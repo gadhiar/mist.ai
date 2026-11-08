@@ -1,44 +1,37 @@
 """How the alarm scheduler tells the outside world that an occurrence rang, stopped or changed.
 
-The scheduler depends on the `AlarmNotifier` protocol, not on a transport, so a room unit or a
-TTS sink can be added beside the WebSocket sink without touching the scheduler. Notifiers are
-told, never asked: `AlarmRecords` stays the source of truth, which is why `alarm_state` is built
-from the live occurrences of one snapshot and carries that snapshot's `rev`.
+The scheduler depends on the `AlarmNotifier` protocol, not on a transport. `RingRouter`
+(`ringing.py`) implements it over one sink per endpoint, so a room unit is added beside the
+desktop without touching the scheduler. Notifiers are told, never asked: `AlarmRecords` stays the
+source of truth, which is why `alarm_state` is built from the live occurrences of one snapshot and
+carries that snapshot's `rev`.
 
-`alarm_state_payload` is the one builder of `alarm_state`, shared by `WsAlarmNotifier` and the
-on-connect snapshot, so the snapshot and the broadcast cannot drift apart. It sends the settings
-an endpoint rings by (the ring timeout, the snooze, the effective grace window, the fallback
-delay and the time zone), so an endpoint that loses the backend can still ring and time out on
-its own rules.
+`alarm_state_payload` is the one builder of `alarm_state`, shared by the router and the
+on-connect snapshot, so the snapshot and the broadcast cannot drift apart, and
+`alarm_fired_payload` is the one builder of `alarm_fired`. `alarm_state` sends the settings an
+endpoint rings by (the ring timeout, the snooze, the effective grace window, the fallback delay
+and the time zone), so an endpoint that loses the backend can still ring and time out on its own
+rules.
 """
 
 from __future__ import annotations
 
-import logging
-import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, tzinfo
-from typing import Literal, Protocol
-
-from backend.errors import MistError
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..config import AlarmSettings
 from ..events import (
     AlarmEntry,
     AlarmFiredEvent,
     AlarmStateEvent,
-    EventSink,
     MissedEntry,
     RingingEntry,
 )
 from .records import Occurrence, RingTarget
 
-logger = logging.getLogger(__name__)
-
-# Failures one notifier in a `CompositeNotifier` contains rather than passing on: the MIST error
-# tree, storage and OS-level I/O (a closed socket is an `OSError`). Anything else is a bug and
-# propagates. No broader catch is added.
-_CONTAINED_ERRORS = (MistError, sqlite3.Error, OSError)
+if TYPE_CHECKING:
+    from .ringing import RingDelivery
 
 GRACE_FLOOR_S = 60.0
 """The shortest grace window: an occurrence found at most this late always rings."""
@@ -63,15 +56,19 @@ class AlarmNotifier(Protocol):
     """Where the scheduler reports occurrence events; every method is called on the main loop.
 
     The scheduler awaits these methods while it holds its lock, so an implementation must not
-    call back into the scheduler (`schedule`, `cancel`, `snooze`, `stop_ringing`, `dismiss`):
-    those take the same lock, which is not reentrant, and the call would wait forever.
+    call back into the scheduler (`schedule`, `cancel`, `snooze`, `stop_ringing`, `dismiss`,
+    `ring_acknowledged`, `report`): those take the same lock, which is not reentrant, and the
+    call would wait forever.
     """
 
-    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> None:
+    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> RingDelivery:
         """Announce that `occurrence`, now stored as ringing, has started ringing.
 
         `occurrence.fired_at` and `occurrence.late_by_s` are set. The scheduler ends it after
         `ring_timeout_s` unless it is stopped or snoozed first.
+
+        Returns:
+            Where the ring went: the endpoints it reached and whether it fell back.
         """
         ...
 
@@ -95,18 +92,14 @@ def alarm_state_payload(
     *,
     settings: AlarmSettings,
     tz: tzinfo,
-    fallback_after_s: float,
 ) -> dict[str, object]:
     """Build the `alarm_state` WS payload from live occurrences, through `AlarmStateEvent`.
 
     `ringing` lists each ringing occurrence with its `late_by_s`, so a client that connects after
     the `alarm_fired` broadcast still sees how late it rang; `missed` lists each missed one with
     its reason. Occurrences keep the order they are given in and every time is converted to UTC.
-    `missed_grace_s` is the effective window (`effective_grace_s`), and `tz` is named by its
-    IANA key where it has one.
-
-    `fallback_after_s` is a parameter, not a setting, until the ringing router reads it from
-    configuration.
+    `missed_grace_s` is the effective window (`effective_grace_s`), `fallback_after_s` the
+    configured delay, and `tz` is named by its IANA key where it has one.
 
     Raises:
         pydantic.ValidationError: A value falls outside the protocol, such as a negative `rev`.
@@ -131,7 +124,7 @@ def alarm_state_payload(
             for o in occurrences
             if o.state == "missed"
         ],
-        fallback_after_s=fallback_after_s,
+        fallback_after_s=settings.fallback_after_s,
         missed_grace_s=effective_grace_s(settings.missed_grace_s),
         ring_timeout_s=settings.ring_timeout_s,
         snooze_minutes=settings.snooze_minutes,
@@ -141,106 +134,33 @@ def alarm_state_payload(
     return event.to_payload()
 
 
-class WsAlarmNotifier:
-    """Sends alarm events to WebSocket clients through the host's event sink."""
+def alarm_fired_payload(
+    occurrence: Occurrence, ring_timeout_s: float, *, fallback: bool
+) -> dict[str, object]:
+    """Build the `alarm_fired` WS payload for a ringing occurrence, through `AlarmFiredEvent`.
 
-    def __init__(
-        self,
-        event_sink: EventSink,
-        settings: AlarmSettings,
-        tz: tzinfo,
-        *,
-        fallback_after_s: float,
-    ) -> None:
-        """Keep the sink that broadcasts to connected clients and what `alarm_state` sends."""
-        self._sink = event_sink
-        self._settings = settings
-        self._tz = tz
-        self._fallback_after_s = fallback_after_s
+    `fallback` says none of the endpoints the occurrence names was present, so the ring went to
+    every endpoint that was. An occurrence with no `fired_at` reports its `next_fire_at`.
 
-    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> None:
-        """Emit `alarm_fired` for a ringing occurrence, built through `AlarmFiredEvent`.
-
-        `fallback` is always False here: this sink rings every connected client, so no named
-        endpoint can be absent from it.
-        """
-        record = occurrence.record
-        fired_at = (
-            occurrence.fired_at if occurrence.fired_at is not None else occurrence.next_fire_at
-        )
-        event = AlarmFiredEvent(
-            type="alarm_fired",
-            alarm_id=occurrence.occurrence_id,
-            record_id=record.record_id,
-            kind=record.kind,
-            category=record.category,
-            label=record.label,
-            scheduled_for=_utc(occurrence.scheduled_for),
-            fired_at=_utc(fired_at),
-            late_by_s=occurrence.late_by_s or 0.0,
-            ring_timeout_s=ring_timeout_s,
-            ring_on=_wire_target(occurrence.ring_on),
-            fallback=False,
-        )
-        self._sink.emit(event.to_payload())
-
-    async def stopped(self, occurrence_id: str) -> None:
-        """Emit nothing: protocol 1.4.0 has no stop event, and the `alarm_state` that follows
-        every stop carries the occurrence's new state.
-        """
-
-    async def state_changed(
-        self, occurrences: Sequence[Occurrence], rev: int, at: datetime
-    ) -> None:
-        """Emit `alarm_state`, exactly as `alarm_state_payload` builds it."""
-        self._sink.emit(
-            alarm_state_payload(
-                occurrences,
-                rev,
-                at,
-                settings=self._settings,
-                tz=self._tz,
-                fallback_after_s=self._fallback_after_s,
-            )
-        )
-
-
-class CompositeNotifier:
-    """Passes every event to each of several notifiers, in order.
-
-    One notifier failing with a contained error is logged at ERROR, naming its class, and the
-    rest are still called, so a broken room unit cannot silence the WebSocket clients.
+    Raises:
+        pydantic.ValidationError: A value falls outside the protocol.
     """
-
-    def __init__(self, notifiers: Sequence[AlarmNotifier]) -> None:
-        """Keep the notifiers, in the order they are called."""
-        self._notifiers = tuple(notifiers)
-
-    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> None:
-        """Call `ring` on every notifier."""
-        for notifier in self._notifiers:
-            try:
-                await notifier.ring(occurrence, ring_timeout_s)
-            except _CONTAINED_ERRORS as exc:
-                _log_failure(notifier, "ring", exc)
-
-    async def stopped(self, occurrence_id: str) -> None:
-        """Call `stopped` on every notifier."""
-        for notifier in self._notifiers:
-            try:
-                await notifier.stopped(occurrence_id)
-            except _CONTAINED_ERRORS as exc:
-                _log_failure(notifier, "stopped", exc)
-
-    async def state_changed(
-        self, occurrences: Sequence[Occurrence], rev: int, at: datetime
-    ) -> None:
-        """Call `state_changed` on every notifier."""
-        for notifier in self._notifiers:
-            try:
-                await notifier.state_changed(occurrences, rev, at)
-            except _CONTAINED_ERRORS as exc:
-                _log_failure(notifier, "state_changed", exc)
+    record = occurrence.record
+    fired_at = occurrence.fired_at if occurrence.fired_at is not None else occurrence.next_fire_at
+    return AlarmFiredEvent(
+        type="alarm_fired",
+        alarm_id=occurrence.occurrence_id,
+        record_id=record.record_id,
+        kind=record.kind,
+        category=record.category,
+        label=record.label,
+        scheduled_for=_utc(occurrence.scheduled_for),
+        fired_at=_utc(fired_at),
+        late_by_s=occurrence.late_by_s or 0.0,
+        ring_timeout_s=ring_timeout_s,
+        ring_on=_wire_target(occurrence.ring_on),
+        fallback=fallback,
+    ).to_payload()
 
 
 def _entry(occurrence: Occurrence) -> AlarmEntry:
@@ -272,12 +192,6 @@ def _tz_name(tz: tzinfo, now: datetime) -> str:
     if isinstance(key, str) and key:
         return key
     return tz.tzname(now.astimezone(tz)) or str(tz)
-
-
-def _log_failure(notifier: AlarmNotifier, method: str, exc: BaseException) -> None:
-    logger.error(
-        "Alarm notifier %s failed in %s: %s", type(notifier).__name__, method, exc, exc_info=exc
-    )
 
 
 def _utc(value: datetime) -> datetime:

@@ -40,11 +40,17 @@ class RouterSettings:
 
 @dataclass(frozen=True, slots=True)
 class AlarmSettings:
-    """Ring timeout, default snooze and the late-ring grace window."""
+    """Ring timeout, default snooze, the late-ring grace window and the endpoint fallback delay.
+
+    `fallback_after_s` is how long an endpoint that cannot reach the owner waits past an alarm's
+    time before it rings on its own (`MIST_RING_FALLBACK_AFTER_S`). `alarm_state` sends all four,
+    so every endpoint rings, times out and snoozes by the owner's rules.
+    """
 
     ring_timeout_s: float
     snooze_minutes: int
     missed_grace_s: float
+    fallback_after_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +111,26 @@ def load_capabilities_config(env: Mapping[str, str]) -> CapabilitiesConfig:
     Raises:
         CapabilityConfigError: A value does not parse or is out of range, or
             `MIST_CAPABILITIES` names an unknown capability. The message names the variable.
+            `MIST_RING_FALLBACK_AFTER_S` must also be below the effective grace window, so an
+            endpoint's own ring always starts before the owner would mark the alarm missed;
+            that refusal names both variables.
     """
+    missed_grace_s = _seconds(env, "MIST_ALARM_MISSED_GRACE_S", default=900.0, allow_zero=True)
+    fallback_after_s = _seconds(env, "MIST_RING_FALLBACK_AFTER_S", default=30.0, high=300.0)
+    if fallback_after_s < 5.0:
+        raise CapabilityConfigError(
+            f"MIST_RING_FALLBACK_AFTER_S={_text(env, 'MIST_RING_FALLBACK_AFTER_S')!r} is out of "
+            "range (5..300 s)"
+        )
+    # The scheduler's grace window is never under 60 s (`alarms.notifier.effective_grace_s`,
+    # which this module cannot import: that package imports these settings).
+    grace_window_s = max(60.0, missed_grace_s)
+    if fallback_after_s >= grace_window_s:
+        raise CapabilityConfigError(
+            f"MIST_RING_FALLBACK_AFTER_S={fallback_after_s:g} must be below the effective grace "
+            f"window of {grace_window_s:g} s (MIST_ALARM_MISSED_GRACE_S={missed_grace_s:g}, "
+            "never under 60 s), so an endpoint's own ring starts before the alarm counts as missed"
+        )
     return CapabilitiesConfig(
         enabled=_bool(env, "MIST_CAPABILITIES_ENABLED", default=False),
         capabilities=_capabilities(env),
@@ -134,9 +159,8 @@ def load_capabilities_config(env: Mapping[str, str]) -> CapabilitiesConfig:
                 env, "MIST_ALARM_RING_TIMEOUT_S", default=600.0, high=RING_TIMEOUT_MAX_S
             ),
             snooze_minutes=_int(env, "MIST_ALARM_SNOOZE_MINUTES", default=9, low=1, high=60),
-            missed_grace_s=_seconds(
-                env, "MIST_ALARM_MISSED_GRACE_S", default=900.0, allow_zero=True
-            ),
+            missed_grace_s=missed_grace_s,
+            fallback_after_s=fallback_after_s,
         ),
         lights=LightsSettings(
             ha_mcp_url=_text(env, "MIST_HA_MCP_URL"),

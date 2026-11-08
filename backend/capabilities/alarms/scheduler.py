@@ -1,12 +1,19 @@
 """`AlarmScheduler`: the one writer of occurrence transitions, run as a supervised task.
 
-Capabilities and `alarm_action` change alarms only through the scheduler's methods (`schedule`,
-`cancel`, `snooze`, `stop_ringing`, `dismiss`), and every write goes through `AlarmRecords`: an
-alarm is a record, armed into occurrences, so a daily alarm keeps one record however often it
-fires. Each method writes, publishes the new state when the write changed an occurrence, and
-calls `wake()`, so the task recomputes its next deadline at once instead of finishing a sleep
-that the change made wrong. Method writes and the task's ticks hold one lock, so their writes
-never interleave and each published state is read after the write it follows.
+Capabilities, `alarm_action` and `alarm_report` change alarms only through the scheduler's
+methods (`schedule`, `cancel`, `snooze`, `stop_ringing`, `dismiss`, `ring_acknowledged`,
+`report`), and every write goes through `AlarmRecords`: an alarm is a record, armed into
+occurrences, so a daily alarm keeps one record however often it fires. Each method writes,
+publishes the new state when the write changed an occurrence, and calls `wake()`, so the task
+recomputes its next deadline at once instead of finishing a sleep that the change made wrong.
+Method writes and the task's ticks hold one lock, so their writes never interleave and each
+published state is read after the write it follows.
+
+Delivery is acknowledged, not assumed. The notifier (`RingRouter`) stores where each ring went;
+an endpoint that starts playing it acknowledges it, through `ring_acknowledged` or a `rang`
+report, which is the same write. An endpoint that rang on its own while the owner was out of
+reach reports the outcome through `report`, which `AlarmRecords.report` applies by the
+occurrence's state under the same grace window the tick uses.
 
 The task sleeps in chunks of at most 60 s on the injected `Clock` and recomputes from the wall
 clock on every tick, so a clock jump or a host sleep is noticed within 60 s of waking. Each tick:
@@ -55,7 +62,15 @@ from backend.errors import CapabilityStoreError, MistError
 from ..clock import Clock
 from ..config import AlarmSettings
 from .notifier import AlarmNotifier, effective_grace_s
-from .records import AlarmRecords, ArmRequest, ArmResult, EventSource, Occurrence
+from .records import (
+    AlarmRecords,
+    ArmRequest,
+    ArmResult,
+    EventSource,
+    Occurrence,
+    ReportOutcome,
+    ReportResult,
+)
 from .timeparse import RepeatRule, next_occurrence
 
 logger = logging.getLogger(__name__)
@@ -366,6 +381,104 @@ class AlarmScheduler:
             self.wake()
         return dismissed
 
+    async def ring_acknowledged(self, occurrence_id: str, *, endpoint: str) -> bool:
+        """Record that `endpoint` started playing the ringing occurrence's current ring.
+
+        At the ring timeout an occurrence some endpoint acknowledged ends `timed_out`, and one
+        none did becomes missed, reason `unheard`.
+
+        Returns:
+            True when the occurrence is ringing and now lists the endpoint; False otherwise.
+
+        Raises:
+            ValueError: The endpoint name is not one `AlarmRecords` stores.
+            CapabilityStoreError: The write failed.
+        """
+        try:
+            async with self._lock:
+                acknowledged = await self._records.acknowledge_ring(
+                    occurrence_id, endpoint, at=self._clock.now()
+                )
+                if acknowledged:
+                    await self._publish_contained()
+        finally:
+            self.wake()
+        return acknowledged
+
+    async def report(
+        self,
+        occurrence_id: str,
+        *,
+        endpoint: str,
+        outcome: ReportOutcome,
+        at: datetime,
+        rang_at: datetime,
+        snoozed_until: datetime | None,
+    ) -> ReportResult:
+        """Apply an endpoint's report of a ring through `AlarmRecords.report`.
+
+        The caller has checked the report's times (`AlarmReportMessage`). The report is judged
+        against the effective grace window, the one the tick applies and `alarm_state` sends.
+        For a scheduled occurrence of a repeating record the series' next instant is passed,
+        since the report may count as its firing. The notifier then hears what changed: a
+        report that fired a scheduled occurrence rings it on the endpoints as usual, and one
+        that ended or snoozed a ringing occurrence stops it. A `rang` on a ringing occurrence
+        is the same acknowledgement as `ring_acknowledged`.
+
+        Returns:
+            The records' `ReportResult`.
+
+        Raises:
+            ValueError: The report is incoherent (`AlarmRecords.report`).
+            CapabilityStoreError: The read or the write failed.
+        """
+        try:
+            async with self._lock:
+                now = self._clock.now()
+                before = await self._live_one(occurrence_id)
+                next_fire_at = None
+                if (
+                    before is not None
+                    and before.state == "scheduled"
+                    and before.record.days is not None
+                ):
+                    next_fire_at = self._next_after(before, max(now, before.next_fire_at))
+                result = await self._records.report(
+                    occurrence_id,
+                    endpoint=endpoint,
+                    outcome=outcome,
+                    at=at,
+                    rang_at=rang_at,
+                    snoozed_until=snoozed_until,
+                    now=now,
+                    next_fire_at=next_fire_at,
+                    grace=timedelta(seconds=effective_grace_s(self._settings.missed_grace_s)),
+                )
+                logger.info(
+                    "Alarm %s reported %s by %s: %s", occurrence_id, outcome, endpoint, result
+                )
+                if result == "applied":
+                    await self._after_report(occurrence_id, before)
+                    await self._publish_contained()
+        finally:
+            self.wake()
+        return result
+
+    async def _after_report(self, occurrence_id: str, before: Occurrence | None) -> None:
+        """Tell the notifier what an applied report changed about a ringing state."""
+        if before is None:
+            return
+        after = await self._live_one(occurrence_id)
+        if after is not None and after.state == "ringing":
+            if before.state == "scheduled":
+                await self._announce(after)
+        elif before.state == "ringing":
+            await self._notify_stopped(occurrence_id)
+
+    async def _live_one(self, occurrence_id: str) -> Occurrence | None:
+        _, live = await self._records.snapshot()
+        return next((o for o in live if o.occurrence_id == occurrence_id), None)
+
     async def _run(self) -> None:
         failures = 0
         while True:
@@ -485,8 +598,13 @@ class AlarmScheduler:
             sent_to=frozenset(),
             delivered_to=frozenset(),
         )
+        await self._announce(rung)
+        return True
+
+    async def _announce(self, occurrence: Occurrence) -> None:
+        """Ring a stored ringing occurrence through the notifier, which records where it went."""
         try:
-            await self._notifier.ring(rung, self._settings.ring_timeout_s)
+            delivery = await self._notifier.ring(occurrence, self._settings.ring_timeout_s)
         except _PER_OCCURRENCE_ERRORS as exc:
             # The ringing state is stored and sound, so the published state still shows it and
             # its ring timeout still ends it; only this announcement is lost.
@@ -496,7 +614,13 @@ class AlarmScheduler:
                 exc,
                 exc_info=exc,
             )
-        return True
+            return
+        logger.info(
+            "Alarm %s rang on %s%s",
+            occurrence.occurrence_id,
+            ", ".join(delivery.sent_to) or "no endpoint",
+            " (fallback)" if delivery.fallback else "",
+        )
 
     def _next_after(self, occurrence: Occurrence, now: datetime) -> datetime:
         """Return the series' first instant after `now`, at the record's wall time and days.

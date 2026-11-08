@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import math
 import sqlite3
@@ -26,6 +27,7 @@ from backend.capabilities.alarms.records import (
     ArmResult,
     Occurrence,
 )
+from backend.capabilities.alarms.ringing import DesktopSink, RingDelivery, RingRouter
 from backend.capabilities.alarms.scheduler import (
     MISSED_ACK_AFTER,
     AlarmScheduler,
@@ -34,14 +36,16 @@ from backend.capabilities.alarms.scheduler import (
 from backend.capabilities.config import AlarmSettings
 from backend.capabilities.db import CapabilitiesDb
 from backend.errors import CapabilityStoreError, MistError
-from tests.unit.capabilities.fakes import DEFAULT_START, FakeClock
+from tests.unit.capabilities.fakes import DEFAULT_START, FakeClock, RecordingEventSink
 
 T0 = DEFAULT_START
 """Monday 5 January 2026, 07:00 UTC."""
 DAY = timedelta(days=1)
 SCHEDULER_LOGGER = "backend.capabilities.alarms.scheduler"
 TASK_NAME = "alarm-scheduler"
-SETTINGS = AlarmSettings(ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=900.0)
+SETTINGS = AlarmSettings(
+    ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=900.0, fallback_after_s=30.0
+)
 
 
 class SteppedClock(FakeClock):
@@ -164,7 +168,7 @@ class RecordingNotifier:
         self.state_errors: list[BaseException] = []
         self.ring_hold: asyncio.Event | None = None
 
-    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> None:
+    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> RingDelivery:
         self.rings.append((occurrence, ring_timeout_s))
         if self.ring_hold is not None:
             try:
@@ -174,6 +178,7 @@ class RecordingNotifier:
                 raise
         if occurrence.occurrence_id in self.ring_errors:
             raise self.ring_errors[occurrence.occurrence_id]
+        return RingDelivery(sent_to=(), fallback=False)
 
     async def stopped(self, occurrence_id: str) -> None:
         self.stops.append(occurrence_id)
@@ -214,7 +219,7 @@ def notifier():
 def _scheduler(
     records: AlarmRecords,
     clock: SteppedClock,
-    notifier: RecordingNotifier,
+    notifier: RecordingNotifier | RingRouter,
     settings: AlarmSettings = SETTINGS,
     tz: tzinfo = UTC,
     **kwargs: float,
@@ -403,7 +408,9 @@ class TestFiring:
     async def test_the_ring_timeout_calls_time_out_and_an_unheard_ring_ends_missed(
         self, db, records, clock, notifier
     ):
-        settings = AlarmSettings(ring_timeout_s=90.0, snooze_minutes=9, missed_grace_s=900.0)
+        settings = AlarmSettings(
+            ring_timeout_s=90.0, snooze_minutes=9, missed_grace_s=900.0, fallback_after_s=30.0
+        )
         occurrence_id = await _arm(records, alarm(T0))
 
         async with _running(_scheduler(records, clock, notifier, settings)):
@@ -418,8 +425,8 @@ class TestFiring:
             await clock.advance(30)
             await clock.slept(3)
 
-            # No endpoint acknowledged playing it (`delivered_to` is empty until T23), so the
-            # timeout records it unheard rather than timed out.
+            # No endpoint acknowledged playing it (`delivered_to` is empty), so the timeout
+            # records it unheard rather than timed out.
             assert notifier.stops == [occurrence_id]
             stored = (await _live(records))[occurrence_id]
             assert (stored.state, stored.missed_reason) == ("missed", "unheard")
@@ -436,7 +443,9 @@ class TestFiring:
     async def test_snooze_reschedules_by_the_configured_minutes_and_keeps_the_count(
         self, db, records, clock, notifier
     ):
-        settings = AlarmSettings(ring_timeout_s=600.0, snooze_minutes=5, missed_grace_s=900.0)
+        settings = AlarmSettings(
+            ring_timeout_s=600.0, snooze_minutes=5, missed_grace_s=900.0, fallback_after_s=30.0
+        )
         scheduler = _scheduler(records, clock, notifier, settings)
         occurrence_id = await _arm(records, alarm(T0))
 
@@ -650,7 +659,9 @@ class TestGraceRule:
     async def test_a_zero_grace_window_still_rings_an_occurrence_up_to_60_s_late(
         self, records, clock, notifier
     ):
-        settings = AlarmSettings(ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=0.0)
+        settings = AlarmSettings(
+            ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=0.0, fallback_after_s=30.0
+        )
         on_edge = await _arm(records, timer(T0 - timedelta(seconds=60), 60))
         under = await _arm(records, timer(T0 - timedelta(seconds=45), 45))
         over = await _arm(records, timer(T0 - timedelta(seconds=61), 61))
@@ -994,7 +1005,9 @@ class TestSupervision:
     async def test_one_ring_timeout_failing_does_not_hold_back_another(
         self, records, clock, notifier
     ):
-        settings = AlarmSettings(ring_timeout_s=60.0, snooze_minutes=9, missed_grace_s=900.0)
+        settings = AlarmSettings(
+            ring_timeout_s=60.0, snooze_minutes=9, missed_grace_s=900.0, fallback_after_s=30.0
+        )
         broken = await _arm(records, timer(T0 - timedelta(seconds=1), 1))
         healthy = await _arm(records, timer(T0, 2))
 
@@ -1279,3 +1292,283 @@ class TestQuarantine:
             # still ends it.
             assert (await _states(records))[broken] == "ringing"
             assert records.quarantine_calls == []
+
+
+SHORT_RING = AlarmSettings(
+    ring_timeout_s=60.0, snooze_minutes=5, missed_grace_s=900.0, fallback_after_s=30.0
+)
+
+
+def _desktop_router(
+    records: AlarmRecords,
+    clock: SteppedClock,
+    *,
+    present: bool,
+    settings: AlarmSettings = SHORT_RING,
+) -> tuple[RingRouter, RecordingEventSink]:
+    events = RecordingEventSink()
+    sink = DesktopSink(events, lambda: present)
+    return RingRouter([sink], records, clock, settings, UTC), events
+
+
+async def _last_event(db: CapabilitiesDb, occurrence_id: str) -> tuple[str, dict[str, object]]:
+    kind, _, detail = [e for e in await _events(db) if e[1] == occurrence_id][-1]
+    return kind, json.loads(detail or "{}")
+
+
+class TestDelivery:
+    """At the ring timeout, an acknowledged ring times out and an unacknowledged one is missed."""
+
+    @pytest.mark.asyncio
+    async def test_with_no_sink_present_the_ring_ends_missed_with_nothing_sent(
+        self, db, records, clock
+    ):
+        router, events = _desktop_router(records, clock, present=False)
+        occurrence_id = await _arm(records, alarm(T0))
+
+        async with _running(_scheduler(records, clock, router, SHORT_RING)):
+            await clock.slept(1)
+            assert (await _live(records))[occurrence_id].sent_to == frozenset()
+            await clock.advance(60)
+            await clock.slept(2)
+
+        assert events.of_type("alarm_fired") == []
+        stored = (await _live(records))[occurrence_id]
+        assert (stored.state, stored.missed_reason) == ("missed", "unheard")
+        assert await _last_event(db, occurrence_id) == (
+            "missed",
+            {"reason": "unheard", "sent_to": []},
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_ring_sent_but_never_acknowledged_ends_missed_with_sent_to(
+        self, db, records, clock
+    ):
+        router, events = _desktop_router(records, clock, present=True)
+        occurrence_id = await _arm(records, alarm(T0))
+
+        async with _running(_scheduler(records, clock, router, SHORT_RING)):
+            await clock.slept(1)
+            assert [p["alarm_id"] for p in events.of_type("alarm_fired")] == [occurrence_id]
+            assert (await _live(records))[occurrence_id].sent_to == frozenset({"desktop"})
+            await clock.advance(60)
+            await clock.slept(2)
+
+        stored = (await _live(records))[occurrence_id]
+        assert (stored.state, stored.missed_reason) == ("missed", "unheard")
+        assert await _last_event(db, occurrence_id) == (
+            "missed",
+            {"reason": "unheard", "sent_to": ["desktop"]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_acknowledged_ring_ends_timed_out(self, db, records, clock):
+        router, _ = _desktop_router(records, clock, present=True)
+        occurrence_id = await _arm(records, alarm(T0))
+        scheduler = _scheduler(records, clock, router, SHORT_RING)
+
+        async with _running(scheduler):
+            await clock.slept(1)
+            assert await scheduler.ring_acknowledged(occurrence_id, endpoint="desktop") is True
+            assert (await _live(records))[occurrence_id].delivered_to == frozenset({"desktop"})
+            # The acknowledgement woke the task, which cut its sleep short.
+            await clock.slept(2)
+            assert clock.cancelled == [60.0]
+            await clock.advance(60)
+            await clock.slept(3)
+
+        assert await _live(records) == {}
+        [record] = await records.saved()
+        assert record.last_outcome == "timed_out"
+        assert await _last_event(db, occurrence_id) == ("timed_out", {"delivered_to": ["desktop"]})
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_an_occurrence_that_is_not_ringing_returns_false(
+        self, records, clock, notifier
+    ):
+        occurrence_id = await _arm(records, alarm(T0 + timedelta(hours=1)))
+        scheduler = _scheduler(records, clock, notifier)
+
+        assert await scheduler.ring_acknowledged(occurrence_id, endpoint="desktop") is False
+        assert notifier.states == []
+
+
+class TestReport:
+    @pytest.mark.asyncio
+    async def test_a_rang_report_on_a_ringing_occurrence_is_the_acknowledgement(
+        self, db, records, clock
+    ):
+        router, _ = _desktop_router(records, clock, present=True)
+        occurrence_id = await _arm(records, alarm(T0))
+        scheduler = _scheduler(records, clock, router, SHORT_RING)
+
+        async with _running(scheduler):
+            await clock.slept(1)
+            result = await scheduler.report(
+                occurrence_id,
+                endpoint="desktop",
+                outcome="rang",
+                at=T0,
+                rang_at=T0,
+                snoozed_until=None,
+            )
+            assert result == "applied"
+            assert (await _live(records))[occurrence_id].delivered_to == frozenset({"desktop"})
+            await clock.slept(2)
+            assert clock.cancelled == [60.0]
+            await clock.advance(60)
+            await clock.slept(3)
+
+        assert await _live(records) == {}
+        assert (await _last_event(db, occurrence_id))[0] == "timed_out"
+
+    @pytest.mark.asyncio
+    async def test_a_report_on_a_due_repeat_fires_it_arms_the_next_and_rings_the_others(
+        self, records, clock, notifier
+    ):
+        occurrence_id = await _arm(records, alarm(T0, days=range(7)))
+        scheduler = _scheduler(records, clock, notifier)
+
+        result = await scheduler.report(
+            occurrence_id,
+            endpoint="desktop",
+            outcome="rang",
+            at=T0,
+            rang_at=T0,
+            snoozed_until=None,
+        )
+
+        assert result == "applied"
+        live = await _live(records)
+        fired = live.pop(occurrence_id)
+        assert (fired.state, fired.fired_at, fired.delivered_to) == (
+            "ringing",
+            T0,
+            frozenset({"desktop"}),
+        )
+        [upcoming] = live.values()
+        assert (upcoming.state, upcoming.next_fire_at) == ("scheduled", T0 + DAY)
+        assert [(o.occurrence_id, o.fired_at) for o, _ in notifier.rings] == [(occurrence_id, T0)]
+        assert notifier.states[-1][1] == await records.rev()
+
+    @pytest.mark.asyncio
+    async def test_a_report_on_an_occurrence_not_yet_due_is_not_due(self, records, clock, notifier):
+        occurrence_id = await _arm(records, alarm(T0 + timedelta(hours=1)))
+        scheduler = _scheduler(records, clock, notifier)
+
+        result = await scheduler.report(
+            occurrence_id,
+            endpoint="desktop",
+            outcome="rang",
+            at=T0,
+            rang_at=T0,
+            snoozed_until=None,
+        )
+
+        assert result == "not_due"
+        assert await _states(records) == {occurrence_id: "scheduled"}
+        assert notifier.rings == []
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_report_on_a_ringing_occurrence_stops_it(
+        self, records, clock, notifier
+    ):
+        occurrence_id = await _arm(records, alarm(T0))
+        scheduler = _scheduler(records, clock, notifier)
+
+        async with _running(scheduler):
+            await clock.slept(1)
+            result = await scheduler.report(
+                occurrence_id,
+                endpoint="desktop",
+                outcome="stopped",
+                at=T0,
+                rang_at=T0,
+                snoozed_until=None,
+            )
+
+            assert result == "applied"
+            assert notifier.stops == [occurrence_id]
+            assert notifier.states[-1][0] == []
+
+        [record] = await records.saved()
+        assert record.last_outcome == "stopped"
+
+    @pytest.mark.parametrize(
+        ("rang_after_s", "result", "states"),
+        [(61, "late", {"missed"}), (60, "applied", set())],
+        ids=["past-the-window", "inside-the-window"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_report_on_a_missed_occurrence_is_bound_by_the_effective_window(
+        self, db, records, clock, notifier, rang_after_s, result, states
+    ):
+        # `missed_grace_s` 0 has the effective window of 60 s that `alarm_state` sends.
+        settings = AlarmSettings(
+            ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=0.0, fallback_after_s=30.0
+        )
+        fire_at = T0 - timedelta(hours=2)
+        occurrence_id = await _arm(records, alarm(fire_at, 5, 0))
+        scheduler = _scheduler(records, clock, notifier, settings)
+
+        async with _running(scheduler):
+            await clock.slept(1)
+            assert (await _live(records))[occurrence_id].missed_reason == "late"
+            rang_at = fire_at + timedelta(seconds=rang_after_s)
+
+            answer = await scheduler.report(
+                occurrence_id,
+                endpoint="desktop",
+                outcome="rang",
+                at=rang_at,
+                rang_at=rang_at,
+                snoozed_until=None,
+            )
+
+        assert answer == result
+        assert {o.state for o in (await _live(records)).values()} == states
+        kinds = [kind for kind, event_id, _ in await _events(db) if event_id == occurrence_id]
+        assert "reported" in kinds
+        assert ("timed_out" in kinds) is (result == "applied")
+
+    @pytest.mark.asyncio
+    async def test_a_snoozed_ring_acknowledged_on_its_second_ring_ends_timed_out(
+        self, db, records, clock
+    ):
+        router, events = _desktop_router(records, clock, present=True)
+        occurrence_id = await _arm(records, alarm(T0))
+        scheduler = _scheduler(records, clock, router, SHORT_RING)
+
+        async with _running(scheduler):
+            await clock.slept(1)
+            assert await scheduler.snooze(occurrence_id, source="alarm_action", endpoint="desktop")
+            for count in range(2, 7):
+                await clock.slept(count)
+                await clock.advance(60)
+            await clock.slept(7)
+
+            second = T0 + timedelta(minutes=5)
+            rung = (await _live(records))[occurrence_id]
+            assert (rung.state, rung.fired_at, rung.delivered_to) == (
+                "ringing",
+                second,
+                frozenset(),
+            )
+            assert len(events.of_type("alarm_fired")) == 2
+            result = await scheduler.report(
+                occurrence_id,
+                endpoint="desktop",
+                outcome="rang",
+                at=second,
+                rang_at=second,
+                snoozed_until=None,
+            )
+            assert result == "applied"
+            await clock.slept(8)
+            await clock.advance(60)
+            await clock.slept(9)
+
+        assert await _live(records) == {}
+        kinds = [kind for kind, event_id, _ in await _events(db) if event_id == occurrence_id]
+        assert kinds[-1] == "timed_out"
+        assert "missed" not in kinds

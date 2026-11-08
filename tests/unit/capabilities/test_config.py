@@ -37,6 +37,7 @@ FULL_ENV = {
     "MIST_ALARM_RING_TIMEOUT_S": "300",
     "MIST_ALARM_SNOOZE_MINUTES": "5",
     "MIST_ALARM_MISSED_GRACE_S": "120",
+    "MIST_RING_FALLBACK_AFTER_S": "45",
     "MIST_HA_MCP_URL": "http://ha.example.invalid:8123/api/mcp",
     "MIST_HA_TOKEN": FAKE_TOKEN,
     "MIST_LIGHTS_DEFAULT_TARGET": "living room",
@@ -66,7 +67,12 @@ class TestDefaults:
             decode_timeout_s=10.0,
             wake_words=("mist", "hey mist", "ok mist", "okay mist"),
             router=RouterSettings(sticky_turns=2, embedding_threshold=None),
-            alarms=AlarmSettings(ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=900.0),
+            alarms=AlarmSettings(
+                ring_timeout_s=600.0,
+                snooze_minutes=9,
+                missed_grace_s=900.0,
+                fallback_after_s=30.0,
+            ),
             lights=LightsSettings(ha_mcp_url=None, ha_token_configured=False, default_target=None),
             music=MusicSettings(
                 spotify_client_id=None,
@@ -107,7 +113,12 @@ class TestEveryVariable:
             decode_timeout_s=12.0,
             wake_words=("mist", "hey mist"),
             router=RouterSettings(sticky_turns=3, embedding_threshold=0.42),
-            alarms=AlarmSettings(ring_timeout_s=300.0, snooze_minutes=5, missed_grace_s=120.0),
+            alarms=AlarmSettings(
+                ring_timeout_s=300.0,
+                snooze_minutes=5,
+                missed_grace_s=120.0,
+                fallback_after_s=45.0,
+            ),
             lights=LightsSettings(
                 ha_mcp_url="http://ha.example.invalid:8123/api/mcp",
                 ha_token_configured=True,
@@ -239,3 +250,52 @@ class TestDurationBounds:
         assert config.alarms.missed_grace_s == 1e12
         assert config.tool_timeout_s == 1e12
         assert config.decode_timeout_s == 1e12
+
+
+class TestRingFallback:
+    """`MIST_RING_FALLBACK_AFTER_S`: how long an endpoint waits before it rings on its own."""
+
+    def test_defaults_to_30_seconds(self):
+        assert load_capabilities_config({}).alarms.fallback_after_s == 30.0
+
+    @pytest.mark.parametrize(("raw", "expected"), [("5", 5.0), ("42.5", 42.5), ("300", 300.0)])
+    def test_reads_a_value_inside_5_to_300_seconds(self, raw, expected):
+        config = load_capabilities_config(
+            {"MIST_RING_FALLBACK_AFTER_S": raw, "MIST_ALARM_MISSED_GRACE_S": "900"}
+        )
+
+        assert config.alarms.fallback_after_s == expected
+
+    @pytest.mark.parametrize("raw", ["4.9", "0", "300.5", "-1", "soon", "inf"])
+    def test_a_value_outside_5_to_300_seconds_is_refused(self, raw):
+        with pytest.raises(CapabilityConfigError, match="MIST_RING_FALLBACK_AFTER_S"):
+            load_capabilities_config({"MIST_RING_FALLBACK_AFTER_S": raw})
+
+    def test_a_delay_not_below_the_effective_grace_window_is_refused_naming_both(self):
+        with pytest.raises(CapabilityConfigError) as excinfo:
+            load_capabilities_config(
+                {"MIST_ALARM_MISSED_GRACE_S": "0", "MIST_RING_FALLBACK_AFTER_S": "120"}
+            )
+
+        message = str(excinfo.value)
+        assert "MIST_RING_FALLBACK_AFTER_S" in message
+        assert "MIST_ALARM_MISSED_GRACE_S" in message
+
+    @pytest.mark.parametrize(
+        ("grace", "fallback", "loads"),
+        [
+            # A grace under 60 s is raised to 60 s, the window the scheduler applies.
+            pytest.param("0", "59", True, id="under-the-floor"),
+            pytest.param("0", "60", False, id="at-the-floor"),
+            pytest.param("120", "119", True, id="under-the-window"),
+            pytest.param("120", "120", False, id="at-the-window"),
+        ],
+    )
+    def test_the_bound_is_the_effective_window(self, grace, fallback, loads):
+        env = {"MIST_ALARM_MISSED_GRACE_S": grace, "MIST_RING_FALLBACK_AFTER_S": fallback}
+
+        if loads:
+            assert load_capabilities_config(env).alarms.fallback_after_s == float(fallback)
+        else:
+            with pytest.raises(CapabilityConfigError, match="MIST_ALARM_MISSED_GRACE_S"):
+                load_capabilities_config(env)
