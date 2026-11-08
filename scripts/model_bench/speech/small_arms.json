@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "_comment": "Small interaction models for run 7 and the run 5 addition (mist-model-host plan v2). Each model names its repository and quant only: the exact file name, revision, sha256 and size come from the run's pin file, which host step H2 writes and `small-serve` checks. `models_dir` says which host directory holds the file: `small` for the downloaded small models, `main` for the models directory mist-llm already uses. Every model runs with thinking off at one common sampling so the comparison is fair. Placements served on host-1070 are listed for the low-level suite; `small-serve` refuses them.",
+  "models": {
+    "gemma4-e2b": {"repository": "unsloth/gemma-4-E2B-it-GGUF", "quant": "Q4_K_M", "models_dir": "small", "thinking": "off"},
+    "minicpm5-2b": {"repository": "openbmb/MiniCPM5-2B-GGUF", "quant": "Q4_K_M", "models_dir": "small", "thinking": "off"},
+    "qwen35-4b": {"repository": "unsloth/Qwen3.5-4B-GGUF", "quant": "Q4_K_M", "models_dir": "small", "thinking": "off"},
+    "e4b-ref": {"repository": "unsloth/gemma-4-E4B-it-GGUF", "quant": "Q5_K_M", "models_dir": "main", "thinking": "off"}
+  },
+  "sampling": {"temperature": 0.7, "top_p": 0.9, "top_k": 40, "min_p": 0},
+  "thinking_args": {"off": ["--reasoning", "off"]},
+  "common_args": [
+    "-c", "8192",
+    "-ctk", "q8_0",
+    "-ctv", "q8_0",
+    "-fa", "on",
+    "-np", "1",
+    "--jinja",
+    "--fit", "off",
+    "-t", "8",
+    "--no-webui",
+    "--host", "0.0.0.0",
+    "--port", "8080"
+  ],
+  "placements": {
+    "gpu-full": {"where": "local", "image": "cuda", "gpus": true, "ngl": 999},
+    "gpu-4g": {"where": "local", "image": "cuda", "gpus": true, "ngl": "given", "slice_mib": 4096},
+    "gpu-2g": {"where": "local", "image": "cuda", "gpus": true, "ngl": "given", "slice_mib": 2048},
+    "cpu": {"where": "local", "image": "cpu", "gpus": false, "ngl": null},
+    "gtx1070-shared": {"where": "host-1070", "image": "cuda", "gpus": true, "ngl": "searched", "margin_mib": 512, "passes": ["idle", "busy"]},
+    "host1070-cpu": {"where": "host-1070", "image": "cpu", "gpus": false, "ngl": null, "fallback_for": "gtx1070-shared"},
+    "gtx1070": {"where": "host-1070", "image": "cuda", "gpus": true, "ngl": 999}
+  }
+}
