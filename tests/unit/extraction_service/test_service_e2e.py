@@ -149,6 +149,7 @@ class TestGptOssDefaultConstrainedMode:
             "groups": [
                 {
                     "group": "G1",
+                    "durable": True,
                     "templates": [{"subject": "user", "predicate": "USES", "object": "item"}],
                     "item_type": "Technology",
                     "unchecked": "plan",

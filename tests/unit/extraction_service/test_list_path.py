@@ -136,6 +136,7 @@ def frame_ok(request: LLMRequest, call: int) -> LLMResponse:
     groups = [
         {
             "group": gid,
+            "durable": True,
             "templates": [{"subject": "user", "predicate": "USES", "object": "item"}],
             "item_type": "Technology",
             "unchecked": "plan",
