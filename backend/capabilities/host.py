@@ -814,8 +814,10 @@ class CapabilityHost(CapabilityTurnPort):
         The decode is bounded by `decode_timeout_s`. A call whose arguments fail validation
         gets one repair decode, under the same bound. Calls that policy sends to confirm are
         bundled into one proposal, while the turn's allowed calls run, in the model's order.
-        An `ActionDecodeError` or a decode timeout gives no records, `also_reply` true and
-        `DECODE_FAILURE_NOTICE`, so the turn continues as it would without capabilities.
+        An `ActionDecodeError`, a decode timeout, or a `CapabilityUnavailableError` from the
+        decode callback (no interaction tier serves at call time) gives no records,
+        `also_reply` true and `DECODE_FAILURE_NOTICE`, so the turn continues as it would
+        without capabilities. A repair decode that fails any of these ways is no repair.
 
         Returns:
             The records, the decode's `also_reply`, and `reply`, `block` and `notices` from
@@ -833,7 +835,7 @@ class CapabilityHost(CapabilityTurnPort):
         try:
             reply = await self._timeout(decode(plan.decode), self._settings.decode_timeout_s)
             calls, also_reply = self._decoder.parse(reply, plan.offered)
-        except (ActionDecodeError, TimeoutError) as exc:
+        except (ActionDecodeError, TimeoutError, CapabilityUnavailableError) as exc:
             self._stats.decode_failures += 1
             logger.warning(
                 "Capability action decode failed; no action runs this turn: %s",
@@ -1185,14 +1187,14 @@ class CapabilityHost(CapabilityTurnPort):
         error: str,
         utterance: str,
     ) -> dict[str, object] | None:
-        """Run the one repair decode for a call; None when it fails or times out."""
+        """Run the one repair decode for a call; None when it fails, times out or has no tier."""
         self._stats.repairs += 1
         schema = self._turn_schemas(capability)[spec.name]
         request = self._decoder.build_repair(spec, schema, arguments, error, utterance)
         try:
             reply = await self._timeout(decode(request), self._settings.decode_timeout_s)
             return self._decoder.parse_repair(reply)
-        except (ActionDecodeError, TimeoutError) as exc:
+        except (ActionDecodeError, TimeoutError, CapabilityUnavailableError) as exc:
             logger.warning("Repair decode for %s failed: %s", spec.name, _describe(exc))
             return None
 
