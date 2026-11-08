@@ -1,0 +1,560 @@
+"""Group a structured turn's units into list frames, and parse the list calls' outputs.
+
+The list path sends a structured turn to one frame call, which decides what each group of
+items states, and to item calls that read the items a few at a time. Both calls read the
+same render of the turn: the prose units and the groups, each group's context written once
+rather than fused into every item as `render_unit` does, so a call sees the list's shape
+and can refer to any item by its id.
+
+A group is a maximal run of list items or table rows that share one context tuple, as
+`split_structured` writes it. A nested child's units carry a longer context, so they open a
+group of their own without ending their parent's run, and a sibling after a nested child
+stays in its group.
+
+The parsers are strict: an output that misses a key, has a value of the wrong type or
+outside its enum, holds a key its schema does not declare, gives a group more than 3
+templates, or misses or invents a group or item id raises `ListOutputError`. That
+subclasses `ExtractionValidationError`, so the extraction service's attempt loop sends
+the repair instruction and retries, as it does for a Stage 2 output.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+
+from backend.errors import ExtractionValidationError
+from backend.extraction_service.list_schemas import (
+    ASSERTION_KIND_ENUM,
+    EXTRACTABLE_TYPE_ENUM,
+    PREDICATE_ENUM,
+    TEMPORAL_STATUS_ENUM,
+    UNCHECKED_ENUM,
+)
+
+from .structure_splitter import InputUnit, _as_context
+
+_LIST_KINDS = frozenset({"list_item", "table_row"})
+_TEMPLATES_MAX = 3
+_ROLES = frozenset({"user", "mist", "item", "parent"})
+
+
+class ListOutputError(ExtractionValidationError):
+    """A frame or item output that does not have the shape its stage asks for."""
+
+
+@dataclass(frozen=True, slots=True)
+class ListGroup:
+    """One group of list items or table rows that share a context.
+
+    Attributes:
+        gid: `G1`, `G2` and so on, in the order the groups start.
+        context: The headings, lead-ins and parent items above the items, as
+            `split_structured` writes them.
+        items: The group's units, in turn order.
+        parent: `(group id, item id)` of the item this group is nested under,
+            or None for a top-level group.
+    """
+
+    gid: str
+    context: tuple[str, ...]
+    items: tuple[InputUnit, ...]
+    parent: tuple[str, str] | None
+
+    @property
+    def item_ids(self) -> tuple[str, ...]:
+        """`G1.1`, `G1.2` and so on, one per item."""
+        return tuple(f"{self.gid}.{n}" for n in range(1, len(self.items) + 1))
+
+
+@dataclass(frozen=True, slots=True)
+class Template:
+    """One fact every item of a group states, its ends given as roles.
+
+    A role is `user`, `mist`, `item` (each item's own entity), `parent` (the item a
+    nested group sits under) or a frame entity's key.
+    """
+
+    subject: str
+    predicate: str
+    object: str
+
+
+@dataclass(frozen=True, slots=True)
+class GroupFrame:
+    """What the frame call decided one group states.
+
+    Attributes:
+        group: The group's id, `G1`.
+        templates: At most 3; none means the group states nothing durable.
+        item_type: The type every item shares, or None.
+        unchecked: `plan` or `goal`, what an unchecked box under this group is.
+    """
+
+    group: str
+    templates: tuple[Template, ...]
+    item_type: str | None
+    unchecked: str
+
+
+@dataclass(frozen=True, slots=True)
+class ListEntity:
+    """An entity a list call names, keyed so the call's relationships can refer to it.
+
+    `activity` marks a habit or recurring activity; `value`, `unit` and `quantity` are a
+    Metric's, and a Date's ISO value is its `value`.
+    """
+
+    key: str
+    span: str
+    name: str
+    type: str
+    activity: bool = False
+    value: str | None = None
+    unit: str | None = None
+    quantity: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ListRelationship:
+    """A relationship whose ends are roles, keys or item references such as `item:G1.2`."""
+
+    source: str
+    target: str
+    type: str
+    properties: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ListFacts:
+    """Entities and relationships a list call states beyond the group templates."""
+
+    entities: tuple[ListEntity, ...]
+    relationships: tuple[ListRelationship, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameOutput:
+    """The frame call's output: frame entities, one frame per group, and turn facts."""
+
+    frame_entities: tuple[ListEntity, ...]
+    groups: tuple[GroupFrame, ...]
+    facts: ListFacts
+
+
+@dataclass(frozen=True, slots=True)
+class ItemEntity:
+    """An item's own entity; for a table row, its first column's."""
+
+    span: str
+    name: str
+    type: str
+    activity: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ItemTemplate:
+    """Whether the group's templates hold for one item, and with what temporal fields."""
+
+    applies: bool
+    assertion_kind: str
+    temporal_status: str
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ItemOutput:
+    """One item's record from an item call."""
+
+    item: str
+    entity: ItemEntity | None
+    template: ItemTemplate
+    entities: tuple[ListEntity, ...]
+    relationships: tuple[ListRelationship, ...]
+
+
+@dataclass(slots=True)
+class _Run:
+    context: tuple[str, ...]
+    start: int
+    positions: list[int]
+    items: list[InputUnit]
+
+
+def _extends(context: tuple[str, ...], base: tuple[str, ...]) -> bool:
+    return len(context) > len(base) and context[: len(base)] == base
+
+
+def _parent(run: _Run, earlier: Sequence[tuple[str, _Run]]) -> tuple[str, str] | None:
+    """The nearest item before `run` whose group context plus its text is `run`'s context.
+
+    The item's text is compared as `split_structured` writes it into a child's context,
+    trailing colon and whitespace stripped, so a parent item "Postgres:" is found.
+    """
+    best: tuple[int, str, str] | None = None
+    for gid, other in earlier:
+        if len(other.context) + 1 != len(run.context) or other.context != run.context[:-1]:
+            continue
+        for n, (position, unit) in enumerate(zip(other.positions, other.items), start=1):
+            found = position < run.start and _as_context(unit.text) == run.context[-1]
+            if found and (best is None or position > best[0]):
+                best = (position, gid, f"{gid}.{n}")
+    return None if best is None else (best[1], best[2])
+
+
+def group_units(units: Sequence[InputUnit]) -> tuple[tuple[ListGroup, ...], tuple[InputUnit, ...]]:
+    """Group the list items and table rows of a turn, and return its prose units apart.
+
+    A unit closes every open group whose context it does not extend; a list item or table
+    row then joins the open group with its own context, or starts a new one.
+
+    Args:
+        units: The turn's units, from `split_structured`.
+
+    Returns:
+        The groups, numbered in the order they start, and the prose units in turn order.
+    """
+    runs: list[_Run] = []
+    open_runs: list[_Run] = []
+    prose: list[InputUnit] = []
+    for position, unit in enumerate(units):
+        is_item = unit.kind in _LIST_KINDS
+        joined: _Run | None = None
+        still_open: list[_Run] = []
+        for run in open_runs:
+            if _extends(unit.context, run.context):
+                still_open.append(run)
+            elif is_item and run.context == unit.context:
+                still_open.append(run)
+                joined = run
+        open_runs = still_open
+        if not is_item:
+            prose.append(unit)
+        elif joined is not None:
+            joined.positions.append(position)
+            joined.items.append(unit)
+        else:
+            run = _Run(unit.context, position, [position], [unit])
+            runs.append(run)
+            open_runs.append(run)
+
+    numbered = [(f"G{n}", run) for n, run in enumerate(runs, start=1)]
+    groups = tuple(
+        ListGroup(gid, run.context, tuple(run.items), _parent(run, numbered[:index]))
+        for index, (gid, run) in enumerate(numbered)
+    )
+    return groups, tuple(prose)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split("\n"))
+
+
+def _quoted(context: tuple[str, ...]) -> str:
+    return " > ".join(f'"{part}"' for part in context)
+
+
+def render_frame_input(groups: Sequence[ListGroup], prose: Sequence[InputUnit]) -> str:
+    """The turn as the frame and item calls read it: prose units, then each group.
+
+    Prose units are `P1`, `P2` in turn order. Each group's line names its context once
+    and its parent item, and its items follow, indented, under their ids. The full
+    utterance travels beside the render, so the prose-first order loses no text.
+    """
+    lines = []
+    for n, unit in enumerate(prose, start=1):
+        under = f"under {_quoted(unit.context)}: " if unit.context else ""
+        lines.append(f"P{n} {under}{_one_line(unit.text)}")
+    for group in groups:
+        head = group.gid
+        if group.context:
+            head += f" under {_quoted(group.context)}"
+        if group.parent is not None:
+            head += f" (parent {group.parent[1]})"
+        lines.append(head)
+        lines.extend(
+            f"  {item_id} {_one_line(unit.text)}"
+            for item_id, unit in zip(group.item_ids, group.items)
+        )
+    return "\n".join(lines)
+
+
+# -- strict parsers -------------------------------------------------------------------------
+
+_Check = Callable[[object], bool]
+
+
+def _text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _string(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _boolean(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _list(value: object) -> bool:
+    return isinstance(value, list)
+
+
+def _one_of(values: Sequence[str]) -> _Check:
+    allowed = frozenset(values)
+    return lambda value: isinstance(value, str) and value in allowed
+
+
+def _object_or_null(value: object) -> bool:
+    return value is None or isinstance(value, dict)
+
+
+_TYPE = _one_of(EXTRACTABLE_TYPE_ENUM)
+_PREDICATE = _one_of(PREDICATE_ENUM)
+_TEMPORAL_STATUS = _one_of(TEMPORAL_STATUS_ENUM)
+_ASSERTION_KIND = _one_of(ASSERTION_KIND_ENUM)
+
+_PROPERTY_CHECKS: dict[str, _Check] = {
+    "confidence": _number,
+    "temporal_status": _TEMPORAL_STATUS,
+    "start_date": _string,
+    "end_date": _string,
+    "temporal_expression": _string,
+    "context": _string,
+    "negated": _boolean,
+    "assertion_kind": _ASSERTION_KIND,
+}
+_ENTITY_REQUIRED: dict[str, _Check] = {"key": _text, "span": _text, "name": _text, "type": _TYPE}
+_ENTITY_OPTIONAL: dict[str, _Check] = {
+    "activity": _boolean,
+    "value": _string,
+    "unit": _string,
+    "quantity": _string,
+}
+
+
+def _record(
+    value: object,
+    where: str,
+    required: Mapping[str, _Check],
+    optional: Mapping[str, _Check] | None = None,
+) -> dict:
+    """The object's declared keys, each checked; an optional key given as null is left out.
+
+    Raises:
+        ListOutputError: `value` is not an object, misses a required key, holds an
+            undeclared key, or has a value its check refuses.
+    """
+    optional = optional or {}
+    if not isinstance(value, dict):
+        raise ListOutputError(f"{where}: expected an object, got {type(value).__name__}")
+    unknown = sorted(set(value) - set(required) - set(optional))
+    if unknown:
+        raise ListOutputError(f"{where}: undeclared keys {unknown}")
+    checked = {}
+    for key, check in required.items():
+        if key not in value:
+            raise ListOutputError(f"{where}: missing key {key!r}")
+        if not check(value[key]):
+            raise ListOutputError(f"{where}.{key}: wrong type or value {value[key]!r}")
+        checked[key] = value[key]
+    for key, check in optional.items():
+        if value.get(key) is None:
+            continue
+        if not check(value[key]):
+            raise ListOutputError(f"{where}.{key}: wrong type or value {value[key]!r}")
+        checked[key] = value[key]
+    return checked
+
+
+def _load(text: str) -> dict:
+    """The output's JSON object; a code fence or a line around it is tolerated, as Stage 2's is."""
+    if not text or not text.strip():
+        raise ListOutputError("empty list output")
+    for candidate in (text, *re.findall(r"\{.*\}", text, re.DOTALL)):
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ListOutputError(f"list output is not a JSON object: {text[:200]!r}")
+
+
+def _entities(values: list, where: str, taken: set[str]) -> tuple[ListEntity, ...]:
+    """Keyed entities; a key may not repeat, nor reuse a role or an earlier key in `taken`."""
+    entities = []
+    for n, value in enumerate(values):
+        record = _record(value, f"{where}[{n}]", _ENTITY_REQUIRED, _ENTITY_OPTIONAL)
+        if record["key"] in taken or record["key"] in _ROLES:
+            raise ListOutputError(f"{where}[{n}].key: {record['key']!r} is already taken")
+        taken.add(record["key"])
+        entities.append(ListEntity(**record))
+    return tuple(entities)
+
+
+def _relationships(values: list, where: str) -> tuple[ListRelationship, ...]:
+    relationships = []
+    for n, value in enumerate(values):
+        at = f"{where}[{n}]"
+        record = _record(
+            value,
+            at,
+            {"source": _text, "target": _text, "type": _PREDICATE},
+            {"properties": lambda v: isinstance(v, dict)},
+        )
+        properties = _record(record.pop("properties", {}), f"{at}.properties", {}, _PROPERTY_CHECKS)
+        relationships.append(ListRelationship(**record, properties=properties))
+    return tuple(relationships)
+
+
+def _facts(value: object, where: str, taken: set[str]) -> ListFacts:
+    record = _record(value, where, {"entities": _list, "relationships": _list})
+    return ListFacts(
+        entities=_entities(record["entities"], f"{where}.entities", taken),
+        relationships=_relationships(record["relationships"], f"{where}.relationships"),
+    )
+
+
+def _ordered(found: Mapping[str, object], expected: Sequence[str], what: str) -> list:
+    missing = [i for i in expected if i not in found]
+    if missing:
+        raise ListOutputError(f"missing {what} ids {missing}")
+    return [found[i] for i in expected]
+
+
+def _claim(found: dict, key: str, value: object, expected: set[str], what: str) -> None:
+    if key not in expected:
+        raise ListOutputError(f"unknown {what} id {key!r}")
+    if key in found:
+        raise ListOutputError(f"{what} id {key!r} given twice")
+    found[key] = value
+
+
+def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame:
+    record = _record(
+        value,
+        where,
+        {
+            "group": _text,
+            "templates": _list,
+            "item_type": lambda v: v is None or _TYPE(v),
+            "unchecked": _one_of(UNCHECKED_ENUM),
+        },
+    )
+    if len(record["templates"]) > _TEMPLATES_MAX:
+        raise ListOutputError(f"{where}.templates: more than {_TEMPLATES_MAX} templates")
+    role = _one_of(sorted(roles))
+    templates = tuple(
+        Template(
+            **_record(
+                t,
+                f"{where}.templates[{n}]",
+                {"subject": role, "predicate": _PREDICATE, "object": role},
+            )
+        )
+        for n, t in enumerate(record["templates"])
+    )
+    return GroupFrame(record["group"], templates, record["item_type"], record["unchecked"])
+
+
+def parse_frame_output(text: str, expected_groups: Sequence[str]) -> FrameOutput:
+    """Parse a frame call's output, its groups in `expected_groups` order.
+
+    Args:
+        text: The model's output.
+        expected_groups: The turn's group ids; the output must give each exactly once.
+
+    Raises:
+        ListOutputError: The output is not a JSON object of the FRAME shape, a
+            template names a role that is neither a fixed role nor a frame key, or the
+            group ids differ from `expected_groups`.
+    """
+    record = _record(
+        _load(text),
+        "frame",
+        {"frame_entities": _list, "groups": _list, "facts": lambda v: isinstance(v, dict)},
+    )
+    taken: set[str] = set()
+    frame_entities = []
+    for n, value in enumerate(record["frame_entities"]):
+        at = f"frame_entities[{n}]"
+        entity = ListEntity(**_record(value, at, _ENTITY_REQUIRED))
+        if entity.key in taken or entity.key in _ROLES:
+            raise ListOutputError(f"{at}.key: {entity.key!r} is already taken")
+        taken.add(entity.key)
+        frame_entities.append(entity)
+    roles = _ROLES | taken
+    found: dict[str, GroupFrame] = {}
+    for n, value in enumerate(record["groups"]):
+        group = _group_frame(value, f"groups[{n}]", roles)
+        _claim(found, group.group, group, set(expected_groups), "group")
+    groups = _ordered(found, expected_groups, "group")
+    return FrameOutput(
+        tuple(frame_entities), tuple(groups), _facts(record["facts"], "facts", taken)
+    )
+
+
+def _item_output(value: object, where: str) -> ItemOutput:
+    record = _record(
+        value,
+        where,
+        {
+            "item": _text,
+            "entity": _object_or_null,
+            "template": lambda v: isinstance(v, dict),
+            "entities": _list,
+            "relationships": _list,
+        },
+    )
+    entity = None
+    if record["entity"] is not None:
+        entity = ItemEntity(
+            **_record(
+                record["entity"],
+                f"{where}.entity",
+                {"span": _text, "name": _text, "type": _TYPE},
+                {"activity": _boolean},
+            )
+        )
+    template = ItemTemplate(
+        **_record(
+            record["template"],
+            f"{where}.template",
+            {
+                "applies": _boolean,
+                "assertion_kind": _ASSERTION_KIND,
+                "temporal_status": _TEMPORAL_STATUS,
+            },
+            {"start_date": _string, "end_date": _string},
+        )
+    )
+    return ItemOutput(
+        item=record["item"],
+        entity=entity,
+        template=template,
+        entities=_entities(record["entities"], f"{where}.entities", set()),
+        relationships=_relationships(record["relationships"], f"{where}.relationships"),
+    )
+
+
+def parse_item_output(text: str, expected: Sequence[str]) -> tuple[ItemOutput, ...]:
+    """Parse an item call's output, one record per id in `expected`, in that order.
+
+    Raises:
+        ListOutputError: The output is not a JSON object of the ITEMS shape, or its item
+            ids differ from `expected`.
+    """
+    record = _record(_load(text), "items", {"items": _list})
+    found: dict[str, ItemOutput] = {}
+    for n, value in enumerate(record["items"]):
+        item = _item_output(value, f"items[{n}]")
+        _claim(found, item.item, item, set(expected), "item")
+    return tuple(_ordered(found, expected, "item"))
