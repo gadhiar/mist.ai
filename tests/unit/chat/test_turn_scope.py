@@ -114,6 +114,11 @@ class TestTurnScope:
         assert scope.ws_events == []
         assert scope.drain_ws_events() == []
 
+    def test_a_fresh_scope_has_no_trace_builder(self):
+        scope = TurnScope(session_id="s", turn_index=1)
+
+        assert (scope.trace, scope.trace_failed, scope.tool_call_index) == (None, False, 0)
+
     def test_scopes_do_not_share_an_event_buffer(self):
         a = TurnScope(session_id="a", turn_index=1)
         b = TurnScope(session_id="b", turn_index=2)

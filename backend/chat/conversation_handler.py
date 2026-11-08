@@ -982,23 +982,13 @@ class ConversationHandler:
         self._slop_max_regen_attempts = 2
 
         # Source of `TurnScope.turn_index`. Per-turn state (the ADR-017
-        # FE-bound event buffer, session id, turn index) lives on the
-        # `TurnScope` each turn creates, not on this shared handler, so
-        # concurrent turns in different sessions cannot see each other's
-        # events. The counter itself stays handler-wide and monotonic: a
+        # FE-bound event buffer, session id, turn index, retrieval trace)
+        # lives on the `TurnScope` each turn creates, not on this shared
+        # handler, so overlapping turns cannot see each other's events or
+        # trace. The counter itself stays handler-wide and monotonic: a
         # session's graph seeds keep the values they had when the index was a
         # handler attribute.
         self._turn_indices = itertools.count(1)
-
-        # Retrieval trace (`retrieval_context["trace"]`): one builder per turn,
-        # made in `open_turn` and dropped once `commit_turn` has rendered it,
-        # so a feed outside a turn is a no-op. A builder
-        # error marks the turn's trace failed instead of breaking the turn.
-        # `_turn_tool_call` is the 1-based position of the tool call being
-        # dispatched, which the trace records as `call`.
-        self._turn_trace: TurnTraceBuilder | None = None
-        self._turn_trace_failed: bool = False
-        self._turn_tool_call: int = 0
 
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
@@ -1049,15 +1039,16 @@ class ConversationHandler:
         # Fed after the `try`, so no trace error can be caught there and
         # change the tool result the model gets.
         self._feed_trace(
+            scope,
             lambda trace: trace.tool_retrieved(
                 "query_knowledge_graph",
-                call=self._turn_tool_call,
+                call=scope.tool_call_index,
                 limit=limit,
                 candidates=result.candidates,
                 unlisted_refs=(
                     _kg_compact_unlisted_refs(result.facts) if verbosity == "compact" else ()
                 ),
-            )
+            ),
         )
         return tool_result
 
@@ -1136,7 +1127,7 @@ class ConversationHandler:
 
         # Fed after the `try`, so no trace error can be caught there and
         # change the tool result the model gets.
-        self._trace_vault_tool(result, facts_before, limit)
+        self._trace_vault_tool(scope, result, facts_before, limit)
         return tool_result
 
     async def _query_vault(
@@ -1230,50 +1221,59 @@ class ConversationHandler:
             trace.auto_inject_ran(retrieval_result.candidates, limit=limit)
 
     def _trace_vault_tool(
-        self, result: RetrievalResult, facts_before: list[RetrievedFact], limit: int
+        self,
+        scope: TurnScope,
+        result: RetrievalResult,
+        facts_before: list[RetrievedFact],
+        limit: int,
     ) -> None:
         """Feed one `query_vault` retrieval to the turn's trace, with its profile dedup."""
         self._feed_trace(
+            scope,
             lambda trace: trace.tool_retrieved(
                 "query_vault",
-                call=self._turn_tool_call,
+                call=scope.tool_call_index,
                 limit=limit,
                 candidates=result.candidates,
                 deduped_refs=refs_removed(facts_before, result.facts),
-            )
+            ),
         )
 
-    def _feed_trace(self, feed: Callable[[TurnTraceBuilder], None]) -> None:
-        """Run one feed against the turn's trace builder, if the turn has one.
+    def _feed_trace(
+        self, scope: TurnScope | None, feed: Callable[[TurnTraceBuilder], None]
+    ) -> None:
+        """Run one feed against `scope`'s trace builder, if it has one.
 
-        The trace records a turn; it must never change or break one. A
-        builder error marks the turn's trace failed, logged by class only so
-        no fact text reaches the log, and later feeds this turn are skipped.
+        A no-op without a scope (a direct `_build_messages` call), on a scope
+        with no builder (built outside `open_turn`, or already committed),
+        or once the turn's trace has failed. The trace records a turn; it
+        must never change or break one. A builder error marks the turn's
+        trace failed, logged by class only so no fact text reaches the log,
+        and later feeds this turn are skipped.
         """
-        trace = self._turn_trace
-        if trace is None or self._turn_trace_failed:
+        if scope is None or scope.trace is None or scope.trace_failed:
             return
         try:
-            feed(trace)
+            feed(scope.trace)
         except (TypeError, ValueError, KeyError) as exc:
-            self._turn_trace_failed = True
+            scope.trace_failed = True
             logger.error("[TRACE] Retrieval trace builder failed: %s", type(exc).__name__)
 
-    def _turn_trace_payload(self) -> dict[str, Any] | None:
-        """Render the turn's trace for `retrieval_context["trace"]`.
+    def _turn_trace_payload(self, scope: TurnScope) -> dict[str, Any] | None:
+        """Render `scope`'s trace for `retrieval_context["trace"]`.
 
-        None outside a turn. `trace_failed()` when a feed or the render
-        failed, so the row still says a trace was attempted.
+        None when the scope has no builder. `trace_failed()` when a feed or
+        the render failed, so the row still says a trace was attempted.
         """
-        trace = self._turn_trace
+        trace = scope.trace
         if trace is None:
             return None
-        if self._turn_trace_failed:
+        if scope.trace_failed:
             return trace_failed()
         try:
             return trace.build()
         except (TypeError, ValueError, KeyError) as exc:
-            self._turn_trace_failed = True
+            scope.trace_failed = True
             logger.error("[TRACE] Retrieval trace render failed: %s", type(exc).__name__)
             return trace_failed()
 
@@ -1378,7 +1378,7 @@ class ConversationHandler:
         # and JSONL records all join on ONE tool_call_id (ADR-017 UUID
         # convention); mint only when the provider sent none.
         tool_call_id = tool_call.id or str(uuid.uuid4())
-        self._turn_tool_call += 1
+        scope.tool_call_index += 1
         scope.emit(
             {
                 "type": "tool_call_started",
@@ -1682,9 +1682,7 @@ class ConversationHandler:
         )
         if not request.held:
             scope.dispatch_gate.set()
-        self._turn_trace = TurnTraceBuilder()
-        self._turn_trace_failed = False
-        self._turn_tool_call = 0
+        scope.trace = TurnTraceBuilder()
         return scope
 
     def prefetch(self, session_id: str, partial_text: str | None) -> None:
@@ -2095,7 +2093,8 @@ class ConversationHandler:
         # Fed after the retrieval's own `try`, so a trace error can never be
         # caught there and turn into a failed retrieval.
         self._feed_trace(
-            lambda trace: self._trace_auto_inject(trace, auto_inject_enabled, retrieval_result)
+            scope,
+            lambda trace: self._trace_auto_inject(trace, auto_inject_enabled, retrieval_result),
         )
 
         mist_context = await self._get_or_fetch_mist_context(session_id)
@@ -2106,6 +2105,7 @@ class ConversationHandler:
             mist_context=mist_context,
             max_output_tokens=self.config.llm.conversation_max_tokens,
             pending_user_message=user_message,
+            scope=scope,
         )
         scope.context_window = messages
         scope.retrieval_result = retrieval_result
@@ -2363,8 +2363,8 @@ class ConversationHandler:
         # Rendered once for both write paths below, then dropped, so a feed
         # after the commit (a shielded tool finishing late, a direct
         # `_build_messages` call) reaches no builder.
-        trace = self._turn_trace_payload()
-        self._turn_trace = None
+        trace = self._turn_trace_payload(scope)
+        scope.trace = None
 
         session.add_message("user", user_message)
         if delivery.outcome == "error":
@@ -3453,6 +3453,7 @@ class ConversationHandler:
         max_output_tokens: int = 400,
         *,
         pending_user_message: str | None = None,
+        scope: TurnScope | None = None,
     ) -> list[dict[str, str]]:
         """Build message list for LLM.
 
@@ -3483,6 +3484,9 @@ class ConversationHandler:
                 commit adds it). History is built as if it had been
                 appended, so the prompt is the same as when the message was
                 written to history before the turn ran.
+            scope: The turn whose trace receives the profile-dedup and
+                budget feeds. None (a direct call outside a turn) feeds
+                nothing.
 
         Returns:
             List of messages for LLM, budget-compliant when planner is active.
@@ -3515,9 +3519,10 @@ class ConversationHandler:
             facts_before = retrieval_result.facts
             self._dedup_profile_from_retrieval(retrieval_result, profile_path)
             self._feed_trace(
+                scope,
                 lambda trace: trace.auto_inject_profile_dedup(
                     refs_removed(facts_before, retrieval_result.facts)
-                )
+                ),
             )
 
         # Live-data advisory is a fixed-cost segment when present.
@@ -3571,7 +3576,9 @@ class ConversationHandler:
             history = plan.pruned_history
             # Covers the minimal fallback too: a plan that does not fit is
             # recorded with `fits` false, and its facts as `dropped_no_fit`.
-            self._feed_trace(lambda trace: trace.budget_planned(plan, history_raw=len(raw_history)))
+            self._feed_trace(
+                scope, lambda trace: trace.budget_planned(plan, history_raw=len(raw_history))
+            )
             if not plan.fits:
                 logger.warning(
                     "[BUDGET] Context budget exceeded: fixed_cost=%d total_budget=%d. "
