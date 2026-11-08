@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from backend.realtime.errors import RealtimeError
 from backend.realtime.speech import (
     CancelToken,
     SynthChunk,
@@ -84,24 +85,50 @@ class ScriptedTranscriptStream:
     """Reveals the utterance's words as audio arrives: one word per `ms_per_word` pushed.
 
     `stable_chars` follows the Whisper adapter's rule, the longest common word prefix of the
-    last two partials; the final is the whole text, all of it stable.
+    last two partials; the final is the whole text, all of it stable. `on_decode` runs inside
+    each decode, before its result is recorded, so a test can hold a decode in flight or close
+    the stream under it.
     """
 
-    def __init__(self, utterance: ScriptedUtterance, *, ms_per_word: int) -> None:
+    def __init__(
+        self,
+        utterance: ScriptedUtterance,
+        *,
+        ms_per_word: int,
+        on_decode: Callable[[], object] | None = None,
+    ) -> None:
         self.utterance = utterance
         self.ms_per_word = ms_per_word
+        self.on_decode = on_decode
         self.pushed: list[int] = []
         self.partials: list[TranscriptUpdate] = []
         self.finals: list[TranscriptUpdate] = []
+        self.closed = False
 
     @property
     def audio_ms(self) -> int:
         return sum(self.pushed) * 1000 // STT_SAMPLE_RATE
 
     def push(self, pcm: np.ndarray) -> None:
+        self._check_open("push")
         self.pushed.append(len(pcm))
 
+    def close(self) -> None:
+        self.closed = True
+
+    def _check_open(self, action: str) -> None:
+        if self.closed:
+            raise RealtimeError(f"transcript stream is closed: cannot {action}")
+
+    def _decoding(self) -> None:
+        """Stand in for the decode's model time; a close landing here discards the result."""
+        self._check_open("decode")
+        if self.on_decode is not None:
+            self.on_decode()
+
     def decode_partial(self, token: CancelToken) -> TranscriptUpdate:
+        self._decoding()
+        self._check_open("return a partial")
         words = self.utterance.text.split()
         text = " ".join(words[: self.audio_ms // self.ms_per_word])
         previous = self.partials[-1].text if self.partials else ""
@@ -117,6 +144,8 @@ class ScriptedTranscriptStream:
         return update
 
     def decode_final(self, token: CancelToken) -> TranscriptUpdate:
+        self._decoding()
+        self._check_open("return a final")
         text = self.utterance.text
         update = TranscriptUpdate(
             text,
@@ -139,9 +168,11 @@ class ScriptedTranscriber:
         *,
         model_id: str = "scripted-stt",
         ms_per_word: int = 200,
+        on_decode: Callable[[], object] | None = None,
     ) -> None:
         self.model_id = model_id
         self.ms_per_word = ms_per_word
+        self.on_decode = on_decode
         self.script = [
             item if isinstance(item, ScriptedUtterance) else ScriptedUtterance(item)
             for item in script
@@ -151,7 +182,9 @@ class ScriptedTranscriber:
     def open_stream(self) -> ScriptedTranscriptStream:
         index = len(self.streams)
         utterance = self.script[index] if index < len(self.script) else ScriptedUtterance("")
-        stream = ScriptedTranscriptStream(utterance, ms_per_word=self.ms_per_word)
+        stream = ScriptedTranscriptStream(
+            utterance, ms_per_word=self.ms_per_word, on_decode=self.on_decode
+        )
         self.streams.append(stream)
         return stream
 

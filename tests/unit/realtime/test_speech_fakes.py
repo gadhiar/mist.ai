@@ -10,6 +10,7 @@ deterministic: the same input or seed gives the same output, run after run.
 import ast
 import dataclasses
 import inspect
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 
 from backend.realtime import speech
+from backend.realtime.errors import RealtimeError
 from backend.realtime.speech import (
     CancelToken,
     SynthChunk,
@@ -38,6 +40,7 @@ from tests.fakes.speech import (
     EnergyVad,
     FakeSynthesizer,
     ScriptedTranscriber,
+    ScriptedTranscriptStream,
     ScriptedTurnEnd,
     ScriptedUtterance,
 )
@@ -150,6 +153,7 @@ class TestProtocols:
         assert _params(speech.TranscriptStream.push) == ["self", "pcm"]
         assert _params(speech.TranscriptStream.decode_partial) == ["self", "token"]
         assert _params(speech.TranscriptStream.decode_final) == ["self", "token"]
+        assert _params(speech.TranscriptStream.close) == ["self"]
 
     def test_synthesizer_protocol_matches_the_design_doc(self):
         assert speech.SpeechSynthesizer.__annotations__ == {
@@ -286,6 +290,91 @@ class TestScriptedTranscriber:
         stream.push(np.zeros(256, dtype=np.float32))
 
         assert stream.pushed == [512, 256]
+
+
+class TestTranscriptStreamClose:
+    """The owner closes a stream once; a release or a cut may close it under a running decode."""
+
+    def test_a_second_close_does_nothing(self):
+        stream = ScriptedTranscriber(["hi"]).open_stream()
+        stream.push(np.zeros(512, dtype=np.float32))
+
+        stream.close()
+        stream.close()
+
+        assert stream.closed is True
+        assert stream.pushed == [512]
+        assert stream.partials == []
+        assert stream.finals == []
+
+    def test_a_partial_decode_in_flight_at_close_has_its_result_discarded(self):
+        streams: list[ScriptedTranscriptStream] = []
+        transcriber = ScriptedTranscriber(
+            ["turn on the lights"], on_decode=lambda: streams[0].close()
+        )
+        streams.append(transcriber.open_stream())
+        streams[0].push(np.zeros(6400, dtype=np.float32))
+
+        with pytest.raises(RealtimeError, match="closed"):
+            streams[0].decode_partial(CancelToken())
+
+        assert streams[0].partials == []
+
+    def test_a_final_decode_in_flight_at_close_has_its_result_discarded(self):
+        streams: list[ScriptedTranscriptStream] = []
+        transcriber = ScriptedTranscriber(["hi"], on_decode=lambda: streams[0].close())
+        streams.append(transcriber.open_stream())
+
+        with pytest.raises(RealtimeError, match="closed"):
+            streams[0].decode_final(CancelToken())
+
+        assert streams[0].finals == []
+
+    def test_a_partial_decode_in_flight_on_another_thread_is_discarded(self):
+        started, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        stream = ScriptedTranscriber(["turn on"], on_decode=hold).open_stream()
+        stream.push(np.zeros(6400, dtype=np.float32))
+        outcome: list[object] = []
+
+        def decode() -> None:
+            try:
+                outcome.append(stream.decode_partial(CancelToken()))
+            except RealtimeError as exc:
+                outcome.append(exc)
+
+        worker = threading.Thread(target=decode)
+        worker.start()
+        assert started.wait(timeout=5)
+        stream.close()
+        release.set()
+        worker.join(timeout=5)
+
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], RealtimeError)
+        assert stream.partials == []
+
+    def test_a_push_after_close_raises_realtime_error(self):
+        stream = ScriptedTranscriber(["hi"]).open_stream()
+        stream.close()
+
+        with pytest.raises(RealtimeError, match="closed"):
+            stream.push(np.zeros(512, dtype=np.float32))
+
+        assert stream.pushed == []
+
+    def test_a_decode_started_after_close_raises_realtime_error(self):
+        stream = ScriptedTranscriber(["hi"]).open_stream()
+        stream.close()
+
+        with pytest.raises(RealtimeError, match="closed"):
+            stream.decode_partial(CancelToken())
+        with pytest.raises(RealtimeError, match="closed"):
+            stream.decode_final(CancelToken())
 
 
 class TestScriptedTurnEnd:
