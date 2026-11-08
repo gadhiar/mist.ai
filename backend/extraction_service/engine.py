@@ -22,11 +22,11 @@ import importlib
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import ModuleType
-from typing import Any
+from typing import Any, TypeVar
 
 from openai import APIError
 from pydantic import ValidationError
@@ -88,6 +88,9 @@ from backend.llm.models import LLMRequest
 from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
+
+# What a Stage 2 call's strict parser returns: a payload for an r6 batch.
+_Parsed = TypeVar("_Parsed")
 
 # Exceptions a failed LLM transport call surfaces as, across the openai
 # client (APIError and its APIConnectionError/APIStatusError/RateLimitError
@@ -203,10 +206,18 @@ class ExtractionTimeoutError(ExtractionServiceError):
 
 
 class _OutputTruncatedError(ExtractionServiceError):
-    """A Stage 2 output stopped at `EXTRACT_MAX_TOKENS` (`finish_reason == "length"`).
+    """A Stage 2 output stopped at its call's `max_tokens` (`finish_reason == "length"`).
 
     Internal to Stage 2: the batch is split and retried, and only a single
     unit cut short leaves the engine, as `UpstreamLLMError`.
+    """
+
+
+class _OutputUnparsableError(UpstreamLLMError):
+    """A Stage 2 output stayed unparsable after the attempts its call was allowed.
+
+    A subclass of `UpstreamLLMError`, so a caller that does not fall back sees
+    what it saw before the attempt loop was shared between stages.
     """
 
 
@@ -628,22 +639,56 @@ class ExtractionEngine:
         """
         start = time.perf_counter()
         try:
-            return await self._extract_attempts(batch_input, run)
+            return await self._extract_attempts(
+                render_extraction_messages(batch_input),
+                run,
+                max_tokens=EXTRACT_MAX_TOKENS,
+                schema=EXTRACTION_OUTPUT_SCHEMA,
+                parse=_strict_extraction_payload,
+                repair=_REPAIR_INSTRUCTION,
+            )
         finally:
             run.elapsed_ms += (time.perf_counter() - start) * 1000
 
     async def _extract_attempts(
-        self, batch_input: PreProcessedInput, run: _Stage2Run
-    ) -> ExtractionPayload:
-        messages = render_extraction_messages(batch_input)
+        self,
+        messages: list[dict],
+        run: _Stage2Run,
+        *,
+        max_tokens: int,
+        schema: dict,
+        parse: Callable[[str], _Parsed],
+        repair: str,
+    ) -> _Parsed:
+        """One Stage 2 call sequence: strict parse with repair-retry up to `max_attempts`.
+
+        Each stage passes its own limit, schema, strict parser and repair text,
+        so the r6 batches and the list calls share the attempt count, the
+        timeout and the error mapping. Every attempt passes `stage="extract"`,
+        so the adapter treats them alike.
+
+        Args:
+            messages: The first attempt's messages; each repair appends the
+                failed output and `repair`.
+            run: The turn's Stage 2 totals, which every attempt adds to.
+            max_tokens: The call's output limit.
+            schema: The output schema sent in `schema` constrained mode.
+            parse: The strict parser; an `ExtractionValidationError` from it
+                gets the repair retry.
+            repair: The instruction sent after a failed output.
+
+        Raises:
+            ExtractionTimeoutError: An attempt exceeded the LLM timeout.
+            UpstreamLLMError: The LLM call failed.
+            _OutputUnparsableError: Every attempt's output stayed unparsable.
+            _OutputTruncatedError: An output stopped at `max_tokens`.
+        """
         last_error: Exception | None = None
 
         for attempt in range(1, self._settings.max_attempts + 1):
             run.calls += 1
             run.attempts = max(run.attempts, attempt)
-            request = self._build_request(
-                messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
-            )
+            request = self._build_request(messages=messages, max_tokens=max_tokens, schema=schema)
             request = self._adapter.prepare(request, stage="extract")
 
             try:
@@ -658,12 +703,12 @@ class ExtractionEngine:
 
             if response.finish_reason == "length":
                 raise _OutputTruncatedError(
-                    f"Extraction output reached max_tokens={EXTRACT_MAX_TOKENS}"
+                    f"Extraction output reached max_tokens={max_tokens}"
                     f" (attempt {attempt}/{self._settings.max_attempts})"
                 )
             raw = self._adapter.final_text(response)
             try:
-                payload = _strict_extraction_payload(raw)
+                parsed = parse(raw)
             except ExtractionValidationError as exc:
                 last_error = exc
                 logger.warning(
@@ -675,13 +720,13 @@ class ExtractionEngine:
                 messages = [
                     *messages,
                     {"role": "assistant", "content": raw},
-                    {"role": "user", "content": _REPAIR_INSTRUCTION},
+                    {"role": "user", "content": repair},
                 ]
                 continue
 
-            return payload
+            return parsed
 
-        raise UpstreamLLMError(
+        raise _OutputUnparsableError(
             f"Extraction output unparsable after {self._settings.max_attempts} attempts"
         ) from last_error
 
