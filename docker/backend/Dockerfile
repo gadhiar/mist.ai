@@ -4,15 +4,40 @@ FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# System dependencies (curl for health checks, libportaudio2 for sounddevice)
+# System dependencies (curl for health checks and the interpreter download, libportaudio2 for sounddevice)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3.11-dev python3-pip \
-    libsndfile1 libportaudio2 ffmpeg git wget curl \
+    ca-certificates libsndfile1 libportaudio2 ffmpeg git wget curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set python3.11 as default
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+# Interpreter: CPython from a python-build-standalone release archive, not Ubuntu 22.04's apt
+# python3.11. The apt package is 3.11.0rc1, a release candidate, and NeMo's TorchScript compile
+# segfaults on it. The archive is pinned by release tag and sha256, so a rebuild installs the same
+# bytes; a new 3.11 patch release is a bump of the three ARGs. The build then checks the version
+# and release level, the CA store the bundled OpenSSL finds, and the SQLite extension loading and
+# FTS5 the vault index needs, so a bad archive fails here rather than in the backend.
+# /opt/python/bin goes first on PATH so that `python -m venv` below runs this interpreter: a venv
+# records the directory of the `python` that created it as its `home` and finds its standard
+# library from there.
+ARG PYTHON_VERSION=3.11.18
+ARG PYTHON_BUILD_STANDALONE_RELEASE=20261026
+ARG PYTHON_ARCHIVE_SHA256=a87ee63646c8f8438b7af3954b2135ed2af91d033c631f12a8f20af903046d06
+RUN curl --fail --silent --show-error --location --proto '=https' -o /tmp/python.tar.gz \
+        "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_STANDALONE_RELEASE}/cpython-${PYTHON_VERSION}%2B${PYTHON_BUILD_STANDALONE_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz" \
+    && echo "${PYTHON_ARCHIVE_SHA256}  /tmp/python.tar.gz" | sha256sum --check --strict \
+    && mkdir /opt/python \
+    && tar -xzf /tmp/python.tar.gz -C /opt/python --strip-components=1 --no-same-owner \
+    && rm /tmp/python.tar.gz \
+    && ln -sf python3.11 /opt/python/bin/python \
+    && /opt/python/bin/python3.11 -c "import glob, os, platform, sqlite3, ssl, sys; \
+        v = platform.python_version(); \
+        assert v == '${PYTHON_VERSION}' and sys.version_info.releaselevel == 'final', (v, sys.version_info); \
+        p = ssl.get_default_verify_paths(); \
+        assert (p.cafile and os.path.isfile(p.cafile)) or (p.capath and glob.glob(os.path.join(p.capath, '*.0'))), p; \
+        c = sqlite3.connect(':memory:'); \
+        c.enable_load_extension(True); \
+        c.execute('CREATE VIRTUAL TABLE t USING fts5(x)'); \
+        print('CPython', v, sys.version_info.releaselevel, ssl.OPENSSL_VERSION, 'SQLite', sqlite3.sqlite_version)"
+ENV PATH="/opt/python/bin:$PATH"
 
 # Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root execution.
 # Create appuser UID 1000 (matches the conventional first user on Linux hosts
