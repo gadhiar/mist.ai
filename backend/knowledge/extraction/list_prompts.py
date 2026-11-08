@@ -82,7 +82,7 @@ _REFERENCE_DATE = _block("## REFERENCE DATE", "## EXAMPLES")
 _EXAMPLES = _block("## EXAMPLES", None)
 
 _LIST_OUTPUT = f"""## LIST OUTPUT SCHEMA
-A list turn is extracted in two stages, and the user message names the stage. Return that stage's JSON object with its keys in the order shown. A key marked ? is optional: leave it out when it has no value.
+A list turn is extracted in two stages; the user message names the stage. Return that stage's JSON object, keys in the order shown. Leave out a key marked ? when it has no value.
 
 Stage FRAME:
 {_skeleton(LIST_FRAME_OUTPUT_SCHEMA)}
@@ -90,70 +90,70 @@ Stage FRAME:
 Stage ITEMS:
 {_skeleton(LIST_ITEM_OUTPUT_SCHEMA)}
 
-- frame_entities: what a lead-in, heading or parent item names, keyed f1, f2.
-- groups: one per group in Units. templates: at most 3 facts every item of the group states; subject and object are roles: user, mist (MIST itself), item (each item's own entity), parent (the item a nested group is under) or a frame key. item_type: the type every item shares, or null. unchecked: see LIST RULES 3.
-- facts: facts of the prose units and of the frame itself, entities keyed e1, e2.
-- items: one record per item id the user message asks for. entity: the item's own entity, or null. template: whether the group's templates hold for this item (applies), with their assertion_kind, temporal_status and dates. entities and relationships: only facts the templates do not already state.
+- frame_entities: each entity a lead-in, heading or parent item names, keyed f1, f2; facts never repeat one.
+- groups: one per group in Units. durable: false only per LIST RULES 5, with no templates. templates: at most 3 facts every item of the group states; subject and object are roles: user, mist (MIST itself), item (each item's own entity), parent (the item a nested group is under) or a frame key; the predicate must admit the type at each end. item_type: the type every item shares, or null; required when a template names item. unchecked: see LIST RULES 3.
+- facts: edges of the prose units and the frame, entities keyed e1, e2 for what only prose names.
+- items: one record per item id asked for. template first: whether the group's templates hold for this item (applies), with their assertion_kind, temporal_status and dates; applies false when the item's type does not fit a template. entity: the item's own entity, or null; required when applies is true and a template names item. entities and relationships: only facts the templates do not already state.
 - An endpoint is a role, a frame or entity key, or another item as item:G1.2.
 
 """
 
 _LIST_RULES = """## LIST RULES
 Units is the utterance cut into prose units (P1, P2) and groups (G1, G2) of items (G1.1, G1.2), each group under the heading, lead-in or parent item it follows.
-1. Read each item as a sentence that completes the line above it: "Weekend kit:" then "- Brindlecraft" reads "I use Brindlecraft". That line sets the subject or the predicate, which FRAME writes once as the group's templates. It is an entity only when it names one, such as an organization or a project.
+1. Read each item as a sentence that completes the line above it: "Read in June:" then "- Harrow Gate" reads "I read Harrow Gate". That line sets the subject or the predicate, which FRAME writes once as the group's templates, with a predicate the item type fits, chosen as for prose; the examples' predicates are not defaults. The line is an entity only when it names one, such as an organization, a project or a service.
 2. An item that refers back ("the second one", "both of them") points at the earlier item as item:G1.2 and makes no new entity. An option that was only listed, which nobody chose, gets no edge: applies false.
 3. Checkboxes: [x] states a done fact. [ ] is a plan and gets no edge; unchecked is plan. When the lead-in names goals, unchecked is goal, and each [ ] item becomes user HAS_GOAL item.
 4. Tables: the header row names the columns, and each row is one fact about its first column, whose entity is the row's entity.
-5. A list with nothing durable (an errand list) gets no templates, and its items return entity null, applies false and no facts.
-6. Copy every span exactly from the utterance. A Goal span is the goal's verb phrase. An Event's name, and an activity's (activity true: a habit or recurring activity), is the bare noun, with no date and no possessor. A Metric gives value, unit and quantity. A Date's value is its ISO date, resolved against the reference date.
+5. A list with nothing durable (an errand list) gets durable false and no templates; its items return entity null, applies false and no facts. A table whose fact is in each row gets durable true, no templates, and each item's own facts.
+6. Copy every span exactly from the utterance. An item's span is the name alone, without a qualifier joined with no comma ("X for work") or a recurrence ("X every Monday"). A Goal span is the goal's verb phrase. An Event's name, and an activity's (activity true: a habit or recurring activity, user HAS_HABIT), is the bare noun, with no date and no possessor. A Metric gives value, unit and quantity. A Date's value is its ISO date, resolved against the reference date.
 7. Where a rule returns an empty extraction, return the stage's object with empty lists.
 
 """
 
 _EXAMPLES_INTRO = (
-    "The EXAMPLES below show which facts to extract. They use the prose output; "
-    "the list stages carry the same facts in their own keys.\n\n"
+    "The EXAMPLES below show which facts to extract, in the prose output; "
+    "the list stages carry them in their own keys.\n\n"
 )
 
 _LIST_EXAMPLES = """
 ## LIST EXAMPLES
 
-### List example 1: an organization in the lead-in, a nested group, an item the frame does not hold for, a back-reference
-Subject scope: user-scope
-Utterance: "Tools I use at Thrennic:\\n- Quorvane\\n- Brellix, though I'm only starting on it\\n- Ostrel:\\n  - Velquist\\nI like the first one most."
+### List example 1: people, a nested group, an item no template admits
+Utterance: "My team at Thrennic:\\n- Ilsa Torv for reviews\\n- Tobin Hale, who works on:\\n  - Ostrel\\n- Corvel, our bot"
 Units:
-P1 I like the first one most.
-G1 under "Tools I use at Thrennic"
-  G1.1 Quorvane
-  G1.2 Brellix, though I'm only starting on it
-  G1.3 Ostrel:
-G2 under "Tools I use at Thrennic" > "Ostrel" (parent G1.3)
-  G2.1 Velquist
+G1 under "My team at Thrennic"
+  G1.1 Ilsa Torv for reviews
+  G1.2 Tobin Hale, who works on:
+  G1.3 Corvel, our bot
+G2 under "My team at Thrennic" > "Tobin Hale, who works on" (parent G1.2)
+  G2.1 Ostrel
 FRAME output:
-{"frame_entities": [{"key": "f1", "span": "Thrennic", "name": "Thrennic", "type": "Organization"}], "groups": [{"group": "G1", "durable": true, "templates": [{"subject": "user", "predicate": "USES", "object": "item"}], "item_type": "Technology", "unchecked": "plan"}, {"group": "G2", "durable": true, "templates": [{"subject": "user", "predicate": "USES", "object": "item"}, {"subject": "item", "predicate": "DEPENDS_ON", "object": "parent"}], "item_type": "Technology", "unchecked": "plan"}], "facts": {"entities": [], "relationships": [{"source": "user", "target": "f1", "type": "WORKS_AT"}, {"source": "user", "target": "item:G1.1", "type": "PREFERS"}]}}
+{"frame_entities": [{"key": "f1", "span": "Thrennic", "name": "Thrennic", "type": "Organization"}], "groups": [{"group": "G1", "durable": true, "templates": [{"subject": "user", "predicate": "KNOWS_PERSON", "object": "item"}, {"subject": "item", "predicate": "MEMBER_OF", "object": "f1"}], "item_type": "Person", "unchecked": "plan"}, {"group": "G2", "durable": true, "templates": [{"subject": "parent", "predicate": "WORKS_ON", "object": "item"}], "item_type": "Project", "unchecked": "plan"}], "facts": {"entities": [], "relationships": [{"source": "user", "target": "f1", "type": "WORKS_AT"}]}}
 Frames:
 f1 Thrennic (Organization)
-G1: each item is the object of user USES; item type Technology
-G2: each item is the object of user USES; each item is the subject of DEPENDS_ON parent G1.3; item type Technology
-ITEMS G1.1, G1.2, G1.3, G2.1 output:
-{"items": [{"item": "G1.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Quorvane", "name": "Quorvane", "type": "Technology"}, "entities": [], "relationships": []}, {"item": "G1.2", "template": {"applies": false, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Brellix", "name": "Brellix", "type": "Technology"}, "entities": [], "relationships": [{"source": "user", "target": "item", "type": "LEARNING"}]}, {"item": "G1.3", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Ostrel", "name": "Ostrel", "type": "Technology"}, "entities": [], "relationships": []}, {"item": "G2.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Velquist", "name": "Velquist", "type": "Technology"}, "entities": [], "relationships": []}]}
+G1: each item is the object of user KNOWS_PERSON; each item is the subject of MEMBER_OF f1; item type Person
+G2: each item is the object of parent G1.2 WORKS_ON; item type Project
+ITEMS output:
+{"items": [{"item": "G1.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Ilsa Torv", "name": "Ilsa Torv", "type": "Person"}, "entities": [], "relationships": []}, {"item": "G1.2", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Tobin Hale", "name": "Tobin Hale", "type": "Person"}, "entities": [], "relationships": []}, {"item": "G1.3", "template": {"applies": false, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Corvel", "name": "Corvel", "type": "Technology"}, "entities": [], "relationships": [{"source": "user", "target": "item", "type": "USES"}]}, {"item": "G2.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "Ostrel", "name": "Ostrel", "type": "Project"}, "entities": [], "relationships": []}]}
 
-### List example 2: a table of events with dates, and unchecked goals
-Subject scope: user-scope
-Utterance: "Races I ran:\\n| Race | Date |\\n|---|---|\\n| Halvard Fell Race | 2026-04-12 |\\n\\nGoals for May:\\n- [ ] learn Kestrin\\n- [ ] visit Ostby"
+### List example 2: a document, a habit, a service's metric
+Utterance: "Read in May:\\n- Tarn Hollow on the train\\n\\nHabits:\\n- skelling every Tuesday\\n\\nBrindle service:\\n- 40 ms p95 latency"
 Units:
-G1 under "Races I ran"
-  G1.1 Race: Halvard Fell Race; Date: 2026-04-12
-G2 under "Goals for May"
-  G2.1 [ ] learn Kestrin
-  G2.2 [ ] visit Ostby
+G1 under "Read in May"
+  G1.1 Tarn Hollow on the train
+G2 under "Habits"
+  G2.1 skelling every Tuesday
+G3 under "Brindle service"
+  G3.1 40 ms p95 latency
 FRAME output:
-{"frame_entities": [], "groups": [{"group": "G1", "durable": true, "templates": [{"subject": "user", "predicate": "EXPERIENCED", "object": "item"}], "item_type": "Event", "unchecked": "plan"}, {"group": "G2", "durable": true, "templates": [{"subject": "user", "predicate": "HAS_GOAL", "object": "item"}], "item_type": "Goal", "unchecked": "goal"}], "facts": {"entities": [], "relationships": []}}
+{"frame_entities": [{"key": "f1", "span": "Brindle", "name": "Brindle", "type": "Technology"}], "groups": [{"group": "G1", "durable": true, "templates": [{"subject": "user", "predicate": "REFERENCES_DOCUMENT", "object": "item"}], "item_type": "Document", "unchecked": "plan"}, {"group": "G2", "durable": true, "templates": [{"subject": "user", "predicate": "HAS_HABIT", "object": "item"}], "item_type": "Concept", "unchecked": "plan"}, {"group": "G3", "durable": true, "templates": [{"subject": "f1", "predicate": "HAS_METRIC", "object": "item"}], "item_type": "Metric", "unchecked": "plan"}], "facts": {"entities": [], "relationships": []}}
 Frames:
-G1: each item is the object of user EXPERIENCED; item type Event
-G2: each item is the object of user HAS_GOAL; item type Goal; unchecked items are goals
-ITEMS G1.1, G2.1, G2.2 output:
-{"items": [{"item": "G1.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "past"}, "entity": {"span": "Halvard Fell Race", "name": "Halvard Fell Race", "type": "Event"}, "entities": [{"key": "e1", "span": "2026-04-12", "name": "2026-04-12", "type": "Date", "value": "2026-04-12"}], "relationships": [{"source": "item", "target": "e1", "type": "OCCURRED_ON"}]}, {"item": "G2.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "future"}, "entity": {"span": "learn Kestrin", "name": "learn Kestrin", "type": "Goal"}, "entities": [], "relationships": []}, {"item": "G2.2", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "future"}, "entity": {"span": "visit Ostby", "name": "visit Ostby", "type": "Goal"}, "entities": [], "relationships": []}]}
+f1 Brindle (Technology)
+G1: each item is the object of user REFERENCES_DOCUMENT; item type Document
+G2: each item is the object of user HAS_HABIT; item type Concept
+G3: each item is the object of f1 HAS_METRIC; item type Metric
+ITEMS output:
+{"items": [{"item": "G1.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "past"}, "entity": {"span": "Tarn Hollow", "name": "Tarn Hollow", "type": "Document"}, "entities": [], "relationships": []}, {"item": "G2.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "skelling", "name": "skelling", "type": "Concept", "activity": true}, "entities": [], "relationships": []}, {"item": "G3.1", "template": {"applies": true, "assertion_kind": "assert", "temporal_status": "current"}, "entity": {"span": "40 ms p95 latency", "name": "40 ms p95 latency", "type": "Metric", "value": "40", "unit": "ms", "quantity": "p95 latency"}, "entities": [], "relationships": []}]}
 """
 
 LIST_SYSTEM_PROMPT = (
@@ -198,16 +198,32 @@ LIST_FRAME_REPAIR_INSTRUCTION = (
     "Your previous output was not valid JSON or did not match the FRAME output. Return ONLY "
     'a JSON object {"frame_entities": [...], "groups": [...], "facts": {"entities": [...], '
     '"relationships": [...]}}, with one groups entry for each group id in Units, each with '
-    "group, templates (at most 3), item_type and unchecked. No prose, no markdown code "
-    "fences, no explanation."
+    "group, durable, templates (at most 3), item_type and unchecked. No prose, no markdown "
+    "code fences, no explanation."
 )
 
 LIST_ITEM_REPAIR_INSTRUCTION = (
     "Your previous output was not valid JSON or did not match the ITEMS output. Return ONLY "
     'a JSON object {"items": [...]}, with one record for each item id asked for, each with '
-    "item, entity, template, entities and relationships. No prose, no markdown code fences, "
+    "item, template, entity, entities and relationships. No prose, no markdown code fences, "
     "no explanation."
 )
+
+LIST_REFUSAL_TEMPLATE = "The output was refused: {error}"
+
+
+def list_repair_text(instruction: str, error: Exception) -> str:
+    """A list stage's repair text, then the line naming why the parser refused the output.
+
+    At temperature 0 a repair that names no reason tends to repeat the refused output,
+    so the list calls name it; the fixed instructions stay constants that the prompt
+    hash covers.
+
+    Args:
+        instruction: The stage's fixed repair instruction.
+        error: The parser's refusal.
+    """
+    return instruction + "\n" + LIST_REFUSAL_TEMPLATE.format(error=error)
 
 
 def _role(role: str, group: ListGroup | None) -> str:
@@ -231,7 +247,18 @@ def _has_checkbox(group: ListGroup | None) -> bool:
 
 
 def _frame_sentence(frame: GroupFrame, group: ListGroup | None) -> str:
-    parts = [_template_text(t, group) for t in frame.templates] or ["no template, nothing durable"]
+    """The group's decisions in one sentence.
+
+    A group with no template says whether it is durable: an errand list states nothing,
+    while a table whose fact is in each row states each item's own facts, and the item
+    call must not read the two alike.
+    """
+    if frame.templates:
+        parts = [_template_text(t, group) for t in frame.templates]
+    elif frame.durable:
+        parts = ["no shared template; extract each item's own facts"]
+    else:
+        parts = ["no template, nothing durable"]
     if frame.item_type is not None:
         parts.append(f"item type {frame.item_type}")
     if _has_checkbox(group):

@@ -46,7 +46,9 @@ from backend.knowledge.extraction.list_prompts import (
     LIST_FRAME_USER_TEMPLATE,
     LIST_ITEM_REPAIR_INSTRUCTION,
     LIST_ITEM_USER_TEMPLATE,
+    LIST_REFUSAL_TEMPLATE,
     LIST_SYSTEM_PROMPT,
+    list_repair_text,
     render_frames_for_items,
 )
 from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT
@@ -759,6 +761,42 @@ def test_each_repair_instruction_names_its_own_outputs_keys():
     assert '"items"' not in LIST_FRAME_REPAIR_INSTRUCTION
 
 
+def _named_in_order(text: str, keys: list[str]) -> bool:
+    positions = [re.search(rf"\b{key}\b", text) for key in keys]
+    return all(positions) and [p.start() for p in positions] == sorted(p.start() for p in positions)
+
+
+def test_the_frame_repair_names_a_groups_keys_in_schema_order():
+    keys = ["group", "durable", "templates", "item_type", "unchecked"]
+    after = LIST_FRAME_REPAIR_INSTRUCTION.split("each with", 1)[1]
+
+    assert _named_in_order(after, keys)
+
+
+def test_the_item_texts_name_an_items_keys_with_template_before_entity():
+    keys = ["item", "template", "entity", "entities", "relationships"]
+    repair = LIST_ITEM_REPAIR_INSTRUCTION.split("each with", 1)[1]
+    prose = _section("## LIST OUTPUT SCHEMA", "## EXTRACTION RULES").split("\n- items:", 1)[1]
+
+    assert _named_in_order(repair, keys)
+    assert _named_in_order(prose.split("\n", 1)[0], ["template", "entity"])
+
+
+@pytest.mark.parametrize(
+    "instruction", [LIST_FRAME_REPAIR_INSTRUCTION, LIST_ITEM_REPAIR_INSTRUCTION]
+)
+def test_a_list_repair_text_ends_with_the_refusal_line(instruction):
+    error = ListOutputError("groups[0] (G1): a template names item, so item_type must be set")
+
+    text = list_repair_text(instruction, error)
+
+    assert LIST_REFUSAL_TEMPLATE == "The output was refused: {error}"
+    assert text == (
+        instruction + "\nThe output was refused: groups[0] (G1): a template names item, so "
+        "item_type must be set"
+    )
+
+
 # --- frames for the item calls ----------------------------------------------------------------
 
 
@@ -777,7 +815,7 @@ def test_the_decided_frames_render_as_one_sentence_a_group():
                 None,
                 "plan",
             ),
-            GroupFrame("G3", (), None, "goal"),
+            GroupFrame("G3", (), None, "goal", durable=False),
         ),
         facts=ListFacts(entities=(), relationships=()),
     )
@@ -789,6 +827,33 @@ def test_the_decided_frames_render_as_one_sentence_a_group():
         "each item is the object of f1 USES\n"
         "G3: no template, nothing durable; unchecked items are goals"
     )
+
+
+@pytest.mark.parametrize(
+    ("durable", "sentence"),
+    [
+        pytest.param(True, "G1: no shared template; extract each item's own facts", id="durable"),
+        pytest.param(False, "G1: no template, nothing durable", id="not-durable"),
+    ],
+)
+def test_a_group_with_no_template_renders_whether_it_is_durable(durable, sentence):
+    """A table whose fact is in each row is durable with no template; an errand list is not."""
+    groups, _ = group_units(split_structured("Brindle runs:\n- Corvel\n- Ashwick"))
+    frame = FrameOutput(
+        frame_entities=(),
+        groups=(GroupFrame("G1", (), None, "plan", durable=durable),),
+        facts=ListFacts(entities=(), relationships=()),
+    )
+
+    assert render_frames_for_items(frame, groups) == sentence
+
+
+def test_list_rule_5_is_keyed_to_a_group_that_is_not_durable():
+    rules = _section("## LIST RULES", "## REFERENCE DATE")
+    rule = rules.split("\n5. ", 1)[1].split("\n", 1)[0]
+
+    assert "durable false" in rule
+    assert "durable true" in rule
 
 
 # --- no gold content in the list prompt -------------------------------------------------------
