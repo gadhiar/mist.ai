@@ -80,23 +80,30 @@ def canonical_id(name: str) -> str:
 def _produced_entity_match_id(raw_id: str, etype: str, properties: dict[str, Any]) -> str:
     """Canonical match id for a PRODUCED entity, mirroring the normalizer.
 
-    For a Metric entity (after `canonical_type`) carrying non-null `value` and a
-    truthy `unit` in its properties, the id is rebuilt as `canonical_metric_id`
-    (value-first), so a model that emits `requests-per-second-12000` collapses to
-    the gold-canonical `12000-requests-per-second`. This is the SHARED helper the
-    production normalizer uses -- not a parallel reimplementation -- so the F2
-    score reflects the post-normalizer behavior on these surface splits.
+    For a Metric entity (after `canonical_type`) carrying a non-null `value` and a
+    truthy `unit` or `quantity` in its properties, the id is rebuilt as
+    `canonical_metric_id(value, unit, quantity)`, `<value>-<unit>[-<quantity>]`. So a
+    model that emits `requests-per-second-12000` collapses to the gold-canonical
+    `12000-requests-per-second`, and a p95 and a p99 latency of `120 ms` score as two
+    entities, not one. This is the SHARED helper the production normalizer's Pass 4
+    uses, called on the same properties under the same condition -- not a parallel
+    reimplementation -- so the F2 score reflects the post-normalizer id.
 
-    Falls back to the plain string `canonical_id` when the type is not Metric or
-    when value/unit are absent. Gold is NOT passed through here: gold Metric
-    entities are authored with the canonical id and may not carry value/unit.
+    A Metric without that value and a unit or quantity falls back to
+    `canonical_metric_id_from_id`, which moves a single numeric token to the front.
+    Any other type falls back to the plain string `canonical_id`. Gold is NOT passed
+    through here: gold Metric entities are authored with the canonical id and may not
+    carry value/unit.
     """
     if canonical_type(etype) == "Metric":
         value = properties.get("value")
         unit = properties.get("unit")
-        if value is not None and unit:
-            return canonical_metric_id(value, str(unit))
-        return canonical_metric_id_from_id(raw_id)  # string fallback: no value/unit props
+        quantity = properties.get("quantity")
+        if value is not None and (unit or quantity):
+            return canonical_metric_id(
+                value, str(unit) if unit else None, str(quantity) if quantity else None
+            )
+        return canonical_metric_id_from_id(raw_id)  # string fallback: no rebuildable props
     return canonical_id(raw_id)
 
 

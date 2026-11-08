@@ -223,6 +223,83 @@ class TestParseProduced:
         assert ok is True
         assert entities == (GoldEntity(id="some-metric", type="Metric"),)
 
+    def test_metric_entity_id_rebuilt_with_quantity(self):
+        # A p95 and a p99 latency of one value and unit score as two entities.
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "id": "p95-latency",
+                        "type": "Metric",
+                        "properties": {"value": "120", "unit": "ms", "quantity": "p95 latency"},
+                    },
+                    {
+                        "id": "p99-latency",
+                        "type": "Metric",
+                        "properties": {"value": "120", "unit": "ms", "quantity": "p99 latency"},
+                    },
+                ],
+                "relationships": [],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert entities == (
+            GoldEntity(id="120-ms-p95-latency", type="Metric"),
+            GoldEntity(id="120-ms-p99-latency", type="Metric"),
+        )
+
+    def test_metric_entity_id_rebuilt_from_value_and_quantity_without_unit(self):
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "id": "max-queue-depth",
+                        "type": "Metric",
+                        "properties": {"value": 180, "quantity": "max queue depth"},
+                    }
+                ],
+                "relationships": [],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert entities == (GoldEntity(id="180-max-queue-depth", type="Metric"),)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "properties",
+        [
+            {"value": "120", "unit": "ms"},
+            {"value": "120", "unit": "ms", "quantity": "p95 latency"},
+            {"value": "87", "unit": "percent-coverage", "quantity": "coverage"},
+            {"value": 180, "quantity": "max queue depth"},
+            {"value": "42"},
+            {},
+        ],
+    )
+    async def test_metric_match_id_equals_normalizer_id(self, properties):
+        # The scorer must score the id production stores, so both sides build it
+        # from the same properties with the same shared builder.
+        from backend.knowledge.extraction.normalizer import EntityNormalizer
+        from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+
+        raw_id = "requests-per-second-12000"
+        normalizer = EntityNormalizer(embedding_generator=FakeEmbeddingGenerator(), executor=None)
+        entity = {"id": raw_id, "type": "Metric", "properties": dict(properties)}
+        out = await normalizer.normalize(ExtractionResult(entities=[entity], relationships=[]))
+
+        content = json.dumps(
+            {
+                "entities": [{"id": raw_id, "type": "Metric", "properties": dict(properties)}],
+                "relationships": [],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert entities == (GoldEntity(id=out.entities[0]["id"], type="Metric"),)
+
     def test_non_metric_entity_not_affected_by_value_unit_props(self):
         # A non-Metric entity that happens to carry value/unit props keeps the
         # plain string canonical id (Metric-id rebuild is type-gated).
