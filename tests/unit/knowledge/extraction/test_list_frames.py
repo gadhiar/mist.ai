@@ -309,11 +309,11 @@ def _frame(**changes: object) -> str:
 
 
 def _parse_frame(text: str) -> FrameOutput:
-    return parse_frame_output(text, [g.gid for g in _GROUPS])
+    return parse_frame_output(text, _GROUPS)
 
 
 def _parse_items(text: str, expected: list[str]) -> tuple[ItemOutput, ...]:
-    return parse_item_output(text, expected)
+    return parse_item_output(text, expected, _parse_frame(json.dumps(_FRAME)), _GROUPS, {})
 
 
 def test_list_output_error_is_an_extraction_validation_error():
@@ -501,6 +501,275 @@ def test_an_item_entity_without_metric_keys_leaves_them_none():
     assert (entity.value, entity.unit, entity.quantity) == (None, None, None)
 
 
+# --- endpoints resolved at parse time ---------------------------------------------------------
+
+# A nested turn: G1 holds G1.1 Quorvane and G1.2 Ostrel; G2 holds G2.1 Brellix, under G1.1.
+_NESTED_TURN = "Stack at Thrennic:\n- Quorvane:\n  - Brellix\n- Ostrel"
+_NESTED = group_units(split_structured(_NESTED_TURN))[0]
+_THRENNIC = {"key": "f1", "span": "Thrennic", "name": "Thrennic", "type": "Organization"}
+_CONCEPT = {"key": "e1", "span": "notes", "name": "notes", "type": "Concept"}
+
+
+def _group_out(gid: str, *templates: str, item_type: str | None = "Technology", **more) -> dict:
+    """A group frame; each template is written `subject PREDICATE object`."""
+    group: dict = {"group": gid, "durable": True}
+    group["templates"] = [
+        dict(zip(("subject", "predicate", "object"), t.split())) for t in templates
+    ]
+    return group | {"item_type": item_type, "unchecked": "plan"} | more
+
+
+def _edge(source: str, target: str, type_: str = "RELATED_TO") -> dict:
+    return {"source": source, "target": target, "type": type_}
+
+
+def _nested_frame(
+    g1: tuple[str, ...] = ("user USES item",),
+    g2: tuple[str, ...] = ("item DEPENDS_ON parent",),
+    *,
+    frame_entities: tuple[dict, ...] = (_THRENNIC,),
+    entities: tuple[dict, ...] = (),
+    relationships: tuple[dict, ...] = (),
+    **group_changes: dict,
+) -> str:
+    groups = [_group_out("G1", *g1), _group_out("G2", *g2)]
+    for n, gid in enumerate(("G1", "G2")):
+        groups[n] |= group_changes.get(gid, {})
+    facts = {"entities": list(entities), "relationships": list(relationships)}
+    return json.dumps({"frame_entities": list(frame_entities), "groups": groups, "facts": facts})
+
+
+def _nested_parse(text: str) -> FrameOutput:
+    return parse_frame_output(text, _NESTED)
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        pytest.param(
+            _nested_frame(frame_entities=({**_THRENNIC, "key": "e1"},)),
+            r"frame_entities\[0\]\.key: 'e1' is not a frame key, f1 to f20",
+            id="F2-frame-key-of-the-facts-set",
+        ),
+        pytest.param(
+            _nested_frame(entities=({**_CONCEPT, "key": "f2"},)),
+            r"facts\.entities\[0\]\.key: 'f2' is not an entity key, e1 to e20",
+            id="F2-facts-key-of-the-frame-set",
+        ),
+        pytest.param(
+            _nested_frame(("e1 USES item",), entities=(_CONCEPT,)),
+            r"groups\[0\]\.templates\[0\]\.subject \(G1\): 'e1' is not",
+            id="F1-template-names-a-facts-key",
+        ),
+        pytest.param(
+            _nested_frame(("user USES Quorvane",)),
+            r"groups\[0\]\.templates\[0\]\.object \(G1\): 'Quorvane' is not",
+            id="U7-template-names-a-name",
+        ),
+        pytest.param(
+            _nested_frame(("user USES item", "item DEPENDS_ON parent")),
+            r"groups\[0\]\.templates\[1\]\.object \(G1\): G1 is a top-level group",
+            id="U4-parent-in-a-top-level-group",
+        ),
+        pytest.param(
+            _nested_frame(relationships=(_edge("item", "f1", "WORKS_AT"),)),
+            r"facts\.relationships\[0\]\.source: 'item' is not",
+            id="U1-fact-names-item",
+        ),
+        pytest.param(
+            _nested_frame(relationships=(_edge("user", "parent"),)),
+            r"facts\.relationships\[0\]\.target: 'parent' is not",
+            id="U1-fact-names-parent",
+        ),
+        pytest.param(
+            _nested_frame(relationships=(_edge("user", "item:G3.1"),)),
+            r"facts\.relationships\[0\]\.target: 'item:G3\.1' is not",
+            id="U3-fact-names-an-item-outside-the-turn",
+        ),
+        pytest.param(
+            _nested_frame(relationships=(_edge("user", "Thrennic", "WORKS_AT"),)),
+            r"facts\.relationships\[0\]\.target: 'Thrennic' is not",
+            id="U7-fact-names-a-name",
+        ),
+        pytest.param(
+            _nested_frame(relationships=(_edge("user", "f2", "WORKS_AT"),)),
+            r"facts\.relationships\[0\]\.target: 'f2' is not",
+            id="U7-fact-names-an-undeclared-key",
+        ),
+        pytest.param(
+            _nested_frame(G1={"item_type": None}),
+            r"groups\[0\] \(G1\): a template names item, so item_type must be set",
+            id="item-type-null-under-an-item-template",
+        ),
+    ],
+)
+def test_the_frame_parser_refuses_an_end_that_does_not_resolve(text, message):
+    with pytest.raises(ListOutputError, match=message):
+        _nested_parse(text)
+
+
+def test_the_frame_parser_resolves_every_kind_of_end():
+    text = _nested_frame(
+        ("user USES item",),
+        ("item DEPENDS_ON parent", "mist USES item"),
+        entities=(_CONCEPT,),
+        relationships=(
+            _edge("user", "f1", "WORKS_AT"),
+            _edge("mist", "e1"),
+            _edge("item:G1.2", "item:G2.1", "DEPENDS_ON"),
+        ),
+    )
+
+    frame = _nested_parse(text)
+
+    assert [len(g.templates) for g in frame.groups] == [1, 2]
+    assert len(frame.facts.relationships) == 3
+
+
+def test_a_null_item_type_is_kept_when_no_template_names_item():
+    frame = _nested_parse(_nested_frame(("user WORKS_AT f1",), G1={"item_type": None}))
+
+    assert frame.groups[0].item_type is None
+
+
+def _item_out(item_id: str, entity: str | None = "Technology", **changes: object) -> dict:
+    """An item record whose entity, unless null, is named after its id with that type."""
+    record: dict = {"item": item_id}
+    record["template"] = {
+        "applies": False,
+        "assertion_kind": "assert",
+        "temporal_status": "current",
+    }
+    record["entity"] = (
+        None if entity is None else {"span": item_id, "name": item_id, "type": entity}
+    )
+    return record | {"entities": [], "relationships": []} | changes
+
+
+def _known(item_id: str, entity: str | None = "Technology") -> ItemOutput:
+    """An item output of an earlier batch."""
+    own = None if entity is None else ItemEntity(item_id, item_id, entity)
+    return ItemOutput(item_id, own, ItemTemplate(False, "assert", "current"), (), ())
+
+
+def _nested_items(
+    *records: dict, earlier: tuple[ItemOutput, ...] = (), frame: str | None = None
+) -> tuple[ItemOutput, ...]:
+    return parse_item_output(
+        json.dumps({"items": list(records)}),
+        [r["item"] for r in records],
+        _nested_parse(frame or _nested_frame()),
+        _NESTED,
+        {o.item: o for o in earlier},
+    )
+
+
+# G2 shares no template that names parent, so G1.1's entity is not required in its own call.
+_NO_PARENT_TEMPLATE = _nested_frame(g2=("user USES item",))
+
+
+@pytest.mark.parametrize(
+    ("records", "earlier", "message"),
+    [
+        pytest.param(
+            [_item_out("G1.2", entities=[{**_CONCEPT, "key": "f2"}])],
+            (),
+            r"items\[0\] \(G1\.2\)\.entities\[0\]\.key: 'f2' is not an entity key, e1 to e20",
+            id="own-key-of-the-frame-set",
+        ),
+        pytest.param(
+            [_item_out("G1.2", relationships=[_edge("item", "Thrennic", "WORKS_AT")])],
+            (),
+            r"items\[0\] \(G1\.2\)\.relationships\[0\]\.target: 'Thrennic' is not",
+            id="U7-a-name",
+        ),
+        pytest.param(
+            [_item_out("G1.2", relationships=[_edge("item", "e1")])],
+            (),
+            r"items\[0\] \(G1\.2\)\.relationships\[0\]\.target: 'e1' is not",
+            id="U7-an-undeclared-own-key",
+        ),
+        pytest.param(
+            [_item_out("G1.2", relationships=[_edge("item", "item:G4.2")])],
+            (),
+            r"items\[0\] \(G1\.2\)\.relationships\[0\]\.target: 'item:G4\.2' is not",
+            id="U3-an-item-outside-the-turn",
+        ),
+        pytest.param(
+            [_item_out("G1.2", None, relationships=[_edge("user", "item", "USES")])],
+            (),
+            r"items\[0\] \(G1\.2\)\.relationships\[0\]\.target: item has no entity",
+            id="U2-item-with-a-null-entity",
+        ),
+        pytest.param(
+            [_item_out("G1.2", relationships=[_edge("item", "parent", "DEPENDS_ON")])],
+            (),
+            r"items\[0\] \(G1\.2\)\.relationships\[0\]\.target: G1\.2 is in a top-level group",
+            id="U4-parent-in-a-top-level-group",
+        ),
+        pytest.param(
+            [_item_out("G2.1", relationships=[_edge("item", "parent", "DEPENDS_ON")])],
+            ("G1.1",),
+            r"items\[0\] \(G2\.1\)\.relationships\[0\]\.target: parent G1\.1 has no entity",
+            id="U5-parent-of-an-earlier-batch-with-a-null-entity",
+        ),
+        pytest.param(
+            [
+                _item_out("G1.1", None),
+                _item_out("G2.1", relationships=[_edge("item", "parent", "DEPENDS_ON")]),
+            ],
+            (),
+            r"items\[1\] \(G2\.1\)\.relationships\[0\]\.target: parent G1\.1 has no entity",
+            id="U5-parent-in-the-batch-with-a-null-entity",
+        ),
+        pytest.param(
+            [_item_out("G2.1", relationships=[_edge("item", "item:G1.2", "DEPENDS_ON")])],
+            ("G1.2",),
+            r"items\[0\] \(G2\.1\)\.relationships\[0\]\.target: item:G1\.2 has no entity",
+            id="U6-item-of-an-earlier-batch-with-a-null-entity",
+        ),
+        pytest.param(
+            [
+                _item_out("G1.2", None),
+                _item_out("G2.1", relationships=[_edge("item:G1.2", "item", "DEPENDS_ON")]),
+            ],
+            (),
+            r"items\[1\] \(G2\.1\)\.relationships\[0\]\.source: item:G1\.2 has no entity",
+            id="U6-item-in-the-batch-with-a-null-entity",
+        ),
+    ],
+)
+def test_the_item_parser_refuses_an_edge_end_that_does_not_resolve(records, earlier, message):
+    known = tuple(_known(item_id, None) for item_id in earlier)
+
+    with pytest.raises(ListOutputError, match=message):
+        _nested_items(*records, earlier=known, frame=_NO_PARENT_TEMPLATE)
+
+
+def test_the_item_parser_resolves_every_kind_of_end():
+    own = [{**_CONCEPT, "key": "e1"}]
+    edges = [
+        _edge("user", "item", "USES"),
+        _edge("mist", "e1"),
+        _edge("item", "f1"),
+        _edge("item", "parent", "DEPENDS_ON"),
+        _edge("item", "item:G1.2", "DEPENDS_ON"),
+        _edge("item", "item:G1.1", "DEPENDS_ON"),
+    ]
+    earlier = (_known("G1.1"),)
+
+    (item,) = _nested_items(_item_out("G2.1", entities=own, relationships=edges), earlier=earlier)
+
+    assert len(item.relationships) == 6
+
+
+def test_an_edge_to_an_item_not_yet_parsed_is_left_to_assembly():
+    """A later batch's item may still name its entity, so its call is not refused here."""
+    (item,) = _nested_items(_item_out("G1.2", relationships=[_edge("item", "item:G2.1")]))
+
+    assert item.relationships[0].target == "item:G2.1"
+
+
 # --- the list prompt's examples ---------------------------------------------------------------
 
 
@@ -520,8 +789,9 @@ def test_each_list_example_parses_and_its_frames_are_the_render_of_its_frame_out
         frames = example.split("Frames:\n", 1)[1].split("\nITEMS ", 1)[0]
         items_text = example.split(" output:\n")[-1].split("\n", 1)[0]
 
-        frame = parse_frame_output(frame_text, [g.gid for g in groups])
-        items = parse_item_output(items_text, [i for g in groups for i in g.item_ids])
+        frame = parse_frame_output(frame_text, groups)
+        expected = [i for g in groups for i in g.item_ids]
+        items = parse_item_output(items_text, expected, frame, groups, {})
 
         assert frames == render_frames_for_items(frame, groups)
         assert len(items) == sum(len(g.items) for g in groups)

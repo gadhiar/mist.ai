@@ -72,6 +72,7 @@ from backend.knowledge.extraction.internal_prompts import (
 )
 from backend.knowledge.extraction.list_assembly import assemble
 from backend.knowledge.extraction.list_frames import (
+    FrameOutput,
     ItemOutput,
     ListGroup,
     group_units,
@@ -821,7 +822,6 @@ class ExtractionEngine:
             await self._run_list_pass(pre_processed, turn.units, run)
             return
 
-        group_ids = [group.gid for group in turn.groups]
         try:
             frame = await self._list_attempts(
                 user,
@@ -829,7 +829,7 @@ class ExtractionEngine:
                 run,
                 max_tokens=LIST_FRAME_MAX_TOKENS,
                 schema=LIST_FRAME_OUTPUT_SCHEMA,
-                parse=lambda raw: parse_frame_output(raw, group_ids),
+                parse=lambda raw: parse_frame_output(raw, turn.groups),
                 repair=LIST_FRAME_REPAIR_INSTRUCTION,
             )
         except (_OutputTruncatedError, _OutputUnparsableError) as exc:
@@ -845,7 +845,7 @@ class ExtractionEngine:
         fallbacks: dict[str, ExtractionPayload] = {}
         for start in range(0, len(turn.items), LIST_ITEM_BATCH_MAX_UNITS):
             batch = turn.items[start : start + LIST_ITEM_BATCH_MAX_UNITS]
-            await self._list_items(turn, kept, frames, batch, run, outputs, fallbacks)
+            await self._list_items(turn, kept, frame, frames, batch, run, outputs, fallbacks)
 
         payload, warnings = assemble(frame, outputs, turn.groups, turn.prose, utterance, fallbacks)
         run.payloads.append(payload)
@@ -855,6 +855,7 @@ class ExtractionEngine:
         self,
         turn: _ListTurn,
         context: Sequence[str],
+        frame: FrameOutput,
         frames: str,
         batch: Sequence[tuple[str, int]],
         run: _Stage2Run,
@@ -865,7 +866,8 @@ class ExtractionEngine:
 
         A single item still cut short or unparsable, or a batch whose message
         is over `LIST_USER_MAX_CHARS` with no history left, takes the item
-        fallback: the r6 pass over that item's unit alone.
+        fallback: the r6 pass over that item's unit alone. The parser checks
+        each item's ends against `frame` and the outputs parsed so far.
 
         Raises:
             ExtractionTimeoutError: A call exceeded the LLM timeout.
@@ -895,6 +897,7 @@ class ExtractionEngine:
                 await self._item_fallback(turn, item, run, fallbacks)
             return
 
+        earlier = {output.item: output for output in outputs}
         try:
             outputs.extend(
                 await self._list_attempts(
@@ -903,7 +906,7 @@ class ExtractionEngine:
                     run,
                     max_tokens=LIST_ITEM_MAX_TOKENS,
                     schema=LIST_ITEM_OUTPUT_SCHEMA,
-                    parse=lambda raw: parse_item_output(raw, ids),
+                    parse=lambda raw: parse_item_output(raw, ids, frame, turn.groups, earlier),
                     repair=LIST_ITEM_REPAIR_INSTRUCTION,
                 )
             )
@@ -918,7 +921,7 @@ class ExtractionEngine:
             return
         half = (len(batch) + 1) // 2
         for part in (batch[:half], batch[half:]):
-            await self._list_items(turn, context, frames, part, run, outputs, fallbacks)
+            await self._list_items(turn, context, frame, frames, part, run, outputs, fallbacks)
 
     async def _item_fallback(
         self,

@@ -13,9 +13,12 @@ stays in its group.
 
 The parsers are strict: an output that misses a key, has a value of the wrong type or
 outside its enum, holds a key its schema does not declare, gives a group more than 3
-templates, or misses or invents a group or item id raises `ListOutputError`. That
-subclasses `ExtractionValidationError`, so the extraction service's attempt loop sends
-the repair instruction and retries, as it does for a Stage 2 output.
+templates, or misses or invents a group or item id raises `ListOutputError`. They also
+resolve every end at parse time, against the turn's groups, the parsed frame and the
+item outputs already parsed, so an end that would resolve to no entity is refused in
+the call that can fix it rather than dropped at assembly. `ListOutputError` subclasses
+`ExtractionValidationError`, so the extraction service's attempt loop sends the repair
+instruction and retries, as it does for a Stage 2 output.
 """
 
 from __future__ import annotations
@@ -28,7 +31,9 @@ from dataclasses import dataclass, field
 from backend.errors import ExtractionValidationError
 from backend.extraction_service.list_schemas import (
     ASSERTION_KIND_ENUM,
+    ENTITY_KEY_ENUM,
     EXTRACTABLE_TYPE_ENUM,
+    FRAME_KEY_ENUM,
     PREDICATE_ENUM,
     TEMPORAL_STATUS_ENUM,
     UNCHECKED_ENUM,
@@ -38,7 +43,12 @@ from .structure_splitter import InputUnit, _as_context
 
 _LIST_KINDS = frozenset({"list_item", "table_row"})
 _TEMPLATES_MAX = 3
-_ROLES = frozenset({"user", "mist", "item", "parent"})
+_ITEM = "item"
+_ITEM_REF = "item:"
+# The ends every edge may name, and the roles a template adds; `parent` only in a
+# nested group.
+_FIXED_ENDS = frozenset({"user", "mist"})
+_TEMPLATE_ENDS = _FIXED_ENDS | {_ITEM}
 
 
 class ListOutputError(ExtractionValidationError):
@@ -399,14 +409,22 @@ def _load(text: str) -> dict:
     raise ListOutputError(f"list output is not a JSON object: {text[:200]!r}")
 
 
-def _entities(values: list, where: str, taken: set[str]) -> tuple[ListEntity, ...]:
-    """Keyed entities; a key may not repeat, nor reuse a role or an earlier key in `taken`."""
+def _key(key: str, where: str, keys: tuple[str, ...], what: str, taken: set[str]) -> None:
+    """Refuse a key outside its set, or one already given in the same output."""
+    if key not in keys:
+        raise ListOutputError(f"{where}.key: {key!r} is not {what}, {keys[0]} to {keys[-1]}")
+    if key in taken:
+        raise ListOutputError(f"{where}.key: {key!r} is already taken")
+    taken.add(key)
+
+
+def _entities(values: list, where: str) -> tuple[ListEntity, ...]:
+    """Entities keyed `e1` to `e20`, no key given twice."""
     entities = []
+    taken: set[str] = set()
     for n, value in enumerate(values):
         record = _record(value, f"{where}[{n}]", _ENTITY_REQUIRED, _ENTITY_OPTIONAL)
-        if record["key"] in taken or record["key"] in _ROLES:
-            raise ListOutputError(f"{where}[{n}].key: {record['key']!r} is already taken")
-        taken.add(record["key"])
+        _key(record["key"], f"{where}[{n}]", ENTITY_KEY_ENUM, "an entity key", taken)
         entities.append(ListEntity(**record))
     return tuple(entities)
 
@@ -426,12 +444,27 @@ def _relationships(values: list, where: str) -> tuple[ListRelationship, ...]:
     return tuple(relationships)
 
 
-def _facts(value: object, where: str, taken: set[str]) -> ListFacts:
+def _facts(
+    value: object, where: str, frame_keys: frozenset[str], items: frozenset[str]
+) -> ListFacts:
+    """The frame's facts; each end is `user`, `mist`, a declared key or an item of the turn.
+
+    `item` and `parent` mean something only in a template or an item's own edge, so a
+    fact that names one would resolve to nothing (U1).
+    """
     record = _record(value, where, {"entities": _list, "relationships": _list})
-    return ListFacts(
-        entities=_entities(record["entities"], f"{where}.entities", taken),
-        relationships=_relationships(record["relationships"], f"{where}.relationships"),
-    )
+    entities = _entities(record["entities"], f"{where}.entities")
+    relationships = _relationships(record["relationships"], f"{where}.relationships")
+    ends = _FIXED_ENDS | frame_keys | {e.key for e in entities} | items
+    for n, relationship in enumerate(relationships):
+        for side in ("source", "target"):
+            end = getattr(relationship, side)
+            if end not in ends:
+                raise ListOutputError(
+                    f"{where}.relationships[{n}].{side}: {end!r} is not user, mist, a "
+                    "declared frame or facts key, or item:<id> for an item of the turn"
+                )
+    return ListFacts(entities, relationships)
 
 
 def _ordered(found: Mapping[str, object], expected: Sequence[str], what: str) -> list:
@@ -449,7 +482,29 @@ def _claim(found: dict, key: str, value: object, expected: set[str], what: str) 
     found[key] = value
 
 
-def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame:
+def _template_end(end: str, at: str, group: ListGroup, frame_keys: frozenset[str]) -> None:
+    """Refuse a template end that names no role or frame key, or `parent` at the top level."""
+    if end in _TEMPLATE_ENDS or end in frame_keys:
+        return
+    if end == "parent":
+        if group.parent is not None:
+            return
+        raise ListOutputError(
+            f"{at} ({group.gid}): {group.gid} is a top-level group, so no template can "
+            "name parent"
+        )
+    parent = "parent, " if group.parent is not None else ""
+    raise ListOutputError(
+        f"{at} ({group.gid}): {end!r} is not user, mist, item, {parent}or a declared " "frame key"
+    )
+
+
+def _group_frame(
+    value: object,
+    where: str,
+    frame_keys: frozenset[str],
+    by_gid: Mapping[str, ListGroup],
+) -> GroupFrame:
     record = _record(
         value,
         where,
@@ -468,33 +523,41 @@ def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame
             f"{where} ({record['group']}): durable is false, so the group takes no "
             "templates; give durable true or no templates"
         )
-    role = _one_of(sorted(roles))
-    templates = tuple(
-        Template(
-            **_record(
-                t,
-                f"{where}.templates[{n}]",
-                {"subject": role, "predicate": _PREDICATE, "object": role},
-            )
+    group = by_gid.get(record["group"])
+    if group is None:
+        raise ListOutputError(f"{where}: unknown group id {record['group']!r}")
+    templates = []
+    for n, value in enumerate(record["templates"]):
+        at = f"{where}.templates[{n}]"
+        template = Template(
+            **_record(value, at, {"subject": _text, "predicate": _PREDICATE, "object": _text})
         )
-        for n, t in enumerate(record["templates"])
-    )
+        _template_end(template.subject, f"{at}.subject", group, frame_keys)
+        _template_end(template.object, f"{at}.object", group, frame_keys)
+        templates.append(template)
+    if record["item_type"] is None and any(_ITEM in (t.subject, t.object) for t in templates):
+        raise ListOutputError(
+            f"{where} ({group.gid}): a template names item, so item_type must be set"
+        )
     return GroupFrame(
-        record["group"], templates, record["item_type"], record["unchecked"], record["durable"]
+        group.gid, tuple(templates), record["item_type"], record["unchecked"], record["durable"]
     )
 
 
-def parse_frame_output(text: str, expected_groups: Sequence[str]) -> FrameOutput:
-    """Parse a frame call's output, its groups in `expected_groups` order.
+def parse_frame_output(text: str, groups: Sequence[ListGroup]) -> FrameOutput:
+    """Parse a frame call's output, its groups in the turn's order, every end resolved.
 
     Args:
         text: The model's output.
-        expected_groups: The turn's group ids; the output must give each exactly once.
+        groups: The turn's groups; the output must give each exactly once.
 
     Raises:
-        ListOutputError: The output is not a JSON object of the FRAME shape, a
-            template names a role that is neither a fixed role nor a frame key, or the
-            group ids differ from `expected_groups`.
+        ListOutputError: The output is not a JSON object of the FRAME shape; a key is
+            outside its set (`f1` to `f20` for a frame entity, `e1` to `e20` for a
+            facts entity); a template end is not `user`, `mist`, `item`, a declared
+            frame key or, in a nested group, `parent`; a fact end is not `user`,
+            `mist`, a declared key or an item of the turn; a group that names `item`
+            has no `item_type`; or the group ids differ from the turn's.
     """
     record = _record(
         _load(text),
@@ -506,18 +569,20 @@ def parse_frame_output(text: str, expected_groups: Sequence[str]) -> FrameOutput
     for n, value in enumerate(record["frame_entities"]):
         at = f"frame_entities[{n}]"
         entity = ListEntity(**_record(value, at, _ENTITY_REQUIRED))
-        if entity.key in taken or entity.key in _ROLES:
-            raise ListOutputError(f"{at}.key: {entity.key!r} is already taken")
-        taken.add(entity.key)
+        _key(entity.key, at, FRAME_KEY_ENUM, "a frame key", taken)
         frame_entities.append(entity)
-    roles = _ROLES | taken
+    frame_keys = frozenset(taken)
+    by_gid = {group.gid: group for group in groups}
+    expected = [group.gid for group in groups]
     found: dict[str, GroupFrame] = {}
     for n, value in enumerate(record["groups"]):
-        group = _group_frame(value, f"groups[{n}]", roles)
-        _claim(found, group.group, group, set(expected_groups), "group")
-    groups = _ordered(found, expected_groups, "group")
+        group = _group_frame(value, f"groups[{n}]", frame_keys, by_gid)
+        _claim(found, group.group, group, set(expected), "group")
+    items = frozenset(_ITEM_REF + item for group in groups for item in group.item_ids)
     return FrameOutput(
-        tuple(frame_entities), tuple(groups), _facts(record["facts"], "facts", taken)
+        tuple(frame_entities),
+        tuple(_ordered(found, expected, "group")),
+        _facts(record["facts"], "facts", frame_keys, items),
     )
 
 
@@ -527,12 +592,13 @@ def _item_output(value: object, where: str) -> ItemOutput:
         where,
         {
             "item": _text,
-            "entity": _object_or_null,
             "template": lambda v: isinstance(v, dict),
+            "entity": _object_or_null,
             "entities": _list,
             "relationships": _list,
         },
     )
+    where = f"{where} ({record['item']})"
     entity = None
     if record["entity"] is not None:
         entity = ItemEntity(
@@ -559,21 +625,101 @@ def _item_output(value: object, where: str) -> ItemOutput:
         item=record["item"],
         entity=entity,
         template=template,
-        entities=_entities(record["entities"], f"{where}.entities", set()),
+        entities=_entities(record["entities"], f"{where}.entities"),
         relationships=_relationships(record["relationships"], f"{where}.relationships"),
     )
 
 
-def parse_item_output(text: str, expected: Sequence[str]) -> tuple[ItemOutput, ...]:
-    """Parse an item call's output, one record per id in `expected`, in that order.
+@dataclass(frozen=True, slots=True)
+class _Turn:
+    """What an item output's ends are checked against."""
+
+    group_of: Mapping[str, ListGroup]
+    frame_keys: frozenset[str]
+    known: Mapping[str, ItemOutput]
+
+
+def _no_entity(item_id: str, turn: _Turn) -> bool:
+    """Whether the item's output is known, from an earlier batch or this one, with no entity.
+
+    An item not yet parsed may still name its entity in a later call, so it is left to
+    assembly's last-resort drop.
+    """
+    output = turn.known.get(item_id)
+    return output is not None and output.entity is None
+
+
+def _edge_end(end: str, at: str, output: ItemOutput, turn: _Turn) -> None:
+    """Refuse an item edge's end that cannot resolve to an entity (U2 to U7)."""
+    if end in _FIXED_ENDS or end in turn.frame_keys or end in {e.key for e in output.entities}:
+        return
+    if end == _ITEM:
+        if output.entity is None:
+            raise ListOutputError(f"{at}: item has no entity in this output; give one")
+        return
+    if end == "parent":
+        group = turn.group_of.get(output.item)
+        parent = None if group is None else group.parent
+        if parent is None:
+            raise ListOutputError(
+                f"{at}: {output.item} is in a top-level group, so it has no parent"
+            )
+        if _no_entity(parent[1], turn):
+            raise ListOutputError(f"{at}: parent {parent[1]} has no entity")
+        return
+    other = end[len(_ITEM_REF) :] if end.startswith(_ITEM_REF) else None
+    if other is not None and other in turn.group_of:
+        if _no_entity(other, turn):
+            raise ListOutputError(f"{at}: {end} has no entity")
+        return
+    raise ListOutputError(
+        f"{at}: {end!r} is not user, mist, item, parent, a declared frame key, one of "
+        "the item's own keys, or item:<id> for an item of the turn"
+    )
+
+
+def parse_item_output(
+    text: str,
+    expected: Sequence[str],
+    frame: FrameOutput,
+    groups: Sequence[ListGroup],
+    earlier: Mapping[str, ItemOutput],
+) -> tuple[ItemOutput, ...]:
+    """Parse an item call's output, one record per id in `expected`, every end resolved.
+
+    An end that names an item, its parent or another item is checked against the
+    outputs known so far: `earlier`, the outputs of the turn's earlier item calls, and
+    the rest of this output. The call that wrote an edge can drop it, so the edge is
+    refused here; an end whose item is not yet parsed is left to assembly.
+
+    Args:
+        text: The model's output.
+        expected: The item ids the call asked for, in order.
+        frame: The turn's parsed frame output.
+        groups: The turn's groups.
+        earlier: The item outputs already parsed in the turn, by item id.
 
     Raises:
-        ListOutputError: The output is not a JSON object of the ITEMS shape, or its item
-            ids differ from `expected`.
+        ListOutputError: The output is not a JSON object of the ITEMS shape; its item
+            ids differ from `expected`; an own key is outside `e1` to `e20`; or an
+            edge end does not resolve.
     """
     record = _record(_load(text), "items", {"items": _list})
     found: dict[str, ItemOutput] = {}
+    at: dict[str, str] = {}
     for n, value in enumerate(record["items"]):
         item = _item_output(value, f"items[{n}]")
         _claim(found, item.item, item, set(expected), "item")
-    return tuple(_ordered(found, expected, "item"))
+        at[item.item] = f"items[{n}] ({item.item})"
+    outputs = tuple(_ordered(found, expected, "item"))
+    turn = _Turn(
+        group_of={item: group for group in groups for item in group.item_ids},
+        frame_keys=frozenset(e.key for e in frame.frame_entities),
+        known={**earlier, **found},
+    )
+    for output in outputs:
+        for n, relationship in enumerate(output.relationships):
+            for side in ("source", "target"):
+                where = f"{at[output.item]}.relationships[{n}].{side}"
+                _edge_end(getattr(relationship, side), where, output, turn)
+    return outputs

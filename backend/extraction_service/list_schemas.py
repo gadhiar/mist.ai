@@ -23,6 +23,13 @@ TEMPORAL_STATUS_ENUM: tuple[str, ...] = ("current", "past", "future")
 ASSERTION_KIND_ENUM: tuple[str, ...] = ("assert", "cease", "retract")
 UNCHECKED_ENUM: tuple[str, ...] = ("plan", "goal")
 
+# The keys a list call may give an entity: `f` keys for the frame call's frame entities,
+# `e` keys for the frame's facts and an item's own entities, so the two sets never
+# overlap and an item's own key never shadows a frame key. No measure bounds how many a
+# turn needs; twenty of each leaves room.
+FRAME_KEY_ENUM: tuple[str, ...] = tuple(f"f{n}" for n in range(1, 21))
+ENTITY_KEY_ENUM: tuple[str, ...] = tuple(f"e{n}" for n in range(1, 21))
+
 
 def _object(required: dict[str, dict], optional: dict[str, dict] | None = None) -> dict:
     return {
