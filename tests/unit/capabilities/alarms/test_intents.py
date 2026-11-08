@@ -13,10 +13,13 @@ import pytest
 from backend.capabilities.alarms.intents import (
     RingingPhrase,
     match_alarm_intent,
+    match_alarms,
     match_clock_intent,
     match_ringing_phrase,
     match_timer_intent,
+    match_timers,
 )
+from backend.capabilities.alarms.timeparse import parse_repeat
 from backend.capabilities.contracts import FastIntent
 from backend.capabilities.intents import normalize_utterance
 
@@ -64,7 +67,7 @@ ALARM_MISSES = [
     "set an alarm for 13 pm",
     "how do I set an alarm for 7",
     "set an alarm for 7 in the morning",
-    "wake me at 7 every day",
+    "wake me at 7 every now and then",
     "set 2 alarms for 7",
 ]
 
@@ -210,6 +213,168 @@ class TestClockRows:
     @pytest.mark.parametrize("raw", CLOCK_MISSES)
     def test_a_non_matching_utterance_gives_none(self, raw):
         assert match_clock_intent(_text(raw)) is None
+
+
+ALARM_TAGS = frozenset({"gym", "morning run"})
+"""The saved alarm tags, as `AlarmRecords.tag_labels("alarm")` gives them: normalised."""
+TIMER_TAGS = frozenset({"pasta", "tea"})
+
+
+def _alarms(raw: str, tags: frozenset[str] = ALARM_TAGS) -> FastIntent | None:
+    return match_alarms(_text(raw), NOW, UTC, tags)
+
+
+def _timers(raw: str, tags: frozenset[str] = TIMER_TAGS) -> FastIntent | None:
+    return match_timers(_text(raw), tags)
+
+
+REPEAT_MATCHES = [
+    (
+        "set an alarm for 7 every Monday and Thursday",
+        {"time": "7", "repeat": "custom", "days": ["monday", "thursday"]},
+    ),
+    ("wake me up at 6:30 every weekday", {"time": "6:30", "repeat": "weekdays"}),
+    ("wake me at 7 every day", {"time": "7", "repeat": "daily"}),
+    ("set an alarm for 9am on weekends", {"time": "9am", "repeat": "weekends"}),
+    ("alarm at 6 weekdays", {"time": "6", "repeat": "weekdays"}),
+    (
+        "set an alarm for 7:15 every monday, wednesday and friday",
+        {"time": "7:15", "repeat": "custom", "days": ["monday", "wednesday", "friday"]},
+    ),
+    (
+        "set an alarm for 8 am every friday and tuesday",
+        {"time": "8 am", "repeat": "custom", "days": ["tuesday", "friday"]},
+    ),
+]
+
+# Each new row's matches, as (utterance, the capability's grammar, the call it gives).
+T30_MATCHES = [
+    *[(raw, "alarms", FastIntent("alarms.set", args)) for raw, args in REPEAT_MATCHES],
+    ("set my gym alarm", "alarms", FastIntent("alarms.set", {"label": "gym"})),
+    ("Set my Gym alarm", "alarms", FastIntent("alarms.set", {"label": "gym"})),
+    (
+        "set my gym alarm for 6:30",
+        "alarms",
+        FastIntent("alarms.set", {"label": "gym", "time": "6:30"}),
+    ),
+    ("gym alarm", "alarms", FastIntent("alarms.set", {"label": "gym"})),
+    (
+        "set my morning run alarm for 5:45 a.m.",
+        "alarms",
+        FastIntent("alarms.set", {"label": "morning run", "time": "5:45 am"}),
+    ),
+    ("start my pasta timer", "timers", FastIntent("timers.start", {"label": "pasta"})),
+    ("start the tea timer", "timers", FastIntent("timers.start", {"label": "tea"})),
+    ("pasta timer", "timers", FastIntent("timers.start", {"label": "pasta"})),
+    ("list my alarms", "alarms", FastIntent("alarms.list", {})),
+    ("show my alarms", "alarms", FastIntent("alarms.list", {})),
+    ("What alarms do I have?", "alarms", FastIntent("alarms.list", {})),
+    ("what are my alarms", "alarms", FastIntent("alarms.list", {})),
+    ("list my saved alarms", "alarms", FastIntent("alarms.list", {"scope": "saved"})),
+    ("show my saved alarms", "alarms", FastIntent("alarms.list", {"scope": "saved"})),
+    ("list my timers", "timers", FastIntent("timers.list", {})),
+    ("show my timers", "timers", FastIntent("timers.list", {})),
+    ("what timers do I have", "timers", FastIntent("timers.list", {})),
+    ("how long is left on my timer", "timers", FastIntent("timers.list", {})),
+    ("Hey MIST, how long is left?", "timers", FastIntent("timers.list", {})),
+    ("cancel my 7 alarm", "alarms", FastIntent("alarms.cancel", {"time": "7"})),
+    ("cancel my 6:30 am alarm", "alarms", FastIntent("alarms.cancel", {"time": "6:30 am"})),
+    ("cancel my gym alarm", "alarms", FastIntent("alarms.cancel", {"label": "gym"})),
+    ("cancel the gym alarm", "alarms", FastIntent("alarms.cancel", {"label": "gym"})),
+    ("cancel gym alarm", "alarms", FastIntent("alarms.cancel", {"label": "gym"})),
+    ("cancel the timer", "timers", FastIntent("timers.cancel", {})),
+    ("cancel my timer", "timers", FastIntent("timers.cancel", {})),
+    ("cancel timer please", "timers", FastIntent("timers.cancel", {})),
+    ("cancel my pasta timer", "timers", FastIntent("timers.cancel", {"label": "pasta"})),
+]
+
+T30_MISSES = [
+    "set my dentist alarm",
+    "every now and then",
+    "list my alarms from last year",
+    "set an alarm for 7 every now and then",
+    "set an alarm for in 20 minutes every day",
+    "set an alarm for whenever every day",
+    "set an alarm for 7 every monday and every thursday",
+    "set my gym alarm for whenever",
+    "set my gym alarm every monday",
+    "set the gym alarm",
+    "start my dentist timer",
+    "start the timer",
+    "list alarms",
+    "what alarms did I have yesterday",
+    "show my saved timers",
+    "how long is left on the oven",
+    "cancel my dentist alarm",
+    "cancel my whenever alarm",
+    "cancel my alarm",
+    "cancel all my alarms",
+    "cancel the timers",
+    "cancel all my timers",
+    "cancel my dentist timer",
+    "cancel my 7 alarm and the timer",
+]
+
+
+class TestT30Rows:
+    def test_the_fixtures_meet_the_minimum_sizes(self):
+        assert len(T30_MATCHES) >= 12
+        assert len(T30_MISSES) >= 12
+
+    @pytest.mark.parametrize(("raw", "grammar", "intent"), T30_MATCHES)
+    def test_a_matching_utterance_gives_its_call_and_only_from_its_grammar(
+        self, raw, grammar, intent
+    ):
+        given = {"alarms": _alarms(raw), "timers": _timers(raw)}
+
+        assert given[grammar] == intent
+        assert all(found is None for name, found in given.items() if name != grammar)
+
+    @pytest.mark.parametrize("raw", T30_MISSES)
+    def test_a_non_matching_utterance_gives_none(self, raw):
+        assert _alarms(raw) is None
+        assert _timers(raw) is None
+
+    def test_custom_days_read_as_parse_repeat_reads_them(self):
+        intent = _alarms("set an alarm for 7 every Monday and Thursday")
+
+        assert intent is not None
+        rule = parse_repeat("every " + " and ".join(intent.args["days"]), hour=7, minute=0)  # type: ignore[arg-type]
+        assert rule is not None and rule.days == frozenset({0, 3})
+
+    def test_a_saved_tag_matches_once_it_is_saved(self):
+        assert _alarms("set my dentist alarm") is None
+        assert _alarms("set my dentist alarm", ALARM_TAGS | {"dentist"}) == FastIntent(
+            "alarms.set", {"label": "dentist"}
+        )
+        assert _timers("start my eggs timer") is None
+        assert _timers("start my eggs timer", TIMER_TAGS | {"eggs"}) == FastIntent(
+            "timers.start", {"label": "eggs"}
+        )
+
+    def test_with_no_saved_tags_no_tag_row_matches(self):
+        empty: frozenset[str] = frozenset()
+
+        assert _alarms("set my gym alarm", empty) is None
+        assert _alarms("cancel my gym alarm", empty) is None
+        assert _timers("start my pasta timer", empty) is None
+        assert _timers("cancel my pasta timer", empty) is None
+        assert _timers("cancel the timer", empty) == FastIntent("timers.cancel", {})
+        assert _alarms("list my alarms", empty) == FastIntent("alarms.list", {})
+
+    def test_a_tag_said_in_full_wins_over_one_that_drops_my(self):
+        tags = frozenset({"gym", "my gym"})
+
+        assert _alarms("set my gym alarm", tags) == FastIntent("alarms.set", {"label": "my gym"})
+
+    def test_the_build_rows_still_match_through_the_combined_grammars(self):
+        assert _alarms("set an alarm for 7") == FastIntent("alarms.set", {"time": "7"})
+        assert _alarms("wake me up at 6:30 tomorrow") == FastIntent(
+            "alarms.set", {"time": "6:30", "day": "tomorrow"}
+        )
+        assert _timers("10 minute timer") == FastIntent("timers.start", {"minutes": 10})
+        assert _alarms("10 minute timer") is None
+        assert _timers("set an alarm for 7") is None
 
 
 STOP_PHRASES = [

@@ -47,10 +47,10 @@ from ..contracts import (
 from ..replies import is_brief_sentence, ok_summary, render_read
 from .intents import (
     SNOOZE_MINUTES_MAX,
-    match_alarm_intent,
+    match_alarms,
     match_clock_intent,
     match_ringing_phrase,
-    match_timer_intent,
+    match_timers,
 )
 from .notifier import AlarmNotifier, alarm_state_payload
 from .records import (
@@ -701,10 +701,16 @@ class AlarmsCapability(_ScheduledCapability):
         return self._tools
 
     def match_intent(self, text: str) -> FastIntent | None:
-        """Match the alarm rows, the time checked in the user's zone at the clock's now."""
+        """Match the alarm rows, the time checked in the user's zone at the clock's now.
+
+        The saved-tag rows read `AlarmRecords.tag_labels`, which the store holds in memory, so
+        this stays synchronous.
+        """
         if self._zone.tz is None:
             return None
-        return match_alarm_intent(text, self._clock.now(), self._zone.tz)
+        return match_alarms(
+            text, self._clock.now(), self._zone.tz, self._records.tag_labels(self._kind)
+        )
 
     def escalate(self, tool: str, args: BaseModel) -> bool:
         """Confirm cancelling every alarm, whatever the policy."""
@@ -943,10 +949,13 @@ class TimersCapability(_ScheduledCapability):
         return self._tools
 
     def match_intent(self, text: str) -> FastIntent | None:
-        """Match the timer rows; none while there is no zone, as no timer can run."""
+        """Match the timer rows; none while there is no zone, as no timer can run.
+
+        The saved-tag rows read `AlarmRecords.tag_labels`, held in memory, as alarms do.
+        """
         if self._scheduler is None:
             return None
-        return match_timer_intent(text)
+        return match_timers(text, self._records.tag_labels(self._kind))
 
     def escalate(self, tool: str, args: BaseModel) -> bool:
         """Confirm cancelling every timer, whatever the policy."""
