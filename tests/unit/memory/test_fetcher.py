@@ -331,6 +331,48 @@ async def test_rerank_is_cut_to_the_pairs_that_fit(
 
 
 @pytest.mark.asyncio
+async def test_the_outcome_carries_the_fused_list_and_the_scored_shortlist(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    rows = [_fact(f"Survey Office {n}") for n in range(6)]
+    fact_index.upsert(rows)
+    reranker = FakeReranker()
+    fetcher = _fetcher(index, executors, reranker=reranker, config=_config(rerank_top_n=4))
+
+    outcome = await fetcher.fetch_outcome(_request("which survey office"))
+
+    # Every fused candidate, in RRF order, before the top_n cut; its head is what was scored.
+    assert len(outcome.fused) == len(rows)
+    rrf = [fused.rrf for fused in outcome.fused]
+    assert rrf == sorted(rrf, reverse=True)
+    [(_, scored_texts, _)] = reranker.calls
+    assert [fused.candidate.text for fused in outcome.fused[:4]] == list(scored_texts)
+    assert outcome.result.reranked == 4
+    # The scored shortlist, unthresholded, in the order and with the scores of the stage.
+    refs = {row.fact_key: graph_ref("user", "WORKS_AT", row.object_id) for row in rows}
+    by_rank = sorted(outcome.result.stage.candidates, key=lambda candidate: candidate.rank)
+    assert [(refs[s.candidate.item_id], s.score) for s in outcome.ranked] == [
+        (candidate.ref, candidate.score) for candidate in by_rank
+    ]
+    assert {s.candidate.item_id for s in outcome.ranked} == {
+        fused.candidate.item_id for fused in outcome.fused[:4]
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_outcome_without_a_stage2_carries_no_candidates(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    fetcher = _fetcher(index, executors, index_state=lambda: "index_rebuilding")
+
+    outcome = await fetcher.fetch_outcome(_request("tidewater survey"))
+
+    assert outcome.result.degraded_reason == "index_rebuilding"
+    assert (outcome.fused, outcome.ranked) == ((), ())
+
+
+@pytest.mark.asyncio
 async def test_each_fact_is_offered_once_by_its_version_current_at_now(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:

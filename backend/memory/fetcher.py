@@ -68,7 +68,7 @@ from .models import (
     ServingProfile,
     StageSkipReason,
 )
-from .ranking import FusedCandidate, ScoredCandidate, score_shortlist, shortlist
+from .ranking import FusedCandidate, ScoredCandidate, fuse, score_shortlist
 from .rerank import NullReranker, Reranker
 from .sources import (
     ANCHOR_TURNS,
@@ -231,10 +231,24 @@ class FetchOutcome:
     the recall harness, flatten a list item back into its facts: the result names a list by
     its best-scored member only, and a sibling only the expansion brought in is not a
     candidate.
+
+    `fused` and `ranked` let the same reader attribute a miss to a stage: the result's stage
+    keeps refs, ranks and scores, not the pool ranks or the score terms, and at most
+    `STAGE_CANDIDATE_CAP` candidates. Both are empty when stage 2 did not run.
+
+    Attributes:
+        result: What `fetch` returns.
+        lists: The fact lists the block placed.
+        fused: Every fused candidate in RRF order, before the `rerank_top_n` cut, so its first
+            `rerank_top_n` are the shortlist whose head the reranker scored.
+        ranked: The scored shortlist before `min_score`, best first; the stage's candidate of
+            rank `i` is `ranked[i - 1]`.
     """
 
     result: MemoryResult
     lists: tuple[PlacedList, ...] = ()
+    fused: tuple[FusedCandidate, ...] = ()
+    ranked: tuple[ScoredCandidate, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,7 +610,8 @@ class MemoryFetcher:
         candidates, versions = await self._pools(request, stage1, deadline, ledger)
         ledger.stage2_s = self._clock.monotonic() - stage2_started
 
-        shortlisted = shortlist(candidates, top_n=self._config.rerank_top_n)
+        fused = fuse(candidates)
+        shortlisted = fused[: self._config.rerank_top_n]
         scores = await self._rerank(request.query_text, shortlisted, deadline, ledger)
         unthresholded = replace(self._config, min_score=0.0)
         ranked = score_shortlist(shortlisted, scores, now=now, window=window, config=unthresholded)
@@ -667,7 +682,9 @@ class MemoryFetcher:
             narrative_suppressed=0,
             stage=stage,
         )
-        return FetchOutcome(result=result, lists=block.lists)
+        return FetchOutcome(
+            result=result, lists=block.lists, fused=tuple(fused), ranked=tuple(ranked)
+        )
 
     async def _pools(
         self, request: MemoryRequest, stage1: _Stage1, deadline: float, ledger: _Ledger
@@ -1201,9 +1218,7 @@ class MemoryFetcher:
         timings = self._timings(started, ledger, "block")
         result = outcome.result
         stage = replace(result.stage, prefetch_reuse="block", timings=timings)
-        return FetchOutcome(
-            result=replace(result, timings=timings, stage=stage), lists=outcome.lists
-        )
+        return replace(outcome, result=replace(result, timings=timings, stage=stage))
 
     def _empty(
         self,
