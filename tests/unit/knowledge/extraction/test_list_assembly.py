@@ -996,3 +996,43 @@ class TestMetricItems:
 
         assert first == second
         assert (frame, items) == before
+
+
+# -- durable groups -----------------------------------------------------------------------------
+
+
+class TestDurableGroupWithNoTemplate:
+    """A durable group with no template: no fact is shared, and each item states its own."""
+
+    def test_each_applying_item_keeps_its_own_edges(self):
+        utterance = "Service latencies:\n- Quorvane: 120 ms\n- Ostrel: 80 ms"
+        group = GroupFrame("G1", (), "Technology", "plan", durable=True)
+        frame = _frame(group)
+
+        def row(item_id: str, name: str, value: str) -> ItemOutput:
+            metric = ListEntity(
+                "e1", f"{value} ms", f"{value} ms", "Metric", value=value, unit="ms"
+            )
+            return _item(
+                item_id,
+                name,
+                entities=[metric],
+                relationships=[_rel("item", "HAS_METRIC", "e1")],
+            )
+
+        items = [row("G1.1", "Quorvane", "120"), row("G1.2", "Ostrel", "80")]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        assert group.durable and group.templates == ()
+        assert _ids(payload) == [
+            "quorvane",
+            canonical_metric_id("120", "ms", None),
+            "ostrel",
+            canonical_metric_id("80", "ms", None),
+        ]
+        assert payload.relationships == [
+            _edge("quorvane", "HAS_METRIC", canonical_metric_id("120", "ms", None), {}),
+            _edge("ostrel", "HAS_METRIC", canonical_metric_id("80", "ms", None), {}),
+        ]
+        assert warnings == []
