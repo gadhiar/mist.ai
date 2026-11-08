@@ -16,7 +16,10 @@ Spec: ~/.claude/plans/cluster-execution-roadmap.md Cluster 6.
 
 from __future__ import annotations
 
+import os
+import random
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 import pytest
 
@@ -24,12 +27,19 @@ from backend.chat.context_budget import (
     ApproximateTokenCounter,
     BudgetPlan,
     ContextBudgetPlanner,
+    HistorySelection,
     SlidingWindowStrategy,
+    StableWindowStrategy,
     get_history_strategy,
     score_fact_for_retrieval_pruning,
 )
 from backend.knowledge.config import ContextBudgetConfig
-from backend.knowledge.models import RetrievalResult, RetrievedFact, fact_ref
+from backend.knowledge.models import (
+    ConversationSession,
+    RetrievalResult,
+    RetrievedFact,
+    fact_ref,
+)
 
 # ---------------------------------------------------------------------------
 # Plan identity invariants, checked on every plan() in this module
@@ -186,13 +196,13 @@ class TestSlidingWindowStrategy:
     def test_empty_history_returns_empty(self):
         strategy = SlidingWindowStrategy()
         counter = ApproximateTokenCounter()
-        assert strategy.select([], 1000, counter) == []
+        assert strategy.select([], 1000, counter) == HistorySelection([], 0, "none")
 
     def test_zero_budget_returns_empty(self):
         strategy = SlidingWindowStrategy()
         counter = ApproximateTokenCounter()
         history = [{"role": "user", "content": "hi"}]
-        assert strategy.select(history, 0, counter) == []
+        assert strategy.select(history, 0, counter) == HistorySelection([], 1, "budget")
 
     def test_fits_returns_all_in_order(self):
         strategy = SlidingWindowStrategy()
@@ -203,7 +213,9 @@ class TestSlidingWindowStrategy:
             {"role": "user", "content": "three"},
         ]
         result = strategy.select(history, 1000, counter)
-        assert [m["content"] for m in result] == ["one", "two", "three"]
+        assert [m["content"] for m in result.messages] == ["one", "two", "three"]
+        assert result.start_index == 0
+        assert result.compacted == "none"
 
     def test_keeps_most_recent_fits_preserve_order(self):
         strategy = SlidingWindowStrategy()
@@ -217,8 +229,10 @@ class TestSlidingWindowStrategy:
         ]
         # Budget = 30 -> fits last 2 messages (28 tokens)
         result = strategy.select(history, 30, counter)
-        assert len(result) == 2
-        assert [m["content"][0] for m in result] == ["c", "d"]  # chronological
+        assert len(result.messages) == 2
+        assert [m["content"][0] for m in result.messages] == ["c", "d"]  # chronological
+        assert result.start_index == 2
+        assert result.compacted == "budget"
 
     def test_keeps_only_last_when_budget_too_small_for_older(self):
         strategy = SlidingWindowStrategy()
@@ -229,8 +243,165 @@ class TestSlidingWindowStrategy:
         ]
         # Budget = 15 -> one message (14) fits; adding second would exceed
         result = strategy.select(history, 15, counter)
-        assert len(result) == 1
-        assert result[0]["content"][0] == "b"
+        assert len(result.messages) == 1
+        assert result.messages[0]["content"][0] == "b"
+        assert result.start_index == 1
+
+    def test_max_messages_caps_before_the_budget_without_counting_as_compaction(self):
+        strategy = SlidingWindowStrategy()
+        counter = ApproximateTokenCounter()
+        history = _alternating_history(9)
+
+        result = strategy.select(history, 10_000, counter, max_messages=4)
+
+        assert result.messages == history[-4:]
+        assert result.start_index == 5
+        assert result.compacted == "none"
+
+    def test_full_history_reproduces_the_pre_sliced_selection(self):
+        """Given the session's full history and `max_messages`, the selection
+        equals what the old list-returning strategy chose from
+        `get_history(max_messages)`, over 40 random histories and budgets.
+        """
+        rng = random.Random(1717)
+        strategy = SlidingWindowStrategy()
+        counter = ApproximateTokenCounter()
+        for _ in range(40):
+            session = ConversationSession(session_id="eq", user_id="U")
+            for i in range(rng.randint(0, 60)):
+                role = "user" if i % 2 == 0 else "assistant"
+                session.add_message(role, "w" * rng.randint(0, 400))
+            max_messages = rng.choice([None, 0, 1, 5, 10, 20])
+            budget = rng.randint(0, 3000)
+
+            expected = _old_sliding_select(session.get_history(max_messages), budget, counter)
+            result = strategy.select(
+                session.get_history(None), budget, counter, max_messages=max_messages
+            )
+
+            assert result.messages == expected
+            full = session.get_history(None)
+            assert result.messages == full[result.start_index :]
+
+
+def _alternating_history(count: int, *, size: int = 36) -> list[dict]:
+    """`count` messages alternating user, assistant, each `size` characters."""
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"{i:03d}" + "x" * (size - 3)}
+        for i in range(count)
+    ]
+
+
+def _old_sliding_select(history: list[dict], budget: int, counter) -> list[dict]:
+    """The sliding-window selection as it was before `HistorySelection`."""
+    if budget <= 0 or not history:
+        return []
+    selected: list[dict] = []
+    used = 0
+    for msg in reversed(history):
+        cost = counter.count_message(msg)
+        if used + cost > budget:
+            break
+        selected.append(msg)
+        used += cost
+    selected.reverse()
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# StableWindowStrategy
+# ---------------------------------------------------------------------------
+
+
+class TestStableWindowStrategy:
+    def _select(self, history, budget=1_000_000, *, max_messages=10, factor=2.0):
+        return StableWindowStrategy().select(
+            history,
+            budget,
+            ApproximateTokenCounter(),
+            max_messages=max_messages,
+            high_water_factor=factor,
+        )
+
+    def test_window_steps_only_past_the_high_water_mark(self):
+        """Turn n holds 2n-1 messages (its own user message last). At 10
+        messages and factor 2.0 the start moves on turns 11, 16, 21 and 26,
+        in steps of 10 counted from the first message.
+        """
+        starts = {}
+        for turn in range(1, 31):
+            history = _alternating_history(2 * turn - 1)
+            selection = self._select(history)
+            assert selection.messages == history[selection.start_index :]
+            starts[turn] = selection.start_index
+        moved = [t for t in range(2, 31) if starts[t] != starts[t - 1]]
+        assert moved == [11, 16, 21, 26]
+        assert starts[10] == 0
+        assert starts[11] == 10
+        assert starts[16] == 20
+        assert starts[30] == 40
+
+    def test_window_never_exceeds_high_water_nor_drops_below_max_messages(self):
+        for count in range(1, 80):
+            selection = self._select(_alternating_history(count))
+            assert min(count, 10) <= len(selection.messages) <= 20
+
+    def test_compacted_reports_none_then_step(self):
+        assert self._select(_alternating_history(19)).compacted == "none"
+        assert self._select(_alternating_history(21)).compacted == "step"
+
+    def test_starts_on_a_whole_exchange_with_odd_max_messages(self):
+        for count in range(1, 60):
+            selection = self._select(_alternating_history(count), max_messages=5)
+            assert selection.start_index % 2 == 0
+            assert len(selection.messages) >= min(count, 5)
+
+    def test_factor_one_keeps_the_last_max_messages(self):
+        # The step rule alone would start at 20 (5 messages); the floor of 10
+        # messages moves it back to 15, and the exchange that 15 belongs to
+        # starts at 14.
+        history = _alternating_history(25)
+        selection = self._select(history, factor=1.0)
+        assert selection.start_index == 14
+        assert selection.messages == history[14:]
+
+    def test_over_budget_jumps_further_steps(self):
+        # Factor 3.0, 35 messages of 14 tokens each: the step rule starts the
+        # window at 10 (25 messages, 350 tokens). One more step, to 20, keeps
+        # 15 messages (210 tokens), which fits the budget of 215.
+        history = _alternating_history(35)
+        selection = self._select(history, budget=215, factor=3.0)
+        assert selection.start_index == 20
+        assert selection.compacted == "budget"
+
+    def test_drops_whole_exchanges_when_one_step_does_not_fit(self):
+        history = _alternating_history(21)  # step start 10, 11 messages
+        # 7 messages fit (98 tokens); whole exchanges keep 7 (start at 14).
+        selection = self._select(history, budget=100)
+        assert selection.start_index == 14
+        assert selection.messages == history[14:]
+        assert selection.compacted == "budget"
+
+    def test_budget_compaction_without_max_messages(self):
+        history = _alternating_history(9)
+        selection = self._select(history, budget=60, max_messages=None)
+        # 4 messages fit (56 tokens); the front exchange boundary at 6
+        # leaves 3, the boundary at 4 would need 5.
+        assert selection.start_index == 6
+        assert selection.compacted == "budget"
+        assert self._select(history, max_messages=None).compacted == "none"
+
+    def test_empty_and_zero_budget(self):
+        assert self._select([]) == HistorySelection([], 0, "none")
+        assert self._select(_alternating_history(3), budget=0) == HistorySelection([], 3, "budget")
+
+    def test_is_a_pure_function_of_history_and_budget(self):
+        history = _alternating_history(47)
+        first = self._select(history, budget=300)
+        assert self._select(list(history), budget=300) == first
+        assert StableWindowStrategy().select(
+            history, 300, ApproximateTokenCounter(), max_messages=10
+        ) == self._select(history, budget=300)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +417,72 @@ class TestHistoryStrategyRegistry:
         # Should log a warning and return the default.
         strategy = get_history_strategy("nonexistent_strategy")
         assert isinstance(strategy, SlidingWindowStrategy)
+
+    def test_stable_window_is_registered(self):
+        assert isinstance(get_history_strategy("stable_window"), StableWindowStrategy)
+
+
+# ---------------------------------------------------------------------------
+# ContextBudgetConfig prompt-layout settings
+# ---------------------------------------------------------------------------
+
+
+class TestContextBudgetConfigPromptLayout:
+    def test_defaults(self):
+        config = ContextBudgetConfig()
+        assert config.turn_delta_max_tokens == 1000
+        assert config.delta_placement == "user_prefix"
+        assert config.history_high_water_factor == 2.0
+        assert config.history_strategy == "stable_window"
+
+    def test_from_env_defaults(self):
+        keys = (
+            "MIST_CTX_BUDGET_TURN_DELTA_MAX_TOKENS",
+            "MIST_CTX_BUDGET_DELTA_PLACEMENT",
+            "MIST_CTX_BUDGET_HISTORY_HIGH_WATER",
+            "MIST_CTX_BUDGET_HISTORY_STRATEGY",
+        )
+        env = {k: v for k, v in os.environ.items() if k not in keys}
+        with mock.patch.dict(os.environ, env, clear=True):
+            config = ContextBudgetConfig.from_env()
+        assert config.turn_delta_max_tokens == 1000
+        assert config.delta_placement == "user_prefix"
+        assert config.history_high_water_factor == 2.0
+        assert config.history_strategy == "stable_window"
+
+    def test_from_env_reads_each_variable(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MIST_CTX_BUDGET_TURN_DELTA_MAX_TOKENS": "600",
+                "MIST_CTX_BUDGET_DELTA_PLACEMENT": "system_tail",
+                "MIST_CTX_BUDGET_HISTORY_HIGH_WATER": "3.5",
+                "MIST_CTX_BUDGET_HISTORY_STRATEGY": "sliding_window",
+            },
+        ):
+            config = ContextBudgetConfig.from_env()
+        assert config.turn_delta_max_tokens == 600
+        assert config.delta_placement == "system_tail"
+        assert config.history_high_water_factor == 3.5
+        assert config.history_strategy == "sliding_window"
+
+    def test_invalid_placement_raises(self):
+        with pytest.raises(ValueError, match="delta_placement"):
+            ContextBudgetConfig(delta_placement="before_history")
+
+    def test_invalid_placement_from_env_raises(self):
+        with (
+            mock.patch.dict(os.environ, {"MIST_CTX_BUDGET_DELTA_PLACEMENT": "middle"}),
+            pytest.raises(ValueError, match="delta_placement"),
+        ):
+            ContextBudgetConfig.from_env()
+
+    def test_factor_below_one_raises(self):
+        with pytest.raises(ValueError, match="history_high_water_factor"):
+            ContextBudgetConfig(history_high_water_factor=0.99)
+
+    def test_factor_of_exactly_one_is_accepted(self):
+        assert ContextBudgetConfig(history_high_water_factor=1.0).history_high_water_factor == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +731,27 @@ class TestContextBudgetPlanner:
         assert len(plan.pruned_history) < len(many_messages)
         # Chronological order preserved.
         assert plan.pruned_history == many_messages[-len(plan.pruned_history) :]
+
+    def test_plan_passes_max_history_and_factor_to_the_strategy(self):
+        planner = ContextBudgetPlanner(
+            config=_default_config(context_window=100_000, history_high_water_factor=3.0)
+        )
+        history = _alternating_history(31)
+
+        plan = planner.plan(
+            persona_text="p",
+            static_text="s",
+            retrieval_result=None,
+            live_advisory_text=None,
+            history=history,
+            tools=None,
+            max_output_tokens=100,
+            max_history=10,
+        )
+
+        # Factor 3.0 at 10 messages: 31 messages exceed 30, so one step.
+        assert plan.pruned_history == history[10:]
+        assert plan.history_compacted == "step"
 
     def test_tools_schema_charged_to_fixed_cost(self):
         config = _default_config(

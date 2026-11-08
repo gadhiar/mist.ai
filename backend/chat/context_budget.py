@@ -11,8 +11,8 @@ responses went empty.
 Cluster 6 enforces a hard prompt-token budget. Fixed segments (persona,
 tools, static system) consume from the top. The remainder is split between
 retrieval and history using a configurable ratio. Retrieval is pruned by
-priority score; history is pruned by a pluggable strategy (sliding-window
-default). All arithmetic happens BEFORE LLMRequest construction so the
+priority score; history is pruned by a pluggable strategy (`stable_window`
+by default). All arithmetic happens BEFORE LLMRequest construction so the
 model never sees oversized prompts.
 
 Components:
@@ -20,9 +20,11 @@ Components:
   (char/3.6 heuristic, fast, zero-IO) is the default. `LlamaServerTokenCounter`
   calls llama-server's /tokenize endpoint for exact counts (slow — reserved
   for validation, not inner loop).
-- `HistoryStrategy`: protocol for history pruning. `SlidingWindowStrategy`
-  keeps the most recent turns that fit; future strategies (summarization)
-  plug into the same interface.
+- `HistoryStrategy`: protocol for history pruning; every strategy returns a
+  `HistorySelection`. `SlidingWindowStrategy` keeps the most recent messages
+  that fit; `StableWindowStrategy` moves the window's start in steps so
+  consecutive prompts share their history and llama-server can reuse its
+  cached prefix.
 - `ContextBudgetPlanner`: owns the arithmetic. Computes fixed cost, splits
   remainder, invokes strategies, returns the pruned retrieval context string
   and pruned history list.
@@ -38,7 +40,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from backend.knowledge.config import ContextBudgetConfig
 from backend.knowledge.models import RetrievalResult, RetrievedFact, fact_ref
@@ -116,6 +118,26 @@ class ApproximateTokenCounter:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class HistorySelection:
+    """The part of a history a strategy chose, and why its front was cut.
+
+    `messages` is always `history[start_index:]`: every strategy keeps a
+    contiguous tail, so a caller can tell which messages were left out by
+    index alone.
+
+    `compacted` says what removed messages from the front: `none` when
+    nothing beyond the strategy's own message cap was removed (for
+    `stable_window`, when the window starts at the first message), `step`
+    when `stable_window`'s stepped start removed them, and `budget` when the
+    token budget removed more than the cap or the step would have.
+    """
+
+    messages: list[dict[str, Any]]
+    start_index: int
+    compacted: Literal["none", "step", "budget"]
+
+
 class HistoryStrategy(Protocol):
     """Chooses which history messages fit the budget."""
 
@@ -124,24 +146,44 @@ class HistoryStrategy(Protocol):
         history: list[dict[str, Any]],
         budget_tokens: int,
         counter: TokenCounter,
-    ) -> list[dict[str, Any]]:
-        """Return a subset of `history` whose total token count ≤ `budget_tokens`.
+        *,
+        max_messages: int | None = None,
+        high_water_factor: float = 2.0,
+    ) -> HistorySelection:
+        """Choose a chronological tail of `history` costing at most `budget_tokens`.
 
-        Must return messages in original chronological order. May return an
-        empty list when the budget is too small for any message.
+        Args:
+            history: The session's full history, oldest first.
+            budget_tokens: Token budget for the selected messages.
+            counter: Token counter used to cost each message.
+            max_messages: The message cap the caller would have sliced to
+                (falsy: no cap, as `ConversationSession.get_history` treats it).
+            high_water_factor: For strategies that let the window grow past
+                `max_messages`, how far (as a multiple) before it is cut.
+
+        Returns:
+            A `HistorySelection`; its messages may be empty when the budget is
+            too small for any message.
         """
         ...
 
 
+def _suffix_costs(history: list[dict[str, Any]], counter: TokenCounter) -> list[int]:
+    """`costs[i]` is the token cost of `history[i:]`; `costs[len(history)]` is 0."""
+    costs = [0] * (len(history) + 1)
+    for index in range(len(history) - 1, -1, -1):
+        costs[index] = costs[index + 1] + counter.count_message(history[index])
+    return costs
+
+
 class SlidingWindowStrategy:
-    """Keeps the most recent N turns that fit the budget.
+    """Keeps the most recent messages that fit the budget.
 
-    Walks history in reverse (newest first) and accumulates until adding the
-    next message would exceed the budget. Preserves chronological order in
-    the returned list.
-
-    This is the simplest viable strategy for MVP. Summarization and
-    hierarchical strategies plug into the same interface post-Cluster-6.
+    Caps the history at the last `max_messages`, then walks it in reverse
+    (newest first) and accumulates until adding the next message would
+    exceed the budget. The window's start moves on every turn, so the
+    prompt's history changes at its front each time; `stable_window` exists
+    to avoid that.
     """
 
     def select(
@@ -149,26 +191,120 @@ class SlidingWindowStrategy:
         history: list[dict[str, Any]],
         budget_tokens: int,
         counter: TokenCounter,
-    ) -> list[dict[str, Any]]:
-        """Keep the most recent history messages that fit the token budget."""
-        if budget_tokens <= 0 or not history:
-            return []
+        *,
+        max_messages: int | None = None,
+        high_water_factor: float = 2.0,
+    ) -> HistorySelection:
+        """Keep the most recent history messages that fit the token budget.
 
-        selected_reverse: list[dict[str, Any]] = []
+        `high_water_factor` is accepted for the protocol and not used.
+        """
+        if not history:
+            return HistorySelection(messages=[], start_index=0, compacted="none")
+        total = len(history)
+        if budget_tokens <= 0:
+            return HistorySelection(messages=[], start_index=total, compacted="budget")
+
+        cap_start = max(0, total - max_messages) if max_messages else 0
+        start = total
         used = 0
-        for msg in reversed(history):
-            cost = counter.count_message(msg)
+        for index in range(total - 1, cap_start - 1, -1):
+            cost = counter.count_message(history[index])
             if used + cost > budget_tokens:
                 break
-            selected_reverse.append(msg)
+            start = index
             used += cost
 
-        selected_reverse.reverse()
-        return selected_reverse
+        return HistorySelection(
+            messages=history[start:],
+            start_index=start,
+            compacted="budget" if start > cap_start else "none",
+        )
+
+
+class StableWindowStrategy:
+    """Moves the history window's start in steps, so the prompt prefix survives turns.
+
+    llama-server reuses its KV cache only up to the first token that differs
+    from the previous prompt. A window whose start moves every turn changes
+    the history's first message every turn, so nothing after the stable
+    prefix is reused. This strategy grows the window append-only and moves
+    its start only in steps of `max_messages`, counted from the session's
+    first message, when the window would exceed `high_water_factor` x
+    `max_messages`. Between steps every prompt extends the previous one.
+
+    Rules, in order:
+
+    1. The start is the first multiple of `max_messages` that keeps the
+       window within the high-water mark, but never later than leaving the
+       last `max_messages` messages (which binds only for factors below 2).
+    2. The start moves back to the beginning of the exchange (the user
+       message) it falls in, so the window holds whole exchanges.
+    3. Over budget, the start jumps further steps while the window keeps at
+       least `max_messages` messages.
+    4. If it still does not fit, whole exchanges are dropped from the front
+       until it does.
+
+    The selection is a pure function of the history, the budget and the two
+    settings, so a replayed session gets the same windows. Without
+    `max_messages` there is no step: the whole history is kept and rule 4
+    alone applies.
+    """
+
+    def select(
+        self,
+        history: list[dict[str, Any]],
+        budget_tokens: int,
+        counter: TokenCounter,
+        *,
+        max_messages: int | None = None,
+        high_water_factor: float = 2.0,
+    ) -> HistorySelection:
+        """Select the stepped window, then fit it to the budget."""
+        total = len(history)
+        if total == 0:
+            return HistorySelection(messages=[], start_index=0, compacted="none")
+        if budget_tokens <= 0:
+            return HistorySelection(messages=[], start_index=total, compacted="budget")
+
+        exchange_starts = [
+            index
+            for index, message in enumerate(history)
+            if index == 0 or message.get("role") == "user"
+        ]
+
+        def exchange_start_at_or_before(index: int) -> int:
+            return max(start for start in exchange_starts if start <= index)
+
+        costs = _suffix_costs(history, counter)
+        compacted: Literal["none", "step", "budget"] = "none"
+        start = 0
+        if max_messages:
+            high_water = int(high_water_factor * max_messages)
+            step = max(0, math.ceil((total - high_water) / max_messages))
+            floor_start = max(0, total - max_messages)
+            start = exchange_start_at_or_before(min(step * max_messages, floor_start))
+            if start > 0:
+                compacted = "step"
+            while costs[start] > budget_tokens:
+                step += 1
+                candidate = exchange_start_at_or_before(step * max_messages)
+                if candidate <= start or total - candidate < max_messages:
+                    break
+                start = candidate
+                compacted = "budget"
+
+        while costs[start] > budget_tokens:
+            later = [index for index in exchange_starts if index > start]
+            start = later[0] if later else total
+            compacted = "budget"
+
+        return HistorySelection(messages=history[start:], start_index=start, compacted=compacted)
 
 
 _HISTORY_STRATEGIES: dict[str, HistoryStrategy] = {
     "sliding_window": SlidingWindowStrategy(),
+    "stable_window": StableWindowStrategy(),
 }
 
 
@@ -247,7 +383,8 @@ class BudgetPlan:
 
     `retrieval_budget` and `history_budget` are the allocated token budgets;
     `retrieval_used` and `history_used` are what the pruned output actually
-    consumed.
+    consumed. `history_compacted` is the history strategy's
+    `HistorySelection.compacted` (`budget` when nothing fits at all).
 
     `kept_fact_refs` and `dropped_fact_refs` name the facts behind
     `facts_kept` and `facts_dropped` (see `fact_ref`), so the turn trace can
@@ -271,6 +408,7 @@ class BudgetPlan:
     kept_fact_refs: tuple[str, ...] = ()
     dropped_fact_refs: tuple[str, ...] = ()
     retrieval_rerendered: bool = False
+    history_compacted: Literal["none", "step", "budget"] = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +510,7 @@ class ContextBudgetPlanner:
         tools: list[dict] | None,
         max_output_tokens: int,
         extra_fixed_texts: list[str] | None = None,
+        max_history: int | None = None,
     ) -> BudgetPlan:
         """Plan the budget allocation for a single turn.
 
@@ -381,6 +520,8 @@ class ContextBudgetPlanner:
             retrieval_result: Auto-RAG result (or None if retrieval was skipped).
             live_advisory_text: Optional live-data advisory body.
             history: Conversation history messages in chronological order.
+                The history strategy chooses the window from it, so pass the
+                whole history rather than a pre-sliced tail.
             tools: Tool schema array passed alongside messages.
             max_output_tokens: `LLMRequest.max_tokens` for the coming call.
             extra_fixed_texts: Additional always-injected blocks (vault
@@ -389,6 +530,8 @@ class ContextBudgetPlanner:
                 blocks eat the quality envelope past the 256-token safety
                 margin while the planner believes pruned retrieval/history
                 still fits.
+            max_history: Message cap handed to the history strategy as
+                `max_messages`, with `config.history_high_water_factor`.
 
         Returns:
             BudgetPlan describing what survives the budget, what got pruned,
@@ -434,6 +577,7 @@ class ContextBudgetPlanner:
                 facts_kept=0,
                 facts_dropped=(len(retrieval_result.facts) if retrieval_result else 0),
                 dropped_fact_refs=(_refs(retrieval_result.facts) if retrieval_result else ()),
+                history_compacted="budget" if history else "none",
             )
 
         # Allocate flex budget by ratio.
@@ -455,8 +599,14 @@ class ContextBudgetPlanner:
             retrieval_rerendered = prune.rerendered
 
         # Prune history by strategy.
-        pruned_history = self._history_strategy.select(history, history_budget, self._counter)
-        history_used = self._counter.count_messages(pruned_history)
+        selection = self._history_strategy.select(
+            history,
+            history_budget,
+            self._counter,
+            max_messages=max_history,
+            high_water_factor=self._config.history_high_water_factor,
+        )
+        history_used = self._counter.count_messages(selection.messages)
 
         return BudgetPlan(
             fits=True,
@@ -465,7 +615,7 @@ class ContextBudgetPlanner:
             retrieval_budget=retrieval_budget,
             history_budget=history_budget,
             pruned_retrieval_text=pruned_retrieval_text,
-            pruned_history=pruned_history,
+            pruned_history=selection.messages,
             retrieval_used=retrieval_used,
             history_used=history_used,
             facts_kept=len(kept_facts),
@@ -473,6 +623,7 @@ class ContextBudgetPlanner:
             kept_fact_refs=_refs(kept_facts),
             dropped_fact_refs=_refs(dropped_facts),
             retrieval_rerendered=retrieval_rerendered,
+            history_compacted=selection.compacted,
         )
 
     def _prune_retrieval(
