@@ -1036,3 +1036,52 @@ class TestDurableGroupWithNoTemplate:
             _edge("ostrel", "HAS_METRIC", canonical_metric_id("80", "ms", None), {}),
         ]
         assert warnings == []
+
+
+# -- the last-resort drop -----------------------------------------------------------------------
+
+
+class TestLastResortDrop:
+    """The two unresolved ends no parse check can refuse, which assembly drops with a warning."""
+
+    def test_an_item_edge_to_a_later_batchs_null_entity_item_is_dropped(self):
+        utterance = "Editors I tried:\n- Kestrel\n- Tallow\n- the one after both"
+        frame = _frame(_group("G1", ("user", "USES", "item")))
+        items = [
+            # G1.1's call ran before G1.3's, so it could not see that G1.3 has no entity.
+            _item("G1.1", "Kestrel", relationships=[_rel("item", "RELATED_TO", "item:G1.3")]),
+            _item("G1.2", "Tallow"),
+            _item("G1.3", None, applies=False),
+        ]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        assert _triples(payload) == [("user", "USES", "kestrel"), ("user", "USES", "tallow")]
+        assert warnings == ["list_item_ref_unresolved"]
+
+    def test_each_end_naming_an_item_that_took_the_fallback_is_dropped(self):
+        utterance = "Tools MIST runs on:\n- Ostrel:\n  - Velquist\n- Brill"
+        frame = _frame(
+            _group("G1", ("mist", "IMPLEMENTED_WITH", "item")),
+            _group("G2", ("item", "DEPENDS_ON", "parent")),
+            relationships=[_rel("user", "PREFERS", "item:G1.1")],
+        )
+        fallback = ExtractionPayload(
+            entities=[_MIST, {"id": "ostrel", "name": "Ostrel", "type": "Technology"}],
+            relationships=[_edge("mist-identity", "IMPLEMENTED_WITH", "ostrel", {})],
+        )
+        items = [
+            # G1.1 took the fallback, so its item output, entity and all, is ignored.
+            _item("G1.1", "Ostrel"),
+            _item("G2.1", "Velquist"),
+            _item("G1.2", "Brill", relationships=[_rel("item", "RELATED_TO", "item:G1.1")]),
+        ]
+
+        payload, warnings = _run(utterance, frame, items, {"G1.1": fallback})
+
+        # The frame fact, G2.1's `parent` template end and G1.2's own edge each name G1.1.
+        assert _triples(payload) == [
+            ("mist-identity", "IMPLEMENTED_WITH", "ostrel"),
+            ("mist-identity", "IMPLEMENTED_WITH", "brill"),
+        ]
+        assert warnings == ["list_item_ref_unresolved"] * 3
