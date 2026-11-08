@@ -148,6 +148,36 @@ def _info_response() -> InfoResponse:
     )
 
 
+_RUN_IDENTITY_COMPONENTS: dict[str, str | int | float | bool | None] = {
+    "prompt_sha256": "p" * 64,
+    "adapter": "gptoss",
+    "temperature": 0.0,
+    "max_attempts": 2,
+    "scope_enabled": True,
+    "reasoning_budget_tokens": None,
+}
+
+
+def _result_stamps_1_2_0() -> ResultStamps:
+    return _result_stamps().model_copy(update={"run_identity": "ri1-" + "a" * 64})
+
+
+def _extract_response_1_2_0() -> ExtractResponse:
+    return _extract_response().model_copy(
+        update={"contract_version": "1.2.0", "stamps": _result_stamps_1_2_0()}
+    )
+
+
+def _info_response_1_2_0() -> InfoResponse:
+    return _info_response().model_copy(
+        update={
+            "contract_version": "1.2.0",
+            "run_identity": "ri1-" + "a" * 64,
+            "run_identity_components": dict(_RUN_IDENTITY_COMPONENTS),
+        }
+    )
+
+
 # The /v1/info body a contract 1.0.0 server sends: the seven original fields
 # and nothing else.
 _INFO_1_0_0_PAYLOAD = {
@@ -227,12 +257,15 @@ ROUND_TRIP_FIXTURES = [
     _extraction_payload,
     _derivation_out,
     _result_stamps,
+    _result_stamps_1_2_0,
     _timings_ms,
     _extract_response,
+    _extract_response_1_2_0,
     _error_detail,
     _error_envelope,
     _health_response,
     _info_response,
+    _info_response_1_2_0,
     _service_status,
     _last_job,
     _cutover_status,
@@ -353,11 +386,83 @@ class TestInfoResponseServingConfig:
 
 
 class TestContractVersion:
-    def test_the_contract_is_1_1_0(self):
-        assert CONTRACT_VERSION == "1.1.0"
+    def test_the_contract_is_1_2_0(self):
+        assert CONTRACT_VERSION == "1.2.0"
 
     def test_this_contract_accepts_its_own_version(self):
         assert is_compatible(CONTRACT_VERSION) is True
+
+
+class TestRunIdentityFields:
+    """Contract 1.2.0 adds the run identity, optional on both sides of the wire."""
+
+    def test_a_1_1_0_response_without_a_run_identity_parses(self):
+        payload = _extract_response().model_dump(mode="json")
+        payload["contract_version"] = "1.1.0"
+        del payload["stamps"]["run_identity"]
+
+        response = ExtractResponse.model_validate(payload)
+
+        assert response.stamps.run_identity is None
+        assert is_compatible(response.contract_version) is True
+
+    def test_a_1_1_0_info_without_a_run_identity_parses(self):
+        payload = _info_response().model_dump(mode="json")
+        del payload["run_identity"]
+        del payload["run_identity_components"]
+
+        info = InfoResponse.model_validate(payload)
+
+        assert info.contract_version == "1.1.0"
+        assert info.run_identity is None
+        assert info.run_identity_components is None
+
+    def test_a_1_2_0_response_carries_its_run_identity(self):
+        restored = ExtractResponse.model_validate(_extract_response_1_2_0().model_dump(mode="json"))
+
+        assert restored.stamps.run_identity == "ri1-" + "a" * 64
+
+    def test_the_components_keep_their_json_types(self):
+        dumped = _info_response_1_2_0().model_dump(mode="json")
+
+        restored = InfoResponse.model_validate(dumped).run_identity_components
+
+        assert restored == _RUN_IDENTITY_COMPONENTS
+        assert {k: type(v) for k, v in restored.items()} == {
+            k: type(v) for k, v in _RUN_IDENTITY_COMPONENTS.items()
+        }
+
+    def test_a_component_that_is_not_a_scalar_is_rejected(self):
+        payload = _info_response_1_2_0().model_dump(mode="json")
+        payload["run_identity_components"] = {"nested": {"a": 1}}
+
+        with pytest.raises(ValidationError):
+            InfoResponse.model_validate(payload)
+
+
+class TestStage2Calls:
+    """Contract 1.2.0 adds the Stage 2 call count, defaulting to the one call of 1.1.0."""
+
+    def test_a_1_1_0_response_without_stage2_calls_reports_one(self):
+        payload = _extract_response().model_dump(mode="json")
+        payload["contract_version"] = "1.1.0"
+        del payload["stage2_calls"]
+
+        assert ExtractResponse.model_validate(payload).stage2_calls == 1
+
+    def test_a_1_2_0_response_carries_its_count(self):
+        response = _extract_response_1_2_0().model_copy(update={"stage2_calls": 7})
+
+        restored = ExtractResponse.model_validate(response.model_dump(mode="json"))
+
+        assert restored.stage2_calls == 7
+
+    def test_zero_calls_is_rejected(self):
+        payload = _extract_response().model_dump(mode="json")
+        payload["stage2_calls"] = 0
+
+        with pytest.raises(ValidationError):
+            ExtractResponse.model_validate(payload)
 
 
 class TestCutoverStatusChecked:

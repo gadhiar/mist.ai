@@ -1,0 +1,165 @@
+{
+  "schema": 1,
+  "_comment": "The low-level tool set of run 7 (mist-model-host plan v2), in the OpenAI `tools` format llama-server reads with --jinja. Eleven tools; nothing here is executed: run 7 scores the calls a model makes. Dates are YYYY-MM-DD and times 24-hour HH:MM, resolved from the date and time the low-level prompt gives. `hand_off` passes a request up to the larger model.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "set_timer",
+        "description": "Start a countdown timer.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "duration_seconds": {"type": "integer", "minimum": 1, "description": "Length of the timer in seconds."},
+            "label": {"type": "string", "description": "Optional name for the timer."}
+          },
+          "required": ["duration_seconds"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "set_alarm",
+        "description": "Set an alarm for a date and time.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "date": {"type": "string", "description": "Date of the alarm, YYYY-MM-DD."},
+            "time": {"type": "string", "description": "Time of the alarm, 24-hour HH:MM."},
+            "label": {"type": "string", "description": "Optional name for the alarm."}
+          },
+          "required": ["date", "time"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "cancel_alarm",
+        "description": "Cancel the alarm set for a time.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "time": {"type": "string", "description": "Time of the alarm to cancel, 24-hour HH:MM."}
+          },
+          "required": ["time"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "add_reminder",
+        "description": "Add a reminder that is spoken at a date and time.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string", "description": "What to remind the user of."},
+            "date": {"type": "string", "description": "Date of the reminder, YYYY-MM-DD."},
+            "time": {"type": "string", "description": "Time of the reminder, 24-hour HH:MM."}
+          },
+          "required": ["text", "date", "time"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "add_to_list",
+        "description": "Add items to one of the user's lists.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "list_name": {"type": "string", "enum": ["shopping", "todo"], "description": "The list to add to."},
+            "items": {"type": "array", "items": {"type": "string"}, "description": "One entry per item."}
+          },
+          "required": ["list_name", "items"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "set_lights",
+        "description": "Switch, dim or brighten the lights in a room, or in every room.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "room": {"type": "string", "enum": ["living room", "kitchen", "bedroom", "office", "hallway", "all"], "description": "The room, or all for every room."},
+            "action": {"type": "string", "enum": ["on", "off", "dim", "brighten", "set"], "description": "What to do; set uses brightness."},
+            "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Brightness in percent."}
+          },
+          "required": ["room", "action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "control_music",
+        "description": "Play, pause, skip or change the volume of the music.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {"type": "string", "enum": ["play", "pause", "resume", "next", "previous", "volume_up", "volume_down", "stop"], "description": "What to do."},
+            "query": {"type": "string", "description": "What to play, for play: an artist, a genre, a mood or a playlist."}
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "show_panel",
+        "description": "Show a panel on one of the desk monitors.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "panel": {"type": "string", "enum": ["report", "chart", "calendar", "notes", "weather", "timers"], "description": "The panel to show."},
+            "monitor": {"type": "integer", "minimum": 1, "maximum": 3, "description": "1 is the main screen, 2 the second monitor, 3 the third."}
+          },
+          "required": ["panel", "monitor"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "close_panel",
+        "description": "Close a panel; with no panel named, close the one in focus.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "panel": {"type": "string", "enum": ["report", "chart", "calendar", "notes", "weather", "timers"], "description": "The panel to close."}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sleep",
+        "description": "Go quiet until the user speaks the wake word again.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hand_off",
+        "description": "Pass the request to the larger model, for anything that needs memory of past conversations or work, a long answer, or careful thought.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "request": {"type": "string", "description": "The user's request, restated in full."},
+            "reason": {"type": "string", "enum": ["memory", "long_answer", "careful_thought"], "description": "Why the request is passed up."}
+          },
+          "required": ["request", "reason"]
+        }
+      }
+    }
+  ]
+}

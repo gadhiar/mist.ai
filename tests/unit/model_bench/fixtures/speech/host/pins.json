@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "_comment": "Test fixture in the shape of the pin file host step H2 writes. The models are fake: their files are short byte strings tests/unit/model_bench/test_speech_core.py and test_speech_docker_cmds.py write, so the sha256 and size values here are of those bytes, not of any real model.",
+  "models": {
+    "gemma4-e2b": {"repository": "unsloth/gemma-4-E2B-it-GGUF", "revision": "fake-rev-e2b", "file": "gemma-4-E2B-it-Q4_K_M.gguf", "sha256": "26b7d98d6e8d0b08b902fbdc16115415a9f4601c10466033b52e8da4fb080ecc", "size": 1856},
+    "minicpm5-2b": {"repository": "openbmb/MiniCPM5-2B-GGUF", "revision": "fake-rev-minicpm", "file": "MiniCPM5-2B-Q4_K_M.gguf", "sha256": "1fef3800a36adf06d1ddbf6aaf184bc65662e6e4c5bcb0af403728dd1822d346", "size": 1440},
+    "qwen35-4b": {"repository": "unsloth/Qwen3.5-4B-GGUF", "revision": "fake-rev-qwen", "file": "Qwen3.5-4B-Q4_K_M.gguf", "sha256": "d5a992bf06c8a26dd25672c57f3d6c5274bbfe72a9dbaaebb107a3262e164a0d", "size": 2240},
+    "e4b-ref": {"repository": "unsloth/gemma-4-E4B-it-GGUF", "revision": "fake-rev-e4b", "file": "unsloth/gemma-4-E4B-it-Q5_K_M.gguf", "sha256": "751eac76c422ec85837690ad40e86b61195e98bcdbc84c6e79f97cde49daa2d7", "size": 2496}
+  },
+  "images": {
+    "cpu-llama": "ghcr.io/ggml-org/llama.cpp:server-b11151@sha256:fffcc1af1105bafc713a47b6680fb7cf5856ed43ea2e9e8bca5a62bbd6365edf"
+  }
+}

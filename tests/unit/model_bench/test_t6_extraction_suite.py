@@ -14,7 +14,8 @@ Covers (see the T6 task brief's "Red before green" list):
 - `score_extraction_run.py`'s scoring functions are imported and called, not
   reimplemented, by `probes/extraction.py`.
 - The summary math (Wilson interval, cluster-by-probe-id bootstrap CI,
-  rel_f1) is correct on a small hand-computable fixture.
+  rel_f1 and its bootstrap interval) is correct on small hand-computable
+  fixtures.
 - `analyse.py`'s new "Extraction quality" section is report-only (no
   verdict) and the v1 `Rules` + `Exploratory` sections stay byte-identical.
 """
@@ -24,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest  # noqa: E402
 
+from scripts.eval_harness.score_extraction_run import Report  # noqa: E402
 from scripts.model_bench import (
     analyse,  # noqa: E402
     bench_host,  # noqa: E402
@@ -628,6 +631,226 @@ def test_build_summary_records_env_values():
         "pythonhashseed": "0",
         "mist_fixed_clock": "2026-06-13T00:00:00+00:00",
     }
+
+
+# ---------------------------------------------------------------------------
+# probes/extraction.py: the relation F1 bootstrap interval (T12)
+# ---------------------------------------------------------------------------
+#
+# An F1 interval cannot be assembled from separate precision and recall
+# intervals, since both read the same true positives; each replicate has to
+# compute F1 from its own pooled counts.
+
+
+def _report_from_rel_counts(rel_counts: dict[str, tuple[int, int, int]]) -> Report:
+    """A real scorer `Report` whose relation tallies are `rel_counts` pooled.
+
+    Entity tallies mirror the relation ones so the entity bootstrap has data too.
+    Using the scorer's own class keeps its zero-denominator rule (`Report._pr`)
+    behind `rel_precision` and `rel_recall`, which `build_summary`'s point
+    `rel_f1` is derived from.
+    """
+    report = Report()
+    for tag, (tp, fp, fn) in rel_counts.items():
+        report.per_probe.append(
+            {
+                "tag": tag,
+                "matched": True,
+                "gold_entities": tp + fn,
+                "gold_relationships": tp + fn,
+                "entity_fps": [["fp", "T"]] * fp,
+                "entity_fns": [["fn", "T"]] * fn,
+                "rel_fps": [["a", "USES", "b"]] * fp,
+                "rel_fns": [["c", "USES", "d"]] * fn,
+            }
+        )
+        report.rel_tp += tp
+        report.rel_fp += fp
+        report.rel_fn += fn
+        report.entity_tp += tp
+        report.entity_fp += fp
+        report.entity_fn += fn
+    report.total_probes = report.matched_probes = len(rel_counts)
+    return report
+
+
+def _summary_for(report: Report, tmp_path: Path, *, seed: int = 7, b: int = 300) -> dict:
+    gold = tmp_path / "gold.jsonl"
+    gold.write_text("{}\n", encoding="utf-8")
+    return extraction_probe.build_summary(
+        report,
+        gold_path=gold,
+        ontology_version="test",
+        bootstrap_seed=seed,
+        bootstrap_b=b,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ((3, 1, 2), 6 / 9),
+        ((4, 0, 0), 1.0),
+        ((0, 2, 3), 0.0),
+        ((0, 0, 0), 1.0),
+    ],
+    ids=["mixed", "perfect", "no-tp", "empty-denominator"],
+)
+def test_cluster_bootstrap_ratio_ci_f1_single_tag_is_the_point(counts, expected):
+    """With one probe tag every resample is that tag, so every replicate is
+    2tp / (2tp + fp + fn) of its counts, or 1.0 when that denominator is 0.
+    """
+    ci = extraction_probe.cluster_bootstrap_ratio_ci(
+        {"only": counts}, n_replicates=50, seed=3, confidence=0.95, kind="f1"
+    )
+    assert ci == (pytest.approx(expected), pytest.approx(expected))
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_cluster_bootstrap_ratio_ci_f1_pools_the_resampled_counts(seed):
+    """One replicate, drawn by the same rng the function seeds: its F1 is
+    computed from the pooled tp, fp and fn of the drawn tags, not averaged
+    over per-probe F1 values.
+    """
+    counts = {"p1": (5, 0, 0), "p2": (0, 3, 1), "p3": (1, 1, 4)}
+    tags = sorted(counts)
+    rng = random.Random(seed)
+    drawn = [tags[rng.randrange(len(tags))] for _ in tags]
+    tp = sum(counts[t][0] for t in drawn)
+    fp = sum(counts[t][1] for t in drawn)
+    fn = sum(counts[t][2] for t in drawn)
+    expected = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0
+    ci = extraction_probe.cluster_bootstrap_ratio_ci(
+        counts, n_replicates=1, seed=seed, confidence=0.95, kind="f1"
+    )
+    assert ci == (pytest.approx(expected), pytest.approx(expected))
+
+
+@pytest.mark.parametrize(
+    "rel_counts",
+    [
+        {"p1": (2, 1, 0), "p2": (1, 0, 2), "p3": (0, 1, 1)},
+        {"p1": (0, 0, 0), "p2": (0, 0, 0)},
+        {"p1": (0, 2, 0), "p2": (0, 0, 3)},
+        {"p1": (0, 0, 2)},
+        {"p1": (0, 4, 0)},
+    ],
+    ids=["mixed", "zero-over-zero", "p-plus-r-zero", "no-produced", "no-gold"],
+)
+def test_f1_replicate_formula_on_full_counts_equals_summary_rel_f1(tmp_path, rel_counts):
+    """The replicate formula, applied to the whole corpus pooled into one tag,
+    equals `build_summary`'s point `2PR / (P + R)` under the scorer's
+    zero-denominator rule, so the interval is an interval for that point.
+    """
+    report = _report_from_rel_counts(rel_counts)
+    summary = _summary_for(report, tmp_path)
+    pooled = (report.rel_tp, report.rel_fp, report.rel_fn)
+    ci = extraction_probe.cluster_bootstrap_ratio_ci(
+        {"all": pooled}, n_replicates=5, seed=1, confidence=0.95, kind="f1"
+    )
+    assert ci is not None
+    assert ci[0] == pytest.approx(summary["rel_f1"])
+    assert ci[1] == pytest.approx(summary["rel_f1"])
+
+
+def test_cluster_bootstrap_ratio_ci_f1_deterministic_for_fixed_seed():
+    counts = {"p1": (2, 0, 0), "p2": (1, 1, 0), "p3": (0, 0, 1)}
+    ci_a = extraction_probe.cluster_bootstrap_ratio_ci(
+        counts, n_replicates=500, seed=42, confidence=0.95, kind="f1"
+    )
+    ci_b = extraction_probe.cluster_bootstrap_ratio_ci(
+        counts, n_replicates=500, seed=42, confidence=0.95, kind="f1"
+    )
+    assert ci_a == ci_b
+    assert ci_a is not None
+    assert 0.0 <= ci_a[0] <= ci_a[1] <= 1.0
+
+
+def test_cluster_bootstrap_ratio_ci_f1_empty_returns_none():
+    assert (
+        extraction_probe.cluster_bootstrap_ratio_ci(
+            {}, n_replicates=10, seed=1, confidence=0.95, kind="f1"
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("kind", ["", "F1", "Precision", "accuracy", "rel_f1"])
+def test_cluster_bootstrap_ratio_ci_unknown_kind_raises(kind):
+    """An unknown kind used to compute recall silently; it now raises, even
+    on an empty corpus, so a typo cannot pass for a real interval.
+    """
+    counts = {"p1": (2, 0, 0)}
+    with pytest.raises(ValueError, match="kind"):
+        extraction_probe.cluster_bootstrap_ratio_ci(
+            counts, n_replicates=10, seed=1, confidence=0.95, kind=kind
+        )
+    with pytest.raises(ValueError, match="kind"):
+        extraction_probe.cluster_bootstrap_ratio_ci(
+            {}, n_replicates=10, seed=1, confidence=0.95, kind=kind
+        )
+
+
+def test_build_summary_bootstrap_carries_rel_f1(tmp_path):
+    report = _report_from_rel_counts({"p1": (2, 1, 0), "p2": (1, 0, 2), "p3": (0, 1, 1)})
+    summary = _summary_for(report, tmp_path, seed=11, b=400)
+    rel_counts = extraction_probe.per_probe_rel_counts(report.per_probe)
+    expected = extraction_probe.cluster_bootstrap_ratio_ci(
+        rel_counts, n_replicates=400, seed=11, confidence=0.95, kind="f1"
+    )
+    assert expected is not None
+    assert summary["bootstrap"]["rel_f1"] == expected
+    lo, hi = summary["bootstrap"]["rel_f1"]
+    assert 0.0 <= lo <= hi <= 1.0
+    assert summary["schema"] == 1
+
+
+def test_build_summary_rel_f1_interval_deterministic_for_fixed_seed(tmp_path):
+    report = _report_from_rel_counts({"p1": (2, 1, 0), "p2": (1, 0, 2), "p3": (0, 1, 1)})
+    first = _summary_for(report, tmp_path, seed=5)
+    second = _summary_for(report, tmp_path, seed=5)
+    assert first["bootstrap"]["rel_f1"] == second["bootstrap"]["rel_f1"]
+
+
+def test_build_summary_rel_f1_interval_none_for_empty_corpus(tmp_path):
+    summary = _summary_for(Report(), tmp_path)
+    assert "rel_f1" in summary["bootstrap"]
+    assert summary["bootstrap"]["rel_f1"] is None
+
+
+def test_build_summary_existing_bootstrap_values_unchanged(tmp_path):
+    """The four intervals from before T12 still equal direct calls with the
+    summary's own seed, B and confidence, and the block holds no other key.
+    """
+    report = _report_from_rel_counts({"p1": (2, 1, 0), "p2": (1, 0, 2), "p3": (0, 1, 1)})
+    summary = _summary_for(report, tmp_path, seed=13, b=250)
+    boot = summary["bootstrap"]
+    entity_counts = extraction_probe.per_probe_entity_counts(report.per_probe)
+    rel_counts = extraction_probe.per_probe_rel_counts(report.per_probe)
+    for key, counts, kind in [
+        ("entity_precision", entity_counts, "precision"),
+        ("entity_recall", entity_counts, "recall"),
+        ("rel_precision", rel_counts, "precision"),
+        ("rel_recall", rel_counts, "recall"),
+    ]:
+        direct = extraction_probe.cluster_bootstrap_ratio_ci(
+            counts, n_replicates=250, seed=13, confidence=0.95, kind=kind
+        )
+        assert boot[key] == direct, key
+    assert set(boot) == {
+        "method",
+        "seed",
+        "B",
+        "confidence",
+        "entity_precision",
+        "entity_recall",
+        "rel_precision",
+        "rel_recall",
+        "rel_f1",
+    }
+    assert (boot["seed"], boot["B"], boot["confidence"]) == (13, 250, 0.95)
 
 
 def test_refuse_if_exists_raises_file_exists_error(tmp_path):

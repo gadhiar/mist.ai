@@ -20,7 +20,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 # 1.1.0: additive -- InfoResponse gained four optional serving-config fields.
-CONTRACT_VERSION = "1.1.0"
+# 1.2.0: additive -- ResultStamps.run_identity, and InfoResponse.run_identity
+# with its components, all optional; ExtractResponse.stage2_calls, default 1.
+CONTRACT_VERSION = "1.2.0"
 CONTRACT_MAJOR = 1
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -144,13 +146,23 @@ class DerivationOut(BaseModel):
 
 
 class ResultStamps(BaseModel):
-    """Version/identity stamps the service attaches to a completed result."""
+    """Version/identity stamps the service attaches to a completed result.
+
+    Attributes:
+        run_identity: The run identity of the setup that produced this result
+            (contract 1.2.0): one hash over the prompt, the code that shapes
+            extraction output, the request settings, the versions, the
+            adapter, the model and the llama.cpp build. It is recorded, not
+            matched: no epoch or cache key reads it. None means not reported,
+            by a pre-1.2.0 service or one wired without it.
+    """
 
     extraction_version: str
     model_hash: str
     prompt_sha256: str
     llama_cpp_build: str
     adapter: str
+    run_identity: str | None = None
 
 
 class TimingsMs(BaseModel):
@@ -163,7 +175,15 @@ class TimingsMs(BaseModel):
 
 
 class ExtractResponse(BaseModel):
-    """Response body for a successfully completed extraction job."""
+    """Response body for a successfully completed extraction job.
+
+    Attributes:
+        attempts: The most attempts any one Stage 2 call sequence took: 1, or
+            more when a repair retry ran.
+        stage2_calls: Every Stage 2 model call the turn took (contract 1.2.0):
+            one per batch of units, plus splits and repair retries. Defaults
+            to 1, the one call a pre-1.2.0 service makes.
+    """
 
     contract_version: str
     job_id: str
@@ -174,6 +194,7 @@ class ExtractResponse(BaseModel):
     stamps: ResultStamps
     timings_ms: TimingsMs
     attempts: int = Field(ge=1)
+    stage2_calls: int = Field(default=1, ge=1)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -260,11 +281,12 @@ class HealthResponse(BaseModel):
 class InfoResponse(BaseModel):
     """Response body for the service's info endpoint.
 
-    The last four fields were added in contract 1.1.0 and describe the
-    serving configuration a result was produced under, so a gauntlet run can
-    record what it measured. Each defaults to None: a 1.0.0 server's payload
-    (the first seven fields only) still validates, and None always means
-    "not reported" -- an older server, or a value the service could not read
+    The four fields after `location_label` were added in contract 1.1.0 and
+    describe the serving configuration a result was produced under, so a
+    gauntlet run can record what it measured; the two `run_identity` fields
+    were added in 1.2.0. Each defaults to None: a 1.0.0 server's payload (the
+    first seven fields only) still validates, and None always means "not
+    reported" -- an older server, or a value the service could not read
     (`ctx_size` when llama-server's `/props` was unavailable).
 
     Attributes:
@@ -277,6 +299,10 @@ class InfoResponse(BaseModel):
         temperature: The sampling temperature every LLM-calling stage uses.
         ctx_size: llama-server's context window (`n_ctx`), as its `/props`
             endpoint reports it.
+        run_identity: The run identity every result from this process is
+            stamped with (contract 1.2.0), computed once at service start.
+        run_identity_components: The values `run_identity` hashes, by name,
+            so a report can say which of them two runs differ in.
     """
 
     contract_version: str
@@ -290,6 +316,8 @@ class InfoResponse(BaseModel):
     reasoning_effort: str | None = None
     temperature: float | None = None
     ctx_size: int | None = None
+    run_identity: str | None = None
+    run_identity_components: dict[str, str | int | float | bool | None] | None = None
 
 
 # ---------------------------------------------------------------------------

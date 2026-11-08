@@ -16,6 +16,7 @@ from backend.interfaces import EmbeddingProvider
 from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.deduplication import MergeAction
 from backend.knowledge.storage.graph_executor import GraphExecutor
+from backend.knowledge.storage.type_labels import entity_type_label
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +346,7 @@ class CurationGraphWriter:
         Why the `new_fact` LearningEvent is in this statement too. `write()`
         writes it only for an entity dedup did NOT map onto an existing node
         (`grep -n 'is_update = entity_id in merge_lookup' backend/knowledge/curation/graph_writer.py`
-        -> 195, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
+        -> 196, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
         by exact id first (`EntityDeduplicator.deduplicate` calls `_find_existing`,
         whose tier 1 is the exact id: `grep -n 'existing = await self._find_existing'
         backend/knowledge/curation/deduplication.py`), and emits a MergeAction for
@@ -397,9 +398,21 @@ class CurationGraphWriter:
                 None, self._embedding_provider.generate_embedding, display_name
             )
 
+        # The ontology type label mirrors `entity_type` and is set on create
+        # only, as `entity_type` is: ON MATCH changes neither, so the dedup rule
+        # that keeps an existing node's type keeps its label in step. It is an
+        # item of the ON CREATE SET clause, which leaves every statement
+        # fragment the replay-guard fakes match unchanged. The label is
+        # interpolated (Neo4j cannot parameterize one) and comes only from
+        # `entity_type_label`, so a type outside the label set, or any other
+        # string, adds nothing to the statement.
+        type_label = entity_type_label(entity_type)
+        type_label_item = f", e:{type_label}" if type_label is not None else ""
         # :User label is an invariant of the user node (persona/identity
         # reads anchor on it); the extraction path must stamp it, not just
-        # seed/rebuild (deep review cypher-data-integrity-2a). Idempotent.
+        # seed/rebuild (deep review cypher-data-integrity-2a). Idempotent. It
+        # runs on every write, unlike the type label, so a user node an older
+        # writer left without `:User` gains it.
         user_label_set = " SET e:User" if entity_id == "user" else ""
         query = (
             # Replay guard: evaluated BEFORE the MERGE, in the same statement.
@@ -414,7 +427,7 @@ class CurationGraphWriter:
             "e.source_type = $source_type, e.created_at = $now, e.updated_at = $now, "
             "e.ontology_version = $ontology_version, e.embedding = $embedding, "
             "e.description = $description, e.aliases = $aliases, e.status = 'active', "
-            "e.provenance = 'extraction' "
+            "e.provenance = 'extraction'" + type_label_item + " "
             "ON MATCH SET e.confidence = CASE WHEN event_already_applied THEN e.confidence "
             "WHEN e.confidence < $reinforced THEN $reinforced ELSE e.confidence END, "
             "e.updated_at = $now, "

@@ -942,7 +942,7 @@ PRIOR ENTRY -- 2026-07-31 (R1.4 -- seed-utterance migration + Phase-1 data gate 
 - **StreamingLLMProvider abstraction:** `LlamaServerProvider` (primary), `OllamaProvider` (fallback), optionally wrapped by `InstrumentedStreamingLLMProvider` (Cluster 5) for JSONL observability.
 - **ConversationHandler:** Cluster 3 persona injection + Cluster 6 `ContextBudgetPlanner` + `_build_request` Pydantic-dump helper (Cluster 5). `conversation_max_tokens=1024` (up from 400; Cluster 6 fix for Bug E).
 - **ExtractionPipeline:** 6 stages + Stage 1.5 `SubjectScopeClassifier` (Cluster 1) — classifies each utterance as `user-scope | system-scope | third-party | unknown` between pre-processing and ontology extraction. Metadata threaded into `EXTRACTION_USER_TEMPLATE` as a `subject_scope` hint.
-- **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox Turbo TTS with streaming parallelism. ~4-5s TTFA.
+- **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox TTS (the original model) with streaming parallelism. ~4-5s TTFA.
 - **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out.
 - **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation.
 - **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal).
@@ -1277,7 +1277,7 @@ VECTOR_STORE_DATA_DIR=/app/data/vector_store
 - `StreamingLLMProvider` abstraction: `LlamaServerProvider` primary, `OllamaProvider` fallback, `InstrumentedStreamingLLMProvider` decorator
 - openai + httpx (LLM client)
 - Whisper (STT — base model)
-- Chatterbox Turbo (TTS — zero-shot voice cloning, MIT)
+- Chatterbox, the original model (TTS — zero-shot voice cloning, MIT)
 - Neo4j 5.x (knowledge graph; `:__Entity__` user-facing, `:__Provenance__` audit-trail per ADR-009; bitemporal versioned fact edges per C1/C2)
 - LanceDB (vector store Layer 2 -- legacy; sidecar sqlite-vec covers vault retrieval, see KNOWN_ISSUES)
 - sqlite-vec + FTS5 (vault sidecar index, RRF hybrid query)
@@ -1560,7 +1560,7 @@ cause of Bug J -- and it is the first thing a maintainer opens to tune extractio
 | Extraction harness (F2/F3) | LANDED | extraction-only byte-reproducible harness (`replay --extraction-only`); full-chat non-determinism is flash-attn, not MIST code |
 | Extraction accuracy (C3 + MIS-124) | COMPLETE | `extraction_version=2026-06-14-r5` (r4 was C3; MIS-124 bumped it); typing 0.909 PASS, F2 rel precision 0.833 = documented near-miss vs 0.90 -- residual is model extraction QUALITY, not canonicalization; that lever is spent -> MIS-125 (constrained decoding or a larger model). V7 PASS R=0.950 P=1.000 FP 0/5 |
 | Reachability | **UNSOLVED, in progress** | ~20 features built/tested/wired to nothing, 6 shapes. `TestProductionCallerExists` covers shape 1 only. Mechanisms A-E designed; see "Known live bugs" and the findings register |
-| TTS | Chatterbox Turbo | 0.74x RTF, 3.9GB VRAM |
+| TTS | Chatterbox (original model) | 0.74x RTF, 3.9GB VRAM |
 | Frontend | Wave 1 integrated | Nested `./mist-frontend/` repo; ADR-017 v1.1.1 |
 | Code Quality | FULL SUITE | black, ruff, bandit, codespell, AI-slop, pre-commit |
 | Docker | COMPLETE | 3-service stack + eval profile (mist-backend, mist-neo4j, mist-llm, mist-neo4j-eval) |

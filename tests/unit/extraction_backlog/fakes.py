@@ -71,6 +71,9 @@ class FakeServiceState:
     extraction_version: str = "ev-test"
     model_hash: str = "svc-model"
     location_label: str = "test-box"
+    # Contract 1.2.0: reported on /v1/info and stamped on every result. None
+    # answers the way a 1.1.0 service does.
+    run_identity: str | None = None
     down: bool = False
     # utterance -> errors to answer with, consumed front to back before success.
     fail_script: dict[str, list[tuple[ErrorCode, bool]]] = field(default_factory=dict)
@@ -107,6 +110,7 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
             reasoning_effort="low",
             temperature=0.0,
             ctx_size=8192,
+            run_identity=state.run_identity,
         )
 
     @app.get("/v1/health")
@@ -142,6 +146,7 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
                 prompt_sha256="0" * 64,
                 llama_cpp_build="b0",
                 adapter="fake",
+                run_identity=state.run_identity,
             ),
             timings_ms=TimingsMs(scope=1.0, extract=2.0, derive=None, total=3.0),
             attempts=1,

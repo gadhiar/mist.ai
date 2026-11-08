@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,6 @@ logger = logging.getLogger("eval_harness")
 HARNESS_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = HARNESS_ROOT / "models.yaml"
 DEFAULT_TESTS_DIR = HARNESS_ROOT / "tests"
-DEFAULT_GRAMMARS_DIR = HARNESS_ROOT / "grammars"
 DEFAULT_RESULTS_DIR = HARNESS_ROOT / "results"
 DEFAULT_LOG_DIR = DEFAULT_RESULTS_DIR / "server-logs"
 
@@ -62,7 +61,6 @@ DEFAULT_TEST_ORDER: tuple[str, ...] = (
     "speed_minimal",
     "schema_conformance",
     "schema_conformance_lenient",
-    "schema_conformance_fewshot",
     "tool_selection",
     "personality",
     "adversarial_persona",
@@ -137,16 +135,24 @@ class TestCase:
 
 @dataclass(frozen=True, slots=True)
 class TestFile:
-    """A test YAML file. One test type per file."""
+    """A test YAML file. One test type per file.
+
+    `prompt_source` names a production prompt the harness renders in place of
+    YAML prompt text (a key of `PROMPT_SOURCES`), so the eval measures what
+    the service sends rather than a copy that drifts. `constrained` asks for
+    that source's output schema as the response format.
+    """
 
     name: str
     test_type: str
     description: str
     temperature_mode: str
     max_tokens: int
-    use_grammar: bool
+    constrained: bool
     response_format: dict[str, Any] | None
     system_prompt: str | None
+    prompt_source: str | None
+    reference_date: str | None
     cases: tuple[TestCase, ...]
 
 
@@ -241,7 +247,43 @@ def load_test_files(names: list[str], tests_dir: Path) -> list[TestFile]:
 
 
 def _parse_test_file(name: str, data: dict[str, Any]) -> TestFile:
+    """Build a TestFile, refusing a prompt source that is unknown or mixed with prompt text.
+
+    Raises:
+        ValueError: `prompt_source` is not a key of `PROMPT_SOURCES`, lacks a
+            `reference_date`, or sits beside a `system_prompt` or a case
+            `context`; or `constrained` is set without a `prompt_source` or
+            beside a `response_format`.
+    """
     cases_raw = data.get("cases") or []
+    prompt_source = data.get("prompt_source")
+    reference_date = data.get("reference_date")
+    constrained = bool(data.get("constrained", False))
+    if prompt_source is not None:
+        if prompt_source not in PROMPT_SOURCES:
+            raise ValueError(
+                f"{name}: prompt_source {prompt_source!r} is not one of {sorted(PROMPT_SOURCES)}"
+            )
+        if reference_date is None:
+            raise ValueError(f"{name}: prompt_source {prompt_source!r} needs a reference_date")
+        reference_date = date.fromisoformat(str(reference_date)).isoformat()
+        texts = [
+            f"case {c['id']} {key}"
+            for c in cases_raw
+            for key in ("system_prompt", "context")
+            if c.get(key) is not None
+        ]
+        if data.get("system_prompt") is not None:
+            texts.insert(0, "file system_prompt")
+        if texts:
+            raise ValueError(
+                f"{name}: prompt_source {prompt_source!r} renders the whole prompt; "
+                f"remove the system_prompt and context text ({', '.join(texts)})"
+            )
+    if constrained and prompt_source is None:
+        raise ValueError(f"{name}: constrained needs a prompt_source to take the schema from")
+    if constrained and data.get("response_format") is not None:
+        raise ValueError(f"{name}: constrained and response_format are exclusive")
     cases = tuple(
         TestCase(
             id=c["id"],
@@ -260,19 +302,85 @@ def _parse_test_file(name: str, data: dict[str, Any]) -> TestFile:
         description=data.get("description", ""),
         temperature_mode=data.get("temperature_mode", "extraction"),
         max_tokens=int(data.get("max_tokens", 1024)),
-        use_grammar=bool(data.get("use_grammar", False)),
+        constrained=constrained,
         response_format=data.get("response_format"),
         system_prompt=data.get("system_prompt"),
+        prompt_source=prompt_source,
+        reference_date=reference_date,
         cases=cases,
     )
 
 
-def load_grammar(grammar_name: str) -> str:
-    """Read a GBNF grammar file from grammars/."""
-    path = DEFAULT_GRAMMARS_DIR / f"{grammar_name}.gbnf"
-    if not path.exists():
-        raise FileNotFoundError(f"grammar file not found: {path}")
-    return path.read_text(encoding="utf-8")
+# ---------------------------------------------------------------------------
+# Production prompt sources
+# ---------------------------------------------------------------------------
+
+PRODUCTION_EXTRACTION = "production_extraction"
+PROMPT_SOURCES: frozenset[str] = frozenset({PRODUCTION_EXTRACTION})
+
+# Stage 2's empty-history context line (`ontology_extractor.NO_PRIOR_CONTEXT`)
+# and the scope Stage 2 falls back to when Stage 1.5 is off. Copied, not
+# imported: `ontology_extractor` imports `backend.llm.models` (pydantic) and
+# `backend.knowledge.config` (python-dotenv), which the harness does not
+# otherwise need. tests/unit/eval_harness/test_schema_conformance_source.py
+# compares the rendered messages with `render_extraction_messages`.
+_NO_PRIOR_CONTEXT = "(no prior context)"
+_UNKNOWN_SUBJECT_SCOPE = "unknown"
+
+
+def _render_production_extraction(utterance: str, reference_date: str) -> list[dict[str, Any]]:
+    """Stage 2's messages for one utterance with empty history and scope unknown.
+
+    The import runs here rather than at module load so the harness loads no
+    backend module unless a case file names this source; `prompts` imports
+    nothing itself.
+    """
+    from backend.knowledge.extraction.prompts import (
+        EXTRACTION_SYSTEM_PROMPT,
+        EXTRACTION_USER_TEMPLATE,
+    )
+
+    return [
+        {
+            "role": "system",
+            "content": EXTRACTION_SYSTEM_PROMPT.format(reference_date=reference_date),
+        },
+        {
+            "role": "user",
+            "content": EXTRACTION_USER_TEMPLATE.format(
+                context=_NO_PRIOR_CONTEXT,
+                utterance=utterance,
+                subject_scope=_UNKNOWN_SUBJECT_SCOPE,
+            ),
+        },
+    ]
+
+
+def _production_extraction_response_format() -> dict[str, Any]:
+    """The production Stage 2 output schema, in the shape the engine's `schema` mode sends.
+
+    `LlamaServerProvider._build_kwargs` wraps `LLMRequest.response_schema` this
+    way, and `ExtractionEngine._build_request` sets that field to
+    `EXTRACTION_OUTPUT_SCHEMA` for Stage 2 in `schema` mode.
+    """
+    from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
+
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "schema": EXTRACTION_OUTPUT_SCHEMA, "strict": True},
+    }
+
+
+def resolve_response_format(test_file: TestFile, candidate: Candidate) -> dict[str, Any] | None:
+    """The response_format one request sends.
+
+    A constrained file sends its source's output schema, except to a
+    candidate marked `gbnf_supported: false`, which runs unconstrained as it
+    did when the constraint was a GBNF grammar.
+    """
+    if test_file.constrained:
+        return _production_extraction_response_format() if candidate.gbnf_supported else None
+    return test_file.response_format
 
 
 # ---------------------------------------------------------------------------
@@ -311,12 +419,18 @@ class CaseResult:
 def build_messages(test_file: TestFile, case: TestCase) -> list[dict[str, Any]]:
     """Assemble OpenAI-format messages for one test case.
 
-    System prompt priority: case.system_prompt > test_file.system_prompt.
-    Context (if present) is folded into the single system message to avoid
-    two consecutive system messages, which some bundled jinja templates
-    reject: Qwen 3.5 requires system to be first-only, Gemma 3 requires
-    strict user/assistant alternation.
+    A file with a `prompt_source` gets that source's rendering of the case
+    prompt, and nothing from the YAML. Otherwise the system prompt priority is
+    case.system_prompt > test_file.system_prompt, and context (if present) is
+    folded into the single system message to avoid two consecutive system
+    messages, which some bundled jinja templates reject: Qwen 3.5 requires
+    system to be first-only, Gemma 3 requires strict user/assistant
+    alternation.
     """
+    if test_file.prompt_source == PRODUCTION_EXTRACTION:
+        if test_file.reference_date is None:
+            raise ValueError(f"{test_file.name}: prompt_source needs a reference_date")
+        return _render_production_extraction(case.prompt, test_file.reference_date)
     messages: list[dict[str, Any]] = []
     system_prompt = case.system_prompt or test_file.system_prompt
     if system_prompt and case.context:
@@ -337,11 +451,18 @@ def run_case(
     case: TestCase,
     *,
     iteration: int,
-    grammar_text: str | None,
     seed: int | None,
 ) -> CaseResult:
-    """Run one test case and return a CaseResult (success or error)."""
+    """Run one test case and return a CaseResult (success or error).
+
+    For a file with a `prompt_source`, the record's `system_prompt` is the
+    rendered system message, so the run carries the prompt text it measured.
+    """
     messages = build_messages(test_file, case)
+    if test_file.prompt_source is not None:
+        recorded_system_prompt = messages[0]["content"]
+    else:
+        recorded_system_prompt = case.system_prompt or test_file.system_prompt
     temperature = candidate.temperature.get(test_file.temperature_mode, 0.0)
     top_p = candidate.top_p.get(test_file.temperature_mode, 0.95)
 
@@ -352,7 +473,7 @@ def run_case(
         "case_id": case.id,
         "iteration": iteration,
         "prompt": case.prompt,
-        "system_prompt": case.system_prompt or test_file.system_prompt,
+        "system_prompt": recorded_system_prompt,
         "expected": case.expected,
     }
 
@@ -365,8 +486,7 @@ def run_case(
             stop=list(candidate.stop_sequences) if candidate.stop_sequences else None,
             tools=list(case.tools) if case.tools else None,
             tool_choice="auto" if case.tools else None,
-            response_format=test_file.response_format,
-            grammar=(grammar_text if test_file.use_grammar and candidate.gbnf_supported else None),
+            response_format=resolve_response_format(test_file, candidate),
             seed=seed,
         )
     except HarnessRequestError as exc:
@@ -405,7 +525,6 @@ def run_candidate(
     models_dir: Path,
     log_dir: Path,
     results_dir: Path,
-    grammar_text: str | None,
 ) -> Path:
     """Run all tests against one candidate. Returns the JSONL result path."""
     logger.info("=" * 72)
@@ -465,7 +584,6 @@ def run_candidate(
                             test_file,
                             case,
                             iteration=iteration,
-                            grammar_text=grammar_text,
                             seed=seed,
                         )
                         out.write(result.to_jsonl() + "\n")
@@ -565,12 +683,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="override the auto-generated UTC timestamp subdir with this name (orchestrator use: multi-invocation runs share one dir)",
     )
     parser.add_argument(
-        "--grammar",
-        type=str,
-        default="mist_ontology",
-        help="grammar file basename under grammars/ (default: mist_ontology)",
-    )
-    parser.add_argument(
         "--list-models",
         action="store_true",
         help="print candidate IDs and exit",
@@ -633,12 +745,6 @@ def main(argv: list[str] | None = None) -> int:
     test_names = [t.strip() for t in args.tests.split(",") if t.strip()]
     test_files = load_test_files(test_names, args.tests_dir)
 
-    try:
-        grammar_text = load_grammar(args.grammar)
-    except FileNotFoundError as exc:
-        logger.warning("grammar load failed, continuing without GBNF: %s", exc)
-        grammar_text = None
-
     models_dir_str = str(args.models_dir) if args.models_dir is not None else defaults.models_dir
     models_dir = Path(models_dir_str)
     llama_server_bin = args.llama_server_bin or defaults.llama_server_binary
@@ -671,7 +777,6 @@ def main(argv: list[str] | None = None) -> int:
             models_dir=models_dir,
             log_dir=run_log_dir,
             results_dir=run_results_dir,
-            grammar_text=grammar_text,
         )
         jsonl_paths.append(path)
         elapsed = time.perf_counter() - started

@@ -53,7 +53,7 @@ Conventions.
 - LLM inference: interactive: Gemma 4 E4B Q5_K_M via llama.cpp's llama-server; extraction: a
   separate llama-server host (`docker-compose.extraction.yml`), gpt-oss-20b since 2026-09-29.
   Read live model ids from each host's `/v1/info`.
-- Voice: VAD -> Whisper STT -> LLM -> Chatterbox Turbo TTS (MIT license, zero-shot voice cloning;
+- Voice: VAD -> Whisper STT -> LLM -> Chatterbox TTS, the original model (MIT license, zero-shot voice cloning;
   adapter `ChatterboxTTS` in `src/multimodal/tts.py`).
 - Knowledge: Neo4j knowledge graph; vault layer (ADR-010, partly superseded by ADR-023):
   `mist-memory/` markdown corpus + sqlite-vec sidecar index + watchdog filewatcher. Embeddings:
