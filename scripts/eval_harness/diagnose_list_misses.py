@@ -49,9 +49,10 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _candidate in (str(_REPO_ROOT), str(Path.cwd())):
@@ -61,6 +62,7 @@ for _candidate in (str(_REPO_ROOT), str(Path.cwd())):
 from backend.knowledge.extraction.structure_splitter import split_structured  # noqa: E402
 from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     GoldProbe,
+    GoldRel,
     iter_gold_probes,
     parse_produced,
     types_match,
@@ -92,6 +94,14 @@ _USER_ID = "user"
 
 
 Key = tuple[str, str, str]
+EdgeTest = Callable[[str, str, str, str, str], bool]
+
+
+class RawRecord(TypedDict, total=False):
+    """One line of an extraction-service raw file, as far as this script reads it."""
+
+    id: str
+    response: dict[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +192,7 @@ def _variant_kind(gold_id: str, gold_type: str, produced_id: str) -> str | None:
     return None
 
 
-def _produced_view(record: dict[str, Any] | None) -> ProducedView | None:
+def _produced_view(record: RawRecord | None) -> ProducedView | None:
     if record is None:
         return None
     response = record.get("response") or {}
@@ -272,7 +282,7 @@ def _edge_between(
     view: ProducedView,
     sources: list[tuple[str, str]],
     targets: list[tuple[str, str]],
-    test: Any,
+    test: EdgeTest,
 ) -> tuple[str, str, str, str, str] | None:
     for s_id, s_kind in sources:
         for t_id, t_kind in targets:
@@ -284,7 +294,7 @@ def _edge_between(
 
 def _classify(
     tag: str,
-    rel: Any,
+    rel: GoldRel,
     view: ProducedView | None,
     gold_ids: frozenset[str],
     frame: frozenset[str],
@@ -369,8 +379,8 @@ def _classify(
     return miss("OMITTED")
 
 
-def _read_raw(path: Path) -> dict[str, dict[str, Any]]:
-    records: dict[str, dict[str, Any]] = {}
+def _read_raw(path: Path) -> dict[str, RawRecord]:
+    records: dict[str, RawRecord] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -405,7 +415,7 @@ class RunDiagnosis:
 
 
 def diagnose(
-    probes: list[GoldProbe], records: dict[str, dict[str, Any]], excluded: set[tuple[str, Key]]
+    probes: list[GoldProbe], records: dict[str, RawRecord], excluded: set[tuple[str, Key]]
 ) -> RunDiagnosis:
     """Classify every miss of one run over the relations not excluded."""
     total = fan_out_total = fan_out_found = 0
@@ -417,7 +427,7 @@ def diagnose(
         views[probe.tag] = view
         gold_ids = frozenset(e.id for e in probe.entities)
         frame = _frame_ids(probe)
-        counted: dict[Key, Any] = {}
+        counted: dict[Key, GoldRel] = {}
         for rel in probe.relationships:
             key = (rel.source, rel.predicate, rel.target)
             if (probe.tag, key) not in excluded:

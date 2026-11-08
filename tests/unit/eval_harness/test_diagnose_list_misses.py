@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 import pytest
 
@@ -26,9 +27,16 @@ LEAD_IN = "Tools at Acme Corp:\n- Python\n- Rust"
 Rel = tuple[str, str, str, str, str]
 
 
-def _probe(
-    tag: str, entities: dict[str, str], rels: list[Rel], utterance: str = PROSE
-) -> dict[str, Any]:
+class GoldRow(TypedDict):
+    """One gold probe line, in the shape `iter_gold_probes` reads."""
+
+    tag: str
+    utterance: str
+    expected_entities: list[dict[str, str]]
+    expected_relationships: list[dict[str, str]]
+
+
+def _probe(tag: str, entities: dict[str, str], rels: list[Rel], utterance: str = PROSE) -> GoldRow:
     return {
         "tag": tag,
         "utterance": utterance,
@@ -40,7 +48,7 @@ def _probe(
     }
 
 
-def _record(tag: str, entities: dict[str, str], edges: list[tuple[str, str, str]]) -> Any:
+def _record(tag: str, entities: dict[str, str], edges: list[tuple[str, str, str]]) -> dlm.RawRecord:
     return {
         "id": tag,
         "response": {
@@ -52,15 +60,15 @@ def _record(tag: str, entities: dict[str, str], edges: list[tuple[str, str, str]
     }
 
 
-def _write(path: Path, rows: list[dict[str, Any]]) -> Path:
+def _write(path: Path, rows: Sequence[Mapping[str, object]]) -> Path:
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return path
 
 
 def _run(
     tmp_path: Path,
-    probes: list[dict[str, Any]],
-    records: list[dict[str, Any]],
+    probes: list[GoldRow],
+    records: list[dlm.RawRecord],
     capsys: pytest.CaptureFixture[str],
 ) -> tuple[dict[tuple[str, str], tuple[str, str]], str]:
     """Run the CLI on one gold and raw pair; map (tag, gold key) to (class, detail and marks)."""
@@ -205,8 +213,8 @@ def test_each_class_is_reached(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     cls: str,
-    probe: dict[str, Any],
-    record: dict[str, Any] | None,
+    probe: GoldRow,
+    record: dlm.RawRecord | None,
     detail: str,
 ) -> None:
     misses, out = _run(tmp_path, [probe], [record] if record else [], capsys)
