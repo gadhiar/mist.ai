@@ -584,6 +584,79 @@ class TestRemainder:
         assert _complete(events).tool_calls_used == 1
 
 
+# --- Who answered the recorded turn -------------------------------------------
+
+
+class TestRecordedAnsweredBy:
+    """`answered_by` on the recorded turn: `"capability"` only when no model reply ran."""
+
+    @pytest.mark.asyncio
+    async def test_a_handled_turn_records_capability(self):
+        port = _FakePort([_handled("Timer set.", _record())])
+        handler, _provider, store = _make_handler(port=port)
+
+        await _collect(handler, "set a timer for 10 minutes")
+
+        assert [e.answered_by for e in store.events] == ["capability"]
+
+    @pytest.mark.asyncio
+    async def test_a_handled_remainder_turn_records_capability(self):
+        port = _FakePort([_handled("Approved.", remainder="dim them"), _handled("Dimmed.")])
+        handler, provider, store = _make_handler(port=port)
+
+        await _collect(handler, "yes, and dim them")
+
+        assert provider.calls == []
+        assert [e.answered_by for e in store.events] == ["capability"]
+
+    @pytest.mark.asyncio
+    async def test_a_model_turn_records_model(self):
+        handler, _provider, store = _make_handler([ScriptedPass(chunks=["Hello there."])])
+
+        await _collect(handler, "hi")
+
+        assert [e.answered_by for e in store.events] == ["model"]
+
+    @pytest.mark.asyncio
+    async def test_an_unhandled_turn_with_a_host_records_model(self):
+        port = _FakePort([None])
+        handler, _provider, store = _make_handler([ScriptedPass(chunks=["Hi."])], port=port)
+
+        await _collect(handler, "hi")
+
+        assert [e.answered_by for e in store.events] == ["model"]
+
+    @pytest.mark.asyncio
+    async def test_a_handled_proposal_whose_remainder_runs_the_model_records_model(self):
+        port = _FakePort([_handled("Approved.", _record(), remainder="tell me a joke"), None])
+        handler, provider, store = _make_handler([ScriptedPass(chunks=["Here is one."])], port=port)
+
+        await _collect(handler, "yes, and tell me a joke")
+
+        assert len(provider.calls) == 1
+        assert [e.answered_by for e in store.events] == ["model"]
+
+    @pytest.mark.asyncio
+    async def test_the_error_turn_records_model(self):
+        port = _FakePort([RuntimeError("hook failed")])
+        handler, _provider, store = _make_handler(port=port)
+
+        await _collect(handler, "stop")
+
+        assert [e.system_response for e in store.events] == ["I encountered an error: hook failed"]
+        assert [e.answered_by for e in store.events] == ["model"]
+
+    def test_a_direct_call_without_the_keyword_records_model(self):
+        handler, _provider, store = _make_handler()
+
+        event_id, _recorded_at = handler._record_turn_event(
+            session_id="s1", user_message="hello", assistant_message="hi"
+        )
+
+        assert event_id == "evt-1"
+        assert [e.answered_by for e in store.events] == ["model"]
+
+
 # --- Error backstop -----------------------------------------------------------
 
 

@@ -10,9 +10,17 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
+
+# Who answered a turn. "capability": a capability's template was the whole
+# reply and no model pass ran, so the text is a command and a template, not
+# knowledge. "model": everything else, the error backstop included. The memory
+# writers read this through one predicate,
+# `backend.extraction_backlog.eligibility.policy_skip_reason`.
+AnsweredBy = Literal["model", "capability"]
+ANSWERED_BY_VALUES: frozenset[str] = frozenset({"model", "capability"})
 
 
 @dataclass
@@ -113,8 +121,26 @@ class ConversationTurnEvent:
     # Versioning -- derived, never restated (see backend.knowledge.version_stamps).
     ontology_version: str = ONTOLOGY_VERSION
 
+    # None: recorded before the field existed, which reads as "model".
+    answered_by: AnsweredBy | None = None
+
     # Assigned by EventStore.append_turn(), not by caller
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    def __post_init__(self) -> None:
+        """Refuse an `answered_by` outside `ANSWERED_BY_VALUES`.
+
+        Checked at construction, so a misspelt value fails where it is written
+        rather than being stored and read later as a model turn.
+
+        Raises:
+            ValueError: `answered_by` is neither None nor a known value.
+        """
+        if self.answered_by is not None and self.answered_by not in ANSWERED_BY_VALUES:
+            raise ValueError(
+                f"unknown answered_by {self.answered_by!r}; "
+                f"expected one of {sorted(ANSWERED_BY_VALUES)} or None"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for SQLite insertion.
@@ -172,6 +198,7 @@ class ConversationTurnEvent:
                 json.dumps(self.llm_parameters) if self.llm_parameters is not None else None
             ),
             "ontology_version": self.ontology_version,
+            "answered_by": self.answered_by,
         }
 
     @classmethod
@@ -215,4 +242,5 @@ class ConversationTurnEvent:
             llm_model=row.get("llm_model"),
             llm_parameters=_parse_json(row.get("llm_parameters")),
             ontology_version=row.get("ontology_version", ONTOLOGY_VERSION),
+            answered_by=row.get("answered_by"),
         )

@@ -30,7 +30,7 @@ from backend.chat.session_synthesizer import SessionSynthesizer
 from backend.chat.slop_detector import SlopDetector
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.errors import CapabilityUnavailableError
-from backend.event_store.models import ConversationTurnEvent
+from backend.event_store.models import AnsweredBy, ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.models import (
@@ -2362,6 +2362,7 @@ class ConversationHandler:
                     user_message=user_message,
                     assistant_message=final_text,
                     trace=self._turn_trace_payload(),
+                    answered_by="capability",
                 )
             else:
                 # On a turn whose calls also need an answer, today's passes read
@@ -3303,6 +3304,7 @@ class ConversationHandler:
         retrieval_result: RetrievalResult | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         trace: dict[str, Any] | None = None,
+        answered_by: AnsweredBy = "model",
     ) -> tuple[str | None, str | None]:
         """Record a conversation turn to the event store.
 
@@ -3321,6 +3323,13 @@ class ConversationHandler:
                 keep their own condition. None (callers outside a turn, such
                 as the extraction-only admin path) leaves `retrieval_context`
                 as it was.
+            answered_by: `"capability"` only for a turn a capability's template
+                answered with no model pass; such a turn stays out of
+                extraction, self-reflection and session notes
+                (`backend.extraction_backlog.eligibility`). The default
+                `"model"` keeps every other caller's turns eligible, the error
+                backstop's included, since its exception can come from
+                anywhere in the turn.
 
         Returns:
             (event_id, recorded_at_iso) on success -- recorded_at is the event's
@@ -3379,6 +3388,7 @@ class ConversationHandler:
                 llm_model=self._provider.model,
                 llm_parameters={"temperature": 0.7},
                 ontology_version=self.config.ontology_version,
+                answered_by=answered_by,
             )
 
             event_id = self.event_store.append_turn(event)

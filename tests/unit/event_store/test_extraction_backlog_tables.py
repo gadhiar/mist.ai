@@ -75,7 +75,7 @@ class TestReplayOrderKeys:
         keys = store.list_turn_keys_in_replay_order()
 
         assert [k["event_id"] for k in keys] == ["a0", "a1", "b0", "b1"]
-        assert set(keys[0]) == {"event_id", "session_id", "turn_index", "timestamp"}
+        assert set(keys[0]) == {"event_id", "session_id", "turn_index", "timestamp", "answered_by"}
 
     def test_matches_get_all_turns_for_reextraction_order(self):
         store = _store()
