@@ -30,6 +30,7 @@ from backend.chat.context_budget import (
     HistorySelection,
     SlidingWindowStrategy,
     StableWindowStrategy,
+    TurnDeltaPart,
     get_history_strategy,
     score_fact_for_retrieval_pruning,
 )
@@ -532,9 +533,103 @@ def _default_config(**overrides) -> ContextBudgetConfig:
         "output_reserve_tokens": 100,
         "safety_margin_tokens": 50,
         "retrieval_budget_ratio": 0.4,
+        "turn_delta_max_tokens": 200,
     }
     defaults.update(overrides)
     return ContextBudgetConfig(**defaults)
+
+
+def _advisory(text: str = "Suggested tools: weather") -> TurnDeltaPart:
+    return TurnDeltaPart(kind="live_advisory", text=text, prunable=False)
+
+
+class TestPlannerTurnDelta:
+    """The stable prefix and tools are fixed cost; the delta has its own reserve."""
+
+    def _plan(self, planner, **overrides):
+        kwargs = {
+            "persona_text": "p" * 360,
+            "static_text": "s" * 360,
+            "retrieval_result": None,
+            "history": _alternating_history(30),
+            "tools": None,
+            "max_output_tokens": 100,
+            "max_history": 10,
+        }
+        kwargs.update(overrides)
+        return planner.plan(**kwargs)
+
+    def test_history_budget_ignores_advisory_and_retrieval(self):
+        planner = ContextBudgetPlanner(config=_default_config(context_window=2000))
+        bare = self._plan(planner)
+        busy = self._plan(
+            planner,
+            retrieval_result=_make_retrieval_result([_make_fact()]),
+            delta_parts=[
+                _advisory("x" * 300),
+                TurnDeltaPart(kind="interruption", text="cut off", prunable=False),
+            ],
+        )
+
+        assert busy.history_budget == bare.history_budget
+        assert busy.fixed_cost == bare.fixed_cost
+        assert busy.pruned_history == bare.pruned_history
+        # The prefix alone is fixed cost: 100 + 100 content tokens + 2 * 4 overhead.
+        assert bare.fixed_cost == 208
+        assert bare.delta_budget == 200
+        assert bare.history_budget == bare.total_budget - 208 - 200
+
+    def test_retrieval_gets_the_delta_left_after_the_fixed_parts(self):
+        planner = ContextBudgetPlanner(
+            config=_default_config(
+                context_window=4000, turn_delta_max_tokens=100, retrieval_budget_ratio=0.9
+            )
+        )
+        facts = [_make_fact(subject=f"S{i}", similarity=1.0 - i / 100) for i in range(40)]
+        plan = self._plan(
+            planner,
+            retrieval_result=_make_retrieval_result(facts, formatted="BIG " * 400),
+            delta_parts=[_advisory("a" * 108)],  # 30 content + 4 overhead
+        )
+
+        assert plan.retrieval_budget == 100 - 34
+        assert 0 < plan.retrieval_used <= plan.retrieval_budget
+        assert plan.facts_dropped > 0
+        assert "S0" in plan.pruned_retrieval_text
+
+    def test_live_advisory_keyword_charges_like_a_delta_part(self):
+        planner = ContextBudgetPlanner(
+            config=_default_config(
+                context_window=4000, turn_delta_max_tokens=100, retrieval_budget_ratio=0.9
+            )
+        )
+        retrieval = _make_retrieval_result([_make_fact()])
+        by_keyword = self._plan(planner, retrieval_result=retrieval, live_advisory_text="a" * 108)
+        by_part = self._plan(
+            planner, retrieval_result=retrieval, delta_parts=[_advisory("a" * 108)]
+        )
+
+        assert by_keyword.retrieval_budget == by_part.retrieval_budget == 100 - 34
+        assert by_keyword.history_budget == by_part.history_budget
+
+    def test_retrieval_is_also_capped_by_the_flex_ratio(self):
+        planner = ContextBudgetPlanner(
+            config=_default_config(
+                context_window=1000, turn_delta_max_tokens=500, retrieval_budget_ratio=0.1
+            )
+        )
+        plan = self._plan(planner, retrieval_result=_make_retrieval_result([_make_fact()]))
+
+        flex = plan.total_budget - plan.fixed_cost
+        assert plan.retrieval_budget == int(flex * 0.1)
+
+    def test_delta_reserve_never_exceeds_the_flex_budget(self):
+        planner = ContextBudgetPlanner(
+            config=_default_config(context_window=1000, turn_delta_max_tokens=5000)
+        )
+        plan = self._plan(planner)
+        assert plan.delta_budget == plan.total_budget - plan.fixed_cost
+        assert plan.history_budget == 0
 
 
 class TestContextBudgetPlannerRejectsUnresolvedWindow:
@@ -564,7 +659,6 @@ class TestContextBudgetPlanner:
             persona_text="p" * 36,
             static_text="s" * 36,
             retrieval_result=result,
-            live_advisory_text=None,
             history=history,
             tools=None,
             max_output_tokens=100,
@@ -584,7 +678,6 @@ class TestContextBudgetPlanner:
             persona_text="p",
             static_text="s",
             retrieval_result=None,
-            live_advisory_text=None,
             history=[],
             tools=None,
             max_output_tokens=100,
@@ -602,7 +695,6 @@ class TestContextBudgetPlanner:
             "persona_text": "p",
             "static_text": "s",
             "retrieval_result": None,
-            "live_advisory_text": None,
             "history": [],
             "tools": None,
             "max_output_tokens": 100,
@@ -621,7 +713,6 @@ class TestContextBudgetPlanner:
             persona_text="p" * 5000,
             static_text="s",
             retrieval_result=_make_retrieval_result([_make_fact()]),
-            live_advisory_text=None,
             history=[{"role": "user", "content": "x"}],
             tools=None,
             max_output_tokens=50,
@@ -659,7 +750,6 @@ class TestContextBudgetPlanner:
             persona_text="p",
             static_text="s",
             retrieval_result=result,
-            live_advisory_text=None,
             history=[],
             tools=None,
             max_output_tokens=50,
@@ -698,7 +788,6 @@ class TestContextBudgetPlanner:
             persona_text="p",
             static_text="s",
             retrieval_result=result,
-            live_advisory_text=None,
             history=[],
             tools=None,
             max_output_tokens=50,
@@ -721,7 +810,6 @@ class TestContextBudgetPlanner:
             persona_text="p",
             static_text="s",
             retrieval_result=None,
-            live_advisory_text=None,
             history=many_messages,
             tools=None,
             max_output_tokens=100,
@@ -742,7 +830,6 @@ class TestContextBudgetPlanner:
             persona_text="p",
             static_text="s",
             retrieval_result=None,
-            live_advisory_text=None,
             history=history,
             tools=None,
             max_output_tokens=100,
@@ -775,7 +862,6 @@ class TestContextBudgetPlanner:
             persona_text="",
             static_text="",
             retrieval_result=None,
-            live_advisory_text=None,
             history=[],
             tools=tools,
             max_output_tokens=50,

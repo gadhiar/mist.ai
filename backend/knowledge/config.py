@@ -341,8 +341,8 @@ class ContextBudgetConfig:
     The model's usable attention window is usually smaller than its configured
     context window. Gemma 4 E4B at 32K ctx_size still degrades quality past
     its trained context (~8K). This config caps the total prompt budget and
-    splits the remainder (after persona + tools + static) between retrieval
-    and history via weight-based allocation.
+    splits the remainder (after the stable prefix and tools) between the
+    per-turn delta and history.
 
     - `context_window` is the hard ceiling; output `max_tokens` is subtracted.
       MIS-171 T4: this may be the literal string `"auto"` after `from_env()`
@@ -357,14 +357,15 @@ class ContextBudgetConfig:
       reach the arithmetic in `plan()`.
     - `output_reserve_tokens` additionally reserves headroom for the completion.
     - `safety_margin_tokens` is extra headroom for tokenizer inaccuracy.
-    - `retrieval_budget_ratio` allocates share of the remaining budget to
-      retrieval-context; history gets the rest.
+    - `retrieval_budget_ratio` caps retrieval at this share of the budget
+      left after the prefix; retrieval is also held to the delta reserve.
     - `history_strategy` names a strategy registered in
       `backend.chat.context_budget`: `stable_window` (the default) or
       `sliding_window`.
     - `turn_delta_max_tokens` is the token cap for the per-turn delta (the
       context that varies every turn: retrieval or memory, advisory,
-      interruption note, clock).
+      interruption note, clock). The planner reserves it whole on every
+      turn, so the history budget does not move when the delta does.
     - `delta_placement` is where that delta goes: `user_prefix`, ahead of
       the user's words in the final user message, or `system_tail`, a system
       message directly before the final user message.

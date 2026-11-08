@@ -1,19 +1,21 @@
 """Cluster 6 — budget-aware context assembly for ConversationHandler.
 
-The conversation prompt is built from five ordered segments (persona block,
-static system template, retrieval context, optional live-data advisory,
-conversation history). Before Cluster 6 every segment was dumped in full and
+The conversation prompt is built from three ordered segments: the stable
+prefix (persona block, static system template, MIST.md, user profile; the
+tool schemas travel beside it), the conversation history, and the per-turn
+delta (interruption note, retrieval context, live-data advisory) in the
+final user message. Before Cluster 6 every segment was dumped in full and
 trusted to fit the model's context window. Bug E (43% empty V6 responses)
 traced back to this — persona + retrieval + 30 turns of history consumed
 the model's usable attention past Gemma 4 E4B's effective 8K context, and
 responses went empty.
 
-Cluster 6 enforces a hard prompt-token budget. Fixed segments (persona,
-tools, static system) consume from the top. The remainder is split between
-retrieval and history using a configurable ratio. Retrieval is pruned by
-priority score; history is pruned by a pluggable strategy (`stable_window`
-by default). All arithmetic happens BEFORE LLMRequest construction so the
-model never sees oversized prompts.
+Cluster 6 enforces a hard prompt-token budget. The stable prefix and tools
+consume from the top as fixed cost; a reserve of `turn_delta_max_tokens`
+goes to the delta; history gets the rest. Retrieval is pruned by priority
+score to the delta left after the other parts; history is pruned by a
+pluggable strategy (`stable_window` by default). All arithmetic happens
+BEFORE LLMRequest construction so the model never sees oversized prompts.
 
 Components:
 - `TokenCounter`: protocol for token accounting. `ApproximateTokenCounter`
@@ -25,9 +27,11 @@ Components:
   that fit; `StableWindowStrategy` moves the window's start in steps so
   consecutive prompts share their history and llama-server can reuse its
   cached prefix.
-- `ContextBudgetPlanner`: owns the arithmetic. Computes fixed cost, splits
-  remainder, invokes strategies, returns the pruned retrieval context string
+- `ContextBudgetPlanner`: owns the arithmetic. Computes fixed cost, reserves
+  the delta, invokes strategies, returns the pruned retrieval context string
   and pruned history list.
+- `TurnDeltaPart` and `PromptStats`: one block of the per-turn delta, and
+  the per-turn prompt statistics the handler puts on `TurnScope`.
 - `score_fact_for_retrieval_pruning`: priority = similarity x confidence x
   recency-decay.
 
@@ -368,6 +372,50 @@ def score_fact_for_retrieval_pruning(
 
 
 # ---------------------------------------------------------------------------
+# Turn delta and prompt statistics
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TurnDeltaPart:
+    """One block of the per-turn delta, the context that varies every turn.
+
+    The delta goes after the history, in the final user message (or one
+    system message directly before it), so a change in it never invalidates
+    the cached prefix of the next prompt. `kind` orders and labels the block
+    when it is rendered. `prunable` marks a block the planner may shorten to
+    fit the delta budget (retrieval, memory); the others are charged whole.
+    No producer of `clock` or `memory` parts exists yet.
+    """
+
+    kind: Literal["clock", "interruption", "retrieval", "memory", "live_advisory"]
+    text: str
+    prunable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PromptStats:
+    """Prompt-size and cache statistics for one turn, kept on `TurnScope.prompt_stats`.
+
+    The `*_est` counts are the planner's token estimates, taken when the
+    prompt is built. `prompt_tokens` comes from the provider's usage for
+    pass 1, None until that pass finishes or when the provider reports
+    nothing. `cached_tokens` is always None: `UsageMetadata` does not carry
+    a cached count yet. `prefix_changed` is True when the stable prefix
+    or the tool schemas differ from the session's previous turn.
+    `history_compacted` is the history selection's `compacted`.
+    """
+
+    prefix_tokens_est: int
+    history_tokens_est: int
+    delta_tokens_est: int
+    prompt_tokens: int | None
+    cached_tokens: int | None
+    prefix_changed: bool
+    history_compacted: Literal["none", "step", "budget"]
+
+
+# ---------------------------------------------------------------------------
 # Budget plan and planner
 # ---------------------------------------------------------------------------
 
@@ -381,10 +429,12 @@ class BudgetPlan:
     full history list. `fits` is False when even the minimum (persona + static)
     exceeds context_window — a hard stop that should log + degrade gracefully.
 
-    `retrieval_budget` and `history_budget` are the allocated token budgets;
-    `retrieval_used` and `history_used` are what the pruned output actually
-    consumed. `history_compacted` is the history strategy's
-    `HistorySelection.compacted` (`budget` when nothing fits at all).
+    `fixed_cost` is the stable prefix plus the tool schemas. `delta_budget`
+    is the reserve for the per-turn delta, `retrieval_budget` the part of it
+    left to retrieval, and `history_budget` the rest; `retrieval_used` and
+    `history_used` are what the pruned output actually consumed.
+    `history_compacted` is the history strategy's `HistorySelection.compacted`
+    (`budget` when nothing fits at all).
 
     `kept_fact_refs` and `dropped_fact_refs` name the facts behind
     `facts_kept` and `facts_dropped` (see `fact_ref`), so the turn trace can
@@ -409,6 +459,7 @@ class BudgetPlan:
     dropped_fact_refs: tuple[str, ...] = ()
     retrieval_rerendered: bool = False
     history_compacted: Literal["none", "step", "budget"] = "none"
+    delta_budget: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,6 +518,11 @@ class ContextBudgetPlanner:
         self._history_strategy = history_strategy or get_history_strategy(config.history_strategy)
 
     @property
+    def config(self) -> ContextBudgetConfig:
+        """Return the config the planner budgets with."""
+        return self._config
+
+    @property
     def counter(self) -> TokenCounter:
         """Return the injected or default TokenCounter."""
         return self._counter
@@ -505,20 +561,29 @@ class ContextBudgetPlanner:
         persona_text: str | None,
         static_text: str,
         retrieval_result: RetrievalResult | None,
-        live_advisory_text: str | None,
         history: list[dict[str, Any]],
         tools: list[dict] | None,
         max_output_tokens: int,
         extra_fixed_texts: list[str] | None = None,
         max_history: int | None = None,
+        delta_parts: list[TurnDeltaPart] | None = None,
+        live_advisory_text: str | None = None,
     ) -> BudgetPlan:
         """Plan the budget allocation for a single turn.
+
+        Only the stable prefix and the tool schemas are fixed cost. The
+        per-turn delta gets its own reserve of `turn_delta_max_tokens`
+        (capped at what the prefix leaves), whether or not this turn uses it,
+        so the history budget stays the same while the prefix and tools do; before
+        this, a live advisory was charged as fixed cost and moved the history
+        budget whenever it appeared. Inside the reserve, `delta_parts` are
+        charged first and retrieval is pruned by priority score to what is
+        left, capped also at `retrieval_budget_ratio` of the flex budget.
 
         Args:
             persona_text: Serialized persona block (MistContext.as_system_prompt_block).
             static_text: Static system-template body.
             retrieval_result: Auto-RAG result (or None if retrieval was skipped).
-            live_advisory_text: Optional live-data advisory body.
             history: Conversation history messages in chronological order.
                 The history strategy chooses the window from it, so pass the
                 whole history rather than a pre-sliced tail.
@@ -532,6 +597,11 @@ class ContextBudgetPlanner:
                 still fits.
             max_history: Message cap handed to the history strategy as
                 `max_messages`, with `config.history_high_water_factor`.
+            delta_parts: The delta parts that are charged whole (interruption
+                note, live advisory, clock), as rendered text.
+            live_advisory_text: Advisory text charged exactly like a
+                `live_advisory` entry in `delta_parts`; the keyword callers
+                used before `delta_parts` existed.
 
         Returns:
             BudgetPlan describing what survives the budget, what got pruned,
@@ -545,8 +615,8 @@ class ContextBudgetPlanner:
             - self._config.safety_margin_tokens,
         )
 
-        # Fixed segments that never get pruned.
-        fixed_texts = [t for t in (persona_text, static_text, live_advisory_text) if t]
+        # Fixed segments: the stable prefix, never pruned.
+        fixed_texts = [t for t in (persona_text, static_text) if t]
         fixed_texts += [t for t in (extra_fixed_texts or []) if t]
         fixed_cost = self._fixed_segment_tokens(fixed_texts)
         fixed_cost += self._tools_schema_tokens(tools)
@@ -580,9 +650,22 @@ class ContextBudgetPlanner:
                 history_compacted="budget" if history else "none",
             )
 
-        # Allocate flex budget by ratio.
-        retrieval_budget = int(flex_budget * self._config.retrieval_budget_ratio)
-        history_budget = flex_budget - retrieval_budget
+        # The delta reserve is taken whole, used or not, so history_budget
+        # depends on the prefix alone. Retrieval gets what the parts charged
+        # whole leave of the reserve, capped by the ratio of the flex budget.
+        delta_budget = min(self._config.turn_delta_max_tokens, flex_budget)
+        history_budget = flex_budget - delta_budget
+        whole_texts = [part.text for part in delta_parts or []]
+        if live_advisory_text:
+            whole_texts.append(live_advisory_text)
+        whole_parts_cost = self._fixed_segment_tokens(whole_texts)
+        retrieval_budget = max(
+            0,
+            min(
+                delta_budget - whole_parts_cost,
+                int(flex_budget * self._config.retrieval_budget_ratio),
+            ),
+        )
 
         # Prune retrieval by priority score.
         pruned_retrieval_text: str | None = None
@@ -624,6 +707,7 @@ class ContextBudgetPlanner:
             dropped_fact_refs=_refs(dropped_facts),
             retrieval_rerendered=retrieval_rerendered,
             history_compacted=selection.compacted,
+            delta_budget=delta_budget,
         )
 
     def _prune_retrieval(

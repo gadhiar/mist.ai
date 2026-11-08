@@ -474,6 +474,27 @@ class TestTraceOnEveryTurn:
         assert context["trace"]["budget"]["history_raw"] == 1
 
     @pytest.mark.asyncio
+    async def test_history_raw_counts_the_whole_history_on_a_long_session(
+        self, tmp_path: Path
+    ) -> None:
+        handler, _provider, store = _make_handler(
+            tmp_path, [ScriptedPass(chunks=["Sure."])], _full_script()
+        )
+        session = handler.get_or_create_session("s1")
+        for index in range(15):
+            session.add_message("user", f"seed question {index}")
+            session.add_message("assistant", f"seed answer {index}")
+
+        await _run_turn(handler, _UTTERANCE_2)
+
+        budget = store.events[0].retrieval_context["trace"]["budget"]
+        # The planner chooses the window from the 30 stored messages plus the
+        # pending one. At max_history 10 and the default high-water factor 2.0
+        # the stable window starts at message 20, the first step that leaves
+        # it within 20 messages, so it keeps the last 11.
+        assert (budget["history_raw"], budget["history_kept"]) == (31, 11)
+
+    @pytest.mark.asyncio
     async def test_disabled_auto_inject_is_recorded(self, tmp_path: Path) -> None:
         handler, _provider, store = _make_handler(
             tmp_path, [ScriptedPass(chunks=["Sure."])], _full_script(), auto_inject=False
@@ -1112,7 +1133,10 @@ class TestToolFeeds:
 
         monkeypatch.setattr(TurnTraceBuilder, "budget_planned", spy)
         handler._build_messages(
-            session=handler.sessions["s1"], max_history=10, retrieval_result=None
+            session=handler.sessions["s1"],
+            max_history=10,
+            retrieval_result=None,
+            pending_user_message=_UTTERANCE_1,
         )
 
         assert fed == []
@@ -1189,8 +1213,9 @@ def _vault_tool_call(utterance: str) -> LLMToolCall:
 class _AlternatingProvider(StreamingLLMProvider):
     """Serves two concurrent turns, handing control to the loop before every chunk.
 
-    The turn is the request's last user message. Pass 1 (a request with
-    tools) asks for that turn's one vault-tool call; pass 2 answers in text.
+    The turn is the user text that ends the request's last user message.
+    Pass 1 (a request with tools) asks for that turn's one vault-tool call;
+    pass 2 answers in text.
     `pass1_order` lists the turns in the order their pass 1 started.
     """
 
@@ -1204,7 +1229,9 @@ class _AlternatingProvider(StreamingLLMProvider):
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
         self.calls.append(request)
-        utterance = next(m["content"] for m in reversed(request.messages) if m["role"] == "user")
+        last_user = next(m["content"] for m in reversed(request.messages) if m["role"] == "user")
+        # The final user message carries the turn's delta ahead of the user's words.
+        utterance = next(turn for turn in _TOOL_QUERY if last_user.endswith(turn))
         if request.tools:
             self.pass1_order.append(utterance)
             await asyncio.sleep(0)
