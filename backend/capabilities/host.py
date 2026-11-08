@@ -42,6 +42,11 @@ Power (`power.py`): the host reads the level into every record, log row and broa
 decides nothing on it. Only the constrained decode needs a model, so `plan_turn` builds none
 while `decode_available()` is False; every `pre_llm` step and every client action runs at
 every level, off included.
+
+Voice: each record carries its spec's `ack` and `view` and the `source` that ran it, which
+`tool_events.py` turns into tool-event fields. The `ReplyRegister`'s address form ends the first
+templated reply each session hears: a handled `pre_llm` or `decide` reply, or a `run_actions`
+reply with `also_reply` false. The records keep the capability's own summaries.
 """
 
 from __future__ import annotations
@@ -108,7 +113,14 @@ from .intents import normalize_utterance
 from .policy import PolicyTable
 from .power import FixedPower, PowerLevel, PowerState, TierProviders
 from .proposals import DecisionMatcher, Proposal, ProposalStore, ProposedCall
-from .replies import actions_block, notices_for, reply_for
+from .replies import (
+    NoAddress,
+    ReplyRegister,
+    actions_block,
+    notices_for,
+    reply_for,
+    with_address,
+)
 from .router import ToolRouter, count_catalog_tokens
 from .schema import to_args_schema, to_catalog_line
 from .secrets import SecretRegistry, redact
@@ -331,6 +343,7 @@ class CapabilityHost(CapabilityTurnPort):
         alarm_control: AlarmControl | None = None,
         power: PowerState = FixedPower(),
         tiers: TierProviders | None = None,
+        register: ReplyRegister = NoAddress(),
     ) -> None:
         """Register the capabilities; nothing is started and no file is touched.
 
@@ -355,6 +368,9 @@ class CapabilityHost(CapabilityTurnPort):
             tiers: Whose `interaction` provider gates the decode (`decode_available`). None
                 means the decode is not gated by a tier. Both defaults serve callers built
                 before the power port; the factory always passes both.
+            register: Supplies the address form that ends each session's first templated
+                reply (`with_address`). `NoAddress()` by default, which leaves every reply
+                as `replies.py` renders it.
 
         Raises:
             CapabilityRegistrationError: Two capabilities share a name, or two offer the same
@@ -399,6 +415,9 @@ class CapabilityHost(CapabilityTurnPort):
         self._alarm_control = alarm_control
         self._power = power
         self._tiers = tiers
+        self._register = register
+        # Sessions that have had a templated reply, so only each one's first is addressed.
+        self._addressed: set[str] = set()
         # Per session, the `received_at` of the turn `plan_turn` built a decode for, which its
         # `run_actions` takes, because `TurnPlan` has no field for it. A turn holds the voice
         # processor's `generation_lock` until it ends (module docstring), so no other turn's
@@ -636,7 +655,7 @@ class CapabilityHost(CapabilityTurnPort):
         text = normalize_utterance(utterance, self._settings.wake_words)
         ringing = await self._handle_active(session_id, turn_id, utterance, text, received)
         if ringing is not None:
-            return ringing
+            return self._addressed_resolution(session_id, ringing)
 
         match = self._matcher.match(text)
         if match is None:
@@ -651,10 +670,15 @@ class CapabilityHost(CapabilityTurnPort):
                         proposal, decision, turn_id, utterance, received
                     )
                 self._buffer(session_id, payload)
-                return PreTurnResolution(
-                    handled=True, reply=reply, remainder=remainder, records=records, events=()
+                return self._addressed_resolution(
+                    session_id,
+                    PreTurnResolution(
+                        handled=True, reply=reply, remainder=remainder, records=records, events=()
+                    ),
                 )
-        return await self._fast_path(session_id, turn_id, utterance, text, received)
+        return self._addressed_resolution(
+            session_id, await self._fast_path(session_id, turn_id, utterance, text, received)
+        )
 
     def plan_turn(
         self,
@@ -749,10 +773,14 @@ class CapabilityHost(CapabilityTurnPort):
         ]
         async with self._lock(session_id):
             records = await self._run_calls(session_id, items, plan.offered, repair, received)
+        reply = reply_for(records)
+        if not also_reply:
+            # Only a reply that is spoken in place of the main passes counts as the first.
+            reply = self._addressed_reply(session_id, reply)
         return ActionResult(
             records=records,
             also_reply=also_reply,
-            reply=reply_for(records),
+            reply=reply,
             block=actions_block(records),
             notices=notices_for(records),
             events=(),
@@ -784,6 +812,7 @@ class CapabilityHost(CapabilityTurnPort):
             records, payload, reply = await self._resolve(
                 proposal, decision, proposal.proposal_id, "", received
             )
+        reply = self._addressed_reply(session_id, reply)
         return PreTurnResolution(True, reply, None, records, (payload,))
 
     def static_sentence(self) -> str:
@@ -900,6 +929,7 @@ class CapabilityHost(CapabilityTurnPort):
                 arguments,
                 outcome,
                 received=received,
+                spec=spec,
             )
 
         args, error = _validate(spec, arguments)
@@ -925,6 +955,7 @@ class CapabilityHost(CapabilityTurnPort):
                 arguments,
                 outcome,
                 received=received,
+                spec=spec,
             )
         return _Ready(capability, spec, args, self.redact(spec.summarize(args)))
 
@@ -989,6 +1020,7 @@ class CapabilityHost(CapabilityTurnPort):
             outcome,
             duration_ms,
             received=received,
+            spec=ready.spec,
         )
 
     async def _record(
@@ -1003,12 +1035,15 @@ class CapabilityHost(CapabilityTurnPort):
         duration_ms: int = 0,
         *,
         received: float,
+        spec: ToolSpec | None = None,
     ) -> ActionRecord:
         """Stages 8-9: redact, count, log, and build the record.
 
         `args` is the call's summary, or its raw arguments when they never validated, rendered
         as compact JSON and capped. The power level is read here, at the outcome, and
-        `turn_ms` runs from `received` (a `time.monotonic()` value) to now.
+        `turn_ms` runs from `received` (a `time.monotonic()` value) to now. The record's `ack`
+        and `view` come from `spec`, None when no spec ran the call, and its `source` from
+        `ctx`, the path that ran it.
         """
         args_summary = self.redact(args if isinstance(args, str) else _raw_args(args))
         outcome = self._redacted(outcome)
@@ -1023,6 +1058,9 @@ class CapabilityHost(CapabilityTurnPort):
             outcome=outcome,
             duration_ms=duration_ms,
             power_level=power_level,
+            ack=None if spec is None else spec.ack,
+            view=None if spec is None else spec.view,
+            source=ctx.source,
         )
         self._stats.invocations[outcome.status] += 1
         self._stats.by_source[ctx.source] += 1
@@ -1238,6 +1276,27 @@ class CapabilityHost(CapabilityTurnPort):
         return PreTurnResolution(True, reply_for(records), None, records, ())
 
     # -- Helpers ---------------------------------------------------------------------------
+
+    def _addressed_reply(self, session_id: str, reply: str) -> str:
+        """Give a templated reply the address form when it is the session's first.
+
+        A blank reply is not a reply, so it neither gains the form nor uses up the first.
+        """
+        if not reply.strip():
+            return reply
+        first = session_id not in self._addressed
+        self._addressed.add(session_id)
+        return with_address(reply, self._register, first_in_session=first)
+
+    def _addressed_resolution(
+        self, session_id: str, resolution: PreTurnResolution | None
+    ) -> PreTurnResolution | None:
+        """`_addressed_reply` over a handled resolution's reply; anything else unchanged."""
+        if resolution is None or not resolution.handled or resolution.reply is None:
+            return resolution
+        return dataclasses.replace(
+            resolution, reply=self._addressed_reply(session_id, resolution.reply)
+        )
 
     def _status_of(self, capability: Capability) -> CapabilityStatus:
         status = capability.status()
