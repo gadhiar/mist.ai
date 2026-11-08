@@ -148,6 +148,14 @@ data/runtime/
 data/eval-run/
 data/*-backup-*
 
+# Capabilities: alarms, timers and the action log; the Spotify refresh token
+# (secret); the optional local policy override (configuration, not a secret).
+data/capabilities.db
+data/capabilities.db-shm
+data/capabilities.db-wal
+data/secrets/
+data/capability_policy.yaml
+
 # R1.4.6 hydration. `dev-state/` is the dev profile's live-ish store root (the
 # ONLY writable mount of mist-backend-dev); `data/hydration-snapshots/` holds
 # the versioned artifacts snapshot.py dumps out of it. Both are regenerable --
