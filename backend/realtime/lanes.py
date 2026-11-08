@@ -16,6 +16,7 @@ every `except CancelledError` above it.
 
 import asyncio
 import logging
+import sys
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -66,13 +67,14 @@ class _Job:
 class InferenceLane:
     """A FIFO queue of blocking engine calls served by one worker thread.
 
-    A job that raises an exception fails only itself: the caller receives `SpeechEngineError`
-    (the engine's own `SpeechEngineError` unchanged, any other exception wrapped with it as the
-    cause), because the turn controller handles engine failures by that one type. A job that
-    ends the worker thread itself (`SystemExit` or another exception outside `Exception`) fails
-    with every job queued behind it; the lane starts a replacement worker once, and after a
-    second death it is unhealthy and refuses new jobs at once, so its engine can be reported
-    unavailable instead of hanging callers.
+    A job that raises `SpeechEngineError` or `LaneJobCancelled` fails only itself: the caller
+    receives that exception unchanged and the worker serves on. Adapters convert their library's
+    errors to `SpeechEngineError`, the one type the turn controller handles engine failures by,
+    so any other exception that reaches the lane is a bug and is not hidden behind a wrap: it
+    ends the worker thread, which logs it with its traceback and fails the job and every job
+    queued behind it with `SpeechEngineError` ("worker thread died"). The lane starts a
+    replacement worker once, and after a second death it is unhealthy and refuses new jobs at
+    once, so its engine can be reported unavailable instead of hanging callers.
     """
 
     def __init__(self, name: str, *, max_queue: int = 64) -> None:
@@ -98,8 +100,9 @@ class InferenceLane:
             LaneJobCancelled: Another holder set `token` before submission, while the job was
                 queued or while it ran, or the job was a decode cut by its stream's `close()`;
                 the job's result, if any, is discarded.
-            SpeechEngineError: The job failed, its worker thread died, the queue is full, or
-                the lane is shut down or unhealthy.
+            SpeechEngineError: The job raised it; the job raised any other exception, which
+                ends the worker thread ("worker thread died"), or a job ahead of it did; the
+                queue is full; or the lane is shut down or unhealthy.
         """
         if token.is_set():
             raise self._cancelled("before submission")
@@ -182,7 +185,8 @@ class InferenceLane:
                 current = None
         finally:
             if not exited_cleanly:
-                self._on_worker_death(current)
+                # Inside `finally`, `sys.exc_info()` is the exception ending the thread.
+                self._on_worker_death(current, sys.exc_info()[1])
 
     def _execute(self, job: _Job) -> None:
         if job.token.is_set():
@@ -193,14 +197,6 @@ class InferenceLane:
         except (SpeechEngineError, LaneJobCancelled) as exc:
             self._settle(job, error=exc)
             return
-        # The job's exception is not handled here but forwarded: it fails the awaiting caller as
-        # `SpeechEngineError`, the one type the controller handles engine failures by, with the
-        # original as its cause. Letting it propagate instead would end the worker thread.
-        except Exception as exc:  # noqa: BLE001 -- forwarded to the awaiting caller
-            error = SpeechEngineError(f"inference lane {self._name!r}: job failed: {exc!r}")
-            error.__cause__ = exc
-            self._settle(job, error=error)
-            return
         if job.token.is_set():
             self._settle(job, error=self._cancelled("while it ran"))
         else:
@@ -209,7 +205,7 @@ class InferenceLane:
     def _cancelled(self, when: str) -> LaneJobCancelled:
         return LaneJobCancelled(f"inference lane {self._name!r}: job cancelled {when}")
 
-    def _on_worker_death(self, current: _Job | None) -> None:
+    def _on_worker_death(self, current: _Job | None, cause: BaseException | None) -> None:
         with self._cond:
             self._deaths += 1
             failed = ([current] if current is not None else []) + list(self._queue)
@@ -223,6 +219,7 @@ class InferenceLane:
             self._deaths,
             _MAX_WORKER_DEATHS,
             "restarted" if restart else "lane unavailable",
+            exc_info=cause,
         )
         error = SpeechEngineError(f"inference lane {self._name!r}: worker thread died")
         for job in failed:

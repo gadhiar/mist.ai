@@ -8,6 +8,7 @@ explicit and nothing depends on timing.
 """
 
 import asyncio
+import logging
 import threading
 from collections.abc import Iterator
 
@@ -100,27 +101,18 @@ class TestExecution:
         assert caught.value is error
 
     @pytest.mark.asyncio
-    async def test_another_engine_exception_reaches_the_caller_as_speech_engine_error(self, lane):
-        cause = RuntimeError("CUDA out of memory")
-
+    async def test_a_job_failing_with_speech_engine_error_leaves_the_same_worker_serving(
+        self, lane
+    ):
         def fail() -> None:
-            raise cause
+            raise SpeechEngineError("bad input")
 
-        with pytest.raises(SpeechEngineError) as caught:
-            await lane.run(fail, token=CancelToken())
-
-        assert caught.value.__cause__ is cause
-        assert lane.healthy()
-
-    @pytest.mark.asyncio
-    async def test_a_failed_job_leaves_the_worker_serving(self, lane):
-        def fail() -> None:
-            raise ValueError("bad input")
-
+        worker_before = await lane.run(threading.get_ident, token=CancelToken())
         with pytest.raises(SpeechEngineError):
             await lane.run(fail, token=CancelToken())
 
-        assert await lane.run(lambda: "next", token=CancelToken()) == "next"
+        assert await lane.run(threading.get_ident, token=CancelToken()) == worker_before
+        assert lane.healthy()
 
 
 class TestCancellation:
@@ -340,8 +332,8 @@ def _kill_worker() -> None:
     raise SystemExit("worker killed by its job")
 
 
-# The worker's death is the behaviour under test. Python's own thread excepthook ignores
-# `SystemExit`, but pytest's replacement reports it as an unhandled thread exception.
+# The worker's death is the behaviour under test. pytest reports the exception that ends the
+# thread (`SystemExit`, or a job's non-engine exception) as an unhandled thread exception.
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 class TestWorkerDeath:
     @pytest.mark.asyncio
@@ -389,3 +381,43 @@ class TestWorkerDeath:
 
         assert not lane.healthy()
         assert not ran.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_non_engine_exception_ends_the_worker_and_logs_its_traceback(
+        self, lane, caplog
+    ):
+        # Adapters convert library errors to `SpeechEngineError`, so any other exception that
+        # reaches the lane is a bug: it ends the worker instead of being wrapped and hidden.
+        cause = RuntimeError("CUDA out of memory")
+
+        def fail() -> None:
+            raise cause
+
+        worker_before = await lane.run(threading.get_ident, token=CancelToken())
+        with (
+            caplog.at_level(logging.ERROR, logger="backend.realtime.lanes"),
+            pytest.raises(SpeechEngineError, match="worker thread died") as caught,
+        ):
+            await lane.run(fail, token=CancelToken())
+
+        assert caught.value.__cause__ is None
+        deaths = [record for record in caplog.records if "worker thread died" in record.message]
+        assert len(deaths) == 1
+        assert deaths[0].exc_info is not None
+        assert deaths[0].exc_info[1] is cause
+        assert lane.healthy()
+        assert await lane.run(threading.get_ident, token=CancelToken()) != worker_before
+
+    @pytest.mark.asyncio
+    async def test_two_non_engine_exceptions_make_the_lane_unhealthy(self, lane):
+        def fail() -> None:
+            raise ValueError("bad input")
+
+        with pytest.raises(SpeechEngineError, match="worker thread died"):
+            await lane.run(fail, token=CancelToken())
+        with pytest.raises(SpeechEngineError, match="worker thread died"):
+            await lane.run(fail, token=CancelToken())
+
+        with pytest.raises(SpeechEngineError, match="unavailable"):
+            await lane.run(int, token=CancelToken())
+        assert not lane.healthy()
