@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from backend.realtime.errors import RealtimeError
+from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.speech import (
     CancelToken,
     SynthChunk,
@@ -120,15 +121,20 @@ class ScriptedTranscriptStream:
         if self.closed:
             raise RealtimeError(f"transcript stream is closed: cannot {action}")
 
+    def _check_decode_open(self, action: str) -> None:
+        # A decode runs as a lane job, so a close cuts it as another holder's cancel would.
+        if self.closed:
+            raise LaneJobCancelled(f"transcript stream is closed: cannot {action}")
+
     def _decoding(self) -> None:
         """Stand in for the decode's model time; a close landing here discards the result."""
-        self._check_open("decode")
+        self._check_decode_open("decode")
         if self.on_decode is not None:
             self.on_decode()
 
     def decode_partial(self, token: CancelToken) -> TranscriptUpdate:
         self._decoding()
-        self._check_open("return a partial")
+        self._check_decode_open("return a partial")
         words = self.utterance.text.split()
         text = " ".join(words[: self.audio_ms // self.ms_per_word])
         previous = self.partials[-1].text if self.partials else ""
@@ -145,7 +151,7 @@ class ScriptedTranscriptStream:
 
     def decode_final(self, token: CancelToken) -> TranscriptUpdate:
         self._decoding()
-        self._check_open("return a final")
+        self._check_decode_open("return a final")
         text = self.utterance.text
         update = TranscriptUpdate(
             text,

@@ -142,10 +142,10 @@ class TranscriptStream(Protocol):
         """End the stream; a second call does nothing.
 
         A GPU release or a cut can close a stream while one of its decodes is still running on
-        the STT lane, so that decode's result is discarded: the decode raises `RealtimeError`
-        instead of returning a transcript of an utterance nobody is listening to. A push or a
-        decode after `close` raises `RealtimeError` too. Each owner closes its stream exactly
-        once.
+        the STT lane, so that decode's result is discarded: the decode raises `LaneJobCancelled`
+        (`lanes.py`) instead of returning a transcript of an utterance nobody is listening to,
+        and so does a decode that starts after `close`. A push after `close` raises
+        `RealtimeError`. Each owner closes its stream exactly once.
         """
         ...
 

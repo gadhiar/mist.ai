@@ -11,11 +11,13 @@ import asyncio
 import threading
 from collections.abc import Iterator
 
+import numpy as np
 import pytest
 
-from backend.realtime.errors import SpeechEngineError
-from backend.realtime.lanes import InferenceLane
+from backend.realtime.errors import RealtimeError, SpeechEngineError
+from backend.realtime.lanes import InferenceLane, LaneJobCancelled
 from backend.realtime.speech import CancelToken
+from tests.fakes.speech import ScriptedTranscriber
 
 WAIT_S = 5.0
 
@@ -122,8 +124,21 @@ class TestExecution:
 
 
 class TestCancellation:
+    """Who cancelled decides what the caller sees.
+
+    `asyncio.CancelledError` means only that the awaiting task itself was cancelled. A job whose
+    token another holder set (a barge-in, a GPU release), or a decode cut by its stream's
+    `close()`, fails with `LaneJobCancelled`, so the caller's task is never told it was cancelled
+    when it was not.
+    """
+
+    def test_lane_job_cancelled_is_a_realtime_error_apart_from_engine_failures(self):
+        assert issubclass(LaneJobCancelled, RealtimeError)
+        assert not issubclass(LaneJobCancelled, SpeechEngineError)
+        assert not issubclass(LaneJobCancelled, asyncio.CancelledError)
+
     @pytest.mark.asyncio
-    async def test_a_job_whose_token_is_set_before_it_starts_never_runs(self, lane):
+    async def test_a_job_whose_token_another_holder_set_before_it_starts_never_runs(self, lane):
         gate = _BlockingJob()
         ran = threading.Event()
         token = CancelToken()
@@ -136,7 +151,7 @@ class TestCancellation:
         gate.release.set()
         await first
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(LaneJobCancelled):
             await queued
         assert await lane.run(lambda: "after", token=CancelToken()) == "after"
         assert not ran.is_set()
@@ -167,7 +182,7 @@ class TestCancellation:
         token = CancelToken()
         token.set()
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(LaneJobCancelled):
             await lane.run(ran.set, token=token)
 
         assert await lane.run(lambda: "after", token=CancelToken()) == "after"
@@ -190,7 +205,7 @@ class TestCancellation:
         assert job.finished.is_set()
 
     @pytest.mark.asyncio
-    async def test_a_token_set_while_running_discards_the_result(self, lane):
+    async def test_a_token_another_holder_set_while_running_discards_the_result(self, lane):
         job = _BlockingJob(result="stale audio")
         token = CancelToken()
         running = asyncio.ensure_future(lane.run(job, token=token))
@@ -199,8 +214,44 @@ class TestCancellation:
         token.set()
         job.release.set()
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(LaneJobCancelled):
             await running
+
+    @pytest.mark.asyncio
+    async def test_a_decode_cut_by_close_fails_with_lane_job_cancelled_and_the_worker_serves_on(
+        self, lane
+    ):
+        started, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            started.set()
+            release.wait(WAIT_S)
+
+        stream = ScriptedTranscriber(["turn on the lights"], on_decode=hold).open_stream()
+        stream.push(np.zeros(6400, dtype=np.float32))
+        worker_before = await lane.run(threading.get_ident, token=CancelToken())
+        decoding = asyncio.ensure_future(
+            lane.run(stream.decode_partial, CancelToken(), token=CancelToken())
+        )
+        await _wait_for(started)
+
+        stream.close()
+        release.set()
+
+        with pytest.raises(LaneJobCancelled):
+            await decoding
+        assert stream.partials == []
+        assert await lane.run(threading.get_ident, token=CancelToken()) == worker_before
+        assert lane.healthy()
+
+    @pytest.mark.asyncio
+    async def test_a_decode_queued_behind_a_close_fails_with_lane_job_cancelled(self, lane):
+        stream = ScriptedTranscriber(["hi"]).open_stream()
+        stream.close()
+
+        with pytest.raises(LaneJobCancelled):
+            await lane.run(stream.decode_final, CancelToken(), token=CancelToken())
+        assert lane.healthy()
 
 
 class TestDepth:

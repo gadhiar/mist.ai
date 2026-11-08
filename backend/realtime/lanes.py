@@ -6,6 +6,12 @@ serializes sessions that share an engine instead of letting them race on the GPU
 is cooperative: a queued job whose `CancelToken` is set never starts, and a running job cannot
 be interrupted from outside, so its token is set for the engine to check between chunks and its
 result is discarded when it returns.
+
+Who cancelled decides what the caller sees. `asyncio.CancelledError` means only that the awaiting
+task itself was cancelled. A job whose token another holder set (a barge-in, a GPU release), and
+a decode cut by its stream's `close()`, fail with `LaneJobCancelled`: raising `CancelledError`
+into a task nobody cancelled would make it look cancelled to `asyncio.timeout`, `TaskGroup` and
+every `except CancelledError` above it.
 """
 
 import asyncio
@@ -15,7 +21,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import TypeVar
 
-from .errors import SpeechEngineError
+from .errors import RealtimeError, SpeechEngineError
 from .speech import CancelToken
 
 logger = logging.getLogger(__name__)
@@ -23,6 +29,18 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _MAX_WORKER_DEATHS = 2
+
+
+# N818 asks for an `Error` suffix. This is a cancellation signal, not a failure, and it is named
+# for what happened to the job, as `asyncio.CancelledError`'s counterpart.
+class LaneJobCancelled(RealtimeError):  # noqa: N818
+    """A lane job stopped because another holder cancelled it, not because its caller was.
+
+    Raised by `InferenceLane.run` when the job's token was set by someone other than the
+    awaiting task (queued, running, or already set at submission), and by a transcript stream's
+    decode cut by `close()`. It is not a `SpeechEngineError`: the engine did not fail, the work
+    was no longer wanted.
+    """
 
 
 class _Job:
@@ -75,13 +93,16 @@ class InferenceLane:
         the worker discard the result of one that has.
 
         Raises:
-            asyncio.CancelledError: `token` was set before the job started or while it ran, or
-                the awaiting task was cancelled; the job's result, if any, is discarded.
+            asyncio.CancelledError: The awaiting task itself was cancelled; the job's result, if
+                any, is discarded.
+            LaneJobCancelled: Another holder set `token` before submission, while the job was
+                queued or while it ran, or the job was a decode cut by its stream's `close()`;
+                the job's result, if any, is discarded.
             SpeechEngineError: The job failed, its worker thread died, the queue is full, or
                 the lane is shut down or unhealthy.
         """
         if token.is_set():
-            raise asyncio.CancelledError()
+            raise self._cancelled("before submission")
         loop = asyncio.get_running_loop()
         future: asyncio.Future[object] = loop.create_future()
         job = _Job(fn, args, token, loop, future)
@@ -165,11 +186,11 @@ class InferenceLane:
 
     def _execute(self, job: _Job) -> None:
         if job.token.is_set():
-            self._settle(job, cancelled=True)
+            self._settle(job, error=self._cancelled("before it started"))
             return
         try:
             result = job.fn(*job.args)
-        except SpeechEngineError as exc:
+        except (SpeechEngineError, LaneJobCancelled) as exc:
             self._settle(job, error=exc)
             return
         # The job's exception is not handled here but forwarded: it fails the awaiting caller as
@@ -181,9 +202,12 @@ class InferenceLane:
             self._settle(job, error=error)
             return
         if job.token.is_set():
-            self._settle(job, cancelled=True)
+            self._settle(job, error=self._cancelled("while it ran"))
         else:
             self._settle(job, result=result)
+
+    def _cancelled(self, when: str) -> LaneJobCancelled:
+        return LaneJobCancelled(f"inference lane {self._name!r}: job cancelled {when}")
 
     def _on_worker_death(self, current: _Job | None) -> None:
         with self._cond:
@@ -210,14 +234,12 @@ class InferenceLane:
         *,
         result: object = None,
         error: BaseException | None = None,
-        cancelled: bool = False,
     ) -> None:
         def resolve() -> None:
+            # A future already done is one whose awaiting task was cancelled.
             if job.future.done():
                 return
-            if cancelled:
-                job.future.cancel()
-            elif error is not None:
+            if error is not None:
                 job.future.set_exception(error)
             else:
                 job.future.set_result(result)

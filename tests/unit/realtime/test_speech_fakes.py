@@ -19,6 +19,7 @@ import pytest
 
 from backend.realtime import speech
 from backend.realtime.errors import RealtimeError
+from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.speech import (
     CancelToken,
     SynthChunk,
@@ -290,7 +291,7 @@ class TestTranscriptStreamClose:
         streams.append(transcriber.open_stream())
         streams[0].push(np.zeros(6400, dtype=np.float32))
 
-        with pytest.raises(RealtimeError, match="closed"):
+        with pytest.raises(LaneJobCancelled, match="closed"):
             streams[0].decode_partial(CancelToken())
 
         assert streams[0].partials == []
@@ -300,7 +301,7 @@ class TestTranscriptStreamClose:
         transcriber = ScriptedTranscriber(["hi"], on_decode=lambda: streams[0].close())
         streams.append(transcriber.open_stream())
 
-        with pytest.raises(RealtimeError, match="closed"):
+        with pytest.raises(LaneJobCancelled, match="closed"):
             streams[0].decode_final(CancelToken())
 
         assert streams[0].finals == []
@@ -330,25 +331,26 @@ class TestTranscriptStreamClose:
         worker.join(timeout=5)
 
         assert len(outcome) == 1
-        assert isinstance(outcome[0], RealtimeError)
+        assert isinstance(outcome[0], LaneJobCancelled)
         assert stream.partials == []
 
     def test_a_push_after_close_raises_realtime_error(self):
         stream = ScriptedTranscriber(["hi"]).open_stream()
         stream.close()
 
-        with pytest.raises(RealtimeError, match="closed"):
+        with pytest.raises(RealtimeError, match="closed") as caught:
             stream.push(np.zeros(512, dtype=np.float32))
 
+        assert not isinstance(caught.value, LaneJobCancelled)
         assert stream.pushed == []
 
-    def test_a_decode_started_after_close_raises_realtime_error(self):
+    def test_a_decode_started_after_close_is_cut_with_lane_job_cancelled(self):
         stream = ScriptedTranscriber(["hi"]).open_stream()
         stream.close()
 
-        with pytest.raises(RealtimeError, match="closed"):
+        with pytest.raises(LaneJobCancelled, match="closed"):
             stream.decode_partial(CancelToken())
-        with pytest.raises(RealtimeError, match="closed"):
+        with pytest.raises(LaneJobCancelled, match="closed"):
             stream.decode_final(CancelToken())
 
 
