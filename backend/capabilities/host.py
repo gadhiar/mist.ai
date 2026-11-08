@@ -31,11 +31,17 @@ caller: inside a turn, the turn's own error backstop. A capability's `start` run
 its own, and a failure of any kind there makes that capability `unavailable`.
 
 Clients learn of status changes from `capabilities_status`, which `status_changed` emits only
-when the status set differs from the one last broadcast. The host's own transition sites (a
-finished start, `stop`) and the MCP connection's state listener call it at once; a watcher
-task polls it every second for statuses that change with no transition site, such as the
-alarm scheduler's health. The watcher contains `MistError` per tick and backs off after a
-failing tick; any other end it was not asked for is logged at ERROR and costs only the poll.
+when the status set, the power level or `decode_available()` differs from the one last
+broadcast. The host's own transition sites (a finished start, `stop`) and the MCP connection's
+state listener call it at once; a watcher task polls it every second for changes with no
+transition site, such as the alarm scheduler's health or the power level. The watcher contains
+`MistError` per tick and backs off after a failing tick; any other end it was not asked for is
+logged at ERROR and costs only the poll.
+
+Power (`power.py`): the host reads the level into every record, log row and broadcast, and
+decides nothing on it. Only the constrained decode needs a model, so `plan_turn` builds none
+while `decode_available()` is False; every `pre_llm` step and every client action runs at
+every level, off included.
 """
 
 from __future__ import annotations
@@ -100,6 +106,7 @@ from .events import (
 )
 from .intents import normalize_utterance
 from .policy import PolicyTable
+from .power import FixedPower, PowerLevel, PowerState, TierProviders
 from .proposals import DecisionMatcher, Proposal, ProposalStore, ProposedCall
 from .replies import actions_block, notices_for, reply_for
 from .router import ToolRouter, count_catalog_tokens
@@ -174,10 +181,12 @@ _WATCHER_NAME = "capability-status-watcher"
 # bug and ends the watcher, which `_on_watcher_done` records. No broader catch is added.
 _WATCHER_CONTAINED_ERRORS: tuple[type[BaseException], ...] = (MistError,)
 
-# The compared part of a broadcast: per capability, in name order, its name, state, reason
-# and tool names. `at` and `checked_at` are left out, so a poll that finds only a newer check
-# time emits nothing.
+# Per capability, in name order, its name, state, reason and tool names.
 _StatusSet = tuple[tuple[str, CapabilityState, str | None, tuple[str, ...]], ...]
+# The compared part of a broadcast: the power level, whether a decode can run, and the status
+# set. `at` and `checked_at` are left out, so a poll that finds only a newer check time emits
+# nothing.
+_Broadcast = tuple[PowerLevel, bool, _StatusSet]
 
 
 class AlarmControl(Protocol):
@@ -320,6 +329,8 @@ class CapabilityHost(CapabilityTurnPort):
         settings: HostSettings,
         timeout_runner: TimeoutRunner = asyncio.wait_for,
         alarm_control: AlarmControl | None = None,
+        power: PowerState = FixedPower(),
+        tiers: TierProviders | None = None,
     ) -> None:
         """Register the capabilities; nothing is started and no file is touched.
 
@@ -339,6 +350,11 @@ class CapabilityHost(CapabilityTurnPort):
             timeout_runner: Bounds each invoke and decode; `asyncio.wait_for` by default.
             alarm_control: The alarm state and actions behind `snapshot_events` and
                 `alarm_action`; None when no alarm scheduler is built.
+            power: The level each record, log row and status broadcast carries; the host
+                makes no decision on it. `FixedPower()` (full) by default.
+            tiers: Whose `interaction` provider gates the decode (`decode_available`). None
+                means the decode is not gated by a tier. Both defaults serve callers built
+                before the power port; the factory always passes both.
 
         Raises:
             CapabilityRegistrationError: Two capabilities share a name, or two offer the same
@@ -381,9 +397,16 @@ class CapabilityHost(CapabilityTurnPort):
         self._oversized: dict[str, tuple[str, ...]] = {}
         self._stats = _Stats(clock.now())
         self._alarm_control = alarm_control
+        self._power = power
+        self._tiers = tiers
+        # Per session, the `received_at` of the turn `plan_turn` built a decode for, which its
+        # `run_actions` takes, because `TurnPlan` has no field for it. A turn holds the voice
+        # processor's `generation_lock` until it ends (module docstring), so no other turn's
+        # `plan_turn` falls between a turn's two calls and one entry per session is enough.
+        self._received_at: dict[str, float] = {}
         self._status_rev = 0
         # None until the first broadcast, so the first `status_changed` always emits.
-        self._broadcast: _StatusSet | None = None
+        self._broadcast: _Broadcast | None = None
         self._watcher: asyncio.Task[None] | None = None
         self._watcher_stopping = False
         self._watcher_dead = False
@@ -473,21 +496,37 @@ class CapabilityHost(CapabilityTurnPort):
 
     # -- Status broadcast, connect snapshot and alarm actions ------------------------------
 
-    def status_changed(self) -> None:
-        """Broadcast `capabilities_status` if the status set differs from the last broadcast.
+    def decode_available(self) -> bool:
+        """Return whether a constrained decode can run now.
 
-        The one entry point for every broadcast: the host's transition sites, the MCP
-        connection's state listener and the watcher all call it, so one change is emitted
-        once. It is synchronous and runs on the loop. On a difference it bumps `rev` and emits
-        one payload through the event sink; otherwise it emits nothing.
+        It is `tiers.provider("interaction") is not None`, read at each call; with no tiers it
+        is True. Which tiers a level allows is the router's policy, so the level itself is not
+        consulted here.
         """
-        current = self._status_set()
+        return self._tiers is None or self._tiers.provider("interaction") is not None
+
+    def status_changed(self) -> None:
+        """Broadcast `capabilities_status` if the compared state differs from the last broadcast.
+
+        The compared state is the power level, `decode_available()` and the status set, so a
+        level change that only the watcher can see is broadcast at its next tick. This is the
+        one entry point for every broadcast: the host's transition sites, the MCP connection's
+        state listener and the watcher all call it, so one change is emitted once. It is
+        synchronous and runs on the loop. On a difference it bumps `rev` and emits one payload
+        through the event sink; otherwise it emits nothing.
+        """
+        self._broadcast_if_changed()
+
+    def _broadcast_if_changed(self) -> _Broadcast:
+        """Run `status_changed`'s comparison and broadcast, and return the compared state."""
+        current = (self._power.level(), self.decode_available(), self._status_set())
         if current == self._broadcast:
-            return
+            return current
         payload = _status_payload(self._status_rev + 1, current, self._clock.now())
         self._status_rev += 1
         self._broadcast = current
         self._sink.emit(payload)
+        return current
 
     async def snapshot_events(self) -> list[dict[str, object]]:
         """Return the payloads a connecting client gets: status first, then alarm state.
@@ -498,8 +537,8 @@ class CapabilityHost(CapabilityTurnPort):
         `alarm_state` left out, because `capabilities_status` already shows alarms and timers
         `unavailable` with the reason; any other exception propagates to the caller.
         """
-        self.status_changed()
-        events = [_status_payload(self._status_rev, self._broadcast or (), self._clock.now())]
+        broadcast = self._broadcast_if_changed()
+        events = [_status_payload(self._status_rev, broadcast, self._clock.now())]
         if self._alarm_control is not None:
             try:
                 state = await self._alarm_control.snapshot()
@@ -572,9 +611,12 @@ class CapabilityHost(CapabilityTurnPort):
     # -- CapabilityTurnPort ----------------------------------------------------------------
 
     async def pre_llm(
-        self, session_id: str, turn_id: str, utterance: str
+        self, session_id: str, turn_id: str, utterance: str, *, received_at: float | None = None
     ) -> PreTurnResolution | None:
         """Resolve the turn without the model, in the Design doc's pre-LLM order.
+
+        No step needs a model or reads the tiers, so all of them run at every power level,
+        off included. `received_at` (`CapabilityTurnPort`) starts each record's `turn_ms`.
 
         1. While a capability is `active()`, it gets the normalised utterance through
            `on_active_utterance`, under the per-call timeout; an outcome answers the turn, and
@@ -590,8 +632,9 @@ class CapabilityHost(CapabilityTurnPort):
         starts again at step 1; the first pass popped the proposal, so steps 2 and 3 find
         nothing.
         """
+        received = _received(received_at)
         text = normalize_utterance(utterance, self._settings.wake_words)
-        ringing = await self._handle_active(session_id, turn_id, utterance, text)
+        ringing = await self._handle_active(session_id, turn_id, utterance, text, received)
         if ringing is not None:
             return ringing
 
@@ -605,16 +648,21 @@ class CapabilityHost(CapabilityTurnPort):
                 decision, remainder = match
                 async with self._lock(session_id):
                     records, payload, reply = await self._resolve(
-                        proposal, decision, turn_id, utterance
+                        proposal, decision, turn_id, utterance, received
                     )
                 self._buffer(session_id, payload)
                 return PreTurnResolution(
                     handled=True, reply=reply, remainder=remainder, records=records, events=()
                 )
-        return await self._fast_path(session_id, turn_id, utterance, text)
+        return await self._fast_path(session_id, turn_id, utterance, text, received)
 
     def plan_turn(
-        self, session_id: str, utterance: str, recent: Sequence[tuple[str, str]]
+        self,
+        session_id: str,
+        utterance: str,
+        recent: Sequence[tuple[str, str]],
+        *,
+        received_at: float | None = None,
     ) -> TurnPlan:
         """Route the utterance and build the decode over the routed capabilities' tools.
 
@@ -627,13 +675,19 @@ class CapabilityHost(CapabilityTurnPort):
             session_id: Whose stickiness the router applies.
             utterance: The text routing and the decode read.
             recent: Passed to `ActionDecoder.build` as given.
+            received_at: Starts `turn_ms` for the records of this plan's `run_actions`
+                (`CapabilityTurnPort`).
 
         Returns:
-            A plan with no decode and nothing offered when nothing is routed.
+            A plan with no decode and nothing offered when nothing is routed, or when
+            `decode_available()` is False; the route is still the router's decision.
         """
+        received = _received(received_at)
+        self._received_at.pop(session_id, None)
         route = self._router.select(utterance, session_id)
-        if not route.capabilities:
+        if not route.capabilities or not self.decode_available():
             return TurnPlan(route=route, offered=frozenset(), decode=None)
+        self._received_at[session_id] = received
         offered: list[tuple[ToolSpec, Mapping[str, object]]] = []
         for name in route.capabilities:
             capability = self._by_name[name]
@@ -663,6 +717,11 @@ class CapabilityHost(CapabilityTurnPort):
         """
         if plan.decode is None:
             return ActionResult((), True, None, "", (), ())
+        # The `received_at` this session's last `plan_turn` stored; with none (the plan came
+        # from elsewhere), `turn_ms` counts from here.
+        received = self._received_at.pop(session_id, None)
+        if received is None:
+            received = time.monotonic()
         self._stats.decodes += 1
         try:
             reply = await self._timeout(decode(plan.decode), self._settings.decode_timeout_s)
@@ -689,7 +748,7 @@ class CapabilityHost(CapabilityTurnPort):
             for call in calls
         ]
         async with self._lock(session_id):
-            records = await self._run_calls(session_id, items, plan.offered, repair)
+            records = await self._run_calls(session_id, items, plan.offered, repair, received)
         return ActionResult(
             records=records,
             also_reply=also_reply,
@@ -720,9 +779,10 @@ class CapabilityHost(CapabilityTurnPort):
             return PreTurnResolution(False, self.redact(str(exc)), None, (), ())
         if proposal is None:
             return PreTurnResolution(False, NO_LIVE_PROPOSAL_REPLY, None, (), ())
+        received = time.monotonic()
         async with self._lock(session_id):
             records, payload, reply = await self._resolve(
-                proposal, decision, proposal.proposal_id, ""
+                proposal, decision, proposal.proposal_id, "", received
             )
         return PreTurnResolution(True, reply, None, records, (payload,))
 
@@ -758,9 +818,13 @@ class CapabilityHost(CapabilityTurnPort):
         Returns:
             The record. A call that needs confirmation becomes a proposal of its own,
             superseding the session's live one, and its outcome is `pending_confirmation`.
+            Its `turn_ms` counts from this call.
         """
+        received = time.monotonic()
         async with self._lock(ctx.session_id):
-            (record,) = await self._run_calls(ctx.session_id, [(tool_call, ctx)], offered, None)
+            (record,) = await self._run_calls(
+                ctx.session_id, [(tool_call, ctx)], offered, None, received
+            )
         return record
 
     async def _run_calls(
@@ -769,23 +833,27 @@ class CapabilityHost(CapabilityTurnPort):
         items: Sequence[tuple[ToolCall, InvocationContext]],
         offered: frozenset[str] | None,
         repair: _Repair | None,
+        received: float,
     ) -> tuple[ActionRecord, ...]:
-        """Run stages 1-9 for each call in order; the caller holds the session's lock."""
+        """Run stages 1-9 for each call in order; the caller holds the session's lock.
+
+        `received` is the monotonic time each record's `turn_ms` counts from.
+        """
         slots: list[ActionRecord | None] = []
         waiting: list[tuple[int, _Ready, InvocationContext]] = []
         for call, ctx in items:
-            admitted = await self._admit(call, ctx, offered, repair)
+            admitted = await self._admit(call, ctx, offered, repair, received)
             if isinstance(admitted, ActionRecord):
                 slots.append(admitted)
                 continue
-            processed = await self._decide_and_run(admitted, ctx)
+            processed = await self._decide_and_run(admitted, ctx, received)
             if isinstance(processed, _Ready):
                 waiting.append((len(slots), processed, ctx))
                 slots.append(None)
             else:
                 slots.append(processed)
         if waiting:
-            await self._propose(session_id, waiting, slots)
+            await self._propose(session_id, waiting, slots, received)
         return tuple(record for record in slots if record is not None)
 
     async def _admit(
@@ -794,6 +862,7 @@ class CapabilityHost(CapabilityTurnPort):
         ctx: InvocationContext,
         offered: frozenset[str] | None,
         repair: _Repair | None,
+        received: float,
     ) -> _Ready | ActionRecord:
         """Stages 1-3: lookup, the offered check and validation, with one repair if given."""
         arguments: dict[str, object] = dict(call.arguments)
@@ -806,7 +875,14 @@ class CapabilityHost(CapabilityTurnPort):
             )
             # Nothing ran and no capability owns the name, so the record names the prefix.
             return await self._record(
-                ctx, call.id, call.name.partition(".")[0], "read", call.name, arguments, outcome
+                ctx,
+                call.id,
+                call.name.partition(".")[0],
+                "read",
+                call.name,
+                arguments,
+                outcome,
+                received=received,
             )
         capability, spec = found
         if offered is not None and call.name not in offered:
@@ -816,7 +892,14 @@ class CapabilityHost(CapabilityTurnPort):
                 reason="not offered",
             )
             return await self._record(
-                ctx, call.id, capability.name, spec.risk, call.name, arguments, outcome
+                ctx,
+                call.id,
+                capability.name,
+                spec.risk,
+                call.name,
+                arguments,
+                outcome,
+                received=received,
             )
 
         args, error = _validate(spec, arguments)
@@ -834,11 +917,20 @@ class CapabilityHost(CapabilityTurnPort):
                 reason=error,
             )
             return await self._record(
-                ctx, call.id, capability.name, spec.risk, call.name, arguments, outcome
+                ctx,
+                call.id,
+                capability.name,
+                spec.risk,
+                call.name,
+                arguments,
+                outcome,
+                received=received,
             )
         return _Ready(capability, spec, args, self.redact(spec.summarize(args)))
 
-    async def _decide_and_run(self, ready: _Ready, ctx: InvocationContext) -> ActionRecord | _Ready:
+    async def _decide_and_run(
+        self, ready: _Ready, ctx: InvocationContext, received: float
+    ) -> ActionRecord | _Ready:
         """Stages 4-5, then 6-9: the status gate, policy, and the call itself.
 
         Returns the `_Ready` call unchanged when policy holds it for confirmation.
@@ -850,18 +942,20 @@ class CapabilityHost(CapabilityTurnPort):
                 summary=f"{ready.capability.name} is {status.state}.",
                 reason=status.reason or status.state,
             )
-            return await self._finish(ready, ctx, outcome, 0)
+            return await self._finish(ready, ctx, outcome, 0, received)
         decision = self._policy.decide(ready.spec, ready.args, ctx, ready.capability)
         if decision == "deny":
             outcome = ToolOutcome(
                 status="denied", summary="That action is turned off.", reason="denied by policy"
             )
-            return await self._finish(ready, ctx, outcome, 0)
+            return await self._finish(ready, ctx, outcome, 0, received)
         if decision == "confirm":
             return ready
-        return await self._execute(ready, ctx)
+        return await self._execute(ready, ctx, received)
 
-    async def _execute(self, ready: _Ready, ctx: InvocationContext) -> ActionRecord:
+    async def _execute(
+        self, ready: _Ready, ctx: InvocationContext, received: float
+    ) -> ActionRecord:
         """Stages 6-9: invoke under the timeout and normalise a `CapabilityError`."""
         tool = ready.spec.name
         timeout = self._settings.tool_timeout_s
@@ -875,10 +969,15 @@ class CapabilityHost(CapabilityTurnPort):
             logger.warning("Capability call %s failed: %s", tool, _describe(exc))
             outcome = _outcome_for_error(tool, exc)
         duration_ms = int((time.monotonic() - started) * 1000)
-        return await self._finish(ready, ctx, outcome, duration_ms)
+        return await self._finish(ready, ctx, outcome, duration_ms, received)
 
     async def _finish(
-        self, ready: _Ready, ctx: InvocationContext, outcome: ToolOutcome, duration_ms: int
+        self,
+        ready: _Ready,
+        ctx: InvocationContext,
+        outcome: ToolOutcome,
+        duration_ms: int,
+        received: float,
     ) -> ActionRecord:
         return await self._record(
             ctx,
@@ -889,6 +988,7 @@ class CapabilityHost(CapabilityTurnPort):
             ready.summary,
             outcome,
             duration_ms,
+            received=received,
         )
 
     async def _record(
@@ -901,14 +1001,19 @@ class CapabilityHost(CapabilityTurnPort):
         args: str | Mapping[str, object],
         outcome: ToolOutcome,
         duration_ms: int = 0,
+        *,
+        received: float,
     ) -> ActionRecord:
         """Stages 8-9: redact, count, log, and build the record.
 
         `args` is the call's summary, or its raw arguments when they never validated, rendered
-        as compact JSON and capped.
+        as compact JSON and capped. The power level is read here, at the outcome, and
+        `turn_ms` runs from `received` (a `time.monotonic()` value) to now.
         """
         args_summary = self.redact(args if isinstance(args, str) else _raw_args(args))
         outcome = self._redacted(outcome)
+        power_level = self._power.level()
+        turn_ms = max(0, int((time.monotonic() - received) * 1000))
         record = ActionRecord(
             tool_call_id=tool_call_id,
             tool=tool,
@@ -917,6 +1022,7 @@ class CapabilityHost(CapabilityTurnPort):
             args_summary=args_summary,
             outcome=outcome,
             duration_ms=duration_ms,
+            power_level=power_level,
         )
         self._stats.invocations[outcome.status] += 1
         self._stats.by_source[ctx.source] += 1
@@ -935,6 +1041,8 @@ class CapabilityHost(CapabilityTurnPort):
                 reason=outcome.reason,
                 proposal_id=outcome.proposal_id,
                 duration_ms=duration_ms,
+                power_level=power_level,
+                turn_ms=turn_ms,
             )
         )
         return record
@@ -966,6 +1074,7 @@ class CapabilityHost(CapabilityTurnPort):
         session_id: str,
         waiting: Sequence[tuple[int, _Ready, InvocationContext]],
         slots: list[ActionRecord | None],
+        received: float,
     ) -> None:
         """Bundle a turn's held calls into one proposal and fill their pending records.
 
@@ -992,7 +1101,7 @@ class CapabilityHost(CapabilityTurnPort):
             logger.warning("Capability calls could not be proposed: %s", _describe(exc))
             for index, ready, ctx in waiting:
                 outcome = _outcome_for_error(ready.spec.name, exc)
-                slots[index] = await self._finish(ready, ctx, outcome, 0)
+                slots[index] = await self._finish(ready, ctx, outcome, 0, received)
             return
         self._buffer(session_id, _proposed_payload(proposal))
         for index, ready, ctx in waiting:
@@ -1001,7 +1110,7 @@ class CapabilityHost(CapabilityTurnPort):
                 summary=ready.summary,
                 proposal_id=proposal.proposal_id,
             )
-            slots[index] = await self._finish(ready, ctx, outcome, 0)
+            slots[index] = await self._finish(ready, ctx, outcome, 0, received)
 
     async def _resolve(
         self,
@@ -1009,6 +1118,7 @@ class CapabilityHost(CapabilityTurnPort):
         decision: Literal["approve", "reject"],
         turn_id: str,
         utterance: str,
+        received: float,
     ) -> tuple[tuple[ActionRecord, ...], dict[str, object], str]:
         """Reject a popped proposal, or run each of its calls in order with source `proposal`.
 
@@ -1030,7 +1140,7 @@ class CapabilityHost(CapabilityTurnPort):
                 now=self._clock.now(),
             )
             processed = await self._decide_and_run(
-                _Ready(capability, spec, call.args, call.summary), ctx
+                _Ready(capability, spec, call.args, call.summary), ctx, received
             )
             if isinstance(processed, _Ready):
                 # `PolicyTable.decide` never confirms source `proposal`; re-proposing an
@@ -1056,7 +1166,7 @@ class CapabilityHost(CapabilityTurnPort):
     # -- Pre-LLM steps ---------------------------------------------------------------------
 
     async def _handle_active(
-        self, session_id: str, turn_id: str, utterance: str, text: str
+        self, session_id: str, turn_id: str, utterance: str, text: str, received: float
     ) -> PreTurnResolution | None:
         timeout = self._settings.tool_timeout_s
         for capability in self._capabilities:
@@ -1096,12 +1206,13 @@ class CapabilityHost(CapabilityTurnPort):
                 text,
                 outcome,
                 duration_ms,
+                received=received,
             )
             return PreTurnResolution(True, reply_for([record]), None, (record,), ())
         return None
 
     async def _fast_path(
-        self, session_id: str, turn_id: str, utterance: str, text: str
+        self, session_id: str, turn_id: str, utterance: str, text: str, received: float
     ) -> PreTurnResolution | None:
         if not self._settings.fast_path:
             return None
@@ -1123,7 +1234,7 @@ class CapabilityHost(CapabilityTurnPort):
             now=self._clock.now(),
         )
         async with self._lock(session_id):
-            records = await self._run_calls(session_id, [(call, ctx)], None, None)
+            records = await self._run_calls(session_id, [(call, ctx)], None, None, received)
         return PreTurnResolution(True, reply_for(records), None, records, ())
 
     # -- Helpers ---------------------------------------------------------------------------
@@ -1361,11 +1472,17 @@ def _raw_args(arguments: Mapping[str, object]) -> str:
     return text if len(text) <= _RAW_ARGS_CHARS else f"{text[: _RAW_ARGS_CHARS - 3]}..."
 
 
+def _received(received_at: float | None) -> float:
+    """Return the handler's `received_at`, or the time of the call when it passed none."""
+    return time.monotonic() if received_at is None else received_at
+
+
 def _describe(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
-def _status_payload(rev: int, statuses: _StatusSet, at: datetime) -> dict[str, object]:
+def _status_payload(rev: int, broadcast: _Broadcast, at: datetime) -> dict[str, object]:
+    power_level, decode_available, statuses = broadcast
     return CapabilitiesStatusEvent(
         type="capabilities_status",
         rev=rev,
@@ -1373,6 +1490,8 @@ def _status_payload(rev: int, statuses: _StatusSet, at: datetime) -> dict[str, o
             CapabilityStatusEntry(name=name, state=state, reason=reason, tools=list(tools))
             for name, state, reason, tools in statuses
         ],
+        power_level=power_level,
+        decode_available=decode_available,
         at=at,
     ).to_payload()
 

@@ -18,6 +18,7 @@ from backend.errors import MistError
 
 from .contracts import CallSource, OutcomeStatus
 from .db import CapabilitiesDb
+from .power import PowerLevel
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +42,15 @@ _STEPS = (
     " reason TEXT,"
     " proposal_id TEXT,"
     " duration_ms INTEGER NOT NULL)",
+    # Step 2 (T24): the power level read at the call, and the time from the handler's receipt
+    # of the user message to the call's outcome. Rows written before it read null in both.
+    "ALTER TABLE action_log ADD COLUMN power_level TEXT;"
+    " ALTER TABLE action_log ADD COLUMN turn_ms INTEGER",
 )
 _INSERT = (
     "INSERT INTO action_log (at, session_id, turn_id, tool_call_id, tool, capability, source,"
-    " status, args_summary, summary, reason, proposal_id, duration_ms)"
-    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " status, args_summary, summary, reason, proposal_id, duration_ms, power_level, turn_ms)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 # Deletes every row older than the newest `limit` rows; a no-op while fewer exist.
 _PRUNE = (
@@ -72,6 +77,9 @@ class ActionLogEntry:
         reason: The outcome reason, if any.
         proposal_id: Set for a call that waits for confirmation.
         duration_ms: Time spent in the capability; 0 for a call that never reached it.
+        power_level: The level read at the call; None from a writer that does not know it.
+        turn_ms: Milliseconds from the handler's receipt of the user message to the call's
+            outcome; None from a writer that does not know it.
     """
 
     at: datetime
@@ -87,6 +95,8 @@ class ActionLogEntry:
     reason: str | None
     proposal_id: str | None
     duration_ms: int
+    power_level: PowerLevel | None = None
+    turn_ms: int | None = None
 
 
 class ActionLog:
@@ -149,6 +159,8 @@ class ActionLog:
                     entry.reason,
                     entry.proposal_id,
                     entry.duration_ms,
+                    entry.power_level,
+                    entry.turn_ms,
                 ),
             )
             conn.execute(_PRUNE, (self._max_rows,))

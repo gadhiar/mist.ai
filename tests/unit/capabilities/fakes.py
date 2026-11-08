@@ -32,6 +32,8 @@ from backend.capabilities.contracts import (
     ToolOutcome,
     ToolSpec,
 )
+from backend.capabilities.power import ModelTier, PowerLevel
+from backend.llm.provider import StreamingLLMProvider
 
 DEFAULT_START = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
 """A fixed Monday morning, so tests never depend on the real date."""
@@ -191,6 +193,36 @@ class FakeClock:
     async def _settle(self) -> None:
         for _ in range(_SETTLE_YIELDS):
             await asyncio.sleep(0)
+
+
+class FakePower:
+    """A `PowerState` whose level a test sets through `current`; it counts each read."""
+
+    def __init__(self, level: PowerLevel = "full") -> None:
+        self.current: PowerLevel = level
+        self.reads = 0
+
+    def level(self) -> PowerLevel:
+        self.reads += 1
+        return self.current
+
+
+class FakeTiers:
+    """A `TierProviders` that answers from `providers`, None for a missing tier.
+
+    It records each tier asked for in `asked`, so a test can show a path never asked for
+    a model.
+    """
+
+    def __init__(
+        self, providers: Mapping[ModelTier, StreamingLLMProvider | None] | None = None
+    ) -> None:
+        self.providers: dict[ModelTier, StreamingLLMProvider | None] = dict(providers or {})
+        self.asked: list[ModelTier] = []
+
+    def provider(self, tier: ModelTier) -> StreamingLLMProvider | None:
+        self.asked.append(tier)
+        return self.providers.get(tier)
 
 
 class RecordingEventSink:

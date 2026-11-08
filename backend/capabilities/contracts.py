@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel
 
+from .power import PowerLevel
+
 if TYPE_CHECKING:
     # `RouteDecision` belongs to the router module, which builds on these contracts. A
     # type-only import keeps this module free of any runtime dependency on the router.
@@ -267,7 +269,11 @@ class TurnPlan:
 
 @dataclass(frozen=True, slots=True)
 class ActionRecord:
-    """One executed or proposed call, for the handler's tool-call events."""
+    """One executed or proposed call, for the handler's tool-call events.
+
+    `power_level` is the level the host read at the call. It defaults to None so a record built
+    before the power port existed stays valid.
+    """
 
     tool_call_id: str
     tool: str
@@ -276,6 +282,7 @@ class ActionRecord:
     args_summary: str
     outcome: ToolOutcome
     duration_ms: int
+    power_level: PowerLevel | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,16 +326,26 @@ class PreTurnResolution:
 
 
 class CapabilityTurnPort(Protocol):
-    """The port a turn handler depends on, so it needs no import of the host implementation."""
+    """The port a turn handler depends on, so it needs no import of the host implementation.
+
+    `pre_llm` and `plan_turn` take `received_at`, the `time.monotonic()` at which the handler
+    received the user message, so each call's `turn_ms` in the action log runs from there. None,
+    the default, means the time of the call, so a handler that does not pass it stays valid.
+    """
 
     async def pre_llm(
-        self, session_id: str, turn_id: str, utterance: str
+        self, session_id: str, turn_id: str, utterance: str, *, received_at: float | None = None
     ) -> PreTurnResolution | None:
         """Resolve the turn deterministically before routing, or return None."""
         ...
 
     def plan_turn(
-        self, session_id: str, utterance: str, recent: Sequence[tuple[str, str]]
+        self,
+        session_id: str,
+        utterance: str,
+        recent: Sequence[tuple[str, str]],
+        *,
+        received_at: float | None = None,
     ) -> TurnPlan:
         """Route the utterance and build the decode request."""
         ...
