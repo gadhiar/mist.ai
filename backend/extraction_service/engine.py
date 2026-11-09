@@ -55,6 +55,8 @@ from backend.extraction_service.adapters import ModelFamilyAdapter
 from backend.extraction_service.list_schemas import (
     LIST_FRAME_OUTPUT_SCHEMA,
     LIST_ITEM_OUTPUT_SCHEMA,
+    list_frame_output_schema,
+    list_item_output_schema,
 )
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
@@ -76,6 +78,7 @@ from backend.knowledge.extraction.list_frames import (
     ItemOutput,
     ListGroup,
     group_units,
+    item_slots,
     parse_frame_output,
     parse_item_output,
     render_frame_input,
@@ -85,7 +88,9 @@ from backend.knowledge.extraction.list_prompts import (
     LIST_FRAME_USER_TEMPLATE,
     LIST_ITEM_REPAIR_INSTRUCTION,
     LIST_ITEM_USER_TEMPLATE,
+    LIST_REFUSAL_TEMPLATE,
     LIST_SYSTEM_PROMPT,
+    list_repair_text,
     render_frames_for_items,
 )
 from backend.knowledge.extraction.ontology_extractor import (
@@ -114,6 +119,16 @@ from backend.llm.models import LLMRequest
 from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
+
+# The list output log (`ServiceSettings.log_list_outputs`): a logger of its own, so
+# `__main__` can give it a handler and the INFO level, which uvicorn's default
+# configuration does not, without changing where the engine's warnings go.
+LIST_OUTPUTS_LOGGER = "backend.extraction_service.list_outputs"
+_list_outputs_log = logging.getLogger(LIST_OUTPUTS_LOGGER)
+
+# Called once per list call attempt that returns a response, with the attempt, the
+# finish reason, the final text and the parser's refusal or None.
+_OnOutput = Callable[[int, str | None, str, str | None], None]
 
 # What a Stage 2 call's strict parser returns: a payload for an r6 batch, a
 # frame output for a frame call, the item outputs for an item call.
@@ -196,10 +211,10 @@ def list_call_fits(messages: Sequence[Mapping[str, str]]) -> bool:
 # above, whose renderers, strict parsers and list assembly Stages 1.5, 2 and 9
 # call, `canonical_id`, which the list assembly builds Metric ids with, the
 # validator, whose relationship constraints the list parsers check templates
-# and item entities against, and the provider module the service builds.
-# Whole modules rather than functions, so a
-# helper a covered function calls is covered too; an edit elsewhere in a
-# covered module costs one `CODE_REVISIONS` line, never a silent miss.
+# and item entities against, and the provider module the service builds. Whole
+# modules rather than functions, so a helper a covered function calls is
+# covered too; an edit elsewhere in a covered module costs one `CODE_REVISIONS`
+# line, never a silent miss.
 RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     importlib.import_module(name)
     for name in (
@@ -255,7 +270,9 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
     (
         "backend.extraction_service.settings",
         "its values are components already: temperature, attempts, constrained mode, "
-        "reasoning, the scope switch, the model hash and the llama.cpp build",
+        "reasoning, the scope switch, the model hash and the llama.cpp build; the list "
+        "output log switch is not one, because it changes what the service logs, never "
+        "what it returns",
     ),
     (
         "backend.knowledge.version_stamps",
@@ -426,6 +443,7 @@ class _ListTurn:
         items: `(item id, position in units)` of every item, in turn order.
         system: The list system prompt message, its reference date filled in.
         render: The turn as `render_frame_input` writes it.
+        job_id: The request's job id, which keys the list output log's lines.
     """
 
     pre_processed: PreProcessedInput
@@ -435,10 +453,16 @@ class _ListTurn:
     items: tuple[tuple[str, int], ...]
     system: dict[str, str]
     render: str
+    job_id: str
 
     @property
     def subject_scope(self) -> str:
         return self.pre_processed.metadata.get("subject_scope", "unknown")
+
+    @property
+    def item_ids(self) -> tuple[str, ...]:
+        """Every item id of the turn, group by group, as the render lists them."""
+        return tuple(item for group in self.groups for item in group.item_ids)
 
 
 def _list_turn(
@@ -446,6 +470,7 @@ def _list_turn(
     units: Sequence[InputUnit],
     groups: Sequence[ListGroup],
     prose: Sequence[InputUnit],
+    job_id: str,
 ) -> _ListTurn:
     positions = {id(unit): index for index, unit in enumerate(units)}
     items = sorted(
@@ -467,6 +492,7 @@ def _list_turn(
         items=tuple(items),
         system={"role": "system", "content": system},
         render=render_frame_input(groups, prose),
+        job_id=job_id,
     )
 
 
@@ -537,10 +563,12 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     retry, the three constrained-decoding output schemas (serialised with
     sorted keys; hashed whether or not the active mode sends them, which
     only makes the stamp stricter), the list path's system prompt, its two
-    user templates and two repair instructions, its two output schemas, and
-    the adapter's own name/version. The list schemas are serialised in
-    declared key order, because the grammar emits keys in that order, so a
-    reorder changes decoding.
+    user templates, two repair instructions and the refusal line each list
+    repair ends with, its two output schemas, and the adapter's own
+    name/version. The list schemas are serialised in declared key order,
+    because the grammar emits keys in that order, so a reorder changes
+    decoding. They are the static supersets every call's built schema
+    narrows; the builders are code, which `code_sha256` covers.
 
     Not covered: the PreProcessor's context formatting (code, not a
     template) and request parameters (temperature, max_tokens, reasoning
@@ -573,6 +601,7 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
             LIST_ITEM_USER_TEMPLATE,
             LIST_FRAME_REPAIR_INSTRUCTION,
             LIST_ITEM_REPAIR_INSTRUCTION,
+            LIST_REFUSAL_TEMPLATE,
             json.dumps(LIST_FRAME_OUTPUT_SCHEMA, sort_keys=False),
             json.dumps(LIST_ITEM_OUTPUT_SCHEMA, sort_keys=False),
             adapter.name,
@@ -651,7 +680,7 @@ class ExtractionEngine:
         )
 
         scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
-        stage2 = await self._run_extraction(pre_processed)
+        stage2 = await self._run_extraction(pre_processed, req.job_id)
         payload, merge_warnings = merge_payloads(stage2.payloads)
         warnings.extend(stage2.warnings)
         warnings.extend(merge_warnings)
@@ -753,11 +782,12 @@ class ExtractionEngine:
             warnings.append("scope_classification_failed")
         return ScopeOut(label=label, confidence=confidence), elapsed
 
-    async def _run_extraction(self, pre_processed: PreProcessedInput) -> _Stage2Run:
+    async def _run_extraction(self, pre_processed: PreProcessedInput, job_id: str) -> _Stage2Run:
         """Stage 2: the list frame path for a structured turn, else the r6 list pass.
 
         A turn is structured when `group_units` finds a group of list items
-        or table rows in it.
+        or table rows in it. `job_id` reaches the list calls only, for the
+        list output log.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
@@ -768,7 +798,8 @@ class ExtractionEngine:
         run = _Stage2Run()
         groups, prose = group_units(units)
         if groups:
-            await self._run_list_frames(_list_turn(pre_processed, units, groups, prose), run)
+            turn = _list_turn(pre_processed, units, groups, prose, job_id)
+            await self._run_list_frames(turn, run)
         else:
             await self._run_list_pass(pre_processed, units, run)
         return run
@@ -800,6 +831,13 @@ class ExtractionEngine:
         unparsable sends the turn through the r6 list pass too. The item calls
         start from the history the frame message kept.
 
+        Each call sends the schema built for it, so most shapes the parsers
+        refuse cannot be decoded: the frame call's from the turn's groups and
+        items, each item call's from the item slots the parsed frame gives its
+        batch. A refused output is repaired with the stage's repair text and a
+        line naming the refusal, because at temperature 0 a repair that names
+        no reason tends to repeat the output.
+
         Adds the assembled payload and the path's warnings to `run`.
 
         Raises:
@@ -827,15 +865,21 @@ class ExtractionEngine:
             await self._run_list_pass(pre_processed, turn.units, run)
             return
 
+        schema = list_frame_output_schema(
+            [group.gid for group in turn.groups],
+            {group.gid for group in turn.groups if group.parent is not None},
+            turn.item_ids,
+        )
         try:
             frame = await self._list_attempts(
                 user,
                 turn,
                 run,
                 max_tokens=LIST_FRAME_MAX_TOKENS,
-                schema=LIST_FRAME_OUTPUT_SCHEMA,
+                schema=schema,
                 parse=lambda raw: parse_frame_output(raw, turn.groups),
-                repair=LIST_FRAME_REPAIR_INSTRUCTION,
+                repair=lambda error: list_repair_text(LIST_FRAME_REPAIR_INSTRUCTION, error),
+                on_output=self._list_output_log(turn, "frame", ()),
             )
         except (_OutputTruncatedError, _OutputUnparsableError) as exc:
             if isinstance(exc, _OutputUnparsableError) and exc.repair_skipped:
@@ -903,6 +947,11 @@ class ExtractionEngine:
             return
 
         earlier = {output.item: output for output in outputs}
+        schema = list_item_output_schema(
+            item_slots(frame, turn.groups, ids),
+            [entity.key for entity in frame.frame_entities],
+            turn.item_ids,
+        )
         try:
             outputs.extend(
                 await self._list_attempts(
@@ -910,9 +959,10 @@ class ExtractionEngine:
                     turn,
                     run,
                     max_tokens=LIST_ITEM_MAX_TOKENS,
-                    schema=LIST_ITEM_OUTPUT_SCHEMA,
+                    schema=schema,
                     parse=lambda raw: parse_item_output(raw, ids, frame, turn.groups, earlier),
-                    repair=LIST_ITEM_REPAIR_INSTRUCTION,
+                    repair=lambda error: list_repair_text(LIST_ITEM_REPAIR_INSTRUCTION, error),
+                    on_output=self._list_output_log(turn, "items", ids),
                 )
             )
             return
@@ -1014,6 +1064,33 @@ class ExtractionEngine:
         finally:
             run.elapsed_ms += (time.perf_counter() - start) * 1000
 
+    def _list_output_log(
+        self, turn: _ListTurn, stage: str, items: Sequence[str]
+    ) -> _OnOutput | None:
+        """The callback that writes one list call's attempts to the list output log, or None.
+
+        None when `log_list_outputs` is off, so an off setting makes no call to
+        the log's logger at all. Each line is one JSON object, keyed by the
+        request's job id, so a run's lines can be kept apart from any other's.
+        """
+        if not self._settings.log_list_outputs:
+            return None
+
+        def write(attempt: int, finish_reason: str | None, text: str, refusal: str | None) -> None:
+            record = {
+                "event": "list_output",
+                "job_id": turn.job_id,
+                "stage": stage,
+                "items": list(items),
+                "attempt": attempt,
+                "finish_reason": finish_reason,
+                "text": text,
+                "refusal": refusal,
+            }
+            _list_outputs_log.info("%s", json.dumps(record, ensure_ascii=False))
+
+        return write
+
     async def _list_attempts(
         self,
         user: str,
@@ -1023,7 +1100,8 @@ class ExtractionEngine:
         max_tokens: int,
         schema: dict,
         parse: Callable[[str], _Parsed],
-        repair: str,
+        repair: str | Callable[[ExtractionValidationError], str],
+        on_output: _OnOutput | None = None,
     ) -> _Parsed:
         """One frame or item call sequence, timed into `run`, its repairs budgeted.
 
@@ -1041,6 +1119,7 @@ class ExtractionEngine:
                 parse=parse,
                 repair=repair,
                 fits=list_call_fits,
+                on_output=on_output,
             )
         finally:
             run.elapsed_ms += (time.perf_counter() - start) * 1000
@@ -1053,8 +1132,9 @@ class ExtractionEngine:
         max_tokens: int,
         schema: dict,
         parse: Callable[[str], _Parsed],
-        repair: str,
+        repair: str | Callable[[ExtractionValidationError], str],
         fits: Callable[[Sequence[Mapping[str, str]]], bool] | None = None,
+        on_output: _OnOutput | None = None,
     ) -> _Parsed:
         """One Stage 2 call sequence: strict parse with repair-retry up to `max_attempts`.
 
@@ -1071,11 +1151,19 @@ class ExtractionEngine:
             schema: The output schema sent in `schema` constrained mode.
             parse: The strict parser; an `ExtractionValidationError` from it
                 gets the repair retry.
-            repair: The instruction sent after a failed output.
+            repair: The instruction sent after a failed output, or a function
+                of the parser's error that returns it. The list calls pass a
+                function, so the repair names the refusal; the r6 batches pass
+                the fixed `_REPAIR_INSTRUCTION`, so their requests stay as
+                they were.
             fits: When given, called with the whole message list before each
                 repair attempt; a False return ends the attempts as an
                 unparsable output, with `repair_skipped` set. The r6 batches
                 pass none, so their repair is unbudgeted, as before.
+            on_output: When given, called once for each attempt that returns a
+                response, with the attempt, the finish reason, the final text
+                and the parser's refusal or None; a cut-short output is
+                reported before it raises. The r6 batches pass none.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
@@ -1112,15 +1200,19 @@ class ExtractionEngine:
             except _LLM_TRANSPORT_ERRORS as exc:
                 raise UpstreamLLMError(f"Extraction LLM call failed: {exc}") from exc
 
+            raw = self._adapter.final_text(response)
             if response.finish_reason == "length":
+                if on_output is not None:
+                    on_output(attempt, response.finish_reason, raw, None)
                 raise _OutputTruncatedError(
                     f"Extraction output reached max_tokens={max_tokens}"
                     f" (attempt {attempt}/{self._settings.max_attempts})"
                 )
-            raw = self._adapter.final_text(response)
             try:
                 parsed = parse(raw)
             except ExtractionValidationError as exc:
+                if on_output is not None:
+                    on_output(attempt, response.finish_reason, raw, str(exc))
                 last_error = exc
                 logger.warning(
                     "Extraction attempt %d/%d unparsable: %s",
@@ -1131,10 +1223,12 @@ class ExtractionEngine:
                 messages = [
                     *messages,
                     {"role": "assistant", "content": raw},
-                    {"role": "user", "content": repair},
+                    {"role": "user", "content": repair if isinstance(repair, str) else repair(exc)},
                 ]
                 continue
 
+            if on_output is not None:
+                on_output(attempt, response.finish_reason, raw, None)
             return parsed
 
         raise _OutputUnparsableError(

@@ -45,16 +45,28 @@ from backend.extraction_service.engine import (
 from backend.extraction_service.list_schemas import (
     LIST_FRAME_OUTPUT_SCHEMA,
     LIST_ITEM_OUTPUT_SCHEMA,
+    list_frame_output_schema,
+    list_item_output_schema,
 )
 from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
 from backend.extraction_service.settings import ServiceSettings
-from backend.knowledge.extraction.list_frames import group_units
+from backend.knowledge.extraction.list_frames import (
+    ListOutputError,
+    group_units,
+    item_slots,
+    parse_frame_output,
+    parse_item_output,
+)
 from backend.knowledge.extraction.list_prompts import (
     LIST_FRAME_REPAIR_INSTRUCTION,
     LIST_ITEM_REPAIR_INSTRUCTION,
     LIST_SYSTEM_PROMPT,
+    list_repair_text,
 )
-from backend.knowledge.extraction.ontology_extractor import render_extraction_messages
+from backend.knowledge.extraction.ontology_extractor import (
+    ExtractionResult,
+    render_extraction_messages,
+)
 from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.structure_splitter import (
     batch_units,
@@ -62,6 +74,7 @@ from backend.knowledge.extraction.structure_splitter import (
     render_unit,
     split_structured,
 )
+from backend.knowledge.extraction.validator import ExtractionValidator
 from backend.llm.models import LLMRequest, LLMResponse
 from backend.llm.provider import StreamingLLMProvider
 from tests.unit.extraction_service.test_list_pass import (
@@ -369,6 +382,21 @@ async def test_item_batches_follow_turn_order_and_may_span_groups():
     ]
 
 
+def built_schemas(text: str, frame_text: str, batches: list[list[str]]) -> tuple[dict, list[dict]]:
+    """The frame schema and each batch's item schema the builders give for this turn."""
+    groups, _prose = group_units(split_structured(text))
+    item_ids = [item for group in groups for item in group.item_ids]
+    nested = {group.gid for group in groups if group.parent is not None}
+    frame = parse_frame_output(frame_text, groups)
+    keys = [entity.key for entity in frame.frame_entities]
+    frame_schema = list_frame_output_schema([g.gid for g in groups], nested, item_ids)
+    item_schemas = [
+        list_item_output_schema(item_slots(frame, groups, batch), keys, item_ids)
+        for batch in batches
+    ]
+    return frame_schema, item_schemas
+
+
 @pytest.mark.asyncio
 async def test_the_list_calls_send_their_schemas_limits_and_one_system_prompt():
     llm = ListLLM()
@@ -378,17 +406,65 @@ async def test_the_list_calls_send_their_schemas_limits_and_one_system_prompt():
 
     (frame,) = llm.of("frame")
     items = llm.of("items")
-    assert (frame.max_tokens, frame.response_schema) == (
-        LIST_FRAME_MAX_TOKENS,
-        LIST_FRAME_OUTPUT_SCHEMA,
+    frame_schema, item_schemas = built_schemas(
+        tool_list(5), frame_ok(frame, 1).content, [asked_items(r) for r in items]
     )
+    assert (frame.max_tokens, frame.response_schema) == (LIST_FRAME_MAX_TOKENS, frame_schema)
     assert {r.max_tokens for r in items} == {LIST_ITEM_MAX_TOKENS}
-    assert all(r.response_schema == LIST_ITEM_OUTPUT_SCHEMA for r in items)
+    assert [r.response_schema for r in items] == item_schemas
+    assert frame.response_schema != LIST_FRAME_OUTPUT_SCHEMA
+    assert all(r.response_schema != LIST_ITEM_OUTPUT_SCHEMA for r in items)
     reference_date = parse_recorded_at(req.recorded_at).strftime("%Y-%m-%d")
     system = LIST_SYSTEM_PROMPT.format(reference_date=reference_date)
     assert {r.messages[0]["content"] for r in [frame, *items]} == {system}
     assert "Subject scope: user-scope\n" in frame.messages[1]["content"]
     assert "Frames:\nG1: each item is the object of user USES" in items[0].messages[1]["content"]
+
+
+_NESTED_TURN = "Projects at Zentrova:\n- Harbor\n  - Quillon\n  - Brask\n- Lumen\n  - Tervane"
+
+
+def nested_frame(request: LLMRequest, call: int) -> LLMResponse:
+    """A frame with a frame entity, and a parent template in each nested group."""
+    groups = [
+        {
+            "group": gid,
+            "durable": True,
+            "templates": (
+                []
+                if gid == "G1"
+                else [{"subject": "parent", "predicate": "DEPENDS_ON", "object": "item"}]
+            ),
+            "item_type": None if gid == "G1" else "Technology",
+            "unchecked": "plan",
+        }
+        for gid in group_ids(request)
+    ]
+    frame_entities = [{"key": "f1", "span": "Zentrova", "name": "Zentrova", "type": "Organization"}]
+    body = {
+        "frame_entities": frame_entities,
+        "groups": groups,
+        "facts": {"entities": [], "relationships": []},
+    }
+    return LLMResponse(content=json.dumps(body), finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_a_nested_turn_sends_the_schemas_built_from_its_groups_and_frame():
+    llm = ListLLM(frame=nested_frame)
+
+    response = await make_engine(llm).run(make_request(_NESTED_TURN))
+
+    (frame,) = llm.of("frame")
+    items = llm.of("items")
+    batches = [asked_items(r) for r in items]
+    frame_schema, item_schemas = built_schemas(
+        _NESTED_TURN, nested_frame(frame, 1).content, batches
+    )
+    assert batches == [["G1.1", "G2.1", "G2.2", "G1.2"], ["G3.1"]]
+    assert frame.response_schema == frame_schema
+    assert [r.response_schema for r in items] == item_schemas
+    assert response.warnings == []
 
 
 @pytest.mark.asyncio
@@ -413,6 +489,17 @@ def fail_first(answer: Answer, failure: LLMResponse = _NOT_JSON) -> Answer:
     return wrapped
 
 
+def refusal(parse: Callable[[], object]) -> ListOutputError:
+    """The error the list parser refuses an output with."""
+    with pytest.raises(ListOutputError) as caught:
+        parse()
+    return caught.value
+
+
+def turn_groups(text: str):
+    return group_units(split_structured(text))[0]
+
+
 @pytest.mark.asyncio
 async def test_a_malformed_frame_output_gets_the_frame_repair_then_succeeds():
     llm = ListLLM(frame=fail_first(frame_ok))
@@ -420,10 +507,13 @@ async def test_a_malformed_frame_output_gets_the_frame_repair_then_succeeds():
     response = await make_engine(llm).run(make_request(tool_list(3)))
 
     first, second = llm.of("frame")
+    error = refusal(lambda: parse_frame_output("not json", turn_groups(tool_list(3))))
     assert second.messages[2:] == [
         {"role": "assistant", "content": "not json"},
-        {"role": "user", "content": LIST_FRAME_REPAIR_INSTRUCTION},
+        {"role": "user", "content": list_repair_text(LIST_FRAME_REPAIR_INSTRUCTION, error)},
     ]
+    assert second.messages[3]["content"].startswith(LIST_FRAME_REPAIR_INSTRUCTION + "\n")
+    assert second.messages[3]["content"].endswith(f"\nThe output was refused: {error}")
     assert second.messages[:2] == first.messages
     assert response.attempts == 2
     assert response.stage2_calls == 3
@@ -437,9 +527,14 @@ async def test_a_malformed_item_output_gets_the_item_repair_then_succeeds():
     response = await make_engine(llm).run(make_request(tool_list(3)))
 
     first, second = llm.of("items")
+    groups = turn_groups(tool_list(3))
+    frame = parse_frame_output(frame_ok(llm.of("frame")[0], 1).content, groups)
+    error = refusal(
+        lambda: parse_item_output("not json", ["G1.1", "G1.2", "G1.3"], frame, groups, {})
+    )
     assert second.messages[2:] == [
         {"role": "assistant", "content": "not json"},
-        {"role": "user", "content": LIST_ITEM_REPAIR_INSTRUCTION},
+        {"role": "user", "content": list_repair_text(LIST_ITEM_REPAIR_INSTRUCTION, error)},
     ]
     assert response.stage2_calls == 3
     assert response.warnings == []
@@ -643,9 +738,13 @@ async def test_with_three_attempts_the_second_repair_estimate_counts_both_failed
 
     assert len(seen) == 2
     assert [m["content"] for m in seen[1] if m["role"] == "assistant"] == ["bad one", "bad two"]
+    groups = turn_groups(tool_list(2))
     assert [m["content"] for m in seen[1][2:] if m["role"] == "user"] == [
-        LIST_FRAME_REPAIR_INSTRUCTION
-    ] * 2
+        list_repair_text(
+            LIST_FRAME_REPAIR_INSTRUCTION, refusal(lambda t=text: parse_frame_output(t, groups))
+        )
+        for text in ("bad one", "bad two")
+    ]
     assert len(llm.of("frame")) == 3
     assert response.warnings == ["list_frame_fallback"]
 
@@ -660,3 +759,332 @@ async def test_the_r6_repair_is_not_budgeted():
     assert [_is_repair(r) for r in llm.of("r6")] == [False, True]
     assert response.attempts == 2
     assert response.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# The r6 path keeps its request and its fixed repair
+# ---------------------------------------------------------------------------
+
+
+def _dumped(request: LLMRequest) -> str:
+    return json.dumps(request.model_dump())
+
+
+def _r6_request(messages: list[dict]) -> LLMRequest:
+    return get_adapter("gptoss").prepare(
+        LLMRequest(
+            messages=messages,
+            temperature=_settings().temperature,
+            max_tokens=EXTRACT_MAX_TOKENS,
+            json_mode=False,
+            response_schema=EXTRACTION_OUTPUT_SCHEMA,
+        ),
+        stage="extract",
+    )
+
+
+def _pre_processed(req):
+    pre_processed = PreProcessor().pre_process(
+        utterance=req.utterance,
+        conversation_history=[],
+        reference_date=parse_recorded_at(req.recorded_at),
+        turn_index=req.turn_index,
+    )
+    pre_processed.metadata["subject_scope"] = "user-scope"
+    return pre_processed
+
+
+def _repaired(messages: list[dict], output: str) -> list[dict]:
+    return [
+        *messages,
+        {"role": "assistant", "content": output},
+        {"role": "user", "content": engine._REPAIR_INSTRUCTION},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_prose_turn_sends_the_fixed_r6_repair_byte_for_byte():
+    req = make_request("I have been learning Kestrin for a few months")
+    llm = ListLLM(r6=fail_first(r6_echo))
+
+    response = await make_engine(llm).run(req)
+
+    first = render_extraction_messages(_pre_processed(req))
+    expected = [first, _repaired(first, "not json")]
+    assert [_dumped(r) for r in llm.of("r6")] == [_dumped(_r6_request(m)) for m in expected]
+    assert "The output was refused" not in engine._REPAIR_INSTRUCTION
+    assert response.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_an_r6_list_pass_turn_sends_its_requests_and_fixed_repair_byte_for_byte(
+    monkeypatch,
+):
+    monkeypatch.setattr(engine, "LIST_USER_MAX_CHARS", 0)
+    req = make_request(tool_list(5))
+    llm = ListLLM(r6=fail_first(r6_echo))
+
+    response = await make_engine(llm).run(req)
+
+    pre_processed = _pre_processed(req)
+    units = split_structured(pre_processed.original_text)
+    head = render_extraction_messages(engine._batch_input(pre_processed, units, 0, 4))
+    tail = render_extraction_messages(engine._batch_input(pre_processed, units, 4, 1))
+    expected = [head, _repaired(head, "not json"), tail]
+    assert [_dumped(r) for r in llm.of("r6")] == [_dumped(_r6_request(m)) for m in expected]
+    assert response.warnings == ["list_frame_over_budget"]
+
+
+# ---------------------------------------------------------------------------
+# Replays: each refused list output is repaired once, by the line naming the refusal
+# ---------------------------------------------------------------------------
+
+
+def scripted(*bodies: dict) -> Answer:
+    """Answer the n-th call with the n-th body, and every later call with the last one."""
+
+    def answer(request: LLMRequest, call: int) -> LLMResponse:
+        body = bodies[min(call, len(bodies)) - 1]
+        return LLMResponse(content=json.dumps(body), finish_reason="stop")
+
+    return answer
+
+
+def entity(span: str, etype: str, **extra: str) -> dict:
+    return {"span": span, "name": span, "type": etype, **extra}
+
+
+def keyed(key: str, span: str, etype: str, **extra: str) -> dict:
+    return {"key": key, **entity(span, etype, **extra)}
+
+
+def edge(source: str, type_: str, target: str) -> dict:
+    return {"source": source, "target": target, "type": type_}
+
+
+def group(gid: str, templates: list[tuple[str, str, str]], item_type: str | None) -> dict:
+    return {
+        "group": gid,
+        "durable": True,
+        "templates": [dict(zip(("subject", "predicate", "object"), t)) for t in templates],
+        "item_type": item_type,
+        "unchecked": "plan",
+    }
+
+
+def frame_body(groups: list[dict], frame_entities=(), facts_entities=()) -> dict:
+    return {
+        "frame_entities": list(frame_entities),
+        "groups": groups,
+        "facts": {"entities": list(facts_entities), "relationships": []},
+    }
+
+
+def item_record(item_id: str, own: dict | None, entities=(), relationships=()) -> dict:
+    return {
+        "item": item_id,
+        "template": {"applies": True, "assertion_kind": "assert", "temporal_status": "current"},
+        "entity": own,
+        "entities": list(entities),
+        "relationships": list(relationships),
+    }
+
+
+async def replay(text: str, *, frame: Answer, items: Answer = items_ok):
+    """Run the turn with three attempts allowed, and check it ends clean after one repair."""
+    llm = ListLLM(frame=frame, items=items)
+
+    response = await make_engine(llm, max_attempts=3).run(make_request(text))
+
+    assert "list_item_ref_unresolved" not in response.warnings
+    assert "list_frame_fallback" not in response.warnings
+    assert "list_item_fallback" not in response.warnings
+    assert llm.of("r6") == []
+    assert all(len(r.messages) <= 4 for r in llm.stage2), "a call took a second repair"
+    return llm, response
+
+
+def predicates(response) -> list[str]:
+    return sorted(r["type"] for r in response.payload.relationships)
+
+
+@pytest.mark.asyncio
+async def test_a_people_list_whose_first_items_have_no_entity_is_repaired_u2():
+    text = "People I work with at Zentrova:\n- Alba Venn\n- Corvel Osk"
+    frame = frame_body(
+        [group("G1", [("user", "KNOWS_PERSON", "item"), ("item", "WORKS_AT", "f1")], "Person")],
+        frame_entities=[keyed("f1", "Zentrova", "Organization")],
+    )
+    empty = {"items": [item_record("G1.1", None), item_record("G1.2", None)]}
+    named = {
+        "items": [
+            item_record("G1.1", entity("Alba Venn", "Person")),
+            item_record("G1.2", entity("Corvel Osk", "Person")),
+        ]
+    }
+
+    llm, response = await replay(text, frame=scripted(frame), items=scripted(empty, named))
+
+    groups = turn_groups(text)
+    parsed = parse_frame_output(json.dumps(frame), groups)
+    error = refusal(
+        lambda: parse_item_output(json.dumps(empty), ["G1.1", "G1.2"], parsed, groups, {})
+    )
+    assert "requires an entity" in str(error)
+    _first, second = llm.of("items")
+    assert second.messages[3]["content"] == list_repair_text(LIST_ITEM_REPAIR_INSTRUCTION, error)
+    assert predicates(response) == ["KNOWS_PERSON"] * 2 + ["WORKS_AT"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_template_naming_parent_in_a_top_level_group_is_repaired_u4():
+    text = tool_list(3)
+    wrong = frame_body([group("G1", [("parent", "USES", "item")], "Technology")])
+    right = frame_body([group("G1", [("user", "USES", "item")], "Technology")])
+
+    llm, response = await replay(text, frame=scripted(wrong, right))
+
+    error = refusal(lambda: parse_frame_output(json.dumps(wrong), turn_groups(text)))
+    assert "top-level group" in str(error)
+    _first, second = llm.of("frame")
+    assert second.messages[3]["content"] == list_repair_text(LIST_FRAME_REPAIR_INSTRUCTION, error)
+    assert predicates(response) == ["USES"] * 3
+
+
+@pytest.mark.asyncio
+async def test_an_item_edge_naming_an_entity_by_name_is_repaired_u7():
+    text = "Tools I use at work:\n- Quillon with the Brask plugin\n- Tervane"
+    frame = frame_body([group("G1", [("user", "USES", "item")], "Technology")])
+
+    def items(target: str) -> dict:
+        return {
+            "items": [
+                item_record(
+                    "G1.1",
+                    entity("Quillon", "Technology"),
+                    entities=[keyed("e1", "Brask", "Technology")],
+                    relationships=[edge("item", "DEPENDS_ON", target)],
+                ),
+                item_record("G1.2", entity("Tervane", "Technology")),
+            ]
+        }
+
+    llm, response = await replay(
+        text, frame=scripted(frame), items=scripted(items("Brask"), items("e1"))
+    )
+
+    groups = turn_groups(text)
+    parsed = parse_frame_output(json.dumps(frame), groups)
+    error = refusal(
+        lambda: parse_item_output(json.dumps(items("Brask")), ["G1.1", "G1.2"], parsed, groups, {})
+    )
+    assert "'Brask' is not user" in str(error)
+    _first, second = llm.of("items")
+    assert second.messages[3]["content"] == list_repair_text(LIST_ITEM_REPAIR_INSTRUCTION, error)
+    assert predicates(response) == ["DEPENDS_ON", "USES", "USES"]
+
+
+@pytest.mark.asyncio
+async def test_a_template_naming_a_facts_key_is_repaired_f1():
+    text = "Tools we use at Zentrova:\n- Quillon\n- Brask"
+    wrong = frame_body(
+        [group("G1", [("user", "USES", "item"), ("e1", "USES", "item")], "Technology")],
+        facts_entities=[keyed("e1", "Zentrova", "Organization")],
+    )
+    right = frame_body(
+        [group("G1", [("user", "USES", "item"), ("f1", "USES", "item")], "Technology")],
+        frame_entities=[keyed("f1", "Zentrova", "Organization")],
+    )
+
+    llm, response = await replay(text, frame=scripted(wrong, right))
+
+    error = refusal(lambda: parse_frame_output(json.dumps(wrong), turn_groups(text)))
+    assert "'e1' is not user, mist, item" in str(error)
+    _first, second = llm.of("frame")
+    assert second.messages[3]["content"] == list_repair_text(LIST_FRAME_REPAIR_INSTRUCTION, error)
+    assert predicates(response) == ["USES"] * 4
+
+
+@pytest.mark.asyncio
+async def test_a_service_latency_table_keeps_its_per_row_metric_edges():
+    text = (
+        "Latency by service:\n\n"
+        "| Service | Latency |\n|---|---|\n| Vornix | 40 ms |\n| Quellan | 75 ms |"
+    )
+    frame = frame_body([group("G1", [], "Technology")])
+
+    def row(item_id: str, name: str, latency: str) -> dict:
+        value, unit = latency.split()
+        return item_record(
+            item_id,
+            entity(name, "Technology"),
+            entities=[keyed("e1", latency, "Metric", value=value, unit=unit)],
+            relationships=[edge("item", "HAS_METRIC", "e1")],
+        )
+
+    items = {"items": [row("G1.1", "Vornix", "40 ms"), row("G1.2", "Quellan", "75 ms")]}
+
+    llm, response = await replay(text, frame=scripted(frame), items=scripted(items))
+
+    by_id = {e["id"]: e for e in response.payload.entities}
+    metric_edges = {
+        (by_id[r["source"]]["name"], by_id[r["target"]]["type"])
+        for r in response.payload.relationships
+        if r["type"] == "HAS_METRIC"
+    }
+    assert metric_edges == {("Vornix", "Metric"), ("Quellan", "Metric")}
+    assert len(llm.of("frame")) == len(llm.of("items")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_document_list_under_experienced_is_repaired_and_every_edge_validates():
+    text = "Books I read this year:\n- The Glass Orchard\n- Northwind Ledger"
+    wrong = frame_body([group("G1", [("user", "EXPERIENCED", "item")], "Document")])
+    right = frame_body([group("G1", [("user", "REFERENCES_DOCUMENT", "item")], "Document")])
+    items = {
+        "items": [
+            item_record("G1.1", entity("The Glass Orchard", "Document")),
+            item_record("G1.2", entity("Northwind Ledger", "Document")),
+        ]
+    }
+
+    llm, response = await replay(text, frame=scripted(wrong, right), items=scripted(items))
+
+    error = refusal(lambda: parse_frame_output(json.dumps(wrong), turn_groups(text)))
+    assert "EXPERIENCED does not admit Document" in str(error)
+    _first, second = llm.of("frame")
+    assert second.messages[3]["content"] == list_repair_text(LIST_FRAME_REPAIR_INSTRUCTION, error)
+    payload = response.payload
+    validated = ExtractionValidator(min_confidence=0.0).validate(
+        ExtractionResult(entities=payload.entities, relationships=payload.relationships)
+    )
+    assert predicates(response) == ["REFERENCES_DOCUMENT"] * 2
+    assert len(validated.relationships) == len(payload.relationships)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_of_four_with_one_persistently_refused_item_halves_to_nine_calls():
+    def answer(request: LLMRequest, call: int) -> LLMResponse:
+        body = json.loads(items_ok(request, call).content)
+        for record in body["items"]:
+            if record["item"] == "G1.3":
+                record["entity"] = None
+        return LLMResponse(content=json.dumps(body), finish_reason="stop")
+
+    llm = ListLLM(items=answer)
+
+    response = await make_engine(llm).run(make_request(tool_list(4)))
+
+    assert [asked_items(r) for r in llm.of("items")] == [
+        ["G1.1", "G1.2", "G1.3", "G1.4"],
+        ["G1.1", "G1.2", "G1.3", "G1.4"],
+        ["G1.1", "G1.2"],
+        ["G1.3", "G1.4"],
+        ["G1.3", "G1.4"],
+        ["G1.3"],
+        ["G1.3"],
+        ["G1.4"],
+    ]
+    assert len(llm.of("items")) + len(llm.of("r6")) == 9
+    assert response.stage2_calls == 10
+    assert response.warnings == ["list_item_fallback"]

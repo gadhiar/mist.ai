@@ -23,12 +23,16 @@ from backend.extraction_service.engine import (
 from backend.extraction_service.list_schemas import (
     LIST_FRAME_OUTPUT_SCHEMA,
     LIST_ITEM_OUTPUT_SCHEMA,
+    list_frame_output_schema,
+    list_item_output_schema,
 )
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
     EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
+from backend.knowledge.extraction.list_frames import group_units, item_slots, parse_frame_output
+from backend.knowledge.extraction.structure_splitter import split_structured
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from tests.unit.extraction_service.conftest import FAKE_BASE_URL, make_extract_request
 from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
@@ -192,11 +196,17 @@ class TestGptOssDefaultConstrainedMode:
             ("user", "USES", "quillon"),
             ("user", "USES", "brask"),
         }
+        groups, _prose = group_units(split_structured(body["utterance"]))
+        parsed = parse_frame_output(json.dumps(frame), groups)
         requests = fake_llama_state.chat_requests
         assert [r["response_format"]["json_schema"]["schema"] for r in requests[1:]] == [
-            LIST_FRAME_OUTPUT_SCHEMA,
-            LIST_ITEM_OUTPUT_SCHEMA,
+            list_frame_output_schema(["G1"], set(), ["G1.1", "G1.2"]),
+            list_item_output_schema(
+                item_slots(parsed, groups, ["G1.1", "G1.2"]), [], ["G1.1", "G1.2"]
+            ),
         ]
+        assert requests[1]["response_format"]["json_schema"]["schema"] != LIST_FRAME_OUTPUT_SCHEMA
+        assert requests[2]["response_format"]["json_schema"]["schema"] != LIST_ITEM_OUTPUT_SCHEMA
         assert [r["max_tokens"] for r in requests[1:]] == [
             LIST_FRAME_MAX_TOKENS,
             LIST_ITEM_MAX_TOKENS,

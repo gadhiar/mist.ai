@@ -221,6 +221,12 @@ services:
       # this var was reachable. This makes the setting overridable without
       # changing today's effective default.
       - EXTRACTION_CONSTRAINED_MODE=${EXTRACTION_CONSTRAINED_MODE:-}
+      # EXTRACTION_LOG_LIST_OUTPUTS: off unless docker/extraction/.env sets it.
+      # When true, each list frame and item call attempt writes one JSON line,
+      # keyed by job id, to the container's stderr. The text derives from the
+      # utterance, so it is on only for synthetic dev-lists runs, never for
+      # held-out runs or real turns: HOST_1070_RUNBOOK.md, "List output log".
+      - EXTRACTION_LOG_LIST_OUTPUTS=${EXTRACTION_LOG_LIST_OUTPUTS:-false}
     depends_on:
       mist-extraction-ts:
         condition: service_started

@@ -18,6 +18,7 @@ _ALL_ENV_VARS = [
     "EXTRACTION_TEMPERATURE",
     "LLAMA_CPP_BUILD",
     "EXTRACTION_PORT",
+    "EXTRACTION_LOG_LIST_OUTPUTS",
 ]
 
 
@@ -38,6 +39,7 @@ class TestServiceSettingsFromEnv:
         assert settings.temperature == 0.0
         assert settings.llama_cpp_build == "b11151"
         assert settings.port == 8090
+        assert settings.log_list_outputs is False
 
     def test_reads_overrides_from_env(self, monkeypatch):
         monkeypatch.setenv("EXTRACTION_ADAPTER", "qwen")
@@ -69,3 +71,8 @@ class TestServiceSettingsFromEnv:
 
         monkeypatch.setenv("EXTRACTION_SCOPE_ENABLED", "yes")
         assert ServiceSettings.from_env().scope_enabled is True
+
+    def test_log_list_outputs_parses_as_a_boolean(self, monkeypatch):
+        for value, expected in [("true", True), ("1", True), ("false", False), ("", False)]:
+            monkeypatch.setenv("EXTRACTION_LOG_LIST_OUTPUTS", value)
+            assert ServiceSettings.from_env().log_list_outputs is expected, value
