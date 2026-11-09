@@ -193,7 +193,8 @@ class TestLlamaServerPins:
 class TestServiceEnvPassthrough:
     """Pins the compose passthrough for three vars that were previously
     silently unreachable inside the container (compose never forwarded
-    them, even though README.md documented them as operator-settable).
+    them, even though README.md documented them as operator-settable),
+    and for the list output log's switch, forwarded from the start.
     """
 
     def test_llm_timeout_seconds_is_forwarded_with_120_default(self) -> None:
@@ -216,6 +217,14 @@ class TestServiceEnvPassthrough:
         env = _env_dict(_host_extraction())
         assert env["EXTRACTION_CONSTRAINED_MODE"] == "${EXTRACTION_CONSTRAINED_MODE:-}", env[
             "EXTRACTION_CONSTRAINED_MODE"
+        ]
+
+    def test_log_list_outputs_is_forwarded_with_false_default(self) -> None:
+        # The list output log (plan v6, D6) is on only for dev-lists runs, by an
+        # `.env` line; an unforwarded variable would stay unset in the container.
+        env = _env_dict(_host_extraction())
+        assert env["EXTRACTION_LOG_LIST_OUTPUTS"] == "${EXTRACTION_LOG_LIST_OUTPUTS:-false}", env[
+            "EXTRACTION_LOG_LIST_OUTPUTS"
         ]
 
 

@@ -251,6 +251,15 @@ def test_each_request_setting_and_deployment_value_moves_the_identity(service_se
     assert _identity(moved) != _identity(service_settings)
 
 
+def test_the_list_output_log_does_not_move_the_identity(service_settings):
+    """It changes what the service logs, never what it returns."""
+    logged = dataclasses.replace(service_settings, log_list_outputs=True)
+    reason = dict(engine_module.RUN_IDENTITY_EXCLUDED)["backend.extraction_service.settings"]
+
+    assert _identity(logged) == _identity(service_settings)
+    assert "never what it returns" in reason
+
+
 def test_the_adapter_moves_the_identity(service_settings):
     qwen = dataclasses.replace(service_settings, adapter_name="qwen")
 
