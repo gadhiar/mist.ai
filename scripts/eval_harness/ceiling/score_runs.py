@@ -24,6 +24,22 @@ the classifier's class counts and recall over the relations the prompt asks for:
 classifier's `_beyond_prompt` sets aside the relations the current gold adds to the pre-H8
 gold, and `diagnose` classifies the rest. Every figure is the scorer's or the classifier's own.
 
+With two or more runs, one line per unordered pair of `--run` names, in `--run` order (n1|n2,
+n1|n3, ..., then n2|n3 and so on), compares the runs on the same probes:
+
+    [paired X|Y] relation recall over probes both runs completed: X 0.000 (tp/g), Y 0.000
+    (tp/g), probes n of t
+
+on one line. The probes run X completed are the gold probes whose raw row in X has a non-null
+`response`, narrower than the per-run rule above, which counts any raw row. The pair's subset
+is the probes both runs completed, in gold order; n is its size and t the gold probe count.
+Each run's tp and g are the scorer's `rel_tp` and `rel_recall_denominator` from `score_run`
+over that subset with the run's own index, so two runs are compared on the same probes even
+when one completes few of them. g is the gold relations over the subset, so it must be
+the same for both runs; a difference is an input error. An empty subset prints `n/a (0/0)`,
+not the scorer's 1.0 for an empty denominator. The lines follow the expectation lines and
+precede the worksheet line, and none prints when an expectation fails.
+
 `--expect NAME=R` compares run NAME's relation recall at 3 decimals. When any expectation
 fails, only the expected runs' lines print, nothing is written, and the exit is 1, so no
 other run's figure appears before the reproductions hold.
@@ -180,6 +196,26 @@ class RunScore:
         ]
         out.extend(f"{prefix} class {cls}: {count}" for cls, count in self.class_counts)
         return out
+
+
+@dataclass(frozen=True, slots=True)
+class PairScore:
+    """Two runs' relation recall over the probes both completed."""
+
+    first: str
+    second: str
+    first_recall: Ratio
+    second_recall: Ratio
+    shared_probes: int
+    total_probes: int
+
+    def line(self) -> str:
+        """The pair's line, prefixed `[paired ` so no per-run `[name] ` prefix matches it."""
+        return (
+            f"[paired {self.first}|{self.second}] relation recall over probes both runs "
+            f"completed: {self.first} {self.first_recall}, {self.second} {self.second_recall}, "
+            f"probes {self.shared_probes} of {self.total_probes}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +420,44 @@ def _score_run(
     )
 
 
+def _completed(probes: list[_Probe], run: ScoredRun) -> set[str]:
+    """The probes the run completed: a raw row whose `response` is not null."""
+    return {
+        p.tag for p in probes if p.tag in run.rows and run.rows[p.tag].get("response") is not None
+    }
+
+
+def _paired_scores(
+    scorer: ModuleType, probes: list[_Probe], runs: dict[str, ScoredRun]
+) -> list[PairScore]:
+    """Each unordered pair in `--run` order, scored by the scorer over the shared probes."""
+    names = list(runs)
+    completed = {name: _completed(probes, run) for name, run in runs.items()}
+    pairs: list[PairScore] = []
+    for i, first in enumerate(names):
+        for second in names[i + 1 :]:
+            shared = [p for p in probes if p.tag in completed[first] & completed[second]]
+            one = scorer.score_run(shared, runs[first].index)
+            two = scorer.score_run(shared, runs[second].index)
+            if one.rel_recall_denominator != two.rel_recall_denominator:
+                raise InputError(
+                    f"paired {first}|{second}: the scorer counts "
+                    f"{one.rel_recall_denominator} gold relations over the shared probes for "
+                    f"{first} and {two.rel_recall_denominator} for {second}"
+                )
+            pairs.append(
+                PairScore(
+                    first=first,
+                    second=second,
+                    first_recall=Ratio.of(one.rel_tp, one.rel_recall_denominator),
+                    second_recall=Ratio.of(two.rel_tp, two.rel_recall_denominator),
+                    shared_probes=len(shared),
+                    total_probes=len(probes),
+                )
+            )
+    return pairs
+
+
 def _key(parts: Sequence[str]) -> Key:
     source, predicate, target = parts
     return source, predicate, target
@@ -511,6 +585,9 @@ def _run(argv: Sequence[str] | None) -> int:
         for name, want in expects.items()
         if f"{scores[name].relation_recall.value:.3f}" != f"{want:.3f}"
     ]
+    pairs: list[PairScore] = []
+    if not failed:
+        pairs = _paired_scores(scorer, probes, {name: run for name, (_, run) in scored.items()})
     lines: list[dict[str, object]] = []
     if worksheet is not None and not failed:
         lines = _worksheet_lines(
@@ -530,6 +607,8 @@ def _run(argv: Sequence[str] | None) -> int:
         return 1
     for name, want in expects.items():
         print(f"expect {name}: {want:.3f} holds")
+    for pair in pairs:
+        print(pair.line())
     if worksheet is not None:
         _write_worksheet(worksheet, lines)
         run = scored[args.worksheet_run][1]

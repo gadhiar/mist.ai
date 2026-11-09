@@ -702,3 +702,156 @@ def test_worksheet_flags_go_together(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "--worksheet-run" in result.stderr
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Recall paired on the probes two runs completed
+# ---------------------------------------------------------------------------
+
+
+def _run_named(
+    root: Path, files: dict[str, Path], runs: list[tuple[str, Path]], *extra: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the script with exactly the `--run` names given, in the order given."""
+    argv = [
+        sys.executable,
+        str(_SCRIPT),
+        "--code-root",
+        str(root),
+        "--gold",
+        str(files["gold"]),
+        "--pre-h8-gold",
+        str(files["pre"]),
+    ]
+    for name, path in runs:
+        argv += ["--run", f"{name}={path}"]
+    argv += list(extra)
+    return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=120, check=False)
+
+
+def _paired(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return [line for line in result.stdout.splitlines() if line.startswith("[paired ")]
+
+
+def test_paired_recall_is_the_scorer_sums_over_the_shared_probes(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    # Shared: t-02 only. Run a finds one of its two relations, run b both.
+    assert _paired(result) == [
+        "[paired a|b] relation recall over probes both runs completed: "
+        "a 0.500 (1/2), b 1.000 (2/2), probes 1 of 3"
+    ]
+
+
+def test_a_row_with_a_null_response_is_outside_the_pair(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    failed = {"id": "t-01", "job_id": "j4", "utterance": "first  probe", "response": None}
+    _jsonl(files["b"], [failed, *_RAW_B])
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, files)
+    assert result.returncode == 0, result.stderr
+    # The per-run rule still counts the row: probes 2 of 3 for run b.
+    assert "[b] relation recall over probes with a raw row: 0.400 (2/5, probes 2 of 3)" in (
+        _lines(result, "b")
+    )
+    assert _paired(result) == [
+        "[paired a|b] relation recall over probes both runs completed: "
+        "a 0.500 (1/2), b 1.000 (2/2), probes 1 of 3"
+    ]
+
+
+def test_no_shared_probe_prints_no_ratio(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    only_third = {
+        "id": "t-03",
+        "job_id": "j5",
+        "utterance": "third probe",
+        "response": {"payload": {"entities": [], "relationships": []}},
+    }
+    _jsonl(files["b"], [only_third])
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, files)
+    assert result.returncode == 0, result.stderr
+    assert _paired(result) == [
+        "[paired a|b] relation recall over probes both runs completed: "
+        "a n/a (0/0), b n/a (0/0), probes 0 of 3"
+    ]
+
+
+def test_three_runs_print_three_pairs_in_run_order(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    # Run c completes every probe and finds every relation.
+    raw_c = [
+        {
+            "id": probe["tag"],
+            "job_id": f"c{n}",
+            "utterance": probe["utterance"],
+            "response": {
+                "payload": {
+                    "entities": probe["expected_entities"],
+                    "relationships": probe["expected_relationships"],
+                }
+            },
+        }
+        for n, probe in enumerate(_GOLD)
+    ]
+    c = _jsonl(tmp_path / "data" / "c_raw.jsonl", raw_c)
+    root = _write_stub_root(tmp_path / "code")
+    result = _run_named(root, files, [("b", files["b"]), ("c", c), ("a", files["a"])])
+    assert result.returncode == 0, result.stderr
+    assert _paired(result) == [
+        "[paired b|c] relation recall over probes both runs completed: "
+        "b 1.000 (2/2), c 1.000 (2/2), probes 1 of 3",
+        "[paired b|a] relation recall over probes both runs completed: "
+        "b 1.000 (2/2), a 0.500 (1/2), probes 1 of 3",
+        "[paired c|a] relation recall over probes both runs completed: "
+        "c 1.000 (5/5), a 0.600 (3/5), probes 2 of 3",
+    ]
+
+
+def test_paired_lines_follow_the_expectations_and_precede_the_worksheet(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "worksheet.jsonl"
+    result = _with_worksheet(tmp_path, out, "--expect", "a=0.500")
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    holds = lines.index("expect a: 0.500 holds")
+    paired = lines.index(_paired(result)[0])
+    sheet = next(n for n, line in enumerate(lines) if line.startswith("worksheet a: "))
+    assert holds < paired < sheet
+
+
+def test_an_expect_mismatch_prints_no_paired_line(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path), "--expect", "a=0.428")
+    assert result.returncode == 1
+    assert "[paired" not in result.stdout
+
+
+def test_a_single_run_prints_no_paired_line(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    root = _write_stub_root(tmp_path / "code")
+    result = _run_named(root, files, [("a", files["a"])])
+    assert result.returncode == 0, result.stderr
+    assert _lines(result, "a")
+    assert "[paired" not in result.stdout
+
+
+def test_unequal_gold_counts_over_a_pair_exit_1(tmp_path: Path) -> None:
+    # A scorer whose recall denominator depends on the index breaks the shared-gold premise.
+    tail = """
+    _score_run = score_run
+
+
+    def score_run(probes, produced_index):
+        report = _score_run(probes, produced_index)
+        report.rel_fn += len(produced_index)
+        return report
+    """
+    root = _write_stub_root(tmp_path / "code", scorer_tail=tail)
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 1
+    assert "paired a|b" in result.stderr
+    assert "[paired" not in result.stdout
