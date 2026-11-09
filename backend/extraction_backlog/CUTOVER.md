@@ -3,7 +3,9 @@
 Changing the extraction model is a NEW epoch. The whole event log is re-extracted
 through the backlog under the new model, a staging graph is built from it and
 checked, and only then does the new epoch become active. The old graph stays
-live, frozen, until the swap.
+live, frozen, until the swap. A change of the extraction service's serving
+settings, or of the backend's dispatch settings, is a new epoch too, cut over
+the same way with `--settings-change` (section 9).
 
 Code: `backend/extraction_backlog/cutover.py` (lifecycle, check, seed-only
 probe), `ExtractionDispatcher._fill_step` (filling),
@@ -119,7 +121,12 @@ composed from the bare hash and the backend's embedding model through
 `compose_model_hash`.
 
 Refused (exit 2, nothing written) when a cutover is already open, when the ledger is
-empty, or when the candidate stamps equal the active epoch's.
+empty, or when the candidate stamps equal the active epoch's. The last refusal
+names `--settings-change`, which is for a change of settings alone (section 9).
+While the active epoch is unbound (section 9.2), a candidate with the active
+`extraction_version` and `model_hash` and another `ontology_version` is refused
+too: until the epoch is bound nothing shows the candidate may share its rows.
+[UNIT-TESTED: `TestBegin` in `tests/unit/extraction_backlog/test_identity_cutover.py`]
 
 ---
 
@@ -181,7 +188,11 @@ identical, turns processed (both builds), canonical form non-vacuous, replay edg
 non-vacuous, self-model applied. `live == rebuilt` is NOT a gate (a new model is
 expected to differ); its summary line is stored in the report as
 `live_vs_rebuilt`. The check also refuses if the rebuild's turn selection changed
-while it ran.
+while it ran, and refuses an unbound candidate (`cutover <k> is not bound yet`):
+both builds read the candidate's rows from the namespace its binding names, and the
+report records it as `identity_namespace` (section 9.2). [UNIT-TESTED:
+`test_an_unbound_ready_candidate_is_refused_and_records_nothing`,
+`TestCutoverRebuildNamespace`]
 
 Exit codes: 0 passed -> `checked`; 1 rebuild-twice disagreed; 2 refused; 4 a
 non-vacuity or self-model gate failed. On anything but 0 the cutover is `ready`
@@ -668,10 +679,11 @@ applies it in log order. [UNIT-TESTED:
 
 [VERIFIED-IN-REPO] [UNIT-TESTED]
 
-Deletes nothing. The candidate's cache rows are keyed by its stamps, so no other
-epoch reads them; a later cutover to the same stamps reuses them. Point the
-extraction service back at the active epoch's model afterwards, or the active
-epoch stays in `epoch_mismatch`.
+Deletes nothing. The candidate's cache rows are keyed by its stamps and its identity
+namespace (section 9.2), so no other epoch reads them; a later cutover to the same
+stamps that binds to the same namespace reuses them. Point the extraction service
+back at the active epoch's model (or settings) afterwards, or the active epoch
+stays in `epoch_mismatch`.
 
 ---
 
@@ -711,3 +723,136 @@ epoch stays in `epoch_mismatch`.
   was never reset. The seed-only path rests on the operator precondition and
   the reseed-then-probe procedure in 6A; writers outside the backend are not
   enumerated.
+
+---
+
+## 9. Settings changes
+
+Code: `backend/extraction_backlog/binding.py` (the binding rules),
+`ExtractionDispatcher._bind` and `_dispatch_identity_guard`, `begin_cutover` in
+`cutover.py`, `_epoch_accept` in `admin.py`.
+
+### 9.1 When a change is a new epoch
+
+An epoch's full identity is its stamp triple plus two more identities, both
+computed, never typed:
+
+- the serving identity (`si1-...`), which the extraction service reports on
+  `/v1/info` and computes from the settings it keys: model file, build, context
+  size, placement, device, request sampling and the server flags
+  (`backend/knowledge/extraction/serving_identity.py`);
+- the dispatch identity (`di1-...`), which the backend computes from its
+  dispatch settings: the history window and the Gate 2 and Gate 3 settings
+  (`backend/extraction_backlog/dispatch_identity.py`).
+
+A change to any of them is a new epoch. A model or version change moves the
+triple and goes through sections 2 to 6. A change of settings alone keeps the
+triple, and the dispatcher refuses the changed configuration, naming each
+differing setting: `epoch_mismatch` with `service serving identity <si> != epoch
+<n>'s <si>: <diffs>` for the service, and `stalled` with `backend dispatch settings
+<di> != epoch <n>'s <di>: <diffs>; restore them or begin a cutover with
+--settings-change` for the backend. [UNIT-TESTED: `test_identity_guard.py`]
+`redispatch-check` refuses a pipeline whose dispatch identity differs from the
+bound epoch's, through the same guard. [UNIT-TESTED: `TestDispatchIdentity` in
+`test_redispatch.py`]
+
+Either restore the settings, or cut over:
+
+    docker compose exec mist-backend python -m backend.extraction_backlog.admin \
+      cutover begin --model-hash <BARE_MODEL_HASH> --settings-change
+
+[VERIFIED-IN-REPO: `admin.py`, `_add_cutover_parser`] [UNIT-TESTED:
+`TestSettingsCutoverEndToEnd` in `tests/unit/extraction_backlog/test_identity_cutover.py`]
+
+The candidate has the active triple and covers 0 turns: the 3-part rows of the
+triple are the active epoch's. `--settings-change` on a candidate whose triple
+differs is refused. Then restart the service (or the backend) with the new
+settings. While the service still reports the active epoch's identity, the fill
+stalls in `epoch_mismatch` (`the service still reports the active epoch's
+identity`) and sends no job. At the first contact with the changed service the
+candidate binds to a keyed namespace of its own and fills; sections 3 to 6 then
+apply unchanged. Promotion writes the binding to the new epoch with source
+`promoted`. A later change back to a configuration an epoch has already bound in
+the 3-part namespace binds there again (rule 3) and reuses its rows: only turns
+logged since are extracted.
+
+### 9.2 The namespace rule, and binding at upgrade
+
+The cache rows of one `extraction_version`/`model_hash` pair have a 3-part
+namespace, the key used before bindings existed, and any number of keyed ones
+(`<serving identity>+<dispatch identity>`). The 3-part namespace belongs to the
+first identity bound to it, its claim. A target takes a keyed namespace only when
+it cannot share the 3-part rows. The active epoch never moves to a keyed
+namespace: an upgrade neither hides its rows nor forces a refill.
+
+Every epoch, and every cutover open at upgrade, is unbound when this code first
+runs. The dispatcher binds each one at its first successful `/v1/info` contact
+under it, and logs one line: `epoch_identity bound target=... source=... rule=...
+namespace=3-part|keyed unverified=...`. While a cutover is open the active epoch
+is not bound. `status` and `cutover status` print each binding, or `binding:
+unbound`: [VERIFIED-IN-REPO: `_print_binding` in `admin.py`] [UNIT-TESTED:
+`TestStatus` in `test_identity_cutover.py`]
+
+    binding: source=adopted rule=5c namespace=3-part
+      serving_identity=si1-...
+      dispatch_identity=di1-...
+      bound_at=...
+      unverified (N): <setting>, ...
+
+An adoption compares only the newest extracted row's adapter, build and location
+label with the service. Context size, placement, device, top_p and the server
+flags are never recorded by any row, so they are always listed unverified.
+
+While the active epoch is unbound, `--settings-change` also needs `--refill`:
+without a binding the change cannot be checked against the epoch, so the
+candidate would refill even if nothing changed. `--refill` is the operator's
+choice to re-extract the whole log. Without it the begin is refused with `epoch
+<n> has no identity yet, so this change cannot be checked against it`. Wait until
+`status` shows the epoch bound instead, where you can.
+
+### 9.3 The contradiction stall and its three ways out
+
+When the store contradicts the service, the active epoch stalls in
+`epoch_mismatch` and nothing is applied or dispatched: its 3-part rows belong to
+another identity, or its newest extracted row records another adapter, build or
+location label. The reason ends with the identities to accept:
+
+    epoch <n> cannot be adopted: <contradiction>; restore the service settings,
+    accept them with admin epoch accept --serving-identity <si>
+    --dispatch-identity <di>, or begin a cutover with --settings-change --refill
+
+1. Restore the service settings. The next contact binds.
+2. Accept the running configuration (rule 2):
+
+       docker compose exec mist-backend python -m backend.extraction_backlog.admin \
+         epoch accept --serving-identity <si> --dispatch-identity <di> --note "<why>"
+
+   [UNIT-TESTED: `TestAccept`, `TestContradictionWaysOut`] The dispatcher binds
+   the epoch with source `operator`, in the 3-part namespace, only while the live
+   identities equal the accepted ones; nothing is refilled. `--cutover` accepts
+   for the open candidate instead. Refused (exit 2) with no target, a malformed
+   identity, an empty note, a target already bound, or `--cutover` on a
+   settings-change candidate, whose pair's 3-part rows are its source's.
+3. Re-extract under a new epoch: `cutover begin --settings-change --refill`. The
+   candidate takes a keyed namespace and fills the whole log, then sections 3 to 6.
+
+### 9.4 The rollback boundary
+
+Code from before bindings reads only the 3-part namespace and knows nothing of
+bindings. Rolling back to it is safe only while all of these hold:
+
+- no cache row has a non-NULL `identity_namespace`;
+- no `epoch_identity` row and no bound cutover has a keyed namespace;
+- no cutover begun with `--settings-change` is open. Abandon it first (`cutover
+  abandon`, section 7): old code would read the active epoch's rows as its
+  coverage.
+
+To roll back inside the boundary, revert the merge on main (`git revert -m 1
+<merge sha>`), rebuild and restart the backend, then the service. Old code
+ignores the new tables, and its cache `INSERT` names its columns, so the new
+column stays NULL. Bindings written meanwhile are reused on the next deploy.
+Rows written during the rollback land in the 3-part namespace unchecked, so a
+settings change made then is not detected. [UNVERIFIED: no rollback has been run]
+
+Past the boundary, roll forward only: old code's `event_ids_for` filters on the
+pair alone, so it would merge a keyed namespace's rows into the 3-part scan.
