@@ -803,6 +803,18 @@ An adoption compares only the newest extracted row's adapter, build and location
 label with the service. Context size, placement, device, top_p and the server
 flags are never recorded by any row, so they are always listed unverified.
 
+Deploy the extraction service first, then the backend. A backend from before
+bindings keeps working against the new service: it accepts a contract with its
+own major version, its contract models ignore the fields 1.3.0 adds, and it
+sends no `expect.serving_identity`, which the service checks only when a request
+carries one. A backend deployed first binds nothing: it stalls with `service
+reports no serving identity: contract 1.2.0 predates 1.3.0` and sends no job
+until the service is deployed. [VERIFIED-IN-REPO: `is_compatible` in
+`backend/extraction_contract/models.py`, the `expect.serving_identity` check in
+`backend/extraction_service/app.py`] [UNIT-TESTED:
+`test_a_pre_1_3_0_service_stalls_with_its_contract_named` in
+`test_identity_guard.py`]
+
 While the active epoch is unbound, `--settings-change` also needs `--refill`:
 without a binding the change cannot be checked against the epoch, so the
 candidate would refill even if nothing changed. `--refill` is the operator's
