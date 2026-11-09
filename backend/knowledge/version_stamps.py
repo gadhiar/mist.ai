@@ -166,7 +166,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-08-r7",
-        code_identity="ci1-265b3970c92f9b49a51618b5caceca8fca9c8900b4921383a44cff74317010d9",
+        code_identity="ci1-80db1588e0e840c25f860f9c3b77fed31e04bca6499fa42d22ad9b06ec87aee9",
         date="2026-11-08",
         reason=(
             "List frame path: list_frames, list_prompts, list_schemas, list_assembly and "
@@ -174,7 +174,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "(LIST_FRAME_MAX_TOKENS = 2048) and item calls of LIST_ITEM_BATCH_MAX_UNITS = 4 "
             "items (LIST_ITEM_MAX_TOKENS = 2048), each user message fitted to "
             "LIST_USER_MAX_CHARS = 7200; the r6 list pass is the fallback. Re-extracts "
-            "history."
+            "history. Updated for candidate 2: the validator joins the covered code, because "
+            "the list parsers check templates and item entities against its relationship "
+            "constraints; each list call sends a schema built for it and repairs a refused "
+            "output with a line naming the refusal; durable groups and Metric items."
         ),
     ),
 )
