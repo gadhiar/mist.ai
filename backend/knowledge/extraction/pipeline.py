@@ -1230,3 +1230,28 @@ class ExtractionPipeline:
             curation_resumed=curation_resumed,
             derivation_operations_applied=applied_ops,
         )
+
+    # Placed after `apply_cached_turn` so the line `graph_writer.py` cites in
+    # this module (tests/unit/extraction_backlog/test_graph_writer_citations.py)
+    # does not move.
+    def dispatch_gate_settings(self) -> Mapping[str, float | int | bool]:
+        """The gate values `evaluate_dispatch_gates` decides with, for the dispatch identity.
+
+        Read from the attributes the gates themselves read: the Gate 2
+        threshold through `_significance_threshold("conversation")` (the
+        source the dispatcher gates with), Gate 3's three settings from the
+        config `_check_dedup` and `_add_to_dedup_cache` read, and whether an
+        embedding provider is wired (`_embed`): without one, Gate 2's novelty
+        is 1.0 and Gate 3 never fires. Gate 0 is a code constant and Gate 1 is
+        not on the dispatcher path, so neither is here. The backlog hashes
+        these into the dispatch identity
+        (`backend.extraction_backlog.dispatch_identity`), because a cached skip
+        is replayed by every rebuild.
+        """
+        return {
+            "significance_threshold": self._significance_threshold("conversation"),
+            "dedup_similarity_threshold": self._config.dedup_similarity_threshold,
+            "dedup_cache_size": self._config.dedup_cache_size,
+            "dedup_cache_ttl_seconds": self._config.dedup_cache_ttl_seconds,
+            "embedding_gates": self._embedding_provider is not None,
+        }
