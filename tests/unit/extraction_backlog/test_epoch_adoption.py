@@ -249,8 +249,40 @@ class TestDecideBinding:
         decision = _decide(target, claims=[OTHER, (SI, DI)])
 
         assert isinstance(decision, Bind)
-        assert (decision.rule, decision.identity_namespace) == (RULE_CLAIMED, None)
-        assert decision.unverified == ()
+        assert (decision.rule, decision.source, decision.identity_namespace) == (
+            RULE_CLAIMED,
+            "adopted",
+            None,
+        )
+        assert decision.evidence["rule"] == RULE_CLAIMED
+
+    @pytest.mark.parametrize("target", [ACTIVE, CANDIDATE], ids=["active", "candidate"])
+    def test_rule_3_lists_what_no_row_records_as_unverified(self, target):
+        """The shared claim may itself be an adoption, so the claim verifies nothing."""
+        decision = _decide(target, records=CLEAN, claims=[(SI, DI)])
+
+        assert decision.evidence["verified"] == [
+            "adapter",
+            "llama_cpp_build",
+            "max_attempts",
+            "request.extract.temperature",
+            "request.extract.thinking_effort",
+            "scope_enabled",
+        ]
+        assert decision.unverified == (
+            "model_file",
+            "n_ctx",
+            "request.extract.top_p",
+            "server.device",
+            "dispatch.history_messages",
+        )
+
+    @pytest.mark.parametrize("target", [ACTIVE, CANDIDATE], ids=["active", "candidate"])
+    def test_rule_3_with_no_service_records_leaves_everything_unverified(self, target):
+        decision = _decide(target, records=UNSTAMPED_ONLY, claims=[(SI, DI)])
+
+        assert decision.rule == RULE_CLAIMED
+        assert decision.unverified == _ALL_NAMES
 
     # -- rule 4 -------------------------------------------------------------
 

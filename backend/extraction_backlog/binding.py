@@ -197,10 +197,13 @@ def decide_binding(
         }
         return _bind(RULE_OPERATOR, SOURCE_OPERATOR, None, evidence, names, verified)
 
-    # Rule 3: the pair's 3-part rows are claimed by this identity.
+    # Rule 3: the pair's 3-part rows are claimed by this identity. The claim
+    # may itself be an adoption whose history was never verified, so it
+    # verifies only what the rows record, as rule 5c does.
     if live in claims:
         evidence = {**base, "rule": RULE_CLAIMED}
-        return _bind(RULE_CLAIMED, SOURCE_ADOPTED, None, evidence, names, set(names))
+        verified = _verified_by_records(info, records)
+        return _bind(RULE_CLAIMED, SOURCE_ADOPTED, None, evidence, names, verified)
 
     keyed = keyed_namespace(*live)
 
