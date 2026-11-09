@@ -196,6 +196,7 @@ class LogRegenerator:
         self._validator = validator
 
     def _assert_cache_coverage(self, turns: list[dict], epoch: dict) -> None:
+        namespace = epoch.get("identity_namespace")
         uncached = [
             t["event_id"]
             for t in turns
@@ -203,6 +204,7 @@ class LogRegenerator:
                 t["event_id"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
+                identity_namespace=namespace,
             )
             is None
         ]
@@ -210,7 +212,8 @@ class LogRegenerator:
             raise ColdCacheError(
                 f"{len(uncached)} of {len(turns)} turns are uncached for epoch "
                 f"{epoch['epoch_id']} (ontology={epoch['ontology_version']}, "
-                f"extraction={epoch['extraction_version']}). R1.2 is cache-driven; "
+                f"extraction={epoch['extraction_version']}, "
+                f"identity_namespace={namespace or '3-part'}). R1.2 is cache-driven; "
                 f"warm the cache before rebuilding. First uncached: {uncached[:3]}"
             )
 
@@ -231,7 +234,11 @@ class LogRegenerator:
             staging_uri: Bolt URI for the staging Neo4j (must not equal live_uri).
             live_uri: Bolt URI for the live Neo4j (guard only; never written to).
             epoch: Epoch dict with ontology_version, extraction_version, model_hash,
-                epoch_id, activated_at.
+                epoch_id, activated_at, and optionally identity_namespace: the
+                cache namespace the epoch's binding names. None or absent is the
+                3-part namespace, so a dict built from a bare ledger row reads
+                the rows every epoch read before bindings existed; a bound keyed
+                epoch's rows are only under its key.
             min_seed_nodes: Floor the seed-apply must clear before the replay loop
                 runs. REQUIRED and undefaulted, for the reason MIS-137 gave about
                 `--expect-turns`: a defaulted floor is a number nobody chose that
@@ -418,6 +425,7 @@ class LogRegenerator:
                 turn["event_id"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
+                identity_namespace=epoch.get("identity_namespace"),
             )
             # coverage was asserted above, so cached is never None here
             if cached["outcome"] == OUTCOME_SKIPPED:
