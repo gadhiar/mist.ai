@@ -75,6 +75,7 @@ from backend.knowledge.extraction.scope_classifier import (
     parse_scope_output,
     render_scope_messages,
 )
+from backend.knowledge.extraction.serving_identity import REQUEST_STAGES, StageRequestProfile
 from backend.knowledge.extraction.structure_splitter import (
     InputUnit,
     batch_units,
@@ -176,6 +177,11 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
         "its versions are components already, and it holds CODE_REVISIONS: covering it "
         "would move the code identity each new entry has to name, so the drift guard "
         "could never pass",
+    ),
+    (
+        "backend.knowledge.extraction.serving_identity",
+        "the serving identity's types and hash: request_profile reads the requests the "
+        "stages build and changes none of them",
     ),
 )
 
@@ -384,6 +390,30 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _profile_of(stage: str, request: LLMRequest) -> StageRequestProfile:
+    """The output-changing fields of `request`, read as the provider sends them.
+
+    The constraint follows `LlamaServerProvider._build_kwargs`: a schema wins
+    over JSON mode, and neither means an unconstrained reply.
+    """
+    if request.response_schema is not None:
+        constrained = "schema"
+    elif request.json_mode:
+        constrained = "json_object"
+    else:
+        constrained = "none"
+    thinking = request.thinking
+    return StageRequestProfile(
+        stage=stage,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        constrained=constrained,
+        thinking_effort=None if thinking is None else thinking.effort,
+        thinking_enabled=None if thinking is None else thinking.enabled,
+        thinking_budget_tokens=None if thinking is None else thinking.budget_tokens,
+    )
+
+
 class ExtractionEngine:
     """Runs Stages 1 / 1.5 / 2 / 9 for one `ExtractRequest`.
 
@@ -427,8 +457,32 @@ class ExtractionEngine:
         """The run identity this engine stamps on every result."""
         return self._run_identity
 
-    async def run(self, req: ExtractRequest) -> ExtractResponse:
+    def request_profile(self) -> tuple[StageRequestProfile, ...]:
+        """The output-changing fields of each stage's request, in `REQUEST_STAGES` order.
+
+        Each profile comes from the builder the stage itself calls, so it is
+        the request as sent, after the adapter has prepared it: a setting the
+        adapter ignores is absent. The messages are left empty, because the
+        profile records how a request is sampled and constrained, not what it
+        says. Every stage is listed, Stage 1.5 even when `scope_enabled` is
+        off, since that switch is a component of its own.
+        """
+        builders = {
+            "scope": self._scope_request,
+            "extract": self._extract_request,
+            "derive": self._derive_request,
+        }
+        return tuple(_profile_of(stage, builders[stage](messages=[])) for stage in REQUEST_STAGES)
+
+    async def run(
+        self, req: ExtractRequest, *, serving_identity: str | None = None
+    ) -> ExtractResponse:
         """Run the full stage sequence for one job and build its response.
+
+        Args:
+            req: The job.
+            serving_identity: The serving identity the caller computed for this
+                job, stamped on the result. None stamps none.
 
         Raises:
             InvalidRequestError: `req.recorded_at` is not ISO-8601; raised
@@ -474,6 +528,7 @@ class ExtractionEngine:
                 llama_cpp_build=self._settings.llama_cpp_build,
                 adapter=self._adapter.name,
                 run_identity=self._run_identity,
+                serving_identity=serving_identity,
             ),
             timings_ms=TimingsMs(
                 scope=scope_ms,
@@ -506,6 +561,27 @@ class ExtractionEngine:
             response_schema=schema if mode == "schema" else None,
         )
 
+    def _scope_request(self, *, messages: list[dict]) -> LLMRequest:
+        """Stage 1.5's request for `messages`, prepared by the adapter."""
+        request = self._build_request(
+            messages=messages, max_tokens=SCOPE_MAX_TOKENS, schema=SCOPE_OUTPUT_SCHEMA
+        )
+        return self._adapter.prepare(request, stage="scope")
+
+    def _extract_request(self, *, messages: list[dict]) -> LLMRequest:
+        """Stage 2's request for `messages`, prepared by the adapter."""
+        request = self._build_request(
+            messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
+        )
+        return self._adapter.prepare(request, stage="extract")
+
+    def _derive_request(self, *, messages: list[dict]) -> LLMRequest:
+        """Stage 9's request for `messages`, prepared by the adapter."""
+        request = self._build_request(
+            messages=messages, max_tokens=DERIVE_MAX_TOKENS, schema=DERIVATION_OUTPUT_SCHEMA
+        )
+        return self._adapter.prepare(request, stage="derive")
+
     async def _invoke(self, request: LLMRequest):
         """Invoke the LLM under the configured timeout.
 
@@ -528,12 +604,7 @@ class ExtractionEngine:
             return ScopeOut(label="unknown", confidence=0.0), None
 
         start = time.perf_counter()
-        request = self._build_request(
-            messages=render_scope_messages(pre_processed),
-            max_tokens=SCOPE_MAX_TOKENS,
-            schema=SCOPE_OUTPUT_SCHEMA,
-        )
-        request = self._adapter.prepare(request, stage="scope")
+        request = self._scope_request(messages=render_scope_messages(pre_processed))
 
         try:
             response = await self._invoke(request)
@@ -641,10 +712,7 @@ class ExtractionEngine:
         for attempt in range(1, self._settings.max_attempts + 1):
             run.calls += 1
             run.attempts = max(run.attempts, attempt)
-            request = self._build_request(
-                messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
-            )
-            request = self._adapter.prepare(request, stage="extract")
+            request = self._extract_request(messages=messages)
 
             try:
                 response = await self._invoke(request)
@@ -693,18 +761,15 @@ class ExtractionEngine:
             return None, None
 
         start = time.perf_counter()
-        request = self._build_request(
+        request = self._derive_request(
             messages=render_derivation_messages(
                 utterance=req.utterance,
                 assistant_response=req.derivation.assistant_response,
                 signal_types=req.derivation.signal_types,
                 matched_patterns=req.derivation.matched_patterns,
                 existing_internal_entities=req.derivation.existing_internal_entities,
-            ),
-            max_tokens=DERIVE_MAX_TOKENS,
-            schema=DERIVATION_OUTPUT_SCHEMA,
+            )
         )
-        request = self._adapter.prepare(request, stage="derive")
 
         try:
             response = await self._invoke(request)
