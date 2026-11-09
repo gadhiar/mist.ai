@@ -3,7 +3,7 @@
     python -m backend.extraction_backlog.admin status
     python -m backend.extraction_backlog.admin retry-dead-letters [--event-id ID]
     python -m backend.extraction_backlog.admin cutover begin --model-hash BARE \
-        [--extraction-version V] [--ontology-version O]
+        [--extraction-version V] [--ontology-version O] [--settings-change [--refill]]
     python -m backend.extraction_backlog.admin cutover status
     python -m backend.extraction_backlog.admin cutover rebuild --staging-uri URI \
         --min-seed-nodes N --expect-turns N --min-replay-edges N
@@ -12,6 +12,8 @@
     python -m backend.extraction_backlog.admin cutover promote --seed-only-graph
     python -m backend.extraction_backlog.admin cutover abandon
     python -m backend.extraction_backlog.admin redispatch-check --event-id ID
+    python -m backend.extraction_backlog.admin epoch accept --serving-identity SI \
+        --dispatch-identity DI [--cutover] --note TEXT
 
 `status` reads the event store and extraction cache directly (it does not call
 the extraction service or need the backend running) and prints the active
@@ -24,6 +26,26 @@ and `writer stamps: match` or `writer stamps: MISMATCH (<field>, ...)`: whether
 the stamps a backend started from this environment would write
 (`factories.writer_stamps_from_config`) equal the active epoch's, judged by
 the dispatcher's own guard (`ExtractionDispatcher._writer_stamp_mismatch`).
+For the active epoch and the open cutover it prints the binding
+(`binding.py`): its source and rule, the serving and dispatch identities, the
+cache namespace (3-part, or keyed with the key), and the setting names the
+binding could not verify, or `binding: unbound`; and an operator acceptance on
+record for the target.
+
+`cutover begin --settings-change` opens a candidate with the active epoch's
+stamps, for a change of a serving setting the extraction service keys or of a
+backend dispatch setting; without the flag such a candidate is refused. While
+the active epoch is unbound it also needs `--refill` (the change cannot be
+checked against an identity the epoch does not have yet, so the candidate
+re-extracts the log), and an ontology-only candidate (the active extraction
+version and model hash) is refused. Both refusals exit 2.
+
+`epoch accept` records an operator acceptance for the active epoch, or with
+`--cutover` the open candidate (not a settings-change one: the 3-part rows of
+its stamps are its source's). The dispatcher binds the target with source
+'operator' at its next contact while the live identities equal the accepted
+ones. Exit 2 with no target, a malformed identity, an empty note, a bound
+target, or `--cutover` on a settings-change candidate.
 
 `cutover probe` runs the seed-only checks read-only (`cutover.check_seed_only`):
 the conversation log must be empty and the live-graph probe must pass. It
@@ -63,8 +85,9 @@ row (`redispatch.py` has the operator command and the details). Exit 0 the
 fingerprints are identical, 1 it could not run (Neo4j unreachable, the apply
 raised, or curation stage errors), 2 refused with nothing applied (no active
 epoch, no `applied` marker for the turn, no cache row under the active epoch,
-a skip row, writer stamps differ from the epoch, or the backend is not
-positively down), 3 the fingerprints differ.
+a skip row, writer stamps differ from the epoch, the backend is not
+positively down, or the pipeline's dispatch identity differs from the bound
+epoch's), 3 the fingerprints differ.
 """
 
 from __future__ import annotations
@@ -75,7 +98,7 @@ import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from backend.event_store.store import EventStore
 from backend.knowledge.extraction_cache import ExtractionCache
@@ -112,6 +135,53 @@ def _embedding_model_from_env() -> str:
     return KnowledgeConfig.from_env().embedding.model_name
 
 
+def _binding_rule_and_unverified(binding: dict[str, Any]) -> tuple[str, list[str]]:
+    """The rule that bound a target and the setting names it left unverified.
+
+    A promoted epoch's evidence nests the candidate's (`EventStore` promotion
+    copies the cutover binding), and what was verified is the candidate's.
+    """
+    evidence = binding.get("evidence") or {}
+    nested = evidence.get("cutover_binding_evidence")
+    if binding.get("source") == "promoted" and isinstance(nested, dict):
+        evidence = nested
+    return str(evidence.get("rule") or "-"), [str(n) for n in evidence.get("unverified") or []]
+
+
+def _print_binding(
+    binding: dict[str, Any] | None, acceptance: dict[str, Any] | None, indent: str, out: TextIO
+) -> None:
+    """A target's binding: source, rule, both identities, the namespace, the unverified names.
+
+    Then an operator acceptance on record for it, if any: the dispatcher binds
+    with it (source 'operator') only while the live identities equal its.
+    """
+    if binding is None:
+        print(f"{indent}binding: unbound", file=out)
+    else:
+        rule, unverified = _binding_rule_and_unverified(binding)
+        namespace = binding.get("identity_namespace")
+        shown = "3-part" if namespace is None else f"keyed ({namespace})"
+        print(
+            f"{indent}binding: source={binding['source']} rule={rule} namespace={shown}",
+            file=out,
+        )
+        print(f"{indent}  serving_identity={binding['serving_identity']}", file=out)
+        print(f"{indent}  dispatch_identity={binding['dispatch_identity']}", file=out)
+        print(f"{indent}  bound_at={binding['bound_at']}", file=out)
+        print(
+            f"{indent}  unverified ({len(unverified)}): {', '.join(unverified) or '-'}",
+            file=out,
+        )
+    if acceptance is not None:
+        print(
+            f"{indent}acceptance: serving_identity={acceptance['serving_identity']} "
+            f"dispatch_identity={acceptance['dispatch_identity']} "
+            f"(accepted {acceptance['accepted_at']}): {acceptance['note']}",
+            file=out,
+        )
+
+
 def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
     fill = store.fill_scan(cutover)
     print(
@@ -126,6 +196,13 @@ def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
         file=out,
     )
     print(f"  covered={fill.covered} total={fill.total}", file=out)
+    events = store.event_store
+    _print_binding(
+        events.get_cutover_identity(cutover.cutover_id),
+        events.get_identity_acceptance(-cutover.cutover_id),
+        "  ",
+        out,
+    )
     if cutover.rebuilt_through_event_id:
         print(
             f"  rebuilt_through_event_id={cutover.rebuilt_through_event_id} "
@@ -193,6 +270,13 @@ def _status(store: BacklogStore, config: KnowledgeConfig, out: TextIO) -> int:
     print(verdict, file=out)
     if reason is not None:
         print(f"  {reason}", file=out)
+    events = store.event_store
+    _print_binding(
+        events.get_epoch_identity(epoch.epoch_id),
+        events.get_identity_acceptance(epoch.epoch_id),
+        "",
+        out,
+    )
     if activation is None:
         print("activation: not yet activated (no dispatcher has run for this epoch)", file=out)
     else:
@@ -257,12 +341,23 @@ def _cutover_begin(
             ontology_version=args.ontology_version or ONTOLOGY_VERSION,
             embedding_model_name=embedding_model_name,
             now_iso=now_iso,
+            settings_change=args.settings_change,
+            refill=args.refill,
         )
     except CutoverRefusedError as exc:
         print(f"[cutover] REFUSED: {exc}", file=out)
         return 2
     print(f"[cutover] began cutover {cutover.cutover_id} (state=filling)", file=out)
     _print_cutover(store, cutover, out)
+    if args.settings_change:
+        print(
+            "[cutover] Next: restart the extraction service (or the backend, for a dispatch "
+            "setting) with the candidate settings. The dispatcher binds the candidate at its "
+            "first contact with the changed service and fills it; while the service still "
+            "reports the active epoch's identity it stalls in epoch_mismatch and fills nothing.",
+            file=out,
+        )
+        return 0
     print(
         "[cutover] Next: point the extraction service at the candidate model (its /v1/info "
         f"must report extraction_version={cutover.extraction_version} and "
@@ -431,6 +526,121 @@ def _cutover_rebuild(
     return result.exit_code
 
 
+# ---------------------------------------------------------------------------
+# epoch accept
+# ---------------------------------------------------------------------------
+
+
+def _well_formed(identity: str, prefix: str) -> bool:
+    """`prefix` and 64 lower-case hex digits: the form both identities are computed in."""
+    digest = identity[len(prefix) :]
+    return (
+        identity.startswith(prefix)
+        and len(digest) == 64
+        and all(c in "0123456789abcdef" for c in digest)
+    )
+
+
+def _epoch_accept(store: BacklogStore, args: argparse.Namespace, now_iso: str, out) -> int:
+    """`epoch accept`: record the operator's acceptance of a live identity for one target.
+
+    The target is the active epoch, or with `--cutover` the open candidate.
+    Nothing is bound here: the dispatcher binds the target with source
+    'operator' (rule 2) at its next contact, and only while the live serving
+    and dispatch identities equal the accepted ones, so an acceptance cannot
+    bind a configuration that is not running.
+    """
+    from backend.knowledge.extraction.serving_identity import SERVING_IDENTITY_PREFIX
+
+    from .dispatch_identity import DISPATCH_IDENTITY_PREFIX
+
+    def refuse(reason: str) -> int:
+        print(f"[epoch] REFUSED: {reason}", file=out)
+        return 2
+
+    for flag, value, prefix in (
+        ("--serving-identity", args.serving_identity, SERVING_IDENTITY_PREFIX),
+        ("--dispatch-identity", args.dispatch_identity, DISPATCH_IDENTITY_PREFIX),
+    ):
+        if not _well_formed(value, prefix):
+            return refuse(
+                f"{flag} {value!r} is malformed: expected {prefix} and 64 lower-case hex "
+                "digits, as the stall reason or admin status prints it"
+            )
+    note = args.note.strip()
+    if not note:
+        return refuse("--note is empty; say why this identity is accepted")
+
+    if args.cutover:
+        cutover = store.open_cutover()
+        if cutover is None:
+            return refuse("no cutover is open; omit --cutover to accept for the active epoch")
+        source = (
+            store.get_epoch(cutover.source_epoch_id)
+            if cutover.source_epoch_id is not None
+            else None
+        )
+        if source is not None and (
+            cutover.ontology_version,
+            cutover.extraction_version,
+            cutover.model_hash,
+        ) == (source.ontology_version, source.extraction_version, source.model_hash):
+            return refuse(
+                f"cutover {cutover.cutover_id} is a settings-change candidate: the 3-part rows "
+                f"of its stamps are epoch {source.epoch_id}'s, so an acceptance cannot bind it "
+                "there; it binds at its first fill contact with the changed service"
+            )
+        target_id = -cutover.cutover_id
+        label = f"cutover {cutover.cutover_id}"
+        bound = cutover.bound
+    else:
+        epoch = store.active_epoch()
+        if epoch is None:
+            return refuse("no epoch in the ledger; there is nothing to accept an identity for")
+        target_id = epoch.epoch_id
+        label = f"epoch {epoch.epoch_id}"
+        bound = epoch.bound
+    if bound:
+        return refuse(
+            f"{label} is already bound (admin status shows its binding); a binding is never "
+            "moved, so an acceptance for it would never be read"
+        )
+
+    store.event_store.accept_identity(
+        target_id,
+        serving_identity=args.serving_identity,
+        dispatch_identity=args.dispatch_identity,
+        note=note,
+        accepted_at=now_iso,
+    )
+    print(
+        f"[epoch] accepted serving_identity={args.serving_identity} "
+        f"dispatch_identity={args.dispatch_identity} for {label}. The dispatcher binds it, "
+        "source 'operator', at its next contact while the live identities equal these; "
+        "admin status shows the binding.",
+        file=out,
+    )
+    return 0
+
+
+def _add_epoch_parser(sub) -> None:
+    epoch = sub.add_parser("epoch", help="epoch identity: accept a live identity")
+    esub = epoch.add_subparsers(dest="epoch_command", required=True)
+    accept = esub.add_parser(
+        "accept",
+        help=(
+            "accept the live identities for the active epoch (or with --cutover the open "
+            "candidate); the dispatcher binds it with source 'operator' while they hold"
+        ),
+    )
+    accept.add_argument("--serving-identity", required=True, help="si1-..., the service's")
+    accept.add_argument("--dispatch-identity", required=True, help="di1-..., the backend's")
+    accept.add_argument(
+        "--cutover", action="store_true", help="accept for the open cutover's candidate"
+    )
+    accept.add_argument("--note", required=True, help="why the operator accepts it (recorded)")
+
+
 def _add_cutover_parser(sub) -> None:
     cutover = sub.add_parser(
         "cutover", help="epoch cutover: begin, status, probe, rebuild, promote, abandon"
@@ -452,6 +662,23 @@ def _add_cutover_parser(sub) -> None:
         "--ontology-version",
         default=None,
         help="default: this code's ONTOLOGY_VERSION (backend/knowledge/version_stamps.py)",
+    )
+    begin.add_argument(
+        "--settings-change",
+        action="store_true",
+        help=(
+            "the candidate keeps the active epoch's stamps: a serving setting the extraction "
+            "service keys, or a backend dispatch setting, changed (CUTOVER.md, settings "
+            "changes)"
+        ),
+    )
+    begin.add_argument(
+        "--refill",
+        action="store_true",
+        help=(
+            "with --settings-change while the active epoch is unbound: re-extract the whole "
+            "log under the candidate, since the change cannot be checked against the epoch"
+        ),
     )
 
     csub.add_parser("status", help="print the open cutover, or the last one")
@@ -547,6 +774,7 @@ def main(
     )
     retry.add_argument("--event-id", default=None, help="retry only this turn")
     _add_cutover_parser(sub)
+    _add_epoch_parser(sub)
     redispatch = sub.add_parser(
         "redispatch-check",
         help=(
@@ -572,6 +800,8 @@ def main(
         return _redispatch_check(
             backlog, args.event_id, knowledge_config, backend_probe, redispatch_graph, stream
         )
+    if args.command == "epoch":
+        return _epoch_accept(backlog, args, now_iso, stream)
 
     command = args.cutover_command
     if command == "begin":

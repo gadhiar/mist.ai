@@ -22,6 +22,7 @@ import pytest
 from backend.errors import Neo4jConnectionError, Neo4jQueryError
 from backend.event_store.store import EventStore
 from backend.extraction_backlog import admin
+from backend.extraction_backlog.dispatch_identity import DispatchIdentity
 from backend.extraction_backlog.redispatch import (
     EXCLUDED_PROPERTIES,
     EXCLUDED_RELATIONSHIP_PROPERTIES,
@@ -171,11 +172,19 @@ class FakeGraph:
     output_at_apply: list[str] = field(default_factory=list)
     opens: int = 0
     closes: int = 0
+    # What the pipeline this graph was opened with computes; checked only
+    # against a bound epoch, so the default serves every unbound world.
+    dispatch_identity: DispatchIdentity = field(
+        default_factory=lambda: DispatchIdentity("di1-" + "0" * 64, {})
+    )
 
     def open(self) -> RedispatchGraph:
         self.opens += 1
         return RedispatchGraph(
-            apply_turn=self.apply, fingerprint=self.fingerprint, close=self.close
+            apply_turn=self.apply,
+            fingerprint=self.fingerprint,
+            close=self.close,
+            dispatch_identity=self.dispatch_identity,
         )
 
     async def apply(self, turn, cached, progress) -> ApplyReport:
@@ -376,6 +385,49 @@ class TestRefusals:
 
 
 # ---------------------------------------------------------------------------
+# The dispatch identity: refused, as on the writer stamps, once the graph's
+# pipeline is built (the gates are read off it)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchIdentity:
+    def test_a_pipeline_whose_dispatch_identity_differs_from_the_epochs_is_refused(self, world):
+        _applied_turn(world)
+        world.bind_active_epoch()
+        graph = FakeGraph(dispatch_identity=world.dispatch_identity(history_messages=3))
+        before = _snapshot(world.event_store, world.cache)
+
+        code, text = _cli(world, "evt-1", graph)
+
+        assert code == EXIT_REFUSED
+        assert "REFUSED (exit 2, nothing applied)" in text
+        assert "backend dispatch settings" in text
+        assert "history_messages" in text
+        assert (graph.opens, graph.closes, graph.applies) == (1, 1, [])
+        assert _snapshot(world.event_store, world.cache) == before
+
+    def test_a_matching_dispatch_identity_runs_the_check(self, world):
+        _applied_turn(world)
+        world.bind_active_epoch()
+        graph = FakeGraph(dispatch_identity=world.dispatch_identity())
+
+        code, text = _cli(world, "evt-1", graph)
+
+        assert code == EXIT_IDENTICAL, text
+        assert len(graph.applies) == 1
+
+    def test_an_unbound_epoch_has_no_dispatch_identity_to_check(self, world):
+        # Nothing records what the epoch was dispatched under until it is
+        # bound; the writer stamps are still checked.
+        _applied_turn(world)
+        graph = FakeGraph(dispatch_identity=world.dispatch_identity(history_messages=3))
+
+        code, text = _cli(world, "evt-1", graph)
+
+        assert code == EXIT_IDENTICAL, text
+
+
+# ---------------------------------------------------------------------------
 # Verdicts
 # ---------------------------------------------------------------------------
 
@@ -573,6 +625,7 @@ class TestVerdicts:
             apply_turn=pipeline.apply_cached_turn,
             fingerprint=fingerprint,
             close=lambda: closes.append(1),
+            dispatch_identity=world.dispatch_identity(),
         )
         before = _snapshot(world.event_store, world.cache)
         codes = []
