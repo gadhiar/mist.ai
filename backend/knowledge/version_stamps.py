@@ -158,6 +158,17 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "at EXTRACT_MAX_TOKENS is split in two and retried. Re-extracts history."
         ),
     ),
+    CodeRevision(
+        extraction_version="2026-11-06-r6",
+        code_identity="ci1-29646c2d855e3c09f3147ea73eaf8ca32c9f43c949ccf1d8529aea8f2152d328",
+        date="2026-11-09",
+        reason=(
+            "Serving identity (MIS-196): each stage's request is built by its own method, "
+            "which ExtractionEngine.request_profile also calls, and run() stamps the "
+            "serving identity it is given. Every request is sent exactly as before. New "
+            "turns only."
+        ),
+    ),
 )
 
 

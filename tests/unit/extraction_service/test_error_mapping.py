@@ -103,7 +103,10 @@ class _EngineRaising:
         self._exc = exc
         self.runs = 0
 
-    async def run(self, req: ExtractRequest):
+    def request_profile(self) -> tuple:
+        return ()
+
+    async def run(self, req: ExtractRequest, *, serving_identity: str | None = None):
         self.runs += 1
         raise self._exc
 

@@ -112,7 +112,7 @@ class TestServiceReportsOneIdentity:
         async with await _client_for(built_app) as client:
             data = (await client.get("/v1/info")).json()
 
-        assert data["contract_version"] == "1.2.0"
+        assert data["contract_version"] == "1.3.0"
         assert data["run_identity"] == compute_run_identity(components)
         assert data["run_identity_components"] == dataclasses.asdict(components)
 
@@ -172,12 +172,16 @@ class TestServiceReportsOneIdentity:
         assert first["stamps"]["run_identity"] == again["stamps"]["run_identity"] == identity
 
     async def test_the_identity_is_not_part_of_the_epoch_check(self, built_app):
-        """`expect` still carries two stamps; a run identity is never asked for."""
+        """`expect` never asks for a run identity: the serving identity is what is keyed."""
         async with await _client_for(built_app) as client:
             response = await client.post("/v1/extract", json=make_extract_request())
 
         assert response.status_code == 200
-        assert set(ExpectStamps.model_fields) == {"extraction_version", "model_hash"}
+        assert set(ExpectStamps.model_fields) == {
+            "extraction_version",
+            "model_hash",
+            "serving_identity",
+        }
 
     async def test_an_app_built_without_an_identity_reports_none(self, service_app, client):
         """`create_app` alone, as a test wires it, stamps nothing it was not given."""

@@ -2,7 +2,11 @@
 
 Decision 7 (MIS-171): changing the extraction model means a NEW epoch and
 re-extraction of the WHOLE log through the backlog, with the old graph kept
-until the new one passes a check. The lifecycle, one `epoch_cutover` row:
+until the new one passes a check. So does a change of a serving setting the
+extraction service keys, or of a backend dispatch setting
+(mist-extraction-epoch-identity): such a candidate keeps the active stamp
+triple (`begin_cutover`'s `settings_change`) and is told apart by the identity
+it binds to at its first fill contact. The lifecycle, one `epoch_cutover` row:
 
     begin     -> filling   the candidate stamps are recorded; nothing is live
     (fill)    -> ready     the dispatcher has a candidate cache row for every
@@ -112,28 +116,86 @@ def begin_cutover(
     ontology_version: str,
     embedding_model_name: str,
     now_iso: str,
+    settings_change: bool = False,
+    refill: bool = False,
 ) -> Cutover:
     """Open a cutover candidate in state 'filling'.
 
     The candidate's `model_hash` is composed from the bare service hash and the
     backend's embedding model through `compose_model_hash`, never inline.
 
+    A settings change (`settings_change`) keeps the active epoch's stamp
+    triple: what changed is a serving setting the service keys or a backend
+    dispatch setting. Nothing records the flag; a candidate whose triple equals
+    its source's is a settings change, and the dispatcher binds it at its first
+    fill contact (`binding.decide_binding`): rule 1 refuses a service that has
+    not changed, rule 4 or 5a gives it a keyed namespace, and rule 3 gives a
+    return to a configuration that claims the pair its 3-part rows.
+
+    Two candidates need the active epoch bound, because what decides their
+    rows is a comparison with its identity. A settings change while it is
+    unbound would fill keyed by rule 5a even against an unchanged service, so
+    it needs `refill`, the operator's choice to re-extract the log. An
+    ontology-only candidate (the active extraction version and model hash)
+    while it is unbound would take the pair's 3-part rows on the recorded
+    fields alone (rule 5c); it waits for the binding, or for an acceptance.
+
     Raises:
-        CutoverRefusedError: The ledger is empty, a cutover is already open, or
-            the candidate's stamps equal the active epoch's (nothing to cut
-            over to).
+        CutoverRefusedError: The ledger is empty; a cutover is already open;
+            the candidate's stamps equal the active epoch's without
+            `settings_change`, or differ with it; `refill` without
+            `settings_change`; or one of the two candidates above while the
+            active epoch is unbound.
     """
     epoch = store.active_epoch()
     if epoch is None:
         raise CutoverRefusedError("the epoch ledger is empty; there is no epoch to cut over from")
+    if refill and not settings_change:
+        raise CutoverRefusedError(
+            "--refill applies only with --settings-change: any other candidate's rows are "
+            "decided by its stamps"
+        )
+    existing = store.open_cutover()
+    if existing is not None:
+        raise CutoverRefusedError(
+            f"cutover {existing.cutover_id} is already open ({existing.state}); "
+            "promote or abandon it first"
+        )
     model_hash = compose_epoch_model_hash(bare_model_hash, embedding_model_name)
-    if (ontology_version, extraction_version, model_hash) == (
+    same_triple = (ontology_version, extraction_version, model_hash) == (
         epoch.ontology_version,
         epoch.extraction_version,
         epoch.model_hash,
-    ):
+    )
+    if same_triple and not settings_change:
         raise CutoverRefusedError(
-            f"the candidate stamps equal the active epoch {epoch.epoch_id}'s; nothing to cut over"
+            f"the candidate stamps equal the active epoch {epoch.epoch_id}'s; nothing to cut "
+            "over. A change of serving or dispatch settings alone is cut over with "
+            "--settings-change"
+        )
+    if settings_change and not same_triple:
+        raise CutoverRefusedError(
+            f"--settings-change keeps the active epoch {epoch.epoch_id}'s stamps "
+            f"(ontology_version={epoch.ontology_version}, "
+            f"extraction_version={epoch.extraction_version}, model_hash={epoch.model_hash}); "
+            "this candidate's differ, so it is a cutover of its own: omit the flag"
+        )
+    if settings_change and not epoch.bound and not refill:
+        raise CutoverRefusedError(
+            f"epoch {epoch.epoch_id} has no identity yet, so this change cannot be checked "
+            "against it; wait until admin status shows it bound, or pass --refill to "
+            "re-extract the log anyway"
+        )
+    ontology_only = (
+        not same_triple
+        and extraction_version == epoch.extraction_version
+        and model_hash == epoch.model_hash
+    )
+    if ontology_only and not epoch.bound:
+        raise CutoverRefusedError(
+            f"epoch {epoch.epoch_id} has no identity yet, so this candidate cannot be shown "
+            "to share its rows; wait until admin status shows it bound, or run admin epoch "
+            "accept"
         )
     cutover = store.begin_cutover(
         ontology_version=ontology_version,
@@ -149,16 +211,25 @@ def begin_cutover(
             f"cutover {existing.cutover_id if existing else '?'} is already open "
             f"({existing.state if existing else '?'}); promote or abandon it first"
         )
-    log_transition(cutover, "none", "filling", source_epoch_id=epoch.epoch_id)
+    log_transition(
+        cutover,
+        "none",
+        "filling",
+        source_epoch_id=epoch.epoch_id,
+        settings_change=settings_change,
+        refill=refill,
+    )
     return cutover
 
 
 def abandon_cutover(store: BacklogStore, *, now_iso: str) -> Cutover:
     """Close the open cutover as 'abandoned'. Deletes nothing.
 
-    The candidate's cache rows stay: they are keyed by the candidate's stamps,
-    so no other epoch reads them, and a later cutover to the same stamps
-    reuses them.
+    The candidate's cache rows stay: they are keyed by the candidate's stamps
+    and identity namespace, so no other epoch reads them, and a later cutover
+    to the same stamps that binds to the same namespace reuses them. A keyed
+    namespace is one identity's (`keyed_namespace`), so only a candidate bound
+    to that identity reads it; the 3-part rows are the claim's.
 
     Raises:
         CutoverRefusedError: No cutover is open.
@@ -207,7 +278,8 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 
     Raises:
         CutoverRefusedError: No cutover is open, it is not 'checked',
-            `graph_swapped` is False, or the store refused the promotion.
+            `graph_swapped` is False, it is bound keyed and its check report
+            does not record that namespace, or the store refused the promotion.
     """
     cutover = store.open_cutover()
     if cutover is None:
@@ -224,6 +296,20 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
             "replaced by the checked staging graph; or pass --seed-only-graph instead when "
             "the live graph holds seed data only (backend/extraction_backlog/CUTOVER.md)"
         )
+    # A keyed candidate's check must have read its keyed rows. A check by code
+    # from before bindings records no namespace and reads the 3-part rows; the
+    # candidate may have been bound keyed and refilled to 'ready' meanwhile,
+    # and that check's final transition compares only the state. A 3-part or
+    # unbound candidate reads the 3-part rows either way.
+    if cutover.identity_namespace is not None:
+        recorded = (cutover.check_report or {}).get("identity_namespace")
+        if recorded != cutover.identity_namespace:
+            raise CutoverRefusedError(
+                f"cutover {cutover.cutover_id} is bound to the keyed namespace "
+                f"{cutover.identity_namespace}, but its check report records "
+                f"{'no namespace' if recorded is None else recorded}: the check did not "
+                "read the candidate's rows; run `cutover rebuild` again"
+            )
     try:
         result = store.promote_cutover(cutover, activated_at=now_iso)
     except EpochCutoverStateError as exc:
@@ -748,7 +834,9 @@ async def check_cutover(
     Every refusal `assert_rebuild_target_not_live` makes stands: it runs here
     before any staging write, and again inside every `LogRegenerator.rebuild`.
     `deps_factory` (which opens the Neo4j connections) is called only after the
-    cutover's state and coverage have been checked.
+    cutover's state, binding and coverage have been checked. An unbound
+    candidate is refused: which rows a check certifies depends on the
+    namespace the binding names, and a bind during the check could change it.
 
     One check beyond the gates: the rebuild's turn selection is read before and
     after the two builds and must be unchanged and equal to what each build
@@ -786,6 +874,22 @@ async def check_cutover(
         return CheckResult(
             EXIT_REFUSED,
             {"refused": f"cutover {cutover.cutover_id} is {cutover.state!r}; wait for 'ready'"},
+        )
+    # An unbound candidate (one open at upgrade) reads the 3-part rows. If the
+    # dispatcher bound it keyed during the check, the bind would send it back
+    # to 'filling' and a keyed refill could bring it to 'ready' again before
+    # the final transition, which compares only the state: the stale check
+    # would be recorded on a keyed candidate. A binding is written once, so a
+    # check that starts on a bound candidate cannot race a bind.
+    if not cutover.bound:
+        return CheckResult(
+            EXIT_REFUSED,
+            {
+                "refused": (
+                    f"cutover {cutover.cutover_id} is not bound yet, so its check cannot be "
+                    "tied to its rows; wait until admin status shows it bound"
+                )
+            },
         )
     fill = store.fill_scan(cutover)
     if fill.head is not None:
@@ -836,6 +940,9 @@ async def check_cutover(
         "expect_turns": expect_turns,
         "min_replay_edges": min_replay_edges,
         "min_seed_nodes": min_seed_nodes,
+        # The namespace both builds read the candidate's rows from (None: the
+        # 3-part one), so the report says which rows it certified.
+        "identity_namespace": cutover.identity_namespace,
         "gates": {},
         "passed": False,
     }
@@ -846,6 +953,9 @@ async def check_cutover(
     try:
         deps = deps_factory(cutover)
         assert_rebuild_target_not_live(staging_uri, deps.live_uri)
+        # Carries the candidate's `identity_namespace`, which `LogRegenerator`
+        # reads its rows from: a keyed candidate is rebuilt from its own rows,
+        # never from the 3-part rows of the same pair.
         epoch = cutover.epoch_dict()
         scope_before = _in_scope_event_ids(store, cutover)
         builds: list[tuple[str, Any]] = []
