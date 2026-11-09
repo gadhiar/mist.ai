@@ -162,6 +162,48 @@ def _bind_cutover(world, *, namespace: str | None, components: dict | None = Non
     return serving
 
 
+def _checked_keyed_candidate(world, ts, *, recorded_namespace: bool) -> str:
+    """A settings-change candidate bound keyed, covering one turn, in state 'checked'.
+
+    Its check report carries the candidate's namespace, as a check by this
+    code records it, or (`recorded_namespace` False) no namespace, as a check
+    by code from before bindings records it. Returns the turn's event id.
+    """
+    world.bind_active_epoch()
+    event_id = _log(world, ts, 0)
+    assert _begin(world, "--settings-change")[0] == 0
+    _bind_cutover(world, namespace="keyed", components={**world.service.serving_components})
+    store = world.store
+    cutover = store.open_cutover()
+    world.cache.put(
+        event_id,
+        ONTOLOGY_VERSION,
+        cutover.extraction_version,
+        cutover.model_hash,
+        outcome=OUTCOME_EXTRACTED,
+        entities=[],
+        created_at=ts(0),
+        identity_namespace=cutover.identity_namespace,
+    )
+    assert store.transition_cutover(
+        cutover, from_states=("filling",), to_state="ready", updated_at=ts(1)
+    )
+    report: dict[str, Any] = {"passed": True}
+    if recorded_namespace:
+        report["identity_namespace"] = cutover.identity_namespace
+    assert store.transition_cutover(
+        store.open_cutover(),
+        from_states=("ready",),
+        to_state="checked",
+        updated_at=ts(1),
+        rebuild_job_id="job",
+        rebuilt_through_event_id=event_id,
+        check_report=report,
+        write_check=True,
+    )
+    return event_id
+
+
 def _beta_payload(req) -> tuple[list[dict], list[dict]]:
     """The changed configuration's output: a different entity for every turn."""
     word = req.utterance.rstrip(".!?").split()[-1].lower()
@@ -606,41 +648,47 @@ class TestStatus:
 
     def test_a_promoted_epoch_prints_the_candidates_unverified_names(self, sync_world, ts):
         world = sync_world
-        world.bind_active_epoch()
-        event_id = _log(world, ts, 0)
-        assert _begin(world, "--settings-change")[0] == 0
-        _bind_cutover(world, namespace="keyed", components={**world.service.serving_components})
-        store = world.store
-        cutover = store.open_cutover()
-        world.cache.put(
-            event_id,
-            ONTOLOGY_VERSION,
-            cutover.extraction_version,
-            cutover.model_hash,
-            outcome=OUTCOME_EXTRACTED,
-            entities=[],
-            created_at=ts(0),
-            identity_namespace=cutover.identity_namespace,
-        )
-        assert store.transition_cutover(
-            cutover, from_states=("filling",), to_state="ready", updated_at=ts(1)
-        )
-        assert store.transition_cutover(
-            store.open_cutover(),
-            from_states=("ready",),
-            to_state="checked",
-            updated_at=ts(1),
-            rebuild_job_id="job",
-            rebuilt_through_event_id=event_id,
-            check_report={"passed": True},
-            write_check=True,
-        )
+        _checked_keyed_candidate(world, ts, recorded_namespace=True)
         assert _cli(world, "cutover", "promote", "--graph-swapped")[0] == 0
 
         _code, text = _status(world)
 
         assert "binding: source=promoted rule=4 namespace=keyed" in text
         assert "  unverified (2): n_ctx, server.device\n" in text
+
+
+# ---------------------------------------------------------------------------
+# Promotion ties the check to the candidate's binding
+# ---------------------------------------------------------------------------
+
+
+class TestPromotionTiesTheCheckToTheBinding:
+    def test_a_keyed_candidate_whose_check_recorded_no_namespace_is_refused(self, sync_world, ts):
+        # A check by code from before bindings reads only the 3-part rows and
+        # records no namespace; the candidate may have been bound keyed and
+        # refilled since, so that check certified other rows than its own.
+        world = sync_world
+        _checked_keyed_candidate(world, ts, recorded_namespace=False)
+        cutover = world.store.open_cutover()
+
+        code, text = _cli(world, "cutover", "promote", "--graph-swapped")
+
+        assert code == 2
+        assert (
+            f"cutover {cutover.cutover_id} is bound to the keyed namespace "
+            f"{cutover.identity_namespace}, but its check report records no namespace"
+        ) in text
+        assert world.store.open_cutover().state == "checked"
+        assert world.store.active_epoch().epoch_id == world.epoch_id
+
+    def test_a_keyed_candidate_checked_in_its_namespace_promotes(self, sync_world, ts):
+        world = sync_world
+        _checked_keyed_candidate(world, ts, recorded_namespace=True)
+
+        code, text = _cli(world, "cutover", "promote", "--graph-swapped")
+
+        assert code == 0, text
+        assert world.store.active_epoch().identity_source == "promoted"
 
 
 # ---------------------------------------------------------------------------
