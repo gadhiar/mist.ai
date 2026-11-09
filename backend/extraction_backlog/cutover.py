@@ -278,7 +278,8 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 
     Raises:
         CutoverRefusedError: No cutover is open, it is not 'checked',
-            `graph_swapped` is False, or the store refused the promotion.
+            `graph_swapped` is False, it is bound keyed and its check report
+            does not record that namespace, or the store refused the promotion.
     """
     cutover = store.open_cutover()
     if cutover is None:
@@ -295,6 +296,20 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
             "replaced by the checked staging graph; or pass --seed-only-graph instead when "
             "the live graph holds seed data only (backend/extraction_backlog/CUTOVER.md)"
         )
+    # A keyed candidate's check must have read its keyed rows. A check by code
+    # from before bindings records no namespace and reads the 3-part rows; the
+    # candidate may have been bound keyed and refilled to 'ready' meanwhile,
+    # and that check's final transition compares only the state. A 3-part or
+    # unbound candidate reads the 3-part rows either way.
+    if cutover.identity_namespace is not None:
+        recorded = (cutover.check_report or {}).get("identity_namespace")
+        if recorded != cutover.identity_namespace:
+            raise CutoverRefusedError(
+                f"cutover {cutover.cutover_id} is bound to the keyed namespace "
+                f"{cutover.identity_namespace}, but its check report records "
+                f"{'no namespace' if recorded is None else recorded}: the check did not "
+                "read the candidate's rows; run `cutover rebuild` again"
+            )
     try:
         result = store.promote_cutover(cutover, activated_at=now_iso)
     except EpochCutoverStateError as exc:
