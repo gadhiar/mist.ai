@@ -1,6 +1,11 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-11-06 (**MIST is now a daily general assistant, and the daily instance is
+**Last Updated:** 2026-11-09 (**Extraction epochs are keyed on every setting that changes
+output** (PR 40): see the ExtractionPipeline bullet under Current Status. Deploy step pending: set
+`EXTRACTION_LLM_DEVICE` in `.env`, rebuild the extraction service, restart the backend, then
+confirm the active epoch is bound in `admin status`.)
+
+**PRIOR ENTRY --** 2026-11-06 (**MIST is now a daily general assistant, and the daily instance is
 built.** ADR-042, amended 6 Nov 2026, sets the bar, the order and the power levels; see Current
 Focus.)
 
@@ -941,7 +946,7 @@ PRIOR ENTRY -- 2026-07-31 (R1.4 -- seed-utterance migration + Phase-1 data gate 
 - **LLM ctx_size:** 32K configured on llama-server; effective attention window ~8K (Gemma's trained context). Cluster 6's `context_budget.context_window=8192` default respects this.
 - **StreamingLLMProvider abstraction:** `LlamaServerProvider` (primary), `OllamaProvider` (fallback), optionally wrapped by `InstrumentedStreamingLLMProvider` (Cluster 5) for JSONL observability.
 - **ConversationHandler:** Cluster 3 persona injection + Cluster 6 `ContextBudgetPlanner` + `_build_request` Pydantic-dump helper (Cluster 5). `conversation_max_tokens=1024` (up from 400; Cluster 6 fix for Bug E).
-- **ExtractionPipeline:** 6 stages + Stage 1.5 `SubjectScopeClassifier` (Cluster 1) — classifies each utterance as `user-scope | system-scope | third-party | unknown` between pre-processing and ontology extraction. Metadata threaded into `EXTRACTION_USER_TEMPLATE` as a `subject_scope` hint.
+- **ExtractionPipeline:** 6 stages + Stage 1.5 `SubjectScopeClassifier` (Cluster 1) — classifies each utterance as `user-scope | system-scope | third-party | unknown` between pre-processing and ontology extraction. Metadata threaded into `EXTRACTION_USER_TEMPLATE` as a `subject_scope` hint. **Epoch identity (PR 40, 2026-11-09):** an epoch is keyed on (ontology_version, extraction_version, model_hash) plus a serving identity (`si1-`, computed by the extraction service from every output-changing llama-server setting, placement and GPU included: `backend/knowledge/extraction/serving_identity.py`) and a dispatch identity (`backend/extraction_backlog/dispatch_identity.py`: history messages, the Gate 2 threshold, Gate 3's dedup settings, embedding gates). The binding table `epoch_identity` (`backend/event_store/schema.sql`; logic in `backend/extraction_backlog/binding.py`) records each epoch's bound identities, its identity namespace, its source (promoted, adopted, first-contact or operator) and the evidence the binding verified; the dispatcher refuses a host whose identity differs and names the settings. Existing epochs are adopted at first contact without re-extraction; a settings-only change is a cutover (`backend/extraction_backlog/CUTOVER.md`). Extraction contract 1.3.0 (additive).
 - **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox TTS (the original model) with streaming parallelism. ~4-5s TTFA.
 - **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out.
 - **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation.
