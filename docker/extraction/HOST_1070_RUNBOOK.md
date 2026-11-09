@@ -131,6 +131,9 @@ variable out of `.env` (or empty) selects the working mode. See
 `docker/extraction/README.md`'s "`EXTRACTION_CONSTRAINED_MODE` and the
 `gptoss` default" note for the A/B result.
 
+**`EXTRACTION_LOG_LIST_OUTPUTS` stays out of `.env`** except during a
+dev-lists run, which adds the line and then removes it as step 11 states.
+
 **Out-of-repo timeout override, retirement.** Before this compose passthrough
 landed, `compose.host.yml` had no way to forward `EXTRACTION_LLM_TIMEOUT_SECONDS`
 at all, so the live host set it to `300` via an out-of-repo override file
@@ -374,3 +377,75 @@ and `list_user_max_chars`. A response that still shows `2026-11-06-r6` or
 `2026-06-14-r5`, or has no `run_identity` field, comes from an old image. The
 new extraction version is an epoch cutover for the backend: follow
 `backend/extraction_backlog/CUTOVER.md`.
+
+11. List output log (dev-lists runs only)
+-----------------------------------------
+
+With `EXTRACTION_LOG_LIST_OUTPUTS=true`, the service writes one JSON line to its
+stderr for each list frame and item call attempt that returns a response, a
+cut-short one included:
+
+    {"event": "list_output", "job_id": "<request job_id>", "stage": "frame", "items": [], "attempt": 1, "finish_reason": "stop", "text": "<final text>", "refusal": null}
+
+`stage` is `frame` or `items`, `items` holds the asked item ids (empty for the
+frame call), and `refusal` is the parser's refusal message, or null when the
+output parsed. The r6 path writes no line. The text derives from the utterance,
+so the log is on only for dev-lists runs, whose utterances are synthetic, and off
+for held-out runs and for real turns. `compose.host.yml` forwards the variable
+with default `false`, so the log is off unless `docker/extraction/.env` sets it.
+It changes what the service logs, never what it returns, and it is not a run
+identity component.
+
+11.1 Before it goes on. The lead confirms that the daily path sends this host no
+real-origin turn for the run's window. Then check the service container's log
+driver:
+
+    docker inspect -f '{{.HostConfig.LogConfig.Type}}' mist-extraction-host
+
+It must print `json-file` or `local`, the drivers that delete a container's log
+with the container. If either check fails, the log stays off, the run goes ahead
+without it, and the record notes the gap.
+
+11.2 Turn it on. Add this line to `docker/extraction/.env`:
+
+    EXTRACTION_LOG_LIST_OUTPUTS=true
+
+then recreate the service:
+
+    docker compose -f docker/extraction/compose.host.yml up -d --force-recreate
+
+It stays on for both smoke runs and the full dev-lists run. The prose smoke run
+(one probe of the 60) makes no list call, so it writes no line.
+
+11.3 Copy the run's lines. Write the run's raw `job_id` values, one per line, to
+`job_ids.txt`, then keep only the log lines that carry one of them. Run this in
+bash or Git Bash:
+
+    docker logs mist-extraction-host 2>&1 | grep -F -f job_ids.txt > list_outputs.jsonl
+
+The `2>&1` is required: the handler writes to stderr, and `docker logs` passes a
+container's stderr to its own stderr, which a pipe does not carry. Do not use
+Windows PowerShell 5.1 for this copy: it wraps each merged stderr line in an
+error record, and its redirects write UTF-16 or a byte-order mark, which breaks a
+JSON-lines file. The file must hold at least one `"stage": "frame"` line for each
+probe that took the list path.
+
+11.4 Turn it off. Remove the line from `docker/extraction/.env` and recreate the
+service with the command of 11.2. The recreate removes the old container and,
+under the `json-file` or `local` driver that 11.1 checked, its log. Then check:
+
+    docker exec mist-extraction-host printenv EXTRACTION_LOG_LIST_OUTPUTS
+
+It must print `false`. A count of `docker logs` lines would prove nothing here:
+after the recreate it reads only the new container, which has served no call.
+Any other output stops the session, which reports it before any other run on this
+host.
+
+11.5 Held-out and gate runs. The log stays off. Before the runs, confirm that
+`docker/extraction/.env` holds no `EXTRACTION_LOG_LIST_OUTPUTS=true` line and
+that the `printenv` check of 11.4 prints `false`. After the held-out run, print
+only the count of list output lines, with stderr merged as in 11.3:
+
+    docker logs mist-extraction-host 2>&1 | grep -c '"event": "list_output"'
+
+It must print 0. Nothing from that log is read or copied.
