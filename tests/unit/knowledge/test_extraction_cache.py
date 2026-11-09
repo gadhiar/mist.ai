@@ -10,8 +10,11 @@ from backend.knowledge.extraction_cache import (
     SKIP_EXTRACTION_FAILED,
     SKIP_RATE_LIMITED,
     VALID_SKIP_REASONS,
+    AdoptionRecords,
     ExtractionCache,
+    ServiceRecord,
     cache_key,
+    keyed_namespace,
 )
 
 
@@ -455,3 +458,244 @@ def test_conditional_delete_leaves_a_row_whose_skip_reason_no_longer_matches():
     assert cache.get("e1", "v1", "m1") is not None
     assert cache.delete("e2", "v1", "m1", only_skip_reason=SKIP_EXTRACTION_FAILED) is True
     assert cache.get("e2", "v1", "m1") is None
+
+
+# ---------------------------------------------------------------------------
+# Identity namespace (mist-extraction-epoch-identity T3)
+# ---------------------------------------------------------------------------
+
+NS = "si1-aaa+di1-bbb"
+_AT = {"created_at": "2026-08-18T00:00:00+00:00"}
+
+
+def test_keyed_namespace_joins_the_serving_and_dispatch_identity():
+    assert keyed_namespace("si1-aaa", "di1-bbb") == NS
+
+
+def test_cache_key_with_a_namespace_appends_it_to_the_hashed_string():
+    """A keyed row gets its own key; the 3-part key (pinned above) is unchanged."""
+    keyed = cache_key("evt-1", "v1", "m1", NS)
+
+    assert keyed == hashlib.sha256(f"evt-1|v1|m1|{NS}".encode()).hexdigest()
+    assert keyed != cache_key("evt-1", "v1", "m1")
+    assert cache_key("evt-1", "v1", "m1", None) == cache_key("evt-1", "v1", "m1")
+
+
+def _both_namespaces(cache: ExtractionCache) -> None:
+    """One triple, written once in the 3-part namespace and once keyed."""
+    cache.put("e1", "1.4.0", "v1", "m1", outcome=OUTCOME_EXTRACTED, scope="legacy", **_AT)
+    cache.put(
+        "e1",
+        "1.4.0",
+        "v1",
+        "m1",
+        outcome=OUTCOME_SKIPPED,
+        skip_reason=SKIP_EXTRACTION_FAILED,
+        identity_namespace=NS,
+        **_AT,
+    )
+    cache.put("e2", "1.4.0", "v1", "m1", outcome=OUTCOME_EXTRACTED, identity_namespace=NS, **_AT)
+
+
+class TestNamespaceIsolation:
+    def test_put_writes_two_rows_for_one_triple_in_two_namespaces(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+
+        _both_namespaces(cache)
+
+        rows = cache._get_connection().execute(
+            "SELECT event_id, identity_namespace FROM extraction_cache ORDER BY rowid"
+        )
+        assert [tuple(r) for r in rows] == [("e1", None), ("e1", NS), ("e2", NS)]
+
+    def test_get_reads_only_its_own_namespace(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _both_namespaces(cache)
+
+        legacy = cache.get("e1", "v1", "m1")
+        keyed = cache.get("e1", "v1", "m1", identity_namespace=NS)
+
+        assert (legacy["outcome"], legacy["scope"]) == (OUTCOME_EXTRACTED, "legacy")
+        assert keyed["skip_reason"] == SKIP_EXTRACTION_FAILED
+        assert cache.get("e2", "v1", "m1") is None
+        assert cache.get("e2", "v1", "m1", identity_namespace=NS) is not None
+
+    def test_event_ids_for_scans_only_its_own_namespace(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _both_namespaces(cache)
+
+        assert cache.event_ids_for("v1", "m1") == {"e1": None}
+        assert cache.event_ids_for("v1", "m1", identity_namespace=NS) == {
+            "e1": SKIP_EXTRACTION_FAILED,
+            "e2": None,
+        }
+
+    def test_delete_removes_only_its_own_namespace(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _both_namespaces(cache)
+
+        assert cache.delete("e2", "v1", "m1") is False
+        assert (
+            cache.delete(
+                "e1", "v1", "m1", identity_namespace=NS, only_skip_reason=SKIP_EXTRACTION_FAILED
+            )
+            is True
+        )
+
+        assert cache.get("e1", "v1", "m1") is not None
+        assert cache.get("e1", "v1", "m1", identity_namespace=NS) is None
+        assert cache.get("e2", "v1", "m1", identity_namespace=NS) is not None
+
+    def test_a_pre_namespace_row_reads_in_the_3_part_namespace(self, tmp_path):
+        """A row written before the column existed is NULL, so the 3-part scan keeps it."""
+        import sqlite3
+
+        db = tmp_path / "old.db"
+        _create_pre_phase_1_table(db)
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT INTO extraction_cache (cache_key, event_id, ontology_version, "
+            "extraction_version, model_hash, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cache_key("e-old", "v1", "m1"), "e-old", "1.4.0", "v1", "m1", "{}", "t0"),
+        )
+        conn.commit()
+        conn.close()
+
+        cache = ExtractionCache(str(db))
+        cache.initialize()
+
+        assert cache.event_ids_for("v1", "m1") == {"e-old": None}
+        assert cache.get("e-old", "v1", "m1") is not None
+        assert cache.event_ids_for("v1", "m1", identity_namespace=NS) == {}
+
+
+def _stamped(run_identity: str | None, location: str, adapter: str = "gptoss") -> dict:
+    """`service_stamps` in the shape the dispatcher writes (`ExtractionDispatcher`)."""
+    return {
+        "stamps": {"adapter": adapter, "llama_cpp_build": "b1", "run_identity": run_identity},
+        "location_label": location,
+        "job_id": "j",
+    }
+
+
+def _put_extracted(cache: ExtractionCache, event_id: str, stamps: dict | None, **kwargs) -> None:
+    cache.put(
+        event_id,
+        "1.4.0",
+        kwargs.pop("extraction_version", "v1"),
+        "m1",
+        outcome=OUTCOME_EXTRACTED,
+        service_stamps=stamps,
+        **_AT,
+        **kwargs,
+    )
+
+
+class TestAdoptionRecords:
+    def test_an_empty_pair_has_no_rows_and_no_newest_record(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+
+        records = cache.adoption_records("v1", "m1")
+
+        assert records == AdoptionRecords(
+            rows=0,
+            extracted=0,
+            extracted_without_service_stamps=0,
+            run_identities=(),
+            location_labels=(),
+            newest=None,
+        )
+
+    @pytest.mark.parametrize(
+        "skip_reason",
+        [
+            pytest.param(SKIP_RATE_LIMITED, id="skip-only"),
+            pytest.param(SKIP_EXTRACTION_FAILED, id="dead-letter-only"),
+        ],
+    )
+    def test_a_pair_of_only_skip_rows_counts_rows_but_has_no_newest(self, skip_reason):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        for event_id in ("e1", "e2"):
+            cache.put(
+                event_id,
+                "1.4.0",
+                "v1",
+                "m1",
+                outcome=OUTCOME_SKIPPED,
+                skip_reason=skip_reason,
+                **_AT,
+            )
+
+        records = cache.adoption_records("v1", "m1")
+
+        assert (records.rows, records.extracted, records.newest) == (2, 0, None)
+
+    def test_rows_without_service_stamps_are_counted_and_never_the_newest(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _put_extracted(cache, "e1", None)
+        _put_extracted(cache, "e2", _stamped("ri-1", "host-a"))
+        _put_extracted(cache, "e3", None)
+
+        records = cache.adoption_records("v1", "m1")
+
+        assert (records.extracted, records.extracted_without_service_stamps) == (3, 2)
+        assert records.newest == ServiceRecord(
+            event_id="e2", service_stamps=_stamped("ri-1", "host-a")
+        )
+
+    def test_distinct_run_identities_and_locations_cover_extracted_rows_only(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _put_extracted(cache, "e1", _stamped("ri-1", "host-a"))
+        _put_extracted(cache, "e2", _stamped("ri-2", "host-b"))
+        _put_extracted(cache, "e3", _stamped("ri-1", "host-a"))
+        _put_extracted(cache, "e4", _stamped(None, "host-a"))
+        cache.put(
+            "e5", "1.4.0", "v1", "m1", outcome=OUTCOME_SKIPPED, skip_reason=SKIP_RATE_LIMITED, **_AT
+        )
+
+        records = cache.adoption_records("v1", "m1")
+
+        assert records.rows == 5
+        assert records.run_identities == (None, "ri-1", "ri-2")
+        assert records.location_labels == ("host-a", "host-b")
+
+    def test_a_row_rewritten_by_put_after_a_newer_one_reads_as_the_newest(self):
+        """`INSERT OR REPLACE` reinserts, so the newest write holds the largest rowid."""
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _put_extracted(cache, "e1", _stamped("ri-1", "host-a"))
+        _put_extracted(cache, "e2", _stamped("ri-1", "host-b"))
+        _put_extracted(cache, "e1", _stamped("ri-1", "host-c"))
+
+        records = cache.adoption_records("v1", "m1")
+
+        assert records.newest == ServiceRecord(
+            event_id="e1", service_stamps=_stamped("ri-1", "host-c")
+        )
+        assert records.extracted == 2
+
+    def test_only_the_pairs_3_part_rows_are_summarized(self):
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        _put_extracted(cache, "e1", _stamped("ri-1", "host-a"))
+        _put_extracted(cache, "e2", _stamped("ri-9", "host-z"), identity_namespace=NS)
+        _put_extracted(cache, "e3", _stamped("ri-8", "host-y"), extraction_version="v2")
+
+        records = cache.adoption_records("v1", "m1")
+
+        assert (records.rows, records.run_identities, records.location_labels) == (
+            1,
+            ("ri-1",),
+            ("host-a",),
+        )
+        assert records.newest == ServiceRecord(
+            event_id="e1", service_stamps=_stamped("ri-1", "host-a")
+        )
