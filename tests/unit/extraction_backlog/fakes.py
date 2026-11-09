@@ -17,6 +17,8 @@ methods the backlog uses.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,6 +65,35 @@ def default_payload(req: ExtractRequest) -> tuple[list[dict], list[dict]]:
     return ([{"id": word, "type": "Technology", "name": word.capitalize()}], [])
 
 
+def default_serving_components() -> dict[str, Any]:
+    """A contract 1.3.0 service's flat serving components, in the shape T1 reports them.
+
+    A subset of the real names (`serving_identity.components_dict`): enough for
+    a test to change one setting and see the identity move and the refusal
+    name it.
+    """
+    return {
+        "adapter": "fake",
+        "model_file": "fake.gguf",
+        "llama_cpp_build": "b0",
+        "max_attempts": 2,
+        "scope_enabled": True,
+        "n_ctx": 8192,
+        "request.extract.temperature": 0.0,
+        "request.extract.top_p": 0.9,
+        "request.extract.thinking_effort": "low",
+        "server.ctx_size": "8192",
+        "server.device": "test-gpu",
+        "server.n_cpu_moe": "24",
+    }
+
+
+def serving_identity_of(components: dict[str, Any]) -> str:
+    """The `si1-` identity of `components`, computed the way the service does."""
+    canonical = json.dumps(components, sort_keys=True, separators=(",", ":"))
+    return "si1-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class FakeServiceState:
     """What the fake service reports and does. Mutate it mid-test to change behaviour."""
@@ -74,6 +105,16 @@ class FakeServiceState:
     # Contract 1.2.0: reported on /v1/info and stamped on every result. None
     # answers the way a 1.1.0 service does.
     run_identity: str | None = None
+    # Contract 1.3.0: the serving identity is computed from these on every
+    # call, so mutating one models a restarted service with that setting
+    # changed. `serving_identity_error` set (or `reports_serving_identity`
+    # False, a pre-1.3.0 service) reports no identity.
+    serving_components: dict[str, Any] = field(default_factory=default_serving_components)
+    serving_identity_error: str | None = None
+    reports_serving_identity: bool = True
+    # When set, results are stamped with this serving identity instead of the
+    # computed one: a service that changed between `/v1/info` and the reply.
+    result_serving_identity: str | None = None
     down: bool = False
     # utterance -> errors to answer with, consumed front to back before success.
     fail_script: dict[str, list[tuple[ErrorCode, bool]]] = field(default_factory=dict)
@@ -88,6 +129,13 @@ class FakeServiceState:
     @property
     def received_utterances(self) -> list[str]:
         return [r.utterance for r in self.received]
+
+    @property
+    def serving_identity(self) -> str | None:
+        """The identity `/v1/info` reports now, or None (an error, or a pre-1.3.0 service)."""
+        if not self.reports_serving_identity or self.serving_identity_error is not None:
+            return None
+        return serving_identity_of(self.serving_components)
 
 
 def build_fake_service_app(state: FakeServiceState) -> FastAPI:
@@ -111,6 +159,13 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
             temperature=0.0,
             ctx_size=8192,
             run_identity=state.run_identity,
+            serving_identity=state.serving_identity,
+            serving_identity_components=(
+                dict(state.serving_components) if state.reports_serving_identity else None
+            ),
+            serving_identity_error=(
+                state.serving_identity_error if state.reports_serving_identity else None
+            ),
         )
 
     @app.get("/v1/health")
@@ -126,6 +181,15 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
         if script:
             code, retryable = script.pop(0)
             envelope = error_envelope(code, f"scripted {code.value}", retryable)
+            return JSONResponse(
+                status_code=ERROR_HTTP_STATUS[code], content=envelope.model_dump(mode="json")
+            )
+        expected = req.expect.serving_identity
+        if expected is not None and expected != state.serving_identity:
+            code = ErrorCode.EPOCH_MISMATCH
+            envelope = error_envelope(
+                code, f"serving identity {state.serving_identity} != expected {expected}", False
+            )
             return JSONResponse(
                 status_code=ERROR_HTTP_STATUS[code], content=envelope.model_dump(mode="json")
             )
@@ -147,6 +211,7 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
                 llama_cpp_build="b0",
                 adapter="fake",
                 run_identity=state.run_identity,
+                serving_identity=state.result_serving_identity or state.serving_identity,
             ),
             timings_ms=TimingsMs(scope=1.0, extract=2.0, derive=None, total=3.0),
             attempts=1,
