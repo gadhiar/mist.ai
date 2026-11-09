@@ -236,7 +236,9 @@ class TestComputeServingIdentity:
                 ),
                 id="a-setting-is-added",
             ),
-            pytest.param((("ctx_size", "16384"), ("device", "rtx4070s")), id="a-setting-is-dropped"),
+            pytest.param(
+                (("ctx_size", "16384"), ("device", "rtx4070s")), id="a-setting-is-dropped"
+            ),
         ],
     )
     def test_each_declared_server_setting_moves_the_identity(self, server):

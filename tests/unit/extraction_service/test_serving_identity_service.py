@@ -430,9 +430,7 @@ class TestCapturedRequestsMatchTheProfile:
 
 @pytest.mark.asyncio
 class TestInfoReportsTheServingIdentity:
-    async def test_the_identity_its_components_and_no_error(
-        self, client, service_settings, engine
-    ):
+    async def test_the_identity_its_components_and_no_error(self, client, service_settings, engine):
         components = serving_identity_components(service_settings, engine, FAKE_N_CTX)
 
         data = (await client.get("/v1/info")).json()
