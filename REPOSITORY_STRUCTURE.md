@@ -104,6 +104,7 @@ backend/
 │   ├── embeddings.py            # Sentence Transformers all-MiniLM-L6-v2
 │   ├── extraction/              # 6-stage extraction + subject-scope classifier
 │   │   ├── run_identity.py      # Run identity of the setup behind each result
+│   │   ├── serving_identity.py  # Serving identity an extraction epoch is keyed on
 │   │   └── structure_splitter.py # List, table and heading units for Stage 2
 │   ├── curation/                # Dedup, ReconciliationEngine (reconciliation.py,
 │   │                            #   bitemporal C2; replaced conflict_resolver.py),
