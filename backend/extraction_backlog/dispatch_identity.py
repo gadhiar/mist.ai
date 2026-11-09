@@ -5,7 +5,8 @@ extraction service computes (`backend.knowledge.extraction.serving_identity`),
 and this one, which the backend computes. Its components are the dispatcher's
 history window and the gate settings: a Gate 2 or Gate 3 skip is cached and
 replayed by every rebuild, so a tuned threshold that is not keyed splits cached
-history silently (KNOWN_ISSUES.md, the significance-threshold entry).
+history silently. The resolved significance-threshold entry in KNOWN_ISSUES.md
+records that split.
 
 The rule is the serving identity's: a setting is keyed unless it provably
 cannot change the bytes the model returns or the decision the backend caches.
