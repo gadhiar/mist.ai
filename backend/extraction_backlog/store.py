@@ -3,7 +3,9 @@
 There is no queue table. For the ACTIVE epoch (the latest `epoch_ledger` row):
 
 - a turn is INFERENCE-PENDING when the extraction cache has no row for
-  `cache_key(event_id, epoch.extraction_version, epoch.model_hash)`, marker or not;
+  `cache_key(event_id, epoch.extraction_version, epoch.model_hash,
+  epoch.identity_namespace)`, marker or not (the namespace is None, the 3-part
+  key, until the epoch is bound to a keyed one);
 - a turn is APPLY-PENDING when it has a cache row but no `applied` marker in
   `extraction_applied`;
 - a turn is DONE when it has a cache row AND its marker says `applied`;
@@ -80,6 +82,12 @@ class Epoch:
     candidate's `epoch_id` is `-cutover_id`: the id its service attempts are
     recorded under in `extraction_attempts`, a namespace no ledger row can
     occupy because ledger ids are AUTOINCREMENT and start at 1.
+
+    The four identity fields are the target's binding (`epoch_identity`, or
+    the cutover's binding columns), all None while it is unbound.
+    `identity_namespace` is the cache namespace every cache call for this
+    target uses; None is the 3-part namespace, which is also what an unbound
+    target reads and writes.
     """
 
     epoch_id: int
@@ -87,6 +95,10 @@ class Epoch:
     extraction_version: str
     model_hash: str
     cutover_id: int | None = None
+    serving_identity: str | None = None
+    dispatch_identity: str | None = None
+    identity_namespace: str | None = None
+    identity_source: str | None = None
 
     @property
     def label(self) -> str:
@@ -95,14 +107,23 @@ class Epoch:
             return f"cutover {self.cutover_id} candidate"
         return f"epoch {self.epoch_id}"
 
+    @property
+    def bound(self) -> bool:
+        """True once the target has an identity binding."""
+        return self.serving_identity is not None
+
     @classmethod
-    def from_row(cls, row: dict[str, Any]) -> Epoch:
-        """Build from an `epoch_ledger` row dict."""
+    def from_row(cls, row: dict[str, Any], binding: dict[str, Any] | None = None) -> Epoch:
+        """Build from an `epoch_ledger` row dict and its `epoch_identity` row, if any."""
         return cls(
             epoch_id=int(row["epoch_id"]),
             ontology_version=str(row["ontology_version"]),
             extraction_version=str(row["extraction_version"]),
             model_hash=str(row["model_hash"]),
+            serving_identity=None if binding is None else binding["serving_identity"],
+            dispatch_identity=None if binding is None else binding["dispatch_identity"],
+            identity_namespace=None if binding is None else binding["identity_namespace"],
+            identity_source=None if binding is None else binding["source"],
         )
 
 
@@ -123,16 +144,29 @@ class Cutover:
     check_report: dict[str, Any] | None
     promoted_epoch_id: int | None
     updated_at: str
+    serving_identity: str | None = None
+    dispatch_identity: str | None = None
+    identity_namespace: str | None = None
+    identity_source: str | None = None
+
+    @property
+    def bound(self) -> bool:
+        """True once the candidate has an identity binding."""
+        return self.serving_identity is not None
 
     @property
     def target(self) -> Epoch:
-        """The candidate's stamps as an `Epoch` (epoch_id = -cutover_id)."""
+        """The candidate's stamps and binding as an `Epoch` (epoch_id = -cutover_id)."""
         return Epoch(
             epoch_id=-self.cutover_id,
             ontology_version=self.ontology_version,
             extraction_version=self.extraction_version,
             model_hash=self.model_hash,
             cutover_id=self.cutover_id,
+            serving_identity=self.serving_identity,
+            dispatch_identity=self.dispatch_identity,
+            identity_namespace=self.identity_namespace,
+            identity_source=self.identity_source,
         )
 
     def epoch_dict(self) -> dict[str, Any]:
@@ -141,6 +175,8 @@ class Cutover:
         `activated_at` is the cutover's `requested_at`, a constant: the
         regenerator stamps the seed-apply with it, and two rebuilds must stamp
         identically or the rebuild-twice gate fails on clock noise.
+        `identity_namespace` is the namespace the rebuild must read the
+        candidate's rows from (None: the 3-part one).
         """
         return {
             "epoch_id": -self.cutover_id,
@@ -148,6 +184,7 @@ class Cutover:
             "extraction_version": self.extraction_version,
             "model_hash": self.model_hash,
             "activated_at": self.requested_at,
+            "identity_namespace": self.identity_namespace,
         }
 
     @classmethod
@@ -172,16 +209,26 @@ class Cutover:
                 None if row.get("promoted_epoch_id") is None else int(row["promoted_epoch_id"])
             ),
             updated_at=str(row["updated_at"]),
+            serving_identity=row.get("serving_identity"),
+            dispatch_identity=row.get("dispatch_identity"),
+            identity_namespace=row.get("identity_namespace"),
+            identity_source=row.get("binding_source"),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class FillScan:
-    """How far a cutover candidate's re-extraction of the log has got."""
+    """How far a cutover candidate's re-extraction of the log has got.
+
+    `bound` is whether the candidate had an identity binding when scanned; an
+    unbound candidate's coverage is what the 3-part namespace holds for it (or
+    0, see `BacklogStore.fill_scan`), not yet a namespace of its own.
+    """
 
     head: PendingTurn | None
     covered: int
     total: int
+    bound: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,9 +338,18 @@ class BacklogStore:
     # -- epoch / activation ----------------------------------------------------
 
     def active_epoch(self) -> Epoch | None:
-        """The latest epoch in the ledger, or None when the ledger is empty."""
+        """The latest epoch in the ledger with its binding, or None when the ledger is empty."""
         row = self._events.get_current_epoch()
-        return Epoch.from_row(row) if row is not None else None
+        if row is None:
+            return None
+        return Epoch.from_row(row, self._events.get_epoch_identity(int(row["epoch_id"])))
+
+    def get_epoch(self, epoch_id: int) -> Epoch | None:
+        """One ledger epoch with its binding (a candidate's source epoch, say), or None."""
+        row = self._events.get_epoch(epoch_id)
+        if row is None:
+            return None
+        return Epoch.from_row(row, self._events.get_epoch_identity(epoch_id))
 
     def get_activation(self, epoch: Epoch) -> Activation | None:
         """The stored first-activation floor for `epoch`, or None before activation."""
@@ -326,7 +382,7 @@ class BacklogStore:
         if existing is not None:
             return existing
         keys = self._events.list_turn_keys_in_replay_order()
-        cached = self._cache.event_ids_for(epoch.extraction_version, epoch.model_hash)
+        cached = self._cached_ids(epoch)
         applied = [k["event_id"] for k in keys if k["event_id"] in cached]
         legacy = [k["event_id"] for k in keys if k["event_id"] not in cached]
         created = self._events.record_extraction_activation(
@@ -375,9 +431,20 @@ class BacklogStore:
         `list_turn_keys_in_replay_order` the active backlog uses), so the
         candidate re-extracts the whole log from the beginning, in log order,
         and a turn logged mid-fill is reached in its place.
+
+        A bound candidate is scanned in its own namespace. An unbound one is
+        scanned in the 3-part namespace, as before bindings existed, with one
+        exception: a candidate whose triple equals its source epoch's (a
+        settings-change candidate) reports covered 0 with the first logged
+        turn as head, because the 3-part rows of that triple are the source
+        epoch's, not the candidate's. It never raises: an unbound or
+        source-less candidate still scans, so status readers keep working.
         """
         keys = self._events.list_turn_keys_in_replay_order()
-        cached = self._cache.event_ids_for(cutover.extraction_version, cutover.model_hash)
+        if not cutover.bound and self._is_settings_change(cutover):
+            cached: dict[str, str | None] = {}
+        else:
+            cached = self._cached_ids(cutover.target)
         head: PendingTurn | None = None
         covered = 0
         for key in keys:
@@ -392,7 +459,28 @@ class BacklogStore:
                     cached=False,
                     curated=False,
                 )
-        return FillScan(head=head, covered=covered, total=len(keys))
+        return FillScan(head=head, covered=covered, total=len(keys), bound=cutover.bound)
+
+    def _is_settings_change(self, cutover: Cutover) -> bool:
+        """True when the candidate's triple equals its source epoch's."""
+        if cutover.source_epoch_id is None:
+            return False
+        source = self._events.get_epoch(cutover.source_epoch_id)
+        if source is None:
+            return False
+        return (
+            source["ontology_version"],
+            source["extraction_version"],
+            source["model_hash"],
+        ) == (cutover.ontology_version, cutover.extraction_version, cutover.model_hash)
+
+    def _cached_ids(self, target: Epoch) -> dict[str, str | None]:
+        """The target's cached event ids in its own namespace (see `ExtractionCache`)."""
+        return self._cache.event_ids_for(
+            target.extraction_version,
+            target.model_hash,
+            identity_namespace=target.identity_namespace,
+        )
 
     def begin_cutover(
         self,
@@ -462,7 +550,7 @@ class BacklogStore:
     def scan(self, epoch: Epoch) -> BacklogScan:
         """The backlog for `epoch`; a marker counts only beside a cache row (see retry)."""
         keys = self._events.list_turn_keys_in_replay_order()
-        cached = self._cache.event_ids_for(epoch.extraction_version, epoch.model_hash)
+        cached = self._cached_ids(epoch)
         applied = self._events.get_extraction_applied(epoch.epoch_id)
         legacy = self._events.get_extraction_legacy_turns(epoch.epoch_id)
 
@@ -525,11 +613,16 @@ class BacklogStore:
         return messages[-limit:] if limit > 0 else []
 
     def get_cached(self, turn_event_id: str, epoch: Epoch) -> dict[str, Any] | None:
-        """The turn's cached decision under the epoch's stamps, or None."""
-        return self._cache.get(turn_event_id, epoch.extraction_version, epoch.model_hash)
+        """The turn's cached decision under the epoch's stamps and namespace, or None."""
+        return self._cache.get(
+            turn_event_id,
+            epoch.extraction_version,
+            epoch.model_hash,
+            identity_namespace=epoch.identity_namespace,
+        )
 
     def put_skip(self, event_id: str, epoch: Epoch, *, skip_reason: str, created_at: str) -> None:
-        """Record a gate skip or a dead-letter under the epoch's stamps."""
+        """Record a gate skip or a dead-letter under the epoch's stamps and namespace."""
         self._cache.put(
             event_id,
             epoch.ontology_version,
@@ -538,6 +631,7 @@ class BacklogStore:
             outcome=OUTCOME_SKIPPED,
             skip_reason=skip_reason,
             created_at=created_at,
+            identity_namespace=epoch.identity_namespace,
         )
 
     def put_extracted(
@@ -567,6 +661,7 @@ class BacklogStore:
             scope_confidence=scope_confidence,
             derivation=derivation,
             service_stamps=service_stamps,
+            identity_namespace=epoch.identity_namespace,
         )
 
     def progress(self, turn: PendingTurn, epoch: Epoch, *, now_iso) -> TurnProgress:
@@ -624,7 +719,7 @@ class BacklogStore:
 
     def list_dead_letters(self, epoch: Epoch) -> list[str]:
         """Event ids dead-lettered under `epoch`, in replay order."""
-        cached = self._cache.event_ids_for(epoch.extraction_version, epoch.model_hash)
+        cached = self._cached_ids(epoch)
         return [
             k["event_id"]
             for k in self._events.list_turn_keys_in_replay_order()
@@ -728,6 +823,7 @@ class BacklogStore:
             epoch.extraction_version,
             epoch.model_hash,
             only_skip_reason=SKIP_EXTRACTION_FAILED,
+            identity_namespace=epoch.identity_namespace,
         )
 
 
