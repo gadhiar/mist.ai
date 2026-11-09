@@ -525,7 +525,10 @@ def create_app(
 
         # The serving identity is computed for this job, from a fresh /props
         # read. Without a context size there is no identity to check or stamp,
-        # and the job waits for llama-server like a loading model does.
+        # and the job waits for llama-server like a loading model does. This
+        # runs before the stored-job replay below, so a job this process
+        # already holds is also answered 503 while /props is unreadable.
+        # Whether /props answers during a model load is not verified.
         view = await serving_view()
         if view.props.n_ctx is None:
             return _error_response(
@@ -540,8 +543,9 @@ def create_app(
             )
 
         # A job already stored or in flight needs no model: answer it (or
-        # join it) even while llama-server reloads, rather than 503 a result
-        # this process already holds or is about to have.
+        # join it) even while the health probe reports llama-server not
+        # ready, rather than 503 a result this process already holds or is
+        # about to have. The /props read above still applies to it.
         if not cache.knows(req.job_id):
             probe_result = await health_probe.check()
             if probe_result.status != "ok":
