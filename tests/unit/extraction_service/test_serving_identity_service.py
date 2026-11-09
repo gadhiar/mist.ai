@@ -234,7 +234,7 @@ _VARIANTS = [
 
 class TestAgreementWithTheRunIdentity:
     def test_the_shared_fields(self):
-        assert _SHARED_FIELDS == ["adapter", "llama_cpp_build", "max_attempts", "scope_enabled"]
+        assert ["adapter", "llama_cpp_build", "max_attempts", "scope_enabled"] == _SHARED_FIELDS
 
     @pytest.mark.parametrize("change", _VARIANTS)
     def test_every_shared_field_has_the_same_value(self, service_settings, wired_llm, change):
