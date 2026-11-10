@@ -85,7 +85,7 @@ from backend.knowledge.extraction.structure_splitter import (
     split_structured,
 )
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
-from backend.llm.models import LLMRequest
+from backend.llm.models import LLMRequest, LLMResponse
 from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
@@ -442,6 +442,53 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def repetition_flag(
+    text: str, *, tail_chars: int = 2000, probe_chars: int = 200, min_count: int = 3
+) -> bool:
+    """True when the last `probe_chars` of `text`'s tail occur `min_count` times in that tail.
+
+    The tail is the last `tail_chars` characters. A model stuck in a loop
+    repeats its last stretch of text, so any loop whose period is at most
+    `tail_chars / min_count` characters (about 666 at the defaults) is
+    flagged, while text still making progress is not. Occurrences may
+    overlap, so a loop shorter than the probe counts every repetition.
+    """
+    tail = text[-tail_chars:]
+    if len(tail) < probe_chars:
+        return False
+    probe = tail[-probe_chars:]
+    count = 0
+    start = tail.find(probe)
+    while start != -1:
+        count += 1
+        if count >= min_count:
+            return True
+        start = tail.find(probe, start + 1)
+    return False
+
+
+def _log_length_stop(request: LLMRequest, response: LLMResponse) -> None:
+    """Log a call that stopped at its cap: counts and the repetition flag, never text.
+
+    The cap names the stage, since the three caps differ at every effort. The
+    response text stays out of the log because production turns are real
+    conversations; the flag is what tells a repetition loop from reasoning
+    that was still progressing when the cap cut it.
+    """
+    reasoning = response.reasoning_content or ""
+    content = response.content or ""
+    completion_tokens = None if response.usage is None else response.usage.completion_tokens
+    logger.warning(
+        "extraction length stop: cap %d completion_tokens %s reasoning_chars %d "
+        "content_chars %d repeat %s",
+        request.max_tokens,
+        completion_tokens,
+        len(reasoning),
+        len(content),
+        "true" if repetition_flag(reasoning[-2000:] + content) else "false",
+    )
+
+
 def _profile_of(stage: str, request: LLMRequest) -> StageRequestProfile:
     """The output-changing fields of `request`, read as the provider sends them.
 
@@ -645,14 +692,21 @@ class ExtractionEngine:
     async def _invoke(self, request: LLMRequest):
         """Invoke the LLM under the configured timeout.
 
+        A response that stopped at its output cap is logged (`_log_length_stop`)
+        before it is returned, so before the stage that called raises, retries
+        or degrades on it.
+
         Raises:
             TimeoutError: The call exceeded `settings.llm_timeout_seconds`.
             openai.APIError / LLMConnectionError / LLMResponseError: The
                 transport or provider failed.
         """
-        return await asyncio.wait_for(
+        response = await asyncio.wait_for(
             self._llm.invoke(request), timeout=self._settings.llm_timeout_seconds
         )
+        if response.finish_reason == "length":
+            _log_length_stop(request, response)
+        return response
 
     async def _run_scope(
         self, pre_processed: PreProcessedInput, warnings: list[str]
