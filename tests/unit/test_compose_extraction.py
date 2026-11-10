@@ -347,20 +347,19 @@ class TestLlamaServerPins:
         assert "-ncmoe" in command
         assert "EXTRACTION_LOCAL_NCMOE" in command[command.index("-ncmoe") + 1]
 
-    def test_ncmoe_default_is_24(self) -> None:
-        # gpt-oss-20b's block_count is verified as 24 via GGUF metadata (the
-        # host build's finding); 24 means "all experts on CPU", replacing the
-        # previous unverified 999 sentinel.
+    def test_ncmoe_default_is_9(self) -> None:
+        # Medium is the deployed effort: H13 ran it at offload 9 on the 4070
+        # SUPER with the chat stack down. 24 (all experts on CPU) is the shell
+        # override for a low-effort run beside the main stack.
         command = _command(_local_llm())
         value = command[command.index("-ncmoe") + 1]
-        assert value == "${EXTRACTION_LOCAL_NCMOE:-24}", value
+        assert value == "${EXTRACTION_LOCAL_NCMOE:-9}", value
 
-    def test_ctx_size_default_is_16384(self) -> None:
-        # A real /v1/extract probe needed 9162 prompt tokens plus
-        # max_tokens=2048 from the extraction engine, exceeding the old 8192
-        # default.
+    def test_ctx_size_default_is_65536(self) -> None:
+        # Medium's extract cap (32,768) plus the prompt reserve needs more
+        # than 16,384; H13 ran medium at 65,536.
         env = _env_dict(_local_llm())
-        assert env["LLAMA_ARG_CTX_SIZE"] == "${EXTRACTION_LLM_CTX_SIZE:-16384}", env[
+        assert env["LLAMA_ARG_CTX_SIZE"] == "${EXTRACTION_LLM_CTX_SIZE:-65536}", env[
             "LLAMA_ARG_CTX_SIZE"
         ]
 
@@ -371,11 +370,18 @@ class TestServiceEnvPassthrough:
     them, even though README.md documented them as operator-settable).
     """
 
-    def test_llm_timeout_seconds_is_forwarded_with_120_default(self) -> None:
+    def test_llm_timeout_seconds_is_forwarded_with_1800_default(self) -> None:
+        # One capped medium extract call costs about 651 s, past 120.
         env = _env_dict(_services()["mist-extraction-local"])
         assert (
-            env["EXTRACTION_LLM_TIMEOUT_SECONDS"] == "${EXTRACTION_LLM_TIMEOUT_SECONDS:-120}"
+            env["EXTRACTION_LLM_TIMEOUT_SECONDS"] == "${EXTRACTION_LLM_TIMEOUT_SECONDS:-1800}"
         ), env["EXTRACTION_LLM_TIMEOUT_SECONDS"]
+
+    def test_reasoning_effort_is_forwarded_with_medium_default(self) -> None:
+        env = _env_dict(_services()["mist-extraction-local"])
+        assert env["EXTRACTION_REASONING_EFFORT"] == "${EXTRACTION_REASONING_EFFORT:-medium}", env[
+            "EXTRACTION_REASONING_EFFORT"
+        ]
 
     def test_max_attempts_is_forwarded_with_2_default(self) -> None:
         env = _env_dict(_services()["mist-extraction-local"])
@@ -436,6 +442,13 @@ class TestDeclaredServerSettings:
     def test_ctx_size_is_the_expression_that_feeds_llama_server(self) -> None:
         declared = _server_declarations(_local_extraction())
         assert declared["CTX_SIZE"] == _env_dict(_local_llm())["LLAMA_ARG_CTX_SIZE"]
+
+    def test_the_medium_defaults_are_declared(self) -> None:
+        # The declarations carry the deployed defaults, not only the same
+        # expression: the serving identity is keyed on what they resolve to.
+        declared = _server_declarations(_local_extraction())
+        assert declared["CTX_SIZE"] == "${EXTRACTION_LLM_CTX_SIZE:-65536}"
+        assert declared["N_CPU_MOE"] == "${EXTRACTION_LOCAL_NCMOE:-9}"
 
     def test_the_device_is_required_with_no_default(self) -> None:
         assert device_problems(_local_extraction()) == []

@@ -18,8 +18,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-# The compose default (`EXTRACTION_LLM_CTX_SIZE`), which fits low effort's
-# extract cap and prompt reserve, so a fake-backed service has a serving identity.
+# Low effort's context, the `EXTRACTION_LLM_CTX_SIZE` a run beside the main
+# stack sets (the compose default is medium's 65,536). It fits low's extract
+# cap and the prompt reserve, so a fake-backed service at low effort has a
+# serving identity.
 FAKE_N_CTX = 16384
 
 
