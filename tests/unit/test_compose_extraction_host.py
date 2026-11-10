@@ -33,6 +33,14 @@ from pathlib import Path
 
 import yaml
 
+from tests.unit.test_compose_extraction import (
+    EXPECTED_SERVER_DECLARATIONS,
+    SERVER_ENV_PREFIX,
+    declaration_problems,
+    device_problems,
+    model_path_problems,
+    required_server_keys,
+)
 from tests.unit.test_compose_pins import DIGEST_PATTERN, PINNED_IMAGE
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -249,6 +257,51 @@ class TestModelHashRequired:
             r"\$\{EXTRACTION_MODEL_HASH:\?", value
         ), f"EXTRACTION_MODEL_HASH must use ${{VAR:?msg}}, got {value!r}"
         assert ":-" not in value, "EXTRACTION_MODEL_HASH must not have a default"
+
+
+def _server_declarations(extraction: dict) -> dict[str, str]:
+    return {
+        key[len(SERVER_ENV_PREFIX) :]: value
+        for key, value in _env_dict(extraction).items()
+        if key.startswith(SERVER_ENV_PREFIX)
+    }
+
+
+class TestDeclaredServerSettings:
+    """The host service declares every keyed setting of its llama-server (MIS-196).
+
+    The checker and its exclusion table live in test_compose_extraction.py, so
+    both files are held to one table; that file also tests the checker itself.
+    """
+
+    def test_every_llama_server_setting_is_declared_or_excluded(self) -> None:
+        assert declaration_problems(_host_llm(), _host_extraction()) == []
+
+    def test_the_declared_names_are_the_keyed_set(self) -> None:
+        assert set(_server_declarations(_host_extraction())) == EXPECTED_SERVER_DECLARATIONS
+
+    def test_the_image_repeats_the_llama_server_image(self) -> None:
+        declared = _server_declarations(_host_extraction())
+        assert declared["IMAGE"] == _host_llm()["image"] == PINNED_IMAGE
+
+    def test_ctx_size_is_the_expression_that_feeds_llama_server(self) -> None:
+        declared = _server_declarations(_host_extraction())
+        assert declared["CTX_SIZE"] == _env_dict(_host_llm())["LLAMA_ARG_CTX_SIZE"]
+
+    def test_n_cpu_moe_is_the_host_expression(self) -> None:
+        declared = _server_declarations(_host_extraction())
+        assert declared["N_CPU_MOE"] == "${EXTRACTION_HOST_NCMOE:-24}"
+
+    def test_the_device_is_required_with_no_default(self) -> None:
+        assert device_problems(_host_extraction()) == []
+
+    def test_the_model_path_is_pinned_to_the_model_file(self) -> None:
+        assert model_path_problems(_host_llm(), _host_extraction()) == []
+
+    def test_every_required_server_key_is_declared(self) -> None:
+        declared = _server_declarations(_host_extraction())
+        for key in required_server_keys():
+            assert declared.get(key.upper()), f"{SERVER_ENV_PREFIX}{key.upper()} is empty"
 
 
 class TestHostCudaCache:

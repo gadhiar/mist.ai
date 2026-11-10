@@ -8,6 +8,10 @@ behind `httpx.ASGITransport`) without touching a real network.
 `LlamaServerProvider` and a real health probe from `EXTRACTION_*` env vars;
 `build_app()` is the wiring it runs, given the provider and HTTP client, and
 the place the run identity is computed, once per process.
+
+The serving identity, by contrast, is computed on every `/v1/info` and
+`/v1/extract` call, because one of its components, llama-server's context
+size, is observed through `/props` for each call rather than configured.
 """
 
 from __future__ import annotations
@@ -54,11 +58,18 @@ from backend.extraction_service.engine import (
     _compute_prompt_sha256,
     parse_recorded_at,
 )
-from backend.extraction_service.settings import ServiceSettings
+from backend.extraction_service.settings import SERVER_ENV_PREFIX, ServiceSettings
 from backend.knowledge.extraction.run_identity import (
     RunIdentityComponents,
     code_sha256,
     compute_run_identity,
+)
+from backend.knowledge.extraction.serving_identity import (
+    REQUIRED_SERVER_KEYS,
+    ServingIdentityComponents,
+    components_dict,
+    compute_serving_identity,
+    diff_components,
 )
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from backend.llm.llama_server_provider import LlamaServerProvider
@@ -116,11 +127,25 @@ class LlamaHealthProbe:
         return HealthProbeResult(status="degraded", llm_reachable=False)
 
 
+@dataclass(frozen=True, slots=True)
+class PropsRead:
+    """One read of llama-server's context window.
+
+    Attributes:
+        n_ctx: The context size `/props` reported, or None when it could not
+            be read.
+        error: Why `n_ctx` is None; None when it was read.
+    """
+
+    n_ctx: int | None
+    error: str | None = None
+
+
 class ContextSizeSource(Protocol):
     """Contract for reading the configured llama-server's context window."""
 
-    async def ctx_size(self) -> int | None:
-        """Return llama-server's `n_ctx`, or None when it cannot be read."""
+    async def read(self) -> PropsRead:
+        """Read llama-server's `n_ctx` now, or say why it cannot be read."""
         ...
 
 
@@ -131,40 +156,39 @@ class LlamaPropsContextSize:
     `LlamaServerProvider.server_context_size` and
     `backend.factories._probe_llama_server_n_ctx` parse.
 
-    Every fetch runs under one lock. On success the value is cached for the
-    life of the process: concurrent first calls queued on the lock find it
-    cached and make no request of their own, and every later `/v1/info`
-    call is served from the cache.
+    Every read fetches: nothing is kept once a fetch has finished, so a
+    llama-server restarted with another context size is seen on the next
+    call. The context size is part of the serving identity, which keys an
+    extraction epoch, so a stale value would stamp results with a setup that
+    no longer runs. The cost is one GET per `/v1/info` and `/v1/extract`
+    call, milliseconds against a job of seconds.
 
-    A failed read (transport error, non-2xx, a body without an int `n_ctx`)
-    is NOT cached: that call returns None. So a service that starts before
-    its llama-server has loaded reports the real value once llama-server is
-    up, rather than None forever. The cost is that under a failing `/props`
-    each caller waiting on the lock retries in turn: N concurrent calls make
-    N sequential requests, each bounded by `timeout`, so the last of them
-    can wait up to N * `timeout`.
+    Concurrent reads share the fetch in flight, failed or not, so N callers
+    at once make one request bounded by `timeout`. Each caller waits through
+    `asyncio.shield`: a caller cancelled mid-fetch stops waiting, and the
+    fetch carries on for the others.
     """
 
     def __init__(self, http_client: httpx.AsyncClient, base_url: str, timeout: float = 2.0) -> None:
         self._client = http_client
         self._base_url = base_url
         self._timeout = timeout
-        self._cached: int | None = None
-        self._lock = asyncio.Lock()
+        self._in_flight: asyncio.Task[PropsRead] | None = None
 
-    async def ctx_size(self) -> int | None:
-        """Return the cached `n_ctx`, fetching it first if nothing is cached."""
-        if self._cached is not None:
-            return self._cached
-        async with self._lock:
-            if self._cached is not None:
-                return self._cached
-            try:
-                self._cached = await self._fetch()
-            except (LLMConnectionError, LLMResponseError) as exc:
-                logger.warning("llama-server context size unavailable; ctx_size=null: %s", exc)
-                return None
-            return self._cached
+    async def read(self) -> PropsRead:
+        """Join the fetch in flight, or start one when none is."""
+        fetch = self._in_flight
+        if fetch is None or fetch.done():
+            fetch = asyncio.ensure_future(self._read_once())
+            self._in_flight = fetch
+        return await asyncio.shield(fetch)
+
+    async def _read_once(self) -> PropsRead:
+        try:
+            return PropsRead(n_ctx=await self._fetch())
+        except (LLMConnectionError, LLMResponseError) as exc:
+            logger.warning("llama-server context size unavailable; ctx_size=null: %s", exc)
+            return PropsRead(n_ctx=None, error=str(exc))
 
     async def _fetch(self) -> int:
         """GET `{base_url}/props` and return `default_generation_settings.n_ctx`.
@@ -331,6 +355,90 @@ def run_identity_components(
     )
 
 
+def serving_identity_components(
+    settings: ServiceSettings, engine: ExtractionEngine, n_ctx: int
+) -> ServingIdentityComponents:
+    """The serving identity's components for `engine` running `settings`, at `n_ctx`.
+
+    The request profile comes from the engine's own stage builders, so it is
+    what each stage sends; the adapter is the one the engine runs. Every other
+    value is read from `settings`, and `n_ctx` is what `/props` reported for
+    this call.
+    """
+    return ServingIdentityComponents(
+        adapter=engine.adapter_name,
+        model_file=settings.model_file,
+        llama_cpp_build=settings.llama_cpp_build,
+        max_attempts=settings.max_attempts,
+        scope_enabled=settings.scope_enabled,
+        requests=engine.request_profile(),
+        server=tuple(sorted(settings.server_config)),
+        n_ctx=n_ctx,
+    )
+
+
+def _serving_identity_error(settings: ServiceSettings, props: PropsRead) -> str | None:
+    """Why the service has no serving identity for this call, or None when it has one."""
+    declared = dict(settings.server_config)
+    problems: list[str] = []
+    missing = [key for key in REQUIRED_SERVER_KEYS if not declared.get(key)]
+    if missing:
+        names = ", ".join(SERVER_ENV_PREFIX + key.upper() for key in missing)
+        problems.append(f"declared llama-server settings missing: {names}")
+    if props.n_ctx is None:
+        problems.append(f"llama-server /props unreadable: {props.error}")
+    elif declared.get("ctx_size"):
+        ctx_size = declared["ctx_size"]
+        try:
+            matches = int(ctx_size) == props.n_ctx
+        except ValueError:
+            problems.append(f"declared ctx_size {ctx_size!r} is not an integer")
+        else:
+            if not matches:
+                problems.append(f"declared ctx_size {ctx_size} != observed n_ctx {props.n_ctx}")
+    return "; ".join(problems) or None
+
+
+@dataclass(frozen=True, slots=True)
+class _ServingView:
+    """The serving identity of one call, as `/v1/info` reports it."""
+
+    props: PropsRead
+    identity: str | None
+    components: dict[str, str | int | float | bool | None] | None
+    error: str | None
+
+
+class _SeenIdentities:
+    """The components of each serving identity this process has reported, newest last.
+
+    A request names its expected identity by hash alone, so the service can
+    say which settings differ only for an identity it computed itself: in one
+    process the declarations are fixed, and the observed `n_ctx` is what
+    moves, when llama-server restarts with another context size. Bounded,
+    because each new context size adds an entry.
+    """
+
+    def __init__(self, maxsize: int = 32) -> None:
+        self._maxsize = maxsize
+        self._components: OrderedDict[str, dict[str, str | int | float | bool | None]] = (
+            OrderedDict()
+        )
+
+    def remember(
+        self, identity: str, components: dict[str, str | int | float | bool | None]
+    ) -> None:
+        """Record `identity`'s components, evicting the oldest past `maxsize`."""
+        self._components[identity] = components
+        self._components.move_to_end(identity)
+        while len(self._components) > self._maxsize:
+            self._components.popitem(last=False)
+
+    def components_of(self, identity: str) -> dict[str, str | int | float | bool | None]:
+        """The components of `identity`, or an empty mapping when it was never seen here."""
+        return self._components.get(identity, {})
+
+
 def create_app(
     settings: ServiceSettings,
     engine: ExtractionEngine,
@@ -344,7 +452,9 @@ def create_app(
         settings: Service configuration.
         engine: The engine that runs each job.
         health_probe: Reads llama-server's readiness.
-        ctx_size_source: Reads llama-server's context window.
+        ctx_size_source: Reads llama-server's context window, once per
+            `/v1/info` and `/v1/extract` call, for `ctx_size` and the serving
+            identity.
         run_identity: The components of the run identity `engine` stamps,
             reported on `/v1/info`. None reports no run identity.
 
@@ -362,7 +472,22 @@ def create_app(
     identity_components = None if run_identity is None else dataclasses.asdict(run_identity)
     app = FastAPI(title="MIST extraction service")
     cache = _IdempotencyCache(maxsize=settings.idempotency_cache_size)
+    seen = _SeenIdentities()
     started_at = time.monotonic()
+
+    async def serving_view() -> _ServingView:
+        # Read for every call: the context size is observed, never cached.
+        props = await ctx_size_source.read()
+        error = _serving_identity_error(settings, props)
+        if props.n_ctx is None:
+            return _ServingView(props=props, identity=None, components=None, error=error)
+        components = serving_identity_components(settings, engine, props.n_ctx)
+        flat = components_dict(components)
+        identity = None
+        if error is None:
+            identity = compute_serving_identity(components)
+            seen.remember(identity, flat)
+        return _ServingView(props=props, identity=identity, components=flat, error=error)
 
     @app.exception_handler(RequestValidationError)
     async def _on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -398,9 +523,29 @@ def create_app(
         except InvalidRequestError as exc:
             return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
 
+        # The serving identity is computed for this job, from a fresh /props
+        # read. Without a context size there is no identity to check or stamp,
+        # and the job waits for llama-server like a loading model does. This
+        # runs before the stored-job replay below, so a job this process
+        # already holds is also answered 503 while /props is unreadable.
+        # Whether /props answers during a model load is not verified.
+        view = await serving_view()
+        if view.props.n_ctx is None:
+            return _error_response(
+                ErrorCode.MODEL_LOADING,
+                f"llama-server context size unavailable: {view.error}",
+            )
+        expected = req.expect.serving_identity
+        if expected is not None and expected != view.identity:
+            return _error_response(
+                ErrorCode.EPOCH_MISMATCH,
+                _serving_mismatch_message(expected, view, seen.components_of(expected)),
+            )
+
         # A job already stored or in flight needs no model: answer it (or
-        # join it) even while llama-server reloads, rather than 503 a result
-        # this process already holds or is about to have.
+        # join it) even while the health probe reports llama-server not
+        # ready, rather than 503 a result this process already holds or is
+        # about to have. The /props read above still applies to it.
         if not cache.knows(req.job_id):
             probe_result = await health_probe.check()
             if probe_result.status != "ok":
@@ -411,7 +556,9 @@ def create_app(
 
         request_start = time.perf_counter()
         try:
-            response = await cache.get_or_run(req.job_id, lambda: engine.run(req))
+            response = await cache.get_or_run(
+                req.job_id, lambda: engine.run(req, serving_identity=view.identity)
+            )
         except InvalidRequestError as exc:
             # Checked above; kept so the engine's own refusal is never a 500.
             return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
@@ -485,6 +632,7 @@ def create_app(
     @app.get("/v1/info")
     async def info() -> InfoResponse:
         """Report this service's identity, version stamps and serving config."""
+        view = await serving_view()
         return InfoResponse(
             contract_version=CONTRACT_VERSION,
             extraction_version=EXTRACTION_VERSION,
@@ -496,12 +644,42 @@ def create_app(
             constrained_mode=_effective_constrained_mode(settings, engine.adapter_name),
             reasoning_effort=settings.reasoning_effort,
             temperature=settings.temperature,
-            ctx_size=await ctx_size_source.ctx_size(),
+            ctx_size=view.props.n_ctx,
             run_identity=identity,
             run_identity_components=identity_components,
+            serving_identity=view.identity,
+            serving_identity_components=view.components,
+            serving_identity_error=view.error,
         )
 
     return app
+
+
+def _serving_mismatch_message(
+    expected: str,
+    view: _ServingView,
+    expected_components: dict[str, str | int | float | bool | None],
+) -> str:
+    """The 409 message: both identities, why this one is None if it is, and the diff.
+
+    The diff is against the expected identity's components when this process
+    computed that identity; otherwise every component shows `<missing>` on
+    the expected side, and the backend diffs against the components it bound.
+    """
+    parts = [
+        f"expect.serving_identity {expected!r} does not match this service's "
+        f"serving identity {view.identity!r}"
+    ]
+    if view.error is not None:
+        parts.append(f"this service has no serving identity: {view.error}")
+    if not expected_components:
+        parts.append(
+            f"{expected!r} was not computed by this process, so its components are unknown"
+        )
+    diff = diff_components(expected_components, view.components or {})
+    if diff:
+        parts.append("differs in: " + "; ".join(diff))
+    return ". ".join(parts)
 
 
 def build_app(

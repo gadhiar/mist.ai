@@ -56,6 +56,19 @@ FAILURES
   (composed through `compose_model_hash`, never inline).
 - `contract_mismatch`, an incompatible `contract_version`, or an unparsable
   `/v1/info`: state `stalled`.
+- IDENTITY. An epoch or candidate is bound to a serving identity (the
+  service's, `si1-`) and a dispatch identity (this backend's gate and
+  history settings, `dispatch_identity.py`, `di1-`). An unbound one (every
+  epoch at upgrade) is bound at its first usable `/v1/info` contact, after
+  the writer-stamp guard and before its head is acted on, by
+  `binding.decide_binding`; while the service cannot be read it waits in
+  `stalled`. A refused binding (a recorded contradiction for the active
+  epoch, which is never moved to a keyed namespace, or rule 1 for a
+  candidate) is `epoch_mismatch`. Once bound: a service reporting no
+  serving identity is `stalled`; a different one is `epoch_mismatch`, at
+  `/v1/info`, per job (`ExpectStamps.serving_identity`, a 409) and on the
+  reply's stamp; a different dispatch identity is `stalled` before any
+  contact, apply or dispatch. None of these counts an attempt.
 - Job-attributable failures -- retryable `upstream_llm`, `timeout`, or a reply
   that fails validation -- are counted. After `max_attempts` of them (or at
   once, for a NON-retryable `upstream_llm`/`timeout`) the turn is
@@ -148,10 +161,13 @@ from backend.knowledge.extraction.pipeline import (
     ExtractionPipeline,
     TurnToApply,
 )
+from backend.knowledge.extraction.serving_identity import diff_components
 from backend.knowledge.extraction_cache import SKIP_EXTRACTION_FAILED
 
 from . import telemetry
+from .binding import Refuse, binding_is_warning, binding_log_line, decide_binding
 from .cutover import log_transition
+from .dispatch_identity import DispatchIdentity, dispatch_identity_for
 from .errors import (
     ExtractionInferenceError,
     InferenceResponseInvalidError,
@@ -203,6 +219,15 @@ def _now_ms(now: datetime) -> int:
     return int(now.timestamp() * 1000)
 
 
+def _predates_serving_identity(contract_version: str) -> bool:
+    """True for a contract older than 1.3.0, the first to carry a serving identity."""
+    try:
+        major_minor = tuple(int(part) for part in contract_version.split(".")[:2])
+    except ValueError:
+        return False
+    return major_minor < (1, 3)
+
+
 class ExtractionDispatcher:
     """Single-writer consumer of the extraction backlog."""
 
@@ -252,6 +277,13 @@ class ExtractionDispatcher:
         self._embedding_model_name = embedding_model_name
         self._writer_stamps = writer_stamps
         self._writer_mismatch_logged_epoch: int | None = None
+        # Computed once: the gate settings and the history window are fixed
+        # for the life of the pipeline and the settings object.
+        self._dispatch_id: DispatchIdentity = dispatch_identity_for(
+            pipeline.dispatch_gate_settings(), settings
+        )
+        self._dispatch_mismatch_logged: int | None = None
+        self._reason: str | None = None
         self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
         self._on_stop = on_stop
 
@@ -291,6 +323,16 @@ class ExtractionDispatcher:
     def state(self) -> str:
         """Current `ExtractionStatus.state` value."""
         return self._state
+
+    @property
+    def reason(self) -> str | None:
+        """Why the dispatcher is in its current state, as last logged; None when no reason."""
+        return self._reason
+
+    @property
+    def dispatch_identity(self) -> DispatchIdentity:
+        """The backend's dispatch identity (`dispatch_identity.py`), with its components."""
+        return self._dispatch_id
 
     @property
     def running(self) -> bool:
@@ -435,6 +477,7 @@ class ExtractionDispatcher:
                 target_model_hash=cutover.model_hash,
                 covered=fill.covered,
                 total=fill.total,
+                target_serving_identity=cutover.serving_identity,
             )
         return ExtractionStatus(
             state=self._state,  # type: ignore[arg-type]
@@ -515,6 +558,34 @@ class ExtractionDispatcher:
             self._set_state(STATE_STALLED, reason=mismatch)
             return _Wait(self._settings.stall_recheck_s, True)
 
+        # Binding: an unbound epoch (every epoch, at upgrade) is bound at its
+        # first successful `/v1/info` contact, even when the head is cached or
+        # the backlog is empty, because the binding needs the service's
+        # identity. Nothing is applied before it: which rows the epoch reads
+        # depends on the binding's namespace.
+        info: InfoResponse | None = None
+        if not epoch.bound:
+            self._phase = "inference"
+            info_or_wait = await self._check_service(epoch, binding=True)
+            self._phase = "idle"
+            if isinstance(info_or_wait, _Wait):
+                return info_or_wait
+            refused = self._bind(epoch, info_or_wait, cutover=None)
+            if refused is not None:
+                return refused
+            rebound = self._store.get_epoch(epoch.epoch_id)
+            if rebound is None or not rebound.bound:  # pragma: no cover -- just written
+                return None
+            # Re-read: another process may have bound it first, to its own
+            # identity, and then this reply has not been checked against it.
+            epoch = rebound
+            if rebound.serving_identity == info_or_wait.serving_identity:
+                info = info_or_wait
+
+        stalled = self._dispatch_identity_guard(epoch)
+        if stalled is not None:
+            return stalled
+
         scan = self._store.scan(epoch)
         head = scan.head
         if head is None:
@@ -527,11 +598,13 @@ class ExtractionDispatcher:
             return None
 
         self._phase = "inference"
-        info_or_wait = await self._check_service(epoch)
-        if isinstance(info_or_wait, _Wait):
-            return info_or_wait
+        if info is None:
+            info_or_wait = await self._check_service(epoch)
+            if isinstance(info_or_wait, _Wait):
+                return info_or_wait
+            info = info_or_wait
         self._set_state(STATE_WORKING)
-        return await self._dispatch(head, epoch, info_or_wait)
+        return await self._dispatch(head, epoch, info)
 
     async def _fill_step(self, cutover: Cutover) -> _Wait | None:
         """One step of an open cutover: infer the next uncovered turn under the candidate.
@@ -549,16 +622,59 @@ class ExtractionDispatcher:
         When every logged turn has a candidate row the cutover moves
         'filling' -> 'ready'. It keeps filling after that: a turn logged later
         is uncovered again, and is inferred in its place in the log.
+
+        An unbound candidate (one begun before bindings existed, or not yet
+        contacted) is bound first, before its head is acted on, because the
+        binding decides which namespace its coverage is read from. It never
+        moves to 'ready' unbound. A keyed bind of a 'ready' or 'checked'
+        candidate sends it back to 'filling' with its check cleared (in the
+        bind's own transaction, `EventStore.bind_cutover_identity`); that is
+        logged here as a transition.
         """
+        info: InfoResponse | None = None
+        if not cutover.bound:
+            self._phase = "inference"
+            info_or_wait = await self._check_service(cutover.target, binding=True)
+            self._phase = "idle"
+            if isinstance(info_or_wait, _Wait):
+                return info_or_wait
+            refused = self._bind(cutover.target, info_or_wait, cutover=cutover)
+            if refused is not None:
+                return refused
+            rebound = self._store.open_cutover()
+            if rebound is None or rebound.cutover_id != cutover.cutover_id or not rebound.bound:
+                # Promoted or abandoned while it was being bound: rescan.
+                return None
+            if rebound.state != cutover.state:
+                log_transition(
+                    rebound,
+                    cutover.state,
+                    rebound.state,
+                    reason="bound_to_a_keyed_namespace",
+                    check="cleared",
+                )
+                self._notify()
+                self._emit_state(self._state, self._state)
+            cutover = rebound
+            if rebound.serving_identity == info_or_wait.serving_identity:
+                info = info_or_wait
+
         candidate = cutover.target
+        stalled = self._dispatch_identity_guard(candidate)
+        if stalled is not None:
+            return stalled
         fill = self._store.fill_scan(cutover)
         head = fill.head
         if head is None:
-            if cutover.state == "filling" and self._store.transition_cutover(
-                cutover,
-                from_states=("filling",),
-                to_state="ready",
-                updated_at=self._clock().isoformat(),
+            if (
+                fill.bound
+                and cutover.state == "filling"
+                and self._store.transition_cutover(
+                    cutover,
+                    from_states=("filling",),
+                    to_state="ready",
+                    updated_at=self._clock().isoformat(),
+                )
             ):
                 log_transition(cutover, "filling", "ready", covered=fill.covered, total=fill.total)
                 self._notify()
@@ -567,11 +683,13 @@ class ExtractionDispatcher:
             return _Wait(self._settings.idle_poll_s, True)
 
         self._phase = "inference"
-        info_or_wait = await self._check_service(candidate)
-        if isinstance(info_or_wait, _Wait):
-            return info_or_wait
+        if info is None:
+            info_or_wait = await self._check_service(candidate)
+            if isinstance(info_or_wait, _Wait):
+                return info_or_wait
+            info = info_or_wait
         self._set_state(STATE_WORKING)
-        return await self._dispatch(head, candidate, info_or_wait, apply=False)
+        return await self._dispatch(head, candidate, info, apply=False)
 
     # ------------------------------------------------------------------
     # Service / epoch checks
@@ -606,15 +724,31 @@ class ExtractionDispatcher:
             and self._composed(bare_model_hash) == epoch.model_hash
         )
 
-    async def _check_service(self, epoch: Epoch) -> InfoResponse | _Wait:
+    async def _check_service(self, epoch: Epoch, *, binding: bool = False) -> InfoResponse | _Wait:
+        """`/v1/info`, when it matches `epoch` (the active epoch or a candidate); else a wait.
+
+        With `binding`, `epoch` is unbound and this contact is the one that
+        will bind it, so a service that cannot be read stalls with the reason
+        that the binding is waiting, rather than reporting the service down.
+        Every contact needs a serving identity (contract 1.3.0), and once the
+        target is bound the identity must equal its binding's.
+        """
         assert self._inference is not None  # service mode, enforced in __init__
         try:
             info = await self._inference.info()
         except InferenceUnreachableError as exc:
-            return self._unreachable(str(exc))
+            if not binding:
+                return self._unreachable(str(exc))
+            self._consecutive_unreachable += 1
+            self._service = self._service.model_copy(update={"reachable": False})
+            self._set_state(STATE_STALLED, reason=self._not_bound_reason(epoch, str(exc)))
+            return _Wait(self._settings.backoff_s(self._consecutive_unreachable), True)
         except (InferenceServiceError, InferenceResponseInvalidError) as exc:
             self._service = self._service.model_copy(update={"reachable": True})
-            self._set_state(STATE_STALLED, reason=f"/v1/info unusable: {exc}")
+            reason = f"/v1/info unusable: {exc}"
+            if binding:
+                reason = self._not_bound_reason(epoch, reason)
+            self._set_state(STATE_STALLED, reason=reason)
             return _Wait(self._settings.stall_recheck_s, True)
 
         self._consecutive_unreachable = 0
@@ -625,6 +759,7 @@ class ExtractionDispatcher:
             extraction_version=info.extraction_version,
             contract_version=info.contract_version,
             last_health_ms=_now_ms(self._clock()),
+            serving_identity=info.serving_identity,
         )
         if not is_compatible(info.contract_version):
             self._set_state(
@@ -646,7 +781,119 @@ class ExtractionDispatcher:
                 ),
             )
             return _Wait(self._settings.stall_recheck_s, True)
+        if info.serving_identity is None:
+            detail = info.serving_identity_error
+            if detail is None:
+                detail = (
+                    f"contract {info.contract_version} predates 1.3.0"
+                    if _predates_serving_identity(info.contract_version)
+                    else f"contract {info.contract_version} gave no serving_identity_error"
+                )
+            self._set_state(STATE_STALLED, reason=f"service reports no serving identity: {detail}")
+            return _Wait(self._settings.stall_recheck_s, True)
+        if epoch.bound and info.serving_identity != epoch.serving_identity:
+            expected = self._bound_serving_components(epoch)
+            diffs = diff_components(expected, info.serving_identity_components or {})
+            self._set_state(
+                STATE_EPOCH_MISMATCH,
+                reason=(
+                    f"service serving identity {info.serving_identity} != {epoch.label}'s "
+                    f"{epoch.serving_identity}: {'; '.join(diffs) or 'no component differs'}"
+                ),
+            )
+            return _Wait(self._settings.stall_recheck_s, True)
         return info
+
+    @staticmethod
+    def _not_bound_reason(target: Epoch, error: str) -> str:
+        return f"{target.label} is not bound yet: waiting for the extraction service ({error})"
+
+    def _bound_serving_components(self, target: Epoch) -> dict[str, object]:
+        """The serving components `target` is bound to, as stored with its binding."""
+        events = self._store.event_store
+        if target.cutover_id is not None:
+            binding = events.get_cutover_identity(target.cutover_id)
+        else:
+            binding = events.get_epoch_identity(target.epoch_id)
+        if binding is None:  # pragma: no cover -- the caller saw it bound
+            return {}
+        return dict(binding.get("serving_components") or {})
+
+    def _dispatch_identity_guard(self, target: Epoch) -> _Wait | None:
+        """Stall unless the backend's dispatch identity equals the bound target's.
+
+        The dispatch settings decide what the cache holds for a turn (a Gate 2
+        or Gate 3 skip is cached and replayed), so a backend whose settings
+        differ from the epoch's must neither apply nor dispatch under it. The
+        reason is logged at ERROR once per target, then held as the state's.
+        """
+        if not target.bound or target.dispatch_identity == self._dispatch_id.identity:
+            return None
+        events = self._store.event_store
+        if target.cutover_id is not None:
+            binding = events.get_cutover_identity(target.cutover_id)
+        else:
+            binding = events.get_epoch_identity(target.epoch_id)
+        expected = dict((binding or {}).get("dispatch_components") or {})
+        diffs = diff_components(expected, self._dispatch_id.components)
+        reason = (
+            f"backend dispatch settings {self._dispatch_id.identity} != {target.label}'s "
+            f"{target.dispatch_identity}: {'; '.join(diffs) or 'no component differs'}; "
+            "restore them or begin a cutover with --settings-change"
+        )
+        if self._dispatch_mismatch_logged != target.epoch_id:
+            self._dispatch_mismatch_logged = target.epoch_id
+            logger.error("Extraction dispatcher refuses to dispatch: %s", reason)
+        self._set_state(STATE_STALLED, reason=reason)
+        return _Wait(self._settings.stall_recheck_s, True)
+
+    def _bind(self, target: Epoch, info: InfoResponse, *, cutover: Cutover | None) -> _Wait | None:
+        """Bind an unbound target (`binding.decide_binding`); a wait when it is refused.
+
+        A refusal stalls in `epoch_mismatch` with the rule's reason: rule 1
+        for a candidate whose identity is its source's, or a contradiction for
+        the active epoch, which is never moved to a keyed namespace.
+        """
+        events = self._store.event_store
+        records = self._store.cache.adoption_records(target.extraction_version, target.model_hash)
+        claims = events.legacy_claims(target.extraction_version, target.model_hash)
+        source: Epoch | None = None
+        if cutover is None:
+            acceptance = events.get_identity_acceptance(target.epoch_id)
+        else:
+            acceptance = events.get_identity_acceptance(-cutover.cutover_id)
+            if cutover.source_epoch_id is not None:
+                source = self._store.get_epoch(cutover.source_epoch_id)
+        decision = decide_binding(
+            target, info, self._dispatch_id, records, claims, acceptance, source
+        )
+        if isinstance(decision, Refuse):
+            self._set_state(STATE_EPOCH_MISMATCH, reason=decision.reason)
+            return _Wait(self._settings.stall_recheck_s, True)
+        assert info.serving_identity is not None  # decide_binding refuses None
+        fields = {
+            "serving_identity": info.serving_identity,
+            "serving_components": dict(info.serving_identity_components or {}),
+            "dispatch_identity": self._dispatch_id.identity,
+            "dispatch_components": dict(self._dispatch_id.components),
+            "identity_namespace": decision.identity_namespace,
+            "source": decision.source,
+            "evidence": decision.evidence,
+            "bound_at": self._clock().isoformat(),
+        }
+        if cutover is None:
+            wrote = events.bind_epoch_identity(epoch_id=target.epoch_id, **fields)
+        else:
+            wrote = events.bind_cutover_identity(cutover.cutover_id, **fields)
+        if wrote:
+            logger.log(
+                logging.WARNING if binding_is_warning(decision) else logging.INFO,
+                "%s",
+                binding_log_line(
+                    target, decision, info.serving_identity, self._dispatch_id.identity
+                ),
+            )
+        return None
 
     def _unreachable(self, reason: str) -> _Wait:
         self._consecutive_unreachable += 1
@@ -743,9 +990,13 @@ class ExtractionDispatcher:
             # The service compares `expect.model_hash` with its BARE model hash
             # (`extraction_service/app.py`, the EPOCH_MISMATCH branch), so the
             # bare value goes on the wire; the composed comparison against the
-            # epoch already passed in `_check_service`.
+            # epoch already passed in `_check_service`. The serving identity
+            # is the epoch's binding, which the service checks per job (409
+            # `epoch_mismatch` when its own differs).
             expect=ExpectStamps(
-                extraction_version=epoch.extraction_version, model_hash=info.model_hash
+                extraction_version=epoch.extraction_version,
+                model_hash=info.model_hash,
+                serving_identity=epoch.serving_identity,
             ),
             derivation=derivation,
         )
@@ -794,6 +1045,10 @@ class ExtractionDispatcher:
                 "job_id": job_id,
                 "request_id": request_id,
                 "location_label": info.location_label,
+                # The full identity the row was written under, beside the
+                # triple its key carries.
+                "serving_identity": epoch.serving_identity,
+                "dispatch_identity": self._dispatch_id.identity,
             },
         )
         self._store.record_attempt(
@@ -856,6 +1111,14 @@ class ExtractionDispatcher:
             raise InferenceServiceError(
                 f"reply stamps (extraction_version={stamps.extraction_version!r}, "
                 f"model_hash={stamps.model_hash!r}) do not match {epoch.label}",
+                code=ErrorCode.EPOCH_MISMATCH,
+                retryable=False,
+                http_status=200,
+            )
+        if epoch.bound and stamps.serving_identity != epoch.serving_identity:
+            raise InferenceServiceError(
+                f"reply serving identity {stamps.serving_identity} != {epoch.label}'s "
+                f"{epoch.serving_identity}",
                 code=ErrorCode.EPOCH_MISMATCH,
                 retryable=False,
                 http_status=200,
@@ -1070,8 +1333,14 @@ class ExtractionDispatcher:
 
     def _set_state(self, state: str, *, reason: str | None = None) -> None:
         if state == self._state:
+            # A new reason in the same state (one stall replaced by another)
+            # is logged too, or the log would still show the first one.
+            if reason and reason != self._reason:
+                self._reason = reason
+                logger.info("Extraction dispatcher %s: %s", state, reason)
             return
         previous, self._state = self._state, state
+        self._reason = reason
         if reason:
             logger.info("Extraction dispatcher %s -> %s: %s", previous, state, reason)
         else:

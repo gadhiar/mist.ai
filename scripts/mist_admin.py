@@ -1039,8 +1039,11 @@ def _build_log_regenerator(
     explicit override) and are READ-ONLY replay sources: the regenerator's own
     job/checkpoint rows go to a `NullRebuildJournal`, never to the live ledger.
 
-    Returns (LogRegenerator, epoch_dict).
+    Returns (LogRegenerator, epoch_dict). The epoch dict is the ledger row plus
+    `identity_namespace`, the cache namespace of the epoch's binding (None: the
+    3-part one), which `LogRegenerator.rebuild` reads its rows from.
     """
+    import sqlite3
     from pathlib import Path as _Path
 
     from backend.event_store.store import EventStore
@@ -1104,7 +1107,16 @@ def _build_log_regenerator(
         # lacking the column was measured to read fine through both.
         {"conversation_sessions": ("origin",)},
     )
-    _assert_replay_source_exists(cache_path, "extraction cache", ("extraction_cache",))
+    # `identity_namespace` is filtered on by every cache read the replay makes
+    # (`ExtractionCache.get`), and it arrives via the cache `initialize()` this
+    # command does not call, so a cache no current backend has opened would pass
+    # the table gate and then raise `no such column` as a bare traceback.
+    _assert_replay_source_exists(
+        cache_path,
+        "extraction cache",
+        ("extraction_cache",),
+        {"extraction_cache": ("identity_namespace",)},
+    )
 
     # Seed corpus: the third input to `graph = f(seed, log, epoch)`, and until
     # MIS-130 step B the only one the rebuild did not actually have. Loaded from
@@ -1199,6 +1211,22 @@ def _build_log_regenerator(
                 f"Epoch {epoch_id} not found in the event store. "
                 f"Available epoch IDs: {[e['epoch_id'] for e in epochs]}"
             )
+
+    # The namespace the epoch's rows are read from is its binding's: a keyed
+    # epoch's rows are only under its key, and an unbound epoch reads the 3-part
+    # rows it always has. A store with no `epoch_identity` table (one no backend
+    # with bindings has initialized) has bound nothing, so every epoch in it is
+    # unbound. A plain SELECT, so this stays read-only.
+    try:
+        binding = event_store.get_epoch_identity(int(epoch["epoch_id"]))
+    except sqlite3.OperationalError as exc:
+        if "no such table: epoch_identity" not in str(exc):
+            raise
+        binding = None
+    epoch = {
+        **epoch,
+        "identity_namespace": None if binding is None else binding["identity_namespace"],
+    }
 
     return regen, epoch
 
