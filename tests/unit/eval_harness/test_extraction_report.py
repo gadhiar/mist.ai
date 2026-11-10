@@ -508,6 +508,99 @@ def test_notes_say_which_f1_cells_carry_an_interval(
     assert "Entity F1 and the list-only row carry no interval" in md
 
 
+_ALIGNED_ROWS = (
+    "aligned relation precision",
+    "aligned relation recall",
+    "aligned relation F1",
+    "id agreement",
+)
+
+
+def test_aligned_rows_print_the_summarys_values_and_intervals(tmp_path: Path) -> None:
+    summary = _summary(
+        tmp_path,
+        "dev-lists-2026-11.jsonl",
+        aligned_relationship_precision={"value": 0.8, "ci95": [0.7, 0.9]},
+        aligned_relationship_recall={"value": 0.625, "ci95": [0.5, 0.75]},
+        aligned_relationship_f1={"value": 0.7, "ci95": None},
+        id_agreement=0.95,
+    )
+    run = _write_run(tmp_path / "run", summary, DEV_ROWS)
+    code, md = _run_report(tmp_path, run)
+    assert code == 0
+    assert _cells(md, "aligned relation precision") == ["0.8000 [0.7000, 0.9000]"]
+    assert _cells(md, "aligned relation recall") == ["0.6250 [0.5000, 0.7500]"]
+    assert _cells(md, "aligned relation F1") == ["0.7000 [no interval]"]
+    assert _cells(md, "id agreement") == ["0.9500"]
+    # The exact rows keep their own values.
+    assert _cells(md, "relation recall") == ["0.5000 [0.4000, 0.6250]"]
+
+
+def test_aligned_rows_are_na_for_a_summary_from_before_aligned_scoring(
+    tmp_path: Path, dev_and_heldout: tuple[Path, Path]
+) -> None:
+    code, md = _run_report(tmp_path, *dev_and_heldout)
+    assert code == 0
+    for label in _ALIGNED_ROWS:
+        assert _cells(md, label) == ["n/a", "n/a"], label
+
+
+def test_aligned_rows_read_the_gauntlets_own_summary(tmp_path: Path) -> None:
+    """A summary from the gauntlet's builder over the real scorer prints its aligned values."""
+    user = GoldEntity("user", "User")
+    probes = [
+        GoldProbe(
+            tag="ext-01-tools",
+            utterance="utterance 1",
+            entities=(user, GoldEntity("quillpad", "Tool")),
+            relationships=(GoldRel("user", "User", "USES", "quillpad", "Tool"),),
+        )
+    ]
+    ents = (user, GoldEntity("the-quillpad", "Tool"))
+    index = {
+        "utterance 1": Produced(
+            utterance="utterance 1",
+            parse_ok=True,
+            entities=ents,
+            entity_type_by_id={e.id: e.type for e in ents},
+            relationships=(
+                {"source": "user", "predicate": "USES", "target": "the-quillpad", "properties": {}},
+            ),
+        )
+    }
+    report = score_run(probes, index)
+    gold = tmp_path / "gold.jsonl"
+    gold.write_text("{}\n", encoding="utf-8")
+    summary = build_summary(
+        report,
+        gold_path=gold,
+        ontology_version="test",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+    gold.unlink()
+    summary.update(run_identity=RID_A, failure_classes=_failure_classes(ok=1))
+    run = _write_run(tmp_path / "run", summary, build_per_item_rows(report))
+    code, md = _run_report(tmp_path, run)
+    assert code == 0
+    assert _cells(md, "relation recall") == ["0.0000 [0.0000, 0.0000]"]
+    assert _cells(md, "aligned relation recall") == ["1.0000 [1.0000, 1.0000]"]
+    assert _cells(md, "id agreement") == ["0.5000"]
+
+
+def test_notes_say_what_the_aligned_rows_count(
+    tmp_path: Path, dev_and_heldout: tuple[Path, Path]
+) -> None:
+    code, md = _run_report(tmp_path, *dev_and_heldout)
+    assert code == 0
+    assert "The aligned relation rows score relations over aligned entity ids" in md
+    assert "Id agreement is the share of aligned entity pairs" in md
+    # The existing notes stay.
+    assert "Entity F1 and the list-only row carry no interval" in md
+
+
 def test_module_docstring_says_which_f1_cells_carry_an_interval() -> None:
     doc = " ".join((er.__doc__ or "").split())
     assert "computes no interval for either F1" not in doc

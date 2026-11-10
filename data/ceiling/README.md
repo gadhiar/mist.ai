@@ -110,6 +110,66 @@ Optional flags, for tests and other layouts; the defaults give the commands abov
 | `--relay-port N` | round, replay | `18080` (0 picks a free port) |
 | `--service-port N` | round, replay | `18090` (0 picks a free port) |
 
+## Scoring
+
+`score_runs` scores raw runs with the scorer and classifier of the checkout `--code-root`
+names; its module docstring holds every line's format. On run A's replay, with this
+checkout as the code root:
+
+```
+python -m scripts.eval_harness.ceiling.score_runs --code-root . --gold data/gold/extraction/dev-lists-2026-11.jsonl --pre-h8-gold <pre-H8 gold> --run run-a=.local/eval-ceiling/run-a-1/extraction_service_raw.jsonl
+```
+
+`--pre-h8-gold` is optional. Without it the gold's own `beyond_prompt` flags set the
+relations beyond the prompt aside, and a gold with neither prints
+`asked-for basis: n/a (no beyond-prompt flags)` and is scored on all relations.
+
+When the code root's scorer scores relations over aligned entity ids (plan v8, D8), each
+run gains one line beside its exact ones:
+
+```
+[aligned <name>] recall R (tp/n) ci95 [lo, hi]; precision P (tp/m) ci95 [lo, hi]; f1 F ci95 [lo, hi]; id agreement A (rail/aligned); typing T (ok/total); list-only recall L (tp/n); kinds exact=N alternative=N event-date=N metric=N n1=N reorder=N typo=N paraphrase=N; pending P accepted Q
+```
+
+and each pair of runs one line, D being the second run's figure less the first's over the
+probes both completed:
+
+```
+[paired-aligned <a>|<b>] recall diff D ci95 [lo, hi]; precision diff D ci95 [lo, hi]; probes N of M
+```
+
+Intervals are the cluster bootstrap by probe tag, 10,000 replicates, seed 0, 95%. Id
+agreement is the counted pairs of the kinds a rail or gold makes equal (exact, alternative,
+event-date, metric) over all counted pairs. Typo and paraphrase pairs are pending: they
+count only when an adjudicator accepts them.
+
+- `--pairs-out DIR` writes each run's pending pairs to `DIR/<name>.jsonl`,
+  `{"tag", "utterance", "gold_id", "gold_type", "produced_id", "produced_type", "kind"}`
+  per line, with no run name, so the pairs of several runs can be pooled and shuffled for
+  a blind adjudicator. It exits 1 before anything is written when the gold's file name
+  starts with `heldout-`, or when a pairs file already exists.
+- `--accepted-pairs PATH`, repeatable, reads the adjudicator's
+  `{"tag", "gold_id", "produced_id", "accept": true|false}` rows. An accepted pair counts in
+  the aligned figures; a rejected or absent one stays a miss and a false positive.
+
+The aligned check tests how the aligner was built against run A's adjudication:
+
+```
+python -m scripts.eval_harness.ceiling.adjudicated --worksheet data/ceiling/worksheet-run-a.jsonl --adjudication data/ceiling/adjudication-run-a.jsonl --aligned-check .local/eval-ceiling/run-a-1/extraction_service_raw.jsonl
+```
+
+It scores the raw against the worksheet's own gold, the gold the adjudication judged, with
+every pending pair counted as accepted (the most the aligner could credit), and refuses a
+raw whose exact misses are not the worksheet's. After the corrected figures it prints
+
+```
+aligned credits by class: answerer_error N, gold_wrong N, scorer_artifact N, ambiguous N
+```
+
+counting the misses the aligned scoring finds by their adjudicated class, and exits 1 when
+answerer_error or gold_wrong is above 0: the aligner must never credit an answer a reader
+judged wrong, or a gold relation judged wrong.
+
 ## Service env
 
 Every run A service process gets host-1070's r6 settings, except the four identity

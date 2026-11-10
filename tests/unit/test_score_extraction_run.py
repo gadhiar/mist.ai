@@ -1101,3 +1101,233 @@ class TestUtteranceJoinRoundTrip:
         m = V9_PATTERN.search(self._render(utterance))
         assert m is not None, "score_v9_predicate_run pattern no longer matches the template"
         assert m.group(1) == utterance
+
+
+# ---------------------------------------------------------------------------
+# Relations scored over aligned entity ids (plan v8, D8)
+# ---------------------------------------------------------------------------
+
+
+class TestGoldLoaderOptionalKeys:
+    def _load(self, tmp_path, entity_extra, rel_extra):
+        row = {
+            "utterance": "I sit on the Kestrel Board",
+            "tag": "t-opt",
+            "expected_entities": [
+                {"id": "kestrel-board", "type": "Organization", **entity_extra},
+            ],
+            "expected_relationships": [
+                {
+                    "source": "user",
+                    "source_type": "User",
+                    "predicate": "MEMBER_OF",
+                    "target": "kestrel-board",
+                    "target_type": "Organization",
+                    **rel_extra,
+                }
+            ],
+        }
+        path = tmp_path / "gold.jsonl"
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        return iter_gold_probes(path)[0]
+
+    def test_absent_keys_take_their_defaults(self, tmp_path):
+        probe = self._load(tmp_path, {}, {})
+        assert probe.entities[0].alternatives == ()
+        assert probe.relationships[0].predicate_alternatives == ()
+        assert probe.relationships[0].beyond_prompt is False
+
+    def test_alternatives_are_canonical_ids(self, tmp_path):
+        probe = self._load(
+            tmp_path, {"alternatives": ["The Kestrel Committee", "kestrel-group"]}, {}
+        )
+        assert probe.entities[0].alternatives == ("the-kestrel-committee", "kestrel-group")
+
+    def test_predicate_alternatives_and_beyond_prompt(self, tmp_path):
+        probe = self._load(
+            tmp_path, {}, {"predicate_alternatives": ["WORKS_AT"], "beyond_prompt": True}
+        )
+        assert probe.relationships[0].predicate_alternatives == ("WORKS_AT",)
+        assert probe.relationships[0].beyond_prompt is True
+
+
+def _edge(source, predicate, target):
+    return {"source": source, "target": target, "predicate": predicate, "properties": {}}
+
+
+_ACME = GoldProbe(
+    tag="t-acme",
+    utterance="I work at Acme Corp",
+    entities=(GoldEntity("user", "User"), GoldEntity("acme-corp", "Organization")),
+    relationships=(GoldRel("user", "User", "WORKS_AT", "acme-corp", "Organization"),),
+)
+
+
+def _acme_index(produced_id, predicate="WORKS_AT"):
+    entities = [GoldEntity("user", "User"), GoldEntity(produced_id, "Organization")]
+    return {
+        _ACME.utterance: _produced(
+            _ACME.utterance,
+            entities,
+            [_edge("user", predicate, produced_id)],
+            {e.id: e.type for e in entities},
+        )
+    }
+
+
+_TYPO = GoldProbe(
+    tag="t-typo",
+    utterance="I work on the Kestrel board",
+    entities=(GoldEntity("user", "User"), GoldEntity("kestrel-board", "Project")),
+    relationships=(GoldRel("user", "User", "WORKS_ON", "kestrel-board", "Project"),),
+)
+
+
+def _typo_index():
+    entities = [GoldEntity("user", "User"), GoldEntity("kestral-board", "Project")]
+    return {
+        _TYPO.utterance: _produced(
+            _TYPO.utterance,
+            entities,
+            [_edge("user", "WORKS_ON", "kestral-board")],
+            {e.id: e.type for e in entities},
+        )
+    }
+
+
+class TestAlignedScoring:
+    def test_an_n1_id_is_found_aligned_and_missed_exact(self):
+        r = score_run([_ACME], _acme_index("the-acme-corp"))
+        assert (r.rel_tp, r.rel_fp, r.rel_fn) == (0, 1, 1)
+        assert (r.aligned_rel_tp, r.aligned_rel_fp, r.aligned_rel_fn) == (1, 0, 0)
+        assert (r.aligned_rel_recall, r.aligned_rel_precision, r.aligned_rel_f1) == (1.0, 1.0, 1.0)
+        probe = r.per_probe[0]
+        assert probe["rel_fns"] == [["user", "WORKS_AT", "acme-corp"]]
+        assert probe["aligned_rel_fns"] == []
+        assert probe["aligned_rel_fps"] == []
+        assert probe["aligned_pairs"] == [
+            ["user", "user", "exact"],
+            ["acme-corp", "the-acme-corp", "n1"],
+        ]
+
+    def test_kind_counts_cover_every_kind(self):
+        from eval_harness.entity_alignment import ALIGNMENT_KINDS
+
+        r = score_run([_ACME], _acme_index("the-acme-corp"))
+        assert list(r.alignment_kinds) == list(ALIGNMENT_KINDS)
+        assert r.alignment_kinds["exact"] == 1
+        assert r.alignment_kinds["n1"] == 1
+        assert sum(r.alignment_kinds.values()) == 2
+
+    def test_id_agreement_is_the_rail_pairs_over_every_counted_pair(self):
+        r = score_run([_ACME], _acme_index("the-acme-corp"))
+        assert (r.id_rail_pairs, r.id_aligned_pairs) == (1, 2)
+        assert r.id_agreement == 0.5
+        assert score_run([_ACME], _acme_index("acme-corp")).id_agreement == 1.0
+
+    def test_a_dated_event_id_agrees_as_an_exact_one(self):
+        probe = GoldProbe(
+            tag="t-event",
+            utterance="The quill review is on 14 March",
+            entities=(
+                GoldEntity("user", "User"),
+                GoldEntity("quill-review", "Event"),
+                GoldEntity("2026-03-14", "Date"),
+            ),
+            relationships=(
+                GoldRel("user", "User", "EXPERIENCED", "quill-review", "Event"),
+                GoldRel("quill-review", "Event", "OCCURRED_ON", "2026-03-14", "Date"),
+            ),
+        )
+
+        def index(event_id):
+            entities = [
+                GoldEntity("user", "User"),
+                GoldEntity(event_id, "Event"),
+                GoldEntity("2026-03-14", "Date"),
+            ]
+            edges = [
+                _edge("user", "EXPERIENCED", event_id),
+                _edge(event_id, "OCCURRED_ON", "2026-03-14"),
+            ]
+            return {
+                probe.utterance: _produced(
+                    probe.utterance, entities, edges, {e.id: e.type for e in entities}
+                )
+            }
+
+        exact = score_run([probe], index("quill-review"))
+        dated = score_run([probe], index("quill-review-2026-03-14"))
+        assert dated.rel_tp == 0
+        assert dated.aligned_rel_tp == exact.aligned_rel_tp == 2
+        assert dated.id_agreement == exact.id_agreement == 1.0
+        assert dated.alignment_kinds["event-date"] == 1
+
+    def test_a_pending_pair_is_listed_and_scored_as_a_miss_until_accepted(self):
+        r = score_run([_TYPO], _typo_index())
+        assert (r.aligned_rel_tp, r.aligned_rel_fp, r.aligned_rel_fn) == (0, 1, 1)
+        assert r.pending_pairs == [
+            {
+                "tag": "t-typo",
+                "utterance": "I work on the Kestrel board",
+                "gold_id": "kestrel-board",
+                "gold_type": "Project",
+                "produced_id": "kestral-board",
+                "produced_type": "Project",
+                "kind": "typo",
+                "accepted": False,
+            }
+        ]
+
+    def test_an_accepted_pending_pair_counts(self):
+        r = score_run(
+            [_TYPO], _typo_index(), accepted_pairs=[("t-typo", "kestrel-board", "kestral-board")]
+        )
+        assert (r.aligned_rel_tp, r.aligned_rel_fp, r.aligned_rel_fn) == (1, 0, 0)
+        assert r.pending_pairs[0]["accepted"] is True
+        assert r.alignment_kinds["typo"] == 1
+        # The exact figures do not move.
+        assert (r.rel_tp, r.rel_fp, r.rel_fn) == (0, 1, 1)
+
+    def test_an_accepted_row_for_another_probe_does_not_count(self):
+        r = score_run(
+            [_TYPO], _typo_index(), accepted_pairs=[("t-other", "kestrel-board", "kestral-board")]
+        )
+        assert (r.aligned_rel_tp, r.aligned_rel_fp, r.aligned_rel_fn) == (0, 1, 1)
+        assert r.pending_pairs[0]["accepted"] is False
+
+    def test_a_gold_predicate_alternative_is_found(self):
+        probe = GoldProbe(
+            tag=_ACME.tag,
+            utterance=_ACME.utterance,
+            entities=_ACME.entities,
+            relationships=(
+                GoldRel(
+                    "user",
+                    "User",
+                    "WORKS_AT",
+                    "acme-corp",
+                    "Organization",
+                    predicate_alternatives=("MEMBER_OF",),
+                ),
+            ),
+        )
+        r = score_run([probe], _acme_index("acme-corp", predicate="MEMBER_OF"))
+        assert r.rel_tp == 0
+        assert r.aligned_rel_tp == 1
+
+    def test_an_unmatched_probe_misses_every_gold_relation(self):
+        r = score_run([_ACME], {})
+        assert (r.aligned_rel_tp, r.aligned_rel_fp, r.aligned_rel_fn) == (0, 0, 1)
+        assert r.per_probe[0]["aligned_rel_fns"] == [["user", "WORKS_AT", "acme-corp"]]
+        assert r.per_probe[0]["aligned_pairs"] == []
+        assert r.pending_pairs == []
+
+    def test_an_empty_report_takes_the_vacuous_defaults(self):
+        from eval_harness.score_extraction_run import Report
+
+        r = Report()
+        assert (r.aligned_rel_recall, r.aligned_rel_precision, r.aligned_rel_f1) == (1.0, 1.0, 1.0)
+        assert r.id_agreement == 1.0
+        assert r.alignment_kinds == {}
+        assert r.pending_pairs == []

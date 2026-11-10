@@ -1,8 +1,9 @@
 """Classify every missed dev-lists relation by where it was lost.
 
 Planning diagnosis for mist-extraction-quality v5. It reads the dev-lists gold
-file, the pre-H8 gold file (to set aside the six relations H8 added from
-labelling rules beyond the prompt), and one or more extraction-service raw files
+file, optionally the pre-H8 gold file (to set aside the six relations H8 added from
+labelling rules beyond the prompt; without it the gold's own `beyond_prompt` flags
+set them aside, and a gold with no flags is counted whole), and one or more extraction-service raw files
 (one JSON object per probe, with `id` and `response.payload`). Each payload goes
 through the scorer's own `parse_produced`, so a relation counts as found exactly
 when `score_extraction_run.score_run` counts it: the key `(source, predicate,
@@ -46,7 +47,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -60,12 +60,18 @@ for _candidate in (str(_REPO_ROOT), str(Path.cwd())):
         sys.path.insert(0, _candidate)
 
 from backend.knowledge.extraction.structure_splitter import split_structured  # noqa: E402
+from scripts.eval_harness.entity_alignment import content_tokens  # noqa: E402
+from scripts.eval_harness.entity_alignment import (  # noqa: E402
+    type_compatible as _type_compatible,
+)
+from scripts.eval_harness.entity_alignment import (  # noqa: E402
+    variant_kind as _variant_kind,
+)
 from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     GoldProbe,
     GoldRel,
     iter_gold_probes,
     parse_produced,
-    types_match,
 )
 
 CLASSES = (
@@ -84,12 +90,6 @@ CLASSES = (
     "OMITTED",
 )
 
-# LABELLING.md N1: leading articles and possessive pronouns are dropped from ids.
-_N1_WORDS = frozenset({"a", "an", "the", "my", "our", "your", "his", "her", "their", "its"})
-_STOPWORDS = _N1_WORDS | frozenset(
-    {"of", "to", "for", "and", "in", "on", "at", "with", "by", "from", "into", "about", "per", "s"}
-)
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _USER_ID = "user"
 
 
@@ -126,72 +126,6 @@ class Miss:
     fan_out: bool
 
 
-def _stem(token: str) -> str:
-    if len(token) > 4 and token.endswith("ies"):
-        return token[:-3] + "y"
-    if len(token) > 5 and token.endswith("ing"):
-        return token[:-3]
-    if len(token) > 4 and token.endswith("ed"):
-        return token[:-2]
-    if len(token) > 4 and token.endswith(("ches", "shes", "xes", "zes", "sses")):
-        return token[:-2]
-    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-        return token[:-1]
-    return token
-
-
-def _raw_tokens(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text.lower())
-
-
-def _content(text: str) -> frozenset[str]:
-    return frozenset(_stem(t) for t in _raw_tokens(text) if t not in _STOPWORDS)
-
-
-def _levenshtein(a: str, b: str) -> int:
-    previous = list(range(len(b) + 1))
-    for i, char_a in enumerate(a, start=1):
-        current = [i]
-        for j, char_b in enumerate(b, start=1):
-            current.append(
-                min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (char_a != char_b))
-            )
-        previous = current
-    return previous[-1]
-
-
-def _type_compatible(produced_type: str | None, gold_type: str) -> bool:
-    if produced_type is None:
-        return True
-    return types_match(produced_type, gold_type) or types_match(gold_type, produced_type)
-
-
-def _variant_kind(gold_id: str, gold_type: str, produced_id: str) -> str | None:
-    """How `produced_id` differs from `gold_id` by form only, or None when it is another id.
-
-    Kinds: `n1` (articles or possessives only), `reorder` (the same tokens in
-    another order), `typo` (edit distance 2 or less on ids of 5 or more
-    characters), `metric` (a Metric id whose tokens are a subset or superset of
-    gold's), `paraphrase` (the same content tokens after stemming, or one set
-    inside the other).
-    """
-    gold_raw = [t for t in _raw_tokens(gold_id) if t not in _N1_WORDS]
-    produced_raw = [t for t in _raw_tokens(produced_id) if t not in _N1_WORDS]
-    if gold_raw and gold_raw == produced_raw:
-        return "n1"
-    if gold_raw and sorted(gold_raw) == sorted(produced_raw):
-        return "reorder"
-    if len(gold_id) >= 5 and len(produced_id) >= 5 and _levenshtein(gold_id, produced_id) <= 2:
-        return "typo"
-    gold_content = _content(gold_id)
-    produced_content = _content(produced_id)
-    if not gold_content or not produced_content:
-        return None
-    if gold_content <= produced_content or produced_content <= gold_content:
-        return "metric" if gold_type == "Metric" else "paraphrase"
-    return None
-
-
 def _produced_view(record: RawRecord | None) -> ProducedView | None:
     if record is None:
         return None
@@ -214,12 +148,12 @@ def _produced_view(record: RawRecord | None) -> ProducedView | None:
 
 def _frame_ids(probe: GoldProbe) -> frozenset[str]:
     contexts = {c for unit in split_structured(probe.utterance) for c in unit.context}
-    context_tokens = [_content(c) for c in contexts]
+    context_tokens = [content_tokens(c) for c in contexts]
     frame = set()
     for entity in probe.entities:
         if entity.id == _USER_ID:
             continue
-        tokens = _content(entity.id)
+        tokens = content_tokens(entity.id)
         if tokens and any(tokens <= ctx for ctx in context_tokens):
             frame.add(entity.id)
     return frozenset(frame)
@@ -248,16 +182,16 @@ def _candidates(
     strong: list[tuple[str, str]] = []
     weak: list[tuple[str, str]] = []
     merged: list[str] = []
-    gold_tokens = _content(gold_id)
+    gold_tokens = content_tokens(gold_id)
     # Shared words: any content token but a one- or two-digit number, which date parts are.
     gold_words = frozenset(t for t in gold_tokens if not (t.isdigit() and len(t) <= 2))
-    other_gold_tokens = [_content(g) for g in gold_ids if g not in (gold_id, _USER_ID)]
+    other_gold_tokens = [content_tokens(g) for g in gold_ids if g not in (gold_id, _USER_ID)]
     for produced_id in sorted(view.ids):
         if produced_id in gold_ids:
             continue
         produced_type = view.type_by_id.get(produced_id)
         compatible = _type_compatible(produced_type, gold_type)
-        produced_tokens = _content(produced_id)
+        produced_tokens = content_tokens(produced_id)
         shares_word = bool(gold_words & produced_tokens)
         extra = produced_tokens - gold_tokens
         holds_other = any(extra & other for other in other_gold_tokens)
@@ -274,7 +208,7 @@ def _candidates(
         elif shares_word:
             weak.append((produced_id, "overlap"))
     # The merged id holding most of gold's words first, so the detail names the likeliest one.
-    merged.sort(key=lambda q: (-len(gold_tokens & _content(q)), q))
+    merged.sort(key=lambda q: (-len(gold_tokens & content_tokens(q)), q))
     return Candidates(strong, weak, merged)
 
 
@@ -470,14 +404,17 @@ def _counts(items: Counter[str]) -> str:
 def _print_tables(
     runs: dict[str, RunDiagnosis],
     primary: str,
-    six: set[tuple[str, Key]],
+    six: set[tuple[str, Key]] | None,
     detail: bool,
     dump: bool,
 ) -> None:
     names = list(runs)
-    print(f"Relations beyond the prompt set aside: {len(six)}")
-    for tag, key in sorted(six):
-        print(f"- {tag}: {' '.join(key)}")
+    if six is None:
+        print("asked-for basis: n/a (no beyond-prompt flags)")
+    else:
+        print(f"Relations beyond the prompt set aside: {len(six)}")
+        for tag, key in sorted(six):
+            print(f"- {tag}: {' '.join(key)}")
     print()
     print("| class | " + " | ".join(names) + " |")
     print("|---|" + "---|" * len(names))
@@ -574,7 +511,12 @@ def _print_tables(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--gold", type=Path, required=True)
-    parser.add_argument("--pre-h8-gold", type=Path, required=True)
+    parser.add_argument(
+        "--pre-h8-gold",
+        type=Path,
+        help="the gold before H8; its diff sets relations aside in place of the gold's "
+        "beyond_prompt flags",
+    )
     parser.add_argument(
         "--run",
         action="append",
@@ -591,14 +533,33 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     raw_paths = {name: Path(path) for name, _, path in (s.partition("=") for s in args.run)}
     for path in (args.gold, args.pre_h8_gold, *raw_paths.values()):
-        if not path.is_file():
+        if path is not None and not path.is_file():
             parser.error(f"no such file: {path}")
 
     probes = iter_gold_probes(args.gold)
-    six = _beyond_prompt(probes, iter_gold_probes(args.pre_h8_gold))
-    runs = {name: diagnose(probes, _read_raw(path), six) for name, path in raw_paths.items()}
+    six = _set_aside(probes, args.pre_h8_gold)
+    runs = {
+        name: diagnose(probes, _read_raw(path), six or set()) for name, path in raw_paths.items()
+    }
     _print_tables(runs, next(iter(runs)), six, args.detail, args.dump)
     return 0
+
+
+def _set_aside(probes: list[GoldProbe], pre_h8_gold: Path | None) -> set[tuple[str, Key]] | None:
+    """The relations beyond the prompt, or None when nothing marks them.
+
+    The pre-H8 gold's diff wins when it is given; otherwise the gold's own `beyond_prompt`
+    flags are read, and a gold with neither (the 60, held-out) has no asked-for basis.
+    """
+    if pre_h8_gold is not None:
+        return _beyond_prompt(probes, iter_gold_probes(pre_h8_gold))
+    flagged = {
+        (p.tag, (r.source, r.predicate, r.target))
+        for p in probes
+        for r in p.relationships
+        if r.beyond_prompt
+    }
+    return flagged or None
 
 
 if __name__ == "__main__":

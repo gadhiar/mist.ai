@@ -13,13 +13,21 @@ Gold, raw and pre-H8 gold files are synthetic, written by each test.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO_ROOT / "scripts" / "eval_harness" / "ceiling" / "score_runs.py"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# The aligned tests' expected intervals come from the bootstrap the script calls.
+from scripts.model_bench.probes import extraction as _bootstrap  # noqa: E402
 
 _STUB_SCORER = '''
 """Stub scorer: the shapes of the real one, with plain set matching."""
@@ -855,3 +863,327 @@ def test_unequal_gold_counts_over_a_pair_exit_1(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "paired a|b" in result.stderr
     assert "[paired" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Aligned scoring (plan v8, D8), against this checkout's own scorer
+# ---------------------------------------------------------------------------
+#
+# The stub scorer has no aligned scoring, so these tests name this checkout as the code root.
+# The gold and raw files are invented, written under `tmp_path`.
+
+_KINDS_NONE = "alternative=0 event-date=0 metric=0"
+
+
+def _typed_rel(
+    source: str, source_type: str, predicate: str, target: str, target_type: str, **extra: object
+) -> dict[str, object]:
+    return {
+        "source": source,
+        "source_type": source_type,
+        "predicate": predicate,
+        "target": target,
+        "target_type": target_type,
+        **extra,
+    }
+
+
+def _aligned_gold(*, flag: bool = False) -> list[dict]:
+    knows = {"beyond_prompt": True} if flag else {}
+    return [
+        {
+            "tag": "syn-01-list-tools",
+            "utterance": "Tools: the Quillpad and the Brindle app",
+            "expected_entities": [
+                _ent("user", "User"),
+                _ent("quillpad", "Tool"),
+                _ent("brindle-app", "Tool"),
+            ],
+            "expected_relationships": [
+                _typed_rel("user", "User", "USES", "quillpad", "Tool"),
+                _typed_rel("user", "User", "USES", "brindle-app", "Tool"),
+            ],
+        },
+        {
+            "tag": "syn-02-prose",
+            "utterance": "I know Orla Venn",
+            "expected_entities": [_ent("user", "User"), _ent("orla-venn", "Person")],
+            "expected_relationships": [
+                _typed_rel("user", "User", "KNOWS", "orla-venn", "Person", **knows)
+            ],
+        },
+    ]
+
+
+def _raw_row(probe: dict, entities: list[tuple[str, str]], edges: list[tuple[str, str, str]]):
+    return {
+        "id": probe["tag"],
+        "job_id": f"job-{probe['tag']}",
+        "utterance": probe["utterance"],
+        "response": {
+            "payload": {
+                "entities": [{"id": i, "type": t} for i, t in entities],
+                "relationships": [{"source": s, "type": p, "target": t} for s, p, t in edges],
+            }
+        },
+    }
+
+
+def _aligned_inputs(tmp_path: Path, *, gold_name: str = "gold.jsonl", flag: bool = False):
+    """Gold, a candidate run (an n1 id, a typo id, one exact probe) and a run exact on both."""
+    data = tmp_path / "aligned-data"
+    data.mkdir()
+    gold = _aligned_gold(flag=flag)
+    first, second = gold
+    cand = [
+        _raw_row(
+            first,
+            [("user", "User"), ("the-quillpad", "Tool"), ("brindel-app", "Tool")],
+            [("user", "USES", "the-quillpad"), ("user", "USES", "brindel-app")],
+        ),
+        _raw_row(
+            second, [("user", "User"), ("orla-venn", "Person")], [("user", "KNOWS", "orla-venn")]
+        ),
+    ]
+    base = [
+        _raw_row(
+            first,
+            [("user", "User"), ("quillpad", "Tool"), ("brindle-app", "Tool")],
+            [("user", "USES", "quillpad"), ("user", "USES", "brindle-app")],
+        ),
+        cand[1],
+    ]
+    return {
+        "gold": _jsonl(data / gold_name, gold),
+        "cand": _jsonl(data / "cand_raw.jsonl", cand),
+        "base": _jsonl(data / "base_raw.jsonl", base),
+    }
+
+
+def _run_aligned(
+    files: dict[str, Path], runs: list[str], *extra: str, root: Path = _REPO_ROOT
+) -> subprocess.CompletedProcess[str]:
+    argv = [sys.executable, str(_SCRIPT), "--code-root", str(root), "--gold", str(files["gold"])]
+    for name in runs:
+        argv += ["--run", f"{name}={files[name]}"]
+    argv += list(extra)
+    return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=300, check=False)
+
+
+def _aligned_line(result: subprocess.CompletedProcess[str], run: str) -> str:
+    hits = [line for line in result.stdout.splitlines() if line.startswith(f"[aligned {run}] ")]
+    assert len(hits) == 1, result.stdout
+    return hits[0]
+
+
+def _ci(counts: dict[str, tuple[int, int, int]], kind: str) -> str:
+    bounds = _bootstrap.cluster_bootstrap_ratio_ci(
+        counts, n_replicates=10_000, seed=0, confidence=0.95, kind=kind
+    )
+    assert bounds is not None
+    return f"ci95 [{bounds[0]:.3f}, {bounds[1]:.3f}]"
+
+
+def _accepted(tmp_path: Path, rows: list[dict]) -> Path:
+    return _jsonl(tmp_path / "accepted.jsonl", rows)
+
+
+_TYPO_ROW = {"tag": "syn-01-list-tools", "gold_id": "brindle-app", "produced_id": "brindel-app"}
+
+
+def test_the_aligned_line_carries_typing_and_list_only_recall(tmp_path: Path) -> None:
+    result = _run_aligned(_aligned_inputs(tmp_path), ["cand"])
+    assert result.returncode == 0, result.stderr
+    line = _aligned_line(result, "cand")
+    # syn-01: the n1 id finds one relation, the unaccepted typo id is a miss and an extra;
+    # syn-02 is exact. Pairs: user twice and orla-venn exact, the-quillpad n1.
+    counts = {"syn-01-list-tools": (1, 1, 1), "syn-02-prose": (1, 0, 0)}
+    head, _, rest = line.partition("; typing ")
+    assert head == (
+        f"[aligned cand] recall 0.667 (2/3) {_ci(counts, 'recall')}; "
+        f"precision 0.667 (2/3) {_ci(counts, 'precision')}; "
+        f"f1 0.667 {_ci(counts, 'f1')}; id agreement 0.750 (3/4)"
+    )
+    # Typing is the scorer's relation-typing accuracy over the three produced relations.
+    assert re.match(r"\d\.\d{3} \(\d/3\); list-only recall ", rest), rest
+    assert line.endswith(
+        "; list-only recall 0.500 (1/2); kinds exact=3 "
+        f"{_KINDS_NONE} n1=1 reorder=0 typo=0 paraphrase=0; pending 1 accepted 0"
+    )
+    # The exact lines are still there, unchanged in form.
+    assert "[cand] relation recall: 0.333 (1/3)" in _lines(result, "cand")
+
+
+def test_a_gold_with_no_flags_and_no_pre_h8_gold_scores_every_relation(tmp_path: Path) -> None:
+    result = _run_aligned(_aligned_inputs(tmp_path), ["cand"])
+    assert result.returncode == 0, result.stderr
+    assert "asked-for basis: n/a (no beyond-prompt flags)" in result.stdout.splitlines()
+    lines = _lines(result, "cand")
+    assert "[cand] classifier recall over every relation: 0.333 (1/3)" in lines
+    assert not any("without the relations beyond the prompt" in line for line in lines)
+
+
+def test_the_gold_flags_set_relations_aside_without_the_pre_h8_gold(tmp_path: Path) -> None:
+    result = _run_aligned(_aligned_inputs(tmp_path, flag=True), ["cand"])
+    assert result.returncode == 0, result.stderr
+    assert "asked-for basis: the gold's beyond_prompt flags, 1 relation set aside" in (
+        result.stdout.splitlines()
+    )
+    # syn-02's KNOWS edge is set aside; neither of syn-01's is found by exact ids.
+    assert "[cand] classifier recall without the relations beyond the prompt: 0.000 (0/2)" in (
+        _lines(result, "cand")
+    )
+
+
+def test_a_pairs_file_holds_no_run_name(tmp_path: Path) -> None:
+    files = _aligned_inputs(tmp_path)
+    out = tmp_path / "pairs"
+    result = _run_aligned(files, ["cand"], "--pairs-out", str(out))
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.name for p in out.iterdir()) == ["cand.jsonl"]
+    text = (out / "cand.jsonl").read_text(encoding="utf-8")
+    assert "cand" not in text
+    assert [json.loads(line) for line in text.splitlines()] == [
+        {
+            "tag": "syn-01-list-tools",
+            "utterance": "Tools: the Quillpad and the Brindle app",
+            "gold_id": "brindle-app",
+            "gold_type": "Tool",
+            "produced_id": "brindel-app",
+            "produced_type": "Tool",
+            "kind": "typo",
+        }
+    ]
+
+
+def test_an_accepted_row_moves_its_pair_into_the_aligned_counts(tmp_path: Path) -> None:
+    files = _aligned_inputs(tmp_path)
+    accepted = _accepted(tmp_path, [{**_TYPO_ROW, "accept": True}])
+    result = _run_aligned(files, ["cand"], "--accepted-pairs", str(accepted))
+    assert result.returncode == 0, result.stderr
+    line = _aligned_line(result, "cand")
+    assert line.startswith("[aligned cand] recall 1.000 (3/3) ci95 [1.000, 1.000]; ")
+    assert "; precision 1.000 (3/3) " in line
+    assert "typo=1" in line
+    assert line.endswith("; pending 1 accepted 1")
+    # The exact figure does not move.
+    assert "[cand] relation recall: 0.333 (1/3)" in _lines(result, "cand")
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{**_TYPO_ROW, "accept": False}],
+        [{**_TYPO_ROW, "tag": "syn-02-prose", "accept": True}],
+        [],
+    ],
+    ids=["rejected", "another-probe", "absent"],
+)
+def test_a_rejected_or_absent_row_leaves_a_miss_and_a_false_positive(
+    tmp_path: Path, rows: list[dict]
+) -> None:
+    files = _aligned_inputs(tmp_path)
+    accepted = _accepted(tmp_path, rows)
+    result = _run_aligned(files, ["cand"], "--accepted-pairs", str(accepted))
+    assert result.returncode == 0, result.stderr
+    line = _aligned_line(result, "cand")
+    assert line.startswith("[aligned cand] recall 0.667 (2/3) ")
+    assert "; precision 0.667 (2/3) " in line
+    assert line.endswith("; pending 1 accepted 0")
+
+
+def test_a_heldout_gold_with_pairs_out_exits_1_before_any_file_is_written(
+    tmp_path: Path,
+) -> None:
+    files = _aligned_inputs(tmp_path, gold_name="heldout-synthetic.jsonl")
+    out = tmp_path / "pairs"
+    result = _run_aligned(files, ["cand"], "--pairs-out", str(out))
+    assert result.returncode == 1
+    assert "heldout-" in result.stderr
+    assert not out.exists()
+    assert "[cand]" not in result.stdout
+
+
+def test_an_existing_pairs_file_exits_1_before_scoring(tmp_path: Path) -> None:
+    files = _aligned_inputs(tmp_path)
+    out = tmp_path / "pairs"
+    out.mkdir()
+    (out / "cand.jsonl").write_text("kept\n", encoding="utf-8")
+    result = _run_aligned(files, ["cand"], "--pairs-out", str(out))
+    assert result.returncode == 1
+    assert "cand.jsonl" in result.stderr
+    assert (out / "cand.jsonl").read_text(encoding="utf-8") == "kept\n"
+    assert "[cand]" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"tag": "syn-01-list-tools", "gold_id": "brindle-app", "accept": True},
+        {**_TYPO_ROW, "accept": "yes"},
+        ["syn-01-list-tools", "brindle-app", "brindel-app"],
+    ],
+    ids=["no-produced-id", "accept-not-bool", "not-an-object"],
+)
+def test_a_malformed_accepted_row_exits_1(tmp_path: Path, row: object) -> None:
+    files = _aligned_inputs(tmp_path)
+    accepted = tmp_path / "accepted.jsonl"
+    accepted.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    result = _run_aligned(files, ["cand"], "--accepted-pairs", str(accepted))
+    assert result.returncode == 1
+    assert "accepted.jsonl" in result.stderr
+    assert "[cand]" not in result.stdout
+
+
+def test_two_rows_disagreeing_on_one_pair_exit_1(tmp_path: Path) -> None:
+    files = _aligned_inputs(tmp_path)
+    one = _jsonl(tmp_path / "one.jsonl", [{**_TYPO_ROW, "accept": True}])
+    two = _jsonl(tmp_path / "two.jsonl", [{**_TYPO_ROW, "accept": False}])
+    result = _run_aligned(
+        files, ["cand"], "--accepted-pairs", str(one), "--accepted-pairs", str(two)
+    )
+    assert result.returncode == 1
+    assert "brindel-app" in result.stderr
+
+
+def test_the_paired_aligned_line_is_second_minus_first(tmp_path: Path) -> None:
+    result = _run_aligned(_aligned_inputs(tmp_path), ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    cand = {"syn-01-list-tools": (1, 1, 1), "syn-02-prose": (1, 0, 0)}
+    base = {"syn-01-list-tools": (2, 0, 0), "syn-02-prose": (1, 0, 0)}
+
+    def diff_ci(kind: str) -> str:
+        bounds = _bootstrap.cluster_bootstrap_paired_difference_ci(
+            cand, base, n_replicates=10_000, seed=0, confidence=0.95, kind=kind
+        )
+        assert bounds is not None
+        return f"ci95 [{bounds[0]:+.3f}, {bounds[1]:+.3f}]"
+
+    paired = [line for line in result.stdout.splitlines() if line.startswith("[paired-aligned ")]
+    assert paired == [
+        f"[paired-aligned cand|base] recall diff +0.333 {diff_ci('recall')}; "
+        f"precision diff +0.333 {diff_ci('precision')}; probes 2 of 2"
+    ]
+    # The exact paired line keeps its form, and no `[paired ` filter picks up the new one.
+    assert _paired(result) == [
+        "[paired cand|base] relation recall over probes both runs completed: "
+        "cand 0.333 (1/3), base 1.000 (3/3), probes 2 of 2"
+    ]
+
+
+def test_a_scorer_without_aligned_scoring_refuses_pairs_out(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    files = _inputs(tmp_path)
+    out = tmp_path / "pairs"
+    result = _run(root, files, "--pairs-out", str(out))
+    assert result.returncode == 1
+    assert "aligned" in result.stderr
+    assert not out.exists()
+
+
+def test_a_scorer_without_aligned_scoring_prints_no_aligned_line(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[aligned" not in result.stdout
+    assert "[paired-aligned" not in result.stdout
