@@ -227,6 +227,23 @@ class TestBuildAppFromEnv:
         assert isinstance(seen["llm"], app_module.LlamaServerProvider)
         assert isinstance(seen["http_client"], httpx.AsyncClient)
 
+    def test_it_gives_the_llm_clients_the_service_timeout(self, monkeypatch):
+        """The client and the engine's `asyncio.wait_for` bound each call by the same timeout."""
+        monkeypatch.setenv("EXTRACTION_MODEL_HASH", "env-model-hash")
+        monkeypatch.setenv("EXTRACTION_LLM_TIMEOUT_SECONDS", "1500")
+        seen = {}
+
+        def spy(settings, llm, http_client):
+            seen.update(settings=settings, llm=llm)
+            return "app"
+
+        monkeypatch.setattr(app_module, "build_app", spy)
+
+        app_module.build_app_from_env()
+
+        assert seen["settings"].llm_timeout_seconds == 1500.0
+        assert seen["llm"]._async_client.timeout == httpx.Timeout(1500.0, connect=5.0)
+
 
 # ---------------------------------------------------------------------------
 # Each component moves the service's identity
