@@ -396,7 +396,94 @@ class TestGroup1IdentityConventions:
         assert _has_edge(output, "user", "HAS_HABIT", "work-out")
 
     def test_the_prompt_stays_under_its_length_budget(self):
-        assert len(EXTRACTION_SYSTEM_PROMPT) <= 45000
+        # Lead decision of 10 Nov: the binding limit is PROMPT_RESERVE_TOKENS (14,336 tokens),
+        # and H16's `prompt_tokens` lines are authoritative; this cap is a coarse proxy.
+        assert len(EXTRACTION_SYSTEM_PROMPT) <= 52000
+
+
+class TestGroup2ListConventions:
+    """v11 group 2 (ADR-054 Decision 7): how a structured turn reads, the list rules, and
+    N3, N5, N7 and N13, each stated as a rule. Each presence check is keyed on the rule's
+    own phrase; Example 30 teaches the list shapes a rule alone does not hold.
+    """
+
+    def test_a_structured_turn_reads_as_context_lead_in_and_item(self):
+        assert "each `<context> > <lead-in>: <item>`" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_user_context_lines_are_never_extracted_again(self):
+        assert "Lines marked `[user]:` are earlier units" in EXTRACTION_SYSTEM_PROMPT
+        assert "never extract them again" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_an_item_s_id_is_the_item_s_own_words(self):
+        assert "An item's id is the item's own words" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_the_lead_in_sets_the_subject_or_predicate_and_is_not_an_entity(self):
+        assert "as if its line were a sentence completing the lead-in" in EXTRACTION_SYSTEM_PROMPT
+        assert "sets the subject or the predicate for the items under it" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "it is not an entity unless it names one" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_a_refer_back_item_takes_the_earlier_item_s_id(self):
+        assert "resolves to that item's entity and uses the same id" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_an_option_nobody_chose_gets_no_edge(self):
+        assert "that nobody chose, gets no edge" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_checked_and_unchecked_boxes(self):
+        assert "A checked box `[x]` states a fact that is done" in EXTRACTION_SYSTEM_PROMPT
+        assert "An unchecked box `[ ]` is a plan and gets no edge" in EXTRACTION_SYSTEM_PROMPT
+        assert "a lead-in that names goals, where it is HAS_GOAL" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_a_table_row_is_one_fact_about_its_first_column(self):
+        assert "one fact about its first column" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_a_list_with_nothing_durable_is_empty(self):
+        assert "A list with nothing durable, such as an errand list" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_itinerary_items_are_experienced_events_with_dates(self):
+        assert "Itinerary items are Events" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n3_decisions(self):
+        assert "Decisions. A decision the user or the user's team makes" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "A decision does not make its outcome a current fact" in EXTRACTION_SYSTEM_PROMPT
+        assert "A decision by someone else gets the Event and the link" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+
+    def test_n5_stated_places_and_organisations(self):
+        assert "Stated places and organisations." in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n7_third_party_events(self):
+        assert "Third-party events. A named person's own Event" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n13_topic_links(self):
+        assert "Topic links. An Event links by RELATED_TO" in EXTRACTION_SYSTEM_PROMPT
+        assert "Something chosen for a subject links to that subject" in (EXTRACTION_SYSTEM_PROMPT)
+
+    def test_example_29_the_stated_place_is_a_location_related_to_the_event(self):
+        _, output = _examples()[29]
+        event = next(e for e in output["entities"] if e["type"] == "Event")
+        place = next(e for e in output["entities"] if e["type"] == "Location")
+        assert _has_edge(output, event["id"], "RELATED_TO", place["id"])
+
+    def test_example_30_is_one_rendered_unit_whose_lead_in_sets_the_predicate(self):
+        heading = next(
+            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if "### Example 30:" in line
+        )
+        utterance, output = _examples()[30]
+        context, item = utterance.rsplit(": ", 1)
+        assert " > " in context, "the unit renders its context joined by ' > '"
+        item_id = "-".join(re.findall(r"[a-z0-9]+", item.lower()))
+        entities = _entities_by_id(output)
+        assert set(entities) == {"user", item_id}, "only the item is an entity, by its own words"
+        assert _has_edge(output, "user", "LEARNING", item_id)
+        assert len(output["relationships"]) == 1
+        # The earlier unit, shown as a `[user]:` context line, is not extracted again.
+        earlier = heading.split("Context: [user]: ", 1)[1].rsplit(": ", 1)[1]
+        assert "-".join(re.findall(r"[a-z0-9]+", earlier.lower())) not in entities
 
 
 class TestUserTemplate:
@@ -440,8 +527,8 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-11-10-r8", group 1 (identity conventions).
-    PINNED_SHA256 = "2ea75168d5036cecfd1e22b0f082de8c9f8756c0b7b1d8339d207edb074ef51f"
+    # extraction_version = "2026-11-10-r8", groups 1 (identity) and 2 (list conventions).
+    PINNED_SHA256 = "0dc85cac1e777c4985c30dcfd44c284049a2d1aa323d5569c912ed137313345e"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
