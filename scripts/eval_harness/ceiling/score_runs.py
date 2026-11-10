@@ -23,6 +23,33 @@ have a raw row, relation precision (matched over produced), entity recall and pr
 the classifier's class counts and recall over the relations the prompt asks for: the
 classifier's `_beyond_prompt` sets aside the relations the current gold adds to the pre-H8
 gold, and `diagnose` classifies the rest. Every figure is the scorer's or the classifier's own.
+`--pre-h8-gold` is optional: without it the gold's own `beyond_prompt` flags set relations
+aside (`asked-for basis: the gold's beyond_prompt flags, N relations set aside`), and a gold
+with neither (the 60, held-out) prints `asked-for basis: n/a (no beyond-prompt flags)` and
+the classifier line reads `classifier recall over every relation`.
+
+When the code root's scorer has aligned scoring (plan v8, D8: `score_run` takes
+`accepted_pairs`), each run also prints
+
+    [aligned X] recall R (tp/n) ci95 [lo, hi]; precision P (tp/m) ci95 [lo, hi]; f1 F ci95
+    [lo, hi]; id agreement A (rail/aligned); typing T (ok/total); list-only recall L (tp/n);
+    kinds exact=N ...; pending P accepted Q
+
+on one line, and each pair of runs, after the `[paired ...]` lines,
+
+    [paired-aligned X|Y] recall diff D ci95 [lo, hi]; precision diff D ci95 [lo, hi]; probes
+    n of t
+
+with D second minus first over the probes both completed. Intervals are the gauntlet's
+cluster bootstrap by probe tag (`scripts/model_bench/probes/extraction.py`, imported from the
+code root), 10,000 replicates, seed 0, 95%. Typing is the scorer's relation-typing accuracy;
+list-only recall pools the aligned counts of probes `extraction_report.is_list_probe` names.
+`--accepted-pairs PATH` (repeatable) reads `{"tag", "gold_id", "produced_id", "accept"}` rows,
+and a typo or paraphrase pair counts only when a row accepts it. `--pairs-out DIR` writes each
+run's pending pairs to `DIR/<name>.jsonl` with neither the run's name nor the accepted flag in
+a row, so a blind adjudicator can read them pooled; it is refused, before anything is scored
+or written, for a gold whose file name starts with `heldout-`, and for a pairs file that
+exists. A scorer without aligned scoring prints neither line and refuses both options.
 
 With two or more runs, one line per unordered pair of `--run` names, in `--run` order (n1|n2,
 n1|n3, ..., then n2|n3 and so on), compares the runs on the same probes:
@@ -66,6 +93,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import math
 import sys
@@ -77,6 +105,13 @@ from typing import Protocol
 
 SCORER_MODULE = "scripts.eval_harness.score_extraction_run"
 CLASSIFIER_MODULE = "scripts.eval_harness.diagnose_list_misses"
+# Loaded only for a scorer with aligned scoring: the cluster bootstrap and `is_list_probe`.
+BOOTSTRAP_MODULE = "scripts.model_bench.probes.extraction"
+REPORT_MODULE = "scripts.eval_harness.extraction_report"
+BOOTSTRAP_REPLICATES = 10_000
+BOOTSTRAP_SEED = 0
+BOOTSTRAP_CONFIDENCE = 0.95
+PAIR_FIELDS = ("tag", "utterance", "gold_id", "gold_type", "produced_id", "produced_type", "kind")
 _GUARDED_PACKAGES = frozenset({"scripts", "backend"})
 
 RawRow = dict[str, object]
@@ -112,6 +147,26 @@ class _Produced(Protocol):
 
     entities: Sequence[_Entity]
     relationships: Sequence[Mapping[str, str]]
+
+
+class _AlignedReport(Protocol):
+    """A scorer `Report` with aligned scoring, as far as this script reads it."""
+
+    per_probe: list[dict[str, object]]
+    aligned_rel_tp: int
+    aligned_rel_fp: int
+    aligned_rel_fn: int
+    aligned_rel_recall: float
+    aligned_rel_precision: float
+    aligned_rel_f1: float
+    id_rail_pairs: int
+    id_aligned_pairs: int
+    id_agreement: float
+    typing_ok: int
+    typing_total: int
+    typing_accuracy: float
+    alignment_kinds: dict[str, int]
+    pending_pairs: list[dict[str, object]]
 
 
 class ScoreRunsError(Exception):
@@ -178,10 +233,15 @@ class RunScore:
     entity_precision: Ratio
     classifier_recall: Ratio
     class_counts: tuple[tuple[str, int], ...]
+    # False when nothing marks the relations beyond the prompt, so the classifier counts all.
+    asked_for: bool = True
 
     def lines(self) -> list[str]:
         """The run's lines, each prefixed `[name]` so a reader can tell which runs printed."""
         prefix = f"[{self.name}]"
+        classifier_basis = (
+            "without the relations beyond the prompt" if self.asked_for else "over every relation"
+        )
         out = [
             f"{prefix} relation recall: {self.relation_recall}",
             f"{prefix} relation recall over probes with a raw row: "
@@ -191,8 +251,7 @@ class RunScore:
             f"{prefix} relation precision: {self.relation_precision}",
             f"{prefix} entity recall: {self.entity_recall}",
             f"{prefix} entity precision: {self.entity_precision}",
-            f"{prefix} classifier recall without the relations beyond the prompt: "
-            f"{self.classifier_recall}",
+            f"{prefix} classifier recall {classifier_basis}: {self.classifier_recall}",
         ]
         out.extend(f"{prefix} class {cls}: {count}" for cls, count in self.class_counts)
         return out
@@ -230,18 +289,162 @@ class ScoredRun:
     index: dict[str, _Produced]
     misses: dict[str, list[Key]]
     fps: dict[str, list[Key]]
+    aligned: AlignedScore | None = None
+    pending_pairs: tuple[dict[str, object], ...] = ()
+
+
+def _ci(bounds: tuple[float, float] | None, *, signed: bool = False) -> str:
+    if bounds is None:
+        return "ci95 n/a"
+    spec = "+.3f" if signed else ".3f"
+    return f"ci95 [{format(bounds[0], spec)}, {format(bounds[1], spec)}]"
+
+
+@dataclass(frozen=True, slots=True)
+class AlignedScore:
+    """One run's relations over aligned entity ids, with their intervals."""
+
+    name: str
+    recall: Ratio
+    recall_ci: tuple[float, float] | None
+    precision: Ratio
+    precision_ci: tuple[float, float] | None
+    f1: float
+    f1_ci: tuple[float, float] | None
+    id_agreement: Ratio
+    typing: Ratio
+    list_only_recall: Ratio
+    kinds: tuple[tuple[str, int], ...]
+    pending: int
+    accepted: int
+
+    def line(self) -> str:
+        """The run's aligned line, prefixed `[aligned ` so no `[name] ` prefix matches it."""
+        kinds = " ".join(f"{kind}={count}" for kind, count in self.kinds)
+        return (
+            f"[aligned {self.name}] recall {self.recall} {_ci(self.recall_ci)}; "
+            f"precision {self.precision} {_ci(self.precision_ci)}; "
+            f"f1 {self.f1:.3f} {_ci(self.f1_ci)}; id agreement {self.id_agreement}; "
+            f"typing {self.typing}; list-only recall {self.list_only_recall}; "
+            f"kinds {kinds}; pending {self.pending} accepted {self.accepted}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AlignedPairScore:
+    """Second minus first of two runs' aligned recall and precision over the shared probes."""
+
+    first: str
+    second: str
+    recall_diff: float
+    recall_ci: tuple[float, float] | None
+    precision_diff: float
+    precision_ci: tuple[float, float] | None
+    shared_probes: int
+    total_probes: int
+
+    def line(self) -> str:
+        """The pair's line, prefixed `[paired-aligned ` so no `[paired ` filter matches it."""
+
+        def diff(value: float) -> str:
+            return "n/a" if math.isnan(value) else f"{value:+.3f}"
+
+        return (
+            f"[paired-aligned {self.first}|{self.second}] recall diff {diff(self.recall_diff)} "
+            f"{_ci(self.recall_ci, signed=True)}; precision diff {diff(self.precision_diff)} "
+            f"{_ci(self.precision_ci, signed=True)}; probes {self.shared_probes} of "
+            f"{self.total_probes}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Aligned:
+    """The modules and inputs the aligned lines need, loaded only for a scorer that has them."""
+
+    bootstrap: ModuleType
+    report: ModuleType
+    accepted: frozenset[tuple[str, str, str]]
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _Parser(description=__doc__.splitlines()[0])
     parser.add_argument("--code-root", type=Path, required=True)
     parser.add_argument("--gold", type=Path, required=True)
-    parser.add_argument("--pre-h8-gold", type=Path, required=True)
+    parser.add_argument(
+        "--pre-h8-gold",
+        type=Path,
+        help="the gold before H8; its diff sets relations aside in place of the gold's "
+        "beyond_prompt flags",
+    )
     parser.add_argument("--run", action="append", required=True, metavar="NAME=PATH")
     parser.add_argument("--expect", action="append", default=[], metavar="NAME=R")
     parser.add_argument("--worksheet-run", metavar="NAME")
     parser.add_argument("--worksheet", type=Path, metavar="OUT")
+    parser.add_argument(
+        "--pairs-out",
+        type=Path,
+        metavar="DIR",
+        help="write each run's pending typo and paraphrase pairs to DIR/<name>.jsonl",
+    )
+    parser.add_argument(
+        "--accepted-pairs",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="an adjudicated pairs file, repeatable: {tag, gold_id, produced_id, accept} rows",
+    )
     return parser.parse_args(argv)
+
+
+def _pairs_targets(args: argparse.Namespace, runs: dict[str, Path]) -> dict[str, Path]:
+    """Each run's pairs file; refused for a held-out gold and for a file that exists."""
+    if args.pairs_out is None:
+        return {}
+    if args.gold.name.startswith("heldout-"):
+        raise UsageError(
+            f"--pairs-out with a held-out gold ({args.gold.name}): held-out pairs are never "
+            "written; nothing was scored"
+        )
+    targets = {name: args.pairs_out / f"{name}.jsonl" for name in runs}
+    existing = [str(path) for path in targets.values() if path.exists()]
+    if existing:
+        raise UsageError(f"pairs file already exists: {', '.join(existing)}; nothing was scored")
+    return targets
+
+
+def _read_accepted(paths: list[Path]) -> frozenset[tuple[str, str, str]]:
+    """The accepted (tag, gold id, produced id) rows; a row two files disagree on is refused."""
+    verdicts: dict[tuple[str, str, str], bool] = {}
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise InputError(f"cannot read accepted pairs {path}: {exc}") from exc
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise InputError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+            if not (
+                isinstance(row, dict)
+                and all(isinstance(row.get(k), str) for k in ("tag", "gold_id", "produced_id"))
+                and isinstance(row.get("accept"), bool)
+            ):
+                raise InputError(
+                    f"{path}:{line_no}: a pairs row needs string tag, gold_id and produced_id "
+                    "and a true or false accept"
+                )
+            key = (row["tag"], row["gold_id"], row["produced_id"])
+            if verdicts.setdefault(key, row["accept"]) != row["accept"]:
+                raise InputError(f"{path}:{line_no}: {' '.join(key)} is both accepted and not")
+    return frozenset(key for key, accept in verdicts.items() if accept)
+
+
+def _has_aligned_scoring(scorer: ModuleType) -> bool:
+    return "accepted_pairs" in inspect.signature(scorer.score_run).parameters
 
 
 def _worksheet_target(args: argparse.Namespace, runs: dict[str, Path]) -> Path | None:
@@ -379,14 +582,19 @@ def _score_run(
     name: str,
     path: Path,
     probes: list[_Probe],
-    beyond_prompt: set[tuple[str, Key]],
+    beyond_prompt: set[tuple[str, Key]] | None,
+    aligned: Aligned | None,
 ) -> tuple[RunScore, ScoredRun]:
     rows = _read_raw(name, path)
     index = _produced_index(scorer, path, rows)
-    report = scorer.score_run(probes, index)
+    if aligned is None:
+        report = scorer.score_run(probes, index)
+    else:
+        # The accepted pairs move only the aligned figures; the exact ones do not read them.
+        report = scorer.score_run(probes, index, accepted_pairs=aligned.accepted)
     covered = [p for p in probes if p.tag in rows]
     covered_report = scorer.score_run(covered, index)
-    diagnosis = classifier.diagnose(probes, rows, beyond_prompt)
+    diagnosis = classifier.diagnose(probes, rows, beyond_prompt or set())
     counts = {cls: 0 for cls in classifier.CLASSES}
     for miss in diagnosis.misses:
         counts[miss.cls] = counts.get(miss.cls, 0) + 1
@@ -411,12 +619,50 @@ def _score_run(
         ),
         classifier_recall=Ratio.of(diagnosis.found, diagnosis.total),
         class_counts=tuple(counts.items()),
+        asked_for=beyond_prompt is not None,
     )
     return score, ScoredRun(
         rows=rows,
         index=index,
         misses={r["tag"]: [_key(k) for k in r["rel_fns"]] for r in report.per_probe},
         fps={r["tag"]: [_key(k) for k in r["rel_fps"]] for r in report.per_probe},
+        aligned=None if aligned is None else _aligned_score(aligned, name, report),
+        pending_pairs=() if aligned is None else tuple(report.pending_pairs),
+    )
+
+
+def _bootstrap_ci(
+    aligned: Aligned, counts: dict[str, tuple[int, int, int]], kind: str
+) -> tuple[float, float] | None:
+    result: tuple[float, float] | None = aligned.bootstrap.cluster_bootstrap_ratio_ci(
+        counts,
+        n_replicates=BOOTSTRAP_REPLICATES,
+        seed=BOOTSTRAP_SEED,
+        confidence=BOOTSTRAP_CONFIDENCE,
+        kind=kind,
+    )
+    return result
+
+
+def _aligned_score(aligned: Aligned, name: str, report: _AlignedReport) -> AlignedScore:
+    """The scorer's aligned figures, intervals by the gauntlet's cluster bootstrap."""
+    counts = aligned.bootstrap.per_probe_aligned_rel_counts(report.per_probe)
+    listed = [c for tag, c in counts.items() if aligned.report.is_list_probe(tag)]
+    tp, fp, fn = report.aligned_rel_tp, report.aligned_rel_fp, report.aligned_rel_fn
+    return AlignedScore(
+        name=name,
+        recall=Ratio(report.aligned_rel_recall, tp, tp + fn),
+        recall_ci=_bootstrap_ci(aligned, counts, "recall"),
+        precision=Ratio(report.aligned_rel_precision, tp, tp + fp),
+        precision_ci=_bootstrap_ci(aligned, counts, "precision"),
+        f1=report.aligned_rel_f1,
+        f1_ci=_bootstrap_ci(aligned, counts, "f1"),
+        id_agreement=Ratio(report.id_agreement, report.id_rail_pairs, report.id_aligned_pairs),
+        typing=Ratio(report.typing_accuracy, report.typing_ok, report.typing_total),
+        list_only_recall=Ratio.of(sum(c[0] for c in listed), sum(c[0] + c[2] for c in listed)),
+        kinds=tuple(report.alignment_kinds.items()),
+        pending=len(report.pending_pairs),
+        accepted=sum(1 for pair in report.pending_pairs if pair["accepted"]),
     )
 
 
@@ -456,6 +702,95 @@ def _paired_scores(
                 )
             )
     return pairs
+
+
+def _paired_aligned_scores(
+    scorer: ModuleType, aligned: Aligned, probes: list[_Probe], runs: dict[str, ScoredRun]
+) -> list[AlignedPairScore]:
+    """Each unordered pair in `--run` order: second minus first over the shared probes."""
+    names = list(runs)
+    completed = {name: _completed(probes, run) for name, run in runs.items()}
+    pairs: list[AlignedPairScore] = []
+    for i, first in enumerate(names):
+        for second in names[i + 1 :]:
+            shared = [p for p in probes if p.tag in completed[first] & completed[second]]
+            one = scorer.score_run(shared, runs[first].index, accepted_pairs=aligned.accepted)
+            two = scorer.score_run(shared, runs[second].index, accepted_pairs=aligned.accepted)
+            one_counts = aligned.bootstrap.per_probe_aligned_rel_counts(one.per_probe)
+            two_counts = aligned.bootstrap.per_probe_aligned_rel_counts(two.per_probe)
+
+            def interval(kind: str, a=one_counts, b=two_counts) -> tuple[float, float] | None:
+                result: tuple[float, float] | None = (
+                    aligned.bootstrap.cluster_bootstrap_paired_difference_ci(
+                        a,
+                        b,
+                        n_replicates=BOOTSTRAP_REPLICATES,
+                        seed=BOOTSTRAP_SEED,
+                        confidence=BOOTSTRAP_CONFIDENCE,
+                        kind=kind,
+                    )
+                )
+                return result
+
+            empty = not shared
+            pairs.append(
+                AlignedPairScore(
+                    first=first,
+                    second=second,
+                    recall_diff=(
+                        math.nan if empty else two.aligned_rel_recall - one.aligned_rel_recall
+                    ),
+                    recall_ci=interval("recall"),
+                    precision_diff=(
+                        math.nan if empty else two.aligned_rel_precision - one.aligned_rel_precision
+                    ),
+                    precision_ci=interval("precision"),
+                    shared_probes=len(shared),
+                    total_probes=len(probes),
+                )
+            )
+    return pairs
+
+
+def _write_pairs(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    """A run's pending pairs without the run's name or the accepted flag, for a blind reader."""
+    text = "".join(
+        json.dumps({field: row[field] for field in PAIR_FIELDS}, ensure_ascii=False) + "\n"
+        for row in rows
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+    except FileExistsError as exc:
+        raise InputError(f"pairs file {path} already exists") from exc
+    except OSError as exc:
+        raise InputError(f"cannot write pairs file {path}: {exc}") from exc
+
+
+def _asked_for_basis(
+    scorer: ModuleType, classifier: ModuleType, probes: list[_Probe], pre_h8_gold: Path | None
+) -> tuple[set[tuple[str, Key]] | None, str | None]:
+    """The relations beyond the prompt, None when nothing marks them, and the line saying so.
+
+    The pre-H8 gold's diff wins when it is given and prints no line, as before; otherwise the
+    gold's own `beyond_prompt` flags are read.
+    """
+    if pre_h8_gold is not None:
+        return classifier._beyond_prompt(probes, _load_gold(scorer, pre_h8_gold)), None
+    flagged = {
+        (p.tag, (r.source, r.predicate, r.target))
+        for p in probes
+        for r in p.relationships
+        if getattr(r, "beyond_prompt", False)
+    }
+    if not flagged:
+        return None, "asked-for basis: n/a (no beyond-prompt flags)"
+    n = len(flagged)
+    return flagged, (
+        f"asked-for basis: the gold's beyond_prompt flags, {n} relation"
+        f"{'' if n == 1 else 's'} set aside"
+    )
 
 
 def _key(parts: Sequence[str]) -> Key:
@@ -561,22 +896,32 @@ def _run(argv: Sequence[str] | None) -> int:
     runs = _named_runs(args.run)
     expects = _expectations(args.expect, runs)
     worksheet = _worksheet_target(args, runs)
+    pairs_targets = _pairs_targets(args, runs)
     code_root = args.code_root.resolve()
     if not code_root.is_dir():
         raise UsageError(f"--code-root {code_root} is not a directory")
-    for path in (args.gold, args.pre_h8_gold, *runs.values()):
-        if not path.is_file():
+    for path in (args.gold, args.pre_h8_gold, *runs.values(), *args.accepted_pairs):
+        if path is not None and not path.is_file():
             raise InputError(f"no such file: {path}")
+    accepted = _read_accepted(args.accepted_pairs)
 
     _bind_code_root(code_root)
     scorer = _import(SCORER_MODULE)
     classifier = _import(CLASSIFIER_MODULE)
+    aligned: Aligned | None = None
+    if _has_aligned_scoring(scorer):
+        aligned = Aligned(_import(BOOTSTRAP_MODULE), _import(REPORT_MODULE), accepted)
+    elif pairs_targets or args.accepted_pairs:
+        raise InputError(
+            "the code root's scorer has no aligned scoring, which --pairs-out and "
+            "--accepted-pairs need"
+        )
     _check_code_root(code_root)
 
     probes = _load_gold(scorer, args.gold)
-    beyond_prompt = classifier._beyond_prompt(probes, _load_gold(scorer, args.pre_h8_gold))
+    beyond_prompt, basis_line = _asked_for_basis(scorer, classifier, probes, args.pre_h8_gold)
     scored = {
-        name: _score_run(scorer, classifier, name, path, probes, beyond_prompt)
+        name: _score_run(scorer, classifier, name, path, probes, beyond_prompt, aligned)
         for name, path in runs.items()
     }
     scores = {name: score for name, (score, _) in scored.items()}
@@ -586,21 +931,30 @@ def _run(argv: Sequence[str] | None) -> int:
         if f"{scores[name].relation_recall.value:.3f}" != f"{want:.3f}"
     ]
     pairs: list[PairScore] = []
+    aligned_pairs: list[AlignedPairScore] = []
+    by_name = {name: run for name, (_, run) in scored.items()}
     if not failed:
-        pairs = _paired_scores(scorer, probes, {name: run for name, (_, run) in scored.items()})
+        pairs = _paired_scores(scorer, probes, by_name)
+        if aligned is not None:
+            aligned_pairs = _paired_aligned_scores(scorer, aligned, probes, by_name)
     lines: list[dict[str, object]] = []
     if worksheet is not None and not failed:
         lines = _worksheet_lines(
-            scorer, classifier, probes, scored[args.worksheet_run][1], beyond_prompt
+            scorer, classifier, probes, scored[args.worksheet_run][1], beyond_prompt or set()
         )
     _check_code_root(code_root)
 
     print(f"scorer: {Path(scorer.__file__).resolve()}")
     print(f"classifier: {Path(classifier.__file__).resolve()}")
+    if basis_line is not None:
+        print(basis_line)
     shown = [name for name in runs if name in expects] if failed else list(runs)
     for name in shown:
         print()
         print("\n".join(scores[name].lines()))
+        aligned_score = by_name[name].aligned
+        if aligned_score is not None:
+            print(aligned_score.line())
     print()
     if failed:
         print("\n".join(failed))
@@ -609,6 +963,11 @@ def _run(argv: Sequence[str] | None) -> int:
         print(f"expect {name}: {want:.3f} holds")
     for pair in pairs:
         print(pair.line())
+    for aligned_pair in aligned_pairs:
+        print(aligned_pair.line())
+    for name, target in pairs_targets.items():
+        _write_pairs(target, by_name[name].pending_pairs)
+        print(f"pairs {name}: {len(by_name[name].pending_pairs)} pending, written to {target}")
     if worksheet is not None:
         _write_worksheet(worksheet, lines)
         run = scored[args.worksheet_run][1]
