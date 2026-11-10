@@ -6,12 +6,6 @@ nearest `LIST_CONTEXT_MAX_UNITS` earlier units as context. A turn without
 structure must send exactly the one Stage 2 request it sent before the list
 pass existed. The fake LLM here answers each Stage 2 call with one entity per
 line of the batch it was sent, so a test can read off what each call saw.
-
-Since r7 a structured turn takes the list frame path (test_list_path.py), and
-the r6 pass is its fallback. A turn whose frame message is over
-`LIST_USER_MAX_CHARS` with no history left takes the r6 pass before any list
-call, so these tests set the limit to 0 and reach the r6 pass that way. A turn
-without structure never reads the limit.
 """
 
 from __future__ import annotations
@@ -24,7 +18,6 @@ from pathlib import Path
 import pytest
 
 from backend.extraction_contract.models import ExtractRequest
-from backend.extraction_service import engine as engine_module
 from backend.extraction_service.adapters import get_adapter
 from backend.extraction_service.engine import (
     DERIVE_MAX_TOKENS,
@@ -161,12 +154,6 @@ def make_request(utterance: str, history: list[dict] | None = None, **kwargs) ->
 
 def numbered_list(count: int, lead_in: str = "Things I want to try this year:") -> str:
     return lead_in + "\n" + "\n".join(f"{n}. thing {n}" for n in range(1, count + 1))
-
-
-@pytest.fixture(autouse=True)
-def r6_list_pass(monkeypatch):
-    """Send every structured turn here through the r6 pass, as `list_frame_over_budget` does."""
-    monkeypatch.setattr(engine_module, "LIST_USER_MAX_CHARS", 0)
 
 
 # ---------------------------------------------------------------------------

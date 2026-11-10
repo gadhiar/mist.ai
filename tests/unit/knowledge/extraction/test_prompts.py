@@ -337,7 +337,7 @@ class TestExtractionVersionDriftGuard:
     def test_single_authority_holds_the_pinned_version(self):
         from backend.knowledge.version_stamps import EXTRACTION_VERSION
 
-        assert EXTRACTION_VERSION == "2026-11-08-r7"
+        assert EXTRACTION_VERSION == "2026-11-06-r6"
 
     def test_config_default_is_the_single_authority(self):
         from backend.knowledge.config import KnowledgeConfig

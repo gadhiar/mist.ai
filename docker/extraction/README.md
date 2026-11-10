@@ -122,7 +122,6 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_LLM_TIMEOUT_SECONDS` | `120` | same | Per-LLM-call timeout. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s, but the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below); 120 gives real headroom. |
 | `EXTRACTION_MAX_ATTEMPTS` | `2` | same | Maximum extraction attempts per job (first call plus repair retries on unparsable output), matching `ServiceSettings.max_attempts`'s own default. |
 | `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. The `gptoss` default is `schema` (it was `none`); see the note below the table. |
-| `EXTRACTION_LOG_LIST_OUTPUTS` | not forwarded (`false`) | `false` | When true, each list frame and item call attempt writes one JSON line (`"event": "list_output"`, keyed by `job_id`) to the service's stderr. Its text derives from the utterance, so it is on only for synthetic dev-lists runs, never for held-out runs or real turns. It changes what the service logs, never what it returns, so it is not a run identity component. Steps: `HOST_1070_RUNBOOK.md`, "List output log". |
 
 **`EXTRACTION_CONSTRAINED_MODE` and the `gptoss` default.** `GptOssAdapter`'s
 `default_constrained_mode` is `schema`, not `none`. An A/B run on the
