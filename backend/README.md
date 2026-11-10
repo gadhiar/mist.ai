@@ -157,7 +157,7 @@ class VoiceConfig(BaseModel):
 
     # TTS
     tts_device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    voice_profile: str = "friday"  # Selected via VOICE_PROFILE env var
+    voice_profile: str = "mist"  # Selected via VOICE_PROFILE env var
     use_voice_context: bool = True
 ```
 
@@ -177,7 +177,8 @@ class VoiceConfig(BaseModel):
 - **Fallback:** OllamaProvider remains wired for `LLM_BACKEND=ollama`
 
 ### TTS: Chatterbox
-- **Model:** Zero-shot voice cloning from reference WAV (MIT license)
+- **Model:** Chatterbox's built-in voice; a profile may name a reference WAV to clone
+  instead (MIT license)
 - **Sample Rate:** 24kHz
 - **Latency:** ~0.74x RTF in-container
 - **Legacy:** Sesame CSM-1B retained under `dependencies/csm/` for rollback only

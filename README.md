@@ -50,7 +50,7 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 |-------------|---------------------------------------------|
 | LLM         | Gemma 4 E4B Q5_K_M via llama-server         |
 | STT         | OpenAI Whisper                              |
-| TTS         | Chatterbox (zero-shot voice cloning)  |
+| TTS         | Chatterbox (built-in voice)                 |
 | VAD         | Silero VAD                                  |
 | Server      | FastAPI + Uvicorn + WebSockets              |
 | Database    | Neo4j 5.x (knowledge graph)                 |

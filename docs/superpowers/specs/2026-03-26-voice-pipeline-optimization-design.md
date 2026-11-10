@@ -38,8 +38,8 @@ share a single CUDA context inside the backend container.
 
 ### 1.3 Log-Derived Pipeline Timings
 
-The log contains two server sessions. Session 2 (05:00 series, FRIDAY voice
-profile, 46s reference) provides the cleanest data because LLM was already
+The log contains two server sessions. Session 2 (05:00 series, the default voice
+profile at the time, 46s reference) provides the cleanest data because LLM was already
 warm. All timings below are from session 2 unless noted.
 
 #### Conversation Turn 1: "hi mist how are you doing" (61 chars response)
@@ -89,7 +89,7 @@ TOTAL: speech-end to last-audio-sent   = 15.41s
   TTS:  11.74s (chunk 1: 8.66s, chunk 2: 2.90s)
 ```
 
-#### Session 1 Data Points (Jarvis voice, 25s reference)
+#### Session 1 Data Points (a second voice profile, 25s reference)
 
 | Turn | Input | Response | LLM | TTS | TTS Chunks | First Audio | Total |
 |------|-------|----------|-----|-----|------------|-------------|-------|
@@ -522,7 +522,7 @@ This is the single highest-impact change.
 
 **Estimated latency improvement:**
 
-TTS RTF analysis from logs (Chatterbox Turbo, FRIDAY voice):
+TTS RTF analysis from logs (Chatterbox Turbo, the default voice, session 2):
 
 | Chars | Audio Duration | Gen Time | RTF | Steps |
 |-------|---------------|----------|-----|-------|

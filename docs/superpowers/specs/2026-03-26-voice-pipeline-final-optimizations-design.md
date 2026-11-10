@@ -202,39 +202,34 @@ Each voice profile gets a companion personality config:
 
 ```
 voice_profiles/
-  friday/
-    profile.yaml          # Existing: TTS params (reference audio, exaggeration, etc.)
+  mist/
+    profile.yaml          # Existing: TTS params (exaggeration, cfg_weight, etc.)
     personality.yaml      # New: speaking style, openers, mannerisms
-  jarvis/
-    profile.yaml
-    personality.yaml
-  cortana/
-    profile.yaml
-    personality.yaml
 ```
 
 Personality config format:
 
 ```yaml
-name: FRIDAY
-address_form: "Boss"
+name: M.I.S.T
+address_form: null
 characteristic_openers:
-  - "Sure thing, Boss."
   - "Got it."
   - "Right away."
-  - "On it, Boss."
   - "Here's what I found."
   - "One moment."
+  - "Working on it."
+  - "Right."
 speaking_style: |
-  Concise, professional, slightly warm. Military-assistant cadence.
+  Concise, professional, slightly warm.
   Favor short declarative sentences. No filler or hedging.
-  Address the user as "Boss" occasionally but not every response.
   Lead with action or acknowledgment, then substance.
+  Keep voice responses to 1-3 sentences for simple questions.
+  For detailed requests, provide thorough but structured answers.
 mannerisms:
-  - Uses "Boss" as form of address (2-3x per conversation, not every turn)
   - Dry humor when appropriate
   - Never says "I think" -- states things directly
-  - Avoids unnecessary qualifiers
+  - Avoids unnecessary qualifiers and hedging
+  - Prioritizes correctness and accuracy
 ```
 
 #### System Prompt Templating
@@ -267,9 +262,7 @@ regardless of length.
 
 ### Changes
 
-- New: `voice_profiles/friday/personality.yaml`
-- New: `voice_profiles/jarvis/personality.yaml` (stub)
-- New: `voice_profiles/cortana/personality.yaml` (stub)
+- New: `voice_profiles/mist/personality.yaml`
 - `backend/chat/knowledge_integration.py`: Load personality config, template
   into voice system prompt
 - `backend/voice_processor.py`: First-sentence coalescing bypass in
@@ -285,7 +278,7 @@ established for all future voice profile work.
 
 - Flutter "Profiles" screen: Replace Voice Profiles stub with unified profile
   management UI combining TTS voice settings + personality config
-- FRIDAY personality review: Dedicated pass to tune openers, mannerisms, and
+- M.I.S.T personality review: Dedicated pass to tune openers, mannerisms, and
   speaking style for quality and naturalness
 
 ---
@@ -307,7 +300,7 @@ after full sequence completion.
 | Criterion | Requirement |
 |-----------|-------------|
 | Output mode | Streaming/chunked (frames emitted mid-generation) |
-| Voice cloning | Zero-shot or few-shot from reference audio |
+| Voice cloning | From reference audio alone, or from a few samples |
 | RTF | Competitive with Chatterbox (~0.74x or better) |
 | VRAM | Fits within ~4GB (current Chatterbox allocation) |
 | License | MIT, Apache 2.0, or similar |
@@ -358,7 +351,7 @@ written.
 | Adaptive pre-buffering -- remove 6s buffer, client jitter only | Improvement | High | Voice |
 | Personality profile system + first-utterance priming | Feature | High | Voice |
 | Flutter Profiles screen (voice + personality management) | Feature | Medium | Frontend |
-| FRIDAY personality review and finalization | Improvement | Medium | Voice |
+| M.I.S.T personality review and finalization | Improvement | Medium | Voice |
 | Research: Streaming TTS model evaluation | Research | Medium | Voice |
 
 ### Ticket Updates
@@ -366,7 +359,7 @@ written.
 | Ticket | Current Status | Action |
 |--------|---------------|--------|
 | MIS-76 (Voice Streaming E2E) | Backlog | Update description: merge conflict resolution needed against pipeline parallelism on main. Covers binary transport implementation (no new ticket needed). |
-| MIS-45 (FRIDAY Voice Research) | In Progress | Mark Done -- FRIDAY voice profile created and shipped |
+| MIS-45 (Voice Research) | In Progress | Mark Done -- the default voice profile created and shipped |
 | MIS-44 (Voice Pipeline Review) | Backlog | Update -- pipeline parallelism addressed architecture rework |
 | MIS-50 (Voice Pipeline Refactoring Phase 1) | Backlog | Review scope overlap with completed pipeline parallelism work |
 
@@ -380,7 +373,7 @@ Phase A (tightly coupled):
   2. Remove 6s backend pre-buffer, validate adaptive client jitter buffer
 
 Phase B (independent):
-  3. Personality config system + FRIDAY personality + system prompt templating
+  3. Personality config system + M.I.S.T personality + system prompt templating
   4. First-sentence coalescing bypass
 
 Phase C (parallel research):

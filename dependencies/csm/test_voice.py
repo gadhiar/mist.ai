@@ -3,8 +3,8 @@
 Usage:
     python test_voice.py                          # Test with default lines
     python test_voice.py "Custom text to speak"   # Test with custom text
-    python test_voice.py --profile cortana        # Use VoiceProfile system
-    python test_voice.py --profile cortana "Hi"   # Profile + custom text
+    python test_voice.py --profile <name>         # Use VoiceProfile system
+    python test_voice.py --profile <name> "Hi"    # Profile + custom text
 """
 
 import argparse
@@ -22,21 +22,6 @@ from huggingface_hub import hf_hub_download
 MODEL_WEIGHTS = "finetuned_model/model.safetensors"
 SPEAKER_ID = 0
 OUTPUT_DIR = "test_output"
-
-# Reference clips for voice anchoring -- model uses these to match the voice
-REFERENCE_DIR = "D:/rajga/Downloads/Xbox 360 - Halo 3 - Character Voices - Cortana/Cortana"
-REFERENCE_CLIPS = [
-    # 050lb files -- AI-processed/radio-filtered Cortana voice
-    ("050lb_030_cor.wav", "High Charity, the Prophet's Holy City is on-"),
-    (
-        "050lb_230_cor.wav",
-        "High Charity, the Prophet's Holy City is on its way to Earth, with an army of flood.",
-    ),
-    (
-        "050lb_240_cor.wav",
-        "I can't tell you everything. It's not safe. The Gravemind, it knows I'm in the system.",
-    ),
-]
 
 TEST_LINES = [
     "Good morning. I've reviewed the session notes from yesterday.",
@@ -162,17 +147,9 @@ def main():
         weights_path = str(profile.weights_path)
         ref_clips = [(str(c.audio_path), c.transcription) for c in profile.reference_clips]
     else:
-        # Standalone mode
+        # Standalone mode: no reference clips, so generation runs without voice anchoring
         weights_path = args.weights or MODEL_WEIGHTS
-        profile_ref_dir = os.path.join(
-            os.path.dirname(__file__), "..", "..", "data", "voice_profiles", "cortana"
-        )
-        if os.path.isdir(profile_ref_dir) and os.path.exists(
-            os.path.join(profile_ref_dir, REFERENCE_CLIPS[0][0])
-        ):
-            ref_clips = [(os.path.join(profile_ref_dir, f), t) for f, t in REFERENCE_CLIPS]
-        else:
-            ref_clips = [(os.path.join(REFERENCE_DIR, f), t) for f, t in REFERENCE_CLIPS]
+        ref_clips = []
 
     if not os.path.exists(weights_path):
         print(f"Weights not found at {weights_path}")

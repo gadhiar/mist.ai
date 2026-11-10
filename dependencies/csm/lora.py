@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 AUDIO_DIR = "audio_data"
 OUTPUT_DIR = "finetuned_model"
-NUM_EPOCHS = 15  # 277 Cortana clips, 15 epochs
+NUM_EPOCHS = 15  # the 277-clip fine-tuning dataset, 15 epochs
 BATCH_SIZE = 1  # Conservative for 12GB VRAM
 GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = 8 for stable gradients
 LEARNING_RATE = 5e-7  # Smooth convergence over more epochs
@@ -48,7 +48,7 @@ WARMUP_STEPS = 75  # Proportional warmup for 15 epochs
 SPEAKER_ID = 0
 MODEL_NAME = "sesame/csm-1b"
 TRANSCRIPTION_MODEL = "openai/whisper-large-v3-turbo"
-MAX_AUDIO_FILES = 0  # Use all 277 Cortana clips
+MAX_AUDIO_FILES = 0  # Use every clip of the 277-clip fine-tuning dataset
 R = 96  # High rank for best voice quality without overfitting
 APLHA = 96  # Keep scaling ratio at 1.0
 

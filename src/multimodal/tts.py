@@ -240,10 +240,11 @@ logger = logging.getLogger(__name__)
 
 
 class ChatterboxTTS:
-    """Wrapper for Chatterbox TTS with zero-shot voice cloning.
+    """Wrapper for Chatterbox TTS: the engine's built-in voice, or a clone of one clip.
 
     Unlike CSM, Chatterbox does not use context segments or fine-tuned weights.
-    It clones voice from a single reference WAV file at inference time.
+    A profile with a reference WAV is cloned from it at inference time; a profile
+    without one uses the built-in voice that ships with the pretrained weights.
     """
 
     SAMPLE_RATE = 24_000
@@ -252,7 +253,9 @@ class ChatterboxTTS:
         """Initialize Chatterbox TTS.
 
         Args:
-            profile: VoiceProfile with reference_audio_path set.
+            profile: VoiceProfile with `tts_engine` "chatterbox". Its
+                `reference_audio_path` is the clip to clone, or None for the
+                built-in voice.
             device: 'cuda' or 'cpu'. Auto-detects if None.
         """
         if device is None:
@@ -260,7 +263,11 @@ class ChatterboxTTS:
 
         self.profile = profile
         self.device = device
-        self.reference_audio_path = str(profile.reference_audio_path)
+        # None, not the string "None": Chatterbox loads a clip only when
+        # `audio_prompt_path` is truthy and otherwise keeps its built-in voice.
+        self.reference_audio_path: str | None = (
+            None if profile.reference_audio_path is None else str(profile.reference_audio_path)
+        )
 
         logger.info("Loading Chatterbox (%s) on %s...", profile.name, device)
 
@@ -271,7 +278,10 @@ class ChatterboxTTS:
         logger.info("Chatterbox (%s) loaded", profile.name)
 
     def generate(self, text: str) -> torch.Tensor:
-        """Generate speech from text using zero-shot voice cloning.
+        """Generate speech from text in the profile's voice.
+
+        Passes `reference_audio_path` as `audio_prompt_path`; None selects the
+        engine's built-in voice.
 
         Args:
             text: Text to synthesize.

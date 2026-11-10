@@ -107,8 +107,8 @@ cases:
     expected:
       tool_name: search_web
 
-  - id: voice_profile_switch_friday
-    prompt: "Switch to the FRIDAY voice."
+  - id: voice_profile_switch_calm
+    prompt: "Switch to the calm voice."
     tools:
       - type: function
         function:
@@ -119,12 +119,12 @@ cases:
             properties:
               profile:
                 type: string
-                enum: [jarvis, friday, cortana]
+                enum: [mist, calm, bright]
             required: [profile]
     expected:
       tool_name: set_voice_profile
       arguments:
-        profile: friday
+        profile: calm
 
   - id: no_tool_small_talk
     prompt: "Good morning! How are you today?"

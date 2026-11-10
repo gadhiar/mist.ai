@@ -36,7 +36,7 @@ scripts/eval_harness/
   tests/
     schema_conformance.yaml # 12 extraction cases, production prompt + schema
     tool_selection.yaml     # 8 tool-calling cases
-    personality.yaml        # 6 persona-adherence cases
+    personality.yaml        # 6 formal / casual / clinical style cases
     rag_integration.yaml    # 5 context-grounding cases
     coherence.yaml          # 5 multi-turn coherence cases
     speed.yaml              # 5 tokens-per-second cases
