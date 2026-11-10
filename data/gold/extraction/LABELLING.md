@@ -123,8 +123,9 @@ score shows what extraction misses. In dev-lists, the six edges H8 added under s
   dvl-09, `learn-to-sail` in ho-091). The H8 check marked ho-004's goal ids good.
 - **N4 Name modifiers.** A name that only modifies another name (the Lisbon summit, the Corvane
   outage drills, the Wrenfield Bakery ordering site) gets no entity of its own, unless a list's
-  lead-in carries it (List-shaped probes; dvl-35, ho-038). From `ext-18`, where "on the payments
-  team" adds no entity, and the agreed rows ho-057, ho-069, ho-095 and ho-188.
+  lead-in carries it (List-shaped probes; dvl-35, ho-038). From the agreed rows ho-057, ho-069,
+  ho-095 and ho-188. N4 still covers a team name that only modifies another name and places no
+  one in it; a team that places someone is N17's.
 
 ### The user anchor
 
@@ -181,6 +182,46 @@ names the person. The 60-probe set has no unnamed relative.
 thesis defense, Marta's birthday dinner, Imre's retirement) is `<person> EXPERIENCED <event>`,
 beside the anchor. From prompt Rule 19 (the third party's own fact, with the person as source)
 and Rule 11 (life events pair with `EXPERIENCED`); settled on dvl-15, dvl-37 and ho-121.
+
+**N17 Named teams.** A named team, club or community that the utterance places a person in is
+an `Organization`. A person is placed in it when:
+
+- they are on it, are in it, joined it, or run or lead it;
+- the speaker's possessive names it ("our billing team", "my billing team"), which places the
+  speaker;
+- they hold a title that names the team with its group noun ("the billing team lead"); a title
+  with no group noun ("our design lead") names no team;
+- they are listed under a heading, lead-in or parent bullet that is its name.
+
+*Named:* a team is named when the utterance gives it a word that tells it apart from other
+teams, what it does or its proper name. A heading, lead-in or parent bullet also names a team
+when it carries its own group noun ("Tooling team:") or sits under a lead-in that carries a
+group noun ("My team at <employer>:" over "Tooling"). A describing word (new, old, small,
+whole, current, remote, other) does not name a team. Nor does the employer's name alone: "the
+<employer> team" is the employer, with `WORKS_AT`, and no team entity.
+
+*Id:* the phrase under N1. The group word is kept when the utterance writes it
+(`billing-team`); a heading's own word stands alone (`tooling`).
+
+*Edges:* each person placed in it gets `MEMBER_OF` it, including the one who runs or leads it.
+A named employer is a separate `Organization` that each of them `WORKS_AT`. The team gets no
+`PART_OF` to the employer.
+
+*No entity and no `MEMBER_OF` for:* a group noun with no name of its own ("my team", "the
+group", "my new team", "my team lead"), as an item or as a lead-in; a role or job title with no
+group noun; a relationship category (colleagues, friends, family, household), which N16 already
+leaves without an entity.
+
+*What stays elsewhere:* a team's tools and decisions stay on the user (N8, N3). N4 still covers
+a team name that only modifies another name and places no one in it. An employer that only
+modifies a team's name is still the employer, with `WORKS_AT`.
+
+From A32(a) (Raj's Ruling 21, 2026-11-10): the ontology types a team as an `Organization`
+("a company, team, institution, community, or open-source project", `v1_0_0.py:494`), and
+dev-lists already labels team membership this way (dvl-06, dvl-12, dvl-33). Settled on
+`ext-18` ("at Stripe on the payments team": `user MEMBER_OF payments-team` beside
+`user WORKS_AT stripe`), `ext-33` and dvl-26 (Relabel log). Beyond the prompt until the
+prompt's group 3 carries it.
 
 ### Event and metric ids
 
@@ -470,3 +511,10 @@ at least twice. T8 checks the same floor on the adjudicated labels.
   already such a run: dvl-26 `discord-bot-for-book-club` back to `discord-bot`, dvl-40
   `dark-mode-everywhere` back to `dark-mode`, with their edges and the retrieval fact
   (`rq-type-scoped-07`).
+- **2026-11-10, the 60 and dev-lists, named teams (N17; A32(a), Ruling 21; plan v11 T35).**
+  ext-18 gains the `Organization` `payments-team` and `user MEMBER_OF payments-team`, beside
+  `user WORKS_AT stripe`. ext-33's `user WORKS_AT platform-team` becomes
+  `user MEMBER_OF platform-team`, `valid_from` 2026-05 kept; the retrieval fact of
+  `rq-direct-15` follows it. dvl-26 gains the `Organization` `book-club` and
+  `user MEMBER_OF book-club` ("a Discord bot for my book club": the speaker's possessive names
+  the club), one more dev-lists gold edge. N4 no longer cites ext-18.

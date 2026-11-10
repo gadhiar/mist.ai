@@ -1291,6 +1291,33 @@ _RELABELLED_ROWS: dict[tuple[str, str], tuple[set, set]] = {
         {("user", "User"), ("mentoring-junior-engineers", "Skill")},
         {("user", "EXPERT_IN", "mentoring-junior-engineers", "2026-02")},
     ),
+    # N17 (A32(a), Ruling 21): a named team, club or community the utterance places a person
+    # in is an Organization the person is MEMBER_OF; a named employer stays WORKS_AT.
+    ("sixty", "ext-18-works-at"): (
+        {("user", "User"), ("payments-team", "Organization"), ("stripe", "Organization")},
+        {("user", "MEMBER_OF", "payments-team", None), ("user", "WORKS_AT", "stripe", None)},
+    ),
+    ("sixty", "ext-33-validtime-since"): (
+        {("user", "User"), ("platform-team", "Organization")},
+        {("user", "MEMBER_OF", "platform-team", "2026-05")},
+    ),
+    ("dev-lists", "dvl-26-list-plus-side-projects"): (
+        {
+            ("user", "User"),
+            ("book-club", "Organization"),
+            ("cli-for-splitting-bills", "Project"),
+            ("discord-bot", "Project"),
+            ("elm", "Technology"),
+            ("plotwise", "Project"),
+        },
+        {
+            ("plotwise", "IMPLEMENTED_WITH", "elm", None),
+            ("user", "MEMBER_OF", "book-club", None),
+            ("user", "WORKS_ON", "cli-for-splitting-bills", None),
+            ("user", "WORKS_ON", "discord-bot", None),
+            ("user", "WORKS_ON", "plotwise", None),
+        },
+    ),
 }
 _RELABEL_SETS = {"dev-lists": _DEV_GOLD, "sixty": _SIXTY}
 
