@@ -484,8 +484,17 @@ _GOLD_BY_SET = {"dev-lists": _DEV_GOLD, "heldout": _HELDOUT_GOLD}
 _GOLD_SIZE_RANGE = {"dev-lists": (40, 40), "heldout": (190, 210)}
 _GOLD_ROW_FIELDS = {"utterance", "tag", "expected_entities", "expected_relationships"}
 _GOLD_ENTITY_FIELDS = {"id", "type"}
+# The extraction contract's optional keys, read by `iter_gold_probes`: an entity's other
+# accepted ids, an edge's other accepted predicates, and the beyond-the-prompt flag.
+_GOLD_ENTITY_OPTIONAL = {"alternatives"}
 _GOLD_EDGE_REQUIRED = {"source", "source_type", "predicate", "target", "target_type"}
-_GOLD_EDGE_OPTIONAL = {"valid_from", "valid_to", "assertion_kind"}
+_GOLD_EDGE_OPTIONAL = {
+    "valid_from",
+    "valid_to",
+    "assertion_kind",
+    "predicate_alternatives",
+    "beyond_prompt",
+}
 _HELDOUT_LIST_MIN = 40
 _HELDOUT_NOFACT_MIN = 20
 _PROMPT_ANCHOR_IDS = {"user", "mist-identity"}
@@ -547,7 +556,7 @@ def test_gold_rows_follow_the_sixty_probe_schema(set_name):
         bad += [
             (row["tag"], sorted(e))
             for e in row["expected_entities"]
-            if set(e) != _GOLD_ENTITY_FIELDS
+            if not _GOLD_ENTITY_FIELDS <= set(e) <= _GOLD_ENTITY_FIELDS | _GOLD_ENTITY_OPTIONAL
         ]
         for rel in row["expected_relationships"]:
             keys = set(rel)
@@ -683,6 +692,126 @@ def test_heldout_ids_avoid_the_prompts_example_entities_outright():
     example_ids = {canonical_id(t) for t in _prompt_entity_terms()}
 
     assert sorted(set(_PROMPT_WORD_EXEMPTIONS) & example_ids) == []
+
+
+# --- The extraction contract's optional gold keys --------------------------------------------
+
+# Every gold set the scorer reads, the 60 probes included, is held to the optional-key rules.
+_ALL_GOLD_PARAMS = [pytest.param(p, id=p.name) for p in (_SIXTY, _DEV_GOLD, _HELDOUT_GOLD)]
+
+# The edges H8 added to dev-lists by labelling rules the production prompt does not carry:
+# the edges of today's gold that the pre-H8 gold (`4f5ceed`) lacks, as
+# `diagnose_list_misses._beyond_prompt` computed them before the Event relabel renamed any
+# endpoint. Pinned here because a test that read the parent commit would break in a shallow
+# checkout and after a squash merge.
+_BEYOND_PROMPT_EDGES = {
+    ("dvl-01-list-dash-current-tools", "fish", "IS_A", "shell"),
+    ("dvl-01-list-dash-current-tools", "helix", "IS_A", "editor"),
+    ("dvl-17-list-ref-middle-editor", "kakoune", "IS_A", "editor"),
+    ("dvl-30-list-checkbox-planning-decisions", "planning", "RELATED_TO", "docs-site-move"),
+    ("dvl-30-list-checkbox-planning-decisions", "planning", "RELATED_TO", "feature-freeze"),
+    ("dvl-34-list-long-weekly-habits", "user", "KNOWS_PERSON", "sister"),
+}
+
+
+def _optional_key_faults(rows: list[dict]) -> Counter:
+    """Count each kind of malformed optional key, so a held-out failure shows no label."""
+    faults: Counter = Counter()
+    predicates = set(EXTRACTABLE_RELATIONSHIP_TYPES)
+    for row in rows:
+        ids = [e["id"] for e in row["expected_entities"]]
+        claimed = list(ids)
+        for entity in row["expected_entities"]:
+            if "alternatives" not in entity:
+                continue
+            alternatives = entity["alternatives"]
+            if not isinstance(alternatives, list) or not alternatives:
+                faults["alternatives not a non-empty list"] += 1
+                continue
+            for alt in alternatives:
+                if not isinstance(alt, str) or canonical_id(alt) != alt:
+                    faults["alternative not a canonical id"] += 1
+                elif alt in ids:
+                    faults["alternative equal to an entity id of its probe"] += 1
+                elif alt in claimed:
+                    faults["alternative repeated within its probe"] += 1
+                claimed.append(alt)
+        for rel in row["expected_relationships"]:
+            if "beyond_prompt" in rel and rel["beyond_prompt"] is not True:
+                faults["beyond_prompt written other than true"] += 1
+            if "predicate_alternatives" not in rel:
+                continue
+            others = rel["predicate_alternatives"]
+            if not isinstance(others, list) or not others:
+                faults["predicate_alternatives not a non-empty list"] += 1
+                continue
+            if len(set(others)) != len(others) or rel["predicate"] in others:
+                faults["predicate alternative repeated"] += 1
+            for other in others:
+                if other not in predicates:
+                    faults["predicate alternative not extractable"] += 1
+                elif not _types_allowed(other, rel["source_type"], rel["target_type"]):
+                    faults["predicate alternative refused for the edge's types"] += 1
+    return faults
+
+
+@pytest.mark.parametrize("path", _ALL_GOLD_PARAMS)
+def test_optional_gold_keys_are_well_formed(path):
+    assert _optional_key_faults(_gold_rows(path)) == Counter()
+
+
+def test_optional_key_check_names_each_fault_on_synthetic_rows():
+    def edge(**extra: object) -> dict:
+        return {
+            "source": "user",
+            "source_type": "User",
+            "predicate": "USES",
+            "target": "helix",
+            "target_type": "Technology",
+            **extra,
+        }
+
+    row = {
+        "tag": "syn-01",
+        "utterance": "I use Helix and Zed.",
+        "expected_entities": [
+            {"id": "user", "type": "User"},
+            {"id": "helix", "type": "Technology", "alternatives": ["helix-editor", "Helix"]},
+            {"id": "zed", "type": "Technology", "alternatives": ["helix", "helix-editor"]},
+        ],
+        "expected_relationships": [
+            edge(beyond_prompt=True, predicate_alternatives=["PREFERS"]),
+            edge(beyond_prompt=False),
+            edge(predicate_alternatives=["USES"]),
+            edge(predicate_alternatives=["MILESTONE_OF"]),
+            edge(predicate_alternatives=["WORKS_AT"]),
+            edge(predicate_alternatives=[]),
+        ],
+    }
+
+    assert _optional_key_faults([row]) == Counter(
+        {
+            "alternative not a canonical id": 1,
+            "alternative equal to an entity id of its probe": 1,
+            "alternative repeated within its probe": 1,
+            "beyond_prompt written other than true": 1,
+            "predicate alternative repeated": 1,
+            "predicate alternative not extractable": 1,
+            "predicate alternative refused for the edge's types": 1,
+            "predicate_alternatives not a non-empty list": 1,
+        }
+    )
+
+
+def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
+    flagged = {
+        (row["tag"], rel["source"], rel["predicate"], rel["target"])
+        for row in _gold_rows(_DEV_GOLD)
+        for rel in row["expected_relationships"]
+        if rel.get("beyond_prompt")
+    }
+
+    assert flagged == _BEYOND_PROMPT_EDGES
 
 
 # --- Labelling rules from the H8 check (N11 to N16 in LABELLING.md) ---------------------------
