@@ -43,8 +43,10 @@ from backend.knowledge.extraction.validator import (  # noqa: E402
 from backend.knowledge.ontologies.hierarchy import (  # noqa: E402
     canonical_type,
     children_of,
-    parent_of,
 )
+
+# `types_match` lives with the other id form rules and is re-exported here for its callers.
+from scripts.eval_harness.entity_alignment import types_match  # noqa: E402
 from scripts.golden_log.native_shape import (  # noqa: E402
     GOLD_PREDICATE_FIELD,
     GOLD_SOURCE_FIELD,
@@ -457,21 +459,6 @@ def _typing_ok(predicate: str, s_type: str | None, t_type: str | None) -> bool:
     if allowed_tgt is not None and t_type not in allowed_tgt:
         return False
     return True
-
-
-def types_match(produced: str, gold: str) -> bool:
-    """Hierarchy-aware entity type comparison.
-
-    A produced type matches gold if it equals the canonical form of gold, OR if
-    it equals gold's parent type (Abstraction is acceptable when gold is a concrete
-    abstract-cluster leaf such as Concept or Skill). Wrong-sibling is the only miss.
-
-    Both sides are canonicalized first so retired types (Topic -> Concept,
-    Milestone -> Event) on either the produced or gold side resolve correctly.
-    """
-    g = canonical_type(gold)
-    p = canonical_type(produced)
-    return p == g or p == parent_of(g)
 
 
 def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> Report:

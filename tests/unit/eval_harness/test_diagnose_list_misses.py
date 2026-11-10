@@ -310,6 +310,55 @@ def test_relations_beyond_the_prompt_are_set_aside(
     assert "| gold relations | 1 |" in out
 
 
+def test_the_form_kinds_are_imported_from_entity_alignment() -> None:
+    # Moved, not copied: the classifier and the aligner read one definition of each form kind.
+    from scripts.eval_harness import entity_alignment as ea
+    from scripts.eval_harness import score_extraction_run as scorer
+
+    assert dlm._variant_kind is ea.variant_kind
+    assert dlm._type_compatible is ea.type_compatible
+    assert scorer.types_match is ea.types_match
+
+
+def test_entity_alignment_imports_neither_the_scorer_nor_the_classifier() -> None:
+    import ast
+
+    from scripts.eval_harness import entity_alignment as ea
+
+    tree = ast.parse(Path(ea.__file__).read_text(encoding="utf-8"))
+    imported = {
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert not any(
+        name.endswith(("score_extraction_run", "diagnose_list_misses")) for name in imported
+    )
+
+
+@pytest.mark.parametrize(
+    ("gold_id", "gold_type", "produced_id", "kind"),
+    [
+        # The classifier drops N1 words anywhere in the id, not only at the start.
+        ("watering-plants", "Activity", "watering-the-plants", "n1"),
+        ("acme-corp", "Organization", "the-acme-corp", "n1"),
+        ("corp-acme", "Organization", "acme-corp", "reorder"),
+        ("kestrel-board", "Project", "kestral-board", "typo"),
+        # A Metric whose words are a subset of the other's reads as `metric` here.
+        ("71-percent-cpu", "Metric", "71-percent-peak-cpu", "metric"),
+        ("quarry-notes", "Document", "quarry-notes-draft", "paraphrase"),
+        ("quarry-notes", "Document", "harbor-plan", None),
+    ],
+)
+def test_variant_kind_keeps_its_own_readings(
+    gold_id: str, gold_type: str, produced_id: str, kind: str | None
+) -> None:
+    assert dlm._variant_kind(gold_id, gold_type, produced_id) == kind
+
+
 @pytest.mark.parametrize("missing", ["gold", "pre", "raw"])
 def test_a_missing_file_exits_2(tmp_path: Path, missing: str) -> None:
     paths = {
