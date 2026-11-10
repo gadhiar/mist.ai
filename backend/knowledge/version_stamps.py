@@ -169,6 +169,19 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "turns only."
         ),
     ),
+    CodeRevision(
+        extraction_version="2026-11-06-r6",
+        code_identity="ci1-6ed7f68d0599961f548ea162e1282b43367786e813638813f2343539878ab8c6",
+        date="2026-11-09",
+        reason=(
+            "Stage caps by reasoning effort (T32): STAGE_CAPS gives each stage the cap of "
+            "the effort the adapter sends it, low (96, 2048, 400) and medium and high "
+            "(1024, 32768, 400), with derive sent at low effort under every setting; "
+            "_invoke logs an `extraction length stop:` line with counts and a repetition "
+            "flag; LlamaServerProvider takes the client timeout. At low effort every "
+            "request is sent exactly as before. New turns only."
+        ),
+    ),
 )
 
 

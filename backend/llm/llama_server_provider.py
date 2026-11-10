@@ -25,11 +25,29 @@ logger = logging.getLogger(__name__)
 class LlamaServerProvider(StreamingLLMProvider):
     """StreamingLLMProvider backed by llama-server's OpenAI-compatible API."""
 
-    def __init__(self, base_url: str, model: str) -> None:
+    def __init__(self, base_url: str, model: str, *, timeout: float | None = None) -> None:
+        """Build the async and sync clients for llama-server at `base_url`.
+
+        Args:
+            base_url: llama-server's root URL, without `/v1`.
+            model: The `model` field every request sends.
+            timeout: Seconds a call may spend reading, writing or waiting for
+                a pooled connection, with 5 s to connect. The extraction
+                service passes its own per-call timeout, so a long reasoning
+                call is not cut at the SDK's 600 s read default before the
+                engine's own bound. None keeps the SDK default.
+        """
         self.model = model
         self._base_url = base_url
-        self._async_client = AsyncOpenAI(base_url=f"{base_url}/v1", api_key="not-needed")
-        self._sync_client = OpenAI(base_url=f"{base_url}/v1", api_key="not-needed")
+        client_options: dict[str, Any] = {}
+        if timeout is not None:
+            client_options["timeout"] = httpx.Timeout(timeout, connect=5.0)
+        self._async_client = AsyncOpenAI(
+            base_url=f"{base_url}/v1", api_key="not-needed", **client_options
+        )
+        self._sync_client = OpenAI(
+            base_url=f"{base_url}/v1", api_key="not-needed", **client_options
+        )
 
     def _build_kwargs(self, request: LLMRequest, stream: bool) -> dict:
         """Build kwargs dict for the OpenAI chat completions API."""

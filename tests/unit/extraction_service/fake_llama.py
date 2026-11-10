@@ -18,7 +18,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-FAKE_N_CTX = 8192
+# The compose default (`EXTRACTION_LLM_CTX_SIZE`), which fits low effort's
+# extract cap and prompt reserve, so a fake-backed service has a serving identity.
+FAKE_N_CTX = 16384
 
 
 @dataclass

@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 
 import httpx
 import pytest
@@ -31,6 +31,7 @@ from backend.extraction_service.engine import (
 )
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.extraction.run_identity import code_sha256, compute_run_identity
+from backend.knowledge.extraction.serving_identity import REQUEST_STAGES
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from tests.unit.extraction_service.conftest import make_extract_request
 
@@ -226,6 +227,23 @@ class TestBuildAppFromEnv:
         assert isinstance(seen["llm"], app_module.LlamaServerProvider)
         assert isinstance(seen["http_client"], httpx.AsyncClient)
 
+    def test_it_gives_the_llm_clients_the_service_timeout(self, monkeypatch):
+        """The client and the engine's `asyncio.wait_for` bound each call by the same timeout."""
+        monkeypatch.setenv("EXTRACTION_MODEL_HASH", "env-model-hash")
+        monkeypatch.setenv("EXTRACTION_LLM_TIMEOUT_SECONDS", "1500")
+        seen = {}
+
+        def spy(settings, llm, http_client):
+            seen.update(settings=settings, llm=llm)
+            return "app"
+
+        monkeypatch.setattr(app_module, "build_app", spy)
+
+        app_module.build_app_from_env()
+
+        assert seen["settings"].llm_timeout_seconds == 1500.0
+        assert seen["llm"]._async_client.timeout == httpx.Timeout(1500.0, connect=5.0)
+
 
 # ---------------------------------------------------------------------------
 # Each component moves the service's identity
@@ -285,17 +303,27 @@ def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):
 @pytest.mark.parametrize(
     "name",
     [
-        "SCOPE_MAX_TOKENS",
-        "EXTRACT_MAX_TOKENS",
-        "DERIVE_MAX_TOKENS",
+        "scope",
+        "extract",
+        "derive",
         "ONTOLOGY_VERSION",
         "EXTRACTION_VERSION",
     ],
 )
 def test_a_limit_or_version_change_moves_the_identity(service_settings, monkeypatch, name):
     before = _identity(service_settings)
-    value = getattr(app_module, name)
-    monkeypatch.setattr(app_module, name, value + 1 if isinstance(value, int) else value + "x")
+    if name in REQUEST_STAGES:
+        # The caps are read from STAGE_CAPS at the effort each stage is sent at.
+        low = engine_module.STAGE_CAPS["low"]
+        moved = dataclasses.replace(low, **{name: getattr(low, name) + 1})
+        monkeypatch.setattr(
+            engine_module,
+            "STAGE_CAPS",
+            MappingProxyType({**engine_module.STAGE_CAPS, "low": moved}),
+        )
+    else:
+        value = getattr(app_module, name)
+        monkeypatch.setattr(app_module, name, value + 1 if isinstance(value, int) else value + "x")
 
     assert _identity(service_settings) != before
 
