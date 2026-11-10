@@ -144,11 +144,16 @@ STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
     }
 )
 
-# The context a prompt may take beside the extract cap: above the largest
-# prompt measured on the r6 prompt (9,327 tokens). The service withholds its
-# serving identity when the extract cap plus this reserve exceeds the context
-# llama-server reports (`backend.extraction_service.app._serving_identity_error`).
-PROMPT_RESERVE_TOKENS: int = 10240
+# The context a prompt may take beside the extract cap. The largest prompt
+# measured on the r6 prompt was 9,327 tokens, and the prompt's stated
+# conventions add about 2,600 more by estimate, so the reserve is the largest
+# value with which low's extract cap still fits a 16,384 context (2,048 +
+# 14,336), the context a run beside the main stack and host-1070 use. Medium
+# then needs 47,104. The `extraction call:` line reports each call's real
+# prompt_tokens. The service withholds its serving identity when the extract
+# cap plus this reserve exceeds the context llama-server reports
+# (`backend.extraction_service.app._serving_identity_error`).
+PROMPT_RESERVE_TOKENS: int = 14336
 
 
 def stage_caps(effort: ReasoningEffort | None) -> StageCaps:

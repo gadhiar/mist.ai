@@ -189,14 +189,16 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-dfeaa6144e81523b6fbd5070d81626630151e61fa8a08024db1b91e44922d9e8",
+        code_identity="ci1-d35126ac4d4f32e933ae04731072dd4bb0cb5ebf50f91b7114d5e618dcb4437c",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
             "prompt states its conventions, and medium is the deployed effort. Every later "
             "change under r8 updates this entry's code_identity, since only the final "
             "identity ships. So far: _invoke logs one `extraction call:` line per LLM call "
-            "with its cap, token counts and finish reason. Re-extracts history."
+            "with its cap, token counts and finish reason; PROMPT_RESERVE_TOKENS is 14336, "
+            "so medium needs a context of 47,104 and low still fits 16,384. Re-extracts "
+            "history."
         ),
     ),
 )

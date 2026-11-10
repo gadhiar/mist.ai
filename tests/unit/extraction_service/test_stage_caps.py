@@ -119,7 +119,15 @@ class TestTheCapsTable:
         assert tuple(f.name for f in dataclasses.fields(StageCaps)) == REQUEST_STAGES
 
     def test_the_prompt_reserve(self):
-        assert PROMPT_RESERVE_TOKENS == 10240
+        assert PROMPT_RESERVE_TOKENS == 14336
+
+    def test_low_fills_a_16384_context_exactly(self):
+        # The largest reserve with which low still fits the 16,384 context a
+        # run beside the main stack, host-1070 and the fake llama-server use.
+        assert stage_caps("low").extract + PROMPT_RESERVE_TOKENS == 16384
+
+    def test_medium_needs_47104(self):
+        assert stage_caps("medium").extract + PROMPT_RESERVE_TOKENS == 47104
 
 
 # ---------------------------------------------------------------------------
