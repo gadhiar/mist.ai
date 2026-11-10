@@ -36,6 +36,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
   - `extraction_retrieval.py` - Builds the retrieval eval graph from the dev turns and runs the queries
+  - `entity_alignment.py` - Pairs gold and produced entity ids by id form, for relations scored over aligned ids
   - `ceiling/` - Extraction ceiling runs: an answerer in the model's seat of the unchanged service (see `data/ceiling/README.md`)
     - `store.py` - Append-only, hash-chained answer store and its state-file check
     - `relay.py` - Serves stored answers to the service as llama-server would; logs pending requests
