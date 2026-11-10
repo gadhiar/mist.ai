@@ -81,14 +81,6 @@ class RunIdentityComponents:
             service from before the list pass reported it.
         list_context_max_units: Most earlier units sent as context; None as
             for `list_batch_max_units`.
-        list_frame_max_tokens: The list frame call's output token limit.
-            None is how a service from before the list frame path reported it.
-        list_item_max_tokens: The list item calls' output token limit; None
-            as for `list_frame_max_tokens`.
-        list_item_batch_max_units: Most items per list item call; None as for
-            `list_frame_max_tokens`.
-        list_user_max_chars: Most characters a frame or item user message
-            holds; None as for `list_frame_max_tokens`.
     """
 
     prompt_sha256: str
@@ -109,10 +101,6 @@ class RunIdentityComponents:
     derive_max_tokens: int
     list_batch_max_units: int | None
     list_context_max_units: int | None
-    list_frame_max_tokens: int | None
-    list_item_max_tokens: int | None
-    list_item_batch_max_units: int | None
-    list_user_max_chars: int | None
 
 
 # The components that are code rather than deployment configuration: what
@@ -128,10 +116,6 @@ CODE_IDENTITY_FIELDS: tuple[str, ...] = (
     "derive_max_tokens",
     "list_batch_max_units",
     "list_context_max_units",
-    "list_frame_max_tokens",
-    "list_item_max_tokens",
-    "list_item_batch_max_units",
-    "list_user_max_chars",
 )
 
 

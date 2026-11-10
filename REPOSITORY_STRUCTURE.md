@@ -36,7 +36,6 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
   - `extraction_retrieval.py` - Builds the retrieval eval graph from the dev turns and runs the queries
-  - `diagnose_list_misses.py` - The list miss classifier: each dev-lists miss of one or more runs, by class
 - `daily/` - The daily instance's host tools
   - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
@@ -92,10 +91,6 @@ backend/
 │   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
 │   └── status_intervals.py      # Uptime ledger: /health status intervals per local day
 │
-├── extraction_service/          # Stateless HTTP extraction service (its own llama-server)
-│   ├── engine.py                # Stages 1.5, 2 and 9; the list frame path and r6 list pass
-│   └── list_schemas.py          # The list frame and item output schemas
-│
 ├── llm/                         # LLM provider abstraction
 │   ├── provider.py              # Abstract StreamingLLMProvider
 │   ├── llama_server_provider.py # Primary (Gemma 4 E4B via llama.cpp)
@@ -108,9 +103,6 @@ backend/
 │   ├── models.py                # RetrievalResult, QueryIntent, etc.
 │   ├── embeddings.py            # Sentence Transformers all-MiniLM-L6-v2
 │   ├── extraction/              # 6-stage extraction + subject-scope classifier
-│   │   ├── list_assembly.py     # List path payload assembly and list entity ids
-│   │   ├── list_frames.py       # List groups, the list render, frame and item parsers
-│   │   ├── list_prompts.py      # List system prompt, user templates, repair texts
 │   │   ├── run_identity.py      # Run identity of the setup behind each result
 │   │   └── structure_splitter.py # List, table and heading units for Stage 2
 │   ├── curation/                # Dedup, ReconciliationEngine (reconciliation.py,

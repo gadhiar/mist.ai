@@ -21,7 +21,6 @@ from __future__ import annotations
 import ast
 import dataclasses
 import hashlib
-import importlib.util
 import json
 import re
 import uuid
@@ -88,10 +87,6 @@ def _components(**overrides) -> RunIdentityComponents:
         "derive_max_tokens": 400,
         "list_batch_max_units": None,
         "list_context_max_units": None,
-        "list_frame_max_tokens": None,
-        "list_item_max_tokens": None,
-        "list_item_batch_max_units": None,
-        "list_user_max_chars": None,
     }
     values.update(overrides)
     return RunIdentityComponents(**values)
@@ -121,7 +116,7 @@ _FIELD_NAMES = [f.name for f in dataclasses.fields(RunIdentityComponents)]
 
 
 class TestComponents:
-    def test_the_twenty_two_components_in_order(self):
+    def test_the_eighteen_components_in_order(self):
         field_names = [f.name for f in dataclasses.fields(RunIdentityComponents)]
 
         assert field_names == [
@@ -143,10 +138,6 @@ class TestComponents:
             "derive_max_tokens",
             "list_batch_max_units",
             "list_context_max_units",
-            "list_frame_max_tokens",
-            "list_item_max_tokens",
-            "list_item_batch_max_units",
-            "list_user_max_chars",
         ]
 
     def test_frozen_with_slots(self):
@@ -166,28 +157,7 @@ class TestComponents:
             "derive_max_tokens",
             "list_batch_max_units",
             "list_context_max_units",
-            "list_frame_max_tokens",
-            "list_item_max_tokens",
-            "list_item_batch_max_units",
-            "list_user_max_chars",
         )
-
-    def test_the_service_reports_the_list_path_limits(self):
-        settings = ServiceSettings(llm_base_url="http://unused", model_hash="m", model_file="f")
-        components = run_identity_components(settings, get_adapter("gptoss"))
-
-        assert (
-            components.list_frame_max_tokens,
-            components.list_item_max_tokens,
-            components.list_item_batch_max_units,
-            components.list_user_max_chars,
-        ) == (
-            engine.LIST_FRAME_MAX_TOKENS,
-            engine.LIST_ITEM_MAX_TOKENS,
-            engine.LIST_ITEM_BATCH_MAX_UNITS,
-            engine.LIST_USER_MAX_CHARS,
-        )
-        assert components.list_batch_max_units == engine.LIST_BATCH_MAX_UNITS
 
 
 class TestComputeRunIdentity:
@@ -406,18 +376,12 @@ class TestCodeSha256:
 
 
 # ---------------------------------------------------------------------------
-# Coverage: every backend module the service's engine, adapters and list
-# modules import from
+# Coverage: every backend module the service's engine and adapters import from
 # ---------------------------------------------------------------------------
 
 _SERVICE_SOURCES = (
     _BACKEND_ROOT / "extraction_service" / "engine.py",
     _BACKEND_ROOT / "extraction_service" / "adapters.py",
-    _BACKEND_ROOT / "extraction_service" / "list_schemas.py",
-    _BACKEND_ROOT / "knowledge" / "extraction" / "list_frames.py",
-    _BACKEND_ROOT / "knowledge" / "extraction" / "list_prompts.py",
-    _BACKEND_ROOT / "knowledge" / "extraction" / "list_assembly.py",
-    _BACKEND_ROOT / "knowledge" / "extraction" / "validator.py",
 )
 
 
@@ -426,33 +390,23 @@ def _is_backend_module(dotted: str) -> bool:
     return path.with_suffix(".py").is_file() or path.is_dir()
 
 
-def _package_of(path: Path) -> str:
-    """The dotted package a source file under the repository root belongs to."""
-    return ".".join(path.resolve().relative_to(_REPO_ROOT).parent.parts)
-
-
-def _backend_imports(source: str, package: str | None = None) -> set[str]:
+def _backend_imports(source: str) -> set[str]:
     """The `backend.*` modules `source` imports, or imports names from.
 
     `from backend.pkg import mod` counts as `backend.pkg.mod` when `mod` is a
     module, so a submodule imported by name is not mistaken for its package.
-    A relative import is resolved against `package`, the importing file's
-    package, as `importlib.util.resolve_name` does.
     """
     modules: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             modules.update(a.name for a in node.names if a.name.startswith("backend."))
         elif isinstance(node, ast.ImportFrom):
-            module = node.module
-            if node.level > 0:
-                assert package is not None, "a relative import needs the importing package"
-                module = importlib.util.resolve_name("." * node.level + (module or ""), package)
-            if module is None or not module.startswith("backend."):
+            assert node.level == 0, "relative imports are not resolved by this guard"
+            if node.module is None or not node.module.startswith("backend."):
                 continue
             for alias in node.names:
-                candidate = f"{module}.{alias.name}"
-                modules.add(candidate if _is_backend_module(candidate) else module)
+                candidate = f"{node.module}.{alias.name}"
+                modules.add(candidate if _is_backend_module(candidate) else node.module)
     return modules
 
 
@@ -462,22 +416,18 @@ def _listed() -> set[str]:
     return covered | excluded
 
 
-def _unlisted(imports: set[str]) -> list[str]:
-    return sorted(imports - _listed())
+def _unlisted(source: str) -> list[str]:
+    return sorted(_backend_imports(source) - _listed())
 
 
-def _service_imports() -> set[str]:
-    """Every backend import of the service sources, each file resolved against its package."""
-    imports: set[str] = set()
-    for path in _SERVICE_SOURCES:
-        imports |= _backend_imports(path.read_text(encoding="utf-8"), _package_of(path))
-    return imports
+def _service_source() -> str:
+    return "\n".join(path.read_text(encoding="utf-8") for path in _SERVICE_SOURCES)
 
 
 class TestRunIdentityCoverage:
     def test_every_backend_import_is_covered_or_excluded(self):
-        assert _unlisted(_service_imports()) == [], (
-            "A module in _SERVICE_SOURCES imports from a backend module that is in neither "
+        assert _unlisted(_service_source()) == [], (
+            "engine.py or adapters.py imports from a backend module that is in neither "
             "RUN_IDENTITY_CODE nor RUN_IDENTITY_EXCLUDED (backend/extraction_service/engine.py). "
             "Cover it if it can change what the service returns; exclude it, with the reason, "
             "if it cannot."
@@ -485,10 +435,9 @@ class TestRunIdentityCoverage:
 
     def test_the_guard_fails_on_an_unlisted_import(self):
         fake_import = "from backend.knowledge.storage.graph_store import GraphStore"
+        source = _service_source() + "\n" + fake_import + "\n"
 
-        assert _unlisted(_service_imports() | _backend_imports(fake_import)) == [
-            "backend.knowledge.storage.graph_store"
-        ]
+        assert _unlisted(source) == ["backend.knowledge.storage.graph_store"]
 
     def test_the_guard_sees_a_plain_import_and_a_submodule_import(self):
         source = (
@@ -496,57 +445,23 @@ class TestRunIdentityCoverage:
             "from backend.knowledge import config\n"
         )
 
-        assert _unlisted(_backend_imports(source)) == [
+        assert _unlisted(source) == [
             "backend.knowledge.config",
             "backend.knowledge.curation.graph_writer",
         ]
-
-    def test_a_relative_import_resolves_against_the_importing_package(self):
-        path = _BACKEND_ROOT / "knowledge" / "extraction" / "list_assembly.py"
-        source = "from .canonical_id import canonical_metric_id\n"
-
-        assert _package_of(path) == "backend.knowledge.extraction"
-        assert _backend_imports(source, _package_of(path)) == {
-            "backend.knowledge.extraction.canonical_id"
-        }
-
-    def test_a_relative_package_import_names_the_submodule(self):
-        source = "from .. import ontologies\nfrom . import prompts\n"
-
-        assert _backend_imports(source, "backend.knowledge.extraction") == {
-            "backend.knowledge.ontologies",
-            "backend.knowledge.extraction.prompts",
-        }
-
-    def test_the_scan_covers_the_list_modules_relative_imports(self):
-        imported = _service_imports()
-
-        assert {
-            "backend.knowledge.extraction.canonical_id",
-            "backend.knowledge.extraction.list_frames",
-            "backend.knowledge.extraction.structure_splitter",
-            "backend.knowledge.extraction.prompts",
-            "backend.knowledge.ontologies",
-        } <= imported
 
     def test_the_covered_modules(self):
         assert [module.__name__ for module in engine.RUN_IDENTITY_CODE] == [
             "backend.extraction_service.engine",
             "backend.extraction_service.adapters",
             "backend.extraction_service.schemas",
-            "backend.extraction_service.list_schemas",
-            "backend.knowledge.extraction.canonical_id",
             "backend.knowledge.extraction.internal_derivation",
             "backend.knowledge.extraction.internal_prompts",
-            "backend.knowledge.extraction.list_assembly",
-            "backend.knowledge.extraction.list_frames",
-            "backend.knowledge.extraction.list_prompts",
             "backend.knowledge.extraction.ontology_extractor",
             "backend.knowledge.extraction.preprocessor",
             "backend.knowledge.extraction.prompts",
             "backend.knowledge.extraction.scope_classifier",
             "backend.knowledge.extraction.structure_splitter",
-            "backend.knowledge.extraction.validator",
             "backend.llm.llama_server_provider",
         ]
 
@@ -557,7 +472,6 @@ class TestRunIdentityCoverage:
             "backend.errors",
             "backend.extraction_contract.models",
             "backend.extraction_service.settings",
-            "backend.knowledge.ontologies",
             "backend.knowledge.version_stamps",
             "backend.llm.models",
             "backend.llm.provider",
@@ -565,7 +479,7 @@ class TestRunIdentityCoverage:
         assert all(reason.strip() for reason in excluded.values())
 
     def test_no_exclusion_is_stale(self):
-        imported = _service_imports()
+        imported = _backend_imports(_service_source())
 
         assert [name for name, _ in engine.RUN_IDENTITY_EXCLUDED if name not in imported] == []
 

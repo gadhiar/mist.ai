@@ -45,10 +45,6 @@ from backend.extraction_service.engine import (
     EXTRACT_MAX_TOKENS,
     LIST_BATCH_MAX_UNITS,
     LIST_CONTEXT_MAX_UNITS,
-    LIST_FRAME_MAX_TOKENS,
-    LIST_ITEM_BATCH_MAX_UNITS,
-    LIST_ITEM_MAX_TOKENS,
-    LIST_USER_MAX_CHARS,
     RUN_IDENTITY_CODE,
     SCOPE_MAX_TOKENS,
     ExtractionEngine,
@@ -309,8 +305,8 @@ def run_identity_components(
     """The run identity's components for a service running `settings` with `adapter`.
 
     Every value is read from where the engine reads it: the prompt hash from
-    the same function the engine stamps with, the token, list-pass and list
-    frame path limits from the engine's constants, and the constrained mode as the engine resolves it
+    the same function the engine stamps with, the token and list-pass limits
+    from the engine's constants, and the constrained mode as the engine resolves it
     (`settings.constrained_mode or adapter.default_constrained_mode`).
     """
     return RunIdentityComponents(
@@ -332,10 +328,6 @@ def run_identity_components(
         derive_max_tokens=DERIVE_MAX_TOKENS,
         list_batch_max_units=LIST_BATCH_MAX_UNITS,
         list_context_max_units=LIST_CONTEXT_MAX_UNITS,
-        list_frame_max_tokens=LIST_FRAME_MAX_TOKENS,
-        list_item_max_tokens=LIST_ITEM_MAX_TOKENS,
-        list_item_batch_max_units=LIST_ITEM_BATCH_MAX_UNITS,
-        list_user_max_chars=LIST_USER_MAX_CHARS,
     )
 
 

@@ -65,12 +65,6 @@ class ServiceSettings:
             runs, reported in `ResultStamps.llama_cpp_build` and
             `InfoResponse.llama_cpp_build`.
         port: TCP port `python -m backend.extraction_service` binds to.
-        log_list_outputs: Write each list call attempt's output and refusal,
-            keyed by job id, to the `backend.extraction_service.list_outputs`
-            logger. Off by default: the text derives from the utterance, so it
-            is on only for synthetic dev-lists runs, never for held-out runs or
-            production. It changes what the service logs, never what it
-            returns.
     """
 
     llm_base_url: str
@@ -88,7 +82,6 @@ class ServiceSettings:
     temperature: float = 0.0
     llama_cpp_build: str = "b11151"
     port: int = 8090
-    log_list_outputs: bool = False
 
     def __post_init__(self) -> None:
         """Refuse values the service cannot run with.
@@ -130,7 +123,6 @@ class ServiceSettings:
             temperature=float(os.environ.get("EXTRACTION_TEMPERATURE", "0.0")),
             llama_cpp_build=os.environ.get("LLAMA_CPP_BUILD", "b11151"),
             port=int(os.environ.get("EXTRACTION_PORT", "8090")),
-            log_list_outputs=_as_bool(os.environ.get("EXTRACTION_LOG_LIST_OUTPUTS", "false")),
         )
 
 
