@@ -7,9 +7,11 @@ deploy identically in two places, but via two SEPARATE compose files -- one
 per deployment, not one file with two profiles, because interpolation and
 "what starts on this machine" differ between them:
 
-- **extraction-local**: RTX 4070 SUPER (12 GB), beside the main stack, voice
-  off, switched on manually. Overlay file `docker-compose.extraction.yml` at
-  the repo root, always used alongside `docker-compose.yml`.
+- **extraction-local**: RTX 4070 SUPER (12 GB), voice off, switched on
+  manually. Overlay file `docker-compose.extraction.yml` at the repo root,
+  used alongside `docker-compose.yml`. Its defaults deploy medium effort,
+  which runs instead of the chat stack, not beside it; low effort beside the
+  main stack takes four shell overrides (see "Medium by default (local)").
 - **extraction-host**: GTX 1070 (8 GB, Pascal), a separate machine reached
   over Tailscale, running nothing else from this repo. Standalone file
   `docker/extraction/compose.host.yml`, used alone -- `docker-compose.yml`
@@ -44,7 +46,16 @@ main stack's network) plus `--profile extraction-local` to switch it on.
 `compose.host.yml` is STANDALONE: it needs no other compose file and no
 profile flag -- all three of its services start on a plain `up`.
 
-    # Local, alongside the main stack (needs no TS_AUTHKEY):
+    # Local at the defaults (medium), with the chat stack down. Naming the
+    # service starts it and its llama-server, not the main stack's services
+    # (needs no TS_AUTHKEY):
+    docker compose -f docker-compose.yml -f docker-compose.extraction.yml \
+      --profile extraction-local up -d mist-extraction-local
+
+    # Local at low effort, beside the main stack (the earlier defaults, set
+    # as shell overrides):
+    EXTRACTION_REASONING_EFFORT=low EXTRACTION_LLM_CTX_SIZE=16384 \
+    EXTRACTION_LOCAL_NCMOE=24 EXTRACTION_LLM_TIMEOUT_SECONDS=120 \
     docker compose -f docker-compose.yml -f docker-compose.extraction.yml \
       --profile extraction-local up -d
 
@@ -82,7 +93,9 @@ template), the same file
 `scripts/model_bench/arms.json`'s `c9` arm benchmarks. Reasoning is always
 on for this model; `EXTRACTION_REASONING_EFFORT` controls how much
 (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`
--- `llama_server_help_b11151.txt:639-642`). Default `low` per the T0 brief.
+-- `llama_server_help_b11151.txt:639-642`). The local default is `medium`
+(see "Medium by default (local)"); the host file keeps `low`, the T0 brief's
+default.
 
 **Switching to the Qwen fallback (Qwen3.5-9B) is an env change only** --
 no code, no compose structure change:
@@ -117,11 +130,11 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_MODEL_HASH` | **required, no default** (`:?`) | **required, no default** (`:?`) | Defines the epoch. Set explicitly every deploy; see EPOCH_MISMATCH in `backend/extraction_service/app.py`. |
 | `EXTRACTION_MODEL_FILE` | `ggml-org/gpt-oss-20b-MXFP4.gguf` | same | Passed to `LlamaServerProvider` as the OpenAI-API `model` field. |
 | `EXTRACTION_ADAPTER` | `gptoss` | same | `gptoss` / `qwen` / `gemma` -- see `backend/extraction_service/adapters.py`. |
-| `EXTRACTION_REASONING_EFFORT` | `low` | same | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` keeps scope 96, extract 2048, derive 400; `medium` and `high` send scope 1024, extract 32768, derive 400. Derive is always sent at `low` effort, so its cap stays 400. `medium` and `high` need a context of at least 43,008 tokens (the 32,768 extract cap plus the 10,240-token prompt reserve), so set `EXTRACTION_LLM_CTX_SIZE` to at least that; at the 16,384 default the service reports no serving identity. See "Effort caps and the context" below. |
+| `EXTRACTION_REASONING_EFFORT` | `medium` | `low` | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` keeps scope 96, extract 2048, derive 400; `medium` and `high` send scope 1024, extract 32768, derive 400. Derive is always sent at `low` effort, so its cap stays 400. `medium` and `high` need a context of at least 47,104 tokens (the 32,768 extract cap plus the 14,336-token prompt reserve); the local default context, 65,536, gives it, and at the host's 16,384 default the service reports no serving identity for them. See "Effort caps and the context" and "Medium by default (local)" below. |
 | `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per deployment, not overridable via `.env`. |
 | `LLAMA_CPP_BUILD` | `b11151` | same | Reported in `ResultStamps`/`/v1/info`; shared with the compose image pin. |
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
-| `EXTRACTION_LLM_TIMEOUT_SECONDS` | `120` | same | Per-LLM-call timeout. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s, but the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below); 120 gives real headroom. The value also reaches the OpenAI clients (`LlamaServerProvider(..., timeout=...)`, 5 s to connect), so a setting above 600 s is no longer cut at the SDK's 600 s read default. |
+| `EXTRACTION_LLM_TIMEOUT_SECONDS` | `1800` | `120` | Per-LLM-call timeout: it bounds one call, not a whole `/v1/extract` request. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s. Local: 1800 is H13's medium value, since one medium extract call that runs to its 32,768-token cap costs about 651 s. Host: at low effort the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below), and 120 gives headroom. The value also reaches the OpenAI clients (`LlamaServerProvider(..., timeout=...)`, 5 s to connect), so a setting above 600 s is no longer cut at the SDK's 600 s read default. |
 | `EXTRACTION_MAX_ATTEMPTS` | `2` | same | Maximum extraction attempts per job (first call plus repair retries on unparsable output), matching `ServiceSettings.max_attempts`'s own default. |
 | `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. The `gptoss` default is `schema` (it was `none`); see the note below the table. |
 | `EXTRACTION_LLM_DEVICE` | **required, no default** (`:?`) | **required, no default** (`:?`) | The GPU llama-server runs on, e.g. `rtx-4070-super` or `gtx-1070`. Reaches the service as `EXTRACTION_SERVER_DEVICE` and keys the extraction epoch; see "Declared llama-server settings" below. |
@@ -150,8 +163,9 @@ plus about 125s decode) -- over the 120s generic default. The host's own
 `.env` should keep `EXTRACTION_LLM_TIMEOUT_SECONDS=300` (see
 `docker/extraction/HOST_1070_RUNBOOK.md`'s "Out-of-repo timeout override,
 retirement" note) rather than relying on this compose-file fallback;
-120 is sized for the common case and for the local (4070) deployment, whose
-much faster decode keeps it well clear of this worst case.
+120 is sized for the common low-effort case. The local file defaults to
+1800 for medium, and its low-effort override, 120, relies on the 4070's much
+faster decode to stay clear of this worst case.
 
 Every other `ServiceSettings` field (`reasoning_budget_tokens`,
 `idempotency_cache_size`, `scope_enabled`, `temperature`, `port`) has a
@@ -254,12 +268,12 @@ flag and its declaration together.
 | `EXTRACTION_SERVER_IMAGE` | the service's `image:` | the pinned b11151 digest | same |
 | `EXTRACTION_SERVER_DEVICE` | none (the GPU) | `${EXTRACTION_LLM_DEVICE:?...}` | same |
 | `EXTRACTION_SERVER_N_GPU_LAYERS` | `LLAMA_ARG_N_GPU_LAYERS` | `999` | same |
-| `EXTRACTION_SERVER_CTX_SIZE` | `LLAMA_ARG_CTX_SIZE` | `${EXTRACTION_LLM_CTX_SIZE:-16384}` | same |
+| `EXTRACTION_SERVER_CTX_SIZE` | `LLAMA_ARG_CTX_SIZE` | `${EXTRACTION_LLM_CTX_SIZE:-65536}` | `${EXTRACTION_LLM_CTX_SIZE:-16384}` |
 | `EXTRACTION_SERVER_N_PARALLEL` | `LLAMA_ARG_N_PARALLEL` | `1` | same |
 | `EXTRACTION_SERVER_JINJA` | `LLAMA_ARG_JINJA` | `1` | same |
 | `EXTRACTION_SERVER_REASONING` | `LLAMA_ARG_REASONING` | `on` | same |
 | `EXTRACTION_SERVER_THINK` | `LLAMA_ARG_THINK` | `deepseek` | same |
-| `EXTRACTION_SERVER_N_CPU_MOE` | `-ncmoe` | `${EXTRACTION_LOCAL_NCMOE:-24}` | `${EXTRACTION_HOST_NCMOE:-24}` |
+| `EXTRACTION_SERVER_N_CPU_MOE` | `-ncmoe` | `${EXTRACTION_LOCAL_NCMOE:-9}` | `${EXTRACTION_HOST_NCMOE:-24}` |
 | `EXTRACTION_SERVER_BATCH` | `-b` | `2048` | same |
 | `EXTRACTION_SERVER_UBATCH` | `-ub` | `2048` | same |
 | `EXTRACTION_SERVER_CACHE_RAM_MIB` | `--cache-ram` | `${LLM_CACHE_RAM_MIB:-2048}` | same |
@@ -298,16 +312,18 @@ with the identical value nor in the tests' exclusion table, and when a
 declaration names no llama-server setting. Adding a flag to a llama-server
 command therefore means adding its declaration in the same edit.
 
-Context size (`EXTRACTION_LLM_CTX_SIZE`, default `16384`)
------------------------------------------------------------
+Context size (`EXTRACTION_LLM_CTX_SIZE`, local default `65536`, host default `16384`)
+---------------------------------------------------------------------------------------
 
 `LLAMA_ARG_CTX_SIZE` used to default to `8192` on both deployments. A real
 `/v1/extract` probe (a one-sentence utterance, empty history) needed 9162
 prompt tokens, and the extraction engine
 (`backend/extraction_service/engine.py`) asks for `max_tokens=2048` on top of
 the prompt -- 9162 + 2048 > 8192, so extraction could not succeed at the old
-default. The default is now `16384`, which gives headroom over that
-measurement.
+default. Both defaults then became `16384`, which low effort fills exactly
+with the current prompt reserve (see "Effort caps and the context"). The host
+file keeps it. The local file defaults to `65536` for medium effort, H13's
+context; see "Medium by default (local)".
 
 The host ncmoe fit has been re-measured at ctx 16384 -- see "Host ncmoe
 sizing" below for the current table.
@@ -320,26 +336,96 @@ that stage (`STAGE_CAPS`, `stage_caps` and `GptOssAdapter.stage_effort`):
 
 | `EXTRACTION_REASONING_EFFORT` | scope | extract | derive | context needed |
 |---|---|---|---|---|
-| `low` (default) | 96 | 2048 | 400 | 12,288 |
-| `medium` | 1024 | 32768 | 400 | 43,008 |
-| `high` | 1024 | 32768 | 400 | 43,008 |
+| `low` (host default) | 96 | 2048 | 400 | 16,384 |
+| `medium` (local default) | 1024 | 32768 | 400 | 47,104 |
+| `high` | 1024 | 32768 | 400 | 47,104 |
 
 - Derive is sent at `low` effort under every setting, so its cap is always
   400. No effort run calls derive, so a higher effort there would ship
   unmeasured.
 - `qwen` and `gemma` send no effort, so they keep `low`'s caps whatever the
   setting says.
-- The context needed is the extract cap plus `PROMPT_RESERVE_TOKENS`
-  (10,240, above the largest measured r6 prompt of 9,327 tokens). When the
-  `n_ctx` llama-server reports is smaller, `/v1/info` reports no serving
-  identity and `serving_identity_error` names
-  `extract cap <c> + prompt reserve 10240 > observed n_ctx <n>`, and a job
-  that expects an identity gets 409. To run `medium` or `high`, set
-  `EXTRACTION_LLM_CTX_SIZE` to at least 43,008, for example 65,536. The
-  reserve fits the r6 prompt only, so a longer prompt needs it raised.
+- The context needed is the extract cap plus `PROMPT_RESERVE_TOKENS`,
+  14,336: the largest value with which low's extract cap still fits a 16,384
+  context (2,048 + 14,336). The largest r6 prompt measured was 9,327 tokens,
+  and the r8 prompt conventions add about 2,600 more by estimate; the
+  `extraction call:` line (below) reports each call's real `prompt_tokens`.
+  When the `n_ctx` llama-server reports is smaller, `/v1/info` reports no
+  serving identity and `serving_identity_error` names
+  `extract cap <c> + prompt reserve 14336 > observed n_ctx <n>`, and a job
+  that expects an identity gets 409. `medium` and `high` need
+  `EXTRACTION_LLM_CTX_SIZE` of at least 47,104; the local default, 65,536,
+  gives it.
 - A medium extract call can take many minutes. Size
   `EXTRACTION_LLM_TIMEOUT_SECONDS` for it: the value bounds each call both in
-  the engine and in the OpenAI clients.
+  the engine and in the OpenAI clients. The local default, 1800, does.
+
+Medium by default (local)
+-------------------------
+
+`docker-compose.extraction.yml` deploys medium effort by default:
+
+| Variable | Local default | Earlier default (the override beside the main stack) |
+|---|---|---|
+| `EXTRACTION_REASONING_EFFORT` | `medium` | `low` |
+| `EXTRACTION_LLM_CTX_SIZE` | `65536` | `16384` |
+| `EXTRACTION_LOCAL_NCMOE` | `9` | `24` |
+| `EXTRACTION_LLM_TIMEOUT_SECONDS` | `1800` | `120` |
+
+- Medium needs a context of 47,104 tokens (its 32,768 extract cap plus the
+  14,336-token prompt reserve); 65,536 gives it room.
+- These are the settings of H13, goal mist-extraction-quality's effort run
+  on the RTX 4070 SUPER, which ran with the chat stack down. On the 12 GB
+  card this configuration is measured only with the chat stack down: no run
+  has measured it beside the chat model (Gemma 4 E4B). So at these defaults
+  the extraction stack runs instead of chat, not beside it. Start it by
+  naming the service (`... --profile extraction-local up -d
+  mist-extraction-local`), as under "Running it", so `up` does not start the
+  main stack's services.
+- To run extraction beside the main stack, set the four earlier defaults as
+  shell overrides (`EXTRACTION_REASONING_EFFORT=low
+  EXTRACTION_LLM_CTX_SIZE=16384 EXTRACTION_LOCAL_NCMOE=24
+  EXTRACTION_LLM_TIMEOUT_SECONDS=120`), as under "Running it". The context
+  size and the ncmoe value are declared llama-server settings, so the
+  override starts a different extraction epoch from the defaults (see
+  "Declared llama-server settings").
+- `EXTRACTION_MODEL_HASH` and `EXTRACTION_LLM_DEVICE` stay required, with no
+  default.
+
+**Two timeouts, two bounds.** The service's `EXTRACTION_LLM_TIMEOUT_SECONDS`
+bounds one LLM call. The backend dispatcher's client timeout,
+`MIST_EXTRACTION_REQUEST_TIMEOUT_S` (default 1800 s,
+`backend/extraction_backlog/settings.py`), bounds one whole `/v1/extract`
+request, which can hold several capped calls: an extract batch cut short at
+its cap is split in two and retried (`backend/extraction_service/engine.py`).
+1,800 s covers two medium extract calls that run to their cap (about 651 s
+each), not three. A turn that caps three times can run past it: the
+dispatcher's client times out, and its retry sends a fresh `job_id`
+(`backend/extraction_backlog/dispatcher.py`), so the retry does not join the
+run still going and waits behind it on llama-server's single slot
+(`LLAMA_ARG_N_PARALLEL=1`); the turn may be dead-lettered after
+`MIST_EXTRACTION_MAX_ATTEMPTS`. The `extraction call:` lines show how close a
+turn comes.
+
+Per-call token counts (operations note)
+---------------------------------------
+
+Every LLM call the service makes, at every stage, logs one INFO line:
+
+    extraction call: cap <max_tokens> prompt_tokens <n> completion_tokens <n> finish <reason>
+
+- `cap` is the cap the call was sent with, which names the stage.
+- `prompt_tokens` and `completion_tokens` are llama-server's own counts, so
+  a run records its real prompt sizes, context lines included; a count the
+  server did not report prints as `None`. `finish` is the finish reason
+  (`stop`, or `length` at the cap, which also logs a length-stop line).
+- The line holds counts and the finish reason only, never prompt or
+  response text.
+- The entry point (`backend/extraction_service/__main__.py`,
+  `configure_logging()`) sends the engine logger's INFO lines and every
+  logger's WARNING lines to stderr; other INFO lines, such as the job
+  outcomes `app.py` logs, stay off. Read the line with
+  `docker logs mist-extraction-local` (or `mist-extraction-host`).
 
 Length stops (operations note)
 ------------------------------
@@ -360,45 +446,39 @@ service logs one WARNING line before the stage handles the stop:
   production turns are real conversations. Read it with
   `docker logs mist-extraction-local` (or `mist-extraction-host`).
 
-Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `24`)
---------------------------------------------------------------
+Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `9`)
+-------------------------------------------------------------
 
-gpt-oss-20b measured **~10.8 GiB VRAM at `ncmoe=6`** (per the T1b brief;
-not independently re-measured by this worker -- no GPU, no docker, no
-network). At that setting it cannot sit beside the main stack's Gemma 4
-E4B on a 12 GB card (clause F,
-`scripts/model_bench/analyse.py:1025`: `arm_peak_mib + voice_vram_mib +
-margin_mib <= total_mib` -- 10.8 GiB alone already leaves under 1.2 GiB for
-Gemma 4 E4B + KV cache + voice, which does not fit under any voice
-allowance).
+The default, `9`, is H13's: medium effort at context 65,536 on the RTX 4070
+SUPER, run with the chat stack down. That is the only condition this
+configuration has run under on the 12 GB card. No run has measured it beside
+the main stack's Gemma 4 E4B, so at this default the extraction stack runs
+instead of chat (see "Medium by default (local)").
 
-**No repo-held measurement exists at any OTHER `ncmoe` value for this
-model on this card.** Searched `scripts/model_bench/README.md`,
-`arms.json`, and `analyse.py` for "10.8"/"gpt-oss"/VRAM figures; nothing
-beyond the single `ncmoe=6` point above. Per the brief's own fallback
-instruction for this case, the default here is **all experts on CPU**.
+The one other measurement on this card is **~10.8 GiB VRAM at `ncmoe=6`**
+(per the T1b brief; not independently re-measured). At that setting it
+cannot sit beside E4B (clause F, `scripts/model_bench/analyse.py:1025`:
+`arm_peak_mib + voice_vram_mib + margin_mib <= total_mib` -- 10.8 GiB alone
+already leaves under 1.2 GiB for Gemma 4 E4B + KV cache + voice, which does
+not fit under any voice allowance).
 
-gpt-oss-20b's MoE layer count is now **VERIFIED as 24** via the GGUF file's
-own metadata (`block_count`, confirmed on the real host build). b11151's
-llama-server load log is not confirmed to print this either -- the real host
-build found it prints no CUDA device or offload lines at all -- so treat the
-GGUF metadata as the source rather than relying on the log. `24` replaces the
-previous saturating sentinel (`999`) as the precise "all experts on CPU"
-value -- the behavior is unchanged (still all experts on CPU by default),
-this is a precision fix, not a new performance tuning decision.
-
-**The lead measures the real fitting value on the 4070, beside the running
-E4B, and records it as the new default here** (replace `24` with the
-measured minimum `ncmoe` that satisfies clause F, or leave `24` if even
-"all experts on CPU" is the answer). Latency is acceptable for this
-setting either way -- extraction is asynchronous, per the T1b brief.
+`24`, the earlier default, is **all experts on CPU**: gpt-oss-20b's MoE layer
+count is **24** by the GGUF file's own metadata (`block_count`, confirmed on
+the real host build; b11151's llama-server load log prints no CUDA device or
+offload lines, so the metadata is the source). It was chosen, with no
+measurement at any value between 6 and 24, so that extraction could sit
+beside E4B on the 12 GB card, and it is the override for a low-effort run
+beside the main stack (`EXTRACTION_LOCAL_NCMOE=24`). Whether medium at a
+lower offload can sit beside E4B is unmeasured; a run beside the chat model
+would decide it. Latency is acceptable either way -- extraction is
+asynchronous, per the T1b brief.
 
 Host ncmoe sizing (`EXTRACTION_HOST_NCMOE`, default `24`)
 --------------------------------------------------------------------------
 
-Same "all experts on CPU" default and same reasoning as local -- `24` is
-verified via GGUF metadata (`block_count`), not the load log; see "Local
-ncmoe sizing" above. `24` stays the shipped compose-file default (conservative,
+"All experts on CPU", the local file's earlier default -- `24` is verified
+via GGUF metadata (`block_count`), not the load log; see "Local ncmoe
+sizing" above. `24` stays the shipped compose-file default (conservative,
 all-CPU); an operator opts into a tighter value via `EXTRACTION_HOST_NCMOE`
 in the host's own `.env`.
 
