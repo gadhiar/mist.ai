@@ -1,8 +1,9 @@
 """Classify every missed dev-lists relation by where it was lost.
 
 Planning diagnosis for mist-extraction-quality v5. It reads the dev-lists gold
-file, the pre-H8 gold file (to set aside the six relations H8 added from
-labelling rules beyond the prompt), and one or more extraction-service raw files
+file, optionally the pre-H8 gold file (to set aside the six relations H8 added from
+labelling rules beyond the prompt; without it the gold's own `beyond_prompt` flags
+set them aside, and a gold with no flags is counted whole), and one or more extraction-service raw files
 (one JSON object per probe, with `id` and `response.payload`). Each payload goes
 through the scorer's own `parse_produced`, so a relation counts as found exactly
 when `score_extraction_run.score_run` counts it: the key `(source, predicate,
@@ -403,14 +404,17 @@ def _counts(items: Counter[str]) -> str:
 def _print_tables(
     runs: dict[str, RunDiagnosis],
     primary: str,
-    six: set[tuple[str, Key]],
+    six: set[tuple[str, Key]] | None,
     detail: bool,
     dump: bool,
 ) -> None:
     names = list(runs)
-    print(f"Relations beyond the prompt set aside: {len(six)}")
-    for tag, key in sorted(six):
-        print(f"- {tag}: {' '.join(key)}")
+    if six is None:
+        print("asked-for basis: n/a (no beyond-prompt flags)")
+    else:
+        print(f"Relations beyond the prompt set aside: {len(six)}")
+        for tag, key in sorted(six):
+            print(f"- {tag}: {' '.join(key)}")
     print()
     print("| class | " + " | ".join(names) + " |")
     print("|---|" + "---|" * len(names))
@@ -507,7 +511,12 @@ def _print_tables(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--gold", type=Path, required=True)
-    parser.add_argument("--pre-h8-gold", type=Path, required=True)
+    parser.add_argument(
+        "--pre-h8-gold",
+        type=Path,
+        help="the gold before H8; its diff sets relations aside in place of the gold's "
+        "beyond_prompt flags",
+    )
     parser.add_argument(
         "--run",
         action="append",
@@ -524,14 +533,33 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     raw_paths = {name: Path(path) for name, _, path in (s.partition("=") for s in args.run)}
     for path in (args.gold, args.pre_h8_gold, *raw_paths.values()):
-        if not path.is_file():
+        if path is not None and not path.is_file():
             parser.error(f"no such file: {path}")
 
     probes = iter_gold_probes(args.gold)
-    six = _beyond_prompt(probes, iter_gold_probes(args.pre_h8_gold))
-    runs = {name: diagnose(probes, _read_raw(path), six) for name, path in raw_paths.items()}
+    six = _set_aside(probes, args.pre_h8_gold)
+    runs = {
+        name: diagnose(probes, _read_raw(path), six or set()) for name, path in raw_paths.items()
+    }
     _print_tables(runs, next(iter(runs)), six, args.detail, args.dump)
     return 0
+
+
+def _set_aside(probes: list[GoldProbe], pre_h8_gold: Path | None) -> set[tuple[str, Key]] | None:
+    """The relations beyond the prompt, or None when nothing marks them.
+
+    The pre-H8 gold's diff wins when it is given; otherwise the gold's own `beyond_prompt`
+    flags are read, and a gold with neither (the 60, held-out) has no asked-for basis.
+    """
+    if pre_h8_gold is not None:
+        return _beyond_prompt(probes, iter_gold_probes(pre_h8_gold))
+    flagged = {
+        (p.tag, (r.source, r.predicate, r.target))
+        for p in probes
+        for r in p.relationships
+        if r.beyond_prompt
+    }
+    return flagged or None
 
 
 if __name__ == "__main__":

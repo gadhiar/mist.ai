@@ -310,6 +310,44 @@ def test_relations_beyond_the_prompt_are_set_aside(
     assert "| gold relations | 1 |" in out
 
 
+def _flagged_gold(tmp_path: Path, flag: bool) -> Path:
+    row = _probe(
+        "p",
+        {"user": "User", "rust": "Technology", "alice": "Person"},
+        [
+            ("user", "User", "USES", "rust", "Technology"),
+            ("user", "User", "KNOWS", "alice", "Person"),
+        ],
+    )
+    if flag:
+        row["expected_relationships"][1]["beyond_prompt"] = True  # type: ignore[typeddict-unknown-key]
+    return _write(tmp_path / "gold.jsonl", [row])
+
+
+def test_the_gold_flags_set_relations_aside_without_the_pre_h8_gold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = _flagged_gold(tmp_path, flag=True)
+    raw = _write(tmp_path / "raw.jsonl", [_record("p", {"user": "User"}, [])])
+    assert dlm.main(["--gold", str(gold), f"--run=r={raw}"]) == 0
+    out = capsys.readouterr().out
+    assert "Relations beyond the prompt set aside: 1\n- p: user KNOWS alice" in out
+    assert "| gold relations | 1 |" in out
+    assert "asked-for basis: n/a" not in out
+
+
+def test_a_gold_with_no_flags_and_no_pre_h8_gold_counts_every_relation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = _flagged_gold(tmp_path, flag=False)
+    raw = _write(tmp_path / "raw.jsonl", [_record("p", {"user": "User"}, [])])
+    assert dlm.main(["--gold", str(gold), f"--run=r={raw}"]) == 0
+    out = capsys.readouterr().out
+    assert "asked-for basis: n/a (no beyond-prompt flags)" in out
+    assert "Relations beyond the prompt set aside" not in out
+    assert "| gold relations | 2 |" in out
+
+
 def test_the_form_kinds_are_imported_from_entity_alignment() -> None:
     # Moved, not copied: the classifier and the aligner read one definition of each form kind.
     from scripts.eval_harness import entity_alignment as ea
