@@ -703,13 +703,23 @@ _ALL_GOLD_PARAMS = [pytest.param(p, id=p.name) for p in (_SIXTY, _DEV_GOLD, _HEL
 # the edges of today's gold that the pre-H8 gold (`4f5ceed`) lacks, as
 # `diagnose_list_misses._beyond_prompt` computed them before the Event relabel renamed any
 # endpoint. Pinned here because a test that read the parent commit would break in a shallow
-# checkout and after a squash merge.
+# checkout and after a squash merge. The dvl-30 keys carry the relabelled Event ids.
 _BEYOND_PROMPT_EDGES = {
     ("dvl-01-list-dash-current-tools", "fish", "IS_A", "shell"),
     ("dvl-01-list-dash-current-tools", "helix", "IS_A", "editor"),
     ("dvl-17-list-ref-middle-editor", "kakoune", "IS_A", "editor"),
-    ("dvl-30-list-checkbox-planning-decisions", "planning", "RELATED_TO", "docs-site-move"),
-    ("dvl-30-list-checkbox-planning-decisions", "planning", "RELATED_TO", "feature-freeze"),
+    (
+        "dvl-30-list-checkbox-planning-decisions",
+        "planning-2026-06-13",
+        "RELATED_TO",
+        "move-docs-site-to-astro",
+    ),
+    (
+        "dvl-30-list-checkbox-planning-decisions",
+        "planning-2026-06-13",
+        "RELATED_TO",
+        "freeze-features-2026-11-28",
+    ),
     ("dvl-34-list-long-weekly-habits", "user", "KNOWS_PERSON", "sister"),
 }
 
@@ -812,6 +822,161 @@ def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
     }
 
     assert flagged == _BEYOND_PROMPT_EDGES
+
+
+# --- The Event id rule (the extraction contract ADR, Event id rule E-b) ----------------------
+
+# An Event id is the utterance's own phrase for it, articles and possessive pronouns dropped,
+# a named owner kept without its `'s`, a place kept as worded, no date word, and the one day
+# its `OCCURRED_ON` edge dates it to appended as `-YYYY-MM-DD`. The date words are the ADR's
+# closed list. A bare day number is left to the labeller, because a number can name the event
+# itself (`sprint-12`, `tram-28`); a name word that is also a date word (`may`, `sun`) would
+# need an exemption here naming its probe.
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_SUFFIX = re.compile(r"-(\d{4}-\d{2}-\d{2})$")
+_ARTICLES = frozenset({"a", "an", "the"})
+_POSSESSIVE_PRONOUNS = frozenset({"my", "our", "your", "his", "her", "their", "its"})
+_WEEKDAYS = frozenset(
+    "monday tuesday wednesday thursday friday saturday sunday"
+    " mon tue tues wed thu thurs fri sat sun".split()
+)
+_DATE_WORDS = _WEEKDAYS | frozenset(
+    "january february march april may june july august september october november december"
+    " jan feb mar apr jun jul aug sep sept oct nov dec"
+    " today tonight tomorrow yesterday".split()
+)
+_RELATIVE_HEADS = frozenset({"this", "next", "last"})
+_RELATIVE_UNITS = _WEEKDAYS | frozenset({"week", "weekend", "month", "year"})
+_ORDINAL_DAY = re.compile(r"^\d{1,2}(?:st|nd|rd|th)$")
+_YEAR = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _is_date_word(tokens: list[str], i: int) -> bool:
+    token = tokens[i]
+    if token in _DATE_WORDS or _ORDINAL_DAY.match(token) or _YEAR.match(token):
+        return True
+    after = tokens[i + 1] if i + 1 < len(tokens) else ""
+    before = tokens[i - 1] if i > 0 else ""
+    return (token in _RELATIVE_HEADS and after in _RELATIVE_UNITS) or (
+        token in _RELATIVE_UNITS and before in _RELATIVE_HEADS
+    )
+
+
+def _phrase_words(utterance: str) -> list[str]:
+    """The utterance's words as an Event id may use them, in order."""
+    text = _ISO_DATE.sub(" ", utterance.lower().replace("’", "'"))
+    words = [re.sub(r"'s$", "", w) for w in re.findall(r"[a-z0-9]+(?:'[a-z]+)?", text)]
+    words = [w for w in words if w not in _ARTICLES and w not in _POSSESSIVE_PRONOUNS]
+    return [w for i, w in enumerate(words) if not _is_date_word(words, i)]
+
+
+def _is_run_of(part: list[str], whole: list[str]) -> bool:
+    return any(whole[i : i + len(part)] == part for i in range(len(whole) - len(part) + 1))
+
+
+def _event_rule_faults(row: dict) -> list[tuple[str, str]]:
+    """(event id, fault) for each Event of one gold row that breaks the Event id rule."""
+    types = {e["id"]: e["type"] for e in row["expected_entities"]}
+    words = _phrase_words(row["utterance"])
+    faults = []
+    for event in (i for i, t in types.items() if t == "Event"):
+        edges = row["expected_relationships"]
+        days = [
+            r["target"]
+            for r in edges
+            if r["source"] == event
+            and r["predicate"] == "OCCURRED_ON"
+            and types.get(r["target"]) == "Date"
+        ]
+        suffix = _ISO_SUFFIX.search(event)
+        if len(days) == 1:
+            if suffix is None or suffix.group(1) != days[0]:
+                faults.append((event, "date suffix"))
+        elif _ISO_DATE.search(event):
+            faults.append((event, "date suffix"))
+        stem = event[: suffix.start()] if suffix else event
+        tokens = stem.split("-")
+        dated = [i for i in range(len(tokens)) if _is_date_word(tokens, i)]
+        if dated:
+            faults.append((event, "date word"))
+        if not _is_run_of([t for i, t in enumerate(tokens) if i not in dated], words):
+            faults.append((event, "not the utterance's phrase"))
+        for rel in edges:
+            owner = rel["source"]
+            if rel["predicate"] != "EXPERIENCED" or rel["target"] != event or owner == "user":
+                continue
+            possessive = rf"\b{re.escape(owner.replace('-', ' '))}['’]s\b"
+            if re.search(possessive, row["utterance"], re.I) and not stem.startswith(f"{owner}-"):
+                faults.append((event, "owner"))
+    return faults
+
+
+def _event_row(utterance: str, event: str, day: str | None = None, owner: str | None = None):
+    entities = [{"id": event, "type": "Event"}]
+    edges = []
+    if day:
+        entities.append({"id": day, "type": "Date"})
+        edges.append(
+            {
+                "source": event,
+                "source_type": "Event",
+                "predicate": "OCCURRED_ON",
+                "target": day,
+                "target_type": "Date",
+            }
+        )
+    if owner:
+        entities.append({"id": owner, "type": "Person"})
+        edges.append(
+            {
+                "source": owner,
+                "source_type": "Person",
+                "predicate": "EXPERIENCED",
+                "target": event,
+                "target_type": "Event",
+            }
+        )
+    return {
+        "tag": "syn",
+        "utterance": utterance,
+        "expected_entities": entities,
+        "expected_relationships": edges,
+    }
+
+
+_PARTY = "Noor's graduation party is on 2026-05-30."
+_OFFSITE = "The May 30 offsite went well."
+
+
+@pytest.mark.parametrize(
+    ("utterance", "event", "day", "owner", "faults"),
+    [
+        (_PARTY, "noor-graduation-party-2026-05-30", "2026-05-30", "noor", []),
+        (_PARTY, "graduation-party-2026-05-30", "2026-05-30", "noor", ["owner"]),
+        (_PARTY, "noor-graduation-party", "2026-05-30", "noor", ["date suffix"]),
+        (_PARTY, "noor-graduation-party-2026-05-31", "2026-05-30", "noor", ["date suffix"]),
+        (_OFFSITE, "offsite-2026-05-30", "2026-05-30", None, []),
+        (_OFFSITE, "may-offsite-2026-05-30", "2026-05-30", None, ["date word"]),
+        (_OFFSITE, "offsite", None, None, []),
+        (_OFFSITE, "offsite-2026-05-30", None, None, ["date suffix"]),
+        (_OFFSITE, "team-offsite", None, None, ["not the utterance's phrase"]),
+        ("Our team dinner is next week.", "team-dinner", None, None, []),
+        ("Sprint 12 demo on 2026-05-29.", "sprint-12-demo-2026-05-29", "2026-05-29", None, []),
+        ("Signed the lease in Bruges.", "signed-lease-in-bruges", None, None, []),
+        ("Decisions from today's planning:", "planning-2026-06-13", "2026-06-13", None, []),
+    ],
+)
+def test_event_rule_check_on_synthetic_rows(utterance, event, day, owner, faults):
+    found = [fault for _, fault in _event_rule_faults(_event_row(utterance, event, day, owner))]
+
+    assert found == faults
+
+
+def test_every_dev_lists_event_id_follows_the_event_rule():
+    """The 60 and held-out keep their gold Event ids until their own relabel."""
+    faults = [(row["tag"], *f) for row in _gold_rows(_DEV_GOLD) for f in _event_rule_faults(row)]
+
+    assert faults == []
 
 
 # --- Labelling rules from the H8 check (N11 to N16 in LABELLING.md) ---------------------------
