@@ -824,6 +824,37 @@ def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
     assert flagged == _BEYOND_PROMPT_EDGES
 
 
+# The dev-lists entities that carry other accepted ids, each a case N1's last sentence admits:
+# two forms fit and neither is a phrase of the utterance's own. dvl-08 words both habits only
+# as verbs ("swim on Tuesdays", "call my parents"), and a habit id names the activity
+# (`journaling` for "I journal", ext-55), so the activity noun and the verb as written both fit.
+_ID_ALTERNATIVES = {
+    ("dvl-08-list-plus-weekly-routine", "calling-parents"): ["call-parents"],
+    ("dvl-08-list-plus-weekly-routine", "swimming"): ["swim"],
+}
+# LABELLING names no two predicates for one shape that a dev-lists edge fits, so none has any.
+_PREDICATE_ALTERNATIVES: dict[tuple[str, str, str, str], list[str]] = {}
+
+
+def test_dev_lists_alternatives_are_exactly_the_named_cases():
+    rows = _gold_rows(_DEV_GOLD)
+    ids = {
+        (row["tag"], e["id"]): e["alternatives"]
+        for row in rows
+        for e in row["expected_entities"]
+        if "alternatives" in e
+    }
+    predicates = {
+        (row["tag"], r["source"], r["predicate"], r["target"]): r["predicate_alternatives"]
+        for row in rows
+        for r in row["expected_relationships"]
+        if "predicate_alternatives" in r
+    }
+
+    assert ids == _ID_ALTERNATIVES
+    assert predicates == _PREDICATE_ALTERNATIVES
+
+
 # --- The Event id rule (the extraction contract ADR, Event id rule E-b) ----------------------
 
 # An Event id is the utterance's own phrase for it, articles and possessive pronouns dropped,
