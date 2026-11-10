@@ -32,11 +32,11 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 ### Subject Scope (passed in as SUBJECT SCOPE below)
 - `user-scope` utterances: the user is the subject. Use User-centric predicates (USES, LEARNING, WORKS_ON, etc.). source="user".
 - `system-scope` utterances: MIST is the subject. Use MistIdentity-centric predicates (USES, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE). source="mist-identity" with type="MistIdentity".
-- `third-party` utterances: someone else is the subject. Use Person or Organization as source, or drop the relationship if the subject is ambiguous. Do NOT attribute third-party claims to the user.
+- `third-party` utterances: someone else is the subject. Use Person or Organization as source, or drop the relationship if the subject is ambiguous. Do NOT attribute third-party claims to the user. When the user names that someone only by their relation ("my coworker"), still emit that Person and user KNOWS_PERSON <relation noun> (Rule 24, Example 7); only the claim stays off the user.
 - `unknown` scope: use utterance content to infer; prefer no relationship over wrong attribution.
 
 ### Relationship Direction Rules:
-- Structural relationships flow from specific to general: "React" IS_A "Framework".
+- Structural relationships flow from specific to general: "Combwright" IS_A "hive-logging app" (Rule 25).
 - USES accepts User, Person, Organization, or MistIdentity as source.
 - DEPENDS_ON sources are Technology, Project, Organization, or MistIdentity (never User).
 - WORKS_WITH is undirected between Technology/Organization/MistIdentity and Technology; either orientation is valid.
@@ -47,8 +47,8 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 
 ## EXTRACTION RULES
 1. Subject entity depends on scope. For `user-scope` utterances, create entity {{"id": "user", "name": "User", "type": "User"}}. For `system-scope` utterances, create entity {{"id": "mist-identity", "name": "MIST", "type": "MistIdentity"}}. For `third-party` utterances, use Person/Organization names directly as sources. For `unknown` scope, infer from content and prefer no relationship over wrong attribution.
-2. Entity IDs: lowercase, hyphenated. "Python 3.11" -> "python", "React Native" -> "react-native".
-3. Collapse version specifics into canonical names.
+2. Entity IDs are the utterance's own phrase for the thing: lowercased and hyphenated, with leading articles and possessive pronouns (a, an, the, my, our, your, his, her, their, its) dropped, and a plural kept as written ("React Native" -> "react-native"). Never invent an id. When a contiguous run of the utterance's words names the entity, that run is the id, neither lengthened nor shortened: "handles transient network failures" -> "transient-network-failures", not "transient-failure". An id differs from the utterance's phrase only where a rule builds it: the "user" and "mist-identity" anchors, ISO Date ids, version collapse (Rule 3), and Rules 21 to 27.
+3. Collapse version specifics into canonical names: "Python 3.11" -> "python".
 4. Confidence scoring: Definitive=0.95, Personal=0.9, Opinions=0.7, Hedged=-0.2, Third-party=0.8, Speculative=0.5
 5. Temporal extraction: relative dates resolved against reference_date, temporal_status assigned
 6. Assertion kind -- every relationship carries "assertion_kind": "assert" (the fact is true / began), "cease" (the fact stopped being true: "stopped", "quit", "left", "gave up on", "don't ... anymore"; set end_date if a stop date is stated), or "retract" (the fact was NEVER true: "I never actually", "I misspoke", "scratch that", "I was wrong about"). Self-corrections about the user's own facts ("scratch that, I don't work at Initech") are retractions of facts, NOT directives -- Rule 10 does not apply to them. Preference negation is NOT cessation: "don't like X" -> DISLIKES with assertion_kind=assert; "don't like X anymore" -> DISLIKES assert (the new preference is the fact). When unsure, use "assert".
@@ -66,6 +66,13 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 18. Extract the asserted fact, not incidental scope. A trailing prepositional phrase that merely scopes another fact ("recommended GraphQL FOR the new service", "switched to Memcached FOR the project", "covers 87 percent OF the codebase") is context, not a separate relationship -- do NOT manufacture a structural edge (STRATEGY_FOR / APPLICABLE_TO / WORKS_ON / PART_OF / USED_FOR) for it. Extract a structural edge ONLY when that relationship is itself the asserted fact: "I use Rust FOR backend work" -> rust USED_FOR backend-work IS the fact, so extract it.
 19. Third-party facts -- when the user states a fact about another person ("my sister Anjali works in biotech"), extract BOTH: user KNOWS_PERSON the person AND the third party's own fact with the third party as source (person WORKS_AT org, or equivalent predicate). Do not collapse the third-party fact onto the user.
 20. Abstract-type disambiguation -- when a noun phrase names an abstract knowledge object, apply the ABSTRACT-TYPE TESTS above. Emit the winning child type (Concept / Skill / Pattern / Strategy / Mechanism / Convention / DataStructure). Emit `Abstraction` ONLY when no child type's test clearly wins. Never guess between siblings: if the noun could be Concept OR Pattern, choose Abstraction rather than picking at random.
+21. An activity keeps its object. The id of an activity, a capability or a habit keeps the object the utterance gives it, possessive pronouns dropped: "learning to carve soundboards" -> "carve-soundboards", not "carving" (Example 27). A habit id is the utterance's own phrase: "I work out every morning" -> "work-out" (Example 24). This shapes the id only; it adds no fact.
+22. Goal ids. A Goal's id is the goal's verb phrase as the utterance words it, articles and possessive pronouns dropped: "my goal is to rebuild my old harpsichord" -> "rebuild-old-harpsichord" (Example 27), not a rephrasing such as "harpsichord-restoration".
+23. Name modifiers. A name that only modifies another name gets no entity of its own, unless a list's lead-in carries it: in "the Ferrowind tuning guide" the entity is "ferrowind-tuning-guide", and Ferrowind gets no entity.
+24. A relative named by the relation. A single person the user names only by their relation to the user ("my coworker") is a `Person` whose id is the relation noun ("coworker"). That person gets user KNOWS_PERSON <relation noun> and their own durable facts, as a named person would (Example 7). No entity for: a group, since a `Person` is one person; someone the utterance relates to another person rather than to the user; someone named without a possessive ("a coworker").
+25. Kind nouns. When the utterance says what kind of thing a named entity is, beyond its entity type, the kind is a `Concept` and the entity gets IS_A to it: "Combwright, a hive-logging app" -> combwright IS_A hive-logging-app (Example 28). No IS_A edge when: the kind only restates the entity type, as the words of the type's description do ("a framework" for a Technology); IS_A cannot join the pair (it joins only Abstraction, Concept, Location, Organization, Skill and Technology); the kind is part of the name; or the entity stands for something other than the thing the kind describes.
+26. Event ids and edges. An Event's id is the utterance's own phrase for it, articles and possessive pronouns dropped. Keep a named owner, dropping its possessive 's ("Maelle's housewarming" -> "maelle-housewarming"), and keep a place as the utterance words it (Example 29). The id holds no date word. Date words are: a month or weekday name or its abbreviation, a day or year number, an ordinal day ("30th"), an ISO date, "today", "tonight", "tomorrow", "yesterday", and "this", "next" or "last" before "week", "weekend", "month", "year" or a weekday. So "the June 3 regatta" is "regatta", not "june-3-regatta". A number that names the event itself is not a date word ("cluster-8-phase-6", Example 9). The date is carried only by the Event's OCCURRED_ON edge to its `Date` (Examples 9, 12 and 29). A milestone-class Event (shipped, launched, completed, promoted) gets OCCURRED_ON to its `Date` and no user EXPERIENCED edge. An Event stated with no participant gets OCCURRED_ON only. An Event the user took part in also gets user EXPERIENCED <event>. A decision the user made is user DECIDED <event>; DECIDED takes only a User source.
+27. Metric properties. When the utterance gives a measured number, the Metric carries "properties": {{"value": <the number as written>, "unit": <its unit, or null when it has none>, "quantity": <what is measured, or null>}}. Write its id value-first, "<value>-<unit>-<quantity>" with empty parts left out and a decimal point as a hyphen: "0.94 tool_selection" -> "0-94-tool-selection" (Example 10). Attach it with HAS_METRIC, whose source is a User, Project, Technology, Skill, Concept or Goal; a metric about an Organization or an Event gets no edge.
 
 ## REFERENCE DATE
 Today's date: {reference_date}
@@ -106,13 +113,13 @@ Output:
 Subject scope: system-scope
 Utterance: "MIST is warm and playful by default"
 Output:
-{{"entities": [{{"id": "mist-identity", "name": "MIST", "type": "MistIdentity"}}, {{"id": "warmth", "name": "Warmth", "type": "Concept"}}, {{"id": "playfulness", "name": "Playfulness", "type": "Concept"}}], "relationships": [{{"source": "mist-identity", "target": "warmth", "type": "MIST_HAS_TRAIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "by default", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "mist-identity", "target": "playfulness", "type": "MIST_HAS_TRAIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "by default", "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "mist-identity", "name": "MIST", "type": "MistIdentity"}}, {{"id": "warm", "name": "Warm", "type": "Concept"}}, {{"id": "playful", "name": "Playful", "type": "Concept"}}], "relationships": [{{"source": "mist-identity", "target": "warm", "type": "MIST_HAS_TRAIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "by default", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "mist-identity", "target": "playful", "type": "MIST_HAS_TRAIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "by default", "negated": false, "assertion_kind": "assert"}}}}]}}
 
-### Example 7: Third-party opinion, no attribution to user
+### Example 7: Third-party opinion -- the relative named by the relation is a Person; the opinion is not the user's
 Subject scope: third-party
 Utterance: "My coworker says Rust is really fast"
 Output:
-{{"entities": [{{"id": "rust", "name": "Rust", "type": "Technology"}}], "relationships": []}}
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "coworker", "name": "Coworker", "type": "Person"}}, {{"id": "rust", "name": "Rust", "type": "Technology"}}], "relationships": [{{"source": "user", "target": "coworker", "type": "KNOWS_PERSON", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 8: No extractable knowledge
 Subject scope: user-scope
@@ -130,7 +137,7 @@ Output:
 Subject scope: unknown
 Utterance: "Gemma 4 E4B gets 0.94 tool_selection on the eval harness"
 Output:
-{{"entities": [{{"id": "gemma-4-e4b", "name": "Gemma 4 E4B", "type": "Technology"}}, {{"id": "tool-selection-0-94", "name": "0.94 tool_selection", "type": "Metric"}}], "relationships": [{{"source": "gemma-4-e4b", "target": "tool-selection-0-94", "type": "HAS_METRIC", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "eval harness", "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "gemma-4-e4b", "name": "Gemma 4 E4B", "type": "Technology"}}, {{"id": "0-94-tool-selection", "name": "0.94 tool_selection", "type": "Metric", "properties": {{"value": 0.94, "unit": null, "quantity": "tool_selection"}}}}], "relationships": [{{"source": "gemma-4-e4b", "target": "0-94-tool-selection", "type": "HAS_METRIC", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "eval harness", "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 11: Document reference -- user references an ADR via REFERENCES_DOCUMENT
 Subject scope: user-scope
@@ -138,11 +145,11 @@ Utterance: "I read ADR-010 yesterday and I like the vault-as-canon pattern"
 Output:
 {{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "adr-010", "name": "ADR-010", "type": "Document"}}], "relationships": [{{"source": "user", "target": "adr-010", "type": "REFERENCES_DOCUMENT", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": null, "end_date": null, "temporal_expression": "yesterday", "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 
-### Example 12: Temporal -- user-experienced Event anchored to a Date (contrast Example 9 milestone-class Event)
+### Example 12: Temporal -- user-experienced Event anchored to a Date; the id is the bare phrase, the date only on OCCURRED_ON (contrast Example 9 milestone-class Event)
 Subject scope: user-scope
-Utterance: "I attended a conference on 2026-04-15"
+Utterance: "I attended a glassblowing symposium on 2026-04-15"
 Output:
-{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "conference-2026-04-15", "name": "Conference attended on 2026-04-15", "type": "Event"}}, {{"id": "2026-04-15", "name": "2026-04-15", "type": "Date"}}], "relationships": [{{"source": "user", "target": "conference-2026-04-15", "type": "EXPERIENCED", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": "2026-04-15", "end_date": null, "temporal_expression": "on 2026-04-15", "context": null, "negated": false, "assertion_kind": "assert"}}}}, {{"source": "conference-2026-04-15", "target": "2026-04-15", "type": "OCCURRED_ON", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": "2026-04-15", "end_date": null, "temporal_expression": "on 2026-04-15", "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "glassblowing-symposium", "name": "Glassblowing symposium", "type": "Event"}}, {{"id": "2026-04-15", "name": "2026-04-15", "type": "Date"}}], "relationships": [{{"source": "user", "target": "glassblowing-symposium", "type": "EXPERIENCED", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": "2026-04-15", "end_date": null, "temporal_expression": "on 2026-04-15", "context": null, "negated": false, "assertion_kind": "assert"}}}}, {{"source": "glassblowing-symposium", "target": "2026-04-15", "type": "OCCURRED_ON", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": "2026-04-15", "end_date": null, "temporal_expression": "on 2026-04-15", "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 13: Document engagement -- active reading verbs trigger REFERENCES_DOCUMENT
 Subject scope: user-scope
@@ -160,7 +167,7 @@ Output:
 Subject scope: unknown
 Utterance: "The garbage collector reclaims unused memory fragments"
 Output:
-{{"entities": [{{"id": "garbage-collector", "name": "Garbage collector", "type": "Mechanism"}}, {{"id": "memory-fragment", "name": "Memory fragment", "type": "DataStructure"}}], "relationships": [{{"source": "garbage-collector", "target": "memory-fragment", "type": "OPERATES_ON", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "reclaims unused", "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "garbage-collector", "name": "Garbage collector", "type": "Mechanism"}}, {{"id": "memory-fragments", "name": "Memory fragments", "type": "DataStructure"}}], "relationships": [{{"source": "garbage-collector", "target": "memory-fragments", "type": "OPERATES_ON", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "reclaims unused", "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 16: COMPRISES + INPUT_TO -- composition and data-flow direction
 Subject scope: unknown
@@ -190,7 +197,7 @@ Output:
 Subject scope: unknown
 Utterance: "Speculative decoding is the mechanism behind faster token generation, and the retry-policy mechanism handles transient network failures"
 Output:
-{{"entities": [{{"id": "speculative-decoding", "name": "Speculative decoding", "type": "Mechanism"}}, {{"id": "token-generation", "name": "Token generation", "type": "Concept"}}, {{"id": "retry-policy", "name": "Retry policy", "type": "Mechanism"}}, {{"id": "transient-failure", "name": "Transient failure", "type": "Concept"}}], "relationships": [{{"source": "speculative-decoding", "target": "token-generation", "type": "MECHANISM_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "behind faster", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "retry-policy", "target": "transient-failure", "type": "MECHANISM_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "handles", "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "speculative-decoding", "name": "Speculative decoding", "type": "Mechanism"}}, {{"id": "token-generation", "name": "Token generation", "type": "Concept"}}, {{"id": "retry-policy", "name": "Retry policy", "type": "Mechanism"}}, {{"id": "transient-network-failures", "name": "Transient network failures", "type": "Concept"}}], "relationships": [{{"source": "speculative-decoding", "target": "token-generation", "type": "MECHANISM_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "behind faster", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "retry-policy", "target": "transient-network-failures", "type": "MECHANISM_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "handles", "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 21: Cessation with stated stop date and abandoned learning
 Subject scope: user-scope
@@ -214,7 +221,7 @@ Output:
 Subject scope: user-scope
 Utterance: "I work out every morning before standup"
 Output:
-{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "working-out", "name": "Working out", "type": "Concept"}}], "relationships": [{{"source": "user", "target": "working-out", "type": "HAS_HABIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": "every morning", "context": "before standup", "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "work-out", "name": "Work out", "type": "Concept"}}], "relationships": [{{"source": "user", "target": "work-out", "type": "HAS_HABIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": "every morning", "context": "before standup", "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 25: Third-party facts -- KNOWS_PERSON plus the third party's own WORKS_AT fact
 Subject scope: user-scope
@@ -227,6 +234,24 @@ Subject scope: user-scope
 Utterance: "I find the notion of semantic closure really interesting"
 Output:
 {{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "semantic-closure", "name": "Semantic closure", "type": "Abstraction"}}], "relationships": [{{"source": "user", "target": "semantic-closure", "type": "INTERESTED_IN", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 27: Goal and activity ids -- the goal's verb phrase, the activity with its object
+Subject scope: user-scope
+Utterance: "My goal is to rebuild my old harpsichord, so I'm learning to carve soundboards"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "rebuild-old-harpsichord", "name": "Rebuild old harpsichord", "type": "Goal"}}, {{"id": "carve-soundboards", "name": "Carve soundboards", "type": "Skill"}}], "relationships": [{{"source": "user", "target": "rebuild-old-harpsichord", "type": "HAS_GOAL", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}, {{"source": "user", "target": "carve-soundboards", "type": "LEARNING", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 28: Kind noun -- the named entity IS_A the kind the utterance gives it
+Subject scope: user-scope
+Utterance: "I track my beehives with Combwright, a hive-logging app"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "combwright", "name": "Combwright", "type": "Technology"}}, {{"id": "hive-logging-app", "name": "Hive-logging app", "type": "Concept"}}], "relationships": [{{"source": "user", "target": "combwright", "type": "USES", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "track my beehives", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "combwright", "target": "hive-logging-app", "type": "IS_A", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 29: Event id -- named owner and place kept, possessive 's dropped, date only on OCCURRED_ON
+Subject scope: user-scope
+Utterance: "I went to Maelle's housewarming in Dunmarrow on 2026-03-07"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "maelle-housewarming-in-dunmarrow", "name": "Maelle housewarming in Dunmarrow", "type": "Event"}}, {{"id": "2026-03-07", "name": "2026-03-07", "type": "Date"}}], "relationships": [{{"source": "user", "target": "maelle-housewarming-in-dunmarrow", "type": "EXPERIENCED", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": "2026-03-07", "end_date": null, "temporal_expression": "on 2026-03-07", "context": null, "negated": false, "assertion_kind": "assert"}}}}, {{"source": "maelle-housewarming-in-dunmarrow", "target": "2026-03-07", "type": "OCCURRED_ON", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": "2026-03-07", "end_date": null, "temporal_expression": "on 2026-03-07", "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:
