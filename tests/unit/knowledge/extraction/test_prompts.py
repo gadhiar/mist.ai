@@ -6,6 +6,9 @@ without churn-testing, while still catching regressions that drop a
 load-bearing rule.
 """
 
+import json
+import re
+
 from backend.knowledge.extraction.prompts import (
     EXTRACTION_SYSTEM_PROMPT,
     EXTRACTION_USER_TEMPLATE,
@@ -275,6 +278,127 @@ class TestR4PrecisionRules:
         assert "Extract the asserted fact, not incidental scope" in EXTRACTION_SYSTEM_PROMPT
 
 
+_EXAMPLE_RE = re.compile(
+    r"^### Example (\d+):[^\n]*\nSubject scope: [^\n]*\nUtterance: \"(.*)\"\nOutput:\n(.*)$",
+    re.MULTILINE,
+)
+
+
+def _examples() -> dict[int, tuple[str, dict]]:
+    """Example number to (utterance, parsed output), with the format braces undoubled."""
+    return {
+        int(m.group(1)): (m.group(2), json.loads(m.group(3).replace("{{", "{").replace("}}", "}")))
+        for m in _EXAMPLE_RE.finditer(EXTRACTION_SYSTEM_PROMPT)
+    }
+
+
+def _entities_by_id(output: dict) -> dict[str, dict]:
+    return {entity["id"]: entity for entity in output["entities"]}
+
+
+def _has_edge(output: dict, source: str, edge_type: str, target: str) -> bool:
+    return any(
+        (rel["source"], rel["type"], rel["target"]) == (source, edge_type, target)
+        for rel in output["relationships"]
+    )
+
+
+class TestGroup1IdentityConventions:
+    """v11 group 1 (ADR-054 Decisions 3 to 5 and 7): the identity conventions the gold
+    labels follow are stated in the prompt, each as a rule, with an example where the
+    rule alone is a new shape. Each presence check is keyed on the rule's own phrase.
+    """
+
+    def test_rule_2_states_n1_the_id_is_the_utterance_s_own_phrase(self):
+        assert "Entity IDs are the utterance's own phrase" in EXTRACTION_SYSTEM_PROMPT
+        assert "Never invent an id" in EXTRACTION_SYSTEM_PROMPT
+        assert "neither lengthened nor shortened" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n15_an_activity_keeps_its_object(self):
+        assert "An activity keeps its object" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n2_goal_ids_are_the_goal_s_verb_phrase(self):
+        assert "Goal ids. A Goal's id is the goal's verb phrase" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n4_a_name_that_only_modifies_another_name_gets_no_entity(self):
+        assert "Name modifiers. A name that only modifies another name" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+
+    def test_n16_a_relative_named_by_the_relation_is_a_person(self):
+        assert "A relative named by the relation" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n14_kind_nouns_get_is_a_to_a_concept(self):
+        assert "Kind nouns. When the utterance says what kind of thing" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+
+    def test_the_event_rule_keeps_owner_and_place_and_no_date_words(self):
+        assert "Event ids and edges" in EXTRACTION_SYSTEM_PROMPT
+        assert "The id holds no date word" in EXTRACTION_SYSTEM_PROMPT
+        # ADR-054 Decision 4's closed list, its last clause verbatim.
+        assert (
+            '"this", "next" or "last" before "week", "weekend", "month", "year" or a weekday'
+            in EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "DECIDED takes only a User source" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_the_metric_rule_asks_for_value_unit_and_quantity(self):
+        assert "Metric properties" in EXTRACTION_SYSTEM_PROMPT
+        assert "value-first" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_the_third_party_scope_rule_keeps_the_relative_s_anchor(self):
+        third_party = next(
+            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if "`third-party` utt" in line
+        )
+        assert "KNOWS_PERSON" in third_party and "Example 7" in third_party
+
+    def test_every_example_output_parses_as_json(self):
+        examples = _examples()
+        count = EXTRACTION_SYSTEM_PROMPT.count("### Example ")
+        assert len(examples) == count
+        assert sorted(examples) == list(range(1, count + 1))
+
+    def test_example_7_the_coworker_is_a_person_anchored_to_the_user(self):
+        _, output = _examples()[7]
+        entities = _entities_by_id(output)
+        assert entities["coworker"]["type"] == "Person"
+        assert _has_edge(output, "user", "KNOWS_PERSON", "coworker")
+        assert all(
+            rel["source"] != "user" or rel["type"] == "KNOWS_PERSON"
+            for rel in (output["relationships"])
+        ), "the coworker's opinion is not attributed to the user"
+
+    def test_example_10_the_metric_carries_its_properties_and_a_value_first_id(self):
+        _, output = _examples()[10]
+        metric = next(e for e in output["entities"] if e["type"] == "Metric")
+        props = metric["properties"]
+        assert props["value"] is not None
+        assert props.get("unit") or props.get("quantity")
+        assert metric["id"] == "0-94-tool-selection"
+
+    def test_example_12_the_event_id_is_a_phrase_of_its_utterance_with_no_date(self):
+        utterance, output = _examples()[12]
+        event = next(e for e in output["entities"] if e["type"] == "Event")
+        words = re.findall(r"[a-z0-9]+", utterance.lower())
+        id_words = event["id"].split("-")
+        assert any(
+            words[i : i + len(id_words)] == id_words for i in range(len(words))
+        ), "the Event id is not a run of its utterance's words"
+        assert not re.search(r"\d", event["id"])
+        dates = [e["id"] for e in output["entities"] if e["type"] == "Date"]
+        assert len(dates) == 1
+        assert _has_edge(output, event["id"], "OCCURRED_ON", dates[0])
+
+    def test_example_24_the_habit_id_is_the_utterance_s_phrase(self):
+        _, output = _examples()[24]
+        assert "work-out" in _entities_by_id(output)
+        assert _has_edge(output, "user", "HAS_HABIT", "work-out")
+
+    def test_the_prompt_stays_under_its_length_budget(self):
+        assert len(EXTRACTION_SYSTEM_PROMPT) <= 45000
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
@@ -316,8 +440,8 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-06-14-r5".
-    PINNED_SHA256 = "26ed83579f3663c827729bc624e39d323c3484aa7b3622066f93c5287a9855c3"
+    # extraction_version = "2026-11-10-r8", group 1 (identity conventions).
+    PINNED_SHA256 = "2ea75168d5036cecfd1e22b0f082de8c9f8756c0b7b1d8339d207edb074ef51f"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
