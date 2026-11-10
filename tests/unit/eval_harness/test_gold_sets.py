@@ -847,7 +847,7 @@ def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
 
 # The dev-lists entities that carry other accepted ids, each a case N1's last sentence admits:
 # two forms fit and neither is a phrase of the utterance's own. None does: with N1's habit
-# clause suspended (it has no carrier), dvl-08's habits take the utterance's own `swim` and
+# clause retired (A30, Ruling 22), dvl-08's habits take the utterance's own `swim` and
 # `call-parents`, the forms that were their alternatives.
 _ID_ALTERNATIVES: dict[tuple[str, str], list[str]] = {}
 # LABELLING names no two predicates for one shape that a dev-lists edge fits, so none has any.

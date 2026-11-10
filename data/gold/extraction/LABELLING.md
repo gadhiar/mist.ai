@@ -62,11 +62,12 @@ Each label row follows the 60-probe schema exactly, so `iter_gold_probes`
 - `id`, `source` and `target` are canonical: lowercase, hyphenated, letters, digits and hyphens
   only (`score_extraction_run.py:65-77`; prompt Rule 2, `prompts.py:50`). Versions collapse to
   the base name (Rule 3, `prompts.py:51`).
-- An id is written as `canonical_id` leaves it, so the file row and the loaded probe are the same
-  (N9). A decimal point is dropped: `31-gb-peak-memory`, not `3.1-gb-peak-memory`. The loader
-  and the normaliser's slug strip it anyway (`canonical_id.py:10-15`), so the loaded gold is
-  the same either way; written in loader form, the test can compare the file with what the
-  loader returns. Settled in the 2026-11 adjudication (dvl-39, ho-015).
+- An id is written as the loader leaves it, so the file row and the loaded probe are the same
+  (N9); written in loader form, the test can compare the file with what the loader returns.
+  A Metric id keeps its decimal point as a hyphen: `3-1-gb-peak-memory`, not
+  `31-gb-peak-memory` or `3.1-gb-peak-memory`, so 3.1 GB and 31 GB do not share an id (plan v11
+  D16; the Metric paragraph under Event and metric ids). This replaces the 2026-11
+  adjudication's dropped decimal (dvl-39, ho-015).
 - Types and predicates are the extractable v1.4.0 sets only: `EXTRACTABLE_NODE_TYPES`
   (`v1_0_0.py:1877-1879`, 21 types) and `EXTRACTABLE_RELATIONSHIP_TYPES`
   (`v1_0_0.py:1914-1916`, 39 predicates). The test derives both sets from the module. `Topic`
@@ -105,18 +106,22 @@ score shows what extraction misses. In dev-lists, the six edges H8 added under s
   as Rule 1's `user`, the ISO Date id, the Metric rail, N2, N4, N14, N15, N16 and the Event
   rule do. An id that is a contiguous run of the utterance's words naming the entity is the
   utterance's own phrase, and a labeller neither lengthens nor shortens it.
-  *Suspended:* "a habit id names the activity, as `journaling` and `long-run` (`ext-55`,
-  `ext-57`)". No prompt rule or rail carries it, so it decides no id until it has a carrier;
-  a habit id is the utterance's phrase ("swim on Tuesdays" is `swim`). Where two ids both fit
-  this and neither is the utterance's own phrase, gold lists both: the entity keeps one as
+  *Retired:* N1's habit clause, "a habit id names the activity", is retired (A30, Raj's
+  Ruling 22, 2026-11-10). No prompt rule or rail carried it, and a carrier would have to turn
+  verbs into activity nouns, which no deterministic rail can check. A habit id is the
+  utterance's own phrase: "swim on Tuesdays" is `swim`, "I journal every night" is `journal`
+  (`ext-55`, relabelled from `journaling`), "a long run every Sunday" is `long-run` (`ext-57`).
+  A verb-form habit id and a later noun mention (`swim`, `swimming`) stay two nodes until a
+  graph resolution step joins them. Where two ids both fit N1 and neither is the utterance's
+  own phrase, gold lists both: the entity keeps one as
   `id` and the other in `alternatives` (Decision 3; this replaced the adjudication's rule that
   the base pass's stands). No dev-lists entity is such a case.
 - **N15 An activity keeps its object.** An id for an activity, a capability or a habit keeps the
   object the utterance gives it, possessives dropped: "MIST can search my notes by meaning" is
   `search-notes-by-meaning`, not `search-by-meaning`, because the notes are part of the
   capability. From the H8 mark on ho-165. It asks for no new fact, only the id's surface. The
-  60-probe `ext-58` writes "mentoring junior engineers" as `mentoring`, so it does not follow
-  this rule; that file stays unchanged.
+  60-probe `ext-58` wrote "mentoring junior engineers" as `mentoring`; it is relabelled to
+  `mentoring-junior-engineers` under this rule (Relabel log).
 - **N2 Goal ids.** A Goal id is the goal's verb phrase as the utterance words it, articles and
   possessive pronouns dropped: `get-pilots-license`, `cut-screen-time`, `pay-off-mortgage`. The
   60-probe set has no Goal; this follows the goal ids both passes agreed on (`ship-saltmere` in
@@ -293,9 +298,15 @@ not record entity properties.
 
 A Metric id puts the value first: `<value>-<unit>[-<quantity>]`, for example
 `12000-requests-per-second` and `87-percent-coverage` (changelog lines 22-23;
-`backend/knowledge/extraction/canonical_id.py:18-22`). Write the value as the utterance states
-it, in loader form (N9): `31-gb-peak-memory` for "3.1 GB peak memory", with the decimal point
-dropped as `canonical_id` drops it (`canonical_id.py:10-15`). The
+`canonical_metric_id` in `backend/knowledge/extraction/canonical_id.py`). Write the value as the
+utterance states it, spelled as the Metric rail spells it (plan v11 D16,
+`canonical_metric_value`): a digit separator is dropped (`12,000` is `12000`), a decimal point
+is kept as a hyphen and trailing fractional zeros are dropped, so "3.1 GB peak memory" is
+`3-1-gb-peak-memory`, "0.2 percent" is `0-2-percent-...` and "3.80 euros" is `3-8-euros-...`.
+The unit takes gold's one spelling (D16, `UNIT_SPELLINGS`): `percent` (for `%`, `pct`),
+`ms` (for `msec`, `milliseconds`), `seconds` (for `s`, `sec`), `requests-per-second` (for
+`rps`, `requests/sec`), `tokens-per-second` (for `tokens/sec`) and `gb` (for `gigabytes`);
+any other unit keeps its slug (`euros-per-hour`, `matches-per-minute`). The
 metric attaches through `HAS_METRIC` (`v1_0_0.py:1519`). That predicate's allowed sources
 include User, Project, Technology, Skill, Concept and Goal but not Organization or Event, so a
 metric about an organisation or an event gets no edge.
@@ -336,8 +347,9 @@ heading "Shells" over "zsh" is `zsh IS_A shell`, "a covers band called The Late 
 From the H8 marks on ho-121 (the Pinecil is a soldering iron) and ho-009 ("shells are zsh").
 Beyond the prompt: the prompt teaches `IS_A` only by direction ("React" IS_A "Framework",
 `prompts.py:39`), with no rule for a kind noun in apposition, after "as the", or in a heading.
-The 60-probe `ext-13` ("Neovim as my daily editor") has no `neovim IS_A editor`, so it does not
-follow this rule; that file stays unchanged.
+The 60-probe `ext-13` ("Neovim as my daily editor") had no `neovim IS_A editor`; it is
+relabelled under this rule with the `Concept` `editor` and `neovim IS_A editor`, since "daily"
+qualifies the use and is not part of the kind (Relabel log).
 
 ### Date entities
 
@@ -518,3 +530,13 @@ at least twice. T8 checks the same floor on the adjudicated labels.
   `rq-direct-15` follows it. dvl-26 gains the `Organization` `book-club` and
   `user MEMBER_OF book-club` ("a Discord bot for my book club": the speaker's possessive names
   the club), one more dev-lists gold edge. N4 no longer cites ext-18.
+- **2026-11-10, dev-lists and the 60, under the id rails (plan v11 T35).**
+  - dvl-39's four decimal Metric ids keep the decimal (D16): `02-percent-error-rate` to
+    `0-2-percent-error-rate`, `24-seconds-cold-start` to `2-4-seconds-cold-start`,
+    `31-gb-peak-memory` to `3-1-gb-peak-memory`, `380-euros-per-hour` to `3-8-euros-per-hour`,
+    with their `HAS_METRIC` edges. No other dev-lists id changed.
+  - ext-13 gains the `Concept` `editor` and `neovim IS_A editor` (N14). ext-58's `mentoring`
+    becomes `mentoring-junior-engineers` (N15). N1's habit clause is retired (A30, Ruling 22),
+    so ext-55's `journaling` becomes `journal`. The retrieval facts of `rq-paraphrase-06` and
+    `rq-type-scoped-04` name the new ids, and `data/golden-log/golden-log.jsonl` is regenerated
+    from the relabelled 60.
