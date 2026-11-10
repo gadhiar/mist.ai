@@ -208,8 +208,9 @@ The date keeps two occurrences of one event on different days apart, since a wro
 worse than a missed one, and the owner keeps one person's party apart from another's (ADR,
 Rationale). Under the contract the prompt carries the owner and no-date-word clauses and a
 normalizer rail appends the date (v8). This replaces the earlier rule of the bare event noun.
-The 60-probe set and held-out keep their gold Event ids until their own relabel; the scorer's
-event-date alignment bridges a dated produced id to them. `test_gold_sets.py` checks the rule
+The held-out set is relabelled under the contract's owner and own-phrase clauses and, like the
+60-probe set, whose Event ids are not yet relabelled, leaves Event dates to the scorer's
+event-date alignment. `test_gold_sets.py` checks the rule
 on every dev-lists Event.
 
 A milestone-class event (shipped, launched, completed, promoted) is an `Event` anchored to its
