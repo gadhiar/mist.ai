@@ -1,10 +1,27 @@
-"""General compound-id canonicalization. Used by BOTH the normalizer/resolver and
-the F2 scorer so a metric's id never depends on the LLM's word order.
+"""Id canonicalization shared by the normalizer and the eval scorer.
+
+The graph and the scorer import these functions rather than keeping two copies, so a
+stored id and a scored id cannot drift apart, and a metric's id never depends on the
+LLM's word order.
 """
 
 from __future__ import annotations
 
 import re
+
+
+def canonical_id(name: str) -> str:
+    """Canonical entity id: lowercase, hyphenated, alnum+hyphen only.
+
+    Version collapsing is not part of the slug; it is a separate rail that only some
+    entity types take.
+    """
+    s = name.lower().strip()
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip("-")
+    return s or name.lower().replace(" ", "-")
 
 
 def _slug(s: str) -> str:

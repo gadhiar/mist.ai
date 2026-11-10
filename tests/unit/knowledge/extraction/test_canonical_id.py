@@ -69,3 +69,26 @@ def test_metric_id_without_unit_joins_value_and_quantity():
 
     assert canonical_metric_id("180", None, "max queue depth") == "180-max-queue-depth"
     assert canonical_metric_id("180", "", "max queue depth") == "180-max-queue-depth"
+
+
+def test_canonical_id_lowercases_hyphenates_and_strips_non_alnum():
+    from backend.knowledge.extraction.canonical_id import canonical_id
+
+    assert canonical_id("Backend Work") == "backend-work"
+    assert canonical_id("C#  / .NET") == "c-net"
+    assert canonical_id("snake_case name") == "snake-case-name"
+    assert canonical_id("--rust--") == "rust"
+
+
+def test_canonical_id_falls_back_to_the_lowered_text_when_the_slug_is_empty():
+    from backend.knowledge.extraction.canonical_id import canonical_id
+
+    assert canonical_id("") == ""
+    assert canonical_id("++ ##") == "++-##"
+
+
+def test_scorer_re_exports_the_backend_canonical_id():
+    from backend.knowledge.extraction import canonical_id as module
+    from scripts.eval_harness import score_extraction_run
+
+    assert score_extraction_run.canonical_id is module.canonical_id

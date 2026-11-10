@@ -34,7 +34,11 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.knowledge.curation.reconciliation import (  # noqa: E402
     derive_assertion_kind,
 )
+
+# `canonical_id` lives in the backend so the graph and the scorer share it; it is
+# re-exported here for the eval scripts and tests that import it from this module.
 from backend.knowledge.extraction.canonical_id import (  # noqa: E402
+    canonical_id,
     canonical_metric_id,
     canonical_metric_id_from_id,
 )
@@ -75,21 +79,6 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 EXTRACTION_CALL_SITE = "extraction.ontology"
 EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
-
-
-def canonical_id(name: str) -> str:
-    """Canonical entity id: lowercase, hyphenated, alnum+hyphen only.
-
-    Mirrors the core of EntityNormalizer._canonicalize. Version collapsing is
-    omitted -- the extraction prompt (Rule 3) already collapses versions, so
-    produced ids arrive version-free; gold ids are authored canonical.
-    """
-    s = name.lower().strip()
-    s = re.sub(r"[\s_]+", "-", s)
-    s = re.sub(r"[^a-z0-9\-]", "", s)
-    s = re.sub(r"-{2,}", "-", s)
-    s = s.strip("-")
-    return s or name.lower().replace(" ", "-")
 
 
 def _produced_entity_match_id(raw_id: str, etype: str, properties: dict[str, Any]) -> str:
