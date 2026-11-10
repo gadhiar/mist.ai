@@ -29,6 +29,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.knowledge.extraction.id_rails import stored_entity_id  # noqa: E402
 from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT  # noqa: E402
 from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS  # noqa: E402
 from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
@@ -1377,3 +1378,26 @@ def _heldout_n17_counts() -> dict[str, int]:
 
 def test_heldout_team_membership_follows_n17():
     assert _heldout_n17_counts() == _HELDOUT_N17_COUNTS
+
+
+def _heldout_ids_the_rails_move() -> int:
+    """How many held-out ids, alternatives and edge endpoints `stored_entity_id` changes."""
+    moved = 0
+    for row in _gold_rows(_HELDOUT_GOLD):
+        for entity in row["expected_entities"]:
+            for gold_id in (entity["id"], *entity.get("alternatives", ())):
+                moved += stored_entity_id(gold_id, entity["type"]) != gold_id
+        for rel in row["expected_relationships"]:
+            for end in ("source", "target"):
+                moved += stored_entity_id(rel[end], rel[f"{end}_type"]) != rel[end]
+    return moved
+
+
+def test_every_heldout_id_is_a_fixed_point_of_the_id_rails():
+    """A gold id the rails would move is never an id the graph stores, so it could never match.
+
+    Counted rather than listed, so a failure prints no held-out id.
+    """
+    moved = _heldout_ids_the_rails_move()
+
+    assert moved == 0, f"{moved} held-out ids are not fixed points of the id rails"
