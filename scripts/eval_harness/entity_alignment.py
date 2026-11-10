@@ -40,6 +40,9 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+# LABELLING.md N1: leading articles and possessive pronouns are dropped from ids. The N1
+# rail's own words, so the aligner and the rail read one set.
+from backend.knowledge.extraction.id_rails import N1_WORDS
 from backend.knowledge.ontologies.hierarchy import canonical_type, parent_of
 
 AlignmentKind = Literal[
@@ -70,8 +73,6 @@ _USER_ID = "user"
 _MEASURE_SYNONYMS = {"millisecond": "ms"}
 _RATE_WORDS = (("request", "requests"), ("per",), ("second", "seconds"))
 
-# LABELLING.md N1: leading articles and possessive pronouns are dropped from ids.
-N1_WORDS = frozenset({"a", "an", "the", "my", "our", "your", "his", "her", "their", "its"})
 STOPWORDS = N1_WORDS | frozenset(
     {"of", "to", "for", "and", "in", "on", "at", "with", "by", "from", "into", "about", "per", "s"}
 )

@@ -300,6 +300,119 @@ class TestParseProduced:
         assert ok is True
         assert entities == (GoldEntity(id=out.entities[0]["id"], type="Metric"),)
 
+    @pytest.mark.asyncio
+    async def test_parse_produced_equals_the_normalizer_on_the_whole_payload(self):
+        # The scorer scores the ids, types and edges the graph stores: the same id rails
+        # run over the same payload on both sides.
+        from backend.knowledge.extraction.normalizer import EntityNormalizer
+        from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+
+        payload = {
+            "entities": [
+                {"id": "user", "name": "user", "type": "User"},
+                {"id": "python-3-11", "name": "Python 3.11", "type": "Technology"},
+                {"id": "vs-code", "name": "VS Code", "type": "Technology"},
+                {"id": "The Acme Corp", "name": "The Acme Corp", "type": "Organization"},
+                {"id": "mist", "name": "MIST", "type": "Organization"},
+                {"id": "c++", "name": "C++", "type": "Technology"},
+                {"id": "tool-selection-0.94", "name": "tool selection", "type": "Metric"},
+                {
+                    "id": "cold-start",
+                    "name": "cold start",
+                    "type": "Metric",
+                    "properties": {"value": 2.4, "unit": "s", "quantity": "cold start"},
+                },
+                {"id": "the-team-offsite", "name": "the team offsite", "type": "Milestone"},
+                {"id": "2026-05-30", "name": "May 30", "type": "Date"},
+                {"id": "my-sister", "name": "my sister", "type": "Person"},
+                {"id": "python", "name": "Python", "type": "Technology"},
+            ],
+            "relationships": [
+                {"source": "user", "target": "python-3-11", "type": "USES"},
+                {"source": "user", "target": "vs-code", "type": "USES"},
+                {"source": "user", "target": "The Acme Corp", "type": "WORKS_AT"},
+                {"source": "mist", "target": "c++", "type": "IMPLEMENTED_WITH"},
+                {"source": "the-acme-corp", "target": "tool-selection-0.94", "type": "HAS_METRIC"},
+                {"source": "the-acme-corp", "target": "cold-start", "type": "HAS_METRIC"},
+                {"source": "user", "target": "the-team-offsite", "type": "EXPERIENCED"},
+                {"source": "the-team-offsite", "target": "2026-05-30", "type": "OCCURRED_ON"},
+                {"source": "user", "target": "my-sister", "type": "KNOWS_PERSON"},
+                {"source": "user", "target": "python", "type": "USES"},
+            ],
+        }
+        normalizer = EntityNormalizer(embedding_generator=FakeEmbeddingGenerator(), executor=None)
+        out = await normalizer.normalize(
+            ExtractionResult(
+                entities=json.loads(json.dumps(payload["entities"])),
+                relationships=json.loads(json.dumps(payload["relationships"])),
+            )
+        )
+
+        ok, entities, type_by_id, rels = parse_produced(json.dumps(payload))
+
+        assert ok is True
+        assert entities == tuple(GoldEntity(id=e["id"], type=e["type"]) for e in out.entities)
+        assert type_by_id == {e["id"]: e["type"] for e in out.entities}
+        stored_ids = {e["id"] for e in out.entities}
+        assert [(r["source"], r["predicate"], r["target"]) for r in rels] == [
+            (
+                r["source"] if r["source"] in stored_ids else canonical_id(r["source"]),
+                r["type"],
+                r["target"] if r["target"] in stored_ids else canonical_id(r["target"]),
+            )
+            for r in out.relationships
+        ]
+        assert ("user", "USES", "python") in [
+            (r["source"], r["predicate"], r["target"]) for r in rels
+        ]
+        assert ("team-offsite-2026-05-30", "OCCURRED_ON", "2026-05-30") in [
+            (r["source"], r["predicate"], r["target"]) for r in rels
+        ]
+
+    def test_a_bare_endpoint_keeps_the_canonical_id_slug(self):
+        # An endpoint that names no produced entity is slugged, as before the rails, and
+        # takes no rail: the N1 rail runs on entities only.
+        content = json.dumps(
+            {
+                "entities": [{"id": "user", "type": "User"}],
+                "relationships": [
+                    {"source": "user", "target": "The Unlisted Thing", "type": "USES"},
+                    {"source": "User", "target": "Python 3.11", "type": "USES"},
+                ],
+            }
+        )
+
+        ok, entities, type_by_id, rels = parse_produced(content)
+
+        assert [(r["source"], r["target"]) for r in rels] == [
+            ("user", "the-unlisted-thing"),
+            ("user", "python-311"),
+        ]
+
+    def test_the_aligner_reads_the_n1_rails_words(self):
+        from eval_harness import entity_alignment
+
+        from backend.knowledge.extraction import id_rails
+
+        assert entity_alignment.N1_WORDS is id_rails.N1_WORDS
+
+    def test_produced_entity_match_id_is_the_stored_id_and_idempotent(self):
+        from eval_harness.score_extraction_run import _produced_entity_match_id
+
+        from backend.knowledge.extraction.id_rails import stored_entity_id
+
+        cases = [
+            ("the-acme-corp", "Organization", {}),
+            ("vs-code", "Technology", {}),
+            ("tool-selection-0.94", "Metric", {}),
+            ("p95", "Metric", {"value": "120", "unit": "msec", "quantity": "p95 latency"}),
+        ]
+        for raw_id, etype, props in cases:
+            match_id = _produced_entity_match_id(raw_id, etype, props)
+            assert match_id == stored_entity_id(raw_id, etype, props)
+            assert _produced_entity_match_id(match_id, etype, {}) == match_id
+
     def test_non_metric_entity_not_affected_by_value_unit_props(self):
         # A non-Metric entity that happens to carry value/unit props keeps the
         # plain string canonical id (Metric-id rebuild is type-gated).
@@ -1141,7 +1254,8 @@ class TestGoldLoaderOptionalKeys:
         probe = self._load(
             tmp_path, {"alternatives": ["The Kestrel Committee", "kestrel-group"]}, {}
         )
-        assert probe.entities[0].alternatives == ("the-kestrel-committee", "kestrel-group")
+        # Alternatives take the id rails, so the leading article goes (N1 rail).
+        assert probe.entities[0].alternatives == ("kestrel-committee", "kestrel-group")
 
     def test_predicate_alternatives_and_beyond_prompt(self, tmp_path):
         probe = self._load(

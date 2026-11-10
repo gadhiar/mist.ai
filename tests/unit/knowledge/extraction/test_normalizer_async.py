@@ -300,8 +300,8 @@ class TestReservedNameTypeRemap:
 
 class TestResolverPasses:
     """Task 7: resolver passes 3-5 (retired-type coercion, Metric compound-id, parent
-    fallback). These run AFTER _canonicalize in the normal loop path (non-reserved, non-user
-    entities).
+    fallback). These run AFTER the id field's slug, the version rail, the static aliases and
+    the registry, for non-reserved, non-user entities.
     """
 
     @pytest.fixture
@@ -458,7 +458,7 @@ class TestResolverPasses:
                 ]
             )
         )
-        # id should fall through to whatever _canonicalize produced, not compound id.
+        # id should fall through to the raw-id fallback, not compound id.
         assert out.entities[0]["type"] == "Metric"
         assert out.entities[0]["id"] != "42-"  # no blank-unit compound id
 
@@ -466,9 +466,8 @@ class TestResolverPasses:
     async def test_metric_no_props_string_fallback_moves_number_to_front(self, normalizer):
         # Pass 4 string fallback: Metric with no value/unit props, bare id with numeric
         # token at the end is reordered to value-first by canonical_metric_id_from_id.
-        # The entity carries NO name field so entity_name falls back to old_id, which
-        # means _canonicalize receives "requests-per-second-12000" (already-hyphenated,
-        # no version-strip match) and canonical_metric_id_from_id fires on the result.
+        # The entity carries NO name field, and canonical_metric_id_from_id reads the raw
+        # id field "requests-per-second-12000".
         out = await normalizer.normalize(
             _result(
                 [
@@ -495,15 +494,48 @@ class TestCanonicalRegistry:
 
     @pytest.mark.asyncio
     async def test_registry_overrides_id_and_type(self, normalizer_no_graph, monkeypatch):
-        # Key is the CANONICAL id: "the graph" canonicalizes to "the-graph".
+        # Key is the CANONICAL id: the id field "the graph" canonicalizes to "the-graph".
         monkeypatch.setitem(
             EntityNormalizer.CANONICAL_REGISTRY, "the-graph", ("neo4j", "Technology")
         )
         out = await normalizer_no_graph.normalize(
-            _result([{"id": "x", "name": "the graph", "type": "Concept"}])
+            _result([{"id": "the graph", "name": "the graph", "type": "Concept"}])
         )
         assert out.entities[0]["id"] == "neo4j"
         assert out.entities[0]["type"] == "Technology"
+
+
+class TestStoredIdFromTheIdField:
+    """ADR-054 Decision 2: the graph stores the payload's `id` field through the id rails."""
+
+    @pytest.mark.asyncio
+    async def test_the_id_field_is_stored_rather_than_the_display_name(self, normalizer_no_graph):
+        out = await normalizer_no_graph.normalize(
+            _result([{"id": "rust-lang", "name": "Rust", "type": "Technology"}])
+        )
+        assert out.entities[0]["id"] == "rust-lang"
+
+    @pytest.mark.asyncio
+    async def test_the_n1_rail_drops_a_leading_article(self, normalizer_no_graph):
+        out = await normalizer_no_graph.normalize(
+            _result(
+                [{"id": "the-acme-corp", "name": "The Acme Corp", "type": "Organization"}],
+                [{"source": "user", "target": "the-acme-corp", "type": "WORKS_AT"}],
+            )
+        )
+        assert out.entities[0]["id"] == "acme-corp"
+        assert out.relationships[0]["target"] == "acme-corp"
+
+    def test_the_class_constants_are_the_id_rails_objects(self):
+        from backend.knowledge.extraction import id_rails
+
+        assert EntityNormalizer.STATIC_ALIASES is id_rails.STATIC_ALIASES
+        assert EntityNormalizer.RESERVED_NAMES is id_rails.RESERVED_NAMES
+        assert EntityNormalizer.CANONICAL_REGISTRY is id_rails.CANONICAL_REGISTRY
+        assert EntityNormalizer.VERSION_PATTERN is id_rails.VERSION_PATTERN
+        assert EntityNormalizer.PRE_CANON_ALIASES is id_rails.PRE_CANON_ALIASES
+        assert not hasattr(EntityNormalizer, "_canonicalize")
+        assert not hasattr(EntityNormalizer, "_resolve_type_and_id")
 
 
 class TestNoGraphIdentityQuery:

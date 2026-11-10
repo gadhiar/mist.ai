@@ -14,6 +14,7 @@ Standalone, mirrors scripts/eval_harness/score_v8_probe_run.py.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import sys
@@ -34,9 +35,19 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.knowledge.curation.reconciliation import (  # noqa: E402
     derive_assertion_kind,
 )
+
+# `canonical_id` lives in the backend so the graph and the scorer share it; it is
+# re-exported here for the eval scripts and tests that import it from this module.
 from backend.knowledge.extraction.canonical_id import (  # noqa: E402
-    canonical_metric_id,
-    canonical_metric_id_from_id,
+    canonical_id,
+)
+
+# The id rails the normalizer runs, imported rather than copied, so a scored id is the
+# id the graph stores.
+from backend.knowledge.extraction.id_rails import (  # noqa: E402
+    ISO_DATE_RE,
+    normalize_payload,
+    stored_entity_id,
 )
 from backend.knowledge.extraction.validator import (  # noqa: E402
     RELATIONSHIP_CONSTRAINTS,
@@ -65,61 +76,27 @@ from scripts.golden_log.native_shape import (  # noqa: E402
     GOLD_VALID_FROM_FIELD,
     GOLD_VALID_TO_FIELD,
     native_endpoints,
-    native_entity_id,
     native_entity_type,
     native_predicate,
     native_properties,
 )
 
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATE_RE = ISO_DATE_RE
 
 EXTRACTION_CALL_SITE = "extraction.ontology"
 EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
 
 
-def canonical_id(name: str) -> str:
-    """Canonical entity id: lowercase, hyphenated, alnum+hyphen only.
-
-    Mirrors the core of EntityNormalizer._canonicalize. Version collapsing is
-    omitted -- the extraction prompt (Rule 3) already collapses versions, so
-    produced ids arrive version-free; gold ids are authored canonical.
-    """
-    s = name.lower().strip()
-    s = re.sub(r"[\s_]+", "-", s)
-    s = re.sub(r"[^a-z0-9\-]", "", s)
-    s = re.sub(r"-{2,}", "-", s)
-    s = s.strip("-")
-    return s or name.lower().replace(" ", "-")
-
-
 def _produced_entity_match_id(raw_id: str, etype: str, properties: dict[str, Any]) -> str:
-    """Canonical match id for a PRODUCED entity, mirroring the normalizer.
+    """The id the graph stores for one entity: `stored_entity_id`, the normalizer's steps.
 
-    For a Metric entity (after `canonical_type`) carrying a non-null `value` and a
-    truthy `unit` or `quantity` in its properties, the id is rebuilt as
-    `canonical_metric_id(value, unit, quantity)`, `<value>-<unit>[-<quantity>]`. So a
-    model that emits `requests-per-second-12000` collapses to the gold-canonical
-    `12000-requests-per-second`, and a p95 and a p99 latency of `120 ms` score as two
-    entities, not one. This is the SHARED helper the production normalizer's Pass 4
-    uses, called on the same properties under the same condition -- not a parallel
-    reimplementation -- so the F2 score reflects the post-normalizer id.
-
-    A Metric without that value and a unit or quantity falls back to
-    `canonical_metric_id_from_id`, which moves a single numeric token to the front.
-    Any other type falls back to the plain string `canonical_id`. Gold is NOT passed
-    through here: gold Metric entities are authored with the canonical id and may not
-    carry value/unit.
+    The per-entity id rails only: the reserved names, the slug of the id, the version
+    rail, the aliases, the registry, the Metric id (from `value` with `unit` or `quantity`,
+    else from the raw id) and the N1 rail. The steps are idempotent on a stored id, so a
+    caller holding a graph id (the retrieval scorer) gets it back unchanged. The
+    Event-date rail needs the whole payload, so `parse_produced` runs it.
     """
-    if canonical_type(etype) == "Metric":
-        value = properties.get("value")
-        unit = properties.get("unit")
-        quantity = properties.get("quantity")
-        if value is not None and (unit or quantity):
-            return canonical_metric_id(
-                value, str(unit) if unit else None, str(quantity) if quantity else None
-            )
-        return canonical_metric_id_from_id(raw_id)  # string fallback: no rebuildable props
-    return canonical_id(raw_id)
+    return stored_entity_id(raw_id, etype, properties)
 
 
 def _norm_ws(text: str) -> str:
@@ -199,21 +176,27 @@ def iter_gold_probes(path: Path) -> list[GoldProbe]:
                 obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+            # Every id, alternative and endpoint takes the per-entity id rails with its type,
+            # so gold holds the ids the graph would store (`vs-code` loads as
+            # `visual-studio-code`). Gold Event ids keep their dates as labelled; the
+            # event-date alignment kind bridges them.
             entities = tuple(
                 GoldEntity(
-                    id=canonical_id(e["id"]),
+                    id=stored_entity_id(e["id"], e["type"]),
                     type=e["type"],
-                    alternatives=tuple(canonical_id(a) for a in e.get("alternatives", ())),
+                    alternatives=tuple(
+                        stored_entity_id(a, e["type"]) for a in e.get("alternatives", ())
+                    ),
                 )
                 for e in obj.get("expected_entities", [])
             )
             tag = obj.get("tag", f"probe-{line_no}")
             rels = tuple(
                 GoldRel(
-                    source=canonical_id(r[GOLD_SOURCE_FIELD]),
+                    source=stored_entity_id(r[GOLD_SOURCE_FIELD], r["source_type"]),
                     source_type=r["source_type"],
                     predicate=r[GOLD_PREDICATE_FIELD],
-                    target=canonical_id(r[GOLD_TARGET_FIELD]),
+                    target=stored_entity_id(r[GOLD_TARGET_FIELD], r["target_type"]),
                     target_type=r["target_type"],
                     valid_from=r.get(GOLD_VALID_FROM_FIELD),
                     valid_to=r.get(GOLD_VALID_TO_FIELD),
@@ -270,7 +253,11 @@ def _recover_utterance(request: dict[str, Any]) -> str | None:
 def parse_produced(
     content: str,
 ) -> tuple[bool, tuple[GoldEntity, ...], dict[str, str], tuple[dict[str, Any], ...]]:
-    """Parse a raw extraction-LLM JSON string into canonicalized entities + rels."""
+    """Parse a raw extraction-LLM JSON string into the entities and rels the graph stores.
+
+    The payload goes through `normalize_payload`, the normalizer's id rails, so each id,
+    type and edge is the stored one. The return shape is unchanged.
+    """
     parsed: Any = None
     try:
         parsed = json.loads(content)
@@ -283,40 +270,29 @@ def parse_produced(
                 parsed = None
     if not isinstance(parsed, dict):
         return False, (), {}, ()
+    # The normalizer's own payload rail, on copies: the stored ids, types and edges,
+    # Event-date rail and deduplication included, so the score is of what the graph stores.
+    stored_entities, stored_rels = normalize_payload(
+        [copy.deepcopy(e) for e in parsed.get("entities") or [] if isinstance(e, dict)],
+        [copy.deepcopy(r) for r in parsed.get("relationships") or [] if isinstance(r, dict)],
+    )
     entities: list[GoldEntity] = []
     type_by_id: dict[str, str] = {}
-    # Maps the plain-string-canonical id (what a relationship endpoint references)
-    # to the Metric-canonical id, so an edge pointing at a Metric entity by its
-    # raw id is rewritten to the rebuilt value-first id -- mirroring the normalizer
-    # rewriting edge endpoints when it canonicalizes a node.
-    metric_id_remap: dict[str, str] = {}
-    for e in parsed.get("entities", []):
-        if not isinstance(e, dict):
-            continue
-        etype = native_entity_type(e)
-        raw_id = native_entity_id(e)
-        props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
-        # Metric entities get a value-first canonical id so word-order splits
-        # (requests-per-second-12000 vs 12000-requests-per-second) collapse before
-        # the match key is built. Non-Metric ids use the plain string canonical_id.
-        cid = _produced_entity_match_id(raw_id, etype, props)
+    for e in stored_entities:
+        cid = str(e.get("id") or "")
         if cid:
+            etype = native_entity_type(e)
             entities.append(GoldEntity(id=cid, type=etype))
             type_by_id[cid] = etype
-            plain = canonical_id(raw_id)
-            if plain != cid:
-                metric_id_remap[plain] = cid
     rels: list[dict[str, Any]] = []
-    for r in parsed.get("relationships", []):
-        if not isinstance(r, dict):
-            continue
+    for r in stored_rels:
         raw_source, raw_target = native_endpoints(r)
-        source = canonical_id(raw_source)
-        target = canonical_id(raw_target)
+        # An endpoint that names no produced entity keeps the plain slug, as before the
+        # rails, so a bare endpoint is credited as it was.
         rels.append(
             {
-                "source": metric_id_remap.get(source, source),
-                "target": metric_id_remap.get(target, target),
+                "source": raw_source if raw_source in type_by_id else canonical_id(raw_source),
+                "target": raw_target if raw_target in type_by_id else canonical_id(raw_target),
                 "predicate": native_predicate(r),
                 "properties": native_properties(r),
             }

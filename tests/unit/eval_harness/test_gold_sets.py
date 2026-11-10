@@ -568,20 +568,41 @@ def test_gold_rows_follow_the_sixty_probe_schema(set_name):
     assert bad == []
 
 
-@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+# The dev gold sets whose ids are pinned as fixed points of the id rails. Held-out's fixed
+# points are pinned with its own relabel, so it is not a parameter here.
+_FIXED_POINT_SETS = {"dev-lists": _DEV_GOLD, "sixty": _SIXTY}
+# Gold ids the loader maps to the id the graph stores, by (tag, gold id): a static alias.
+_STORED_ID_MAP = {
+    ("dvl-21-list-dash-laptop-cleanup", "vs-code"): "visual-studio-code",
+}
+
+
+@pytest.mark.parametrize("set_name", sorted(_FIXED_POINT_SETS))
 def test_gold_sets_load_through_the_gold_loader_unchanged(set_name):
-    """The loader canonicalises ids, so an id it would rewrite could never match a produced one."""
-    path = _GOLD_BY_SET[set_name]
+    """The loader maps ids through the id rails, so it loads the ids the graph would store.
+
+    Every id, alternative and endpoint is a fixed point of the rails but the pinned
+    `_STORED_ID_MAP`, so a gold id is the stored id a produced one must equal.
+    """
+    path = _FIXED_POINT_SETS[set_name]
     changed = []
 
     for row, probe in zip(_gold_rows(path), iter_gold_probes(path), strict=True):
-        raw_entities = tuple((e["id"], e["type"]) for e in row["expected_entities"])
+        tag = row["tag"]
+        raw_entities = tuple(
+            (
+                _STORED_ID_MAP.get((tag, e["id"]), e["id"]),
+                e["type"],
+                tuple(_STORED_ID_MAP.get((tag, a), a) for a in e.get("alternatives", ())),
+            )
+            for e in row["expected_entities"]
+        )
         raw_edges = tuple(
             (
-                r["source"],
+                _STORED_ID_MAP.get((tag, r["source"]), r["source"]),
                 r["source_type"],
                 r["predicate"],
-                r["target"],
+                _STORED_ID_MAP.get((tag, r["target"]), r["target"]),
                 r["target_type"],
                 r.get("valid_from"),
                 r.get("valid_to"),
@@ -589,7 +610,7 @@ def test_gold_sets_load_through_the_gold_loader_unchanged(set_name):
             )
             for r in row["expected_relationships"]
         )
-        loaded_entities = tuple((e.id, e.type) for e in probe.entities)
+        loaded_entities = tuple((e.id, e.type, e.alternatives) for e in probe.entities)
         loaded_edges = tuple(
             (
                 r.source,
