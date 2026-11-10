@@ -27,6 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.knowledge.extraction.id_rails import event_date_rail  # noqa: E402
 from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     GoldProbe,
     canonical_id,
@@ -81,11 +82,36 @@ def _dev_probes() -> list[GoldProbe]:
     return iter_gold_probes(_SIXTY) + iter_gold_probes(_DEV_LISTS)
 
 
+def _stored_event_ids(probe: GoldProbe) -> dict[str, str]:
+    """Gold Event id to the id the Event-date rail gives it when the probe's turn is stored.
+
+    Gold keeps an Event's date out of its id (ADR-054 Decision 4), and a built graph stores
+    the dated id, so a query names the dated one.
+    """
+    types = {e.id: e.type for e in probe.entities}
+    for rel in probe.relationships:
+        types.setdefault(rel.source, rel.source_type)
+        types.setdefault(rel.target, rel.target_type)
+    entities = [{"id": entity_id, "type": etype} for entity_id, etype in types.items()]
+    relationships = [
+        {"source": rel.source, "target": rel.target, "type": rel.predicate}
+        for rel in probe.relationships
+    ]
+    return event_date_rail(entities, relationships)
+
+
 def _facts_by_kind(probes: list[GoldProbe]) -> dict[str, set[Fact]]:
     by_kind: dict[str, set[Fact]] = {"assert": set(), "cease": set(), "retract": set()}
     for probe in probes:
+        stored = _stored_event_ids(probe)
         for rel in probe.relationships:
-            by_kind[rel.assertion_kind].add((rel.source, rel.predicate, rel.target))
+            by_kind[rel.assertion_kind].add(
+                (
+                    stored.get(rel.source, rel.source),
+                    rel.predicate,
+                    stored.get(rel.target, rel.target),
+                )
+            )
     return by_kind
 
 

@@ -116,6 +116,7 @@ _USER_ID = "user"
 # Types whose ids follow their own convention, so the N1 rail leaves them alone.
 _N1_EXEMPT_TYPES = frozenset({"User", "MistIdentity", "Date", "Metric"})
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_TRAILING_ISO_DATE_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 
 
 def _raw_id(entity: Mapping) -> str:
@@ -281,6 +282,53 @@ def stored_entity_id(
     return str(entity["id"])
 
 
+def event_date_rail(entities: list[dict], relationships: list[dict]) -> dict[str, str]:
+    """Date each Event that the payload dates to exactly one day (ADR-054 Decision 4).
+
+    For each `Event`, the distinct targets of its `OCCURRED_ON` edges that are `Date`
+    entities with an ISO day id (`YYYY-MM-DD`) are collected. With exactly one, the id
+    loses a trailing `-YYYY-MM-DD` and gains `-<that date>`, and the display name gains
+    ` <that date>` unless it already ends with it; with none, or two or more, the Event is
+    unchanged. The rail reads the Date entity's id, never an edge's `start_date`, so it
+    gives the same id whether or not the temporal resolver ran, and the scorer, which runs
+    no resolver, mirrors it. Entities are renamed in place; edges are not touched.
+
+    Args:
+        entities: The payload's entity dicts, after `normalize_entity`.
+        relationships: The payload's relationship dicts, endpoints already remapped.
+
+    Returns:
+        Old id to new id, for every Event whose id changed.
+    """
+    date_ids = {
+        e.get("id")
+        for e in entities
+        if e.get("type") == "Date" and ISO_DATE_RE.match(str(e.get("id", "")))
+    }
+    dates_by_source: dict[str, set[str]] = {}
+    for rel in relationships:
+        if rel.get("type") == "OCCURRED_ON" and rel.get("target") in date_ids:
+            dates_by_source.setdefault(rel.get("source"), set()).add(rel["target"])
+
+    renames: dict[str, str] = {}
+    for entity in entities:
+        if entity.get("type") != "Event":
+            continue
+        dates = dates_by_source.get(entity.get("id"), set())
+        if len(dates) != 1:
+            continue
+        (date,) = dates
+        old_id = str(entity["id"])
+        new_id = f"{_TRAILING_ISO_DATE_RE.sub('', old_id)}-{date}"
+        name = entity.get("name")
+        if isinstance(name, str) and name and not name.endswith(date):
+            entity["name"] = f"{name} {date}"
+        entity["id"] = new_id
+        if new_id != old_id:
+            renames[old_id] = new_id
+    return renames
+
+
 def _remap_endpoints(relationships: list[dict], id_map: Mapping) -> None:
     for rel in relationships:
         source = rel.get("source", "")
@@ -297,7 +345,8 @@ def normalize_payload(
     """Run the id rails over one payload, in ADR-054's order.
 
     Each entity goes through `normalize_entity`; relationship endpoints that name an
-    entity's `id` field are remapped to its stored id; entities are deduplicated
+    entity's `id` field are remapped to its stored id; the Event-date rail runs, and the
+    endpoints naming a dated Event are remapped again; entities are deduplicated
     first-wins by id, and relationships by (source, target, type). The entity and
     relationship dicts are changed in place.
 
@@ -314,6 +363,7 @@ def normalize_payload(
         normalize_entity(entity)
         id_map[old_id] = entity["id"]
     _remap_endpoints(relationships, id_map)
+    _remap_endpoints(relationships, event_date_rail(entities, relationships))
 
     seen: set[str] = set()
     deduped_entities: list[dict] = []

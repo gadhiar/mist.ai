@@ -15,6 +15,7 @@ import pytest
 
 from backend.knowledge.extraction import id_rails
 from backend.knowledge.extraction.id_rails import (
+    event_date_rail,
     n1_rail,
     normalize_entity,
     normalize_payload,
@@ -319,6 +320,127 @@ async def test_normalize_payload_equals_the_normalizer_on_the_same_payload():
 
     assert out.entities == rail_entities
     assert out.relationships == rail_relationships
+
+
+# --- the Event-date rail ------------------------------------------------------------------
+
+
+def _event(event_id: str, name: str | None = None, etype: str = "Event") -> dict:
+    entity = {"id": event_id, "type": etype}
+    if name is not None:
+        entity["name"] = name
+    return entity
+
+
+def _date(date: str) -> dict:
+    return {"id": date, "name": date, "type": "Date"}
+
+
+def _on(source: str, target: str) -> dict:
+    return {"source": source, "target": target, "type": "OCCURRED_ON"}
+
+
+def test_one_iso_occurred_on_date_dates_the_event_id_and_name():
+    entities = [_event("team-offsite", "Team offsite"), _date("2026-05-30")]
+    relationships = [_on("team-offsite", "2026-05-30")]
+
+    renames = event_date_rail(entities, relationships)
+
+    assert entities[0]["id"] == "team-offsite-2026-05-30"
+    assert entities[0]["name"] == "Team offsite 2026-05-30"
+    assert renames == {"team-offsite": "team-offsite-2026-05-30"}
+
+
+def test_a_name_already_ending_with_the_date_is_not_extended():
+    entities = [_event("team-offsite", "Team offsite 2026-05-30"), _date("2026-05-30")]
+
+    event_date_rail(entities, [_on("team-offsite", "2026-05-30")])
+
+    assert entities[0]["name"] == "Team offsite 2026-05-30"
+
+
+def test_a_trailing_iso_date_in_the_id_is_replaced_by_the_edge_date():
+    entities = [_event("conference-2026-04-14", "Conference"), _date("2026-04-15")]
+
+    renames = event_date_rail(entities, [_on("conference-2026-04-14", "2026-04-15")])
+
+    assert entities[0]["id"] == "conference-2026-04-15"
+    assert renames == {"conference-2026-04-14": "conference-2026-04-15"}
+
+
+def test_an_event_already_dated_with_its_own_date_is_unchanged():
+    entities = [_event("conference-2026-04-15"), _date("2026-04-15")]
+
+    renames = event_date_rail(entities, [_on("conference-2026-04-15", "2026-04-15")])
+
+    assert entities[0]["id"] == "conference-2026-04-15"
+    assert renames == {}
+
+
+def test_two_distinct_dates_leave_the_event_unchanged():
+    entities = [_event("trip", "Trip"), _date("2026-05-01"), _date("2026-05-09")]
+    relationships = [_on("trip", "2026-05-01"), _on("trip", "2026-05-09")]
+
+    renames = event_date_rail(entities, relationships)
+
+    assert (entities[0]["id"], entities[0]["name"]) == ("trip", "Trip")
+    assert renames == {}
+
+
+def test_the_same_date_twice_counts_once():
+    entities = [_event("trip"), _date("2026-05-01")]
+
+    event_date_rail(entities, [_on("trip", "2026-05-01"), _on("trip", "2026-05-01")])
+
+    assert entities[0]["id"] == "trip-2026-05-01"
+
+
+def test_a_month_is_no_iso_day():
+    entities = [_event("trip"), {"id": "2026-05", "type": "Date"}]
+
+    assert event_date_rail(entities, [_on("trip", "2026-05")]) == {}
+    assert entities[0]["id"] == "trip"
+
+
+def test_a_date_that_is_not_a_date_entity_does_not_date_the_event():
+    entities = [_event("trip")]
+
+    assert event_date_rail(entities, [_on("trip", "2026-05-01")]) == {}
+
+
+def test_a_non_event_is_untouched():
+    entities = [_event("launch-plan", etype="Goal"), _date("2026-05-01")]
+
+    assert event_date_rail(entities, [_on("launch-plan", "2026-05-01")]) == {}
+    assert entities[0]["id"] == "launch-plan"
+
+
+def test_another_predicate_does_not_date_the_event():
+    entities = [_event("trip"), _date("2026-05-01")]
+    relationships = [{"source": "trip", "target": "2026-05-01", "type": "RELATED_TO"}]
+
+    assert event_date_rail(entities, relationships) == {}
+
+
+def test_normalize_payload_dates_an_event_after_the_entity_steps_and_remaps_its_edges():
+    entities = [
+        {"id": "user", "name": "user", "type": "User"},
+        {"id": "the-team-offsite", "name": "the team offsite", "type": "Milestone"},
+        {"id": "2026-05-30", "name": "May 30", "type": "Date"},
+    ]
+    relationships = [
+        {"source": "user", "target": "the-team-offsite", "type": "EXPERIENCED"},
+        _on("the-team-offsite", "2026-05-30"),
+    ]
+
+    out_entities, out_relationships = normalize_payload(entities, relationships)
+
+    assert out_entities[1]["id"] == "team-offsite-2026-05-30"
+    assert out_entities[1]["type"] == "Event"
+    assert [(r["source"], r["target"]) for r in out_relationships] == [
+        ("user", "team-offsite-2026-05-30"),
+        ("team-offsite-2026-05-30", "2026-05-30"),
+    ]
 
 
 def test_id_rails_imports_nothing_from_scripts_and_no_io_dependency():
