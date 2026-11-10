@@ -77,6 +77,11 @@ Each label row follows the 60-probe schema exactly, so `iter_gold_probes`
   The test checks all three. An edge the validator would drop is not gold.
 - `assertion_kind` is written only for `cease` and `retract`. Absent means `assert`
   (`score_extraction_run.py:185`; design note line 27).
+- Three keys are optional, and `iter_gold_probes` reads them: an entity's `alternatives`
+  (other ids gold accepts, under N1's last sentence), an edge's `predicate_alternatives`
+  (other predicates gold accepts, only where this guide names two predicates for one shape),
+  and an edge's `beyond_prompt`, written only as `true`, for an edge a labelling rule beyond
+  the prompt added. Each alternative is a canonical id distinct from every id in its probe.
 - A probe with nothing to extract has empty `expected_entities` and `expected_relationships`
   (prompt Rule 9, `prompts.py:57`; design note line 28).
 
@@ -87,7 +92,8 @@ The rules marked N1 to N10 below came out of the 2026-11 adjudication
 N11 to N16 came out of the H8 check of 20 held-out probes against their gold (same file, "H8
 marks"), each from the mark that asked for it. A rule marked "beyond the prompt" asks for a fact
 the production prompt does not tell the model to extract; the gold labels it anyway, so the
-score shows what extraction misses.
+score shows what extraction misses. In dev-lists, the six edges H8 added under such rules carry
+`"beyond_prompt": true` (Relabel log).
 
 ### Ids
 
@@ -95,8 +101,11 @@ score shows what extraction misses.
   hyphenated, with leading articles and possessive pronouns dropped and a plural kept as
   written: `regular-expressions` (`ext-28`), `in-memory-data-store` (`ext-41`), `backend-work`
   (`ext-01`). A habit id names the activity, as `journaling` and `long-run` (`ext-55`,
-  `ext-57`). Where two ids both fit this and neither is the utterance's own phrase, the base
-  pass's stands (adjudication, Method).
+  `ext-57`). Where two ids both fit this and neither is the utterance's own phrase, gold
+  lists both: the entity keeps one as `id` and the other in `alternatives` (extraction
+  contract ADR, Decision 3; this replaced the adjudication's rule that the base pass's stands).
+  dvl-08 is the case: "swim on Tuesdays" and "call my parents" name habits only by a verb, so
+  `swimming` accepts `swim` and `calling-parents` accepts `call-parents`.
 - **N15 An activity keeps its object.** An id for an activity, a capability or a habit keeps the
   object the utterance gives it, possessives dropped: "MIST can search my notes by meaning" is
   `search-notes-by-meaning`, not `search-by-meaning`, because the notes are part of the
@@ -170,12 +179,33 @@ and Rule 11 (life events pair with `EXPERIENCED`); settled on dvl-15, dvl-37 and
 
 ### Event and metric ids
 
-An Event id names the event at the grain `OCCURRED_ON` works on, not the artifact it concerns:
-`mobile-app-launch`, not `mobile-app`; `house-closing`, not `house` or `closing-on-house`
-(changelog lines 24-25 and 44-50). Five of the six dated Event probes in the 60 use the bare
-event noun (`team-offsite`, `birthday-party`, `mobile-app-launch`, `house-closing`,
-`product-demo`); ext-23's `wedding-2026-05-30` is the one date-suffixed id (changelog line 26).
-New rule: use the bare event noun, as the five do, so the two label passes agree.
+An Event id follows the Event rule of the extraction contract ADR ("The extraction contract:
+gold labels only what the prompt or a rail carries", adopted by Raj on 2026-11-09 with Event
+id rule E-b; Decision 4):
+
+- The id is the utterance's own phrase for the event, with articles and possessive pronouns
+  dropped (N1): "work from a cafe" is `work-from-cafe`.
+- A named owner is kept, its possessive `'s` dropped: "Ilse's thesis defense" is
+  `ilse-thesis-defense`.
+- A place is kept as the utterance words it: "surf lesson in Cascais" is
+  `surf-lesson-in-cascais`.
+- The id holds no date word. The date words are a closed list: a month or weekday name or its
+  abbreviation, a day or year number, an ordinal day (`30th`), an ISO date, `today`,
+  `tonight`, `tomorrow`, `yesterday`, and `this`, `next` or `last` before `week`, `weekend`,
+  `month`, `year` or a weekday. A number that names the event itself is not a date word
+  (`sprint-12`, `tram-28`).
+- When the probe dates the event to exactly one day by its `OCCURRED_ON` edge, that date is
+  appended as `-YYYY-MM-DD`: "dentist on 2026-11-18" is `dentist-2026-11-18`, and "today's
+  planning" is `planning-2026-06-13`. An event with no single day keeps the bare phrase
+  ("Lisbon trip, December" is `lisbon-trip`).
+
+The date keeps two occurrences of one event on different days apart, since a wrong merge is
+worse than a missed one, and the owner keeps one person's party apart from another's (ADR,
+Rationale). Under the contract the prompt carries the owner and no-date-word clauses and a
+normalizer rail appends the date (v8). This replaces the earlier rule of the bare event noun.
+The 60-probe set and held-out keep their gold Event ids until their own relabel; the scorer's
+event-date alignment bridges a dated produced id to them. `test_gold_sets.py` checks the rule
+on every dev-lists Event.
 
 A milestone-class event (shipped, launched, completed, promoted) is an `Event` anchored to its
 `Date` by `OCCURRED_ON`, with no user `EXPERIENCED` edge: ext-21 and ext-22, and prompt
@@ -389,3 +419,31 @@ at least twice. T8 checks the same floor on the adjudicated labels.
   test checks exact repeats after case and whitespace folding, near copies by word overlap, and
   the prompt's example entity ids and names.
 - Label new probes with two blind passes and adjudication, as for the first batch.
+
+## Relabel log
+
+- **2026-11-09, dev-lists, under the extraction contract ADR (T30).**
+  - The six edges H8 added beyond the prompt carry `"beyond_prompt": true`: `fish IS_A shell`
+    and `helix IS_A editor` (dvl-01), `kakoune IS_A editor` (dvl-17), the two `RELATED_TO`
+    edges from the planning event (dvl-30) and `user KNOWS_PERSON sister` (dvl-34). They are
+    the edges the pre-H8 gold (`4f5ceed`) lacks, flagged before any id changed.
+  - The 19 Events follow the Event rule above; 18 ids changed. dvl-15: `dentist-appointment`
+    to `dentist-2026-11-18`, `thesis-defense` to `ilse-thesis-defense-2026-12-03`,
+    `team-retro` to `team-retro-2026-11-21`. dvl-18: `lease-signing` to
+    `signed-lease-in-ghent`. dvl-30: `planning` to `planning-2026-06-13`, `docs-site-move` to
+    `move-docs-site-to-astro`, `feature-freeze` to `freeze-features-2026-11-28`. dvl-37:
+    `flight-to-lisbon` to `fly-into-lisbon-2026-12-10`, `tram-28-ride` to
+    `tram-28-2026-12-11`, `castle-visit` to `castle-2026-12-11`, `sintra-day-trip` to
+    `day-trip-to-sintra-2026-12-12`, `birthday-dinner` to `marta-birthday-dinner-2026-12-13`,
+    `cafe-workday` to `work-from-cafe-2026-12-14`, `surf-lesson` to
+    `surf-lesson-in-cascais-2026-12-15`, `train-to-porto` to `train-to-porto-2026-12-16`,
+    `port-cellar-tour` to `port-cellar-tour-2026-12-17`, `serralves-museum-visit` to
+    `serralves-museum-2026-12-18`, `flight-home` to `fly-home-2026-12-19`; `lisbon-trip`
+    stays. Every edge is kept with its endpoints renamed, and the retrieval queries
+    (`data/gold/retrieval/queries-2026-11.jsonl`) name the new ids.
+  - dvl-08's `swimming` and `calling-parents` gained `alternatives` (N1). No edge has
+    `predicate_alternatives`.
+  - dvl-38's `leader-election MECHANISM_OF scheduler` was not added: by its type test, and by
+    prompt Rule 14, which names it, the scheduler is a `Mechanism`, and `MECHANISM_OF` admits no
+    `Mechanism` target (`v1_0_0.py:1587-1588`). It goes to
+    the ontology goal.
