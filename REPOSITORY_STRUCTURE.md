@@ -44,6 +44,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
     - `replay.py` - Replays all stored answers once over every probe, and compares two replays
     - `make_probes.py` - Writes the utterance-only probes file from gold
     - `score_runs.py` - Scores raw runs with a pinned checkout's scorer and classifier: exact and aligned figures, paired lines, the worksheet and pending pairs
+    - `adjudicated.py` - Checks an adjudicated worksheet, prints the corrected figures, and checks the aligner's credits against the adjudicated classes
 - `daily/` - The daily instance's host tools
   - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs

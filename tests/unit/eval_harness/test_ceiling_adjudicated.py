@@ -299,3 +299,179 @@ def test_runs_as_a_module(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "corrected 0.900 (9/10)" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# --aligned-check: the aligner must not credit a miss the adjudication blamed on the
+# answerer or on gold
+# ---------------------------------------------------------------------------
+#
+# One invented probe, scored by this checkout's scorer: gold `quillpad`, `brindle-app` and
+# `kestrel`; the raw names them `the-quillpad` (n1), `brindel-app` (typo, pending) and
+# `kestrel` (exact). The worksheet's misses are the two the exact scorer misses, numbered in
+# its sorted order.
+
+_TAG = "syn-01-list-tools"
+_UTTERANCE = "Tools: the Quillpad, the Brindle app and Kestrel"
+
+
+def _aligned_worksheet() -> list[dict[str, object]]:
+    def item(kind: str, n: int, relation: list[str]) -> dict[str, object]:
+        return {
+            "id": f"{_TAG}:{kind}:{n}",
+            "kind": kind,
+            "relation": relation,
+            "class": "ID_VARIANT" if kind == "miss" else None,
+            "beyond_prompt": False,
+        }
+
+    return [
+        {
+            "tag": _TAG,
+            "utterance": _UTTERANCE,
+            "gold_entities": [
+                ["user", "User"],
+                ["quillpad", "Tool"],
+                ["brindle-app", "Tool"],
+                ["kestrel", "Tool"],
+            ],
+            "gold_relations": [
+                ["user", "USES", "quillpad"],
+                ["user", "USES", "brindle-app"],
+                ["user", "USES", "kestrel"],
+            ],
+            "produced_entities": [],
+            "produced_relations": [],
+            "counts": {
+                "gold": 3,
+                "found": 1,
+                "produced": 3,
+                "matched": 1,
+                "beyond_prompt_gold": 0,
+                "beyond_prompt_found": 0,
+            },
+            "items": [
+                item("miss", 1, ["user", "USES", "brindle-app"]),
+                item("miss", 2, ["user", "USES", "quillpad"]),
+                item("fp", 1, ["user", "USES", "brindel-app"]),
+                item("fp", 2, ["user", "USES", "the-quillpad"]),
+            ],
+        }
+    ]
+
+
+def _aligned_raw(produced: list[str]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": _TAG,
+            "job_id": "job-1",
+            "utterance": _UTTERANCE,
+            "response": {
+                "payload": {
+                    "entities": [
+                        {"id": "user", "type": "User"},
+                        *({"id": i, "type": "Tool"} for i in produced),
+                    ],
+                    "relationships": [
+                        {"source": "user", "type": "USES", "target": i} for i in produced
+                    ],
+                }
+            },
+        }
+    ]
+
+
+def _aligned_main(
+    tmp_path: Path, classes: dict[str, str], produced: list[str] | None = None
+) -> int:
+    worksheet = _write(tmp_path / "worksheet.jsonl", _aligned_worksheet())
+    rows = [
+        {"id": f"{_TAG}:{item_id}", "class": cls, "note": "One sentence.", "pair": None}
+        for item_id, cls in classes.items()
+    ]
+    adjudication = _write(tmp_path / "adjudication.jsonl", rows)
+    raw = _write(
+        tmp_path / "raw.jsonl",
+        _aligned_raw(produced or ["the-quillpad", "brindel-app", "kestrel"]),
+    )
+    return adjudicated.main(
+        [
+            "--worksheet",
+            str(worksheet),
+            "--adjudication",
+            str(adjudication),
+            "--aligned-check",
+            str(raw),
+        ]
+    )
+
+
+_ARTIFACTS = {
+    "miss:1": "scorer_artifact",
+    "miss:2": "scorer_artifact",
+    "fp:1": "scorer_artifact",
+    "fp:2": "scorer_artifact",
+}
+
+
+def test_the_aligned_check_passes_when_it_credits_only_scorer_artifacts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _aligned_main(tmp_path, _ARTIFACTS) == 0
+    out = capsys.readouterr().out
+    # Both misses are credited: the n1 pair at once, the typo pair as if accepted.
+    assert (
+        "aligned credits by class: answerer_error 0, gold_wrong 0, scorer_artifact 2, ambiguous 0"
+        in out.splitlines()
+    )
+    # The figures still print, as without the check.
+    assert "relation recall, all gold: raw 0.333 (1/3), corrected 1.000 (3/3)" in out
+
+
+@pytest.mark.parametrize(
+    ("item_id", "cls"),
+    [("miss:2", "answerer_error"), ("miss:1", "gold_wrong"), ("miss:1", "answerer_error")],
+    ids=["n1-answerer-error", "typo-gold-wrong", "pending-typo-answerer-error"],
+)
+def test_an_aligned_credit_on_an_answerer_error_or_gold_wrong_miss_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], item_id: str, cls: str
+) -> None:
+    assert _aligned_main(tmp_path, {**_ARTIFACTS, item_id: cls}) == 1
+    out = capsys.readouterr().out
+    line = next(x for x in out.splitlines() if x.startswith("aligned credits by class: "))
+    assert f"{cls} 1" in line
+
+
+def test_a_miss_the_aligner_does_not_credit_is_not_counted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `brandle-tool` shares no form with `brindle-app`, so its miss stays a miss.
+    worksheet = _aligned_worksheet()
+    probe = worksheet[0]
+    probe["items"][2]["relation"] = ["user", "USES", "brandle-tool"]  # type: ignore[index]
+    path = _write(tmp_path / "worksheet.jsonl", worksheet)
+    rows = [
+        {"id": f"{_TAG}:{item_id}", "class": cls, "note": "One sentence.", "pair": None}
+        for item_id, cls in {**_ARTIFACTS, "miss:1": "answerer_error"}.items()
+    ]
+    adjudication = _write(tmp_path / "adjudication.jsonl", rows)
+    raw = _write(tmp_path / "raw.jsonl", _aligned_raw(["the-quillpad", "brandle-tool", "kestrel"]))
+    code = adjudicated.main(
+        ["--worksheet", str(path), "--adjudication", str(adjudication), "--aligned-check", str(raw)]
+    )
+    assert code == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert (
+        "aligned credits by class: answerer_error 0, gold_wrong 0, scorer_artifact 1, ambiguous 0"
+        in out.splitlines()
+    )
+
+
+def test_a_raw_that_is_not_the_worksheets_run_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # This raw finds `quillpad` exactly, so its exact misses are not the worksheet's.
+    assert _aligned_main(tmp_path, _ARTIFACTS, ["quillpad", "brindel-app", "kestrel"]) == 1
+    captured = capsys.readouterr()
+    assert _TAG in captured.err
+    assert "aligned credits" not in captured.out

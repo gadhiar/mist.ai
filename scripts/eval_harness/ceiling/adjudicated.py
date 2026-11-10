@@ -24,6 +24,19 @@ them.
 `--check` exits 0 only when every worksheet item has exactly one line, with a class valid for
 its kind, a note, and a pair that is null or another item's id. Without `--check` the same
 check runs, and a failure prints no figure. Exit 1 on any problem.
+
+`--aligned-check RAW` checks how the aligner (plan v8, D8) was built against what a reader
+judged. It scores RAW, the run the worksheet was made from, with this checkout's scorer
+against the worksheet's own gold entities and relations, the gold the adjudication judged,
+and accepts every pending typo or paraphrase pair, the most the aligner could credit. RAW's
+exact misses must be the worksheet's, or it is not that run and the exit is 1. After the
+figures it prints
+
+    aligned credits by class: answerer_error N, gold_wrong N, scorer_artifact N, ambiguous N
+
+counting the miss items the aligned scoring finds, by their adjudicated class (ontology_gap
+is added when it is above 0), and exits 1 when answerer_error or gold_wrong is above 0: the
+aligner would then credit an answer a reader judged wrong, or a gold relation judged wrong.
 """
 
 from __future__ import annotations
@@ -39,6 +52,9 @@ from pathlib import Path
 MISS_CLASSES = ("answerer_error", "gold_wrong", "scorer_artifact", "ontology_gap", "ambiguous")
 FP_CLASSES = ("answerer_error", "gold_missing", "scorer_artifact", "ontology_gap", "ambiguous")
 _CLASSES_BY_KIND = {"miss": MISS_CLASSES, "fp": FP_CLASSES}
+# The classes the aligned check line always names; another class shows only when credited.
+ALIGNED_CHECK_CLASSES = ("answerer_error", "gold_wrong", "scorer_artifact", "ambiguous")
+Key = tuple[str, str, str]
 _ARTICLE = {"miss": "a miss", "fp": "an fp"}
 _COUNT_FIELDS = (
     "gold",
@@ -223,11 +239,124 @@ def figures(totals: Totals, items: list[Item], classes: dict[str, str]) -> list[
     return lines
 
 
+def _strings(value: object, size: int) -> list[str] | None:
+    if isinstance(value, list) and len(value) == size and all(isinstance(v, str) for v in value):
+        return value
+    return None
+
+
+def _worksheet_probes(
+    path: Path,
+) -> tuple[list[object], dict[str, set[Key]], dict[str, Key]]:
+    """The worksheet's own gold as scorer probes, each probe's missed keys, each miss's key."""
+    from scripts.eval_harness.score_extraction_run import GoldEntity, GoldProbe, GoldRel
+
+    probes: list[object] = []
+    misses: dict[str, set[Key]] = {}
+    relation_of: dict[str, Key] = {}
+    for line_no, line in _jsonl(path):
+        if not isinstance(line, dict):
+            raise AdjudicatedError(f"{path}:{line_no}: a probe line needs to be an object")
+        tag, utterance = line.get("tag"), line.get("utterance")
+        entities = [_strings(e, 2) for e in line.get("gold_entities") or []]
+        relations = [_strings(r, 3) for r in line.get("gold_relations") or []]
+        miss_items = [i for i in line["items"] if i["kind"] == "miss"]
+        missed = [_strings(i.get("relation"), 3) for i in miss_items]
+        if not (isinstance(tag, str) and isinstance(utterance, str)) or None in (
+            *entities,
+            *relations,
+            *missed,
+        ):
+            raise AdjudicatedError(
+                f"{path}:{line_no}: a probe line needs a tag, an utterance, [id, type] gold "
+                "entities and [source, predicate, target] relations"
+            )
+        types = {e[0]: e[1] for e in entities if e is not None}
+        probes.append(
+            GoldProbe(
+                tag=tag,
+                utterance=utterance,
+                entities=tuple(GoldEntity(e[0], e[1]) for e in entities if e is not None),
+                relationships=tuple(
+                    GoldRel(r[0], types.get(r[0], ""), r[1], r[2], types.get(r[2], ""))
+                    for r in relations
+                    if r is not None
+                ),
+            )
+        )
+        keys = [(m[0], m[1], m[2]) for m in missed if m is not None]
+        misses[tag] = set(keys)
+        relation_of.update((i["id"], key) for i, key in zip(miss_items, keys))
+    return probes, misses, relation_of
+
+
+def _raw_index(path: Path) -> dict[str, object]:
+    """The bench probe's produced index from a raw run file, as `score_runs` builds it."""
+    from scripts.eval_harness import score_extraction_run as scorer
+
+    index: dict[str, object] = {}
+    for line_no, row in _jsonl(path):
+        if not isinstance(row, dict) or not isinstance(row.get("utterance"), str):
+            raise AdjudicatedError(f"{path}:{line_no}: a raw row needs an utterance")
+        response = row.get("response")
+        if response is None:
+            continue  # A failed case is absent from the index, as in the bench probe.
+        if not isinstance(response, dict) or not isinstance(response.get("payload"), dict):
+            raise AdjudicatedError(f"{path}:{line_no}: a response with no payload object")
+        ok, entities, type_by_id, rels = scorer.parse_produced(json.dumps(response["payload"]))
+        utterance = scorer._norm_ws(row["utterance"])
+        index[utterance] = scorer.Produced(utterance, ok, entities, type_by_id, rels)
+    return index
+
+
+def aligned_credits(
+    worksheet: Path, raw: Path, items: list[Item], classes: dict[str, str]
+) -> Counter[str]:
+    """Each adjudication class's count of the misses the aligner credits, pending pairs all in.
+
+    The raw is scored against the worksheet's own gold, the gold the adjudication judged.
+    Every pending typo or paraphrase pair is accepted, the most the aligner could credit.
+    """
+    from scripts.eval_harness.score_extraction_run import score_run
+
+    probes, worksheet_misses, relation_of = _worksheet_probes(worksheet)
+    index = _raw_index(raw)
+    pending = {
+        (p["tag"], p["gold_id"], p["produced_id"]) for p in score_run(probes, index).pending_pairs
+    }
+    report = score_run(probes, index, accepted_pairs=pending)
+    still_missed: set[tuple[str, str, str, str]] = set()
+    for entry in report.per_probe:
+        tag = entry["tag"]
+        exact = {tuple(key) for key in entry["rel_fns"]}  # [s, p, t] lists from the scorer
+        if exact != worksheet_misses.get(tag, set()):
+            raise AdjudicatedError(
+                f"{tag}: the raw's exact misses are not the worksheet's, so it is not the run "
+                "the worksheet was made from"
+            )
+        still_missed.update((tag, s, p, t) for s, p, t in entry["aligned_rel_fns"])
+    credits: Counter[str] = Counter()
+    for item in items:
+        if item.kind != "miss":
+            continue
+        tag = item.id.rsplit(":miss:", 1)[0]
+        if (tag, *relation_of[item.id]) not in still_missed:
+            credits[classes[item.id]] += 1
+    return credits
+
+
 def _run(argv: Sequence[str] | None) -> int:
     parser = _Parser(description=__doc__.splitlines()[0])
     parser.add_argument("--worksheet", type=Path, required=True)
     parser.add_argument("--adjudication", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--aligned-check",
+        type=Path,
+        metavar="RAW",
+        help="score RAW over aligned ids against the worksheet's gold; exit 1 if any "
+        "answerer_error or gold_wrong miss is credited",
+    )
     args = parser.parse_args(argv)
 
     totals, items = read_worksheet(args.worksheet)
@@ -236,10 +365,22 @@ def _run(argv: Sequence[str] | None) -> int:
         print("\n".join(problems))
         print(f"check: {len(problems)} problems over {len(items)} items")
         return 1
+    credits: Counter[str] | None = None
+    if args.aligned_check is not None:
+        credits = aligned_credits(args.worksheet, args.aligned_check, items, classes)
     if args.check:
         print(f"check: {len(items)} items, one valid line each")
     print("\n".join(figures(totals, items, classes)))
-    return 0
+    if credits is None:
+        return 0
+    shown = [*ALIGNED_CHECK_CLASSES, *(c for c in MISS_CLASSES if c not in ALIGNED_CHECK_CLASSES)]
+    print(
+        "aligned credits by class: "
+        + ", ".join(
+            f"{cls} {credits[cls]}" for cls in shown if cls in ALIGNED_CHECK_CLASSES or credits[cls]
+        )
+    )
+    return 1 if credits["answerer_error"] or credits["gold_wrong"] else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

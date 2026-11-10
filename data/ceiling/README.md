@@ -152,6 +152,24 @@ count only when an adjudicator accepts them.
   `{"tag", "gold_id", "produced_id", "accept": true|false}` rows. An accepted pair counts in
   the aligned figures; a rejected or absent one stays a miss and a false positive.
 
+The aligned check tests how the aligner was built against run A's adjudication:
+
+```
+python -m scripts.eval_harness.ceiling.adjudicated --worksheet data/ceiling/worksheet-run-a.jsonl --adjudication data/ceiling/adjudication-run-a.jsonl --aligned-check .local/eval-ceiling/run-a-1/extraction_service_raw.jsonl
+```
+
+It scores the raw against the worksheet's own gold, the gold the adjudication judged, with
+every pending pair counted as accepted (the most the aligner could credit), and refuses a
+raw whose exact misses are not the worksheet's. After the corrected figures it prints
+
+```
+aligned credits by class: answerer_error N, gold_wrong N, scorer_artifact N, ambiguous N
+```
+
+counting the misses the aligned scoring finds by their adjudicated class, and exits 1 when
+answerer_error or gold_wrong is above 0: the aligner must never credit an answer a reader
+judged wrong, or a gold relation judged wrong.
+
 ## Service env
 
 Every run A service process gets host-1070's r6 settings, except the four identity
