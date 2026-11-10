@@ -1234,3 +1234,62 @@ def test_the_h8_marks_section_covers_every_sampled_probe():
 
     assert len(sampled) == 20
     assert [t for t in sampled if t[:6] not in marks] == []
+
+
+# --- Rows relabelled under the id rails (plan v11 T35) ---------------------------------------
+
+# Each relabelled row's whole label, by (gold set, tag): its entities as (id, type) and its
+# edges as (source, predicate, target, valid_from). A later edit of one of these rows has to
+# move its pin here, so a relabel is never silent.
+_RELABELLED_ROWS: dict[tuple[str, str], tuple[set, set]] = {
+    # The Metric rail keeps a decimal as a hyphen (D16), so 3.1 GB and 31 GB stay apart.
+    ("dev-lists", "dvl-39-list-long-load-test-numbers"): (
+        {("saltmere-matchmaking-service", "Project")}
+        | {
+            (m, "Metric")
+            for m in (
+                "0-2-percent-error-rate",
+                "180-max-queue-depth",
+                "2-4-seconds-cold-start",
+                "2400-matches-per-minute",
+                "3-1-gb-peak-memory",
+                "38-ms-p50-latency",
+                "3-8-euros-per-hour",
+                "410-ms-p99-latency",
+                "71-percent-peak-cpu",
+                "9500-requests-per-second",
+            )
+        },
+        {
+            ("saltmere-matchmaking-service", "HAS_METRIC", m, None)
+            for m in (
+                "0-2-percent-error-rate",
+                "180-max-queue-depth",
+                "2-4-seconds-cold-start",
+                "2400-matches-per-minute",
+                "3-1-gb-peak-memory",
+                "38-ms-p50-latency",
+                "3-8-euros-per-hour",
+                "410-ms-p99-latency",
+                "71-percent-peak-cpu",
+                "9500-requests-per-second",
+            )
+        },
+    ),
+}
+_RELABEL_SETS = {"dev-lists": _DEV_GOLD, "sixty": _SIXTY}
+
+
+@pytest.mark.parametrize(
+    ("set_name", "tag"), sorted(_RELABELLED_ROWS), ids=[t for _, t in sorted(_RELABELLED_ROWS)]
+)
+def test_a_relabelled_row_holds_exactly_its_new_labels(set_name, tag):
+    rows = [r for r in _gold_rows(_RELABEL_SETS[set_name]) if r["tag"] == tag]
+    assert len(rows) == 1, f"{tag}: not exactly one row"
+    entities = {(e["id"], e["type"]) for e in rows[0]["expected_entities"]}
+    edges = {
+        (r["source"], r["predicate"], r["target"], r.get("valid_from"))
+        for r in rows[0]["expected_relationships"]
+    }
+
+    assert (entities, edges) == _RELABELLED_ROWS[(set_name, tag)]
