@@ -1286,6 +1286,11 @@ _RELABELLED_ROWS: dict[tuple[str, str], tuple[set, set]] = {
         {("user", "User"), ("journal", "Concept")},
         {("user", "HAS_HABIT", "journal", None)},
     ),
+    # The same retired clause: "I review PRs every Friday" is `review-prs`, not `pr-review`.
+    ("sixty", "ext-56-habit"): (
+        {("user", "User"), ("review-prs", "Concept")},
+        {("user", "HAS_HABIT", "review-prs", None)},
+    ),
     # N15: an activity keeps its object.
     ("sixty", "ext-58-dateentity-stative-since"): (
         {("user", "User"), ("mentoring-junior-engineers", "Skill")},

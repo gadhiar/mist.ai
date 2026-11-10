@@ -537,6 +537,7 @@ at least twice. T8 checks the same floor on the adjudicated labels.
     with their `HAS_METRIC` edges. No other dev-lists id changed.
   - ext-13 gains the `Concept` `editor` and `neovim IS_A editor` (N14). ext-58's `mentoring`
     becomes `mentoring-junior-engineers` (N15). N1's habit clause is retired (A30, Ruling 22),
-    so ext-55's `journaling` becomes `journal`. The retrieval facts of `rq-paraphrase-06` and
+    so ext-55's `journaling` becomes `journal` and ext-56's `pr-review` becomes `review-prs`
+    ("I review PRs every Friday"). The retrieval facts of `rq-paraphrase-06` and
     `rq-type-scoped-04` name the new ids, and `data/golden-log/golden-log.jsonl` is regenerated
     from the relabelled 60.
