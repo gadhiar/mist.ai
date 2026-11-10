@@ -847,7 +847,7 @@ def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
 
 # The dev-lists entities that carry other accepted ids, each a case N1's last sentence admits:
 # two forms fit and neither is a phrase of the utterance's own. None does: with N1's habit
-# clause suspended (it has no carrier), dvl-08's habits take the utterance's own `swim` and
+# clause retired (A30, Ruling 22), dvl-08's habits take the utterance's own `swim` and
 # `call-parents`, the forms that were their alternatives.
 _ID_ALTERNATIVES: dict[tuple[str, str], list[str]] = {}
 # LABELLING names no two predicates for one shape that a dev-lists edge fits, so none has any.
@@ -1234,3 +1234,104 @@ def test_the_h8_marks_section_covers_every_sampled_probe():
 
     assert len(sampled) == 20
     assert [t for t in sampled if t[:6] not in marks] == []
+
+
+# --- Rows relabelled under the id rails (plan v11 T35) ---------------------------------------
+
+# Each relabelled row's whole label, by (gold set, tag): its entities as (id, type) and its
+# edges as (source, predicate, target, valid_from). A later edit of one of these rows has to
+# move its pin here, so a relabel is never silent.
+_RELABELLED_ROWS: dict[tuple[str, str], tuple[set, set]] = {
+    # The Metric rail keeps a decimal as a hyphen (D16), so 3.1 GB and 31 GB stay apart.
+    ("dev-lists", "dvl-39-list-long-load-test-numbers"): (
+        {("saltmere-matchmaking-service", "Project")}
+        | {
+            (m, "Metric")
+            for m in (
+                "0-2-percent-error-rate",
+                "180-max-queue-depth",
+                "2-4-seconds-cold-start",
+                "2400-matches-per-minute",
+                "3-1-gb-peak-memory",
+                "38-ms-p50-latency",
+                "3-8-euros-per-hour",
+                "410-ms-p99-latency",
+                "71-percent-peak-cpu",
+                "9500-requests-per-second",
+            )
+        },
+        {
+            ("saltmere-matchmaking-service", "HAS_METRIC", m, None)
+            for m in (
+                "0-2-percent-error-rate",
+                "180-max-queue-depth",
+                "2-4-seconds-cold-start",
+                "2400-matches-per-minute",
+                "3-1-gb-peak-memory",
+                "38-ms-p50-latency",
+                "3-8-euros-per-hour",
+                "410-ms-p99-latency",
+                "71-percent-peak-cpu",
+                "9500-requests-per-second",
+            )
+        },
+    ),
+    # N14: the utterance names the kind; "daily" qualifies the use and is not part of it.
+    ("sixty", "ext-13-uses-editor"): (
+        {("user", "User"), ("editor", "Concept"), ("neovim", "Technology")},
+        {("neovim", "IS_A", "editor", None), ("user", "USES", "neovim", None)},
+    ),
+    # N1's habit clause is retired (A30, Ruling 22): a habit id is the utterance's own phrase.
+    ("sixty", "ext-55-habit"): (
+        {("user", "User"), ("journal", "Concept")},
+        {("user", "HAS_HABIT", "journal", None)},
+    ),
+    # N15: an activity keeps its object.
+    ("sixty", "ext-58-dateentity-stative-since"): (
+        {("user", "User"), ("mentoring-junior-engineers", "Skill")},
+        {("user", "EXPERT_IN", "mentoring-junior-engineers", "2026-02")},
+    ),
+    # N17 (A32(a), Ruling 21): a named team, club or community the utterance places a person
+    # in is an Organization the person is MEMBER_OF; a named employer stays WORKS_AT.
+    ("sixty", "ext-18-works-at"): (
+        {("user", "User"), ("payments-team", "Organization"), ("stripe", "Organization")},
+        {("user", "MEMBER_OF", "payments-team", None), ("user", "WORKS_AT", "stripe", None)},
+    ),
+    ("sixty", "ext-33-validtime-since"): (
+        {("user", "User"), ("platform-team", "Organization")},
+        {("user", "MEMBER_OF", "platform-team", "2026-05")},
+    ),
+    ("dev-lists", "dvl-26-list-plus-side-projects"): (
+        {
+            ("user", "User"),
+            ("book-club", "Organization"),
+            ("cli-for-splitting-bills", "Project"),
+            ("discord-bot", "Project"),
+            ("elm", "Technology"),
+            ("plotwise", "Project"),
+        },
+        {
+            ("plotwise", "IMPLEMENTED_WITH", "elm", None),
+            ("user", "MEMBER_OF", "book-club", None),
+            ("user", "WORKS_ON", "cli-for-splitting-bills", None),
+            ("user", "WORKS_ON", "discord-bot", None),
+            ("user", "WORKS_ON", "plotwise", None),
+        },
+    ),
+}
+_RELABEL_SETS = {"dev-lists": _DEV_GOLD, "sixty": _SIXTY}
+
+
+@pytest.mark.parametrize(
+    ("set_name", "tag"), sorted(_RELABELLED_ROWS), ids=[t for _, t in sorted(_RELABELLED_ROWS)]
+)
+def test_a_relabelled_row_holds_exactly_its_new_labels(set_name, tag):
+    rows = [r for r in _gold_rows(_RELABEL_SETS[set_name]) if r["tag"] == tag]
+    assert len(rows) == 1, f"{tag}: not exactly one row"
+    entities = {(e["id"], e["type"]) for e in rows[0]["expected_entities"]}
+    edges = {
+        (r["source"], r["predicate"], r["target"], r.get("valid_from"))
+        for r in rows[0]["expected_relationships"]
+    }
+
+    assert (entities, edges) == _RELABELLED_ROWS[(set_name, tag)]
