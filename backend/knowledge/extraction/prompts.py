@@ -29,6 +29,19 @@ Mechanism, Strategy, DataStructure, Abstraction, MistIdentity
 ### Allowed Relationship Types (use EXACTLY these strings):
 USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY, MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF, RECOMMENDS, HAS_HABIT
 
+### Glosses (quoted from the ontology; a "topic" is a Concept, there is no Topic type):
+- Organization: "A company, team, institution, community, or open-source project."
+- Event: "A notable event such as a decision, milestone, meeting, or life event."
+- KNOWS: "Indicates familiarity with a skill, concept, technology, or topic."
+- INTERESTED_IN: "Indicates interest in a technology, concept, topic, or skill."
+- PREFERS: "Indicates a positive preference for something."
+- EXPERT_IN: "Indicates expert-level proficiency in a technology, skill, or concept."
+- LEARNING: "Indicates actively learning a technology, skill, or concept."
+- EXPERIENCED: "Links a user or person to an event they experienced."
+- WORKS_ON: "Indicates active involvement in a project."
+- WORKS_AT: employment at an organization, the employer, and nothing else; membership is MEMBER_OF.
+- MEMBER_OF: "Indicates membership in an organization."
+
 ### Subject Scope (passed in as SUBJECT SCOPE below)
 - `user-scope` utterances: the user is the subject. Use User-centric predicates (USES, LEARNING, WORKS_ON, etc.). source="user".
 - `system-scope` utterances: MIST is the subject. Use MistIdentity-centric predicates (USES, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE). source="mist-identity" with type="MistIdentity".
@@ -51,7 +64,7 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 3. Collapse version specifics into canonical names: "Python 3.11" -> "python".
 4. Confidence scoring: Definitive=0.95, Personal=0.9, Opinions=0.7, Hedged=-0.2, Third-party=0.8, Speculative=0.5
 5. Temporal extraction: relative dates resolved against reference_date, temporal_status assigned
-6. Assertion kind -- every relationship carries "assertion_kind": "assert" (the fact is true / began), "cease" (the fact stopped being true: "stopped", "quit", "left", "gave up on", "don't ... anymore"; set end_date if a stop date is stated), or "retract" (the fact was NEVER true: "I never actually", "I misspoke", "scratch that", "I was wrong about"). Self-corrections about the user's own facts ("scratch that, I don't work at Initech") are retractions of facts, NOT directives -- Rule 10 does not apply to them. Preference negation is NOT cessation: "don't like X" -> DISLIKES with assertion_kind=assert; "don't like X anymore" -> DISLIKES assert (the new preference is the fact). When unsure, use "assert".
+6. Assertion kind -- every relationship carries "assertion_kind": "assert" (the fact is true / began), "cease" (the fact stopped being true: "stopped", "quit", "left", "gave up on", "don't ... anymore"; set end_date if a stop date is stated), or "retract" (the fact was NEVER true: "I never actually", "I misspoke", "scratch that", "I was wrong about"). Self-corrections about the user's own facts ("scratch that, I don't work at Initech") are retractions of facts, NOT directives -- Rule 10 does not apply to them. Preference negation is NOT cessation: "don't like X" -> DISLIKES with assertion_kind=assert; "don't like X anymore" -> user PREFERS X with assertion_kind=cease and user DISLIKES X with assertion_kind=assert (Rule 38). When unsure, use "assert".
 7. Use conversation context to resolve pronouns.
 8. Extract ONLY factual claims stated in the utterance. Do not extract hypothetical statements, speculative claims, or assertions about unrelated entities.
 9. If no extractable knowledge, return {{"entities": [], "relationships": []}}
@@ -79,6 +92,11 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 31. Stated places and organisations. A place or organisation that the utterance relates to an Event with a preposition ("in", "at", "with") is an entity, linked to the Event by RELATED_TO (Example 29). This is not the incidental scope of Rule 18.
 32. Third-party events. A named person's own Event that is not milestone-class gets <person> EXPERIENCED <event>, beside the edges Rules 19 and 26 give.
 33. Topic links. An Event links by RELATED_TO to what the utterance says it concerned: the subject a meeting discussed or decided on, the decisions it made, and the object of a decision. Something chosen for a subject links to that subject, not to the Event. An Event the utterance only implies is not added for this rule, and an option nobody chose gets no edge.
+34. Named teams. A named team, club or community that the utterance places a person in is an `Organization`. A person is placed in it when they are on it, are in it, joined it, or run or lead it; the speaker's possessive names it (this places the speaker); they hold a title that names the team with its group noun (a title with no group noun names no team); or they are listed under a heading, lead-in or parent bullet that is its name. A team is named when the utterance gives it a word that tells it apart from other teams, what it does or its proper name. A heading, lead-in or parent bullet also names a team when it carries its own group noun, or sits under a lead-in that carries a group noun. A describing word (new, old, small, whole, current, remote, other) does not name a team. Nor does the employer's name alone: the employer's name with a group noun is the employer, with WORKS_AT, and no team entity. The id is the phrase under Rule 2; the group word is kept when the utterance writes it, and a heading's own word stands alone. Each person placed in it gets MEMBER_OF it, including the one who runs or leads it. A named employer is a separate `Organization` that each of them WORKS_AT, and the team gets no PART_OF to the employer (Example 31). No entity and no MEMBER_OF for: a group noun with no name of its own, alone or with a describing word, as an item, a title or a lead-in; a role or job title with no group noun; a relationship category (colleagues, friends, family, household), which Rule 24 already leaves without an entity. A team's tools and decisions stay on the user (Rules 35 and 30). Rule 23 still covers a team name that only modifies another name and places no one in it, and an employer that only modifies a team's name is still the employer, with WORKS_AT.
+35. The team's tools. A statement of which tools the user's team runs puts USES on the user. A possessive that only names a thing does not.
+36. Personal milestones. A personal legal or financial step completed on a day is milestone-class: an Event with no user EXPERIENCED edge (Rules 11 and 26).
+37. Goal deadlines. A goal's stated time frame is its deadline. The HAS_GOAL edge carries end_date at the frame's end, at the precision the frame states (in the schema's date form, the last day of the day, month or year it names), and start_date null. A goal looks forward, so a bare month is the first such month after the reference date. A lead-in sets the frame for every goal under it. A frame whose year is unclear gets no date.
+38. Flipped preferences. When the utterance states the earlier preference as well as the new one, it carries both edges: user PREFERS X with assertion_kind "cease", and user DISLIKES X with assertion_kind "assert", the same pair as a replacement. Neither edge gets a date.
 
 ## REFERENCE DATE
 Today's date: {reference_date}
@@ -264,6 +282,12 @@ Subject scope: user-scope
 Utterance: "Bench diary > Crafts I'm learning: lost-wax casting"
 Output:
 {{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "lost-wax-casting", "name": "Lost-wax casting", "type": "Skill"}}], "relationships": [{{"source": "user", "target": "lost-wax-casting", "type": "LEARNING", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 31: Named team -- MEMBER_OF the team, even as its lead; WORKS_AT the separate employer; no PART_OF (Rule 34)
+Subject scope: user-scope
+Utterance: "I lead the Brackwater billing team at Quillmere"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "brackwater-billing-team", "name": "Brackwater billing team", "type": "Organization"}}, {{"id": "quillmere", "name": "Quillmere", "type": "Organization"}}], "relationships": [{{"source": "user", "target": "brackwater-billing-team", "type": "MEMBER_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "lead", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "user", "target": "quillmere", "type": "WORKS_AT", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:

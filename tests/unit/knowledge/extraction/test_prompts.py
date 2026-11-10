@@ -486,6 +486,124 @@ class TestGroup2ListConventions:
         assert "-".join(re.findall(r"[a-z0-9]+", earlier.lower())) not in entities
 
 
+class TestGroup3GlossesAndTeamConventions:
+    """v11 group 3 (ADR-054 Decision 7, plan D17): a gloss quoted from the ontology after
+    each user-centric predicate and each confusable type, N17 named teams with its own
+    example, and N8, N10, N11 and N12, each stated as a rule. Each presence check is keyed
+    on the rule's own phrase.
+    """
+
+    # The ontology's own descriptions, quoted. WORKS_AT is the one exception: the prompt
+    # glosses it as employment only, since membership is MEMBER_OF (lead decision 3).
+    QUOTED = {
+        "Organization": "A company, team, institution, community, or open-source project.",
+        "Event": "A notable event such as a decision, milestone, meeting, or life event.",
+        "KNOWS": "Indicates familiarity with a skill, concept, technology, or topic.",
+        "INTERESTED_IN": "Indicates interest in a technology, concept, topic, or skill.",
+        "PREFERS": "Indicates a positive preference for something.",
+        "EXPERT_IN": "Indicates expert-level proficiency in a technology, skill, or concept.",
+        "LEARNING": "Indicates actively learning a technology, skill, or concept.",
+        "EXPERIENCED": "Links a user or person to an event they experienced.",
+        "WORKS_ON": "Indicates active involvement in a project.",
+        "MEMBER_OF": "Indicates membership in an organization.",
+    }
+
+    @staticmethod
+    def _gloss_lines() -> dict[str, str]:
+        lines = EXTRACTION_SYSTEM_PROMPT.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("### Glosses"))
+        glosses: dict[str, str] = {}
+        for line in lines[start + 1 :]:
+            if not line.startswith("- "):
+                break
+            name, gloss = line[2:].split(": ", 1)
+            glosses[name] = gloss
+        return glosses
+
+    def test_each_gloss_quotes_its_ontology_description(self):
+        from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
+
+        glosses = self._gloss_lines()
+        descriptions = {
+            d.type_name: d.description
+            for d in (*ONTOLOGY_V1_0_0.node_types, *ONTOLOGY_V1_0_0.edge_types)
+        }
+        assert set(glosses) == {*self.QUOTED, "WORKS_AT"}
+        for name, description in self.QUOTED.items():
+            assert descriptions[name] == description, name
+            assert glosses[name].startswith(f'"{description}"'), name
+
+    def test_works_at_is_glossed_as_employment_only(self):
+        gloss = self._gloss_lines()["WORKS_AT"]
+        assert "employment at an organization, the employer, and nothing else" in gloss
+        assert "membership" not in gloss.split(";")[0]
+
+    def test_a_quoted_topic_does_not_suggest_a_topic_type(self):
+        assert "there is no Topic type" in EXTRACTION_SYSTEM_PROMPT
+        assert "Topic," not in EXTRACTION_SYSTEM_PROMPT.split("### Abstract-Type Tests")[0]
+
+    def test_n17_named_teams(self):
+        assert "Named teams. A named team, club or community that the utterance places a" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "A describing word (new, old, small, whole, current, remote, other)" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "the team gets no PART_OF to the employer" in EXTRACTION_SYSTEM_PROMPT
+        assert "a relationship category (colleagues, friends, family, household)" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+
+    def test_n8_the_team_s_tools(self):
+        assert "The team's tools. A statement of which tools the user's team runs puts USES" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "A possessive that only names a thing does not" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n10_personal_milestones(self):
+        assert "Personal milestones. A personal legal or financial step completed on a day" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+
+    def test_n11_goal_windows(self):
+        assert "Goal deadlines. A goal's stated time frame is its deadline" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "a bare month is the first such month after the reference date" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "A frame whose year is unclear gets no date" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n12_flipped_preferences_and_rule_6_follows_it(self):
+        assert "Flipped preferences. When the utterance states the earlier preference" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "Neither edge gets a date" in EXTRACTION_SYSTEM_PROMPT
+        rule_6 = next(
+            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if line.startswith("6. ")
+        )
+        anymore = rule_6.split('"don\'t like X anymore"', 1)[1].split(". ", 1)[0]
+        assert "PREFERS X" in anymore and "cease" in anymore
+        assert "DISLIKES X" in anymore and "assert" in anymore
+        assert "(the new preference is the fact)" not in rule_6
+
+    def test_example_31_the_named_team_beside_the_employer(self):
+        heading = next(
+            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if "### Example 31:" in line
+        )
+        assert "Rule 34" in heading
+        _, output = _examples()[31]
+        orgs = [e["id"] for e in output["entities"] if e["type"] == "Organization"]
+        assert len(orgs) == 2
+        team = next(o for o in orgs if _has_edge(output, "user", "MEMBER_OF", o))
+        employer = next(o for o in orgs if _has_edge(output, "user", "WORKS_AT", o))
+        assert team != employer
+        assert team.endswith("-team"), "the group word is kept when the utterance writes it"
+        assert not _has_edge(output, "user", "WORKS_AT", team)
+        assert not _has_edge(output, "user", "MEMBER_OF", employer)
+        assert all(rel["type"] != "PART_OF" for rel in output["relationships"])
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
@@ -527,8 +645,9 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-11-10-r8", groups 1 (identity) and 2 (list conventions).
-    PINNED_SHA256 = "0dc85cac1e777c4985c30dcfd44c284049a2d1aa323d5569c912ed137313345e"
+    # extraction_version = "2026-11-10-r8", groups 1 (identity), 2 (list conventions) and
+    # 3 (glosses, named teams and the remaining conventions).
+    PINNED_SHA256 = "e45298f9c9800aebd29fa3b96c8dd3fef850bd03b21b1521485326d39b8b71ac"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
