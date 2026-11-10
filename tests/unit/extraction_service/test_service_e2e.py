@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from backend.extraction_service.app import LlamaPropsContextSize, create_app
-from backend.extraction_service.engine import ExtractionEngine
+from backend.extraction_service.engine import STAGE_CAPS, ExtractionEngine
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
     EXTRACTION_OUTPUT_SCHEMA,
@@ -334,14 +334,14 @@ def _props_client(handler) -> httpx.AsyncClient:
 
 @pytest.mark.asyncio
 class TestInfoServingConfig:
-    """`/v1/info` reports the serving config a result was produced under (contract 1.1.0)."""
+    """`/v1/info` reports the serving config a result was produced under (contract 1.1.0 on)."""
 
     async def test_info_reports_the_settings_and_the_props_ctx_size(self, client, service_settings):
         response = await client.get("/v1/info")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["contract_version"] == "1.1.0"
+        assert data["contract_version"] == "1.3.0"
         # No settings override: the gpt-oss adapter's default mode is in effect.
         assert service_settings.constrained_mode is None
         assert data["constrained_mode"] == "schema"
@@ -387,6 +387,12 @@ class TestInfoServingConfig:
         class _UnknownAdapterEngine:
             adapter_name = "not-a-registered-adapter"
 
+            def request_profile(self) -> tuple:
+                return ()
+
+            def stage_cap(self, stage: str) -> int:
+                return getattr(STAGE_CAPS["low"], stage)
+
         app = create_app(
             service_settings, _UnknownAdapterEngine(), health_probe, ctx_size_source  # type: ignore[arg-type]
         )
@@ -396,51 +402,125 @@ class TestInfoServingConfig:
         assert response.status_code == 200
         assert response.json()["constrained_mode"] is None
 
-    async def test_props_is_fetched_once_across_repeated_info_calls(self, client, fake_llama_state):
+    async def test_props_is_fetched_on_every_info_call(self, client, fake_llama_state):
+        """Nothing is cached: a llama-server restarted with another context is seen at once."""
         responses = [await client.get("/v1/info") for _ in range(3)]
 
         assert [r.json()["ctx_size"] for r in responses] == [FAKE_N_CTX] * 3
-        assert fake_llama_state.props_requests == 1
+        assert fake_llama_state.props_requests == 3
 
-    async def test_concurrent_first_info_calls_share_one_props_fetch(
-        self, client, fake_llama_state
-    ):
-        responses = await asyncio.gather(*(client.get("/v1/info") for _ in range(3)))
-
-        assert [r.json()["ctx_size"] for r in responses] == [FAKE_N_CTX] * 3
-        assert fake_llama_state.props_requests == 1
-
-    async def test_concurrent_calls_under_a_failing_props_retry_one_at_a_time(
+    async def test_concurrent_info_calls_share_one_props_fetch(
         self, service_settings, engine, health_probe
     ):
-        # A failure is not cached, so every caller queued on the lock makes its
-        # own request -- sequentially, never overlapping, each with the timeout.
-        in_flight = 0
-        max_in_flight = 0
+        held = asyncio.Event()
+        fetches = 0
+
+        async def slow(request: httpx.Request) -> httpx.Response:
+            nonlocal fetches
+            fetches += 1
+            await held.wait()
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": FAKE_N_CTX}})
+
+        source = LlamaPropsContextSize(http_client=_props_client(slow), base_url=FAKE_BASE_URL)
+        app = create_app(service_settings, engine, health_probe, source)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://service") as client:
+            calls = [asyncio.create_task(client.get("/v1/info")) for _ in range(3)]
+            while fetches == 0:
+                await asyncio.sleep(0)
+            for _ in range(200):  # let the other two calls reach the held fetch
+                await asyncio.sleep(0)
+            held.set()
+            responses = await asyncio.gather(*calls)
+
+        assert [r.json()["ctx_size"] for r in responses] == [FAKE_N_CTX] * 3
+        assert fetches == 1
+
+    async def test_concurrent_reads_join_the_fetch_in_flight(self):
+        held = asyncio.Event()
+        fetches = 0
+
+        async def slow(request: httpx.Request) -> httpx.Response:
+            nonlocal fetches
+            fetches += 1
+            await held.wait()
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 4096}})
+
+        source = LlamaPropsContextSize(http_client=_props_client(slow), base_url=FAKE_BASE_URL)
+        reads = [asyncio.create_task(source.read()) for _ in range(3)]
+        while fetches == 0:
+            await asyncio.sleep(0)
+        held.set()
+        results = await asyncio.gather(*reads)
+
+        assert [r.n_ctx for r in results] == [4096] * 3
+        assert fetches == 1
+
+    async def test_a_finished_fetch_is_never_reused(self):
+        values = iter([4096, 8192])
+
+        def answer(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"default_generation_settings": {"n_ctx": next(values)}}
+            )
+
+        source = LlamaPropsContextSize(http_client=_props_client(answer), base_url=FAKE_BASE_URL)
+
+        first = await source.read()
+        second = await source.read()
+
+        assert (first.n_ctx, second.n_ctx) == (4096, 8192)
+
+    async def test_a_cancelled_reader_leaves_the_fetch_to_the_others(self):
+        held = asyncio.Event()
+        fetches = 0
+
+        async def slow(request: httpx.Request) -> httpx.Response:
+            nonlocal fetches
+            fetches += 1
+            await held.wait()
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 4096}})
+
+        source = LlamaPropsContextSize(http_client=_props_client(slow), base_url=FAKE_BASE_URL)
+        first = asyncio.create_task(source.read())
+        second = asyncio.create_task(source.read())
+        while fetches == 0:
+            await asyncio.sleep(0)
+        first.cancel()
+        held.set()
+
+        result = await second
+
+        assert result.n_ctx == 4096
+        assert first.cancelled()
+        assert fetches == 1
+
+    async def test_concurrent_calls_under_a_failing_props_share_one_failed_fetch(
+        self, service_settings, engine, health_probe
+    ):
+        # Concurrent callers join the one fetch in flight, failed or not, and
+        # that fetch carries the configured timeout.
+        held = asyncio.Event()
         timeouts: list[dict] = []
 
         async def failing(request: httpx.Request) -> httpx.Response:
-            nonlocal in_flight, max_in_flight
-            in_flight += 1
-            max_in_flight = max(max_in_flight, in_flight)
             timeouts.append(request.extensions["timeout"])
-            for _ in range(5):  # yield, so an unlocked caller could overlap
-                await asyncio.sleep(0)
-            in_flight -= 1
+            await held.wait()
             return httpx.Response(503, json={"error": "loading"})
 
         source = LlamaPropsContextSize(
             http_client=_props_client(failing), base_url=FAKE_BASE_URL, timeout=1.5
         )
-        app = create_app(service_settings, engine, health_probe, source)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://service") as client:
-            responses = await asyncio.gather(*(client.get("/v1/info") for _ in range(8)))
+        reads = [asyncio.create_task(source.read()) for _ in range(8)]
+        while not timeouts:
+            await asyncio.sleep(0)
+        held.set()
+        results = await asyncio.gather(*reads)
 
-        assert [r.json()["ctx_size"] for r in responses] == [None] * 8
-        assert len(timeouts) == 8  # one request per caller: nothing was cached
-        assert max_in_flight == 1  # one at a time, under the lock
-        assert all(t["read"] == 1.5 and t["connect"] == 1.5 for t in timeouts)
+        assert [r.n_ctx for r in results] == [None] * 8
+        assert all("HTTP 503" in (r.error or "") for r in results)
+        assert len(timeouts) == 1
+        assert timeouts[0]["read"] == 1.5 and timeouts[0]["connect"] == 1.5
 
     async def test_props_non_2xx_gives_a_null_ctx_size(self, client, fake_llama_state):
         fake_llama_state.props_status = 503
@@ -462,7 +542,7 @@ class TestInfoServingConfig:
         assert first.json()["ctx_size"] is None
         assert second.json()["ctx_size"] == FAKE_N_CTX
         assert third.json()["ctx_size"] == FAKE_N_CTX
-        assert fake_llama_state.props_requests == 2
+        assert fake_llama_state.props_requests == 3
 
     @pytest.mark.parametrize(
         "body",

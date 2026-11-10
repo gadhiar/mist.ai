@@ -265,7 +265,9 @@ class TestWebSocketPush:
     @pytest.mark.asyncio
     async def test_a_state_transition_pushes_at_once(self, monkeypatch, backlog_world, ts):
         # Arrange: the service is down, so start() moves idle -> unreachable.
+        # The epoch is bound: an unbound one would wait to be bound instead.
         world = backlog_world
+        world.bind_active_epoch()
         world.service.down = True
         world.log_turn(session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use rust")
         captured: asyncio.Queue = asyncio.Queue()
@@ -290,9 +292,11 @@ class TestWebSocketPush:
         """`_start_extraction_dispatcher` itself wires the listener.
 
         The service URL is a closed loopback port, so the first `/v1/info` is
-        refused locally and the dispatcher moves idle -> unreachable.
+        refused locally and the dispatcher moves idle -> unreachable. The epoch
+        is bound, as it is on a running instance after the upgrade.
         """
         world = backlog_world
+        world.bind_active_epoch()
         world.log_turn(session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use rust")
         monkeypatch.setenv("MIST_EXTRACTION_INFERENCE", "service")
         monkeypatch.setenv("MIST_EXTRACTION_SERVICE_URL", "http://127.0.0.1:9")

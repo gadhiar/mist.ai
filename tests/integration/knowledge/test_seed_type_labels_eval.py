@@ -1,9 +1,12 @@
-"""MIS-177 D2 against real Neo4j: the seed writes types as `entity_type`, not labels.
+"""Typed labels against real Neo4j: each seed node carries its own type label.
 
-Unit fakes pin the query text (`test_seed_applier.py`, `test_seed_gates.py`);
-only Neo4j shows what `SET n:User REMOVE n:A:B:...` leaves on a node, including
-one the MERGE matched rather than created, and that `check_node_definitions`
-binds the result.
+The seed writes the type as `entity_type` and, since typed labels (6 Nov,
+reversing MIS-177 D2, under which an `:__Entity__` node kept only `:User`), as
+the node's one ontology type label. Unit fakes pin the query text
+(`test_seed_applier.py`, `test_seed_gates.py`); only Neo4j shows what
+`SET n:<Type> REMOVE n:A:B:...` leaves on a node, including one the MERGE
+matched rather than created, and that `check_node_definitions` binds the
+result.
 
 Runs ONLY against the disposable eval instance (docker-compose.eval-neo4j.yml)
 and skips when it is not reachable. It empties that instance first and last.
@@ -113,14 +116,20 @@ def _labels_by_id(conn) -> dict[str, set[str]]:
     return {row["id"]: set(row["labels"]) for row in rows}
 
 
-def test_seed_writes_type_labels_only_where_they_are_invariants(eval_connection):
+def test_seed_writes_each_node_its_own_type_label(eval_connection):
     conn = eval_connection
-    # A node an earlier (pre-MIS-177) seed wrote: seed-stamped, and carrying
-    # the type label that seed used to SET. The MERGE matches it; the REMOVE
-    # must strip the label.
+    # Two nodes earlier seeds wrote, both seed-stamped. `lbl-acme` carries a
+    # stray type label (an older seed authored another type); `lbl-rust` was
+    # seeded under MIS-177 D2 and carries none. The MERGE matches both: the SET
+    # must add the node's own label and the REMOVE must strip the stray one.
     conn.execute_write(
-        "CREATE (:__Entity__:Organization {id: 'lbl-acme', entity_type: 'Organization', "
+        "CREATE (:__Entity__:Project {id: 'lbl-acme', entity_type: 'Project', "
         "display_name: 'Acme', provenance: 'seed', seed_version: $v})",
+        {"v": _SEED_VERSION},
+    )
+    conn.execute_write(
+        "CREATE (:__Entity__ {id: 'lbl-rust', entity_type: 'Technology', "
+        "display_name: 'Rust', provenance: 'seed', seed_version: $v})",
         {"v": _SEED_VERSION},
     )
 
@@ -128,8 +137,8 @@ def test_seed_writes_type_labels_only_where_they_are_invariants(eval_connection)
 
     labels = _labels_by_id(conn)
     assert labels["lbl-user"] == {ENTITY_LABEL, "User"}
-    assert labels["lbl-rust"] == {ENTITY_LABEL}
-    assert labels["lbl-acme"] == {ENTITY_LABEL}
+    assert labels["lbl-rust"] == {ENTITY_LABEL, "Technology"}
+    assert labels["lbl-acme"] == {ENTITY_LABEL, "Organization"}
     assert labels["lbl-mist"] == {SELF_MODEL_LABEL, "MistIdentity"}
     assert labels["lbl-trait"] == {SELF_MODEL_LABEL, "MistTrait"}
 
@@ -146,15 +155,31 @@ def test_seed_writes_type_labels_only_where_they_are_invariants(eval_connection)
     assert gate.passed, gate.failures
 
 
-def test_node_definitions_gate_fails_on_a_stray_label_or_a_wrong_entity_type(eval_connection):
+def test_node_definitions_gate_fails_on_a_stray_or_missing_label_or_a_wrong_type(
+    eval_connection,
+):
     conn = eval_connection
     apply_seed_documents(conn, _documents(), seed_version=_SEED_VERSION, now_iso=_NOW)
 
-    conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-rust'}) SET n:Technology", {})
+    conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-rust'}) SET n:Project", {})
     conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-acme'}) SET n.entity_type = 'Project'", {})
+    conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-user'}) REMOVE n:User", {})
 
     gate = check_node_definitions(conn, _documents(), seed_version=_SEED_VERSION)
     assert not gate.passed
     failed = " ".join(gate.failures)
-    assert "'lbl-rust'" in failed and "'lbl-acme'" in failed, gate.failures
-    assert len(gate.failures) == 2, gate.failures
+    for node_id in ("'lbl-rust'", "'lbl-acme'", "'lbl-user'"):
+        assert node_id in failed, gate.failures
+    assert len(gate.failures) == 3, gate.failures
+
+
+def test_node_definitions_gate_fails_on_a_node_seeded_without_its_type_label(eval_connection):
+    """A graph seeded under MIS-177 D2 fails `seed-verify` until it is reseeded."""
+    conn = eval_connection
+    apply_seed_documents(conn, _documents(), seed_version=_SEED_VERSION, now_iso=_NOW)
+
+    conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-acme'}) REMOVE n:Organization", {})
+
+    gate = check_node_definitions(conn, _documents(), seed_version=_SEED_VERSION)
+    assert not gate.passed
+    assert len(gate.failures) == 1 and "'lbl-acme'" in gate.failures[0], gate.failures

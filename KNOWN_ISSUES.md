@@ -183,6 +183,29 @@ the adjacent findings it deliberately left out of scope.
   gaming mode at all (entry above), so the goal that turns speech on needs the low level, or a
   safe release, first.
 
+## Extraction Epoch Identity (2026-11-09, goal mist-extraction-epoch-identity)
+
+Gaps the epoch identity work (PR 40) exposed and left out of its scope.
+
+- [ ] **A scope timeout degrades the scope to "unknown", and Stage 2 reads it as a real scope.**
+  (`backend/extraction_service/engine.py:611-617`,
+  `backend/knowledge/extraction/ontology_extractor.py:72-77`.) The failure is logged and recorded
+  as the warning `scope_classification_failed`, but the turn is still extracted with the subject
+  hint "unknown", and nothing keys or flags the result as degraded.
+
+- [ ] **model_hash is a free string, not verified against the weights.** The model file name is
+  the only recorded link to the weights the service loads.
+
+- [ ] **Gate 3's TTL makes duplicate decisions depend on dispatch timing**
+  (`backend/knowledge/extraction/pipeline.py:558-560`),
+  so a fill can decide differently from the live path for the same turns.
+
+- [ ] **In-process rows carry no service record.** Rows written without the dispatcher land in the
+  3-part cache namespace unchecked against its claim, and a keyed epoch does not see them.
+
+- [ ] **The declared llama-server settings are trusted, apart from n_ctx,** until a `/props`
+  field set is verified against llama.cpp build b11151.
+
 ---
 
 ## P3: Maintenance Risk / Technical Debt

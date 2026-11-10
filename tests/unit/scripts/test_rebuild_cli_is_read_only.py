@@ -789,3 +789,114 @@ class TestTheJournalIsNonDurable:
             "job rows nothing reads into the LIVE event store, twice per invocation."
         )
         assert regen._journal.durable is False
+
+
+# The identity a test binds an epoch to; any well-formed pair serves.
+SERVING = "si1-" + "a" * 64
+DISPATCH = "di1-" + "b" * 64
+
+
+def _bind(db_path: str, epoch_id: int, namespace: str | None) -> None:
+    store = EventStore(db_path)
+    assert store.bind_epoch_identity(
+        epoch_id=epoch_id,
+        serving_identity=SERVING,
+        serving_components={"adapter": "fake"},
+        dispatch_identity=DISPATCH,
+        dispatch_components={"history_messages": 10},
+        identity_namespace=namespace,
+        source="adopted",
+        evidence={},
+        bound_at=EPOCH_TS,
+    )
+    store.close()
+
+
+def _build_epoch(db_path: str, epoch_id: int):
+    """`_build` with `--epoch <epoch_id>` rather than the active epoch."""
+    import scripts.mist_admin as mist_admin
+
+    with ExitStack() as stack:
+        for target in (EMBEDDINGS, GRAPH_STORE, GRAPH_EXECUTOR, BUILD_PIPELINE, STAGING_SEEDER):
+            stack.enter_context(patch(target))
+        stack.enter_context(
+            patch(LOAD_SEED, lambda _dir: [SimpleNamespace(seed_version="test-seed-1")])
+        )
+        return mist_admin._build_log_regenerator(_backend_stub(db_path), object(), epoch_id)
+
+
+class TestTheEpochCarriesItsIdentityNamespace:
+    """The epoch dict names the namespace its rows are read from (`LogRegenerator`)."""
+
+    def test_a_keyed_epoch_reads_its_keyed_namespace(self, tmp_path):
+        from backend.knowledge.extraction_cache import keyed_namespace
+
+        # Arrange
+        db_path = _seed_replay_sources(tmp_path)
+        namespace = keyed_namespace(SERVING, DISPATCH)
+        _bind(db_path, 1, namespace)
+        stores = (Path(db_path), tmp_path / "extraction_cache.db")
+        before = _store_fingerprint(*stores)
+
+        # Act
+        _regen, epoch = _build(db_path)
+
+        # Assert -- and reading the binding wrote nothing
+        assert epoch["identity_namespace"] == namespace
+        assert _store_fingerprint(*stores) == before
+
+    def test_an_epoch_chosen_by_id_reads_its_own_binding(self, tmp_path):
+        from backend.knowledge.extraction_cache import keyed_namespace
+
+        db_path = _seed_replay_sources(tmp_path)
+        _bind(db_path, 1, keyed_namespace(SERVING, DISPATCH))
+
+        _regen, epoch = _build_epoch(db_path, 1)
+
+        assert epoch["epoch_id"] == 1
+        assert epoch["identity_namespace"] == keyed_namespace(SERVING, DISPATCH)
+
+    def test_an_unbound_epoch_reads_the_3_part_namespace(self, tmp_path):
+        db_path = _seed_replay_sources(tmp_path)
+
+        _regen, epoch = _build(db_path)
+
+        assert epoch["identity_namespace"] is None
+
+    def test_a_store_from_before_bindings_existed_reads_the_3_part_namespace(self, tmp_path):
+        import sqlite3
+
+        # Arrange -- no epoch_identity table: a store this code never initialized
+        db_path = _seed_replay_sources(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE epoch_identity")
+        conn.commit()
+        conn.close()
+
+        # Act
+        _regen, epoch = _build(db_path)
+
+        # Assert
+        assert epoch["identity_namespace"] is None
+
+    def test_a_cache_from_before_namespaces_is_refused_not_tracebacked(self, tmp_path):
+        import sqlite3
+
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- an extraction_cache table without `identity_namespace`, the
+        # column the `initialize()` this command never calls adds
+        db_path = _seed_replay_sources(tmp_path)
+        cache_path = tmp_path / "extraction_cache.db"
+        cache_path.unlink()
+        conn = sqlite3.connect(str(cache_path))
+        conn.execute(
+            "CREATE TABLE extraction_cache (event_id TEXT, ontology_version TEXT, "
+            "extraction_version TEXT, model_hash TEXT, outcome TEXT)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Act / Assert
+        with pytest.raises(ColdCacheError, match="extraction_cache.identity_namespace"):
+            _build(db_path)

@@ -35,12 +35,17 @@ def _put_cached(world, event_id: str, *, entity: str, created_at: str) -> None:
 
 
 class TestServiceDown:
+    """A bound epoch's service goes down. An unbound epoch waits to be bound instead
+    (`test_identity_guard.py`, `TestBindingWaitsForTheService`).
+    """
+
     @pytest.mark.asyncio
     async def test_five_logged_turns_stay_in_the_backlog_while_the_service_is_down(
         self, backlog_world, ts
     ):
         # Arrange
         world = backlog_world
+        world.bind_active_epoch()
         world.service.down = True
         for i in range(5):
             world.log_turn(
@@ -65,6 +70,7 @@ class TestServiceDown:
     async def test_backlog_drains_once_the_service_comes_back(self, backlog_world, ts):
         # Arrange
         world = backlog_world
+        world.bind_active_epoch()
         world.service.down = True
         for i in range(3):
             world.log_turn(

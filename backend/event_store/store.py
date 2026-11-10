@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,29 @@ logger = logging.getLogger(__name__)
 CUTOVER_STATES = ("filling", "ready", "checked", "promoted", "abandoned")
 OPEN_CUTOVER_STATES = ("filling", "ready", "checked")
 _CUTOVER_CHECK_COLUMNS = frozenset({"rebuild_job_id", "rebuilt_through_event_id", "check_report"})
+
+# Epoch identity binding (mist-extraction-epoch-identity). See `epoch_identity`
+# in schema.sql. The sources a caller may bind with; 'promoted' is written only
+# by the two promotion transactions, which copy a cutover's binding.
+BINDING_SOURCES = ("adopted", "first-contact", "operator")
+SOURCE_PROMOTED = "promoted"
+# Nullable TEXT columns on `epoch_cutover`, in declaration order; the guarded
+# ALTER in `initialize` adds any an older table lacks.
+_CUTOVER_BINDING_COLUMNS = (
+    "serving_identity",
+    "serving_components",
+    "dispatch_identity",
+    "dispatch_components",
+    "identity_namespace",
+    "binding_source",
+    "binding_evidence",
+    "bound_at",
+)
+
+
+def _dumps(value: Mapping[str, Any]) -> str:
+    """A JSON column value with a stable key order."""
+    return json.dumps(dict(value), sort_keys=True)
 
 
 class EpochCutoverStateError(MistError):
@@ -111,6 +135,15 @@ class EventStore:
                 "ALTER TABLE epoch_ledger ADD COLUMN provisional INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("Event store: added `provisional` column to epoch_ledger")
+
+        # The cutover's identity binding (mist-extraction-epoch-identity): the
+        # same guard, one nullable column at a time, so a cutover written
+        # before them reads as unbound and no existing value changes.
+        cutover_columns = {row[1] for row in conn.execute("PRAGMA table_info(epoch_cutover)")}
+        for name in _CUTOVER_BINDING_COLUMNS:
+            if name not in cutover_columns:
+                conn.execute(f"ALTER TABLE epoch_cutover ADD COLUMN {name} TEXT")
+                logger.info("Event store: added `%s` column to epoch_cutover", name)
 
         logger.info("Event store initialized at %s", self.db_path)
 
@@ -529,6 +562,12 @@ class EventStore:
         """Return the latest epoch row as a dict, or None if the ledger is empty."""
         conn = self._get_connection()
         row = conn.execute("SELECT * FROM epoch_ledger ORDER BY epoch_id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def get_epoch(self, epoch_id: int) -> dict[str, Any] | None:
+        """One ledger row by id, or None."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM epoch_ledger WHERE epoch_id = ?", (epoch_id,)).fetchone()
         return dict(row) if row else None
 
     def list_epochs(self) -> list[dict[str, Any]]:
@@ -1265,7 +1304,10 @@ class EventStore:
         Inside a single `BEGIN IMMEDIATE`:
 
         1. append the candidate's stamp triple to `epoch_ledger` (prev = the
-           cutover's source epoch), which makes it the active epoch;
+           cutover's source epoch), which makes it the active epoch, and, when
+           the cutover is bound, copy its binding to `epoch_identity` (source
+           'promoted', the cutover's namespace), so the new epoch is never
+           live unbound when its candidate was bound;
         2. write the new epoch's `extraction_activation` row FIRST-HAND, with
            `legacy_unextracted = 0`;
         3. mark `applied` (source 'cutover') exactly the logged turns up to and
@@ -1342,6 +1384,7 @@ class EventStore:
                 ),
             )
             epoch_id = int(cursor.lastrowid)
+            self._copy_cutover_binding(conn, row, epoch_id=epoch_id, bound_at=activated_at)
             self._promotion_fault_point("ledger_appended")
             conn.execute(
                 "INSERT INTO extraction_activation (epoch_id, activated_at, turns_at_activation, "
@@ -1422,7 +1465,8 @@ class EventStore:
            `conversation_turn_events` has NO row (a turn logged after the
            caller's own check is refused here, under the write lock);
         2. append the candidate's stamp triple to `epoch_ledger` (prev = the
-           source epoch, provisional 0);
+           source epoch, provisional 0), and copy a bound cutover's binding to
+           `epoch_identity`, as `promote_epoch_cutover` does;
         3. write the new epoch's `extraction_activation` row first-hand, with
            `turns_at_activation` = `marked_applied` = `legacy_unextracted` = 0
            (the log is empty), so `BacklogStore.ensure_activation` never runs
@@ -1509,6 +1553,7 @@ class EventStore:
                 ),
             )
             epoch_id = int(cursor.lastrowid)
+            self._copy_cutover_binding(conn, row, epoch_id=epoch_id, bound_at=activated_at)
             self._promotion_fault_point("ledger_appended")
             conn.execute(
                 "INSERT INTO extraction_activation (epoch_id, activated_at, turns_at_activation, "
@@ -1528,6 +1573,334 @@ class EventStore:
             conn.execute("ROLLBACK")
             raise
         return {"epoch_id": epoch_id, "turns_at_activation": turns, "marked_applied": 0}
+
+    # ------------------------------------------------------------------
+    # Epoch identity (mist-extraction-epoch-identity)
+    # ------------------------------------------------------------------
+
+    def get_epoch_identity(self, epoch_id: int) -> dict[str, Any] | None:
+        """An epoch's binding, its JSON columns decoded, or None while it is unbound."""
+        row = (
+            self._get_connection()
+            .execute("SELECT * FROM epoch_identity WHERE epoch_id = ?", (epoch_id,))
+            .fetchone()
+        )
+        if row is None:
+            return None
+        binding = dict(row)
+        for name in ("serving_components", "dispatch_components", "evidence"):
+            binding[name] = self._decode_report(binding[name])
+        return binding
+
+    def get_cutover_identity(self, cutover_id: int) -> dict[str, Any] | None:
+        """A cutover's binding in the `get_epoch_identity` shape, or None while unbound.
+
+        The keys are those of `get_epoch_identity`, with `cutover_id` in place
+        of `epoch_id`; `source` and `evidence` read the `binding_source` and
+        `binding_evidence` columns.
+        """
+        row = (
+            self._get_connection()
+            .execute(
+                "SELECT * FROM epoch_cutover WHERE cutover_id = ? AND serving_identity IS NOT NULL",
+                (cutover_id,),
+            )
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return {
+            "cutover_id": int(row["cutover_id"]),
+            "serving_identity": row["serving_identity"],
+            "serving_components": self._decode_report(row["serving_components"]),
+            "dispatch_identity": row["dispatch_identity"],
+            "dispatch_components": self._decode_report(row["dispatch_components"]),
+            "identity_namespace": row["identity_namespace"],
+            "source": row["binding_source"],
+            "evidence": self._decode_report(row["binding_evidence"]),
+            "bound_at": row["bound_at"],
+        }
+
+    def bind_epoch_identity(
+        self,
+        *,
+        epoch_id: int,
+        serving_identity: str,
+        serving_components: Mapping[str, Any],
+        dispatch_identity: str,
+        dispatch_components: Mapping[str, Any],
+        identity_namespace: str | None,
+        source: str,
+        evidence: Mapping[str, Any],
+        bound_at: str,
+    ) -> bool:
+        """Bind a ledger epoch to its identity, once.
+
+        A binding is never updated: an epoch's cache namespace decides which
+        rows it reads, so moving it would silently change what the backlog
+        sees. A second call writes nothing and returns False, so two
+        dispatchers racing to bind the same epoch leave the first binding.
+
+        Args:
+            identity_namespace: None for the 3-part cache key, or the keyed
+                namespace `f"{serving_identity}+{dispatch_identity}"`.
+            source: One of `BINDING_SOURCES`; 'promoted' is written only by
+                promotion.
+            evidence: What the binding verified and what it could not
+                (Migration, "The evidence, stated honestly"), stored as JSON.
+
+        Returns:
+            True when this call wrote the binding.
+
+        Raises:
+            ValueError: An unknown source, a namespace other than None or the
+                keyed form, or an epoch_id that is not in the ledger.
+        """
+        self._check_binding(serving_identity, dispatch_identity, identity_namespace, source)
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            exists = conn.execute(
+                "SELECT 1 FROM epoch_ledger WHERE epoch_id = ?", (epoch_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"epoch {epoch_id} is not in the epoch ledger")
+            cursor = conn.execute(
+                "INSERT INTO epoch_identity (epoch_id, serving_identity, serving_components, "
+                "dispatch_identity, dispatch_components, identity_namespace, source, evidence, "
+                "bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(epoch_id) DO NOTHING",
+                (
+                    epoch_id,
+                    serving_identity,
+                    _dumps(serving_components),
+                    dispatch_identity,
+                    _dumps(dispatch_components),
+                    identity_namespace,
+                    source,
+                    _dumps(evidence),
+                    bound_at,
+                ),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount > 0
+
+    def bind_cutover_identity(
+        self,
+        cutover_id: int,
+        *,
+        serving_identity: str,
+        serving_components: Mapping[str, Any],
+        dispatch_identity: str,
+        dispatch_components: Mapping[str, Any],
+        identity_namespace: str | None,
+        source: str,
+        evidence: Mapping[str, Any],
+        bound_at: str,
+    ) -> bool:
+        """Bind an open cutover candidate to its identity, once, in one transaction.
+
+        The update applies only while the cutover is open and unbound
+        (`WHERE serving_identity IS NULL`), so a second call, or a call on a
+        promoted or abandoned cutover, writes nothing and returns False.
+
+        A keyed bind (`identity_namespace` not None) of a 'ready' or 'checked'
+        cutover also moves it back to 'filling' and clears `rebuild_job_id`,
+        `rebuilt_through_event_id` and `check_report`, in the same
+        transaction: its coverage and its check were read in the 3-part
+        namespace, which is no longer its own. Both promotion paths re-check
+        the state under their own write lock, so a promotion racing this bind
+        either commits first (the bind then finds no open cutover) or refuses.
+        A 3-part bind leaves the state and the check columns as they are.
+
+        Args:
+            identity_namespace: As for `bind_epoch_identity`.
+            source: One of `BINDING_SOURCES`.
+
+        Returns:
+            True when this call wrote the binding.
+
+        Raises:
+            ValueError: As for `bind_epoch_identity`, except that a missing
+                cutover returns False.
+        """
+        self._check_binding(serving_identity, dispatch_identity, identity_namespace, source)
+        placeholders = ", ".join("?" * len(OPEN_CUTOVER_STATES))
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state, serving_identity FROM epoch_cutover WHERE cutover_id = ?",
+                (cutover_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] not in OPEN_CUTOVER_STATES
+                or row["serving_identity"] is not None
+            ):
+                conn.execute("COMMIT")
+                return False
+            reset = identity_namespace is not None and row["state"] in ("ready", "checked")
+            assignments = [
+                "serving_identity = ?",
+                "serving_components = ?",
+                "dispatch_identity = ?",
+                "dispatch_components = ?",
+                "identity_namespace = ?",
+                "binding_source = ?",
+                "binding_evidence = ?",
+                "bound_at = ?",
+            ]
+            params: list[Any] = [
+                serving_identity,
+                _dumps(serving_components),
+                dispatch_identity,
+                _dumps(dispatch_components),
+                identity_namespace,
+                source,
+                _dumps(evidence),
+                bound_at,
+            ]
+            if reset:
+                assignments += [
+                    "state = 'filling'",
+                    "rebuild_job_id = NULL",
+                    "rebuilt_through_event_id = NULL",
+                    "check_report = NULL",
+                    "updated_at = ?",
+                ]
+                params.append(bound_at)
+            cursor = conn.execute(
+                f"UPDATE epoch_cutover SET {', '.join(assignments)} "  # nosec B608 -- fixed names
+                f"WHERE cutover_id = ? AND serving_identity IS NULL AND state IN ({placeholders})",
+                [*params, cutover_id, *OPEN_CUTOVER_STATES],
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        if reset:
+            logger.warning(
+                "cutover %d bound to keyed namespace %s while %r: back to 'filling', "
+                "its check cleared",
+                cutover_id,
+                identity_namespace,
+                row["state"],
+            )
+        return cursor.rowcount > 0
+
+    def accept_identity(
+        self,
+        target_id: int,
+        *,
+        serving_identity: str,
+        dispatch_identity: str,
+        note: str,
+        accepted_at: str,
+    ) -> None:
+        """Record the operator's acceptance of an identity for an epoch or a candidate.
+
+        `target_id` is an epoch_id, or -cutover_id for a candidate. A later
+        acceptance for the same target replaces the earlier one: it is the
+        operator's current instruction, and the binding it leads to records
+        its own evidence.
+        """
+        self._get_connection().execute(
+            "INSERT INTO epoch_identity_acceptance (target_id, serving_identity, "
+            "dispatch_identity, note, accepted_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(target_id) DO UPDATE SET serving_identity = excluded.serving_identity, "
+            "dispatch_identity = excluded.dispatch_identity, note = excluded.note, "
+            "accepted_at = excluded.accepted_at",
+            (target_id, serving_identity, dispatch_identity, note, accepted_at),
+        )
+
+    def get_identity_acceptance(self, target_id: int) -> dict[str, Any] | None:
+        """The operator's acceptance for a target (epoch_id or -cutover_id), or None."""
+        row = (
+            self._get_connection()
+            .execute("SELECT * FROM epoch_identity_acceptance WHERE target_id = ?", (target_id,))
+            .fetchone()
+        )
+        return dict(row) if row is not None else None
+
+    def legacy_claims(self, extraction_version: str, model_hash: str) -> list[tuple[str, str]]:
+        """Who claims the 3-part cache namespace of an (extraction_version, model_hash) pair.
+
+        The distinct (serving_identity, dispatch_identity) pairs of every bound
+        epoch and every bound cutover, open or closed, whose stamps are this
+        pair and whose namespace is the 3-part one. A keyed binding claims
+        nothing: its rows are under its own key. Sorted, for a stable reading.
+        """
+        rows = (
+            self._get_connection()
+            .execute(
+                "SELECT i.serving_identity, i.dispatch_identity FROM epoch_identity i "
+                "JOIN epoch_ledger l ON l.epoch_id = i.epoch_id "
+                "WHERE l.extraction_version = ? AND l.model_hash = ? "
+                "AND i.identity_namespace IS NULL "
+                "UNION "
+                "SELECT serving_identity, dispatch_identity FROM epoch_cutover "
+                "WHERE extraction_version = ? AND model_hash = ? "
+                "AND serving_identity IS NOT NULL AND identity_namespace IS NULL "
+                "ORDER BY 1, 2",
+                (extraction_version, model_hash, extraction_version, model_hash),
+            )
+            .fetchall()
+        )
+        return [(str(r[0]), str(r[1])) for r in rows]
+
+    @staticmethod
+    def _check_binding(
+        serving_identity: str, dispatch_identity: str, identity_namespace: str | None, source: str
+    ) -> None:
+        """Refuse a binding no reader could interpret."""
+        if source not in BINDING_SOURCES:
+            raise ValueError(f"binding source {source!r} is not one of {BINDING_SOURCES}")
+        keyed = f"{serving_identity}+{dispatch_identity}"
+        if identity_namespace is not None and identity_namespace != keyed:
+            raise ValueError(
+                f"identity_namespace {identity_namespace!r} is neither None (3-part) nor {keyed!r}"
+            )
+
+    def _copy_cutover_binding(
+        self, conn: sqlite3.Connection, row: sqlite3.Row, *, epoch_id: int, bound_at: str
+    ) -> None:
+        """Inside a promotion: bind the new epoch to its bound cutover's identity.
+
+        An unbound cutover writes nothing, and the new epoch binds at the
+        dispatcher's first contact. Runs on the promotion's connection, inside
+        its transaction, so a crash leaves neither the ledger row nor this one.
+        """
+        if row["serving_identity"] is None:
+            return
+        evidence = {
+            "cutover_id": int(row["cutover_id"]),
+            "cutover_binding_source": row["binding_source"],
+            "cutover_binding_evidence": (
+                None
+                if row["binding_evidence"] is None
+                else self._decode_report(row["binding_evidence"])
+            ),
+        }
+        conn.execute(
+            "INSERT INTO epoch_identity (epoch_id, serving_identity, serving_components, "
+            "dispatch_identity, dispatch_components, identity_namespace, source, evidence, "
+            "bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                epoch_id,
+                row["serving_identity"],
+                row["serving_components"],
+                row["dispatch_identity"],
+                row["dispatch_components"],
+                row["identity_namespace"],
+                SOURCE_PROMOTED,
+                _dumps(evidence),
+                bound_at,
+            ),
+        )
 
     @staticmethod
     def _decode_report(text: str) -> Any:

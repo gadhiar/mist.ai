@@ -153,6 +153,25 @@ def _nearest_rank_percentile(values: list[float], p: float) -> float:
     return sorted_vals[rank - 1]
 
 
+def _pooled_precision(tp: int, fp: int, fn: int) -> float:
+    return tp / (tp + fp) if (tp + fp) else 1.0
+
+
+def _pooled_recall(tp: int, fp: int, fn: int) -> float:
+    return tp / (tp + fn) if (tp + fn) else 1.0
+
+
+def _pooled_f1(tp: int, fp: int, fn: int) -> float:
+    return 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0
+
+
+_RATIO_KINDS = {
+    "precision": _pooled_precision,
+    "recall": _pooled_recall,
+    "f1": _pooled_f1,
+}
+
+
 def cluster_bootstrap_ratio_ci(
     per_probe_counts: dict[str, tuple[int, int, int]],
     *,
@@ -161,7 +180,7 @@ def cluster_bootstrap_ratio_ci(
     confidence: float,
     kind: str,
 ) -> tuple[float, float] | None:
-    """Cluster bootstrap CI for a precision/recall ratio metric, resampled by probe tag.
+    """Cluster bootstrap CI for a ratio metric of pooled counts, resampled by probe tag.
 
     `per_probe_counts` maps probe tag -> (tp, fp, fn) for the metric family
     (entity or relationship). Each replicate resamples probe tags with
@@ -172,8 +191,26 @@ def cluster_bootstrap_ratio_ci(
     `scripts.model_bench.analyse.cluster_bootstrap_ci` computes, and why this
     module does not reuse it for these metrics).
 
-    `kind` is "precision" (tp/(tp+fp)) or "recall" (tp/(tp+fn)).
+    `kind` selects the ratio each replicate computes:
+
+    - "precision": tp/(tp+fp), or 1.0 when tp+fp is 0;
+    - "recall": tp/(tp+fn), or 1.0 when tp+fn is 0;
+    - "f1": 2tp/(2tp+fp+fn), or 1.0 when 2tp+fp+fn is 0. Under the scorer's
+      zero-denominator rule this equals 2PR/(P+R) of the pooled precision and
+      recall, with 0.0 when P+R is 0. F1 needs its own replicates because it
+      cannot be built from separate precision and recall intervals: both read
+      the same true positives.
+
+    Every call seeds its own `random.Random(seed)` and draws tags in the same
+    order, so calls that share `per_probe_counts`, `seed` and `n_replicates`
+    see the same resamples whatever their `kind`.
+
+    Raises:
+        ValueError: `kind` is not one of the three above.
     """
+    ratio = _RATIO_KINDS.get(kind)
+    if ratio is None:
+        raise ValueError(f"unknown kind {kind!r}; expected one of {sorted(_RATIO_KINDS)}")
     tags = sorted(per_probe_counts)
     if not tags:
         return None
@@ -188,14 +225,107 @@ def cluster_bootstrap_ratio_ci(
             tp += t
             fp += f_p
             fn += f_n
-        if kind == "precision":
-            replicate_values.append(tp / (tp + fp) if (tp + fp) else 1.0)
-        else:
-            replicate_values.append(tp / (tp + fn) if (tp + fn) else 1.0)
+        replicate_values.append(ratio(tp, fp, fn))
     alpha = 1.0 - confidence
     lo = _nearest_rank_percentile(replicate_values, 100.0 * (alpha / 2.0))
     hi = _nearest_rank_percentile(replicate_values, 100.0 * (1.0 - alpha / 2.0))
     return (lo, hi)
+
+
+def cluster_bootstrap_paired_difference_ci(
+    first: dict[str, tuple[int, int, int]],
+    second: dict[str, tuple[int, int, int]],
+    *,
+    n_replicates: int,
+    seed: int,
+    confidence: float,
+    kind: str,
+) -> tuple[float, float] | None:
+    """Cluster bootstrap CI for ratio(second) minus ratio(first) over the same probe tags.
+
+    Two runs scored on the same probes are not independent samples: a hard probe is hard for
+    both. Each replicate therefore draws one resample of the shared tags, as
+    `cluster_bootstrap_ratio_ci` draws them (sorted tags, `random.Random(seed)`), pools each
+    run's counts over that one resample, and takes the difference of the two pooled ratios.
+    `kind` is one of that function's kinds.
+
+    Raises:
+        ValueError: `kind` is unknown, or the two runs' tag sets differ.
+    """
+    ratio = _RATIO_KINDS.get(kind)
+    if ratio is None:
+        raise ValueError(f"unknown kind {kind!r}; expected one of {sorted(_RATIO_KINDS)}")
+    if set(first) != set(second):
+        only = sorted(set(first) ^ set(second))
+        raise ValueError(f"the two runs' tags differ: {only}")
+    tags = sorted(first)
+    if not tags:
+        return None
+    rng = random.Random(seed)
+    n_tags = len(tags)
+    replicate_values: list[float] = []
+    for _ in range(n_replicates):
+        pooled = [[0, 0, 0], [0, 0, 0]]
+        for _ in range(n_tags):
+            tag = tags[rng.randrange(n_tags)]
+            for side, counts in zip(pooled, (first[tag], second[tag])):
+                for i in range(3):
+                    side[i] += counts[i]
+        replicate_values.append(ratio(*pooled[1]) - ratio(*pooled[0]))
+    alpha = 1.0 - confidence
+    lo = _nearest_rank_percentile(replicate_values, 100.0 * (alpha / 2.0))
+    hi = _nearest_rank_percentile(replicate_values, 100.0 * (1.0 - alpha / 2.0))
+    return (lo, hi)
+
+
+def per_probe_aligned_rel_counts(
+    per_probe: list[dict[str, Any]],
+) -> dict[str, tuple[int, int, int]]:
+    """Derive aligned (tp, fp, fn) per probe tag from `Report.per_probe`.
+
+    The aligned scoring counts the same gold relation keys as the exact one, so tp is
+    `gold_relationships` less the aligned misses, as `per_probe_rel_counts` derives it.
+    """
+    out: dict[str, tuple[int, int, int]] = {}
+    for p in per_probe:
+        fp = len(p["aligned_rel_fps"])
+        fn = len(p["aligned_rel_fns"])
+        out[p["tag"]] = (p["gold_relationships"] - fn, fp, fn)
+    return out
+
+
+def _aligned_figures(
+    report: Any, *, bootstrap_seed: int, bootstrap_b: int, bootstrap_confidence: float
+) -> dict[str, Any]:
+    """The summary's aligned relation figures, each None for a report without them."""
+    keys = (
+        "aligned_relationship_recall",
+        "aligned_relationship_precision",
+        "aligned_relationship_f1",
+        "id_agreement",
+    )
+    has_aligned = hasattr(report, "aligned_rel_tp") and all(
+        "aligned_rel_fns" in p and "aligned_rel_fps" in p for p in report.per_probe
+    )
+    if not has_aligned:
+        return dict.fromkeys(keys)
+    counts = per_probe_aligned_rel_counts(report.per_probe)
+    figures: dict[str, Any] = {}
+    for key, value, kind in (
+        (keys[0], report.aligned_rel_recall, "recall"),
+        (keys[1], report.aligned_rel_precision, "precision"),
+        (keys[2], report.aligned_rel_f1, "f1"),
+    ):
+        ci = cluster_bootstrap_ratio_ci(
+            counts,
+            n_replicates=bootstrap_b,
+            seed=bootstrap_seed,
+            confidence=bootstrap_confidence,
+            kind=kind,
+        )
+        figures[key] = {"value": value, "ci95": ci}
+    figures["id_agreement"] = report.id_agreement
+    return figures
 
 
 def per_probe_rel_counts(per_probe: list[dict[str, Any]]) -> dict[str, tuple[int, int, int]]:
@@ -241,6 +371,17 @@ def build_summary(
     """The aggregate `extraction_summary.json` document: the scorer's own metrics
     plus Wilson intervals and a probe-id cluster bootstrap CI, unchanged from
     what `score_extraction_run.Report` computes.
+
+    The `bootstrap` block holds intervals for entity precision and recall and
+    for relation precision, recall and F1 (`rel_f1`), each None for an empty
+    corpus. All five use the same seed, B and confidence, so the relation F1
+    interval comes from the same resamples as the relation precision and
+    recall intervals. Entity F1 has no interval.
+
+    Beside the block, `aligned_relationship_recall`, `aligned_relationship_precision` and
+    `aligned_relationship_f1` (each `{"value", "ci95"}`, the interval from the same seed, B
+    and confidence) and `id_agreement` carry the scorer's relations over aligned entity ids
+    (plan v8, D8). Each is None for a report from a scorer without aligned scoring.
 
     Also computes `complete` / `unmatched_probe_ids` (T6 reviewer finding 1b):
     the SAME invariant `score_extraction_run._gates_pass` checks at
@@ -335,7 +476,20 @@ def build_summary(
                 confidence=bootstrap_confidence,
                 kind="recall",
             ),
+            "rel_f1": cluster_bootstrap_ratio_ci(
+                rel_counts,
+                n_replicates=bootstrap_b,
+                seed=bootstrap_seed,
+                confidence=bootstrap_confidence,
+                kind="f1",
+            ),
         },
+        **_aligned_figures(
+            report,
+            bootstrap_seed=bootstrap_seed,
+            bootstrap_b=bootstrap_b,
+            bootstrap_confidence=bootstrap_confidence,
+        ),
     }
 
 

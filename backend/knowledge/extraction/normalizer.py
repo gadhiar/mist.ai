@@ -267,8 +267,10 @@ class EntityNormalizer:
         also sets properties.event_type='milestone' via setdefault so an existing
         value is never overwritten.
 
-        Pass 4: Metric compound-id from value + unit properties. Only fires when both
-        value and unit are present; skips silently otherwise.
+        Pass 4: Metric compound-id from the value, unit and quantity properties. It
+        rebuilds the id as `canonical_metric_id` when the value is present and a unit
+        or a quantity is (a count such as `180-max-queue-depth` has no unit). Otherwise
+        it reorders the existing id with `canonical_metric_id_from_id`.
 
         Pass 5: Unknown type -> Abstraction fallback. Fires when the post-pass-3 type
         is not in ALL_NODE_TYPE_NAMES.
@@ -284,16 +286,18 @@ class EntityNormalizer:
             entity["type"] = coerced
             etype = coerced
 
-        # Pass 4: compound-id canonicalization for Metric (id from value + unit).
-        # When structured props are present, rebuild as <value>-<unit> (canonical_metric_id).
-        # When props are absent, fall back to string-based value-position normalization
-        # (canonical_metric_id_from_id) so bare ids like `requests-per-second-12000`
-        # still collapse to the canonical `12000-requests-per-second`.
+        # Pass 4: compound-id canonicalization for Metric (id from value, unit, quantity).
+        # With a value and a unit or a quantity, rebuild as <value>-<unit>[-<quantity>]
+        # (canonical_metric_id), the same builder the F2 scorer uses. Otherwise fall back
+        # to string-based value-position normalization (canonical_metric_id_from_id) so
+        # bare ids like `requests-per-second-12000` still collapse to the canonical
+        # `12000-requests-per-second`.
         if etype == "Metric":
             props = entity.get("properties") or {}
             value, unit = props.get("value"), props.get("unit")
-            if value is not None and unit:
-                entity["id"] = canonical_metric_id(value, unit)
+            quantity = props.get("quantity")
+            if value is not None and (unit or quantity):
+                entity["id"] = canonical_metric_id(value, unit, quantity)
             else:
                 entity["id"] = canonical_metric_id_from_id(entity["id"])
 

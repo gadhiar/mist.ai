@@ -43,14 +43,85 @@ DIGEST_REF_PATTERN = re.compile(r"^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
 
 LOCAL_PROFILE = "extraction-local"
 
-# The ONLY required (`${VAR:?...}`) env var this file's local services may declare.
+# The ONLY required (`${VAR:?...}`) env vars this file's local services may declare.
 # A Tailscale key belongs to the host file only -- this allowlist is what pins that:
 # if a future edit adds another required var here (in particular TS_AUTHKEY), this
 # test fails rather than silently reintroducing the interpolation defect that made
 # `--profile extraction-local` fail with "required variable TS_AUTHKEY is missing".
-REQUIRED_VAR_ALLOWLIST = {"EXTRACTION_MODEL_HASH"}
+# EXTRACTION_LLM_DEVICE joins EXTRACTION_MODEL_HASH for the same reason it is
+# required: it keys the serving identity, and a deploy must name it (MIS-196).
+REQUIRED_VAR_ALLOWLIST = {"EXTRACTION_MODEL_HASH", "EXTRACTION_LLM_DEVICE"}
 
 REQUIRED_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+):\?")
+
+SERVING_IDENTITY_PATH = REPO_ROOT / "backend" / "knowledge" / "extraction" / "serving_identity.py"
+
+# Declared llama-server settings (MIS-196). The extraction service cannot see its
+# llama-server's launch flags, so compose declares each one to it as
+# `EXTRACTION_SERVER_<NAME>`, from the same expression the flag uses, and the
+# service folds them into its serving identity. Both compose files are checked
+# against the tables below by `declaration_problems`; the host test reuses them.
+SERVER_ENV_PREFIX = "EXTRACTION_SERVER_"
+LLAMA_ARG_PREFIX = "LLAMA_ARG_"
+
+# Every llama-server env var or command flag that is NOT declared, and why. A
+# setting is declared unless it provably cannot change the bytes the model
+# returns (plan mist-extraction-epoch-identity v1, "Setting classification").
+SERVER_SETTING_EXCLUSIONS: dict[str, str] = {
+    "LLAMA_ARG_HOST": "Transport: the address llama-server binds to.",
+    "LLAMA_ARG_PORT": "Transport: the port llama-server listens on.",
+    "LLAMA_ARG_METRICS": "Exposes the /metrics endpoint; no completion reads it.",
+    "--no-webui": "UI: turns off the bundled web UI.",
+    "-lm": (
+        "Loads the same weight bytes without mmap; the bytes in memory are identical, "
+        "so the output cannot change."
+    ),
+    "CUDA_CACHE_PATH": (
+        "Caches the driver's compile of the same PTX; the device it compiles for is "
+        "declared as EXTRACTION_SERVER_DEVICE."
+    ),
+    "CUDA_CACHE_MAXSIZE": "Caps that compile cache; the device is declared separately.",
+    "LLAMA_ARG_MODEL": (
+        "Keyed through EXTRACTION_MODEL_FILE: one expression feeds both, and "
+        "`model_path_problems` pins them equal."
+    ),
+}
+
+# Command flags -> the `EXTRACTION_SERVER_<NAME>` each is declared as. An env var
+# `LLAMA_ARG_<NAME>` is declared as `EXTRACTION_SERVER_<NAME>`, so it needs no entry.
+FLAG_DECLARATIONS: dict[str, str] = {
+    "-ncmoe": "N_CPU_MOE",
+    "-b": "BATCH",
+    "-ub": "UBATCH",
+    "--cache-ram": "CACHE_RAM_MIB",
+    "--temp": "TEMP",
+    "--top-p": "TOP_P",
+}
+
+# Declarations that name no llama-server flag: the image string, which pins every
+# flag left at its build default, and the GPU, which no flag names.
+STANDALONE_DECLARATIONS = {"IMAGE", "DEVICE"}
+
+# The keyed set the plan names for both files, so a dropped declaration fails even
+# when its flag is dropped with it.
+EXPECTED_SERVER_DECLARATIONS = {
+    "IMAGE",
+    "DEVICE",
+    "N_GPU_LAYERS",
+    "N_CPU_MOE",
+    "CTX_SIZE",
+    "BATCH",
+    "UBATCH",
+    "N_PARALLEL",
+    "CACHE_RAM_MIB",
+    "JINJA",
+    "REASONING",
+    "THINK",
+    "TEMP",
+    "TOP_P",
+}
+
+_NUMBER_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 
 
 def _compose() -> dict:
@@ -83,6 +154,122 @@ def _command(service: dict) -> list[str]:
 
 def _local_llm() -> dict:
     return _services()["mist-extraction-llm-local"]
+
+
+def _local_extraction() -> dict:
+    return _services()["mist-extraction-local"]
+
+
+def llama_server_settings(llm: dict) -> dict[str, str]:
+    """Every env var and command flag of a llama-server service, as name -> raw value.
+
+    A flag's value is the token after it unless that token is itself a flag; a
+    flag with no value (`--no-webui`) maps to "". A token that is neither a flag
+    nor a flag's value is reported as a setting of its own, so it cannot hide.
+    """
+    settings: dict[str, str] = {}
+    for entry in llm.get("environment", []):
+        key, _, value = str(entry).partition("=")
+        settings[key] = value
+    tokens = _command(llm)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        nxt = tokens[index + 1] if index + 1 < len(tokens) else None
+        if not token.startswith("-") or _NUMBER_PATTERN.match(token):
+            settings[f"<positional {token}>"] = token
+            index += 1
+            continue
+        assert token not in settings, f"command flag {token} is passed twice"
+        if nxt is not None and (not nxt.startswith("-") or _NUMBER_PATTERN.match(nxt)):
+            settings[token] = nxt
+            index += 2
+        else:
+            settings[token] = ""
+            index += 1
+    return settings
+
+
+def _declared_name(setting: str) -> str | None:
+    if setting.startswith(LLAMA_ARG_PREFIX):
+        return setting[len(LLAMA_ARG_PREFIX) :]
+    return FLAG_DECLARATIONS.get(setting)
+
+
+def _server_declarations(extraction: dict) -> dict[str, str]:
+    return {
+        key[len(SERVER_ENV_PREFIX) :]: value
+        for key, value in _env_dict(extraction).items()
+        if key.startswith(SERVER_ENV_PREFIX)
+    }
+
+
+def declaration_problems(llm: dict, extraction: dict) -> list[str]:
+    """What the extraction service fails to declare about its llama-server.
+
+    Every llama-server setting is either in `SERVER_SETTING_EXCLUSIONS` or declared
+    as `EXTRACTION_SERVER_<NAME>` with the identical raw compose string, so an
+    operator override reaches both containers through one `${...}` expression.
+    Every declaration names a setting the server has, so none goes stale.
+    """
+    declared = _server_declarations(extraction)
+    problems: list[str] = []
+    named: set[str] = set()
+    for setting, value in llama_server_settings(llm).items():
+        if setting in SERVER_SETTING_EXCLUSIONS:
+            continue
+        name = _declared_name(setting)
+        if name is None:
+            problems.append(
+                f"{setting} is neither declared to the extraction service nor in "
+                "SERVER_SETTING_EXCLUSIONS"
+            )
+            continue
+        named.add(name)
+        if name not in declared:
+            problems.append(f"{setting}={value!r} is not declared as {SERVER_ENV_PREFIX}{name}")
+        elif declared[name] != value:
+            problems.append(
+                f"{SERVER_ENV_PREFIX}{name}={declared[name]!r} differs from {setting}={value!r}"
+            )
+    if declared.get("IMAGE") != llm.get("image"):
+        problems.append(
+            f"{SERVER_ENV_PREFIX}IMAGE={declared.get('IMAGE')!r} differs from the "
+            f"llama-server image {llm.get('image')!r}"
+        )
+    for name in sorted(set(declared) - named - STANDALONE_DECLARATIONS):
+        problems.append(f"{SERVER_ENV_PREFIX}{name} names no setting of the llama-server")
+    return problems
+
+
+def model_path_problems(llm: dict, extraction: dict) -> list[str]:
+    """`LLAMA_ARG_MODEL` must load the file the service reports as `EXTRACTION_MODEL_FILE`."""
+    model = _env_dict(llm).get("LLAMA_ARG_MODEL")
+    model_file = _env_dict(extraction).get("EXTRACTION_MODEL_FILE")
+    if model_file is None or model != f"/models/{model_file}":
+        return [f"LLAMA_ARG_MODEL={model!r} is not /models/ + EXTRACTION_MODEL_FILE={model_file!r}"]
+    return []
+
+
+def device_problems(extraction: dict) -> list[str]:
+    """The device is required, with no default, from `EXTRACTION_LLM_DEVICE`."""
+    value = _server_declarations(extraction).get("DEVICE", "")
+    if not re.fullmatch(r"\$\{EXTRACTION_LLM_DEVICE:\?[^}]+\}", value):
+        return [f"{SERVER_ENV_PREFIX}DEVICE must be ${{EXTRACTION_LLM_DEVICE:?msg}}, got {value!r}"]
+    return []
+
+
+def required_server_keys() -> tuple[str, ...]:
+    """`REQUIRED_SERVER_KEYS` as `serving_identity.py` defines it, read by AST."""
+    tree = ast.parse(SERVING_IDENTITY_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "REQUIRED_SERVER_KEYS"
+        ):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError("REQUIRED_SERVER_KEYS not found in serving_identity.py")
 
 
 class TestLocalFileHasNoTailscale:
@@ -231,6 +418,128 @@ class TestModelHashRequired:
             r"\$\{EXTRACTION_MODEL_HASH:\?", value
         ), f"EXTRACTION_MODEL_HASH must use ${{VAR:?msg}}, got {value!r}"
         assert ":-" not in value, "EXTRACTION_MODEL_HASH must not have a default"
+
+
+class TestDeclaredServerSettings:
+    """The local service declares every keyed setting of its llama-server (MIS-196)."""
+
+    def test_every_llama_server_setting_is_declared_or_excluded(self) -> None:
+        assert declaration_problems(_local_llm(), _local_extraction()) == []
+
+    def test_the_declared_names_are_the_keyed_set(self) -> None:
+        assert set(_server_declarations(_local_extraction())) == EXPECTED_SERVER_DECLARATIONS
+
+    def test_the_image_repeats_the_llama_server_image(self) -> None:
+        declared = _server_declarations(_local_extraction())
+        assert declared["IMAGE"] == _local_llm()["image"] == PINNED_IMAGE
+
+    def test_ctx_size_is_the_expression_that_feeds_llama_server(self) -> None:
+        declared = _server_declarations(_local_extraction())
+        assert declared["CTX_SIZE"] == _env_dict(_local_llm())["LLAMA_ARG_CTX_SIZE"]
+
+    def test_the_device_is_required_with_no_default(self) -> None:
+        assert device_problems(_local_extraction()) == []
+
+    def test_the_model_path_is_pinned_to_the_model_file(self) -> None:
+        assert model_path_problems(_local_llm(), _local_extraction()) == []
+
+    def test_every_required_server_key_is_declared(self) -> None:
+        declared = _server_declarations(_local_extraction())
+        for key in required_server_keys():
+            assert declared.get(key.upper()), f"{SERVER_ENV_PREFIX}{key.upper()} is empty"
+
+
+class TestTheDeclarationCheckCanFail:
+    """Guards the checker itself: each kind of drift is reported, not passed."""
+
+    def _pair(self) -> tuple[dict, dict]:
+        return _local_llm(), _local_extraction()
+
+    def test_an_undeclared_flag_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        llm["command"] = [*llm["command"], "--min-p", "0.05"]
+        problems = declaration_problems(llm, extraction)
+        assert any("--min-p" in problem for problem in problems), problems
+
+    def test_an_undeclared_env_var_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        llm["environment"] = [*llm["environment"], "LLAMA_ARG_FLASH_ATTN=on"]
+        problems = declaration_problems(llm, extraction)
+        assert any("LLAMA_ARG_FLASH_ATTN" in problem for problem in problems), problems
+
+    def test_a_non_llama_arg_env_var_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        llm["environment"] = [*llm["environment"], "GGML_CUDA_FORCE_MMQ=1"]
+        problems = declaration_problems(llm, extraction)
+        assert any("GGML_CUDA_FORCE_MMQ" in problem for problem in problems), problems
+
+    def test_a_differing_value_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        llm["environment"] = [
+            "LLAMA_ARG_CTX_SIZE=32768" if str(entry).startswith("LLAMA_ARG_CTX_SIZE=") else entry
+            for entry in llm["environment"]
+        ]
+        problems = declaration_problems(llm, extraction)
+        assert any("EXTRACTION_SERVER_CTX_SIZE" in problem for problem in problems), problems
+
+    def test_a_stale_declaration_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        extraction["environment"] = [*extraction["environment"], "EXTRACTION_SERVER_MIN_P=0.05"]
+        problems = declaration_problems(llm, extraction)
+        assert any("EXTRACTION_SERVER_MIN_P" in problem for problem in problems), problems
+
+    def test_a_differing_image_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        llm["image"] = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+        problems = declaration_problems(llm, extraction)
+        assert any("EXTRACTION_SERVER_IMAGE" in problem for problem in problems), problems
+
+    def test_a_device_default_is_reported(self) -> None:
+        _, extraction = self._pair()
+        extraction["environment"] = [
+            (
+                "EXTRACTION_SERVER_DEVICE=${EXTRACTION_LLM_DEVICE:-rtx-4070-super}"
+                if str(entry).startswith("EXTRACTION_SERVER_DEVICE=")
+                else entry
+            )
+            for entry in extraction["environment"]
+        ]
+        assert device_problems(extraction)
+
+    def test_a_drifted_model_path_is_reported(self) -> None:
+        llm, extraction = self._pair()
+        llm["environment"] = [
+            (
+                "LLAMA_ARG_MODEL=/models/other.gguf"
+                if str(entry).startswith("LLAMA_ARG_MODEL=")
+                else entry
+            )
+            for entry in llm["environment"]
+        ]
+        assert model_path_problems(llm, extraction)
+
+
+class TestServerSettingExclusions:
+    def test_every_exclusion_carries_a_reason(self) -> None:
+        for setting, reason in SERVER_SETTING_EXCLUSIONS.items():
+            assert reason.strip(), f"{setting} is excluded with no reason"
+
+    def test_every_exclusion_names_a_setting_one_of_the_files_uses(self) -> None:
+        with (REPO_ROOT / "docker" / "extraction" / "compose.host.yml").open(
+            encoding="utf-8"
+        ) as fh:
+            host_llm = yaml.safe_load(fh)["services"]["mist-extraction-llm-host"]
+        used = set(llama_server_settings(_local_llm())) | set(llama_server_settings(host_llm))
+        assert set(SERVER_SETTING_EXCLUSIONS) <= used, set(SERVER_SETTING_EXCLUSIONS) - used
+
+    def test_no_setting_is_both_excluded_and_declared(self) -> None:
+        excluded_names = {_declared_name(setting) for setting in SERVER_SETTING_EXCLUSIONS}
+        assert excluded_names.isdisjoint(EXPECTED_SERVER_DECLARATIONS)
+
+    def test_the_required_keys_are_in_the_keyed_set(self) -> None:
+        names = {key.upper() for key in required_server_keys()}
+        assert names == {"IMAGE", "DEVICE", "CTX_SIZE"}
+        assert names <= EXPECTED_SERVER_DECLARATIONS
 
 
 class TestLocalLlmHasNoCudaCache:

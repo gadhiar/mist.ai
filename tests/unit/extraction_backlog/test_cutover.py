@@ -461,10 +461,33 @@ def _fake_gates(**raises) -> tuple[SimpleNamespace, list[str]]:
     return gates, called
 
 
-def _fill_directly(world, ts, n: int = 4) -> list[str]:
-    """Log `n` turns, begin a cutover, write candidate rows, and set state 'ready'."""
+def _bind_open_cutover(world) -> None:
+    """Bind the open candidate in the 3-part namespace, as rule 5b does at first contact."""
+    cutover = world.store.open_cutover()
+    dispatch = world.dispatch_identity()
+    assert world.event_store.bind_cutover_identity(
+        cutover.cutover_id,
+        serving_identity=world.service.serving_identity,
+        serving_components=dict(world.service.serving_components),
+        dispatch_identity=dispatch.identity,
+        dispatch_components=dict(dispatch.components),
+        identity_namespace=None,
+        source="first-contact",
+        evidence={"rule": "5b"},
+        bound_at="2026-09-01T00:00:00+00:00",
+    )
+
+
+def _fill_directly(world, ts, n: int = 4, *, bind: bool = True) -> list[str]:
+    """Log `n` turns, begin a cutover, write candidate rows, and set state 'ready'.
+
+    The candidate is bound first unless `bind` is False: a check refuses an
+    unbound one.
+    """
     ids = [_log(world, ts, i) for i in range(n)]
     assert _begin(world)[0] == 0
+    if bind:
+        _bind_open_cutover(world)
     for event_id in ids:
         world.cache.put(
             event_id,
@@ -644,6 +667,31 @@ class TestRebuildCheck:
         assert harness.factory_calls == 0
         assert called == []
         assert world.store.open_cutover().state == "filling"
+
+    def test_an_unbound_ready_candidate_is_refused_and_records_nothing(self, sync_world, ts):
+        # A check on an unbound candidate reads the 3-part rows; a keyed bind
+        # meanwhile (back to 'filling') followed by a keyed refill to 'ready'
+        # would let that stale check be recorded on a keyed candidate. A
+        # binding is written once, so a check on a bound candidate cannot race one.
+        world = sync_world
+        _fill_directly(world, ts, bind=False)
+        harness = _Harness(world)
+        gates, called = _fake_gates()
+
+        result = _run_check(world, harness, gates)
+
+        assert result.exit_code == 2
+        cutover = world.store.open_cutover()
+        assert result.report["refused"] == (
+            f"cutover {cutover.cutover_id} is not bound yet, so its check cannot be tied to "
+            "its rows; wait until admin status shows it bound"
+        )
+        assert (harness.factory_calls, called) == (0, [])
+        assert (cutover.state, cutover.check_report, cutover.rebuild_job_id) == (
+            "ready",
+            None,
+            None,
+        )
 
     def test_a_live_staging_uri_is_refused_before_any_write(self, sync_world, ts):
         world = sync_world

@@ -493,3 +493,38 @@ class TestSelfModelPartition:
         assert "__SelfModel__" in q, f"Expected __SelfModel__ partition in query, got: {q}"
         assert "__Entity__" not in q, f"Unexpected __Entity__ label in capability create: {q}"
         assert "SET e:MistCapability" in q, f"typed label must be applied via SET, got: {q}"
+
+
+class TestEntityTypeLabels:
+    """The Skill node and the user node this job may create carry their type label.
+
+    Both labels are set on create only, beside `entity_type`, the rule the
+    curation graph writer follows (`backend/knowledge/storage/type_labels.py`).
+    """
+
+    @staticmethod
+    async def _create_query() -> str:
+        job, tracker, conn = _build_job(config=_make_config(skill_threshold=3))
+        _record_identical(tracker, count=3)
+        await job.run()
+        [query] = [q for q, _ in conn.writes if "MERGE (e:__Entity__ {id: $skill_id})" in q]
+        return query
+
+    @pytest.mark.asyncio
+    async def test_skill_node_gets_the_skill_label_on_create(self):
+        query = await self._create_query()
+
+        skill_merge = query.split("MERGE (u:", 1)[0]
+        on_create = skill_merge.split("ON CREATE SET", 1)[1]
+        assert "e.entity_type = 'Skill'" in on_create
+        assert "e:Skill " in on_create
+        assert "ON MATCH" not in skill_merge
+
+    @pytest.mark.asyncio
+    async def test_user_node_it_may_create_gets_user_on_create(self):
+        query = await self._create_query()
+
+        user_merge = query.split("MERGE (u:__Entity__ {id: $user_entity_id}) ", 1)[1]
+        on_create = user_merge.split("MERGE (u)-[:KNOWS]->(e)", 1)[0]
+        assert on_create == "ON CREATE SET u.entity_type = 'User', u:User "
+        assert "ON MATCH" not in user_merge
