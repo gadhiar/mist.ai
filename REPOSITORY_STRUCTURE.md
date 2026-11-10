@@ -117,6 +117,8 @@ backend/
 │   ├── models.py                # RetrievalResult, QueryIntent, etc.
 │   ├── embeddings.py            # Sentence Transformers all-MiniLM-L6-v2
 │   ├── extraction/              # 6-stage extraction + subject-scope classifier
+│   │   ├── canonical_id.py      # Id slug and Metric id spellings, shared with the scorer
+│   │   ├── id_rails.py          # Stored id from the payload's id field; the scorer mirrors it
 │   │   ├── run_identity.py      # Run identity of the setup behind each result
 │   │   ├── serving_identity.py  # Serving identity an extraction epoch is keyed on
 │   │   └── structure_splitter.py # List, table and heading units for Stage 2
