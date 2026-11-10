@@ -22,10 +22,10 @@ import importlib
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import Any
 
 from openai import APIError
@@ -53,7 +53,7 @@ from backend.extraction_service.schemas import (
     EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
-from backend.extraction_service.settings import ConstrainedMode, ServiceSettings
+from backend.extraction_service.settings import ConstrainedMode, ReasoningEffort, ServiceSettings
 from backend.knowledge.extraction.internal_derivation import (
     parse_derivation_output,
     render_derivation_messages,
@@ -106,12 +106,62 @@ _REPAIR_INSTRUCTION = (
     "markdown code fences, no explanation."
 )
 
-# Output token limits, one per LLM-calling stage. Named so the run identity
-# can record them: a limit that cuts an output short changes what the stage
-# returns as surely as a prompt edit does.
+# Output token limits at low reasoning effort, one per LLM-calling stage. Named
+# so the run identity can record them: a limit that cuts an output short
+# changes what the stage returns as surely as a prompt edit does.
 SCOPE_MAX_TOKENS = 96
 EXTRACT_MAX_TOKENS = 2048
 DERIVE_MAX_TOKENS = 400
+
+
+@dataclass(frozen=True, slots=True)
+class StageCaps:
+    """The output token cap of each LLM-calling stage, at one reasoning effort.
+
+    The fields are named as the stages are in `REQUEST_STAGES`, so a stage's
+    cap is `getattr(caps, stage)`.
+    """
+
+    scope: int
+    extract: int
+    derive: int
+
+
+# A model reasoning at medium or high effort spends its output tokens on
+# reasoning before the answer, so low's caps would cut most calls short. The
+# medium extract cap sits above the longest extract call that stopped on its
+# own at high effort (28,916 tokens) and cuts a runaway call a third sooner than
+# the 49,152 that run used. High takes medium's caps; no run has measured them
+# at high. Derive keeps 400 at every effort because the adapters send derive at
+# low effort under every setting (`GptOssAdapter.stage_effort`).
+STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
+    {
+        "low": StageCaps(
+            scope=SCOPE_MAX_TOKENS, extract=EXTRACT_MAX_TOKENS, derive=DERIVE_MAX_TOKENS
+        ),
+        "medium": StageCaps(scope=1024, extract=32768, derive=DERIVE_MAX_TOKENS),
+        "high": StageCaps(scope=1024, extract=32768, derive=DERIVE_MAX_TOKENS),
+    }
+)
+
+# The context a prompt may take beside the extract cap: above the largest
+# prompt measured on the r6 prompt (9,327 tokens).
+PROMPT_RESERVE_TOKENS: int = 10240
+
+
+def stage_caps(effort: ReasoningEffort | None) -> StageCaps:
+    """The caps for `effort`; None, an adapter that sends no effort, gets low's."""
+    return STAGE_CAPS["low" if effort is None else effort]
+
+
+def effective_cap(adapter: ModelFamilyAdapter, stage: str) -> int:
+    """The output token cap `stage` is sent with under `adapter`.
+
+    It follows the effort the adapter applies to that stage, not the
+    configured effort, so an adapter that sends no effort keeps low's caps.
+    """
+    return getattr(stage_caps(adapter.stage_effort(stage)), stage)
+
 
 # The Stage 2 list pass's limits: the most units one call extracts, and the
 # most earlier units of the same message a later batch sees as context. Small
@@ -209,7 +259,7 @@ class ExtractionTimeoutError(ExtractionServiceError):
 
 
 class _OutputTruncatedError(ExtractionServiceError):
-    """A Stage 2 output stopped at `EXTRACT_MAX_TOKENS` (`finish_reason == "length"`).
+    """A Stage 2 output stopped at the extract cap (`finish_reason == "length"`).
 
     Internal to Stage 2: the batch is split and retried, and only a single
     unit cut short leaves the engine, as `UpstreamLLMError`.
@@ -457,6 +507,10 @@ class ExtractionEngine:
         """The run identity this engine stamps on every result."""
         return self._run_identity
 
+    def stage_cap(self, stage: str) -> int:
+        """The output token cap `stage`'s request is sent with (`effective_cap`)."""
+        return effective_cap(self._adapter, stage)
+
     def request_profile(self) -> tuple[StageRequestProfile, ...]:
         """The output-changing fields of each stage's request, in `REQUEST_STAGES` order.
 
@@ -564,21 +618,25 @@ class ExtractionEngine:
     def _scope_request(self, *, messages: list[dict]) -> LLMRequest:
         """Stage 1.5's request for `messages`, prepared by the adapter."""
         request = self._build_request(
-            messages=messages, max_tokens=SCOPE_MAX_TOKENS, schema=SCOPE_OUTPUT_SCHEMA
+            messages=messages, max_tokens=self.stage_cap("scope"), schema=SCOPE_OUTPUT_SCHEMA
         )
         return self._adapter.prepare(request, stage="scope")
 
     def _extract_request(self, *, messages: list[dict]) -> LLMRequest:
         """Stage 2's request for `messages`, prepared by the adapter."""
         request = self._build_request(
-            messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
+            messages=messages,
+            max_tokens=self.stage_cap("extract"),
+            schema=EXTRACTION_OUTPUT_SCHEMA,
         )
         return self._adapter.prepare(request, stage="extract")
 
     def _derive_request(self, *, messages: list[dict]) -> LLMRequest:
         """Stage 9's request for `messages`, prepared by the adapter."""
         request = self._build_request(
-            messages=messages, max_tokens=DERIVE_MAX_TOKENS, schema=DERIVATION_OUTPUT_SCHEMA
+            messages=messages,
+            max_tokens=self.stage_cap("derive"),
+            schema=DERIVATION_OUTPUT_SCHEMA,
         )
         return self._adapter.prepare(request, stage="derive")
 
@@ -654,7 +712,7 @@ class ExtractionEngine:
     ) -> None:
         """Extract `units[start:start + size]`, halving the batch while its output is cut short.
 
-        An output that stops at `EXTRACT_MAX_TOKENS` is never repaired: the
+        An output that stops at the extract cap is never repaired: the
         repair retry would ask for the same output under the same limit. The
         batch is split in two and each half extracted in turn, each seeing
         the units before it as context, down to single units.
@@ -670,7 +728,7 @@ class ExtractionEngine:
         except _OutputTruncatedError as exc:
             if size == 1:
                 raise UpstreamLLMError(
-                    f"extraction output truncated at max_tokens ({EXTRACT_MAX_TOKENS}) "
+                    f"extraction output truncated at max_tokens ({self.stage_cap('extract')}) "
                     "on a single unit"
                 ) from exc
             half = (size + 1) // 2
@@ -726,7 +784,7 @@ class ExtractionEngine:
 
             if response.finish_reason == "length":
                 raise _OutputTruncatedError(
-                    f"Extraction output reached max_tokens={EXTRACT_MAX_TOKENS}"
+                    f"Extraction output reached max_tokens={request.max_tokens}"
                     f" (attempt {attempt}/{self._settings.max_attempts})"
                 )
             raw = self._adapter.final_text(response)

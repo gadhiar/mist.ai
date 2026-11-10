@@ -45,17 +45,15 @@ from backend.extraction_contract.models import (
 )
 from backend.extraction_service.adapters import ModelFamilyAdapter, get_adapter
 from backend.extraction_service.engine import (
-    DERIVE_MAX_TOKENS,
-    EXTRACT_MAX_TOKENS,
     LIST_BATCH_MAX_UNITS,
     LIST_CONTEXT_MAX_UNITS,
     RUN_IDENTITY_CODE,
-    SCOPE_MAX_TOKENS,
     ExtractionEngine,
     ExtractionTimeoutError,
     InvalidRequestError,
     UpstreamLLMError,
     _compute_prompt_sha256,
+    effective_cap,
     parse_recorded_at,
 )
 from backend.extraction_service.settings import SERVER_ENV_PREFIX, ServiceSettings
@@ -329,8 +327,9 @@ def run_identity_components(
     """The run identity's components for a service running `settings` with `adapter`.
 
     Every value is read from where the engine reads it: the prompt hash from
-    the same function the engine stamps with, the token and list-pass limits
-    from the engine's constants, and the constrained mode as the engine resolves it
+    the same function the engine stamps with, each stage's token cap as the
+    engine sizes it for `adapter` (`effective_cap`), the list-pass limits from
+    the engine's constants, and the constrained mode as the engine resolves it
     (`settings.constrained_mode or adapter.default_constrained_mode`).
     """
     return RunIdentityComponents(
@@ -347,9 +346,9 @@ def run_identity_components(
         temperature=settings.temperature,
         max_attempts=settings.max_attempts,
         scope_enabled=settings.scope_enabled,
-        scope_max_tokens=SCOPE_MAX_TOKENS,
-        extract_max_tokens=EXTRACT_MAX_TOKENS,
-        derive_max_tokens=DERIVE_MAX_TOKENS,
+        scope_max_tokens=effective_cap(adapter, "scope"),
+        extract_max_tokens=effective_cap(adapter, "extract"),
+        derive_max_tokens=effective_cap(adapter, "derive"),
         list_batch_max_units=LIST_BATCH_MAX_UNITS,
         list_context_max_units=LIST_CONTEXT_MAX_UNITS,
     )

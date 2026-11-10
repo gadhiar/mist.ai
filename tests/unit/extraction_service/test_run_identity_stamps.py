@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 
 import httpx
 import pytest
@@ -31,6 +31,7 @@ from backend.extraction_service.engine import (
 )
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.extraction.run_identity import code_sha256, compute_run_identity
+from backend.knowledge.extraction.serving_identity import REQUEST_STAGES
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from tests.unit.extraction_service.conftest import make_extract_request
 
@@ -285,17 +286,27 @@ def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):
 @pytest.mark.parametrize(
     "name",
     [
-        "SCOPE_MAX_TOKENS",
-        "EXTRACT_MAX_TOKENS",
-        "DERIVE_MAX_TOKENS",
+        "scope",
+        "extract",
+        "derive",
         "ONTOLOGY_VERSION",
         "EXTRACTION_VERSION",
     ],
 )
 def test_a_limit_or_version_change_moves_the_identity(service_settings, monkeypatch, name):
     before = _identity(service_settings)
-    value = getattr(app_module, name)
-    monkeypatch.setattr(app_module, name, value + 1 if isinstance(value, int) else value + "x")
+    if name in REQUEST_STAGES:
+        # The caps are read from STAGE_CAPS at the effort each stage is sent at.
+        low = engine_module.STAGE_CAPS["low"]
+        moved = dataclasses.replace(low, **{name: getattr(low, name) + 1})
+        monkeypatch.setattr(
+            engine_module,
+            "STAGE_CAPS",
+            MappingProxyType({**engine_module.STAGE_CAPS, "low": moved}),
+        )
+    else:
+        value = getattr(app_module, name)
+        monkeypatch.setattr(app_module, name, value + 1 if isinstance(value, int) else value + "x")
 
     assert _identity(service_settings) != before
 
