@@ -189,7 +189,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-88751ad0b032424232999eade8d6808c437b1c7022869aba65373de2a8c69b82",
+        code_identity="ci1-dab830325cf31812855e713a012287240ba9a830a4a77e910494964e6da45fb0",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -202,8 +202,11 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "the Metric rule as Rules 21 to 27, corrects Examples 6, 7, 10, 12, 15, 20 and "
             "24, and adds Examples 27 to 29; prompt group 2 (lists) states how a structured "
             "turn reads, the list rules and itinerary items, N3, N5, N7 and N13 as Rules 28 "
-            "to 33, adds the stated place to Example 29, and adds Example 30. Re-extracts "
-            "history."
+            "to 33, adds the stated place to Example 29, and adds Example 30; prompt group 3 "
+            "(glosses) quotes the ontology's description after each user-centric predicate "
+            "and the Organization and Event types, glosses WORKS_AT as employment only, states "
+            "N17 named teams, N8, N10, N11 and N12 as Rules 34 to 38, amends Rule 6's "
+            "\"don't like X anymore\" to N12's pair, and adds Example 31. Re-extracts history."
         ),
     ),
 )
