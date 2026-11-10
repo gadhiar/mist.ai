@@ -484,7 +484,7 @@ class TestInfoReportsTheServingIdentity:
         assert data["serving_identity"] is None
         assert data["serving_identity_error"] == (
             f"declared ctx_size {FAKE_N_CTX} != observed n_ctx 4096; "
-            "extract cap 2048 + prompt reserve 10240 > observed n_ctx 4096"
+            "extract cap 2048 + prompt reserve 14336 > observed n_ctx 4096"
         )
         assert data["serving_identity_components"]["n_ctx"] == 4096
 
@@ -529,7 +529,7 @@ class TestTheCapsMustFitTheContext:
         async with _client_for(app) as client:
             return (await client.get("/v1/info")).json()
 
-    async def test_low_fits_the_compose_default(
+    async def test_low_fits_a_context_of_16384(
         self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state
     ):
         settings = _at_context(service_settings, fake_llama_state, 16384)
@@ -539,8 +539,20 @@ class TestTheCapsMustFitTheContext:
         assert data["serving_identity_error"] is None
         assert data["serving_identity"] is not None
 
+    async def test_low_one_token_short_does_not_fit(
+        self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state
+    ):
+        settings = _at_context(service_settings, fake_llama_state, 16383)
+
+        data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
+
+        assert data["serving_identity"] is None
+        assert data["serving_identity_error"] == (
+            "extract cap 2048 + prompt reserve 14336 > observed n_ctx 16383"
+        )
+
     @pytest.mark.parametrize("effort", ["medium", "high"])
-    async def test_medium_and_high_do_not_fit_the_compose_default(
+    async def test_medium_and_high_do_not_fit_a_context_of_16384(
         self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state, effort
     ):
         settings = _at_context(
@@ -551,12 +563,12 @@ class TestTheCapsMustFitTheContext:
 
         assert data["serving_identity"] is None
         assert data["serving_identity_error"] == (
-            "extract cap 32768 + prompt reserve 10240 > observed n_ctx 16384"
+            "extract cap 32768 + prompt reserve 14336 > observed n_ctx 16384"
         )
         assert data["serving_identity_components"]["n_ctx"] == 16384
 
-    @pytest.mark.parametrize("n_ctx", [43008, 65536])
-    async def test_medium_fits_a_context_of_43008_or_more(
+    @pytest.mark.parametrize("n_ctx", [47104, 65536])
+    async def test_medium_fits_a_context_of_47104_or_more(
         self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state, n_ctx
     ):
         settings = _at_context(
@@ -576,13 +588,13 @@ class TestTheCapsMustFitTheContext:
         settings = _at_context(
             dataclasses.replace(service_settings, reasoning_effort="medium"),
             fake_llama_state,
-            43007,
+            47103,
         )
 
         data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
 
         assert data["serving_identity_error"] == (
-            "extract cap 32768 + prompt reserve 10240 > observed n_ctx 43007"
+            "extract cap 32768 + prompt reserve 14336 > observed n_ctx 47103"
         )
 
     @pytest.mark.parametrize("adapter_name", ["qwen", "gemma"])
@@ -623,7 +635,7 @@ class TestTheCapsMustFitTheContext:
             )
 
         assert response.status_code == 409
-        assert "extract cap 32768 + prompt reserve 10240 > observed n_ctx 16384" in (
+        assert "extract cap 32768 + prompt reserve 14336 > observed n_ctx 16384" in (
             response.json()["error"]["message"]
         )
         assert fake_llama_state.chat_requests == []

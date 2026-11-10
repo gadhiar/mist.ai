@@ -45,6 +45,11 @@ class DispatcherSettings:
             doubles per failure.
         backoff_cap_s: Upper bound on any retry or reconnect delay.
         request_timeout_s: Client-side timeout for one `/v1/extract` call.
+            It bounds the whole request, which can hold several LLM calls
+            when a batch cut at its cap is split and retried; the service's
+            `EXTRACTION_LLM_TIMEOUT_SECONDS` bounds one call. 1,800 s covers
+            two medium extract calls that run to their cap (about 651 s
+            each), not three.
         idle_poll_s: How often an idle dispatcher rescans the log without a
             `wake()` (catches turns logged by another process).
         stall_recheck_s: How often a stalled dispatcher re-reads `/v1/info`.
@@ -58,7 +63,7 @@ class DispatcherSettings:
     max_attempts: int = 5
     backoff_base_s: float = 2.0
     backoff_cap_s: float = 60.0
-    request_timeout_s: float = 300.0
+    request_timeout_s: float = 1800.0
     idle_poll_s: float = 30.0
     stall_recheck_s: float = 30.0
     history_messages: int = 10
@@ -90,7 +95,7 @@ class DispatcherSettings:
             max_attempts=_int_env("MIST_EXTRACTION_MAX_ATTEMPTS", 5),
             backoff_base_s=_float_env("MIST_EXTRACTION_BACKOFF_BASE_S", 2.0),
             backoff_cap_s=_float_env("MIST_EXTRACTION_BACKOFF_CAP_S", 60.0),
-            request_timeout_s=_float_env("MIST_EXTRACTION_REQUEST_TIMEOUT_S", 300.0),
+            request_timeout_s=_float_env("MIST_EXTRACTION_REQUEST_TIMEOUT_S", 1800.0),
             idle_poll_s=_float_env("MIST_EXTRACTION_IDLE_POLL_S", 30.0),
             stall_recheck_s=_float_env("MIST_EXTRACTION_STALL_RECHECK_S", 30.0),
             history_messages=_int_env("MIST_EXTRACTION_HISTORY_MESSAGES", 10),

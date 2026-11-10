@@ -144,11 +144,16 @@ STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
     }
 )
 
-# The context a prompt may take beside the extract cap: above the largest
-# prompt measured on the r6 prompt (9,327 tokens). The service withholds its
-# serving identity when the extract cap plus this reserve exceeds the context
-# llama-server reports (`backend.extraction_service.app._serving_identity_error`).
-PROMPT_RESERVE_TOKENS: int = 10240
+# The context a prompt may take beside the extract cap. The largest prompt
+# measured on the r6 prompt was 9,327 tokens, and the prompt's stated
+# conventions add about 2,600 more by estimate, so the reserve is the largest
+# value with which low's extract cap still fits a 16,384 context (2,048 +
+# 14,336), the context a run beside the main stack and host-1070 use. Medium
+# then needs 47,104. The `extraction call:` line reports each call's real
+# prompt_tokens. The service withholds its serving identity when the extract
+# cap plus this reserve exceeds the context llama-server reports
+# (`backend.extraction_service.app._serving_identity_error`).
+PROMPT_RESERVE_TOKENS: int = 14336
 
 
 def stage_caps(effort: ReasoningEffort | None) -> StageCaps:
@@ -489,6 +494,25 @@ def _log_length_stop(request: LLMRequest, response: LLMResponse) -> None:
     )
 
 
+def _log_call(request: LLMRequest, response: LLMResponse) -> None:
+    """Log one LLM call's cap, token counts and finish reason, never text.
+
+    A run's prompt size cannot be counted offline (the tokenizer needs the
+    network inside the container), so this line is how a run records what
+    llama-server counted for every call, context lines included. The cap
+    names the stage, as on the length-stop line. A count the server did not
+    report prints as None.
+    """
+    usage = response.usage
+    logger.info(
+        "extraction call: cap %d prompt_tokens %s completion_tokens %s finish %s",
+        request.max_tokens,
+        None if usage is None else usage.prompt_tokens,
+        None if usage is None else usage.completion_tokens,
+        response.finish_reason,
+    )
+
+
 def _profile_of(stage: str, request: LLMRequest) -> StageRequestProfile:
     """The output-changing fields of `request`, read as the provider sends them.
 
@@ -692,9 +716,10 @@ class ExtractionEngine:
     async def _invoke(self, request: LLMRequest):
         """Invoke the LLM under the configured timeout.
 
-        A response that stopped at its output cap is logged (`_log_length_stop`)
-        before it is returned, so before the stage that called raises, retries
-        or degrades on it.
+        Every response is logged (`_log_call`, at INFO), and one that stopped
+        at its output cap is logged again (`_log_length_stop`, at WARNING),
+        both before it is returned, so before the stage that called raises,
+        retries or degrades on it. Every stage's call passes here.
 
         Raises:
             TimeoutError: The call exceeded `settings.llm_timeout_seconds`.
@@ -704,6 +729,7 @@ class ExtractionEngine:
         response = await asyncio.wait_for(
             self._llm.invoke(request), timeout=self._settings.llm_timeout_seconds
         )
+        _log_call(request, response)
         if response.finish_reason == "length":
             _log_length_stop(request, response)
         return response

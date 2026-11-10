@@ -104,7 +104,12 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # context and extracted four units a call, each later call seeing up to eight
 # earlier units; a batch cut short at the output limit is split and retried.
 # Bumped so history is re-extracted under it at the next cutover.
-EXTRACTION_VERSION: str = "2026-11-06-r6"
+# 2026-11-10-r8: the stored id is built from the payload's `id` field through
+# shared id rails, the prompt states its id, list and predicate conventions,
+# and medium is the deployed effort, each LLM call logging its token counts.
+# r7 named the withdrawn list frame path's builds, so this skips to r8 to keep
+# the stamps unambiguous. Re-extracts history at the next cutover.
+EXTRACTION_VERSION: str = "2026-11-10-r8"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +185,20 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "_invoke logs an `extraction length stop:` line with counts and a repetition "
             "flag; LlamaServerProvider takes the client timeout. At low effort every "
             "request is sent exactly as before. New turns only."
+        ),
+    ),
+    CodeRevision(
+        extraction_version="2026-11-10-r8",
+        code_identity="ci1-d35126ac4d4f32e933ae04731072dd4bb0cb5ebf50f91b7114d5e618dcb4437c",
+        date="2026-11-10",
+        reason=(
+            "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
+            "prompt states its conventions, and medium is the deployed effort. Every later "
+            "change under r8 updates this entry's code_identity, since only the final "
+            "identity ships. So far: _invoke logs one `extraction call:` line per LLM call "
+            "with its cap, token counts and finish reason; PROMPT_RESERVE_TOKENS is 14336, "
+            "so medium needs a context of 47,104 and low still fits 16,384. Re-extracts "
+            "history."
         ),
     ),
 )

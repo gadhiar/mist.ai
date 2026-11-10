@@ -384,7 +384,7 @@ def _serving_identity_error(
 
     Beside the declarations, the extract cap plus `PROMPT_RESERVE_TOKENS` must
     fit the observed context. A deployment whose longest extract call could
-    exceed its context (medium's caps at the 16,384 compose default) gets no
+    exceed its context (medium's caps at low's 16,384 context) gets no
     identity, and `/v1/info` names the shortfall, the same way a declared
     context size that differs from the observed one is reported.
     """
