@@ -103,7 +103,8 @@ score shows what extraction misses. In dev-lists, the six edges H8 added under s
   (`ext-01`). Gold invents no id (extraction contract ADR, Decision 3): an id differs from the
   utterance's phrase only where a convention with a carrier (the prompt or a rail) builds it,
   as Rule 1's `user`, the ISO Date id, the Metric rail, N2, N4, N14, N15, N16 and the Event
-  rule do.
+  rule do. An id that is a contiguous run of the utterance's words naming the entity is the
+  utterance's own phrase, and a labeller neither lengthens nor shortens it.
   *Suspended:* "a habit id names the activity, as `journaling` and `long-run` (`ext-55`,
   `ext-57`)". No prompt rule or rail carries it, so it decides no id until it has a carrier;
   a habit id is the utterance's phrase ("swim on Tuesdays" is `swim`). Where two ids both fit
@@ -462,3 +463,9 @@ at least twice. T8 checks the same floor on the adjudicated labels.
   `dark-mode-everywhere`. A trailing phrase stays out of an id only where it is a fact of its
   own (dvl-19's parser clauses, labelled as `OPERATES_ON`), a scope of a named thing (`sqlite`
   "for small apps", Rule 18) or a name modifier (N4).
+- **2026-11-09, dev-lists, an id is neither lengthened nor shortened (T30, lead ruling).** An id
+  that is a contiguous run of the utterance's words naming the entity is the utterance's own
+  phrase (N1). This replaces the previous entry's trailing-phrase reading for ids that were
+  already such a run: dvl-26 `discord-bot-for-book-club` back to `discord-bot`, dvl-40
+  `dark-mode-everywhere` back to `dark-mode`, with their edges and the retrieval fact
+  (`rq-type-scoped-07`).
