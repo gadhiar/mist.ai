@@ -36,6 +36,15 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
   - `extraction_retrieval.py` - Builds the retrieval eval graph from the dev turns and runs the queries
+  - `entity_alignment.py` - Pairs gold and produced entity ids by id form, for relations scored over aligned ids
+  - `ceiling/` - Extraction ceiling runs: an answerer in the model's seat of the unchanged service (see `data/ceiling/README.md`)
+    - `store.py` - Append-only, hash-chained answer store and its state-file check
+    - `relay.py` - Serves stored answers to the service as llama-server would; logs pending requests
+    - `round.py` - One answer round for answerer K: run the probes, offer pending requests, `--add`, `--check`
+    - `replay.py` - Replays all stored answers once over every probe, and compares two replays
+    - `make_probes.py` - Writes the utterance-only probes file from gold
+    - `score_runs.py` - Scores raw runs with a pinned checkout's scorer and classifier: exact and aligned figures, paired lines, the worksheet and pending pairs
+    - `adjudicated.py` - Checks an adjudicated worksheet, prints the corrected figures, and checks the aligner's credits against the adjudicated classes
 - `daily/` - The daily instance's host tools
   - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
@@ -59,6 +68,11 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 ### Gold sets (`data/gold/`)
 - `data/gold/extraction/` - Extraction gold sets (dev lists, held out) and the labelling guide (`LABELLING.md`)
 - `data/gold/retrieval/` - Retrieval queries over the dev gold facts, with a README
+
+### Ceiling runs (`data/ceiling/`)
+- `data/ceiling/probes.jsonl` - The dev-lists probes as tag and utterance only, made by `make_probes`
+- `data/ceiling/answers-<k>.jsonl` - Answerer k's stored answers (k = 1 to 4), once committed
+- `data/ceiling/README.md` - The files, the round and replay commands, and the caveats
 
 ---
 

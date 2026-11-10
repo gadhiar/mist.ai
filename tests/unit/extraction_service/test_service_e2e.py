@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from backend.extraction_service.app import LlamaPropsContextSize, create_app
-from backend.extraction_service.engine import ExtractionEngine
+from backend.extraction_service.engine import STAGE_CAPS, ExtractionEngine
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
     EXTRACTION_OUTPUT_SCHEMA,
@@ -389,6 +389,9 @@ class TestInfoServingConfig:
 
             def request_profile(self) -> tuple:
                 return ()
+
+            def stage_cap(self, stage: str) -> int:
+                return getattr(STAGE_CAPS["low"], stage)
 
         app = create_app(
             service_settings, _UnknownAdapterEngine(), health_probe, ctx_size_source  # type: ignore[arg-type]

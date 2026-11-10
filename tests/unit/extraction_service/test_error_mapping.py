@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from backend.extraction_contract.models import ExtractionPayload, ExtractRequest
 from backend.extraction_service.app import create_app
+from backend.extraction_service.engine import STAGE_CAPS
 from tests.unit.extraction_service.conftest import make_extract_request
 
 _SCOPE = '{"scope": "unknown", "confidence": 0.0}'
@@ -105,6 +106,9 @@ class _EngineRaising:
 
     def request_profile(self) -> tuple:
         return ()
+
+    def stage_cap(self, stage: str) -> int:
+        return getattr(STAGE_CAPS["low"], stage)
 
     async def run(self, req: ExtractRequest, *, serving_identity: str | None = None):
         self.runs += 1

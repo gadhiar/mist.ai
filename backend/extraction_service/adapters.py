@@ -36,9 +36,17 @@ class ModelFamilyAdapter(Protocol):
         Args:
             request: The model-agnostic request built by the engine.
             stage: Which pipeline stage this call is for -- one of
-                "scope", "extract", "derive". Adapters that need
-                stage-specific behavior (e.g. a different reasoning
-                effort per stage) read it; the current adapters do not.
+                "scope", "extract", "derive". `GptOssAdapter` reads it to
+                send each stage at its `stage_effort`.
+        """
+        ...
+
+    def stage_effort(self, stage: str) -> ReasoningEffort | None:
+        """The reasoning effort `prepare` sends for `stage`, or None when it sends none.
+
+        The engine sizes each stage's output token cap by this effort
+        (`backend.extraction_service.engine.effective_cap`), so an adapter
+        that sends no effort keeps low's caps whatever the configured effort.
         """
         ...
 
@@ -111,10 +119,21 @@ class GptOssAdapter:
     def prepare(self, request: LLMRequest, stage: str) -> LLMRequest:
         """Set gpt-oss reasoning-effort/budget thinking controls on `request`."""
         thinking = ThinkingConfig(
-            effort=self.reasoning_effort,
+            effort=self.stage_effort(stage),
             budget_tokens=self.reasoning_budget_tokens,
         )
         return request.model_copy(update={"thinking": thinking})
+
+    def stage_effort(self, stage: str) -> ReasoningEffort:
+        """`reasoning_effort` for scope and extract; low for derive.
+
+        Derive stays at low effort under every setting because no effort run
+        calls derive (the probe client sends no derivation), so derive above
+        low would ship unmeasured.
+        """
+        if stage == "derive":
+            return "low"
+        return self.reasoning_effort
 
     def final_text(self, response: LLMResponse) -> str:
         """Return `response.content`, recovering the final-channel text from raw Harmony markup."""
@@ -136,6 +155,10 @@ class QwenAdapter:
         """Disable Qwen chat-template thinking on `request`."""
         return request.model_copy(update={"thinking": ThinkingConfig(enabled=False)})
 
+    def stage_effort(self, stage: str) -> None:
+        """None: Qwen thinking is disabled, so no stage is sent an effort."""
+        return None
+
     def final_text(self, response: LLMResponse) -> str:
         """Return `response.content` with a leading <think>...</think> block stripped."""
         content = response.content or ""
@@ -153,6 +176,10 @@ class GemmaAdapter:
     def prepare(self, request: LLMRequest, stage: str) -> LLMRequest:
         """Disable thinking on `request` (Gemma has no reasoning-effort hint)."""
         return request.model_copy(update={"thinking": ThinkingConfig(enabled=False)})
+
+    def stage_effort(self, stage: str) -> None:
+        """None: Gemma has no reasoning-effort hint, so no stage is sent an effort."""
+        return None
 
     def final_text(self, response: LLMResponse) -> str:
         """Return `response.content` unchanged -- Gemma emits no family-specific markup."""

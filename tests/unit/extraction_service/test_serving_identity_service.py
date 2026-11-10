@@ -32,6 +32,7 @@ from backend.extraction_service.engine import (
     DERIVE_MAX_TOKENS,
     EXTRACT_MAX_TOKENS,
     SCOPE_MAX_TOKENS,
+    STAGE_CAPS,
     ExtractionEngine,
 )
 from backend.extraction_service.settings import ServiceSettings
@@ -281,8 +282,11 @@ class TestAgreementWithTheRunIdentity:
 
         profiles = _engine_for(settings, wired_llm).request_profile()
 
-        assert {(p.thinking_effort, p.thinking_budget_tokens) for p in profiles} == {
-            (run.reasoning_effort, run.reasoning_budget_tokens)
+        # Derive is sent at low effort under every setting (`GptOssAdapter.stage_effort`).
+        assert {(p.stage, p.thinking_effort, p.thinking_budget_tokens) for p in profiles} == {
+            ("scope", run.reasoning_effort, run.reasoning_budget_tokens),
+            ("extract", run.reasoning_effort, run.reasoning_budget_tokens),
+            ("derive", "low", run.reasoning_budget_tokens),
         }
 
 
@@ -360,6 +364,8 @@ _STAGE_BY_MAX_TOKENS = {
     SCOPE_MAX_TOKENS: "scope",
     EXTRACT_MAX_TOKENS: "extract",
     DERIVE_MAX_TOKENS: "derive",
+    STAGE_CAPS["medium"].scope: "scope",
+    STAGE_CAPS["medium"].extract: "extract",
 }
 _CONSTRAINED_BY_FORMAT = {"json_schema": "schema", "json_object": "json_object", None: "none"}
 
@@ -477,7 +483,8 @@ class TestInfoReportsTheServingIdentity:
 
         assert data["serving_identity"] is None
         assert data["serving_identity_error"] == (
-            f"declared ctx_size {FAKE_N_CTX} != observed n_ctx 4096"
+            f"declared ctx_size {FAKE_N_CTX} != observed n_ctx 4096; "
+            "extract cap 2048 + prompt reserve 10240 > observed n_ctx 4096"
         )
         assert data["serving_identity_components"]["n_ctx"] == 4096
 
@@ -505,6 +512,121 @@ class TestInfoReportsTheServingIdentity:
         assert second["serving_identity"] is None
         assert second["serving_identity_components"]["n_ctx"] == 32768
         assert fake_llama_state.props_requests == 2
+
+
+def _at_context(settings: ServiceSettings, fake_llama_state, n_ctx: int) -> ServiceSettings:
+    """`settings` declaring `n_ctx`, with the fake llama-server reporting it."""
+    fake_llama_state.props_body = {"default_generation_settings": {"n_ctx": n_ctx}}
+    return _with_server_value(settings, "ctx_size", str(n_ctx))
+
+
+@pytest.mark.asyncio
+class TestTheCapsMustFitTheContext:
+    """The extract cap plus the prompt reserve must fit the context llama-server reports."""
+
+    async def _info(self, settings, wired_llm, health_probe, ctx_size_source) -> dict:
+        app = _app_for(settings, wired_llm, health_probe, ctx_size_source)
+        async with _client_for(app) as client:
+            return (await client.get("/v1/info")).json()
+
+    async def test_low_fits_the_compose_default(
+        self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state
+    ):
+        settings = _at_context(service_settings, fake_llama_state, 16384)
+
+        data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
+
+        assert data["serving_identity_error"] is None
+        assert data["serving_identity"] is not None
+
+    @pytest.mark.parametrize("effort", ["medium", "high"])
+    async def test_medium_and_high_do_not_fit_the_compose_default(
+        self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state, effort
+    ):
+        settings = _at_context(
+            dataclasses.replace(service_settings, reasoning_effort=effort), fake_llama_state, 16384
+        )
+
+        data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
+
+        assert data["serving_identity"] is None
+        assert data["serving_identity_error"] == (
+            "extract cap 32768 + prompt reserve 10240 > observed n_ctx 16384"
+        )
+        assert data["serving_identity_components"]["n_ctx"] == 16384
+
+    @pytest.mark.parametrize("n_ctx", [43008, 65536])
+    async def test_medium_fits_a_context_of_43008_or_more(
+        self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state, n_ctx
+    ):
+        settings = _at_context(
+            dataclasses.replace(service_settings, reasoning_effort="medium"),
+            fake_llama_state,
+            n_ctx,
+        )
+
+        data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
+
+        assert data["serving_identity_error"] is None
+        assert data["serving_identity"] is not None
+
+    async def test_medium_one_token_short_does_not_fit(
+        self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state
+    ):
+        settings = _at_context(
+            dataclasses.replace(service_settings, reasoning_effort="medium"),
+            fake_llama_state,
+            43007,
+        )
+
+        data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
+
+        assert data["serving_identity_error"] == (
+            "extract cap 32768 + prompt reserve 10240 > observed n_ctx 43007"
+        )
+
+    @pytest.mark.parametrize("adapter_name", ["qwen", "gemma"])
+    async def test_an_adapter_that_sends_no_effort_keeps_low_caps_and_fits(
+        self,
+        service_settings,
+        wired_llm,
+        health_probe,
+        ctx_size_source,
+        fake_llama_state,
+        adapter_name,
+    ):
+        settings = _at_context(
+            dataclasses.replace(
+                service_settings, adapter_name=adapter_name, reasoning_effort="high"
+            ),
+            fake_llama_state,
+            16384,
+        )
+
+        data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
+
+        assert data["serving_identity_error"] is None
+
+    async def test_a_job_expecting_an_identity_is_refused_when_the_caps_do_not_fit(
+        self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state
+    ):
+        settings = _at_context(
+            dataclasses.replace(service_settings, reasoning_effort="medium"),
+            fake_llama_state,
+            16384,
+        )
+        app = _app_for(settings, wired_llm, health_probe, ctx_size_source)
+
+        async with _client_for(app) as client:
+            response = await client.post(
+                "/v1/extract", json=make_extract_request(serving_identity="si1-" + "0" * 64)
+            )
+
+        assert response.status_code == 409
+        assert "extract cap 32768 + prompt reserve 10240 > observed n_ctx 16384" in (
+            response.json()["error"]["message"]
+        )
+        assert fake_llama_state.chat_requests == []
 
 
 # ---------------------------------------------------------------------------

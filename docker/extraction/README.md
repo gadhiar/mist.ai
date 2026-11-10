@@ -117,11 +117,11 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_MODEL_HASH` | **required, no default** (`:?`) | **required, no default** (`:?`) | Defines the epoch. Set explicitly every deploy; see EPOCH_MISMATCH in `backend/extraction_service/app.py`. |
 | `EXTRACTION_MODEL_FILE` | `ggml-org/gpt-oss-20b-MXFP4.gguf` | same | Passed to `LlamaServerProvider` as the OpenAI-API `model` field. |
 | `EXTRACTION_ADAPTER` | `gptoss` | same | `gptoss` / `qwen` / `gemma` -- see `backend/extraction_service/adapters.py`. |
-| `EXTRACTION_REASONING_EFFORT` | `low` | same | Only meaningful for `gptoss`. |
+| `EXTRACTION_REASONING_EFFORT` | `low` | same | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` keeps scope 96, extract 2048, derive 400; `medium` and `high` send scope 1024, extract 32768, derive 400. Derive is always sent at `low` effort, so its cap stays 400. `medium` and `high` need a context of at least 43,008 tokens (the 32,768 extract cap plus the 10,240-token prompt reserve), so set `EXTRACTION_LLM_CTX_SIZE` to at least that; at the 16,384 default the service reports no serving identity. See "Effort caps and the context" below. |
 | `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per deployment, not overridable via `.env`. |
 | `LLAMA_CPP_BUILD` | `b11151` | same | Reported in `ResultStamps`/`/v1/info`; shared with the compose image pin. |
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
-| `EXTRACTION_LLM_TIMEOUT_SECONDS` | `120` | same | Per-LLM-call timeout. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s, but the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below); 120 gives real headroom. |
+| `EXTRACTION_LLM_TIMEOUT_SECONDS` | `120` | same | Per-LLM-call timeout. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s, but the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below); 120 gives real headroom. The value also reaches the OpenAI clients (`LlamaServerProvider(..., timeout=...)`, 5 s to connect), so a setting above 600 s is no longer cut at the SDK's 600 s read default. |
 | `EXTRACTION_MAX_ATTEMPTS` | `2` | same | Maximum extraction attempts per job (first call plus repair retries on unparsable output), matching `ServiceSettings.max_attempts`'s own default. |
 | `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. The `gptoss` default is `schema` (it was `none`); see the note below the table. |
 | `EXTRACTION_LLM_DEVICE` | **required, no default** (`:?`) | **required, no default** (`:?`) | The GPU llama-server runs on, e.g. `rtx-4070-super` or `gtx-1070`. Reaches the service as `EXTRACTION_SERVER_DEVICE` and keys the extraction epoch; see "Declared llama-server settings" below. |
@@ -311,6 +311,54 @@ measurement.
 
 The host ncmoe fit has been re-measured at ctx 16384 -- see "Host ncmoe
 sizing" below for the current table.
+
+Effort caps and the context
+---------------------------
+
+Each stage's output token cap follows the reasoning effort the adapter sends
+that stage (`STAGE_CAPS`, `stage_caps` and `GptOssAdapter.stage_effort`):
+
+| `EXTRACTION_REASONING_EFFORT` | scope | extract | derive | context needed |
+|---|---|---|---|---|
+| `low` (default) | 96 | 2048 | 400 | 12,288 |
+| `medium` | 1024 | 32768 | 400 | 43,008 |
+| `high` | 1024 | 32768 | 400 | 43,008 |
+
+- Derive is sent at `low` effort under every setting, so its cap is always
+  400. No effort run calls derive, so a higher effort there would ship
+  unmeasured.
+- `qwen` and `gemma` send no effort, so they keep `low`'s caps whatever the
+  setting says.
+- The context needed is the extract cap plus `PROMPT_RESERVE_TOKENS`
+  (10,240, above the largest measured r6 prompt of 9,327 tokens). When the
+  `n_ctx` llama-server reports is smaller, `/v1/info` reports no serving
+  identity and `serving_identity_error` names
+  `extract cap <c> + prompt reserve 10240 > observed n_ctx <n>`, and a job
+  that expects an identity gets 409. To run `medium` or `high`, set
+  `EXTRACTION_LLM_CTX_SIZE` to at least 43,008, for example 65,536. The
+  reserve fits the r6 prompt only, so a longer prompt needs it raised.
+- A medium extract call can take many minutes. Size
+  `EXTRACTION_LLM_TIMEOUT_SECONDS` for it: the value bounds each call both in
+  the engine and in the OpenAI clients.
+
+Length stops (operations note)
+------------------------------
+
+When a call stops at its output cap (`finish_reason == "length"`), the
+service logs one WARNING line before the stage handles the stop:
+
+    extraction length stop: cap <c> completion_tokens <n> reasoning_chars <r> content_chars <k> repeat <true|false>
+
+- `cap` is the cap the call was sent with, which names the stage, since the
+  three caps differ at every effort.
+- `repeat` is true when the last 200 characters of the call's tail (the last
+  2,000 characters of its reasoning followed by its content) occur at least
+  three times in that tail, which any loop with a period of 600 characters or
+  less does. True points to a repetition loop; false to reasoning that was
+  still going when the cap cut it.
+- The line holds counts and the flag only, never the response text, because
+  production turns are real conversations. Read it with
+  `docker logs mist-extraction-local` (or `mist-extraction-host`).
 
 Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `24`)
 --------------------------------------------------------------

@@ -355,6 +355,46 @@ class TestResolverPasses:
         assert out.entities[0]["id"] == "12000-requests-per-second"
 
     @pytest.mark.asyncio
+    async def test_metric_id_carries_quantity_so_two_quantities_do_not_collide(self, normalizer):
+        # Pass 4: a p95 and a p99 latency of one value and unit keep two ids.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "p95-latency",
+                        "name": "p95 latency",
+                        "type": "Metric",
+                        "properties": {"value": "120", "unit": "ms", "quantity": "p95 latency"},
+                    },
+                    {
+                        "id": "p99-latency",
+                        "name": "p99 latency",
+                        "type": "Metric",
+                        "properties": {"value": "120", "unit": "ms", "quantity": "p99 latency"},
+                    },
+                ]
+            )
+        )
+        assert [e["id"] for e in out.entities] == ["120-ms-p95-latency", "120-ms-p99-latency"]
+
+    @pytest.mark.asyncio
+    async def test_metric_id_rebuilt_from_value_and_quantity_without_unit(self, normalizer):
+        # Pass 4: a count has no unit, so value and quantity alone rebuild the id.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "max-queue-depth",
+                        "name": "max queue depth",
+                        "type": "Metric",
+                        "properties": {"value": 180, "quantity": "max queue depth"},
+                    }
+                ]
+            )
+        )
+        assert out.entities[0]["id"] == "180-max-queue-depth"
+
+    @pytest.mark.asyncio
     async def test_unknown_abstract_type_falls_back_to_abstraction(self, normalizer):
         # Pass 5: unknown type -> Abstraction fallback.
         out = await normalizer.normalize(

@@ -21,6 +21,10 @@ Of the F1 cells, relation F1 carries the gauntlet's cluster bootstrap when the r
 one (a summary written before the gauntlet recorded it shows `[no interval]`); the gauntlet
 computes no interval for a derived cell, so entity F1 and the list-only row carry none.
 
+The aligned relation rows and id agreement are the summary's own aligned figures (plan v8,
+D8), relations scored over aligned entity ids beside the exact ones; a summary written
+before the gauntlet recorded them shows n/a.
+
 A run with no run identity (a service from before contract 1.2.0, or a gauntlet from
 before it recorded one) shows as "unrecorded". Runs whose recorded identities differ, a
 run whose identity is unrecorded beside others, and a run with results stamped with an
@@ -151,6 +155,14 @@ def _f1(precision: float | None, recall: float | None) -> float | None:
     return 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
 
 
+def _aligned_cell(summary: dict[str, Any], key: str) -> str:
+    """An aligned figure with its interval; n/a for a summary written before aligned scoring."""
+    figure = summary.get(key)
+    if not isinstance(figure, dict):
+        return NOT_AVAILABLE
+    return _with_interval(figure.get("value"), figure.get("ci95"))
+
+
 def run_identity(run: Run) -> str | None:
     """The run's identity as the summary records it, or None when unrecorded."""
     value = run.summary.get("run_identity")
@@ -240,6 +252,10 @@ def _column(run: Run) -> dict[str, str]:
         "relation precision": _with_interval(s.get("rel_precision"), boot.get("rel_precision")),
         "relation recall": _with_interval(s.get("rel_recall"), boot.get("rel_recall")),
         "relation F1": _with_interval(s.get("rel_f1"), boot.get("rel_f1")),
+        "aligned relation precision": _aligned_cell(s, "aligned_relationship_precision"),
+        "aligned relation recall": _aligned_cell(s, "aligned_relationship_recall"),
+        "aligned relation F1": _aligned_cell(s, "aligned_relationship_f1"),
+        "id agreement": _fmt(_number(s.get("id_agreement"))),
         "typing accuracy": _with_interval(
             s.get("typing_accuracy"), wilson.get("typing_accuracy"), " Wilson"
         ),
@@ -299,6 +315,11 @@ def render_report(runs: list[Run], warnings: list[str]) -> str:
         "bootstrap when the run recorded one. Entity F1 and the list-only row carry no "
         "interval. Entity F1 is 2PR/(P+R) of the precision and recall shown. The list-only "
         "row pools the relation counts of probes whose tag slug starts with `list-`.",
+        "",
+        "The aligned relation rows score relations over aligned entity ids (plan v8, D8), "
+        "each with the gauntlet's cluster bootstrap; a run scored before aligned scoring "
+        "shows n/a. Id agreement is the share of aligned entity pairs whose ids the graph "
+        "stores as one node.",
     ]
     if warnings:
         lines += ["", "## Warnings", ""]

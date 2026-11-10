@@ -17,6 +17,7 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,19 @@ from backend.knowledge.extraction.validator import (  # noqa: E402
 from backend.knowledge.ontologies.hierarchy import (  # noqa: E402
     canonical_type,
     children_of,
-    parent_of,
+)
+
+# `types_match` lives with the other id form rules and is re-exported here for its callers.
+from scripts.eval_harness.entity_alignment import (  # noqa: E402
+    ALIGNMENT_KINDS,
+    EXCLUSION_EXEMPT_KINDS,
+    PENDING_KINDS,
+    AlignedPair,
+    EntityRef,
+    align_entities,
+    candidate_pairs,
+    match_relations,
+    types_match,
 )
 from scripts.golden_log.native_shape import (  # noqa: E402
     GOLD_PREDICATE_FIELD,
@@ -57,6 +70,8 @@ from scripts.golden_log.native_shape import (  # noqa: E402
     native_predicate,
     native_properties,
 )
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 EXTRACTION_CALL_SITE = "extraction.ontology"
 EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
@@ -80,23 +95,30 @@ def canonical_id(name: str) -> str:
 def _produced_entity_match_id(raw_id: str, etype: str, properties: dict[str, Any]) -> str:
     """Canonical match id for a PRODUCED entity, mirroring the normalizer.
 
-    For a Metric entity (after `canonical_type`) carrying non-null `value` and a
-    truthy `unit` in its properties, the id is rebuilt as `canonical_metric_id`
-    (value-first), so a model that emits `requests-per-second-12000` collapses to
-    the gold-canonical `12000-requests-per-second`. This is the SHARED helper the
-    production normalizer uses -- not a parallel reimplementation -- so the F2
-    score reflects the post-normalizer behavior on these surface splits.
+    For a Metric entity (after `canonical_type`) carrying a non-null `value` and a
+    truthy `unit` or `quantity` in its properties, the id is rebuilt as
+    `canonical_metric_id(value, unit, quantity)`, `<value>-<unit>[-<quantity>]`. So a
+    model that emits `requests-per-second-12000` collapses to the gold-canonical
+    `12000-requests-per-second`, and a p95 and a p99 latency of `120 ms` score as two
+    entities, not one. This is the SHARED helper the production normalizer's Pass 4
+    uses, called on the same properties under the same condition -- not a parallel
+    reimplementation -- so the F2 score reflects the post-normalizer id.
 
-    Falls back to the plain string `canonical_id` when the type is not Metric or
-    when value/unit are absent. Gold is NOT passed through here: gold Metric
-    entities are authored with the canonical id and may not carry value/unit.
+    A Metric without that value and a unit or quantity falls back to
+    `canonical_metric_id_from_id`, which moves a single numeric token to the front.
+    Any other type falls back to the plain string `canonical_id`. Gold is NOT passed
+    through here: gold Metric entities are authored with the canonical id and may not
+    carry value/unit.
     """
     if canonical_type(etype) == "Metric":
         value = properties.get("value")
         unit = properties.get("unit")
-        if value is not None and unit:
-            return canonical_metric_id(value, str(unit))
-        return canonical_metric_id_from_id(raw_id)  # string fallback: no value/unit props
+        quantity = properties.get("quantity")
+        if value is not None and (unit or quantity):
+            return canonical_metric_id(
+                value, str(unit) if unit else None, str(quantity) if quantity else None
+            )
+        return canonical_metric_id_from_id(raw_id)  # string fallback: no rebuildable props
     return canonical_id(raw_id)
 
 
@@ -110,6 +132,9 @@ class GoldEntity:
 
     id: str
     type: str
+    # Other canonical ids gold accepts for this entity, where the labelling rules admit two
+    # forms; only the aligned scoring reads them.
+    alternatives: tuple[str, ...] = ()
 
 
 VALID_ASSERTION_KINDS = ("assert", "cease", "retract")
@@ -124,6 +149,10 @@ class GoldRel:
     (optionally bounded by `valid_to`), `retract` states it was never true.
     Bucket scoring on this label lands in a later C3 task; the loader validates
     it here so an unknown value fails loudly at corpus-author time.
+
+    `predicate_alternatives` are other predicates gold accepts for the edge, read only by
+    the aligned scoring. `beyond_prompt` marks an edge that a labelling rule beyond the
+    extraction prompt added, so a report can score the asked-for relations apart.
     """
 
     source: str
@@ -134,6 +163,8 @@ class GoldRel:
     valid_from: str | None = None
     valid_to: str | None = None
     assertion_kind: str = "assert"
+    predicate_alternatives: tuple[str, ...] = ()
+    beyond_prompt: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +200,11 @@ def iter_gold_probes(path: Path) -> list[GoldProbe]:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
             entities = tuple(
-                GoldEntity(id=canonical_id(e["id"]), type=e["type"])
+                GoldEntity(
+                    id=canonical_id(e["id"]),
+                    type=e["type"],
+                    alternatives=tuple(canonical_id(a) for a in e.get("alternatives", ())),
+                )
                 for e in obj.get("expected_entities", [])
             )
             tag = obj.get("tag", f"probe-{line_no}")
@@ -183,6 +218,8 @@ def iter_gold_probes(path: Path) -> list[GoldProbe]:
                     valid_from=r.get(GOLD_VALID_FROM_FIELD),
                     valid_to=r.get(GOLD_VALID_TO_FIELD),
                     assertion_kind=str(r.get("assertion_kind", "assert")),
+                    predicate_alternatives=tuple(r.get("predicate_alternatives", ())),
+                    beyond_prompt=bool(r.get("beyond_prompt", False)),
                 )
                 for r in obj.get("expected_relationships", [])
             )
@@ -343,6 +380,20 @@ class Report:
     # total omission would still clear the 0.80 overall-recall gate.
     assertion_kind_buckets: dict[str, dict[str, int]] = field(default_factory=dict)
     per_probe: list[dict[str, Any]] = field(default_factory=list)
+    # Relations scored over aligned entity ids (plan v8, D8): each produced id stands for
+    # at most one gold id, paired by `entity_alignment.align_entities`. The exact counts
+    # above are unchanged by them.
+    aligned_rel_tp: int = 0
+    aligned_rel_fp: int = 0
+    aligned_rel_fn: int = 0
+    # Counted pairs of the kinds a rail or gold makes equal (exact, alternative, event-date,
+    # metric), and all counted pairs; their ratio is `id_agreement`.
+    id_rail_pairs: int = 0
+    id_aligned_pairs: int = 0
+    alignment_kinds: dict[str, int] = field(default_factory=dict)
+    # Every typo or paraphrase candidate that could count if accepted: tag, utterance,
+    # gold id and type, produced id and type, kind, accepted.
+    pending_pairs: list[dict[str, Any]] = field(default_factory=list)
 
     @staticmethod
     def _pr(tp: int, fp: int, fn: int) -> tuple[float, float]:
@@ -389,6 +440,31 @@ class Report:
     def rel_recall_denominator(self) -> int:
         """Comparisons behind `rel_recall`: TP + FN gold relationships."""
         return self.rel_tp + self.rel_fn
+
+    @property
+    def aligned_rel_precision(self) -> float:
+        """Relationship precision with endpoints compared through the entity alignment."""
+        return self._pr(self.aligned_rel_tp, self.aligned_rel_fp, self.aligned_rel_fn)[0]
+
+    @property
+    def aligned_rel_recall(self) -> float:
+        """Relationship recall with endpoints compared through the entity alignment."""
+        return self._pr(self.aligned_rel_tp, self.aligned_rel_fp, self.aligned_rel_fn)[1]
+
+    @property
+    def aligned_rel_f1(self) -> float:
+        """F1 of the aligned relationship counts, 1.0 when there is nothing to count."""
+        denominator = 2 * self.aligned_rel_tp + self.aligned_rel_fp + self.aligned_rel_fn
+        return 2 * self.aligned_rel_tp / denominator if denominator else 1.0
+
+    @property
+    def id_agreement(self) -> float:
+        """Share of counted pairs whose ids the graph stores as one node, 1.0 with none.
+
+        A pair of kinds 5 to 8 (n1, reorder, typo, paraphrase) is two nodes in the graph,
+        so a fall in this share is recall bought by fragmenting the graph.
+        """
+        return self.id_rail_pairs / self.id_aligned_pairs if self.id_aligned_pairs else 1.0
 
     @property
     def typing_accuracy(self) -> float:
@@ -452,27 +528,72 @@ def _typing_ok(predicate: str, s_type: str | None, t_type: str | None) -> bool:
     return True
 
 
-def types_match(produced: str, gold: str) -> bool:
-    """Hierarchy-aware entity type comparison.
+def _occurred_on(keys: Collection[tuple[str, str, str]]) -> dict[str, str]:
+    """Each source's earliest `OCCURRED_ON` date among the keys whose target is an ISO date."""
+    dates: dict[str, str] = {}
+    for source, predicate, target in keys:
+        if predicate == "OCCURRED_ON" and _ISO_DATE_RE.match(target):
+            dates[source] = min(dates.get(source, target), target)
+    return dates
 
-    A produced type matches gold if it equals the canonical form of gold, OR if
-    it equals gold's parent type (Abstraction is acceptable when gold is a concrete
-    abstract-cluster leaf such as Concept or Skill). Wrong-sibling is the only miss.
 
-    Both sides are canonicalized first so retired types (Topic -> Concept,
-    Milestone -> Event) on either the produced or gold side resolve correctly.
+def gold_entity_refs(probe: GoldProbe) -> list[EntityRef]:
+    """The probe's gold entities and relation endpoints, as the aligner reads them.
+
+    An endpoint that is not a listed entity takes its type from the relation, and every
+    entity takes the date of its own `OCCURRED_ON` edge in the probe.
     """
-    g = canonical_type(gold)
-    p = canonical_type(produced)
-    return p == g or p == parent_of(g)
+    dates = _occurred_on([(r.source, r.predicate, r.target) for r in probe.relationships])
+    types: dict[str, str | None] = {}
+    alternatives: dict[str, tuple[str, ...]] = {}
+    for e in probe.entities:
+        types.setdefault(e.id, e.type or None)
+        alternatives.setdefault(e.id, e.alternatives)
+    for r in probe.relationships:
+        types.setdefault(r.source, r.source_type or None)
+        types.setdefault(r.target, r.target_type or None)
+    return [
+        EntityRef(i, t, alternatives.get(i, ()), dates.get(i)) for i, t in sorted(types.items())
+    ]
 
 
-def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> Report:
+def produced_entity_refs(produced: Produced) -> list[EntityRef]:
+    """The produced entities and relation endpoints, as the aligner reads them.
+
+    An endpoint with no entity of its own is untyped, which the aligner treats as
+    compatible with any gold type.
+    """
+    keys = [(r["source"], r["predicate"], r["target"]) for r in produced.relationships]
+    dates = _occurred_on(keys)
+    ids = {e.id for e in produced.entities}
+    ids.update(i for s, _, t in keys for i in (s, t))
+    return [
+        EntityRef(i, produced.entity_type_by_id.get(i) or None, (), dates.get(i))
+        for i in sorted(ids)
+    ]
+
+
+def score_run(
+    probes: list[GoldProbe],
+    produced_index: dict[str, Produced],
+    *,
+    accepted_pairs: Collection[tuple[str, str, str]] = (),
+) -> Report:
+    """Score every probe on exact ids, and its relations again over aligned entity ids.
+
+    `accepted_pairs` holds (probe tag, gold id, produced id) rows an adjudicator accepted;
+    a typo or paraphrase pair counts only when its own probe's row lists it, so with the
+    default none counts and each such pair scores as a miss and a false positive.
+    """
     report = Report(total_probes=len(probes))
     # Initialize all three kinds so an absent bucket reads zeros (not KeyError):
     # a corpus with no retract gold must still surface retract: 0/0 0/0.
     for kind in VALID_ASSERTION_KINDS:
         report.assertion_kind_buckets[kind] = {"gold_total": 0, "found": 0, "correct": 0}
+    report.alignment_kinds = dict.fromkeys(ALIGNMENT_KINDS, 0)
+    accepted_by_tag: dict[str, set[tuple[str, str]]] = {}
+    for tag, gold_id, produced_id in accepted_pairs:
+        accepted_by_tag.setdefault(tag, set()).add((gold_id, produced_id))
     for probe in probes:
         produced = produced_index.get(_norm_ws(probe.utterance))
         if produced is not None:
@@ -535,6 +656,56 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
         report.rel_fp += len(prod_rel_keys - gold_rel_keys)
         report.rel_fn += len(gold_rel_keys - prod_rel_keys)
 
+        aligned_pairs: tuple[AlignedPair, ...] = ()
+        if produced is not None:
+            gold_refs = gold_entity_refs(probe)
+            produced_refs = produced_entity_refs(produced)
+            accepted = accepted_by_tag.get(probe.tag, set())
+            aligned_pairs = align_entities(gold_refs, produced_refs, accepted=accepted)
+            # A pending candidate is listed only when neither id is held by a counted pair
+            # of a rail or form kind, since only then could accepting it change the score.
+            held_gold = {p.gold_id for p in aligned_pairs if p.kind not in PENDING_KINDS}
+            held_produced = {p.produced_id for p in aligned_pairs if p.kind not in PENDING_KINDS}
+            gold_types = {r.id: r.type for r in gold_refs}
+            produced_types = {r.id: r.type for r in produced_refs}
+            for pair in candidate_pairs(gold_refs, produced_refs):
+                if pair.kind not in PENDING_KINDS:
+                    continue
+                if pair.gold_id in held_gold or pair.produced_id in held_produced:
+                    continue
+                report.pending_pairs.append(
+                    {
+                        "tag": probe.tag,
+                        "utterance": probe.utterance,
+                        "gold_id": pair.gold_id,
+                        "gold_type": gold_types[pair.gold_id],
+                        "produced_id": pair.produced_id,
+                        "produced_type": produced_types[pair.produced_id],
+                        "kind": pair.kind,
+                        "accepted": (pair.gold_id, pair.produced_id) in accepted,
+                    }
+                )
+        for pair in aligned_pairs:
+            report.alignment_kinds[pair.kind] += 1
+            report.id_aligned_pairs += 1
+            report.id_rail_pairs += pair.kind in EXCLUSION_EXEMPT_KINDS
+        predicate_alternatives: dict[tuple[str, str, str], tuple[str, ...]] = {}
+        for r in probe.relationships:
+            key = (r.source, r.predicate, r.target)
+            known = predicate_alternatives.get(key, ())
+            predicate_alternatives[key] = known + tuple(
+                a for a in r.predicate_alternatives if a not in known
+            )
+        aligned = match_relations(
+            sorted(gold_rel_keys),
+            sorted(prod_rel_keys),
+            aligned_pairs,
+            predicate_alternatives=predicate_alternatives,
+        )
+        report.aligned_rel_tp += len(aligned.found)
+        report.aligned_rel_fp += len(aligned.extra)
+        report.aligned_rel_fn += len(aligned.missed)
+
         for gr in probe.relationships:
             bucket = report.assertion_kind_buckets[gr.assertion_kind]
             bucket["gold_total"] += 1
@@ -594,6 +765,9 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
                 "entity_fns": entity_fns,
                 "rel_fps": rel_fps,
                 "rel_fns": rel_fns,
+                "aligned_rel_fps": sorted(list(t) for t in aligned.extra),
+                "aligned_rel_fns": sorted(list(t) for t in aligned.missed),
+                "aligned_pairs": [[p.gold_id, p.produced_id, p.kind] for p in aligned_pairs],
             }
         )
     return report

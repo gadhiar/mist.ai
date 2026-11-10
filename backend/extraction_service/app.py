@@ -45,17 +45,16 @@ from backend.extraction_contract.models import (
 )
 from backend.extraction_service.adapters import ModelFamilyAdapter, get_adapter
 from backend.extraction_service.engine import (
-    DERIVE_MAX_TOKENS,
-    EXTRACT_MAX_TOKENS,
     LIST_BATCH_MAX_UNITS,
     LIST_CONTEXT_MAX_UNITS,
+    PROMPT_RESERVE_TOKENS,
     RUN_IDENTITY_CODE,
-    SCOPE_MAX_TOKENS,
     ExtractionEngine,
     ExtractionTimeoutError,
     InvalidRequestError,
     UpstreamLLMError,
     _compute_prompt_sha256,
+    effective_cap,
     parse_recorded_at,
 )
 from backend.extraction_service.settings import SERVER_ENV_PREFIX, ServiceSettings
@@ -329,8 +328,9 @@ def run_identity_components(
     """The run identity's components for a service running `settings` with `adapter`.
 
     Every value is read from where the engine reads it: the prompt hash from
-    the same function the engine stamps with, the token and list-pass limits
-    from the engine's constants, and the constrained mode as the engine resolves it
+    the same function the engine stamps with, each stage's token cap as the
+    engine sizes it for `adapter` (`effective_cap`), the list-pass limits from
+    the engine's constants, and the constrained mode as the engine resolves it
     (`settings.constrained_mode or adapter.default_constrained_mode`).
     """
     return RunIdentityComponents(
@@ -347,9 +347,9 @@ def run_identity_components(
         temperature=settings.temperature,
         max_attempts=settings.max_attempts,
         scope_enabled=settings.scope_enabled,
-        scope_max_tokens=SCOPE_MAX_TOKENS,
-        extract_max_tokens=EXTRACT_MAX_TOKENS,
-        derive_max_tokens=DERIVE_MAX_TOKENS,
+        scope_max_tokens=effective_cap(adapter, "scope"),
+        extract_max_tokens=effective_cap(adapter, "extract"),
+        derive_max_tokens=effective_cap(adapter, "derive"),
         list_batch_max_units=LIST_BATCH_MAX_UNITS,
         list_context_max_units=LIST_CONTEXT_MAX_UNITS,
     )
@@ -377,8 +377,17 @@ def serving_identity_components(
     )
 
 
-def _serving_identity_error(settings: ServiceSettings, props: PropsRead) -> str | None:
-    """Why the service has no serving identity for this call, or None when it has one."""
+def _serving_identity_error(
+    settings: ServiceSettings, props: PropsRead, extract_cap: int
+) -> str | None:
+    """Why the service has no serving identity for this call, or None when it has one.
+
+    Beside the declarations, the extract cap plus `PROMPT_RESERVE_TOKENS` must
+    fit the observed context. A deployment whose longest extract call could
+    exceed its context (medium's caps at the 16,384 compose default) gets no
+    identity, and `/v1/info` names the shortfall, the same way a declared
+    context size that differs from the observed one is reported.
+    """
     declared = dict(settings.server_config)
     problems: list[str] = []
     missing = [key for key in REQUIRED_SERVER_KEYS if not declared.get(key)]
@@ -396,6 +405,11 @@ def _serving_identity_error(settings: ServiceSettings, props: PropsRead) -> str 
         else:
             if not matches:
                 problems.append(f"declared ctx_size {ctx_size} != observed n_ctx {props.n_ctx}")
+    if props.n_ctx is not None and extract_cap + PROMPT_RESERVE_TOKENS > props.n_ctx:
+        problems.append(
+            f"extract cap {extract_cap} + prompt reserve {PROMPT_RESERVE_TOKENS} "
+            f"> observed n_ctx {props.n_ctx}"
+        )
     return "; ".join(problems) or None
 
 
@@ -478,7 +492,7 @@ def create_app(
     async def serving_view() -> _ServingView:
         # Read for every call: the context size is observed, never cached.
         props = await ctx_size_source.read()
-        error = _serving_identity_error(settings, props)
+        error = _serving_identity_error(settings, props, engine.stage_cap("extract"))
         if props.n_ctx is None:
             return _ServingView(props=props, identity=None, components=None, error=error)
         components = serving_identity_components(settings, engine, props.n_ctx)
@@ -714,7 +728,16 @@ def build_app(
 
 
 def build_app_from_env() -> FastAPI:
-    """Wire the real `LlamaServerProvider` and health probe from env vars."""
+    """Wire the real `LlamaServerProvider` and health probe from env vars.
+
+    The provider's clients take `llm_timeout_seconds`, the bound the engine's
+    `asyncio.wait_for` puts on each call, so the SDK's 600 s read default no
+    longer cuts a call the engine still allows.
+    """
     settings = ServiceSettings.from_env()
-    llm = LlamaServerProvider(base_url=settings.llm_base_url, model=settings.model_file)
+    llm = LlamaServerProvider(
+        base_url=settings.llm_base_url,
+        model=settings.model_file,
+        timeout=settings.llm_timeout_seconds,
+    )
     return build_app(settings, llm, httpx.AsyncClient())
