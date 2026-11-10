@@ -1276,6 +1276,21 @@ _RELABELLED_ROWS: dict[tuple[str, str], tuple[set, set]] = {
             )
         },
     ),
+    # N14: the utterance names the kind; "daily" qualifies the use and is not part of it.
+    ("sixty", "ext-13-uses-editor"): (
+        {("user", "User"), ("editor", "Concept"), ("neovim", "Technology")},
+        {("neovim", "IS_A", "editor", None), ("user", "USES", "neovim", None)},
+    ),
+    # N1's habit clause is retired (A30, Ruling 22): a habit id is the utterance's own phrase.
+    ("sixty", "ext-55-habit"): (
+        {("user", "User"), ("journal", "Concept")},
+        {("user", "HAS_HABIT", "journal", None)},
+    ),
+    # N15: an activity keeps its object.
+    ("sixty", "ext-58-dateentity-stative-since"): (
+        {("user", "User"), ("mentoring-junior-engineers", "Skill")},
+        {("user", "EXPERT_IN", "mentoring-junior-engineers", "2026-02")},
+    ),
 }
 _RELABEL_SETS = {"dev-lists": _DEV_GOLD, "sixty": _SIXTY}
 
