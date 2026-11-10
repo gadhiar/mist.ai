@@ -893,15 +893,15 @@ def _aligned_gold(*, flag: bool = False) -> list[dict]:
     return [
         {
             "tag": "syn-01-list-tools",
-            "utterance": "Tools: the Quillpad and the Brindle app",
+            "utterance": "Tools: Quill Pad and the Brindle app",
             "expected_entities": [
                 _ent("user", "User"),
-                _ent("quillpad", "Tool"),
-                _ent("brindle-app", "Tool"),
+                _ent("quill-pad", "Technology"),
+                _ent("brindle-app", "Technology"),
             ],
             "expected_relationships": [
-                _typed_rel("user", "User", "USES", "quillpad", "Tool"),
-                _typed_rel("user", "User", "USES", "brindle-app", "Tool"),
+                _typed_rel("user", "User", "USES", "quill-pad", "Technology"),
+                _typed_rel("user", "User", "USES", "brindle-app", "Technology"),
             ],
         },
         {
@@ -930,7 +930,7 @@ def _raw_row(probe: dict, entities: list[tuple[str, str]], edges: list[tuple[str
 
 
 def _aligned_inputs(tmp_path: Path, *, gold_name: str = "gold.jsonl", flag: bool = False):
-    """Gold, a candidate run (an n1 id, a typo id, one exact probe) and a run exact on both."""
+    """Gold, a candidate run (a reorder id, a typo id, one exact probe) and a run exact on both."""
     data = tmp_path / "aligned-data"
     data.mkdir()
     gold = _aligned_gold(flag=flag)
@@ -938,8 +938,8 @@ def _aligned_inputs(tmp_path: Path, *, gold_name: str = "gold.jsonl", flag: bool
     cand = [
         _raw_row(
             first,
-            [("user", "User"), ("the-quillpad", "Tool"), ("brindel-app", "Tool")],
-            [("user", "USES", "the-quillpad"), ("user", "USES", "brindel-app")],
+            [("user", "User"), ("pad-quill", "Technology"), ("brindel-app", "Technology")],
+            [("user", "USES", "pad-quill"), ("user", "USES", "brindel-app")],
         ),
         _raw_row(
             second, [("user", "User"), ("orla-venn", "Person")], [("user", "KNOWS", "orla-venn")]
@@ -948,8 +948,8 @@ def _aligned_inputs(tmp_path: Path, *, gold_name: str = "gold.jsonl", flag: bool
     base = [
         _raw_row(
             first,
-            [("user", "User"), ("quillpad", "Tool"), ("brindle-app", "Tool")],
-            [("user", "USES", "quillpad"), ("user", "USES", "brindle-app")],
+            [("user", "User"), ("quill-pad", "Technology"), ("brindle-app", "Technology")],
+            [("user", "USES", "quill-pad"), ("user", "USES", "brindle-app")],
         ),
         cand[1],
     ]
@@ -995,8 +995,8 @@ def test_the_aligned_line_carries_typing_and_list_only_recall(tmp_path: Path) ->
     result = _run_aligned(_aligned_inputs(tmp_path), ["cand"])
     assert result.returncode == 0, result.stderr
     line = _aligned_line(result, "cand")
-    # syn-01: the n1 id finds one relation, the unaccepted typo id is a miss and an extra;
-    # syn-02 is exact. Pairs: user twice and orla-venn exact, the-quillpad n1.
+    # syn-01: the reorder id finds one relation, the unaccepted typo id is a miss and an extra;
+    # syn-02 is exact. Pairs: user twice and orla-venn exact, pad-quill reorder.
     counts = {"syn-01-list-tools": (1, 1, 1), "syn-02-prose": (1, 0, 0)}
     head, _, rest = line.partition("; typing ")
     assert head == (
@@ -1008,7 +1008,7 @@ def test_the_aligned_line_carries_typing_and_list_only_recall(tmp_path: Path) ->
     assert re.match(r"\d\.\d{3} \(\d/3\); list-only recall ", rest), rest
     assert line.endswith(
         "; list-only recall 0.500 (1/2); kinds exact=3 "
-        f"{_KINDS_NONE} n1=1 reorder=0 typo=0 paraphrase=0; pending 1 accepted 0"
+        f"{_KINDS_NONE} n1=0 reorder=1 typo=0 paraphrase=0; pending 1 accepted 0"
     )
     # The exact lines are still there, unchanged in form.
     assert "[cand] relation recall: 0.333 (1/3)" in _lines(result, "cand")
@@ -1046,11 +1046,11 @@ def test_a_pairs_file_holds_no_run_name(tmp_path: Path) -> None:
     assert [json.loads(line) for line in text.splitlines()] == [
         {
             "tag": "syn-01-list-tools",
-            "utterance": "Tools: the Quillpad and the Brindle app",
+            "utterance": "Tools: Quill Pad and the Brindle app",
             "gold_id": "brindle-app",
-            "gold_type": "Tool",
+            "gold_type": "Technology",
             "produced_id": "brindel-app",
-            "produced_type": "Tool",
+            "produced_type": "Technology",
             "kind": "typo",
         }
     ]

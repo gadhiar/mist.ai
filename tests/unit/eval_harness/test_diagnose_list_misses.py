@@ -103,15 +103,17 @@ CLASS_CASES = [
     ),
     (
         "ID_VARIANT",
+        # A leading article is now dropped by the N1 rail, so the variant is an article
+        # inside the id, which the rail leaves and the classifier reads as `n1`.
         _probe(
             "p",
-            {"user": "User", "acme-corp": "Organization"},
-            [("user", "User", "WORKS_AT", "acme-corp", "Organization")],
+            {"user": "User", "history-of-rome": "Concept"},
+            [("user", "User", "INTERESTED_IN", "history-of-rome", "Concept")],
         ),
         _record(
             "p",
-            {"user": "User", "The Acme Corp": "Organization"},
-            [("user", "WORKS_AT", "the-acme-corp")],
+            {"user": "User", "history-of-the-rome": "Concept"},
+            [("user", "INTERESTED_IN", "history-of-the-rome")],
         ),
         "n1",
     ),
@@ -186,7 +188,8 @@ CLASS_CASES = [
         "WRONG_ENDPOINT",
         _probe("p", RUST, [("user", "User", "USES", "rust", "Technology")]),
         _record("p", {**RUST, "golang": "Technology"}, [("user", "USES", "golang")]),
-        "target golang",
+        # The produced `golang` is stored under its alias `go`.
+        "target go",
     ),
     (
         "PARENT_LINK_OMITTED",
@@ -238,12 +241,13 @@ FAN_OUT_SOURCE = _probe(
 def test_a_sibling_holding_the_shared_source_and_predicate_is_not_a_wrong_endpoint(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # `js` is the model's id for the `javascript` item: it matches no gold entity, so the edge
-    # `user USES js` is the sibling item's, not a wrong target for `python` or `rust`.
+    # `ecmascript` is the model's id for the `javascript` item: it matches no gold entity, so
+    # the edge `user USES ecmascript` is the sibling item's, not a wrong target for `python` or
+    # `rust`. (`js` no longer serves: the id rails store it under its alias `javascript`.)
     record = _record(
         "fan",
-        {"user": "User", "python": "Technology", "rust": "Technology", "js": "Technology"},
-        [("user", "USES", "js")],
+        {"user": "User", "python": "Technology", "rust": "Technology", "ecmascript": "Technology"},
+        [("user", "USES", "ecmascript")],
     )
     misses, _ = _run(tmp_path, [FAN_OUT_SOURCE], [record], capsys)
     assert misses == {

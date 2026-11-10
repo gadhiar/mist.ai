@@ -306,13 +306,13 @@ def test_runs_as_a_module(tmp_path: Path) -> None:
 # answerer or on gold
 # ---------------------------------------------------------------------------
 #
-# One invented probe, scored by this checkout's scorer: gold `quillpad`, `brindle-app` and
-# `kestrel`; the raw names them `the-quillpad` (n1), `brindel-app` (typo, pending) and
+# One invented probe, scored by this checkout's scorer: gold `quill-pad`, `brindle-app` and
+# `kestrel`; the raw names them `pad-quill` (reorder), `brindel-app` (typo, pending) and
 # `kestrel` (exact). The worksheet's misses are the two the exact scorer misses, numbered in
 # its sorted order.
 
 _TAG = "syn-01-list-tools"
-_UTTERANCE = "Tools: the Quillpad, the Brindle app and Kestrel"
+_UTTERANCE = "Tools: Quill Pad, the Brindle app and Kestrel"
 
 
 def _aligned_worksheet() -> list[dict[str, object]]:
@@ -331,12 +331,12 @@ def _aligned_worksheet() -> list[dict[str, object]]:
             "utterance": _UTTERANCE,
             "gold_entities": [
                 ["user", "User"],
-                ["quillpad", "Tool"],
-                ["brindle-app", "Tool"],
-                ["kestrel", "Tool"],
+                ["quill-pad", "Technology"],
+                ["brindle-app", "Technology"],
+                ["kestrel", "Technology"],
             ],
             "gold_relations": [
-                ["user", "USES", "quillpad"],
+                ["user", "USES", "quill-pad"],
                 ["user", "USES", "brindle-app"],
                 ["user", "USES", "kestrel"],
             ],
@@ -352,9 +352,9 @@ def _aligned_worksheet() -> list[dict[str, object]]:
             },
             "items": [
                 item("miss", 1, ["user", "USES", "brindle-app"]),
-                item("miss", 2, ["user", "USES", "quillpad"]),
+                item("miss", 2, ["user", "USES", "quill-pad"]),
                 item("fp", 1, ["user", "USES", "brindel-app"]),
-                item("fp", 2, ["user", "USES", "the-quillpad"]),
+                item("fp", 2, ["user", "USES", "pad-quill"]),
             ],
         }
     ]
@@ -370,7 +370,7 @@ def _aligned_raw(produced: list[str]) -> list[dict[str, object]]:
                 "payload": {
                     "entities": [
                         {"id": "user", "type": "User"},
-                        *({"id": i, "type": "Tool"} for i in produced),
+                        *({"id": i, "type": "Technology"} for i in produced),
                     ],
                     "relationships": [
                         {"source": "user", "type": "USES", "target": i} for i in produced
@@ -392,7 +392,7 @@ def _aligned_main(
     adjudication = _write(tmp_path / "adjudication.jsonl", rows)
     raw = _write(
         tmp_path / "raw.jsonl",
-        _aligned_raw(produced or ["the-quillpad", "brindel-app", "kestrel"]),
+        _aligned_raw(produced or ["pad-quill", "brindel-app", "kestrel"]),
     )
     return adjudicated.main(
         [
@@ -419,7 +419,7 @@ def test_the_aligned_check_passes_when_it_credits_only_scorer_artifacts(
 ) -> None:
     assert _aligned_main(tmp_path, _ARTIFACTS) == 0
     out = capsys.readouterr().out
-    # Both misses are credited: the n1 pair at once, the typo pair as if accepted.
+    # Both misses are credited: the reorder pair at once, the typo pair as if accepted.
     assert (
         "aligned credits by class: answerer_error 0, gold_wrong 0, scorer_artifact 2, ambiguous 0"
         in out.splitlines()
@@ -431,7 +431,7 @@ def test_the_aligned_check_passes_when_it_credits_only_scorer_artifacts(
 @pytest.mark.parametrize(
     ("item_id", "cls"),
     [("miss:2", "answerer_error"), ("miss:1", "gold_wrong"), ("miss:1", "answerer_error")],
-    ids=["n1-answerer-error", "typo-gold-wrong", "pending-typo-answerer-error"],
+    ids=["reorder-answerer-error", "typo-gold-wrong", "pending-typo-answerer-error"],
 )
 def test_an_aligned_credit_on_an_answerer_error_or_gold_wrong_miss_exits_1(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], item_id: str, cls: str
@@ -455,7 +455,7 @@ def test_a_miss_the_aligner_does_not_credit_is_not_counted(
         for item_id, cls in {**_ARTIFACTS, "miss:1": "answerer_error"}.items()
     ]
     adjudication = _write(tmp_path / "adjudication.jsonl", rows)
-    raw = _write(tmp_path / "raw.jsonl", _aligned_raw(["the-quillpad", "brandle-tool", "kestrel"]))
+    raw = _write(tmp_path / "raw.jsonl", _aligned_raw(["pad-quill", "brandle-tool", "kestrel"]))
     code = adjudicated.main(
         ["--worksheet", str(path), "--adjudication", str(adjudication), "--aligned-check", str(raw)]
     )
@@ -470,8 +470,8 @@ def test_a_miss_the_aligner_does_not_credit_is_not_counted(
 def test_a_raw_that_is_not_the_worksheets_run_exits_1(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # This raw finds `quillpad` exactly, so its exact misses are not the worksheet's.
-    assert _aligned_main(tmp_path, _ARTIFACTS, ["quillpad", "brindel-app", "kestrel"]) == 1
+    # This raw finds `quill-pad` exactly, so its exact misses are not the worksheet's.
+    assert _aligned_main(tmp_path, _ARTIFACTS, ["quill-pad", "brindel-app", "kestrel"]) == 1
     captured = capsys.readouterr()
     assert _TAG in captured.err
     assert "aligned credits" not in captured.out

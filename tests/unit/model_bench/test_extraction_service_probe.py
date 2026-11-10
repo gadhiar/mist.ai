@@ -10,10 +10,11 @@ in `tmp_path`, except the echo test that reads the real gold corpus from the rep
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ from backend.extraction_contract.models import (  # noqa: E402
     TimingsMs,
     error_envelope,
 )
+from backend.knowledge.extraction.id_rails import event_date_rail  # noqa: E402
 from backend.knowledge.extraction.scope_classifier import SCOPE_USER_TEMPLATE  # noqa: E402
 from scripts.eval_harness.score_extraction_run import GoldProbe, iter_gold_probes  # noqa: E402
 from scripts.golden_log.native_shape import (  # noqa: E402
@@ -90,6 +92,25 @@ def echo_payload(gold: GoldProbe) -> dict[str, list[dict[str, Any]]]:
             for r in gold.relationships
         ],
     }
+
+
+def _share_the_event_date_rail_leaves(probes: Iterable[GoldProbe]) -> tuple[float, float]:
+    """The share of echoed entities and relations whose ids the Event-date rail leaves."""
+    entities = moved_entities = rels = moved_rels = 0
+    for gold in probes:
+        payload = copy.deepcopy(echo_payload(gold))
+        moved = {
+            old: new
+            for old, new in event_date_rail(payload["entities"], payload["relationships"]).items()
+            if old != new
+        }
+        entities += len(payload["entities"])
+        moved_entities += len(moved)
+        rels += len(payload["relationships"])
+        moved_rels += sum(
+            1 for r in payload["relationships"] if r["source"] in moved or r["target"] in moved
+        )
+    return (entities - moved_entities) / entities, (rels - moved_rels) / rels
 
 
 RUN_IDENTITY = "ri1-" + "c" * 64
@@ -463,10 +484,15 @@ async def test_echo_service_on_real_corpus_is_perfect_complete_and_sequential(
     summary = read_summary(out)
     assert summary["complete"] is True
     assert summary["total_probes"] == summary["matched_probes"] == len(state.received) == 60
-    assert summary["entity_precision"] == 1.0
-    assert summary["entity_recall"] == 1.0
-    assert summary["rel_precision"] == 1.0
-    assert summary["rel_recall"] == 1.0
+    # The echo is exact apart from what the Event-date rail moves: produced Event ids gain
+    # their date, while gold keeps its labelled ids (ADR-054; the aligner's event-date kind
+    # bridges them).
+    entity_share, rel_share = _share_the_event_date_rail_leaves(state.gold.values())
+    assert entity_share < 1.0
+    assert summary["entity_precision"] == pytest.approx(entity_share)
+    assert summary["entity_recall"] == pytest.approx(entity_share)
+    assert summary["rel_precision"] == pytest.approx(rel_share)
+    assert summary["rel_recall"] == pytest.approx(rel_share)
     assert summary["cases_not_run"] == 0
     assert summary["run"]["stopped_reason"] is None
 
