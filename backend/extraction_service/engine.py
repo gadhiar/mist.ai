@@ -145,7 +145,9 @@ STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
 )
 
 # The context a prompt may take beside the extract cap: above the largest
-# prompt measured on the r6 prompt (9,327 tokens).
+# prompt measured on the r6 prompt (9,327 tokens). The service withholds its
+# serving identity when the extract cap plus this reserve exceeds the context
+# llama-server reports (`backend.extraction_service.app._serving_identity_error`).
 PROMPT_RESERVE_TOKENS: int = 10240
 
 

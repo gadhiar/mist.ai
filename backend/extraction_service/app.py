@@ -47,6 +47,7 @@ from backend.extraction_service.adapters import ModelFamilyAdapter, get_adapter
 from backend.extraction_service.engine import (
     LIST_BATCH_MAX_UNITS,
     LIST_CONTEXT_MAX_UNITS,
+    PROMPT_RESERVE_TOKENS,
     RUN_IDENTITY_CODE,
     ExtractionEngine,
     ExtractionTimeoutError,
@@ -376,8 +377,17 @@ def serving_identity_components(
     )
 
 
-def _serving_identity_error(settings: ServiceSettings, props: PropsRead) -> str | None:
-    """Why the service has no serving identity for this call, or None when it has one."""
+def _serving_identity_error(
+    settings: ServiceSettings, props: PropsRead, extract_cap: int
+) -> str | None:
+    """Why the service has no serving identity for this call, or None when it has one.
+
+    Beside the declarations, the extract cap plus `PROMPT_RESERVE_TOKENS` must
+    fit the observed context. A deployment whose longest extract call could
+    exceed its context (medium's caps at the 16,384 compose default) gets no
+    identity, and `/v1/info` names the shortfall, the same way a declared
+    context size that differs from the observed one is reported.
+    """
     declared = dict(settings.server_config)
     problems: list[str] = []
     missing = [key for key in REQUIRED_SERVER_KEYS if not declared.get(key)]
@@ -395,6 +405,11 @@ def _serving_identity_error(settings: ServiceSettings, props: PropsRead) -> str 
         else:
             if not matches:
                 problems.append(f"declared ctx_size {ctx_size} != observed n_ctx {props.n_ctx}")
+    if props.n_ctx is not None and extract_cap + PROMPT_RESERVE_TOKENS > props.n_ctx:
+        problems.append(
+            f"extract cap {extract_cap} + prompt reserve {PROMPT_RESERVE_TOKENS} "
+            f"> observed n_ctx {props.n_ctx}"
+        )
     return "; ".join(problems) or None
 
 
@@ -477,7 +492,7 @@ def create_app(
     async def serving_view() -> _ServingView:
         # Read for every call: the context size is observed, never cached.
         props = await ctx_size_source.read()
-        error = _serving_identity_error(settings, props)
+        error = _serving_identity_error(settings, props, engine.stage_cap("extract"))
         if props.n_ctx is None:
             return _ServingView(props=props, identity=None, components=None, error=error)
         components = serving_identity_components(settings, engine, props.n_ctx)
