@@ -825,13 +825,10 @@ def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
 
 
 # The dev-lists entities that carry other accepted ids, each a case N1's last sentence admits:
-# two forms fit and neither is a phrase of the utterance's own. dvl-08 words both habits only
-# as verbs ("swim on Tuesdays", "call my parents"), and a habit id names the activity
-# (`journaling` for "I journal", ext-55), so the activity noun and the verb as written both fit.
-_ID_ALTERNATIVES = {
-    ("dvl-08-list-plus-weekly-routine", "calling-parents"): ["call-parents"],
-    ("dvl-08-list-plus-weekly-routine", "swimming"): ["swim"],
-}
+# two forms fit and neither is a phrase of the utterance's own. None does: with N1's habit
+# clause suspended (it has no carrier), dvl-08's habits take the utterance's own `swim` and
+# `call-parents`, the forms that were their alternatives.
+_ID_ALTERNATIVES: dict[tuple[str, str], list[str]] = {}
 # LABELLING names no two predicates for one shape that a dev-lists edge fits, so none has any.
 _PREDICATE_ALTERNATIVES: dict[tuple[str, str, str, str], list[str]] = {}
 
@@ -1008,6 +1005,82 @@ def test_every_dev_lists_event_id_follows_the_event_rule():
     faults = [(row["tag"], *f) for row in _gold_rows(_DEV_GOLD) for f in _event_rule_faults(row)]
 
     assert faults == []
+
+
+# --- Gold invents no id (the extraction contract ADR, Decision 3) ----------------------------
+
+# Types whose ids a rule with a carrier builds rather than the utterance's words: the user
+# anchor (Rule 1), ISO Date ids (Rules 5, 13, 16), value-first Metric ids (the Metric rail) and
+# Event ids (E-b, checked above).
+_BUILT_ID_TYPES = frozenset({"User", "Date", "Metric", "Event"})
+# Other dev-lists ids that are not a run of the utterance's words, each kept by the register
+# convention named. A test below fails an entry that no longer needs keeping.
+_CONVENTION_KEPT_IDS = {
+    ("dvl-09-list-dash-next-year-goals", "get-pilots-license"): "N2 goal id",
+    ("dvl-09-list-dash-next-year-goals", "ship-saltmere"): "N2 goal id",
+    ("dvl-17-list-ref-middle-editor", "editor"): "N14 kind noun",
+    ("dvl-29-list-heading-work-personal", "training-for-10k"): "N2 goal id",
+}
+
+
+def _utterance_word_runs(utterance: str) -> list[list[str]]:
+    """The utterance's words with possessive pronouns dropped (N1), in two spellings.
+
+    A possessive `'s` either joins its word, as `canonical_id` leaves a title ("The Manager's
+    Path" is `managers-path`), or drops, as an owner's name stands alone (`ilse`).
+    """
+    text = utterance.lower().replace("’", "'")
+    spellings = (text.replace("'", ""), re.sub(r"'s\b", "", text))
+    return [
+        [w for w in re.findall(r"[a-z0-9]+", s) if w not in _POSSESSIVE_PRONOUNS] for s in spellings
+    ]
+
+
+def _is_utterance_phrase(entity_id: str, utterance: str) -> bool:
+    tokens = entity_id.split("-")
+    return any(_is_run_of(tokens, words) for words in _utterance_word_runs(utterance))
+
+
+@pytest.mark.parametrize(
+    ("utterance", "entity_id", "expected"),
+    [
+        ("+ call my parents each Thursday", "call-parents", True),
+        ("+ call my parents each Thursday", "calling-parents", False),
+        ("* watering the plants every other day", "watering-the-plants", True),
+        ("* watering the plants every other day", "watering-plants", False),
+        ("25. The Manager's Path", "managers-path", True),
+        ("Ilse's thesis defense", "ilse", True),
+        ("+ a CLI for splitting bills", "bill-splitting-cli", False),
+    ],
+)
+def test_utterance_phrase_check_on_synthetic_rows(utterance, entity_id, expected):
+    assert _is_utterance_phrase(entity_id, utterance) is expected
+
+
+def test_every_other_dev_lists_id_is_the_utterance_phrase():
+    invented = [
+        (row["tag"], e["id"])
+        for row in _gold_rows(_DEV_GOLD)
+        for e in row["expected_entities"]
+        if e["type"] not in _BUILT_ID_TYPES
+        and (row["tag"], e["id"]) not in _CONVENTION_KEPT_IDS
+        and not _is_utterance_phrase(e["id"], row["utterance"])
+    ]
+
+    assert invented == []
+
+
+def test_every_convention_kept_id_is_still_needed():
+    rows = {row["tag"]: row for row in _gold_rows(_DEV_GOLD)}
+    stale = [
+        key
+        for key in _CONVENTION_KEPT_IDS
+        if key[0] not in rows
+        or key[1] not in {e["id"] for e in rows[key[0]]["expected_entities"]}
+        or _is_utterance_phrase(key[1], rows[key[0]]["utterance"])
+    ]
+
+    assert stale == []
 
 
 # --- Labelling rules from the H8 check (N11 to N16 in LABELLING.md) ---------------------------

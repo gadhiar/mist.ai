@@ -100,12 +100,16 @@ score shows what extraction misses. In dev-lists, the six edges H8 added under s
 - **N1 Id surface.** An id is the utterance's own phrase for the thing, lowercased and
   hyphenated, with leading articles and possessive pronouns dropped and a plural kept as
   written: `regular-expressions` (`ext-28`), `in-memory-data-store` (`ext-41`), `backend-work`
-  (`ext-01`). A habit id names the activity, as `journaling` and `long-run` (`ext-55`,
-  `ext-57`). Where two ids both fit this and neither is the utterance's own phrase, gold
-  lists both: the entity keeps one as `id` and the other in `alternatives` (extraction
-  contract ADR, Decision 3; this replaced the adjudication's rule that the base pass's stands).
-  dvl-08 is the case: "swim on Tuesdays" and "call my parents" name habits only by a verb, so
-  `swimming` accepts `swim` and `calling-parents` accepts `call-parents`.
+  (`ext-01`). Gold invents no id (extraction contract ADR, Decision 3): an id differs from the
+  utterance's phrase only where a convention with a carrier (the prompt or a rail) builds it,
+  as Rule 1's `user`, the ISO Date id, the Metric rail, N2, N4, N14, N15, N16 and the Event
+  rule do.
+  *Suspended:* "a habit id names the activity, as `journaling` and `long-run` (`ext-55`,
+  `ext-57`)". No prompt rule or rail carries it, so it decides no id until it has a carrier;
+  a habit id is the utterance's phrase ("swim on Tuesdays" is `swim`). Where two ids both fit
+  this and neither is the utterance's own phrase, gold lists both: the entity keeps one as
+  `id` and the other in `alternatives` (Decision 3; this replaced the adjudication's rule that
+  the base pass's stands). No dev-lists entity is such a case.
 - **N15 An activity keeps its object.** An id for an activity, a capability or a habit keeps the
   object the utterance gives it, possessives dropped: "MIST can search my notes by meaning" is
   `search-notes-by-meaning`, not `search-by-meaning`, because the notes are part of the
@@ -447,3 +451,14 @@ at least twice. T8 checks the same floor on the adjudicated labels.
     prompt Rule 14, which names it, the scheduler is a `Mechanism`, and `MECHANISM_OF` admits no
     `Mechanism` target (`v1_0_0.py:1587-1588`). It goes to
     the ontology goal.
+- **2026-11-09, dev-lists, gold invents no id (T30, plan v10).** Every other id that differed
+  from the utterance's phrase and that no convention with a carrier builds now is that phrase,
+  with its edges and retrieval query facts renamed. N1's habit clause is suspended (N1).
+  dvl-08: `swimming` to `swim`, `calling-parents` to `call-parents`, both dropping the
+  `alternatives` they had. dvl-23: `tests-under-a-minute` to `tests-that-run-in-under-a-minute`.
+  dvl-26: `bill-splitting-cli` to `cli-for-splitting-bills`, `discord-bot` to
+  `discord-bot-for-book-club`. dvl-34: `swimming` to `swim`, `calling-sister` to
+  `call-with-sister`, `watering-plants` to `watering-the-plants`. dvl-40: `dark-mode` to
+  `dark-mode-everywhere`. A trailing phrase stays out of an id only where it is a fact of its
+  own (dvl-19's parser clauses, labelled as `OPERATES_ON`), a scope of a named thing (`sqlite`
+  "for small apps", Rule 18) or a name modifier (N4).
