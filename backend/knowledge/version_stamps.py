@@ -189,7 +189,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-bfd650372195e9527e522d5275d497946c382457d0aa500c5e07b861939a0f98",
+        code_identity="ci1-88751ad0b032424232999eade8d6808c437b1c7022869aba65373de2a8c69b82",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -200,7 +200,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "so medium needs a context of 47,104 and low still fits 16,384; prompt group 1 "
             "(identity) states N1 in Rule 2, N2, N4, N14, N15 and N16, the Event rule and "
             "the Metric rule as Rules 21 to 27, corrects Examples 6, 7, 10, 12, 15, 20 and "
-            "24, and adds Examples 27 to 29. Re-extracts history."
+            "24, and adds Examples 27 to 29; prompt group 2 (lists) states how a structured "
+            "turn reads, the list rules and itinerary items, N3, N5, N7 and N13 as Rules 28 "
+            "to 33, adds the stated place to Example 29, and adds Example 30. Re-extracts "
+            "history."
         ),
     ),
 )
