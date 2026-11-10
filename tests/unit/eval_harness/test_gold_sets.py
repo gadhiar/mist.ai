@@ -1340,3 +1340,40 @@ def test_a_relabelled_row_holds_exactly_its_new_labels(set_name, tag):
     }
 
     assert (entities, edges) == _RELABELLED_ROWS[(set_name, tag)]
+
+
+# --- Held-out under N17 and the id rails (plan v11 T36) --------------------------------------
+
+# Held-out is pinned by counts alone, so a failure prints no held-out label. N17 (A32(a),
+# Ruling 21) moved no held-out row: each named team, club or community a held-out utterance
+# places a person in already carried `MEMBER_OF`, beside a separate `WORKS_AT` employer. The
+# rows N17 does not clearly decide were left as labelled, each with its reason in
+# `labelling/relabel-v11-2026-11.md`.
+_HELDOUT_N17_COUNTS = {
+    "MEMBER_OF edges": 12,
+    "MEMBER_OF targets": 11,
+    "WORKS_AT edges": 31,
+    "WORKS_AT edges into a MEMBER_OF target": 0,
+    "PART_OF edges out of a MEMBER_OF target": 0,
+}
+
+
+def _heldout_n17_counts() -> dict[str, int]:
+    counts = dict.fromkeys(_HELDOUT_N17_COUNTS, 0)
+    for row in _gold_rows(_HELDOUT_GOLD):
+        edges = row["expected_relationships"]
+        teams = {r["target"] for r in edges if r["predicate"] == "MEMBER_OF"}
+        counts["MEMBER_OF edges"] += sum(r["predicate"] == "MEMBER_OF" for r in edges)
+        counts["MEMBER_OF targets"] += len(teams)
+        counts["WORKS_AT edges"] += sum(r["predicate"] == "WORKS_AT" for r in edges)
+        counts["WORKS_AT edges into a MEMBER_OF target"] += sum(
+            r["predicate"] == "WORKS_AT" and r["target"] in teams for r in edges
+        )
+        counts["PART_OF edges out of a MEMBER_OF target"] += sum(
+            r["predicate"] == "PART_OF" and r["source"] in teams for r in edges
+        )
+    return counts
+
+
+def test_heldout_team_membership_follows_n17():
+    assert _heldout_n17_counts() == _HELDOUT_N17_COUNTS
