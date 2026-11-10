@@ -1021,6 +1021,19 @@ _CONVENTION_KEPT_IDS = {
     ("dvl-17-list-ref-middle-editor", "editor"): "N14 kind noun",
     ("dvl-29-list-heading-work-personal", "training-for-10k"): "N2 goal id",
 }
+# An id that is a contiguous run of the utterance's words naming the entity is the utterance's
+# own phrase, and a labeller neither lengthens nor shortens it (lead ruling under Decision 3).
+# These two had been lengthened ("for my book club", "everywhere") and are restored.
+_ENTITY_NAME_RUNS = {
+    ("dvl-26-list-plus-side-projects", "discord-bot"),
+    ("dvl-40-list-long-nested-opinions", "dark-mode"),
+}
+
+
+def test_ids_that_are_runs_naming_the_entity_are_not_lengthened():
+    ids = {(row["tag"], e["id"]) for row in _gold_rows(_DEV_GOLD) for e in row["expected_entities"]}
+
+    assert sorted(_ENTITY_NAME_RUNS - ids) == []
 
 
 def _utterance_word_runs(utterance: str) -> list[list[str]]:
