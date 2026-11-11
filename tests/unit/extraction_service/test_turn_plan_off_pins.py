@@ -1,0 +1,161 @@
+"""With `EXTRACTION_TURN_PLAN` off, the service is the one that ran before the flag existed.
+
+Every literal here was captured at 058e52c, the commit before the turn plan
+stage, and this file passes there unedited: it imports nothing the stage
+added. It pins what a flag-off service sends and reports:
+
+- every request body the fake llama-server receives for one structured turn
+  and one prose turn, as the sha256 of their canonical JSON;
+- the three stage output schemas;
+- `prompt_sha256` for the gpt-oss adapter;
+- the serving identity of the `service_settings` fixture;
+- the keys of the `/v1/extract` response, with no `turn_plan` among them.
+
+The request bodies hold the prompts, so a prompt edit moves the two body
+hashes and `prompt_sha256` together. Re-pin all three in that edit's commit,
+and only there.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+
+import pytest
+
+from backend.extraction_service import engine as engine_module
+from backend.extraction_service import schemas
+from backend.extraction_service.adapters import get_adapter
+from backend.extraction_service.app import serving_identity_components
+from backend.knowledge.extraction.serving_identity import (
+    components_dict,
+    compute_serving_identity,
+)
+from tests.unit.extraction_service.conftest import make_extract_request
+from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
+
+_SCOPE_REPLY = '{"scope": "user-scope", "confidence": 0.9, "reasoning": "first person"}'
+_EXTRACT_REPLY = '{"entities": [], "relationships": []}'
+_DERIVE_REPLY = '{"operations": []}'
+_DERIVATION = {
+    "signal_types": ["feedback"],
+    "matched_patterns": ["feedback:stop"],
+    "existing_internal_entities": "No existing internal entities.",
+    "assistant_response": "Got it.",
+}
+
+# Five items under one lead-in: two Stage 2 batches.
+STRUCTURED_UTTERANCE = "Things I want to try this year:\n" + "\n".join(
+    f"{n}. thing {n}" for n in range(1, 6)
+)
+PROSE_UTTERANCE = "I have been learning Rust for a few months"
+
+STRUCTURED_BODIES_SHA256 = "acf2adde1d0473a0af20963052b08e27bc1ad9df02748dc4ba16013089aef834"
+PROSE_BODIES_SHA256 = "1c2489eb2a125f17e56bac300608e1798be6d447dab861447fe8e0e01cb35eb0"
+PROMPT_SHA256 = "6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e"
+SERVING_IDENTITY = "si1-0a4fdfffca232a0e3d27716f7ab0e41ed75715ed7eb932b05939b692bc358cb1"
+RESPONSE_KEYS = [
+    "contract_version",
+    "job_id",
+    "outcome",
+    "scope",
+    "payload",
+    "derivation",
+    "stamps",
+    "timings_ms",
+    "attempts",
+    "stage2_calls",
+    "warnings",
+]
+
+
+def canonical_sha256(value: object) -> str:
+    """sha256 of `value` as canonical JSON: sorted keys, no whitespace."""
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_a_structured_turn_sends_the_pinned_request_bodies(client, fake_llama_state):
+    fake_llama_state.chat_responses = [_SCOPE_REPLY, _EXTRACT_REPLY, _EXTRACT_REPLY, _DERIVE_REPLY]
+
+    response = await client.post(
+        "/v1/extract",
+        json=make_extract_request(utterance=STRUCTURED_UTTERANCE, derivation=_DERIVATION),
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(fake_llama_state.chat_requests) == 4
+    assert canonical_sha256(fake_llama_state.chat_requests) == STRUCTURED_BODIES_SHA256
+    assert list(response.json()) == RESPONSE_KEYS
+
+
+@pytest.mark.asyncio
+async def test_a_prose_turn_sends_the_pinned_request_bodies(client, fake_llama_state):
+    fake_llama_state.chat_responses = [_SCOPE_REPLY, _EXTRACT_REPLY, _DERIVE_REPLY]
+
+    response = await client.post(
+        "/v1/extract",
+        json=make_extract_request(utterance=PROSE_UTTERANCE, derivation=_DERIVATION),
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(fake_llama_state.chat_requests) == 3
+    assert canonical_sha256(fake_llama_state.chat_requests) == PROSE_BODIES_SHA256
+    assert list(response.json()) == RESPONSE_KEYS
+
+
+PINNED_SCOPE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scope": {"type": "string"},
+        "confidence": {"type": "number"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["scope"],
+    "additionalProperties": True,
+}
+PINNED_EXTRACTION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "entities": {
+            "type": "array",
+            "items": {"type": "object", "additionalProperties": True},
+        },
+        "relationships": {
+            "type": "array",
+            "items": {"type": "object", "additionalProperties": True},
+        },
+    },
+    "required": ["entities", "relationships"],
+    "additionalProperties": True,
+}
+PINNED_DERIVATION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "operations": {
+            "type": "array",
+            "items": {"type": "object", "additionalProperties": True},
+        },
+    },
+    "required": ["operations"],
+    "additionalProperties": True,
+}
+
+
+def test_the_three_output_schemas_are_the_pinned_ones():
+    assert schemas.SCOPE_OUTPUT_SCHEMA == PINNED_SCOPE_OUTPUT_SCHEMA
+    assert schemas.EXTRACTION_OUTPUT_SCHEMA == PINNED_EXTRACTION_OUTPUT_SCHEMA
+    assert schemas.DERIVATION_OUTPUT_SCHEMA == PINNED_DERIVATION_OUTPUT_SCHEMA
+
+
+def test_the_prompt_hash_is_the_pinned_one():
+    assert engine_module._compute_prompt_sha256(get_adapter("gptoss")) == PROMPT_SHA256
+
+
+def test_the_serving_identity_is_the_pinned_one(service_settings, engine):
+    components = serving_identity_components(service_settings, engine, FAKE_N_CTX)
+
+    assert compute_serving_identity(components) == SERVING_IDENTITY
+    assert "si1-" + canonical_sha256(components_dict(components)) == SERVING_IDENTITY
+    assert "turn_plan" not in components_dict(components)

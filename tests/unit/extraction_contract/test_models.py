@@ -36,6 +36,7 @@ from backend.extraction_contract import (
     error_envelope,
     is_compatible,
 )
+from backend.extraction_contract.models import TurnPlanOut
 
 # ---------------------------------------------------------------------------
 # Round-trip fixtures -- one minimal-but-valid instance per model
@@ -118,6 +119,27 @@ def _extract_response() -> ExtractResponse:
         attempts=1,
         warnings=[],
     )
+
+
+def _turn_plan_out() -> TurnPlanOut:
+    return TurnPlanOut(
+        payload={"entities": [], "templates": [], "back_references": []},
+        prompt_tokens=812,
+        completion_tokens=96,
+        finish_reason="stop",
+    )
+
+
+def _failed_turn_plan_out() -> TurnPlanOut:
+    return TurnPlanOut(payload=None, prompt_tokens=812, completion_tokens=1500)
+
+
+def _extract_response_with_a_turn_plan() -> ExtractResponse:
+    return _extract_response().model_copy(update={"turn_plan": _turn_plan_out()})
+
+
+def _extract_response_with_a_failed_turn_plan() -> ExtractResponse:
+    return _extract_response().model_copy(update={"turn_plan": _failed_turn_plan_out()})
 
 
 def _error_detail() -> ErrorDetail:
@@ -311,6 +333,10 @@ ROUND_TRIP_FIXTURES = [
     _timings_ms,
     _extract_response,
     _extract_response_1_2_0,
+    _turn_plan_out,
+    _failed_turn_plan_out,
+    _extract_response_with_a_turn_plan,
+    _extract_response_with_a_failed_turn_plan,
     _error_detail,
     _error_envelope,
     _health_response,
@@ -610,6 +636,73 @@ class TestStage2Calls:
 
         with pytest.raises(ValidationError):
             ExtractResponse.model_validate(payload)
+
+
+class TestTurnPlan:
+    """The turn plan rides on the response only when the service made the plan call.
+
+    A response without one serializes without the key, so a service that has
+    the plan off answers byte for byte as it did before the field existed.
+    """
+
+    def test_a_response_has_no_turn_plan_by_default(self):
+        assert _extract_response().turn_plan is None
+
+    def test_an_absent_turn_plan_is_left_out_of_every_serialization(self):
+        response = _extract_response()
+
+        assert "turn_plan" not in response.model_dump()
+        assert "turn_plan" not in response.model_dump(mode="json")
+        assert "turn_plan" not in response.model_dump_json()
+
+    def test_a_response_without_one_serializes_to_the_fields_it_had_before(self):
+        assert list(_extract_response().model_dump(mode="json")) == [
+            "contract_version",
+            "job_id",
+            "outcome",
+            "scope",
+            "payload",
+            "derivation",
+            "stamps",
+            "timings_ms",
+            "attempts",
+            "stage2_calls",
+            "warnings",
+        ]
+
+    def test_a_payload_without_the_key_validates_to_no_turn_plan(self):
+        payload = _extract_response().model_dump(mode="json")
+
+        assert ExtractResponse.model_validate(payload).turn_plan is None
+
+    def test_a_turn_plan_is_serialized_with_its_four_fields(self):
+        dumped = _extract_response_with_a_turn_plan().model_dump(mode="json")
+
+        assert dumped["turn_plan"] == {
+            "payload": {"entities": [], "templates": [], "back_references": []},
+            "prompt_tokens": 812,
+            "completion_tokens": 96,
+            "finish_reason": "stop",
+        }
+        assert list(dumped)[-1] == "turn_plan"
+
+    def test_a_failed_plan_call_is_serialized_with_a_null_payload(self):
+        dumped = _extract_response_with_a_failed_turn_plan().model_dump(mode="json")
+
+        assert dumped["turn_plan"] == {
+            "payload": None,
+            "prompt_tokens": 812,
+            "completion_tokens": 1500,
+            "finish_reason": None,
+        }
+
+    def test_a_turn_plan_needs_its_payload_field(self):
+        """`payload` has no default: null says the call failed, and that is said, not implied."""
+        with pytest.raises(ValidationError):
+            TurnPlanOut.model_validate({"prompt_tokens": 1})
+
+    def test_the_contract_version_did_not_move_for_it(self):
+        assert CONTRACT_VERSION == "1.3.0"
 
 
 class TestCutoverStatusChecked:

@@ -22,6 +22,7 @@ _ALL_ENV_VARS = [
     "EXTRACTION_TEMPERATURE",
     "LLAMA_CPP_BUILD",
     "EXTRACTION_PORT",
+    "EXTRACTION_TURN_PLAN",
 ]
 
 
@@ -42,6 +43,20 @@ class TestServiceSettingsFromEnv:
         assert settings.temperature == 0.0
         assert settings.llama_cpp_build == "b11151"
         assert settings.port == 8090
+        assert settings.turn_plan is False
+
+    @pytest.mark.parametrize("value", ["", "  ", "0", "false", "off", "no", "maybe"])
+    def test_the_turn_plan_stays_off_for_an_empty_or_falsy_value(self, monkeypatch, value):
+        """Compose forwards an unset `${EXTRACTION_TURN_PLAN:-}` as an empty string."""
+        monkeypatch.setenv("EXTRACTION_TURN_PLAN", value)
+
+        assert ServiceSettings.from_env().turn_plan is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", " on ", "yes"])
+    def test_the_turn_plan_is_on_for_a_truthy_value(self, monkeypatch, value):
+        monkeypatch.setenv("EXTRACTION_TURN_PLAN", value)
+
+        assert ServiceSettings.from_env().turn_plan is True
 
     def test_reads_overrides_from_env(self, monkeypatch):
         monkeypatch.setenv("EXTRACTION_ADAPTER", "qwen")

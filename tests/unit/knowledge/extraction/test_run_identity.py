@@ -376,12 +376,14 @@ class TestCodeSha256:
 
 
 # ---------------------------------------------------------------------------
-# Coverage: every backend module the service's engine and adapters import from
+# Coverage: every backend module the service's engine, adapters and turn plan
+# import from
 # ---------------------------------------------------------------------------
 
 _SERVICE_SOURCES = (
     _BACKEND_ROOT / "extraction_service" / "engine.py",
     _BACKEND_ROOT / "extraction_service" / "adapters.py",
+    _BACKEND_ROOT / "extraction_service" / "turn_plan.py",
 )
 
 
@@ -427,7 +429,7 @@ def _service_source() -> str:
 class TestRunIdentityCoverage:
     def test_every_backend_import_is_covered_or_excluded(self):
         assert _unlisted(_service_source()) == [], (
-            "engine.py or adapters.py imports from a backend module that is in neither "
+            "engine.py, adapters.py or turn_plan.py imports from a backend module that is in neither "
             "RUN_IDENTITY_CODE nor RUN_IDENTITY_EXCLUDED (backend/extraction_service/engine.py). "
             "Cover it if it can change what the service returns; exclude it, with the reason, "
             "if it cannot."
@@ -455,6 +457,7 @@ class TestRunIdentityCoverage:
             "backend.extraction_service.engine",
             "backend.extraction_service.adapters",
             "backend.extraction_service.schemas",
+            "backend.extraction_service.turn_plan",
             "backend.knowledge.extraction.internal_derivation",
             "backend.knowledge.extraction.internal_prompts",
             "backend.knowledge.extraction.ontology_extractor",
@@ -473,11 +476,42 @@ class TestRunIdentityCoverage:
             "backend.extraction_contract.models",
             "backend.extraction_service.settings",
             "backend.knowledge.extraction.serving_identity",
+            "backend.knowledge.ontologies",
             "backend.knowledge.version_stamps",
             "backend.llm.models",
             "backend.llm.provider",
         ]
         assert all(reason.strip() for reason in excluded.values())
+
+    def test_the_turn_plan_module_is_scanned(self):
+        """The ontology is listed for the turn plan's import, and only for it."""
+        turn_plan = _BACKEND_ROOT / "extraction_service" / "turn_plan.py"
+        others = "\n".join(
+            path.read_text(encoding="utf-8") for path in _SERVICE_SOURCES if path != turn_plan
+        )
+
+        assert turn_plan in _SERVICE_SOURCES
+        assert "backend.knowledge.ontologies" in _backend_imports(
+            turn_plan.read_text(encoding="utf-8")
+        )
+        assert "backend.knowledge.ontologies" not in _backend_imports(others)
+        assert "backend.knowledge.ontologies" in _listed()
+
+    def test_the_turn_plan_reads_only_the_ontologys_two_derived_lists(self):
+        """What its exclusion reason says: nothing else of the ontology reaches the plan."""
+        turn_plan = _BACKEND_ROOT / "extraction_service" / "turn_plan.py"
+        tree = ast.parse(turn_plan.read_text(encoding="utf-8"))
+
+        names = sorted(
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.startswith("backend.knowledge.ontologies")
+            for alias in node.names
+        )
+
+        assert names == ["EXTRACTABLE_NODE_TYPES", "EXTRACTABLE_RELATIONSHIP_TYPES"]
 
     def test_no_exclusion_is_stale(self):
         imported = _backend_imports(_service_source())

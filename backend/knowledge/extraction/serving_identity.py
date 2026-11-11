@@ -26,6 +26,8 @@ What it covers, and why some settings are absent:
   digest, because a default changes only with the build.
 - `n_ctx` as llama-server's `/props` reports it on the call, cross-checked by
   the service against the declared context size.
+- The turn plan flag, when it is on: a planned turn's batches carry text an
+  unplanned turn's do not, under request profiles that are the same.
 - Code is not covered. A code change is governed by `EXTRACTION_VERSION` and
   `CODE_REVISIONS` (`backend.knowledge.version_stamps`), which choose between
   re-extracting history and new turns only; a key here would override that
@@ -107,6 +109,12 @@ class ServingIdentityComponents:
         server: The declared `EXTRACTION_SERVER_*` settings: lower-cased key,
             stripped value, sorted by key.
         n_ctx: llama-server's context size, observed on this call.
+        turn_plan: Whether a structured turn gets a plan call before its
+            Stage 2 batches, which then carry the plan. The plan call is sent
+            as stage `extract`, so no request profile shows it. False, the
+            default, is left out of the flat form (`components_dict`), so an
+            identity bound before the flag existed is still the identity of
+            the same setup with the flag off.
     """
 
     adapter: str
@@ -117,6 +125,7 @@ class ServingIdentityComponents:
     requests: tuple[StageRequestProfile, ...]
     server: tuple[tuple[str, str], ...]
     n_ctx: int
+    turn_plan: bool = False
 
 
 # Derived from the dataclass, so a field added to the profile is hashed too.
@@ -125,12 +134,18 @@ _PROFILE_FIELDS: tuple[str, ...] = tuple(
 )
 _NESTED_FIELDS = frozenset({"requests", "server"})
 
+# Scalar fields added after identities were first bound, each with the value
+# that reproduces the earlier behaviour. A field at that value is left out of
+# the flat form, so those identities and their stored components do not move.
+_OMITTED_AT: Mapping[str, object] = MappingProxyType({"turn_plan": False})
+
 
 def components_dict(c: ServingIdentityComponents) -> dict[str, str | int | float | bool | None]:
     """The components as one flat mapping of JSON scalars, the form stored and compared.
 
     The scalar fields keep their names; each profile field becomes
     `request.<stage>.<field>` and each declared setting `server.<key>`.
+    `turn_plan` appears only when True (`_OMITTED_AT`).
 
     Raises:
         ValueError: Two profiles name one stage, or one server key is declared
@@ -140,6 +155,7 @@ def components_dict(c: ServingIdentityComponents) -> dict[str, str | int | float
         f.name: getattr(c, f.name)
         for f in dataclasses.fields(ServingIdentityComponents)
         if f.name not in _NESTED_FIELDS
+        and not (f.name in _OMITTED_AT and getattr(c, f.name) is _OMITTED_AT[f.name])
     }
     seen_stages: set[str] = set()
     for profile in c.requests:

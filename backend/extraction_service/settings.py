@@ -78,6 +78,10 @@ class ServiceSettings:
             (lower-cased name, stripped value) pairs sorted by name. The
             service cannot see llama-server's launch flags, so these
             declarations are how they reach its serving identity.
+        turn_plan: Whether a structured turn gets a plan call before its
+            Stage 2 batches (`backend.extraction_service.turn_plan`). Off by
+            default: the stage is unmeasured, and with it off the service
+            sends and returns exactly what it did before the stage existed.
     """
 
     llm_base_url: str
@@ -96,6 +100,7 @@ class ServiceSettings:
     llama_cpp_build: str = "b11151"
     port: int = 8090
     server_config: tuple[tuple[str, str], ...] = ()
+    turn_plan: bool = False
 
     def __post_init__(self) -> None:
         """Refuse values the service cannot run with.
@@ -143,6 +148,9 @@ class ServiceSettings:
             llama_cpp_build=os.environ.get("LLAMA_CPP_BUILD", "b11151"),
             port=int(os.environ.get("EXTRACTION_PORT", "8090")),
             server_config=_server_config(os.environ),
+            # Unset and empty are both off: compose forwards an unset host
+            # variable as an empty string.
+            turn_plan=_as_bool(os.environ.get("EXTRACTION_TURN_PLAN", "")),
         )
 
 

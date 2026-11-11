@@ -129,6 +129,7 @@ _MUTATIONS: dict[str, object] = {
     "llama_cpp_build": "b12000",
     "port": 9999,
     "server_config": "add n_cpu_moe",
+    "turn_plan": True,
 }
 
 _SETTINGS_FIELDS = {f.name for f in dataclasses.fields(ServiceSettings)}

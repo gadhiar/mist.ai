@@ -334,7 +334,7 @@ def run_identity_components(
     (`settings.constrained_mode or adapter.default_constrained_mode`).
     """
     return RunIdentityComponents(
-        prompt_sha256=_compute_prompt_sha256(adapter),
+        prompt_sha256=_compute_prompt_sha256(adapter, turn_plan=settings.turn_plan),
         code_sha256=code_sha256(RUN_IDENTITY_CODE),
         ontology_version=ONTOLOGY_VERSION,
         extraction_version=EXTRACTION_VERSION,
@@ -374,6 +374,7 @@ def serving_identity_components(
         requests=engine.request_profile(),
         server=tuple(sorted(settings.server_config)),
         n_ctx=n_ctx,
+        turn_plan=settings.turn_plan,
     )
 
 
