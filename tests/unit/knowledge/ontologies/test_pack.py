@@ -304,11 +304,11 @@ def test_a_definition_value_that_cannot_be_stated_as_data_is_refused(value):
 # fixture's types, rules or plug-in module moves one on purpose; a loader change must not.
 _PINNED_HASHES = {
     BASE: (
-        "a9ce742bd351cbb2098eb2c46b6c292e9fa5adde19f0873c71952625192e80b4",
+        "cb81cc6abe25756b381b2c256a35ca4ba7447e16b08a9cdca034c3b197e2c8ce",
         "58b8b85f66a1f6828c853e44c0ecd2c8a2441d0dfe78c65470e952fda0e4d920",
     ),
     PET: (
-        "dea655659d9dd5a96826dae26b148e4d6106152c054dd9af0c5c7f3997a7f731",
+        "2f34c9f17e0d2fe0e5b5ef2a7f8808b39af6d2cb0276f5f83abaea1591a2c71d",
         "4101934dcca63c62cf238850f824c59c5a2b7342d25abe825a195be1f048c713",
     ),
 }
@@ -369,7 +369,7 @@ def test_the_fallback_type_moves_only_the_rails_hash():
 
 
 def test_a_prompt_visible_manifest_field_moves_only_the_prompt_hash():
-    changed = _build(manifest=dataclasses.replace(manifest.MANIFEST, prompt_token_budget=4000))
+    changed = _build(manifest=dataclasses.replace(manifest.MANIFEST, prompt_token_budget=24000))
 
     assert changed.pack_prompt_hash != _build().pack_prompt_hash
     assert changed.pack_rails_hash == _build().pack_rails_hash

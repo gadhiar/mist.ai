@@ -228,7 +228,8 @@ RULES = (
         kind="prompt_fragment",
         phase=PRE_LLM,
         params=PromptFragment(
-            text="F1. Each deckhand placed in a crew also SERVES_UNDER its skipper.",
+            # Placed as written after the core's last rule, so it ends its own line.
+            text="F1. Each deckhand placed in a crew also SERVES_UNDER its skipper.\n",
             position=1,
         ),
     ),

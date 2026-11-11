@@ -3,9 +3,26 @@
 Contains the system prompt, few-shot examples, and user template used by
 OntologyConstrainedExtractor. The prompt enforces strict ontology types and
 produces structured JSON output in a single LLM call.
+
+The system prompt is assembled: the engine core (`ENGINE_CORE`) is its text in the
+order the model reads it, with a slot wherever a pack's `prompt_fragment` rules may be
+placed, and `assemble_system_prompt` puts each fragment in the slot its `position`
+names. The core still holds the whole prompt, the ontology's part included, so with no
+fragment the assembled text is `EXTRACTION_SYSTEM_PROMPT`, unchanged. Moving the
+ontology's part into a pack is a cut of the core at each place the text leaves it, a
+slot there, and the same text as fragments of that slot.
 """
 
-EXTRACTION_SYSTEM_PROMPT = """You are a knowledge extraction engine for a personal AI assistant. Your task is to extract structured knowledge from conversation text.
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from backend.errors import MistError
+from backend.knowledge.ontologies.pack import PromptFragment
+
+_CORE_CONSTRAINTS = """You are a knowledge extraction engine for a personal AI assistant. Your task is to extract structured knowledge from conversation text.
 
 You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just the JSON object.
 
@@ -51,7 +68,9 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 - WORKS_WITH is undirected between Technology/Organization/MistIdentity and Technology; either orientation is valid.
 - IMPLEMENTED_WITH / MIST_HAS_* predicates require a MistIdentity source (id="mist-identity").
 
-## OUTPUT SCHEMA
+"""
+
+_CORE_RULES = """## OUTPUT SCHEMA
 {{"entities": [{{"id": "lowercase-hyphenated-name", "name": "Display Name", "type": "EntityType"}}], "relationships": [{{"source": "entity-id", "target": "entity-id", "type": "RELATIONSHIP_TYPE", "properties": {{"confidence": 0.9, "temporal_status": "current|past|future", "start_date": "YYYY-MM-DD or null", "end_date": "YYYY-MM-DD or null", "temporal_expression": "original text or null", "context": "additional context or null", "negated": false, "assertion_kind": "assert|cease|retract"}}}}]}}
 
 ## EXTRACTION RULES
@@ -92,7 +111,9 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 35. The team's tools. Tools the user's team runs are user USES; a possessive that only names a thing is not.
 36. Personal milestones. A personal legal or financial step completed on a day is a milestone-class Event, no user EXPERIENCED.
 37. Goal deadlines. A goal's stated time frame is its deadline: HAS_GOAL gets end_date at the frame's end (last day of the day, month or year named), start_date null. A bare month is the first such month after the reference date. A lead-in's frame covers its goals; a frame whose year is unclear gets no date.
+"""
 
+_CORE_EXAMPLES = """
 ## REFERENCE DATE
 Today's date: {reference_date}
 
@@ -284,6 +305,122 @@ Utterance: "I lead the Brackwater billing team at Quillmere"
 Output:
 {{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "brackwater-billing-team", "name": "Brackwater billing team", "type": "Organization"}}, {{"id": "quillmere", "name": "Quillmere", "type": "Organization"}}], "relationships": [{{"source": "user", "target": "brackwater-billing-team", "type": "MEMBER_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "lead", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "user", "target": "quillmere", "type": "WORKS_AT", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 """
+
+
+class PromptAssemblyError(MistError):
+    """A fragment could not be placed: the message names the fragment's position."""
+
+
+@dataclass(frozen=True, slots=True)
+class Slot:
+    """A place in the engine core where a pack's fragments are put.
+
+    Attributes:
+        name: What the slot holds, for a reader of the core.
+        position: The number a fragment's `position` names to have its text placed
+            here. None marks the examples slot, which takes the examples of every
+            fragment whatever its position.
+    """
+
+    name: str
+    position: int | None
+
+
+# The positions a fragment may name, in the order the prompt reads. A constraints
+# fragment closes the ontology constraints, before the output schema note; a rules
+# fragment follows the last numbered rule, before the reference date.
+CONSTRAINTS_SLOT: int = 0
+RULES_SLOT: int = 1
+
+# The engine's prompt: its text in reading order, and the slots between. Text here is
+# template text for `str.format`: `{reference_date}` is its one field and every other
+# brace is doubled.
+ENGINE_CORE: tuple[str | Slot, ...] = (
+    _CORE_CONSTRAINTS,
+    Slot("constraints", CONSTRAINTS_SLOT),
+    _CORE_RULES,
+    Slot("rules", RULES_SLOT),
+    _CORE_EXAMPLES,
+    Slot("examples", None),
+)
+
+# The coarse bound on the assembled template's length that the loader refuses a pack
+# over. The binding limit is the service's prompt reserve in tokens, which the runs'
+# `prompt_tokens` lines measure; this is its proxy where no tokenizer runs.
+SYSTEM_PROMPT_MAX_CHARACTERS: int = 52000
+
+# The ratio the token estimate divides by. A model's tokenizer gives the true count;
+# the estimate is what a load can compute, and for this prompt it lands within a tenth
+# of the count the runs logged.
+PROMPT_CHARACTERS_PER_TOKEN: float = 3.6
+
+
+def _as_template(text: str) -> str:
+    """`text` with its braces doubled, so `str.format` renders it as it was written."""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def assemble_system_prompt(fragments: Sequence[PromptFragment] = ()) -> str:
+    """The system prompt template: the engine core with `fragments` placed in its slots.
+
+    A fragment's text goes in the slot its `position` names and its examples go in the
+    examples slot; within a slot, fragments keep the order they are given in. The
+    assembler adds nothing around a fragment, so a fragment that is a line of its own
+    ends in its newline, and one that completes a line of the core does not. A fragment
+    is written as the model is to read it: its braces are doubled here, so it can hold
+    JSON and cannot take the template's `{reference_date}` field.
+
+    Args:
+        fragments: The parameters of a pack's `prompt_fragment` rules, in the pack's
+            order.
+
+    Returns:
+        The template, whose one field is `reference_date`.
+
+    Raises:
+        PromptAssemblyError: A fragment names a position the core has no slot for.
+    """
+    positions = sorted(
+        part.position
+        for part in ENGINE_CORE
+        if isinstance(part, Slot) and part.position is not None
+    )
+    for fragment in fragments:
+        if fragment.position not in positions:
+            raise PromptAssemblyError(
+                f"a fragment names position {fragment.position}, and the engine core has "
+                f"slots at {', '.join(str(position) for position in positions)} only"
+            )
+    pieces: list[str] = []
+    for part in ENGINE_CORE:
+        if isinstance(part, str):
+            pieces.append(part)
+        elif part.position is None:
+            pieces.extend(
+                _as_template(example) for fragment in fragments for example in fragment.examples
+            )
+        else:
+            pieces.extend(
+                _as_template(fragment.text)
+                for fragment in fragments
+                if fragment.position == part.position
+            )
+    return "".join(pieces)
+
+
+def estimate_prompt_tokens(system_prompt: str) -> int:
+    """About how many tokens `system_prompt` takes once its reference date is filled in.
+
+    Args:
+        system_prompt: An assembled template.
+    """
+    rendered = system_prompt.format(reference_date="0000-00-00")
+    return math.ceil(len(rendered) / PROMPT_CHARACTERS_PER_TOKEN)
+
+
+# The engine core with nothing placed: the prompt of a pack that holds no fragment,
+# which is what the in-process extractor and the eval harness read.
+EXTRACTION_SYSTEM_PROMPT: str = assemble_system_prompt()
 
 EXTRACTION_USER_TEMPLATE = """Context:
 {context}

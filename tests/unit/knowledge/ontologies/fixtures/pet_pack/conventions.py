@@ -14,6 +14,7 @@ from backend.knowledge.ontologies.pack import (
     PinnedCase,
     PlanTrigger,
     PlanVocabulary,
+    PromptFragment,
 )
 from tests.unit.knowledge.ontologies.fixtures.base_pack.conventions import RULES as BASE_RULES
 
@@ -85,6 +86,27 @@ PET_ROSTER_CASE = PinnedCase(
     ),
 )
 
+# The rule's two examples, written as the model reads them: the assembler places each
+# whole after the core's last example, so each opens with its blank line.
+_ROSTER_EXAMPLE = (
+    "\n### Example N18a: Pet roster\n"
+    "Subject scope: user-scope\n"
+    'Utterance: "Our pets: Biscuit, a terrier"\n'
+    "Output:\n"
+    '{"entities": [{"id": "user", "name": "User", "type": "Deckhand"}, '
+    '{"id": "biscuit", "name": "Biscuit", "type": "Pet"}], "relationships": '
+    '[{"source": "user", "target": "biscuit", "type": "HAS_PET"}]}\n'
+)
+_OWNER_EXAMPLE = (
+    "\n### Example N18b: Pet roster, a named owner\n"
+    "Subject scope: user-scope\n"
+    'Utterance: "Our pets: Corwen keeps a ferret called Sable"\n'
+    "Output:\n"
+    '{"entities": [{"id": "corwen", "name": "Corwen", "type": "Deckhand"}, '
+    '{"id": "sable", "name": "Sable", "type": "Pet"}], "relationships": '
+    '[{"source": "corwen", "target": "sable", "type": "HAS_PET"}]}\n'
+)
+
 RULES = (
     *BASE_RULES,
     ConventionRule(
@@ -105,6 +127,19 @@ RULES = (
         ),
         prompt_rule="N18",
         pinned_case=PET_ROSTER_CASE,
+    ),
+    ConventionRule(
+        id="pet-roster-text",
+        kind="prompt_fragment",
+        phase=PRE_LLM,
+        params=PromptFragment(
+            text=(
+                "N18. Pet rosters. Under a lead-in that names pets, each animal is a Pet. "
+                "A pet whose owner the line names gets <owner> HAS_PET <pet>.\n"
+            ),
+            position=1,
+            examples=(_ROSTER_EXAMPLE, _OWNER_EXAMPLE),
+        ),
     ),
     ConventionRule(
         id="pet-plan-words",

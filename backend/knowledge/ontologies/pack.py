@@ -8,10 +8,16 @@ version is a new pack and no engine edit.
 
 `build_pack` is the loader. It refuses a pack whose rules name something the pack does
 not define, whose plug-ins are not registered or not pinned, or whose pair table does not
-build, and it computes the pack's two identities:
+build. It builds what the pack feeds the model with, the assembled system prompt and the
+generated output schema, and refuses a pack whose schema does not generate or whose
+prompt does not assemble, runs over the character guard or runs over the manifest's
+token budget. It computes the pack's two identities, and refuses a pack the release line
+names (`backend.knowledge.version_stamps.PACK_RELEASE`) when either differs from it:
 
 - `pack_prompt_hash` covers what feeds the model: the types, the edges and their pairs,
-  the pre-LLM rules and the manifest's prompt-visible fields.
+  the pre-LLM rules, the generated schema and the manifest's prompt-visible fields. The
+  engine's prompt core is not the pack's and is not covered here; the service's
+  `prompt_sha256` covers the assembled prompt.
 - `pack_rails_hash` covers what runs after the model: the post-LLM rules by phase, the
   plug-ins and the manifest's post-LLM data (the fallback type, the retired types, the
   user anchor).
@@ -262,7 +268,19 @@ class PlanVocabulary:
 
 @dataclass(frozen=True)
 class PromptFragment:
-    """A rule's prompt text and examples, placed by the prompt assembler."""
+    """A rule's prompt text and examples, placed by the prompt assembler.
+
+    The text is written as the model is to read it, braces included, and is placed as
+    written: the assembler (`backend.knowledge.extraction.prompts`) adds no newline, so
+    a fragment that is a line of its own ends in one.
+
+    Attributes:
+        text: The rule's text.
+        position: The slot of the engine's prompt core the text is placed in. A slot's
+            fragments keep the pack's order.
+        examples: The rule's examples, each placed whole in the core's examples slot,
+            after the examples of the fragments before it in the pack.
+    """
 
     text: str
     position: int = 0
@@ -425,7 +443,9 @@ class Manifest:
             child accepts the supertype.
         escape_edge: The edge the model uses when no typed edge fits.
         escape_rate_trigger: The share of escape edges that opens a growth review.
-        prompt_token_budget: The most tokens the assembled prompt may take.
+        prompt_token_budget: The most tokens the whole assembled prompt may take, the
+            engine's core and the pack's fragments together, by the loader's estimate.
+            None leaves the prompt to the character guard alone.
         released_against: The extraction version the pack was released against.
         migration_script_path: The migration that moves a graph to this version.
         deprecated: True when the registry must not pick the pack by default.
@@ -465,6 +485,11 @@ class Pack:
         labelling: The pack's labelling text. It feeds neither hash.
         pair_table: Each extractable edge's allowed source and target types; None
             stands for any type.
+        system_prompt: The Stage 2 system prompt template the pack is extracted with:
+            the engine's core with the pack's fragments placed. `reference_date` is its
+            one field.
+        extraction_schema: The Stage 2 output schema generated from the pack. Read it;
+            a caller that would change it takes a copy.
         pack_prompt_hash: sha256 over what feeds the model.
         pack_rails_hash: sha256 over what runs after it.
     """
@@ -478,6 +503,8 @@ class Pack:
     plugins: tuple[Plugin, ...]
     labelling: str
     pair_table: PairTable
+    system_prompt: str
+    extraction_schema: Mapping[str, object]
     pack_prompt_hash: str
     pack_rails_hash: str
 
@@ -844,6 +871,57 @@ def _by_phase(rules: tuple[ConventionRule, ...], phases: tuple[Phase, ...]) -> d
     }
 
 
+def _prompt_side(
+    manifest: Manifest,
+    rules: tuple[ConventionRule, ...],
+    extractable_node_types: tuple[str, ...],
+    extractable_edge_types: tuple[str, ...],
+) -> tuple[str, dict[str, object]]:
+    """The system prompt and the output schema a pack feeds the model with.
+
+    The prompt is measured two ways. Its template's length is held to the engine's
+    character guard, whatever the manifest says. Its estimated token count is held to
+    the manifest's budget, when the manifest states one. Both measure the whole
+    assembled prompt, the engine's core included, since that is what the service's
+    context has to hold.
+
+    Raises:
+        PackLoadError: The schema does not generate, a fragment names a position the
+            core has no slot for, or the prompt is over the guard or the budget.
+    """
+    # Imported here because both modules sit above this one: the prompt module imports
+    # this module's `PromptFragment`, and the schema belongs to the service.
+    from backend.extraction_service import schemas
+    from backend.knowledge.extraction import prompts
+
+    try:
+        schema = schemas.generate_extraction_schema(
+            entity_types=extractable_node_types, relationship_types=extractable_edge_types
+        )
+    except schemas.SchemaGenerationError as exc:
+        raise PackLoadError(f"schema does not generate: {exc}") from exc
+    fragments = tuple(rule.params for rule in rules if rule.kind == "prompt_fragment")
+    try:
+        system_prompt = prompts.assemble_system_prompt(fragments)
+    except prompts.PromptAssemblyError as exc:
+        raise PackLoadError(f"prompt does not assemble: {exc}") from exc
+    length = len(system_prompt)
+    if length > prompts.SYSTEM_PROMPT_MAX_CHARACTERS:
+        raise PackLoadError(
+            f"prompt does not fit: the assembled prompt is {length} characters, over the "
+            f"{prompts.SYSTEM_PROMPT_MAX_CHARACTERS}-character guard"
+        )
+    budget = manifest.prompt_token_budget
+    if budget is not None:
+        tokens = prompts.estimate_prompt_tokens(system_prompt)
+        if tokens > budget:
+            raise PackLoadError(
+                f"prompt does not fit: the assembled prompt is about {tokens} tokens, over "
+                f"the manifest's budget of {budget}"
+            )
+    return system_prompt, schema
+
+
 def _check_release(version: str, prompt_hash: str, rails_hash: str) -> None:
     """Refuse a pack the release line names whose hashes are not the line's.
 
@@ -865,8 +943,8 @@ def _check_release(version: str, prompt_hash: str, rails_hash: str) -> None:
         f"{release.extraction_version} (PACK_RELEASE in backend/knowledge/version_stamps.py): "
         f"pack_prompt_hash expected {release.pack_prompt_hash}, found {prompt_hash}; "
         f"pack_rails_hash expected {release.pack_rails_hash}, found {rails_hash}. "
-        "Rewrite the release line in the commit that moves a hash; a moved "
-        "pack_prompt_hash also needs a new EXTRACTION_VERSION."
+        "Rewrite the release line in the commit that moves a hash; the line's comment "
+        "says when a moved hash also needs a new EXTRACTION_VERSION."
     )
 
 
@@ -885,6 +963,8 @@ def build_pack(
 
     The manifest's retired types and supertypes are applied to every edge's allowed
     sets first, so the pair table and the prompt hash see the edges the engine uses.
+    The system prompt is assembled and the output schema generated here, once, so what
+    the loader checked is what the service sends.
 
     Args:
         manifest: The pack's manifest.
@@ -899,8 +979,11 @@ def build_pack(
     Raises:
         PackLoadError: A name is unknown or repeated, a plug-in is not registered, has
             no pinned case, is not a plain function or is not the object its module
-            holds under its qualified name, the pair table does not build, or a value
-            the hashes cover cannot be stated as data.
+            holds under its qualified name, the pair table does not build, the schema
+            does not generate, the prompt does not assemble or is over the character
+            guard or the manifest's token budget, a value the hashes cover cannot be
+            stated as data, or the release line names the pack's version with other
+            hashes.
     """
     for what, names in (
         ("node type", tuple(node.type_name for node in node_types)),
@@ -926,6 +1009,9 @@ def build_pack(
     )
     pair_table = _build_pair_table(built_edges, tuple(extractable_edge_types), type_names)
     _check_rules(tuple(rules), tuple(plugins), type_names, edge_names)
+    system_prompt, schema = _prompt_side(
+        manifest, tuple(rules), tuple(extractable_node_types), tuple(extractable_edge_types)
+    )
 
     prompt_hash = _sha256(
         {
@@ -938,6 +1024,7 @@ def build_pack(
                 for name, ends in pair_table.items()
             },
             "rules": _by_phase(tuple(rules), (PRE_LLM,)),
+            "schema": schema,
             "manifest": {
                 "supertypes": manifest.supertypes,
                 "escape_edge": manifest.escape_edge,
@@ -970,6 +1057,8 @@ def build_pack(
         plugins=tuple(plugins),
         labelling=labelling,
         pair_table=pair_table,
+        system_prompt=system_prompt,
+        extraction_schema=schema,
         pack_prompt_hash=prompt_hash,
         pack_rails_hash=rails_hash,
     )
