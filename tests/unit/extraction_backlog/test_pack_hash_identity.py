@@ -507,3 +507,83 @@ class TestRebuildUnderTheCandidatesPack:
         assert normalizer._pack is pack
         assert validator._pack is pack
         assert validator.min_confidence == 0.25
+
+    def test_the_replay_stages_hold_a_pack_that_is_not_the_registrys(self):
+        """Mutant this kills: dropping `pack=pack` from either constructor call.
+
+        A consumer built without a pack resolves the registry's active one, so
+        the pack handed in here is one the registry does not return.
+        """
+        from backend.extraction_backlog.cutover import replay_pack_consumers
+        from backend.knowledge.ontologies import registry
+
+        marked = _marked_pack()
+
+        normalizer, validator = replay_pack_consumers(marked, min_confidence=0.25)
+
+        assert marked is not registry.active_pack()
+        assert normalizer._pack is marked
+        assert validator._pack is marked
+        assert normalizer._pack is not registry.active_pack()
+        assert validator._pack is not registry.active_pack()
+
+
+def _marked_pack(**hashes):
+    """A real `Pack` the registry does not return: its active one under other hashes."""
+    from backend.knowledge.ontologies import registry
+
+    return dataclasses.replace(registry.active_pack(), **{**STORED, **hashes})
+
+
+class _ReachedTheConnectionsError(Exception):
+    """Raised in place of the first step the rebuild wiring takes after the pack check."""
+
+
+class TestTheRebuildWiringChecksThePackFirst:
+    """`build_rebuild_deps_from_env` reads the active pack and refuses before it connects."""
+
+    def _wire(self, monkeypatch, *, active, **stored):
+        from backend.extraction_backlog.cutover import build_rebuild_deps_from_env
+        from backend.knowledge.ontologies import registry
+        from backend.knowledge.version_stamps import compose_model_hash
+        from tests.mocks.config import build_test_config
+
+        config = build_test_config()
+        candidate_config = dataclasses.replace(
+            config,
+            ontology_version=_CUTOVER_ROW["ontology_version"],
+            extraction_version=_CUTOVER_ROW["extraction_version"],
+            model_hash=_CUTOVER_ROW["bare_model_hash"],
+        )
+        cutover = Cutover.from_row(
+            {**_CUTOVER_ROW, "model_hash": compose_model_hash(candidate_config), **stored}
+        )
+
+        def reached(*_args, **_kwargs):
+            raise _ReachedTheConnectionsError
+
+        monkeypatch.setattr("backend.knowledge.config.get_config", lambda: config)
+        monkeypatch.setattr(registry, "active_pack", lambda: active)
+        monkeypatch.setattr(
+            "backend.knowledge.eval_isolation.assert_rebuild_target_not_live", reached
+        )
+        return build_rebuild_deps_from_env(None, "bolt://staging.invalid:7687", cutover)
+
+    def test_the_candidates_pack_goes_on_to_the_connections(self, monkeypatch):
+        with pytest.raises(_ReachedTheConnectionsError):
+            self._wire(monkeypatch, active=_marked_pack(), **STORED)
+
+    def test_a_legacy_candidate_goes_on_under_any_pack(self, monkeypatch):
+        with pytest.raises(_ReachedTheConnectionsError):
+            self._wire(monkeypatch, active=_marked_pack())
+
+    @BOTH_FIELDS
+    def test_another_active_pack_is_refused_before_any_connection(self, monkeypatch, field):
+        active = _marked_pack(**{field: OTHER})
+
+        with pytest.raises(CutoverRefusedError) as raised:
+            self._wire(monkeypatch, active=active, **STORED)
+
+        assert f"{field}={OTHER!r}" in str(raised.value)
+        assert f"{field}={STORED[field]!r}" in str(raised.value)
+        assert "cutover 7" in str(raised.value)
