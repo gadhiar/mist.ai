@@ -481,6 +481,11 @@ class TestGroup2ListConventions:
     def test_itinerary_items_are_experienced_events_with_dates(self):
         assert "Itinerary items are Events" in EXTRACTION_SYSTEM_PROMPT
 
+    def test_itinerary_items_state_the_user_edge_literally(self):
+        # T40 round 2: the shortened wording lost user EXPERIENCED on a dated list.
+        assert "Itinerary items are Events: user EXPERIENCED <event>" in _rule(29)
+        assert "OCCURRED_ON the date its line or heading gives (Rule 26)" in _rule(29)
+
     def test_n3_decisions(self):
         assert "Decisions. A decision by the user or their team is user DECIDED" in (
             EXTRACTION_SYSTEM_PROMPT
@@ -490,6 +495,19 @@ class TestGroup2ListConventions:
 
     def test_n5_stated_places_and_organisations(self):
         assert "Stated places and organisations." in EXTRACTION_SYSTEM_PROMPT
+
+    def test_n5_illustrates_the_place_as_a_location_related_to_from_the_event(self):
+        # T40 round 2: with Example 29's Location edge cut, a trip list lost its places.
+        match = re.search(
+            r'"(?:an? |the )?([^"]+) in ([A-Z][a-z]+)" -> ([a-z0-9-]+) RELATED_TO '
+            r"([a-z0-9-]+) \(Location\)",
+            _rule(31),
+        )
+        assert match is not None, "Rule 31 illustrates an Event with its stated place"
+        phrase, place, event_id, target = match.groups()
+        assert target == place.lower(), "the place is its own entity"
+        # The Event's id still keeps the place as the utterance words it (Rule 26).
+        assert event_id == "-".join(re.findall(r"[a-z0-9]+", f"{phrase} in {place}".lower()))
 
     def test_n7_third_party_events(self):
         assert "Third-party events. A named person's own non-milestone Event" in (
@@ -523,13 +541,18 @@ class TestGroup3GlossesAndTeamConventions:
     """v11 group 3 (ADR-054 Decision 7, plan D17): the Organization, WORKS_AT and
     MEMBER_OF glosses, N17 named teams with its own example, and N8, N10 and N11, each
     stated as a rule; N12 lives in Rule 6. Each presence check is keyed on the rule's own
-    phrase. T40 round 1 cut the other glosses and Rule 38 to fit the token reserve.
+    phrase. T40 round 1 cut the other glosses and Rule 38 to fit the token reserve; round 2
+    restored the four stance glosses, whose loss flipped KNOWS, EXPERT_IN and LEARNING.
     """
 
     # The ontology's own descriptions, quoted. WORKS_AT is the one exception: the prompt
     # glosses it as employment only, since membership is MEMBER_OF (lead decision 3).
     QUOTED = {
         "Organization": "A company, team, institution, community, or open-source project.",
+        "KNOWS": "Indicates familiarity with a skill, concept, technology, or topic.",
+        "INTERESTED_IN": "Indicates interest in a technology, concept, topic, or skill.",
+        "EXPERT_IN": "Indicates expert-level proficiency in a technology, skill, or concept.",
+        "LEARNING": "Indicates actively learning a technology, skill, or concept.",
         "MEMBER_OF": "Indicates membership in an organization.",
     }
 
@@ -558,6 +581,17 @@ class TestGroup3GlossesAndTeamConventions:
             assert descriptions[name] == description, name
             assert glosses[name].startswith(f'"{description}"'), name
 
+    def test_the_stance_glosses_sit_between_organization_and_works_at(self):
+        assert list(self._gloss_lines()) == [
+            "Organization",
+            "KNOWS",
+            "INTERESTED_IN",
+            "EXPERT_IN",
+            "LEARNING",
+            "WORKS_AT",
+            "MEMBER_OF",
+        ]
+
     def test_works_at_is_glossed_as_employment_only(self):
         gloss = self._gloss_lines()["WORKS_AT"]
         assert "employment at an organization, the employer, and nothing else" in gloss
@@ -579,6 +613,17 @@ class TestGroup3GlossesAndTeamConventions:
         assert "a relationship category (colleagues, friends, family, household)" in (
             EXTRACTION_SYSTEM_PROMPT
         )
+
+    def test_n17_each_team_member_works_at_the_named_employer(self):
+        # T40 round 2: without this clause a named-team list lost every WORKS_AT.
+        rule_34 = _rule(34)
+        assert (
+            "A named employer is a separate `Organization` that each person placed in the "
+            "team also WORKS_AT"
+        ) in rule_34
+
+    def test_n17_the_team_s_id_carries_no_employer(self):
+        assert 'the team\'s id holds no employer name and no "at <employer>"' in _rule(34)
 
     def test_n8_the_team_s_tools(self):
         assert "The team's tools. Tools the user's team runs are user USES" in (
@@ -671,8 +716,9 @@ class TestExtractionVersionDriftGuard:
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
     # extraction_version = "2026-11-10-r8", groups 1 (identity), 2 (list conventions) and
-    # 3 (glosses, named teams and the remaining conventions), as T40 round 1 revised them.
-    PINNED_SHA256 = "0ad6912fd8638461e8aed0c7344be8e7f4e5b53b2112d9c5f80bce5de1fcd089"
+    # 3 (glosses, named teams and the remaining conventions), as T40 rounds 1 and 2 revised
+    # them.
+    PINNED_SHA256 = "88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib

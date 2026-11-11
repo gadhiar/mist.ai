@@ -189,7 +189,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-c83995edaa16a34497759583b8afe6ca098decdd308c2df87401d3350893d9b3",
+        code_identity="ci1-c1e2f66b661adb398251bbe32d764f7513c5b85d867b09fdf08305c4cdaf1f56",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -211,7 +211,11 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "that a list item's id is its own words, with no cadence, scope, owner, purpose "
             "or quantity added, Rule 38 folds into Rule 6, Rule 34 and Rules 29 to 37 are "
             "tightened, the glosses keep Organization, WORKS_AT and MEMBER_OF, and Example "
-            "29 returns to its group 1 text. Re-extracts history."
+            "29 returns to its group 1 text; T40 round 2 restores the KNOWS, INTERESTED_IN, "
+            "EXPERT_IN and LEARNING glosses, Rule 34's clause that each team member WORKS_AT "
+            "the named employer with no employer in the team's id, a stated place as a "
+            "Location in Rule 31, and Rule 29's literal user EXPERIENCED <event>. "
+            "Re-extracts history."
         ),
     ),
 )
