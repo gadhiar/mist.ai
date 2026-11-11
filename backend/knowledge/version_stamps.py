@@ -237,7 +237,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-4af580515edebe101c9a9d31b57a9c0758ddd3262f1469b0c8ef2257ac4f6b06",
+        code_identity="ci1-41f9dc57eacaad00a60577352ecf3e0cb09eb60d8f57329c57b2deab1efdaea6",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -279,7 +279,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "assembled prompt and generated schema at Stage 2 and under the plan call, and "
             "stamping its two hashes on every result, and pre_llm, the pack loader and the "
             "registry join the covered code; the active pack holds no prompt fragment and "
-            "no item filter, so it drops no unit and changes no request. "
+            "no item filter, so it drops no unit and changes no request; T46 ships the "
+            "ontology as a pack of files, which the registry loads in place of the adapter "
+            "that stated it from the old modules, with the same types, rules, pair table, "
+            "prompt and schema. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

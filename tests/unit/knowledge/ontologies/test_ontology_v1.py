@@ -661,7 +661,7 @@ class TestTheGuideIsSplitBetweenTheGoldSetsAndThePack:
 
 
 # ---------------------------------------------------------------------------
-# The pack built from its files is the pack the registry's adapter builds
+# The pack built from its files is the pack the registry serves
 # ---------------------------------------------------------------------------
 
 
@@ -672,9 +672,23 @@ def file_pack() -> Pack:
 
 
 @pytest.fixture(scope="module")
-def adapter_pack() -> Pack:
-    """The pack the registry builds from the modules that held the ontology before."""
+def registry_pack() -> Pack:
+    """The pack the registry serves for the version."""
     return registry.get_pack(ONTOLOGY_V1_0_0.version)
+
+
+# The rules in the order the rails run them, as the adapter the registry held before
+# the pack declared them.
+_RULE_IDS = [
+    "reserved-mist-identity",
+    "n1-exempt",
+    "pre-canon-aliases",
+    "technology-version",
+    "static-aliases",
+    "metric-id",
+    "event-date",
+    "plan-vocabulary",
+]
 
 
 def _identity(rule) -> tuple:
@@ -701,8 +715,8 @@ def _run_case(case, pack: Pack) -> tuple[list[dict], list[dict]]:
     return rails.run_rails(row, pack)
 
 
-class TestThePackHasTheAdaptersIdentity:
-    """Moving the ontology into files changes nothing a stored id or a prompt depends on."""
+class TestTheRegistryServesThePack:
+    """The registry's pack is the one the loader builds from the pack's files."""
 
     def test_both_hashes_are_the_release_lines(self, file_pack: Pack):
         release = version_stamps.PACK_RELEASE
@@ -711,35 +725,42 @@ class TestThePackHasTheAdaptersIdentity:
         assert file_pack.pack_prompt_hash == release.pack_prompt_hash
         assert file_pack.pack_rails_hash == release.pack_rails_hash
 
-    def test_the_types_are_the_adapters(self, file_pack: Pack, adapter_pack: Pack):
-        assert file_pack.node_types == adapter_pack.node_types
-        assert file_pack.edge_types == adapter_pack.edge_types
+    def test_the_types_are_the_ones_the_registry_serves(self, file_pack: Pack, registry_pack: Pack):
+        assert file_pack.node_types == registry_pack.node_types
+        assert file_pack.edge_types == registry_pack.edge_types
         assert file_pack.edge_types == tuple(ALL_EDGE_TYPES)
-        assert file_pack.extractable_node_types == adapter_pack.extractable_node_types
-        assert file_pack.extractable_edge_types == adapter_pack.extractable_edge_types
+        assert file_pack.extractable_node_types == registry_pack.extractable_node_types
+        assert file_pack.extractable_edge_types == registry_pack.extractable_edge_types
 
-    def test_the_pair_table_the_prompt_and_the_schema_are_the_adapters(
-        self, file_pack: Pack, adapter_pack: Pack
+    def test_the_pair_table_the_prompt_and_the_schema_are_the_ones_the_registry_serves(
+        self, file_pack: Pack, registry_pack: Pack
     ):
-        assert file_pack.pair_table == adapter_pack.pair_table
-        assert file_pack.system_prompt == adapter_pack.system_prompt
-        assert file_pack.extraction_schema == adapter_pack.extraction_schema
+        assert file_pack.pair_table == registry_pack.pair_table
+        assert file_pack.system_prompt == registry_pack.system_prompt
+        assert file_pack.extraction_schema == registry_pack.extraction_schema
 
-    def test_the_rules_are_the_adapters_in_the_adapters_order(
-        self, file_pack: Pack, adapter_pack: Pack
+    def test_the_rules_are_the_ones_the_registry_serves_in_order_with_their_cases(
+        self, file_pack: Pack, registry_pack: Pack
     ):
         assert [_identity(rule) for rule in file_pack.rules] == [
-            _identity(rule) for rule in adapter_pack.rules
+            _identity(rule) for rule in registry_pack.rules
         ]
+        assert registry_pack.rules == pack_conventions.RULES
+        assert [rule.id for rule in registry_pack.rules] == _RULE_IDS
 
-    def test_the_manifest_is_the_adapters(self, file_pack: Pack, adapter_pack: Pack):
-        assert file_pack.manifest == adapter_pack.manifest
+    def test_the_manifest_is_the_one_the_registry_serves(
+        self, file_pack: Pack, registry_pack: Pack
+    ):
+        assert file_pack.manifest == registry_pack.manifest
+        assert registry_pack.manifest is pack_manifest.MANIFEST
 
-    def test_the_plug_ins_are_the_adapters_functions(self, file_pack: Pack, adapter_pack: Pack):
+    def test_the_plug_ins_are_the_ones_the_registry_serves(
+        self, file_pack: Pack, registry_pack: Pack
+    ):
         assert [(plugin.name, plugin.phase) for plugin in file_pack.plugins] == [
-            (plugin.name, plugin.phase) for plugin in adapter_pack.plugins
+            (plugin.name, plugin.phase) for plugin in registry_pack.plugins
         ]
-        for mine, theirs in zip(file_pack.plugins, adapter_pack.plugins, strict=True):
+        for mine, theirs in zip(file_pack.plugins, registry_pack.plugins, strict=True):
             assert mine.fn is theirs.fn
 
     def test_the_pack_adds_no_prompt_fragment(self, file_pack: Pack):
@@ -814,10 +835,10 @@ class TestThePinnedCases:
         assert rails.check_pinned_cases(file_pack) == []
 
     @pytest.mark.parametrize("rule_id", _POST_LLM_RULES)
-    def test_the_adapter_gives_the_same_payload(self, rule_id: str, adapter_pack: Pack):
+    def test_the_registrys_pack_gives_the_cases_payload(self, rule_id: str, registry_pack: Pack):
         case = next(rule.pinned_case for rule in pack_conventions.RULES if rule.id == rule_id)
 
-        entities, relationships = _run_case(case, adapter_pack)
+        entities, relationships = _run_case(case, registry_pack)
 
         assert entities == list(case.expected_entities)
         assert relationships == list(case.expected_relationships)

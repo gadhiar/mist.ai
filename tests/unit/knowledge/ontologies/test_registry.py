@@ -1,4 +1,4 @@
-"""The pack registry, and the adapter pack that states today's ontology as pack rules."""
+"""The pack registry, and the v1.4.0 pack it builds from the pack's files."""
 
 from __future__ import annotations
 
@@ -21,6 +21,9 @@ from backend.knowledge.ontologies import (
 )
 from backend.knowledge.ontologies.hierarchy import ANCHOR_CHILD, RETIRED_TYPE_MAP
 from backend.knowledge.ontologies.pack import PackLoadError, build_pack, load_pack
+from backend.knowledge.ontologies.packs.v1_4_0 import conventions as pack_conventions
+from backend.knowledge.ontologies.packs.v1_4_0 import manifest as pack_manifest
+from backend.knowledge.ontologies.packs.v1_4_0 import plugins as pack_plugins
 
 BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
 
@@ -61,7 +64,33 @@ def test_the_registry_reads_the_version_and_writes_no_literal():
     source = Path(registry.__file__).read_text(encoding="utf-8")
 
     assert ONTOLOGY_V1_0_0.version not in source
-    assert "version=ONTOLOGY_V1_0_0.version" in source
+    assert "ONTOLOGY_V1_0_0.version: partial(load_pack," in source
+
+
+def test_the_registry_builds_each_pack_under_the_version_its_manifest_states(fresh_registry):
+    for version in fresh_registry.available_versions():
+        assert fresh_registry.get_pack(version).version == version
+
+
+def test_the_registry_builds_todays_pack_from_the_packs_files(fresh_registry):
+    pack = fresh_registry.get_pack(ONTOLOGY_V1_0_0.version)
+
+    assert pack.manifest is pack_manifest.MANIFEST
+    assert pack.rules == pack_conventions.RULES
+    assert pack.plugins == pack_plugins.PLUGINS
+    assert pack.labelling == (
+        Path(pack_manifest.__file__).with_name("labelling.md").read_text(encoding="utf-8")
+    )
+
+
+def test_the_registry_holds_no_pack_of_its_own_making():
+    # The adapter, which stated the ontology as pack rules from the modules that held
+    # it, is gone: the registry builds nothing and reads no rule, type or id rail.
+    source = Path(registry.__file__).read_text(encoding="utf-8")
+
+    assert "_adapter" not in source
+    assert "build_pack" not in source
+    assert "id_rails" not in source
 
 
 def test_a_pack_is_built_once(fresh_registry):
@@ -120,10 +149,10 @@ def test_the_registry_imports_nothing_from_the_rail_runner():
     assert "import rails" not in source
 
 
-# --- the adapter pack is today's ontology -------------------------------------------------
+# --- the pack is today's ontology ---------------------------------------------------------
 
 
-def test_the_adapter_holds_todays_types_and_edges():
+def test_the_pack_holds_todays_types_and_edges():
     pack = registry.active_pack()
 
     assert [node.type_name for node in pack.node_types] == ALL_NODE_TYPE_NAMES
@@ -132,7 +161,7 @@ def test_the_adapter_holds_todays_types_and_edges():
     assert list(pack.extractable_edge_types) == EXTRACTABLE_RELATIONSHIP_TYPES
 
 
-def test_the_adapters_pair_table_is_the_one_the_validator_derived_before():
+def test_the_packs_pair_table_is_the_one_the_validator_derived_before():
     all_types = set(ALL_NODE_TYPE_NAMES)
     before = {}
     for name in EXTRACTABLE_RELATIONSHIP_TYPES:
@@ -151,7 +180,7 @@ def test_the_adapters_pair_table_is_the_one_the_validator_derived_before():
     assert registry.active_pack().pair_table.keys() == before.keys()
 
 
-def test_the_adapters_manifest_is_read_from_the_hierarchy_and_the_id_rails():
+def test_the_packs_manifest_is_what_the_hierarchy_and_the_id_rails_hold():
     manifest = registry.active_pack().manifest
 
     assert {r.name: r.replacement for r in manifest.retired_types} == RETIRED_TYPE_MAP
@@ -163,7 +192,7 @@ def test_the_adapters_manifest_is_read_from_the_hierarchy_and_the_id_rails():
     assert sum(1 for value in defaults.values() if value) == 1
 
 
-def test_the_adapters_rules_are_the_id_rails_constants():
+def test_the_packs_rules_are_the_id_rails_constants():
     pack = registry.active_pack()
     reserved = {
         name: (rule.params.id, rule.params.type)
@@ -180,7 +209,7 @@ def test_the_adapters_rules_are_the_id_rails_constants():
     assert sorted(id_rails.ID_EXEMPT_TYPES) == sorted(id_rails._N1_EXEMPT_TYPES)
 
 
-def test_the_adapters_plan_vocabulary_is_todays_extractable_lists():
+def test_the_packs_plan_vocabulary_is_todays_extractable_lists():
     assert plan_vocabulary(registry.active_pack()) == PlanWords(
         entity_types=tuple(EXTRACTABLE_NODE_TYPES),
         predicates=tuple(EXTRACTABLE_RELATIONSHIP_TYPES),
@@ -188,11 +217,11 @@ def test_the_adapters_plan_vocabulary_is_todays_extractable_lists():
     )
 
 
-def test_the_adapter_adds_and_removes_no_edge():
+def test_the_pack_adds_and_removes_no_edge():
     assert registry.active_pack().rules_in("relation") == ()
 
 
-def test_the_adapter_exposes_both_hashes_and_they_are_stable(fresh_registry):
+def test_the_pack_exposes_both_hashes_and_they_are_stable(fresh_registry):
     first = fresh_registry.active_pack()
     fresh_registry.get_pack.cache_clear()
     second = fresh_registry.active_pack()
@@ -206,11 +235,10 @@ def test_the_adapter_exposes_both_hashes_and_they_are_stable(fresh_registry):
     assert first.pack_prompt_hash != first.pack_rails_hash
 
 
-def test_the_adapter_hashes_to_the_pinned_values(fresh_registry):
-    # What today's ontology hashed to when the adapter's hashes were first pinned. The
-    # rails hash covers the source of `id_rails.py`, where the adapter's plug-ins live,
-    # so an edit there or to the ontology moves a value on purpose; a loader change
-    # must not.
+def test_the_pack_hashes_to_the_pinned_values(fresh_registry):
+    # What today's ontology hashes to. The rails hash covers the source of the module
+    # that holds the pack's plug-ins, so an edit there or to the ontology moves a value
+    # on purpose; a loader change must not.
     pack = fresh_registry.active_pack()
 
     assert (pack.pack_prompt_hash, pack.pack_rails_hash) == (
