@@ -27,6 +27,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from backend.extraction_backlog.store import PackHashes
 from backend.extraction_contract.models import (
     CONTRACT_VERSION,
     ERROR_HTTP_STATUS,
@@ -48,6 +49,7 @@ from backend.knowledge.curation.deduplication import DeduplicationResult
 from backend.knowledge.curation.graph_writer import WriteResult
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.curation.reconciliation import ReconcileTurnResult
+from backend.knowledge.ontologies.pack import PackLoadError
 
 SERVICE_URL = "http://fake-extraction"
 
@@ -140,12 +142,42 @@ class FakeServiceState:
     def received_utterances(self) -> list[str]:
         return [r.utterance for r in self.received]
 
+    def serve_pack(self, carrier: Any) -> None:
+        """Report `carrier`'s two pack hashes from now on.
+
+        `carrier` is anything with `pack_prompt_hash` and `pack_rails_hash`: a
+        cutover candidate, an epoch, a pack. It models the operator pointing
+        the service at that pack.
+        """
+        self.pack_prompt_hash = carrier.pack_prompt_hash
+        self.pack_rails_hash = carrier.pack_rails_hash
+
     @property
     def serving_identity(self) -> str | None:
         """The identity `/v1/info` reports now, or None (an error, or a pre-1.3.0 service)."""
         if not self.reports_serving_identity or self.serving_identity_error is not None:
             return None
         return serving_identity_of(self.serving_components)
+
+
+def fake_pack_resolver(
+    packs: dict[str, tuple[str | None, str | None]],
+) -> Callable[[str], PackHashes]:
+    """A `pack_for_version` for `admin.main`, over invented packs.
+
+    `packs` maps an ontology version to that pack's `(pack_prompt_hash,
+    pack_rails_hash)`. A version it does not hold raises `PackLoadError`, as
+    `registry.get_pack` does.
+    """
+
+    def pack_for_version(version: str) -> PackHashes:
+        if version not in packs:
+            known = ", ".join(sorted(packs))
+            raise PackLoadError(f"no ontology pack for version {version} (known: {known})")
+        prompt, rails = packs[version]
+        return PackHashes(pack_prompt_hash=prompt, pack_rails_hash=rails)
+
+    return pack_for_version
 
 
 def build_fake_service_app(state: FakeServiceState) -> FastAPI:

@@ -95,6 +95,7 @@ not run from this branch]
 `TestAdminStatusCli` in `tests/unit/extraction_backlog/test_status.py`]
 
     epoch N: ontology_version=... extraction_version=... model_hash=...
+    pack: pack_prompt_hash=<sha256|none> pack_rails_hash=<sha256|none>
     code: ONTOLOGY_VERSION=... EXTRACTION_VERSION=... configured model_hash=<MIST_MODEL_HASH> (MIST_MODEL_HASH; composed <hash>)
     writer stamps: match
 
@@ -105,6 +106,38 @@ KnowledgeConfig.from_env())`); the verdict is the dispatcher's guard
 (`ExtractionDispatcher._writer_stamp_mismatch`), compared with the ACTIVE epoch
 (not an open cutover's candidate). On a MISMATCH the dispatcher applies and
 dispatches nothing. Exit 0, or 1 when the epoch ledger is empty.
+
+The `pack:` line under the epoch's stamps prints the two ontology pack hashes
+the active epoch's `epoch_ledger` row stores, and `none` for one it does not
+store. [UNIT-TESTED:
+`test_the_active_epochs_stored_pack_hashes_are_printed_under_its_stamps`,
+`test_an_epoch_that_stores_no_pack_hash_prints_none_for_both` and
+`test_one_stored_hash_prints_beside_none_for_the_other` in
+`tests/unit/extraction_backlog/test_status.py`]
+
+An open cutover prints the same line, indented, under its `candidate:` line,
+from its `epoch_cutover` row, in `status` and in `cutover status`. [UNIT-TESTED:
+`test_an_open_candidates_stored_pack_hashes_are_printed_under_its_stamps`,
+`test_an_open_candidate_that_stores_no_pack_hash_prints_none` and
+`test_cutover_status_prints_the_candidates_stored_pack_hashes` in
+`tests/unit/extraction_backlog/test_status.py`]
+
+      candidate: ontology_version=... extraction_version=... model_hash=... (service model_hash=...)
+      pack: pack_prompt_hash=<sha256|none> pack_rails_hash=<sha256|none>
+
+The writer-stamp verdict does not compare a hash printed as `none`: against an
+epoch that stores neither, the writer stamps match on the triple alone. [UNIT-TESTED:
+`test_an_epoch_that_stores_no_pack_hash_prints_none_for_both` in
+`tests/unit/extraction_backlog/test_status.py`]
+
+A MISMATCH names the fields of the triple that differ, then each pack hash the
+epoch stores that this backend's pack does not equal, by its field name
+(`pack_prompt_hash`, `pack_rails_hash`). When only a pack hash differs, the
+refusal text that follows gives that hash's two values in place of the triples.
+[UNIT-TESTED: `test_a_differing_pack_hash_is_named_by_its_field`,
+`test_both_differing_pack_hashes_are_named` and
+`test_a_differing_pack_hash_is_named_after_the_differing_triple_fields` in
+`tests/unit/extraction_backlog/test_status.py`]
 
 ---
 

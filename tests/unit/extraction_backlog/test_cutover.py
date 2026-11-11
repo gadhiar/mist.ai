@@ -48,7 +48,12 @@ def _cli(world, *argv: str) -> tuple[int, str]:
 
 
 def _begin(world) -> tuple[int, str]:
-    return _cli(
+    """`cutover begin`, then the service pointed at the pack the candidate stored.
+
+    The candidate row holds the hashes of the registry's pack for
+    `ONTOLOGY_VERSION`, and the fill refuses a service that reports others.
+    """
+    result = _cli(
         world,
         "cutover",
         "begin",
@@ -59,6 +64,8 @@ def _begin(world) -> tuple[int, str]:
         "--ontology-version",
         ONTOLOGY_VERSION,
     )
+    world.serve_candidate_pack()
+    return result
 
 
 def _log(world, ts, index: int, minute: int | None = None) -> str:

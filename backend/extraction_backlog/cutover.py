@@ -152,8 +152,10 @@ def begin_cutover(
     (`pack_hash_mismatches`): a candidate that differs from the epoch in a hash
     the epoch holds does not equal it, so it is a cutover of its own and never
     a settings change. An epoch that holds no hash compares the triple only.
-    The two values are compared and not stored: `BacklogStore.begin_cutover`
-    takes no pack hash, so the candidate row holds none.
+    The two values are then stored on the candidate's row as given
+    (`BacklogStore.begin_cutover`), None as NULL: the fill compares a service's
+    hashes with them, the rebuild compares its pack with them
+    (`candidate_pack_refusal`), and promotion copies them to the new epoch.
 
     Two candidates need the active epoch bound, because what decides their
     rows is a comparison with its identity. A settings change while it is
@@ -237,6 +239,8 @@ def begin_cutover(
         bare_model_hash=bare_model_hash,
         source_epoch_id=epoch.epoch_id,
         requested_at=now_iso,
+        pack_prompt_hash=pack_prompt_hash,
+        pack_rails_hash=pack_rails_hash,
     )
     if cutover is None:
         existing = store.open_cutover()

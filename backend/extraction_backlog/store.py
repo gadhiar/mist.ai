@@ -568,8 +568,15 @@ class BacklogStore:
         bare_model_hash: str,
         source_epoch_id: int,
         requested_at: str,
+        pack_prompt_hash: str | None = None,
+        pack_rails_hash: str | None = None,
     ) -> Cutover | None:
-        """Open a candidate in state 'filling'. None when one is already open."""
+        """Open a candidate in state 'filling'. None when one is already open.
+
+        The two pack hashes are stored on the candidate's row as given, NULL
+        for None: the fill, the rebuild and the promoted epoch read them from
+        there. Nothing here derives one.
+        """
         cutover_id = self._events.begin_epoch_cutover(
             ontology_version=ontology_version,
             extraction_version=extraction_version,
@@ -577,6 +584,8 @@ class BacklogStore:
             bare_model_hash=bare_model_hash,
             source_epoch_id=source_epoch_id,
             requested_at=requested_at,
+            pack_prompt_hash=pack_prompt_hash,
+            pack_rails_hash=pack_rails_hash,
         )
         return None if cutover_id is None else self.get_cutover(cutover_id)
 

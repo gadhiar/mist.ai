@@ -20,13 +20,20 @@ the extraction service or need the backend running) and prints the active
 epoch's stamps, the backlog for it, including `legacy_unextracted` (turns
 logged before the backlog first activated that had no cache row; never
 dispatched, and covered by the next cutover's re-extraction), and any open
-cutover with its candidate stamps. It also prints this code's
-`ONTOLOGY_VERSION` and `EXTRACTION_VERSION`, the configured `MIST_MODEL_HASH`,
-and `writer stamps: match` or `writer stamps: MISMATCH (<field>, ...)`: whether
-the stamps a backend started from this environment would write
-(`factories.writer_stamps_from_config`) equal the active epoch's, judged by
-the dispatcher's own guard (`ExtractionDispatcher._writer_stamp_mismatch`).
-For the active epoch and the open cutover it prints the binding
+cutover with its candidate stamps. Under the active epoch's stamps, and under
+an open candidate's (`cutover status` prints the candidate's too), a `pack:`
+line prints the two ontology pack hashes the row stores, `pack_prompt_hash`
+and `pack_rails_hash`, and `none` for one it does not store: a row from before
+the hashes were stored, which the identity checks do not compare in that hash
+(`pack_hash_mismatches`). It also prints
+this code's `ONTOLOGY_VERSION` and `EXTRACTION_VERSION`, the configured
+`MIST_MODEL_HASH`, and `writer stamps: match` or `writer stamps: MISMATCH
+(<field>, ...)`: whether the stamps a backend started from this environment
+would write (`factories.writer_stamps_from_config`) equal the active epoch's,
+judged by the dispatcher's own guard
+(`ExtractionDispatcher._writer_stamp_mismatch`). The fields named are those of
+the triple that differ, then each pack hash the epoch stores that the
+backend's pack does not equal. For the active epoch and the open cutover it prints the binding
 (`binding.py`): its source and rule, the serving and dispatch identities, the
 cache namespace (3-part, or keyed with the key), and the setting names the
 binding could not verify, or `binding: unbound`; and an operator acceptance on
@@ -39,6 +46,11 @@ the active epoch is unbound it also needs `--refill` (the change cannot be
 checked against an identity the epoch does not have yet, so the candidate
 re-extracts the log), and an ontology-only candidate (the active extraction
 version and model hash) is refused. Both refusals exit 2.
+
+`cutover begin` stores on the candidate the two hashes of the ontology pack
+this code holds for the candidate's ontology version (`registry.get_pack`).
+A version it holds no pack for is refused with exit 2 and nothing written:
+the candidate's hashes are that pack's, and there is none to take them from.
 
 `epoch accept` records an operator acceptance for the active epoch, or with
 `--cutover` the open candidate (not a settings-change one: the 3-part rows of
@@ -103,11 +115,19 @@ from typing import TYPE_CHECKING, Any, TextIO
 from backend.event_store.store import EventStore
 from backend.knowledge.extraction_cache import ExtractionCache
 
-from .store import BacklogStore, Cutover, Epoch
+from .store import (
+    PACK_HASH_FIELDS,
+    BacklogStore,
+    CarriesPackHashes,
+    Cutover,
+    Epoch,
+    pack_hash_mismatches,
+)
 
 if TYPE_CHECKING:
     from backend.knowledge.config import KnowledgeConfig
     from backend.knowledge.curation.graph_writer import RebuildStamps
+    from backend.knowledge.ontologies.pack import Pack
 
 OUT_OF_ORDER_WARNING = (
     "[WARNING] A retried turn is applied OUT OF LOG ORDER: turns logged after it are "
@@ -182,6 +202,17 @@ def _print_binding(
         )
 
 
+def _print_pack_hashes(stored: CarriesPackHashes, indent: str, out: TextIO) -> None:
+    """The `pack:` line: the two pack hashes a row stores, `none` for one it does not.
+
+    `stored` is the active epoch or an open candidate, as read from its row.
+    `none` is a row from before the hashes were stored: no identity check
+    compares that hash (`pack_hash_mismatches`).
+    """
+    shown = " ".join(f"{name}={getattr(stored, name) or 'none'}" for name in PACK_HASH_FIELDS)
+    print(f"{indent}pack: {shown}", file=out)
+
+
 def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
     fill = store.fill_scan(cutover)
     print(
@@ -195,6 +226,7 @@ def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
         f"(service model_hash={cutover.bare_model_hash})",
         file=out,
     )
+    _print_pack_hashes(cutover, "  ", out)
     print(f"  covered={fill.covered} total={fill.total}", file=out)
     events = store.event_store
     _print_binding(
@@ -230,8 +262,11 @@ def _writer_stamps_verdict(writer: RebuildStamps, epoch: Epoch) -> tuple[str, st
     `ExtractionDispatcher._writer_stamp_mismatch`, not a second comparison: it
     reads nothing of the dispatcher but `_writer_stamps`, so it is called on a
     stand-in holding just that. The field names listed on a mismatch are for
-    the operator's eye only; a mismatch the guard reports with no differing
-    field (not possible today) is still printed as MISMATCH.
+    the operator's eye only: the fields of the triple that differ, then each
+    pack hash the epoch stores that the writer does not equal
+    (`pack_hash_mismatches`, the comparison the guard makes, so a hash the
+    epoch does not store is never named). A mismatch the guard reports with no
+    differing field (not possible today) is still printed as MISMATCH.
     """
     from .dispatcher import ExtractionDispatcher
 
@@ -241,6 +276,7 @@ def _writer_stamps_verdict(writer: RebuildStamps, epoch: Epoch) -> tuple[str, st
     if reason is None:
         return "writer stamps: match", None
     differing = [name for name in _STAMP_FIELDS if getattr(writer, name) != getattr(epoch, name)]
+    differing.extend(pack_hash_mismatches(epoch, writer))
     return f"writer stamps: MISMATCH ({', '.join(differing) or 'see reason'})", reason
 
 
@@ -260,6 +296,7 @@ def _status(store: BacklogStore, config: KnowledgeConfig, out: TextIO) -> int:
         f"extraction_version={epoch.extraction_version} model_hash={epoch.model_hash}",
         file=out,
     )
+    _print_pack_hashes(epoch, "", out)
     print(
         f"code: ONTOLOGY_VERSION={ONTOLOGY_VERSION} EXTRACTION_VERSION={EXTRACTION_VERSION} "
         f"configured model_hash={config.model_hash} (MIST_MODEL_HASH; composed "
@@ -327,22 +364,47 @@ def _retry(store: BacklogStore, event_id: str | None, out: TextIO) -> int:
 
 
 def _cutover_begin(
-    store: BacklogStore, args: argparse.Namespace, embedding_model_name: str, now_iso: str, out
+    store: BacklogStore,
+    args: argparse.Namespace,
+    embedding_model_name: str,
+    now_iso: str,
+    out,
+    pack_for_version: Callable[[str], Pack],
 ) -> int:
+    """`cutover begin`: open a candidate that stores its ontology pack's two hashes.
+
+    The pack is the one `pack_for_version` holds for the candidate's ontology
+    version, resolved before anything is written. A version it holds no pack
+    for is refused: such a candidate would store no hash, and a row that
+    stores none is compared with no pack (`pack_hash_mismatches`).
+    """
+    from backend.knowledge.ontologies.pack import PackLoadError
     from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 
     from .cutover import CutoverRefusedError, begin_cutover
 
+    ontology_version = args.ontology_version or ONTOLOGY_VERSION
+    try:
+        pack = pack_for_version(ontology_version)
+    except PackLoadError as exc:
+        print(
+            f"[cutover] REFUSED: {exc}; a candidate is begun from the code that holds its "
+            "ontology pack",
+            file=out,
+        )
+        return 2
     try:
         cutover = begin_cutover(
             store,
             bare_model_hash=args.model_hash,
             extraction_version=args.extraction_version or EXTRACTION_VERSION,
-            ontology_version=args.ontology_version or ONTOLOGY_VERSION,
+            ontology_version=ontology_version,
             embedding_model_name=embedding_model_name,
             now_iso=now_iso,
             settings_change=args.settings_change,
             refill=args.refill,
+            pack_prompt_hash=pack.pack_prompt_hash,
+            pack_rails_hash=pack.pack_rails_hash,
         )
     except CutoverRefusedError as exc:
         print(f"[cutover] REFUSED: {exc}", file=out)
@@ -731,6 +793,7 @@ def main(
     graph_probe: Callable | None = None,
     clock: Callable[[], datetime] | None = None,
     knowledge_config: KnowledgeConfig | None = None,
+    pack_for_version: Callable[[str], Pack] | None = None,
     backend_probe: Callable | None = None,
     redispatch_graph: Callable | None = None,
 ) -> int:
@@ -753,6 +816,10 @@ def main(
             epoch (and, for `redispatch-check`, the graph it opens); defaults
             to `KnowledgeConfig.from_env()`, what a backend started from this
             environment reads.
+        pack_for_version: For `cutover begin`, the ontology pack of a version
+            (`str -> Pack`), raising `PackLoadError` for a version it holds no
+            pack for; the candidate stores that pack's two hashes. Defaults to
+            `registry.get_pack`, the packs this code holds.
         backend_probe: For `redispatch-check`, `() -> BackendProbe`; defaults
             to `redispatch.probe_backend`, the live `GET /health` probe.
         redispatch_graph: For `redispatch-check`, `() -> RedispatchGraph`,
@@ -806,7 +873,11 @@ def main(
     command = args.cutover_command
     if command == "begin":
         model = embedding_model_name or _embedding_model_from_env()
-        return _cutover_begin(backlog, args, model, now_iso, stream)
+        if pack_for_version is None:
+            from backend.knowledge.ontologies import registry
+
+            pack_for_version = registry.get_pack
+        return _cutover_begin(backlog, args, model, now_iso, stream, pack_for_version)
     if command == "status":
         return _cutover_status(backlog, stream)
     if command == "probe":

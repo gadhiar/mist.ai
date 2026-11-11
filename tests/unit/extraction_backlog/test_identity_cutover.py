@@ -44,7 +44,7 @@ from tests.unit.extraction_backlog.conftest import (
     composed,
     wait_until,
 )
-from tests.unit.extraction_backlog.fakes import default_payload
+from tests.unit.extraction_backlog.fakes import default_payload, fake_pack_resolver
 
 STAGING_URI = "bolt://localhost:7689"
 LIVE_URI = "bolt://mist-neo4j:7687"
@@ -73,20 +73,34 @@ def sync_world():
     return _build_world(with_deriver=False)
 
 
-def _cli(world, *argv: str, store: BacklogStore | None = None) -> tuple[int, str]:
+def _cli(
+    world, *argv: str, store: BacklogStore | None = None, pack_for_version=None
+) -> tuple[int, str]:
     out = io.StringIO()
     code = admin.main(
         list(argv),
         store=store if store is not None else world.store,
         out=out,
         embedding_model_name=EMBEDDING_MODEL,
+        pack_for_version=pack_for_version,
     )
     return code, out.getvalue()
 
 
-def _begin(world, *flags: str, ontology_version: str = ONTOLOGY_VERSION, model_hash=None):
-    """`cutover begin` with the active epoch's extraction version and model hash."""
-    return _cli(
+def _begin(
+    world,
+    *flags: str,
+    ontology_version: str = ONTOLOGY_VERSION,
+    model_hash=None,
+    pack_for_version=None,
+):
+    """`cutover begin` with the active epoch's extraction version and model hash.
+
+    The candidate stores the hashes of the pack `pack_for_version` holds for
+    its ontology version (None: the registry's), and the fake service is then
+    pointed at them, because the fill refuses a service that reports others.
+    """
+    result = _cli(
         world,
         "cutover",
         "begin",
@@ -97,7 +111,15 @@ def _begin(world, *flags: str, ontology_version: str = ONTOLOGY_VERSION, model_h
         "--ontology-version",
         ontology_version,
         *flags,
+        pack_for_version=pack_for_version,
     )
+    world.serve_candidate_pack()
+    return result
+
+
+# The registry holds no pack for the version the ontology-only tests name, so
+# they resolve it from an invented one.
+PACK_1_5_0 = fake_pack_resolver({"1.5.0": ("c" * 64, "d" * 64)})
 
 
 def _accept(world, serving: str, dispatch: str, *flags: str, store=None) -> tuple[int, str]:
@@ -408,7 +430,7 @@ class TestBegin:
     ):
         world = sync_world
 
-        code, text = _begin(world, ontology_version="1.5.0")
+        code, text = _begin(world, ontology_version="1.5.0", pack_for_version=PACK_1_5_0)
 
         assert code == 2
         assert UNBOUND_ONTOLOGY_ONLY.format(n=world.epoch_id) in text
@@ -420,7 +442,7 @@ class TestBegin:
         world = sync_world
         world.bind_active_epoch()
 
-        code, text = _begin(world, ontology_version="1.5.0")
+        code, text = _begin(world, ontology_version="1.5.0", pack_for_version=PACK_1_5_0)
 
         assert code == 0, text
         assert world.store.open_cutover().ontology_version == "1.5.0"

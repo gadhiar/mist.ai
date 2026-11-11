@@ -78,13 +78,18 @@ def _store(tmp_path):
 
 
 def make_pre_pack_hash(path: str) -> None:
-    """Rewrite a freshly initialized database into the shape it had before the pack hashes.
+    """Give the database at `path` its two epoch tables as they were before the pack hashes.
 
-    Both epoch tables are recreated from the earlier DDL and given one row
-    each: an active epoch, and an open, bound cutover from it.
+    Over a freshly initialized database the two tables are replaced; over a
+    path with no database, the file is created holding them alone. Either way
+    both are built from the earlier DDL and given one row each: an active
+    epoch, and an open, bound cutover from it.
     """
     conn = sqlite3.connect(path)
-    conn.executescript("DROP TABLE epoch_ledger; DROP TABLE epoch_cutover;" + _PRE_PACK_HASH_DDL)
+    conn.executescript(
+        "DROP TABLE IF EXISTS epoch_ledger; DROP TABLE IF EXISTS epoch_cutover;"
+        + _PRE_PACK_HASH_DDL
+    )
     conn.execute(
         "INSERT INTO epoch_ledger (ontology_version, extraction_version, model_hash, "
         "activated_at, prev_epoch_id, provisional) VALUES ('1.4.0', 'ev', 'm1', 't0', NULL, 1)"
