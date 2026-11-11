@@ -23,9 +23,11 @@ PRODUCTION CONSTRUCTS ONE leaves an epoch in the ledger. Delete the call site
 and this fails; that is its entire job.
 """
 
+import dataclasses
 from datetime import UTC, datetime
 
 from backend.chat.conversation_handler import ConversationHandler
+from backend.factories import writer_stamps_from_config
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from tests.mocks.config import build_test_config
@@ -35,6 +37,13 @@ from tests.mocks.ollama import FakeLLM
 from tests.unit.conftest import make_test_conventions_loader
 
 FIXED_CLOCK = datetime(2026, 8, 1, 12, 30, 0, tzinfo=UTC)
+FIVE_STAMPS = (
+    "ontology_version",
+    "extraction_version",
+    "model_hash",
+    "pack_prompt_hash",
+    "pack_rails_hash",
+)
 
 
 def _build_handler(config, *, now_fn=None) -> ConversationHandler:
@@ -101,6 +110,52 @@ class TestProductionCallerExists:
         assert epoch["extraction_version"]
         assert epoch["model_hash"]
         assert epoch["activated_at"]
+
+    def test_the_epochs_five_stamps_are_the_writers(self):
+        """The first epoch is what this backend writes under, pack hashes included.
+
+        The dispatcher's writer guard compares `writer_stamps_from_config`
+        with the active epoch, so a first epoch seeded with other stamps, or
+        with no pack hash, would either stall the backend it was seeded by or
+        leave its pack unrecorded.
+        """
+        # Arrange
+        config = build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        writer = writer_stamps_from_config(config)
+
+        # Act
+        handler = _build_handler(config)
+
+        # Assert
+        epoch = handler.event_store.get_current_epoch()
+        assert {name: epoch[name] for name in FIVE_STAMPS} == {
+            name: getattr(writer, name) for name in FIVE_STAMPS
+        }
+        assert epoch["pack_prompt_hash"] is not None
+        assert epoch["pack_rails_hash"] is not None
+
+    def test_the_epochs_pack_hashes_follow_the_pack_the_writer_stamps_resolve(self, monkeypatch):
+        """Mutant this kills: a call site that names a pack of its own.
+
+        The writer stamps take `active_pack()`; with another pack active, the
+        epoch must hold that pack's hashes, not the registry's default one's.
+        """
+        # Arrange
+        from backend import factories
+        from backend.knowledge.ontologies import registry
+
+        marked = dataclasses.replace(
+            registry.active_pack(), pack_prompt_hash="a" * 64, pack_rails_hash="b" * 64
+        )
+        monkeypatch.setattr(factories, "active_pack", lambda: marked)
+        config = build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+
+        # Act
+        handler = _build_handler(config)
+
+        # Assert
+        epoch = handler.event_store.get_current_epoch()
+        assert (epoch["pack_prompt_hash"], epoch["pack_rails_hash"]) == ("a" * 64, "b" * 64)
 
 
 class TestClockDiscipline:
