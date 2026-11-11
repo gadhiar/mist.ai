@@ -69,5 +69,8 @@ the gold row schema of `LABELLING.md`:
 - `shape` is one of the fourteen list shapes above; `category` is one of the seven prose
   categories. A row has one or the other.
 - `persona` is an id such as `p01-...`; it groups the probes written from one invented person.
-- `intended_relations` is the number of gold relations the author built the probe to carry, at
-  most 15. It is a design bound, not a label: the gold count comes from the passes.
+- `intended_relations` is the author's count of the probe's relations under the fullest natural
+  reading of `LABELLING.md`: every numbered convention and list rule that adds an edge per item
+  is counted, a kind noun in a lead-in (N14) and a named team (N17) included. No probe was written
+  to pass 13, two under the bound of 15 that the gold-set test puts on this field. It is a
+  design bound, not a label: the gold count comes from the passes.
