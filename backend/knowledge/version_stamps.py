@@ -189,7 +189,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-7f2ab02a4ea4165301082b1e35ef45124db48e660879211e708dea27c2459e28",
+        code_identity="ci1-5ae16e2551e615d5562ca4a622f98bca3b504b979ddb5f8b93c0993839da1381",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -219,7 +219,9 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "joins the covered code, and with the flag on a structured turn gets one plan "
             "call before its first batch, sent as stage extract under the plan's own "
             "schema, and every batch carries the plan block in front of its user message, "
-            "while a failed plan call leaves the batches as they are with the flag off. "
+            "while a failed plan call leaves the batches as they are with the flag off; the "
+            "plan asks for a template only where a heading or lead-in states a relationship, "
+            "and a failed plan call is logged by exception type and HTTP status alone. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

@@ -4,7 +4,7 @@ Stage 2 extracts a structured turn a few units at a time, so each batch
 decides on its own what a lead-in means and which id an entity gets, and two
 batches of one list can disagree. The turn plan makes those decisions once,
 with the whole turn in view: the entities the turn names, one template per
-heading or lead-in, and the lines that refer back. Every batch of the turn
+heading or lead-in that states a relationship, and the lines that refer back. Every batch of the turn
 then carries the plan in front of its own text.
 
 This module holds the plan's text and shape and nothing that calls a model:
@@ -48,7 +48,7 @@ Message, one line per unit:
 
 Do not extract this message yet. It is a structured turn (Rule 28) that is extracted a few lines at a time, and every line has to be read the same way. Plan that extraction from the whole message. Return ONLY a JSON object with these three lists, in place of the entities and relationships output:
 - "entities": every entity the message names, each one once, and never the user. Each has the "id" Rules 2 and 28 give it, its "name" and its "type", one of the allowed entity types above.
-- "templates": one for each heading or lead-in with lines under it. "lead_in" is its text as written. "subject", "predicate" and "fixed_endpoint" state the relationship the lead-in itself gives: "subject" is "user" or an id from "entities", "predicate" is one of the allowed relationship types above, and "fixed_endpoint" is the id of the entity the lead-in names as the other end, or "" when the other end is the entity of each line under it. "fan_out" lists every further relationship each line under the lead-in gets from it, as "source", "predicate" and "target": write "each" for the line's own entity, and "user" or an id from "entities" for the other end.
+- "templates": one for each heading or lead-in that gives the lines under it a relationship. A heading or lead-in that only names or groups its lines gets no template. "lead_in" is its text as written. "subject", "predicate" and "fixed_endpoint" state the relationship the lead-in itself gives: "subject" is "user" or an id from "entities", "predicate" is one of the allowed relationship types above, and "fixed_endpoint" is the id of the entity the lead-in names as the other end, or "" when the other end is the entity of each line under it. "fan_out" lists every further relationship each line under the lead-in gets from it, as "source", "predicate" and "target": write "each" for the line's own entity, and "user" or an id from "entities" for the other end.
 - "back_references": one for each line that refers back to an earlier line. "item" is the line's text as written and "refers_to" is the id, from "entities", of what it refers to.
 Leave a list empty when the message gives nothing for it.
 
@@ -68,7 +68,8 @@ PLAN_BLOCK_HEADER = (
 PLAN_BLOCK_ENTITIES_HEADING = "Entities named in this message (id | name | type):"
 PLAN_BLOCK_ENTITY_LINE = "- {id} | {name} | {type}"
 PLAN_BLOCK_TEMPLATES_HEADING = (
-    'Templates, one per lead-in or heading ("each" is the entity of each line under it):'
+    "Templates, one per lead-in or heading that states a relationship "
+    '("each" is the entity of each line under it):'
 )
 PLAN_BLOCK_TEMPLATE_LINE = "- {lead_in}: {relationships}"
 PLAN_BLOCK_RELATIONSHIP = "{source} {predicate} {target}"

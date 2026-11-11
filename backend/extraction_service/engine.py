@@ -577,6 +577,19 @@ def _log_call(request: LLMRequest, response: LLMResponse) -> None:
     )
 
 
+def _transport_failure(exc: Exception) -> str:
+    """A failed transport call as its exception type and HTTP status, never its message.
+
+    The openai client puts an error response's body in the exception's
+    message. Whether llama-server's error bodies quote the request or the
+    model's reply is not verified, and production turns are real
+    conversations, so the message stays out of the log.
+    """
+    status = getattr(exc, "status_code", None)
+    name = type(exc).__name__
+    return name if status is None else f"{name} (HTTP {status})"
+
+
 def _profile_of(stage: str, request: LLMRequest) -> StageRequestProfile:
     """The output-changing fields of `request`, read as the provider sends them.
 
@@ -916,7 +929,7 @@ class ExtractionEngine:
         except TimeoutError:
             failure = f"timed out after {self._settings.llm_timeout_seconds}s"
         except _LLM_TRANSPORT_ERRORS as exc:
-            failure = f"{type(exc).__name__}: {exc}"
+            failure = _transport_failure(exc)
         else:
             if response.finish_reason == "length":
                 failure = f"output stopped at max_tokens ({request.max_tokens})"

@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from openai import InternalServerError
 
 from backend.errors import ExtractionValidationError, LLMConnectionError, LLMResponseError
 from backend.extraction_contract.models import ExtractRequest, TurnPlanOut
@@ -137,7 +138,8 @@ _PLAN_BLOCK = (
     "- glasswren-audio | Glasswren Audio | Organization\n"
     "- lisel | Lisel | Person\n"
     "- chip-carving | Chip carving | Skill\n"
-    'Templates, one per lead-in or heading ("each" is the entity of each line under it):\n'
+    "Templates, one per lead-in or heading that states a relationship "
+    '("each" is the entity of each line under it):\n'
     "- The audio engine group at Glasswren Audio: user MEMBER_OF audio-engine-group; "
     "each MEMBER_OF audio-engine-group; each WORKS_AT glasswren-audio; user KNOWS_PERSON each\n"
     "- Crafts I'm learning: user LEARNING each\n"
@@ -494,6 +496,14 @@ class TestRenderPlanRequest:
         for field in ("entities", "templates", "back_references", "fixed_endpoint", "fan_out"):
             assert f'"{field}"' in PLAN_REQUEST_TEMPLATE
 
+    def test_a_heading_that_states_no_relationship_gets_no_template(self):
+        """Every template carries a predicate, so a heading without one must be left out."""
+        assert (
+            "one for each heading or lead-in that gives the lines under it a relationship"
+            in PLAN_REQUEST_TEMPLATE
+        )
+        assert "only names or groups its lines gets no template" in PLAN_REQUEST_TEMPLATE
+
 
 class TestRenderPlanBlock:
     def test_a_full_plan_renders_as_the_pinned_block(self):
@@ -827,6 +837,14 @@ def _raises(error: Exception) -> Answer:
     return answer
 
 
+def _upstream_500(body_text: str) -> InternalServerError:
+    """An openai status error as the client raises it, its message carrying the body."""
+    response = httpx.Response(
+        500, request=httpx.Request("POST", "http://llama/v1/chat/completions")
+    )
+    return InternalServerError(f"Error code: 500 - {body_text}", response=response, body=None)
+
+
 async def _never_answers(request: LLMRequest) -> LLMResponse:
     await asyncio.Event().wait()
     raise AssertionError("unreachable")
@@ -856,16 +874,23 @@ _FAILURES = [
     pytest.param(
         _raises(LLMConnectionError("connection refused")),
         {},
-        "LLMConnectionError: connection refused",
+        "LLMConnectionError",
         _NOT_RETURNED,
         id="a-transport-error",
     ),
     pytest.param(
         _raises(LLMResponseError("HTTP 500")),
         {},
-        "LLMResponseError: HTTP 500",
+        "LLMResponseError",
         _NOT_RETURNED,
         id="a-provider-error",
+    ),
+    pytest.param(
+        _raises(_upstream_500("Failed to parse input: Orrin Vale leads the rota")),
+        {},
+        "InternalServerError (HTTP 500)",
+        _NOT_RETURNED,
+        id="an-upstream-error-whose-body-quotes-text",
     ),
     pytest.param(
         _never_answers,
