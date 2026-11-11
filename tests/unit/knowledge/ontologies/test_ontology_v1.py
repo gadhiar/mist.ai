@@ -8,6 +8,7 @@ immediate, visible test failures.
 from __future__ import annotations
 
 import ast
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -572,3 +573,76 @@ class TestThePackImportsWithNoCycle:
             for name in reaching_the_loader
             if not name.startswith("backend.knowledge.ontologies.packs")
         } == set()
+
+
+# ---------------------------------------------------------------------------
+# The labelling guide: the ontology's rows are the pack's
+# ---------------------------------------------------------------------------
+
+_GUIDE = _REPO_ROOT / "data" / "gold" / "extraction" / "LABELLING.md"
+_PACK_GUIDE = _PACKS_DIR / "v1_4_0" / "labelling.md"
+
+# The guide before the split, at 058e52c: its non-empty lines, sorted, then hashed. The
+# split moves lines between the two files and adds or rewords none, headings included,
+# so the two files together keep this value and the line count.
+_GUIDE_LINE_COUNT = 471
+_GUIDE_LINES_SHA256 = "5e428caba6e710eadab0b29c6e999056750ce4c97272f9ac79e9030f9c60d498"
+
+# The rules that name this ontology's types and predicates, and the ones that hold for
+# any ontology.
+_ONTOLOGY_RULES = ("N2", "N3", "N5", "N7", "N8", "N10", "N11", "N12", "N13", "N14", "N16", "N17")
+_GENERIC_RULES = ("N1", "N4", "N6", "N15")
+_ONTOLOGY_HEADINGS = (
+    "### Event and metric ids",
+    "### Date entities",
+    "### Habits and incidental scope",
+)
+_GENERIC_HEADINGS = (
+    "### Ids",
+    "### Assertion kinds",
+    "### No-fact probes",
+    "## List-shaped probes (new)",
+)
+_GOAL_LIST_LINE = "  except under a lead-in that names goals, where it is `HAS_GOAL`."
+
+
+def _lines(path: Path) -> list[str]:
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _rule_starts(lines: list[str], rule: str) -> int:
+    """How many lines open the rule `rule`, as a bullet or as a paragraph."""
+    return sum(1 for line in lines if line.startswith((f"**{rule} ", f"- **{rule} ")))
+
+
+class TestTheGuideIsSplitBetweenTheGoldSetsAndThePack:
+    """The gold guide keeps the rules of any ontology; the pack holds its own."""
+
+    def test_the_two_files_hold_the_lines_of_the_guide_before_the_split(self):
+        lines = sorted(_lines(_GUIDE) + _lines(_PACK_GUIDE))
+
+        assert len(lines) == _GUIDE_LINE_COUNT
+        digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+        assert digest == _GUIDE_LINES_SHA256
+
+    @pytest.mark.parametrize("rule", _ONTOLOGY_RULES)
+    def test_an_ontology_rule_is_in_the_pack_alone(self, rule: str):
+        assert _rule_starts(_lines(_PACK_GUIDE), rule) == 1
+        assert _rule_starts(_lines(_GUIDE), rule) == 0
+
+    @pytest.mark.parametrize("rule", _GENERIC_RULES)
+    def test_a_generic_rule_stays_in_the_gold_guide(self, rule: str):
+        assert _rule_starts(_lines(_GUIDE), rule) == 1
+        assert _rule_starts(_lines(_PACK_GUIDE), rule) == 0
+
+    def test_the_sections_follow_their_rules(self):
+        guide, pack_guide = _lines(_GUIDE), _lines(_PACK_GUIDE)
+
+        assert [h for h in _ONTOLOGY_HEADINGS if h in pack_guide] == list(_ONTOLOGY_HEADINGS)
+        assert [h for h in _ONTOLOGY_HEADINGS if h in guide] == []
+        assert [h for h in _GENERIC_HEADINGS if h in guide] == list(_GENERIC_HEADINGS)
+        assert [h for h in _GENERIC_HEADINGS if h in pack_guide] == []
+
+    def test_the_goal_line_of_the_list_rules_is_the_packs(self):
+        assert _GOAL_LIST_LINE in _lines(_PACK_GUIDE)
+        assert _GOAL_LIST_LINE not in _lines(_GUIDE)
