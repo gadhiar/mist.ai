@@ -30,6 +30,10 @@ from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_seri
 # serialized response when None, which it is unless the service runs with its
 # off-by-default turn plan flag. A response without the flag is unchanged, so
 # the version stays; it moves when the plan ships.
+# Not a version either, for the same reason: ExtractResponse.batch_record, and
+# pack_prompt_hash and pack_rails_hash on ResultStamps and InfoResponse. Each is
+# optional and left out of the serialized model when None, which it is until
+# the service reports it.
 CONTRACT_VERSION = "1.3.0"
 CONTRACT_MAJOR = 1
 
@@ -160,6 +164,21 @@ class DerivationOut(BaseModel):
     operations: list[dict[str, Any]]
 
 
+_PACK_HASH_FIELDS: tuple[str, ...] = ("pack_prompt_hash", "pack_rails_hash")
+
+
+def _without_absent(data: dict[str, Any], model: BaseModel, names: tuple[str, ...]) -> dict:
+    """Drop from a serialized model each of `names` whose field is None.
+
+    A field that a service does not report yet is left out of the wire form, so the
+    model serializes byte for byte as it did before the field existed.
+    """
+    for name in names:
+        if getattr(model, name) is None:
+            data.pop(name, None)
+    return data
+
+
 class ResultStamps(BaseModel):
     """Version/identity stamps the service attaches to a completed result.
 
@@ -175,6 +194,11 @@ class ResultStamps(BaseModel):
             changes extraction output, which an epoch is keyed on. None means
             not reported, by a pre-1.3.0 service, or one that could not compute
             it (see `InfoResponse.serving_identity_error`).
+        pack_prompt_hash: The ontology pack's prompt hash: sha256 over what the
+            pack feeds the model. None means not reported, and the serialized
+            stamps then have no such key.
+        pack_rails_hash: The pack's rails hash: sha256 over the rules that run
+            on a payload after the model. None and its serialization likewise.
     """
 
     extraction_version: str
@@ -184,6 +208,13 @@ class ResultStamps(BaseModel):
     adapter: str
     run_identity: str | None = None
     serving_identity: str | None = None
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_pack_hashes(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Serialize as usual, then drop each pack hash that is not reported."""
+        return _without_absent(handler(self), self, _PACK_HASH_FIELDS)
 
 
 class TimingsMs(BaseModel):
@@ -220,6 +251,35 @@ class TurnPlanOut(BaseModel):
     finish_reason: str | None = None
 
 
+class BatchRecordEntry(BaseModel):
+    """The record of one Stage 2 call: what the model was given and what it returned.
+
+    A turn's batch record holds one entry per call, in call order, so which
+    batch an entity came from is logged, not inferred.
+
+    Attributes:
+        units: The batch's own units, each as the structure splitter gave it:
+            its `text`, its `context` (the headings, lead-in and parent items
+            above it) and its `kind`.
+        context: The earlier units of the same message the call was given for
+            reference, as rendered; empty when it was given none.
+        payload: The entities and relationships the call returned, as the
+            service parsed them. None when the call gave no usable payload.
+        prompt_tokens: The prompt tokens llama-server counted for the call.
+            None when the call returned no usage, or did not return.
+        completion_tokens: The completion tokens it counted; None likewise.
+        finish: Why the call stopped ("stop", "length"). None when the call
+            did not return.
+    """
+
+    units: list[dict[str, Any]]
+    context: list[str]
+    payload: ExtractionPayload | None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    finish: str | None = None
+
+
 class ExtractResponse(BaseModel):
     """Response body for a successfully completed extraction job.
 
@@ -237,6 +297,10 @@ class ExtractResponse(BaseModel):
             response it gave before the field existed. The plan call's time
             is part of `timings_ms.total` and of no stage's own figure:
             `timings_ms.extract` stays the time of the batch calls.
+        batch_record: One entry per Stage 2 call, in call order, when the
+            service records them. None otherwise, and then the serialized
+            response has no `batch_record` key, as with `turn_plan`.
+            `stage2_calls` stays the count; this is the calls themselves.
     """
 
     contract_version: str
@@ -251,14 +315,12 @@ class ExtractResponse(BaseModel):
     stage2_calls: int = Field(default=1, ge=1)
     warnings: list[str] = Field(default_factory=list)
     turn_plan: TurnPlanOut | None = None
+    batch_record: list[BatchRecordEntry] | None = None
 
     @model_serializer(mode="wrap")
-    def _omit_an_absent_turn_plan(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        """Serialize as usual, then drop `turn_plan` when there is none."""
-        data = handler(self)
-        if self.turn_plan is None:
-            data.pop("turn_plan", None)
-        return data
+    def _omit_the_absent_records(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Serialize as usual, then drop `turn_plan` and `batch_record` when there is none."""
+        return _without_absent(handler(self), self, ("turn_plan", "batch_record"))
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +440,11 @@ class InfoResponse(BaseModel):
             `EXTRACTION_SERVER_*` declaration is missing, `/props` is
             unreadable, or the declared context size differs from the observed
             one. None when the identity is reported, or by a pre-1.3.0 service.
+        pack_prompt_hash: The prompt hash of the ontology pack the service
+            runs with. None means not reported, and the serialized response
+            then has no such key.
+        pack_rails_hash: That pack's rails hash; None and its serialization
+            likewise.
     """
 
     contract_version: str
@@ -396,6 +463,13 @@ class InfoResponse(BaseModel):
     serving_identity: str | None = None
     serving_identity_components: dict[str, str | int | float | bool | None] | None = None
     serving_identity_error: str | None = None
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_pack_hashes(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Serialize as usual, then drop each pack hash that is not reported."""
+        return _without_absent(handler(self), self, _PACK_HASH_FIELDS)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,85 @@
+"""The boundary: no engine file names a type or an edge of a pack.
+
+The engine reads rules as data, so a type or edge name belongs in pack files only. The
+search reads a pack's names and looks for each as a quoted string literal in the engine
+files. A later ontology version joins the check by adding its pack to `_BOUNDARY_PACKS`.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from backend.knowledge.ontologies import registry
+from backend.knowledge.ontologies.pack import Pack, load_pack
+
+BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
+PET = load_pack("tests.unit.knowledge.ontologies.fixtures.pet_pack")
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_ONTOLOGY_HALF = "# === ontology half ==="
+
+
+def _engine_sources() -> dict[str, str]:
+    """The engine files, by path: the id rails count up to their ontology half."""
+    backend = _REPO_ROOT / "backend"
+    extraction = backend / "knowledge" / "extraction"
+    paths = sorted((backend / "extraction_service").glob("*.py"))
+    paths += [
+        extraction / "structure_splitter.py",
+        extraction / "normalizer.py",
+        extraction / "rails.py",
+        extraction / "pre_llm.py",
+    ]
+    sources = {
+        str(path.relative_to(_REPO_ROOT)): path.read_text(encoding="utf-8") for path in paths
+    }
+    id_rails_source = (extraction / "id_rails.py").read_text(encoding="utf-8")
+    assert id_rails_source.count(f"\n{_ONTOLOGY_HALF}\n") == 1
+    engine_half = id_rails_source.split(f"\n{_ONTOLOGY_HALF}\n")[0]
+    sources["backend/knowledge/extraction/id_rails.py (engine half)"] = engine_half
+    return sources
+
+
+def _quoted_pack_names(pack: Pack, sources: dict[str, str]) -> list[tuple[str, str]]:
+    """Every (file, name) where a type or edge of `pack` stands as a quoted string literal."""
+    names = sorted(pack.type_names | set(pack.edges_by_name) | set(pack.retired))
+    found = []
+    for path, source in sources.items():
+        for name in names:
+            if re.search(rf"""["']{re.escape(name)}["']""", source):
+                found.append((path, name))
+    return found
+
+
+# T46 adds the v1.4.0 pack to this list. Today's ontology already passes through the
+# adapter pack, so the active pack is on it now.
+_BOUNDARY_PACKS = {"base": BASE, "pet": PET, "active": registry.active_pack()}
+
+
+@pytest.mark.parametrize("name", sorted(_BOUNDARY_PACKS))
+def test_no_engine_file_names_a_type_or_an_edge_of_the_pack(name):
+    assert _quoted_pack_names(_BOUNDARY_PACKS[name], _engine_sources()) == []
+
+
+def test_the_boundary_search_finds_a_quoted_name():
+    planted = {"engine.py": "if entity['type'] == \"Pet\":\n    pass\n"}
+
+    assert _quoted_pack_names(PET, planted) == [("engine.py", "Pet")]
+    assert _quoted_pack_names(BASE, planted) == []
+
+
+def test_the_boundary_covers_the_engine_files_the_plan_lists():
+    covered = set(_engine_sources())
+
+    assert {
+        "backend/extraction_service/engine.py",
+        "backend/extraction_service/turn_plan.py",
+        "backend/knowledge/extraction/structure_splitter.py",
+        "backend/knowledge/extraction/normalizer.py",
+        "backend/knowledge/extraction/rails.py",
+        "backend/knowledge/extraction/pre_llm.py",
+        "backend/knowledge/extraction/id_rails.py (engine half)",
+    } <= {path.replace("\\", "/") for path in covered}

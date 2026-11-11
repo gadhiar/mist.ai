@@ -59,6 +59,7 @@ from datetime import datetime
 from backend.errors import MistError
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
+from backend.knowledge.extraction.normalizer import rail_inputs
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
 from backend.knowledge.regeneration.rebuild_gate import (
@@ -462,7 +463,7 @@ class LogRegenerator:
             reference_date = datetime.fromisoformat(turn["timestamp"])
             extraction = self._confidence_scorer.adjust_confidence(extraction)
             extraction = self._temporal_resolver.resolve(extraction, reference_date)
-            extraction = await self._normalizer.normalize(extraction)
+            extraction = await self._normalizer.normalize(extraction, **rail_inputs(cached))
             vr = self._validator.validate(extraction)
 
             result: CurationResult = await self._curation.curate_and_store(
