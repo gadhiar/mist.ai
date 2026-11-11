@@ -6,9 +6,10 @@ candidate that holds one refuses a service, a reply or a backend writer whose
 hash differs or is missing. A stored null is a target from before the hashes
 existed: that hash is not compared.
 
-The event store has no column for either hash yet, so every row it returns
-reads as legacy. The stored side here is therefore built directly: a row dict
-that carries the keys, or `dataclasses.replace` on what the store returned.
+The stored side here is built directly: a row dict that carries the keys, or
+`dataclasses.replace` on what the store returned. The suite's world seeds its
+epoch with no hash, so what its store returns reads as legacy. The same checks
+over hashes a real `EventStore` holds are in `test_pack_hash_persistence.py`.
 """
 
 from __future__ import annotations
@@ -174,7 +175,7 @@ class TestRowReaders:
         assert target.cutover_id == 7
 
     def test_what_the_event_store_returns_today_reads_as_legacy(self, backlog_world):
-        """No ledger column holds a hash yet, so the active epoch compares neither."""
+        """An epoch seeded with no hash stores NULL in both columns, so it compares neither."""
         epoch = backlog_world.store.active_epoch()
 
         assert (epoch.pack_prompt_hash, epoch.pack_rails_hash) == (None, None)

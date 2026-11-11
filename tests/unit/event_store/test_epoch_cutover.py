@@ -471,3 +471,121 @@ class TestPromoteSeedOnly:
 
         with pytest.raises(EpochCutoverStateError, match="only a 'checked' cutover"):
             store.promote_epoch_cutover(cutover_id=cutover_id, activated_at="t3")
+
+
+PROMPT = "a" * 64
+RAILS = "b" * 64
+
+
+def _begin_with_pack(store: EventStore) -> int:
+    """A candidate that stores both pack hashes."""
+    cutover_id = store.begin_epoch_cutover(
+        ontology_version="1.4.0",
+        extraction_version="ev",
+        model_hash="m2|emb:e",
+        bare_model_hash="m2",
+        source_epoch_id=1,
+        requested_at=T0.isoformat(),
+        pack_prompt_hash=PROMPT,
+        pack_rails_hash=RAILS,
+    )
+    assert cutover_id is not None
+    return cutover_id
+
+
+def _pack_hashes(row) -> tuple[str | None, str | None]:
+    return (row["pack_prompt_hash"], row["pack_rails_hash"])
+
+
+def _promote_graph_swapped(store: EventStore, cutover_id: int) -> dict:
+    ids = _log(store, 2)
+    _checked(store, cutover_id, ids[1])
+    return store.promote_epoch_cutover(cutover_id=cutover_id, activated_at="t3")
+
+
+def _promote_seed_only(store: EventStore, cutover_id: int) -> dict:
+    _ready(store, cutover_id)
+    return _seed_only(store, cutover_id)
+
+
+BOTH_PROMOTIONS = pytest.mark.parametrize(
+    "promote", [_promote_graph_swapped, _promote_seed_only], ids=["graph-swapped", "seed-only"]
+)
+
+
+class TestPackHashes:
+    """A candidate stores the two pack hashes it is given; promotion carries them to the ledger."""
+
+    def test_begin_stores_the_hashes_it_is_given(self):
+        store = _store()
+
+        cutover_id = _begin_with_pack(store)
+
+        assert _pack_hashes(store.get_epoch_cutover(cutover_id)) == (PROMPT, RAILS)
+        assert _pack_hashes(store.get_open_epoch_cutover()) == (PROMPT, RAILS)
+
+    def test_begin_given_no_hash_stores_null(self):
+        store = _store()
+
+        cutover_id = _begin(store)
+
+        assert _pack_hashes(store.get_epoch_cutover(cutover_id)) == (None, None)
+
+    @BOTH_PROMOTIONS
+    def test_the_promoted_ledger_row_carries_the_candidates_hashes(self, promote):
+        store = _store()
+        cutover_id = _begin_with_pack(store)
+
+        result = promote(store, cutover_id)
+
+        epoch = store.get_current_epoch()
+        assert epoch["epoch_id"] == result["epoch_id"] == 2
+        assert _pack_hashes(epoch) == _pack_hashes(store.get_epoch_cutover(cutover_id))
+        assert _pack_hashes(epoch) == (PROMPT, RAILS)
+        # The source epoch's row is not rewritten.
+        assert _pack_hashes(store.get_epoch(1)) == (None, None)
+
+    @BOTH_PROMOTIONS
+    def test_a_candidate_that_holds_no_hash_promotes_to_a_row_that_holds_none(self, promote):
+        store = _store()
+        cutover_id = _begin(store)
+
+        promote(store, cutover_id)
+
+        assert _pack_hashes(store.get_current_epoch()) == (None, None)
+
+    @BOTH_PROMOTIONS
+    def test_the_hashes_are_written_with_the_triple_and_a_fault_leaves_no_ledger_row(
+        self, tmp_path, monkeypatch, promote
+    ):
+        # Arrange
+        path = str(tmp_path / "event_store.db")
+        store = _store(path)
+        cutover_id = _begin_with_pack(store)
+        seen: dict = {}
+
+        def crash(step: str) -> None:
+            # This connection, inside the open transaction, at the point right
+            # after the ledger INSERT: the row is already complete.
+            row = (
+                store._get_connection()
+                .execute("SELECT * FROM epoch_ledger WHERE epoch_id = 2")
+                .fetchone()
+            )
+            seen["step"] = step
+            seen["in_transaction"] = (row["model_hash"], *_pack_hashes(row))
+            raise SimulatedCrashError("process died after the ledger append")
+
+        monkeypatch.setattr(store, "_promotion_fault_point", crash)
+
+        # Act
+        with pytest.raises(SimulatedCrashError):
+            promote(store, cutover_id)
+
+        # Assert
+        assert seen == {"step": "ledger_appended", "in_transaction": ("m2|emb:e", PROMPT, RAILS)}
+        store.close()
+        reopened = EventStore(db_path=path)
+        assert [row["epoch_id"] for row in reopened.list_epochs()] == [1]
+        assert reopened.get_epoch_cutover(cutover_id)["promoted_epoch_id"] is None
+        reopened.close()

@@ -475,6 +475,54 @@ class TestEnsureInitialEpoch:
         assert epoch["extraction_version"] == expected_config.extraction_version
         assert epoch["model_hash"] == expected_config.model_hash
 
+    def test_it_stores_the_pack_hashes_it_is_given(self, tmp_path):
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.ensure_initial_epoch(
+            now_iso="2026-07-31T00:00:00",
+            ontology_version="onto-x",
+            extraction_version="extract-x",
+            model_hash="hash-x",
+            pack_prompt_hash="a" * 64,
+            pack_rails_hash="b" * 64,
+        )
+
+        row = store.get_current_epoch()
+        assert (row["pack_prompt_hash"], row["pack_rails_hash"]) == ("a" * 64, "b" * 64)
+        assert row["provisional"] == 1
+
+    def test_given_no_pack_hash_it_stores_null_even_when_it_derives_the_triple(self, tmp_path):
+        """The triple has defaults read from the config; a pack hash has none."""
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.ensure_initial_epoch(now_iso="2026-07-31T00:00:00")
+
+        row = store.get_current_epoch()
+        assert row["pack_prompt_hash"] is None
+        assert row["pack_rails_hash"] is None
+
+    @pytest.mark.parametrize(
+        "hashes",
+        [{}, {"pack_prompt_hash": "a" * 64, "pack_rails_hash": "b" * 64}],
+        ids=["no-hashes", "both-hashes"],
+    )
+    def test_the_returned_dict_equals_the_stored_row(self, tmp_path, hashes):
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        returned = store.ensure_initial_epoch(
+            now_iso="2026-07-31T00:00:00",
+            ontology_version="onto-x",
+            extraction_version="extract-x",
+            model_hash="hash-x",
+            **hashes,
+        )
+
+        assert returned == store.get_current_epoch()
+        assert list(returned) == list(store.get_current_epoch())
+
     def test_does_not_overwrite_an_existing_non_provisional_epoch(self, tmp_path):
         """A genuine epoch (written via `append_epoch`, not this method)
         must not be superseded by a provisional one -- 'ensure a reference

@@ -379,11 +379,19 @@ def materialize_isolated(
     # Stamps come from the single authority. No parameter, no literal: a generator that can
     # state its own triple reintroduces the drift the collapse removed.
     model_hash = KnowledgeConfig.from_env().model_hash
+    # The two pack hashes are those of the pack the registry holds for the version the
+    # epoch is stamped with, read by version so the epoch's hashes and its
+    # `ontology_version` name one pack.
+    from backend.knowledge.ontologies import registry
+
+    pack = registry.get_pack(ONTOLOGY_VERSION)
     epoch_id = event_store.append_epoch(
         ontology_version=ONTOLOGY_VERSION,
         extraction_version=EXTRACTION_VERSION,
         model_hash=model_hash,
         activated_at=activated_at or turns[0].timestamp,
+        pack_prompt_hash=pack.pack_prompt_hash,
+        pack_rails_hash=pack.pack_rails_hash,
     )
     epoch = event_store.get_current_epoch()
     if epoch is None or int(epoch["epoch_id"]) != epoch_id:

@@ -205,6 +205,31 @@ class TestSchema:
         assert {c[0] for c in fresh_columns} >= set(_BINDING_COLUMNS)
         migrated.close()
 
+    def test_the_oldest_epoch_cutover_migrates_to_the_fresh_column_order(self, tmp_path):
+        """A table from before the binding gains its columns first, then the two pack hashes."""
+        fresh = _store()
+        path = str(tmp_path / "old.db")
+        _store(path).close()
+        _make_pre_change(path)
+
+        migrated = EventStore(db_path=path)
+        migrated.initialize()
+
+        def names(store: EventStore) -> list[str]:
+            return [
+                row[1]
+                for row in store._get_connection().execute("PRAGMA table_info(epoch_cutover)")
+            ]
+
+        assert names(migrated) == names(fresh)
+        assert names(fresh) == [
+            *_PRE_CHANGE_CUTOVER_COLUMNS,
+            *_BINDING_COLUMNS,
+            "pack_prompt_hash",
+            "pack_rails_hash",
+        ]
+        migrated.close()
+
     def test_a_pre_change_database_opens_and_keeps_every_row_byte_identical(self, tmp_path):
         # Arrange: a pre-change database with a ledger, a log, markers and an open cutover.
         path = str(tmp_path / "old.db")

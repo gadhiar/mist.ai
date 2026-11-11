@@ -960,13 +960,20 @@ class ConversationHandler:
                 # on 2 of 3 fields, and since `LogRegenerator` keys the
                 # extraction cache off the EPOCH row, that is a permanent
                 # `ColdCacheError` on every rebuild rather than a mislabel.
-                from backend.knowledge.version_stamps import compose_model_hash
+                # All five come from `writer_stamps_from_config`, the function
+                # the curation writer and the dispatcher's writer guard read,
+                # so the first epoch also stores the two hashes of the ontology
+                # pack this backend writes under.
+                from backend.factories import writer_stamps_from_config
 
+                writer_stamps = writer_stamps_from_config(self.config)
                 self.event_store.ensure_initial_epoch(
                     now_iso=self._now_fn().isoformat(),
-                    ontology_version=self.config.ontology_version,
-                    extraction_version=self.config.extraction_version,
-                    model_hash=compose_model_hash(self.config),
+                    ontology_version=writer_stamps.ontology_version,
+                    extraction_version=writer_stamps.extraction_version,
+                    model_hash=writer_stamps.model_hash,
+                    pack_prompt_hash=writer_stamps.pack_prompt_hash,
+                    pack_rails_hash=writer_stamps.pack_rails_hash,
                 )
                 logger.info("Event store enabled at %s", self.event_store.db_path)
             except Exception as e:

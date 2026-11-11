@@ -7,6 +7,7 @@ output" is a claim only a text artifact can support.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from backend.knowledge.eval_isolation import (
     IsolatedRootError,
 )
 from backend.knowledge.extraction_cache import cache_key
+from backend.knowledge.ontologies import registry
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from scripts.golden_log.generate import (
     ARTIFACT_PATH,
@@ -226,6 +228,45 @@ class TestStampsHaveOneAuthority:
         # a pre-collapse extraction_version and must never be depended on.
         materialized = materialize_isolated(turns, root=tmp_path / "isolated")
         assert materialized.event_store.list_epochs() == [materialized.epoch]
+
+    def test_epoch_holds_the_hashes_of_the_registrys_pack_for_the_code_version(
+        self, turns, tmp_path
+    ):
+        # Arrange: the pack the registry holds for the version the epoch is stamped with.
+        pack = registry.get_pack(ONTOLOGY_VERSION)
+
+        # Act
+        materialized = materialize_isolated(turns, root=tmp_path / "isolated")
+
+        # Assert
+        assert materialized.epoch["pack_prompt_hash"] == pack.pack_prompt_hash
+        assert materialized.epoch["pack_rails_hash"] == pack.pack_rails_hash
+        assert pack.pack_prompt_hash is not None
+        assert pack.pack_rails_hash is not None
+
+    def test_epoch_pack_is_resolved_by_version_from_the_registry(
+        self, turns, tmp_path, monkeypatch
+    ):
+        # Arrange: a registry that records what it is asked for and answers with a pack
+        # whose hashes no real pack has. A generator that states its own hashes, or takes
+        # the active pack instead of the one for ONTOLOGY_VERSION, fails here.
+        asked: list[str] = []
+        real = registry.get_pack(ONTOLOGY_VERSION)
+        marked = dataclasses.replace(real, pack_prompt_hash="a" * 64, pack_rails_hash="b" * 64)
+
+        def get_pack(version: str):
+            asked.append(version)
+            return marked
+
+        monkeypatch.setattr(registry, "get_pack", get_pack)
+
+        # Act
+        materialized = materialize_isolated(turns, root=tmp_path / "isolated")
+
+        # Assert
+        assert asked == [ONTOLOGY_VERSION]
+        assert materialized.epoch["pack_prompt_hash"] == "a" * 64
+        assert materialized.epoch["pack_rails_hash"] == "b" * 64
 
 
 class TestIsolation:

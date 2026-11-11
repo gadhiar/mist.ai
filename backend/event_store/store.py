@@ -46,6 +46,10 @@ _CUTOVER_BINDING_COLUMNS = (
     "binding_evidence",
     "bound_at",
 )
+# The ontology pack's two hashes: nullable TEXT columns declared last on both
+# `epoch_ledger` and `epoch_cutover`. The guarded ALTER in `initialize` adds
+# them to an older table, after the columns above.
+_PACK_HASH_COLUMNS = ("pack_prompt_hash", "pack_rails_hash")
 
 
 def _dumps(value: Mapping[str, Any]) -> str:
@@ -144,6 +148,18 @@ class EventStore:
             if name not in cutover_columns:
                 conn.execute(f"ALTER TABLE epoch_cutover ADD COLUMN {name} TEXT")
                 logger.info("Event store: added `%s` column to epoch_cutover", name)
+
+        # The ontology pack's two hashes on both epoch tables: the same guard.
+        # Nullable with no default, so every existing row reads NULL there, a
+        # row from before the hashes were stored, and no existing value
+        # changes. Added after the columns above, so a migrated table has the
+        # column order `schema.sql` declares.
+        for table in ("epoch_ledger", "epoch_cutover"):
+            table_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name in _PACK_HASH_COLUMNS:
+                if name not in table_columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT")
+                    logger.info("Event store: added `%s` column to %s", name, table)
 
         logger.info("Event store initialized at %s", self.db_path)
 
@@ -532,18 +548,32 @@ class EventStore:
         extraction_version: str,
         model_hash: str,
         activated_at: str,
+        *,
+        pack_prompt_hash: str | None = None,
+        pack_rails_hash: str | None = None,
     ) -> int:
-        """Append a new epoch unless the latest already has this stamp triple.
+        """Append a new epoch unless the latest already has these five stamps.
 
-        Idempotent on an unchanged triple: returns the existing epoch_id without
-        inserting. Returns the (new or existing) epoch_id.
+        The five are the stamp triple and the ontology pack's two hashes.
+        Idempotent only when all five equal the latest row's: returns the
+        existing epoch_id without inserting. None is a value here like any
+        other, so a call that gives no hash over a latest row that holds one
+        appends, as does a call that differs in one hash alone. Returns the
+        (new or existing) epoch_id.
+
+        Args:
+            pack_prompt_hash: The pack's prompt hash, stored as given. None is
+                stored as NULL; this method derives no hash.
+            pack_rails_hash: The pack's rails hash, on the same terms.
         """
         current = self.get_current_epoch()
         if current is not None and (
             current["ontology_version"],
             current["extraction_version"],
             current["model_hash"],
-        ) == (ontology_version, extraction_version, model_hash):
+            current.get("pack_prompt_hash"),
+            current.get("pack_rails_hash"),
+        ) == (ontology_version, extraction_version, model_hash, pack_prompt_hash, pack_rails_hash):
             return int(current["epoch_id"])
 
         prev_id = int(current["epoch_id"]) if current is not None else None
@@ -551,10 +581,19 @@ class EventStore:
         cursor = conn.execute(
             """
             INSERT INTO epoch_ledger (
-                ontology_version, extraction_version, model_hash, activated_at, prev_epoch_id
-            ) VALUES (?, ?, ?, ?, ?)
+                ontology_version, extraction_version, model_hash, activated_at, prev_epoch_id,
+                pack_prompt_hash, pack_rails_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (ontology_version, extraction_version, model_hash, activated_at, prev_id),
+            (
+                ontology_version,
+                extraction_version,
+                model_hash,
+                activated_at,
+                prev_id,
+                pack_prompt_hash,
+                pack_rails_hash,
+            ),
         )
         return int(cursor.lastrowid)
 
@@ -583,6 +622,8 @@ class EventStore:
         ontology_version: str | None = None,
         extraction_version: str | None = None,
         model_hash: str | None = None,
+        pack_prompt_hash: str | None = None,
+        pack_rails_hash: str | None = None,
     ) -> dict[str, Any]:
         """Ensure the epoch ledger has a reference epoch, seeding one if empty.
 
@@ -620,10 +661,14 @@ class EventStore:
                 given.
             model_hash: Stamp to write. Defaults to
                 `KnowledgeConfig.from_env().model_hash` when not given.
+            pack_prompt_hash: The ontology pack's prompt hash, stored as
+                given. It has no default to read: None is stored as NULL, also
+                when the triple above is derived.
+            pack_rails_hash: The pack's rails hash, on the same terms.
 
         Returns:
             The current epoch row as a dict -- either the one just
-            inserted, or the pre-existing one.
+            inserted, read back from the ledger, or the pre-existing one.
         """
         current = self.get_current_epoch()
         if current is not None:
@@ -656,10 +701,17 @@ class EventStore:
             """
             INSERT INTO epoch_ledger (
                 ontology_version, extraction_version, model_hash, activated_at,
-                prev_epoch_id, provisional
-            ) VALUES (?, ?, ?, ?, NULL, 1)
+                prev_epoch_id, provisional, pack_prompt_hash, pack_rails_hash
+            ) VALUES (?, ?, ?, ?, NULL, 1, ?, ?)
             """,
-            (ontology_version, extraction_version, model_hash, now_iso),
+            (
+                ontology_version,
+                extraction_version,
+                model_hash,
+                now_iso,
+                pack_prompt_hash,
+                pack_rails_hash,
+            ),
         )
 
         logger.info(
@@ -669,15 +721,12 @@ class EventStore:
             extraction_version,
         )
 
-        return {
-            "epoch_id": int(cursor.lastrowid),
-            "ontology_version": ontology_version,
-            "extraction_version": extraction_version,
-            "model_hash": model_hash,
-            "activated_at": now_iso,
-            "prev_epoch_id": None,
-            "provisional": 1,
-        }
+        # Read back rather than restated, so what a caller is handed is the
+        # stored row, column for column, whatever columns the ledger has.
+        row = conn.execute(
+            "SELECT * FROM epoch_ledger WHERE epoch_id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        return dict(row)
 
     # ------------------------------------------------------------------
     # Curation observability (D3)
@@ -1176,6 +1225,8 @@ class EventStore:
         bare_model_hash: str,
         source_epoch_id: int,
         requested_at: str,
+        pack_prompt_hash: str | None = None,
+        pack_rails_hash: str | None = None,
     ) -> int | None:
         """Open a cutover candidate in state 'filling', unless one is already open.
 
@@ -1193,6 +1244,11 @@ class EventStore:
             bare_model_hash: The service's own model identity (`/v1/info`).
             source_epoch_id: The active epoch the cutover starts from;
                 promotion refuses if the ledger has moved on since.
+            pack_prompt_hash: The candidate's ontology pack prompt hash,
+                stored as given. None is stored as NULL; this method derives
+                no hash.
+            pack_rails_hash: The candidate's pack rails hash, on the same
+                terms.
 
         Returns:
             The new `cutover_id`, or None when a cutover is already open.
@@ -1210,8 +1266,9 @@ class EventStore:
                 return None
             cursor = conn.execute(
                 "INSERT INTO epoch_cutover (ontology_version, extraction_version, model_hash, "
-                "bare_model_hash, requested_at, state, source_epoch_id, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'filling', ?, ?)",
+                "bare_model_hash, requested_at, state, source_epoch_id, updated_at, "
+                "pack_prompt_hash, pack_rails_hash) "
+                "VALUES (?, ?, ?, ?, ?, 'filling', ?, ?, ?, ?)",
                 (
                     ontology_version,
                     extraction_version,
@@ -1220,6 +1277,8 @@ class EventStore:
                     requested_at,
                     source_epoch_id,
                     requested_at,
+                    pack_prompt_hash,
+                    pack_rails_hash,
                 ),
             )
             conn.execute("COMMIT")
@@ -1303,8 +1362,9 @@ class EventStore:
 
         Inside a single `BEGIN IMMEDIATE`:
 
-        1. append the candidate's stamp triple to `epoch_ledger` (prev = the
-           cutover's source epoch), which makes it the active epoch, and, when
+        1. append the candidate's stamp triple and its two pack hashes, in one
+           INSERT, to `epoch_ledger` (prev = the cutover's source epoch),
+           which makes it the active epoch, and, when
            the cutover is bound, copy its binding to `epoch_identity` (source
            'promoted', the cutover's namespace), so the new epoch is never
            live unbound when its candidate was bound;
@@ -1374,13 +1434,16 @@ class EventStore:
 
             cursor = conn.execute(
                 "INSERT INTO epoch_ledger (ontology_version, extraction_version, model_hash, "
-                "activated_at, prev_epoch_id, provisional) VALUES (?, ?, ?, ?, ?, 0)",
+                "activated_at, prev_epoch_id, provisional, pack_prompt_hash, pack_rails_hash) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
                 (
                     row["ontology_version"],
                     row["extraction_version"],
                     row["model_hash"],
                     activated_at,
                     int(current["epoch_id"]),
+                    row["pack_prompt_hash"],
+                    row["pack_rails_hash"],
                 ),
             )
             epoch_id = int(cursor.lastrowid)
@@ -1464,8 +1527,9 @@ class EventStore:
            graph may hold extracted data the probe did not see), and that
            `conversation_turn_events` has NO row (a turn logged after the
            caller's own check is refused here, under the write lock);
-        2. append the candidate's stamp triple to `epoch_ledger` (prev = the
-           source epoch, provisional 0), and copy a bound cutover's binding to
+        2. append the candidate's stamp triple and its two pack hashes, in one
+           INSERT, to `epoch_ledger` (prev = the source epoch, provisional
+           0), and copy a bound cutover's binding to
            `epoch_identity`, as `promote_epoch_cutover` does;
         3. write the new epoch's `extraction_activation` row first-hand, with
            `turns_at_activation` = `marked_applied` = `legacy_unextracted` = 0
@@ -1543,13 +1607,16 @@ class EventStore:
 
             cursor = conn.execute(
                 "INSERT INTO epoch_ledger (ontology_version, extraction_version, model_hash, "
-                "activated_at, prev_epoch_id, provisional) VALUES (?, ?, ?, ?, ?, 0)",
+                "activated_at, prev_epoch_id, provisional, pack_prompt_hash, pack_rails_hash) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
                 (
                     row["ontology_version"],
                     row["extraction_version"],
                     row["model_hash"],
                     activated_at,
                     int(current["epoch_id"]),
+                    row["pack_prompt_hash"],
+                    row["pack_rails_hash"],
                 ),
             )
             epoch_id = int(cursor.lastrowid)

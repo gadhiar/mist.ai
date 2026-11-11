@@ -80,9 +80,9 @@ class RebuildStamps:
     `pack_prompt_hash` and `pack_rails_hash` are the hashes of the ontology pack
     the factory built the stamps from, which is the pack it hands the
     normalizer and validator it constructs: what that pack feeds a model, and
-    the rules it runs on a payload before the write. The EXTRACTED_FROM edge
-    carries both (`_extracted_from_clause`); the fact edges
-    `reconciliation.py` writes carry the triple only. The dispatcher's
+    the rules it runs on a payload before the write. The EXTRACTED_FROM edge carries both
+    (`_extracted_from_clause`), and so do the fact edge and the structural edge
+    `reconciliation.py` writes, which set them beside the triple on create alone. The dispatcher's
     writer-stamp guard compares both with an epoch that holds them. None is a
     writer built with no pack named, which stamps no hash.
     """

@@ -118,6 +118,8 @@ def _begin(world) -> None:
         ONTOLOGY_VERSION,
     )
     assert code == 0, text
+    # The candidate stores its pack's hashes; the fill refuses a service on others.
+    world.serve_candidate_pack()
 
 
 def _log(world, ts, index: int, *, session_id: str = "s1") -> str:

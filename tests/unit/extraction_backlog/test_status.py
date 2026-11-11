@@ -328,6 +328,10 @@ class TestWebSocketPush:
         assert message["backlog_depth"] == 1
 
 
+PROMPT = "a" * 64
+RAILS = "b" * 64
+
+
 def _matching_config(world):
     """A backend config whose writer stamps equal the world's active epoch."""
     from tests.mocks.config import build_test_config
@@ -437,6 +441,170 @@ class TestAdminStatusCli:
         ) in text
         # Before promotion the writer stamps are still compared with the ACTIVE epoch.
         assert "writer stamps: match" in text
+
+    # -- the stored pack hashes ------------------------------------------------
+
+    def _epoch_line(self, world) -> str:
+        return (
+            f"epoch {world.epoch_id}: ontology_version={ONTOLOGY_VERSION} "
+            f"extraction_version={world.service.extraction_version} "
+            f"model_hash={composed(world.service.model_hash)}\n"
+        )
+
+    def test_an_epoch_that_stores_no_pack_hash_prints_none_for_both(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+
+        code, text = _admin_status(world, _matching_config(world))
+
+        assert code == 0, text
+        assert (
+            self._epoch_line(world) + "pack: pack_prompt_hash=none pack_rails_hash=none\n"
+        ) in text
+        # A stored null is not compared, so the backend's own pack still matches.
+        assert "writer stamps: match\n" in text
+
+    def test_the_active_epochs_stored_pack_hashes_are_printed_under_its_stamps(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False, pack_prompt_hash=PROMPT, pack_rails_hash=RAILS)
+
+        code, text = _admin_status(world, _matching_config(world))
+
+        assert code == 0, text
+        assert (
+            self._epoch_line(world) + f"pack: pack_prompt_hash={PROMPT} pack_rails_hash={RAILS}\n"
+        ) in text
+
+    def test_one_stored_hash_prints_beside_none_for_the_other(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False, pack_prompt_hash=PROMPT)
+
+        _, text = _admin_status(world, _matching_config(world))
+
+        assert f"\npack: pack_prompt_hash={PROMPT} pack_rails_hash=none\n" in text
+
+    def test_a_backend_on_the_epochs_stored_pack_is_a_match(self):
+        from backend.knowledge.ontologies import registry
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        pack = registry.active_pack()
+        world = _build_world(
+            with_deriver=False,
+            pack_prompt_hash=pack.pack_prompt_hash,
+            pack_rails_hash=pack.pack_rails_hash,
+        )
+
+        _, text = _admin_status(world, _matching_config(world))
+
+        assert "writer stamps: match\n" in text
+        assert "MISMATCH" not in text
+
+    def test_a_differing_pack_hash_is_named_by_its_field(self):
+        """The backend's pack is the registry's; the epoch stores another rails hash."""
+        from backend.knowledge.ontologies import registry
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        pack = registry.active_pack()
+        world = _build_world(
+            with_deriver=False, pack_prompt_hash=pack.pack_prompt_hash, pack_rails_hash=RAILS
+        )
+
+        code, text = _admin_status(world, _matching_config(world))
+
+        assert code == 0, text
+        assert "writer stamps: MISMATCH (pack_rails_hash)\n" in text
+        # The dispatcher guard's own reason follows, with both values of the hash.
+        assert f"  backend ontology pack (pack_rails_hash={pack.pack_rails_hash!r}) != " in text
+        assert f"(pack_rails_hash={RAILS!r}); nothing is applied or dispatched" in text
+
+    def test_both_differing_pack_hashes_are_named(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False, pack_prompt_hash=PROMPT, pack_rails_hash=RAILS)
+
+        _, text = _admin_status(world, _matching_config(world))
+
+        assert "writer stamps: MISMATCH (pack_prompt_hash, pack_rails_hash)\n" in text
+
+    def test_a_differing_pack_hash_is_named_after_the_differing_triple_fields(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False, pack_prompt_hash=PROMPT, pack_rails_hash=RAILS)
+        config = _matching_config(world)
+        config.model_hash = "some-other-model"
+
+        _, text = _admin_status(world, config)
+
+        assert "writer stamps: MISMATCH (model_hash, pack_prompt_hash, pack_rails_hash)\n" in text
+
+    def _open_candidate(self, world, ts, **hashes) -> str:
+        """Open a candidate holding `hashes`; returns its `candidate:` line."""
+        world.store.begin_cutover(
+            ontology_version="1.5.0",
+            extraction_version="candidate-ev",
+            model_hash=composed("svc-model-2"),
+            bare_model_hash="svc-model-2",
+            source_epoch_id=world.epoch_id,
+            requested_at=ts(0),
+            **hashes,
+        )
+        return (
+            "  candidate: ontology_version=1.5.0 extraction_version=candidate-ev "
+            f"model_hash={composed('svc-model-2')} (service model_hash=svc-model-2)\n"
+        )
+
+    def test_an_open_candidates_stored_pack_hashes_are_printed_under_its_stamps(self, ts):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        candidate_line = self._open_candidate(
+            world, ts, pack_prompt_hash=PROMPT, pack_rails_hash=RAILS
+        )
+
+        code, text = _admin_status(world, _matching_config(world))
+
+        assert code == 0, text
+        assert (
+            candidate_line + f"  pack: pack_prompt_hash={PROMPT} pack_rails_hash={RAILS}\n"
+        ) in text
+        # The active epoch's own line still reports what the epoch stores.
+        assert "\npack: pack_prompt_hash=none pack_rails_hash=none\n" in text
+
+    def test_an_open_candidate_that_stores_no_pack_hash_prints_none(self, ts):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        candidate_line = self._open_candidate(world, ts)
+
+        _, text = _admin_status(world, _matching_config(world))
+
+        assert (candidate_line + "  pack: pack_prompt_hash=none pack_rails_hash=none\n") in text
+
+    @pytest.mark.parametrize(
+        ("hashes", "shown"),
+        [
+            (
+                {"pack_prompt_hash": PROMPT, "pack_rails_hash": RAILS},
+                f"  pack: pack_prompt_hash={PROMPT} pack_rails_hash={RAILS}\n",
+            ),
+            ({}, "  pack: pack_prompt_hash=none pack_rails_hash=none\n"),
+        ],
+        ids=["both-hashes", "no-hashes"],
+    )
+    def test_cutover_status_prints_the_candidates_stored_pack_hashes(self, ts, hashes, shown):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        candidate_line = self._open_candidate(world, ts, **hashes)
+        out = io.StringIO()
+
+        code = admin.main(["cutover", "status"], store=world.store, out=out)
+
+        assert code == 0, out.getvalue()
+        assert (candidate_line + shown) in out.getvalue()
 
     def test_an_empty_ledger_exits_1(self):
         from backend.event_store.store import EventStore

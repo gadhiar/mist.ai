@@ -184,13 +184,31 @@ class BacklogWorld:
         )
 
     def active_epoch_stamps(self) -> RebuildStamps:
-        """The active epoch's stamp triple, read now, as the writer's `RebuildStamps`."""
+        """The active epoch's five stamps, read now, as the writer's `RebuildStamps`.
+
+        The triple and the two pack hashes the row stores (None where it stores
+        none): a backend whose config and pack are the epoch's.
+        """
         epoch = self.event_store.get_current_epoch()
         return RebuildStamps(
             ontology_version=epoch["ontology_version"],
             extraction_version=epoch["extraction_version"],
             model_hash=epoch["model_hash"],
+            pack_prompt_hash=epoch["pack_prompt_hash"],
+            pack_rails_hash=epoch["pack_rails_hash"],
         )
+
+    def serve_candidate_pack(self) -> None:
+        """Point the fake service at the open candidate's stored pack hashes.
+
+        `cutover begin` through the CLI stores the candidate's pack hashes, and
+        the fill refuses a service that reports others, so a test that begins
+        that way calls this next: the operator pointing the service at the
+        candidate's pack. Nothing changes when no cutover is open.
+        """
+        cutover = self.store.open_cutover()
+        if cutover is not None:
+            self.service.serve_pack(cutover)
 
     def build_dispatcher(
         self, *, writer_stamps: RebuildStamps | None = None, **setting_overrides
@@ -223,21 +241,35 @@ class BacklogWorld:
         return self.event_store.list_extraction_attempts(limit=1000)
 
 
-def _build_world(*, with_deriver: bool, activated: bool = True) -> BacklogWorld:
+def _build_world(
+    *,
+    with_deriver: bool,
+    activated: bool = True,
+    db_path: str = ":memory:",
+    pack_prompt_hash: str | None = None,
+    pack_rails_hash: str | None = None,
+) -> BacklogWorld:
     """Build one hermetic backlog world.
 
     `activated` records the first-activation floor over the still-empty log,
     modelling a backlog that has been live since before any turn the test
     logs -- otherwise every pre-start turn would be legacy.
+
+    `db_path` puts the event store in a file (a test passes one under
+    `tmp_path`). The two pack hashes are stored on the first epoch and reported
+    by the fake service; None, the default, is an epoch from before the hashes
+    were stored and a service that reports none.
     """
-    event_store = EventStore(db_path=":memory:")
+    event_store = EventStore(db_path=db_path)
     event_store.initialize()
-    service = FakeServiceState()
+    service = FakeServiceState(pack_prompt_hash=pack_prompt_hash, pack_rails_hash=pack_rails_hash)
     epoch = event_store.ensure_initial_epoch(
         now_iso="2026-09-01T00:00:00+00:00",
         ontology_version=ONTOLOGY_VERSION,
         extraction_version=service.extraction_version,
         model_hash=composed(service.model_hash),
+        pack_prompt_hash=pack_prompt_hash,
+        pack_rails_hash=pack_rails_hash,
     )
     cache = ExtractionCache(":memory:")
     cache.initialize()
