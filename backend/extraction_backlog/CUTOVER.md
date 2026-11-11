@@ -134,7 +134,8 @@ epoch that stores neither, the writer stamps match on the triple alone. [UNIT-TE
 A MISMATCH names the fields of the triple that differ, then each pack hash the
 epoch stores that this backend's pack does not equal, by its field name
 (`pack_prompt_hash`, `pack_rails_hash`). When only a pack hash differs, the
-refusal text that follows gives that hash's two values in place of the triples.
+refusal text that follows gives the two values of each differing hash in place
+of the triples.
 [UNIT-TESTED: `test_a_differing_pack_hash_is_named_by_its_field`,
 `test_both_differing_pack_hashes_are_named` and
 `test_a_differing_pack_hash_is_named_after_the_differing_triple_fields` in
