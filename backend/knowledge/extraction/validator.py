@@ -13,11 +13,8 @@ from backend.knowledge.extraction.ontology_extractor import (
     ExtractionResult,
     OntologyConstrainedExtractor,
 )
-from backend.knowledge.ontologies import (
-    ALL_NODE_TYPE_NAMES,
-    EDGE_TYPES_BY_NAME,
-    EXTRACTABLE_RELATIONSHIP_TYPES,
-)
+from backend.knowledge.ontologies import registry
+from backend.knowledge.ontologies.pack import Pack
 
 logger = logging.getLogger(__name__)
 
@@ -37,31 +34,27 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _derive_relationship_constraints() -> dict[str, tuple[set[str] | None, set[str] | None]]:
-    """Derive source/target constraints from the ontology (Inv-A6).
+def _relationship_constraints(pack: Pack) -> dict[str, tuple[set[str] | None, set[str] | None]]:
+    """A pack's pair table as source/target constraints (Inv-A6).
 
-    One source of truth: `EdgeTypeDefinition.allowed_source_types/-target_types`.
-    A definition that permits every known node type maps to None ("any"),
-    preserving the validator's historical RELATED_TO escape-hatch shape.
+    One source of truth: the pack builds the table from each extractable edge's
+    `allowed_source_types`/`allowed_target_types` at load. An edge that permits every
+    node type maps to None ("any"), the shape of the pack's any-to-any escape edge.
     """
-    all_types = set(ALL_NODE_TYPE_NAMES)
-    constraints: dict[str, tuple[set[str] | None, set[str] | None]] = {}
-    for name in EXTRACTABLE_RELATIONSHIP_TYPES:
-        defn = EDGE_TYPES_BY_NAME[name]
-        src = set(defn.allowed_source_types)
-        tgt = set(defn.allowed_target_types)
-        constraints[name] = (
-            None if src >= all_types else src,
-            None if tgt >= all_types else tgt,
+    return {
+        name: (
+            None if sources is None else set(sources),
+            None if targets is None else set(targets),
         )
-    return constraints
+        for name, (sources, targets) in pack.pair_table.items()
+    }
 
 
-# Derived at import. The standing drift guard
-# (TestValidatorOntologyConsistency) keeps asserting the mirror property;
-# it is now true by construction.
+# The active pack's pair table, derived at import for the callers that read it as a
+# module constant (the eval scorers). The standing drift guard
+# (TestValidatorOntologyConsistency) keeps asserting that it mirrors the ontology.
 RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = (
-    _derive_relationship_constraints()
+    _relationship_constraints(registry.active_pack())
 )
 
 VALID_TEMPORAL_STATUSES: set[str] = {"current", "past", "future", "recurring"}
@@ -88,14 +81,21 @@ class ExtractionValidator:
     Invalid items are dropped and logged. The pipeline never halts.
     """
 
-    def __init__(self, min_confidence: float = 0.5) -> None:
+    def __init__(self, min_confidence: float = 0.5, pack: Pack | None = None) -> None:
         """Initialize the validator.
 
         Args:
             min_confidence: Minimum confidence threshold for relationships.
                 Relationships below this threshold are dropped.
+            pack: The ontology pack whose types, edges and pair table are enforced.
+                None takes the registry's active pack, and the allowed type sets are
+                then the extractor's, which that pack's extractable lists equal.
         """
         self.min_confidence = min_confidence
+        self._pack = pack if pack is not None else registry.active_pack()
+        self._constraints = _relationship_constraints(self._pack)
+        self._entity_types = None if pack is None else frozenset(pack.extractable_node_types)
+        self._relationship_types = None if pack is None else frozenset(pack.extractable_edge_types)
 
     def validate(self, extraction: ExtractionResult) -> ValidationResult:
         """Validate an extraction result.
@@ -111,6 +111,13 @@ class ExtractionValidator:
         """
         warnings: list[str] = []
         errors: list[str] = []
+        # Read at each call when no pack was injected, as before the pack existed.
+        entity_types = self._entity_types
+        if entity_types is None:
+            entity_types = OntologyConstrainedExtractor.ALLOWED_ENTITY_TYPES
+        relationship_types = self._relationship_types
+        if relationship_types is None:
+            relationship_types = OntologyConstrainedExtractor.ALLOWED_RELATIONSHIP_TYPES
 
         # --- Validate entities ---
         valid_entities: list[dict] = []
@@ -127,7 +134,7 @@ class ExtractionValidator:
                 continue
 
             # Check entity type is allowed
-            if entity_type not in OntologyConstrainedExtractor.ALLOWED_ENTITY_TYPES:
+            if entity_type not in entity_types:
                 errors.append(f"Entity '{entity_id}' has invalid type '{entity_type}', dropped")
                 continue
 
@@ -145,7 +152,7 @@ class ExtractionValidator:
             props = rel.get("properties", {}) or {}
 
             # Check relationship type is allowed
-            if rel_type not in OntologyConstrainedExtractor.ALLOWED_RELATIONSHIP_TYPES:
+            if rel_type not in relationship_types:
                 errors.append(
                     f"Relationship type '{rel_type}' not in ontology, dropped: "
                     f"{source} -[{rel_type}]-> {target}"
@@ -176,14 +183,14 @@ class ExtractionValidator:
                 continue
 
             # Check source/target type constraints
-            constraints = RELATIONSHIP_CONSTRAINTS.get(rel_type)
+            constraints = self._constraints.get(rel_type)
             if constraints is not None:
                 allowed_sources, allowed_targets = constraints
 
                 source_type = entity_type_map.get(source, "")
                 target_type = entity_type_map.get(target, "")
 
-                defn = EDGE_TYPES_BY_NAME.get(rel_type)
+                defn = self._pack.edges_by_name.get(rel_type)
                 if defn is not None and not defn.directional:
                     # Undirected predicates: the (source, target) sets describe
                     # an unordered pair, and the write path canonicalizes
