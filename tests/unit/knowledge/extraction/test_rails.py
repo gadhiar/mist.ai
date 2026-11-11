@@ -197,11 +197,11 @@ def test_a_reserved_id_slug_sets_the_id_and_the_type():
 
 def test_endpoints_follow_a_reserved_entity():
     _, relationships = _run(
-        [{"id": "hm", "name": "the harbourmaster", "type": "Deckhand"}, _hand("ada")],
-        [_edge("ada", "hm", "KNOWS_HAND")],
+        [{"id": "hm", "name": "the harbourmaster", "type": "Deckhand"}, _hand("nell")],
+        [_edge("nell", "hm", "KNOWS_HAND")],
     )
 
-    assert relationships == [_edge("ada", "harbourmaster", "KNOWS_HAND")]
+    assert relationships == [_edge("nell", "harbourmaster", "KNOWS_HAND")]
 
 
 # --- id_exempt, typed_id, alias_vocabulary ---------------------------------------------------
@@ -339,6 +339,39 @@ def test_an_edge_trigger_adds_nothing_from_an_edge_that_is_not_a_live_assertion(
     assert len(relationships) == 1
 
 
+def _crew_twice(first: dict, second: dict) -> list[dict]:
+    """The crew payload with the member's trigger edge written twice."""
+    _, relationships = _run(
+        [_hand("user"), _hand("oswin"), _hand("brannoch")],
+        [
+            _edge("oswin", "brannoch", "CREWS_WITH", **first),
+            _edge("oswin", "brannoch", "CREWS_WITH", **second),
+        ],
+        scope="user-scope",
+    )
+    return relationships
+
+
+def test_an_edge_trigger_adds_nothing_when_the_members_first_trigger_edge_is_past():
+    # The first copy of an edge is the one that is stored, so an edge built on the live
+    # second copy would stand on an edge the graph holds as past.
+    relationships = _crew_twice(
+        {"temporal_status": "past"}, {"temporal_status": "current", "confidence": 0.9}
+    )
+
+    assert relationships == [_edge("oswin", "brannoch", "CREWS_WITH", temporal_status="past")]
+
+
+def test_an_edge_trigger_adds_nothing_when_a_later_trigger_edge_of_the_member_is_past():
+    relationships = _crew_twice(
+        {"temporal_status": "current", "confidence": 0.9}, {"temporal_status": "past"}
+    )
+
+    assert relationships == [
+        _edge("oswin", "brannoch", "CREWS_WITH", temporal_status="current", confidence=0.9)
+    ]
+
+
 def test_a_gained_edge_with_a_scope_condition_needs_that_scope():
     for scope in ("third-party", None):
         _, relationships = _crew({}, scope=scope)
@@ -431,10 +464,12 @@ def test_a_fan_out_group_lists_only_the_members_whose_trigger_edge_is_live():
     _SEEN_GROUPS.clear()
 
     _run(
-        [_hand("oswin"), _hand("wend"), _hand("brannoch")],
+        [_hand("oswin"), _hand("wend"), _hand("tamsin"), _hand("brannoch")],
         [
             _edge("oswin", "brannoch", "CREWS_WITH"),
             _edge("wend", "brannoch", "CREWS_WITH", temporal_status="past"),
+            _edge("tamsin", "brannoch", "CREWS_WITH", temporal_status="past"),
+            _edge("tamsin", "brannoch", "CREWS_WITH"),
         ],
         pack=pack,
     )
@@ -582,15 +617,18 @@ def test_the_pet_convention_is_unknown_to_the_base_pack():
 
 
 def test_an_edge_outside_the_suppressed_pattern_is_kept():
-    _, relationships = _run([_hand("ada"), _hand("bo")], [_edge("ada", "bo", "OUTRANKS")])
+    _, relationships = _run([_hand("nell"), _hand("bo")], [_edge("nell", "bo", "OUTRANKS")])
 
-    assert relationships == [_edge("ada", "bo", "OUTRANKS")]
+    assert relationships == [_edge("nell", "bo", "OUTRANKS")]
 
 
 def test_an_edge_in_the_suppressed_pattern_is_dropped():
     _, relationships = _run(
-        [_hand("ada"), _hand("bo")],
-        [_edge("bo", "ada", "CREWS_WITH", temporal_status="past"), _edge("ada", "bo", "OUTRANKS")],
+        [_hand("nell"), _hand("bo")],
+        [
+            _edge("bo", "nell", "CREWS_WITH", temporal_status="past"),
+            _edge("nell", "bo", "OUTRANKS"),
+        ],
     )
 
     assert [r["type"] for r in relationships] == ["CREWS_WITH"]

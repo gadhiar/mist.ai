@@ -125,8 +125,8 @@ class FanOutGroup:
     Attributes:
         member: The member's id, as the model wrote it.
         members: The members of the group, in the order the row gives them. Under an
-            edge trigger these are the members whose own trigger edge is live; one whose
-            edge is not live is left out.
+            edge trigger these are the members whose every trigger edge to the anchor
+            is live; one with a trigger edge that is not live is left out.
         anchor: The endpoint the trigger edges share; None under a plan trigger.
         lead_in: The lead-in of the plan's template; None under an edge trigger.
         fixed_endpoint: The entity the template names as the other end, or None.
@@ -388,8 +388,12 @@ def _lead_in_key(text: object) -> str:
 
 def _edge_groups(
     trigger: EdgeTrigger, relationships: Sequence[Mapping], types: Mapping
-) -> list[tuple[object, list[tuple[object, Mapping]]]]:
-    """The trigger edges by the endpoint they share: (anchor, [(member, edge)])."""
+) -> list[tuple[object, list[tuple[object, list[Mapping]]]]]:
+    """The trigger edges by the endpoint they share: (anchor, [(member, its edges)]).
+
+    A member the payload joins to one anchor by several trigger edges is listed once,
+    with every one of those edges in the payload's order.
+    """
     groups: dict = {}
     for relationship in relationships:
         if relationship.get("type") != trigger.edge:
@@ -401,8 +405,12 @@ def _edge_groups(
             continue
         member, anchor = (source, target) if trigger.members == "source" else (target, source)
         members = groups.setdefault(anchor, [])
-        if all(member != seen for seen, _ in members):
-            members.append((member, relationship))
+        for seen, edges in members:
+            if seen == member:
+                edges.append(relationship)
+                break
+        else:
+            members.append((member, [relationship]))
     return list(groups.items())
 
 
@@ -488,20 +496,27 @@ def _gain(
 def _fan_out(state: _State, pack: Pack, params: FanOut) -> None:
     """Give each member of each group the rule's edges.
 
-    Under an edge trigger a member gains nothing unless its own trigger edge is live,
-    and each added edge copies that edge's `temporal_status` and confidence. Under a
-    plan trigger the added edges carry the values the rule states.
+    Under an edge trigger a member gains nothing unless every trigger edge that joins
+    it to the group's anchor is live, and each added edge copies the first such edge's
+    `temporal_status` and confidence. Under a plan trigger the added edges carry the
+    values the rule states.
     """
     at_start = tuple(state.relationships)
     live = tuple(rel for rel in at_start if edge_is_live(rel))
     entities = tuple(state.entities)
     if isinstance(params.trigger, EdgeTrigger):
         types = _types_by_id(entities)
-        # Groups are built from live trigger edges only: a member whose own edge is not
-        # live gains nothing and is not listed as a member of its group.
-        for anchor, members in _edge_groups(params.trigger, live, types):
-            names = tuple(member for member, _ in members)
-            for member, edge in members:
+        for anchor, members in _edge_groups(params.trigger, at_start, types):
+            # Every trigger edge of a member is an input, and a rail adds an edge only when
+            # every input it reads is live. The payload may state the edge twice, and the
+            # dedupe step stores the first copy: built on a live second copy, the added
+            # edges would stand on a stored edge that is not live. A member that fails is
+            # not listed in its group either.
+            passing = [
+                (member, edges[0]) for member, edges in members if all(map(edge_is_live, edges))
+            ]
+            names = tuple(member for member, _ in passing)
+            for member, edge in passing:
                 own = edge.get("properties")
                 own = own if isinstance(own, Mapping) else {}
                 copied = {name: own[name] for name in _COPIED_EDGE_PROPERTIES if name in own}
