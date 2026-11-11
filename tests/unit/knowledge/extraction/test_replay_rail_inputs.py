@@ -1,8 +1,8 @@
 """The two replay paths hand the cache row's rail inputs to the normalizer.
 
 `apply_cached_turn` and the log regenerator read a turn back from the extraction cache.
-The rails need more of that row than its payload: the batch record and the turn plan. A
-row that carries neither is normalized as before.
+The rails need more of that row than its payload: the scope, the batch record and the
+turn plan. A row that carries none of them is normalized as before.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ EPOCH = {
     "activated_at": "2026-08-18T00:00:00+00:00",
 }
 _STAMP = "2026-07-01T09:00:00+00:00"
+_SCOPE = "user-scope"
 _BATCH_RECORD = [{"units": [], "context": [], "payload": None}]
 _TURN_PLAN = {"entities": [], "templates": [], "back_references": []}
 
@@ -65,7 +66,7 @@ class _CacheWithRailColumns(ExtractionCache):
         return row
 
 
-def _world(cache: ExtractionCache) -> EventStore:
+def _world(cache: ExtractionCache, scope: str | None) -> EventStore:
     store = EventStore(db_path=":memory:")
     store.initialize()
     cache.initialize()
@@ -88,6 +89,7 @@ def _world(cache: ExtractionCache) -> EventStore:
         EPOCH["model_hash"],
         created_at=_STAMP,
         outcome=OUTCOME_EXTRACTED,
+        scope=scope,
         entities=[{"id": "user", "type": "User", "name": "User"}],
         relationships=[],
     )
@@ -113,8 +115,8 @@ class _NoProgress:
         pass
 
 
-async def _apply(cache: ExtractionCache) -> list[dict]:
-    store = _world(cache)
+async def _apply(cache: ExtractionCache, scope: str | None = None) -> list[dict]:
+    store = _world(cache, scope)
     normalizer = _RecordingNormalizer()
     embeddings = FakeEmbeddingGenerator()
     pipeline = ExtractionPipeline(
@@ -145,8 +147,8 @@ async def _apply(cache: ExtractionCache) -> list[dict]:
     return normalizer.calls
 
 
-async def _rebuild(cache: ExtractionCache) -> list[dict]:
-    store = _world(cache)
+async def _rebuild(cache: ExtractionCache, scope: str | None = None) -> list[dict]:
+    store = _world(cache, scope)
     normalizer = _RecordingNormalizer()
     regenerator = LogRegenerator(
         event_store=store,
@@ -171,6 +173,22 @@ async def test_a_replay_hands_the_rows_batch_record_and_plan_to_the_normalizer(r
     calls = await replay(_CacheWithRailColumns(":memory:"))
 
     assert calls == [{"batch_record": _BATCH_RECORD, "turn_plan": _TURN_PLAN}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", [_apply, _rebuild], ids=["apply_cached_turn", "rebuild"])
+async def test_a_replay_hands_the_rows_scope_to_the_normalizer(replay):
+    calls = await replay(ExtractionCache(":memory:"), scope=_SCOPE)
+
+    assert calls == [{"scope": _SCOPE}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", [_apply, _rebuild], ids=["apply_cached_turn", "rebuild"])
+async def test_a_replay_of_a_row_that_holds_all_three_hands_over_all_three(replay):
+    calls = await replay(_CacheWithRailColumns(":memory:"), scope=_SCOPE)
+
+    assert calls == [{"scope": _SCOPE, "batch_record": _BATCH_RECORD, "turn_plan": _TURN_PLAN}]
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,8 @@ from tests.unit.extraction_backlog.conftest import wait_until
 
 PROMPT = "a" * 64
 RAILS = "b" * 64
+# The label the fake service replies with (`fakes.py`), which the dispatcher stores.
+SCOPE = "user-scope"
 
 BATCH_RECORD = [
     BatchRecordEntry(
@@ -88,13 +90,17 @@ async def test_the_turn_plan_is_stored_as_the_contract_dumps_it(backlog_world, t
 
 @pytest.mark.asyncio
 async def test_both_reach_the_rails_on_replay_and_the_turn_is_applied(backlog_world, ts):
-    """The stored row hands both to `normalize`, and the apply that reads it completes."""
+    """The stored row hands both to `normalize`, and the apply that reads it completes.
+
+    The scope the service replied with is on the same row, so it is handed over too.
+    """
     backlog_world.service.batch_record = BATCH_RECORD
     backlog_world.service.turn_plan = TURN_PLAN
 
     row = await _extract_one(backlog_world, ts)
 
     assert rail_inputs(row) == {
+        "scope": SCOPE,
         "batch_record": [entry.model_dump(mode="json") for entry in BATCH_RECORD],
         "turn_plan": TURN_PLAN.model_dump(mode="json"),
     }
@@ -103,11 +109,14 @@ async def test_both_reach_the_rails_on_replay_and_the_turn_is_applied(backlog_wo
 
 @pytest.mark.asyncio
 async def test_a_reply_without_them_stores_null_in_both_columns(backlog_world, ts):
-    """A service that records neither: the row reads as one batch with no plan."""
+    """A service that records neither: the row reads as one batch with no plan.
+
+    The reply still carries a scope, which is all the rails are handed beside the payload.
+    """
     row = await _extract_one(backlog_world, ts)
 
     assert (row["batch_record"], row["turn_plan"]) == (None, None)
-    assert rail_inputs(row) == {}
+    assert rail_inputs(row) == {"scope": SCOPE}
     assert backlog_world.curation.event_ids, "the turn was not applied"
 
 
