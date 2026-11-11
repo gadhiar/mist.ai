@@ -4,8 +4,8 @@ Stage 2 extracts a structured turn a few units at a time, so each batch
 decides on its own what a lead-in means and which id an entity gets, and two
 batches of one list can disagree. The turn plan makes those decisions once,
 with the whole turn in view: the entities the turn names, one template per
-heading or lead-in that states a relationship, and the lines that refer back. Every batch of the turn
-then carries the plan in front of its own text.
+heading or lead-in that states a relationship, and the lines that refer
+back. Every batch of the turn then carries the plan in front of its own text.
 
 This module holds the plan's text and shape and nothing that calls a model:
 the request the plan call sends, the strict schema its reply is decoded
