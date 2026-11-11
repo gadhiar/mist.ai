@@ -252,3 +252,107 @@ def test_live_pipeline_degrades_gracefully_when_cache_initialization_fails(tmp_p
 
     assert pipeline._extraction_cache is None
     assert pipeline._rebuild_stamps is None
+
+
+# ---------------------------------------------------------------------------
+# One ontology pack, injected into every consumer the factory constructs
+# ---------------------------------------------------------------------------
+
+
+def _build_pipeline(tmp_path):
+    from backend.factories import build_extraction_pipeline
+    from tests.mocks.config import build_test_config
+
+    config = build_test_config(event_store_db_path=str(tmp_path / "event_store.db"))
+    return build_extraction_pipeline(
+        config,
+        graph_store=_FakeGraphStore(),
+        llm_provider=_FakeLLM(),
+        include_curation=False,
+        include_internal_derivation=False,
+    )
+
+
+class _MarkedPack:
+    """Stands in for a `Pack` no registry call returns, to show which pack was injected."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.pack_prompt_hash = "a" * 64
+        self.pack_rails_hash = "b" * 64
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_the_normalizer_and_the_validator_are_given_the_registrys_active_pack(
+    tmp_path, monkeypatch
+):
+    """Mutant this kills: dropping `pack=` from either constructor call.
+
+    Without the argument each consumer still resolves the active pack itself,
+    so identity with `registry.active_pack()` alone would not see the drop. The
+    registry call the factory makes is therefore replaced by one that returns a
+    marked object: a consumer that was not handed it holds the real pack.
+    """
+    from backend import factories
+    from backend.knowledge.ontologies import registry
+
+    marked = _MarkedPack(registry.active_pack())
+    monkeypatch.setattr(factories, "active_pack", lambda: marked)
+
+    pipeline = _build_pipeline(tmp_path)
+
+    assert pipeline._normalizer._pack is marked
+    assert pipeline._validator._pack is marked
+
+
+def test_the_writer_stamps_carry_the_same_packs_hashes(tmp_path, monkeypatch):
+    """The stamps a cache row and an edge are written with name the pack that was injected."""
+    from backend import factories
+    from backend.knowledge.ontologies import registry
+
+    marked = _MarkedPack(registry.active_pack())
+    monkeypatch.setattr(factories, "active_pack", lambda: marked)
+
+    pipeline = _build_pipeline(tmp_path)
+
+    stamps = pipeline._rebuild_stamps
+    assert (stamps.pack_prompt_hash, stamps.pack_rails_hash) == ("a" * 64, "b" * 64)
+
+
+def test_without_a_replacement_the_pack_is_the_registrys_and_its_hashes_are_stamped(tmp_path):
+    from backend.factories import writer_stamps_from_config
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    pack = registry.active_pack()
+    pipeline = _build_pipeline(tmp_path)
+
+    assert pipeline._normalizer._pack is pack
+    assert pipeline._validator._pack is pack
+    assert (
+        pipeline._rebuild_stamps.pack_prompt_hash,
+        pipeline._rebuild_stamps.pack_rails_hash,
+    ) == (
+        pack.pack_prompt_hash,
+        pack.pack_rails_hash,
+    )
+    writer = writer_stamps_from_config(build_test_config())
+    assert (writer.pack_prompt_hash, writer.pack_rails_hash) == (
+        pack.pack_prompt_hash,
+        pack.pack_rails_hash,
+    )
+
+
+def test_a_pack_passed_to_the_stamp_function_is_the_one_stamped():
+    """`build_curation_pipeline` hands its pack on, so one build stamps one pack."""
+    from backend.factories import writer_stamps_from_config
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    marked = _MarkedPack(registry.active_pack())
+
+    writer = writer_stamps_from_config(build_test_config(), marked)
+
+    assert (writer.pack_prompt_hash, writer.pack_rails_hash) == ("a" * 64, "b" * 64)

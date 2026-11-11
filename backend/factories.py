@@ -46,6 +46,7 @@ from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.scope_classifier import SubjectScopeClassifier
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator
+from backend.knowledge.ontologies.registry import active_pack
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
@@ -333,8 +334,11 @@ def resolve_context_budget_window(
     return fallback
 
 
-def writer_stamps_from_config(config: KnowledgeConfig) -> RebuildStamps:
-    """The curation stamp triple for `config`.
+def writer_stamps_from_config(
+    config: KnowledgeConfig,
+    pack: "Pack | None" = None,  # noqa: F821
+) -> RebuildStamps:
+    """The curation stamps for `config`: the triple, and the ontology pack's two hashes.
 
     `build_curation_pipeline` passes the result to its graph writer and
     reconciliation engine, and `build_extraction_dispatcher` passes it to the
@@ -346,9 +350,16 @@ def writer_stamps_from_config(config: KnowledgeConfig) -> RebuildStamps:
     `backend/voice_models/model_manager.py` for the curation pipeline), and
     the two agree because both read the same environment. The model hash is
     `compose_model_hash(config)`, never the bare `config.model_hash`.
+
+    The two pack hashes are `pack`'s, so a caller that injects a pack into a
+    normalizer or a validator passes the same one here and the stamps name
+    the pack that ran. None takes `active_pack()`, the pack a consumer built
+    without one resolves for itself.
     """
     from backend.knowledge.version_stamps import compose_model_hash
 
+    if pack is None:
+        pack = active_pack()
     # Assigned rather than returned inline so the construction-site grep cited
     # in `build_extraction_pipeline` and tests/unit/test_factories_rebuild_stamps.py
     # still counts this site.
@@ -356,6 +367,8 @@ def writer_stamps_from_config(config: KnowledgeConfig) -> RebuildStamps:
         ontology_version=config.ontology_version,
         extraction_version=config.extraction_version,
         model_hash=compose_model_hash(config),
+        pack_prompt_hash=pack.pack_prompt_hash,
+        pack_rails_hash=pack.pack_rails_hash,
     )
     return rebuild_stamps
 
@@ -365,6 +378,7 @@ def build_curation_pipeline(
     executor: GraphExecutor,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
     embedding_provider: "EmbeddingProvider | None" = None,  # noqa: F821
+    pack: "Pack | None" = None,  # noqa: F821
 ) -> CurationPipeline:
     """Create a fully wired CurationPipeline (bitemporal engine, C2).
 
@@ -372,6 +386,10 @@ def build_curation_pipeline(
     EmbeddingGenerator here is never warmed by ModelManager, so the first
     turn reaching tier-3 dedup or a new-entity write lazy-loads a
     SentenceTransformer ON the event loop UNDER the curation lock.
+
+    Pass `pack` when the caller also builds the normalizer and validator, so
+    the stamps the writer puts on its edges name the pack those ran
+    (`writer_stamps_from_config`). None takes the registry's active pack.
     """
     from backend.knowledge.embeddings import EmbeddingGenerator
 
@@ -391,7 +409,7 @@ def build_curation_pipeline(
     # backend). The extraction dispatcher's writer-stamp
     # guard compares a triple derived by the same function (from its own
     # config) with the active epoch, not the stored edges, when no cutover is open.
-    rebuild_stamps = writer_stamps_from_config(config)
+    rebuild_stamps = writer_stamps_from_config(config, pack)
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
         reconciliation_engine=ReconciliationEngine(
@@ -510,6 +528,12 @@ def build_extraction_pipeline(
     gs = graph_store or build_graph_store(config)
     executor = build_graph_executor(config, gs.connection)
 
+    # One ontology pack for this pipeline: the normalizer runs its rails, the
+    # validator checks against its types, and both stamps objects below carry
+    # its two hashes, so what an edge or a cache row is stamped with is the
+    # pack that ran.
+    pack = active_pack()
+
     curation = (
         build_curation_pipeline(
             config,
@@ -519,6 +543,7 @@ def build_extraction_pipeline(
             # exactly that instance at startup (off-loop), so curation never
             # cold-loads a second SentenceTransformer under the write lock.
             embedding_provider=gs.embedding_generator,
+            pack=pack,
         )
         if include_curation
         else None
@@ -617,6 +642,8 @@ def build_extraction_pipeline(
             ontology_version=config.ontology_version,
             extraction_version=config.extraction_version,
             model_hash=compose_model_hash(config),
+            pack_prompt_hash=pack.pack_prompt_hash,
+            pack_rails_hash=pack.pack_rails_hash,
         )
         if extraction_cache is not None
         else None
@@ -630,9 +657,11 @@ def build_extraction_pipeline(
         normalizer=EntityNormalizer(
             embedding_generator=gs.embedding_generator,
             executor=executor,
+            pack=pack,
         ),
         validator=ExtractionValidator(
             min_confidence=config.extraction.min_extraction_confidence,
+            pack=pack,
         ),
         graph_store=gs,
         curation_pipeline=curation,
