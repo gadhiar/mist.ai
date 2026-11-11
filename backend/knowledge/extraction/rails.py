@@ -124,7 +124,9 @@ class FanOutGroup:
 
     Attributes:
         member: The member's id, as the model wrote it.
-        members: Every member of the group, in the order the row gives them.
+        members: The members of the group, in the order the row gives them. Under an
+            edge trigger these are the members whose own trigger edge is live; one whose
+            edge is not live is left out.
         anchor: The endpoint the trigger edges share; None under a plan trigger.
         lead_in: The lead-in of the plan's template; None under an edge trigger.
         fixed_endpoint: The entity the template names as the other end, or None.
@@ -171,12 +173,18 @@ def edge_is_live(relationship: Mapping) -> bool:
 
 @dataclass(slots=True)
 class _State:
-    """One run's working lists. `settled` maps an entity dict, by identity, to its id."""
+    """One run's working lists.
+
+    `settled` maps an entity dict, by object identity, to its id, and `added_keys` maps
+    one to the keys the payload phase added before it had an `id` key. Both follow the
+    dict object, which is why a `plugin` rule must not return a copy of an entity.
+    """
 
     row: RailRow
     entities: list[dict]
     relationships: list[dict]
     settled: dict[int, str] = field(default_factory=dict)
+    added_keys: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,13 +275,22 @@ def reserved_identity(entity: Mapping, pack: Pack) -> tuple[str, str] | None:
     return hit
 
 
-def _settle_entity(entity: dict, pack: Pack) -> str | None:
+def _settle_entity(entity: dict, pack: Pack) -> tuple[str | None, tuple[str, ...]]:
     """Settle one entity, or replace its retired type.
 
     Returns:
         The id a settled entity is stored under (the user anchor's, or a reserved
-        identity's, whose type is set here); None for an entity the id phase builds.
+        identity's, whose type is set here), or None for an entity the id phase builds;
+        and the keys this step added to an entity that has no `id` key, which
+        `_set_stored_id` moves behind the `id` key it adds.
     """
+    before = None if "id" in entity else set(entity)
+    stored = _settled_id(entity, pack)
+    added = () if before is None else tuple(key for key in entity if key not in before)
+    return stored, added
+
+
+def _settled_id(entity: dict, pack: Pack) -> str | None:
     if _is_user(entity, pack):
         return pack.manifest.user_id
     reserved = reserved_identity(entity, pack)
@@ -293,11 +310,25 @@ def _settle_entity(entity: dict, pack: Pack) -> str | None:
     return None
 
 
+def _set_stored_id(entity: dict, stored: str, added: Sequence[str]) -> None:
+    """Write the stored id, keeping the key order the id rails always gave.
+
+    The id rails wrote an entity's `id` before any other key they added. The payload
+    phase runs before the id is built, so a key it added to an entity with no `id` key
+    (`added`) is moved behind the `id` key written here.
+    """
+    entity["id"] = stored
+    for key in added:
+        entity[key] = entity.pop(key)
+
+
 def _payload_phase(state: _State, pack: Pack) -> None:
     for entity in state.entities:
-        final_id = _settle_entity(entity, pack)
+        final_id, added = _settle_entity(entity, pack)
         if final_id is not None:
             state.settled[id(entity)] = final_id
+        if added:
+            state.added_keys[id(entity)] = added
     _run_plugin_rules(state, pack, PAYLOAD)
 
 
@@ -466,11 +497,11 @@ def _fan_out(state: _State, pack: Pack, params: FanOut) -> None:
     entities = tuple(state.entities)
     if isinstance(params.trigger, EdgeTrigger):
         types = _types_by_id(entities)
-        for anchor, members in _edge_groups(params.trigger, at_start, types):
+        # Groups are built from live trigger edges only: a member whose own edge is not
+        # live gains nothing and is not listed as a member of its group.
+        for anchor, members in _edge_groups(params.trigger, live, types):
             names = tuple(member for member, _ in members)
             for member, edge in members:
-                if not edge_is_live(edge):
-                    continue
                 own = edge.get("properties")
                 own = own if isinstance(own, Mapping) else {}
                 copied = {name: own[name] for name in _COPIED_EDGE_PROPERTIES if name in own}
@@ -568,7 +599,9 @@ def _build_entity_id(entity: dict, pack: Pack) -> tuple[str, bool]:
         if position == rules.registry_after:
             registered = id_rails.CANONICAL_REGISTRY.get(entity_id)
             if registered is not None:
-                entity["type"] = registered[1]
+                # The id is written first, so an entity with neither key gets `id`
+                # before `type`, as the id rails gave it.
+                entity["id"], entity["type"] = registered
                 return registered[0], True
         if position == len(rules.entity_id_rules):
             break
@@ -682,7 +715,7 @@ def _id_phase(state: _State, pack: Pack) -> None:
             stored, by_registry = _build_entity_id(entity, pack)
             if by_registry:
                 state.settled[id(entity)] = stored
-        entity["id"] = stored
+        _set_stored_id(entity, stored, state.added_keys.get(id(entity), ()))
         id_map[written] = stored
     _remap_endpoints(state.relationships, id_map)
     for rule in _rules(pack).derived_ids:
@@ -759,11 +792,11 @@ def normalize_entity(entity: dict, pack: Pack) -> None:
     The entity is settled or its retired type replaced, its id is built, and an unknown
     type takes the fallback. No relationship is read, so no `derived_edge` applies.
     """
-    stored = _settle_entity(entity, pack)
+    stored, added = _settle_entity(entity, pack)
     settled = stored is not None
     if stored is None:
         stored, settled = _build_entity_id(entity, pack)
-    entity["id"] = stored
+    _set_stored_id(entity, stored, added)
     if not settled and entity.get("type", "") not in pack.type_names:
         entity["type"] = pack.manifest.fallback_type
 

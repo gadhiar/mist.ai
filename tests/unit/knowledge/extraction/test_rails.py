@@ -20,7 +20,22 @@ from backend.knowledge.extraction.rails import (
     rail_row,
     run_rails,
 )
-from backend.knowledge.ontologies.pack import Pack, load_pack
+from backend.knowledge.ontologies.pack import (
+    ENDPOINT_FIXED,
+    ENDPOINT_MEMBER,
+    ENDPOINT_PLUGIN_PREFIX,
+    RELATION,
+    ConventionRule,
+    EdgeTrigger,
+    FanOut,
+    GainedEdge,
+    Pack,
+    PinnedCase,
+    PlanTrigger,
+    Plugin,
+    build_pack,
+    load_pack,
+)
 from tests.unit.knowledge.ontologies.fixtures.pet_pack.conventions import PET_ROSTER_CASE
 
 BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
@@ -386,6 +401,47 @@ def test_a_fan_out_endpoint_plugin_is_shown_live_edges_only(properties):
     assert [r for r in relationships if r["source"] == "oswin" and r["type"] == "LODGES_AT"] == []
 
 
+_SEEN_GROUPS: list = []
+
+
+def _record_group(group, row):
+    """A fan_out endpoint plug-in that keeps the group it is shown and names no endpoint."""
+    _SEEN_GROUPS.append(group)
+
+
+def test_a_fan_out_group_lists_only_the_members_whose_trigger_edge_is_live():
+    watch = ConventionRule(
+        id="crew-watch",
+        kind="fan_out",
+        phase=RELATION,
+        params=FanOut(
+            trigger=EdgeTrigger(edge="CREWS_WITH"),
+            gains=(
+                GainedEdge(
+                    edge="KNOWS_HAND",
+                    source=ENDPOINT_MEMBER,
+                    target=ENDPOINT_PLUGIN_PREFIX + "record-group",
+                ),
+            ),
+        ),
+        prompt_rule="Rule F5",
+        pinned_case=PinnedCase((), (), (), ()),
+    )
+    pack = _with_rule(BASE, watch, Plugin("record-group", RELATION, _record_group))
+    _SEEN_GROUPS.clear()
+
+    _run(
+        [_hand("oswin"), _hand("wend"), _hand("brannoch")],
+        [
+            _edge("oswin", "brannoch", "CREWS_WITH"),
+            _edge("wend", "brannoch", "CREWS_WITH", temporal_status="past"),
+        ],
+        pack=pack,
+    )
+
+    assert [(group.member, group.members) for group in _SEEN_GROUPS] == [("oswin", ("oswin",))]
+
+
 def test_the_fixture_crew_case_fires_the_fan_out_the_plugin_and_the_suppression():
     case = next(rule for rule in BASE.rules if rule.id == "crew-fan-out").pinned_case
 
@@ -467,6 +523,53 @@ def test_a_plan_trigger_adds_the_user_anchor_when_the_payload_lacks_it():
         ("user", "biscuit"),
         ("user", "mango"),
     }
+
+
+def _with_rule(pack: Pack, rule: ConventionRule, *plugins: Plugin) -> Pack:
+    """`pack` again with one more rule, and the plug-ins that rule names."""
+    return build_pack(
+        manifest=pack.manifest,
+        node_types=pack.node_types,
+        edge_types=pack.edge_types,
+        extractable_node_types=pack.extractable_node_types,
+        extractable_edge_types=pack.extractable_edge_types,
+        rules=(*pack.rules, rule),
+        plugins=(*pack.plugins, *plugins),
+    )
+
+
+# The pet pack, plus a rule that gives each pet of a lead-in to the entity the plan's
+# template names as its fixed endpoint.
+KENNEL = _with_rule(
+    PET,
+    ConventionRule(
+        id="kennel-roster",
+        kind="fan_out",
+        phase=RELATION,
+        params=FanOut(
+            trigger=PlanTrigger(predicate="HAS_PET", member_type="Pet"),
+            gains=(GainedEdge(edge="HAS_PET", source=ENDPOINT_FIXED, target=ENDPOINT_MEMBER),),
+        ),
+        prompt_rule="N19",
+    ),
+)
+
+
+def _kennel_owners(fixed_endpoint: str) -> set[str]:
+    plan = copy.deepcopy(PET_ROSTER_CASE.turn_plan)
+    plan["templates"][0]["fixed_endpoint"] = fixed_endpoint
+    _, relationships = run_rails(_pet_row(turn_plan=plan), KENNEL)
+    return {r["target"] for r in relationships if r["source"] == "corwen"}
+
+
+@pytest.mark.parametrize("written", ["corwen", "Corwen"], ids=["as-the-id", "as-the-name"])
+def test_a_plan_trigger_gives_each_member_an_edge_from_the_templates_fixed_endpoint(written):
+    assert _kennel_owners(written) == {"sable", "biscuit", "mango"}
+
+
+@pytest.mark.parametrize("written", ["", "nobody-in-the-payload"], ids=["none", "unknown"])
+def test_a_fixed_endpoint_that_names_no_payload_entity_adds_no_edge(written):
+    assert _kennel_owners(written) == {"sable"}
 
 
 def test_the_pet_convention_is_unknown_to_the_base_pack():

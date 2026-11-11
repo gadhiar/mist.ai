@@ -43,6 +43,34 @@ def test_normalize_payload_is_run_rails_through_the_active_pack():
     )
 
 
+def _without_an_id_key() -> tuple[dict, dict]:
+    """A reserved name with no type and a retired type with a default, neither with an id."""
+    reserved_name = next(iter(id_rails.RESERVED_NAMES))
+    retired = next(name for name, added in id_rails.RETIRED_PROPERTY_DEFAULTS.items() if added)
+    return {"name": reserved_name}, {"name": "Harbour Opening", "type": retired}
+
+
+def test_an_entity_with_no_id_key_gets_its_keys_in_the_order_the_id_rails_gave():
+    reserved, retired = _without_an_id_key()
+
+    entities, _ = id_rails.normalize_payload([reserved, retired], [])
+
+    assert [list(entity) for entity in entities] == [
+        ["name", "id", "type"],
+        ["name", "type", "id", "properties"],
+    ]
+
+
+def test_normalize_entity_gives_the_same_key_order_as_the_payload_path():
+    reserved, retired = _without_an_id_key()
+
+    id_rails.normalize_entity(reserved)
+    id_rails.normalize_entity(retired)
+
+    assert list(reserved) == ["name", "id", "type"]
+    assert list(retired) == ["name", "type", "id", "properties"]
+
+
 def test_the_adapter_packs_own_pinned_cases_hold():
     assert check_pinned_cases(registry.active_pack()) == []
 
