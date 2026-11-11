@@ -264,15 +264,10 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
         "the serving identity's types and hash: request_profile reads the requests the "
         "stages build and changes none of them",
     ),
-    (
-        "backend.knowledge.ontologies",
-        "the turn plan reads its two derived extractable lists and nothing else, as the "
-        "plan schema's enums, and that schema is hashed into prompt_sha256 when the plan "
-        "is on; the ontology's version is a component already. A pack's own types and "
-        "rules live under this package and no service module imports them: the covered "
-        "registry reaches them, and pack_prompt_hash and pack_rails_hash, stamped on "
-        "every result, cover their content",
-    ),
+    # No entry for `backend.knowledge.ontologies`: no service module imports an
+    # ontology's own modules. The covered registry reaches a pack's types and rules,
+    # the turn plan's vocabulary among them, and pack_prompt_hash and
+    # pack_rails_hash, stamped on every result, cover their content.
 )
 
 

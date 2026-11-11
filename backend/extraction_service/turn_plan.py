@@ -14,9 +14,9 @@ under, the strict parser, and the block a batch carries. The engine
 `ServiceSettings.turn_plan`, and hashes every string here and the schema
 into `prompt_sha256` when the plan is on.
 
-The entity types and relationship types the plan may name are read from the
-ontology's derived extractable lists. No type or relationship name is
-written in this module, so an ontology change reaches the plan without an
+The entity types and relationship types the plan may name are the active
+pack's plan vocabulary, a rule the pack states. No type or relationship name
+is written in this module, so an ontology change reaches the plan without an
 edit here.
 
 The schema stays inside the subset of JSON Schema that llama.cpp's
@@ -34,7 +34,8 @@ from typing import Any
 
 from backend.errors import ExtractionValidationError
 from backend.knowledge.extraction.structure_splitter import InputUnit, render_batch
-from backend.knowledge.ontologies import EXTRACTABLE_NODE_TYPES, EXTRACTABLE_RELATIONSHIP_TYPES
+from backend.knowledge.ontologies.pack import PlanVocabulary
+from backend.knowledge.ontologies.registry import active_pack
 
 # The plan call's user message. It opens like a batch's user message (context,
 # then subject scope) and then carries every unit of the turn, one per line,
@@ -120,49 +121,67 @@ def _strict_object(properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# The plan call's output schema. The property order is the order the model
-# writes them in under the grammar: the roster first, so the templates and the
-# back references can name its ids.
-PLAN_OUTPUT_SCHEMA: dict[str, Any] = _strict_object(
-    {
-        "entities": _array_of(
-            _strict_object(
-                {
-                    "id": _string(),
-                    "name": _string(),
-                    "type": _one_of(EXTRACTABLE_NODE_TYPES),
-                }
-            )
-        ),
-        "templates": _array_of(
-            _strict_object(
-                {
-                    "lead_in": _string(),
-                    "subject": _string(),
-                    "predicate": _one_of(EXTRACTABLE_RELATIONSHIP_TYPES),
-                    "fixed_endpoint": _string(),
-                    "fan_out": _array_of(
-                        _strict_object(
-                            {
-                                "source": _string(),
-                                "predicate": _one_of(EXTRACTABLE_RELATIONSHIP_TYPES),
-                                "target": _string(),
-                            }
-                        )
-                    ),
-                }
-            )
-        ),
-        "back_references": _array_of(
-            _strict_object(
-                {
-                    "item": _string(),
-                    "refers_to": _string(),
-                }
-            )
-        ),
-    }
-)
+def plan_output_schema(vocabulary: PlanVocabulary) -> dict[str, Any]:
+    """The plan call's output schema, naming what `vocabulary` lets the plan name.
+
+    The property order is the order the model writes them in under the grammar:
+    the roster first, so the templates and the back references can name its ids.
+
+    Args:
+        vocabulary: A pack's plan vocabulary: the entity types, the template
+            predicates and the fan-out predicates the plan may name.
+    """
+    return _strict_object(
+        {
+            "entities": _array_of(
+                _strict_object(
+                    {
+                        "id": _string(),
+                        "name": _string(),
+                        "type": _one_of(vocabulary.entity_types),
+                    }
+                )
+            ),
+            "templates": _array_of(
+                _strict_object(
+                    {
+                        "lead_in": _string(),
+                        "subject": _string(),
+                        "predicate": _one_of(vocabulary.predicates),
+                        "fixed_endpoint": _string(),
+                        "fan_out": _array_of(
+                            _strict_object(
+                                {
+                                    "source": _string(),
+                                    "predicate": _one_of(vocabulary.fan_out_predicates),
+                                    "target": _string(),
+                                }
+                            )
+                        ),
+                    }
+                )
+            ),
+            "back_references": _array_of(
+                _strict_object(
+                    {
+                        "item": _string(),
+                        "refers_to": _string(),
+                    }
+                )
+            ),
+        }
+    )
+
+
+def _active_vocabulary() -> PlanVocabulary:
+    """The active pack's plan vocabulary: the one rule of that kind the pack states."""
+    (rule,) = active_pack().rules_of("plan_vocabulary")
+    return rule.params
+
+
+# The schema for the pack the service runs by default, built once at import. The
+# engine sends it with the plan call and hashes it into `prompt_sha256`.
+PLAN_OUTPUT_SCHEMA: dict[str, Any] = plan_output_schema(_active_vocabulary())
 
 
 def is_structured_turn(units: Sequence[InputUnit]) -> bool:

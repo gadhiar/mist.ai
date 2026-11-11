@@ -242,7 +242,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-e692b80d908bf941110a3534ddf0f50d43da15aeba692e722d5054bdb5a13ec6",
+        code_identity="ci1-a06741b8e2eb51bf981db1a212df413a0010420928a5c8a5e58c32f99535e5f0",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -290,7 +290,8 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "prompt and schema, and no module keeps the assembled prompt as a constant: the "
             "service, the in-process extractor and the eval harness send the active pack's, "
             "which the engine core and the pack's prompt fragments assemble to the same "
-            "bytes. "
+            "bytes; the turn plan's schema is built from the pack's plan vocabulary, "
+            "which holds the lists it read before. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),
