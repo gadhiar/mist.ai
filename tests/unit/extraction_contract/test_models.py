@@ -36,7 +36,7 @@ from backend.extraction_contract import (
     error_envelope,
     is_compatible,
 )
-from backend.extraction_contract.models import TurnPlanOut
+from backend.extraction_contract.models import BatchRecordEntry, TurnPlanOut
 
 # ---------------------------------------------------------------------------
 # Round-trip fixtures -- one minimal-but-valid instance per model
@@ -502,6 +502,8 @@ class TestServingIdentityFields:
             "ctx_size",
             "run_identity",
             "run_identity_components",
+            "pack_prompt_hash",
+            "pack_rails_hash",
         }
 
         assert set(InfoResponse.model_fields) - fields_1_2_0 == {
@@ -703,6 +705,153 @@ class TestTurnPlan:
 
     def test_the_contract_version_did_not_move_for_it(self):
         assert CONTRACT_VERSION == "1.3.0"
+
+
+_PROMPT_HASH = "a" * 64
+_RAILS_HASH = "b" * 64
+
+
+def _batch_record_entry() -> BatchRecordEntry:
+    return BatchRecordEntry(
+        units=[{"text": "Biscuit, a terrier", "context": ["Our pets"], "kind": "list_item"}],
+        context=["Mango, a parrot"],
+        payload=ExtractionPayload(entities=[{"id": "biscuit", "type": "Pet"}], relationships=[]),
+        prompt_tokens=640,
+        completion_tokens=52,
+        finish="stop",
+    )
+
+
+class TestPackHashes:
+    """Both pack hashes ride on the stamps and on the info response once a service reports them.
+
+    Until then each is None and left out of the serialized model, so a result's stored
+    stamps and a `/v1/info` body are byte for byte what they were before the fields.
+    """
+
+    @pytest.mark.parametrize("build", [_result_stamps, _info_response])
+    def test_the_hashes_default_to_none_and_are_left_out_of_every_serialization(self, build):
+        instance = build()
+
+        assert (instance.pack_prompt_hash, instance.pack_rails_hash) == (None, None)
+        for dumped in (instance.model_dump(), instance.model_dump(mode="json")):
+            assert "pack_prompt_hash" not in dumped
+            assert "pack_rails_hash" not in dumped
+        assert "pack_" not in instance.model_dump_json()
+
+    def test_stamps_without_the_hashes_serialize_to_the_fields_they_had_before(self):
+        assert list(_result_stamps().model_dump(mode="json")) == [
+            "extraction_version",
+            "model_hash",
+            "prompt_sha256",
+            "llama_cpp_build",
+            "adapter",
+            "run_identity",
+            "serving_identity",
+        ]
+        assert "pack_" not in _extract_response().model_dump_json()
+
+    def test_an_info_response_without_the_hashes_serializes_as_before(self):
+        dumped = _info_response_1_3_0().model_dump(mode="json")
+
+        assert list(dumped)[-1] == "serving_identity_error"
+        assert len(dumped) == len(InfoResponse.model_fields) - 2
+
+    @pytest.mark.parametrize("build", [_result_stamps, _info_response])
+    def test_reported_hashes_are_serialized_last_and_round_trip(self, build):
+        reported = build().model_copy(
+            update={"pack_prompt_hash": _PROMPT_HASH, "pack_rails_hash": _RAILS_HASH}
+        )
+
+        dumped = reported.model_dump(mode="json")
+        restored = type(reported).model_validate(dumped)
+
+        assert list(dumped)[-2:] == ["pack_prompt_hash", "pack_rails_hash"]
+        assert (restored.pack_prompt_hash, restored.pack_rails_hash) == (_PROMPT_HASH, _RAILS_HASH)
+
+    def test_one_reported_hash_is_serialized_without_the_other(self):
+        dumped = _result_stamps().model_copy(update={"pack_rails_hash": _RAILS_HASH}).model_dump()
+
+        assert dumped["pack_rails_hash"] == _RAILS_HASH
+        assert "pack_prompt_hash" not in dumped
+
+    def test_a_response_carries_the_hashes_inside_its_stamps(self):
+        stamps = _result_stamps().model_copy(
+            update={"pack_prompt_hash": _PROMPT_HASH, "pack_rails_hash": _RAILS_HASH}
+        )
+        response = _extract_response().model_copy(update={"stamps": stamps})
+
+        restored = ExtractResponse.model_validate(response.model_dump(mode="json"))
+
+        assert restored.stamps.pack_rails_hash == _RAILS_HASH
+
+    def test_the_contract_version_did_not_move_for_them(self):
+        assert CONTRACT_VERSION == "1.3.0"
+
+
+class TestBatchRecord:
+    """The batch record rides on the response only when the service records its calls."""
+
+    def test_a_response_has_no_batch_record_by_default_and_serializes_without_the_key(self):
+        response = _extract_response()
+
+        assert response.batch_record is None
+        assert "batch_record" not in response.model_dump()
+        assert "batch_record" not in response.model_dump(mode="json")
+        assert "batch_record" not in response.model_dump_json()
+
+    def test_an_entry_is_serialized_with_its_six_fields(self):
+        response = _extract_response().model_copy(update={"batch_record": [_batch_record_entry()]})
+
+        dumped = response.model_dump(mode="json")
+
+        assert list(dumped)[-1] == "batch_record"
+        assert dumped["batch_record"] == [
+            {
+                "units": [
+                    {"text": "Biscuit, a terrier", "context": ["Our pets"], "kind": "list_item"}
+                ],
+                "context": ["Mango, a parrot"],
+                "payload": {"entities": [{"id": "biscuit", "type": "Pet"}], "relationships": []},
+                "prompt_tokens": 640,
+                "completion_tokens": 52,
+                "finish": "stop",
+            }
+        ]
+        assert ExtractResponse.model_validate(dumped).batch_record == [_batch_record_entry()]
+
+    def test_the_record_follows_the_turn_plan_when_a_response_has_both(self):
+        response = _extract_response_with_a_turn_plan().model_copy(
+            update={"batch_record": [_batch_record_entry()]}
+        )
+
+        assert list(response.model_dump(mode="json"))[-2:] == ["turn_plan", "batch_record"]
+
+    def test_a_call_that_gave_no_payload_is_recorded_with_a_null_payload(self):
+        entry = BatchRecordEntry(units=[], context=[], payload=None)
+
+        assert entry.model_dump(mode="json") == {
+            "units": [],
+            "context": [],
+            "payload": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "finish": None,
+        }
+
+    def test_an_entry_needs_its_payload_field(self):
+        with pytest.raises(ValidationError):
+            BatchRecordEntry.model_validate({"units": [], "context": []})
+
+    def test_the_call_count_stays_a_number_beside_the_record(self):
+        response = _extract_response().model_copy(
+            update={"stage2_calls": 2, "batch_record": [_batch_record_entry()] * 2}
+        )
+
+        dumped = response.model_dump(mode="json")
+
+        assert dumped["stage2_calls"] == 2
+        assert len(dumped["batch_record"]) == 2
 
 
 class TestCutoverStatusChecked:
