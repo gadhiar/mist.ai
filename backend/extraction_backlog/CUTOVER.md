@@ -100,7 +100,8 @@ not run from this branch]
     writer stamps: match
 
 or `writer stamps: MISMATCH (<field>, ...)` followed by the dispatcher's own
-refusal text with both stamp triples. The writer stamps are what a backend
+refusal text (both stamp triples, or, when only a pack hash differs, the two
+values of each differing hash). The writer stamps are what a backend
 started from this environment writes (`writer_stamps_from_config(
 KnowledgeConfig.from_env())`); the verdict is the dispatcher's guard
 (`ExtractionDispatcher._writer_stamp_mismatch`), compared with the ACTIVE epoch
