@@ -10,8 +10,11 @@ ontology read from where it lives (`v1_0_0.py`, `hierarchy.py` and the ontology 
 gives the outputs the id rails gave before it. Its version is the ontology's own. A
 later version adds a pack package and a line in `_BUILDERS`, and no engine edit.
 
-A pack is built once and refused, with `PackLoadError`, when the loader refuses it or
-when one of its pinned cases does not hold.
+The registry is a directory of packs and nothing more. A pack is built once, and what
+the loader refuses (`PackLoadError`) is refused here. A pack's pinned cases are not run
+here: the rail runner runs them the first time it is handed the pack, and the normalizer
+when it is built. So this module imports nothing from the runner, and reading a pack
+here does not load it: the extraction service must never import the runner.
 """
 
 from __future__ import annotations
@@ -21,7 +24,6 @@ from collections.abc import Callable, Mapping
 from functools import cache
 
 from backend.knowledge.extraction import id_rails
-from backend.knowledge.extraction.rails import check_pinned_cases
 from backend.knowledge.ontologies.hierarchy import ANCHOR_CHILD, RETIRED_TYPE_MAP
 from backend.knowledge.ontologies.pack import (
     ID,
@@ -217,24 +219,22 @@ def available_versions() -> tuple[str, ...]:
 
 @cache
 def get_pack(version: str) -> Pack:
-    """The pack of one ontology version, built and checked once.
+    """The pack of one ontology version, built once.
+
+    The pack's pinned cases are not run here; the rail runner and the normalizer run
+    them.
 
     Args:
         version: A version `available_versions` lists.
 
     Raises:
-        PackLoadError: The version is unknown, the loader refuses the pack, or one of
-            the pack's pinned cases does not hold.
+        PackLoadError: The version is unknown, or the loader refuses the pack.
     """
     builder = _BUILDERS.get(version)
     if builder is None:
         known = ", ".join(available_versions())
         raise PackLoadError(f"no ontology pack for version {version} (known: {known})")
-    pack = builder()
-    failed = check_pinned_cases(pack)
-    if failed:
-        raise PackLoadError(f"pack {pack.version}: pinned case(s) do not hold: {', '.join(failed)}")
-    return pack
+    return builder()
 
 
 def active_pack() -> Pack:

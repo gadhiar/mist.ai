@@ -24,12 +24,19 @@ the pack's `plugin` rules of that phase run after them, in the pack's order.
 The row is the only input besides the pack: the payload, the scope, the batch record
 and the turn plan. Nothing here reads a clock, a file or the graph, so the same row and
 pack always give the same bytes.
+
+The runner checks a pack itself. The first time it is handed a pack it runs the pack's
+pinned cases (`require_pinned_cases`), and it refuses, with `PackLoadError`, a pack
+whose case does not hold. The pack registry does not run the cases, so reading a pack
+from the registry does not load this module: the extraction service must never import
+it.
 """
 
 from __future__ import annotations
 
 import copy
 import re
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -52,6 +59,7 @@ from backend.knowledge.ontologies.pack import (
     FanOut,
     GainedEdge,
     Pack,
+    PackLoadError,
     Phase,
 )
 
@@ -704,7 +712,11 @@ def derived_ids(entities: list[dict], relationships: list[dict], pack: Pack) -> 
 
     Returns:
         Old id to new id, for every entity a rule renamed. Edges are not touched.
+
+    Raises:
+        PackLoadError: One of the pack's pinned cases does not hold.
     """
+    require_pinned_cases(pack)
     renames: dict[str, str] = {}
     for rule in _rules(pack).derived_ids:
         renames.update(_derive_ids(entities, relationships, pack, rule))
@@ -778,6 +790,46 @@ PHASES: tuple[tuple[str, Callable[[_State, Pack], None]], ...] = (
 )
 
 
+def _run_phases(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
+    """The phases and the dedupe over one row, with no check of the pack."""
+    state = _State(
+        row=cache_row,
+        entities=list(cache_row.entities),
+        relationships=list(cache_row.relationships),
+    )
+    for _, phase in PHASES:
+        phase(state, pack)
+    return _dedupe(state.entities, state.relationships)
+
+
+# What `check_pinned_cases` gave for each pack the runner has checked: the ids of the
+# rules whose case does not hold. A pack is keyed by the object and held weakly, so one
+# that is dropped is forgotten. Besides the `_rules` cache this is the module's only
+# state, and it never changes what a row gives: it decides only whether a pack runs.
+_CASE_RESULTS: weakref.WeakKeyDictionary[Pack, tuple[str, ...]] = weakref.WeakKeyDictionary()
+
+
+def require_pinned_cases(pack: Pack) -> None:
+    """Refuse a pack whose pinned cases do not hold.
+
+    The cases run the first time the runner is handed the pack. What they gave is kept,
+    so each later call is a lookup, and a refused pack is refused again without running
+    its cases again.
+
+    Args:
+        pack: The pack about to run.
+
+    Raises:
+        PackLoadError: Naming each rule whose pinned case does not hold.
+    """
+    failed = _CASE_RESULTS.get(pack)
+    if failed is None:
+        failed = tuple(check_pinned_cases(pack))
+        _CASE_RESULTS[pack] = failed
+    if failed:
+        raise PackLoadError(f"pack {pack.version}: pinned case(s) do not hold: {', '.join(failed)}")
+
+
 def run_rails(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
     """Run a pack's post-LLM rules over one cache row.
 
@@ -790,15 +842,13 @@ def run_rails(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
 
     Returns:
         The entities and relationships the graph stores.
+
+    Raises:
+        PackLoadError: One of the pack's pinned cases does not hold. The row is not
+            touched.
     """
-    state = _State(
-        row=cache_row,
-        entities=list(cache_row.entities),
-        relationships=list(cache_row.relationships),
-    )
-    for _, phase in PHASES:
-        phase(state, pack)
-    return _dedupe(state.entities, state.relationships)
+    require_pinned_cases(pack)
+    return _run_phases(cache_row, pack)
 
 
 def normalize_entity(entity: dict, pack: Pack) -> None:
@@ -806,7 +856,11 @@ def normalize_entity(entity: dict, pack: Pack) -> None:
 
     The entity is settled or its retired type replaced, its id is built, and an unknown
     type takes the fallback. No relationship is read, so no `derived_edge` applies.
+
+    Raises:
+        PackLoadError: One of the pack's pinned cases does not hold.
     """
+    require_pinned_cases(pack)
     stored, added = _settle_entity(entity, pack)
     settled = stored is not None
     if stored is None:
@@ -818,6 +872,9 @@ def normalize_entity(entity: dict, pack: Pack) -> None:
 
 def check_pinned_cases(pack: Pack) -> list[str]:
     """Run every rule's pinned case through the pack.
+
+    The cases go through the phases directly and not through `run_rails`, which calls
+    this function for a pack it has not checked yet.
 
     Returns:
         The ids of the rules whose case does not give its expected payload; empty when
@@ -835,7 +892,7 @@ def check_pinned_cases(pack: Pack) -> list[str]:
             batch_record=copy.deepcopy(case.batch_record),
             turn_plan=copy.deepcopy(case.turn_plan),
         )
-        entities, relationships = run_rails(row, pack)
+        entities, relationships = _run_phases(row, pack)
         if entities != list(case.expected_entities) or relationships != list(
             case.expected_relationships
         ):

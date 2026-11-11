@@ -7,6 +7,7 @@ so a case that passes here shows the runner reading a rule, not knowing an ontol
 from __future__ import annotations
 
 import copy
+import dataclasses
 import inspect
 import json
 
@@ -30,6 +31,7 @@ from backend.knowledge.ontologies.pack import (
     FanOut,
     GainedEdge,
     Pack,
+    PackLoadError,
     PinnedCase,
     PlanTrigger,
     Plugin,
@@ -116,18 +118,73 @@ def test_every_pinned_case_of_the_fixture_packs_holds(pack):
     assert check_pinned_cases(pack) == []
 
 
-def test_a_pinned_case_that_does_not_hold_is_named():
-    import dataclasses
-
+def _unheld_pet() -> Pack:
+    """The pet pack again, with a `pet-roster` case that expects no relationship."""
     roster = next(rule for rule in PET.rules if rule.id == "pet-roster")
     wrong = dataclasses.replace(roster.pinned_case, expected_relationships=())
     rules = tuple(
         dataclasses.replace(rule, pinned_case=wrong) if rule.id == "pet-roster" else rule
         for rule in PET.rules
     )
-    broken = dataclasses.replace(PET, rules=rules)
+    return dataclasses.replace(PET, rules=rules)
 
-    assert check_pinned_cases(broken) == ["pet-roster"]
+
+@pytest.fixture
+def case_checks(monkeypatch) -> list[Pack]:
+    """The packs whose pinned cases the runner runs during the test, one entry per run."""
+    checked: list[Pack] = []
+    real = rails.check_pinned_cases
+
+    def counted(pack: Pack) -> list[str]:
+        checked.append(pack)
+        return real(pack)
+
+    monkeypatch.setattr(rails, "check_pinned_cases", counted)
+    return checked
+
+
+def test_a_pinned_case_that_does_not_hold_is_named():
+    assert check_pinned_cases(_unheld_pet()) == ["pet-roster"]
+
+
+def test_run_rails_refuses_a_pack_whose_pinned_case_does_not_hold_at_every_call(case_checks):
+    unheld = _unheld_pet()
+
+    for _ in range(2):
+        with pytest.raises(PackLoadError, match="pinned case.*do not hold: pet-roster"):
+            run_rails(rail_row([_hand("The Cook")], []), unheld)
+
+    assert case_checks == [unheld]
+
+
+def test_run_rails_checks_the_pinned_cases_of_a_pack_once(case_checks):
+    pack = dataclasses.replace(PET)
+
+    for _ in range(3):
+        entities, _ = run_rails(rail_row([_hand("The Cook")], []), pack)
+
+    assert entities[0]["id"] == "cook"
+    assert case_checks == [pack]
+
+
+def test_the_single_entity_and_derived_id_steps_refuse_such_a_pack_too(case_checks):
+    unheld = _unheld_pet()
+
+    with pytest.raises(PackLoadError, match="pinned case.*do not hold: pet-roster"):
+        rails.normalize_entity(_hand("The Cook"), unheld)
+    with pytest.raises(PackLoadError, match="pinned case.*do not hold: pet-roster"):
+        rails.derived_ids([_hand("The Cook")], [], unheld)
+
+    assert case_checks == [unheld]
+
+
+def test_checking_the_pinned_cases_does_not_go_through_the_guard(case_checks):
+    # `check_pinned_cases` runs the runner on the pinned inputs. Were that the guarded
+    # entry point, the check would call itself.
+    pack = dataclasses.replace(PET)
+
+    assert rails.check_pinned_cases(pack) == []
+    assert case_checks == [pack]
 
 
 @pytest.mark.parametrize("pack", [BASE, PET], ids=["base", "pet"])
@@ -461,6 +518,9 @@ def test_a_fan_out_group_lists_only_the_members_whose_trigger_edge_is_live():
         pinned_case=PinnedCase((), (), (), ()),
     )
     pack = _with_rule(BASE, watch, Plugin("record-group", RELATION, _record_group))
+    # The first run of a pack checks its pinned cases, and the plug-in would record the
+    # groups of those too: check them here, then start the record empty.
+    rails.require_pinned_cases(pack)
     _SEEN_GROUPS.clear()
 
     _run(
@@ -500,8 +560,6 @@ def test_the_pet_roster_gives_the_user_each_pet_of_the_lead_ins_batches():
 
 
 def _pet_row(**changes) -> RailRow:
-    import dataclasses
-
     return _case_row(dataclasses.replace(PET_ROSTER_CASE, **changes))
 
 
