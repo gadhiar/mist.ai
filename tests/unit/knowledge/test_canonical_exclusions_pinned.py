@@ -38,8 +38,26 @@ class TestPinnedByExactEquality:
         )
 
     def test_epoch_stamp_fields(self):
+        """The stamp triple, and the two ontology pack hashes written beside it.
+
+        The pack hashes joined the set with the edges that carry them (plan
+        v14, T45). What the gate can no longer see: which pack wrote an edge.
+        That is acceptable for the reason the triple is excluded: a rebuild
+        re-stamps every edge with today's values, and an edge written before
+        the hashes existed holds neither, so comparing them would fail
+        `live == rebuilt` on stamps alone. A pack change that alters a fact is
+        still seen, because the facts are compared.
+        """
         assert (
-            frozenset({"ontology_version", "extraction_version", "model_hash"})
+            frozenset(
+                {
+                    "ontology_version",
+                    "extraction_version",
+                    "model_hash",
+                    "pack_prompt_hash",
+                    "pack_rails_hash",
+                }
+            )
             == cs.EPOCH_STAMP_FIELDS
         )
 
