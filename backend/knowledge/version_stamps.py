@@ -149,15 +149,18 @@ class PackRelease:
 # The extraction version and the pack version are read, never restated: the line is
 # for the running version by construction, and names the pack of the ontology in use.
 #
-# Under 2026-11-10-r8 the prompt hash moved once with no change to the model's input:
-# the generated output schema joined what it covers, and that schema equals the one
-# the service already sent. The rails hash moved once with no change to what is
-# stored: the three id plug-ins moved, bodies unchanged, from `id_rails.py` into the
-# pack's `plugins.py`, and the hash covers the source of the module that holds them.
+# Under 2026-11-10-r8 the prompt hash moved twice with no change to the model's input.
+# The generated output schema joined what it covers, and that schema equals the one
+# the service already sent. Then the prompt's ontology half moved from the engine
+# core into the pack as prompt fragments, which the hash covers: the assembled prompt
+# is the same bytes, and `prompt_sha256` did not move. The rails hash moved once with no
+# change to what is stored: the three id plug-ins moved, bodies unchanged, from
+# `id_rails.py` into the pack's `plugins.py`, and the hash covers the source of the
+# module that holds them.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
-    pack_prompt_hash="5357a198ce334d01a38ae38f7ca63c8e2d916381f3099d5f74ea6862a6f54fdb",
+    pack_prompt_hash="ae81af5889e9f5676e2516008ac67fcfd46d51c52a34eee899a14dbc2a68aff0",
     pack_rails_hash="a837f8cfc450ed027dd6af5c823b70bf974178cfb2a8672b3fd4174024e0c76d",
 )
 
@@ -239,7 +242,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-4541c2e825d04707a7faa3333dbb297fa455da60d750aca3b1e8eaac59f477d4",
+        code_identity="ci1-e692b80d908bf941110a3534ddf0f50d43da15aeba692e722d5054bdb5a13ec6",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -280,12 +283,14 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "running its item filters on the units before they are batched, sending its "
             "assembled prompt and generated schema at Stage 2 and under the plan call, and "
             "stamping its two hashes on every result, and pre_llm, the pack loader and the "
-            "registry join the covered code; the active pack holds no prompt fragment and "
+            "registry join the covered code; the active pack holds "
             "no item filter, so it drops no unit and changes no request; T46 ships the "
             "ontology as a pack of files, which the registry loads in place of the adapter "
             "that stated it from the old modules, with the same types, rules, pair table, "
             "prompt and schema, and no module keeps the assembled prompt as a constant: the "
-            "service, the in-process extractor and the eval harness send the active pack's. "
+            "service, the in-process extractor and the eval harness send the active pack's, "
+            "which the engine core and the pack's prompt fragments assemble to the same "
+            "bytes. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

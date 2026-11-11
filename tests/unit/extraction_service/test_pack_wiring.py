@@ -3,9 +3,10 @@
 The engine takes a pack, the registry's active one by default: the pack's item filters
 choose the units the model is given, its assembled prompt and generated schema are what
 Stage 2 sends, and its two hashes are stamped on every result and reported on `/v1/info`.
-The active pack holds no prompt fragment and no item filter, so the service sends what it
-sent before; `test_turn_plan_off_pins.py` pins those bytes. The cases that need a
-fragment or a filter run on the base fixture pack.
+The active pack holds no item filter and its fragments assemble to the prompt as it
+stood, so the service sends what it sent before; `test_turn_plan_off_pins.py` pins
+those bytes. The cases that need a fragment of their own or a filter run on the base
+fixture pack.
 """
 
 from __future__ import annotations
@@ -32,8 +33,11 @@ from tests.unit.extraction_service.conftest import make_extract_request
 
 BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
 
-# Rule 37's last words: text of the Stage 2 system prompt and of no other stage's.
-_STAGE2_MARK = "a frame whose year is unclear gets no date."
+# The heading over the numbered rules: text of the engine core, so of every pack's
+# Stage 2 system prompt, and of no other stage's.
+_STAGE2_MARK = "## EXTRACTION RULES"
+# How the engine core's last rule ends: what the base pack's rules fragment follows.
+_CORE_RULES_END = "even if first-person pronouns are present.\n"
 _FRAGMENT = "F1. Each deckhand placed in a crew also SERVES_UNDER its skipper.\n"
 _DECK_JOBS = "Deck jobs for Saturday:\n- [ ] coil the stern lines\n- [x] check the bilge pump\n"
 _WATCH_LIST = "Watch list:\n- [ ] the frayed halyard\n- [x] the port winch\n"
@@ -204,7 +208,7 @@ async def test_stage_2_is_sent_under_the_packs_assembled_prompt(base_client, fak
 
     assert response.status_code == 200
     (sent,) = _stage2_texts(fake_llama_state)
-    assert f"gets no date.\n{_FRAGMENT}\n## REFERENCE DATE\n" in sent
+    assert f"{_CORE_RULES_END}{_FRAGMENT}\n## REFERENCE DATE\n" in sent
 
 
 @pytest.mark.asyncio
@@ -246,7 +250,7 @@ async def test_the_plan_call_is_sent_under_the_packs_prompt_and_given_the_kept_u
     assert response.status_code == 200
     plan_call, batch_call = _stage2_texts(fake_llama_state)
     for sent in (plan_call, batch_call):
-        assert f"gets no date.\n{_FRAGMENT}\n## REFERENCE DATE\n" in sent
+        assert f"{_CORE_RULES_END}{_FRAGMENT}\n## REFERENCE DATE\n" in sent
         assert "coil the stern lines" not in sent
         assert "check the bilge pump" in sent
 

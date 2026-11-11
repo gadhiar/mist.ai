@@ -12,6 +12,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from backend.knowledge import version_stamps
-from backend.knowledge.extraction import id_rails, rails
+from backend.knowledge.extraction import id_rails, prompts, rails
 from backend.knowledge.ontologies import hierarchy, registry, v1_0_0
 from backend.knowledge.ontologies.base import KnowledgeDomain
 from backend.knowledge.ontologies.pack import POST_LLM_PHASES, Pack, load_pack
@@ -696,6 +697,11 @@ _RULE_IDS = [
     "metric-id",
     "event-date",
     "plan-vocabulary",
+    "prompt-constraints",
+    "prompt-rules-1-to-3",
+    "prompt-rule-6",
+    "prompt-rules-11-to-37",
+    "prompt-examples",
 ]
 
 
@@ -771,8 +777,29 @@ class TestTheRegistryServesThePack:
         for mine, theirs in zip(file_pack.plugins, registry_pack.plugins, strict=True):
             assert mine.fn is theirs.fn
 
-    def test_the_pack_adds_no_prompt_fragment(self, file_pack: Pack):
-        assert file_pack.rules_of("prompt_fragment") == ()
+    def test_the_packs_fragments_are_the_prompts_ontology_half(self, file_pack: Pack):
+        fragments = [rule.params for rule in file_pack.rules_of("prompt_fragment")]
+
+        assert [(fragment.position, len(fragment.examples)) for fragment in fragments] == [
+            (prompts.CONSTRAINTS_SLOT, 0),
+            (prompts.OPENING_RULES_SLOT, 0),
+            (prompts.MID_RULES_SLOT, 0),
+            (prompts.RULES_SLOT, 0),
+            (prompts.RULES_SLOT, 31),
+        ]
+        assert file_pack.system_prompt == prompts.assemble_system_prompt(tuple(fragments))
+        digest = hashlib.sha256(
+            (file_pack.system_prompt + prompts.EXTRACTION_USER_TEMPLATE).encode("utf-8")
+        ).hexdigest()
+        # The prompt as it stood before the pack stated any of it, which
+        # `TestExtractionVersionDriftGuard` pins too.
+        assert digest == "88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4"
+
+    def test_no_type_or_edge_of_the_pack_is_named_in_the_engine_core(self, file_pack: Pack):
+        core = prompts.assemble_system_prompt()
+        names = file_pack.type_names | set(file_pack.edges_by_name) | set(file_pack.retired)
+
+        assert [name for name in sorted(names) if re.search(rf"\b{name}\b", core)] == []
 
     def test_the_loader_reads_the_packs_own_files(self, file_pack: Pack):
         assert file_pack.manifest is pack_manifest.MANIFEST
