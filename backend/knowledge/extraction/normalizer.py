@@ -18,12 +18,13 @@ from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
 
-# What a cache row holds, besides the payload, that the rails read.
-_RAIL_INPUTS: tuple[str, ...] = ("scope", "batch_record", "turn_plan")
+# What a replay hands over from a cache row, besides the payload. The row's scope is a
+# rail input too and `normalize` takes it, but the replay paths do not hand it over yet.
+_RAIL_INPUTS: tuple[str, ...] = ("batch_record", "turn_plan")
 
 
 def rail_inputs(cached: Mapping) -> dict:
-    """The rail inputs a cache row carries, as keyword arguments for `normalize`.
+    """The batch record and plan a cache row carries, as keyword arguments for `normalize`.
 
     A row written before a column existed, or by a turn that had no plan, holds None
     there. Those are left out, so `normalize` is called exactly as it was before the

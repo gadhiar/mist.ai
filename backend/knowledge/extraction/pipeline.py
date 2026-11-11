@@ -30,7 +30,7 @@ from backend.event_store.models import ConversationTurnEvent
 from backend.interfaces import EmbeddingProvider, EventStoreProvider
 from backend.knowledge.config import ExtractionConfig
 from backend.knowledge.extraction.confidence import ConfidenceScorer
-from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.normalizer import EntityNormalizer, rail_inputs
 from backend.knowledge.extraction.ontology_extractor import (
     ExtractionResult,
     OntologyConstrainedExtractor,
@@ -1196,7 +1196,7 @@ class ExtractionPipeline:
             reference_date = datetime.fromisoformat(turn.recorded_at)
             extraction = self._confidence_scorer.adjust_confidence(extraction)
             extraction = self._temporal_resolver.resolve(extraction, reference_date)
-            extraction = await self._normalizer.normalize(extraction)
+            extraction = await self._normalizer.normalize(extraction, **rail_inputs(cached))
             validation = self._validator.validate(extraction)
             if self._curation_pipeline is not None:
                 curation_result = await self._curation_pipeline.curate_and_store(

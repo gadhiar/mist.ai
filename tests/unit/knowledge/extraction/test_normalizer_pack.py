@@ -88,13 +88,9 @@ async def test_the_normalizer_logs_a_reserved_name_of_its_own_pack(caplog):
 
 
 def test_rail_inputs_are_the_fields_a_cache_row_carries():
-    row = {"entities": [], "scope": "user-scope", "batch_record": [{"units": []}], "turn_plan": {}}
+    row = {"entities": [], "batch_record": [{"units": []}], "turn_plan": {}}
 
-    assert rail_inputs(row) == {
-        "scope": "user-scope",
-        "batch_record": [{"units": []}],
-        "turn_plan": {},
-    }
+    assert rail_inputs(row) == {"batch_record": [{"units": []}], "turn_plan": {}}
 
 
 def test_a_row_written_before_the_columns_existed_hands_over_nothing():
