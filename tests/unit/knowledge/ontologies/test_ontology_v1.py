@@ -7,9 +7,16 @@ immediate, visible test failures.
 
 from __future__ import annotations
 
+import ast
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
+from backend.knowledge.ontologies import v1_0_0
 from backend.knowledge.ontologies.base import KnowledgeDomain
+from backend.knowledge.ontologies.packs.v1_4_0 import types as pack_types
 from backend.knowledge.ontologies.v1_0_0 import (
     ALL_EDGE_TYPES,
     ALL_NODE_TYPES,
@@ -404,3 +411,164 @@ class TestOntologyVersion:
         assert not hasattr(
             writer, "_ONTOLOGY_VERSION"
         ), "the mirrored literal is deleted, not merely unreferenced"
+
+
+# -------------------------------------------------------------------
+# The pack's files: the types live in `packs/v1_4_0/types.py`
+# -------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_PACK_PACKAGE = "backend.knowledge.ontologies.packs.v1_4_0"
+_PACK_TYPES = f"{_PACK_PACKAGE}.types"
+_PACKS_DIR = Path(pack_types.__file__).resolve().parents[1]
+
+# The names `types.py` binds for the pack loader alone, which the old path never had.
+_LOADER_ONLY_NAMES = {"NODE_TYPES", "EDGE_TYPES", "EXTRACTABLE_EDGE_TYPES"}
+
+
+def _bound_names(source: str) -> set[str]:
+    """Every name a module's own top-level statements bind, imports left out."""
+    names: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """Every module a file imports, at any depth, by its dotted name."""
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            modules.add(node.module)
+            modules.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return modules
+
+
+class TestTheOldPathIsAReExport:
+    """`v1_0_0.py` is the import path older code uses, and holds nothing of its own."""
+
+    def test_its_only_statements_are_a_docstring_and_imports_from_the_packs_types(self):
+        body = ast.parse(Path(v1_0_0.__file__).read_text(encoding="utf-8")).body
+
+        assert isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+        rest = body[1:]
+        assert rest, "the module re-exports nothing"
+        assert all(isinstance(node, ast.ImportFrom) for node in rest)
+        assert {node.module for node in rest} == {"__future__", _PACK_TYPES}
+
+    def test_every_name_the_packs_types_bind_is_the_same_object_under_the_old_path(self):
+        bound = _bound_names(Path(pack_types.__file__).read_text(encoding="utf-8"))
+        expected = bound - _LOADER_ONLY_NAMES
+
+        # A scan that has gone blind would pass with nothing to compare.
+        assert len(expected) > 100
+        assert {"ONTOLOGY_V1_0_0", "_EXTERNAL_NODE_TYPES", "_apply_v1_4_0"} <= expected
+        assert bound >= _LOADER_ONLY_NAMES
+        missing = sorted(name for name in expected if not hasattr(v1_0_0, name))
+        assert missing == []
+        other = sorted(
+            name for name in expected if getattr(v1_0_0, name) is not getattr(pack_types, name)
+        )
+        assert other == []
+
+    def test_the_old_path_binds_nothing_the_packs_types_do_not(self):
+        own = {name for name in vars(v1_0_0) if not name.startswith("__")} - {"annotations"}
+
+        assert sorted(name for name in own if not hasattr(pack_types, name)) == []
+
+
+class TestWhatTheLoaderReadsFromTheTypes:
+    """`types.py` gives the pack loader the lists the old path always had."""
+
+    def test_the_node_types_and_both_extractable_lists_are_the_old_lists(self):
+        assert tuple(ALL_NODE_TYPES) == pack_types.NODE_TYPES
+        assert pack_types.EXTRACTABLE_NODE_TYPES is EXTRACTABLE_NODE_TYPES
+        assert tuple(EXTRACTABLE_RELATIONSHIP_TYPES) == pack_types.EXTRACTABLE_EDGE_TYPES
+
+    def test_the_edges_are_the_old_ones_as_written(self):
+        # As written, before the retired types and the supertypes are applied: the
+        # loader applies the manifest to them.
+        assert [edge.type_name for edge in pack_types.EDGE_TYPES] == [
+            edge.type_name for edge in ALL_EDGE_TYPES
+        ]
+        assert pack_types.EDGE_TYPES is v1_0_0._RAW_EDGE_TYPES
+        assert [pack_types._apply_v1_4_0(edge) for edge in pack_types.EDGE_TYPES] == ALL_EDGE_TYPES
+
+
+class TestThePackImportsWithNoCycle:
+    """The loader imports the version stamps, which import the types through the old path.
+
+    So nothing the old path imports may reach the loader, whichever module a process
+    imports first.
+    """
+
+    @pytest.mark.parametrize(
+        "first",
+        [
+            "backend.knowledge.version_stamps",
+            "backend.knowledge.ontologies.pack",
+            "backend.knowledge.ontologies.v1_0_0",
+            "backend.knowledge.ontologies.registry",
+            "backend.knowledge.extraction.id_rails",
+            _PACK_TYPES,
+        ],
+    )
+    def test_a_fresh_interpreter_imports_the_chain_from_any_end(self, first: str):
+        code = (
+            f"import {first}\n"
+            "from backend.knowledge import version_stamps\n"
+            "from backend.knowledge.ontologies import pack, v1_0_0\n"
+            f"from {_PACK_PACKAGE} import types\n"
+            "assert v1_0_0.ONTOLOGY_V1_0_0 is types.ONTOLOGY_V1_0_0\n"
+            "assert version_stamps.ONTOLOGY_VERSION is types.ONTOLOGY_V1_0_0.version\n"
+            "assert pack.load_pack\n"
+        )
+
+        done = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr[-2000:]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            _PACKS_DIR / "__init__.py",
+            _PACKS_DIR / "v1_4_0" / "__init__.py",
+            _PACKS_DIR / "v1_4_0" / "types.py",
+        ],
+        ids=["packs", "packs.v1_4_0", "packs.v1_4_0.types"],
+    )
+    def test_what_the_old_path_loads_never_imports_the_loader(self, path: Path):
+        reaching_the_loader = {
+            name
+            for name in _imported_modules(path)
+            if name.startswith(
+                (
+                    "backend.knowledge.ontologies.pack",
+                    "backend.knowledge.ontologies.registry",
+                    "backend.knowledge.version_stamps",
+                    "backend.knowledge.extraction",
+                )
+            )
+        }
+
+        # `packs` itself starts with `...ontologies.pack`, so the pack's own modules
+        # are told apart from the loader by the dot that follows.
+        assert {
+            name
+            for name in reaching_the_loader
+            if not name.startswith("backend.knowledge.ontologies.packs")
+        } == set()
