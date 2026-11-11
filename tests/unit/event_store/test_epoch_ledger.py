@@ -245,6 +245,29 @@ class TestPackHashes:
         assert (current["pack_prompt_hash"], current["pack_rails_hash"]) == (None, None)
         store.close()
 
+    def test_a_call_with_hashes_over_an_epoch_that_holds_none_appends(self, tmp_path):
+        """A stored NULL is not a wildcard: the first call that gives hashes appends.
+
+        This is the direction a migrated ledger takes: its latest row holds the
+        triple and no hash, and the next writer gives the same triple with two.
+        """
+        store = _store(tmp_path)
+        first = store.append_epoch("1.1.0", "v1", "m1", activated_at="t1")
+
+        second = store.append_epoch(
+            "1.1.0", "v1", "m1", activated_at="t2", pack_prompt_hash=PROMPT, pack_rails_hash=RAILS
+        )
+
+        assert second != first
+        assert len(store.list_epochs()) == 2
+        current = store.get_current_epoch()
+        assert current["epoch_id"] == second
+        assert current["prev_epoch_id"] == first
+        assert (current["pack_prompt_hash"], current["pack_rails_hash"]) == (PROMPT, RAILS)
+        older = store.get_epoch(first)
+        assert (older["pack_prompt_hash"], older["pack_rails_hash"]) == (None, None)
+        store.close()
+
 
 class TestPackHashColumnsMigrate:
     """`initialize` adds the two columns to both epoch tables, last, and rewrites no row."""
