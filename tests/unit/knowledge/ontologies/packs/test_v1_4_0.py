@@ -1,8 +1,10 @@
-"""Snapshot tests for the MIST.AI v1.0.0 ontology definition.
+"""Snapshot tests for the v1.4.0 ontology pack.
 
-These tests pin the ontology structure so that accidental changes to entity
-types, relationship types, confidence policies, or extraction rules cause
-immediate, visible test failures.
+These tests pin the pack's files, so that an accidental change to an entity type, a
+relationship type, a confidence policy, a convention rule, the manifest or the
+prompt's ontology half is an immediate, visible test failure. They also pin what the
+move into pack files kept: the old import path, the values the old modules held,
+and the payload each rule's pinned case gives.
 """
 
 from __future__ import annotations
@@ -447,7 +449,7 @@ class TestOntologyVersion:
 # The pack's files: the types live in `packs/v1_4_0/types.py`
 # -------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[5]
 _PACK_PACKAGE = "backend.knowledge.ontologies.packs.v1_4_0"
 _PACK_TYPES = f"{_PACK_PACKAGE}.types"
 _PACKS_DIR = Path(pack_types.__file__).resolve().parents[1]
