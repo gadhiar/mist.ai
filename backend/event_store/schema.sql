@@ -131,6 +131,16 @@ CREATE INDEX IF NOT EXISTS idx_health_events_time ON graph_health_events(timesta
 
 -- Append-only epoch ledger (F3): records each (ontology, extraction, model)
 -- epoch so the graph is a projection of (log, epoch). Never mutated.
+--
+-- pack_prompt_hash and pack_rails_hash are the two hashes of the ontology pack
+-- the epoch runs under, stored beside the triple by whichever writer appends
+-- the row (`EventStore.append_epoch`, `ensure_initial_epoch`, and the two
+-- promotions, which copy the cutover row's). NULL: the writer was given none,
+-- or the row was written before the columns existed; the identity checks skip
+-- a hash the row holds as NULL (`pack_hash_mismatches` in
+-- `backend/extraction_backlog/store.py`). The two columns came after
+-- `provisional`; `EventStore.initialize()` adds them to an older table with a
+-- guarded ALTER, and rewrites no existing row.
 CREATE TABLE IF NOT EXISTS epoch_ledger (
     epoch_id INTEGER PRIMARY KEY AUTOINCREMENT,
     ontology_version TEXT NOT NULL,
@@ -138,8 +148,10 @@ CREATE TABLE IF NOT EXISTS epoch_ledger (
     model_hash TEXT NOT NULL,
     activated_at TEXT NOT NULL,
     prev_epoch_id INTEGER,
-    provisional INTEGER NOT NULL DEFAULT 0  -- R1.4 Task 7 (spec O2): 1 = bootstrap
+    provisional INTEGER NOT NULL DEFAULT 0, -- R1.4 Task 7 (spec O2): 1 = bootstrap
                                              -- placeholder, may be superseded by R1.6
+    pack_prompt_hash TEXT,                   -- sha256 over what the pack feeds the model
+    pack_rails_hash TEXT                     -- sha256 over the pack's rules for a payload
 );
 
 -- ---------------------------------------------------------------------------
@@ -235,6 +247,13 @@ CREATE INDEX IF NOT EXISTS idx_extraction_attempts_turn
 -- binding columns below `updated_at` came later; `EventStore.initialize()`
 -- adds them to an older table with a guarded ALTER, so a row written before
 -- them reads as an unbound candidate (all NULL).
+--
+-- pack_prompt_hash and pack_rails_hash, the last two columns, came later
+-- still and are added the same way. They are the two hashes of the candidate's
+-- ontology pack, written once by `begin_epoch_cutover` from what its caller
+-- gives it, and copied to the new `epoch_ledger` row by promotion. NULL: the
+-- caller gave none, or the row was written before the columns existed; the
+-- identity checks skip a hash the row holds as NULL, as for `epoch_ledger`.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS epoch_cutover (
     cutover_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,7 +279,11 @@ CREATE TABLE IF NOT EXISTS epoch_cutover (
     identity_namespace TEXT,                  -- NULL: the 3-part cache key
     binding_source TEXT,                      -- adopted, first-contact, operator
     binding_evidence TEXT,                    -- JSON
-    bound_at TEXT                             -- ISO-8601
+    bound_at TEXT,                            -- ISO-8601
+    -- The candidate's ontology pack. Same meaning as the `epoch_ledger`
+    -- columns of the same names.
+    pack_prompt_hash TEXT,
+    pack_rails_hash TEXT
 );
 
 -- ---------------------------------------------------------------------------
