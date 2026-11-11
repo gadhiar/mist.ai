@@ -39,8 +39,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend.knowledge.extraction.id_rails import stored_entity_id  # noqa: E402
-from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT  # noqa: E402
 from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS  # noqa: E402
+from backend.knowledge.ontologies.registry import active_pack  # noqa: E402
 from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
     EDGE_TYPES_BY_NAME,
     EXTRACTABLE_NODE_TYPES,
@@ -162,8 +162,8 @@ def _term_pattern(term: str) -> re.Pattern[str]:
 
 def _prompt_entity_terms() -> set[str]:
     """Entity ids and names the production prompt's rules and examples carry."""
-    ids = set(re.findall(r'"id": "([^"]+)"', EXTRACTION_SYSTEM_PROMPT))
-    names = set(re.findall(r'"name": "([^"]+)"', EXTRACTION_SYSTEM_PROMPT))
+    ids = set(re.findall(r'"id": "([^"]+)"', active_pack().system_prompt))
+    names = set(re.findall(r'"name": "([^"]+)"', active_pack().system_prompt))
     allowed = {"user", "mist-identity", "User", "MIST"}
     placeholders = {"lowercase-hyphenated-name", "Display Name"}
     return (ids | names) - allowed - placeholders
@@ -742,7 +742,7 @@ def _gold_ids_in_the_prompt(path: Path) -> dict[str, list[str]]:
         for entity in row["expected_entities"]:
             if entity["id"] in _PROMPT_ANCHOR_IDS:
                 continue
-            if _term_pattern(entity["id"]).search(EXTRACTION_SYSTEM_PROMPT):
+            if _term_pattern(entity["id"]).search(active_pack().system_prompt):
                 hits.setdefault(entity["id"], []).append(row["tag"])
     return hits
 

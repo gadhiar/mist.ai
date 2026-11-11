@@ -155,13 +155,14 @@ class TestBugKInjectionPrompt:
     """Bug K reproducer (prompt layer): system prompt contains directive-rejection rule."""
 
     def test_prompt_has_explicit_directive_rejection(self):
-        from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT
+        from backend.knowledge.ontologies.registry import active_pack
 
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        system_prompt = active_pack().system_prompt
+        prompt_lower = system_prompt.lower()
         # Must mention directives AND must tell the model what to do.
         assert "directive" in prompt_lower
         assert "hypothetical" in prompt_lower
         # Empty-return instruction must be present for directive handling.
         # The prompt uses double-brace escaping (it is a .format()-style template),
         # so the literal substring in the raw constant is the double-brace form.
-        assert 'return {{"entities": [], "relationships": []}}' in EXTRACTION_SYSTEM_PROMPT
+        assert 'return {{"entities": [], "relationships": []}}}}' in system_prompt

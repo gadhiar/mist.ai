@@ -331,19 +331,18 @@ _UNKNOWN_SUBJECT_SCOPE = "unknown"
 def _render_production_extraction(utterance: str, reference_date: str) -> list[dict[str, Any]]:
     """Stage 2's messages for one utterance with empty history and scope unknown.
 
-    The import runs here rather than at module load so the harness loads no
-    backend module unless a case file names this source; `prompts` imports
-    nothing itself.
+    The system message is the active pack's assembled prompt, the one the
+    service sends. The imports run here rather than at module load so the
+    harness loads no backend module unless a case file names this source.
     """
-    from backend.knowledge.extraction.prompts import (
-        EXTRACTION_SYSTEM_PROMPT,
-        EXTRACTION_USER_TEMPLATE,
-    )
+    from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
+    from backend.knowledge.ontologies import registry
 
+    system_prompt = registry.active_pack().system_prompt
     return [
         {
             "role": "system",
-            "content": EXTRACTION_SYSTEM_PROMPT.format(reference_date=reference_date),
+            "content": system_prompt.format(reference_date=reference_date),
         },
         {
             "role": "user",

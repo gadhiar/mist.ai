@@ -133,7 +133,7 @@ _STUB_FILES = {
         "    return entities, relationships\n"
     ),
     "backend/knowledge/extraction/prompts.py": (
-        "EXTRACTION_SYSTEM_PROMPT = 'stub system prompt'\n"
+        f"{pack_equivalence.BASE_PROMPT_NAME} = 'stub system prompt'\n"
         "EXTRACTION_USER_TEMPLATE = 'stub user template'\n"
     ),
     "backend/knowledge/extraction/validator.py": (

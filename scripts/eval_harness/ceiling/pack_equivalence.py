@@ -54,6 +54,9 @@ from fractions import Fraction
 from pathlib import Path
 
 _BASE_HALF_FLAG = "--base-half"
+# The name a base tree from before T46 gives its assembled prompt. A later tree, this
+# one included, holds no such constant: its prompt is its active pack's.
+BASE_PROMPT_NAME = "EXTRACTION_SYSTEM_PROMPT"
 _BASE_TIMEOUT_SECONDS = 900
 
 # What the base tree must hold for the base half to run.
@@ -204,6 +207,20 @@ def _outside(root: Path) -> list[str]:
     return names
 
 
+def _base_system_prompt(base_prompts) -> str:
+    """The base tree's system prompt: its constant where it has one, else its pack's.
+
+    Args:
+        base_prompts: The base tree's `backend.knowledge.extraction.prompts`.
+    """
+    constant = getattr(base_prompts, BASE_PROMPT_NAME, None)
+    if constant is not None:
+        return constant
+    from backend.knowledge.ontologies import registry
+
+    return registry.active_pack().system_prompt
+
+
 def _run_base_half(base_root: Path) -> int:
     """Run the base tree over the payloads on stdin and write its results to stdout.
 
@@ -216,13 +233,11 @@ def _run_base_half(base_root: Path) -> int:
     sys.path[:] = [str(root), *kept]
 
     from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
+    from backend.knowledge.extraction import prompts as base_prompts
     from backend.knowledge.extraction.id_rails import normalize_payload
-    from backend.knowledge.extraction.prompts import (
-        EXTRACTION_SYSTEM_PROMPT,
-        EXTRACTION_USER_TEMPLATE,
-    )
     from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
 
+    system_prompt = _base_system_prompt(base_prompts)
     outside = _outside(root)
     if outside:
         sys.stderr.write(f"modules loaded from outside the base root: {', '.join(outside)}\n")
@@ -240,8 +255,8 @@ def _run_base_half(base_root: Path) -> int:
     json.dump(
         {
             "sets": stored,
-            "system_prompt": EXTRACTION_SYSTEM_PROMPT,
-            "user_template": EXTRACTION_USER_TEMPLATE,
+            "system_prompt": system_prompt,
+            "user_template": base_prompts.EXTRACTION_USER_TEMPLATE,
             "pairs": _pairs(RELATIONSHIP_CONSTRAINTS),
             "schema": json.dumps(EXTRACTION_OUTPUT_SCHEMA),
         },

@@ -24,13 +24,11 @@ if TYPE_CHECKING:
 
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.extraction.preprocessor import PreProcessedInput
-from backend.knowledge.extraction.prompts import (
-    EXTRACTION_SYSTEM_PROMPT,
-    EXTRACTION_USER_TEMPLATE,
-)
+from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
 from backend.knowledge.ontologies import (
     EXTRACTABLE_NODE_TYPES,
     EXTRACTABLE_RELATIONSHIP_TYPES,
+    registry,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +59,7 @@ def render_extraction_messages(pre_processed: PreProcessedInput) -> list[dict]:
         else NO_PRIOR_CONTEXT
     )
 
-    system_prompt = EXTRACTION_SYSTEM_PROMPT.format(
+    system_prompt = registry.active_pack().system_prompt.format(
         reference_date=pre_processed.reference_date.strftime("%Y-%m-%d"),
     )
 

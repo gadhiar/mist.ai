@@ -7,10 +7,12 @@ produces structured JSON output in a single LLM call.
 The system prompt is assembled: the engine core (`ENGINE_CORE`) is its text in the
 order the model reads it, with a slot wherever a pack's `prompt_fragment` rules may be
 placed, and `assemble_system_prompt` puts each fragment in the slot its `position`
-names. The core still holds the whole prompt, the ontology's part included, so with no
-fragment the assembled text is `EXTRACTION_SYSTEM_PROMPT`, unchanged. Moving the
-ontology's part into a pack is a cut of the core at each place the text leaves it, a
-slot there, and the same text as fragments of that slot.
+names. No module holds an assembled prompt as a constant: the loader assembles each
+pack's (`Pack.system_prompt`), and every reader takes the active pack's. The core still
+holds the whole prompt, the ontology's part included, so a pack with no fragment has
+the core as its prompt. Moving the ontology's part into a pack is a cut of the core at
+each place the text leaves it, a slot there, and the same text as fragments of that
+slot.
 """
 
 from __future__ import annotations
@@ -417,10 +419,6 @@ def estimate_prompt_tokens(system_prompt: str) -> int:
     rendered = system_prompt.format(reference_date="0000-00-00")
     return math.ceil(len(rendered) / PROMPT_CHARACTERS_PER_TOKEN)
 
-
-# The engine core with nothing placed: the prompt of a pack that holds no fragment,
-# which is what the in-process extractor and the eval harness read.
-EXTRACTION_SYSTEM_PROMPT: str = assemble_system_prompt()
 
 EXTRACTION_USER_TEMPLATE = """Context:
 {context}

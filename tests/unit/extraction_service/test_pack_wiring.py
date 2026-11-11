@@ -20,10 +20,11 @@ import pytest
 import pytest_asyncio
 
 import backend.extraction_service as service_package
+from backend.extraction_service import engine as engine_module
 from backend.extraction_service.app import create_app, run_identity_components
 from backend.extraction_service.engine import ExtractionEngine, _compute_prompt_sha256
 from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
-from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT
+from backend.knowledge.extraction.prompts import assemble_system_prompt
 from backend.knowledge.extraction.run_identity import RunIdentityComponents
 from backend.knowledge.ontologies.pack import load_pack
 from backend.knowledge.ontologies.registry import active_pack
@@ -70,9 +71,42 @@ def test_the_engine_takes_the_registrys_active_pack_by_default(engine):
 def test_the_active_packs_prompt_and_schema_are_the_ones_the_service_sent_before(adapter):
     pack = active_pack()
 
-    assert pack.system_prompt == EXTRACTION_SYSTEM_PROMPT
+    fragments = tuple(rule.params for rule in pack.rules_of("prompt_fragment"))
+
+    assert pack.system_prompt == assemble_system_prompt(fragments)
     assert json.dumps(pack.extraction_schema) == json.dumps(EXTRACTION_OUTPUT_SCHEMA)
     assert _compute_prompt_sha256(adapter, pack=pack) == _compute_prompt_sha256(adapter)
+
+
+def _other_pack():
+    """The active pack with a prompt and a schema of its own."""
+    return dataclasses.replace(
+        active_pack(),
+        system_prompt="A harbour log, read on {reference_date}.",
+        extraction_schema={"type": "object", "title": "harbour log"},
+    )
+
+
+def test_with_no_pack_the_prompt_hash_is_the_active_packs(adapter, monkeypatch):
+    todays = _compute_prompt_sha256(adapter)
+    other = _other_pack()
+    monkeypatch.setattr(engine_module, "active_pack", lambda: other)
+
+    assert _compute_prompt_sha256(adapter) == _compute_prompt_sha256(adapter, pack=other)
+    assert _compute_prompt_sha256(adapter) != todays
+
+
+def test_with_no_pack_the_run_identity_is_the_active_packs(service_settings, adapter, monkeypatch):
+    pack = active_pack()
+    todays = run_identity_components(service_settings, adapter)
+    assert todays == run_identity_components(service_settings, adapter, pack=pack)
+
+    other = _other_pack()
+    monkeypatch.setattr(engine_module, "active_pack", lambda: other)
+
+    moved = run_identity_components(service_settings, adapter)
+    assert moved == run_identity_components(service_settings, adapter, pack=other)
+    assert moved.prompt_sha256 != todays.prompt_sha256
 
 
 @pytest.mark.asyncio
