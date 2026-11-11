@@ -252,3 +252,239 @@ def test_live_pipeline_degrades_gracefully_when_cache_initialization_fails(tmp_p
 
     assert pipeline._extraction_cache is None
     assert pipeline._rebuild_stamps is None
+
+
+# ---------------------------------------------------------------------------
+# One ontology pack, injected into every consumer the factory constructs
+# ---------------------------------------------------------------------------
+
+
+def _build_pipeline(tmp_path):
+    from backend.factories import build_extraction_pipeline
+    from tests.mocks.config import build_test_config
+
+    config = build_test_config(event_store_db_path=str(tmp_path / "event_store.db"))
+    return build_extraction_pipeline(
+        config,
+        graph_store=_FakeGraphStore(),
+        llm_provider=_FakeLLM(),
+        include_curation=False,
+        include_internal_derivation=False,
+    )
+
+
+class _MarkedPack:
+    """Stands in for a `Pack` no registry call returns, to show which pack was injected."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.pack_prompt_hash = "a" * 64
+        self.pack_rails_hash = "b" * 64
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_the_normalizer_and_the_validator_are_given_the_registrys_active_pack(
+    tmp_path, monkeypatch
+):
+    """Mutant this kills: dropping `pack=` from either constructor call.
+
+    Without the argument each consumer still resolves the active pack itself,
+    so identity with `registry.active_pack()` alone would not see the drop. The
+    registry call the factory makes is therefore replaced by one that returns a
+    marked object: a consumer that was not handed it holds the real pack.
+    """
+    from backend import factories
+    from backend.knowledge.ontologies import registry
+
+    marked = _MarkedPack(registry.active_pack())
+    monkeypatch.setattr(factories, "active_pack", lambda: marked)
+
+    pipeline = _build_pipeline(tmp_path)
+
+    assert pipeline._normalizer._pack is marked
+    assert pipeline._validator._pack is marked
+
+
+def test_the_writer_stamps_carry_the_same_packs_hashes(tmp_path, monkeypatch):
+    """The stamps a cache row and an edge are written with name the pack that was injected."""
+    from backend import factories
+    from backend.knowledge.ontologies import registry
+
+    marked = _MarkedPack(registry.active_pack())
+    monkeypatch.setattr(factories, "active_pack", lambda: marked)
+
+    pipeline = _build_pipeline(tmp_path)
+
+    stamps = pipeline._rebuild_stamps
+    assert (stamps.pack_prompt_hash, stamps.pack_rails_hash) == ("a" * 64, "b" * 64)
+
+
+def test_without_a_replacement_the_pack_is_the_registrys_and_its_hashes_are_stamped(tmp_path):
+    from backend.factories import writer_stamps_from_config
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    pack = registry.active_pack()
+    pipeline = _build_pipeline(tmp_path)
+
+    assert pipeline._normalizer._pack is pack
+    assert pipeline._validator._pack is pack
+    assert (
+        pipeline._rebuild_stamps.pack_prompt_hash,
+        pipeline._rebuild_stamps.pack_rails_hash,
+    ) == (
+        pack.pack_prompt_hash,
+        pack.pack_rails_hash,
+    )
+    writer = writer_stamps_from_config(build_test_config())
+    assert (writer.pack_prompt_hash, writer.pack_rails_hash) == (
+        pack.pack_prompt_hash,
+        pack.pack_rails_hash,
+    )
+
+
+def test_a_pack_passed_to_the_stamp_function_is_the_one_stamped():
+    """`build_curation_pipeline` hands its pack on, so one build stamps one pack."""
+    from backend.factories import writer_stamps_from_config
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    marked = _MarkedPack(registry.active_pack())
+
+    writer = writer_stamps_from_config(build_test_config(), marked)
+
+    assert (writer.pack_prompt_hash, writer.pack_rails_hash) == ("a" * 64, "b" * 64)
+
+
+# ---------------------------------------------------------------------------
+# The injected pack, followed through both pipeline builders
+# ---------------------------------------------------------------------------
+
+
+class _UnusedEmbeddings:
+    """Never called. Present so the curation builder constructs no embedding model."""
+
+
+class _PackSource:
+    """Replaces the factory's registry read with a different real `Pack` on every call.
+
+    Each pack is the registry's active one under hashes no registry pack has, so a
+    consumer holds a handed-out pack only if it was passed that object. A consumer
+    that resolved a pack for itself holds the registry's (when it asks the registry)
+    or a later one from this source (when it asks the factory module), and either
+    is told apart from the first.
+    """
+
+    def __init__(self) -> None:
+        self.handed_out: list = []
+
+    def __call__(self):
+        import dataclasses
+
+        from backend.knowledge.ontologies import registry
+
+        number = len(self.handed_out) + 1
+        pack = dataclasses.replace(
+            registry.active_pack(),
+            pack_prompt_hash=f"{number:x}" * 64,
+            pack_rails_hash=f"{number + 8:x}" * 64,
+        )
+        self.handed_out.append(pack)
+        return pack
+
+
+def _pack_hashes(carrier) -> tuple[str | None, str | None]:
+    return (carrier.pack_prompt_hash, carrier.pack_rails_hash)
+
+
+def _curation_stamps(curation) -> list:
+    """The stamps of the two stages of a curation pipeline that write stamped edges."""
+    return [curation._graph_writer._rebuild_stamps, curation._engine._stamps]
+
+
+def test_one_registry_read_feeds_every_consumer_of_the_extraction_pipeline(tmp_path, monkeypatch):
+    """Mutant this kills: dropping `pack=pack` from the `build_curation_pipeline` call.
+
+    Without it the curation builder asks for a pack of its own, which here is a
+    second pack from the source: the read count and the curation stamps both show
+    it. The same holds for a dropped `pack=` on the normalizer or the validator,
+    which would then hold the registry's pack.
+    """
+    from backend import factories
+    from backend.factories import build_extraction_pipeline
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    source = _PackSource()
+    monkeypatch.setattr(factories, "active_pack", source)
+    graph_store = _FakeGraphStore()
+    graph_store.embedding_generator = _UnusedEmbeddings()
+
+    pipeline = build_extraction_pipeline(
+        build_test_config(event_store_db_path=str(tmp_path / "event_store.db")),
+        graph_store=graph_store,
+        llm_provider=_FakeLLM(),
+        include_curation=True,
+        include_internal_derivation=False,
+    )
+
+    assert len(source.handed_out) == 1
+    marked = source.handed_out[0]
+    registrys = registry.active_pack()
+    assert _pack_hashes(marked) != _pack_hashes(registrys)
+    assert pipeline._normalizer._pack is marked
+    assert pipeline._validator._pack is marked
+    assert pipeline._normalizer._pack is not registrys
+    assert pipeline._validator._pack is not registrys
+    assert _pack_hashes(pipeline._rebuild_stamps) == _pack_hashes(marked)
+    for stamps in _curation_stamps(pipeline._curation_pipeline):
+        assert _pack_hashes(stamps) == _pack_hashes(marked)
+        assert _pack_hashes(stamps) != _pack_hashes(registrys)
+
+
+def test_the_curation_builder_stamps_the_pack_it_is_given():
+    """Mutant this kills: dropping `pack` from the `writer_stamps_from_config` call.
+
+    The builder is called the way the cutover's rebuild wiring calls it, with a
+    pack and no registry replacement, so stamps that fell back to the registry
+    carry the registry's hashes.
+    """
+    from backend.factories import build_curation_pipeline, build_graph_executor
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    config = build_test_config()
+    marked = _PackSource()()
+    registrys = registry.active_pack()
+
+    curation = build_curation_pipeline(
+        config,
+        build_graph_executor(config, _RefusingConnection()),
+        embedding_provider=_UnusedEmbeddings(),
+        pack=marked,
+    )
+
+    assert _pack_hashes(marked) != _pack_hashes(registrys)
+    for stamps in _curation_stamps(curation):
+        assert _pack_hashes(stamps) == _pack_hashes(marked)
+        assert _pack_hashes(stamps) != _pack_hashes(registrys)
+
+
+def test_the_curation_builder_without_a_pack_stamps_the_registrys():
+    """The default the callers outside the pipeline builder rely on."""
+    from backend.factories import build_curation_pipeline, build_graph_executor
+    from backend.knowledge.ontologies import registry
+    from tests.mocks.config import build_test_config
+
+    config = build_test_config()
+
+    curation = build_curation_pipeline(
+        config,
+        build_graph_executor(config, _RefusingConnection()),
+        embedding_provider=_UnusedEmbeddings(),
+    )
+
+    for stamps in _curation_stamps(curation):
+        assert _pack_hashes(stamps) == _pack_hashes(registry.active_pack())

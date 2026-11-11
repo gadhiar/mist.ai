@@ -76,11 +76,22 @@ class RebuildStamps:
     keeping the dataclass default `compare=True` -- a field declared with
     `field(compare=False)` would be silently excluded from `__eq__` and could
     diverge between the two sites undetected.
+
+    `pack_prompt_hash` and `pack_rails_hash` are the hashes of the ontology pack
+    the factory built the stamps from, which is the pack it hands the
+    normalizer and validator it constructs: what that pack feeds a model, and
+    the rules it runs on a payload before the write. The EXTRACTED_FROM edge
+    carries both (`_extracted_from_clause`); the fact edges
+    `reconciliation.py` writes carry the triple only. The dispatcher's
+    writer-stamp guard compares both with an epoch that holds them. None is a
+    writer built with no pack named, which stamps no hash.
     """
 
     ontology_version: str
     extraction_version: str
     model_hash: str
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,7 +357,7 @@ class CurationGraphWriter:
         Why the `new_fact` LearningEvent is in this statement too. `write()`
         writes it only for an entity dedup did NOT map onto an existing node
         (`grep -n 'is_update = entity_id in merge_lookup' backend/knowledge/curation/graph_writer.py`
-        -> 196, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
+        -> 207, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
         by exact id first (`EntityDeduplicator.deduplicate` calls `_find_existing`,
         whose tier 1 is the exact id: `grep -n 'existing = await self._find_existing'
         backend/knowledge/curation/deduplication.py`), and emits a MergeAction for
@@ -378,7 +389,7 @@ class CurationGraphWriter:
         (`grep -n '"updated_at",' backend/knowledge/canonical_serialize.py` -> 29,
         inside `AUDIT_FIELDS`), and node `confidence` is excluded
         (`grep -n 'NODE_ONLY_EXCLUDED_FIELDS = ' backend/knowledge/canonical_serialize.py`
-        -> 71). That exclusion is why the canonical-form crash test cannot see
+        -> 88). That exclusion is why the canonical-form crash test cannot see
         this defect and a direct confidence assertion is needed.
         """
         entity_id = entity.get("id", "")
@@ -478,7 +489,7 @@ class CurationGraphWriter:
                 query += " MERGE (le)-[:LEARNED_FROM]->(ctx) MERGE (le)-[:ABOUT]->(e)"
         await self._executor.execute_write(query, params)
 
-    def _extracted_from_clause(self) -> tuple[str, dict[str, str]]:
+    def _extracted_from_clause(self) -> tuple[str, dict[str, str | None]]:
         """Build the EXTRACTED_FROM MERGE that anchors an entity to its utterance.
 
         Returns a (cypher_fragment, params) pair. The fragment expects `e` (the
@@ -507,17 +518,23 @@ class CurationGraphWriter:
         Epoch stamps always ride this edge (`rebuild_stamps` is a required
         constructor dependency), keeping the per-turn (ontology, extraction,
         model) triple auditable in the graph now that the VaultNote anchor that
-        used to carry them is retired.
+        used to carry them is retired. The two pack hashes ride with the
+        triple, set on create and on match like it; a writer whose stamps hold
+        no hash passes null, and Neo4j stores no property for a null.
         """
-        params: dict[str, str] = {
+        params: dict[str, str | None] = {
             "ontology_version": self._rebuild_stamps.ontology_version,
             "extraction_version": self._rebuild_stamps.extraction_version,
             "model_hash": self._rebuild_stamps.model_hash,
+            "pack_prompt_hash": self._rebuild_stamps.pack_prompt_hash,
+            "pack_rails_hash": self._rebuild_stamps.pack_rails_hash,
         }
         stamp_clause = (
             ", r.ontology_version = $ontology_version"
             ", r.extraction_version = $extraction_version"
             ", r.model_hash = $model_hash"
+            ", r.pack_prompt_hash = $pack_prompt_hash"
+            ", r.pack_rails_hash = $pack_rails_hash"
             ", r.derived_at = $now"
         )
         create_set = (

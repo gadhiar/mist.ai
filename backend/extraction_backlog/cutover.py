@@ -60,12 +60,25 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.errors import MistError
 from backend.event_store.store import EpochCutoverStateError
 
-from .store import BacklogStore, Cutover, compose_epoch_model_hash
+from .store import (
+    BacklogStore,
+    CarriesPackHashes,
+    Cutover,
+    PackHashes,
+    compose_epoch_model_hash,
+    describe_pack_hashes,
+    pack_hash_mismatches,
+)
+
+if TYPE_CHECKING:
+    from backend.knowledge.extraction.normalizer import EntityNormalizer
+    from backend.knowledge.extraction.validator import ExtractionValidator
+    from backend.knowledge.ontologies.pack import Pack
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +131,8 @@ def begin_cutover(
     now_iso: str,
     settings_change: bool = False,
     refill: bool = False,
+    pack_prompt_hash: str | None = None,
+    pack_rails_hash: str | None = None,
 ) -> Cutover:
     """Open a cutover candidate in state 'filling'.
 
@@ -131,6 +146,14 @@ def begin_cutover(
     fill contact (`binding.decide_binding`): rule 1 refuses a service that has
     not changed, rule 4 or 5a gives it a keyed namespace, and rule 3 gives a
     return to a configuration that claims the pair its 3-part rows.
+
+    `pack_prompt_hash` and `pack_rails_hash` are the candidate's ontology pack
+    hashes. They are compared here with the active epoch's, beside the triple
+    (`pack_hash_mismatches`): a candidate that differs from the epoch in a hash
+    the epoch holds does not equal it, so it is a cutover of its own and never
+    a settings change. An epoch that holds no hash compares the triple only.
+    The two values are compared and not stored: `BacklogStore.begin_cutover`
+    takes no pack hash, so the candidate row holds none.
 
     Two candidates need the active epoch bound, because what decides their
     rows is a comparison with its identity. A settings change while it is
@@ -162,22 +185,32 @@ def begin_cutover(
             "promote or abandon it first"
         )
     model_hash = compose_epoch_model_hash(bare_model_hash, embedding_model_name)
-    same_triple = (ontology_version, extraction_version, model_hash) == (
-        epoch.ontology_version,
-        epoch.extraction_version,
-        epoch.model_hash,
-    )
-    if same_triple and not settings_change:
+    candidate_pack = PackHashes(pack_prompt_hash=pack_prompt_hash, pack_rails_hash=pack_rails_hash)
+    differing_hashes = pack_hash_mismatches(epoch, candidate_pack)
+    # "The same stamps": the triple, and each pack hash the active epoch holds.
+    same_stamps = (
+        (ontology_version, extraction_version, model_hash)
+        == (epoch.ontology_version, epoch.extraction_version, epoch.model_hash)
+    ) and not differing_hashes
+    if same_stamps and not settings_change:
         raise CutoverRefusedError(
             f"the candidate stamps equal the active epoch {epoch.epoch_id}'s; nothing to cut "
             "over. A change of serving or dispatch settings alone is cut over with "
             "--settings-change"
         )
-    if settings_change and not same_triple:
+    if settings_change and not same_stamps:
+        pack_detail = ""
+        if differing_hashes:
+            pack_detail = (
+                f"; the epoch's ontology pack is "
+                f"({describe_pack_hashes(epoch, differing_hashes)}) and the candidate's is "
+                f"({describe_pack_hashes(candidate_pack, differing_hashes)})"
+            )
         raise CutoverRefusedError(
             f"--settings-change keeps the active epoch {epoch.epoch_id}'s stamps "
             f"(ontology_version={epoch.ontology_version}, "
-            f"extraction_version={epoch.extraction_version}, model_hash={epoch.model_hash}); "
+            f"extraction_version={epoch.extraction_version}, model_hash={epoch.model_hash})"
+            f"{pack_detail}; "
             "this candidate's differ, so it is a cutover of its own: omit the flag"
         )
     if settings_change and not epoch.bound and not refill:
@@ -187,7 +220,7 @@ def begin_cutover(
             "re-extract the log anyway"
         )
     ontology_only = (
-        not same_triple
+        not same_stamps
         and extraction_version == epoch.extraction_version
         and model_hash == epoch.model_hash
     )
@@ -1076,13 +1109,63 @@ def format_report(report: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def candidate_pack_refusal(cutover: Cutover, pack: CarriesPackHashes) -> str | None:
+    """Why `pack` may not rebuild the candidate's staging graph, or None when it may.
+
+    The rebuild runs `pack`'s rails over the candidate's cached rows and stamps
+    the staging edges with `pack`'s hashes, so a pack whose hashes differ from
+    the candidate's would build a graph the candidate's stamps do not describe.
+    A candidate that holds no hash is not compared (`pack_hash_mismatches`).
+
+    Args:
+        cutover: The candidate.
+        pack: The pack the rebuild would run: anything with `pack_prompt_hash`
+            and `pack_rails_hash`.
+    """
+    differing = pack_hash_mismatches(cutover, pack)
+    if not differing:
+        return None
+    return (
+        f"cutover {cutover.cutover_id} was begun under the ontology pack "
+        f"({describe_pack_hashes(cutover, differing)}), but this environment's active pack "
+        f"is ({describe_pack_hashes(pack, differing)}); run the rebuild from the code whose "
+        "pack the candidate names, or abandon and begin again"
+    )
+
+
+def replay_pack_consumers(
+    pack: Pack, *, min_confidence: float
+) -> tuple[EntityNormalizer, ExtractionValidator]:
+    """The rebuild's normalizer and validator, both over `pack`.
+
+    One pack for both, and the one `candidate_pack_refusal` compared: the
+    rails that run and the types that validate are the pack whose hashes the
+    staging edges are stamped with.
+
+    Returns:
+        `(EntityNormalizer, ExtractionValidator)`.
+    """
+    from backend.knowledge.extraction.normalizer import EntityNormalizer
+    from backend.knowledge.extraction.validator import ExtractionValidator
+
+    return (
+        EntityNormalizer(embedding_generator=None, executor=None, pack=pack),
+        ExtractionValidator(min_confidence=min_confidence, pack=pack),
+    )
+
+
 def build_rebuild_deps_from_env(
     store: BacklogStore, staging_uri: str, cutover: Cutover
 ) -> RebuildDeps:
     """Wire the real staging rebuild, as `scripts/mist_admin.py::_build_log_regenerator` does.
 
     Same construction, from the same backend factories (nothing is imported
-    from `scripts/`), with two deliberate differences:
+    from `scripts/`), with these deliberate differences:
+
+    - the replay's normalizer and validator, and the curation pipeline's
+      stamps, are built over one `registry.active_pack()`, which is refused
+      first if its hashes differ from those the candidate holds
+      (`candidate_pack_refusal`);
 
     - the curation pipeline is built from a config whose stamps are the
       CANDIDATE's (`dataclasses.replace` of `ontology_version`,
@@ -1097,7 +1180,8 @@ def build_rebuild_deps_from_env(
     `assert_rebuild_target_not_live` runs before any connection is opened.
 
     Raises:
-        CutoverRefusedError: The composed candidate hash no longer matches.
+        CutoverRefusedError: The composed candidate hash no longer matches, or
+            the active pack's hashes differ from the candidate's.
         RebuildTargetError: The staging URI is not an allowlisted staging
             endpoint, or resolves to live.
     """
@@ -1110,9 +1194,8 @@ def build_rebuild_deps_from_env(
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
     from backend.knowledge.extraction.confidence import ConfidenceScorer
-    from backend.knowledge.extraction.normalizer import EntityNormalizer
     from backend.knowledge.extraction.temporal import TemporalResolver
-    from backend.knowledge.extraction.validator import ExtractionValidator
+    from backend.knowledge.ontologies import registry
     from backend.knowledge.regeneration.log_regenerator import LogRegenerator
     from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
     from backend.knowledge.regeneration.staging_seeder import StagingSeeder
@@ -1135,6 +1218,10 @@ def build_rebuild_deps_from_env(
             f"environment composes {compose_model_hash(candidate_config)!r} (the embedding "
             "model changed since `cutover begin`); abandon and begin again"
         )
+    pack = registry.active_pack()
+    pack_refusal = candidate_pack_refusal(cutover, pack)
+    if pack_refusal is not None:
+        raise CutoverRefusedError(pack_refusal)
 
     live_uri = config.neo4j.uri
     assert_rebuild_target_not_live(staging_uri, live_uri)
@@ -1160,7 +1247,13 @@ def build_rebuild_deps_from_env(
             connection=staging_conn, embedding_generator=embedding_provider
         ).initialize_schema()
         pipeline = build_curation_pipeline(
-            candidate_config, GraphExecutor(staging_conn), embedding_provider=embedding_provider
+            candidate_config,
+            GraphExecutor(staging_conn),
+            embedding_provider=embedding_provider,
+            pack=pack,
+        )
+        normalizer, validator = replay_pack_consumers(
+            pack, min_confidence=config.extraction.min_extraction_confidence
         )
         return LogRegenerator(
             event_store=store.event_store,
@@ -1168,10 +1261,8 @@ def build_rebuild_deps_from_env(
             staging_curation_pipeline=pipeline,
             confidence_scorer=ConfidenceScorer(),
             temporal_resolver=TemporalResolver(),
-            normalizer=EntityNormalizer(embedding_generator=None, executor=None),
-            validator=ExtractionValidator(
-                min_confidence=config.extraction.min_extraction_confidence
-            ),
+            normalizer=normalizer,
+            validator=validator,
             journal=NullRebuildJournal(),
             staging_seeder=StagingSeeder(
                 connection=staging_conn,

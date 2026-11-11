@@ -224,7 +224,9 @@ class _PassThroughResolver:
 
 
 class _PassThroughNormalizer:
-    async def normalize(self, extraction):
+    async def normalize(self, extraction, **_rail_inputs):
+        # The replay passes a row's batch record and turn plan as keywords
+        # (`rail_inputs`); a pass-through has no rails to hand them to.
         return extraction
 
 

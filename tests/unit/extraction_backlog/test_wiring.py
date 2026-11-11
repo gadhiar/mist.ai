@@ -219,6 +219,7 @@ class TestFactory:
     def test_writer_stamps_are_the_ones_the_curation_graph_writer_stamps_with(self):
         from backend.factories import build_curation_pipeline, build_extraction_dispatcher
         from backend.knowledge.curation.graph_writer import RebuildStamps
+        from backend.knowledge.ontologies import registry
         from backend.knowledge.version_stamps import compose_model_hash
         from tests.mocks.neo4j import FakeGraphExecutor
         from tests.unit.extraction_backlog.conftest import _build_world
@@ -243,11 +244,16 @@ class TestFactory:
         )
 
         writer = dispatcher._writer_stamps
+        pack = registry.active_pack()
         assert writer == RebuildStamps(
             ontology_version="7.7.7",
             extraction_version="wiring-ev",
             model_hash=compose_model_hash(config),
+            pack_prompt_hash=pack.pack_prompt_hash,
+            pack_rails_hash=pack.pack_rails_hash,
         )
+        assert writer.pack_prompt_hash is not None
+        assert writer.pack_rails_hash is not None
         assert writer.model_hash == "wiring-model|emb:wiring-emb"
         assert writer == curation._graph_writer._rebuild_stamps
         assert writer == curation._engine._stamps

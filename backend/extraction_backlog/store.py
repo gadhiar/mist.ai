@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from backend.event_store.store import EventStore
 from backend.knowledge.extraction_cache import (
@@ -74,6 +74,62 @@ def compose_epoch_model_hash(bare_model_hash: str, embedding_model_name: str) ->
     )
 
 
+# The ontology pack's two hashes, by the name every carrier gives them: the
+# service's stamps and `/v1/info` (`ResultStamps`, `InfoResponse`), an epoch, a
+# cutover candidate, the writer's `RebuildStamps`, and the `Pack` itself.
+# `pack_prompt_hash` covers what the pack feeds the model, `pack_rails_hash`
+# what runs on a payload after it.
+PACK_HASH_FIELDS: tuple[str, ...] = ("pack_prompt_hash", "pack_rails_hash")
+
+
+class CarriesPackHashes(Protocol):
+    """Anything with the two pack hash attributes."""
+
+    @property
+    def pack_prompt_hash(self) -> str | None:
+        """Hash over what the pack feeds the model; None when not recorded."""
+
+    @property
+    def pack_rails_hash(self) -> str | None:
+        """Hash over the pack's rules for a payload; None when not recorded."""
+
+
+@dataclass(frozen=True, slots=True)
+class PackHashes:
+    """The two pack hashes on their own, for a caller that has no other carrier."""
+
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
+
+
+def pack_hash_mismatches(stored: CarriesPackHashes, offered: CarriesPackHashes) -> tuple[str, ...]:
+    """The pack hashes `stored` holds that `offered` does not equal, by field name.
+
+    The one comparison every identity check makes. `stored` is an epoch or a
+    cutover candidate; `offered` is what would be applied or written under it:
+    a service's stamps, a backend writer's stamps, a pack.
+
+    A hash `stored` holds as None is not compared: the target was created
+    before pack hashes were recorded, and nothing says which pack it ran
+    under. A hash it does hold must be equalled, so an `offered` that holds
+    another value, or None, is a mismatch.
+
+    Returns:
+        The names in `PACK_HASH_FIELDS` order; empty when `offered` may be
+        used under `stored`.
+    """
+    return tuple(
+        name
+        for name in PACK_HASH_FIELDS
+        if getattr(stored, name) is not None and getattr(offered, name) != getattr(stored, name)
+    )
+
+
+def describe_pack_hashes(carrier: CarriesPackHashes, names: tuple[str, ...]) -> str:
+    """`name='value'` for each of `names`, for a refusal that says which hash differs."""
+    return ", ".join(f"{name}={getattr(carrier, name)!r}" for name in names)
+
+
 @dataclass(frozen=True, slots=True)
 class Epoch:
     """The stamp triple the backlog reads and writes the cache under.
@@ -88,6 +144,9 @@ class Epoch:
     `identity_namespace` is the cache namespace every cache call for this
     target uses; None is the 3-part namespace, which is also what an unbound
     target reads and writes.
+
+    The two pack hashes are stamps beside the triple. None is a target whose
+    row holds none: that hash is not compared (`pack_hash_mismatches`).
     """
 
     epoch_id: int
@@ -99,6 +158,8 @@ class Epoch:
     dispatch_identity: str | None = None
     identity_namespace: str | None = None
     identity_source: str | None = None
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
 
     @property
     def label(self) -> str:
@@ -114,7 +175,11 @@ class Epoch:
 
     @classmethod
     def from_row(cls, row: dict[str, Any], binding: dict[str, Any] | None = None) -> Epoch:
-        """Build from an `epoch_ledger` row dict and its `epoch_identity` row, if any."""
+        """Build from an `epoch_ledger` row dict and its `epoch_identity` row, if any.
+
+        The pack hashes are read from the ledger row when it has the keys. A
+        row without them, or with NULL there, gives None.
+        """
         return cls(
             epoch_id=int(row["epoch_id"]),
             ontology_version=str(row["ontology_version"]),
@@ -124,6 +189,8 @@ class Epoch:
             dispatch_identity=None if binding is None else binding["dispatch_identity"],
             identity_namespace=None if binding is None else binding["identity_namespace"],
             identity_source=None if binding is None else binding["source"],
+            pack_prompt_hash=row.get("pack_prompt_hash"),
+            pack_rails_hash=row.get("pack_rails_hash"),
         )
 
 
@@ -148,6 +215,8 @@ class Cutover:
     dispatch_identity: str | None = None
     identity_namespace: str | None = None
     identity_source: str | None = None
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
 
     @property
     def bound(self) -> bool:
@@ -167,6 +236,8 @@ class Cutover:
             dispatch_identity=self.dispatch_identity,
             identity_namespace=self.identity_namespace,
             identity_source=self.identity_source,
+            pack_prompt_hash=self.pack_prompt_hash,
+            pack_rails_hash=self.pack_rails_hash,
         )
 
     def epoch_dict(self) -> dict[str, Any]:
@@ -189,7 +260,11 @@ class Cutover:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> Cutover:
-        """Build from an `epoch_cutover` row dict."""
+        """Build from an `epoch_cutover` row dict.
+
+        The pack hashes are read from the row when it has the keys. A row
+        without them, or with NULL there, gives None.
+        """
         report = row.get("check_report")
         return cls(
             cutover_id=int(row["cutover_id"]),
@@ -213,6 +288,8 @@ class Cutover:
             dispatch_identity=row.get("dispatch_identity"),
             identity_namespace=row.get("identity_namespace"),
             identity_source=row.get("binding_source"),
+            pack_prompt_hash=row.get("pack_prompt_hash"),
+            pack_rails_hash=row.get("pack_rails_hash"),
         )
 
 
@@ -646,8 +723,15 @@ class BacklogStore:
         scope_confidence: float | None,
         derivation: dict[str, Any] | None,
         service_stamps: dict[str, Any] | None,
+        batch_record: list[dict[str, Any]] | None = None,
+        turn_plan: dict[str, Any] | None = None,
     ) -> None:
-        """Record the service's raw Stage-2 result (and Stage 9 ops) under the epoch."""
+        """Record the service's raw Stage-2 result (and Stage 9 ops) under the epoch.
+
+        `batch_record` and `turn_plan` are the reply's rail inputs, stored
+        beside the payload for the replay to read; None when the reply had
+        none.
+        """
         self._cache.put(
             event_id,
             epoch.ontology_version,
@@ -662,6 +746,8 @@ class BacklogStore:
             derivation=derivation,
             service_stamps=service_stamps,
             identity_namespace=epoch.identity_namespace,
+            batch_record=batch_record,
+            turn_plan=turn_plan,
         )
 
     def progress(self, turn: PendingTurn, epoch: Epoch, *, now_iso) -> TurnProgress:

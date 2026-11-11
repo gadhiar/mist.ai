@@ -94,7 +94,9 @@ class _RecordingNormalizer:
     def __init__(self, sink: list[str]) -> None:
         self._sink = sink
 
-    async def normalize(self, extraction: Any) -> Any:
+    async def normalize(self, extraction: Any, **_rail_inputs: Any) -> Any:
+        # The replay passes a row's batch record and turn plan as keywords
+        # (`rail_inputs`); the recorder observes the call, not what it carried.
         self._sink.append("normalize")
         return extraction
 

@@ -152,6 +152,7 @@ from backend.extraction_contract.models import (
     HistoryMessage,
     InfoResponse,
     LastJob,
+    ResultStamps,
     ServiceStatus,
     is_compatible,
 )
@@ -183,6 +184,8 @@ from .store import (
     PendingTurn,
     age_ms,
     compose_epoch_model_hash,
+    describe_pack_hashes,
+    pack_hash_mismatches,
 )
 
 logger = logging.getLogger(__name__)
@@ -696,14 +699,30 @@ class ExtractionDispatcher:
     # ------------------------------------------------------------------
 
     def _writer_stamp_mismatch(self, epoch: Epoch) -> str | None:
-        """None when the writer stamps equal `epoch`'s on all three fields, else why not."""
+        """None when the writer stamps may write under `epoch`, else why not.
+
+        The triple must be equal on all three fields. Each pack hash `epoch`
+        holds must be equalled too (`pack_hash_mismatches`): the writer stamps
+        its edges with its own pack's hashes and runs that pack's rails, so a
+        backend on another pack would apply under an epoch that names different
+        rules. An epoch that holds no hash compares the triple only.
+        """
         writer = self._writer_stamps
         if (
             writer.ontology_version == epoch.ontology_version
             and writer.extraction_version == epoch.extraction_version
             and writer.model_hash == epoch.model_hash
         ):
-            return None
+            differing = pack_hash_mismatches(epoch, writer)
+            if not differing:
+                return None
+            return (
+                f"backend ontology pack ({describe_pack_hashes(writer, differing)}) != "
+                f"{epoch.label} ({describe_pack_hashes(epoch, differing)}); nothing is "
+                "applied or dispatched until they match. Deploy the code whose ontology "
+                "pack the epoch names, or cut over to a new epoch for this pack, then "
+                "restart the backend"
+            )
         return (
             f"backend writer stamps (ontology_version={writer.ontology_version!r}, "
             f"extraction_version={writer.extraction_version!r}, "
@@ -718,10 +737,33 @@ class ExtractionDispatcher:
     def _composed(self, bare_model_hash: str) -> str:
         return compose_epoch_model_hash(bare_model_hash, self._embedding_model_name)
 
-    def _epoch_matches(self, extraction_version: str, bare_model_hash: str, epoch: Epoch) -> bool:
+    def _epoch_matches(self, reported: InfoResponse | ResultStamps, epoch: Epoch) -> bool:
+        """True when what a service reports may be cached and applied under `epoch`.
+
+        `reported` is `/v1/info` or a reply's stamps. Its extraction version
+        and composed model hash must equal the epoch's, and so must each pack
+        hash the epoch holds (`pack_hash_mismatches`): a result extracted
+        under another pack is not this epoch's. An epoch that holds no hash
+        compares the version and the model only.
+        """
         return (
-            extraction_version == epoch.extraction_version
-            and self._composed(bare_model_hash) == epoch.model_hash
+            reported.extraction_version == epoch.extraction_version
+            and self._composed(reported.model_hash) == epoch.model_hash
+            and not pack_hash_mismatches(epoch, reported)
+        )
+
+    def _epoch_mismatch_detail(self, reported: InfoResponse | ResultStamps, epoch: Epoch) -> str:
+        """The pack hashes in which `reported` differs from `epoch`, as a reason suffix.
+
+        Empty when no pack hash differs, so a mismatch of the version or the
+        model reads as it did before the hashes were compared.
+        """
+        differing = pack_hash_mismatches(epoch, reported)
+        if not differing:
+            return ""
+        return (
+            f"; service pack ({describe_pack_hashes(reported, differing)}) != "
+            f"{epoch.label}'s ({describe_pack_hashes(epoch, differing)})"
         )
 
     async def _check_service(self, epoch: Epoch, *, binding: bool = False) -> InfoResponse | _Wait:
@@ -770,7 +812,7 @@ class ExtractionDispatcher:
                 ),
             )
             return _Wait(self._settings.stall_recheck_s, True)
-        if not self._epoch_matches(info.extraction_version, info.model_hash, epoch):
+        if not self._epoch_matches(info, epoch):
             self._set_state(
                 STATE_EPOCH_MISMATCH,
                 reason=(
@@ -778,6 +820,7 @@ class ExtractionDispatcher:
                     f"model_hash={self._composed(info.model_hash)!r}) != "
                     f"{epoch.label} (extraction_version={epoch.extraction_version!r}, "
                     f"model_hash={epoch.model_hash!r})"
+                    f"{self._epoch_mismatch_detail(info, epoch)}"
                 ),
             )
             return _Wait(self._settings.stall_recheck_s, True)
@@ -1050,6 +1093,18 @@ class ExtractionDispatcher:
                 "serving_identity": epoch.serving_identity,
                 "dispatch_identity": self._dispatch_id.identity,
             },
+            # The rail inputs, in the shape the contract model dumps: a rail
+            # reads the cached row and the pack, so what the service recorded
+            # about the turn's Stage 2 calls and its plan call is stored with
+            # the payload. None when the reply carried none.
+            batch_record=(
+                None
+                if response.batch_record is None
+                else [entry.model_dump(mode="json") for entry in response.batch_record]
+            ),
+            turn_plan=(
+                None if response.turn_plan is None else response.turn_plan.model_dump(mode="json")
+            ),
         )
         self._store.record_attempt(
             turn=head,
@@ -1107,10 +1162,11 @@ class ExtractionDispatcher:
                 f"reply contract_version {response.contract_version!r} is incompatible"
             )
         stamps = response.stamps
-        if not self._epoch_matches(stamps.extraction_version, stamps.model_hash, epoch):
+        if not self._epoch_matches(stamps, epoch):
             raise InferenceServiceError(
                 f"reply stamps (extraction_version={stamps.extraction_version!r}, "
-                f"model_hash={stamps.model_hash!r}) do not match {epoch.label}",
+                f"model_hash={stamps.model_hash!r}) do not match {epoch.label}"
+                f"{self._epoch_mismatch_detail(stamps, epoch)}",
                 code=ErrorCode.EPOCH_MISMATCH,
                 retryable=False,
                 http_status=200,

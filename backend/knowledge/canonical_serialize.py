@@ -43,7 +43,24 @@ AUDIT_FIELDS = frozenset(
 # over a difference that says nothing about whether the FACTS were reproduced.
 # The proof is deliberately "same log + same epoch => same facts", not
 # "same stamps".
-EPOCH_STAMP_FIELDS = frozenset({"ontology_version", "extraction_version", "model_hash"})
+#
+# `pack_prompt_hash` and `pack_rails_hash` are stamps of the same kind: the
+# hashes of the ontology pack active when an edge was written
+# (`curation/graph_writer.py::RebuildStamps`). A rebuild under a pack whose rails
+# changed re-stamps every edge with the new `pack_rails_hash`, and an edge written
+# before the hashes existed holds neither, so comparing them would fail
+# `live == rebuilt` on stamps alone. What the gate cannot see as a result: which
+# pack wrote an edge. What a different pack does to the facts is still compared,
+# because the facts are.
+EPOCH_STAMP_FIELDS = frozenset(
+    {
+        "ontology_version",
+        "extraction_version",
+        "model_hash",
+        "pack_prompt_hash",
+        "pack_rails_hash",
+    }
+)
 
 # Derived artifacts: reproducible in principle, not compared in practice.
 # `embedding` is large and float-noisy, and excluding it has a documented cost
