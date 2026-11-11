@@ -8,6 +8,8 @@ immediate, visible test failures.
 from __future__ import annotations
 
 import ast
+import copy
+import dataclasses
 import hashlib
 import subprocess
 import sys
@@ -15,8 +17,14 @@ from pathlib import Path
 
 import pytest
 
-from backend.knowledge.ontologies import v1_0_0
+from backend.knowledge import version_stamps
+from backend.knowledge.extraction import id_rails, rails
+from backend.knowledge.ontologies import hierarchy, registry, v1_0_0
 from backend.knowledge.ontologies.base import KnowledgeDomain
+from backend.knowledge.ontologies.pack import POST_LLM_PHASES, Pack, load_pack
+from backend.knowledge.ontologies.packs.v1_4_0 import conventions as pack_conventions
+from backend.knowledge.ontologies.packs.v1_4_0 import manifest as pack_manifest
+from backend.knowledge.ontologies.packs.v1_4_0 import plugins as pack_plugins
 from backend.knowledge.ontologies.packs.v1_4_0 import types as pack_types
 from backend.knowledge.ontologies.v1_0_0 import (
     ALL_EDGE_TYPES,
@@ -45,7 +53,7 @@ class TestEntityTypes:
         # Strategy, DataStructure as EXTERNAL extractable types.
         # v1.4.0 (2026-06-14): Topic and Milestone retired; Abstraction supertype
         # added. Net change: -2 retired, +1 Abstraction = -1 total (31 -> 30).
-        assert len(ALL_NODE_TYPES) == 30
+        assert len(ALL_NODE_TYPES) == pack_manifest.NODE_TYPE_COUNT
 
     @pytest.mark.parametrize(
         "type_name",
@@ -167,7 +175,7 @@ class TestEntityTypes:
 
         extractable_set = set(EXTRACTABLE_NODE_TYPES)
 
-        assert len(EXTRACTABLE_NODE_TYPES) == 21
+        assert len(EXTRACTABLE_NODE_TYPES) == pack_manifest.EXTRACTABLE_NODE_TYPE_COUNT
         assert extractable_set == expected
 
 
@@ -189,7 +197,7 @@ class TestRelationshipTypes:
         # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF.
         # v1.3.0 additive (2026-06-13) added 2 user-centric edges: RECOMMENDS,
         # HAS_HABIT.
-        assert len(ALL_EDGE_TYPES) == 51
+        assert len(ALL_EDGE_TYPES) == pack_manifest.EDGE_TYPE_COUNT
 
     def test_extractable_relationships_count(self):
         # 13 user-centric + 8 original structural (excludes LEARNED_FROM, ABOUT,
@@ -200,7 +208,7 @@ class TestRelationshipTypes:
         # (MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES,
         # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF) + 2 v1.3.0 additive
         # user-centric (RECOMMENDS, HAS_HABIT).
-        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 39
+        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == pack_manifest.EXTRACTABLE_EDGE_TYPE_COUNT
 
     @pytest.mark.parametrize(
         "type_name",
@@ -519,6 +527,9 @@ class TestThePackImportsWithNoCycle:
             "backend.knowledge.ontologies.registry",
             "backend.knowledge.extraction.id_rails",
             _PACK_TYPES,
+            f"{_PACK_PACKAGE}.manifest",
+            f"{_PACK_PACKAGE}.conventions",
+            f"{_PACK_PACKAGE}.plugins",
         ],
     )
     def test_a_fresh_interpreter_imports_the_chain_from_any_end(self, first: str):
@@ -529,7 +540,8 @@ class TestThePackImportsWithNoCycle:
             f"from {_PACK_PACKAGE} import types\n"
             "assert v1_0_0.ONTOLOGY_V1_0_0 is types.ONTOLOGY_V1_0_0\n"
             "assert version_stamps.ONTOLOGY_VERSION is types.ONTOLOGY_V1_0_0.version\n"
-            "assert pack.load_pack\n"
+            f"built = pack.load_pack('{_PACK_PACKAGE}')\n"
+            "assert built.version == version_stamps.ONTOLOGY_VERSION\n"
         )
 
         done = subprocess.run(
@@ -646,3 +658,225 @@ class TestTheGuideIsSplitBetweenTheGoldSetsAndThePack:
     def test_the_goal_line_of_the_list_rules_is_the_packs(self):
         assert _GOAL_LIST_LINE in _lines(_PACK_GUIDE)
         assert _GOAL_LIST_LINE not in _lines(_GUIDE)
+
+
+# ---------------------------------------------------------------------------
+# The pack built from its files is the pack the registry's adapter builds
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def file_pack() -> Pack:
+    """The v1.4.0 pack as the loader builds it from the pack's files."""
+    return load_pack(_PACK_PACKAGE)
+
+
+@pytest.fixture(scope="module")
+def adapter_pack() -> Pack:
+    """The pack the registry builds from the modules that held the ontology before."""
+    return registry.get_pack(ONTOLOGY_V1_0_0.version)
+
+
+def _identity(rule) -> tuple:
+    """What a rule does: everything the rails hash reads of it, so not its pinned case."""
+    return (rule.id, rule.kind, rule.phase, rule.params, rule.prompt_rule)
+
+
+def _without_cases(pack: Pack, *, dropped: str | None = None) -> Pack:
+    """`pack` with no pinned case, and without the rule `dropped` when one is named."""
+    rules = tuple(
+        dataclasses.replace(rule, pinned_case=None) for rule in pack.rules if rule.id != dropped
+    )
+    return dataclasses.replace(pack, rules=rules)
+
+
+def _run_case(case, pack: Pack) -> tuple[list[dict], list[dict]]:
+    row = rails.rail_row(
+        copy.deepcopy(list(case.entities)),
+        copy.deepcopy(list(case.relationships)),
+        scope=case.scope,
+        batch_record=copy.deepcopy(case.batch_record),
+        turn_plan=copy.deepcopy(case.turn_plan),
+    )
+    return rails.run_rails(row, pack)
+
+
+class TestThePackHasTheAdaptersIdentity:
+    """Moving the ontology into files changes nothing a stored id or a prompt depends on."""
+
+    def test_both_hashes_are_the_release_lines(self, file_pack: Pack):
+        release = version_stamps.PACK_RELEASE
+
+        assert file_pack.version == release.pack_version
+        assert file_pack.pack_prompt_hash == release.pack_prompt_hash
+        assert file_pack.pack_rails_hash == release.pack_rails_hash
+
+    def test_the_types_are_the_adapters(self, file_pack: Pack, adapter_pack: Pack):
+        assert file_pack.node_types == adapter_pack.node_types
+        assert file_pack.edge_types == adapter_pack.edge_types
+        assert file_pack.edge_types == tuple(ALL_EDGE_TYPES)
+        assert file_pack.extractable_node_types == adapter_pack.extractable_node_types
+        assert file_pack.extractable_edge_types == adapter_pack.extractable_edge_types
+
+    def test_the_pair_table_the_prompt_and_the_schema_are_the_adapters(
+        self, file_pack: Pack, adapter_pack: Pack
+    ):
+        assert file_pack.pair_table == adapter_pack.pair_table
+        assert file_pack.system_prompt == adapter_pack.system_prompt
+        assert file_pack.extraction_schema == adapter_pack.extraction_schema
+
+    def test_the_rules_are_the_adapters_in_the_adapters_order(
+        self, file_pack: Pack, adapter_pack: Pack
+    ):
+        assert [_identity(rule) for rule in file_pack.rules] == [
+            _identity(rule) for rule in adapter_pack.rules
+        ]
+
+    def test_the_manifest_is_the_adapters(self, file_pack: Pack, adapter_pack: Pack):
+        assert file_pack.manifest == adapter_pack.manifest
+
+    def test_the_plug_ins_are_the_adapters_functions(self, file_pack: Pack, adapter_pack: Pack):
+        assert [(plugin.name, plugin.phase) for plugin in file_pack.plugins] == [
+            (plugin.name, plugin.phase) for plugin in adapter_pack.plugins
+        ]
+        for mine, theirs in zip(file_pack.plugins, adapter_pack.plugins, strict=True):
+            assert mine.fn is theirs.fn
+
+    def test_the_pack_adds_no_prompt_fragment(self, file_pack: Pack):
+        assert file_pack.rules_of("prompt_fragment") == ()
+
+    def test_the_loader_reads_the_packs_own_files(self, file_pack: Pack):
+        assert file_pack.manifest is pack_manifest.MANIFEST
+        assert file_pack.rules == pack_conventions.RULES
+        assert file_pack.plugins == pack_plugins.PLUGINS
+        assert file_pack.labelling == _PACK_GUIDE.read_text(encoding="utf-8")
+
+
+class TestThePackStatesWhatTheOldModulesHold:
+    """The pack states its data itself, equal to the modules that still hold a copy.
+
+    While the two are equal, removing the modules' copy is a deletion.
+    """
+
+    def test_the_alias_vocabularies(self):
+        assert tuple(id_rails.STATIC_ALIASES.items()) == pack_conventions.STATIC_ALIASES
+        assert tuple(id_rails.PRE_CANON_ALIASES.items()) == pack_conventions.PRE_CANON_ALIASES
+
+    def test_the_reserved_names(self):
+        identity = (pack_conventions.RESERVED_ID, pack_types.MIST_IDENTITY.type_name)
+
+        assert tuple(id_rails.RESERVED_NAMES) == pack_conventions.RESERVED_NAMES
+        assert set(id_rails.RESERVED_NAMES.values()) == {identity}
+
+    def test_the_types_the_id_rail_leaves_alone(self):
+        assert id_rails.ID_EXEMPT_TYPES == pack_conventions.ID_EXEMPT_TYPES
+
+    def test_the_retired_types_and_what_they_gain(self):
+        retired = pack_manifest.MANIFEST.retired_types
+
+        assert {r.name: r.replacement for r in retired} == hierarchy.RETIRED_TYPE_MAP
+        assert [r.name for r in retired] == list(hierarchy.RETIRED_TYPE_MAP)
+        assert {r.name: r.property_defaults for r in retired} == id_rails.RETIRED_PROPERTY_DEFAULTS
+
+    def test_the_supertype_the_fallback_and_the_user_anchor(self):
+        manifest = pack_manifest.MANIFEST
+
+        assert manifest.supertypes == tuple(hierarchy.ANCHOR_CHILD.items())
+        assert manifest.fallback_type == id_rails.FALLBACK_TYPE
+        assert manifest.user_id == id_rails.USER_ID
+
+
+class TestThePacksCounts:
+    """The four counts are stated once, in the manifest module, and hold for the pack."""
+
+    def test_the_counts_are_the_packs_lists(self, file_pack: Pack):
+        assert len(file_pack.node_types) == pack_manifest.NODE_TYPE_COUNT
+        assert len(file_pack.extractable_node_types) == pack_manifest.EXTRACTABLE_NODE_TYPE_COUNT
+        assert len(file_pack.edge_types) == pack_manifest.EDGE_TYPE_COUNT
+        assert len(file_pack.extractable_edge_types) == pack_manifest.EXTRACTABLE_EDGE_TYPE_COUNT
+
+
+_POST_LLM_RULES = [rule.id for rule in pack_conventions.RULES if rule.phase in POST_LLM_PHASES]
+
+
+class TestThePinnedCases:
+    """Each rule the rails run holds a row and the payload the pack turns it into."""
+
+    def test_every_rule_the_rails_run_has_a_case(self):
+        assert len(_POST_LLM_RULES) == 7
+        assert [
+            rule.id
+            for rule in pack_conventions.RULES
+            if rule.id in _POST_LLM_RULES and rule.pinned_case is None
+        ] == []
+
+    def test_every_case_holds(self, file_pack: Pack):
+        assert rails.check_pinned_cases(file_pack) == []
+
+    @pytest.mark.parametrize("rule_id", _POST_LLM_RULES)
+    def test_the_adapter_gives_the_same_payload(self, rule_id: str, adapter_pack: Pack):
+        case = next(rule.pinned_case for rule in pack_conventions.RULES if rule.id == rule_id)
+
+        entities, relationships = _run_case(case, adapter_pack)
+
+        assert entities == list(case.expected_entities)
+        assert relationships == list(case.expected_relationships)
+
+    @pytest.mark.parametrize("rule_id", _POST_LLM_RULES)
+    def test_a_case_needs_its_rule(self, rule_id: str, file_pack: Pack):
+        # A case its rule does not change would hold with the rule gone, and pin nothing.
+        case = next(rule.pinned_case for rule in pack_conventions.RULES if rule.id == rule_id)
+
+        with_rule = _run_case(case, _without_cases(file_pack))
+        without_rule = _run_case(case, _without_cases(file_pack, dropped=rule_id))
+
+        assert with_rule == (list(case.expected_entities), list(case.expected_relationships))
+        assert without_rule != with_rule
+
+    @pytest.mark.parametrize("rule_id", _POST_LLM_RULES)
+    def test_every_edge_a_case_expects_is_one_the_pack_allows(self, rule_id: str, file_pack: Pack):
+        case = next(rule.pinned_case for rule in pack_conventions.RULES if rule.id == rule_id)
+        types = {entity["id"]: entity["type"] for entity in case.expected_entities}
+
+        refused = []
+        for edge in case.expected_relationships:
+            sources, targets = file_pack.pair_table[edge["type"]]
+            source, target = types[edge["source"]], types[edge["target"]]
+            if (sources is not None and source not in sources) or (
+                targets is not None and target not in targets
+            ):
+                refused.append((source, edge["type"], target))
+        assert refused == []
+
+    def test_the_tuning_runs_payloads_are_among_the_cases(self):
+        # Three cases are payloads the service wrote for dev-lists probes: the tag of
+        # each probe is named beside the rule its payload pins.
+        assert sorted(pack_conventions.CASES_FROM_THE_TUNING_RUN) == [
+            "event-date",
+            "metric-id",
+            "static-aliases",
+        ]
+        assert set(pack_conventions.CASES_FROM_THE_TUNING_RUN) <= set(_POST_LLM_RULES)
+        for tag in pack_conventions.CASES_FROM_THE_TUNING_RUN.values():
+            assert tag.startswith("dvl-")
+
+    def test_one_case_carries_what_the_manifest_states_without_a_rule(self):
+        # A retired type, an unknown type and the user anchor are manifest data, so no
+        # rule of their own can hold a case for them: the first id rule's case does.
+        case = pack_conventions.RULES[1].pinned_case
+        manifest = pack_manifest.MANIFEST
+        written = [entity["type"] for entity in case.entities]
+        stored = {entity["id"]: entity for entity in case.expected_entities}
+
+        assert [r.name for r in manifest.retired_types if r.name not in written] == []
+        assert [t for t in written if t not in pack_types.ALL_NODE_TYPE_NAMES] == [
+            "Milestone",
+            "Topic",
+            "Feeling",
+        ]
+        assert stored["first-release"]["type"] == "Event"
+        assert stored["first-release"]["properties"] == {"event_type": "milestone"}
+        assert stored["release-cadence"]["type"] == "Concept"
+        assert stored["hunch"]["type"] == manifest.fallback_type
+        assert [e["id"] for e in case.entities if e["id"].lower() == manifest.user_id] == ["User"]
+        assert manifest.user_id in stored
