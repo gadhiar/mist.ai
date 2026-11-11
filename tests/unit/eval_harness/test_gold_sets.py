@@ -25,6 +25,7 @@ selection tags and counts only, because no session that tunes extraction may see
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -436,7 +437,9 @@ def test_every_label_row_loads_through_the_gold_loader(path):
 
     probes = iter_gold_probes(path)
 
-    assert len(probes) == len(lines)
+    # Counts in locals: an assert on `len()` of a collection prints the collection's rows.
+    loaded, written = len(probes), len(lines)
+    assert loaded == written
 
 
 @pytest.mark.parametrize("path", _LABEL_PARAMS)
@@ -466,7 +469,8 @@ def test_labels_name_only_extractable_types_and_predicates(path):
             if rel.predicate not in predicates:
                 bad.append((probe.tag, rel.predicate))
 
-    assert _faults_to_report(path, bad) == []
+    faults = _faults_to_report(path, bad)
+    assert faults == []
 
 
 @pytest.mark.parametrize("path", _LABEL_PARAMS)
@@ -481,7 +485,8 @@ def test_label_edges_join_their_own_entities_with_matching_types(path):
             if type_by_id.get(rel.target) != rel.target_type:
                 bad.append((probe.tag, rel.target))
 
-    assert _faults_to_report(path, bad) == []
+    faults = _faults_to_report(path, bad)
+    assert faults == []
 
 
 def _types_allowed(predicate: str, source_type: str, target_type: str) -> bool:
@@ -509,7 +514,8 @@ def test_label_edge_types_are_allowed_for_their_predicate(path):
             if not _types_allowed(rel.predicate, rel.source_type, rel.target_type):
                 bad.append((probe.tag, rel.source_type, rel.predicate, rel.target_type))
 
-    assert _faults_to_report(path, bad) == []
+    faults = _faults_to_report(path, bad)
+    assert faults == []
 
 
 # --- The published dev-list and held-out sets ------------------------------------------------
@@ -606,7 +612,9 @@ def _schema_faults(rows: list[dict]) -> list[tuple]:
 
 @pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
 def test_gold_rows_follow_the_sixty_probe_schema(set_name):
-    assert _schema_faults(_gold_rows(_GOLD_BY_SET[set_name])) == []
+    bad = _schema_faults(_gold_rows(_GOLD_BY_SET[set_name]))
+
+    assert bad == []
 
 
 # The dev gold sets whose ids are pinned as fixed points of the id rails. Held-out's fixed
@@ -1610,7 +1618,9 @@ def test_selection_rows_follow_the_gold_row_schema(path):
 
 @pytest.mark.parametrize("path", _SELECTION_LABEL_FILES, ids=lambda p: p.name)
 def test_selection_optional_gold_keys_are_well_formed(path):
-    assert _optional_key_faults(_gold_rows(path)) == Counter()
+    faults = _optional_key_faults(_gold_rows(path))
+
+    assert faults == Counter()
 
 
 def test_a_selection_pass_holds_every_selection_tag():
@@ -1629,26 +1639,29 @@ def test_selection_tags_follow_the_format_and_number_densely():
 
     malformed = [r["tag"] for r in rows if not _SELECTION_TAG.match(r["tag"])]
     numbers = sorted(int(m.group("num")) for r in rows if (m := _SELECTION_TAG.match(r["tag"])))
+    dense = list(range(1, len(rows) + 1))
 
     assert malformed == []
-    assert numbers == list(range(1, len(rows) + 1))
+    assert numbers == dense
 
 
 def test_selection_has_240_list_probes_and_40_prose_probes():
     shapes = [_selection_shape(r) for r in _selection_rows()]
 
     lists = sum(shape is not None for shape in shapes)
+    prose = len(shapes) - lists
 
-    assert (lists, len(shapes) - lists) == (_SELECTION_LIST_PROBES, _SELECTION_PROSE_PROBES)
+    assert (lists, prose) == (_SELECTION_LIST_PROBES, _SELECTION_PROSE_PROBES)
 
 
 def test_selection_list_shapes_are_six_times_the_dev_lists_split():
     dev = Counter(r["tag"].split("-")[3] for r in _gold_rows(_DEV_GOLD))
 
     shapes = Counter(s for r in _selection_rows() if (s := _selection_shape(r)) is not None)
+    six_times_dev, counted = {shape: 6 * n for shape, n in dev.items()}, dict(shapes)
 
-    assert {shape: 6 * n for shape, n in dev.items()} == _SELECTION_SHAPES
-    assert dict(shapes) == _SELECTION_SHAPES
+    assert six_times_dev == _SELECTION_SHAPES
+    assert counted == _SELECTION_SHAPES
 
 
 def test_selection_prose_slugs_start_with_a_labelling_category():
@@ -1698,9 +1711,12 @@ def test_no_selection_utterance_copies_an_utterance_of_another_set(set_name):
     others = _other_set_utterances()[set_name]
 
     copies = _tags_copying(_selection_rows(), others)
+    # Counts in locals: an assert on `len(others)` would print the other set's utterances.
+    compared, expected = len(others), _SET_SIZES.get(set_name, len(_sixty_rows()))
+    copied = len(copies)
 
-    assert len(others) >= _SET_SIZES.get(set_name, len(_sixty_rows()))
-    assert copies == [], f"{len(copies)} selection probes copy a {set_name} utterance"
+    assert compared >= expected, "the other set's utterances were not all compared"
+    assert copies == [], f"{copied} selection probes copy an utterance of another set"
 
 
 @pytest.mark.parametrize("set_name", _OTHER_SETS)
@@ -1708,18 +1724,21 @@ def test_no_selection_utterance_names_a_person_or_organization_of_another_set(se
     terms = _other_set_people_and_organizations()[set_name]
 
     named = _tags_naming(_selection_rows(), terms)
+    # Counts in locals: an assert on `len(terms)` would print the other set's names.
+    found, naming = len(terms), len(named)
 
-    assert len(terms) >= _OTHER_SET_TERMS_MIN, f"{set_name}: its people were not found"
-    assert named == [], f"{len(named)} selection probes name a {set_name} person or organization"
+    assert found >= _OTHER_SET_TERMS_MIN, "the other set's people and organizations were not found"
+    assert named == [], f"{naming} selection probes name a person or organization of another set"
 
 
 def test_selection_utterances_avoid_entity_names_in_the_production_prompt():
     terms = _prompt_entity_terms()
 
     named = _tags_naming(_selection_rows(), terms)
+    found, naming = len(terms), len(named)
 
-    assert len(terms) > 20, "the prompt's example entities were not found"
-    assert named == [], f"{len(named)} selection probes name an entity of the prompt's examples"
+    assert found > 20, "the prompt's example entities were not found"
+    assert named == [], f"{naming} selection probes name an entity of the prompt's examples"
 
 
 def _selection_tags_with_an_id_in_the_prompt() -> list[str]:
@@ -1737,28 +1756,31 @@ def _selection_tags_with_an_id_in_the_prompt() -> list[str]:
 def test_no_selection_gold_id_occurs_in_the_production_prompt():
     """Binds once the selection gold is filled: an id the prompt spells out scores the prompt."""
     tags = _selection_tags_with_an_id_in_the_prompt()
+    holding = len(tags)
 
-    assert tags == [], f"{len(tags)} selection probes hold a gold id the prompt spells out"
+    assert tags == [], f"{holding} selection probes hold a gold id the prompt spells out"
 
 
 def test_every_selection_prompt_word_exemption_is_still_needed():
-    unused = set(_SELECTION_PROMPT_WORD_EXEMPTIONS) - set(_gold_ids_in_the_prompt(_SELECTION))
+    unused = len(set(_SELECTION_PROMPT_WORD_EXEMPTIONS) - set(_gold_ids_in_the_prompt(_SELECTION)))
 
-    assert len(unused) == 0, f"{len(unused)} selection prompt-word exemptions match no gold id"
+    assert unused == 0, "a selection prompt-word exemption matches no gold id"
 
 
 def test_selection_exemptions_are_never_an_entity_of_the_prompts_examples():
     example_ids = {canonical_id(t) for t in _prompt_entity_terms()}
 
-    lifted = set(_SELECTION_PROMPT_WORD_EXEMPTIONS) & example_ids
+    lifted = len(set(_SELECTION_PROMPT_WORD_EXEMPTIONS) & example_ids)
 
-    assert len(lifted) == 0, f"{len(lifted)} selection exemptions are prompt example entities"
+    assert lifted == 0, "a selection exemption is an entity of the prompt's examples"
 
 
 def test_no_selection_utterance_mentions_raj():
     rows = _selection_rows()
 
-    assert [r["tag"] for r in rows if re.search(r"\braj\b", r["utterance"], re.IGNORECASE)] == []
+    naming = [r["tag"] for r in rows if re.search(r"\braj\b", r["utterance"], re.IGNORECASE)]
+
+    assert naming == []
 
 
 def test_selection_design_has_one_row_per_probe_naming_its_shape_or_category():
@@ -1778,8 +1800,9 @@ def test_selection_design_has_one_row_per_probe_naming_its_shape_or_category():
         or not isinstance(d["persona"], str)
         or not d["persona"]
     ]
+    design_tags, probe_tags = sorted(d.get("tag", "") for d in design), sorted(expected)
 
-    assert sorted(d.get("tag", "") for d in design) == sorted(expected)
+    assert design_tags == probe_tags
     assert stray == []
 
 
@@ -1793,12 +1816,48 @@ def test_every_selection_probe_is_built_to_carry_at_most_fifteen_relations():
         or isinstance(d["intended_relations"], bool)
         or not 0 <= d["intended_relations"] <= _SELECTION_MAX_RELATIONS
     ]
+    designed = len(design)
 
-    assert len(design) == _SELECTION_LIST_PROBES + _SELECTION_PROSE_PROBES
+    assert designed == _SELECTION_LIST_PROBES + _SELECTION_PROSE_PROBES
     assert unbounded == []
 
 
 def test_selection_is_written_from_ten_or_more_personas():
-    personas = {d.get("persona") for d in _gold_rows(_SELECTION_DESIGN)}
+    personas = len({d.get("persona") for d in _gold_rows(_SELECTION_DESIGN)})
 
-    assert len(personas) >= _SELECTION_PERSONAS_MIN
+    assert personas >= _SELECTION_PERSONAS_MIN
+
+
+# The label checks near the top of this file that also run on the selection file and its passes.
+_LABEL_CHECKS_ON_SELECTION = (
+    "test_every_label_row_loads_through_the_gold_loader",
+    "test_label_tags_are_unique_and_name_their_utterance",
+    "test_labels_name_only_extractable_types_and_predicates",
+    "test_label_edges_join_their_own_entities_with_matching_types",
+    "test_label_edge_types_are_allowed_for_their_predicate",
+)
+
+
+def test_no_assert_on_the_selection_set_passes_an_argument_to_a_call():
+    """A failing assert prints the arguments of a call inside it, rows included.
+
+    `assert len(rows) >= n` prints `rows`: selection text, or the text of the set a guard
+    compares it with, held-out included. A check that reads the selection set computes into a
+    local first and asserts on the local.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    calling = sorted(
+        {
+            function.name
+            for function in tree.body
+            if isinstance(function, ast.FunctionDef)
+            and ("selection" in function.name or function.name in _LABEL_CHECKS_ON_SELECTION)
+            for statement in ast.walk(function)
+            if isinstance(statement, ast.Assert)
+            for part in ast.walk(statement.test)
+            if isinstance(part, ast.Call) and (part.args or part.keywords)
+        }
+    )
+
+    assert calling == []
