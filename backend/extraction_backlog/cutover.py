@@ -69,9 +69,10 @@ from .store import (
     BacklogStore,
     CarriesPackHashes,
     Cutover,
-    PackHashes,
+    Stamps,
     compose_epoch_model_hash,
     describe_pack_hashes,
+    has_same_stamps,
     pack_hash_mismatches,
 )
 
@@ -139,38 +140,52 @@ def begin_cutover(
     The candidate's `model_hash` is composed from the bare service hash and the
     backend's embedding model through `compose_model_hash`, never inline.
 
-    A settings change (`settings_change`) keeps the active epoch's stamp
-    triple: what changed is a serving setting the service keys or a backend
-    dispatch setting. Nothing records the flag; a candidate whose triple equals
-    its source's is a settings change, and the dispatcher binds it at its first
-    fill contact (`binding.decide_binding`): rule 1 refuses a service that has
-    not changed, rule 4 or 5a gives it a keyed namespace, and rule 3 gives a
-    return to a configuration that claims the pair its 3-part rows.
-
     `pack_prompt_hash` and `pack_rails_hash` are the candidate's ontology pack
-    hashes. They are compared here with the active epoch's, beside the triple
-    (`pack_hash_mismatches`): a candidate that differs from the epoch in a hash
-    the epoch holds does not equal it, so it is a cutover of its own and never
-    a settings change. An epoch that holds no hash compares the triple only.
-    The two values are then stored on the candidate's row as given
+    hashes, stamps beside the triple. The candidate's five stamps are compared
+    here with the active epoch's, and the comparison puts it in one of four
+    classes. An epoch that holds no pack hash compares the triple only.
+
+    1. The same stamps (`has_same_stamps`): a settings change, opened only
+       with `settings_change`. What changed is a serving setting the service
+       keys or a backend dispatch setting. Nothing records the flag; a
+       candidate with its source's stamps is a settings change, and the
+       dispatcher binds it at its first fill contact
+       (`binding.decide_binding`): rule 1 refuses a service that has not
+       changed, rule 4 or 5a gives it a keyed namespace, and rule 3 gives a
+       return to a configuration that claims the pair its 3-part rows.
+    2. The active extraction version and model hash, under a
+       `pack_prompt_hash` that differs from one the epoch holds: refused. The
+       cache key is the pair, so the candidate would read the rows extracted
+       under the other prompt as its own. It needs a new `EXTRACTION_VERSION`.
+    3. The active extraction version and model hash otherwise (another
+       ontology version, another `pack_rails_hash`, or both): what feeds the
+       model is unchanged, so the candidate shares the pair's cached rows. A
+       change of the rails hash alone is the replay epoch: the fill finds
+       every turn covered and the staging rebuild replays the rows under the
+       new rails.
+    4. Any other candidate: a cutover of its own pair.
+
+    `settings_change` on a candidate of any class but the first is refused.
+
+    The two hashes are stored on the candidate's row as given
     (`BacklogStore.begin_cutover`), None as NULL: the fill compares a service's
     hashes with them, the rebuild compares its pack with them
     (`candidate_pack_refusal`), and promotion copies them to the new epoch.
 
-    Two candidates need the active epoch bound, because what decides their
+    Classes 1 and 3 need the active epoch bound, because what decides their
     rows is a comparison with its identity. A settings change while it is
     unbound would fill keyed by rule 5a even against an unchanged service, so
-    it needs `refill`, the operator's choice to re-extract the log. An
-    ontology-only candidate (the active extraction version and model hash)
-    while it is unbound would take the pair's 3-part rows on the recorded
-    fields alone (rule 5c); it waits for the binding, or for an acceptance.
+    it needs `refill`, the operator's choice to re-extract the log. A class 3
+    candidate while it is unbound would take the pair's 3-part rows on the
+    recorded fields alone (rule 5c); it waits for the binding, or for an
+    acceptance.
 
     Raises:
         CutoverRefusedError: The ledger is empty; a cutover is already open;
-            the candidate's stamps equal the active epoch's without
-            `settings_change`, or differ with it; `refill` without
-            `settings_change`; or one of the two candidates above while the
-            active epoch is unbound.
+            the candidate has the active epoch's stamps without
+            `settings_change`, or other stamps with it; the candidate is of
+            class 2; `refill` without `settings_change`; or a candidate of
+            class 1 or 3 while the active epoch is unbound.
     """
     epoch = store.active_epoch()
     if epoch is None:
@@ -186,14 +201,26 @@ def begin_cutover(
             f"cutover {existing.cutover_id} is already open ({existing.state}); "
             "promote or abandon it first"
         )
-    model_hash = compose_epoch_model_hash(bare_model_hash, embedding_model_name)
-    candidate_pack = PackHashes(pack_prompt_hash=pack_prompt_hash, pack_rails_hash=pack_rails_hash)
-    differing_hashes = pack_hash_mismatches(epoch, candidate_pack)
-    # "The same stamps": the triple, and each pack hash the active epoch holds.
-    same_stamps = (
-        (ontology_version, extraction_version, model_hash)
-        == (epoch.ontology_version, epoch.extraction_version, epoch.model_hash)
-    ) and not differing_hashes
+    candidate = Stamps(
+        ontology_version=ontology_version,
+        extraction_version=extraction_version,
+        model_hash=compose_epoch_model_hash(bare_model_hash, embedding_model_name),
+        pack_prompt_hash=pack_prompt_hash,
+        pack_rails_hash=pack_rails_hash,
+    )
+    model_hash = candidate.model_hash
+    differing_hashes = pack_hash_mismatches(epoch, candidate)
+    # The candidate's class (the docstring's four).
+    same_stamps = has_same_stamps(epoch, candidate)
+    same_pair = (extraction_version, model_hash) == (epoch.extraction_version, epoch.model_hash)
+    feeds_the_model_differently = same_pair and "pack_prompt_hash" in differing_hashes
+    shares_the_pairs_rows = same_pair and not same_stamps and not feeds_the_model_differently
+    new_version_needed = (
+        "what feeds the model changed, and the cache key "
+        f"(extraction_version={epoch.extraction_version}, model_hash={epoch.model_hash}) says "
+        "it did not, so the epoch's cached rows would be read as the candidate's. Give the "
+        "change a new EXTRACTION_VERSION and begin the candidate under it"
+    )
     if same_stamps and not settings_change:
         raise CutoverRefusedError(
             f"the candidate stamps equal the active epoch {epoch.epoch_id}'s; nothing to cut "
@@ -206,14 +233,26 @@ def begin_cutover(
             pack_detail = (
                 f"; the epoch's ontology pack is "
                 f"({describe_pack_hashes(epoch, differing_hashes)}) and the candidate's is "
-                f"({describe_pack_hashes(candidate_pack, differing_hashes)})"
+                f"({describe_pack_hashes(candidate, differing_hashes)})"
             )
+        way_out = (
+            f"this candidate's differ, and {new_version_needed}"
+            if feeds_the_model_differently
+            else "this candidate's differ, so it is a cutover of its own: omit the flag"
+        )
         raise CutoverRefusedError(
             f"--settings-change keeps the active epoch {epoch.epoch_id}'s stamps "
             f"(ontology_version={epoch.ontology_version}, "
             f"extraction_version={epoch.extraction_version}, model_hash={epoch.model_hash})"
-            f"{pack_detail}; "
-            "this candidate's differ, so it is a cutover of its own: omit the flag"
+            f"{pack_detail}; {way_out}"
+        )
+    if feeds_the_model_differently:
+        prompt_hash = ("pack_prompt_hash",)
+        raise CutoverRefusedError(
+            f"the candidate keeps the active epoch {epoch.epoch_id}'s extraction_version and "
+            f"model_hash under another prompt hash: the epoch's ontology pack is "
+            f"({describe_pack_hashes(epoch, prompt_hash)}) and the candidate's is "
+            f"({describe_pack_hashes(candidate, prompt_hash)}); {new_version_needed}"
         )
     if settings_change and not epoch.bound and not refill:
         raise CutoverRefusedError(
@@ -221,12 +260,7 @@ def begin_cutover(
             "against it; wait until admin status shows it bound, or pass --refill to "
             "re-extract the log anyway"
         )
-    ontology_only = (
-        not same_stamps
-        and extraction_version == epoch.extraction_version
-        and model_hash == epoch.model_hash
-    )
-    if ontology_only and not epoch.bound:
+    if shares_the_pairs_rows and not epoch.bound:
         raise CutoverRefusedError(
             f"epoch {epoch.epoch_id} has no identity yet, so this candidate cannot be shown "
             "to share its rows; wait until admin status shows it bound, or run admin epoch "

@@ -30,6 +30,10 @@ EV = "ev"
 MH = "m1|emb:e"
 NS = "si1-a+di1-a"
 _AT = "2026-09-01T00:00:00+00:00"
+# Invented pack hashes: an epoch's, and the rails hash of a rails-only candidate.
+PROMPT = "a" * 64
+RAILS = "b" * 64
+NEXT_RAILS = "d" * 64
 
 
 def _binding(namespace: str | None, source: str = "adopted") -> dict:
@@ -46,12 +50,17 @@ def _binding(namespace: str | None, source: str = "adopted") -> dict:
 
 
 def _world(
-    event_path: str = ":memory:", cache_path: str = ":memory:"
+    event_path: str = ":memory:", cache_path: str = ":memory:", **epoch_pack_hashes: str
 ) -> tuple[EventStore, ExtractionCache, BacklogStore]:
+    """One epoch over an empty log; `epoch_pack_hashes` are the pack hashes its row stores."""
     events = EventStore(db_path=event_path)
     events.initialize()
     events.ensure_initial_epoch(
-        now_iso=_AT, ontology_version="1.4.0", extraction_version=EV, model_hash=MH
+        now_iso=_AT,
+        ontology_version="1.4.0",
+        extraction_version=EV,
+        model_hash=MH,
+        **epoch_pack_hashes,
     )
     cache = ExtractionCache(cache_path)
     cache.initialize()
@@ -81,7 +90,9 @@ def _put(cache: ExtractionCache, event_id: str, *, model_hash: str = MH, **kwarg
     )
 
 
-def _begin(store: BacklogStore, *, ontology: str = "1.4.0", model_hash: str = MH) -> Cutover:
+def _begin(
+    store: BacklogStore, *, ontology: str = "1.4.0", model_hash: str = MH, **pack_hashes: str
+) -> Cutover:
     cutover = store.begin_cutover(
         ontology_version=ontology,
         extraction_version=EV,
@@ -89,6 +100,7 @@ def _begin(store: BacklogStore, *, ontology: str = "1.4.0", model_hash: str = MH
         bare_model_hash=model_hash.split("|")[0],
         source_epoch_id=1,
         requested_at=_AT,
+        **pack_hashes,
     )
     assert cutover is not None
     return cutover
@@ -320,6 +332,40 @@ class TestFillScan:
             3,
             False,
         )
+
+    def test_an_unbound_candidate_under_another_rails_hash_counts_the_pairs_cached_rows(self):
+        """The source's triple and another rails hash: not the same stamps, so not covered 0.
+
+        A rails-only candidate shares the pair's rows, as an ontology-only one
+        does, and is scanned in the 3-part namespace until it is bound.
+        """
+        events, cache, store = _world(pack_prompt_hash=PROMPT, pack_rails_hash=RAILS)
+        ids = _log(events, 3)
+        _put(cache, ids[0])
+        _put(cache, ids[1])
+        _put(cache, ids[2], identity_namespace=NS)
+        cutover = _begin(store, pack_prompt_hash=PROMPT, pack_rails_hash=NEXT_RAILS)
+
+        fill = store.fill_scan(cutover)
+
+        assert (fill.head.event_id, fill.covered, fill.total, fill.bound) == (
+            ids[2],
+            2,
+            3,
+            False,
+        )
+
+    def test_an_unbound_candidate_with_its_sources_five_stamps_is_covered_0(self):
+        """Five equal stamps: a settings change, whose 3-part rows are the source's."""
+        events, cache, store = _world(pack_prompt_hash=PROMPT, pack_rails_hash=RAILS)
+        ids = _log(events, 2)
+        for event_id in ids:
+            _put(cache, event_id)
+        cutover = _begin(store, pack_prompt_hash=PROMPT, pack_rails_hash=RAILS)
+
+        fill = store.fill_scan(cutover)
+
+        assert (fill.head.event_id, fill.covered, fill.total, fill.bound) == (ids[0], 0, 2, False)
 
     def test_a_bound_keyed_candidate_is_scanned_in_its_namespace(self):
         events, cache, store = _world()

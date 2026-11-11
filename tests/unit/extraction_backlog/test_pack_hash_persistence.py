@@ -455,3 +455,213 @@ class TestCutoverBeginCli:
 
         assert code == 0, out.getvalue()
         assert _hashes(stored_world.store.open_cutover()) == (PROMPT, RAILS)
+
+
+UNBOUND_SHARES_ROWS = (
+    "epoch {n} has no identity yet, so this candidate cannot be shown to share its rows; "
+    "wait until admin status shows it bound, or run admin epoch accept"
+)
+
+# The three ways a candidate keeps the active pair and the active prompt hash
+# and still differs from the active epoch: class 3.
+SHARES_THE_PAIRS_ROWS = pytest.mark.parametrize(
+    ("ontology_version", "rails"),
+    [
+        pytest.param(ONTOLOGY_VERSION, NEXT_RAILS, id="another-rails-hash"),
+        pytest.param("1.5.0", RAILS, id="another-ontology-version"),
+        pytest.param("1.5.0", NEXT_RAILS, id="both"),
+    ],
+)
+
+
+def _cli_begin_on_the_active_pair(
+    world,
+    *flags: str,
+    pack: tuple[str | None, str | None],
+    ontology_version: str = ONTOLOGY_VERSION,
+):
+    """`admin cutover begin` with the active epoch's extraction version and model hash.
+
+    `pack` is the `(pack_prompt_hash, pack_rails_hash)` the resolver holds for
+    the candidate's ontology version, so the candidate differs from the active
+    epoch in its ontology version, in a pack hash, or in nothing.
+    """
+    out = io.StringIO()
+    code = admin.main(
+        [
+            "cutover",
+            "begin",
+            "--model-hash",
+            world.service.model_hash,
+            "--extraction-version",
+            world.service.extraction_version,
+            "--ontology-version",
+            ontology_version,
+            *flags,
+        ],
+        store=world.store,
+        out=out,
+        embedding_model_name=EMBEDDING_MODEL,
+        pack_for_version=fake_pack_resolver({ontology_version: pack}),
+    )
+    return code, out.getvalue()
+
+
+class TestCandidateClassesAtBegin:
+    """A candidate's class at `cutover begin`, against an epoch that stores (PROMPT, RAILS).
+
+    Class 1 has the same stamps, the triple and both hashes: a settings change.
+    Class 2 keeps the extraction version and the model hash and changes the
+    prompt hash: refused. Class 3 keeps the pair otherwise, with another
+    ontology version or another rails hash: it shares the pair's cached rows and
+    needs the active epoch bound. Class 4 is any other candidate.
+    """
+
+    # -- class 1: the same stamps ---------------------------------------------
+
+    def test_the_same_stamps_without_the_flag_are_refused(self, stored_world):
+        stored_world.bind_active_epoch()
+
+        code, text = _cli_begin_on_the_active_pair(stored_world, pack=(PROMPT, RAILS))
+
+        assert code == 2
+        assert "nothing to cut over" in text
+        assert "--settings-change" in text
+        assert _cutover_rows(stored_world) == []
+
+    def test_the_same_stamps_with_the_flag_open_a_candidate(self, stored_world):
+        stored_world.bind_active_epoch()
+
+        code, text = _cli_begin_on_the_active_pair(
+            stored_world, "--settings-change", pack=(PROMPT, RAILS)
+        )
+
+        assert code == 0, text
+        candidate = stored_world.store.open_cutover()
+        assert candidate.state == "filling"
+        assert _hashes(candidate) == (PROMPT, RAILS)
+
+    # -- class 2: the pair, under another prompt hash ---------------------------
+
+    @pytest.mark.parametrize(
+        ("ontology_version", "rails"),
+        [
+            pytest.param(ONTOLOGY_VERSION, RAILS, id="the-prompt-hash-alone"),
+            pytest.param(ONTOLOGY_VERSION, NEXT_RAILS, id="both-hashes"),
+            pytest.param("1.5.0", NEXT_RAILS, id="another-ontology-version-too"),
+        ],
+    )
+    def test_the_pair_under_another_prompt_hash_is_refused(
+        self, stored_world, ontology_version, rails
+    ):
+        stored_world.bind_active_epoch()
+
+        code, text = _cli_begin_on_the_active_pair(
+            stored_world, pack=(NEXT_PROMPT, rails), ontology_version=ontology_version
+        )
+
+        assert code == 2
+        assert "[cutover] REFUSED:" in text
+        assert "EXTRACTION_VERSION" in text
+        assert f"pack_prompt_hash={NEXT_PROMPT!r}" in text
+        assert f"pack_prompt_hash={PROMPT!r}" in text
+        assert _cutover_rows(stored_world) == []
+        assert stored_world.store.open_cutover() is None
+
+    def test_the_refusal_does_not_wait_for_the_active_epoch_to_be_bound(self, stored_world):
+        """Class 2 is refused bound or not: binding the epoch would not make it valid."""
+        code, text = _cli_begin_on_the_active_pair(stored_world, pack=(NEXT_PROMPT, RAILS))
+
+        assert code == 2
+        assert "EXTRACTION_VERSION" in text
+        assert "has no identity yet" not in text
+
+    def test_another_prompt_hash_under_another_model_is_a_cutover_of_its_own(self, stored_world):
+        """Class 4: the pair differs, so the candidate's rows are its own and it opens unbound."""
+        resolver = fake_pack_resolver({ONTOLOGY_VERSION: (NEXT_PROMPT, NEXT_RAILS)})
+
+        code, text = _cli_begin(stored_world, pack_for_version=resolver)
+
+        assert code == 0, text
+        assert _hashes(stored_world.store.open_cutover()) == (NEXT_PROMPT, NEXT_RAILS)
+
+    # -- class 3: the pair otherwise -------------------------------------------
+
+    @SHARES_THE_PAIRS_ROWS
+    def test_the_pair_otherwise_needs_the_active_epoch_bound(
+        self, stored_world, ontology_version, rails
+    ):
+        code, text = _cli_begin_on_the_active_pair(
+            stored_world, pack=(PROMPT, rails), ontology_version=ontology_version
+        )
+
+        assert code == 2
+        assert UNBOUND_SHARES_ROWS.format(n=stored_world.epoch_id) in text
+        assert _cutover_rows(stored_world) == []
+
+    @SHARES_THE_PAIRS_ROWS
+    def test_the_pair_otherwise_opens_once_the_active_epoch_is_bound(
+        self, stored_world, ontology_version, rails
+    ):
+        stored_world.bind_active_epoch()
+
+        code, text = _cli_begin_on_the_active_pair(
+            stored_world, pack=(PROMPT, rails), ontology_version=ontology_version
+        )
+
+        assert code == 0, text
+        candidate = stored_world.store.open_cutover()
+        assert candidate.state == "filling"
+        assert candidate.ontology_version == ontology_version
+        assert _hashes(candidate) == (PROMPT, rails)
+
+    # -- --settings-change on a candidate that differs in a pack hash ----------
+
+    def test_settings_change_under_another_rails_hash_is_refused(self, stored_world):
+        stored_world.bind_active_epoch()
+
+        code, text = _cli_begin_on_the_active_pair(
+            stored_world, "--settings-change", pack=(PROMPT, NEXT_RAILS)
+        )
+
+        assert code == 2
+        assert "--settings-change keeps the active epoch" in text
+        assert f"pack_rails_hash={NEXT_RAILS!r}" in text
+        assert f"pack_rails_hash={RAILS!r}" in text
+        assert "omit the flag" in text
+        assert _cutover_rows(stored_world) == []
+
+    def test_settings_change_under_another_prompt_hash_is_refused_and_not_told_to_omit_the_flag(
+        self, stored_world
+    ):
+        """Without the flag the candidate is class 2, so the refusal does not send it there."""
+        stored_world.bind_active_epoch()
+
+        code, text = _cli_begin_on_the_active_pair(
+            stored_world, "--settings-change", pack=(NEXT_PROMPT, RAILS)
+        )
+
+        assert code == 2
+        assert "--settings-change keeps the active epoch" in text
+        assert f"pack_prompt_hash={NEXT_PROMPT!r}" in text
+        assert f"pack_prompt_hash={PROMPT!r}" in text
+        assert "EXTRACTION_VERSION" in text
+        assert "omit the flag" not in text
+        assert _cutover_rows(stored_world) == []
+
+    # -- an epoch from before the hashes ---------------------------------------
+
+    def test_an_epoch_that_stores_no_hash_is_compared_on_the_triple_alone(self, tmp_path):
+        """No stored prompt hash to differ from: the triple decides, as before the hashes."""
+        world = _build_world(with_deriver=False, db_path=str(tmp_path / "legacy.db"))
+        world.bind_active_epoch()
+
+        same_triple = _cli_begin_on_the_active_pair(world, pack=(NEXT_PROMPT, NEXT_RAILS))
+        ontology_only = _cli_begin_on_the_active_pair(
+            world, pack=(NEXT_PROMPT, NEXT_RAILS), ontology_version="1.5.0"
+        )
+
+        assert same_triple[0] == 2
+        assert "nothing to cut over" in same_triple[1]
+        assert ontology_only[0] == 0, ontology_only[1]
+        assert _hashes(world.store.open_cutover()) == (NEXT_PROMPT, NEXT_RAILS)

@@ -40,12 +40,17 @@ binding could not verify, or `binding: unbound`; and an operator acceptance on
 record for the target.
 
 `cutover begin --settings-change` opens a candidate with the active epoch's
-stamps, for a change of a serving setting the extraction service keys or of a
-backend dispatch setting; without the flag such a candidate is refused. While
-the active epoch is unbound it also needs `--refill` (the change cannot be
-checked against an identity the epoch does not have yet, so the candidate
-re-extracts the log), and an ontology-only candidate (the active extraction
-version and model hash) is refused. Both refusals exit 2.
+stamps (the triple and each pack hash the epoch stores: `has_same_stamps`),
+for a change of a serving setting the extraction service keys or of a
+backend dispatch setting; without the flag such a candidate is refused, and
+with it a candidate whose stamps differ is. While the active epoch is unbound
+it also needs `--refill` (the change cannot be checked against an identity the
+epoch does not have yet, so the candidate re-extracts the log), and a
+candidate that shares the pair's rows (the active extraction version and model
+hash under another ontology version, another `pack_rails_hash`, or both) is
+refused. A candidate that keeps the active extraction version and model hash
+under another `pack_prompt_hash` than the epoch stores is refused whatever the
+flags: it needs a new `EXTRACTION_VERSION`. Every refusal exits 2.
 
 `cutover begin` stores on the candidate the two hashes of the ontology pack
 this code holds for the candidate's ontology version (`registry.get_pack`).
@@ -121,6 +126,7 @@ from .store import (
     CarriesPackHashes,
     Cutover,
     Epoch,
+    has_same_stamps,
     pack_hash_mismatches,
 )
 
@@ -421,9 +427,11 @@ def _cutover_begin(
         )
         return 0
     print(
-        "[cutover] Next: point the extraction service at the candidate model (its /v1/info "
-        f"must report extraction_version={cutover.extraction_version} and "
-        f"model_hash={cutover.bare_model_hash}); the dispatcher fills while it matches.",
+        "[cutover] Next: run the extraction service on the candidate's code and model (its "
+        f"/v1/info must report extraction_version={cutover.extraction_version}, "
+        f"model_hash={cutover.bare_model_hash} and the two pack hashes above); the dispatcher "
+        "fills while it matches, and sends no job for a turn the candidate already has a "
+        "cached row for.",
         file=out,
     )
     return 0
@@ -606,7 +614,11 @@ def _well_formed(identity: str, prefix: str) -> bool:
 def _epoch_accept(store: BacklogStore, args: argparse.Namespace, now_iso: str, out) -> int:
     """`epoch accept`: record the operator's acceptance of a live identity for one target.
 
-    The target is the active epoch, or with `--cutover` the open candidate.
+    The target is the active epoch, or with `--cutover` the open candidate,
+    unless it has its source's stamps (`has_same_stamps`): the 3-part rows of
+    a settings-change candidate's pair are its source's. A candidate that
+    keeps the source's triple under another `pack_rails_hash` is not one, and
+    is accepted for.
     Nothing is bound here: the dispatcher binds the target with source
     'operator' (rule 2) at its next contact, and only while the live serving
     and dispatch identities equal the accepted ones, so an acceptance cannot
@@ -642,11 +654,7 @@ def _epoch_accept(store: BacklogStore, args: argparse.Namespace, now_iso: str, o
             if cutover.source_epoch_id is not None
             else None
         )
-        if source is not None and (
-            cutover.ontology_version,
-            cutover.extraction_version,
-            cutover.model_hash,
-        ) == (source.ontology_version, source.extraction_version, source.model_hash):
+        if source is not None and has_same_stamps(source, cutover):
             return refuse(
                 f"cutover {cutover.cutover_id} is a settings-change candidate: the 3-part rows "
                 f"of its stamps are epoch {source.epoch_id}'s, so an acceptance cannot bind it "
