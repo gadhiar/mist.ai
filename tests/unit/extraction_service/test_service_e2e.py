@@ -20,6 +20,7 @@ from backend.extraction_service.schemas import (
     EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
+from backend.knowledge.ontologies.registry import active_pack
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from tests.unit.extraction_service.conftest import FAKE_BASE_URL, make_extract_request
 from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
@@ -386,6 +387,7 @@ class TestInfoServingConfig:
     ):
         class _UnknownAdapterEngine:
             adapter_name = "not-a-registered-adapter"
+            pack = active_pack()
 
             def request_profile(self) -> tuple:
                 return ()

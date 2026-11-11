@@ -237,7 +237,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-5da0d754dc02196da8f36c54e0dbfb6b87b81d8d409ce6e15031c180f31cc255",
+        code_identity="ci1-806dc5fb1a1ef0ca886b575eb315ac377293201996e2552ffd3672698639b513",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -274,7 +274,12 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "assemble_system_prompt places a pack's prompt fragments, and generates the "
             "Stage 2 schema from a pack's extractable names, the core with no fragment "
             "and the generated schema being byte-identical to the prompt and the schema "
-            "as they stood. "
+            "as they stood; the engine now extracts with the registry's active pack, "
+            "running its item filters on the units before they are batched, sending its "
+            "assembled prompt and generated schema at Stage 2 and under the plan call, and "
+            "stamping its two hashes on every result, and pre_llm, the pack loader and the "
+            "registry join the covered code; the active pack holds no prompt fragment and "
+            "no item filter, so it drops no unit and changes no request. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

@@ -461,10 +461,13 @@ class TestRunIdentityCoverage:
             "backend.knowledge.extraction.internal_derivation",
             "backend.knowledge.extraction.internal_prompts",
             "backend.knowledge.extraction.ontology_extractor",
+            "backend.knowledge.extraction.pre_llm",
             "backend.knowledge.extraction.preprocessor",
             "backend.knowledge.extraction.prompts",
             "backend.knowledge.extraction.scope_classifier",
             "backend.knowledge.extraction.structure_splitter",
+            "backend.knowledge.ontologies.pack",
+            "backend.knowledge.ontologies.registry",
             "backend.llm.llama_server_provider",
         ]
 
