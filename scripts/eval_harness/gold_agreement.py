@@ -18,6 +18,9 @@ How a probe is counted:
 - **Ids after the id function.** `id_function` is applied to each pass's row first, and every
   id is compared as it leaves that function, since two labels that the rails store under one
   id are one label.
+- **`alternatives` are ignored.** Only an entity's `id` is read. An id one pass wrote and the
+  other listed under `alternatives` counts as two ids, unless the caller's id function maps
+  both to one.
 - **A relation is its id triple** `(source, predicate, target)`, the key the scorer counts
   relations by (`gold_rel_keys`, `score_extraction_run.py:610`). Types are not part of it.
 - **The universe** is every triple with two distinct endpoints that the pair table admits over

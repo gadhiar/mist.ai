@@ -198,6 +198,16 @@ class TestProbeAgreement:
         assert (undirected.universe, undirected.both_present) == (1, 1)
         assert (undirected.outside_a, undirected.outside_b) == (0, 0)
 
+    def test_an_id_listed_only_as_an_alternative_is_another_id(self):
+        row_a = _row("p", {"user": "User", "zed": "Technology"}, [("user", "USES", "zed")])
+        row_a["expected_entities"][1]["alternatives"] = ["zola"]
+        row_b = _row("p", {"user": "User", "zola": "Technology"}, [("user", "USES", "zola")])
+
+        figures = _agree(row_a, row_b)
+
+        assert figures.universe == 2
+        assert (figures.both_present, figures.only_a, figures.only_b) == (0, 1, 1)
+
     def test_an_entity_typed_differently_admits_candidates_under_either_type(self):
         row_a = _row("p", {"user": "User", "foo": "Technology"}, [("user", "USES", "foo")])
         row_b = _row("p", {"user": "User", "foo": "Concept"}, [("user", "INTERESTED_IN", "foo")])
