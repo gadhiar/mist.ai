@@ -296,6 +296,12 @@ def _entities_by_id(output: dict) -> dict[str, dict]:
     return {entity["id"]: entity for entity in output["entities"]}
 
 
+def _rule(number: int) -> str:
+    """The numbered extraction rule's line."""
+    prefix = f"{number}. "
+    return next(line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if line.startswith(prefix))
+
+
 def _has_edge(output: dict, source: str, edge_type: str, target: str) -> bool:
     return any(
         (rel["source"], rel["type"], rel["target"]) == (source, edge_type, target)
@@ -415,59 +421,86 @@ class TestGroup2ListConventions:
         assert "never extract them again" in EXTRACTION_SYSTEM_PROMPT
 
     def test_an_item_s_id_is_the_item_s_own_words(self):
-        assert "An item's id is the item's own words" in EXTRACTION_SYSTEM_PROMPT
+        assert "A list item's id is the item's own words for the thing itself" in _rule(28)
+
+    def test_a_list_item_s_id_adds_no_cadence_scope_owner_purpose_or_quantity(self):
+        rule_28 = _rule(28)
+        assert "a possessive 's dropped anywhere in it" in rule_28
+        assert "no word of its lead-in, heading or context" in rule_28
+        assert "no cadence, scope, owner, purpose or quantity phrase" in rule_28
+        assert "a cadence goes in temporal_expression" in rule_28
+        assert "a scope or purpose in context" in rule_28
+
+    def test_a_joining_word_goes_with_the_phrase_it_joins(self):
+        rule_28 = _rule(28)
+        assert "A word that only joins a dropped phrase" in rule_28
+        # The one illustration: the id is the item's words in order, fewer than the item's,
+        # with no word of the lead-in.
+        match = re.search(r'"([^":]+): ([^"]+)" -> "([a-z0-9-]+)"', rule_28)
+        assert match is not None, "Rule 28 illustrates the id rule"
+        lead_in, item, item_id = match.groups()
+        item_words = re.findall(r"[a-z0-9]+", item.lower())
+        id_words = item_id.split("-")
+        rest = iter(item_words)
+        assert all(word in rest for word in id_words), "the id is the item's own words"
+        assert len(id_words) < len(item_words)
+        assert not set(re.findall(r"[a-z0-9]+", lead_in.lower())) & set(id_words)
+
+    def test_event_and_metric_items_keep_group_1_s_ids(self):
+        rule_28 = _rule(28)
+        assert "an Event item keeps its named owner and stated place (Rule 26)" in rule_28
+        assert (
+            "a Metric item's quantity is every word it gives for what is measured, "
+            "none dropped or added (Rule 27)"
+        ) in rule_28
 
     def test_the_lead_in_sets_the_subject_or_predicate_and_is_not_an_entity(self):
-        assert "as if its line were a sentence completing the lead-in" in EXTRACTION_SYSTEM_PROMPT
-        assert "sets the subject or the predicate for the items under it" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "Read each item as a sentence completing the lead-in" in EXTRACTION_SYSTEM_PROMPT
+        assert "sets the subject or predicate of the items under it" in EXTRACTION_SYSTEM_PROMPT
         assert "it is not an entity unless it names one" in EXTRACTION_SYSTEM_PROMPT
 
     def test_a_refer_back_item_takes_the_earlier_item_s_id(self):
-        assert "resolves to that item's entity and uses the same id" in EXTRACTION_SYSTEM_PROMPT
+        assert "An item referring back takes the earlier item's entity and id" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
 
     def test_an_option_nobody_chose_gets_no_edge(self):
-        assert "that nobody chose, gets no edge" in EXTRACTION_SYSTEM_PROMPT
+        assert "An option nobody chose gets no edge" in EXTRACTION_SYSTEM_PROMPT
 
     def test_checked_and_unchecked_boxes(self):
-        assert "A checked box `[x]` states a fact that is done" in EXTRACTION_SYSTEM_PROMPT
-        assert "An unchecked box `[ ]` is a plan and gets no edge" in EXTRACTION_SYSTEM_PROMPT
-        assert "a lead-in that names goals, where it is HAS_GOAL" in EXTRACTION_SYSTEM_PROMPT
+        assert "A checked box `[x]` is a done fact" in EXTRACTION_SYSTEM_PROMPT
+        assert "an unchecked box `[ ]` is a plan with no edge" in EXTRACTION_SYSTEM_PROMPT
+        assert "under a goals lead-in, where it is HAS_GOAL" in EXTRACTION_SYSTEM_PROMPT
 
     def test_a_table_row_is_one_fact_about_its_first_column(self):
         assert "one fact about its first column" in EXTRACTION_SYSTEM_PROMPT
 
     def test_a_list_with_nothing_durable_is_empty(self):
-        assert "A list with nothing durable, such as an errand list" in EXTRACTION_SYSTEM_PROMPT
+        assert "A list with nothing durable (an errand list) is empty" in EXTRACTION_SYSTEM_PROMPT
 
     def test_itinerary_items_are_experienced_events_with_dates(self):
         assert "Itinerary items are Events" in EXTRACTION_SYSTEM_PROMPT
 
     def test_n3_decisions(self):
-        assert "Decisions. A decision the user or the user's team makes" in (
+        assert "Decisions. A decision by the user or their team is user DECIDED" in (
             EXTRACTION_SYSTEM_PROMPT
         )
-        assert "A decision does not make its outcome a current fact" in EXTRACTION_SYSTEM_PROMPT
-        assert "A decision by someone else gets the Event and the link" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "It does not make its outcome current" in EXTRACTION_SYSTEM_PROMPT
+        assert "Someone else's decision gets the Event and the link" in EXTRACTION_SYSTEM_PROMPT
 
     def test_n5_stated_places_and_organisations(self):
         assert "Stated places and organisations." in EXTRACTION_SYSTEM_PROMPT
 
     def test_n7_third_party_events(self):
-        assert "Third-party events. A named person's own Event" in EXTRACTION_SYSTEM_PROMPT
+        assert "Third-party events. A named person's own non-milestone Event" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
 
     def test_n13_topic_links(self):
-        assert "Topic links. An Event links by RELATED_TO" in EXTRACTION_SYSTEM_PROMPT
-        assert "Something chosen for a subject links to that subject" in (EXTRACTION_SYSTEM_PROMPT)
-
-    def test_example_29_the_stated_place_is_a_location_related_to_the_event(self):
-        _, output = _examples()[29]
-        event = next(e for e in output["entities"] if e["type"] == "Event")
-        place = next(e for e in output["entities"] if e["type"] == "Location")
-        assert _has_edge(output, event["id"], "RELATED_TO", place["id"])
+        assert "Topic links. An Event is RELATED_TO what the utterance says" in (
+            EXTRACTION_SYSTEM_PROMPT
+        )
+        assert "something chosen for a subject links to that subject" in EXTRACTION_SYSTEM_PROMPT
 
     def test_example_30_is_one_rendered_unit_whose_lead_in_sets_the_predicate(self):
         heading = next(
@@ -487,24 +520,16 @@ class TestGroup2ListConventions:
 
 
 class TestGroup3GlossesAndTeamConventions:
-    """v11 group 3 (ADR-054 Decision 7, plan D17): a gloss quoted from the ontology after
-    each user-centric predicate and each confusable type, N17 named teams with its own
-    example, and N8, N10, N11 and N12, each stated as a rule. Each presence check is keyed
-    on the rule's own phrase.
+    """v11 group 3 (ADR-054 Decision 7, plan D17): the Organization, WORKS_AT and
+    MEMBER_OF glosses, N17 named teams with its own example, and N8, N10 and N11, each
+    stated as a rule; N12 lives in Rule 6. Each presence check is keyed on the rule's own
+    phrase. T40 round 1 cut the other glosses and Rule 38 to fit the token reserve.
     """
 
     # The ontology's own descriptions, quoted. WORKS_AT is the one exception: the prompt
     # glosses it as employment only, since membership is MEMBER_OF (lead decision 3).
     QUOTED = {
         "Organization": "A company, team, institution, community, or open-source project.",
-        "Event": "A notable event such as a decision, milestone, meeting, or life event.",
-        "KNOWS": "Indicates familiarity with a skill, concept, technology, or topic.",
-        "INTERESTED_IN": "Indicates interest in a technology, concept, topic, or skill.",
-        "PREFERS": "Indicates a positive preference for something.",
-        "EXPERT_IN": "Indicates expert-level proficiency in a technology, skill, or concept.",
-        "LEARNING": "Indicates actively learning a technology, skill, or concept.",
-        "EXPERIENCED": "Links a user or person to an event they experienced.",
-        "WORKS_ON": "Indicates active involvement in a project.",
         "MEMBER_OF": "Indicates membership in an organization.",
     }
 
@@ -543,10 +568,11 @@ class TestGroup3GlossesAndTeamConventions:
         assert "Topic," not in EXTRACTION_SYSTEM_PROMPT.split("### Abstract-Type Tests")[0]
 
     def test_n17_named_teams(self):
-        assert "Named teams. A named team, club or community that the utterance places a" in (
+        assert "Named teams. A team, club or community named by its work" in (
             EXTRACTION_SYSTEM_PROMPT
         )
-        assert "A describing word (new, old, small, whole, current, remote, other)" in (
+        assert "each, lead included, gets MEMBER_OF it" in EXTRACTION_SYSTEM_PROMPT
+        assert "a describing word (new, old, small, whole, current, remote, other)" in (
             EXTRACTION_SYSTEM_PROMPT
         )
         assert "the team gets no PART_OF to the employer" in EXTRACTION_SYSTEM_PROMPT
@@ -555,10 +581,10 @@ class TestGroup3GlossesAndTeamConventions:
         )
 
     def test_n8_the_team_s_tools(self):
-        assert "The team's tools. A statement of which tools the user's team runs puts USES" in (
+        assert "The team's tools. Tools the user's team runs are user USES" in (
             EXTRACTION_SYSTEM_PROMPT
         )
-        assert "A possessive that only names a thing does not" in EXTRACTION_SYSTEM_PROMPT
+        assert "a possessive that only names a thing is not" in EXTRACTION_SYSTEM_PROMPT
 
     def test_n10_personal_milestones(self):
         assert "Personal milestones. A personal legal or financial step completed on a day" in (
@@ -569,23 +595,22 @@ class TestGroup3GlossesAndTeamConventions:
         assert "Goal deadlines. A goal's stated time frame is its deadline" in (
             EXTRACTION_SYSTEM_PROMPT
         )
-        assert "a bare month is the first such month after the reference date" in (
+        assert "A bare month is the first such month after the reference date" in (
             EXTRACTION_SYSTEM_PROMPT
         )
-        assert "A frame whose year is unclear gets no date" in EXTRACTION_SYSTEM_PROMPT
+        assert "a frame whose year is unclear gets no date" in EXTRACTION_SYSTEM_PROMPT
 
-    def test_n12_flipped_preferences_and_rule_6_follows_it(self):
-        assert "Flipped preferences. When the utterance states the earlier preference" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "Neither edge gets a date" in EXTRACTION_SYSTEM_PROMPT
-        rule_6 = next(
-            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if line.startswith("6. ")
-        )
+    def test_n12_flipped_preferences_live_in_rule_6_with_no_date(self):
+        rule_6 = _rule(6)
         anymore = rule_6.split('"don\'t like X anymore"', 1)[1].split(". ", 1)[0]
         assert "PREFERS X" in anymore and "cease" in anymore
         assert "DISLIKES X" in anymore and "assert" in anymore
+        assert "neither edge gets a date" in anymore
         assert "(the new preference is the fact)" not in rule_6
+
+    def test_rule_38_folded_into_rule_6(self):
+        assert "Rule 38" not in EXTRACTION_SYSTEM_PROMPT
+        assert not any(line.startswith("38. ") for line in EXTRACTION_SYSTEM_PROMPT.splitlines())
 
     def test_example_31_the_named_team_beside_the_employer(self):
         heading = next(
@@ -646,8 +671,8 @@ class TestExtractionVersionDriftGuard:
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
     # extraction_version = "2026-11-10-r8", groups 1 (identity), 2 (list conventions) and
-    # 3 (glosses, named teams and the remaining conventions).
-    PINNED_SHA256 = "e45298f9c9800aebd29fa3b96c8dd3fef850bd03b21b1521485326d39b8b71ac"
+    # 3 (glosses, named teams and the remaining conventions), as T40 round 1 revised them.
+    PINNED_SHA256 = "0ad6912fd8638461e8aed0c7344be8e7f4e5b53b2112d9c5f80bce5de1fcd089"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
