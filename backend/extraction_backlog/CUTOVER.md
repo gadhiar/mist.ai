@@ -155,13 +155,78 @@ Optional: `--extraction-version V` and `--ontology-version O` (default: the code
 composed from the bare hash and the backend's embedding model through
 `compose_model_hash`.
 
-Refused (exit 2, nothing written) when a cutover is already open, when the ledger is
-empty, or when the candidate stamps equal the active epoch's. The last refusal
-names `--settings-change`, which is for a change of settings alone (section 9).
-While the active epoch is unbound (section 9.2), a candidate with the active
-`extraction_version` and `model_hash` and another `ontology_version` is refused
-too: until the epoch is bound nothing shows the candidate may share its rows.
-[UNIT-TESTED: `TestBegin` in `tests/unit/extraction_backlog/test_identity_cutover.py`]
+Every candidate the CLI begins stores the two hashes of the ontology pack this
+code holds for the candidate's ontology version: `pack_prompt_hash`, over what
+the pack feeds the model, and `pack_rails_hash`, over the rules it runs on a
+payload. [UNIT-TESTED: `TestCutoverBeginCli` in
+`tests/unit/extraction_backlog/test_pack_hash_persistence.py`] `cutover begin`
+and `cutover status` print both on the candidate's `pack:` line.
+[VERIFIED-IN-REPO: `_print_cutover` in `admin.py`] The fill then
+refuses a service whose `/v1/info` reports another value for either hash, or
+none: the dispatcher stays in `epoch_mismatch`, names the hash and both values,
+and sends no job (section 3). [UNIT-TESTED: `TestEpochMatches` and
+`TestServiceCheck` in `tests/unit/extraction_backlog/test_pack_hash_identity.py`;
+`TestReplayEpochEndToEnd` in `tests/unit/extraction_backlog/test_replay_epoch.py`]
+
+"The same stamps" in this runbook means the triple and each pack hash the active
+epoch stores. An epoch from before the hashes were stored holds none, and is
+compared on the triple alone. [UNIT-TESTED: `TestTheSameStamps` in
+`tests/unit/extraction_backlog/test_pack_hash_identity.py`]
+
+`cutover begin` is refused, with exit 2 and nothing written, in each of these
+cases. They are every refusal in `begin_cutover` (`cutover.py`) and
+`_cutover_begin` (`admin.py`):
+
+- A cutover is already open. [UNIT-TESTED: `test_a_second_begin_is_refused` in
+  `tests/unit/extraction_backlog/test_cutover.py`]
+- The epoch ledger is empty: there is no epoch to cut over from.
+  [VERIFIED-IN-REPO: `begin_cutover` in `cutover.py`]
+- The candidate has the same stamps as the active epoch and `--settings-change`
+  is not given. The refusal names the flag, which is for a change of settings
+  alone (section 9). [UNIT-TESTED:
+  `test_the_same_stamps_without_the_flag_are_refused` in
+  `tests/unit/extraction_backlog/test_pack_hash_persistence.py`]
+- `--settings-change` is given and the candidate's stamps differ from the
+  active epoch's, in the triple or in a pack hash the epoch stores. The refusal
+  names each differing hash with both values. [UNIT-TESTED:
+  `test_settings_change_under_another_rails_hash_is_refused` and
+  `test_settings_change_under_another_prompt_hash_is_refused_and_not_told_to_omit_the_flag`
+  in `tests/unit/extraction_backlog/test_pack_hash_persistence.py`;
+  `test_a_settings_change_may_not_change_a_hash` in
+  `tests/unit/extraction_backlog/test_pack_hash_identity.py`;
+  `test_settings_change_with_a_different_triple_is_refused` in
+  `tests/unit/extraction_backlog/test_identity_cutover.py`]
+- `--refill` is given without `--settings-change`. [UNIT-TESTED:
+  `test_refill_without_settings_change_is_refused` in
+  `tests/unit/extraction_backlog/test_identity_cutover.py`]
+- The candidate keeps the active `extraction_version` and `model_hash` under a
+  `pack_prompt_hash` other than the one the epoch stores, with or without
+  `--settings-change`. What feeds the model changed, and the cache key
+  (`extraction_version`, `model_hash`) says it did not, so the candidate would
+  read the epoch's cached rows as its own. The refusal names
+  `EXTRACTION_VERSION` and both prompt hashes: give the change a new
+  `EXTRACTION_VERSION` and begin the candidate under it. [UNIT-TESTED:
+  `test_the_pair_under_another_prompt_hash_is_refused` in
+  `tests/unit/extraction_backlog/test_pack_hash_persistence.py`]
+- The candidate's ontology version is one this code holds no pack for: the
+  candidate's hashes are that pack's, and there is none to take them from.
+  Begin the candidate from the code that holds its pack. [UNIT-TESTED:
+  `test_an_ontology_version_the_resolver_holds_no_pack_for_is_refused` and
+  `test_the_default_resolver_refuses_a_version_the_registry_does_not_hold` in
+  `tests/unit/extraction_backlog/test_pack_hash_persistence.py`]
+- The active epoch is unbound (section 9.2) and the candidate needs its
+  binding. One such candidate keeps the active `extraction_version` and
+  `model_hash` under another `ontology_version`, another `pack_rails_hash`, or
+  both: it shares the pair's cached rows, and until the epoch is bound nothing
+  shows it may. Wait until `status` shows the binding, or record an acceptance
+  (section 9.3). [UNIT-TESTED:
+  `test_an_ontology_only_candidate_is_refused_while_the_active_epoch_is_unbound`
+  in `tests/unit/extraction_backlog/test_identity_cutover.py`;
+  `test_the_pair_otherwise_needs_the_active_epoch_bound` in
+  `tests/unit/extraction_backlog/test_pack_hash_persistence.py`] The other is a
+  `--settings-change` candidate without `--refill` (section 9.2). [UNIT-TESTED:
+  `test_settings_change_while_the_active_epoch_is_unbound_needs_refill` in
+  `tests/unit/extraction_backlog/test_identity_cutover.py`]
 
 ---
 
@@ -799,9 +864,10 @@ Either restore the settings, or cut over:
 [VERIFIED-IN-REPO: `admin.py`, `_add_cutover_parser`] [UNIT-TESTED:
 `TestSettingsCutoverEndToEnd` in `tests/unit/extraction_backlog/test_identity_cutover.py`]
 
-The candidate has the active triple and covers 0 turns: the 3-part rows of the
-triple are the active epoch's. `--settings-change` on a candidate whose triple
-differs is refused. Then restart the service (or the backend) with the new
+The candidate has the active epoch's stamps (the triple, and each pack hash the
+epoch stores) and covers 0 turns: the 3-part rows of its pair are the active
+epoch's. `--settings-change` on a candidate whose stamps differ is refused
+(section 2). Then restart the service (or the backend) with the new
 settings. While the service still reports the active epoch's identity, the fill
 stalls in `epoch_mismatch` (`the service still reports the active epoch's
 identity`) and sends no job. At the first contact with the changed service the
@@ -810,6 +876,59 @@ apply unchanged. Promotion writes the binding to the new epoch with source
 `promoted`. A later change back to a configuration an epoch has already bound in
 the 3-part namespace binds there again (rule 3) and reuses its rows: only turns
 logged since are extracted.
+
+**The replay epoch.** A change of the ontology pack's rails alone is a new epoch
+too, and it is not a settings change. The rails are the rules that run on a
+payload after the model, so `pack_rails_hash` moves while `pack_prompt_hash` and
+the triple stay: the candidate's stamps differ from the active epoch's, and what
+feeds the model does not. A backend on the new pack stalls against the active
+epoch, and `status` names the hash on its `writer stamps: MISMATCH` line
+(section 1). [UNIT-TESTED:
+`test_the_writer_guard_refuses_a_backend_on_another_rails_hash` in
+`tests/unit/extraction_backlog/test_pack_hash_persistence.py`]
+
+Begin the candidate with no flag, from the code that holds the new pack, while
+the active epoch is bound (section 2):
+
+    docker compose exec mist-backend python -m backend.extraction_backlog.admin \
+      cutover begin --model-hash <BARE_MODEL_HASH>
+
+[VERIFIED-IN-REPO: `admin.py`, `_add_cutover_parser`] [UNIT-TESTED:
+`TestReplayEpochEndToEnd` in `tests/unit/extraction_backlog/test_replay_epoch.py`]
+
+The candidate stores the active triple, the active `pack_prompt_hash` and the new
+`pack_rails_hash`, and it shares the rows the active epoch cached, so no turn is
+extracted again. The extraction service must report the candidate's two hashes
+on `/v1/info`: restart it on the code that holds the new pack, with every
+serving setting unchanged. [UNVERIFIED: the restart procedure on the extraction
+host is the lead's, as in section 3] While it still reports the active epoch's
+rails hash, the fill stays in `epoch_mismatch`, names `pack_rails_hash` with both
+values, and binds nothing. At the first contact with a service that reports the
+candidate's hashes under an unchanged serving identity, the candidate binds in
+the namespace the active epoch's rows are in, the fill finds every row cached
+and sends no job, and the cutover reaches `ready`. [UNIT-TESTED:
+`TestReplayEpochEndToEnd`, for an epoch bound in the 3-part namespace (rule 3),
+and `TestAReplayCandidateOfAKeyedEpoch`, for an epoch bound keyed while another
+configuration claims the 3-part namespace (rule 4), in
+`tests/unit/extraction_backlog/test_replay_epoch.py`]
+
+Sections 4 to 6 then apply unchanged. The check replays the cached rows under
+the new rails, and it runs from the code that holds the candidate's pack:
+`cutover rebuild` refuses a pack whose hashes differ from the candidate's.
+[UNIT-TESTED: `TestRebuildUnderTheCandidatesPack` and
+`TestTheRebuildWiringChecksThePackFirst` in
+`tests/unit/extraction_backlog/test_pack_hash_identity.py`] After promotion the
+ledger row stores the candidate's two hashes, a backend on the new pack passes
+the writer guard, and one still on the old rails is refused by it.
+[UNIT-TESTED: `TestReplayEpochEndToEnd`]
+
+A restart that also changes a serving setting is not a replay: the service's
+identity is then not the one the epoch's rows are bound to, so the candidate
+does not land in their namespace. With the epoch bound in the 3-part namespace
+it binds to a keyed namespace of its own (rule 4) and re-extracts the log.
+[VERIFIED-IN-REPO: rule 4 in `binding.py`] Change the rails alone. A change of
+the pack's prompt under the active `EXTRACTION_VERSION` is refused at begin
+(section 2).
 
 ### 9.2 The namespace rule, and binding at upgrade
 
