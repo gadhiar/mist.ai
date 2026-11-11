@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 from backend.extraction_contract.models import (
     CONTRACT_VERSION,
     ERROR_HTTP_STATUS,
+    BatchRecordEntry,
     DerivationOut,
     ErrorCode,
     ExtractionPayload,
@@ -40,6 +41,7 @@ from backend.extraction_contract.models import (
     ResultStamps,
     ScopeOut,
     TimingsMs,
+    TurnPlanOut,
     error_envelope,
 )
 from backend.knowledge.curation.deduplication import DeduplicationResult
@@ -115,6 +117,14 @@ class FakeServiceState:
     # When set, results are stamped with this serving identity instead of the
     # computed one: a service that changed between `/v1/info` and the reply.
     result_serving_identity: str | None = None
+    # The ontology pack's two hashes, reported on /v1/info and stamped on every
+    # result. None answers the way a service from before the hashes does.
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
+    # What every result carries as its Stage 2 batch record and its plan call.
+    # None leaves the key out of the reply, as a service that records neither.
+    batch_record: list[BatchRecordEntry] | None = None
+    turn_plan: TurnPlanOut | None = None
     down: bool = False
     # utterance -> errors to answer with, consumed front to back before success.
     fail_script: dict[str, list[tuple[ErrorCode, bool]]] = field(default_factory=dict)
@@ -166,6 +176,8 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
             serving_identity_error=(
                 state.serving_identity_error if state.reports_serving_identity else None
             ),
+            pack_prompt_hash=state.pack_prompt_hash,
+            pack_rails_hash=state.pack_rails_hash,
         )
 
     @app.get("/v1/health")
@@ -212,9 +224,13 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
                 adapter="fake",
                 run_identity=state.run_identity,
                 serving_identity=state.result_serving_identity or state.serving_identity,
+                pack_prompt_hash=state.pack_prompt_hash,
+                pack_rails_hash=state.pack_rails_hash,
             ),
             timings_ms=TimingsMs(scope=1.0, extract=2.0, derive=None, total=3.0),
             attempts=1,
+            turn_plan=state.turn_plan,
+            batch_record=state.batch_record,
         )
 
     return app
