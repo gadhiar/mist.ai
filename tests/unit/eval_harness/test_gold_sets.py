@@ -1084,10 +1084,33 @@ def test_every_dev_lists_event_id_follows_the_event_rule():
 
 # --- Gold invents no id (the extraction contract ADR, Decision 3) ----------------------------
 
+
 # Types whose ids a rule with a carrier builds rather than the utterance's words: the user
 # anchor (Rule 1), ISO Date ids (Rules 5, 13, 16), value-first Metric ids (the Metric rail) and
 # Event ids (E-b, checked above).
-_BUILT_ID_TYPES = frozenset({"User", "Date", "Metric", "Event"})
+def _built_id_types() -> frozenset[str]:
+    """Those types, read from the registry's active pack.
+
+    The user anchor's type is the manifest's. A type that a `typed_id` rule builds and an
+    `id_exempt` rule spares the id rail has an id its plug-in builds whole (Metric; a
+    Technology's rule only drops a version from the utterance's words). The two ends of an
+    id-phase `derived_edge` rule are the dated type and the type whose id dates it (Event,
+    Date).
+    """
+    from backend.knowledge.ontologies import registry
+
+    pack = registry.active_pack()
+    spared = {name for rule in pack.rules_of("id_exempt") for name in rule.params.types}
+    built = {rule.params.type for rule in pack.rules_of("typed_id")}
+    dated = {
+        name
+        for rule in pack.rules_of("derived_edge", "id")
+        for name in (rule.params.source_type, rule.params.target_type)
+    }
+    return frozenset({pack.manifest.user_type} | (built & spared) | dated)
+
+
+_BUILT_ID_TYPES = _built_id_types()
 # Other dev-lists ids that are not a run of the utterance's words, each kept by the register
 # convention named. A test below fails an entry that no longer needs keeping.
 _CONVENTION_KEPT_IDS = {

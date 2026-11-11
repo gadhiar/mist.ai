@@ -43,6 +43,7 @@ from typing import Literal
 # LABELLING.md N1: leading articles and possessive pronouns are dropped from ids. The N1
 # rail's own words, so the aligner and the rail read one set.
 from backend.knowledge.extraction.id_rails import N1_WORDS
+from backend.knowledge.ontologies import registry
 from backend.knowledge.ontologies.hierarchy import canonical_type, parent_of
 
 AlignmentKind = Literal[
@@ -62,8 +63,23 @@ EXCLUSION_EXEMPT_KINDS: frozenset[AlignmentKind] = frozenset(
     {"exact", "alternative", "event-date", "metric"}
 )
 PENDING_KINDS: frozenset[AlignmentKind] = frozenset({"typo", "paraphrase"})
-UNDIRECTED_PREDICATES: frozenset[str] = frozenset({"RELATED_TO", "WORKS_WITH"})
 RelKey = tuple[str, str, str]
+
+
+def undirected_predicates() -> frozenset[str]:
+    """The active pack's undirected edges: predicates whose two directions are one relation."""
+    return frozenset(
+        edge.type_name for edge in registry.active_pack().edge_types if not edge.directional
+    )
+
+
+def __getattr__(name: str) -> object:
+    # `UNDIRECTED_PREDICATES` is read as a module attribute, and is the active pack's set
+    # at each read rather than a copy taken when this module loaded.
+    if name == "UNDIRECTED_PREDICATES":
+        return undirected_predicates()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 _KIND_RANK: dict[str, int] = {kind: rank for rank, kind in enumerate(ALIGNMENT_KINDS)}
 _DATED_ID_RE = re.compile(r"^(?P<base>.+)-(?P<date>\d{4}-\d{2}-\d{2})$")
@@ -390,6 +406,7 @@ def match_relations(
     """
     to_gold = {pair.produced_id: pair.gold_id for pair in pairs}
     alternatives = predicate_alternatives or {}
+    undirected = undirected_predicates()
     gold_keys = sorted(set(gold))
     produced_keys = sorted(set(produced))
     options: list[tuple[tuple[int, int], RelKey, RelKey]] = []
@@ -404,7 +421,7 @@ def match_relations(
                 continue
             if mapped == (gold_source, gold_target):
                 orientation = 0
-            elif gold_predicate in UNDIRECTED_PREDICATES and mapped == (gold_target, gold_source):
+            elif gold_predicate in undirected and mapped == (gold_target, gold_source):
                 orientation = 1
             else:
                 continue
