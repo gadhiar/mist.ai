@@ -76,6 +76,26 @@ async def test_the_normalizer_builds_the_rail_row_from_what_it_is_handed():
 
 
 @pytest.mark.asyncio
+async def test_the_scope_the_normalizer_is_handed_reaches_the_rail_row():
+    # The base pack's crew rule adds `KNOWS_HAND` only in the user's own scope.
+    normalizer = EntityNormalizer(FakeEmbeddingGenerator(), pack=BASE)
+    entities = [
+        {"id": "user", "name": "User", "type": "Deckhand"},
+        {"id": "oswin", "name": "Oswin", "type": "Deckhand"},
+        {"id": "brannoch", "name": "Brannoch", "type": "Deckhand"},
+    ]
+    crew = [{"source": "oswin", "target": "brannoch", "type": "CREWS_WITH"}]
+
+    in_scope = await normalizer.normalize(_extraction(entities, crew), scope="user-scope")
+    no_scope = await normalizer.normalize(_extraction(entities, crew))
+
+    known = {"source": "user", "target": "oswin", "type": "KNOWS_HAND"}
+    assert known in in_scope.relationships
+    assert known not in no_scope.relationships
+    assert [r["type"] for r in no_scope.relationships] == ["CREWS_WITH", "SERVES_UNDER"]
+
+
+@pytest.mark.asyncio
 async def test_the_normalizer_logs_a_reserved_name_of_its_own_pack(caplog):
     normalizer = EntityNormalizer(FakeEmbeddingGenerator(), pack=BASE)
 
@@ -108,32 +128,32 @@ def _validated(pack, entities, relationships):
 
 def test_the_validator_reads_types_edges_and_pairs_from_the_pack_it_is_given():
     entities = [
-        {"id": "ada", "type": "Deckhand"},
+        {"id": "nell", "type": "Deckhand"},
         {"id": "bo", "type": "Deckhand"},
         {"id": "mooring-2", "type": "Mooring"},
         {"id": "rust", "type": "Technology"},
     ]
     relationships = [
-        {"source": "ada", "target": "mooring-2", "type": "MOORED_AT"},
-        {"source": "mooring-2", "target": "ada", "type": "MOORED_AT"},
-        {"source": "ada", "target": "bo", "type": "USES"},
-        {"source": "mooring-2", "target": "ada", "type": "ALONGSIDE"},
+        {"source": "nell", "target": "mooring-2", "type": "MOORED_AT"},
+        {"source": "mooring-2", "target": "nell", "type": "MOORED_AT"},
+        {"source": "nell", "target": "bo", "type": "USES"},
+        {"source": "mooring-2", "target": "nell", "type": "ALONGSIDE"},
     ]
 
     assert _validated(BASE, entities, relationships) == (
-        ["ada", "bo", "mooring-2"],
+        ["nell", "bo", "mooring-2"],
         ["MOORED_AT", "ALONGSIDE"],
     )
 
 
 def test_a_type_and_an_edge_one_pack_adds_are_unknown_to_the_other():
-    entities = [{"id": "ada", "type": "Deckhand"}, {"id": "pip", "type": "Pet"}]
-    owned = [{"source": "ada", "target": "pip", "type": "HAS_PET"}]
-    reversed_pair = [{"source": "pip", "target": "ada", "type": "HAS_PET"}]
+    entities = [{"id": "nell", "type": "Deckhand"}, {"id": "pip", "type": "Pet"}]
+    owned = [{"source": "nell", "target": "pip", "type": "HAS_PET"}]
+    reversed_pair = [{"source": "pip", "target": "nell", "type": "HAS_PET"}]
 
-    assert _validated(PET, entities, owned) == (["ada", "pip"], ["HAS_PET"])
-    assert _validated(PET, entities, reversed_pair) == (["ada", "pip"], [])
-    assert _validated(BASE, entities, owned) == (["ada"], [])
+    assert _validated(PET, entities, owned) == (["nell", "pip"], ["HAS_PET"])
+    assert _validated(PET, entities, reversed_pair) == (["nell", "pip"], [])
+    assert _validated(BASE, entities, owned) == (["nell"], [])
 
 
 def test_the_validator_without_a_pack_enforces_the_active_packs_pair_table():

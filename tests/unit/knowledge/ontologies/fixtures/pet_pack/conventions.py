@@ -36,18 +36,18 @@ def _batch(units: list[dict], entities: list[dict], relationships: list[dict]) -
 _USER = {"id": "user", "name": "User", "type": "Deckhand"}
 _BISCUIT = {"id": "biscuit", "name": "Biscuit", "type": "Pet"}
 _MANGO = {"id": "mango", "name": "Mango", "type": "Pet"}
-_JUNIPER = {"id": "juniper", "name": "Juniper", "type": "Deckhand"}
+_CORWEN = {"id": "corwen", "name": "Corwen", "type": "Deckhand"}
 _SABLE = {"id": "sable", "name": "Sable", "type": "Pet"}
 _PIP = {"id": "pip", "name": "Pip", "type": "Pet"}
 _USER_HAS_BISCUIT = {"source": "user", "target": "biscuit", "type": "HAS_PET"}
-_JUNIPER_HAS_SABLE = {"source": "juniper", "target": "sable", "type": "HAS_PET"}
+_CORWEN_HAS_SABLE = {"source": "corwen", "target": "sable", "type": "HAS_PET"}
 
 PET_ROSTER_CASE = PinnedCase(
     scope="user-scope",
-    entities=(_USER, _BISCUIT, _MANGO, _JUNIPER, _SABLE, _PIP),
-    relationships=(_USER_HAS_BISCUIT, _JUNIPER_HAS_SABLE),
+    entities=(_USER, _BISCUIT, _MANGO, _CORWEN, _SABLE, _PIP),
+    relationships=(_USER_HAS_BISCUIT, _CORWEN_HAS_SABLE),
     turn_plan={
-        "entities": [_BISCUIT, _MANGO, _JUNIPER, _SABLE, _PIP],
+        "entities": [_BISCUIT, _MANGO, _CORWEN, _SABLE, _PIP],
         "templates": [
             {
                 "lead_in": "Our pets:",
@@ -66,16 +66,16 @@ PET_ROSTER_CASE = PinnedCase(
             [_USER_HAS_BISCUIT],
         ),
         _batch(
-            [_unit("Juniper keeps a ferret called Sable", "Our pets")],
-            [_JUNIPER, _SABLE],
-            [_JUNIPER_HAS_SABLE],
+            [_unit("Corwen keeps a ferret called Sable", "Our pets")],
+            [_CORWEN, _SABLE],
+            [_CORWEN_HAS_SABLE],
         ),
         _batch([_unit("Pip", "The neighbours' animals")], [_PIP], []),
     ),
-    expected_entities=(_USER, _BISCUIT, _MANGO, _JUNIPER, _SABLE, _PIP),
+    expected_entities=(_USER, _BISCUIT, _MANGO, _CORWEN, _SABLE, _PIP),
     expected_relationships=(
         _USER_HAS_BISCUIT,
-        _JUNIPER_HAS_SABLE,
+        _CORWEN_HAS_SABLE,
         {
             "source": "user",
             "target": "mango",
