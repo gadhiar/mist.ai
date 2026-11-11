@@ -30,7 +30,7 @@ from backend.event_store.models import ConversationTurnEvent
 from backend.interfaces import EmbeddingProvider, EventStoreProvider
 from backend.knowledge.config import ExtractionConfig
 from backend.knowledge.extraction.confidence import ConfidenceScorer
-from backend.knowledge.extraction.normalizer import EntityNormalizer, rail_inputs
+from backend.knowledge.extraction.normalizer import EntityNormalizer, live_rail_inputs, rail_inputs
 from backend.knowledge.extraction.ontology_extractor import (
     ExtractionResult,
     OntologyConstrainedExtractor,
@@ -894,7 +894,7 @@ class ExtractionPipeline:
 
         # Stage 5: Normalization + deduplication
         stage_start = time.perf_counter()
-        extraction = await self._normalizer.normalize(extraction)
+        extraction = await self._normalizer.normalize(extraction, **live_rail_inputs(pre_processed))
         stage_5_ms = (time.perf_counter() - stage_start) * 1000
         logger.debug("Stage 5 (normalization): %.1fms", stage_5_ms)
 

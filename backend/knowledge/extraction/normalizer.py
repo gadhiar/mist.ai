@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.extraction import id_rails, rails
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.extraction.preprocessor import PreProcessedInput
 from backend.knowledge.ontologies import registry
 from backend.knowledge.ontologies.pack import Pack
 from backend.knowledge.storage.graph_executor import GraphExecutor
@@ -35,6 +36,22 @@ def rail_inputs(cached: Mapping) -> dict:
         cached: The row `ExtractionCache.get` returned.
     """
     return {name: cached[name] for name in _RAIL_INPUTS if cached.get(name) is not None}
+
+
+def live_rail_inputs(pre_processed: PreProcessedInput) -> dict:
+    """The rail inputs of a turn applied in process, as keyword arguments for `normalize`.
+
+    The in-process apply records the turn's cache row and runs the rails itself. A
+    replay of that row hands the rails `rail_inputs(row)`, so the first apply has to
+    hand them the same, or a scope-gated rule fires at one and not at the other. The
+    row is recorded with the Stage 1.5 scope and with no batch record and no turn plan,
+    which the in-process path does not have, so the scope is its only rail input.
+
+    Args:
+        pre_processed: The turn's Stage 1 output. Its metadata holds the Stage 1.5
+            scope under `subject_scope` when a classifier ran.
+    """
+    return rail_inputs({"scope": pre_processed.metadata.get("subject_scope")})
 
 
 class EntityNormalizer:
