@@ -189,7 +189,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-dab830325cf31812855e713a012287240ba9a830a4a77e910494964e6da45fb0",
+        code_identity="ci1-c83995edaa16a34497759583b8afe6ca098decdd308c2df87401d3350893d9b3",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -206,7 +206,12 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "(glosses) quotes the ontology's description after each user-centric predicate "
             "and the Organization and Event types, glosses WORKS_AT as employment only, states "
             "N17 named teams, N8, N10, N11 and N12 as Rules 34 to 38, amends Rule 6's "
-            "\"don't like X anymore\" to N12's pair, and adds Example 31. Re-extracts history."
+            "\"don't like X anymore\" to N12's pair, and adds Example 31; T40 round 1 "
+            "revises groups 2 and 3 to fit the 13,312-token prompt bound: Rule 28 states "
+            "that a list item's id is its own words, with no cadence, scope, owner, purpose "
+            "or quantity added, Rule 38 folds into Rule 6, Rule 34 and Rules 29 to 37 are "
+            "tightened, the glosses keep Organization, WORKS_AT and MEMBER_OF, and Example "
+            "29 returns to its group 1 text. Re-extracts history."
         ),
     ),
 )
