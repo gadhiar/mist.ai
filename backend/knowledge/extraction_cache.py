@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS extraction_cache (
     created_at TEXT,
     derivation TEXT,
     service_stamps TEXT,
-    identity_namespace TEXT
+    identity_namespace TEXT,
+    batch_record TEXT,
+    turn_plan TEXT
 );
 """
 
@@ -53,6 +55,13 @@ CREATE TABLE IF NOT EXISTS extraction_cache (
 # `identity_namespace` (mist-extraction-epoch-identity) IS part of the key when
 # set (`cache_key()`). NULL is the 3-part namespace: every row written before
 # the column existed, and every row an unbound or 3-part-bound epoch writes.
+#
+# `batch_record` and `turn_plan` are nullable JSON columns and are NOT part of
+# `cache_key()`. They are what a rail may read beside the payload and the scope
+# (`backend/knowledge/extraction/normalizer.py::rail_inputs`): one entry per
+# Stage 2 call the turn took, and the record of its plan call. NULL in either is
+# a turn extracted as one batch, or with no plan: every row written before the
+# columns existed, every row the in-process pipeline writes, and every skip row.
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("outcome", "TEXT NOT NULL DEFAULT 'extracted'"),
     ("skip_reason", "TEXT"),
@@ -61,6 +70,8 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("derivation", "TEXT"),
     ("service_stamps", "TEXT"),
     ("identity_namespace", "TEXT"),
+    ("batch_record", "TEXT"),
+    ("turn_plan", "TEXT"),
 )
 
 OUTCOME_EXTRACTED = "extracted"
@@ -228,13 +239,18 @@ class ExtractionCache:
         and treats a `skipped` row as a no-op turn rather than re-deciding it --
         spec D1's target state, landed in this same branch (Task 6), not a
         pending follow-up.
+
+        `batch_record` and `turn_plan` are always keys of the returned dict.
+        Each holds what `put` was given, or None when the column is NULL: a
+        turn extracted as one batch, or with no plan.
         """
         key = cache_key(event_id, extraction_version, model_hash, identity_namespace)
         row = (
             self._get_connection()
             .execute(
                 "SELECT ontology_version, outcome, skip_reason, scope, "
-                "scope_confidence, payload, derivation, service_stamps "
+                "scope_confidence, payload, derivation, service_stamps, "
+                "batch_record, turn_plan "
                 "FROM extraction_cache WHERE cache_key = ? AND identity_namespace IS ?",
                 (key, identity_namespace),
             )
@@ -253,6 +269,8 @@ class ExtractionCache:
             "relationships": payload.get("relationships", []),
             "derivation": _loads_or_none(row["derivation"]),
             "service_stamps": _loads_or_none(row["service_stamps"]),
+            "batch_record": _loads_or_none(row["batch_record"]),
+            "turn_plan": _loads_or_none(row["turn_plan"]),
         }
 
     def event_ids_for(
@@ -402,6 +420,8 @@ class ExtractionCache:
         derivation: dict[str, Any] | None = None,
         service_stamps: dict[str, Any] | None = None,
         identity_namespace: str | None = None,
+        batch_record: list[dict[str, Any]] | None = None,
+        turn_plan: dict[str, Any] | None = None,
     ) -> None:
         """Record what the live pipeline DECIDED for this turn.
 
@@ -416,6 +436,11 @@ class ExtractionCache:
         `identity_namespace` is the writing epoch's namespace, stored on the
         row and folded into its key; None (the 3-part namespace) is what every
         caller wrote before namespaces existed.
+
+        `batch_record` and `turn_plan` are the rail inputs the extraction
+        service returned with the payload (see `_MIGRATION_COLUMNS`), stored as
+        JSON and read back by `get` under the same names. None stores SQL NULL.
+        Neither is part of the key.
         """
         if outcome not in (OUTCOME_EXTRACTED, OUTCOME_SKIPPED):
             raise ValueError(f"unknown outcome {outcome!r}")
@@ -436,8 +461,8 @@ class ExtractionCache:
             "INSERT OR REPLACE INTO extraction_cache "
             "(cache_key, event_id, ontology_version, extraction_version, model_hash, "
             "outcome, skip_reason, scope, scope_confidence, payload, created_at, "
-            "derivation, service_stamps, identity_namespace) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "derivation, service_stamps, identity_namespace, batch_record, turn_plan) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 event_id,
@@ -453,6 +478,8 @@ class ExtractionCache:
                 None if derivation is None else json.dumps(derivation, sort_keys=True),
                 None if service_stamps is None else json.dumps(service_stamps, sort_keys=True),
                 identity_namespace,
+                None if batch_record is None else json.dumps(batch_record, sort_keys=True),
+                None if turn_plan is None else json.dumps(turn_plan, sort_keys=True),
             ),
         )
 
