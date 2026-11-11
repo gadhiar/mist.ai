@@ -210,14 +210,38 @@ _FIRST_APPLY = "2026-09-01T10:00:05+00:00"
 _RE_APPLY = "2026-09-28T12:00:00+00:00"
 
 
-def _extracted_from_on_match_set(*, now: str, event_id: str) -> dict[str, Any]:
+_HASHLESS_STAMPS = RebuildStamps(
+    ontology_version="1.2.0", extraction_version="v-x", model_hash="m-x"
+)
+_PROMPT = "a" * 64
+_RAILS = "b" * 64
+_PACK_STAMPS = RebuildStamps(
+    ontology_version="1.2.0",
+    extraction_version="v-x",
+    model_hash="m-x",
+    pack_prompt_hash=_PROMPT,
+    pack_rails_hash=_RAILS,
+)
+
+
+def _set_properties(properties: dict[str, Any], written: dict[str, Any]) -> None:
+    """Apply a Cypher SET to `properties`: a null value removes the property."""
+    for name, value in written.items():
+        if value is None:
+            properties.pop(name, None)
+        else:
+            properties[name] = value
+
+
+def _extracted_from_on_match_set(
+    *, now: str, event_id: str, stamps: RebuildStamps = _HASHLESS_STAMPS
+) -> dict[str, Any]:
     """The properties `_extracted_from_clause`'s ON MATCH SET writes, read off the clause.
 
     Built from the production fragment rather than restated, so a property
     added to that SET shows up here. Only the writer's stamps are read from
-    `self`, so a stand-in carrying them is enough.
+    `self`, so a stand-in carrying them is enough; `stamps` are that writer's.
     """
-    stamps = RebuildStamps(ontology_version="1.2.0", extraction_version="v-x", model_hash="m-x")
     fragment, params = CurationGraphWriter._extracted_from_clause(
         SimpleNamespace(_rebuild_stamps=stamps)  # type: ignore[arg-type]
     )
@@ -546,6 +570,94 @@ class TestVerdicts:
             assert '  changed node "python": derived_at' in text
         else:
             assert '  changed rel "user"-[USES]->"python": derived_at' in text
+
+    def _provenance_edge_world(self, first_writer: RebuildStamps, mutate) -> FakeGraph:
+        """`_extracted_from_world`, with the provenance edge as `first_writer` left it.
+
+        The edge holds what a first apply by a writer with those stamps set on
+        it: a pack hash the writer held, and no property for one it did not.
+        """
+        graph = self._extracted_from_world(mutate)
+        edge = graph.rels[1]["properties"]
+        _set_properties(
+            edge,
+            _extracted_from_on_match_set(now=_FIRST_APPLY, event_id="evt-1", stamps=first_writer),
+        )
+        return graph
+
+    @pytest.mark.parametrize(
+        "first_writer",
+        [
+            pytest.param(_HASHLESS_STAMPS, id="edge-holds-no-hash"),
+            pytest.param(
+                RebuildStamps(
+                    ontology_version="1.2.0",
+                    extraction_version="v-x",
+                    model_hash="m-x",
+                    pack_prompt_hash="e" * 64,
+                    pack_rails_hash="f" * 64,
+                ),
+                id="edge-holds-other-hashes",
+            ),
+        ],
+    )
+    def test_a_reapply_by_a_writer_with_pack_hashes_names_exactly_the_two_hashes(
+        self, world, first_writer
+    ):
+        """Not excluded: the provenance edge takes the re-applying writer's pack hashes."""
+        _applied_turn(world)
+        seen: list[set[str]] = []
+
+        def reapply(nodes, rels):
+            props = rels[1]["properties"]
+            before = dict(props)
+            _set_properties(
+                props,
+                _extracted_from_on_match_set(now=_RE_APPLY, event_id="evt-1", stamps=_PACK_STAMPS),
+            )
+            seen.append({k for k in props if props[k] != before.get(k)})
+
+        graph = self._provenance_edge_world(first_writer, reapply)
+        if first_writer is _HASHLESS_STAMPS:
+            assert "pack_prompt_hash" not in graph.rels[1]["properties"]
+            assert "pack_rails_hash" not in graph.rels[1]["properties"]
+
+        code, text = _cli(world, "evt-1", graph)
+
+        # The clause changed four properties; the two excluded ones are not reported.
+        assert seen == [{"derived_at", "updated_at", "pack_prompt_hash", "pack_rails_hash"}]
+        assert code == EXIT_DIFFERS, text
+        assert "differing keys: added=0 removed=0 changed=1" in text
+        assert (
+            "differing properties on changed elements: pack_prompt_hash x1, pack_rails_hash x1\n"
+        ) in text
+        assert (
+            '  changed rel "python"-[EXTRACTED_FROM]->"ctx-s1": pack_prompt_hash, pack_rails_hash'
+        ) in text
+
+    def test_a_reapply_over_an_edge_that_holds_the_writers_pack_hashes_exits_0(self, world):
+        """The same writer twice: the two hashes are rewritten to the values they hold."""
+        _applied_turn(world)
+        seen: list[set[str]] = []
+
+        def reapply(nodes, rels):
+            props = rels[1]["properties"]
+            before = dict(props)
+            _set_properties(
+                props,
+                _extracted_from_on_match_set(now=_RE_APPLY, event_id="evt-1", stamps=_PACK_STAMPS),
+            )
+            seen.append({k for k in props if props[k] != before.get(k)})
+
+        graph = self._provenance_edge_world(_PACK_STAMPS, reapply)
+        held = graph.rels[1]["properties"]
+        assert (held["pack_prompt_hash"], held["pack_rails_hash"]) == (_PROMPT, _RAILS)
+
+        code, text = _cli(world, "evt-1", graph)
+
+        assert seen == [{"derived_at", "updated_at"}]
+        assert code == EXIT_IDENTICAL, text
+        assert "fingerprints IDENTICAL (exit 0)" in text
 
     def test_the_summary_lists_at_most_the_limit(self):
         before = fingerprint_graph([], [])

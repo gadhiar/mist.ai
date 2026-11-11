@@ -107,6 +107,17 @@ WHAT A RE-APPLY IS KNOWN TO CHANGE (found by reading)
   turn's event id, and the `_upsert_entity` replay guard, which keys on it,
   then no longer suppresses the confidence reinforce. Choose the most
   recently applied turn.
+- Not excluded: `pack_prompt_hash` and `pack_rails_hash` on those
+  EXTRACTED_FROM edges. `_extracted_from_clause` sets both on ON MATCH as
+  well as ON CREATE, from the writer's `RebuildStamps`
+  (`grep -n 'pack_prompt_hash\|pack_rails_hash' backend/knowledge/curation/graph_writer.py`),
+  so a re-apply by a writer whose stamps hold pack hashes sets both on every
+  provenance edge the turn's entities write. Over an edge that holds none
+  (written before the hashes were stamped), or others (written under another
+  pack), the check exits 3 and names the two properties; over an edge that
+  holds the writer's hashes neither changes. The fact edge and the structural
+  edge `reconciliation.py` writes set the two hashes on create alone, so a
+  re-apply does not rewrite them there.
 """
 
 from __future__ import annotations
