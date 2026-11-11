@@ -45,8 +45,9 @@ def test_normalize_payload_is_run_rails_through_the_active_pack():
 
 def _without_an_id_key() -> tuple[dict, dict]:
     """A reserved name with no type and a retired type with a default, neither with an id."""
-    reserved_name = next(iter(id_rails.RESERVED_NAMES))
-    retired = next(name for name, added in id_rails.RETIRED_PROPERTY_DEFAULTS.items() if added)
+    pack = registry.active_pack()
+    reserved_name = pack.rules_of("reserved_identity")[0].params.names[0]
+    retired = next(r.name for r in pack.manifest.retired_types if r.property_defaults)
     return {"name": reserved_name}, {"name": "Harbour Opening", "type": retired}
 
 

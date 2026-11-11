@@ -180,19 +180,18 @@ def test_the_packs_pair_table_is_the_one_the_validator_derived_before():
     assert registry.active_pack().pair_table.keys() == before.keys()
 
 
-def test_the_packs_manifest_is_what_the_hierarchy_and_the_id_rails_hold():
+def test_the_packs_manifest_is_what_the_hierarchy_holds_and_the_id_rails_held():
     manifest = registry.active_pack().manifest
 
     assert {r.name: r.replacement for r in manifest.retired_types} == RETIRED_TYPE_MAP
     assert dict(manifest.supertypes) == ANCHOR_CHILD
-    assert manifest.fallback_type == id_rails.FALLBACK_TYPE
-    assert manifest.user_id == id_rails.USER_ID
+    assert (manifest.fallback_type, manifest.user_id) == ("Abstraction", "user")
     defaults = {r.name: r.property_defaults for r in manifest.retired_types}
-    assert defaults == id_rails.RETIRED_PROPERTY_DEFAULTS
+    assert defaults == {"Topic": (), "Milestone": (("event_type", "milestone"),)}
     assert sum(1 for value in defaults.values() if value) == 1
 
 
-def test_the_packs_rules_are_the_id_rails_constants():
+def test_the_packs_rules_are_the_vocabularies_the_pack_states():
     pack = registry.active_pack()
     reserved = {
         name: (rule.params.id, rule.params.type)
@@ -201,12 +200,15 @@ def test_the_packs_rules_are_the_id_rails_constants():
     }
     by_match = {rule.params.match: rule.params for rule in pack.rules_of("alias_vocabulary")}
 
-    assert reserved == id_rails.RESERVED_NAMES
-    assert dict(by_match["id"].aliases) == id_rails.STATIC_ALIASES
-    assert dict(by_match["name"].aliases) == id_rails.PRE_CANON_ALIASES
+    assert reserved == {
+        name: (pack_conventions.RESERVED_ID, "MistIdentity")
+        for name in pack_conventions.RESERVED_NAMES
+    }
+    assert by_match["id"].aliases == pack_conventions.STATIC_ALIASES
+    assert by_match["name"].aliases == pack_conventions.PRE_CANON_ALIASES
     assert by_match["id"].types == by_match["name"].types == ()
-    assert pack.rules_of("id_exempt")[0].params.types == id_rails.ID_EXEMPT_TYPES
-    assert sorted(id_rails.ID_EXEMPT_TYPES) == sorted(id_rails._N1_EXEMPT_TYPES)
+    assert pack.rules_of("id_exempt")[0].params.types == pack_conventions.ID_EXEMPT_TYPES
+    assert sorted(pack_conventions.ID_EXEMPT_TYPES) == ["Date", "Metric", "MistIdentity", "User"]
 
 
 def test_the_packs_plan_vocabulary_is_todays_extractable_lists():
@@ -243,7 +245,7 @@ def test_the_pack_hashes_to_the_pinned_values(fresh_registry):
 
     assert (pack.pack_prompt_hash, pack.pack_rails_hash) == (
         "5357a198ce334d01a38ae38f7ca63c8e2d916381f3099d5f74ea6862a6f54fdb",
-        "4781cce194608f35e864998ae4946c1a5b4070e310f6d7d756aed2582edd73ab",
+        "a837f8cfc450ed027dd6af5c823b70bf974178cfb2a8672b3fd4174024e0c76d",
     )
 
 

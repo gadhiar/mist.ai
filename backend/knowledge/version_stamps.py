@@ -151,12 +151,14 @@ class PackRelease:
 #
 # Under 2026-11-10-r8 the prompt hash moved once with no change to the model's input:
 # the generated output schema joined what it covers, and that schema equals the one
-# the service already sent.
+# the service already sent. The rails hash moved once with no change to what is
+# stored: the three id plug-ins moved, bodies unchanged, from `id_rails.py` into the
+# pack's `plugins.py`, and the hash covers the source of the module that holds them.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
     pack_prompt_hash="5357a198ce334d01a38ae38f7ca63c8e2d916381f3099d5f74ea6862a6f54fdb",
-    pack_rails_hash="4781cce194608f35e864998ae4946c1a5b4070e310f6d7d756aed2582edd73ab",
+    pack_rails_hash="a837f8cfc450ed027dd6af5c823b70bf974178cfb2a8672b3fd4174024e0c76d",
 )
 
 

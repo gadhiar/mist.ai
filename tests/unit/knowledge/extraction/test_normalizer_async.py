@@ -526,14 +526,14 @@ class TestStoredIdFromTheIdField:
         assert out.entities[0]["id"] == "acme-corp"
         assert out.relationships[0]["target"] == "acme-corp"
 
-    def test_the_class_constants_are_the_id_rails_objects(self):
+    def test_the_class_keeps_the_engines_registry_and_no_name_that_moved_to_the_pack(self):
         from backend.knowledge.extraction import id_rails
 
-        assert EntityNormalizer.STATIC_ALIASES is id_rails.STATIC_ALIASES
-        assert EntityNormalizer.RESERVED_NAMES is id_rails.RESERVED_NAMES
         assert EntityNormalizer.CANONICAL_REGISTRY is id_rails.CANONICAL_REGISTRY
-        assert EntityNormalizer.VERSION_PATTERN is id_rails.VERSION_PATTERN
-        assert EntityNormalizer.PRE_CANON_ALIASES is id_rails.PRE_CANON_ALIASES
+        assert {} == id_rails.CANONICAL_REGISTRY
+        for moved in ("STATIC_ALIASES", "RESERVED_NAMES", "VERSION_PATTERN", "PRE_CANON_ALIASES"):
+            assert not hasattr(EntityNormalizer, moved)
+            assert not hasattr(id_rails, moved)
         assert not hasattr(EntityNormalizer, "_canonicalize")
         assert not hasattr(EntityNormalizer, "_resolve_type_and_id")
 

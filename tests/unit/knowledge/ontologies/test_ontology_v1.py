@@ -11,6 +11,7 @@ import ast
 import copy
 import dataclasses
 import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -526,6 +527,7 @@ class TestThePackImportsWithNoCycle:
             "backend.knowledge.ontologies.v1_0_0",
             "backend.knowledge.ontologies.registry",
             "backend.knowledge.extraction.id_rails",
+            "backend.knowledge.ontologies.hierarchy",
             _PACK_TYPES,
             f"{_PACK_PACKAGE}.manifest",
             f"{_PACK_PACKAGE}.conventions",
@@ -533,8 +535,14 @@ class TestThePackImportsWithNoCycle:
         ],
     )
     def test_a_fresh_interpreter_imports_the_chain_from_any_end(self, first: str):
+        # The hierarchy's two maps are read first of all: the hierarchy module reads
+        # them from the pack's types, which import the hierarchy module.
         code = (
             f"import {first}\n"
+            "from backend.knowledge.ontologies.hierarchy import ANCHOR_CHILD, RETIRED_TYPE_MAP\n"
+            f"from {_PACK_PACKAGE}.types import RETIRED_TYPES, SUPERTYPES\n"
+            "assert RETIRED_TYPE_MAP == dict(RETIRED_TYPES)\n"
+            "assert ANCHOR_CHILD == dict(SUPERTYPES)\n"
             "from backend.knowledge import version_stamps\n"
             "from backend.knowledge.ontologies import pack, v1_0_0\n"
             f"from {_PACK_PACKAGE} import types\n"
@@ -773,38 +781,136 @@ class TestTheRegistryServesThePack:
         assert file_pack.labelling == _PACK_GUIDE.read_text(encoding="utf-8")
 
 
-class TestThePackStatesWhatTheOldModulesHold:
-    """The pack states its data itself, equal to the modules that still hold a copy.
+def _digest(pairs) -> str:
+    text = json.dumps([list(pair) for pair in pairs], separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    While the two are equal, removing the modules' copy is a deletion.
+
+_MOVED_FROM_THE_ID_RAILS = (
+    "STATIC_ALIASES",
+    "PRE_CANON_ALIASES",
+    "VERSION_PATTERN",
+    "RESERVED_NAMES",
+    "USER_ID",
+    "FALLBACK_TYPE",
+    "ID_EXEMPT_TYPES",
+    "RETIRED_PROPERTY_DEFAULTS",
+    "version_rail",
+    "technology_version_id",
+    "metric_id",
+    "event_date_id",
+)
+
+
+class TestThePackStatesWhatTheOldModulesHeld:
+    """The pack states, value for value, what the id rails' ontology half held.
+
+    That half is removed. The values here were read from it before it went: the alias
+    vocabulary by the digest of its pairs in order, the rest written out.
     """
 
     def test_the_alias_vocabularies(self):
-        assert tuple(id_rails.STATIC_ALIASES.items()) == pack_conventions.STATIC_ALIASES
-        assert tuple(id_rails.PRE_CANON_ALIASES.items()) == pack_conventions.PRE_CANON_ALIASES
+        assert len(pack_conventions.STATIC_ALIASES) == 32
+        assert _digest(pack_conventions.STATIC_ALIASES) == (
+            "3492a6a04cde8509d0e5f7c8f975371c145ad05a1469a9033215bb4a180122e9"
+        )
+        assert pack_conventions.PRE_CANON_ALIASES == (("c++", "c-plus-plus"), ("c#", "c-sharp"))
 
     def test_the_reserved_names(self):
-        identity = (pack_conventions.RESERVED_ID, pack_types.MIST_IDENTITY.type_name)
-
-        assert tuple(id_rails.RESERVED_NAMES) == pack_conventions.RESERVED_NAMES
-        assert set(id_rails.RESERVED_NAMES.values()) == {identity}
+        assert pack_conventions.RESERVED_NAMES == (
+            "mist",
+            "mist.ai",
+            "mist ai",
+            "mist-ai",
+            "the ai",
+            "the-ai",
+            "the assistant",
+            "the-assistant",
+        )
+        assert (pack_conventions.RESERVED_ID, pack_types.MIST_IDENTITY.type_name) == (
+            "mist-identity",
+            "MistIdentity",
+        )
 
     def test_the_types_the_id_rail_leaves_alone(self):
-        assert id_rails.ID_EXEMPT_TYPES == pack_conventions.ID_EXEMPT_TYPES
+        assert pack_conventions.ID_EXEMPT_TYPES == ("MistIdentity", "User", "Date", "Metric")
 
     def test_the_retired_types_and_what_they_gain(self):
         retired = pack_manifest.MANIFEST.retired_types
 
-        assert {r.name: r.replacement for r in retired} == hierarchy.RETIRED_TYPE_MAP
-        assert [r.name for r in retired] == list(hierarchy.RETIRED_TYPE_MAP)
-        assert {r.name: r.property_defaults for r in retired} == id_rails.RETIRED_PROPERTY_DEFAULTS
+        assert [(r.name, r.replacement, r.property_defaults) for r in retired] == [
+            ("Topic", "Concept", ()),
+            ("Milestone", "Event", (("event_type", "milestone"),)),
+        ]
 
     def test_the_supertype_the_fallback_and_the_user_anchor(self):
         manifest = pack_manifest.MANIFEST
 
-        assert manifest.supertypes == tuple(hierarchy.ANCHOR_CHILD.items())
-        assert manifest.fallback_type == id_rails.FALLBACK_TYPE
-        assert manifest.user_id == id_rails.USER_ID
+        assert manifest.supertypes == (("Abstraction", "Concept"),)
+        assert (manifest.fallback_type, manifest.user_id, manifest.user_type) == (
+            "Abstraction",
+            "user",
+            "User",
+        )
+
+    @pytest.mark.parametrize("name", _MOVED_FROM_THE_ID_RAILS)
+    def test_the_id_rails_hold_no_copy(self, name: str):
+        assert not hasattr(id_rails, name)
+
+    def test_the_plug_ins_are_written_in_the_packs_own_module(self, file_pack: Pack):
+        assert [plugin.fn.__module__ for plugin in file_pack.plugins] == [pack_plugins.__name__] * 3
+        assert pack_plugins.ISO_DATE_RE is id_rails.ISO_DATE_RE
+
+
+class TestTheHierarchyReadsThePack:
+    """The retired types and the supertypes are stated once, in the pack's types."""
+
+    def test_the_two_maps_are_the_packs_tuples(self):
+        assert dict(pack_types.RETIRED_TYPES) == hierarchy.RETIRED_TYPE_MAP
+        assert list(hierarchy.RETIRED_TYPE_MAP) == [name for name, _ in pack_types.RETIRED_TYPES]
+        assert dict(pack_types.SUPERTYPES) == hierarchy.ANCHOR_CHILD
+
+    def test_the_two_maps_hold_what_they_held(self):
+        assert {"Topic": "Concept", "Milestone": "Event"} == hierarchy.RETIRED_TYPE_MAP
+        assert {"Abstraction": "Concept"} == hierarchy.ANCHOR_CHILD
+
+    def test_each_map_is_one_object_however_it_is_read(self):
+        from backend.knowledge.ontologies.hierarchy import ANCHOR_CHILD, RETIRED_TYPE_MAP
+
+        assert RETIRED_TYPE_MAP is hierarchy.RETIRED_TYPE_MAP
+        assert ANCHOR_CHILD is hierarchy.ANCHOR_CHILD
+
+    def test_the_manifest_is_built_from_the_same_tuples(self):
+        manifest = pack_manifest.MANIFEST
+
+        assert tuple((r.name, r.replacement) for r in manifest.retired_types) == (
+            pack_types.RETIRED_TYPES
+        )
+        assert manifest.supertypes is pack_types.SUPERTYPES
+
+    def test_the_hierarchy_module_names_no_type(self):
+        source = Path(hierarchy.__file__).read_text(encoding="utf-8")
+        names = {name for pair in pack_types.RETIRED_TYPES + pack_types.SUPERTYPES for name in pair}
+
+        assert [name for name in sorted(names) if f'"{name}"' in source] == []
+
+    def test_a_name_the_module_does_not_have_is_an_attribute_error(self):
+        with pytest.raises(AttributeError, match="NO_SUCH_MAP"):
+            hierarchy.NO_SUCH_MAP  # noqa: B018
+
+    def test_the_functions_read_the_same_data(self):
+        assert hierarchy.canonical_type("Milestone") == "Event"
+        assert hierarchy.canonical_type("Event") == "Event"
+        assert hierarchy.anchor_child_of("Abstraction") == "Concept"
+        assert hierarchy.expand_allowed_with_parents(("Concept", "Skill")) == (
+            "Concept",
+            "Skill",
+            "Abstraction",
+        )
+        assert hierarchy.dedup_type_filter("Abstraction") == sorted(
+            {"Abstraction", *hierarchy.children_of("Abstraction")}
+        )
+        assert hierarchy.dedup_type_filter("Person") == ["Person"]
 
 
 class TestThePacksCounts:

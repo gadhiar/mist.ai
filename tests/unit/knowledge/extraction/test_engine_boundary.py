@@ -19,11 +19,10 @@ BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
 PET = load_pack("tests.unit.knowledge.ontologies.fixtures.pet_pack")
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_ONTOLOGY_HALF = "# === ontology half ==="
 
 
 def _engine_sources() -> dict[str, str]:
-    """The engine files, by path: the id rails count up to their ontology half."""
+    """The engine files, by path."""
     backend = _REPO_ROOT / "backend"
     extraction = backend / "knowledge" / "extraction"
     paths = sorted((backend / "extraction_service").glob("*.py"))
@@ -32,15 +31,9 @@ def _engine_sources() -> dict[str, str]:
         extraction / "normalizer.py",
         extraction / "rails.py",
         extraction / "pre_llm.py",
+        extraction / "id_rails.py",
     ]
-    sources = {
-        str(path.relative_to(_REPO_ROOT)): path.read_text(encoding="utf-8") for path in paths
-    }
-    id_rails_source = (extraction / "id_rails.py").read_text(encoding="utf-8")
-    assert id_rails_source.count(f"\n{_ONTOLOGY_HALF}\n") == 1
-    engine_half = id_rails_source.split(f"\n{_ONTOLOGY_HALF}\n")[0]
-    sources["backend/knowledge/extraction/id_rails.py (engine half)"] = engine_half
-    return sources
+    return {str(path.relative_to(_REPO_ROOT)): path.read_text(encoding="utf-8") for path in paths}
 
 
 def _quoted_pack_names(pack: Pack, sources: dict[str, str]) -> list[tuple[str, str]]:
@@ -81,5 +74,5 @@ def test_the_boundary_covers_the_engine_files_the_plan_lists():
         "backend/knowledge/extraction/normalizer.py",
         "backend/knowledge/extraction/rails.py",
         "backend/knowledge/extraction/pre_llm.py",
-        "backend/knowledge/extraction/id_rails.py (engine half)",
+        "backend/knowledge/extraction/id_rails.py",
     } <= {path.replace("\\", "/") for path in covered}

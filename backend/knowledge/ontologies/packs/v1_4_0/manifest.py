@@ -12,7 +12,13 @@ from __future__ import annotations
 
 from backend.knowledge.ontologies.pack import Manifest, RetiredType
 
-from .types import ABSTRACTION, CONCEPT, EVENT, ONTOLOGY_V1_0_0, RELATED_TO, USER
+from .types import ABSTRACTION, ONTOLOGY_V1_0_0, RELATED_TO, RETIRED_TYPES, SUPERTYPES, USER
+
+# What an entity of a retired type gains, unless it has it, when its type is replaced: a
+# Milestone becomes an Event whose `event_type` says what it was.
+_RETIRED_GAINS: dict[str, tuple[tuple[str, str], ...]] = {
+    "Milestone": (("event_type", "milestone"),),
+}
 
 # How many types and edges the version has, and how many of each the model may produce.
 NODE_TYPE_COUNT = 30
@@ -28,14 +34,13 @@ MANIFEST = Manifest(
     user_id="user",
     user_type=USER.type_name,
     parent_version=ONTOLOGY_V1_0_0.parent_version,
-    # v1.4.0 retired both. A Milestone becomes an Event whose `event_type` says what it
-    # was, unless the entity already states one.
-    retired_types=(
-        RetiredType("Topic", CONCEPT.type_name),
-        RetiredType("Milestone", EVENT.type_name, (("event_type", "milestone"),)),
+    # The retired types and the supertypes are the tuples `types.py` states, which the
+    # hierarchy module reads too: an edge that accepts a Concept accepts an Abstraction.
+    retired_types=tuple(
+        RetiredType(name, replacement, _RETIRED_GAINS.get(name, ()))
+        for name, replacement in RETIRED_TYPES
     ),
-    # An edge that accepts a Concept accepts an Abstraction.
-    supertypes=((ABSTRACTION.type_name, CONCEPT.type_name),),
+    supertypes=SUPERTYPES,
     escape_edge=RELATED_TO.type_name,
     migration_script_path=ONTOLOGY_V1_0_0.migration_script_path,
     deprecated=ONTOLOGY_V1_0_0.deprecated,

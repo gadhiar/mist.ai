@@ -39,7 +39,26 @@ from backend.knowledge.ontologies.base import (
     PropertyDefinition,
     TemporalClass,
 )
-from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP, expand_allowed_with_parents
+from backend.knowledge.ontologies.hierarchy import expand_allowed_with_parents
+
+# ===================================================================
+# The hierarchy's data
+# ===================================================================
+
+# Stated once, here, because this module imports no loader. The manifest builds its
+# retired types and its supertypes from the two tuples, and
+# `backend/knowledge/ontologies/hierarchy.py` reads them for the code that asks it for
+# a canonical type. They stand above the edge types, which are built with them.
+#
+# What v1.4.0 retired, and the type each retired type becomes.
+RETIRED_TYPES: tuple[tuple[str, str], ...] = (
+    ("Topic", "Concept"),
+    ("Milestone", "Event"),
+)
+
+# Each abstract supertype and its anchor child: a type slot accepts the supertype
+# wherever it accepts the anchor child.
+SUPERTYPES: tuple[tuple[str, str], ...] = (("Abstraction", "Concept"),)
 
 # ===================================================================
 # Confidence Policies
@@ -1846,9 +1865,10 @@ def _v1_4_0_allowed(types: tuple[str, ...]) -> tuple[str, ...]:
     Milestone -> Event mapping: edges that listed BOTH Event and Milestone collapse to
     a single Event (dedup); edges that listed ONLY Milestone now list Event. Intended.
     """
+    retired = dict(RETIRED_TYPES)
     mapped: list[str] = []
     for t in types:
-        c = RETIRED_TYPE_MAP.get(t, t)
+        c = retired.get(t, t)
         if c not in mapped:
             mapped.append(c)
     return expand_allowed_with_parents(tuple(mapped))

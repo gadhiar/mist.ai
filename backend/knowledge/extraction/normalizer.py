@@ -43,16 +43,12 @@ class EntityNormalizer:
     the sole authority for graph-identity decisions. The steps and their order are in
     `rails.run_rails`; what they act on is the pack's.
 
-    The class constants are the `id_rails` objects themselves. `CANONICAL_REGISTRY` is
+    The class constant is the `id_rails` object itself. `CANONICAL_REGISTRY` is
     read by the runner at each call, so a test that patches it in place
     (`monkeypatch.setitem(EntityNormalizer.CANONICAL_REGISTRY, ...)`) reaches the steps.
     """
 
-    STATIC_ALIASES = id_rails.STATIC_ALIASES
-    PRE_CANON_ALIASES = id_rails.PRE_CANON_ALIASES
-    VERSION_PATTERN = id_rails.VERSION_PATTERN
     CANONICAL_REGISTRY = id_rails.CANONICAL_REGISTRY
-    RESERVED_NAMES = id_rails.RESERVED_NAMES
 
     def __init__(
         self,
