@@ -9,7 +9,6 @@ from backend.knowledge.ontologies.base import (
     ConfidencePolicy,
     EdgeTypeDefinition,
     EntityStatus,
-    ExtractionRules,
     KnowledgeDomain,
     NodeTypeDefinition,
     OntologyVersion,
@@ -43,7 +42,6 @@ __all__ = [
     "PropertyDefinition",
     "NodeTypeDefinition",
     "EdgeTypeDefinition",
-    "ExtractionRules",
     "ConfidencePolicy",
     "OntologyVersion",
     # v1.0.0 ontology

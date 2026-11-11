@@ -399,6 +399,25 @@ class TestConfidencePolicies:
 # -------------------------------------------------------------------
 
 
+def test_an_ontology_version_holds_types_and_policies_and_no_prompt_of_its_own():
+    """The prompt and the extractable lists are the pack's; a second copy went unread."""
+    assert [field.name for field in dataclasses.fields(type(ONTOLOGY_V1_0_0))] == [
+        "version",
+        "created_at",
+        "description",
+        "node_types",
+        "edge_types",
+        "confidence_policies",
+        "universal_entity_properties",
+        "universal_relationship_properties",
+        "parent_version",
+        "migration_script_path",
+        "active",
+        "deprecated",
+        "deprecated_reason",
+    ]
+
+
 class TestOntologyVersion:
     """Verify the top-level ontology version metadata."""
 

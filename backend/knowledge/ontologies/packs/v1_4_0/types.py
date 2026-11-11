@@ -32,7 +32,6 @@ from backend.knowledge.ontologies.base import (
     Cardinality,
     ConfidencePolicy,
     EdgeTypeDefinition,
-    ExtractionRules,
     KnowledgeDomain,
     NodeTypeDefinition,
     OntologyVersion,
@@ -1943,59 +1942,6 @@ EXTRACTABLE_RELATIONSHIP_TYPES: list[str] = [
 ]
 
 # ===================================================================
-# Extraction Rules
-# ===================================================================
-
-_EXTRACTION_SYSTEM_PROMPT = """\
-You are a knowledge-graph extraction engine for the MIST.AI cognitive assistant.
-
-Your job is to read a user utterance and produce structured entities and
-relationships that should be stored in MIST's persistent knowledge graph.
-
-ENTITY TYPES YOU MAY PRODUCE (21):
-  User, Person, Organization, Technology, Skill, Project, Concept, Event,
-  Goal, Preference, Location, Date, Metric, Document, Pattern, Convention,
-  Mechanism, Strategy, DataStructure, Abstraction, MistIdentity
-
-RELATIONSHIP TYPES YOU MAY PRODUCE (39):
-  User-centric: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL,
-    PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED,
-    RECOMMENDS, HAS_HABIT
-  Structural: IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH,
-    KNOWS_PERSON, MEMBER_OF
-  Temporal / quantified / document: OCCURRED_ON, HAS_METRIC,
-    REFERENCES_DOCUMENT, PRECEDED_BY
-  Mechanism / Pattern / Strategy (v1.1.0): MECHANISM_OF, OPERATES_ON,
-    INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR,
-    NAMING_CONVENTION_OF
-  MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
-    MIST_HAS_PREFERENCE
-
-RULES:
-1. Only extract entities and relationships that are clearly supported by the
-   utterance. Do not infer beyond what is stated.
-2. Each entity must have a display_name. Include type-specific properties only
-   when explicitly mentioned.
-3. Each relationship must reference source and target entities by display_name
-   and include a confidence score.
-4. Respect the allowed source/target type constraints for each relationship.
-5. Assign confidence scores between 0.0 and 1.0 based on how explicitly the
-   information was stated.
-6. Do not produce internal (Mist*) entities or bridging entities -- those are
-   managed by separate subsystems.
-"""
-
-EXTRACTION_RULES = ExtractionRules(
-    system_prompt=_EXTRACTION_SYSTEM_PROMPT,
-    allowed_node_types=tuple(EXTRACTABLE_NODE_TYPES),
-    allowed_relationship_types=tuple(EXTRACTABLE_RELATIONSHIP_TYPES),
-    property_extraction_enabled=True,
-    max_entities_per_utterance=10,
-    max_relationships_per_utterance=15,
-    min_confidence_threshold=0.4,
-)
-
-# ===================================================================
 # OntologyVersion v1.0.0
 # ===================================================================
 
@@ -2029,7 +1975,6 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
     ),
     node_types=tuple(ALL_NODE_TYPES),
     edge_types=tuple(ALL_EDGE_TYPES),
-    extraction_rules=EXTRACTION_RULES,
     confidence_policies=(
         CONFIDENCE_INTERNAL,
         CONFIDENCE_EXTERNAL,

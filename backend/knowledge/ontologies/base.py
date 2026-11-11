@@ -1,7 +1,7 @@
 """Base types and enums for the MIST.AI knowledge ontology system.
 
 Defines the foundational data structures used to describe node types,
-edge types, extraction rules, confidence policies, and ontology versions.
+edge types, confidence policies, and ontology versions.
 All dataclasses are frozen (immutable) to prevent accidental mutation of
 ontology definitions at runtime.
 """
@@ -143,19 +143,6 @@ class EdgeTypeDefinition:
 
 
 @dataclass(frozen=True)
-class ExtractionRules:
-    """Configuration governing how the LLM extractor operates."""
-
-    system_prompt: str
-    allowed_node_types: tuple[str, ...]
-    allowed_relationship_types: tuple[str, ...]
-    property_extraction_enabled: bool = True
-    max_entities_per_utterance: int = 10
-    max_relationships_per_utterance: int = 15
-    min_confidence_threshold: float = 0.4
-
-
-@dataclass(frozen=True)
 class ConfidencePolicy:
     """Policy controlling confidence scoring and decay for a knowledge domain."""
 
@@ -176,7 +163,6 @@ class OntologyVersion:
     description: str
     node_types: tuple[NodeTypeDefinition, ...]
     edge_types: tuple[EdgeTypeDefinition, ...]
-    extraction_rules: ExtractionRules
     confidence_policies: tuple[ConfidencePolicy, ...]
     universal_entity_properties: tuple[PropertyDefinition, ...]
     universal_relationship_properties: tuple[PropertyDefinition, ...]
