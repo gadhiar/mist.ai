@@ -248,6 +248,12 @@ services:
       # this var was reachable. This makes the setting overridable without
       # changing today's effective default.
       - EXTRACTION_CONSTRAINED_MODE=${EXTRACTION_CONSTRAINED_MODE:-}
+      # EXTRACTION_TURN_PLAN: the turn plan stage (ServiceSettings.turn_plan),
+      # off unless set to a truthy value. Unset reaches the service as an
+      # empty string, which ServiceSettings.from_env() reads as off, so a
+      # deployment that never names the variable runs as it did before the
+      # stage existed.
+      - EXTRACTION_TURN_PLAN=${EXTRACTION_TURN_PLAN:-}
     depends_on:
       mist-extraction-llm-local:
         condition: service_healthy

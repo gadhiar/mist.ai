@@ -17,7 +17,7 @@ import re
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 # 1.1.0: additive -- InfoResponse gained four optional serving-config fields.
 # 1.2.0: additive -- ResultStamps.run_identity, and InfoResponse.run_identity
@@ -26,6 +26,10 @@ from pydantic import BaseModel, Field
 # ResultStamps.serving_identity, InfoResponse.serving_identity with its
 # components and error, ServiceStatus.serving_identity and
 # CutoverStatus.target_serving_identity, all optional.
+# Not a version: ExtractResponse.turn_plan is optional and left out of the
+# serialized response when None, which it is unless the service runs with its
+# off-by-default turn plan flag. A response without the flag is unchanged, so
+# the version stays; it moves when the plan ships.
 CONTRACT_VERSION = "1.3.0"
 CONTRACT_MAJOR = 1
 
@@ -191,15 +195,48 @@ class TimingsMs(BaseModel):
     total: float
 
 
+class TurnPlanOut(BaseModel):
+    """The record of one turn's plan call: what it returned and what it cost.
+
+    A service running with its turn plan flag makes one plan call per
+    structured turn, before the Stage 2 batches, and this is that call as the
+    raw record keeps it.
+
+    Attributes:
+        payload: The plan the call returned, as the service parsed it. None
+            when the call failed, stopped at its output cap or returned a
+            plan the service rejected; the batches then ran without a plan
+            and `ExtractResponse.warnings` holds `turn_plan_failed`.
+        prompt_tokens: The prompt tokens llama-server counted for the call.
+            None when the call returned no usage, or did not return.
+        completion_tokens: The completion tokens it counted; None likewise.
+        finish_reason: Why the call stopped ("stop", "length"). None when the
+            call did not return: a transport failure or a timeout.
+    """
+
+    payload: dict[str, Any] | None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    finish_reason: str | None = None
+
+
 class ExtractResponse(BaseModel):
     """Response body for a successfully completed extraction job.
 
     Attributes:
         attempts: The most attempts any one Stage 2 call sequence took: 1, or
-            more when a repair retry ran.
+            more when a repair retry ran. The plan call is not an attempt.
         stage2_calls: Every Stage 2 model call the turn took (contract 1.2.0):
             one per batch of units, plus splits and repair retries. Defaults
-            to 1, the one call a pre-1.2.0 service makes.
+            to 1, the one call a pre-1.2.0 service makes. The plan call is not
+            counted, so the count means the same with the plan on or off.
+        turn_plan: The turn's plan call, when the service runs with its turn
+            plan flag and the turn is structured. None otherwise, and then
+            the serialized response has no `turn_plan` key at all, so a
+            response from a service without the flag is byte-for-byte the
+            response it gave before the field existed. The plan call's time
+            is part of `timings_ms.total` and of no stage's own figure:
+            `timings_ms.extract` stays the time of the batch calls.
     """
 
     contract_version: str
@@ -213,6 +250,15 @@ class ExtractResponse(BaseModel):
     attempts: int = Field(ge=1)
     stage2_calls: int = Field(default=1, ge=1)
     warnings: list[str] = Field(default_factory=list)
+    turn_plan: TurnPlanOut | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_an_absent_turn_plan(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Serialize as usual, then drop `turn_plan` when there is none."""
+        data = handler(self)
+        if self.turn_plan is None:
+            data.pop("turn_plan", None)
+        return data
 
 
 # ---------------------------------------------------------------------------

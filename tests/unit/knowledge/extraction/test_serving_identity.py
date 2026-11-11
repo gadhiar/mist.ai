@@ -173,6 +173,84 @@ class TestComponentsDict:
 
 
 # ---------------------------------------------------------------------------
+# The turn plan flag: absent when off, so earlier identities do not move
+# ---------------------------------------------------------------------------
+
+# The flat form of `_components()` written out key by key, as it was before
+# `turn_plan` existed, and the identity it hashed to then. Neither is derived
+# from the module under test.
+_FLAT_WITHOUT_TURN_PLAN: dict[str, str | int | float | bool | None] = {
+    "adapter": "gptoss",
+    "model_file": "gpt-oss-20b.gguf",
+    "llama_cpp_build": "b11151",
+    "max_attempts": 2,
+    "scope_enabled": True,
+    "n_ctx": 16384,
+    "request.scope.temperature": 0.0,
+    "request.scope.top_p": 0.9,
+    "request.scope.constrained": "schema",
+    "request.scope.thinking_effort": "low",
+    "request.scope.thinking_enabled": None,
+    "request.scope.thinking_budget_tokens": None,
+    "request.extract.temperature": 0.0,
+    "request.extract.top_p": 0.9,
+    "request.extract.constrained": "schema",
+    "request.extract.thinking_effort": "low",
+    "request.extract.thinking_enabled": None,
+    "request.extract.thinking_budget_tokens": None,
+    "request.derive.temperature": 0.0,
+    "request.derive.top_p": 0.9,
+    "request.derive.constrained": "schema",
+    "request.derive.thinking_effort": "low",
+    "request.derive.thinking_enabled": None,
+    "request.derive.thinking_budget_tokens": None,
+    "server.ctx_size": "16384",
+    "server.device": "rtx4070s",
+    "server.image": "llama@sha256:a",
+}
+_IDENTITY_WITHOUT_TURN_PLAN = "si1-20be596d6608e8b18dc511743401412a22c3e22aa9ef7591ce3693451888080c"
+
+
+def _identity_of(flat: dict[str, str | int | float | bool | None]) -> str:
+    canonical = json.dumps(flat, sort_keys=True, separators=(",", ":"))
+    return "si1-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class TestTurnPlanComponent:
+    def test_it_is_off_by_default(self):
+        assert _components().turn_plan is False
+
+    def test_off_is_left_out_of_the_flat_form(self):
+        assert components_dict(_components()) == _FLAT_WITHOUT_TURN_PLAN
+        assert components_dict(_components(turn_plan=False)) == _FLAT_WITHOUT_TURN_PLAN
+
+    def test_off_keeps_the_identity_bound_before_the_flag_existed(self):
+        assert _identity_of(_FLAT_WITHOUT_TURN_PLAN) == _IDENTITY_WITHOUT_TURN_PLAN
+        assert compute_serving_identity(_components()) == _IDENTITY_WITHOUT_TURN_PLAN
+        assert compute_serving_identity(_components(turn_plan=False)) == (
+            _IDENTITY_WITHOUT_TURN_PLAN
+        )
+
+    def test_on_adds_the_key(self):
+        assert components_dict(_components(turn_plan=True)) == {
+            **_FLAT_WITHOUT_TURN_PLAN,
+            "turn_plan": True,
+        }
+
+    def test_on_moves_the_identity(self):
+        on = compute_serving_identity(_components(turn_plan=True))
+
+        assert on != _IDENTITY_WITHOUT_TURN_PLAN
+        assert on == _identity_of({**_FLAT_WITHOUT_TURN_PLAN, "turn_plan": True})
+
+    def test_the_diff_names_the_flag(self):
+        off = components_dict(_components())
+        on = components_dict(_components(turn_plan=True))
+
+        assert diff_components(off, on) == ["turn_plan: <missing> != true"]
+
+
+# ---------------------------------------------------------------------------
 # The hash
 # ---------------------------------------------------------------------------
 

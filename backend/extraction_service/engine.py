@@ -11,6 +11,12 @@ Stage 2 runs the list pass: `structure_splitter` cuts a structured utterance
 into units that keep their parent context, and each batch of units is one
 Stage 2 call. An utterance without structure is one batch, sent exactly as
 before the list pass existed.
+
+With `ServiceSettings.turn_plan` on, a structured utterance first gets one
+plan call over all of its units (`backend.extraction_service.turn_plan`),
+and every batch then carries the plan in front of its user message. The flag
+is off by default, and with it off no request differs from one sent before
+the plan existed.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ from backend.extraction_contract.models import (
     ResultStamps,
     ScopeOut,
     TimingsMs,
+    TurnPlanOut,
 )
 from backend.extraction_service.adapters import ModelFamilyAdapter
 from backend.extraction_service.schemas import (
@@ -54,6 +61,15 @@ from backend.extraction_service.schemas import (
     SCOPE_OUTPUT_SCHEMA,
 )
 from backend.extraction_service.settings import ConstrainedMode, ReasoningEffort, ServiceSettings
+from backend.extraction_service.turn_plan import (
+    PLAN_BLOCK_CONSTANTS,
+    PLAN_OUTPUT_SCHEMA,
+    PLAN_REQUEST_TEMPLATE,
+    is_structured_turn,
+    parse_turn_plan,
+    render_plan_block,
+    render_plan_request,
+)
 from backend.knowledge.extraction.internal_derivation import (
     parse_derivation_output,
     render_derivation_messages,
@@ -179,18 +195,20 @@ LIST_BATCH_MAX_UNITS: int = 4
 LIST_CONTEXT_MAX_UNITS: int = 8
 
 # The code the run identity covers (`code_sha256` in
-# `backend.knowledge.extraction.run_identity`): this module, the adapters and
-# schemas, every `backend.knowledge.extraction` module imported above, whose
-# renderers and strict parsers Stages 1.5, 2 and 9 call, and the provider
-# module the service builds. Whole modules rather than functions, so a helper
-# a covered function calls is covered too; an edit elsewhere in a covered
-# module costs one `CODE_REVISIONS` line, never a silent miss.
+# `backend.knowledge.extraction.run_identity`): this module, the adapters,
+# the schemas and the turn plan, every `backend.knowledge.extraction` module
+# imported above, whose renderers and strict parsers Stages 1.5, 2 and 9 call,
+# and the provider module the service builds. Whole modules rather than
+# functions, so a helper a covered function calls is covered too; an edit
+# elsewhere in a covered module costs one `CODE_REVISIONS` line, never a
+# silent miss.
 RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     importlib.import_module(name)
     for name in (
         __name__,
         "backend.extraction_service.adapters",
         "backend.extraction_service.schemas",
+        "backend.extraction_service.turn_plan",
         "backend.knowledge.extraction.internal_derivation",
         "backend.knowledge.extraction.internal_prompts",
         "backend.knowledge.extraction.ontology_extractor",
@@ -202,8 +220,8 @@ RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     )
 )
 
-# The backend modules this module and the adapters import from that the run
-# identity does not hash, each with the reason. The coverage test in
+# The backend modules this module, the adapters and the turn plan import from
+# that the run identity does not hash, each with the reason. The coverage test in
 # tests/unit/knowledge/extraction/test_run_identity.py fails on an import in
 # neither tuple.
 RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
@@ -239,6 +257,12 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
         "backend.knowledge.extraction.serving_identity",
         "the serving identity's types and hash: request_profile reads the requests the "
         "stages build and changes none of them",
+    ),
+    (
+        "backend.knowledge.ontologies",
+        "the turn plan reads its two derived extractable lists and nothing else, as the "
+        "plan schema's enums, and that schema is hashed into prompt_sha256 when the plan "
+        "is on; the ontology's version is a component already",
     ),
 )
 
@@ -366,12 +390,27 @@ def _strict_derivation(raw: str) -> DerivationOut:
 
 @dataclass(slots=True)
 class _Stage2Run:
-    """What one turn's Stage 2 calls add up to, across its batches."""
+    """What one turn's Stage 2 calls add up to, across its batches.
+
+    Attributes:
+        calls: Every batch call, splits and repair retries included. The
+            plan call is not one of them.
+        attempts: The most attempts any one batch took.
+        elapsed_ms: The time the batch calls took. The plan call's time is
+            not in it; it shows in the turn's total alone.
+        payloads: One payload per batch, in order.
+        plan_block: The text every batch of the turn carries in front of its
+            user message, or the empty string when the turn has no plan: the
+            flag is off, the turn is prose, or the plan call failed.
+        turn_plan: The record of the plan call, or None when none was made.
+    """
 
     calls: int = 0
     attempts: int = 0
     elapsed_ms: float = 0.0
     payloads: list[ExtractionPayload] = field(default_factory=list)
+    plan_block: str = ""
+    turn_plan: TurnPlanOut | None = None
 
 
 def _batch_input(
@@ -398,7 +437,18 @@ def _batch_input(
     )
 
 
-def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
+def _with_plan_block(messages: list[dict], plan_block: str) -> list[dict]:
+    """`messages` with `plan_block` in front of the first user message's text.
+
+    The block goes before everything a batch renders for itself, so the
+    batches of one turn share a prefix that runs through the system prompt
+    and the whole block, and llama-server's prompt cache covers both.
+    """
+    system, user, *rest = messages
+    return [system, {**user, "content": plan_block + user["content"]}, *rest]
+
+
+def _compute_prompt_sha256(adapter: ModelFamilyAdapter, *, turn_plan: bool = False) -> str:
     """Hash the prompt text and output schemas sent to the model, plus the adapter identity.
 
     `prompt_sha256` is a per-result provenance stamp: the record of what the
@@ -414,6 +464,11 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     sorted keys; hashed whether or not the active mode sends them, which
     only makes the stamp stricter), and the adapter's own name/version.
 
+    With `turn_plan` on, three more follow, in this order: the plan request
+    text, every constant string of the plan block, and the plan's output
+    schema. With it off nothing is added, so the hash is the one a service
+    without the turn plan computes.
+
     Not covered: the PreProcessor's context formatting (code, not a
     template) and request parameters (temperature, max_tokens, reasoning
     effort and budget, constrained mode), which are configuration and change
@@ -426,25 +481,34 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
 
     Computed once at engine construction (not per request): none of its
     inputs vary per job.
+
+    Args:
+        adapter: The model-family adapter the service runs.
+        turn_plan: Whether the service runs with the turn plan
+            (`ServiceSettings.turn_plan`).
     """
-    material = "\x1f".join(
-        [
-            SCOPE_CLASSIFIER_SYSTEM_PROMPT,
-            SCOPE_USER_TEMPLATE,
-            EXTRACTION_SYSTEM_PROMPT,
-            EXTRACTION_USER_TEMPLATE,
-            NO_PRIOR_CONTEXT,
-            INTERNAL_DERIVATION_SYSTEM_PROMPT,
-            INTERNAL_DERIVATION_USER_TEMPLATE,
-            _REPAIR_INSTRUCTION,
-            json.dumps(SCOPE_OUTPUT_SCHEMA, sort_keys=True),
-            json.dumps(EXTRACTION_OUTPUT_SCHEMA, sort_keys=True),
-            json.dumps(DERIVATION_OUTPUT_SCHEMA, sort_keys=True),
-            adapter.name,
-            adapter.version,
+    components = [
+        SCOPE_CLASSIFIER_SYSTEM_PROMPT,
+        SCOPE_USER_TEMPLATE,
+        EXTRACTION_SYSTEM_PROMPT,
+        EXTRACTION_USER_TEMPLATE,
+        NO_PRIOR_CONTEXT,
+        INTERNAL_DERIVATION_SYSTEM_PROMPT,
+        INTERNAL_DERIVATION_USER_TEMPLATE,
+        _REPAIR_INSTRUCTION,
+        json.dumps(SCOPE_OUTPUT_SCHEMA, sort_keys=True),
+        json.dumps(EXTRACTION_OUTPUT_SCHEMA, sort_keys=True),
+        json.dumps(DERIVATION_OUTPUT_SCHEMA, sort_keys=True),
+        adapter.name,
+        adapter.version,
+    ]
+    if turn_plan:
+        components += [
+            PLAN_REQUEST_TEMPLATE,
+            *PLAN_BLOCK_CONSTANTS,
+            json.dumps(PLAN_OUTPUT_SCHEMA, sort_keys=True),
         ]
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return hashlib.sha256("\x1f".join(components).encode("utf-8")).hexdigest()
 
 
 def repetition_flag(
@@ -568,7 +632,7 @@ class ExtractionEngine:
         self._settings = settings
         self._run_identity = run_identity
         self._preprocessor = PreProcessor()
-        self._prompt_sha256 = _compute_prompt_sha256(adapter)
+        self._prompt_sha256 = _compute_prompt_sha256(adapter, turn_plan=settings.turn_plan)
 
     @property
     def adapter_name(self) -> str:
@@ -592,7 +656,10 @@ class ExtractionEngine:
         adapter ignores is absent. The messages are left empty, because the
         profile records how a request is sampled and constrained, not what it
         says. Every stage is listed, Stage 1.5 even when `scope_enabled` is
-        off, since that switch is a component of its own.
+        off, since that switch is a component of its own. The turn plan call
+        has no entry: it is sent as stage `extract`, with that stage's cap and
+        thinking controls, and differs from a batch only in its messages and
+        in which schema constrains it.
         """
         builders = {
             "scope": self._scope_request,
@@ -634,7 +701,7 @@ class ExtractionEngine:
         )
 
         scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
-        stage2 = await self._run_extraction(pre_processed)
+        stage2 = await self._run_extraction(pre_processed, warnings)
         payload, merge_warnings = merge_payloads(stage2.payloads)
         warnings.extend(merge_warnings)
         derivation_out, derive_ms = await self._run_derivation(req, warnings)
@@ -666,6 +733,7 @@ class ExtractionEngine:
             attempts=stage2.attempts,
             stage2_calls=stage2.calls,
             warnings=warnings,
+            turn_plan=stage2.turn_plan,
         )
 
     def _resolve_constrained_mode(self) -> ConstrainedMode:
@@ -701,6 +769,20 @@ class ExtractionEngine:
             messages=messages,
             max_tokens=self.stage_cap("extract"),
             schema=EXTRACTION_OUTPUT_SCHEMA,
+        )
+        return self._adapter.prepare(request, stage="extract")
+
+    def _plan_request(self, *, messages: list[dict]) -> LLMRequest:
+        """The turn plan's request for `messages`, prepared by the adapter as stage `extract`.
+
+        The plan is part of Stage 2, made with the extract stage's cap and
+        thinking controls, so the request stages stay the three the serving
+        identity profiles. Only the schema differs from a batch's request.
+        """
+        request = self._build_request(
+            messages=messages,
+            max_tokens=self.stage_cap("extract"),
+            schema=PLAN_OUTPUT_SCHEMA,
         )
         return self._adapter.prepare(request, stage="extract")
 
@@ -765,11 +847,15 @@ class ExtractionEngine:
             warnings.append("scope_classification_failed")
         return ScopeOut(label=label, confidence=confidence), elapsed
 
-    async def _run_extraction(self, pre_processed: PreProcessedInput) -> _Stage2Run:
+    async def _run_extraction(
+        self, pre_processed: PreProcessedInput, warnings: list[str]
+    ) -> _Stage2Run:
         """Stage 2: one call sequence per batch of at most `LIST_BATCH_MAX_UNITS` units.
 
         Batches run in order, one at a time, and any batch failing fails the
-        turn: there are no partial results.
+        turn: there are no partial results. With the turn plan on, a
+        structured turn's plan call goes out first, and its failure adds a
+        warning to `warnings` and fails nothing.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
@@ -778,11 +864,78 @@ class ExtractionEngine:
         """
         units = split_structured(pre_processed.original_text)
         run = _Stage2Run()
+        if self._settings.turn_plan and is_structured_turn(units):
+            run.turn_plan = await self._run_turn_plan(pre_processed, units, warnings)
+            if run.turn_plan.payload is not None:
+                run.plan_block = render_plan_block(run.turn_plan.payload)
         start = 0
         for batch in batch_units(units, LIST_BATCH_MAX_UNITS):
             await self._extract_units(pre_processed, units, start, len(batch), run)
             start += len(batch)
         return run
+
+    async def _run_turn_plan(
+        self,
+        pre_processed: PreProcessedInput,
+        units: Sequence[InputUnit],
+        warnings: list[str],
+    ) -> TurnPlanOut:
+        """The turn's one plan call, over all of `units`. Never raises on a failed plan.
+
+        The call goes out under the system message the batches use, rendered
+        for the same reference date, so llama-server's cached prefix holds
+        from the plan call through every batch. It is made once: an
+        unparsable plan gets no repair retry and a plan cut short at the cap
+        is not split, because the batches extract the same turn without it.
+
+        A call that fails at the transport, times out, stops at its output
+        cap or returns a plan the strict parser rejects logs one
+        `turn plan failed:` line, adds `turn_plan_failed` to `warnings`, and
+        is returned with no payload; the batches then run as they do with
+        the plan off. The line carries the reason and never the turn's or
+        the reply's text.
+        """
+        system = render_extraction_messages(pre_processed)[0]
+        context = (
+            "\n".join(pre_processed.conversation_context)
+            if pre_processed.conversation_context
+            else NO_PRIOR_CONTEXT
+        )
+        user = render_plan_request(
+            units,
+            context=context,
+            subject_scope=pre_processed.metadata.get("subject_scope", "unknown"),
+        )
+        request = self._plan_request(messages=[system, {"role": "user", "content": user}])
+
+        payload: dict[str, Any] | None = None
+        response: LLMResponse | None = None
+        failure: str | None = None
+        try:
+            response = await self._invoke(request)
+        except TimeoutError:
+            failure = f"timed out after {self._settings.llm_timeout_seconds}s"
+        except _LLM_TRANSPORT_ERRORS as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        else:
+            if response.finish_reason == "length":
+                failure = f"output stopped at max_tokens ({request.max_tokens})"
+            else:
+                try:
+                    payload = parse_turn_plan(self._adapter.final_text(response))
+                except ExtractionValidationError as exc:
+                    failure = str(exc)
+
+        if failure is not None:
+            logger.warning("turn plan failed: %s", failure)
+            warnings.append("turn_plan_failed")
+        usage = None if response is None else response.usage
+        return TurnPlanOut(
+            payload=payload,
+            prompt_tokens=None if usage is None else usage.prompt_tokens,
+            completion_tokens=None if usage is None else usage.completion_tokens,
+            finish_reason=None if response is None else response.finish_reason,
+        )
 
     async def _extract_units(
         self,
@@ -847,6 +1000,8 @@ class ExtractionEngine:
         self, batch_input: PreProcessedInput, run: _Stage2Run
     ) -> ExtractionPayload:
         messages = render_extraction_messages(batch_input)
+        if run.plan_block:
+            messages = _with_plan_block(messages, run.plan_block)
         last_error: Exception | None = None
 
         for attempt in range(1, self._settings.max_attempts + 1):

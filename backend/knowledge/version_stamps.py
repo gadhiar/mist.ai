@@ -189,7 +189,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-c1e2f66b661adb398251bbe32d764f7513c5b85d867b09fdf08305c4cdaf1f56",
+        code_identity="ci1-7f2ab02a4ea4165301082b1e35ef45124db48e660879211e708dea27c2459e28",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -214,7 +214,13 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "29 returns to its group 1 text; T40 round 2 restores the KNOWS, INTERESTED_IN, "
             "EXPERT_IN and LEARNING glosses, Rule 34's clause that each team member WORKS_AT "
             "the named employer with no employer in the team's id, a stated place as a "
-            "Location in Rule 31, and Rule 29's literal user EXPERIENCED <event>. "
+            "Location in Rule 31, and Rule 29's literal user EXPERIENCED <event>; T42 adds "
+            "the turn plan stage behind EXTRACTION_TURN_PLAN, off by default: turn_plan "
+            "joins the covered code, and with the flag on a structured turn gets one plan "
+            "call before its first batch, sent as stage extract under the plan's own "
+            "schema, and every batch carries the plan block in front of its user message, "
+            "while a failed plan call leaves the batches as they are with the flag off. "
+            "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),
     ),

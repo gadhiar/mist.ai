@@ -399,6 +399,21 @@ class TestServiceEnvPassthrough:
             "EXTRACTION_CONSTRAINED_MODE"
         ]
 
+    def test_turn_plan_is_forwarded_with_empty_default(self) -> None:
+        # Empty default: ServiceSettings.from_env() reads an empty
+        # EXTRACTION_TURN_PLAN as off, so the stage stays off for a
+        # deployment that never sets the variable.
+        env = _env_dict(_services()["mist-extraction-local"])
+        assert env["EXTRACTION_TURN_PLAN"] == "${EXTRACTION_TURN_PLAN:-}", env[
+            "EXTRACTION_TURN_PLAN"
+        ]
+
+    def test_turn_plan_is_forwarded_to_the_service_only(self) -> None:
+        # The llama-server has no use for the flag; only the service reads it.
+        for name, service in _services().items():
+            if name != "mist-extraction-local":
+                assert "EXTRACTION_TURN_PLAN" not in _env_dict(service), name
+
 
 class TestProfile:
     def test_every_service_has_exactly_the_local_profile(self) -> None:

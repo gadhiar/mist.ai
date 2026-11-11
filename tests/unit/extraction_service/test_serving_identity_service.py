@@ -129,9 +129,21 @@ _MUTATIONS: dict[str, object] = {
     "llama_cpp_build": "b12000",
     "port": 9999,
     "server_config": "add n_cpu_moe",
+    "turn_plan": True,
 }
 
 _SETTINGS_FIELDS = {f.name for f in dataclasses.fields(ServiceSettings)}
+
+# `turn_plan` is keyed: `ServingIdentityComponents.turn_plan` moves the
+# identity (tests/unit/knowledge/extraction/test_serving_identity.py). The
+# service does not pass the setting to it yet; that is one line in
+# `backend.extraction_service.app.serving_identity_components`, and this mark
+# fails the day it lands, so it is removed with it.
+_PENDING_APP = pytest.mark.xfail(strict=True, reason="pending app.py (v14)")
+_MUTATION_PARAMS = [
+    pytest.param(name, marks=_PENDING_APP) if name == "turn_plan" else name
+    for name in sorted(_MUTATIONS)
+]
 
 
 def _mutated(settings: ServiceSettings, name: str) -> ServiceSettings:
@@ -163,7 +175,7 @@ class TestSettingsClassification:
             "llm_timeout_seconds",
         }
 
-    @pytest.mark.parametrize("name", sorted(_MUTATIONS))
+    @pytest.mark.parametrize("name", _MUTATION_PARAMS)
     def test_a_keyed_setting_moves_the_identity_and_an_excluded_one_does_not(
         self, service_settings, wired_llm, name
     ):
