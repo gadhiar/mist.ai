@@ -1,4 +1,4 @@
-"""Validate the dev-list and held-out probe utterances and any label passes over them.
+"""Validate the dev-list, held-out and selection probe sets and any label passes over them.
 
 The held-out set measures extraction only if nobody tuned on it, and the report counts
 categories from the tag alone, so the shape of the utterance file is load-bearing: a wrong
@@ -13,10 +13,19 @@ The labelling rules that came out of Raj's check of 20 held-out probes (N11 to N
 where a pattern in the utterance identifies the probes they govern. The conventions behind these
 checks are in `data/gold/extraction/LABELLING.md`, and the adjudication that produced the sets is
 in `labelling/adjudication-2026-11.md`.
+
+The selection set (`selection-2026-11.jsonl`, the last section of this file) is the set the
+recall verdict is read on, so it is checked before it has any gold: its size, its tag format
+and its split of list shapes, that each list probe shows the markup its tag names, and that no
+utterance copies one of the dev-list, held-out or 60-probe sets, names a person or organization
+of those sets, or names an entity of the production prompt's examples. Its label passes are
+held to the label checks from the commit that adds each file. A failing selection check reports
+selection tags and counts only, because no session that tunes extraction may see its text.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -47,6 +56,14 @@ _GOLD_DIR = _REPO_ROOT / "data" / "gold" / "extraction"
 _LABELLING_DIR = _GOLD_DIR / "labelling"
 _UTTERANCES = _LABELLING_DIR / "utterances-2026-11.jsonl"
 _SIXTY = _REPO_ROOT / "data" / "ingest" / "extraction-gold-2026-06-14.jsonl"
+# The selection set (plan v14 T53): its utterances, and the directory its two blind label
+# passes are written to. A pass is checked from the commit that adds its file.
+_SELECTION = _GOLD_DIR / "selection-2026-11.jsonl"
+_SELECTION_DIR = _LABELLING_DIR / "selection-2026-11"
+_SELECTION_DESIGN = _SELECTION_DIR / "design.jsonl"
+_SELECTION_PASSES = [
+    p for p in (_SELECTION_DIR / "pass-a.jsonl", _SELECTION_DIR / "pass-b.jsonl") if p.is_file()
+]
 
 _LABELLED_ONTOLOGY_VERSION = "1.4.0"
 _ROW_FIELDS = {"tag", "set", "utterance", "intent"}
@@ -387,8 +404,27 @@ def test_heldout_intents_cover_every_extractable_predicate_twice(heldout):
 _LABEL_FILES = sorted(_LABELLING_DIR.glob("labels-*.jsonl"))
 _DEV_GOLD = _GOLD_DIR / "dev-lists-2026-11.jsonl"
 _HELDOUT_GOLD = _GOLD_DIR / "heldout-2026-11.jsonl"
-# The published sets are labels too, so every label check below runs on them as well.
-_LABEL_PARAMS = [pytest.param(p, id=p.name) for p in (*_LABEL_FILES, _DEV_GOLD, _HELDOUT_GOLD)]
+# The published sets are labels too, so every label check below runs on them as well. So are
+# the selection set and its label passes, whose tags name selection utterances.
+_SELECTION_LABEL_FILES = (*_SELECTION_PASSES, _SELECTION)
+_LABEL_PARAMS = [
+    pytest.param(p, id=p.name)
+    for p in (*_LABEL_FILES, _DEV_GOLD, _HELDOUT_GOLD, *_SELECTION_LABEL_FILES)
+]
+
+
+def _labelled_utterances(path: Path) -> dict[str, str]:
+    """The utterance each tag of a label file has to carry, from the file it was labelled from."""
+    if path in _SELECTION_LABEL_FILES:
+        return {r["tag"]: r["utterance"] for r in _gold_rows(_SELECTION)}
+    return {r["tag"]: r["utterance"] for r in _load_utterances()}
+
+
+def _faults_to_report(path: Path, faults: list[tuple]) -> list:
+    """A selection file's faults as their tags alone, so a failure prints no selection label."""
+    if path in _SELECTION_LABEL_FILES:
+        return sorted({fault[0] for fault in faults})
+    return faults
 
 
 def test_labels_are_judged_against_the_ontology_version_they_were_written_for():
@@ -401,12 +437,14 @@ def test_every_label_row_loads_through_the_gold_loader(path):
 
     probes = iter_gold_probes(path)
 
-    assert len(probes) == len(lines)
+    # Counts in locals: an assert on `len()` of a collection prints the collection's rows.
+    loaded, written = len(probes), len(lines)
+    assert loaded == written
 
 
 @pytest.mark.parametrize("path", _LABEL_PARAMS)
 def test_label_tags_are_unique_and_name_their_utterance(path):
-    utterances = {r["tag"]: r["utterance"] for r in _load_utterances()}
+    utterances = _labelled_utterances(path)
     probes = iter_gold_probes(path)
 
     duplicates = [t for t, n in Counter(p.tag for p in probes).items() if n > 1]
@@ -431,7 +469,8 @@ def test_labels_name_only_extractable_types_and_predicates(path):
             if rel.predicate not in predicates:
                 bad.append((probe.tag, rel.predicate))
 
-    assert bad == []
+    faults = _faults_to_report(path, bad)
+    assert faults == []
 
 
 @pytest.mark.parametrize("path", _LABEL_PARAMS)
@@ -446,7 +485,8 @@ def test_label_edges_join_their_own_entities_with_matching_types(path):
             if type_by_id.get(rel.target) != rel.target_type:
                 bad.append((probe.tag, rel.target))
 
-    assert bad == []
+    faults = _faults_to_report(path, bad)
+    assert faults == []
 
 
 def _types_allowed(predicate: str, source_type: str, target_type: str) -> bool:
@@ -474,7 +514,8 @@ def test_label_edge_types_are_allowed_for_their_predicate(path):
             if not _types_allowed(rel.predicate, rel.source_type, rel.target_type):
                 bad.append((probe.tag, rel.source_type, rel.predicate, rel.target_type))
 
-    assert bad == []
+    faults = _faults_to_report(path, bad)
+    assert faults == []
 
 
 # --- The published dev-list and held-out sets ------------------------------------------------
@@ -547,11 +588,11 @@ def test_every_probe_left_out_of_a_gold_set_is_listed_as_dropped(set_name):
     assert [t for t in sorted(own - published) if t not in dropped] == []
 
 
-@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
-def test_gold_rows_follow_the_sixty_probe_schema(set_name):
+def _schema_faults(rows: list[dict]) -> list[tuple]:
+    """(tag, what is wrong) for each row, entity or edge that departs from the gold row schema."""
     bad = []
 
-    for row in _gold_rows(_GOLD_BY_SET[set_name]):
+    for row in rows:
         if set(row) != _GOLD_ROW_FIELDS:
             bad.append((row["tag"], sorted(row)))
         bad += [
@@ -565,6 +606,13 @@ def test_gold_rows_follow_the_sixty_probe_schema(set_name):
                 bad.append((row["tag"], sorted(keys)))
             if rel.get("assertion_kind") == "assert":
                 bad.append((row["tag"], "assertion_kind assert is written as absent"))
+
+    return bad
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_gold_rows_follow_the_sixty_probe_schema(set_name):
+    bad = _schema_faults(_gold_rows(_GOLD_BY_SET[set_name]))
 
     assert bad == []
 
@@ -687,15 +735,20 @@ def test_no_heldout_utterance_is_shared_with_a_dev_probe():
     assert [r["tag"] for r in _gold_rows(_HELDOUT_GOLD) if _fold(r["utterance"]) in dev] == []
 
 
-def _heldout_ids_in_the_prompt() -> dict[str, list[str]]:
+def _gold_ids_in_the_prompt(path: Path) -> dict[str, list[str]]:
+    """Each entity id of a gold set that the production prompt spells out, with its probes."""
     hits: dict[str, list[str]] = {}
-    for row in _gold_rows(_HELDOUT_GOLD):
+    for row in _gold_rows(path):
         for entity in row["expected_entities"]:
             if entity["id"] in _PROMPT_ANCHOR_IDS:
                 continue
             if _term_pattern(entity["id"]).search(EXTRACTION_SYSTEM_PROMPT):
                 hits.setdefault(entity["id"], []).append(row["tag"])
     return hits
+
+
+def _heldout_ids_in_the_prompt() -> dict[str, list[str]]:
+    return _gold_ids_in_the_prompt(_HELDOUT_GOLD)
 
 
 def test_no_heldout_entity_id_occurs_in_the_production_prompt():
@@ -1401,3 +1454,410 @@ def test_every_heldout_id_is_a_fixed_point_of_the_id_rails():
     moved = _heldout_ids_the_rails_move()
 
     assert moved == 0, f"{moved} held-out ids are not fixed points of the id rails"
+
+
+# --- The selection set (plan v14 T53) --------------------------------------------------------
+
+# The recall verdict is read on the selection set, so it has to be a set that no tuning and no
+# held-out probe overlaps: a shared utterance or a shared invented name would let a candidate
+# tuned on dev-lists or the 60 score on what it has already seen, and would tie this set to the
+# sealed one. Its size and list shapes are pinned because the power arithmetic behind the set
+# (240 list probes, each bounded at 15 gold relations) assumes them. Every failure here names
+# selection tags and counts only: never an utterance, an id, a name or a held-out row.
+_SELECTION_TAG = re.compile(rf"^sel-(?P<num>\d{{3}})-(?P<slug>{_SLUG})$")
+_SELECTION_LIST_PROBES = 240
+_SELECTION_PROSE_PROBES = 40
+# Six times the split of dev-lists' 40 tags by their shape word.
+_SELECTION_SHAPES = {
+    "dash": 36,
+    "numbered": 18,
+    "ref": 48,
+    "plus": 12,
+    "star": 6,
+    "checkbox": 12,
+    "nested": 6,
+    "heading": 12,
+    "table": 6,
+    "paren": 6,
+    "dot": 6,
+    "mixed": 6,
+    "lettered": 6,
+    "long": 60,
+}
+_SELECTION_PROSE_CATEGORIES = frozenset(_HELDOUT_CATEGORIES) - {"list"}
+_SELECTION_MAX_RELATIONS = 15
+_SELECTION_PERSONAS_MIN = 10
+# The markup a shape word promises, where markup alone shows it. `long` and `mixed` are checked
+# by item count and by prose after an item; `ref` (a later line refers back) is the author's.
+_SHAPE_MARKUP = {
+    "dash": "dash-bullet",
+    "numbered": "numbered-dot",
+    "plus": "plus-bullet",
+    "star": "star-bullet",
+    "checkbox": "checkbox",
+    "nested": "nested",
+    "heading": "heading",
+    "table": "pipe-table",
+    "paren": "numbered-paren",
+    "dot": "dot-bullet",
+    "lettered": "lettered",
+}
+# Selection gold ids that are ordinary words of the prompt's prose, as `_PROMPT_WORD_EXEMPTIONS`
+# is for held-out. Empty while the selection gold is empty; a test fails an unused entry.
+_SELECTION_PROMPT_WORD_EXEMPTIONS: dict[str, str] = {}
+_OTHER_SETS = ("dev-lists", "heldout", "sixty")
+_OTHER_SET_TERMS_MIN = 10
+
+
+def _selection_rows() -> list[dict]:
+    return _gold_rows(_SELECTION)
+
+
+def _selection_slug(row: dict) -> str:
+    match = _SELECTION_TAG.match(row["tag"])
+    assert match is not None, "a selection tag is malformed"
+    return match.group("slug")
+
+
+def _selection_shape(row: dict) -> str | None:
+    """A list probe's shape word, or None for a prose probe."""
+    parts = _selection_slug(row).split("-")
+    return parts[1] if parts[0] == "list" and len(parts) > 1 else None
+
+
+def _other_set_utterances() -> dict[str, list[str]]:
+    """Every tuning and held-out utterance by set, with the probes a gold set dropped."""
+    listed = _load_utterances()
+    gold = {"dev-lists": _gold_rows(_DEV_GOLD), "heldout": _gold_rows(_HELDOUT_GOLD)}
+    utterances = {
+        name: [r["utterance"] for r in (*rows, *listed) if r.get("set", name) == name]
+        for name, rows in gold.items()
+    }
+    utterances["sixty"] = [r["utterance"] for r in _sixty_rows()]
+    return utterances
+
+
+def _other_set_people_and_organizations() -> dict[str, set[str]]:
+    """The Person and Organization ids, with their alternatives, of each other set's gold."""
+    paths = {"dev-lists": _DEV_GOLD, "heldout": _HELDOUT_GOLD, "sixty": _SIXTY}
+    return {
+        name: {
+            gold_id
+            for row in _gold_rows(path)
+            for entity in row["expected_entities"]
+            if entity["type"] in {"Person", "Organization"}
+            for gold_id in (entity["id"], *entity.get("alternatives", ()))
+        }
+        for name, path in paths.items()
+    }
+
+
+def _tags_copying(rows: list[dict], others: list[str]) -> list[str]:
+    """Tags of the rows whose utterance equals, or is a near copy of, one of `others`."""
+    folded = {_fold(u) for u in others}
+    word_sets = [_words(u) for u in others]
+    tags = []
+    for row in rows:
+        words = _words(row["utterance"])
+        if _fold(row["utterance"]) in folded or any(
+            len(words & other) / len(words | other) >= _NEAR_COPY_JACCARD
+            for other in word_sets
+            if words | other
+        ):
+            tags.append(row["tag"])
+    return tags
+
+
+def _tags_naming(rows: list[dict], terms: set[str]) -> list[str]:
+    """Tags of the rows whose utterance holds one of `terms` as a term."""
+    patterns = [_term_pattern(term) for term in terms]
+    return [row["tag"] for row in rows if any(p.search(row["utterance"]) for p in patterns)]
+
+
+def test_copy_check_flags_an_equal_and_a_near_copy_utterance_only():
+    rows = [
+        {"tag": "syn-1", "utterance": "My  setup:\n- Zed for EDITING"},
+        {"tag": "syn-2", "utterance": "My setup:\n- Zed for writing"},
+        {"tag": "syn-3", "utterance": "Tools I rely on:\n- Zed"},
+    ]
+
+    copies = _tags_copying(rows, ["my setup:\n- zed for editing"])
+
+    assert copies == ["syn-1", "syn-2"]
+
+
+def test_name_check_flags_a_term_across_case_and_separators_only():
+    rows = [
+        {"tag": "syn-1", "utterance": "I met Marek at Halvane-Systems."},
+        {"tag": "syn-2", "utterance": "The halvane   systems office"},
+        {"tag": "syn-3", "utterance": "Halvanesque systems thinking"},
+    ]
+
+    named = _tags_naming(rows, {"halvane-systems"})
+
+    assert named == ["syn-1", "syn-2"]
+
+
+@pytest.mark.parametrize("path", _SELECTION_LABEL_FILES, ids=lambda p: p.name)
+def test_selection_rows_follow_the_gold_row_schema(path):
+    rows = _gold_rows(path)
+
+    malformed = sorted({fault[0] for fault in _schema_faults(rows)})
+    untyped = [
+        r["tag"]
+        for r in rows
+        if not isinstance(r.get("utterance"), str)
+        or not r["utterance"].strip()
+        or not isinstance(r.get("expected_entities"), list)
+        or not isinstance(r.get("expected_relationships"), list)
+    ]
+
+    assert malformed == []
+    assert untyped == []
+
+
+@pytest.mark.parametrize("path", _SELECTION_LABEL_FILES, ids=lambda p: p.name)
+def test_selection_optional_gold_keys_are_well_formed(path):
+    faults = _optional_key_faults(_gold_rows(path))
+
+    assert faults == Counter()
+
+
+def test_a_selection_pass_holds_every_selection_tag():
+    """Checked from the commit that adds a pass file; the agreement is measured over all 280."""
+    tags = sorted(r["tag"] for r in _selection_rows())
+
+    incomplete = [
+        p.name for p in _SELECTION_PASSES if sorted(r["tag"] for r in _gold_rows(p)) != tags
+    ]
+
+    assert incomplete == []
+
+
+def test_selection_tags_follow_the_format_and_number_densely():
+    rows = _selection_rows()
+
+    malformed = [r["tag"] for r in rows if not _SELECTION_TAG.match(r["tag"])]
+    numbers = sorted(int(m.group("num")) for r in rows if (m := _SELECTION_TAG.match(r["tag"])))
+    dense = list(range(1, len(rows) + 1))
+
+    assert malformed == []
+    assert numbers == dense
+
+
+def test_selection_has_240_list_probes_and_40_prose_probes():
+    shapes = [_selection_shape(r) for r in _selection_rows()]
+
+    lists = sum(shape is not None for shape in shapes)
+    prose = len(shapes) - lists
+
+    assert (lists, prose) == (_SELECTION_LIST_PROBES, _SELECTION_PROSE_PROBES)
+
+
+def test_selection_list_shapes_are_six_times_the_dev_lists_split():
+    dev = Counter(r["tag"].split("-")[3] for r in _gold_rows(_DEV_GOLD))
+
+    shapes = Counter(s for r in _selection_rows() if (s := _selection_shape(r)) is not None)
+    six_times_dev, counted = {shape: 6 * n for shape, n in dev.items()}, dict(shapes)
+
+    assert six_times_dev == _SELECTION_SHAPES
+    assert counted == _SELECTION_SHAPES
+
+
+def test_selection_prose_slugs_start_with_a_labelling_category():
+    stray = [
+        r["tag"]
+        for r in _selection_rows()
+        if _selection_shape(r) is None
+        and _selection_slug(r).split("-")[0] not in _SELECTION_PROSE_CATEGORIES
+    ]
+
+    assert stray == []
+
+
+def test_a_selection_list_probe_shows_the_markup_its_shape_names():
+    unshown = []
+
+    for row in _selection_rows():
+        shape, utterance = _selection_shape(row), row["utterance"]
+        if shape is None:
+            continue
+        markup = _SHAPE_MARKUP.get(shape)
+        if (
+            "\n" not in utterance
+            or (markup is not None and not _LIST_FORMATS[markup].search(utterance))
+            or (shape == "long" and _item_count(utterance) < _LONG_LIST_MIN_ITEMS)
+            or (shape == "mixed" and not _has_prose_after_an_item(utterance))
+        ):
+            unshown.append(row["tag"])
+
+    assert unshown == []
+
+
+def test_no_two_selection_utterances_are_the_same_or_near_copies():
+    rows = _selection_rows()
+
+    copies = [
+        row["tag"]
+        for i, row in enumerate(rows)
+        if _tags_copying([row], [o["utterance"] for j, o in enumerate(rows) if j != i])
+    ]
+
+    assert copies == []
+
+
+@pytest.mark.parametrize("set_name", _OTHER_SETS)
+def test_no_selection_utterance_copies_an_utterance_of_another_set(set_name):
+    others = _other_set_utterances()[set_name]
+
+    copies = _tags_copying(_selection_rows(), others)
+    # Counts in locals: an assert on `len(others)` would print the other set's utterances.
+    compared, expected = len(others), _SET_SIZES.get(set_name, len(_sixty_rows()))
+    copied = len(copies)
+
+    assert compared >= expected, "the other set's utterances were not all compared"
+    assert copies == [], f"{copied} selection probes copy an utterance of another set"
+
+
+@pytest.mark.parametrize("set_name", _OTHER_SETS)
+def test_no_selection_utterance_names_a_person_or_organization_of_another_set(set_name):
+    terms = _other_set_people_and_organizations()[set_name]
+
+    named = _tags_naming(_selection_rows(), terms)
+    # Counts in locals: an assert on `len(terms)` would print the other set's names.
+    found, naming = len(terms), len(named)
+
+    assert found >= _OTHER_SET_TERMS_MIN, "the other set's people and organizations were not found"
+    assert named == [], f"{naming} selection probes name a person or organization of another set"
+
+
+def test_selection_utterances_avoid_entity_names_in_the_production_prompt():
+    terms = _prompt_entity_terms()
+
+    named = _tags_naming(_selection_rows(), terms)
+    found, naming = len(terms), len(named)
+
+    assert found > 20, "the prompt's example entities were not found"
+    assert named == [], f"{naming} selection probes name an entity of the prompt's examples"
+
+
+def _selection_tags_with_an_id_in_the_prompt() -> list[str]:
+    hits = _gold_ids_in_the_prompt(_SELECTION)
+    return sorted(
+        {
+            tag
+            for gold_id, tags in hits.items()
+            if gold_id not in _SELECTION_PROMPT_WORD_EXEMPTIONS
+            for tag in tags
+        }
+    )
+
+
+def test_no_selection_gold_id_occurs_in_the_production_prompt():
+    """Binds once the selection gold is filled: an id the prompt spells out scores the prompt."""
+    tags = _selection_tags_with_an_id_in_the_prompt()
+    holding = len(tags)
+
+    assert tags == [], f"{holding} selection probes hold a gold id the prompt spells out"
+
+
+def test_every_selection_prompt_word_exemption_is_still_needed():
+    unused = len(set(_SELECTION_PROMPT_WORD_EXEMPTIONS) - set(_gold_ids_in_the_prompt(_SELECTION)))
+
+    assert unused == 0, "a selection prompt-word exemption matches no gold id"
+
+
+def test_selection_exemptions_are_never_an_entity_of_the_prompts_examples():
+    example_ids = {canonical_id(t) for t in _prompt_entity_terms()}
+
+    lifted = len(set(_SELECTION_PROMPT_WORD_EXEMPTIONS) & example_ids)
+
+    assert lifted == 0, "a selection exemption is an entity of the prompt's examples"
+
+
+def test_no_selection_utterance_mentions_raj():
+    rows = _selection_rows()
+
+    naming = [r["tag"] for r in rows if re.search(r"\braj\b", r["utterance"], re.IGNORECASE)]
+
+    assert naming == []
+
+
+def test_selection_design_has_one_row_per_probe_naming_its_shape_or_category():
+    design = _gold_rows(_SELECTION_DESIGN)
+    expected = {}
+    for row in _selection_rows():
+        shape = _selection_shape(row)
+        kind = ("shape", shape) if shape else ("category", _selection_slug(row).split("-")[0])
+        expected[row["tag"]] = kind
+
+    stray = [
+        d.get("tag")
+        for d in design
+        if d.get("tag") not in expected
+        or set(d) != {"tag", "persona", "intended_relations", expected[d["tag"]][0]}
+        or d[expected[d["tag"]][0]] != expected[d["tag"]][1]
+        or not isinstance(d["persona"], str)
+        or not d["persona"]
+    ]
+    design_tags, probe_tags = sorted(d.get("tag", "") for d in design), sorted(expected)
+
+    assert design_tags == probe_tags
+    assert stray == []
+
+
+def test_every_selection_probe_is_built_to_carry_at_most_fifteen_relations():
+    design = _gold_rows(_SELECTION_DESIGN)
+
+    unbounded = [
+        d.get("tag")
+        for d in design
+        if not isinstance(d.get("intended_relations"), int)
+        or isinstance(d["intended_relations"], bool)
+        or not 0 <= d["intended_relations"] <= _SELECTION_MAX_RELATIONS
+    ]
+    designed = len(design)
+
+    assert designed == _SELECTION_LIST_PROBES + _SELECTION_PROSE_PROBES
+    assert unbounded == []
+
+
+def test_selection_is_written_from_ten_or_more_personas():
+    personas = len({d.get("persona") for d in _gold_rows(_SELECTION_DESIGN)})
+
+    assert personas >= _SELECTION_PERSONAS_MIN
+
+
+# The label checks near the top of this file that also run on the selection file and its passes.
+_LABEL_CHECKS_ON_SELECTION = (
+    "test_every_label_row_loads_through_the_gold_loader",
+    "test_label_tags_are_unique_and_name_their_utterance",
+    "test_labels_name_only_extractable_types_and_predicates",
+    "test_label_edges_join_their_own_entities_with_matching_types",
+    "test_label_edge_types_are_allowed_for_their_predicate",
+)
+
+
+def test_no_assert_on_the_selection_set_passes_an_argument_to_a_call():
+    """A failing assert prints the arguments of a call inside it, rows included.
+
+    `assert len(rows) >= n` prints `rows`: selection text, or the text of the set a guard
+    compares it with, held-out included. A check that reads the selection set computes into a
+    local first and asserts on the local.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    calling = sorted(
+        {
+            function.name
+            for function in tree.body
+            if isinstance(function, ast.FunctionDef)
+            and ("selection" in function.name or function.name in _LABEL_CHECKS_ON_SELECTION)
+            for statement in ast.walk(function)
+            if isinstance(statement, ast.Assert)
+            for part in ast.walk(statement.test)
+            if isinstance(part, ast.Call) and (part.args or part.keywords)
+        }
+    )
+
+    assert calling == []
