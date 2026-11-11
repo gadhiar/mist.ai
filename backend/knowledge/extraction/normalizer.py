@@ -68,6 +68,10 @@ class EntityNormalizer:
                 Graph-identity resolution moved to the curation deduper (Stage 7a).
             pack: The ontology pack whose rails run; None takes the registry's active
                 pack.
+
+        Raises:
+            PackLoadError: One of the pack's pinned cases does not hold. The check runs
+                here, when the normalizer is built, and not at its first `normalize`.
         """
         # retained: constructor params kept for call-site compatibility (factories.py +
         # ~16 test call sites). Graph-identity path (_find_in_graph) was removed in R1.1d.
@@ -75,6 +79,7 @@ class EntityNormalizer:
         self._executor = executor
         self._graph_available = executor is not None
         self._pack = pack if pack is not None else registry.active_pack()
+        rails.require_pinned_cases(self._pack)
 
     async def normalize(
         self,

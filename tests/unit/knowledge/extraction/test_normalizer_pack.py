@@ -7,14 +7,16 @@ pack was read and today's ontology was not.
 from __future__ import annotations
 
 import copy
+import dataclasses
 
 import pytest
 
+from backend.knowledge.extraction import rails
 from backend.knowledge.extraction.normalizer import EntityNormalizer, rail_inputs
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction.validator import ExtractionValidator
 from backend.knowledge.ontologies import registry
-from backend.knowledge.ontologies.pack import load_pack
+from backend.knowledge.ontologies.pack import Pack, PackLoadError, load_pack
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.unit.knowledge.ontologies.fixtures.pet_pack.conventions import PET_ROSTER_CASE
 
@@ -37,6 +39,58 @@ def test_the_normalizer_defaults_to_the_registrys_active_pack():
     normalizer = EntityNormalizer(FakeEmbeddingGenerator())
 
     assert normalizer._pack is registry.active_pack()
+
+
+def _unheld_base() -> Pack:
+    """The base pack again, with a `mooring-number` case that expects no entity."""
+    rule = next(rule for rule in BASE.rules if rule.id == "mooring-number")
+    wrong = dataclasses.replace(rule.pinned_case, expected_entities=())
+    rules = tuple(
+        dataclasses.replace(r, pinned_case=wrong) if r.id == rule.id else r for r in BASE.rules
+    )
+    return dataclasses.replace(BASE, rules=rules)
+
+
+def test_the_normalizer_refuses_at_construction_a_pack_whose_pinned_case_does_not_hold():
+    with pytest.raises(PackLoadError, match="pinned case.*do not hold: mooring-number"):
+        EntityNormalizer(FakeEmbeddingGenerator(), pack=_unheld_base())
+
+
+def test_the_normalizer_refuses_at_construction_such_a_pack_from_the_registry(monkeypatch):
+    # A normalizer given no pack takes the registry's active one, which the registry no
+    # longer checks: the refusal comes when the normalizer is built, before any turn.
+    unheld = _unheld_base()
+    monkeypatch.setitem(registry._BUILDERS, "0.1.0", lambda: unheld)
+    monkeypatch.setenv(registry.ENV_VAR, "0.1.0")
+    registry.get_pack.cache_clear()
+
+    try:
+        with pytest.raises(PackLoadError, match="pinned case.*do not hold: mooring-number"):
+            EntityNormalizer(FakeEmbeddingGenerator())
+    finally:
+        registry.get_pack.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_two_normalizers_and_a_run_check_a_packs_pinned_cases_once(monkeypatch):
+    pack = dataclasses.replace(BASE)
+    checked: list[Pack] = []
+    real = rails.check_pinned_cases
+
+    def counted(checked_pack: Pack) -> list[str]:
+        checked.append(checked_pack)
+        return real(checked_pack)
+
+    monkeypatch.setattr(rails, "check_pinned_cases", counted)
+    normalizer = EntityNormalizer(FakeEmbeddingGenerator(), pack=pack)
+    EntityNormalizer(FakeEmbeddingGenerator(), pack=pack)
+
+    out = await normalizer.normalize(
+        _extraction([{"id": "the-flotsam", "name": "Flotsam", "type": "Driftwood"}])
+    )
+
+    assert [(e["id"], e["type"]) for e in out.entities] == [("flotsam", "Deckhand")]
+    assert checked == [pack]
 
 
 @pytest.mark.asyncio

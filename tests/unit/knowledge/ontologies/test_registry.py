@@ -96,18 +96,28 @@ def test_the_default_is_the_newest_pack_that_is_not_deprecated(fresh_registry, m
     assert fresh_registry.active_pack() is BASE
 
 
-def test_a_pack_whose_pinned_case_does_not_hold_is_refused(fresh_registry, monkeypatch):
+def test_the_registry_hands_out_a_pack_without_running_its_pinned_cases(
+    fresh_registry, monkeypatch
+):
+    # The registry is a directory of packs. The rail runner refuses a pack whose pinned
+    # case does not hold (`test_rails.py`), and so does the normalizer when it is built
+    # (`test_normalizer_pack.py`); the extraction service runs neither.
     rule = next(rule for rule in BASE.rules if rule.id == "mooring-number")
     wrong = dataclasses.replace(rule.pinned_case, expected_entities=())
     rules = tuple(
         dataclasses.replace(r, pinned_case=wrong) if r.id == rule.id else r for r in BASE.rules
     )
-    monkeypatch.setitem(
-        fresh_registry._BUILDERS, "0.1.0", lambda: dataclasses.replace(BASE, rules=rules)
-    )
+    unheld = dataclasses.replace(BASE, rules=rules)
+    monkeypatch.setitem(fresh_registry._BUILDERS, "0.1.0", lambda: unheld)
 
-    with pytest.raises(PackLoadError, match="pinned case.*do not hold: mooring-number"):
-        fresh_registry.get_pack("0.1.0")
+    assert fresh_registry.get_pack("0.1.0") is unheld
+
+
+def test_the_registry_imports_nothing_from_the_rail_runner():
+    source = Path(registry.__file__).read_text(encoding="utf-8")
+
+    assert "extraction.rails" not in source
+    assert "import rails" not in source
 
 
 # --- the adapter pack is today's ontology -------------------------------------------------
