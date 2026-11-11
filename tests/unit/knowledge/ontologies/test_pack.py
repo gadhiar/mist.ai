@@ -234,6 +234,14 @@ def test_a_rule_id_used_twice_is_refused():
         _build(rules=(*conventions.RULES, _rule("mooring-exempt")))
 
 
+def _with_mooring_number(fn) -> tuple[Plugin, ...]:
+    """The fixture's plug-ins, with `fn` registered as `mooring-number`."""
+    return tuple(
+        Plugin(plugin.name, plugin.phase, fn) if plugin.name == "mooring-number" else plugin
+        for plugin in plugins.PLUGINS
+    )
+
+
 class _CallableObject:
     def __call__(self, entity, entity_id, target):
         return None
@@ -245,13 +253,36 @@ class _CallableObject:
     ids=["partial", "callable-object", "builtin"],
 )
 def test_a_plugin_that_is_not_a_plain_function_is_refused(fn):
-    swapped = tuple(
-        Plugin(plugin.name, plugin.phase, fn) if plugin.name == "mooring-number" else plugin
-        for plugin in plugins.PLUGINS
-    )
-
     with pytest.raises(PackLoadError, match="plug-in mooring-number: .*not a plain function"):
-        _build(plugins=swapped)
+        _build(plugins=_with_mooring_number(fn))
+
+
+def _numbered(prefix: str):
+    """A plug-in factory: each function it returns stores a mooring under its own prefix."""
+
+    def mooring_number(entity, entity_id, target):
+        return f"{prefix}{entity_id}"
+
+    return mooring_number
+
+
+def test_a_plugin_that_is_a_lambda_is_refused():
+    # Two lambdas of one module share a qualified name, so one could replace the other
+    # with the rails hash unmoved.
+    with pytest.raises(PackLoadError, match="plug-in mooring-number: .*its module does not hold"):
+        _build(plugins=_with_mooring_number(lambda entity, entity_id, target: None))
+
+
+@pytest.mark.parametrize("prefix", ["x-", "y-"])
+def test_a_plugin_that_is_a_closure_is_refused(prefix):
+    # The value a closure holds is in neither its qualified name nor its module's source.
+    with pytest.raises(PackLoadError, match="plug-in mooring-number: .*its module does not hold"):
+        _build(plugins=_with_mooring_number(_numbered(prefix)))
+
+
+def _unnumbered(entity, entity_id, target):
+    """A plug-in of this module, to stand in for the fixture's `mooring_number`."""
+    return None
 
 
 @pytest.mark.parametrize(
@@ -345,18 +376,7 @@ def test_a_prompt_visible_manifest_field_moves_only_the_prompt_hash():
 
 
 def test_a_plugin_change_moves_only_the_rails_hash():
-    def mooring_number(entity, entity_id, target):
-        return None
-
-    swapped = tuple(
-        (
-            Plugin(plugin.name, plugin.phase, mooring_number)
-            if plugin.name == "mooring-number"
-            else plugin
-        )
-        for plugin in plugins.PLUGINS
-    )
-    changed = _build(plugins=swapped)
+    changed = _build(plugins=_with_mooring_number(_unnumbered))
 
     assert changed.pack_rails_hash != _build().pack_rails_hash
     assert changed.pack_prompt_hash == _build().pack_prompt_hash

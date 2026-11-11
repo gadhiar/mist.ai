@@ -380,9 +380,12 @@ class Plugin:
     Attributes:
         name: The name rules cite.
         phase: The phase the plug-in runs in; it must equal the citing rule's.
-        fn: The function: a plain `def` or `lambda`, so that its qualified name and its
-            module's source identify it the same way in every process. The loader
-            refuses a `functools.partial`, a callable object or a builtin.
+        fn: The function: one written with `def` at the top of a module or in a class
+            body, and still the object that module holds under the function's qualified
+            name. Its qualified name and its module's source then identify it the same
+            way in every process, and an edit to the function is an edit to that
+            source. The loader refuses a `functools.partial`, a callable object, a
+            builtin, a `lambda` and a function built inside another (a closure).
     """
 
     name: str
@@ -648,7 +651,8 @@ def _check_rules(
     """Refuse an unknown kind, phase, type, edge or plug-in, and an unpinned plug-in.
 
     A plug-in that is not a plain function is refused too: its identity could not be
-    hashed the same way in every process.
+    hashed the same way in every process. So is one its module does not hold under its
+    own qualified name: its identity would not move when what it does changes.
 
     Raises:
         PackLoadError: Naming the rule and what it names that the pack lacks.
@@ -666,6 +670,14 @@ def _check_rules(
             raise PackLoadError(
                 f"plug-in {plugin.name}: {type(plugin.fn).__name__} is not a plain function, "
                 "so the pack's hash would differ between processes"
+            )
+        # A lambda or a function built inside another is named the same as its
+        # siblings, and what a closure holds is in no source text: the hash would stay
+        # where it was when the plug-in's behaviour changed.
+        if not _module_holds(plugin.fn):
+            raise PackLoadError(
+                f"plug-in {plugin.name}: its module does not hold {plugin.fn.__qualname__} "
+                "under that name, so a change to what it does would not move the pack's hash"
             )
     registered = {plugin.name: plugin for plugin in plugins}
     pinned: set[str] = set()
@@ -782,12 +794,30 @@ def _rule_identity(rule: ConventionRule) -> dict[str, object]:
     }
 
 
+def _module_holds(fn: Callable[..., object]) -> bool:
+    """True when `fn` is the very object its module holds under `fn.__qualname__`.
+
+    That holds for a function written with `def` at the top of a module or in a class
+    body. It does not hold for a lambda (named `<lambda>`), for a function built inside
+    another (`<locals>` in its name), or for a function whose name the module has since
+    bound to another object.
+    """
+    held: object = inspect.getmodule(fn)
+    for part in fn.__qualname__.split("."):
+        held = getattr(held, part, None)
+        if held is None:
+            return False
+    return held is fn
+
+
 def _plugin_identity(plugin: Plugin) -> dict[str, object]:
     """A plug-in's name, phase, qualified name and the source of the module that defines it.
 
     The whole defining module is hashed, so the hash covers the plug-in and every
     helper written in that same module. It does not cover a helper the plug-in imports
-    from another module: an edit there leaves the hash where it was.
+    from another module: an edit there leaves the hash where it was. The loader has
+    checked that the module holds the plug-in under its qualified name, so the name and
+    the source together state which function runs.
 
     Raises:
         PackLoadError: The plug-in's source cannot be read.
@@ -841,8 +871,9 @@ def build_pack(
 
     Raises:
         PackLoadError: A name is unknown or repeated, a plug-in is not registered, has
-            no pinned case or is not a plain function, the pair table does not build,
-            or a value the hashes cover cannot be stated as data.
+            no pinned case, is not a plain function or is not the object its module
+            holds under its qualified name, the pair table does not build, or a value
+            the hashes cover cannot be stated as data.
     """
     for what, names in (
         ("node type", tuple(node.type_name for node in node_types)),
