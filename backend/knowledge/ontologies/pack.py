@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Literal
 
 from backend.errors import MistError
+from backend.knowledge import version_stamps
 from backend.knowledge.ontologies.base import EdgeTypeDefinition, NodeTypeDefinition
 
 Phase = Literal["pre_llm", "payload", "relation", "id"]
@@ -843,6 +844,32 @@ def _by_phase(rules: tuple[ConventionRule, ...], phases: tuple[Phase, ...]) -> d
     }
 
 
+def _check_release(version: str, prompt_hash: str, rails_hash: str) -> None:
+    """Refuse a pack the release line names whose hashes are not the line's.
+
+    The release line (`backend.knowledge.version_stamps.PACK_RELEASE`) pins, outside
+    the pack, the pack version and both hashes the running extraction version was
+    released with. A pack of another version is not the line's to judge and loads.
+
+    Raises:
+        PackLoadError: Stating, for each hash, the value the line expects and the
+            value the pack has.
+    """
+    release = version_stamps.PACK_RELEASE
+    if version != release.pack_version:
+        return
+    if (prompt_hash, rails_hash) == (release.pack_prompt_hash, release.pack_rails_hash):
+        return
+    raise PackLoadError(
+        f"pack {version}: its hashes differ from the release line for extraction version "
+        f"{release.extraction_version} (PACK_RELEASE in backend/knowledge/version_stamps.py): "
+        f"pack_prompt_hash expected {release.pack_prompt_hash}, found {prompt_hash}; "
+        f"pack_rails_hash expected {release.pack_rails_hash}, found {rails_hash}. "
+        "Rewrite the release line in the commit that moves a hash; a moved "
+        "pack_prompt_hash also needs a new EXTRACTION_VERSION."
+    )
+
+
 def build_pack(
     *,
     manifest: Manifest,
@@ -932,6 +959,7 @@ def build_pack(
         },
         "pack",
     )
+    _check_release(manifest.version, prompt_hash, rails_hash)
     return Pack(
         manifest=manifest,
         node_types=tuple(node_types),

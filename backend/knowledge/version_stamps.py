@@ -113,6 +113,49 @@ EXTRACTION_VERSION: str = "2026-11-10-r8"
 
 
 @dataclass(frozen=True, slots=True)
+class PackRelease:
+    """The ontology pack an extraction version was released with.
+
+    Attributes:
+        extraction_version: The `EXTRACTION_VERSION` the line is for.
+        pack_version: The version of the pack that extraction version runs with.
+        pack_prompt_hash: That pack's `pack_prompt_hash`: sha256 over what feeds the
+            model.
+        pack_rails_hash: That pack's `pack_rails_hash`: sha256 over what runs after
+            the model.
+    """
+
+    extraction_version: str
+    pack_version: str
+    pack_prompt_hash: str
+    pack_rails_hash: str
+
+
+# The release line: the pack the running EXTRACTION_VERSION was released with, by
+# version and by both hashes. The pin lives here, outside the pack, so a pack cannot
+# change under a version string: the loader
+# (`backend.knowledge.ontologies.pack.build_pack`) refuses a pack of this version
+# whose hashes are not these two, and its message states the hashes it expected and
+# the hashes it found.
+#
+# Rewrite the line in the same commit as any change that moves a pack hash:
+# - `pack_prompt_hash` moves when what feeds the model changes (a type, an edge, a
+#   prompt fragment, an item filter, the plan vocabulary, the generated schema). That
+#   is a re-extraction, so bump EXTRACTION_VERSION with it.
+# - `pack_rails_hash` moves when a post-LLM rule, a plug-in or the manifest's
+#   post-LLM data changes. That is a replay from the cache, with no bump.
+#
+# The extraction version and the pack version are read, never restated: the line is
+# for the running version by construction, and names the pack of the ontology in use.
+PACK_RELEASE: PackRelease = PackRelease(
+    extraction_version=EXTRACTION_VERSION,
+    pack_version=ONTOLOGY_VERSION,
+    pack_prompt_hash="afb06c63e3281cff788d140b7db0fc1bee75cd3ac80461db661b5f406581e03e",
+    pack_rails_hash="4781cce194608f35e864998ae4946c1a5b4070e310f6d7d756aed2582edd73ab",
+)
+
+
+@dataclass(frozen=True, slots=True)
 class CodeRevision:
     """One deliberate change to the code that shapes extraction output.
 
