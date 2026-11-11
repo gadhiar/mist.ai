@@ -29,7 +29,10 @@ Only `design.jsonl` and this file exist until the passes are written.
 - The utterances come from twelve synthetic personas. No persona, person or organisation in them
   is real, and none appears in the tuning sets or the held-out set; the guards in
   `tests/unit/eval_harness/test_gold_sets.py` check the overlap. People have first names only.
-  Technologies, products, places, events and published titles may be real.
+  Real technologies, real public documents (books, papers, RFCs) and real places are allowed, as
+  in `LABELLING.md`'s synthetic-data rule. Nothing else real is named: an organised event, a
+  branded good that is not computing equipment or software, or another published title is
+  invented or written as a plain noun.
 
 ## Who may open what
 

@@ -29,15 +29,15 @@
 {"tag": "sel-029-list-ref-third-ward-app", "shape": "ref", "persona": "p02-hospital-pharmacist", "intended_relations": 1}
 {"tag": "sel-030-list-ref-former-mentor", "shape": "ref", "persona": "p02-hospital-pharmacist", "intended_relations": 6}
 {"tag": "sel-031-list-ref-first-and-last-course", "shape": "ref", "persona": "p02-hospital-pharmacist", "intended_relations": 2}
-{"tag": "sel-032-list-ref-neither-ordered-erg", "shape": "ref", "persona": "p02-hospital-pharmacist", "intended_relations": 1}
+{"tag": "sel-032-list-ref-neither-ordered-erg", "shape": "ref", "persona": "p02-hospital-pharmacist", "intended_relations": 2}
 {"tag": "sel-033-list-plus-shift-rules", "shape": "plus", "persona": "p02-hospital-pharmacist", "intended_relations": 3}
 {"tag": "sel-034-list-checkbox-msc-year-goals", "shape": "checkbox", "persona": "p02-hospital-pharmacist", "intended_relations": 3}
 {"tag": "sel-035-list-heading-ward-study-river", "shape": "heading", "persona": "p02-hospital-pharmacist", "intended_relations": 3}
 {"tag": "sel-036-list-table-drug-round-delays", "shape": "table", "persona": "p02-hospital-pharmacist", "intended_relations": 3}
-{"tag": "sel-037-list-paren-fixed-dates", "shape": "paren", "persona": "p02-hospital-pharmacist", "intended_relations": 6}
+{"tag": "sel-037-list-paren-fixed-dates", "shape": "paren", "persona": "p02-hospital-pharmacist", "intended_relations": 8}
 {"tag": "sel-038-list-dot-eprescribing-complaints", "shape": "dot", "persona": "p02-hospital-pharmacist", "intended_relations": 3}
 {"tag": "sel-039-list-lettered-friends-hospice", "shape": "lettered", "persona": "p02-hospital-pharmacist", "intended_relations": 3}
-{"tag": "sel-040-list-long-weekly-references", "shape": "long", "persona": "p02-hospital-pharmacist", "intended_relations": 11}
+{"tag": "sel-040-list-long-weekly-references", "shape": "long", "persona": "p02-hospital-pharmacist", "intended_relations": 10}
 {"tag": "sel-041-list-long-week-fixed-points", "shape": "long", "persona": "p02-hospital-pharmacist", "intended_relations": 11}
 {"tag": "sel-042-list-long-regatta-errands", "shape": "long", "persona": "p02-hospital-pharmacist", "intended_relations": 0}
 {"tag": "sel-043-list-long-confident-drug-classes", "shape": "long", "persona": "p02-hospital-pharmacist", "intended_relations": 10}
@@ -72,7 +72,7 @@
 {"tag": "sel-072-list-dash-quarter-clients", "shape": "dash", "persona": "p04-freelance-illustrator", "intended_relations": 4}
 {"tag": "sel-073-list-dash-freelance-hates", "shape": "dash", "persona": "p04-freelance-illustrator", "intended_relations": 3}
 {"tag": "sel-074-list-numbered-chargeable-skills", "shape": "numbered", "persona": "p04-freelance-illustrator", "intended_relations": 3}
-{"tag": "sel-075-list-ref-second-print-shop", "shape": "ref", "persona": "p04-freelance-illustrator", "intended_relations": 3}
+{"tag": "sel-075-list-ref-second-print-shop", "shape": "ref", "persona": "p04-freelance-illustrator", "intended_relations": 7}
 {"tag": "sel-076-list-ref-latter-studio-mate", "shape": "ref", "persona": "p04-freelance-illustrator", "intended_relations": 6}
 {"tag": "sel-077-list-ref-first-brush-pack", "shape": "ref", "persona": "p04-freelance-illustrator", "intended_relations": 2}
 {"tag": "sel-078-list-ref-first-two-workshops", "shape": "ref", "persona": "p04-freelance-illustrator", "intended_relations": 2}
@@ -86,7 +86,7 @@
 {"tag": "sel-086-list-long-paid-licences", "shape": "long", "persona": "p04-freelance-illustrator", "intended_relations": 11}
 {"tag": "sel-087-list-long-shelf-art-books", "shape": "long", "persona": "p04-freelance-illustrator", "intended_relations": 10}
 {"tag": "sel-088-list-long-sketchbook-subjects", "shape": "long", "persona": "p04-freelance-illustrator", "intended_relations": 10}
-{"tag": "sel-089-list-long-fairs-attended", "shape": "long", "persona": "p04-freelance-illustrator", "intended_relations": 10}
+{"tag": "sel-089-list-long-tables-last-year", "shape": "long", "persona": "p04-freelance-illustrator", "intended_relations": 10}
 {"tag": "sel-090-list-long-five-year-wall", "shape": "long", "persona": "p04-freelance-illustrator", "intended_relations": 10}
 {"tag": "sel-091-temporal-contract-then-roughs", "category": "temporal", "persona": "p04-freelance-illustrator", "intended_relations": 5}
 {"tag": "sel-092-coref-editor-and-deputy", "category": "coref", "persona": "p04-freelance-illustrator", "intended_relations": 4}
@@ -131,7 +131,7 @@
 {"tag": "sel-131-list-dot-how-projects-run", "shape": "dot", "persona": "p06-indie-game-developer", "intended_relations": 3}
 {"tag": "sel-132-list-lettered-jam-organiser", "shape": "lettered", "persona": "p06-indie-game-developer", "intended_relations": 5}
 {"tag": "sel-133-list-long-day-one-addons", "shape": "long", "persona": "p06-indie-game-developer", "intended_relations": 10}
-{"tag": "sel-134-list-long-games-finished", "shape": "long", "persona": "p06-indie-game-developer", "intended_relations": 10}
+{"tag": "sel-134-list-long-played-to-the-end", "shape": "long", "persona": "p06-indie-game-developer", "intended_relations": 10}
 {"tag": "sel-135-list-long-skills-for-first-game", "shape": "long", "persona": "p06-indie-game-developer", "intended_relations": 11}
 {"tag": "sel-136-list-long-launch-week-numbers", "shape": "long", "persona": "p06-indie-game-developer", "intended_relations": 11}
 {"tag": "sel-137-list-long-sorted-opinions", "shape": "long", "persona": "p06-indie-game-developer", "intended_relations": 10}
@@ -143,7 +143,7 @@
 {"tag": "sel-143-list-dash-trusted-suppliers", "shape": "dash", "persona": "p07-restaurant-sous-chef", "intended_relations": 3}
 {"tag": "sel-144-list-numbered-best-cuisines", "shape": "numbered", "persona": "p07-restaurant-sous-chef", "intended_relations": 3}
 {"tag": "sel-145-list-numbered-kitchen-nerves", "shape": "numbered", "persona": "p07-restaurant-sous-chef", "intended_relations": 3}
-{"tag": "sel-146-list-ref-second-oven", "shape": "ref", "persona": "p07-restaurant-sous-chef", "intended_relations": 4}
+{"tag": "sel-146-list-ref-second-oven", "shape": "ref", "persona": "p07-restaurant-sous-chef", "intended_relations": 5}
 {"tag": "sel-147-list-ref-first-two-on-pass", "shape": "ref", "persona": "p07-restaurant-sous-chef", "intended_relations": 7}
 {"tag": "sel-148-list-ref-last-stage", "shape": "ref", "persona": "p07-restaurant-sous-chef", "intended_relations": 5}
 {"tag": "sel-149-list-ref-first-knife", "shape": "ref", "persona": "p07-restaurant-sous-chef", "intended_relations": 5}
@@ -175,7 +175,7 @@
 {"tag": "sel-175-list-heading-funded-and-unfunded", "shape": "heading", "persona": "p08-marine-biology-phd", "intended_relations": 4}
 {"tag": "sel-176-list-table-station-tickets", "shape": "table", "persona": "p08-marine-biology-phd", "intended_relations": 3}
 {"tag": "sel-177-list-paren-survey-day", "shape": "paren", "persona": "p08-marine-biology-phd", "intended_relations": 2}
-{"tag": "sel-178-list-dot-journals-read", "shape": "dot", "persona": "p08-marine-biology-phd", "intended_relations": 3}
+{"tag": "sel-178-list-dot-books-reread", "shape": "dot", "persona": "p08-marine-biology-phd", "intended_relations": 3}
 {"tag": "sel-179-list-lettered-after-the-viva", "shape": "lettered", "persona": "p08-marine-biology-phd", "intended_relations": 3}
 {"tag": "sel-180-list-long-tally-sheet-species", "shape": "long", "persona": "p08-marine-biology-phd", "intended_relations": 11}
 {"tag": "sel-181-list-long-unadvertised-skills", "shape": "long", "persona": "p08-marine-biology-phd", "intended_relations": 10}
@@ -195,13 +195,13 @@
 {"tag": "sel-195-list-ref-last-navigation-library", "shape": "ref", "persona": "p09-mobile-app-engineer", "intended_relations": 2}
 {"tag": "sel-196-list-ref-accepted-b-and-c", "shape": "ref", "persona": "p09-mobile-app-engineer", "intended_relations": 2}
 {"tag": "sel-197-list-plus-week-off-keyboard", "shape": "plus", "persona": "p09-mobile-app-engineer", "intended_relations": 4}
-{"tag": "sel-198-list-star-aims-written-down", "shape": "star", "persona": "p09-mobile-app-engineer", "intended_relations": 5}
+{"tag": "sel-198-list-star-aims-written-down", "shape": "star", "persona": "p09-mobile-app-engineer", "intended_relations": 6}
 {"tag": "sel-199-list-checkbox-release-four-two", "shape": "checkbox", "persona": "p09-mobile-app-engineer", "intended_relations": 3}
 {"tag": "sel-200-list-nested-what-i-own", "shape": "nested", "persona": "p09-mobile-app-engineer", "intended_relations": 5}
 {"tag": "sel-201-list-heading-quarters-and-never", "shape": "heading", "persona": "p09-mobile-app-engineer", "intended_relations": 3}
 {"tag": "sel-202-list-mixed-odd-day", "shape": "mixed", "persona": "p09-mobile-app-engineer", "intended_relations": 3}
 {"tag": "sel-203-list-long-android-build-libraries", "shape": "long", "persona": "p09-mobile-app-engineer", "intended_relations": 12}
-{"tag": "sel-204-list-long-fell-races-finished", "shape": "long", "persona": "p09-mobile-app-engineer", "intended_relations": 10}
+{"tag": "sel-204-list-long-summits-run-hardest-first", "shape": "long", "persona": "p09-mobile-app-engineer", "intended_relations": 10}
 {"tag": "sel-205-list-long-accessibility-checks", "shape": "long", "persona": "p09-mobile-app-engineer", "intended_relations": 10}
 {"tag": "sel-206-list-long-cv-languages", "shape": "long", "persona": "p09-mobile-app-engineer", "intended_relations": 11}
 {"tag": "sel-207-list-long-fell-day-kit", "shape": "long", "persona": "p09-mobile-app-engineer", "intended_relations": 10}
@@ -226,7 +226,7 @@
 {"tag": "sel-226-list-long-routes-walked", "shape": "long", "persona": "p10-travel-product-manager", "intended_relations": 11}
 {"tag": "sel-227-list-long-partner-portal-integrations", "shape": "long", "persona": "p10-travel-product-manager", "intended_relations": 10}
 {"tag": "sel-228-list-long-foraged-through-the-year", "shape": "long", "persona": "p10-travel-product-manager", "intended_relations": 11}
-{"tag": "sel-229-list-long-guesthouses-stayed-in", "shape": "long", "persona": "p10-travel-product-manager", "intended_relations": 10}
+{"tag": "sel-229-list-long-slept-in-while-scouting", "shape": "long", "persona": "p10-travel-product-manager", "intended_relations": 10}
 {"tag": "sel-230-list-long-product-manager-refusals", "shape": "long", "persona": "p10-travel-product-manager", "intended_relations": 10}
 {"tag": "sel-231-multi-product-lead-founder-blog", "category": "multi", "persona": "p10-travel-product-manager", "intended_relations": 5}
 {"tag": "sel-232-neg-former-report-and-unbought-tool", "category": "neg", "persona": "p10-travel-product-manager", "intended_relations": 2}
@@ -247,7 +247,7 @@
 {"tag": "sel-247-list-nested-society-duties", "shape": "nested", "persona": "p11-retired-carpenter", "intended_relations": 9}
 {"tag": "sel-248-list-heading-mornings-afternoons", "shape": "heading", "persona": "p11-retired-carpenter", "intended_relations": 3}
 {"tag": "sel-249-list-mixed-committee-night", "shape": "mixed", "persona": "p11-retired-carpenter", "intended_relations": 3}
-{"tag": "sel-250-list-long-seed-order-varieties", "shape": "long", "persona": "p11-retired-carpenter", "intended_relations": 12}
+{"tag": "sel-250-list-long-raised-from-seed", "shape": "long", "persona": "p11-retired-carpenter", "intended_relations": 10}
 {"tag": "sel-251-list-long-built-since-retiring", "shape": "long", "persona": "p11-retired-carpenter", "intended_relations": 10}
 {"tag": "sel-252-list-long-workshop-machines", "shape": "long", "persona": "p11-retired-carpenter", "intended_relations": 10}
 {"tag": "sel-253-list-long-towns-worked-in", "shape": "long", "persona": "p11-retired-carpenter", "intended_relations": 10}
@@ -261,7 +261,7 @@
 {"tag": "sel-261-list-numbered-interviewing-skills", "shape": "numbered", "persona": "p12-audio-journalist", "intended_relations": 3}
 {"tag": "sel-262-list-ref-former-host", "shape": "ref", "persona": "p12-audio-journalist", "intended_relations": 5}
 {"tag": "sel-263-list-ref-first-script-reader", "shape": "ref", "persona": "p12-audio-journalist", "intended_relations": 7}
-{"tag": "sel-264-list-ref-second-microphone", "shape": "ref", "persona": "p12-audio-journalist", "intended_relations": 1}
+{"tag": "sel-264-list-ref-second-microphone", "shape": "ref", "persona": "p12-audio-journalist", "intended_relations": 2}
 {"tag": "sel-265-list-ref-third-application", "shape": "ref", "persona": "p12-audio-journalist", "intended_relations": 1}
 {"tag": "sel-266-list-plus-standing-dates", "shape": "plus", "persona": "p12-audio-journalist", "intended_relations": 5}
 {"tag": "sel-267-list-checkbox-episode-six", "shape": "checkbox", "persona": "p12-audio-journalist", "intended_relations": 3}
@@ -273,7 +273,7 @@
 {"tag": "sel-273-list-long-towns-recorded-in", "shape": "long", "persona": "p12-audio-journalist", "intended_relations": 11}
 {"tag": "sel-274-list-long-pieces-proud-of", "shape": "long", "persona": "p12-audio-journalist", "intended_relations": 10}
 {"tag": "sel-275-list-long-collected-sounds", "shape": "long", "persona": "p12-audio-journalist", "intended_relations": 10}
-{"tag": "sel-276-list-long-voice-track-plugins", "shape": "long", "persona": "p12-audio-journalist", "intended_relations": 10}
+{"tag": "sel-276-list-long-voice-track-chain", "shape": "long", "persona": "p12-audio-journalist", "intended_relations": 10}
 {"tag": "sel-277-list-long-beats-covered", "shape": "long", "persona": "p12-audio-journalist", "intended_relations": 10}
 {"tag": "sel-278-multi-producer-show-composer", "category": "multi", "persona": "p12-audio-journalist", "intended_relations": 7}
 {"tag": "sel-279-neg-audition-and-television", "category": "neg", "persona": "p12-audio-journalist", "intended_relations": 2}
