@@ -371,12 +371,18 @@ class Plugin:
       `row` its `RailRow`. The result is the id of a payload entity, or None for no
       edge.
     - any post-LLM phase, named by a `plugin` rule:
-      `(entities, relationships, row) -> (entities, relationships)`.
+      `(entities, relationships, row) -> (entities, relationships)`. It changes the
+      entity dicts in place, or returns the same dict objects it was given, and never
+      a copy of one: the runner knows an entity it has settled (the user anchor, a
+      reserved identity, a registry hit) by the dict object, so a copy would be given
+      the id rules and the type fallback a settled entity is spared.
 
     Attributes:
         name: The name rules cite.
         phase: The phase the plug-in runs in; it must equal the citing rule's.
-        fn: The function.
+        fn: The function: a plain `def` or `lambda`, so that its qualified name and its
+            module's source identify it the same way in every process. The loader
+            refuses a `functools.partial`, a callable object or a builtin.
     """
 
     name: str
@@ -641,6 +647,9 @@ def _check_rules(
 ) -> None:
     """Refuse an unknown kind, phase, type, edge or plug-in, and an unpinned plug-in.
 
+    A plug-in that is not a plain function is refused too: its identity could not be
+    hashed the same way in every process.
+
     Raises:
         PackLoadError: Naming the rule and what it names that the pack lacks.
     """
@@ -650,6 +659,14 @@ def _check_rules(
     repeated = _duplicates(tuple(plugin.name for plugin in plugins))
     if repeated:
         raise PackLoadError(f"plug-in(s) registered twice: {', '.join(repeated)}")
+    for plugin in plugins:
+        # A partial or a callable object has no qualified name of its own, and what it
+        # would be hashed by instead changes from one process to the next.
+        if not inspect.isfunction(plugin.fn):
+            raise PackLoadError(
+                f"plug-in {plugin.name}: {type(plugin.fn).__name__} is not a plain function, "
+                "so the pack's hash would differ between processes"
+            )
     registered = {plugin.name: plugin for plugin in plugins}
     pinned: set[str] = set()
     for rule in rules:
@@ -704,28 +721,53 @@ def _check_manifest(
         raise PackLoadError("manifest: the user anchor has no id")
 
 
-def _canonical(value: object) -> object:
-    """`value` as JSON-ready data, the one serialization both hashes are taken over."""
+def _is_scalar(value: object) -> bool:
+    return value is None or isinstance(value, str | int | float | bool)
+
+
+def _canonical(value: object, where: str) -> object:
+    """`value` as JSON-ready data, the one serialization both hashes are taken over.
+
+    Only data is stated: dataclasses, enums, mappings with scalar keys, sequences, sets
+    of scalars and scalars. Anything else would be written as its `repr`, which may
+    carry a memory address and so differ between two processes, and a pack whose hash
+    is not the same in every process never equals its own stamp.
+
+    Args:
+        value: The value to state.
+        where: Where the value sits in the pack, for the refusal.
+
+    Raises:
+        PackLoadError: `value`, or something inside it, cannot be stated as data.
+    """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         body = {
-            spec.name: _canonical(getattr(value, spec.name)) for spec in dataclasses.fields(value)
+            spec.name: _canonical(getattr(value, spec.name), f"{where}.{spec.name}")
+            for spec in dataclasses.fields(value)
         }
         return {"__class__": type(value).__name__, **body}
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, Mapping):
-        return {str(key): _canonical(item) for key, item in value.items()}
-    if isinstance(value, tuple | list):
-        return [_canonical(item) for item in value]
-    if isinstance(value, frozenset | set):
-        return sorted(str(item) for item in value)
-    if value is None or isinstance(value, str | int | float | bool):
+        if all(_is_scalar(key) for key in value):
+            return {str(key): _canonical(item, f"{where}.{key}") for key, item in value.items()}
+    elif isinstance(value, tuple | list):
+        return [_canonical(item, f"{where}[{index}]") for index, item in enumerate(value)]
+    elif isinstance(value, frozenset | set):
+        if all(_is_scalar(item) for item in value):
+            return sorted(str(item) for item in value)
+    elif _is_scalar(value):
         return value
-    return repr(value)
+    raise PackLoadError(
+        f"{where}: a value of type {type(value).__name__} cannot be stated as data, so the "
+        "pack's hash would differ between processes"
+    )
 
 
-def _sha256(value: object) -> str:
-    text = json.dumps(_canonical(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+def _sha256(value: object, where: str) -> str:
+    text = json.dumps(
+        _canonical(value, where), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -741,9 +783,11 @@ def _rule_identity(rule: ConventionRule) -> dict[str, object]:
 
 
 def _plugin_identity(plugin: Plugin) -> dict[str, object]:
-    """A plug-in's name, phase and the source of the module that defines it.
+    """A plug-in's name, phase, qualified name and the source of the module that defines it.
 
-    The whole module is hashed, so a helper the plug-in calls is covered too.
+    The whole defining module is hashed, so the hash covers the plug-in and every
+    helper written in that same module. It does not cover a helper the plug-in imports
+    from another module: an edit there leaves the hash where it was.
 
     Raises:
         PackLoadError: The plug-in's source cannot be read.
@@ -758,7 +802,7 @@ def _plugin_identity(plugin: Plugin) -> dict[str, object]:
     return {
         "name": plugin.name,
         "phase": plugin.phase,
-        "function": getattr(plugin.fn, "__qualname__", repr(plugin.fn)),
+        "function": plugin.fn.__qualname__,
         "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
     }
 
@@ -796,8 +840,9 @@ def build_pack(
         labelling: The pack's labelling text.
 
     Raises:
-        PackLoadError: A name is unknown or repeated, a plug-in is not registered or
-            has no pinned case, or the pair table does not build.
+        PackLoadError: A name is unknown or repeated, a plug-in is not registered, has
+            no pinned case or is not a plain function, the pair table does not build,
+            or a value the hashes cover cannot be stated as data.
     """
     for what, names in (
         ("node type", tuple(node.type_name for node in node_types)),
@@ -840,7 +885,8 @@ def build_pack(
                 "escape_edge": manifest.escape_edge,
                 "prompt_token_budget": manifest.prompt_token_budget,
             },
-        }
+        },
+        "pack",
     )
     rails_hash = _sha256(
         {
@@ -852,7 +898,8 @@ def build_pack(
                 "user_id": manifest.user_id,
                 "user_type": manifest.user_type,
             },
-        }
+        },
+        "pack",
     )
     return Pack(
         manifest=manifest,

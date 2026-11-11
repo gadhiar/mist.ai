@@ -196,6 +196,19 @@ def test_the_adapter_exposes_both_hashes_and_they_are_stable(fresh_registry):
     assert first.pack_prompt_hash != first.pack_rails_hash
 
 
+def test_the_adapter_hashes_to_the_pinned_values(fresh_registry):
+    # What today's ontology hashed to when the adapter's hashes were first pinned. The
+    # rails hash covers the source of `id_rails.py`, where the adapter's plug-ins live,
+    # so an edit there or to the ontology moves a value on purpose; a loader change
+    # must not.
+    pack = fresh_registry.active_pack()
+
+    assert (pack.pack_prompt_hash, pack.pack_rails_hash) == (
+        "afb06c63e3281cff788d140b7db0fc1bee75cd3ac80461db661b5f406581e03e",
+        "4781cce194608f35e864998ae4946c1a5b4070e310f6d7d756aed2582edd73ab",
+    )
+
+
 def test_the_id_rails_run_with_the_active_pack(fresh_registry, monkeypatch):
     monkeypatch.setitem(fresh_registry._BUILDERS, "0.1.0", lambda: BASE)
     monkeypatch.setenv(fresh_registry.ENV_VAR, "0.1.0")

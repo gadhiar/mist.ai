@@ -7,10 +7,12 @@ invented, so nothing here depends on the ontology the product ships.
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import pytest
 
 from backend.errors import MistError
+from backend.knowledge.ontologies.base import PropertyDefinition
 from backend.knowledge.ontologies.pack import (
     ID,
     KINDS,
@@ -232,7 +234,60 @@ def test_a_rule_id_used_twice_is_refused():
         _build(rules=(*conventions.RULES, _rule("mooring-exempt")))
 
 
+class _CallableObject:
+    def __call__(self, entity, entity_id, target):
+        return None
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [functools.partial(plugins.mooring_number), _CallableObject(), len],
+    ids=["partial", "callable-object", "builtin"],
+)
+def test_a_plugin_that_is_not_a_plain_function_is_refused(fn):
+    swapped = tuple(
+        Plugin(plugin.name, plugin.phase, fn) if plugin.name == "mooring-number" else plugin
+        for plugin in plugins.PLUGINS
+    )
+
+    with pytest.raises(PackLoadError, match="plug-in mooring-number: .*not a plain function"):
+        _build(plugins=swapped)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [object(), b"raw", len, frozenset({object()}), {object(): "keyed"}],
+    ids=["object", "bytes", "builtin", "set-of-objects", "object-key"],
+)
+def test_a_definition_value_that_cannot_be_stated_as_data_is_refused(value):
+    berth = PropertyDefinition(name="berth", type="string", default=value)
+    first = dataclasses.replace(types.NODE_TYPES[0], optional_properties=(berth,))
+
+    with pytest.raises(PackLoadError, match="default.*cannot be stated as data"):
+        _build(node_types=(first, *types.NODE_TYPES[1:]))
+
+
 # --- the two hashes --------------------------------------------------------------------
+
+# What the fixture packs hashed to when their hashes were first pinned. An edit to a
+# fixture's types, rules or plug-in module moves one on purpose; a loader change must not.
+_PINNED_HASHES = {
+    BASE: (
+        "a9ce742bd351cbb2098eb2c46b6c292e9fa5adde19f0873c71952625192e80b4",
+        "58b8b85f66a1f6828c853e44c0ecd2c8a2441d0dfe78c65470e952fda0e4d920",
+    ),
+    PET: (
+        "dea655659d9dd5a96826dae26b148e4d6106152c054dd9af0c5c7f3997a7f731",
+        "4101934dcca63c62cf238850f824c59c5a2b7342d25abe825a195be1f048c713",
+    ),
+}
+
+
+@pytest.mark.parametrize("package", [BASE, PET], ids=["base", "pet"])
+def test_the_fixture_packs_hash_to_the_pinned_values(package):
+    pack = load_pack(package)
+
+    assert (pack.pack_prompt_hash, pack.pack_rails_hash) == _PINNED_HASHES[package]
 
 
 def _sha256_shaped(value: str) -> bool:
