@@ -243,21 +243,28 @@ class ExtractionCache:
         `batch_record` and `turn_plan` are always keys of the returned dict.
         Each holds what `put` was given, or None when the column is NULL: a
         turn extracted as one batch, or with no plan.
+
+        A file may lack those two columns altogether: the rebuild CLI reads
+        the cache without calling `initialize()`, so a file no backend of
+        this code has opened (a restored backup) still has the older table.
+        Every row in it was written before the columns existed, so both keys
+        read None, the same as a NULL. The row is therefore selected whole
+        and the two columns are looked up among the ones it came back with,
+        on every call: nothing is remembered, so a later `initialize()` on
+        this object is seen by the next read. The read adds no column.
         """
         key = cache_key(event_id, extraction_version, model_hash, identity_namespace)
         row = (
             self._get_connection()
             .execute(
-                "SELECT ontology_version, outcome, skip_reason, scope, "
-                "scope_confidence, payload, derivation, service_stamps, "
-                "batch_record, turn_plan "
-                "FROM extraction_cache WHERE cache_key = ? AND identity_namespace IS ?",
+                "SELECT * FROM extraction_cache WHERE cache_key = ? AND identity_namespace IS ?",
                 (key, identity_namespace),
             )
             .fetchone()
         )
         if row is None:
             return None
+        columns = row.keys()
         payload = json.loads(row["payload"])
         return {
             "ontology_version": row["ontology_version"],
@@ -269,8 +276,10 @@ class ExtractionCache:
             "relationships": payload.get("relationships", []),
             "derivation": _loads_or_none(row["derivation"]),
             "service_stamps": _loads_or_none(row["service_stamps"]),
-            "batch_record": _loads_or_none(row["batch_record"]),
-            "turn_plan": _loads_or_none(row["turn_plan"]),
+            "batch_record": (
+                _loads_or_none(row["batch_record"]) if "batch_record" in columns else None
+            ),
+            "turn_plan": _loads_or_none(row["turn_plan"]) if "turn_plan" in columns else None,
         }
 
     def event_ids_for(
