@@ -113,6 +113,54 @@ EXTRACTION_VERSION: str = "2026-11-10-r8"
 
 
 @dataclass(frozen=True, slots=True)
+class PackRelease:
+    """The ontology pack an extraction version was released with.
+
+    Attributes:
+        extraction_version: The `EXTRACTION_VERSION` the line is for.
+        pack_version: The version of the pack that extraction version runs with.
+        pack_prompt_hash: That pack's `pack_prompt_hash`: sha256 over what feeds the
+            model.
+        pack_rails_hash: That pack's `pack_rails_hash`: sha256 over what runs after
+            the model.
+    """
+
+    extraction_version: str
+    pack_version: str
+    pack_prompt_hash: str
+    pack_rails_hash: str
+
+
+# The release line: the pack the running EXTRACTION_VERSION was released with, by
+# version and by both hashes. The pin lives here, outside the pack, so a pack cannot
+# change under a version string: the loader
+# (`backend.knowledge.ontologies.pack.build_pack`) refuses a pack of this version
+# whose hashes are not these two, and its message states the hashes it expected and
+# the hashes it found.
+#
+# Rewrite the line in the same commit as any change that moves a pack hash:
+# - `pack_prompt_hash` moves when what feeds the model changes (a type, an edge, a
+#   prompt fragment, an item filter, the plan vocabulary, the generated schema). That
+#   is a re-extraction, so bump EXTRACTION_VERSION with it. The one exception is a
+#   change to what the hash covers that leaves the model's input as it was.
+# - `pack_rails_hash` moves when a post-LLM rule, a plug-in or the manifest's
+#   post-LLM data changes. That is a replay from the cache, with no bump.
+#
+# The extraction version and the pack version are read, never restated: the line is
+# for the running version by construction, and names the pack of the ontology in use.
+#
+# Under 2026-11-10-r8 the prompt hash moved once with no change to the model's input:
+# the generated output schema joined what it covers, and that schema equals the one
+# the service already sent.
+PACK_RELEASE: PackRelease = PackRelease(
+    extraction_version=EXTRACTION_VERSION,
+    pack_version=ONTOLOGY_VERSION,
+    pack_prompt_hash="5357a198ce334d01a38ae38f7ca63c8e2d916381f3099d5f74ea6862a6f54fdb",
+    pack_rails_hash="4781cce194608f35e864998ae4946c1a5b4070e310f6d7d756aed2582edd73ab",
+)
+
+
+@dataclass(frozen=True, slots=True)
 class CodeRevision:
     """One deliberate change to the code that shapes extraction output.
 
@@ -189,7 +237,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-5ae16e2551e615d5562ca4a622f98bca3b504b979ddb5f8b93c0993839da1381",
+        code_identity="ci1-4af580515edebe101c9a9d31b57a9c0758ddd3262f1469b0c8ef2257ac4f6b06",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -221,7 +269,17 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "schema, and every batch carries the plan block in front of its user message, "
             "while a failed plan call leaves the batches as they are with the flag off; the "
             "plan asks for a template only where a heading or lead-in states a relationship, "
-            "and a failed plan call is logged by exception type and HTTP status alone. "
+            "and a failed plan call is logged by exception type and HTTP status alone; "
+            "T44 states the system prompt as an engine core with slots, into which "
+            "assemble_system_prompt places a pack's prompt fragments, and generates the "
+            "Stage 2 schema from a pack's extractable names, the core with no fragment "
+            "and the generated schema being byte-identical to the prompt and the schema "
+            "as they stood; the engine now extracts with the registry's active pack, "
+            "running its item filters on the units before they are batched, sending its "
+            "assembled prompt and generated schema at Stage 2 and under the plan call, and "
+            "stamping its two hashes on every result, and pre_llm, the pack loader and the "
+            "registry join the covered code; the active pack holds no prompt fragment and "
+            "no item filter, so it drops no unit and changes no request. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

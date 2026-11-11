@@ -83,6 +83,7 @@ from backend.knowledge.extraction.ontology_extractor import (
     parse_extraction_output,
     render_extraction_messages,
 )
+from backend.knowledge.extraction.pre_llm import filter_units
 from backend.knowledge.extraction.preprocessor import PreProcessedInput, PreProcessor
 from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE
 from backend.knowledge.extraction.scope_classifier import (
@@ -100,6 +101,8 @@ from backend.knowledge.extraction.structure_splitter import (
     render_unit,
     split_structured,
 )
+from backend.knowledge.ontologies.pack import Pack
+from backend.knowledge.ontologies.registry import active_pack
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from backend.llm.models import LLMRequest, LLMResponse
 from backend.llm.provider import StreamingLLMProvider
@@ -198,10 +201,11 @@ LIST_CONTEXT_MAX_UNITS: int = 8
 # `backend.knowledge.extraction.run_identity`): this module, the adapters,
 # the schemas and the turn plan, every `backend.knowledge.extraction` module
 # imported above, whose renderers and strict parsers Stages 1.5, 2 and 9 call,
-# and the provider module the service builds. Whole modules rather than
-# functions, so a helper a covered function calls is covered too; an edit
-# elsewhere in a covered module costs one `CODE_REVISIONS` line, never a
-# silent miss.
+# the pack loader, the registry and the pre-LLM interpreters, which decide the
+# prompt, the schema and the units the model is given, and the provider module
+# the service builds. Whole modules rather than functions, so a helper a covered
+# function calls is covered too; an edit elsewhere in a covered module costs one
+# `CODE_REVISIONS` line, never a silent miss.
 RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     importlib.import_module(name)
     for name in (
@@ -212,10 +216,13 @@ RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
         "backend.knowledge.extraction.internal_derivation",
         "backend.knowledge.extraction.internal_prompts",
         "backend.knowledge.extraction.ontology_extractor",
+        "backend.knowledge.extraction.pre_llm",
         "backend.knowledge.extraction.preprocessor",
         "backend.knowledge.extraction.prompts",
         "backend.knowledge.extraction.scope_classifier",
         "backend.knowledge.extraction.structure_splitter",
+        "backend.knowledge.ontologies.pack",
+        "backend.knowledge.ontologies.registry",
         "backend.llm.llama_server_provider",
     )
 )
@@ -262,7 +269,10 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
         "backend.knowledge.ontologies",
         "the turn plan reads its two derived extractable lists and nothing else, as the "
         "plan schema's enums, and that schema is hashed into prompt_sha256 when the plan "
-        "is on; the ontology's version is a component already",
+        "is on; the ontology's version is a component already. A pack's own types and "
+        "rules live under this package and no service module imports them: the covered "
+        "registry reaches them, and pack_prompt_hash and pack_rails_hash, stamped on "
+        "every result, cover their content",
     ),
 )
 
@@ -448,7 +458,9 @@ def _with_plan_block(messages: list[dict], plan_block: str) -> list[dict]:
     return [system, {**user, "content": plan_block + user["content"]}, *rest]
 
 
-def _compute_prompt_sha256(adapter: ModelFamilyAdapter, *, turn_plan: bool = False) -> str:
+def _compute_prompt_sha256(
+    adapter: ModelFamilyAdapter, *, turn_plan: bool = False, pack: Pack | None = None
+) -> str:
     """Hash the prompt text and output schemas sent to the model, plus the adapter identity.
 
     `prompt_sha256` is a per-result provenance stamp: the record of what the
@@ -486,18 +498,27 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter, *, turn_plan: bool = Fal
         adapter: The model-family adapter the service runs.
         turn_plan: Whether the service runs with the turn plan
             (`ServiceSettings.turn_plan`).
+        pack: The pack the service extracts with: its assembled system prompt
+            and its generated schema are the Stage 2 components. None hashes
+            this module's `EXTRACTION_SYSTEM_PROMPT` and
+            `EXTRACTION_OUTPUT_SCHEMA`, the prompt and schema of a pack that
+            holds no prompt fragment, which the pack in use by default is.
+            The pack's two hashes are stamps of their own and are no
+            component here.
     """
+    system_prompt = EXTRACTION_SYSTEM_PROMPT if pack is None else pack.system_prompt
+    extraction_schema = EXTRACTION_OUTPUT_SCHEMA if pack is None else pack.extraction_schema
     components = [
         SCOPE_CLASSIFIER_SYSTEM_PROMPT,
         SCOPE_USER_TEMPLATE,
-        EXTRACTION_SYSTEM_PROMPT,
+        system_prompt,
         EXTRACTION_USER_TEMPLATE,
         NO_PRIOR_CONTEXT,
         INTERNAL_DERIVATION_SYSTEM_PROMPT,
         INTERNAL_DERIVATION_USER_TEMPLATE,
         _REPAIR_INSTRUCTION,
         json.dumps(SCOPE_OUTPUT_SCHEMA, sort_keys=True),
-        json.dumps(EXTRACTION_OUTPUT_SCHEMA, sort_keys=True),
+        json.dumps(extraction_schema, sort_keys=True),
         json.dumps(DERIVATION_OUTPUT_SCHEMA, sort_keys=True),
         adapter.name,
         adapter.version,
@@ -627,6 +648,7 @@ class ExtractionEngine:
         adapter: ModelFamilyAdapter,
         settings: ServiceSettings,
         run_identity: str | None = None,
+        pack: Pack | None = None,
     ) -> None:
         """Initialize the engine.
 
@@ -639,18 +661,31 @@ class ExtractionEngine:
                 takes it rather than computing it, so it imports no backend
                 module beyond those `RUN_IDENTITY_CODE` and
                 `RUN_IDENTITY_EXCLUDED` name. None stamps nothing.
+            pack: The ontology pack to extract with: its item filters choose
+                the units the model is given, its assembled prompt and its
+                generated schema are what Stage 2 sends, and its two hashes
+                are stamped on every result. None takes the registry's
+                active pack.
         """
         self._llm = llm
         self._adapter = adapter
         self._settings = settings
         self._run_identity = run_identity
+        self._pack = pack if pack is not None else active_pack()
         self._preprocessor = PreProcessor()
-        self._prompt_sha256 = _compute_prompt_sha256(adapter, turn_plan=settings.turn_plan)
+        self._prompt_sha256 = _compute_prompt_sha256(
+            adapter, turn_plan=settings.turn_plan, pack=self._pack
+        )
 
     @property
     def adapter_name(self) -> str:
         """The active model-family adapter's name (e.g. "gptoss")."""
         return self._adapter.name
+
+    @property
+    def pack(self) -> Pack:
+        """The ontology pack this engine extracts with."""
+        return self._pack
 
     @property
     def run_identity(self) -> str | None:
@@ -736,6 +771,8 @@ class ExtractionEngine:
                 adapter=self._adapter.name,
                 run_identity=self._run_identity,
                 serving_identity=serving_identity,
+                pack_prompt_hash=self._pack.pack_prompt_hash,
+                pack_rails_hash=self._pack.pack_rails_hash,
             ),
             timings_ms=TimingsMs(
                 scope=scope_ms,
@@ -781,9 +818,23 @@ class ExtractionEngine:
         request = self._build_request(
             messages=messages,
             max_tokens=self.stage_cap("extract"),
-            schema=EXTRACTION_OUTPUT_SCHEMA,
+            schema=dict(self._pack.extraction_schema),
         )
         return self._adapter.prepare(request, stage="extract")
+
+    def _extraction_messages(self, batch_input: PreProcessedInput) -> list[dict]:
+        """Stage 2's messages for `batch_input`, under the pack's system prompt.
+
+        The shared renderer writes the user message, and a system message from
+        the prompt module's own template. The system message sent is the pack's
+        assembled prompt with the same reference date, which for a pack that
+        holds no prompt fragment is the same text.
+        """
+        messages = render_extraction_messages(batch_input)
+        system_prompt = self._pack.system_prompt.format(
+            reference_date=batch_input.reference_date.strftime("%Y-%m-%d")
+        )
+        return [{"role": "system", "content": system_prompt}, *messages[1:]]
 
     def _plan_request(self, *, messages: list[dict]) -> LLMRequest:
         """The turn plan's request for `messages`, prepared by the adapter as stage `extract`.
@@ -870,12 +921,16 @@ class ExtractionEngine:
         structured turn's plan call goes out first, and its failure adds a
         warning to `warnings` and fails nothing.
 
+        The pack's item filters run first, on the split units and before any
+        batch is cut, so a unit they drop reaches neither a batch, nor a later
+        batch's context, nor the plan call.
+
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
             UpstreamLLMError: The LLM call failed, or every attempt's
                 output stayed unparsable.
         """
-        units = split_structured(pre_processed.original_text)
+        units = filter_units(split_structured(pre_processed.original_text), self._pack)
         run = _Stage2Run()
         if self._settings.turn_plan and is_structured_turn(units):
             run.turn_plan = await self._run_turn_plan(pre_processed, units, warnings)
@@ -908,7 +963,7 @@ class ExtractionEngine:
         the plan off. The line carries the reason and never the turn's or
         the reply's text.
         """
-        system = render_extraction_messages(pre_processed)[0]
+        system = self._extraction_messages(pre_processed)[0]
         context = (
             "\n".join(pre_processed.conversation_context)
             if pre_processed.conversation_context
@@ -1012,7 +1067,7 @@ class ExtractionEngine:
     async def _extract_attempts(
         self, batch_input: PreProcessedInput, run: _Stage2Run
     ) -> ExtractionPayload:
-        messages = render_extraction_messages(batch_input)
+        messages = self._extraction_messages(batch_input)
         if run.plan_block:
             messages = _with_plan_block(messages, run.plan_block)
         last_error: Exception | None = None

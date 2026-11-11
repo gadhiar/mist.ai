@@ -70,6 +70,8 @@ from backend.knowledge.extraction.serving_identity import (
     compute_serving_identity,
     diff_components,
 )
+from backend.knowledge.ontologies.pack import Pack
+from backend.knowledge.ontologies.registry import active_pack
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from backend.llm.llama_server_provider import LlamaServerProvider
 from backend.llm.provider import StreamingLLMProvider
@@ -323,7 +325,7 @@ def _effective_constrained_mode(settings: ServiceSettings, adapter_name: str) ->
 
 
 def run_identity_components(
-    settings: ServiceSettings, adapter: ModelFamilyAdapter
+    settings: ServiceSettings, adapter: ModelFamilyAdapter, pack: Pack | None = None
 ) -> RunIdentityComponents:
     """The run identity's components for a service running `settings` with `adapter`.
 
@@ -332,9 +334,16 @@ def run_identity_components(
     engine sizes it for `adapter` (`effective_cap`), the list-pass limits from
     the engine's constants, and the constrained mode as the engine resolves it
     (`settings.constrained_mode or adapter.default_constrained_mode`).
+
+    `pack` is the pack the engine extracts with, whose assembled prompt and
+    generated schema the prompt hash covers. None hashes the engine module's
+    prompt and schema constants, which are those of a pack that holds no
+    prompt fragment; `build_app` passes the pack it gives the engine. The
+    pack's own two hashes are no component: they are stamped beside the run
+    identity, not into it.
     """
     return RunIdentityComponents(
-        prompt_sha256=_compute_prompt_sha256(adapter, turn_plan=settings.turn_plan),
+        prompt_sha256=_compute_prompt_sha256(adapter, turn_plan=settings.turn_plan, pack=pack),
         code_sha256=code_sha256(RUN_IDENTITY_CODE),
         ontology_version=ONTOLOGY_VERSION,
         extraction_version=EXTRACTION_VERSION,
@@ -665,6 +674,8 @@ def create_app(
             serving_identity=view.identity,
             serving_identity_components=view.components,
             serving_identity_error=view.error,
+            pack_prompt_hash=engine.pack.pack_prompt_hash,
+            pack_rails_hash=engine.pack.pack_rails_hash,
         )
 
     return app
@@ -716,12 +727,14 @@ def build_app(
         reasoning_effort=settings.reasoning_effort,
         reasoning_budget_tokens=settings.reasoning_budget_tokens,
     )
-    components = run_identity_components(settings, adapter)
+    pack = active_pack()
+    components = run_identity_components(settings, adapter, pack)
     engine = ExtractionEngine(
         llm=llm,
         adapter=adapter,
         settings=settings,
         run_identity=compute_run_identity(components),
+        pack=pack,
     )
     health_probe = LlamaHealthProbe(http_client=http_client, base_url=settings.llm_base_url)
     ctx_size_source = LlamaPropsContextSize(http_client=http_client, base_url=settings.llm_base_url)
