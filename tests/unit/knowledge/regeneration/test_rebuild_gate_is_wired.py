@@ -65,6 +65,8 @@ from scripts import mist_admin
 
 LIVE_URI = "bolt://mist-neo4j:7687"
 STAGING_URI = "bolt://mist-neo4j-staging:7687"
+# How the command's one line about the ontology pack it ran under begins.
+PACK_LINE = "[rebuild] ontology pack:"
 
 
 def _form(
@@ -434,6 +436,66 @@ class TestDiagnosticModeAnnouncesItself:
             )
             == 0
         )
+
+
+class TestThePackLineIsPrintedOncePerCommand:
+    """The run names the ontology pack it ran under: its version and its rails hash.
+
+    An epoch that stores no pack hash is compared with no pack, so this line is
+    the only record of which rails produced the staging graph. It comes from the
+    command's main path, not from the builder, which runs once per build.
+    """
+
+    @staticmethod
+    def _pack_lines(out: str) -> list[str]:
+        return [line for line in out.splitlines() if line.startswith(PACK_LINE)]
+
+    def test_a_green_run_prints_it_once_though_it_builds_twice(self, wired, capsys):
+        from backend.knowledge.ontologies import registry
+
+        # Arrange -- the pack the command runs, read from the registry now
+        pack = registry.active_pack()
+        wired["set"]()
+
+        # Act
+        code = mist_admin.cmd_graph_rebuild_from_log(_args())
+
+        # Assert
+        assert code == 0
+        assert wired["regen"].rebuild_calls == 2
+        (line,) = self._pack_lines(capsys.readouterr().out)
+        assert f"version={pack.version}" in line
+        assert f"pack_rails_hash={pack.pack_rails_hash}" in line
+
+    def test_a_diagnostic_run_prints_it_once_too(self, wired, capsys):
+        wired["set"](live=_form(tag="live"), rebuilt=[_form(tag="rebuilt")] * 2)
+
+        assert mist_admin.cmd_graph_rebuild_from_log(_args(diagnostic=True)) == 0
+
+        assert len(self._pack_lines(capsys.readouterr().out)) == 1
+
+    def test_a_run_that_fails_a_gate_still_prints_it(self, wired, capsys):
+        """A divergence is read against the pack that produced the rebuilt side."""
+        wired["set"](live=_form(tag="live"), rebuilt=[_form(tag="rebuilt")] * 2)
+
+        assert mist_admin.cmd_graph_rebuild_from_log(_args()) == 3
+
+        assert len(self._pack_lines(capsys.readouterr().out)) == 1
+
+    def test_a_run_the_builder_refuses_prints_none(self, wired, monkeypatch, capsys):
+        """No build ran, so there is no pack the run ran under."""
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        wired["set"]()
+
+        def _refuse(be, staging_conn, epoch_id):
+            raise ColdCacheError("refused by the builder")
+
+        monkeypatch.setattr(mist_admin, "_build_log_regenerator", _refuse)
+
+        assert mist_admin.cmd_graph_rebuild_from_log(_args()) == 2
+
+        assert self._pack_lines(capsys.readouterr().out) == []
 
 
 def test_vacuity_error_is_not_a_divergence_error():

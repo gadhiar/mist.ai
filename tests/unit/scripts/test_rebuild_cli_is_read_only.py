@@ -45,7 +45,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -54,6 +54,15 @@ from backend.knowledge.extraction_cache import ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
 from tests.mocks.config import build_test_config
+from tests.unit.event_store.test_epoch_ledger import make_pre_pack_hash
+from tests.unit.knowledge.regeneration.test_rebuild_gate_is_wired import (
+    LIVE_URI,
+    PACK_LINE,
+    _args,
+    _FakeConn,
+    _FakeReport,
+    _form,
+)
 
 # Function-local imports in `_build_log_regenerator`, so the SOURCE modules are the
 # patch targets -- `mist_admin.EmbeddingGenerator` does not exist to patch.
@@ -76,11 +85,14 @@ MODEL_HASH = "test-model-hash"
 EPOCH_TS = "2026-07-01T08:00:00+00:00"
 
 
-def _seed_replay_sources(root: Path) -> str:
+def _seed_replay_sources(root: Path, **pack_hashes: str | None) -> str:
     """Create an event store (with one epoch) + extraction cache under `root`.
 
     The TEST creates these, which is exactly the point: `_build_log_regenerator` must
     find them already present and must never bring them into being itself.
+
+    `pack_hashes` are the epoch row's `pack_prompt_hash` and `pack_rails_hash`; a
+    hash not given is stored as NULL, as on a row from before the hashes were stored.
     """
     db_path = root / "event_store.db"
     store = EventStore(str(db_path))
@@ -90,6 +102,7 @@ def _seed_replay_sources(root: Path) -> str:
         extraction_version=EXTRACTION,
         model_hash=MODEL_HASH,
         activated_at=EPOCH_TS,
+        **pack_hashes,
     )
     cache = ExtractionCache(str(root / "extraction_cache.db"))
     cache.initialize()
@@ -900,3 +913,248 @@ class TestTheEpochCarriesItsIdentityNamespace:
         # Act / Assert
         with pytest.raises(ColdCacheError, match="extraction_cache.identity_namespace"):
             _build(db_path)
+
+
+# A value no pack hashes to, in the form a pack hash has: 64 hex digits.
+ANOTHER_HASH = "f" * 64
+PACK_HASH_FIELDS = ("pack_prompt_hash", "pack_rails_hash")
+NORMALIZER = "backend.knowledge.extraction.normalizer.EntityNormalizer"
+VALIDATOR = "backend.knowledge.extraction.validator.ExtractionValidator"
+LOG_REGENERATOR = "backend.knowledge.regeneration.log_regenerator.LogRegenerator"
+CANONICAL_FORM = "backend.knowledge.canonical_serialize.canonical_graph_form"
+STAGING_WIPE = ("MATCH (n) DETACH DELETE n", {})
+
+
+def _running_pack():
+    """The pack the rebuild runs: the registry's active one, read when the test runs."""
+    from backend.knowledge.ontologies import registry
+
+    return registry.active_pack()
+
+
+def _running_hashes() -> dict[str, str]:
+    pack = _running_pack()
+    return {field: getattr(pack, field) for field in PACK_HASH_FIELDS}
+
+
+def _pack_lines(out: str) -> list[str]:
+    return [line for line in out.splitlines() if line.startswith(PACK_LINE)]
+
+
+def _run_command(db_path: str, **arg_overrides) -> SimpleNamespace:
+    """Run the real `cmd_graph_rebuild_from_log` over the real `_build_log_regenerator`.
+
+    The stores are the ones under `tmp_path` that `db_path` names. Both graph
+    connections are fakes that record their writes, the replay is a stand-in
+    that replays nothing, and every form serialises to the same string, so a
+    run the builder does not refuse passes every gate.
+
+    Returns:
+        `code` (the exit code), `staging` (the fake staging connection),
+        `graph_store` (the mock in `GraphStore`'s place) and `replays` (one
+        entry per `rebuild()` call).
+    """
+    import scripts.mist_admin as mist_admin
+
+    staging = _FakeConn()
+    graph_store = MagicMock()
+    replays: list[dict[str, Any]] = []
+
+    class _Replay:
+        def __init__(self, **_wiring):
+            pass
+
+        async def rebuild(self, **kwargs):
+            replays.append(kwargs)
+            return _FakeReport(87)
+
+    config = build_test_config(neo4j_uri=LIVE_URI)
+    config.event_store.db_path = db_path
+    backend = SimpleNamespace(get_config=lambda: config, Neo4jConnection=lambda _config: staging)
+
+    with ExitStack() as stack:
+        for target in (EMBEDDINGS, GRAPH_EXECUTOR, BUILD_PIPELINE, STAGING_SEEDER):
+            stack.enter_context(patch(target))
+        stack.enter_context(patch(GRAPH_STORE, graph_store))
+        stack.enter_context(
+            patch(LOAD_SEED, lambda _dir: [SimpleNamespace(seed_version="test-seed-1")])
+        )
+        stack.enter_context(patch(LOG_REGENERATOR, _Replay))
+        stack.enter_context(patch(CANONICAL_FORM, lambda _conn, **_switches: _form(tag="same")))
+        stack.enter_context(patch.object(mist_admin, "_load_backend", lambda: backend))
+        stack.enter_context(patch.object(mist_admin, "_connect", lambda _be: _FakeConn()))
+        code = mist_admin.cmd_graph_rebuild_from_log(_args(**arg_overrides))
+    return SimpleNamespace(code=code, staging=staging, graph_store=graph_store, replays=replays)
+
+
+class TestTheEpochsPackIsThePackTheRebuildRuns:
+    """An epoch that stores a pack hash is rebuilt only under the pack with that hash.
+
+    The rebuild runs its pack's rails over the epoch's cached rows and stamps the
+    staging edges with its pack's hashes. Under another pack it builds a graph the
+    epoch's stamps do not describe, and the live == rebuilt gate then reports a
+    divergence that is a difference of code, not of derivation.
+    """
+
+    @pytest.mark.parametrize("field", PACK_HASH_FIELDS)
+    def test_an_epoch_under_another_hash_is_refused_naming_the_field_and_both_values(
+        self, tmp_path, field
+    ):
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- the epoch stores the running pack's hashes but for `field`
+        running = _running_hashes()
+        db_path = _seed_replay_sources(tmp_path, **{**running, field: ANOTHER_HASH})
+        stores = (Path(db_path), tmp_path / "extraction_cache.db")
+        before = _store_fingerprint(*stores)
+        graph_store, embeddings = MagicMock(), MagicMock()
+
+        # Act
+        with pytest.raises(ColdCacheError) as refusal:
+            _build(db_path, {GRAPH_STORE: graph_store, EMBEDDINGS: embeddings})
+
+        # Assert -- the differing field with both values, and the equal one not at all
+        message = str(refusal.value)
+        (other_field,) = (name for name in PACK_HASH_FIELDS if name != field)
+        assert f"{field}={ANOTHER_HASH!r}" in message
+        assert f"{field}={running[field]!r}" in message
+        assert other_field not in message
+        # before the embedding model loads and before `initialize_schema()`
+        assert embeddings.mock_calls == []
+        assert graph_store.mock_calls == []
+        # and reading the stored hashes wrote nothing
+        assert _store_fingerprint(*stores) == before
+
+    def test_an_epoch_under_another_pack_altogether_names_both_fields(self, tmp_path):
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        db_path = _seed_replay_sources(
+            tmp_path, pack_prompt_hash=ANOTHER_HASH, pack_rails_hash=ANOTHER_HASH
+        )
+
+        with pytest.raises(ColdCacheError) as refusal:
+            _build(db_path)
+
+        for field, value in _running_hashes().items():
+            assert f"{field}={ANOTHER_HASH!r}" in str(refusal.value)
+            assert f"{field}={value!r}" in str(refusal.value)
+
+    @pytest.mark.parametrize("field", PACK_HASH_FIELDS)
+    def test_the_command_exits_2_after_the_wipe_and_before_any_other_staging_write(
+        self, tmp_path, capsys, field
+    ):
+        # Arrange
+        running = _running_hashes()
+        db_path = _seed_replay_sources(tmp_path, **{**running, field: ANOTHER_HASH})
+
+        # Act
+        run = _run_command(db_path)
+
+        # Assert -- refused, on one line that names the field and both values
+        out = capsys.readouterr().out
+        assert run.code == 2
+        (refusal,) = (line for line in out.splitlines() if line.startswith("[rebuild] REFUSED:"))
+        assert f"{field}={ANOTHER_HASH!r}" in refusal
+        assert f"{field}={running[field]!r}" in refusal
+        # The wipe that opens the first build precedes the refusal, as it precedes
+        # a cold-cache refusal; nothing else reached staging, and nothing replayed.
+        assert run.staging.writes == [STAGING_WIPE]
+        assert run.graph_store.mock_calls == []
+        assert run.replays == []
+        assert _pack_lines(out) == []
+
+    def test_an_epoch_that_stores_the_running_packs_hashes_is_built_over_that_pack(self, tmp_path):
+        # Arrange
+        pack = _running_pack()
+        db_path = _seed_replay_sources(tmp_path, **_running_hashes())
+        pipeline, normalizer, validator = MagicMock(), MagicMock(), MagicMock()
+
+        # Act
+        regen, epoch = _build(
+            db_path, {BUILD_PIPELINE: pipeline, NORMALIZER: normalizer, VALIDATOR: validator}
+        )
+
+        # Assert -- built, and the pack compared is the pack every consumer runs
+        assert isinstance(regen, LogRegenerator)
+        assert {field: epoch[field] for field in PACK_HASH_FIELDS} == _running_hashes()
+        assert pipeline.call_args.kwargs["pack"] is pack
+        assert normalizer.call_args.kwargs["pack"] is pack
+        assert validator.call_args.kwargs["pack"] is pack
+
+    def test_the_command_builds_such_an_epoch_twice_and_prints_the_pack_line_once(
+        self, tmp_path, capsys
+    ):
+        pack = _running_pack()
+        db_path = _seed_replay_sources(tmp_path, **_running_hashes())
+
+        run = _run_command(db_path)
+
+        out = capsys.readouterr().out
+        assert run.code == 0, out
+        assert len(run.replays) == 2
+        (line,) = _pack_lines(out)
+        assert f"version={pack.version}" in line
+        assert f"pack_rails_hash={pack.pack_rails_hash}" in line
+
+    def test_an_epoch_that_stores_no_hash_is_built_as_before(self, tmp_path, capsys):
+        # Arrange -- the row a store from before the hashes were stored holds
+        pack = _running_pack()
+        db_path = _seed_replay_sources(tmp_path)
+
+        # Act
+        regen, epoch = _build(db_path)
+        run = _run_command(db_path)
+
+        # Assert -- nothing to compare, so the run says which pack it ran under
+        out = capsys.readouterr().out
+        assert isinstance(regen, LogRegenerator)
+        assert (epoch["pack_prompt_hash"], epoch["pack_rails_hash"]) == (None, None)
+        assert run.code == 0, out
+        (line,) = _pack_lines(out)
+        assert f"version={pack.version}" in line
+        assert f"pack_rails_hash={pack.pack_rails_hash}" in line
+
+    def test_a_ledger_from_before_the_hash_columns_is_built_as_before(self, tmp_path, capsys):
+        import sqlite3
+
+        # Arrange -- `epoch_ledger` as it was before the two columns existed
+        pack = _running_pack()
+        db_path = _seed_replay_sources(tmp_path)
+        make_pre_pack_hash(db_path)
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(epoch_ledger)")}
+        conn.close()
+        assert not columns & set(PACK_HASH_FIELDS), "precondition: the columns must be absent"
+        stores = (Path(db_path), tmp_path / "extraction_cache.db")
+        before = _store_fingerprint(*stores)
+
+        # Act
+        regen, epoch = _build(db_path)
+        run = _run_command(db_path)
+
+        # Assert -- built, the columns were not added, and the pack line is printed
+        out = capsys.readouterr().out
+        assert isinstance(regen, LogRegenerator)
+        assert not set(epoch) & set(PACK_HASH_FIELDS)
+        assert _store_fingerprint(*stores) == before
+        assert run.code == 0, out
+        (line,) = _pack_lines(out)
+        assert f"version={pack.version}" in line
+        assert f"pack_rails_hash={pack.pack_rails_hash}" in line
+
+    @pytest.mark.parametrize("field", PACK_HASH_FIELDS)
+    def test_an_epoch_that_stores_one_hash_is_compared_in_that_hash_alone(self, tmp_path, field):
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- two stores, each holding `field` alone: the running pack's
+        # value in one, another value in the other
+        (tmp_path / "equal").mkdir()
+        (tmp_path / "differing").mkdir()
+        equal = _seed_replay_sources(tmp_path / "equal", **{field: _running_hashes()[field]})
+        differing = _seed_replay_sources(tmp_path / "differing", **{field: ANOTHER_HASH})
+
+        # Act / Assert
+        regen, _epoch = _build(equal)
+        assert isinstance(regen, LogRegenerator)
+        with pytest.raises(ColdCacheError, match=field):
+            _build(differing)

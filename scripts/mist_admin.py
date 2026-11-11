@@ -1039,6 +1039,13 @@ def _build_log_regenerator(
     explicit override) and are READ-ONLY replay sources: the regenerator's own
     job/checkpoint rows go to a `NullRebuildJournal`, never to the live ledger.
 
+    The curation pipeline, the normalizer and the validator are all built over
+    one pack, `registry.active_pack()`. An epoch whose ledger row stores a pack
+    hash that pack does not equal is refused with `ColdCacheError`, naming the
+    field and both values, before the embedding model loads and before
+    anything is written to staging. An epoch that stores no hash is built as
+    it was before the hashes were stored.
+
     Returns (LogRegenerator, epoch_dict). The epoch dict is the ledger row plus
     `identity_namespace`, the cache namespace of the epoch's binding (None: the
     3-part one), which `LogRegenerator.rebuild` reads its rows from.
@@ -1047,13 +1054,18 @@ def _build_log_regenerator(
     from pathlib import Path as _Path
 
     from backend.event_store.store import EventStore
+    from backend.extraction_backlog.cutover import replay_pack_consumers
+    from backend.extraction_backlog.store import (
+        PackHashes,
+        describe_pack_hashes,
+        pack_hash_mismatches,
+    )
     from backend.factories import build_curation_pipeline, production_cache_path
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.extraction.confidence import ConfidenceScorer
-    from backend.knowledge.extraction.normalizer import EntityNormalizer
     from backend.knowledge.extraction.temporal import TemporalResolver
-    from backend.knowledge.extraction.validator import ExtractionValidator
     from backend.knowledge.extraction_cache import ExtractionCache
+    from backend.knowledge.ontologies import registry
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
     from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
     from backend.knowledge.regeneration.staging_seeder import StagingSeeder
@@ -1134,6 +1146,52 @@ def _build_log_regenerator(
     seed_dir = _Path(config.vault.root) / "seed"
     seed_documents = load_seed_documents(seed_dir)
 
+    # Resolve epoch -- raise ColdCacheError so the handler's REFUSED branch fires.
+    if epoch_id is None:
+        epoch = event_store.get_current_epoch()
+        if epoch is None:
+            raise ColdCacheError(
+                "No epochs found in the event store. "
+                "Run at least one conversation turn to register an epoch before rebuilding."
+            )
+    else:
+        epochs = event_store.list_epochs()
+        epoch = next((e for e in epochs if e["epoch_id"] == epoch_id), None)
+        if epoch is None:
+            raise ColdCacheError(
+                f"Epoch {epoch_id} not found in the event store. "
+                f"Available epoch IDs: {[e['epoch_id'] for e in epochs]}"
+            )
+
+    # The one pack this build runs: its rails and types over the epoch's cached
+    # rows (the normalizer and validator below), and its hashes on the staging
+    # edges (the curation pipeline). An epoch that stores a pack hash names the
+    # pack its graph was written under, so a build under a pack with another
+    # hash is a graph the epoch's stamps do not describe, and the live ==
+    # rebuilt gate would then report a difference of code as a derivation gap.
+    # A hash the row does not store is not compared (`pack_hash_mismatches`): a
+    # row from before the hashes were stored, or a ledger without the columns,
+    # which `SELECT *` reads as a dict without the keys.
+    #
+    # Refused HERE, after the replay-source and seed refusals and before the
+    # embedding model loads or `initialize_schema()` writes to staging, with
+    # `ColdCacheError`: the builder's one refusal type, which the command
+    # reports as REFUSED with exit 2.
+    pack = registry.active_pack()
+    stored_pack = PackHashes(
+        pack_prompt_hash=epoch.get("pack_prompt_hash"),
+        pack_rails_hash=epoch.get("pack_rails_hash"),
+    )
+    differing_hashes = pack_hash_mismatches(stored_pack, pack)
+    if differing_hashes:
+        raise ColdCacheError(
+            f"Epoch {epoch['epoch_id']} stores the ontology pack "
+            f"({describe_pack_hashes(stored_pack, differing_hashes)}), but the pack this "
+            f"code runs, version {pack.version}, is "
+            f"({describe_pack_hashes(pack, differing_hashes)}). A rebuild under another pack "
+            "is not a rebuild of that epoch; run it from the code whose pack the epoch stores."
+        )
+
     # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
     # this is an admin CLI (sync batch), NOT the async server event loop, so there
     # is no event-loop lazy-loading hazard. A single instance is shared across
@@ -1150,7 +1208,23 @@ def _build_log_regenerator(
     # decisions match production topology; determinism holds because
     # all-MiniLM-L6-v2 is deterministic for identical input text.
     executor = GraphExecutor(staging_conn)
-    pipeline = build_curation_pipeline(config, executor, embedding_provider=embedding_provider)
+    pipeline = build_curation_pipeline(
+        config, executor, embedding_provider=embedding_provider, pack=pack
+    )
+
+    # Stage 5 is pure: `normalize()` issues no graph queries (R1.1d strip
+    # moved graph-identity resolution to the curation deduper, Stage 7a).
+    # `embedding_generator` and `executor` are retained on the class only
+    # for constructor-signature compatibility and are never read after
+    # assignment (`grep -n "self\._embedding_generator\|self\._executor"
+    # backend/knowledge/extraction/normalizer.py` -> both hits are the
+    # `__init__` assignments, neither is read again). `replay_pack_consumers`
+    # passes None for both, which costs nothing and avoids wiring a
+    # staging-graph executor into a stage that cannot use it. It builds the
+    # normalizer and the validator over `pack`, the pack compared above.
+    normalizer, validator = replay_pack_consumers(
+        pack, min_confidence=config.extraction.min_extraction_confidence
+    )
 
     regen = LogRegenerator(
         event_store=event_store,
@@ -1158,19 +1232,8 @@ def _build_log_regenerator(
         staging_curation_pipeline=pipeline,
         confidence_scorer=ConfidenceScorer(),
         temporal_resolver=TemporalResolver(),
-        # Stage 5 is pure: `normalize()` issues no graph queries (R1.1d strip
-        # moved graph-identity resolution to the curation deduper, Stage 7a).
-        # `embedding_generator` and `executor` are retained on the class only
-        # for constructor-signature compatibility and are never read after
-        # assignment (`grep -n "self\._embedding_generator\|self\._executor"
-        # backend/knowledge/extraction/normalizer.py` -> both hits are the
-        # `__init__` assignments, neither is read again). Passing None costs
-        # nothing and avoids wiring a staging-graph executor into a stage that
-        # cannot use it.
-        normalizer=EntityNormalizer(embedding_generator=None, executor=None),
-        validator=ExtractionValidator(
-            min_confidence=config.extraction.min_extraction_confidence,
-        ),
+        normalizer=normalizer,
+        validator=validator,
         # The dry-run proof is not a rebuild of record: nothing reads its job rows
         # (`get_reextraction_job` has no production caller), and `_build_once` runs
         # twice per invocation, so a durable journal here would append two
@@ -1194,23 +1257,6 @@ def _build_log_regenerator(
             expected_dimension=config.embedding.dimension,
         ),
     )
-
-    # Resolve epoch -- raise ColdCacheError so the handler's REFUSED branch fires.
-    if epoch_id is None:
-        epoch = event_store.get_current_epoch()
-        if epoch is None:
-            raise ColdCacheError(
-                "No epochs found in the event store. "
-                "Run at least one conversation turn to register an epoch before rebuilding."
-            )
-    else:
-        epochs = event_store.list_epochs()
-        epoch = next((e for e in epochs if e["epoch_id"] == epoch_id), None)
-        if epoch is None:
-            raise ColdCacheError(
-                f"Epoch {epoch_id} not found in the event store. "
-                f"Available epoch IDs: {[e['epoch_id'] for e in epochs]}"
-            )
 
     # The namespace the epoch's rows are read from is its binding's: a keyed
     # epoch's rows are only under its key, and an unbound epoch reads the 3-part
@@ -1239,7 +1285,8 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     ==== =========================================================================
     0    every gate green
     1    rebuild-twice disagreed -- NON-DETERMINISM
-    2    refused before measuring (live target, cold cache, or no floors chosen)
+    2    refused before measuring (live target, cold cache, an epoch stored under
+         another ontology pack, or no floors chosen)
     3    live != rebuilt -- a DERIVATION GAP, not non-determinism
     4    a non-vacuity floor failed -- the run proved nothing
     ==== =========================================================================
@@ -1247,12 +1294,18 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     Before MIS-137 this function printed `live_vs_rebuilt_report` and returned 0,
     so it could not fail on a divergence of any size, and none of the five
     non-vacuity floors had a production caller at all.
+
+    An epoch whose row stores an ontology pack hash is built only under the pack
+    with that hash (`_build_log_regenerator` refuses any other, exit 2). A run
+    that built prints one `[rebuild] ontology pack:` line naming the version and
+    the rails hash of the pack it ran under.
     """
     import asyncio as _asyncio
 
     from backend.knowledge.canonical_serialize import canonical_graph_form
     from backend.knowledge.config import Neo4jConfig
     from backend.knowledge.eval_isolation import RebuildTargetError, assert_rebuild_target_not_live
+    from backend.knowledge.ontologies import registry
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, RebuildScopeError
     from backend.knowledge.regeneration.rebuild_gate import (
         RebuildDeterminismError,
@@ -1359,6 +1412,17 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
 
         build_a, report_a = _build_once()
         build_b, report_b = _build_once()
+        # The pack both builds ran under, once per command: `_build_once` runs
+        # twice, so the builder is not the place to print it. An epoch that
+        # stores no pack hash was compared with no pack, and for it this line is
+        # the only record of which rails produced the staging graph. Printed
+        # before the gates, so a gate that fails is read against it too. Not
+        # printed for a run the builder refused: nothing was built.
+        pack = registry.active_pack()
+        print(
+            f"[rebuild] ontology pack: version={pack.version} "
+            f"pack_rails_hash={pack.pack_rails_hash}"
+        )
         assert_rebuild_twice_identical(build_a, build_b)
         print("[rebuild] determinism gate PASSED (rebuild-twice byte-identical)")
 
