@@ -794,6 +794,7 @@ class ReconciliationEngine:
             "r.provenance = $provenance, r.seed_origin_version = $seed_origin_version, "
             "r.ontology_version = $ontology_version, "
             "r.extraction_version = $extraction_version, r.model_hash = $model_hash, "
+            "r.pack_prompt_hash = $pack_prompt_hash, r.pack_rails_hash = $pack_rails_hash, "
             "r.created_at = $now, r.updated_at = $now "
             "RETURN count(r) AS n",
             {
@@ -820,6 +821,10 @@ class ReconciliationEngine:
                 "ontology_version": self._stamps.ontology_version,
                 "extraction_version": self._stamps.extraction_version,
                 "model_hash": self._stamps.model_hash,
+                # The writer's pack, beside its triple. None (stamps built with
+                # no pack named) sets no property.
+                "pack_prompt_hash": self._stamps.pack_prompt_hash,
+                "pack_rails_hash": self._stamps.pack_rails_hash,
                 "now": now,
             },
         )
@@ -847,6 +852,7 @@ class ReconciliationEngine:
             "r.context = $context, r.evidence = [$eid], r.provenance = 'extraction', "
             "r.ontology_version = $ontology_version, "
             "r.extraction_version = $extraction_version, r.model_hash = $model_hash, "
+            "r.pack_prompt_hash = $pack_prompt_hash, r.pack_rails_hash = $pack_rails_hash, "
             "r.created_at = $now, r.updated_at = $now "
             "ON MATCH SET r.confidence = CASE WHEN coalesce(r.confidence, 0) < $confidence "
             "THEN $confidence ELSE r.confidence END, "
@@ -865,6 +871,8 @@ class ReconciliationEngine:
                 "ontology_version": self._stamps.ontology_version,
                 "extraction_version": self._stamps.extraction_version,
                 "model_hash": self._stamps.model_hash,
+                "pack_prompt_hash": self._stamps.pack_prompt_hash,
+                "pack_rails_hash": self._stamps.pack_rails_hash,
                 "now": now,
             },
         )
