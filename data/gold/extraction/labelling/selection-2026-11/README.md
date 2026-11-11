@@ -28,7 +28,8 @@ Only `design.jsonl` and this file exist until the passes are written.
   temporal, coref, nofact, scope, fill.
 - The utterances come from twelve synthetic personas. No persona, person or organisation in them
   is real, and none appears in the tuning sets or the held-out set; the guards in
-  `tests/unit/eval_harness/test_gold_sets.py` check the overlap.
+  `tests/unit/eval_harness/test_gold_sets.py` check the overlap. People have first names only.
+  Technologies, products, places, events and published titles may be real.
 
 ## Who may open what
 
