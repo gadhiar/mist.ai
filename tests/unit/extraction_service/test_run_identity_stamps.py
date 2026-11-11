@@ -122,7 +122,9 @@ class TestServiceReportsOneIdentity:
             components = (await client.get("/v1/info")).json()["run_identity_components"]
 
         assert components == {
-            "prompt_sha256": engine_module._compute_prompt_sha256(_adapter_for(service_settings)),
+            "prompt_sha256": engine_module._compute_prompt_sha256(
+                _adapter_for(service_settings), turn_plan=service_settings.turn_plan
+            ),
             "code_sha256": code_sha256(RUN_IDENTITY_CODE),
             "ontology_version": ONTOLOGY_VERSION,
             "extraction_version": EXTRACTION_VERSION,

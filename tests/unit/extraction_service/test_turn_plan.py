@@ -31,7 +31,12 @@ from backend.extraction_contract.models import ExtractRequest, TurnPlanOut
 from backend.extraction_service import engine as engine_module
 from backend.extraction_service import turn_plan
 from backend.extraction_service.adapters import get_adapter
-from backend.extraction_service.app import build_app, create_app
+from backend.extraction_service.app import (
+    build_app,
+    create_app,
+    run_identity_components,
+    serving_identity_components,
+)
 from backend.extraction_service.engine import (
     DERIVE_MAX_TOKENS,
     EXTRACT_MAX_TOKENS,
@@ -51,7 +56,11 @@ from backend.extraction_service.turn_plan import (
     render_plan_request,
 )
 from backend.knowledge.extraction.ontology_extractor import NO_PRIOR_CONTEXT
-from backend.knowledge.extraction.serving_identity import REQUEST_STAGES
+from backend.knowledge.extraction.serving_identity import (
+    REQUEST_STAGES,
+    components_dict,
+    compute_serving_identity,
+)
 from backend.knowledge.extraction.structure_splitter import (
     InputUnit,
     batch_units,
@@ -61,10 +70,12 @@ from backend.knowledge.extraction.structure_splitter import (
 from backend.knowledge.ontologies import EXTRACTABLE_NODE_TYPES, EXTRACTABLE_RELATIONSHIP_TYPES
 from backend.llm.models import LLMRequest, LLMResponse, UsageMetadata
 from tests.unit.extraction_service.conftest import make_extract_request
+from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
 from tests.unit.extraction_service.test_turn_plan_off_pins import (
     PROMPT_SHA256,
     PROSE_BODIES_SHA256,
     PROSE_UTTERANCE,
+    SERVING_IDENTITY,
     STRUCTURED_BODIES_SHA256,
     STRUCTURED_UTTERANCE,
     canonical_sha256,
@@ -72,7 +83,6 @@ from tests.unit.extraction_service.test_turn_plan_off_pins import (
 
 _ENGINE_LOGGER = "backend.extraction_service.engine"
 _FAILED_PREFIX = "turn plan failed: "
-_PENDING_APP = pytest.mark.xfail(strict=True, reason="pending app.py (v14)")
 
 _SCOPE_REPLY = '{"scope": "user-scope", "confidence": 0.9, "reasoning": "first person"}'
 _EXTRACT_REPLY = '{"entities": [], "relationships": []}'
@@ -1190,13 +1200,12 @@ class TestTheServiceWithTheFlagOn:
 
 
 # ---------------------------------------------------------------------------
-# /v1/info: pending the two app.py lines that pass the flag to both identities
+# /v1/info: the service passes the flag to both identities
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestInfoReportsTheFlag:
-    @_PENDING_APP
     async def test_info_reports_the_flag_in_the_serving_identity_components(self, plan_app):
         async with _client_for(plan_app) as client:
             data = (await client.get("/v1/info")).json()
@@ -1209,7 +1218,6 @@ class TestInfoReportsTheFlag:
 
         assert "turn_plan" not in data["serving_identity_components"]
 
-    @_PENDING_APP
     async def test_info_reports_the_flag_on_prompt_hash_in_the_run_identity(
         self, plan_settings, wired_llm, fake_llama_app
     ):
@@ -1231,3 +1239,30 @@ class TestInfoReportsTheFlag:
             data = (await client.get("/v1/info")).json()
 
         assert data["run_identity_components"]["prompt_sha256"] == PROMPT_SHA256
+
+
+class TestTheFlagInBothIdentities:
+    """The flag is one component of each identity, and with it off neither one moves."""
+
+    def test_the_run_identity_differs_in_its_prompt_hash_alone(self, service_settings):
+        adapter = get_adapter(service_settings.adapter_name)
+        off = dataclasses.asdict(run_identity_components(service_settings, adapter))
+        on = dataclasses.asdict(
+            run_identity_components(dataclasses.replace(service_settings, turn_plan=True), adapter)
+        )
+
+        assert off["prompt_sha256"] == PROMPT_SHA256
+        assert on["prompt_sha256"] == _hash(on=True)
+        assert [name for name in off if off[name] != on[name]] == ["prompt_sha256"]
+
+    def test_the_serving_identity_gains_the_flag_and_changes_no_other_component(
+        self, service_settings, engine
+    ):
+        off = serving_identity_components(service_settings, engine, FAKE_N_CTX)
+        on = serving_identity_components(
+            dataclasses.replace(service_settings, turn_plan=True), engine, FAKE_N_CTX
+        )
+
+        assert compute_serving_identity(off) == SERVING_IDENTITY
+        assert components_dict(on) == {**components_dict(off), "turn_plan": True}
+        assert compute_serving_identity(on) != SERVING_IDENTITY
