@@ -12,28 +12,46 @@ from collections.abc import Mapping, Sequence
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.extraction import id_rails, rails
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.extraction.preprocessor import PreProcessedInput
 from backend.knowledge.ontologies import registry
 from backend.knowledge.ontologies.pack import Pack
 from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
 
-# What a replay hands over from a cache row, besides the payload. The row's scope is a
-# rail input too and `normalize` takes it, but the replay paths do not hand it over yet.
-_RAIL_INPUTS: tuple[str, ...] = ("batch_record", "turn_plan")
+# What a replay hands over from a cache row, besides the payload: the keyword arguments
+# of `normalize`. The scope is one of them because the runner gates a gained edge on the
+# row's scope (`rails._gain`); a row replayed without it would never meet that gate.
+_RAIL_INPUTS: tuple[str, ...] = ("scope", "batch_record", "turn_plan")
 
 
 def rail_inputs(cached: Mapping) -> dict:
-    """The batch record and plan a cache row carries, as keyword arguments for `normalize`.
+    """The scope, batch record and plan of a cache row, as keyword arguments for `normalize`.
 
-    A row written before a column existed, or by a turn that had no plan, holds None
-    there. Those are left out, so `normalize` is called exactly as it was before the
-    row could carry them.
+    A row written before a column existed, or by a turn that had no scope or no plan,
+    holds None there. Those are left out, so `normalize` is called exactly as it was
+    before the row could carry them.
 
     Args:
         cached: The row `ExtractionCache.get` returned.
     """
     return {name: cached[name] for name in _RAIL_INPUTS if cached.get(name) is not None}
+
+
+def live_rail_inputs(pre_processed: PreProcessedInput) -> dict:
+    """The rail inputs of a turn applied in process, as keyword arguments for `normalize`.
+
+    The in-process apply records the turn's cache row and runs the rails itself. A
+    replay of that row hands the rails `rail_inputs(row)`, so the first apply has to
+    hand them the same, or a scope-gated rule fires at one and not at the other. The
+    row is recorded with the Stage 1.5 scope and with no batch record and no turn plan,
+    which the in-process path does not have, so the scope is its only rail input.
+
+    Args:
+        pre_processed: The turn's Stage 1 output. Its metadata holds the Stage 1.5
+            scope under `subject_scope` when a classifier ran.
+    """
+    return rail_inputs({"scope": pre_processed.metadata.get("subject_scope")})
 
 
 class EntityNormalizer:

@@ -162,9 +162,48 @@ async def test_the_normalizer_logs_a_reserved_name_of_its_own_pack(caplog):
 
 
 def test_rail_inputs_are_the_fields_a_cache_row_carries():
-    row = {"entities": [], "batch_record": [{"units": []}], "turn_plan": {}}
+    row = {
+        "entities": [],
+        "scope": "user-scope",
+        "batch_record": [{"units": []}],
+        "turn_plan": {},
+    }
+
+    assert rail_inputs(row) == {
+        "scope": "user-scope",
+        "batch_record": [{"units": []}],
+        "turn_plan": {},
+    }
+
+
+def test_a_row_with_no_scope_hands_over_no_scope_keyword():
+    row = {"entities": [], "scope": None, "batch_record": [{"units": []}], "turn_plan": {}}
 
     assert rail_inputs(row) == {"batch_record": [{"units": []}], "turn_plan": {}}
+
+
+@pytest.mark.asyncio
+async def test_a_scope_gated_rule_fires_on_the_rail_inputs_of_a_row_with_that_scope():
+    # The base pack's crew rule adds `KNOWS_HAND` only in the user's own scope, so the
+    # edge shows the row's scope went from `rail_inputs` through `normalize` to the rule.
+    normalizer = EntityNormalizer(FakeEmbeddingGenerator(), pack=BASE)
+    entities = [
+        {"id": "user", "name": "User", "type": "Deckhand"},
+        {"id": "oswin", "name": "Oswin", "type": "Deckhand"},
+        {"id": "brannoch", "name": "Brannoch", "type": "Deckhand"},
+    ]
+    crew = [{"source": "oswin", "target": "brannoch", "type": "CREWS_WITH"}]
+    known = {"source": "user", "target": "oswin", "type": "KNOWS_HAND"}
+
+    scoped = await normalizer.normalize(
+        _extraction(entities, crew), **rail_inputs({"entities": [], "scope": "user-scope"})
+    )
+    unscoped = await normalizer.normalize(
+        _extraction(entities, crew), **rail_inputs({"entities": [], "scope": None})
+    )
+
+    assert known in scoped.relationships
+    assert known not in unscoped.relationships
 
 
 def test_a_row_written_before_the_columns_existed_hands_over_nothing():
