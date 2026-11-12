@@ -13,7 +13,11 @@ The phases run in a fixed order, each a separate step:
    `derived_edge`, `edge_suppress`). They read the entities under the ids the model
    wrote, because the endpoints still name those.
 3. id: each entity's stored id is built, the endpoints are remapped to it, and the id
-   form of `derived_edge` renames an entity from the node its edge points at.
+   form of `derived_edge` renames an entity from the node its edge points at. An id
+   of a type no `id_exempt` rule names first loses the context its batch was read
+   under, when the batch record names one (`_own_contexts`) and the context names no
+   entity of the payload (`_strip_own_contexts`), so the id rules after it read that
+   entity's own id. An exempt type's id keeps its context.
 4. fallback: an entity whose type the pack does not define takes the manifest's
    fallback type.
 
@@ -186,6 +190,8 @@ class _State:
     `settled` maps an entity dict, by object identity, to its id, and `added_keys` maps
     one to the keys the payload phase added before it had an `id` key. Both follow the
     dict object, which is why a `plugin` rule must not return a copy of an entity.
+    `named` holds the slug of the `id` field of every entity of the payload as the
+    runner was handed it, read before any phase runs.
     """
 
     row: RailRow
@@ -193,13 +199,19 @@ class _State:
     relationships: list[dict]
     settled: dict[int, str] = field(default_factory=dict)
     added_keys: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    named: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
 class _Rules:
-    """A pack's post-LLM rules as the phases read them."""
+    """A pack's post-LLM rules as the phases read them.
+
+    `identities` holds what a settled entity goes by: the user anchor's id, each name a
+    `reserved_identity` rule maps, and each id such a rule maps to.
+    """
 
     reserved: Mapping[str, tuple[str, str]]
+    identities: frozenset[str]
     exempt: frozenset[str]
     entity_id_rules: tuple[ConventionRule, ...]
     aliases: Mapping[str, Mapping[str, str]]
@@ -228,6 +240,9 @@ def _rules(pack: Pack) -> _Rules:
     )
     return _Rules(
         reserved=reserved,
+        identities=frozenset(
+            {pack.manifest.user_id, *reserved, *(stored for stored, _ in reserved.values())}
+        ),
         exempt=exempt,
         entity_id_rules=entity_id_rules,
         aliases={rule.id: dict(rule.params.aliases) for rule in pack.rules_of("alias_vocabulary")},
@@ -604,13 +619,126 @@ def _relation_phase(state: _State, pack: Pack) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_entity_id(entity: dict, pack: Pack) -> tuple[str, bool]:
+def _own_contexts(batch_record: Sequence[Mapping]) -> dict[str, tuple[str, ...]]:
+    """The context slugs each written id may lose from its start, longest first.
+
+    A list item is extracted with the headings, the lead-in and the parent items above
+    it as its context, and the model sometimes writes that context in front of the
+    item's id. The batch record says which contexts a batch was read under and which
+    entities it returned, per batch and not per entity. So:
+
+    - an entity may lose a context line of any unit of a batch whose own payload holds
+      the entity's `id` as the model wrote it. Which unit of the batch the entity came
+      from is not recorded, so every unit's lines are offered, each line on its own;
+    - an entity several batches hold is offered the lines of all of them;
+    - a batch that does not hold the entity offers it nothing, and neither does an
+      entry's own `context` list, the earlier units the call was shown for reference;
+    - an entity no batch holds, and every entity of a row with no batch record, is
+      offered nothing.
+
+    What is offered is stripped only from an entity the id phase builds an id for, of a
+    type no `id_exempt` rule names (`_build_entity_id`): a settled entity and an exempt
+    type keep their ids whatever is offered. Which offered line is dropped, and when,
+    is `_strip_own_contexts`.
+
+    A line is slugged with `canonical_id`, the function an id is slugged with, so the
+    two compare as written: a line that opens with a leading word keeps it.
+
+    A second run of the runner over its own output, with the same record, gives the
+    same ids for most rows and not for all. Two shapes differ:
+
+    - the lookup is by the id the model wrote, so a stored id that equals an id another
+      batch holds is offered that batch's lines on the second run;
+    - a line is kept when it names an entity of the payload, by the id the model wrote.
+      Where the pack stores that entity under another id (an alias), the second run's
+      payload holds no entity the line names, and the strip goes through.
+
+    A replay starts from the cache row, never from stored output.
+    """
+    offered: dict[str, set[str]] = {}
+    for batch in batch_record:
+        slugs = {
+            canonical_id(str(line))
+            for unit in batch.get("units") or ()
+            for line in unit.get("context") or ()
+        }
+        payload = batch.get("payload") or {}
+        for entity in payload.get("entities") or ():
+            written = entity.get("id")
+            if isinstance(written, str):
+                offered.setdefault(written, set()).update(slugs)
+    return {
+        written: tuple(sorted(slugs - {""}, key=lambda slug: (-len(slug), slug)))
+        for written, slugs in offered.items()
+    }
+
+
+def _strip_own_contexts(
+    entity_id: str, contexts: Sequence[str], named: frozenset[str], pack: Pack
+) -> str:
+    """Drop the offered contexts from the start of the id, as whole words.
+
+    The line tried is the longest of `contexts` that is the id or starts it with a
+    hyphen after; `_own_contexts` gives them longest first. It is dropped, with its
+    hyphen, only when all of these hold:
+
+    1. something is left besides hyphens. An id that is the line and nothing more is
+       the line's own entity. An id that is the line and hyphens is kept too:
+       `canonical_id` gives text with no ASCII letter or digit back lowered, with a
+       hyphen for each space, so such an id can end in one;
+    2. the line is not in `named`. A heading the model also wrote as an entity is part
+       of its items' own ids: with `redis` and `postgres` in the payload,
+       `redis-cluster` and `postgres-cluster` are two things, not one `cluster`;
+    3. what is left is not the user anchor's id, a name a `reserved_identity` rule
+       maps, or the id such a rule maps to. The payload phase has already settled the
+       entities that go by those, and a strip must not make another.
+
+    After a drop the id is read again, so an id that carries two lines of its context
+    loses both. A line that is refused ends the strip with the id as it then stands: no
+    shorter line is tried, since a shorter line would take a part of a name the
+    refusal kept whole.
+
+    Args:
+        entity_id: The slug of the entity's `id` field.
+        contexts: The slugs the batch record offers the entity, longest first.
+        named: The slug of the `id` field of every entity of the row's payload.
+        pack: The pack whose reserved names and user anchor are read.
+    """
+    identities = _rules(pack).identities
+    while True:
+        line = next(
+            (slug for slug in contexts if entity_id == slug or entity_id.startswith(f"{slug}-")),
+            None,
+        )
+        if line is None:
+            return entity_id
+        rest = entity_id[len(line) + 1 :]
+        if not rest.strip("-") or line in named or rest in identities:
+            return entity_id
+        entity_id = rest
+
+
+def _build_entity_id(
+    entity: dict,
+    pack: Pack,
+    own_contexts: Sequence[str] = (),
+    named: frozenset[str] = frozenset(),
+) -> tuple[str, bool]:
     """One entity's stored id, from its `id` field and the pack's id rules.
 
-    The slug of the `id` field goes through the `alias_vocabulary` and `typed_id` rules
-    in the pack's order; the engine's registry is read after the last alias vocabulary,
-    and a hit sets the type and ends the steps; a type no `id_exempt` rule names then
-    loses its leading words.
+    The slug of the `id` field first loses the `own_contexts` it starts with
+    (`_strip_own_contexts`), unless an `id_exempt` rule names the type. It then goes
+    through the `alias_vocabulary` and `typed_id` rules in the pack's order; the
+    engine's registry is read after the last alias vocabulary, and a hit sets the type
+    and ends the steps; a type no `id_exempt` rule names then loses its leading words.
+
+    Args:
+        entity: The entity, its type already settled by the payload phase.
+        pack: The pack whose id rules run.
+        own_contexts: The context slugs the batch record offers this entity
+            (`_own_contexts`), longest first; empty for an entity it offers none.
+        named: The slug of the `id` field of every entity of the row's payload, which
+            no context that equals one is stripped as.
 
     Returns:
         The id, and True when the registry settled the entity.
@@ -618,6 +746,8 @@ def _build_entity_id(entity: dict, pack: Pack) -> tuple[str, bool]:
     rules = _rules(pack)
     entity_type = str(entity.get("type", ""))
     entity_id = canonical_id(_raw_id(entity))
+    if entity_type not in rules.exempt:
+        entity_id = _strip_own_contexts(entity_id, own_contexts, named, pack)
     for position in range(len(rules.entity_id_rules) + 1):
         if position == rules.registry_after:
             registered = id_rails.CANONICAL_REGISTRY.get(entity_id)
@@ -735,11 +865,13 @@ def _remap_endpoints(relationships: list[dict], id_map: Mapping) -> None:
 
 def _id_phase(state: _State, pack: Pack) -> None:
     id_map: dict = {}
+    own_contexts = _own_contexts(state.row.batch_record)
     for entity in state.entities:
         written = entity.get("id", "")
         stored = state.settled.get(id(entity))
         if stored is None:
-            stored, by_registry = _build_entity_id(entity, pack)
+            offered = own_contexts.get(written, ()) if isinstance(written, str) else ()
+            stored, by_registry = _build_entity_id(entity, pack, offered, state.named)
             if by_registry:
                 state.settled[id(entity)] = stored
         _set_stored_id(entity, stored, state.added_keys.get(id(entity), ()))
@@ -796,6 +928,7 @@ def _run_phases(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]
         row=cache_row,
         entities=list(cache_row.entities),
         relationships=list(cache_row.relationships),
+        named=frozenset(canonical_id(_raw_id(entity)) for entity in cache_row.entities),
     )
     for _, phase in PHASES:
         phase(state, pack)
