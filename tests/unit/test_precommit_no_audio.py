@@ -1,8 +1,9 @@
-"""The `repo: local` pre-commit hooks that keep audio out of this public repository.
+"""The `repo: local` hooks that keep audio and voice assets out of this public repository.
 
 Hermetic: parses the committed `.pre-commit-config.yaml` only; no git, no pre-commit run. The
-repository is public, so a voice clip committed once is published for good: the hook refuses it at
-commit time, before it can reach a push.
+repository is public, so a voice clip, a voice identity manifest (`voice.json`) or a model weight
+file committed once is published for good: the hooks refuse them at commit time, before they can
+reach a push.
 
 pre-commit matches a hook's `files` with `re.search` against each repository-relative path and
 compiles it without flags, so case-insensitivity has to be written into the pattern itself (`(?i)`);
@@ -76,6 +77,42 @@ def test_no_audio_files_ignores_other_files(path: str) -> None:
 
 def test_no_audio_files_has_no_exclude() -> None:
     assert "exclude" not in _local_hook("no-audio-files")
+
+
+def test_no_voice_assets_hook_always_fails() -> None:
+    hook = _local_hook("no-voice-assets")
+    assert hook["language"] == "fail"
+    entry = hook["entry"].lower()
+    assert "voice identities" in entry
+    assert "model weights" in entry
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "voices/mist-v1/voice.json",
+        "voice.json",
+        "a/VOICE.JSON",
+        "x.SAFETENSORS",
+        "a/b.nemo",
+        "models/m.gguf",
+        "models/m.onnx",
+    ],
+)
+def test_no_voice_assets_matches_identities_and_weights(path: str) -> None:
+    assert _matches("no-voice-assets", path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["voice_json.py", "voice.jsonl", "myvoice.json", "voice.json.md", "x.py", "a.wav"],
+)
+def test_no_voice_assets_ignores_other_files(path: str) -> None:
+    assert not _matches("no-voice-assets", path)
+
+
+def test_no_voice_assets_has_no_exclude() -> None:
+    assert "exclude" not in _local_hook("no-voice-assets")
 
 
 def test_config_has_no_top_level_exclude() -> None:
