@@ -17,7 +17,13 @@ import re
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 # 1.1.0: additive -- InfoResponse gained four optional serving-config fields.
 # 1.2.0: additive -- ResultStamps.run_identity, and InfoResponse.run_identity
@@ -31,7 +37,9 @@ from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_seri
 # cancelled job is answered with, and CancelResponse with its CancelOutcome,
 # the reply of `POST /v1/jobs/{job_id}/cancel`. T42's turn plan fields and
 # T43's pack hashes, below, are covered by it, though none of them alone moved
-# the version.
+# the version. So is T48's change: ExtractResponse.attempts and stage2_calls are
+# both 0 for a turn whose every unit the pack's item filters drop, which makes no
+# Stage 2 call, where before each was at least 1.
 # Not a version: ExtractResponse.turn_plan is optional and left out of the
 # serialized response when None, which it is unless the service runs with its
 # off-by-default turn plan flag. A response without the flag is unchanged, so
@@ -291,11 +299,15 @@ class ExtractResponse(BaseModel):
 
     Attributes:
         attempts: The most attempts any one Stage 2 call sequence took: 1, or
-            more when a repair retry ran. The plan call is not an attempt.
+            more when a repair retry ran. The plan call is not an attempt. 0
+            for a turn with no unit left once the pack's item filters ran,
+            which makes no Stage 2 call.
         stage2_calls: Every Stage 2 model call the turn took (contract 1.2.0):
             one per batch of units, plus splits and repair retries. Defaults
             to 1, the one call a pre-1.2.0 service makes. The plan call is not
-            counted, so the count means the same with the plan on or off.
+            counted, so the count means the same with the plan on or off. 0
+            only beside `attempts` 0: each call is an attempt, so the two are
+            0 together or not at all.
         turn_plan: The turn's plan call, when the service runs with its turn
             plan flag and the turn is structured. None otherwise, and then
             the serialized response has no `turn_plan` key at all, so a
@@ -317,11 +329,21 @@ class ExtractResponse(BaseModel):
     derivation: DerivationOut | None
     stamps: ResultStamps
     timings_ms: TimingsMs
-    attempts: int = Field(ge=1)
-    stage2_calls: int = Field(default=1, ge=1)
+    attempts: int = Field(ge=0)
+    stage2_calls: int = Field(default=1, ge=0)
     warnings: list[str] = Field(default_factory=list)
     turn_plan: TurnPlanOut | None = None
     batch_record: list[BatchRecordEntry] | None = None
+
+    @model_validator(mode="after")
+    def _zero_calls_only_with_zero_attempts(self) -> ExtractResponse:
+        """Refuse `attempts` or `stage2_calls` at 0 while the other is not."""
+        if (self.attempts == 0) != (self.stage2_calls == 0):
+            raise ValueError(
+                f"attempts ({self.attempts}) and stage2_calls ({self.stage2_calls}) are 0 "
+                "only together: a turn with no unit left makes no Stage 2 call"
+            )
+        return self
 
     @model_serializer(mode="wrap")
     def _omit_the_absent_records(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
