@@ -541,6 +541,41 @@ async def test_echo_service_on_real_corpus_is_perfect_complete_and_sequential(
 
 
 @pytest.mark.asyncio
+async def test_the_summary_holds_both_columns_and_the_three_counts(tmp_path: Path) -> None:
+    # Plan v15, T50 Acceptance 2. The pack at this checkout has no relation-phase rule, so
+    # the model-written column equals the headline and the relation rails moved nothing.
+    gold = write_gold(tmp_path / "gold.jsonl", 6)
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=make_world(gold), gold_path=gold, out_dir=out)
+
+    assert code == 0
+    summary = read_summary(out)
+    columns = summary["columns"]
+    # The summary is written with sorted keys, so sets, not orders, are pinned here.
+    assert set(columns) == {"exact k1-4", "model-written"}
+    for column in columns.values():
+        assert set(column) == {"recall", "precision", "f1", "aligned"}
+        assert set(column["aligned"]) == {"recall", "precision", "f1"}
+        assert set(column["recall"]) == {"value", "tp", "n", "ci95"}
+        assert column["recall"] == {"value": 1.0, "tp": 6, "n": 6, "ci95": [1.0, 1.0]}
+    assert columns["exact k1-4"] == columns["model-written"]
+    assert {kind: effect["value"] for kind, effect in summary["rails_effect"].items()} == {
+        "recall_diff": 0.0,
+        "precision_diff": 0.0,
+        "f1_diff": 0.0,
+    }
+    assert {
+        name: summary[name]
+        for name in (
+            "relation_rails_added",
+            "relation_rails_removed",
+            "found_only_by_relation_rails",
+        )
+    } == {"relation_rails_added": 0, "relation_rails_removed": 0, "found_only_by_relation_rails": 0}
+
+
+@pytest.mark.asyncio
 async def test_each_failure_class_is_recorded_and_scored_as_false_negatives(
     tmp_path: Path,
 ) -> None:

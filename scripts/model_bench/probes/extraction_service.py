@@ -78,6 +78,7 @@ from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     Produced,
     _norm_ws,
     _recover_utterance,
+    column_summary,
     iter_gold_probes,
     produced_from_response,
     reading_identity,
@@ -374,17 +375,24 @@ async def run_cases(
 # ---------------------------------------------------------------------------
 
 
-def build_produced_index(cases: list[CaseResult]) -> dict[str, Produced]:
+def build_produced_index(
+    cases: list[CaseResult], *, relation_rails: bool = True
+) -> dict[str, Produced]:
     """Index each successful case's payload as the scorer's `Produced`, by normalised utterance.
 
     The scorer reads the response as the raw record dumps it, so the rails are handed the
-    case's scope label, batch record and turn plan with its payload.
+    case's scope label, batch record and turn plan with its payload. `relation_rails=False`
+    gives the model-written column's index.
     """
     index: dict[str, Produced] = {}
     for case in cases:
         if case.response is None:
             continue
-        produced = produced_from_response(case.utterance, case.response.model_dump(mode="json"))
+        produced = produced_from_response(
+            case.utterance,
+            case.response.model_dump(mode="json"),
+            relation_rails=relation_rails,
+        )
         index[produced.utterance] = produced
     return index
 
@@ -522,8 +530,18 @@ def build_run_summary(
     """
     if identity is None:
         identity = reading_identity(gold_path)
-    report = score_run(probes, build_produced_index(result.cases))
+    index = build_produced_index(result.cases)
+    report = score_run(probes, index)
     seed, b, confidence, z = load_bootstrap_params()
+    # Both columns, the rails effect and the three counts (plan v15, T50 Acceptance 2).
+    columns = column_summary(
+        probes,
+        index,
+        build_produced_index(result.cases, relation_rails=False),
+        seed=seed,
+        b=b,
+        confidence=confidence,
+    )
     summary = build_summary(
         report,
         gold_path=gold_path,
@@ -548,6 +566,7 @@ def build_run_summary(
     repaired = sum(1 for c in completed if c.response and response_flags(c.response)[1])
 
     summary.update(identity)
+    summary.update(columns)
     summary["ontology_version_note"] = "scorer-side (local repo); the service reports none"
     summary["endpoint"] = {
         "url": endpoint,
