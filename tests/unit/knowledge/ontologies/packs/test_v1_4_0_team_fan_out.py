@@ -465,6 +465,22 @@ def test_a_dated_membership_gives_its_confidence_and_status_and_no_date(pack: Pa
     assert _edge("user", "tomasz-wierzba", "KNOWS_PERSON", copied) in relationships
 
 
+def test_a_future_membership_gives_its_own_status_and_confidence(pack: Pack):
+    # The status is copied from the membership, not written as `current`.
+    future = {**LIVE, "temporal_status": "future", "confidence": 0.7}
+    edges = (
+        TEAM_EDGES[0],
+        _edge("tomasz-wierzba", "kestrel-platform-team", "MEMBER_OF", future),
+        TEAM_EDGES[2],
+    )
+
+    _, relationships = _run(pack, TEAM, edges, batch_record=TEAM_RECORD)
+
+    copied = {"temporal_status": "future", "confidence": 0.7}
+    assert _edge("tomasz-wierzba", "varnholt", "WORKS_AT", copied) in relationships
+    assert _edge("user", "tomasz-wierzba", "KNOWS_PERSON", copied) in relationships
+
+
 # --- determinism ---------------------------------------------------------------------------
 
 

@@ -99,6 +99,27 @@ def test_a_teams_part_of_its_employer_is_not_stored(pack: Pack, scope):
     assert MEMBERSHIP in relationships
 
 
+def test_a_team_whose_only_membership_is_past_still_loses_its_part_of(pack: Pack):
+    # The pattern reads any `MEMBER_OF` to the team: a past one still marks it a team.
+    past = {**MEMBERSHIP, "properties": {**LIVE, "temporal_status": "past"}}
+
+    relationships = _run(pack, (past, TEAM_PART_OF))
+
+    assert _part_of(relationships) == []
+    assert past in relationships
+
+
+def test_a_teams_part_of_an_organization_that_is_not_its_employer_is_not_stored(pack: Pack):
+    # The pattern names no employer: a team's `PART_OF` any other Organization is dropped.
+    works_at = _edge("aino-pelkonen", "brightwater", "WORKS_AT")
+    to_the_group = _edge("harrow-data-team", "lindqvist-group", "PART_OF")
+
+    relationships = _run(pack, (MEMBERSHIP, works_at, to_the_group))
+
+    assert _part_of(relationships) == []
+    assert works_at in relationships
+
+
 def test_a_projects_part_of_an_organization_is_kept(pack: Pack):
     project = _edge("harrow-migration", "brightwater", "PART_OF")
     # A `MEMBER_OF` targeting a Project is outside the pair table; the type alone keeps it.
