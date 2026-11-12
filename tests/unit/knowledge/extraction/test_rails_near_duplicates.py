@@ -1,10 +1,12 @@
 """The near-duplicate merge: two entities of one type under one name, one edit apart, become one.
 
 The model writes one entity under two spellings of its id in two batches of a turn. The
-merge joins the later into the earlier when the two have one type, the slugs of their
-ids are within one edit, and their names are equal, read in one case and with single
-spaces. It refuses a type an `id_exempt` rule names, an edit that adds, drops or
-replaces a digit, and an edit that replaces a one-character token.
+merge joins two written ids when they have one type, their slugs are within one edit,
+and their names are equal, read in one case and with single spaces. It keeps the
+spelling a fixed order reads first, never the payload's: the longer slug, then the
+smaller slug, then the smaller written id. It refuses a type an `id_exempt` rule names,
+an edit that adds, drops or replaces a digit, and an edit that replaces a one-character
+token. A pin of which spelling is kept runs in every order of its entities.
 
 The cases run on the fixture packs, whose types are invented, so a case that passes
 shows the runner reading the pack's `id_exempt` rules and not knowing a type. No rule
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+from itertools import permutations
 
 import pytest
 
@@ -28,6 +31,7 @@ from backend.knowledge.ontologies.pack import (
     build_pack,
     load_pack,
 )
+from tests.unit.knowledge.extraction.test_rails_own_context import NO_ALIAS
 from tests.unit.knowledge.ontologies.fixtures.pet_pack.conventions import PET_ROSTER_CASE
 
 BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
@@ -59,6 +63,19 @@ def _ids(entities: list[dict]) -> list[str]:
     return [entity["id"] for entity in entities]
 
 
+def _every_order(entities, relationships=(), pack: Pack = BASE) -> set:
+    """What the row stores in each order of its entities: sorted ids, sorted edges."""
+    return {
+        (
+            tuple(sorted(_ids(stored))),
+            tuple(sorted((r["source"], r["target"], r["type"]) for r in edges)),
+        )
+        for stored, edges in (
+            _run(order, relationships, pack=pack) for order in permutations(entities)
+        )
+    }
+
+
 TAMSIN = _hand("tamsin", "Tamsin")
 # The same hand under a second spelling of the id: the model's name for her is the same.
 TAMSYN = _hand("tamsyn", "Tamsin")
@@ -68,7 +85,7 @@ WEND = _hand("wend", "Wend")
 # --- what merges --------------------------------------------------------------------------------
 
 
-def test_two_ids_one_letter_apart_under_one_name_are_one_entity_the_earlier():
+def test_two_ids_one_letter_apart_under_one_name_are_one_entity_the_longer_spelling():
     # One hand, written `tamsin` in one batch and `tamsn` in the next.
     entities, relationships = _run(
         [TAMSIN, WEND, _hand("tamsn", "Tamsin")], [_edge("wend", "tamsn", "KNOWS_HAND")]
@@ -79,14 +96,16 @@ def test_two_ids_one_letter_apart_under_one_name_are_one_entity_the_earlier():
 
 
 @pytest.mark.parametrize(
-    "later_id",
-    ["tamsyn", "tamsinn", "tamsi", "amsin"],
+    ("other_id", "kept"),
+    [("tamsyn", "tamsin"), ("tamsinn", "tamsinn"), ("tamsi", "tamsin"), ("amsin", "tamsin")],
     ids=["a-letter-changed", "a-letter-added", "the-last-letter-lost", "the-first-letter-lost"],
 )
-def test_one_edit_is_one_letter_changed_added_or_lost(later_id):
-    entities, _ = _run([TAMSIN, _hand(later_id, "Tamsin")])
+def test_one_edit_is_one_letter_changed_added_or_lost(other_id, kept):
+    # The fixed order keeps the longer slug, and of two of one length the smaller.
+    other = _hand(other_id, "Tamsin")
 
-    assert entities == [TAMSIN]
+    assert _ids(_run([TAMSIN, other])[0]) == [kept]
+    assert _ids(_run([other, TAMSIN])[0]) == [kept]
 
 
 @pytest.mark.parametrize(
@@ -105,14 +124,15 @@ def test_names_that_differ_in_case_or_spacing_alone_are_one_name(first_name, sec
 
 
 @pytest.mark.parametrize(
-    ("first_id", "second_id"),
-    [("ky", "ko"), ("jem", "jen"), ("wend", "wand")],
+    ("first_id", "second_id", "kept"),
+    [("ky", "ko", "ko"), ("jem", "jen", "jem"), ("wend", "wand", "wand")],
     ids=["two-characters", "three-characters", "four-characters"],
 )
-def test_two_short_ids_one_letter_apart_under_one_name_are_merged(first_id, second_id):
+def test_two_short_ids_one_letter_apart_under_one_name_are_merged(first_id, second_id, kept):
+    # Of two spellings of one length the smaller slug is kept.
     entities, _ = _run([_hand(first_id, "Wend"), _hand(second_id, "Wend")])
 
-    assert _ids(entities) == [first_id]
+    assert _ids(entities) == [kept]
 
 
 def test_a_digit_and_a_one_character_token_elsewhere_in_both_ids_do_not_stop_a_merge():
@@ -140,13 +160,102 @@ def test_a_missing_name_is_read_as_the_id():
     assert entities == [{"id": "tamsin", "type": "Deckhand"}]
 
 
-def test_the_earlier_entity_in_payload_order_is_kept_whole_and_the_later_one_is_dropped():
-    # Payload order decides, not which spelling is right or which entity says more.
-    second = _hand("tamsin", "Tamsin", properties={"rank": "mate"})
+def test_the_spelling_the_fixed_order_reads_first_is_kept_whole_and_the_other_is_dropped():
+    # The order decides, not the payload's order or which entity says more: `tamsin` is
+    # the smaller of two slugs of one length, and the property of `tamsyn` is lost.
+    other = _hand("tamsyn", "Tamsin", properties={"rank": "mate"})
 
-    entities, _ = _run([TAMSYN, second])
+    assert _run([other, TAMSIN])[0] == [TAMSIN]
+    assert _run([TAMSIN, other])[0] == [TAMSIN]
 
-    assert entities == [TAMSYN]
+
+# --- which spelling is kept: a fixed order, the same in every order of the payload -----------------
+
+
+def test_a_letter_dropped_inside_a_token_keeps_the_longer_spelling_in_every_order():
+    # The shape of a typo the model makes: one letter lost inside a word. The longer
+    # spelling holds every letter either one wrote.
+    pair = [_hand("brannoch", "Brannoch"), _hand("branoch", "Brannoch")]
+    edges = [_edge("wend", "brannoch", "KNOWS_HAND"), _edge("wend", "branoch", "OUTRANKS")]
+
+    assert _every_order([*pair, WEND], edges) == {
+        (
+            ("brannoch", "wend"),
+            (("wend", "brannoch", "KNOWS_HAND"), ("wend", "brannoch", "OUTRANKS")),
+        )
+    }
+
+
+def test_two_spellings_of_one_length_keep_the_smaller_slug_in_every_order():
+    edges = [_edge("wend", "tamsyn", "KNOWS_HAND"), _edge("wend", "tamsin", "OUTRANKS")]
+
+    assert _every_order([TAMSYN, TAMSIN, WEND], edges) == {
+        (("tamsin", "wend"), (("wend", "tamsin", "KNOWS_HAND"), ("wend", "tamsin", "OUTRANKS")))
+    }
+
+
+def test_two_written_ids_with_one_slug_keep_the_smaller_written_id_in_both_orders():
+    # `Tamsin` sorts before `tamsin`, so the entity written `Tamsin` is kept, and with it
+    # its property.
+    upper = {"id": "Tamsin", "name": "Tamsin", "type": "Deckhand", "properties": {"rank": "mate"}}
+    lower = _hand("tamsin", "Tamsin")
+    stored = [
+        {"id": "tamsin", "name": "Tamsin", "type": "Deckhand", "properties": {"rank": "mate"}}
+    ]
+
+    assert _run([upper, lower])[0] == stored
+    assert _run([lower, upper])[0] == stored
+
+
+def test_a_written_id_repeated_under_two_names_is_read_under_both_in_every_order():
+    # `tamsyn` shares the name `Tamsin` with one writer of `tamsin`, whichever writer of
+    # `tamsin` the payload lists first, so the two ids are one entity in every order.
+    entities = [
+        _hand("tamsin", "Tamsin"),
+        _hand("tamsin", "Tamsin Hale"),
+        _hand("tamsyn", "Tamsin"),
+        WEND,
+    ]
+    edges = [_edge("wend", "tamsyn", "KNOWS_HAND"), _edge("wend", "tamsin", "KNOWS_HAND")]
+
+    assert _every_order(entities, edges, pack=NO_ALIAS) == {
+        (("tamsin", "wend"), (("wend", "tamsin", "KNOWS_HAND"),))
+    }
+
+
+def test_a_written_id_one_of_whose_writers_is_of_an_exempt_type_takes_no_part():
+    entities = [
+        {"id": "tamsin", "name": "Tamsin", "type": "Mooring"},
+        _hand("tamsin", "Tamsin"),
+        _hand("tamsyn", "Tamsin"),
+        WEND,
+    ]
+    edges = [_edge("wend", "tamsyn", "KNOWS_HAND"), _edge("wend", "tamsin", "KNOWS_HAND")]
+
+    assert _every_order(entities, edges, pack=NO_ALIAS) == {
+        (
+            ("tamsin", "tamsyn", "wend"),
+            (("wend", "tamsin", "KNOWS_HAND"), ("wend", "tamsyn", "KNOWS_HAND")),
+        )
+    }
+
+
+def test_a_written_id_whose_writers_are_of_two_types_takes_no_part():
+    # The pack's alias stores the Deckhand `bosun` as `boatswain`, and the `Galley` one,
+    # a type the pack does not define, keeps `bosun`. Merging `bosun` into `bosuns`
+    # would drop a writer of another type. Which stored id the edge to `bosun` names
+    # follows the id phase, so the pin is on the entity ids.
+    entities = [
+        _hand("bosun", "Bosun"),
+        {"id": "bosun", "name": "Bosun", "type": "Galley"},
+        _hand("bosuns", "Bosun"),
+        WEND,
+    ]
+    edges = [_edge("wend", "bosun", "KNOWS_HAND")]
+
+    stored = {tuple(sorted(_ids(_run(order, edges)[0]))) for order in permutations(entities)}
+
+    assert stored == {("boatswain", "bosun", "bosuns", "wend")}
 
 
 # --- what stays two, under two names ------------------------------------------------------------
@@ -257,18 +366,22 @@ def test_an_edit_that_replaces_a_one_character_token_is_not_merged(first_id, sec
 
 
 @pytest.mark.parametrize(
-    ("first_id", "second_id", "name"),
-    [("teama", "teamb", "Team"), ("phase-i", "phase-ii", "Phase"), ("team-a", "team-ab", "Team")],
+    ("first_id", "second_id", "name", "kept"),
+    [
+        ("teama", "teamb", "Team", "teama"),
+        ("phase-i", "phase-ii", "Phase", "phase-ii"),
+        ("team-a", "team-ab", "Team", "team-ab"),
+    ],
     ids=["a-mark-inside-a-token", "a-letter-added-to-a-mark", "a-letter-added-after-a-mark"],
 )
 def test_a_mark_that_is_not_a_token_of_its_own_or_is_not_replaced_is_merged(
-    first_id, second_id, name
+    first_id, second_id, name, kept
 ):
     # On record: the two refusals stop a number and a replaced one-character token, and
     # nothing else. These pairs may be two things, and under one name they are merged.
     entities, _ = _run([_hand(first_id, name), _hand(second_id, name)])
 
-    assert _ids(entities) == [first_id]
+    assert _ids(entities) == [kept]
 
 
 # --- the types, and what takes no part ------------------------------------------------------------
@@ -308,7 +421,8 @@ def test_the_exempt_types_are_read_from_the_packs_rules():
         plugins=PET.plugins,
     )
 
-    assert _ids(_run(pets, pack=PET)[0]) == ["biscuit"]
+    # Under the pack itself the two are one, the smaller of two slugs of one length.
+    assert _ids(_run(pets, pack=PET)[0]) == ["biscuet"]
     assert _ids(_run(pets, pack=exempting)[0]) == ["biscuit", "biscuet"]
 
 
@@ -338,6 +452,16 @@ def test_a_retired_type_is_read_as_its_replacement():
     ]
 
 
+def test_a_retired_writer_is_read_as_its_replacement_type_in_both_orders():
+    # The base pack retires Stowaway for Deckhand, so a Stowaway `tamsyn` reads as a
+    # Deckhand: it shares a reading with the Deckhand `tamsin` and merges into it.
+    stowaway = {"id": "tamsyn", "name": "Tamsin", "type": "Stowaway"}
+
+    assert _every_order([stowaway, TAMSIN]) == {(("tamsin",), ())}
+    # One id written by a Stowaway and by a Deckhand is of one type, and takes part.
+    assert _every_order([stowaway, TAMSYN, TAMSIN]) == {(("tamsin",), ())}
+
+
 def test_an_entity_with_no_id_field_takes_no_part():
     # No endpoint can name it, so it can neither be kept for another nor be remapped.
     entities, _ = _run([{"name": "Tamsin", "type": "Deckhand"}, TAMSYN])
@@ -345,7 +469,8 @@ def test_an_entity_with_no_id_field_takes_no_part():
     assert _ids(entities) == ["tamsin", "tamsyn"]
 
 
-def test_an_entity_that_repeats_a_written_id_follows_the_entity_that_first_wrote_it():
+def test_every_writer_of_a_written_id_follows_that_id():
+    # Dropped with it when it is merged, and otherwise left to the dedupe step.
     again = _hand("tamsyn", "Tamsin of the night watch")
 
     merged_away, _ = _run([TAMSIN, TAMSYN, again])
@@ -365,37 +490,34 @@ def test_ids_that_come_within_one_edit_only_as_stored_are_not_merged():
 # --- the tie rules ------------------------------------------------------------------------------
 
 
-def test_a_chain_whose_ends_are_two_edits_apart_keeps_both_ends_when_an_end_comes_first():
-    # `marlow` goes to `marlo`. `marlowe` is one edit from `marlow`, which is gone, and
-    # two from `marlo`: an id is merged only into a kept id it is one edit from.
-    entities, relationships = _run(
-        [_hand("marlo", "Marlow"), _hand("marlow", "Marlow"), _hand("marlowe", "Marlow"), WEND],
-        [_edge("wend", "marlow", "KNOWS_HAND"), _edge("wend", "marlowe", "KNOWS_HAND")],
-    )
+def test_a_chain_whose_ends_are_two_edits_apart_keeps_both_ends_when_an_end_is_read_first():
+    # The longest, `marlowe`, is read first and kept, and `marlow` goes to it. `marlo`
+    # is one edit from `marlow`, which is gone, and two from `marlowe`: an id is merged
+    # only into a kept id it is one edit from. So in every order:
+    chain = [_hand("marlo", "Marlow"), _hand("marlow", "Marlow"), _hand("marlowe", "Marlow")]
+    edges = [_edge("wend", "marlow", "KNOWS_HAND"), _edge("wend", "marlowe", "KNOWS_HAND")]
 
-    assert _ids(entities) == ["marlo", "marlowe", "wend"]
-    assert relationships == [
-        _edge("wend", "marlo", "KNOWS_HAND"),
-        _edge("wend", "marlowe", "KNOWS_HAND"),
-    ]
+    assert _every_order([*chain, WEND], edges) == {
+        (("marlo", "marlowe", "wend"), (("wend", "marlowe", "KNOWS_HAND"),))
+    }
 
 
-def test_a_chain_whose_ends_are_two_edits_apart_is_one_entity_when_the_middle_comes_first():
-    entities, _ = _run(
-        [_hand("marlow", "Marlow"), _hand("marlo", "Marlow"), _hand("marlowe", "Marlow")]
-    )
+def test_a_chain_whose_ends_are_two_edits_apart_is_one_entity_when_the_middle_is_read_first():
+    # `marlow` is the longest, so it is read first; each end is one edit from it.
+    chain = [_hand("marlo", "Marlow"), _hand("marlow", "Marlow"), _hand("marow", "Marlow")]
 
-    assert _ids(entities) == ["marlow"]
+    assert _every_order(chain) == {(("marlow",), ())}
 
 
 def test_an_entity_within_one_edit_of_two_kept_entities_goes_to_the_earlier():
-    entities, relationships = _run(
-        [TAMSIN, _hand("tomsyn", "Tamsin"), WEND, _hand("tomsin", "Tamsin")],
-        [_edge("wend", "tomsin", "KNOWS_HAND")],
-    )
+    # `kerinn` and `kerrin` are two edits apart, so both are kept, `kerinn` first as
+    # the smaller of one length. `kerin` is read last, as the shortest, and is one
+    # edit from each: it goes to the earlier in that order.
+    spellings = [_hand("kerrin", "Kerrin"), _hand("kerinn", "Kerrin"), _hand("kerin", "Kerrin")]
 
-    assert _ids(entities) == ["tamsin", "tomsyn", "wend"]
-    assert relationships == [_edge("wend", "tamsin", "KNOWS_HAND")]
+    assert _every_order([*spellings, WEND], [_edge("wend", "kerin", "KNOWS_HAND")]) == {
+        (("kerinn", "kerrin", "wend"), (("wend", "kerinn", "KNOWS_HAND"),))
+    }
 
 
 # --- the edges of a merged entity -----------------------------------------------------------------
@@ -451,13 +573,14 @@ def test_a_fan_out_reads_the_kept_id_of_a_merged_member():
 
 
 def test_a_batch_that_holds_the_merged_id_places_the_kept_entity_under_its_lead_in():
-    # `pip` is written under the neighbours' lead-in and `pipp` under the roster's. They
-    # are one pet under one name, which the roster's batch therefore holds.
+    # `pip` is written under the neighbours' lead-in and `pi` under the roster's. They
+    # are one pet under one name, kept as the longer `pip`, which the roster's batch
+    # therefore holds.
     pip = PET_ROSTER_CASE.entities[-1]
-    pipp = _pet("pipp", pip["name"])
+    pi = _pet("pi", pip["name"])
     record = copy.deepcopy(PET_ROSTER_CASE.batch_record)
-    record[0]["payload"]["entities"].append(pipp)
-    entities = (pip, *PET_ROSTER_CASE.entities[:-1], pipp)
+    record[0]["payload"]["entities"].append(pi)
+    entities = (pip, *PET_ROSTER_CASE.entities[:-1], pi)
 
     out_entities, relationships = _run(
         entities,

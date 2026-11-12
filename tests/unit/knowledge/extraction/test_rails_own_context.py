@@ -318,6 +318,18 @@ _KEPT_UNRESERVED_ROW = (*_KEPT_ROW[:3], _UNRESERVED)
 
 _TOOLS_VERSIONED_UNRECORDED_ROW = (*_TOOLS_VERSIONED_ROW[:2], [], V1_4_0)
 
+# One crossing written under two spellings in two batches, both under one heading. The
+# near-duplicate merge keeps the longer spelling, the one that starts with the heading,
+# whichever the payload lists first; the strip then drops the heading from it.
+_HARBOUR = _hand("harbour-weekend-ferry-crossing", "Ferry crossing")
+_HARBOR = _hand("harbor-weekend-ferry-crossing", "Ferry crossing")
+_HARBOR_RECORD = [
+    _batch([("Harbour weekend",)], [_HARBOUR]),
+    _batch([("Harbour weekend",)], [_HARBOR]),
+]
+_HARBOR_ROW = ([_HARBOUR, _HARBOR], [], _HARBOR_RECORD, NO_ALIAS)
+_HARBOR_REVERSED_ROW = ([_HARBOR, _HARBOUR], [], _HARBOR_RECORD, NO_ALIAS)
+
 
 def test_a_lead_ins_slug_in_front_of_each_items_id_is_stripped_and_the_edges_follow():
     entities, relationships = _run(_ROSTER, _ROSTER_EDGES, batch_record=_ROSTER_RECORD)
@@ -558,6 +570,11 @@ def test_a_strip_whose_built_rest_is_reserved_by_nothing_goes_through():
     assert _stored(cook, _batch([("People",)], [cook])) == "cook"
 
 
+def test_two_spellings_under_one_heading_lose_it_in_both_orders():
+    assert _row_ids(_HARBOR_ROW) == ["ferry-crossing"]
+    assert _row_ids(_HARBOR_REVERSED_ROW) == ["ferry-crossing"]
+
+
 # --- which contexts may strip which entity ------------------------------------------------------
 
 
@@ -733,6 +750,8 @@ def test_the_roster_row_gives_the_bytes_stated_here():
         pytest.param(
             _KEPT_BUILT_ROW, id="the-anchor-and-a-reserved-name-the-leading-word-rail-builds"
         ),
+        pytest.param(_HARBOR_ROW, id="two-spellings-under-one-heading"),
+        pytest.param(_HARBOR_REVERSED_ROW, id="two-spellings-under-one-heading-reversed"),
     ],
 )
 def test_a_second_run_over_a_rows_own_output_changes_nothing(row):

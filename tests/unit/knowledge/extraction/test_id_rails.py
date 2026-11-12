@@ -553,11 +553,56 @@ def test_one_service_written_under_two_spellings_of_its_id_is_one_entity():
     ]
 
 
+def test_the_service_keeps_its_longer_spelling_in_every_order_of_the_payload():
+    # The same pair: the longer spelling is kept whichever order the model listed the
+    # entities in, and holds the edges both spellings wrote.
+    from itertools import permutations
+
+    entities = [
+        {
+            "id": "saltmere-matchmaking-service",
+            "name": "Salmere matchmaking service",
+            "type": "Technology",
+        },
+        {"id": "38-ms-latency", "name": "38-ms-latency", "type": "Metric"},
+        {
+            "id": "salmere-matchmaking-service",
+            "name": "Salmere matchmaking service",
+            "type": "Technology",
+        },
+        {"id": "410-ms-latency", "name": "410-ms-latency", "type": "Metric"},
+    ]
+    relationships = [
+        _has_metric("saltmere-matchmaking-service", "38-ms-latency"),
+        _has_metric("salmere-matchmaking-service", "410-ms-latency"),
+        _has_metric("salmere-matchmaking-service", "38-ms-latency"),
+    ]
+
+    stored = set()
+    for order in permutations(entities):
+        out_entities, out_relationships = normalize_payload(
+            copy.deepcopy(list(order)), copy.deepcopy(relationships)
+        )
+        stored.add((tuple(sorted(e["id"] for e in out_entities)), json.dumps(out_relationships)))
+
+    assert stored == {
+        (
+            ("38-ms-latency", "410-ms-latency", "saltmere-matchmaking-service"),
+            json.dumps(
+                [
+                    _has_metric("saltmere-matchmaking-service", "38-ms-latency"),
+                    _has_metric("saltmere-matchmaking-service", "410-ms-latency"),
+                ]
+            ),
+        )
+    }
+
+
 def test_two_people_one_letter_apart_stay_two_under_two_names_and_are_one_under_one_name():
     # Dana Orrin and Dane Orrin are two people, and their names say so. Written under
     # one name, the two ids are read as two spellings of it: the merge cannot tell two
-    # people the model named alike from one. The earlier is kept, and the later one's
-    # edges become hers.
+    # people the model named alike from one. Of the two spellings, one length, the
+    # smaller is kept, and the other one's edges become hers.
     def payload(second_name: str) -> tuple[list[dict], list[dict]]:
         entities = [
             {"id": "user", "name": "user", "type": "User"},
