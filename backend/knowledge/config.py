@@ -5,7 +5,9 @@ Central configuration for Neo4j connection, embedding models, and extraction set
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -72,6 +74,21 @@ class EmbeddingConfig:
         return None if self.device == "auto" else self.device
 
 
+# A role is a caller of the LLM that may run on its own server and model. Each
+# role reads `MIST_LLM_<ROLE>_URL` and `MIST_LLM_<ROLE>_MODEL`, so adding one is
+# a new value here and its two variables, with no new code path.
+LLMRole = Literal["conversation"]
+LLM_ROLES: tuple[LLMRole, ...] = ("conversation",)
+
+
+@dataclass(frozen=True, slots=True)
+class LLMEndpoint:
+    """One llama-server (or Ollama) host and the model id requests name on it."""
+
+    base_url: str
+    model: str
+
+
 @dataclass
 class LLMConfig:
     """LLM model configuration.
@@ -84,6 +101,12 @@ class LLMConfig:
 
     Keeping the original `temperature` field as extraction-default avoids
     a rename that would churn through 10+ extraction call sites.
+
+    `model` and `base_url` are the base endpoint: extraction and curation
+    always use it. `roles` holds an endpoint only for a role whose URL
+    variable is set, so an unset role resolves to the base through
+    `endpoint` and nothing changes for it. `backend` and the sampling fields
+    apply to every endpoint.
     """
 
     model: str = "gemma-4-e4b"
@@ -105,25 +128,77 @@ class LLMConfig:
     # ever sent when the caller left `LLMRequest.thinking` unset; it never
     # overrides an explicit thinking config.
     tool_thinking_budget_tokens: int | None = 1024
+    # Only roles whose URL variable is set. A factory, not an env read: the
+    # class-level `os.getenv` defaults elsewhere in this module are baked in
+    # at import (KNOWN_ISSUES.md), so the role variables are read in
+    # `from_env` alone.
+    roles: dict[str, LLMEndpoint] = field(default_factory=dict)
+
+    def endpoint(self, role: LLMRole | None) -> LLMEndpoint:
+        """The endpoint `role` calls: its own when set, else the base.
+
+        Raises:
+            ValueError: `role` is not None and not in `LLM_ROLES`. A typo
+                would otherwise fall back to the base without a sign.
+        """
+        if role is not None and role not in LLM_ROLES:
+            raise ValueError(f"Unknown LLM role {role!r}; known roles: {', '.join(LLM_ROLES)}")
+        if role is not None and role in self.roles:
+            return self.roles[role]
+        return LLMEndpoint(base_url=self.base_url, model=self.model)
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables.
+
+        Raises:
+            ValueError: A role's model variable is set without its URL
+                variable, or a role's URL is not an `http` or `https` URL
+                with a host. Both fail at startup rather than at the first
+                turn's LLM call.
+        """
         backend = os.getenv("LLM_BACKEND", "llamacpp")
         default_url = "http://localhost:11434" if backend == "ollama" else "http://localhost:8080"
         raw_thinking_budget = os.getenv("MIST_TOOL_THINKING_BUDGET", "1024").strip()
         tool_thinking_budget_tokens = (
             None if raw_thinking_budget.lower() == "off" else int(raw_thinking_budget)
         )
+        model = os.getenv("MODEL", "gemma-4-e4b")
         return cls(
-            model=os.getenv("MODEL", "gemma-4-e4b"),
+            model=model,
             base_url=os.getenv("LLM_SERVER_URL", default_url),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
             conversation_temperature=float(os.getenv("LLM_CONVERSATION_TEMPERATURE", "0.7")),
             conversation_max_tokens=int(os.getenv("LLM_CONVERSATION_MAX_TOKENS", "1024")),
             backend=backend,
             tool_thinking_budget_tokens=tool_thinking_budget_tokens,
+            roles=cls._roles_from_env(default_model=model),
         )
+
+    @staticmethod
+    def _roles_from_env(default_model: str) -> dict[str, LLMEndpoint]:
+        """Read each role's endpoint; a role with no URL is left out.
+
+        An empty or blank variable counts as unset, as a `.env` line `NAME=`
+        leaves it.
+        """
+        roles: dict[str, LLMEndpoint] = {}
+        for role in LLM_ROLES:
+            url_var = f"MIST_LLM_{role.upper()}_URL"
+            model_var = f"MIST_LLM_{role.upper()}_MODEL"
+            url = os.getenv(url_var, "").strip()
+            role_model = os.getenv(model_var, "").strip()
+            if not url:
+                if role_model:
+                    raise ValueError(
+                        f"{model_var} is set but {url_var} is not; set both or neither"
+                    )
+                continue
+            parts = urlsplit(url)
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                raise ValueError(f"{url_var} must be an http or https URL with a host, got {url!r}")
+            roles[role] = LLMEndpoint(base_url=url, model=role_model or default_model)
+        return roles
 
 
 @dataclass

@@ -76,10 +76,24 @@ def _make_handler(*, event_store_enabled: bool = True) -> ConversationHandler:
     )
 
 
-def _voice_processor_for(handler: ConversationHandler | None) -> SimpleNamespace:
-    """Wrap a handler in the voice_processor -> models -> knowledge chain."""
+_HANDLERS_PROVIDER = object()
+
+
+def _voice_processor_for(
+    handler: ConversationHandler | None, provider: object = _HANDLERS_PROVIDER
+) -> SimpleNamespace:
+    """Wrap a handler in the voice_processor -> models -> knowledge chain.
+
+    `_llm_provider` is the base provider the live voice processor builds and
+    injects into `build_conversation_handler` (`voice_processor.py`), the one
+    `/health` probes. It defaults to the handler's own `_provider`, which is
+    that same object when no conversation role is set.
+    """
+    if provider is _HANDLERS_PROVIDER:
+        provider = handler._provider if handler is not None else None
     return SimpleNamespace(
-        models=SimpleNamespace(knowledge=SimpleNamespace(conversation_handler=handler))
+        _llm_provider=provider,
+        models=SimpleNamespace(knowledge=SimpleNamespace(conversation_handler=handler)),
     )
 
 
@@ -131,13 +145,14 @@ class TestResolveCurationDependencies:
         equivalents of them.
         """
         handler = _make_handler()
+        voice_processor = _voice_processor_for(handler)
 
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler))
+        deps = server._resolve_curation_dependencies(voice_processor)
 
         assert deps.handler_found is True
         assert deps.tracker is handler._tool_usage_tracker
         assert deps.event_store is handler.event_store
-        assert deps.llm_provider is handler._provider
+        assert deps.llm_provider is voice_processor._llm_provider
 
     @pytest.mark.parametrize(
         "voice_processor",
@@ -181,13 +196,14 @@ class TestResolveCurationDependencies:
         """
         handler = _make_handler(event_store_enabled=False)
         assert handler.event_store is None, "precondition: config disabled the store"
+        voice_processor = _voice_processor_for(handler)
 
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler))
+        deps = server._resolve_curation_dependencies(voice_processor)
 
         assert deps.handler_found is True
         assert deps.event_store is None
         assert deps.tracker is handler._tool_usage_tracker
-        assert deps.llm_provider is handler._provider
+        assert deps.llm_provider is voice_processor._llm_provider
 
 
 class TestSchedulerObjectGraph:
@@ -228,13 +244,15 @@ class TestSchedulerObjectGraph:
         assert reflection_job._event_store is not None
         assert reflection_job._event_store is handler.event_store
 
-    def test_internal_deriver_uses_the_handlers_llm_provider(self):
+    def test_internal_deriver_uses_the_voice_processors_base_provider(self):
         """Supplying the provider is what keeps the deriver's LLM calls on
-        the same (possibly instrumented) provider the turn path uses, instead
-        of a second one the factory builds with no debug logger.
+        the same (possibly instrumented) base provider the extraction
+        pipeline uses and `/health` probes, instead of a second one the
+        factory builds with no debug logger.
         """
         handler = _make_handler()
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler))
+        voice_processor = _voice_processor_for(handler)
+        deps = server._resolve_curation_dependencies(voice_processor)
 
         scheduler, _ = _build_scheduler(
             handler.config,
@@ -243,7 +261,45 @@ class TestSchedulerObjectGraph:
             llm_provider=deps.llm_provider,
         )
 
-        assert _job(scheduler, "self_reflection")._deriver._llm is handler._provider
+        assert _job(scheduler, "self_reflection")._deriver._llm is voice_processor._llm_provider
+
+    def test_curation_keeps_the_base_provider_when_the_conversation_role_is_set(self, monkeypatch):
+        """Design review finding 1: with the conversation role set the handler
+        holds the role's provider, and curation must not follow it. It takes
+        the base the voice processor injected, which the pipeline also holds.
+        """
+        from backend.knowledge.config import ContextBudgetConfig, LLMConfig
+        from tests.unit.knowledge.conftest import FakeVectorStore
+
+        monkeypatch.setenv("LLM_BACKEND", "llamacpp")
+        monkeypatch.setenv("MIST_LLM_CONVERSATION_URL", "http://conversation-llm:8081")
+        monkeypatch.delenv("MIST_LLM_CONVERSATION_MODEL", raising=False)
+        monkeypatch.delenv("MIST_HYDRATION_ISOLATION", raising=False)
+        config = build_test_config()
+        config.llm = LLMConfig.from_env()
+        config.context_budget = ContextBudgetConfig(context_window=8192, enabled=False)
+        base = FakeLLM()
+
+        handler = factories.build_conversation_handler(
+            config=config,
+            llm_provider=base,
+            graph_store=GraphStore(FakeNeo4jConnection(), FakeEmbeddingGenerator()),
+            vector_store=FakeVectorStore(),
+        )
+        assert handler._provider is not base, "precondition: the handler holds the role's"
+        pipeline_provider = handler._extraction_pipeline._extractor._llm
+
+        deps = server._resolve_curation_dependencies(_voice_processor_for(handler, base))
+        scheduler, _ = _build_scheduler(
+            config,
+            event_store=deps.event_store,
+            tracker=deps.tracker,
+            llm_provider=deps.llm_provider,
+        )
+
+        assert deps.llm_provider is pipeline_provider
+        assert deps.llm_provider is not handler._provider
+        assert _job(scheduler, "self_reflection")._deriver._llm is pipeline_provider
 
 
 class TestLlmJobDeferral:
