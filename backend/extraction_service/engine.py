@@ -15,8 +15,8 @@ refers back is shown the earlier units under `EARLIER_ITEMS_HEADING`, for
 reference only. An utterance without structure is one batch, sent exactly as
 before the list pass existed. Every Stage 2 call leaves one entry in the
 response's `batch_record`. A turn with no unit left makes no plan call and no
-Stage 2 call; its scope call is made, and so is its derivation call when the
-request asks for one.
+Stage 2 call; it makes its scope call as any other turn does, when scope is
+enabled, and its derivation call when the request asks for one.
 
 With `ServiceSettings.turn_plan` on, a structured utterance first gets one
 plan call over all of its units (`backend.extraction_service.turn_plan`),
@@ -808,10 +808,11 @@ class ExtractionEngine:
             turn_index=req.turn_index,
         )
 
-        # Every turn makes its scope call: the label is stored on the cache row
-        # and read after Stage 2 too. The pack's item filters run on the split
-        # units before Stage 2, and a turn they leave no unit of makes no plan
-        # or Stage 2 call and is answered with an empty payload.
+        # Every turn runs scope, which calls the model when scope is enabled: the
+        # label is stored on the cache row and read after Stage 2 too. The pack's
+        # item filters run on the split units before Stage 2, and a turn they
+        # leave no unit of makes no plan or Stage 2 call and is answered with an
+        # empty payload.
         scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
         units = filter_units(split_structured(pre_processed.original_text), self._pack)
         stage2 = await self._run_extraction(pre_processed, units, warnings)
