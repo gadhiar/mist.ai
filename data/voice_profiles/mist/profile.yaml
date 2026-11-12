@@ -1,0 +1,9 @@
+name: mist
+description: "M.I.S.T voice: Chatterbox's built-in voice, no reference clip"
+speaker_id: 0
+tts_engine: chatterbox
+sample_rate: 24000
+temperature: 0.8
+exaggeration: 0.5
+cfg_weight: 0.5
+reference_clips: []

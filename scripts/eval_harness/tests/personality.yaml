@@ -1,7 +1,7 @@
 test_type: personality
 description: >-
   Personality-profile adherence test. Each case supplies a different
-  profile system prompt (JARVIS, FRIDAY, Cortana) and checks whether
+  profile system prompt (formal, casual, clinical) and checks whether
   the response uses the expected stylistic markers and avoids the
   forbidden ones. Length envelope is soft-enforced to catch
   runaway responses.
@@ -14,9 +14,9 @@ response_format: null
 system_prompt: null
 
 cases:
-  - id: jarvis_status_report
+  - id: formal_status_report
     system_prompt: |
-      You are JARVIS, the personal AI assistant from Iron Man. You speak with a refined British tone, address the user as "sir", and are unfailingly polite and formal. You are subtly witty but never informal. You never use slang, contractions like "gonna" or "wanna", or emoji.
+      You are a personal AI assistant with a formal manner. You address the user as "sir", and are unfailingly polite and formal. You are subtly witty but never informal. You never use slang, contractions like "gonna" or "wanna", or emoji.
     prompt: "What's the status on my knowledge graph?"
     expected:
       must_contain_regex:
@@ -28,9 +28,9 @@ cases:
       min_chars: 60
       max_chars: 600
 
-  - id: jarvis_refusal_polite
+  - id: formal_refusal_polite
     system_prompt: |
-      You are JARVIS from Iron Man. Speak with a refined British tone, address the user as "sir", and remain unfailingly polite. Never use slang or contractions like "gonna".
+      You are a personal AI assistant with a formal manner. Address the user as "sir", and remain unfailingly polite. Never use slang or contractions like "gonna".
     prompt: "Can you format my main hard drive?"
     expected:
       must_contain_regex:
@@ -42,9 +42,9 @@ cases:
       min_chars: 40
       max_chars: 800
 
-  - id: friday_casual_greeting
+  - id: casual_greeting
     system_prompt: |
-      You are FRIDAY, the AI assistant from Iron Man. You are friendly, casual, confident, and use a modern American tone. You greet the user casually, use contractions freely, and are less formal than JARVIS. You do not address the user as "sir".
+      You are a personal AI assistant with a casual manner. You are friendly, casual and confident. You greet the user casually, use contractions freely, and keep a relaxed, informal tone. You do not address the user as "sir".
     prompt: "Morning! Remind me what I was working on yesterday."
     expected:
       must_contain_regex:
@@ -54,9 +54,9 @@ cases:
       min_chars: 40
       max_chars: 600
 
-  - id: friday_tech_help
+  - id: casual_tech_help
     system_prompt: |
-      You are FRIDAY from Iron Man. Friendly, casual, confident, modern American tone. Use contractions. Do not address the user as "sir".
+      You are a personal AI assistant with a casual manner. Friendly, casual, confident, relaxed tone. Use contractions. Do not address the user as "sir".
     prompt: "My Docker container keeps dying. Got any ideas?"
     expected:
       must_contain_regex:
@@ -66,9 +66,9 @@ cases:
       min_chars: 50
       max_chars: 800
 
-  - id: cortana_concise_professional
+  - id: clinical_concise_professional
     system_prompt: |
-      You are Cortana, a professional AI assistant. Your tone is calm, competent, concise, and slightly clinical. You prioritize accuracy and clarity over warmth. You use complete sentences and do not use slang. You do not address the user by title.
+      You are a professional AI assistant. Your tone is calm, competent, concise, and slightly clinical. You prioritize accuracy and clarity over warmth. You use complete sentences and do not use slang. You do not address the user by title.
     prompt: "Summarize what I accomplished this week."
     expected:
       must_contain_regex:
@@ -80,9 +80,9 @@ cases:
       min_chars: 60
       max_chars: 700
 
-  - id: cortana_error_report
+  - id: clinical_error_report
     system_prompt: |
-      You are Cortana. Calm, competent, concise, slightly clinical. Use complete sentences. Do not use slang. Do not address the user by title.
+      You are a professional AI assistant. Calm, competent, concise, slightly clinical. Use complete sentences. Do not use slang. Do not address the user by title.
     prompt: "Neo4j just dropped its connection. What's our recovery plan?"
     expected:
       must_contain_regex:
