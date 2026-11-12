@@ -372,10 +372,154 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `user LEARNING pricing-own-work` (pass A only): dropped, pass B held.
 - Entities: the three items are Goals (B).
 
+### sel-091-temporal-contract-then-roughs (F1 1.00)
+
+- Ruling: Entities only; the relations are agreed.
+- Entities: the book's release is an event the utterance states, dated only by a season, so it has no Date and no edge (Date entities); N6 keeps it as an entity-only label (B).
+
+### sel-092-coref-editor-and-deputy (F1 0.44, adjudicated whole)
+
+- Pass A: resolved 'the magazine' to Saltgrass and gave both editors their employment there.
+- Pass B: kept 'the magazine' as its own id and made the cover the user's project.
+- Ruling: The magazine the editor left is the one whose cover she commissioned, so the reference resolves to that entity and takes its own name (N1, List rule on references). The commission is a past event of the editor's, and the utterance states no current work of the user on the cover, so no WORKS_ON. The anchors and the cessation are agreed.
+- `greta WORKS_AT magazine` (pass B only): dropped, pass A held.
+- `greta WORKS_AT saltgrass` (pass A only): kept, pass A held.
+- `user WORKS_ON saltgrass-cover` (pass B only): dropped, pass A held.
+- `xanthe WORKS_AT magazine` (pass B only): dropped, pass A held.
+- `xanthe WORKS_AT saltgrass` (pass A only): kept, pass A held.
+
+### sel-093-scope-memos-into-briefs (F1 0.80)
+
+- Ruling: Beside the MIST facts, the utterance states a user fact, forgetting the deadlines, which is a difficulty with them: user STRUGGLES_WITH, with the user anchor (The user anchor); each fact keeps its own subject.
+- `user STRUGGLES_WITH deadline` (pass B only): kept, pass B held.
+
+### sel-094-multi-architect-to-illustrator (F1 0.20, adjudicated whole)
+
+- Pass A: made the training an event in its place, and the two crafts expertise.
+- Pass B: read both crafts as knowledge and tied the user to the city.
+- Ruling: The training is an event the user took part in, linked to its stated place (Event rule, N5); a user RELATED_TO a city is not a shape the guide gives. Switching to illustration as a profession, worked for commissions, is the professional level of EXPERT_IN's gloss, as for a skill the user charges for. Teaching linocut states the user's knowledge of linocut, as teaching does elsewhere in this set, so KNOWS linocut. The book commissions are the user's work (WORKS_ON).
+- `trained-as-architect-in-valencia RELATED_TO valencia` (pass A only): kept, pass A held.
+- `user EXPERIENCED trained-as-architect-in-valencia` (pass A only): kept, pass A held.
+- `user EXPERT_IN illustration` (pass A only): kept, pass A held.
+- `user EXPERT_IN teaching-linocut` (pass A only): dropped, pass B held.
+- `user KNOWS illustration` (pass B only): dropped, pass A held.
+- `user KNOWS linocut` (pass B only): kept, pass B held.
+- `user RELATED_TO valencia` (pass B only): dropped, pass A held.
+- `user WORKS_ON book-commissions` (pass A only): kept, pass A held.
+- Entities: linocut is a Skill (B); the teaching activity is no entity.
+
+### sel-095-list-dash-forecast-stages (F1 0.71)
+
+- Ruling: Data the feature builder joins in is consumed as its input, INPUT_TO's gloss ('X feeds into Y'), not data it acts on or owns, so B holds.
+- `feature-builder OPERATES_ON holidays` (pass A only): dropped, pass B held.
+- `feature-builder OPERATES_ON weather` (pass A only): dropped, pass B held.
+- `holidays INPUT_TO feature-builder` (pass B only): kept, pass B held.
+- `weather INPUT_TO feature-builder` (pass B only): kept, pass B held.
+- Entities: the meter reads are concrete data a pipeline stage pulls, not an abstract idea, so the DataStructure test fits (A).
+
+### sel-096-list-dash-monday-first-things (F1 0.40, adjudicated whole)
+
+- Pass A: named the tool by its proper name and gave it its kind.
+- Pass B: kept the kind noun in the tool's id.
+- Ruling: N14: a proper name followed by a kind noun ('a Pinecil soldering iron') is the named entity IS_A the kind, flagged beyond the prompt; the kind is not part of the name. The coffee is nothing durable.
+- `ampere-atlas IS_A dashboard` (pass A only): kept, pass A held.
+- `user USES ampere-atlas` (pass A only): kept, pass A held.
+- `user USES ampere-atlas-dashboard` (pass B only): dropped, pass A held.
+
+### sel-097-list-dash-company-courses (F1 0.67)
+
+- Ruling: N1: the course's own phrase is the whole run 'power systems for non-engineers', and a labeller does not shorten it.
+- `user LEARNING power-systems` (pass A only): dropped, pass B held.
+- `user LEARNING power-systems-for-non-engineers` (pass B only): kept, pass B held.
+- `user LEARNING bayesian-time-series` attributes differ: the lead-in's 'this year' scopes each course as a stative fact, valid_from 2026 (Date entities), pass B held.
+- `user LEARNING dutch` attributes differ: the lead-in's 'this year' scopes each course as a stative fact, valid_from 2026 (Date entities), pass B held.
+
+### sel-098-list-numbered-trusted-methods (F1 0.67)
+
+- Ruling: N14: the lead-in's kind noun gives each item IS_A, as a heading 'Shells' over 'zsh' does, flagged beyond the prompt.
+- `anything-with-a-transformer-in-it IS_A forecasting-method` (pass B only): kept, pass B held.
+- `exponential-smoothing IS_A forecasting-method` (pass B only): kept, pass B held.
+- `gradient-boosted-trees IS_A forecasting-method` (pass B only): kept, pass B held.
+
+### sel-099-list-numbered-weekly-numbers (F1 1.00)
+
+- Ruling: Attributes only: N16's relative anchor is beyond the prompt, so its flag stands.
+- `user KNOWS_PERSON manager` attributes differ: settled by the attribute policy in the method section.
+
+### sel-100-list-ref-second-orchestrator (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `airflow IS_A orchestrator` attributes differ: settled by the attribute policy in the method section.
+- `dagster IS_A orchestrator` attributes differ: settled by the attribute policy in the method section.
+
+### sel-102-list-ref-middle-weather-feed (F1 0.80)
+
+- Ruling: 'For the wind features' scopes the comparison, not a use the utterance states (Habits and incidental scope, Rule 18), so no USED_FOR.
+- `icon-eu USED_FOR wind-features` (pass B only): dropped, pass A held.
+- `icon-eu IS_A weather-feed` attributes differ: settled by the attribute policy in the method section.
+
+### sel-103-list-ref-former-talk (F1 0.00, adjudicated whole)
+
+- Pass A: took the conference as the user's event and linked it to the talk's subject.
+- Pass B: took the talk given as the user's event, linked to the conference and its subject.
+- Ruling: 'The former' resolves to the first item, the talk, and 'the one I gave' makes it an event the user took part in (List rule on references, Event rule); its subject links to it (N13), not to the conference. Giving the talk there is taking part in the conference too, so A's EXPERIENCED holds beside B's; the talk links to the conference it was for by RELATED_TO, no canonical shape joining two events (Rule 15).
+- `lowland-data-days RELATED_TO probabilistic-load-forecasts` (pass A only): dropped, pass B held.
+- `one-on-probabilistic-load-forecasts RELATED_TO lowland-data-days` (pass B only): kept, pass B held.
+- `one-on-probabilistic-load-forecasts RELATED_TO probabilistic-load-forecasts` (pass B only): kept, pass B held.
+- `user EXPERIENCED lowland-data-days` (pass A only): kept, pass A held.
+- `user EXPERIENCED one-on-probabilistic-load-forecasts` (pass B only): kept, pass B held.
+- Entities: the talk's id is the item's own phrase (N1, Event rule), so no alternative is listed: N1 lists one only where neither id is the utterance's phrase.
+
+### sel-104-list-plus-repeating-week (F1 0.75)
+
+- Ruling: N1 as in the river outing: 'on the polder roads' scopes the habit, so the shorter run names it.
+- `user HAS_HABIT long-ride` (pass A only): kept, pass A held.
+- `user HAS_HABIT long-ride-on-the-polder-roads` (pass B only): dropped, pass A held.
+- Entities: a habit is a recurring activity, a Concept (A), as Example 24's habit is.
+
+### sel-115-multi-grid-scientist-utrecht (F1 0.75)
+
+- Ruling: N1 and N4: 'Gridcast' only modifies 'forecast' here, and what the user owns is the forecast, so its id is the whole phrase.
+- `user WORKS_ON gridcast` (pass A only): dropped, pass B held.
+- `user WORKS_ON gridcast-forecast` (pass B only): kept, pass B held.
+
+### sel-118-list-dash-game-made-with (F1 0.77)
+
+- Ruling: N1: 'the sea and the wind' names two things, each its own entity with its article dropped, so the purpose gives two USED_FOR edges.
+- `fmod USED_FOR sea` (pass B only): kept, pass B held.
+- `fmod USED_FOR sea-and-the-wind` (pass A only): dropped, pass B held.
+- `fmod USED_FOR wind` (pass B only): kept, pass B held.
+
+### sel-119-list-dash-systems-i-wrote (F1 0.92)
+
+- Ruling: The mixer blends rain into fog, acting on both, so each is a target of OPERATES_ON (its gloss: acts upon or manipulates).
+- `weather-mixer OPERATES_ON fog` (pass B only): kept, pass B held.
+
+### sel-120-list-dash-day-off-genres (F1 0.67)
+
+- Ruling: N14: the lead-in's kind noun gives each item IS_A, flagged beyond the prompt, as in the trusted-methods list.
+- `anything-with-a-fishing-minigame IS_A genre` (pass B only): kept, pass B held.
+- `city-builders IS_A genre` (pass B only): kept, pass B held.
+- `roguelike-deckbuilders IS_A genre` (pass B only): kept, pass B held.
+
+### sel-122-list-ref-second-engine (F1 0.86)
+
+- Ruling: The engines were weighed for the game, and the second was picked and is still the engine ('never looked back'), so the game is built with it (IMPLEMENTED_WITH) beside the user's USES.
+- `tidewrack IMPLEMENTED_WITH godot` (pass B only): kept, pass B held.
+- `godot IS_A engine` attributes differ: settled by the attribute policy in the method section.
+
+### sel-124-list-ref-first-art-tool (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A edges are beyond the prompt, and the use is dated.
+- `aseprite IS_A art-tool` attributes differ: the IS_A edges are flagged beyond the prompt (N14), and 'last week' resolves to 2026-06 at the precision a week allows, valid_from on the use (Date entities), pass B held.
+- `krita IS_A art-tool` attributes differ: the IS_A edges are flagged beyond the prompt (N14), and 'last week' resolves to 2026-06 at the precision a week allows, valid_from on the use (Date entities), pass B held.
+- `pixelorama IS_A art-tool` attributes differ: the IS_A edges are flagged beyond the prompt (N14), and 'last week' resolves to 2026-06 at the precision a week allows, valid_from on the use (Date entities), pass B held.
+- `user USES aseprite` attributes differ: the IS_A edges are flagged beyond the prompt (N14), and 'last week' resolves to 2026-06 at the precision a week allows, valid_from on the use (Date entities), pass B held.
+
 ## Totals
 
-- Probes with a difference adjudicated: 42; still to adjudicate: 97.
-- Relations the passes differed on, adjudicated: 121.
-- Probes adjudicated whole (F1 under 0.61): 17.
-- Outcomes: pass A held 44, pass B held 77, neither held 0.
-- Shared relations whose attributes differed: 9.
+- Probes with a difference adjudicated: 61; still to adjudicate: 78.
+- Relations the passes differed on, adjudicated: 165.
+- Probes adjudicated whole (F1 under 0.61): 21.
+- Outcomes: pass A held 62, pass B held 103, neither held 0.
+- Shared relations whose attributes differed: 20.
