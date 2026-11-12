@@ -151,8 +151,12 @@ class StageCaps:
 # medium extract cap sits above the longest extract call that stopped on its
 # own at high effort (28,916 tokens) and cuts a runaway call a third sooner than
 # the 49,152 that run used. High takes medium's caps; no run has measured them
-# at high. Derive keeps 400 at every effort because the adapters send derive at
-# low effort under every setting (`GptOssAdapter.stage_effort`).
+# at high. Scope and derive keep low's caps (96 and 400) at every effort:
+# `effective_cap` sizes a stage by the effort the adapter sends it, and the
+# adapters send both at low under every setting (`GptOssAdapter.stage_effort`),
+# so the medium and high scope entries below are never sent. Scope is a
+# classification, sent at low as one; derive stays at low because no effort run
+# calls it, so derive above low would ship unmeasured.
 STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
     {
         "low": StageCaps(
