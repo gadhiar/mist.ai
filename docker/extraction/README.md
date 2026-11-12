@@ -415,15 +415,15 @@ left going. The dispatcher counts the timeout as a failed attempt, and its
 retry sends a fresh `job_id` (`backend/extraction_backlog/dispatcher.py`),
 which starts a run of its own on llama-server's single slot
 (`LLAMA_ARG_N_PARALLEL=1`); the turn may be dead-lettered after
-`MIST_EXTRACTION_MAX_ATTEMPTS`. Whether llama-server b11151 stops
-generating as soon as the stream closes is not measured here.
+`MIST_EXTRACTION_MAX_ATTEMPTS`. The `extraction call:` lines show how close a
+turn comes. Whether llama-server b11151 stops generating as soon as the
+stream closes is not measured here.
 
 **Cancelling a job.** `POST /v1/jobs/<job_id>/cancel` cancels the job's run
 if one is in flight and answers 200 with a `CancelResponse` whose `status`
 is `cancelled`, `finished` or `unknown`; every request waiting on a
 cancelled run gets HTTP 499 with `ErrorCode.CANCELLED`, nothing is stored,
-and the same `job_id` runs again when it is sent again. The `extraction call:` lines show how close a
-turn comes.
+and the same `job_id` runs again when it is sent again.
 
 Per-call token counts (operations note)
 ---------------------------------------
