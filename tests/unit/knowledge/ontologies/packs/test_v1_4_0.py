@@ -645,7 +645,10 @@ _GUIDE_LINES_SHA256 = "5e428caba6e710eadab0b29c6e999056750ce4c97272f9ac79e9030f9
 _ONTOLOGY_RULES = ("N2", "N3", "N5", "N7", "N8", "N10", "N11", "N12", "N13", "N14", "N16", "N17")
 _GENERIC_RULES = ("N1", "N4", "N6", "N15")
 _ONTOLOGY_HEADINGS = (
+    "### The user anchor",
+    "### Durable third-party facts",
     "### Event and metric ids",
+    "### The Abstraction fallback",
     "### Date entities",
     "### Habits and incidental scope",
 )

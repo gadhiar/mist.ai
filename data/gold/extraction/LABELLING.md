@@ -128,52 +128,6 @@ score shows what extraction misses. In dev-lists, the six edges H8 added under s
   ho-095 and ho-188. N4 still covers a team name that only modifies another name and places no
   one in it; a team that places someone is N17's.
 
-### The user anchor
-
-When the user is the subject of a fact, the probe carries the entity `{"id": "user", "type":
-"User"}` and the user-sourced anchor edge for that fact (prompt Rule 1, `prompts.py:49`; design
-note lines 95-106; changelog lines 32-33, which restore the `user` entity and the
-`user -[KNOWS_PERSON]-> anjali` anchor on ext-29). Edges between other entities sit beside the
-anchor, not in place of it (`rust -[USED_FOR]-> backend-work` in ext-01).
-
-The `user` entity appears only when some edge uses it. ext-05, ext-12, ext-24 and ext-41 state
-no user fact and carry no `user` entity. The `User` type is a singleton
-(`v1_0_0.py:421-425`), so the id is always `user`.
-
-MIST-scope facts use `{"id": "mist-identity", "type": "MistIdentity"}` as the subject, with
-`USES`, `IMPLEMENTED_WITH`, `MIST_HAS_CAPABILITY`, `MIST_HAS_TRAIT` or `MIST_HAS_PREFERENCE`
-(prompt lines 34 and 43; Rule 1, `prompts.py:49`; Examples 3, 4 and 6, `prompts.py:87-109`).
-When one utterance states a MIST fact and a user fact, each fact keeps its own subject: never
-move a MIST fact onto `user` or a user fact onto `mist-identity`. Naming MIST does not make it
-the subject (`ho-174`).
-
-### Durable third-party facts
-
-When the user states a durable fact about another person, label both the anchor
-`user -[KNOWS_PERSON]-> <person>` and the person's own fact with the person as source (prompt
-Rule 19, `prompts.py:67`; changelog line 17 and lines 32-35, which add `anjali -[WORKS_AT]-> biotech`
-to ext-29). A recommendation is such a fact: `<person> -[RECOMMENDS]-> <thing>` plus the
-anchor (prompt Rule 17, `prompts.py:65`; ext-08, ext-31 and ext-32, audited at changelog
-lines 18, 20 and 21).
-
-An incidental encounter is not a durable fact. "I had coffee with my old manager Devin" gets
-the anchor only, with no Event for the coffee (changelog lines 19 and 38).
-
-Third-party facts are never moved onto the user (prompt line 35). A person the user does not
-claim to know (a name mentioned in passing) gets no `KNOWS_PERSON` edge.
-
-### The Abstraction fallback
-
-An abstract noun takes the child type whose test clearly fits: Concept, Skill, Pattern,
-Strategy, Mechanism, Convention or DataStructure (the abstract-type tests, `prompts.py:19-27`;
-Rule 14, `prompts.py:62`). Only when no child's test clearly wins does it take `Abstraction`:
-never pick between two siblings that fit equally well (Rule 20, `prompts.py:68`; Example 26,
-`prompts.py:225-229`; the type at `v1_0_0.py:833-842`). Abstraction became the supertype of
-the seven children in v1.4.0, the same taxonomy revision that retired Topic and Milestone
-(changelog lines 13-16). The 60-probe set has no `Abstraction` entity; the rule above is the
-prompt's and the ontology's. The held-out fill probes `ho-176` to `ho-178` were written to need
-the fallback.
-
 **N6 Type by its test.** A type is chosen by its type test, never to keep an edge. An edge the
 validator then refuses is dropped (Row schema). An entity left with no edge stays as an
 entity-only label when the utterance states something about it, as prompt Example 7 keeps
