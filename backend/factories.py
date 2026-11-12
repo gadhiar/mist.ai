@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from backend.vault import VaultFilewatcher, VaultWriter
     from backend.vault.invalidation_bus import InvalidationBus
     from backend.vault.sidecar_index import VaultSidecarIndex
-from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig, LLMConfig
+from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig, LLMConfig, LLMRole
 from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.deduplication import EntityDeduplicator
 from backend.knowledge.curation.graph_writer import CurationGraphWriter, RebuildStamps
@@ -194,6 +194,8 @@ def build_graph_store(
 def build_llm_provider(
     config: KnowledgeConfig,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+    *,
+    role: LLMRole | None = None,
 ) -> StreamingLLMProvider:
     """Create the LLM provider based on config.
 
@@ -205,6 +207,11 @@ def build_llm_provider(
             emits a `phase: "llm_call"` JSONL record. When the gate is False
             (or the logger is None) the concrete provider is returned directly
             with no wrapper overhead.
+        role: The caller's LLM role. The provider targets
+            `config.llm.endpoint(role)`: the role's own endpoint when its URL
+            variable is set, else `base_url` and `model`. None, as extraction
+            and curation pass, is always the base. The wrappers below apply to
+            a role's provider exactly as to the base.
 
     Returns:
         StreamingLLMProvider instance (LlamaServerProvider or OllamaProvider),
@@ -224,19 +231,20 @@ def build_llm_provider(
         backend/extraction_service` has no hits).
     """
     llm_config = config.llm
+    endpoint = llm_config.endpoint(role)
     if llm_config.backend == "llamacpp":
         from backend.llm.llama_server_provider import LlamaServerProvider
 
         provider: StreamingLLMProvider = LlamaServerProvider(
-            base_url=llm_config.base_url,
-            model=llm_config.model,
+            base_url=endpoint.base_url,
+            model=endpoint.model,
         )
     elif llm_config.backend == "ollama":
         from backend.llm.ollama_provider import OllamaProvider
 
         provider = OllamaProvider(
-            base_url=llm_config.base_url,
-            model=llm_config.model,
+            base_url=endpoint.base_url,
+            model=endpoint.model,
         )
     else:
         raise ValueError(f"Unknown LLM backend: {llm_config.backend}")
@@ -726,6 +734,8 @@ def build_conversation_handler(
     graph_store: GraphStore | None = None,
     vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
     with_extraction_dispatcher: bool = False,
+    *,
+    conversation_llm_provider: StreamingLLMProvider | None = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -759,9 +769,20 @@ def build_conversation_handler(
       `_on_vault_rebuild` listener so vault-change events evict stale
       `_mist_context_cache` entries. When None, no subscription is registered.
 
+    T39 (LLM roles): the base provider and the conversation's are split.
+    The extraction pipeline always gets the base (`llm_provider`, or one
+    built from `base_url` and `model`). The handler gets the conversation
+    role's, so a smaller conversation model on its own server never moves
+    extraction. With the role unset the handler gets the base object itself,
+    so both hold one provider, as before roles existed. Curation takes the
+    base from `voice_processor._llm_provider`, not from the handler
+    (`backend/server.py::_resolve_curation_dependencies`).
+
     Args:
         config: Knowledge subsystem configuration.
-        llm_provider: Optional pre-built LLM provider.
+        llm_provider: Optional pre-built base LLM provider, for the
+            extraction pipeline and, with no conversation role set, the
+            handler. The live server injects one built by `VoiceProcessor`.
         vault_writer: Optional pre-built VaultWriter. When None, one is
             constructed from config. Pass an explicit None-equivalent by
             disabling config.vault.enabled.
@@ -790,6 +811,11 @@ def build_conversation_handler(
             does not use this flag: its handler is built inside the
             VoiceProcessor chain, so `backend/server.py` attaches one after the
             fact via `ConversationHandler.attach_extraction_dispatcher`.
+        conversation_llm_provider: Optional pre-built provider for the
+            handler alone. When None, the handler gets
+            `build_llm_provider(config, role="conversation")` if the
+            conversation role is set in `config.llm.roles`, else the base
+            provider. The extraction pipeline never receives it.
     """
     from pathlib import Path
 
@@ -821,6 +847,14 @@ def build_conversation_handler(
     if gs is None:
         gs = build_graph_store(config)
     provider = llm_provider or build_llm_provider(config, debug_logger=debug_logger)
+    if conversation_llm_provider is not None:
+        handler_provider = conversation_llm_provider
+    elif "conversation" in config.llm.roles:
+        handler_provider = build_llm_provider(
+            config, debug_logger=debug_logger, role="conversation"
+        )
+    else:
+        handler_provider = provider
     pipeline = build_extraction_pipeline(
         config,
         graph_store=gs,
@@ -878,7 +912,7 @@ def build_conversation_handler(
         graph_store=gs,
         extraction_pipeline=pipeline,
         retriever=retriever,
-        llm_provider=provider,
+        llm_provider=handler_provider,
         conventions_loader=conventions_loader,
         tool_usage_tracker=tracker,
         debug_logger=debug_logger,

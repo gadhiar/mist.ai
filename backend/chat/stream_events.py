@@ -5,6 +5,9 @@ events. Token + Complete are the load-bearing pair emitted by v1; Thinking
 and Filler are extensibility hooks reserved for future iterations. WSEvent
 carries pre-formed FE-bound JSON payloads (tool_call_started, cards_summon,
 graph_subgraph, etc.) emitted mid-turn for ADR-017 observability.
+StateHint and HandOff are seams for a speaking state and for a slower route
+that continues the turn after a spoken acknowledgement; nothing emits them
+yet.
 
 Pattern motivated by Claude's per-turn shape: input goes in, the LLM
 executes whatever it needs (retrieval, tool calls, regen), tokens stream
@@ -97,3 +100,36 @@ class WSEvent(StreamEvent):
     """
 
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class StateHint(StreamEvent):
+    """The speaking state for the reply's following text, chosen upstream per turn.
+
+    A member of `backend.realtime.speech.SPEAKING_STATES`; "neutral" returns to the default.
+    The turn starts neutral, and a state never carries into the next turn.
+
+    This module names the vocabulary without importing the realtime package:
+    the voice turn controller checks the state, and reads one outside the
+    vocabulary as "neutral". No emitter exists yet.
+    """
+
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
+class HandOff(StreamEvent):
+    """A slower route continues this turn; speak `ack_text` now.
+
+    Yielded at most once, before any `Token`. `ack_text` is the start of the reply's
+    text: the continuation's `Token`s follow it in the same stream, and the turn's
+    `Complete.final_response` starts with it. A consumer must treat `ack_text` as the
+    text of a `Token` if it does not handle `HandOff` itself.
+
+    No emitter exists yet. Both drains in `backend/chat/knowledge_integration.py`
+    yield `Token` text and `WSEvent` payloads and nothing else from the stream,
+    so they would drop the acknowledgement; the change that adds an emitter
+    updates them.
+    """
+
+    ack_text: str
