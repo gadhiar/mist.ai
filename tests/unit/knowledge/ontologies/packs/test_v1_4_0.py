@@ -732,6 +732,8 @@ def registry_pack() -> Pack:
 # the pack declared them.
 _RULE_IDS = [
     "reserved-mist-identity",
+    "team-fan-out",
+    "team-part-of",
     "n1-exempt",
     "pre-canon-aliases",
     "technology-version",
@@ -914,7 +916,7 @@ class TestThePackStatesWhatTheOldModulesHeld:
         assert not hasattr(id_rails, name)
 
     def test_the_plug_ins_are_written_in_the_packs_own_module(self, file_pack: Pack):
-        assert [plugin.fn.__module__ for plugin in file_pack.plugins] == [pack_plugins.__name__] * 3
+        assert [plugin.fn.__module__ for plugin in file_pack.plugins] == [pack_plugins.__name__] * 4
         assert pack_plugins.ISO_DATE_RE is id_rails.ISO_DATE_RE
 
 
@@ -986,7 +988,7 @@ class TestThePinnedCases:
     """Each rule the rails run holds a row and the payload the pack turns it into."""
 
     def test_every_rule_the_rails_run_has_a_case(self):
-        assert len(_POST_LLM_RULES) == 7
+        assert len(_POST_LLM_RULES) == 9
         assert [
             rule.id
             for rule in pack_conventions.RULES
@@ -1046,7 +1048,7 @@ class TestThePinnedCases:
     def test_one_case_carries_what_the_manifest_states_without_a_rule(self):
         # A retired type, an unknown type and the user anchor are manifest data, so no
         # rule of their own can hold a case for them: the first id rule's case does.
-        case = pack_conventions.RULES[1].pinned_case
+        case = next(rule for rule in pack_conventions.RULES if rule.id == "n1-exempt").pinned_case
         manifest = pack_manifest.MANIFEST
         written = [entity["type"] for entity in case.entities]
         stored = {entity["id"]: entity for entity in case.expected_entities}

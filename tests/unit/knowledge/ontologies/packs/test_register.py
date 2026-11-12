@@ -880,6 +880,28 @@ def test_a_first_row_names_the_fragment_that_holds_its_prompt_rule(
     assert (rule, _LATE_RULES) in carriers(row.carrier).in_fragments
 
 
+@pytest.mark.parametrize(
+    ("convention", "rule_id", "kind"),
+    [
+        (_TEAM_EMPLOYER, "team-fan-out", "fan_out"),
+        (_TEAM_ACQUAINTANCE, "team-fan-out", "fan_out"),
+        (_TEAM_PART_OF, "team-part-of", "edge_suppress"),
+    ],
+    ids=_FIRST_ROW_IDS[:3],
+)
+def test_a_team_row_names_the_relation_rail_that_carries_it(
+    v1_4_0: Pack, convention: str, rule_id: str, kind: str
+):
+    (row,) = (row for row in read_register(v1_4_0.labelling).rows if row.convention == convention)
+    (rule,) = (rule for rule in v1_4_0.rules if rule.id == rule_id)
+
+    # Plan v15's T51, Acceptance 7: the prompt rule stays the row's first carrier, and the
+    # rail that stores the edge after the model is named beside it.
+    assert carriers(row.carrier).ids == (_LATE_RULES, rule_id)
+    assert rule.kind == kind
+    assert row.classes == f"{PROMPT_RULE} and relation rail"
+
+
 def test_the_labels_of_the_v1_4_0_guide_are_its_twelve_rules_and_six_sections(v1_4_0: Pack):
     assert read_register(v1_4_0.labelling).labels == (
         "N2",

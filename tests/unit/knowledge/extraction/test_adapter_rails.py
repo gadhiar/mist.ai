@@ -76,7 +76,12 @@ def test_the_active_packs_own_pinned_cases_hold():
     assert check_pinned_cases(registry.active_pack()) == []
 
 
-def test_the_synthetic_payload_fires_every_rule_of_the_active_pack():
+def test_the_synthetic_payload_reproduces_the_old_id_rails_and_the_pack_kinds_are_pinned():
+    """The payload stores what the old id rails stored, and the active pack's kinds are pinned.
+
+    The payload was written for the old id rails, so it does not fire the kinds the team
+    rules added; their own pinned cases cover those.
+    """
     pack = registry.active_pack()
     post_llm = {rule.kind for rule in pack.rules if rule.phase != "pre_llm"}
 
@@ -86,6 +91,8 @@ def test_the_synthetic_payload_fires_every_rule_of_the_active_pack():
         "alias_vocabulary",
         "typed_id",
         "derived_edge",
+        "fan_out",
+        "edge_suppress",
     }
     stored = {entity["id"] for entity in every_rail_payload.EXPECTED_ENTITIES}
     assert {"mist-identity", "c-plus-plus", "quillscript", "nodejs", "kubernetes"} <= stored
