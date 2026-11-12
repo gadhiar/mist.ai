@@ -282,7 +282,7 @@ extending the sets and the relabel log.
 
 | Convention | Carrier | Class |
 |---|---|---|
-| Row schema | Rules 2 and 3 of the active pack, Rule 9 of the engine core, and `backend.knowledge.extraction.validator.ExtractionValidator.validate` | prompt rule and engine rule |
+| Row schema | Rules 2 and 3 of the active pack, Rule 9 of the engine core, `backend.knowledge.extraction.id_rails.stored_entity_id` and `backend.knowledge.extraction.validator.ExtractionValidator.validate` | prompt rule and engine rule |
 | N1 Id surface | Rule 2 of the active pack, and `backend.knowledge.extraction.id_rails.n1_rail` | prompt rule and engine rule |
 | N15 An activity keeps its object | Rule 21 of the active pack | prompt rule |
 | N4 Name modifiers | Rule 23 of the active pack | prompt rule |

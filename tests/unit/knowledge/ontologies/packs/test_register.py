@@ -1230,6 +1230,60 @@ def test_a_v1_4_0_register_that_does_not_hold_fails(v1_4_0_copy, old: str, new: 
     assert problem in _registry_pack_problems(pack)
 
 
+# ---------------------------------------------------------------------------
+# Carriers of one clause of a row, which a check of the row's label cannot miss
+# ---------------------------------------------------------------------------
+
+_STORED_ID = "backend.knowledge.extraction.id_rails.stored_entity_id"
+_RESOLVE = "backend.knowledge.extraction.temporal.TemporalResolver.resolve"
+
+
+def _row(guide: str, key: str) -> Row:
+    """The one row of `guide`'s register under `key`."""
+    (row,) = (row for row in read_register(guide).rows if row.key == key)
+    return row
+
+
+def test_the_row_schema_rows_name_what_carries_an_id_as_the_loader_leaves_it(v1_4_0: Pack):
+    # The row schema writes an id as the loader leaves it (N9). The scorer's loader passes
+    # each gold id through `stored_entity_id`, which runs the pack's id rules, and the two
+    # alias vocabularies are the ones of those rules no other row names.
+    in_the_guide = carriers(_row(_GUIDE.read_text(encoding="utf-8"), "Row schema").carrier)
+    in_the_pack = carriers(_row(v1_4_0.labelling, "Row schema").carrier)
+
+    assert _STORED_ID in in_the_guide.functions
+    assert engine_function(_STORED_ID) is not None
+    assert {"pre-canon-aliases", "static-aliases"} <= set(in_the_pack.ids)
+
+
+def test_the_row_schema_row_names_the_fragment_that_lists_the_extractable_sets(v1_4_0: Pack):
+    assert "prompt-constraints" in carriers(_row(v1_4_0.labelling, "Row schema").carrier).ids
+
+
+def test_the_n6_row_names_the_rule_that_holds_the_example_it_cites(v1_4_0: Pack):
+    (examples,) = (rule for rule in v1_4_0.rules if rule.id == "prompt-examples")
+
+    # N6 keeps an entity with no edge "as prompt Example 7" does.
+    assert any("Example 7:" in example for example in examples.params.examples)
+    assert "prompt-examples" in carriers(_row(v1_4_0.labelling, "N6 Type by its test").carrier).ids
+
+
+def test_the_abstraction_fallback_row_names_both_rules_its_section_cites(v1_4_0: Pack):
+    named = carriers(_row(v1_4_0.labelling, "The Abstraction fallback").carrier)
+
+    assert named.in_fragments == (("14", _LATE_RULES), ("20", _LATE_RULES))
+
+
+def test_the_date_entities_row_names_the_resolver_of_the_stored_graph(v1_4_0: Pack):
+    row = _row(v1_4_0.labelling, "Date entities")
+
+    # Rule 5 tells the model to resolve a relative date, and the pipeline's resolver does
+    # it for what is stored. The row names both, so it holds of the graph and of a score.
+    assert carriers(row.carrier).engine_core == ("5",)
+    assert carriers(row.carrier).functions == (_RESOLVE,)
+    assert row.classes == f"{PROMPT_RULE} and {ENGINE_RULE}"
+
+
 def test_a_generic_row_fails_when_the_pack_does_not_list_it(v1_4_0_copy):
     pack = v1_4_0_copy(guide=_swap(f"{_N4_LISTING}\n", ""))
 

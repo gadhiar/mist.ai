@@ -277,11 +277,14 @@ for Y" is itself the fact and gets `USED_FOR` (Rule 18, `prompts.py:66`; ext-01,
 ## Register
 
 Each convention above, by its label, and what carries it in this pack: a prompt rule by its number
-and the id of the prompt fragment that holds it, any other rule by its id in `conventions.py`. The
-first four rows are the first rows of the extraction contract ADR's v14 amendment (ADR-054,
-2026-11-11), word for word. Each of them states its convention in full: a labeller applies the
+and the id of the prompt fragment that holds it, any other rule by its id in `conventions.py`.
+Beside a rule of the pack, a row may name a rule of the prompt's engine core by its number, or a
+rule of the engine by the name of its function. The first four rows are the first rows of the
+extraction contract ADR's v14 amendment (ADR-054, 2026-11-11): their Convention cells are the
+amendment's, word for word. Each of them states its convention in full: a labeller applies the
 row, never a rule's code, and where the row is narrower than a line above it, the row governs.
-The last seven rows list the generic conventions of the gold guide
+The row governs too where a line above says a convention is beyond the prompt and the row names a
+prompt rule that carries it. The last seven rows list the generic conventions of the gold guide
 (`data/gold/extraction/LABELLING.md`) that a rule of this pack carries, each under the key of its
 row in that guide's register.
 
@@ -303,16 +306,16 @@ row in that guide's register.
 | N3 Decisions | Rule 30 in `prompt-rules-11-to-37` | prompt rule |
 | N5 Stated places and organisations | Rule 31 in `prompt-rules-11-to-37` | prompt rule |
 | N13 Topic links | Rule 33 in `prompt-rules-11-to-37` | prompt rule |
-| The Abstraction fallback | Rule 20 in `prompt-rules-11-to-37`, and `prompt-constraints` | prompt rule |
+| The Abstraction fallback | Rules 14 and 20 in `prompt-rules-11-to-37`, and `prompt-constraints` | prompt rule |
 | N14 Kind nouns | Rule 25 in `prompt-rules-11-to-37` | prompt rule |
-| Date entities | Rules 13 and 16 in `prompt-rules-11-to-37`, and Rule 5 of the engine core | prompt rule |
+| Date entities | Rules 13 and 16 in `prompt-rules-11-to-37`, Rule 5 of the engine core, and `backend.knowledge.extraction.temporal.TemporalResolver.resolve` | prompt rule and engine rule |
 | N11 Goal windows | Rule 37 in `prompt-rules-11-to-37` | prompt rule |
 | N12 Flipped preferences | Rule 6 in `prompt-rule-6` | prompt rule |
 | Habits and incidental scope | Rules 17 and 18 in `prompt-rules-11-to-37` | prompt rule |
-| Row schema | Rules 2 and 3 in `prompt-rules-1-to-3`, `technology-version` and `metric-id` | prompt rule and id rail |
+| Row schema | Rules 2 and 3 in `prompt-rules-1-to-3`, `prompt-constraints`, `technology-version`, `metric-id`, `pre-canon-aliases` and `static-aliases` | prompt rule and id rail |
 | N1 Id surface | Rule 2 in `prompt-rules-1-to-3`, and `n1-exempt` | prompt rule and id rail |
 | N15 An activity keeps its object | Rule 21 in `prompt-rules-11-to-37` | prompt rule |
 | N4 Name modifiers | Rule 23 in `prompt-rules-11-to-37` | prompt rule |
-| N6 Type by its test | Rules 14 and 20 in `prompt-rules-11-to-37`, and `prompt-constraints` | prompt rule |
+| N6 Type by its test | Rules 14 and 20 in `prompt-rules-11-to-37`, `prompt-constraints` and `prompt-examples` | prompt rule |
 | Assertion kinds | Rule 6 in `prompt-rule-6` | prompt rule |
 | List-shaped probes (new) | Rule 29 in `prompt-rules-11-to-37` | prompt rule |
