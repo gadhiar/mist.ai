@@ -10,6 +10,7 @@ deterministic: the same input or seed gives the same output, run after run.
 import ast
 import dataclasses
 import inspect
+import logging
 import math
 import threading
 from collections.abc import Mapping
@@ -20,10 +21,12 @@ import numpy as np
 import pytest
 
 from backend.realtime import speech
-from backend.realtime.errors import RealtimeError
+from backend.realtime.errors import RealtimeError, SpeechEngineError
 from backend.realtime.lanes import LaneJobCancelled
-from backend.realtime.protocol import Spotter
+from backend.realtime.protocol import Spotter, TtsVoice
 from backend.realtime.speech import (
+    NEUTRAL_STATE,
+    SPEAKING_STATES,
     CancelToken,
     NameHit,
     SpotterCalibration,
@@ -94,16 +97,39 @@ class TestValueTypes:
         assert update.no_speech_prob is None
         assert update.avg_logprob is None
 
-    def test_text_segment_and_synth_chunk_fields_match_the_design_doc(self):
-        assert _fields(TextSegment) == [("text", str), ("start_char", int), ("end_char", int)]
+    def test_text_segment_and_synth_chunk_fields_match_the_interfaces(self):
+        assert _fields(TextSegment) == [
+            ("text", str),
+            ("start_char", int),
+            ("end_char", int),
+            ("state", str),
+        ]
         assert _fields(SynthChunk) == [
             ("pcm16", bytes),
             ("samples", int),
             ("segment", TextSegment),
+            ("state", str),
         ]
 
-    def test_voice_info_names_an_engine_a_stock_voice_and_the_profile(self):
+    def test_a_segment_built_without_a_state_is_neutral(self):
+        assert TextSegment("a", 0, 1).state == "neutral"
+
+    def test_a_positional_synth_chunk_still_constructs_and_is_neutral(self):
+        segment = TextSegment("a", 0, 1, "calm")
+
+        chunk = SynthChunk(b"\x00\x00", 1, segment)
+
+        assert chunk.state == NEUTRAL_STATE
+        assert chunk.segment.state == "calm"
+
+    def test_voice_info_names_an_engine_a_voice_identity_and_the_profile(self):
         assert _fields(VoiceInfo) == [("engine", str), ("voice", str), ("profile", str)]
+        assert "identity" in VoiceInfo.__doc__
+        assert "stock" not in VoiceInfo.__doc__
+
+    def test_the_tts_voice_wire_model_reports_the_voice_identity_id(self):
+        assert "identity" in TtsVoice.__doc__
+        assert "stock" not in TtsVoice.__doc__
 
     def test_the_cloned_voice_reference_is_gone(self):
         assert not hasattr(speech, "VoiceReference")
@@ -134,6 +160,35 @@ class TestValueTypes:
         assert speech.Phase == Literal["idle", "held", "thinking", "speaking", "text"]
 
 
+class TestSpeakingStates:
+    def test_the_vocabulary_is_exactly_the_five_states(self):
+        assert frozenset({"neutral", "calm", "awake", "sleepy", "excited"}) == SPEAKING_STATES
+        assert isinstance(SPEAKING_STATES, frozenset)
+
+    def test_neutral_is_the_fallback_and_in_the_vocabulary(self):
+        assert NEUTRAL_STATE == "neutral"
+        assert NEUTRAL_STATE in SPEAKING_STATES
+
+    def test_the_segment_and_synthesizer_docstrings_state_the_speaking_state_rules(self):
+        for doc in (TextSegment.__doc__, speech.SpeechSynthesizer.__doc__):
+            assert "neutral" in doc
+            assert "SPEAKING_STATES" in doc
+
+    @pytest.mark.parametrize(
+        "protocol",
+        [speech.SpeechSynthesizer, speech.StreamingTranscriber],
+        ids=lambda protocol: protocol.__name__,
+    )
+    def test_each_release_docstring_states_the_release_rules(self, protocol):
+        doc = protocol.release.__doc__
+
+        assert "second call does nothing" in doc
+        assert "SpeechEngineError" in doc
+
+    def test_the_module_docstring_keeps_the_placement_by_configuration_rule(self):
+        assert "by configuration alone" in speech.__doc__
+
+
 class TestProtocols:
     def test_vad_protocols_match_the_design_doc(self):
         assert _params(speech.VoiceActivityDetector.open_stream) == ["self"]
@@ -146,6 +201,7 @@ class TestProtocols:
     def test_transcriber_protocols_match_the_design_doc(self):
         assert speech.StreamingTranscriber.__annotations__ == {"model_id": str}
         assert _params(speech.StreamingTranscriber.open_stream) == ["self"]
+        assert _params(speech.StreamingTranscriber.release) == ["self"]
         assert _params(speech.TranscriptStream.push) == ["self", "pcm"]
         assert _params(speech.TranscriptStream.decode_partial) == ["self", "token"]
         assert _params(speech.TranscriptStream.decode_final) == ["self", "token"]
@@ -157,8 +213,25 @@ class TestProtocols:
             "engine_id": str,
             "sample_rate": int,
             "voice": VoiceInfo,
+            "states": frozenset[str],
         }
         assert _params(speech.SpeechSynthesizer.synthesize) == ["self", "segment", "token"]
+        assert (
+            _params(speech.SpeechSynthesizer.release)
+            == _params(speech.StreamingTranscriber.release)
+            == ["self"]
+        )
+
+    def test_the_fakes_match_the_engine_protocols(self):
+        synthesizer = FakeSynthesizer()
+        transcriber = ScriptedTranscriber([])
+
+        for name in speech.SpeechSynthesizer.__annotations__:
+            assert hasattr(synthesizer, name)
+        assert _params(FakeSynthesizer.synthesize) == ["self", "segment", "token"]
+        assert _params(FakeSynthesizer.release) == ["self"]
+        assert _params(ScriptedTranscriber.release) == ["self"]
+        assert hasattr(transcriber, "model_id")
 
     def test_name_spotter_protocols_match_the_interfaces(self):
         assert speech.NameSpotter.__annotations__ == {
@@ -427,6 +500,36 @@ class TestScriptedTranscriber:
         assert stream.pushed == [512, 256]
 
 
+class TestScriptedTranscriberRelease:
+    def test_release_is_counted_and_a_second_call_does_nothing_more(self):
+        transcriber = ScriptedTranscriber(["hi"])
+
+        transcriber.release()
+        transcriber.release()
+
+        assert transcriber.releases == 2
+        assert transcriber.streams == []
+
+    def test_open_stream_after_release_raises_speech_engine_error(self):
+        transcriber = ScriptedTranscriber(["hi"])
+        transcriber.release()
+
+        with pytest.raises(SpeechEngineError, match="released"):
+            transcriber.open_stream()
+
+        assert transcriber.streams == []
+
+    def test_release_can_be_told_to_raise_and_still_counts_as_released(self):
+        transcriber = ScriptedTranscriber(["hi"], release_error=SpeechEngineError("unload failed"))
+
+        with pytest.raises(SpeechEngineError, match="unload failed"):
+            transcriber.release()
+
+        assert transcriber.releases == 1
+        with pytest.raises(SpeechEngineError, match="released"):
+            transcriber.open_stream()
+
+
 class TestTranscriptStreamClose:
     """The owner closes a stream once; a release or a cut may close it under a running decode."""
 
@@ -580,24 +683,24 @@ class TestFakeSynthesizer:
 
         assert slept == [0.05] * len(chunks)
 
-    def test_defaults_are_the_fake_engine_and_its_stock_voice_and_both_are_settable(self):
+    def test_defaults_are_the_fake_engine_and_its_voice_identity_and_both_are_settable(self):
         synthesizer = FakeSynthesizer()
         defaults = (synthesizer.engine_id, synthesizer.voice, synthesizer.sample_rate)
-        other_voice = VoiceInfo("kokoro", "af_heart", "studio")
+        other_voice = VoiceInfo("pocket-clone", "test-voice", "studio")
 
-        synthesizer.engine_id = "kokoro"
+        synthesizer.engine_id = "pocket-clone"
         synthesizer.voice = other_voice
 
-        assert defaults == ("fake", VoiceInfo("fake", "stock", "mist"), 24000)
-        assert VoiceInfo("fake", "stock", "mist") == FAKE_VOICE
-        assert (synthesizer.engine_id, synthesizer.voice) == ("kokoro", other_voice)
+        assert defaults == ("fake", VoiceInfo("fake", "fake-voice", "mist"), 24000)
+        assert VoiceInfo("fake", "fake-voice", "mist") == FAKE_VOICE
+        assert (synthesizer.engine_id, synthesizer.voice) == ("pocket-clone", other_voice)
 
     def test_engine_id_and_voice_are_constructor_arguments(self):
-        voice = VoiceInfo("kokoro", "af_heart", "mist")
+        voice = VoiceInfo("pocket-clone", "test-voice", "mist")
 
-        synthesizer = FakeSynthesizer(engine_id="kokoro", voice=voice)
+        synthesizer = FakeSynthesizer(engine_id="pocket-clone", voice=voice)
 
-        assert (synthesizer.engine_id, synthesizer.voice) == ("kokoro", voice)
+        assert (synthesizer.engine_id, synthesizer.voice) == ("pocket-clone", voice)
 
     def test_records_every_requested_segment(self):
         synthesizer = FakeSynthesizer()
@@ -607,6 +710,117 @@ class TestFakeSynthesizer:
             list(synthesizer.synthesize(segment, CancelToken()))
 
         assert synthesizer.segments == segments
+
+
+FAKES_LOGGER = "tests.fakes.speech"
+
+
+def _voice(synthesizer: FakeSynthesizer, state: str) -> list[SynthChunk]:
+    return list(synthesizer.synthesize(TextSegment("x" * 10, 0, 10, state), CancelToken()))
+
+
+class TestFakeSynthesizerStates:
+    """The fake voices by the speaking-state rules every adapter follows."""
+
+    def test_states_default_to_neutral_only(self):
+        assert FakeSynthesizer().states == frozenset({"neutral"})
+
+    def test_a_supported_state_is_carried_on_every_chunk(self, caplog):
+        synthesizer = FakeSynthesizer(states=frozenset({"neutral", "calm"}))
+
+        with caplog.at_level(logging.DEBUG, logger=FAKES_LOGGER):
+            chunks = _voice(synthesizer, "calm")
+
+        assert chunks
+        assert all(chunk.state == "calm" for chunk in chunks)
+        assert caplog.records == []
+
+    def test_a_segment_without_a_state_is_voiced_neutral(self):
+        chunks = list(FakeSynthesizer().synthesize(TextSegment("hello", 0, 5), CancelToken()))
+
+        assert chunks
+        assert all(chunk.state == "neutral" for chunk in chunks)
+
+    def test_an_unvoiced_state_in_the_vocabulary_falls_back_to_neutral_with_one_info(self, caplog):
+        synthesizer = FakeSynthesizer()
+
+        with caplog.at_level(logging.DEBUG, logger=FAKES_LOGGER):
+            chunks = _voice(synthesizer, "sleepy")
+
+        assert chunks
+        assert all(chunk.state == "neutral" for chunk in chunks)
+        assert all(chunk.segment.state == "sleepy" for chunk in chunks)
+        assert [record.levelno for record in caplog.records] == [logging.INFO]
+        message = caplog.records[0].getMessage()
+        assert "fake" in message and "fake-voice" in message and "sleepy" in message
+
+    def test_a_state_outside_the_vocabulary_falls_back_to_neutral_with_one_warning(self, caplog):
+        synthesizer = FakeSynthesizer(states=frozenset({"neutral", "calm"}))
+
+        with caplog.at_level(logging.DEBUG, logger=FAKES_LOGGER):
+            chunks = _voice(synthesizer, "furious")
+
+        assert chunks
+        assert all(chunk.state == "neutral" for chunk in chunks)
+        assert [record.levelno for record in caplog.records] == [logging.WARNING]
+        assert "furious" in caplog.records[0].getMessage()
+
+    def test_a_repeated_fallback_logs_nothing_more(self, caplog):
+        synthesizer = FakeSynthesizer()
+
+        with caplog.at_level(logging.DEBUG, logger=FAKES_LOGGER):
+            for state in ("sleepy", "furious", "sleepy", "furious", "sleepy"):
+                _voice(synthesizer, state)
+
+        assert [record.levelno for record in caplog.records] == [logging.INFO, logging.WARNING]
+
+    def test_a_fallback_log_never_holds_the_segment_text(self, caplog):
+        synthesizer = FakeSynthesizer()
+        text = "test line zebra quartz"
+
+        with caplog.at_level(logging.DEBUG, logger=FAKES_LOGGER):
+            list(synthesizer.synthesize(TextSegment(text, 0, len(text), "awake"), CancelToken()))
+
+        assert caplog.records
+        assert all("zebra quartz" not in record.getMessage() for record in caplog.records)
+
+    def test_the_segment_is_recorded_with_its_requested_state(self):
+        synthesizer = FakeSynthesizer()
+        segment = TextSegment("hello", 0, 5, "excited")
+
+        list(synthesizer.synthesize(segment, CancelToken()))
+
+        assert synthesizer.segments == [segment]
+
+
+class TestFakeSynthesizerRelease:
+    def test_release_is_counted_and_a_second_call_does_nothing_more(self):
+        synthesizer = FakeSynthesizer()
+
+        synthesizer.release()
+        synthesizer.release()
+
+        assert synthesizer.releases == 2
+        assert synthesizer.segments == []
+
+    def test_synthesize_after_release_raises_speech_engine_error(self):
+        synthesizer = FakeSynthesizer()
+        synthesizer.release()
+
+        with pytest.raises(SpeechEngineError, match="released"):
+            synthesizer.synthesize(TextSegment("hello", 0, 5), CancelToken())
+
+        assert synthesizer.segments == []
+
+    def test_release_can_be_told_to_raise_and_still_counts_as_released(self):
+        synthesizer = FakeSynthesizer(release_error=SpeechEngineError("unload failed"))
+
+        with pytest.raises(SpeechEngineError, match="unload failed"):
+            synthesizer.release()
+
+        assert synthesizer.releases == 1
+        with pytest.raises(SpeechEngineError, match="released"):
+            synthesizer.synthesize(TextSegment("hello", 0, 5), CancelToken())
 
 
 FRAME = bytes(640)

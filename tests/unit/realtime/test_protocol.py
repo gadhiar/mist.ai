@@ -1365,7 +1365,7 @@ def test_engine_location_keeps_the_local_values(location):
 
 
 def test_tts_voice_takes_exactly_engine_voice_and_profile():
-    """A stock voice has no reference audio, so its provenance fields are gone."""
+    """`voice` is the voice identity id; its audio is private, so no provenance fields."""
     assert set(TtsVoice.model_fields) == {"engine", "voice", "profile"}
     message = _vector_message(SERVER_VECTORS, "voice_state")
     sent = json.loads(json.dumps(message))

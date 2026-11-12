@@ -22,6 +22,17 @@ from .protocol import Spotter
 Phase = Literal["idle", "held", "thinking", "speaking", "text"]
 """The turn controller's phase, which the barge-in policy reads to judge user speech."""
 
+NEUTRAL_STATE = "neutral"
+"""The speaking state every segment has by default and every engine voices."""
+
+SPEAKING_STATES: frozenset[str] = frozenset({"neutral", "calm", "awake", "sleepy", "excited"})
+"""The speaking-state vocabulary every chooser, identity and adapter shares (Raj, 12 Nov).
+
+It lives in the realtime contract so that the chooser upstream, the identity manifest
+(`voice_assets.py`) and every adapter use one set of names. Adding a state is one entry here
+plus, for an engine that voices it from a clip, one clip in the identity.
+"""
+
 
 class CancelToken:
     """A one-way flag a turn sets to stop the engine work it started.
@@ -49,9 +60,10 @@ class CancelToken:
 class VoiceInfo:
     """The voice a synthesizer speaks with, as reported to clients and logs.
 
-    MIST speaks one of the engine's stock voices, not a cloned one, so the report names the
-    engine (its id as `speech_arms.json` names it), the stock voice and the voice profile
-    (`VoiceSettings.profile`) the voice was chosen for.
+    MIST speaks her own voice identity (`voice_assets.VoiceIdentity`) through whichever engine
+    the TTS chain loaded, so the report names the engine (its id as the TTS chain names it, for
+    example `pocket-clone`), the voice identity id (`VoiceIdentity.voice_id`, for example
+    `mist-v1`) and the voice profile (`VoiceSettings.profile`, `mist` by default).
     """
 
     engine: str
@@ -65,20 +77,32 @@ class TextSegment:
 
     The character offsets locate the segment in the turn's generated text, which is how the
     playback ledger maps played audio back to the spoken prefix.
+
+    `state` is the speaking state requested for this segment, a member of `SPEAKING_STATES`. A
+    segment built without one is `neutral` (`NEUTRAL_STATE`), so every `TextSegment(text, start,
+    end)` keeps its meaning. The request is not a promise: an engine that does not voice the
+    state voices `neutral` instead (the rules are on `SpeechSynthesizer`), and the chunk's own
+    `state` says which was voiced.
     """
 
     text: str
     start_char: int
     end_char: int
+    state: str = NEUTRAL_STATE
 
 
 @dataclass(frozen=True, slots=True)
 class SynthChunk:
-    """A piece of synthesized audio and the segment it voices."""
+    """A piece of synthesized audio and the segment it voices.
+
+    `state` is the speaking state the audio was voiced in, after any fallback to `neutral`, so
+    it can differ from `segment.state`.
+    """
 
     pcm16: bytes
     samples: int
     segment: TextSegment
+    state: str = NEUTRAL_STATE
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,22 +187,61 @@ class StreamingTranscriber(Protocol):
         """Open a stream for a new utterance."""
         ...
 
+    def release(self) -> None:
+        """Free what the engine holds; a second call does nothing.
+
+        This is the one hook a GPU release needs from an engine. The runtime calls it on the
+        lane thread after the engine's jobs have stopped, and drops the engine after it returns.
+        An in-process adapter drops its model references here, and the runtime then empties the
+        CUDA cache; an adapter that proxies to a sidecar asks the sidecar to unload, so an
+        engine in its own container frees its memory too. A `release` that raises is logged at
+        ERROR with the engine id and no text, and the drop goes on. After `release`, any call
+        but `release` raises `SpeechEngineError`.
+        """
+        ...
+
 
 class SpeechSynthesizer(Protocol):
-    """A TTS engine speaking one stock voice, chosen when the adapter is built.
+    """A TTS engine speaking MIST's voice identity, chosen when the adapter is built.
 
-    `engine_id` is the engine's id (`PlacementConfig.tts_engine`) and `voice` the stock voice it
-    speaks. `sample_rate` is the rate of the audio the adapter yields: 24000 whatever the
-    engine's own rate, which the adapter converts from.
+    `engine_id` is the engine's id (`PlacementConfig.tts_engine`) and `voice` reports the voice
+    identity it speaks. `sample_rate` is the rate of the audio the adapter yields: 24000
+    whatever the engine's own rate, which the adapter converts from.
+
+    Speaking states. `states` holds the states the engine voices distinctly: always
+    `NEUTRAL_STATE`, and nothing outside `SPEAKING_STATES`; an engine with no per-state control
+    declares `frozenset({"neutral"})`. `synthesize` reads `segment.state`:
+
+    - A state in `states` is voiced with the adapter's own control for it (Pocket: the voice
+      state computed from the identity's clip for that state), and every chunk carries it.
+    - Any other state is voiced as `neutral`, and every chunk carries `neutral`. It never
+      raises. The first such request per adapter and state logs one line naming the engine,
+      the identity and the state: INFO for a state in `SPEAKING_STATES` the engine does not
+      voice, WARNING for a state outside the vocabulary.
+    - No log line from an adapter holds segment text, a transcript or audio.
     """
 
     model_id: str
     engine_id: str
     sample_rate: int
     voice: VoiceInfo
+    states: frozenset[str]
 
     def synthesize(self, segment: TextSegment, token: CancelToken) -> Iterator[SynthChunk]:
-        """Synthesize one segment, checking the token before each chunk."""
+        """Synthesize one segment in its speaking state, checking the token before each chunk."""
+        ...
+
+    def release(self) -> None:
+        """Free what the engine holds; a second call does nothing.
+
+        This is the one hook a GPU release needs from an engine. The runtime calls it on the
+        lane thread after the engine's jobs have stopped, and drops the engine after it returns.
+        An in-process adapter drops its model references here, and the runtime then empties the
+        CUDA cache; an adapter that proxies to a sidecar asks the sidecar to unload, so an
+        engine in its own container frees its memory too. A `release` that raises is logged at
+        ERROR with the engine id and no text, and the drop goes on. After `release`, any call
+        but `release` raises `SpeechEngineError`.
+        """
         ...
 
 

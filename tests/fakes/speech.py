@@ -2,11 +2,15 @@
 
 Every realtime test runs against these instead of real models: `EnergyVad` scores loudness,
 `ScriptedTranscriber` returns scripted text, `ScriptedTurnEnd` returns scripted probabilities,
-`FakeSynthesizer` emits tones and `ScriptedNameSpotter` hears the names where a test scripts them. Each records what it was given, so a test asserts on what reached
-the engine, and none depends on time or randomness. The classes are plain and unslotted so a
-test can subclass or wrap one to observe or delay a call.
+`FakeSynthesizer` emits tones and `ScriptedNameSpotter` hears the names where a test scripts
+them. Each records what it was given, so a test asserts on what reached the engine, and none
+depends on time or randomness. The classes are plain and unslotted so a test can subclass or
+wrap one to observe or delay a call. The synthesizer and the transcriber follow the engine
+release rules (`speech.py`): they count `release()` calls, can be told to raise from one, and
+refuse every other call after it with `SpeechEngineError`.
 """
 
+import logging
 import math
 import time
 import zlib
@@ -15,10 +19,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from backend.realtime.errors import RealtimeError
+from backend.realtime.errors import RealtimeError, SpeechEngineError
 from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.protocol import Spotter
 from backend.realtime.speech import (
+    NEUTRAL_STATE,
+    SPEAKING_STATES,
     CancelToken,
     NameHit,
     SpotterCalibration,
@@ -28,10 +34,12 @@ from backend.realtime.speech import (
     VoiceInfo,
 )
 
+logger = logging.getLogger(__name__)
+
 STT_SAMPLE_RATE = 16000
 TTS_SAMPLE_RATE = 24000
 
-FAKE_VOICE = VoiceInfo(engine="fake", voice="stock", profile="mist")
+FAKE_VOICE = VoiceInfo(engine="fake", voice="fake-voice", profile="mist")
 
 
 class EnergyVadStream:
@@ -178,17 +186,28 @@ class ScriptedTranscriber:
         model_id: str = "scripted-stt",
         ms_per_word: int = 200,
         on_decode: Callable[[], object] | None = None,
+        release_error: BaseException | None = None,
     ) -> None:
         self.model_id = model_id
         self.ms_per_word = ms_per_word
         self.on_decode = on_decode
+        self.release_error = release_error
         self.script = [
             item if isinstance(item, ScriptedUtterance) else ScriptedUtterance(item)
             for item in script
         ]
         self.streams: list[ScriptedTranscriptStream] = []
+        self.releases = 0
+
+    def release(self) -> None:
+        """Count the call; the transcriber is released even when told to raise."""
+        self.releases += 1
+        if self.release_error is not None:
+            raise self.release_error
 
     def open_stream(self) -> ScriptedTranscriptStream:
+        if self.releases:
+            raise SpeechEngineError(f"transcriber {self.model_id!r} is released")
         index = len(self.streams)
         utterance = self.script[index] if index < len(self.script) else ScriptedUtterance("")
         stream = ScriptedTranscriptStream(
@@ -220,6 +239,12 @@ class FakeSynthesizer:
     segment is identical on every run. Audio is split into chunks of at most `chunk_ms`; before
     each chunk the token is checked, `sleep(chunk_delay_s)` stands in for inference time, and the
     token is checked again, so a cancel lands between chunks as it does with a real engine.
+
+    It voices by the speaking-state rules every adapter follows (`SpeechSynthesizer`): a state
+    in `states` is carried on every chunk; any other is voiced `neutral`, with one log record
+    per state, INFO inside the vocabulary and WARNING outside it. The tone does not change with
+    the state, since only the chunk's `state` is under test. A call is recorded when it is made,
+    not when its chunks are first read.
     """
 
     def __init__(
@@ -228,24 +253,60 @@ class FakeSynthesizer:
         model_id: str = "fake-tts",
         engine_id: str = "fake",
         voice: VoiceInfo = FAKE_VOICE,
+        states: frozenset[str] = frozenset({NEUTRAL_STATE}),
         sample_rate: int = TTS_SAMPLE_RATE,
         ms_per_char: int = 50,
         chunk_ms: int = 200,
         chunk_delay_s: float = 0.0,
         sleep: Callable[[float], object] = time.sleep,
+        release_error: BaseException | None = None,
     ) -> None:
+        if NEUTRAL_STATE not in states or not states <= SPEAKING_STATES:
+            raise ValueError("FakeSynthesizer: states must hold neutral and only known states")
         self.model_id = model_id
         self.engine_id = engine_id
         self.voice = voice
+        self.states = states
         self.sample_rate = sample_rate
         self.ms_per_char = ms_per_char
         self.chunk_ms = chunk_ms
         self.chunk_delay_s = chunk_delay_s
         self.sleep = sleep
+        self.release_error = release_error
         self.segments: list[TextSegment] = []
+        self.releases = 0
+        self._fallbacks_logged: set[str] = set()
+
+    def release(self) -> None:
+        """Count the call; the synthesizer is released even when told to raise."""
+        self.releases += 1
+        if self.release_error is not None:
+            raise self.release_error
 
     def synthesize(self, segment: TextSegment, token: CancelToken) -> Iterator[SynthChunk]:
+        if self.releases:
+            raise SpeechEngineError(f"synthesizer {self.engine_id!r} is released")
         self.segments.append(segment)
+        return self._chunks(segment, self._voiced_state(segment.state), token)
+
+    def _voiced_state(self, requested: str) -> str:
+        if requested in self.states:
+            return requested
+        if requested not in self._fallbacks_logged:
+            self._fallbacks_logged.add(requested)
+            known = requested in SPEAKING_STATES
+            logger.log(
+                logging.INFO if known else logging.WARNING,
+                "TTS engine %r (voice %r) does not voice %s state %r; voicing %r",
+                self.engine_id,
+                self.voice.voice,
+                "the" if known else "the unknown",
+                requested,
+                NEUTRAL_STATE,
+            )
+        return NEUTRAL_STATE
+
+    def _chunks(self, segment: TextSegment, state: str, token: CancelToken) -> Iterator[SynthChunk]:
         total = len(segment.text) * self.ms_per_char * self.sample_rate // 1000
         per_chunk = self.chunk_ms * self.sample_rate // 1000
         frequency = 200 + zlib.crc32(segment.text.encode("utf-8")) % 400
@@ -260,7 +321,7 @@ class FakeSynthesizer:
             t = np.arange(start, start + count) / self.sample_rate
             tone = 0.3 * np.sin(2 * math.pi * frequency * t)
             pcm16 = (tone * 32767).astype("<i2").tobytes()
-            yield SynthChunk(pcm16=pcm16, samples=count, segment=segment)
+            yield SynthChunk(pcm16=pcm16, samples=count, segment=segment, state=state)
 
 
 class ScriptedNameSpotterStream:
