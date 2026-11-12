@@ -13,9 +13,10 @@ older server), and a `[WARN]` line names every result stamped with a different o
 
 Nothing is re-implemented:
 - Corpus and scoring: `scripts.eval_harness.score_extraction_run` (`iter_gold_probes`,
-  `parse_produced`, `score_run`, `_norm_ws`). The service's payload
+  `produced_from_response`, `score_run`, `_norm_ws`). The service's payload
   `{"entities": [...], "relationships": [...]}` has the shape of the raw extraction
-  LLM JSON, so `parse_produced(json.dumps(payload))` yields the scorer's `Produced`,
+  LLM JSON, so `produced_from_response` yields the scorer's `Produced` from the
+  response, its scope label, batch record and turn plan handed to the rails with it,
   indexed by the normalised utterance. A failed case is absent from the index and
   scores as all false negatives.
 - Metrics, CIs and per-item rows: `scripts.model_bench.probes.extraction`.
@@ -77,7 +78,7 @@ from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     _norm_ws,
     _recover_utterance,
     iter_gold_probes,
-    parse_produced,
+    produced_from_response,
     score_run,
 )
 from scripts.model_bench.probes.extraction import (  # noqa: E402
@@ -372,21 +373,17 @@ async def run_cases(
 
 
 def build_produced_index(cases: list[CaseResult]) -> dict[str, Produced]:
-    """Index each successful case's payload as the scorer's `Produced`, by normalised utterance."""
+    """Index each successful case's payload as the scorer's `Produced`, by normalised utterance.
+
+    The scorer reads the response as the raw record dumps it, so the rails are handed the
+    case's scope label, batch record and turn plan with its payload.
+    """
     index: dict[str, Produced] = {}
     for case in cases:
         if case.response is None:
             continue
-        ok, entities, type_by_id, rels = parse_produced(
-            json.dumps(case.response.payload.model_dump(mode="json"))
-        )
-        index[_norm_ws(case.utterance)] = Produced(
-            utterance=_norm_ws(case.utterance),
-            parse_ok=ok,
-            entities=entities,
-            entity_type_by_id=type_by_id,
-            relationships=rels,
-        )
+        produced = produced_from_response(case.utterance, case.response.model_dump(mode="json"))
+        index[produced.utterance] = produced
     return index
 
 

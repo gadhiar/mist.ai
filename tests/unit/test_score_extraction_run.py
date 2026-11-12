@@ -595,6 +595,86 @@ class TestParseProduced:
         assert entities == (GoldEntity(id="rust", type="Technology"),)
 
 
+class TestTheRowTheScorerGivesTheRails:
+    """Plan v15, T50 Acceptance 8: the rails read the raw record's scope, batch record and plan.
+
+    A rail that reads any of the three gives the scorer the payload it gives the graph only
+    when the scorer hands it what the service recorded for the turn.
+    """
+
+    _PAYLOAD = {
+        "entities": [
+            {"id": "user", "name": "user", "type": "User"},
+            {"id": "rust", "name": "Rust", "type": "Technology"},
+        ],
+        "relationships": [{"source": "user", "target": "rust", "type": "USES"}],
+    }
+    _RECORD = [
+        {
+            "units": [{"text": "I use Rust", "context": [], "kind": "prose"}],
+            "context": [],
+            "payload": _PAYLOAD,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "finish": "stop",
+        }
+    ]
+    _PLAN = {
+        "payload": {"entities": [], "templates": [], "back_references": []},
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "finish_reason": "stop",
+    }
+
+    @pytest.fixture
+    def rows(self, monkeypatch):
+        import eval_harness.score_extraction_run as scorer
+
+        seen = []
+        real = scorer.rails.run_rails
+
+        def spy(row, pack, **switches):
+            seen.append(row)
+            return real(row, pack, **switches)
+
+        monkeypatch.setattr(scorer.rails, "run_rails", spy)
+        return seen
+
+    def _response(self, **extra):
+        return {
+            "scope": {"label": "user-scope", "confidence": 0.9},
+            "payload": json.loads(json.dumps(self._PAYLOAD)),
+            **extra,
+        }
+
+    def _produce(self, response):
+        from eval_harness.score_extraction_run import produced_from_response
+
+        return produced_from_response("I  use Rust", response)
+
+    def test_the_row_carries_the_scope_label(self, rows):
+        self._produce(self._response())
+        assert rows and all(row.scope == "user-scope" for row in rows)
+
+    def test_the_row_carries_the_batch_record(self, rows):
+        self._produce(self._response(batch_record=json.loads(json.dumps(self._RECORD))))
+        assert rows and all(row.batch_record == tuple(self._RECORD) for row in rows)
+
+    def test_the_row_carries_the_turn_plan(self, rows):
+        self._produce(self._response(turn_plan=json.loads(json.dumps(self._PLAN))))
+        assert rows and all(row.turn_plan == self._PLAN["payload"] for row in rows)
+
+    def test_a_record_without_them_is_a_row_of_one_batch_with_no_plan(self, rows):
+        self._produce(self._response())
+        assert rows and all((row.batch_record, row.turn_plan) == ((), None) for row in rows)
+
+    def test_the_produced_payload_is_keyed_by_the_normalised_utterance(self, rows):
+        produced = self._produce(self._response())
+        assert produced.utterance == "I use Rust"
+        assert produced.parse_ok is True
+        assert produced.entity_type_by_id == {"user": "User", "rust": "Technology"}
+
+
 class TestBuildProducedIndex:
     def test_indexes_extraction_ontology_records_by_utterance(self):
         content = json.dumps(

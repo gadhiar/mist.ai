@@ -574,6 +574,11 @@ def _produced_index(
             continue  # A failed case: absent from the index, as in the bench probe.
         if not isinstance(response, dict) or not isinstance(response.get("payload"), dict):
             raise InputError(f"{path}: probe {probe_id} has a response with no payload object")
+        if hasattr(scorer, "produced_from_response"):
+            # The rails read the row's scope label, batch record and plan, as on the service.
+            produced = scorer.produced_from_response(row["utterance"], response)
+            index[produced.utterance] = produced
+            continue
         ok, entities, type_by_id, rels = scorer.parse_produced(json.dumps(response["payload"]))
         utterance = scorer._norm_ws(row["utterance"])
         index[utterance] = scorer.Produced(

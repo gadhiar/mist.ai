@@ -18,7 +18,7 @@ import copy
 import json
 import re
 import sys
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,17 +36,17 @@ from backend.knowledge.curation.reconciliation import (  # noqa: E402
     derive_assertion_kind,
 )
 
+# The rail runner and the id rails the normalizer runs, imported rather than copied, so a
+# scored id is the id the graph stores.
+from backend.knowledge.extraction import rails  # noqa: E402
+
 # `canonical_id` lives in the backend so the graph and the scorer share it; it is
 # re-exported here for the eval scripts and tests that import it from this module.
 from backend.knowledge.extraction.canonical_id import (  # noqa: E402
     canonical_id,
 )
-
-# The id rails the normalizer runs, imported rather than copied, so a scored id is the
-# id the graph stores.
 from backend.knowledge.extraction.id_rails import (  # noqa: E402
     ISO_DATE_RE,
-    normalize_payload,
     stored_entity_id,
 )
 from backend.knowledge.extraction.validator import (  # noqa: E402
@@ -258,11 +258,14 @@ def parse_produced(
     content: str,
     *,
     batch_record: list[dict[str, Any]] | None = None,
+    scope: str | None = None,
+    turn_plan: Mapping[str, Any] | None = None,
 ) -> tuple[bool, tuple[GoldEntity, ...], dict[str, str], tuple[dict[str, Any], ...]]:
     """Parse a raw extraction-LLM JSON string into the entities and rels the graph stores.
 
-    The payload goes through `normalize_payload`, the normalizer's id rails, so each id,
-    type and edge is the stored one. The return shape is unchanged.
+    The payload goes through `rails.run_rails` with the registry's active pack, the runner
+    the normalizer runs, so each id, type and edge is the stored one. The return shape is
+    unchanged.
 
     Args:
         content: The payload as JSON text.
@@ -270,6 +273,9 @@ def parse_produced(
             rails as the apply hands it, so a rail that reads the record gives the
             scorer the id it gives the graph. None scores the payload as a row extracted
             as one batch.
+        scope: The row's scope label; None for a row that was not classified.
+        turn_plan: The row's plan, as its payload or as the stored record that wraps it;
+            None for a row without a plan.
     """
     parsed: Any = None
     try:
@@ -283,13 +289,16 @@ def parse_produced(
                 parsed = None
     if not isinstance(parsed, dict):
         return False, (), {}, ()
-    # The normalizer's own payload rail, on copies: the stored ids, types and edges,
-    # Event-date rail and deduplication included, so the score is of what the graph stores.
-    stored_entities, stored_rels = normalize_payload(
+    # The normalizer's own runner, on copies: the stored ids, types and edges, Event-date
+    # rail and deduplication included, so the score is of what the graph stores.
+    row = rails.rail_row(
         [copy.deepcopy(e) for e in parsed.get("entities") or [] if isinstance(e, dict)],
         [copy.deepcopy(r) for r in parsed.get("relationships") or [] if isinstance(r, dict)],
-        batch_record=batch_record,
+        scope=scope,
+        batch_record=copy.deepcopy(batch_record),
+        turn_plan=copy.deepcopy(turn_plan),
     )
+    stored_entities, stored_rels = rails.run_rails(row, registry.active_pack())
     entities: list[GoldEntity] = []
     type_by_id: dict[str, str] = {}
     for e in stored_entities:
@@ -312,6 +321,36 @@ def parse_produced(
             }
         )
     return True, tuple(entities), type_by_id, tuple(rels)
+
+
+def produced_from_response(utterance: str, response: Mapping[str, Any]) -> Produced:
+    """The scorer's `Produced` for one extraction-service response, as a raw record holds it.
+
+    The rails are handed the row the service recorded for the turn: the payload, the
+    scope label, the batch record and the turn plan, each read from the response's dump
+    (`ExtractResponse.model_dump(mode="json")`). A response with no `batch_record` or no
+    `turn_plan` key stands for a row extracted as one batch, or with no plan.
+
+    Args:
+        utterance: The probe's utterance; the index key is its normalised form.
+        response: The response dump, with a `payload` object.
+    """
+    scope = response.get("scope")
+    label = scope.get("label") if isinstance(scope, Mapping) else None
+    ok, entities, type_by_id, rels = parse_produced(
+        json.dumps(response["payload"]),
+        batch_record=response.get("batch_record"),
+        scope=label if isinstance(label, str) else None,
+        turn_plan=response.get("turn_plan"),
+    )
+    key = _norm_ws(utterance)
+    return Produced(
+        utterance=key,
+        parse_ok=ok,
+        entities=entities,
+        entity_type_by_id=type_by_id,
+        relationships=rels,
+    )
 
 
 def build_produced_index(records: list[dict[str, Any]]) -> dict[str, Produced]:
