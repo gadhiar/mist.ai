@@ -44,6 +44,7 @@ from backend.knowledge.extraction.structure_splitter import (
 from backend.llm.models import LLMRequest, LLMResponse
 from backend.llm.provider import StreamingLLMProvider
 from tests.unit.extraction_service.conftest import make_extract_request
+from tests.unit.extraction_service.scripted_llm import ScriptedProvider
 
 _GOLD = Path(__file__).resolve().parents[3] / "data" / "ingest" / "extraction-gold-2026-06-14.jsonl"
 
@@ -97,24 +98,19 @@ def echo(request: LLMRequest, call: int) -> LLMResponse:
     return LLMResponse(content=json.dumps(payload_for(batch_text(request))), finish_reason="stop")
 
 
-class ScriptedLLM(StreamingLLMProvider):
+class ScriptedLLM(ScriptedProvider):
     """Answers scope and derivation plainly and Stage 2 through `extract`.
 
     `extract` gets the request and the 1-based index of this Stage 2 call.
     """
 
-    model = "scripted"
-
     def __init__(self, extract: StageAnswer = echo) -> None:
         self.requests: list[LLMRequest] = []
         self._extract = extract
 
-    async def generate(self, request: LLMRequest, *, stream: bool = False):
+    async def reply(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
-        yield self._answer(request)
-
-    def generate_sync(self, request: LLMRequest, *, stream: bool = False):
-        raise NotImplementedError
+        return self._answer(request)
 
     def _answer(self, request: LLMRequest) -> LLMResponse:
         if request.max_tokens == SCOPE_MAX_TOKENS:

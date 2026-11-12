@@ -74,6 +74,7 @@ from backend.knowledge.ontologies.registry import active_pack
 from backend.llm.models import LLMRequest, LLMResponse, UsageMetadata
 from tests.unit.extraction_service.conftest import make_extract_request
 from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
+from tests.unit.extraction_service.scripted_llm import ScriptedProvider
 from tests.unit.extraction_service.test_turn_plan_off_pins import (
     PROMPT_SHA256,
     PROSE_BODIES_SHA256,
@@ -81,7 +82,10 @@ from tests.unit.extraction_service.test_turn_plan_off_pins import (
     SERVING_IDENTITY,
     STRUCTURED_BODIES_SHA256,
     STRUCTURED_UTTERANCE,
+    T49_EXTRACT_FIELDS,
+    T49_OTHER_FIELDS,
     canonical_sha256,
+    split_t49,
 )
 
 _ENGINE_LOGGER = "backend.extraction_service.engine"
@@ -201,7 +205,7 @@ def _plan_reply(request: LLMRequest) -> LLMResponse:
 Answer = Callable[[LLMRequest], LLMResponse | Awaitable[LLMResponse]]
 
 
-class PlanLLM:
+class PlanLLM(ScriptedProvider):
     """Answers scope and derivation plainly, the plan call with `plan`, a batch with `extract`."""
 
     def __init__(
@@ -215,7 +219,7 @@ class PlanLLM:
         self._extract = extract
         self._is_plan = is_plan
 
-    async def invoke(self, request: LLMRequest) -> LLMResponse:
+    async def reply(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
         if request.max_tokens == SCOPE_MAX_TOKENS:
             return LLMResponse(content=_SCOPE_REPLY, finish_reason="stop")
@@ -1123,7 +1127,11 @@ def plan_settings(service_settings: ServiceSettings) -> ServiceSettings:
 @pytest.fixture
 def plan_app(plan_settings, wired_llm, health_probe, ctx_size_source):
     """The service with the flag on, wired as the `service_app` fixture is."""
-    adapter = get_adapter(plan_settings.adapter_name, reasoning_effort="low")
+    adapter = get_adapter(
+        plan_settings.adapter_name,
+        reasoning_effort=plan_settings.reasoning_effort,
+        reasoning_budget_tokens=plan_settings.reasoning_budget_tokens,
+    )
     engine = ExtractionEngine(llm=wired_llm, adapter=adapter, settings=plan_settings)
     return create_app(plan_settings, engine, health_probe, ctx_size_source)
 
@@ -1162,6 +1170,14 @@ class TestTheServiceWithTheFlagOn:
             EXTRACT_MAX_TOKENS,
             DERIVE_MAX_TOKENS,
         ]
+        # The plan call is sent as stage extract: budgeted and streamed, as a batch is.
+        assert split_t49(bodies)[1] == [
+            T49_OTHER_FIELDS,
+            T49_EXTRACT_FIELDS,
+            T49_EXTRACT_FIELDS,
+            T49_EXTRACT_FIELDS,
+            T49_OTHER_FIELDS,
+        ]
         for batch in bodies[2:4]:
             assert batch["messages"][0] == bodies[1]["messages"][0]
             assert batch["messages"][1]["content"].startswith(_PLAN_BLOCK + "Context:\n")
@@ -1189,7 +1205,8 @@ class TestTheServiceWithTheFlagOn:
             )
 
         assert response.status_code == 200, response.text
-        assert canonical_sha256(fake_llama_state.chat_requests) == PROSE_BODIES_SHA256
+        before_t49, _set_by_t49 = split_t49(fake_llama_state.chat_requests)
+        assert canonical_sha256(before_t49) == PROSE_BODIES_SHA256
         assert "turn_plan" not in response.json()
 
     async def test_a_failed_plan_leaves_the_flag_off_bodies_around_the_plan_call(
@@ -1212,7 +1229,8 @@ class TestTheServiceWithTheFlagOn:
         assert response.status_code == 200, response.text
         bodies = fake_llama_state.chat_requests
         assert [_is_plan_body(body) for body in bodies] == [False, True, False, False, False]
-        assert canonical_sha256([bodies[0], *bodies[2:]]) == STRUCTURED_BODIES_SHA256
+        before_t49, _set_by_t49 = split_t49([bodies[0], *bodies[2:]])
+        assert canonical_sha256(before_t49) == STRUCTURED_BODIES_SHA256
         data = response.json()
         assert data["warnings"] == ["turn_plan_failed"]
         assert data["turn_plan"]["payload"] is None

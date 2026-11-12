@@ -19,6 +19,7 @@ from backend.extraction_service.adapters import get_adapter
 from backend.extraction_service.engine import ExtractionEngine, UpstreamLLMError
 from backend.llm.models import LLMRequest, LLMResponse, UsageMetadata
 from tests.unit.extraction_service.conftest import make_extract_request
+from tests.unit.extraction_service.scripted_llm import ScriptedProvider
 
 _ENGINE_LOGGER = "backend.extraction_service.engine"
 _PREFIX = "extraction call:"
@@ -39,14 +40,14 @@ _REASONING = "Considering the turn about Orrin Vale and his marmot sanctuary. " 
 _CONTENT = '{"entities": [{"id": "orrin-vale", "type": "Person"}'
 
 
-class _ScriptedLLM:
+class _ScriptedLLM(ScriptedProvider):
     """A provider that answers each call with the next scripted response."""
 
     def __init__(self, responses: list[LLMResponse]) -> None:
         self._responses = list(responses)
         self.requests: list[LLMRequest] = []
 
-    async def invoke(self, request: LLMRequest) -> LLMResponse:
+    async def reply(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
         return self._responses[min(len(self.requests), len(self._responses)) - 1]
 
@@ -76,7 +77,7 @@ class TestTheCallLine:
         "effort, caps",
         [
             pytest.param("low", (96, 2048, 400), id="low"),
-            pytest.param("medium", (1024, 32768, 400), id="medium"),
+            pytest.param("medium", (96, 32768, 400), id="medium"),
         ],
     )
     async def test_every_stage_logs_one_line_at_info(self, service_settings, caplog, effort, caps):

@@ -95,7 +95,8 @@ class GptOssAdapter:
     """Adapter for gpt-oss models (OpenAI Harmony chat format).
 
     Reasoning is always on for gpt-oss (the T0 brief's extraction model
-    choice); `reasoning_effort` controls how much. Constrained decoding
+    choice); `reasoning_effort` controls how much on the extract stage, and
+    scope and derive are sent at low (`stage_effort`). Constrained decoding
     defaults to "schema". An A/B run on the extraction host (llama.cpp
     b11151, gpt-oss-20b) found that "none" breaks the scope call: the model
     wraps its answer as `<|channel|>final <|constrain|>JSON<|message|>{...}`,
@@ -117,23 +118,31 @@ class GptOssAdapter:
     default_constrained_mode: ConstrainedMode = "schema"
 
     def prepare(self, request: LLMRequest, stage: str) -> LLMRequest:
-        """Set gpt-oss reasoning-effort/budget thinking controls on `request`."""
+        """Set the stage's reasoning effort on `request`, and the budget on extract.
+
+        The budget is the extract stage's alone: it is there to bound the
+        extract call's reasoning. Scope and derive are sent none; each runs
+        at low effort under low's output cap (`stage_effort`). The turn plan
+        call is sent as stage extract, so it carries the budget too.
+        """
         thinking = ThinkingConfig(
             effort=self.stage_effort(stage),
-            budget_tokens=self.reasoning_budget_tokens,
+            budget_tokens=self.reasoning_budget_tokens if stage == "extract" else None,
         )
         return request.model_copy(update={"thinking": thinking})
 
     def stage_effort(self, stage: str) -> ReasoningEffort:
-        """`reasoning_effort` for scope and extract; low for derive.
+        """`reasoning_effort` for extract; low for scope and derive.
 
-        Derive stays at low effort under every setting because no effort run
-        calls derive (the probe client sends no derivation), so derive above
-        low would ship unmeasured.
+        Scope is a classification and is sent at low under every setting. The
+        engine sizes a stage's cap by this effort, so scope also keeps low's
+        cap whatever the setting. Derive stays at low effort under every setting
+        because no effort run calls derive (the probe client sends no
+        derivation), so derive above low would ship unmeasured.
         """
-        if stage == "derive":
-            return "low"
-        return self.reasoning_effort
+        if stage == "extract":
+            return self.reasoning_effort
+        return "low"
 
     def final_text(self, response: LLMResponse) -> str:
         """Return `response.content`, recovering the final-channel text from raw Harmony markup."""

@@ -30,6 +30,12 @@ _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
 
 SERVER_ENV_PREFIX = "EXTRACTION_SERVER_"
 
+# The reasoning budget the extract call carries unless the deployment sets
+# another. It bounds how long one extract call can reason before it answers.
+DEFAULT_REASONING_BUDGET_TOKENS = 8192
+# What `EXTRACTION_REASONING_BUDGET_TOKENS` is set to for an unbudgeted run.
+_UNBUDGETED = "none"
+
 
 @dataclass(frozen=True, slots=True)
 class ServiceSettings:
@@ -47,11 +53,16 @@ class ServiceSettings:
         adapter_name: Model-family adapter to use (`"gptoss"`, `"qwen"`, or
             `"gemma"`). Switching models is a config change: a different
             `adapter_name` + `model_file` + `model_hash`, nothing else.
-        reasoning_effort: gpt-oss/Qwen chat-template reasoning-effort hint.
-            Default "low" per the T0 brief.
-        reasoning_budget_tokens: Reasoning token budget. `None` means
-            unbudgeted -- the field is omitted from the outgoing LLM
-            request entirely (see `ThinkingConfig.budget_tokens`).
+        reasoning_effort: The reasoning-effort hint the gpt-oss adapter sends
+            on the extract stage. It sends scope and derive at low under
+            every setting, and the other adapters send no effort. Default
+            "low" per the T0 brief.
+        reasoning_budget_tokens: The reasoning token budget the gpt-oss
+            adapter sends on the extract stage, and on no other. Default
+            `DEFAULT_REASONING_BUDGET_TOKENS`. `None` means unbudgeted -- the
+            field is omitted from the outgoing LLM request entirely (see
+            `ThinkingConfig.budget_tokens`); `from_env` reads it from the
+            value `none`. The other adapters send no budget.
         constrained_mode: Overrides the adapter's `default_constrained_mode`
             when set. `None` means "use the adapter's default".
         location_label: Human-readable label for where this service is
@@ -89,7 +100,7 @@ class ServiceSettings:
     model_file: str
     adapter_name: str = "gptoss"
     reasoning_effort: ReasoningEffort = "low"
-    reasoning_budget_tokens: int | None = None
+    reasoning_budget_tokens: int | None = DEFAULT_REASONING_BUDGET_TOKENS
     constrained_mode: ConstrainedMode | None = None
     location_label: str = "local"
     llm_timeout_seconds: float = 30.0
@@ -135,7 +146,7 @@ class ServiceSettings:
             model_file=os.environ.get("EXTRACTION_MODEL_FILE", "gpt-oss-20b.gguf"),
             adapter_name=os.environ.get("EXTRACTION_ADAPTER", "gptoss"),
             reasoning_effort=reasoning_effort_raw,  # type: ignore[arg-type]
-            reasoning_budget_tokens=_int_or_none(
+            reasoning_budget_tokens=_reasoning_budget(
                 os.environ.get("EXTRACTION_REASONING_BUDGET_TOKENS")
             ),
             constrained_mode=constrained_mode_raw,  # type: ignore[arg-type]
@@ -170,11 +181,28 @@ def _server_config(environ: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
     )
 
 
-def _int_or_none(value: str | None) -> int | None:
-    """Parse an optional integer env var. Empty/unset means None."""
-    if value is None or value.strip() == "":
+def _reasoning_budget(value: str | None) -> int | None:
+    """Parse `EXTRACTION_REASONING_BUDGET_TOKENS`.
+
+    Unset and empty are both the default: compose forwards an unset host
+    variable as an empty string, so empty cannot be the unbudgeted spelling.
+    `none`, in any case, is.
+
+    Raises:
+        ValueError: The value is neither empty, `none`, nor an integer.
+    """
+    text = "" if value is None else value.strip()
+    if text == "":
+        return DEFAULT_REASONING_BUDGET_TOKENS
+    if text.lower() == _UNBUDGETED:
         return None
-    return int(value)
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(
+            f"EXTRACTION_REASONING_BUDGET_TOKENS must be an integer or "
+            f"{_UNBUDGETED!r} (unbudgeted), got {value!r}"
+        ) from None
 
 
 def _as_bool(value: str) -> bool:

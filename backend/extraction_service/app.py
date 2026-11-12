@@ -35,6 +35,8 @@ from backend.errors import LLMConnectionError, LLMResponseError
 from backend.extraction_contract.models import (
     CONTRACT_MAJOR,
     CONTRACT_VERSION,
+    CancelOutcome,
+    CancelResponse,
     ErrorCode,
     ExtractRequest,
     ExtractResponse,
@@ -50,6 +52,7 @@ from backend.extraction_service.engine import (
     PROMPT_RESERVE_TOKENS,
     RUN_IDENTITY_CODE,
     ExtractionEngine,
+    ExtractionServiceError,
     ExtractionTimeoutError,
     InvalidRequestError,
     UpstreamLLMError,
@@ -84,6 +87,7 @@ _ERROR_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.MODEL_LOADING: 503,
     ErrorCode.UPSTREAM_LLM: 502,
     ErrorCode.TIMEOUT: 504,
+    ErrorCode.CANCELLED: 499,
 }
 
 
@@ -218,6 +222,43 @@ class LlamaPropsContextSize:
         return n_ctx
 
 
+class JobCancelledError(ExtractionServiceError):
+    """The job's run was cancelled before it finished; nothing is stored for it.
+
+    Maps to HTTP 499 / `ErrorCode.CANCELLED`.
+    """
+
+
+class ClientGoneError(ExtractionServiceError):
+    """This caller's client disconnected before the job's run finished.
+
+    The caller's own condition, not the job's: the run carries on while
+    another caller waits on it.
+    """
+
+
+async def _client_gone(request: Request) -> None:
+    """Return once the client of `request` has disconnected.
+
+    Read after the request body was consumed, so the next ASGI message is
+    the disconnect, whenever it comes. This is how the handler learns that
+    its client left under a server that keeps the handler running.
+    """
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+@dataclass(slots=True)
+class _SharedRun:
+    """One job's run in flight, the callers waiting on it, and whether it was cancelled."""
+
+    task: asyncio.Task[ExtractResponse]
+    waiters: int = 0
+    cancelled: bool = False
+
+
 class _IdempotencyCache:
     """LRU of completed `ExtractResponse`s, keyed on `job_id`, with single-flight.
 
@@ -232,13 +273,20 @@ class _IdempotencyCache:
     Concurrency relies on the event loop, not a lock: `get_or_run` does its
     lookups and registers a new run with no `await` in between, and the run
     task's done callback stores the result and THEN un-registers the run,
-    also synchronously. So at every point a duplicate can observe, the job
-    is either in flight or stored -- never neither, which would start a
-    second run.
+    also synchronously. So at every point a duplicate can observe, a job
+    whose run was not cancelled is either in flight or stored -- never
+    neither, which would start a second run.
 
-    Each caller awaits the shared run through `asyncio.shield`: a caller
-    cancelled mid-run (its client disconnected) stops waiting, but the run
-    carries on for the other callers and is still stored when it finishes.
+    A run ends early in two ways, and both store nothing and un-register the
+    run at once, so the same `job_id` sent again starts a run of its own
+    even while the cancelled one is still unwinding:
+
+    - `cancel` cancels the job: every caller waiting on its run gets
+      `JobCancelledError`.
+    - The last caller waiting on a run leaves, because it was cancelled or
+      its client disconnected. A caller that leaves while another still
+      waits takes nothing with it: the run carries on and is stored when it
+      finishes.
     """
 
     def __init__(self, maxsize: int) -> None:
@@ -251,20 +299,33 @@ class _IdempotencyCache:
             raise ValueError(f"maxsize must be >= 0, got {maxsize}")
         self._maxsize = maxsize
         self._results: OrderedDict[str, ExtractResponse] = OrderedDict()
-        self._in_flight: dict[str, asyncio.Task[ExtractResponse]] = {}
+        self._in_flight: dict[str, _SharedRun] = {}
 
     def knows(self, job_id: str) -> bool:
         """True when `job_id` has a stored result or a run in flight."""
         return job_id in self._results or job_id in self._in_flight
 
     async def get_or_run(
-        self, job_id: str, factory: Callable[[], Awaitable[ExtractResponse]]
+        self,
+        job_id: str,
+        factory: Callable[[], Awaitable[ExtractResponse]],
+        *,
+        gone: Callable[[], Awaitable[object]] | None = None,
     ) -> ExtractResponse:
         """Return the job's response, running `factory` only if nothing has it.
 
+        Args:
+            job_id: The job to answer.
+            factory: Starts the job's run when none is stored or in flight.
+            gone: Awaited beside the run when given; it returns when this
+                caller's client has disconnected.
+
         Raises:
-            Whatever the shared run raised (every joined caller sees it), or
-            `asyncio.CancelledError` when THIS caller is cancelled.
+            JobCancelledError: The job was cancelled while this caller waited.
+            ClientGoneError: `gone` returned before the run finished.
+            asyncio.CancelledError: THIS caller was cancelled.
+            Exception: Whatever the shared run raised; every caller waiting
+                on it sees the same error.
         """
         cached = self._results.get(job_id)
         if cached is not None:
@@ -273,15 +334,64 @@ class _IdempotencyCache:
 
         run = self._in_flight.get(job_id)
         if run is None:
-            run = asyncio.ensure_future(factory())
+            run = _SharedRun(task=asyncio.ensure_future(factory()))
             self._in_flight[job_id] = run
-            run.add_done_callback(lambda done: self._on_run_done(job_id, done))
-        return await asyncio.shield(run)
+            run.task.add_done_callback(lambda _done, run=run: self._on_run_done(job_id, run))
 
-    def _on_run_done(self, job_id: str, run: asyncio.Task[ExtractResponse]) -> None:
+        watcher = None if gone is None else asyncio.ensure_future(gone())
+        run.waiters += 1
+        try:
+            # `asyncio.wait` cancels neither future when this caller is
+            # cancelled, so the run outlives a caller that leaves.
+            await asyncio.wait(
+                {run.task} if watcher is None else {run.task, watcher},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if run.cancelled or run.task.cancelled():
+                raise JobCancelledError(f"job {job_id!r} was cancelled")
+            if run.task.done():
+                return run.task.result()
+            raise ClientGoneError(f"the client waiting on job {job_id!r} disconnected")
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+            run.waiters -= 1
+            if run.waiters == 0 and not run.task.done():
+                self._drop(job_id, run)
+
+    def cancel(self, job_id: str) -> CancelOutcome:
+        """Cancel `job_id`'s run if one is in flight, and say what was found.
+
+        Returns:
+            `cancelled` when a run was in flight: it is cancelled, nothing
+            is stored for it, and every caller waiting on it gets
+            `JobCancelledError`. `finished` when the job has a stored
+            result, which is kept. `unknown` otherwise: a job never seen, a
+            job already cancelled, or a finished job this cache no longer
+            holds.
+        """
+        run = self._in_flight.get(job_id)
+        if run is not None:
+            self._drop(job_id, run)
+            return "cancelled"
+        return "finished" if job_id in self._results else "unknown"
+
+    def _drop(self, job_id: str, run: _SharedRun) -> None:
+        # Synchronous: mark, un-register, then cancel. The mark keeps a run
+        # that finishes anyway out of the store and tells its waiters.
+        run.cancelled = True
+        if self._in_flight.get(job_id) is run:
+            del self._in_flight[job_id]
+        run.task.cancel()
+
+    def _on_run_done(self, job_id: str, run: _SharedRun) -> None:
         # Synchronous: store, then un-register, with no await in between.
-        if not run.cancelled() and run.exception() is None:
-            self._store(job_id, run.result())
+        task = run.task
+        # Read the exception even for a dropped run, so the loop never
+        # reports it as one nobody retrieved.
+        succeeded = not task.cancelled() and task.exception() is None
+        if succeeded and not run.cancelled:
+            self._store(job_id, task.result())
         if self._in_flight.get(job_id) is run:
             del self._in_flight[job_id]
 
@@ -520,7 +630,7 @@ def create_app(
         )
 
     @app.post("/v1/extract")
-    async def extract(req: ExtractRequest):
+    async def extract(req: ExtractRequest, request: Request):
         if not is_compatible(req.contract_version):
             return _error_response(
                 ErrorCode.CONTRACT_MISMATCH,
@@ -580,8 +690,23 @@ def create_app(
         request_start = time.perf_counter()
         try:
             response = await cache.get_or_run(
-                req.job_id, lambda: engine.run(req, serving_identity=view.identity)
+                req.job_id,
+                lambda: engine.run(req, serving_identity=view.identity),
+                gone=lambda: _client_gone(request),
             )
+        except (JobCancelledError, ClientGoneError) as exc:
+            # A client that left reads no answer; the envelope is what the
+            # handler returns either way.
+            outcome = "cancelled" if isinstance(exc, JobCancelledError) else "client_gone"
+            logger.info(
+                "job ended early request_id=%s job_id=%s event_id=%s turn_id=%s outcome=%s",
+                req.request_id,
+                req.job_id,
+                req.event_id,
+                req.turn_id,
+                outcome,
+            )
+            return _error_response(ErrorCode.CANCELLED, str(exc))
         except InvalidRequestError as exc:
             # Checked above; kept so the engine's own refusal is never a 500.
             return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
@@ -641,6 +766,18 @@ def create_app(
             duration_ms,
         )
         return response
+
+    @app.post("/v1/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> CancelResponse:
+        """Cancel the job's run if one is in flight; always 200, the body says what was found.
+
+        Every request waiting on a cancelled run is answered
+        `ErrorCode.CANCELLED`, nothing is stored for the job, and the same
+        `job_id` runs when it is sent again.
+        """
+        outcome = cache.cancel(job_id)
+        logger.info("cancel requested job_id=%s outcome=%s", job_id, outcome)
+        return CancelResponse(job_id=job_id, status=outcome)
 
     @app.get("/v1/health")
     async def health() -> HealthResponse:
@@ -744,7 +881,7 @@ def build_app_from_env() -> FastAPI:
     """Wire the real `LlamaServerProvider` and health probe from env vars.
 
     The provider's clients take `llm_timeout_seconds`, the bound the engine's
-    `asyncio.wait_for` puts on each call, so the SDK's 600 s read default no
+    `asyncio.timeout` puts on each call, so the SDK's 600 s read default no
     longer cuts a call the engine still allows.
     """
     settings = ServiceSettings.from_env()

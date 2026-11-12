@@ -477,6 +477,206 @@ class TestDeadLetter:
         assert dispatcher.snapshot().dead_lettered == 0
 
 
+def _rows(world, event_id: str) -> list[dict]:
+    return [r for r in world.attempts() if r["event_id"] == event_id]
+
+
+class TestCancelledJob:
+    """A `cancelled` reply says nothing about the turn: deferred, not counted, never dead-lettered."""
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_reply_is_deferred_and_the_turn_dispatched_again(
+        self, backlog_world, ts
+    ):
+        # Arrange
+        world = backlog_world
+        turn = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use rust"
+        )
+        world.service.fail_script["I really use rust"] = [(ErrorCode.CANCELLED, True)]
+        dispatcher = world.build_dispatcher()
+
+        # Act
+        await dispatcher.start()
+        assert await dispatcher.drain(timeout=5.0)
+
+        # Assert
+        rows = _rows(world, turn)
+        assert [r["outcome"] for r in rows] == ["deferred", "extracted"]
+        assert rows[0]["error_code"] == "cancelled"
+        assert rows[0]["counted"] == 0
+        assert [r["attempt"] for r in rows] == [1, 2]
+        first, second = world.service.received
+        assert first.job_id != second.job_id
+        assert [r["job_id"] for r in rows] == [first.job_id, second.job_id]
+        assert world.curation.event_ids == [turn]
+        assert dispatcher.snapshot().dead_lettered == 0
+
+    @pytest.mark.asyncio
+    async def test_after_a_cancelled_reply_the_turn_is_pending_uncounted_and_working(
+        self, backlog_world, ts
+    ):
+        # Arrange: a long wait after the reply, so the test reads the state inside it.
+        world = backlog_world
+        turn = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use rust"
+        )
+        world.service.fail_script["I really use rust"] = [(ErrorCode.CANCELLED, True)]
+        dispatcher = world.build_dispatcher(idle_poll_s=30.0)
+
+        # Act
+        await dispatcher.start()
+        await wait_until(lambda: len(_rows(world, turn)) == 1)
+
+        # Assert
+        epoch = world.store.active_epoch()
+        assert world.store.counted_failures(turn, epoch) == 0
+        assert turn in {p.event_id for p in world.store.scan(epoch).pending}
+        assert world.cache.get(turn, epoch.extraction_version, epoch.model_hash) is None
+        assert dispatcher.state == "working"
+        status = dispatcher.snapshot()
+        assert status.state == "working"
+        assert status.backlog_depth == 1
+        assert status.dead_lettered == 0
+        await dispatcher.stop(timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_max_attempts_cancelled_replies_write_no_skip_row(self, backlog_world, ts):
+        # Arrange: more cancels than max_attempts (5).
+        world = backlog_world
+        turn = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use rust"
+        )
+        world.service.fail_script["I really use rust"] = [(ErrorCode.CANCELLED, True)] * 8
+        dispatcher = world.build_dispatcher()
+
+        # Act: wait for one dispatch past max_attempts.
+        await dispatcher.start()
+        await wait_until(lambda: len(_rows(world, turn)) >= 6)
+        await dispatcher.stop(timeout=5.0)
+
+        # Assert
+        epoch = world.store.active_epoch()
+        rows = _rows(world, turn)
+        assert all(r["outcome"] == "deferred" for r in rows)
+        assert all(r["error_code"] == "cancelled" and r["counted"] == 0 for r in rows)
+        assert world.cache.get(turn, epoch.extraction_version, epoch.model_hash) is None
+        assert world.store.list_dead_letters(epoch) == []
+        assert world.store.counted_failures(turn, epoch) == 0
+        assert turn in {p.event_id for p in world.store.scan(epoch).pending}
+        assert world.curation.event_ids == []
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_after_max_attempts_minus_one_failures_keeps_the_count(
+        self, backlog_world, ts
+    ):
+        # Arrange: four counted failures, a cancel, then the fifth counted failure.
+        world = backlog_world
+        turn = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use cobol"
+        )
+        world.service.fail_script["I really use cobol"] = (
+            [(ErrorCode.UPSTREAM_LLM, True)] * 4
+            + [(ErrorCode.CANCELLED, True)]
+            + [(ErrorCode.UPSTREAM_LLM, True)]
+        )
+        dispatcher = world.build_dispatcher()
+
+        # Act
+        await dispatcher.start()
+        assert await dispatcher.drain(timeout=5.0)
+
+        # Assert: the cancel neither dead-lettered the turn nor reset its count.
+        rows = _rows(world, turn)
+        assert [r["outcome"] for r in rows] == ["failed"] * 4 + ["deferred", "dead_lettered"]
+        assert [r["counted"] for r in rows] == [1, 1, 1, 1, 0, 1]
+        assert rows[4]["error_code"] == "cancelled"
+        epoch = world.store.active_epoch()
+        row = world.cache.get(turn, epoch.extraction_version, epoch.model_hash)
+        assert row["outcome"] == OUTCOME_SKIPPED
+        assert row["skip_reason"] == SKIP_EXTRACTION_FAILED
+        assert dispatcher.snapshot().dead_lettered == 1
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_reply_that_is_not_retryable_is_handled_the_same(
+        self, backlog_world, ts
+    ):
+        # Arrange
+        world = backlog_world
+        turn = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use rust"
+        )
+        world.service.fail_script["I really use rust"] = [(ErrorCode.CANCELLED, False)]
+        dispatcher = world.build_dispatcher()
+
+        # Act
+        await dispatcher.start()
+        assert await dispatcher.drain(timeout=5.0)
+
+        # Assert
+        rows = _rows(world, turn)
+        assert [r["outcome"] for r in rows] == ["deferred", "extracted"]
+        assert rows[0]["error_code"] == "cancelled"
+        assert rows[0]["counted"] == 0
+        assert world.curation.event_ids == [turn]
+        assert dispatcher.snapshot().dead_lettered == 0
+
+    @pytest.mark.asyncio
+    async def test_the_wait_after_a_cancel_is_idle_poll_s_and_wake_does_not_end_it(
+        self, backlog_world, ts
+    ):
+        # Arrange: a first-failure backoff of a millisecond, an idle poll of 0.6 s,
+        # and the cancelled job held in flight while another turn is logged.
+        world = backlog_world
+        loop = asyncio.get_running_loop()
+        world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use rust"
+        )
+        world.service.fail_script["I really use rust"] = [(ErrorCode.CANCELLED, True)]
+        world.service.hold = asyncio.Event()
+        dispatcher = world.build_dispatcher(idle_poll_s=0.6)
+        assert dispatcher._settings.backoff_s(1) < 0.1
+        await dispatcher.start()
+        await wait_until(lambda: len(world.service.received) == 1)
+        world.log_turn(session_id="s1", turn_index=1, timestamp=ts(1), utterance="I really use go")
+        dispatcher.wake()
+
+        # Act: let the cancelled reply through, then wake the dispatcher again.
+        released = loop.time()
+        world.service.hold.set()
+        await wait_until(lambda: len(world.attempts()) >= 1)
+        dispatcher.wake()
+        await wait_until(lambda: len(world.service.received) >= 2)
+        waited = loop.time() - released
+
+        # Assert: the same turn again, and not before the idle poll ran out.
+        assert waited >= 0.5
+        assert world.service.received_utterances[:2] == ["I really use rust"] * 2
+        await dispatcher.stop(timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_stopping_the_dispatcher_ends_the_wait_after_a_cancel(self, backlog_world, ts):
+        # Arrange
+        world = backlog_world
+        loop = asyncio.get_running_loop()
+        world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use rust"
+        )
+        world.service.fail_script["I really use rust"] = [(ErrorCode.CANCELLED, True)]
+        dispatcher = world.build_dispatcher(idle_poll_s=30.0)
+        await dispatcher.start()
+        await wait_until(lambda: len(world.attempts()) == 1)
+
+        # Act
+        started = loop.time()
+        await dispatcher.stop(timeout=5.0)
+
+        # Assert
+        assert loop.time() - started < 2.0
+        assert dispatcher.running is False
+        assert len(world.service.received) == 1
+
+
 async def _settle(dispatcher, limit: int = 50) -> None:
     """Run dispatcher steps on this task until one would sleep (idle or backoff).
 

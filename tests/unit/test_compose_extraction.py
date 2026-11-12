@@ -332,8 +332,8 @@ class TestLlamaServerPins:
     def test_local_llm_does_not_pass_reasoning_budget(self) -> None:
         assert "--reasoning-budget" not in _command(_local_llm()), (
             "mist-extraction-llm-local must not pass --reasoning-budget: the service "
-            "sends a per-request budget, and the server's own default (-1, "
-            "unrestricted) already matches 'no cap'"
+            "sends the budget per request, on the extract call alone "
+            "(EXTRACTION_REASONING_BUDGET_TOKENS)"
         )
 
     def test_local_llm_passes_cache_ram(self) -> None:
@@ -382,6 +382,21 @@ class TestServiceEnvPassthrough:
         assert env["EXTRACTION_REASONING_EFFORT"] == "${EXTRACTION_REASONING_EFFORT:-medium}", env[
             "EXTRACTION_REASONING_EFFORT"
         ]
+
+    def test_reasoning_budget_tokens_is_forwarded_with_8192_default(self) -> None:
+        # The same default as ServiceSettings.reasoning_budget_tokens. `none`
+        # is the override for an unbudgeted run.
+        env = _env_dict(_services()["mist-extraction-local"])
+        assert (
+            env["EXTRACTION_REASONING_BUDGET_TOKENS"]
+            == "${EXTRACTION_REASONING_BUDGET_TOKENS:-8192}"
+        ), env["EXTRACTION_REASONING_BUDGET_TOKENS"]
+
+    def test_reasoning_budget_tokens_is_forwarded_to_the_service_only(self) -> None:
+        # The budget is a request field; llama-server takes no such variable here.
+        for name, service in _services().items():
+            if name != "mist-extraction-local":
+                assert "EXTRACTION_REASONING_BUDGET_TOKENS" not in _env_dict(service), name
 
     def test_max_attempts_is_forwarded_with_2_default(self) -> None:
         env = _env_dict(_services()["mist-extraction-local"])

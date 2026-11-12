@@ -249,7 +249,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-c1cf16a9f46473765a83b3586ea6ba1c27756e3f3f20fa7006cfe8375d891306",
+        code_identity="ci1-22f9a668a2094d8f3632428eaf102870023d37a7afc4073356fc98a6c11efab4",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -304,8 +304,21 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "the eval harness's aligner applies to ids of its type, which the aligner reads "
             "from the active pack in place of a type name of its own, and the Metric rule "
             "states it, which moves the pack's rails hash and nothing a rail reads or a "
-            "request carries. "
-            "With the flag off every request is sent exactly as before. "
+            "request carries; T49 sends scope at low effort under every setting, as derive "
+            "already was, so a service configured above low sends its scope call with low's "
+            "hint and low's 96-token cap, and puts a reasoning budget on the extract "
+            "request and the plan call, 8,192 tokens unless "
+            "EXTRACTION_REASONING_BUDGET_TOKENS states another, with none on scope or "
+            "derive, and sends the extract request and the plan call as streaming "
+            "requests, read to their end, so that a call that times out or whose run is "
+            "cancelled closes its stream; LlamaServerProvider closes a streamed call's "
+            "stream however the call ends, and raises a transport failure while the "
+            "stream is read as LLMConnectionError; the engine bounds each call with "
+            "asyncio.timeout in the run's own task, not asyncio.wait_for, so a cancel that "
+            "lands as a call returns ends the run instead of being dropped. "
+            "With the turn plan flag off, the effort at low and that budget set to none, "
+            "the scope and derive requests are sent exactly as before, and the extract "
+            "request differs only in asking for a streamed reply and its usage chunk. "
             "Re-extracts history."
         ),
     ),

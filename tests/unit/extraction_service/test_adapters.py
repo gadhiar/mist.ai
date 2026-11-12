@@ -36,6 +36,16 @@ class TestGptOssAdapter:
 
         assert prepared.thinking.budget_tokens == 512
 
+    @pytest.mark.parametrize("stage", ["scope", "derive"])
+    def test_the_budget_is_the_extract_stages_alone(self, stage):
+        """Scope and derive run at low effort under their own small caps, with no budget."""
+        adapter = GptOssAdapter(reasoning_effort="high", reasoning_budget_tokens=512)
+
+        prepared = adapter.prepare(_request(), stage=stage)
+
+        assert prepared.thinking.effort == "low"
+        assert prepared.thinking.budget_tokens is None
+
     def test_final_text_returns_plain_content_unchanged(self):
         adapter = GptOssAdapter()
         response = LLMResponse(content='{"entities": []}')

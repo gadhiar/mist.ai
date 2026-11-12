@@ -67,11 +67,15 @@ class TestHappyPath:
         assert data["timings_ms"]["derive"] is not None
         assert len(fake_llama_state.chat_requests) == 3
 
-        # gpt-oss adapter forwards reasoning_effort via chat_template_kwargs
-        # and omits reasoning_budget_tokens entirely when unset.
-        first_request = fake_llama_state.chat_requests[0]
-        assert first_request["chat_template_kwargs"]["reasoning_effort"] == "low"
-        assert "reasoning_budget_tokens" not in first_request
+        # The gpt-oss adapter forwards reasoning_effort via chat_template_kwargs
+        # on every stage. The reasoning budget goes on the extract request
+        # alone; scope and derive omit the field.
+        scope_request, extract_request, derive_request = fake_llama_state.chat_requests
+        assert scope_request["chat_template_kwargs"]["reasoning_effort"] == "low"
+        assert service_settings.reasoning_budget_tokens == 8192
+        assert extract_request["reasoning_budget_tokens"] == 8192
+        assert "reasoning_budget_tokens" not in scope_request
+        assert "reasoning_budget_tokens" not in derive_request
 
     async def test_extract_without_derivation_input_skips_stage_9(self, client, fake_llama_state):
         fake_llama_state.chat_responses = [
@@ -342,7 +346,7 @@ class TestInfoServingConfig:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["contract_version"] == "1.3.0"
+        assert data["contract_version"] == "1.4.0"
         # No settings override: the gpt-oss adapter's default mode is in effect.
         assert service_settings.constrained_mode is None
         assert data["constrained_mode"] == "schema"

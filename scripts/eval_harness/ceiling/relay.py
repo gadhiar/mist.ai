@@ -3,10 +3,12 @@
 Under run A the service's `EXTRACTION_LLM_BASE_URL` points here. The relay serves the
 three routes the service calls (`GET /health`, `GET /props`, `POST /v1/chat/completions`),
 keys each chat request by the SHA-256 of its whole body, and answers it from the store's
-key-to-answer mapping. A key with no answer gets HTTP 400, which the openai SDK does not
-retry, so each pending request reaches the relay exactly once and is logged for the round
-tool to offer to the answerer. Two routes of its own, `/_relay/probe` and `/_relay/log`,
-attribute requests to probe tags and report them in arrival order.
+key-to-answer mapping. A body with `"stream": true` is answered with server-sent events, as
+llama-server answers it; any other body with one JSON completion. A key with no answer gets
+HTTP 400 before any stream starts, which the openai SDK does not retry, so each pending
+request reaches the relay exactly once and is logged for the round tool to offer to the
+answerer. Two routes of its own, `/_relay/probe` and `/_relay/log`, attribute requests to
+probe tags and report them in arrival order.
 
 It listens on 127.0.0.1 only: the answers are eval material, not a service.
 """
@@ -18,14 +20,14 @@ import json
 import socket
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from backend.errors import MistError
 from backend.extraction_service.schemas import (
@@ -203,6 +205,51 @@ async def _json_object(request: Request) -> dict[str, Any] | None:
     return body if isinstance(body, dict) else None
 
 
+_ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def _chunk(body: Mapping[str, Any], key: str, choices: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "id": f"chatcmpl-relay-{key[:12]}",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": body.get("model"),
+        "choices": choices,
+    }
+
+
+def _event(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+async def _stream_events(body: Mapping[str, Any], key: str, text: str) -> AsyncIterator[bytes]:
+    """A stored answer as llama-server streams a chat reply, so the service reads its own path.
+
+    The whole text is one content delta, carried by the first chunk with the role. Then a
+    finish chunk with an empty delta, the usage-only chunk with no choices when the body's
+    `stream_options` asks for it, and `[DONE]`. The shape is the fake llama-server's in the
+    service's tests; it is not checked here against a real llama-server's stream.
+    """
+    yield _event(
+        _chunk(
+            body,
+            key,
+            [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": None,
+                }
+            ],
+        )
+    )
+    yield _event(_chunk(body, key, [{"index": 0, "delta": {}, "finish_reason": "stop"}]))
+    stream_options = body.get("stream_options")
+    if isinstance(stream_options, dict) and stream_options.get("include_usage") is True:
+        yield _event({**_chunk(body, key, []), "usage": _ZERO_USAGE})
+    yield b"data: [DONE]\n\n"
+
+
 def build_relay(answers: Mapping[str, Any], log: RelayLog) -> FastAPI:
     """Build the relay app over a key-to-answer mapping, logging every chat request to `log`.
 
@@ -237,7 +284,7 @@ def build_relay(answers: Mapping[str, Any], log: RelayLog) -> FastAPI:
         return JSONResponse([e.public() for e in log.entries()])
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request) -> JSONResponse:
+    async def chat_completions(request: Request) -> Response:
         body = await _json_object(request)
         if body is None:
             return _error("relay_bad_request", "the body is not a JSON object")
@@ -249,6 +296,10 @@ def build_relay(answers: Mapping[str, Any], log: RelayLog) -> FastAPI:
             return _error("relay_unknown_kind", f"no stage schema matches {key}")
         if text is None:
             return _error("relay_pending", f"pending {key}")
+        if body.get("stream") is True:
+            return StreamingResponse(
+                _stream_events(body, key, text), media_type="text/event-stream"
+            )
         return JSONResponse(
             {
                 "id": f"chatcmpl-relay-{key[:12]}",

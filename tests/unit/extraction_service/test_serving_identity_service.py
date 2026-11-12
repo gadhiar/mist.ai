@@ -283,12 +283,22 @@ class TestAgreementWithTheRunIdentity:
 
         profiles = _engine_for(settings, wired_llm).request_profile()
 
-        # Derive is sent at low effort under every setting (`GptOssAdapter.stage_effort`).
+        # Scope and derive are sent at low effort under every setting
+        # (`GptOssAdapter.stage_effort`), and the budget goes on extract alone.
         assert {(p.stage, p.thinking_effort, p.thinking_budget_tokens) for p in profiles} == {
-            ("scope", run.reasoning_effort, run.reasoning_budget_tokens),
+            ("scope", "low", None),
             ("extract", run.reasoning_effort, run.reasoning_budget_tokens),
-            ("derive", "low", run.reasoning_budget_tokens),
+            ("derive", "low", None),
         }
+
+    def test_the_default_budget_is_8192_on_extract_alone(self, service_settings, wired_llm):
+        profiles = _engine_for(service_settings, wired_llm).request_profile()
+
+        assert [(p.stage, p.thinking_budget_tokens) for p in profiles] == [
+            ("scope", None),
+            ("extract", 8192),
+            ("derive", None),
+        ]
 
 
 def _reasoning(settings: ServiceSettings) -> dict:
@@ -365,7 +375,6 @@ _STAGE_BY_MAX_TOKENS = {
     SCOPE_MAX_TOKENS: "scope",
     EXTRACT_MAX_TOKENS: "extract",
     DERIVE_MAX_TOKENS: "derive",
-    STAGE_CAPS["medium"].scope: "scope",
     STAGE_CAPS["medium"].extract: "extract",
 }
 _CONSTRAINED_BY_FORMAT = {"json_schema": "schema", "json_object": "json_object", None: "none"}
@@ -442,7 +451,7 @@ class TestInfoReportsTheServingIdentity:
 
         data = (await client.get("/v1/info")).json()
 
-        assert data["contract_version"] == "1.3.0"
+        assert data["contract_version"] == "1.4.0"
         assert data["serving_identity"] == compute_serving_identity(components)
         assert data["serving_identity_components"] == components_dict(components)
         assert data["serving_identity_error"] is None

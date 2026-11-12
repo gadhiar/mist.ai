@@ -130,7 +130,7 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_MODEL_HASH` | **required, no default** (`:?`) | **required, no default** (`:?`) | Defines the epoch. Set explicitly every deploy; see EPOCH_MISMATCH in `backend/extraction_service/app.py`. |
 | `EXTRACTION_MODEL_FILE` | `ggml-org/gpt-oss-20b-MXFP4.gguf` | same | Passed to `LlamaServerProvider` as the OpenAI-API `model` field. |
 | `EXTRACTION_ADAPTER` | `gptoss` | same | `gptoss` / `qwen` / `gemma` -- see `backend/extraction_service/adapters.py`. |
-| `EXTRACTION_REASONING_EFFORT` | `medium` | `low` | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` keeps scope 96, extract 2048, derive 400; `medium` and `high` send scope 1024, extract 32768, derive 400. Derive is always sent at `low` effort, so its cap stays 400. `medium` and `high` need a context of at least 47,104 tokens (the 32,768 extract cap plus the 14,336-token prompt reserve); the local default context, 65,536, gives it, and at the host's 16,384 default the service reports no serving identity for them. See "Effort caps and the context" and "Medium by default (local)" below. |
+| `EXTRACTION_REASONING_EFFORT` | `medium` | `low` | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` sends scope 96, extract 2048, derive 400; `medium` and `high` send extract 32768 and keep scope 96 and derive 400. Scope and derive are always sent at `low` effort, so their caps stay low's. `medium` and `high` need a context of at least 47,104 tokens (the 32,768 extract cap plus the 14,336-token prompt reserve); the local default context, 65,536, gives it, and at the host's 16,384 default the service reports no serving identity for them. See "Effort caps and the context" and "Medium by default (local)" below. |
 | `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per deployment, not overridable via `.env`. |
 | `LLAMA_CPP_BUILD` | `b11151` | same | Reported in `ResultStamps`/`/v1/info`; shared with the compose image pin. |
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
@@ -167,11 +167,16 @@ retirement" note) rather than relying on this compose-file fallback;
 1800 for medium, and its low-effort override, 120, relies on the 4070's much
 faster decode to stay clear of this worst case.
 
-Every other `ServiceSettings` field (`reasoning_budget_tokens`,
-`idempotency_cache_size`, `scope_enabled`, `temperature`, `port`) has a
-tested default in `settings.py` and is left unset here deliberately --
-`EXTRACTION_REASONING_BUDGET_TOKENS` in particular MUST stay unset (see
-"No reasoning-budget cap" below).
+Every other `ServiceSettings` field (`idempotency_cache_size`,
+`scope_enabled`, `temperature`, `port`) has a tested default in
+`settings.py` and is left unset here deliberately.
+`EXTRACTION_REASONING_BUDGET_TOKENS` sets `reasoning_budget_tokens`, the
+reasoning budget the `gptoss` adapter puts on the extract request and the
+plan call (never on scope or derive): 8,192 by default
+(`DEFAULT_REASONING_BUDGET_TOKENS`), which the local compose file passes on
+as `${EXTRACTION_REASONING_BUDGET_TOKENS:-8192}` and the host file leaves to
+the service's own default. An integer sets another budget, and `none` sends
+no budget at all (see "No `--reasoning-budget` cap" below).
 
 **Idempotency-cache trap (operator note).** `ServiceSettings.idempotency_cache_size`
 (default 256) backs a `job_id` -> `ExtractResponse` LRU cache
@@ -238,14 +243,16 @@ real `--help` capture for this build.
   that worker's container either, per that file's own note).
 
 **No `--reasoning-budget` cap.** The flag is absent from both llama-server
-commands. The extraction service sends a per-request thinking budget
-(`ThinkingConfig.budget_tokens`, `None` by default per
-`backend/extraction_service/settings.py`'s `reasoning_budget_tokens`
-field); when `None`, the field is omitted from the outgoing request
-entirely (see that field's docstring), so llama-server's OWN default
-governs. That default is already `-1` (unrestricted,
-`llama_server_help_b11151.txt:644-645`), so a request-level `-1` and the
-server's own unset-flag default resolve to the same unbudgeted behavior.
+commands. The extraction service sends the budget per request instead
+(`ThinkingConfig.budget_tokens`, from
+`backend/extraction_service/settings.py`'s `reasoning_budget_tokens`):
+8,192 tokens on the extract request and the plan call by default, another
+integer when `EXTRACTION_REASONING_BUDGET_TOKENS` sets one, and none on
+scope or derive. Set the variable to `none` and the field is omitted from
+the outgoing request entirely (see that field's docstring), so
+llama-server's OWN default governs. That default is `-1` (unrestricted,
+`llama_server_help_b11151.txt:644-645`). Whether llama-server b11151
+honours the per-request budget is not measured here.
 `tests/unit/test_compose_extraction.py` (local) and
 `tests/unit/test_compose_extraction_host.py` (host) each assert
 `--reasoning-budget` is absent from their own llama-server command.
@@ -337,9 +344,11 @@ that stage (`STAGE_CAPS`, `stage_caps` and `GptOssAdapter.stage_effort`):
 | `EXTRACTION_REASONING_EFFORT` | scope | extract | derive | context needed |
 |---|---|---|---|---|
 | `low` (host default) | 96 | 2048 | 400 | 16,384 |
-| `medium` (local default) | 1024 | 32768 | 400 | 47,104 |
-| `high` | 1024 | 32768 | 400 | 47,104 |
+| `medium` (local default) | 96 | 32768 | 400 | 47,104 |
+| `high` | 96 | 32768 | 400 | 47,104 |
 
+- Scope is sent at `low` effort under every setting, so its cap is always
+  96: it is a classification.
 - Derive is sent at `low` effort under every setting, so its cap is always
   400. No effort run calls derive, so a higher effort there would ship
   unmeasured.
@@ -400,12 +409,21 @@ request, which can hold several capped calls: an extract batch cut short at
 its cap is split in two and retried (`backend/extraction_service/engine.py`).
 1,800 s covers two medium extract calls that run to their cap (about 651 s
 each), not three. A turn that caps three times can run past it: the
-dispatcher's client times out, and its retry sends a fresh `job_id`
-(`backend/extraction_backlog/dispatcher.py`), so the retry does not join the
-run still going and waits behind it on llama-server's single slot
+dispatcher's client times out and leaves. A run whose only waiting client
+has left is cancelled, and its streamed LLM call is closed, so no run is
+left going. The dispatcher counts the timeout as a failed attempt, and its
+retry sends a fresh `job_id` (`backend/extraction_backlog/dispatcher.py`),
+which starts a run of its own on llama-server's single slot
 (`LLAMA_ARG_N_PARALLEL=1`); the turn may be dead-lettered after
 `MIST_EXTRACTION_MAX_ATTEMPTS`. The `extraction call:` lines show how close a
-turn comes.
+turn comes. Whether llama-server b11151 stops generating as soon as the
+stream closes is not measured here.
+
+**Cancelling a job.** `POST /v1/jobs/<job_id>/cancel` cancels the job's run
+if one is in flight and answers 200 with a `CancelResponse` whose `status`
+is `cancelled`, `finished` or `unknown`; every request waiting on a
+cancelled run gets HTTP 499 with `ErrorCode.CANCELLED`, nothing is stored,
+and the same `job_id` runs again when it is sent again.
 
 Per-call token counts (operations note)
 ---------------------------------------

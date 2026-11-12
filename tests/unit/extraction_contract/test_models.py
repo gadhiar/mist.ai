@@ -14,6 +14,7 @@ from backend.extraction_contract import (
     CONTRACT_VERSION,
     ERROR_DEFAULT_RETRYABLE,
     ERROR_HTTP_STATUS,
+    CancelResponse,
     CutoverStatus,
     DerivationInput,
     DerivationOut,
@@ -466,14 +467,14 @@ class TestInfoResponseServingConfig:
 
 
 class TestContractVersion:
-    def test_the_contract_is_1_3_0(self):
-        assert CONTRACT_VERSION == "1.3.0"
+    def test_the_contract_is_1_4_0(self):
+        assert CONTRACT_VERSION == "1.4.0"
 
     def test_this_contract_accepts_its_own_version(self):
         assert is_compatible(CONTRACT_VERSION) is True
 
-    @pytest.mark.parametrize("version", ["1.2.0", "1.3.0"])
-    def test_a_1_2_0_and_a_1_3_0_peer_are_compatible(self, version):
+    @pytest.mark.parametrize("version", ["1.2.0", "1.3.0", "1.4.0"])
+    def test_an_earlier_minor_and_this_one_are_compatible(self, version):
         assert is_compatible(version) is True
 
 
@@ -704,7 +705,8 @@ class TestTurnPlan:
             TurnPlanOut.model_validate({"prompt_tokens": 1})
 
     def test_the_contract_version_did_not_move_for_it(self):
-        assert CONTRACT_VERSION == "1.3.0"
+        # 1.4.0 covers this field with T43's and T49's, but the field alone did not move it.
+        assert CONTRACT_VERSION == "1.4.0"
 
 
 _PROMPT_HASH = "a" * 64
@@ -786,7 +788,8 @@ class TestPackHashes:
         assert restored.stamps.pack_rails_hash == _RAILS_HASH
 
     def test_the_contract_version_did_not_move_for_them(self):
-        assert CONTRACT_VERSION == "1.3.0"
+        # 1.4.0 covers these fields with T42's and T49's, but they alone did not move it.
+        assert CONTRACT_VERSION == "1.4.0"
 
 
 class TestBatchRecord:
@@ -933,6 +936,7 @@ class TestErrorEnvelope:
             (ErrorCode.MODEL_LOADING, 503, True),
             (ErrorCode.UPSTREAM_LLM, 502, True),
             (ErrorCode.TIMEOUT, 504, True),
+            (ErrorCode.CANCELLED, 499, True),
         ],
     )
     def test_default_status_and_retryability(self, code, expected_status, expected_retryable):
@@ -950,10 +954,51 @@ class TestErrorEnvelope:
 
         assert envelope.error.retryable is False
 
+    def test_cancelled_is_its_own_code_on_the_wire(self):
+        """A cancelled job is told apart from a failed one by the code alone."""
+        assert ErrorCode.CANCELLED.value == "cancelled"
+        assert error_envelope(ErrorCode.CANCELLED, "job cancelled").model_dump(mode="json") == {
+            "error": {"code": "cancelled", "message": "job cancelled", "retryable": True}
+        }
+
+    def test_no_two_codes_share_a_status(self):
+        assert len(set(ERROR_HTTP_STATUS.values())) == len(ErrorCode)
+
     def test_every_error_code_has_a_status_and_default(self):
         for code in ErrorCode:
             assert code in ERROR_HTTP_STATUS
             assert code in ERROR_DEFAULT_RETRYABLE
+
+
+# ---------------------------------------------------------------------------
+# CancelResponse
+# ---------------------------------------------------------------------------
+
+
+class TestCancelResponse:
+    def test_the_cancel_reply_carries_the_job_id_and_a_status(self):
+        assert set(CancelResponse.model_fields) == {"job_id", "status"}
+        reply = CancelResponse(job_id="j-1", status="cancelled")
+
+        assert reply.model_dump(mode="json") == {"job_id": "j-1", "status": "cancelled"}
+        assert CancelResponse.model_validate_json(reply.model_dump_json()) == reply
+
+    @pytest.mark.parametrize("status", ["cancelled", "finished", "unknown"])
+    def test_each_of_the_three_statuses_is_accepted(self, status):
+        assert CancelResponse(job_id="j-1", status=status).status == status
+
+    @pytest.mark.parametrize("status", ["failed", "running", ""])
+    def test_any_other_status_is_refused(self, status):
+        with pytest.raises(ValidationError):
+            CancelResponse(job_id="j-1", status=status)
+
+    def test_the_package_exports_the_model_and_its_status_type(self):
+        import backend.extraction_contract as contract
+        from backend.extraction_contract import models
+
+        assert contract.CancelResponse is models.CancelResponse
+        assert contract.CancelOutcome is models.CancelOutcome
+        assert {"CancelResponse", "CancelOutcome"} <= set(contract.__all__)
 
 
 # ---------------------------------------------------------------------------

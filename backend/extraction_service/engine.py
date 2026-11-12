@@ -22,6 +22,7 @@ the plan existed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import importlib
@@ -150,8 +151,12 @@ class StageCaps:
 # medium extract cap sits above the longest extract call that stopped on its
 # own at high effort (28,916 tokens) and cuts a runaway call a third sooner than
 # the 49,152 that run used. High takes medium's caps; no run has measured them
-# at high. Derive keeps 400 at every effort because the adapters send derive at
-# low effort under every setting (`GptOssAdapter.stage_effort`).
+# at high. Scope and derive keep low's caps (96 and 400) at every effort:
+# `effective_cap` sizes a stage by the effort the adapter sends it, and the
+# adapters send both at low under every setting (`GptOssAdapter.stage_effort`),
+# so the medium and high scope entries below are never sent. Scope is a
+# classification, sent at low as one; derive stays at low because no effort run
+# calls it, so derive above low would ship unmeasured.
 STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
     {
         "low": StageCaps(
@@ -852,7 +857,7 @@ class ExtractionEngine:
         )
         return self._adapter.prepare(request, stage="derive")
 
-    async def _invoke(self, request: LLMRequest):
+    async def _invoke(self, request: LLMRequest, *, stream: bool = False):
         """Invoke the LLM under the configured timeout.
 
         Every response is logged (`_log_call`, at INFO), and one that stopped
@@ -860,18 +865,59 @@ class ExtractionEngine:
         both before it is returned, so before the stage that called raises,
         retries or degrades on it. Every stage's call passes here.
 
+        Args:
+            request: The stage's request, as the adapter prepared it.
+            stream: Send a streaming request and read it to its end
+                (`_read_stream`). The Stage 2 calls pass True, so that a call
+                which times out here, or whose run is cancelled, closes its
+                stream. Whether llama-server stops generating when the stream
+                closes is not measured here.
+
+        The call runs in the caller's task under `asyncio.timeout`, not in a
+        task of its own under `asyncio.wait_for`: on Python 3.11 `wait_for`
+        returns the result of a call that finished by the time a cancel of
+        the run woke it, and drops the cancel, so the run went on to its next
+        call. Here the cancel stays pending and ends the run at its next
+        await.
+
         Raises:
             TimeoutError: The call exceeded `settings.llm_timeout_seconds`.
             openai.APIError / LLMConnectionError / LLMResponseError: The
                 transport or provider failed.
         """
-        response = await asyncio.wait_for(
-            self._llm.invoke(request), timeout=self._settings.llm_timeout_seconds
-        )
+        async with asyncio.timeout(self._settings.llm_timeout_seconds):
+            if stream:
+                response = await self._read_stream(request)
+            else:
+                response = await self._llm.invoke(request)
         _log_call(request, response)
         if response.finish_reason == "length":
             _log_length_stop(request, response)
         return response
+
+    async def _read_stream(self, request: LLMRequest) -> LLMResponse:
+        """One streamed call, as the response a call that is not streamed returns.
+
+        The content is the partial chunks joined; the finish reason, usage
+        and reasoning are the final chunk's. The provider's generator is
+        closed on every way out, a cancellation or a timeout included, and
+        closing it closes the stream.
+
+        Raises:
+            LLMResponseError: The stream ended with no final chunk, so
+                nothing says the content is the whole reply.
+        """
+        parts: list[str] = []
+        final: LLMResponse | None = None
+        async with contextlib.aclosing(self._llm.generate(request, stream=True)) as chunks:
+            async for chunk in chunks:
+                if chunk.partial:
+                    parts.append(chunk.content or "")
+                else:
+                    final = chunk
+        if final is None:
+            raise LLMResponseError("the streamed LLM call ended with no final chunk")
+        return final.model_copy(update={"content": "".join(parts)})
 
     async def _run_scope(
         self, pre_processed: PreProcessedInput, warnings: list[str]
@@ -973,7 +1019,7 @@ class ExtractionEngine:
         response: LLMResponse | None = None
         failure: str | None = None
         try:
-            response = await self._invoke(request)
+            response = await self._invoke(request, stream=True)
         except TimeoutError:
             failure = f"timed out after {self._settings.llm_timeout_seconds}s"
         except _LLM_TRANSPORT_ERRORS as exc:
@@ -1071,7 +1117,7 @@ class ExtractionEngine:
             request = self._extract_request(messages=messages)
 
             try:
-                response = await self._invoke(request)
+                response = await self._invoke(request, stream=True)
             except TimeoutError as exc:
                 raise ExtractionTimeoutError(
                     f"Extraction LLM call timed out after {self._settings.llm_timeout_seconds}s"
