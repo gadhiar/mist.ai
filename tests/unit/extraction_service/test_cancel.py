@@ -173,6 +173,14 @@ class TestCancelRoute:
         assert {r.json()["error"]["code"] for r in responses} == {"cancelled"}
         assert fake_llama_state.chat_aborted == 1
 
+    async def test_the_reply_is_the_contract_model(self):
+        from backend.extraction_contract import models as contract
+        from backend.extraction_service import app
+
+        assert app.CancelResponse is contract.CancelResponse
+        assert app.CancelOutcome is contract.CancelOutcome
+        assert app.CancelResponse.__module__ == "backend.extraction_contract.models"
+
     async def test_an_unknown_job_is_reported_unknown(self, client, fake_llama_state):
         cancel = await client.post("/v1/jobs/never-sent/cancel")
 

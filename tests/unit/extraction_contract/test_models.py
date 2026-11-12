@@ -14,6 +14,7 @@ from backend.extraction_contract import (
     CONTRACT_VERSION,
     ERROR_DEFAULT_RETRYABLE,
     ERROR_HTTP_STATUS,
+    CancelResponse,
     CutoverStatus,
     DerivationInput,
     DerivationOut,
@@ -704,7 +705,7 @@ class TestTurnPlan:
             TurnPlanOut.model_validate({"prompt_tokens": 1})
 
     def test_the_contract_version_did_not_move_for_it(self):
-        # 1.4.0 is `ErrorCode.CANCELLED`'s minor, not this field's.
+        # 1.4.0 covers this field with T43's and T49's, but the field alone did not move it.
         assert CONTRACT_VERSION == "1.4.0"
 
 
@@ -787,7 +788,7 @@ class TestPackHashes:
         assert restored.stamps.pack_rails_hash == _RAILS_HASH
 
     def test_the_contract_version_did_not_move_for_them(self):
-        # 1.4.0 is `ErrorCode.CANCELLED`'s minor, not these fields'.
+        # 1.4.0 covers these fields with T42's and T49's, but they alone did not move it.
         assert CONTRACT_VERSION == "1.4.0"
 
 
@@ -967,6 +968,37 @@ class TestErrorEnvelope:
         for code in ErrorCode:
             assert code in ERROR_HTTP_STATUS
             assert code in ERROR_DEFAULT_RETRYABLE
+
+
+# ---------------------------------------------------------------------------
+# CancelResponse
+# ---------------------------------------------------------------------------
+
+
+class TestCancelResponse:
+    def test_the_cancel_reply_carries_the_job_id_and_a_status(self):
+        assert set(CancelResponse.model_fields) == {"job_id", "status"}
+        reply = CancelResponse(job_id="j-1", status="cancelled")
+
+        assert reply.model_dump(mode="json") == {"job_id": "j-1", "status": "cancelled"}
+        assert CancelResponse.model_validate_json(reply.model_dump_json()) == reply
+
+    @pytest.mark.parametrize("status", ["cancelled", "finished", "unknown"])
+    def test_each_of_the_three_statuses_is_accepted(self, status):
+        assert CancelResponse(job_id="j-1", status=status).status == status
+
+    @pytest.mark.parametrize("status", ["failed", "running", ""])
+    def test_any_other_status_is_refused(self, status):
+        with pytest.raises(ValidationError):
+            CancelResponse(job_id="j-1", status=status)
+
+    def test_the_package_exports_the_model_and_its_status_type(self):
+        import backend.extraction_contract as contract
+        from backend.extraction_contract import models
+
+        assert contract.CancelResponse is models.CancelResponse
+        assert contract.CancelOutcome is models.CancelOutcome
+        assert {"CancelResponse", "CancelOutcome"} <= set(contract.__all__)
 
 
 # ---------------------------------------------------------------------------

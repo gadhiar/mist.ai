@@ -29,12 +29,14 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from backend.errors import LLMConnectionError, LLMResponseError
 from backend.extraction_contract.models import (
     CONTRACT_MAJOR,
     CONTRACT_VERSION,
+    CancelOutcome,
+    CancelResponse,
     ErrorCode,
     ExtractRequest,
     ExtractResponse,
@@ -233,26 +235,6 @@ class ClientGoneError(ExtractionServiceError):
     The caller's own condition, not the job's: the run carries on while
     another caller waits on it.
     """
-
-
-CancelOutcome = Literal["cancelled", "finished", "unknown"]
-
-
-class CancelResponse(BaseModel):
-    """Response body of `POST /v1/jobs/{job_id}/cancel`.
-
-    Local to the service: the contract package has no model for it yet, and
-    no client in this repository calls the route.
-
-    Attributes:
-        job_id: The job the request named.
-        status: `cancelled` when a run was in flight and is now cancelled;
-            `finished` when the job already has a stored result, which is
-            kept; `unknown` when this process holds neither.
-    """
-
-    job_id: str
-    status: CancelOutcome
 
 
 async def _client_gone(request: Request) -> None:

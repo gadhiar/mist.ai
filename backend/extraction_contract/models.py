@@ -26,8 +26,12 @@ from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_seri
 # ResultStamps.serving_identity, InfoResponse.serving_identity with its
 # components and error, ServiceStatus.serving_identity and
 # CutoverStatus.target_serving_identity, all optional.
-# 1.4.0: additive -- ErrorCode.CANCELLED, the code a request waiting on a
-# cancelled job is answered with. No model gained or lost a field.
+# 1.4.0: additive -- the one minor above 1.3.0 for T42's, T43's and T49's
+# fields together. T49's: ErrorCode.CANCELLED, the code a request waiting on a
+# cancelled job is answered with, and CancelResponse with its CancelOutcome,
+# the reply of `POST /v1/jobs/{job_id}/cancel`. T42's turn plan fields and
+# T43's pack hashes, below, are covered by it, though none of them alone moved
+# the version.
 # Not a version: ExtractResponse.turn_plan is optional and left out of the
 # serialized response when None, which it is unless the service runs with its
 # off-by-default turn plan flag. A response without the flag is unchanged, so
@@ -397,6 +401,30 @@ def error_envelope(code: ErrorCode, message: str, retryable: bool | None = None)
     if retryable is None:
         retryable = ERROR_DEFAULT_RETRYABLE[code]
     return ErrorEnvelope(error=ErrorDetail(code=code, message=message, retryable=retryable))
+
+
+# ---------------------------------------------------------------------------
+# Cancel
+# ---------------------------------------------------------------------------
+
+CancelOutcome = Literal["cancelled", "finished", "unknown"]
+
+
+class CancelResponse(BaseModel):
+    """Response body of `POST /v1/jobs/{job_id}/cancel`.
+
+    The route always answers 200; the status says what the service found.
+    A request waiting on a cancelled job is answered `ErrorCode.CANCELLED`.
+
+    Attributes:
+        job_id: The job the request named.
+        status: `cancelled` when a run was in flight and is now cancelled;
+            `finished` when the job already has a stored result, which is
+            kept; `unknown` when the service holds neither.
+    """
+
+    job_id: str
+    status: CancelOutcome
 
 
 # ---------------------------------------------------------------------------
