@@ -22,7 +22,12 @@ from backend.knowledge.ontologies.base import NodeTypeDefinition, PropertyDefini
 
 
 class SchemaGenerationError(MistError):
-    """A pack's names give no schema: the message says which name and why."""
+    """A pack's declarations give no schema: the message says which name and why.
+
+    Raised when a list of names could not stand as an enum (empty, or holding an empty or
+    repeated name), and when a property the model writes declares a type with no JSON
+    type the schema can state.
+    """
 
 
 SCOPE_OUTPUT_SCHEMA: dict = {
