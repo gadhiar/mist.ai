@@ -290,9 +290,9 @@ row in that guide's register.
 
 | Convention | Carrier | Class |
 |---|---|---|
-| Named teams (N17; Rule 34): each person placed in a named team also `WORKS_AT` the employer the utterance names for that team | Rule 34 in `prompt-rules-11-to-37` | prompt rule |
-| Durable third-party facts (Rule 19): in a user-scope turn, the user `KNOWS_PERSON` each person the utterance places in a named team, whether or not the user is in it, since a placement is a durable fact about that person. The user gets no edge to themself | Rule 19 in `prompt-rules-11-to-37` | prompt rule |
-| Named teams (N17; Rule 34): a team's `PART_OF` its employer is not stored. This covers a team `Organization` to its employer only; any other `PART_OF` is kept | Rule 34 in `prompt-rules-11-to-37` | prompt rule |
+| Named teams (N17; Rule 34): each person placed in a named team also `WORKS_AT` the employer the utterance names for that team | Rule 34 in `prompt-rules-11-to-37`, and `team-fan-out` | prompt rule and relation rail |
+| Durable third-party facts (Rule 19): in a user-scope turn, the user `KNOWS_PERSON` each person the utterance places in a named team, whether or not the user is in it, since a placement is a durable fact about that person. The user gets no edge to themself | Rule 19 in `prompt-rules-11-to-37`, and `team-fan-out` | prompt rule and relation rail |
+| Named teams (N17; Rule 34): a team's `PART_OF` its employer is not stored. This covers a team `Organization` to its employer only; any other `PART_OF` is kept | Rule 34 in `prompt-rules-11-to-37`, and `team-part-of` | prompt rule and relation rail |
 | List rules, unchecked box: a `[ ]` item yields no edge, except `HAS_GOAL` when its lead-in, or any heading or parent bullet above it, contains one of these goal words, as a whole word in any case, singular or plural: goal, objective, resolution, aim, aspiration, target, and the phrase "bucket list". An unchecked itinerary item is a plan and yields no edge | Rule 29 in `prompt-rules-11-to-37`, and `unchecked-goals` | prompt rule and pre-LLM rule |
 | N2 Goal ids | Rule 22 in `prompt-rules-11-to-37` | prompt rule |
 | The user anchor | Rule 1 in `prompt-rules-1-to-3`, and `reserved-mist-identity` | prompt rule and payload rail |
