@@ -207,6 +207,9 @@ _DOUBLED = [
 ]
 _DOUBLED_ROW = (_DOUBLED, [], [_batch([("Redis",)], _DOUBLED)], BASE)
 
+_WRITTEN_TWICE = [_hand("night-watch-night-watch-tolliver", "Tolliver")]
+_WRITTEN_TWICE_ROW = (_WRITTEN_TWICE, [], [_batch([NIGHT_WATCH], _WRITTEN_TWICE)], BASE)
+
 # Ids that a strip would leave as a name the v1.4.0 pack reserves, or as the id it
 # maps those names to. Neither entity is itself reserved: its name and its whole id
 # are not reserved names.
@@ -260,6 +263,52 @@ _KEPT_BUILT = [
 ]
 _KEPT_BUILT_ROW = (_KEPT_BUILT, [], [_batch([NIGHT_WATCH], _KEPT_BUILT)], BASE)
 
+# The rows of the conditions v14 stated, each kept whole: no batch record, an exempt
+# type (read from the pack's rules), and an id that is the context and nothing more.
+_UNRECORDED_ROW = (_ROSTER, _ROSTER_EDGES, [], BASE)
+
+_QUAY = {"id": "night-watch-far-quay", "name": "Far quay", "type": "Mooring"}
+_QUAY_ROW = ([_QUAY], [], [_batch([NIGHT_WATCH], [_QUAY])], BASE)
+
+_BISCUIT = {"id": "our-pets-biscuit", "name": "Biscuit", "type": "Pet"}
+_PET_EXEMPTING = _with_rule(
+    PET,
+    ConventionRule(id="pet-exempt", kind="id_exempt", phase=ID, params=IdExempt(types=("Pet",))),
+)
+_BISCUIT_ROW = ([_BISCUIT], [], [_batch([("Our pets",)], [_BISCUIT])], PET)
+_BISCUIT_EXEMPT_ROW = (*_BISCUIT_ROW[:3], _PET_EXEMPTING)
+
+_WATCH = _hand("Night watch")
+_WATCH_ROW = ([_WATCH], [], [_batch([NIGHT_WATCH], [_WATCH])], BASE)
+
+# The fourth: an id the strip would leave empty, or only hyphens. Each case is
+# (lead-in, written id, the id it keeps).
+_EMPTIED = [
+    pytest.param("???", "??? ", "???-", id="one-space"),
+    pytest.param("???", "???  ", "???--", id="two-spaces"),
+    pytest.param("Список", "Список ", "список-", id="no-ascii-letter"),
+    pytest.param("Список", "список-", "список-", id="a-written-hyphen"),
+]
+
+
+def _emptied_row(lead_in: str, written: str) -> tuple:
+    entity = _hand(written, lead_in)
+    return ([entity], [], [_batch([(lead_in,)], [entity])], BASE)
+
+
+# The second assertion of the tests above whose first runs a row of its own.
+_CLUSTERS_ROW = (_STORES[2:], [], _STORES_RECORD[1:], NO_ALIAS)
+
+_EVENT_ONLY = [_HOUSEWARMING[0], _HOUSEWARMING[2]]
+_EVENT_ONLY_ROW = (_EVENT_ONLY, [], [_batch([("Maelle",)], _EVENT_ONLY)], V1_4_0)
+
+_UNRESERVED = _with_rules(
+    BASE, tuple(rule for rule in BASE.rules if rule.kind != "reserved_identity")
+)
+_KEPT_UNRESERVED_ROW = (*_KEPT_ROW[:3], _UNRESERVED)
+
+_TOOLS_VERSIONED_UNRECORDED_ROW = (*_TOOLS_VERSIONED_ROW[:2], [], V1_4_0)
+
 
 def test_a_lead_ins_slug_in_front_of_each_items_id_is_stripped_and_the_edges_follow():
     entities, relationships = _run(_ROSTER, _ROSTER_EDGES, batch_record=_ROSTER_RECORD)
@@ -299,9 +348,7 @@ def test_an_items_id_loses_a_lead_in_that_is_in_its_name_and_names_no_entity():
 
 
 def test_a_row_without_a_batch_record_is_not_stripped():
-    entities, _ = _run(_ROSTER, _ROSTER_EDGES)
-
-    assert _ids(entities) == [
+    assert _row_ids(_UNRECORDED_ROW) == [
         "user",
         "night-watch-tolliver-at-mooring-12",
         "night-watch-fenwick",
@@ -323,29 +370,16 @@ def test_one_entity_normalized_alone_has_no_record_and_is_not_stripped():
 
 
 def test_an_id_that_is_the_context_and_nothing_more_is_kept():
-    watch = _hand("Night watch")
-
-    assert _stored(watch, _batch([NIGHT_WATCH], [watch])) == "night-watch"
+    assert _row_ids(_WATCH_ROW) == ["night-watch"]
 
 
 def test_a_type_an_id_exempt_rule_names_is_not_stripped():
-    quay = {"id": "night-watch-far-quay", "name": "Far quay", "type": "Mooring"}
-
-    assert _stored(quay, _batch([NIGHT_WATCH], [quay])) == "night-watch-far-quay"
+    assert _row_ids(_QUAY_ROW) == ["night-watch-far-quay"]
 
 
 def test_the_exempt_types_are_read_from_the_packs_rules():
-    biscuit = {"id": "our-pets-biscuit", "name": "Biscuit", "type": "Pet"}
-    record = _batch([("Our pets",)], [biscuit])
-    exempting = _with_rule(
-        PET,
-        ConventionRule(
-            id="pet-exempt", kind="id_exempt", phase=ID, params=IdExempt(types=("Pet",))
-        ),
-    )
-
-    assert _stored(biscuit, record, pack=PET) == "biscuit"
-    assert _stored(biscuit, record, pack=exempting) == "our-pets-biscuit"
+    assert _row_ids(_BISCUIT_ROW) == ["biscuit"]
+    assert _row_ids(_BISCUIT_EXEMPT_ROW) == ["our-pets-biscuit"]
 
 
 def test_a_settled_entity_is_not_stripped():
@@ -372,23 +406,12 @@ def test_a_settled_entity_is_not_stripped():
     assert _stored(_hand("night-warden", "Warden"), record) == "warden"
 
 
-@pytest.mark.parametrize(
-    ("lead_in", "written", "kept"),
-    [
-        ("???", "??? ", "???-"),
-        ("???", "???  ", "???--"),
-        ("Список", "Список ", "список-"),
-        ("Список", "список-", "список-"),
-    ],
-    ids=["one-space", "two-spaces", "no-ascii-letter", "a-written-hyphen"],
-)
+@pytest.mark.parametrize(("lead_in", "written", "kept"), _EMPTIED)
 def test_an_id_that_is_the_context_and_a_hyphen_is_kept(lead_in, written, kept):
     # A slug with no ASCII letter or digit is the lowered text with a hyphen for each
     # space, so it can end in a hyphen: dropping the context and its hyphen would
     # leave an empty id, or only hyphens.
-    entity = _hand(written, lead_in)
-
-    assert _stored(entity, _batch([(lead_in,)], [entity])) == kept
+    assert _row_ids(_emptied_row(lead_in, written)) == [kept]
 
 
 # --- a context that names an entity of the row ------------------------------------------------
@@ -397,15 +420,13 @@ def test_an_id_that_is_the_context_and_a_hyphen_is_kept(lead_in, written, kept):
 def test_a_heading_that_is_an_entity_of_the_row_is_kept_in_its_items_ids():
     assert _row_ids(_STORES_ROW) == ["redis", "postgres", "redis-cluster", "postgres-cluster"]
     # With neither heading in the row, both items lose theirs and become one entity.
-    assert _row_ids((_STORES[2:], [], _STORES_RECORD[1:], NO_ALIAS)) == ["cluster"]
+    assert _row_ids(_CLUSTERS_ROW) == ["cluster"]
 
 
 def test_the_v1_4_0_event_id_keeps_an_owner_that_is_a_person_of_the_row():
     assert _row_ids(_HOUSEWARMING_ROW) == ["user", "maelle", "maelle-housewarming-in-dunmarrow"]
     # The example's own payload holds no such Person, and its id loses the heading.
-    event_only = [_HOUSEWARMING[0], _HOUSEWARMING[2]]
-    record = [_batch([("Maelle",)], event_only)]
-    assert _row_ids((event_only, [], record, V1_4_0)) == ["user", "housewarming-in-dunmarrow"]
+    assert _row_ids(_EVENT_ONLY_ROW) == ["user", "housewarming-in-dunmarrow"]
 
 
 @pytest.mark.parametrize(
@@ -456,9 +477,7 @@ def test_an_id_that_carries_two_lines_of_its_context_loses_both():
 
 
 def test_a_context_written_twice_is_dropped_twice():
-    doubled = _hand("night-watch-night-watch-tolliver", "Tolliver")
-
-    assert _stored(doubled, _batch([NIGHT_WATCH], [doubled])) == "tolliver"
+    assert _row_ids(_WRITTEN_TWICE_ROW) == ["tolliver"]
     # Both of this batch's ids are stored as one: the id with the context twice, and
     # the id with it once.
     assert _row_ids(_DOUBLED_ROW) == ["cluster"]
@@ -478,10 +497,7 @@ def test_the_user_anchors_id_and_a_reserved_name_or_id_are_read_from_the_pack():
         "night-watch-harbourmaster",
     ]
     # A pack with no `reserved_identity` rule reserves nothing; the anchor is its manifest's.
-    unreserved = _with_rules(
-        BASE, tuple(rule for rule in BASE.rules if rule.kind != "reserved_identity")
-    )
-    assert _row_ids((*_KEPT_ROW[:3], unreserved)) == [
+    assert _row_ids(_KEPT_UNRESERVED_ROW) == [
         "night-watch-user",
         "harbour-master",
         "harbourmaster",
@@ -503,7 +519,7 @@ def test_a_strip_is_refused_when_the_version_rail_would_build_a_reserved_name_fr
     # The version rail drops `-2` from each id, with or without the record; the context
     # stays on the two ids whose rest it would build into `mist`.
     assert _row_ids(_TOOLS_VERSIONED_ROW) == ["tools-mist", "tools-the-mist", "lanternfish"]
-    assert _row_ids((*_TOOLS_VERSIONED_ROW[:2], [], V1_4_0)) == [
+    assert _row_ids(_TOOLS_VERSIONED_UNRECORDED_ROW) == [
         "tools-mist",
         "tools-the-mist",
         "tools-the-lanternfish",
@@ -671,36 +687,36 @@ def test_the_roster_row_gives_the_bytes_stated_here():
 @pytest.mark.parametrize(
     "row",
     [
-        _ROSTER_ROW,
-        _DAWN_ROW,
-        _STORES_ROW,
-        _HOUSEWARMING_ROW,
-        _NODES_ROW,
-        _PLAN_ROW,
-        _VISIT_ROW,
-        _DOUBLED_ROW,
-        _TOOLS_ROW,
-        _KEPT_ROW,
-        _TOOLS_BUILT_ROW,
-        _TOOLS_VERSIONED_ROW,
-        _PEOPLE_ROW,
-        _KEPT_BUILT_ROW,
-    ],
-    ids=[
-        "the-roster",
-        "the-target",
-        "headings-that-are-entities",
-        "the-v1-4-0-event",
-        "a-refused-longest-line",
-        "an-id-that-is-the-longest-line",
-        "two-lines",
-        "a-context-written-twice",
-        "the-v1-4-0-reserved-names",
-        "the-anchor-and-the-reserved-names",
-        "the-v1-4-0-reserved-names-the-leading-word-rail-builds",
-        "the-v1-4-0-reserved-names-the-version-rail-builds",
-        "the-anchor-the-leading-word-rail-builds",
-        "the-anchor-and-a-reserved-name-the-leading-word-rail-builds",
+        pytest.param(_ROSTER_ROW, id="the-roster"),
+        pytest.param(_DAWN_ROW, id="the-target"),
+        pytest.param(_UNRECORDED_ROW, id="no-batch-record"),
+        pytest.param(_QUAY_ROW, id="an-exempt-type"),
+        pytest.param(_BISCUIT_ROW, id="a-pack-with-no-exempt-rule"),
+        pytest.param(_BISCUIT_EXEMPT_ROW, id="a-pack-whose-rule-exempts-the-type"),
+        pytest.param(_WATCH_ROW, id="the-context-and-nothing-more"),
+        *(
+            pytest.param(_emptied_row(*case.values[:2]), id=f"the-context-and-hyphens-{case.id}")
+            for case in _EMPTIED
+        ),
+        pytest.param(_STORES_ROW, id="headings-that-are-entities"),
+        pytest.param(_CLUSTERS_ROW, id="headings-that-are-no-entity"),
+        pytest.param(_HOUSEWARMING_ROW, id="the-v1-4-0-event"),
+        pytest.param(_EVENT_ONLY_ROW, id="the-v1-4-0-event-with-no-owner"),
+        pytest.param(_NODES_ROW, id="a-refused-longest-line"),
+        pytest.param(_PLAN_ROW, id="an-id-that-is-the-longest-line"),
+        pytest.param(_VISIT_ROW, id="two-lines"),
+        pytest.param(_WRITTEN_TWICE_ROW, id="one-id-with-its-context-twice"),
+        pytest.param(_DOUBLED_ROW, id="a-context-written-twice"),
+        pytest.param(_TOOLS_ROW, id="the-v1-4-0-reserved-names"),
+        pytest.param(_KEPT_ROW, id="the-anchor-and-the-reserved-names"),
+        pytest.param(_KEPT_UNRESERVED_ROW, id="a-pack-with-no-reserved-rule"),
+        pytest.param(_TOOLS_BUILT_ROW, id="the-v1-4-0-reserved-names-the-leading-word-rail-builds"),
+        pytest.param(_TOOLS_VERSIONED_ROW, id="the-v1-4-0-reserved-names-the-version-rail-builds"),
+        pytest.param(_TOOLS_VERSIONED_UNRECORDED_ROW, id="the-version-rail-with-no-record"),
+        pytest.param(_PEOPLE_ROW, id="the-anchor-the-leading-word-rail-builds"),
+        pytest.param(
+            _KEPT_BUILT_ROW, id="the-anchor-and-a-reserved-name-the-leading-word-rail-builds"
+        ),
     ],
 )
 def test_a_second_run_over_a_rows_own_output_changes_nothing(row):
