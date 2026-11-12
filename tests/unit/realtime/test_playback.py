@@ -678,9 +678,7 @@ class TestTerminalFrames:
         assert harness.control[1].reason == "barge_in"
 
     @pytest.mark.asyncio
-    async def test_a_second_end_or_stop_sends_nothing_and_no_0x01_follows_a_terminal(
-        self, harness
-    ):
+    async def test_a_second_end_or_stop_sends_nothing_and_no_0x01_follows_a_terminal(self, harness):
         segment = _segment("Hi.")
         harness.pacer.submit(0, _chunk(segment, 40))
         harness.pacer.finish()

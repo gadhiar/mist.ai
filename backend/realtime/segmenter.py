@@ -146,7 +146,8 @@ class SpeechSegmenter:
 
     def _split_point(self, piece: str) -> int:
         """The cut for an over-long piece: its last clause boundary within the cap, else its
-        last whitespace within the cap, else the cap itself."""
+        last whitespace within the cap, else the cap itself.
+        """
         cap = self._config.max_segment_chars
         window = piece[: cap + 1]
         best: int | None = None
