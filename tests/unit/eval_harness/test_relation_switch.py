@@ -9,13 +9,22 @@ the same payload with only the relation rules left out (plan v15, T50 Acceptance
 from __future__ import annotations
 
 import copy
+import dataclasses
 import inspect
 import json
 
 import pytest
 
-from backend.knowledge.extraction.rails import rail_row, run_rails
-from backend.knowledge.ontologies.pack import RELATION, Pack, build_pack, load_pack
+from backend.knowledge.extraction.rails import _run_phases, rail_row, run_rails
+from backend.knowledge.ontologies.pack import (
+    RELATION,
+    ConventionRule,
+    EdgeSuppress,
+    Pack,
+    _rule_plugins,
+    build_pack,
+    load_pack,
+)
 from tests.unit.knowledge.ontologies.fixtures.pet_pack.conventions import PET_ROSTER_CASE
 
 PET = load_pack("tests.unit.knowledge.ontologies.fixtures.pet_pack")
@@ -94,10 +103,11 @@ def test_the_default_call_is_byte_identical_to_the_call_before_the_switch():
 # --- the v1.4.0 pack (plan v15, T50 Acceptance 7) ----------------------------------------------
 #
 # The id phase runs in both columns, so an Event dated by its own edge gets one id in each.
-# Each relation-phase rule of the pack must change an edge in its own pinned case, or the
-# two columns could not differ by it. The parameter set is the pack's relation-phase rules,
-# each test named by the rule's id: a pack with none reports the test as skipped for an
-# empty parameter set, and nothing here asserts the set is non-empty.
+# Each relation-phase rule of the pack must change an edge in its own pinned case when it
+# alone is deleted, or the two columns could not differ by it. The parameter set is the
+# pack's relation-phase rules, each test named by the rule's id: a pack with none reports
+# one skipped test whose reason names the pack, and nothing here asserts the set is
+# non-empty.
 
 V1_4_0 = load_pack("backend.knowledge.ontologies.packs.v1_4_0")
 
@@ -141,24 +151,89 @@ def _edges(result) -> set[tuple[str, str, str]]:
     return {(r["source"], r["type"], r["target"]) for r in relationships}
 
 
-_RELATION_RULES = V1_4_0.rules_in(RELATION)
+def _case_row(case):
+    return rail_row(
+        copy.deepcopy(list(case.entities)),
+        copy.deepcopy(list(case.relationships)),
+        scope=case.scope,
+        batch_record=copy.deepcopy(case.batch_record),
+        turn_plan=copy.deepcopy(case.turn_plan),
+    )
 
 
-@pytest.mark.parametrize("rule", _RELATION_RULES, ids=[rule.id for rule in _RELATION_RULES])
-def test_every_relation_rule_changes_an_edge_in_its_pinned_case(rule):
+def _without_rule(pack: Pack, rule) -> Pack:
+    """`pack` again with `rule` deleted, and with it any plug-in no other rule names.
+
+    `build_pack` refuses a pack carrying the release's version with hashes other than the
+    release's, so the cut-down pack takes a version of its own.
+    """
+    rules = tuple(kept for kept in pack.rules if kept.id != rule.id)
+    named = {name for kept in rules for name in _rule_plugins(kept)}
+    return build_pack(
+        manifest=dataclasses.replace(pack.manifest, version=f"{pack.version}-without-{rule.id}"),
+        node_types=pack.node_types,
+        edge_types=pack.edge_types,
+        extractable_node_types=pack.extractable_node_types,
+        extractable_edge_types=pack.extractable_edge_types,
+        rules=rules,
+        plugins=tuple(plugin for plugin in pack.plugins if plugin.name in named),
+    )
+
+
+def _changed_edges(pack: Pack, rule) -> set[tuple[str, str, str]]:
+    """The edges `rule` alone adds or removes in its own pinned case.
+
+    The full pack runs through `run_rails`, so its pinned cases are checked. The cut-down
+    pack runs through `_run_phases`, which skips that check: with `rule` gone, another
+    rule's case that leans on it no longer holds, and that is the difference measured here.
+    """
     case = rule.pinned_case
     assert case is not None, f"{rule.id} has no pinned case"
+    with_rule = _edges(run_rails(_case_row(case), pack))
+    without_rule = _edges(_run_phases(_case_row(case), _without_rule(pack, rule)))
+    return with_rule ^ without_rule
 
-    def row():
-        return rail_row(
-            copy.deepcopy(list(case.entities)),
-            copy.deepcopy(list(case.relationships)),
-            scope=case.scope,
-            batch_record=copy.deepcopy(case.batch_record),
-            turn_plan=copy.deepcopy(case.turn_plan),
-        )
 
-    with_rails = _edges(run_rails(row(), V1_4_0))
-    model_written = _edges(run_rails(row(), V1_4_0, relation_rails=False))
+# The pet pack, plus an `edge_suppress` rule that matches nothing: no `Pet` is the source of
+# a `HAS_PET`. Its pinned case is the roster case, where the working `pet-roster` fan-out
+# adds an edge, so only a comparison that deletes the inert rule alone finds it inert.
+_INERT = ConventionRule(
+    id="inert-pet-suppress",
+    kind="edge_suppress",
+    phase=RELATION,
+    params=EdgeSuppress(edge="HAS_PET", source_types=("Pet",)),
+    pinned_case=PET_ROSTER_CASE,
+    prompt_rule="N18",
+)
+_PET_AND_INERT = build_pack(
+    manifest=PET.manifest,
+    node_types=PET.node_types,
+    edge_types=PET.edge_types,
+    extractable_node_types=PET.extractable_node_types,
+    extractable_edge_types=PET.extractable_edge_types,
+    rules=(*PET.rules, _INERT),
+    plugins=PET.plugins,
+)
 
-    assert with_rails != model_written
+
+def test_a_rule_that_does_nothing_changes_no_edge_in_its_pinned_case():
+    assert _changed_edges(_PET_AND_INERT, _INERT) == set()
+
+
+def test_a_working_rule_changes_an_edge_in_its_pinned_case():
+    (roster,) = (rule for rule in _PET_AND_INERT.rules if rule.id == "pet-roster")
+
+    assert _changed_edges(_PET_AND_INERT, roster) == {("user", "HAS_PET", "mango")}
+
+
+def _relation_rule_params(pack: Pack) -> list:
+    rules = [pytest.param(rule, id=rule.id) for rule in pack.rules_in(RELATION)]
+    if rules:
+        return rules
+    reason = f"pack {pack.version} has no relation-phase rule"
+    return [pytest.param(None, id="no-relation-rule", marks=pytest.mark.skip(reason=reason))]
+
+
+@pytest.mark.parametrize("rule", _relation_rule_params(V1_4_0))
+def test_every_relation_rule_changes_an_edge_in_its_pinned_case(rule):
+    assert _changed_edges(V1_4_0, rule)
