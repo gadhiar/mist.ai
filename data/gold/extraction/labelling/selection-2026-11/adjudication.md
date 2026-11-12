@@ -1221,6 +1221,7 @@ nothing else in the probe changes, and the probe's ruling above stands except fo
 - `sel-096-list-dash-monday-first-things`: `ampere-atlas` -> `ampere-atlas-dashboard`, in its entity and 2 relation endpoints. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
 - `sel-115-multi-grid-scientist-utrecht`: `gridcast` -> `gridcast-forecast`, in its entity and 1 relation endpoint. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
 - `sel-161-multi-sous-chef-club-newsletter`: `second-stove` -> `second-stove-newsletter`, in its entity and 1 relation endpoint. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
+- `sel-096-list-dash-monday-first-things`: `ampere-atlas-dashboard IS_A dashboard` dropped. Rule 25: no IS_A edge when the kind is part of the name, and the kind is now part of the entity's own id.
 
 Kept as ruled, counted unsure, where Rule 23 is not explicit:
 
@@ -1235,7 +1236,7 @@ Kept as ruled, counted unsure, where Rule 23 is not explicit:
 - `sel-024-scope-notes-and-tone`: the noun after the name is plural and names files of a format, not one thing as in Rule 23's example.
 - `sel-092-coref-editor-and-deputy`: the name does not only modify: the utterance refers back to it as an organisation, the target of both WORKS_AT edges.
 
-Ids renamed: 4, in 4 probes; relation endpoints renamed: 6. Kept and counted unsure: 10.
+Ids renamed: 4, in 4 probes; relation endpoints renamed: 6; relations dropped under Rule 25: 1. Kept and counted unsure: 10.
 
 ## Totals
 
