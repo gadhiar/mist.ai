@@ -13,8 +13,11 @@ A convention's label is derived from the lines above the register, never listed 
   the numbered rules under it do.
 
 A row is a label's row when its key holds the label. The key is the Convention cell up to
-its first colon, or the whole cell when it has none. An N number stands anywhere in the
-key as a whole word; a heading opens it.
+its first colon, or the whole cell when it has none. An N number opens the key as a whole
+word; a heading is the whole key. So a row that only cites a label, as the amendment's
+first rows cite N17, is not that label's row. Every label has a row, and every row is a
+label's, save the rows a register holds for conventions another document states, which
+the caller names by their keys.
 
 A Carrier cell names a carrier in one of these forms, and anything else names none:
 
@@ -55,6 +58,7 @@ A section of the gold guide that states no labelling convention is named in
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import inspect
 import re
@@ -126,10 +130,10 @@ class Row:
         return self.convention.split(":", 1)[0]
 
     def holds(self, label: str) -> bool:
-        """Whether this is a row of the convention `label`."""
+        """Whether this is the row of the convention `label`."""
         if _N_LABEL_RE.fullmatch(label):
-            return re.search(rf"\b{label}\b", self.key) is not None
-        return self.key.startswith(label)
+            return re.match(rf"{label}\b", self.key) is not None
+        return self.key == label
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +229,14 @@ def _missing_rows(register: Register) -> list[str]:
     ]
 
 
+def _stray_rows(register: Register, elsewhere: Collection[str] = ()) -> list[str]:
+    return [
+        f"row `{row.key}`: no convention above the register has this label"
+        for row in register.rows
+        if row.key not in elsewhere and not any(row.holds(label) for label in register.labels)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # What a Carrier cell names
 # ---------------------------------------------------------------------------
@@ -277,9 +289,10 @@ def quoted_words(convention: str) -> tuple[str, ...]:
     match = _WORDS_RE.search(convention)
     if match is None:
         return ()
+    items = [item.strip() for item in match["words"].split(",")]
+    items[-1] = items[-1].removeprefix("and ").strip()
     words: list[str] = []
-    for item in match["words"].split(","):
-        item = item.strip().removeprefix("and ").strip()
+    for item in items:
         phrase = _PHRASE_RE.fullmatch(item)
         words.append(phrase.group(1) if phrase else item)
     return tuple(word for word in words if word)
@@ -378,14 +391,16 @@ def _pack_row_problems(row: Row, pack: Pack) -> list[str]:
     return problems or _class_problems(row, where, carried_by)
 
 
-def pack_register_problems(pack: Pack) -> list[str]:
+def pack_register_problems(pack: Pack, elsewhere: Collection[str] = ()) -> list[str]:
     """What is wrong with the register of a pack's guide; empty when it holds.
 
     Args:
         pack: A loaded pack. Its guide is `pack.labelling`.
+        elsewhere: The keys of the rows the register may hold for conventions that
+            another document states.
     """
     register = read_register(pack.labelling)
-    problems = [*register.problems, *_missing_rows(register)]
+    problems = [*register.problems, *_missing_rows(register), *_stray_rows(register, elsewhere)]
     for row in register.rows:
         problems.extend(_pack_row_problems(row, pack))
     return problems
@@ -434,7 +449,7 @@ def guide_register_problems(
     """
     register = read_register(text, not_conventions)
     listed = read_register(pack.labelling).rows
-    problems = [*register.problems, *_missing_rows(register)]
+    problems = [*register.problems, *_missing_rows(register), *_stray_rows(register)]
     for row in register.rows:
         problems.extend(_generic_row_problems(row, listed))
     return problems
@@ -503,6 +518,12 @@ def test_a_rule_number_with_no_place_names_no_carrier():
     )
 
 
+def test_only_the_last_quoted_word_may_open_with_and():
+    cell = "Berths: kept under one of these words: and so on, drill, and muster. No other is"
+
+    assert quoted_words(cell) == ("and so on", "drill", "muster")
+
+
 # ---------------------------------------------------------------------------
 # The failing cases, each on a copy of the base fixture pack under `tmp_path`
 # ---------------------------------------------------------------------------
@@ -525,13 +546,13 @@ def _swap(old: str, new: str) -> Edit:
 
 
 @pytest.fixture
-def base_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Pack]]:
-    """Load a copy of the base fixture pack from `tmp_path`, edited before it is loaded."""
-    source = Path(str(importlib.import_module(BASE).__file__)).parent
+def pack_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Pack]]:
+    """Load a copy of a pack's package from `tmp_path`, edited before it is loaded."""
     package = f"copy_{tmp_path.name}"
     monkeypatch.syspath_prepend(str(tmp_path))
 
-    def load(*, guide: Edit | None = None, conventions: Edit | None = None) -> Pack:
+    def load(of: str, *, guide: Edit | None = None, conventions: Edit | None = None) -> Pack:
+        source = Path(str(importlib.import_module(of).__file__)).parent
         target = tmp_path / package
         shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
         for name, edit in (("labelling.md", guide), ("conventions.py", conventions)):
@@ -544,6 +565,12 @@ def base_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Calla
 
     for name in [name for name in sys.modules if name.split(".")[0] == package]:
         del sys.modules[name]
+
+
+@pytest.fixture
+def base_copy(pack_copy) -> Callable[..., Pack]:
+    """Load an edited copy of the base fixture pack from `tmp_path`."""
+    return functools.partial(pack_copy, BASE)
 
 
 def test_an_unedited_copy_holds(base_copy):
@@ -682,6 +709,24 @@ def test_an_unedited_copy_holds(base_copy):
             "not a row of three cells: | N2 A skipper's rank | `skipper-outranks` |",
             id="a-row-of-two-cells",
         ),
+        pytest.param(
+            f"{_N2_ROW}\n",
+            f"{_N2_ROW}\n| N99 Phantom | `skipper-outranks` | relation rail |\n",
+            "row `N99 Phantom`: no convention above the register has this label",
+            id="a-row-of-no-convention",
+        ),
+        pytest.param(
+            f"{_N2_ROW}\n",
+            f"{_N2_ROW}\n| A skipper (N2) | `skipper-outranks` | relation rail |\n",
+            "row `A skipper (N2)`: no convention above the register has this label",
+            id="a-row-that-cites-a-rule-number-it-does-not-open-with",
+        ),
+        pytest.param(
+            f"{_N2_ROW}\n",
+            f"{_N2_ROW}\n| Unchecked items, again | `skipper-outranks` | relation rail |\n",
+            "row `Unchecked items, again`: no convention above the register has this label",
+            id="a-row-that-opens-with-a-heading-and-goes-on",
+        ),
     ],
 )
 def test_a_register_that_does_not_hold_fails(base_copy, old: str, new: str, problem: str):
@@ -748,11 +793,22 @@ def test_an_engine_rule_beside_a_pack_rule_is_a_carrier_of_its_own_class(base_co
 # ---------------------------------------------------------------------------
 
 
+def _registry_pack_problems(pack: Pack) -> list[str]:
+    """What is wrong with the register of a pack the engine may run with.
+
+    Beyond its own guide's conventions, such a register may hold the first rows of the
+    amendment, and a row for each generic row of the gold guide, under that row's key.
+    """
+    guide = read_register(_GUIDE.read_text(encoding="utf-8"), _NOT_CONVENTIONS)
+    first = (Row(convention, "", "") for convention in _FIRST_ROWS)
+    return pack_register_problems(pack, {row.key for row in (*guide.rows, *first)})
+
+
 @pytest.mark.parametrize("version", registry.available_versions())
 def test_the_register_of_a_pack_the_registry_lists_holds(version: str):
     pack = registry.get_pack(version)
 
-    assert pack_register_problems(pack) == []
+    assert _registry_pack_problems(pack) == []
 
 
 @pytest.fixture(scope="module")
@@ -843,6 +899,10 @@ def _with_goal_filter(pack: Pack, words: tuple[str, ...]) -> Pack:
 
     The row's Convention cell stays as the guide has it, and its other two cells are
     written here, so the case holds whatever rule the guide's own row names.
+
+    This one is built on the loaded pack, not on a copy of its files under `tmp_path`:
+    the pack declares no `item_filter` rule yet, and what the case varies is the
+    parameter of the rule a later task adds, which no edit of today's files can state.
     """
     rule = ConventionRule(
         id="unchecked-goals",
@@ -862,13 +922,13 @@ def _with_goal_filter(pack: Pack, words: tuple[str, ...]) -> Pack:
 def test_the_unchecked_box_row_takes_an_item_filter_rule_in_the_form_it_has(v1_4_0: Pack):
     pack = _with_goal_filter(v1_4_0, _GOAL_WORDS)
 
-    assert pack_register_problems(pack) == []
+    assert _registry_pack_problems(pack) == []
 
 
 def test_the_unchecked_box_row_fails_a_filter_that_keeps_other_words(v1_4_0: Pack):
     pack = _with_goal_filter(v1_4_0, (*_GOAL_WORDS[:-1], "wish list"))
 
-    assert pack_register_problems(pack) == [
+    assert _registry_pack_problems(pack) == [
         "row `List rules, unchecked box`: quotes the words aim, aspiration, bucket list, goal, "
         "objective, resolution, target, and `unchecked-goals` keeps aim, aspiration, goal, "
         "objective, resolution, target, wish list"
@@ -906,11 +966,15 @@ _NOT_CONVENTIONS = frozenset(
         # What a probe's author may write in an utterance, not how it is then labelled.
         "Synthetic-data rule",
         "Naming rule",
-        # Says where N1 to N16 came from; the rules under it carry the conventions.
+        # Says where N1 to N16 came from, and defines "beyond the prompt" and the
+        # `beyond_prompt` flag. The first is by definition what the prompt does not carry,
+        # and the second is a key of the row schema, whose row covers it.
         "Conventions from the 60-probe set",
-        # How a tag names its category, how a set grows, and what was relabelled when.
+        # How a tag names its category, and how a set grows.
         "Categories",
         "Extending the sets",
+        # A history of what was relabelled when. Its one sentence that reads as a rule, on
+        # a trailing phrase of an id, applies N1, and N1's row governs.
         "Relabel log",
     }
 )
@@ -967,8 +1031,8 @@ def test_each_section_named_as_no_convention_is_a_heading_of_the_gold_guide():
     assert headings >= _NOT_CONVENTIONS
 
 
-def test_a_gold_guide_read_with_no_section_set_aside_fails(active: Pack):
-    guide = _GUIDE.read_text(encoding="utf-8")
+def test_a_gold_guide_read_with_no_section_set_aside_fails(guide_copy, active: Pack):
+    guide = guide_copy(lambda text: text)
 
     assert sorted(guide_register_problems(guide, active)) == sorted(
         f"{heading}: no row of the register holds this label" for heading in _NOT_CONVENTIONS
@@ -1064,6 +1128,18 @@ def test_an_unedited_copy_of_the_gold_guide_holds(guide_copy, active: Pack):
             "the register's columns are not Convention, Carrier, Class: | Convention | Carrier |",
             id="other-columns",
         ),
+        pytest.param(
+            f"{_N4_ROW}\n",
+            f"{_N4_ROW}\n| N99 Phantom | Rule 9 of the engine core | prompt rule |\n",
+            "row `N99 Phantom`: no convention above the register has this label",
+            id="a-row-of-no-convention",
+        ),
+        pytest.param(
+            f"{_N4_ROW}\n",
+            f"{_N4_ROW}\n| Relabel log | Rule 9 of the engine core | prompt rule |\n",
+            "row `Relabel log`: no convention above the register has this label",
+            id="a-row-of-a-section-that-states-no-convention",
+        ),
     ],
 )
 def test_a_gold_guide_register_that_does_not_hold_fails(
@@ -1083,19 +1159,6 @@ def test_a_gold_guide_with_no_register_fails(guide_copy, active: Pack):
     ]
 
 
-def test_a_generic_row_fails_when_the_pack_does_not_list_it(active: Pack):
-    lines = active.labelling.splitlines()
-    (listing,) = (line for line in lines if line.startswith("| N4 Name modifiers |"))
-    pack = dataclasses.replace(
-        active, labelling="\n".join(line for line in lines if line != listing)
-    )
-
-    assert pack_register_problems(pack) == []
-    assert guide_register_problems(_GUIDE.read_text(encoding="utf-8"), pack, _NOT_CONVENTIONS) == [
-        "row `N4 Name modifiers`: the active pack's register lists no Rule 23 under this key"
-    ]
-
-
 def test_the_pack_lists_a_generic_row_with_the_id_of_the_rule_that_carries_it(v1_4_0: Pack):
     rows = {row.key: row for row in read_register(v1_4_0.labelling).rows}
 
@@ -1109,3 +1172,68 @@ def test_the_pack_lists_a_generic_row_with_the_id_of_the_rule_that_carries_it(v1
         ids=("prompt-rules-1-to-3", "n1-exempt"),
         functions=(),
     )
+
+
+# ---------------------------------------------------------------------------
+# The v1.4.0 pack's failing cases, each on a copy of the pack under `tmp_path`
+# ---------------------------------------------------------------------------
+
+_V1_4_0 = str(pack_manifest.__package__)
+_N17_ROW = "| N17 Named teams | Rule 34 in `prompt-rules-11-to-37` | prompt rule |"
+_THIRD_PARTY_ROW = (
+    "| Durable third-party facts | Rules 17 and 19 in `prompt-rules-11-to-37` | prompt rule |"
+)
+_PHANTOM_ROW = "| N99 Phantom | Rule 34 in `prompt-rules-11-to-37` | prompt rule |"
+_N4_LISTING = "| N4 Name modifiers | Rule 23 in `prompt-rules-11-to-37` | prompt rule |"
+
+
+@pytest.fixture
+def v1_4_0_copy(pack_copy) -> Callable[..., Pack]:
+    """Load an edited copy of the v1.4.0 pack from `tmp_path`."""
+    return functools.partial(pack_copy, _V1_4_0)
+
+
+def test_an_unedited_copy_of_the_v1_4_0_pack_holds(v1_4_0_copy):
+    pack = v1_4_0_copy()
+
+    assert _registry_pack_problems(pack) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "problem"),
+    [
+        # Two of the amendment's first rows cite N17, and one opens with `Durable third-party
+        # facts`. They are rows of the amendment, and stand in for the row of neither label.
+        pytest.param(
+            f"{_N17_ROW}\n",
+            "",
+            "N17: no row of the register holds this label",
+            id="the-row-of-a-rule-a-first-row-cites",
+        ),
+        pytest.param(
+            f"{_THIRD_PARTY_ROW}\n",
+            "",
+            "Durable third-party facts: no row of the register holds this label",
+            id="the-row-of-a-section-a-first-row-opens-with",
+        ),
+        pytest.param(
+            f"{_N17_ROW}\n",
+            f"{_N17_ROW}\n{_PHANTOM_ROW}\n",
+            "row `N99 Phantom`: no convention above the register has this label",
+            id="a-row-of-no-convention",
+        ),
+    ],
+)
+def test_a_v1_4_0_register_that_does_not_hold_fails(v1_4_0_copy, old: str, new: str, problem: str):
+    pack = v1_4_0_copy(guide=_swap(old, new))
+
+    assert problem in _registry_pack_problems(pack)
+
+
+def test_a_generic_row_fails_when_the_pack_does_not_list_it(v1_4_0_copy):
+    pack = v1_4_0_copy(guide=_swap(f"{_N4_LISTING}\n", ""))
+
+    assert _registry_pack_problems(pack) == []
+    assert guide_register_problems(_GUIDE.read_text(encoding="utf-8"), pack, _NOT_CONVENTIONS) == [
+        "row `N4 Name modifiers`: the active pack's register lists no Rule 23 under this key"
+    ]
