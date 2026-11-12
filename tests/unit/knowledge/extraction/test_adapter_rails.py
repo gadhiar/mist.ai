@@ -92,6 +92,7 @@ def test_the_synthetic_payload_reproduces_the_old_id_rails_and_the_pack_kinds_ar
         "typed_id",
         "derived_edge",
         "fan_out",
+        "edge_suppress",
     }
     stored = {entity["id"] for entity in every_rail_payload.EXPECTED_ENTITIES}
     assert {"mist-identity", "c-plus-plus", "quillscript", "nodejs", "kubernetes"} <= stored

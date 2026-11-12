@@ -733,6 +733,7 @@ def registry_pack() -> Pack:
 _RULE_IDS = [
     "reserved-mist-identity",
     "team-fan-out",
+    "team-part-of",
     "n1-exempt",
     "pre-canon-aliases",
     "technology-version",
@@ -987,7 +988,7 @@ class TestThePinnedCases:
     """Each rule the rails run holds a row and the payload the pack turns it into."""
 
     def test_every_rule_the_rails_run_has_a_case(self):
-        assert len(_POST_LLM_RULES) == 8
+        assert len(_POST_LLM_RULES) == 9
         assert [
             rule.id
             for rule in pack_conventions.RULES

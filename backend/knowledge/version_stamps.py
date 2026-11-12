@@ -173,13 +173,14 @@ class PackRelease:
 # Under 2026-11-12-r9 the prompt hash moved with the `unchecked-goals` item filter,
 # which changes what reaches the model. The rails hash then moved with the
 # `team-fan-out` rule and its `team-employer` plug-in, which add a named team's
-# members' `WORKS_AT` and the user's `KNOWS_PERSON` after the model: a replay, with
-# no bump.
+# members' `WORKS_AT` and the user's `KNOWS_PERSON` after the model, and again with
+# the `team-part-of` rule, which drops a named team's `PART_OF` its employer: a
+# replay each time, with no bump.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
     pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
-    pack_rails_hash="fd203e9b523661332f29c301e493cc1b388b7930d877474062e45786e5e518e6",
+    pack_rails_hash="7ad1dd7da6d0c44096751b1e75859db104f2008e569b29460e1a5a300a4e08ad",
 )
 
 

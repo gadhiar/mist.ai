@@ -36,6 +36,7 @@ from backend.knowledge.ontologies.pack import (
     AliasVocabulary,
     ConventionRule,
     DerivedEdge,
+    EdgeSuppress,
     EdgeTrigger,
     FanOut,
     GainedEdge,
@@ -60,6 +61,7 @@ from .types import (
     MIST_IDENTITY,
     OCCURRED_ON,
     ORGANIZATION,
+    PART_OF,
     PERSON,
     TECHNOLOGY,
     USER,
@@ -662,6 +664,68 @@ _TEAM_FAN_OUT_CASE = PinnedCase(
     ),
 )
 
+# A third-party message in two batches, its opening line and its heading:
+#
+#     The Harrow migration is part of Brightwater's roadmap.
+#     ## Harrow data team at Brightwater
+#     - Aino Pelkonen, who works at Brightwater
+#     - Kofi Mensah
+#
+# The model writes the team `PART_OF` Brightwater, which Rule 34 forbids: a `MEMBER_OF`
+# targets the team, so the edge is dropped. The Project's `PART_OF` Brightwater is kept.
+# Kofi gains Aino's employer; the row is not user-scope, so nobody gains `KNOWS_PERSON`.
+_HARROW_HEADING = "Harrow data team at Brightwater"
+_BRIGHTWATER = _entity("brightwater", "Brightwater", "Organization")
+_HARROW_OPENING = (
+    _BRIGHTWATER,
+    _entity("harrow-migration", "Harrow migration", "Project"),
+)
+_HARROW_TEAM = (
+    _BRIGHTWATER,
+    _entity("harrow-data-team", "Harrow data team", "Organization"),
+    _entity("aino-pelkonen", "Aino Pelkonen", "Person"),
+    _entity("kofi-mensah", "Kofi Mensah", "Person"),
+)
+_HARROW = (*_HARROW_OPENING, *_HARROW_TEAM[1:])
+_HARROW_KEPT_PART_OF = (_team_edge("harrow-migration", "brightwater", "PART_OF"),)
+_HARROW_MEMBERS = (
+    _team_edge("aino-pelkonen", "harrow-data-team", "MEMBER_OF"),
+    _team_edge("aino-pelkonen", "brightwater", "WORKS_AT"),
+    _team_edge("kofi-mensah", "harrow-data-team", "MEMBER_OF"),
+)
+_HARROW_TEAM_PART_OF = _team_edge("harrow-data-team", "brightwater", "PART_OF")
+_TEAM_PART_OF_CASE = PinnedCase(
+    entities=_HARROW,
+    relationships=(*_HARROW_KEPT_PART_OF, _HARROW_TEAM_PART_OF, *_HARROW_MEMBERS),
+    expected_entities=_HARROW,
+    expected_relationships=(
+        *_HARROW_KEPT_PART_OF,
+        *_HARROW_MEMBERS,
+        {
+            "source": "kofi-mensah",
+            "target": "brightwater",
+            "type": "WORKS_AT",
+            "properties": _COPIED,
+        },
+    ),
+    scope="third-party",
+    batch_record=(
+        _team_batch(
+            (),
+            ("The Harrow migration is part of Brightwater's roadmap.",),
+            _HARROW_OPENING,
+            _HARROW_KEPT_PART_OF,
+            "prose",
+        ),
+        _team_batch(
+            (_HARROW_HEADING,),
+            ("Aino Pelkonen, who works at Brightwater", "Kofi Mensah"),
+            _HARROW_TEAM,
+            (_HARROW_TEAM_PART_OF, *_HARROW_MEMBERS),
+        ),
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # The prompt's ontology half
 # ---------------------------------------------------------------------------
@@ -1020,6 +1084,21 @@ RULES: tuple[ConventionRule, ...] = (
         ),
         prompt_rule="Rule 34 and Rule 19",
         pinned_case=_TEAM_FAN_OUT_CASE,
+    ),
+    # Register row 3: a named team is no `PART_OF` its employer (Rule 34). The pattern is
+    # an Organization that a `MEMBER_OF` targets; every other `PART_OF` is kept.
+    ConventionRule(
+        id="team-part-of",
+        kind="edge_suppress",
+        phase=RELATION,
+        params=EdgeSuppress(
+            edge=PART_OF.type_name,
+            source_types=(ORGANIZATION.type_name,),
+            target_types=(ORGANIZATION.type_name,),
+            source_is_target_of=(MEMBER_OF.type_name,),
+        ),
+        prompt_rule="Rule 34",
+        pinned_case=_TEAM_PART_OF_CASE,
     ),
     ConventionRule(
         id="n1-exempt",
