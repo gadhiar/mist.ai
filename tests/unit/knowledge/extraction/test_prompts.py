@@ -771,14 +771,14 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE + EARLIER_ITEMS_HEADING) pinned for
-    # extraction_version = "2026-11-12-r9": the r8 prompt, whose groups 1 (identity), 2
-    # (list conventions) and 3 (glosses, named teams and the remaining conventions) T40
-    # rounds 1 and 2 revised, and the heading a later batch's earlier units stand under,
-    # which T48 adds to what a Stage 2 call reads. Without the heading the digest is r8's,
-    # 88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4. Still under r9 and
-    # before any r9 release, T52 brought Rule 28 and Example 30 to the earlier units the
-    # engine sends since T48; before T52 the digest was
-    # 8deb5f7068307e2a7405fca1b66426fb0cfb0baba4e95944c3be0a31b4345fa3.
+    # extraction_version = "2026-11-12-r9": the active pack's system prompt, whose Rule 28
+    # and Example 30 T52 brought to the earlier units the engine sends since T48, the user
+    # template, and the heading a later batch's earlier units stand under, which T48 added
+    # to what a Stage 2 call reads. Without the heading the digest is
+    # 3b3ea3ca90958d552ebb1a4817721ae0aa2f85eec8a0bf4bb4b6b1ec48986ffd, which
+    # `test_v1_4_0.py` pins. Before T52 (at 178696b) the digest was
+    # 8deb5f7068307e2a7405fca1b66426fb0cfb0baba4e95944c3be0a31b4345fa3, and without the
+    # heading 88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4.
     PINNED_SHA256 = "bb9572ef6b8dca68187fac4ff39e100e51fef699b41a31ad91318b9d4a05ede7"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
