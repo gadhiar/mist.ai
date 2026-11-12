@@ -50,8 +50,13 @@ def _quoted_pack_names(pack: Pack, sources: dict[str, str]) -> list[tuple[str, s
 
 
 def _scorer_sources() -> dict[str, str]:
-    """The eval harness's scripts, by path, less the scorers of past probe sets."""
+    """The eval harness's scripts, by path, less the scorers of past probe sets.
+
+    The glob reads the harness's own directory, so the ceiling's scorer, one directory
+    down, is named.
+    """
     paths = sorted(path for path in _SCORERS.glob("*.py") if path.name not in _LEGACY_SCORERS)
+    paths.append(_SCORERS / "ceiling" / "score_runs.py")
     return {
         path.relative_to(_REPO_ROOT).as_posix(): path.read_text(encoding="utf-8") for path in paths
     }
@@ -76,6 +81,20 @@ def test_no_engine_file_names_a_type_or_an_edge_of_the_pack(name):
 @pytest.mark.parametrize("name", sorted(_BOUNDARY_PACKS))
 def test_no_scorer_names_a_type_or_an_edge_of_the_pack(name):
     assert _quoted_pack_names(_BOUNDARY_PACKS[name], _scorer_sources()) == []
+
+
+# The scorers the search has to read: the extraction scorer, the aligner, the name
+# sets, and the ceiling's scorer, which sits one directory down.
+_PLANNED_SCORERS = (
+    "scripts/eval_harness/ceiling/score_runs.py",
+    "scripts/eval_harness/entity_alignment.py",
+    "scripts/eval_harness/score_extraction_run.py",
+    "scripts/eval_harness/scorers.py",
+)
+
+
+def test_the_search_reads_every_planned_scorer():
+    assert [path for path in _PLANNED_SCORERS if path not in _scorer_sources()] == []
 
 
 def test_the_legacy_scorers_exist_and_each_names_the_pack():
