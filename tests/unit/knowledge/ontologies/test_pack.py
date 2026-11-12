@@ -18,6 +18,7 @@ from backend.knowledge.ontologies.pack import (
     KINDS,
     PAYLOAD,
     RELATION,
+    TYPED_ID_ALIGNMENTS,
     ConventionRule,
     FanOut,
     GainedEdge,
@@ -404,6 +405,38 @@ def test_a_post_llm_rule_change_moves_only_the_rails_hash():
 
     assert changed.pack_rails_hash != base.pack_rails_hash
     assert changed.pack_prompt_hash == base.pack_prompt_hash
+
+
+def _mooring_aligned_as(kind: str | None) -> tuple[ConventionRule, ...]:
+    """The fixture's rules, with its `typed_id` rule stating the alignment `kind`."""
+    params = TypedId(type="Mooring", plugin="mooring-number", alignment=kind)
+    return _with("mooring-number", params=params)
+
+
+@pytest.mark.parametrize("kind", TYPED_ID_ALIGNMENTS)
+def test_a_typed_id_rule_that_states_an_alignment_kind_loads(kind):
+    pack = _build(rules=_mooring_aligned_as(kind))
+
+    (rule,) = pack.rules_of("typed_id")
+    assert rule.params.alignment == kind
+
+
+def test_the_alignment_kinds_a_pack_may_state_are_pinned():
+    assert TYPED_ID_ALIGNMENTS == ("metric",)
+
+
+def test_a_typed_id_rule_that_states_an_unknown_alignment_kind_is_refused():
+    with pytest.raises(PackLoadError, match="mooring-number: unknown alignment tidal"):
+        _build(rules=_mooring_aligned_as("tidal"))
+
+
+def test_stating_an_alignment_kind_moves_only_the_rails_hash():
+    base = _build()
+    stated = _build(rules=_mooring_aligned_as("metric"))
+
+    assert _hashes(_build(rules=_mooring_aligned_as(None))) == _hashes(base)
+    assert stated.pack_rails_hash != base.pack_rails_hash
+    assert stated.pack_prompt_hash == base.pack_prompt_hash
 
 
 def test_a_pre_llm_rule_change_moves_only_the_prompt_hash():

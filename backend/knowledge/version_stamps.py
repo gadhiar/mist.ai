@@ -246,7 +246,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-0cac847d590a7a79ae20eca1d4f07f38c47286d6dd2efa8ed52e2919e23b3e04",
+        code_identity="ci1-c1cf16a9f46473765a83b3586ea6ba1c27756e3f3f20fa7006cfe8375d891306",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
