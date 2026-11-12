@@ -39,8 +39,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend.knowledge.extraction.id_rails import stored_entity_id  # noqa: E402
-from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT  # noqa: E402
 from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS  # noqa: E402
+from backend.knowledge.ontologies.registry import active_pack  # noqa: E402
 from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
     EDGE_TYPES_BY_NAME,
     EXTRACTABLE_NODE_TYPES,
@@ -162,8 +162,8 @@ def _term_pattern(term: str) -> re.Pattern[str]:
 
 def _prompt_entity_terms() -> set[str]:
     """Entity ids and names the production prompt's rules and examples carry."""
-    ids = set(re.findall(r'"id": "([^"]+)"', EXTRACTION_SYSTEM_PROMPT))
-    names = set(re.findall(r'"name": "([^"]+)"', EXTRACTION_SYSTEM_PROMPT))
+    ids = set(re.findall(r'"id": "([^"]+)"', active_pack().system_prompt))
+    names = set(re.findall(r'"name": "([^"]+)"', active_pack().system_prompt))
     allowed = {"user", "mist-identity", "User", "MIST"}
     placeholders = {"lowercase-hyphenated-name", "Display Name"}
     return (ids | names) - allowed - placeholders
@@ -742,7 +742,7 @@ def _gold_ids_in_the_prompt(path: Path) -> dict[str, list[str]]:
         for entity in row["expected_entities"]:
             if entity["id"] in _PROMPT_ANCHOR_IDS:
                 continue
-            if _term_pattern(entity["id"]).search(EXTRACTION_SYSTEM_PROMPT):
+            if _term_pattern(entity["id"]).search(active_pack().system_prompt):
                 hits.setdefault(entity["id"], []).append(row["tag"])
     return hits
 
@@ -1084,10 +1084,33 @@ def test_every_dev_lists_event_id_follows_the_event_rule():
 
 # --- Gold invents no id (the extraction contract ADR, Decision 3) ----------------------------
 
+
 # Types whose ids a rule with a carrier builds rather than the utterance's words: the user
 # anchor (Rule 1), ISO Date ids (Rules 5, 13, 16), value-first Metric ids (the Metric rail) and
 # Event ids (E-b, checked above).
-_BUILT_ID_TYPES = frozenset({"User", "Date", "Metric", "Event"})
+def _built_id_types() -> frozenset[str]:
+    """Those types, read from the registry's active pack.
+
+    The user anchor's type is the manifest's. A type that a `typed_id` rule builds and an
+    `id_exempt` rule spares the id rail has an id its plug-in builds whole (Metric; a
+    Technology's rule only drops a version from the utterance's words). The two ends of an
+    id-phase `derived_edge` rule are the dated type and the type whose id dates it (Event,
+    Date).
+    """
+    from backend.knowledge.ontologies import registry
+
+    pack = registry.active_pack()
+    spared = {name for rule in pack.rules_of("id_exempt") for name in rule.params.types}
+    built = {rule.params.type for rule in pack.rules_of("typed_id")}
+    dated = {
+        name
+        for rule in pack.rules_of("derived_edge", "id")
+        for name in (rule.params.source_type, rule.params.target_type)
+    }
+    return frozenset({pack.manifest.user_type} | (built & spared) | dated)
+
+
+_BUILT_ID_TYPES = _built_id_types()
 # Other dev-lists ids that are not a run of the utterance's words, each kept by the register
 # convention named. A test below fails an entry that no longer needs keeping.
 _CONVENTION_KEPT_IDS = {

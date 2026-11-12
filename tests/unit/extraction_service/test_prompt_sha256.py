@@ -11,17 +11,19 @@ schemas, and the adapter identity.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from backend.extraction_service import engine
 from backend.extraction_service.adapters import get_adapter
 from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.scope_classifier import render_scope_messages
+from backend.knowledge.ontologies.registry import active_pack
 
 _COMPONENTS = (
     "SCOPE_CLASSIFIER_SYSTEM_PROMPT",
     "SCOPE_USER_TEMPLATE",
-    "EXTRACTION_SYSTEM_PROMPT",
     "EXTRACTION_USER_TEMPLATE",
     "INTERNAL_DERIVATION_SYSTEM_PROMPT",
     "INTERNAL_DERIVATION_USER_TEMPLATE",
@@ -29,11 +31,19 @@ _COMPONENTS = (
     "NO_PRIOR_CONTEXT",
 )
 
-_SCHEMAS = ("SCOPE_OUTPUT_SCHEMA", "EXTRACTION_OUTPUT_SCHEMA", "DERIVATION_OUTPUT_SCHEMA")
+# The Stage 2 system prompt and schema are the pack's, not a constant of the engine:
+# `_serve` gives the engine an edited pack in their place.
+_SCHEMAS = ("SCOPE_OUTPUT_SCHEMA", "DERIVATION_OUTPUT_SCHEMA")
 
 
 def _hash() -> str:
     return engine._compute_prompt_sha256(get_adapter("gptoss"))
+
+
+def _serve(monkeypatch, **changes) -> None:
+    """Make the active pack, as the engine reads it, today's pack with `changes`."""
+    edited = dataclasses.replace(active_pack(), **changes)
+    monkeypatch.setattr(engine, "active_pack", lambda: edited)
 
 
 def test_hash_is_deterministic() -> None:
@@ -45,6 +55,19 @@ def test_each_prompt_component_moves_the_hash(monkeypatch, name) -> None:
     before = _hash()
     monkeypatch.setattr(engine, name, getattr(engine, name) + " (edited)")
     assert _hash() != before, f"editing {name} left prompt_sha256 unchanged"
+
+
+def test_the_packs_system_prompt_moves_the_hash(monkeypatch) -> None:
+    before = _hash()
+    _serve(monkeypatch, system_prompt=active_pack().system_prompt + " (edited)")
+    assert _hash() != before, "editing the pack's prompt left prompt_sha256 unchanged"
+
+
+def test_the_packs_extraction_schema_moves_the_hash(monkeypatch) -> None:
+    before = _hash()
+    edited = {**active_pack().extraction_schema, "description": "edited"}
+    _serve(monkeypatch, extraction_schema=edited)
+    assert _hash() != before, "editing the pack's schema left prompt_sha256 unchanged"
 
 
 @pytest.mark.parametrize("name", _SCHEMAS)
@@ -61,9 +84,9 @@ def test_adapter_identity_moves_the_hash() -> None:
 
 def test_text_moved_between_neighbouring_templates_changes_the_hash(monkeypatch) -> None:
     before = _hash()
-    system = engine.EXTRACTION_SYSTEM_PROMPT
+    system = active_pack().system_prompt
     user = engine.EXTRACTION_USER_TEMPLATE
-    monkeypatch.setattr(engine, "EXTRACTION_SYSTEM_PROMPT", system + user[:1])
+    _serve(monkeypatch, system_prompt=system + user[:1])
     monkeypatch.setattr(engine, "EXTRACTION_USER_TEMPLATE", user[1:])
     assert _hash() != before
 

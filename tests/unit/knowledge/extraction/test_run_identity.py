@@ -479,7 +479,6 @@ class TestRunIdentityCoverage:
             "backend.extraction_contract.models",
             "backend.extraction_service.settings",
             "backend.knowledge.extraction.serving_identity",
-            "backend.knowledge.ontologies",
             "backend.knowledge.version_stamps",
             "backend.llm.models",
             "backend.llm.provider",
@@ -487,21 +486,17 @@ class TestRunIdentityCoverage:
         assert all(reason.strip() for reason in excluded.values())
 
     def test_the_turn_plan_module_is_scanned(self):
-        """The ontology is listed for the turn plan's import, and only for it."""
+        """The turn plan reaches the ontology through the covered registry, as the engine does."""
         turn_plan = _BACKEND_ROOT / "extraction_service" / "turn_plan.py"
-        others = "\n".join(
-            path.read_text(encoding="utf-8") for path in _SERVICE_SOURCES if path != turn_plan
-        )
+        imports = _backend_imports(turn_plan.read_text(encoding="utf-8"))
 
         assert turn_plan in _SERVICE_SOURCES
-        assert "backend.knowledge.ontologies" in _backend_imports(
-            turn_plan.read_text(encoding="utf-8")
-        )
-        assert "backend.knowledge.ontologies" not in _backend_imports(others)
-        assert "backend.knowledge.ontologies" in _listed()
+        assert "backend.knowledge.ontologies.registry" in imports
+        assert "backend.knowledge.ontologies" not in _backend_imports(_service_source())
+        assert "backend.knowledge.ontologies" not in _listed()
 
-    def test_the_turn_plan_reads_only_the_ontologys_two_derived_lists(self):
-        """What its exclusion reason says: nothing else of the ontology reaches the plan."""
+    def test_the_turn_plan_reads_the_packs_plan_vocabulary_and_no_ontology_list(self):
+        """The pack's vocabulary type and the registry's active pack: no list of the ontology."""
         turn_plan = _BACKEND_ROOT / "extraction_service" / "turn_plan.py"
         tree = ast.parse(turn_plan.read_text(encoding="utf-8"))
 
@@ -514,7 +509,7 @@ class TestRunIdentityCoverage:
             for alias in node.names
         )
 
-        assert names == ["EXTRACTABLE_NODE_TYPES", "EXTRACTABLE_RELATIONSHIP_TYPES"]
+        assert names == ["PlanVocabulary", "active_pack"]
 
     def test_no_exclusion_is_stale(self):
         imported = _backend_imports(_service_source())

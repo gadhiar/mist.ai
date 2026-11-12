@@ -336,11 +336,10 @@ def run_identity_components(
     (`settings.constrained_mode or adapter.default_constrained_mode`).
 
     `pack` is the pack the engine extracts with, whose assembled prompt and
-    generated schema the prompt hash covers. None hashes the engine module's
-    prompt and schema constants, which are those of a pack that holds no
-    prompt fragment; `build_app` passes the pack it gives the engine. The
-    pack's own two hashes are no component: they are stamped beside the run
-    identity, not into it.
+    generated schema the prompt hash covers. None takes the registry's active
+    pack, as the engine does when it is given none; `build_app` passes the
+    pack it gives the engine. The pack's own two hashes are no component:
+    they are stamped beside the run identity, not into it.
     """
     return RunIdentityComponents(
         prompt_sha256=_compute_prompt_sha256(adapter, turn_plan=settings.turn_plan, pack=pack),

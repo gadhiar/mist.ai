@@ -87,10 +87,19 @@ class IdExempt:
 
 @dataclass(frozen=True)
 class TypedId:
-    """A type whose id an id plug-in builds; a None from the plug-in keeps the id."""
+    """A type whose id an id plug-in builds; a None from the plug-in keeps the id.
+
+    Attributes:
+        type: The type whose ids the plug-in builds.
+        plugin: The id plug-in.
+        alignment: The equality a scorer applies to ids of the type, beyond the
+            kinds every type takes: the pack's statement that its plug-in makes
+            such ids one node. One of `TYPED_ID_ALIGNMENTS`; None states no kind.
+    """
 
     type: str = field(metadata=_TYPE_NAMES)
     plugin: str = field(metadata=_PLUGIN_NAME)
+    alignment: str | None = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +328,9 @@ KINDS: Mapping[str, tuple[type, tuple[Phase, ...]]] = {
 }
 
 ITEM_STATES: tuple[str, ...] = ("unchecked", "checked")
+
+# The alignment kinds a `typed_id` rule may state.
+TYPED_ID_ALIGNMENTS: tuple[str, ...] = ("metric",)
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +676,8 @@ def _check_shape(rule: ConventionRule) -> None:
                 raise PackLoadError(f"rule {rule.id}: a gained edge has the member at one end")
     if isinstance(params, ItemFilter) and params.state not in ITEM_STATES:
         raise PackLoadError(f"rule {rule.id}: unknown item state {params.state}")
+    if isinstance(params, TypedId) and params.alignment not in (None, *TYPED_ID_ALIGNMENTS):
+        raise PackLoadError(f"rule {rule.id}: unknown alignment {params.alignment}")
     if rule.phase == RELATION and not rule.prompt_rule:
         raise PackLoadError(
             f"rule {rule.id}: a relation rule names the prompt rule it derives from"
@@ -773,6 +787,14 @@ def _canonical(value: object, where: str) -> object:
     carry a memory address and so differ between two processes, and a pack whose hash
     is not the same in every process never equals its own stamp.
 
+    A dataclass field whose value is None is not written. None is a field's
+    unstated value, and a hash covers what a pack states. Two conventions follow:
+    a field added to a class under a hash takes None as its unstated value, so it
+    moves the hashes of the packs that set it and of no other; and an entry added
+    to a hash input is written only when the pack states it. Every other None is
+    written: inside a tuple, a list or a set, and as a mapping's key or value,
+    which is what the loader's own entries of a hash input are.
+
     Args:
         value: The value to state.
         where: Where the value sits in the pack, for the refusal.
@@ -782,8 +804,9 @@ def _canonical(value: object, where: str) -> object:
     """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         body = {
-            spec.name: _canonical(getattr(value, spec.name), f"{where}.{spec.name}")
+            spec.name: _canonical(item, f"{where}.{spec.name}")
             for spec in dataclasses.fields(value)
+            if (item := getattr(value, spec.name)) is not None
         }
         return {"__class__": type(value).__name__, **body}
     if isinstance(value, Enum):

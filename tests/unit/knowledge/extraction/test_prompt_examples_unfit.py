@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT
+from backend.knowledge.ontologies.registry import active_pack
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _GATE_FILES = (
@@ -132,7 +132,7 @@ _EXAMPLE_RE = re.compile(
 def _examples() -> dict[int, tuple[str, list[str]]]:
     """Example number to (utterance, entity ids), parsed from the production prompt."""
     examples: dict[int, tuple[str, list[str]]] = {}
-    for match in _EXAMPLE_RE.finditer(EXTRACTION_SYSTEM_PROMPT):
+    for match in _EXAMPLE_RE.finditer(active_pack().system_prompt):
         payload = json.loads(match.group(3).replace("{{", "{").replace("}}", "}"))
         ids = [str(entity["id"]) for entity in payload["entities"]]
         examples[int(match.group(1))] = (match.group(2), ids)

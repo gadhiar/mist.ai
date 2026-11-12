@@ -52,10 +52,14 @@ from backend.knowledge.extraction.id_rails import (  # noqa: E402
 from backend.knowledge.extraction.validator import (  # noqa: E402
     RELATIONSHIP_CONSTRAINTS,
 )
+
+# The ontology names this scorer needs (the edge that dates an entity, the escape edge,
+# the abstract cluster) are the active pack's, read when a run is scored.
+from backend.knowledge.ontologies import registry  # noqa: E402
 from backend.knowledge.ontologies.hierarchy import (  # noqa: E402
     canonical_type,
-    children_of,
 )
+from backend.knowledge.ontologies.pack import ID as _ID_PHASE  # noqa: E402
 
 # `types_match` lives with the other id form rules and is re-exported here for its callers.
 from scripts.eval_harness.entity_alignment import (  # noqa: E402
@@ -504,11 +508,30 @@ def _typing_ok(predicate: str, s_type: str | None, t_type: str | None) -> bool:
     return True
 
 
+def _dating_edges() -> frozenset[str]:
+    """The edges that date an entity's id: the active pack's id-phase `derived_edge` rules'."""
+    rules = registry.active_pack().rules_of("derived_edge", _ID_PHASE)
+    return frozenset(rule.params.edge for rule in rules)
+
+
+def _abstract_cluster() -> frozenset[str]:
+    """The types under the active pack's fallback type, which the specificity ratio covers."""
+    pack = registry.active_pack()
+    fallback = pack.manifest.fallback_type
+    return frozenset(
+        node.type_name for node in pack.node_types if getattr(node, "parent_type", None) == fallback
+    )
+
+
 def _occurred_on(keys: Collection[tuple[str, str, str]]) -> dict[str, str]:
-    """Each source's earliest `OCCURRED_ON` date among the keys whose target is an ISO date."""
+    """Each source's earliest date among the keys of a dating edge whose target is an ISO date.
+
+    The dating edge is `OCCURRED_ON` in today's pack.
+    """
+    dating = _dating_edges()
     dates: dict[str, str] = {}
     for source, predicate, target in keys:
-        if predicate == "OCCURRED_ON" and _ISO_DATE_RE.match(target):
+        if predicate in dating and _ISO_DATE_RE.match(target):
             dates[source] = min(dates.get(source, target), target)
     return dates
 
@@ -570,6 +593,8 @@ def score_run(
     accepted_by_tag: dict[str, set[tuple[str, str]]] = {}
     for tag, gold_id, produced_id in accepted_pairs:
         accepted_by_tag.setdefault(tag, set()).add((gold_id, produced_id))
+    _cluster = _abstract_cluster()
+    escape_edge = registry.active_pack().manifest.escape_edge
     for probe in probes:
         produced = produced_index.get(_norm_ws(probe.utterance))
         if produced is not None:
@@ -587,7 +612,6 @@ def score_run(
         for pe in prod_list:
             prod_by_id.setdefault(pe.id, pe)
 
-        _cluster = children_of("Abstraction")
         # hierarchy_tp: gold entity ids for which the produced output was TP.
         hierarchy_tp: set[str] = set()
         for ge in gold_list:
@@ -619,7 +643,7 @@ def score_run(
                 prod_rel_keys.add(key)
                 prod_rel_by_key[key] = r
                 report.produced_rel_total += 1
-                if r["predicate"] == "RELATED_TO":
+                if r["predicate"] == escape_edge:
                     report.related_to_count += 1
                 report.typing_total += 1
                 if _typing_ok(

@@ -289,7 +289,6 @@ def test_the_effective_constrained_mode_is_recorded(service_settings):
 @pytest.mark.parametrize(
     "name",
     [
-        "EXTRACTION_SYSTEM_PROMPT",
         "SCOPE_CLASSIFIER_SYSTEM_PROMPT",
         "INTERNAL_DERIVATION_SYSTEM_PROMPT",
         "_REPAIR_INSTRUCTION",
@@ -298,6 +297,15 @@ def test_the_effective_constrained_mode_is_recorded(service_settings):
 def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):
     before = _identity(service_settings)
     monkeypatch.setattr(engine_module, name, getattr(engine_module, name) + " (edited)")
+
+    assert _identity(service_settings) != before
+
+
+def test_an_edit_of_the_packs_prompt_moves_the_identity(service_settings, monkeypatch):
+    before = _identity(service_settings)
+    pack = engine_module.active_pack()
+    edited = dataclasses.replace(pack, system_prompt=pack.system_prompt + " (edited)")
+    monkeypatch.setattr(engine_module, "active_pack", lambda: edited)
 
     assert _identity(service_settings) != before
 

@@ -1,4 +1,4 @@
-"""Snapshot-style assertions on EXTRACTION_SYSTEM_PROMPT contents.
+"""Snapshot-style assertions on the contents of the active pack's system prompt.
 
 These are deliberately coarse-grained: we assert key language is PRESENT
 rather than asserting a full-text snapshot. This lets us refine wording
@@ -9,10 +9,11 @@ load-bearing rule.
 import json
 import re
 
-from backend.knowledge.extraction.prompts import (
-    EXTRACTION_SYSTEM_PROMPT,
-    EXTRACTION_USER_TEMPLATE,
-)
+from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
+from backend.knowledge.ontologies.registry import active_pack
+
+# The prompt every reader sends: the active pack's, assembled by the loader.
+SYSTEM_PROMPT = active_pack().system_prompt
 
 
 class TestExtractionPromptInjectionResistance:
@@ -20,33 +21,33 @@ class TestExtractionPromptInjectionResistance:
 
     def test_prompt_rejects_directives(self):
         """Prompt must instruct the model not to follow in-utterance directives."""
-        assert "do not follow" in EXTRACTION_SYSTEM_PROMPT.lower() or (
-            "do not execute" in EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "do not follow" in SYSTEM_PROMPT.lower() or (
+            "do not execute" in SYSTEM_PROMPT.lower()
         ), "Expected injection-resistance language referring to directives/instructions"
 
     def test_prompt_mentions_directive_or_instruction(self):
         """Prompt must explicitly reference directives or instructions in utterances."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert any(
             term in prompt_lower for term in ["directive", "instruction", "command"]
         ), "Expected explicit reference to directive/instruction/command"
 
     def test_prompt_restricts_to_factual_claims(self):
         """Prompt must constrain extraction to factual claims about user/work/world."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert (
             "factual" in prompt_lower or "stated" in prompt_lower
         ), "Expected factual-claim restriction language"
 
     def test_prompt_rejects_hypotheticals_and_directives(self):
         """Prompt must explicitly mention not extracting hypotheticals or instructions."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert "hypothetical" in prompt_lower, "Expected 'hypothetical' in rejection list"
         assert "instruction" in prompt_lower, "Expected 'instruction' in rejection list"
 
     def test_prompt_rule_10_covers_override_and_new_instructions(self):
         """Rule 10 example list must cover all 6 preprocessor injection patterns."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         # These were added to close Critical #2 from Task 5 review.
         assert (
             "override the system" in prompt_lower
@@ -57,7 +58,7 @@ class TestExtractionPromptInjectionResistance:
 
     def test_prompt_rule_10_takes_precedence_over_rule_1(self):
         """Rule 10 must explicitly state precedence over Rule 1 for mixed utterances."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         # Closes Critical #1: without explicit priority, Gemma 4 E4B may follow
         # Rule 1 ("always create user entity") on a mixed directive/factual utterance.
         assert (
@@ -73,7 +74,7 @@ class TestSystemPromptOntologyCoverage:
 
     def test_system_prompt_lists_mist_identity_entity_type(self):
         """MistIdentity must appear in the Allowed Entity Types section."""
-        assert "MistIdentity" in EXTRACTION_SYSTEM_PROMPT, (
+        assert "MistIdentity" in SYSTEM_PROMPT, (
             "Expected 'MistIdentity' in Allowed Entity Types; Cluster 1 added "
             "it as the 13th extractable type for MIST-scope facts."
         )
@@ -87,7 +88,7 @@ class TestSystemPromptOntologyCoverage:
             "MIST_HAS_PREFERENCE",
         ]
         for rel_type in new_types:
-            assert rel_type in EXTRACTION_SYSTEM_PROMPT, (
+            assert rel_type in SYSTEM_PROMPT, (
                 f"Expected '{rel_type}' in Allowed Relationship Types; "
                 "Cluster 1 added 4 MIST-scope edge types."
             )
@@ -103,14 +104,14 @@ class TestSystemPromptScopeHandling:
         the model absorbed it as a hard prior and overrode the few-shot signal.
         """
         banned = "User is almost always the SUBJECT"
-        assert banned not in EXTRACTION_SYSTEM_PROMPT, (
+        assert banned not in SYSTEM_PROMPT, (
             f"Expected '{banned}' to be removed; it biases Gemma 4 E4B toward "
             "user-as-source attribution in multi-turn sessions."
         )
 
     def test_system_prompt_explains_subject_scope_handling(self):
         """All three scope labels must appear so the prompt can route on them."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         for label in ["user-scope", "system-scope", "third-party"]:
             assert label in prompt_lower, (
                 f"Expected scope label '{label}' in prompt; the scope-aware "
@@ -123,7 +124,7 @@ class TestSystemPromptExampleBalance:
 
     def test_examples_include_mist_scope_case(self):
         """At least one example must demonstrate mist-identity as the source entity."""
-        assert "mist-identity" in EXTRACTION_SYSTEM_PROMPT, (
+        assert "mist-identity" in SYSTEM_PROMPT, (
             "Expected at least one few-shot example with source='mist-identity'; "
             "without a system-scope exemplar the model reverts to user-centric extraction."
         )
@@ -133,7 +134,7 @@ class TestSystemPromptExampleBalance:
         # Example 7 ("My coworker says Rust is really fast") is the canonical third-party
         # no-attribution example. We assert both the coworker language AND the empty
         # relationships array for that case.
-        assert "coworker" in EXTRACTION_SYSTEM_PROMPT, (
+        assert "coworker" in SYSTEM_PROMPT, (
             "Expected a third-party exemplar (coworker/colleague quote); without it "
             "the model may attribute third-party claims to the user."
         )
@@ -150,7 +151,7 @@ class TestEventVsMilestoneDisambiguation:
 
     def test_prompt_includes_event_vs_milestone_rule(self):
         """The rules section must explicitly distinguish Event from Milestone."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert (
             "event vs milestone" in prompt_lower or "milestone vs event" in prompt_lower
         ), "Expected explicit Event-vs-Milestone disambiguation rule in EXTRACTION RULES"
@@ -162,7 +163,7 @@ class TestEventVsMilestoneDisambiguation:
         canonical shape. The rule must name event_type=milestone so the model
         knows the output shape.
         """
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert 'event_type="milestone"' in prompt_lower or "event_type=milestone" in prompt_lower, (
             "Expected 'event_type=milestone' to appear in Rule 11 so the model "
             "knows the canonical output shape for milestone-class facts."
@@ -175,13 +176,11 @@ class TestEventVsMilestoneDisambiguation:
         milestone-class Event (shipped Cluster 8 Phase 6) with event_type=milestone.
         Both must be present so the model has anchors for each sub-case.
         """
-        assert '"type": "Event"' in EXTRACTION_SYSTEM_PROMPT, (
+        assert '"type": "Event"' in SYSTEM_PROMPT, (
             "Expected an Event extraction in the few-shot examples; without one "
             "the model has no anchor for non-milestone events."
         )
-        assert (
-            "event_type" in EXTRACTION_SYSTEM_PROMPT and "milestone" in EXTRACTION_SYSTEM_PROMPT
-        ), (
+        assert "event_type" in SYSTEM_PROMPT and "milestone" in SYSTEM_PROMPT, (
             "Expected a milestone-class Event extraction in the few-shot examples "
             "(Example 9 since the v1.4.0 Milestone retirement)."
         )
@@ -198,7 +197,7 @@ class TestDocumentEngagementRule:
 
     def test_prompt_includes_document_engagement_rule(self):
         """Rules section must explicitly cover active-reading verbs."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert (
             "document engagement" in prompt_lower
         ), "Expected 'Document engagement' rule in EXTRACTION RULES"
@@ -208,7 +207,7 @@ class TestDocumentEngagementRule:
 
     def test_prompt_explicitly_retires_learning_and_works_on_for_documents(self):
         """The rule must call out both incorrect alternatives by name."""
-        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        prompt_lower = SYSTEM_PROMPT.lower()
         assert (
             "learning" in prompt_lower and "works_on" in prompt_lower
         ), "Expected explicit retirement of LEARNING and WORKS_ON for Document targets"
@@ -220,7 +219,7 @@ class TestDocumentEngagementRule:
         ('working through'). The contrast pair anchors the rule with concrete output.
         """
         assert (
-            "working through" in EXTRACTION_SYSTEM_PROMPT.lower()
+            "working through" in SYSTEM_PROMPT.lower()
         ), "Expected active-engagement few-shot using 'working through' verb"
 
 
@@ -234,11 +233,11 @@ class TestAssertionKindSignal:
     """
 
     def test_prompt_emits_assertion_kind_in_schema(self):
-        assert '"assertion_kind"' in EXTRACTION_SYSTEM_PROMPT
+        assert '"assertion_kind"' in SYSTEM_PROMPT
 
     def test_prompt_rule6_teaches_assertion_kind(self):
-        assert "cease" in EXTRACTION_SYSTEM_PROMPT
-        assert "retract" in EXTRACTION_SYSTEM_PROMPT
+        assert "cease" in SYSTEM_PROMPT
+        assert "retract" in SYSTEM_PROMPT
 
 
 class TestRecommendsHabitDateRules:
@@ -253,11 +252,11 @@ class TestRecommendsHabitDateRules:
     """
 
     def test_prompt_lists_recommends_and_has_habit(self):
-        assert "RECOMMENDS" in EXTRACTION_SYSTEM_PROMPT
-        assert "HAS_HABIT" in EXTRACTION_SYSTEM_PROMPT
+        assert "RECOMMENDS" in SYSTEM_PROMPT
+        assert "HAS_HABIT" in SYSTEM_PROMPT
 
     def test_prompt_teaches_date_entity_discrimination(self):
-        assert "do NOT create a Date entity" in EXTRACTION_SYSTEM_PROMPT
+        assert "do NOT create a Date entity" in SYSTEM_PROMPT
 
 
 class TestR4PrecisionRules:
@@ -272,10 +271,10 @@ class TestR4PrecisionRules:
     """
 
     def test_prompt_requires_recurrence_cadence_for_has_habit(self):
-        assert "requires an explicit recurrence cadence" in EXTRACTION_SYSTEM_PROMPT
+        assert "requires an explicit recurrence cadence" in SYSTEM_PROMPT
 
     def test_prompt_forbids_prepositional_over_extraction(self):
-        assert "Extract the asserted fact, not incidental scope" in EXTRACTION_SYSTEM_PROMPT
+        assert "Extract the asserted fact, not incidental scope" in SYSTEM_PROMPT
 
 
 _EXAMPLE_RE = re.compile(
@@ -288,7 +287,7 @@ def _examples() -> dict[int, tuple[str, dict]]:
     """Example number to (utterance, parsed output), with the format braces undoubled."""
     return {
         int(m.group(1)): (m.group(2), json.loads(m.group(3).replace("{{", "{").replace("}}", "}")))
-        for m in _EXAMPLE_RE.finditer(EXTRACTION_SYSTEM_PROMPT)
+        for m in _EXAMPLE_RE.finditer(SYSTEM_PROMPT)
     }
 
 
@@ -299,7 +298,7 @@ def _entities_by_id(output: dict) -> dict[str, dict]:
 def _rule(number: int) -> str:
     """The numbered extraction rule's line."""
     prefix = f"{number}. "
-    return next(line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if line.startswith(prefix))
+    return next(line for line in SYSTEM_PROMPT.splitlines() if line.startswith(prefix))
 
 
 def _has_edge(output: dict, source: str, edge_type: str, target: str) -> bool:
@@ -316,52 +315,48 @@ class TestGroup1IdentityConventions:
     """
 
     def test_rule_2_states_n1_the_id_is_the_utterance_s_own_phrase(self):
-        assert "Entity IDs are the utterance's own phrase" in EXTRACTION_SYSTEM_PROMPT
-        assert "Never invent an id" in EXTRACTION_SYSTEM_PROMPT
-        assert "neither lengthened nor shortened" in EXTRACTION_SYSTEM_PROMPT
+        assert "Entity IDs are the utterance's own phrase" in SYSTEM_PROMPT
+        assert "Never invent an id" in SYSTEM_PROMPT
+        assert "neither lengthened nor shortened" in SYSTEM_PROMPT
 
     def test_n15_an_activity_keeps_its_object(self):
-        assert "An activity keeps its object" in EXTRACTION_SYSTEM_PROMPT
+        assert "An activity keeps its object" in SYSTEM_PROMPT
 
     def test_n2_goal_ids_are_the_goal_s_verb_phrase(self):
-        assert "Goal ids. A Goal's id is the goal's verb phrase" in EXTRACTION_SYSTEM_PROMPT
+        assert "Goal ids. A Goal's id is the goal's verb phrase" in SYSTEM_PROMPT
 
     def test_n4_a_name_that_only_modifies_another_name_gets_no_entity(self):
-        assert "Name modifiers. A name that only modifies another name" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "Name modifiers. A name that only modifies another name" in (SYSTEM_PROMPT)
 
     def test_n16_a_relative_named_by_the_relation_is_a_person(self):
-        assert "A relative named by the relation" in EXTRACTION_SYSTEM_PROMPT
+        assert "A relative named by the relation" in SYSTEM_PROMPT
 
     def test_n14_kind_nouns_get_is_a_to_a_concept(self):
-        assert "Kind nouns. When the utterance says what kind of thing" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "Kind nouns. When the utterance says what kind of thing" in (SYSTEM_PROMPT)
 
     def test_the_event_rule_keeps_owner_and_place_and_no_date_words(self):
-        assert "Event ids and edges" in EXTRACTION_SYSTEM_PROMPT
-        assert "The id holds no date word" in EXTRACTION_SYSTEM_PROMPT
+        assert "Event ids and edges" in SYSTEM_PROMPT
+        assert "The id holds no date word" in SYSTEM_PROMPT
         # ADR-054 Decision 4's closed list, its last clause verbatim.
         assert (
             '"this", "next" or "last" before "week", "weekend", "month", "year" or a weekday'
-            in EXTRACTION_SYSTEM_PROMPT
+            in SYSTEM_PROMPT
         )
-        assert "DECIDED takes only a User source" in EXTRACTION_SYSTEM_PROMPT
+        assert "DECIDED takes only a User source" in SYSTEM_PROMPT
 
     def test_the_metric_rule_asks_for_value_unit_and_quantity(self):
-        assert "Metric properties" in EXTRACTION_SYSTEM_PROMPT
-        assert "value-first" in EXTRACTION_SYSTEM_PROMPT
+        assert "Metric properties" in SYSTEM_PROMPT
+        assert "value-first" in SYSTEM_PROMPT
 
     def test_the_third_party_scope_rule_keeps_the_relative_s_anchor(self):
         third_party = next(
-            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if "`third-party` utt" in line
+            line for line in SYSTEM_PROMPT.splitlines() if "`third-party` utt" in line
         )
         assert "KNOWS_PERSON" in third_party and "Example 7" in third_party
 
     def test_every_example_output_parses_as_json(self):
         examples = _examples()
-        count = EXTRACTION_SYSTEM_PROMPT.count("### Example ")
+        count = SYSTEM_PROMPT.count("### Example ")
         assert len(examples) == count
         assert sorted(examples) == list(range(1, count + 1))
 
@@ -404,7 +399,7 @@ class TestGroup1IdentityConventions:
     def test_the_prompt_stays_under_its_length_budget(self):
         # Lead decision of 10 Nov: the binding limit is PROMPT_RESERVE_TOKENS (14,336 tokens),
         # and H16's `prompt_tokens` lines are authoritative; this cap is a coarse proxy.
-        assert len(EXTRACTION_SYSTEM_PROMPT) <= 52000
+        assert len(SYSTEM_PROMPT) <= 52000
 
 
 class TestGroup2ListConventions:
@@ -414,11 +409,11 @@ class TestGroup2ListConventions:
     """
 
     def test_a_structured_turn_reads_as_context_lead_in_and_item(self):
-        assert "each `<context> > <lead-in>: <item>`" in EXTRACTION_SYSTEM_PROMPT
+        assert "each `<context> > <lead-in>: <item>`" in SYSTEM_PROMPT
 
     def test_user_context_lines_are_never_extracted_again(self):
-        assert "Lines marked `[user]:` are earlier units" in EXTRACTION_SYSTEM_PROMPT
-        assert "never extract them again" in EXTRACTION_SYSTEM_PROMPT
+        assert "Lines marked `[user]:` are earlier units" in SYSTEM_PROMPT
+        assert "never extract them again" in SYSTEM_PROMPT
 
     def test_an_item_s_id_is_the_item_s_own_words(self):
         assert "A list item's id is the item's own words for the thing itself" in _rule(28)
@@ -455,31 +450,29 @@ class TestGroup2ListConventions:
         ) in rule_28
 
     def test_the_lead_in_sets_the_subject_or_predicate_and_is_not_an_entity(self):
-        assert "Read each item as a sentence completing the lead-in" in EXTRACTION_SYSTEM_PROMPT
-        assert "sets the subject or predicate of the items under it" in EXTRACTION_SYSTEM_PROMPT
-        assert "it is not an entity unless it names one" in EXTRACTION_SYSTEM_PROMPT
+        assert "Read each item as a sentence completing the lead-in" in SYSTEM_PROMPT
+        assert "sets the subject or predicate of the items under it" in SYSTEM_PROMPT
+        assert "it is not an entity unless it names one" in SYSTEM_PROMPT
 
     def test_a_refer_back_item_takes_the_earlier_item_s_id(self):
-        assert "An item referring back takes the earlier item's entity and id" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "An item referring back takes the earlier item's entity and id" in (SYSTEM_PROMPT)
 
     def test_an_option_nobody_chose_gets_no_edge(self):
-        assert "An option nobody chose gets no edge" in EXTRACTION_SYSTEM_PROMPT
+        assert "An option nobody chose gets no edge" in SYSTEM_PROMPT
 
     def test_checked_and_unchecked_boxes(self):
-        assert "A checked box `[x]` is a done fact" in EXTRACTION_SYSTEM_PROMPT
-        assert "an unchecked box `[ ]` is a plan with no edge" in EXTRACTION_SYSTEM_PROMPT
-        assert "under a goals lead-in, where it is HAS_GOAL" in EXTRACTION_SYSTEM_PROMPT
+        assert "A checked box `[x]` is a done fact" in SYSTEM_PROMPT
+        assert "an unchecked box `[ ]` is a plan with no edge" in SYSTEM_PROMPT
+        assert "under a goals lead-in, where it is HAS_GOAL" in SYSTEM_PROMPT
 
     def test_a_table_row_is_one_fact_about_its_first_column(self):
-        assert "one fact about its first column" in EXTRACTION_SYSTEM_PROMPT
+        assert "one fact about its first column" in SYSTEM_PROMPT
 
     def test_a_list_with_nothing_durable_is_empty(self):
-        assert "A list with nothing durable (an errand list) is empty" in EXTRACTION_SYSTEM_PROMPT
+        assert "A list with nothing durable (an errand list) is empty" in SYSTEM_PROMPT
 
     def test_itinerary_items_are_experienced_events_with_dates(self):
-        assert "Itinerary items are Events" in EXTRACTION_SYSTEM_PROMPT
+        assert "Itinerary items are Events" in SYSTEM_PROMPT
 
     def test_itinerary_items_state_the_user_edge_literally(self):
         # T40 round 2: the shortened wording lost user EXPERIENCED on a dated list.
@@ -487,14 +480,12 @@ class TestGroup2ListConventions:
         assert "OCCURRED_ON the date its line or heading gives (Rule 26)" in _rule(29)
 
     def test_n3_decisions(self):
-        assert "Decisions. A decision by the user or their team is user DECIDED" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "It does not make its outcome current" in EXTRACTION_SYSTEM_PROMPT
-        assert "Someone else's decision gets the Event and the link" in EXTRACTION_SYSTEM_PROMPT
+        assert "Decisions. A decision by the user or their team is user DECIDED" in (SYSTEM_PROMPT)
+        assert "It does not make its outcome current" in SYSTEM_PROMPT
+        assert "Someone else's decision gets the Event and the link" in SYSTEM_PROMPT
 
     def test_n5_stated_places_and_organisations(self):
-        assert "Stated places and organisations." in EXTRACTION_SYSTEM_PROMPT
+        assert "Stated places and organisations." in SYSTEM_PROMPT
 
     def test_n5_illustrates_the_place_as_a_location_related_to_from_the_event(self):
         # T40 round 2: with Example 29's Location edge cut, a trip list lost its places.
@@ -510,20 +501,14 @@ class TestGroup2ListConventions:
         assert event_id == "-".join(re.findall(r"[a-z0-9]+", f"{phrase} in {place}".lower()))
 
     def test_n7_third_party_events(self):
-        assert "Third-party events. A named person's own non-milestone Event" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "Third-party events. A named person's own non-milestone Event" in (SYSTEM_PROMPT)
 
     def test_n13_topic_links(self):
-        assert "Topic links. An Event is RELATED_TO what the utterance says" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "something chosen for a subject links to that subject" in EXTRACTION_SYSTEM_PROMPT
+        assert "Topic links. An Event is RELATED_TO what the utterance says" in (SYSTEM_PROMPT)
+        assert "something chosen for a subject links to that subject" in SYSTEM_PROMPT
 
     def test_example_30_is_one_rendered_unit_whose_lead_in_sets_the_predicate(self):
-        heading = next(
-            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if "### Example 30:" in line
-        )
+        heading = next(line for line in SYSTEM_PROMPT.splitlines() if "### Example 30:" in line)
         utterance, output = _examples()[30]
         context, item = utterance.rsplit(": ", 1)
         assert " > " in context, "the unit renders its context joined by ' > '"
@@ -558,7 +543,7 @@ class TestGroup3GlossesAndTeamConventions:
 
     @staticmethod
     def _gloss_lines() -> dict[str, str]:
-        lines = EXTRACTION_SYSTEM_PROMPT.splitlines()
+        lines = SYSTEM_PROMPT.splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith("### Glosses"))
         glosses: dict[str, str] = {}
         for line in lines[start + 1 :]:
@@ -598,21 +583,17 @@ class TestGroup3GlossesAndTeamConventions:
         assert "membership" not in gloss.split(";")[0]
 
     def test_a_quoted_topic_does_not_suggest_a_topic_type(self):
-        assert "there is no Topic type" in EXTRACTION_SYSTEM_PROMPT
-        assert "Topic," not in EXTRACTION_SYSTEM_PROMPT.split("### Abstract-Type Tests")[0]
+        assert "there is no Topic type" in SYSTEM_PROMPT
+        assert "Topic," not in SYSTEM_PROMPT.split("### Abstract-Type Tests")[0]
 
     def test_n17_named_teams(self):
-        assert "Named teams. A team, club or community named by its work" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "each, lead included, gets MEMBER_OF it" in EXTRACTION_SYSTEM_PROMPT
+        assert "Named teams. A team, club or community named by its work" in (SYSTEM_PROMPT)
+        assert "each, lead included, gets MEMBER_OF it" in SYSTEM_PROMPT
         assert "a describing word (new, old, small, whole, current, remote, other)" in (
-            EXTRACTION_SYSTEM_PROMPT
+            SYSTEM_PROMPT
         )
-        assert "the team gets no PART_OF to the employer" in EXTRACTION_SYSTEM_PROMPT
-        assert "a relationship category (colleagues, friends, family, household)" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
+        assert "the team gets no PART_OF to the employer" in SYSTEM_PROMPT
+        assert "a relationship category (colleagues, friends, family, household)" in (SYSTEM_PROMPT)
 
     def test_n17_each_team_member_works_at_the_named_employer(self):
         # T40 round 2: without this clause a named-team list lost every WORKS_AT.
@@ -626,24 +607,18 @@ class TestGroup3GlossesAndTeamConventions:
         assert 'the team\'s id holds no employer name and no "at <employer>"' in _rule(34)
 
     def test_n8_the_team_s_tools(self):
-        assert "The team's tools. Tools the user's team runs are user USES" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "a possessive that only names a thing is not" in EXTRACTION_SYSTEM_PROMPT
+        assert "The team's tools. Tools the user's team runs are user USES" in (SYSTEM_PROMPT)
+        assert "a possessive that only names a thing is not" in SYSTEM_PROMPT
 
     def test_n10_personal_milestones(self):
         assert "Personal milestones. A personal legal or financial step completed on a day" in (
-            EXTRACTION_SYSTEM_PROMPT
+            SYSTEM_PROMPT
         )
 
     def test_n11_goal_windows(self):
-        assert "Goal deadlines. A goal's stated time frame is its deadline" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "A bare month is the first such month after the reference date" in (
-            EXTRACTION_SYSTEM_PROMPT
-        )
-        assert "a frame whose year is unclear gets no date" in EXTRACTION_SYSTEM_PROMPT
+        assert "Goal deadlines. A goal's stated time frame is its deadline" in (SYSTEM_PROMPT)
+        assert "A bare month is the first such month after the reference date" in (SYSTEM_PROMPT)
+        assert "a frame whose year is unclear gets no date" in SYSTEM_PROMPT
 
     def test_n12_flipped_preferences_live_in_rule_6_with_no_date(self):
         rule_6 = _rule(6)
@@ -654,13 +629,11 @@ class TestGroup3GlossesAndTeamConventions:
         assert "(the new preference is the fact)" not in rule_6
 
     def test_rule_38_folded_into_rule_6(self):
-        assert "Rule 38" not in EXTRACTION_SYSTEM_PROMPT
-        assert not any(line.startswith("38. ") for line in EXTRACTION_SYSTEM_PROMPT.splitlines())
+        assert "Rule 38" not in SYSTEM_PROMPT
+        assert not any(line.startswith("38. ") for line in SYSTEM_PROMPT.splitlines())
 
     def test_example_31_the_named_team_beside_the_employer(self):
-        heading = next(
-            line for line in EXTRACTION_SYSTEM_PROMPT.splitlines() if "### Example 31:" in line
-        )
+        heading = next(line for line in SYSTEM_PROMPT.splitlines() if "### Example 31:" in line)
         assert "Rule 34" in heading
         _, output = _examples()[31]
         orgs = [e["id"] for e in output["entities"] if e["type"] == "Organization"]
@@ -714,7 +687,7 @@ class TestExtractionVersionDriftGuard:
     honor-system pairing mechanical.
     """
 
-    # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
+    # sha256(SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
     # extraction_version = "2026-11-10-r8", groups 1 (identity), 2 (list conventions) and
     # 3 (glosses, named teams and the remaining conventions), as T40 rounds 1 and 2 revised
     # them.
@@ -724,7 +697,7 @@ class TestExtractionVersionDriftGuard:
         import hashlib
 
         digest = hashlib.sha256(
-            (EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE).encode("utf-8")
+            (SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE).encode("utf-8")
         ).hexdigest()
         assert digest == self.PINNED_SHA256, (
             "Extraction prompt content changed WITHOUT an extraction_version "

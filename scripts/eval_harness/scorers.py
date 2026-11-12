@@ -30,104 +30,26 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Ontology constants (mirror of backend/knowledge/ontologies/v1_0_0.py).
+# The types and edges the model may produce.
 #
-# RESYNCED 2026-06-14 (v1.4.0). These frozensets MUST stay aligned with
-# EXTRACTABLE_NODE_TYPES and EXTRACTABLE_RELATIONSHIP_TYPES in
-# backend/knowledge/ontologies/v1_0_0.py. The harness is designed to
-# run standalone without a backend import at module load time, so the
-# mirror is intentional -- but drift here silently mis-scores extraction
-# quality (a type the model correctly produces gets counted as
-# "bad_entity_types" if missing from this list).
-#
-# v1.4.0 changes: Topic and Milestone retired (Topic -> Concept,
-# Milestone -> Event with event_type=milestone); Abstraction supertype added.
-#
-# Drift is caught by tests/unit/test_eval_harness_scorers.py which
-# cross-checks these frozensets against the ontology source of truth
-# every time the unit-test suite runs.
+# Read from the registry's active ontology pack each time a result is scored, so a
+# type the pack gains is scored as soon as the pack has it. The backend is imported
+# at the first call and not when this module loads: the other scorers need none.
 # ---------------------------------------------------------------------------
 
-EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
-    {
-        # External domain -- original (10; Topic/Milestone retired in v1.4.0).
-        "User",
-        "Person",
-        "Organization",
-        "Technology",
-        "Skill",
-        "Project",
-        "Concept",
-        "Event",
-        "Goal",
-        "Preference",
-        "Location",
-        # External domain -- post-MVP additive 2026-04-22 (3; Milestone retired).
-        "Date",
-        "Metric",
-        "Document",
-        # External domain -- v1.1.0 additive 2026-05-06 (5).
-        "Pattern",
-        "Convention",
-        "Mechanism",
-        "Strategy",
-        "DataStructure",
-        # External domain -- v1.4.0 Abstraction supertype (1).
-        "Abstraction",
-        # MIST-scope identity -- Cluster 1 promoted from INTERNAL-only (1).
-        "MistIdentity",
-    }
-)
 
-EXTRACTABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
-    {
-        # External user-centric (13).
-        "USES",
-        "KNOWS",
-        "WORKS_ON",
-        "WORKS_AT",
-        "INTERESTED_IN",
-        "HAS_GOAL",
-        "PREFERS",
-        "DISLIKES",
-        "EXPERT_IN",
-        "LEARNING",
-        "STRUGGLES_WITH",
-        "DECIDED",
-        "EXPERIENCED",
-        # Structural (8 original).
-        "IS_A",
-        "PART_OF",
-        "RELATED_TO",
-        "DEPENDS_ON",
-        "USED_FOR",
-        "WORKS_WITH",
-        "KNOWS_PERSON",
-        "MEMBER_OF",
-        # Cluster 1 MIST-scope (4).
-        "IMPLEMENTED_WITH",
-        "MIST_HAS_CAPABILITY",
-        "MIST_HAS_TRAIT",
-        "MIST_HAS_PREFERENCE",
-        # Post-MVP additive temporal / quantified / document (4).
-        "OCCURRED_ON",
-        "HAS_METRIC",
-        "REFERENCES_DOCUMENT",
-        "PRECEDED_BY",
-        # v1.1.0 additive mechanism / pattern / strategy (8).
-        "MECHANISM_OF",
-        "OPERATES_ON",
-        "INPUT_TO",
-        "IMPROVES",
-        "COMPRISES",
-        "APPLICABLE_TO",
-        "STRATEGY_FOR",
-        "NAMING_CONVENTION_OF",
-        # v1.3.0 additive recommendation / habit (2).
-        "RECOMMENDS",
-        "HAS_HABIT",
-    }
-)
+def extractable_entity_types() -> frozenset[str]:
+    """The entity types the active ontology pack lets the model produce."""
+    from backend.knowledge.ontologies import registry
+
+    return frozenset(registry.active_pack().extractable_node_types)
+
+
+def extractable_relationship_types() -> frozenset[str]:
+    """The relationship types the active ontology pack lets the model produce."""
+    from backend.knowledge.ontologies import registry
+
+    return frozenset(registry.active_pack().extractable_edge_types)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +269,8 @@ def score_schema_conformance(result: dict[str, Any], expected: dict[str, Any]) -
         return ScoreOutcome(passed=False, score=0.2, breakdown=breakdown, examined=0)
     breakdown["schema_shape_ok"] = True
 
+    entity_types = extractable_entity_types()
+    relationship_types = extractable_relationship_types()
     bad_entity_types: list[str] = []
     entity_ids: set[str] = set()
     for ent in parsed["entities"]:
@@ -354,7 +278,7 @@ def score_schema_conformance(result: dict[str, Any], expected: dict[str, Any]) -
             bad_entity_types.append("<non-dict entity>")
             continue
         et = ent.get("type")
-        if et not in EXTRACTABLE_ENTITY_TYPES:
+        if et not in entity_types:
             bad_entity_types.append(str(et))
         if isinstance(ent.get("id"), str):
             entity_ids.add(ent["id"])
@@ -368,7 +292,7 @@ def score_schema_conformance(result: dict[str, Any], expected: dict[str, Any]) -
             bad_relationship_types.append("<non-dict relationship>")
             continue
         rt = rel.get("type")
-        if rt not in EXTRACTABLE_RELATIONSHIP_TYPES:
+        if rt not in relationship_types:
             bad_relationship_types.append(str(rt))
         src = rel.get("source")
         tgt = rel.get("target")

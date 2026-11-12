@@ -69,6 +69,8 @@ from backend.knowledge.extraction.structure_splitter import (
     split_structured,
 )
 from backend.knowledge.ontologies import EXTRACTABLE_NODE_TYPES, EXTRACTABLE_RELATIONSHIP_TYPES
+from backend.knowledge.ontologies.pack import PlanVocabulary
+from backend.knowledge.ontologies.registry import active_pack
 from backend.llm.models import LLMRequest, LLMResponse, UsageMetadata
 from tests.unit.extraction_service.conftest import make_extract_request
 from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
@@ -302,6 +304,28 @@ class TestPlanSchema:
         assert entity_types == EXTRACTABLE_NODE_TYPES
         assert predicates == EXTRACTABLE_RELATIONSHIP_TYPES
         assert fan_out_predicates == EXTRACTABLE_RELATIONSHIP_TYPES
+
+    def test_the_schema_is_built_from_the_active_packs_plan_vocabulary(self):
+        (rule,) = active_pack().rules_of("plan_vocabulary")
+
+        assert turn_plan.plan_output_schema(rule.params) == PLAN_OUTPUT_SCHEMA
+
+    def test_a_vocabulary_gives_each_enum_its_own_list(self):
+        vocabulary = PlanVocabulary(
+            entity_types=("Boat", "Crew"),
+            predicates=("CREWS_WITH",),
+            fan_out_predicates=("SERVES_UNDER",),
+        )
+
+        properties = turn_plan.plan_output_schema(vocabulary)["properties"]
+        template = properties["templates"]["items"]["properties"]
+
+        assert properties["entities"]["items"]["properties"]["type"]["enum"] == [
+            "Boat",
+            "Crew",
+        ]
+        assert template["predicate"]["enum"] == ["CREWS_WITH"]
+        assert template["fan_out"]["items"]["properties"]["predicate"]["enum"] == ["SERVES_UNDER"]
 
     def test_the_schema_holds_no_other_enum(self):
         enums = {path for path, node in _schema_nodes(PLAN_OUTPUT_SCHEMA) if "enum" in node}

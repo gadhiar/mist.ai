@@ -57,7 +57,6 @@ from backend.extraction_contract.models import (
 from backend.extraction_service.adapters import ModelFamilyAdapter
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
-    EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
 from backend.extraction_service.settings import ConstrainedMode, ReasoningEffort, ServiceSettings
@@ -85,7 +84,7 @@ from backend.knowledge.extraction.ontology_extractor import (
 )
 from backend.knowledge.extraction.pre_llm import filter_units
 from backend.knowledge.extraction.preprocessor import PreProcessedInput, PreProcessor
-from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE
+from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
 from backend.knowledge.extraction.scope_classifier import (
     SCOPE_CLASSIFIER_SYSTEM_PROMPT,
     SCOPE_USER_TEMPLATE,
@@ -265,15 +264,10 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
         "the serving identity's types and hash: request_profile reads the requests the "
         "stages build and changes none of them",
     ),
-    (
-        "backend.knowledge.ontologies",
-        "the turn plan reads its two derived extractable lists and nothing else, as the "
-        "plan schema's enums, and that schema is hashed into prompt_sha256 when the plan "
-        "is on; the ontology's version is a component already. A pack's own types and "
-        "rules live under this package and no service module imports them: the covered "
-        "registry reaches them, and pack_prompt_hash and pack_rails_hash, stamped on "
-        "every result, cover their content",
-    ),
+    # No entry for `backend.knowledge.ontologies`: no service module imports an
+    # ontology's own modules. The covered registry reaches a pack's types and rules,
+    # the turn plan's vocabulary among them, and pack_prompt_hash and
+    # pack_rails_hash, stamped on every result, cover their content.
 )
 
 
@@ -499,26 +493,25 @@ def _compute_prompt_sha256(
         turn_plan: Whether the service runs with the turn plan
             (`ServiceSettings.turn_plan`).
         pack: The pack the service extracts with: its assembled system prompt
-            and its generated schema are the Stage 2 components. None hashes
-            this module's `EXTRACTION_SYSTEM_PROMPT` and
-            `EXTRACTION_OUTPUT_SCHEMA`, the prompt and schema of a pack that
-            holds no prompt fragment, which the pack in use by default is.
+            and its generated schema are the Stage 2 components. None takes
+            the registry's active pack, as the engine's constructor does:
+            no module holds a prompt or an extraction schema of its own.
             The pack's two hashes are stamps of their own and are no
             component here.
     """
-    system_prompt = EXTRACTION_SYSTEM_PROMPT if pack is None else pack.system_prompt
-    extraction_schema = EXTRACTION_OUTPUT_SCHEMA if pack is None else pack.extraction_schema
+    if pack is None:
+        pack = active_pack()
     components = [
         SCOPE_CLASSIFIER_SYSTEM_PROMPT,
         SCOPE_USER_TEMPLATE,
-        system_prompt,
+        pack.system_prompt,
         EXTRACTION_USER_TEMPLATE,
         NO_PRIOR_CONTEXT,
         INTERNAL_DERIVATION_SYSTEM_PROMPT,
         INTERNAL_DERIVATION_USER_TEMPLATE,
         _REPAIR_INSTRUCTION,
         json.dumps(SCOPE_OUTPUT_SCHEMA, sort_keys=True),
-        json.dumps(extraction_schema, sort_keys=True),
+        json.dumps(pack.extraction_schema, sort_keys=True),
         json.dumps(DERIVATION_OUTPUT_SCHEMA, sort_keys=True),
         adapter.name,
         adapter.version,

@@ -840,7 +840,7 @@ class ExtractionPipeline:
         # Note on Bug K two-layer defense: pre_processed.metadata may carry an
         # "injection_warning" flag from the preprocessor (backend/knowledge/extraction/
         # preprocessor.py _detect_injection). We intentionally do NOT gate here on that
-        # flag — enforcement lives in EXTRACTION_SYSTEM_PROMPT Rule 10, which instructs
+        # flag — enforcement lives in the system prompt's Rule 10, which instructs
         # the LLM to return empty extraction on directive utterances. The metadata is a
         # reserved signal for a future drop-on-flag policy; flipping to hard-drop here
         # would require re-tuning the prompt rule and re-running Phase A gauntlet.

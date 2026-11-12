@@ -149,14 +149,26 @@ class PackRelease:
 # The extraction version and the pack version are read, never restated: the line is
 # for the running version by construction, and names the pack of the ontology in use.
 #
-# Under 2026-11-10-r8 the prompt hash moved once with no change to the model's input:
-# the generated output schema joined what it covers, and that schema equals the one
-# the service already sent.
+# Under 2026-11-10-r8 the prompt hash moved three times with no change to the model's
+# input. The generated output schema joined what it covers, and that schema equals the
+# one the service already sent. Then the prompt's ontology half moved from the engine
+# core into the pack as prompt fragments, which the hash covers: the assembled prompt
+# is the same bytes, and `prompt_sha256` did not move. Then the serialization both
+# hashes are taken over stopped writing a dataclass field a pack leaves unstated
+# (None), so that a field added to a class later moves the hashes of the packs that
+# state it and of no other: both hashes of every pack moved, and nothing a pack states
+# changed. The rails hash moved three times with no change to what is stored. Once when
+# the three id plug-ins moved from `id_rails.py` into the pack's `plugins.py`, since
+# the hash covers the source of the module that holds them: each returns what it
+# returned, and `version_rail` and `technology_version_id` now read the type's name
+# from the pack's types where they wrote it as a literal. Once with that serialization.
+# And once when the Metric `typed_id` rule stated its alignment kind, a parameter the
+# eval harness's aligner reads and no rail does.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
-    pack_prompt_hash="5357a198ce334d01a38ae38f7ca63c8e2d916381f3099d5f74ea6862a6f54fdb",
-    pack_rails_hash="4781cce194608f35e864998ae4946c1a5b4070e310f6d7d756aed2582edd73ab",
+    pack_prompt_hash="23ed42d935f3589044b274ae2d60b51fd39fa6721dc87b65bfc0c560ca81e0ea",
+    pack_rails_hash="6705d826291cb01f7f9b9f3057fa72ad8ab6aaa1cc17c6bdf3568e7dc2703c05",
 )
 
 
@@ -237,7 +249,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-4af580515edebe101c9a9d31b57a9c0758ddd3262f1469b0c8ef2257ac4f6b06",
+        code_identity="ci1-c1cf16a9f46473765a83b3586ea6ba1c27756e3f3f20fa7006cfe8375d891306",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -278,8 +290,17 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "running its item filters on the units before they are batched, sending its "
             "assembled prompt and generated schema at Stage 2 and under the plan call, and "
             "stamping its two hashes on every result, and pre_llm, the pack loader and the "
-            "registry join the covered code; the active pack holds no prompt fragment and "
-            "no item filter, so it drops no unit and changes no request. "
+            "registry join the covered code; the active pack holds "
+            "no item filter, so it drops no unit and changes no request; T46 ships the "
+            "ontology as a pack of files, which the registry loads in place of the adapter "
+            "that stated it from the old modules, with the same types, rules, pair table, "
+            "prompt and schema, and no module keeps the assembled prompt as a constant: the "
+            "service, the in-process extractor and the eval harness send the active pack's, "
+            "which the engine core and the pack's prompt fragments assemble to the same "
+            "bytes; the turn plan's schema is built from the pack's plan vocabulary, "
+            "which holds the lists it read before; the two pack hashes leave out a "
+            "dataclass field a pack leaves unstated, which moves both hashes of every pack "
+            "and nothing a request carries. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

@@ -1,4 +1,4 @@
-"""Today's ontology through the adapter pack: the rail runner gives the old id rails' output.
+"""Today's ontology through its pack: the rail runner gives the old id rails' output.
 
 `every_rail_payload.py` holds one synthetic payload that fires every rail the id rails
 ran before the pack, with the output they gave written out by hand.
@@ -21,7 +21,7 @@ def _every_rail_payload() -> tuple[list[dict], list[dict]]:
     )
 
 
-def test_run_rails_through_the_adapter_pack_gives_the_output_of_the_old_id_rails():
+def test_run_rails_through_the_active_pack_gives_the_output_of_the_old_id_rails():
     entities, relationships = _every_rail_payload()
 
     out_entities, out_relationships = run_rails(
@@ -45,8 +45,9 @@ def test_normalize_payload_is_run_rails_through_the_active_pack():
 
 def _without_an_id_key() -> tuple[dict, dict]:
     """A reserved name with no type and a retired type with a default, neither with an id."""
-    reserved_name = next(iter(id_rails.RESERVED_NAMES))
-    retired = next(name for name, added in id_rails.RETIRED_PROPERTY_DEFAULTS.items() if added)
+    pack = registry.active_pack()
+    reserved_name = pack.rules_of("reserved_identity")[0].params.names[0]
+    retired = next(r.name for r in pack.manifest.retired_types if r.property_defaults)
     return {"name": reserved_name}, {"name": "Harbour Opening", "type": retired}
 
 
@@ -71,11 +72,11 @@ def test_normalize_entity_gives_the_same_key_order_as_the_payload_path():
     assert list(retired) == ["name", "type", "id", "properties"]
 
 
-def test_the_adapter_packs_own_pinned_cases_hold():
+def test_the_active_packs_own_pinned_cases_hold():
     assert check_pinned_cases(registry.active_pack()) == []
 
 
-def test_the_synthetic_payload_fires_every_rule_of_the_adapter_pack():
+def test_the_synthetic_payload_fires_every_rule_of_the_active_pack():
     pack = registry.active_pack()
     post_llm = {rule.kind for rule in pack.rules if rule.phase != "pre_llm"}
 

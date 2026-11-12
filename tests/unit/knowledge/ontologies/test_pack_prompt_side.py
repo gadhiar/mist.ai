@@ -87,7 +87,7 @@ def test_a_loaded_pack_holds_its_assembled_prompt_and_its_schema():
 def test_a_pack_with_no_fragment_holds_the_engine_core():
     without = tuple(rule for rule in conventions.RULES if rule.kind != "prompt_fragment")
 
-    assert _build(rules=without).system_prompt == prompts.EXTRACTION_SYSTEM_PROMPT
+    assert _build(rules=without).system_prompt == prompts.assemble_system_prompt()
 
 
 # --- a prompt-visible change moves only the prompt hash ---------------------------------

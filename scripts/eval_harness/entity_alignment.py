@@ -12,7 +12,8 @@ priority order:
 2. `alternative`: the produced id is one of gold's `alternatives`.
 3. `event-date`: one id is the other plus `-YYYY-MM-DD`, and both entities' own
    `OCCURRED_ON` dates exist and equal that date.
-4. `metric`: a gold Metric and a produced id with the same concatenated digit string and
+4. `metric`: a gold id of a type whose `typed_id` rule in the active pack states the
+   kind, and a produced id with the same concatenated digit string and
    the same non-empty set of measure words, after stopwords, stemming and the synonyms
    `rps` (requests per second), `ms` (milliseconds) and `percent` (%).
 5. `n1`: equal once leading articles and possessive pronouns are dropped (N1).
@@ -43,6 +44,7 @@ from typing import Literal
 # LABELLING.md N1: leading articles and possessive pronouns are dropped from ids. The N1
 # rail's own words, so the aligner and the rail read one set.
 from backend.knowledge.extraction.id_rails import N1_WORDS
+from backend.knowledge.ontologies import registry
 from backend.knowledge.ontologies.hierarchy import canonical_type, parent_of
 
 AlignmentKind = Literal[
@@ -62,8 +64,36 @@ EXCLUSION_EXEMPT_KINDS: frozenset[AlignmentKind] = frozenset(
     {"exact", "alternative", "event-date", "metric"}
 )
 PENDING_KINDS: frozenset[AlignmentKind] = frozenset({"typo", "paraphrase"})
-UNDIRECTED_PREDICATES: frozenset[str] = frozenset({"RELATED_TO", "WORKS_WITH"})
 RelKey = tuple[str, str, str]
+
+
+def undirected_predicates() -> frozenset[str]:
+    """The active pack's undirected edges: predicates whose two directions are one relation."""
+    return frozenset(
+        edge.type_name for edge in registry.active_pack().edge_types if not edge.directional
+    )
+
+
+def types_aligned_as(kind: str) -> frozenset[str]:
+    """The types whose `typed_id` rule in the active pack states the alignment `kind`.
+
+    A pack states a kind on the rule whose plug-in makes such ids one node, so the
+    kind's equality holds for ids of those types and of no other.
+    """
+    return frozenset(
+        rule.params.type
+        for rule in registry.active_pack().rules_of("typed_id")
+        if rule.params.alignment == kind
+    )
+
+
+def __getattr__(name: str) -> object:
+    # `UNDIRECTED_PREDICATES` is read as a module attribute, and is the active pack's set
+    # at each read rather than a copy taken when this module loaded.
+    if name == "UNDIRECTED_PREDICATES":
+        return undirected_predicates()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 _KIND_RANK: dict[str, int] = {kind: rank for rank, kind in enumerate(ALIGNMENT_KINDS)}
 _DATED_ID_RE = re.compile(r"^(?P<base>.+)-(?P<date>\d{4}-\d{2}-\d{2})$")
@@ -144,8 +174,8 @@ def variant_kind(gold_id: str, gold_type: str, produced_id: str) -> str | None:
 
     Kinds: `n1` (articles or possessives only), `reorder` (the same tokens in
     another order), `typo` (edit distance 2 or less on ids of 5 or more
-    characters), `metric` (a Metric id whose tokens are a subset or superset of
-    gold's), `paraphrase` (the same content tokens after stemming, or one set
+    characters), `metric` (an id of a type the active pack aligns as `metric`, whose
+    tokens are a subset or superset of gold's), `paraphrase` (the same content tokens after stemming, or one set
     inside the other).
     """
     gold_raw = [t for t in raw_tokens(gold_id) if t not in N1_WORDS]
@@ -161,7 +191,7 @@ def variant_kind(gold_id: str, gold_type: str, produced_id: str) -> str | None:
     if not gold_content or not produced_content:
         return None
     if gold_content <= produced_content or produced_content <= gold_content:
-        return "metric" if gold_type == "Metric" else "paraphrase"
+        return "metric" if gold_type in types_aligned_as("metric") else "paraphrase"
     return None
 
 
@@ -270,7 +300,7 @@ def _pair_kind(gold: EntityRef, produced: EntityRef) -> AlignmentKind | None:
         return "alternative"
     if event_date_equal(gold, produced):
         return "event-date"
-    is_metric = gold.type is not None and canonical_type(gold.type) == "Metric"
+    is_metric = gold.type is not None and canonical_type(gold.type) in types_aligned_as("metric")
     if is_metric and metric_equal(gold.id, produced.id):
         return "metric"
     gold_raw, produced_raw = raw_tokens(gold.id), raw_tokens(produced.id)
@@ -390,6 +420,7 @@ def match_relations(
     """
     to_gold = {pair.produced_id: pair.gold_id for pair in pairs}
     alternatives = predicate_alternatives or {}
+    undirected = undirected_predicates()
     gold_keys = sorted(set(gold))
     produced_keys = sorted(set(produced))
     options: list[tuple[tuple[int, int], RelKey, RelKey]] = []
@@ -404,7 +435,7 @@ def match_relations(
                 continue
             if mapped == (gold_source, gold_target):
                 orientation = 0
-            elif gold_predicate in UNDIRECTED_PREDICATES and mapped == (gold_target, gold_source):
+            elif gold_predicate in undirected and mapped == (gold_target, gold_source):
                 orientation = 1
             else:
                 continue

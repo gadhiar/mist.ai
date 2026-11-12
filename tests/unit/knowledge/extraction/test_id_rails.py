@@ -20,10 +20,10 @@ from backend.knowledge.extraction.id_rails import (
     normalize_entity,
     normalize_payload,
     stored_entity_id,
-    version_rail,
 )
 from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.ontologies.packs.v1_4_0.plugins import version_rail
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -451,7 +451,4 @@ def test_id_rails_imports_nothing_from_scripts_and_no_io_dependency():
         "from __future__ import annotations",
         "import re",
         "from collections.abc import Mapping",
-        "from backend.knowledge.extraction.canonical_id import (",
-        "from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP",
-        "from backend.knowledge.ontologies.v1_0_0 import ALL_NODE_TYPE_NAMES",
     ]

@@ -1,8 +1,9 @@
-"""The boundary: no engine file names a type or an edge of a pack.
+"""The boundary: no engine file and no scorer names a type or an edge of a pack.
 
-The engine reads rules as data, so a type or edge name belongs in pack files only. The
-search reads a pack's names and looks for each as a quoted string literal in the engine
-files. A later ontology version joins the check by adding its pack to `_BOUNDARY_PACKS`.
+The engine reads rules as data, and the scorers read the pack, so a type or edge name
+belongs in pack files only. The search reads a pack's names and looks for each as a
+quoted string literal in the engine files and in the eval harness's scripts. A later
+ontology version joins the check by adding its pack to `_BOUNDARY_PACKS`.
 """
 
 from __future__ import annotations
@@ -19,11 +20,10 @@ BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
 PET = load_pack("tests.unit.knowledge.ontologies.fixtures.pet_pack")
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_ONTOLOGY_HALF = "# === ontology half ==="
 
 
 def _engine_sources() -> dict[str, str]:
-    """The engine files, by path: the id rails count up to their ontology half."""
+    """The engine files, by path."""
     backend = _REPO_ROOT / "backend"
     extraction = backend / "knowledge" / "extraction"
     paths = sorted((backend / "extraction_service").glob("*.py"))
@@ -32,15 +32,10 @@ def _engine_sources() -> dict[str, str]:
         extraction / "normalizer.py",
         extraction / "rails.py",
         extraction / "pre_llm.py",
+        extraction / "id_rails.py",
+        extraction / "prompts.py",
     ]
-    sources = {
-        str(path.relative_to(_REPO_ROOT)): path.read_text(encoding="utf-8") for path in paths
-    }
-    id_rails_source = (extraction / "id_rails.py").read_text(encoding="utf-8")
-    assert id_rails_source.count(f"\n{_ONTOLOGY_HALF}\n") == 1
-    engine_half = id_rails_source.split(f"\n{_ONTOLOGY_HALF}\n")[0]
-    sources["backend/knowledge/extraction/id_rails.py (engine half)"] = engine_half
-    return sources
+    return {str(path.relative_to(_REPO_ROOT)): path.read_text(encoding="utf-8") for path in paths}
 
 
 def _quoted_pack_names(pack: Pack, sources: dict[str, str]) -> list[tuple[str, str]]:
@@ -54,14 +49,60 @@ def _quoted_pack_names(pack: Pack, sources: dict[str, str]) -> list[tuple[str, s
     return found
 
 
-# T46 adds the v1.4.0 pack to this list. Today's ontology already passes through the
-# adapter pack, so the active pack is on it now.
-_BOUNDARY_PACKS = {"base": BASE, "pet": PET, "active": registry.active_pack()}
+def _scorer_sources() -> dict[str, str]:
+    """The eval harness's scripts, by path, less the scorers of past probe sets.
+
+    The glob reads the harness's own directory, so the ceiling's scorer, one directory
+    down, is named.
+    """
+    paths = sorted(path for path in _SCORERS.glob("*.py") if path.name not in _LEGACY_SCORERS)
+    paths.append(_SCORERS / "ceiling" / "score_runs.py")
+    return {
+        path.relative_to(_REPO_ROOT).as_posix(): path.read_text(encoding="utf-8") for path in paths
+    }
+
+
+_SCORERS = _REPO_ROOT / "scripts" / "eval_harness"
+
+# Scorers written for one past probe set each. A probe set's predicates are part of
+# what such a scorer is, it scores no run of today's sets, and no pack changes it.
+_LEGACY_SCORERS = ("score_v8_probe_run.py", "score_v9_predicate_run.py")
+
+
+V1_4_0 = registry.get_pack("1.4.0")
+_BOUNDARY_PACKS = {"base": BASE, "pet": PET, "v1.4.0": V1_4_0}
 
 
 @pytest.mark.parametrize("name", sorted(_BOUNDARY_PACKS))
 def test_no_engine_file_names_a_type_or_an_edge_of_the_pack(name):
     assert _quoted_pack_names(_BOUNDARY_PACKS[name], _engine_sources()) == []
+
+
+@pytest.mark.parametrize("name", sorted(_BOUNDARY_PACKS))
+def test_no_scorer_names_a_type_or_an_edge_of_the_pack(name):
+    assert _quoted_pack_names(_BOUNDARY_PACKS[name], _scorer_sources()) == []
+
+
+# The scorers the search has to read: the extraction scorer, the aligner, the name
+# sets, and the ceiling's scorer, which sits one directory down.
+_PLANNED_SCORERS = (
+    "scripts/eval_harness/ceiling/score_runs.py",
+    "scripts/eval_harness/entity_alignment.py",
+    "scripts/eval_harness/score_extraction_run.py",
+    "scripts/eval_harness/scorers.py",
+)
+
+
+def test_the_search_reads_every_planned_scorer():
+    assert [path for path in _PLANNED_SCORERS if path not in _scorer_sources()] == []
+
+
+def test_the_legacy_scorers_exist_and_each_names_the_pack():
+    sources = {name: (_SCORERS / name).read_text(encoding="utf-8") for name in _LEGACY_SCORERS}
+
+    assert sorted({path for path, _ in _quoted_pack_names(V1_4_0, sources)}) == sorted(
+        _LEGACY_SCORERS
+    )
 
 
 def test_the_boundary_search_finds_a_quoted_name():
@@ -81,5 +122,6 @@ def test_the_boundary_covers_the_engine_files_the_plan_lists():
         "backend/knowledge/extraction/normalizer.py",
         "backend/knowledge/extraction/rails.py",
         "backend/knowledge/extraction/pre_llm.py",
-        "backend/knowledge/extraction/id_rails.py (engine half)",
+        "backend/knowledge/extraction/id_rails.py",
+        "backend/knowledge/extraction/prompts.py",
     } <= {path.replace("\\", "/") for path in covered}

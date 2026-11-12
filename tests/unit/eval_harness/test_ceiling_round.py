@@ -37,10 +37,10 @@ from backend.extraction_service.schemas import (  # noqa: E402
     EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
-from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT  # noqa: E402
 from backend.knowledge.extraction.scope_classifier import (  # noqa: E402
     SCOPE_CLASSIFIER_SYSTEM_PROMPT,
 )
+from backend.knowledge.ontologies.registry import active_pack  # noqa: E402
 from scripts.eval_harness.ceiling import replay as rp  # noqa: E402
 from scripts.eval_harness.ceiling import round as rd  # noqa: E402
 from scripts.eval_harness.ceiling.store import AnswerStore, OfferedRequest  # noqa: E402
@@ -326,7 +326,7 @@ def test_answerer_k_takes_rows_10k_minus_9_to_10k() -> None:
         rd.answerer_probes(rows[:10], 2)
 
 
-@pytest.mark.parametrize("prompt", [EXTRACTION_SYSTEM_PROMPT, SCOPE_CLASSIFIER_SYSTEM_PROMPT])
+@pytest.mark.parametrize("prompt", [active_pack().system_prompt, SCOPE_CLASSIFIER_SYSTEM_PROMPT])
 def test_no_h3_marker_is_in_the_system_or_scope_prompt(prompt: str) -> None:
     assert [m for m in H3_MARKERS if m in prompt] == []
 
@@ -415,7 +415,7 @@ def test_each_offer_names_a_prompt_and_a_schema_file_holding_the_request_s_own(
         encoding="utf-8"
     ) == SCOPE_CLASSIFIER_SYSTEM_PROMPT
     extract_prompt = (ceiling / extract_item["prompt"]).read_text(encoding="utf-8")
-    assert extract_prompt.startswith(EXTRACTION_SYSTEM_PROMPT[:200])
+    assert extract_prompt.startswith(active_pack().system_prompt[:200])
     assert len(list((ceiling / "prompts").iterdir())) == 2
     assert len(list((ceiling / "schemas").iterdir())) == 2
 
