@@ -6,8 +6,8 @@ batch record names each batch's units, their contexts and the entities the batch
 returned, so the rail knows which context an id may carry.
 
 A line is dropped only when something is left, when it names no entity of the row's
-payload, and when the id the later id rails would build from what is left is not the
-user anchor's id or a reserved identity's name or id. The longest line that fits is
+payload, and when neither what is left nor the id the later id rails would build from
+it is the user anchor's id or a reserved identity's name or id. The longest line that fits is
 tried, and after a drop the id is read again; a line that is refused ends the strip.
 
 The cases run on the fixture packs, whose types are invented, so a case that passes
@@ -241,6 +241,15 @@ _TOOLS_BUILT = [
     {"id": "tools-the-lanternfish", "name": "Tools the Lanternfish", "type": "Technology"},
 ]
 _TOOLS_BUILT_ROW = (_TOOLS_BUILT, [], [_batch([("Tools",)], _TOOLS_BUILT)], V1_4_0)
+
+# The other way round: what is left is a reserved name as it stands, and the
+# leading-word rail would build from it an id nothing reserves (`the-ai` gives `ai`).
+_TOOLS_RAW = [
+    {"id": "tools-the-ai", "name": "Tools the AI", "type": "Technology"},
+    {"id": "tools-the-assistant", "name": "Tools the assistant", "type": "Technology"},
+    {"id": "tools-the-lanternfish", "name": "Tools the Lanternfish", "type": "Technology"},
+]
+_TOOLS_RAW_ROW = (_TOOLS_RAW, [], [_batch([("Tools",)], _TOOLS_RAW)], V1_4_0)
 
 _TOOLS_VERSIONED = [
     {"id": "tools-mist-2", "name": "Tools MIST 2", "type": "Technology"},
@@ -515,6 +524,12 @@ def test_a_strip_is_refused_when_the_id_rails_would_build_a_reserved_name_from_t
     ]
 
 
+def test_a_strip_is_refused_when_the_rest_is_a_reserved_name_the_id_rails_would_change():
+    # The remainder is judged as it stands as well as built: neither reading may give
+    # a reserved name.
+    assert _row_ids(_TOOLS_RAW_ROW) == ["tools-the-ai", "tools-the-assistant", "lanternfish"]
+
+
 def test_a_strip_is_refused_when_the_version_rail_would_build_a_reserved_name_from_the_rest():
     # The version rail drops `-2` from each id, with or without the record; the context
     # stays on the two ids whose rest it would build into `mist`.
@@ -711,6 +726,7 @@ def test_the_roster_row_gives_the_bytes_stated_here():
         pytest.param(_KEPT_ROW, id="the-anchor-and-the-reserved-names"),
         pytest.param(_KEPT_UNRESERVED_ROW, id="a-pack-with-no-reserved-rule"),
         pytest.param(_TOOLS_BUILT_ROW, id="the-v1-4-0-reserved-names-the-leading-word-rail-builds"),
+        pytest.param(_TOOLS_RAW_ROW, id="the-v1-4-0-reserved-names-as-they-stand"),
         pytest.param(_TOOLS_VERSIONED_ROW, id="the-v1-4-0-reserved-names-the-version-rail-builds"),
         pytest.param(_TOOLS_VERSIONED_UNRECORDED_ROW, id="the-version-rail-with-no-record"),
         pytest.param(_PEOPLE_ROW, id="the-anchor-the-leading-word-rail-builds"),

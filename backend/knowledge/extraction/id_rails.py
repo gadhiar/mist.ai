@@ -146,12 +146,13 @@ def normalize_payload(
     equal display name when the slugs of the two written ids are equal or one edit
     apart, and the edit touches no digit and replaces no one-character token
     (`rails._merge_near_duplicates`): it is dropped, an edge between the two is
-    dropped, and the endpoints that name it then name the earlier one. Each entity's stored id is built: the id of an entity that
-    is not settled, of a type the pack does not exempt, first loses the context its
-    batch was read under when the record names one (`rails._own_contexts`) and that
-    context may be dropped (`rails._strip_own_contexts`: it names no entity of the
-    payload, and the id rules after the strip build from what is left neither the user
-    anchor's id nor a reserved name or id). Relationship endpoints that name an
+    dropped, and the endpoints that name it then name the earlier one. Each entity's
+    stored id is built: the id of an entity that is not settled, of a type the pack
+    does not exempt, first loses the context its batch was read under when the record
+    names one (`rails._own_contexts`) and that context may be dropped
+    (`rails._strip_own_contexts`: it names no entity of the payload, and neither what
+    is left nor the id the id rules after the strip build from it is the user anchor's
+    id or a reserved name or id). Relationship endpoints that name an
     entity's `id` field are remapped to its stored id; the id-phase `derived_edge`
     rules run, and the endpoints naming a renamed entity are remapped again; entities
     are deduplicated first-wins by id, and relationships by (source, target, type). The

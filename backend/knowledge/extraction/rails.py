@@ -19,9 +19,10 @@ The phases run in a fixed order, each a separate step:
    form of `derived_edge` renames an entity from the node its edge points at. An id
    of a type no `id_exempt` rule names first loses the context its batch was read
    under, when the batch record names one (`_own_contexts`), the context names no
-   entity of the payload, and the id rules after it would build neither the user
-   anchor's id nor a reserved name or id from what is left (`_strip_own_contexts`),
-   so those rules read that entity's own id. An exempt type's id keeps its context.
+   entity of the payload, and neither what is left nor the id the id rules after it
+   would build from it is the user anchor's id or a reserved name or id
+   (`_strip_own_contexts`), so those rules read that entity's own id. An exempt
+   type's id keeps its context.
 4. fallback: an entity whose type the pack does not define takes the manifest's
    fallback type.
 
@@ -830,13 +831,14 @@ def _strip_own_contexts(
     2. the line is not in `named`. A heading the model also wrote as an entity is part
        of its items' own ids: with `redis` and `postgres` in the payload,
        `redis-cluster` and `postgres-cluster` are two things, not one `cluster`;
-    3. the id the later id rails would build from what is left (`_built_id`: the
-       alias vocabularies, the `typed_id` rules, the registry and the leading-word
-       rail) is not the user anchor's id, a name a `reserved_identity` rule maps, or
-       the id such a rule maps to. The payload phase has already settled the entities
-       that go by those, and a strip must not make another. What is left is judged as
-       built, not as it stands: under `Tools`, `tools-the-mist` would leave `the-mist`,
-       which the leading-word rail makes `mist`.
+    3. neither what is left, as it stands, nor the id the later id rails would build
+       from it (`_built_id`: the alias vocabularies, the `typed_id` rules, the
+       registry and the leading-word rail) is the user anchor's id, a name a
+       `reserved_identity` rule maps, or the id such a rule maps to. The payload phase
+       has already settled the entities that go by those, and a strip must not make
+       another. Both readings count: under `Tools`, `tools-the-mist` would leave
+       `the-mist`, which the leading-word rail makes `mist`, and `tools-the-ai` would
+       leave the reserved name `the-ai`, which the same rail makes `ai`.
 
     After a drop the id is read again, so an id that carries two lines of its context
     loses both. A line that is refused ends the strip with the id as it then stands: no
@@ -859,7 +861,7 @@ def _strip_own_contexts(
         if line is None:
             return entity_id
         rest = entity_id[len(line) + 1 :]
-        if not rest.strip("-") or line in named:
+        if not rest.strip("-") or line in named or rest in identities:
             return entity_id
         if _built_id(entity, rest, pack)[0] in identities:
             return entity_id
