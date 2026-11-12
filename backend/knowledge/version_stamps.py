@@ -149,19 +149,23 @@ class PackRelease:
 # The extraction version and the pack version are read, never restated: the line is
 # for the running version by construction, and names the pack of the ontology in use.
 #
-# Under 2026-11-10-r8 the prompt hash moved twice with no change to the model's input.
-# The generated output schema joined what it covers, and that schema equals the one
-# the service already sent. Then the prompt's ontology half moved from the engine
+# Under 2026-11-10-r8 the prompt hash moved three times with no change to the model's
+# input. The generated output schema joined what it covers, and that schema equals the
+# one the service already sent. Then the prompt's ontology half moved from the engine
 # core into the pack as prompt fragments, which the hash covers: the assembled prompt
-# is the same bytes, and `prompt_sha256` did not move. The rails hash moved once with no
-# change to what is stored: the three id plug-ins moved, bodies unchanged, from
-# `id_rails.py` into the pack's `plugins.py`, and the hash covers the source of the
-# module that holds them.
+# is the same bytes, and `prompt_sha256` did not move. Then the serialization both
+# hashes are taken over stopped writing a dataclass field a pack leaves unstated
+# (None), so that a field added to a class later moves the hashes of the packs that
+# state it and of no other: both hashes of every pack moved, and nothing a pack states
+# changed. The rails hash moved twice with no change to what is stored: once when the
+# three id plug-ins moved, bodies unchanged, from `id_rails.py` into the pack's
+# `plugins.py`, since the hash covers the source of the module that holds them, and
+# once with that serialization.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
-    pack_prompt_hash="ae81af5889e9f5676e2516008ac67fcfd46d51c52a34eee899a14dbc2a68aff0",
-    pack_rails_hash="a837f8cfc450ed027dd6af5c823b70bf974178cfb2a8672b3fd4174024e0c76d",
+    pack_prompt_hash="23ed42d935f3589044b274ae2d60b51fd39fa6721dc87b65bfc0c560ca81e0ea",
+    pack_rails_hash="a8e305e9a8615f01768c6f5c5854ba2ab5b65c45275bf75c98766e3311c0a53f",
 )
 
 
@@ -242,7 +246,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-a06741b8e2eb51bf981db1a212df413a0010420928a5c8a5e58c32f99535e5f0",
+        code_identity="ci1-0cac847d590a7a79ae20eca1d4f07f38c47286d6dd2efa8ed52e2919e23b3e04",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -291,7 +295,9 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "service, the in-process extractor and the eval harness send the active pack's, "
             "which the engine core and the pack's prompt fragments assemble to the same "
             "bytes; the turn plan's schema is built from the pack's plan vocabulary, "
-            "which holds the lists it read before. "
+            "which holds the lists it read before; the two pack hashes leave out a "
+            "dataclass field a pack leaves unstated, which moves both hashes of every pack "
+            "and nothing a request carries. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),

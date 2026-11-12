@@ -12,7 +12,7 @@ import functools
 import pytest
 
 from backend.errors import MistError
-from backend.knowledge.ontologies.base import PropertyDefinition
+from backend.knowledge.ontologies.base import NodeTypeDefinition, PropertyDefinition
 from backend.knowledge.ontologies.pack import (
     ID,
     KINDS,
@@ -300,16 +300,17 @@ def test_a_definition_value_that_cannot_be_stated_as_data_is_refused(value):
 
 # --- the two hashes --------------------------------------------------------------------
 
-# What the fixture packs hashed to when their hashes were first pinned. An edit to a
-# fixture's types, rules or plug-in module moves one on purpose; a loader change must not.
+# What the fixture packs hash to under the serialization that leaves out a field a pack
+# leaves unstated. An edit to a fixture's types, rules or plug-in module moves one on
+# purpose; a loader change must not.
 _PINNED_HASHES = {
     BASE: (
-        "cb81cc6abe25756b381b2c256a35ca4ba7447e16b08a9cdca034c3b197e2c8ce",
-        "58b8b85f66a1f6828c853e44c0ecd2c8a2441d0dfe78c65470e952fda0e4d920",
+        "d3270b5c914633fcf3af81f8481b2cca80ba6e41e44213c9b70e1ab9363723e6",
+        "b7d1edbb324940784eb00272f6740116d4202f68615f95f3be996ed15a5f8514",
     ),
     PET: (
-        "2f34c9f17e0d2fe0e5b5ef2a7f8808b39af6d2cb0276f5f83abaea1591a2c71d",
-        "4101934dcca63c62cf238850f824c59c5a2b7342d25abe825a195be1f048c713",
+        "0c73cd98947655dc358b16320490cde27ba3440d53e6f375e37381132fecbb07",
+        "072d387d13f42cd795751d7da7635a6ec613319cd5d6d7ceb9da01c0013ffc25",
     ),
 }
 
@@ -335,6 +336,66 @@ def test_a_pack_exposes_two_sha256_hashes_that_are_stable_across_loads():
         second.pack_prompt_hash,
         second.pack_rails_hash,
     )
+
+
+def _hashes(pack: Pack) -> tuple[str, str]:
+    return pack.pack_prompt_hash, pack.pack_rails_hash
+
+
+def _gains_a_field(parent: type) -> type:
+    """`parent` as it would be after gaining a field: its name, and one more field.
+
+    The field's default is None, the value a field takes when a pack leaves it
+    unstated.
+    """
+    return dataclasses.make_dataclass(
+        parent.__name__, [("note", "str | None", None)], bases=(parent,), frozen=True
+    )
+
+
+def test_a_parameter_class_that_gains_a_field_moves_only_the_packs_that_state_it():
+    grown = _gains_a_field(IdExempt)
+    types_exempt = _rule("mooring-exempt").params.types
+    base = _build()
+    unstated = _build(rules=_with("mooring-exempt", params=grown(types=types_exempt)))
+    stated = _build(rules=_with("mooring-exempt", params=grown(types=types_exempt, note="moored")))
+
+    assert _hashes(unstated) == _hashes(base)
+    assert stated.pack_rails_hash != base.pack_rails_hash
+    assert stated.pack_prompt_hash == base.pack_prompt_hash
+
+
+def test_a_type_definition_that_gains_a_field_moves_only_the_packs_that_state_it():
+    grown = _gains_a_field(NodeTypeDefinition)
+    stated_today = {
+        spec.name: getattr(types.MOORING, spec.name) for spec in dataclasses.fields(types.MOORING)
+    }
+    base = _build()
+    unstated = _build(node_types=(types.DECKHAND, grown(**stated_today)))
+    stated = _build(node_types=(types.DECKHAND, grown(**stated_today, note="a buoy")))
+
+    assert _hashes(unstated) == _hashes(base)
+    assert stated.pack_prompt_hash != base.pack_prompt_hash
+    assert stated.pack_rails_hash == base.pack_rails_hash
+
+
+def _with_berth_default(value: object) -> Pack:
+    """The base pack with one optional property whose `default` is `value`."""
+    berth = PropertyDefinition(name="berth", type="string", default=value)
+    first = dataclasses.replace(types.NODE_TYPES[0], optional_properties=(berth,))
+    return _build(node_types=(first, *types.NODE_TYPES[1:]))
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [(None, False), (None, 0), (None, ""), ((), (None,)), ({}, {"depth": None})],
+    ids=["false", "zero", "empty-string", "none-in-a-tuple", "none-as-a-mapping-value"],
+)
+def test_a_hash_leaves_out_an_unstated_field_and_nothing_else(one, other):
+    """Each of the two is written, or one is the unstated field and the other is not."""
+    first, second = _with_berth_default(one), _with_berth_default(other)
+
+    assert first.pack_prompt_hash != second.pack_prompt_hash
 
 
 def test_a_post_llm_rule_change_moves_only_the_rails_hash():

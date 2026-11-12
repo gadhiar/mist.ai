@@ -773,6 +773,14 @@ def _canonical(value: object, where: str) -> object:
     carry a memory address and so differ between two processes, and a pack whose hash
     is not the same in every process never equals its own stamp.
 
+    A dataclass field whose value is None is not written. None is a field's
+    unstated value, and a hash covers what a pack states. Two conventions follow:
+    a field added to a class under a hash takes None as its unstated value, so it
+    moves the hashes of the packs that set it and of no other; and an entry added
+    to a hash input is written only when the pack states it. Every other None is
+    written: inside a tuple, a list or a set, and as a mapping's key or value,
+    which is what the loader's own entries of a hash input are.
+
     Args:
         value: The value to state.
         where: Where the value sits in the pack, for the refusal.
@@ -782,8 +790,9 @@ def _canonical(value: object, where: str) -> object:
     """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         body = {
-            spec.name: _canonical(getattr(value, spec.name), f"{where}.{spec.name}")
+            spec.name: _canonical(item, f"{where}.{spec.name}")
             for spec in dataclasses.fields(value)
+            if (item := getattr(value, spec.name)) is not None
         }
         return {"__class__": type(value).__name__, **body}
     if isinstance(value, Enum):
