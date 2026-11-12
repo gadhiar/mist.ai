@@ -50,9 +50,6 @@ services:
       - MIST_LOG_DIR=/app/logs
       - TTS_ENABLED=${TTS_ENABLED:-true}
       - TTS_ENGINE=${TTS_ENGINE:-chatterbox}
-      - TTS_EXAGGERATION=${TTS_EXAGGERATION:-0.5}
-      - TTS_TEMPERATURE=${TTS_TEMPERATURE:-0.8}
-      - TTS_CFG_WEIGHT=${TTS_CFG_WEIGHT:-0.5}
       - VOICE_PROFILE=${VOICE_PROFILE:-mist}
       - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
     # Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root container user.
