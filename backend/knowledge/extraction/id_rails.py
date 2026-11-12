@@ -141,12 +141,15 @@ def normalize_payload(
     """Run the rails over one payload: `rails.run_rails` with the active pack.
 
     The payload stands for a row with no scope and no plan, and with the batch record
-    the caller hands over. Before any id is built, an entity that is not settled, of a
-    type the pack does not exempt, is merged into an earlier entity of its type with an
-    equal display name when the slugs of the two written ids are equal or one edit
-    apart, and the edit touches no digit and replaces no one-character token
-    (`rails._merge_near_duplicates`): it is dropped, an edge between the two is
-    dropped, and the endpoints that name it then name the earlier one. Each entity's
+    the caller hands over. Before any id is built, two written ids are merged when they
+    share a type and a display name and their slugs are equal or one edit apart, and
+    the edit touches no digit and replaces no one-character token
+    (`rails._merge_near_duplicates`). An id takes part only when none of the entities
+    that wrote it is settled or of a type the pack exempts, and all are of one type.
+    The spelling kept is the one a fixed order reads first, never the earlier in the
+    payload: the longer slug, then the smaller slug, then the smaller written id.
+    Every entity that wrote the other id is dropped, an edge between the two is
+    dropped, and the endpoints that name the other id then name the kept one. Each entity's
     stored id is built: the id of an entity that is not settled, of a type the pack
     does not exempt, first loses the context its batch was read under when the record
     names one (`rails._own_contexts`) and that context may be dropped

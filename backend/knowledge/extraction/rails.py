@@ -8,10 +8,11 @@ name it acts on is a parameter of a rule, so a new ontology version is a new pac
 The phases run in a fixed order, each a separate step:
 
 1. payload: the user anchor and the reserved identities are settled, and a retired type
-   is replaced. A settled entity takes no id rule and no type fallback. Then an entity
-   written under the name of an earlier one of its type, its id one edit from that
-   one's, is merged into it (`_merge_near_duplicates`), so every later rule counts
-   the two once.
+   is replaced. A settled entity takes no id rule and no type fallback. Then a written
+   id that shares a type and a name with another, one edit from it, is merged into it
+   (`_merge_near_duplicates`): the spelling kept is the one a fixed order reads
+   first, not the earlier in the payload, so every later rule counts the two once
+   whichever order the model listed them in.
 2. relation: rules that add or remove an edge (`fan_out`, the relation form of
    `derived_edge`, `edge_suppress`). They read the entities under the ids the model
    wrote, because the endpoints still name those.
@@ -391,42 +392,52 @@ def _name_key(entity: Mapping) -> str:
 
 
 def _merge_near_duplicates(state: _State, pack: Pack) -> None:
-    """Merge each entity into the earliest kept entity of its type it is a spelling of.
+    """Merge each written id into the first kept id, in a fixed order, it is a spelling of.
 
     The model writes one entity under two spellings of its id in two batches of a
-    turn, and each spelling then holds some of the entity's edges. Two entities are
-    near-duplicates when they have one type, their display names are equal, and the
-    slugs of their `id` fields are one spelling (`_one_spelling`). The name is what
-    says the two are one thing: two ids one letter apart under two names are two
-    things, a `mario` and a `maria`. How the two are read:
+    turn, and each spelling then holds some of the entity's edges. An edge names a
+    written id, not the entity that wrote it, so the merge reads each written id as
+    one entity, whichever entities of the payload wrote it (its writers), under every
+    reading they gave it: a writer's type and its name. Two written ids are
+    near-duplicates when they share a reading, one type and one name, and their slugs
+    are one spelling (`_one_spelling`). The name is what says the two are one thing:
+    two ids one letter apart under two names are two things, a `mario` and a `maria`.
+    How they are read:
 
     - an id is read as its slug, and a name in one case and with single spaces
       (`_name_key`). A missing name reads as the `id` field, so an entity with no name
       is merged only with one whose name or id reads the same;
     - two neighbouring characters swapped are two edits, and are not merged;
-    - the entities are read in the payload's order. Each is compared with the kept
-      entities of its type, earliest first, and merged into the first it is a
-      near-duplicate of: it is dropped, and every endpoint that names its id then
-      names the kept entity's. So the earlier of two is the earlier in the payload;
+    - the ids are read in a fixed order, never the payload's: the longer slug first,
+      then the smaller slug, then the smaller written id, each by code point. Each is
+      compared with the ids kept so far, in that order, and merged into the first it
+      is a near-duplicate of: every writer of it is dropped, and every endpoint that
+      names it then names the kept id. So of two spellings the longer is kept, which
+      holds every character either one wrote where the model dropped one; of two of
+      one length the smaller slug; and of two with one slug the smaller written id.
+      Which ids are kept depends on the entities, not on the order the model listed
+      them in;
     - an id is merged only into a kept id it is itself one edit from. Of three ids in
-      a chain whose ends are two edits apart, both ends stay when an end comes first,
-      and all three are one entity when the middle comes first;
-    - an edge between the two merged entities would join the kept entity to itself
-      and is dropped. Edges that become copies of one another are left to the dedupe
-      step, where the first wins.
+      a chain whose ends are two edits apart, both ends stay when an end is read
+      first, and all three are one entity when the middle is read first;
+    - an edge between the two merged ids would join the kept entity to itself and is
+      dropped. Edges that become copies of one another are left to the dedupe step,
+      where the first wins.
 
-    The kept entity is not changed: its name, type and properties stand, and the
-    dropped entity's are lost.
+    The kept id's writers are not changed and stay at their places in the payload:
+    their names, types and properties stand, and the dropped writers' are lost. Where
+    a kept id has several writers, the dedupe step keeps the first.
 
-    These take no part, neither merged nor kept for another:
+    These ids take no part, neither merged nor kept for another:
 
-    - a settled entity, the user anchor or a reserved identity;
-    - an entity of a type an `id_exempt` rule names: such an id is built whole by a
-      rule, so two of them one character apart are two things;
-    - an entity whose `id` is not a non-empty string, which no endpoint can name;
-    - an entity that repeats an `id` already written. It is the entity that first wrote
-      the id: it is dropped with that one when that one is merged, and is otherwise
-      left to the dedupe step.
+    - an id a settled writer wrote, the user anchor or a reserved identity;
+    - an id a writer of a type an `id_exempt` rule names wrote: such an id is built
+      whole by a rule, so two of them one character apart are two things;
+    - an id whose writers are of two types, each read as the model wrote it, or as its
+      replacement where the type is retired. Their types can build two stored ids
+      apart (a type-scoped alias, a `typed_id` rule, the fallback type), and merging
+      the id would drop a writer of another type;
+    - an entity whose `id` is not a non-empty string, which no endpoint can name.
 
     The ids compared are the ones the model wrote, so the merge is not a fixed point
     over the runner's own output: two ids that come within one edit only as stored,
@@ -435,41 +446,43 @@ def _merge_near_duplicates(state: _State, pack: Pack) -> None:
     from the cache row, never from stored output.
     """
     exempt = _rules(pack).exempt
-    kept: list[dict] = []
-    kept_by_type: dict[str, list[tuple[str, str, str]]] = {}
-    written_ids: set[str] = set()
-    merged: dict[str, str] = {}
+    writers: dict[str, list[dict]] = {}
     for entity in state.entities:
         written = entity.get("id")
-        if not isinstance(written, str) or not written:
-            kept.append(entity)
+        if isinstance(written, str) and written:
+            writers.setdefault(written, []).append(entity)
+    taking_part: list[tuple[tuple[int, str, str], frozenset[tuple[str, str]]]] = []
+    for written, of_id in writers.items():
+        types = {str(entity.get("type", "")) for entity in of_id}
+        if len(types) > 1 or types & exempt or any(id(e) in state.settled for e in of_id):
             continue
-        if written in written_ids:
-            if written not in merged:
-                kept.append(entity)
-            continue
-        written_ids.add(written)
-        entity_type = str(entity.get("type", ""))
-        if id(entity) in state.settled or entity_type in exempt:
-            kept.append(entity)
-            continue
-        slug, name = canonical_id(written), _name_key(entity)
-        of_type = kept_by_type.setdefault(entity_type, [])
+        slug = canonical_id(written)
+        readings = frozenset((str(entity.get("type", "")), _name_key(entity)) for entity in of_id)
+        taking_part.append(((-len(slug), slug, written), readings))
+    taking_part.sort(key=lambda item: item[0])
+    kept_ids: list[tuple[str, str, frozenset[tuple[str, str]]]] = []
+    merged: dict[str, str] = {}
+    for (_, slug, written), readings in taking_part:
         into = next(
             (
                 kept_id
-                for kept_id, kept_slug, kept_name in of_type
-                if name == kept_name and _one_spelling(slug, kept_slug)
+                for kept_id, kept_slug, kept_readings in kept_ids
+                if readings & kept_readings and _one_spelling(slug, kept_slug)
             ),
             None,
         )
         if into is None:
-            of_type.append((written, slug, name))
-            kept.append(entity)
+            kept_ids.append((written, slug, readings))
         else:
             merged[written] = into
     if not merged:
         return
+    # Every writer of a merged id is dropped; the writers of a kept id stay in place.
+    kept = [
+        entity
+        for entity in state.entities
+        if not (isinstance(entity.get("id"), str) and entity["id"] in merged)
+    ]
     relationships: list[dict] = []
     for relationship in state.relationships:
         source, target = relationship.get("source"), relationship.get("target")
