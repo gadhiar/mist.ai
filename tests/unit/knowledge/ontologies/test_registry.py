@@ -255,8 +255,10 @@ def test_the_packs_plan_vocabulary_is_todays_extractable_lists():
     assert _names_digest(words.fan_out_predicates) == _EXTRACTABLE_EDGE_NAMES
 
 
-def test_the_pack_adds_and_removes_no_edge():
-    assert registry.active_pack().rules_in("relation") == ()
+def test_the_packs_only_relation_rails_are_the_team_rules():
+    # ADR-054's v14 amendment, register rows 1 to 3: the one convention a relation rail
+    # of this pack carries is the named team's.
+    assert [rule.id for rule in registry.active_pack().rules_in("relation")] == ["team-fan-out"]
 
 
 def test_the_pack_exposes_both_hashes_and_they_are_stable(fresh_registry):
@@ -281,7 +283,7 @@ def test_the_pack_hashes_to_the_pinned_values(fresh_registry):
 
     assert (pack.pack_prompt_hash, pack.pack_rails_hash) == (
         "944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
-        "6705d826291cb01f7f9b9f3057fa72ad8ab6aaa1cc17c6bdf3568e7dc2703c05",
+        "fd203e9b523661332f29c301e493cc1b388b7930d877474062e45786e5e518e6",
     )
 
 

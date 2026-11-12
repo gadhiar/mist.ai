@@ -171,12 +171,15 @@ class PackRelease:
 # eval harness's aligner reads and no rail does.
 #
 # Under 2026-11-12-r9 the prompt hash moved with the `unchecked-goals` item filter,
-# which changes what reaches the model.
+# which changes what reaches the model. The rails hash then moved with the
+# `team-fan-out` rule and its `team-employer` plug-in, which add a named team's
+# members' `WORKS_AT` and the user's `KNOWS_PERSON` after the model: a replay, with
+# no bump.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
     pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
-    pack_rails_hash="6705d826291cb01f7f9b9f3057fa72ad8ab6aaa1cc17c6bdf3568e7dc2703c05",
+    pack_rails_hash="fd203e9b523661332f29c301e493cc1b388b7930d877474062e45786e5e518e6",
 )
 
 

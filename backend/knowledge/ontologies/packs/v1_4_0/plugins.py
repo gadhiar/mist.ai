@@ -1,4 +1,4 @@
-"""The v1.4.0 pack's plug-ins: what its id rules need that data cannot state.
+"""The v1.4.0 pack's plug-ins: what its rules need that data cannot state.
 
 The pack loader reads `PLUGINS`. Each name is the one a rule in `conventions.py` cites.
 
@@ -6,26 +6,31 @@ The pack's rails hash covers this module's source, so an edit here moves that ha
 the release line with it. Each plug-in calls pure helpers only. None runs the rail
 runner or resolves a pack: the runner checks a pack's pinned cases, which call these
 functions, before the pack's first row, and a plug-in that ran the rails would start
-that check again.
+that check again. For that reason too this module does not import the runner: the
+team plug-in reads the runner's group and row by the attributes `_Group` and `_Row`
+name.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from typing import Protocol
 
 from backend.knowledge.extraction.canonical_id import (
+    canonical_id,
     canonical_metric_id,
     canonical_metric_id_from_id,
 )
 from backend.knowledge.extraction.id_rails import ISO_DATE_RE
-from backend.knowledge.ontologies.pack import ID, Plugin
+from backend.knowledge.ontologies.pack import ID, RELATION, Plugin
 
-from .types import TECHNOLOGY
+from .types import ORGANIZATION, TECHNOLOGY, WORKS_AT
 
 TECHNOLOGY_VERSION = "technology-version"
 METRIC_ID = "metric-id"
 EVENT_DATE = "event-date"
+TEAM_EMPLOYER = "team-employer"
 
 # A version suffix on a display name: "Python 3.11", "Node 18.x", "React v18". Requires
 # whitespace before the number or an explicit "v" prefix, so the trailing digits of
@@ -97,6 +102,120 @@ def event_date_id(entity: Mapping, entity_id: str, target: Mapping | None) -> st
     return f"{_TRAILING_ISO_DATE_RE.sub('', entity_id)}-{date}"
 
 
+class _Group(Protocol):
+    """The runner's `FanOutGroup`, as `team_employer` reads it."""
+
+    anchor: object
+    members: tuple[str, ...]
+    entities: tuple[Mapping, ...]
+    relationships: tuple[Mapping, ...]
+
+
+class _Row(Protocol):
+    """The runner's `RailRow`, as `team_employer` reads it."""
+
+    batch_record: tuple[Mapping, ...]
+    turn_plan: Mapping | None
+
+
+def _names(line: str, entity: Mapping) -> bool:
+    """True when a slugged line holds the entity's id or display name as whole words."""
+    padded = f"-{line}-"
+    for spelling in (entity.get("id"), entity.get("name")):
+        slug = canonical_id(str(spelling or ""))
+        if slug and f"-{slug}-" in padded:
+            return True
+    return False
+
+
+def _holds(batch: Mapping, entity_id: object) -> bool:
+    """True when a batch's own payload holds the entity, as an entity or as an edge's end."""
+    payload = batch.get("payload") or {}
+    if any(entity.get("id") == entity_id for entity in payload.get("entities") or ()):
+        return True
+    return any(
+        entity_id in (relationship.get("source"), relationship.get("target"))
+        for relationship in payload.get("relationships") or ()
+    )
+
+
+def _team_lines(team: Mapping, row: _Row) -> Iterator[str]:
+    """The team's own headings, lead-ins and units, each slugged.
+
+    - A unit is read from a batch whose own payload holds the team. It is the team's
+      when its text or one of its context lines names the team, and then its text and
+      every context line are the team's: the headings and lead-in it was read under,
+      and the unit itself. A batch's own `context`, the earlier units it was shown for
+      reference, is not read.
+    - A template of the turn plan is the team's when its fixed endpoint is the team or
+      its lead-in names the team, and then its lead-in is the team's.
+    """
+    team_id = team.get("id")
+    for batch in row.batch_record:
+        if not _holds(batch, team_id):
+            continue
+        for unit in batch.get("units") or ():
+            lines = [canonical_id(str(unit.get("text") or ""))]
+            lines += [canonical_id(str(line)) for line in unit.get("context") or ()]
+            if any(_names(line, team) for line in lines):
+                yield from lines
+    team_slug = canonical_id(str(team_id or ""))
+    for template in (row.turn_plan or {}).get("templates") or ():
+        lead_in = canonical_id(str(template.get("lead_in") or ""))
+        fixed = canonical_id(str(template.get("fixed_endpoint") or ""))
+        if (fixed and fixed == team_slug) or _names(lead_in, team):
+            yield lead_in
+
+
+def team_employer(group: _Group, row: _Row) -> str | None:
+    """The `team-fan-out` rule's `WORKS_AT` endpoint: the employer of a member's team.
+
+    ADR-054's v14 amendment, point 2 and register row 1. The employer is the one
+    `Organization` E, other than the team, that both:
+
+    - one of the team's own headings, lead-ins or units names, read from the batch
+      record or from the turn plan's template (`_team_lines`), by E's id or display
+      name as whole words; and
+    - a member of the team holds a `WORKS_AT` to. The runner lists only the members
+      whose every `MEMBER_OF` the team is a current assertion, and shows only current
+      edges, so both input edges are current.
+
+    A team's `PART_OF` its employer is not read: Rule 34 forbids that edge, and a rail
+    adds no edge from an output the prompt forbids. A row with neither a batch record
+    nor a plan names no heading, so no employer resolves. When two organizations
+    qualify, the team has no one employer and none resolves: a member gains no
+    `WORKS_AT` rather than a wrong one.
+
+    Returns:
+        E's id as the payload writes it, or None.
+    """
+    entities: dict = {}
+    for entity in group.entities:
+        entities.setdefault(entity.get("id"), entity)
+    team = entities.get(group.anchor)
+    if team is None:
+        return None
+    lines = list(_team_lines(team, row))
+    members = set(group.members)
+    found: list[str] = []
+    for relationship in group.relationships:
+        employer = relationship.get("target")
+        entity = entities.get(employer)
+        if (
+            relationship.get("type") != WORKS_AT.type_name
+            or relationship.get("source") not in members
+            or not isinstance(employer, str)
+            or employer == group.anchor
+            or employer in found
+            or entity is None
+            or entity.get("type") != ORGANIZATION.type_name
+        ):
+            continue
+        if any(_names(line, entity) for line in lines):
+            found.append(employer)
+    return found[0] if len(found) == 1 else None
+
+
 PLUGINS: tuple[Plugin, ...] = (
     # A Technology's version, read from its name, leaves the end of its id.
     Plugin(TECHNOLOGY_VERSION, ID, technology_version_id),
@@ -104,4 +223,6 @@ PLUGINS: tuple[Plugin, ...] = (
     Plugin(METRIC_ID, ID, metric_id),
     # An Event dated to one ISO day gains that day at the end of its id.
     Plugin(EVENT_DATE, ID, event_date_id),
+    # A named team's employer, which each member of the team gains.
+    Plugin(TEAM_EMPLOYER, RELATION, team_employer),
 )

@@ -7,8 +7,9 @@ handed the pack. A pinned case feeds neither of the pack's hashes.
 Three of the cases are payloads the extraction service wrote for probes of dev-lists, the
 tuning set, in the run of prompt candidate c3r2 (`CASES_FROM_THE_TUNING_RUN`). Each holds
 the payload's entities as written and, of each relationship, its two ends and its type:
-a relationship's properties quote the utterance, and no rule of this pack reads them.
-The other cases are written for their rule.
+a relationship's properties quote the utterance, and none of those three rules reads
+them. The other cases are written for their rule, with invented names. The team cases'
+relationships carry the properties the team rules read.
 
 The vocabularies, the reserved names and the prompt's ontology half are stated here and
 nowhere else: the engine reads each through the pack.
@@ -25,12 +26,19 @@ from backend.knowledge.extraction.prompts import (
     RULES_SLOT,
 )
 from backend.knowledge.ontologies.pack import (
+    ENDPOINT_MEMBER,
+    ENDPOINT_PLUGIN_PREFIX,
+    ENDPOINT_USER,
     ID,
     PAYLOAD,
     PRE_LLM,
+    RELATION,
     AliasVocabulary,
     ConventionRule,
     DerivedEdge,
+    EdgeTrigger,
+    FanOut,
+    GainedEdge,
     IdExempt,
     ItemFilter,
     PinnedCase,
@@ -40,17 +48,22 @@ from backend.knowledge.ontologies.pack import (
     TypedId,
 )
 
-from .plugins import EVENT_DATE, METRIC_ID, TECHNOLOGY_VERSION
+from .plugins import EVENT_DATE, METRIC_ID, TEAM_EMPLOYER, TECHNOLOGY_VERSION
 from .types import (
     DATE,
     EVENT,
     EXTRACTABLE_EDGE_TYPES,
     EXTRACTABLE_NODE_TYPES,
+    KNOWS_PERSON,
+    MEMBER_OF,
     METRIC,
     MIST_IDENTITY,
     OCCURRED_ON,
+    ORGANIZATION,
+    PERSON,
     TECHNOLOGY,
     USER,
+    WORKS_AT,
 )
 
 # ---------------------------------------------------------------------------
@@ -481,6 +494,174 @@ _UNCHECKED_GOALS_CASE = PinnedCase(
     ),
 )
 
+
+def _team_edge(source: str, target: str, edge_type: str, **changes: object) -> dict[str, object]:
+    """A relationship with the properties a team rule reads: a current assertion, changed."""
+    properties = {
+        "confidence": 0.9,
+        "temporal_status": "current",
+        "negated": False,
+        "assertion_kind": "assert",
+        **changes,
+    }
+    return {"source": source, "target": target, "type": edge_type, "properties": properties}
+
+
+def _team_batch(
+    context: tuple[str, ...],
+    texts: tuple[str, ...],
+    entities: tuple[Mapping, ...],
+    relationships: tuple[Mapping, ...],
+    kind: str = "list_item",
+) -> dict[str, object]:
+    """One Stage 2 call of a team case: its units, read under `context`, and its payload."""
+    return {
+        "units": tuple({"text": text, "context": context, "kind": kind} for text in texts),
+        "context": (),
+        "payload": {"entities": list(entities), "relationships": list(relationships)},
+        "finish": "stop",
+    }
+
+
+# A user-scope message in four batches, its opening line and one per heading:
+#
+#     I work at Varnholt.
+#     ## Kestrel platform team at Varnholt
+#     - Oriana Duarte
+#     - Tomasz Wierzba, since March
+#     - not Wen Halloran
+#     - Pavla Restrepo, until last year
+#     - Hollis Amadi, who left in May
+#     - Marit Solberg, no, scratch that, she never joined
+#     ## Saltmarsh rowing club at Copperfield Boathouse
+#     - Odile Brannagh
+#     - Femi Achterberg
+#     ## Thursday chess circle
+#     - me
+#     - Ruairi Spelman
+#
+# Someone else's team: its heading names Varnholt and Oriana works there, so its
+# current members gain Varnholt (Oriana holds it already) and the user's acquaintance. Tomasz's
+# dated membership gives its confidence and status and no date. The negated, past,
+# ceased and retracted memberships add nothing. A club at a venue: its heading names an
+# Organization no member works at, so it gains no employer. A club the user is in,
+# beside the user's employer: its heading names none, so it gains no employer either.
+# Their other members gain the user's acquaintance; the user gains no edge to themself.
+_KESTREL_HEADING = "Kestrel platform team at Varnholt"
+_ROWING_HEADING = "Saltmarsh rowing club at Copperfield Boathouse"
+_CHESS_HEADING = "Thursday chess circle"
+_VARNHOLT = _entity("varnholt", "Varnholt", "Organization")
+_KESTREL = (
+    _VARNHOLT,
+    _entity("kestrel-platform-team", "Kestrel platform team", "Organization"),
+    _entity("oriana-duarte", "Oriana Duarte", "Person"),
+    _entity("tomasz-wierzba", "Tomasz Wierzba", "Person"),
+    _entity("wen-halloran", "Wen Halloran", "Person"),
+    _entity("pavla-restrepo", "Pavla Restrepo", "Person"),
+    _entity("hollis-amadi", "Hollis Amadi", "Person"),
+    _entity("marit-solberg", "Marit Solberg", "Person"),
+)
+_ROWING = (
+    _entity("saltmarsh-rowing-club", "Saltmarsh rowing club", "Organization"),
+    _entity("copperfield-boathouse", "Copperfield Boathouse", "Organization"),
+    _entity("odile-brannagh", "Odile Brannagh", "Person"),
+    _entity("femi-achterberg", "Femi Achterberg", "Person"),
+)
+_CHESS = (
+    _entity("thursday-chess-circle", "Thursday chess circle", "Organization"),
+    _entity("ruairi-spelman", "Ruairi Spelman", "Person"),
+)
+_TEAMS = (_USER, *_KESTREL, *_ROWING, *_CHESS)
+_EMPLOYER_EDGES = (_team_edge("user", "varnholt", "WORKS_AT"),)
+_DATED = {"confidence": 0.85, "start_date": "2026-03-01", "temporal_expression": "since March"}
+_KESTREL_EDGES = (
+    _team_edge("oriana-duarte", "kestrel-platform-team", "MEMBER_OF"),
+    _team_edge("oriana-duarte", "varnholt", "WORKS_AT"),
+    _team_edge("tomasz-wierzba", "kestrel-platform-team", "MEMBER_OF", **_DATED),
+    _team_edge("wen-halloran", "kestrel-platform-team", "MEMBER_OF", negated=True),
+    _team_edge("pavla-restrepo", "kestrel-platform-team", "MEMBER_OF", temporal_status="past"),
+    _team_edge("hollis-amadi", "kestrel-platform-team", "MEMBER_OF", assertion_kind="cease"),
+    _team_edge("marit-solberg", "kestrel-platform-team", "MEMBER_OF", assertion_kind="retract"),
+)
+_ROWING_EDGES = (
+    _team_edge("odile-brannagh", "saltmarsh-rowing-club", "MEMBER_OF"),
+    _team_edge("femi-achterberg", "saltmarsh-rowing-club", "MEMBER_OF"),
+)
+_CHESS_EDGES = (
+    _team_edge("user", "thursday-chess-circle", "MEMBER_OF"),
+    _team_edge("ruairi-spelman", "thursday-chess-circle", "MEMBER_OF"),
+)
+_COPIED = {"temporal_status": "current", "confidence": 0.9}
+_COPIED_DATED = {"temporal_status": "current", "confidence": 0.85}
+_TEAM_FAN_OUT_CASE = PinnedCase(
+    entities=_TEAMS,
+    relationships=(*_EMPLOYER_EDGES, *_KESTREL_EDGES, *_ROWING_EDGES, *_CHESS_EDGES),
+    expected_entities=_TEAMS,
+    expected_relationships=(
+        *_EMPLOYER_EDGES,
+        *_KESTREL_EDGES,
+        *_ROWING_EDGES,
+        *_CHESS_EDGES,
+        {
+            "source": "user",
+            "target": "oriana-duarte",
+            "type": "KNOWS_PERSON",
+            "properties": _COPIED,
+        },
+        {
+            "source": "tomasz-wierzba",
+            "target": "varnholt",
+            "type": "WORKS_AT",
+            "properties": _COPIED_DATED,
+        },
+        {
+            "source": "user",
+            "target": "tomasz-wierzba",
+            "type": "KNOWS_PERSON",
+            "properties": _COPIED_DATED,
+        },
+        {
+            "source": "user",
+            "target": "odile-brannagh",
+            "type": "KNOWS_PERSON",
+            "properties": _COPIED,
+        },
+        {
+            "source": "user",
+            "target": "femi-achterberg",
+            "type": "KNOWS_PERSON",
+            "properties": _COPIED,
+        },
+        {
+            "source": "user",
+            "target": "ruairi-spelman",
+            "type": "KNOWS_PERSON",
+            "properties": _COPIED,
+        },
+    ),
+    scope="user-scope",
+    batch_record=(
+        _team_batch((), ("I work at Varnholt.",), (_USER, _VARNHOLT), _EMPLOYER_EDGES, "prose"),
+        _team_batch(
+            (_KESTREL_HEADING,),
+            (
+                "Oriana Duarte",
+                "Tomasz Wierzba, since March",
+                "not Wen Halloran",
+                "Pavla Restrepo, until last year",
+                "Hollis Amadi, who left in May",
+                "Marit Solberg, no, scratch that, she never joined",
+            ),
+            _KESTREL,
+            _KESTREL_EDGES,
+        ),
+        _team_batch(
+            (_ROWING_HEADING,), ("Odile Brannagh", "Femi Achterberg"), _ROWING, _ROWING_EDGES
+        ),
+        _team_batch((_CHESS_HEADING,), ("me", "Ruairi Spelman"), (_USER, *_CHESS), _CHESS_EDGES),
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # The prompt's ontology half
 # ---------------------------------------------------------------------------
@@ -807,6 +988,38 @@ RULES: tuple[ConventionRule, ...] = (
         phase=PAYLOAD,
         params=ReservedIdentity(names=RESERVED_NAMES, id=RESERVED_ID, type=MIST_IDENTITY.type_name),
         pinned_case=_RESERVED_CASE,
+    ),
+    # ADR-054's v14 amendment, register rows 1 and 2: each person placed in a named team
+    # also works at the employer named for the team (Rule 34), and in a user-scope turn
+    # the user knows each of them (Rule 19). The inputs are the team's current
+    # `MEMBER_OF` edges; the employer is read by the plug-in, never from a `PART_OF`.
+    ConventionRule(
+        id="team-fan-out",
+        kind="fan_out",
+        phase=RELATION,
+        params=FanOut(
+            trigger=EdgeTrigger(
+                edge=MEMBER_OF.type_name,
+                members="source",
+                source_types=(PERSON.type_name, USER.type_name),
+                target_types=(ORGANIZATION.type_name,),
+            ),
+            gains=(
+                GainedEdge(
+                    edge=WORKS_AT.type_name,
+                    source=ENDPOINT_MEMBER,
+                    target=f"{ENDPOINT_PLUGIN_PREFIX}{TEAM_EMPLOYER}",
+                ),
+                GainedEdge(
+                    edge=KNOWS_PERSON.type_name,
+                    source=ENDPOINT_USER,
+                    target=ENDPOINT_MEMBER,
+                    scopes=("user-scope",),
+                ),
+            ),
+        ),
+        prompt_rule="Rule 34 and Rule 19",
+        pinned_case=_TEAM_FAN_OUT_CASE,
     ),
     ConventionRule(
         id="n1-exempt",
