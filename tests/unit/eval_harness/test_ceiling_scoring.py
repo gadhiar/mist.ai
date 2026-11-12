@@ -12,6 +12,7 @@ Gold, raw and pre-H8 gold files are synthetic, written by each test.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -1405,6 +1406,63 @@ def test_the_new_lines_carry_the_identity(tmp_path: Path) -> None:
     ]
     assert len(new) == 9, result.stdout
     assert all(_IDENTITY_MARK in line for line in new)
+
+
+def _effect_figures(headline: dict, model_written: dict, diff: str) -> str:
+    return "; ".join(
+        f"{kind} diff {diff} {_diff_ci(model_written, headline, kind)}"
+        for kind in ("recall", "precision", "f1")
+    )
+
+
+def test_each_run_prints_the_rails_effect_with_a_paired_interval(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand"])
+    assert result.returncode == 0, result.stderr
+    # The pack here has no relation-phase rule, so the two columns agree probe by probe.
+    assert _column_line(result, "[rails effect cand] ") == (
+        "[rails effect cand] exact k1-4 minus model-written: "
+        + _effect_figures(_CAND_HEADLINE, _CAND_HEADLINE, "+0.000")
+    )
+    (line,) = (line for line in result.stdout.splitlines() if line.startswith("[rails effect "))
+    assert _IDENTITY_MARK in line
+
+
+def _score_runs_module():
+    spec = importlib.util.spec_from_file_location("_score_runs_under_test", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_rails_effect_is_the_headline_minus_the_model_written_column() -> None:
+    score_runs = _score_runs_module()
+
+    def column(name: str, value: float, tp: int) -> object:
+        ratio = score_runs.Ratio(value, tp, 3)
+        return score_runs.ColumnScore(name, "cand", ratio, None, ratio, None, value, None)
+
+    # The rails find two relations the model-written rows miss: base's counts as the headline.
+    effect = score_runs._rails_effect(
+        _bootstrap,
+        column(score_runs.HEADLINE, 1.0, 3),
+        column(score_runs.MODEL_WRITTEN, 1 / 3, 1),
+        _BASE_HEADLINE,
+        _CAND_HEADLINE,
+    )
+
+    assert effect.line() == (
+        "[rails effect cand] exact k1-4 minus model-written: "
+        + _effect_figures(_BASE_HEADLINE, _CAND_HEADLINE, "+0.667")
+    )
+
+
+def test_a_scorer_without_aligned_scoring_prints_no_rails_effect(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[rails effect" not in result.stdout
 
 
 def test_a_scorer_without_aligned_scoring_prints_neither_column(tmp_path: Path) -> None:

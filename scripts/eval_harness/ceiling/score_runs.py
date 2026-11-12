@@ -59,8 +59,12 @@ column's aligned figures and what the relation rails did:
     ci95 [lo, hi]
     [model-written X] (the same figures, the rows scored with the relation rails off)
     [aligned model-written X] (the aligned line's figures for that column)
+    [rails effect X] exact k1-4 minus model-written: recall diff D ci95 [lo, hi]; precision
+    diff D ci95 [lo, hi]; f1 diff D ci95 [lo, hi]
     [relation rails X] relation_rails_added=A relation_rails_removed=B
     found_only_by_relation_rails=C
+
+The rails effect pairs each probe with itself, since both columns score the run's own rows.
 
 The headline counts only relations found through pairs of alignment kinds 1 to 4, the ids
 the graph stores as one node. Each pair of runs then prints, after the `[paired-aligned`
@@ -470,6 +474,28 @@ class ColumnPairScore:
 
 
 @dataclass(frozen=True, slots=True)
+class RailsEffect:
+    """One run's headline minus its model-written column, over the same probes."""
+
+    name: str
+    recall_diff: float
+    recall_ci: tuple[float, float] | None
+    precision_diff: float
+    precision_ci: tuple[float, float] | None
+    f1_diff: float
+    f1_ci: tuple[float, float] | None
+
+    def line(self) -> str:
+        """The run's line, prefixed `[rails effect <name>] ` so no other filter matches it."""
+        return (
+            f"[rails effect {self.name}] {HEADLINE} minus {MODEL_WRITTEN}: recall diff "
+            f"{self.recall_diff:+.3f} {_ci(self.recall_ci, signed=True)}; precision diff "
+            f"{self.precision_diff:+.3f} {_ci(self.precision_ci, signed=True)}; f1 diff "
+            f"{self.f1_diff:+.3f} {_ci(self.f1_ci, signed=True)}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Columns:
     """One run's headline and model-written columns, and what the relation rails did."""
 
@@ -477,15 +503,17 @@ class Columns:
     headline: ColumnScore
     model_written: ColumnScore
     model_written_aligned: AlignedScore
+    rails_effect: RailsEffect
     rails_counts: dict[str, int]
 
     def lines(self) -> list[str]:
-        """The headline, then the model-written column with its aligned figures, then the counts."""
+        """The headline, the model-written column with its aligned figures, then the rails."""
         counts = " ".join(f"{field}={count}" for field, count in self.rails_counts.items())
         return [
             self.headline.line(),
             self.model_written.line(),
             self.model_written_aligned.line(),
+            self.rails_effect.line(),
             f"[relation rails {self.headline.name}] {counts}",
         ]
 
@@ -941,12 +969,56 @@ def _columns(
     """The run's headline, and the same rows scored with the relation rails switched off."""
     model_index = _produced_index(scorer, path, rows, relation_rails=False)
     model_report = scorer.score_run(probes, model_index, accepted_pairs=aligned.accepted)
+    headline = _column_score(aligned, HEADLINE, name, report)
+    model_written = _column_score(aligned, MODEL_WRITTEN, name, model_report)
     return Columns(
         model_index=model_index,
-        headline=_column_score(aligned, HEADLINE, name, report),
-        model_written=_column_score(aligned, MODEL_WRITTEN, name, model_report),
+        headline=headline,
+        model_written=model_written,
         model_written_aligned=_aligned_score(aligned, f"{MODEL_WRITTEN} {name}", model_report),
+        rails_effect=_rails_effect(
+            aligned.bootstrap,
+            headline,
+            model_written,
+            _headline_counts(report.per_probe),
+            _headline_counts(model_report.per_probe),
+        ),
         rails_counts=dict(scorer.relation_rails_counts(probes, index, model_index)),
+    )
+
+
+def _rails_effect(
+    bootstrap: ModuleType,
+    headline: ColumnScore,
+    model_written: ColumnScore,
+    headline_counts: dict[str, tuple[int, int, int]],
+    model_counts: dict[str, tuple[int, int, int]],
+) -> RailsEffect:
+    """The headline minus the model-written column, paired by probe over the same probes.
+
+    Both columns score the run's own rows, so each probe is paired with itself, and the
+    interval is the gauntlet's paired cluster bootstrap with the model-written column first.
+    """
+
+    def interval(kind: str) -> tuple[float, float] | None:
+        result: tuple[float, float] | None = bootstrap.cluster_bootstrap_paired_difference_ci(
+            model_counts,
+            headline_counts,
+            n_replicates=BOOTSTRAP_REPLICATES,
+            seed=BOOTSTRAP_SEED,
+            confidence=BOOTSTRAP_CONFIDENCE,
+            kind=kind,
+        )
+        return result
+
+    return RailsEffect(
+        name=headline.name,
+        recall_diff=headline.recall.value - model_written.recall.value,
+        recall_ci=interval("recall"),
+        precision_diff=headline.precision.value - model_written.precision.value,
+        precision_ci=interval("precision"),
+        f1_diff=headline.f1 - model_written.f1,
+        f1_ci=interval("f1"),
     )
 
 
