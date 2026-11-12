@@ -660,9 +660,17 @@ _GENERIC_HEADINGS = (
 )
 _GOAL_LIST_LINE = "  except under a lead-in that names goals, where it is `HAS_GOAL`."
 
+# Each file ends in a register of its conventions, added after the split. The lines of the
+# guide before the split are the ones above that heading.
+_REGISTER_HEADING = "## Register"
+
 
 def _lines(path: Path) -> list[str]:
-    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    """The file's non-empty lines above its register, or all of them when it has none."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if _REGISTER_HEADING in lines:
+        lines = lines[: lines.index(_REGISTER_HEADING)]
+    return [line for line in lines if line.strip()]
 
 
 def _rule_starts(lines: list[str], rule: str) -> int:

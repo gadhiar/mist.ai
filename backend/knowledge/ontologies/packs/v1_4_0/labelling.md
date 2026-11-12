@@ -273,3 +273,49 @@ not a structural edge. "Recommended X for the new service" adds no `STRATEGY_FOR
 for Y" is itself the fact and gets `USED_FOR` (Rule 18, `prompts.py:66`; ext-01, ext-31).
 
   except under a lead-in that names goals, where it is `HAS_GOAL`.
+
+## Register
+
+Each convention above, by its label, and what carries it in this pack: a prompt rule by its number
+and the id of the prompt fragment that holds it, any other rule by its id in `conventions.py`.
+Beside a rule of the pack, a row may name a rule of the prompt's engine core by its number, or a
+rule of the engine by the name of its function. The first four rows are the first rows of the
+extraction contract ADR's v14 amendment (ADR-054, 2026-11-11): their Convention cells are the
+amendment's, word for word. Each of them states its convention in full: a labeller applies the
+row, never a rule's code, and where the row is narrower than a line above it, the row governs.
+The row governs too where a line above says a convention is beyond the prompt and the row names a
+prompt rule that carries it. The last seven rows list the generic conventions of the gold guide
+(`data/gold/extraction/LABELLING.md`) that a rule of this pack carries, each under the key of its
+row in that guide's register.
+
+| Convention | Carrier | Class |
+|---|---|---|
+| Named teams (N17; Rule 34): each person placed in a named team also `WORKS_AT` the employer the utterance names for that team | Rule 34 in `prompt-rules-11-to-37` | prompt rule |
+| Durable third-party facts (Rule 19): in a user-scope turn, the user `KNOWS_PERSON` each person the utterance places in a named team, whether or not the user is in it, since a placement is a durable fact about that person. The user gets no edge to themself | Rule 19 in `prompt-rules-11-to-37` | prompt rule |
+| Named teams (N17; Rule 34): a team's `PART_OF` its employer is not stored. This covers a team `Organization` to its employer only; any other `PART_OF` is kept | Rule 34 in `prompt-rules-11-to-37` | prompt rule |
+| List rules, unchecked box: a `[ ]` item yields no edge, except `HAS_GOAL` when its lead-in, or any heading or parent bullet above it, contains one of these goal words, as a whole word in any case, singular or plural: goal, objective, resolution, aim, aspiration, target, and the phrase "bucket list". An unchecked itinerary item is a plan and yields no edge | Rule 29 in `prompt-rules-11-to-37` | prompt rule |
+| N2 Goal ids | Rule 22 in `prompt-rules-11-to-37` | prompt rule |
+| The user anchor | Rule 1 in `prompt-rules-1-to-3`, and `reserved-mist-identity` | prompt rule and payload rail |
+| N8 The team's tools | Rule 35 in `prompt-rules-11-to-37` | prompt rule |
+| Durable third-party facts | Rules 17 and 19 in `prompt-rules-11-to-37` | prompt rule |
+| N16 A relative named by the relation | Rule 24 in `prompt-rules-11-to-37` | prompt rule |
+| N7 Third-party events | Rule 32 in `prompt-rules-11-to-37` | prompt rule |
+| N17 Named teams | Rule 34 in `prompt-rules-11-to-37` | prompt rule |
+| Event and metric ids | Rules 11, 26 and 27 in `prompt-rules-11-to-37`, `event-date` and `metric-id` | prompt rule and id rail |
+| N10 Personal milestones | Rule 36 in `prompt-rules-11-to-37` | prompt rule |
+| N3 Decisions | Rule 30 in `prompt-rules-11-to-37` | prompt rule |
+| N5 Stated places and organisations | Rule 31 in `prompt-rules-11-to-37` | prompt rule |
+| N13 Topic links | Rule 33 in `prompt-rules-11-to-37` | prompt rule |
+| The Abstraction fallback | Rules 14 and 20 in `prompt-rules-11-to-37`, and `prompt-constraints` | prompt rule |
+| N14 Kind nouns | Rule 25 in `prompt-rules-11-to-37` | prompt rule |
+| Date entities | Rules 13 and 16 in `prompt-rules-11-to-37`, Rule 5 of the engine core, and `backend.knowledge.extraction.temporal.TemporalResolver.resolve` | prompt rule and engine rule |
+| N11 Goal windows | Rule 37 in `prompt-rules-11-to-37` | prompt rule |
+| N12 Flipped preferences | Rule 6 in `prompt-rule-6` | prompt rule |
+| Habits and incidental scope | Rules 17 and 18 in `prompt-rules-11-to-37` | prompt rule |
+| Row schema | Rules 2 and 3 in `prompt-rules-1-to-3`, `prompt-constraints`, `technology-version`, `metric-id`, `pre-canon-aliases` and `static-aliases` | prompt rule and id rail |
+| N1 Id surface | Rule 2 in `prompt-rules-1-to-3`, and `n1-exempt` | prompt rule and id rail |
+| N15 An activity keeps its object | Rule 21 in `prompt-rules-11-to-37` | prompt rule |
+| N4 Name modifiers | Rule 23 in `prompt-rules-11-to-37` | prompt rule |
+| N6 Type by its test | Rules 14 and 20 in `prompt-rules-11-to-37`, `prompt-constraints` and `prompt-examples` | prompt rule |
+| Assertion kinds | Rule 6 in `prompt-rule-6` | prompt rule |
+| List-shaped probes (new) | Rule 29 in `prompt-rules-11-to-37` | prompt rule |

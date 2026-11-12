@@ -267,3 +267,26 @@ at least twice. T8 checks the same floor on the adjudicated labels.
     ("I review PRs every Friday"). The retrieval facts of `rq-paraphrase-06` and
     `rq-type-scoped-04` name the new ids, and `data/golden-log/golden-log.jsonl` is regenerated
     from the relabelled 60.
+
+## Register
+
+Each generic convention above, by its label, and what carries it: a rule of the production prompt
+by its number, or a rule of the engine by the name of its function. `Rule 9 of the engine core` is
+a rule of the prompt's engine core (`ENGINE_CORE` in `backend/knowledge/extraction/prompts.py`).
+`Rule 23 of the active pack` is a prompt rule of the ontology pack in use; that pack's own
+register, at the end of its `labelling.md`, lists a row under the same key with the id of the rule
+that holds it. The conventions about one ontology's types and edges, and their rows, are in the
+pack's guide. A section above that states no labelling convention has no row: the held-out rule,
+the synthetic-data rule, the naming rule, the note that opens the conventions, the categories,
+extending the sets and the relabel log.
+
+| Convention | Carrier | Class |
+|---|---|---|
+| Row schema | Rules 2 and 3 of the active pack, Rule 9 of the engine core, `backend.knowledge.extraction.id_rails.stored_entity_id` and `backend.knowledge.extraction.validator.ExtractionValidator.validate` | prompt rule and engine rule |
+| N1 Id surface | Rule 2 of the active pack, and `backend.knowledge.extraction.id_rails.n1_rail` | prompt rule and engine rule |
+| N15 An activity keeps its object | Rule 21 of the active pack | prompt rule |
+| N4 Name modifiers | Rule 23 of the active pack | prompt rule |
+| N6 Type by its test | Rules 14 and 20 of the active pack, and `backend.knowledge.extraction.validator.ExtractionValidator.validate` | prompt rule and engine rule |
+| Assertion kinds | Rule 6 of the active pack | prompt rule |
+| No-fact probes | Rules 8, 9 and 10 of the engine core | prompt rule |
+| List-shaped probes (new) | Rule 29 of the active pack | prompt rule |
