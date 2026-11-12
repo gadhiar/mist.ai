@@ -78,8 +78,9 @@ def test_a_loaded_pack_holds_its_assembled_prompt_and_its_schema():
     fragments = tuple(rule.params for rule in pack.rules_of("prompt_fragment"))
 
     assert pack.system_prompt == prompts.assemble_system_prompt(fragments)
+    by_name = {node.type_name: node for node in types.NODE_TYPES}
     assert pack.extraction_schema == schemas.generate_extraction_schema(
-        entity_types=types.EXTRACTABLE_NODE_TYPES,
+        entity_types=tuple(by_name[name] for name in types.EXTRACTABLE_NODE_TYPES),
         relationship_types=types.EXTRACTABLE_EDGE_TYPES,
     )
 

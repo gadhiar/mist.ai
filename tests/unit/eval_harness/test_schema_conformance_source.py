@@ -33,12 +33,12 @@ if str(_REPO_ROOT) not in sys.path:
 import pytest  # noqa: E402
 import yaml  # noqa: E402
 
-from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA  # noqa: E402
 from backend.knowledge.extraction.ontology_extractor import (  # noqa: E402
     render_extraction_messages,
 )
 from backend.knowledge.extraction.preprocessor import PreProcessor  # noqa: E402
 from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP  # noqa: E402
+from backend.knowledge.ontologies.registry import active_pack  # noqa: E402
 from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
     EXTRACTABLE_NODE_TYPES,
     EXTRACTABLE_RELATIONSHIP_TYPES,
@@ -79,7 +79,7 @@ def _service_stage2_messages(utterance: str, reference_date: datetime) -> list[d
 def _engine_schema_mode_response_format() -> dict:
     """The response_format the provider sends when the engine runs in `schema` mode."""
     provider = LlamaServerProvider(base_url="http://127.0.0.1:9", model="unused")
-    request = LLMRequest(messages=[], response_schema=EXTRACTION_OUTPUT_SCHEMA)
+    request = LLMRequest(messages=[], response_schema=active_pack().extraction_schema)
     return provider._build_kwargs(request, stream=False)["response_format"]
 
 
@@ -210,7 +210,7 @@ def test_constrained_arm_sends_the_production_output_schema(name):
     call = _sent(name, gbnf_supported=True)
 
     assert call["response_format"] == _engine_schema_mode_response_format()
-    assert call["response_format"]["json_schema"]["schema"] == EXTRACTION_OUTPUT_SCHEMA
+    assert call["response_format"]["json_schema"]["schema"] == active_pack().extraction_schema
     assert call.get("grammar") is None
 
 

@@ -266,7 +266,7 @@ class TestNewNodeTypeInvariants:
             ),
             pytest.param(
                 "METRIC",
-                ["value", "unit"],
+                ["value", "unit", "quantity"],
                 ["as_of_date"],
                 {},
                 id="Metric",
@@ -822,9 +822,11 @@ class TestTheRegistryServesThePack:
         digest = hashlib.sha256(
             (file_pack.system_prompt + prompts.EXTRACTION_USER_TEMPLATE).encode("utf-8")
         ).hexdigest()
-        # The prompt as it stood before the pack stated any of it. Since T48
+        # The pack's assembled system prompt, T52's Rule 28 and Example 30 included,
+        # followed by the user template; before T52 this was
+        # 88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4. Since T48
         # `TestExtractionVersionDriftGuard` pins it followed by the earlier items' heading.
-        assert digest == "88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4"
+        assert digest == "3b3ea3ca90958d552ebb1a4817721ae0aa2f85eec8a0bf4bb4b6b1ec48986ffd"
 
     def test_no_type_or_edge_of_the_pack_is_named_in_the_engine_core(self, file_pack: Pack):
         core = prompts.assemble_system_prompt()

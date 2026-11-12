@@ -15,8 +15,8 @@
 #   3. --no-kv-unified added for correctness under KV quantization
 #      (flag became boolean in llama.cpp >= b8700; was --kv-unified 0 pre-b8700).
 #   4. No --grammar-file. The constrained schema_conformance arm sends the
-#      production extraction output schema (EXTRACTION_OUTPUT_SCHEMA,
-#      backend/extraction_service/schemas.py) per request as a json_schema
+#      production extraction output schema (the active pack's extraction_schema,
+#      generated in backend/extraction_service/schemas.py) per request as a json_schema
 #      response_format, as the extraction engine's schema mode does;
 #      gbnf_supported: false candidates are sent no constraint.
 #   5. Speculative decoding dropped from baseline (Nemotron only has 0.5B draft).

@@ -303,14 +303,18 @@ def test_a_definition_value_that_cannot_be_stated_as_data_is_refused(value):
 
 # What the fixture packs hash to under the serialization that leaves out a field a pack
 # leaves unstated. An edit to a fixture's types, rules or plug-in module moves one on
-# purpose; a loader change must not.
+# purpose; a loader change must not. A change to the generated schema moves the prompt
+# hash, which covers it: T52's schema, which states each fixture's types, moved both
+# prompt hashes; before T52 they were
+# d3270b5c914633fcf3af81f8481b2cca80ba6e41e44213c9b70e1ab9363723e6 (base) and
+# 0c73cd98947655dc358b16320490cde27ba3440d53e6f375e37381132fecbb07 (pet).
 _PINNED_HASHES = {
     BASE: (
-        "d3270b5c914633fcf3af81f8481b2cca80ba6e41e44213c9b70e1ab9363723e6",
+        "a25b3333b7c8e5bbb0df661aea578e0ea3687106ff17d2fc80e5c64652431794",
         "b7d1edbb324940784eb00272f6740116d4202f68615f95f3be996ed15a5f8514",
     ),
     PET: (
-        "0c73cd98947655dc358b16320490cde27ba3440d53e6f375e37381132fecbb07",
+        "d096fc175d4f58abb95f336cdd88dab7dcfd8b8d75eec0bb5ede46fb64d45155",
         "072d387d13f42cd795751d7da7635a6ec613319cd5d6d7ceb9da01c0013ffc25",
     ),
 }

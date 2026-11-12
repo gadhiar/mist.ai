@@ -359,14 +359,16 @@ def _production_extraction_response_format() -> dict[str, Any]:
     """The production Stage 2 output schema, in the shape the engine's `schema` mode sends.
 
     `LlamaServerProvider._build_kwargs` wraps `LLMRequest.response_schema` this
-    way, and `ExtractionEngine._build_request` sets that field to
-    `EXTRACTION_OUTPUT_SCHEMA` for Stage 2 in `schema` mode.
+    way, and `ExtractionEngine._build_request` sets that field to the active pack's
+    `extraction_schema`, the schema generated from its declarations, for Stage 2 in
+    `schema` mode.
     """
-    from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
+    from backend.knowledge.ontologies import registry
 
+    schema = registry.active_pack().extraction_schema
     return {
         "type": "json_schema",
-        "json_schema": {"name": "response", "schema": EXTRACTION_OUTPUT_SCHEMA, "strict": True},
+        "json_schema": {"name": "response", "schema": schema, "strict": True},
     }
 
 

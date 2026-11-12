@@ -17,7 +17,6 @@ from backend.extraction_service.app import LlamaPropsContextSize, create_app
 from backend.extraction_service.engine import STAGE_CAPS, ExtractionEngine
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
-    EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
 from backend.knowledge.ontologies.registry import active_pack
@@ -126,9 +125,10 @@ class TestGptOssDefaultConstrainedMode:
         assert response.status_code == 200
         requests = fake_llama_state.chat_requests
         assert len(requests) == 3
+        # Stage 2 sends the schema the active pack generated, not the permissive constant.
         expected_schemas = [
             SCOPE_OUTPUT_SCHEMA,
-            EXTRACTION_OUTPUT_SCHEMA,
+            active_pack().extraction_schema,
             DERIVATION_OUTPUT_SCHEMA,
         ]
         for request, schema in zip(requests, expected_schemas, strict=True):

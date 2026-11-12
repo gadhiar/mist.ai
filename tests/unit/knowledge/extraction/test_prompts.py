@@ -6,10 +6,16 @@ without churn-testing, while still catching regressions that drop a
 load-bearing rule.
 """
 
+import dataclasses
 import json
 import re
 
 from backend.knowledge.extraction.prompts import EARLIER_ITEMS_HEADING, EXTRACTION_USER_TEMPLATE
+from backend.knowledge.extraction.structure_splitter import (
+    needs_earlier_units,
+    render_unit,
+    split_structured,
+)
 from backend.knowledge.ontologies.registry import active_pack
 
 # The prompt every reader sends: the active pack's, assembled by the loader.
@@ -277,8 +283,11 @@ class TestR4PrecisionRules:
         assert "Extract the asserted fact, not incidental scope" in SYSTEM_PROMPT
 
 
+# An example may show the `Context:` lines a call reads before its subject scope, as the
+# user template places them.
 _EXAMPLE_RE = re.compile(
-    r"^### Example (\d+):[^\n]*\nSubject scope: [^\n]*\nUtterance: \"(.*)\"\nOutput:\n(.*)$",
+    r"^### Example (\d+):[^\n]*\n(?:Context:\n((?:[^\n]*\n)*?))?"
+    r"Subject scope: [^\n]*\nUtterance: \"(.*)\"\nOutput:\n(.*)$",
     re.MULTILINE,
 )
 
@@ -286,9 +295,20 @@ _EXAMPLE_RE = re.compile(
 def _examples() -> dict[int, tuple[str, dict]]:
     """Example number to (utterance, parsed output), with the format braces undoubled."""
     return {
-        int(m.group(1)): (m.group(2), json.loads(m.group(3).replace("{{", "{").replace("}}", "}")))
+        int(m.group(1)): (m.group(3), json.loads(m.group(4).replace("{{", "{").replace("}}", "}")))
         for m in _EXAMPLE_RE.finditer(SYSTEM_PROMPT)
     }
+
+
+def _example_context(number: int) -> list[str]:
+    """The `Context:` lines an example shows, none when it shows no context."""
+    match = next(m for m in _EXAMPLE_RE.finditer(SYSTEM_PROMPT) if int(m.group(1)) == number)
+    return (match.group(2) or "").splitlines()
+
+
+def _sentences(text: str) -> list[str]:
+    """`text`'s sentences: a line, or a run of it ending at a full stop before a space."""
+    return [s for line in text.splitlines() for s in re.split(r"(?<=\.)\s+", line) if s]
 
 
 def _entities_by_id(output: dict) -> dict[str, dict]:
@@ -411,9 +431,21 @@ class TestGroup2ListConventions:
     def test_a_structured_turn_reads_as_context_lead_in_and_item(self):
         assert "each `<context> > <lead-in>: <item>`" in SYSTEM_PROMPT
 
-    def test_user_context_lines_are_never_extracted_again(self):
-        assert "Lines marked `[user]:` are earlier units" in SYSTEM_PROMPT
-        assert "never extract them again" in SYSTEM_PROMPT
+    def test_earlier_units_stand_under_the_engine_s_heading_and_are_never_extracted_again(self):
+        # T52: the engine shows a later batch its earlier units under this heading since T48.
+        quoted = f"`{EARLIER_ITEMS_HEADING}`"
+        sentence = next(s for s in _sentences(_rule(28)) if quoted in s)
+        said = sentence.replace(quoted, "")
+        assert "earlier units" in said
+        assert "for reference only" in said, "the rule says so, not only the heading"
+        assert "never extract them again" in said
+        assert "(Example 30)" in said
+
+    def test_no_sentence_calls_a_user_line_an_earlier_unit(self):
+        # A `[user]:` line is a line of the turn's history, never an earlier unit.
+        for sentence in _sentences(SYSTEM_PROMPT):
+            if "[user]:" in sentence:
+                assert not re.search(r"earlier (?:unit|item)", sentence, re.IGNORECASE), sentence
 
     def test_an_item_s_id_is_the_item_s_own_words(self):
         assert "A list item's id is the item's own words for the thing itself" in _rule(28)
@@ -507,19 +539,70 @@ class TestGroup2ListConventions:
         assert "Topic links. An Event is RELATED_TO what the utterance says" in (SYSTEM_PROMPT)
         assert "something chosen for a subject links to that subject" in SYSTEM_PROMPT
 
-    def test_example_30_is_one_rendered_unit_whose_lead_in_sets_the_predicate(self):
-        heading = next(line for line in SYSTEM_PROMPT.splitlines() if "### Example 30:" in line)
-        utterance, output = _examples()[30]
-        context, item = utterance.rsplit(": ", 1)
-        assert " > " in context, "the unit renders its context joined by ' > '"
-        item_id = "-".join(re.findall(r"[a-z0-9]+", item.lower()))
+    @staticmethod
+    def _example_30_units() -> tuple[str, str, tuple]:
+        """Example 30's earlier line, its utterance, and the units the engine splits them into.
+
+        The two lines are written back as the list they render, a heading, a lead-in and
+        two items, and split as the engine splits a turn.
+        """
+        context = _example_context(30)
+        assert len(context) == 2, "the heading's line, then one earlier unit"
+        assert context[0] == EARLIER_ITEMS_HEADING
+        earlier_line = context[1]
+        utterance, _ = _examples()[30]
+        earlier_context, earlier_item = earlier_line.rsplit(": ", 1)
+        own_context, own_item = utterance.rsplit(": ", 1)
+        assert earlier_context == own_context, "both items stand under one heading and lead-in"
+        heading, lead_in = own_context.split(" > ")
+        units = split_structured(f"# {heading}\n{lead_in}:\n- {earlier_item}\n- {own_item}")
+        return earlier_line, utterance, units
+
+    def test_example_30_shows_one_earlier_unit_as_the_engine_renders_it(self):
+        earlier_line, utterance, units = self._example_30_units()
+        assert [render_unit(unit) for unit in units] == [earlier_line, utterance]
+        assert [unit.kind for unit in units] == ["list_item", "list_item"]
+
+    def test_example_30_s_item_refers_back_so_the_engine_shows_it_the_earlier_unit(self):
+        _, _, units = self._example_30_units()
+        assert needs_earlier_units((units[1],), numbered=False)
+        assert not needs_earlier_units((units[0],), numbered=False)
+
+    def test_example_30_extracts_only_its_own_item_with_the_lead_in_s_predicate(self):
+        _, output = _examples()[30]
+        _, _, (earlier, own) = self._example_30_units()
         entities = _entities_by_id(output)
-        assert set(entities) == {"user", item_id}, "only the item is an entity, by its own words"
-        assert _has_edge(output, "user", "LEARNING", item_id)
-        assert len(output["relationships"]) == 1
-        # The earlier unit, shown as a `[user]:` context line, is not extracted again.
-        earlier = heading.split("Context: [user]: ", 1)[1].rsplit(": ", 1)[1]
-        assert "-".join(re.findall(r"[a-z0-9]+", earlier.lower())) not in entities
+        own_ids = set(entities) - {"user"}
+        assert len(own_ids) == 1, "only the utterance's own item is an entity"
+        (item_id,) = own_ids
+        # The id is the item's own words, from its start; the words that refer back are
+        # left out of it.
+        words = re.findall(r"[a-z0-9]+", own.text.lower())
+        id_words = item_id.split("-")
+        assert words[: len(id_words)] == id_words
+        rest = " ".join(words[len(id_words) :])
+        assert needs_earlier_units((dataclasses.replace(own, text=rest),), numbered=False)
+        assert not needs_earlier_units((dataclasses.replace(own, text=item_id),), numbered=False)
+        # The lead-in sets the predicate, as it did before T48.
+        assert output["relationships"] == [
+            {
+                "source": "user",
+                "target": item_id,
+                "type": "LEARNING",
+                "properties": {
+                    "confidence": 0.9,
+                    "temporal_status": "current",
+                    "start_date": None,
+                    "end_date": None,
+                    "temporal_expression": None,
+                    "context": None,
+                    "negated": False,
+                    "assertion_kind": "assert",
+                },
+            }
+        ]
+        # The earlier unit is not extracted again.
+        assert "-".join(re.findall(r"[a-z0-9]+", earlier.text.lower())) not in entities
 
 
 class TestGroup3GlossesAndTeamConventions:
@@ -692,8 +775,11 @@ class TestExtractionVersionDriftGuard:
     # (list conventions) and 3 (glosses, named teams and the remaining conventions) T40
     # rounds 1 and 2 revised, and the heading a later batch's earlier units stand under,
     # which T48 adds to what a Stage 2 call reads. Without the heading the digest is r8's,
-    # 88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4.
-    PINNED_SHA256 = "8deb5f7068307e2a7405fca1b66426fb0cfb0baba4e95944c3be0a31b4345fa3"
+    # 88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4. Still under r9 and
+    # before any r9 release, T52 brought Rule 28 and Example 30 to the earlier units the
+    # engine sends since T48; before T52 the digest was
+    # 8deb5f7068307e2a7405fca1b66426fb0cfb0baba4e95944c3be0a31b4345fa3.
+    PINNED_SHA256 = "bb9572ef6b8dca68187fac4ff39e100e51fef699b41a31ad91318b9d4a05ede7"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
@@ -708,6 +794,27 @@ class TestExtractionVersionDriftGuard:
             "which every other site imports -- then re-pin PINNED_SHA256 "
             "here. The extraction cache keys on the version string; skipping "
             "the bump makes R1 rebuilds silently serve stale extractions."
+        )
+
+    # sha256 of json.dumps(active_pack().extraction_schema), keys in the order the schema
+    # states them, pinned for extraction_version = "2026-11-12-r9": the Stage 2 schema
+    # T52 generates from the pack's declarations. The grammar emits required keys in
+    # `properties` order, so a reorder changes what the model writes; both pack hashes
+    # and `prompt_sha256` sort keys and do not see one. Before T52 the schema was the
+    # permissive constant, and this digest was
+    # 51929b7d74b84a48acdcd99e8c4a721f5949fd860a7dd87d8170561aa21c183a.
+    PINNED_SCHEMA_SHA256 = "2267cee8fd752728b20179306ec25c7004fef59d9923689fc86101a878a81f8d"
+
+    def test_the_stage_2_schema_matches_the_pinned_extraction_version_in_key_order(self):
+        import hashlib
+
+        digest = hashlib.sha256(
+            json.dumps(active_pack().extraction_schema).encode("utf-8")
+        ).hexdigest()
+        assert digest == self.PINNED_SCHEMA_SHA256, (
+            "The Stage 2 schema changed, its key order included, WITHOUT an "
+            "extraction_version bump. Update EXTRACTION_VERSION in "
+            "backend/knowledge/version_stamps.py, then re-pin PINNED_SCHEMA_SHA256 here."
         )
 
     def test_single_authority_holds_the_pinned_version(self):

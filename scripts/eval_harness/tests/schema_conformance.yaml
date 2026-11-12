@@ -3,7 +3,7 @@ description: >-
   Ontology-constrained JSON extraction with the production Stage 2 prompt
   and output schema. Each case is rendered as the extraction service
   renders it (render_extraction_messages, empty history, subject scope
-  unknown), and the request carries EXTRACTION_OUTPUT_SCHEMA as a
+  unknown), and the request carries the active pack's extraction_schema as a
   json_schema response_format, as the engine's schema mode does; a
   candidate with gbnf_supported false runs unconstrained. Every case
   expects a schema-valid JSON object whose types come from the
