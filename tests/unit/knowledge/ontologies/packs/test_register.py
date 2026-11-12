@@ -796,12 +796,25 @@ def test_an_engine_rule_beside_a_pack_rule_is_a_carrier_of_its_own_class(base_co
 def _registry_pack_problems(pack: Pack) -> list[str]:
     """What is wrong with the register of a pack the engine may run with.
 
-    Beyond its own guide's conventions, such a register may hold the first rows of the
-    amendment, and a row for each generic row of the gold guide, under that row's key.
+    Beyond its own guide's conventions, such a register may hold a row for each generic
+    row of the gold guide, under that row's key, and the first rows of the amendment. A
+    first row is admitted by its whole Convention cell and once, never by its key alone:
+    under a key of the amendment, a row states what the amendment states or it is refused.
     """
     guide = read_register(_GUIDE.read_text(encoding="utf-8"), _NOT_CONVENTIONS)
-    first = (Row(convention, "", "") for convention in _FIRST_ROWS)
-    return pack_register_problems(pack, {row.key for row in (*guide.rows, *first)})
+    first_keys = {Row(convention, "", "").key for convention in _FIRST_ROWS}
+    generic_keys = {row.key for row in guide.rows}
+    problems = pack_register_problems(pack, first_keys | generic_keys)
+    listed: set[str] = set()
+    for row in read_register(pack.labelling).rows:
+        if row.key not in first_keys:
+            continue
+        if row.convention not in _FIRST_ROWS:
+            problems.append(f"row `{row.key}`: it is none of the amendment's first rows")
+        elif row.convention in listed:
+            problems.append(f"row `{row.key}`: this first row of the amendment is listed twice")
+        listed.add(row.convention)
+    return problems
 
 
 @pytest.mark.parametrize("version", registry.available_versions())
@@ -900,9 +913,11 @@ def _with_goal_filter(pack: Pack, words: tuple[str, ...]) -> Pack:
     The row's Convention cell stays as the guide has it, and its other two cells are
     written here, so the case holds whatever rule the guide's own row names.
 
-    This one is built on the loaded pack, not on a copy of its files under `tmp_path`:
-    the pack declares no `item_filter` rule yet, and what the case varies is the
-    parameter of the rule a later task adds, which no edit of today's files can state.
+    This one is built on the loaded pack, not on a copy of its files under `tmp_path`.
+    The pack declares no `item_filter` rule yet. A `conventions` edit of a copy could
+    write one into `RULES`, but that edit would be this test's own rule in the pack's
+    code, to be rewritten when a later task adds the pack's. Added to the loaded pack,
+    the rule stays apart from the pack's files, and the case varies only its parameter.
     """
     rule = ConventionRule(
         id="unchecked-goals",
@@ -1222,12 +1237,50 @@ def test_an_unedited_copy_of_the_v1_4_0_pack_holds(v1_4_0_copy):
             "row `N99 Phantom`: no convention above the register has this label",
             id="a-row-of-no-convention",
         ),
+        # A first row's key is the amendment's, and so is every word under it: a row that
+        # borrows the key to state something else is no row of the amendment.
+        pytest.param(
+            f"{_N17_ROW}\n",
+            f"{_N17_ROW}\n| Named teams (N17; Rule 34): every teammate also mentors the user "
+            "| Rule 34 in `prompt-rules-11-to-37` | prompt rule |\n",
+            "row `Named teams (N17; Rule 34)`: it is none of the amendment's first rows",
+            id="a-row-under-the-key-of-the-team-rows",
+        ),
+        pytest.param(
+            f"{_N17_ROW}\n",
+            f"{_N17_ROW}\n| Durable third-party facts (Rule 19): the user also knows each "
+            "person's manager | Rule 19 in `prompt-rules-11-to-37` | prompt rule |\n",
+            "row `Durable third-party facts (Rule 19)`: it is none of the amendment's first rows",
+            id="a-row-under-the-key-of-the-acquaintance-row",
+        ),
+        pytest.param(
+            f"{_N17_ROW}\n",
+            f"{_N17_ROW}\n| List rules, unchecked box: an unchecked item under a heading of "
+            "wishes is a goal | Rule 29 in `prompt-rules-11-to-37` | prompt rule |\n",
+            "row `List rules, unchecked box`: it is none of the amendment's first rows",
+            id="a-row-under-the-key-of-the-unchecked-box-row",
+        ),
+        pytest.param(
+            f"{_N17_ROW}\n",
+            f"{_N17_ROW}\n| {_TEAM_PART_OF} | Rule 34 in `prompt-rules-11-to-37` | prompt rule |\n",
+            "row `Named teams (N17; Rule 34)`: this first row of the amendment is listed twice",
+            id="a-first-row-listed-twice",
+        ),
     ],
 )
 def test_a_v1_4_0_register_that_does_not_hold_fails(v1_4_0_copy, old: str, new: str, problem: str):
     pack = v1_4_0_copy(guide=_swap(old, new))
 
     assert problem in _registry_pack_problems(pack)
+
+
+def test_a_v1_4_0_row_under_the_key_of_a_generic_row_holds(v1_4_0_copy):
+    # The gold guide's `No-fact probes` row names the engine core alone. Should a rule of a
+    # pack come to carry it too, the pack lists it under that key, as it does the other seven.
+    listing = "| No-fact probes | Rule 12 in `prompt-rules-11-to-37` | prompt rule |"
+    pack = v1_4_0_copy(guide=_swap(f"{_N17_ROW}\n", f"{_N17_ROW}\n{listing}\n"))
+
+    assert _registry_pack_problems(pack) == []
 
 
 # ---------------------------------------------------------------------------
