@@ -6,9 +6,9 @@ batch record names each batch's units, their contexts and the entities the batch
 returned, so the rail knows which context an id may carry.
 
 A line is dropped only when something is left, when it names no entity of the row's
-payload, and when what is left is not the user anchor's id or a reserved identity's
-name or id. The longest line that fits is tried, and after a drop the id is read
-again; a line that is refused ends the strip.
+payload, and when the id the later id rails would build from what is left is not the
+user anchor's id or a reserved identity's name or id. The longest line that fits is
+tried, and after a drop the id is read again; a line that is refused ends the strip.
 
 The cases run on the fixture packs, whose types are invented, so a case that passes
 shows the runner reading the pack's rules and not knowing a type or a name. The cases
@@ -225,6 +225,40 @@ _KEPT = [
     _hand("night-watch-harbourmaster", "Night watch harbourmaster"),
 ]
 _KEPT_ROW = (_KEPT, [], [_batch([NIGHT_WATCH], _KEPT)], BASE)
+
+# Ids whose remainder is no reserved name as it stands, but which the id rails after
+# the strip would build into one: the leading-word rail drops `the` or `my`, and the
+# v1.4.0 version rail drops a version its name states. The last of each is a control,
+# whose built remainder is reserved by nothing.
+_TOOLS_BUILT = [
+    {"id": "tools-the-mist", "name": "Tools the MIST", "type": "Technology"},
+    {"id": "tools-my-mist", "name": "Tools my MIST", "type": "Technology"},
+    {"id": "tools-the-mist-identity", "name": "Tools the MIST identity", "type": "Technology"},
+    {"id": "tools-the-mist-ai", "name": "Tools the MIST AI", "type": "Technology"},
+    {"id": "tools-the-lanternfish", "name": "Tools the Lanternfish", "type": "Technology"},
+]
+_TOOLS_BUILT_ROW = (_TOOLS_BUILT, [], [_batch([("Tools",)], _TOOLS_BUILT)], V1_4_0)
+
+_TOOLS_VERSIONED = [
+    {"id": "tools-mist-2", "name": "Tools MIST 2", "type": "Technology"},
+    {"id": "tools-the-mist-2", "name": "Tools the MIST 2", "type": "Technology"},
+    {"id": "tools-the-lanternfish-2", "name": "Tools the Lanternfish 2", "type": "Technology"},
+]
+_TOOLS_VERSIONED_ROW = (_TOOLS_VERSIONED, [], [_batch([("Tools",)], _TOOLS_VERSIONED)], V1_4_0)
+
+_PEOPLE = [
+    _hand("people-the-user", "People the user"),
+    _hand("people-my-user", "People my user"),
+    _hand("people-the-cook", "People the cook"),
+]
+_PEOPLE_ROW = (_PEOPLE, [], [_batch([("People",)], _PEOPLE)], BASE)
+
+_KEPT_BUILT = [
+    _hand("night-watch-the-user", "Night watch the user"),
+    _hand("night-watch-the-harbour-master", "Night watch the harbour master"),
+    _hand("night-watch-the-cook", "Night watch the cook"),
+]
+_KEPT_BUILT_ROW = (_KEPT_BUILT, [], [_batch([NIGHT_WATCH], _KEPT_BUILT)], BASE)
 
 
 def test_a_lead_ins_slug_in_front_of_each_items_id_is_stripped_and_the_edges_follow():
@@ -454,6 +488,45 @@ def test_the_user_anchors_id_and_a_reserved_name_or_id_are_read_from_the_pack():
     ]
 
 
+def test_a_strip_is_refused_when_the_id_rails_would_build_a_reserved_name_from_the_rest():
+    # `the-mist` is no reserved name, but the leading-word rail would make it `mist`.
+    assert _row_ids(_TOOLS_BUILT_ROW) == [
+        "tools-the-mist",
+        "tools-my-mist",
+        "tools-the-mist-identity",
+        "tools-the-mist-ai",
+        "lanternfish",
+    ]
+
+
+def test_a_strip_is_refused_when_the_version_rail_would_build_a_reserved_name_from_the_rest():
+    # The version rail drops `-2` from each id, with or without the record; the context
+    # stays on the two ids whose rest it would build into `mist`.
+    assert _row_ids(_TOOLS_VERSIONED_ROW) == ["tools-mist", "tools-the-mist", "lanternfish"]
+    assert _row_ids((*_TOOLS_VERSIONED_ROW[:2], [], V1_4_0)) == [
+        "tools-mist",
+        "tools-the-mist",
+        "tools-the-lanternfish",
+    ]
+
+
+def test_a_strip_is_refused_when_the_id_rails_would_build_the_anchor_or_a_reserved_name():
+    assert _row_ids(_PEOPLE_ROW) == ["people-the-user", "people-my-user", "cook"]
+    assert _row_ids(_KEPT_BUILT_ROW) == [
+        "night-watch-the-user",
+        "night-watch-the-harbour-master",
+        "cook",
+    ]
+
+
+def test_a_strip_whose_built_rest_is_reserved_by_nothing_goes_through():
+    lanternfish = {"id": "tools-the-lanternfish-2", "name": "Lanternfish 2", "type": "Technology"}
+    cook = _hand("people-my-cook", "Cook")
+
+    assert _stored(lanternfish, _batch([("Tools",)], [lanternfish]), pack=V1_4_0) == "lanternfish"
+    assert _stored(cook, _batch([("People",)], [cook])) == "cook"
+
+
 # --- which contexts may strip which entity ------------------------------------------------------
 
 
@@ -608,6 +681,10 @@ def test_the_roster_row_gives_the_bytes_stated_here():
         _DOUBLED_ROW,
         _TOOLS_ROW,
         _KEPT_ROW,
+        _TOOLS_BUILT_ROW,
+        _TOOLS_VERSIONED_ROW,
+        _PEOPLE_ROW,
+        _KEPT_BUILT_ROW,
     ],
     ids=[
         "the-roster",
@@ -620,6 +697,10 @@ def test_the_roster_row_gives_the_bytes_stated_here():
         "a-context-written-twice",
         "the-v1-4-0-reserved-names",
         "the-anchor-and-the-reserved-names",
+        "the-v1-4-0-reserved-names-the-leading-word-rail-builds",
+        "the-v1-4-0-reserved-names-the-version-rail-builds",
+        "the-anchor-the-leading-word-rail-builds",
+        "the-anchor-and-a-reserved-name-the-leading-word-rail-builds",
     ],
 )
 def test_a_second_run_over_a_rows_own_output_changes_nothing(row):

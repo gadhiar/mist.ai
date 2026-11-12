@@ -18,9 +18,10 @@ The phases run in a fixed order, each a separate step:
 3. id: each entity's stored id is built, the endpoints are remapped to it, and the id
    form of `derived_edge` renames an entity from the node its edge points at. An id
    of a type no `id_exempt` rule names first loses the context its batch was read
-   under, when the batch record names one (`_own_contexts`) and the context names no
-   entity of the payload (`_strip_own_contexts`), so the id rules after it read that
-   entity's own id. An exempt type's id keeps its context.
+   under, when the batch record names one (`_own_contexts`), the context names no
+   entity of the payload, and the id rules after it would build neither the user
+   anchor's id nor a reserved name or id from what is left (`_strip_own_contexts`),
+   so those rules read that entity's own id. An exempt type's id keeps its context.
 4. fallback: an entity whose type the pack does not define takes the manifest's
    fallback type.
 
@@ -810,7 +811,11 @@ def _own_contexts(batch_record: Sequence[Mapping]) -> dict[str, tuple[str, ...]]
 
 
 def _strip_own_contexts(
-    entity_id: str, contexts: Sequence[str], named: frozenset[str], pack: Pack
+    entity: Mapping,
+    entity_id: str,
+    contexts: Sequence[str],
+    named: frozenset[str],
+    pack: Pack,
 ) -> str:
     """Drop the offered contexts from the start of the id, as whole words.
 
@@ -825,9 +830,13 @@ def _strip_own_contexts(
     2. the line is not in `named`. A heading the model also wrote as an entity is part
        of its items' own ids: with `redis` and `postgres` in the payload,
        `redis-cluster` and `postgres-cluster` are two things, not one `cluster`;
-    3. what is left is not the user anchor's id, a name a `reserved_identity` rule
-       maps, or the id such a rule maps to. The payload phase has already settled the
-       entities that go by those, and a strip must not make another.
+    3. the id the later id rails would build from what is left (`_built_id`: the
+       alias vocabularies, the `typed_id` rules, the registry and the leading-word
+       rail) is not the user anchor's id, a name a `reserved_identity` rule maps, or
+       the id such a rule maps to. The payload phase has already settled the entities
+       that go by those, and a strip must not make another. What is left is judged as
+       built, not as it stands: under `Tools`, `tools-the-mist` would leave `the-mist`,
+       which the leading-word rail makes `mist`.
 
     After a drop the id is read again, so an id that carries two lines of its context
     loses both. A line that is refused ends the strip with the id as it then stands: no
@@ -835,10 +844,11 @@ def _strip_own_contexts(
     refusal kept whole.
 
     Args:
+        entity: The entity, which the later id rails read for its type and name.
         entity_id: The slug of the entity's `id` field.
         contexts: The slugs the batch record offers the entity, longest first.
         named: The slug of the `id` field of every entity of the row's payload.
-        pack: The pack whose reserved names and user anchor are read.
+        pack: The pack whose id rules, reserved names and user anchor are read.
     """
     identities = _rules(pack).identities
     while True:
@@ -849,49 +859,33 @@ def _strip_own_contexts(
         if line is None:
             return entity_id
         rest = entity_id[len(line) + 1 :]
-        if not rest.strip("-") or line in named or rest in identities:
+        if not rest.strip("-") or line in named:
+            return entity_id
+        if _built_id(entity, rest, pack)[0] in identities:
             return entity_id
         entity_id = rest
 
 
-def _build_entity_id(
-    entity: dict,
-    pack: Pack,
-    own_contexts: Sequence[str] = (),
-    named: frozenset[str] = frozenset(),
-) -> tuple[str, bool]:
-    """One entity's stored id, from its `id` field and the pack's id rules.
+def _built_id(entity: Mapping, entity_id: str, pack: Pack) -> tuple[str, tuple[str, str] | None]:
+    """The id the id rules after the strip build from `entity_id`, writing nothing.
 
-    The slug of the `id` field first loses the `own_contexts` it starts with
-    (`_strip_own_contexts`), unless an `id_exempt` rule names the type. It then goes
-    through the `alias_vocabulary` and `typed_id` rules in the pack's order; the
-    engine's registry is read after the last alias vocabulary, and a hit sets the type
-    and ends the steps; a type no `id_exempt` rule names then loses its leading words.
-
-    Args:
-        entity: The entity, its type already settled by the payload phase.
-        pack: The pack whose id rules run.
-        own_contexts: The context slugs the batch record offers this entity
-            (`_own_contexts`), longest first; empty for an entity it offers none.
-        named: The slug of the `id` field of every entity of the row's payload, which
-            no context that equals one is stripped as.
+    The slug goes through the `alias_vocabulary` and `typed_id` rules in the pack's
+    order; the engine's registry is read after the last alias vocabulary, and a hit
+    ends the steps; a type no `id_exempt` rule names then loses its leading words. The
+    strip reads it to judge a remainder, so it changes neither the entity nor the
+    registry: the id plug-ins it calls are pure (`Plugin`).
 
     Returns:
-        The id, and True when the registry settled the entity.
+        The id, and the registry's (id, type) when the registry settled the entity, or
+        None.
     """
     rules = _rules(pack)
     entity_type = str(entity.get("type", ""))
-    entity_id = canonical_id(_raw_id(entity))
-    if entity_type not in rules.exempt:
-        entity_id = _strip_own_contexts(entity_id, own_contexts, named, pack)
     for position in range(len(rules.entity_id_rules) + 1):
         if position == rules.registry_after:
             registered = id_rails.CANONICAL_REGISTRY.get(entity_id)
             if registered is not None:
-                # The id is written first, so an entity with neither key gets `id`
-                # before `type`, as the id rails gave it.
-                entity["id"], entity["type"] = registered
-                return registered[0], True
+                return registered[0], registered
         if position == len(rules.entity_id_rules):
             break
         rule = rules.entity_id_rules[position]
@@ -910,7 +904,45 @@ def _build_entity_id(
             entity_id = aliases.get(entity_id, entity_id)
     if entity_type not in rules.exempt:
         entity_id = id_rails.n1_rail(entity_id)
-    return entity_id, False
+    return entity_id, None
+
+
+def _build_entity_id(
+    entity: dict,
+    pack: Pack,
+    own_contexts: Sequence[str] = (),
+    named: frozenset[str] = frozenset(),
+) -> tuple[str, bool]:
+    """One entity's stored id, from its `id` field and the pack's id rules.
+
+    The slug of the `id` field first loses the `own_contexts` it starts with
+    (`_strip_own_contexts`), unless an `id_exempt` rule names the type. It then goes
+    through the `alias_vocabulary` and `typed_id` rules in the pack's order; the
+    engine's registry is read after the last alias vocabulary, and a hit sets the type
+    and ends the steps; a type no `id_exempt` rule names then loses its leading words
+    (`_built_id`, which the strip also reads to judge what a drop would leave).
+
+    Args:
+        entity: The entity, its type already settled by the payload phase.
+        pack: The pack whose id rules run.
+        own_contexts: The context slugs the batch record offers this entity
+            (`_own_contexts`), longest first; empty for an entity it offers none.
+        named: The slug of the `id` field of every entity of the row's payload, which
+            no context that equals one is stripped as.
+
+    Returns:
+        The id, and True when the registry settled the entity.
+    """
+    entity_id = canonical_id(_raw_id(entity))
+    if str(entity.get("type", "")) not in _rules(pack).exempt:
+        entity_id = _strip_own_contexts(entity, entity_id, own_contexts, named, pack)
+    entity_id, registered = _built_id(entity, entity_id, pack)
+    if registered is None:
+        return entity_id, False
+    # The id is written first, so an entity with neither key gets `id` before `type`,
+    # as the id rails gave it.
+    entity["id"], entity["type"] = registered
+    return entity_id, True
 
 
 def _derive_ids(
