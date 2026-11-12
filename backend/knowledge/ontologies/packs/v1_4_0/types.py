@@ -1,9 +1,11 @@
 """The v1.4.0 pack's types: MIST.AI Knowledge Ontology v1.x family.
 
-Defines every node type, edge type, confidence policy, extraction rule, and
-universal property for the v1.x ontology snapshot. The definitions moved here
-unchanged from `backend/knowledge/ontologies/v1_0_0.py`, which re-exports every
-name below for the code that imports that path. The ACTIVE version is tracked
+Defines every node type, edge type, confidence policy and universal property for
+the v1.x ontology snapshot. The definitions moved here unchanged from
+`backend/knowledge/ontologies/v1_0_0.py`, which re-exports every name below for
+the code that imports that path. The extraction rules that module also held did
+not move: nothing read them, and the prompt's ontology half is stated by the
+pack's prompt fragments (`conventions.py`). The ACTIVE version is tracked
 solely by the `version` field on the exported `ONTOLOGY_V1_0_0` constant (do not
 duplicate the version number here -- this docstring drifted twice). Version
 history lives in the constant's `description` field.
