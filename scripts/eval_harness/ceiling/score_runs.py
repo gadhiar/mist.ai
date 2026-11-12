@@ -85,6 +85,15 @@ printed class counts come from, or, for a relation beyond the prompt, which that
 sets aside, from a diagnosis that sets nothing aside. The worksheet holds no recall or
 precision figure: the adjudicator classifies items without a score in view.
 
+`--prior-code-root DIR` re-scores the same runs under the scorer at DIR (this file run again,
+in a second interpreter, with DIR as its code root) and prints, after the paired lines, one
+line per run in `--run` order:
+
+    [scorer effect X] relations found under the prior scorer p/g, under this scorer c/g,
+    diff D; prior scorer_sha=S
+
+on one line, so a moved score names the share the scorer change made (design h.5).
+
 Every line that holds a figure (each `[...` line and each `expect` line) ends with
 ` | scorer_sha=... gold_version=... pack_prompt_hash=... pack_rails_hash=...`, and an
 `identity:` line after the provenance lines prints the same. They are taken before anything
@@ -106,6 +115,8 @@ import importlib.util
 import inspect
 import json
 import math
+import re
+import subprocess  # nosec B404 - re-runs this file under the prior code root, a fixed argv
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -127,6 +138,8 @@ _GOVERNANCE_PATH = Path(__file__).resolve().parents[1] / "governance.py"
 _GOVERNANCE_NAME = "_score_runs_governance"
 # The lines that hold a figure, each of which ends with the reading's identity.
 _FIGURE_LINE_STARTS = ("[", "expect ")
+# A run's relation recall line, as this script prints it under any code root.
+_RECALL_LINE_RE = re.compile(r"^\[(?P<name>.+?)\] relation recall: \S+ \((?P<tp>\d+)/(?P<n>\d+)\)")
 PAIR_FIELDS = ("tag", "utterance", "gold_id", "gold_type", "produced_id", "produced_type", "kind")
 # The gold files whose pending pairs are never written: (file name prefix, what it is).
 SEALED_GOLD_PREFIXES: tuple[tuple[str, str], ...] = (
@@ -408,6 +421,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="write each run's pending typo and paraphrase pairs to DIR/<name>.jsonl",
     )
     parser.add_argument(
+        "--prior-code-root",
+        type=Path,
+        metavar="DIR",
+        help="the checkout of the scorer the runs were last scored under; prints a "
+        "`scorer effect` line per run",
+    )
+    parser.add_argument(
         "--accepted-pairs",
         type=Path,
         action="append",
@@ -561,6 +581,56 @@ def _reading_identity(code_root: Path, gold: Path) -> str:
     )
     text: str = governance.identity_text(identity)
     return text
+
+
+@dataclass(frozen=True, slots=True)
+class PriorScores:
+    """Each run's relations found under the prior scorer, and that scorer's sha."""
+
+    scorer_sha: str
+    found: dict[str, tuple[int, int]]
+
+
+def _prior_scores(args: argparse.Namespace, runs: dict[str, Path]) -> PriorScores:
+    """Score the runs again under `--prior-code-root`, in a second interpreter.
+
+    One process holds `scripts.*` and `backend.*` to one code root, so the prior scorer
+    runs this file again with the prior root as its code root, and its recall lines are
+    read back. Nothing but the gold, the pre-H8 gold and the runs is passed on.
+    """
+    prior = args.prior_code_root.resolve()
+    argv = [sys.executable, str(Path(__file__).resolve()), "--code-root", str(prior)]
+    argv += ["--gold", str(args.gold.resolve())]
+    if args.pre_h8_gold is not None:
+        argv += ["--pre-h8-gold", str(args.pre_h8_gold.resolve())]
+    for name, path in runs.items():
+        argv += ["--run", f"{name}={path.resolve()}"]
+    done = subprocess.run(  # nosec B603 - a fixed argv: this interpreter on this file
+        argv, cwd=prior, capture_output=True, text=True, check=False
+    )
+    if done.returncode != 0:
+        tail = (done.stderr.strip().splitlines() or ["no message"])[-1]
+        raise InputError(f"the prior scorer at {prior} exited {done.returncode}: {tail}")
+    found: dict[str, tuple[int, int]] = {}
+    for line in done.stdout.splitlines():
+        match = _RECALL_LINE_RE.match(line)
+        if match is not None and match["name"] in runs:
+            found[match["name"]] = (int(match["tp"]), int(match["n"]))
+    missing = [name for name in runs if name not in found]
+    if missing:
+        raise InputError(f"the prior scorer at {prior} printed no recall for {', '.join(missing)}")
+    return PriorScores(scorer_sha=_governance().scorer_sha(prior), found=found)
+
+
+def _scorer_effect_line(name: str, score: RunScore, prior: PriorScores) -> str:
+    """One run's found count under the prior scorer and this one, and the difference."""
+    before, total_before = prior.found[name]
+    now, total = score.relation_recall.numerator, score.relation_recall.denominator
+    return (
+        f"[scorer effect {name}] relations found under the prior scorer {before}/"
+        f"{total_before}, under this scorer {now}/{total}, diff {now - before:+d}; "
+        f"prior scorer_sha={prior.scorer_sha}"
+    )
 
 
 def _check_code_root(code_root: Path) -> None:
@@ -965,6 +1035,8 @@ def _run(argv: Sequence[str] | None) -> int:
     code_root = args.code_root.resolve()
     if not code_root.is_dir():
         raise UsageError(f"--code-root {code_root} is not a directory")
+    if args.prior_code_root is not None and not args.prior_code_root.is_dir():
+        raise UsageError(f"--prior-code-root {args.prior_code_root} is not a directory")
     for path in (args.gold, args.pre_h8_gold, *runs.values(), *args.accepted_pairs):
         if path is not None and not path.is_file():
             raise InputError(f"no such file: {path}")
@@ -1004,10 +1076,13 @@ def _run(argv: Sequence[str] | None) -> int:
     pairs: list[PairScore] = []
     aligned_pairs: list[AlignedPairScore] = []
     by_name = {name: run for name, (_, run) in scored.items()}
+    prior: PriorScores | None = None
     if not failed:
         pairs = _paired_scores(scorer, probes, by_name)
         if aligned is not None:
             aligned_pairs = _paired_aligned_scores(scorer, aligned, probes, by_name)
+        if args.prior_code_root is not None:
+            prior = _prior_scores(args, runs)
     lines: list[dict[str, object]] = []
     if worksheet is not None and not failed:
         lines = _worksheet_lines(
@@ -1039,6 +1114,9 @@ def _run(argv: Sequence[str] | None) -> int:
         say(pair.line())
     for aligned_pair in aligned_pairs:
         say(aligned_pair.line())
+    if prior is not None:
+        for name in runs:
+            say(_scorer_effect_line(name, scores[name], prior))
     for name, target in pairs_targets.items():
         _write_pairs(target, by_name[name].pending_pairs)
         print(f"pairs {name}: {len(by_name[name].pending_pairs)} pending, written to {target}")

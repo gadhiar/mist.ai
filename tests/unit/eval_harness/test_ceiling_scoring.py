@@ -425,6 +425,60 @@ def test_every_figure_line_carries_the_scorer_the_gold_and_the_pack(tmp_path: Pa
     assert f"identity: {identity}" in result.stdout.splitlines()
 
 
+# A prior scorer that finds nothing: each run's found count moves under the current one.
+_FINDS_NOTHING = """
+_score_run = score_run
+
+
+def score_run(probes, produced_index):
+    report = _score_run(probes, produced_index)
+    report.rel_fn += report.rel_tp
+    report.rel_tp = 0
+    return report
+"""
+
+
+def test_a_re_score_under_a_changed_scorer_prints_a_scorer_effect_line_per_run(
+    tmp_path: Path,
+) -> None:
+    from scripts.eval_harness import governance
+
+    prior = _write_stub_root(tmp_path / "prior", scorer_tail=_FINDS_NOTHING)
+    root = _write_stub_root(tmp_path / "code")
+    files = _inputs(tmp_path)
+    result = _run(root, files, "--prior-code-root", str(prior))
+    assert result.returncode == 0, result.stderr
+    prior_sha = governance.scorer_sha(prior)
+    assert prior_sha != governance.scorer_sha(root)
+    effects = [line for line in _bare(result) if line.startswith("[scorer effect ")]
+    assert effects == [
+        "[scorer effect a] relations found under the prior scorer 0/6, under this scorer "
+        f"3/6, diff +3; prior scorer_sha={prior_sha}",
+        "[scorer effect b] relations found under the prior scorer 0/6, under this scorer "
+        f"2/6, diff +2; prior scorer_sha={prior_sha}",
+    ]
+    identity = _identity(root, files["gold"])
+    assert all(
+        line.endswith(f" | {identity}")
+        for line in result.stdout.splitlines()
+        if line.startswith("[scorer effect ")
+    )
+
+
+def test_no_prior_code_root_prints_no_scorer_effect_line(tmp_path: Path) -> None:
+    result = _run(_write_stub_root(tmp_path / "code"), _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[scorer effect" not in result.stdout
+
+
+def test_a_prior_code_root_that_is_not_a_directory_exits_1(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path), "--prior-code-root", str(tmp_path / "nowhere"))
+    assert result.returncode == 1
+    assert "--prior-code-root" in result.stderr
+    assert "[a]" not in result.stdout
+
+
 def test_a_change_to_the_code_roots_harness_moves_the_scorer_sha(tmp_path: Path) -> None:
     files = _inputs(tmp_path)
     one = _run(_write_stub_root(tmp_path / "one"), files)
