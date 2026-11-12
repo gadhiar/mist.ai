@@ -72,6 +72,7 @@ from backend.extraction_contract.models import (  # noqa: E402
 )
 from backend.knowledge.extraction.scope_classifier import parse_scope_output  # noqa: E402
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION  # noqa: E402
+from scripts.eval_harness import governance  # noqa: E402
 from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     GoldProbe,
     Produced,
@@ -79,6 +80,7 @@ from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     _recover_utterance,
     iter_gold_probes,
     produced_from_response,
+    reading_identity,
     score_run,
 )
 from scripts.model_bench.probes.extraction import (  # noqa: E402
@@ -507,12 +509,19 @@ def build_run_summary(
     max_minutes: float,
     limit: int | None,
     drain_s: float = DEFAULT_DRAIN_S,
+    identity: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Score the run and assemble `extraction_service_summary.json`.
+
+    Args:
+        identity: The reading's identity (`reading_identity`), taken before the first
+            probe ran; None takes it now.
 
     Returns:
         `(summary, report)` where `report` is the scorer's `Report`.
     """
+    if identity is None:
+        identity = reading_identity(gold_path)
     report = score_run(probes, build_produced_index(result.cases))
     seed, b, confidence, z = load_bootstrap_params()
     summary = build_summary(
@@ -538,6 +547,7 @@ def build_run_summary(
     scope_failed = sum(1 for c in completed if c.response and response_flags(c.response)[0])
     repaired = sum(1 for c in completed if c.response and response_flags(c.response)[1])
 
+    summary.update(identity)
     summary["ontology_version_note"] = "scorer-side (local repo); the service reports none"
     summary["endpoint"] = {
         "url": endpoint,
@@ -740,12 +750,20 @@ def read_baseline_scope(path: Path, probes: list[GoldProbe]) -> dict[str, tuple[
 def load_baseline(baseline_dir: Path, probes: list[GoldProbe]) -> Baseline:
     """Load `extraction_summary.json`, `extraction.jsonl` and `extraction_debug.jsonl`.
 
-    A missing or unreadable file degrades to a stated omission; nothing raises.
+    A missing or unreadable file degrades to a stated omission; nothing raises. A summary
+    that does not name its scorer, gold and pack (`governance.require_reading`) is not a
+    reading, so its figures are refused the same way, the missing fields named.
     """
     omissions: list[str] = []
     summary = _read_json(baseline_dir / "extraction_summary.json")
     if summary is None:
         omissions.append("extraction_summary.json missing or unreadable: metric table omitted")
+    else:
+        try:
+            governance.require_reading(summary)
+        except governance.NotAReadingError as exc:
+            omissions.append(f"extraction_summary.json refused: {exc}; metric table omitted")
+            summary = None
     rows = _read_rows(baseline_dir / "extraction.jsonl")
     if rows is None:
         omissions.append("extraction.jsonl missing or unreadable: regression list omitted")
@@ -1128,6 +1146,12 @@ async def execute(
     # The rows file holds only the per-case fields until the run is scored; it is then
     # replaced with the full scored rows.
     out_dir.mkdir(parents=True, exist_ok=True)
+    # The reading's identity is fixed and written before the first probe runs, so a
+    # change to the scorer, the gold or the pack during the run cannot relabel it. The
+    # summary holds only the identity until the run is scored; it is then replaced.
+    identity = reading_identity(gold_path)
+    with open(out_dir / OUT_SUMMARY, "x", encoding="utf-8") as summary_fh:
+        summary_fh.write(json.dumps({**identity, "scored": False}, indent=2, sort_keys=True))
     rows_path = out_dir / OUT_ROWS
     with (
         open(rows_path, "x", encoding="utf-8") as rows_fh,
@@ -1167,6 +1191,7 @@ async def execute(
         max_minutes=max_minutes,
         limit=limit,
         drain_s=drain_s,
+        identity=identity,
     )
     rows = build_case_rows(report, result)
     warn_run_identity_mismatches(

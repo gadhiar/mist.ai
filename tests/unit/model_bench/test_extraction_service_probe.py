@@ -49,7 +49,13 @@ from backend.extraction_contract.models import (  # noqa: E402
 )
 from backend.knowledge.extraction.id_rails import event_date_rail  # noqa: E402
 from backend.knowledge.extraction.scope_classifier import SCOPE_USER_TEMPLATE  # noqa: E402
-from scripts.eval_harness.score_extraction_run import GoldProbe, iter_gold_probes  # noqa: E402
+from backend.knowledge.ontologies import registry  # noqa: E402
+from scripts.eval_harness import governance  # noqa: E402
+from scripts.eval_harness.score_extraction_run import (  # noqa: E402
+    GoldProbe,
+    iter_gold_probes,
+    reading_identity,
+)
 from scripts.golden_log.native_shape import (  # noqa: E402
     build_native_entity,
     build_native_relationship,
@@ -786,7 +792,37 @@ async def test_rows_and_raw_are_written_incrementally_and_survive_a_crash(
     assert [json.loads(x)["id"] for x in row_lines] == ["p-1", "p-2"]
     assert all(json.loads(x)["scored"] is False for x in row_lines)
     assert [json.loads(x)["id"] for x in raw_lines] == ["p-1", "p-2"]
-    assert not (out / probe.OUT_SUMMARY).exists()  # the crash came before scoring
+    # The crash came before scoring: the summary holds the identity written before the run.
+    summary = json.loads((out / probe.OUT_SUMMARY).read_text(encoding="utf-8"))
+    assert summary == {**reading_identity(gold), "scored": False}
+
+
+@pytest.mark.asyncio
+async def test_the_reading_identity_is_written_before_the_first_probe(tmp_path: Path) -> None:
+    # Plan v14 T50 Acceptance 1: scorer_sha, gold_version and both pack hashes.
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    world = make_world(gold)
+    state, _ = world
+    out = tmp_path / "out"
+    seen: list[dict[str, Any]] = []
+
+    def read_summary(n_received: int) -> None:
+        if n_received == 1:
+            seen.append(json.loads((out / probe.OUT_SUMMARY).read_text(encoding="utf-8")))
+
+    state.on_request = read_summary
+    assert await run_execute(state_and_client=world, gold_path=gold, out_dir=out) == 0
+    pack = registry.active_pack()
+    identity = {
+        "scorer_sha": governance.scorer_sha(_REPO_ROOT),
+        "gold_version": governance.gold_version(gold, _REPO_ROOT, pack.version),
+        "pack_prompt_hash": pack.pack_prompt_hash,
+        "pack_rails_hash": pack.pack_rails_hash,
+    }
+    assert seen == [{**identity, "scored": False}]
+    summary = json.loads((out / probe.OUT_SUMMARY).read_text(encoding="utf-8"))
+    assert {name: summary[name] for name in identity} == identity
+    governance.require_reading(summary)
 
 
 @pytest.mark.asyncio
@@ -1164,6 +1200,15 @@ def _scope_record(utterance: str, label: str, confidence: float) -> dict[str, An
     }
 
 
+# A baseline summary is a reading only when it names its scorer, gold and pack.
+_BASELINE_IDENTITY = {
+    "scorer_sha": "a" * 64,
+    "gold_version": "gold-000000000000.labelling-000000000000.pack-1.4.0",
+    "pack_prompt_hash": "b" * 64,
+    "pack_rails_hash": "c" * 64,
+}
+
+
 def write_baseline(directory: Path, n: int, *, with_debug: bool = True) -> Path:
     """A synthetic baseline in the existing probe's layout: everything matched, all user-scope."""
     directory.mkdir(parents=True)
@@ -1194,6 +1239,7 @@ def write_baseline(directory: Path, n: int, *, with_debug: bool = True) -> Path:
         "related_to_rate": 0.0,
         "valid_time_accuracy": 1.0,
         "gold_corpus_sha256": "abc",
+        **_BASELINE_IDENTITY,
         "bootstrap": {
             "entity_precision": [0.9, 1.0],
             "entity_recall": [0.95, 1.0],
@@ -1357,6 +1403,29 @@ async def test_missing_baseline_files_degrade_to_a_stated_omission(
         assert comparison["scope"]["host"]["n"] == 2  # host scope stats still reported
     else:
         assert comparison["metrics"] is None and comparison["regressed"] is None
+
+
+@pytest.mark.parametrize("field", sorted(_BASELINE_IDENTITY))
+@pytest.mark.asyncio
+async def test_a_baseline_summary_without_its_identity_is_refused_as_a_reading(
+    tmp_path: Path, field: str
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    baseline = write_baseline(tmp_path / "baseline", 2)
+    path = baseline / "extraction_summary.json"
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    del summary[field]
+    path.write_text(json.dumps(summary), encoding="utf-8")
+    out = tmp_path / "out"
+
+    code = await run_execute(
+        state_and_client=make_world(gold), gold_path=gold, out_dir=out, baseline_dir=baseline
+    )
+
+    assert code == 0
+    comparison = json.loads((out / probe.OUT_COMPARISON_JSON).read_text(encoding="utf-8"))
+    assert comparison["metrics"] is None
+    assert any("not a reading" in o and field in o for o in comparison["omissions"])
 
 
 def test_read_baseline_scope_recovers_labels_and_skips_noise(tmp_path: Path) -> None:

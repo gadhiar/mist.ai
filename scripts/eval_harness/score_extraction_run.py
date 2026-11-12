@@ -60,6 +60,7 @@ from backend.knowledge.ontologies.hierarchy import (  # noqa: E402
     canonical_type,
 )
 from backend.knowledge.ontologies.pack import ID as _ID_PHASE  # noqa: E402
+from scripts.eval_harness import governance  # noqa: E402
 
 # `types_match` lives with the other id form rules and is re-exported here for its callers.
 from scripts.eval_harness.entity_alignment import (  # noqa: E402
@@ -835,6 +836,22 @@ RELATED_TO_RATE_LIMIT = 0.10
 SPECIFICITY_FLOOR = 0.90
 
 
+def reading_identity(gold: Path) -> dict[str, str | None]:
+    """What a score of `gold` is taken under: this scorer, the gold and the active pack.
+
+    Taken before anything is scored, so a reading names the code and pack that scored it
+    (`governance` holds the rule for each field).
+    """
+    pack = registry.active_pack()
+    return governance.reading_identity(
+        root=_REPO_ROOT,
+        gold=gold,
+        pack_version=pack.version,
+        pack_prompt_hash=pack.pack_prompt_hash,
+        pack_rails_hash=pack.pack_rails_hash,
+    )
+
+
 def score_reconciliation() -> None:
     """Hook: reconciliation-action accuracy.
 
@@ -873,11 +890,13 @@ def _row(
     return f"| {name} | {value:.3f} | {count} | {op} {gate:.2f} | {'PASS' if ok else 'FAIL'} |"
 
 
-def render_markdown(report: Report) -> str:
+def render_markdown(report: Report, identity: Mapping[str, object] | None = None) -> str:
     lines = [
         "# Extraction Accuracy Report (F2)",
         "",
     ]
+    if identity is not None:
+        lines += [f"- Reading: {governance.identity_text(identity)}", ""]
     if report.vacuous:
         lines += [
             "**VACUOUS RUN -- 0 probes were read from the gold corpus. No gate "
@@ -980,16 +999,18 @@ def render_markdown(report: Report) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_json(report: Report) -> str:
+def render_json(report: Report, identity: Mapping[str, object] | None = None) -> str:
     """Render the machine-readable report, counts included.
 
     `render_markdown`'s Count column and these fields read the same Report
     attributes -- this is the durable artifact, so a ratio without its
     backing numerator/denominator here is exactly as unfalsifiable as it
-    would be in the markdown table.
+    would be in the markdown table. `identity` (`reading_identity`) leads the
+    report when given.
     """
     return json.dumps(
         {
+            **(dict(identity) if identity is not None else {}),
             "total_probes": report.total_probes,
             "matched_probes": report.matched_probes,
             "vacuous": report.vacuous,
@@ -1069,11 +1090,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.debug_jsonl.exists():
         print(f"error: debug jsonl not found: {args.debug_jsonl}", file=sys.stderr)
         return 2
+    identity = reading_identity(args.gold)
     probes = iter_gold_probes(args.gold)
     records = iter_debug_records(args.debug_jsonl, session_id=args.session_id)
     report = score_run(probes, build_produced_index(records))
     score_reconciliation()
-    md = render_markdown(report)
+    md = render_markdown(report, identity)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(md, encoding="utf-8")
@@ -1081,7 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
     if args.json_output:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
-        args.json_output.write_text(render_json(report), encoding="utf-8")
+        args.json_output.write_text(render_json(report, identity), encoding="utf-8")
     if args.strict and not _gates_pass(report):
         return 1
     return 0

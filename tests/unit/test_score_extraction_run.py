@@ -1052,6 +1052,33 @@ class TestRenderAndCli:
         assert rc == 0
         assert "Entity precision" in out.read_text(encoding="utf-8")
 
+    def test_every_summary_names_its_scorer_gold_and_pack(self, tmp_path):
+        # Plan v14 T50 Acceptance 1: both reports carry the four fields of a reading.
+        from backend.knowledge.ontologies import registry
+        from scripts.eval_harness import governance
+
+        gold = tmp_path / "gold.jsonl"
+        gold.write_text(json.dumps({"utterance": "I use Rust", "tag": "t1"}) + "\n")
+        debug = tmp_path / "debug.jsonl"
+        debug.write_text("", encoding="utf-8")
+        md, js = tmp_path / "report.md", tmp_path / "report.json"
+        argv = ["--gold", str(gold), "--debug-jsonl", str(debug), "--output", str(md)]
+        assert main([*argv, "--json-output", str(js)]) == 0
+        pack = registry.active_pack()
+        expected = {
+            "scorer_sha": governance.scorer_sha(_REPO_ROOT),
+            "gold_version": governance.gold_version(gold, _REPO_ROOT, pack.version),
+            "pack_prompt_hash": pack.pack_prompt_hash,
+            "pack_rails_hash": pack.pack_rails_hash,
+        }
+        payload = json.loads(js.read_text(encoding="utf-8"))
+        assert {name: payload.get(name) for name in expected} == expected
+        governance.require_reading(payload)
+        assert (
+            f"- Reading: {governance.identity_text(expected)}"
+            in md.read_text(encoding="utf-8").splitlines()
+        )
+
     def test_main_returns_2_on_missing_file(self, tmp_path):
         rc = main(
             ["--gold", str(tmp_path / "nope.jsonl"), "--debug-jsonl", str(tmp_path / "nope2.jsonl")]

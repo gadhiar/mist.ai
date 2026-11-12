@@ -85,6 +85,15 @@ printed class counts come from, or, for a relation beyond the prompt, which that
 sets aside, from a diagnosis that sets nothing aside. The worksheet holds no recall or
 precision figure: the adjudicator classifies items without a score in view.
 
+Every line that holds a figure (each `[...` line and each `expect` line) ends with
+` | scorer_sha=... gold_version=... pack_prompt_hash=... pack_rails_hash=...`, and an
+`identity:` line after the provenance lines prints the same. They are taken before anything
+is scored, by `scripts/eval_harness/governance.py` of this script's own tree (loaded by
+path, so the rule is the one every summary is written under): `scorer_sha` over the code
+root's harness and engine rails, `gold_version` from the gold file, its LABELLING guide and
+the code root's pack version, and the code root's pack hashes; `none` for a code root with
+no pack registry.
+
 Exit codes: 0 scored, 1 a usage or input error or a failed expectation, 2 a module loaded
 from outside `--code-root`.
 """
@@ -93,6 +102,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import inspect
 import json
 import math
@@ -111,6 +121,12 @@ REPORT_MODULE = "scripts.eval_harness.extraction_report"
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 0
 BOOTSTRAP_CONFIDENCE = 0.95
+REGISTRY_MODULE = "backend.knowledge.ontologies.registry"
+REGISTRY_FILE = Path("backend") / "knowledge" / "ontologies" / "registry.py"
+_GOVERNANCE_PATH = Path(__file__).resolve().parents[1] / "governance.py"
+_GOVERNANCE_NAME = "_score_runs_governance"
+# The lines that hold a figure, each of which ends with the reading's identity.
+_FIGURE_LINE_STARTS = ("[", "expect ")
 PAIR_FIELDS = ("tag", "utterance", "gold_id", "gold_type", "produced_id", "produced_type", "kind")
 # The gold files whose pending pairs are never written: (file name prefix, what it is).
 SEALED_GOLD_PREFIXES: tuple[tuple[str, str], ...] = (
@@ -511,6 +527,40 @@ def _import(name: str) -> ModuleType:
         return importlib.import_module(name)
     except ImportError as exc:
         raise InputError(f"cannot import {name} from the code root: {exc}") from exc
+
+
+def _governance() -> ModuleType:
+    """This checkout's `governance.py`, loaded by path under a name the guard does not hold.
+
+    The identity rule is the one every summary is written under, so it comes from this
+    script's own tree, not from the pinned code root, which may predate it.
+    """
+    spec = importlib.util.spec_from_file_location(_GOVERNANCE_NAME, _GOVERNANCE_PATH)
+    if spec is None or spec.loader is None:
+        raise InputError(f"cannot load {_GOVERNANCE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _reading_identity(code_root: Path, gold: Path) -> str:
+    """The code root's scorer sha, the gold version and the code root's active pack hashes.
+
+    A code root with no pack registry (a checkout from before the packs) names none.
+    """
+    governance = _governance()
+    pack = None
+    if (code_root / REGISTRY_FILE).is_file():
+        pack = _import(REGISTRY_MODULE).active_pack()
+    identity = governance.reading_identity(
+        root=code_root,
+        gold=gold,
+        pack_version=getattr(pack, "version", None),
+        pack_prompt_hash=getattr(pack, "pack_prompt_hash", None),
+        pack_rails_hash=getattr(pack, "pack_rails_hash", None),
+    )
+    text: str = governance.identity_text(identity)
+    return text
 
 
 def _check_code_root(code_root: Path) -> None:
@@ -931,7 +981,13 @@ def _run(argv: Sequence[str] | None) -> int:
             "the code root's scorer has no aligned scoring, which --pairs-out and "
             "--accepted-pairs need"
         )
+    # The reading's identity is taken from the code root before anything is scored.
+    identity = _reading_identity(code_root, args.gold)
     _check_code_root(code_root)
+
+    def say(line: str) -> None:
+        """Print a line; a figure line ends with the identity it was scored under."""
+        print(f"{line} | {identity}" if line.startswith(_FIGURE_LINE_STARTS) else line)
 
     probes = _load_gold(scorer, args.gold)
     beyond_prompt, basis_line = _asked_for_basis(scorer, classifier, probes, args.pre_h8_gold)
@@ -961,25 +1017,28 @@ def _run(argv: Sequence[str] | None) -> int:
 
     print(f"scorer: {Path(scorer.__file__).resolve()}")
     print(f"classifier: {Path(classifier.__file__).resolve()}")
+    print(f"identity: {identity}")
     if basis_line is not None:
         print(basis_line)
     shown = [name for name in runs if name in expects] if failed else list(runs)
     for name in shown:
         print()
-        print("\n".join(scores[name].lines()))
+        for line in scores[name].lines():
+            say(line)
         aligned_score = by_name[name].aligned
         if aligned_score is not None:
-            print(aligned_score.line())
+            say(aligned_score.line())
     print()
     if failed:
-        print("\n".join(failed))
+        for line in failed:
+            say(line)
         return 1
     for name, want in expects.items():
-        print(f"expect {name}: {want:.3f} holds")
+        say(f"expect {name}: {want:.3f} holds")
     for pair in pairs:
-        print(pair.line())
+        say(pair.line())
     for aligned_pair in aligned_pairs:
-        print(aligned_pair.line())
+        say(aligned_pair.line())
     for name, target in pairs_targets.items():
         _write_pairs(target, by_name[name].pending_pairs)
         print(f"pairs {name}: {len(by_name[name].pending_pairs)} pending, written to {target}")

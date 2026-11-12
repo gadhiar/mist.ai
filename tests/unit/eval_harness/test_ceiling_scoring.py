@@ -380,8 +380,58 @@ def _run(root: Path, files: dict[str, Path], *extra: str) -> subprocess.Complete
     return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=120, check=False)
 
 
+# Every figure line ends with the reading's identity after this mark (plan v14 T50).
+_IDENTITY_MARK = " | scorer_sha="
+
+
+def _bare(result: subprocess.CompletedProcess[str]) -> list[str]:
+    """The output's lines without the identity each figure line ends with."""
+    return [line.split(_IDENTITY_MARK, 1)[0] for line in result.stdout.splitlines()]
+
+
 def _lines(result: subprocess.CompletedProcess[str], run: str) -> list[str]:
-    return [line for line in result.stdout.splitlines() if line.startswith(f"[{run}] ")]
+    return [line for line in _bare(result) if line.startswith(f"[{run}] ")]
+
+
+def _identity(root: Path, gold: Path, pack: object | None = None) -> str:
+    from scripts.eval_harness import governance
+
+    return governance.identity_text(
+        {
+            "scorer_sha": governance.scorer_sha(root),
+            "gold_version": governance.gold_version(gold, root, getattr(pack, "version", None)),
+            "pack_prompt_hash": getattr(pack, "pack_prompt_hash", None),
+            "pack_rails_hash": getattr(pack, "pack_rails_hash", None),
+        }
+    )
+
+
+def _figure_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return [line for line in result.stdout.splitlines() if line.startswith(("[", "expect "))]
+
+
+def test_every_figure_line_carries_the_scorer_the_gold_and_the_pack(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    files = _inputs(tmp_path)
+    result = _run(root, files, "--expect", "a=0.500")
+    assert result.returncode == 0, result.stderr
+    # A code root without a pack names none; its harness files still give a scorer sha.
+    identity = _identity(root, files["gold"])
+    assert "pack_prompt_hash=none pack_rails_hash=none" in identity
+    lines = _figure_lines(result)
+    assert any(line.startswith("[paired ") for line in lines)
+    assert any(line.startswith("expect a: ") for line in lines)
+    assert all(line.endswith(f" | {identity}") for line in lines), lines
+    assert f"identity: {identity}" in result.stdout.splitlines()
+
+
+def test_a_change_to_the_code_roots_harness_moves_the_scorer_sha(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    one = _run(_write_stub_root(tmp_path / "one"), files)
+    two = _run(_write_stub_root(tmp_path / "two", scorer_tail="\n# changed\n"), files)
+    first = [line for line in one.stdout.splitlines() if line.startswith("identity: ")]
+    second = [line for line in two.stdout.splitlines() if line.startswith("identity: ")]
+    assert first and second and first != second
 
 
 def test_relation_recall_and_precision_are_the_scorer_sums(tmp_path: Path) -> None:
@@ -738,7 +788,7 @@ def _run_named(
 
 
 def _paired(result: subprocess.CompletedProcess[str]) -> list[str]:
-    return [line for line in result.stdout.splitlines() if line.startswith("[paired ")]
+    return [line for line in _bare(result) if line.startswith("[paired ")]
 
 
 def test_paired_recall_is_the_scorer_sums_over_the_shared_probes(tmp_path: Path) -> None:
@@ -824,7 +874,7 @@ def test_paired_lines_follow_the_expectations_and_precede_the_worksheet(
     out = tmp_path / "worksheet.jsonl"
     result = _with_worksheet(tmp_path, out, "--expect", "a=0.500")
     assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
+    lines = _bare(result)
     holds = lines.index("expect a: 0.500 holds")
     paired = lines.index(_paired(result)[0])
     sheet = next(n for n, line in enumerate(lines) if line.startswith("worksheet a: "))
@@ -971,7 +1021,7 @@ def _run_aligned(
 
 
 def _aligned_line(result: subprocess.CompletedProcess[str], run: str) -> str:
-    hits = [line for line in result.stdout.splitlines() if line.startswith(f"[aligned {run}] ")]
+    hits = [line for line in _bare(result) if line.startswith(f"[aligned {run}] ")]
     assert len(hits) == 1, result.stdout
     return hits[0]
 
@@ -1012,6 +1062,19 @@ def test_the_aligned_line_carries_typing_and_list_only_recall(tmp_path: Path) ->
     )
     # The exact lines are still there, unchanged in form.
     assert "[cand] relation recall: 0.333 (1/3)" in _lines(result, "cand")
+
+
+def test_a_code_root_with_a_pack_names_its_hashes_on_every_figure_line(tmp_path: Path) -> None:
+    from backend.knowledge.ontologies import registry
+
+    files = _aligned_inputs(tmp_path)
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    identity = _identity(_REPO_ROOT, files["gold"], registry.active_pack())
+    assert "pack_rails_hash=none" not in identity
+    lines = _figure_lines(result)
+    assert any(line.startswith("[paired-aligned ") for line in lines)
+    assert all(line.endswith(f" | {identity}") for line in lines), lines
 
 
 def test_a_gold_with_no_flags_and_no_pre_h8_gold_scores_every_relation(tmp_path: Path) -> None:
@@ -1171,7 +1234,7 @@ def test_the_paired_aligned_line_is_second_minus_first(tmp_path: Path) -> None:
         assert bounds is not None
         return f"ci95 [{bounds[0]:+.3f}, {bounds[1]:+.3f}]"
 
-    paired = [line for line in result.stdout.splitlines() if line.startswith("[paired-aligned ")]
+    paired = [line for line in _bare(result) if line.startswith("[paired-aligned ")]
     assert paired == [
         f"[paired-aligned cand|base] recall diff +0.333 {diff_ci('recall')}; "
         f"precision diff +0.333 {diff_ci('precision')}; probes 2 of 2"
