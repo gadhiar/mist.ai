@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_seri
 # ResultStamps.serving_identity, InfoResponse.serving_identity with its
 # components and error, ServiceStatus.serving_identity and
 # CutoverStatus.target_serving_identity, all optional.
+# 1.4.0: additive -- ErrorCode.CANCELLED, the code a request waiting on a
+# cancelled job is answered with. No model gained or lost a field.
 # Not a version: ExtractResponse.turn_plan is optional and left out of the
 # serialized response when None, which it is unless the service runs with its
 # off-by-default turn plan flag. A response without the flag is unchanged, so
@@ -34,7 +36,7 @@ from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_seri
 # pack_prompt_hash and pack_rails_hash on ResultStamps and InfoResponse. Each is
 # optional and left out of the serialized model when None, which it is until
 # the service reports it.
-CONTRACT_VERSION = "1.3.0"
+CONTRACT_VERSION = "1.4.0"
 CONTRACT_MAJOR = 1
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -336,26 +338,33 @@ class ErrorCode(StrEnum):
     MODEL_LOADING = "model_loading"
     UPSTREAM_LLM = "upstream_llm"
     TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
 
 
+# cancelled takes 499, a status no standard assigns, so that no two codes
+# share one: 409, the nearest standard status, is epoch_mismatch's.
 ERROR_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.EPOCH_MISMATCH: 409,
     ErrorCode.CONTRACT_MISMATCH: 422,
     ErrorCode.MODEL_LOADING: 503,
     ErrorCode.UPSTREAM_LLM: 502,
     ErrorCode.TIMEOUT: 504,
+    ErrorCode.CANCELLED: 499,
 }
 
 # Default retryability per code. epoch_mismatch and contract_mismatch are
 # permanent for the request as given (the caller must fix the request, not
 # retry it unchanged); model_loading, upstream_llm, and timeout are
-# transient conditions worth retrying.
+# transient conditions worth retrying. cancelled is retryable because the
+# service stores nothing for a cancelled job: the same job_id, sent again
+# unchanged, runs.
 ERROR_DEFAULT_RETRYABLE: dict[ErrorCode, bool] = {
     ErrorCode.EPOCH_MISMATCH: False,
     ErrorCode.CONTRACT_MISMATCH: False,
     ErrorCode.MODEL_LOADING: True,
     ErrorCode.UPSTREAM_LLM: True,
     ErrorCode.TIMEOUT: True,
+    ErrorCode.CANCELLED: True,
 }
 
 

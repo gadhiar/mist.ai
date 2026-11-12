@@ -451,7 +451,7 @@ class TestInfoReportsTheServingIdentity:
 
         data = (await client.get("/v1/info")).json()
 
-        assert data["contract_version"] == "1.3.0"
+        assert data["contract_version"] == "1.4.0"
         assert data["serving_identity"] == compute_serving_identity(components)
         assert data["serving_identity_components"] == components_dict(components)
         assert data["serving_identity_error"] is None

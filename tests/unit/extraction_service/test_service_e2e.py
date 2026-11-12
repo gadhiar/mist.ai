@@ -346,7 +346,7 @@ class TestInfoServingConfig:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["contract_version"] == "1.3.0"
+        assert data["contract_version"] == "1.4.0"
         # No settings override: the gpt-oss adapter's default mode is in effect.
         assert service_settings.constrained_mode is None
         assert data["constrained_mode"] == "schema"

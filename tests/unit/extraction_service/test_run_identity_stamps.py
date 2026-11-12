@@ -113,7 +113,7 @@ class TestServiceReportsOneIdentity:
         async with await _client_for(built_app) as client:
             data = (await client.get("/v1/info")).json()
 
-        assert data["contract_version"] == "1.3.0"
+        assert data["contract_version"] == "1.4.0"
         assert data["run_identity"] == compute_run_identity(components)
         assert data["run_identity_components"] == dataclasses.asdict(components)
 

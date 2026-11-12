@@ -84,6 +84,7 @@ _ERROR_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.MODEL_LOADING: 503,
     ErrorCode.UPSTREAM_LLM: 502,
     ErrorCode.TIMEOUT: 504,
+    ErrorCode.CANCELLED: 499,
 }
 
 
