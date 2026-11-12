@@ -454,6 +454,66 @@ class TestParseProduced:
             (r["source"], r["type"], r["target"]) for r in out.relationships
         ]
 
+    @pytest.mark.asyncio
+    async def test_parse_produced_runs_both_engine_rails_as_the_normalizer_does(self):
+        # One event of a list under `Harbour weekend`, written by two batches under two
+        # spellings of its id and one name. The near-duplicate merge joins the second
+        # into the first, and the own-context rail then drops the lead-in from the id
+        # that is left. The apply side and the scorer run the same rails over the same
+        # record, so the graph stores the id the scorer scores.
+        from backend.extraction_contract.models import BatchRecordEntry, ExtractionPayload
+        from backend.knowledge.extraction.normalizer import EntityNormalizer
+        from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+
+        first = {"id": "harbour-weekend-ferry-crossing", "name": "Ferry crossing", "type": "Event"}
+        second = {"id": "harbour-weekend-fery-crossing", "name": "Ferry crossing", "type": "Event"}
+        user = {"id": "user", "name": "user", "type": "User"}
+        day = {"id": "2026-05-30", "name": "2026-05-30", "type": "Date"}
+        payload = {
+            "entities": [user, first, second, day],
+            "relationships": [
+                {"source": "user", "target": first["id"], "type": "EXPERIENCED"},
+                {"source": "user", "target": second["id"], "type": "EXPERIENCED"},
+                {"source": second["id"], "target": "2026-05-30", "type": "OCCURRED_ON"},
+            ],
+        }
+        record = [
+            BatchRecordEntry(
+                units=[{"text": text, "context": ["Harbour weekend"], "kind": "list_item"}],
+                context=[],
+                payload=ExtractionPayload(entities=held, relationships=[]),
+                prompt_tokens=120,
+                completion_tokens=60,
+                finish="stop",
+            ).model_dump(mode="json")
+            for text, held in (
+                ("ferry crossing", [user, first]),
+                ("the fery crossing on 30 May", [second, day]),
+            )
+        ]
+        normalizer = EntityNormalizer(embedding_generator=FakeEmbeddingGenerator(), executor=None)
+        out = await normalizer.normalize(
+            ExtractionResult(
+                entities=json.loads(json.dumps(payload["entities"])),
+                relationships=json.loads(json.dumps(payload["relationships"])),
+            ),
+            batch_record=record,
+        )
+
+        ok, entities, _, rels = parse_produced(json.dumps(payload), batch_record=record)
+
+        assert ok is True
+        assert [e.id for e in entities] == ["user", "ferry-crossing-2026-05-30", "2026-05-30"]
+        assert entities == tuple(GoldEntity(id=e["id"], type=e["type"]) for e in out.entities)
+        assert [(r["source"], r["predicate"], r["target"]) for r in rels] == [
+            ("user", "EXPERIENCED", "ferry-crossing-2026-05-30"),
+            ("ferry-crossing-2026-05-30", "OCCURRED_ON", "2026-05-30"),
+        ]
+        assert [(r["source"], r["predicate"], r["target"]) for r in rels] == [
+            (r["source"], r["type"], r["target"]) for r in out.relationships
+        ]
+
     def test_parse_produced_without_a_batch_record_strips_no_context(self):
         content = json.dumps(
             {

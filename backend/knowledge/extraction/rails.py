@@ -8,7 +8,10 @@ name it acts on is a parameter of a rule, so a new ontology version is a new pac
 The phases run in a fixed order, each a separate step:
 
 1. payload: the user anchor and the reserved identities are settled, and a retired type
-   is replaced. A settled entity takes no id rule and no type fallback.
+   is replaced. A settled entity takes no id rule and no type fallback. Then an entity
+   written under the name of an earlier one of its type, its id one edit from that
+   one's, is merged into it (`_merge_near_duplicates`), so every later rule counts
+   the two once.
 2. relation: rules that add or remove an edge (`fan_out`, the relation form of
    `derived_edge`, `edge_suppress`). They read the entities under the ids the model
    wrote, because the endpoints still name those.
@@ -191,7 +194,9 @@ class _State:
     one to the keys the payload phase added before it had an `id` key. Both follow the
     dict object, which is why a `plugin` rule must not return a copy of an entity.
     `named` holds the slug of the `id` field of every entity of the payload as the
-    runner was handed it, read before any phase runs.
+    runner was handed it, read before any phase runs. `merged` maps the id of an
+    entity the near-duplicate merge dropped to the id of the entity kept for it, both
+    as the model wrote them: the batch record still names the dropped id.
     """
 
     row: RailRow
@@ -200,6 +205,7 @@ class _State:
     settled: dict[int, str] = field(default_factory=dict)
     added_keys: dict[int, tuple[str, ...]] = field(default_factory=dict)
     named: frozenset[str] = frozenset()
+    merged: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +351,133 @@ def _set_stored_id(entity: dict, stored: str, added: Sequence[str]) -> None:
         entity[key] = entity.pop(key)
 
 
+def _one_spelling(first: str, second: str) -> bool:
+    """True when two id slugs are equal, or one edit apart and the edit may be a slip.
+
+    An edit is one character added, dropped or replaced; two neighbours swapped are
+    two edits. Where a run of equal characters leaves the place of an added character
+    open, the character is still one value, so the edit names one character, or one
+    pair for a replacement. Two edits are refused, since they tell two things apart
+    more often than they are a slip:
+
+    - one that adds, drops or replaces a digit (`str.isdigit`, either character of a
+      replacement): `sprint-1` and `sprint-12`, `python-3-11` and `python-3-12`;
+    - one that replaces a one-character token, a character with a hyphen or an end of
+      the slug on each side in both slugs: `team-a` and `team-b`, `sam-r` and `sam-t`.
+
+    Two equal slugs have no edit, and neither refusal reads them.
+    """
+    if first == second:
+        return True
+    short, long = sorted((first, second), key=len)
+    if len(long) - len(short) > 1:
+        return False
+    at = next((i for i, (a, b) in enumerate(zip(short, long, strict=False)) if a != b), len(short))
+    if len(short) < len(long):
+        return short[at:] == long[at + 1 :] and not long[at].isdigit()
+    if short[at + 1 :] != long[at + 1 :] or short[at].isdigit() or long[at].isdigit():
+        return False
+    # The two slugs are equal on both sides of the replaced character, so one is read.
+    starts_token = at == 0 or short[at - 1] == "-"
+    ends_token = at == len(short) - 1 or short[at + 1] == "-"
+    return not (starts_token and ends_token and "-" not in (short[at], long[at]))
+
+
+def _name_key(entity: Mapping) -> str:
+    """The display name as the merge compares it: one case, single spaces."""
+    return _WHITESPACE_RE.sub(" ", _display_name(entity)).strip().casefold()
+
+
+def _merge_near_duplicates(state: _State, pack: Pack) -> None:
+    """Merge each entity into the earliest kept entity of its type it is a spelling of.
+
+    The model writes one entity under two spellings of its id in two batches of a
+    turn, and each spelling then holds some of the entity's edges. Two entities are
+    near-duplicates when they have one type, their display names are equal, and the
+    slugs of their `id` fields are one spelling (`_one_spelling`). The name is what
+    says the two are one thing: two ids one letter apart under two names are two
+    things, a `mario` and a `maria`. How the two are read:
+
+    - an id is read as its slug, and a name in one case and with single spaces
+      (`_name_key`). A missing name reads as the `id` field, so an entity with no name
+      is merged only with one whose name or id reads the same;
+    - two neighbouring characters swapped are two edits, and are not merged;
+    - the entities are read in the payload's order. Each is compared with the kept
+      entities of its type, earliest first, and merged into the first it is a
+      near-duplicate of: it is dropped, and every endpoint that names its id then
+      names the kept entity's. So the earlier of two is the earlier in the payload;
+    - an id is merged only into a kept id it is itself one edit from. Of three ids in
+      a chain whose ends are two edits apart, both ends stay when an end comes first,
+      and all three are one entity when the middle comes first;
+    - an edge between the two merged entities would join the kept entity to itself
+      and is dropped. Edges that become copies of one another are left to the dedupe
+      step, where the first wins.
+
+    The kept entity is not changed: its name, type and properties stand, and the
+    dropped entity's are lost.
+
+    These take no part, neither merged nor kept for another:
+
+    - a settled entity, the user anchor or a reserved identity;
+    - an entity of a type an `id_exempt` rule names: such an id is built whole by a
+      rule, so two of them one character apart are two things;
+    - an entity whose `id` is not a non-empty string, which no endpoint can name;
+    - an entity that repeats an `id` already written. It is the entity that first wrote
+      the id: it is dropped with that one when that one is merged, and is otherwise
+      left to the dedupe step.
+
+    The ids compared are the ones the model wrote, so the merge is not a fixed point
+    over the runner's own output: two ids that come within one edit only as stored,
+    after the id phase dropped a leading word or a context from one, are not merged
+    here, and a second run over this run's output may merge them. A replay starts
+    from the cache row, never from stored output.
+    """
+    exempt = _rules(pack).exempt
+    kept: list[dict] = []
+    kept_by_type: dict[str, list[tuple[str, str, str]]] = {}
+    written_ids: set[str] = set()
+    merged: dict[str, str] = {}
+    for entity in state.entities:
+        written = entity.get("id")
+        if not isinstance(written, str) or not written:
+            kept.append(entity)
+            continue
+        if written in written_ids:
+            if written not in merged:
+                kept.append(entity)
+            continue
+        written_ids.add(written)
+        entity_type = str(entity.get("type", ""))
+        if id(entity) in state.settled or entity_type in exempt:
+            kept.append(entity)
+            continue
+        slug, name = canonical_id(written), _name_key(entity)
+        of_type = kept_by_type.setdefault(entity_type, [])
+        into = next(
+            (
+                kept_id
+                for kept_id, kept_slug, kept_name in of_type
+                if name == kept_name and _one_spelling(slug, kept_slug)
+            ),
+            None,
+        )
+        if into is None:
+            of_type.append((written, slug, name))
+            kept.append(entity)
+        else:
+            merged[written] = into
+    if not merged:
+        return
+    relationships: list[dict] = []
+    for relationship in state.relationships:
+        source, target = relationship.get("source"), relationship.get("target")
+        if source != target and merged.get(source, source) == merged.get(target, target):
+            continue
+        relationships.append(relationship)
+    _remap_endpoints(relationships, merged)
+    state.entities, state.relationships, state.merged = kept, relationships, merged
+
+
 def _payload_phase(state: _State, pack: Pack) -> None:
     for entity in state.entities:
         final_id, added = _settle_entity(entity, pack)
@@ -352,6 +485,7 @@ def _payload_phase(state: _State, pack: Pack) -> None:
             state.settled[id(entity)] = final_id
         if added:
             state.added_keys[id(entity)] = added
+    _merge_near_duplicates(state, pack)
     _run_plugin_rules(state, pack, PAYLOAD)
 
 
@@ -444,7 +578,8 @@ def _plan_groups(
 
     A batch belongs to a lead-in when one of its units carries the lead-in in its
     context. The members are the payload's entities of `member_type` that one of those
-    batches' own payloads holds, in the payload's order.
+    batches' own payloads holds, in the payload's order. A batch that holds an id the
+    near-duplicate merge dropped holds the entity kept for it.
     """
     plan = state.row.turn_plan or {}
     groups: list[tuple[Mapping, list[object]]] = []
@@ -460,7 +595,8 @@ def _plan_groups(
             if lead_in not in {_lead_in_key(context) for context in contexts}:
                 continue
             payload = batch.get("payload") or {}
-            in_batches.update(entity.get("id") for entity in payload.get("entities") or ())
+            written = (entity.get("id") for entity in payload.get("entities") or ())
+            in_batches.update(state.merged.get(held, held) for held in written)
         members: list[object] = []
         for entity in state.entities:
             member = entity.get("id")
