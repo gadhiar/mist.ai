@@ -14,7 +14,9 @@ A batch's utterance holds its own units only; a later batch one of whose items
 refers back is shown the earlier units under `EARLIER_ITEMS_HEADING`, for
 reference only. An utterance without structure is one batch, sent exactly as
 before the list pass existed. Every Stage 2 call leaves one entry in the
-response's `batch_record`, and a turn with no unit left makes no model call.
+response's `batch_record`. A turn with no unit left makes no plan call and no
+Stage 2 call; its scope call is made, and so is its derivation call when the
+request asks for one.
 
 With `ServiceSettings.turn_plan` on, a structured utterance first gets one
 plan call over all of its units (`backend.extraction_service.turn_plan`),
@@ -806,16 +808,13 @@ class ExtractionEngine:
             turn_index=req.turn_index,
         )
 
-        # The pack's item filters run on the split units before any model call:
-        # a turn they leave no unit of is answered with an empty payload and no
-        # scope, plan or Stage 2 call, since there is nothing to extract.
+        # Every turn makes its scope call: the label is stored on the cache row
+        # and read after Stage 2 too. The pack's item filters run on the split
+        # units before Stage 2, and a turn they leave no unit of makes no plan
+        # or Stage 2 call and is answered with an empty payload.
+        scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
         units = filter_units(split_structured(pre_processed.original_text), self._pack)
-        if units:
-            scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
-            stage2 = await self._run_extraction(pre_processed, units, warnings)
-        else:
-            scope_out, scope_ms = ScopeOut(label="unknown", confidence=0.0), None
-            stage2 = _Stage2Run()
+        stage2 = await self._run_extraction(pre_processed, units, warnings)
         payload, merge_warnings = merge_payloads(stage2.payloads)
         warnings.extend(merge_warnings)
         derivation_out, derive_ms = await self._run_derivation(req, warnings)

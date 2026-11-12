@@ -332,7 +332,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-12-r9",
-        code_identity="ci1-28bb65ba49aa1bd5b1f51eba0584989cdbc79123a621dcf2f5b31ac217070806",
+        code_identity="ci1-05e08807f788c4e062ffd6bee50b85bbd87d307961131fbfb1f1c8dfc3456a7c",
         date="2026-11-12",
         reason=(
             "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
@@ -342,8 +342,8 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "prompt_sha256, and any other batch is shown none; a batch ends where the "
             "lead-in or heading changes; each Stage 2 call leaves a batch record entry on "
             "the response; the pack's `unchecked-goals` item filter drops an unchecked item "
-            "under no goal word, and a turn with no unit left makes no scope, plan or "
-            "Stage 2 call. Re-extracts history."
+            "under no goal word, and a turn with no unit left makes its scope call and no "
+            "plan or Stage 2 call. Re-extracts history."
         ),
     ),
 )
