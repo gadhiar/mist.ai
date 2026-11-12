@@ -1316,3 +1316,100 @@ def test_a_scorer_without_aligned_scoring_prints_no_aligned_line(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     assert "[aligned" not in result.stdout
     assert "[paired-aligned" not in result.stdout
+
+
+# --- the headline and the model-written column (plan v15, T50 Acceptance 2) -------------------
+#
+# The candidate's reorder id and typo id are pairs of kinds 6 and 7, so the headline, which
+# counts kinds 1 to 4 only, finds neither of its syn-01 relations. The pack at this checkout
+# has no relation-phase rule, so the model-written column equals the headline here; the
+# scorer's own tests pin a column that differs.
+
+_CAND_HEADLINE = {"syn-01-list-tools": (0, 2, 2), "syn-02-prose": (1, 0, 0)}
+_BASE_HEADLINE = {"syn-01-list-tools": (2, 0, 0), "syn-02-prose": (1, 0, 0)}
+
+
+def _with_fields(path: Path, **fields: object) -> None:
+    """Rewrite a raw file with `fields` in every row's response."""
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["response"].update(fields)
+    _jsonl(path, rows)
+
+
+def _column_line(result: subprocess.CompletedProcess[str], prefix: str) -> str:
+    hits = [line for line in _bare(result) if line.startswith(prefix)]
+    assert len(hits) == 1, result.stdout
+    return hits[0]
+
+
+def _diff_ci(first: dict, second: dict, kind: str) -> str:
+    bounds = _bootstrap.cluster_bootstrap_paired_difference_ci(
+        first, second, n_replicates=10_000, seed=0, confidence=0.95, kind=kind
+    )
+    assert bounds is not None
+    return f"ci95 [{bounds[0]:+.3f}, {bounds[1]:+.3f}]"
+
+
+def _recorded_inputs(tmp_path: Path) -> dict[str, Path]:
+    files = _aligned_inputs(tmp_path)
+    for name in ("cand", "base"):
+        _with_fields(files[name], batch_record=[])
+    return files
+
+
+def test_each_run_prints_the_headline_and_the_model_written_column(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand"])
+    assert result.returncode == 0, result.stderr
+    figures = (
+        f"recall 0.333 (1/3) {_ci(_CAND_HEADLINE, 'recall')}; "
+        f"precision 0.333 (1/3) {_ci(_CAND_HEADLINE, 'precision')}; "
+        f"f1 0.333 {_ci(_CAND_HEADLINE, 'f1')}"
+    )
+    assert _column_line(result, "[exact k1-4 cand] ") == f"[exact k1-4 cand] {figures}"
+    assert _column_line(result, "[model-written cand] ") == f"[model-written cand] {figures}"
+    # The aligned figures stay beside both columns.
+    aligned = _aligned_line(result, "cand").removeprefix("[aligned cand] ")
+    assert _column_line(result, "[aligned model-written cand] ") == (
+        f"[aligned model-written cand] {aligned}"
+    )
+    assert _column_line(result, "[relation rails cand] ") == (
+        "[relation rails cand] relation_rails_added=0 relation_rails_removed=0 "
+        "found_only_by_relation_rails=0"
+    )
+
+
+def test_each_pair_prints_both_columns_with_paired_intervals(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    diffs = (
+        f"recall diff +0.667 {_diff_ci(_CAND_HEADLINE, _BASE_HEADLINE, 'recall')}; "
+        f"precision diff +0.667 {_diff_ci(_CAND_HEADLINE, _BASE_HEADLINE, 'precision')}; "
+        f"f1 diff +0.667 {_diff_ci(_CAND_HEADLINE, _BASE_HEADLINE, 'f1')}; probes 2 of 2"
+    )
+    assert _column_line(result, "[paired-exact k1-4 ") == f"[paired-exact k1-4 cand|base] {diffs}"
+    assert _column_line(result, "[paired-model-written ") == (
+        f"[paired-model-written cand|base] {diffs}"
+    )
+    # No `[paired ` filter picks up either new line.
+    assert len(_paired(result)) == 1
+
+
+def test_the_new_lines_carry_the_identity(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    new = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith(("[exact k1-4 ", "[model-written ", "[relation rails ", "[paired-"))
+    ]
+    assert len(new) == 9, result.stdout
+    assert all(_IDENTITY_MARK in line for line in new)
+
+
+def test_a_scorer_without_aligned_scoring_prints_neither_column(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[exact k1-4" not in result.stdout
+    assert "model-written" not in result.stdout

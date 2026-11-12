@@ -261,6 +261,7 @@ def parse_produced(
     batch_record: list[dict[str, Any]] | None = None,
     scope: str | None = None,
     turn_plan: Mapping[str, Any] | None = None,
+    relation_rails: bool = True,
 ) -> tuple[bool, tuple[GoldEntity, ...], dict[str, str], tuple[dict[str, Any], ...]]:
     """Parse a raw extraction-LLM JSON string into the entities and rels the graph stores.
 
@@ -277,6 +278,8 @@ def parse_produced(
         scope: The row's scope label; None for a row that was not classified.
         turn_plan: The row's plan, as its payload or as the stored record that wraps it;
             None for a row without a plan.
+        relation_rails: False runs the rails with the relation phase skipped: the
+            model-written column, which scores the edges the model wrote.
     """
     parsed: Any = None
     try:
@@ -299,7 +302,9 @@ def parse_produced(
         batch_record=copy.deepcopy(batch_record),
         turn_plan=copy.deepcopy(turn_plan),
     )
-    stored_entities, stored_rels = rails.run_rails(row, registry.active_pack())
+    stored_entities, stored_rels = rails.run_rails(
+        row, registry.active_pack(), relation_rails=relation_rails
+    )
     entities: list[GoldEntity] = []
     type_by_id: dict[str, str] = {}
     for e in stored_entities:
@@ -324,7 +329,9 @@ def parse_produced(
     return True, tuple(entities), type_by_id, tuple(rels)
 
 
-def produced_from_response(utterance: str, response: Mapping[str, Any]) -> Produced:
+def produced_from_response(
+    utterance: str, response: Mapping[str, Any], *, relation_rails: bool = True
+) -> Produced:
     """The scorer's `Produced` for one extraction-service response, as a raw record holds it.
 
     The rails are handed the row the service recorded for the turn: the payload, the
@@ -335,6 +342,7 @@ def produced_from_response(utterance: str, response: Mapping[str, Any]) -> Produ
     Args:
         utterance: The probe's utterance; the index key is its normalised form.
         response: The response dump, with a `payload` object.
+        relation_rails: False gives the model-written column's `Produced`.
     """
     scope = response.get("scope")
     label = scope.get("label") if isinstance(scope, Mapping) else None
@@ -343,6 +351,7 @@ def produced_from_response(utterance: str, response: Mapping[str, Any]) -> Produ
         batch_record=response.get("batch_record"),
         scope=label if isinstance(label, str) else None,
         turn_plan=response.get("turn_plan"),
+        relation_rails=relation_rails,
     )
     key = _norm_ws(utterance)
     return Produced(
@@ -416,6 +425,12 @@ class Report:
     aligned_rel_tp: int = 0
     aligned_rel_fp: int = 0
     aligned_rel_fn: int = 0
+    # The headline, `[exact k1-4]`: relations over the aligned pairs of kinds 1 to 4 only
+    # (exact, alternative, event-date, metric), the ids the graph stores as one node, so a
+    # relation found through an id the graph keeps apart is not counted (plan v14, h.4).
+    headline_rel_tp: int = 0
+    headline_rel_fp: int = 0
+    headline_rel_fn: int = 0
     # Counted pairs of the kinds a rail or gold makes equal (exact, alternative, event-date,
     # metric), and all counted pairs; their ratio is `id_agreement`.
     id_rail_pairs: int = 0
@@ -486,6 +501,22 @@ class Report:
         """F1 of the aligned relationship counts, 1.0 when there is nothing to count."""
         denominator = 2 * self.aligned_rel_tp + self.aligned_rel_fp + self.aligned_rel_fn
         return 2 * self.aligned_rel_tp / denominator if denominator else 1.0
+
+    @property
+    def headline_rel_precision(self) -> float:
+        """Relationship precision over the aligned pairs of kinds 1 to 4."""
+        return self._pr(self.headline_rel_tp, self.headline_rel_fp, self.headline_rel_fn)[0]
+
+    @property
+    def headline_rel_recall(self) -> float:
+        """Relationship recall over the aligned pairs of kinds 1 to 4."""
+        return self._pr(self.headline_rel_tp, self.headline_rel_fp, self.headline_rel_fn)[1]
+
+    @property
+    def headline_rel_f1(self) -> float:
+        """F1 of the headline counts, 1.0 when there is nothing to count."""
+        denominator = 2 * self.headline_rel_tp + self.headline_rel_fp + self.headline_rel_fn
+        return 2 * self.headline_rel_tp / denominator if denominator else 1.0
 
     @property
     def id_agreement(self) -> float:
@@ -755,6 +786,17 @@ def score_run(
         report.aligned_rel_tp += len(aligned.found)
         report.aligned_rel_fp += len(aligned.extra)
         report.aligned_rel_fn += len(aligned.missed)
+        # Kinds 1 to 4 rank first in the alignment, so the pairs of those kinds are the
+        # ones an alignment of those kinds alone would make.
+        headline = match_relations(
+            sorted(gold_rel_keys),
+            sorted(prod_rel_keys),
+            [pair for pair in aligned_pairs if pair.kind in EXCLUSION_EXEMPT_KINDS],
+            predicate_alternatives=predicate_alternatives,
+        )
+        report.headline_rel_tp += len(headline.found)
+        report.headline_rel_fp += len(headline.extra)
+        report.headline_rel_fn += len(headline.missed)
 
         for gr in probe.relationships:
             bucket = report.assertion_kind_buckets[gr.assertion_kind]
@@ -818,9 +860,57 @@ def score_run(
                 "aligned_rel_fps": sorted(list(t) for t in aligned.extra),
                 "aligned_rel_fns": sorted(list(t) for t in aligned.missed),
                 "aligned_pairs": [[p.gold_id, p.produced_id, p.kind] for p in aligned_pairs],
+                "headline_rel_fps": sorted(list(t) for t in headline.extra),
+                "headline_rel_fns": sorted(list(t) for t in headline.missed),
             }
         )
     return report
+
+
+RELATION_RAILS_COUNTS = (
+    "relation_rails_added",
+    "relation_rails_removed",
+    "found_only_by_relation_rails",
+)
+
+
+def relation_rails_counts(
+    probes: list[GoldProbe],
+    headline_index: Mapping[str, Produced],
+    model_written_index: Mapping[str, Produced],
+) -> dict[str, int]:
+    """What the relation rails did to a run, from its two columns (plan v15, Interfaces).
+
+    `relation_rails_added` and `relation_rails_removed` count the produced relations one
+    column holds and the other lacks, over the probes' utterances; the two columns share
+    every rail but the relation phase, so their ids agree. `found_only_by_relation_rails`
+    counts the gold relations the headline finds and the model-written column misses.
+
+    Args:
+        probes: The gold probes.
+        headline_index: The run's index with every rail run.
+        model_written_index: The same rows with the relation rails switched off.
+    """
+
+    def keys(index: Mapping[str, Produced], utterance: str) -> set[tuple[str, str, str]]:
+        produced = index.get(utterance)
+        if produced is None:
+            return set()
+        return {(r["source"], r["predicate"], r["target"]) for r in produced.relationships}
+
+    added = removed = 0
+    for utterance in dict.fromkeys(_norm_ws(probe.utterance) for probe in probes):
+        with_rails = keys(headline_index, utterance)
+        without = keys(model_written_index, utterance)
+        added += len(with_rails - without)
+        removed += len(without - with_rails)
+    headline = score_run(probes, dict(headline_index))
+    model_written = score_run(probes, dict(model_written_index))
+    found_only = sum(
+        len({tuple(k) for k in m["headline_rel_fns"]} - {tuple(k) for k in h["headline_rel_fns"]})
+        for h, m in zip(headline.per_probe, model_written.per_probe, strict=True)
+    )
+    return dict(zip(RELATION_RAILS_COUNTS, (added, removed, found_only), strict=True))
 
 
 ENTITY_PRECISION_GATE = 0.90

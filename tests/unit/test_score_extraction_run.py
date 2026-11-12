@@ -1714,3 +1714,101 @@ class TestAlignedScoring:
         assert r.id_agreement == 1.0
         assert r.alignment_kinds == {}
         assert r.pending_pairs == []
+
+
+class TestTheHeadlineAndTheModelWrittenColumn:
+    """Plan v15, T50 Acceptance 2: `[exact k1-4]`, and the model-written column beside it.
+
+    The headline counts a relation found only through a pair of alignment kinds 1 to 4
+    (exact, alternative, event-date, metric), the ids the graph stores as one node. The
+    model-written column scores the same payload with the relation rails switched off.
+    """
+
+    def test_an_n1_pair_finds_nothing_on_the_headline(self):
+        r = score_run([_ACME], _acme_index("the-acme-corp"))
+        assert (r.headline_rel_tp, r.headline_rel_fp, r.headline_rel_fn) == (0, 1, 1)
+        assert r.per_probe[0]["headline_rel_fns"] == [["user", "WORKS_AT", "acme-corp"]]
+        assert r.per_probe[0]["headline_rel_fps"] == [["user", "WORKS_AT", "the-acme-corp"]]
+        assert (r.aligned_rel_tp, r.aligned_rel_fn) == (1, 0)
+
+    def test_an_exact_pair_finds_the_relation_on_the_headline(self):
+        r = score_run([_ACME], _acme_index("acme-corp"))
+        assert (r.headline_rel_tp, r.headline_rel_fp, r.headline_rel_fn) == (1, 0, 0)
+        assert (r.headline_rel_recall, r.headline_rel_precision, r.headline_rel_f1) == (
+            1.0,
+            1.0,
+            1.0,
+        )
+
+    def test_an_empty_report_takes_the_vacuous_headline_defaults(self):
+        from eval_harness.score_extraction_run import Report
+
+        r = Report()
+        assert (r.headline_rel_recall, r.headline_rel_precision, r.headline_rel_f1) == (
+            1.0,
+            1.0,
+            1.0,
+        )
+
+    @pytest.mark.parametrize("relation_rails", [True, False])
+    def test_the_switch_reaches_the_rails(self, monkeypatch, relation_rails):
+        import eval_harness.score_extraction_run as scorer
+
+        seen = []
+        real = scorer.rails.run_rails
+
+        def spy(row, pack, **switches):
+            seen.append(switches.get("relation_rails", True))
+            return real(row, pack, **switches)
+
+        monkeypatch.setattr(scorer.rails, "run_rails", spy)
+        response = {"payload": {"entities": [], "relationships": []}}
+        scorer.produced_from_response("I use Rust", response, relation_rails=relation_rails)
+        assert seen == [relation_rails]
+
+    def test_the_default_parse_runs_every_rail(self, monkeypatch):
+        import eval_harness.score_extraction_run as scorer
+
+        seen = []
+        real = scorer.rails.run_rails
+
+        def spy(row, pack, **switches):
+            seen.append(switches.get("relation_rails", True))
+            return real(row, pack, **switches)
+
+        monkeypatch.setattr(scorer.rails, "run_rails", spy)
+        scorer.parse_produced('{"entities": [], "relationships": []}')
+        assert seen == [True]
+
+    def test_the_three_counts_compare_the_columns(self):
+        from eval_harness.score_extraction_run import relation_rails_counts
+
+        def index(edges):
+            entities = [
+                GoldEntity("user", "User"),
+                GoldEntity("acme-corp", "Organization"),
+                GoldEntity("rust", "Technology"),
+            ]
+            return {
+                _ACME.utterance: _produced(
+                    _ACME.utterance,
+                    entities,
+                    [_edge(*edge) for edge in edges],
+                    {e.id: e.type for e in entities},
+                )
+            }
+
+        # A relation rail added the gold edge and removed the model's USES edge.
+        headline = index([("user", "WORKS_AT", "acme-corp")])
+        model_written = index([("user", "USES", "rust")])
+
+        assert relation_rails_counts([_ACME], headline, model_written) == {
+            "relation_rails_added": 1,
+            "relation_rails_removed": 1,
+            "found_only_by_relation_rails": 1,
+        }
+        assert relation_rails_counts([_ACME], headline, headline) == {
+            "relation_rails_added": 0,
+            "relation_rails_removed": 0,
+            "found_only_by_relation_rails": 0,
+        }

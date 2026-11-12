@@ -51,6 +51,22 @@ a row, so a blind adjudicator can read them pooled; it is refused, before anythi
 or written, for a gold whose file name starts with `heldout-` or `selection-`, and for a
 pairs file that exists. A scorer without aligned scoring prints neither line and refuses both options.
 
+When the scorer also has column scoring (plan v15, T50: `produced_from_response` takes
+`relation_rails`), each run then prints the headline, the model-written column, that
+column's aligned figures and what the relation rails did:
+
+    [exact k1-4 X] recall R (tp/n) ci95 [lo, hi]; precision P (tp/m) ci95 [lo, hi]; f1 F
+    ci95 [lo, hi]
+    [model-written X] (the same figures, the rows scored with the relation rails off)
+    [aligned model-written X] (the aligned line's figures for that column)
+    [relation rails X] relation_rails_added=A relation_rails_removed=B
+    found_only_by_relation_rails=C
+
+The headline counts only relations found through pairs of alignment kinds 1 to 4, the ids
+the graph stores as one node. Each pair of runs then prints, after the `[paired-aligned`
+line, `[paired-exact k1-4 X|Y]` and `[paired-model-written X|Y]`: recall, precision and F1
+diffs, second minus first, with paired cluster-bootstrap intervals.
+
 With two or more runs, one line per unordered pair of `--run` names, in `--run` order (n1|n2,
 n1|n3, ..., then n2|n3 and so on), compares the runs on the same probes:
 
@@ -325,6 +341,7 @@ class ScoredRun:
     fps: dict[str, list[Key]]
     aligned: AlignedScore | None = None
     pending_pairs: tuple[dict[str, object], ...] = ()
+    columns: Columns | None = None
 
 
 def _ci(bounds: tuple[float, float] | None, *, signed: bool = False) -> str:
@@ -391,13 +408,95 @@ class AlignedPairScore:
         )
 
 
+HEADLINE = "exact k1-4"
+MODEL_WRITTEN = "model-written"
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnScore:
+    """One run's relations in one column: recall, precision and F1 with their intervals."""
+
+    column: str
+    name: str
+    recall: Ratio
+    recall_ci: tuple[float, float] | None
+    precision: Ratio
+    precision_ci: tuple[float, float] | None
+    f1: float
+    f1_ci: tuple[float, float] | None
+
+    def line(self) -> str:
+        """The run's line in the column, prefixed `[<column> <name>] `."""
+        return (
+            f"[{self.column} {self.name}] recall {self.recall} {_ci(self.recall_ci)}; "
+            f"precision {self.precision} {_ci(self.precision_ci)}; "
+            f"f1 {self.f1:.3f} {_ci(self.f1_ci)}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnPairScore:
+    """Second minus first of two runs' recall, precision and F1 in one column."""
+
+    column: str
+    first: str
+    second: str
+    recall_diff: float
+    recall_ci: tuple[float, float] | None
+    precision_diff: float
+    precision_ci: tuple[float, float] | None
+    f1_diff: float
+    f1_ci: tuple[float, float] | None
+    shared_probes: int
+    total_probes: int
+
+    def line(self) -> str:
+        """The pair's line, prefixed `[paired-<column> ` so no `[paired ` filter matches it."""
+
+        def diff(value: float) -> str:
+            return "n/a" if math.isnan(value) else f"{value:+.3f}"
+
+        return (
+            f"[paired-{self.column} {self.first}|{self.second}] recall diff "
+            f"{diff(self.recall_diff)} {_ci(self.recall_ci, signed=True)}; precision diff "
+            f"{diff(self.precision_diff)} {_ci(self.precision_ci, signed=True)}; f1 diff "
+            f"{diff(self.f1_diff)} {_ci(self.f1_ci, signed=True)}; probes "
+            f"{self.shared_probes} of {self.total_probes}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Columns:
+    """One run's headline and model-written columns, and what the relation rails did."""
+
+    model_index: dict[str, _Produced]
+    headline: ColumnScore
+    model_written: ColumnScore
+    model_written_aligned: AlignedScore
+    rails_counts: dict[str, int]
+
+    def lines(self) -> list[str]:
+        """The headline, then the model-written column with its aligned figures, then the counts."""
+        counts = " ".join(f"{field}={count}" for field, count in self.rails_counts.items())
+        return [
+            self.headline.line(),
+            self.model_written.line(),
+            self.model_written_aligned.line(),
+            f"[relation rails {self.headline.name}] {counts}",
+        ]
+
+
 @dataclass(frozen=True, slots=True)
 class Aligned:
-    """The modules and inputs the aligned lines need, loaded only for a scorer that has them."""
+    """The modules and inputs the aligned lines need, loaded only for a scorer that has them.
+
+    `columns` is True for a scorer that also has the headline and the model-written column.
+    """
 
     bootstrap: ModuleType
     report: ModuleType
     accepted: frozenset[tuple[str, str, str]]
+    columns: bool = False
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -491,6 +590,16 @@ def _read_accepted(paths: list[Path]) -> frozenset[tuple[str, str, str]]:
 
 def _has_aligned_scoring(scorer: ModuleType) -> bool:
     return "accepted_pairs" in inspect.signature(scorer.score_run).parameters
+
+
+def _has_column_scoring(scorer: ModuleType) -> bool:
+    """True for a scorer with the headline and the model-written column (plan v15, T50)."""
+    produce = getattr(scorer, "produced_from_response", None)
+    return (
+        produce is not None
+        and "relation_rails" in inspect.signature(produce).parameters
+        and hasattr(scorer, "relation_rails_counts")
+    )
 
 
 def _worksheet_target(args: argparse.Namespace, runs: dict[str, Path]) -> Path | None:
@@ -684,9 +793,14 @@ def _read_raw(name: str, path: Path) -> dict[str, RawRow]:
 
 
 def _produced_index(
-    scorer: ModuleType, path: Path, rows: dict[str, RawRow]
+    scorer: ModuleType, path: Path, rows: dict[str, RawRow], *, relation_rails: bool = True
 ) -> dict[str, _Produced]:
-    """The bench probe's `build_produced_index`, fed from raw rows instead of live cases."""
+    """The bench probe's `build_produced_index`, fed from raw rows instead of live cases.
+
+    `relation_rails=False` gives the model-written column's index; only a scorer with
+    column scoring is asked for it.
+    """
+    switch = {} if relation_rails else {"relation_rails": False}
     index: dict[str, _Produced] = {}
     for probe_id, row in rows.items():
         response = row.get("response")
@@ -696,7 +810,7 @@ def _produced_index(
             raise InputError(f"{path}: probe {probe_id} has a response with no payload object")
         if hasattr(scorer, "produced_from_response"):
             # The rails read the row's scope label, batch record and plan, as on the service.
-            produced = scorer.produced_from_response(row["utterance"], response)
+            produced = scorer.produced_from_response(row["utterance"], response, **switch)
             index[produced.utterance] = produced
             continue
         ok, entities, type_by_id, rels = scorer.parse_produced(json.dumps(response["payload"]))
@@ -763,6 +877,72 @@ def _score_run(
         fps={r["tag"]: [_key(k) for k in r["rel_fps"]] for r in report.per_probe},
         aligned=None if aligned is None else _aligned_score(aligned, name, report),
         pending_pairs=() if aligned is None else tuple(report.pending_pairs),
+        columns=(
+            _columns(scorer, aligned, name, path, rows, probes, index, report)
+            if aligned is not None and aligned.columns
+            else None
+        ),
+    )
+
+
+def _headline_counts(per_probe: Sequence[Mapping]) -> dict[str, tuple[int, int, int]]:
+    """(tp, fp, fn) per probe tag on the headline, as the bootstrap reads aligned counts."""
+    return {
+        str(probe["tag"]): (
+            probe["gold_relationships"] - len(probe["headline_rel_fns"]),
+            len(probe["headline_rel_fps"]),
+            len(probe["headline_rel_fns"]),
+        )
+        for probe in per_probe
+    }
+
+
+class _HeadlineReport(Protocol):
+    """A scorer `Report` with the headline counts, as far as this script reads it."""
+
+    per_probe: list[dict[str, object]]
+    headline_rel_recall: float
+    headline_rel_precision: float
+    headline_rel_f1: float
+
+
+def _column_score(aligned: Aligned, column: str, name: str, report: _HeadlineReport) -> ColumnScore:
+    """A report's headline counts, as one column's line, intervals by the cluster bootstrap."""
+    counts = _headline_counts(report.per_probe)
+    tp = sum(c[0] for c in counts.values())
+    fp = sum(c[1] for c in counts.values())
+    fn = sum(c[2] for c in counts.values())
+    return ColumnScore(
+        column=column,
+        name=name,
+        recall=Ratio(report.headline_rel_recall, tp, tp + fn),
+        recall_ci=_bootstrap_ci(aligned, counts, "recall"),
+        precision=Ratio(report.headline_rel_precision, tp, tp + fp),
+        precision_ci=_bootstrap_ci(aligned, counts, "precision"),
+        f1=report.headline_rel_f1,
+        f1_ci=_bootstrap_ci(aligned, counts, "f1"),
+    )
+
+
+def _columns(
+    scorer: ModuleType,
+    aligned: Aligned,
+    name: str,
+    path: Path,
+    rows: dict[str, RawRow],
+    probes: list[_Probe],
+    index: dict[str, _Produced],
+    report: _HeadlineReport,
+) -> Columns:
+    """The run's headline, and the same rows scored with the relation rails switched off."""
+    model_index = _produced_index(scorer, path, rows, relation_rails=False)
+    model_report = scorer.score_run(probes, model_index, accepted_pairs=aligned.accepted)
+    return Columns(
+        model_index=model_index,
+        headline=_column_score(aligned, HEADLINE, name, report),
+        model_written=_column_score(aligned, MODEL_WRITTEN, name, model_report),
+        model_written_aligned=_aligned_score(aligned, f"{MODEL_WRITTEN} {name}", model_report),
+        rails_counts=dict(scorer.relation_rails_counts(probes, index, model_index)),
     )
 
 
@@ -884,6 +1064,77 @@ def _paired_aligned_scores(
                     total_probes=len(probes),
                 )
             )
+    return pairs
+
+
+def _paired_column_score(
+    scorer: ModuleType,
+    aligned: Aligned,
+    column: str,
+    pair: tuple[str, str],
+    shared: list[_Probe],
+    indexes: tuple[dict[str, _Produced], dict[str, _Produced]],
+    total: int,
+) -> ColumnPairScore:
+    """Second minus first in one column over the shared probes, with paired intervals."""
+    one = scorer.score_run(shared, indexes[0], accepted_pairs=aligned.accepted)
+    two = scorer.score_run(shared, indexes[1], accepted_pairs=aligned.accepted)
+    one_counts = _headline_counts(one.per_probe)
+    two_counts = _headline_counts(two.per_probe)
+
+    def interval(kind: str) -> tuple[float, float] | None:
+        result: tuple[float, float] | None = (
+            aligned.bootstrap.cluster_bootstrap_paired_difference_ci(
+                one_counts,
+                two_counts,
+                n_replicates=BOOTSTRAP_REPLICATES,
+                seed=BOOTSTRAP_SEED,
+                confidence=BOOTSTRAP_CONFIDENCE,
+                kind=kind,
+            )
+        )
+        return result
+
+    def diff(field: str) -> float:
+        return math.nan if not shared else getattr(two, field) - getattr(one, field)
+
+    return ColumnPairScore(
+        column=column,
+        first=pair[0],
+        second=pair[1],
+        recall_diff=diff("headline_rel_recall"),
+        recall_ci=interval("recall"),
+        precision_diff=diff("headline_rel_precision"),
+        precision_ci=interval("precision"),
+        f1_diff=diff("headline_rel_f1"),
+        f1_ci=interval("f1"),
+        shared_probes=len(shared),
+        total_probes=total,
+    )
+
+
+def _paired_columns(
+    scorer: ModuleType, aligned: Aligned, probes: list[_Probe], runs: dict[str, ScoredRun]
+) -> list[ColumnPairScore]:
+    """Each unordered pair in `--run` order: the headline, then the model-written column."""
+    names = list(runs)
+    completed = {name: _completed(probes, run) for name, run in runs.items()}
+    pairs: list[ColumnPairScore] = []
+    for i, first in enumerate(names):
+        for second in names[i + 1 :]:
+            shared = [p for p in probes if p.tag in completed[first] & completed[second]]
+            one, two = runs[first].columns, runs[second].columns
+            if one is None or two is None:
+                continue
+            for column, indexes in (
+                (HEADLINE, (runs[first].index, runs[second].index)),
+                (MODEL_WRITTEN, (one.model_index, two.model_index)),
+            ):
+                pairs.append(
+                    _paired_column_score(
+                        scorer, aligned, column, (first, second), shared, indexes, len(probes)
+                    )
+                )
     return pairs
 
 
@@ -1047,7 +1298,12 @@ def _run(argv: Sequence[str] | None) -> int:
     classifier = _import(CLASSIFIER_MODULE)
     aligned: Aligned | None = None
     if _has_aligned_scoring(scorer):
-        aligned = Aligned(_import(BOOTSTRAP_MODULE), _import(REPORT_MODULE), accepted)
+        aligned = Aligned(
+            _import(BOOTSTRAP_MODULE),
+            _import(REPORT_MODULE),
+            accepted,
+            columns=_has_column_scoring(scorer),
+        )
     elif pairs_targets or args.accepted_pairs:
         raise InputError(
             "the code root's scorer has no aligned scoring, which --pairs-out and "
@@ -1075,12 +1331,14 @@ def _run(argv: Sequence[str] | None) -> int:
     ]
     pairs: list[PairScore] = []
     aligned_pairs: list[AlignedPairScore] = []
+    column_pairs: list[ColumnPairScore] = []
     by_name = {name: run for name, (_, run) in scored.items()}
     prior: PriorScores | None = None
     if not failed:
         pairs = _paired_scores(scorer, probes, by_name)
         if aligned is not None:
             aligned_pairs = _paired_aligned_scores(scorer, aligned, probes, by_name)
+            column_pairs = _paired_columns(scorer, aligned, probes, by_name)
         if args.prior_code_root is not None:
             prior = _prior_scores(args, runs)
     lines: list[dict[str, object]] = []
@@ -1103,6 +1361,9 @@ def _run(argv: Sequence[str] | None) -> int:
         aligned_score = by_name[name].aligned
         if aligned_score is not None:
             say(aligned_score.line())
+        columns = by_name[name].columns
+        for line in [] if columns is None else columns.lines():
+            say(line)
     print()
     if failed:
         for line in failed:
@@ -1114,6 +1375,8 @@ def _run(argv: Sequence[str] | None) -> int:
         say(pair.line())
     for aligned_pair in aligned_pairs:
         say(aligned_pair.line())
+    for column_pair in column_pairs:
+        say(column_pair.line())
     if prior is not None:
         for name in runs:
             say(_scorer_effect_line(name, scores[name], prior))
