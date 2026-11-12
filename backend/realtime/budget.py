@@ -9,6 +9,7 @@ as an engine failure.
 """
 
 import dataclasses
+import json
 import math
 import posixpath
 import re
@@ -18,6 +19,8 @@ from types import MappingProxyType
 from typing import TypeVar
 
 from src.multimodal.voice_profile import DEFAULT_VOICE_PROFILE
+
+from .protocol import MAX_WAKE_BACKLOG_MS
 
 _T = TypeVar("_T")
 
@@ -30,8 +33,9 @@ class VoiceLatencyBudget:
     `transport_playback_ms` (`STAGE_FIELDS`). Every row after it is a separate target outside
     that sum: `total_p90_ms`, `tool_call_ms` and `barge_in_reaction_ms`, then the five screen
     and caption targets from `wake_screen_ms` to `event_to_pixel_ms`, which time what the user
-    sees rather than a step of the reply. `preset` travels with the figures so
-    `turn_metrics.budget.preset` can say which preset a turn was judged against.
+    sees rather than a step of the reply. `wake_screen_ms` is wake to screen, server side: the
+    name's end, estimated, to `attend` or `listen` sent (G6). `preset` travels with the figures
+    so `turn_metrics.budget.preset` can say which preset a turn was judged against.
     """
 
     preset: str
@@ -61,9 +65,10 @@ BUDGET_FIELDS: tuple[str, ...] = tuple(
 STAGE_FIELDS: tuple[str, ...] = BUDGET_FIELDS[:7]
 """The seven serial stages whose sum is `total_p50_ms`."""
 
-# The screen and caption targets, the same in every preset: wake to screen, caption lag behind
-# speech, speech-to-screen skew, a spoken screen command, and a client event to its pixels.
-_SCREEN_TARGETS = (300, 500, 150, 600, 50)
+# The screen and caption targets, the same in every preset: wake to screen, server side (the
+# name's end, estimated, to `attend` or `listen` sent, G6), caption lag behind speech,
+# speech-to-screen skew, a spoken screen command, and a client event to its pixels.
+_SCREEN_TARGETS = (205, 500, 150, 600, 50)
 
 
 def _preset(name: str, *rows: int) -> VoiceLatencyBudget:
@@ -209,7 +214,10 @@ class PlacementConfig:
     loads nothing, so that capability is off until the adapters set a default. Model settings
     are `<repo>@<revision>` for STT and TTS and `<repo>@<revision>:<file>` for the ONNX engines,
     so every weight is pinned, and every weight is read under `models_dir`. `release_timeout_s`
-    bounds how long a GPU release waits for running jobs to stop.
+    bounds how long a GPU release waits for running jobs to stop. `kws_model` is the name
+    spotter's model id, the same id form, read from `<models_dir>/speech/wake/<id>/`; `None`
+    turns the server spotter off. The spotter runs on the CPU only, with `kws_threads` threads,
+    so it has no device setting.
     """
 
     vad_device: str = "cpu"
@@ -232,6 +240,8 @@ class PlacementConfig:
     vram_budget_mib: int = 4500
     release_timeout_s: float = 10.0
     models_dir: str = "/models"
+    kws_model: str | None = None
+    kws_threads: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +249,111 @@ class TurnConfig:
     """Turn teardown limits: how long a dispatched tool may finish after a cancel."""
 
     tool_cancel_grace_ms: int = 2000
+
+
+DEFAULT_WAKE_PHRASES: tuple[str, ...] = (
+    "hey {name}",
+    "{name}, how's it going",
+    "{name}, what's up",
+    "are you there {name}",
+)
+"""Templates that address MIST when they open or end an utterance; `{name}` is any name."""
+
+DEFAULT_ADDRESS_STARTS: tuple[str, ...] = (
+    "what",
+    "what's",
+    "how",
+    "how's",
+    "are",
+    "can",
+    "could",
+    "would",
+    "will",
+    "do",
+    "did",
+    "set",
+    "play",
+    "turn",
+    "tell",
+    "show",
+    "open",
+    "close",
+    "stop",
+    "remind",
+    "start",
+    "put",
+    "add",
+    "call",
+)
+"""Words that start a request after a leading name with no comma.
+
+"is" is not among them, so "mist is a good name" talks about the name rather than to her.
+"""
+
+DEFAULT_STOP_BEFORE: tuple[str, ...] = (
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "some",
+    "of",
+    "in",
+    "into",
+    "through",
+    "morning",
+    "thick",
+    "light",
+    "sea",
+    "mountain",
+)
+"""Words after which a name is a noun: "the morning mist", "we drove into mist".
+
+A greeting that opens an utterance is read first, so "morning mist" alone still greets her.
+"""
+
+DEFAULT_GREETINGS: tuple[str, ...] = ("hey", "hi", "hello", "morning", "evening", "yo")
+"""Greetings that make a following name a vocative at the start of an utterance."""
+
+# The phrases file's keys, each a list of strings replacing that field's default.
+_PHRASE_KEYS = ("phrases", "address_starts", "stop_before", "greetings")
+
+# `lookback_ms` plus this must stay within the wire's `MAX_WAKE_BACKLOG_MS`.
+_LOOKBACK_HEADROOM_MS = 1000
+# The least `endpoint_min_backlog_ms` may be; its most is `MAX_WAKE_BACKLOG_MS`.
+_MIN_ENDPOINT_BACKLOG_MS = 500
+
+
+@dataclass(frozen=True, slots=True)
+class WakeConfig:
+    """How MIST hears her name and decides she was addressed (Design doc, Wake by name).
+
+    `names` are lower-case single words the spotter scores. `phrases`, `address_starts`,
+    `stop_before` and `greetings` are the addressee gate's word sets, which
+    `MIST_VOICE_WAKE_PHRASES_FILE` changes without a release; each template holds `{name}`
+    once. A name hit at or above `kws_threshold` (an endpoint wake at or above
+    `endpoint_threshold`) opens a candidate reaching back at most `lookback_ms`, across speech
+    gaps of at most `join_gap_ms`. The gate decodes `gate_tail_ms` past the hit, and the
+    reference may lead the hit's window by `reference_tolerance_ms`. An endpoint wake with
+    less than `endpoint_min_backlog_ms` of audio before it is rejected. `followup_window_ms`
+    above 0 keeps listening without the name after a turn; `attend_cue` sends `attend` at a
+    hit, before the verdict.
+    """
+
+    names: tuple[str, ...] = ("mist",)
+    phrases: tuple[str, ...] = DEFAULT_WAKE_PHRASES
+    address_starts: tuple[str, ...] = DEFAULT_ADDRESS_STARTS
+    stop_before: tuple[str, ...] = DEFAULT_STOP_BEFORE
+    greetings: tuple[str, ...] = DEFAULT_GREETINGS
+    kws_threshold: float = 0.5
+    endpoint_threshold: float = 0.5
+    lookback_ms: int = 6000
+    join_gap_ms: int = 1000
+    gate_tail_ms: int = 300
+    reference_tolerance_ms: int = 400
+    endpoint_min_backlog_ms: int = 1500
+    followup_window_ms: int = 0
+    attend_cue: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,12 +367,14 @@ class VoiceSettings:
     segmenter: SegmenterConfig = field(default_factory=SegmenterConfig)
     placement: PlacementConfig = field(default_factory=PlacementConfig)
     turn: TurnConfig = field(default_factory=TurnConfig)
+    wake: WakeConfig = field(default_factory=WakeConfig)
     profile: str = DEFAULT_VOICE_PROFILE
 
 
 _LOCATION = re.compile(r"cpu|cuda(?::\d+)?|off")
 _DEVICE = re.compile(r"cpu|cuda(?::\d+)?")
 _ENGINE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+_NAME = re.compile(r"[a-z0-9]+(?:['-][a-z0-9]+)*")
 _REPO_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+")
 _ONNX_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+:[^@:\s]+")
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -330,6 +447,21 @@ class _Env:
 
     def keywords(self, name: str, default: tuple[str, ...]) -> tuple[str, ...]:
         return self._read(name, default, _parse_keywords)
+
+    def names(self, name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        return self._read(name, default, _parse_names)
+
+    def bounded_integer(self, name: str, default: int, low: int, high: int) -> int:
+        def parse(var: str, raw: str) -> int:
+            value = _parse_non_negative_int(var, raw)
+            if not low <= value <= high:
+                raise ValueError(f"{var}: expected an integer from {low} to {high}, got {raw!r}")
+            return value
+
+        return self._read(name, default, parse)
+
+    def phrases_file(self, name: str) -> Mapping[str, tuple[str, ...]]:
+        return self._read(name, {}, _parse_phrases_file)
 
 
 def _parse_non_negative_int(name: str, raw: str) -> int:
@@ -436,6 +568,85 @@ def _parse_keywords(name: str, raw: str) -> tuple[str, ...]:
     return keywords
 
 
+def _parse_names(name: str, raw: str) -> tuple[str, ...]:
+    names = tuple(_split_list(raw))
+    if not names:
+        raise ValueError(f"{name}: expected at least one comma-separated name, got {raw!r}")
+    for item in names:
+        if not _NAME.fullmatch(item):
+            raise ValueError(f"{name}: {item!r} is not one lower-case word")
+    return names
+
+
+def _parse_phrases_file(name: str, raw: str) -> Mapping[str, tuple[str, ...]]:
+    path = _parse_absolute_path(name, raw)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            content = json.load(handle)
+    except OSError as exc:
+        raise ValueError(f"{name}: cannot read {path}: {exc.strerror}") from exc
+    except ValueError as exc:  # json.JSONDecodeError and UnicodeDecodeError
+        raise ValueError(f"{name}: {path} is not valid JSON: {exc}") from exc
+    if not isinstance(content, dict):
+        raise ValueError(f"{name}: {path} must hold a JSON object")
+    unknown = sorted(set(content) - set(_PHRASE_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{name}: {path} has unknown keys {', '.join(unknown)}; "
+            f"expected any of {', '.join(_PHRASE_KEYS)}"
+        )
+    sets: dict[str, tuple[str, ...]] = {}
+    for key, items in content.items():
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise ValueError(f"{name}: {path} key {key!r} must be a list of strings")
+        stripped = tuple(item.strip() for item in items)
+        if "" in stripped:
+            raise ValueError(f"{name}: {path} key {key!r} holds an empty string")
+        sets[key] = stripped
+    for template in sets.get("phrases", ()):
+        if template.count("{name}") != 1:
+            raise ValueError(f"{name}: template {template!r} must hold {{name}} exactly once")
+    return sets
+
+
+def _wake_config(env: _Env, barge_in: BargeInConfig) -> WakeConfig:
+    defaults = WakeConfig()
+    lookback_limit = MAX_WAKE_BACKLOG_MS - _LOOKBACK_HEADROOM_MS
+    wake = WakeConfig(
+        names=env.names("MIST_VOICE_WAKE_NAMES", defaults.names),
+        kws_threshold=env.probability("MIST_VOICE_KWS_THRESHOLD", defaults.kws_threshold),
+        endpoint_threshold=env.probability(
+            "MIST_VOICE_WAKE_ENDPOINT_THRESHOLD", defaults.endpoint_threshold
+        ),
+        lookback_ms=env.bounded_integer(
+            "MIST_VOICE_WAKE_LOOKBACK_MS", defaults.lookback_ms, 1, lookback_limit
+        ),
+        join_gap_ms=env.positive_integer("MIST_VOICE_WAKE_JOIN_GAP_MS", defaults.join_gap_ms),
+        gate_tail_ms=env.positive_integer("MIST_VOICE_WAKE_GATE_TAIL_MS", defaults.gate_tail_ms),
+        reference_tolerance_ms=env.positive_integer(
+            "MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS", defaults.reference_tolerance_ms
+        ),
+        endpoint_min_backlog_ms=env.bounded_integer(
+            "MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS",
+            defaults.endpoint_min_backlog_ms,
+            _MIN_ENDPOINT_BACKLOG_MS,
+            MAX_WAKE_BACKLOG_MS,
+        ),
+        followup_window_ms=env.integer(
+            "MIST_VOICE_FOLLOWUP_WINDOW_MS", defaults.followup_window_ms
+        ),
+        attend_cue=env.boolean("MIST_VOICE_WAKE_ATTEND_CUE", defaults.attend_cue),
+    )
+    # Arbitration runs during the gate tail, so it must end by the time the tail does.
+    if barge_in.wake_arbitration_ms > wake.gate_tail_ms:
+        raise ValueError(
+            f"MIST_VOICE_WAKE_ARBITRATION_MS: {barge_in.wake_arbitration_ms} ms is longer than "
+            f"MIST_VOICE_WAKE_GATE_TAIL_MS, {wake.gate_tail_ms} ms; arbitration must end within "
+            "the gate tail"
+        )
+    return dataclasses.replace(wake, **env.phrases_file("MIST_VOICE_WAKE_PHRASES_FILE"))
+
+
 def _alarm_stop_keywords(env: _Env, name: str, barge_in: BargeInConfig) -> tuple[str, ...]:
     keywords = env.keywords(name, barge_in.alarm_stop_keywords)
     for keyword in keywords:
@@ -454,6 +665,10 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     which the handler's `LLMConfig` owns (the handler never imports this package). The variables
     the GPU yield, the remote speech service and the cloned voice used are not read either, so a
     stale `.env` entry for one of them changes nothing.
+
+    `MIST_VOICE_WAKE_PHRASES_FILE` is the one variable that names a file: a JSON object with
+    any of `phrases`, `address_starts`, `stop_before` and `greetings`, each a list of strings
+    that replaces that set; a key it omits keeps its default.
 
     Raises:
         ValueError: A set variable is malformed; the message starts with the variable's name.
@@ -528,6 +743,13 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
             "MIST_VOICE_RELEASE_TIMEOUT_S", place.release_timeout_s
         ),
         models_dir=env.absolute_path("MIST_VOICE_MODELS_DIR", place.models_dir),
+        kws_model=env.pattern(
+            "MIST_VOICE_KWS_MODEL",
+            place.kws_model,
+            _ENGINE_ID,
+            "a model id matching [a-z0-9][a-z0-9-]*",
+        ),
+        kws_threads=env.positive_integer("MIST_VOICE_KWS_THREADS", place.kws_threads),
     )
     turn = TurnConfig(
         tool_cancel_grace_ms=env.integer(
@@ -542,5 +764,6 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         segmenter=segmenter,
         placement=placement,
         turn=turn,
+        wake=_wake_config(env, barge_in),
         profile=env.text("VOICE_PROFILE", VoiceSettings().profile),
     )

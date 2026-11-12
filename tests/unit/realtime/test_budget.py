@@ -11,6 +11,7 @@ error. The variables the GPU yield and the cloned voice used are pinned as ignor
 
 import dataclasses
 import importlib.util
+import json
 import sys
 
 import pytest
@@ -19,6 +20,10 @@ from backend.realtime import budget as budget_module
 from backend.realtime.budget import (
     BUDGET_FIELDS,
     BUDGET_PRESETS,
+    DEFAULT_ADDRESS_STARTS,
+    DEFAULT_GREETINGS,
+    DEFAULT_STOP_BEFORE,
+    DEFAULT_WAKE_PHRASES,
     STAGE_FIELDS,
     BargeInConfig,
     EndpointingConfig,
@@ -28,6 +33,7 @@ from backend.realtime.budget import (
     TurnConfig,
     VoiceLatencyBudget,
     VoiceSettings,
+    WakeConfig,
     load_voice_settings,
     parse_budget,
 )
@@ -56,8 +62,9 @@ TABLE_ROWS = (
     "event_to_pixel_ms",
 )
 
-# The five screen and caption targets, the same in every preset.
-SCREEN_TARGETS = (300, 500, 150, 600, 50)
+# The five screen and caption targets, the same in every preset. Wake to screen is the server
+# side only, the name's end to `attend` or `listen` sent, so it is 205, not the 300 to the pixel.
+SCREEN_TARGETS = (205, 500, 150, 600, 50)
 
 # The Design doc's Latency budget table, column by column, in TABLE_ROWS order.
 TABLE = {
@@ -131,6 +138,13 @@ class TestPresets:
 
         assert reported["preset"] == "memo"
         assert reported["tts_first_chunk_ms"] == 420
+
+    @pytest.mark.parametrize("name", sorted(BUDGET_PRESETS))
+    def test_every_preset_judges_wake_to_screen_on_the_server_side_bound(self, name):
+        budget = BUDGET_PRESETS[name]
+
+        assert budget.wake_screen_ms == 205
+        assert budget.event_to_pixel_ms == 50
 
 
 class TestParseBudget:
@@ -265,10 +279,78 @@ CONFIG_DEFAULTS = [
             "vram_budget_mib": 4500,
             "release_timeout_s": 10.0,
             "models_dir": "/models",
+            "kws_model": None,
+            "kws_threads": 1,
         },
         id="placement",
     ),
     pytest.param(TurnConfig, {"tool_cancel_grace_ms": 2000}, id="turn"),
+    pytest.param(
+        WakeConfig,
+        {
+            "names": ("mist",),
+            "phrases": (
+                "hey {name}",
+                "{name}, how's it going",
+                "{name}, what's up",
+                "are you there {name}",
+            ),
+            "address_starts": (
+                "what",
+                "what's",
+                "how",
+                "how's",
+                "are",
+                "can",
+                "could",
+                "would",
+                "will",
+                "do",
+                "did",
+                "set",
+                "play",
+                "turn",
+                "tell",
+                "show",
+                "open",
+                "close",
+                "stop",
+                "remind",
+                "start",
+                "put",
+                "add",
+                "call",
+            ),
+            "stop_before": (
+                "the",
+                "a",
+                "an",
+                "this",
+                "that",
+                "some",
+                "of",
+                "in",
+                "into",
+                "through",
+                "morning",
+                "thick",
+                "light",
+                "sea",
+                "mountain",
+            ),
+            "greetings": ("hey", "hi", "hello", "morning", "evening", "yo"),
+            "kws_threshold": 0.5,
+            "endpoint_threshold": 0.5,
+            "lookback_ms": 6000,
+            "join_gap_ms": 1000,
+            "gate_tail_ms": 300,
+            "reference_tolerance_ms": 400,
+            "endpoint_min_backlog_ms": 1500,
+            "followup_window_ms": 0,
+            "attend_cue": True,
+        },
+        id="wake",
+    ),
 ]
 
 
@@ -306,17 +388,36 @@ class TestConfigDataclasses:
             "segmenter",
             "placement",
             "turn",
+            "wake",
             "profile",
         ]
         assert VoiceSettings().profile == "mist"
 
+    def test_the_four_wake_word_sets_are_the_wake_configs_defaults(self):
+        config = WakeConfig()
+
+        assert config.phrases == DEFAULT_WAKE_PHRASES
+        assert config.address_starts == DEFAULT_ADDRESS_STARTS
+        assert config.stop_before == DEFAULT_STOP_BEFORE
+        assert config.greetings == DEFAULT_GREETINGS
+
+    def test_is_is_not_an_address_start(self):
+        # "mist is a good name" talks about the name, not to her.
+        assert "is" not in DEFAULT_ADDRESS_STARTS
+
+    def test_every_default_template_holds_the_name_slot_once(self):
+        for template in DEFAULT_WAKE_PHRASES:
+            assert template.count("{name}") == 1
+
     def test_the_profile_default_follows_the_voice_profile_constant(self, monkeypatch):
         # A fresh copy of the module, built while the constant reads "probe": a default that
-        # comes from `DEFAULT_VOICE_PROFILE` follows it, and a literal copy of it would not.
+        # comes from `DEFAULT_VOICE_PROFILE` follows it, and a literal copy of it would not. The
+        # copy is named inside `backend.realtime`, so its relative imports resolve.
         monkeypatch.setattr(voice_profile, "DEFAULT_VOICE_PROFILE", "probe")
-        spec = importlib.util.spec_from_file_location("budget_probe", budget_module.__file__)
+        name = "backend.realtime.budget_probe"
+        spec = importlib.util.spec_from_file_location(name, budget_module.__file__)
         probe = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, "budget_probe", probe)
+        monkeypatch.setitem(sys.modules, name, probe)
 
         spec.loader.exec_module(probe)
 
@@ -347,8 +448,11 @@ class TestLoadVoiceSettingsDefaults:
             segmenter=SegmenterConfig(),
             placement=PlacementConfig(),
             turn=TurnConfig(),
+            wake=WakeConfig(),
             profile="mist",
         )
+        assert settings.placement.kws_model is None
+        assert settings.placement.kws_threads == 1
         assert settings.placement.stt_device == ("cuda", "cpu")
         assert settings.placement.tts_device == ("cuda", "off")
         assert settings.placement.stt_engine is None
@@ -448,8 +552,24 @@ VARIABLES = [
     ("MIST_VOICE_NO_SPEECH_THRESHOLD", "0.8", "endpointing.no_speech_threshold", 0.8),
     ("MIST_VOICE_LOGPROB_THRESHOLD", "-0.5", "endpointing.logprob_threshold", -0.5),
     ("MIST_VOICE_TOOL_CANCEL_GRACE_MS", "3000", "turn.tool_cancel_grace_ms", 3000),
-    ("MIST_VOICE_WAKE_ARBITRATION_MS", "400", "barge_in.wake_arbitration_ms", 400),
+    # At most the 300 ms gate tail, so that arbitration overlaps it.
+    ("MIST_VOICE_WAKE_ARBITRATION_MS", "280", "barge_in.wake_arbitration_ms", 280),
+    ("MIST_VOICE_WAKE_NAMES", " mist, nova ", "wake.names", ("mist", "nova")),
+    ("MIST_VOICE_KWS_THRESHOLD", "0.62", "wake.kws_threshold", 0.62),
+    ("MIST_VOICE_WAKE_ENDPOINT_THRESHOLD", "0.4", "wake.endpoint_threshold", 0.4),
+    ("MIST_VOICE_WAKE_LOOKBACK_MS", "9000", "wake.lookback_ms", 9000),
+    ("MIST_VOICE_WAKE_JOIN_GAP_MS", "800", "wake.join_gap_ms", 800),
+    ("MIST_VOICE_WAKE_GATE_TAIL_MS", "350", "wake.gate_tail_ms", 350),
+    ("MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS", "500", "wake.reference_tolerance_ms", 500),
+    ("MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS", "2000", "wake.endpoint_min_backlog_ms", 2000),
+    ("MIST_VOICE_FOLLOWUP_WINDOW_MS", "4000", "wake.followup_window_ms", 4000),
+    ("MIST_VOICE_WAKE_ATTEND_CUE", "false", "wake.attend_cue", False),
+    ("MIST_VOICE_KWS_MODEL", "mist-wake-2", "placement.kws_model", "mist-wake-2"),
+    ("MIST_VOICE_KWS_THREADS", "2", "placement.kws_threads", 2),
 ]
+
+# Read from a file the variable names, so the file tests cover them.
+FILE_VARIABLES = {"MIST_VOICE_WAKE_PHRASES_FILE"}
 
 
 def _get_path(settings: VoiceSettings, path: str) -> object:
@@ -509,9 +629,22 @@ class TestLoadVoiceSettingsVariables:
         assert settings.barge_in.alarm_stop_keywords == ("halt",)
 
     def test_every_variable_in_the_configuration_list_is_covered(self):
-        read = {case[0] for case in VARIABLES}
+        read = {case[0] for case in VARIABLES} | FILE_VARIABLES
 
         assert read == {
+            "MIST_VOICE_WAKE_NAMES",
+            "MIST_VOICE_WAKE_PHRASES_FILE",
+            "MIST_VOICE_KWS_THRESHOLD",
+            "MIST_VOICE_WAKE_ENDPOINT_THRESHOLD",
+            "MIST_VOICE_WAKE_LOOKBACK_MS",
+            "MIST_VOICE_WAKE_JOIN_GAP_MS",
+            "MIST_VOICE_WAKE_GATE_TAIL_MS",
+            "MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS",
+            "MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS",
+            "MIST_VOICE_FOLLOWUP_WINDOW_MS",
+            "MIST_VOICE_WAKE_ATTEND_CUE",
+            "MIST_VOICE_KWS_MODEL",
+            "MIST_VOICE_KWS_THREADS",
             "MIST_VOICE_BUDGET",
             "MIST_VOICE_CLIENT_PREBUFFER_MS",
             "MIST_VOICE_VAD_THRESHOLD",
@@ -547,7 +680,174 @@ class TestLoadVoiceSettingsVariables:
         }
 
 
+def _phrases_file(tmp_path, content: object) -> dict[str, str]:
+    path = tmp_path / "phrases.json"
+    text = content if isinstance(content, str) else json.dumps(content)
+    path.write_text(text, encoding="utf-8")
+    return {"MIST_VOICE_WAKE_PHRASES_FILE": str(path)}
+
+
+class TestWakePhrasesFile:
+    def test_a_file_adds_a_template_and_a_greeting(self, tmp_path):
+        environ = _phrases_file(
+            tmp_path,
+            {
+                "phrases": [*DEFAULT_WAKE_PHRASES, "yo {name}"],
+                "greetings": [*DEFAULT_GREETINGS, "howdy"],
+            },
+        )
+
+        wake = load_voice_settings(environ).wake
+
+        assert wake.phrases == (*DEFAULT_WAKE_PHRASES, "yo {name}")
+        assert wake.greetings == (*DEFAULT_GREETINGS, "howdy")
+
+    def test_the_keys_a_file_omits_keep_their_defaults(self, tmp_path):
+        environ = _phrases_file(tmp_path, {"phrases": ["yo {name}"]})
+
+        wake = load_voice_settings(environ).wake
+
+        assert wake.phrases == ("yo {name}",)
+        assert wake.address_starts == DEFAULT_ADDRESS_STARTS
+        assert wake.stop_before == DEFAULT_STOP_BEFORE
+        assert wake.greetings == DEFAULT_GREETINGS
+        assert wake == dataclasses.replace(WakeConfig(), phrases=("yo {name}",))
+
+    def test_a_file_sets_the_address_starts_and_the_stop_words(self, tmp_path):
+        environ = _phrases_file(
+            tmp_path, {"address_starts": ["what", "find"], "stop_before": ["the"]}
+        )
+
+        wake = load_voice_settings(environ).wake
+
+        assert wake.address_starts == ("what", "find")
+        assert wake.stop_before == ("the",)
+
+
 class TestLoadVoiceSettingsErrors:
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("hey there", id="no-name"),
+            pytest.param("{name} {name}", id="two-names"),
+        ],
+    )
+    def test_a_template_without_exactly_one_name_slot_raises_naming_the_file_variable(
+        self, tmp_path, template
+    ):
+        environ = _phrases_file(tmp_path, {"phrases": ["hey {name}", template]})
+
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_PHRASES_FILE"):
+            load_voice_settings(environ)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("mist ai", id="space"),
+            pytest.param("Mist", id="upper-case"),
+            pytest.param(" , ", id="empty"),
+        ],
+    )
+    def test_a_name_that_is_not_one_lower_case_word_raises_naming_the_variable(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_NAMES"):
+            load_voice_settings({"MIST_VOICE_WAKE_NAMES": raw})
+
+    def test_a_lookback_that_leaves_no_second_inside_the_wire_bound_raises_naming_it(self):
+        # 9500 + 1000 > 10000, the most a wake may carry.
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_LOOKBACK_MS"):
+            load_voice_settings({"MIST_VOICE_WAKE_LOOKBACK_MS": "9500"})
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "MIST_VOICE_WAKE_LOOKBACK_MS",
+            "MIST_VOICE_WAKE_JOIN_GAP_MS",
+            "MIST_VOICE_WAKE_GATE_TAIL_MS",
+            "MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS",
+        ],
+    )
+    def test_a_zero_wake_interval_raises_naming_the_variable(self, name):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: "0"})
+
+    def test_a_relative_phrases_path_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_PHRASES_FILE"):
+            load_voice_settings({"MIST_VOICE_WAKE_PHRASES_FILE": "wake/phrases.json"})
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param('{"phrases": ["hey {name}"', id="truncated-json"),
+            pytest.param(["hey {name}"], id="not-an-object"),
+            pytest.param({"phrases": "hey {name}"}, id="not-a-list"),
+            pytest.param({"phrases": ["hey {name}", 3]}, id="not-a-string"),
+            pytest.param({"greetings": ["hey", " "]}, id="empty-string"),
+            pytest.param({"phrase": ["hey {name}"]}, id="unknown-key"),
+        ],
+    )
+    def test_a_malformed_phrases_file_raises_naming_the_variable(self, tmp_path, content):
+        environ = _phrases_file(tmp_path, content)
+
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_PHRASES_FILE"):
+            load_voice_settings(environ)
+
+    def test_a_missing_phrases_file_raises_naming_the_variable(self, tmp_path):
+        missing = str(tmp_path / "absent.json")
+
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_PHRASES_FILE"):
+            load_voice_settings({"MIST_VOICE_WAKE_PHRASES_FILE": missing})
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("wake/mist-2", id="slash"),
+            pytest.param("Mist-Wake", id="upper-case"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    def test_a_kws_model_outside_the_id_form_raises_naming_the_variable(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_KWS_MODEL"):
+            load_voice_settings({"MIST_VOICE_KWS_MODEL": raw})
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "two"])
+    def test_kws_threads_must_be_a_positive_integer(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_KWS_THREADS"):
+            load_voice_settings({"MIST_VOICE_KWS_THREADS": raw})
+
+    @pytest.mark.parametrize("raw", ["400", "10001"])
+    def test_an_endpoint_min_backlog_outside_its_bounds_raises_naming_it(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS"):
+            load_voice_settings({"MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS": raw})
+
+    @pytest.mark.parametrize("raw", ["500", "10000"])
+    def test_an_endpoint_min_backlog_at_its_bounds_is_accepted(self, raw):
+        settings = load_voice_settings({"MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS": raw})
+
+        assert settings.wake.endpoint_min_backlog_ms == int(raw)
+
+    def test_wake_arbitration_above_the_gate_tail_raises_naming_both(self):
+        environ = {"MIST_VOICE_WAKE_ARBITRATION_MS": "301", "MIST_VOICE_WAKE_GATE_TAIL_MS": "300"}
+
+        with pytest.raises(
+            ValueError, match="MIST_VOICE_WAKE_ARBITRATION_MS.*MIST_VOICE_WAKE_GATE_TAIL_MS"
+        ):
+            load_voice_settings(environ)
+
+    def test_a_gate_tail_shorter_than_the_default_arbitration_raises(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_ARBITRATION_MS"):
+            load_voice_settings({"MIST_VOICE_WAKE_GATE_TAIL_MS": "200"})
+
+    @pytest.mark.parametrize(
+        "name", ["MIST_VOICE_KWS_THRESHOLD", "MIST_VOICE_WAKE_ENDPOINT_THRESHOLD"]
+    )
+    def test_a_wake_threshold_above_one_raises_naming_the_variable(self, name):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: "1.2"})
+
+    def test_a_negative_followup_window_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_FOLLOWUP_WINDOW_MS"):
+            load_voice_settings({"MIST_VOICE_FOLLOWUP_WINDOW_MS": "-1"})
+
     def test_a_negative_number_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_ENDPOINT_SILENCE_MS"):
             load_voice_settings({"MIST_VOICE_ENDPOINT_SILENCE_MS": "-200"})
