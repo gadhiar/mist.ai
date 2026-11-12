@@ -9,6 +9,7 @@ the health-probe ordering.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -20,7 +21,11 @@ from backend.extraction_contract.models import (
     ScopeOut,
     TimingsMs,
 )
-from backend.extraction_service.app import _IdempotencyCache
+from backend.extraction_service.app import (
+    ClientGoneError,
+    JobCancelledError,
+    _IdempotencyCache,
+)
 from backend.extraction_service.settings import ServiceSettings
 from tests.unit.extraction_service.conftest import make_extract_request
 
@@ -51,11 +56,16 @@ class _Run:
 
     def __init__(self) -> None:
         self.runs = 0
+        self.cancelled = 0
         self.release = asyncio.Event()
 
     async def __call__(self) -> ExtractResponse:
         self.runs += 1
-        await self.release.wait()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
         return _response()
 
 
@@ -84,28 +94,213 @@ class TestCancellation:
         run.release.set()
         result = await asyncio.wait_for(stays, timeout=2.0)
 
-        # Assert
+        # Assert: the run was never cancelled, and it is stored for the job.
         assert result == _response()
         assert run.runs == 1
+        assert run.cancelled == 0
+        assert await cache.get_or_run("j", run) == _response()
+        assert run.runs == 1
 
-    async def test_a_run_whose_every_waiter_left_still_completes_and_is_kept(self):
+    async def test_a_run_whose_every_waiter_left_is_cancelled_and_nothing_is_kept(self):
         # Arrange
         cache = _IdempotencyCache(maxsize=4)
         run = _Run()
         only = asyncio.create_task(cache.get_or_run("j", run))
         await _ticks()
 
-        # Act: the only client leaves; the run finishes anyway; the job is resubmitted.
+        # Act: the only client leaves; then the job is resubmitted.
         only.cancel()
         with pytest.raises(asyncio.CancelledError):
             await only
-        run.release.set()
+        known_after_leaving = cache.knows("j")
         await _ticks()
+        run.release.set()
         again = await asyncio.wait_for(cache.get_or_run("j", run), timeout=2.0)
 
-        # Assert: the resubmission is served from the finished run.
+        # Assert: the first run was cancelled; the resubmission ran on its own.
+        assert known_after_leaving is False
+        assert run.cancelled == 1
         assert again == _response()
+        assert run.runs == 2
+
+    async def test_the_last_of_two_waiters_leaving_cancels_the_run(self):
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        owner = asyncio.create_task(cache.get_or_run("j", run))
+        await _ticks()
+        joiner = asyncio.create_task(cache.get_or_run("j", run))
+        await _ticks()
+
+        owner.cancel()
+        await _ticks()
+        cancelled_with_one_left = run.cancelled
+        joiner.cancel()
+        await _ticks()
+
+        assert cancelled_with_one_left == 0
+        assert run.cancelled == 1
+        assert not cache.knows("j")
+
+    @pytest.mark.parametrize("gone", ["owner", "joiner"])
+    async def test_a_waiter_whose_client_is_gone_leaves_the_run_to_the_other(self, gone):
+        # Arrange: two callers share one run, each watching its own client.
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        left = {"owner": asyncio.Event(), "joiner": asyncio.Event()}
+        owner = asyncio.create_task(cache.get_or_run("j", run, gone=left["owner"].wait))
+        await _ticks()
+        joiner = asyncio.create_task(cache.get_or_run("j", run, gone=left["joiner"].wait))
+        await _ticks()
+        leaver, stays = (owner, joiner) if gone == "owner" else (joiner, owner)
+
+        # Act
+        left[gone].set()
+        with pytest.raises(ClientGoneError):
+            await asyncio.wait_for(leaver, timeout=2.0)
+        run.release.set()
+        result = await asyncio.wait_for(stays, timeout=2.0)
+
+        # Assert
+        assert result == _response()
+        assert run.cancelled == 0
         assert run.runs == 1
+
+    async def test_the_only_waiter_whose_client_is_gone_cancels_the_run(self):
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        left = asyncio.Event()
+        only = asyncio.create_task(cache.get_or_run("j", run, gone=left.wait))
+        await _ticks()
+
+        left.set()
+        with pytest.raises(ClientGoneError):
+            await asyncio.wait_for(only, timeout=2.0)
+        await _ticks()
+
+        assert run.cancelled == 1
+        assert not cache.knows("j")
+
+    async def test_a_run_that_finishes_answers_a_waiter_whose_client_stayed(self):
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        run.release.set()
+
+        result = await cache.get_or_run("j", run, gone=asyncio.Event().wait)
+
+        assert result == _response()
+
+
+@pytest.mark.asyncio
+class TestCancel:
+    async def test_cancelling_a_run_in_flight_raises_for_every_waiter(self):
+        # Arrange
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        owner = asyncio.create_task(cache.get_or_run("j", run))
+        await _ticks()
+        joiner = asyncio.create_task(cache.get_or_run("j", run))
+        await _ticks()
+
+        # Act
+        outcome = cache.cancel("j")
+
+        # Assert
+        assert outcome == "cancelled"
+        for waiter in (owner, joiner):
+            with pytest.raises(JobCancelledError, match="'j'"):
+                await asyncio.wait_for(waiter, timeout=2.0)
+        assert run.cancelled == 1
+        assert not cache.knows("j")
+
+    async def test_a_cancelled_job_is_not_stored_and_runs_when_sent_again(self):
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        owner = asyncio.create_task(cache.get_or_run("j", run))
+        await _ticks()
+        cache.cancel("j")
+        with pytest.raises(JobCancelledError):
+            await owner
+
+        run.release.set()
+        again = await cache.get_or_run("j", run)
+
+        assert again == _response()
+        assert run.runs == 2
+
+    async def test_a_job_sent_again_before_the_cancelled_run_has_ended_gets_its_own_run(self):
+        # Arrange
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        owner = asyncio.create_task(cache.get_or_run("j", run))
+        await _ticks()
+
+        # Act: cancel and resubmit with no tick between them, so the first
+        # run has not yet been told it is cancelled.
+        cache.cancel("j")
+        again = asyncio.create_task(cache.get_or_run("j", run))
+        with pytest.raises(JobCancelledError):
+            await owner
+        await _ticks()
+        still_in_flight = cache.knows("j")
+        run.release.set()
+        result = await asyncio.wait_for(again, timeout=2.0)
+
+        # Assert: the first run's end neither un-registered nor answered the second.
+        assert still_in_flight is True
+        assert result == _response()
+        assert run.runs == 2
+        assert run.cancelled == 1
+
+    async def test_a_cancelled_run_that_returns_anyway_is_not_stored(self):
+        # Arrange: a run that swallows its cancellation and returns a result.
+        cache = _IdempotencyCache(maxsize=4)
+        release = asyncio.Event()
+        runs = 0
+
+        async def stubborn() -> ExtractResponse:
+            nonlocal runs
+            runs += 1
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()
+            return _response()
+
+        owner = asyncio.create_task(cache.get_or_run("j", stubborn))
+        await _ticks()
+
+        # Act
+        cache.cancel("j")
+        with pytest.raises(JobCancelledError):
+            await asyncio.wait_for(owner, timeout=2.0)
+        await _ticks()
+        release.set()
+        again = await cache.get_or_run("j", stubborn)
+
+        # Assert
+        assert again == _response()
+        assert runs == 2
+
+    async def test_a_finished_job_is_reported_finished_and_stays_stored(self):
+        cache = _IdempotencyCache(maxsize=4)
+        run = _Run()
+        run.release.set()
+        await cache.get_or_run("j", run)
+
+        outcome = cache.cancel("j")
+
+        assert outcome == "finished"
+        assert await cache.get_or_run("j", run) == _response()
+        assert run.runs == 1
+
+    async def test_a_job_never_seen_is_reported_unknown(self):
+        assert _IdempotencyCache(maxsize=4).cancel("j") == "unknown"
+
+    async def test_a_finished_job_the_cache_did_not_retain_is_reported_unknown(self):
+        cache = _IdempotencyCache(maxsize=0)
+        run = _Run()
+        run.release.set()
+        await cache.get_or_run("j", run)
+
+        assert cache.cancel("j") == "unknown"
 
 
 class _YieldingLock(asyncio.Lock):

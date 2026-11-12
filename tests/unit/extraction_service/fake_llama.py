@@ -5,7 +5,8 @@ needs: `GET /health`, `GET /props` and `POST /v1/chat/completions`. Tests
 mutate a shared `FakeLlamaState` to script responses (canned content per
 call, an HTTP error status, a health status, a `/props` status and body, or
 a gate that holds every chat call until a test releases it) and to inspect
-what was actually sent (`chat_requests`, `props_requests`).
+what was actually sent (`chat_requests`, `props_requests`) and which held
+calls their caller left (`chat_aborted`).
 """
 
 from __future__ import annotations
@@ -45,6 +46,9 @@ class FakeLlamaState:
     # Use the `blocked_chat` fixture, which releases the gate at teardown.
     chat_gate: asyncio.Event | None = None
     chat_requests: list[dict] = field(default_factory=list)
+    # Chat calls the caller left while the gate held them: the call was
+    # cancelled before the fake answered it.
+    chat_aborted: int = 0
     # GET /props: the status and JSON body to answer with.
     props_status: int = 200
     props_body: object = field(
@@ -72,7 +76,11 @@ def build_fake_llama_app(state: FakeLlamaState) -> Starlette:
         state.chat_requests.append(body)
 
         if state.chat_gate is not None:
-            await state.chat_gate.wait()
+            try:
+                await state.chat_gate.wait()
+            except asyncio.CancelledError:
+                state.chat_aborted += 1
+                raise
 
         if state.chat_status_code is not None:
             return JSONResponse(
