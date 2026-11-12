@@ -284,8 +284,10 @@ def test_the_pack_hashes_to_the_pinned_values(fresh_registry):
     # on purpose; a loader change must not.
     pack = fresh_registry.active_pack()
 
+    # T52's Rule 28, Example 30 and generated schema moved the prompt hash; before T52 it
+    # was 944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d.
     assert (pack.pack_prompt_hash, pack.pack_rails_hash) == (
-        "944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
+        "ac0dcd956bcb596a86bee1ab6a90a42661dff5347366fe859033a43067a75eac",
         "bc72f2458c8bc3a62a6843a08b0c11262880778912d2e387cdcedffc0582bc3d",
     )
 

@@ -234,7 +234,7 @@ research (see Section 6 of the research note):
    `models.yaml`. Correctness fix under KV quantization.
 4. No `--grammar-file` on the server. The constrained arm (a test file
    with `constrained: true`) sends the production extraction output
-   schema, `EXTRACTION_OUTPUT_SCHEMA`, per request as
+   schema, the active pack's `extraction_schema`, per request as
    `response_format={"type": "json_schema", "json_schema": {"name":
    "response", "schema": <schema>, "strict": true}}`, the request the
    extraction engine's `schema` mode sends. A candidate with

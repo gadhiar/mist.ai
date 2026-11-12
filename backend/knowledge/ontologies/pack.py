@@ -899,10 +899,13 @@ def _by_phase(rules: tuple[ConventionRule, ...], phases: tuple[Phase, ...]) -> d
 def _prompt_side(
     manifest: Manifest,
     rules: tuple[ConventionRule, ...],
-    extractable_node_types: tuple[str, ...],
+    extractable_node_types: tuple[NodeTypeDefinition, ...],
     extractable_edge_types: tuple[str, ...],
 ) -> tuple[str, dict[str, object]]:
     """The system prompt and the output schema a pack feeds the model with.
+
+    The schema is generated from the extractable types' definitions, not their names
+    alone, because it states the keys each type declares the model writes.
 
     The prompt is measured two ways. Its template's length is held to the engine's
     character guard, whatever the manifest says. Its estimated token count is held to
@@ -1034,8 +1037,12 @@ def build_pack(
     )
     pair_table = _build_pair_table(built_edges, tuple(extractable_edge_types), type_names)
     _check_rules(tuple(rules), tuple(plugins), type_names, edge_names)
+    by_name = {node.type_name: node for node in node_types}
     system_prompt, schema = _prompt_side(
-        manifest, tuple(rules), tuple(extractable_node_types), tuple(extractable_edge_types)
+        manifest,
+        tuple(rules),
+        tuple(by_name[name] for name in extractable_node_types),
+        tuple(extractable_edge_types),
     )
 
     prompt_hash = _sha256(

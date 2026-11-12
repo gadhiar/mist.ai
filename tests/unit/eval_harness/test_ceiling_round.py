@@ -33,10 +33,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest  # noqa: E402
 
-from backend.extraction_service.schemas import (  # noqa: E402
-    EXTRACTION_OUTPUT_SCHEMA,
-    SCOPE_OUTPUT_SCHEMA,
-)
+from backend.extraction_service.schemas import SCOPE_OUTPUT_SCHEMA  # noqa: E402
 from backend.knowledge.extraction.scope_classifier import (  # noqa: E402
     SCOPE_CLASSIFIER_SYSTEM_PROMPT,
 )
@@ -177,10 +174,9 @@ def _answer(item: dict[str, str]) -> dict:
     """The test answerer's reply: a fixed scope, or one entity named for the request."""
     if item["kind"] == "scope":
         return {"scope": "user-scope", "confidence": 0.9}
-    return {
-        "entities": [{"id": f"thing-{item['key'][:8]}", "type": "Thing", "name": item["tag"]}],
-        "relationships": [],
-    }
+    # The pack's schema admits only its extractable types; Abstraction is its fallback.
+    entity = {"id": f"thing-{item['key'][:8]}", "type": "Abstraction", "name": item["tag"]}
+    return {"entities": [entity], "relationships": []}
 
 
 def _write_answers(layout: Layout, answers: list[dict]) -> None:
@@ -410,7 +406,8 @@ def test_each_offer_names_a_prompt_and_a_schema_file_holding_the_request_s_own(
     ceiling = campaign.layout.local_dir / "ceiling"
     scope_item, extract_item = campaign.items[0][0], campaign.items[1][0]
     assert json.loads((ceiling / scope_item["schema"]).read_text()) == SCOPE_OUTPUT_SCHEMA
-    assert json.loads((ceiling / extract_item["schema"]).read_text()) == EXTRACTION_OUTPUT_SCHEMA
+    extract_schema = json.loads((ceiling / extract_item["schema"]).read_text())
+    assert extract_schema == active_pack().extraction_schema
     assert (ceiling / scope_item["prompt"]).read_text(
         encoding="utf-8"
     ) == SCOPE_CLASSIFIER_SYSTEM_PROMPT
@@ -614,7 +611,7 @@ def test_two_replays_of_the_same_answers_compare_equal(replays: Replays) -> None
 
 def _altered_store(campaign: Campaign, store_dir: Path) -> None:
     """Rebuild the store through its own API with the list's last answer altered."""
-    schemas = {"scope": SCOPE_OUTPUT_SCHEMA, "extract": EXTRACTION_OUTPUT_SCHEMA}
+    schemas = {"scope": SCOPE_OUTPUT_SCHEMA, "extract": active_pack().extraction_schema}
     entries = AnswerStore.load(campaign.layout.store).entries
     store_dir.mkdir()
     store = AnswerStore.load(store_dir / "answers-1.jsonl")
@@ -624,7 +621,7 @@ def _altered_store(campaign: Campaign, store_dir: Path) -> None:
     for entry in entries:
         answer = entry.answer
         if entry.seq == len(entries):
-            extra = {"id": "altered-entity", "type": "Thing", "name": ALTERED}
+            extra = {"id": "altered-entity", "type": "Abstraction", "name": ALTERED}
             answer = {**answer, "entities": [*answer["entities"], extra]}
         store.add(entry.key, answer)
 

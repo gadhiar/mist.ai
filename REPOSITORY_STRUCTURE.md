@@ -37,6 +37,10 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
   - `extraction_retrieval.py` - Builds the retrieval eval graph from the dev turns and runs the queries
   - `entity_alignment.py` - Pairs gold and produced entity ids by id form, for relations scored over aligned ids
+  - `gold_agreement.py` - Cohen's kappa and relation F1 between two label passes over a fixed candidate universe
+  - `governance.py` - What a score was taken under: stamps `scorer_sha`, `gold_version` and both pack hashes on every summary and `score_runs` line, and refuses an unstamped summary as a reading
+  - `judgement_relations.py` - The judgement filter: relations a pack's rails derive from a team's `MEMBER_OF` edges count once per rule, team and predicate before label agreement is measured (ADR-054 v14 amendment, point 7)
+  - `selection_agreement.py` - Recomputes the selection set's two-pass label agreement (all relations and judgement relations) that its `agreement.json` records
   - `ceiling/` - Extraction ceiling runs: an answerer in the model's seat of the unchanged service (see `data/ceiling/README.md`)
     - `store.py` - Append-only, hash-chained answer store and its state-file check
     - `relay.py` - Serves stored answers to the service as llama-server would; logs pending requests
@@ -45,6 +49,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
     - `make_probes.py` - Writes the utterance-only probes file from gold
     - `score_runs.py` - Scores raw runs with a pinned checkout's scorer and classifier: exact and aligned figures, paired lines, the worksheet and pending pairs
     - `adjudicated.py` - Checks an adjudicated worksheet, prints the corrected figures, and checks the aligner's credits against the adjudicated classes
+    - `pack_equivalence.py` - Cell P: checks on stored payloads, with no model call, that the active ontology pack gives the ids, relationships and model input the tree before it gave
 - `daily/` - The daily instance's host tools
   - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
@@ -67,6 +72,9 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 
 ### Gold sets (`data/gold/`)
 - `data/gold/extraction/` - Extraction gold sets (dev lists, held out) and the labelling guide (`LABELLING.md`)
+- `data/gold/extraction/selection-2026-11.jsonl` - The selection gold set: 240 list and 40 prose probes adjudicated from two blind label passes; the verdict set
+- `data/gold/extraction/labelling/relabel-v11-2026-11.md` - The log of the v11 relabel of gold ids under the extraction contract and the id rails
+- `data/gold/extraction/labelling/selection-2026-11/` - The selection set's design, its two blind label passes, the agreement measured before adjudication, the adjudication log, the prompt-word exemptions the gold-set test loads, and a README
 - `data/gold/retrieval/` - Retrieval queries over the dev gold facts, with a README
 
 ### Ceiling runs (`data/ceiling/`)
@@ -112,6 +120,9 @@ backend/
 │   ├── instrumented_provider.py # Cluster 5 telemetry wrapper
 │   └── models.py                # LLMRequest / LLMResponse / ToolCall (Pydantic)
 │
+├── extraction_service/          # The extraction service: scope, Stage 2 and derive calls
+│   └── turn_plan.py             # Turn plan: one call over a structured turn, before its batches
+│
 ├── knowledge/                   # Knowledge graph system
 │   ├── config.py                # KnowledgeConfig + nested configs
 │   ├── models.py                # RetrievalResult, QueryIntent, etc.
@@ -119,9 +130,23 @@ backend/
 │   ├── extraction/              # 6-stage extraction + subject-scope classifier
 │   │   ├── canonical_id.py      # Id slug and Metric id spellings, shared with the scorer
 │   │   ├── id_rails.py          # Stored id from the payload's id field; the scorer mirrors it
+│   │   ├── pre_llm.py           # A pack's pre-LLM rules: the item filter and the plan vocabulary
+│   │   ├── rails.py             # Rail runner: a pack's post-LLM rules over one cache row
 │   │   ├── run_identity.py      # Run identity of the setup behind each result
 │   │   ├── serving_identity.py  # Serving identity an extraction epoch is keyed on
 │   │   └── structure_splitter.py # List, table and heading units for Stage 2
+│   ├── ontologies/              # Ontology types and the packs that hold them
+│   │   ├── pack.py              # Pack loader: checks a pack, builds its prompt and schema, hashes it
+│   │   ├── registry.py          # Which packs exist and which is active (MIST_ONTOLOGY_VERSION)
+│   │   └── packs/               # One package per ontology version
+│   │       ├── __init__.py      # Package marker; imports nothing
+│   │       └── v1_4_0/          # The v1.4.0 pack
+│   │           ├── __init__.py  # Package marker; imports nothing
+│   │           ├── types.py     # Node and edge types and the extractable lists
+│   │           ├── manifest.py  # Version, fallback type, user anchor, retired types, counts
+│   │           ├── conventions.py # Convention rules with pinned cases; the prompt's ontology half
+│   │           ├── plugins.py   # Plug-ins the rules cite; the rails hash covers their source
+│   │           └── labelling.md # Labelling conventions and the Register table; feeds neither hash
 │   ├── curation/                # Dedup, ReconciliationEngine (reconciliation.py,
 │   │                            #   bitemporal C2; replaced conflict_resolver.py),
 │   │                            #   intervals.py, graph writer, regenerator, health

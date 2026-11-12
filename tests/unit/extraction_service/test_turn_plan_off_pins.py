@@ -58,11 +58,18 @@ PROSE_UTTERANCE = "I have been learning Rust for a few months"
 # T48: the second batch, `5. thing 5`, refers back to no item, so it is no longer sent
 # the four units before it as context lines; at 058e52c this was
 # acf2adde1d0473a0af20963052b08e27bc1ad9df02748dc4ba16013089aef834.
-STRUCTURED_BODIES_SHA256 = "f41d3afdced9a0f9e158a52f9abf5b38db9ca20a8eb79060e78704078f8f7dbc"
-PROSE_BODIES_SHA256 = "1c2489eb2a125f17e56bac300608e1798be6d447dab861447fe8e0e01cb35eb0"
+# T52: the bodies hold the system prompt, whose Rule 28 and Example 30 now show earlier
+# units as the engine sends them, and a Stage 2 body the schema generated from the
+# pack's declarations; before T52 the two were
+# f41d3afdced9a0f9e158a52f9abf5b38db9ca20a8eb79060e78704078f8f7dbc and
+# 1c2489eb2a125f17e56bac300608e1798be6d447dab861447fe8e0e01cb35eb0.
+STRUCTURED_BODIES_SHA256 = "49903b6ece2a885e20b813bd77acf90cd8a49110a4f44f8213da66dc8d815b5d"
+PROSE_BODIES_SHA256 = "11b54c027d71919b5bcbf7b2c5dd3aa80b4f6d200d444928215c6d9d9b8cf281"
 # T48: `EARLIER_ITEMS_HEADING` joined the hash; at 058e52c this was
 # 6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e.
-PROMPT_SHA256 = "dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b"
+# T52: Rule 28, Example 30 and the generated schema moved it; before T52 it was
+# dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b.
+PROMPT_SHA256 = "3db8b2a7e7346efa14835792c38ff82123043bec67b82a017d5f67d18f719212"
 SERVING_IDENTITY_AT_058E52C = "si1-0a4fdfffca232a0e3d27716f7ab0e41ed75715ed7eb932b05939b692bc358cb1"
 # T49: `request.extract.thinking_budget_tokens` went from None to 8192.
 SERVING_IDENTITY = "si1-f967ffbbd60a599a2627654e2ac373bbb787390b374cf1e9a3e2c87dc3b83050"

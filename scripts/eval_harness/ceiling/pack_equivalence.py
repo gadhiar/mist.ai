@@ -227,6 +227,11 @@ def _run_base_half(base_root: Path) -> int:
     This function runs in the base half's own interpreter. The base root goes first on
     the path and every other entry that holds a `backend` directory is dropped, so the
     tree this file belongs to cannot be imported here.
+
+    The Stage 2 schema is the one the base tree's service sent: its active pack's
+    `extraction_schema` where the tree has a registry and its pack holds one, else its
+    constant. A tree with no registry file is not asked to import one, so a stub tree
+    whose rails refuse an ontology module still reads its constant.
     """
     root = base_root.resolve()
     kept = [entry for entry in sys.path if entry and not (Path(entry) / "backend").is_dir()]
@@ -238,6 +243,13 @@ def _run_base_half(base_root: Path) -> int:
     from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
 
     system_prompt = _base_system_prompt(base_prompts)
+    schema = EXTRACTION_OUTPUT_SCHEMA
+    if (root / "backend" / "knowledge" / "ontologies" / "registry.py").is_file():
+        from backend.knowledge.ontologies import registry
+
+        pack_schema = getattr(registry.active_pack(), "extraction_schema", None)
+        if pack_schema is not None:
+            schema = pack_schema
     outside = _outside(root)
     if outside:
         sys.stderr.write(f"modules loaded from outside the base root: {', '.join(outside)}\n")
@@ -258,7 +270,7 @@ def _run_base_half(base_root: Path) -> int:
             "system_prompt": system_prompt,
             "user_template": base_prompts.EXTRACTION_USER_TEMPLATE,
             "pairs": _pairs(RELATIONSHIP_CONSTRAINTS),
-            "schema": json.dumps(EXTRACTION_OUTPUT_SCHEMA),
+            "schema": json.dumps(schema),
         },
         sys.stdout,
     )

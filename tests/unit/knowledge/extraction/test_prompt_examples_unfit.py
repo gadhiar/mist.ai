@@ -123,8 +123,11 @@ R6_IDS: frozenset[str] = frozenset(
 _ANCHOR_IDS = frozenset({"user", "mist-identity"})
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# An example may show `Context:` lines before its subject scope (Example 30, since T52),
+# as the user template places them. The test reads its utterance and ids, as before.
 _EXAMPLE_RE = re.compile(
-    r"^### Example (\d+):[^\n]*\nSubject scope: [^\n]*\nUtterance: \"(.*)\"\nOutput:\n(.*)$",
+    r"^### Example (\d+):[^\n]*\n(?:Context:\n(?:[^\n]*\n)*?)?"
+    r"Subject scope: [^\n]*\nUtterance: \"(.*)\"\nOutput:\n(.*)$",
     re.MULTILINE,
 )
 

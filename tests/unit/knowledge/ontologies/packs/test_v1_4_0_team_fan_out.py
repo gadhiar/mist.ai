@@ -43,9 +43,12 @@ from eval_harness.score_extraction_run import parse_produced  # noqa: E402
 RULE_ID = "team-fan-out"
 HEADING = "Kestrel platform team at Varnholt"
 
-# The prompt hash and the extraction version before this rule: the rule runs after the
-# model, so neither moves. The rails hash before it, which does.
-PROMPT_HASH = "944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d"
+# The pack's prompt hash as released under r9, and the extraction version: the rule runs
+# after the model, so it moves neither. The prompt hash moved after the rule landed,
+# with T52's Rule 28, Example 30 and generated schema; before T52 it was
+# 944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d. The rails hash
+# before the rule, which the rule moves.
+PROMPT_HASH = "ac0dcd956bcb596a86bee1ab6a90a42661dff5347366fe859033a43067a75eac"
 EXTRACTION_VERSION = "2026-11-12-r9"
 RAILS_HASH_BEFORE = "6705d826291cb01f7f9b9f3057fa72ad8ab6aaa1cc17c6bdf3568e7dc2703c05"
 

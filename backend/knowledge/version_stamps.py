@@ -178,11 +178,20 @@ class PackRelease:
 # once more when the plug-in stopped reading a unit's own text, a member's item or a
 # line of prose, and read a team's employer from its heading or lead-in only, and
 # then when it stopped reading a context line nested below the team's, such as a
-# member's parent item: a replay each time, with no bump.
+# member's parent item: a replay each time, with no bump. The prompt hash moved again,
+# still under r9 and before any r9 release, when Rule 28 and Example 30 were brought to
+# the earlier units the engine shows since T48: under `EARLIER_ITEMS_HEADING`, each
+# rendered by `render_unit`, and only to a batch one of whose items refers back. In the
+# same change the Stage 2 schema came to be generated from the pack's declarations: it
+# limits each entity's and relationship's type to the extractable lists, and Metric
+# declares `quantity` beside `value` and `unit`, the three keys the schema requires of
+# a Metric's properties. The rails hash did not move.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
-    pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
+    # Before T52's Rule 28, Example 30 and generated schema:
+    # 944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d.
+    pack_prompt_hash="ac0dcd956bcb596a86bee1ab6a90a42661dff5347366fe859033a43067a75eac",
     pack_rails_hash="bc72f2458c8bc3a62a6843a08b0c11262880778912d2e387cdcedffc0582bc3d",
 )
 
@@ -339,7 +348,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-12-r9",
-        code_identity="ci1-05e08807f788c4e062ffd6bee50b85bbd87d307961131fbfb1f1c8dfc3456a7c",
+        # Before T52's Rule 28, Example 30 and generated schema, which move
+        # prompt_sha256, and the schema's code, which moves code_sha256:
+        # ci1-05e08807f788c4e062ffd6bee50b85bbd87d307961131fbfb1f1c8dfc3456a7c.
+        code_identity="ci1-61591c98b4b3dbef9c3a252cd43c11ade626fafdc93eb4de6d1fa3afcff1e86e",
         date="2026-11-12",
         reason=(
             "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
@@ -350,7 +362,14 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "lead-in or heading changes; each Stage 2 call leaves a batch record entry on "
             "the response; the pack's `unchecked-goals` item filter drops an unchecked item "
             "under no goal word, and a turn with no unit left makes its scope call and no "
-            "plan or Stage 2 call. Re-extracts history."
+            "plan or Stage 2 call; T52 brings Rule 28 and Example 30 to that form, so the "
+            "prompt says earlier units stand under EARLIER_ITEMS_HEADING and no longer "
+            "calls a `[user]:` line one; T52 also generates the Stage 2 schema from the "
+            "pack's declarations, so an entity's type is one of the pack's extractable "
+            "types and a relationship's one of its extractable edges, each entity carries "
+            "id, name and type and each relationship source, target and type, and a "
+            "Metric that writes properties writes value, unit and quantity, unit and "
+            "quantity possibly null. Re-extracts history."
         ),
     ),
 )

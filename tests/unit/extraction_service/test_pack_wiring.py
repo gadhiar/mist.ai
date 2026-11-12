@@ -25,7 +25,10 @@ import backend.extraction_service as service_package
 from backend.extraction_service import engine as engine_module
 from backend.extraction_service.app import create_app, run_identity_components
 from backend.extraction_service.engine import ExtractionEngine, _compute_prompt_sha256
-from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
+from backend.extraction_service.schemas import (
+    EXTRACTION_OUTPUT_SCHEMA,
+    generate_extraction_schema,
+)
 from backend.knowledge.extraction.run_identity import RunIdentityComponents
 from backend.knowledge.ontologies.pack import load_pack
 from backend.knowledge.ontologies.registry import active_pack
@@ -72,18 +75,29 @@ def test_the_engine_takes_the_registrys_active_pack_by_default(engine):
     assert engine.pack == active_pack()
 
 
-def test_the_active_packs_prompt_and_schema_are_the_ones_the_service_sent_before(adapter):
+def test_the_active_packs_prompt_and_generated_schema_are_the_ones_the_service_sends(adapter):
     pack = active_pack()
+    by_name = {node.type_name: node for node in pack.node_types}
 
     # The Stage 2 system prompt as the service held it at 058e52c, and the prompt hash
     # `test_turn_plan_off_pins.py` pins, which moved when T48 added the earlier items'
-    # heading to it.
+    # heading to it. The prompt moved again with T52's Rule 28 and Example 30, and the
+    # prompt hash with those and with T52's generated schema, which takes the place of
+    # the permissive constant; before T52 they were
+    # a486c5bfd3cd09175a5361d7de448a1254fc8f69475c3c967889849ea39584e4 and
+    # dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b.
     assert hashlib.sha256(pack.system_prompt.encode("utf-8")).hexdigest() == (
-        "a486c5bfd3cd09175a5361d7de448a1254fc8f69475c3c967889849ea39584e4"
+        "63e075e9aa9344bd558718e317b778014cf5415820b3a4eb682d54507f33fbb5"
     )
-    assert json.dumps(pack.extraction_schema) == json.dumps(EXTRACTION_OUTPUT_SCHEMA)
+    assert json.dumps(pack.extraction_schema) == json.dumps(
+        generate_extraction_schema(
+            entity_types=tuple(by_name[name] for name in pack.extractable_node_types),
+            relationship_types=pack.extractable_edge_types,
+        )
+    )
+    assert pack.extraction_schema != EXTRACTION_OUTPUT_SCHEMA
     assert _compute_prompt_sha256(adapter, pack=pack) == (
-        "dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b"
+        "3db8b2a7e7346efa14835792c38ff82123043bec67b82a017d5f67d18f719212"
     )
 
 

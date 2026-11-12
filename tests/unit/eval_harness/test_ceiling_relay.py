@@ -25,19 +25,21 @@ import pytest  # noqa: E402
 from backend.extraction_service.adapters import GptOssAdapter  # noqa: E402
 from backend.extraction_service.schemas import (  # noqa: E402
     DERIVATION_OUTPUT_SCHEMA,
-    EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
+from backend.knowledge.ontologies.registry import active_pack  # noqa: E402
 from backend.llm.llama_server_provider import LlamaServerProvider  # noqa: E402
 from backend.llm.models import LLMRequest, LLMResponse  # noqa: E402
 from scripts.eval_harness.ceiling import relay as rl  # noqa: E402
 from scripts.eval_harness.ceiling.store import served_text  # noqa: E402
 
 MODEL = "answerer-relay"
+# The Stage 2 schema the service sends: the one the active pack generated.
+STAGE_2_SCHEMA = active_pack().extraction_schema
 
 
 def _body(
-    schema: dict = EXTRACTION_OUTPUT_SCHEMA,
+    schema: dict = STAGE_2_SCHEMA,
     *,
     messages: list[dict] | None = None,
     temperature: float = 0.0,
@@ -73,7 +75,7 @@ def _extract_request() -> LLMRequest:
         temperature=0.0,
         max_tokens=2048,
         top_p=1.0,
-        response_schema=EXTRACTION_OUTPUT_SCHEMA,
+        response_schema=STAGE_2_SCHEMA,
     )
     return GptOssAdapter(reasoning_effort="low").prepare(request, stage="extract")
 
@@ -106,7 +108,7 @@ def test_request_key_is_stable_under_dict_order() -> None:
     body = _body()
     reordered = {k: body[k] for k in reversed(list(body))}
     reordered["response_format"] = {
-        "json_schema": {"strict": True, "schema": EXTRACTION_OUTPUT_SCHEMA, "name": "response"},
+        "json_schema": {"strict": True, "schema": STAGE_2_SCHEMA, "name": "response"},
         "type": "json_schema",
     }
 
@@ -154,7 +156,7 @@ def test_request_kind_follows_the_imported_stage_schemas() -> None:
     ]
 
     assert rl.request_kind(_body(SCOPE_OUTPUT_SCHEMA)) == "scope"
-    assert rl.request_kind(_body(EXTRACTION_OUTPUT_SCHEMA)) == "extract"
+    assert rl.request_kind(_body(STAGE_2_SCHEMA)) == "extract"
     assert rl.request_kind(_body(messages=repair_messages)) == "repair"
     assert rl.request_kind(_body(DERIVATION_OUTPUT_SCHEMA)) == "derive"
     assert rl.request_kind(_body({"type": "object"})) is None

@@ -30,11 +30,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from backend.errors import MistError
-from backend.extraction_service.schemas import (
-    DERIVATION_OUTPUT_SCHEMA,
-    EXTRACTION_OUTPUT_SCHEMA,
-    SCOPE_OUTPUT_SCHEMA,
-)
+from backend.extraction_service.schemas import DERIVATION_OUTPUT_SCHEMA, SCOPE_OUTPUT_SCHEMA
 
 from .store import OfferedRequest, served_text
 
@@ -155,19 +151,23 @@ def _body_schema(body: Mapping[str, Any]) -> Any:
 def request_kind(body: Mapping[str, Any]) -> str | None:
     """Name the engine stage that made a request, from the schema it constrains to.
 
-    The schemas are the service's own imported constants, so a schema change in the
-    service shows up here as None rather than as a wrong kind. An extract request that
-    already carries an assistant turn is the engine's repair attempt.
+    The schemas are the ones the service sends: its scope and derivation constants, and
+    for Stage 2 the schema the registry's active pack generated, the pack the service
+    reads. So a schema change in the service shows up here as None rather than as a
+    wrong kind. An extract request that already carries an assistant turn is the
+    engine's repair attempt.
 
     Returns:
         `scope`, `extract`, `repair` or `derive`, or None for a body matching no stage.
     """
+    from backend.knowledge.ontologies import registry
+
     schema = _body_schema(body)
     if schema == SCOPE_OUTPUT_SCHEMA:
         return "scope"
     if schema == DERIVATION_OUTPUT_SCHEMA:
         return "derive"
-    if schema == EXTRACTION_OUTPUT_SCHEMA:
+    if schema == registry.active_pack().extraction_schema:
         messages = body.get("messages")
         if isinstance(messages, list) and any(
             isinstance(m, dict) and m.get("role") == "assistant" for m in messages
