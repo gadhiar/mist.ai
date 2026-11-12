@@ -910,7 +910,14 @@ and sends no job, and the cutover reaches `ready`. [UNIT-TESTED:
 `TestReplayEpochEndToEnd`, for an epoch bound in the 3-part namespace (rule 3),
 and `TestAReplayCandidateOfAKeyedEpoch`, for an epoch bound keyed while another
 configuration claims the 3-part namespace (rule 4), in
-`tests/unit/extraction_backlog/test_replay_epoch.py`]
+`tests/unit/extraction_backlog/test_replay_epoch.py`] For an epoch bound keyed
+this holds only while the candidate binds keyed too: while another configuration
+claims the pair's 3-part namespace (rule 4), or, with no claim, while the pair's
+newest extracted 3-part row records another adapter, build or location label
+than the service reports (rule 5c). With no claim and no such row the candidate
+binds 3-part (rule 5b or 5c), does not read the epoch's keyed rows, and the fill
+extracts every turn that namespace lacks. [VERIFIED-IN-REPO: rules 4, 5b and 5c
+in `binding.py`]
 
 Sections 4 to 6 then apply unchanged. The check replays the cached rows under
 the new rails, and it runs from the code that holds the candidate's pack:
