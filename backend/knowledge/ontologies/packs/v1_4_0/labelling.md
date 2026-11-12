@@ -281,6 +281,9 @@ and the id of the prompt fragment that holds it, any other rule by its id in `co
 first four rows are the first rows of the extraction contract ADR's v14 amendment (ADR-054,
 2026-11-11), word for word. Each of them states its convention in full: a labeller applies the
 row, never a rule's code, and where the row is narrower than a line above it, the row governs.
+The last seven rows list the generic conventions of the gold guide
+(`data/gold/extraction/LABELLING.md`) that a rule of this pack carries, each under the key of its
+row in that guide's register.
 
 | Convention | Carrier | Class |
 |---|---|---|
@@ -306,3 +309,10 @@ row, never a rule's code, and where the row is narrower than a line above it, th
 | N11 Goal windows | Rule 37 in `prompt-rules-11-to-37` | prompt rule |
 | N12 Flipped preferences | Rule 6 in `prompt-rule-6` | prompt rule |
 | Habits and incidental scope | Rules 17 and 18 in `prompt-rules-11-to-37` | prompt rule |
+| Row schema | Rules 2 and 3 in `prompt-rules-1-to-3`, `technology-version` and `metric-id` | prompt rule and id rail |
+| N1 Id surface | Rule 2 in `prompt-rules-1-to-3`, and `n1-exempt` | prompt rule and id rail |
+| N15 An activity keeps its object | Rule 21 in `prompt-rules-11-to-37` | prompt rule |
+| N4 Name modifiers | Rule 23 in `prompt-rules-11-to-37` | prompt rule |
+| N6 Type by its test | Rules 14 and 20 in `prompt-rules-11-to-37`, and `prompt-constraints` | prompt rule |
+| Assertion kinds | Rule 6 in `prompt-rule-6` | prompt rule |
+| List-shaped probes (new) | Rule 29 in `prompt-rules-11-to-37` | prompt rule |

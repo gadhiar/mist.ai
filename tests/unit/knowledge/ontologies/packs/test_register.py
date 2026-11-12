@@ -37,6 +37,19 @@ A row that names an `item_filter` rule quotes the rule's test in its Convention 
 words after `one of these ... words ...:`, up to the full stop. They are a list parted by
 commas, whose last item may open with `and`, and `the phrase "x y"` quotes a phrase. The
 quoted words are the rule's `keep_context_words`, in any order.
+
+The gold guide, `data/gold/extraction/LABELLING.md`, holds the generic conventions: the
+ones about no type and no edge of one ontology. Its rows name a rule of the engine core, an
+engine function, or a prompt rule of whichever pack is active:
+
+    Rule 23 of the active pack            a prompt rule of the active pack, whose register
+                                          lists a row of the same key that names the
+                                          fragment holding the rule
+
+A generic row names at least one of the three and no pack rule by its id, since the id
+belongs to one pack and is in that pack's row. Its Class cell is read as a pack row's is.
+A section of the gold guide that states no labelling convention is named in
+`_NOT_CONVENTIONS`, with the reason.
 """
 
 from __future__ import annotations
@@ -375,6 +388,55 @@ def pack_register_problems(pack: Pack) -> list[str]:
     problems = [*register.problems, *_missing_rows(register)]
     for row in register.rows:
         problems.extend(_pack_row_problems(row, pack))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# The gold guide's register
+# ---------------------------------------------------------------------------
+
+
+def _generic_row_problems(row: Row, listed: Sequence[Row]) -> list[str]:
+    """What is wrong with one generic row, given the rows of the active pack's register."""
+    where = f"row `{row.key}`"
+    named = carriers(row.carrier)
+    carried_by, problems = _engine_carriers(named, where)
+    if not (named.engine_core or named.functions or named.active_pack):
+        problems.append(f"{where}: names no carrier")
+    for name in named.ids:
+        problems.append(f"{where}: `{name}` is a pack's rule, and a generic row names none by id")
+    in_the_pack = {
+        number
+        for pack_row in listed
+        if pack_row.key == row.key
+        for number, _ in carriers(pack_row.carrier).in_fragments
+    }
+    for number in named.active_pack:
+        if number in in_the_pack:
+            carried_by.add(PROMPT_RULE)
+        else:
+            problems.append(
+                f"{where}: the active pack's register lists no Rule {number} under this key"
+            )
+    return problems or _class_problems(row, where, carried_by)
+
+
+def guide_register_problems(
+    text: str, pack: Pack, not_conventions: Collection[str] = ()
+) -> list[str]:
+    """What is wrong with the register of the gold guide; empty when it holds.
+
+    Args:
+        text: The gold guide.
+        pack: The active pack. A row that names one of its prompt rules is checked
+            against its register, which `pack_register_problems` checks in its turn.
+        not_conventions: The guide's headings that state no labelling convention.
+    """
+    register = read_register(text, not_conventions)
+    listed = read_register(pack.labelling).rows
+    problems = [*register.problems, *_missing_rows(register)]
+    for row in register.rows:
+        problems.extend(_generic_row_problems(row, listed))
     return problems
 
 
@@ -826,3 +888,224 @@ def test_the_register_lists_the_event_date_rule_as_an_id_rail(v1_4_0: Pack):
 
     assert [row.key for row in rows] == ["Event and metric ids"]
     assert "id rail" in _LIST_BREAK_RE.split(rows[0].classes)
+
+
+# ---------------------------------------------------------------------------
+# The gold guide: its generic rows, and the failing cases on copies under `tmp_path`
+# ---------------------------------------------------------------------------
+
+_GUIDE = Path(__file__).resolve().parents[5] / "data" / "gold" / "extraction" / "LABELLING.md"
+
+# The gold guide's sections that state no labelling convention, so no rule of the prompt
+# or the engine could carry one. A heading added to the guide is a convention until it is
+# named here.
+_NOT_CONVENTIONS = frozenset(
+    {
+        # Who may open the held-out files: a rule about people, not about a label.
+        "The held-out rule",
+        # What a probe's author may write in an utterance, not how it is then labelled.
+        "Synthetic-data rule",
+        "Naming rule",
+        # Says where N1 to N16 came from; the rules under it carry the conventions.
+        "Conventions from the 60-probe set",
+        # How a tag names its category, how a set grows, and what was relabelled when.
+        "Categories",
+        "Extending the sets",
+        "Relabel log",
+    }
+)
+_GUIDE_LABELS = (
+    "Row schema",
+    "N1",
+    "N15",
+    "N4",
+    "N6",
+    "Assertion kinds",
+    "No-fact probes",
+    "List-shaped probes (new)",
+)
+
+_N4_ROW = "| N4 Name modifiers | Rule 23 of the active pack | prompt rule |"
+_VALIDATE = "backend.knowledge.extraction.validator.ExtractionValidator.validate"
+
+
+@pytest.fixture(scope="module")
+def active() -> Pack:
+    """The pack the engine runs with, whose prompt rules a generic row may name."""
+    return registry.active_pack()
+
+
+@pytest.fixture
+def guide_copy(tmp_path: Path) -> Callable[[Edit], str]:
+    """Write an edited copy of the gold guide under `tmp_path`, and read it back."""
+
+    def read(edit: Edit) -> str:
+        copy = tmp_path / _GUIDE.name
+        copy.write_text(edit(_GUIDE.read_text(encoding="utf-8")), encoding="utf-8")
+        return copy.read_text(encoding="utf-8")
+
+    return read
+
+
+def test_the_register_of_the_gold_guide_holds(active: Pack):
+    guide = _GUIDE.read_text(encoding="utf-8")
+
+    assert guide_register_problems(guide, active, _NOT_CONVENTIONS) == []
+
+
+def test_the_labels_of_the_gold_guide_are_its_four_rules_and_four_sections():
+    register = read_register(_GUIDE.read_text(encoding="utf-8"), _NOT_CONVENTIONS)
+
+    # `### Ids` has no line of its own, so the rules under it are the labels.
+    assert register.labels == _GUIDE_LABELS
+
+
+def test_each_section_named_as_no_convention_is_a_heading_of_the_gold_guide():
+    lines = _GUIDE.read_text(encoding="utf-8").splitlines()
+    headings = {match.group(1) for match in map(_HEADING_RE.match, lines) if match}
+
+    assert headings >= _NOT_CONVENTIONS
+
+
+def test_a_gold_guide_read_with_no_section_set_aside_fails(active: Pack):
+    guide = _GUIDE.read_text(encoding="utf-8")
+
+    assert sorted(guide_register_problems(guide, active)) == sorted(
+        f"{heading}: no row of the register holds this label" for heading in _NOT_CONVENTIONS
+    )
+
+
+def test_an_unedited_copy_of_the_gold_guide_holds(guide_copy, active: Pack):
+    guide = guide_copy(lambda text: text)
+
+    assert guide_register_problems(guide, active, _NOT_CONVENTIONS) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "problem"),
+    [
+        pytest.param(
+            f"\n{REGISTER_HEADING}\n",
+            f"\n### Quoted speech\n\nA fact a speaker is quoted on.\n\n{REGISTER_HEADING}\n",
+            "Quoted speech: no row of the register holds this label",
+            id="a-generic-section-with-no-row",
+        ),
+        pytest.param(
+            f"\n{REGISTER_HEADING}\n",
+            f"\n**N99 Quoted speech.** A fact a speaker is quoted on.\n\n{REGISTER_HEADING}\n",
+            "N99: no row of the register holds this label",
+            id="a-generic-numbered-rule-with-no-row",
+        ),
+        pytest.param(
+            f"{_N4_ROW}\n",
+            "",
+            "N4: no row of the register holds this label",
+            id="a-generic-row-taken-out",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | the prompt's rule on a name inside a name | prompt rule |",
+            "row `N4 Name modifiers`: names no carrier",
+            id="a-generic-row-that-names-no-carrier",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | | prompt rule |",
+            "row `N4 Name modifiers`: names no carrier",
+            id="an-empty-carrier-cell",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | `prompt-rules-11-to-37` | prompt rule |",
+            "row `N4 Name modifiers`: names no carrier",
+            id="a-pack-rule-alone",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | Rule 23 in `prompt-rules-11-to-37` | prompt rule |",
+            "row `N4 Name modifiers`: `prompt-rules-11-to-37` is a pack's rule, "
+            "and a generic row names none by id",
+            id="a-pack-rule-named-by-its-id",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | Rule 6 of the engine core | prompt rule |",
+            "row `N4 Name modifiers`: the engine core holds no Rule 6",
+            id="an-engine-core-rule-that-does-not-exist",
+        ),
+        pytest.param(
+            _N4_ROW,
+            f"| N4 Name modifiers | `{_VALIDATE}_names` | engine rule |",
+            f"row `N4 Name modifiers`: `{_VALIDATE}_names` is no function of the engine",
+            id="an-engine-function-that-does-not-exist",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | Rule 24 of the active pack | prompt rule |",
+            "row `N4 Name modifiers`: the active pack's register lists no Rule 24 under this key",
+            id="a-pack-rule-the-pack-lists-under-another-key",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | Rule 99 of the active pack | prompt rule |",
+            "row `N4 Name modifiers`: the active pack's register lists no Rule 99 under this key",
+            id="a-pack-rule-that-does-not-exist",
+        ),
+        pytest.param(
+            _N4_ROW,
+            "| N4 Name modifiers | Rule 23 of the active pack | engine rule |",
+            "row `N4 Name modifiers`: its Class cell reads `engine rule`, "
+            "and its carriers are prompt rule",
+            id="a-class-that-is-not-the-carriers",
+        ),
+        pytest.param(
+            "| Convention | Carrier | Class |",
+            "| Convention | Carrier |",
+            "the register's columns are not Convention, Carrier, Class: | Convention | Carrier |",
+            id="other-columns",
+        ),
+    ],
+)
+def test_a_gold_guide_register_that_does_not_hold_fails(
+    guide_copy, active: Pack, old: str, new: str, problem: str
+):
+    guide = guide_copy(_swap(old, new))
+
+    assert problem in guide_register_problems(guide, active, _NOT_CONVENTIONS)
+
+
+def test_a_gold_guide_with_no_register_fails(guide_copy, active: Pack):
+    guide = guide_copy(lambda text: text.split(f"\n{REGISTER_HEADING}\n")[0])
+
+    assert guide_register_problems(guide, active, _NOT_CONVENTIONS) == [
+        "the guide has no `## Register` section",
+        *(f"{label}: no row of the register holds this label" for label in _GUIDE_LABELS),
+    ]
+
+
+def test_a_generic_row_fails_when_the_pack_does_not_list_it(active: Pack):
+    lines = active.labelling.splitlines()
+    (listing,) = (line for line in lines if line.startswith("| N4 Name modifiers |"))
+    pack = dataclasses.replace(
+        active, labelling="\n".join(line for line in lines if line != listing)
+    )
+
+    assert pack_register_problems(pack) == []
+    assert guide_register_problems(_GUIDE.read_text(encoding="utf-8"), pack, _NOT_CONVENTIONS) == [
+        "row `N4 Name modifiers`: the active pack's register lists no Rule 23 under this key"
+    ]
+
+
+def test_the_pack_lists_a_generic_row_with_the_id_of_the_rule_that_carries_it(v1_4_0: Pack):
+    rows = {row.key: row for row in read_register(v1_4_0.labelling).rows}
+
+    # The gold guide's N1 is carried by the prompt's Rule 2 and the engine's N1 rail. The
+    # pack's row holds what is the pack's: the fragment with Rule 2, and the rule naming
+    # the types whose ids that rail skips.
+    assert carriers(rows["N1 Id surface"].carrier) == Carriers(
+        in_fragments=(("2", "prompt-rules-1-to-3"),),
+        engine_core=(),
+        active_pack=(),
+        ids=("prompt-rules-1-to-3", "n1-exempt"),
+        functions=(),
+    )
