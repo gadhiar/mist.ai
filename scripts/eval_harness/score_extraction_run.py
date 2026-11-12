@@ -18,7 +18,7 @@ import copy
 import json
 import re
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -363,8 +363,13 @@ def produced_from_response(
     )
 
 
-def build_produced_index(records: list[dict[str, Any]]) -> dict[str, Produced]:
-    """Index produced extractions by recovered (normalized) utterance."""
+def build_produced_index(
+    records: list[dict[str, Any]], *, relation_rails: bool = True
+) -> dict[str, Produced]:
+    """Index produced extractions by recovered (normalized) utterance.
+
+    `relation_rails=False` gives the model-written column's index.
+    """
     index: dict[str, Produced] = {}
     for rec in records:
         if rec.get("phase") != "llm_call" or rec.get("call_site") != EXTRACTION_CALL_SITE:
@@ -373,7 +378,7 @@ def build_produced_index(records: list[dict[str, Any]]) -> dict[str, Produced]:
         if not utterance:
             continue
         content = (rec.get("response") or {}).get("content") or ""
-        ok, entities, type_by_id, rels = parse_produced(content)
+        ok, entities, type_by_id, rels = parse_produced(content, relation_rails=relation_rails)
         if utterance in index and not ok:
             continue
         index[utterance] = Produced(
@@ -913,6 +918,128 @@ def relation_rails_counts(
     return dict(zip(RELATION_RAILS_COUNTS, (added, removed, found_only), strict=True))
 
 
+HEADLINE_COLUMN = "exact k1-4"
+MODEL_WRITTEN_COLUMN = "model-written"
+
+
+def column_summary(
+    probes: list[GoldProbe],
+    headline_index: Mapping[str, Produced],
+    model_written_index: Mapping[str, Produced],
+    *,
+    seed: int,
+    b: int,
+    confidence: float,
+) -> dict[str, Any]:
+    """Both columns of a run, the rails effect between them and the three counts.
+
+    Each column holds recall, precision and F1 on the headline basis (alignment kinds 1
+    to 4) and the same on the aligned basis, each with its cluster-bootstrap interval by
+    probe tag. `rails_effect` is the headline minus the model-written column over the
+    same probes, with paired intervals: what the relation rails moved (plan v15, T50).
+
+    Args:
+        probes: The gold probes.
+        headline_index: The run's index with every rail run.
+        model_written_index: The same rows with the relation rails switched off.
+        seed: The bootstrap seed.
+        b: The bootstrap replicates.
+        confidence: The interval's confidence.
+    """
+    # Imported here: the bench probe's module imports this one when it scores.
+    from scripts.model_bench.probes.extraction import (
+        cluster_bootstrap_paired_difference_ci,
+        cluster_bootstrap_ratio_ci,
+        per_probe_aligned_rel_counts,
+    )
+
+    def interval(counts: Mapping[str, tuple[int, int, int]], kind: str) -> list[float] | None:
+        bounds = cluster_bootstrap_ratio_ci(
+            counts, n_replicates=b, seed=seed, confidence=confidence, kind=kind
+        )
+        return None if bounds is None else list(bounds)
+
+    def figures(
+        counts: Mapping[str, tuple[int, int, int]], recall: float, precision: float, f1: float
+    ) -> dict[str, Any]:
+        tp = sum(c[0] for c in counts.values())
+        fp = sum(c[1] for c in counts.values())
+        fn = sum(c[2] for c in counts.values())
+        return {
+            "recall": {"value": recall, "tp": tp, "n": tp + fn, "ci95": interval(counts, "recall")},
+            "precision": {
+                "value": precision,
+                "tp": tp,
+                "n": tp + fp,
+                "ci95": interval(counts, "precision"),
+            },
+            "f1": {"value": f1, "ci95": interval(counts, "f1")},
+        }
+
+    reports: dict[str, Report] = {}
+    headline_counts: dict[str, dict[str, tuple[int, int, int]]] = {}
+    columns: dict[str, Any] = {}
+    for column, index in (
+        (HEADLINE_COLUMN, headline_index),
+        (MODEL_WRITTEN_COLUMN, model_written_index),
+    ):
+        report = score_run(probes, dict(index))
+        counts = headline_rel_counts(report.per_probe)
+        columns[column] = {
+            **figures(
+                counts,
+                report.headline_rel_recall,
+                report.headline_rel_precision,
+                report.headline_rel_f1,
+            ),
+            "aligned": figures(
+                per_probe_aligned_rel_counts(report.per_probe),
+                report.aligned_rel_recall,
+                report.aligned_rel_precision,
+                report.aligned_rel_f1,
+            ),
+        }
+        reports[column] = report
+        headline_counts[column] = counts
+    with_rails, without = reports[HEADLINE_COLUMN], reports[MODEL_WRITTEN_COLUMN]
+
+    def paired(kind: str) -> list[float] | None:
+        bounds = cluster_bootstrap_paired_difference_ci(
+            headline_counts[MODEL_WRITTEN_COLUMN],
+            headline_counts[HEADLINE_COLUMN],
+            n_replicates=b,
+            seed=seed,
+            confidence=confidence,
+            kind=kind,
+        )
+        return None if bounds is None else list(bounds)
+
+    return {
+        "columns": columns,
+        "rails_effect": {
+            f"{kind}_diff": {
+                "value": getattr(with_rails, f"headline_rel_{kind}")
+                - getattr(without, f"headline_rel_{kind}"),
+                "ci95": paired(kind),
+            }
+            for kind in ("recall", "precision", "f1")
+        },
+        **relation_rails_counts(probes, headline_index, model_written_index),
+    }
+
+
+def headline_rel_counts(per_probe: list[dict[str, Any]]) -> dict[str, tuple[int, int, int]]:
+    """(tp, fp, fn) per probe tag on the headline, as the bootstrap reads aligned counts."""
+    return {
+        str(p["tag"]): (
+            p["gold_relationships"] - len(p["headline_rel_fns"]),
+            len(p["headline_rel_fps"]),
+            len(p["headline_rel_fns"]),
+        )
+        for p in per_probe
+    }
+
+
 ENTITY_PRECISION_GATE = 0.90
 ENTITY_RECALL_GATE = 0.80
 REL_PRECISION_GATE = 0.90
@@ -980,7 +1107,63 @@ def _row(
     return f"| {name} | {value:.3f} | {count} | {op} {gate:.2f} | {'PASS' if ok else 'FAIL'} |"
 
 
-def render_markdown(report: Report, identity: Mapping[str, object] | None = None) -> str:
+def _ci_text(bounds: Sequence[float] | None, *, signed: bool = False) -> str:
+    if bounds is None:
+        return "ci95 n/a"
+    spec = "+.3f" if signed else ".3f"
+    return f"ci95 [{format(bounds[0], spec)}, {format(bounds[1], spec)}]"
+
+
+def _column_lines(columns: Mapping[str, Any]) -> list[str]:
+    """The summary's column table, the rails effect line and the three counts."""
+
+    def ratio(figure: Mapping[str, Any]) -> str:
+        return f"{figure['value']:.3f} ({figure['tp']}/{figure['n']}) {_ci_text(figure['ci95'])}"
+
+    def f1(figure: Mapping[str, Any]) -> str:
+        return f"{figure['value']:.3f} {_ci_text(figure['ci95'])}"
+
+    lines = [
+        "## Columns",
+        "",
+        f"`{HEADLINE_COLUMN}` scores the payload after every rail, counting relations found "
+        f"through alignment kinds 1 to 4; `{MODEL_WRITTEN_COLUMN}` scores it with the "
+        "relation rails switched off. The aligned figures count kinds 1 to 6.",
+        "",
+        "| Column | Recall | Precision | F1 | Aligned recall | Aligned precision | Aligned F1 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for name, column in columns["columns"].items():
+        aligned = column["aligned"]
+        lines.append(
+            f"| {name} | {ratio(column['recall'])} | {ratio(column['precision'])} | "
+            f"{f1(column['f1'])} | {ratio(aligned['recall'])} | {ratio(aligned['precision'])} | "
+            f"{f1(aligned['f1'])} |"
+        )
+    effect = "; ".join(
+        f"{kind} {effect['value']:+.3f} {_ci_text(effect['ci95'], signed=True)}"
+        for kind, effect in (
+            (kind, columns["rails_effect"][f"{kind}_diff"])
+            for kind in ("recall", "precision", "f1")
+        )
+    )
+    counts = " ".join(f"{field}={columns[field]}" for field in RELATION_RAILS_COUNTS)
+    return [
+        *lines,
+        "",
+        f"Rails effect ({HEADLINE_COLUMN} minus {MODEL_WRITTEN_COLUMN}): {effect}",
+        "",
+        counts,
+        "",
+    ]
+
+
+def render_markdown(
+    report: Report,
+    identity: Mapping[str, object] | None = None,
+    columns: Mapping[str, Any] | None = None,
+) -> str:
+    """Render the human-readable report; `columns` (`column_summary`) adds its section."""
     lines = [
         "# Extraction Accuracy Report (F2)",
         "",
@@ -1069,6 +1252,7 @@ def render_markdown(report: Report, identity: Mapping[str, object] | None = None
         f"{_render_count(report.negative_violations, report.negative_probes)} | == 0 | "
         f"{'PASS' if report.negative_violations == 0 else 'FAIL'} |",
         "",
+        *([] if columns is None else _column_lines(columns)),
         "## Assertion-kind buckets",
         "",
         "Derivation is the engine's own `derive_assertion_kind` (shared, not "
@@ -1089,18 +1273,23 @@ def render_markdown(report: Report, identity: Mapping[str, object] | None = None
     return "\n".join(lines) + "\n"
 
 
-def render_json(report: Report, identity: Mapping[str, object] | None = None) -> str:
+def render_json(
+    report: Report,
+    identity: Mapping[str, object] | None = None,
+    columns: Mapping[str, Any] | None = None,
+) -> str:
     """Render the machine-readable report, counts included.
 
     `render_markdown`'s Count column and these fields read the same Report
     attributes -- this is the durable artifact, so a ratio without its
     backing numerator/denominator here is exactly as unfalsifiable as it
     would be in the markdown table. `identity` (`reading_identity`) leads the
-    report when given.
+    report when given, and `columns` (`column_summary`) follows it.
     """
     return json.dumps(
         {
             **(dict(identity) if identity is not None else {}),
+            **(dict(columns) if columns is not None else {}),
             "total_probes": report.total_probes,
             "matched_probes": report.matched_probes,
             "vacuous": report.vacuous,
@@ -1183,9 +1372,22 @@ def main(argv: list[str] | None = None) -> int:
     identity = reading_identity(args.gold)
     probes = iter_gold_probes(args.gold)
     records = iter_debug_records(args.debug_jsonl, session_id=args.session_id)
-    report = score_run(probes, build_produced_index(records))
+    index = build_produced_index(records)
+    report = score_run(probes, index)
+    # Imported here: the bench probe's module imports this one when it scores.
+    from scripts.model_bench.probes.extraction import load_bootstrap_params
+
+    seed, b, confidence, _ = load_bootstrap_params()
+    columns = column_summary(
+        probes,
+        index,
+        build_produced_index(records, relation_rails=False),
+        seed=seed,
+        b=b,
+        confidence=confidence,
+    )
     score_reconciliation()
-    md = render_markdown(report, identity)
+    md = render_markdown(report, identity, columns)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(md, encoding="utf-8")
@@ -1193,7 +1395,7 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
     if args.json_output:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
-        args.json_output.write_text(render_json(report, identity), encoding="utf-8")
+        args.json_output.write_text(render_json(report, identity, columns), encoding="utf-8")
     if args.strict and not _gates_pass(report):
         return 1
     return 0

@@ -1812,3 +1812,176 @@ class TestTheHeadlineAndTheModelWrittenColumn:
             "relation_rails_removed": 0,
             "found_only_by_relation_rails": 0,
         }
+
+
+class TestEverySummaryPrintsBothColumns:
+    """Plan v15, T50 Acceptance 2: each summary prints both columns and the three counts.
+
+    The headline index finds both gold relations; the model-written index lacks the
+    `t-acme` edge, as if a relation rail had added it.
+    """
+
+    _SEED, _B, _CONFIDENCE = 0, 2000, 0.95
+
+    @staticmethod
+    def _indexes():
+        acme = [GoldEntity("user", "User"), GoldEntity("acme-corp", "Organization")]
+        board = [GoldEntity("user", "User"), GoldEntity("kestrel-board", "Project")]
+
+        def produced(probe, entities, edges):
+            return _produced(probe.utterance, entities, edges, {e.id: e.type for e in entities})
+
+        typo = produced(_TYPO, board, [_edge("user", "WORKS_ON", "kestrel-board")])
+        headline = {
+            _ACME.utterance: produced(_ACME, acme, [_edge("user", "WORKS_AT", "acme-corp")]),
+            _TYPO.utterance: typo,
+        }
+        model_written = {_ACME.utterance: produced(_ACME, acme, []), _TYPO.utterance: typo}
+        return headline, model_written
+
+    def _summary(self):
+        from eval_harness.score_extraction_run import column_summary
+
+        headline, model_written = self._indexes()
+        return column_summary(
+            [_ACME, _TYPO],
+            headline,
+            model_written,
+            seed=self._SEED,
+            b=self._B,
+            confidence=self._CONFIDENCE,
+        )
+
+    def _ci(self, counts, kind):
+        from scripts.model_bench.probes.extraction import cluster_bootstrap_ratio_ci
+
+        bounds = cluster_bootstrap_ratio_ci(
+            counts, n_replicates=self._B, seed=self._SEED, confidence=self._CONFIDENCE, kind=kind
+        )
+        return None if bounds is None else list(bounds)
+
+    def _diff_ci(self, first, second, kind):
+        from scripts.model_bench.probes.extraction import cluster_bootstrap_paired_difference_ci
+
+        bounds = cluster_bootstrap_paired_difference_ci(
+            first,
+            second,
+            n_replicates=self._B,
+            seed=self._SEED,
+            confidence=self._CONFIDENCE,
+            kind=kind,
+        )
+        return None if bounds is None else list(bounds)
+
+    def _column(self, counts, recall, precision, f1):
+        tp = sum(c[0] for c in counts.values())
+        figures = {
+            "recall": {"value": recall, "tp": tp, "n": 2, "ci95": self._ci(counts, "recall")},
+            "precision": {
+                "value": precision,
+                "tp": tp,
+                "n": tp,
+                "ci95": self._ci(counts, "precision"),
+            },
+            "f1": {"value": f1, "ci95": self._ci(counts, "f1")},
+        }
+        # Every pair here is exact, so the aligned figures equal the headline's.
+        return {**figures, "aligned": figures}
+
+    def test_the_summary_holds_both_columns_the_rails_effect_and_the_counts(self):
+        headline = {"t-acme": (1, 0, 0), "t-typo": (1, 0, 0)}
+        model_written = {"t-acme": (0, 0, 1), "t-typo": (1, 0, 0)}
+
+        assert self._summary() == {
+            "columns": {
+                "exact k1-4": self._column(headline, 1.0, 1.0, 1.0),
+                "model-written": self._column(model_written, 0.5, 1.0, 2 / 3),
+            },
+            "rails_effect": {
+                "recall_diff": {
+                    "value": 0.5,
+                    "ci95": self._diff_ci(model_written, headline, "recall"),
+                },
+                "precision_diff": {
+                    "value": 0.0,
+                    "ci95": self._diff_ci(model_written, headline, "precision"),
+                },
+                "f1_diff": {
+                    "value": 1 - 2 / 3,
+                    "ci95": self._diff_ci(model_written, headline, "f1"),
+                },
+            },
+            "relation_rails_added": 1,
+            "relation_rails_removed": 0,
+            "found_only_by_relation_rails": 1,
+        }
+
+    def test_render_json_carries_the_columns_after_the_identity(self):
+        columns = self._summary()
+        identity = {"scorer_sha": "s", "gold_version": "g"}
+        out = json.loads(render_json(score_run([_ACME, _TYPO], {}), identity, columns))
+        assert list(out)[:2] == ["scorer_sha", "gold_version"]
+        assert {key: out[key] for key in columns} == json.loads(json.dumps(columns))
+
+    def test_render_markdown_prints_both_columns_the_rails_effect_and_the_counts(self):
+        columns = self._summary()
+        md = render_markdown(score_run([_ACME, _TYPO], {}), None, columns)
+
+        def ratio(figure):
+            return f"{figure['value']:.3f} ({figure['tp']}/{figure['n']}) {ci(figure['ci95'])}"
+
+        def ci(bounds, sign=""):
+            return f"ci95 [{bounds[0]:{sign}.3f}, {bounds[1]:{sign}.3f}]"
+
+        def row(name):
+            c = columns["columns"][name]
+            a = c["aligned"]
+            return (
+                f"| {name} | {ratio(c['recall'])} | {ratio(c['precision'])} | "
+                f"{c['f1']['value']:.3f} {ci(c['f1']['ci95'])} | {ratio(a['recall'])} | "
+                f"{ratio(a['precision'])} | {a['f1']['value']:.3f} {ci(a['f1']['ci95'])} |"
+            )
+
+        effect = columns["rails_effect"]
+        assert (
+            "| Column | Recall | Precision | F1 | Aligned recall | Aligned precision | "
+            "Aligned F1 |"
+        ) in md
+        assert row("exact k1-4") in md
+        assert row("model-written") in md
+        assert (
+            "Rails effect (exact k1-4 minus model-written): "
+            f"recall {effect['recall_diff']['value']:+.3f} "
+            f"{ci(effect['recall_diff']['ci95'], '+')}; "
+            f"precision {effect['precision_diff']['value']:+.3f} "
+            f"{ci(effect['precision_diff']['ci95'], '+')}; "
+            f"f1 {effect['f1_diff']['value']:+.3f} {ci(effect['f1_diff']['ci95'], '+')}"
+        ) in md
+        assert (
+            "relation_rails_added=1 relation_rails_removed=0 found_only_by_relation_rails=1"
+        ) in md
+
+    def test_the_cli_writes_both_columns_into_both_reports(self, tmp_path):
+        gold = tmp_path / "gold.jsonl"
+        gold.write_text(json.dumps({"utterance": "I use Rust", "tag": "t1"}) + "\n")
+        debug = tmp_path / "debug.jsonl"
+        debug.write_text("", encoding="utf-8")
+        md, js = tmp_path / "report.md", tmp_path / "report.json"
+        argv = ["--gold", str(gold), "--debug-jsonl", str(debug), "--output", str(md)]
+        assert main([*argv, "--json-output", str(js)]) == 0
+        payload = json.loads(js.read_text(encoding="utf-8"))
+        assert list(payload["columns"]) == ["exact k1-4", "model-written"]
+        assert {
+            key: payload[key] for key in ("relation_rails_added", "relation_rails_removed")
+        } == {
+            "relation_rails_added": 0,
+            "relation_rails_removed": 0,
+        }
+        text = md.read_text(encoding="utf-8")
+        assert "| exact k1-4 | " in text
+        assert "| model-written | " in text
+
+    def test_no_columns_prints_no_column_section(self):
+        md = render_markdown(score_run([_ACME], {}))
+        assert "| Column |" not in md
+        assert "columns" not in json.loads(render_json(score_run([_ACME], {})))
