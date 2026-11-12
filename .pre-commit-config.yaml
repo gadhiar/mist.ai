@@ -52,6 +52,15 @@ repos:
         pass_filenames: true
         files: \.(py|md|txt|ya?ml|json|dart|sh)$
 
+      # This repository is public: a voice clip committed once is published for good. The hook
+      # fails on any audio file, whatever its directory or case, and has no exclude on purpose
+      # (pinned by tests/unit/test_precommit_no_audio.py).
+      - id: no-audio-files
+        name: Refuse audio files
+        entry: Audio files are not committed to this repository; keep them outside the checkout.
+        language: fail
+        files: (?i)\.(wav|mp3|flac|ogg|opus|m4a|aac|aif|aiff|wma|webm)$
+
   # General file quality checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
