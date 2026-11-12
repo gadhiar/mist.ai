@@ -443,6 +443,191 @@ def test_normalize_payload_dates_an_event_after_the_entity_steps_and_remaps_its_
     ]
 
 
+# --- the row's batch record -----------------------------------------------------------------
+
+
+def _listed_under(lead_in: str, entities: list[dict]) -> list[dict]:
+    """A batch record of one call, whose one unit sits under `lead_in`."""
+    return [
+        {
+            "units": [{"text": "an item", "context": [lead_in], "kind": "list_item"}],
+            "context": [],
+            "payload": {"entities": copy.deepcopy(entities), "relationships": []},
+            "prompt_tokens": 120,
+            "completion_tokens": 40,
+            "finish": "stop",
+        }
+    ]
+
+
+def _weekend() -> tuple[list[dict], list[dict]]:
+    entities = [
+        {"id": "user", "name": "user", "type": "User"},
+        {"id": "harbour-weekend-ferry-crossing", "name": "Ferry crossing", "type": "Event"},
+        {"id": "2026-05-30", "name": "2026-05-30", "type": "Date"},
+    ]
+    relationships = [
+        {"source": "user", "target": "harbour-weekend-ferry-crossing", "type": "EXPERIENCED"},
+        _on("harbour-weekend-ferry-crossing", "2026-05-30"),
+    ]
+    return entities, relationships
+
+
+def test_normalize_payload_hands_the_batch_record_to_the_rails():
+    entities, relationships = _weekend()
+    record = _listed_under("Harbour weekend", entities)
+
+    out_entities, out_relationships = normalize_payload(
+        entities, relationships, batch_record=record
+    )
+
+    assert [e["id"] for e in out_entities] == ["user", "ferry-crossing-2026-05-30", "2026-05-30"]
+    assert [(r["source"], r["target"]) for r in out_relationships] == [
+        ("user", "ferry-crossing-2026-05-30"),
+        ("ferry-crossing-2026-05-30", "2026-05-30"),
+    ]
+
+
+def test_normalize_payload_without_a_batch_record_is_a_row_extracted_as_one_batch():
+    out_entities, _ = normalize_payload(*_weekend())
+
+    assert out_entities[1]["id"] == "harbour-weekend-ferry-crossing-2026-05-30"
+
+
+@pytest.mark.asyncio
+async def test_normalize_payload_equals_the_normalizer_on_the_same_batch_record():
+    entities, relationships = _weekend()
+    record = _listed_under("Harbour weekend", entities)
+    rail_entities, rail_relationships = normalize_payload(
+        copy.deepcopy(entities), copy.deepcopy(relationships), batch_record=record
+    )
+    normalizer = EntityNormalizer(embedding_generator=FakeEmbeddingGenerator(), executor=None)
+
+    out = await normalizer.normalize(
+        ExtractionResult(entities=entities, relationships=relationships), batch_record=record
+    )
+
+    assert out.entities == rail_entities
+    assert out.relationships == rail_relationships
+
+
+# --- the near-duplicate merge, on today's ontology ------------------------------------------
+
+
+def _has_metric(source: str, target: str) -> dict:
+    return {"source": source, "target": target, "type": "HAS_METRIC"}
+
+
+def test_one_service_written_under_two_spellings_of_its_id_is_one_entity():
+    # The pair of the pack's `metric-id` case: one name, two ids one letter apart.
+    entities = [
+        {
+            "id": "saltmere-matchmaking-service",
+            "name": "Salmere matchmaking service",
+            "type": "Technology",
+        },
+        {"id": "38-ms-latency", "name": "38-ms-latency", "type": "Metric"},
+        {
+            "id": "salmere-matchmaking-service",
+            "name": "Salmere matchmaking service",
+            "type": "Technology",
+        },
+        {"id": "410-ms-latency", "name": "410-ms-latency", "type": "Metric"},
+    ]
+    relationships = [
+        _has_metric("saltmere-matchmaking-service", "38-ms-latency"),
+        _has_metric("salmere-matchmaking-service", "410-ms-latency"),
+        _has_metric("salmere-matchmaking-service", "38-ms-latency"),
+    ]
+
+    out_entities, out_relationships = normalize_payload(entities, relationships)
+
+    assert [e["id"] for e in out_entities] == [
+        "saltmere-matchmaking-service",
+        "38-ms-latency",
+        "410-ms-latency",
+    ]
+    assert out_relationships == [
+        _has_metric("saltmere-matchmaking-service", "38-ms-latency"),
+        _has_metric("saltmere-matchmaking-service", "410-ms-latency"),
+    ]
+
+
+def test_two_people_one_letter_apart_stay_two_under_two_names_and_are_one_under_one_name():
+    # Dana Orrin and Dane Orrin are two people, and their names say so. Written under
+    # one name, the two ids are read as two spellings of it: the merge cannot tell two
+    # people the model named alike from one. The earlier is kept, and the later one's
+    # edges become hers.
+    def payload(second_name: str) -> tuple[list[dict], list[dict]]:
+        entities = [
+            {"id": "user", "name": "user", "type": "User"},
+            {"id": "dana-orrin", "name": "Dana Orrin", "type": "Person"},
+            {"id": "dane-orrin", "name": second_name, "type": "Person"},
+            {"id": "brindle-works", "name": "Brindle Works", "type": "Organization"},
+        ]
+        relationships = [
+            {"source": "user", "target": "dana-orrin", "type": "KNOWS_PERSON"},
+            {"source": "user", "target": "dane-orrin", "type": "KNOWS_PERSON"},
+            {"source": "dane-orrin", "target": "brindle-works", "type": "WORKS_AT"},
+        ]
+        return entities, relationships
+
+    two, two_relationships = normalize_payload(*payload("Dane Orrin"))
+    one, one_relationships = normalize_payload(*payload("Dana Orrin"))
+
+    assert [e["id"] for e in two] == ["user", "dana-orrin", "dane-orrin", "brindle-works"]
+    assert two_relationships == payload("Dane Orrin")[1]
+    assert [e["id"] for e in one] == ["user", "dana-orrin", "brindle-works"]
+    assert one_relationships == [
+        {"source": "user", "target": "dana-orrin", "type": "KNOWS_PERSON"},
+        {"source": "dana-orrin", "target": "brindle-works", "type": "WORKS_AT"},
+    ]
+
+
+def test_two_dates_or_two_metrics_one_letter_apart_under_one_name_are_never_merged():
+    # Both types are ones the pack's `id_exempt` rule names.
+    entities = [
+        {"id": "jun-2026", "name": "that month", "type": "Date"},
+        {"id": "jul-2026", "name": "that month", "type": "Date"},
+        {"id": "peak-cpu", "name": "peak usage", "type": "Metric"},
+        {"id": "peak-gpu", "name": "peak usage", "type": "Metric"},
+    ]
+
+    out_entities, _ = normalize_payload(entities, [])
+
+    assert [e["id"] for e in out_entities] == ["jun-2026", "jul-2026", "peak-cpu", "peak-gpu"]
+
+
+def test_a_person_and_an_organization_one_letter_apart_under_one_name_are_never_merged():
+    entities = [
+        {"id": "orrin", "name": "Orrin", "type": "Person"},
+        {"id": "orrim", "name": "Orrin", "type": "Organization"},
+    ]
+
+    out_entities, _ = normalize_payload(entities, [])
+
+    assert [e["id"] for e in out_entities] == ["orrin", "orrim"]
+
+
+def test_what_the_pack_stores_for_two_pairs_the_merge_leaves_alone():
+    # The merge joins neither pair: each has two names. The pack's version rule then
+    # stores the two versions under one id, and its alias gives `C#` its own.
+    versions = [
+        {"id": "quillscript-3-11", "name": "Quillscript 3.11", "type": "Technology"},
+        {"id": "quillscript-3-12", "name": "Quillscript 3.12", "type": "Technology"},
+    ]
+    languages = [
+        {"id": "c", "name": "C", "type": "Technology"},
+        {"id": "c#", "name": "C#", "type": "Technology"},
+    ]
+
+    stored_versions, _ = normalize_payload(versions, [])
+    stored_languages, _ = normalize_payload(languages, [])
+
+    assert [(e["id"], e["name"]) for e in stored_versions] == [("quillscript", "Quillscript 3.11")]
+    assert [e["id"] for e in stored_languages] == ["c", "c-sharp"]
+
+
 def test_id_rails_imports_nothing_from_scripts_and_no_io_dependency():
     source = Path(id_rails.__file__).read_text(encoding="utf-8")
     imports = [line for line in source.splitlines() if line.startswith(("import ", "from "))]
@@ -450,5 +635,5 @@ def test_id_rails_imports_nothing_from_scripts_and_no_io_dependency():
     assert imports == [
         "from __future__ import annotations",
         "import re",
-        "from collections.abc import Mapping",
+        "from collections.abc import Mapping, Sequence",
     ]

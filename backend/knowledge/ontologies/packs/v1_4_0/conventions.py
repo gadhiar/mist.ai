@@ -276,10 +276,11 @@ _STATIC_ALIASES_CASE = _case(
 )
 
 # The tuning run's payload for dvl-39, which writes several of its numbers more than once.
-# The service entity is written twice, under two spellings of its id, and stays two
-# entities: no rule joins them. A Metric that states its value takes the id the metric
-# rail builds from it, and where that is the id of a Metric written earlier, the earlier
-# one is kept.
+# The service entity is written twice, under two spellings of its id and one name. No
+# rule of this pack joins them: the engine's near-duplicate merge joins the two spellings
+# under the first, so the second entity is gone and its edges are the first's. A Metric
+# that states its value takes the id the metric rail builds from it, and where that is
+# the id of a Metric written earlier, the earlier one is kept.
 _SERVICE = "saltmere-matchmaking-service"
 _SERVICE_AGAIN = "salmere-matchmaking-service"
 _STATED_FIRST = (
@@ -322,6 +323,23 @@ _STATED_FIRST_EDGES = (
     _edge(_SERVICE_AGAIN, "2400-matches-per-minute", "HAS_METRIC"),
     _edge(_SERVICE_AGAIN, "180-queue-depth", "HAS_METRIC"),
 )
+# What is stored for the two: the first service entity alone, holding its own edges and
+# then the second's. The second's edge to `0-2-percent-error-rate` repeats one of the
+# first's and is stored once.
+_STORED_FIRST = tuple(entity for entity in _STATED_FIRST if entity["id"] != _SERVICE_AGAIN)
+_STORED_FIRST_EDGES = (
+    _edge(_SERVICE, "38-ms-p50-latency", "HAS_METRIC"),
+    _edge(_SERVICE, "410-ms-p99-latency", "HAS_METRIC"),
+    _edge(_SERVICE, "9500-requests-per-second-peak-throughput", "HAS_METRIC"),
+    _edge(_SERVICE, "0-2-percent-error-rate", "HAS_METRIC"),
+    _edge(_SERVICE, "38-ms-latency", "HAS_METRIC"),
+    _edge(_SERVICE, "410-ms-latency", "HAS_METRIC"),
+    _edge(_SERVICE, "9500-requests-per-second-throughput", "HAS_METRIC"),
+    _edge(_SERVICE, "71-percent-cpu", "HAS_METRIC"),
+    _edge(_SERVICE, "3-1-gb-memory", "HAS_METRIC"),
+    _edge(_SERVICE, "2400-matches-per-minute", "HAS_METRIC"),
+    _edge(_SERVICE, "180-queue-depth", "HAS_METRIC"),
+)
 _METRIC_ID_CASE = _case(
     (
         _USER,
@@ -345,7 +363,7 @@ _METRIC_ID_CASE = _case(
     ),
     (
         _USER,
-        *_STATED_FIRST,
+        *_STORED_FIRST,
         {**_CPU_AT_PEAK, "id": "71-percent-cpu-usage"},
         {**_MEMORY_AT_PEAK, "id": "3-1-gb-memory-usage"},
         {**_QUEUE_DEPTH_MAX, "id": "180-depth-queue-depth"},
@@ -364,7 +382,7 @@ _METRIC_ID_CASE = _case(
         _edge("user", "queue-depth-max", "HAS_METRIC"),
     ),
     expected_relationships=(
-        *_STATED_FIRST_EDGES,
+        *_STORED_FIRST_EDGES,
         _edge("user", "38-ms-latency", "HAS_METRIC"),
         _edge("user", "410-ms-latency", "HAS_METRIC"),
         _edge("user", "9500-requests-per-second-throughput", "HAS_METRIC"),

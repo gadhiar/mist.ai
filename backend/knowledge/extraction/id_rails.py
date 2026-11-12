@@ -21,7 +21,7 @@ that call them, because both import this module.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 # Bounded curated (id, type) overrides for recurring high-value entities, keyed by the id
 # the pack's alias vocabularies give. Seeded later from curated vocab (the versioned seed
@@ -133,20 +133,37 @@ def event_date_rail(entities: list[dict], relationships: list[dict]) -> dict[str
 
 
 def normalize_payload(
-    entities: list[dict], relationships: list[dict]
+    entities: list[dict],
+    relationships: list[dict],
+    *,
+    batch_record: Sequence[Mapping] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run the rails over one payload: `rails.run_rails` with the active pack.
 
-    The payload stands for a row with no scope, batch record or plan. Each entity's
-    stored id is built; relationship endpoints that name an entity's `id` field are
-    remapped to its stored id; the id-phase `derived_edge` rules run, and the endpoints
-    naming a renamed entity are remapped again; entities are deduplicated first-wins by
-    id, and relationships by (source, target, type). The entity and relationship dicts
-    are changed in place.
+    The payload stands for a row with no scope and no plan, and with the batch record
+    the caller hands over. Before any id is built, an entity that is not settled, of a
+    type the pack does not exempt, is merged into an earlier entity of its type with an
+    equal display name when the slugs of the two written ids are equal or one edit
+    apart, and the edit touches no digit and replaces no one-character token
+    (`rails._merge_near_duplicates`): it is dropped, an edge between the two is
+    dropped, and the endpoints that name it then name the earlier one. Each entity's
+    stored id is built: the id of an entity that is not settled, of a type the pack
+    does not exempt, first loses the context its batch was read under when the record
+    names one (`rails._own_contexts`) and that context may be dropped
+    (`rails._strip_own_contexts`: it names no entity of the payload, and neither what
+    is left nor the id the id rules after the strip build from it is the user anchor's
+    id or a reserved name or id). Relationship endpoints that name an
+    entity's `id` field are remapped to its stored id; the id-phase `derived_edge`
+    rules run, and the endpoints naming a renamed entity are remapped again; entities
+    are deduplicated first-wins by id, and relationships by (source, target, type). The
+    entity and relationship dicts are changed in place.
 
     Args:
         entities: The payload's entity dicts.
         relationships: The payload's relationship dicts.
+        batch_record: The row's batch record, one entry per Stage 2 call, so that a
+            rule that reads the record acts here as it does when the row is applied.
+            None stands for a row extracted as one batch, which offers no context.
 
     Returns:
         The deduplicated entities and relationships.
@@ -154,4 +171,5 @@ def normalize_payload(
     from backend.knowledge.extraction import rails
     from backend.knowledge.ontologies import registry
 
-    return rails.run_rails(rails.rail_row(entities, relationships), registry.active_pack())
+    row = rails.rail_row(entities, relationships, batch_record=batch_record)
+    return rails.run_rails(row, registry.active_pack())
