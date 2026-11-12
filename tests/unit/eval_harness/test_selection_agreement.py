@@ -100,3 +100,86 @@ def test_the_cli_writes_the_committed_file_byte_for_byte(tmp_path):
     same = out.read_bytes() == _COMMITTED.read_bytes()
 
     assert same
+
+
+# M63's scope rule on invented probes: the rails read a probe as user-scope when either pass
+# labels the user, and as third-party when neither does. Each probe's marker is a person only
+# it names, so a rail call is traced back to its probe.
+_SCOPE_PROBES = {
+    "pin-001-prose-pass-a-holds-the-user": (
+        "ondrel-vask",
+        "I know Ondrel Vask from the climbing wall; he works at Brask Mill.",
+        [
+            ("user", "User", "KNOWS_PERSON", "ondrel-vask", "Person"),
+            ("ondrel-vask", "Person", "WORKS_AT", "brask-mill", "Organization"),
+        ],
+        [("ondrel-vask", "Person", "WORKS_AT", "brask-mill", "Organization")],
+    ),
+    "pin-002-prose-pass-b-holds-the-user": (
+        "ysolde-marrick",
+        "Ysolde Marrick, whom I met at the ferry, works at Corlew Yard.",
+        [("ysolde-marrick", "Person", "WORKS_AT", "corlew-yard", "Organization")],
+        [
+            ("user", "User", "KNOWS_PERSON", "ysolde-marrick", "Person"),
+            ("ysolde-marrick", "Person", "WORKS_AT", "corlew-yard", "Organization"),
+        ],
+    ),
+    "pin-003-prose-neither-pass-holds-the-user": (
+        "petrik-hallam",
+        "Petrik Hallam works at Fenwhistle Dock.",
+        [("petrik-hallam", "Person", "WORKS_AT", "fenwhistle-dock", "Organization")],
+        [("petrik-hallam", "Person", "WORKS_AT", "fenwhistle-dock", "Organization")],
+    ),
+}
+
+
+def _scope_row(tag: str, utterance: str, edges: list[tuple[str, str, str, str, str]]) -> dict:
+    entities: dict[str, str] = {}
+    relationships = []
+    for source, source_type, predicate, target, target_type in edges:
+        entities.setdefault(source, source_type)
+        entities.setdefault(target, target_type)
+        relationships.append(
+            {
+                "source": source,
+                "source_type": source_type,
+                "predicate": predicate,
+                "target": target,
+                "target_type": target_type,
+            }
+        )
+    return {
+        "tag": tag,
+        "utterance": utterance,
+        "expected_entities": [{"id": i, "type": t} for i, t in entities.items()],
+        "expected_relationships": relationships,
+    }
+
+
+def _scopes_the_rails_read() -> dict[str, set]:
+    rows_a = [_scope_row(tag, utt, a) for tag, (_, utt, a, _) in _SCOPE_PROBES.items()]
+    rows_b = [_scope_row(tag, utt, b) for tag, (_, utt, _, b) in _SCOPE_PROBES.items()]
+    seen: dict[str, set] = {tag: set() for tag in _SCOPE_PROBES}
+
+    def recording_rails(row, pack, **kwargs):
+        ids = {entity["id"] for entity in row.entities}
+        for tag, (marker, _, _, _) in _SCOPE_PROBES.items():
+            if marker in ids:
+                seen[tag].add(row.scope)
+        return run_rails(row, pack, **kwargs)
+
+    selection_agreement(rows_a, rows_b, rows_a, pack=PACK, run_rails=recording_rails)
+    return seen
+
+
+def test_a_probe_is_user_scope_when_one_pass_labels_the_user():
+    seen = _scopes_the_rails_read()
+
+    assert seen["pin-001-prose-pass-a-holds-the-user"] == {"user-scope"}
+    assert seen["pin-002-prose-pass-b-holds-the-user"] == {"user-scope"}
+
+
+def test_a_probe_is_third_party_when_neither_pass_labels_the_user():
+    seen = _scopes_the_rails_read()
+
+    assert seen["pin-003-prose-neither-pass-holds-the-user"] == {"third-party"}
