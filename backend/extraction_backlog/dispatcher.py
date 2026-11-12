@@ -69,6 +69,13 @@ FAILURES
   `/v1/info`, per job (`ExpectStamps.serving_identity`, a 409) and on the
   reply's stamp; a different dispatch identity is `stalled` before any
   contact, apply or dispatch. None of these counts an attempt.
+- `cancelled`: something cancelled the job on the service
+  (`POST /v1/jobs/<job_id>/cancel`), which says nothing about the turn. The
+  attempt is recorded `deferred` and not counted, so `counted_failures` keeps
+  its value, and the turn is never dead-lettered for it, whatever the reply's
+  `retryable` says. The state stays `working`; after `idle_poll_s`, a wait
+  `wake()` does not cut short, the turn is dispatched again under a new
+  `job_id`.
 - Job-attributable failures -- retryable `upstream_llm`, `timeout`, or a reply
   that fails validation -- are counted. After `max_attempts` of them (or at
   once, for a NON-retryable `upstream_llm`/`timeout`) the turn is
@@ -1230,6 +1237,16 @@ class ExtractionDispatcher:
             record("deferred", exc.code.value, counted=False)
             self._set_state(STATE_STALLED, reason=str(exc))
             return _Wait(self._settings.stall_recheck_s, True)
+        if exc.code is ErrorCode.CANCELLED:
+            # Something cancelled the job on the service; that says nothing
+            # about the turn, so it is never counted or dead-lettered, whatever
+            # `retryable` says. The service is healthy, so the state stays
+            # `working`. The wait is one that `wake()` cannot cut short: a
+            # turn logged while the job ran has set the wake event, and an
+            # immediate re-send would undo the cancel.
+            record("deferred", exc.code.value, counted=False)
+            logger.info("Extraction job %s for %s was cancelled; deferred", job_id, head.turn_id)
+            return _Wait(self._settings.idle_poll_s, False)
 
         # Job-attributable: upstream_llm, timeout, or an invalid reply.
         code = exc.code.value if exc.code is not None else "invalid_response"
