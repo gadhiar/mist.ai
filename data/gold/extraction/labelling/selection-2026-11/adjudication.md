@@ -145,6 +145,11 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `user KNOWS reading-a-renal-function-panel` (pass B only): dropped, pass A held.
 - Entities: the two topics the passes typed apart are Skills by the abstract-type test.
 
+### sel-029-list-ref-third-ward-app (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `medusa IS_A reference-app` attributes differ: settled by the attribute policy in the method section.
+
 ### sel-032-list-ref-neither-ordered-erg (F1 1.00)
 
 - Ruling: Entity only: the id is the utterance's own phrase, so it takes no alternative (N1's last sentence lists one only where neither id is the utterance's phrase).
@@ -630,6 +635,11 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `user WORKS_ON second-stove-newsletter` (pass B only): dropped, pass A held.
 - `issue-41-2026-05-08 RELATED_TO preserved-lemons` attributes differ: settled by the attribute policy in the method section.
 
+### sel-154-list-heading-restaurant-and-side (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `larder-club IS_A supper-club` attributes differ: settled by the attribute policy in the method section.
+
 ### sel-155-list-mixed-messy-service (F1 0.50, adjudicated whole)
 
 - Pass A: labelled only the anchor for the named colleague.
@@ -637,6 +647,11 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - Ruling: One evening's service is routine work, an incidental occasion like the coffee in the guide's example (Durable third-party facts), so it gets no Event; the colleague's anchor is agreed.
 - `service-2026-06-13 OCCURRED_ON 2026-06-13` (pass B only): dropped, pass A held.
 - `user EXPERIENCED service-2026-06-13` (pass B only): dropped, pass A held.
+
+### sel-159-list-long-section-rules (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: rules the user keeps on the section are workflow preferences, the Preference type's own test (B, N6).
 
 ### sel-161-multi-sous-chef-club-newsletter (F1 0.75)
 
@@ -1061,10 +1076,141 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `committee-night RELATED_TO waiting-list` attributes differ: settled by the attribute policy in the method section.
 - `committee-night RELATED_TO water-bill` attributes differ: settled by the attribute policy in the method section.
 
+### sel-251-list-long-built-since-retiring (F1 1.00)
+
+- Ruling: Attributes only: each piece is built, so the work on it has ended.
+- `user WORKS_ON bird-tables` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON bookcase` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON childs-stool` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON cold-frame` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON compost-bay` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON garden-gate` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON kitchen-dresser` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON lectern` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON rocking-horse` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+- `user WORKS_ON tool-chest` attributes differ: 'what I've built' states finished work, so WORKS_ON is no longer true of any piece and each carries cease (Assertion kinds), pass A held.
+
+### sel-259-list-dash-episode-software (F1 0.50, adjudicated whole)
+
+- Pass A: read the software as what the podcast is made with.
+- Pass B: read it as what the podcast depends on.
+- Ruling: The episode passes through each tool as it is made, so the podcast is built with them (IMPLEMENTED_WITH), as 'made with' and 'built from' read elsewhere in this set; the purposes are agreed.
+- `undertow DEPENDS_ON descript` (pass B only): dropped, pass A held.
+- `undertow DEPENDS_ON hindenburg` (pass B only): dropped, pass A held.
+- `undertow DEPENDS_ON reaper` (pass B only): dropped, pass A held.
+- `undertow IMPLEMENTED_WITH descript` (pass A only): kept, pass A held.
+- `undertow IMPLEMENTED_WITH hindenburg` (pass A only): kept, pass A held.
+- `undertow IMPLEMENTED_WITH reaper` (pass A only): kept, pass A held.
+
+### sel-260-list-dash-stories-being-chased (F1 0.18, adjudicated whole)
+
+- Pass A: read the stories as the user's interests, each part of the podcast.
+- Pass B: read each story as work the user is doing.
+- Ruling: Chasing a story is working on it, WORKS_ON's gloss (active involvement), so each is a Project of the user. They are for a season not yet made, so the utterance states no PART_OF yet, and no interest beyond the work.
+- `dredging-records-that-went-missing PART_OF undertow` (pass A only): dropped, pass B held.
+- `ferry-contract-signed-without-a-tender PART_OF undertow` (pass A only): dropped, pass B held.
+- `user INTERESTED_IN dredging-records-that-went-missing` (pass A only): dropped, pass B held.
+- `user INTERESTED_IN ferry-contract-signed-without-a-tender` (pass A only): dropped, pass B held.
+- `user INTERESTED_IN who-really-owns-the-lyttelton-coal-berths` (pass A only): dropped, pass B held.
+- `user WORKS_ON dredging-records-that-went-missing` (pass B only): kept, pass B held.
+- `user WORKS_ON ferry-contract-signed-without-a-tender` (pass B only): kept, pass B held.
+- `user WORKS_ON who-really-owns-the-lyttelton-coal-berths` (pass B only): kept, pass B held.
+- `who-really-owns-the-lyttelton-coal-berths PART_OF undertow` (pass A only): dropped, pass B held.
+- Entities: the stories are Projects (B).
+
+### sel-261-list-numbered-interviewing-skills (F1 0.67)
+
+- Ruling: N14: the lead-in's kind noun gives each item IS_A, flagged beyond the prompt, as in the trusted-methods list.
+- `doorstepping IS_A interviewing-skill` (pass A only): kept, pass A held.
+- `reading-documents-upside-down IS_A interviewing-skill` (pass A only): kept, pass A held.
+- `staying-quiet-after-a-hard-question IS_A interviewing-skill` (pass A only): kept, pass A held.
+
+### sel-264-list-ref-second-microphone (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `broadcast-dynamic IS_A microphone` attributes differ: settled by the attribute policy in the method section.
+
+### sel-265-list-ref-third-application (F1 0.00, adjudicated whole)
+
+- Pass A: made the grant awarded an event the user took part in.
+- Pass B: labelled nothing.
+- Ruling: A grant coming through is milestone-class, like a promotion, so it gets no user EXPERIENCED, and with no stated day it gets no Date (Event rule, Date entities). The applications that failed get no edge (List rule).
+- `user EXPERIENCED reporting-grant-for-pacific-shipping` (pass A only): dropped, pass B held.
+- Entities: N6 keeps the grant as an entity-only label, since the utterance states it.
+
+### sel-266-list-plus-standing-dates (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: habits are recurring activities, Concepts (A), as Example 24's habit is.
+
+### sel-271-list-dot-interview-languages (F1 0.67)
+
+- Ruling: N14: the lead-in's kind noun gives each item IS_A, flagged beyond the prompt, as in the trusted-methods list.
+- `english IS_A language` (pass B only): kept, pass B held.
+- `samoan IS_A language` (pass B only): kept, pass B held.
+- `te-reo-maori IS_A language` (pass B only): kept, pass B held.
+
+### sel-274-list-long-pieces-proud-of (F1 0.00, adjudicated whole)
+
+- Pass A: typed each piece as a Document the user refers to.
+- Pass B: typed each as a Project the user works on.
+- Ruling: N6: a type is chosen by its test, never to keep an edge. Each piece is a finished article named by its title, the Document test, and the user discusses each here, REFERENCES_DOCUMENT's gloss; WORKS_ON (active involvement) is not true of finished work and admits no Document.
+- `user REFERENCES_DOCUMENT ferry-tender` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT harbourmaster-who-kept-two-logbooks` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT last-woolshed-dance` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT lighthouse-keepers-tapes` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT night-with-the-oyster-fleet` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT profile-of-a-shearing-gang-cook` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT school-with-one-pupil` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT six-hours-in-a-magistrates-waiting-room` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT wharf-strike-told-by-the-tea-lady` (pass A only): kept, pass A held.
+- `user REFERENCES_DOCUMENT what-the-dredger-found` (pass A only): kept, pass A held.
+- `user WORKS_ON ferry-tender` (pass B only): dropped, pass A held.
+- `user WORKS_ON harbourmaster-who-kept-two-logbooks` (pass B only): dropped, pass A held.
+- `user WORKS_ON last-woolshed-dance` (pass B only): dropped, pass A held.
+- `user WORKS_ON lighthouse-keepers-tapes` (pass B only): dropped, pass A held.
+- `user WORKS_ON night-with-the-oyster-fleet` (pass B only): dropped, pass A held.
+- `user WORKS_ON profile-of-a-shearing-gang-cook` (pass B only): dropped, pass A held.
+- `user WORKS_ON school-with-one-pupil` (pass B only): dropped, pass A held.
+- `user WORKS_ON six-hours-in-a-magistrates-waiting-room` (pass B only): dropped, pass A held.
+- `user WORKS_ON wharf-strike-told-by-the-tea-lady` (pass B only): dropped, pass A held.
+- `user WORKS_ON what-the-dredger-found` (pass B only): dropped, pass A held.
+
+### sel-275-list-long-recorded-wherever-i-travel (F1 0.00, adjudicated whole)
+
+- Pass A: read each sound as a habit with the cadence of every trip.
+- Pass B: read each sound as an interest.
+- Ruling: 'Wherever I travel' gives the recording a cadence, each trip, so each item is HAS_HABIT under its own phrase (List rules, N1); the utterance states no interest beyond the habit.
+- `user HAS_HABIT cattle-grids` (pass A only): kept, pass A held.
+- `user HAS_HABIT church-bells` (pass A only): kept, pass A held.
+- `user HAS_HABIT ferry-horns` (pass A only): kept, pass A held.
+- `user HAS_HABIT kettle-whistles` (pass A only): kept, pass A held.
+- `user HAS_HABIT market-traders` (pass A only): kept, pass A held.
+- `user HAS_HABIT rain-on-tin-roofs` (pass A only): kept, pass A held.
+- `user HAS_HABIT screen-doors` (pass A only): kept, pass A held.
+- `user HAS_HABIT shearing-handpieces` (pass A only): kept, pass A held.
+- `user HAS_HABIT station-announcements` (pass A only): kept, pass A held.
+- `user HAS_HABIT tui-at-dawn` (pass A only): kept, pass A held.
+- `user INTERESTED_IN cattle-grids` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN church-bells` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN ferry-horns` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN kettle-whistles` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN market-traders` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN rain-on-tin-roofs` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN screen-doors` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN shearing-handpieces` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN station-announcements` (pass B only): dropped, pass A held.
+- `user INTERESTED_IN tui-at-dawn` (pass B only): dropped, pass A held.
+
+### sel-280-temporal-seasons-and-tenure (F1 1.00)
+
+- Ruling: Entities only; the relations are agreed.
+- Entities: the season the utterance calls 'the second' has no id that is its own phrase, so N1 lists both forms, B's alternative held.
+
 ## Totals
 
-- Probes with a difference adjudicated: 125; still to adjudicate: 14.
-- Relations the passes differed on, adjudicated: 363.
-- Probes adjudicated whole (F1 under 0.61): 48.
-- Outcomes: pass A held 178, pass B held 185, neither held 2.
-- Shared relations whose attributes differed: 41.
+- Probes with a difference adjudicated: 139; still to adjudicate: 0.
+- Relations the passes differed on, adjudicated: 425.
+- Probes adjudicated whole (F1 under 0.61): 53.
+- Outcomes: pass A held 227, pass B held 198, neither held 2.
+- Shared relations whose attributes differed: 54.
