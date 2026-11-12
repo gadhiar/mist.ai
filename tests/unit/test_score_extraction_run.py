@@ -595,6 +595,86 @@ class TestParseProduced:
         assert entities == (GoldEntity(id="rust", type="Technology"),)
 
 
+class TestTheRowTheScorerGivesTheRails:
+    """Plan v15, T50 Acceptance 8: the rails read the raw record's scope, batch record and plan.
+
+    A rail that reads any of the three gives the scorer the payload it gives the graph only
+    when the scorer hands it what the service recorded for the turn.
+    """
+
+    _PAYLOAD = {
+        "entities": [
+            {"id": "user", "name": "user", "type": "User"},
+            {"id": "rust", "name": "Rust", "type": "Technology"},
+        ],
+        "relationships": [{"source": "user", "target": "rust", "type": "USES"}],
+    }
+    _RECORD = [
+        {
+            "units": [{"text": "I use Rust", "context": [], "kind": "prose"}],
+            "context": [],
+            "payload": _PAYLOAD,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "finish": "stop",
+        }
+    ]
+    _PLAN = {
+        "payload": {"entities": [], "templates": [], "back_references": []},
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "finish_reason": "stop",
+    }
+
+    @pytest.fixture
+    def rows(self, monkeypatch):
+        import eval_harness.score_extraction_run as scorer
+
+        seen = []
+        real = scorer.rails.run_rails
+
+        def spy(row, pack, **switches):
+            seen.append(row)
+            return real(row, pack, **switches)
+
+        monkeypatch.setattr(scorer.rails, "run_rails", spy)
+        return seen
+
+    def _response(self, **extra):
+        return {
+            "scope": {"label": "user-scope", "confidence": 0.9},
+            "payload": json.loads(json.dumps(self._PAYLOAD)),
+            **extra,
+        }
+
+    def _produce(self, response):
+        from eval_harness.score_extraction_run import produced_from_response
+
+        return produced_from_response("I  use Rust", response)
+
+    def test_the_row_carries_the_scope_label(self, rows):
+        self._produce(self._response())
+        assert rows and all(row.scope == "user-scope" for row in rows)
+
+    def test_the_row_carries_the_batch_record(self, rows):
+        self._produce(self._response(batch_record=json.loads(json.dumps(self._RECORD))))
+        assert rows and all(row.batch_record == tuple(self._RECORD) for row in rows)
+
+    def test_the_row_carries_the_turn_plan(self, rows):
+        self._produce(self._response(turn_plan=json.loads(json.dumps(self._PLAN))))
+        assert rows and all(row.turn_plan == self._PLAN["payload"] for row in rows)
+
+    def test_a_record_without_them_is_a_row_of_one_batch_with_no_plan(self, rows):
+        self._produce(self._response())
+        assert rows and all((row.batch_record, row.turn_plan) == ((), None) for row in rows)
+
+    def test_the_produced_payload_is_keyed_by_the_normalised_utterance(self, rows):
+        produced = self._produce(self._response())
+        assert produced.utterance == "I use Rust"
+        assert produced.parse_ok is True
+        assert produced.entity_type_by_id == {"user": "User", "rust": "Technology"}
+
+
 class TestBuildProducedIndex:
     def test_indexes_extraction_ontology_records_by_utterance(self):
         content = json.dumps(
@@ -971,6 +1051,33 @@ class TestRenderAndCli:
         rc = main(["--gold", str(gold), "--debug-jsonl", str(debug), "--output", str(out)])
         assert rc == 0
         assert "Entity precision" in out.read_text(encoding="utf-8")
+
+    def test_every_summary_names_its_scorer_gold_and_pack(self, tmp_path):
+        # Plan v14 T50 Acceptance 1: both reports carry the four fields of a reading.
+        from backend.knowledge.ontologies import registry
+        from scripts.eval_harness import governance
+
+        gold = tmp_path / "gold.jsonl"
+        gold.write_text(json.dumps({"utterance": "I use Rust", "tag": "t1"}) + "\n")
+        debug = tmp_path / "debug.jsonl"
+        debug.write_text("", encoding="utf-8")
+        md, js = tmp_path / "report.md", tmp_path / "report.json"
+        argv = ["--gold", str(gold), "--debug-jsonl", str(debug), "--output", str(md)]
+        assert main([*argv, "--json-output", str(js)]) == 0
+        pack = registry.active_pack()
+        expected = {
+            "scorer_sha": governance.scorer_sha(_REPO_ROOT),
+            "gold_version": governance.gold_version(gold, _REPO_ROOT, pack.version),
+            "pack_prompt_hash": pack.pack_prompt_hash,
+            "pack_rails_hash": pack.pack_rails_hash,
+        }
+        payload = json.loads(js.read_text(encoding="utf-8"))
+        assert {name: payload.get(name) for name in expected} == expected
+        governance.require_reading(payload)
+        assert (
+            f"- Reading: {governance.identity_text(expected)}"
+            in md.read_text(encoding="utf-8").splitlines()
+        )
 
     def test_main_returns_2_on_missing_file(self, tmp_path):
         rc = main(
@@ -1607,3 +1714,274 @@ class TestAlignedScoring:
         assert r.id_agreement == 1.0
         assert r.alignment_kinds == {}
         assert r.pending_pairs == []
+
+
+class TestTheHeadlineAndTheModelWrittenColumn:
+    """Plan v15, T50 Acceptance 2: `[exact k1-4]`, and the model-written column beside it.
+
+    The headline counts a relation found only through a pair of alignment kinds 1 to 4
+    (exact, alternative, event-date, metric), the ids the graph stores as one node. The
+    model-written column scores the same payload with the relation rails switched off.
+    """
+
+    def test_an_n1_pair_finds_nothing_on_the_headline(self):
+        r = score_run([_ACME], _acme_index("the-acme-corp"))
+        assert (r.headline_rel_tp, r.headline_rel_fp, r.headline_rel_fn) == (0, 1, 1)
+        assert r.per_probe[0]["headline_rel_fns"] == [["user", "WORKS_AT", "acme-corp"]]
+        assert r.per_probe[0]["headline_rel_fps"] == [["user", "WORKS_AT", "the-acme-corp"]]
+        assert (r.aligned_rel_tp, r.aligned_rel_fn) == (1, 0)
+
+    def test_an_exact_pair_finds_the_relation_on_the_headline(self):
+        r = score_run([_ACME], _acme_index("acme-corp"))
+        assert (r.headline_rel_tp, r.headline_rel_fp, r.headline_rel_fn) == (1, 0, 0)
+        assert (r.headline_rel_recall, r.headline_rel_precision, r.headline_rel_f1) == (
+            1.0,
+            1.0,
+            1.0,
+        )
+
+    def test_an_empty_report_takes_the_vacuous_headline_defaults(self):
+        from eval_harness.score_extraction_run import Report
+
+        r = Report()
+        assert (r.headline_rel_recall, r.headline_rel_precision, r.headline_rel_f1) == (
+            1.0,
+            1.0,
+            1.0,
+        )
+
+    @pytest.mark.parametrize("relation_rails", [True, False])
+    def test_the_switch_reaches_the_rails(self, monkeypatch, relation_rails):
+        import eval_harness.score_extraction_run as scorer
+
+        seen = []
+        real = scorer.rails.run_rails
+
+        def spy(row, pack, **switches):
+            seen.append(switches.get("relation_rails", True))
+            return real(row, pack, **switches)
+
+        monkeypatch.setattr(scorer.rails, "run_rails", spy)
+        response = {"payload": {"entities": [], "relationships": []}}
+        scorer.produced_from_response("I use Rust", response, relation_rails=relation_rails)
+        assert seen == [relation_rails]
+
+    def test_the_default_parse_runs_every_rail(self, monkeypatch):
+        import eval_harness.score_extraction_run as scorer
+
+        seen = []
+        real = scorer.rails.run_rails
+
+        def spy(row, pack, **switches):
+            seen.append(switches.get("relation_rails", True))
+            return real(row, pack, **switches)
+
+        monkeypatch.setattr(scorer.rails, "run_rails", spy)
+        scorer.parse_produced('{"entities": [], "relationships": []}')
+        assert seen == [True]
+
+    def test_the_three_counts_compare_the_columns(self):
+        from eval_harness.score_extraction_run import relation_rails_counts
+
+        def index(edges):
+            entities = [
+                GoldEntity("user", "User"),
+                GoldEntity("acme-corp", "Organization"),
+                GoldEntity("rust", "Technology"),
+            ]
+            return {
+                _ACME.utterance: _produced(
+                    _ACME.utterance,
+                    entities,
+                    [_edge(*edge) for edge in edges],
+                    {e.id: e.type for e in entities},
+                )
+            }
+
+        # A relation rail added the gold edge and removed the model's USES edge.
+        headline = index([("user", "WORKS_AT", "acme-corp")])
+        model_written = index([("user", "USES", "rust")])
+
+        assert relation_rails_counts([_ACME], headline, model_written) == {
+            "relation_rails_added": 1,
+            "relation_rails_removed": 1,
+            "found_only_by_relation_rails": 1,
+        }
+        assert relation_rails_counts([_ACME], headline, headline) == {
+            "relation_rails_added": 0,
+            "relation_rails_removed": 0,
+            "found_only_by_relation_rails": 0,
+        }
+
+
+class TestEverySummaryPrintsBothColumns:
+    """Plan v15, T50 Acceptance 2: each summary prints both columns and the three counts.
+
+    The headline index finds both gold relations; the model-written index lacks the
+    `t-acme` edge, as if a relation rail had added it.
+    """
+
+    _SEED, _B, _CONFIDENCE = 0, 2000, 0.95
+
+    @staticmethod
+    def _indexes():
+        acme = [GoldEntity("user", "User"), GoldEntity("acme-corp", "Organization")]
+        board = [GoldEntity("user", "User"), GoldEntity("kestrel-board", "Project")]
+
+        def produced(probe, entities, edges):
+            return _produced(probe.utterance, entities, edges, {e.id: e.type for e in entities})
+
+        typo = produced(_TYPO, board, [_edge("user", "WORKS_ON", "kestrel-board")])
+        headline = {
+            _ACME.utterance: produced(_ACME, acme, [_edge("user", "WORKS_AT", "acme-corp")]),
+            _TYPO.utterance: typo,
+        }
+        model_written = {_ACME.utterance: produced(_ACME, acme, []), _TYPO.utterance: typo}
+        return headline, model_written
+
+    def _summary(self):
+        from eval_harness.score_extraction_run import column_summary
+
+        headline, model_written = self._indexes()
+        return column_summary(
+            [_ACME, _TYPO],
+            headline,
+            model_written,
+            seed=self._SEED,
+            b=self._B,
+            confidence=self._CONFIDENCE,
+        )
+
+    def _ci(self, counts, kind):
+        from scripts.model_bench.probes.extraction import cluster_bootstrap_ratio_ci
+
+        bounds = cluster_bootstrap_ratio_ci(
+            counts, n_replicates=self._B, seed=self._SEED, confidence=self._CONFIDENCE, kind=kind
+        )
+        return None if bounds is None else list(bounds)
+
+    def _diff_ci(self, first, second, kind):
+        from scripts.model_bench.probes.extraction import cluster_bootstrap_paired_difference_ci
+
+        bounds = cluster_bootstrap_paired_difference_ci(
+            first,
+            second,
+            n_replicates=self._B,
+            seed=self._SEED,
+            confidence=self._CONFIDENCE,
+            kind=kind,
+        )
+        return None if bounds is None else list(bounds)
+
+    def _column(self, counts, recall, precision, f1):
+        tp = sum(c[0] for c in counts.values())
+        figures = {
+            "recall": {"value": recall, "tp": tp, "n": 2, "ci95": self._ci(counts, "recall")},
+            "precision": {
+                "value": precision,
+                "tp": tp,
+                "n": tp,
+                "ci95": self._ci(counts, "precision"),
+            },
+            "f1": {"value": f1, "ci95": self._ci(counts, "f1")},
+        }
+        # Every pair here is exact, so the aligned figures equal the headline's.
+        return {**figures, "aligned": figures}
+
+    def test_the_summary_holds_both_columns_the_rails_effect_and_the_counts(self):
+        headline = {"t-acme": (1, 0, 0), "t-typo": (1, 0, 0)}
+        model_written = {"t-acme": (0, 0, 1), "t-typo": (1, 0, 0)}
+
+        assert self._summary() == {
+            "columns": {
+                "exact k1-4": self._column(headline, 1.0, 1.0, 1.0),
+                "model-written": self._column(model_written, 0.5, 1.0, 2 / 3),
+            },
+            "rails_effect": {
+                "recall_diff": {
+                    "value": 0.5,
+                    "ci95": self._diff_ci(model_written, headline, "recall"),
+                },
+                "precision_diff": {
+                    "value": 0.0,
+                    "ci95": self._diff_ci(model_written, headline, "precision"),
+                },
+                "f1_diff": {
+                    "value": 1 - 2 / 3,
+                    "ci95": self._diff_ci(model_written, headline, "f1"),
+                },
+            },
+            "relation_rails_added": 1,
+            "relation_rails_removed": 0,
+            "found_only_by_relation_rails": 1,
+        }
+
+    def test_render_json_carries_the_columns_after_the_identity(self):
+        columns = self._summary()
+        identity = {"scorer_sha": "s", "gold_version": "g"}
+        out = json.loads(render_json(score_run([_ACME, _TYPO], {}), identity, columns))
+        assert list(out)[:2] == ["scorer_sha", "gold_version"]
+        assert {key: out[key] for key in columns} == json.loads(json.dumps(columns))
+
+    def test_render_markdown_prints_both_columns_the_rails_effect_and_the_counts(self):
+        columns = self._summary()
+        md = render_markdown(score_run([_ACME, _TYPO], {}), None, columns)
+
+        def ratio(figure):
+            return f"{figure['value']:.3f} ({figure['tp']}/{figure['n']}) {ci(figure['ci95'])}"
+
+        def ci(bounds, sign=""):
+            return f"ci95 [{bounds[0]:{sign}.3f}, {bounds[1]:{sign}.3f}]"
+
+        def row(name):
+            c = columns["columns"][name]
+            a = c["aligned"]
+            return (
+                f"| {name} | {ratio(c['recall'])} | {ratio(c['precision'])} | "
+                f"{c['f1']['value']:.3f} {ci(c['f1']['ci95'])} | {ratio(a['recall'])} | "
+                f"{ratio(a['precision'])} | {a['f1']['value']:.3f} {ci(a['f1']['ci95'])} |"
+            )
+
+        effect = columns["rails_effect"]
+        assert (
+            "| Column | Recall | Precision | F1 | Aligned recall | Aligned precision | "
+            "Aligned F1 |"
+        ) in md
+        assert row("exact k1-4") in md
+        assert row("model-written") in md
+        assert (
+            "Rails effect (exact k1-4 minus model-written): "
+            f"recall {effect['recall_diff']['value']:+.3f} "
+            f"{ci(effect['recall_diff']['ci95'], '+')}; "
+            f"precision {effect['precision_diff']['value']:+.3f} "
+            f"{ci(effect['precision_diff']['ci95'], '+')}; "
+            f"f1 {effect['f1_diff']['value']:+.3f} {ci(effect['f1_diff']['ci95'], '+')}"
+        ) in md
+        assert (
+            "relation_rails_added=1 relation_rails_removed=0 found_only_by_relation_rails=1"
+        ) in md
+
+    def test_the_cli_writes_both_columns_into_both_reports(self, tmp_path):
+        gold = tmp_path / "gold.jsonl"
+        gold.write_text(json.dumps({"utterance": "I use Rust", "tag": "t1"}) + "\n")
+        debug = tmp_path / "debug.jsonl"
+        debug.write_text("", encoding="utf-8")
+        md, js = tmp_path / "report.md", tmp_path / "report.json"
+        argv = ["--gold", str(gold), "--debug-jsonl", str(debug), "--output", str(md)]
+        assert main([*argv, "--json-output", str(js)]) == 0
+        payload = json.loads(js.read_text(encoding="utf-8"))
+        assert list(payload["columns"]) == ["exact k1-4", "model-written"]
+        assert {
+            key: payload[key] for key in ("relation_rails_added", "relation_rails_removed")
+        } == {
+            "relation_rails_added": 0,
+            "relation_rails_removed": 0,
+        }
+        text = md.read_text(encoding="utf-8")
+        assert "| exact k1-4 | " in text
+        assert "| model-written | " in text
+
+    def test_no_columns_prints_no_column_section(self):
+        md = render_markdown(score_run([_ACME], {}))
+        assert "| Column |" not in md
+        assert "columns" not in json.loads(render_json(score_run([_ACME], {})))

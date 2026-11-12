@@ -48,8 +48,32 @@ list-only recall pools the aligned counts of probes `extraction_report.is_list_p
 and a typo or paraphrase pair counts only when a row accepts it. `--pairs-out DIR` writes each
 run's pending pairs to `DIR/<name>.jsonl` with neither the run's name nor the accepted flag in
 a row, so a blind adjudicator can read them pooled; it is refused, before anything is scored
-or written, for a gold whose file name starts with `heldout-`, and for a pairs file that
-exists. A scorer without aligned scoring prints neither line and refuses both options.
+or written, for a gold whose file name starts with `heldout-` or `selection-`, and for a
+pairs file that exists. A scorer without aligned scoring prints neither line and refuses both options.
+
+When the scorer also has column scoring (plan v15, T50: `produced_from_response` takes
+`relation_rails`), each run then prints the headline, the model-written column, that
+column's aligned figures and what the relation rails did:
+
+    [exact k1-4 X] recall R (tp/n) ci95 [lo, hi]; precision P (tp/m) ci95 [lo, hi]; f1 F
+    ci95 [lo, hi]
+    [model-written X] (the same figures, the rows scored with the relation rails off)
+    [aligned model-written X] (the aligned line's figures for that column)
+    [rails effect X] exact k1-4 minus model-written: recall diff D ci95 [lo, hi]; precision
+    diff D ci95 [lo, hi]; f1 diff D ci95 [lo, hi]
+    [relation rails X] relation_rails_added=A relation_rails_removed=B
+    found_only_by_relation_rails=C
+
+The rails effect pairs each probe with itself, since both columns score the run's own rows.
+
+The headline counts only relations found through pairs of alignment kinds 1 to 4, the ids
+the graph stores as one node. Each pair of runs then prints, after the `[paired-aligned`
+line, `[paired-exact k1-4 X|Y]` and `[paired-model-written X|Y]`: recall, precision and F1
+diffs, second minus first, with paired cluster-bootstrap intervals. The headline pair
+prints only when every completed row of both runs carries a `batch_record`, and, when
+either run's rows carry a `turn_plan`, both runs' do; otherwise it reads
+`[paired-exact k1-4 X|Y] withheld: <the run and the missing field>; compared on
+model-written`, since a rail that reads either field fires only on a row that has it.
 
 With two or more runs, one line per unordered pair of `--run` names, in `--run` order (n1|n2,
 n1|n3, ..., then n2|n3 and so on), compares the runs on the same probes:
@@ -85,6 +109,24 @@ printed class counts come from, or, for a relation beyond the prompt, which that
 sets aside, from a diagnosis that sets nothing aside. The worksheet holds no recall or
 precision figure: the adjudicator classifies items without a score in view.
 
+`--prior-code-root DIR` re-scores the same runs under the scorer at DIR (this file run again,
+in a second interpreter, with DIR as its code root) and prints, after the paired lines, one
+line per run in `--run` order:
+
+    [scorer effect X] relations found under the prior scorer p/g, under this scorer c/g,
+    diff D; prior scorer_sha=S
+
+on one line, so a moved score names the share the scorer change made (design h.5).
+
+Every line that holds a figure (each `[...` line and each `expect` line) ends with
+` | scorer_sha=... gold_version=... pack_prompt_hash=... pack_rails_hash=...`, and an
+`identity:` line after the provenance lines prints the same. They are taken before anything
+is scored, by `scripts/eval_harness/governance.py` of this script's own tree (loaded by
+path, so the rule is the one every summary is written under): `scorer_sha` over the code
+root's harness and engine rails, `gold_version` from the gold file, its LABELLING guide and
+the code root's pack version, and the code root's pack hashes; `none` for a code root with
+no pack registry.
+
 Exit codes: 0 scored, 1 a usage or input error or a failed expectation, 2 a module loaded
 from outside `--code-root`.
 """
@@ -93,9 +135,12 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import inspect
 import json
 import math
+import re
+import subprocess  # nosec B404 - re-runs this file under the prior code root, a fixed argv
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -111,7 +156,20 @@ REPORT_MODULE = "scripts.eval_harness.extraction_report"
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 0
 BOOTSTRAP_CONFIDENCE = 0.95
+REGISTRY_MODULE = "backend.knowledge.ontologies.registry"
+REGISTRY_FILE = Path("backend") / "knowledge" / "ontologies" / "registry.py"
+_GOVERNANCE_PATH = Path(__file__).resolve().parents[1] / "governance.py"
+_GOVERNANCE_NAME = "_score_runs_governance"
+# The lines that hold a figure, each of which ends with the reading's identity.
+_FIGURE_LINE_STARTS = ("[", "expect ")
+# A run's relation recall line, as this script prints it under any code root.
+_RECALL_LINE_RE = re.compile(r"^\[(?P<name>.+?)\] relation recall: \S+ \((?P<tp>\d+)/(?P<n>\d+)\)")
 PAIR_FIELDS = ("tag", "utterance", "gold_id", "gold_type", "produced_id", "produced_type", "kind")
+# The gold files whose pending pairs are never written: (file name prefix, what it is).
+SEALED_GOLD_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("heldout-", "held-out"),
+    ("selection-", "selection"),
+)
 _GUARDED_PACKAGES = frozenset({"scripts", "backend"})
 
 RawRow = dict[str, object]
@@ -291,6 +349,7 @@ class ScoredRun:
     fps: dict[str, list[Key]]
     aligned: AlignedScore | None = None
     pending_pairs: tuple[dict[str, object], ...] = ()
+    columns: Columns | None = None
 
 
 def _ci(bounds: tuple[float, float] | None, *, signed: bool = False) -> str:
@@ -357,13 +416,119 @@ class AlignedPairScore:
         )
 
 
+HEADLINE = "exact k1-4"
+MODEL_WRITTEN = "model-written"
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnScore:
+    """One run's relations in one column: recall, precision and F1 with their intervals."""
+
+    column: str
+    name: str
+    recall: Ratio
+    recall_ci: tuple[float, float] | None
+    precision: Ratio
+    precision_ci: tuple[float, float] | None
+    f1: float
+    f1_ci: tuple[float, float] | None
+
+    def line(self) -> str:
+        """The run's line in the column, prefixed `[<column> <name>] `."""
+        return (
+            f"[{self.column} {self.name}] recall {self.recall} {_ci(self.recall_ci)}; "
+            f"precision {self.precision} {_ci(self.precision_ci)}; "
+            f"f1 {self.f1:.3f} {_ci(self.f1_ci)}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnPairScore:
+    """Second minus first of two runs' recall, precision and F1 in one column."""
+
+    column: str
+    first: str
+    second: str
+    recall_diff: float
+    recall_ci: tuple[float, float] | None
+    precision_diff: float
+    precision_ci: tuple[float, float] | None
+    f1_diff: float
+    f1_ci: tuple[float, float] | None
+    shared_probes: int
+    total_probes: int
+
+    def line(self) -> str:
+        """The pair's line, prefixed `[paired-<column> ` so no `[paired ` filter matches it."""
+
+        def diff(value: float) -> str:
+            return "n/a" if math.isnan(value) else f"{value:+.3f}"
+
+        return (
+            f"[paired-{self.column} {self.first}|{self.second}] recall diff "
+            f"{diff(self.recall_diff)} {_ci(self.recall_ci, signed=True)}; precision diff "
+            f"{diff(self.precision_diff)} {_ci(self.precision_ci, signed=True)}; f1 diff "
+            f"{diff(self.f1_diff)} {_ci(self.f1_ci, signed=True)}; probes "
+            f"{self.shared_probes} of {self.total_probes}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RailsEffect:
+    """One run's headline minus its model-written column, over the same probes."""
+
+    name: str
+    recall_diff: float
+    recall_ci: tuple[float, float] | None
+    precision_diff: float
+    precision_ci: tuple[float, float] | None
+    f1_diff: float
+    f1_ci: tuple[float, float] | None
+
+    def line(self) -> str:
+        """The run's line, prefixed `[rails effect <name>] ` so no other filter matches it."""
+        return (
+            f"[rails effect {self.name}] {HEADLINE} minus {MODEL_WRITTEN}: recall diff "
+            f"{self.recall_diff:+.3f} {_ci(self.recall_ci, signed=True)}; precision diff "
+            f"{self.precision_diff:+.3f} {_ci(self.precision_ci, signed=True)}; f1 diff "
+            f"{self.f1_diff:+.3f} {_ci(self.f1_ci, signed=True)}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Columns:
+    """One run's headline and model-written columns, and what the relation rails did."""
+
+    model_index: dict[str, _Produced]
+    headline: ColumnScore
+    model_written: ColumnScore
+    model_written_aligned: AlignedScore
+    rails_effect: RailsEffect
+    rails_counts: dict[str, int]
+
+    def lines(self) -> list[str]:
+        """The headline, the model-written column with its aligned figures, then the rails."""
+        counts = " ".join(f"{field}={count}" for field, count in self.rails_counts.items())
+        return [
+            self.headline.line(),
+            self.model_written.line(),
+            self.model_written_aligned.line(),
+            self.rails_effect.line(),
+            f"[relation rails {self.headline.name}] {counts}",
+        ]
+
+
 @dataclass(frozen=True, slots=True)
 class Aligned:
-    """The modules and inputs the aligned lines need, loaded only for a scorer that has them."""
+    """The modules and inputs the aligned lines need, loaded only for a scorer that has them.
+
+    `columns` is True for a scorer that also has the headline and the model-written column.
+    """
 
     bootstrap: ModuleType
     report: ModuleType
     accepted: frozenset[tuple[str, str, str]]
+    columns: bool = False
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -387,6 +552,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="write each run's pending typo and paraphrase pairs to DIR/<name>.jsonl",
     )
     parser.add_argument(
+        "--prior-code-root",
+        type=Path,
+        metavar="DIR",
+        help="the checkout of the scorer the runs were last scored under; prints a "
+        "`scorer effect` line per run",
+    )
+    parser.add_argument(
         "--accepted-pairs",
         type=Path,
         action="append",
@@ -398,14 +570,19 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def _pairs_targets(args: argparse.Namespace, runs: dict[str, Path]) -> dict[str, Path]:
-    """Each run's pairs file; refused for a held-out gold and for a file that exists."""
+    """Each run's pairs file; refused for a sealed gold and for a file that exists.
+
+    A held-out or selection gold is never read probe by probe, and a pairs row holds a
+    probe's utterance and ids, so neither gold's pairs are written.
+    """
     if args.pairs_out is None:
         return {}
-    if args.gold.name.startswith("heldout-"):
-        raise UsageError(
-            f"--pairs-out with a held-out gold ({args.gold.name}): held-out pairs are never "
-            "written; nothing was scored"
-        )
+    for prefix, kind in SEALED_GOLD_PREFIXES:
+        if args.gold.name.startswith(prefix):
+            raise UsageError(
+                f"--pairs-out with a {kind} gold ({args.gold.name}, `{prefix}`): {kind} pairs "
+                "are never written; nothing was scored"
+            )
     targets = {name: args.pairs_out / f"{name}.jsonl" for name in runs}
     existing = [str(path) for path in targets.values() if path.exists()]
     if existing:
@@ -445,6 +622,16 @@ def _read_accepted(paths: list[Path]) -> frozenset[tuple[str, str, str]]:
 
 def _has_aligned_scoring(scorer: ModuleType) -> bool:
     return "accepted_pairs" in inspect.signature(scorer.score_run).parameters
+
+
+def _has_column_scoring(scorer: ModuleType) -> bool:
+    """True for a scorer with the headline and the model-written column (plan v15, T50)."""
+    produce = getattr(scorer, "produced_from_response", None)
+    return (
+        produce is not None
+        and "relation_rails" in inspect.signature(produce).parameters
+        and hasattr(scorer, "relation_rails_counts")
+    )
 
 
 def _worksheet_target(args: argparse.Namespace, runs: dict[str, Path]) -> Path | None:
@@ -503,6 +690,90 @@ def _import(name: str) -> ModuleType:
         raise InputError(f"cannot import {name} from the code root: {exc}") from exc
 
 
+def _governance() -> ModuleType:
+    """This checkout's `governance.py`, loaded by path under a name the guard does not hold.
+
+    The identity rule is the one every summary is written under, so it comes from this
+    script's own tree, not from the pinned code root, which may predate it.
+    """
+    spec = importlib.util.spec_from_file_location(_GOVERNANCE_NAME, _GOVERNANCE_PATH)
+    if spec is None or spec.loader is None:
+        raise InputError(f"cannot load {_GOVERNANCE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _reading_identity(code_root: Path, gold: Path) -> str:
+    """The code root's scorer sha, the gold version and the code root's active pack hashes.
+
+    A code root with no pack registry (a checkout from before the packs) names none.
+    """
+    governance = _governance()
+    pack = None
+    if (code_root / REGISTRY_FILE).is_file():
+        pack = _import(REGISTRY_MODULE).active_pack()
+    identity = governance.reading_identity(
+        root=code_root,
+        gold=gold,
+        pack_version=getattr(pack, "version", None),
+        pack_prompt_hash=getattr(pack, "pack_prompt_hash", None),
+        pack_rails_hash=getattr(pack, "pack_rails_hash", None),
+    )
+    text: str = governance.identity_text(identity)
+    return text
+
+
+@dataclass(frozen=True, slots=True)
+class PriorScores:
+    """Each run's relations found under the prior scorer, and that scorer's sha."""
+
+    scorer_sha: str
+    found: dict[str, tuple[int, int]]
+
+
+def _prior_scores(args: argparse.Namespace, runs: dict[str, Path]) -> PriorScores:
+    """Score the runs again under `--prior-code-root`, in a second interpreter.
+
+    One process holds `scripts.*` and `backend.*` to one code root, so the prior scorer
+    runs this file again with the prior root as its code root, and its recall lines are
+    read back. Nothing but the gold, the pre-H8 gold and the runs is passed on.
+    """
+    prior = args.prior_code_root.resolve()
+    argv = [sys.executable, str(Path(__file__).resolve()), "--code-root", str(prior)]
+    argv += ["--gold", str(args.gold.resolve())]
+    if args.pre_h8_gold is not None:
+        argv += ["--pre-h8-gold", str(args.pre_h8_gold.resolve())]
+    for name, path in runs.items():
+        argv += ["--run", f"{name}={path.resolve()}"]
+    done = subprocess.run(  # nosec B603 - a fixed argv: this interpreter on this file
+        argv, cwd=prior, capture_output=True, text=True, check=False
+    )
+    if done.returncode != 0:
+        tail = (done.stderr.strip().splitlines() or ["no message"])[-1]
+        raise InputError(f"the prior scorer at {prior} exited {done.returncode}: {tail}")
+    found: dict[str, tuple[int, int]] = {}
+    for line in done.stdout.splitlines():
+        match = _RECALL_LINE_RE.match(line)
+        if match is not None and match["name"] in runs:
+            found[match["name"]] = (int(match["tp"]), int(match["n"]))
+    missing = [name for name in runs if name not in found]
+    if missing:
+        raise InputError(f"the prior scorer at {prior} printed no recall for {', '.join(missing)}")
+    return PriorScores(scorer_sha=_governance().scorer_sha(prior), found=found)
+
+
+def _scorer_effect_line(name: str, score: RunScore, prior: PriorScores) -> str:
+    """One run's found count under the prior scorer and this one, and the difference."""
+    before, total_before = prior.found[name]
+    now, total = score.relation_recall.numerator, score.relation_recall.denominator
+    return (
+        f"[scorer effect {name}] relations found under the prior scorer {before}/"
+        f"{total_before}, under this scorer {now}/{total}, diff {now - before:+d}; "
+        f"prior scorer_sha={prior.scorer_sha}"
+    )
+
+
 def _check_code_root(code_root: Path) -> None:
     outside = []
     for name, module in list(sys.modules.items()):
@@ -554,9 +825,14 @@ def _read_raw(name: str, path: Path) -> dict[str, RawRow]:
 
 
 def _produced_index(
-    scorer: ModuleType, path: Path, rows: dict[str, RawRow]
+    scorer: ModuleType, path: Path, rows: dict[str, RawRow], *, relation_rails: bool = True
 ) -> dict[str, _Produced]:
-    """The bench probe's `build_produced_index`, fed from raw rows instead of live cases."""
+    """The bench probe's `build_produced_index`, fed from raw rows instead of live cases.
+
+    `relation_rails=False` gives the model-written column's index; only a scorer with
+    column scoring is asked for it.
+    """
+    switch = {} if relation_rails else {"relation_rails": False}
     index: dict[str, _Produced] = {}
     for probe_id, row in rows.items():
         response = row.get("response")
@@ -564,6 +840,11 @@ def _produced_index(
             continue  # A failed case: absent from the index, as in the bench probe.
         if not isinstance(response, dict) or not isinstance(response.get("payload"), dict):
             raise InputError(f"{path}: probe {probe_id} has a response with no payload object")
+        if hasattr(scorer, "produced_from_response"):
+            # The rails read the row's scope label, batch record and plan, as on the service.
+            produced = scorer.produced_from_response(row["utterance"], response, **switch)
+            index[produced.utterance] = produced
+            continue
         ok, entities, type_by_id, rels = scorer.parse_produced(json.dumps(response["payload"]))
         utterance = scorer._norm_ws(row["utterance"])
         index[utterance] = scorer.Produced(
@@ -628,6 +909,116 @@ def _score_run(
         fps={r["tag"]: [_key(k) for k in r["rel_fps"]] for r in report.per_probe},
         aligned=None if aligned is None else _aligned_score(aligned, name, report),
         pending_pairs=() if aligned is None else tuple(report.pending_pairs),
+        columns=(
+            _columns(scorer, aligned, name, path, rows, probes, index, report)
+            if aligned is not None and aligned.columns
+            else None
+        ),
+    )
+
+
+def _headline_counts(per_probe: Sequence[Mapping]) -> dict[str, tuple[int, int, int]]:
+    """(tp, fp, fn) per probe tag on the headline, as the bootstrap reads aligned counts."""
+    return {
+        str(probe["tag"]): (
+            probe["gold_relationships"] - len(probe["headline_rel_fns"]),
+            len(probe["headline_rel_fps"]),
+            len(probe["headline_rel_fns"]),
+        )
+        for probe in per_probe
+    }
+
+
+class _HeadlineReport(Protocol):
+    """A scorer `Report` with the headline counts, as far as this script reads it."""
+
+    per_probe: list[dict[str, object]]
+    headline_rel_recall: float
+    headline_rel_precision: float
+    headline_rel_f1: float
+
+
+def _column_score(aligned: Aligned, column: str, name: str, report: _HeadlineReport) -> ColumnScore:
+    """A report's headline counts, as one column's line, intervals by the cluster bootstrap."""
+    counts = _headline_counts(report.per_probe)
+    tp = sum(c[0] for c in counts.values())
+    fp = sum(c[1] for c in counts.values())
+    fn = sum(c[2] for c in counts.values())
+    return ColumnScore(
+        column=column,
+        name=name,
+        recall=Ratio(report.headline_rel_recall, tp, tp + fn),
+        recall_ci=_bootstrap_ci(aligned, counts, "recall"),
+        precision=Ratio(report.headline_rel_precision, tp, tp + fp),
+        precision_ci=_bootstrap_ci(aligned, counts, "precision"),
+        f1=report.headline_rel_f1,
+        f1_ci=_bootstrap_ci(aligned, counts, "f1"),
+    )
+
+
+def _columns(
+    scorer: ModuleType,
+    aligned: Aligned,
+    name: str,
+    path: Path,
+    rows: dict[str, RawRow],
+    probes: list[_Probe],
+    index: dict[str, _Produced],
+    report: _HeadlineReport,
+) -> Columns:
+    """The run's headline, and the same rows scored with the relation rails switched off."""
+    model_index = _produced_index(scorer, path, rows, relation_rails=False)
+    model_report = scorer.score_run(probes, model_index, accepted_pairs=aligned.accepted)
+    headline = _column_score(aligned, HEADLINE, name, report)
+    model_written = _column_score(aligned, MODEL_WRITTEN, name, model_report)
+    return Columns(
+        model_index=model_index,
+        headline=headline,
+        model_written=model_written,
+        model_written_aligned=_aligned_score(aligned, f"{MODEL_WRITTEN} {name}", model_report),
+        rails_effect=_rails_effect(
+            aligned.bootstrap,
+            headline,
+            model_written,
+            _headline_counts(report.per_probe),
+            _headline_counts(model_report.per_probe),
+        ),
+        rails_counts=dict(scorer.relation_rails_counts(probes, index, model_index)),
+    )
+
+
+def _rails_effect(
+    bootstrap: ModuleType,
+    headline: ColumnScore,
+    model_written: ColumnScore,
+    headline_counts: dict[str, tuple[int, int, int]],
+    model_counts: dict[str, tuple[int, int, int]],
+) -> RailsEffect:
+    """The headline minus the model-written column, paired by probe over the same probes.
+
+    Both columns score the run's own rows, so each probe is paired with itself, and the
+    interval is the gauntlet's paired cluster bootstrap with the model-written column first.
+    """
+
+    def interval(kind: str) -> tuple[float, float] | None:
+        result: tuple[float, float] | None = bootstrap.cluster_bootstrap_paired_difference_ci(
+            model_counts,
+            headline_counts,
+            n_replicates=BOOTSTRAP_REPLICATES,
+            seed=BOOTSTRAP_SEED,
+            confidence=BOOTSTRAP_CONFIDENCE,
+            kind=kind,
+        )
+        return result
+
+    return RailsEffect(
+        name=headline.name,
+        recall_diff=headline.recall.value - model_written.recall.value,
+        recall_ci=interval("recall"),
+        precision_diff=headline.precision.value - model_written.precision.value,
+        precision_ci=interval("precision"),
+        f1_diff=headline.f1 - model_written.f1,
+        f1_ci=interval("f1"),
     )
 
 
@@ -749,6 +1140,130 @@ def _paired_aligned_scores(
                     total_probes=len(probes),
                 )
             )
+    return pairs
+
+
+def _paired_column_score(
+    scorer: ModuleType,
+    aligned: Aligned,
+    column: str,
+    pair: tuple[str, str],
+    shared: list[_Probe],
+    indexes: tuple[dict[str, _Produced], dict[str, _Produced]],
+    total: int,
+) -> ColumnPairScore:
+    """Second minus first in one column over the shared probes, with paired intervals."""
+    one = scorer.score_run(shared, indexes[0], accepted_pairs=aligned.accepted)
+    two = scorer.score_run(shared, indexes[1], accepted_pairs=aligned.accepted)
+    one_counts = _headline_counts(one.per_probe)
+    two_counts = _headline_counts(two.per_probe)
+
+    def interval(kind: str) -> tuple[float, float] | None:
+        result: tuple[float, float] | None = (
+            aligned.bootstrap.cluster_bootstrap_paired_difference_ci(
+                one_counts,
+                two_counts,
+                n_replicates=BOOTSTRAP_REPLICATES,
+                seed=BOOTSTRAP_SEED,
+                confidence=BOOTSTRAP_CONFIDENCE,
+                kind=kind,
+            )
+        )
+        return result
+
+    def diff(field: str) -> float:
+        return math.nan if not shared else getattr(two, field) - getattr(one, field)
+
+    return ColumnPairScore(
+        column=column,
+        first=pair[0],
+        second=pair[1],
+        recall_diff=diff("headline_rel_recall"),
+        recall_ci=interval("recall"),
+        precision_diff=diff("headline_rel_precision"),
+        precision_ci=interval("precision"),
+        f1_diff=diff("headline_rel_f1"),
+        f1_ci=interval("f1"),
+        shared_probes=len(shared),
+        total_probes=total,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WithheldPair:
+    """A pair the headline does not compare, and the field one of its runs lacks."""
+
+    first: str
+    second: str
+    reason: str
+
+    def line(self) -> str:
+        """The headline pair's line, naming the missing field and the column compared on."""
+        return (
+            f"[paired-{HEADLINE} {self.first}|{self.second}] withheld: {self.reason}; "
+            f"compared on {MODEL_WRITTEN}"
+        )
+
+
+def _headline_withheld(
+    names: tuple[str, str], probes: list[_Probe], runs: dict[str, ScoredRun]
+) -> str | None:
+    """Why two runs are not compared on the headline, or None when they are.
+
+    A rail that reads the batch record or the turn plan fires only on a row that carries
+    it, so the headline compares two runs only when every completed row of both carries a
+    batch record, and, when either run had the plan on (a row carries a turn plan), both
+    did (plan v15, T50 Acceptance 5).
+    """
+    responses = {
+        name: [runs[name].rows[tag]["response"] for tag in sorted(_completed(probes, runs[name]))]
+        for name in names
+    }
+    no_record = [
+        name
+        for name in names
+        if not responses[name]
+        or any(response.get("batch_record") is None for response in responses[name])
+    ]
+    if no_record:
+        return " and ".join(f"{name}'s" for name in no_record) + " rows carry no batch_record"
+    plan_on = [
+        name
+        for name in names
+        if any(response.get("turn_plan") is not None for response in responses[name])
+    ]
+    if len(plan_on) == 1:
+        (off,) = (name for name in names if name not in plan_on)
+        return f"{off}'s rows carry no turn_plan, and {plan_on[0]} had the plan on"
+    return None
+
+
+def _paired_columns(
+    scorer: ModuleType, aligned: Aligned, probes: list[_Probe], runs: dict[str, ScoredRun]
+) -> list[ColumnPairScore | WithheldPair]:
+    """Each unordered pair in `--run` order: the headline or why not, then model-written."""
+    names = list(runs)
+    completed = {name: _completed(probes, run) for name, run in runs.items()}
+    pairs: list[ColumnPairScore | WithheldPair] = []
+    for i, first in enumerate(names):
+        for second in names[i + 1 :]:
+            shared = [p for p in probes if p.tag in completed[first] & completed[second]]
+            one, two = runs[first].columns, runs[second].columns
+            if one is None or two is None:
+                continue
+            withheld = _headline_withheld((first, second), probes, runs)
+            for column, indexes in (
+                (HEADLINE, (runs[first].index, runs[second].index)),
+                (MODEL_WRITTEN, (one.model_index, two.model_index)),
+            ):
+                if column == HEADLINE and withheld is not None:
+                    pairs.append(WithheldPair(first, second, withheld))
+                    continue
+                pairs.append(
+                    _paired_column_score(
+                        scorer, aligned, column, (first, second), shared, indexes, len(probes)
+                    )
+                )
     return pairs
 
 
@@ -900,6 +1415,8 @@ def _run(argv: Sequence[str] | None) -> int:
     code_root = args.code_root.resolve()
     if not code_root.is_dir():
         raise UsageError(f"--code-root {code_root} is not a directory")
+    if args.prior_code_root is not None and not args.prior_code_root.is_dir():
+        raise UsageError(f"--prior-code-root {args.prior_code_root} is not a directory")
     for path in (args.gold, args.pre_h8_gold, *runs.values(), *args.accepted_pairs):
         if path is not None and not path.is_file():
             raise InputError(f"no such file: {path}")
@@ -910,13 +1427,24 @@ def _run(argv: Sequence[str] | None) -> int:
     classifier = _import(CLASSIFIER_MODULE)
     aligned: Aligned | None = None
     if _has_aligned_scoring(scorer):
-        aligned = Aligned(_import(BOOTSTRAP_MODULE), _import(REPORT_MODULE), accepted)
+        aligned = Aligned(
+            _import(BOOTSTRAP_MODULE),
+            _import(REPORT_MODULE),
+            accepted,
+            columns=_has_column_scoring(scorer),
+        )
     elif pairs_targets or args.accepted_pairs:
         raise InputError(
             "the code root's scorer has no aligned scoring, which --pairs-out and "
             "--accepted-pairs need"
         )
+    # The reading's identity is taken from the code root before anything is scored.
+    identity = _reading_identity(code_root, args.gold)
     _check_code_root(code_root)
+
+    def say(line: str) -> None:
+        """Print a line; a figure line ends with the identity it was scored under."""
+        print(f"{line} | {identity}" if line.startswith(_FIGURE_LINE_STARTS) else line)
 
     probes = _load_gold(scorer, args.gold)
     beyond_prompt, basis_line = _asked_for_basis(scorer, classifier, probes, args.pre_h8_gold)
@@ -932,11 +1460,16 @@ def _run(argv: Sequence[str] | None) -> int:
     ]
     pairs: list[PairScore] = []
     aligned_pairs: list[AlignedPairScore] = []
+    column_pairs: list[ColumnPairScore | WithheldPair] = []
     by_name = {name: run for name, (_, run) in scored.items()}
+    prior: PriorScores | None = None
     if not failed:
         pairs = _paired_scores(scorer, probes, by_name)
         if aligned is not None:
             aligned_pairs = _paired_aligned_scores(scorer, aligned, probes, by_name)
+            column_pairs = _paired_columns(scorer, aligned, probes, by_name)
+        if args.prior_code_root is not None:
+            prior = _prior_scores(args, runs)
     lines: list[dict[str, object]] = []
     if worksheet is not None and not failed:
         lines = _worksheet_lines(
@@ -946,25 +1479,36 @@ def _run(argv: Sequence[str] | None) -> int:
 
     print(f"scorer: {Path(scorer.__file__).resolve()}")
     print(f"classifier: {Path(classifier.__file__).resolve()}")
+    print(f"identity: {identity}")
     if basis_line is not None:
         print(basis_line)
     shown = [name for name in runs if name in expects] if failed else list(runs)
     for name in shown:
         print()
-        print("\n".join(scores[name].lines()))
+        for line in scores[name].lines():
+            say(line)
         aligned_score = by_name[name].aligned
         if aligned_score is not None:
-            print(aligned_score.line())
+            say(aligned_score.line())
+        columns = by_name[name].columns
+        for line in [] if columns is None else columns.lines():
+            say(line)
     print()
     if failed:
-        print("\n".join(failed))
+        for line in failed:
+            say(line)
         return 1
     for name, want in expects.items():
-        print(f"expect {name}: {want:.3f} holds")
+        say(f"expect {name}: {want:.3f} holds")
     for pair in pairs:
-        print(pair.line())
+        say(pair.line())
     for aligned_pair in aligned_pairs:
-        print(aligned_pair.line())
+        say(aligned_pair.line())
+    for column_pair in column_pairs:
+        say(column_pair.line())
+    if prior is not None:
+        for name in runs:
+            say(_scorer_effect_line(name, scores[name], prior))
     for name, target in pairs_targets.items():
         _write_pairs(target, by_name[name].pending_pairs)
         print(f"pairs {name}: {len(by_name[name].pending_pairs)} pending, written to {target}")

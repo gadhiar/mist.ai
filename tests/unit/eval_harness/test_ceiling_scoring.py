@@ -12,6 +12,7 @@ Gold, raw and pre-H8 gold files are synthetic, written by each test.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
@@ -380,8 +381,112 @@ def _run(root: Path, files: dict[str, Path], *extra: str) -> subprocess.Complete
     return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=120, check=False)
 
 
+# Every figure line ends with the reading's identity after this mark (plan v14 T50).
+_IDENTITY_MARK = " | scorer_sha="
+
+
+def _bare(result: subprocess.CompletedProcess[str]) -> list[str]:
+    """The output's lines without the identity each figure line ends with."""
+    return [line.split(_IDENTITY_MARK, 1)[0] for line in result.stdout.splitlines()]
+
+
 def _lines(result: subprocess.CompletedProcess[str], run: str) -> list[str]:
-    return [line for line in result.stdout.splitlines() if line.startswith(f"[{run}] ")]
+    return [line for line in _bare(result) if line.startswith(f"[{run}] ")]
+
+
+def _identity(root: Path, gold: Path, pack: object | None = None) -> str:
+    from scripts.eval_harness import governance
+
+    return governance.identity_text(
+        {
+            "scorer_sha": governance.scorer_sha(root),
+            "gold_version": governance.gold_version(gold, root, getattr(pack, "version", None)),
+            "pack_prompt_hash": getattr(pack, "pack_prompt_hash", None),
+            "pack_rails_hash": getattr(pack, "pack_rails_hash", None),
+        }
+    )
+
+
+def _figure_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return [line for line in result.stdout.splitlines() if line.startswith(("[", "expect "))]
+
+
+def test_every_figure_line_carries_the_scorer_the_gold_and_the_pack(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    files = _inputs(tmp_path)
+    result = _run(root, files, "--expect", "a=0.500")
+    assert result.returncode == 0, result.stderr
+    # A code root without a pack names none; its harness files still give a scorer sha.
+    identity = _identity(root, files["gold"])
+    assert "pack_prompt_hash=none pack_rails_hash=none" in identity
+    lines = _figure_lines(result)
+    assert any(line.startswith("[paired ") for line in lines)
+    assert any(line.startswith("expect a: ") for line in lines)
+    assert all(line.endswith(f" | {identity}") for line in lines), lines
+    assert f"identity: {identity}" in result.stdout.splitlines()
+
+
+# A prior scorer that finds nothing: each run's found count moves under the current one.
+_FINDS_NOTHING = """
+_score_run = score_run
+
+
+def score_run(probes, produced_index):
+    report = _score_run(probes, produced_index)
+    report.rel_fn += report.rel_tp
+    report.rel_tp = 0
+    return report
+"""
+
+
+def test_a_re_score_under_a_changed_scorer_prints_a_scorer_effect_line_per_run(
+    tmp_path: Path,
+) -> None:
+    from scripts.eval_harness import governance
+
+    prior = _write_stub_root(tmp_path / "prior", scorer_tail=_FINDS_NOTHING)
+    root = _write_stub_root(tmp_path / "code")
+    files = _inputs(tmp_path)
+    result = _run(root, files, "--prior-code-root", str(prior))
+    assert result.returncode == 0, result.stderr
+    prior_sha = governance.scorer_sha(prior)
+    assert prior_sha != governance.scorer_sha(root)
+    effects = [line for line in _bare(result) if line.startswith("[scorer effect ")]
+    assert effects == [
+        "[scorer effect a] relations found under the prior scorer 0/6, under this scorer "
+        f"3/6, diff +3; prior scorer_sha={prior_sha}",
+        "[scorer effect b] relations found under the prior scorer 0/6, under this scorer "
+        f"2/6, diff +2; prior scorer_sha={prior_sha}",
+    ]
+    identity = _identity(root, files["gold"])
+    assert all(
+        line.endswith(f" | {identity}")
+        for line in result.stdout.splitlines()
+        if line.startswith("[scorer effect ")
+    )
+
+
+def test_no_prior_code_root_prints_no_scorer_effect_line(tmp_path: Path) -> None:
+    result = _run(_write_stub_root(tmp_path / "code"), _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[scorer effect" not in result.stdout
+
+
+def test_a_prior_code_root_that_is_not_a_directory_exits_1(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path), "--prior-code-root", str(tmp_path / "nowhere"))
+    assert result.returncode == 1
+    assert "--prior-code-root" in result.stderr
+    assert "[a]" not in result.stdout
+
+
+def test_a_change_to_the_code_roots_harness_moves_the_scorer_sha(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    one = _run(_write_stub_root(tmp_path / "one"), files)
+    two = _run(_write_stub_root(tmp_path / "two", scorer_tail="\n# changed\n"), files)
+    first = [line for line in one.stdout.splitlines() if line.startswith("identity: ")]
+    second = [line for line in two.stdout.splitlines() if line.startswith("identity: ")]
+    assert first and second and first != second
 
 
 def test_relation_recall_and_precision_are_the_scorer_sums(tmp_path: Path) -> None:
@@ -738,7 +843,7 @@ def _run_named(
 
 
 def _paired(result: subprocess.CompletedProcess[str]) -> list[str]:
-    return [line for line in result.stdout.splitlines() if line.startswith("[paired ")]
+    return [line for line in _bare(result) if line.startswith("[paired ")]
 
 
 def test_paired_recall_is_the_scorer_sums_over_the_shared_probes(tmp_path: Path) -> None:
@@ -824,7 +929,7 @@ def test_paired_lines_follow_the_expectations_and_precede_the_worksheet(
     out = tmp_path / "worksheet.jsonl"
     result = _with_worksheet(tmp_path, out, "--expect", "a=0.500")
     assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
+    lines = _bare(result)
     holds = lines.index("expect a: 0.500 holds")
     paired = lines.index(_paired(result)[0])
     sheet = next(n for n, line in enumerate(lines) if line.startswith("worksheet a: "))
@@ -971,7 +1076,7 @@ def _run_aligned(
 
 
 def _aligned_line(result: subprocess.CompletedProcess[str], run: str) -> str:
-    hits = [line for line in result.stdout.splitlines() if line.startswith(f"[aligned {run}] ")]
+    hits = [line for line in _bare(result) if line.startswith(f"[aligned {run}] ")]
     assert len(hits) == 1, result.stdout
     return hits[0]
 
@@ -1012,6 +1117,19 @@ def test_the_aligned_line_carries_typing_and_list_only_recall(tmp_path: Path) ->
     )
     # The exact lines are still there, unchanged in form.
     assert "[cand] relation recall: 0.333 (1/3)" in _lines(result, "cand")
+
+
+def test_a_code_root_with_a_pack_names_its_hashes_on_every_figure_line(tmp_path: Path) -> None:
+    from backend.knowledge.ontologies import registry
+
+    files = _aligned_inputs(tmp_path)
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    identity = _identity(_REPO_ROOT, files["gold"], registry.active_pack())
+    assert "pack_rails_hash=none" not in identity
+    lines = _figure_lines(result)
+    assert any(line.startswith("[paired-aligned ") for line in lines)
+    assert all(line.endswith(f" | {identity}") for line in lines), lines
 
 
 def test_a_gold_with_no_flags_and_no_pre_h8_gold_scores_every_relation(tmp_path: Path) -> None:
@@ -1104,6 +1222,18 @@ def test_a_heldout_gold_with_pairs_out_exits_1_before_any_file_is_written(
     assert "[cand]" not in result.stdout
 
 
+def test_a_selection_gold_with_pairs_out_exits_1_before_any_file_is_written(
+    tmp_path: Path,
+) -> None:
+    files = _aligned_inputs(tmp_path, gold_name="selection-synthetic.jsonl")
+    out = tmp_path / "pairs"
+    result = _run_aligned(files, ["cand"], "--pairs-out", str(out))
+    assert result.returncode == 1
+    assert "selection-" in result.stderr
+    assert not out.exists()
+    assert "[cand]" not in result.stdout
+
+
 def test_an_existing_pairs_file_exits_1_before_scoring(tmp_path: Path) -> None:
     files = _aligned_inputs(tmp_path)
     out = tmp_path / "pairs"
@@ -1159,7 +1289,7 @@ def test_the_paired_aligned_line_is_second_minus_first(tmp_path: Path) -> None:
         assert bounds is not None
         return f"ci95 [{bounds[0]:+.3f}, {bounds[1]:+.3f}]"
 
-    paired = [line for line in result.stdout.splitlines() if line.startswith("[paired-aligned ")]
+    paired = [line for line in _bare(result) if line.startswith("[paired-aligned ")]
     assert paired == [
         f"[paired-aligned cand|base] recall diff +0.333 {diff_ci('recall')}; "
         f"precision diff +0.333 {diff_ci('precision')}; probes 2 of 2"
@@ -1187,3 +1317,211 @@ def test_a_scorer_without_aligned_scoring_prints_no_aligned_line(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     assert "[aligned" not in result.stdout
     assert "[paired-aligned" not in result.stdout
+
+
+# --- the headline and the model-written column (plan v15, T50 Acceptance 2) -------------------
+#
+# The candidate's reorder id and typo id are pairs of kinds 6 and 7, so the headline, which
+# counts kinds 1 to 4 only, finds neither of its syn-01 relations. The pack at this checkout
+# has no relation-phase rule, so the model-written column equals the headline here; the
+# scorer's own tests pin a column that differs.
+
+_CAND_HEADLINE = {"syn-01-list-tools": (0, 2, 2), "syn-02-prose": (1, 0, 0)}
+_BASE_HEADLINE = {"syn-01-list-tools": (2, 0, 0), "syn-02-prose": (1, 0, 0)}
+
+
+def _with_fields(path: Path, **fields: object) -> None:
+    """Rewrite a raw file with `fields` in every row's response."""
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["response"].update(fields)
+    _jsonl(path, rows)
+
+
+def _column_line(result: subprocess.CompletedProcess[str], prefix: str) -> str:
+    hits = [line for line in _bare(result) if line.startswith(prefix)]
+    assert len(hits) == 1, result.stdout
+    return hits[0]
+
+
+def _diff_ci(first: dict, second: dict, kind: str) -> str:
+    bounds = _bootstrap.cluster_bootstrap_paired_difference_ci(
+        first, second, n_replicates=10_000, seed=0, confidence=0.95, kind=kind
+    )
+    assert bounds is not None
+    return f"ci95 [{bounds[0]:+.3f}, {bounds[1]:+.3f}]"
+
+
+def _recorded_inputs(tmp_path: Path) -> dict[str, Path]:
+    files = _aligned_inputs(tmp_path)
+    for name in ("cand", "base"):
+        _with_fields(files[name], batch_record=[])
+    return files
+
+
+def test_each_run_prints_the_headline_and_the_model_written_column(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand"])
+    assert result.returncode == 0, result.stderr
+    figures = (
+        f"recall 0.333 (1/3) {_ci(_CAND_HEADLINE, 'recall')}; "
+        f"precision 0.333 (1/3) {_ci(_CAND_HEADLINE, 'precision')}; "
+        f"f1 0.333 {_ci(_CAND_HEADLINE, 'f1')}"
+    )
+    assert _column_line(result, "[exact k1-4 cand] ") == f"[exact k1-4 cand] {figures}"
+    assert _column_line(result, "[model-written cand] ") == f"[model-written cand] {figures}"
+    # The aligned figures stay beside both columns.
+    aligned = _aligned_line(result, "cand").removeprefix("[aligned cand] ")
+    assert _column_line(result, "[aligned model-written cand] ") == (
+        f"[aligned model-written cand] {aligned}"
+    )
+    assert _column_line(result, "[relation rails cand] ") == (
+        "[relation rails cand] relation_rails_added=0 relation_rails_removed=0 "
+        "found_only_by_relation_rails=0"
+    )
+
+
+def test_each_pair_prints_both_columns_with_paired_intervals(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    diffs = (
+        f"recall diff +0.667 {_diff_ci(_CAND_HEADLINE, _BASE_HEADLINE, 'recall')}; "
+        f"precision diff +0.667 {_diff_ci(_CAND_HEADLINE, _BASE_HEADLINE, 'precision')}; "
+        f"f1 diff +0.667 {_diff_ci(_CAND_HEADLINE, _BASE_HEADLINE, 'f1')}; probes 2 of 2"
+    )
+    assert _column_line(result, "[paired-exact k1-4 ") == f"[paired-exact k1-4 cand|base] {diffs}"
+    assert _column_line(result, "[paired-model-written ") == (
+        f"[paired-model-written cand|base] {diffs}"
+    )
+    # No `[paired ` filter picks up either new line.
+    assert len(_paired(result)) == 1
+
+
+def test_the_new_lines_carry_the_identity(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    new = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith(("[exact k1-4 ", "[model-written ", "[relation rails ", "[paired-"))
+    ]
+    assert len(new) == 9, result.stdout
+    assert all(_IDENTITY_MARK in line for line in new)
+
+
+def _effect_figures(headline: dict, model_written: dict, diff: str) -> str:
+    return "; ".join(
+        f"{kind} diff {diff} {_diff_ci(model_written, headline, kind)}"
+        for kind in ("recall", "precision", "f1")
+    )
+
+
+def test_each_run_prints_the_rails_effect_with_a_paired_interval(tmp_path: Path) -> None:
+    result = _run_aligned(_recorded_inputs(tmp_path), ["cand"])
+    assert result.returncode == 0, result.stderr
+    # The pack here has no relation-phase rule, so the two columns agree probe by probe.
+    assert _column_line(result, "[rails effect cand] ") == (
+        "[rails effect cand] exact k1-4 minus model-written: "
+        + _effect_figures(_CAND_HEADLINE, _CAND_HEADLINE, "+0.000")
+    )
+    (line,) = (line for line in result.stdout.splitlines() if line.startswith("[rails effect "))
+    assert _IDENTITY_MARK in line
+
+
+def _score_runs_module():
+    spec = importlib.util.spec_from_file_location("_score_runs_under_test", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_rails_effect_is_the_headline_minus_the_model_written_column() -> None:
+    score_runs = _score_runs_module()
+
+    def column(name: str, value: float, tp: int) -> object:
+        ratio = score_runs.Ratio(value, tp, 3)
+        return score_runs.ColumnScore(name, "cand", ratio, None, ratio, None, value, None)
+
+    # The rails find two relations the model-written rows miss: base's counts as the headline.
+    effect = score_runs._rails_effect(
+        _bootstrap,
+        column(score_runs.HEADLINE, 1.0, 3),
+        column(score_runs.MODEL_WRITTEN, 1 / 3, 1),
+        _BASE_HEADLINE,
+        _CAND_HEADLINE,
+    )
+
+    assert effect.line() == (
+        "[rails effect cand] exact k1-4 minus model-written: "
+        + _effect_figures(_BASE_HEADLINE, _CAND_HEADLINE, "+0.667")
+    )
+
+
+def test_a_scorer_without_aligned_scoring_prints_no_rails_effect(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[rails effect" not in result.stdout
+
+
+def test_a_scorer_without_aligned_scoring_prints_neither_column(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    result = _run(root, _inputs(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "[exact k1-4" not in result.stdout
+    assert "model-written" not in result.stdout
+
+
+# --- which column a pair is compared on (plan v15, T50 Acceptance 5) -------------------------
+#
+# A rail that reads the batch record or the plan fires only on rows that carry them, so two
+# runs are compared on the headline only when both carry a batch record, and a turn plan
+# when either had the plan on. Otherwise the headline pair is withheld and the field named.
+
+_PLAN = {"payload": {"entities": [], "templates": [], "back_references": []}}
+
+
+def _model_written_pair(result: subprocess.CompletedProcess[str]) -> str:
+    return _column_line(result, "[paired-model-written ")
+
+
+def test_a_pair_without_batch_records_is_compared_on_the_model_written_column(
+    tmp_path: Path,
+) -> None:
+    files = _aligned_inputs(tmp_path)
+    _with_fields(files["cand"], batch_record=[])
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    assert _column_line(result, "[paired-exact k1-4 ") == (
+        "[paired-exact k1-4 cand|base] withheld: base's rows carry no batch_record; "
+        "compared on model-written"
+    )
+    assert _model_written_pair(result).startswith("[paired-model-written cand|base] recall diff ")
+
+
+def test_a_pair_with_the_plan_on_one_side_is_compared_on_the_model_written_column(
+    tmp_path: Path,
+) -> None:
+    files = _recorded_inputs(tmp_path)
+    _with_fields(files["base"], turn_plan=_PLAN)
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    assert _column_line(result, "[paired-exact k1-4 ") == (
+        "[paired-exact k1-4 cand|base] withheld: cand's rows carry no turn_plan, and base had "
+        "the plan on; compared on model-written"
+    )
+    assert _model_written_pair(result).startswith("[paired-model-written cand|base] recall diff ")
+
+
+def test_a_pair_with_both_fields_on_both_sides_is_compared_on_the_headline(
+    tmp_path: Path,
+) -> None:
+    files = _recorded_inputs(tmp_path)
+    for name in ("cand", "base"):
+        _with_fields(files[name], turn_plan=_PLAN)
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    assert _column_line(result, "[paired-exact k1-4 ").startswith(
+        "[paired-exact k1-4 cand|base] recall diff +0.667 "
+    )

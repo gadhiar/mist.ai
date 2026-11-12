@@ -13,9 +13,10 @@ older server), and a `[WARN]` line names every result stamped with a different o
 
 Nothing is re-implemented:
 - Corpus and scoring: `scripts.eval_harness.score_extraction_run` (`iter_gold_probes`,
-  `parse_produced`, `score_run`, `_norm_ws`). The service's payload
+  `produced_from_response`, `score_run`, `_norm_ws`). The service's payload
   `{"entities": [...], "relationships": [...]}` has the shape of the raw extraction
-  LLM JSON, so `parse_produced(json.dumps(payload))` yields the scorer's `Produced`,
+  LLM JSON, so `produced_from_response` yields the scorer's `Produced` from the
+  response, its scope label, batch record and turn plan handed to the rails with it,
   indexed by the normalised utterance. A failed case is absent from the index and
   scores as all false negatives.
 - Metrics, CIs and per-item rows: `scripts.model_bench.probes.extraction`.
@@ -71,13 +72,16 @@ from backend.extraction_contract.models import (  # noqa: E402
 )
 from backend.knowledge.extraction.scope_classifier import parse_scope_output  # noqa: E402
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION  # noqa: E402
+from scripts.eval_harness import governance  # noqa: E402
 from scripts.eval_harness.score_extraction_run import (  # noqa: E402
     GoldProbe,
     Produced,
     _norm_ws,
     _recover_utterance,
+    column_summary,
     iter_gold_probes,
-    parse_produced,
+    produced_from_response,
+    reading_identity,
     score_run,
 )
 from scripts.model_bench.probes.extraction import (  # noqa: E402
@@ -371,22 +375,25 @@ async def run_cases(
 # ---------------------------------------------------------------------------
 
 
-def build_produced_index(cases: list[CaseResult]) -> dict[str, Produced]:
-    """Index each successful case's payload as the scorer's `Produced`, by normalised utterance."""
+def build_produced_index(
+    cases: list[CaseResult], *, relation_rails: bool = True
+) -> dict[str, Produced]:
+    """Index each successful case's payload as the scorer's `Produced`, by normalised utterance.
+
+    The scorer reads the response as the raw record dumps it, so the rails are handed the
+    case's scope label, batch record and turn plan with its payload. `relation_rails=False`
+    gives the model-written column's index.
+    """
     index: dict[str, Produced] = {}
     for case in cases:
         if case.response is None:
             continue
-        ok, entities, type_by_id, rels = parse_produced(
-            json.dumps(case.response.payload.model_dump(mode="json"))
+        produced = produced_from_response(
+            case.utterance,
+            case.response.model_dump(mode="json"),
+            relation_rails=relation_rails,
         )
-        index[_norm_ws(case.utterance)] = Produced(
-            utterance=_norm_ws(case.utterance),
-            parse_ok=ok,
-            entities=entities,
-            entity_type_by_id=type_by_id,
-            relationships=rels,
-        )
+        index[produced.utterance] = produced
     return index
 
 
@@ -510,14 +517,31 @@ def build_run_summary(
     max_minutes: float,
     limit: int | None,
     drain_s: float = DEFAULT_DRAIN_S,
+    identity: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Score the run and assemble `extraction_service_summary.json`.
+
+    Args:
+        identity: The reading's identity (`reading_identity`), taken before the first
+            probe ran; None takes it now.
 
     Returns:
         `(summary, report)` where `report` is the scorer's `Report`.
     """
-    report = score_run(probes, build_produced_index(result.cases))
+    if identity is None:
+        identity = reading_identity(gold_path)
+    index = build_produced_index(result.cases)
+    report = score_run(probes, index)
     seed, b, confidence, z = load_bootstrap_params()
+    # Both columns, the rails effect and the three counts (plan v15, T50 Acceptance 2).
+    columns = column_summary(
+        probes,
+        index,
+        build_produced_index(result.cases, relation_rails=False),
+        seed=seed,
+        b=b,
+        confidence=confidence,
+    )
     summary = build_summary(
         report,
         gold_path=gold_path,
@@ -541,6 +565,8 @@ def build_run_summary(
     scope_failed = sum(1 for c in completed if c.response and response_flags(c.response)[0])
     repaired = sum(1 for c in completed if c.response and response_flags(c.response)[1])
 
+    summary.update(identity)
+    summary.update(columns)
     summary["ontology_version_note"] = "scorer-side (local repo); the service reports none"
     summary["endpoint"] = {
         "url": endpoint,
@@ -743,12 +769,20 @@ def read_baseline_scope(path: Path, probes: list[GoldProbe]) -> dict[str, tuple[
 def load_baseline(baseline_dir: Path, probes: list[GoldProbe]) -> Baseline:
     """Load `extraction_summary.json`, `extraction.jsonl` and `extraction_debug.jsonl`.
 
-    A missing or unreadable file degrades to a stated omission; nothing raises.
+    A missing or unreadable file degrades to a stated omission; nothing raises. A summary
+    that does not name its scorer, gold and pack (`governance.require_reading`) is not a
+    reading, so its figures are refused the same way, the missing fields named.
     """
     omissions: list[str] = []
     summary = _read_json(baseline_dir / "extraction_summary.json")
     if summary is None:
         omissions.append("extraction_summary.json missing or unreadable: metric table omitted")
+    else:
+        try:
+            governance.require_reading(summary)
+        except governance.NotAReadingError as exc:
+            omissions.append(f"extraction_summary.json refused: {exc}; metric table omitted")
+            summary = None
     rows = _read_rows(baseline_dir / "extraction.jsonl")
     if rows is None:
         omissions.append("extraction.jsonl missing or unreadable: regression list omitted")
@@ -1131,6 +1165,12 @@ async def execute(
     # The rows file holds only the per-case fields until the run is scored; it is then
     # replaced with the full scored rows.
     out_dir.mkdir(parents=True, exist_ok=True)
+    # The reading's identity is fixed and written before the first probe runs, so a
+    # change to the scorer, the gold or the pack during the run cannot relabel it. The
+    # summary holds only the identity until the run is scored; it is then replaced.
+    identity = reading_identity(gold_path)
+    with open(out_dir / OUT_SUMMARY, "x", encoding="utf-8") as summary_fh:
+        summary_fh.write(json.dumps({**identity, "scored": False}, indent=2, sort_keys=True))
     rows_path = out_dir / OUT_ROWS
     with (
         open(rows_path, "x", encoding="utf-8") as rows_fh,
@@ -1170,6 +1210,7 @@ async def execute(
         max_minutes=max_minutes,
         limit=limit,
         drain_s=drain_s,
+        identity=identity,
     )
     rows = build_case_rows(report, result)
     warn_run_identity_mismatches(
