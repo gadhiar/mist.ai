@@ -370,6 +370,108 @@ class TestParseProduced:
             (r["source"], r["predicate"], r["target"]) for r in rels
         ]
 
+    @pytest.mark.asyncio
+    async def test_parse_produced_reads_the_rows_batch_record_as_the_normalizer_does(self):
+        # A list under the lead-in `Harbour weekend`, extracted as one batch: the model
+        # wrote the lead-in's slug in front of each item's id. The apply side and the
+        # scorer hand the same record to the same rails, so both strip it.
+        from backend.extraction_contract.models import BatchRecordEntry, ExtractionPayload
+        from backend.knowledge.extraction.normalizer import EntityNormalizer
+        from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+
+        payload = {
+            "entities": [
+                {"id": "user", "name": "user", "type": "User"},
+                {
+                    "id": "harbour-weekend-ferry-crossing",
+                    "name": "Ferry crossing",
+                    "type": "Event",
+                },
+                {
+                    "id": "harbour-weekend-the-lighthouse-walk",
+                    "name": "the lighthouse walk",
+                    "type": "Event",
+                },
+                {"id": "2026-05-30", "name": "2026-05-30", "type": "Date"},
+            ],
+            "relationships": [
+                {
+                    "source": "user",
+                    "target": "harbour-weekend-ferry-crossing",
+                    "type": "EXPERIENCED",
+                },
+                {
+                    "source": "user",
+                    "target": "harbour-weekend-the-lighthouse-walk",
+                    "type": "EXPERIENCED",
+                },
+                {
+                    "source": "harbour-weekend-ferry-crossing",
+                    "target": "2026-05-30",
+                    "type": "OCCURRED_ON",
+                },
+            ],
+        }
+        record = [
+            BatchRecordEntry(
+                units=[
+                    {"text": text, "context": ["Harbour weekend"], "kind": "list_item"}
+                    for text in ("ferry crossing on 30 May", "the lighthouse walk")
+                ],
+                context=[],
+                payload=ExtractionPayload(**json.loads(json.dumps(payload))),
+                prompt_tokens=120,
+                completion_tokens=60,
+                finish="stop",
+            ).model_dump(mode="json")
+        ]
+        normalizer = EntityNormalizer(embedding_generator=FakeEmbeddingGenerator(), executor=None)
+        out = await normalizer.normalize(
+            ExtractionResult(
+                entities=json.loads(json.dumps(payload["entities"])),
+                relationships=json.loads(json.dumps(payload["relationships"])),
+            ),
+            batch_record=record,
+        )
+
+        ok, entities, type_by_id, rels = parse_produced(json.dumps(payload), batch_record=record)
+
+        assert ok is True
+        assert [e.id for e in entities] == [
+            "user",
+            "ferry-crossing-2026-05-30",
+            "lighthouse-walk",
+            "2026-05-30",
+        ]
+        assert entities == tuple(GoldEntity(id=e["id"], type=e["type"]) for e in out.entities)
+        assert [(r["source"], r["predicate"], r["target"]) for r in rels] == [
+            ("user", "EXPERIENCED", "ferry-crossing-2026-05-30"),
+            ("user", "EXPERIENCED", "lighthouse-walk"),
+            ("ferry-crossing-2026-05-30", "OCCURRED_ON", "2026-05-30"),
+        ]
+        assert [(r["source"], r["predicate"], r["target"]) for r in rels] == [
+            (r["source"], r["type"], r["target"]) for r in out.relationships
+        ]
+
+    def test_parse_produced_without_a_batch_record_strips_no_context(self):
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "id": "harbour-weekend-ferry-crossing",
+                        "name": "Ferry crossing",
+                        "type": "Event",
+                    }
+                ],
+                "relationships": [],
+            }
+        )
+
+        _, entities, _, _ = parse_produced(content)
+
+        assert [e.id for e in entities] == ["harbour-weekend-ferry-crossing"]
+
     def test_a_bare_endpoint_keeps_the_canonical_id_slug(self):
         # An endpoint that names no produced entity is slugged, as before the rails, and
         # takes no rail: the N1 rail runs on entities only.

@@ -256,11 +256,20 @@ def _recover_utterance(request: dict[str, Any]) -> str | None:
 
 def parse_produced(
     content: str,
+    *,
+    batch_record: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, tuple[GoldEntity, ...], dict[str, str], tuple[dict[str, Any], ...]]:
     """Parse a raw extraction-LLM JSON string into the entities and rels the graph stores.
 
     The payload goes through `normalize_payload`, the normalizer's id rails, so each id,
     type and edge is the stored one. The return shape is unchanged.
+
+    Args:
+        content: The payload as JSON text.
+        batch_record: The batch record of the row the payload came from, handed to the
+            rails as the apply hands it, so a rail that reads the record gives the
+            scorer the id it gives the graph. None scores the payload as a row extracted
+            as one batch.
     """
     parsed: Any = None
     try:
@@ -279,6 +288,7 @@ def parse_produced(
     stored_entities, stored_rels = normalize_payload(
         [copy.deepcopy(e) for e in parsed.get("entities") or [] if isinstance(e, dict)],
         [copy.deepcopy(r) for r in parsed.get("relationships") or [] if isinstance(r, dict)],
+        batch_record=batch_record,
     )
     entities: list[GoldEntity] = []
     type_by_id: dict[str, str] = {}

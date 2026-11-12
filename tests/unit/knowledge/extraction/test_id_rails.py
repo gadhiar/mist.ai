@@ -443,6 +443,74 @@ def test_normalize_payload_dates_an_event_after_the_entity_steps_and_remaps_its_
     ]
 
 
+# --- the row's batch record -----------------------------------------------------------------
+
+
+def _listed_under(lead_in: str, entities: list[dict]) -> list[dict]:
+    """A batch record of one call, whose one unit sits under `lead_in`."""
+    return [
+        {
+            "units": [{"text": "an item", "context": [lead_in], "kind": "list_item"}],
+            "context": [],
+            "payload": {"entities": copy.deepcopy(entities), "relationships": []},
+            "prompt_tokens": 120,
+            "completion_tokens": 40,
+            "finish": "stop",
+        }
+    ]
+
+
+def _weekend() -> tuple[list[dict], list[dict]]:
+    entities = [
+        {"id": "user", "name": "user", "type": "User"},
+        {"id": "harbour-weekend-ferry-crossing", "name": "Ferry crossing", "type": "Event"},
+        {"id": "2026-05-30", "name": "2026-05-30", "type": "Date"},
+    ]
+    relationships = [
+        {"source": "user", "target": "harbour-weekend-ferry-crossing", "type": "EXPERIENCED"},
+        _on("harbour-weekend-ferry-crossing", "2026-05-30"),
+    ]
+    return entities, relationships
+
+
+def test_normalize_payload_hands_the_batch_record_to_the_rails():
+    entities, relationships = _weekend()
+    record = _listed_under("Harbour weekend", entities)
+
+    out_entities, out_relationships = normalize_payload(
+        entities, relationships, batch_record=record
+    )
+
+    assert [e["id"] for e in out_entities] == ["user", "ferry-crossing-2026-05-30", "2026-05-30"]
+    assert [(r["source"], r["target"]) for r in out_relationships] == [
+        ("user", "ferry-crossing-2026-05-30"),
+        ("ferry-crossing-2026-05-30", "2026-05-30"),
+    ]
+
+
+def test_normalize_payload_without_a_batch_record_is_a_row_extracted_as_one_batch():
+    out_entities, _ = normalize_payload(*_weekend())
+
+    assert out_entities[1]["id"] == "harbour-weekend-ferry-crossing-2026-05-30"
+
+
+@pytest.mark.asyncio
+async def test_normalize_payload_equals_the_normalizer_on_the_same_batch_record():
+    entities, relationships = _weekend()
+    record = _listed_under("Harbour weekend", entities)
+    rail_entities, rail_relationships = normalize_payload(
+        copy.deepcopy(entities), copy.deepcopy(relationships), batch_record=record
+    )
+    normalizer = EntityNormalizer(embedding_generator=FakeEmbeddingGenerator(), executor=None)
+
+    out = await normalizer.normalize(
+        ExtractionResult(entities=entities, relationships=relationships), batch_record=record
+    )
+
+    assert out.entities == rail_entities
+    assert out.relationships == rail_relationships
+
+
 def test_id_rails_imports_nothing_from_scripts_and_no_io_dependency():
     source = Path(id_rails.__file__).read_text(encoding="utf-8")
     imports = [line for line in source.splitlines() if line.startswith(("import ", "from "))]
@@ -450,5 +518,5 @@ def test_id_rails_imports_nothing_from_scripts_and_no_io_dependency():
     assert imports == [
         "from __future__ import annotations",
         "import re",
-        "from collections.abc import Mapping",
+        "from collections.abc import Mapping, Sequence",
     ]
