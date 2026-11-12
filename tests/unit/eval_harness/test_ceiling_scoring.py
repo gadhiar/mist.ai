@@ -1413,3 +1413,57 @@ def test_a_scorer_without_aligned_scoring_prints_neither_column(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     assert "[exact k1-4" not in result.stdout
     assert "model-written" not in result.stdout
+
+
+# --- which column a pair is compared on (plan v15, T50 Acceptance 5) -------------------------
+#
+# A rail that reads the batch record or the plan fires only on rows that carry them, so two
+# runs are compared on the headline only when both carry a batch record, and a turn plan
+# when either had the plan on. Otherwise the headline pair is withheld and the field named.
+
+_PLAN = {"payload": {"entities": [], "templates": [], "back_references": []}}
+
+
+def _model_written_pair(result: subprocess.CompletedProcess[str]) -> str:
+    return _column_line(result, "[paired-model-written ")
+
+
+def test_a_pair_without_batch_records_is_compared_on_the_model_written_column(
+    tmp_path: Path,
+) -> None:
+    files = _aligned_inputs(tmp_path)
+    _with_fields(files["cand"], batch_record=[])
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    assert _column_line(result, "[paired-exact k1-4 ") == (
+        "[paired-exact k1-4 cand|base] withheld: base's rows carry no batch_record; "
+        "compared on model-written"
+    )
+    assert _model_written_pair(result).startswith("[paired-model-written cand|base] recall diff ")
+
+
+def test_a_pair_with_the_plan_on_one_side_is_compared_on_the_model_written_column(
+    tmp_path: Path,
+) -> None:
+    files = _recorded_inputs(tmp_path)
+    _with_fields(files["base"], turn_plan=_PLAN)
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    assert _column_line(result, "[paired-exact k1-4 ") == (
+        "[paired-exact k1-4 cand|base] withheld: cand's rows carry no turn_plan, and base had "
+        "the plan on; compared on model-written"
+    )
+    assert _model_written_pair(result).startswith("[paired-model-written cand|base] recall diff ")
+
+
+def test_a_pair_with_both_fields_on_both_sides_is_compared_on_the_headline(
+    tmp_path: Path,
+) -> None:
+    files = _recorded_inputs(tmp_path)
+    for name in ("cand", "base"):
+        _with_fields(files[name], turn_plan=_PLAN)
+    result = _run_aligned(files, ["cand", "base"])
+    assert result.returncode == 0, result.stderr
+    assert _column_line(result, "[paired-exact k1-4 ").startswith(
+        "[paired-exact k1-4 cand|base] recall diff +0.667 "
+    )

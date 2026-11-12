@@ -65,7 +65,11 @@ column's aligned figures and what the relation rails did:
 The headline counts only relations found through pairs of alignment kinds 1 to 4, the ids
 the graph stores as one node. Each pair of runs then prints, after the `[paired-aligned`
 line, `[paired-exact k1-4 X|Y]` and `[paired-model-written X|Y]`: recall, precision and F1
-diffs, second minus first, with paired cluster-bootstrap intervals.
+diffs, second minus first, with paired cluster-bootstrap intervals. The headline pair
+prints only when every completed row of both runs carries a `batch_record`, and, when
+either run's rows carry a `turn_plan`, both runs' do; otherwise it reads
+`[paired-exact k1-4 X|Y] withheld: <the run and the missing field>; compared on
+model-written`, since a rail that reads either field fires only on a row that has it.
 
 With two or more runs, one line per unordered pair of `--run` names, in `--run` order (n1|n2,
 n1|n3, ..., then n2|n3 and so on), compares the runs on the same probes:
@@ -1113,23 +1117,76 @@ def _paired_column_score(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class WithheldPair:
+    """A pair the headline does not compare, and the field one of its runs lacks."""
+
+    first: str
+    second: str
+    reason: str
+
+    def line(self) -> str:
+        """The headline pair's line, naming the missing field and the column compared on."""
+        return (
+            f"[paired-{HEADLINE} {self.first}|{self.second}] withheld: {self.reason}; "
+            f"compared on {MODEL_WRITTEN}"
+        )
+
+
+def _headline_withheld(
+    names: tuple[str, str], probes: list[_Probe], runs: dict[str, ScoredRun]
+) -> str | None:
+    """Why two runs are not compared on the headline, or None when they are.
+
+    A rail that reads the batch record or the turn plan fires only on a row that carries
+    it, so the headline compares two runs only when every completed row of both carries a
+    batch record, and, when either run had the plan on (a row carries a turn plan), both
+    did (plan v15, T50 Acceptance 5).
+    """
+    responses = {
+        name: [runs[name].rows[tag]["response"] for tag in sorted(_completed(probes, runs[name]))]
+        for name in names
+    }
+    no_record = [
+        name
+        for name in names
+        if not responses[name]
+        or any(response.get("batch_record") is None for response in responses[name])
+    ]
+    if no_record:
+        return " and ".join(f"{name}'s" for name in no_record) + " rows carry no batch_record"
+    plan_on = [
+        name
+        for name in names
+        if any(response.get("turn_plan") is not None for response in responses[name])
+    ]
+    if len(plan_on) == 1:
+        (off,) = (name for name in names if name not in plan_on)
+        return f"{off}'s rows carry no turn_plan, and {plan_on[0]} had the plan on"
+    return None
+
+
 def _paired_columns(
     scorer: ModuleType, aligned: Aligned, probes: list[_Probe], runs: dict[str, ScoredRun]
-) -> list[ColumnPairScore]:
-    """Each unordered pair in `--run` order: the headline, then the model-written column."""
+) -> list[ColumnPairScore | WithheldPair]:
+    """Each unordered pair in `--run` order: the headline or why not, then model-written."""
     names = list(runs)
     completed = {name: _completed(probes, run) for name, run in runs.items()}
-    pairs: list[ColumnPairScore] = []
+    pairs: list[ColumnPairScore | WithheldPair] = []
     for i, first in enumerate(names):
         for second in names[i + 1 :]:
             shared = [p for p in probes if p.tag in completed[first] & completed[second]]
             one, two = runs[first].columns, runs[second].columns
             if one is None or two is None:
                 continue
+            withheld = _headline_withheld((first, second), probes, runs)
             for column, indexes in (
                 (HEADLINE, (runs[first].index, runs[second].index)),
                 (MODEL_WRITTEN, (one.model_index, two.model_index)),
             ):
+                if column == HEADLINE and withheld is not None:
+                    pairs.append(WithheldPair(first, second, withheld))
+                    continue
                 pairs.append(
                     _paired_column_score(
                         scorer, aligned, column, (first, second), shared, indexes, len(probes)
@@ -1331,7 +1388,7 @@ def _run(argv: Sequence[str] | None) -> int:
     ]
     pairs: list[PairScore] = []
     aligned_pairs: list[AlignedPairScore] = []
-    column_pairs: list[ColumnPairScore] = []
+    column_pairs: list[ColumnPairScore | WithheldPair] = []
     by_name = {name: run for name, (_, run) in scored.items()}
     prior: PriorScores | None = None
     if not failed:
