@@ -1207,6 +1207,36 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - Ruling: Entities only; the relations are agreed.
 - Entities: the season the utterance calls 'the second' has no id that is its own phrase, so N1 lists both forms, B's alternative held.
 
+## M66: Rule 23's form
+
+Lead ruling M66 (12 Nov): where the production prompt is explicit, it governs the gold. Rule 23
+reads: "A name that only modifies another name gets no entity of its own, unless a list's lead-in
+carries it: in "the Ferrowind tuning guide" the entity is "ferrowind-tuning-guide", and Ferrowind
+gets no entity." So on that shape Rule 23's form, the name kept together with the noun it
+modifies in one id, replaces the N14 reading that rulings above took (the id is the name alone).
+Each id below is renamed in the probe's entities and in every relation endpoint that names it;
+nothing else in the probe changes, and the probe's ruling above stands except for the id.
+
+- `sel-025-list-dash-dispensary-software`: `access` -> `access-database`, in its entity and 2 relation endpoints. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
+- `sel-096-list-dash-monday-first-things`: `ampere-atlas` -> `ampere-atlas-dashboard`, in its entity and 2 relation endpoints. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
+- `sel-115-multi-grid-scientist-utrecht`: `gridcast` -> `gridcast-forecast`, in its entity and 1 relation endpoint. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
+- `sel-161-multi-sous-chef-club-newsletter`: `second-stove` -> `second-stove-newsletter`, in its entity and 1 relation endpoint. Rule 23: the name only modifies the noun after it, and no list lead-in carries it.
+
+Kept as ruled, counted unsure, where Rule 23 is not explicit:
+
+- `sel-002-list-dash-planner-parts`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-019-list-long-soak-run-figures`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-099-list-numbered-weekly-numbers`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-106-list-checkbox-release-checklist`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-112-list-long-monthly-backtest-error`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-152-list-checkbox-newsletter-month`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-165-list-dash-dive-bag-kit`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-188-list-dash-android-app-parts`: a list's lead-in carries the name, and Rule 23 does not say which id the name takes there.
+- `sel-024-scope-notes-and-tone`: the noun after the name is plural and names files of a format, not one thing as in Rule 23's example.
+- `sel-092-coref-editor-and-deputy`: the name does not only modify: the utterance refers back to it as an organisation, the target of both WORKS_AT edges.
+
+Ids renamed: 4, in 4 probes; relation endpoints renamed: 6. Kept and counted unsure: 10.
+
 ## Totals
 
 - Probes with a difference adjudicated: 139; still to adjudicate: 0.
