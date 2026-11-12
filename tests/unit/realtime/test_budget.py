@@ -5,8 +5,12 @@ makes `turn_metrics.over_budget` judge turns against a target nobody agreed to, 
 pinned figure by figure and by its sum rule. `load_voice_settings` is the only reader of the
 `MIST_VOICE_*` variables, so each variable is checked to reach its field and each malformed value
 to fail at startup with the variable's name, instead of surfacing later as a confusing engine
-error. The variables the GPU yield and the cloned voice used are pinned as ignored, so a stale
-`.env` entry neither fails startup nor changes a setting.
+error. Each speech slot is an ordered chain of `engine@device` options, and the voice is an
+identity id read under `MIST_VOICE_IDENTITY_ROOT`, so the chain grammar and the identity id are
+pinned case by case. The per-slot engine, device and model variables the chains replaced are
+pinned to fail naming their replacement, because ignoring one would move an engine without a
+word. The variables the GPU yield and the earlier profile-based cloned voice used are pinned as
+ignored, so a stale `.env` entry neither fails startup nor changes a setting.
 """
 
 import dataclasses
@@ -27,6 +31,7 @@ from backend.realtime.budget import (
     STAGE_FIELDS,
     BargeInConfig,
     EndpointingConfig,
+    EngineOption,
     PlacementConfig,
     PlaybackConfig,
     SegmenterConfig,
@@ -261,8 +266,11 @@ CONFIG_DEFAULTS = [
             "vad_device": "cpu",
             "eot_device": "cpu",
             "eot_threads": 4,
-            "stt_device": ("cuda", "cpu"),
-            "tts_device": ("cuda", "off"),
+            "stt_chain": (
+                {"engine": "nemotron-160", "device": "cuda"},
+                {"engine": "parakeet-cpu", "device": "cpu"},
+            ),
+            "tts_chain": ({"engine": "pocket-clone", "device": "cpu"},),
             "vad_model": (
                 "onnx-community/silero-vad@e71cae966052b992a7eca6b17738916ce0eca4ec"
                 ":onnx/model.onnx"
@@ -271,11 +279,9 @@ CONFIG_DEFAULTS = [
                 "pipecat-ai/smart-turn-v3@f766f81d3cfdf7737ac64aad813d91bbfd56bf93"
                 ":smart-turn-v3.2-cpu.onnx"
             ),
-            "stt_engine": None,
-            "stt_model": None,
-            "tts_engine": None,
-            "tts_model": None,
             "tts_voice": None,
+            "voice_root": "/voices",
+            "voice_cache_dir": "/voice-cache",
             "vram_budget_mib": 4500,
             "release_timeout_s": 10.0,
             "models_dir": "/models",
@@ -370,6 +376,30 @@ class TestConfigDataclasses:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(config, first_field, getattr(config, first_field))
 
+    def test_an_engine_option_is_an_engine_and_a_device_frozen_and_slotted(self):
+        option = EngineOption("parakeet-cpu", "cpu")
+
+        assert [field.name for field in dataclasses.fields(EngineOption)] == ["engine", "device"]
+        assert (option.engine, option.device) == ("parakeet-cpu", "cpu")
+        assert not hasattr(option, "__dict__")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            option.device = "cuda"  # type: ignore[misc]
+
+    def test_the_default_chains_try_nemotron_on_the_gpu_then_parakeet_on_the_cpu(self):
+        config = PlacementConfig()
+
+        assert config.stt_chain == (
+            EngineOption("nemotron-160", "cuda"),
+            EngineOption("parakeet-cpu", "cpu"),
+        )
+        assert config.tts_chain == (EngineOption("pocket-clone", "cpu"),)
+
+    @pytest.mark.parametrize(
+        "name", ["stt_engine", "stt_device", "stt_model", "tts_engine", "tts_device", "tts_model"]
+    )
+    def test_the_per_slot_engine_device_and_model_fields_are_gone(self, name):
+        assert name not in {field.name for field in dataclasses.fields(PlacementConfig)}
+
     def test_voice_settings_is_frozen_and_slotted(self):
         settings = VoiceSettings()
 
@@ -453,11 +483,14 @@ class TestLoadVoiceSettingsDefaults:
         )
         assert settings.placement.kws_model is None
         assert settings.placement.kws_threads == 1
-        assert settings.placement.stt_device == ("cuda", "cpu")
-        assert settings.placement.tts_device == ("cuda", "off")
-        assert settings.placement.stt_engine is None
-        assert settings.placement.tts_engine is None
+        assert settings.placement.stt_chain == (
+            EngineOption("nemotron-160", "cuda"),
+            EngineOption("parakeet-cpu", "cpu"),
+        )
+        assert settings.placement.tts_chain == (EngineOption("pocket-clone", "cpu"),)
         assert settings.placement.tts_voice is None
+        assert settings.placement.voice_root == "/voices"
+        assert settings.placement.voice_cache_dir == "/voice-cache"
         assert settings.endpointing.stt_partial_interval_ms == 250
         assert settings.placement.release_timeout_s == 10.0
         assert settings.placement.models_dir == "/models"
@@ -522,12 +555,17 @@ VARIABLES = [
     ("MIST_VOICE_EOT_DEVICE", "cuda:1", "placement.eot_device", "cuda:1"),
     ("MIST_VOICE_EOT_THREADS", "8", "placement.eot_threads", 8),
     (
-        "MIST_VOICE_STT_DEVICE",
-        "cuda:0, cpu, off",
-        "placement.stt_device",
-        ("cuda:0", "cpu", "off"),
+        "MIST_VOICE_STT_CHAIN",
+        "parakeet-cpu@cpu",
+        "placement.stt_chain",
+        (EngineOption("parakeet-cpu", "cpu"),),
     ),
-    ("MIST_VOICE_TTS_DEVICE", "off", "placement.tts_device", ("off",)),
+    (
+        "MIST_VOICE_TTS_CHAIN",
+        "pocket-clone@cuda, pocket-clone@cpu",
+        "placement.tts_chain",
+        (EngineOption("pocket-clone", "cuda"), EngineOption("pocket-clone", "cpu")),
+    ),
     (
         "MIST_VOICE_VAD_MODEL",
         "org/vad@abc123:model.onnx",
@@ -540,11 +578,9 @@ VARIABLES = [
         "placement.eot_model",
         "org/eot@def456:onnx/x.onnx",
     ),
-    ("MIST_VOICE_STT_ENGINE", "whisper-turbo", "placement.stt_engine", "whisper-turbo"),
-    ("MIST_VOICE_STT_MODEL", "org/stt@0123abc", "placement.stt_model", "org/stt@0123abc"),
-    ("MIST_VOICE_TTS_ENGINE", "kokoro2", "placement.tts_engine", "kokoro2"),
-    ("MIST_VOICE_TTS_MODEL", "org/tts@0123abc", "placement.tts_model", "org/tts@0123abc"),
-    ("MIST_VOICE_TTS_VOICE", "af_heart", "placement.tts_voice", "af_heart"),
+    ("MIST_VOICE_TTS_VOICE", "mist-v1", "placement.tts_voice", "mist-v1"),
+    ("MIST_VOICE_IDENTITY_ROOT", "/srv/voices", "placement.voice_root", "/srv/voices"),
+    ("MIST_VOICE_CACHE_DIR", "/srv/voice-cache", "placement.voice_cache_dir", "/srv/voice-cache"),
     ("MIST_VOICE_VRAM_BUDGET_MIB", "6000", "placement.vram_budget_mib", 6000),
     ("MIST_VOICE_RELEASE_TIMEOUT_S", "2.5", "placement.release_timeout_s", 2.5),
     ("MIST_VOICE_MODELS_DIR", "/srv/weights", "placement.models_dir", "/srv/weights"),
@@ -660,15 +696,13 @@ class TestLoadVoiceSettingsVariables:
             "MIST_VOICE_VAD_DEVICE",
             "MIST_VOICE_EOT_DEVICE",
             "MIST_VOICE_EOT_THREADS",
-            "MIST_VOICE_STT_DEVICE",
-            "MIST_VOICE_TTS_DEVICE",
+            "MIST_VOICE_STT_CHAIN",
+            "MIST_VOICE_TTS_CHAIN",
             "MIST_VOICE_VAD_MODEL",
             "MIST_VOICE_EOT_MODEL",
-            "MIST_VOICE_STT_ENGINE",
-            "MIST_VOICE_STT_MODEL",
-            "MIST_VOICE_TTS_ENGINE",
-            "MIST_VOICE_TTS_MODEL",
             "MIST_VOICE_TTS_VOICE",
+            "MIST_VOICE_IDENTITY_ROOT",
+            "MIST_VOICE_CACHE_DIR",
             "MIST_VOICE_VRAM_BUDGET_MIB",
             "MIST_VOICE_RELEASE_TIMEOUT_S",
             "MIST_VOICE_MODELS_DIR",
@@ -722,6 +756,131 @@ class TestWakePhrasesFile:
 
         assert wake.address_starts == ("what", "find")
         assert wake.stop_before == ("the",)
+
+
+CHAIN_VARIABLES = [
+    pytest.param("MIST_VOICE_STT_CHAIN", "stt_chain", id="stt"),
+    pytest.param("MIST_VOICE_TTS_CHAIN", "tts_chain", id="tts"),
+]
+
+
+class TestPlacementChains:
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    def test_a_chain_variable_reads_ordered_engine_device_options(self, name, attribute):
+        settings = load_voice_settings({name: "nemotron-160@cuda,parakeet-cpu@cpu"})
+
+        assert getattr(settings.placement, attribute) == (
+            EngineOption("nemotron-160", "cuda"),
+            EngineOption("parakeet-cpu", "cpu"),
+        )
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    def test_off_alone_gives_an_empty_chain(self, name, attribute):
+        settings = load_voice_settings({name: " off "})
+
+        assert getattr(settings.placement, attribute) == ()
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    def test_the_same_engine_may_be_tried_on_two_devices(self, name, attribute):
+        settings = load_voice_settings({name: "pocket-clone@cuda,pocket-clone@cpu"})
+
+        assert getattr(settings.placement, attribute) == (
+            EngineOption("pocket-clone", "cuda"),
+            EngineOption("pocket-clone", "cpu"),
+        )
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("Nemotron-160@cuda", id="engine-upper-case"),
+            pytest.param("-parakeet@cpu", id="engine-leading-hyphen"),
+            pytest.param("parakeet_cpu@cpu", id="engine-underscore"),
+            pytest.param("@cpu", id="engine-missing"),
+            pytest.param("parakeet cpu@cpu", id="engine-space"),
+        ],
+    )
+    def test_an_engine_id_outside_the_pattern_raises_naming_the_variable(
+        self, name, attribute, raw
+    ):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: raw})
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("nemotron-160@cuda:1", id="cuda-index"),
+            pytest.param("nemotron-160@cuda:0", id="cuda-zero"),
+            pytest.param("parakeet-cpu@tpu", id="unknown-device"),
+            pytest.param("parakeet-cpu@CPU", id="upper-case-device"),
+            pytest.param("parakeet-cpu@remote", id="remote"),
+            pytest.param("parakeet-cpu@off", id="off-as-device"),
+            pytest.param("parakeet-cpu", id="device-missing"),
+            pytest.param("parakeet-cpu@", id="device-empty"),
+            pytest.param("parakeet-cpu@cpu@cuda", id="two-devices"),
+        ],
+    )
+    def test_a_device_other_than_cpu_or_cuda_raises_naming_the_variable(self, name, attribute, raw):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: raw})
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    def test_a_repeated_option_raises_naming_the_variable(self, name, attribute):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: "parakeet-cpu@cpu,nemotron-160@cuda,parakeet-cpu@cpu"})
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("off,parakeet-cpu@cpu", id="off-first"),
+            pytest.param("parakeet-cpu@cpu,off", id="off-last"),
+            pytest.param("off,off", id="off-twice"),
+        ],
+    )
+    def test_off_beside_an_option_raises_naming_the_variable(self, name, attribute, raw):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: raw})
+
+    @pytest.mark.parametrize(("name", "attribute"), CHAIN_VARIABLES)
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("  ", id="blank"),
+            pytest.param(" , ", id="only-separators"),
+            pytest.param("parakeet-cpu@cpu,", id="trailing-separator"),
+            pytest.param("nemotron-160@cuda,,parakeet-cpu@cpu", id="empty-option"),
+        ],
+    )
+    def test_an_empty_value_or_option_raises_naming_the_variable(self, name, attribute, raw):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: raw})
+
+
+# (removed variable, the variable that replaced it)
+REMOVED_PER_SLOT_VARIABLES = [
+    pytest.param("MIST_VOICE_STT_ENGINE", "MIST_VOICE_STT_CHAIN", id="stt-engine"),
+    pytest.param("MIST_VOICE_STT_DEVICE", "MIST_VOICE_STT_CHAIN", id="stt-device"),
+    pytest.param("MIST_VOICE_STT_MODEL", "MIST_VOICE_STT_CHAIN", id="stt-model"),
+    pytest.param("MIST_VOICE_TTS_ENGINE", "MIST_VOICE_TTS_CHAIN", id="tts-engine"),
+    pytest.param("MIST_VOICE_TTS_DEVICE", "MIST_VOICE_TTS_CHAIN", id="tts-device"),
+    pytest.param("MIST_VOICE_TTS_MODEL", "MIST_VOICE_TTS_CHAIN", id="tts-model"),
+]
+
+
+class TestRemovedPerSlotVariables:
+    @pytest.mark.parametrize(("removed", "replacement"), REMOVED_PER_SLOT_VARIABLES)
+    def test_a_removed_variable_raises_naming_it_and_its_replacement(self, removed, replacement):
+        # A value the old variable accepted, so the error is the removal, not a malformed value.
+        with pytest.raises(ValueError, match=f"{removed}.*{replacement}"):
+            load_voice_settings({removed: "cpu"})
+
+    @pytest.mark.parametrize(("removed", "replacement"), REMOVED_PER_SLOT_VARIABLES)
+    def test_a_removed_variable_set_empty_still_raises(self, removed, replacement):
+        with pytest.raises(ValueError, match=replacement):
+            load_voice_settings({removed: ""})
 
 
 class TestLoadVoiceSettingsErrors:
@@ -868,35 +1027,6 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_VAD_THRESHOLD"):
             load_voice_settings({"MIST_VOICE_VAD_THRESHOLD": "1.5"})
 
-    def test_an_unknown_placement_location_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_DEVICE"):
-            load_voice_settings({"MIST_VOICE_STT_DEVICE": "cuda,tpu"})
-
-    @pytest.mark.parametrize("name", ["MIST_VOICE_STT_DEVICE", "MIST_VOICE_TTS_DEVICE"])
-    def test_remote_is_no_longer_a_location(self, name):
-        with pytest.raises(ValueError, match=name):
-            load_voice_settings({name: "remote,off"})
-
-    def test_a_malformed_cuda_index_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_DEVICE"):
-            load_voice_settings({"MIST_VOICE_TTS_DEVICE": "cuda:x,off"})
-
-    def test_an_empty_placement_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_DEVICE"):
-            load_voice_settings({"MIST_VOICE_TTS_DEVICE": ""})
-
-    def test_a_placement_of_only_separators_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_DEVICE"):
-            load_voice_settings({"MIST_VOICE_STT_DEVICE": " , "})
-
-    def test_a_repeated_placement_location_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_DEVICE"):
-            load_voice_settings({"MIST_VOICE_STT_DEVICE": "cpu,cuda,cpu"})
-
-    def test_off_before_the_last_place_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_DEVICE"):
-            load_voice_settings({"MIST_VOICE_TTS_DEVICE": "cuda,off,cpu"})
-
     def test_a_vad_device_list_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_VAD_DEVICE"):
             load_voice_settings({"MIST_VOICE_VAD_DEVICE": "cuda,cpu"})
@@ -914,34 +1044,6 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_EOT_THREADS"):
             load_voice_settings({"MIST_VOICE_EOT_THREADS": raw})
 
-    @pytest.mark.parametrize("name", ["MIST_VOICE_STT_ENGINE", "MIST_VOICE_TTS_ENGINE"])
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            pytest.param("", id="empty"),
-            pytest.param("Whisper", id="upper-case"),
-            pytest.param("-kokoro", id="leading-hyphen"),
-            pytest.param("faster_whisper", id="underscore"),
-            pytest.param("qwen3 tts", id="space"),
-            pytest.param("kokoro/v1", id="slash"),
-        ],
-    )
-    def test_an_engine_id_outside_the_id_form_raises_naming_the_variable(self, name, raw):
-        with pytest.raises(ValueError, match=name):
-            load_voice_settings({name: raw})
-
-    def test_an_stt_model_without_a_revision_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_MODEL"):
-            load_voice_settings({"MIST_VOICE_STT_MODEL": "base"})
-
-    def test_a_tts_model_without_a_revision_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_MODEL"):
-            load_voice_settings({"MIST_VOICE_TTS_MODEL": "ResembleAI/chatterbox-turbo"})
-
-    def test_a_tts_model_with_a_file_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_MODEL"):
-            load_voice_settings({"MIST_VOICE_TTS_MODEL": "org/tts@abc:model.bin"})
-
     def test_an_onnx_model_without_a_file_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_VAD_MODEL"):
             load_voice_settings({"MIST_VOICE_VAD_MODEL": "onnx-community/silero-vad@e71cae9"})
@@ -950,9 +1052,34 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_EOT_MODEL"):
             load_voice_settings({"MIST_VOICE_EOT_MODEL": "pipecat-ai/smart-turn-v3:model.onnx"})
 
-    def test_an_empty_tts_voice_raises_naming_the_variable(self):
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param(" ", id="empty"),
+            # A stock voice name, the variable's meaning before it named an identity.
+            pytest.param("af_heart", id="stock-voice-underscore"),
+            pytest.param("Mist-v1", id="upper-case"),
+            pytest.param("-mist", id="leading-hyphen"),
+            pytest.param("mist/v1", id="slash"),
+            pytest.param("../mist-v1", id="parent-directory"),
+        ],
+    )
+    def test_a_tts_voice_that_is_not_an_identity_id_raises_naming_the_variable(self, raw):
         with pytest.raises(ValueError, match="MIST_VOICE_TTS_VOICE"):
-            load_voice_settings({"MIST_VOICE_TTS_VOICE": " "})
+            load_voice_settings({"MIST_VOICE_TTS_VOICE": raw})
+
+    @pytest.mark.parametrize("name", ["MIST_VOICE_IDENTITY_ROOT", "MIST_VOICE_CACHE_DIR"])
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("voices", id="relative"),
+            pytest.param("./voices", id="dot-relative"),
+        ],
+    )
+    def test_a_voice_path_that_is_not_absolute_raises_naming_it(self, name, raw):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: raw})
 
     @pytest.mark.parametrize(
         "raw",
