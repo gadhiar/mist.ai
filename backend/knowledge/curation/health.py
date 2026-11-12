@@ -2,7 +2,9 @@
 
 Computes a 0-100 overall health score from freshness, confidence,
 connectivity, consistency, coverage, and self-model sub-scores.
-Each sub-score is 0-100, combined via a weighted average.
+Each sub-score is 0-100, combined via a weighted average. Beside the score
+it reports a count of `:__Entity__` nodes whose type label and `entity_type`
+disagree.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP
 from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.partitions import (
@@ -19,6 +22,7 @@ from backend.knowledge.storage.partitions import (
     PROVENANCE_LABEL,
     SELF_MODEL_LABEL,
 )
+from backend.knowledge.storage.type_labels import ENTITY_TYPE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +122,37 @@ WHERE coalesce(e.status, 'active') = 'active'
 RETURN count(e) AS self_model_count
 """
 
+# An `:__Entity__` node carries its `entity_type` as a label when the type is in
+# `ENTITY_TYPE_LABELS`, and no other ontology type label
+# (`backend/knowledge/storage/type_labels.py`). The property is the record and
+# the label mirrors it, so this counts the nodes where the two have diverged: a
+# missing label, a wrong one, or a stray one beside the right one. A label is
+# compared only if it names an ontology type, current or retired; any other
+# label, such as the partition label itself, is not a type label.
+#
+# Every `:__Entity__` node counts, whatever its `status`: a label is structure,
+# not belief state, and an archived node keeps its labels.
+_TYPE_LABEL_MISMATCH_QUERY = f"""\
+MATCH (e:{ENTITY_LABEL})
+WITH e, [label IN labels(e) WHERE label IN $ontology_type_labels] AS type_labels,
+     CASE WHEN e.entity_type IN $entity_type_labels THEN [e.entity_type] ELSE [] END AS expected
+RETURN sum(CASE WHEN type_labels = expected THEN 0 ELSE 1 END) AS type_label_mismatches
+"""
+
+_TYPE_LABEL_MISMATCH_PARAMS: dict[str, list[str]] = {
+    "ontology_type_labels": sorted(_VALID_ENTITY_TYPES | set(RETIRED_TYPE_MAP)),
+    "entity_type_labels": sorted(ENTITY_TYPE_LABELS),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class HealthScore:
-    """Composite graph health score."""
+    """Composite graph health score.
+
+    `type_label_mismatches` is a count beside the score, not a sub-score: it
+    does not enter `overall` (`_TYPE_LABEL_MISMATCH_QUERY`). It defaults to 0
+    so a caller that builds a score without it still constructs.
+    """
 
     overall: float
     freshness: float
@@ -132,6 +163,7 @@ class HealthScore:
     self_model: float
     entity_count: int
     relationship_count: int
+    type_label_mismatches: int = 0
 
 
 class GraphHealthScorer:
@@ -145,9 +177,17 @@ class GraphHealthScorer:
         start = time.perf_counter()
 
         total = await self._count_entities()
+        # Counted before the empty-graph return: it ranges over every
+        # `:__Entity__` node, active or not, so a graph with no active entity
+        # can still hold a mislabelled one.
+        type_label_mismatches = await self._count_type_label_mismatches()
         if total == 0:
             elapsed = (time.perf_counter() - start) * 1000
-            logger.info("Health score: empty graph (%.1fms)", elapsed)
+            logger.info(
+                "Health score: empty graph, type_label_mismatches=%d (%.1fms)",
+                type_label_mismatches,
+                elapsed,
+            )
             return HealthScore(
                 overall=0.0,
                 freshness=0.0,
@@ -158,6 +198,7 @@ class GraphHealthScorer:
                 self_model=0.0,
                 entity_count=0,
                 relationship_count=0,
+                type_label_mismatches=type_label_mismatches,
             )
 
         freshness = await self._score_freshness(total)
@@ -181,7 +222,7 @@ class GraphHealthScorer:
         logger.info(
             "Health score: overall=%.1f freshness=%.1f confidence=%.1f "
             "connectivity=%.1f consistency=%.1f coverage=%.1f "
-            "self_model=%.1f entities=%d rels=%d (%.1fms)",
+            "self_model=%.1f entities=%d rels=%d type_label_mismatches=%d (%.1fms)",
             overall,
             freshness,
             confidence,
@@ -191,8 +232,14 @@ class GraphHealthScorer:
             self_model,
             total,
             rel_count,
+            type_label_mismatches,
             elapsed,
         )
+        if type_label_mismatches:
+            logger.warning(
+                "%d :__Entity__ node(s) carry a type label that does not match entity_type",
+                type_label_mismatches,
+            )
 
         return HealthScore(
             overall=overall,
@@ -204,6 +251,7 @@ class GraphHealthScorer:
             self_model=self_model,
             entity_count=total,
             relationship_count=rel_count,
+            type_label_mismatches=type_label_mismatches,
         )
 
     async def _count_entities(self) -> int:
@@ -211,6 +259,16 @@ class GraphHealthScorer:
         if not records:
             return 0
         return records[0]["total"]
+
+    async def _count_type_label_mismatches(self) -> int:
+        """Count `:__Entity__` nodes whose type label does not match `entity_type`."""
+        records = await self._executor.execute_query(
+            _TYPE_LABEL_MISMATCH_QUERY,
+            {name: list(labels) for name, labels in _TYPE_LABEL_MISMATCH_PARAMS.items()},
+        )
+        if not records or records[0]["type_label_mismatches"] is None:
+            return 0
+        return records[0]["type_label_mismatches"]
 
     async def _score_freshness(self, total: int) -> float:
         """Percentage of entities updated in last 30 days."""

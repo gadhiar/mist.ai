@@ -4,31 +4,14 @@ description: >-
   scored with minimum-scope lenient repair (strip whitespace bursts,
   tolerate trailing commas). Runs on all candidates for parity so the
   strict-vs-lenient delta quantifies each candidate's format fragility.
+  Prompt source, reference date and constraint match schema_conformance.
 
 temperature_mode: extraction
 max_tokens: 1024
-use_grammar: true
+prompt_source: production_extraction
+reference_date: "2026-06-14"
+constrained: true
 response_format: null
-
-system_prompt: |
-  You are a knowledge extraction engine for a personal AI assistant. Your task is to extract structured knowledge from conversation text.
-
-  You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just the JSON object.
-
-  Allowed Entity Types (use EXACTLY these strings):
-  User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
-
-  Allowed Relationship Types (use EXACTLY these strings):
-  USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
-
-  Output schema:
-  {"entities": [{"id": "kebab-case-id", "name": "Display Name", "type": "EntityType"}], "relationships": [{"source": "entity-id", "target": "entity-id", "type": "RELATIONSHIP_TYPE", "properties": {"confidence": 0.9, "temporal_status": "current|past|future", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}]}
-
-  Rules:
-  - The user is always the first entity with id "user", name "User", type "User" when first-person pronouns appear.
-  - Entity IDs are lowercase kebab-case derived from the display name.
-  - Extract ONLY what is explicitly stated.
-  - If nothing is extractable, return {"entities": [], "relationships": []}.
 
 cases:
   - id: simple_usage

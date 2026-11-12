@@ -9,11 +9,17 @@ constructor parameters, per the project's no-hidden-construction rule.
 Environment variable names are all prefixed `EXTRACTION_`, except
 `LLAMA_CPP_BUILD` which is shared with the rest of the deployment (T1b's
 image build records the llama.cpp build it ships).
+
+The `EXTRACTION_SERVER_<NAME>` family is open-ended: compose declares one per
+llama-server setting it sets, built from the same `${...}` expression as the
+llama-server flag, and the service reads every one into `server_config` for
+its serving identity (`backend.knowledge.extraction.serving_identity`).
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,6 +27,8 @@ ConstrainedMode = Literal["schema", "json_object", "none"]
 ReasoningEffort = Literal["low", "medium", "high"]
 
 _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+SERVER_ENV_PREFIX = "EXTRACTION_SERVER_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +73,11 @@ class ServiceSettings:
             runs, reported in `ResultStamps.llama_cpp_build` and
             `InfoResponse.llama_cpp_build`.
         port: TCP port `python -m backend.extraction_service` binds to.
+        server_config: The llama-server settings compose declares to the
+            service, one `EXTRACTION_SERVER_<NAME>` variable each, as
+            (lower-cased name, stripped value) pairs sorted by name. The
+            service cannot see llama-server's launch flags, so these
+            declarations are how they reach its serving identity.
     """
 
     llm_base_url: str
@@ -82,18 +95,24 @@ class ServiceSettings:
     temperature: float = 0.0
     llama_cpp_build: str = "b11151"
     port: int = 8090
+    server_config: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse values the service cannot run with.
 
         Raises:
-            ValueError: `idempotency_cache_size` is negative.
+            ValueError: `idempotency_cache_size` is negative, or a
+                `server_config` name appears twice.
         """
         if self.idempotency_cache_size < 0:
             raise ValueError(
                 f"idempotency_cache_size must be >= 0 (0 disables retention), "
                 f"got {self.idempotency_cache_size}"
             )
+        names = [name for name, _value in self.server_config]
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        if repeated:
+            raise ValueError(f"server_config declares {', '.join(repeated)} more than once")
 
     @classmethod
     def from_env(cls) -> ServiceSettings:
@@ -123,7 +142,24 @@ class ServiceSettings:
             temperature=float(os.environ.get("EXTRACTION_TEMPERATURE", "0.0")),
             llama_cpp_build=os.environ.get("LLAMA_CPP_BUILD", "b11151"),
             port=int(os.environ.get("EXTRACTION_PORT", "8090")),
+            server_config=_server_config(os.environ),
         )
+
+
+def _server_config(environ: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    """Every `EXTRACTION_SERVER_<NAME>` in `environ`, as sorted (name, value) pairs.
+
+    The name is lower-cased and the value stripped. An empty value is kept: an
+    unset `${VAR:-}` in compose arrives as one, and the service reports it as
+    declared rather than dropping it.
+    """
+    return tuple(
+        sorted(
+            (key[len(SERVER_ENV_PREFIX) :].lower(), value.strip())
+            for key, value in environ.items()
+            if key.startswith(SERVER_ENV_PREFIX) and len(key) > len(SERVER_ENV_PREFIX)
+        )
+    )
 
 
 def _int_or_none(value: str | None) -> int | None:

@@ -21,7 +21,7 @@ venv-chatterbox/
 dependencies/csm/audio_data*/
 dependencies/csm/finetuned_model*/
 dependencies/csm/hf_cache/
-dependencies/csm/jarvis_test_outputs/
+dependencies/csm/*_test_outputs/
 dependencies/csm/test_output/
 *.wav
 *.safetensors

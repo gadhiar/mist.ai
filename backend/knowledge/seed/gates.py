@@ -153,16 +153,17 @@ def check_facts_present(
     return GateResult(passed=not failures, failures=failures)
 
 
-# The node's type is its `entity_type` PROPERTY (MIS-177 D2), checked in the
-# WHERE against the authored type. The MATCH pattern carries the document's
-# partition label, plus the ontology type label wherever the applier still
-# writes one (`node_type_label` in applier.py: `:__SelfModel__` nodes and
-# `User`), interpolated as `%s` because Neo4j cannot parameterize a label --
-# the same interpolate-and-pin discipline as `_CHECK_FACT_QUERY`'s predicate.
-# A node missing a required label fails to bind and is reported.
+# The node's type is its `entity_type` PROPERTY, checked in the WHERE against
+# the authored type. The MATCH pattern carries the document's partition label,
+# plus the ontology type label the applier writes (`node_type_label` in
+# applier.py: a `:__SelfModel__` node's type, and an `:__Entity__` node's type
+# when it is in `ENTITY_TYPE_LABELS` -- typed labels, reversing MIS-177 D2),
+# interpolated as `%s` because Neo4j cannot parameterize a label -- the same
+# interpolate-and-pin discipline as `_CHECK_FACT_QUERY`'s predicate. A node
+# missing its type label fails to bind and is reported.
 #
 # `$forbidden_labels` is the other half of the applier's contract: an
-# `:__Entity__` seed node carries no ontology type label except `User`
+# `:__Entity__` seed node carries no ontology type label but its own
 # (`entity_type_labels_removed` in applier.py). Empty for `:__SelfModel__`,
 # where the applier removes nothing.
 _CHECK_NODE_QUERY = (
@@ -206,7 +207,9 @@ def check_node_definitions(
     match on its document's partition label (plus its type label, where
     the applier writes one), carry `entity_type` equal to the authored
     type and a non-null `display_name`, and carry none of the type labels
-    the applier removes from an `:__Entity__` node (MIS-177 D2).
+    the applier removes from an `:__Entity__` node. Since typed labels
+    (reversing MIS-177 D2) an `:__Entity__` node's own type label is
+    required, so a node seeded without it fails until it is reseeded.
 
     Read-only: issues `execute_query` only, never `execute_write`.
 
