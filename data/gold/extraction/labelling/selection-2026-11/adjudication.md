@@ -917,10 +917,154 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `user WORKS_ON bootprint-redesign` (pass B only): kept, pass B held.
 - `oxbow-finch IS_A agency` attributes differ: settled by the attribute policy in the method section.
 
+### sel-216-list-ref-first-and-other-two-reports (F1 1.00)
+
+- Ruling: Attributes only: the newest report's anchor is dated.
+- `user KNOWS_PERSON fergal` attributes differ: 'joined only last week' resolves to 2026-06 at the precision a week allows, valid_from on the anchor as the other two carry 2024 (Date entities), pass B held.
+
+### sel-217-list-ref-middle-survey-tool (F1 0.80)
+
+- Ruling: 'For the post-trip questionnaire' scopes the trial, not a use the utterance states (Habits and incidental scope, Rule 18), so no USED_FOR, as for the weather feeds.
+- `tally USED_FOR post-trip-questionnaire` (pass B only): dropped, pass A held.
+- `tally IS_A survey-tool` attributes differ: settled by the attribute policy in the method section.
+
+### sel-219-list-plus-calendar-repeats (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: habits are recurring activities, Concepts (A), as Example 24's habit is.
+
+### sel-220-list-checkbox-half-year-objectives (F1 1.00)
+
+- Ruling: Entities only; the relations are agreed.
+- Entities: the checked launch is a done fact, an event with no stated day, so it has no Date and no edge (Date entities); N6 keeps it as an entity-only label (B).
+
+### sel-224-list-dot-learning-on-the-side (F1 1.00)
+
+- Ruling: Attributes only: the lead-in's year dates every item.
+- `user LEARNING sketchnoting` attributes differ: the lead-in's 'this year' scopes each item as a stative fact, valid_from 2026 (Date entities), pass B held.
+- `user LEARNING slovenian` attributes differ: the lead-in's 'this year' scopes each item as a stative fact, valid_from 2026 (Date entities), pass B held.
+- `user LEARNING sql` attributes differ: the lead-in's 'this year' scopes each item as a stative fact, valid_from 2026 (Date entities), pass B held.
+
+### sel-227-list-long-learned-my-way-around (F1 0.00, adjudicated whole)
+
+- Pass A: read the tools learned as tools the user knows.
+- Pass B: read them as tools the user is learning, from this year.
+- Ruling: 'I've had to learn my way around' states learning done, so the user now knows each tool (KNOWS), not learning in progress. The lead-in's 'this year' dates when that began, valid_from 2026, as B's dates do (Date entities).
+- `user KNOWS beds24` (pass A only): kept, pass A held.
+- `user KNOWS cloudbeds` (pass A only): kept, pass A held.
+- `user KNOWS eviivo` (pass A only): kept, pass A held.
+- `user KNOWS freetobook` (pass A only): kept, pass A held.
+- `user KNOWS mailchimp` (pass A only): kept, pass A held.
+- `user KNOWS plain-ical-feeds` (pass A only): kept, pass A held.
+- `user KNOWS quickbooks` (pass A only): kept, pass A held.
+- `user KNOWS twilio` (pass A only): kept, pass A held.
+- `user KNOWS xero` (pass A only): kept, pass A held.
+- `user KNOWS zendesk` (pass A only): kept, pass A held.
+- `user LEARNING beds24` (pass B only): dropped, pass A held.
+- `user LEARNING cloudbeds` (pass B only): dropped, pass A held.
+- `user LEARNING eviivo` (pass B only): dropped, pass A held.
+- `user LEARNING freetobook` (pass B only): dropped, pass A held.
+- `user LEARNING mailchimp` (pass B only): dropped, pass A held.
+- `user LEARNING plain-ical-feeds` (pass B only): dropped, pass A held.
+- `user LEARNING quickbooks` (pass B only): dropped, pass A held.
+- `user LEARNING twilio` (pass B only): dropped, pass A held.
+- `user LEARNING xero` (pass B only): dropped, pass A held.
+- `user LEARNING zendesk` (pass B only): dropped, pass A held.
+
+### sel-230-list-long-product-manager-refusals (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: ways of working the user refuses are workflow preferences, the Preference type's own test (B, N6).
+
+### sel-233-temporal-vouchers-redesign-role (F1 0.50, adjudicated whole)
+
+- Pass A: named each event by its subject with its day.
+- Pass B: named the launch by its clause and the kick-off by its subject.
+- Ruling: Event rule: the id is the utterance's own phrase for the event, and where the utterance words it as a clause the verb is kept, as the guide's 'signed-lease-in-ghent' and 'fly-into-lisbon' are. 'Gift vouchers went live' and 'Bootprint redesign kicks off' are the events; the subject alone names the product or the project. The role names no entity.
+- `gift-vouchers-2026-04-02 OCCURRED_ON 2026-04-02` (pass A only): dropped, pass B held.
+- `gift-vouchers-went-live-2026-04-02 OCCURRED_ON 2026-04-02` (pass B only): kept, pass B held.
+- `bootprint-redesign-kicks-off-2026-06-15 OCCURRED_ON 2026-06-15` (neither pass): kept, neither held.
+- `bootprint-redesign-2026-06-15 OCCURRED_ON 2026-06-15` (both passes): dropped, neither held.
+
+### sel-234-scope-release-notes-and-exclamations (F1 0.50, adjudicated whole)
+
+- Pass A: cut the capability to its head.
+- Pass B: kept the capability's manner.
+- Ruling: N15: a capability keeps what the utterance gives it, as 'search my notes by meaning' keeps its manner, so 'in plain English' stays. The trait is agreed, and the user's overuse of exclamation marks has no predicate of the guide.
+- `mist-identity MIST_HAS_CAPABILITY draft-release-notes` (pass A only): dropped, pass B held.
+- `mist-identity MIST_HAS_CAPABILITY draft-release-notes-in-plain-english` (pass B only): kept, pass B held.
+
+### sel-236-list-dash-tools-saved-from-fire (F1 0.67)
+
+- Ruling: N1: the chisels are the tools, and 'set of' counts them as 'two' does for the flasks, so the run that names them is 'bevel-edge chisels'.
+- `user USES bevel-edge-chisels` (pass A only): kept, pass A held.
+- `user USES set-of-bevel-edge-chisels` (pass B only): dropped, pass A held.
+
+### sel-239-list-numbered-ruled-out-by-knees (F1 0.00, adjudicated whole)
+
+- Pass A: read work the user's knees rule out as a difficulty.
+- Pass B: read it as knowledge the user no longer has.
+- Ruling: The utterance says the user can no longer do this work, a current difficulty (STRUGGLES_WITH's gloss); it does not say the user stopped knowing it, so a KNOWS cessation states a fact it does not.
+- `user KNOWS double-digging` (pass B only): dropped, pass A held.
+- `user KNOWS laying-floors` (pass B only): dropped, pass A held.
+- `user KNOWS roofing` (pass B only): dropped, pass A held.
+- `user STRUGGLES_WITH double-digging` (pass A only): kept, pass A held.
+- `user STRUGGLES_WITH laying-floors` (pass A only): kept, pass A held.
+- `user STRUGGLES_WITH roofing` (pass A only): kept, pass A held.
+
+### sel-242-list-ref-middle-bench-timber (F1 0.00, adjudicated whole)
+
+- Pass A: kept the place in the project's id.
+- Pass B: named the project by its head and gave the chosen timber its kind.
+- Ruling: N1 as in the river outing: 'on the green' scopes the benches, so the shorter run names them. N13: the timber chosen for them links to them. N14: the lead-in's kind noun gives the chosen item IS_A, flagged beyond the prompt; the other two are options nobody chose.
+- `benches RELATED_TO sweet-chestnut` (pass B only): kept, pass B held.
+- `benches-on-the-green RELATED_TO sweet-chestnut` (pass A only): dropped, pass B held.
+- `sweet-chestnut IS_A timber` (pass B only): kept, pass B held.
+- `user WORKS_ON benches` (pass B only): kept, pass B held.
+- `user WORKS_ON benches-on-the-green` (pass A only): dropped, pass B held.
+
+### sel-243-list-ref-all-but-first-class (F1 0.00, adjudicated whole)
+
+- Pass A: read the classes the user agreed to teach as expertise.
+- Pass B: read them as subjects the user knows.
+- Ruling: Teaching a subject states no expert-level claim (EXPERT_IN's gloss), so KNOWS holds, as for teaching elsewhere in this set; the declined class gets no edge.
+- `user EXPERT_IN furniture-repair` (pass A only): dropped, pass B held.
+- `user EXPERT_IN tool-sharpening` (pass A only): dropped, pass B held.
+- `user KNOWS furniture-repair` (pass B only): kept, pass B held.
+- `user KNOWS tool-sharpening` (pass B only): kept, pass B held.
+
+### sel-244-list-plus-retired-month-shape (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: habits are recurring activities, Concepts (A), as Example 24's habit is.
+
+### sel-245-list-star-before-eighty (F1 0.86)
+
+- Ruling: The user names the person a goal is shared with, someone the user knows, so the anchor holds, as for the hand-over goal (Durable third-party facts).
+- `user KNOWS_PERSON fionnuala` (pass B only): kept, pass B held.
+
+### sel-247-list-nested-society-duties (F1 0.80)
+
+- Ruling: The parent bullets name what each person looks after (List rules), a durable fact about each, so WORKS_ON the duty beside the agreed membership (Durable third-party facts). A duty heading names one undertaking, so it keeps one id.
+- `clovis WORKS_ON water-and-paths` (pass A only): kept, pass A held.
+- `drusilla WORKS_ON seed-swap` (pass A only): kept, pass A held.
+- `peregrine WORKS_ON water-and-paths` (pass A only): kept, pass A held.
+
+### sel-248-list-heading-mornings-afternoons (F1 0.86)
+
+- Ruling: The heading gives the cadence for its items (List rules), and the item names two places the user's mornings go, so each is HAS_HABIT.
+- `user HAS_HABIT workshop` (pass A only): kept, pass A held.
+
+### sel-249-list-mixed-committee-night (F1 1.00)
+
+- Ruling: Attributes only: the N13 links are beyond the prompt, so their flags stand.
+- `committee-night RELATED_TO waiting-list` attributes differ: settled by the attribute policy in the method section.
+- `committee-night RELATED_TO water-bill` attributes differ: settled by the attribute policy in the method section.
+
 ## Totals
 
-- Probes with a difference adjudicated: 107; still to adjudicate: 32.
-- Relations the passes differed on, adjudicated: 316.
-- Probes adjudicated whole (F1 under 0.61): 42.
-- Outcomes: pass A held 145, pass B held 171, neither held 0.
-- Shared relations whose attributes differed: 34.
+- Probes with a difference adjudicated: 125; still to adjudicate: 14.
+- Relations the passes differed on, adjudicated: 363.
+- Probes adjudicated whole (F1 under 0.61): 48.
+- Outcomes: pass A held 178, pass B held 185, neither held 2.
+- Shared relations whose attributes differed: 41.
