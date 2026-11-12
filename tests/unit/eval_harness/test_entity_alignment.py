@@ -6,6 +6,7 @@ and no run output is opened.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 import sys
 from pathlib import Path
@@ -16,6 +17,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.knowledge.ontologies import registry  # noqa: E402
+from backend.knowledge.ontologies.base import (  # noqa: E402
+    KnowledgeDomain,
+    NodeTypeDefinition,
+)
+from backend.knowledge.ontologies.pack import (  # noqa: E402
+    TYPED_ID_ALIGNMENTS,
+    Pack,
+    build_pack,
+)
 from scripts.eval_harness import entity_alignment as ea  # noqa: E402
 from scripts.eval_harness.entity_alignment import (  # noqa: E402
     AlignedPair,
@@ -25,6 +36,18 @@ from scripts.eval_harness.entity_alignment import (  # noqa: E402
     event_date_equal,
     match_relations,
     metric_equal,
+)
+from tests.unit.knowledge.ontologies.fixtures.base_pack import (  # noqa: E402
+    conventions as fixture_conventions,
+)
+from tests.unit.knowledge.ontologies.fixtures.base_pack import (  # noqa: E402
+    manifest as fixture_manifest,
+)
+from tests.unit.knowledge.ontologies.fixtures.base_pack import (  # noqa: E402
+    plugins as fixture_plugins,
+)
+from tests.unit.knowledge.ontologies.fixtures.base_pack import (  # noqa: E402
+    types as fixture_types,
 )
 
 Triple = tuple[str, str, str]
@@ -439,3 +462,79 @@ def test_input_order_does_not_change_the_pairs(seed: int) -> None:
     assert align_entities(gold, shuffled_produced, accepted=accepted) == expected
     assert align_entities(shuffled_gold, shuffled_produced, accepted=accepted) == expected
     assert candidate_pairs(shuffled_gold, shuffled_produced) == candidate_pairs(gold, produced)
+
+
+# ---------------------------------------------------------------------------
+# The kind a pack states for a type
+# ---------------------------------------------------------------------------
+
+# Ids `metric_equal` holds, which are a reorder pair for a type that takes no kind.
+_METRIC_PAIR = ("42-ms-p50-latency", "42-p50-latency-ms")
+# An id whose content tokens are inside those of the first id above.
+_INSIDE_ID = "42-ms-latency"
+
+# One pair per kind a pack may state: ids the kind's equality holds.
+PAIR_OF_STATED_KIND = {"metric": _METRIC_PAIR}
+
+
+def _pack_stating(type_name: str, kind: str | None) -> Pack:
+    """The base fixture pack with one more type, which its `typed_id` rule names.
+
+    The rule states `kind` for the type.
+    """
+    node_type = NodeTypeDefinition(
+        type_name=type_name,
+        description="A type the aligner is asked about.",
+        knowledge_domain=KnowledgeDomain.EXTERNAL,
+    )
+    rules = tuple(
+        (
+            dataclasses.replace(
+                rule, params=dataclasses.replace(rule.params, type=type_name, alignment=kind)
+            )
+            if rule.kind == "typed_id"
+            else rule
+        )
+        for rule in fixture_conventions.RULES
+    )
+    return build_pack(
+        manifest=fixture_manifest.MANIFEST,
+        node_types=(*fixture_types.NODE_TYPES, node_type),
+        edge_types=fixture_types.EDGE_TYPES,
+        extractable_node_types=fixture_types.EXTRACTABLE_NODE_TYPES,
+        extractable_edge_types=fixture_types.EXTRACTABLE_EDGE_TYPES,
+        rules=rules,
+        plugins=fixture_plugins.PLUGINS,
+        labelling="rows",
+    )
+
+
+def _activate(monkeypatch: pytest.MonkeyPatch, pack: Pack) -> None:
+    monkeypatch.setattr(registry, "active_pack", lambda: pack)
+
+
+def test_a_type_whose_rule_states_metric_takes_the_metric_kind(monkeypatch) -> None:
+    _activate(monkeypatch, _pack_stating("Gauge", "metric"))
+    gold_id, produced_id = _METRIC_PAIR
+
+    assert metric_equal(gold_id, produced_id)
+    assert ea._pair_kind(_ref(gold_id, "Gauge"), _ref(produced_id, "Gauge")) == "metric"
+    assert ea.variant_kind(gold_id, "Gauge", _INSIDE_ID) == "metric"
+
+
+def test_a_type_named_metric_whose_rule_states_no_kind_takes_none(monkeypatch) -> None:
+    _activate(monkeypatch, _pack_stating("Metric", None))
+    gold_id, produced_id = _METRIC_PAIR
+
+    assert ea._pair_kind(_ref(gold_id, "Metric"), _ref(produced_id, "Metric")) == "reorder"
+    assert ea.variant_kind(gold_id, "Metric", _INSIDE_ID) == "paraphrase"
+
+
+@pytest.mark.parametrize("kind", TYPED_ID_ALIGNMENTS)
+def test_a_kind_a_pack_may_state_is_a_kind_the_aligner_gives(kind: str, monkeypatch) -> None:
+    assert kind in ea.ALIGNMENT_KINDS
+    assert kind in PAIR_OF_STATED_KIND, f"no pair for the kind {kind!r}: add one"
+    gold_id, produced_id = PAIR_OF_STATED_KIND[kind]
+    _activate(monkeypatch, _pack_stating("Gauge", kind))
+
+    assert ea._pair_kind(_ref(gold_id, "Gauge"), _ref(produced_id, "Gauge")) == kind

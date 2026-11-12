@@ -420,6 +420,16 @@ def test_an_ontology_version_holds_types_and_policies_and_no_prompt_of_its_own()
     ]
 
 
+def test_the_metric_rule_states_its_alignment_kind_and_the_technology_rule_none():
+    stated = {
+        rule.params.type: rule.params.alignment
+        for rule in pack_conventions.RULES
+        if rule.kind == "typed_id"
+    }
+
+    assert stated == {"Technology": None, "Metric": "metric"}
+
+
 class TestOntologyVersion:
     """Verify the top-level ontology version metadata."""
 

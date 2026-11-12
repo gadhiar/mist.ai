@@ -157,15 +157,16 @@ class PackRelease:
 # hashes are taken over stopped writing a dataclass field a pack leaves unstated
 # (None), so that a field added to a class later moves the hashes of the packs that
 # state it and of no other: both hashes of every pack moved, and nothing a pack states
-# changed. The rails hash moved twice with no change to what is stored: once when the
-# three id plug-ins moved, bodies unchanged, from `id_rails.py` into the pack's
-# `plugins.py`, since the hash covers the source of the module that holds them, and
-# once with that serialization.
+# changed. The rails hash moved three times with no change to what is stored: once when
+# the three id plug-ins moved, bodies unchanged, from `id_rails.py` into the pack's
+# `plugins.py`, since the hash covers the source of the module that holds them, once
+# with that serialization, and once when the Metric `typed_id` rule stated its
+# alignment kind, a parameter the eval harness's aligner reads and no rail does.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
     pack_prompt_hash="23ed42d935f3589044b274ae2d60b51fd39fa6721dc87b65bfc0c560ca81e0ea",
-    pack_rails_hash="a8e305e9a8615f01768c6f5c5854ba2ab5b65c45275bf75c98766e3311c0a53f",
+    pack_rails_hash="6705d826291cb01f7f9b9f3057fa72ad8ab6aaa1cc17c6bdf3568e7dc2703c05",
 )
 
 

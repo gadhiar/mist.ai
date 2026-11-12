@@ -9,7 +9,6 @@ ontology version joins the check by adding its pack to `_BOUNDARY_PACKS`.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -65,27 +64,6 @@ _SCORERS = _REPO_ROOT / "scripts" / "eval_harness"
 _LEGACY_SCORERS = ("score_v8_probe_run.py", "score_v9_predicate_run.py")
 
 
-@dataclass(frozen=True)
-class KnownLiteral:
-    """One name a scorer still writes, and why it stands."""
-
-    file: str
-    literal: str
-    reason: str
-
-
-# The one exception among the scorers. Delete this entry, and the two lines of the
-# scorer test that read it, when the alignment reads the type from the pack.
-_KNOWN_LITERAL = KnownLiteral(
-    file="scripts/eval_harness/entity_alignment.py",
-    literal="Metric",
-    reason=(
-        "the alignment gives a gold entity of this type its own match rule, in "
-        "`variant_kind` and in `_pair_kind`; reading it from the pack is an edit of "
-        "those two lines, which T46 leaves as they are"
-    ),
-)
-
 V1_4_0 = registry.get_pack("1.4.0")
 _BOUNDARY_PACKS = {"base": BASE, "pet": PET, "v1.4.0": V1_4_0}
 
@@ -97,17 +75,7 @@ def test_no_engine_file_names_a_type_or_an_edge_of_the_pack(name):
 
 @pytest.mark.parametrize("name", sorted(_BOUNDARY_PACKS))
 def test_no_scorer_names_a_type_or_an_edge_of_the_pack(name):
-    found = _quoted_pack_names(_BOUNDARY_PACKS[name], _scorer_sources())
-    known = (_KNOWN_LITERAL.file, _KNOWN_LITERAL.literal)
-
-    assert [hit for hit in found if hit != known] == []
-
-
-def test_the_known_literal_still_stands_and_says_why():
-    found = _quoted_pack_names(V1_4_0, _scorer_sources())
-
-    assert found == [(_KNOWN_LITERAL.file, _KNOWN_LITERAL.literal)]
-    assert _KNOWN_LITERAL.reason.strip()
+    assert _quoted_pack_names(_BOUNDARY_PACKS[name], _scorer_sources()) == []
 
 
 def test_the_legacy_scorers_exist_and_each_names_the_pack():

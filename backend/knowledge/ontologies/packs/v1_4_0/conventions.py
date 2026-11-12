@@ -775,7 +775,7 @@ RULES: tuple[ConventionRule, ...] = (
         id=METRIC_ID,
         kind="typed_id",
         phase=ID,
-        params=TypedId(type=METRIC.type_name, plugin=METRIC_ID),
+        params=TypedId(type=METRIC.type_name, plugin=METRIC_ID, alignment="metric"),
         pinned_case=_METRIC_ID_CASE,
     ),
     ConventionRule(
