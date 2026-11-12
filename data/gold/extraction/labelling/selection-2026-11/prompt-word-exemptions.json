@@ -1,4 +1,5 @@
 {
   "goal": "a Document's own name; the prompt says 'Goal' only as an entity type, in its type list and in Rule 22 'Goal ids'",
-  "morning": "a Concept's own name, a time of day; the prompt says 'every morning' only as a habit's cadence, in Rule 17 and Example 24, where it names no entity"
+  "morning": "a Concept's own name, a time of day; the prompt says 'every morning' only as a habit's cadence, in Rule 17 and Example 24, where it names no entity",
+  "scratch": "a Technology's own name; the prompt says 'scratch that' only as a retraction phrase, in Rule 6 and Example 22, where it names no entity"
 }

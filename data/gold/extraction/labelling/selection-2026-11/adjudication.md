@@ -174,10 +174,208 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `elmstoke-hospice USES paper-drug-charts` (pass A only): kept, pass A held.
 - Entities: the charts take A's Technology type, the target USES admits.
 
+### sel-041-list-long-week-fixed-points (F1 0.82)
+
+- Ruling: N1 with the lead ruling: a habit id is the utterance's own phrase, and 'on the river' and 'by ten' scope the habit, so the shorter contiguous runs hold.
+- `user HAS_HABIT club-outing` (pass A only): kept, pass A held.
+- `user HAS_HABIT club-outing-on-the-river` (pass B only): dropped, pass A held.
+- `user HAS_HABIT lights-out` (pass A only): kept, pass A held.
+- `user HAS_HABIT lights-out-by-ten` (pass B only): dropped, pass A held.
+- Entities: the journal club is a recurring activity like the other habits, a Concept (A).
+
+### sel-044-list-long-audit-figures (F1 0.95)
+
+- Ruling: 'my discharge prescriptions audit' makes the user the subject of a fact, the work on the audit, so the user anchor holds (The user anchor) beside the agreed metrics.
+- `user WORKS_ON discharge-prescriptions-audit` (pass B only): kept, pass B held.
+
+### sel-045-coref-clinic-lead (F1 0.86)
+
+- Ruling: The clinic's move is an event the utterance states, its id the utterance's phrase (Event rule), and N5 links it to the place it moves into. With no single day it gets no Date.
+- `clinic-moves-into-new-wing RELATED_TO new-wing` (pass A only): kept, pass A held.
+
+### sel-050-list-dash-year-nine-stumbles (F1 1.00)
+
+- Ruling: Entities only: the pupils are a group with no entity (N16), so no edge, but the utterance states something about each topic, and N6 keeps an entity-only label.
+
+### sel-051-list-numbered-teaching-weak-spots (F1 0.67)
+
+- Ruling: N1: the thing the user struggles with is Fourier transforms; 'anything involving' names no entity, so the id is the run that names the thing.
+- `user STRUGGLES_WITH anything-involving-fourier-transforms` (pass B only): dropped, pass A held.
+- `user STRUGGLES_WITH fourier-transforms` (pass A only): kept, pass A held.
+
+### sel-052-list-numbered-concert-order (F1 0.00, adjudicated whole)
+
+- Pass A: read each piece as a Document the user refers to.
+- Pass B: labelled nothing, reading no named document and no fact of the user.
+- Ruling: The items describe pieces by their kind and name none, and rehearsing a piece is no reference to a document; no predicate of the guide carries the rehearsal, so the probe is empty (No-fact probes, List rule for a list with nothing durable).
+- `user REFERENCES_DOCUMENT evening-hymn` (pass A only): dropped, pass B held.
+- `user REFERENCES_DOCUMENT new-carol` (pass A only): dropped, pass B held.
+- `user REFERENCES_DOCUMENT unaccompanied-motet` (pass A only): dropped, pass B held.
+
+### sel-053-list-ref-second-simulation-tool (F1 0.67)
+
+- Ruling: N17: 'the department' is a group noun with no name of its own, so no entity and no edge from it. 'For the waves unit' scopes the shortlist, not a stated use (Rule 18), so no USED_FOR. The user's USES with its date stands.
+- `algodoo USED_FOR waves-unit` (pass B only): dropped, pass A held.
+- `department USES algodoo` (pass A only): dropped, pass B held.
+- `algodoo IS_A simulation-tool` attributes differ: settled by the attribute policy in the method section.
+
+### sel-059-list-checkbox-before-mocks (F1 0.00, adjudicated whole)
+
+- Pass A: labelled nothing, reading the checklist as tasks.
+- Pass B: dated the mocks by the hall booked for them.
+- Ruling: The lead-in names the mocks and the checked item books their hall for one day, which dates the event; an event stated with no participant gets OCCURRED_ON only (Event rule), with the date in its id. The tasks state no durable fact.
+- `year-11-mocks-2026-12-07 OCCURRED_ON 2026-12-07` (pass B only): kept, pass B held.
+
+### sel-060-list-nested-science-cover (F1 0.80)
+
+- Ruling: Each person covers a subject at the school, a durable fact about that person (Durable third-party facts), so B's KNOWS edges hold. The parent bullets carry no group noun, so they name no team (N17).
+- `isidore KNOWS physics` (pass B only): kept, pass B held.
+- `jacinta KNOWS physics` (pass B only): kept, pass B held.
+- `kasimir KNOWS chemistry` (pass B only): kept, pass B held.
+
+### sel-061-list-heading-teaching-and-outside (F1 0.33, adjudicated whole)
+
+- Pass A: read the courses the user teaches as expertise.
+- Pass B: read them as subjects the user knows.
+- Ruling: The heading states what the user teaches, not a claim of expert-level proficiency (EXPERT_IN's gloss), so KNOWS holds; the choir membership is agreed.
+- `user EXPERT_IN year-10-electricity` (pass A only): dropped, pass B held.
+- `user EXPERT_IN year-12-mechanics` (pass A only): dropped, pass B held.
+- `user KNOWS year-10-electricity` (pass B only): kept, pass B held.
+- `user KNOWS year-12-mechanics` (pass B only): kept, pass B held.
+
+### sel-062-list-mixed-parents-evening (F1 0.80)
+
+- Ruling: The user took part in the parents' evening ('I got home after nine'), so the event gets user EXPERIENCED (Event rule).
+- `user EXPERIENCED parents-evening` (pass B only): kept, pass B held.
+
+### sel-063-list-long-used-with-a-class (F1 0.00, adjudicated whole)
+
+- Pass A: read each tool as one the user uses.
+- Pass B: read each as one the user knows.
+- Ruling: 'Used ... at some point' states past use, not current use, so USES as an assertion would state a current fact the utterance does not; it states the user's familiarity with each, which is KNOWS.
+- `user KNOWS algodoo` (pass B only): kept, pass B held.
+- `user KNOWS audacity` (pass B only): kept, pass B held.
+- `user KNOWS desmos` (pass B only): kept, pass B held.
+- `user KNOWS geogebra` (pass B only): kept, pass B held.
+- `user KNOWS logger-pro` (pass B only): kept, pass B held.
+- `user KNOWS phyphox` (pass B only): kept, pass B held.
+- `user KNOWS scratch` (pass B only): kept, pass B held.
+- `user KNOWS stellarium` (pass B only): kept, pass B held.
+- `user KNOWS tinkercad` (pass B only): kept, pass B held.
+- `user KNOWS tracker` (pass B only): kept, pass B held.
+- `user USES algodoo` (pass A only): dropped, pass B held.
+- `user USES audacity` (pass A only): dropped, pass B held.
+- `user USES desmos` (pass A only): dropped, pass B held.
+- `user USES geogebra` (pass A only): dropped, pass B held.
+- `user USES logger-pro` (pass A only): dropped, pass B held.
+- `user USES phyphox` (pass A only): dropped, pass B held.
+- `user USES scratch` (pass A only): dropped, pass B held.
+- `user USES stellarium` (pass A only): dropped, pass B held.
+- `user USES tinkercad` (pass A only): dropped, pass B held.
+- `user USES tracker` (pass A only): dropped, pass B held.
+
+### sel-068-multi-teacher-choir-site (F1 0.80)
+
+- Ruling: Teaching a subject states no expert-level claim (EXPERT_IN's gloss), so KNOWS holds, as in the teaching heading probe.
+- `user EXPERT_IN physics` (pass A only): dropped, pass B held.
+- `user KNOWS physics` (pass B only): kept, pass B held.
+
+### sel-069-neg-club-handover (F1 1.00)
+
+- Ruling: Attributes only: the cessation's stop date is stated, so it carries valid_to.
+- `user MEMBER_OF astronomy-club` attributes differ: the cessation carries the stated stop date as valid_to (Date entities), pass B held.
+
+### sel-071-list-dash-drawing-desk (F1 0.92)
+
+- Ruling: The item reads 'I use an iPad Pro with Procreate for sketching': the purpose covers both tools, so A's USED_FOR for the tablet holds (Rule 18).
+- `ipad-pro USED_FOR sketching` (pass A only): kept, pass A held.
+
+### sel-072-list-dash-quarter-clients (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `pellham-rook IS_A childrens-publisher` attributes differ: settled by the attribute policy in the method section.
+
+### sel-074-list-numbered-chargeable-skills (F1 0.00, adjudicated whole)
+
+- Pass A: read skills the user would charge for as expertise.
+- Pass B: read them as skills the user knows.
+- Ruling: A skill the user would charge for is one held at a professional, expert level, EXPERT_IN's gloss, so A holds.
+- `user EXPERT_IN character-design` (pass A only): kept, pass A held.
+- `user EXPERT_IN gouache-painting` (pass A only): kept, pass A held.
+- `user EXPERT_IN hand-lettering` (pass A only): kept, pass A held.
+- `user KNOWS character-design` (pass B only): dropped, pass A held.
+- `user KNOWS gouache-painting` (pass B only): dropped, pass A held.
+- `user KNOWS hand-lettering` (pass B only): dropped, pass A held.
+
+### sel-075-list-ref-second-print-shop (F1 0.40, adjudicated whole)
+
+- Pass A: linked the user to the print shop chosen.
+- Pass B: made the proofs the user's project and linked the chosen shop to them.
+- Ruling: N13: something chosen for a subject links to that subject, so the shop links to the proofs, and the proofs are the user's work (The user anchor). A user RELATED_TO the shop is not a shape the guide gives.
+- `moth-almanac-proofs RELATED_TO grafica-albufera` (pass B only): kept, pass B held.
+- `user RELATED_TO grafica-albufera` (pass A only): dropped, pass B held.
+- `user WORKS_ON moth-almanac-proofs` (pass B only): kept, pass B held.
+- `grafica-albufera IS_A print-shop` attributes differ: settled by the attribute policy in the method section.
+
+### sel-076-list-ref-latter-studio-mate (F1 0.89)
+
+- Ruling: Sharing the named studio is a durable fact of the user; no canonical predicate joins the user to a place, so RELATED_TO (Rule 15) holds.
+- `user RELATED_TO inkwell-yard-studio` (pass B only): kept, pass B held.
+
+### sel-077-list-ref-first-brush-pack (F1 0.50, adjudicated whole)
+
+- Pass A: gave every pack its kind and ceased the two the user no longer opens.
+- Pass B: labelled the first pack only.
+- Ruling: N14: the lead-in's kind noun gives each item IS_A, as a heading 'Shells' over 'zsh' does, flagged beyond the prompt. 'The only one I still open' says the other two are no longer used, a cessation (Assertion kinds).
+- `gouache-dreams-megapack IS_A brush-pack` (pass A only): kept, pass A held.
+- `rusty-nib-set IS_A brush-pack` (pass A only): kept, pass A held.
+- `user USES gouache-dreams-megapack` (pass A only): kept, pass A held.
+- `user USES rusty-nib-set` (pass A only): kept, pass A held.
+- `wet-edge-watercolours IS_A brush-pack` attributes differ: settled by the attribute policy in the method section.
+
+### sel-078-list-ref-first-two-workshops (F1 0.00, adjudicated whole)
+
+- Pass A: read the two accepted workshops as events the user takes part in.
+- Pass B: read them as skills the user knows.
+- Ruling: Teaching a workshop is an event the user takes part in (Event rule, EXPERIENCED); the utterance states no skill, and the declined workshop gets nothing.
+- `user EXPERIENCED linocut-for-beginners` (pass A only): kept, pass A held.
+- `user EXPERIENCED zine-making` (pass A only): kept, pass A held.
+- `user KNOWS linocut-for-beginners` (pass B only): dropped, pass A held.
+- `user KNOWS zine-making` (pass B only): dropped, pass A held.
+- Entities: the two workshops are Events (A).
+
+### sel-079-list-plus-studio-day (F1 0.50, adjudicated whole)
+
+- Pass A: labelled only the item with its own cadence.
+- Pass B: read the lead-in as the cadence of every item.
+- Ruling: List rule: the lead-in sets the predicate for the items under it, and 'my studio day' gives each item the cadence of the studio day, so each is HAS_HABIT.
+- `user HAS_HABIT emails` (pass B only): kept, pass B held.
+- `user HAS_HABIT walk-along-the-turia` (pass B only): kept, pass B held.
+
+### sel-083-list-paren-agreed-deadlines (F1 0.77)
+
+- Ruling: Deadlines are deliveries, milestone-class events with OCCURRED_ON and no user EXPERIENCED (Event rule); the opening is the named person's own event (N7).
+- `user EXPERIENCED delphine-gallery-opening-2026-09-05` (pass A only): dropped, pass B held.
+- `user EXPERIENCED moth-almanac-files-to-printer-2026-08-21` (pass A only): dropped, pass B held.
+- `user EXPERIENCED saltgrass-cover-art-2026-07-10` (pass A only): dropped, pass B held.
+
+### sel-084-list-dot-want-to-improve (F1 0.00, adjudicated whole)
+
+- Pass A: read each item as something the user is learning.
+- Pass B: read each as a goal of the user.
+- Ruling: 'Things I'd like to get better at' states a wish, not current learning, so HAS_GOAL holds, each Goal named by the item's own phrase (N2, List rule).
+- `user HAS_GOAL animating-in-toon-boom` (pass B only): kept, pass B held.
+- `user HAS_GOAL perspective-in-crowded-street-scenes` (pass B only): kept, pass B held.
+- `user HAS_GOAL pricing-own-work` (pass B only): kept, pass B held.
+- `user LEARNING animating-in-toon-boom` (pass A only): dropped, pass B held.
+- `user LEARNING perspective-in-crowded-street-scenes` (pass A only): dropped, pass B held.
+- `user LEARNING pricing-own-work` (pass A only): dropped, pass B held.
+- Entities: the three items are Goals (B).
+
 ## Totals
 
-- Probes with a difference adjudicated: 18; still to adjudicate: 121.
-- Relations the passes differed on, adjudicated: 47.
-- Probes adjudicated whole (F1 under 0.61): 7.
-- Outcomes: pass A held 21, pass B held 26, neither held 0.
-- Shared relations whose attributes differed: 4.
+- Probes with a difference adjudicated: 42; still to adjudicate: 97.
+- Relations the passes differed on, adjudicated: 121.
+- Probes adjudicated whole (F1 under 0.61): 17.
+- Outcomes: pass A held 44, pass B held 77, neither held 0.
+- Shared relations whose attributes differed: 9.
