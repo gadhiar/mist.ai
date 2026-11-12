@@ -7,8 +7,10 @@ bytes or JSON back.
 """
 
 import json
+import re
 import struct
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -20,10 +22,12 @@ from backend.realtime.protocol import (
     DOWNLINK_SAMPLE_RATE,
     HEADER_SIZE,
     MAGIC,
+    MAX_WAKE_BACKLOG_MS,
     PROTOCOL_VERSION,
     SERVER_MESSAGE_TYPES,
     UPLINK_SAMPLE_RATE,
     VOICE_DECISION_KINDS,
+    BackendMistState,
     DegradedDetail,
     Direction,
     Frame,
@@ -31,17 +35,23 @@ from backend.realtime.protocol import (
     MsgType,
     MuteMessage,
     PlaybackStopMessage,
+    Spotter,
     StateCycleMessage,
     StreamCancelledMessage,
     StreamStartMessage,
     TranscriptionMessage,
     TtsVoice,
+    TurnMetricsMessage,
     VoiceDecisionDropped,
     VoiceDecisionPlacement,
     VoiceDecisionWakeLost,
+    VoiceDecisionWakeRejected,
+    VoiceMode,
     VoiceStartMessage,
     VoiceStartPeek,
     VoiceStateMessage,
+    WakeMessage,
+    WakeRejectedDetail,
     decode_frame,
     encode_frame,
     encode_message,
@@ -58,6 +68,11 @@ VECTORS = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))
 BINARY_VECTORS = VECTORS["binary"]
 CLIENT_VECTORS = VECTORS["control"]["client_to_server"]
 SERVER_VECTORS = VECTORS["control"]["server_to_client"]
+# The invalid arrays take the frontend fixture's entry shape: `binary_invalid` entries are
+# `{name, direction, frame_hex, field}` and `control_invalid` entries `{name, direction, json,
+# rule, field}`, where `field` is the field the `ProtocolError` must name.
+BINARY_INVALID_VECTORS = VECTORS["binary_invalid"]
+CONTROL_INVALID_VECTORS = VECTORS["control_invalid"]
 
 
 def _header(
@@ -126,11 +141,245 @@ def test_vectors_cover_every_server_message_and_decision_kind():
     assert kinds == VOICE_DECISION_KINDS
 
 
+def test_vectors_have_both_invalid_arrays():
+    """An empty array would let `test_invalid_vectors_fail_naming_their_field` pass vacuously."""
+    assert BINARY_INVALID_VECTORS
+    assert CONTROL_INVALID_VECTORS
+    for vector in BINARY_INVALID_VECTORS:
+        assert set(vector) == {"name", "direction", "frame_hex", "field"}
+    for vector in CONTROL_INVALID_VECTORS:
+        assert set(vector) == {"name", "direction", "json", "rule", "field"}
+
+
+def _decode_invalid(vector: dict) -> None:
+    decode_frame(bytes.fromhex(vector["frame_hex"]), direction=Direction(vector["direction"]))
+
+
+def _parse_invalid(vector: dict) -> None:
+    parse = {
+        "client_to_server": parse_client_message,
+        "server_to_client": parse_server_message,
+    }[vector["direction"]]
+    parse(json.dumps(vector["json"]))
+
+
+@pytest.mark.parametrize(
+    ("check", "vector"),
+    [
+        *(
+            pytest.param(_decode_invalid, v, id=f"binary-{v['name']}")
+            for v in BINARY_INVALID_VECTORS
+        ),
+        *(
+            pytest.param(_parse_invalid, v, id=f"control-{v['name']}")
+            for v in CONTROL_INVALID_VECTORS
+        ),
+    ],
+)
+def test_invalid_vectors_fail_naming_their_field(check, vector):
+    with pytest.raises(ProtocolError) as excinfo:
+        check(vector)
+
+    assert excinfo.value.field == vector["field"]
+
+
+# The removed push-to-talk and open-mode names. `control_invalid` must name them to prove they
+# fail, so it is the one path the walk skips.
+_REMOVED_MODES = {"open", "ptt"}
+
+
+def _removed_names_in(node: object, path: str) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        if node.get("type") == "ptt":
+            found.append(f"{path}: type ptt")
+        for key, value in node.items():
+            if key in ("local_kws", "pressed"):
+                found.append(f"{path}.{key}")
+            if key == "mode" and value in _REMOVED_MODES:
+                found.append(f"{path}.mode: {value}")
+            if key == "modes" and isinstance(value, list):
+                found.extend(f"{path}.modes: {m}" for m in value if m in _REMOVED_MODES)
+            found.extend(_removed_names_in(value, f"{path}.{key}"))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found.extend(_removed_names_in(item, f"{path}[{index}]"))
+    return found
+
+
+def _removed_names_outside_control_invalid(vectors: dict) -> list[str]:
+    return [
+        *_removed_names_in(vectors["binary"], "binary"),
+        *_removed_names_in(vectors["control"]["client_to_server"], "control.client_to_server"),
+        *_removed_names_in(vectors["control"]["server_to_client"], "control.server_to_client"),
+    ]
+
+
+def test_removed_names_absent_outside_control_invalid():
+    assert _removed_names_outside_control_invalid(VECTORS) == []
+
+    # The walk must see the removed names where they would be: a copy with the old `ptt`
+    # vector put back fails it, and one with a `ptt` vector only under `control_invalid` does not.
+    restored = json.loads(json.dumps(VECTORS))
+    restored["control"]["client_to_server"].append(
+        {"name": "ptt", "message": {"type": "ptt", "pressed": True}}
+    )
+    restored_path = f"control.client_to_server[{len(CLIENT_VECTORS)}].message"
+    assert _removed_names_outside_control_invalid(restored) == [
+        f"{restored_path}: type ptt",
+        f"{restored_path}.pressed",
+    ]
+    invalid_only = json.loads(json.dumps(VECTORS))
+    invalid_only["control_invalid"].append(
+        {"name": "ptt", "direction": "client_to_server", "json": {"type": "ptt"}}
+    )
+    assert _removed_names_outside_control_invalid(invalid_only) == []
+
+
+def test_voice_mode_is_wake_only():
+    assert get_args(VoiceMode) == ("wake",)
+
+
+# -- wake by name: spotter, reference, backlog, kws, attend, wake_rejected ----
+
+
+def test_spotter_is_server_or_endpoint():
+    assert get_args(Spotter) == ("server", "endpoint")
+
+
+def test_voice_start_reference_and_muted_default_to_false():
+    message = _vector_message(CLIENT_VECTORS, "voice_start")
+    del message["reference"]
+    del message["muted"]
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert parsed.spotter == "server"
+    assert parsed.reference is False
+    assert parsed.muted is False
+
+
+def test_voice_start_reference_with_endpoint_spotter_is_invalid_but_its_req_is_read():
+    """An endpoint spots on the device, so the server has no name hit to score 0x11 against.
+
+    The session answers it `refused: "invalid"`, which needs the `req` peeked from it.
+    """
+    vector = next(
+        v for v in CONTROL_INVALID_VECTORS if v["name"].startswith("voice_start: reference true")
+    )
+    raw = json.dumps(vector["json"])
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(raw)
+
+    assert excinfo.value.field == "reference"
+    assert peek_voice_start(raw) == VoiceStartPeek(req=vector["json"]["req"])
+
+
+@pytest.mark.parametrize("backlog_ms", [0, 1500, MAX_WAKE_BACKLOG_MS])
+def test_wake_backlog_ms_bounds_parse(backlog_ms):
+    """0 parses: the gate's minimum is a server setting, which rejects it `no_backlog`."""
+    message = dict(_vector_message(CLIENT_VECTORS, "wake"), backlog_ms=backlog_ms)
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert isinstance(parsed, WakeMessage)
+    assert parsed.backlog_ms == backlog_ms
+
+
+@pytest.mark.parametrize("backlog_ms", [-1, MAX_WAKE_BACKLOG_MS + 1, 1500.0, "1500"])
+def test_wake_backlog_ms_outside_the_wire_bound_raises(backlog_ms):
+    message = dict(_vector_message(CLIENT_VECTORS, "wake"), backlog_ms=backlog_ms)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps(message))
+
+    assert excinfo.value.field == "backlog_ms"
+
+
+def test_max_wake_backlog_is_ten_seconds():
+    assert MAX_WAKE_BACKLOG_MS == 10000
+
+
+def test_state_cycle_attend_is_a_backend_state():
+    assert "attend" in get_args(BackendMistState)
+    message = _vector_message(SERVER_VECTORS, "state_cycle_attend_sent_at_the_name_hit")
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert isinstance(parsed, StateCycleMessage)
+    assert parsed.state == "attend"
+    assert json.loads(encode_message(parsed)) == message
+
+
+WAKE_REJECTED_REASONS = [
+    "self_speech",
+    "self_media",
+    "not_addressed",
+    "lost_arbitration",
+    "no_backlog",
+]
+
+
+def test_wake_rejected_reasons_are_exactly_the_five():
+    schema = VoiceDecisionWakeRejected.model_json_schema()
+
+    assert schema["properties"]["reason"]["enum"] == WAKE_REJECTED_REASONS
+
+
+@pytest.mark.parametrize("reason", WAKE_REJECTED_REASONS)
+def test_wake_rejected_round_trips_with_each_reason(reason):
+    message = dict(_vector_message(SERVER_VECTORS, "voice_decision_wake_rejected"), reason=reason)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert isinstance(parsed, VoiceDecisionWakeRejected)
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_wake_rejected_detail_cannot_carry_an_utterance_or_text():
+    """A rejected candidate was never published, so nothing about its speech travels."""
+    assert set(WakeRejectedDetail.model_fields) == {"source", "score", "reference_score"}
+    message = _vector_message(SERVER_VECTORS, "voice_decision_wake_rejected")
+    sent = json.loads(json.dumps(message))
+    sent["detail"].update(utterance_id="utt-9", text="hey mist")
+
+    parsed = parse_server_message(json.dumps(sent))
+
+    assert json.loads(encode_message(parsed))["detail"] == message["detail"]
+
+
+@pytest.mark.parametrize("source", ["server", "endpoint"])
+def test_wake_rejected_source_is_a_spotter(source):
+    message = _vector_message(SERVER_VECTORS, "voice_decision_wake_rejected")
+    message["detail"]["source"] = source
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.detail.source == source
+
+
+def test_capabilities_announce_spotters_and_reference():
+    message = _vector_message(SERVER_VECTORS, "session_started")
+
+    voice = parse_server_message(json.dumps(message)).capabilities.voice
+
+    assert voice.modes == ["wake"]
+    assert voice.spotters == ["endpoint", "server"]
+    assert voice.reference is True
+
+
+def test_removed_push_to_talk_names_are_gone_from_the_source():
+    """T31's acceptance grep over `backend/realtime`, pinned for `protocol.py`."""
+    source = PROTOCOL_SOURCE.read_text(encoding="utf-8")
+
+    assert re.findall(r"\bptt\b|Ptt|ptt_release|local_kws", source) == []
+
+
 def test_client_message_set_matches_design_doc():
     assert {
         "voice_start",
         "voice_stop",
-        "ptt",
         "playback_progress",
         "playback_done",
         "barge_in",
@@ -171,6 +420,7 @@ def test_server_message_set_matches_design_doc():
         "degraded",
         "overload",
         "wake_lost",
+        "wake_rejected",
         "placement",
     } == VOICE_DECISION_KINDS
 
@@ -218,7 +468,7 @@ def test_decode_rejects_bad_magic():
 
 def test_decode_rejects_unknown_type():
     with pytest.raises(ProtocolError) as excinfo:
-        decode_frame(_header(msg_type=0x11) + b"\x00\x00")
+        decode_frame(_header(msg_type=0x12) + b"\x00\x00")
     assert excinfo.value.field == "msg_type"
 
 
@@ -313,6 +563,38 @@ def test_encode_applies_the_same_rules():
     assert excinfo.value.field == "seq"
 
 
+def test_ref_audio_is_an_uplink_type_0x11():
+    assert MsgType.REF_AUDIO == 0x11
+    assert Frame(MsgType.REF_AUDIO, 0, 0, UPLINK_SAMPLE_RATE).direction is Direction.UP
+
+
+def test_ref_audio_640_byte_frame_round_trips_byte_exactly():
+    """One 20 ms frame of the PC's output, PCM16 mono at 16 kHz, as the desktop sends it."""
+    vector = next(v for v in BINARY_VECTORS if v["msg_type"] == MsgType.REF_AUDIO)
+    data = bytes.fromhex(vector["frame_hex"])
+
+    frame = decode_frame(data, direction=Direction.UP)
+
+    assert frame.msg_type is MsgType.REF_AUDIO
+    assert frame.turn_tag == 0
+    assert frame.sample_rate == UPLINK_SAMPLE_RATE
+    assert len(frame.payload) == 640
+    assert encode_frame(frame) == data
+
+
+def test_ref_audio_invalid_vectors_cover_the_four_rules():
+    """Rate 24000, an odd payload, a downlink decode and a nonzero tag each have a vector."""
+    ref_audio = [v for v in BINARY_INVALID_VECTORS if v["frame_hex"][8:12] == "1100"]
+    covered = {(v["field"], v["direction"]) for v in ref_audio}
+
+    assert covered == {
+        ("sample_rate", "up"),
+        ("payload", "up"),
+        ("msg_type", "down"),
+        ("turn_tag", "up"),
+    }
+
+
 def test_next_turn_tag_wraps_past_zero():
     assert next_turn_tag(1) == 2
     assert next_turn_tag(65534) == 65535
@@ -380,7 +662,7 @@ def test_removed_v1_messages_are_unknown(removed):
 
 def test_missing_type_raises_protocol_error():
     with pytest.raises(ProtocolError) as excinfo:
-        parse_client_message(json.dumps({"pressed": True}))
+        parse_client_message(json.dumps({"active": True}))
     assert excinfo.value.field == "type"
 
 
@@ -423,8 +705,8 @@ def test_voice_start_rejects_uplink_rate_other_than_16000():
 
 def test_wrong_field_type_is_not_coerced():
     with pytest.raises(ProtocolError) as excinfo:
-        parse_client_message(json.dumps({"type": "ptt", "pressed": "yes"}))
-    assert excinfo.value.field == "pressed"
+        parse_client_message(json.dumps({"type": "mute", "active": "yes"}))
+    assert excinfo.value.field == "active"
 
 
 def test_invalid_json_raises_protocol_error():
@@ -506,6 +788,8 @@ DESIGN_TIMING_KEYS = {
     # v3's D4: the caption's P90 lag over the turn's partials, and the wake's screen latency.
     "caption_lag_ms",
     "wake_screen_ms",
+    # v5: the hit frame's arrival to the addressee verdict.
+    "wake_accept_ms",
 }
 
 
@@ -611,9 +895,9 @@ def test_integer_fields_are_strict(played_ms):
 def test_unknown_field_on_client_message_is_dropped():
     """A field a newer client adds must not break this server."""
     message = parse_client_message(
-        json.dumps({"type": "ptt", "pressed": True, "added_in_minor": 1})
+        json.dumps({"type": "mute", "active": True, "added_in_minor": 1})
     )
-    assert json.loads(encode_message(message)) == {"type": "ptt", "pressed": True}
+    assert json.loads(encode_message(message)) == {"type": "mute", "active": True}
 
 
 def test_unknown_field_on_server_message_is_dropped():
@@ -689,6 +973,27 @@ def _without(message: dict, path: tuple[str, ...]) -> dict:
         pytest.param("server", "voice_state", ("tts_voice", "engine"), id="tts_voice-engine"),
         pytest.param("server", "voice_state", ("tts_voice", "voice"), id="tts_voice-voice"),
         pytest.param("server", "voice_state", ("tts_voice", "profile"), id="tts_voice-profile"),
+        pytest.param("client", "voice_start", ("spotter",), id="voice_start-spotter"),
+        pytest.param("client", "wake", ("backlog_ms",), id="wake-backlog_ms"),
+        pytest.param("server", "voice_state", ("engines", "kws"), id="engines-kws"),
+        pytest.param(
+            "server",
+            "session_started",
+            ("capabilities", "voice", "spotters"),
+            id="capabilities-spotters",
+        ),
+        pytest.param(
+            "server",
+            "session_started",
+            ("capabilities", "voice", "reference"),
+            id="capabilities-reference",
+        ),
+        pytest.param(
+            "server",
+            "voice_decision_wake_rejected",
+            ("detail", "reference_score"),
+            id="wake_rejected-reference_score",
+        ),
     ],
 )
 def test_each_new_key_is_required(direction, name, path):
@@ -862,7 +1167,7 @@ _DEEPLY_NESTED = '{"type": "voice_start", "req": 7, "x": ' + "[" * 100_000 + "]"
         pytest.param(_voice_start_text(), VoiceStartPeek(req=1), id="valid"),
         pytest.param(_voice_start_text(mode="loud", req=5), VoiceStartPeek(req=5), id="bad-mode"),
         pytest.param(_voice_start_text(req="x"), VoiceStartPeek(req=None), id="req-string"),
-        pytest.param(json.dumps({"type": "ptt"}), None, id="other-type"),
+        pytest.param(json.dumps({"type": "mute"}), None, id="other-type"),
         pytest.param("{not json", None, id="not-json"),
         pytest.param(json.dumps({"type": "voice_start"}), VoiceStartPeek(req=None), id="no-req"),
         pytest.param(_voice_start_text(req=True), VoiceStartPeek(req=None), id="req-bool"),
@@ -985,6 +1290,18 @@ def test_encode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
             ("voiced_text", "text_from_token", "tts_failed", "rejects"),
             id="DegradedDetail",
         ),
+        pytest.param(
+            VoiceStartMessage,
+            ("spotter", "`server`", "`endpoint`", "reference", "0x11", "invalid"),
+            id="VoiceStartMessage.spotter",
+        ),
+        pytest.param(WakeMessage, ("backlog_ms", "no_backlog", "score"), id="WakeMessage"),
+        pytest.param(WakeRejectedDetail, ("never published",), id="WakeRejectedDetail"),
+        pytest.param(
+            TurnMetricsMessage,
+            ("wake_accept_ms", "wake_screen_ms", "hit_lag_ms", "`attend`", "server side"),
+            id="TurnMetricsMessage",
+        ),
     ],
 )
 def test_docstrings_state_the_v2_rules(documented, terms):
@@ -1026,7 +1343,7 @@ def test_voice_state_ignores_the_retired_gpu_keys(retired):
     assert json.loads(encode_message(parsed)) == message
 
 
-@pytest.mark.parametrize("engine", ["vad", "eot", "stt", "tts"])
+@pytest.mark.parametrize("engine", ["vad", "eot", "stt", "tts", "kws"])
 def test_engine_location_remote_is_refused(engine):
     message = _vector_message(SERVER_VECTORS, "voice_state")
     message["engines"][engine]["location"] = "remote"

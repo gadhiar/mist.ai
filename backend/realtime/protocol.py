@@ -8,12 +8,12 @@ file and assert the same parity, so a change here must be mirrored in the vector
 
 Binary frames carry audio. Each is a 16-byte little-endian header (`<IHHII`: magic, msg_type,
 turn_tag, seq, sample_rate) followed by the payload; the payload length is the WebSocket message
-length minus 16. Uplink frames (`mic_audio`) are PCM16 mono at 16 kHz with `turn_tag` 0.
-Downlink frames are PCM16 mono at 24 kHz, tagged with the turn's audio tag (1..65535, wrapping
+length minus 16. Uplink frames (`mic_audio`, and `ref_audio`, the PC's own output that a desktop
+sends as a reference) are PCM16 mono at 16 kHz with `turn_tag` 0. Downlink frames are PCM16 mono at 24 kHz, tagged with the turn's audio tag (1..65535, wrapping
 past 0) so the client can flush every frame of a stopped turn by tag.
 
 Control messages are JSON text frames discriminated by `type`. `parse_client_message` and
-`parse_server_message` validate in strict mode, so a client sending `"pressed": "yes"` gets a
+`parse_server_message` validate in strict mode, so a client sending `"active": "yes"` gets a
 `ProtocolError` instead of a silent coercion; a JavaScript client must round integer fields
 before sending. Fields a newer client adds are ignored rather than rejected, which keeps a minor
 protocol bump compatible with this server.
@@ -57,15 +57,24 @@ PCM16_SAMPLE_BYTES = 2
 MAX_TURN_TAG = 0xFFFF
 MAX_SEQ = 0xFFFFFFFF
 MAX_REQ = 0xFFFFFFFF
+# The wire bound on `wake.backlog_ms`. The addressee gate's minimum is a server setting, not a
+# wire rule, so a smaller backlog parses and is then rejected `no_backlog`.
+MAX_WAKE_BACKLOG_MS = 10000
 
 
 class MsgType(IntEnum):
-    """Binary frame message types."""
+    """Binary frame message types.
+
+    `REF_AUDIO` (0x11) is the PC's system output, sent by a desktop whose `voice_start` had
+    `reference` true. Each frame covers the same 20 ms as the `MIC_AUDIO` frame with the same
+    `seq`, so the server can tell whether a name it heard came from the PC's own playback.
+    """
 
     AUDIO_CHUNK = 0x01
     AUDIO_COMPLETE = 0x02
     INTERRUPT_FADE = 0x03
     MIC_AUDIO = 0x10
+    REF_AUDIO = 0x11
 
 
 class Direction(StrEnum):
@@ -80,6 +89,7 @@ MSG_DIRECTION: dict[MsgType, Direction] = {
     MsgType.AUDIO_COMPLETE: Direction.DOWN,
     MsgType.INTERRUPT_FADE: Direction.DOWN,
     MsgType.MIC_AUDIO: Direction.UP,
+    MsgType.REF_AUDIO: Direction.UP,
 }
 
 _SAMPLE_RATE: dict[Direction, int] = {
@@ -88,7 +98,7 @@ _SAMPLE_RATE: dict[Direction, int] = {
 }
 
 # Types that carry PCM16; the others are markers whose payload must be empty.
-_PCM_TYPES = frozenset({MsgType.AUDIO_CHUNK, MsgType.MIC_AUDIO})
+_PCM_TYPES = frozenset({MsgType.AUDIO_CHUNK, MsgType.MIC_AUDIO, MsgType.REF_AUDIO})
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,11 +220,17 @@ def next_turn_tag(tag: int) -> int:
 
 # -- Control messages: shared types --------------------------------------------
 
-VoiceMode = Literal["open", "ptt", "wake"]
+# MIST wakes by name on every endpoint, so `wake` is the one listening mode. It stays a `Literal`
+# so `voice_start.mode` and `capabilities.voice.modes` keep a place for a later mode.
+VoiceMode = Literal["wake"]
+# Where MIST's names are spotted: `server` on the uplink the client streams, `endpoint` on the
+# device, which then sends `wake`.
+Spotter = Literal["server", "endpoint"]
 # The same values as capabilities' power level. Only gaming mode sets it; nothing in the voice
 # path detects games, full-screen windows or VRAM pressure.
 PowerLevel = Literal["full", "low", "off"]
-BackendMistState = Literal["idle", "listen", "think", "speak"]
+# `attend` is the provisional state sent at a name hit, before the addressee verdict.
+BackendMistState = Literal["idle", "attend", "listen", "think", "speak"]
 StreamChannel = Literal["tts", "text"]
 TurnOrigin = Literal["voice", "text", "system"]
 ErrorKind = Literal[
@@ -262,6 +278,14 @@ class VoiceStartMessage(_WireModel):
         endpoint: The client's view of its endpoint, which is advisory: the server binds each
             connection's endpoint when it accepts it, and logs and ignores a value that
             differs from the bound one.
+        spotter: Who spots MIST's names and the stop keywords. With `server` the client
+            streams while voice is on and unmuted, and the server spots both on the uplink; the
+            desktop sends this. With `endpoint` the device spots both and sends `wake` and
+            `barge_in`; the room unit sends this.
+        reference: Whether the client sends `0x11` reference frames of the PC's output. Only
+            `spotter` `server` may set it, because the server scores the reference at its own
+            name hit; with `spotter` `endpoint` it fails validation naming `reference`, and the
+            session answers `refused: "invalid"`. A missing `reference` reads as false.
         muted: The client's mute state, which the session applies before it accepts any uplink
             frame of this voice session, so a reconnect cannot unmute the client. A client that
             offers mute must send it. A missing `muted` reads as false, so frontend v1's C1,
@@ -276,21 +300,23 @@ class VoiceStartMessage(_WireModel):
     aec: Literal["browser", "native", "device", "headset", "none"]
     playback: bool
     endpoint: Literal["desktop", "room"]
-    local_kws: bool
+    spotter: Spotter
+    reference: bool = False
     muted: bool = False
+
+    @field_validator("reference")
+    @classmethod
+    def _reference_needs_the_server_spotter(cls, reference: bool, info: ValidationInfo) -> bool:
+        # `spotter` is declared before `reference`, so it is in `info.data` once it validated.
+        if reference and info.data.get("spotter") == "endpoint":
+            raise ValueError("reference frames are scored only with spotter server")
+        return reference
 
 
 class VoiceStopMessage(_WireModel):
     """Close the session's voice path."""
 
     type: Literal["voice_stop"] = "voice_stop"
-
-
-class PttMessage(_WireModel):
-    """Push-to-talk key state; a release ends the utterance."""
-
-    type: Literal["ptt"] = "ptt"
-    pressed: bool
 
 
 class PlaybackProgressMessage(_WireModel):
@@ -318,11 +344,18 @@ class BargeInMessage(_WireModel):
 
 
 class WakeMessage(_WireModel):
-    """A room unit heard its wake word; `score` arbitrates between units that heard it."""
+    """An endpoint heard one of MIST's names; `score` arbitrates against the other endpoints.
+
+    `backlog_ms` is required, because every sender knows how much audio it buffered: the first
+    `backlog_ms` of audio the endpoint sends after this message was captured before the wake, so
+    the words before the name are kept. Below the server's `endpoint_min_backlog_ms` the wake is
+    rejected `no_backlog`, so 0 parses but never opens a turn.
+    """
 
     type: Literal["wake"] = "wake"
     keyword: str
     score: float
+    backlog_ms: int = Field(ge=0, le=MAX_WAKE_BACKLOG_MS)
 
 
 class GpuYieldMessage(_WireModel):
@@ -385,7 +418,6 @@ class SubscribeLogsMessage(_WireModel):
 ClientMessage = (
     VoiceStartMessage
     | VoiceStopMessage
-    | PttMessage
     | PlaybackProgressMessage
     | PlaybackDoneMessage
     | BargeInMessage
@@ -448,12 +480,13 @@ class EngineStatus(_WireModel):
 
 
 class EngineStatuses(_WireModel):
-    """Status of the four speech engines."""
+    """Status of the five speech engines; `kws` is the server's name spotter, on `cpu` or `off`."""
 
     vad: EngineStatus
     eot: EngineStatus
     stt: EngineStatus
     tts: EngineStatus
+    kws: EngineStatus
 
 
 class TtsVoice(_WireModel):
@@ -498,10 +531,17 @@ class TurnLaneStats(_WireModel):
 
 
 class VoiceCapabilities(_WireModel):
-    """What the server's voice path supports; its presence marks a protocol 2 server."""
+    """What the server's voice path supports; its presence marks a protocol 2 server.
+
+    Attributes:
+        spotters: `endpoint` once VAD and STT are loaded, and `server` as well once `kws` is.
+        reference: Whether the server scores `0x11` frames, which needs `kws` loaded.
+    """
 
     protocol: Literal[2]
     modes: list[VoiceMode]
+    spotters: list[Spotter]
+    reference: bool
     uplink_sample_rate: Literal[16000]
     downlink_sample_rate: Literal[24000]
     barge_in: Literal["keyword"]
@@ -644,7 +684,7 @@ class BargeInDetail(_WireModel):
     """Detail of a `barge_in` decision.
 
     `utterance_id` is set or null by what produced the verdict, not by its reason: it names the
-    utterance when a transcript (partial or final), a press or a wake produced it, and is null
+    utterance when a transcript (partial or final) or a wake produced it, and is null
     when an endpoint `barge_in` report, the UI stop or `voice_stop` did.
     """
 
@@ -717,6 +757,19 @@ class WakeLostDetail(_WireModel):
     utterance_id: str
 
 
+class WakeRejectedDetail(_WireModel):
+    """Detail of a `wake_rejected` decision: no utterance id and no text.
+
+    The candidate was never published, so nothing about its speech may travel: only which
+    spotter heard the name, its score, and the reference score, null when no `0x11` reference
+    was scored.
+    """
+
+    source: Spotter
+    score: float
+    reference_score: float | None
+
+
 class PlacementDetail(_WireModel):
     """Detail of a `placement` decision.
 
@@ -735,7 +788,7 @@ class VoiceDecisionEndpoint(_WireModel):
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["endpoint"] = "endpoint"
     turn_id: str | None
-    reason: Literal["semantic", "silence_cap", "silence_cap_no_model", "ptt_release"]
+    reason: Literal["semantic", "silence_cap", "silence_cap_no_model"]
     detail: EndpointDetail
 
 
@@ -775,7 +828,7 @@ class VoiceDecisionBargeIn(_WireModel):
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["barge_in"] = "barge_in"
     turn_id: str | None
-    reason: Literal["keyword", "endpoint_kws", "ptt", "ui", "wake", "voice_stop"]
+    reason: Literal["keyword", "endpoint_kws", "ui", "wake", "voice_stop"]
     detail: BargeInDetail
 
 
@@ -875,6 +928,22 @@ class VoiceDecisionWakeLost(_WireModel):
     detail: WakeLostDetail
 
 
+class VoiceDecisionWakeRejected(_WireModel):
+    """A name was heard but the addressee gate rejected it; the one trace such speech leaves.
+
+    `turn_id` is the turn in flight when the name was heard, else null. `self_speech`: MIST said
+    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the
+    transcript does not address her. `lost_arbitration`: another candidate won. `no_backlog`:
+    an endpoint `wake` carried less pre-wake audio than the server's minimum.
+    """
+
+    type: Literal["voice_decision"] = "voice_decision"
+    kind: Literal["wake_rejected"] = "wake_rejected"
+    turn_id: str | None
+    reason: Literal["self_speech", "self_media", "not_addressed", "lost_arbitration", "no_backlog"]
+    detail: WakeRejectedDetail
+
+
 class VoiceDecisionPlacement(_WireModel):
     """The speech engines moved; process-wide, so it belongs to no turn.
 
@@ -905,6 +974,7 @@ VoiceDecisionMessage = (
     | VoiceDecisionDegraded
     | VoiceDecisionOverload
     | VoiceDecisionWakeLost
+    | VoiceDecisionWakeRejected
     | VoiceDecisionPlacement
 )
 
@@ -931,8 +1001,16 @@ class TurnMetricsMessage(_WireModel):
     """Timings, budget and outcome of one turn.
 
     `power_level` is the level at the turn's open. `timings` is keyed by stage timestamp, plus
-    `caption_lag_ms` (the turn's P90 over its utterance's partials) and `wake_screen_ms` (set
-    when a wake opened the utterance); new keys keep the schema, which is any string to an int.
+    `caption_lag_ms` (the turn's P90 over its utterance's partials), and two keys set when a
+    name or an endpoint wake opened the utterance:
+
+    - `wake_accept_ms`: the hit frame's arrival to the addressee verdict.
+    - `wake_screen_ms`: the name's end to the first `attend` or `listen` sent. The name's end is
+      estimated as the hit frame's arrival less the manifest's `hit_lag_ms`, or for an endpoint
+      wake as the `wake` message's arrival. It is the server side only: it uses a fixed median
+      lag and leaves out capture to server and server to pixel.
+
+    New keys keep the schema, which is any string to an int.
     """
 
     type: Literal["turn_metrics"] = "turn_metrics"
@@ -986,7 +1064,12 @@ class StreamCancelledMessage(_WireModel):
 
 
 class StateCycleMessage(_WireModel):
-    """MIST's visible state; `turn_id` is absent for `listen` when no turn is speaking."""
+    """MIST's visible state; `turn_id` is absent for `listen` when no turn is speaking.
+
+    `attend` is provisional: with the `attend_cue` setting on, it is sent at a name hit before
+    the addressee verdict, and is followed by `listen` on acceptance or by the state of the
+    controller's current phase on rejection.
+    """
 
     type: Literal["state_cycle"] = "state_cycle"
     state: BackendMistState

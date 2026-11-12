@@ -51,6 +51,96 @@
       "sample_rate": 16000,
       "payload_hex": "64009cff",
       "frame_hex": "5453494d1000000000000000803e000064009cff"
+    },
+    {
+      "name": "ref_audio",
+      "msg_type": 17,
+      "direction": "up",
+      "turn_tag": 0,
+      "seq": 0,
+      "sample_rate": 16000,
+      "payload_hex": "30f895fafafc5fffc40129048e0652f9b7fb1cfe8100e6024b05b00774fad9fc3effa30108046d0631f996fbfbfd6000c5022a058f0753fab8fc1dff8201e7034c0610f975fbdafd3f00a40209056e0732fa97fcfcfe6101c6032b06eff854fbb9fd1e008302e8044d0711fa76fcdbfe4001a5030a06cef833fb98fdfdff6202c7042c07f0f955fcbafe1f018403e905adf812fb77fddcff4102a6040b07cff934fc99fefe006303c8058cf8f1fa56fdbbff20028504ea06aef913fc78fedd004203a7056bf8d0fa35fd9affff016404c9068df9f2fb57febc00210386054af8affa14fd79ffde014304a8066cf9d1fb36fe9b0000036505ca078efaf3fc58ffbd01220487064bf9b0fb15fe7a00df024405a9076dfad2fc37ff9c01010466062af98ffbf4fd5900be02230588074cfab1fc16ff7b01e003450609f96efbd3fd38009d02020567072bfa90fcf5fe5a01bf032406e8f84dfbb2fd17007c02e10446070afa6ffcd4fe39019e030306c7f82cfb91fdf6ff5b02c0042507e9f94efcb3fe18017d03e205a6f80bfb70fdd5ff3a029f040407c8f92dfc92fef7005c03c10585f8eafa4ffdb4ff19027e04e306a7f90cfc71fed6003b03a00564f8c9fa2efd93fff8015d04c20686f9ebfb50feb5001a037f0543f8a8fa0dfd72ffd7013c04a10665f9cafb2ffe9400f9025e05c30787faecfc51ffb6011b04800644f9a9fb0efe7300d8023d05a20766facbfc30ff9501fa035f0623f988fbedfd5200b7021c05810745faaafc0fff7401d9033e0602f967fbccfd31009602fb04600724fa89fceefe5301b8031d06e1f846fbabfd10007502da043f0703fa68fccdfe32019703fc05c0f825fb8afdefff5402b9041e07e2f947fcacfe11017603db05",
+      "frame_hex": "5453494d1100000000000000803e000030f895fafafc5fffc40129048e0652f9b7fb1cfe8100e6024b05b00774fad9fc3effa30108046d0631f996fbfbfd6000c5022a058f0753fab8fc1dff8201e7034c0610f975fbdafd3f00a40209056e0732fa97fcfcfe6101c6032b06eff854fbb9fd1e008302e8044d0711fa76fcdbfe4001a5030a06cef833fb98fdfdff6202c7042c07f0f955fcbafe1f018403e905adf812fb77fddcff4102a6040b07cff934fc99fefe006303c8058cf8f1fa56fdbbff20028504ea06aef913fc78fedd004203a7056bf8d0fa35fd9affff016404c9068df9f2fb57febc00210386054af8affa14fd79ffde014304a8066cf9d1fb36fe9b0000036505ca078efaf3fc58ffbd01220487064bf9b0fb15fe7a00df024405a9076dfad2fc37ff9c01010466062af98ffbf4fd5900be02230588074cfab1fc16ff7b01e003450609f96efbd3fd38009d02020567072bfa90fcf5fe5a01bf032406e8f84dfbb2fd17007c02e10446070afa6ffcd4fe39019e030306c7f82cfb91fdf6ff5b02c0042507e9f94efcb3fe18017d03e205a6f80bfb70fdd5ff3a029f040407c8f92dfc92fef7005c03c10585f8eafa4ffdb4ff19027e04e306a7f90cfc71fed6003b03a00564f8c9fa2efd93fff8015d04c20686f9ebfb50feb5001a037f0543f8a8fa0dfd72ffd7013c04a10665f9cafb2ffe9400f9025e05c30787faecfc51ffb6011b04800644f9a9fb0efe7300d8023d05a20766facbfc30ff9501fa035f0623f988fbedfd5200b7021c05810745faaafc0fff7401d9033e0602f967fbccfd31009602fb04600724fa89fceefe5301b8031d06e1f846fbabfd10007502da043f0703fa68fccdfe32019703fc05c0f825fb8afdefff5402b9041e07e2f947fcacfe11017603db05"
+    }
+  ],
+  "binary_invalid": [
+    {
+      "name": "header: 15 bytes, one short of the 16-byte header",
+      "direction": "down",
+      "frame_hex": "5453494d020007000d000000c05d00",
+      "field": "header"
+    },
+    {
+      "name": "magic: 0x4D495355, not 0x4D495354",
+      "direction": "down",
+      "frame_hex": "5553494d020007000d000000c05d0000",
+      "field": "magic"
+    },
+    {
+      "name": "msg_type: unknown type 0x04",
+      "direction": "down",
+      "frame_hex": "5453494d0400070000000000c05d0000",
+      "field": "msg_type"
+    },
+    {
+      "name": "msg_type: uplink mic_audio 0x10 decoded as downlink, a type of the other direction",
+      "direction": "down",
+      "frame_hex": "5453494d1000000000000000803e000064009cff",
+      "field": "msg_type"
+    },
+    {
+      "name": "msg_type: downlink audio_chunk 0x01 decoded as uplink, a type of the other direction",
+      "direction": "up",
+      "frame_hex": "5453494d010007002a000000c05d00000000e80318fcff7f",
+      "field": "msg_type"
+    },
+    {
+      "name": "sample_rate: uplink mic_audio 0x10 at 48000 Hz, 16000 required",
+      "direction": "up",
+      "frame_hex": "5453494d100000000000000080bb00000000",
+      "field": "sample_rate"
+    },
+    {
+      "name": "turn_tag: uplink mic_audio 0x10 with tag 1, the uplink tag is always 0",
+      "direction": "up",
+      "frame_hex": "5453494d1000010000000000803e00000000",
+      "field": "turn_tag"
+    },
+    {
+      "name": "payload: odd PCM byte count, mic_audio 0x10 with 3 payload bytes",
+      "direction": "up",
+      "frame_hex": "5453494d1000000000000000803e0000000000",
+      "field": "payload"
+    },
+    {
+      "name": "payload: audio_complete 0x02 with a 2-byte payload, must be empty",
+      "direction": "down",
+      "frame_hex": "5453494d020007002b000000c05d00000000",
+      "field": "payload"
+    },
+    {
+      "name": "sample_rate: uplink ref_audio 0x11 at 24000 Hz, 16000 required",
+      "direction": "up",
+      "frame_hex": "5453494d1100000000000000c05d00000000",
+      "field": "sample_rate"
+    },
+    {
+      "name": "payload: odd PCM byte count, ref_audio 0x11 with 3 payload bytes",
+      "direction": "up",
+      "frame_hex": "5453494d1100000000000000803e0000000000",
+      "field": "payload"
+    },
+    {
+      "name": "msg_type: uplink ref_audio 0x11 decoded as downlink, a type of the other direction",
+      "direction": "down",
+      "frame_hex": "5453494d1100000000000000803e00000000",
+      "field": "msg_type"
+    },
+    {
+      "name": "turn_tag: uplink ref_audio 0x11 with tag 1, the uplink tag is always 0",
+      "direction": "up",
+      "frame_hex": "5453494d1100010000000000803e00000000",
+      "field": "turn_tag"
     }
   ],
   "control": {
@@ -60,13 +150,14 @@
         "message": {
           "type": "voice_start",
           "req": 1,
-          "mode": "open",
+          "mode": "wake",
           "sample_rate": 16000,
           "frame_ms": 20,
           "aec": "browser",
           "playback": true,
           "endpoint": "desktop",
-          "local_kws": false,
+          "spotter": "server",
+          "reference": false,
           "muted": false
         }
       },
@@ -75,23 +166,52 @@
         "message": {
           "type": "voice_start",
           "req": 2,
-          "mode": "ptt",
+          "mode": "wake",
           "sample_rate": 16000,
           "frame_ms": 20,
           "aec": "browser",
           "playback": true,
           "endpoint": "desktop",
-          "local_kws": false,
+          "spotter": "server",
+          "reference": false,
           "muted": true
+        }
+      },
+      {
+        "name": "voice_start_server_spotter_with_reference",
+        "message": {
+          "type": "voice_start",
+          "req": 3,
+          "mode": "wake",
+          "sample_rate": 16000,
+          "frame_ms": 20,
+          "aec": "native",
+          "playback": true,
+          "endpoint": "desktop",
+          "spotter": "server",
+          "reference": true,
+          "muted": false
+        }
+      },
+      {
+        "name": "voice_start_endpoint_spotter_room_unit",
+        "message": {
+          "type": "voice_start",
+          "req": 1,
+          "mode": "wake",
+          "sample_rate": 16000,
+          "frame_ms": 20,
+          "aec": "device",
+          "playback": true,
+          "endpoint": "room",
+          "spotter": "endpoint",
+          "reference": false,
+          "muted": false
         }
       },
       {
         "name": "voice_stop",
         "message": {"type": "voice_stop"}
-      },
-      {
-        "name": "ptt",
-        "message": {"type": "ptt", "pressed": true}
       },
       {
         "name": "playback_progress",
@@ -107,7 +227,11 @@
       },
       {
         "name": "wake",
-        "message": {"type": "wake", "keyword": "hey mist", "score": 0.87}
+        "message": {"type": "wake", "keyword": "hey mist", "score": 0.87, "backlog_ms": 1500}
+      },
+      {
+        "name": "wake_backlog_zero_parses_and_the_server_rejects_it_no_backlog",
+        "message": {"type": "wake", "keyword": "mist", "score": 0.74, "backlog_ms": 0}
       },
       {
         "name": "gpu_yield",
@@ -147,7 +271,7 @@
           "cause": "answer",
           "req": 1,
           "active": true,
-          "mode": "open",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -175,7 +299,8 @@
               "model_id": "whisper-small",
               "vram_mib": 1024
             },
-            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -214,7 +339,8 @@
             "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
             "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
             "stt": {"loaded": true, "location": "cpu", "model_id": "whisper-small", "vram_mib": null},
-            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -230,7 +356,7 @@
           "cause": "answer",
           "req": 2,
           "active": true,
-          "mode": "ptt",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -258,7 +384,8 @@
               "model_id": "whisper-small",
               "vram_mib": 1024
             },
-            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -274,7 +401,7 @@
           "cause": "answer",
           "req": 3,
           "active": true,
-          "mode": "ptt",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -302,7 +429,8 @@
               "model_id": "whisper-small",
               "vram_mib": 1024
             },
-            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -346,7 +474,8 @@
               "model_id": "whisper-small",
               "vram_mib": 1024
             },
-            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -362,7 +491,7 @@
           "cause": "broadcast",
           "req": null,
           "active": true,
-          "mode": "open",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -395,7 +524,8 @@
               "location": "cuda:0",
               "model_id": "pocket-tts",
               "vram_mib": 512
-            }
+            },
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -411,7 +541,7 @@
           "cause": "broadcast",
           "req": null,
           "active": true,
-          "mode": "open",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -434,7 +564,8 @@
             "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
             "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
             "stt": {"loaded": true, "location": "cpu", "model_id": "whisper-small", "vram_mib": null},
-            "tts": {"loaded": true, "location": "cpu", "model_id": "pocket-tts", "vram_mib": null}
+            "tts": {"loaded": true, "location": "cpu", "model_id": "pocket-tts", "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -473,7 +604,8 @@
             "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
             "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
             "stt": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
-            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "kws": {"loaded": true, "location": "cpu", "model_id": "mist-wake", "vram_mib": null}
           },
           "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
@@ -672,6 +804,26 @@
         }
       },
       {
+        "name": "voice_decision_wake_rejected",
+        "message": {
+          "type": "voice_decision",
+          "kind": "wake_rejected",
+          "turn_id": null,
+          "reason": "self_media",
+          "detail": {"source": "server", "score": 0.91, "reference_score": 0.88}
+        }
+      },
+      {
+        "name": "voice_decision_wake_rejected_no_backlog_endpoint_during_a_turn",
+        "message": {
+          "type": "voice_decision",
+          "kind": "wake_rejected",
+          "turn_id": "turn-1",
+          "reason": "no_backlog",
+          "detail": {"source": "endpoint", "score": 0.8, "reference_score": null}
+        }
+      },
+      {
         "name": "voice_decision_placement",
         "message": {
           "type": "voice_decision",
@@ -818,6 +970,10 @@
         "message": {"type": "state_cycle", "state": "listen"}
       },
       {
+        "name": "state_cycle_attend_sent_at_the_name_hit",
+        "message": {"type": "state_cycle", "state": "attend"}
+      },
+      {
         "name": "error",
         "message": {
           "type": "error",
@@ -839,7 +995,9 @@
             "vad_enabled": true,
             "voice": {
               "protocol": 2,
-              "modes": ["open", "ptt", "wake"],
+              "modes": ["wake"],
+              "spotters": ["endpoint", "server"],
+              "reference": true,
               "uplink_sample_rate": 16000,
               "downlink_sample_rate": 24000,
               "barge_in": "keyword",
@@ -851,5 +1009,162 @@
         }
       }
     ]
-  }
+  },
+  "control_invalid": [
+    {
+      "name": "ptt: the push-to-talk message is removed, so its type is unknown",
+      "direction": "client_to_server",
+      "json": {"type": "ptt", "pressed": true},
+      "rule": "protocol 2 has no push-to-talk; MIST wakes by name on every endpoint",
+      "field": "type"
+    },
+    {
+      "name": "voice_start: mode open is removed",
+      "direction": "client_to_server",
+      "json": {
+        "type": "voice_start",
+        "req": 1,
+        "mode": "open",
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "aec": "browser",
+        "playback": true,
+        "endpoint": "desktop",
+        "spotter": "server",
+        "reference": false,
+        "muted": false
+      },
+      "rule": "wake is the one voice mode; open mode answered unnamed speech",
+      "field": "mode"
+    },
+    {
+      "name": "voice_start: mode ptt is removed",
+      "direction": "client_to_server",
+      "json": {
+        "type": "voice_start",
+        "req": 1,
+        "mode": "ptt",
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "aec": "browser",
+        "playback": true,
+        "endpoint": "desktop",
+        "spotter": "server",
+        "reference": false,
+        "muted": false
+      },
+      "rule": "wake is the one voice mode; protocol 2 has no push-to-talk",
+      "field": "mode"
+    },
+    {
+      "name": "voice_decision endpoint: reason ptt_release is removed",
+      "direction": "server_to_client",
+      "json": {
+        "type": "voice_decision",
+        "kind": "endpoint",
+        "turn_id": null,
+        "reason": "ptt_release",
+        "detail": {"utterance_id": "utt-1", "eot_probability": null, "silence_ms": 0}
+      },
+      "rule": "an utterance ends by endpointing only: semantic, silence_cap or silence_cap_no_model",
+      "field": "reason"
+    },
+    {
+      "name": "voice_decision barge_in: reason ptt is removed",
+      "direction": "server_to_client",
+      "json": {
+        "type": "voice_decision",
+        "kind": "barge_in",
+        "turn_id": "turn-1",
+        "reason": "ptt",
+        "detail": {"keyword": null, "phase": "speaking", "utterance_id": "utt-4"}
+      },
+      "rule": "a barge-in comes from a keyword, an endpoint report, the UI, a wake or voice_stop",
+      "field": "reason"
+    },
+    {
+      "name": "voice_start: local_kws without spotter, the shape before wake by name",
+      "direction": "client_to_server",
+      "json": {
+        "type": "voice_start",
+        "req": 1,
+        "mode": "wake",
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "aec": "browser",
+        "playback": true,
+        "endpoint": "desktop",
+        "local_kws": false,
+        "muted": false
+      },
+      "rule": "local_kws is replaced by spotter, which is required (M133)",
+      "field": "spotter"
+    },
+    {
+      "name": "voice_start: reference true with spotter endpoint",
+      "direction": "client_to_server",
+      "json": {
+        "type": "voice_start",
+        "req": 4,
+        "mode": "wake",
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "aec": "device",
+        "playback": true,
+        "endpoint": "room",
+        "spotter": "endpoint",
+        "reference": true,
+        "muted": false
+      },
+      "rule": "0x11 reference frames are scored at a server name hit, so reference needs spotter server (M54's refused invalid)",
+      "field": "reference"
+    },
+    {
+      "name": "wake: backlog_ms missing",
+      "direction": "client_to_server",
+      "json": {"type": "wake", "keyword": "hey mist", "score": 0.87},
+      "rule": "backlog_ms is required: every sender knows how much audio it buffered before the wake",
+      "field": "backlog_ms"
+    },
+    {
+      "name": "wake: backlog_ms -1, below 0",
+      "direction": "client_to_server",
+      "json": {"type": "wake", "keyword": "hey mist", "score": 0.87, "backlog_ms": -1},
+      "rule": "backlog_ms is 0 to 10000 on the wire",
+      "field": "backlog_ms"
+    },
+    {
+      "name": "wake: backlog_ms 10001, above the 10000 wire bound",
+      "direction": "client_to_server",
+      "json": {"type": "wake", "keyword": "hey mist", "score": 0.87, "backlog_ms": 10001},
+      "rule": "backlog_ms is 0 to 10000 on the wire",
+      "field": "backlog_ms"
+    },
+    {
+      "name": "voice_decision wake_rejected: reason outside the five",
+      "direction": "server_to_client",
+      "json": {
+        "type": "voice_decision",
+        "kind": "wake_rejected",
+        "turn_id": null,
+        "reason": "too_quiet",
+        "detail": {"source": "server", "score": 0.6, "reference_score": null}
+      },
+      "rule": "wake_rejected reasons: self_speech, self_media, not_addressed, lost_arbitration, no_backlog",
+      "field": "reason"
+    },
+    {
+      "name": "voice_decision wake_rejected: source outside the two spotters",
+      "direction": "server_to_client",
+      "json": {
+        "type": "voice_decision",
+        "kind": "wake_rejected",
+        "turn_id": null,
+        "reason": "not_addressed",
+        "detail": {"source": "phone", "score": 0.6, "reference_score": null}
+      },
+      "rule": "detail.source is the spotter that heard the name, server or endpoint",
+      "field": "detail.source"
+    }
+  ]
 }
