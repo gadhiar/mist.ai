@@ -704,10 +704,223 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `creag-gobhainn-bed IS_A dive-site` attributes differ: settled by the attribute policy in the method section.
 - `sween-narrows IS_A dive-site` attributes differ: settled by the attribute policy in the method section.
 
+### sel-171-list-ref-top-scoring-software (F1 0.57, adjudicated whole)
+
+- Pass A: ceased the tools that did not stick.
+- Pass B: labelled only the tool still in use.
+- Ruling: The user tried every item, and 'nothing stuck except the top one' says the others are no longer used, a cessation (Assertion kinds), as for the packs no longer opened elsewhere in this set. 'A spreadsheet and a stopwatch' names two things, each its own entity.
+- `user USES eventmeasure` (pass A only): kept, pass A held.
+- `user USES spreadsheet` (pass A only): kept, pass A held.
+- `user USES stopwatch` (pass A only): kept, pass A held.
+
+### sel-172-list-ref-last-two-officemates (F1 0.60, adjudicated whole)
+
+- Pass A: gave each member of the cohort and the user employment at the institute.
+- Pass B: gave each membership of the institute.
+- Ruling: The institute is where the cohort and the user are based and work, WORKS_AT's gloss (employment or membership at an organisation). MEMBER_OF is the guide's edge for a named team or club placed under an employer (N17), which the institute is not. The topics and anchors are agreed.
+- `emrys MEMBER_OF skerryvore-institute` (pass B only): dropped, pass A held.
+- `emrys WORKS_AT skerryvore-institute` (pass A only): kept, pass A held.
+- `ludovic MEMBER_OF skerryvore-institute` (pass B only): dropped, pass A held.
+- `ludovic WORKS_AT skerryvore-institute` (pass A only): kept, pass A held.
+- `marit MEMBER_OF skerryvore-institute` (pass B only): dropped, pass A held.
+- `marit WORKS_AT skerryvore-institute` (pass A only): kept, pass A held.
+- `user MEMBER_OF skerryvore-institute` (pass B only): dropped, pass A held.
+- `user WORKS_AT skerryvore-institute` (pass A only): kept, pass A held.
+
+### sel-173-list-plus-fortnight-repeats (F1 0.50, adjudicated whole)
+
+- Pass A: named each habit by its activity.
+- Pass B: kept each habit's place or company in its id.
+- Ruling: N1 as in the river outing: 'out of Gannet Rock' and 'with the department' scope the habits, so the shorter runs name them.
+- `user HAS_HABIT boat-day` (pass A only): kept, pass A held.
+- `user HAS_HABIT boat-day-out-of-gannet-rock` (pass B only): dropped, pass A held.
+- `user HAS_HABIT sea-swim` (pass A only): kept, pass A held.
+- `user HAS_HABIT sea-swim-with-the-department` (pass B only): dropped, pass A held.
+- Entities: habits are recurring activities, Concepts (A), as Example 24's habit is.
+
+### sel-177-list-paren-survey-day (F1 0.00, adjudicated whole)
+
+- Pass A: read the list as one day's itinerary, with nothing durable.
+- Pass B: read it as the user's routine and kept the database the user enters counts in.
+- Ruling: 'A survey day, start to finish' describes the user's routine on every survey day, not one day's errands, and the last step states the user's use of the station database, a durable fact (USES). The other steps name no entity.
+- `user USES station-database` (pass B only): kept, pass B held.
+
+### sel-186-temporal-phd-start-to-stipend-end (F1 0.75)
+
+- Ruling: As in the cohort probe: the institute where the user does the PhD is where the user works, WORKS_AT, with its start date; MEMBER_OF is N17's edge for a team.
+- `user MEMBER_OF skerryvore-institute` (pass B only): dropped, pass A held.
+- `user WORKS_AT skerryvore-institute` (pass A only): kept, pass A held.
+
+### sel-187-multi-supervisors-and-cottage (F1 0.86)
+
+- Ruling: Renting a cottage on the island states where the user lives, a durable fact; no canonical predicate joins the user to a place, so RELATED_TO (Rule 15) holds, as for the shared studio.
+- `user RELATED_TO cumbrae` (pass B only): kept, pass B held.
+
+### sel-188-list-dash-android-app-parts (F1 0.50, adjudicated whole)
+
+- Pass A: took the app's proper name as the project.
+- Pass B: kept the kind noun in the project's id.
+- Ruling: N14 as in the route planner probe: 'Pennywhistle' is the app's own name, so the id is the name and the Project takes no IS_A; the IMPLEMENTED_WITH edges follow it.
+- `pennywhistle IMPLEMENTED_WITH jetpack-compose` (pass A only): kept, pass A held.
+- `pennywhistle IMPLEMENTED_WITH retrofit` (pass A only): kept, pass A held.
+- `pennywhistle IMPLEMENTED_WITH room` (pass A only): kept, pass A held.
+- `pennywhistle-app IMPLEMENTED_WITH jetpack-compose` (pass B only): dropped, pass A held.
+- `pennywhistle-app IMPLEMENTED_WITH retrofit` (pass B only): dropped, pass A held.
+- `pennywhistle-app IMPLEMENTED_WITH room` (pass B only): dropped, pass A held.
+
+### sel-189-list-dash-habits-from-api-author (F1 0.89)
+
+- Ruling: 'Elowen, who writes the API my app calls' is a durable fact about her, WORKS_ON the API, beside her anchor (Durable third-party facts).
+- `elowen WORKS_ON api` (pass B only): kept, pass B held.
+
+### sel-190-list-dash-why-left-agency (F1 0.40, adjudicated whole)
+
+- Pass A: labelled only the new employer.
+- Pass B: read each reason as something the user prefers.
+- Ruling: The reasons for the move state what the user values in a job, each a preference (PREFERS), beside the agreed employer.
+- `user PREFERS no-timesheets` (pass B only): kept, pass B held.
+- `user PREFERS one-product-instead-of-nine` (pass B only): kept, pass B held.
+- `user PREFERS pension-that-actually-exists` (pass B only): kept, pass B held.
+- Entities: the reasons are preferences about work, the Preference type's test (B).
+
+### sel-192-list-numbered-job-parts-ranked (F1 0.67)
+
+- Ruling: N1 with the lead ruling: 'for the app stores' qualifies the paperwork, and the shorter run names it, as 'dark mode' does without 'everywhere'.
+- `user KNOWS release-paperwork` (pass A only): kept, pass A held.
+- `user KNOWS release-paperwork-for-the-app-stores` (pass B only): dropped, pass A held.
+
+### sel-193-list-ref-former-crash-reporter (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `bugsnag IS_A crash-reporter` attributes differ: settled by the attribute policy in the method section.
+
+### sel-195-list-ref-last-navigation-library (F1 0.44, adjudicated whole)
+
+- Pass A: gave every library its kind and the user's use.
+- Pass B: labelled only the library the app shipped on.
+- Ruling: List rule: options nobody chose get no edge, so the two libraries only prototyped with get neither use nor kind. The app shipped on the last one, which the user built it with, so A's USES holds for it beside the agreed edges.
+- `decompose IS_A navigation-library` (pass A only): dropped, pass B held.
+- `user USES compose-navigation` (pass A only): kept, pass A held.
+- `user USES decompose` (pass A only): dropped, pass B held.
+- `user USES voyager` (pass A only): dropped, pass B held.
+- `voyager IS_A navigation-library` (pass A only): dropped, pass B held.
+- `compose-navigation IS_A navigation-library` attributes differ: settled by the attribute policy in the method section.
+
+### sel-196-list-ref-accepted-b-and-c (F1 0.00, adjudicated whole)
+
+- Pass A: took the conference as the user's event and linked the talks to it as topics.
+- Pass B: took the two accepted talks as the user's events, linked to the conference.
+- Ruling: The accepted talks are events the user takes part in (Event rule), each linked to the conference it is for by RELATED_TO (Rule 15), and the declined talk gets no edge (List rule). Giving them is taking part in the conference too, so A's EXPERIENCED holds, as in the former-talk probe.
+- `offline-first-savings-pots RELATED_TO pocketconf` (pass B only): kept, pass B held.
+- `pocketconf RELATED_TO offline-first-savings-pots` (pass A only): dropped, pass B held.
+- `pocketconf RELATED_TO what-screen-readers-taught-me` (pass A only): dropped, pass B held.
+- `user EXPERIENCED offline-first-savings-pots` (pass B only): kept, pass B held.
+- `user EXPERIENCED pocketconf` (pass A only): kept, pass A held.
+- `user EXPERIENCED what-screen-readers-taught-me` (pass B only): kept, pass B held.
+- `what-screen-readers-taught-me RELATED_TO pocketconf` (pass B only): kept, pass B held.
+- Entities: the two talks are Events (B).
+
+### sel-197-list-plus-week-off-keyboard (F1 0.33, adjudicated whole)
+
+- Pass A: named each habit by its activity.
+- Pass B: kept each habit's company or place in its id.
+- Ruling: N1 as in the river outing: 'with the Hollin Beck harriers' and 'round Roundhay Park' scope the habits, so the shorter runs name them.
+- `user HAS_HABIT fell-running` (pass A only): kept, pass A held.
+- `user HAS_HABIT fell-running-with-the-hollin-beck-harriers` (pass B only): dropped, pass A held.
+- `user HAS_HABIT five-kilometres` (pass A only): kept, pass A held.
+- `user HAS_HABIT five-kilometres-round-roundhay-park` (pass B only): dropped, pass A held.
+- Entities: habits are recurring activities, Concepts (A), as Example 24's habit is.
+
+### sel-198-list-star-aims-written-down (F1 0.86)
+
+- Ruling: The user names the person the work goes to, someone the user knows, not a name in passing, so the anchor holds (Durable third-party facts).
+- `user KNOWS_PERSON gethin` (pass B only): kept, pass B held.
+
+### sel-199-list-checkbox-release-four-two (F1 0.80)
+
+- Ruling: A checked box states a fact that is done (List rules): the biometric login is now part of the app, PART_OF.
+- `biometric-login PART_OF pennywhistle` (pass B only): kept, pass B held.
+
+### sel-200-list-nested-what-i-own (F1 0.88)
+
+- Ruling: The parent bullets set the subject for their children (List rules), and the user owns the children: 'only the map screen' says the user does not own the whole app, so no WORKS_ON for either parent.
+- `user WORKS_ON branch-finder` (pass B only): dropped, pass A held.
+- `user WORKS_ON pennywhistle` (pass B only): dropped, pass A held.
+
+### sel-201-list-heading-quarters-and-never (F1 0.50, adjudicated whole)
+
+- Pass A: made this quarter's items the user's current work.
+- Pass B: labelled only the dislike.
+- Ruling: The heading sets the predicate for its items (List rules): this quarter's items are the user's current work, WORKS_ON, and next quarter's are a plan with no edge. The quarter is not resolved to dates.
+- `user WORKS_ON dark-theme` (pass A only): kept, pass A held.
+- `user WORKS_ON pots-that-round-up-card-payments` (pass A only): kept, pass A held.
+- Entities: a chatbot is a tool or service, the Technology test (B).
+
+### sel-205-list-long-run-through-before-release (F1 0.30, adjudicated whole)
+
+- Pass A: made every check a habit named by its whole line.
+- Pass B: named each check by its head and read the two screen readers as tools in use.
+- Ruling: 'Before every release' is a stated cadence, so each check is HAS_HABIT; as in the river outing, a trailing phrase that scopes a habit stays out of its id (N1). The two screen-reader lines state the user's use of a tool, 'I use X for Y' (Rule 18), so USES; HAS_HABIT admits no Technology.
+- `user HAS_HABIT captions` (pass B only): kept, pass B held.
+- `user HAS_HABIT captions-on-the-help-videos` (pass A only): dropped, pass B held.
+- `user HAS_HABIT colour-contrast` (pass B only): kept, pass B held.
+- `user HAS_HABIT colour-contrast-on-both-themes` (pass A only): dropped, pass B held.
+- `user HAS_HABIT keyboard-only` (pass B only): kept, pass B held.
+- `user HAS_HABIT keyboard-only-on-a-tablet` (pass A only): dropped, pass B held.
+- `user HAS_HABIT landscape` (pass B only): kept, pass B held.
+- `user HAS_HABIT landscape-on-a-small-phone` (pass A only): dropped, pass B held.
+- `user HAS_HABIT second-screen-reader-on-the-transfer-flow` (pass A only): dropped, pass B held.
+- `user HAS_HABIT talkback-through-the-whole-sign-up` (pass A only): dropped, pass B held.
+- `user HAS_HABIT touch-targets` (pass B only): kept, pass B held.
+- `user HAS_HABIT touch-targets-of-48-dp` (pass A only): dropped, pass B held.
+- `user USES second-screen-reader` (pass B only): kept, pass B held.
+- `user USES talkback` (pass B only): kept, pass B held.
+
+### sel-206-list-long-cv-languages (F1 0.91)
+
+- Ruling: N1: the item's own phrase cannot be an id, and its canonical form collides with another language's name, so gold lists the spelled-out id with the others as alternatives, as N1 lists both where neither id is the utterance's phrase.
+- `user KNOWS c` (pass A only): dropped, pass B held.
+- `user KNOWS c-sharp` (pass B only): kept, pass B held.
+
+### sel-207-list-long-fell-day-kit (F1 0.50, adjudicated whole)
+
+- Pass A: typed every item but the food as a Technology the user uses.
+- Pass B: typed only the instruments as Technology and kept the rest as entity-only labels.
+- Ruling: N6: a type is chosen by its test, never to keep an edge. Clothing, containers, emergency cover and food are not tools, so they stay entity-only labels; a paper map is a navigation tool like the compass, so it takes Technology and USES.
+- `user USES foil-blanket` (pass A only): dropped, pass B held.
+- `user USES paper-map` (pass A only): kept, pass A held.
+- `user USES soft-flasks` (pass A only): dropped, pass B held.
+- `user USES spare-gloves` (pass A only): dropped, pass B held.
+- `user USES studded-fell-shoes` (pass A only): dropped, pass B held.
+- `user USES windproof-smock` (pass A only): dropped, pass B held.
+
+### sel-212-list-dash-promises-to-guesthouses (F1 0.86)
+
+- Ruling: The lead-in names the product the promises are made for, a project, so it is an entity, and the user's promises for it make it the user's work (WORKS_ON), as for the demo aims.
+- `user WORKS_ON stile` (pass B only): kept, pass B held.
+
+### sel-214-list-numbered-countries-sold (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `england IS_A country` attributes differ: settled by the attribute policy in the method section.
+- `portugal IS_A country` attributes differ: settled by the attribute policy in the method section.
+- `scotland IS_A country` attributes differ: settled by the attribute policy in the method section.
+- `slovenia IS_A country` attributes differ: settled by the attribute policy in the method section.
+
+### sel-215-list-ref-second-agency (F1 0.40, adjudicated whole)
+
+- Pass A: linked the user to the chosen agency.
+- Pass B: made the redesign the user's project and linked the chosen agency to it.
+- Ruling: N13: something chosen for a subject links to that subject, so the agency links to the redesign, dated from its stated start; the redesign is the user's work, and 'Bootprint' names another entity, so it keeps the whole phrase (N4).
+- `bootprint-redesign RELATED_TO oxbow-finch` (pass B only): kept, pass B held.
+- `user RELATED_TO oxbow-finch` (pass A only): dropped, pass B held.
+- `user WORKS_ON bootprint-redesign` (pass B only): kept, pass B held.
+- `oxbow-finch IS_A agency` attributes differ: settled by the attribute policy in the method section.
+
 ## Totals
 
-- Probes with a difference adjudicated: 83; still to adjudicate: 56.
-- Relations the passes differed on, adjudicated: 237.
-- Probes adjudicated whole (F1 under 0.61): 29.
-- Outcomes: pass A held 109, pass B held 128, neither held 0.
-- Shared relations whose attributes differed: 27.
+- Probes with a difference adjudicated: 107; still to adjudicate: 32.
+- Relations the passes differed on, adjudicated: 316.
+- Probes adjudicated whole (F1 under 0.61): 42.
+- Outcomes: pass A held 145, pass B held 171, neither held 0.
+- Shared relations whose attributes differed: 34.
