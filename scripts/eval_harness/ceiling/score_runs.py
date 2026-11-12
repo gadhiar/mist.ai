@@ -48,8 +48,8 @@ list-only recall pools the aligned counts of probes `extraction_report.is_list_p
 and a typo or paraphrase pair counts only when a row accepts it. `--pairs-out DIR` writes each
 run's pending pairs to `DIR/<name>.jsonl` with neither the run's name nor the accepted flag in
 a row, so a blind adjudicator can read them pooled; it is refused, before anything is scored
-or written, for a gold whose file name starts with `heldout-`, and for a pairs file that
-exists. A scorer without aligned scoring prints neither line and refuses both options.
+or written, for a gold whose file name starts with `heldout-` or `selection-`, and for a
+pairs file that exists. A scorer without aligned scoring prints neither line and refuses both options.
 
 With two or more runs, one line per unordered pair of `--run` names, in `--run` order (n1|n2,
 n1|n3, ..., then n2|n3 and so on), compares the runs on the same probes:
@@ -112,6 +112,11 @@ BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 0
 BOOTSTRAP_CONFIDENCE = 0.95
 PAIR_FIELDS = ("tag", "utterance", "gold_id", "gold_type", "produced_id", "produced_type", "kind")
+# The gold files whose pending pairs are never written: (file name prefix, what it is).
+SEALED_GOLD_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("heldout-", "held-out"),
+    ("selection-", "selection"),
+)
 _GUARDED_PACKAGES = frozenset({"scripts", "backend"})
 
 RawRow = dict[str, object]
@@ -398,14 +403,19 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def _pairs_targets(args: argparse.Namespace, runs: dict[str, Path]) -> dict[str, Path]:
-    """Each run's pairs file; refused for a held-out gold and for a file that exists."""
+    """Each run's pairs file; refused for a sealed gold and for a file that exists.
+
+    A held-out or selection gold is never read probe by probe, and a pairs row holds a
+    probe's utterance and ids, so neither gold's pairs are written.
+    """
     if args.pairs_out is None:
         return {}
-    if args.gold.name.startswith("heldout-"):
-        raise UsageError(
-            f"--pairs-out with a held-out gold ({args.gold.name}): held-out pairs are never "
-            "written; nothing was scored"
-        )
+    for prefix, kind in SEALED_GOLD_PREFIXES:
+        if args.gold.name.startswith(prefix):
+            raise UsageError(
+                f"--pairs-out with a {kind} gold ({args.gold.name}, `{prefix}`): {kind} pairs "
+                "are never written; nothing was scored"
+            )
     targets = {name: args.pairs_out / f"{name}.jsonl" for name in runs}
     existing = [str(path) for path in targets.values() if path.exists()]
     if existing:

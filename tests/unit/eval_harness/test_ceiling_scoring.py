@@ -1104,6 +1104,18 @@ def test_a_heldout_gold_with_pairs_out_exits_1_before_any_file_is_written(
     assert "[cand]" not in result.stdout
 
 
+def test_a_selection_gold_with_pairs_out_exits_1_before_any_file_is_written(
+    tmp_path: Path,
+) -> None:
+    files = _aligned_inputs(tmp_path, gold_name="selection-synthetic.jsonl")
+    out = tmp_path / "pairs"
+    result = _run_aligned(files, ["cand"], "--pairs-out", str(out))
+    assert result.returncode == 1
+    assert "selection-" in result.stderr
+    assert not out.exists()
+    assert "[cand]" not in result.stdout
+
+
 def test_an_existing_pairs_file_exits_1_before_scoring(tmp_path: Path) -> None:
     files = _aligned_inputs(tmp_path)
     out = tmp_path / "pairs"
