@@ -41,6 +41,7 @@ quoted words are the rule's `keep_context_words`, in any order.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import inspect
 import re
@@ -53,7 +54,17 @@ from pathlib import Path
 import pytest
 
 from backend.knowledge.extraction import prompts
-from backend.knowledge.ontologies.pack import PRE_LLM, ConventionRule, Pack, load_pack
+from backend.knowledge.ontologies import registry
+from backend.knowledge.ontologies.pack import (
+    ID,
+    PRE_LLM,
+    ConventionRule,
+    ItemFilter,
+    Pack,
+    load_pack,
+)
+from backend.knowledge.ontologies.packs.v1_4_0 import manifest as pack_manifest
+from backend.knowledge.ontologies.packs.v1_4_0.plugins import EVENT_DATE
 
 BASE = "tests.unit.knowledge.ontologies.fixtures.base_pack"
 PET = "tests.unit.knowledge.ontologies.fixtures.pet_pack"
@@ -668,3 +679,150 @@ def test_an_engine_rule_beside_a_pack_rule_is_a_carrier_of_its_own_class(base_co
     )
 
     assert pack_register_problems(pack) == []
+
+
+# ---------------------------------------------------------------------------
+# Every pack the registry lists, and the v1.4.0 pack's own rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("version", registry.available_versions())
+def test_the_register_of_a_pack_the_registry_lists_holds(version: str):
+    pack = registry.get_pack(version)
+
+    assert pack_register_problems(pack) == []
+
+
+@pytest.fixture(scope="module")
+def v1_4_0() -> Pack:
+    """The v1.4.0 pack, as the registry serves it."""
+    return registry.get_pack(pack_manifest.MANIFEST.version)
+
+
+# The first rows of ADR-054's v14 amendment, word for word and in its order, each with the
+# number of the prompt rule that carries it. The amendment records them once, because the
+# label passes began before this guide existed; from this pack on, the pack's guide holds
+# them, and a later task adds a rule's id to a row's Carrier cell, never a word to these.
+_TEAM_EMPLOYER = (
+    "Named teams (N17; Rule 34): each person placed in a named team also `WORKS_AT` the "
+    "employer the utterance names for that team"
+)
+_TEAM_ACQUAINTANCE = (
+    "Durable third-party facts (Rule 19): in a user-scope turn, the user `KNOWS_PERSON` each "
+    "person the utterance places in a named team, whether or not the user is in it, since a "
+    "placement is a durable fact about that person. The user gets no edge to themself"
+)
+_TEAM_PART_OF = (
+    "Named teams (N17; Rule 34): a team's `PART_OF` its employer is not stored. This covers a "
+    "team `Organization` to its employer only; any other `PART_OF` is kept"
+)
+_UNCHECKED_BOX = (
+    "List rules, unchecked box: a `[ ]` item yields no edge, except `HAS_GOAL` when its "
+    "lead-in, or any heading or parent bullet above it, contains one of these goal words, as "
+    "a whole word in any case, singular or plural: goal, objective, resolution, aim, "
+    'aspiration, target, and the phrase "bucket list". An unchecked itinerary item is a plan '
+    "and yields no edge"
+)
+_FIRST_ROWS = {
+    _TEAM_EMPLOYER: "34",
+    _TEAM_ACQUAINTANCE: "19",
+    _TEAM_PART_OF: "34",
+    _UNCHECKED_BOX: "29",
+}
+_FIRST_ROW_IDS = ["team-employer", "team-acquaintance", "team-part-of", "unchecked-box"]
+_GOAL_WORDS = ("goal", "objective", "resolution", "aim", "aspiration", "target", "bucket list")
+_LATE_RULES = "prompt-rules-11-to-37"
+
+
+def test_the_first_rows_of_the_amendment_open_the_table_word_for_word(v1_4_0: Pack):
+    rows = read_register(v1_4_0.labelling).rows
+
+    assert [row.convention for row in rows[: len(_FIRST_ROWS)]] == list(_FIRST_ROWS)
+
+
+@pytest.mark.parametrize(("convention", "rule"), _FIRST_ROWS.items(), ids=_FIRST_ROW_IDS)
+def test_a_first_row_names_the_fragment_that_holds_its_prompt_rule(
+    v1_4_0: Pack, convention: str, rule: str
+):
+    (row,) = (row for row in read_register(v1_4_0.labelling).rows if row.convention == convention)
+
+    assert (rule, _LATE_RULES) in carriers(row.carrier).in_fragments
+
+
+def test_the_labels_of_the_v1_4_0_guide_are_its_twelve_rules_and_six_sections(v1_4_0: Pack):
+    assert read_register(v1_4_0.labelling).labels == (
+        "N2",
+        "The user anchor",
+        "N8",
+        "Durable third-party facts",
+        "N16",
+        "N7",
+        "N17",
+        "Event and metric ids",
+        "N10",
+        "N3",
+        "N5",
+        "N13",
+        "The Abstraction fallback",
+        "N14",
+        "Date entities",
+        "N11",
+        "N12",
+        "Habits and incidental scope",
+    )
+
+
+def test_the_unchecked_box_row_quotes_the_goal_words():
+    assert quoted_words(_UNCHECKED_BOX) == _GOAL_WORDS
+
+
+def _with_goal_filter(pack: Pack, words: tuple[str, ...]) -> Pack:
+    """`pack` with an `item_filter` rule that keeps `words`, named by the unchecked-box row.
+
+    The row's Convention cell stays as the guide has it, and its other two cells are
+    written here, so the case holds whatever rule the guide's own row names.
+    """
+    rule = ConventionRule(
+        id="unchecked-goals",
+        kind="item_filter",
+        phase=PRE_LLM,
+        params=ItemFilter(state="unchecked", keep_context_words=words),
+    )
+    lines = pack.labelling.splitlines()
+    (at,) = (at for at, line in enumerate(lines) if line.startswith(f"| {_UNCHECKED_BOX} |"))
+    lines[at] = (
+        f"| {_UNCHECKED_BOX} | Rule 29 in `{_LATE_RULES}`, and `{rule.id}` "
+        f"| {PROMPT_RULE} and {PRE_LLM_RULE} |"
+    )
+    return dataclasses.replace(pack, rules=(*pack.rules, rule), labelling="\n".join(lines))
+
+
+def test_the_unchecked_box_row_takes_an_item_filter_rule_in_the_form_it_has(v1_4_0: Pack):
+    pack = _with_goal_filter(v1_4_0, _GOAL_WORDS)
+
+    assert pack_register_problems(pack) == []
+
+
+def test_the_unchecked_box_row_fails_a_filter_that_keeps_other_words(v1_4_0: Pack):
+    pack = _with_goal_filter(v1_4_0, (*_GOAL_WORDS[:-1], "wish list"))
+
+    assert pack_register_problems(pack) == [
+        "row `List rules, unchecked box`: quotes the words aim, aspiration, bucket list, goal, "
+        "objective, resolution, target, and `unchecked-goals` keeps aim, aspiration, goal, "
+        "objective, resolution, target, wish list"
+    ]
+
+
+def test_the_event_date_rule_declares_the_id_phase(v1_4_0: Pack):
+    (rule,) = (rule for rule in v1_4_0.rules if rule.id == EVENT_DATE)
+
+    # ADR-054, v14 amendment, point 3: the rule changes an id only, so it is an id rail,
+    # whatever its kind is called, and it stays on when the relation rails are off.
+    assert (rule.kind, rule.phase) == ("derived_edge", ID)
+
+
+def test_the_register_lists_the_event_date_rule_as_an_id_rail(v1_4_0: Pack):
+    rows = [row for row in read_register(v1_4_0.labelling).rows if f"`{EVENT_DATE}`" in row.carrier]
+
+    assert [row.key for row in rows] == ["Event and metric ids"]
+    assert "id rail" in _LIST_BREAK_RE.split(rows[0].classes)
