@@ -176,13 +176,14 @@ class PackRelease:
 # members' `WORKS_AT` and the user's `KNOWS_PERSON` after the model, and again with
 # the `team-part-of` rule, which drops a named team's `PART_OF` its employer, and
 # once more when the plug-in stopped reading a unit's own text, a member's item or a
-# line of prose, and read a team's employer from its heading or lead-in only: a
-# replay each time, with no bump.
+# line of prose, and read a team's employer from its heading or lead-in only, and
+# then when it stopped reading a context line nested below the team's, such as a
+# member's parent item: a replay each time, with no bump.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
     pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
-    pack_rails_hash="1c08415cf78642fc15a69d1badf3e0ebe1ef1fb69edb867094431f99d6be3f28",
+    pack_rails_hash="bc72f2458c8bc3a62a6843a08b0c11262880778912d2e387cdcedffc0582bc3d",
 )
 
 

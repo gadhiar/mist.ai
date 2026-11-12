@@ -200,6 +200,58 @@ def test_a_unit_whose_own_text_names_the_team_and_its_employer_resolves_none(pac
     assert _pairs(relationships, "WORKS_AT") == [("oriana-duarte", "varnholt")]
 
 
+def test_a_members_parent_bullet_under_the_teams_heading_names_none(pack: Pack):
+    # A sub-item's context is the heading, then its parent bullet, outermost first
+    # (`structure_splitter.py:219-223`). The parent bullet nests below the team's line,
+    # so it is the member's, not the team's heading or lead-in.
+    hospital = _entity("brigid-hospital", "Brigid Hospital", "Organization")
+    femi = _entity("femi-achterberg", "Femi Achterberg", "Person")
+    entities = (USER, ROWING, hospital, ODILE, femi)
+    edges = (
+        _edge("odile-brannagh", "saltmarsh-rowing-club", "MEMBER_OF", LIVE),
+        _edge("odile-brannagh", "brigid-hospital", "WORKS_AT", LIVE),
+        _edge("femi-achterberg", "saltmarsh-rowing-club", "MEMBER_OF", LIVE),
+    )
+    heading = ("Saltmarsh rowing club",)
+    parent = (*heading, "Odile Brannagh, a nurse at Brigid Hospital")
+    record = [
+        {
+            "units": [
+                {"text": parent[1], "context": list(heading), "kind": "list_item"},
+                {"text": "rows stroke", "context": list(parent), "kind": "list_item"},
+                {"text": "Femi Achterberg", "context": list(heading), "kind": "list_item"},
+            ],
+            "context": [],
+            "payload": {"entities": [dict(e) for e in entities[1:]], "relationships": []},
+            "finish": "stop",
+        }
+    ]
+
+    _, relationships = _run(pack, entities, edges, batch_record=record)
+
+    assert _pairs(relationships, "WORKS_AT") == [("odile-brannagh", "brigid-hospital")]
+
+
+def test_an_outer_heading_over_the_teams_lead_in_names_its_employer(pack: Pack):
+    brightwater = _entity("brightwater", "Brightwater", "Organization")
+    harrow = _entity("harrow-data-team", "Harrow data team", "Organization")
+    aino = _entity("aino-pelkonen", "Aino Pelkonen", "Person")
+    kofi = _entity("kofi-mensah", "Kofi Mensah", "Person")
+    entities = (USER, brightwater, harrow, aino, kofi)
+    edges = (
+        _edge("aino-pelkonen", "harrow-data-team", "MEMBER_OF", LIVE),
+        _edge("aino-pelkonen", "brightwater", "WORKS_AT", LIVE),
+        _edge("kofi-mensah", "harrow-data-team", "MEMBER_OF", LIVE),
+    )
+    record = [
+        _batch(("Brightwater", "Harrow data team"), ("Aino Pelkonen", "Kofi Mensah"), entities)
+    ]
+
+    _, relationships = _run(pack, entities, edges, batch_record=record)
+
+    assert ("kofi-mensah", "brightwater") in _pairs(relationships, "WORKS_AT")
+
+
 def test_a_line_of_prose_that_names_a_team_and_an_employer_resolves_none(pack: Pack):
     # Pass 1's probe P4: the user works at Varnholt and plays in a circle with Ruairi.
     # Ruairi gains no employer; the user's acquaintance needs none, so it still comes.
@@ -218,7 +270,9 @@ def test_a_line_of_prose_that_names_a_team_and_an_employer_resolves_none(pack: P
     assert _pairs(relationships, "KNOWS_PERSON") == [("user", "ruairi-spelman")]
 
 
-def test_a_lead_in_under_the_teams_heading_resolves_it(pack: Pack):
+def test_a_line_nested_below_the_teams_heading_names_none(pack: Pack):
+    # The record does not mark a lead-in apart from a parent item, so a line below the
+    # deepest line that names the team is read as neither, even one that is a lead-in.
     record = [
         _batch(
             ("Kestrel platform team", "All of them at Varnholt:"),
@@ -229,7 +283,7 @@ def test_a_lead_in_under_the_teams_heading_resolves_it(pack: Pack):
 
     _, relationships = _run(pack, TEAM, TEAM_EDGES, batch_record=record)
 
-    assert ("tomasz-wierzba", "varnholt") in _pairs(relationships, "WORKS_AT")
+    assert _pairs(relationships, "WORKS_AT") == [("oriana-duarte", "varnholt")]
 
 
 def test_a_lead_in_of_the_plans_template_resolves_it_with_no_batch_record(pack: Pack):

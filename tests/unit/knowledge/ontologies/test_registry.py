@@ -286,7 +286,7 @@ def test_the_pack_hashes_to_the_pinned_values(fresh_registry):
 
     assert (pack.pack_prompt_hash, pack.pack_rails_hash) == (
         "944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
-        "1c08415cf78642fc15a69d1badf3e0ebe1ef1fb69edb867094431f99d6be3f28",
+        "bc72f2458c8bc3a62a6843a08b0c11262880778912d2e387cdcedffc0582bc3d",
     )
 
 

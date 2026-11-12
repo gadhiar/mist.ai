@@ -142,15 +142,19 @@ def _holds(batch: Mapping, entity_id: object) -> bool:
 def _team_lines(team: Mapping, row: _Row) -> Iterator[str]:
     """The team's own headings and lead-ins, each slugged; never a unit's own text.
 
-    - From a batch whose own payload holds the team, a unit's context lines, the
-      headings and lead-in it was read under, are the team's when one of them names
-      the team. A unit's own text is never read, prose included: a member's own item
-      names that member's employer, not the team's, and a club whose member works
-      somewhere must not give every member that employer (ADR-054's v14 amendment).
-      The rail only infers, and a wrong `WORKS_AT` would overwrite a stored employer,
-      so a sentence that names a team and an employer together gives none; the
-      model's own `WORKS_AT` still covers it. A batch's own `context`, the earlier
-      units it was shown for reference, is not read.
+    - From a batch whose own payload holds the team, a unit's context lists its
+      headings, then its lead-in lines, then its parent items, outermost first (the
+      splitter's `_context` and `_list_item`). The team's heading or lead-in is that
+      context from the outermost line down to the deepest line that names the team:
+      an outer heading above it, such as the employer's, is read, and a line nested
+      below it, a member's parent item, is never read. A unit's own text is never
+      read either, prose included: a member's own item names that member's employer,
+      not the team's, and a club whose member works somewhere must not give every
+      member that employer (ADR-054's v14 amendment). The rail only infers, and a
+      wrong `WORKS_AT` would overwrite a stored employer, so a sentence that names a
+      team and an employer together gives none; the model's own `WORKS_AT` still
+      covers it. A batch's own `context`, the earlier units it was shown for
+      reference, is not read.
     - A template of the turn plan is the team's when its fixed endpoint is the team or
       its lead-in names the team, and then its lead-in is the team's.
     """
@@ -160,8 +164,9 @@ def _team_lines(team: Mapping, row: _Row) -> Iterator[str]:
             continue
         for unit in batch.get("units") or ():
             context = [canonical_id(str(line)) for line in unit.get("context") or ()]
-            if any(_names(line, team) for line in context):
-                yield from context
+            named = [at for at, line in enumerate(context) if _names(line, team)]
+            if named:
+                yield from context[: named[-1] + 1]
     team_slug = canonical_id(str(team_id or ""))
     for template in (row.turn_plan or {}).get("templates") or ():
         lead_in = canonical_id(str(template.get("lead_in") or ""))
