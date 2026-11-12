@@ -10,7 +10,9 @@ deterministic: the same input or seed gives the same output, run after run.
 import ast
 import dataclasses
 import inspect
+import math
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -20,12 +22,18 @@ import pytest
 from backend.realtime import speech
 from backend.realtime.errors import RealtimeError
 from backend.realtime.lanes import LaneJobCancelled
+from backend.realtime.protocol import Spotter
 from backend.realtime.speech import (
     CancelToken,
+    NameHit,
+    SpotterCalibration,
     SynthChunk,
     TextSegment,
     TranscriptUpdate,
     VoiceInfo,
+    arbitration_key,
+    false_accepts_per_hour,
+    positive_quantile,
 )
 from tests.fakes.scripted_audio import (
     SAMPLE_RATE,
@@ -39,6 +47,7 @@ from tests.fakes.speech import (
     FAKE_VOICE,
     EnergyVad,
     FakeSynthesizer,
+    ScriptedNameSpotter,
     ScriptedTranscriber,
     ScriptedTranscriptStream,
     ScriptedTurnEnd,
@@ -99,9 +108,20 @@ class TestValueTypes:
     def test_the_cloned_voice_reference_is_gone(self):
         assert not hasattr(speech, "VoiceReference")
 
+    def test_name_hit_fields_match_the_interfaces(self):
+        assert _fields(NameHit) == [("end_pos", int), ("keyword", str), ("score", float)]
+
+    def test_spotter_calibration_holds_the_two_tables(self):
+        table = tuple[tuple[float, float], ...]
+
+        assert _fields(SpotterCalibration) == [
+            ("false_accepts", table),
+            ("positive_quantile", table),
+        ]
+
     @pytest.mark.parametrize(
         "cls",
-        [TranscriptUpdate, TextSegment, SynthChunk, VoiceInfo],
+        [TranscriptUpdate, TextSegment, SynthChunk, VoiceInfo, NameHit, SpotterCalibration],
         ids=lambda cls: cls.__name__,
     )
     def test_value_types_are_frozen_and_slotted(self, cls):
@@ -139,6 +159,145 @@ class TestProtocols:
             "voice": VoiceInfo,
         }
         assert _params(speech.SpeechSynthesizer.synthesize) == ["self", "segment", "token"]
+
+    def test_name_spotter_protocols_match_the_interfaces(self):
+        assert speech.NameSpotter.__annotations__ == {
+            "model_id": str,
+            "names": tuple[str, ...],
+            "window_ms": int,
+            "hit_lag_ms": int,
+            "calibration": Mapping[Spotter, SpotterCalibration],
+        }
+        assert _params(speech.NameSpotter.open_stream) == ["self", "threshold"]
+        assert _params(speech.NameSpotter.score_window) == ["self", "pcm"]
+        assert _params(speech.NameSpotterStream.push) == ["self", "pcm", "pos"]
+        assert _params(speech.NameSpotterStream.reset) == ["self"]
+
+    def test_the_scripted_name_spotter_matches_the_protocols(self):
+        spotter = ScriptedNameSpotter([NameHit(end_pos=3, keyword="mist", score=0.9)])
+        stream = spotter.open_stream(0.5)
+
+        hits = stream.push(bytes(640), 3)
+
+        for name in speech.NameSpotter.__annotations__:
+            assert hasattr(spotter, name)
+        assert _params(ScriptedNameSpotter.open_stream) == ["self", "threshold"]
+        assert _params(ScriptedNameSpotter.score_window) == ["self", "pcm"]
+        assert _params(type(stream).push) == ["self", "pcm", "pos"]
+        assert _params(type(stream).reset) == ["self"]
+        assert hits and all(isinstance(hit, NameHit) for hit in hits)
+
+
+# Two points of a table, so a score between them interpolates and one outside clamps.
+TWO_POINTS = ((0.5, 2.0), (0.9, 0.0))
+RISING = ((0.5, 0.2), (0.9, 0.6))
+
+
+class TestCalibrationTables:
+    @pytest.mark.parametrize(
+        ("lookup", "table", "score", "expected"),
+        [
+            pytest.param(false_accepts_per_hour, TWO_POINTS, 0.7, 1.0, id="false-accepts-mid"),
+            pytest.param(false_accepts_per_hour, TWO_POINTS, 0.6, 1.5, id="false-accepts-quarter"),
+            pytest.param(positive_quantile, RISING, 0.7, 0.4, id="quantile-mid"),
+            pytest.param(positive_quantile, RISING, 0.8, 0.5, id="quantile-three-quarters"),
+        ],
+    )
+    def test_a_score_between_two_points_interpolates_linearly(self, lookup, table, score, expected):
+        assert lookup(score, table) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("lookup", "table", "score", "expected"),
+        [
+            pytest.param(false_accepts_per_hour, TWO_POINTS, 0.1, 2.0, id="false-accepts-below"),
+            pytest.param(false_accepts_per_hour, TWO_POINTS, 0.99, 0.0, id="false-accepts-above"),
+            pytest.param(positive_quantile, RISING, 0.1, 0.2, id="quantile-below"),
+            pytest.param(positive_quantile, RISING, 0.99, 0.6, id="quantile-above"),
+        ],
+    )
+    def test_a_score_outside_the_table_clamps_to_the_nearest_end(
+        self, lookup, table, score, expected
+    ):
+        assert lookup(score, table) == expected
+
+    @pytest.mark.parametrize(
+        "lookup",
+        [false_accepts_per_hour, positive_quantile],
+        ids=lambda lookup: lookup.__name__,
+    )
+    def test_an_empty_table_gives_none(self, lookup):
+        assert lookup(0.7, ()) is None
+
+    @pytest.mark.parametrize(
+        "lookup",
+        [false_accepts_per_hour, positive_quantile],
+        ids=lambda lookup: lookup.__name__,
+    )
+    def test_a_score_on_a_table_point_returns_that_point(self, lookup):
+        table = ((0.3, 5.0), (0.6, 1.0), (0.9, 0.5))
+
+        assert lookup(0.6, table) == 1.0
+
+
+# One spotter's calibration: false accepts reach their floor of 0 per hour at 0.8, and the
+# quantile keeps rising past it, as tune positives score above every false accept.
+SERVER_CAL = SpotterCalibration(
+    false_accepts=((0.5, 3.0), (0.8, 0.0)),
+    positive_quantile=((0.5, 0.0), (1.0, 1.0)),
+)
+# A second spotter on a different score scale.
+ENDPOINT_CAL = SpotterCalibration(
+    false_accepts=((0.2, 6.0), (0.6, 0.0)),
+    positive_quantile=((0.2, 0.0), (0.8, 1.0)),
+)
+
+
+class TestArbitrationKey:
+    def test_two_scores_at_the_false_accept_floor_order_by_quantile_higher_first(self):
+        clear = arbitration_key(0.95, 0.5, SERVER_CAL)
+        marginal = arbitration_key(0.65, 0.5, ENDPOINT_CAL)
+
+        ranked = sorted([marginal, clear])
+
+        assert clear[0] == marginal[0] == 0.0
+        assert ranked == [clear, marginal]
+        assert clear == pytest.approx((0.0, 0.1))
+
+    def test_a_lower_false_accept_estimate_wins_whatever_the_quantiles(self):
+        # The first has the lower quantile but the lower false-accept estimate.
+        cal = SpotterCalibration(
+            false_accepts=((0.5, 4.0), (0.9, 1.0)),
+            positive_quantile=((0.5, 0.0), (0.9, 0.1)),
+        )
+        steep = SpotterCalibration(
+            false_accepts=((0.5, 4.0), (0.9, 2.0)),
+            positive_quantile=((0.5, 0.9), (0.9, 1.0)),
+        )
+        fewer = arbitration_key(0.9, 0.5, cal)
+        more = arbitration_key(0.9, 0.5, steep)
+
+        assert fewer < more
+        assert fewer[1] > more[1]
+
+    def test_any_calibrated_key_sorts_before_any_uncalibrated_one(self):
+        # The calibrated candidate is weak; the uncalibrated one has a large margin.
+        weak = arbitration_key(0.5, 0.5, SERVER_CAL)
+        strong_uncalibrated = arbitration_key(1.0, 0.1, None)
+
+        assert weak < strong_uncalibrated
+        assert strong_uncalibrated[0] == math.inf
+
+    def test_a_calibration_with_an_empty_table_is_uncalibrated(self):
+        partial = SpotterCalibration(false_accepts=((0.5, 1.0),), positive_quantile=())
+
+        assert arbitration_key(0.8, 0.5, partial) == arbitration_key(0.8, 0.5, None)
+
+    def test_two_uncalibrated_keys_order_by_margin_larger_first(self):
+        wide = arbitration_key(0.9, 0.5, None)
+        narrow = arbitration_key(0.7, 0.6, None)
+
+        assert sorted([narrow, wide]) == [wide, narrow]
+        assert wide == pytest.approx((math.inf, -0.4))
 
 
 class TestCancelToken:
@@ -448,3 +607,104 @@ class TestFakeSynthesizer:
             list(synthesizer.synthesize(segment, CancelToken()))
 
         assert synthesizer.segments == segments
+
+
+FRAME = bytes(640)
+"""One 20 ms PCM16 frame of silence at 16 kHz."""
+
+
+class TestScriptedNameSpotter:
+    def test_a_hit_is_returned_at_its_end_position_and_nowhere_else(self):
+        hit = NameHit(end_pos=4, keyword="mist", score=0.8)
+        stream = ScriptedNameSpotter([hit]).open_stream(0.5)
+
+        results = [stream.push(FRAME, pos) for pos in range(7)]
+
+        assert results == [[], [], [], [], [hit], [], []]
+
+    def test_a_hit_at_the_threshold_counts_and_one_below_it_does_not(self):
+        at = NameHit(end_pos=2, keyword="mist", score=0.5)
+        below = NameHit(end_pos=3, keyword="mist", score=0.49)
+        stream = ScriptedNameSpotter([at, below]).open_stream(0.5)
+
+        assert stream.push(FRAME, 2) == [at]
+        assert stream.push(FRAME, 3) == []
+
+    def test_the_threshold_is_the_streams_own(self):
+        hit = NameHit(end_pos=1, keyword="mist", score=0.6)
+        spotter = ScriptedNameSpotter([hit])
+        strict = spotter.open_stream(0.7)
+        lenient = spotter.open_stream(0.3)
+
+        assert strict.push(FRAME, 1) == []
+        assert lenient.push(FRAME, 1) == [hit]
+
+    def test_hit_lag_and_calibration_default_to_zero_and_empty(self):
+        spotter = ScriptedNameSpotter([])
+
+        assert spotter.hit_lag_ms == 0
+        assert dict(spotter.calibration) == {}
+
+    def test_hit_lag_and_calibration_are_constructor_arguments(self):
+        calibration = {"server": SERVER_CAL}
+
+        spotter = ScriptedNameSpotter([], hit_lag_ms=240, calibration=calibration)
+
+        assert spotter.hit_lag_ms == 240
+        assert dict(spotter.calibration) == calibration
+
+    def test_score_window_returns_the_score_scripted_for_a_marker_in_the_buffer(self):
+        marker = b"NAME-MARKER"
+        spotter = ScriptedNameSpotter([], markers={marker: 0.83})
+        buffer = FRAME * 3 + marker + FRAME * 2
+
+        assert spotter.score_window(buffer) == 0.83
+
+    def test_score_window_without_a_marker_returns_zero(self):
+        spotter = ScriptedNameSpotter([], markers={b"NAME-MARKER": 0.83})
+
+        assert spotter.score_window(FRAME * 10) == 0.0
+
+    def test_score_window_with_two_markers_returns_the_higher_score(self):
+        spotter = ScriptedNameSpotter([], markers={b"FAINT": 0.3, b"CLEAR": 0.9})
+
+        assert spotter.score_window(b"FAINT" + FRAME + b"CLEAR") == 0.9
+
+    def test_an_empty_marker_is_refused(self):
+        with pytest.raises(ValueError, match="marker"):
+            ScriptedNameSpotter([], markers={b"": 0.5})
+
+    def test_a_hit_already_reported_in_a_context_is_not_reported_again(self):
+        hit = NameHit(end_pos=5, keyword="mist", score=0.9)
+        stream = ScriptedNameSpotter([hit]).open_stream(0.5)
+
+        first = stream.push(FRAME, 5)
+        replayed = stream.push(FRAME, 5)
+
+        assert first == [hit]
+        assert replayed == []
+
+    def test_reset_forgets_partial_context(self):
+        hit = NameHit(end_pos=5, keyword="mist", score=0.9)
+        stream = ScriptedNameSpotter([hit]).open_stream(0.5)
+        for pos in range(3, 6):
+            stream.push(FRAME, pos)
+
+        stream.reset()
+
+        assert stream.context == []
+        assert stream.resets == 1
+        assert stream.push(FRAME, 5) == [hit]
+        assert stream.context == [5]
+
+    def test_the_spotter_records_its_streams_and_scored_buffers(self):
+        spotter = ScriptedNameSpotter([])
+
+        stream = spotter.open_stream(0.4)
+        spotter.score_window(FRAME * 2)
+        stream.push(FRAME, 0)
+
+        assert spotter.streams == [stream]
+        assert stream.threshold == 0.4
+        assert spotter.scored == [len(FRAME) * 2]
+        assert stream.pushed == [0]

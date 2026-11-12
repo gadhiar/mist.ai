@@ -8,12 +8,16 @@ the GPU and the CPU by configuration alone. Every engine call is blocking and ru
 already running there.
 """
 
+import bisect
+import math
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import numpy as np
+
+from .protocol import Spotter
 
 Phase = Literal["idle", "held", "thinking", "speaking", "text"]
 """The turn controller's phase, which the barge-in policy reads to judge user speech."""
@@ -176,3 +180,126 @@ class SpeechSynthesizer(Protocol):
     def synthesize(self, segment: TextSegment, token: CancelToken) -> Iterator[SynthChunk]:
         """Synthesize one segment, checking the token before each chunk."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class NameHit:
+    """A name spotter's score crossed its threshold on a rising edge.
+
+    `end_pos` is an uplink position, a count of 20 ms frames: the position of the last frame of
+    the hop whose score crossed, so ingress can find where the name was said from it. `keyword`
+    is the name the model scored and `score` the crossing score, on that model's own scale.
+    """
+
+    end_pos: int
+    keyword: str
+    score: float
+
+
+class NameSpotterStream(Protocol):
+    """One audio source's spotting state: the feature window and the refractory period."""
+
+    def push(self, pcm: bytes, pos: int) -> list[NameHit]:
+        """Score one 20 ms frame of PCM16 mono 16 kHz audio at uplink position `pos`.
+
+        Returns the hits whose hop ended on this frame, usually none.
+        """
+        ...
+
+    def reset(self) -> None:
+        """Forget the partial context, so the next push starts a new one."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class SpotterCalibration:
+    """One spotter's score scale, mapped onto two scales every spotter shares.
+
+    Scores from different models are not comparable, so arbitration between a server hit and an
+    endpoint wake ranks them on these instead. Both tables are `(score, value)` points with
+    ascending scores, measured on the tuning split. `false_accepts` maps a score to the
+    estimated false accepts per hour of tuning media at that score, made monotone, so its rates
+    do not increase.
+    `positive_quantile` maps a score to the share, from 0 to 1, of the tuning positives that
+    scored at or below it, so its shares do not decrease.
+    """
+
+    false_accepts: tuple[tuple[float, float], ...]
+    positive_quantile: tuple[tuple[float, float], ...]
+
+
+class NameSpotter(Protocol):
+    """A model trained to spot MIST's names, shared by sessions; CPU-only.
+
+    `window_ms` is the audio one score looks at. `hit_lag_ms` is the typical delay from the
+    name's end to the hit, from the model's manifest, which is how `wake_screen_ms` estimates
+    when the name ended. `calibration` holds each spotter's tables from the tuning pass; a
+    spotter with no entry is uncalibrated, and its events rank by margin below every calibrated
+    one (`arbitration_key`).
+    """
+
+    model_id: str
+    names: tuple[str, ...]
+    window_ms: int
+    hit_lag_ms: int
+    calibration: Mapping[Spotter, SpotterCalibration]
+
+    def open_stream(self, threshold: float) -> NameSpotterStream:
+        """Open a stream with fresh context that reports scores at or above `threshold`."""
+        ...
+
+    def score_window(self, pcm: bytes) -> float:
+        """The highest score over a finished buffer of PCM16 mono 16 kHz audio."""
+        ...
+
+
+def _interpolate(score: float, table: tuple[tuple[float, float], ...]) -> float | None:
+    if not table:
+        return None
+    if score <= table[0][0]:
+        return table[0][1]
+    if score >= table[-1][0]:
+        return table[-1][1]
+    # The first point at or above the score; the one before it lies strictly below, so the two
+    # scores differ and the division is safe.
+    upper = bisect.bisect_left(table, score, key=lambda point: point[0])
+    (x0, y0), (x1, y1) = table[upper - 1], table[upper]
+    return y0 + (y1 - y0) * (score - x0) / (x1 - x0)
+
+
+def false_accepts_per_hour(score: float, table: tuple[tuple[float, float], ...]) -> float | None:
+    """Estimated false accepts per hour at `score`, read from a `false_accepts` table.
+
+    Interpolates linearly between the two points around the score and clamps to the table's
+    first or last value outside it, so a score above every tuning false accept reads the
+    table's floor. None for an empty table.
+    """
+    return _interpolate(score, table)
+
+
+def positive_quantile(score: float, table: tuple[tuple[float, float], ...]) -> float | None:
+    """The share, from 0 to 1, of tuning positives scoring at or below `score`.
+
+    Interpolates and clamps as `false_accepts_per_hour` does. None for an empty table.
+    """
+    return _interpolate(score, table)
+
+
+def arbitration_key(
+    score: float, threshold: float, cal: SpotterCalibration | None
+) -> tuple[float, float]:
+    """The key that ranks wake candidates from different spotters; the lowest key wins.
+
+    Calibrated (both tables present): `(false accepts per hour, 1 - positive quantile)`. A real
+    wake usually scores above every false accept in the tuning media, so two candidates often
+    tie at the false-accept floor, and the quantile then separates a clear wake from a marginal
+    one. Uncalibrated: `(inf, -(score - threshold))`, so every calibrated candidate outranks it
+    and two uncalibrated ones fall back to their margin. Ties after the key go to arrival order,
+    which the caller applies.
+    """
+    if cal is not None:
+        rate = false_accepts_per_hour(score, cal.false_accepts)
+        share = positive_quantile(score, cal.positive_quantile)
+        if rate is not None and share is not None:
+            return (rate, 1.0 - share)
+    return (math.inf, -(score - threshold))

@@ -1,8 +1,8 @@
 """Deterministic speech engines implementing the protocols in `backend/realtime/speech.py`.
 
 Every realtime test runs against these instead of real models: `EnergyVad` scores loudness,
-`ScriptedTranscriber` returns scripted text, `ScriptedTurnEnd` returns scripted probabilities and
-`FakeSynthesizer` emits tones. Each records what it was given, so a test asserts on what reached
+`ScriptedTranscriber` returns scripted text, `ScriptedTurnEnd` returns scripted probabilities,
+`FakeSynthesizer` emits tones and `ScriptedNameSpotter` hears the names where a test scripts them. Each records what it was given, so a test asserts on what reached
 the engine, and none depends on time or randomness. The classes are plain and unslotted so a
 test can subclass or wrap one to observe or delay a call.
 """
@@ -10,15 +10,18 @@ test can subclass or wrap one to observe or delay a call.
 import math
 import time
 import zlib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
 from backend.realtime.errors import RealtimeError
 from backend.realtime.lanes import LaneJobCancelled
+from backend.realtime.protocol import Spotter
 from backend.realtime.speech import (
     CancelToken,
+    NameHit,
+    SpotterCalibration,
     SynthChunk,
     TextSegment,
     TranscriptUpdate,
@@ -258,3 +261,77 @@ class FakeSynthesizer:
             tone = 0.3 * np.sin(2 * math.pi * frequency * t)
             pcm16 = (tone * 32767).astype("<i2").tobytes()
             yield SynthChunk(pcm16=pcm16, samples=count, segment=segment)
+
+
+class ScriptedNameSpotterStream:
+    """Returns each scripted hit at its `end_pos`, when its score reaches the stream's threshold.
+
+    The partial context is the positions pushed since the last `reset`. A hit is reported once
+    per context, as a spotter's refractory period reports a name once, so a frame pushed again in
+    the same context gives no second hit, and after a `reset` it does.
+    """
+
+    def __init__(self, hits: Sequence[NameHit], threshold: float) -> None:
+        self.hits = hits
+        self.threshold = threshold
+        self.pushed: list[int] = []
+        self.context: list[int] = []
+        self.resets = 0
+        self._reported: set[int] = set()
+
+    def push(self, pcm: bytes, pos: int) -> list[NameHit]:
+        self.pushed.append(pos)
+        self.context.append(pos)
+        found: list[NameHit] = []
+        for index, hit in enumerate(self.hits):
+            if hit.end_pos == pos and hit.score >= self.threshold and index not in self._reported:
+                self._reported.add(index)
+                found.append(hit)
+        return found
+
+    def reset(self) -> None:
+        self.context = []
+        self._reported = set()
+        self.resets += 1
+
+
+class ScriptedNameSpotter:
+    """A name spotter that hears the names where the test says, and nowhere else.
+
+    `hits` script what streams report, by uplink position. `markers` script `score_window`: a
+    buffer holding a marker byte pattern scores that marker's score, the highest when it holds
+    several, and 0.0 when it holds none, which is how a test scripts media that says the name.
+    """
+
+    def __init__(
+        self,
+        hits: Sequence[NameHit] = (),
+        *,
+        markers: Mapping[bytes, float] | None = None,
+        model_id: str = "scripted-kws",
+        names: tuple[str, ...] = ("mist",),
+        window_ms: int = 1280,
+        hit_lag_ms: int = 0,
+        calibration: Mapping[Spotter, SpotterCalibration] | None = None,
+    ) -> None:
+        scripted = dict(markers or {})
+        if b"" in scripted:
+            raise ValueError("ScriptedNameSpotter: an empty marker would match every buffer")
+        self.hits = list(hits)
+        self.markers = scripted
+        self.model_id = model_id
+        self.names = names
+        self.window_ms = window_ms
+        self.hit_lag_ms = hit_lag_ms
+        self.calibration: Mapping[Spotter, SpotterCalibration] = dict(calibration or {})
+        self.streams: list[ScriptedNameSpotterStream] = []
+        self.scored: list[int] = []
+
+    def open_stream(self, threshold: float) -> ScriptedNameSpotterStream:
+        stream = ScriptedNameSpotterStream(self.hits, threshold)
+        self.streams.append(stream)
+        return stream
+
+    def score_window(self, pcm: bytes) -> float:
+        self.scored.append(len(pcm))
+        return max((score for marker, score in self.markers.items() if marker in pcm), default=0.0)
