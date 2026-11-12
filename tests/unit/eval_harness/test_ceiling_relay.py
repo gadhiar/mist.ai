@@ -392,6 +392,141 @@ def test_an_unclassified_body_is_refused_and_logged_without_a_kind() -> None:
     assert entry.answered is False
 
 
+# ---------------------------------------------------------------------------
+# Streamed replies, as llama-server's OpenAI-compatible route sends them
+# ---------------------------------------------------------------------------
+
+
+async def _streamed_call(provider: LlamaServerProvider, request: LLMRequest) -> LLMResponse:
+    """One streamed call read as the engine reads it: the partials joined, the final's rest."""
+    parts: list[str] = []
+    finals: list[LLMResponse] = []
+    async for chunk in provider.generate(request, stream=True):
+        if chunk.partial:
+            parts.append(chunk.content or "")
+        else:
+            finals.append(chunk)
+    (final,) = finals
+    return final.model_copy(update={"content": "".join(parts)})
+
+
+def _events(reply: httpx.Response) -> list[str]:
+    """The `data:` payloads of a server-sent event stream, in order."""
+    return [
+        line.removeprefix("data: ") for line in reply.text.split("\n") if line.startswith("data: ")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_answer_gives_the_single_reply_text_with_finish_reason_stop() -> None:
+    request = _extract_request()
+    answer = {
+        "entities": [{"id": "e1", "type": "Place", "name": "café"}],
+        "relationships": [{"source": "user", "predicate": "VISITS", "target": "e1"}],
+    }
+
+    # Learn the streamed request's key from the relay itself, as the stored-answer test does.
+    probe_log = rl.RelayLog()
+    with (
+        rl.running_relay(rl.build_relay({}, probe_log)) as base_url,
+        pytest.raises(openai.APIError),
+    ):
+        await _streamed_call(LlamaServerProvider(base_url=base_url, model=MODEL), request)
+    (pending,) = probe_log.entries()
+    assert pending.kind == "extract"
+    assert pending.body["stream"] is True
+    assert pending.body["stream_options"] == {"include_usage": True}
+
+    log = rl.RelayLog()
+    with rl.running_relay(rl.build_relay({pending.key: answer}, log)) as base_url:
+        streamed = await _streamed_call(
+            LlamaServerProvider(base_url=base_url, model=MODEL), request
+        )
+
+    assert streamed.finish_reason == "stop"
+    assert streamed.content == served_text(answer)
+    assert GptOssAdapter().final_text(streamed) == served_text(answer)
+    assert json.loads(GptOssAdapter().final_text(streamed)) == answer
+    assert streamed.usage is not None
+    assert [e.answered for e in log.entries()] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_pending_key_asked_for_as_a_stream_gives_one_400_and_no_sdk_retry() -> None:
+    log = rl.RelayLog()
+    with rl.running_relay(rl.build_relay({}, log)) as base_url:
+        provider = LlamaServerProvider(base_url=base_url, model=MODEL)
+        with pytest.raises(openai.APIError) as caught:
+            await _streamed_call(provider, _extract_request())
+
+    assert isinstance(caught.value, openai.APIStatusError)
+    assert caught.value.status_code == 400
+    (entry,) = log.entries()
+    assert entry.answered is False
+    assert entry.body["stream"] is True
+    assert caught.value.body == {
+        "code": 400,
+        "type": "relay_pending",
+        "message": f"pending {entry.key}",
+    }
+
+
+@pytest.mark.parametrize("include_usage", [True, False, None], ids=["usage", "no-usage", "unset"])
+def test_a_streamed_reply_has_the_llama_server_event_shape(include_usage: bool | None) -> None:
+    body = {**_body(), "stream": True}
+    if include_usage is not None:
+        body["stream_options"] = {"include_usage": include_usage}
+    key = rl.request_key(body)
+    answer = {"entities": [], "relationships": []}
+    with rl.running_relay(rl.build_relay({key: answer}, rl.RelayLog())) as base_url:
+        reply = httpx.post(f"{base_url}/v1/chat/completions", json=body)
+
+    assert reply.status_code == 200
+    assert reply.headers["content-type"].startswith("text/event-stream")
+    *chunks, done = _events(reply)
+    assert done == "[DONE]"
+    parsed = [json.loads(c) for c in chunks]
+    head = {
+        "id": f"chatcmpl-relay-{key[:12]}",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": MODEL,
+    }
+    expected = [
+        {
+            **head,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": served_text(answer)},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {**head, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    if include_usage:
+        expected.append(
+            {
+                **head,
+                "choices": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
+    assert parsed == expected
+
+
+def test_a_body_with_stream_false_gets_the_single_completion() -> None:
+    body = _body()
+    assert body["stream"] is False
+    key = rl.request_key(body)
+    with rl.running_relay(rl.build_relay({key: {"x": 1}}, rl.RelayLog())) as base_url:
+        reply = httpx.post(f"{base_url}/v1/chat/completions", json=body)
+
+    assert reply.headers["content-type"].startswith("application/json")
+    assert reply.json()["object"] == "chat.completion"
+
+
 def test_the_relay_listens_on_loopback_only() -> None:
     with rl.running_relay(rl.build_relay({}, rl.RelayLog())) as base_url:
         assert base_url.startswith("http://127.0.0.1:")
