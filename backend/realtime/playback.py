@@ -91,9 +91,7 @@ class TurnLane:
         self, max_items: int = 2048, lock: AbstractContextManager[object] | None = None
     ) -> None:
         self._max_items = max_items
-        self._lock: AbstractContextManager[object] = (
-            lock if lock is not None else threading.Lock()
-        )
+        self._lock: AbstractContextManager[object] = lock if lock is not None else threading.Lock()
         self._items: deque[_LaneEntry] = deque()
 
     def put(
@@ -162,7 +160,8 @@ class TurnLane:
 
 class TurnSink(Protocol):
     """Where the pacer queues a tag's frames: the session's `TurnLane`, or T11's sink in front
-    of it, which keeps frames back during a hold and returns False for them."""
+    of it, which keeps frames back during a hold and returns False for them.
+    """
 
     def put(
         self,
@@ -189,7 +188,8 @@ class PlaybackListener(Protocol):
 
     def stream_ending(self, audio_tag: int, last_sample: int) -> None:
         """The tag's terminal frame is next; `last_sample` is the offset just past its last
-        sample, so 0 for a tag that carried no frame."""
+        sample, so 0 for a tag that carried no frame.
+        """
         ...
 
 
@@ -614,7 +614,8 @@ class PlaybackPacer:
 
     def scheduled_play_ms(self, sample: int) -> int:
         """When `sample` of the tag's stream is scheduled to play, from the client's progress
-        or, without any, the ledger's estimate (T27's `scene_anchor_lead_ms` reads it)."""
+        or, without any, the ledger's estimate (T27's `scene_anchor_lead_ms` reads it).
+        """
         return self._ledger.scheduled_play_ms(sample)
 
     def stop(self, terminal_purged: bool, *, reason: str = "interrupt") -> None:

@@ -60,7 +60,9 @@ class TestHandlerTokenShapes:
     ):
         segmenter = SpeechSegmenter(SegmenterConfig())
 
-        segments = segmenter.feed("Here is the first sentence of the reply, which runs long.", False)
+        segments = segmenter.feed(
+            "Here is the first sentence of the reply, which runs long.", False
+        )
 
         assert segments == [
             SpeechSegment(0, TextSegment("Here is the first sentence of the reply,", 0, 40)),
@@ -159,7 +161,9 @@ class TestMaxSegmentChars:
         ]
 
     def test_a_long_segment_without_a_clause_boundary_is_split_at_the_last_whitespace(self):
-        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10, max_segment_chars=30))
+        segmenter = SpeechSegmenter(
+            SegmenterConfig(first_segment_min_chars=10, max_segment_chars=30)
+        )
 
         segments = segmenter.feed("alpha bravo charlie delta echo foxtrot golf hotel", False)
         segments += segmenter.flush()
@@ -167,14 +171,18 @@ class TestMaxSegmentChars:
         assert _texts(segments) == ["alpha bravo charlie delta echo", "foxtrot golf hotel"]
 
     def test_text_past_the_cap_is_cut_before_its_sentence_ends(self):
-        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10, max_segment_chars=30))
+        segmenter = SpeechSegmenter(
+            SegmenterConfig(first_segment_min_chars=10, max_segment_chars=30)
+        )
 
         segments = segmenter.feed("alpha bravo charlie delta echo foxtrot", False)
 
         assert _texts(segments) == ["alpha bravo charlie delta echo"]
 
     def test_a_word_longer_than_the_cap_is_cut_at_the_cap(self):
-        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10, max_segment_chars=10))
+        segmenter = SpeechSegmenter(
+            SegmenterConfig(first_segment_min_chars=10, max_segment_chars=10)
+        )
 
         segments = segmenter.feed("abcdefghijklmnopqrstuvwxyz", False) + segmenter.flush()
 
