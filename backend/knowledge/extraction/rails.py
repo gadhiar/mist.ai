@@ -18,12 +18,12 @@ The phases run in a fixed order, each a separate step:
    wrote, because the endpoints still name those.
 3. id: each entity's stored id is built, the endpoints are remapped to it, and the id
    form of `derived_edge` renames an entity from the node its edge points at. An id
-   of a type no `id_exempt` rule names first loses the context its batch was read
-   under, when the batch record names one (`_own_contexts`), the context names no
-   entity of the payload, and neither what is left nor the id the id rules after it
-   would build from it is the user anchor's id or a reserved name or id
-   (`_strip_own_contexts`), so those rules read that entity's own id. An exempt
-   type's id keeps its context.
+   of a type no `id_exempt` rule names first loses the context its batch, or the
+   batch of a spelling merged into it, was read under, when the batch record names
+   one (`_own_contexts`), the context names no entity of the payload, and neither what
+   is left nor the id the id rules after it would build from it is the user anchor's
+   id or a reserved name or id (`_strip_own_contexts`), so those rules read that
+   entity's own id. An exempt type's id keeps its context.
 4. fallback: an entity whose type the pack does not define takes the manifest's
    fallback type.
 
@@ -770,7 +770,9 @@ def _relation_phase(state: _State, pack: Pack) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _own_contexts(batch_record: Sequence[Mapping]) -> dict[str, tuple[str, ...]]:
+def _own_contexts(
+    batch_record: Sequence[Mapping], merged: Mapping[str, str]
+) -> dict[str, tuple[str, ...]]:
     """The context slugs each written id may lose from its start, longest first.
 
     A list item is extracted with the headings, the lead-in and the parent items above
@@ -781,6 +783,10 @@ def _own_contexts(batch_record: Sequence[Mapping]) -> dict[str, tuple[str, ...]]
     - an entity may lose a context line of any unit of a batch whose own payload holds
       the entity's `id` as the model wrote it. Which unit of the batch the entity came
       from is not recorded, so every unit's lines are offered, each line on its own;
+    - a batch holds the entity kept for each id the near-duplicate merge dropped
+      (`merged`, the dropped written id to the kept one), as `_plan_groups` reads it.
+      The kept entity is offered the lines of every batch that held either spelling,
+      so the lines it may lose do not depend on which spelling the merge kept;
     - an entity several batches hold is offered the lines of all of them;
     - a batch that does not hold the entity offers it nothing, and neither does an
       entry's own `context` list, the earlier units the call was shown for reference;
@@ -796,15 +802,25 @@ def _own_contexts(batch_record: Sequence[Mapping]) -> dict[str, tuple[str, ...]]
     two compare as written: a line that opens with a leading word keeps it.
 
     A second run of the runner over its own output, with the same record, gives the
-    same ids for most rows and not for all. Two shapes differ:
+    same ids for most rows and not for all. Three shapes differ:
 
     - the lookup is by the id the model wrote, so a stored id that equals an id another
       batch holds is offered that batch's lines on the second run;
     - a line is kept when it names an entity of the payload, by the id the model wrote.
       Where the pack stores that entity under another id (an alias), the second run's
-      payload holds no entity the line names, and the strip goes through.
+      payload holds no entity the line names, and the strip goes through;
+    - a line offered through the merge, from a batch that held only the dropped
+      spelling, is not offered on the second run, whose payload holds no dropped
+      spelling. A longer such line that refused the strip on the first run, and ended
+      it, is gone, and a shorter line then strips: `redis-cluster-nodes`, offered
+      `redis-cluster` through the merge where `redis-cluster` is an entity of the row,
+      is kept whole on the first run and loses `redis` on the second.
 
     A replay starts from the cache row, never from stored output.
+
+    Args:
+        batch_record: The row's batch record.
+        merged: The near-duplicate merge's map, each dropped written id to the kept one.
     """
     offered: dict[str, set[str]] = {}
     for batch in batch_record:
@@ -817,7 +833,7 @@ def _own_contexts(batch_record: Sequence[Mapping]) -> dict[str, tuple[str, ...]]
         for entity in payload.get("entities") or ():
             written = entity.get("id")
             if isinstance(written, str):
-                offered.setdefault(written, set()).update(slugs)
+                offered.setdefault(merged.get(written, written), set()).update(slugs)
     return {
         written: tuple(sorted(slugs - {""}, key=lambda slug: (-len(slug), slug)))
         for written, slugs in offered.items()
@@ -1048,7 +1064,7 @@ def _remap_endpoints(relationships: list[dict], id_map: Mapping) -> None:
 
 def _id_phase(state: _State, pack: Pack) -> None:
     id_map: dict = {}
-    own_contexts = _own_contexts(state.row.batch_record)
+    own_contexts = _own_contexts(state.row.batch_record, state.merged)
     for entity in state.entities:
         written = entity.get("id", "")
         stored = state.settled.get(id(entity))
