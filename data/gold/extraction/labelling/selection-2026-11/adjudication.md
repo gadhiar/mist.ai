@@ -38,13 +38,13 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 
 - Pass A: took the proper name as the project and read 'route planner' as its kind.
 - Pass B: kept the utterance's noun phrase for the project whole.
-- Ruling: N1 and N4: 'Lanternfish' only modifies 'route planner', and the project is the route planner, so its id is the utterance's whole phrase; the DEPENDS_ON edges follow that id. The USED_FOR edges stand as both passes wrote them.
-- `lanternfish DEPENDS_ON cassandra` (pass A only): dropped, pass B held.
-- `lanternfish DEPENDS_ON ktor` (pass A only): dropped, pass B held.
-- `lanternfish DEPENDS_ON nats` (pass A only): dropped, pass B held.
-- `lanternfish-route-planner DEPENDS_ON cassandra` (pass B only): kept, pass B held.
-- `lanternfish-route-planner DEPENDS_ON ktor` (pass B only): kept, pass B held.
-- `lanternfish-route-planner DEPENDS_ON nats` (pass B only): kept, pass B held.
+- Ruling: N14: a proper name before a kind noun ('a Pinecil soldering iron') is the named thing, and the kind is not part of its name; 'Lanternfish' is the planner's own name, not another entity's, so N4 does not apply. The id is the name, and a Project takes no IS_A to the kind. The DEPENDS_ON edges follow that id; the USED_FOR edges stand as both passes wrote them.
+- `lanternfish DEPENDS_ON cassandra` (pass A only): kept, pass A held.
+- `lanternfish DEPENDS_ON ktor` (pass A only): kept, pass A held.
+- `lanternfish DEPENDS_ON nats` (pass A only): kept, pass A held.
+- `lanternfish-route-planner DEPENDS_ON cassandra` (pass B only): dropped, pass A held.
+- `lanternfish-route-planner DEPENDS_ON ktor` (pass B only): dropped, pass A held.
+- `lanternfish-route-planner DEPENDS_ON nats` (pass B only): dropped, pass A held.
 
 ### sel-006-list-ref-first-broker (F1 0.80)
 
@@ -479,9 +479,9 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 
 ### sel-115-multi-grid-scientist-utrecht (F1 0.75)
 
-- Ruling: N1 and N4: 'Gridcast' only modifies 'forecast' here, and what the user owns is the forecast, so its id is the whole phrase.
-- `user WORKS_ON gridcast` (pass A only): dropped, pass B held.
-- `user WORKS_ON gridcast-forecast` (pass B only): kept, pass B held.
+- Ruling: N14 as in the route planner probe: 'Gridcast' is the forecast's own name, not another entity's (N4), so the id is the name and the Project takes no IS_A.
+- `user WORKS_ON gridcast` (pass A only): kept, pass A held.
+- `user WORKS_ON gridcast-forecast` (pass B only): dropped, pass A held.
 
 ### sel-118-list-dash-game-made-with (F1 0.77)
 
@@ -516,10 +516,198 @@ measured first, before any ruling, and is recorded in `agreement.json`.
 - `pixelorama IS_A art-tool` attributes differ: the IS_A edges are flagged beyond the prompt (N14), and 'last week' resolves to 2026-06 at the precision a week allows, valid_from on the use (Date entities), pass B held.
 - `user USES aseprite` attributes differ: the IS_A edges are flagged beyond the prompt (N14), and 'last week' resolves to 2026-06 at the precision a week allows, valid_from on the use (Date entities), pass B held.
 
+### sel-126-list-plus-studio-rituals (F1 0.67)
+
+- Ruling: N1 as in the river outing: 'round Kelvingrove' scopes the habit, so the shorter run names it.
+- `user HAS_HABIT walk` (pass A only): kept, pass A held.
+- `user HAS_HABIT walk-round-kelvingrove` (pass B only): dropped, pass A held.
+- Entities: habits are recurring activities, Concepts (A), as Example 24's habit is.
+
+### sel-127-list-checkbox-demo-aims (F1 0.80)
+
+- Ruling: The lead-in names the demo the aims are for, and a lead-in that names a project is an entity (List rules); the user's aims for it make it the user's work, WORKS_ON. 'Tidewrack' names another entity, the game, so the demo keeps the whole phrase (N4).
+- `user WORKS_ON tidewrack-demo` (pass B only): kept, pass B held.
+
+### sel-130-list-paren-studio-calendar (F1 0.77)
+
+- Ruling: The showcase and the wedding are on the user's calendar, events the user takes part in (Event rule; the wedding is also the named person's own, N7). The demo freeze is milestone-class, like the deadlines elsewhere in this set, so it gets OCCURRED_ON and no user EXPERIENCED.
+- `user EXPERIENCED clydeside-showcase-2026-09-12` (pass A only): kept, pass A held.
+- `user EXPERIENCED demo-freeze-2026-08-14` (pass A only): dropped, pass B held.
+- `user EXPERIENCED torquil-wedding-2026-10-03` (pass A only): kept, pass A held.
+
+### sel-131-list-dot-how-projects-run (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: how the user likes a project run is a workflow preference, the Preference type's own test, so Preference holds (B, N6).
+
+### sel-135-list-long-skills-for-first-game (F1 1.00)
+
+- Ruling: Types only; the relations are agreed.
+- Entities: every item is a competency the user picked up, typed Skill like the other nine (B).
+
+### sel-139-temporal-launch-start-demo (F1 0.67)
+
+- Ruling: Event rule: the id is the utterance's own phrase for the event, 'Lampblack launched', with its single day appended; the game's name alone names the game, not its launch.
+- `lampblack-2024-11-07 OCCURRED_ON 2024-11-07` (pass A only): dropped, pass B held.
+- `lampblack-launched-2024-11-07 OCCURRED_ON 2024-11-07` (pass B only): kept, pass B held.
+
+### sel-140-coref-borrowed-handheld (F1 0.57, adjudicated whole)
+
+- Pass A: read the loan as the user's current use of the device.
+- Pass B: read each friend's device as that friend's use.
+- Ruling: The loan for the port states that the user uses the device now. The friends' devices are stated as possessions, not uses, and no extractable predicate carries ownership, so they get no edge; the anchors are agreed.
+- `ailsa USES steam-deck` (pass B only): dropped, pass A held.
+- `struan USES steam-deck` (pass B only): dropped, pass A held.
+- `user USES steam-deck` (pass A only): kept, pass A held.
+
+### sel-142-list-dash-commis-techniques (F1 0.00, adjudicated whole)
+
+- Pass A: read techniques the user teaches as expertise.
+- Pass B: read them as techniques the user knows.
+- Ruling: Teaching a technique states no expert-level claim (EXPERT_IN's gloss), so KNOWS holds, as for teaching elsewhere in this set.
+- `user EXPERT_IN breaking-down-a-whole-turbot` (pass A only): dropped, pass B held.
+- `user EXPERT_IN making-a-proper-beurre-blanc` (pass A only): dropped, pass B held.
+- `user EXPERT_IN sharpening-on-a-whetstone` (pass A only): dropped, pass B held.
+- `user KNOWS breaking-down-a-whole-turbot` (pass B only): kept, pass B held.
+- `user KNOWS making-a-proper-beurre-blanc` (pass B only): kept, pass B held.
+- `user KNOWS sharpening-on-a-whetstone` (pass B only): kept, pass B held.
+
+### sel-144-list-numbered-best-cuisines (F1 0.00, adjudicated whole)
+
+- Pass A: read the cuisines cooked best as expertise.
+- Pass B: read them as cuisines the user knows, each of the lead-in's kind.
+- Ruling: 'Best' ranks the user's own cuisines against each other and makes no expert-level claim (EXPERT_IN's gloss), so KNOWS holds. N14: the lead-in's kind noun gives each IS_A cuisine, flagged beyond the prompt.
+- `basque IS_A cuisine` (pass B only): kept, pass B held.
+- `japanese IS_A cuisine` (pass B only): kept, pass B held.
+- `lebanese IS_A cuisine` (pass B only): kept, pass B held.
+- `user EXPERT_IN basque` (pass A only): dropped, pass B held.
+- `user EXPERT_IN japanese` (pass A only): dropped, pass B held.
+- `user EXPERT_IN lebanese` (pass A only): dropped, pass B held.
+- `user KNOWS basque` (pass B only): kept, pass B held.
+- `user KNOWS japanese` (pass B only): kept, pass B held.
+- `user KNOWS lebanese` (pass B only): kept, pass B held.
+- Entities: a cuisine is a domain, the Concept test, not a competency, so the three take Concept (A).
+
+### sel-146-list-ref-second-oven (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `ten-tray-electric-one IS_A combi-oven` attributes differ: settled by the attribute policy in the method section.
+- Entities: the oven's id is the item's own phrase, so no alternative is listed (N1 lists one only where neither id is the utterance's phrase).
+
+### sel-147-list-ref-first-two-on-pass (F1 0.67)
+
+- Ruling: The training is an event of each named person (N7), linked to its stated place (N5), as the user's training is in the architect probe; a person RELATED_TO a city is not a shape the guide gives.
+- `jimena EXPERIENCED trained-in-san-sebastian` (pass A only): kept, pass A held.
+- `jimena RELATED_TO san-sebastian` (pass B only): dropped, pass A held.
+- `octavio EXPERIENCED trained-in-san-sebastian` (pass A only): kept, pass A held.
+- `octavio RELATED_TO san-sebastian` (pass B only): dropped, pass A held.
+- `trained-in-san-sebastian RELATED_TO san-sebastian` (pass A only): kept, pass A held.
+
+### sel-149-list-ref-first-knife (F1 0.62)
+
+- Ruling: N1 drops only leading articles and possessive pronouns, so the knife's id keeps its size. 'I reach for the first one for nearly everything' states the user's preference for it beside its use, PREFERS. The lead-in's kind gives it IS_A knife, flagged beyond the prompt (N14).
+- `240-mm-gyuto IS_A knife` (pass B only): kept, pass B held.
+- `gyuto IS_A knife` (pass A only): dropped, pass B held.
+- `user PREFERS 240-mm-gyuto` (pass B only): kept, pass B held.
+- `user USES 240-mm-gyuto` (pass B only): kept, pass B held.
+- `user USES gyuto` (pass A only): dropped, pass B held.
+- `petty IS_A knife` attributes differ: settled by the attribute policy in the method section.
+
+### sel-150-list-plus-days-off-pattern (F1 0.33, adjudicated whole)
+
+- Pass A: named each habit by its activity.
+- Pass B: kept each habit's place in its id.
+- Ruling: N1 as in the river outing: 'at La Ribera' and 'at Sopelana' scope the habits, so the shorter runs name them; the cadences are stated, so each is HAS_HABIT.
+- `user HAS_HABIT market` (pass A only): kept, pass A held.
+- `user HAS_HABIT market-at-la-ribera` (pass B only): dropped, pass A held.
+- `user HAS_HABIT surfing` (pass A only): kept, pass A held.
+- `user HAS_HABIT surfing-at-sopelana` (pass B only): dropped, pass A held.
+
+### sel-152-list-checkbox-newsletter-month (F1 0.75)
+
+- Ruling: N14 as in the route planner probe: 'Second Stove' is the newsletter's own name, so the id is the name, and the Project takes no IS_A.
+- `user WORKS_ON second-stove` (pass A only): kept, pass A held.
+- `user WORKS_ON second-stove-newsletter` (pass B only): dropped, pass A held.
+- `issue-41-2026-05-08 RELATED_TO preserved-lemons` attributes differ: settled by the attribute policy in the method section.
+
+### sel-155-list-mixed-messy-service (F1 0.50, adjudicated whole)
+
+- Pass A: labelled only the anchor for the named colleague.
+- Pass B: made tonight's service an event the user took part in.
+- Ruling: One evening's service is routine work, an incidental occasion like the coffee in the guide's example (Durable third-party facts), so it gets no Event; the colleague's anchor is agreed.
+- `service-2026-06-13 OCCURRED_ON 2026-06-13` (pass B only): dropped, pass A held.
+- `user EXPERIENCED service-2026-06-13` (pass B only): dropped, pass A held.
+
+### sel-161-multi-sous-chef-club-newsletter (F1 0.75)
+
+- Ruling: N14 as in the route planner probe: 'Second Stove' is the newsletter's own name, so the id is the name.
+- `user WORKS_ON second-stove` (pass A only): kept, pass A held.
+- `user WORKS_ON second-stove-newsletter` (pass B only): dropped, pass A held.
+- `larder-club IS_A supper-club` attributes differ: settled by the attribute policy in the method section.
+
+### sel-162-scope-scaling-and-spanish (F1 0.00, adjudicated whole)
+
+- Pass A: cut each MIST fact to its head and made the language the capability and the liking.
+- Pass B: kept each phrase whole and read the Spanish as a trait the user likes.
+- Ruling: N15: a capability keeps what the utterance gives it, as 'search my notes by meaning' keeps its manner, so the scaling keeps its range. Speaking Spanish to the user when tired is how MIST behaves, a trait, and 'which I like' is the user's preference for that behaviour; each fact keeps its own subject.
+- `mist-identity MIST_HAS_CAPABILITY scale-a-recipe` (pass A only): dropped, pass B held.
+- `mist-identity MIST_HAS_CAPABILITY scale-a-recipe-from-four-covers-to-ninety` (pass B only): kept, pass B held.
+- `mist-identity MIST_HAS_CAPABILITY spanish` (pass A only): dropped, pass B held.
+- `mist-identity MIST_HAS_TRAIT speak-to-me-in-spanish` (pass B only): kept, pass B held.
+- `user PREFERS spanish` (pass A only): dropped, pass B held.
+- `user PREFERS speak-to-me-in-spanish` (pass B only): kept, pass B held.
+
+### sel-163-fill-fishmonger-recommendation (F1 0.80)
+
+- Ruling: The person's job at the market is a durable fact about him (Durable third-party facts), so WORKS_AT holds beside the recommendation.
+- `ulises WORKS_AT la-ribera` (pass B only): kept, pass B held.
+
+### sel-165-list-dash-dive-bag-kit (F1 0.00, adjudicated whole)
+
+- Pass A: read the kit as used for the project's surveys.
+- Pass B: read the project as depending on the kit.
+- Ruling: The kit goes in the bag for every survey: the items are used for the project's work, USED_FOR's gloss, as 'I use X for Y' is (Rule 18). The utterance states no dependency.
+- `compact-camera USED_FOR maerl-watch` (pass A only): kept, pass A held.
+- `maerl-watch DEPENDS_ON compact-camera` (pass B only): dropped, pass A held.
+- `maerl-watch DEPENDS_ON pencils` (pass B only): dropped, pass A held.
+- `maerl-watch DEPENDS_ON quadrat` (pass B only): dropped, pass A held.
+- `maerl-watch DEPENDS_ON slates` (pass B only): dropped, pass A held.
+- `maerl-watch DEPENDS_ON transect-tapes` (pass B only): dropped, pass A held.
+- `pencils USED_FOR maerl-watch` (pass A only): kept, pass A held.
+- `quadrat USED_FOR maerl-watch` (pass A only): kept, pass A held.
+- `slates USED_FOR maerl-watch` (pass A only): kept, pass A held.
+- `transect-tapes USED_FOR maerl-watch` (pass A only): kept, pass A held.
+
+### sel-166-list-dash-thesis-chapters (F1 0.00, adjudicated whole)
+
+- Pass A: made the thesis the user's project and linked its chapters to it.
+- Pass B: made each chapter a project of the user.
+- Ruling: The lead-in names the thesis, a project, so it is an entity (List rules) and the user's work; the chapters are what it concerns, linked by RELATED_TO with no canonical shape for it (Rule 15).
+- `thesis RELATED_TO how-fast-maerl-beds-grow-back-after-scallop-dredging` (pass A only): kept, pass A held.
+- `thesis RELATED_TO whether-drone-photos-can-map-them-at-low-tide` (pass A only): kept, pass A held.
+- `thesis RELATED_TO which-juvenile-fish-shelter-in-them` (pass A only): kept, pass A held.
+- `user WORKS_ON how-fast-maerl-beds-grow-back-after-scallop-dredging` (pass B only): dropped, pass A held.
+- `user WORKS_ON thesis` (pass A only): kept, pass A held.
+- `user WORKS_ON whether-drone-photos-can-map-them-at-low-tide` (pass B only): dropped, pass A held.
+- `user WORKS_ON which-juvenile-fish-shelter-in-them` (pass B only): dropped, pass A held.
+
+### sel-169-list-ref-latter-supervisor (F1 0.67)
+
+- Ruling: List rule: an option nobody chose gets no edge, so the supervisor not asked for gets neither an anchor nor a fact.
+- `anselm KNOWS seagrass` (pass A only): dropped, pass B held.
+- `user KNOWS_PERSON anselm` (pass A only): dropped, pass B held.
+
+### sel-170-list-ref-undredged-first-site (F1 1.00)
+
+- Ruling: Attributes only: the N14 IS_A is beyond the prompt, so its flag stands.
+- `caol-scotnish IS_A dive-site` attributes differ: settled by the attribute policy in the method section.
+- `creag-gobhainn-bed IS_A dive-site` attributes differ: settled by the attribute policy in the method section.
+- `sween-narrows IS_A dive-site` attributes differ: settled by the attribute policy in the method section.
+
 ## Totals
 
-- Probes with a difference adjudicated: 61; still to adjudicate: 78.
-- Relations the passes differed on, adjudicated: 165.
-- Probes adjudicated whole (F1 under 0.61): 21.
-- Outcomes: pass A held 62, pass B held 103, neither held 0.
-- Shared relations whose attributes differed: 20.
+- Probes with a difference adjudicated: 83; still to adjudicate: 56.
+- Relations the passes differed on, adjudicated: 237.
+- Probes adjudicated whole (F1 under 0.61): 29.
+- Outcomes: pass A held 109, pass B held 128, neither held 0.
+- Shared relations whose attributes differed: 27.
