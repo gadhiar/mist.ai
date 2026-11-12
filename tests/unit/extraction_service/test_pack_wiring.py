@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 
@@ -25,7 +26,6 @@ from backend.extraction_service import engine as engine_module
 from backend.extraction_service.app import create_app, run_identity_components
 from backend.extraction_service.engine import ExtractionEngine, _compute_prompt_sha256
 from backend.extraction_service.schemas import EXTRACTION_OUTPUT_SCHEMA
-from backend.knowledge.extraction.prompts import assemble_system_prompt
 from backend.knowledge.extraction.run_identity import RunIdentityComponents
 from backend.knowledge.ontologies.pack import load_pack
 from backend.knowledge.ontologies.registry import active_pack
@@ -75,11 +75,15 @@ def test_the_engine_takes_the_registrys_active_pack_by_default(engine):
 def test_the_active_packs_prompt_and_schema_are_the_ones_the_service_sent_before(adapter):
     pack = active_pack()
 
-    fragments = tuple(rule.params for rule in pack.rules_of("prompt_fragment"))
-
-    assert pack.system_prompt == assemble_system_prompt(fragments)
+    # The Stage 2 system prompt as the service held it at 058e52c, and the prompt hash
+    # `test_turn_plan_off_pins.py` reads from a response.
+    assert hashlib.sha256(pack.system_prompt.encode("utf-8")).hexdigest() == (
+        "a486c5bfd3cd09175a5361d7de448a1254fc8f69475c3c967889849ea39584e4"
+    )
     assert json.dumps(pack.extraction_schema) == json.dumps(EXTRACTION_OUTPUT_SCHEMA)
-    assert _compute_prompt_sha256(adapter, pack=pack) == _compute_prompt_sha256(adapter)
+    assert _compute_prompt_sha256(adapter, pack=pack) == (
+        "6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e"
+    )
 
 
 def _other_pack():

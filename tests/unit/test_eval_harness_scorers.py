@@ -13,6 +13,7 @@ that each one follows it.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -32,14 +33,17 @@ from eval_harness.scorers import (  # noqa: E402  -- after sys.path insertion
 
 from backend.knowledge.ontologies import registry  # noqa: E402
 from backend.knowledge.ontologies.pack import Pack  # noqa: E402
-from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
-    EXTRACTABLE_NODE_TYPES as ONTOLOGY_NODE_TYPES,
-)
-from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
-    EXTRACTABLE_RELATIONSHIP_TYPES as ONTOLOGY_RELATIONSHIP_TYPES,
-)
 from scripts.eval_harness import entity_alignment  # noqa: E402
 from scripts.eval_harness import score_extraction_run as scorer  # noqa: E402
+
+# The v1.4.0 ontology's extractable names, sorted and hashed: what the ontology's
+# modules listed at 058e52c, before the pack held them.
+_EXTRACTABLE_NODE_NAMES = "6f04420b3d6c8a88013c770f2f506d74ded66b36cf9a376523590422fae57dc7"
+_EXTRACTABLE_EDGE_NAMES = "2aedddc00e73593d2ad37ae74cdd71f823a6c6a8e0bd8217edf86ba2c47e7938"
+
+
+def _names_digest(names) -> str:
+    return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
 
 
 class TestScorerOntologyParity:
@@ -47,24 +51,18 @@ class TestScorerOntologyParity:
 
     def test_scorer_entity_types_match_ontology_membership(self):
         scorer_set = extractable_entity_types()
-        ontology_set = frozenset(ONTOLOGY_NODE_TYPES)
 
-        assert scorer_set == ontology_set, (
-            "scorers.py extractable_entity_types() has drifted from the ontology. "
-            f"Missing from scorer: {sorted(ontology_set - scorer_set)}. "
-            f"Extra in scorer (not extractable per ontology): "
-            f"{sorted(scorer_set - ontology_set)}."
+        assert _names_digest(scorer_set) == _EXTRACTABLE_NODE_NAMES, (
+            "scorers.py extractable_entity_types() is not the ontology's extractable "
+            f"list: {sorted(scorer_set)}."
         )
 
     def test_scorer_relationship_types_match_ontology_membership(self):
         scorer_set = extractable_relationship_types()
-        ontology_set = frozenset(ONTOLOGY_RELATIONSHIP_TYPES)
 
-        assert scorer_set == ontology_set, (
-            "scorers.py extractable_relationship_types() has drifted from the ontology. "
-            f"Missing from scorer: {sorted(ontology_set - scorer_set)}. "
-            f"Extra in scorer (not extractable per ontology): "
-            f"{sorted(scorer_set - ontology_set)}."
+        assert _names_digest(scorer_set) == _EXTRACTABLE_EDGE_NAMES, (
+            "scorers.py extractable_relationship_types() is not the ontology's "
+            f"extractable list: {sorted(scorer_set)}."
         )
 
     def test_scorer_frozensets_are_frozen(self):

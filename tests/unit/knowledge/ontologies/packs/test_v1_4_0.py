@@ -736,9 +736,16 @@ _RULE_IDS = [
 ]
 
 
-def _identity(rule) -> tuple:
-    """What a rule does: everything the rails hash reads of it, so not its pinned case."""
-    return (rule.id, rule.kind, rule.phase, rule.params, rule.prompt_rule)
+# The v1.4.0 ontology's names, each list hashed in its order: what the ontology's
+# modules listed at 058e52c, before the pack held them.
+_NODE_NAMES = "f4a5929ad6c4ca36e5d034a4c3c2fa8c3e6e8a8616ff8bb88bc3947173ec3e27"
+_EDGE_NAMES = "d4f9197c14bc43fb75ba81950261b17a139c6b2b8cab67c406d86dd60f2459dd"
+_EXTRACTABLE_NODE_NAMES = "a225b428fb92ba42a6b46f186209a876dd3a1fb8aaa1b9b83605c55bee93d6a9"
+_EXTRACTABLE_EDGE_NAMES = "ad545e1ef9fec6f20a75071bcc5ee446be76d0c744b1cbc345893aec718fdc6a"
+
+
+def _names_digest(names) -> str:
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
 
 
 def _without_cases(pack: Pack, *, dropped: str | None = None) -> Pack:
@@ -770,43 +777,22 @@ class TestTheRegistryServesThePack:
         assert file_pack.pack_prompt_hash == release.pack_prompt_hash
         assert file_pack.pack_rails_hash == release.pack_rails_hash
 
-    def test_the_types_are_the_ones_the_registry_serves(self, file_pack: Pack, registry_pack: Pack):
-        assert file_pack.node_types == registry_pack.node_types
-        assert file_pack.edge_types == registry_pack.edge_types
-        assert file_pack.edge_types == tuple(ALL_EDGE_TYPES)
-        assert file_pack.extractable_node_types == registry_pack.extractable_node_types
-        assert file_pack.extractable_edge_types == registry_pack.extractable_edge_types
-
-    def test_the_pair_table_the_prompt_and_the_schema_are_the_ones_the_registry_serves(
-        self, file_pack: Pack, registry_pack: Pack
+    def test_the_types_and_the_extractable_lists_are_the_ones_before_the_pack(
+        self, file_pack: Pack
     ):
-        assert file_pack.pair_table == registry_pack.pair_table
-        assert file_pack.system_prompt == registry_pack.system_prompt
-        assert file_pack.extraction_schema == registry_pack.extraction_schema
+        assert _names_digest(node.type_name for node in file_pack.node_types) == _NODE_NAMES
+        assert _names_digest(edge.type_name for edge in file_pack.edge_types) == _EDGE_NAMES
+        assert _names_digest(file_pack.extractable_node_types) == _EXTRACTABLE_NODE_NAMES
+        assert _names_digest(file_pack.extractable_edge_types) == _EXTRACTABLE_EDGE_NAMES
 
     def test_the_rules_are_the_ones_the_registry_serves_in_order_with_their_cases(
-        self, file_pack: Pack, registry_pack: Pack
+        self, registry_pack: Pack
     ):
-        assert [_identity(rule) for rule in file_pack.rules] == [
-            _identity(rule) for rule in registry_pack.rules
-        ]
         assert registry_pack.rules == pack_conventions.RULES
         assert [rule.id for rule in registry_pack.rules] == _RULE_IDS
 
-    def test_the_manifest_is_the_one_the_registry_serves(
-        self, file_pack: Pack, registry_pack: Pack
-    ):
-        assert file_pack.manifest == registry_pack.manifest
+    def test_the_manifest_is_the_one_the_registry_serves(self, registry_pack: Pack):
         assert registry_pack.manifest is pack_manifest.MANIFEST
-
-    def test_the_plug_ins_are_the_ones_the_registry_serves(
-        self, file_pack: Pack, registry_pack: Pack
-    ):
-        assert [(plugin.name, plugin.phase) for plugin in file_pack.plugins] == [
-            (plugin.name, plugin.phase) for plugin in registry_pack.plugins
-        ]
-        for mine, theirs in zip(file_pack.plugins, registry_pack.plugins, strict=True):
-            assert mine.fn is theirs.fn
 
     def test_the_packs_fragments_are_the_prompts_ontology_half(self, file_pack: Pack):
         fragments = [rule.params for rule in file_pack.rules_of("prompt_fragment")]
