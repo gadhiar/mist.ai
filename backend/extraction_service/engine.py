@@ -8,9 +8,15 @@ parse-and-repair so a failed job is reported as an error -- never cached
 as an empty extraction.
 
 Stage 2 runs the list pass: `structure_splitter` cuts a structured utterance
-into units that keep their parent context, and each batch of units is one
-Stage 2 call. An utterance without structure is one batch, sent exactly as
-before the list pass existed.
+into units that keep their parent context, the pack's item filters drop the
+units it names, and each batch of units under one lead-in is one Stage 2 call.
+A batch's utterance holds its own units only; a later batch one of whose items
+refers back is shown the earlier units under `EARLIER_ITEMS_HEADING`, for
+reference only. An utterance without structure is one batch, sent exactly as
+before the list pass existed. Every Stage 2 call leaves one entry in the
+response's `batch_record`. A turn with no unit left makes no plan call and no
+Stage 2 call; it makes its scope call as any other turn does, when scope is
+enabled, and its derivation call when the request asks for one.
 
 With `ServiceSettings.turn_plan` on, a structured utterance first gets one
 plan call over all of its units (`backend.extraction_service.turn_plan`),
@@ -46,6 +52,7 @@ from backend.errors import (
 )
 from backend.extraction_contract.models import (
     CONTRACT_VERSION,
+    BatchRecordEntry,
     DerivationOut,
     ExtractionPayload,
     ExtractRequest,
@@ -85,7 +92,7 @@ from backend.knowledge.extraction.ontology_extractor import (
 )
 from backend.knowledge.extraction.pre_llm import filter_units
 from backend.knowledge.extraction.preprocessor import PreProcessedInput, PreProcessor
-from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
+from backend.knowledge.extraction.prompts import EARLIER_ITEMS_HEADING, EXTRACTION_USER_TEMPLATE
 from backend.knowledge.extraction.scope_classifier import (
     SCOPE_CLASSIFIER_SYSTEM_PROMPT,
     SCOPE_USER_TEMPLATE,
@@ -96,7 +103,9 @@ from backend.knowledge.extraction.serving_identity import REQUEST_STAGES, StageR
 from backend.knowledge.extraction.structure_splitter import (
     InputUnit,
     batch_units,
+    is_numbered_list,
     merge_payloads,
+    needs_earlier_units,
     render_batch,
     render_unit,
     split_structured,
@@ -412,6 +421,10 @@ class _Stage2Run:
             user message, or the empty string when the turn has no plan: the
             flag is off, the turn is prose, or the plan call failed.
         turn_plan: The record of the plan call, or None when none was made.
+        batch_record: One entry per batch call, in call order, repair
+            retries and calls cut short included, so it has `calls` entries.
+        numbered: Whether the turn's message is a numbered list, in which
+            an item that cites another by number refers back.
     """
 
     calls: int = 0
@@ -420,29 +433,76 @@ class _Stage2Run:
     payloads: list[ExtractionPayload] = field(default_factory=list)
     plan_block: str = ""
     turn_plan: TurnPlanOut | None = None
+    batch_record: list[BatchRecordEntry] = field(default_factory=list)
+    numbered: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Batch:
+    """One batch call's input, and what its batch record entry repeats of it.
+
+    Attributes:
+        pre_processed: The turn's input, narrowed to the batch.
+        units: The batch's own units, as the structure splitter gave them.
+        earlier: The earlier units of the message the call is shown for
+            reference, rendered; empty when it is shown none.
+    """
+
+    pre_processed: PreProcessedInput
+    units: tuple[InputUnit, ...]
+    earlier: tuple[str, ...]
 
 
 def _batch_input(
-    pre_processed: PreProcessedInput, units: Sequence[InputUnit], start: int, size: int
-) -> PreProcessedInput:
+    pre_processed: PreProcessedInput,
+    units: Sequence[InputUnit],
+    start: int,
+    size: int,
+    *,
+    numbered: bool,
+) -> _Batch:
     """The turn's pre-processed input, narrowed to the batch `units[start:start + size]`.
 
-    The batch's rendered units replace the utterance. The nearest earlier units
-    of the same message, at most `LIST_CONTEXT_MAX_UNITS`, follow the turn's
-    history as `[user]:` lines, the form the PreProcessor gives a user line,
-    so an item can refer back to one in an earlier batch. The first batch adds
-    none, so a turn without structure renders exactly as it did before.
+    The batch's rendered units replace the utterance, so a call sees its own
+    units only. When one of them refers back (`needs_earlier_units`), the
+    nearest earlier units of the same message, at most
+    `LIST_CONTEXT_MAX_UNITS`, follow the turn's history under
+    `EARLIER_ITEMS_HEADING`, so the item can be read; Rule 8 extracts what the
+    utterance states, so they are not extracted again. A batch whose items do
+    not refer back is shown none, and neither is the first batch, so a turn
+    without structure renders exactly as it did before.
     """
-    text = render_batch(units[start : start + size])
-    earlier = units[max(0, start - LIST_CONTEXT_MAX_UNITS) : start]
-    return dataclasses.replace(
-        pre_processed,
-        original_text=text,
-        resolved_text=text,
-        conversation_context=[
-            *pre_processed.conversation_context,
-            *(f"[user]: {render_unit(unit)}" for unit in earlier),
+    batch = tuple(units[start : start + size])
+    text = render_batch(batch)
+    earlier: tuple[str, ...] = ()
+    if start > 0 and needs_earlier_units(batch, numbered=numbered):
+        earlier = tuple(
+            render_unit(unit) for unit in units[max(0, start - LIST_CONTEXT_MAX_UNITS) : start]
+        )
+    context = [*pre_processed.conversation_context]
+    if earlier:
+        context += [EARLIER_ITEMS_HEADING, *earlier]
+    narrowed = dataclasses.replace(
+        pre_processed, original_text=text, resolved_text=text, conversation_context=context
+    )
+    return _Batch(pre_processed=narrowed, units=batch, earlier=earlier)
+
+
+def _record_entry(
+    batch: _Batch, response: LLMResponse, payload: ExtractionPayload | None
+) -> BatchRecordEntry:
+    """The batch record's entry for one call of `batch` that returned `response`."""
+    usage = response.usage
+    return BatchRecordEntry(
+        units=[
+            {"text": unit.text, "context": list(unit.context), "kind": unit.kind}
+            for unit in batch.units
         ],
+        context=list(batch.earlier),
+        payload=payload,
+        prompt_tokens=None if usage is None else usage.prompt_tokens,
+        completion_tokens=None if usage is None else usage.completion_tokens,
+        finish=response.finish_reason,
     )
 
 
@@ -469,7 +529,8 @@ def _compute_prompt_sha256(
 
     Covered: the raw, unformatted templates of all three stages (the scope
     system prompt and user template, the extraction system prompt and user
-    template, the derivation system prompt and user template), the Stage 2
+    template, the derivation system prompt and user template), the heading a
+    later Stage 2 batch's earlier units stand under, the Stage 2
     empty-context placeholder, the Stage 2 repair instruction sent on a
     retry, the three constrained-decoding output schemas (serialised with
     sorted keys; hashed whether or not the active mode sends them, which
@@ -511,6 +572,7 @@ def _compute_prompt_sha256(
         SCOPE_USER_TEMPLATE,
         pack.system_prompt,
         EXTRACTION_USER_TEMPLATE,
+        EARLIER_ITEMS_HEADING,
         NO_PRIOR_CONTEXT,
         INTERNAL_DERIVATION_SYSTEM_PROMPT,
         INTERNAL_DERIVATION_USER_TEMPLATE,
@@ -746,8 +808,14 @@ class ExtractionEngine:
             turn_index=req.turn_index,
         )
 
+        # Every turn runs scope, which calls the model when scope is enabled: the
+        # label is stored on the cache row and read after Stage 2 too. The pack's
+        # item filters run on the split units before Stage 2, and a turn they
+        # leave no unit of makes no plan or Stage 2 call and is answered with an
+        # empty payload.
         scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
-        stage2 = await self._run_extraction(pre_processed, warnings)
+        units = filter_units(split_structured(pre_processed.original_text), self._pack)
+        stage2 = await self._run_extraction(pre_processed, units, warnings)
         payload, merge_warnings = merge_payloads(stage2.payloads)
         warnings.extend(merge_warnings)
         derivation_out, derive_ms = await self._run_derivation(req, warnings)
@@ -782,6 +850,7 @@ class ExtractionEngine:
             stage2_calls=stage2.calls,
             warnings=warnings,
             turn_plan=stage2.turn_plan,
+            batch_record=stage2.batch_record,
         )
 
     def _resolve_constrained_mode(self) -> ConstrainedMode:
@@ -951,26 +1020,33 @@ class ExtractionEngine:
         return ScopeOut(label=label, confidence=confidence), elapsed
 
     async def _run_extraction(
-        self, pre_processed: PreProcessedInput, warnings: list[str]
+        self,
+        pre_processed: PreProcessedInput,
+        units: Sequence[InputUnit],
+        warnings: list[str],
     ) -> _Stage2Run:
         """Stage 2: one call sequence per batch of at most `LIST_BATCH_MAX_UNITS` units.
 
-        Batches run in order, one at a time, and any batch failing fails the
-        turn: there are no partial results. With the turn plan on, a
-        structured turn's plan call goes out first, and its failure adds a
-        warning to `warnings` and fails nothing.
+        A batch ends at its maximum or where the lead-in changes. Batches run
+        in order, one at a time, and any batch failing fails the turn: there
+        are no partial results. With the turn plan on, a structured turn's
+        plan call goes out first, and its failure adds a warning to
+        `warnings` and fails nothing.
 
-        The pack's item filters run first, on the split units and before any
-        batch is cut, so a unit they drop reaches neither a batch, nor a later
-        batch's context, nor the plan call.
+        Args:
+            pre_processed: The turn's input.
+            units: The turn's units, after the pack's item filters ran, so a
+                unit they drop reaches neither a batch, nor a later batch's
+                context, nor the plan call. A turn with none makes no call.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
             UpstreamLLMError: The LLM call failed, or every attempt's
                 output stayed unparsable.
         """
-        units = filter_units(split_structured(pre_processed.original_text), self._pack)
-        run = _Stage2Run()
+        run = _Stage2Run(numbered=is_numbered_list(pre_processed.original_text))
+        if not units:
+            return run
         if self._settings.turn_plan and is_structured_turn(units):
             run.turn_plan = await self._run_turn_plan(pre_processed, units, warnings)
             if run.turn_plan.payload is not None:
@@ -1056,17 +1132,17 @@ class ExtractionEngine:
 
         An output that stops at the extract cap is never repaired: the
         repair retry would ask for the same output under the same limit. The
-        batch is split in two and each half extracted in turn, each seeing
-        the units before it as context, down to single units.
+        batch is split in two and each half extracted in turn, each half that
+        refers back seeing the units before it, down to single units.
 
         Raises:
             UpstreamLLMError: A single unit's output was still cut short, or
                 a call failed or stayed unparsable.
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
         """
-        batch_input = _batch_input(pre_processed, units, start, size)
+        batch = _batch_input(pre_processed, units, start, size, numbered=run.numbered)
         try:
-            payload = await self._extract_batch(batch_input, run)
+            payload = await self._extract_batch(batch, run)
         except _OutputTruncatedError as exc:
             if size == 1:
                 raise UpstreamLLMError(
@@ -1085,12 +1161,10 @@ class ExtractionEngine:
             return
         run.payloads.append(payload)
 
-    async def _extract_batch(
-        self, batch_input: PreProcessedInput, run: _Stage2Run
-    ) -> ExtractionPayload:
+    async def _extract_batch(self, batch: _Batch, run: _Stage2Run) -> ExtractionPayload:
         """One batch's Stage 2 calls: strict parse with repair-retry up to `max_attempts`.
 
-        Adds its calls, attempts and time to `run`.
+        Adds its calls, attempts, time and batch record entries to `run`.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
@@ -1099,14 +1173,17 @@ class ExtractionEngine:
         """
         start = time.perf_counter()
         try:
-            return await self._extract_attempts(batch_input, run)
+            return await self._extract_attempts(batch, run)
         finally:
             run.elapsed_ms += (time.perf_counter() - start) * 1000
 
-    async def _extract_attempts(
-        self, batch_input: PreProcessedInput, run: _Stage2Run
-    ) -> ExtractionPayload:
-        messages = self._extraction_messages(batch_input)
+    async def _extract_attempts(self, batch: _Batch, run: _Stage2Run) -> ExtractionPayload:
+        """The calls of `_extract_batch`; each call that returns leaves a record entry.
+
+        A call that raises at the transport or times out fails the turn, so
+        it leaves no entry: there is no response to record.
+        """
+        messages = self._extraction_messages(batch.pre_processed)
         if run.plan_block:
             messages = _with_plan_block(messages, run.plan_block)
         last_error: Exception | None = None
@@ -1127,6 +1204,7 @@ class ExtractionEngine:
                 raise UpstreamLLMError(f"Extraction LLM call failed: {exc}") from exc
 
             if response.finish_reason == "length":
+                run.batch_record.append(_record_entry(batch, response, None))
                 raise _OutputTruncatedError(
                     f"Extraction output reached max_tokens={request.max_tokens}"
                     f" (attempt {attempt}/{self._settings.max_attempts})"
@@ -1135,6 +1213,7 @@ class ExtractionEngine:
             try:
                 payload = _strict_extraction_payload(raw)
             except ExtractionValidationError as exc:
+                run.batch_record.append(_record_entry(batch, response, None))
                 last_error = exc
                 logger.warning(
                     "Extraction attempt %d/%d unparsable: %s",
@@ -1149,6 +1228,7 @@ class ExtractionEngine:
                 ]
                 continue
 
+            run.batch_record.append(_record_entry(batch, response, payload))
             return payload
 
         raise UpstreamLLMError(

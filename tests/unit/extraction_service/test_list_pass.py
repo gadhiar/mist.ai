@@ -1,11 +1,14 @@
-"""Stage 2's list pass: one call per batch of units, each batch seeing the units before it.
+"""Stage 2's list pass: one call per batch of units, under one lead-in.
 
 The engine splits the utterance with `split_structured`, extracts at most
-`LIST_BATCH_MAX_UNITS` units per Stage 2 call and gives each later batch the
-nearest `LIST_CONTEXT_MAX_UNITS` earlier units as context. A turn without
-structure must send exactly the one Stage 2 request it sent before the list
-pass existed. The fake LLM here answers each Stage 2 call with one entity per
-line of the batch it was sent, so a test can read off what each call saw.
+`LIST_BATCH_MAX_UNITS` units per Stage 2 call, and ends a batch where the lead-in
+changes. A batch's utterance holds its own units only. A later batch one of whose
+own items refers back is given the nearest `LIST_CONTEXT_MAX_UNITS` earlier units
+after the turn's history, under `EARLIER_ITEMS_HEADING`, for reference only; any
+other batch is given none. A turn without structure must send exactly the one
+Stage 2 request it sent before the list pass existed. The fake LLM here answers
+each Stage 2 call with one entity per line of the batch it was sent, so a test can
+read off what each call saw.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from backend.knowledge.extraction.ontology_extractor import (
     render_extraction_messages,
 )
 from backend.knowledge.extraction.preprocessor import PreProcessor
+from backend.knowledge.extraction.prompts import EARLIER_ITEMS_HEADING
 from backend.knowledge.extraction.structure_splitter import (
     batch_units,
     render_batch,
@@ -285,9 +289,30 @@ async def test_every_batch_carries_the_turn_scope():
 # ---------------------------------------------------------------------------
 
 
+def referring_list(count: int) -> str:
+    """`count` items under one lead-in, each referring back to the one before it."""
+    return "Things I want to try this year:\n" + "\n".join(
+        f"- thing {n}, after the one before it" for n in range(1, count + 1)
+    )
+
+
 @pytest.mark.asyncio
-async def test_later_batches_see_up_to_eight_earlier_units_after_the_history():
-    text = numbered_list(30)
+async def test_the_utterance_holds_only_the_batchs_own_units():
+    text = referring_list(9)
+    batches = batch_units(split_structured(text), LIST_BATCH_MAX_UNITS)
+    llm = ScriptedLLM()
+
+    await make_engine(llm).run(make_request(text))
+
+    assert [batch_text(r) for r in llm.stage2_requests] == [render_batch(b) for b in batches]
+    for request, batch in zip(llm.stage2_requests, batches, strict=True):
+        own = {render_unit(u) for u in batch}
+        assert set(batch_text(request).split("\n")) == own
+
+
+@pytest.mark.asyncio
+async def test_a_later_batch_that_refers_back_sees_up_to_eight_earlier_units_after_the_history():
+    text = referring_list(30)
     units = split_structured(text)
     history = [{"role": "assistant", "content": "What are you planning?"}]
     llm = ScriptedLLM()
@@ -299,12 +324,28 @@ async def test_later_batches_see_up_to_eight_earlier_units_after_the_history():
     for index, lines in enumerate(contexts[1:], start=1):
         start = index * LIST_BATCH_MAX_UNITS
         earlier = units[max(0, start - LIST_CONTEXT_MAX_UNITS) : start]
-        assert lines == ["[assistant]: What are you planning?"] + [
-            f"[user]: {render_unit(u)}" for u in earlier
+        assert lines == [
+            "[assistant]: What are you planning?",
+            EARLIER_ITEMS_HEADING,
+            *(render_unit(u) for u in earlier),
         ]
-    assert len(contexts[1]) == 1 + 4
-    assert len(contexts[2]) == 1 + 8
-    assert len(contexts[7]) == 1 + 8
+    assert len(contexts[1]) == 2 + 4
+    assert len(contexts[2]) == 2 + 8
+    assert len(contexts[7]) == 2 + 8
+
+
+@pytest.mark.asyncio
+async def test_a_batch_whose_items_do_not_refer_back_is_shown_no_earlier_unit():
+    history = [{"role": "assistant", "content": "What are you planning?"}]
+    llm = ScriptedLLM()
+
+    await make_engine(llm).run(make_request(numbered_list(9), history))
+
+    assert len(llm.stage2_requests) == 3
+    assert [context_lines(r) for r in llm.stage2_requests] == [
+        ["[assistant]: What are you planning?"]
+    ] * 3
+    assert not any(EARLIER_ITEMS_HEADING in r.messages[1]["content"] for r in llm.stage2_requests)
 
 
 @pytest.mark.asyncio
@@ -325,10 +366,44 @@ async def test_an_item_can_refer_back_to_an_earlier_batch_item():
     assert batch_text(second) == (
         "Tools I picked up this year: the same plugin setup as the second one, on my laptop too"
     )
-    assert "[user]: Tools I picked up this year: Neovim, with the Lazy plugin setup" in (
-        context_lines(second)
-    )
+    assert context_lines(second) == [
+        EARLIER_ITEMS_HEADING,
+        "Tools I picked up this year: Rust, for the backend",
+        "Tools I picked up this year: Neovim, with the Lazy plugin setup",
+        "Tools I picked up this year: Terraform",
+        "Tools I picked up this year: Bun",
+    ]
     assert context_lines(first) == []
+
+
+@pytest.mark.asyncio
+async def test_an_item_citing_an_item_of_a_numbered_list_by_number_sees_the_earlier_units():
+    text = "Options for the move:\n1. hire a van\n2. borrow a trailer\n3. ask Brenna\n"
+    text += "4. pay a mover\n5. as in #2, for the sofa only"
+    llm = ScriptedLLM()
+
+    await make_engine(llm).run(make_request(text))
+
+    first, second = llm.stage2_requests
+    assert context_lines(first) == []
+    assert context_lines(second)[:2] == [
+        EARLIER_ITEMS_HEADING,
+        "Options for the move: hire a van",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_ends_at_a_lead_in_change():
+    text = "Tools I use:\n- Velk\n- Ornate\n\nTools I dropped:\n- Quillet\n- Barrow"
+    llm = ScriptedLLM()
+
+    response = await make_engine(llm).run(make_request(text))
+
+    assert [batch_text(r) for r in llm.stage2_requests] == [
+        "Tools I use: Velk\nTools I use: Ornate",
+        "Tools I dropped: Quillet\nTools I dropped: Barrow",
+    ]
+    assert response.stage2_calls == 2
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +516,8 @@ async def test_a_batch_cut_short_is_split_down_to_single_units():
 
 
 @pytest.mark.asyncio
-async def test_each_half_sees_the_units_before_it():
-    text = numbered_list(5)
+async def test_each_half_that_refers_back_sees_the_units_before_it():
+    text = referring_list(5)
     units = split_structured(text)
     llm = ScriptedLLM(cut_short_when(lambda batch: "\n" in batch))
 
@@ -450,8 +525,12 @@ async def test_each_half_sees_the_units_before_it():
 
     singles = [r for r in llm.stage2_requests if "\n" not in batch_text(r)]
     assert [batch_text(r) for r in singles] == [render_unit(u) for u in units]
-    for index, request in enumerate(singles):
-        assert context_lines(request) == [f"[user]: {render_unit(u)}" for u in units[:index]]
+    assert context_lines(singles[0]) == []
+    for index, request in enumerate(singles[1:], start=1):
+        assert context_lines(request) == [
+            EARLIER_ITEMS_HEADING,
+            *(render_unit(u) for u in units[:index]),
+        ]
 
 
 @pytest.mark.asyncio

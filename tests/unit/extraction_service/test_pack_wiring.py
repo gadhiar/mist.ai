@@ -3,10 +3,10 @@
 The engine takes a pack, the registry's active one by default: the pack's item filters
 choose the units the model is given, its assembled prompt and generated schema are what
 Stage 2 sends, and its two hashes are stamped on every result and reported on `/v1/info`.
-The active pack holds no item filter and its fragments assemble to the prompt as it
-stood, so the service sends what it sent before; `test_turn_plan_off_pins.py` pins
-those bytes. The cases that need a fragment of their own or a filter run on the base
-fixture pack.
+The active pack's fragments assemble to the prompt as it stood, and its one item filter,
+`unchecked-goals`, drops an unchecked item under no goal word; `test_turn_plan_off_pins.py`
+pins the bytes the service sends. The cases that need a fragment of their own or a
+filter with other words run on the base fixture pack.
 """
 
 from __future__ import annotations
@@ -76,13 +76,14 @@ def test_the_active_packs_prompt_and_schema_are_the_ones_the_service_sent_before
     pack = active_pack()
 
     # The Stage 2 system prompt as the service held it at 058e52c, and the prompt hash
-    # `test_turn_plan_off_pins.py` reads from a response.
+    # `test_turn_plan_off_pins.py` pins, which moved when T48 added the earlier items'
+    # heading to it.
     assert hashlib.sha256(pack.system_prompt.encode("utf-8")).hexdigest() == (
         "a486c5bfd3cd09175a5361d7de448a1254fc8f69475c3c967889849ea39584e4"
     )
     assert json.dumps(pack.extraction_schema) == json.dumps(EXTRACTION_OUTPUT_SCHEMA)
     assert _compute_prompt_sha256(adapter, pack=pack) == (
-        "6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e"
+        "dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b"
     )
 
 
@@ -118,12 +119,12 @@ def test_with_no_pack_the_run_identity_is_the_active_packs(service_settings, ada
 
 
 @pytest.mark.asyncio
-async def test_the_active_pack_drops_no_item(client, fake_llama_state):
+async def test_the_active_pack_drops_an_unchecked_item_under_no_goal_word(client, fake_llama_state):
     response = await client.post("/v1/extract", json=make_extract_request(utterance=_DECK_JOBS))
 
     assert response.status_code == 200
     (sent,) = _stage2_texts(fake_llama_state)
-    assert "coil the stern lines" in sent
+    assert "coil the stern lines" not in sent
     assert "check the bilge pump" in sent
     assert _FRAGMENT not in sent
 

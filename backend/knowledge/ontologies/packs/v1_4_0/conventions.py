@@ -32,6 +32,7 @@ from backend.knowledge.ontologies.pack import (
     ConventionRule,
     DerivedEdge,
     IdExempt,
+    ItemFilter,
     PinnedCase,
     PlanVocabulary,
     PromptFragment,
@@ -123,6 +124,20 @@ STATIC_ALIASES: tuple[tuple[str, str], ...] = (
     ("objc", "objective-c"),
     ("sklearn", "scikit-learn"),
     ("torch", "pytorch"),
+)
+
+# The words under which an unchecked `[ ]` item is a goal and reaches the model: ADR-054's
+# v14 amendment, the unchecked-box row of the register. A lead-in, heading or parent item
+# above the item holds one as a whole word, in any case, singular or plural. Any other
+# unchecked item is dropped before the model is called, as Rule 29 gives it no edge.
+GOAL_WORDS: tuple[str, ...] = (
+    "goal",
+    "objective",
+    "resolution",
+    "aim",
+    "aspiration",
+    "target",
+    "bucket list",
 )
 
 # ---------------------------------------------------------------------------
@@ -431,6 +446,38 @@ _EVENT_DATE_CASE = _case(
         _edge("ilse-thesis-defense-2026-12-03", "2026-12-03", "OCCURRED_ON"),
         _edge("user", "team-retro-2026-11-21", "EXPERIENCED"),
         _edge("team-retro-2026-11-21", "2026-11-21", "OCCURRED_ON"),
+    ),
+)
+
+# The shape of dev-lists' dvl-36, a long learning backlog under a lead-in that names no
+# goal, with invented names: two boxes are checked and ten are not. The filter leaves the
+# two checked items, one batch, and the model's payload for it is stored as written.
+_STUDY_PILE_UNITS = (
+    {"text": "[x] Quorvex query planning", "context": ["Study pile"], "kind": "list_item"},
+    {"text": "[x] the basics of Brindle", "context": ["Study pile"], "kind": "list_item"},
+)
+_QUORVEX = _entity("quorvex-query-planning", "Quorvex query planning", "Concept")
+_BRINDLE = _entity("brindle", "Brindle", "Technology")
+_STUDY_PILE_EDGES = (
+    _edge("user", "quorvex-query-planning", "KNOWS"),
+    _edge("user", "brindle", "KNOWS"),
+)
+_UNCHECKED_GOALS_CASE = PinnedCase(
+    entities=(_USER, _QUORVEX, _BRINDLE),
+    relationships=_STUDY_PILE_EDGES,
+    expected_entities=(_USER, _QUORVEX, _BRINDLE),
+    expected_relationships=_STUDY_PILE_EDGES,
+    scope="user-scope",
+    batch_record=(
+        {
+            "units": _STUDY_PILE_UNITS,
+            "context": (),
+            "payload": {
+                "entities": [_USER, _QUORVEX, _BRINDLE],
+                "relationships": list(_STUDY_PILE_EDGES),
+            },
+            "finish": "stop",
+        },
     ),
 )
 
@@ -807,6 +854,16 @@ RULES: tuple[ConventionRule, ...] = (
             plugin=EVENT_DATE,
         ),
         pinned_case=_EVENT_DATE_CASE,
+    ),
+    # Rule 29 gives an unchecked item no edge but a goal's, so one under no goal word is
+    # dropped before the model is called. A line with no box, an itinerary's, is kept.
+    ConventionRule(
+        id="unchecked-goals",
+        kind="item_filter",
+        phase=PRE_LLM,
+        params=ItemFilter(state="unchecked", keep_context_words=GOAL_WORDS),
+        prompt_rule="Rule 29",
+        pinned_case=_UNCHECKED_GOALS_CASE,
     ),
     # What the turn plan may name: every type and predicate the model may produce.
     ConventionRule(

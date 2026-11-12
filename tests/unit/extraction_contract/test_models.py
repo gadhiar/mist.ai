@@ -633,11 +633,37 @@ class TestStage2Calls:
 
         assert restored.stage2_calls == 7
 
-    def test_zero_calls_is_rejected(self):
+    def test_zero_calls_beside_an_attempt_is_rejected(self):
         payload = _extract_response().model_dump(mode="json")
         payload["stage2_calls"] = 0
 
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError, match="only together"):
+            ExtractResponse.model_validate(payload)
+
+    def test_zero_attempts_beside_a_call_is_rejected(self):
+        payload = _extract_response().model_dump(mode="json")
+        payload["attempts"] = 0
+        payload["stage2_calls"] = 1
+
+        with pytest.raises(ValidationError, match="only together"):
+            ExtractResponse.model_validate(payload)
+
+    def test_zero_attempts_and_zero_calls_together_validate(self):
+        """A turn whose every unit the pack's item filters drop makes no Stage 2 call."""
+        payload = _extract_response().model_dump(mode="json")
+        payload["attempts"] = 0
+        payload["stage2_calls"] = 0
+
+        restored = ExtractResponse.model_validate(payload)
+
+        assert (restored.attempts, restored.stage2_calls) == (0, 0)
+
+    @pytest.mark.parametrize("field", ["attempts", "stage2_calls"])
+    def test_a_negative_count_is_rejected(self, field):
+        payload = _extract_response().model_dump(mode="json")
+        payload[field] = -1
+
+        with pytest.raises(ValidationError, match="greater than or equal to 0"):
             ExtractResponse.model_validate(payload)
 
 

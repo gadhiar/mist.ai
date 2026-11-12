@@ -44,6 +44,26 @@ _THEMATIC_BREAK_RE = re.compile(r"^([-*_])(?:[ \t]*\1){2,}$")
 _TABLE_SEPARATOR_RE = re.compile(r"^\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?$")
 _UNESCAPED_PIPE_RE = re.compile(r"(?<!\\)\|")
 
+# A word with which an item refers back to another item of its message: a pronoun of
+# the third person, "both", "same", "former", "latter", or an ordinal before "one"
+# ("the second one"). "this" and "that" are left out: an item says "this year" or "the
+# one that broke" far more often than it points back with them.
+_REFERS_BACK_RE = re.compile(
+    r"\b(?:it|its|itself|they|them|their|theirs|themselves|he|him|his|himself|she|her|"
+    r"hers|herself|both|same|former|latter|"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|previous|"
+    r"other)[ \t]+ones?)\b",
+    re.IGNORECASE,
+)
+# An item of a numbered list cited by its number: `#2`, `(2)`, `[2]`, or a noun before
+# the number, as in "item 2", "no. 2" or "step 2".
+_CITED_NUMBER_RE = re.compile(
+    r"#\d{1,3}\b|[(\[]\d{1,3}[)\]]"
+    r"|\b(?:item|number|no\.|option|step|point|entry)[ \t]*#?\d{1,3}\b",
+    re.IGNORECASE,
+)
+_NUMBERED_ITEM_RE = re.compile(r"^\d{1,3}[.)][ \t]+\S")
+
 
 @dataclass(frozen=True, slots=True)
 class InputUnit:
@@ -349,15 +369,74 @@ def render_unit(unit: InputUnit) -> str:
     return f"{_CONTEXT_JOIN.join(unit.context)}: {unit.text}"
 
 
+def _lead_ins(units: Sequence[InputUnit]) -> list[tuple[str, ...]]:
+    """Each unit's lead-in: the headings and lead-in lines above it, outermost first.
+
+    That is the unit's context without the parent items at its end. A parent item is
+    known by the context its sub-items carry, which is the parent's own context with
+    the parent's text after it, so a sub-item takes its parent's lead-in.
+    """
+    under: dict[tuple[str, ...], tuple[str, ...]] = {}
+    lead_ins: list[tuple[str, ...]] = []
+    for unit in units:
+        lead_in = under.get(unit.context, unit.context)
+        lead_ins.append(lead_in)
+        if unit.kind == "list_item":
+            under[(*unit.context, _as_context(unit.text))] = lead_in
+    return lead_ins
+
+
 def batch_units(units: Sequence[InputUnit], max_units: int) -> tuple[tuple[InputUnit, ...], ...]:
-    """Consecutive runs of at most `max_units` units, in order.
+    """Consecutive runs of at most `max_units` units under one lead-in, in order.
+
+    A batch ends where the lead-in changes (`_lead_ins`), so every unit of a batch
+    was written under the same headings and lead-in lines, and a rail that reads a
+    lead-in's batches from the batch record reads no unit of another lead-in. An item
+    and its sub-items share a lead-in, so they stay in one batch.
 
     Raises:
         ValueError: `max_units` is below 1.
     """
     if max_units < 1:
         raise ValueError(f"max_units must be at least 1, got {max_units}")
-    return tuple(tuple(units[i : i + max_units]) for i in range(0, len(units), max_units))
+    batches: list[tuple[InputUnit, ...]] = []
+    batch: list[InputUnit] = []
+    batch_lead_in: tuple[str, ...] = ()
+    for unit, lead_in in zip(units, _lead_ins(units), strict=True):
+        if batch and (len(batch) == max_units or lead_in != batch_lead_in):
+            batches.append(tuple(batch))
+            batch = []
+        if not batch:
+            batch_lead_in = lead_in
+        batch.append(unit)
+    if batch:
+        batches.append(tuple(batch))
+    return tuple(batches)
+
+
+def needs_earlier_units(batch: Sequence[InputUnit], *, numbered: bool) -> bool:
+    """Whether a batch is shown the earlier units of its message, for reference only.
+
+    Only when one of its own units refers back to an earlier item: by a word that
+    stands for it (`_REFERS_BACK_RE`), or, when the message holds a numbered list,
+    by the item's number (`_CITED_NUMBER_RE`). A unit's context is not read: a
+    heading, a lead-in or a parent item is no own item.
+
+    Args:
+        batch: The batch's own units.
+        numbered: Whether the message holds a numbered list (`is_numbered_list`).
+    """
+    for unit in batch:
+        if _REFERS_BACK_RE.search(unit.text):
+            return True
+        if numbered and _CITED_NUMBER_RE.search(unit.text):
+            return True
+    return False
+
+
+def is_numbered_list(text: str) -> bool:
+    """True when `text` holds a numbered list: at least two items marked `1.` or `1)`."""
+    return sum(1 for line in text.splitlines() if _NUMBERED_ITEM_RE.match(line.strip())) >= 2
 
 
 def render_batch(batch: Sequence[InputUnit]) -> str:
