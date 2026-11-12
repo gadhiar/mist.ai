@@ -328,6 +328,22 @@ class TestADifferingBase:
 
         assert (status, err) == (1, "")
 
+    def test_a_relative_base_root_is_read_from_the_callers_directory(
+        self, raw: Path, tmp_path: Path, capsys, monkeypatch
+    ):
+        # The base half runs with the base root as its working directory, so a relative
+        # root it resolved there would name a directory inside the root.
+        _stub_tree(tmp_path / "base")
+        monkeypatch.chdir(tmp_path)
+
+        status, lines, err = _run(capsys, "--base-root", "base", "--raw", f"synthetic={raw}")
+
+        assert (status, err) == (1, "")
+        assert lines[0] == (
+            "cell P: ids identical 1/5; relations identical 2/5; related_to_rate equal; "
+            "prompt differs; pairs differ; schema differs"
+        )
+
     def test_nothing_is_written_into_the_base_root_or_beside_the_raw_file(
         self, raw: Path, tmp_path: Path, capsys
     ):
