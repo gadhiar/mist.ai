@@ -167,6 +167,19 @@ def test_passes_that_name_different_employers_differ_on_one_works_at():
     assert {predicate for _, predicate, _ in differing} == {"WORKS_AT"}
 
 
+def test_a_group_keeps_a_relation_both_passes_hold_over_an_earlier_one_only_one_holds():
+    """Keeping the first relation by sort would leave pass A one relation pass B never wrote."""
+    entities, edges = _roster("harbour-team", "tollvik", HARBOUR_PEOPLE)
+    first_job = _works_at("brannoc-ashe", "tollvik")
+    row_a = _row(HARBOUR, entities, edges)
+    row_b = _row(HARBOUR, entities, [edge for edge in edges if edge != first_job])
+
+    result = _filter(row_a, row_b)
+
+    kept_a, kept_b = _of(result.row_a, "WORKS_AT"), _of(result.row_b, "WORKS_AT")
+    assert kept_a == kept_b == {("celyn-dorr", "WORKS_AT", "tollvik")}
+
+
 def test_a_works_at_with_no_membership_beside_it_is_kept():
     utterance = (
         "Rafe Dunn also works at Tollvik.\n"
