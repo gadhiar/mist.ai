@@ -576,9 +576,13 @@ def run(argv: Sequence[str]) -> int:
         help="a set's name and its extraction-service raw file; repeat for each set",
     )
     args = parser.parse_args(argv)
-    _check_base_root(args.base_root)
+    # Resolved once, against this process's working directory. The base half runs with
+    # the base root as its own, so a relative root it resolved there would name a
+    # directory inside the root.
+    base_root = args.base_root.resolve()
+    _check_base_root(base_root)
     sets = [read_raw(name, path) for name, path in _parse_raw(args.raw)]
-    base = run_base(args.base_root, sets)
+    base = run_base(base_root, sets)
 
     from backend.knowledge.ontologies.pack import PackLoadError
 

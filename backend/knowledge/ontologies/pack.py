@@ -416,7 +416,9 @@ class Plugin:
             name. Its qualified name and its module's source then identify it the same
             way in every process, and an edit to the function is an edit to that
             source. The loader refuses a `functools.partial`, a callable object, a
-            builtin, a `lambda` and a function built inside another (a closure).
+            builtin, a `lambda`, and any function its module does not hold under its
+            qualified name. A decorator's `functools.wraps` wrapper loads; a decorator
+            defined in another module is outside the hash.
     """
 
     name: str

@@ -175,8 +175,8 @@ def variant_kind(gold_id: str, gold_type: str, produced_id: str) -> str | None:
     Kinds: `n1` (articles or possessives only), `reorder` (the same tokens in
     another order), `typo` (edit distance 2 or less on ids of 5 or more
     characters), `metric` (an id of a type the active pack aligns as `metric`, whose
-    tokens are a subset or superset of gold's), `paraphrase` (the same content tokens after stemming, or one set
-    inside the other).
+    tokens are a subset or superset of gold's), `paraphrase` (the same content tokens
+    after stemming, or one set inside the other).
     """
     gold_raw = [t for t in raw_tokens(gold_id) if t not in N1_WORDS]
     produced_raw = [t for t in raw_tokens(produced_id) if t not in N1_WORDS]

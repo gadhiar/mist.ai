@@ -300,7 +300,11 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "bytes; the turn plan's schema is built from the pack's plan vocabulary, "
             "which holds the lists it read before; the two pack hashes leave out a "
             "dataclass field a pack leaves unstated, which moves both hashes of every pack "
-            "and nothing a request carries. "
+            "and nothing a request carries; a typed_id rule may state the alignment kind "
+            "the eval harness's aligner applies to ids of its type, which the aligner reads "
+            "from the active pack in place of a type name of its own, and the Metric rule "
+            "states it, which moves the pack's rails hash and nothing a rail reads or a "
+            "request carries. "
             "With the flag off every request is sent exactly as before. "
             "Re-extracts history."
         ),
