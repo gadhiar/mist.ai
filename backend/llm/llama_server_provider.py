@@ -15,11 +15,22 @@ from typing import Any
 import httpx
 from openai import AsyncOpenAI, OpenAI
 
-from backend.errors import LLMResponseError
+from backend.errors import LLMConnectionError, LLMResponseError
 from backend.llm.models import LLMRequest, LLMResponse, ToolCall, UsageMetadata
 from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close a streamed completion: the SDK's `AsyncStream.close`, else `aclose`.
+
+    An async generator standing in for the SDK's stream has `aclose` and no
+    `close`. Closing a stream that already ended is a no-op in both.
+    """
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if close is not None:
+        await close()
 
 
 class LlamaServerProvider(StreamingLLMProvider):
@@ -188,7 +199,18 @@ class LlamaServerProvider(StreamingLLMProvider):
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
-        """Generate via async OpenAI client. Yields partial or complete responses."""
+        """Generate via async OpenAI client. Yields partial or complete responses.
+
+        A streamed call closes its stream however it ends: read to the end,
+        left early by a consumer that closes this generator, or cancelled.
+        Closing the stream closes the HTTP response it reads, at once and
+        not when the garbage collector reaches it.
+
+        Raises:
+            LLMConnectionError: The transport failed while a streamed body
+                was being read. The SDK wraps a failed request in its own
+                `APIError`, but not a failure after the response started.
+        """
         kwargs = self._build_kwargs(request, stream)
 
         if stream:
@@ -197,28 +219,33 @@ class LlamaServerProvider(StreamingLLMProvider):
             reasoning_parts: list[str] = []
             finish_reason: str | None = None
             usage: UsageMetadata | None = None
-            async for chunk in response:
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage:
-                    usage = self._parse_usage(chunk_usage)
-                if not chunk.choices:
-                    # The final usage-only chunk (stream_options.include_usage)
-                    # has no choices at all.
-                    continue
-                choice = chunk.choices[0]
-                delta = choice.delta
-                content = getattr(delta, "content", None)
-                if content:
-                    yield LLMResponse(content=content, partial=True)
-                reasoning_piece = getattr(delta, "reasoning_content", None)
-                if reasoning_piece:
-                    reasoning_parts.append(reasoning_piece)
-                tool_call_deltas = getattr(delta, "tool_calls", None)
-                if tool_call_deltas:
-                    self._accumulate_tool_call_deltas(tool_call_acc, tool_call_deltas)
-                choice_finish_reason = getattr(choice, "finish_reason", None)
-                if choice_finish_reason:
-                    finish_reason = choice_finish_reason
+            try:
+                async for chunk in response:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage:
+                        usage = self._parse_usage(chunk_usage)
+                    if not chunk.choices:
+                        # The final usage-only chunk (stream_options.include_usage)
+                        # has no choices at all.
+                        continue
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    content = getattr(delta, "content", None)
+                    if content:
+                        yield LLMResponse(content=content, partial=True)
+                    reasoning_piece = getattr(delta, "reasoning_content", None)
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                    tool_call_deltas = getattr(delta, "tool_calls", None)
+                    if tool_call_deltas:
+                        self._accumulate_tool_call_deltas(tool_call_acc, tool_call_deltas)
+                    choice_finish_reason = getattr(choice, "finish_reason", None)
+                    if choice_finish_reason:
+                        finish_reason = choice_finish_reason
+            except httpx.HTTPError as exc:
+                raise LLMConnectionError(f"llama-server stream failed: {exc!r}") from exc
+            finally:
+                await _close_stream(response)
             yield LLMResponse(
                 content=None,
                 tool_calls=self._finalize_tool_calls(tool_call_acc),

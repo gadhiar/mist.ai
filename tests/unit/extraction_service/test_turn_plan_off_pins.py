@@ -6,9 +6,9 @@ what a flag-off service sends and reports:
 
 - every request body the fake llama-server receives for one structured turn
   and one prose turn, as the sha256 of their canonical JSON. T49 put a
-  reasoning budget on the Stage 2 requests; the bodies are hashed with it
-  taken off, and it is pinned beside them, so the hashes are still the
-  058e52c ones;
+  reasoning budget on the Stage 2 requests and made them streaming requests;
+  the bodies are hashed with those fields as 058e52c sent them, and what T49
+  set is pinned beside them, so the hashes are still the 058e52c ones;
 - the three stage output schemas;
 - `prompt_sha256` for the gpt-oss adapter;
 - the serving identity of the `service_settings` fixture, which T49 moved
@@ -60,8 +60,14 @@ PROMPT_SHA256 = "6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590
 SERVING_IDENTITY_AT_058E52C = "si1-0a4fdfffca232a0e3d27716f7ab0e41ed75715ed7eb932b05939b692bc358cb1"
 # T49: `request.extract.thinking_budget_tokens` went from None to 8192.
 SERVING_IDENTITY = "si1-f967ffbbd60a599a2627654e2ac373bbb787390b374cf1e9a3e2c87dc3b83050"
-# What T49 put on a Stage 2 request, and on no other.
-T49_EXTRACT_FIELDS = {"reasoning_budget_tokens": 8192}
+# What T49 set on a Stage 2 request: the budget, and a streamed reply with its
+# usage chunk. A scope or derive request has neither, and is not streamed.
+T49_EXTRACT_FIELDS = {
+    "reasoning_budget_tokens": 8192,
+    "stream": True,
+    "stream_options": {"include_usage": True},
+}
+T49_OTHER_FIELDS = {"stream": False}
 RESPONSE_KEYS = [
     "contract_version",
     "job_id",
@@ -84,10 +90,17 @@ def canonical_sha256(value: object) -> str:
 
 
 def split_t49(bodies: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Each body as 058e52c sent it, and beside it the fields T49 put on it."""
-    before = [{k: v for k, v in body.items() if k not in T49_EXTRACT_FIELDS} for body in bodies]
-    added = [{k: body[k] for k in T49_EXTRACT_FIELDS if k in body} for body in bodies]
-    return before, added
+    """Each body as 058e52c sent it, and beside it what T49 set on it.
+
+    At 058e52c no request was streamed and none carried a budget or stream
+    options.
+    """
+    before = [
+        {**{k: v for k, v in body.items() if k not in T49_EXTRACT_FIELDS}, "stream": False}
+        for body in bodies
+    ]
+    set_by_t49 = [{k: body[k] for k in T49_EXTRACT_FIELDS if k in body} for body in bodies]
+    return before, set_by_t49
 
 
 @pytest.mark.asyncio
@@ -101,9 +114,14 @@ async def test_a_structured_turn_sends_the_pinned_request_bodies(client, fake_ll
 
     assert response.status_code == 200, response.text
     assert len(fake_llama_state.chat_requests) == 4
-    before, added = split_t49(fake_llama_state.chat_requests)
+    before, set_by_t49 = split_t49(fake_llama_state.chat_requests)
     assert canonical_sha256(before) == STRUCTURED_BODIES_SHA256
-    assert added == [{}, T49_EXTRACT_FIELDS, T49_EXTRACT_FIELDS, {}]
+    assert set_by_t49 == [
+        T49_OTHER_FIELDS,
+        T49_EXTRACT_FIELDS,
+        T49_EXTRACT_FIELDS,
+        T49_OTHER_FIELDS,
+    ]
     assert list(response.json()) == RESPONSE_KEYS
 
 
@@ -118,9 +136,9 @@ async def test_a_prose_turn_sends_the_pinned_request_bodies(client, fake_llama_s
 
     assert response.status_code == 200, response.text
     assert len(fake_llama_state.chat_requests) == 3
-    before, added = split_t49(fake_llama_state.chat_requests)
+    before, set_by_t49 = split_t49(fake_llama_state.chat_requests)
     assert canonical_sha256(before) == PROSE_BODIES_SHA256
-    assert added == [{}, T49_EXTRACT_FIELDS, {}]
+    assert set_by_t49 == [T49_OTHER_FIELDS, T49_EXTRACT_FIELDS, T49_OTHER_FIELDS]
     assert list(response.json()) == RESPONSE_KEYS
 
 

@@ -249,7 +249,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-cbd4f5080fe9edc2c177fe23c3e81fc13033dd4f580033c77e88f617ecd07d7b",
+        code_identity="ci1-9aaeadf138695f0237398b071900994fc243f18ae256326e616963c7ab0cd66b",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -309,9 +309,14 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "hint and low's 96-token cap, and puts a reasoning budget on the extract "
             "request and the plan call, 8,192 tokens unless "
             "EXTRACTION_REASONING_BUDGET_TOKENS states another, with none on scope or "
-            "derive. "
+            "derive, and sends the extract request and the plan call as streaming "
+            "requests, read to their end, so that a call that times out or whose run is "
+            "cancelled closes its stream; LlamaServerProvider closes a streamed call's "
+            "stream however the call ends, and raises a transport failure while the "
+            "stream is read as LLMConnectionError. "
             "With the turn plan flag off, the effort at low and that budget set to none, "
-            "every request is sent exactly as before. "
+            "the scope and derive requests are sent exactly as before, and the extract "
+            "request differs only in asking for a streamed reply and its usage chunk. "
             "Re-extracts history."
         ),
     ),

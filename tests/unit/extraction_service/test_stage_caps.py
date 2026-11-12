@@ -39,6 +39,7 @@ from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.extraction.serving_identity import REQUEST_STAGES
 from backend.llm.models import LLMRequest, LLMResponse
 from tests.unit.extraction_service.conftest import make_extract_request
+from tests.unit.extraction_service.scripted_llm import ScriptedProvider
 
 _DERIVATION = {
     "signal_types": ["feedback"],
@@ -285,13 +286,13 @@ class TestTheRecordedCaps:
         assert engine.stage_cap("derive") == 400
 
 
-class _LengthStopLLM:
+class _LengthStopLLM(ScriptedProvider):
     """A provider whose every reply stopped at its output cap."""
 
     def __init__(self) -> None:
         self.requests: list[LLMRequest] = []
 
-    async def invoke(self, request: LLMRequest) -> LLMResponse:
+    async def reply(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
         return LLMResponse(content='{"entities": [', finish_reason="length")
 

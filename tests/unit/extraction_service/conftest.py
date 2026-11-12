@@ -24,6 +24,7 @@ from backend.llm.llama_server_provider import LlamaServerProvider
 from tests.unit.extraction_service.fake_llama import (
     FAKE_N_CTX,
     FakeLlamaState,
+    StreamingASGITransport,
     build_fake_llama_app,
 )
 
@@ -52,7 +53,12 @@ def fake_llama_app(fake_llama_state: FakeLlamaState):
 
 @pytest.fixture
 def wired_llm(fake_llama_app) -> LlamaServerProvider:
-    """A real LlamaServerProvider whose OpenAI client talks to the fake app."""
+    """A real LlamaServerProvider whose OpenAI client talks to the fake app.
+
+    The client reaches the app through `StreamingASGITransport`, so a
+    streamed reply arrives chunk by chunk and a call the service leaves is
+    one the fake sees left (`FakeLlamaState.chat_aborted`).
+    """
     provider = LlamaServerProvider(base_url=FAKE_BASE_URL, model="fake-model")
     provider._async_client = AsyncOpenAI(
         base_url=f"{FAKE_BASE_URL}/v1",
@@ -62,7 +68,7 @@ def wired_llm(fake_llama_app) -> LlamaServerProvider:
         # retry-with-backoff burning through the engine's LLM timeout
         # before the real error ever surfaces.
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=fake_llama_app)),
+        http_client=httpx.AsyncClient(transport=StreamingASGITransport(fake_llama_app)),
     )
     return provider
 
@@ -93,6 +99,35 @@ async def blocked_chat(fake_llama_state: FakeLlamaState):
     gate.set()
     for _ in range(5):
         await asyncio.sleep(0)
+
+
+@pytest_asyncio.fixture
+async def held_stream(fake_llama_state: FakeLlamaState):
+    """Hold every streamed fake reply after its first content delta.
+
+    The call is in flight with its stream open until the test, or teardown,
+    sets the event. A call that is not streamed is not held.
+    """
+    gate = asyncio.Event()
+    fake_llama_state.stream_gate = gate
+    yield gate
+    gate.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+async def until(condition, *, ticks: int = 2000) -> None:
+    """Yield to the event loop until `condition()` holds; fail when it never does.
+
+    The fakes here run on the event loop with no socket and no thread, so a
+    state another task is about to reach is reached in a bounded number of
+    turns of the loop, and no wall clock is read.
+    """
+    for _ in range(ticks):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"the condition did not hold within {ticks} turns of the event loop")
 
 
 @pytest.fixture

@@ -1,14 +1,15 @@
 """Tests for LlamaServerProvider."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from openai import DEFAULT_TIMEOUT
+from openai import DEFAULT_TIMEOUT, AsyncOpenAI
 from pydantic import ValidationError
 
-from backend.errors import LLMResponseError
+from backend.errors import LLMConnectionError, LLMResponseError
 from backend.llm.llama_server_provider import LlamaServerProvider
 from backend.llm.models import LLMRequest, ThinkingConfig, ToolCall, UsageMetadata
 
@@ -587,6 +588,206 @@ class TestAsyncStreaming:
 
         final = responses[-1]
         assert final.reasoning_content == "think more"
+
+
+# ---------------------------------------------------------------------------
+# Async generate -- the stream is closed however the call ends
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStream:
+    """A stand-in for the SDK's `AsyncStream`: chunks to iterate and a recorded `close`.
+
+    After its chunks it waits on `hold` when given one, then raises `error`
+    when given one.
+    """
+
+    def __init__(
+        self,
+        chunks: list[SimpleNamespace],
+        *,
+        hold: asyncio.Event | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._chunks = chunks
+        self._hold = hold
+        self._error = error
+        self.closed = 0
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for chunk in self._chunks:
+            yield chunk
+        if self._hold is not None:
+            await self._hold.wait()
+        if self._error is not None:
+            raise self._error
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+def _serve(provider: LlamaServerProvider, stream: object) -> None:
+    provider._async_client.chat.completions.create = AsyncMock(return_value=stream)
+
+
+_FIRST_EVENT = (
+    b'data: {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m", '
+    b'"choices": [{"index": 0, "delta": {"role": "assistant", "content": "par"}, '
+    b'"finish_reason": null}]}\n\n'
+)
+
+
+class _HeldEventStream(httpx.AsyncByteStream):
+    """An HTTP response body: one server-sent event, then nothing until it is closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self._hold = asyncio.Event()
+
+    async def __aiter__(self):
+        yield _FIRST_EVENT
+        await self._hold.wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _provider_over(body: httpx.AsyncByteStream) -> LlamaServerProvider:
+    """A provider whose real SDK client reads `body` as the reply to any request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+
+    provider = LlamaServerProvider(base_url="http://llama.test", model="test-model")
+    provider._async_client = AsyncOpenAI(
+        base_url="http://llama.test/v1",
+        api_key="not-needed",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    return provider
+
+
+class TestAsyncStreamIsClosed:
+    @pytest.mark.asyncio
+    async def test_a_stream_read_to_its_end_is_closed(self, provider: LlamaServerProvider):
+        stream = _RecordingStream([_make_chunk(content="hi")])
+        _serve(provider, stream)
+
+        responses = [r async for r in provider.generate(_default_request(), stream=True)]
+
+        assert [r.partial for r in responses] == [True, False]
+        assert stream.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_a_consumer_that_leaves_early_closes_the_stream(
+        self, provider: LlamaServerProvider
+    ):
+        stream = _RecordingStream([_make_chunk(content="a"), _make_chunk(content="b")])
+        _serve(provider, stream)
+        responses = provider.generate(_default_request(), stream=True)
+
+        first = await responses.__anext__()
+        await responses.aclose()
+
+        assert first.content == "a"
+        assert stream.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_consumer_closes_the_stream(self, provider: LlamaServerProvider):
+        stream = _RecordingStream([_make_chunk(content="a")], hold=asyncio.Event())
+        _serve(provider, stream)
+        seen: list[str | None] = []
+
+        async def consume() -> None:
+            async for response in provider.generate(_default_request(), stream=True):
+                seen.append(response.content)
+
+        consumer = asyncio.create_task(consume())
+        while not seen:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+        assert seen == ["a"]
+        assert stream.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_a_transport_failure_mid_stream_is_a_connection_error(
+        self, provider: LlamaServerProvider
+    ):
+        """The SDK wraps a failed request, not a failure while the body is read."""
+        stream = _RecordingStream(
+            [_make_chunk(content="a")], error=httpx.ReadError("connection reset")
+        )
+        _serve(provider, stream)
+
+        with pytest.raises(LLMConnectionError, match="connection reset"):
+            [r async for r in provider.generate(_default_request(), stream=True)]
+
+        assert stream.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_a_stream_that_is_an_async_generator_is_closed_too(
+        self, provider: LlamaServerProvider
+    ):
+        """An async generator has `aclose` and no `close`; it is finished, not left to the GC."""
+        finished: list[bool] = []
+
+        async def mock_stream(**kwargs):
+            try:
+                yield _make_chunk(content="a")
+                yield _make_chunk(content="b")
+            finally:
+                finished.append(True)
+
+        provider._async_client.chat.completions.create = AsyncMock(side_effect=mock_stream)
+        responses = provider.generate(_default_request(), stream=True)
+
+        await responses.__anext__()
+        await responses.aclose()
+
+        assert finished == [True]
+
+    @pytest.mark.asyncio
+    async def test_leaving_early_closes_the_http_response_under_the_sdk_client(self):
+        """Through the real SDK client: the response body is closed, so the connection is."""
+        body = _HeldEventStream()
+        responses = _provider_over(body).generate(_default_request(), stream=True)
+
+        first = await responses.__anext__()
+        await responses.aclose()
+
+        assert (first.content, first.partial) == ("par", True)
+        assert body.closed is True
+
+    @pytest.mark.asyncio
+    async def test_cancelling_closes_the_http_response_under_the_sdk_client(self):
+        body = _HeldEventStream()
+        provider = _provider_over(body)
+        seen: list[str | None] = []
+
+        async def consume() -> None:
+            async for response in provider.generate(_default_request(), stream=True):
+                seen.append(response.content)
+
+        consumer = asyncio.create_task(consume())
+        while not seen:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+        assert seen == ["par"]
+        assert body.closed is True
 
 
 # ---------------------------------------------------------------------------
