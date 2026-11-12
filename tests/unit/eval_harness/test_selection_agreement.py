@@ -36,8 +36,12 @@ _SELECTION = _REPO_ROOT / "data" / "gold" / "extraction" / "selection-2026-11.js
 PACK = load_pack("backend.knowledge.ontologies.packs.v1_4_0")
 
 
-def test_no_module_level_import_loads_the_pack_or_the_rails():
-    """Only `main` resolves the pack, so a caller's pack and rails are the ones measured."""
+def test_the_module_itself_imports_neither_the_pack_nor_the_rails():
+    """Only `main` resolves the pack and the rails, so the ones measured are the caller's.
+
+    Importing the module still loads the engine's v1.4.0 pack modules, through
+    `judgement_relations`; this checks the module's own imports only.
+    """
     tree = ast.parse(Path(selection_agreement_module.__file__).read_text(encoding="utf-8"))
     modules = set()
     for node in tree.body:

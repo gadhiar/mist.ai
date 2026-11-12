@@ -11,8 +11,11 @@ No row records the scope a turn was spoken in, which the rails read, so a probe 
 user-scope when either pass labels the user and as third-party otherwise. Ids are compared as
 the rails store them (`judgement_relations.stored_row`).
 
-The pack and `run_rails` are the caller's, as in `judgement_relations`, so importing this module
-loads neither; only `main` resolves the pack, from the version the recorded file names.
+The module itself imports neither the pack nor `rails.py`: the pack and `run_rails` are the
+caller's, as in `judgement_relations`, and only `main` resolves them, from the version the
+recorded file names. Importing it still loads the engine's v1.4.0 pack modules, since
+`judgement_relations` imports the extraction service's engine; the pack the figures are computed
+under is the one passed in.
 """
 
 from __future__ import annotations
