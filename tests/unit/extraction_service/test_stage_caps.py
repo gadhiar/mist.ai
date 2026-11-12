@@ -2,10 +2,10 @@
 
 Low keeps the named limits (96, 2048, 400), so a low-effort service sends
 exactly what it sent before caps depended on effort. Medium and high give
-scope and extract room to reason; derive runs at low effort, and so at its
-400 cap, under every setting, because no effort run measures derive above
-low. Qwen and Gemma send no effort, so their caps stay low's whatever the
-setting says.
+extract room to reason. Scope and derive run at low effort, and so at their
+96 and 400 caps, under every setting: scope is a classification, and no
+effort run measures derive above low. Qwen and Gemma send no effort, so their
+caps stay low's whatever the setting says.
 """
 
 from __future__ import annotations
@@ -137,11 +137,11 @@ class TestTheCapsTable:
 
 class TestStageEffort:
     @pytest.mark.parametrize("effort", ["low", "medium", "high"])
-    def test_gpt_oss_sends_its_effort_to_scope_and_extract_and_low_to_derive(self, effort):
+    def test_gpt_oss_sends_its_effort_to_extract_and_low_to_scope_and_derive(self, effort):
         adapter = GptOssAdapter(reasoning_effort=effort)
 
         assert [adapter.stage_effort(stage) for stage in REQUEST_STAGES] == [
-            effort,
+            "low",
             effort,
             "low",
         ]
@@ -154,7 +154,7 @@ class TestStageEffort:
         prepared = [adapter.prepare(request, stage=stage).thinking for stage in REQUEST_STAGES]
 
         assert [(t.effort, t.budget_tokens) for t in prepared] == [
-            (effort, 64),
+            ("low", 64),
             (effort, 64),
             ("low", 64),
         ]
@@ -187,7 +187,7 @@ class TestWhatEachStageSends:
         ]
 
     @pytest.mark.parametrize("effort", ["medium", "high"])
-    async def test_gpt_oss_above_low_sends_medium_caps_and_derive_at_low(
+    async def test_gpt_oss_above_low_sends_extract_at_its_effort_and_the_rest_at_low(
         self, service_settings, wired_llm, health_probe, ctx_size_source, fake_llama_state, effort
     ):
         settings = dataclasses.replace(service_settings, reasoning_effort=effort)
@@ -197,7 +197,7 @@ class TestWhatEachStageSends:
         )
 
         assert [(_sent_effort(body), body["max_tokens"]) for body in sent] == [
-            (effort, 1024),
+            ("low", 96),
             (effort, 32768),
             ("low", 400),
         ]
@@ -235,14 +235,16 @@ class TestWhatEachStageSends:
 
 
 class TestTheRecordedCaps:
-    def test_the_request_profile_at_medium_has_derive_at_low(self, service_settings, wired_llm):
+    def test_the_request_profile_at_medium_has_scope_and_derive_at_low(
+        self, service_settings, wired_llm
+    ):
         settings = dataclasses.replace(service_settings, reasoning_effort="medium")
         engine = ExtractionEngine(llm=wired_llm, adapter=_adapter_for(settings), settings=settings)
 
         profiles = engine.request_profile()
 
         assert [(p.stage, p.thinking_effort) for p in profiles] == [
-            ("scope", "medium"),
+            ("scope", "low"),
             ("extract", "medium"),
             ("derive", "low"),
         ]
@@ -251,8 +253,8 @@ class TestTheRecordedCaps:
         ("adapter_name", "effort", "caps"),
         [
             ("gptoss", "low", (96, 2048, 400)),
-            ("gptoss", "medium", (1024, 32768, 400)),
-            ("gptoss", "high", (1024, 32768, 400)),
+            ("gptoss", "medium", (96, 32768, 400)),
+            ("gptoss", "high", (96, 32768, 400)),
             ("qwen", "medium", (96, 2048, 400)),
             ("gemma", "high", (96, 2048, 400)),
         ],
@@ -277,6 +279,7 @@ class TestTheRecordedCaps:
         settings = dataclasses.replace(service_settings, reasoning_effort=effort)
         engine = ExtractionEngine(llm=wired_llm, adapter=_adapter_for(settings), settings=settings)
 
+        assert engine.stage_cap("scope") == 96
         assert engine.stage_cap("extract") == cap
         assert engine.stage_cap("derive") == 400
 

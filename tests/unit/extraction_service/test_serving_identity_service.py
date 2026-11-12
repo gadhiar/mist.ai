@@ -283,9 +283,10 @@ class TestAgreementWithTheRunIdentity:
 
         profiles = _engine_for(settings, wired_llm).request_profile()
 
-        # Derive is sent at low effort under every setting (`GptOssAdapter.stage_effort`).
+        # Scope and derive are sent at low effort under every setting
+        # (`GptOssAdapter.stage_effort`).
         assert {(p.stage, p.thinking_effort, p.thinking_budget_tokens) for p in profiles} == {
-            ("scope", run.reasoning_effort, run.reasoning_budget_tokens),
+            ("scope", "low", run.reasoning_budget_tokens),
             ("extract", run.reasoning_effort, run.reasoning_budget_tokens),
             ("derive", "low", run.reasoning_budget_tokens),
         }
@@ -365,7 +366,6 @@ _STAGE_BY_MAX_TOKENS = {
     SCOPE_MAX_TOKENS: "scope",
     EXTRACT_MAX_TOKENS: "extract",
     DERIVE_MAX_TOKENS: "derive",
-    STAGE_CAPS["medium"].scope: "scope",
     STAGE_CAPS["medium"].extract: "extract",
 }
 _CONSTRAINED_BY_FORMAT = {"json_schema": "schema", "json_object": "json_object", None: "none"}

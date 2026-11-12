@@ -47,8 +47,10 @@ class ServiceSettings:
         adapter_name: Model-family adapter to use (`"gptoss"`, `"qwen"`, or
             `"gemma"`). Switching models is a config change: a different
             `adapter_name` + `model_file` + `model_hash`, nothing else.
-        reasoning_effort: gpt-oss/Qwen chat-template reasoning-effort hint.
-            Default "low" per the T0 brief.
+        reasoning_effort: The reasoning-effort hint the gpt-oss adapter sends
+            on the extract stage. It sends scope and derive at low under
+            every setting, and the other adapters send no effort. Default
+            "low" per the T0 brief.
         reasoning_budget_tokens: Reasoning token budget. `None` means
             unbudgeted -- the field is omitted from the outgoing LLM
             request entirely (see `ThinkingConfig.budget_tokens`).

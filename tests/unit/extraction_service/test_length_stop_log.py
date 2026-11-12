@@ -152,7 +152,7 @@ class TestTheLengthStopLine:
         await engine.run(ExtractRequest(**make_extract_request()))
 
         assert [r.getMessage() for r in _length_stops(caplog)] == [
-            f"{_PREFIX} cap 1024 completion_tokens None reasoning_chars 500 content_chars 0 "
+            f"{_PREFIX} cap 96 completion_tokens None reasoning_chars 500 content_chars 0 "
             "repeat false"
         ]
 

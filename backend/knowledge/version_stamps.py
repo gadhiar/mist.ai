@@ -249,7 +249,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-c1cf16a9f46473765a83b3586ea6ba1c27756e3f3f20fa7006cfe8375d891306",
+        code_identity="ci1-08eb4f8523a2494a18c7d51262d0a21b82432221355d5b2280775a4250e28d1d",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -304,8 +304,11 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "the eval harness's aligner applies to ids of its type, which the aligner reads "
             "from the active pack in place of a type name of its own, and the Metric rule "
             "states it, which moves the pack's rails hash and nothing a rail reads or a "
-            "request carries. "
-            "With the flag off every request is sent exactly as before. "
+            "request carries; T49 sends scope at low effort under every setting, as derive "
+            "already was, so a service configured above low sends its scope call with low's "
+            "hint and low's 96-token cap. "
+            "With the turn plan flag off and the effort at low every request is sent exactly "
+            "as before. "
             "Re-extracts history."
         ),
     ),
