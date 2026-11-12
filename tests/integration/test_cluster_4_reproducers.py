@@ -165,4 +165,4 @@ class TestBugKInjectionPrompt:
         # Empty-return instruction must be present for directive handling.
         # The prompt uses double-brace escaping (it is a .format()-style template),
         # so the literal substring in the raw constant is the double-brace form.
-        assert 'return {{"entities": [], "relationships": []}}}}' in system_prompt
+        assert 'return {{"entities": [], "relationships": []}}' in system_prompt
