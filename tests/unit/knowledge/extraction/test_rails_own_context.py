@@ -38,6 +38,7 @@ from backend.knowledge.ontologies.pack import (
     build_pack,
     load_pack,
 )
+from tests.unit.knowledge.ontologies.fixtures.pet_pack.conventions import PET_ROSTER_CASE
 
 BASE = load_pack("tests.unit.knowledge.ontologies.fixtures.base_pack")
 PET = load_pack("tests.unit.knowledge.ontologies.fixtures.pet_pack")
@@ -330,6 +331,34 @@ _HARBOR_RECORD = [
 _HARBOR_ROW = ([_HARBOUR, _HARBOR], [], _HARBOR_RECORD, NO_ALIAS)
 _HARBOR_REVERSED_ROW = ([_HARBOR, _HARBOUR], [], _HARBOR_RECORD, NO_ALIAS)
 
+# One crossing written under two spellings in two batches: the dropped `fery` spelling's
+# batch is under the heading, and the kept `ferry` spelling's under `Day 2` or under the
+# heading as well. The kept entity is offered the lines of both batches.
+_FERY = _hand("harbour-weekend-fery-crossing", "Ferry crossing")
+_FERRY = _hand("harbour-weekend-ferry-crossing", "Ferry crossing")
+_FERRY_DAY_2_RECORD = [
+    _batch([("Harbour weekend",)], [_FERY]),
+    _batch([("Day 2",)], [_FERRY]),
+]
+_FERRY_HEADING_RECORD = [
+    _batch([("Harbour weekend",)], [_FERY]),
+    _batch([("Harbour weekend",)], [_FERRY]),
+]
+_FERRY_DAY_2_ROW = ([_FERRY, _FERY], [], _FERRY_DAY_2_RECORD, NO_ALIAS)
+_FERRY_DAY_2_REVERSED_ROW = ([_FERY, _FERRY], [], _FERRY_DAY_2_RECORD, NO_ALIAS)
+_FERRY_HEADING_ROW = ([_FERRY, _FERY], [], _FERRY_HEADING_RECORD, NO_ALIAS)
+_FERRY_HEADING_REVERSED_ROW = ([_FERY, _FERRY], [], _FERRY_HEADING_RECORD, NO_ALIAS)
+
+# The third shape in which a second run differs: a line offered through the merge
+# refuses the strip on the first run, and is not offered on the second.
+_REDIS_CLUSTER = _hand("redis-cluster", "Redis cluster")
+_NODES_LONG = _hand("redis-cluster-nodes", "Redis cluster nodes")
+_NODES_SHORT = _hand("redis-cluster-node", "Redis cluster nodes")
+_MERGED_NODES_RECORD = [
+    _batch([("Redis",)], [_NODES_LONG]),
+    _batch([("Redis cluster",)], [_NODES_SHORT]),
+]
+
 
 def test_a_lead_ins_slug_in_front_of_each_items_id_is_stripped_and_the_edges_follow():
     entities, relationships = _run(_ROSTER, _ROSTER_EDGES, batch_record=_ROSTER_RECORD)
@@ -575,6 +604,67 @@ def test_two_spellings_under_one_heading_lose_it_in_both_orders():
     assert _row_ids(_HARBOR_REVERSED_ROW) == ["ferry-crossing"]
 
 
+# --- a merged spelling's batch: the kept entity is offered its lines ----------------------------
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param(_FERRY_DAY_2_ROW, id="kept-spelling-under-day-2"),
+        pytest.param(_FERRY_DAY_2_REVERSED_ROW, id="kept-spelling-under-day-2-reversed"),
+        pytest.param(_FERRY_HEADING_ROW, id="both-under-the-heading"),
+        pytest.param(_FERRY_HEADING_REVERSED_ROW, id="both-under-the-heading-reversed"),
+    ],
+)
+def test_the_kept_spelling_loses_a_heading_the_dropped_spellings_batch_was_read_under(row):
+    assert _row_ids(row) == ["ferry-crossing"]
+
+
+@pytest.mark.parametrize("reversed_order", [False, True], ids=["as-written", "reversed"])
+def test_the_fan_out_and_the_strip_both_read_a_dropped_spellings_batch_as_the_kept_entitys(
+    reversed_order,
+):
+    # The roster's batch holds only the dropped `our-pets-pi`; the kept `our-pets-pip`
+    # was written in the neighbours' batch. The fan-out counts the kept entity a member
+    # of the roster, and the strip offers it the roster's line: the edge names it by
+    # the id it is stored under.
+    user = {"id": "user", "name": "User", "type": "Deckhand"}
+    kept = {"id": "our-pets-pip", "name": "Pip", "type": "Pet"}
+    dropped = {"id": "our-pets-pi", "name": "Pip", "type": "Pet"}
+    record = [
+        _batch([("Our pets",)], [user, dropped]),
+        _batch([("The neighbours' animals",)], [kept]),
+    ]
+    pets = [dropped, kept] if reversed_order else [kept, dropped]
+
+    entities, relationships = _run(
+        [user, *pets],
+        pack=PET,
+        scope=PET_ROSTER_CASE.scope,
+        batch_record=record,
+        turn_plan=PET_ROSTER_CASE.turn_plan,
+    )
+
+    assert _ids(entities) == ["user", "pip"]
+    assert [(r["source"], r["target"], r["type"]) for r in relationships] == [
+        ("user", "pip", "HAS_PET")
+    ]
+
+
+@pytest.mark.parametrize("reversed_order", [False, True], ids=["as-written", "reversed"])
+def test_a_line_offered_through_the_merge_is_not_offered_on_a_second_run(reversed_order):
+    # On the first run the kept `redis-cluster-nodes` is offered `redis-cluster` from the
+    # dropped spelling's batch; it names an entity of the row, so it is refused and ends
+    # the strip. The output holds no dropped spelling, so a second run offers only
+    # `redis`, which strips.
+    nodes = [_NODES_SHORT, _NODES_LONG] if reversed_order else [_NODES_LONG, _NODES_SHORT]
+    first = _run([_REDIS_CLUSTER, *nodes], pack=NO_ALIAS, batch_record=_MERGED_NODES_RECORD)
+    second = _run(*first, pack=NO_ALIAS, batch_record=_MERGED_NODES_RECORD)
+
+    assert _ids(first[0]) == ["redis-cluster", "redis-cluster-nodes"]
+    assert _ids(second[0]) == ["redis-cluster", "cluster-nodes"]
+
+
 # --- which contexts may strip which entity ------------------------------------------------------
 
 
@@ -752,10 +842,14 @@ def test_the_roster_row_gives_the_bytes_stated_here():
         ),
         pytest.param(_HARBOR_ROW, id="two-spellings-under-one-heading"),
         pytest.param(_HARBOR_REVERSED_ROW, id="two-spellings-under-one-heading-reversed"),
+        pytest.param(_FERRY_DAY_2_ROW, id="a-dropped-spellings-heading"),
+        pytest.param(_FERRY_DAY_2_REVERSED_ROW, id="a-dropped-spellings-heading-reversed"),
+        pytest.param(_FERRY_HEADING_ROW, id="both-spellings-under-the-heading"),
+        pytest.param(_FERRY_HEADING_REVERSED_ROW, id="both-spellings-under-the-heading-reversed"),
     ],
 )
 def test_a_second_run_over_a_rows_own_output_changes_nothing(row):
-    # True of these rows, not of every row: `rails._own_contexts` states the two shapes
+    # True of these rows, not of every row: `rails._own_contexts` states the three shapes
     # in which a second run differs.
     entities, relationships, record, pack = row
     first = _run(entities, relationships, pack=pack, batch_record=record)
