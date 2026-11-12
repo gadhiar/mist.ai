@@ -869,13 +869,23 @@ class ExtractionEngine:
                 stream. Whether llama-server stops generating when the stream
                 closes is not measured here.
 
+        The call runs in the caller's task under `asyncio.timeout`, not in a
+        task of its own under `asyncio.wait_for`: on Python 3.11 `wait_for`
+        returns the result of a call that finished by the time a cancel of
+        the run woke it, and drops the cancel, so the run went on to its next
+        call. Here the cancel stays pending and ends the run at its next
+        await.
+
         Raises:
             TimeoutError: The call exceeded `settings.llm_timeout_seconds`.
             openai.APIError / LLMConnectionError / LLMResponseError: The
                 transport or provider failed.
         """
-        call = self._read_stream(request) if stream else self._llm.invoke(request)
-        response = await asyncio.wait_for(call, timeout=self._settings.llm_timeout_seconds)
+        async with asyncio.timeout(self._settings.llm_timeout_seconds):
+            if stream:
+                response = await self._read_stream(request)
+            else:
+                response = await self._llm.invoke(request)
         _log_call(request, response)
         if response.finish_reason == "length":
             _log_length_stop(request, response)

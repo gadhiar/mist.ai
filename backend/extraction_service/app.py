@@ -899,7 +899,7 @@ def build_app_from_env() -> FastAPI:
     """Wire the real `LlamaServerProvider` and health probe from env vars.
 
     The provider's clients take `llm_timeout_seconds`, the bound the engine's
-    `asyncio.wait_for` puts on each call, so the SDK's 600 s read default no
+    `asyncio.timeout` puts on each call, so the SDK's 600 s read default no
     longer cuts a call the engine still allows.
     """
     settings = ServiceSettings.from_env()

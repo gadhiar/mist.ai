@@ -13,10 +13,12 @@ whether the service left it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import pytest
 
+from backend.extraction_contract.models import ExtractRequest
 from tests.unit.extraction_service.conftest import make_extract_request
 
 _SCOPE_THEN_EXTRACT = [
@@ -232,6 +234,68 @@ class TestCancelRoute:
         assert kept.status_code == 200, kept.text
         assert kept.json()["job_id"] == "j-2"
         assert fake_llama_state.chat_aborted == 1
+
+
+@pytest.mark.asyncio
+class TestACancelAsACallReturns:
+    async def test_a_cancel_that_lands_as_an_llm_call_returns_ends_the_run(
+        self, engine, wired_llm, fake_llama_state, blocked_chat, monkeypatch
+    ):
+        """A cancel that lands in the turn the scope call returns ends the run.
+
+        On Python 3.11 `asyncio.wait_for` runs the call in a task of its own,
+        and when that task has finished by the time a cancel wakes the caller,
+        it returns the result and drops the cancel: the run goes on to its
+        extract call and finishes. The fake holds the scope reply until the
+        test sets its gate, and the test cancels the run's task in the first
+        turn it sees the call return, which is inside that window, so the two
+        land together on every run, not by chance. `_IdempotencyCache.cancel`
+        cancels a job's run task the same way.
+
+        Under `asyncio.timeout` the call runs in the run's own task, so the
+        cancel stays pending and is raised at the run's next await. In this
+        test that await is inside the extract call's request, which the run
+        leaves before reading any of its reply.
+        """
+        # Arrange
+        fake_llama_state.chat_responses = list(_SCOPE_THEN_EXTRACT)
+        returned: list[object] = []
+        streamed: list[object] = []
+        real_invoke = wired_llm.invoke
+        real_generate = wired_llm.generate
+
+        async def invoke_and_note(request):
+            response = await real_invoke(request)
+            returned.append(response)
+            return response
+
+        async def generate_and_note(request, *, stream=False):
+            # `invoke` reads the scope call through `generate` too, unstreamed.
+            async with contextlib.aclosing(real_generate(request, stream=stream)) as chunks:
+                async for chunk in chunks:
+                    if stream:
+                        streamed.append(chunk)
+                    yield chunk
+
+        monkeypatch.setattr(wired_llm, "invoke", invoke_and_note)
+        monkeypatch.setattr(wired_llm, "generate", generate_and_note)
+        request = ExtractRequest(**make_extract_request(job_id="j-1"))
+        run = asyncio.create_task(engine.run(request))
+        await _until(lambda: len(fake_llama_state.chat_requests) == 1)
+
+        # Act: release the scope reply, and cancel the run as the call returns.
+        blocked_chat.set()
+        await _until(lambda: bool(returned))
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=2.0)
+        await _settle()
+
+        # Assert: the scope call returned, the run ended cancelled, and no
+        # reply of a later call was read.
+        assert len(returned) == 1
+        assert run.cancelled()
+        assert streamed == []
 
 
 @pytest.mark.asyncio

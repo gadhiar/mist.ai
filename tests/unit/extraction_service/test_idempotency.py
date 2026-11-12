@@ -219,7 +219,7 @@ class TestCancel:
         await _ticks()
         cache.cancel("j")
         with pytest.raises(JobCancelledError):
-            await owner
+            await asyncio.wait_for(owner, timeout=2.0)
 
         run.release.set()
         again = await cache.get_or_run("j", run)
@@ -239,7 +239,7 @@ class TestCancel:
         cache.cancel("j")
         again = asyncio.create_task(cache.get_or_run("j", run))
         with pytest.raises(JobCancelledError):
-            await owner
+            await asyncio.wait_for(owner, timeout=2.0)
         await _ticks()
         still_in_flight = cache.knows("j")
         run.release.set()

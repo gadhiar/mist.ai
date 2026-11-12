@@ -249,7 +249,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-9aaeadf138695f0237398b071900994fc243f18ae256326e616963c7ab0cd66b",
+        code_identity="ci1-22f9a668a2094d8f3632428eaf102870023d37a7afc4073356fc98a6c11efab4",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -313,7 +313,9 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "requests, read to their end, so that a call that times out or whose run is "
             "cancelled closes its stream; LlamaServerProvider closes a streamed call's "
             "stream however the call ends, and raises a transport failure while the "
-            "stream is read as LLMConnectionError. "
+            "stream is read as LLMConnectionError; the engine bounds each call with "
+            "asyncio.timeout in the run's own task, not asyncio.wait_for, so a cancel that "
+            "lands as a call returns ends the run instead of being dropped. "
             "With the turn plan flag off, the effort at low and that budget set to none, "
             "the scope and derive requests are sent exactly as before, and the extract "
             "request differs only in asking for a streamed reply and its usage chunk. "
