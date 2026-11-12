@@ -4,9 +4,10 @@ ADR-054's v14 amendment (point 2, register rows 1 and 2) and plan v15's T51 stat
 `team-fan-out` rule, a `fan_out` rule on each team's `MEMBER_OF` edges:
 
 - each member gains `WORKS_AT` the team's employer E when E resolves. It resolves only
-  when the team's own heading, lead-in or unit names an `Organization` E, read from the
-  batch record or from the turn plan's template, and a member holds a current `WORKS_AT`
-  E. A team's `PART_OF` its employer is no trigger: Rule 34 forbids that edge;
+  when the team's own heading or lead-in names an `Organization` E, read from the batch
+  record or from the turn plan's template, and a member holds a current `WORKS_AT` E. A
+  unit's own text, a member's item or a line of prose, is never read (lead ruling M61).
+  A team's `PART_OF` its employer is no trigger: Rule 34 forbids that edge;
 - in a user-scope row the user gains `KNOWS_PERSON` each member other than themself,
   whether or not an employer resolves;
 - a member gains nothing unless every input edge the rule reads is a current assertion,
@@ -183,11 +184,45 @@ def test_each_member_gains_the_employer_the_teams_heading_names(pack: Pack):
     assert relationships[-2] == _edge("tomasz-wierzba", "varnholt", "WORKS_AT", COPIED)
 
 
-def test_a_unit_that_names_the_team_and_its_employer_resolves_it(pack: Pack):
+def test_a_unit_whose_own_text_names_the_team_and_its_employer_resolves_none(pack: Pack):
+    # M61: the employer counts from the team's heading or lead-in only, never from a
+    # unit's own text, even one that names the team.
     record = [
         _batch(
             ("Teams",),
             (f"{HEADING}: Oriana Duarte, Tomasz Wierzba", "Quillmere reading group: Oriana Duarte"),
+            TEAM[1:],
+        )
+    ]
+
+    _, relationships = _run(pack, TEAM, TEAM_EDGES, batch_record=record)
+
+    assert _pairs(relationships, "WORKS_AT") == [("oriana-duarte", "varnholt")]
+
+
+def test_a_line_of_prose_that_names_a_team_and_an_employer_resolves_none(pack: Pack):
+    # Pass 1's probe P4: the user works at Varnholt and plays in a circle with Ruairi.
+    # Ruairi gains no employer; the user's acquaintance needs none, so it still comes.
+    entities = (USER, VARNHOLT, CHESS, RUAIRI)
+    edges = (
+        _edge("user", "varnholt", "WORKS_AT", LIVE),
+        _edge("user", "thursday-chess-circle", "MEMBER_OF", LIVE),
+        _edge("ruairi-spelman", "thursday-chess-circle", "MEMBER_OF", LIVE),
+    )
+    text = "I work at Varnholt and play in the Thursday chess circle with Ruairi Spelman."
+    record = [_batch((), (text,), entities, kind="prose")]
+
+    _, relationships = _run(pack, entities, edges, batch_record=record)
+
+    assert _pairs(relationships, "WORKS_AT") == [("user", "varnholt")]
+    assert _pairs(relationships, "KNOWS_PERSON") == [("user", "ruairi-spelman")]
+
+
+def test_a_lead_in_under_the_teams_heading_resolves_it(pack: Pack):
+    record = [
+        _batch(
+            ("Kestrel platform team", "All of them at Varnholt:"),
+            ("Oriana Duarte", "Tomasz Wierzba"),
             TEAM[1:],
         )
     ]
@@ -271,6 +306,30 @@ def test_a_club_at_a_venue_where_no_member_works_gains_no_employer(pack: Pack):
 
     assert _pairs(relationships, "WORKS_AT") == []
     assert _pairs(relationships, "KNOWS_PERSON") == [("user", "odile-brannagh")]
+
+
+def test_a_members_own_item_that_names_their_employer_names_none_for_the_team(pack: Pack):
+    # ADR-054's v14 amendment rejects a club whose member works somewhere giving every
+    # member that employer: a member's own item is not the team's heading, lead-in or unit.
+    hospital = _entity("brigid-hospital", "Brigid Hospital", "Organization")
+    femi = _entity("femi-achterberg", "Femi Achterberg", "Person")
+    entities = (USER, ROWING, hospital, ODILE, femi)
+    edges = (
+        _edge("odile-brannagh", "saltmarsh-rowing-club", "MEMBER_OF", LIVE),
+        _edge("odile-brannagh", "brigid-hospital", "WORKS_AT", LIVE),
+        _edge("femi-achterberg", "saltmarsh-rowing-club", "MEMBER_OF", LIVE),
+    )
+    record = [
+        _batch(
+            ("Saltmarsh rowing club",),
+            ("Odile Brannagh, a nurse at Brigid Hospital", "Femi Achterberg"),
+            entities[1:],
+        )
+    ]
+
+    _, relationships = _run(pack, entities, edges, batch_record=record)
+
+    assert _pairs(relationships, "WORKS_AT") == [("odile-brannagh", "brigid-hospital")]
 
 
 def test_a_club_beside_the_users_employer_gains_no_employer(pack: Pack):
@@ -463,11 +522,14 @@ def test_the_pinned_case_adds_the_employer_once_and_the_acquaintances():
     added = _case_added(RULE_ID)
     copied = {"temporal_status": "current", "confidence": 0.85}
 
-    # Someone else's team at the user's employer: its two current members gain the
-    # employer (one holds it already) and the user's acquaintance. The negated, past,
-    # ceased and retracted members gain nothing. The club at a venue and the club the
-    # user is in gain no employer; their other members gain the acquaintance.
+    # The club named in prose beside the user's employer gains no employer (M61); its
+    # other member gains the acquaintance. Someone else's team at the user's employer:
+    # its two current members gain the employer (one holds it already) and the user's
+    # acquaintance. The negated, past, ceased and retracted members gain nothing. The
+    # club at a venue and the club the user is in gain no employer; their other members
+    # gain the acquaintance.
     assert [(rel["source"], rel["target"], rel["type"]) for rel in added] == [
+        ("user", "signe-varga", "KNOWS_PERSON"),
         ("user", "oriana-duarte", "KNOWS_PERSON"),
         ("tomasz-wierzba", "varnholt", "WORKS_AT"),
         ("user", "tomasz-wierzba", "KNOWS_PERSON"),
@@ -476,5 +538,5 @@ def test_the_pinned_case_adds_the_employer_once_and_the_acquaintances():
         ("user", "ruairi-spelman", "KNOWS_PERSON"),
     ]
     # The dated membership's derived edges carry its confidence and status, no date.
-    assert added[1]["properties"] == copied
     assert added[2]["properties"] == copied
+    assert added[3]["properties"] == copied

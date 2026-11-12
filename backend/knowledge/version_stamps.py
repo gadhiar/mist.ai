@@ -174,13 +174,15 @@ class PackRelease:
 # which changes what reaches the model. The rails hash then moved with the
 # `team-fan-out` rule and its `team-employer` plug-in, which add a named team's
 # members' `WORKS_AT` and the user's `KNOWS_PERSON` after the model, and again with
-# the `team-part-of` rule, which drops a named team's `PART_OF` its employer: a
+# the `team-part-of` rule, which drops a named team's `PART_OF` its employer, and
+# once more when the plug-in stopped reading a unit's own text, a member's item or a
+# line of prose, and read a team's employer from its heading or lead-in only: a
 # replay each time, with no bump.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
     pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
-    pack_rails_hash="7ad1dd7da6d0c44096751b1e75859db104f2008e569b29460e1a5a300a4e08ad",
+    pack_rails_hash="1c08415cf78642fc15a69d1badf3e0ebe1ef1fb69edb867094431f99d6be3f28",
 )
 
 

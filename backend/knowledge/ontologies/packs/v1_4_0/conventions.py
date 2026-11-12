@@ -527,7 +527,7 @@ def _team_batch(
 
 # A user-scope message in four batches, its opening line and one per heading:
 #
-#     I work at Varnholt.
+#     I work at Varnholt and play in the Lowfield bridge club with Signe Varga.
 #     ## Kestrel platform team at Varnholt
 #     - Oriana Duarte
 #     - Tomasz Wierzba, since March
@@ -542,13 +542,16 @@ def _team_batch(
 #     - me
 #     - Ruairi Spelman
 #
-# Someone else's team: its heading names Varnholt and Oriana works there, so its
-# current members gain Varnholt (Oriana holds it already) and the user's acquaintance. Tomasz's
-# dated membership gives its confidence and status and no date. The negated, past,
-# ceased and retracted memberships add nothing. A club at a venue: its heading names an
-# Organization no member works at, so it gains no employer. A club the user is in,
-# beside the user's employer: its heading names none, so it gains no employer either.
-# Their other members gain the user's acquaintance; the user gains no edge to themself.
+# A club named in a line of prose beside the user's employer: the employer counts from
+# a team's heading or lead-in only, never from a unit's own text (lead ruling M61), so
+# Signe gains no employer. Someone else's team: its heading names Varnholt and Oriana
+# works there, so its current members gain Varnholt (Oriana holds it already) and the
+# user's acquaintance. Tomasz's dated membership gives its confidence and status and no
+# date. The negated, past, ceased and retracted memberships add nothing. A club at a
+# venue: its heading names an Organization no member works at, so it gains no employer.
+# A club the user is in, beside the user's employer: its heading names none, so it
+# gains no employer either. The clubs' other members gain the user's acquaintance; the
+# user gains no edge to themself.
 _KESTREL_HEADING = "Kestrel platform team at Varnholt"
 _ROWING_HEADING = "Saltmarsh rowing club at Copperfield Boathouse"
 _CHESS_HEADING = "Thursday chess circle"
@@ -573,8 +576,17 @@ _CHESS = (
     _entity("thursday-chess-circle", "Thursday chess circle", "Organization"),
     _entity("ruairi-spelman", "Ruairi Spelman", "Person"),
 )
-_TEAMS = (_USER, *_KESTREL, *_ROWING, *_CHESS)
-_EMPLOYER_EDGES = (_team_edge("user", "varnholt", "WORKS_AT"),)
+_BRIDGE = (
+    _entity("lowfield-bridge-club", "Lowfield bridge club", "Organization"),
+    _entity("signe-varga", "Signe Varga", "Person"),
+)
+_TEAMS = (_USER, *_KESTREL, *_BRIDGE, *_ROWING, *_CHESS)
+_OPENING_LINE = "I work at Varnholt and play in the Lowfield bridge club with Signe Varga."
+_EMPLOYER_EDGES = (
+    _team_edge("user", "varnholt", "WORKS_AT"),
+    _team_edge("user", "lowfield-bridge-club", "MEMBER_OF"),
+    _team_edge("signe-varga", "lowfield-bridge-club", "MEMBER_OF"),
+)
 _DATED = {"confidence": 0.85, "start_date": "2026-03-01", "temporal_expression": "since March"}
 _KESTREL_EDGES = (
     _team_edge("oriana-duarte", "kestrel-platform-team", "MEMBER_OF"),
@@ -604,6 +616,12 @@ _TEAM_FAN_OUT_CASE = PinnedCase(
         *_KESTREL_EDGES,
         *_ROWING_EDGES,
         *_CHESS_EDGES,
+        {
+            "source": "user",
+            "target": "signe-varga",
+            "type": "KNOWS_PERSON",
+            "properties": _COPIED,
+        },
         {
             "source": "user",
             "target": "oriana-duarte",
@@ -643,7 +661,7 @@ _TEAM_FAN_OUT_CASE = PinnedCase(
     ),
     scope="user-scope",
     batch_record=(
-        _team_batch((), ("I work at Varnholt.",), (_USER, _VARNHOLT), _EMPLOYER_EDGES, "prose"),
+        _team_batch((), (_OPENING_LINE,), (_USER, _VARNHOLT, *_BRIDGE), _EMPLOYER_EDGES, "prose"),
         _team_batch(
             (_KESTREL_HEADING,),
             (

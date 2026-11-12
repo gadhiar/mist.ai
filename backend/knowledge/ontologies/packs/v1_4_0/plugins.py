@@ -140,13 +140,17 @@ def _holds(batch: Mapping, entity_id: object) -> bool:
 
 
 def _team_lines(team: Mapping, row: _Row) -> Iterator[str]:
-    """The team's own headings, lead-ins and units, each slugged.
+    """The team's own headings and lead-ins, each slugged; never a unit's own text.
 
-    - A unit is read from a batch whose own payload holds the team. It is the team's
-      when its text or one of its context lines names the team, and then its text and
-      every context line are the team's: the headings and lead-in it was read under,
-      and the unit itself. A batch's own `context`, the earlier units it was shown for
-      reference, is not read.
+    - From a batch whose own payload holds the team, a unit's context lines, the
+      headings and lead-in it was read under, are the team's when one of them names
+      the team. A unit's own text is never read, prose included: a member's own item
+      names that member's employer, not the team's, and a club whose member works
+      somewhere must not give every member that employer (ADR-054's v14 amendment).
+      The rail only infers, and a wrong `WORKS_AT` would overwrite a stored employer,
+      so a sentence that names a team and an employer together gives none; the
+      model's own `WORKS_AT` still covers it. A batch's own `context`, the earlier
+      units it was shown for reference, is not read.
     - A template of the turn plan is the team's when its fixed endpoint is the team or
       its lead-in names the team, and then its lead-in is the team's.
     """
@@ -155,10 +159,9 @@ def _team_lines(team: Mapping, row: _Row) -> Iterator[str]:
         if not _holds(batch, team_id):
             continue
         for unit in batch.get("units") or ():
-            lines = [canonical_id(str(unit.get("text") or ""))]
-            lines += [canonical_id(str(line)) for line in unit.get("context") or ()]
-            if any(_names(line, team) for line in lines):
-                yield from lines
+            context = [canonical_id(str(line)) for line in unit.get("context") or ()]
+            if any(_names(line, team) for line in context):
+                yield from context
     team_slug = canonical_id(str(team_id or ""))
     for template in (row.turn_plan or {}).get("templates") or ():
         lead_in = canonical_id(str(template.get("lead_in") or ""))
@@ -173,9 +176,9 @@ def team_employer(group: _Group, row: _Row) -> str | None:
     ADR-054's v14 amendment, point 2 and register row 1. The employer is the one
     `Organization` E, other than the team, that both:
 
-    - one of the team's own headings, lead-ins or units names, read from the batch
-      record or from the turn plan's template (`_team_lines`), by E's id or display
-      name as whole words; and
+    - one of the team's own headings or lead-ins names, read from the batch record or
+      from the turn plan's template (`_team_lines`), by E's id or display name as whole
+      words; a unit's own text, a member's item or a line of prose, is never read; and
     - a member of the team holds a `WORKS_AT` to. The runner lists only the members
       whose every `MEMBER_OF` the team is a current assertion, and shows only current
       edges, so both input edges are current.
