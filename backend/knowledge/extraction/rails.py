@@ -1121,7 +1121,9 @@ PHASES: tuple[tuple[str, Callable[[_State, Pack], None]], ...] = (
 )
 
 
-def _run_phases(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
+def _run_phases(
+    cache_row: RailRow, pack: Pack, *, relation_rails: bool = True
+) -> tuple[list[dict], list[dict]]:
     """The phases and the dedupe over one row, with no check of the pack."""
     state = _State(
         row=cache_row,
@@ -1129,7 +1131,9 @@ def _run_phases(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]
         relationships=list(cache_row.relationships),
         named=frozenset(canonical_id(_raw_id(entity)) for entity in cache_row.entities),
     )
-    for _, phase in PHASES:
+    for name, phase in PHASES:
+        if name == "relation" and not relation_rails:
+            continue
         phase(state, pack)
     return _dedupe(state.entities, state.relationships)
 
@@ -1162,7 +1166,9 @@ def require_pinned_cases(pack: Pack) -> None:
         raise PackLoadError(f"pack {pack.version}: pinned case(s) do not hold: {', '.join(failed)}")
 
 
-def run_rails(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
+def run_rails(
+    cache_row: RailRow, pack: Pack, *, relation_rails: bool = True
+) -> tuple[list[dict], list[dict]]:
     """Run a pack's post-LLM rules over one cache row.
 
     The entity and relationship dicts of the row are changed in place; its lists are
@@ -1171,6 +1177,11 @@ def run_rails(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
     Args:
         cache_row: The row, built with `rail_row`.
         pack: The pack whose rules run.
+        relation_rails: False skips the relation phase, so the output is what the pack
+            gives with its relation-phase rules deleted; the payload, id and fallback
+            phases still run. The scorer's model-written column reads it, to tell the
+            edges the model wrote from those a relation rule added or removed. Every
+            other caller keeps the default.
 
     Returns:
         The entities and relationships the graph stores.
@@ -1180,7 +1191,7 @@ def run_rails(cache_row: RailRow, pack: Pack) -> tuple[list[dict], list[dict]]:
             touched.
     """
     require_pinned_cases(pack)
-    return _run_phases(cache_row, pack)
+    return _run_phases(cache_row, pack, relation_rails=relation_rails)
 
 
 def normalize_entity(entity: dict, pack: Pack) -> None:

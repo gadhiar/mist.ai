@@ -79,8 +79,8 @@ def _case_row(case) -> RailRow:
 # --- the runner ---------------------------------------------------------------------------
 
 
-def test_run_rails_takes_the_cache_row_and_the_pack_and_nothing_else():
-    assert list(inspect.signature(run_rails).parameters) == ["cache_row", "pack"]
+def test_run_rails_takes_the_cache_row_the_pack_and_the_relation_switch():
+    assert list(inspect.signature(run_rails).parameters) == ["cache_row", "pack", "relation_rails"]
 
 
 def test_the_phases_are_separate_steps_in_the_runners_order():
