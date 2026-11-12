@@ -148,15 +148,16 @@ class TestStageEffort:
 
     @pytest.mark.parametrize("effort", ["low", "medium", "high"])
     def test_gpt_oss_prepares_each_stage_at_its_stage_effort(self, effort):
+        """The budget goes on extract alone; scope and derive are sent none."""
         adapter = GptOssAdapter(reasoning_effort=effort, reasoning_budget_tokens=64)
         request = LLMRequest(messages=[])
 
         prepared = [adapter.prepare(request, stage=stage).thinking for stage in REQUEST_STAGES]
 
         assert [(t.effort, t.budget_tokens) for t in prepared] == [
-            ("low", 64),
+            ("low", None),
             (effort, 64),
-            ("low", 64),
+            ("low", None),
         ]
 
     @pytest.mark.parametrize("adapter", [QwenAdapter(), GemmaAdapter()], ids=["qwen", "gemma"])

@@ -120,14 +120,15 @@ services:
       # with CPU-MoE offload.
       - "-lm"
       - "none"
-      # No --reasoning-budget: the service sends a per-request budget
-      # (backend/extraction_service/settings.py's reasoning_budget_tokens,
-      # None by default -> omitted from the outgoing request); omitting the
-      # server flag too leaves llama-server's own default in effect, which
-      # is ALREADY -1/unrestricted (llama_server_help_b11151.txt:645), so a
-      # request-level -1 and "flag absent" resolve to the same unbudgeted
-      # behavior. Do not add --reasoning-budget here --
-      # test_compose_extraction.py asserts it is absent.
+      # No --reasoning-budget: the service sends the budget per request, on
+      # the extract call alone (backend/extraction_service/settings.py's
+      # reasoning_budget_tokens, 8192 unless
+      # EXTRACTION_REASONING_BUDGET_TOKENS on mist-extraction-local says
+      # otherwise). The scope and derive requests carry no budget, and with
+      # the server flag absent llama-server's own default applies to them,
+      # which is -1/unrestricted (llama_server_help_b11151.txt:645). Do not
+      # add --reasoning-budget here -- test_compose_extraction.py asserts it
+      # is absent.
       - "--cache-ram"
       - "${LLM_CACHE_RAM_MIB:-2048}"
       # gptoss family sampling (README.md:562-563, arms.json c9/bench-c9):
@@ -184,6 +185,13 @@ services:
       # LLM timeout set above and below. low is the override for a run
       # beside the main stack.
       - EXTRACTION_REASONING_EFFORT=${EXTRACTION_REASONING_EFFORT:-medium}
+      # The reasoning token budget the extract request carries
+      # (ServiceSettings.reasoning_budget_tokens). 8192 is also the service's
+      # own default, which an empty value falls back to. `none` sends no
+      # budget. It is part of the serving identity, so changing it starts a
+      # new extraction epoch. Whether llama-server b11151 honours the
+      # request field has not been measured on the GPU.
+      - EXTRACTION_REASONING_BUDGET_TOKENS=${EXTRACTION_REASONING_BUDGET_TOKENS:-8192}
       - EXTRACTION_LOCATION_LABEL=local-4070
       - LLAMA_CPP_BUILD=b11151
       # Declared llama-server settings (MIS-196). The service cannot see the

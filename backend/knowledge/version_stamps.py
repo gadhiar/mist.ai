@@ -249,7 +249,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-10-r8",
-        code_identity="ci1-08eb4f8523a2494a18c7d51262d0a21b82432221355d5b2280775a4250e28d1d",
+        code_identity="ci1-cbd4f5080fe9edc2c177fe23c3e81fc13033dd4f580033c77e88f617ecd07d7b",
         date="2026-11-10",
         reason=(
             "v11 (r8): the stored id comes from the `id` field through shared id rails, the "
@@ -306,9 +306,12 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "states it, which moves the pack's rails hash and nothing a rail reads or a "
             "request carries; T49 sends scope at low effort under every setting, as derive "
             "already was, so a service configured above low sends its scope call with low's "
-            "hint and low's 96-token cap. "
-            "With the turn plan flag off and the effort at low every request is sent exactly "
-            "as before. "
+            "hint and low's 96-token cap, and puts a reasoning budget on the extract "
+            "request and the plan call, 8,192 tokens unless "
+            "EXTRACTION_REASONING_BUDGET_TOKENS states another, with none on scope or "
+            "derive. "
+            "With the turn plan flag off, the effort at low and that budget set to none, "
+            "every request is sent exactly as before. "
             "Re-extracts history."
         ),
     ),

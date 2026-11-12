@@ -118,10 +118,16 @@ class GptOssAdapter:
     default_constrained_mode: ConstrainedMode = "schema"
 
     def prepare(self, request: LLMRequest, stage: str) -> LLMRequest:
-        """Set gpt-oss reasoning-effort/budget thinking controls on `request`."""
+        """Set the stage's reasoning effort on `request`, and the budget on extract.
+
+        The budget is the extract stage's alone: it is there to bound the
+        extract call's reasoning. Scope and derive are sent none; each runs
+        at low effort under low's output cap (`stage_effort`). The turn plan
+        call is sent as stage extract, so it carries the budget too.
+        """
         thinking = ThinkingConfig(
             effort=self.stage_effort(stage),
-            budget_tokens=self.reasoning_budget_tokens,
+            budget_tokens=self.reasoning_budget_tokens if stage == "extract" else None,
         )
         return request.model_copy(update={"thinking": thinking})
 

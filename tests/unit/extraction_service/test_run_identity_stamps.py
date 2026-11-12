@@ -133,7 +133,7 @@ class TestServiceReportsOneIdentity:
             "llama_cpp_build": service_settings.llama_cpp_build,
             "constrained_mode": "schema",
             "reasoning_effort": "low",
-            "reasoning_budget_tokens": None,
+            "reasoning_budget_tokens": 8192,
             "temperature": 0.0,
             "max_attempts": 2,
             "scope_enabled": True,

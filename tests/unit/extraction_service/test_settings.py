@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from backend.extraction_service.settings import ServiceSettings
+from backend.extraction_service.settings import DEFAULT_REASONING_BUDGET_TOKENS, ServiceSettings
 
 _ALL_ENV_VARS = [
     "EXTRACTION_LLM_BASE_URL",
@@ -35,7 +35,7 @@ class TestServiceSettingsFromEnv:
 
         assert settings.adapter_name == "gptoss"
         assert settings.reasoning_effort == "low"
-        assert settings.reasoning_budget_tokens is None
+        assert settings.reasoning_budget_tokens == 8192
         assert settings.constrained_mode is None
         assert settings.max_attempts == 2
         assert settings.idempotency_cache_size == 256
@@ -75,12 +75,42 @@ class TestServiceSettingsFromEnv:
         assert settings.max_attempts == 3
         assert settings.model_hash == "qwen-3.5-9b"
 
-    def test_reasoning_budget_tokens_unset_is_none(self, monkeypatch):
+    def test_the_reasoning_budget_defaults_to_8192(self, monkeypatch):
         monkeypatch.delenv("EXTRACTION_REASONING_BUDGET_TOKENS", raising=False)
 
-        settings = ServiceSettings.from_env()
+        assert DEFAULT_REASONING_BUDGET_TOKENS == 8192
+        assert ServiceSettings.from_env().reasoning_budget_tokens == 8192
+        assert (
+            ServiceSettings(
+                llm_base_url="http://x", model_hash="m", model_file="f"
+            ).reasoning_budget_tokens
+            == 8192
+        )
 
-        assert settings.reasoning_budget_tokens is None
+    @pytest.mark.parametrize("value", ["", "  "])
+    def test_an_empty_reasoning_budget_is_the_default(self, monkeypatch, value):
+        """Compose forwards an unset host variable as an empty string."""
+        monkeypatch.setenv("EXTRACTION_REASONING_BUDGET_TOKENS", value)
+
+        assert ServiceSettings.from_env().reasoning_budget_tokens == 8192
+
+    @pytest.mark.parametrize("value", ["none", "None", " NONE "])
+    def test_none_is_the_unbudgeted_spelling(self, monkeypatch, value):
+        monkeypatch.setenv("EXTRACTION_REASONING_BUDGET_TOKENS", value)
+
+        assert ServiceSettings.from_env().reasoning_budget_tokens is None
+
+    @pytest.mark.parametrize(("value", "budget"), [("0", 0), (" 4096 ", 4096)])
+    def test_a_number_is_the_reasoning_budget(self, monkeypatch, value, budget):
+        monkeypatch.setenv("EXTRACTION_REASONING_BUDGET_TOKENS", value)
+
+        assert ServiceSettings.from_env().reasoning_budget_tokens == budget
+
+    def test_a_reasoning_budget_that_is_no_number_is_refused(self, monkeypatch):
+        monkeypatch.setenv("EXTRACTION_REASONING_BUDGET_TOKENS", "unlimited")
+
+        with pytest.raises(ValueError, match="unlimited"):
+            ServiceSettings.from_env()
 
     def test_scope_enabled_accepts_common_truthy_and_falsy_spellings(self, monkeypatch):
         monkeypatch.setenv("EXTRACTION_SCOPE_ENABLED", "0")

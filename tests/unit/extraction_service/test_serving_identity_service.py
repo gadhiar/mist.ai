@@ -284,12 +284,21 @@ class TestAgreementWithTheRunIdentity:
         profiles = _engine_for(settings, wired_llm).request_profile()
 
         # Scope and derive are sent at low effort under every setting
-        # (`GptOssAdapter.stage_effort`).
+        # (`GptOssAdapter.stage_effort`), and the budget goes on extract alone.
         assert {(p.stage, p.thinking_effort, p.thinking_budget_tokens) for p in profiles} == {
-            ("scope", "low", run.reasoning_budget_tokens),
+            ("scope", "low", None),
             ("extract", run.reasoning_effort, run.reasoning_budget_tokens),
-            ("derive", "low", run.reasoning_budget_tokens),
+            ("derive", "low", None),
         }
+
+    def test_the_default_budget_is_8192_on_extract_alone(self, service_settings, wired_llm):
+        profiles = _engine_for(service_settings, wired_llm).request_profile()
+
+        assert [(p.stage, p.thinking_budget_tokens) for p in profiles] == [
+            ("scope", None),
+            ("extract", 8192),
+            ("derive", None),
+        ]
 
 
 def _reasoning(settings: ServiceSettings) -> dict:
