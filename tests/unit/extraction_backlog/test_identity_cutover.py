@@ -73,6 +73,21 @@ def sync_world():
     return _build_world(with_deriver=False)
 
 
+# Invented pack hashes: the ones `stored_sync_world`'s epoch stores, and the
+# rails hash of a candidate that changes the rails alone.
+EPOCH_PROMPT = "a" * 64
+EPOCH_RAILS = "b" * 64
+NEXT_RAILS = "e" * 64
+
+
+@pytest.fixture
+def stored_sync_world():
+    """`sync_world` whose active epoch stores (EPOCH_PROMPT, EPOCH_RAILS)."""
+    return _build_world(
+        with_deriver=False, pack_prompt_hash=EPOCH_PROMPT, pack_rails_hash=EPOCH_RAILS
+    )
+
+
 def _cli(
     world, *argv: str, store: BacklogStore | None = None, pack_for_version=None
 ) -> tuple[int, str]:
@@ -247,8 +262,8 @@ class _PassThroughResolver:
 
 class _PassThroughNormalizer:
     async def normalize(self, extraction, **_rail_inputs):
-        # The replay passes a row's batch record and turn plan as keywords
-        # (`rail_inputs`); a pass-through has no rails to hand them to.
+        # The replay passes a row's scope, batch record and turn plan as
+        # keywords (`rail_inputs`); a pass-through has no rails to hand them to.
         return extraction
 
 
@@ -565,6 +580,43 @@ class TestAccept:
         # bind it there (binding.py, rule 2).
         world = sync_world
         assert _begin(world, "--settings-change", "--refill")[0] == 0
+        cutover = world.store.open_cutover()
+
+        code, text = _accept(
+            world, world.service.serving_identity, world.dispatch_identity().identity, "--cutover"
+        )
+
+        assert code == 2
+        assert "settings-change" in text
+        assert world.event_store.get_identity_acceptance(-cutover.cutover_id) is None
+
+    def test_cutover_on_a_replay_candidate_is_accepted(self, stored_sync_world):
+        # Its source's triple under another rails hash is not its source's
+        # stamps: the candidate shares the pair's 3-part rows, so rule 2 can
+        # bind it there.
+        world = stored_sync_world
+        world.bind_active_epoch()
+        replay_pack = fake_pack_resolver({ONTOLOGY_VERSION: (EPOCH_PROMPT, NEXT_RAILS)})
+        assert _begin(world, pack_for_version=replay_pack)[0] == 0
+        cutover = world.store.open_cutover()
+
+        code, text = _accept(
+            world, world.service.serving_identity, world.dispatch_identity().identity, "--cutover"
+        )
+
+        assert code == 0, text
+        row = world.event_store.get_identity_acceptance(-cutover.cutover_id)
+        assert row["serving_identity"] == world.service.serving_identity
+
+    def test_cutover_on_a_settings_change_candidate_with_its_sources_hashes_is_refused(
+        self, stored_sync_world
+    ):
+        # All five stamps are its source's, hashes included: still a
+        # settings-change candidate.
+        world = stored_sync_world
+        world.bind_active_epoch()
+        same_pack = fake_pack_resolver({ONTOLOGY_VERSION: (EPOCH_PROMPT, EPOCH_RAILS)})
+        assert _begin(world, "--settings-change", pack_for_version=same_pack)[0] == 0
         cutover = world.store.open_cutover()
 
         code, text = _accept(

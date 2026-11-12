@@ -130,6 +130,54 @@ def describe_pack_hashes(carrier: CarriesPackHashes, names: tuple[str, ...]) -> 
     return ", ".join(f"{name}={getattr(carrier, name)!r}" for name in names)
 
 
+class CarriesStamps(CarriesPackHashes, Protocol):
+    """Anything with the five stamps: the three ledger fields and the two pack hashes."""
+
+    @property
+    def ontology_version(self) -> str:
+        """The ontology version the rows are extracted and curated under."""
+
+    @property
+    def extraction_version(self) -> str:
+        """The extraction service's version stamp."""
+
+    @property
+    def model_hash(self) -> str:
+        """The composed model hash (`compose_epoch_model_hash`)."""
+
+
+@dataclass(frozen=True, slots=True)
+class Stamps:
+    """The five stamps on their own, for a candidate that has no row yet."""
+
+    ontology_version: str
+    extraction_version: str
+    model_hash: str
+    pack_prompt_hash: str | None = None
+    pack_rails_hash: str | None = None
+
+
+def has_same_stamps(source: CarriesStamps, candidate: CarriesStamps) -> bool:
+    """True when `candidate` has the same stamps as `source`: the one meaning of the phrase.
+
+    The three ledger fields are equal, and no pack hash `source` holds differs
+    in `candidate` (`pack_hash_mismatches`, so a hash `source` holds as None
+    is not compared). `source` is the epoch a candidate was begun from.
+
+    A candidate with the same stamps is a settings change: what differs from
+    its source is a serving or dispatch setting, and the 3-part rows of its
+    pair are the source's. A candidate that keeps the three fields under
+    another pack hash is not one. Every site that asks "is this a settings
+    change" asks it here, so `cutover begin`, the fill scan, the binding rules
+    and `epoch accept` cannot disagree about one candidate.
+    """
+    return (source.ontology_version, source.extraction_version, source.model_hash) == (
+        candidate.ontology_version,
+        candidate.extraction_version,
+        candidate.model_hash,
+    ) and not pack_hash_mismatches(source, candidate)
+
+
 @dataclass(frozen=True, slots=True)
 class Epoch:
     """The stamp triple the backlog reads and writes the cache under.
@@ -511,11 +559,15 @@ class BacklogStore:
 
         A bound candidate is scanned in its own namespace. An unbound one is
         scanned in the 3-part namespace, as before bindings existed, with one
-        exception: a candidate whose triple equals its source epoch's (a
-        settings-change candidate) reports covered 0 with the first logged
-        turn as head, because the 3-part rows of that triple are the source
-        epoch's, not the candidate's. It never raises: an unbound or
-        source-less candidate still scans, so status readers keep working.
+        exception: a candidate with the same stamps as its source epoch
+        (`has_same_stamps`, a settings-change candidate) reports covered 0
+        with the first logged turn as head, because the 3-part rows of its
+        pair are the source epoch's, not the candidate's. A candidate that
+        keeps the source's pair under another ontology version or another
+        `pack_rails_hash` is not that exception: what fed the model is
+        unchanged, so it counts the pair's cached rows. It never raises: an
+        unbound or source-less candidate still scans, so status readers keep
+        working.
         """
         keys = self._events.list_turn_keys_in_replay_order()
         if not cutover.bound and self._is_settings_change(cutover):
@@ -539,17 +591,13 @@ class BacklogStore:
         return FillScan(head=head, covered=covered, total=len(keys), bound=cutover.bound)
 
     def _is_settings_change(self, cutover: Cutover) -> bool:
-        """True when the candidate's triple equals its source epoch's."""
+        """True when the candidate has the same stamps as its source epoch."""
         if cutover.source_epoch_id is None:
             return False
         source = self._events.get_epoch(cutover.source_epoch_id)
         if source is None:
             return False
-        return (
-            source["ontology_version"],
-            source["extraction_version"],
-            source["model_hash"],
-        ) == (cutover.ontology_version, cutover.extraction_version, cutover.model_hash)
+        return has_same_stamps(Epoch.from_row(source), cutover)
 
     def _cached_ids(self, target: Epoch) -> dict[str, str | None]:
         """The target's cached event ids in its own namespace (see `ExtractionCache`)."""

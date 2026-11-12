@@ -31,6 +31,8 @@ from backend.extraction_backlog.store import (
     Cutover,
     Epoch,
     PackHashes,
+    Stamps,
+    has_same_stamps,
     pack_hash_mismatches,
 )
 from backend.extraction_contract.models import (
@@ -137,6 +139,59 @@ class TestTheNullRule:
         offered = PackHashes(**{**STORED, field: None})
 
         assert pack_hash_mismatches(PackHashes(**STORED), offered) == (field,)
+
+
+_TRIPLE = {"ontology_version": "1.4.0", "extraction_version": "ev", "model_hash": "m|emb:e"}
+
+
+class TestTheSameStamps:
+    """`has_same_stamps(source, candidate)`: the one meaning of "the same stamps"."""
+
+    def test_an_equal_triple_and_equal_hashes_are_the_same_stamps(self):
+        assert has_same_stamps(Stamps(**_TRIPLE, **STORED), Stamps(**_TRIPLE, **STORED)) is True
+
+    @pytest.mark.parametrize("field", sorted(_TRIPLE))
+    def test_a_different_triple_field_is_not_the_same_stamps(self, field):
+        candidate = Stamps(**{**_TRIPLE, field: "another"}, **STORED)
+
+        assert has_same_stamps(Stamps(**_TRIPLE, **STORED), candidate) is False
+
+    @BOTH_FIELDS
+    def test_a_different_pack_hash_is_not_the_same_stamps(self, field):
+        candidate = Stamps(**_TRIPLE, **{**STORED, field: OTHER})
+
+        assert has_same_stamps(Stamps(**_TRIPLE, **STORED), candidate) is False
+
+    @BOTH_FIELDS
+    def test_a_candidate_without_a_hash_the_source_holds_is_not_the_same_stamps(self, field):
+        candidate = Stamps(**_TRIPLE, **{**STORED, field: None})
+
+        assert has_same_stamps(Stamps(**_TRIPLE, **STORED), candidate) is False
+
+    def test_a_source_that_holds_no_hash_compares_the_triple_alone(self):
+        """A legacy source: nothing says which pack it ran under (`pack_hash_mismatches`)."""
+        candidate = Stamps(**_TRIPLE, pack_prompt_hash=OTHER, pack_rails_hash=OTHER)
+
+        assert has_same_stamps(Stamps(**_TRIPLE), candidate) is True
+
+    @BOTH_FIELDS
+    def test_a_source_that_holds_one_hash_compares_that_one(self, field):
+        other_field = next(name for name in PACK_HASH_FIELDS if name != field)
+        source = Stamps(**_TRIPLE, **{field: STORED[field]})
+
+        assert has_same_stamps(source, Stamps(**_TRIPLE, **{**STORED, other_field: OTHER}))
+        assert not has_same_stamps(source, Stamps(**_TRIPLE, **{**STORED, field: OTHER}))
+
+    def test_an_epoch_and_a_candidate_are_compared_as_the_store_returns_them(self):
+        """The sites hand over what they read: an `Epoch`, and a `Cutover` or its target."""
+        source = Epoch.from_row({**_LEDGER_ROW, **STORED})
+        settings_change = Cutover.from_row({**_CUTOVER_ROW, **STORED})
+        replay = Cutover.from_row({**_CUTOVER_ROW, **STORED, "pack_rails_hash": OTHER})
+
+        assert has_same_stamps(source, settings_change) is True
+        assert has_same_stamps(source, settings_change.target) is True
+        assert has_same_stamps(source, replay) is False
+        assert has_same_stamps(source, replay.target) is False
 
 
 class TestRowReaders:
@@ -425,14 +480,29 @@ class TestBeginCutover:
         with pytest.raises(CutoverRefusedError, match="nothing to cut over"):
             _begin(store, backlog_world, **STORED)
 
-    @BOTH_FIELDS
-    def test_the_same_triple_under_another_hash_is_a_cutover_of_its_own(self, backlog_world, field):
+    def test_the_same_triple_under_another_rails_hash_is_a_cutover_of_its_own(self, backlog_world):
+        """A rails-only change: the candidate shares the pair's rows, so it opens."""
         backlog_world.bind_active_epoch()
         store = _StoreWhoseEpochHolds(backlog_world, **STORED)
 
-        cutover = _begin(store, backlog_world, **{**STORED, field: OTHER})
+        cutover = _begin(store, backlog_world, **{**STORED, "pack_rails_hash": OTHER})
 
         assert cutover.state == "filling"
+
+    def test_the_same_pair_under_another_prompt_hash_needs_a_new_extraction_version(
+        self, backlog_world
+    ):
+        """What feeds the model changed, and the pair's cache key would not say so."""
+        backlog_world.bind_active_epoch()
+        store = _StoreWhoseEpochHolds(backlog_world, **STORED)
+
+        with pytest.raises(CutoverRefusedError) as raised:
+            _begin(store, backlog_world, **{**STORED, "pack_prompt_hash": OTHER})
+
+        assert "EXTRACTION_VERSION" in str(raised.value)
+        assert f"pack_prompt_hash={OTHER!r}" in str(raised.value)
+        assert f"pack_prompt_hash={PROMPT!r}" in str(raised.value)
+        assert backlog_world.store.open_cutover() is None
 
     @BOTH_FIELDS
     def test_a_settings_change_may_not_change_a_hash(self, backlog_world, field):

@@ -18,19 +18,28 @@ the active epoch never does: an upgrade must neither hide its rows nor force a
 refill. Where a candidate would go keyed, the active epoch stalls on a
 contradiction instead.
 
+"The same stamps" below is `store.has_same_stamps`: the ledger triple, and each
+pack hash the source epoch holds. A candidate with the same stamps as its
+source is a settings-change candidate. One that keeps the triple under another
+pack hash is not: a change of `pack_rails_hash` alone leaves what feeds the
+model unchanged, so that candidate (a replay candidate) is bound like any
+other candidate of the pair and shares the pair's rows.
+
 The rules, first match wins:
 
-1. No change: a candidate whose full identity equals its bound source epoch's
-   is refused. It is a settings-change candidate against a service that has
-   not changed.
+1. No change: a candidate with the same stamps as its bound source epoch,
+   whose live identities equal the source's too, is refused. It is a
+   settings-change candidate against a service that has not changed.
 2. Operator: an acceptance row (`admin epoch accept`) whose identities equal
-   the live ones binds in the 3-part namespace. Not for a candidate whose
-   triple equals its source's: the 3-part rows of its pair are the source's.
+   the live ones binds in the 3-part namespace. Not for a candidate with the
+   same stamps as its source: the 3-part rows of its pair are the source's.
 3. Claimed by this identity: binds in the 3-part namespace.
 4. Claimed by another identity: a candidate goes keyed; the active epoch
-   stalls on the contradiction.
+   stalls on the contradiction. The keyed namespace is the live identities',
+   so a replay candidate whose source is bound keyed lands, against an
+   unchanged service, in its source's namespace and reads the source's rows.
 5. No claim:
-   a. a candidate whose triple equals its source's goes keyed;
+   a. a candidate with the same stamps as its source goes keyed;
    b. no row of any outcome: binds in the 3-part namespace ('first-contact').
       A skip or dead-letter row counts, so its apply marker is never orphaned;
    c. otherwise the newest extracted row with a service record is compared
@@ -57,7 +66,7 @@ from backend.extraction_contract.models import InfoResponse
 from backend.knowledge.extraction_cache import AdoptionRecords, keyed_namespace
 
 from .dispatch_identity import DispatchIdentity
-from .store import Epoch
+from .store import Epoch, has_same_stamps
 
 RULE_NO_CHANGE = "1"
 RULE_OPERATOR = "2"
@@ -159,7 +168,7 @@ def decide_binding(
         raise ValueError("a binding needs the service's serving identity")
     live = (serving_identity, dispatch.identity)
     candidate = target.cutover_id is not None
-    same_triple = source is not None and _triple(source) == _triple(target)
+    same_stamps = source is not None and has_same_stamps(source, target)
     names = _component_names(info, dispatch)
     contradiction = _contradiction(target, info, records, claims, live)
     base = _base_evidence(info, records, claims)
@@ -167,7 +176,7 @@ def decide_binding(
     # Rule 1: a settings-change candidate against an unchanged service.
     if (
         candidate
-        and same_triple
+        and same_stamps
         and source is not None
         and (source.serving_identity, source.dispatch_identity) == live
     ):
@@ -182,7 +191,7 @@ def decide_binding(
     # Rule 2: the operator accepted exactly the live identities.
     if (
         acceptance is not None
-        and not (candidate and same_triple)
+        and not (candidate and same_stamps)
         and (acceptance.get("serving_identity"), acceptance.get("dispatch_identity")) == live
     ):
         verified = _verified_by_records(info, records)
@@ -215,7 +224,7 @@ def decide_binding(
         return _refuse_active(RULE_CLAIMED_BY_OTHER, target, contradiction, live)
 
     # Rule 5a: a settings-change candidate whose source is unbound.
-    if candidate and same_triple:
+    if candidate and same_stamps:
         evidence = {**base, "rule": RULE_SETTINGS_CHANGE}
         return _bind(RULE_SETTINGS_CHANGE, SOURCE_FIRST_CONTACT, keyed, evidence, names, set())
 
@@ -239,7 +248,9 @@ def binding_is_warning(bind: Bind) -> bool:
     """Whether the binding's log line is a WARNING (else INFO).
 
     An adopted or operator binding trusts settings it could not verify, and a
-    candidate sent keyed by rule 4 or 5c will refill rows that already exist.
+    candidate sent keyed by rule 4 or 5c will refill rows that already exist,
+    unless the keyed namespace it lands in is its source's (the module
+    docstring's rule 4), which this line does not tell apart.
     """
     if bind.source in (SOURCE_ADOPTED, SOURCE_OPERATOR):
         return True
@@ -266,10 +277,6 @@ def binding_log_line(
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-def _triple(epoch: Epoch) -> tuple[str, str, str]:
-    return (epoch.ontology_version, epoch.extraction_version, epoch.model_hash)
 
 
 def _component_names(info: InfoResponse, dispatch: DispatchIdentity) -> tuple[str, ...]:

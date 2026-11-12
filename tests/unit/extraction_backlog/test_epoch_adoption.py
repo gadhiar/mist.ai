@@ -10,6 +10,7 @@ inference, a cutover open at upgrade, and the T3 no-refill fixture.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sqlite3
 
@@ -102,8 +103,22 @@ SETTINGS_CANDIDATE = Epoch(
 )
 UNBOUND_SOURCE = ACTIVE
 
+# Invented pack hashes. A replay candidate keeps its source's triple and prompt
+# hash and changes the rails hash: not the same stamps, so not a settings change.
+PROMPT = "a" * 64
+RAILS = "b" * 64
+NEXT_RAILS = "d" * 64
+SOURCE_PACK = {"pack_prompt_hash": PROMPT, "pack_rails_hash": RAILS}
+REPLAY_CANDIDATE = dataclasses.replace(
+    SETTINGS_CANDIDATE, pack_prompt_hash=PROMPT, pack_rails_hash=NEXT_RAILS
+)
+# A settings-change candidate of a source that stores hashes: all five stamps equal.
+STAMPED_SETTINGS_CANDIDATE = dataclasses.replace(SETTINGS_CANDIDATE, **SOURCE_PACK)
+UNBOUND_STAMPED_SOURCE = dataclasses.replace(ACTIVE, **SOURCE_PACK)
 
-def _bound_source(si: str = SI, di: str = DI) -> Epoch:
+
+def _bound_source(si: str = SI, di: str = DI, **fields) -> Epoch:
+    """The source epoch, bound to `si`/`di`; `fields` set its namespace or its pack hashes."""
     return Epoch(
         epoch_id=1,
         ontology_version="1.4.0",
@@ -112,6 +127,7 @@ def _bound_source(si: str = SI, di: str = DI) -> Epoch:
         serving_identity=si,
         dispatch_identity=di,
         identity_source="adopted",
+        **fields,
     )
 
 
@@ -431,6 +447,111 @@ class TestDecideBinding:
     def test_a_service_without_a_serving_identity_is_refused_before_any_rule(self):
         with pytest.raises(ValueError, match="serving identity"):
             _decide(ACTIVE, info=_info(serving_identity=None))
+
+
+class TestDecideBindingComparesTheSameStamps:
+    """Rules 1, 2 and 5a ask whether the candidate has its source's stamps, not its triple.
+
+    The stamps are the triple and each pack hash the source holds
+    (`has_same_stamps`). A replay candidate has the source's triple and another
+    rails hash, so none of the three rules takes it for a settings change.
+    """
+
+    # -- rule 1 -------------------------------------------------------------
+
+    def test_rule_1_does_not_refuse_a_replay_candidate_against_an_unchanged_service(self):
+        """It shares the pair's rows, which its unchanged source claims: rule 3."""
+        decision = _decide(REPLAY_CANDIDATE, source=_bound_source(**SOURCE_PACK), claims=[(SI, DI)])
+
+        assert isinstance(decision, Bind)
+        assert (decision.rule, decision.source, decision.identity_namespace) == (
+            RULE_CLAIMED,
+            "adopted",
+            None,
+        )
+
+    def test_rule_1_still_refuses_a_candidate_with_all_five_of_its_sources_stamps(self):
+        decision = _decide(
+            STAMPED_SETTINGS_CANDIDATE, source=_bound_source(**SOURCE_PACK), claims=[(SI, DI)]
+        )
+
+        assert isinstance(decision, Refuse)
+        assert decision.rule == RULE_NO_CHANGE
+
+    def test_rule_1_compares_the_triple_alone_with_a_source_that_holds_no_hash(self):
+        """A legacy source: the candidate's hashes are compared with nothing."""
+        decision = _decide(REPLAY_CANDIDATE, source=_bound_source(), claims=[(SI, DI)])
+
+        assert isinstance(decision, Refuse)
+        assert decision.rule == RULE_NO_CHANGE
+
+    # -- rule 2 -------------------------------------------------------------
+
+    def test_rule_2_binds_an_accepted_replay_candidate_in_the_3_part_namespace(self):
+        acceptance = {"serving_identity": SI, "dispatch_identity": DI}
+
+        decision = _decide(
+            REPLAY_CANDIDATE,
+            claims=[OTHER],
+            acceptance=acceptance,
+            source=UNBOUND_STAMPED_SOURCE,
+        )
+
+        assert isinstance(decision, Bind)
+        assert (decision.rule, decision.source, decision.identity_namespace) == (
+            RULE_OPERATOR,
+            "operator",
+            None,
+        )
+
+    def test_rule_2_still_never_applies_to_a_candidate_with_all_five_stamps(self):
+        acceptance = {"serving_identity": SI, "dispatch_identity": DI}
+
+        decision = _decide(
+            STAMPED_SETTINGS_CANDIDATE, acceptance=acceptance, source=UNBOUND_STAMPED_SOURCE
+        )
+
+        assert isinstance(decision, Bind)
+        assert decision.rule == RULE_SETTINGS_CHANGE
+
+    # -- rule 5a ------------------------------------------------------------
+
+    def test_rule_5a_does_not_key_a_replay_candidate_with_an_unbound_source(self):
+        """Its rows are the pair's 3-part rows, adopted on what they record: rule 5c."""
+        decision = _decide(REPLAY_CANDIDATE, records=CLEAN, source=UNBOUND_STAMPED_SOURCE)
+
+        assert isinstance(decision, Bind)
+        assert (decision.rule, decision.source, decision.identity_namespace) == (
+            RULE_RECORDS,
+            "adopted",
+            None,
+        )
+
+    def test_rule_5a_still_keys_a_candidate_with_all_five_stamps(self):
+        decision = _decide(STAMPED_SETTINGS_CANDIDATE, records=CLEAN, source=UNBOUND_STAMPED_SOURCE)
+
+        assert isinstance(decision, Bind)
+        assert (decision.rule, decision.identity_namespace) == (
+            RULE_SETTINGS_CHANGE,
+            keyed_namespace(SI, DI),
+        )
+
+    # -- a keyed source -------------------------------------------------------
+
+    def test_a_replay_candidate_of_a_keyed_source_binds_in_the_sources_namespace(self):
+        """The source is bound keyed and another identity claims the pair's 3-part rows.
+
+        Against an unchanged service the candidate's keyed namespace is the
+        source's own (rule 4 keys it by the live identities), so it reads the
+        source's rows and refills nothing.
+        """
+        source = _bound_source(identity_namespace=keyed_namespace(SI, DI), **SOURCE_PACK)
+
+        decision = _decide(REPLAY_CANDIDATE, source=source, claims=[OTHER])
+
+        assert isinstance(decision, Bind)
+        assert decision.rule == RULE_CLAIMED_BY_OTHER
+        assert decision.identity_namespace == source.identity_namespace
 
 
 # Every rule's fixture, as it would meet the active epoch at upgrade.
