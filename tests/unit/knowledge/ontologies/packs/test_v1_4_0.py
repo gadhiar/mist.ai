@@ -738,6 +738,7 @@ _RULE_IDS = [
     "static-aliases",
     "metric-id",
     "event-date",
+    "unchecked-goals",
     "plan-vocabulary",
     "prompt-constraints",
     "prompt-rules-1-to-3",
@@ -819,8 +820,8 @@ class TestTheRegistryServesThePack:
         digest = hashlib.sha256(
             (file_pack.system_prompt + prompts.EXTRACTION_USER_TEMPLATE).encode("utf-8")
         ).hexdigest()
-        # The prompt as it stood before the pack stated any of it, which
-        # `TestExtractionVersionDriftGuard` pins too.
+        # The prompt as it stood before the pack stated any of it. Since T48
+        # `TestExtractionVersionDriftGuard` pins it followed by the earlier items' heading.
         assert digest == "88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4"
 
     def test_no_type_or_edge_of_the_pack_is_named_in_the_engine_core(self, file_pack: Pack):

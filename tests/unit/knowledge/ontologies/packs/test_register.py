@@ -908,30 +908,30 @@ def test_the_unchecked_box_row_quotes_the_goal_words():
 
 
 def _with_goal_filter(pack: Pack, words: tuple[str, ...]) -> Pack:
-    """`pack` with an `item_filter` rule that keeps `words`, named by the unchecked-box row.
+    """`pack` with its `unchecked-goals` rule keeping `words`, named by the unchecked-box row.
 
     The row's Convention cell stays as the guide has it, and its other two cells are
     written here, so the case holds whatever rule the guide's own row names.
 
-    This one is built on the loaded pack, not on a copy of its files under `tmp_path`.
-    The pack declares no `item_filter` rule yet. A `conventions` edit of a copy could
-    write one into `RULES`, but that edit would be this test's own rule in the pack's
-    code, to be rewritten when a later task adds the pack's. Added to the loaded pack,
-    the rule stays apart from the pack's files, and the case varies only its parameter.
+    This one is built on the loaded pack, not on a copy of its files under `tmp_path`:
+    the pack's own rule is replaced by one that differs from it in its parameter only,
+    so the case varies only that.
     """
     rule = ConventionRule(
         id="unchecked-goals",
         kind="item_filter",
         phase=PRE_LLM,
         params=ItemFilter(state="unchecked", keep_context_words=words),
+        prompt_rule="Rule 29",
     )
+    rules = tuple(kept for kept in pack.rules if kept.id != rule.id)
     lines = pack.labelling.splitlines()
     (at,) = (at for at, line in enumerate(lines) if line.startswith(f"| {_UNCHECKED_BOX} |"))
     lines[at] = (
         f"| {_UNCHECKED_BOX} | Rule 29 in `{_LATE_RULES}`, and `{rule.id}` "
         f"| {PROMPT_RULE} and {PRE_LLM_RULE} |"
     )
-    return dataclasses.replace(pack, rules=(*pack.rules, rule), labelling="\n".join(lines))
+    return dataclasses.replace(pack, rules=(*rules, rule), labelling="\n".join(lines))
 
 
 def test_the_unchecked_box_row_takes_an_item_filter_rule_in_the_form_it_has(v1_4_0: Pack):

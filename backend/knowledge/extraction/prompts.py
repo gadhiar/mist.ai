@@ -190,3 +190,10 @@ Subject scope: {subject_scope}
 Utterance: "{utterance}"
 
 Output:"""
+
+# The heading over the earlier items of a structured message, in the context of a later
+# Stage 2 batch: the line after the turn's history, and the rendered units under it. A
+# batch's utterance holds its own units only, and the units before them are shown under
+# this heading when one of its items refers back, so the item can be read. Rule 8 of the
+# engine core extracts what the utterance states, so they are not extracted again.
+EARLIER_ITEMS_HEADING = "Earlier items of this message, for reference only:"

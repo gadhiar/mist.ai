@@ -1188,7 +1188,7 @@ class TestTheServiceWithTheFlagOn:
             "completion_tokens": 1,
             "finish_reason": "stop",
         }
-        assert list(data)[-1] == "turn_plan"
+        assert list(data)[-2:] == ["turn_plan", "batch_record"]
         assert data["stage2_calls"] == 2
         assert data["warnings"] == []
         assert data["stamps"]["prompt_sha256"] == _hash(on=True)

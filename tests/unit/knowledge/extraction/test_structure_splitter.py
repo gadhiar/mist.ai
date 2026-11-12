@@ -21,7 +21,9 @@ from backend.knowledge.extraction.structure_splitter import (
     LIST_MERGE_TYPE_CONFLICT,
     InputUnit,
     batch_units,
+    is_numbered_list,
     merge_payloads,
+    needs_earlier_units,
     render_batch,
     render_unit,
     split_structured,
@@ -391,6 +393,106 @@ class TestBatching:
     def test_max_units_must_be_positive(self):
         with pytest.raises(ValueError, match="max_units"):
             batch_units((prose("x"),), 0)
+
+    def test_a_batch_ends_at_a_lead_in_change(self):
+        text = "Tools I use:\n- Velk\n- Ornate\n\nTools I dropped:\n- Quillet\n- Barrow\n- Tamsin"
+
+        batches = batch_units(split_structured(text), 4)
+
+        assert batches == (
+            (item("Velk", "Tools I use"), item("Ornate", "Tools I use")),
+            (
+                item("Quillet", "Tools I dropped"),
+                item("Barrow", "Tools I dropped"),
+                item("Tamsin", "Tools I dropped"),
+            ),
+        )
+
+    def test_a_batch_ends_at_a_heading_change(self):
+        text = "# Spring\n- sow the leeks\n# Autumn\n- lift the leeks"
+
+        batches = batch_units(split_structured(text), 4)
+
+        assert batches == (
+            (item("sow the leeks", "Spring"),),
+            (item("lift the leeks", "Autumn"),),
+        )
+
+    def test_a_sub_item_shares_its_parent_items_lead_in(self):
+        text = "Trip plan:\n- Day 1\n  - visit the museum\n- Day 2\n  - hike"
+
+        (batch,) = batch_units(split_structured(text), 4)
+
+        assert batch == (
+            item("Day 1", "Trip plan"),
+            item("visit the museum", "Trip plan", "Day 1"),
+            item("Day 2", "Trip plan"),
+            item("hike", "Trip plan", "Day 2"),
+        )
+
+    def test_a_long_run_under_one_lead_in_still_splits_at_the_maximum(self):
+        text = "Reading pile:\n" + "\n".join(f"- volume {n}" for n in range(6))
+
+        batches = batch_units(split_structured(text), 4)
+
+        assert [len(batch) for batch in batches] == [4, 2]
+
+    def test_prose_before_a_list_is_a_batch_of_its_own(self):
+        text = "I sorted the shed today.\n\nKept:\n- the old plane\n- the brace"
+
+        batches = batch_units(split_structured(text), 4)
+
+        assert batches == (
+            (prose("I sorted the shed today."),),
+            (item("the old plane", "Kept"), item("the brace", "Kept")),
+        )
+
+
+# ---------------------------------------------------------------------------
+# When a batch is shown the earlier units of its message
+# ---------------------------------------------------------------------------
+
+
+class TestEarlierUnits:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "the same plugin setup as before",
+            "both of them on the laptop",
+            "the second one, again",
+            "the last one too",
+            "it, with the dark theme",
+            "their newest release",
+            "the latter, on weekends",
+        ],
+    )
+    def test_an_own_item_that_refers_back_is_shown_the_earlier_units(self, text):
+        assert needs_earlier_units((item(text, "Tools"),), numbered=False)
+
+    @pytest.mark.parametrize(
+        "text",
+        ["Rust, for the backend", "the Lazy plugin setup", "thing 5", "a second laptop"],
+    )
+    def test_an_own_item_that_does_not_refer_back_is_shown_none(self, text):
+        assert not needs_earlier_units((item(text, "Tools"),), numbered=True)
+
+    def test_a_context_line_is_not_read_for_a_reference(self):
+        assert not needs_earlier_units((item("Velk", "Both of these"),), numbered=False)
+
+    def test_one_referring_item_is_enough_for_the_batch(self):
+        batch = (item("Velk", "Tools"), item("same as Velk, at work", "Tools"))
+
+        assert needs_earlier_units(batch, numbered=False)
+
+    @pytest.mark.parametrize("text", ["as in #2", "see (3)", "like item 2", "per step 4"])
+    def test_an_item_citing_a_number_of_a_numbered_list_is_shown_the_earlier_units(self, text):
+        assert needs_earlier_units((item(text, "Plan"),), numbered=True)
+        assert not needs_earlier_units((item(text, "Plan"),), numbered=False)
+
+    def test_a_numbered_list_is_two_or_more_numbered_items(self):
+        assert is_numbered_list("Plan:\n1. pack\n2) load the van")
+        assert not is_numbered_list("Plan:\n1. pack")
+        assert not is_numbered_list("Plan:\n- pack\n- load the van")
 
 
 # ---------------------------------------------------------------------------

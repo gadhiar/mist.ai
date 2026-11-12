@@ -637,7 +637,10 @@ def test_an_altered_answer_makes_compare_exit_1_and_name_the_tag(
     assert _replay_out(campaign.layout, out, tmp_path / "altered-store").returncode == 0
     result = _replay("--compare", str(replays.first), str(out))
     assert result.returncode == 1
-    assert result.stdout == f"compare: rows differ at tag {LIST_TAG}: response.payload.entities\n"
+    # The batch record holds each call's payload, so the altered answer moves it too.
+    assert result.stdout == (
+        f"compare: rows differ at tag {LIST_TAG}: response.batch_record, response.payload.entities\n"
+    )
     assert ALTERED not in result.stdout + result.stderr
 
 

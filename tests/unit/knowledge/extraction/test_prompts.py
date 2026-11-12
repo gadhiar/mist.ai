@@ -9,7 +9,7 @@ load-bearing rule.
 import json
 import re
 
-from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
+from backend.knowledge.extraction.prompts import EARLIER_ITEMS_HEADING, EXTRACTION_USER_TEMPLATE
 from backend.knowledge.ontologies.registry import active_pack
 
 # The prompt every reader sends: the active pack's, assembled by the loader.
@@ -687,17 +687,19 @@ class TestExtractionVersionDriftGuard:
     honor-system pairing mechanical.
     """
 
-    # sha256(SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-11-10-r8", groups 1 (identity), 2 (list conventions) and
-    # 3 (glosses, named teams and the remaining conventions), as T40 rounds 1 and 2 revised
-    # them.
-    PINNED_SHA256 = "88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4"
+    # sha256(SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE + EARLIER_ITEMS_HEADING) pinned for
+    # extraction_version = "2026-11-12-r9": the r8 prompt, whose groups 1 (identity), 2
+    # (list conventions) and 3 (glosses, named teams and the remaining conventions) T40
+    # rounds 1 and 2 revised, and the heading a later batch's earlier units stand under,
+    # which T48 adds to what a Stage 2 call reads. Without the heading the digest is r8's,
+    # 88050a7dd03df6dad3d085ed1176ba762d93ffe5c01977239bd8c4931168a2f4.
+    PINNED_SHA256 = "8deb5f7068307e2a7405fca1b66426fb0cfb0baba4e95944c3be0a31b4345fa3"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
 
         digest = hashlib.sha256(
-            (SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE).encode("utf-8")
+            (SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE + EARLIER_ITEMS_HEADING).encode("utf-8")
         ).hexdigest()
         assert digest == self.PINNED_SHA256, (
             "Extraction prompt content changed WITHOUT an extraction_version "
@@ -711,7 +713,7 @@ class TestExtractionVersionDriftGuard:
     def test_single_authority_holds_the_pinned_version(self):
         from backend.knowledge.version_stamps import EXTRACTION_VERSION
 
-        assert EXTRACTION_VERSION == "2026-11-10-r8"
+        assert EXTRACTION_VERSION == "2026-11-12-r9"
 
     def test_config_default_is_the_single_authority(self):
         from backend.knowledge.config import KnowledgeConfig

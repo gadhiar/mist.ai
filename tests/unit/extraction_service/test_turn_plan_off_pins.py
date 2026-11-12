@@ -1,8 +1,9 @@
 """With `EXTRACTION_TURN_PLAN` off, the turn plan stage changes nothing the service sends.
 
 Every literal here but `SERVING_IDENTITY` was captured at 058e52c, the commit
-before the turn plan stage. The file imports nothing the stage added. It pins
-what a flag-off service sends and reports:
+before the turn plan stage, except where T48 re-pinned one, as noted at each. The
+file imports nothing the stage added. It pins what a flag-off service sends and
+reports:
 
 - every request body the fake llama-server receives for one structured turn
   and one prose turn, as the sha256 of their canonical JSON. T49 put a
@@ -54,9 +55,14 @@ STRUCTURED_UTTERANCE = "Things I want to try this year:\n" + "\n".join(
 )
 PROSE_UTTERANCE = "I have been learning Rust for a few months"
 
-STRUCTURED_BODIES_SHA256 = "acf2adde1d0473a0af20963052b08e27bc1ad9df02748dc4ba16013089aef834"
+# T48: the second batch, `5. thing 5`, refers back to no item, so it is no longer sent
+# the four units before it as context lines; at 058e52c this was
+# acf2adde1d0473a0af20963052b08e27bc1ad9df02748dc4ba16013089aef834.
+STRUCTURED_BODIES_SHA256 = "f41d3afdced9a0f9e158a52f9abf5b38db9ca20a8eb79060e78704078f8f7dbc"
 PROSE_BODIES_SHA256 = "1c2489eb2a125f17e56bac300608e1798be6d447dab861447fe8e0e01cb35eb0"
-PROMPT_SHA256 = "6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e"
+# T48: `EARLIER_ITEMS_HEADING` joined the hash; at 058e52c this was
+# 6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e.
+PROMPT_SHA256 = "dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b"
 SERVING_IDENTITY_AT_058E52C = "si1-0a4fdfffca232a0e3d27716f7ab0e41ed75715ed7eb932b05939b692bc358cb1"
 # T49: `request.extract.thinking_budget_tokens` went from None to 8192.
 SERVING_IDENTITY = "si1-f967ffbbd60a599a2627654e2ac373bbb787390b374cf1e9a3e2c87dc3b83050"
@@ -80,6 +86,8 @@ RESPONSE_KEYS = [
     "attempts",
     "stage2_calls",
     "warnings",
+    # T48: one entry per Stage 2 call.
+    "batch_record",
 ]
 
 

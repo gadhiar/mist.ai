@@ -109,7 +109,12 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # and medium is the deployed effort, each LLM call logging its token counts.
 # r7 named the withdrawn list frame path's builds, so this skips to r8 to keep
 # the stamps unambiguous. Re-extracts history at the next cutover.
-EXTRACTION_VERSION: str = "2026-11-10-r8"
+# 2026-11-12-r9: each Stage 2 batch's utterance holds its own units only, and
+# a later batch is shown the earlier units under a heading, for reference, only
+# when one of its items refers back; a batch ends where the lead-in changes;
+# the pack drops an unchecked item under no goal word before the model is
+# called. Re-extracts history at the next cutover.
+EXTRACTION_VERSION: str = "2026-11-12-r9"
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +169,13 @@ class PackRelease:
 # from the pack's types where they wrote it as a literal. Once with that serialization.
 # And once when the Metric `typed_id` rule stated its alignment kind, a parameter the
 # eval harness's aligner reads and no rail does.
+#
+# Under 2026-11-12-r9 the prompt hash moved with the `unchecked-goals` item filter,
+# which changes what reaches the model.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
-    pack_prompt_hash="23ed42d935f3589044b274ae2d60b51fd39fa6721dc87b65bfc0c560ca81e0ea",
+    pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
     pack_rails_hash="6705d826291cb01f7f9b9f3057fa72ad8ab6aaa1cc17c6bdf3568e7dc2703c05",
 )
 
@@ -320,6 +328,22 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "the scope and derive requests are sent exactly as before, and the extract "
             "request differs only in asking for a streamed reply and its usage chunk. "
             "Re-extracts history."
+        ),
+    ),
+    CodeRevision(
+        extraction_version="2026-11-12-r9",
+        code_identity="ci1-28bb65ba49aa1bd5b1f51eba0584989cdbc79123a621dcf2f5b31ac217070806",
+        date="2026-11-12",
+        reason=(
+            "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
+            "one of whose items refers back (a pronoun, `same`, `both`, `the second one`, "
+            "or a number cited in a numbered list) is shown up to LIST_CONTEXT_MAX_UNITS "
+            "earlier units after the history under EARLIER_ITEMS_HEADING, which joins "
+            "prompt_sha256, and any other batch is shown none; a batch ends where the "
+            "lead-in or heading changes; each Stage 2 call leaves a batch record entry on "
+            "the response; the pack's `unchecked-goals` item filter drops an unchecked item "
+            "under no goal word, and a turn with no unit left makes no scope, plan or "
+            "Stage 2 call. Re-extracts history."
         ),
     ),
 )
