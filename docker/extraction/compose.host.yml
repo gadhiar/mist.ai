@@ -99,6 +99,10 @@ services:
       # load. CUDA_CACHE_PATH on a named volume makes that compile happen
       # once across container restarts rather than on every `up`.
       - mist-extraction-cuda-cache:/root/.nv/ComputeCache
+    # Every LLAMA_ARG_* and command flag of this service is declared to
+    # mist-extraction-host as EXTRACTION_SERVER_<NAME> from the same
+    # expression, or excluded with a reason in
+    # tests/unit/test_compose_extraction.py. Change both together.
     environment:
       - LLAMA_ARG_MODEL=/models/${EXTRACTION_MODEL_FILE:-ggml-org/gpt-oss-20b-MXFP4.gguf}
       - LLAMA_ARG_N_GPU_LAYERS=999
@@ -191,6 +195,35 @@ services:
       - EXTRACTION_REASONING_EFFORT=${EXTRACTION_REASONING_EFFORT:-low}
       - EXTRACTION_LOCATION_LABEL=host-1070
       - LLAMA_CPP_BUILD=b11151
+      # Declared llama-server settings (MIS-196). The service cannot see the
+      # launch flags of mist-extraction-llm-host, so each keyed one is
+      # declared here as EXTRACTION_SERVER_<NAME>, from the SAME expression
+      # the flag above uses, and the service folds them into its serving
+      # identity. An override in .env therefore reaches both containers at
+      # once, and changing any of them starts a new extraction epoch (admin
+      # cutover begin --settings-change; HOST_1070_RUNBOOK.md step 4).
+      # EXTRACTION_SERVER_IMAGE repeats the llama-server image string; it
+      # stands for every flag left at its build default. The service also
+      # checks the declared ctx size against the n_ctx llama-server reports
+      # on /props. tests/unit/test_compose_extraction_host.py fails when a
+      # llama-server flag is neither declared here with the identical value
+      # nor in its exclusion table.
+      - EXTRACTION_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f721265464f38ccb247c1338d07d852c4bae7509a4b4734d07a2bbadc765c
+      # Required, no default, like EXTRACTION_MODEL_HASH: the GPU is part of
+      # the serving identity, so the 1070 and the 4070 never share an epoch.
+      - "EXTRACTION_SERVER_DEVICE=${EXTRACTION_LLM_DEVICE:?EXTRACTION_LLM_DEVICE is required, no default -- it keys the extraction epoch on the GPU llama-server runs on. Name that GPU, e.g. gtx-1070.}"
+      - EXTRACTION_SERVER_N_GPU_LAYERS=999
+      - EXTRACTION_SERVER_CTX_SIZE=${EXTRACTION_LLM_CTX_SIZE:-16384}
+      - EXTRACTION_SERVER_N_PARALLEL=1
+      - EXTRACTION_SERVER_JINJA=1
+      - EXTRACTION_SERVER_REASONING=on
+      - EXTRACTION_SERVER_THINK=deepseek
+      - EXTRACTION_SERVER_N_CPU_MOE=${EXTRACTION_HOST_NCMOE:-24}
+      - EXTRACTION_SERVER_BATCH=2048
+      - EXTRACTION_SERVER_UBATCH=2048
+      - EXTRACTION_SERVER_CACHE_RAM_MIB=${LLM_CACHE_RAM_MIB:-2048}
+      - EXTRACTION_SERVER_TEMP=1.0
+      - EXTRACTION_SERVER_TOP_P=1.0
       # EXTRACTION_LLM_TIMEOUT_SECONDS / EXTRACTION_MAX_ATTEMPTS /
       # EXTRACTION_CONSTRAINED_MODE were previously silently unreachable
       # inside this container: compose never forwarded them, even though

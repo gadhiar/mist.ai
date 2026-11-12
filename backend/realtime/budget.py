@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TypeVar
 
+from src.multimodal.voice_profile import DEFAULT_VOICE_PROFILE
+
 _T = TypeVar("_T")
 
 
@@ -250,7 +252,7 @@ class VoiceSettings:
     segmenter: SegmenterConfig = field(default_factory=SegmenterConfig)
     placement: PlacementConfig = field(default_factory=PlacementConfig)
     turn: TurnConfig = field(default_factory=TurnConfig)
-    profile: str = "mist"
+    profile: str = DEFAULT_VOICE_PROFILE
 
 
 _LOCATION = re.compile(r"cpu|cuda(?::\d+)?|off")

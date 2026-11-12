@@ -3,9 +3,9 @@
 Three things this file proves, matching the mist-model-bench T2 acceptance criteria:
 
 1. `tests/schema_conformance_json_object.yaml` carries the identical cases,
-   system_prompt, test_type, temperature_mode and max_tokens as
-   `tests/schema_conformance.yaml`; only use_grammar, response_format and
-   description differ.
+   prompt source, reference date, test_type, temperature_mode and max_tokens
+   as `tests/schema_conformance.yaml`, so both arms send the same messages;
+   only the constraint (constrained, response_format) and description differ.
 2. `ChatMetrics.timings` and `ChatMetrics.reasoning_content` (client.py) arrive
    verbatim in the JSONL `metrics` object through the real
    `run.run_candidate` path, driven against a local fake llama-server over
@@ -37,23 +37,33 @@ from scripts.eval_harness import run  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def test_json_object_arm_matches_schema_conformance_except_three_keys():
+def test_json_object_arm_matches_schema_conformance_except_constraint_and_description():
     strict, json_object = run.load_test_files(
         ["schema_conformance", "schema_conformance_json_object"], run.DEFAULT_TESTS_DIR
     )
 
     assert json_object.cases == strict.cases
-    assert json_object.system_prompt == strict.system_prompt
+    assert json_object.prompt_source == strict.prompt_source == "production_extraction"
+    assert json_object.reference_date == strict.reference_date
+    assert json_object.system_prompt is strict.system_prompt is None
     assert json_object.test_type == strict.test_type == "schema_conformance"
     assert json_object.temperature_mode == strict.temperature_mode
     assert json_object.max_tokens == strict.max_tokens
+    for case in strict.cases:
+        assert run.build_messages(json_object, case) == run.build_messages(strict, case)
 
-    # The only three keys that are allowed to differ.
-    assert strict.use_grammar is True
-    assert json_object.use_grammar is False
+    # The only keys that are allowed to differ: the constraint and the description.
+    assert strict.constrained is True
+    assert json_object.constrained is False
     assert strict.response_format is None
     assert json_object.response_format == {"type": "json_object"}
     assert json_object.description != strict.description
+    differing = {
+        field
+        for field in run.TestFile.__slots__
+        if getattr(strict, field) != getattr(json_object, field)
+    }
+    assert differing == {"name", "constrained", "response_format", "description"}
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +199,11 @@ def test_metrics_capture_timings_and_reasoning_content_through_run_candidate(tmp
             description="fake",
             temperature_mode="extraction",
             max_tokens=64,
-            use_grammar=False,
+            constrained=False,
             response_format=None,
             system_prompt=None,
+            prompt_source=None,
+            reference_date=None,
             cases=(
                 run.TestCase(
                     id="case_with_extras",
@@ -225,7 +237,6 @@ def test_metrics_capture_timings_and_reasoning_content_through_run_candidate(tmp
             models_dir=tmp_path,
             log_dir=tmp_path / "logs",
             results_dir=tmp_path / "results",
-            grammar_text=None,
         )
 
         lines = jsonl_path.read_text(encoding="utf-8").splitlines()

@@ -16,5 +16,5 @@
 {"case_id": "recall_python_knowledge", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "tool_selection"}
 {"case_id": "recall_with_entity_type_filter", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "tool_selection"}
 {"case_id": "schedule_reminder_tomorrow", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "tool_selection"}
-{"case_id": "voice_profile_switch_friday", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "tool_selection"}
+{"case_id": "voice_profile_switch_calm", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "tool_selection"}
 {"case_id": "web_search_breaking_news", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "tool_selection"}

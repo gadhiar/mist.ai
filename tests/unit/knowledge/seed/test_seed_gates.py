@@ -320,11 +320,11 @@ class TestNodeDefinitions:
         query, _params = connection.queries[0]
         assert "WHERE n.seed_version = $seed_version AND n.display_name IS NOT NULL" in query
 
-    def test_entity_partition_node_matches_on_the_partition_label_only(self):
-        """MIS-177 D2 (was `test_entity_partition_node_uses_entity_label`, which
-        pinned `:__Entity__:Organization`): the applier no longer writes a
-        non-User type label on an `:__Entity__` node, so the gate matches on the
-        partition label and reads the type from `entity_type`.
+    def test_entity_partition_node_matches_on_its_type_label(self):
+        """Typed labels (6 Nov, reversing MIS-177 D2, under which this test
+        pinned the partition label alone): the applier writes an `:__Entity__`
+        node's own type label, so the gate requires it in the MATCH, forbids
+        every other ontology type label and still reads `entity_type`.
         """
         connection = FakeNeo4jConnection(query_results=[{"n": 1}])
         docs = [
@@ -337,10 +337,28 @@ class TestNodeDefinitions:
         check_node_definitions(connection, docs, seed_version="profile-v1")
 
         query, params = connection.queries[0]
-        assert f"MATCH (n:{ENTITY_LABEL} {{id: $id}})" in query
+        assert f"MATCH (n:{ENTITY_LABEL}:Organization {{id: $id}})" in query
         assert "AND n.entity_type = $entity_type" in query
         assert "AND none(label IN labels(n) WHERE label IN $forbidden_labels)" in query
         assert params["entity_type"] == "Organization"
+        assert set(params["forbidden_labels"]) == set(ALL_NODE_TYPE_NAMES) - {"Organization"}
+
+    def test_entity_partition_node_without_a_type_label_forbids_every_one(self):
+        """A type outside `ENTITY_TYPE_LABELS` gets no label, so the gate
+        matches on the partition label and forbids every ontology type label.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"n": 1}])
+        docs = [
+            _doc(
+                nodes=[SeedNode(id="mist-identity", type="MistIdentity", display_name="MIST")],
+                partition=ENTITY_LABEL,
+            )
+        ]
+
+        check_node_definitions(connection, docs, seed_version="profile-v1")
+
+        query, params = connection.queries[0]
+        assert f"MATCH (n:{ENTITY_LABEL} {{id: $id}})" in query
         assert set(params["forbidden_labels"]) == set(ALL_NODE_TYPE_NAMES)
 
     def test_user_node_matches_on_the_user_label(self):
@@ -372,20 +390,34 @@ class TestNodeDefinitions:
     @pytest.mark.parametrize(
         ("graph_node", "passes"),
         [
-            # What the MIS-177 applier writes: correct entity_type, no type label.
-            ({"labels": {ENTITY_LABEL}, "entity_type": "Organization"}, True),
-            ({"labels": {ENTITY_LABEL}, "entity_type": "Project"}, False),
-            ({"labels": {ENTITY_LABEL}, "entity_type": None}, False),
-            # A pre-MIS-177 node still carrying its type label fails until reseeded.
-            ({"labels": {ENTITY_LABEL, "Organization"}, "entity_type": "Organization"}, False),
+            # What the applier writes: correct entity_type and its type label.
+            ({"labels": {ENTITY_LABEL, "Organization"}, "entity_type": "Organization"}, True),
+            ({"labels": {ENTITY_LABEL, "Organization"}, "entity_type": "Project"}, False),
+            ({"labels": {ENTITY_LABEL, "Organization"}, "entity_type": None}, False),
+            # A node seeded under MIS-177 D2 has no type label and fails until reseeded.
+            ({"labels": {ENTITY_LABEL}, "entity_type": "Organization"}, False),
+            (
+                {
+                    "labels": {ENTITY_LABEL, "Organization", "Project"},
+                    "entity_type": "Organization",
+                },
+                False,
+            ),
         ],
-        ids=["correct", "wrong-entity-type", "missing-entity-type", "stray-type-label"],
+        ids=[
+            "correct",
+            "wrong-entity-type",
+            "missing-entity-type",
+            "missing-type-label",
+            "stray-type-label",
+        ],
     )
-    def test_entity_node_is_judged_by_entity_type(self, graph_node, passes):
-        """Acceptance 4: a node with the right `entity_type` and no type label
-        passes; a wrong or missing `entity_type` fails. `FakeNeo4jConnection`
-        does not interpret Cypher, so `_evaluate_node_check` applies the WHERE
-        clauses the tests above pin, to one simulated node.
+    def test_entity_node_is_judged_by_entity_type_and_its_label(self, graph_node, passes):
+        """A node with the right `entity_type`, its own type label and no other
+        passes; a wrong or missing `entity_type`, a missing type label or a
+        stray one fails. `FakeNeo4jConnection` does not interpret Cypher, so
+        `_evaluate_node_check` applies the MATCH labels and WHERE clauses the
+        tests above pin, to one simulated node.
         """
         node = {
             "id": "slalom",

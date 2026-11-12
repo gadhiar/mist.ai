@@ -10,6 +10,8 @@ error. The variables the GPU yield and the cloned voice used are pinned as ignor
 """
 
 import dataclasses
+import importlib.util
+import sys
 
 import pytest
 
@@ -29,6 +31,7 @@ from backend.realtime.budget import (
     load_voice_settings,
     parse_budget,
 )
+from src.multimodal import voice_profile
 
 STAGE_ROWS = (
     "end_of_turn_ms",
@@ -306,6 +309,18 @@ class TestConfigDataclasses:
             "profile",
         ]
         assert VoiceSettings().profile == "mist"
+
+    def test_the_profile_default_follows_the_voice_profile_constant(self, monkeypatch):
+        # A fresh copy of the module, built while the constant reads "probe": a default that
+        # comes from `DEFAULT_VOICE_PROFILE` follows it, and a literal copy of it would not.
+        monkeypatch.setattr(voice_profile, "DEFAULT_VOICE_PROFILE", "probe")
+        spec = importlib.util.spec_from_file_location("budget_probe", budget_module.__file__)
+        probe = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, "budget_probe", probe)
+
+        spec.loader.exec_module(probe)
+
+        assert probe.VoiceSettings().profile == "probe"
 
     @pytest.mark.parametrize(
         "name",

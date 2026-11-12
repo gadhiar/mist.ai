@@ -23,6 +23,7 @@ import pytest_asyncio
 
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
+from backend.extraction_backlog.dispatch_identity import DispatchIdentity, dispatch_identity_for
 from backend.extraction_backlog.dispatcher import ExtractionDispatcher
 from backend.extraction_backlog.inference import RemoteExtractionInference
 from backend.extraction_backlog.settings import DispatcherSettings
@@ -103,10 +104,36 @@ class BacklogWorld:
     embeddings: FakeEmbeddingGenerator
     clients: list[httpx.AsyncClient] = field(default_factory=list)
     dispatchers: list[ExtractionDispatcher] = field(default_factory=list)
+    embedding_model: str = EMBEDDING_MODEL
 
     @property
     def store(self) -> BacklogStore:
         return BacklogStore(self.event_store, self.cache)
+
+    def dispatch_identity(self, **setting_overrides) -> DispatchIdentity:
+        """The dispatch identity a dispatcher built with these overrides computes."""
+        return dispatch_identity_for(
+            self.build_pipeline().dispatch_gate_settings(), fast_settings(**setting_overrides)
+        )
+
+    def bind_active_epoch(self, *, namespace: str | None = None, source: str = "adopted") -> None:
+        """Bind the active epoch to the fake service's identity and the default dispatch one.
+
+        For a test about a bound epoch (a running instance after the upgrade),
+        so its first step does not have to bind it.
+        """
+        dispatch = self.dispatch_identity()
+        assert self.event_store.bind_epoch_identity(
+            epoch_id=self.store.active_epoch().epoch_id,
+            serving_identity=self.service.serving_identity,
+            serving_components=dict(self.service.serving_components),
+            dispatch_identity=dispatch.identity,
+            dispatch_components=dict(dispatch.components),
+            identity_namespace=namespace,
+            source=source,
+            evidence={},
+            bound_at="2026-09-01T00:00:00+00:00",
+        )
 
     def log_turn(
         self,
@@ -133,7 +160,7 @@ class BacklogWorld:
         return self.event_store.append_turn(event)
 
     def build_pipeline(self) -> ExtractionPipeline:
-        config = build_test_config(embedding_model=EMBEDDING_MODEL)
+        config = build_test_config(embedding_model=self.embedding_model)
         return ExtractionPipeline(
             preprocessor=PreProcessor(),
             extractor=OntologyConstrainedExtractor(config, llm=self.main_llm),
@@ -184,7 +211,7 @@ class BacklogWorld:
             pipeline=self.build_pipeline(),
             inference=RemoteExtractionInference(client, SERVICE_URL),
             settings=fast_settings(**setting_overrides),
-            embedding_model_name=EMBEDDING_MODEL,
+            embedding_model_name=self.embedding_model,
             writer_stamps=(
                 writer_stamps if writer_stamps is not None else self.active_epoch_stamps()
             ),
