@@ -1526,8 +1526,12 @@ _SHAPE_MARKUP = {
     "lettered": "lettered",
 }
 # Selection gold ids that are ordinary words of the prompt's prose, as `_PROMPT_WORD_EXEMPTIONS`
-# is for held-out. Empty while the selection gold is empty; a test fails an unused entry.
-_SELECTION_PROMPT_WORD_EXEMPTIONS: dict[str, str] = {}
+# is for held-out, each with the prompt's phrase and rule beside it. The entries live in the
+# selection labelling directory, not here, because they are selection ids and those stay inside
+# the fenced labelling directory. A test fails an unused entry.
+_SELECTION_PROMPT_WORD_EXEMPTIONS: dict[str, str] = json.loads(
+    (_SELECTION_DIR / "prompt-word-exemptions.json").read_text(encoding="utf-8")
+)
 _OTHER_SETS = ("dev-lists", "heldout", "sixty")
 _OTHER_SET_TERMS_MIN = 10
 
@@ -1675,6 +1679,20 @@ def test_selection_has_240_list_probes_and_40_prose_probes():
     prose = len(shapes) - lists
 
     assert (lists, prose) == (_SELECTION_LIST_PROBES, _SELECTION_PROSE_PROBES)
+
+
+def test_selection_gold_is_240_list_and_40_prose_probes_of_at_most_fifteen_relations():
+    """The adjudicated gold keeps the set's size, and no probe outweighs the design's bound."""
+    rows = _selection_rows()
+    shapes = [_selection_shape(r) for r in rows]
+    sizes = [len(r["expected_relationships"]) for r in rows]
+
+    lists = sum(shape is not None for shape in shapes)
+    prose = len(shapes) - lists
+    largest = max(sizes)
+
+    assert (lists, prose) == (_SELECTION_LIST_PROBES, _SELECTION_PROSE_PROBES)
+    assert largest <= _SELECTION_MAX_RELATIONS
 
 
 def test_selection_list_shapes_are_six_times_the_dev_lists_split():

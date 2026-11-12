@@ -1,0 +1,7 @@
+{
+  "deadline": "a Concept's own name; the prompt says the singular only in Rule 37 'its deadline', a date on a goal's edge, and the plural in Rule 11's list of plain Events and Rule 37's heading 'Goal deadlines'; it names no entity 'deadline'",
+  "engine": "a Concept's own name, a kind of software; the prompt says 'engine' only in its opening line, 'a knowledge extraction engine', describing the model's role, under no rule and naming no entity",
+  "goal": "a Document's own name; the prompt names no entity 'goal' and says the word as the Goal type's name (its type list, Rules 22 and 27, Examples 18 and 27), inside the predicate HAS_GOAL (the relationship type list, Rule 29 'where it is HAS_GOAL', Rule 37 'HAS_GOAL gets end_date' and Example 27's output), and as an ordinary noun: the Strategy gloss 'a goal-directed plan', Rule 14 'a high-level approach to a goal', Rule 15 'goal-oriented', Rule 22 'the goal's verb phrase', Rule 29 'a goals lead-in', Rule 37 'Goal deadlines' and 'a goal's stated time frame', and the headings and utterance of Examples 18 and 27",
+  "morning": "a Concept's own name, a time of day; the prompt says it only in 'every morning', a habit's cadence, in Rule 17, Rule 21 and Example 24 (its utterance and its temporal_expression), where it names no entity",
+  "scratch": "a Technology's own name; the prompt says 'scratch that' only as a retraction phrase, in Rule 6 and Example 22, where it names no entity"
+}
