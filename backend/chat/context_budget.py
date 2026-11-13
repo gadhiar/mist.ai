@@ -385,10 +385,12 @@ class TurnDeltaPart:
     the cached prefix of the next prompt. `kind` orders and labels the block
     when it is rendered. `prunable` marks a block the planner may shorten to
     fit the delta budget (retrieval, memory); the others are charged whole.
-    No producer of `clock` or `memory` parts exists yet.
+    No producer of `clock` or `memory` parts exists yet. `register` asks a
+    `tts` turn for a short spoken reply; it is in the delta rather than the
+    prefix so that typed and spoken turns share one cached prefix.
     """
 
-    kind: Literal["clock", "interruption", "retrieval", "memory", "live_advisory"]
+    kind: Literal["clock", "interruption", "retrieval", "memory", "live_advisory", "register"]
     text: str
     prunable: bool
 

@@ -761,7 +761,23 @@ _INTERRUPTION_NOTES: dict[str, str] = {
     "before_reply": "The user interrupted your previous turn before you said anything.",
 }
 
-_DELTA_ORDER: tuple[str, ...] = ("clock", "interruption", "retrieval", "memory", "live_advisory")
+# The `register` delta part of every `tts`-channel turn. A spoken reply should
+# be brief, a typed one need not be; asking in the delta rather than the prefix
+# keeps one cached prefix for both kinds of turn.
+SPOKEN_REGISTER_TEXT = (
+    "This reply is spoken. Answer in one to three short sentences, and offer more on screen "
+    "or on request."
+)
+
+# `register` goes last, next to the user's words it shapes the answer to.
+_DELTA_ORDER: tuple[str, ...] = (
+    "clock",
+    "interruption",
+    "retrieval",
+    "memory",
+    "live_advisory",
+    "register",
+)
 
 _DELTA_LABELS: dict[str, str] = {
     "clock": "=== CURRENT TIME ===",
@@ -769,6 +785,7 @@ _DELTA_LABELS: dict[str, str] = {
     "retrieval": "=== RETRIEVED CONTEXT ===",
     "memory": "=== MEMORY ===",
     "live_advisory": "=== LIVE DATA ADVISORY ===",
+    "register": "=== SPOKEN REPLY ===",
 }
 
 _USER_MESSAGE_LABEL = "=== USER MESSAGE ==="
@@ -877,6 +894,7 @@ class ConversationHandler:
         hydration_clock: HydrationClock | None = None,
         session_origin: str = "real",
         extraction_dispatcher: ExtractionDispatcher | None = None,
+        register_prompt: str | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -935,7 +953,15 @@ class ConversationHandler:
                 most tests), the in-process `_extract_knowledge_async` path runs
                 exactly as before. May also be attached after construction with
                 `attach_extraction_dispatcher`.
+            register_prompt: The fixed register line every turn shares (how
+                MIST speaks and addresses the user), built by the caller; the
+                handler only places it. Placed in the stable prefix right after
+                the persona block and charged as fixed cost, because it is the
+                same on every turn and so belongs to the cached prefix. None
+                adds nothing. The per-turn ask for a short spoken reply is a
+                separate `register` delta part, not this.
         """
+        self._register_prompt = register_prompt
         self.config = config
         # Injectable clock (DI seam). Default = real wall-clock so production
         # behavior is unchanged; the replay path supplies a fixed value.
@@ -2287,6 +2313,7 @@ class ConversationHandler:
             pending_user_message=user_message,
             interruption_note=scope.request.interruption_note,
             scope=scope,
+            channel=scope.request.channel,
         )
         messages = list(layout.messages)
         scope.context_window = messages
@@ -3673,6 +3700,7 @@ class ConversationHandler:
         pending_user_message: str,
         interruption_note: Literal["mid_reply", "before_reply"] | None = None,
         scope: TurnScope | None = None,
+        channel: Literal["tts", "text"] = "text",
     ) -> PromptLayout:
         """Compose the turn's prompt in cache-stable order.
 
@@ -3681,12 +3709,14 @@ class ConversationHandler:
         per turn at the end:
 
           1. Stable prefix: persona block (MistContext, when provided),
-             static system template, MIST.md conventions, user profile.
+             register prompt (when the handler has one), static system
+             template, MIST.md conventions, user profile.
           2. History: the window the history strategy selects from the
              session's full history (`stable_window` moves its start only
              in steps), raw user text as stored.
-          3. Delta and user text: the interruption note, retrieval context
-             and live-data advisory as labelled blocks in the final user
+          3. Delta and user text: the interruption note, retrieval context,
+             live-data advisory and, on a `tts` turn, the spoken-reply
+             register as labelled blocks in the final user
              message ahead of the user's words (`delta_placement`
              `user_prefix`), or as one system message directly before it
              (`system_tail`). Nothing else follows the history.
@@ -3718,6 +3748,8 @@ class ConversationHandler:
             scope: The turn whose trace receives the profile-dedup and
                 budget feeds. None (a direct call outside a turn) feeds
                 nothing.
+            channel: Where the reply goes. A `tts` turn's delta carries the
+                `register` part asking for a short spoken reply.
 
         Returns:
             The `PromptLayout`: the messages plus the prefix fingerprint and
@@ -3781,6 +3813,10 @@ class ConversationHandler:
                     prunable=False,
                 )
             )
+        if channel == "tts":
+            whole_parts.append(
+                TurnDeltaPart(kind="register", text=SPOKEN_REGISTER_TEXT, prunable=False)
+            )
 
         # The full history plus the pending message: the strategy chooses the
         # window, so the start can stay put across turns instead of sliding.
@@ -3812,7 +3848,9 @@ class ConversationHandler:
                 # or they silently eat the 8K quality envelope past the
                 # 256-token safety margin (deep review phase1-conversation-1).
                 extra_fixed_texts=[
-                    t for t in (conventions_message, profile_block) if t is not None
+                    t
+                    for t in (self._register_prompt, conventions_message, profile_block)
+                    if t is not None
                 ],
                 max_history=max_history,
                 delta_parts=whole_parts,
@@ -3894,6 +3932,7 @@ class ConversationHandler:
         # subsequent positions must re-process. So stable content goes at the
         # front and everything that varies per turn goes last:
         #   1. Persona block       (stable within session; cached MistContext)
+        #   1b. Register prompt    (fixed for the handler's lifetime)
         #   2. Static template     (stable across all sessions)
         #   3. MIST.md             (stable across turns; mtime-cached)
         #   3b. User profile       (stable until the profile file changes)
@@ -3907,6 +3946,10 @@ class ConversationHandler:
         # 1. Persona block (Cluster 3)
         if persona_text is not None:
             messages.append({"role": "system", "content": persona_text})
+
+        # 1b. Register prompt: the same on every turn, so it is prefix.
+        if self._register_prompt is not None:
+            messages.append({"role": "system", "content": self._register_prompt})
 
         # 2. Static system template
         messages.append({"role": "system", "content": static_template})
@@ -3944,6 +3987,7 @@ class ConversationHandler:
             messages=messages,
             prefix_fingerprint=(
                 ("persona", _sha256(persona_text or "")),
+                ("register prompt", _sha256(self._register_prompt or "")),
                 ("static template", _sha256(static_template)),
                 ("MIST.md conventions", _sha256(conventions_message or "")),
                 ("user profile", _sha256(profile_block or "")),
