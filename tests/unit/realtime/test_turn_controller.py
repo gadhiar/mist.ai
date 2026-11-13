@@ -1,5 +1,5 @@
-"""The per-session turn controller: its core (T11a), and cuts, purges, records and completion
-(T11c).
+"""The per-session turn controller: its core (T11a), cuts, purges, records and completion
+(T11c), and the cross-session `WakeArbiter` with `outranks` (T11e part 2).
 
 Every test drives the controller only through `post` and `close`, with the recording transport,
 `RecordingScenePort`, the fake responder, `FakeSynthesizer` on an inline lane, and the fake clock
@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import random
+from collections.abc import Callable
 
 import pytest
 import pytest_asyncio
@@ -40,15 +42,18 @@ from backend.realtime.turn import (
     Text,
     TurnController,
     TurnPlacement,
+    WakeArbiter,
     WakeRank,
     WakeVerdict,
     judge_over_budget,
+    outranks,
 )
 from tests.fakes.speech import FakeSynthesizer
 
 from .turn_fakes import (
     Call,
     FailingSynthesizer,
+    FakeCallLater,
     FakeWakeArbiter,
     Harness,
     IdCounter,
@@ -1912,3 +1917,321 @@ async def test_a_handoff_turns_tts_failed_voiced_text_keeps_the_ack():
     assert degraded.detail.voiced_text == "One moment."
     assert degraded.detail.text_from_token == 2
     assert joined.startswith(degraded.detail.voiced_text)
+
+
+# == T11e part 2: cross-session wake arbitration =====================================================
+# `outranks` (v5 :336-351, v9 :127-130) and `WakeArbiter` (v9 :132-151) alone, with a fake
+# `call_later` and a session count the test sets.
+
+
+def calibrated(
+    fa: float, quantile: float, *, arrival: float = 0.0, margin: float = 0.1
+) -> WakeRank:
+    return WakeRank(
+        arrival=arrival, false_accepts_per_hour=fa, positive_quantile=quantile, margin=margin
+    )
+
+
+def uncalibrated(margin: float, *, arrival: float = 0.0) -> WakeRank:
+    return WakeRank(
+        arrival=arrival, false_accepts_per_hour=None, positive_quantile=None, margin=margin
+    )
+
+
+@pytest.mark.parametrize(
+    ("better", "worse"),
+    [
+        # A calibrated rank outranks an uncalibrated one, whatever their margins and arrivals.
+        (calibrated(5.0, 0.1, arrival=900.0, margin=0.01), uncalibrated(0.9, arrival=0.0)),
+        # Between calibrated ranks the lower false accepts per hour wins, though its quantile,
+        # margin and arrival all favour the other.
+        (calibrated(0.1, 0.2, arrival=500.0, margin=0.05), calibrated(0.5, 0.9, margin=0.4)),
+        # Equal false accepts: the higher positive quantile, though it arrived 120 ms later.
+        (calibrated(0.1, 0.8, arrival=120.0, margin=0.05), calibrated(0.1, 0.6, margin=0.4)),
+        # Equal on both scales: the earlier arrival, whatever the margins.
+        (calibrated(0.1, 0.8, arrival=10.0, margin=0.01), calibrated(0.1, 0.8, arrival=20.0)),
+        # Between uncalibrated ranks the larger margin wins, though it arrived later.
+        (uncalibrated(0.3, arrival=200.0), uncalibrated(0.2, arrival=0.0)),
+        # Equal margins: the earlier arrival.
+        (uncalibrated(0.2, arrival=5.0), uncalibrated(0.2, arrival=6.0)),
+    ],
+    ids=[
+        "calibrated-over-uncalibrated",
+        "lower-false-accepts",
+        "higher-quantile-on-a-false-accept-tie",
+        "earlier-arrival-on-a-full-tie",
+        "larger-margin-uncalibrated",
+        "earlier-arrival-on-a-margin-tie",
+    ],
+)
+async def test_outranks_follows_each_ordering(better, worse):
+    assert outranks(better, worse)
+    assert not outranks(worse, better)
+
+
+async def test_outranks_is_false_both_ways_for_equal_ranks():
+    for rank in (calibrated(0.1, 0.5, arrival=3.0), uncalibrated(0.2, arrival=3.0)):
+        twin = dataclasses.replace(rank)
+        assert not outranks(rank, twin)
+        assert not outranks(twin, rank)
+
+
+async def test_a_rank_missing_either_calibrated_scale_ranks_as_uncalibrated():
+    half = WakeRank(arrival=0.0, false_accepts_per_hour=0.1, positive_quantile=None, margin=0.9)
+    assert outranks(calibrated(9.0, 0.0, arrival=50.0), half)
+    assert outranks(half, uncalibrated(0.5))
+
+
+class Verdicts:
+    """Each claim's verdicts, in the order the `verdict` callbacks were called."""
+
+    def __init__(self) -> None:
+        self.log: list[tuple[str, bool]] = []
+
+    def to(self, name: str) -> Callable[[bool], None]:
+        return lambda proceed: self.log.append((name, proceed))
+
+    def of(self, name: str) -> list[bool]:
+        return [proceed for who, proceed in self.log if who == name]
+
+
+def arbiter_with(
+    sessions: int = 2, window_ms: int = 250
+) -> tuple[WakeArbiter, FakeCallLater, list[int]]:
+    """A real arbiter, its fake `call_later`, and the session count a test may change."""
+    count = [sessions]
+    later = FakeCallLater()
+    wake = WakeArbiter(window_ms=window_ms, sessions=lambda: count[0], call_later=later)
+    return wake, later, count
+
+
+async def test_one_session_with_no_claim_pending_proceeds_before_claim_returns_with_no_timer():
+    wake, later, _ = arbiter_with(sessions=1)
+    verdicts = Verdicts()
+
+    claim = wake.claim("s1", uncalibrated(0.2), verdicts.to("a"))
+    seen_at_return = list(verdicts.log)
+
+    assert seen_at_return == [("a", True)]
+    assert later.timers == []
+    wake.settle(claim, True)
+    second = wake.claim("s1", uncalibrated(0.2), verdicts.to("b"))
+    assert verdicts.of("b") == [True]
+    assert later.timers == []
+    assert second != claim
+
+
+async def test_one_session_with_a_departed_sessions_claim_pending_waits():
+    wake, later, count = arbiter_with(sessions=2)
+    verdicts = Verdicts()
+    gone = wake.claim("s2", uncalibrated(0.2), verdicts.to("gone"))
+    count[0] = 1  # session s2 left with its claim still pending
+
+    stay = wake.claim("s1", uncalibrated(0.1), verdicts.to("stay"))
+
+    assert verdicts.log == []
+    assert len(later.timers) == 1  # it joined the window `gone` opened
+    later.fire()
+    assert verdicts.log == [("gone", True)]
+    wake.settle(gone, False)  # the departed session's controller dropped it at disconnect
+    assert verdicts.log == [("gone", True), ("stay", True)]
+    wake.settle(stay, True)
+
+
+async def test_one_session_with_a_departed_sessions_winner_unsettled_waits():
+    wake, later, count = arbiter_with(sessions=2)
+    verdicts = Verdicts()
+    gone = wake.claim("s2", uncalibrated(0.2), verdicts.to("gone"))
+    later.fire()
+    count[0] = 1
+
+    stay = wake.claim("s1", uncalibrated(0.9), verdicts.to("stay"))
+
+    assert verdicts.log == [("gone", True)]
+    assert len(later.timers) == 1
+    wake.settle(gone, True)
+    assert verdicts.of("stay") == [False]
+    wake.settle(stay, False)
+
+
+async def test_a_window_opens_at_the_first_claim_and_its_best_claim_proceeds_at_its_close():
+    wake, later, _ = arbiter_with(sessions=2, window_ms=250)
+    verdicts = Verdicts()
+
+    wake.claim("s1", uncalibrated(0.1, arrival=0.0), verdicts.to("weak"))
+    assert [delay for delay, _ in later.timers] == [0.25]
+    wake.claim("s2", uncalibrated(0.3, arrival=120.0), verdicts.to("strong"))
+
+    assert len(later.timers) == 1  # the second claim joined the open window
+    assert verdicts.log == []
+    later.fire()
+    assert verdicts.log == [("strong", True)]  # the weak claim waits for the winner's verdict
+
+
+async def test_a_claim_after_the_window_closed_waits_while_the_winner_is_unsettled():
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    first = wake.claim("s1", uncalibrated(0.2), verdicts.to("first"))
+    later.fire()
+
+    wake.claim("s2", uncalibrated(0.9), verdicts.to("late"))
+
+    assert verdicts.log == [("first", True)]
+    assert len(later.timers) == 1  # no new window while a winner is unsettled
+    wake.settle(first, False)
+    assert verdicts.log == [("first", True), ("late", True)]
+
+
+async def test_accepting_the_winner_sends_every_other_pending_claim_false_and_empties_it():
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    winner = wake.claim("s1", uncalibrated(0.5), verdicts.to("winner"))
+    wake.claim("s2", uncalibrated(0.2), verdicts.to("loser"))
+    later.fire()
+    wake.claim("s3", uncalibrated(0.1), verdicts.to("late"))
+
+    wake.settle(winner, True)
+
+    assert verdicts.log == [("winner", True), ("loser", False), ("late", False)]
+    # Empty: the next claim opens a new window.
+    wake.claim("s1", uncalibrated(0.5), verdicts.to("next"))
+    assert len(later.timers) == 2
+    assert verdicts.of("next") == []
+
+
+async def test_rejecting_the_winner_gives_the_next_ranked_claim_its_verdict():
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    winner = wake.claim("s1", uncalibrated(0.5), verdicts.to("winner"))
+    third = wake.claim("s2", uncalibrated(0.1), verdicts.to("third"))
+    second = wake.claim("s3", uncalibrated(0.3), verdicts.to("second"))
+    later.fire()
+
+    wake.settle(winner, False)
+    assert verdicts.log == [("winner", True), ("second", True)]
+    wake.settle(second, False)
+    assert verdicts.log[-1] == ("third", True)
+    wake.settle(third, False)
+
+    # None remains, so it is empty: the next claim opens a new window.
+    assert len(verdicts.log) == 3
+    wake.claim("s1", uncalibrated(0.5), verdicts.to("next"))
+    assert len(later.timers) == 2
+
+
+async def test_withdrawing_a_waiting_claim_sends_no_verdict_to_anyone():
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    best = wake.claim("s1", uncalibrated(0.9), verdicts.to("best"))
+    other = wake.claim("s2", uncalibrated(0.1), verdicts.to("other"))
+
+    wake.settle(best, False)  # withdrawn inside the window: dropped at mute, say
+    assert verdicts.log == []
+    later.fire()
+    assert verdicts.log == [("other", True)]
+
+    late = wake.claim("s1", uncalibrated(0.9), verdicts.to("late"))
+    wake.settle(late, False)  # withdrawn while the winner is unsettled
+    assert verdicts.log == [("other", True)]
+    wake.settle(other, True)
+    assert verdicts.log == [("other", True)]
+
+
+async def test_withdrawing_every_claim_in_a_window_leaves_its_close_nothing_to_grant():
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    only = wake.claim("s1", uncalibrated(0.9), verdicts.to("only"))
+    wake.settle(only, False)
+    later.fire()
+    assert verdicts.log == []
+    wake.claim("s1", uncalibrated(0.9), verdicts.to("next"))
+    assert len(later.timers) == 2
+
+
+async def test_settle_true_on_a_claim_that_is_not_the_winner_raises():
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    winner = wake.claim("s1", uncalibrated(0.9), verdicts.to("winner"))
+    waiting = wake.claim("s2", uncalibrated(0.1), verdicts.to("waiting"))
+
+    with pytest.raises(ValueError):
+        wake.settle(waiting, True)  # still inside the window
+    later.fire()
+    with pytest.raises(ValueError):
+        wake.settle(waiting, True)  # waiting on the winner
+    with pytest.raises(ValueError):
+        wake.settle(999, True)  # never claimed
+    assert verdicts.log == [("winner", True)]
+    wake.settle(winner, True)
+    with pytest.raises(ValueError):
+        wake.settle(waiting, True)  # it lost
+    with pytest.raises(ValueError):
+        wake.settle(winner, True)  # already settled
+
+
+async def test_settle_false_on_a_claim_it_no_longer_holds_is_a_no_op():
+    """Decision 3: a controller settles a lost claim too, after its `verdict(False)`."""
+    wake, later, count = arbiter_with()
+    verdicts = Verdicts()
+    winner = wake.claim("s1", uncalibrated(0.9), verdicts.to("winner"))
+    loser = wake.claim("s2", uncalibrated(0.1), verdicts.to("loser"))
+    later.fire()
+    wake.settle(winner, True)
+    assert verdicts.log == [("winner", True), ("loser", False)]
+
+    wake.settle(loser, False)
+    wake.settle(winner, False)
+    wake.settle(999, False)
+
+    assert verdicts.log == [("winner", True), ("loser", False)]
+    # It is still empty: a lone session's next claim proceeds at once, with no timer.
+    count[0] = 1
+    fresh = wake.claim("s1", uncalibrated(0.9), verdicts.to("fresh"))
+    assert verdicts.of("fresh") == [True]
+    assert len(later.timers) == 1
+    wake.settle(fresh, True)
+
+
+@pytest.mark.parametrize("seed", range(50))
+async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(seed):
+    """Random claims, window closes, settles and session counts, against the arbiter's rules."""
+    rng = random.Random(seed)
+    count = [rng.choice([1, 2, 3])]
+    later = FakeCallLater()
+    wake = WakeArbiter(window_ms=250, sessions=lambda: count[0], call_later=later)
+    got: dict[int, list[bool]] = {}
+    settled: set[int] = set()
+    order: list[int] = []
+
+    def record(index: int) -> Callable[[bool], None]:
+        def verdict(proceed: bool) -> None:
+            assert index >= len(order) or order[index] not in settled, "a verdict after settle"
+            got.setdefault(index, []).append(proceed)
+
+        return verdict
+
+    def unsettled_winners() -> list[int]:
+        return [i for i, v in got.items() if v == [True] and order[i] not in settled]
+
+    for _ in range(60):
+        action = rng.random()
+        if action < 0.35:
+            rank = uncalibrated(round(rng.random(), 1), arrival=float(rng.randint(0, 3)))
+            index = len(order)
+            order.append(wake.claim(f"s{rng.randint(1, 3)}", rank, record(index)))
+        elif action < 0.55 and later.pending:
+            later.fire()
+        elif action < 0.65:
+            count[0] = rng.choice([1, 2, 3])
+        elif order:
+            index = rng.randrange(len(order))
+            if order[index] in settled:
+                continue
+            accepted = index in unsettled_winners() and rng.random() < 0.5
+            wake.settle(order[index], accepted)
+            settled.add(order[index])
+        assert len(unsettled_winners()) <= 1, "two unsettled winners"
+        assert all(len(v) == 1 for v in got.values()), "a claim with two verdicts"
+        waiting = [i for i in range(len(order)) if order[i] not in settled and i not in got]
+        # No claim waits on nothing: a window is open or a winner's verdict is still to come.
+        assert not waiting or unsettled_winners() or later.pending, "a claim left waiting"
