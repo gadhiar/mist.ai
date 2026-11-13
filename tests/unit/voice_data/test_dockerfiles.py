@@ -217,6 +217,8 @@ def test_requirement_lines_are_pinned(name: str) -> None:
         assert "unverified" not in line
 
 
+VLLM_OMNI_COMMIT = "36e048fd7005400e4089079104e1f204cfdac569"
+VLLM_TRANSFORMERS = ">=4.56.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0"
 # The upstream bounds behind the pip ResolutionImpossible failures of the H3 teacher builds at
 # a31679c, and the bounds of the pins that replaced them, as (requirements file, declaring
 # package, its pin, dependency, the declared specifier). A row applies while the file pins the
@@ -232,6 +234,19 @@ UPSTREAM_BOUNDS = [
     ("requirements-omnivoice.txt", "gradio", "6.32.0", "huggingface-hub", ">=1.16.0,<3.0"),
     # pypi.org/pypi/transformers/5.19.0/json
     ("requirements-fish-s2.txt", "transformers", "5.19.0", "safetensors", ">=0.8.0"),
+    # pypi.org/pypi/vllm/0.22.0/json
+    ("requirements-higgs3.txt", "vllm", "0.22.0", "transformers", VLLM_TRANSFORMERS),
+    ("requirements-higgs3.txt", "vllm", "0.22.0", "tokenizers", ">=0.21.1"),
+    # vllm-omni requirements/common.txt at the pinned commit
+    (
+        "requirements-higgs3.txt",
+        "vllm-omni",
+        VLLM_OMNI_COMMIT,
+        "transformers",
+        f"{VLLM_TRANSFORMERS},<5.9.0",
+    ),
+    # pypi.org/pypi/transformers/5.8.1/json
+    ("requirements-higgs3.txt", "transformers", "5.8.1", "tokenizers", ">=0.22.0,<=0.23.0"),
 ]
 
 
