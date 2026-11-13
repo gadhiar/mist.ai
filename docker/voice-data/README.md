@@ -35,7 +35,8 @@ rebuilds only the record, the code layer and the import check.
   `/opt/mist-voice/code` on the path, because jobs run `<venv>/bin/python -I`.
 - `/opt/mist-voice/upstream/<repo>`: upstream code that is not pip-installable, cloned at its
   pinned commit (TIGER, Music-Source-Separation-Training, brouhaha-vad, Sidon, CosyVoice with
-  Matcha-TTS, knn-vc, seed-vc, piper1-gpl at tag v1.8.0, pocket-tts, StyleTTS2, neutts).
+  Matcha-TTS, knn-vc, seed-vc, piper1-gpl at 639388b6317fc4731e91d53da42aea68fd4166ff, the
+  commit its lightweight tag v1.8.0 names, pocket-tts, StyleTTS2, neutts).
 - `/etc/mist-voice-image.json`: the family, the git sha and the sha256 of each requirements file.
 - Default command `remote-entry.sh`: on a pod with `PUBLIC_KEY` set, sshd with key-only login,
   then wait. Local jobs name their own command.
