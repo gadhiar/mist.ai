@@ -490,11 +490,15 @@ class EngineStatuses(_WireModel):
 
 
 class TtsVoice(_WireModel):
-    """The stock voice the synthesizer speaks with; nothing is cloned, so no reference is named.
+    """The voice the synthesizer speaks with: MIST's voice identity, voiced by one engine.
+
+    The identity's clips and transcripts are private, so the message names the identity by its
+    id and carries no reference audio, path or hash.
 
     Attributes:
-        engine: The TTS engine id, for example `pocket`.
-        voice: One of that engine's stock voice names.
+        engine: The TTS engine id, for example `pocket-clone`.
+        voice: The voice identity id (`VoiceIdentity.voice_id`, `PlacementConfig.tts_voice`),
+            for example `mist-v1`.
         profile: The active voice profile, `mist` by default.
     """
 
