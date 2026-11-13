@@ -76,8 +76,8 @@ class TestTheCallLine:
     @pytest.mark.parametrize(
         "effort, caps",
         [
-            pytest.param("low", (96, 2048, 400), id="low"),
-            pytest.param("medium", (96, 32768, 400), id="medium"),
+            pytest.param("low", (512, 2048, 400), id="low"),
+            pytest.param("medium", (512, 32768, 400), id="medium"),
         ],
     )
     async def test_every_stage_logs_one_line_at_info(self, service_settings, caplog, effort, caps):

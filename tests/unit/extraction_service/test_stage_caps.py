@@ -1,11 +1,11 @@
 """Each stage's output token cap follows the reasoning effort that stage is sent at.
 
-Low keeps the named limits (96, 2048, 400), so a low-effort service sends
-exactly what it sent before caps depended on effort. Medium and high give
-extract room to reason. Scope and derive run at low effort, and so at their
-96 and 400 caps, under every setting: scope is a classification, and no
-effort run measures derive above low. Qwen and Gemma send no effort, so their
-caps stay low's whatever the setting says.
+Low keeps the named limits (512, 2048, 400). Scope's 512 sits above every
+scope call measured to stop on its own, where a cap of 96 cut two replies
+mid-answer. Medium and high give extract room to reason. Scope and derive run
+at low effort, and so at their 512 and 400 caps, under every setting: scope is
+a classification, and no effort run measures derive above low. Qwen and Gemma
+send no effort, so their caps stay low's whatever the setting says.
 """
 
 from __future__ import annotations
@@ -89,10 +89,17 @@ def _sent_effort(body: dict) -> str | None:
 
 class TestTheCapsTable:
     def test_low_is_the_named_limits(self):
-        assert stage_caps("low") == StageCaps(scope=96, extract=2048, derive=400)
+        assert stage_caps("low") == StageCaps(scope=512, extract=2048, derive=400)
         assert stage_caps("low") == StageCaps(
             scope=SCOPE_MAX_TOKENS, extract=EXTRACT_MAX_TOKENS, derive=DERIVE_MAX_TOKENS
         )
+
+    def test_no_scope_cap_is_another_stages_cap(self):
+        """A scope `cap N` in the call log names its stage only while no other stage uses N."""
+        scope_caps = {caps.scope for caps in STAGE_CAPS.values()}
+        other_caps = {cap for caps in STAGE_CAPS.values() for cap in (caps.extract, caps.derive)}
+
+        assert scope_caps.isdisjoint(other_caps)
 
     def test_no_effort_gives_low(self):
         assert stage_caps(None) == stage_caps("low")
@@ -183,7 +190,7 @@ class TestWhatEachStageSends:
         )
 
         assert [(_sent_effort(body), body["max_tokens"]) for body in sent] == [
-            ("low", 96),
+            ("low", 512),
             ("low", 2048),
             ("low", 400),
         ]
@@ -199,7 +206,7 @@ class TestWhatEachStageSends:
         )
 
         assert [(_sent_effort(body), body["max_tokens"]) for body in sent] == [
-            ("low", 96),
+            ("low", 512),
             (effort, 32768),
             ("low", 400),
         ]
@@ -225,7 +232,7 @@ class TestWhatEachStageSends:
         )
 
         assert [(_sent_effort(body), body["max_tokens"]) for body in sent] == [
-            (None, 96),
+            (None, 512),
             (None, 2048),
             (None, 400),
         ]
@@ -254,11 +261,11 @@ class TestTheRecordedCaps:
     @pytest.mark.parametrize(
         ("adapter_name", "effort", "caps"),
         [
-            ("gptoss", "low", (96, 2048, 400)),
-            ("gptoss", "medium", (96, 32768, 400)),
-            ("gptoss", "high", (96, 32768, 400)),
-            ("qwen", "medium", (96, 2048, 400)),
-            ("gemma", "high", (96, 2048, 400)),
+            ("gptoss", "low", (512, 2048, 400)),
+            ("gptoss", "medium", (512, 32768, 400)),
+            ("gptoss", "high", (512, 32768, 400)),
+            ("qwen", "medium", (512, 2048, 400)),
+            ("gemma", "high", (512, 2048, 400)),
         ],
     )
     def test_the_run_identity_records_the_caps_each_stage_is_sent_with(
@@ -281,7 +288,7 @@ class TestTheRecordedCaps:
         settings = dataclasses.replace(service_settings, reasoning_effort=effort)
         engine = ExtractionEngine(llm=wired_llm, adapter=_adapter_for(settings), settings=settings)
 
-        assert engine.stage_cap("scope") == 96
+        assert engine.stage_cap("scope") == 512
         assert engine.stage_cap("extract") == cap
         assert engine.stage_cap("derive") == 400
 

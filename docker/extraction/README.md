@@ -130,7 +130,7 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_MODEL_HASH` | **required, no default** (`:?`) | **required, no default** (`:?`) | Defines the epoch. Set explicitly every deploy; see EPOCH_MISMATCH in `backend/extraction_service/app.py`. |
 | `EXTRACTION_MODEL_FILE` | `ggml-org/gpt-oss-20b-MXFP4.gguf` | same | Passed to `LlamaServerProvider` as the OpenAI-API `model` field. |
 | `EXTRACTION_ADAPTER` | `gptoss` | same | `gptoss` / `qwen` / `gemma` -- see `backend/extraction_service/adapters.py`. |
-| `EXTRACTION_REASONING_EFFORT` | `medium` | `low` | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` sends scope 96, extract 2048, derive 400; `medium` and `high` send extract 32768 and keep scope 96 and derive 400. Scope and derive are always sent at `low` effort, so their caps stay low's. `medium` and `high` need a context of at least 47,104 tokens (the 32,768 extract cap plus the 14,336-token prompt reserve); the local default context, 65,536, gives it, and at the host's 16,384 default the service reports no serving identity for them. See "Effort caps and the context" and "Medium by default (local)" below. |
+| `EXTRACTION_REASONING_EFFORT` | `medium` | `low` | Only meaningful for `gptoss`. Sets each stage's output token cap (`STAGE_CAPS` in `backend/extraction_service/engine.py`): `low` sends scope 512, extract 2048, derive 400; `medium` and `high` send extract 32768 and keep scope 512 and derive 400. Scope and derive are always sent at `low` effort, so their caps stay low's. `medium` and `high` need a context of at least 47,104 tokens (the 32,768 extract cap plus the 14,336-token prompt reserve); the local default context, 65,536, gives it, and at the host's 16,384 default the service reports no serving identity for them. See "Effort caps and the context" and "Medium by default (local)" below. |
 | `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per deployment, not overridable via `.env`. |
 | `LLAMA_CPP_BUILD` | `b11151` | same | Reported in `ResultStamps`/`/v1/info`; shared with the compose image pin. |
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
@@ -343,12 +343,15 @@ that stage (`STAGE_CAPS`, `stage_caps` and `GptOssAdapter.stage_effort`):
 
 | `EXTRACTION_REASONING_EFFORT` | scope | extract | derive | context needed |
 |---|---|---|---|---|
-| `low` (host default) | 96 | 2048 | 400 | 16,384 |
-| `medium` (local default) | 96 | 32768 | 400 | 47,104 |
-| `high` | 96 | 32768 | 400 | 47,104 |
+| `low` (host default) | 512 | 2048 | 400 | 16,384 |
+| `medium` (local default) | 512 | 32768 | 400 | 47,104 |
+| `high` | 512 | 32768 | 400 | 47,104 |
 
 - Scope is sent at `low` effort under every setting, so its cap is always
-  96: it is a classification.
+  512: it is a classification. 512 sits above every scope call measured to
+  stop on its own (the longest took 87 tokens at `low` and 316 at `medium`);
+  a cap of 96 cut two scope replies mid-answer, which took 232 and 151 tokens
+  at `medium`.
 - Derive is sent at `low` effort under every setting, so its cap is always
   400. No effort run calls derive, so a higher effort there would ship
   unmeasured.

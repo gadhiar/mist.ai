@@ -351,7 +351,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
         # Before T52's Rule 28, Example 30 and generated schema, which move
         # prompt_sha256, and the schema's code, which moves code_sha256:
         # ci1-05e08807f788c4e062ffd6bee50b85bbd87d307961131fbfb1f1c8dfc3456a7c.
-        code_identity="ci1-61591c98b4b3dbef9c3a252cd43c11ade626fafdc93eb4de6d1fa3afcff1e86e",
+        # Before T60's scope cap of 512, which moves scope_max_tokens and
+        # code_sha256:
+        # ci1-61591c98b4b3dbef9c3a252cd43c11ade626fafdc93eb4de6d1fa3afcff1e86e.
+        code_identity="ci1-b26a03224c323f3835ba8b00fa81462184a6e93e882190ce6e061385779483a7",
         date="2026-11-12",
         reason=(
             "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
@@ -369,7 +372,8 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "types and a relationship's one of its extractable edges, each entity carries "
             "id, name and type and each relationship source, target and type, and a "
             "Metric that writes properties writes value, unit and quantity, unit and "
-            "quantity possibly null. Re-extracts history."
+            "quantity possibly null; T60 sends scope with a cap of 512 in place of 96, so a "
+            "scope reply is no longer cut mid-answer. Re-extracts history."
         ),
     ),
 )
