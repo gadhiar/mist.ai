@@ -32,6 +32,64 @@ dependencies/csm/audio_data_*/
 *.wav
 !data/voice_profiles/**/*.yaml
 
+# Voice data never enters this public repository
+# Mirrors the no-audio-files, no-voice-assets and no-voice-data-records pre-commit
+# hooks, so voice media, weights and records stay untracked before any commit.
+# Voice data lives under MIST_VOICE_PRIVATE_ROOT instead.
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.ac3
+*.eac3
+*.dts
+*.aif
+*.aiff
+*.wma
+*.mka
+*.mkv
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.webm
+*.wmv
+*.flv
+*.m2ts
+*.vob
+voice.json
+student.json
+target.json
+*.npy
+*.npz
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+*.safetensors
+*.nemo
+*.gguf
+*.pkl
+*.h5
+*.hdf5
+*.parquet
+*.arrow
+*.private.*
+*.srt
+*.vtt
+*.ass
+*.rttm
+*.textgrid
+*.lab
+*.tar
+*.tgz
+*.zip
+*.7z
+
 # Cluster 8 vault layer (ADR-010) -- runtime artifacts.
 data/vault_sidecar.db
 data/vault_sidecar.db-shm
