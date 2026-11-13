@@ -10,11 +10,19 @@ python -m scripts.voice_data images build --sha <commit> --family <key or all>
 ```
 
 `images build` exports `scripts/voice_data`, `scripts/model_bench` and `docker/voice-data` at the
-commit with `git archive`, builds `base.Dockerfile` as `mist-voice-base:<first 12 hex>`, then each
-family's `<image without mist-voice->.Dockerfile` with `--build-arg GIT_SHA=<commit>`. A family
-Dockerfile finds its base as `mist-voice-base:${GIT_SHA%<28 x ?>}`, the 40-hex sha with its last
-28 characters dropped; that string trim needs Dockerfile syntax 1.7 or later, which current
-Docker Engine releases carry built in. `--build-arg BASE_IMAGE=<tag>` overrides it.
+commit with `git archive`, then runs three kinds of build from that export, in this order:
+
+1. `base.Dockerfile --target runtime` as `mist-voice-runtime:<first 12 hex>`: the CUDA runtime,
+   Python 3.11, `/opt/venv-score` and the pod entry, with no code and no git sha, so its layers
+   are the same for every commit.
+2. `base.Dockerfile` with `--build-arg GIT_SHA=<commit>` as `mist-voice-base:<first 12 hex>`: the
+   runtime stage plus the git sha record and the code, for the `score` family.
+3. Each family's `<image without mist-voice->.Dockerfile` with `--build-arg GIT_SHA=<commit>` and
+   `--build-arg BASE_IMAGE=mist-voice-runtime:<first 12 hex>`. `BASE_IMAGE` has no default.
+
+A family image builds on the runtime stage, not on the base image, and declares `GIT_SHA` only
+after its venv and upstream clones, so a new commit reuses every venv layer from the cache and
+rebuilds only the record, the code layer and the import check.
 
 ## Layout of every image
 

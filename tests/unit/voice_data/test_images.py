@@ -117,11 +117,12 @@ def test_context_holds_only_the_committed_three_paths(repo) -> None:
     assert context["scripts/model_bench/wer.py"] == "WER = 1\n"
 
 
-def test_all_builds_each_image_once_base_first(repo) -> None:
+def test_all_builds_runtime_then_base_then_each_image_once(repo) -> None:
     path, sha = repo
     docker = FakeDocker()
     tags = images.build(path, sha[:10], "all", docker)
     assert tags == [
+        f"mist-voice-runtime:{sha[:12]}",
         f"mist-voice-base:{sha[:12]}",
         f"mist-voice-extract:{sha[:12]}",
         f"mist-voice-teacher-indextts2:{sha[:12]}",
@@ -132,22 +133,67 @@ def test_all_builds_each_image_once_base_first(repo) -> None:
         "build",
         "-f",
         f"{context}/docker/voice-data/base.Dockerfile",
+        "--target",
+        "runtime",
+        "-t",
+        f"mist-voice-runtime:{sha[:12]}",
+        context,
+    ]
+    assert docker.calls[1] == [
+        "docker",
+        "build",
+        "-f",
+        f"{context}/docker/voice-data/base.Dockerfile",
         "--build-arg",
         f"GIT_SHA={sha}",
         "-t",
         f"mist-voice-base:{sha[:12]}",
         context,
     ]
+    assert docker.calls[2] == [
+        "docker",
+        "build",
+        "-f",
+        f"{context}/docker/voice-data/extract.Dockerfile",
+        "--build-arg",
+        f"GIT_SHA={sha}",
+        "--build-arg",
+        f"BASE_IMAGE=mist-voice-runtime:{sha[:12]}",
+        "-t",
+        f"mist-voice-extract:{sha[:12]}",
+        context,
+    ]
     assert [Path(call[3]).name for call in docker.calls] == [
+        "base.Dockerfile",
         "base.Dockerfile",
         "extract.Dockerfile",
         "teacher-indextts2.Dockerfile",
     ]
 
 
-def test_one_family_builds_base_then_its_image(repo) -> None:
+def test_only_family_builds_get_the_base_image_arg(repo) -> None:
+    # Family venvs build on the code-free runtime stage, so a new sha reuses their cached layers;
+    # the runtime and base builds take no BASE_IMAGE.
+    path, sha = repo
+    docker = FakeDocker()
+    images.build(path, sha, "all", docker)
+    with_arg = [
+        call[call.index("-t") + 1]
+        for call in docker.calls
+        if f"BASE_IMAGE=mist-voice-runtime:{sha[:12]}" in call
+    ]
+    assert with_arg == [
+        f"mist-voice-extract:{sha[:12]}",
+        f"mist-voice-teacher-indextts2:{sha[:12]}",
+    ]
+    assert [call for call in docker.calls if "--target" in call] == [docker.calls[0]]
+    assert not any(arg.startswith("BASE_IMAGE=") for arg in docker.calls[0] + docker.calls[1])
+
+
+def test_one_family_builds_runtime_and_base_then_its_image(repo) -> None:
     path, sha = repo
     assert images.build(path, sha, "teacher-indextts2", FakeDocker()) == [
+        f"mist-voice-runtime:{sha[:12]}",
         f"mist-voice-base:{sha[:12]}",
         f"mist-voice-teacher-indextts2:{sha[:12]}",
     ]
@@ -155,7 +201,10 @@ def test_one_family_builds_base_then_its_image(repo) -> None:
 
 def test_score_family_maps_to_base_and_builds_it_once(repo) -> None:
     path, sha = repo
-    assert images.build(path, sha, "score", FakeDocker()) == [f"mist-voice-base:{sha[:12]}"]
+    assert images.build(path, sha, "score", FakeDocker()) == [
+        f"mist-voice-runtime:{sha[:12]}",
+        f"mist-voice-base:{sha[:12]}",
+    ]
 
 
 def test_the_temporary_context_is_removed_after_a_failed_build(repo) -> None:
