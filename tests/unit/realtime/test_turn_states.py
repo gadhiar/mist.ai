@@ -1142,6 +1142,27 @@ async def test_held_overload_names_no_turn_and_the_turn_stays_held():
     assert h.outbound.of("voice_decision:overload")[-1].turn_id == turn_id
 
 
+@pytest.mark.parametrize(("backlog_ms", "reason"), [(0, "no_backlog"), (1500, "not_addressed")])
+async def test_held_endpoint_wake_rejected_names_no_turn(backlog_ms, reason):
+    """As with `overload`, a `wake_rejected` while held must not name the held turn."""
+    h = make_harness([Token("One two. "), Pause()])
+    h.start_voice()
+    await held(h)
+
+    h.post(Wake(keyword="mist", score=0.8, backlog_ms=backlog_ms, arrival=0.0))
+    await h.settle()
+    if backlog_ms:
+        h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.8))
+        await h.settle()
+        ((*_, uid),) = calls(h.ingress, "open_utterance")
+        h.post(h.ingress.partial(uid, "I missed the bus", gate=True))
+        await h.settle()
+
+    (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+    assert (rejected.reason, rejected.turn_id) == (reason, None)
+    assert h.outbound.queued_turn_ids() == []
+
+
 # == The cells of v2's table in idle, thinking, speaking and text (v2 :476-492) ==================
 # v5 :1174-1189 keeps these rows; its new and changed rows (`NameHeard`, the gate partial, an
 # unpublished candidate's end, `SpeechStarted`, `wake`) are T11e's, and the `ptt` rows are gone.

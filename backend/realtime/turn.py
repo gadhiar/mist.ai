@@ -1695,8 +1695,11 @@ class TurnController:
         return self._settings.frame_ms if self._settings is not None else FRAME_MS
 
     def _turn_id_now(self) -> str | None:
+        """The turn a message may name now: none while it is held, since it sent nothing (v1)."""
         turn = self._turn
-        return turn.turn_id if turn is not None and not turn.ending else None
+        if turn is None or turn.ending or turn.held:
+            return None
+        return turn.turn_id
 
     def _candidate_of(self, utterance_id: str) -> _Wake | None:
         wake = self._candidate
