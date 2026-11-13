@@ -52,9 +52,9 @@ from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.partitions import USER_ENTITY_ID
 from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
-from backend.llm.models import LLMResponse, UsageMetadata
+from backend.llm.models import LLMResponse, ThinkingConfig, UsageMetadata
 from backend.llm.models import ToolCall as LLMToolCall
-from backend.sentence_detector import SentenceBoundaryDetector
+from backend.sentence_detector import SentenceBoundaryDetector, find_clause_boundary
 from backend.vault.conventions import ConventionsLoader
 
 from .retrieval_trace import TurnTraceBuilder, refs_removed, trace_failed
@@ -761,7 +761,23 @@ _INTERRUPTION_NOTES: dict[str, str] = {
     "before_reply": "The user interrupted your previous turn before you said anything.",
 }
 
-_DELTA_ORDER: tuple[str, ...] = ("clock", "interruption", "retrieval", "memory", "live_advisory")
+# The `register` delta part of every `tts`-channel turn. A spoken reply should
+# be brief, a typed one need not be; asking in the delta rather than the prefix
+# keeps one cached prefix for both kinds of turn.
+SPOKEN_REGISTER_TEXT = (
+    "This reply is spoken. Answer in one to three short sentences, and offer more on screen "
+    "or on request."
+)
+
+# `register` goes last, next to the user's words it shapes the answer to.
+_DELTA_ORDER: tuple[str, ...] = (
+    "clock",
+    "interruption",
+    "retrieval",
+    "memory",
+    "live_advisory",
+    "register",
+)
 
 _DELTA_LABELS: dict[str, str] = {
     "clock": "=== CURRENT TIME ===",
@@ -769,6 +785,7 @@ _DELTA_LABELS: dict[str, str] = {
     "retrieval": "=== RETRIEVED CONTEXT ===",
     "memory": "=== MEMORY ===",
     "live_advisory": "=== LIVE DATA ADVISORY ===",
+    "register": "=== SPOKEN REPLY ===",
 }
 
 _USER_MESSAGE_LABEL = "=== USER MESSAGE ==="
@@ -877,6 +894,7 @@ class ConversationHandler:
         hydration_clock: HydrationClock | None = None,
         session_origin: str = "real",
         extraction_dispatcher: ExtractionDispatcher | None = None,
+        register_prompt: str | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -935,7 +953,15 @@ class ConversationHandler:
                 most tests), the in-process `_extract_knowledge_async` path runs
                 exactly as before. May also be attached after construction with
                 `attach_extraction_dispatcher`.
+            register_prompt: The fixed register line every turn shares (how
+                MIST speaks and addresses the user), built by the caller; the
+                handler only places it. Placed in the stable prefix right after
+                the persona block and charged as fixed cost, because it is the
+                same on every turn and so belongs to the cached prefix. None
+                adds nothing. The per-turn ask for a short spoken reply is a
+                separate `register` delta part, not this.
         """
+        self._register_prompt = register_prompt
         self.config = config
         # Injectable clock (DI seam). Default = real wall-clock so production
         # behavior is unchanged; the replay path supplies a fixed value.
@@ -1824,6 +1850,7 @@ class ConversationHandler:
         call_site: str,
         pass_num: int,
         state: StreamTurnState,
+        first_clause_min_chars: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream one LLM pass, sentence-gating content through the slop filter.
 
@@ -1864,12 +1891,34 @@ class ConversationHandler:
         generator (and its HTTP stream) in the same task, not several loop
         ticks later in the asyncgen finalizer.
 
+        With `first_clause_min_chars` set (a `tts` turn), the turn's first
+        emission is cut at `find_clause_boundary` instead of the sentence end,
+        so speech can start while the model is still writing the sentence.
+        TTS cuts its first segment with the same function, so the first Token
+        and the first segment end at the same character. "First" is read
+        from `state.emitted`, which spans both passes: a pass 1 that only
+        called a tool leaves the early cut to pass 2. The clause goes through
+        the same slop gate as a sentence, and everything after it is
+        sentence-gated as before.
+
+        Args:
+            request: The pass's LLM request.
+            session_id: The turn's session, for logs.
+            call_site: The pass's `llm_call_context` call site.
+            pass_num: 1 for the initial pass, 2 for the post-tool pass.
+            state: The turn's accumulator, mutated in place.
+            first_clause_min_chars: The earliest index the first clause may
+                be cut at; None keeps sentence gating throughout.
+
         Yields:
-            Token events, `pass_num=pass_num`, for each gated sentence
-            (including the trailing partial sentence flushed at end of
-            stream).
+            Token events, `pass_num=pass_num`, for the first clause when one
+            is cut early and for each gated sentence (including the trailing
+            partial sentence flushed at end of stream).
         """
         gate = SentenceBoundaryDetector()
+        # Text held for the first clause while no Token of the turn exists;
+        # it reaches `gate` only once the clause is out.
+        clause_buffer = ""
         emitted_text = ""
         # Whitespace the model wrote after the last emitted sentence. It is
         # held back, not emitted with that sentence, so it becomes the
@@ -1924,6 +1973,37 @@ class ConversationHandler:
             emitted_text += text if emitted_text else piece_text
             return Token(text=text, pass_num=pass_num)
 
+        def _feed(content: str) -> list[Token]:
+            """Cut the first clause early while the turn has no Token yet, else
+            sentence-gate.
+
+            The clause segment takes the whitespace that follows it in the
+            buffer, as a sentence segment does, so that whitespace becomes the
+            next Token's separator. A clause the slop gate strips to nothing
+            leaves the turn without a Token, so the next clause is cut early
+            in its place.
+            """
+            nonlocal clause_buffer
+            tokens: list[Token] = []
+            if first_clause_min_chars is not None and not state.emitted:
+                clause_buffer += content
+                while not state.emitted:
+                    cut = find_clause_boundary(clause_buffer, first_clause_min_chars)
+                    if cut is None:
+                        return tokens
+                    after = clause_buffer[cut:]
+                    end = cut + len(after) - len(after.lstrip())
+                    segment, clause_buffer = clause_buffer[:end], clause_buffer[end:]
+                    token = _gate_and_emit(segment)
+                    if token is not None:
+                        tokens.append(token)
+                content, clause_buffer = clause_buffer, ""
+            for segment in gate.feed_segments(content):
+                token = _gate_and_emit(segment)
+                if token is not None:
+                    tokens.append(token)
+            return tokens
+
         with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
             async with aclosing(self._provider.generate(request, stream=True)) as chunks:
                 async for chunk in chunks:
@@ -1932,10 +2012,8 @@ class ConversationHandler:
                             continue
                         if first_token_at is None:
                             first_token_at = time.monotonic()
-                        for segment in gate.feed_segments(chunk.content):
-                            token = _gate_and_emit(segment)
-                            if token is not None:
-                                yield token
+                        for token in _feed(chunk.content):
+                            yield token
                         continue
                     # Terminal chunk: content is always None by contract; everything
                     # else the partials did NOT carry lives here.
@@ -1944,6 +2022,13 @@ class ConversationHandler:
                     usage = chunk.usage
                     reasoning_content = chunk.reasoning_content
 
+        # A first clause that never reached a boundary is sentence-gated with
+        # the rest of the stream.
+        if clause_buffer:
+            for segment in gate.feed_segments(clause_buffer):
+                token = _gate_and_emit(segment)
+                if token is not None:
+                    yield token
         for segment in gate.flush_segments():
             token = _gate_and_emit(segment)
             if token is not None:
@@ -2228,6 +2313,7 @@ class ConversationHandler:
             pending_user_message=user_message,
             interruption_note=scope.request.interruption_note,
             scope=scope,
+            channel=scope.request.channel,
         )
         messages = list(layout.messages)
         scope.context_window = messages
@@ -2250,6 +2336,20 @@ class ConversationHandler:
         # Set on the error path; yielded after the drain below, not from
         # inside the except block (see the comment there).
         error_token: Token | None = None
+        # A spoken turn waits on the model's first words, so it asks for the
+        # voice budget (0: no reasoning) on both passes. Being caller-set, it
+        # also stops `AdaptiveThinkingProvider` budgeting and retrying the
+        # pass. A typed turn leaves thinking unset, as before.
+        thinking = (
+            ThinkingConfig(budget_tokens=self.config.llm.voice_thinking_budget_tokens)
+            if scope.request.origin == "voice"
+            else None
+        )
+        first_clause_min_chars = (
+            self.config.llm.voice_first_segment_min_chars
+            if scope.request.channel == "tts"
+            else None
+        )
 
         try:
             # LLM autonomously decides to use tools
@@ -2262,6 +2362,7 @@ class ConversationHandler:
                 tools=self._tool_schemas,
                 temperature=self.config.llm.conversation_temperature,
                 max_tokens=self.config.llm.conversation_max_tokens,
+                thinking=thinking,
             )
             async with aclosing(
                 self._stream_llm_pass(
@@ -2270,6 +2371,7 @@ class ConversationHandler:
                     call_site="chat.initial",
                     pass_num=1,
                     state=state,
+                    first_clause_min_chars=first_clause_min_chars,
                 )
             ) as pass1_events:
                 async for stream_event in pass1_events:
@@ -2348,6 +2450,7 @@ class ConversationHandler:
                     messages=messages,
                     temperature=self.config.llm.conversation_temperature,
                     max_tokens=self.config.llm.conversation_max_tokens,
+                    thinking=thinking,
                 )
                 current_pass = 2
                 async with aclosing(
@@ -2357,6 +2460,7 @@ class ConversationHandler:
                         call_site="chat.final",
                         pass_num=2,
                         state=state,
+                        first_clause_min_chars=first_clause_min_chars,
                     )
                 ) as pass2_events:
                     async for stream_event in pass2_events:
@@ -3596,6 +3700,7 @@ class ConversationHandler:
         pending_user_message: str,
         interruption_note: Literal["mid_reply", "before_reply"] | None = None,
         scope: TurnScope | None = None,
+        channel: Literal["tts", "text"] = "text",
     ) -> PromptLayout:
         """Compose the turn's prompt in cache-stable order.
 
@@ -3604,12 +3709,14 @@ class ConversationHandler:
         per turn at the end:
 
           1. Stable prefix: persona block (MistContext, when provided),
-             static system template, MIST.md conventions, user profile.
+             register prompt (when the handler has one), static system
+             template, MIST.md conventions, user profile.
           2. History: the window the history strategy selects from the
              session's full history (`stable_window` moves its start only
              in steps), raw user text as stored.
-          3. Delta and user text: the interruption note, retrieval context
-             and live-data advisory as labelled blocks in the final user
+          3. Delta and user text: the interruption note, retrieval context,
+             live-data advisory and, on a `tts` turn, the spoken-reply
+             register as labelled blocks in the final user
              message ahead of the user's words (`delta_placement`
              `user_prefix`), or as one system message directly before it
              (`system_tail`). Nothing else follows the history.
@@ -3641,6 +3748,8 @@ class ConversationHandler:
             scope: The turn whose trace receives the profile-dedup and
                 budget feeds. None (a direct call outside a turn) feeds
                 nothing.
+            channel: Where the reply goes. A `tts` turn's delta carries the
+                `register` part asking for a short spoken reply.
 
         Returns:
             The `PromptLayout`: the messages plus the prefix fingerprint and
@@ -3704,6 +3813,10 @@ class ConversationHandler:
                     prunable=False,
                 )
             )
+        if channel == "tts":
+            whole_parts.append(
+                TurnDeltaPart(kind="register", text=SPOKEN_REGISTER_TEXT, prunable=False)
+            )
 
         # The full history plus the pending message: the strategy chooses the
         # window, so the start can stay put across turns instead of sliding.
@@ -3735,7 +3848,9 @@ class ConversationHandler:
                 # or they silently eat the 8K quality envelope past the
                 # 256-token safety margin (deep review phase1-conversation-1).
                 extra_fixed_texts=[
-                    t for t in (conventions_message, profile_block) if t is not None
+                    t
+                    for t in (self._register_prompt, conventions_message, profile_block)
+                    if t is not None
                 ],
                 max_history=max_history,
                 delta_parts=whole_parts,
@@ -3817,6 +3932,7 @@ class ConversationHandler:
         # subsequent positions must re-process. So stable content goes at the
         # front and everything that varies per turn goes last:
         #   1. Persona block       (stable within session; cached MistContext)
+        #   1b. Register prompt    (fixed for the handler's lifetime)
         #   2. Static template     (stable across all sessions)
         #   3. MIST.md             (stable across turns; mtime-cached)
         #   3b. User profile       (stable until the profile file changes)
@@ -3830,6 +3946,10 @@ class ConversationHandler:
         # 1. Persona block (Cluster 3)
         if persona_text is not None:
             messages.append({"role": "system", "content": persona_text})
+
+        # 1b. Register prompt: the same on every turn, so it is prefix.
+        if self._register_prompt is not None:
+            messages.append({"role": "system", "content": self._register_prompt})
 
         # 2. Static system template
         messages.append({"role": "system", "content": static_template})
@@ -3867,6 +3987,7 @@ class ConversationHandler:
             messages=messages,
             prefix_fingerprint=(
                 ("persona", _sha256(persona_text or "")),
+                ("register prompt", _sha256(self._register_prompt or "")),
                 ("static template", _sha256(static_template)),
                 ("MIST.md conventions", _sha256(conventions_message or "")),
                 ("user profile", _sha256(profile_block or "")),
