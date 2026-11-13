@@ -319,3 +319,24 @@ def test_fish_s2_installs_portaudio_headers_before_its_venv() -> None:
     assert "portaudio19-dev" in steps[apt].split(), steps[apt]
     [pip] = [i for i, s in enumerate(steps) if "/opt/venv-teacher-fish-s2/bin/pip install" in s]
     assert apt < pip
+
+
+def test_extract_import_check_loads_tiger_and_sidon_from_their_clones() -> None:
+    # TIGER and Sidon are cloned, not installed, and `-I` ignores PYTHONPATH, so the check puts
+    # the clones on sys.path itself. TIGER's look2hear.layers imports torch_complex and
+    # typeguard's check_argument_types, which typeguard 2.x provides; without the two pins the
+    # import finds setuptools' vendored typeguard 4, which lacks it.
+    final = instructions(DOCKER_DIR / "extract.Dockerfile")[-1]
+    check = re.match(r"RUN /opt/venv-extract/bin/python -I -c '([^']*)'", final)
+    assert check, final
+    prefix = (
+        'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER",'
+        ' "/opt/mist-voice/upstream/Sidon/src"]; import '
+    )
+    code = check.group(1)
+    assert code.startswith(prefix), code
+    modules = {module.strip() for module in code.removeprefix(prefix).split(",")}
+    assert {"look2hear.models", "sidon.cleansing", "scripts.voice_data"} <= modules
+    pins = pinned_versions("requirements-extract.txt")
+    assert "torch-complex" in pins
+    assert SpecifierSet("<3").contains(pins.get("typeguard", "3")), pins.get("typeguard")

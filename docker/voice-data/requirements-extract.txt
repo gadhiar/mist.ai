@@ -27,3 +27,7 @@ beartype==0.14.1
 rotary-embedding-torch==0.3.5
 ml-collections==1.1.0
 pyyaml==6.0.2
+# TIGER's look2hear.layers (stft_tfgn.py at 9f18d4a) imports torch_complex and typeguard's
+# check_argument_types, which typeguard 2.x provides and 4.x does not.
+torch-complex==0.4.4
+typeguard==2.13.3
