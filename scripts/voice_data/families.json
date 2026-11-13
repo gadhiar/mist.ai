@@ -1,0 +1,218 @@
+{
+  "schema": 1,
+  "families": {
+    "score": {
+      "image": "mist-voice-base",
+      "venv": "/opt/venv-score",
+      "devices": ["cpu", "cuda"],
+      "vram_gb": 6,
+      "models": {
+        "wavlm-sv": {"kind": "hf", "repository": "microsoft/wavlm-base-plus-sv", "revision": "feb593a6c23c1cc3d9510425c29b0a14d2b07b1e", "licence": "unverified", "gated": false},
+        "ecapa": {"kind": "hf", "repository": "speechbrain/spkrec-ecapa-voxceleb", "revision": "0f99f2d0ebe89ac095bcc5903c4dd8f72b367286", "licence": "apache-2.0", "gated": false},
+        "whisper-large-v3-turbo": {"kind": "hf", "repository": "openai/whisper-large-v3-turbo", "revision": "41f01f3fe87f28c78e2fbf8b568835947dd65ed9", "licence": "mit", "gated": false},
+        "arousal": {"kind": "hf", "repository": "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim", "revision": "6eba34a2485ea31cb03600241787c3a5edab8626", "licence": "cc-by-nc-sa-4.0", "gated": false}
+      }
+    },
+    "extract": {
+      "image": "mist-voice-extract",
+      "venv": "/opt/venv-extract",
+      "devices": ["cpu", "cuda"],
+      "vram_gb": 8,
+      "models": {
+        "separator-dme": {"kind": "hf", "repository": "JusperLee/TIGER-DnR", "revision": "b7a59560bbca10febbcd46fb01600f868e587f57", "licence": "apache-2.0", "gated": false},
+        "separator-melband-vocals": {"kind": "hf", "repository": "becruily/mel-band-roformer-vocals", "revision": "cce57b846ff188a0d1c7f3af42c0585b33f02eb1", "licence": "unverified", "gated": false},
+        "dereverb-melband": {"kind": "hf", "repository": "anvuew/dereverb_mel_band_roformer", "revision": "cef05ad2b5b3145ea5c149d3ad5d1f8439b34d06", "licence": "gpl-3.0", "gated": false},
+        "enhancer-sidon": {"kind": "hf", "repository": "sarulab-speech/sidon-v0.1", "revision": "b3b02d8bbd55fdbc410e6e46e76ef95ace4fbf52", "licence": "mit", "gated": false},
+        "diarizer-community-1": {"kind": "hf", "repository": "pyannote/speaker-diarization-community-1", "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee", "licence": "cc-by-4.0", "gated": true},
+        "quality-brouhaha": {"kind": "hf", "repository": "pyannote/brouhaha", "revision": "c93c9b537732dd50c28c0366c73f560c3a7aeb02", "licence": "openrail", "gated": true},
+        "whisperx-asr-large-v3": {"kind": "hf", "repository": "Systran/faster-whisper-large-v3", "revision": "edaa852ec7e145841d8ffdb056a99866b5f0a478", "licence": "mit", "gated": false},
+        "crisperwhisper": {"kind": "hf", "repository": "nyralabs/CrisperWhisper2.0_large", "revision": "f4334f6e8193f2691212d49b20fa12d370e13896", "licence": "nyra-health-non-commercial-research", "gated": false},
+        "whisperx-align-en": {"kind": "url", "url": "https://download.pytorch.org/torchaudio/models/wav2vec2_fairseq_base_ls960_asr_ls960.pth", "sha256": "unverified", "dest": "torch/hub/checkpoints/wav2vec2_fairseq_base_ls960_asr_ls960.pth", "licence": "unverified", "gated": false}
+      }
+    },
+    "teacher-indextts2": {
+      "image": "mist-voice-teacher-indextts2",
+      "venv": "/opt/venv-teacher-indextts2",
+      "devices": ["cuda"],
+      "vram_gb": 16,
+      "models": {
+        "indextts2": {"kind": "hf", "repository": "IndexTeam/IndexTTS-2", "revision": "740dcaff396282ffb241903d150ac011cd4b1ede", "licence": "bilibili-model-use-license (custom, no SPDX)", "gated": false},
+        "w2v-bert-2.0": {"kind": "hf", "repository": "facebook/w2v-bert-2.0", "revision": "da985ba0987f70aaeb84a80f2851cfac8c697a7b", "licence": "mit", "gated": false},
+        "maskgct-semantic-codec": {"kind": "hf", "repository": "amphion/MaskGCT", "revision": "265c6cef07625665d0c28d2faafb1415562379dc", "licence": "cc-by-nc-4.0", "gated": false, "files": ["semantic_codec/model.safetensors"]},
+        "campplus": {"kind": "hf", "repository": "funasr/campplus", "revision": "e4b6ede7ce16997aff4ae69fbca1f0175e2afede", "licence": "apache-2.0", "gated": false, "files": ["campplus_cn_common.bin"]},
+        "bigvgan": {"kind": "hf", "repository": "nvidia/bigvgan_v2_22khz_80band_256x", "revision": "633ff708ed5b74903e86ff1298cf4a98e921c513", "licence": "mit", "gated": false, "files": ["config.json", "bigvgan_generator.pt"]}
+      },
+      "states": {
+        "neutral": {"control": "emotion-ref", "value": "no emo_audio_prompt (speaker prompt is the emotion source)", "verified": true},
+        "calm": {"control": "emotion-ref", "value": "emo_audio_prompt=<calm reference clip>", "verified": false},
+        "awake": {"control": "emotion-ref", "value": "emo_audio_prompt=<awake reference clip>", "verified": false},
+        "sleepy": {"control": "emotion-ref", "value": "emo_audio_prompt=<sleepy reference clip, a public expressive-speech clip if the seed lacks one>", "verified": false},
+        "excited": {"control": "emotion-ref", "value": "emo_audio_prompt=<excited reference clip>", "verified": false}
+      }
+    },
+    "teacher-cosyvoice3": {
+      "image": "mist-voice-teacher-cosyvoice3",
+      "venv": "/opt/venv-teacher-cosyvoice3",
+      "devices": ["cuda"],
+      "vram_gb": 8,
+      "models": {
+        "cosyvoice3": {"kind": "hf", "repository": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512", "revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18", "licence": "apache-2.0", "gated": false}
+      },
+      "states": {
+        "neutral": {"control": "instruction", "value": "You are a helpful assistant.<|endofprompt|>", "verified": true},
+        "calm": {"control": "instruction", "value": "You are a helpful assistant. 请用平静的语气说一句话。<|endofprompt|>", "verified": false},
+        "awake": {"control": "instruction", "value": "You are a helpful assistant. 请用精神饱满的语气说一句话。<|endofprompt|>", "verified": false},
+        "sleepy": {"control": "instruction", "value": "You are a helpful assistant. 请用困倦的语气、尽可能慢地语速说一句话。<|endofprompt|>", "verified": false},
+        "excited": {"control": "instruction", "value": "You are a helpful assistant. 请用兴奋的语气说一句话。<|endofprompt|>", "verified": false}
+      }
+    },
+    "teacher-omnivoice": {
+      "image": "mist-voice-teacher-omnivoice",
+      "venv": "/opt/venv-teacher-omnivoice",
+      "devices": ["cuda"],
+      "vram_gb": 8,
+      "models": {
+        "omnivoice": {"kind": "hf", "repository": "k2-fsa/OmniVoice", "revision": "c5fdb5ccb189668d56333f77ba2629f4cd7535f4", "licence": "CC-BY-NC (version not stated on the card; no licence field in HF metadata)", "gated": false}
+      },
+      "states": {
+        "neutral": {"control": "instruction", "value": "", "verified": true}
+      }
+    },
+    "teacher-fish-s2": {
+      "image": "mist-voice-teacher-fish-s2",
+      "venv": "/opt/venv-teacher-fish-s2",
+      "devices": ["cuda"],
+      "vram_gb": 24,
+      "models": {
+        "fish-s2-pro": {"kind": "hf", "repository": "fishaudio/s2-pro", "revision": "1de9996b6be38b745688de084d87a5633f714e4e", "licence": "fish-audio-research-license (custom)", "gated": false}
+      },
+      "states": {
+        "neutral": {"control": "inline-tag", "value": "", "verified": true},
+        "calm": {"control": "inline-tag", "value": "[calm]", "verified": false},
+        "awake": {"control": "inline-tag", "value": "[energetic]", "verified": false},
+        "sleepy": {"control": "inline-tag", "value": "[low voice]", "verified": false},
+        "excited": {"control": "inline-tag", "value": "[excited]", "verified": true}
+      }
+    },
+    "teacher-higgs3": {
+      "image": "mist-voice-teacher-higgs3",
+      "venv": "/opt/venv-teacher-higgs3",
+      "devices": ["cuda"],
+      "vram_gb": 24,
+      "models": {
+        "higgs-tts-3-4b": {"kind": "hf", "repository": "bosonai/higgs-audio-v3-tts-4b", "revision": "239f63fb7b02b1aa085f98d9efae5e35cc5523e8", "licence": "boson-higgs-tts-3-research-and-non-commercial-license (custom)", "gated": false}
+      },
+      "states": {
+        "neutral": {"control": "inline-tag", "value": "", "verified": true},
+        "calm": {"control": "inline-tag", "value": "<|emotion:contentment|>", "verified": false},
+        "awake": {"control": "inline-tag", "value": "<|prosody:expressive_high|>", "verified": false},
+        "sleepy": {"control": "inline-tag", "value": "<|prosody:speed_slow|><|prosody:pitch_low|>", "verified": false},
+        "excited": {"control": "inline-tag", "value": "<|emotion:enthusiasm|>", "verified": true}
+      }
+    },
+    "teacher-elevenlabs": {
+      "image": null,
+      "venv": null,
+      "devices": [],
+      "vram_gb": 0,
+      "hosted": true,
+      "models": {
+        "eleven_v3": {"kind": "hosted", "repository": null, "revision": null, "licence": "provider terms", "gated": false}
+      },
+      "states": {
+        "neutral": {"control": "audio-tag", "value": "", "verified": true},
+        "calm": {"control": "audio-tag", "value": "[calm]", "verified": false},
+        "awake": {"control": "audio-tag", "value": "[energetic]", "verified": false},
+        "sleepy": {"control": "audio-tag", "value": "[sleepy]", "verified": false},
+        "excited": {"control": "audio-tag", "value": "[excited]", "verified": true}
+      }
+    },
+    "convert": {
+      "image": "mist-voice-convert",
+      "venv": "/opt/venv-convert",
+      "devices": ["cuda"],
+      "vram_gb": 8,
+      "models": {
+        "knnvc-wavlm-large": {"kind": "url", "url": "https://github.com/bshall/knn-vc/releases/download/v0.1/WavLM-Large.pt", "sha256": "unverified", "dest": "torch/hub/checkpoints/WavLM-Large.pt", "licence": "unverified", "gated": false},
+        "knnvc-hifigan-prematched": {"kind": "url", "url": "https://github.com/bshall/knn-vc/releases/download/v0.1/prematch_g_02500000.pt", "sha256": "unverified", "dest": "torch/hub/checkpoints/prematch_g_02500000.pt", "licence": "unverified", "gated": false},
+        "seed-vc": {"kind": "hf", "repository": "Plachta/Seed-VC", "revision": "257283f9f41585055e8f858fba4fd044e5caed6e", "licence": "gpl-3.0", "gated": false},
+        "seed-vc-campplus": {"kind": "hf", "repository": "funasr/campplus", "revision": "e4b6ede7ce16997aff4ae69fbca1f0175e2afede", "licence": "apache-2.0", "gated": false, "files": ["campplus_cn_common.bin"]},
+        "seed-vc-bigvgan-22k": {"kind": "hf", "repository": "nvidia/bigvgan_v2_22khz_80band_256x", "revision": "633ff708ed5b74903e86ff1298cf4a98e921c513", "licence": "mit", "gated": false},
+        "seed-vc-bigvgan-44k": {"kind": "hf", "repository": "nvidia/bigvgan_v2_44khz_128band_512x", "revision": "95a9d1dcb12906c03edd938d77b9333d6ded7dfb", "licence": "mit", "gated": false},
+        "seed-vc-whisper-small": {"kind": "hf", "repository": "openai/whisper-small", "revision": "973afd24965f72e36ca33b3055d56a652f456b4d", "licence": "apache-2.0", "gated": false},
+        "seed-vc-rmvpe": {"kind": "hf", "repository": "lj1995/VoiceConversionWebUI", "revision": "e6d0c1a17da07c33557852f9dfa2bd44cc75737d", "licence": "mit", "gated": false, "files": ["rmvpe.pt"]}
+      }
+    },
+    "train-piper": {
+      "image": "mist-voice-train-piper",
+      "venv": "/opt/venv-train-piper",
+      "devices": ["cuda"],
+      "vram_gb": 12,
+      "models": {
+        "piper-base-checkpoints": {"kind": "hf", "repository": "rhasspy/piper-checkpoints", "revision": "bdc5227d7ac52bf910388a25364266a92eb37689", "licence": "mit", "gated": false, "repo_type": "dataset", "files": ["en/en_US/lessac/medium/epoch=2164-step=1355540.ckpt", "en/en_US/lessac/medium/config.json"]}
+      },
+      "training": {
+        "repo": "https://github.com/OHF-Voice/piper1-gpl",
+        "ref": "639388b6317fc4731e91d53da42aea68fd4166ff",
+        "entry": "python3 -m piper.train fit --data.voice_name --data.csv_path --data.audio_dir --model.sample_rate 22050 --data.espeak_voice --data.cache_dir --data.config_path --data.batch_size --ckpt_path (resume full state) or --model.warmstart_ckpt (weights only); multi-speaker: CSV audio|speaker|text and --model.num_speakers; export: python3 -m piper.train.export_onnx --checkpoint <ckpt> --output-file <onnx>",
+        "base_checkpoint": {"repository": "rhasspy/piper-checkpoints", "revision": "bdc5227d7ac52bf910388a25364266a92eb37689", "repo_type": "dataset", "path": "en/en_US/lessac/medium/epoch=2164-step=1355540.ckpt"}
+      }
+    },
+    "train-pocket": {
+      "image": "mist-voice-train-pocket",
+      "venv": "/opt/venv-train-pocket",
+      "devices": ["cuda"],
+      "vram_gb": 16,
+      "models": {
+        "pocket-tts": {"kind": "hf", "repository": "kyutai/pocket-tts", "revision": "db04f0e653473e5c7333c69686ac92b7460b0c1d", "licence": "cc-by-4.0", "gated": true, "files": ["languages/english_2026-04_24l/*", "tokenizer.json", "tokenizer.model"]}
+      },
+      "training": {
+        "repo": "https://github.com/kyutai-labs/pocket-tts",
+        "ref": "ee2ebc89aba9d0121d04d18e29c20eea75bb624e",
+        "entry": "training/train.py training/configs/finetune.yaml (uv run training/train.py ...; torchrun --nproc-per-node N for multi-GPU); data prep training/scripts/prepare_data.py (HiFiTTS-2 example), tokenizer training/scripts/train_tokenizer.py; finetune.yaml sets model_config pocket_tts/config/english_2026-04_24l.yaml, start_from_pretrained true, batch_size 64, grad_accum_steps 1, train_jsonl data/train_aligned.jsonl, up to 20000 steps, checkpoint every 2500 steps keeping 3",
+        "base_checkpoint": {"repository": "kyutai/pocket-tts", "revision": "db04f0e653473e5c7333c69686ac92b7460b0c1d", "path": "languages/english_2026-04_24l/model.safetensors"}
+      }
+    },
+    "train-styletts2": {
+      "image": "mist-voice-train-styletts2",
+      "venv": "/opt/venv-train-styletts2",
+      "devices": ["cuda"],
+      "vram_gb": 24,
+      "models": {
+        "styletts2-libritts": {"kind": "hf", "repository": "yl4579/StyleTTS2-LibriTTS", "revision": "3aa7ba7f8f275ec13dce21682a61494c35089e2a", "licence": "unverified", "gated": false, "files": ["Models/LibriTTS/epochs_2nd_00020.pth", "Models/LibriTTS/config.yml"]}
+      },
+      "training": {
+        "repo": "https://github.com/yl4579/StyleTTS2",
+        "ref": "5cedc71c333f8d8b8551ca59378bdcc7af4c9529",
+        "entry": "python train_finetune.py --config_path ./Configs/config_ft.yml (single GPU: accelerate launch --mixed_precision=fp16 --num_processes=1 train_finetune_accelerate.py --config_path ./Configs/config_ft.yml); data lists 'filename.wav|transcription|speaker'",
+        "base_checkpoint": {"repository": "yl4579/StyleTTS2-LibriTTS", "revision": "3aa7ba7f8f275ec13dce21682a61494c35089e2a", "path": "Models/LibriTTS/epochs_2nd_00020.pth"}
+      }
+    },
+    "train-neutts": {
+      "image": "mist-voice-train-neutts",
+      "venv": "/opt/venv-train-neutts",
+      "devices": ["cuda"],
+      "vram_gb": 16,
+      "models": {
+        "neutts-air": {"kind": "hf", "repository": "neuphonic/neutts-air", "revision": "3bf9403646f0ca46a3f2250355d2ce4d1f70559c", "licence": "apache-2.0", "gated": true},
+        "neucodec": {"kind": "hf", "repository": "neuphonic/neucodec", "revision": "a940021324df13a07f44185f0a17c6dac3698179", "licence": "apache-2.0", "gated": true}
+      },
+      "training": {
+        "repo": "https://github.com/neuphonic/neutts",
+        "ref": "ac69851f28fc63a487917e7c2e27f0d75c759cba",
+        "entry": "python examples/finetune.py examples/finetune_config.yaml (Hugging Face transformers trainer over NeuCodec-encoded data; lr 1e-5 to 4e-5; about 10 h of data and 1000-2000 steps; speaker ids or emotion labels are concatenated with the phoneme tokens; optional label tokens such as <|LAUGHING|> and <|WHISPERING|> are added to the tokenizer and embeddings resized)",
+        "base_checkpoint": {"repository": "neuphonic/neutts-air", "revision": "3bf9403646f0ca46a3f2250355d2ce4d1f70559c"}
+      }
+    },
+    "ref-voxtream2": {
+      "image": "mist-voice-ref-voxtream2",
+      "venv": "/opt/venv-ref-voxtream2",
+      "devices": ["cuda"],
+      "vram_gb": 8,
+      "models": {
+        "voxtream2": {"kind": "hf", "repository": "herimor/voxtream2", "revision": "e1e47740066dd0bfe521c31283fe994a565a77da", "licence": "cc-by-nc-4.0", "gated": false},
+        "voxtream2.5": {"kind": "hf", "repository": "herimor/voxtream2.5", "revision": "44ea02ce2eef5ab5fc363029e5c8bc62b469fd33", "licence": "cc-by-nc-4.0", "gated": false}
+      }
+    }
+  }
+}
