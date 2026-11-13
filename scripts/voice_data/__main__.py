@@ -1,7 +1,12 @@
-"""Entry point for `python -m scripts.voice_data`."""
+"""Entry point for `python -m scripts.voice_data`.
+
+The call is guarded so that importing the module (the repository's import-walk tests import
+every module under `scripts/`) parses no argv and exits nothing.
+"""
 
 import sys
 
 from .cli import main
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())

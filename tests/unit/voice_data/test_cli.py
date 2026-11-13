@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -371,3 +372,12 @@ def test_doctor_warns_on_old_python(version: tuple[int, int, int], warned: bool)
     assert (warning is not None) is warned
     if warning is not None:
         assert "3.11.13" in warning
+
+
+def test_importing_the_entry_module_parses_no_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The repository's import walks import every module under scripts/, `__main__` included,
+    # with pytest's own argv in place; an unguarded entry call exits 2 there.
+    monkeypatch.setattr(sys, "argv", ["walker", "--not-a-voice-data-option"])
+    monkeypatch.delitem(sys.modules, "scripts.voice_data.__main__", raising=False)
+    module = importlib.import_module("scripts.voice_data.__main__")
+    assert callable(module.main)
