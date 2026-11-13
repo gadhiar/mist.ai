@@ -9,6 +9,7 @@ from `turn_fakes.py`. The client-facing record is what the recording transport's
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
 import logging
 import random
@@ -20,7 +21,7 @@ import pytest_asyncio
 from backend.chat.context_budget import PromptStats
 from backend.chat.stream_events import Complete, HandOff, StateHint, Token
 from backend.chat.turn_scope import CommitResult
-from backend.realtime.budget import BUDGET_PRESETS, TurnConfig
+from backend.realtime.budget import BUDGET_PRESETS, TurnConfig, WakeConfig
 from backend.realtime.ingress import UtteranceEnded
 from backend.realtime.playback import LanePurge, PlaybackListener
 from backend.realtime.protocol import Frame, MsgType
@@ -36,12 +37,16 @@ from backend.realtime.turn import (
     BargeInReport,
     Close,
     Interrupt,
+    Mute,
     PlaybackDone,
     PlaybackProgress,
     Reconfigure,
     Text,
     TurnController,
     TurnPlacement,
+    VoiceStart,
+    VoiceStop,
+    Wake,
     WakeArbiter,
     WakeRank,
     WakeVerdict,
@@ -59,6 +64,7 @@ from .turn_fakes import (
     IdCounter,
     Pause,
     RecordingIngress,
+    WaitGate,
     close_live_controllers,
     describe,
     dispatch_tool,
@@ -2235,3 +2241,457 @@ async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(
         waiting = [i for i in range(len(order)) if order[i] not in settled and i not in got]
         # No claim waits on nothing: a window is open or a winner's verdict is still to come.
         assert not waiting or unsettled_winners() or later.pending, "a claim left waiting"
+
+
+# == T11e part 2: 200 seeded random interleavings (v1 :2733-2734, v2 :1155, v9 :294, :327) ===========
+# Each seed drives one controller through a random sequence of every message type: ingress events
+# (`NameHeard` from either spotter and the gate partial among them, and events of an old epoch),
+# controls, `wake`, verdicts from `FakeWakeArbiter` granted or denied at any point (after the
+# claim was settled included), playback reports, the responder's pauses and the clock. The step
+# invariants are checked after every step, and the end invariants after a drain and the close.
+
+INTERLEAVING_STEPS = 40
+INTERLEAVING_SEEDS = 200
+INTERLEAVING_TEXTS = (
+    "mist what's up",
+    "I missed the bus",
+    "stop",
+    "stop, mist",
+    "what time is it",
+    "mist, wait",
+)
+CLOSING_MESSAGES = ("transcription", "voice_decision:dropped")
+EVERY_KIND = frozenset(
+    {
+        "SpeechStarted",
+        "SpeechResumed",
+        "TranscriptPartial",
+        "TranscriptPartial(gate)",
+        "EndpointCandidate",
+        "UtteranceEnded",
+        "UtteranceDropped",
+        "IngressOverload",
+        "NameHeard(server)",
+        "NameHeard(endpoint)",
+        "old epoch",
+        "Text",
+        "Interrupt",
+        "VoiceStart",
+        "VoiceStop",
+        "Reconfigure",
+        "Mute",
+        "Wake",
+        "WakeVerdict",
+        "BargeInReport",
+        "PlaybackProgress",
+        "PlaybackDone",
+    }
+)
+REACHED: dict[int, tuple[frozenset[str], int]] = {}
+"""Each seed run so far: the message kinds it posted and its verdicts for settled claims."""
+
+
+def named_utterance(item: object) -> str | None:
+    """The utterance a client message names, at its top level or in its `detail`."""
+    uid = getattr(item, "utterance_id", None)
+    if uid is None:
+        uid = getattr(getattr(item, "detail", None), "utterance_id", None)
+    return uid if isinstance(uid, str) else None
+
+
+def random_script(rng: random.Random, pauses: list[Pause]) -> list[object]:
+    pause = Pause()
+    kind = rng.randrange(4)
+    if kind == 0:
+        return [Token("One two three. "), Token("Four five.")]
+    pauses.append(pause)
+    if kind == 1:
+        return [Token("One. "), pause, Token("Two.")]
+    if kind == 2:
+        return [pause, Token("Late.")]
+    return [
+        Token("Setting it. "),
+        WaitGate(),
+        Call(dispatch_tool),
+        tool_started(),
+        pause,
+        tool_completed(),
+        Token("Done."),
+    ]
+
+
+class Interleaving:
+    """One seed's run: a controller, a model of the ingress feeding it, and the invariants."""
+
+    def __init__(self, seed: int) -> None:
+        self.rng = random.Random(seed)
+        self.pauses: list[Pause] = []
+        scripts = [random_script(self.rng, self.pauses) for _ in range(INTERLEAVING_STEPS)]
+        self.h = make_harness(
+            *scripts,
+            solo=False,
+            synthesizer=self.rng.random() < 0.8,
+            wake=WakeConfig(followup_window_ms=self.rng.choice([0, 6000])),
+        )
+        self.ingresses: list[RecordingIngress] = [self.h.ingress]
+        self.ingress: RecordingIngress | None = None
+        self.read = 0
+        self.applies = 0
+        self.open_uid: str | None = None
+        self.gate_asks: list[tuple[str, int]] = []
+        self.failures: list[str] = []
+        self.committed: list[int] = []
+        self.stale_verdicts = 0
+        self.trace: list[str] = []
+        self._instrument()
+
+    # -- Instrumentation ------------------------------------------------------------------------
+
+    def _instrument(self) -> None:
+        """Count commits per turn, and watch each verdict for a settled claim as it is handled."""
+        responder = self.h.responder
+        commit_turn = responder.commit_turn
+
+        def commit(scope, delivery):
+            self.committed.append(scope.turn_index)
+            return commit_turn(scope, delivery)
+
+        responder.commit_turn = commit  # type: ignore[method-assign]
+        handlers = self.h.controller._handlers
+        on_verdict = handlers[WakeVerdict]
+
+        async def verdict(message: WakeVerdict) -> None:
+            settled = any(cid == message.claim_id for cid, _ in self.h.arbiter.settles)
+            before = self._footprint()
+            stale = self.h.controller.stale_events
+            await on_verdict(message)
+            if not settled:
+                return
+            self.stale_verdicts += 1
+            if self._footprint() != before:
+                self.failures.append(f"the verdict for settled claim {message.claim_id} acted")
+            if self.h.controller.stale_events != stale + 1:
+                self.failures.append(f"the verdict for settled claim {message.claim_id} uncounted")
+
+        handlers[WakeVerdict] = verdict
+
+    def _footprint(self) -> tuple[int, int, int, int]:
+        """Everything a handled message could leave: sends, scene calls, levers and settles."""
+        h = self.h
+        levers = sum(len(ingress.calls) for ingress in self.ingresses)
+        return (len(h.outbound.sent), len(h.scene.calls), levers, len(h.arbiter.settles))
+
+    # -- The ingress model ------------------------------------------------------------------------
+
+    def adopt(self, ingress: RecordingIngress | None) -> None:
+        self.ingress = ingress
+        self.read = 0
+        self.open_uid = None
+        self.gate_asks = []
+
+    def _sync(self) -> None:
+        """Follow the levers the controller pulled, and a reconfigure it applied."""
+        applies = [call for call in self.h.host.calls if call[0] == "apply"]
+        if len(applies) > self.applies:
+            self.applies = len(applies)
+            start = self.h.host.apply_result
+            if start is not None:
+                self.adopt(start.ingress)  # type: ignore[arg-type]
+        ingress = self.ingress
+        if ingress is None:
+            return
+        for call in ingress.calls[self.read :]:
+            if call[0] == "open_utterance":
+                self.open_uid = str(call[3])
+            elif call[0] == "drop" and call[1] == self.open_uid:
+                self.open_uid = None
+            elif call[0] == "request_gate_partial":
+                self.gate_asks.append((str(call[1]), int(call[2])))  # type: ignore[call-overload]
+        self.read = len(ingress.calls)
+
+    def _new_start(self) -> VoiceStart:
+        ingress = RecordingIngress(self.h.ids, epoch=len(self.ingresses) + 1)
+        self.ingresses.append(ingress)
+        return VoiceStart(
+            ingress=ingress,  # type: ignore[arg-type]
+            policy=self.h.policy,
+            settings=voice_settings(),
+            epoch=ingress.epoch,
+        )
+
+    def _text(self) -> str:
+        return self.rng.choice(INTERLEAVING_TEXTS)
+
+    def _now(self) -> int:
+        return self.h.clock.now
+
+    # -- Actions: each posts one message and returns its kind, or None when it cannot apply now --
+
+    def _speech(self) -> str | None:
+        ingress, uid = self.ingress, self.open_uid
+        if ingress is None:
+            return None
+        if uid is None:
+            self.open_uid = uid = self.h.ids()
+            self.h.post(ingress.started(uid))
+            return "SpeechStarted"
+        roll = self.rng.random()
+        if roll < 0.3:
+            self.h.post(ingress.partial(uid, self._text(), heard_at_ms=self._now()))
+            return "TranscriptPartial"
+        if roll < 0.45:
+            self.h.post(ingress.candidate(uid, self._text(), heard_at_ms=self._now()))
+            return "EndpointCandidate"
+        if roll < 0.55:
+            self.h.post(ingress.resumed(uid))
+            return "SpeechResumed"
+        self.open_uid = None
+        if roll < 0.85:
+            self.h.post(ingress.ended(uid, self._text(), heard_at_ms=self._now()))
+            return "UtteranceEnded"
+        self.h.post(ingress.dropped(uid, self.rng.choice(["noise", "no_speech", "muted"])))
+        return "UtteranceDropped"
+
+    def _gate_partial(self) -> str | None:
+        if self.ingress is None or not self.gate_asks:
+            return None
+        uid, through = self.gate_asks.pop(0)
+        self.h.post(self.ingress.partial(uid, self._text(), gate=True, through_pos=through))
+        return "TranscriptPartial(gate)"
+
+    def _name(self) -> str | None:
+        if self.ingress is None:
+            return None
+        spotter = "endpoint" if self.rng.random() < 0.3 else "server"
+        self.h.post(
+            self.ingress.heard(
+                None if spotter == "endpoint" else self.open_uid,
+                from_pos=self.rng.randint(40, 100),
+                hit_pos=self.rng.randint(100, 140),
+                arrival=float(self._now()),
+                score=self.rng.choice([0.6, 0.9]),
+                reference_score=self.rng.choice([None, None, None, 0.9]),
+                spotter=spotter,
+            )
+        )
+        return f"NameHeard({spotter})"
+
+    def _overload(self) -> str | None:
+        if self.ingress is None:
+            return None
+        self.h.post(self.ingress.overload(self.rng.choice(["vad", "kws", "capture"])))
+        return "IngressOverload"
+
+    def _old_epoch(self) -> str | None:
+        old = [ingress for ingress in self.ingresses if ingress is not self.ingress]
+        if not old:
+            return None
+        self.h.post(self.rng.choice(old).ended(self.h.ids(), self._text()))
+        return "old epoch"
+
+    def _wake(self) -> str | None:
+        backlog = self.rng.choice([1500, 1500, 0])
+        self.h.post(Wake(keyword="mist", score=0.8, backlog_ms=backlog, arrival=float(self._now())))
+        return "Wake"
+
+    def _verdict(self) -> str | None:
+        waiting = [claim for claim in self.h.arbiter.claims if not claim.answered]
+        if not waiting:
+            return None
+        claim = self.rng.choice(waiting)
+        if self.rng.random() < 0.6:
+            self.h.arbiter.grant(claim.claim_id)
+        else:
+            self.h.arbiter.deny(claim.claim_id)
+        return "WakeVerdict"
+
+    def _control(self) -> str | None:
+        roll = self.rng.random()
+        if roll < 0.25:
+            self.h.post(Text("typed"))
+            return "Text"
+        if roll < 0.4:
+            self.h.post(Interrupt())
+            return "Interrupt"
+        if roll < 0.55:
+            self.h.post(Mute(active=self.rng.random() < 0.5))
+            return "Mute"
+        if roll < 0.7:
+            self.h.post(VoiceStop())
+            self.adopt(None)
+            return "VoiceStop"
+        if roll < 0.85:
+            start = self._new_start()
+            self.h.post(start)
+            self.adopt(start.ingress)  # type: ignore[arg-type]
+            return "VoiceStart"
+        self.h.host.apply_result = self._new_start() if self.rng.random() < 0.7 else None
+        refusal = self.rng.choice([None, None, "unavailable"])
+        self.h.post(Reconfigure(settings=voice_settings(), refusal=refusal))
+        return "Reconfigure"
+
+    def _playback(self) -> str | None:
+        turn_ids = self.h.outbound.queued_turn_ids()[-2:] or ["no-turn"]
+        turn_id = self.rng.choice(turn_ids)
+        played = self.rng.choice([0, 400, 1500, 60_000])
+        roll = self.rng.random()
+        if roll < 0.4:
+            self.h.post(PlaybackProgress(turn_id=turn_id, played_ms=played))
+            return "PlaybackProgress"
+        if roll < 0.8:
+            self.h.post(PlaybackDone(turn_id=turn_id, played_ms=played))
+            return "PlaybackDone"
+        self.h.post(BargeInReport(turn_id=turn_id, keyword="stop"))
+        return "BargeInReport"
+
+    def _release(self) -> str | None:
+        reached = [p for p in self.pauses if p.reached.is_set() and not p.event.is_set()]
+        if not reached:
+            return None
+        self.rng.choice(reached).release()
+        return "release"
+
+    def _tick(self) -> str | None:
+        return "advance"
+
+    # -- Running ----------------------------------------------------------------------------------
+
+    async def step(self) -> None:
+        actions: list[Callable[[], str | None]] = [
+            self._speech,
+            self._gate_partial,
+            self._name,
+            self._overload,
+            self._old_epoch,
+            self._wake,
+            self._verdict,
+            self._control,
+            self._playback,
+            self._release,
+            self._tick,
+        ]
+        weights = [6, 2, 3, 1, 1, 1, 3, 3, 2, 3, 2]
+        for _ in range(20):
+            kind = self.rng.choices(actions, weights)[0]()
+            if kind is not None:
+                break
+        else:
+            kind = "advance"
+        self.trace.append(kind)
+        if kind == "advance":
+            await self.h.clock.advance(self.rng.choice([20, 300, 1500, 6000]))
+        await self.h.settle()
+        self._sync()
+        self.check()
+
+    def check(self) -> None:
+        """The step invariants."""
+        h = self.h
+        task = h.controller.task
+        assert task is not None
+        assert not task.done(), f"the mailbox task ended: {task}"
+        assert self.failures == []
+        assert h.outbound.violations == []
+        # Every claim is settled at most once (exactly once by the end).
+        settles = collections.Counter(cid for cid, _ in h.arbiter.settles)
+        assert all(n == 1 for n in settles.values()), f"a claim settled twice: {settles}"
+        # No utterance gets a second closing message, or any message after its closing one.
+        closed: set[str] = set()
+        for item in h.outbound.client:
+            uid = named_utterance(item)
+            if uid is None:
+                continue
+            assert uid not in closed, f"{describe(item)} names {uid} after its closing message"
+            if describe(item) in CLOSING_MESSAGES:
+                closed.add(uid)
+        # No scene intent names a turn after its `cancel_turn`.
+        cancelled: set[object] = set()
+        for call in h.scene.calls:
+            if call[0] == "cancel_turn":
+                cancelled.add(call[1])
+            elif call[0] == "phase" and call[2] is not None:
+                assert call[2] not in cancelled, f"{call} after its turn's cancel_turn"
+            elif call[0] == "tool_view":
+                assert call[1] not in cancelled, f"{call} after its turn's cancel_turn"
+
+    async def finish(self) -> None:
+        """Drain and stop voice, check, close, then check the end invariants."""
+        h = self.h
+        for pause in self.pauses:
+            pause.release()
+        await h.clock.advance(20_000)
+        h.post(VoiceStop())
+        self.adopt(None)
+        await h.settle()
+        await h.clock.advance(20_000)
+        self.check()
+        # Every utterance a message named has exactly one closing message.
+        named = {uid for uid in map(named_utterance, h.outbound.client) if uid is not None}
+        closings = collections.Counter(
+            named_utterance(item)
+            for item in h.outbound.client
+            if describe(item) in CLOSING_MESSAGES
+        )
+        assert sorted(uid for uid in named if closings[uid] != 1) == []
+
+        closing = asyncio.ensure_future(h.controller.close())
+        for _ in range(20):
+            if closing.done():
+                break
+            await h.clock.advance(20_000)
+        assert closing.done(), "close did not finish"
+        await closing
+        task = h.controller.task
+        assert task is not None and task.done() and task.exception() is None
+        assert self.failures == []
+        # No turn task is left running.
+        assert [
+            t.get_name() for t in asyncio.all_tasks() if t.get_name().startswith("session-1-")
+        ] == []
+        # Every lane is idle.
+        h.outbound.take_all()
+        assert h.outbound.control == []
+        assert h.outbound.lane.take() is None
+        # Every shown turn was committed exactly once, and no other turn was.
+        commits = collections.Counter(self.committed)
+        assert all(n == 1 for n in commits.values()), f"a turn committed twice: {commits}"
+        assert len(commits) == len(set(h.outbound.queued_turn_ids()))
+        # Every claim was settled exactly once.
+        settles = collections.Counter(cid for cid, _ in h.arbiter.settles)
+        assert settles == collections.Counter(c.claim_id for c in h.arbiter.claims)
+        # No message names a turn the client never saw start: a held turn sends nothing (v1).
+        shown = set(h.outbound.queued_turn_ids())
+        for sent in h.outbound.sent:
+            item = sent.item
+            stale_answer = describe(item) == "voice_decision:barge_in_ignored"
+            if sent.turn_id is not None and not stale_answer:
+                assert sent.turn_id in shown, f"{describe(item)} names unseen {sent.turn_id}"
+
+
+async def run_interleaving(seed: int) -> None:
+    run = Interleaving(seed)
+    run.h.start_voice()
+    run.adopt(run.h.ingress)
+    try:
+        for _ in range(INTERLEAVING_STEPS):
+            await run.step()
+        await run.finish()
+    except AssertionError as error:
+        raise AssertionError(f"seed {seed} after {run.trace}: {error}") from error
+    REACHED[seed] = (frozenset(run.trace), run.stale_verdicts)
+
+
+@pytest.mark.parametrize("seed", range(INTERLEAVING_SEEDS))
+async def test_seeded_random_interleavings_keep_every_invariant(seed):
+    await run_interleaving(seed)
+
+
+async def test_the_interleavings_post_every_message_type_and_stale_verdicts():
+    """The 200 seeds together reach every kind; seeds this process has not run are run here."""
+    for seed in range(INTERLEAVING_SEEDS):
+        if seed not in REACHED:
+            await run_interleaving(seed)
+            await close_live_controllers()
+    reached = frozenset().union(*(kinds for kinds, _ in REACHED.values()))
+    assert sorted(EVERY_KIND - reached) == []
+    assert sum(stale for _, stale in REACHED.values()) > 0
