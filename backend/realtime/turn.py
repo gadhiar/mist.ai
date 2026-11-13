@@ -1622,11 +1622,13 @@ class TurnController:
             await self._cancel_held(held)
 
     async def _on_overload(self, event: IngressOverload) -> None:
+        """`overload` names the turn in flight, but never a held one, which sent nothing (v1)."""
         if not self._accept(event):
             return
+        turn = self._turn
         self._send_control(
             VoiceDecisionOverload(
-                turn_id=self._turn.turn_id if self._turn is not None else None,
+                turn_id=turn.turn_id if turn is not None and not turn.held else None,
                 reason=event.lane,
                 detail=OverloadDetail(dropped_ms=event.dropped_ms, lane=event.lane),
             )

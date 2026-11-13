@@ -1117,6 +1117,31 @@ async def test_held_disconnect_cancels_without_trace():
     assert h.responder.closed == [0]
 
 
+async def test_held_overload_names_no_turn_and_the_turn_stays_held():
+    """A held turn sends nothing to the client (v1 :402-404), so no message may name it."""
+    h = make_harness([Token("One two. "), Pause()])
+    h.start_voice()
+    uid = await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.overload("vad", dropped_ms=60))
+    await h.settle()
+
+    assert names_since(h, mark) == ["voice_decision:overload"]
+    (overload,) = h.outbound.of("voice_decision:overload")
+    assert overload.turn_id is None
+    assert (overload.detail.lane, overload.detail.dropped_ms) == ("vad", 60)
+    assert h.controller.phase == "held"
+
+    # Released, the turn's own messages name it as usual; its `stream_start` comes first.
+    h.post(h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+    turn_id = h.last_turn()
+    h.post(h.ingress.overload("kws", dropped_ms=20))
+    await h.settle()
+    assert h.outbound.of("voice_decision:overload")[-1].turn_id == turn_id
+
+
 # == The cells of v2's table in idle, thinking, speaking and text (v2 :476-492) ==================
 # v5 :1174-1189 keeps these rows; its new and changed rows (`NameHeard`, the gate partial, an
 # unpublished candidate's end, `SpeechStarted`, `wake`) are T11e's, and the `ptt` rows are gone.
