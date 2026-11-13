@@ -205,15 +205,30 @@ class SegmenterConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class PlacementConfig:
-    """Where each engine runs, which engine and weights it loads, and how the GPU is released.
+class EngineOption:
+    """One place a speech slot may load: an engine id on a device.
 
-    A location is `cpu`, `cuda`, `cuda:<n>` or `off`; a placement is an ordered tuple of
-    locations of which the first that loads wins, with `off` (no engine) only last. VAD and end
-    of turn run on one device. An engine id is `[a-z0-9][a-z0-9-]*`, a step 0 engine; `None`
-    loads nothing, so that capability is off until the adapters set a default. Model settings
-    are `<repo>@<revision>` for STT and TTS and `<repo>@<revision>:<file>` for the ONNX engines,
-    so every weight is pinned, and every weight is read under `models_dir`. `release_timeout_s`
+    `engine` is an engine id, `[a-z0-9][a-z0-9-]*`. `device` is `cpu` or `cuda`: the host has
+    one GPU, so an option never names a GPU index.
+    """
+
+    engine: str
+    device: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlacementConfig:
+    """Where each engine runs, which voice TTS speaks, and how the GPU is released.
+
+    STT and TTS each have a chain: an ordered tuple of `EngineOption`s, of which the first that
+    loads wins, so "Nemotron on the GPU, else Parakeet on the CPU" is a setting rather than
+    code. An empty chain turns the slot off. Each engine's adapter pins its own weights, so the
+    chains carry no model setting. VAD and end of turn run on one device each, `cpu`, `cuda` or
+    `cuda:<n>`, and their ONNX weights are `<repo>@<revision>:<file>`, read under `models_dir`.
+
+    `tts_voice` is the id of the voice identity TTS speaks, `[a-z0-9][a-z0-9-]*`, read from
+    `<voice_root>/<id>/`; `None` names no identity. `voice_cache_dir` is the directory for the
+    per-engine assets built from an identity. Both paths are absolute. `release_timeout_s`
     bounds how long a GPU release waits for running jobs to stop. `kws_model` is the name
     spotter's model id, the same id form, read from `<models_dir>/speech/wake/<id>/`; `None`
     turns the server spotter off. The spotter runs on the CPU only, with `kws_threads` threads,
@@ -223,8 +238,11 @@ class PlacementConfig:
     vad_device: str = "cpu"
     eot_device: str = "cpu"
     eot_threads: int = 4
-    stt_device: tuple[str, ...] = ("cuda", "cpu")
-    tts_device: tuple[str, ...] = ("cuda", "off")
+    stt_chain: tuple[EngineOption, ...] = (
+        EngineOption("nemotron-160", "cuda"),
+        EngineOption("parakeet-cpu", "cpu"),
+    )
+    tts_chain: tuple[EngineOption, ...] = (EngineOption("pocket-clone", "cpu"),)
     vad_model: str = (
         "onnx-community/silero-vad@e71cae966052b992a7eca6b17738916ce0eca4ec:onnx/model.onnx"
     )
@@ -232,11 +250,9 @@ class PlacementConfig:
         "pipecat-ai/smart-turn-v3@f766f81d3cfdf7737ac64aad813d91bbfd56bf93"
         ":smart-turn-v3.2-cpu.onnx"
     )
-    stt_engine: str | None = None
-    stt_model: str | None = None
-    tts_engine: str | None = None
-    tts_model: str | None = None
     tts_voice: str | None = None
+    voice_root: str = "/voices"
+    voice_cache_dir: str = "/voice-cache"
     vram_budget_mib: int = 4500
     release_timeout_s: float = 10.0
     models_dir: str = "/models"
@@ -371,12 +387,24 @@ class VoiceSettings:
     profile: str = DEFAULT_VOICE_PROFILE
 
 
-_LOCATION = re.compile(r"cpu|cuda(?::\d+)?|off")
 _DEVICE = re.compile(r"cpu|cuda(?::\d+)?")
-_ENGINE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+# Engine, identity and spotter model ids share one form.
+_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+_ID_FORM = "[a-z0-9][a-z0-9-]*"
+_CHAIN_DEVICES = ("cpu", "cuda")
 _NAME = re.compile(r"[a-z0-9]+(?:['-][a-z0-9]+)*")
-_REPO_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+")
 _ONNX_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+:[^@:\s]+")
+# The per-slot variables the chains replaced, each with the chain variable that took its place.
+# Set at all, one raises, because ignoring it would leave an engine where the variable no longer
+# puts it.
+_REMOVED_PER_SLOT = {
+    "MIST_VOICE_STT_ENGINE": "MIST_VOICE_STT_CHAIN",
+    "MIST_VOICE_STT_DEVICE": "MIST_VOICE_STT_CHAIN",
+    "MIST_VOICE_STT_MODEL": "MIST_VOICE_STT_CHAIN",
+    "MIST_VOICE_TTS_ENGINE": "MIST_VOICE_TTS_CHAIN",
+    "MIST_VOICE_TTS_DEVICE": "MIST_VOICE_TTS_CHAIN",
+    "MIST_VOICE_TTS_MODEL": "MIST_VOICE_TTS_CHAIN",
+}
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
@@ -415,8 +443,13 @@ class _Env:
     def text(self, name: str, default: _T) -> str | _T:
         return self._read(name, default, _parse_non_empty)
 
-    def placement(self, name: str, default: tuple[str, ...]) -> tuple[str, ...]:
-        return self._read(name, default, _parse_placement)
+    def chain(self, name: str, default: tuple[EngineOption, ...]) -> tuple[EngineOption, ...]:
+        return self._read(name, default, _parse_chain)
+
+    def refuse_removed(self, removed: Mapping[str, str]) -> None:
+        for name, replacement in removed.items():
+            if name in self._environ:
+                raise ValueError(f"{name}: removed; set {replacement} instead")
 
     def device(self, name: str, default: str) -> str:
         return self._read(name, default, _parse_device)
@@ -429,9 +462,6 @@ class _Env:
             return value
 
         return self._read(name, default, parse)
-
-    def engine_id(self, name: str, default: str | None) -> str | None:
-        return self.pattern(name, default, _ENGINE_ID, "an engine id matching [a-z0-9][a-z0-9-]*")
 
     def absolute_path(self, name: str, default: str) -> str:
         return self._read(name, default, _parse_absolute_path)
@@ -538,20 +568,31 @@ def _split_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _parse_placement(name: str, raw: str) -> tuple[str, ...]:
-    locations = _split_list(raw)
-    if not locations:
-        raise ValueError(f"{name}: expected a comma-separated list of locations, got {raw!r}")
-    for location in locations:
-        if not _LOCATION.fullmatch(location):
-            raise ValueError(
-                f"{name}: unknown location {location!r}; expected cpu, cuda, cuda:<n> or off"
-            )
-    if len(set(locations)) != len(locations):
-        raise ValueError(f"{name}: a location is repeated in {raw!r}")
-    if "off" in locations[:-1]:
-        raise ValueError(f"{name}: off may only be the last location, got {raw!r}")
-    return tuple(locations)
+def _parse_chain(name: str, raw: str) -> tuple[EngineOption, ...]:
+    # Every item is checked, an empty one included, so a stray comma is an error rather than a
+    # silently shorter chain.
+    items = [item.strip() for item in raw.split(",")]
+    if items == ["off"]:
+        return ()
+    form = "comma-separated <engine>@<device> options, or off alone"
+    options: list[EngineOption] = []
+    for item in items:
+        if not item:
+            raise ValueError(f"{name}: expected {form}, got {raw!r}")
+        if item == "off":
+            raise ValueError(f"{name}: off must stand alone, got {raw!r}")
+        engine, at, device = item.partition("@")
+        if not at:
+            raise ValueError(f"{name}: option {item!r} has no device; expected {form}")
+        if not _ID.fullmatch(engine):
+            raise ValueError(f"{name}: engine id {engine!r} does not match {_ID_FORM}")
+        if device not in _CHAIN_DEVICES:
+            raise ValueError(f"{name}: device {device!r} in {item!r}; expected cpu or cuda")
+        option = EngineOption(engine, device)
+        if option in options:
+            raise ValueError(f"{name}: option {item!r} is repeated in {raw!r}")
+        options.append(option)
+    return tuple(options)
 
 
 def _parse_device(name: str, raw: str) -> str:
@@ -663,17 +704,27 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
 
     Not read here: `MIST_VOICE_THINKING_BUDGET_TOKENS` and `MIST_VOICE_FIRST_SEGMENT_MIN_CHARS`,
     which the handler's `LLMConfig` owns (the handler never imports this package). The variables
-    the GPU yield, the remote speech service and the cloned voice used are not read either, so a
-    stale `.env` entry for one of them changes nothing.
+    the GPU yield, the remote speech service and the earlier profile-based cloned voice used are
+    not read either, so a stale `.env` entry for one of them changes nothing.
+
+    `MIST_VOICE_STT_CHAIN` and `MIST_VOICE_TTS_CHAIN` are comma-separated `<engine>@<device>`
+    options in the order they are tried, with `cpu` or `cuda` as the device, or `off` alone for
+    an empty chain. The per-slot variables they replaced (`MIST_VOICE_STT_ENGINE`,
+    `MIST_VOICE_STT_DEVICE`, `MIST_VOICE_STT_MODEL` and the three `MIST_VOICE_TTS_` ones) raise,
+    naming their chain, whatever their value: ignored, a stale one would leave an engine where
+    the operator no longer expects it. `MIST_VOICE_TTS_VOICE` is a voice identity id, read
+    under `MIST_VOICE_IDENTITY_ROOT`; `MIST_VOICE_CACHE_DIR` is where assets built from it go.
 
     `MIST_VOICE_WAKE_PHRASES_FILE` is the one variable that names a file: a JSON object with
     any of `phrases`, `address_starts`, `stop_before` and `greetings`, each a list of strings
     that replaces that set; a key it omits keeps its default.
 
     Raises:
-        ValueError: A set variable is malformed; the message starts with the variable's name.
+        ValueError: A set variable is malformed or removed; the message starts with the
+            variable's name.
     """
     env = _Env(environ)
+    env.refuse_removed(_REMOVED_PER_SLOT)
     defaults = EndpointingConfig()
     endpointing = EndpointingConfig(
         vad_threshold=env.probability("MIST_VOICE_VAD_THRESHOLD", defaults.vad_threshold),
@@ -721,23 +772,19 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         vad_device=env.device("MIST_VOICE_VAD_DEVICE", place.vad_device),
         eot_device=env.device("MIST_VOICE_EOT_DEVICE", place.eot_device),
         eot_threads=env.positive_integer("MIST_VOICE_EOT_THREADS", place.eot_threads),
-        stt_device=env.placement("MIST_VOICE_STT_DEVICE", place.stt_device),
-        tts_device=env.placement("MIST_VOICE_TTS_DEVICE", place.tts_device),
+        stt_chain=env.chain("MIST_VOICE_STT_CHAIN", place.stt_chain),
+        tts_chain=env.chain("MIST_VOICE_TTS_CHAIN", place.tts_chain),
         vad_model=env.pattern(
             "MIST_VOICE_VAD_MODEL", place.vad_model, _ONNX_MODEL, "<repo>@<revision>:<file>"
         ),
         eot_model=env.pattern(
             "MIST_VOICE_EOT_MODEL", place.eot_model, _ONNX_MODEL, "<repo>@<revision>:<file>"
         ),
-        stt_engine=env.engine_id("MIST_VOICE_STT_ENGINE", place.stt_engine),
-        stt_model=env.pattern(
-            "MIST_VOICE_STT_MODEL", place.stt_model, _REPO_MODEL, "<repo>@<revision>"
+        tts_voice=env.pattern(
+            "MIST_VOICE_TTS_VOICE", place.tts_voice, _ID, f"an identity id matching {_ID_FORM}"
         ),
-        tts_engine=env.engine_id("MIST_VOICE_TTS_ENGINE", place.tts_engine),
-        tts_model=env.pattern(
-            "MIST_VOICE_TTS_MODEL", place.tts_model, _REPO_MODEL, "<repo>@<revision>"
-        ),
-        tts_voice=env.text("MIST_VOICE_TTS_VOICE", place.tts_voice),
+        voice_root=env.absolute_path("MIST_VOICE_IDENTITY_ROOT", place.voice_root),
+        voice_cache_dir=env.absolute_path("MIST_VOICE_CACHE_DIR", place.voice_cache_dir),
         vram_budget_mib=env.integer("MIST_VOICE_VRAM_BUDGET_MIB", place.vram_budget_mib),
         release_timeout_s=env.positive_number(
             "MIST_VOICE_RELEASE_TIMEOUT_S", place.release_timeout_s
@@ -746,8 +793,8 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         kws_model=env.pattern(
             "MIST_VOICE_KWS_MODEL",
             place.kws_model,
-            _ENGINE_ID,
-            "a model id matching [a-z0-9][a-z0-9-]*",
+            _ID,
+            f"a model id matching {_ID_FORM}",
         ),
         kws_threads=env.positive_integer("MIST_VOICE_KWS_THREADS", place.kws_threads),
     )
