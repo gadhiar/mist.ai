@@ -1,5 +1,8 @@
-"""The turn controller's state table rows for `VoiceStart`, `voice_stop` and `Reconfigure`, and
-mute for a published utterance (T11d, v2 :1704-1717 and :1736-1784, v3 :1681-1682, v8 :239-247).
+"""The turn controller's state table rows for `VoiceStart`, `voice_stop` and `Reconfigure`, mute
+for a published utterance (T11d, v2 :1704-1717 and :1736-1784, v3 :1681-1682, v8 :239-247), and
+the speculative held turn: its start, buffer, release and cancel (v1 :400-423, :2714-2717), M65
+from `held` at its release and M67's `release` (v2 :392-408, :1615-1637), and v2's `held` column
+(v2 :476-493) where v5 :1174-1189 leaves it.
 
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
@@ -22,11 +25,17 @@ from backend.realtime.turn import (
 )
 
 from .turn_fakes import (
+    Call,
+    FailingSynthesizer,
     Harness,
     Pause,
     RecordingIngress,
+    WaitGate,
     close_live_controllers,
+    describe,
+    dispatch_tool,
     make_harness,
+    tool_started,
     voice_settings,
 )
 
@@ -623,3 +632,464 @@ async def test_a_later_unmuted_utterance_opens_normally():
     await h.speak("what time is it")
 
     assert [r.user_text for r in h.responder.requests] == ["what time is it"]
+
+
+# -- The held turn (v1 :400-404, :2714-2717; v2 :392-408, :1615-1637) ------------------------------
+
+
+async def held(h: Harness, text: str = "what time is it", *partials: str) -> str:
+    """Publish an utterance in idle and post its endpoint candidate: the turn starts held."""
+    uid = await published(h, *partials)
+    h.post(h.ingress.candidate(uid, text))
+    await h.settle()
+    assert h.controller.phase == "held"
+    return uid
+
+
+def names_since(h: Harness, mark: int, lane: str | None = None) -> list[str]:
+    """What was queued to `Outbound` from `mark` on, on one lane or on both."""
+    return [describe(s.item) for s in h.outbound.sent[mark:] if lane is None or s.lane == lane]
+
+
+async def test_an_endpoint_candidate_in_idle_starts_a_held_turn_that_sends_nothing():
+    h = make_harness([Token("One two three. "), Token("Four five. "), Pause()])
+    h.start_voice()
+    uid = await published(h, "what time")
+    mark, scene_mark = len(h.outbound.sent), len(h.scene.calls)
+
+    h.post(h.ingress.candidate(uid, "what time is it"))
+    await h.settle()
+
+    assert h.controller.phase == "held"
+    (req,) = h.responder.requests
+    assert (req.user_text, req.origin, req.channel, req.held) == (
+        "what time is it",
+        "voice",
+        "tts",
+        True,
+    )
+    # Generation and synthesis run while held; nothing reaches the client or the screen.
+    assert "yield:Token:Four five. " in h.responder.log
+    assert [s.text for s in h.synth.segments] == ["One two three.", "Four five."]
+    assert h.outbound.sent[mark:] == []
+    assert h.scene.calls[scene_mark:] == []
+    assert h.controller._turn.ledger.recorded_samples == 0
+    assert h.ingress.calls == []
+
+
+async def test_a_held_turn_dispatches_no_tool_until_its_release():
+    h = make_harness(
+        [Token("Setting it. "), WaitGate(), Call(dispatch_tool), tool_started(), Pause()]
+    )
+    h.start_voice()
+    uid = await held(h, "set a timer")
+    scope = h.responder.scopes[0]
+    assert not scope.dispatch_gate.is_set()
+    assert not scope.tool_dispatched
+    assert "gate" not in h.responder.log
+
+    gate_at: dict[str, bool] = {}
+    send_control, send_turn = h.outbound.send_control, h.outbound.send_turn
+
+    def control(item):
+        gate_at.setdefault(describe(item), scope.dispatch_gate.is_set())
+        send_control(item)
+
+    def turn(turn_id, item, **kwargs):
+        gate_at.setdefault(describe(item), scope.dispatch_gate.is_set())
+        return send_turn(turn_id, item, **kwargs)
+
+    h.outbound.send_control = control  # type: ignore[method-assign]
+    h.outbound.send_turn = turn  # type: ignore[method-assign]
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.ended(uid, "set a timer"))
+    await h.settle()
+
+    # v1's order: `release`, then the dispatch gate set, then the buffered output flushed.
+    assert gate_at["voice_decision:release"] is False
+    assert gate_at["stream_start"] is True
+    assert scope.tool_dispatched
+    names = names_since(h, mark)
+    assert names.index("stream_start") < names.index("tool_call_started")
+    assert h.outbound.violations == []
+
+
+async def test_utterance_ended_releases_the_held_turn_release_first_then_its_buffer_in_order():
+    pause = Pause()
+    h = make_harness([Token("One two three. "), pause])
+    h.start_voice()
+    uid = await held(h)
+    ledger = h.controller._turn.ledger
+    mark, scene_mark = len(h.outbound.sent), len(h.scene.calls)
+
+    h.post(h.ingress.ended(uid, "what time is it", heard_at_ms=0))
+    await h.settle()
+
+    turn_id = h.last_turn()
+    names = names_since(h, mark)
+    assert names[:6] == [
+        "voice_decision:release",
+        "voice_decision:endpoint",
+        "vad_status:speech_ended",
+        "transcription",
+        "state_cycle:think",
+        "stream_start",
+    ]
+    assert subsequence(names, ["stream_start", "stream_token", "state_cycle:speak", "0x01"])
+    (release,) = h.outbound.of("voice_decision:release")
+    assert (release.turn_id, release.detail.utterance_id) == (turn_id, uid)
+    (transcription,) = h.outbound.of("transcription")
+    assert (transcription.text, transcription.utterance_id) == ("what time is it", uid)
+    # The buffered frames are recorded in the ledger as they are queued, at the flush.
+    assert ledger.recorded_samples > 0
+    # The scene's intents and the pacer's hooks were buffered too, and come in their order.
+    assert [c[:2] for c in h.scene.calls[scene_mark:]][:3] == [
+        ("phase", "thinking"),
+        ("phase", "speaking"),
+        ("phase", "idle"),
+    ]
+    assert h.scene.calls[scene_mark + 3][0] == "segment_starting"
+    assert h.controller.phase == "speaking"
+    assert h.outbound.violations == []
+
+    pause.release()
+    await h.settle()
+    h.post(PlaybackDone(turn_id=turn_id, played_ms=1))
+    await h.settle()
+    (commit,) = h.responder.commits
+    assert (commit.outcome, commit.delivered_text) == ("completed", "One two three. ")
+
+
+async def test_a_held_text_channel_turn_whose_reply_ended_completes_only_after_its_release():
+    h = make_harness([Token("It is noon.")], synthesizer=False)
+    h.start_voice()
+    uid = await held(h)
+    assert "yield:Token:It is noon." in h.responder.log
+    assert h.responder.commits == []
+
+    h.post(h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+
+    names = names_since(h, 0)
+    assert names.index("voice_decision:release") < names.index("transcription")
+    assert names.index("transcription") < names.index("stream_complete")
+    (commit,) = h.responder.commits
+    assert (commit.outcome, commit.delivered_text) == ("completed", "It is noon.")
+    assert h.controller.phase == "idle"
+
+
+async def test_speech_resumed_cancels_the_held_turn_without_trace_and_the_utterance_continues():
+    h = make_harness([Token("Early. "), Pause()], [Token("Noon. "), Pause()])
+    h.start_voice()
+    uid = await held(h, "what time")
+    mark, scene_mark = len(h.outbound.sent), len(h.scene.calls)
+
+    h.post(h.ingress.resumed(uid))
+    await h.settle()
+
+    assert h.controller.phase == "idle"
+    assert h.outbound.sent[mark:] == []
+    assert h.outbound.purges == []
+    assert h.scene.calls[scene_mark:] == []
+    assert h.responder.commits == []
+    assert h.responder.closed == [0]
+
+    h.post(h.ingress.candidate(uid, "what time is it"), h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+
+    assert [r.user_text for r in h.responder.requests] == ["what time", "what time is it"]
+    assert [t.text for t in h.outbound.of("transcription")] == ["what time is it"]
+    assert len(h.outbound.of("voice_decision:release")) == 1
+    assert len(h.outbound.of("stream_start")) == 1
+    assert h.outbound.tokens() == ["Noon. "]
+
+
+async def test_a_held_turn_cancelled_without_trace_leaves_the_interruption_note():
+    h = make_harness([Token("Long answer. "), Pause()], [Pause()], [Pause()], synthesizer=False)
+    h.start_voice()
+    h.post(Text("tell me a story"))
+    await h.settle()
+    h.post(Interrupt())
+    await h.settle()
+    assert h.responder.commits[-1].outcome == "interrupted"
+
+    uid = await held(h)
+    h.post(h.ingress.resumed(uid))
+    await h.settle()
+    h.post(h.ingress.candidate(uid, "what time is it"))
+    await h.settle()
+
+    notes = [r.interruption_note for r in h.responder.requests]
+    assert notes == [None, "mid_reply", "mid_reply"]
+    assert len(h.responder.commits) == 1
+
+
+async def test_an_end_whose_text_differs_from_the_held_turns_starts_a_turn_from_the_end():
+    h = make_harness([Pause()], [Pause()])
+    h.start_voice()
+    uid = await held(h, "turn on")
+
+    h.post(h.ingress.ended(uid, "turn on the lights"))
+    await h.settle()
+
+    assert [(r.user_text, r.held) for r in h.responder.requests] == [
+        ("turn on", True),
+        ("turn on the lights", False),
+    ]
+    assert h.outbound.of("voice_decision:release") == []
+    assert [t.text for t in h.outbound.of("transcription")] == ["turn on the lights"]
+    assert len(h.outbound.of("stream_start")) == 1
+    assert h.responder.commits == []
+    assert h.responder.closed == [0]
+
+
+# -- M65 from `held`, at its release (v2 :392-401, :1615-1624) ----------------------------------
+
+
+async def test_tts_failed_while_held_applies_at_the_release_in_its_buffered_order():
+    pause = Pause()
+    h = make_harness(
+        [Token("One two three. "), Token("Four five. "), pause],
+        synthesizer=FailingSynthesizer(fail_call=1),
+    )
+    h.start_voice()
+    uid = await held(h)
+    ledger = h.controller._turn.ledger
+    assert h.synth.calls == 2  # the second segment failed while held
+    assert h.controller.phase == "held"
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+
+    assert names_since(h, mark)[0] == "voice_decision:release"
+    # The buffered frame is discarded; the `degraded` follows the two tokens, the `0x02` it.
+    assert names_since(h, mark, "turn") == [
+        "stream_start",
+        "stream_token",
+        "stream_token",
+        "voice_decision:degraded",
+        "0x02",
+    ]
+    (degraded,) = h.outbound.of("voice_decision:degraded")
+    assert (degraded.reason, degraded.detail.voiced_text, degraded.detail.text_from_token) == (
+        "tts_failed",
+        "",
+        2,
+    )
+    assert ledger.recorded_samples == 0
+    assert h.controller.phase == "text"
+
+    pause.release()
+    await h.settle()
+    # The record is the voiced text, "", plus the tokens from `text_from_token` on (M65, M69).
+    (commit,) = h.responder.commits
+    assert (commit.outcome, commit.delivered_text) == ("completed", "")
+    assert h.controller.phase == "idle"
+    assert h.outbound.violations == []
+
+
+async def test_tts_failed_while_held_then_speech_resumed_cancels_it_without_trace():
+    h = make_harness(
+        [Token("One two three. "), Token("Four five. "), Pause()],
+        synthesizer=FailingSynthesizer(fail_call=1),
+    )
+    h.start_voice()
+    uid = await held(h)
+    assert h.synth.calls == 2
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.resumed(uid))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.responder.commits == []
+    assert h.controller.phase == "idle"
+
+
+# -- The `held` column of v2's table (v2 :476-493; v5 :1174-1189 keeps these) -------------------
+
+
+async def test_held_speech_started_stays_held_and_sends_nothing():
+    h = make_harness([Pause()])
+    h.start_voice()
+    await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(h.ids()))
+    await h.settle()
+
+    assert h.controller.phase == "held"
+    assert h.outbound.sent[mark:] == []
+    assert h.ingress.calls == []
+
+
+async def test_held_endpoint_candidate_is_ignored():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.candidate(uid, "what time is it now"))
+    await h.settle()
+
+    assert h.controller.phase == "held"
+    assert h.outbound.sent[mark:] == []
+    assert len(h.responder.requests) == 1
+    assert h.ingress.calls == []
+
+
+async def test_held_utterance_dropped_sends_dropped_and_cancels_without_trace():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.dropped(uid, "no_speech", text="what time is it"))
+    await h.settle()
+
+    assert names_since(h, mark) == ["voice_decision:dropped"]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("no_speech", uid)
+    assert h.responder.commits == []
+    assert h.responder.closed == [0]
+    assert h.controller.phase == "idle"
+
+
+async def test_held_stop_keyword_end_interrupts_with_no_new_turn_and_closes_dropped_keyword():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await held(h, "stop")
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.ended(uid, "stop"))
+    await h.settle()
+
+    # The held turn never reached the client: no `barge_in`, no teardown, no `release`.
+    assert names_since(h, mark) == ["voice_decision:dropped"]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id, dropped.detail.text) == (
+        "keyword",
+        uid,
+        "stop",
+    )
+    assert len(h.responder.requests) == 1
+    assert h.responder.commits == []
+    assert h.controller.phase == "idle"
+
+
+async def test_held_ui_interrupt_cancels_without_trace():
+    h = make_harness([Pause()])
+    h.start_voice()
+    await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(Interrupt())
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.responder.commits == []
+    assert h.responder.closed == [0]
+    assert h.controller.phase == "idle"
+
+
+async def test_held_voice_stop_cancels_without_trace_and_closes_ingress():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await held(h, "what time is it", "what time")
+    mark = len(h.outbound.sent)
+
+    h.post(VoiceStop())
+    await h.settle()
+
+    assert names_since(h, mark) == ["voice_decision:dropped"]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("voice_stop", uid)
+    assert dropped.detail.text == "what time is it"  # the last transcript the record handled
+    assert calls(h.ingress, "close") == [("close",)]
+    assert h.responder.commits == []
+    assert h.controller.phase == "idle"
+
+
+async def test_held_voice_start_driven_directly_runs_voice_stop_then_adopts():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await held(h)
+    start = new_start(h)
+
+    h.post(start)
+    await h.settle()
+    mark = len(h.outbound.sent)
+    h.post(start.ingress.started(h.ids()))  # type: ignore[attr-defined]
+    await h.settle()
+
+    assert calls(h.ingress, "close") == [("close",)]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("voice_stop", uid)
+    assert h.responder.commits == []
+    assert names_since(h, mark) == ["vad_status:speech_started", "state_cycle:listen"]
+
+
+async def test_held_reconfigure_is_held_pending_until_the_released_turn_completes():
+    pause = Pause()
+    h = make_harness([Token("Noon. "), pause])
+    h.start_voice()
+    uid = await held(h)
+    h.host.apply_result = new_start(h)
+
+    h.post(request())
+    await h.settle()
+    assert h.host.calls == []
+
+    h.post(h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+    pause.release()
+    await h.settle()
+    assert h.host.calls == []
+    h.post(PlaybackDone(turn_id=h.last_turn(), played_ms=1))
+    await h.settle()
+
+    assert [c[0] for c in h.host.calls] == ["apply"]
+
+
+async def test_held_text_message_cancels_without_trace_drops_the_utterance_then_runs_the_typed_turn():
+    h = make_harness([Pause()], [Token("Lights on.")])
+    h.start_voice()
+    uid = await held(h, "what time is it", "what time")
+    mark = len(h.outbound.sent)
+
+    h.post(Text("turn the lights on"), h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+
+    assert calls(h.ingress, "drop") == [("drop", uid, "text_input")]
+    names = names_since(h, mark)
+    assert names[0] == "voice_decision:dropped"
+    assert "voice_decision:release" not in names
+    assert "transcription" not in names
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id, dropped.detail.text) == (
+        "text_input",
+        uid,
+        "what time is it",
+    )
+    assert h.controller.stale_events == 1  # the later end names a closed utterance
+    assert [(r.user_text, r.origin) for r in h.responder.requests] == [
+        ("what time is it", "voice"),
+        ("turn the lights on", "text"),
+    ]
+    (commit,) = h.responder.commits
+    assert (commit.outcome, commit.delivered_text) == ("completed", "Lights on.")
+
+
+async def test_held_disconnect_cancels_without_trace():
+    h = make_harness([Pause()])
+    h.start_voice()
+    await held(h)
+    mark = len(h.outbound.sent)
+
+    await h.controller.close()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.responder.commits == []
+    assert h.responder.closed == [0]

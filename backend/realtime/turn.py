@@ -21,13 +21,19 @@ what the client received. The commit is always the last step of a turn, and a tu
 committed at most once, whichever path ends it: completion, a cut, `close`, or the mailbox
 task's own cancellation at server shutdown.
 
+A speculative turn starts held at an `EndpointCandidate`: it generates and synthesizes, but
+everything it would send to the client or the screen waits in its buffer, and its scope's
+dispatch gate stays clear, so it dispatches no tool. The utterance's end releases it: `release`,
+then the gate set, then the buffer flushed in order. Speech that resumes, or anything else that
+ends it while held, cancels it without trace: nothing was sent, so nothing is purged, sent or
+committed.
+
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
 interruption note, cancellation, prefetch, `turn_metrics`, the scene anchors not tied to a
 wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to text on
 `tts_failed`, completion after both ends and the tool grace's orphan closing. T11d adds the
-`VoiceStart`, `voice_stop` and `Reconfigure` rows. Later work adds, in the methods named for
-them: the hold, the held turn and supersede, and the addressee gate, wake arbitration and the
-follow-up window (T11e).
+`VoiceStart`, `voice_stop` and `Reconfigure` rows and the held turn. Later work adds, in the
+methods named for them, the addressee gate, wake arbitration and the follow-up window (T11e).
 """
 
 from __future__ import annotations
@@ -92,16 +98,27 @@ from .protocol import (
     TurnMetricsMessage,
     TurnOrigin,
     TurnPromptStats,
+    UtteranceDetail,
     VadStatusMessage,
     VoiceDecisionBargeIn,
     VoiceDecisionDegraded,
     VoiceDecisionDropped,
     VoiceDecisionEndpoint,
     VoiceDecisionOverload,
+    VoiceDecisionRelease,
     VoiceStartMessage,
     next_turn_tag,
 )
-from .scene import AtSegment, AtStreamEnd, Immediate, NullScenePort, ScenePort
+from .scene import (
+    AtSegment,
+    AtStreamEnd,
+    Immediate,
+    NullScenePort,
+    SceneAnchor,
+    ScenePhase,
+    ScenePort,
+    ScreenView,
+)
 from .segmenter import SpeechSegment, SpeechSegmenter
 from .speech import (
     NEUTRAL_STATE,
@@ -438,9 +455,25 @@ class _Utterance:
     partial_ms: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _Kept:
+    """One output a held turn keeps back until its release; `frame` marks a kept `0x01`.
+
+    `send` queues the output as it would have been queued had the turn not been held. A `0x01`
+    is marked so that a synthesis failure while held can discard it (v2 M65).
+    """
+
+    send: Callable[[], None]
+    frame: Frame | None = None
+
+
 @dataclass(slots=True, eq=False)
 class _Turn:
-    """One turn's state, owned by the mailbox task."""
+    """One turn's state, owned by the mailbox task.
+
+    A held turn (`held`) answers `utterance_id`, whose end is not yet confirmed; until its
+    release every output it makes waits in `kept`, in the order it was made.
+    """
 
     turn_id: str
     origin: TurnOrigin
@@ -451,6 +484,11 @@ class _Turn:
     opened_ms: int
     base_ms: int
     marks: dict[str, int]
+    text: str = ""
+    held: bool = False
+    utterance_id: str | None = None
+    kept: list[_Kept] = field(default_factory=list)
+    scene: ScenePort = field(default_factory=NullScenePort)
     audio_tag: int | None = None
     segmenter: SpeechSegmenter | None = None
     ledger: PlaybackLedger | None = None
@@ -561,6 +599,42 @@ def _prompt_stats(stats: object | None) -> TurnPromptStats:
     )
 
 
+def _final_update(event: UtteranceEnded) -> TranscriptUpdate:
+    """The end's final transcript as the barge-in policy reads it."""
+    return TranscriptUpdate(
+        event.text,
+        len(event.text),
+        True,
+        event.duration_ms,
+        event.no_speech_prob,
+        event.avg_logprob,
+    )
+
+
+def _closing_detail(utterance: _Utterance, drop: UtteranceDropped | None) -> DroppedDetail:
+    """The detail of a `dropped` the controller sends for an utterance it closes itself (v2).
+
+    It is the drop the lever returned when that drop names the utterance; otherwise it comes
+    from the record, the last transcript handled and its length, since ingress may already have
+    ended an utterance whose end is still queued.
+    """
+    if drop is not None and drop.utterance_id == utterance.utterance_id:
+        return DroppedDetail(
+            utterance_id=utterance.utterance_id,
+            duration_ms=drop.duration_ms,
+            text=drop.text,
+            no_speech_prob=drop.no_speech_prob,
+            avg_logprob=drop.avg_logprob,
+        )
+    return DroppedDetail(
+        utterance_id=utterance.utterance_id,
+        duration_ms=utterance.partial_ms,
+        text=utterance.partial_text,
+        no_speech_prob=None,
+        avg_logprob=None,
+    )
+
+
 def _wire_budget(budget: VoiceLatencyBudget) -> LatencyBudget:
     rows = {name: getattr(budget, name) for name in BUDGET_FIELDS}
     return LatencyBudget(preset=budget.preset, **rows)
@@ -569,12 +643,17 @@ def _wire_budget(budget: VoiceLatencyBudget) -> LatencyBudget:
 # -- The turn sink ------------------------------------------------------------------------
 
 
+def _is_audio(item: object) -> bool:
+    return isinstance(item, Frame) and item.msg_type == MsgType.AUDIO_CHUNK
+
+
 class _TurnSink:
     """The pacer's turn sink: forwards to `Outbound.send_turn` and notes a stretch's first audio.
 
     Before the first `0x01` of a stretch of audio it queues `state_cycle speak`, so the client
     sees MIST speak no later than the frame, and posts `_AudioStarted` so the mailbox moves the
-    turn to `speaking`. T11d puts the hold's gate here.
+    turn to `speaking`. While the turn is held it keeps each frame back and returns False, so
+    the pacer leaves it out of the ledger until the release queues it (v2 N26).
     """
 
     def __init__(self, controller: TurnController, turn: _Turn) -> None:
@@ -591,21 +670,55 @@ class _TurnSink:
     ) -> bool:
         turn = self._turn
         controller = self._controller
-        if isinstance(item, Frame) and item.msg_type == MsgType.AUDIO_CHUNK:
-            now = controller._clock.now_ms()
-            turn.frames_queued = True
-            if not turn.stretch_open:
-                turn.stretch_open = True
-                controller._outbound.send_turn(
-                    turn_id, StateCycleMessage(state="speak", turn_id=turn_id)
-                )
-                controller._post_internal(_AudioStarted(turn_id, now))
-            turn.mark("first_frame_sent", now)
-            if turn.handoff_seen and turn.handoff_ack_ms is None:
-                turn.handoff_ack_ms = now - turn.opened_ms
-        return controller._outbound.send_turn(
-            turn_id, item, terminal=terminal, kind=kind, token_index=token_index
-        )
+        if turn.held:
+            frame = item if isinstance(item, Frame) and _is_audio(item) else None
+            turn.kept.append(_Kept(lambda: controller._flush_frame(turn, item, terminal), frame))
+            return False
+        return controller._queue_frame(turn, item, terminal, kind, token_index)
+
+
+class _TurnScene:
+    """The scene port as one turn reaches it, and that turn's pacer listener.
+
+    A held turn has not reached the screen either, so its intents and its pacer's hooks wait in
+    its buffer with its other output and reach the port at the release, in the order made.
+    """
+
+    def __init__(self, scene: ScenePort, turn: _Turn) -> None:
+        self._scene = scene
+        self._turn = turn
+
+    def _run(self, call: Callable[[], None]) -> None:
+        if self._turn.held:
+            self._turn.kept.append(_Kept(call))
+        else:
+            call()
+
+    def phase(self, phase: ScenePhase, *, turn_id: str | None, at: SceneAnchor) -> None:
+        self._run(lambda: self._scene.phase(phase, turn_id=turn_id, at=at))
+
+    def tool_view(
+        self,
+        turn_id: str,
+        call_id: str,
+        view: ScreenView,
+        data: Mapping[str, object] | None,
+        *,
+        at: SceneAnchor,
+    ) -> None:
+        self._run(lambda: self._scene.tool_view(turn_id, call_id, view, data, at=at))
+
+    def cancel_turn(self, turn_id: str) -> None:
+        self._run(lambda: self._scene.cancel_turn(turn_id))
+
+    def turn_ended(self, turn_id: str) -> None:
+        self._run(lambda: self._scene.turn_ended(turn_id))
+
+    def segment_starting(self, audio_tag: int, segment_index: int, first_sample: int) -> None:
+        self._run(lambda: self._scene.segment_starting(audio_tag, segment_index, first_sample))
+
+    def stream_ending(self, audio_tag: int, last_sample: int) -> None:
+        self._run(lambda: self._scene.stream_ending(audio_tag, last_sample))
 
 
 # -- The controller -------------------------------------------------------------------------
@@ -843,18 +956,72 @@ class TurnController:
     def _send_control(self, item: object) -> None:
         self._outbound.send_control(item)
 
-    def _send_turn(self, turn: _Turn, item: object) -> None:
-        self._outbound.send_turn(turn.turn_id, item)
+    def _keep_or_send(self, turn: _Turn, send: Callable[[], None]) -> None:
+        """Send now, or keep it in a held turn's buffer until the release."""
+        if turn.held:
+            turn.kept.append(_Kept(send))
+        else:
+            send()
+
+    def _send_turn_control(self, turn: _Turn, item: object) -> None:
+        """A `control` item that names the turn, so a held turn keeps it back."""
+        self._keep_or_send(turn, lambda: self._outbound.send_control(item))
+
+    def _send_turn(
+        self,
+        turn: _Turn,
+        item: object,
+        *,
+        kind: Literal["stream_start", "token"] | None = None,
+        token_index: int | None = None,
+    ) -> None:
+        self._keep_or_send(
+            turn,
+            lambda: self._outbound.send_turn(
+                turn.turn_id, item, kind=kind, token_index=token_index
+            ),
+        )
 
     def _send_token(self, turn: _Turn, text: str) -> None:
         index = len(turn.token_texts)
         turn.token_texts.append(text)
-        self._outbound.send_turn(
-            turn.turn_id,
+        self._send_turn(
+            turn,
             {"type": "stream_token", "turn_id": turn.turn_id, "token": text},
             kind="token",
             token_index=index,
         )
+
+    def _queue_frame(
+        self,
+        turn: _Turn,
+        item: object,
+        terminal: bool = False,
+        kind: Literal["stream_start", "token"] | None = None,
+        token_index: int | None = None,
+    ) -> bool:
+        """Queue a pacer frame, with `state_cycle speak` before a stretch's first `0x01`."""
+        if _is_audio(item):
+            now = self._clock.now_ms()
+            turn.frames_queued = True
+            if not turn.stretch_open:
+                turn.stretch_open = True
+                self._outbound.send_turn(
+                    turn.turn_id, StateCycleMessage(state="speak", turn_id=turn.turn_id)
+                )
+                self._post_internal(_AudioStarted(turn.turn_id, now))
+            turn.mark("first_frame_sent", now)
+            if turn.handoff_seen and turn.handoff_ack_ms is None:
+                turn.handoff_ack_ms = now - turn.opened_ms
+        return self._outbound.send_turn(
+            turn.turn_id, item, terminal=terminal, kind=kind, token_index=token_index
+        )
+
+    def _flush_frame(self, turn: _Turn, item: object, terminal: bool) -> None:
+        """Queue a frame a held turn kept back; a `0x01` enters the ledger only now (N26)."""
+        self._queue_frame(turn, item, terminal)
+        if _is_audio(item) and turn.pacer is not None:
+            turn.pacer.record_flushed(item)
 
     def _send_degraded(self, turn: _Turn, reason: str, error: str | None = None) -> None:
         self._send_turn(
@@ -911,9 +1078,21 @@ class TurnController:
             self._publish(utterance)
 
     async def _on_speech_resumed(self, event: SpeechResumed) -> None:
-        """A speculative turn's utterance continued; the hold that uses it is T11d's."""
-        if self._accept(event):
-            self._utterance(event.utterance_id, event.first_pos)
+        """The utterance continued: a turn held on it is cancelled without trace (v1)."""
+        if not self._accept(event):
+            return
+        if self._utterance(event.utterance_id, event.first_pos) is None:
+            return
+        turn = self._held_turn(event.utterance_id)
+        if turn is not None:
+            await self._cancel_held(turn)
+
+    def _held_turn(self, utterance_id: str) -> _Turn | None:
+        """The turn held on the utterance, if one is."""
+        turn = self._turn
+        if turn is None or not turn.held or turn.ending or turn.utterance_id != utterance_id:
+            return None
+        return turn
 
     async def _on_partial(self, event: TranscriptPartial) -> None:
         if not self._accept(event):
@@ -940,12 +1119,30 @@ class TurnController:
                 await self._barge_in(verdict, event.utterance_id, event.heard_at_ms)
 
     async def _on_candidate(self, event: EndpointCandidate) -> None:
-        """The speculative start is T11d's; the read path's prefetch starts here."""
+        """Prefetch, and in `idle` start the turn held on a published utterance (speculative).
+
+        Ingress emits a candidate only with speculative start on. The candidate's text is the
+        last transcript the record handled for the utterance. In every other phase the cell is
+        ignored: the utterance's end decides.
+        """
         if not self._accept(event):
             return
         utterance = self._utterance(event.utterance_id, event.first_pos)
-        if utterance is not None and utterance.published:
-            self._responder.prefetch(self._session_id, event.text)
+        if utterance is None:
+            return
+        utterance.partial_text = event.text
+        if not utterance.published:
+            return
+        self._responder.prefetch(self._session_id, event.text)
+        if self._phase == "idle" and self._turn is None:
+            self._open_turn(
+                self._next_turn_id(),
+                event.text,
+                "voice",
+                base_ms=event.heard_at_ms,
+                marks={"stt_final": self._clock.now_ms()},
+                held_utterance=event.utterance_id,
+            )
 
     async def _on_utterance_ended(self, event: UtteranceEnded) -> None:
         if not self._accept(event):
@@ -954,23 +1151,94 @@ class TurnController:
         if utterance is None:
             return
         utterance.closed = True
+        held = self._held_turn(event.utterance_id)
+        if held is not None:
+            await self._end_held(held, event)
+            return
         if utterance.published:
             if self._turn is not None:
                 await self._cut(self._turn, reason="new_input")
             self._start_voice_turn(event)
             return
         if self._phase in ("thinking", "speaking") and self._policy is not None:
-            update = TranscriptUpdate(
-                event.text,
-                len(event.text),
-                True,
-                event.duration_ms,
-                event.no_speech_prob,
-                event.avg_logprob,
-            )
-            verdict = self._policy.on_utterance_end(update, self._phase)
+            verdict = self._policy.on_utterance_end(_final_update(event), self._phase)
             if verdict is not None and verdict.action == "interrupt":
                 await self._barge_in(verdict, event.utterance_id, event.heard_at_ms)
+
+    async def _end_held(self, turn: _Turn, event: UtteranceEnded) -> None:
+        """The held utterance's end: a stop keyword cancels, any other end releases.
+
+        A stop-keyword utterance means "do not answer": the held turn is cancelled without trace,
+        since it never reached the client (no `barge_in`, no teardown), and the utterance closes
+        with `dropped keyword`. An end whose text is not the text the turn answers is not
+        released: the turn is cancelled without trace and a turn starts from the end.
+        """
+        if self._policy is not None:
+            verdict = self._policy.on_utterance_end(_final_update(event), "held")
+            if verdict is not None and verdict.action == "interrupt":
+                await self._cancel_held(turn)
+                self._send_control(
+                    VoiceDecisionDropped(
+                        turn_id=None,
+                        reason="keyword",
+                        detail=DroppedDetail(
+                            utterance_id=event.utterance_id,
+                            duration_ms=event.duration_ms,
+                            text=event.text,
+                            no_speech_prob=event.no_speech_prob,
+                            avg_logprob=event.avg_logprob,
+                        ),
+                    )
+                )
+                return
+        if event.text != turn.text:
+            await self._cancel_held(turn)
+            self._start_voice_turn(event)
+            return
+        await self._release(turn, event)
+
+    async def _release(self, turn: _Turn, event: UtteranceEnded) -> None:
+        """Release a held turn in v1's order: `release`, the dispatch gate, the buffer (v1, M67).
+
+        The one `release` naming the utterance goes before its `transcription`, its closing
+        message. The buffered output then follows in the order it was made, each `0x01` entering
+        the ledger as it is queued, so the estimate runs from the release. A synthesis failure
+        while held put its `degraded` and frameless `0x02` in the buffer, so the turn is then a
+        text reply (M65).
+        """
+        self._send_control(
+            VoiceDecisionRelease(
+                turn_id=turn.turn_id,
+                reason=event.reason,
+                detail=UtteranceDetail(utterance_id=event.utterance_id),
+            )
+        )
+        turn.scope.dispatch_gate.set()
+        self._send_end_of_utterance(turn.turn_id, event)
+        turn.marks["eot_decided"] = event.heard_at_ms
+        turn.base_ms = event.heard_at_ms - event.silence_ms
+        turn.held = False
+        self._phase = "thinking" if turn.audio_tag is not None else "text"
+        kept, turn.kept = turn.kept, []
+        for item in kept:
+            item.send()
+        if turn.tts_failed and not turn.frames_queued:
+            self._phase = "text"
+        await self._maybe_complete(turn)
+
+    async def _cancel_held(self, turn: _Turn) -> None:
+        """Cancel a held turn without trace (v1).
+
+        It sent nothing and dispatched no tool, so nothing is purged, sent or committed, and the
+        interruption note is left for the turn that follows. Its utterance is untouched.
+        """
+        if turn.ending:
+            return
+        turn.ending = True
+        turn.token.set()
+        turn.kept.clear()
+        await self._cancel_tasks(turn)
+        self._finish(turn)
 
     async def _on_utterance_dropped(self, event: UtteranceDropped) -> None:
         if not self._accept(event):
@@ -993,6 +1261,9 @@ class TurnController:
                     ),
                 )
             )
+        held = self._held_turn(event.utterance_id)
+        if held is not None:
+            await self._cancel_held(held)
 
     async def _on_overload(self, event: IngressOverload) -> None:
         if not self._accept(event):
@@ -1012,14 +1283,39 @@ class TurnController:
     # -- Controls ---------------------------------------------------------------------------
 
     async def _on_text(self, message: Text) -> None:
-        if self._turn is not None:
-            await self._cut(self._turn, reason="new_input")
+        """A typed turn; a held turn is cancelled without trace and its utterance closed first.
+
+        The held utterance was never shown as a turn, so it closes visibly (`dropped
+        text_input`) rather than ending later and cutting the typed turn it preceded (v1).
+        """
+        turn = self._turn
+        if turn is not None and turn.held and turn.utterance_id is not None:
+            await self._cancel_held(turn)
+            self._drop_for_text(turn.utterance_id)
+        elif turn is not None:
+            await self._cut(turn, reason="new_input")
         now = self._clock.now_ms()
         self._open_turn(self._next_turn_id(), message.text, "text", base_ms=now, marks={})
+
+    def _drop_for_text(self, utterance_id: str) -> None:
+        """Close the utterance through the `drop` lever naming it, with `dropped text_input`."""
+        utterance = self._utterances.get(utterance_id)
+        if utterance is None or utterance.closed:
+            return
+        utterance.closed = True
+        drop = self._ingress.drop(utterance_id, "text_input") if self._ingress else None
+        self._send_control(
+            VoiceDecisionDropped(
+                turn_id=None, reason="text_input", detail=_closing_detail(utterance, drop)
+            )
+        )
 
     async def _on_interrupt(self, message: Interrupt) -> None:
         turn = self._turn
         if turn is None or turn.ending:
+            return
+        if turn.held:
+            await self._cancel_held(turn)  # it never reached the client: no `barge_in`
             return
         self._send_control(
             VoiceDecisionBargeIn(
@@ -1057,7 +1353,9 @@ class TurnController:
             pending, self._pending = self._pending, None
             self._host.refuse(pending, "voice_stop")
         turn = self._turn
-        if turn is not None and not turn.ending and self._phase in ("thinking", "speaking"):
+        if turn is not None and turn.held:
+            await self._cancel_held(turn)
+        elif turn is not None and not turn.ending and self._phase in ("thinking", "speaking"):
             self._send_control(
                 VoiceDecisionBargeIn(
                     turn_id=turn.turn_id,
@@ -1091,24 +1389,10 @@ class TurnController:
             utterance.closed = True
             if not utterance.published:
                 continue
-            if drop is not None and drop.utterance_id == utterance.utterance_id:
-                detail = DroppedDetail(
-                    utterance_id=utterance.utterance_id,
-                    duration_ms=drop.duration_ms,
-                    text=drop.text,
-                    no_speech_prob=drop.no_speech_prob,
-                    avg_logprob=drop.avg_logprob,
-                )
-            else:
-                detail = DroppedDetail(
-                    utterance_id=utterance.utterance_id,
-                    duration_ms=utterance.partial_ms,
-                    text=utterance.partial_text,
-                    no_speech_prob=None,
-                    avg_logprob=None,
-                )
             self._send_control(
-                VoiceDecisionDropped(turn_id=None, reason="voice_stop", detail=detail)
+                VoiceDecisionDropped(
+                    turn_id=None, reason="voice_stop", detail=_closing_detail(utterance, drop)
+                )
             )
 
     async def _on_reconfigure(self, message: Reconfigure) -> None:
@@ -1236,8 +1520,8 @@ class TurnController:
             return "tts"
         return "text"
 
-    def _start_voice_turn(self, event: UtteranceEnded) -> None:
-        turn_id = self._next_turn_id()
+    def _send_end_of_utterance(self, turn_id: str, event: UtteranceEnded) -> None:
+        """The end's `endpoint`, `speech_ended` and the utterance's `transcription`."""
         self._send_control(
             VoiceDecisionEndpoint(
                 turn_id=turn_id,
@@ -1251,6 +1535,10 @@ class TurnController:
         )
         self._send_control(VadStatusMessage(status="speech_ended"))
         self._send_control(TranscriptionMessage(text=event.text, utterance_id=event.utterance_id))
+
+    def _start_voice_turn(self, event: UtteranceEnded) -> None:
+        turn_id = self._next_turn_id()
+        self._send_end_of_utterance(turn_id, event)
         # Timings count from the end of speech: the utterance's last frame less its silence.
         marks = {"eot_decided": event.heard_at_ms, "stt_final": self._clock.now_ms()}
         base = event.heard_at_ms - event.silence_ms
@@ -1264,15 +1552,19 @@ class TurnController:
         *,
         base_ms: int,
         marks: dict[str, int],
+        held_utterance: str | None = None,
     ) -> None:
+        """Open a turn; with `held_utterance` it starts held, answering that utterance."""
         placement = self._placement()
         channel = self._channel_for(origin)
+        held = held_utterance is not None
         request = TurnRequest(
             session_id=self._session_id,
             user_text=text,
             origin=origin,
             channel=channel,
             interruption_note=self._note,
+            held=held,
         )
         scope = self._responder.open_turn(request)
         now = self._clock.now_ms()
@@ -1286,32 +1578,38 @@ class TurnController:
             opened_ms=now,
             base_ms=base_ms,
             marks=marks,
+            text=text,
+            held=held,
+            utterance_id=held_utterance,
         )
+        turn.scene = _TurnScene(self._scene, turn)
         self._turn = turn
-        self._send_control(StateCycleMessage(state="think", turn_id=turn_id))
+        self._send_turn_control(turn, StateCycleMessage(state="think", turn_id=turn_id))
         if channel == "tts":
             self._tag = next_turn_tag(self._tag)
             turn.audio_tag = self._tag
-        self._outbound.send_turn(
-            turn_id,
+        self._send_turn(
+            turn,
             StreamStartMessage(
                 turn_id=turn_id, channel=channel, origin=origin, audio_tag=turn.audio_tag
             ),
             kind="stream_start",
         )
-        self._scene.phase("thinking", turn_id=turn_id, at=Immediate())
+        turn.scene.phase("thinking", turn_id=turn_id, at=Immediate())
         if turn.audio_tag is not None:
             self._start_speech(turn, turn.audio_tag)
             self._phase = "thinking"
         else:
             self._phase = "text"
+        if held:
+            self._phase = "held"
         turn.mark("request_sent", now)
         producer = self._spawn(turn, self._produce(turn), "stream")
         producer.add_done_callback(lambda task: self._producer_done(turn, task))
 
     def _start_speech(self, turn: _Turn, tag: int) -> None:
-        self._scene.phase("speaking", turn_id=turn.turn_id, at=AtSegment(tag, 0))
-        self._scene.phase("idle", turn_id=turn.turn_id, at=AtStreamEnd(tag))
+        turn.scene.phase("speaking", turn_id=turn.turn_id, at=AtSegment(tag, 0))
+        turn.scene.phase("idle", turn_id=turn.turn_id, at=AtStreamEnd(tag))
         segmenter = SpeechSegmenter(self._segmenter_config)
         turn.segmenter = segmenter
         turn.ledger = PlaybackLedger(
@@ -1327,7 +1625,7 @@ class TurnController:
             ledger=turn.ledger,
             clock=self._clock,
             config=self._playback_config,
-            listener=self._scene,
+            listener=turn.scene,
         )
         self._spawn(turn, self._synthesize(turn), "synthesize")
         self._spawn(turn, self._play(turn), "play")
@@ -1525,7 +1823,7 @@ class TurnController:
                 if turn.audio_tag is not None and self._speaks(turn):
                     assert turn.segmenter is not None  # noqa: S101 - `_speaks` checked it
                     at = AtSegment(turn.audio_tag, turn.segmenter.next_index)
-                self._scene.tool_view(
+                turn.scene.tool_view(
                     turn.turn_id,
                     str(payload.get("tool_call_id")),
                     view,  # type: ignore[arg-type]
@@ -1601,8 +1899,8 @@ class TurnController:
     async def _on_synth_failed(self, event: _SynthFailed) -> None:
         """The synthesizer failed: the rest of the reply goes on as text (v2 M65, M68).
 
-        A held turn's failure is applied at its release, in its buffered order (T11d); this
-        handles a turn the client has seen open.
+        A held turn's failure goes into its buffer, so it reaches the client at the release, in
+        its buffered order; until then the `held` cells apply.
         """
         turn = self._current(event.turn_id)
         if turn is None or turn.pacer is None or turn.tts_failed:
@@ -1619,12 +1917,18 @@ class TurnController:
         its frameless `0x02` follows the `degraded`, and the turn is a text reply from here.
         Otherwise the pacer hands on the audio it holds, then its `0x02`, and the turn moves to
         `text` when the client has played it (`_on_playback_done`), unless it completes first.
+
+        A held turn has queued no `0x01`: the frames it kept back are discarded, and the
+        `degraded` and the frameless `0x02` join its buffer after the tokens kept before them.
+        It stays `held`; its release moves it to `text` (v2 :392-401).
         """
         assert turn.pacer is not None and turn.segmenter is not None  # noqa: S101
         turn.tts_failed = True
         turn.handoff_waiting = False
         turn.text_from_token = len(turn.token_texts)
         turn.voiced_text = turn.segmenter.text[: turn.voiced_end] if turn.frames_queued else ""
+        if turn.held:
+            turn.kept = [kept for kept in turn.kept if kept.frame is None]
         self._send_turn(
             turn,
             VoiceDecisionDegraded(
@@ -1642,18 +1946,19 @@ class TurnController:
             turn.pacer.finish()
             return
         turn.pacer.end_unsent()
-        self._phase = "text"
+        if not turn.held:
+            self._phase = "text"
 
     # -- Ending a turn ---------------------------------------------------------------------
 
     def _end_scene(self, turn: _Turn) -> None:
         if not turn.scene_ended:
             turn.scene_ended = True
-            self._scene.turn_ended(turn.turn_id)
+            turn.scene.turn_ended(turn.turn_id)
 
     async def _maybe_complete(self, turn: _Turn) -> None:
-        """Complete the turn once its generation and its tag have both ended."""
-        if turn.ending or not turn.stream_done:
+        """Complete the turn once its generation and its tag have both ended; never while held."""
+        if turn.ending or turn.held or not turn.stream_done:
             return
         if turn.channel == "tts":
             assert turn.ledger is not None  # noqa: S101
@@ -1718,7 +2023,13 @@ class TurnController:
         estimate made without client reports runs over frames the client may never get. A turn
         moved to text adds the taken tokens from `text_from_token` on; when the purge removed
         its `degraded`, it removed token `text_from_token` too, so that adds nothing.
+
+        A held turn never reached the client, so any cut of one, a disconnect included, is a
+        cancel without trace.
         """
+        if turn.held:
+            await self._cancel_held(turn)
+            return
         if turn.ending:
             return
         turn.ending = True

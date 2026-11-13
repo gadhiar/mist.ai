@@ -16,7 +16,8 @@ does not start with `test_`, so pytest does not collect it. Each test file impor
 - `RecordingScenePort`: records every scene call.
 - `RecordingIngress`: the controller's levers on ingress, recorded, and builders for the events
   ingress emits, numbered by epoch and `event_seq`.
-- `FakeResponder`: scripted turn streams; records requests, prefetches, commits and closes.
+- `FakeResponder`: scripted turn streams; records requests, prefetches, commits and closes. A
+  `WaitGate` step waits on the scope's dispatch gate, as the handler does before a tool.
 - `FakeHost`: a `ReconfigureHost` that records its answers.
 - `FakeWakeArbiter`: a `WakeArbitration` whose verdicts a test grants or denies by hand.
 - `Harness` and `make_harness`: a controller wired to all of the above.
@@ -49,6 +50,7 @@ from backend.realtime.ingress import (
     IngressOverload,
     IngressSeed,
     OpenedUtterance,
+    SpeechResumed,
     SpeechStarted,
     TranscriptPartial,
     UtteranceDropped,
@@ -437,6 +439,9 @@ class RecordingIngress:
     def started(self, uid: str) -> SpeechStarted:
         return SpeechStarted(self.epoch, self._next_seq(), uid, self._pos(uid))
 
+    def resumed(self, uid: str) -> SpeechResumed:
+        return SpeechResumed(self.epoch, self._next_seq(), uid, self._pos(uid))
+
     def partial(self, uid: str, text: str, *, heard_at_ms: int = 0) -> TranscriptPartial:
         return TranscriptPartial(
             epoch=self.epoch,
@@ -516,7 +521,12 @@ class Call:
     fn: Callable[[TurnScope], None]
 
 
-ScriptStep = StreamEvent | Pause | Call
+@dataclass
+class WaitGate:
+    """A script step: wait for the scope's dispatch gate, as the handler does before a tool."""
+
+
+ScriptStep = StreamEvent | Pause | Call | WaitGate
 
 
 def tool_started(call_id: str = "call-1", name: str = "set_timer") -> WSEvent:
@@ -597,6 +607,10 @@ class FakeResponder:
                     continue
                 if isinstance(step, Call):
                     step.fn(scope)
+                    continue
+                if isinstance(step, WaitGate):
+                    await scope.dispatch_gate.wait()
+                    self.log.append("gate")
                     continue
                 if isinstance(step, Token):
                     scope.stream.emitted += step.text
