@@ -11,6 +11,9 @@ import re
 from pathlib import Path
 
 import pytest
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from scripts.voice_data.images import BASE_IMAGE, IMAGE_PREFIX
 
@@ -212,3 +215,80 @@ def test_requirement_lines_are_pinned(name: str) -> None:
     for line in pins:
         assert REQUIREMENT_LINE.fullmatch(line), f"{name}: {line}"
         assert "unverified" not in line
+
+
+# The upstream bounds behind the pip ResolutionImpossible failures of the H3 teacher builds at
+# a31679c, and the bounds of the pins that replaced them, as (requirements file, declaring
+# package, its pin, dependency, the declared specifier). A row applies while the file pins the
+# declaring package at that version or commit.
+UPSTREAM_BOUNDS = [
+    # pypi.org/pypi/transformers/5.19.0/json
+    ("requirements-omnivoice.txt", "transformers", "5.19.0", "huggingface-hub", ">=1.31.0,<3.0"),
+    # pypi.org/pypi/accelerate/1.8.1/json
+    ("requirements-omnivoice.txt", "accelerate", "1.8.1", "huggingface-hub", ">=0.21.0"),
+    # pypi.org/pypi/gradio/5.45.0/json
+    ("requirements-omnivoice.txt", "gradio", "5.45.0", "huggingface-hub", ">=0.33.5,<1.0"),
+    # pypi.org/pypi/gradio/6.32.0/json
+    ("requirements-omnivoice.txt", "gradio", "6.32.0", "huggingface-hub", ">=1.16.0,<3.0"),
+]
+
+
+def pinned_versions(name: str) -> dict[str, str]:
+    """Map each requirement of a requirements file to its pinned version, or its git commit."""
+    pins: dict[str, str] = {}
+    for raw in (DOCKER_DIR / name).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "--")):
+            continue
+        if " @ git+" in line:
+            package, url = line.split(" @ ", 1)
+            pins[canonicalize_name(package)] = url.rsplit("@", 1)[1]
+        else:
+            package, version = line.split("==", 1)
+            pins[canonicalize_name(package.split("[", 1)[0])] = version
+    return pins
+
+
+def admits_some_version(spec: SpecifierSet) -> bool:
+    """Whether some version meets every clause of `spec`, for an unpinned dependency.
+
+    When every lower bound is inclusive, a non-empty intersection holds its greatest lower bound,
+    or 0 when it has none, so trying 0 and each version the clauses name decides it, unless a `!=`
+    clause excludes that bound. No row in `UPSTREAM_BOUNDS` combines the two.
+    """
+    candidates = [Version("0")]
+    for clause in spec:
+        try:
+            candidates.append(Version(clause.version))
+        except InvalidVersion:
+            continue
+    return any(spec.contains(candidate, prereleases=True) for candidate in candidates)
+
+
+@pytest.mark.parametrize("name", sorted({row[0] for row in UPSTREAM_BOUNDS}))
+def test_teacher_pins_meet_upstream_bounds(name: str) -> None:
+    # pip resolves a family's whole requirements file at once, so a pin that falls outside a
+    # bound declared by another pin, or two pins whose bounds on an unpinned dependency do not
+    # overlap, fails the image build with ResolutionImpossible.
+    pins = pinned_versions(name)
+    declared: dict[str, SpecifierSet] = {}
+    for file, package, pin, dependency, specifier in UPSTREAM_BOUNDS:
+        if file == name and pins.get(package) == pin:
+            declared[dependency] = declared.get(dependency, SpecifierSet()) & specifier
+    assert declared, f"{name}: no row matches its pins"
+    for dependency, spec in declared.items():
+        if dependency in pins:
+            assert spec.contains(pins[dependency]), f"{name}: {dependency}=={pins[dependency]}"
+        else:
+            assert admits_some_version(spec), f"{name}: no {dependency} meets {spec}"
+
+
+@pytest.mark.parametrize("name", sorted({row[0] for row in UPSTREAM_BOUNDS}))
+def test_upstream_bounds_cover_each_declaring_pin(name: str) -> None:
+    # A declaring package pinned at a version with no row would drop its bounds from the check
+    # above, so a version bump has to bring its declared bounds into the table.
+    pins = pinned_versions(name)
+    declaring = {package for file, package, _, _, _ in UPSTREAM_BOUNDS if file == name}
+    for package in declaring:
+        rows = [row for row in UPSTREAM_BOUNDS if row[0] == name and row[1] == package]
+        assert any(row[2] == pins.get(package) for row in rows), f"{name}: {package}"
