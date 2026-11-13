@@ -2,7 +2,9 @@
 for a published utterance (T11d, v2 :1704-1717 and :1736-1784, v3 :1681-1682, v8 :239-247), and
 the speculative held turn: its start, buffer, release and cancel (v1 :400-423, :2714-2717), M65
 from `held` at its release and M67's `release` (v2 :392-408, :1615-1637), and v2's `held` column
-(v2 :476-493) where v5 :1174-1189 leaves it.
+(v2 :476-493) where v5 :1174-1189 leaves it. Then the rest of v2's table in `idle`, `thinking`,
+`speaking` and `text` that v5 keeps, the keyword row's closing messages (v2 :617-651), ignored
+endpoint reports (v2 :1844-1847), and Test strategy's variants that survive v5 (v2 :1117-1130).
 
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
@@ -14,7 +16,9 @@ import pytest
 import pytest_asyncio
 
 from backend.chat.stream_events import Token
+from backend.realtime.budget import BargeInConfig
 from backend.realtime.turn import (
+    BargeInReport,
     Interrupt,
     Mute,
     PlaybackDone,
@@ -1093,3 +1097,508 @@ async def test_held_disconnect_cancels_without_trace():
     assert h.outbound.sent[mark:] == []
     assert h.responder.commits == []
     assert h.responder.closed == [0]
+
+
+# == The cells of v2's table in idle, thinking, speaking and text (v2 :476-492) ==================
+# v5 :1174-1189 keeps these rows; its new and changed rows (`NameHeard`, the gate partial, an
+# unpublished candidate's end, `SpeechStarted`, `wake`) are T11e's, and the `ptt` rows are gone.
+# Unnamed speech in `thinking` and `speaking` stays unpublished (v5 :421-426).
+
+TURN_PHASES = ["thinking", "speaking", "text"]
+
+
+async def with_open_utterance(
+    phase: str, *partials: str, script: list[object] | None = None
+) -> tuple[Harness, Pause, str]:
+    """A turn in `phase`, with an utterance published in idle before it opened and still open.
+
+    Through the session a typed turn reaches `text` this way; `thinking` and `speaking` with a
+    published utterance open are what a named utterance gives (T11e), driven here directly.
+    """
+    pause = Pause()
+    if script is not None:
+        h = make_harness(script)
+    elif phase == "thinking":
+        h = make_harness([pause, Token("Late.")])
+    else:
+        h = make_harness([Token("One two three. Four five. "), pause, Token("Six.")])
+    h.start_voice()
+    uid = await published(h, *partials)
+    if phase == "text":
+        h.post(Text("typed"))
+        await h.settle()
+    else:
+        await h.speak("hello")
+    assert h.controller.phase == phase
+    return h, pause, uid
+
+
+def decisions(h: Harness) -> list[tuple[str, str]]:
+    """The client-facing `voice_decision`s, as (kind, reason)."""
+    return [
+        (m.kind, m.reason) for m in h.outbound.client if getattr(m, "type", "") == "voice_decision"
+    ]
+
+
+# -- EndpointCandidate: ignored outside idle --------------------------------------------------
+
+
+@pytest.mark.parametrize("phase", TURN_PHASES)
+async def test_endpoint_candidate_in_a_turns_phase_is_ignored(phase):
+    h, pause, uid = await with_open_utterance(phase, "what")
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.candidate(uid, "what time is it"))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.phase == phase
+    assert len(h.responder.requests) == 1
+    assert h.ingress.calls == []
+    pause.release()
+
+
+# -- SpeechResumed: ignored with no held turn ---------------------------------------------------
+
+
+@pytest.mark.parametrize("phase", ["idle", *TURN_PHASES])
+async def test_speech_resumed_with_no_held_turn_is_ignored(phase):
+    if phase == "idle":
+        h, pause = make_harness(), Pause()
+        h.start_voice()
+        uid = await published(h, "what")
+    else:
+        h, pause, uid = await with_open_utterance(phase, "what")
+    mark, requests = len(h.outbound.sent), len(h.responder.requests)
+
+    # The published utterance, and unnamed speech nobody published, "as `SpeechStarted`" (v5).
+    h.post(h.ingress.resumed(uid), h.ingress.resumed(h.ids()))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.phase == phase
+    assert len(h.responder.requests) == requests
+    assert h.responder.commits == []
+    assert h.ingress.calls == []
+    pause.release()
+
+
+# -- UtteranceEnded: the `text` cell ------------------------------------------------------------
+
+
+async def test_utterance_ended_in_text_cuts_the_typed_turn_then_starts_a_voice_turn():
+    h, pause, uid = await with_open_utterance("text", "what", script=[Token("Typed. "), Pause()])
+    typed = h.last_turn()
+
+    h.post(h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert (cancelled.turn_id, cancelled.reason) == (typed, "new_input")
+    assert h.responder.commits[0].outcome == "interrupted"
+    (transcription,) = h.outbound.of("transcription")
+    assert (transcription.text, transcription.utterance_id) == ("what time is it", uid)
+    assert [(r.user_text, r.origin) for r in h.responder.requests] == [
+        ("typed", "text"),
+        ("what time is it", "voice"),
+    ]
+    assert h.outbound.violations == []
+
+
+# -- UtteranceDropped: `dropped` in every phase ---------------------------------------------------
+
+
+@pytest.mark.parametrize("reason", ["noise", "no_speech", "stt_error"])
+async def test_an_ingress_drop_in_idle_closes_with_its_reason(reason):
+    h = make_harness()
+    h.start_voice()
+    uid = await published(h, "hm")
+
+    h.post(h.ingress.dropped(uid, reason, text="hm"))
+    await h.settle()
+
+    assert decisions(h) == [("dropped", reason)]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.turn_id, dropped.detail.utterance_id, dropped.detail.text) == (None, uid, "hm")
+    assert h.responder.requests == []
+
+
+@pytest.mark.parametrize("phase", TURN_PHASES)
+async def test_utterance_dropped_in_a_turns_phase_sends_dropped_and_the_turn_goes_on(phase):
+    h, pause, uid = await with_open_utterance(phase, "hm")
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.dropped(uid, "no_speech"))
+    await h.settle()
+
+    assert names_since(h, mark) == ["voice_decision:dropped"]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("no_speech", uid)
+    assert h.controller.phase == phase
+    assert h.responder.commits == []
+    assert h.ingress.calls == []
+    pause.release()
+
+
+@pytest.mark.parametrize("phase", ["thinking", "speaking"])
+async def test_utterance_dropped_of_unnamed_speech_in_a_voice_turn_sends_nothing(phase):
+    h, pause = await in_phase(phase)
+    uid = h.ids()
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "la la"))
+    await h.settle()
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.dropped(uid, "no_speech"))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.phase == phase
+    pause.release()
+
+
+# -- interrupt (UI stop), text and disconnect: the cells no earlier part tested -----------------
+
+
+async def test_ui_interrupt_in_idle_is_ignored():
+    h = make_harness()
+    h.start_voice()
+    await published(h, "hm")
+    mark = len(h.outbound.sent)
+
+    h.post(Interrupt())
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.phase == "idle"
+    assert h.ingress.calls == []
+
+
+@pytest.mark.parametrize("phase", ["thinking", "speaking"])
+async def test_text_message_in_a_voice_turn_cancels_and_commits_then_runs_a_text_turn(phase):
+    h, pause = await in_phase(phase)
+    voice = h.last_turn()
+
+    h.post(Text("typed"))
+    await h.settle()
+
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert (cancelled.turn_id, cancelled.reason) == (voice, "new_input")
+    assert h.responder.commits[0].outcome == "interrupted"
+    assert h.responder.log.index("commit:interrupted") < h.responder.log.index("open", 1)
+    assert [r.origin for r in h.responder.requests] == ["voice", "text"]
+    assert h.outbound.of("voice_decision:barge_in") == []
+    assert h.outbound.violations == []
+    pause.release()
+
+
+async def test_disconnect_in_idle_with_an_utterance_open_sends_nothing_and_calls_no_lever():
+    h = make_harness()
+    h.start_voice()
+    await published(h, "hm")
+    mark = len(h.outbound.sent)
+
+    await h.controller.close()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.ingress.calls == []
+    assert h.responder.commits == []
+
+
+@pytest.mark.parametrize("phase", TURN_PHASES)
+async def test_disconnect_in_a_turns_phase_commits_and_sends_nothing(phase):
+    h, pause, _uid = await with_open_utterance(phase, "hm")
+    mark = len(h.outbound.sent)
+
+    await h.controller.close()
+
+    assert h.outbound.sent[mark:] == []
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    pause.release()
+
+
+# -- The keyword verdict row (v2 :483) and its closing messages (v2 :624-632) -------------------
+
+
+async def test_keyword_in_idle_is_ignored_with_one_barge_in_ignored_idle_and_the_turn_starts():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await published(h, "stop the", "stop the music")
+
+    h.post(h.ingress.ended(uid, "stop the music"))
+    await h.settle()
+
+    (ignored,) = h.outbound.of("voice_decision:barge_in_ignored")
+    assert (ignored.turn_id, ignored.reason) == (None, "idle")
+    assert (ignored.detail.keyword, ignored.detail.text, ignored.detail.utterance_id) == (
+        "stop",
+        "stop the",
+        uid,
+    )
+    assert h.outbound.of("voice_decision:barge_in") == []
+    assert [r.user_text for r in h.responder.requests] == ["stop the music"]
+
+
+async def test_stop_keyword_ending_in_thinking_interrupts_with_no_turn_and_closes_dropped_keyword():
+    h, pause = await in_phase("thinking")
+    turn_id = h.last_turn()
+    uid = h.ids()
+
+    h.post(h.ingress.started(uid), h.ingress.ended(uid, "Stop."))
+    await h.settle()
+
+    assert decisions(h)[-2:] == [("barge_in", "keyword"), ("dropped", "keyword")]
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.turn_id, barge.detail.phase, barge.detail.utterance_id) == (
+        turn_id,
+        "thinking",
+        uid,
+    )
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.detail.utterance_id, dropped.detail.text) == (uid, "Stop.")
+    names = h.outbound.names()
+    assert names.index("stream_cancelled") < names.index("voice_decision:dropped")
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    assert len(h.responder.requests) == 1
+    assert h.outbound.of("transcription")[-1].utterance_id != uid
+    assert h.controller.phase == "idle"
+    pause.release()
+
+
+async def test_unnamed_speech_ending_in_thinking_without_a_keyword_changes_nothing():
+    h, pause = await in_phase("thinking")
+    uid = h.ids()
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(uid), h.ingress.ended(uid, "stop the music"))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.phase == "thinking"
+    pause.release()
+
+
+async def test_keyword_only_utterance_ending_in_speaking_gets_barge_in_then_dropped_keyword():
+    h, pause = await in_phase("speaking")
+    uid = h.ids()
+
+    h.post(h.ingress.started(uid), h.ingress.ended(uid, "stop"))
+    await h.settle()
+
+    assert decisions(h)[-2:] == [("barge_in", "keyword"), ("dropped", "keyword")]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert dropped.detail.utterance_id == uid
+    assert len(h.responder.requests) == 1
+    assert h.controller.phase == "idle"
+    pause.release()
+
+
+async def test_text_after_the_keyword_at_the_end_in_speaking_becomes_the_next_turn():
+    h = make_harness([Token("One two three. Four five. "), Pause()], [Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "speaking"
+    uid = h.ids()
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(uid), h.ingress.ended(uid, "Stop, what's the weather?"))
+    await h.settle()
+
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert h.responder.commits[0].outcome == "interrupted"
+    assert [r.user_text for r in h.responder.requests] == ["hello", "what's the weather?"]
+    transcription = h.outbound.of("transcription")[-1]
+    assert (transcription.text, transcription.utterance_id) == ("what's the weather?", uid)
+    names = names_since(h, mark)
+    assert subsequence(names, ["voice_decision:barge_in", "stream_cancelled", "transcription"])
+    assert h.outbound.violations == []
+
+
+async def test_a_partial_keyword_cut_in_speaking_then_an_end_in_idle_starts_the_remainder():
+    h = make_harness([Token("One two three. Four five. "), Pause()], [Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    uid = h.ids()
+
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "stop what"))
+    await h.settle()
+    assert h.controller.phase == "idle"
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert barge.detail.utterance_id == uid
+    mark = len(h.outbound.sent)
+
+    # The barge-in published it: its later partials show, and its keyword is not judged again.
+    h.post(h.ingress.partial(uid, "stop what time"), h.ingress.ended(uid, "Stop. What time is it?"))
+    await h.settle()
+
+    assert names_since(h, mark)[0] == "transcript_partial"
+    assert h.outbound.of("voice_decision:barge_in_ignored") == []
+    transcription = h.outbound.of("transcription")[-1]
+    assert (transcription.text, transcription.utterance_id) == ("What time is it?", uid)
+    assert [r.user_text for r in h.responder.requests] == ["hello", "What time is it?"]
+
+
+async def test_a_partial_keyword_cut_with_nothing_after_it_ends_in_idle_as_dropped_keyword():
+    h, pause = await in_phase("speaking")
+    uid = h.ids()
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "stop"))
+    await h.settle()
+    assert h.controller.phase == "idle"
+
+    h.post(h.ingress.ended(uid, "Stop."))
+    await h.settle()
+
+    assert decisions(h)[-1] == ("dropped", "keyword")
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.detail.utterance_id, dropped.detail.text) == (uid, "Stop.")
+    assert len(h.responder.requests) == 1
+    assert h.outbound.of("transcription")[-1].utterance_id != uid
+    pause.release()
+
+
+async def test_a_keyword_cut_with_nothing_after_it_ending_in_text_leaves_the_typed_turn_going():
+    h = make_harness([Token("One two three. Four five. "), Pause()], [Token("Typed. "), Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    uid = h.ids()
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "stop"))
+    await h.settle()
+    h.post(Text("typed"))
+    await h.settle()
+    assert h.controller.phase == "text"
+
+    h.post(h.ingress.ended(uid, "stop"))
+    await h.settle()
+
+    assert decisions(h)[-1] == ("dropped", "keyword")
+    assert h.controller.phase == "text"
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    assert len(h.responder.requests) == 2
+
+
+async def test_keyword_in_text_does_not_consult_the_policy():
+    h, pause = await in_phase("text")
+    consulted: list[str] = []
+
+    class Spy:
+        def __getattr__(self, name):
+            consulted.append(name)
+            return getattr(h.policy, name)
+
+    h.controller._policy = Spy()  # the policy VoiceStart adopted, watched
+    uid = h.ids()
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "stop"), h.ingress.ended(uid, "stop"))
+    await h.settle()
+
+    assert consulted == []
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.phase == "text"
+    pause.release()
+
+
+# -- Endpoint barge-in reports: an ignored verdict names no utterance (v2 :1844-1847) -----------
+
+
+async def test_an_endpoint_report_before_the_arm_delay_is_ignored_not_armed():
+    h = make_harness(
+        [Token("One two three. Four five. "), Pause()], barge_in=BargeInConfig(arm_delay_ms=5000)
+    )
+    h.start_voice()
+    await h.speak("hello")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "speaking"
+
+    h.post(BargeInReport(turn_id=turn_id, keyword="Stop"))
+    await h.settle()
+
+    (ignored,) = h.outbound.of("voice_decision:barge_in_ignored")
+    assert (ignored.turn_id, ignored.reason) == (turn_id, "not_armed")
+    assert (ignored.detail.keyword, ignored.detail.text, ignored.detail.utterance_id) == (
+        "stop",
+        "",
+        None,
+    )
+    assert h.responder.commits == []
+    assert h.controller.phase == "speaking"
+
+
+async def test_an_endpoint_report_for_an_ended_turn_is_ignored_stale_turn_and_counted():
+    h = make_harness([Token("One. ")], [Token("Two. Three. "), Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    first = h.last_turn()
+    h.post(PlaybackDone(turn_id=first, played_ms=1))
+    await h.speak("again")
+    assert h.controller.phase == "speaking"
+    stale = h.controller.stale_events
+
+    h.post(BargeInReport(turn_id=first, keyword="stop"))
+    await h.settle()
+
+    (ignored,) = h.outbound.of("voice_decision:barge_in_ignored")
+    assert (ignored.turn_id, ignored.reason, ignored.detail.utterance_id) == (
+        first,
+        "stale_turn",
+        None,
+    )
+    assert h.controller.stale_events == stale + 1
+    assert [c.outcome for c in h.responder.commits] == ["completed"]
+
+
+# -- Test strategy's variants (v2 :1117-1130) that v5 keeps ----------------------------------------
+# The `ptt` variants went with the `ptt` rows (v5 :1179, :1664-1666). The `voice_stop` variants in
+# idle and held are part 1's and part 2's; these are the other three phases.
+
+
+@pytest.mark.parametrize("phase", TURN_PHASES)
+async def test_voice_stop_with_an_utterance_open_closes_it_dropped_voice_stop(phase):
+    h, pause, uid = await with_open_utterance(phase, "turn the")
+
+    h.post(VoiceStop())
+    await h.settle()
+
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id, dropped.detail.text) == (
+        "voice_stop",
+        uid,
+        "turn the",
+    )
+    assert calls(h.ingress, "close") == [("close",)]
+    if phase == "text":
+        assert decisions(h) == [("dropped", "voice_stop")]
+        pause.release()
+        await h.settle()
+        assert h.responder.commits[-1].outcome == "completed"
+    else:
+        assert decisions(h)[-2:] == [("barge_in", "voice_stop"), ("dropped", "voice_stop")]
+        assert h.responder.commits[-1].outcome == "interrupted"
+        pause.release()
+
+
+async def test_reconfigure_in_idle_with_one_pending_refuses_the_first_as_superseded():
+    h = make_harness()
+    h.start_voice()
+    uid = await published(h, "hm")
+    h.host.apply_result = new_start(h)
+    first, second = request(2), request(3)
+
+    h.post(first, second)
+    await h.settle()
+    assert h.host.calls == [("refuse", first, "superseded")]
+
+    h.post(h.ingress.dropped(uid, "noise"))
+    await h.settle()
+    assert h.host.calls[1][:2] == ("apply", second)
+
+
+async def test_reconfigure_in_idle_carrying_a_refusal_is_refused_at_once():
+    h = make_harness()
+    h.start_voice()
+    req = request(refusal="unavailable")
+
+    h.post(req)
+    await h.settle()
+
+    assert h.host.calls == [("refuse", req, "unavailable")]
+    assert calls(h.ingress, "close") == []
