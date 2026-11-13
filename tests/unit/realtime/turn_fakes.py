@@ -5,7 +5,9 @@ does not start with `test_`, so pytest does not collect it. Each test file impor
 
 - `FakeClock`: the session clock, which moves only when a test calls `advance`.
 - `IdCounter`: the one utterance id source the fake ingress and the controller share (v4).
-- `InlineLane`: a TTS lane that runs each job on the event loop, so synthesis is deterministic.
+- `InlineLane`: a TTS lane that runs each job on the event loop, so synthesis is deterministic;
+  a test can hold its jobs back until it opens it.
+- `FailingSynthesizer`: a `FakeSynthesizer` that fails one call, at once or after some chunks.
 - `RecordingOutbound`: the recording transport. It models the `turn` lane's queue and purge with
   the real `TurnLane`, and a sender that takes `control` before `turn`, either at once
   (`auto_take`) or when the test says so. What the sender took is the client-facing record. It
@@ -26,7 +28,7 @@ import asyncio
 import contextlib
 import heapq
 import itertools
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 from backend.chat.stream_events import StreamEvent, Token, WSEvent
@@ -41,6 +43,7 @@ from backend.realtime.budget import (
     TurnConfig,
     WakeConfig,
 )
+from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
     EndpointCandidate,
     IngressOverload,
@@ -55,7 +58,7 @@ from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.playback import LanePurge, TurnLane
 from backend.realtime.protocol import Frame, MsgType, VoiceStartMessage
 from backend.realtime.scene import SceneAnchor
-from backend.realtime.speech import CancelToken
+from backend.realtime.speech import CancelToken, SynthChunk, TextSegment
 from backend.realtime.turn import (
     Reconfigure,
     TurnController,
@@ -122,19 +125,62 @@ class IdCounter:
 
 
 class InlineLane:
-    """A lane that runs each job inline on the loop; a set token fails it as the real lane does."""
+    """A lane that runs each job inline on the loop; a set token fails it as the real lane does.
+
+    `hold()` makes every later job wait until `open()`, as a busy TTS lane would, so a test can
+    queue a turn's tokens before any of their audio exists.
+    """
 
     def __init__(self) -> None:
         self.jobs = 0
+        self._gate: asyncio.Event | None = None
+
+    def hold(self) -> None:
+        self._gate = asyncio.Event()
+
+    def open(self) -> None:
+        if self._gate is not None:
+            self._gate.set()
+            self._gate = None
 
     async def run(self, fn: Callable[..., object], *args: object, token: CancelToken) -> object:
         if token.is_set():
             raise LaneJobCancelled("token set before the job ran")
         self.jobs += 1
         await asyncio.sleep(0)
+        while self._gate is not None:
+            await self._gate.wait()
         if token.is_set():
             raise LaneJobCancelled("token set while the job waited")
         return fn(*args)
+
+
+class FailingSynthesizer(FakeSynthesizer):
+    """A `FakeSynthesizer` whose `fail_call`-th `synthesize` (0-based) fails.
+
+    With `after_chunks` 0 the call itself raises; otherwise its iterator yields that many
+    chunks and then raises, as an engine failing mid-segment does.
+    """
+
+    def __init__(self, *, fail_call: int = 0, after_chunks: int = 0, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.fail_call = fail_call
+        self.after_chunks = after_chunks
+        self.calls = 0
+
+    def synthesize(self, segment: TextSegment, token: CancelToken) -> Iterator[SynthChunk]:
+        call = self.calls
+        self.calls += 1
+        if call != self.fail_call:
+            return super().synthesize(segment, token)
+        if self.after_chunks == 0:
+            raise SpeechEngineError("fake synthesis failure")
+        return self._failing(super().synthesize(segment, token))
+
+    def _failing(self, chunks: Iterator[SynthChunk]) -> Iterator[SynthChunk]:
+        for _ in range(self.after_chunks):
+            yield next(chunks)
+        raise SpeechEngineError("fake synthesis failure")
 
 
 # -- The recording transport -----------------------------------------------------
@@ -235,6 +281,16 @@ class RecordingOutbound:
                 return
             self.client.append(item)
 
+    def take_until(self, done: Callable[[object], bool]) -> None:
+        """Take items one at a time until one that `done` accepts has been taken."""
+        while True:
+            before = len(self.client)
+            self.take()
+            if len(self.client) == before:
+                raise AssertionError("the lanes ran empty before the awaited item was taken")
+            if done(self.client[-1]):
+                return
+
     def take_all(self) -> None:
         while True:
             if self.control:
@@ -254,6 +310,10 @@ class RecordingOutbound:
 
     def turn_ids(self) -> list[str]:
         return [item.turn_id for item in self.of("stream_start")]
+
+    def queued_turn_ids(self) -> list[str]:
+        """Every turn whose `stream_start` was queued, taken by the sender or not."""
+        return [s.item.turn_id for s in self.sent if describe(s.item) == "stream_start"]
 
     def tokens(self, turn_id: str | None = None) -> list[str]:
         return [
@@ -653,6 +713,12 @@ class Harness:
     ids: IdCounter
     policy: KeywordBargeIn
     kwargs: dict[str, object]
+
+    @property
+    def lane(self) -> InlineLane:
+        lane = self.kwargs["tts_lane"]
+        assert isinstance(lane, InlineLane)
+        return lane
 
     def post(self, *messages: object) -> None:
         for message in messages:
