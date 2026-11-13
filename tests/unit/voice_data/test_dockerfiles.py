@@ -21,9 +21,11 @@ CODE_COPIES = [
     "COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/",
     "COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/",
 ]
-# `images build` tags the base `mist-voice-base:<first 12 hex>` and passes only GIT_SHA, so a
-# family Dockerfile trims the 40-hex sha to 12 by removing its last 28 characters.
-BASE_TAG_DEFAULT = "ARG BASE_IMAGE=mist-voice-base:${GIT_SHA%" + "?" * 28 + "}"
+BASE_DIGEST = (
+    "docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04@sha256:"
+    "17e2934e1fa96152b14f78078bfbafd0f00f391df995dc6c641a720fce1202bb"
+)
+SCORE_CODE_CHECK = "/opt/venv-score/bin/python -I -c 'import scripts.voice_data'"
 REQUIREMENT_LINE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.+!-]+"
     r"|[A-Za-z0-9][A-Za-z0-9._-]* @ git\+https://[^\s@]+@[0-9a-f]{40}"
@@ -70,10 +72,31 @@ def test_every_image_has_a_dockerfile_and_no_other_exists() -> None:
 
 def test_base_is_pinned_by_digest() -> None:
     from_lines = [i for i in instructions(DOCKER_DIR / "base.Dockerfile") if i.startswith("FROM ")]
-    assert from_lines == [
-        "FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04@sha256:"
-        "17e2934e1fa96152b14f78078bfbafd0f00f391df995dc6c641a720fce1202bb"
-    ]
+    assert from_lines == [f"FROM {BASE_DIGEST} AS runtime", "FROM runtime"]
+
+
+def test_base_runtime_stage_holds_no_code_and_no_sha() -> None:
+    # The family images build on the `runtime` stage, so a new commit must change nothing in it:
+    # otherwise every family venv is reinstalled for each sha.
+    steps = instructions(DOCKER_DIR / "base.Dockerfile")
+    runtime = steps[: steps.index("FROM runtime")]
+    assert runtime[0] == f"FROM {BASE_DIGEST} AS runtime"
+    assert runtime[-1] == 'CMD ["/usr/local/bin/remote-entry.sh"]'
+    pth = "/opt/venv-score/lib/python3.11/site-packages/mist-voice-code.pth"
+    assert f"RUN printf '%s\\n' /opt/mist-voice/code > {pth}" in runtime
+    for step in runtime:
+        assert "GIT_SHA" not in step, step
+        assert not step.startswith("COPY scripts/"), step
+
+
+def test_base_code_stage_is_record_code_and_check() -> None:
+    steps = instructions(DOCKER_DIR / "base.Dockerfile")
+    code = steps[steps.index("FROM runtime") :]
+    assert len(code) == 6
+    assert code[:2] == ["FROM runtime", "ARG GIT_SHA"]
+    assert "/etc/mist-voice-image.json" in code[2]
+    assert code[3:5] == CODE_COPIES
+    assert code[5].startswith("RUN /opt/venv-score/bin/python -I -c ")
 
 
 def test_base_holds_python_tools_sshd_and_the_entry() -> None:
@@ -93,10 +116,24 @@ def test_base_holds_python_tools_sshd_and_the_entry() -> None:
     assert 'CMD ["/usr/local/bin/remote-entry.sh"]' in text
 
 
-@pytest.mark.parametrize("name", [n for n in DOCKERFILES if n != "base.Dockerfile"])
-def test_family_is_from_the_base_of_the_same_sha(name: str) -> None:
+FAMILY_DOCKERFILES = [n for n in DOCKERFILES if n != "base.Dockerfile"]
+
+
+@pytest.mark.parametrize("name", FAMILY_DOCKERFILES)
+def test_family_is_from_a_required_base_image_arg(name: str) -> None:
+    # `images build` passes BASE_IMAGE=mist-voice-runtime:<sha12>; there is no default, so a
+    # build without it fails rather than picking up some other tag.
     steps = instructions(DOCKER_DIR / name)
-    assert steps[:3] == ["ARG GIT_SHA", BASE_TAG_DEFAULT, "FROM ${BASE_IMAGE}"]
+    assert steps[:2] == ["ARG BASE_IMAGE", "FROM ${BASE_IMAGE}"]
+    assert [s for s in steps if s.startswith("FROM ")] == ["FROM ${BASE_IMAGE}"]
+
+
+@pytest.mark.parametrize("name", FAMILY_DOCKERFILES)
+def test_family_checks_the_code_from_the_score_venv(name: str) -> None:
+    # The runtime stage's score venv names /opt/mist-voice/code, which only the family's own
+    # code layer fills, so each family image checks that the score venv imports it too.
+    final = instructions(DOCKER_DIR / name)[-1]
+    assert final.endswith(f" && {SCORE_CODE_CHECK}"), final
 
 
 @pytest.mark.parametrize("name", DOCKERFILES)
@@ -115,14 +152,19 @@ def test_dockerfile_rules(name: str) -> None:
             assert not any("://" in s for s in sources), step
     copies = [s for s in steps if s.startswith(("COPY ", "ADD "))]
     assert copies[-2:] == CODE_COPIES
-    tail = steps[steps.index(CODE_COPIES[0]) :]
+    # Only the last five steps change with the commit: the sha, the record, the code and the check.
+    tail = steps[-5:]
+    assert tail[0] == "ARG GIT_SHA"
+    assert tail[2:4] == CODE_COPIES
+    for step in steps[:-5]:
+        assert "GIT_SHA" not in step, step
     pth = f"{venv}/lib/python3.11/site-packages/mist-voice-code.pth"
-    assert f"RUN printf '%s\\n' /opt/mist-voice/code > {pth}" in tail
+    assert f"RUN printf '%s\\n' /opt/mist-voice/code > {pth}" in steps[:-5]
     final = steps[-1]
     assert final.startswith(f"RUN {venv}/bin/python -I -c "), final
     assert "scripts.voice_data" in final
     record = [s for s in steps if "/etc/mist-voice-image.json" in s]
-    assert len(record) == 1 and record[0].startswith("RUN ")
+    assert record == [tail[1]] and record[0].startswith("RUN ")
     assert record[0].endswith(f' {family} "$GIT_SHA"')
     assert 'test -n "$GIT_SHA"' in record[0]
 

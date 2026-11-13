@@ -39,6 +39,7 @@ CONTROL_KINDS = {"emotion-ref", "instruction", "inline-tag", "scene-description"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 REQUIREMENTS_COPY = re.compile(r"^COPY docker/voice-data/(requirements-[\w-]+\.txt) ", re.M)
+CHECKOUT_REF = re.compile(r"\bcheckout --detach (\S+)")
 
 
 def load() -> dict:
@@ -84,6 +85,21 @@ def test_dockerfile_creates_the_venv_from_its_requirements(key: str) -> None:
     assert len(copied) == 1, f"{dockerfile.name} copies {copied}"
     assert (DOCKER_DIR / copied[0]).is_file()
     assert f"{family['venv']}/bin/pip install --no-cache-dir -r" in text
+
+
+def test_upstream_code_is_pinned_by_commit() -> None:
+    # A tag can be moved upstream; a commit id cannot, so every clone and training ref is one.
+    refs = [
+        (path.name, ref)
+        for path in sorted(DOCKER_DIR.glob("*.Dockerfile"))
+        for ref in CHECKOUT_REF.findall(path.read_text(encoding="utf-8"))
+    ]
+    refs += [
+        (key, family["training"]["ref"]) for key, family in FAMILIES.items() if "training" in family
+    ]
+    assert refs
+    for where, ref in refs:
+        assert HEX40.fullmatch(ref), f"{where}: {ref}"
 
 
 def models() -> list[tuple[str, str, dict]]:

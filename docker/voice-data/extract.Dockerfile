@@ -1,16 +1,17 @@
 # mist-voice-extract: separation, dereverb, enhancement, diarization, ASR and forced alignment.
 #
-# FROM the base image of the same commit: `images build` tags it mist-voice-base:<first 12 hex>
-# and passes only GIT_SHA, so BASE_IMAGE drops the last 28 characters of the 40-hex sha.
+# FROM the code-free `runtime` stage of base.Dockerfile: `images build` tags it
+# mist-voice-runtime:<first 12 hex> and passes it as BASE_IMAGE, so a new commit reuses the
+# venv layers below and rebuilds only the last four steps.
 # Upstream code bases that are not pip-installable are cloned at their pinned commits under
 # /opt/mist-voice/upstream/.
-ARG GIT_SHA
-ARG BASE_IMAGE=mist-voice-base:${GIT_SHA%????????????????????????????}
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 COPY docker/voice-data/requirements-extract.txt /opt/mist-voice/requirements/requirements-extract.txt
 RUN python3.11 -m venv /opt/venv-extract \
  && /opt/venv-extract/bin/pip install --no-cache-dir -r /opt/mist-voice/requirements/requirements-extract.txt
+RUN printf '%s\n' /opt/mist-voice/code > /opt/venv-extract/lib/python3.11/site-packages/mist-voice-code.pth
 
 RUN git clone --filter=blob:none https://github.com/JusperLee/TIGER /opt/mist-voice/upstream/TIGER \
  && git -C /opt/mist-voice/upstream/TIGER checkout --detach 9f18d4a10a7137e1ce8052cfb62215179f1287b6 \
@@ -27,5 +28,5 @@ RUN test -n "$GIT_SHA" \
 
 COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/
 COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/
-RUN printf '%s\n' /opt/mist-voice/code > /opt/venv-extract/lib/python3.11/site-packages/mist-voice-code.pth
-RUN /opt/venv-extract/bin/python -I -c 'import torch, torchaudio, torchvision, torchcodec, whisperx, pyannote.audio, faster_whisper, ctranslate2, silero_vad, transformers, accelerate, huggingface_hub, numpy, pandas, nltk, omegaconf, scipy, librosa, soundfile, safetensors, einops, beartype, rotary_embedding_torch, ml_collections, yaml, scripts.voice_data'
+RUN /opt/venv-extract/bin/python -I -c 'import torch, torchaudio, torchvision, torchcodec, whisperx, pyannote.audio, faster_whisper, ctranslate2, silero_vad, transformers, accelerate, huggingface_hub, numpy, pandas, nltk, omegaconf, scipy, librosa, soundfile, safetensors, einops, beartype, rotary_embedding_torch, ml_collections, yaml, scripts.voice_data' \
+ && /opt/venv-score/bin/python -I -c 'import scripts.voice_data'

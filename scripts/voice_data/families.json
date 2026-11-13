@@ -46,7 +46,7 @@
         "neutral": {"control": "emotion-ref", "value": "no emo_audio_prompt (speaker prompt is the emotion source)", "verified": true},
         "calm": {"control": "emotion-ref", "value": "emo_audio_prompt=<calm reference clip>", "verified": false},
         "awake": {"control": "emotion-ref", "value": "emo_audio_prompt=<awake reference clip>", "verified": false},
-        "sleepy": {"control": "emotion-ref", "value": "emo_audio_prompt=<sleepy reference clip, \u0045xpresso if the seed lacks one>", "verified": false},
+        "sleepy": {"control": "emotion-ref", "value": "emo_audio_prompt=<sleepy reference clip, a public expressive-speech clip if the seed lacks one>", "verified": false},
         "excited": {"control": "emotion-ref", "value": "emo_audio_prompt=<excited reference clip>", "verified": false}
       }
     },
@@ -153,7 +153,7 @@
       },
       "training": {
         "repo": "https://github.com/OHF-Voice/piper1-gpl",
-        "ref": "v1.8.0",
+        "ref": "639388b6317fc4731e91d53da42aea68fd4166ff",
         "entry": "python3 -m piper.train fit --data.voice_name --data.csv_path --data.audio_dir --model.sample_rate 22050 --data.espeak_voice --data.cache_dir --data.config_path --data.batch_size --ckpt_path (resume full state) or --model.warmstart_ckpt (weights only); multi-speaker: CSV audio|speaker|text and --model.num_speakers; export: python3 -m piper.train.export_onnx --checkpoint <ckpt> --output-file <onnx>",
         "base_checkpoint": {"repository": "rhasspy/piper-checkpoints", "revision": "bdc5227d7ac52bf910388a25364266a92eb37689", "repo_type": "dataset", "path": "en/en_US/lessac/medium/epoch=2164-step=1355540.ckpt"}
       }

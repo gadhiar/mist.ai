@@ -22,6 +22,10 @@ from .jobs import DockerOps, load_families
 COMPONENTS = ("scripts/voice_data", "scripts/model_bench", "docker/voice-data")
 IMAGE_PREFIX = "mist-voice-"
 BASE_IMAGE = "mist-voice-base"
+# The code-free `runtime` stage of base.Dockerfile. The family images build on it rather than on
+# the base image, whose last layers change with every commit, so their venv layers stay cached.
+RUNTIME_IMAGE = "mist-voice-runtime"
+RUNTIME_TARGET = "runtime"
 
 
 def resolve_commit(checkout: Path, sha: str) -> str:
@@ -82,26 +86,40 @@ def images_for(families: Mapping[str, Mapping[str, object]], family: str) -> lis
     return [BASE_IMAGE, *rest]  # type: ignore[list-item]
 
 
-def build_argv(context: Path, image: str, commit: str) -> list[str]:
-    """Return the `docker build` argv for one image from the exported context."""
-    dockerfile = (
-        context / "docker" / "voice-data" / f"{image.removeprefix(IMAGE_PREFIX)}.Dockerfile"
-    )
+def _dockerfile(context: Path, image: str) -> Path:
+    return context / "docker" / "voice-data" / f"{image.removeprefix(IMAGE_PREFIX)}.Dockerfile"
+
+
+def runtime_argv(context: Path, commit: str) -> list[str]:
+    """Return the `docker build` argv for the `runtime` stage, which takes no build arg."""
     return [
         "docker",
         "build",
         "-f",
-        str(dockerfile),
-        "--build-arg",
-        f"GIT_SHA={commit}",
+        str(_dockerfile(context, BASE_IMAGE)),
+        "--target",
+        RUNTIME_TARGET,
         "-t",
-        f"{image}:{commit[:12]}",
+        f"{RUNTIME_IMAGE}:{commit[:12]}",
         str(context),
     ]
 
 
+def build_argv(context: Path, image: str, commit: str) -> list[str]:
+    """Return the `docker build` argv for one image from the exported context.
+
+    A family image also gets `BASE_IMAGE`, the runtime tag of the same commit; its Dockerfile
+    declares the arg without a default, so it cannot build on a tag from another commit.
+    """
+    argv = ["docker", "build", "-f", str(_dockerfile(context, image))]
+    argv += ["--build-arg", f"GIT_SHA={commit}"]
+    if image != BASE_IMAGE:
+        argv += ["--build-arg", f"BASE_IMAGE={RUNTIME_IMAGE}:{commit[:12]}"]
+    return [*argv, "-t", f"{image}:{commit[:12]}", str(context)]
+
+
 def build(checkout: Path, sha: str, family: str, docker: DockerOps) -> list[str]:
-    """Build the images for `family` (or `all`) at commit `sha` and return their tags.
+    """Build the runtime stage, then the images for `family` (or `all`) at `sha`; return the tags.
 
     The family list comes from the exported tree's `families.json`, so it is the one at that
     commit. The temporary context is removed afterwards, whether the builds pass or fail.
@@ -115,8 +133,10 @@ def build(checkout: Path, sha: str, family: str, docker: DockerOps) -> list[str]
     try:
         export_tree(checkout, commit, context)
         families = load_families(context / "scripts" / "voice_data" / "families.json")
-        tags: list[str] = []
-        for image in images_for(families, family):
+        images = images_for(families, family)
+        docker.check(runtime_argv(context, commit))
+        tags = [f"{RUNTIME_IMAGE}:{commit[:12]}"]
+        for image in images:
             docker.check(build_argv(context, image, commit))
             tags.append(f"{image}:{commit[:12]}")
         return tags
