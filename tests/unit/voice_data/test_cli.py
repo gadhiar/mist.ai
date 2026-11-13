@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -203,6 +205,7 @@ def test_doctor_fails_without_docker(private_root: root_mod.Root, empty_path: st
     result = _run(["doctor"], env)
     assert result.returncode == 2
     assert "docker: missing" in result.stdout.splitlines()
+    assert "images: not checked (docker missing)" in result.stdout.splitlines()
 
 
 def test_doctor_fails_without_marker(tmp_path: Path, fake_docker: str) -> None:
@@ -219,6 +222,144 @@ def test_doctor_reports_unset_root(fake_docker: str) -> None:
     lines = result.stdout.splitlines()
     assert "MIST_VOICE_PRIVATE_ROOT: unset" in lines
     assert "root: unset" in lines
+
+
+# --- doctor: local images against HEAD ------------------------------------------------------
+
+HEAD = "0123456789abcdef0123456789abcdef01234567"
+IMAGE_FAMILIES = {
+    "schema": 1,
+    "families": {
+        "score": {"image": "mist-voice-base", "venv": "/opt/venv-score"},
+        "extract": {"image": "mist-voice-extract", "venv": "/opt/venv-extract"},
+        "teacher-elevenlabs": {"image": None, "venv": None, "hosted": True},
+    },
+}
+REQUIREMENTS = {
+    "requirements-score.txt": "numpy==2.1.0\n",
+    "requirements-extract.txt": "torch==2.6.0\n",
+}
+
+
+class FakeProbe:
+    """The doctor's git and docker seam: HEAD's sha and each present image's record text."""
+
+    def __init__(self, head: str | None, records: dict[str, str]) -> None:
+        self._head = head
+        self._records = records
+        self.asked: list[str] = []
+
+    def head(self) -> str | None:
+        return self._head
+
+    def record(self, tag: str) -> str | None:
+        self.asked.append(tag)
+        return self._records.get(tag)
+
+
+@pytest.fixture
+def checkout(tmp_path: Path) -> Path:
+    """A checkout holding `families.json` and the requirements files the records name."""
+    path = tmp_path / "checkout"
+    (path / "scripts" / "voice_data").mkdir(parents=True)
+    (path / "scripts" / "voice_data" / "families.json").write_text(
+        json.dumps(IMAGE_FAMILIES), encoding="utf-8"
+    )
+    (path / "docker" / "voice-data").mkdir(parents=True)
+    for name, text in REQUIREMENTS.items():
+        (path / "docker" / "voice-data" / name).write_text(text, encoding="utf-8")
+    return path
+
+
+def _record(family: str, git_sha: str, names: tuple[str, ...], **override: str) -> str:
+    digests = {
+        name: hashlib.sha256(REQUIREMENTS[name].encode("utf-8")).hexdigest() for name in names
+    }
+    digests.update(override)
+    return json.dumps({"family": family, "git_sha": git_sha, "requirements": digests})
+
+
+def _current_records() -> dict[str, str]:
+    return {
+        f"mist-voice-base:{HEAD[:12]}": _record("score", HEAD, ("requirements-score.txt",)),
+        f"mist-voice-extract:{HEAD[:12]}": _record(
+            "extract", HEAD, ("requirements-score.txt", "requirements-extract.txt")
+        ),
+    }
+
+
+def test_doctor_images_ok(checkout: Path) -> None:
+    probe = FakeProbe(HEAD, _current_records())
+    assert doctor.image_lines(probe, checkout) == [
+        "image mist-voice-base: ok",
+        "image mist-voice-extract: ok",
+    ]
+    assert probe.asked == [f"mist-voice-base:{HEAD[:12]}", f"mist-voice-extract:{HEAD[:12]}"]
+
+
+def test_doctor_images_missing(checkout: Path) -> None:
+    records = _current_records()
+    del records[f"mist-voice-extract:{HEAD[:12]}"]
+    assert doctor.image_lines(FakeProbe(HEAD, records), checkout) == [
+        "image mist-voice-base: ok",
+        "image mist-voice-extract: missing",
+    ]
+
+
+def test_doctor_images_stale(checkout: Path) -> None:
+    other = "f" * 40
+    records = {
+        f"mist-voice-base:{HEAD[:12]}": _record("score", other, ("requirements-score.txt",)),
+        f"mist-voice-extract:{HEAD[:12]}": _record(
+            "extract",
+            HEAD,
+            ("requirements-score.txt", "requirements-extract.txt"),
+            **{"requirements-extract.txt": "0" * 64, "requirements-gone.txt": "1" * 64},
+        ),
+    }
+    assert doctor.image_lines(FakeProbe(HEAD, records), checkout) == [
+        "image mist-voice-base: stale (git sha)",
+        "image mist-voice-extract: stale (requirements-extract.txt, requirements-gone.txt)",
+    ]
+
+
+def test_doctor_images_stale_on_an_unreadable_record(checkout: Path) -> None:
+    records = _current_records()
+    records[f"mist-voice-base:{HEAD[:12]}"] = ""
+    records[f"mist-voice-extract:{HEAD[:12]}"] = _record(
+        "extract", HEAD, (), **{"../../outside.txt": "0" * 64}
+    )
+    assert doctor.image_lines(FakeProbe(HEAD, records), checkout) == [
+        "image mist-voice-base: stale (no readable record)",
+        "image mist-voice-extract: stale (requirements)",
+    ]
+
+
+def test_doctor_images_without_git(checkout: Path) -> None:
+    probe = FakeProbe(None, _current_records())
+    assert doctor.image_lines(probe, checkout) == ["images: not checked (no git HEAD)"]
+    assert probe.asked == []
+
+
+def test_doctor_image_warnings_keep_the_exit_code(
+    private_root: root_mod.Root,
+    checkout: Path,
+    fake_docker: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    canaries,
+    assert_no_canary: Callable[[str], None],
+) -> None:
+    # Images are built after merge, so a missing or stale one is a warning, not a failure.
+    monkeypatch.setenv("PATH", fake_docker + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(doctor, "CHECKOUT", checkout)
+    monkeypatch.setattr(doctor, "make_probe", lambda path: FakeProbe(HEAD, {}))
+    assert cli.main(["--root", str(private_root.path), "doctor"]) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert "image mist-voice-base: missing" in lines
+    assert "image mist-voice-extract: missing" in lines
+    assert_no_canary(captured.out + captured.err)
 
 
 @pytest.mark.parametrize(
