@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import stat
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -47,12 +47,17 @@ def _run(args: list[str], env_extra: dict[str, str] | None = None, path_prefix: 
 
 @pytest.fixture
 def fake_docker(tmp_path: Path) -> str:
-    """A directory holding an executable named `docker`, for PATH."""
+    """A directory holding `docker`, a symlink to `true`, for PATH.
+
+    Nothing written under tmp is executed: the link resolves to the system's `true`, so the
+    fixture works where /tmp is mounted noexec.
+    """
+    true = shutil.which("true")
+    if true is None:
+        pytest.skip("no `true` on PATH")
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir()
-    docker = bin_dir / "docker"
-    docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    docker.chmod(docker.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    (bin_dir / "docker").symlink_to(true)
     return str(bin_dir)
 
 

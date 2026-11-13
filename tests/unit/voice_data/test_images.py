@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from scripts.voice_data import cli, images
+from scripts.voice_data.commands import images as images_cmd
 from scripts.voice_data.errors import InputError, JobError
 
 FAMILIES = {
@@ -229,6 +230,25 @@ def test_unknown_family_exits_2(repo) -> None:
         images.build(path, sha, "nosuch", docker)
     assert cli.exit_code(caught.value) == 2
     assert docker.calls == []
+
+
+def test_images_build_passes_and_prints_no_key_value(
+    repo, monkeypatch, capsys, canaries, assert_no_canary
+) -> None:
+    # Privacy canary (Test strategy): the key value planted in every key env var reaches no
+    # docker argv and no console output.
+    path, sha = repo
+    assert os.environ["HF_TOKEN"] == canaries.key
+    docker = FakeDocker()
+    monkeypatch.setattr(images_cmd, "HostDocker", lambda: docker)
+    argv = ["images", "build", "--family", "all", "--sha", sha, "--checkout", str(path)]
+    assert cli.main(argv) == 0
+    assert len(docker.calls) == 4
+    for call in docker.calls:
+        assert_no_canary("\n".join(call))
+    captured = capsys.readouterr()
+    assert f"built mist-voice-extract:{sha[:12]}" in captured.out
+    assert_no_canary(captured.out + captured.err)
 
 
 def test_unknown_sha_exits_2_through_the_cli(repo, capsys) -> None:
