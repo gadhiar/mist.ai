@@ -12,6 +12,7 @@ speech onset falls on a window boundary and its position is exact.
 import asyncio
 import itertools
 import logging
+import typing
 from collections.abc import AsyncIterator, Callable, Sequence
 
 import numpy as np
@@ -22,6 +23,8 @@ from backend.realtime.budget import EndpointingConfig, TurnConfig, WakeConfig
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
     AudioIngress,
+    ControllerDropReason,
+    DropReason,
     EndpointCandidate,
     IngressEngines,
     IngressLanes,
@@ -1522,6 +1525,239 @@ class TestMute:
         await rig.speak(640)
 
         assert len(rig.of(SpeechStarted)) == 1
+
+
+def events_after(rig: Rig, event: object) -> list:
+    return rig.events[rig.events.index(event) + 1 :]
+
+
+class TestMuteClosesTheUtterance:
+    """A mute closes the open utterance inside ingress and emits its drop (ruling of 12 Nov).
+
+    The emitted drop is the controller's signal, so it needs no mute-specific close of its own,
+    and audio from before the mute can never reach an utterance or a name opened after it.
+    """
+
+    def test_muted_is_an_ingress_reason_and_the_controllers_reasons_are_unchanged(self):
+        assert "muted" in typing.get_args(DropReason)
+        assert typing.get_args(ControllerDropReason) == ("text_input", "wake_lost", "not_addressed")
+
+    @pytest.mark.asyncio
+    async def test_mute_emits_one_drop_with_the_last_partial_and_the_next_event_seq(self):
+        rig = Rig()
+        await rig.quiet(640)
+        await rig.speak(640)
+        started = rig.of(SpeechStarted)[0]
+        partial = rig.of(TranscriptPartial)[-1]
+        last_seq = rig.events[-1].event_seq
+
+        rig.ingress.set_muted(True)
+
+        (dropped,) = rig.of(UtteranceDropped)
+        assert dropped == UtteranceDropped(
+            epoch=3,
+            event_seq=last_seq + 1,
+            utterance_id=started.utterance_id,
+            first_pos=started.first_pos,
+            reason="muted",
+            text=partial.text,
+            duration_ms=(rig.pos - started.first_pos) * FRAME_MS,
+            no_speech_prob=None,
+            avg_logprob=None,
+        )
+        assert rig.events[-1] is dropped
+        assert [event.event_seq for event in rig.events] == list(range(1, len(rig.events) + 1))
+        assert rig.ingress.idle_since() == dropped.event_seq
+        assert rig.transcriber.streams[0].closed
+
+    @pytest.mark.asyncio
+    async def test_mute_before_any_partial_drops_with_no_text(self):
+        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
+        await rig.marked(10)
+        opened = rig.ingress.open_utterance("wake", 2)
+
+        rig.ingress.set_muted(True)
+
+        (dropped,) = rig.of(UtteranceDropped)
+        assert (dropped.utterance_id, dropped.first_pos) == (opened.utterance_id, 2)
+        assert (dropped.reason, dropped.text) == ("muted", None)
+        assert dropped.duration_ms == (rig.pos - 2) * FRAME_MS
+        assert rig.of(TranscriptPartial) == []
+
+    @pytest.mark.asyncio
+    async def test_a_partial_decode_in_flight_at_mute_yields_nothing_after_the_drop(self):
+        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=100))
+        await rig.quiet(640)
+        await rig.speak(320)
+        rig.lanes.stt.holding = True
+        await rig.speak(160)
+        started = rig.of(SpeechStarted)[0]
+        assert rig.lanes.stt.submitted[-1] == "decode_partial"
+
+        rig.ingress.set_muted(True)
+        rig.lanes.stt.release()
+        await settle()
+        rig.ingress.set_muted(False)
+        await rig.quiet(640)
+
+        (dropped,) = rig.of(UtteranceDropped)
+        assert dropped.utterance_id == started.utterance_id
+        assert [
+            event
+            for event in events_after(rig, dropped)
+            if getattr(event, "utterance_id", None) == started.utterance_id
+        ] == []
+
+    @pytest.mark.asyncio
+    async def test_a_final_decode_in_flight_at_mute_yields_no_candidate_and_no_end(self):
+        rig = Rig()
+        await rig.quiet(640)
+        await rig.speak(640)
+        rig.lanes.stt.holding = True
+        await rig.quiet(320)
+        started = rig.of(SpeechStarted)[0]
+        assert "decode_final" in rig.lanes.stt.submitted
+
+        rig.ingress.set_muted(True)
+        rig.lanes.stt.release()
+        await settle()
+        rig.ingress.set_muted(False)
+        await rig.quiet(640)
+
+        (dropped,) = rig.of(UtteranceDropped)
+        assert (dropped.utterance_id, dropped.reason) == (started.utterance_id, "muted")
+        assert rig.of(EndpointCandidate) == [] and rig.of(UtteranceEnded) == []
+        assert "decode_final" not in rig.lanes.stt.started
+
+    @pytest.mark.asyncio
+    async def test_mute_with_no_utterance_open_emits_nothing(self):
+        rig = Rig()
+        await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(480)
+        assert len(rig.of(UtteranceEnded)) == 1
+        count = len(rig.events)
+
+        rig.ingress.set_muted(True)
+
+        assert len(rig.events) == count
+
+    @pytest.mark.asyncio
+    async def test_a_second_mute_emits_nothing(self):
+        rig = Rig()
+        await rig.quiet(640)
+        await rig.speak(640)
+        rig.ingress.set_muted(True)
+        count = len(rig.events)
+
+        rig.ingress.set_muted(True)
+
+        assert len(rig.events) == count
+        assert len(rig.of(UtteranceDropped)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_wake_while_muted_opens_nothing_and_is_dropped_at_once(self):
+        rig = Rig(transcriber=RecordingTranscriber(["hello there"]), retention_ms=400)
+        await rig.quiet(640)
+        await rig.speak(640)
+        before = rig.of(SpeechStarted)[0]
+        rig.ingress.set_muted(True)
+        count = len(rig.events)
+
+        opened = rig.ingress.open_utterance("wake", 4)
+
+        assert opened.utterance_id != before.utterance_id
+        assert opened.first_pos == rig.pos
+        assert len(rig.transcriber.streams) == 1
+        (dropped,) = rig.events[count:]
+        assert dropped == UtteranceDropped(
+            epoch=3,
+            event_seq=rig.events[count - 1].event_seq + 1,
+            utterance_id=opened.utterance_id,
+            first_pos=opened.first_pos,
+            reason="muted",
+            text=None,
+            duration_ms=0,
+            no_speech_prob=None,
+            avg_logprob=None,
+        )
+        assert rig.of(IngressOverload) == []
+        assert rig.ingress.idle_since() == dropped.event_seq
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_wake_partly_counted_at_mute_is_never_heard(self):
+        rig = Rig(engaged=False)
+        rig.ingress.expect_endpoint_wake(
+            keyword="hey mist", score=0.7, backlog_ms=4000, arrival=55.5
+        )
+        await rig.speak(1000)
+
+        rig.ingress.set_muted(True)
+        await rig.speak(400)
+        rig.ingress.set_muted(False)
+        await rig.speak(4000)
+        await rig.quiet(400)
+
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_wake_whose_last_frame_is_unscored_at_mute_is_never_heard(self):
+        rig = Rig(engaged=False)
+        rig.ingress.expect_endpoint_wake(keyword="hey mist", score=0.7, backlog_ms=400, arrival=5.0)
+        await rig.quiet(380)
+        await rig.quiet(20, settle_after=False)
+        assert rig.of(NameHeard) == []
+
+        rig.ingress.set_muted(True)
+        await settle()
+        rig.ingress.set_muted(False)
+        await rig.quiet(400)
+
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_after_unmute_a_wake_from_before_the_mute_starts_after_the_unmute(self):
+        rig = Rig(transcriber=RecordingTranscriber([""]))
+        await rig.marked(10)
+        for _ in range(5):
+            await rig.push_pcm(marked_pcm(rig.pos), settle_after=False)
+        assert rig.ingress.handoff().vad_from <= 10
+
+        rig.ingress.set_muted(True)
+        await rig.marked(5)
+        rig.ingress.set_muted(False)
+        first_after = rig.pos
+        await rig.marked(5)
+        opened = rig.ingress.open_utterance("wake", 2)
+
+        assert opened.first_pos >= first_after
+        assert min(positions_in(rig.transcriber.streams[0].audio)) >= first_after
+
+    @pytest.mark.asyncio
+    async def test_after_unmute_vad_speech_opens_a_fresh_utterance(self):
+        rig = Rig(transcriber=ScriptedTranscriber(["one", "two"], ms_per_word=20))
+        await rig.quiet(640)
+        await rig.speak(640)
+        first = rig.of(SpeechStarted)[0]
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+        # Speech straight after the unmute: before the fix the old utterance was still open and
+        # took it, so no second utterance started.
+        await rig.speak(640)
+
+        started = rig.of(SpeechStarted)
+        assert len(started) == 2
+        assert started[1].utterance_id != first.utterance_id
+        assert started[1].first_pos >= unmuted_at
+        assert len(rig.transcriber.streams) == 2
+
+    def test_the_docstrings_say_ingress_closes_the_utterance_on_mute(self):
+        assert "controller's to close" not in (AudioIngress.set_muted.__doc__ or "")
+        for documented in (AudioIngress.set_muted, AudioIngress.open_utterance, UtteranceDropped):
+            assert "muted" in (documented.__doc__ or "")
+        assert "mute" in (IngressSeed.__doc__ or "")
 
 
 # -- Real lanes -----------------------------------------------------------------------------------
