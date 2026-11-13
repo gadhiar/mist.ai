@@ -204,9 +204,9 @@ class StreamingTranscriber(Protocol):
 class SpeechSynthesizer(Protocol):
     """A TTS engine speaking MIST's voice identity, chosen when the adapter is built.
 
-    `engine_id` is the engine's id (`PlacementConfig.tts_engine`) and `voice` reports the voice
-    identity it speaks. `sample_rate` is the rate of the audio the adapter yields: 24000
-    whatever the engine's own rate, which the adapter converts from.
+    `engine_id` is the `engine` of the `PlacementConfig.tts_chain` option the adapter was built
+    from, and `voice` reports the voice identity it speaks. `sample_rate` is the rate of the audio
+    the adapter yields: 24000 whatever the engine's own rate, which the adapter converts from.
 
     Speaking states. `states` holds the states the engine voices distinctly: always
     `NEUTRAL_STATE`, and nothing outside `SPEAKING_STATES`; an engine with no per-state control
