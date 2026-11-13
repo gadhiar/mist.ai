@@ -230,6 +230,8 @@ UPSTREAM_BOUNDS = [
     ("requirements-omnivoice.txt", "gradio", "5.45.0", "huggingface-hub", ">=0.33.5,<1.0"),
     # pypi.org/pypi/gradio/6.32.0/json
     ("requirements-omnivoice.txt", "gradio", "6.32.0", "huggingface-hub", ">=1.16.0,<3.0"),
+    # pypi.org/pypi/transformers/5.19.0/json
+    ("requirements-fish-s2.txt", "transformers", "5.19.0", "safetensors", ">=0.8.0"),
 ]
 
 
@@ -292,3 +294,13 @@ def test_upstream_bounds_cover_each_declaring_pin(name: str) -> None:
     for package in declaring:
         rows = [row for row in UPSTREAM_BOUNDS if row[0] == name and row[1] == package]
         assert any(row[2] == pins.get(package) for row in rows), f"{name}: {package}"
+
+
+def test_fish_s2_installs_portaudio_headers_before_its_venv() -> None:
+    # fish-speech lists pyaudio unpinned, and PyAudio ships Linux only as an sdist, which
+    # compiles against the portaudio headers.
+    steps = instructions(DOCKER_DIR / "teacher-fish-s2.Dockerfile")
+    [apt] = [i for i, s in enumerate(steps) if "apt-get install" in s]
+    assert "portaudio19-dev" in steps[apt].split(), steps[apt]
+    [pip] = [i for i, s in enumerate(steps) if "/opt/venv-teacher-fish-s2/bin/pip install" in s]
+    assert apt < pip
