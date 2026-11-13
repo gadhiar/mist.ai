@@ -6,26 +6,40 @@ from `held` at its release and M67's `release` (v2 :392-408, :1615-1637), and v2
 `speaking` and `text` that v5 keeps, the keyword row's closing messages (v2 :617-651), ignored
 endpoint reports (v2 :1844-1847), and Test strategy's variants that survive v5 (v2 :1117-1130).
 
+T11e part 1 adds the addressee rows (v5 :1172-1190) and their tests (v5 :1668-1744, without the
+arbitration bullets at :1709-1722), v4's muted wake, the mute bullets for unpublished candidates
+(v8 :248-270), "stop" or the name during a `HandOff` wait (v6 :1649-1650), and the controller's
+handling of wake verdicts (v9 :153-163, :296-300), with `FakeWakeArbiter` standing in for
+arbitration.
+
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
 """
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import pytest_asyncio
 
-from backend.chat.stream_events import Token
-from backend.realtime.budget import BargeInConfig
+from backend.chat.stream_events import HandOff, Token
+from backend.realtime.budget import BargeInConfig, WakeConfig
+from backend.realtime.scene import Immediate
+from backend.realtime.speech import SpotterCalibration
 from backend.realtime.turn import (
     BargeInReport,
+    Close,
     Interrupt,
     Mute,
     PlaybackDone,
+    PlaybackProgress,
     Reconfigure,
     Text,
     VoiceStart,
     VoiceStop,
+    Wake,
+    WakeRank,
 )
 
 from .turn_fakes import (
@@ -1602,3 +1616,916 @@ async def test_reconfigure_in_idle_carrying_a_refusal_is_refused_at_once():
 
     assert h.host.calls == [("refuse", req, "unavailable")]
     assert calls(h.ingress, "close") == []
+
+
+# == T11e part 1: the addressee rows ================================================================
+# Every test here uses `FakeWakeArbiter`: `solo=True` grants each claim before `claim` returns, as
+# the real arbiter does for one session; `solo=False` leaves it waiting for the test's verdict.
+
+HIT = 110
+GATE_THROUGH = HIT + 15  # the hit plus `gate_tail_ms` 300, in 20 ms frames
+
+
+async def name_hit(h: Harness, uid: str | None = None, **heard: object) -> str:
+    """Post a server `NameHeard` and run the mailbox; returns the candidate's utterance id."""
+    opened = len(calls(h.ingress, "open_utterance"))
+    h.post(h.ingress.heard(uid, hit_pos=HIT, **heard))  # type: ignore[arg-type]
+    await h.settle()
+    if uid is not None:
+        return uid
+    new = calls(h.ingress, "open_utterance")[opened:]
+    assert len(new) == 1, "the name opened no candidate"
+    return str(new[0][3])
+
+
+async def gate(h: Harness, uid: str, text: str) -> None:
+    """Post the candidate's gate partial, the decode the controller requested."""
+    h.post(h.ingress.partial(uid, text, gate=True, through_pos=GATE_THROUGH))
+    await h.settle()
+
+
+def engaged_calls(h: Harness) -> list[bool]:
+    return [bool(call[1]) for call in calls(h.ingress, "set_engaged")]
+
+
+def ducks(h: Harness) -> list[float]:
+    return [item.db for item in h.outbound.of("playback_duck")]
+
+
+async def speaking_with_next(*scripts: list[object]) -> tuple[Harness, Pause, str]:
+    """A voice turn in `speaking`, paused mid-reply, with scripts for the turns after it."""
+    pause = Pause()
+    h = make_harness([Token("One two three. Four five. "), pause, Token("Six.")], *scripts)
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "speaking"
+    return h, pause, h.last_turn()
+
+
+# -- NameHeard in idle: name first, name last, the rejections (v5 :1174-1175, :1669-1688) ----------
+
+
+async def test_name_first_attends_at_the_hit_then_publishes_in_one_step_and_starts_the_turn():
+    h = make_harness([Pause()])
+    h.start_voice()
+
+    uid = await name_hit(h)
+
+    # Check a, `attend`, the candidate from `from_pos`, a claim, check b, the gate partial.
+    assert h.outbound.names() == ["state_cycle:attend"]
+    assert calls(h.ingress, "open_utterance") == [("open_utterance", "wake", 100, uid)]
+    assert [(c.session_id, c.rank.margin) for c in h.arbiter.claims] == [
+        ("session-1", pytest.approx(0.4))
+    ]
+    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, GATE_THROUGH)]
+    assert h.responder.prefetches == []
+    mark = len(h.outbound.client)
+    at_wake: list[list[str]] = []
+    h.scene.on_call = lambda call: (
+        at_wake.append(h.outbound.names()[mark:]) if call[1] == "wake" else None
+    )
+
+    await gate(h, uid, "mist what")
+
+    assert h.outbound.names()[mark:] == [
+        "vad_status:speech_started",
+        "state_cycle:listen",
+        "transcript_partial",
+    ]
+    # The scene `wake` comes in the publishing step, after `listen` went to the client.
+    assert at_wake == [["vad_status:speech_started", "state_cycle:listen"]]
+    assert h.outbound.of("transcript_partial")[0].text == "mist what"
+    assert h.arbiter.settles == [(1, True)]
+
+    h.post(h.ingress.ended(uid, "Mist, what's up?"))
+    await h.settle()
+    assert [r.user_text for r in h.responder.requests] == ["Mist, what's up?"]
+    transcription = h.outbound.of("transcription")[-1]
+    assert (transcription.text, transcription.utterance_id) == ("Mist, what's up?", uid)
+
+
+async def test_name_last_with_a_preamble_opens_at_from_pos_and_the_turn_holds_the_preamble():
+    h = make_harness([Pause()])
+    h.start_voice()
+
+    uid = await name_hit(h, from_pos=40)
+    await gate(h, uid, "so about tomorrow are you there mist")
+    h.post(h.ingress.ended(uid, "So about tomorrow... are you there, Mist?"))
+    await h.settle()
+
+    assert calls(h.ingress, "open_utterance") == [("open_utterance", "wake", 40, uid)]
+    assert h.ingress.first_pos[uid] == 40
+    (request,) = h.responder.requests
+    assert request.user_text == "So about tomorrow... are you there, Mist?"
+
+
+async def test_i_missed_the_bus_is_rejected_with_no_trace_of_its_words_or_its_id(caplog):
+    caplog.set_level(logging.DEBUG)
+    h = make_harness([Pause()])
+    h.start_voice()
+
+    uid = await name_hit(h)
+    h.post(h.ingress.partial(uid, "I missed the"))
+    await gate(h, uid, "I missed the bus")
+    h.post(h.ingress.ended(uid, "I missed the bus."))
+    await h.settle()
+
+    assert h.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_rejected",
+        "state_cycle:idle",
+    ]
+    (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+    assert (rejected.reason, rejected.turn_id) == ("not_addressed", None)
+    assert rejected.detail.model_dump() == {
+        "source": "server",
+        "score": 0.9,
+        "reference_score": None,
+    }
+    assert "utterance_id" not in rejected.model_dump_json()
+    assert calls(h.ingress, "drop") == [("drop", uid, "not_addressed")]
+    assert h.responder.prefetches == [] and h.responder.requests == []
+    assert h.arbiter.settles == [(1, False)]
+    for record in caplog.records:
+        message = record.getMessage().lower()
+        assert "missed" not in message and "bus" not in message
+    for item in h.outbound.client:
+        dumped = item.model_dump_json() if hasattr(item, "model_dump_json") else repr(item)
+        assert uid not in dumped
+
+
+async def test_self_speech_in_her_recent_speech_from_any_session_rejects_before_attend():
+    asked: list[int] = []
+
+    def recent(ms: int) -> str:
+        asked.append(ms)
+        return "The room unit said: ask Mist anything."  # another session's turn ledger
+
+    h = make_harness([Pause()], recent_tts_text=recent)
+    h.start_voice()
+
+    h.post(h.ingress.heard(None, hit_pos=HIT))
+    await h.settle()
+
+    assert h.outbound.names() == ["voice_decision:wake_rejected"]
+    assert h.outbound.of("voice_decision:wake_rejected")[0].reason == "self_speech"
+    assert asked == [BargeInConfig().echo_guard_ms]
+    assert calls(h.ingress, "open_utterance") == []
+    assert h.arbiter.claims == []
+
+
+async def test_self_media_rejects_after_attend_and_before_any_gate_partial():
+    h = make_harness([Pause()])
+    h.start_voice()
+
+    uid = await name_hit(h, reference_score=0.7)
+
+    assert h.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_rejected",
+        "state_cycle:idle",
+    ]
+    (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+    assert (rejected.reason, rejected.detail.reference_score) == ("self_media", 0.7)
+    assert calls(h.ingress, "request_gate_partial") == []
+    assert calls(h.ingress, "drop") == [("drop", uid, "not_addressed")]
+    assert h.arbiter.settles == [(1, False)]
+
+
+async def test_scene_wake_then_listening_only_for_an_accepted_name():
+    h = make_harness([Pause()])
+    h.start_voice()
+    rejected = await name_hit(h)
+    await gate(h, rejected, "I missed the bus")
+    assert h.scene.calls == []
+
+    accepted = await name_hit(h)
+    assert h.scene.calls == []
+    await gate(h, accepted, "mist, what's up")
+
+    assert h.scene.phases() == [
+        ("phase", "wake", None, Immediate()),
+        ("phase", "listening", None, Immediate()),
+    ]
+
+
+async def test_attend_goes_out_in_the_name_step_before_any_wait():
+    h = make_harness([Pause()], solo=False)  # two sessions: the claim waits for its verdict
+    h.start_voice()
+    h.clock.now = 500
+
+    uid = await name_hit(h, arrival=500.0)
+
+    assert h.outbound.names() == ["state_cycle:attend"]
+    assert h.clock.now == 500
+    assert calls(h.ingress, "request_gate_partial") == []
+    h.arbiter.grant(1)
+    await h.settle()
+    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, GATE_THROUGH)]
+
+
+async def test_name_heard_while_held_is_ignored():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.heard(uid, hit_pos=HIT))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.ingress.calls == []
+    assert h.arbiter.claims == []
+    assert h.controller.phase == "held"
+
+
+# -- The held end of an unpublished candidate (v5 :1176, :1184-1186, :1697-1701) -------------------
+
+
+async def test_a_held_end_waits_for_the_verdict_and_acceptance_replays_it():
+    h = make_harness([Token("Tomorrow is clear."), Pause()])
+    h.start_voice()
+    uid = await name_hit(h, from_pos=40)
+    text = "so about tomorrow are you there mist"
+    mark = len(h.outbound.client)
+
+    h.post(h.ingress.candidate(uid, text), h.ingress.ended(uid, text))
+    await h.settle()
+    assert h.outbound.client[mark:] == []
+    assert h.responder.prefetches == [] and h.responder.requests == []
+
+    await gate(h, uid, text)
+
+    names = h.outbound.names()[mark:]
+    assert names[:3] == ["vad_status:speech_started", "state_cycle:listen", "transcript_partial"]
+    assert subsequence(names, ["voice_decision:release", "transcription", "stream_start"])
+    (request,) = h.responder.requests
+    assert (request.user_text, request.held) == (text, True)
+    assert h.controller.phase in ("thinking", "speaking")
+
+
+async def test_a_held_end_is_discarded_on_rejection():
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await name_hit(h)
+    text = "so about tomorrow the mist"
+    h.post(h.ingress.candidate(uid, text), h.ingress.ended(uid, text))
+    await h.settle()
+
+    await gate(h, uid, text)
+
+    assert h.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_rejected",
+        "state_cycle:idle",
+    ]
+    assert h.responder.requests == [] and h.responder.prefetches == []
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert h.controller.phase == "idle"
+
+
+async def test_an_end_held_before_the_verdict_is_decided_on_its_own_text():
+    """Ingress ended the candidate before the claim won, so no gate decode can come (v9 :153)."""
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    uid = await name_hit(h)
+    h.post(h.ingress.ended(uid, "Mist, what's the time?"))
+    await h.settle()
+
+    h.arbiter.grant(1)
+    await h.settle()
+
+    assert calls(h.ingress, "request_gate_partial") == []
+    assert [r.user_text for r in h.responder.requests] == ["Mist, what's the time?"]
+    assert h.arbiter.settles == [(1, True)]
+
+
+# -- Speaking and thinking (v5 :1174, :1177-1178, :1182-1183, :1692-1694, :1702-1708) --------------
+
+
+@pytest.mark.parametrize("phase", ["thinking", "speaking"])
+async def test_a_rejected_name_restores_the_phase_state_with_nothing_cut(phase):
+    h, pause = await in_phase(phase)
+    turn_id = h.last_turn()
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    mark = len(h.outbound.client)
+
+    await name_hit(h, uid)
+    await gate(h, uid, "I missed it")
+
+    restored = "think" if phase == "thinking" else "speak"
+    duck = ["playback_duck"] if phase == "speaking" else []
+    assert h.outbound.names()[mark:] == [
+        "state_cycle:attend",
+        *duck,
+        "voice_decision:wake_rejected",
+        *duck,
+        f"state_cycle:{restored}",
+    ]
+    assert ducks(h) == ([12.0, 0.0] if phase == "speaking" else [])
+    assert h.outbound.of("voice_decision:wake_rejected")[0].turn_id == turn_id
+    assert h.outbound.of("state_cycle:idle") == []
+    assert h.responder.commits == []
+    assert h.controller.phase == phase
+    assert calls(h.ingress, "open_utterance") == []  # the candidate is the engaged utterance
+    pause.release()
+
+
+async def test_while_speaking_other_unnamed_speech_sends_nothing_and_does_not_duck():
+    h, pause, _ = await speaking_with_next()
+    uid = h.ids()
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "what a day"))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    pause.release()
+
+
+async def test_while_speaking_mist_wait_ducks_at_the_hit_accepts_and_interrupts_with_wake():
+    h, pause, turn_id = await speaking_with_next([Pause()])
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    mark = len(h.outbound.client)
+
+    await name_hit(h, uid)
+    assert h.outbound.names()[mark:] == ["state_cycle:attend", "playback_duck"]
+    assert ducks(h) == [12.0]
+
+    # "wait" is a stop keyword: the candidate's partials go to the gate, not the keyword policy.
+    h.post(h.ingress.partial(uid, "mist wait"))
+    await h.settle()
+    assert h.outbound.of("voice_decision:barge_in") == []
+    await gate(h, uid, "mist, wait")
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.reason, barge.turn_id) == ("wake", turn_id)
+    assert (barge.detail.phase, barge.detail.utterance_id) == ("speaking", uid)
+    names = h.outbound.names()[mark:]
+    assert subsequence(
+        names,
+        [
+            "voice_decision:barge_in",
+            "stream_cancelled",
+            "vad_status:speech_started",
+            "state_cycle:listen",
+        ],
+    )
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    h.post(h.ingress.ended(uid, "Mist, wait."))
+    await h.settle()
+    assert [r.user_text for r in h.responder.requests] == ["hello", "Mist, wait."]
+    pause.release()
+
+
+async def test_while_thinking_unnamed_speech_neither_holds_output_nor_supersedes():
+    pause = Pause()
+    h = make_harness([Token("One. "), pause, Token("Two. "), Pause()])
+    h.lane.hold()  # no audio yet: the turn stays in `thinking` while its tokens flow
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "thinking"
+    uid = h.ids()
+    silent = h.controller.silent_closes
+
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "what about the"))
+    pause.release()
+    await h.settle()
+
+    assert h.outbound.tokens() == ["One. ", "Two. "]
+    kinds = [kind for kind, _ in decisions(h)]
+    assert "hold" not in kinds and "supersede" not in kinds
+    assert h.controller.phase == "thinking"
+
+    h.post(h.ingress.ended(uid, "what about the weather"))
+    await h.settle()
+    assert h.controller.silent_closes == silent + 1
+    assert len(h.responder.requests) == 1
+    assert h.responder.commits == []
+    h.lane.open()
+
+
+@pytest.mark.parametrize("phase", ["speaking", "text"])
+async def test_unnamed_speech_ending_without_a_keyword_closes_silently_and_is_counted(phase):
+    h, pause = await in_phase(phase)
+    uid = h.ids()
+    silent = h.controller.silent_closes
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(uid), h.ingress.ended(uid, "what a lovely day"))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.silent_closes == silent + 1
+    assert h.controller.phase == phase
+    pause.release()
+
+
+async def test_a_name_during_a_typed_turn_interrupts_it_after_acceptance():
+    h = make_harness([Token("Typed. "), Pause()], [Pause()])
+    h.start_voice()
+    h.post(Text("typed"))
+    await h.settle()
+    typed = h.last_turn()
+    assert h.controller.phase == "text"
+
+    uid = await name_hit(h)
+    assert h.responder.commits == []  # nothing is cut before the verdict
+    await gate(h, uid, "mist, what's the time")
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.reason, barge.turn_id, barge.detail.phase) == ("wake", typed, "text")
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    assert h.outbound.names()[-1] == "transcript_partial"
+
+
+async def test_speech_started_in_text_is_ignored():
+    h, pause = await in_phase("text")
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.started(h.ids()))
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.responder.prefetches == []
+    pause.release()
+
+
+# -- "stop", or the name, during the wait after a `HandOff` ack (v6 :1649-1650) --------------------
+
+
+@pytest.mark.parametrize("how", ["stop", "name"])
+async def test_stop_or_the_name_during_the_handoff_wait_cancels_as_in_thinking(how):
+    h = make_harness([HandOff("One moment."), Pause(), Token(" Here it is.")], [Pause()])
+    h.start_voice()
+    await h.speak("look it up")
+    turn_id = h.last_turn()
+    h.post(PlaybackProgress(turn_id=turn_id, played_ms=600))
+    await h.settle()
+    assert h.controller.phase == "thinking"
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+
+    if how == "stop":
+        h.post(h.ingress.ended(uid, "Stop."))
+        await h.settle()
+    else:
+        await h.settle()
+        await name_hit(h, uid)
+        await gate(h, uid, "mist, never mind that")
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    reason = "keyword" if how == "stop" else "wake"
+    assert (barge.reason, barge.turn_id, barge.detail.phase) == (reason, turn_id, "thinking")
+    assert h.responder.closed == [0]
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+
+
+# -- The endpoint `wake` (v5 :1179, :1723-1733) ------------------------------------------------------
+
+
+def endpoint_wake(backlog_ms: int = 1500, *, arrival: float = 1000.0, score: float = 0.8) -> Wake:
+    return Wake(keyword="mist", score=score, backlog_ms=backlog_ms, arrival=arrival)
+
+
+async def test_endpoint_wake_attends_at_the_message_and_opens_at_the_name_heards_from_pos():
+    asked: list[int] = []
+    h = make_harness([Pause()], recent_tts_text=lambda ms: asked.append(ms) or "")
+    h.start_voice()
+
+    h.post(endpoint_wake(1500))
+    await h.settle()
+
+    # Check a and `attend` at the `wake` message, before any of the backlog has arrived.
+    assert asked == [BargeInConfig().echo_guard_ms]
+    assert h.outbound.names() == ["state_cycle:attend"]
+    (expect,) = calls(h.ingress, "expect_endpoint_wake")
+    assert expect[2] == {"keyword": "mist", "score": 0.8, "backlog_ms": 1500, "arrival": 1000.0}
+    assert calls(h.ingress, "open_utterance") == []
+
+    # The backlog's first frame is 25 (75 frames ending at the hit, 99); the chain rule says 60.
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.8))
+    await h.settle()
+    ((_, mode, from_pos, uid),) = calls(h.ingress, "open_utterance")
+    assert (mode, from_pos) == ("wake", 60)
+    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, 99 + 15)]
+
+    h.post(h.ingress.partial(uid, "mist what's the time", gate=True))
+    await h.settle()
+    assert h.outbound.names()[1:3] == ["vad_status:speech_started", "state_cycle:listen"]
+    assert ("phase", "wake", None, Immediate()) in h.scene.calls
+
+
+async def test_endpoint_wake_ranks_with_its_calibration_and_a_slow_backlog_still_takes_part():
+    calibration = SpotterCalibration(
+        false_accepts=((0.5, 2.0), (0.9, 0.1)), positive_quantile=((0.5, 0.1), (0.9, 0.9))
+    )
+    h = make_harness([Pause()], calibration=calibration, solo=False)
+    h.start_voice()
+
+    h.post(endpoint_wake(1500, arrival=1000.0, score=0.7))
+    await h.settle()
+
+    (claim,) = h.arbiter.claims
+    assert claim.rank == WakeRank(
+        arrival=1000.0,
+        false_accepts_per_hour=pytest.approx(1.05),
+        positive_quantile=pytest.approx(0.5),
+        margin=pytest.approx(0.2),
+    )
+    # The backlog completes well after `wake_arbitration_ms`; the claim made at `wake` waits.
+    await h.clock.advance(400)
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.7))
+    await h.settle()
+    assert calls(h.ingress, "request_gate_partial") == []
+    h.arbiter.grant(claim.claim_id)
+    await h.settle()
+    assert len(calls(h.ingress, "request_gate_partial")) == 1
+
+
+@pytest.mark.parametrize("backlog_ms", [0, 1499])
+async def test_endpoint_wake_with_too_little_backlog_is_rejected_no_backlog(backlog_ms):
+    h, pause, turn_id = await speaking_with_next()
+    mark = len(h.outbound.client)
+
+    h.post(endpoint_wake(backlog_ms))
+    await h.settle()
+
+    assert h.outbound.names()[mark:] == ["voice_decision:wake_rejected"]
+    (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+    assert (rejected.reason, rejected.turn_id) == ("no_backlog", turn_id)
+    assert rejected.detail.model_dump() == {
+        "source": "endpoint",
+        "score": 0.8,
+        "reference_score": None,
+    }
+    assert calls(h.ingress, "expect_endpoint_wake") == []
+    assert calls(h.ingress, "open_utterance") == []
+    assert h.arbiter.claims == []
+    assert h.responder.commits == [] and h.controller.phase == "speaking"
+    pause.release()
+
+
+async def test_endpoint_wake_while_speaking_interrupts_only_after_acceptance():
+    h, pause, turn_id = await speaking_with_next([Pause()])
+
+    h.post(endpoint_wake(1500))
+    await h.settle()
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
+    await h.settle()
+    assert h.responder.commits == []
+    ((*_, uid),) = calls(h.ingress, "open_utterance")
+
+    h.post(h.ingress.partial(uid, "mist, stop that", gate=True))
+    await h.settle()
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.reason, barge.turn_id, barge.detail.utterance_id) == ("wake", turn_id, uid)
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    pause.release()
+
+
+async def test_a_wake_while_muted_is_dropped_muted_with_a_fresh_id():
+    h = make_harness([Pause()])
+    h.start_voice()
+    first = h.ids()  # an id ingress issued before the wake
+    h.post(Mute(active=True), endpoint_wake(1500))
+    await h.settle()
+
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert h.outbound.names() == ["voice_decision:dropped"]
+    detail = dropped.detail
+    assert (dropped.reason, detail.duration_ms, detail.text) == ("muted", 0, None)
+    assert (detail.no_speech_prob, detail.avg_logprob) == (None, None)
+    assert detail.utterance_id == h.ids.issued[-1] != first
+    assert h.ids() != detail.utterance_id
+    assert calls(h.ingress, "open_utterance") == []
+    assert calls(h.ingress, "expect_endpoint_wake") == []
+    assert h.arbiter.claims == []
+    assert h.scene.calls == []
+    assert h.responder.requests == []
+
+
+@pytest.mark.parametrize("muted", [True, False])
+async def test_a_wake_with_no_voice_session_is_ignored(muted):
+    h = make_harness([Pause()])
+    if muted:
+        h.post(Mute(active=True))
+    h.post(endpoint_wake(1500))
+    await h.settle()
+
+    assert h.outbound.client == []
+    assert h.ids.issued == []
+
+
+# -- The follow-up window, `attend_cue`, `set_engaged` and the wake timings (v5 :1734-1744) -------
+
+
+async def named_turn(h: Harness, text: str = "Mist, what's up?") -> str:
+    """Accept a name in idle, end the utterance and finish the turn it opens; returns its id."""
+    uid = await name_hit(h)
+    await gate(h, uid, "mist what's up")
+    h.post(h.ingress.ended(uid, text))
+    await h.settle()
+    turn_id = h.last_turn()
+    h.post(PlaybackDone(turn_id=turn_id, played_ms=1))
+    await h.settle()
+    assert h.controller.phase == "idle"
+    return turn_id
+
+
+async def test_set_engaged_is_true_at_acceptance_and_false_at_the_turns_end_with_no_window():
+    h = make_harness([Token("Sure.")])
+    h.start_voice()
+    uid = await name_hit(h)
+    assert engaged_calls(h) == []
+
+    await gate(h, uid, "mist what's up")
+    assert engaged_calls(h) == [True]
+    h.post(h.ingress.ended(uid, "Mist, what's up?"))
+    await h.settle()
+    assert engaged_calls(h) == [True]
+
+    h.post(PlaybackDone(turn_id=h.last_turn(), played_ms=1))
+    await h.settle()
+    assert engaged_calls(h) == [True, False]
+
+
+async def test_followup_window_unnamed_speech_two_seconds_after_playback_done_opens_a_turn():
+    h = make_harness([Token("Sure.")], [Pause()], wake=WakeConfig(followup_window_ms=6000))
+    h.start_voice()
+    await named_turn(h)
+    assert engaged_calls(h) == [True]
+    await h.clock.advance(2000)
+    mark = len(h.outbound.client)
+    uid = h.ids()
+
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    assert h.outbound.client[mark:] == []  # unpublished until checks a and b pass
+    h.post(h.ingress.partial(uid, "and tomorrow"))
+    await h.settle()
+    assert h.outbound.names()[mark:] == [
+        "vad_status:speech_started",
+        "state_cycle:listen",
+        "transcript_partial",
+    ]
+    h.post(h.ingress.ended(uid, "And tomorrow?"))
+    await h.settle()
+
+    assert [r.user_text for r in h.responder.requests] == ["Mist, what's up?", "And tomorrow?"]
+    assert len(h.outbound.of("state_cycle:attend")) == 1  # the name's; a follow-up needs none
+
+
+async def test_followup_window_rejects_silently_when_her_recent_speech_holds_her_name():
+    spoken = {"text": ""}
+    h = make_harness(
+        [Token("Sure.")],
+        wake=WakeConfig(followup_window_ms=6000),
+        recent_tts_text=lambda _ms: spoken["text"],
+    )
+    h.start_voice()
+    await named_turn(h)
+    spoken["text"] = "This is Mist."
+    mark = len(h.outbound.client)
+    uid = h.ids()
+
+    h.post(h.ingress.started(uid), h.ingress.partial(uid, "this is mist"))
+    await h.settle()
+
+    assert h.outbound.client[mark:] == []
+    assert calls(h.ingress, "drop") == [("drop", uid, "not_addressed")]
+    assert len(h.responder.requests) == 1
+
+
+async def test_followup_window_lapses_after_its_length_and_ingress_is_dormant_again():
+    h = make_harness([Token("Sure.")], wake=WakeConfig(followup_window_ms=6000))
+    h.start_voice()
+    await named_turn(h)
+
+    await h.clock.advance(5999)
+    assert engaged_calls(h) == [True]
+    await h.clock.advance(1001)  # 7 s after `playback_done`
+
+    assert engaged_calls(h) == [True, False]
+    assert len(h.responder.requests) == 1
+
+
+async def test_with_no_followup_window_ingress_is_dormant_at_once_after_the_turn():
+    h = make_harness([Token("Sure.")])
+    h.start_voice()
+    await named_turn(h)
+    assert engaged_calls(h) == [True, False]
+
+    await h.clock.advance(60_000)
+    assert engaged_calls(h) == [True, False]
+    assert len(h.responder.requests) == 1
+
+
+async def test_attend_cue_off_sends_no_attend_and_no_state_after_a_rejection():
+    h = make_harness([Pause()], wake=WakeConfig(attend_cue=False))
+    h.start_voice()
+    uid = await name_hit(h)
+
+    await gate(h, uid, "I missed the bus")
+
+    assert h.outbound.names() == ["voice_decision:wake_rejected"]
+
+
+async def test_turn_metrics_carry_the_wake_timings_of_a_name_opened_turn():
+    h = make_harness([Token("Sure.")], hit_lag_ms=150)
+    h.start_voice()
+    h.clock.now = 1040  # the hit's last frame arrived at 1000; the mailbox reached it 40 ms later
+
+    uid = await name_hit(h, arrival=1000.0)
+    await h.clock.advance(260)
+    await gate(h, uid, "mist what's up")
+    h.post(h.ingress.ended(uid, "Mist, what's up?"))
+    await h.settle()
+    h.post(PlaybackDone(turn_id=h.last_turn(), played_ms=1))
+    await h.settle()
+
+    (metrics,) = h.outbound.of("turn_metrics")
+    assert metrics.timings["wake_accept_ms"] == 300
+    # The name ended `hit_lag_ms` before the hit's arrival: 150 more than the hit to `attend`.
+    assert metrics.timings["wake_screen_ms"] == 150 + 40
+
+
+async def test_a_turn_not_opened_by_a_name_has_no_wake_timings():
+    h = make_harness([Token("Sure.")])
+    h.start_voice()
+    await h.speak("hello")
+    h.post(PlaybackDone(turn_id=h.last_turn(), played_ms=1))
+    await h.settle()
+
+    (metrics,) = h.outbound.of("turn_metrics")
+    assert "wake_accept_ms" not in metrics.timings and "wake_screen_ms" not in metrics.timings
+
+
+# -- Mute and unpublished candidates (v8 :248-270) ---------------------------------------------------
+
+
+async def test_while_speaking_a_name_then_mute_unducks_restores_speak_and_the_reply_goes_on():
+    h, pause, turn_id = await speaking_with_next()
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    await name_hit(h, uid)
+    mark = len(h.outbound.client)
+
+    # Ingress's drop for the utterance open at mute is ahead of `Mute` in the mailbox (T12).
+    h.post(h.ingress.dropped(uid, "muted"), Mute(active=True))
+    await h.settle()
+
+    assert h.outbound.names()[mark:] == ["playback_duck", "state_cycle:speak"]
+    assert ducks(h) == [12.0, 0.0]
+    assert h.outbound.of("voice_decision:wake_rejected") == []
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert h.arbiter.settles == [(1, False)]
+    pause.release()
+    await h.settle()
+    assert h.outbound.tokens(turn_id)[-1] == "Six."
+    assert h.responder.commits == []
+
+
+async def test_a_waiting_endpoint_wake_abandoned_at_mute_restores_the_phase_state():
+    h = make_harness([Pause()])
+    h.start_voice()
+    h.post(endpoint_wake(1500))
+    await h.settle()
+
+    h.post(Mute(active=True))
+    await h.settle()
+
+    assert h.outbound.names() == ["state_cycle:attend", "state_cycle:idle"]
+    assert h.arbiter.settles == [(1, False)]
+    # The backlog's `NameHeard`, should one still come, has no wake waiting for it.
+    stale = h.controller.stale_events
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
+    await h.settle()
+    assert h.controller.stale_events == stale + 1
+    assert calls(h.ingress, "open_utterance") == []
+
+
+async def test_a_name_heard_queued_before_mute_closes_through_the_immediate_drop_with_no_message():
+    h = make_harness([Pause()])
+    h.start_voice()
+    h.post(Mute(active=True))
+
+    uid = await name_hit(h)  # a muted ingress mints the id and posts its drop after this step
+    h.post(h.ingress.dropped(uid, "muted"))
+    await h.settle()
+
+    assert h.outbound.names() == ["state_cycle:attend", "state_cycle:idle"]
+    assert h.arbiter.settles == [(1, False)]
+    assert h.responder.requests == []
+
+
+async def test_an_endpoint_name_heard_with_no_waiting_wake_opens_nothing_and_is_counted():
+    h = make_harness([Pause()])
+    h.start_voice()
+    stale = h.controller.stale_events
+
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
+    await h.settle()
+
+    assert h.outbound.client == []
+    assert h.ingress.calls == []
+    assert h.arbiter.claims == []
+    assert h.controller.stale_events == stale + 1
+
+
+# -- Verdict handling (v9 :153-163, :296-300) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("drop", ["muted", "noise", "text", "voice_stop", "disconnect"])
+async def test_a_dropped_candidate_settles_its_claim_once_with_accepted_false(drop):
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    uid = await name_hit(h)
+
+    if drop in ("muted", "noise"):
+        h.post(h.ingress.dropped(uid, drop))
+    elif drop == "text":
+        h.post(Text("typed"))
+    elif drop == "voice_stop":
+        h.post(VoiceStop())
+    else:
+        h.post(Close())
+    await h.settle()
+
+    assert h.arbiter.settles == [(1, False)]
+    assert h.outbound.of("voice_decision:wake_rejected") == []
+    assert h.outbound.of("voice_decision:dropped") == []
+    if drop == "text":
+        assert calls(h.ingress, "drop") == [("drop", uid, "text_input")]
+    else:
+        assert calls(h.ingress, "drop") == []
+
+
+async def test_a_lost_claim_closes_its_candidate_lost_arbitration_and_settles_once():
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    uid = await name_hit(h)
+
+    h.arbiter.deny(1)
+    await h.settle()
+
+    assert h.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_rejected",
+        "state_cycle:idle",
+    ]
+    assert h.outbound.of("voice_decision:wake_rejected")[0].reason == "lost_arbitration"
+    assert calls(h.ingress, "drop") == [("drop", uid, "wake_lost")]
+    assert calls(h.ingress, "request_gate_partial") == []
+    assert h.arbiter.settles == [(1, False)]
+
+
+async def test_a_verdict_for_a_settled_claim_is_ignored_counted_and_sends_nothing():
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    uid = await name_hit(h)
+    h.post(h.ingress.dropped(uid, "noise"))
+    await h.settle()
+    mark, stale = len(h.outbound.sent), h.controller.stale_events
+
+    h.arbiter.grant(1)  # the verdict was already in the mailbox when the drop was handled
+    await h.settle()
+
+    assert h.outbound.sent[mark:] == []
+    assert h.controller.stale_events == stale + 1
+    assert calls(h.ingress, "request_gate_partial") == []
+    assert h.arbiter.settles == [(1, False)]
+
+
+async def test_a_winning_endpoint_wake_requests_its_gate_partial_when_its_name_heard_comes():
+    h = make_harness([Pause()])
+    h.start_voice()
+    h.post(endpoint_wake(1500))
+    await h.settle()
+    assert [c.answered for c in h.arbiter.claims] == [True]  # the verdict came first
+    assert calls(h.ingress, "request_gate_partial") == []
+
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
+    await h.settle()
+
+    ((*_, uid),) = calls(h.ingress, "open_utterance")
+    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, 99 + 15)]
+
+
+async def test_an_accepted_and_a_rejected_claim_are_each_settled_exactly_once():
+    h = make_harness([Pause()])
+    h.start_voice()
+    rejected = await name_hit(h)
+    await gate(h, rejected, "I missed the bus")
+    accepted = await name_hit(h)
+    await gate(h, accepted, "mist, what's up")
+    h.post(h.ingress.ended(accepted, "Mist, what's up?"))
+    await h.settle()
+
+    assert h.arbiter.settles == [(1, False), (2, True)]

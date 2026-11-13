@@ -49,6 +49,7 @@ from backend.realtime.ingress import (
     EndpointCandidate,
     IngressOverload,
     IngressSeed,
+    NameHeard,
     OpenedUtterance,
     SpeechResumed,
     SpeechStarted,
@@ -60,7 +61,13 @@ from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.playback import LanePurge, TurnLane
 from backend.realtime.protocol import Frame, MsgType, VoiceStartMessage
 from backend.realtime.scene import SceneAnchor
-from backend.realtime.speech import CancelToken, SynthChunk, TextSegment
+from backend.realtime.speech import (
+    CancelToken,
+    NameHit,
+    SpotterCalibration,
+    SynthChunk,
+    TextSegment,
+)
 from backend.realtime.turn import (
     Reconfigure,
     TurnController,
@@ -442,7 +449,15 @@ class RecordingIngress:
     def resumed(self, uid: str) -> SpeechResumed:
         return SpeechResumed(self.epoch, self._next_seq(), uid, self._pos(uid))
 
-    def partial(self, uid: str, text: str, *, heard_at_ms: int = 0) -> TranscriptPartial:
+    def partial(
+        self,
+        uid: str,
+        text: str,
+        *,
+        heard_at_ms: int = 0,
+        gate: bool = False,
+        through_pos: int | None = None,
+    ) -> TranscriptPartial:
         return TranscriptPartial(
             epoch=self.epoch,
             event_seq=self._next_seq(),
@@ -453,6 +468,32 @@ class RecordingIngress:
             heard_at_ms=heard_at_ms,
             audio_end_pos=self._pos(uid) + 10,
             uncovered_since_ms=heard_at_ms,
+            gate=gate,
+            through_pos=through_pos,
+        )
+
+    def heard(
+        self,
+        uid: str | None = None,
+        *,
+        from_pos: int = 100,
+        hit_pos: int = 110,
+        arrival: float = 0.0,
+        score: float = 0.9,
+        reference_score: float | None = None,
+        spotter: str = "server",
+        keyword: str = "mist",
+    ) -> NameHeard:
+        """A name hit; `uid` is the open utterance it fell in, None when ingress was dormant."""
+        return NameHeard(
+            epoch=self.epoch,
+            event_seq=self._next_seq(),
+            hit=NameHit(end_pos=hit_pos, keyword=keyword, score=score),
+            arrival=arrival,
+            from_pos=from_pos,
+            utterance_id=uid,
+            reference_score=reference_score,
+            spotter=spotter,  # type: ignore[arg-type]
         )
 
     def candidate(self, uid: str, text: str, *, heard_at_ms: int = 0) -> EndpointCandidate:
@@ -803,8 +844,17 @@ def make_harness(
     segmenter: SegmenterConfig = TEST_SEGMENTER,
     turn_config: TurnConfig | None = None,
     start: bool = True,
+    wake: WakeConfig | None = None,
+    recent_tts_text: Callable[[int], str] | None = None,
+    calibration: SpotterCalibration | None = None,
+    hit_lag_ms: int = 150,
+    solo: bool = True,
 ) -> Harness:
-    """A controller wired to every fake; `synthesizer=False` builds one with no TTS."""
+    """A controller wired to every fake; `synthesizer=False` builds one with no TTS.
+
+    `wake` configures the gate and the controller alike. With `solo=False` every wake claim waits
+    until the test grants or denies it, as it would with two sessions registered.
+    """
     clock = FakeClock()
     ids = IdCounter()
     outbound = RecordingOutbound(auto_take=auto_take)
@@ -818,8 +868,9 @@ def make_harness(
         synth = None
     else:
         synth = synthesizer
-    arbiter = FakeWakeArbiter(solo=True)
+    arbiter = FakeWakeArbiter(solo=solo)
     host = FakeHost()
+    wake_config = wake or WakeConfig()
     barge = barge_in or BargeInConfig(arm_delay_ms=0)
     policy = KeywordBargeIn(barge, aec="headset", recent_tts_text=lambda _ms: "", clock=clock)
     kwargs: dict[str, object] = {
@@ -829,11 +880,11 @@ def make_harness(
         "host": host,
         "placement": placement or floor_placement,
         "arbiter": arbiter,
-        "gate": default_gate(),
-        "wake": WakeConfig(),
-        "calibration": None,
-        "hit_lag_ms": 150,
-        "recent_tts_text": lambda _ms: "",
+        "gate": default_gate(wake_config),
+        "wake": wake_config,
+        "calibration": calibration,
+        "hit_lag_ms": hit_lag_ms,
+        "recent_tts_text": recent_tts_text or (lambda _ms: ""),
         "new_utterance_id": ids,
         "clock": clock,
         "synthesizer": synth,

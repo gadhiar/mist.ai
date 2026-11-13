@@ -28,14 +28,24 @@ then the gate set, then the buffer flushed in order. Speech that resumes, or any
 ends it while held, cancels it without trace: nothing was sent, so nothing is purged, sent or
 committed.
 
+MIST wakes by name. A `NameHeard` from the server's spotter, or an endpoint's `wake` and the
+`NameHeard` its backlog yields, opens an unpublished wake candidate: nothing names it on the
+wire, in a log line or to the responder until the addressee gate accepts it. The controller
+checks her own recent speech first, sends `attend`, opens the candidate, claims it from the
+cross-session arbiter, checks the reference score once the claim may proceed, and only then asks
+ingress for the one gate decode. Acceptance publishes the candidate in one step and replays any
+end of turn held meanwhile; rejection drops it and sends one `wake_rejected`. While a turn is in
+flight an accepted name interrupts it with `barge_in` reason `wake`. After a name-opened turn a
+follow-up window, when configured, keeps ingress engaged so the next utterance needs no name.
+
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
 interruption note, cancellation, prefetch, `turn_metrics`, the scene anchors not tied to a
 wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to text on
 `tts_failed`, completion after both ends and the tool grace's orphan closing. T11d adds the
 `VoiceStart`, `voice_stop` and `Reconfigure` rows, the held turn, and the keyword row: a
 transcript's keyword interrupt publishes its utterance, whose end then starts a turn from the
-text after the keyword or closes with `dropped keyword`. Later work adds, in the
-methods named for them, the addressee gate, wake arbitration and the follow-up window (T11e).
+text after the keyword or closes with `dropped keyword`. T11e adds the addressee rows, the
+handling of arbitration verdicts and the follow-up window; the arbiter itself is T11e's part 2.
 """
 
 from __future__ import annotations
@@ -65,6 +75,7 @@ from .budget import (
 )
 from .errors import SpeechEngineError
 from .ingress import (
+    FRAME_MS,
     EndpointCandidate,
     IngressOverload,
     IngressSeed,
@@ -91,7 +102,9 @@ from .protocol import (
     LatencyBudget,
     MsgType,
     OverloadDetail,
+    PlaybackDuckMessage,
     PowerLevel,
+    Spotter,
     StateCycleMessage,
     StreamCancelledMessage,
     StreamChannel,
@@ -111,7 +124,9 @@ from .protocol import (
     VoiceDecisionEndpoint,
     VoiceDecisionOverload,
     VoiceDecisionRelease,
+    VoiceDecisionWakeRejected,
     VoiceStartMessage,
+    WakeRejectedDetail,
     next_turn_tag,
 )
 from .scene import (
@@ -135,6 +150,8 @@ from .speech import (
     SynthChunk,
     TextSegment,
     TranscriptUpdate,
+    false_accepts_per_hour,
+    positive_quantile,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +173,13 @@ STAGE_TIMESTAMPS: tuple[tuple[str, str], ...] = (
     ("transport_playback_ms", "first_played"),
 )
 """Each budget stage and the `timings` key that ends it, in order (v2 Design changes)."""
+
+DUCK_DB = 12.0
+"""How far a name hit lowers her playback until its verdict (v1's 12 dB duck)."""
+
+WakeRejectReason = Literal[
+    "self_speech", "self_media", "not_addressed", "lost_arbitration", "no_backlog"
+]
 
 
 # -- Ports ----------------------------------------------------------------------------------
@@ -222,6 +246,12 @@ class ControllerIngress(Protocol):
 
     def set_engaged(self, engaged: bool) -> None:
         """Listen for speech without the name, or stop."""
+        ...
+
+    def expect_endpoint_wake(
+        self, *, keyword: str, score: float, backlog_ms: int, arrival: float
+    ) -> None:
+        """Treat the next `backlog_ms` of frames as an endpoint's backlog ending at its name."""
         ...
 
     def drop(self, utterance_id: str, reason: Literal["text_input", "wake_lost", "not_addressed"]):
@@ -447,6 +477,13 @@ class _AckPlayed:
 _TurnEvent = _StreamItem | _StreamEnded | _AudioStarted | _PlayEnded | _SynthFailed | _AckPlayed
 
 
+@dataclass(frozen=True, slots=True)
+class _WindowLapsed:
+    """The follow-up window `seq` has run its length."""
+
+    seq: int
+
+
 # -- State --------------------------------------------------------------------------------
 
 
@@ -457,6 +494,11 @@ class _Utterance:
     `keyword` is the keyword a transcript verdict interrupted a turn with: the barge-in
     published the utterance, and its turn text is then what follows that keyword (v2, v5).
     `idle_ignored` notes the one `barge_in_ignored idle` it got.
+
+    A `candidate` is unpublished and waits for a verdict: a name's (`_Wake`) or, in a
+    follow-up window (`followup`), its first transcript's. Until then its latest partial is kept
+    in `latest`, and its `EndpointCandidate` and `UtteranceEnded` in `held_ends`, the latest of
+    each in arrival order (v5 :1176). `wake_timings` are the name's, for the turn it opens.
     """
 
     utterance_id: str
@@ -467,6 +509,38 @@ class _Utterance:
     partial_ms: int = 0
     keyword: str | None = None
     idle_ignored: bool = False
+    candidate: bool = False
+    followup: bool = False
+    latest: TranscriptPartial | None = None
+    held_ends: list[EndpointCandidate | UtteranceEnded] = field(default_factory=list)
+    wake_timings: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True, eq=False)
+class _Wake:
+    """One name, from its hit (or an endpoint's `wake`) to the verdict on its candidate.
+
+    `arrival_ms` is the hit's arrival, or the `wake` message's; `name_end_ms` is when the name
+    ended by estimate, from which `wake_screen_ms` runs. `turn_id` is the turn in flight at the
+    hit, which a `wake_rejected` names. `utterance_id` is None while an endpoint wake waits for
+    the `NameHeard` its backlog yields (`waiting_name`). `proceed` records a winning verdict;
+    `claim_id` stays in the controller's claims until the claim is settled.
+    """
+
+    source: Spotter
+    score: float
+    arrival_ms: int
+    name_end_ms: int
+    turn_id: str | None
+    reference_score: float | None = None
+    attend_at: int | None = None
+    ducked: str | None = None
+    claim_id: int | None = None
+    proceed: bool = False
+    waiting_name: bool = False
+    utterance_id: str | None = None
+    hit_pos: int = 0
+    gate_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,6 +607,7 @@ class _Turn:
     handoff_seen: bool = False
     handoff_waiting: bool = False
     handoff_ack_ms: int | None = None
+    wake_timings: dict[str, int] = field(default_factory=dict)
     ack_last_index: int | None = None
     synth_done_through: int = -1
     stretch_open: bool = False
@@ -873,6 +948,14 @@ class TurnController:
         self._stale = 0
         self._closed = False
         self._cancel_pending = False
+        self._candidate: _Wake | None = None
+        self._claims: dict[int, _Wake] = {}
+        self._muted = False
+        self._engaged = False
+        self._window_until: int | None = None
+        self._window_seq = 0
+        self._window_task: asyncio.Task[None] | None = None
+        self._silent_closes = 0
         self._handlers: dict[type, Callable[[object], Awaitable[None]]] = {
             SpeechStarted: self._on_speech_started,
             SpeechResumed: self._on_speech_resumed,
@@ -900,6 +983,7 @@ class TurnController:
             _PlayEnded: self._on_play_ended,
             _SynthFailed: self._on_synth_failed,
             _AckPlayed: self._on_ack_played,
+            _WindowLapsed: self._on_window_lapsed,
         }  # type: ignore[dict-item]
 
     # -- Public surface -------------------------------------------------------------------
@@ -921,8 +1005,13 @@ class TurnController:
 
     @property
     def stale_events(self) -> int:
-        """Events dropped because they named another epoch, utterance or turn."""
+        """Events dropped because they named another epoch, utterance, turn or settled claim."""
         return self._stale
+
+    @property
+    def silent_closes(self) -> int:
+        """Unnamed utterances that ended unpublished, closed with no message (v5 :421-426)."""
+        return self._silent_closes
 
     def start(self) -> None:
         """Start the mailbox task on the running loop; a second call does nothing."""
@@ -954,9 +1043,12 @@ class TurnController:
                 await self._handle(message)
                 if self._cancel_pending:
                     raise asyncio.CancelledError
+                self._sync_engaged()
                 self._maybe_reconfigure()
         except asyncio.CancelledError:
             self._closed = True
+            self._close_window()
+            self._drop_candidates(None)
             turn = self._turn
             if turn is not None and not turn.ending:
                 await self._cut(turn, reason="disconnect", notify=False)
@@ -1114,22 +1206,40 @@ class TurnController:
         self._responder.prefetch(self._session_id, None)
 
     async def _on_speech_started(self, event: SpeechStarted) -> None:
+        """Speech that opened an engaged utterance, which no name opened (v5 :1177).
+
+        In `thinking` and `speaking` it stays unpublished: only the keyword policy judges it,
+        and in `text` it is ignored. In `idle` it is the follow-up window's candidate while the
+        window is open. Ingress opens no utterance while dormant, so the `idle` cell is otherwise
+        unreachable; it keeps the earlier rows' publishing at speech start.
+        """
         if not self._accept(event):
             return
         utterance = self._utterance(event.utterance_id, event.first_pos)
-        if utterance is None or utterance.published:
+        if utterance is None or utterance.published or utterance.candidate:
             return
-        # In `thinking` and `speaking` user speech stays unpublished: only the keyword policy
-        # judges it (v5). T11e gates the publishing in `idle` by the addressee.
-        if self._phase == "idle":
-            self._publish(utterance)
+        if self._phase != "idle":
+            return
+        if self._turn is None and self._window_until is not None:
+            utterance.candidate = True
+            utterance.followup = True
+            return
+        self._publish(utterance)
 
     async def _on_speech_resumed(self, event: SpeechResumed) -> None:
-        """The utterance continued: a turn held on it is cancelled without trace (v1)."""
+        """The utterance continued: a turn held on it is cancelled without trace (v1).
+
+        A candidate's held `EndpointCandidate` no longer stands: its end is not near.
+        """
         if not self._accept(event):
             return
-        if self._utterance(event.utterance_id, event.first_pos) is None:
+        utterance = self._utterance(event.utterance_id, event.first_pos)
+        if utterance is None:
             return
+        if utterance.candidate:
+            utterance.held_ends = [
+                e for e in utterance.held_ends if not isinstance(e, EndpointCandidate)
+            ]
         turn = self._held_turn(event.utterance_id)
         if turn is not None:
             await self._cancel_held(turn)
@@ -1148,8 +1258,17 @@ class TurnController:
         if utterance is None:
             return
         utterance.partial_text = event.text
-        frame_ms = self._settings.frame_ms if self._settings is not None else 20
-        utterance.partial_ms = max(event.audio_end_pos - event.first_pos + 1, 0) * frame_ms
+        utterance.partial_ms = max(event.audio_end_pos - event.first_pos + 1, 0) * self._frame_ms
+        if utterance.candidate:
+            # Unpublished: the gate reads it, not the keyword policy, and nothing is sent.
+            utterance.latest = event
+            wake = self._candidate_of(utterance.utterance_id)
+            if wake is not None:
+                if event.gate and wake.gate_requested:
+                    await self._decide(wake, event.text)
+            elif utterance.followup:
+                await self._judge_followup(utterance)
+            return
         if utterance.published:
             self._send_control(
                 TranscriptPartialMessage(
@@ -1206,6 +1325,12 @@ class TurnController:
         utterance = self._utterance(event.utterance_id, event.first_pos)
         if utterance is None:
             return
+        if utterance.candidate:
+            await self._hold_end(utterance, event)
+            return
+        await self._candidate_step(utterance, event)
+
+    async def _candidate_step(self, utterance: _Utterance, event: EndpointCandidate) -> None:
         utterance.partial_text = event.text
         if not utterance.published:
             return
@@ -1219,6 +1344,7 @@ class TurnController:
                 marks={"stt_final": self._clock.now_ms()},
                 held_utterance=event.utterance_id,
             )
+            self._take_wake_timings(event.utterance_id)
 
     async def _on_utterance_ended(self, event: UtteranceEnded) -> None:
         if not self._accept(event):
@@ -1226,6 +1352,12 @@ class TurnController:
         utterance = self._utterance(event.utterance_id, event.first_pos)
         if utterance is None:
             return
+        if utterance.candidate:
+            await self._hold_end(utterance, event)
+            return
+        await self._ended_step(utterance, event)
+
+    async def _ended_step(self, utterance: _Utterance, event: UtteranceEnded) -> None:
         utterance.closed = True
         held = self._held_turn(event.utterance_id)
         if held is not None:
@@ -1243,7 +1375,9 @@ class TurnController:
             verdict = self._policy.on_utterance_end(_final_update(event), self._phase)
             self._send_idle_ignored(utterance, verdict)
         if not utterance.published:
-            return  # unnamed speech that interrupted nothing closes silently (v5)
+            # Unnamed speech that interrupted nothing closes silently, counted (v5 :421-426).
+            self._silent_closes += 1
+            return
         if utterance.keyword is not None and not text:
             # A keyword interrupt consumed it with nothing after the keyword (v2's closing
             # messages), in whichever phase it ends: no turn starts, and a typed turn goes on.
@@ -1343,6 +1477,13 @@ class TurnController:
                     ),
                 )
             )
+        elif utterance.candidate:
+            # Nothing named it, so no message names its close; a name's cue is undone (v8).
+            utterance.candidate = False
+            utterance.held_ends.clear()
+            wake = self._candidate_of(event.utterance_id)
+            if wake is not None:
+                self._abandon(wake, restore=True)
         held = self._held_turn(event.utterance_id)
         if held is not None:
             await self._cancel_held(held)
@@ -1359,8 +1500,433 @@ class TurnController:
         )
 
     async def _on_name_heard(self, event: NameHeard) -> None:
-        """A name hit opens a wake candidate through the addressee gate: T11e."""
-        self._accept(event)
+        """The `NameHeard` row (v5 :1174): a name hit opens a wake candidate.
+
+        Check a, `attend` (and a duck while she speaks), the candidate, then a claim; checks b
+        and c follow when the claim may proceed. A held utterance is already addressed, so a
+        name in it is ignored, as is a name in a published utterance or while another candidate
+        waits. An endpoint's `NameHeard` continues the `wake` that armed it.
+        """
+        if not self._accept(event):
+            return
+        if event.spotter == "endpoint":
+            await self._on_endpoint_name(event)
+            return
+        if self._phase == "held" or self._candidate is not None:
+            return
+        named = self._utterances.get(event.utterance_id) if event.utterance_id else None
+        if named is not None and named.published:
+            return
+        arrival = round(event.arrival)
+        wake = _Wake(
+            source="server",
+            score=event.hit.score,
+            arrival_ms=arrival,
+            name_end_ms=arrival - self._hit_lag_ms,
+            turn_id=self._turn_id_now(),
+            reference_score=event.reference_score,
+            hit_pos=event.hit.end_pos,
+        )
+        if not self._screen_self_speech(wake):
+            return
+        self._candidate = wake
+        self._attend(wake)
+        if not self._open_candidate(wake, event.from_pos, named):
+            return
+        self._claim(wake, self._wake.kws_threshold)
+
+    async def _on_endpoint_name(self, event: NameHeard) -> None:
+        """The backlog of a waiting endpoint wake has arrived: open its candidate there.
+
+        One with no wake waiting for it is dropped and counted (v8 :256-260), as after a mute
+        abandoned the wake that armed it.
+        """
+        wake = self._candidate
+        if wake is None or not wake.waiting_name:
+            self._count_stale()
+            return
+        wake.waiting_name = False
+        wake.hit_pos = event.hit.end_pos
+        wake.reference_score = event.reference_score
+        named = self._utterances.get(event.utterance_id) if event.utterance_id else None
+        if not self._open_candidate(wake, event.from_pos, named):
+            return
+        await self._screen(wake)
+
+    # -- Wake by name ---------------------------------------------------------------------
+
+    @property
+    def _frame_ms(self) -> int:
+        return self._settings.frame_ms if self._settings is not None else FRAME_MS
+
+    def _turn_id_now(self) -> str | None:
+        turn = self._turn
+        return turn.turn_id if turn is not None and not turn.ending else None
+
+    def _candidate_of(self, utterance_id: str) -> _Wake | None:
+        wake = self._candidate
+        if wake is None or wake.utterance_id != utterance_id:
+            return None
+        return wake
+
+    def _screen_self_speech(self, wake: _Wake) -> bool:
+        """Check a, which reads memory only and so runs before `attend`: False when it rejects.
+
+        `pre_decode` is asked about her recent speech alone here; the reference score is check
+        b's, which runs after `attend`.
+        """
+        recent = self._recent_tts_text(self._gate.echo_guard_ms)
+        verdict = self._gate.pre_decode(
+            score=wake.score, reference_score=None, recent_tts_text=recent
+        )
+        if verdict is None:
+            return True
+        self._send_wake_rejected(wake, "self_speech")
+        return False
+
+    def _attend(self, wake: _Wake) -> None:
+        """`attend` at the hit, before any wait, and the duck while she speaks (v5 :1174)."""
+        now = self._clock.now_ms()
+        if self._wake.attend_cue:
+            wake.attend_at = now
+            self._send_control(StateCycleMessage(state="attend"))
+        turn = self._turn
+        if self._phase == "speaking" and turn is not None and not turn.ending:
+            wake.ducked = turn.turn_id
+            self._send_control(PlaybackDuckMessage(turn_id=turn.turn_id, db=DUCK_DB))
+
+    def _open_candidate(self, wake: _Wake, from_pos: int, named: _Utterance | None) -> bool:
+        """Open the candidate at `from_pos`; in a turn's phase it is the open engaged utterance.
+
+        A name that falls in an utterance already published is already addressed: the hit is
+        abandoned with its cue undone, and False is returned.
+        """
+        utterance = named if named is not None and not named.closed else None
+        if utterance is None:
+            assert self._ingress is not None  # noqa: S101 - `_accept` checked it
+            opened = self._ingress.open_utterance("wake", from_pos)
+            utterance = self._utterances.get(opened.utterance_id)
+            if utterance is None:
+                utterance = _Utterance(opened.utterance_id, opened.first_pos)
+                self._utterances[opened.utterance_id] = utterance
+        if utterance.published or utterance.closed:
+            self._abandon(wake, restore=True)
+            return False
+        utterance.candidate = True
+        utterance.followup = False
+        wake.utterance_id = utterance.utterance_id
+        return True
+
+    def _claim(self, wake: _Wake, threshold: float) -> None:
+        """Enter arbitration; the verdict comes back through the mailbox as a `WakeVerdict`.
+
+        A lone session's arbiter answers before `claim` returns, when the id is not yet known,
+        so that verdict is posted once it is.
+        """
+        calibration = self._calibration
+        fa: float | None = None
+        quantile: float | None = None
+        if calibration is not None:
+            fa = false_accepts_per_hour(wake.score, calibration.false_accepts)
+            quantile = positive_quantile(wake.score, calibration.positive_quantile)
+            if fa is None or quantile is None:
+                fa = quantile = None
+        rank = WakeRank(
+            arrival=float(wake.arrival_ms),
+            false_accepts_per_hour=fa,
+            positive_quantile=quantile,
+            margin=wake.score - threshold,
+        )
+        known: list[int] = []
+        early: list[bool] = []
+
+        def verdict(proceed: bool) -> None:
+            if known:
+                self._mailbox.put_nowait(WakeVerdict(known[0], proceed))
+            else:
+                early.append(proceed)
+
+        claim_id = self._arbiter.claim(self._session_id, rank, verdict)
+        known.append(claim_id)
+        wake.claim_id = claim_id
+        self._claims[claim_id] = wake
+        for proceed in early:
+            self._mailbox.put_nowait(WakeVerdict(claim_id, proceed))
+
+    def _settle(self, wake: _Wake, accepted: bool) -> None:
+        """Settle the candidate's claim, once: later verdicts for it are stale."""
+        claim_id = wake.claim_id
+        if claim_id is None or self._claims.pop(claim_id, None) is None:
+            return
+        self._arbiter.settle(claim_id, accepted)
+
+    async def _screen(self, wake: _Wake) -> None:
+        """Checks b and c once the claim may proceed and the candidate is open.
+
+        Check b needs no decode. Check c reads the one gate decode through the hit plus
+        `gate_tail_ms`; when ingress has already ended the candidate, no decode can come, and its
+        final transcript, held meanwhile, is read instead.
+        """
+        if not wake.proceed or wake.utterance_id is None or wake.gate_requested:
+            return
+        media = self._gate.pre_decode(
+            score=wake.score, reference_score=wake.reference_score, recent_tts_text=""
+        )
+        if media is not None:
+            self._reject(wake, "self_media")
+            return
+        utterance = self._utterances[wake.utterance_id]
+        ended = [e for e in utterance.held_ends if isinstance(e, UtteranceEnded)]
+        if ended:
+            await self._decide(wake, ended[-1].text)
+            return
+        wake.gate_requested = True
+        assert self._ingress is not None  # noqa: S101 - a candidate is open on it
+        through = wake.hit_pos + self._wake.gate_tail_ms // self._frame_ms
+        self._ingress.request_gate_partial(wake.utterance_id, through)
+
+    async def _decide(self, wake: _Wake, text: str) -> None:
+        verdict = self._gate.decide(
+            text=text, score=wake.score, reference_score=wake.reference_score
+        )
+        if verdict.accepted:
+            await self._accept_wake(wake)
+        else:
+            self._reject(wake, "not_addressed")
+
+    async def _accept_wake(self, wake: _Wake) -> None:
+        """Accept: interrupt a turn in flight, publish in one step, replay a held end (v5)."""
+        self._candidate = None
+        self._settle(wake, True)
+        assert wake.utterance_id is not None  # noqa: S101 - only an open candidate is decided
+        utterance = self._utterances[wake.utterance_id]
+        utterance.candidate = False
+        now = self._clock.now_ms()
+        screened_at = wake.attend_at if wake.attend_at is not None else now
+        utterance.wake_timings = {
+            "wake_accept_ms": max(now - wake.arrival_ms, 0),
+            "wake_screen_ms": max(screened_at - wake.name_end_ms, 0),
+        }
+        turn = self._turn
+        if turn is not None and not turn.ending:
+            if turn.held:
+                await self._cancel_held(turn)  # it never reached the client
+            else:
+                self._send_control(
+                    VoiceDecisionBargeIn(
+                        turn_id=turn.turn_id,
+                        reason="wake",
+                        detail=BargeInDetail(
+                            keyword=None, phase=self._phase, utterance_id=wake.utterance_id
+                        ),
+                    )
+                )
+                await self._cut(turn, reason="barge_in")
+        self._publish_candidate(utterance, wake=True)
+        await self._replay(utterance)
+
+    def _publish_candidate(self, utterance: _Utterance, *, wake: bool) -> None:
+        """Publish an accepted candidate in one step (v5 :411-416, the D3 anchors at :1196-1197).
+
+        `vad_status`, `listen`, the scene `wake` for a name, `listening`, then the latest
+        partial; from here it is an ordinary utterance.
+        """
+        utterance.published = True
+        utterance.candidate = False
+        self._send_control(VadStatusMessage(status="speech_started"))
+        self._send_control(StateCycleMessage(state="listen"))
+        if wake:
+            self._scene.phase("wake", turn_id=None, at=Immediate())
+        self._scene.phase("listening", turn_id=None, at=Immediate())
+        latest = utterance.latest
+        if latest is not None:
+            self._send_control(
+                TranscriptPartialMessage(
+                    utterance_id=utterance.utterance_id,
+                    text=latest.text,
+                    stable_chars=latest.stable_chars,
+                )
+            )
+        self._responder.prefetch(self._session_id, latest.text if latest is not None else None)
+        self._set_engaged(True)
+
+    async def _replay(self, utterance: _Utterance) -> None:
+        """Replay the held ends after the publishing step, in arrival order, as if just come."""
+        ends, utterance.held_ends = utterance.held_ends, []
+        for event in ends:
+            if utterance.closed:
+                return
+            if isinstance(event, EndpointCandidate):
+                await self._candidate_step(utterance, event)
+            else:
+                await self._ended_step(utterance, event)
+
+    async def _hold_end(
+        self, utterance: _Utterance, event: EndpointCandidate | UtteranceEnded
+    ) -> None:
+        """Keep the latest of each end until the verdict; no prefetch (v5 :1176, :401-405).
+
+        A follow-up candidate whose end comes before any partial is judged at its end.
+        """
+        utterance.held_ends = [e for e in utterance.held_ends if type(e) is not type(event)]
+        utterance.held_ends.append(event)
+        if utterance.followup and isinstance(event, UtteranceEnded):
+            await self._judge_followup(utterance)
+
+    def _reject(self, wake: _Wake, reason: WakeRejectReason) -> None:
+        """Drop the candidate, send one `wake_rejected`, and put the client back (v5 :417-422)."""
+        drop = "wake_lost" if reason == "lost_arbitration" else "not_addressed"
+        self._abandon(wake, drop_reason=drop, restore=False)
+        self._send_wake_rejected(wake, reason)
+        self._restore(wake)
+
+    def _abandon(
+        self,
+        wake: _Wake,
+        *,
+        drop_reason: Literal["text_input", "wake_lost", "not_addressed"] | None = None,
+        restore: bool,
+    ) -> None:
+        """End the candidate with its claim settled not accepted and no message naming it.
+
+        `drop_reason` closes its utterance through ingress's `drop`; None leaves ingress alone,
+        when ingress dropped it itself or is closing. `restore` undoes the hit's cue.
+        """
+        if self._candidate is wake:
+            self._candidate = None
+        self._settle(wake, False)
+        utterance = self._utterances.get(wake.utterance_id) if wake.utterance_id else None
+        if utterance is not None and not utterance.closed:
+            utterance.closed = True
+            utterance.candidate = False
+            utterance.held_ends.clear()
+            if drop_reason is not None and self._ingress is not None:
+                self._ingress.drop(utterance.utterance_id, drop_reason)
+        if restore:
+            self._restore(wake)
+
+    def _restore(self, wake: _Wake) -> None:
+        """Unduck if the hit ducked, and resend the current phase's state after `attend`."""
+        turn = self._turn
+        ducked = wake.ducked is not None and turn is not None and turn.turn_id == wake.ducked
+        if ducked and turn is not None and not turn.ending:
+            self._send_control(PlaybackDuckMessage(turn_id=turn.turn_id, db=0.0))
+        wake.ducked = None
+        if wake.attend_at is None:
+            return
+        wake.attend_at = None
+        if turn is None or turn.ending or self._phase == "idle":
+            self._send_control(StateCycleMessage(state="idle"))
+        elif self._phase == "speaking":
+            self._send_control(StateCycleMessage(state="speak", turn_id=turn.turn_id))
+        elif self._phase == "held":
+            self._send_control(StateCycleMessage(state="listen"))
+        else:
+            self._send_control(StateCycleMessage(state="think", turn_id=turn.turn_id))
+
+    def _send_wake_rejected(self, wake: _Wake, reason: WakeRejectReason) -> None:
+        self._send_control(
+            VoiceDecisionWakeRejected(
+                turn_id=wake.turn_id,
+                reason=reason,
+                detail=WakeRejectedDetail(
+                    source=wake.source, score=wake.score, reference_score=wake.reference_score
+                ),
+            )
+        )
+
+    def _drop_candidates(
+        self, drop_reason: Literal["text_input", "wake_lost", "not_addressed"] | None
+    ) -> _Wake | None:
+        """Drop every unpublished candidate silently, settling a name's claim; returns the name's.
+
+        `text` and `voice_stop` drop a candidate with no `wake_rejected` (v5 :1189-1190), and a
+        disconnect drops it with nothing at all.
+        """
+        wake = self._candidate
+        if wake is not None:
+            self._abandon(wake, drop_reason=drop_reason, restore=False)
+        for utterance in self._utterances.values():
+            if utterance.candidate and not utterance.closed:
+                utterance.closed = True
+                utterance.candidate = False
+                utterance.held_ends.clear()
+                if drop_reason is not None and self._ingress is not None:
+                    self._ingress.drop(utterance.utterance_id, drop_reason)
+        return wake
+
+    async def _judge_followup(self, utterance: _Utterance) -> None:
+        """A follow-up window's candidate: checks a and b on its first transcript (A36).
+
+        It carries no name, so check a reads her recent speech, and check b has no reference
+        score to read. Accepted as `followup`, it is published; rejected, it closes silently.
+        """
+        utterance.followup = False
+        recent = self._recent_tts_text(self._gate.echo_guard_ms)
+        verdict = self._gate.pre_decode(score=0.0, reference_score=None, recent_tts_text=recent)
+        if verdict is not None:
+            utterance.candidate = False
+            utterance.closed = True
+            utterance.held_ends.clear()
+            if self._ingress is not None:
+                self._ingress.drop(utterance.utterance_id, "not_addressed")
+            return
+        self._publish_candidate(utterance, wake=False)
+        await self._replay(utterance)
+
+    def _take_wake_timings(self, utterance_id: str) -> None:
+        """Give the turn just opened from the utterance the name's wake timings, if any."""
+        utterance = self._utterances.get(utterance_id)
+        if utterance is not None and self._turn is not None and utterance.wake_timings:
+            self._turn.wake_timings = dict(utterance.wake_timings)
+
+    # -- Listening: engaged or dormant, and the follow-up window ------------------------------
+
+    def _set_engaged(self, engaged: bool) -> None:
+        if self._ingress is None or engaged == self._engaged:
+            return
+        self._engaged = engaged
+        self._ingress.set_engaged(engaged)
+
+    def _busy(self) -> bool:
+        """A turn, a waiting name, or an addressed or waiting utterance still open."""
+        if self._turn is not None or self._candidate is not None:
+            return True
+        return any(not u.closed and (u.published or u.candidate) for u in self._utterances.values())
+
+    def _sync_engaged(self) -> None:
+        """At the end of each step: dormant again once nothing is in flight and no window is open.
+
+        Ingress is engaged at an acceptance (v5 :1202-1203) and stays so through the turn it
+        opens, so a stop keyword during her reply is heard.
+        """
+        if self._engaged and self._window_until is None and not self._busy():
+            self._set_engaged(False)
+
+    def _open_window(self) -> None:
+        """Open the follow-up window at a turn's end, when one is configured (A36)."""
+        length = self._wake.followup_window_ms
+        if not self._engaged or length <= 0 or self._closed or self._ingress is None:
+            return
+        self._close_window()
+        self._window_seq += 1
+        self._window_until = self._clock.now_ms() + length
+        self._window_task = asyncio.ensure_future(self._lapse(self._window_seq, length))
+
+    async def _lapse(self, seq: int, length: int) -> None:
+        await self._clock.sleep_ms(length)
+        self._mailbox.put_nowait(_WindowLapsed(seq))
+
+    def _close_window(self) -> None:
+        task, self._window_task = self._window_task, None
+        self._window_until = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _on_window_lapsed(self, event: _WindowLapsed) -> None:
+        if event.seq == self._window_seq:
+            self._window_task = None
+            self._window_until = None
 
     # -- Controls ---------------------------------------------------------------------------
 
@@ -1368,8 +1934,11 @@ class TurnController:
         """A typed turn; a held turn is cancelled without trace and its utterance closed first.
 
         The held utterance was never shown as a turn, so it closes visibly (`dropped
-        text_input`) rather than ending later and cutting the typed turn it preceded (v1).
+        text_input`) rather than ending later and cutting the typed turn it preceded (v1). An
+        unpublished candidate is dropped silently (v5 :1189-1190); the typed turn's `think`
+        follows the `attend` its name sent.
         """
+        self._drop_candidates("text_input")
         turn = self._turn
         if turn is not None and turn.held and turn.utterance_id is not None:
             await self._cancel_held(turn)
@@ -1420,24 +1989,36 @@ class TurnController:
         self._adopt(message)
 
     def _adopt(self, start: VoiceStart) -> None:
+        """Adopt an ingress; a new one starts dormant, and a follow-up window carries over."""
         self._ingress = start.ingress
         self._epoch = start.epoch
         self._policy = start.policy
         self._settings = start.settings
         self._handled_seq = 0
+        self._engaged = False
+        if self._window_until is not None:
+            self._set_engaged(True)
 
     async def _on_voice_stop(self, message: VoiceStop) -> None:
         """Answer a pending reconfigure first, then interrupt by phase and close ingress."""
         await self._stop_voice()
 
     async def _stop_voice(self) -> None:
+        """An unpublished candidate is dropped silently with ingress (v5 :1189-1190).
+
+        When its name sent `attend` and no cut follows to send `idle`, the phase's state is sent
+        again, so the client is not left attending.
+        """
         if self._pending is not None:
             pending, self._pending = self._pending, None
             self._host.refuse(pending, "voice_stop")
+        wake = self._drop_candidates(None)
         turn = self._turn
+        cut = False
         if turn is not None and turn.held:
             await self._cancel_held(turn)
         elif turn is not None and not turn.ending and self._phase in ("thinking", "speaking"):
+            cut = True
             self._send_control(
                 VoiceDecisionBargeIn(
                     turn_id=turn.turn_id,
@@ -1446,6 +2027,9 @@ class TurnController:
                 )
             )
             await self._cut(turn, reason="voice_stop")
+        if wake is not None and not cut:
+            self._restore(wake)
+        self._close_window()
         self._close_ingress()
 
     def _close_ingress(self) -> None:
@@ -1502,6 +2086,8 @@ class TurnController:
         """
         if self._phase != "idle" or self._turn is not None or self._ingress is None:
             return False
+        if self._candidate is not None:
+            return False  # an endpoint wake may still be waiting for its backlog
         if any(not u.closed for u in self._utterances.values()):
             return False
         return self._ingress.idle_since() == self._handled_seq
@@ -1527,13 +2113,85 @@ class TurnController:
         self._adopt(start)
 
     async def _on_mute(self, message: Mute) -> None:
-        """Mute closes nothing itself: ingress emits the open utterance's drop (v8)."""
+        """Mute closes nothing itself: ingress emits the open utterance's drop (v8).
+
+        An endpoint wake still waiting for its backlog has no utterance to drop: ingress
+        discarded the backlog at mute, so the wake is abandoned here, with its claim settled and
+        its cue undone, and no message (v8 :253-255).
+        """
+        self._muted = message.active
+        wake = self._candidate
+        if message.active and wake is not None and wake.waiting_name:
+            self._abandon(wake, restore=True)
 
     async def _on_wake(self, message: Wake) -> None:
-        """An endpoint wake goes through the addressee gate: T11e."""
+        """The `wake` row (v5 :1179): an endpoint's name, through the addressee gate.
+
+        With no voice session it is ignored. Muted, it gets a fresh id and one `dropped muted`
+        (v4). With too little backlog it is rejected `no_backlog` before anything opens.
+        Otherwise check a, `attend` and `expect_endpoint_wake` run now, and the claim is made
+        now, from the message's arrival, so a slow backlog still takes part in arbitration; the
+        candidate opens when the backlog's `NameHeard` comes. A held, thinking, speaking or typed
+        turn is interrupted only after acceptance.
+        """
+        if self._ingress is None:
+            return
+        if self._muted:
+            self._send_control(
+                VoiceDecisionDropped(
+                    turn_id=None,
+                    reason="muted",
+                    detail=DroppedDetail(
+                        utterance_id=self._new_utterance_id(),
+                        duration_ms=0,
+                        text=None,
+                        no_speech_prob=None,
+                        avg_logprob=None,
+                    ),
+                )
+            )
+            return
+        arrival = round(message.arrival)
+        wake = _Wake(
+            source="endpoint",
+            score=message.score,
+            arrival_ms=arrival,
+            name_end_ms=arrival,
+            turn_id=self._turn_id_now(),
+        )
+        if message.backlog_ms < self._wake.endpoint_min_backlog_ms:
+            self._send_wake_rejected(wake, "no_backlog")
+            return
+        if self._candidate is not None or not self._screen_self_speech(wake):
+            return
+        self._candidate = wake
+        wake.waiting_name = True
+        self._attend(wake)
+        self._ingress.expect_endpoint_wake(
+            keyword=message.keyword,
+            score=message.score,
+            backlog_ms=message.backlog_ms,
+            arrival=message.arrival,
+        )
+        self._claim(wake, self._wake.endpoint_threshold)
 
     async def _on_wake_verdict(self, message: WakeVerdict) -> None:
-        """Arbitration verdicts for this controller's claims: T11e."""
+        """An arbitration verdict for one of this controller's claims (v9 :153-163).
+
+        One for a claim already settled is ignored and counted: a drop was handled before a
+        verdict already in the mailbox. A losing claim closes its candidate
+        `lost_arbitration`; a winning one goes on to checks b and c, at once or when an endpoint
+        wake's `NameHeard` opens its candidate.
+        """
+        wake = self._claims.get(message.claim_id)
+        if wake is None:
+            self._count_stale()
+            return
+        if not message.proceed:
+            self._reject(wake, "lost_arbitration")
+            return
+        wake.proceed = True
+        await self._screen(wake)
 
     async def _on_barge_in_report(self, message: BargeInReport) -> None:
         """An endpoint's keyword: it interrupts only audio playing now (v1); every other verdict
@@ -1601,6 +2259,8 @@ class TurnController:
     async def _on_close(self, message: Close) -> None:
         self._closed = True
         self._pending = None  # a disconnect drops a pending reconfigure with no answer
+        self._close_window()
+        self._drop_candidates(None)  # settled, with nothing sent and no lever pulled
         turn = self._turn
         if turn is not None and not turn.ending:
             await self._cut(turn, reason="disconnect", notify=False)
@@ -1658,6 +2318,7 @@ class TurnController:
         marks = {"eot_decided": event.heard_at_ms, "stt_final": self._clock.now_ms()}
         base = event.heard_at_ms - event.silence_ms
         self._open_turn(turn_id, turn_text, "voice", base_ms=base, marks=marks)
+        self._take_wake_timings(event.utterance_id)
 
     def _open_turn(
         self,
@@ -2273,10 +2934,12 @@ class TurnController:
         return result
 
     def _finish(self, turn: _Turn) -> None:
+        """The turn is over: back to `idle`, with the follow-up window open if configured."""
         self._log_states(turn)
         if self._turn is turn:
             self._turn = None
             self._phase = "idle"
+            self._open_window()
 
     def _log_states(self, turn: _Turn) -> None:
         """One INFO line per turn that asked for a speaking state, with counts and no text."""
@@ -2297,6 +2960,7 @@ class TurnController:
             timings["first_played"] = ledger.scheduled_play_ms(0) - turn.base_ms
         if turn.handoff_ack_ms is not None:
             timings["handoff_ack_ms"] = turn.handoff_ack_ms
+        timings.update(turn.wake_timings)
         kind: Literal["plain", "tool"] = (
             "tool" if turn.tool or turn.scope.tool_dispatched else "plain"
         )
