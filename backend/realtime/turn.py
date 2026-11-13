@@ -24,9 +24,10 @@ task's own cancellation at server shutdown.
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
 interruption note, cancellation, prefetch, `turn_metrics`, the scene anchors not tied to a
 wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to text on
-`tts_failed`, completion after both ends and the tool grace's orphan closing. Later tasks add,
-in the methods named for them: the state table with hold, supersede, `voice_stop`, reconfigure
-and mute (T11d), and the addressee gate, wake arbitration and the follow-up window (T11e).
+`tts_failed`, completion after both ends and the tool grace's orphan closing. T11d adds the
+`VoiceStart`, `voice_stop` and `Reconfigure` rows. Later work adds, in the methods named for
+them: the hold, the held turn and supersede, and the addressee gate, wake arbitration and the
+follow-up window (T11e).
 """
 
 from __future__ import annotations
@@ -433,6 +434,8 @@ class _Utterance:
     first_pos: int
     published: bool = False
     closed: bool = False
+    partial_text: str = ""
+    partial_ms: int = 0
 
 
 @dataclass(slots=True, eq=False)
@@ -705,6 +708,8 @@ class TurnController:
         self._policy: BargeInPolicy | None = None
         self._settings: VoiceStartMessage | None = None
         self._utterances: dict[str, _Utterance] = {}
+        self._handled_seq = 0
+        self._pending: Reconfigure | None = None
         self._stale = 0
         self._closed = False
         self._cancel_pending = False
@@ -789,6 +794,7 @@ class TurnController:
                 await self._handle(message)
                 if self._cancel_pending:
                     raise asyncio.CancelledError
+                self._maybe_reconfigure()
         except asyncio.CancelledError:
             self._closed = True
             turn = self._turn
@@ -869,6 +875,9 @@ class TurnController:
         if self._ingress is None or event.epoch != self._epoch:
             self._count_stale()
             return False
+        # Every event of the adopted ingress counts as handled, one later dropped as naming a
+        # closed utterance included, so the reconfigure's quiescent check can trust it (M59).
+        self._handled_seq = event.event_seq
         return True
 
     def _utterance(self, utterance_id: str, first_pos: int) -> _Utterance | None:
@@ -912,6 +921,9 @@ class TurnController:
         utterance = self._utterance(event.utterance_id, event.first_pos)
         if utterance is None:
             return
+        utterance.partial_text = event.text
+        frame_ms = self._settings.frame_ms if self._settings is not None else 20
+        utterance.partial_ms = max(event.audio_end_pos - event.first_pos + 1, 0) * frame_ms
         if utterance.published:
             self._send_control(
                 TranscriptPartialMessage(
@@ -1021,18 +1033,132 @@ class TurnController:
     async def _on_voice_start(self, message: VoiceStart) -> None:
         """Adopt the ingress, its epoch, the policy and the settings; nothing is sent.
 
-        The row's other phases, and closing a previously adopted ingress, are T11d's.
+        The session posts `VoiceStart` only while voice is off, so an ingress is adopted here
+        only when a test drives the row directly: the `voice_stop` cell runs first, and then
+        the `idle` cell. A running typed turn goes on, and keeps its channel.
         """
-        self._ingress = message.ingress
-        self._epoch = message.epoch
-        self._policy = message.policy
-        self._settings = message.settings
+        if self._ingress is not None:
+            await self._stop_voice()
+        self._adopt(message)
+
+    def _adopt(self, start: VoiceStart) -> None:
+        self._ingress = start.ingress
+        self._epoch = start.epoch
+        self._policy = start.policy
+        self._settings = start.settings
+        self._handled_seq = 0
 
     async def _on_voice_stop(self, message: VoiceStop) -> None:
-        """The `voice_stop` row: T11d."""
+        """Answer a pending reconfigure first, then interrupt by phase and close ingress."""
+        await self._stop_voice()
+
+    async def _stop_voice(self) -> None:
+        if self._pending is not None:
+            pending, self._pending = self._pending, None
+            self._host.refuse(pending, "voice_stop")
+        turn = self._turn
+        if turn is not None and not turn.ending and self._phase in ("thinking", "speaking"):
+            self._send_control(
+                VoiceDecisionBargeIn(
+                    turn_id=turn.turn_id,
+                    reason="voice_stop",
+                    detail=BargeInDetail(keyword=None, phase=self._phase, utterance_id=None),
+                )
+            )
+            await self._cut(turn, reason="voice_stop")
+        self._close_ingress()
+
+    def _close_ingress(self) -> None:
+        """Close the adopted ingress and every utterance in the record, in audio order.
+
+        Each published utterance closes with `dropped voice_stop`. Its detail is the drop
+        `close()` returned when that drop names it; otherwise it comes from the record, the
+        last partial's text and length, since ingress may already have ended an utterance whose
+        end is still queued. An unpublished one closes silently: nothing named it.
+        """
+        ingress = self._ingress
+        if ingress is None:
+            return
+        drop = ingress.close()
+        self._ingress = None
+        self._epoch = None
+        self._policy = None
+        open_utterances = sorted(
+            (u for u in self._utterances.values() if not u.closed), key=lambda u: u.first_pos
+        )
+        self._utterances.clear()
+        for utterance in open_utterances:
+            utterance.closed = True
+            if not utterance.published:
+                continue
+            if drop is not None and drop.utterance_id == utterance.utterance_id:
+                detail = DroppedDetail(
+                    utterance_id=utterance.utterance_id,
+                    duration_ms=drop.duration_ms,
+                    text=drop.text,
+                    no_speech_prob=drop.no_speech_prob,
+                    avg_logprob=drop.avg_logprob,
+                )
+            else:
+                detail = DroppedDetail(
+                    utterance_id=utterance.utterance_id,
+                    duration_ms=utterance.partial_ms,
+                    text=utterance.partial_text,
+                    no_speech_prob=None,
+                    avg_logprob=None,
+                )
+            self._send_control(
+                VoiceDecisionDropped(turn_id=None, reason="voice_stop", detail=detail)
+            )
 
     async def _on_reconfigure(self, message: Reconfigure) -> None:
-        """Applied at a quiescent point through the host: T11d."""
+        """Hold a servable request until a quiescent point; answer the others at once (M46).
+
+        A newer request replaces a pending one, which is answered `superseded` first, even when
+        the newer one cannot be served.
+        """
+        if self._pending is not None:
+            pending, self._pending = self._pending, None
+            self._host.refuse(pending, "superseded")
+        if message.refusal is not None:
+            self._host.refuse(message, message.refusal)
+            return
+        if self._ingress is None:
+            self._host.refuse(message, "voice_stop")
+            return
+        self._pending = message
+
+    def _quiescent(self) -> bool:
+        """No turn, no utterance in the record, and ingress idle as of the last event handled.
+
+        Ingress runs ahead of the mailbox, so an utterance it opened can be invisible to the
+        record; comparing its `idle_since()` with the last `event_seq` handled sees it.
+        """
+        if self._phase != "idle" or self._turn is not None or self._ingress is None:
+            return False
+        if any(not u.closed for u in self._utterances.values()):
+            return False
+        return self._ingress.idle_since() == self._handled_seq
+
+    def _maybe_reconfigure(self) -> None:
+        """Apply a pending reconfigure in one step, with no await, so no frame is routed between.
+
+        The old ingress is closed only once the host has built and adopted its successor; a
+        host that refuses (None) leaves it adopted and open.
+        """
+        request = self._pending
+        if request is None or self._closed or not self._quiescent():
+            return
+        self._pending = None
+        ingress = self._ingress
+        assert ingress is not None  # noqa: S101 - `_quiescent` checked it
+        seed = ingress.handoff()
+        start = self._host.apply(request, seed)
+        if start is None:
+            return
+        ingress.close()
+        self._utterances.clear()
+        self._adopt(start)
 
     async def _on_mute(self, message: Mute) -> None:
         """Mute closes nothing itself: ingress emits the open utterance's drop (v8)."""
@@ -1087,6 +1213,7 @@ class TurnController:
 
     async def _on_close(self, message: Close) -> None:
         self._closed = True
+        self._pending = None  # a disconnect drops a pending reconfigure with no answer
         turn = self._turn
         if turn is not None and not turn.ending:
             await self._cut(turn, reason="disconnect", notify=False)
