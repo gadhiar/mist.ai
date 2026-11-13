@@ -169,6 +169,25 @@ def test_dockerfile_rules(name: str) -> None:
     assert 'test -n "$GIT_SHA"' in record[0]
 
 
+def test_cosyvoice3_venv_installs_under_a_setuptools_build_constraint() -> None:
+    # openai-whisper==20231117 (upstream CosyVoice's pin) is an sdist whose setup.py imports
+    # pkg_resources, and pip's isolated build environment gets the newest setuptools, which no
+    # longer ships it. pip's isolated build installs inherit PIP_CONSTRAINT. The constraint file
+    # lives under /tmp: the image record hashes every *.txt in /opt/mist-voice/requirements.
+    requirements = "/opt/mist-voice/requirements/requirements-cosyvoice3.txt"
+    pip = f"/opt/venv-teacher-cosyvoice3/bin/pip install --no-cache-dir -r {requirements}"
+    steps = instructions(DOCKER_DIR / "teacher-cosyvoice3.Dockerfile")
+    [step] = [s for s in steps if pip in s]
+    written = re.search(r"printf '%s\\n' 'setuptools<81' > (\S+)", step)
+    assert written, step
+    constraint = written.group(1)
+    assert constraint.startswith("/tmp/"), constraint
+    assert f"PIP_CONSTRAINT={constraint} {pip}" in step
+    assert step.index(written.group(0)) < step.index(pip)
+    pins = (DOCKER_DIR / "requirements-cosyvoice3.txt").read_text(encoding="utf-8").splitlines()
+    assert "openai-whisper==20231117" in pins
+
+
 def test_remote_entry_is_key_only_and_holds_no_key() -> None:
     text = (DOCKER_DIR / "remote-entry.sh").read_text(encoding="utf-8")
     assert text.startswith("#!/bin/sh\n")

@@ -9,8 +9,14 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 COPY docker/voice-data/requirements-cosyvoice3.txt /opt/mist-voice/requirements/requirements-cosyvoice3.txt
-RUN python3.11 -m venv /opt/venv-teacher-cosyvoice3 \
- && /opt/venv-teacher-cosyvoice3/bin/pip install --no-cache-dir -r /opt/mist-voice/requirements/requirements-cosyvoice3.txt
+# openai-whisper==20231117 is an sdist whose setup.py imports pkg_resources, and pip's isolated
+# build environment gets the newest setuptools, which no longer ships it. pip's isolated build
+# installs inherit PIP_CONSTRAINT, so `setuptools<81` reaches them. The constraint file is in /tmp
+# because the image record hashes every *.txt under /opt/mist-voice/requirements.
+RUN printf '%s\n' 'setuptools<81' > /tmp/cosyvoice3-build-constraints.txt \
+ && python3.11 -m venv /opt/venv-teacher-cosyvoice3 \
+ && PIP_CONSTRAINT=/tmp/cosyvoice3-build-constraints.txt /opt/venv-teacher-cosyvoice3/bin/pip install --no-cache-dir -r /opt/mist-voice/requirements/requirements-cosyvoice3.txt \
+ && rm /tmp/cosyvoice3-build-constraints.txt
 RUN printf '%s\n' /opt/mist-voice/code > /opt/venv-teacher-cosyvoice3/lib/python3.11/site-packages/mist-voice-code.pth
 
 RUN git clone --filter=blob:none https://github.com/FunAudioLLM/CosyVoice /opt/mist-voice/upstream/CosyVoice \
