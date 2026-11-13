@@ -340,7 +340,7 @@ class TestCodeSha256:
     @pytest.mark.parametrize(
         ("old", "new"),
         [
-            pytest.param("SCOPE_MAX_TOKENS = 96", "SCOPE_MAX_TOKENS = 97", id="a-constant"),
+            pytest.param("SCOPE_MAX_TOKENS = 512", "SCOPE_MAX_TOKENS = 513", id="a-constant"),
             pytest.param(
                 "for attempt in range(1, self._settings.max_attempts + 1):",
                 "for attempt in range(0, self._settings.max_attempts + 1):",

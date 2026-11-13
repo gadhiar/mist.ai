@@ -1,9 +1,9 @@
 """With `EXTRACTION_TURN_PLAN` off, the turn plan stage changes nothing the service sends.
 
 Every literal here but `SERVING_IDENTITY` was captured at 058e52c, the commit
-before the turn plan stage, except where T48 re-pinned one, as noted at each. The
-file imports nothing the stage added. It pins what a flag-off service sends and
-reports:
+before the turn plan stage, except where T48 or T60 re-pinned one, as noted at
+each. The file imports nothing the stage added. It pins what a flag-off service
+sends and reports:
 
 - every request body the fake llama-server receives for one structured turn
   and one prose turn, as the sha256 of their canonical JSON. T49 put a
@@ -18,7 +18,8 @@ reports:
 
 The request bodies hold the prompts, so a prompt edit moves the two body
 hashes and `prompt_sha256` together. Re-pin all three in that edit's commit,
-and only there.
+and only there. The bodies also hold each stage's `max_tokens`, which
+`prompt_sha256` leaves out, so a cap edit moves the two body hashes alone.
 """
 
 from __future__ import annotations
@@ -63,8 +64,11 @@ PROSE_UTTERANCE = "I have been learning Rust for a few months"
 # pack's declarations; before T52 the two were
 # f41d3afdced9a0f9e158a52f9abf5b38db9ca20a8eb79060e78704078f8f7dbc and
 # 1c2489eb2a125f17e56bac300608e1798be6d447dab861447fe8e0e01cb35eb0.
-STRUCTURED_BODIES_SHA256 = "49903b6ece2a885e20b813bd77acf90cd8a49110a4f44f8213da66dc8d815b5d"
-PROSE_BODIES_SHA256 = "11b54c027d71919b5bcbf7b2c5dd3aa80b4f6d200d444928215c6d9d9b8cf281"
+# T60: the scope body is sent with `max_tokens` 512 in place of 96; before T60 the two were
+# 49903b6ece2a885e20b813bd77acf90cd8a49110a4f44f8213da66dc8d815b5d and
+# 11b54c027d71919b5bcbf7b2c5dd3aa80b4f6d200d444928215c6d9d9b8cf281.
+STRUCTURED_BODIES_SHA256 = "91ee7c0912e38bb495d1528d83f37929a4c74cc138b619f523ca3c53b1452f2c"
+PROSE_BODIES_SHA256 = "2370541fe87ff38807fd6baaad3ad8d90233592d196797d3a41873a2dc8a2fd2"
 # T48: `EARLIER_ITEMS_HEADING` joined the hash; at 058e52c this was
 # 6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e.
 # T52: Rule 28, Example 30 and the generated schema moved it; before T52 it was

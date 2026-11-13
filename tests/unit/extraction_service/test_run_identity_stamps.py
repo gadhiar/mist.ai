@@ -77,7 +77,7 @@ def built_app(service_settings, wired_llm, fake_llama_app):
 
 class TestStageTokenLimits:
     def test_the_named_limits(self):
-        assert (SCOPE_MAX_TOKENS, EXTRACT_MAX_TOKENS, DERIVE_MAX_TOKENS) == (96, 2048, 400)
+        assert (SCOPE_MAX_TOKENS, EXTRACT_MAX_TOKENS, DERIVE_MAX_TOKENS) == (512, 2048, 400)
 
     @pytest.mark.asyncio
     async def test_each_stage_sends_its_named_limit(self, built_app, fake_llama_state):
@@ -137,7 +137,7 @@ class TestServiceReportsOneIdentity:
             "temperature": 0.0,
             "max_attempts": 2,
             "scope_enabled": True,
-            "scope_max_tokens": 96,
+            "scope_max_tokens": 512,
             "extract_max_tokens": 2048,
             "derive_max_tokens": 400,
             "list_batch_max_units": engine_module.LIST_BATCH_MAX_UNITS,

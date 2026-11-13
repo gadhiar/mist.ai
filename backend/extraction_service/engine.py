@@ -136,8 +136,11 @@ _REPAIR_INSTRUCTION = (
 
 # Output token limits at low reasoning effort, one per LLM-calling stage. Named
 # so the run identity can record them: a limit that cuts an output short
-# changes what the stage returns as surely as a prompt edit does.
-SCOPE_MAX_TOKENS = 96
+# changes what the stage returns as surely as a prompt edit does. The scope cap
+# sits above every scope call measured to stop on its own: the longest took 87
+# tokens at low effort and 316 at medium, and the two replies that a cap of 96
+# cut mid-answer took 232 and 151 at medium.
+SCOPE_MAX_TOKENS = 512
 EXTRACT_MAX_TOKENS = 2048
 DERIVE_MAX_TOKENS = 400
 
@@ -160,7 +163,7 @@ class StageCaps:
 # medium extract cap sits above the longest extract call that stopped on its
 # own at high effort (28,916 tokens) and cuts a runaway call a third sooner than
 # the 49,152 that run used. High takes medium's caps; no run has measured them
-# at high. Scope and derive keep low's caps (96 and 400) at every effort:
+# at high. Scope and derive keep low's caps (512 and 400) at every effort:
 # `effective_cap` sizes a stage by the effort the adapter sends it, and the
 # adapters send both at low under every setting (`GptOssAdapter.stage_effort`),
 # so the medium and high scope entries below are never sent. Scope is a
