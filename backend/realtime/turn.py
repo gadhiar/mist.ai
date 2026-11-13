@@ -23,10 +23,10 @@ task's own cancellation at server shutdown.
 
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
 interruption note, cancellation, prefetch, `turn_metrics`, the scene anchors not tied to a
-wake, `StateHint` and `HandOff`. Later tasks add, in the methods named for them: the cut's
-remaining cases and `tts_failed` (T11c), the state table with hold, supersede, `voice_stop`,
-reconfigure and mute (T11d), and the addressee gate, wake arbitration and the follow-up window
-(T11e).
+wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to text on
+`tts_failed`, completion after both ends and the tool grace's orphan closing. Later tasks add,
+in the methods named for them: the state table with hold, supersede, `voice_stop`, reconfigure
+and mute (T11d), and the addressee gate, wake arbitration and the follow-up window (T11e).
 """
 
 from __future__ import annotations
@@ -465,7 +465,13 @@ class _Turn:
     complete_sent: bool = False
     tag_ended: bool = False
     playback_done: bool = False
+    frames_queued: bool = False
+    voiced_end: int = 0
     tts_failed: bool = False
+    voiced_text: str = ""
+    text_from_token: int = 0
+    disconnected: bool = False
+    open_tools: dict[str, tuple[str, int]] = field(default_factory=dict)
     tool: bool = False
     error: bool = False
     error_sent: bool = False
@@ -584,6 +590,7 @@ class _TurnSink:
         controller = self._controller
         if isinstance(item, Frame) and item.msg_type == MsgType.AUDIO_CHUNK:
             now = controller._clock.now_ms()
+            turn.frames_queued = True
             if not turn.stretch_open:
                 turn.stretch_open = True
                 controller._outbound.send_turn(
@@ -1068,6 +1075,9 @@ class TurnController:
         self._report(turn, message.played_ms)
         turn.playback_done = True
         await self._maybe_complete(turn)
+        if turn.tts_failed and not turn.ending and self._turn is turn:
+            # The voiced part has drained before the generation ended: the rest is text (M65).
+            self._phase = "text"
 
     def _report(self, turn: _Turn, played_ms: int) -> None:
         assert turn.ledger is not None  # noqa: S101 - the callers checked it
@@ -1186,7 +1196,7 @@ class TurnController:
             turn_id=turn.turn_id,
             audio_tag=tag,
             turn_sink=_TurnSink(self, turn),
-            control=self._outbound.send_control,
+            control=lambda item: self._pacer_control(turn, item),
             ledger=turn.ledger,
             clock=self._clock,
             config=self._playback_config,
@@ -1194,6 +1204,11 @@ class TurnController:
         )
         self._spawn(turn, self._synthesize(turn), "synthesize")
         self._spawn(turn, self._play(turn), "play")
+
+    def _pacer_control(self, turn: _Turn, item: object) -> None:
+        """The pacer's `control` sink; after a disconnect no client is left to send to."""
+        if not turn.disconnected:
+            self._outbound.send_control(item)
 
     def _spawn(self, turn: _Turn, coro: Awaitable[None], name: str) -> asyncio.Task[None]:
         task = asyncio.ensure_future(coro)
@@ -1254,6 +1269,7 @@ class TurnController:
         turn.mark("first_tts_chunk", self._clock.now_ms())
         if segment.state != NEUTRAL_STATE and chunk.state == segment.state:
             turn.voiced_states.add(index)
+        turn.voiced_end = segment.end_char
         turn.pacer.submit(index, chunk)
 
     async def _play(self, turn: _Turn) -> None:
@@ -1314,9 +1330,15 @@ class TurnController:
             if not turn.error_sent:
                 turn.error_sent = True
                 self._send_degraded(turn, "turn_error")
-        if turn.segmenter is not None:
+        if self._speaks(turn):
+            assert turn.segmenter is not None  # noqa: S101 - `_speaks` checked it
             for segment in turn.segmenter.feed(event.text, event.is_error):
                 self._submit_segment(turn, segment)
+
+    @staticmethod
+    def _speaks(turn: _Turn) -> bool:
+        """Whether the turn's text still goes to TTS: a `tts` turn not moved to text."""
+        return turn.segmenter is not None and not turn.tts_failed
 
     def _submit_segment(self, turn: _Turn, segment: SpeechSegment) -> None:
         turn.mark("first_segment", self._clock.now_ms())
@@ -1333,8 +1355,9 @@ class TurnController:
             return
         turn.handoff_seen = True
         self._send_token(turn, event.ack_text)
-        if turn.segmenter is None:
+        if not self._speaks(turn):
             return
+        assert turn.segmenter is not None  # noqa: S101 - `_speaks` checked it
         segments = turn.segmenter.feed(event.ack_text, False) + turn.segmenter.flush()
         for segment in segments:
             self._submit_segment(turn, segment)
@@ -1360,16 +1383,20 @@ class TurnController:
         self._send_turn(turn, payload)
         kind = payload.get("type")
         now = self._clock.now_ms()
+        call_id = str(payload.get("tool_call_id"))
         if kind == "tool_call_started":
             turn.tool = True
             turn.mark("tool_call_parsed", now)
+            turn.open_tools[call_id] = (str(payload.get("name")), now)
         elif kind == "tool_call_completed":
             turn.marks["tool_done"] = now
+            turn.open_tools.pop(call_id, None)
             view = payload.get("view")
             if isinstance(view, str):
                 data = payload.get("data")
                 at: Immediate | AtSegment = Immediate()
-                if turn.audio_tag is not None and turn.segmenter is not None:
+                if turn.audio_tag is not None and self._speaks(turn):
+                    assert turn.segmenter is not None  # noqa: S101 - `_speaks` checked it
                     at = AtSegment(turn.audio_tag, turn.segmenter.next_index)
                 self._scene.tool_view(
                     turn.turn_id,
@@ -1409,7 +1436,8 @@ class TurnController:
                 self._send_degraded(turn, "turn_error")
         self._send_complete(turn, None)
         if turn.segmenter is not None:
-            for segment in turn.segmenter.flush():
+            flushed = turn.segmenter.flush() if self._speaks(turn) else []
+            for segment in flushed:
                 self._submit_segment(turn, segment)
             turn.segments.put_nowait(None)
         await self._maybe_complete(turn)
@@ -1444,17 +1472,50 @@ class TurnController:
         await self._maybe_complete(turn)
 
     async def _on_synth_failed(self, event: _SynthFailed) -> None:
-        """The synthesizer failed: the reply goes on as text.
+        """The synthesizer failed: the rest of the reply goes on as text (v2 M65, M68).
 
-        T11c adds the `degraded tts_failed` decision, the phase move and the record. Here the
-        tag is ended as a text reply so that the turn still completes.
+        A held turn's failure is applied at its release, in its buffered order (T11d); this
+        handles a turn the client has seen open.
         """
         turn = self._current(event.turn_id)
-        if turn is None or turn.pacer is None:
+        if turn is None or turn.pacer is None or turn.tts_failed:
             return
         logger.error("turn %s: synthesis failed with %s", turn.turn_id, type(event.error).__name__)
+        self._switch_to_text(turn, event.error)
+
+    def _switch_to_text(self, turn: _Turn, error: SpeechEngineError) -> None:
+        """Send `degraded tts_failed` in stream order and end the tag as the audio allows.
+
+        The `degraded` follows exactly the `stream_token`s sent so far, so `text_from_token`
+        counts them and `voiced_text`, the text of the audio that still reaches the client, is a
+        prefix of their text. With no `0x01` queued yet, the audio the pacer holds is dropped,
+        its frameless `0x02` follows the `degraded`, and the turn is a text reply from here.
+        Otherwise the pacer hands on the audio it holds, then its `0x02`, and the turn moves to
+        `text` when the client has played it (`_on_playback_done`), unless it completes first.
+        """
+        assert turn.pacer is not None and turn.segmenter is not None  # noqa: S101
         turn.tts_failed = True
+        turn.handoff_waiting = False
+        turn.text_from_token = len(turn.token_texts)
+        turn.voiced_text = turn.segmenter.text[: turn.voiced_end] if turn.frames_queued else ""
+        self._send_turn(
+            turn,
+            VoiceDecisionDegraded(
+                turn_id=turn.turn_id,
+                reason="tts_failed",
+                detail=DegradedDetail(
+                    engine=self._synthesizer.engine_id if self._synthesizer is not None else None,
+                    error=type(error).__name__,
+                    voiced_text=turn.voiced_text,
+                    text_from_token=turn.text_from_token,
+                ),
+            ),
+        )
+        if turn.frames_queued:
+            turn.pacer.finish()
+            return
         turn.pacer.end_unsent()
+        self._phase = "text"
 
     # -- Ending a turn ---------------------------------------------------------------------
 
@@ -1476,11 +1537,20 @@ class TurnController:
         await self._complete(turn)
 
     async def _complete(self, turn: _Turn) -> None:
+        """Commit the full reply: a completion purges nothing, so the client has every token.
+
+        A turn moved to text records its voiced text plus every token from `text_from_token`
+        on (v2 M65, M69): the tokens before the switch that no audio voiced were never heard.
+        """
         turn.ending = True
         await self._cancel_tasks(turn)
+        self._close_orphan_tools(turn)
         outcome: Outcome = "error" if turn.error else "completed"
-        result = self._commit(turn, outcome, "".join(turn.token_texts), tool_effect_unknown=False)
-        if turn.channel == "text":
+        delivered = "".join(turn.token_texts)
+        if turn.tts_failed:
+            delivered = turn.voiced_text + "".join(turn.token_texts[turn.text_from_token :])
+        result = self._commit(turn, outcome, delivered, tool_effect_unknown=False)
+        if turn.channel == "text" or turn.tts_failed:
             self._scene.phase("idle", turn_id=turn.turn_id, at=Immediate())
         self._end_scene(turn)
         if result.error is not None:
@@ -1509,15 +1579,23 @@ class TurnController:
         await self._cut(turn, reason="barge_in")
 
     async def _cut(self, turn: _Turn, *, reason: CancelReason, notify: bool = True) -> None:
-        """Cancel the turn and commit what the client received.
+        """Cancel the turn and commit what the client received (v2 M62, M69).
 
         The task group is cancelled and awaited first, so no token or frame of the turn is
         queued after the purge; the purge and the pacer's stop then run with no await between
-        them. A disconnect (`notify` false) sends nothing past the pacer's stop.
+        them. A disconnect (`notify` false) sends nothing from the purge on, the pacer's
+        `0x03` and `playback_stop` included, since no client is left.
+
+        The record holds what the sender took: the tokens before the purge's `first_token`.
+        A `tts` turn's spoken prefix is the ledger's, capped at the end of their text, since an
+        estimate made without client reports runs over frames the client may never get. A turn
+        moved to text adds the taken tokens from `text_from_token` on; when the purge removed
+        its `degraded`, it removed token `text_from_token` too, so that adds nothing.
         """
         if turn.ending:
             return
         turn.ending = True
+        turn.disconnected = not notify
         turn.token.set()
         await self._cancel_tasks(turn)
         purge = self._outbound.purge_turn(turn.turn_id)
@@ -1525,16 +1603,16 @@ class TurnController:
             turn.pacer.stop(purge.terminal, reason=reason)
             turn.marks["playback_stopped"] = self._clock.now_ms() + self._playback_config.fade_ms
         self._scene.cancel_turn(turn.turn_id)
-        taken = (
-            turn.token_texts if purge.first_token is None else turn.token_texts[: purge.first_token]
-        )
-        taken_text = "".join(taken)
+        taken_count = len(turn.token_texts) if purge.first_token is None else purge.first_token
+        taken_text = "".join(turn.token_texts[:taken_count])
         spoken: str | None = None
         delivered = taken_text
         if turn.channel == "tts":
             assert turn.ledger is not None  # noqa: S101
             spoken = turn.ledger.spoken_text()[: len(taken_text)]
             delivered = spoken
+            if turn.tts_failed:
+                delivered += "".join(turn.token_texts[turn.text_from_token : taken_count])
         if notify:
             self._send_turn(
                 turn,
@@ -1546,6 +1624,8 @@ class TurnController:
                 ),
             )
         finished = await self._uncancellable(self._wait_tools(turn.scope))
+        if notify:
+            self._close_orphan_tools(turn)
         result = self._commit(turn, "interrupted", delivered, tool_effect_unknown=not finished)
         if notify:
             if result.error is not None:
@@ -1564,6 +1644,28 @@ class TurnController:
             task.cancel()
         if tasks:
             await self._uncancellable(asyncio.gather(*tasks, return_exceptions=True))
+
+    def _close_orphan_tools(self, turn: _Turn) -> None:
+        """Close every `tool_call_started` the client got no `tool_call_completed` for (v1).
+
+        The stream that would have carried the completion is closed, so the client is told the
+        call was cancelled whether or not the tool finished within the grace; the record keeps
+        the real result of one that did.
+        """
+        now = self._clock.now_ms()
+        for call_id, (name, started_ms) in turn.open_tools.items():
+            self._send_turn(
+                turn,
+                {
+                    "type": "tool_call_completed",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "duration_ms": max(now - started_ms, 0),
+                    "result_summary": "",
+                    "error": "cancelled",
+                },
+            )
+        turn.open_tools.clear()
 
     async def _wait_tools(self, scope: TurnScope) -> bool:
         """Wait up to the tool grace, on the session clock, for every dispatched tool."""
