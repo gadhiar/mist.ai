@@ -11,6 +11,9 @@ import re
 from pathlib import Path
 
 import pytest
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from scripts.voice_data.images import BASE_IMAGE, IMAGE_PREFIX
 
@@ -212,3 +215,128 @@ def test_requirement_lines_are_pinned(name: str) -> None:
     for line in pins:
         assert REQUIREMENT_LINE.fullmatch(line), f"{name}: {line}"
         assert "unverified" not in line
+
+
+VLLM_OMNI_COMMIT = "36e048fd7005400e4089079104e1f204cfdac569"
+VLLM_TRANSFORMERS = ">=4.56.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0"
+# The upstream bounds behind the pip ResolutionImpossible failures of the H3 teacher builds at
+# a31679c, and the bounds of the pins that replaced them, as (requirements file, declaring
+# package, its pin, dependency, the declared specifier). A row applies while the file pins the
+# declaring package at that version or commit.
+UPSTREAM_BOUNDS = [
+    # pypi.org/pypi/transformers/5.19.0/json
+    ("requirements-omnivoice.txt", "transformers", "5.19.0", "huggingface-hub", ">=1.31.0,<3.0"),
+    # pypi.org/pypi/accelerate/1.8.1/json
+    ("requirements-omnivoice.txt", "accelerate", "1.8.1", "huggingface-hub", ">=0.21.0"),
+    # pypi.org/pypi/gradio/5.45.0/json
+    ("requirements-omnivoice.txt", "gradio", "5.45.0", "huggingface-hub", ">=0.33.5,<1.0"),
+    # pypi.org/pypi/gradio/6.32.0/json
+    ("requirements-omnivoice.txt", "gradio", "6.32.0", "huggingface-hub", ">=1.16.0,<3.0"),
+    # pypi.org/pypi/transformers/5.19.0/json
+    ("requirements-fish-s2.txt", "transformers", "5.19.0", "safetensors", ">=0.8.0"),
+    # pypi.org/pypi/vllm/0.22.0/json
+    ("requirements-higgs3.txt", "vllm", "0.22.0", "transformers", VLLM_TRANSFORMERS),
+    ("requirements-higgs3.txt", "vllm", "0.22.0", "tokenizers", ">=0.21.1"),
+    # vllm-omni requirements/common.txt at the pinned commit
+    (
+        "requirements-higgs3.txt",
+        "vllm-omni",
+        VLLM_OMNI_COMMIT,
+        "transformers",
+        f"{VLLM_TRANSFORMERS},<5.9.0",
+    ),
+    # pypi.org/pypi/transformers/5.8.1/json
+    ("requirements-higgs3.txt", "transformers", "5.8.1", "tokenizers", ">=0.22.0,<=0.23.0"),
+]
+
+
+def pinned_versions(name: str) -> dict[str, str]:
+    """Map each requirement of a requirements file to its pinned version, or its git commit."""
+    pins: dict[str, str] = {}
+    for raw in (DOCKER_DIR / name).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "--")):
+            continue
+        if " @ git+" in line:
+            package, url = line.split(" @ ", 1)
+            pins[canonicalize_name(package)] = url.rsplit("@", 1)[1]
+        else:
+            package, version = line.split("==", 1)
+            pins[canonicalize_name(package.split("[", 1)[0])] = version
+    return pins
+
+
+def admits_some_version(spec: SpecifierSet) -> bool:
+    """Whether some version meets every clause of `spec`, for an unpinned dependency.
+
+    When every lower bound is inclusive, a non-empty intersection holds its greatest lower bound,
+    or 0 when it has none, so trying 0 and each version the clauses name decides it, unless a `!=`
+    clause excludes that bound. No row in `UPSTREAM_BOUNDS` combines the two.
+    """
+    candidates = [Version("0")]
+    for clause in spec:
+        try:
+            candidates.append(Version(clause.version))
+        except InvalidVersion:
+            continue
+    return any(spec.contains(candidate, prereleases=True) for candidate in candidates)
+
+
+@pytest.mark.parametrize("name", sorted({row[0] for row in UPSTREAM_BOUNDS}))
+def test_teacher_pins_meet_upstream_bounds(name: str) -> None:
+    # pip resolves a family's whole requirements file at once, so a pin that falls outside a
+    # bound declared by another pin, or two pins whose bounds on an unpinned dependency do not
+    # overlap, fails the image build with ResolutionImpossible.
+    pins = pinned_versions(name)
+    declared: dict[str, SpecifierSet] = {}
+    for file, package, pin, dependency, specifier in UPSTREAM_BOUNDS:
+        if file == name and pins.get(package) == pin:
+            declared[dependency] = declared.get(dependency, SpecifierSet()) & specifier
+    assert declared, f"{name}: no row matches its pins"
+    for dependency, spec in declared.items():
+        if dependency in pins:
+            assert spec.contains(pins[dependency]), f"{name}: {dependency}=={pins[dependency]}"
+        else:
+            assert admits_some_version(spec), f"{name}: no {dependency} meets {spec}"
+
+
+@pytest.mark.parametrize("name", sorted({row[0] for row in UPSTREAM_BOUNDS}))
+def test_upstream_bounds_cover_each_declaring_pin(name: str) -> None:
+    # A declaring package pinned at a version with no row would drop its bounds from the check
+    # above, so a version bump has to bring its declared bounds into the table.
+    pins = pinned_versions(name)
+    declaring = {package for file, package, _, _, _ in UPSTREAM_BOUNDS if file == name}
+    for package in declaring:
+        rows = [row for row in UPSTREAM_BOUNDS if row[0] == name and row[1] == package]
+        assert any(row[2] == pins.get(package) for row in rows), f"{name}: {package}"
+
+
+def test_fish_s2_installs_portaudio_headers_before_its_venv() -> None:
+    # fish-speech lists pyaudio unpinned, and PyAudio ships Linux only as an sdist, which
+    # compiles against the portaudio headers.
+    steps = instructions(DOCKER_DIR / "teacher-fish-s2.Dockerfile")
+    [apt] = [i for i, s in enumerate(steps) if "apt-get install" in s]
+    assert "portaudio19-dev" in steps[apt].split(), steps[apt]
+    [pip] = [i for i, s in enumerate(steps) if "/opt/venv-teacher-fish-s2/bin/pip install" in s]
+    assert apt < pip
+
+
+def test_extract_import_check_loads_tiger_and_sidon_from_their_clones() -> None:
+    # TIGER and Sidon are cloned, not installed, and `-I` ignores PYTHONPATH, so the check puts
+    # the clones on sys.path itself. TIGER's look2hear.layers imports torch_complex and
+    # typeguard's check_argument_types, which typeguard 2.x provides; without the two pins the
+    # import finds setuptools' vendored typeguard 4, which lacks it.
+    final = instructions(DOCKER_DIR / "extract.Dockerfile")[-1]
+    check = re.match(r"RUN /opt/venv-extract/bin/python -I -c '([^']*)'", final)
+    assert check, final
+    prefix = (
+        'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER",'
+        ' "/opt/mist-voice/upstream/Sidon/src"]; import '
+    )
+    code = check.group(1)
+    assert code.startswith(prefix), code
+    modules = {module.strip() for module in code.removeprefix(prefix).split(",")}
+    assert {"look2hear.models", "sidon.cleansing", "scripts.voice_data"} <= modules
+    pins = pinned_versions("requirements-extract.txt")
+    assert "torch-complex" in pins
+    assert SpecifierSet("<3").contains(pins.get("typeguard", "3")), pins.get("typeguard")
