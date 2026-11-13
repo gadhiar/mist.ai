@@ -1,0 +1,12 @@
+# /opt/venv-train-piper: piper-tts with its train extra (H2 pins); the extra's own bounds are
+# resolved at H3. train-piper.Dockerfile also installs the v1.8.0 source tree for training.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+piper-tts[train]==1.8.0
+tensorboard==2.20.0
+tensorboardX==2.6.5
+onnx==1.16.0
+onnxruntime==1.31.1
+cython==3.0.7
+librosa==0.11.0
+numpy==2.2.6
