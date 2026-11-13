@@ -62,7 +62,14 @@ _PCM16_SCALE = 32768.0
 
 EndReason = Literal["semantic", "silence_cap", "silence_cap_no_model"]
 DropReason = Literal[
-    "noise", "no_speech", "stt_error", "text_input", "wake_lost", "not_addressed", "voice_stop"
+    "noise",
+    "no_speech",
+    "stt_error",
+    "text_input",
+    "wake_lost",
+    "not_addressed",
+    "voice_stop",
+    "muted",
 ]
 ControllerDropReason = Literal["text_input", "wake_lost", "not_addressed"]
 
@@ -162,9 +169,11 @@ class UtteranceEnded:
 class UtteranceDropped:
     """An utterance closed without a turn.
 
-    Ingress emits the drops it decides (`noise`, `no_speech`, `stt_error`). `drop` and `close`
-    return theirs instead of emitting them, carrying the `event_seq` of the last emitted event,
-    so the emitted sequence stays 1, 2, ... with no hole.
+    Ingress emits the drops it decides (`noise`, `no_speech`, `stt_error`), and `muted` when a
+    mute closes the open utterance or a wake is asked for while muted: that drop is the
+    controller's signal that the utterance is gone, so the controller has no close of its own to
+    make. `drop` and `close` return theirs instead of emitting them, carrying the `event_seq` of
+    the last emitted event, so the emitted sequence stays 1, 2, ... with no hole.
     """
 
     epoch: int
@@ -238,8 +247,9 @@ class IngressSeed:
     """What one ingress hands the next across a reconfigure (M46).
 
     `frames` are the retained `(position, float32 audio)` pairs, oldest first; `floor` is one past
-    the last frame of the last utterance; `vad_from` the first frame the VAD has not scored, or
-    None when the VAD is not running.
+    the last frame of the last utterance, or one past the newest frame received before the last
+    mute, whichever is later; `vad_from` the first frame the VAD has not scored, or None when the
+    VAD is not running.
     """
 
     frames: tuple[tuple[int, np.ndarray], ...]
@@ -599,13 +609,23 @@ class AudioIngress:
     def set_muted(self, muted: bool) -> None:
         """Muted, every uplink frame is discarded before the VAD and the spotter.
 
-        The open utterance is the controller's to close. Unmuting starts the VAD afresh at the
-        next frame, since the frames between are gone.
+        A mute closes the open utterance here and emits its `UtteranceDropped` with reason
+        `muted` before returning, so the controller needs no close of its own. An armed endpoint wake is discarded, and the floor moves past every
+        frame received so far, including frames still queued for the VAD: no utterance or name
+        opened after the unmute can reach back into audio from before the mute. Unmuting starts
+        the VAD afresh at the next frame, since the frames between are gone.
         """
         if muted == self._muted or self._closed:
             return
         self._muted = muted
         if muted:
+            utt = self._utt
+            if utt is not None:
+                self._drop_emitted(utt, "muted", utt.last_partial_text, None, utt.last_pushed)
+            self._endpoint_wake = None
+            if self._ring:
+                # A frame enters the ring before its queue, so this covers the queued ones too.
+                self._floor = max(self._floor, self._ring[-1].pos + 1)
             self._muted_frames += len(self._queue)
             self._queue.clear()
             self._reset_vad()
@@ -632,6 +652,10 @@ class AudioIngress:
         audio as a `capture` overload. It emits no `SpeechStarted` and endpoints by VAD and end
         of turn.
 
+        While muted there is no audio to hear, so it opens no stream: it mints an id, emits that
+        id's `UtteranceDropped` with reason `muted` at once, and returns the id at the later of
+        `from_pos` and the floor. The controller closes it on that drop, as on any other.
+
         Raises:
             RealtimeError: The ingress is closed.
             ValueError: `mode` is not `wake`.
@@ -640,6 +664,8 @@ class AudioIngress:
             raise RealtimeError("audio ingress is closed: cannot open an utterance")
         if mode != "wake":
             raise ValueError(f"unknown utterance mode {mode!r}")
+        if self._muted:
+            return self._muted_wake(from_pos)
         utt = self._utt
         if utt is not None:
             return OpenedUtterance(utt.id, utt.first_pos)
@@ -1418,6 +1444,25 @@ class AudioIngress:
         )
         self._finish(utt, utt.last_pushed)
         return dropped
+
+    def _muted_wake(self, from_pos: int) -> OpenedUtterance:
+        utterance_id = self._new_id()
+        first_pos = max(from_pos, self._floor)
+        logger.info("Ingress dropped utterance %s: muted", utterance_id)
+        self._send(
+            UtteranceDropped(
+                self._epoch,
+                self._stamp(),
+                utterance_id,
+                first_pos,
+                "muted",
+                None,
+                0,
+                None,
+                None,
+            )
+        )
+        return OpenedUtterance(utterance_id, first_pos)
 
     # -- Emission ---------------------------------------------------------------------------------
 
