@@ -32,7 +32,9 @@ T11a builds the core: the mailbox, the channel rule, completed turns, the commit
 interruption note, cancellation, prefetch, `turn_metrics`, the scene anchors not tied to a
 wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to text on
 `tts_failed`, completion after both ends and the tool grace's orphan closing. T11d adds the
-`VoiceStart`, `voice_stop` and `Reconfigure` rows and the held turn. Later work adds, in the
+`VoiceStart`, `voice_stop` and `Reconfigure` rows, the held turn, and the keyword row: a
+transcript's keyword interrupt publishes its utterance, whose end then starts a turn from the
+text after the keyword or closes with `dropped keyword`. Later work adds, in the
 methods named for them, the addressee gate, wake arbitration and the follow-up window (T11e).
 """
 
@@ -42,6 +44,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, TypeVar
@@ -79,6 +82,7 @@ from .playback import LanePurge, PlaybackClock, PlaybackLedger, PlaybackPacer
 from .protocol import (
     MAX_TURN_TAG,
     BargeInDetail,
+    BargeInIgnoredDetail,
     DegradedDetail,
     DroppedDetail,
     EndpointDetail,
@@ -101,6 +105,7 @@ from .protocol import (
     UtteranceDetail,
     VadStatusMessage,
     VoiceDecisionBargeIn,
+    VoiceDecisionBargeInIgnored,
     VoiceDecisionDegraded,
     VoiceDecisionDropped,
     VoiceDecisionEndpoint,
@@ -447,12 +452,21 @@ _TurnEvent = _StreamItem | _StreamEnded | _AudioStarted | _PlayEnded | _SynthFai
 
 @dataclass(slots=True)
 class _Utterance:
+    """One utterance in the record (v2 M39).
+
+    `keyword` is the keyword a transcript verdict interrupted a turn with: the barge-in
+    published the utterance, and its turn text is then what follows that keyword (v2, v5).
+    `idle_ignored` notes the one `barge_in_ignored idle` it got.
+    """
+
     utterance_id: str
     first_pos: int
     published: bool = False
     closed: bool = False
     partial_text: str = ""
     partial_ms: int = 0
+    keyword: str | None = None
+    idle_ignored: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -608,6 +622,39 @@ def _final_update(event: UtteranceEnded) -> TranscriptUpdate:
         event.duration_ms,
         event.no_speech_prob,
         event.avg_logprob,
+    )
+
+
+# The policy's word rule (`bargein.py`): a run of letters or digits, joined across an apostrophe.
+_WORD = re.compile(r"[^\W_]+(?:['’][^\W_]+)*")
+_LEADING_SEPARATORS = re.compile(r"^[\s,.;:!?\-–—…]+")
+
+
+def _after_keyword(text: str, keyword: str) -> str:
+    """The text after the first occurrence of `keyword` in a final transcript, as a request.
+
+    The keyword was matched in an earlier partial; the final's own words are searched again,
+    since a final transcript may punctuate or case them differently. A final that no longer holds
+    the keyword is taken whole: what the user said is not discarded.
+    """
+    parts = keyword.split()
+    matches = list(_WORD.finditer(text))
+    words = [match.group().lower() for match in matches]
+    for start in range(len(words) - len(parts) + 1):
+        if words[start : start + len(parts)] == parts:
+            end = matches[start + len(parts) - 1].end()
+            return _LEADING_SEPARATORS.sub("", text[end:]).strip()
+    return text.strip()
+
+
+def _ended_detail(event: UtteranceEnded) -> DroppedDetail:
+    """The `dropped` detail of an utterance closed at its end: its final transcript."""
+    return DroppedDetail(
+        utterance_id=event.utterance_id,
+        duration_ms=event.duration_ms,
+        text=event.text,
+        no_speech_prob=event.no_speech_prob,
+        avg_logprob=event.avg_logprob,
     )
 
 
@@ -1112,11 +1159,40 @@ class TurnController:
                 )
             )
             self._responder.prefetch(self._session_id, event.text)
-        if self._phase == "speaking" and self._policy is not None:
-            update = TranscriptUpdate(event.text, event.stable_chars, False, 0)
+        if self._policy is None:
+            return
+        update = TranscriptUpdate(event.text, event.stable_chars, False, 0)
+        if self._phase == "speaking":
             verdict = self._policy.evaluate(update, self._clock.now_ms(), self._phase)
             if verdict is not None and verdict.action == "interrupt":
                 await self._barge_in(verdict, event.utterance_id, event.heard_at_ms)
+        elif self._phase == "idle" and utterance.published and utterance.keyword is None:
+            verdict = self._policy.evaluate(update, self._clock.now_ms(), self._phase)
+            self._send_idle_ignored(utterance, verdict)
+
+    def _send_idle_ignored(self, utterance: _Utterance, verdict: BargeInVerdict | None) -> None:
+        """The `idle` cell of the keyword verdict row: `barge_in_ignored idle`, once (v1).
+
+        The policy judges every partial and the end alike, so a keyword early in the utterance
+        would give the same verdict again at each; the client is told once per utterance.
+        """
+        if verdict is None or verdict.action != "ignored" or utterance.idle_ignored:
+            return
+        utterance.idle_ignored = True
+        self._send_ignored(None, verdict, utterance.utterance_id)
+
+    def _send_ignored(
+        self, turn_id: str | None, verdict: BargeInVerdict, utterance_id: str | None
+    ) -> None:
+        self._send_control(
+            VoiceDecisionBargeInIgnored(
+                turn_id=turn_id,
+                reason=verdict.reason,  # type: ignore[arg-type]
+                detail=BargeInIgnoredDetail(
+                    keyword=verdict.keyword, text=verdict.text, utterance_id=utterance_id
+                ),
+            )
+        )
 
     async def _on_candidate(self, event: EndpointCandidate) -> None:
         """Prefetch, and in `idle` start the turn held on a published utterance (speculative).
@@ -1155,15 +1231,29 @@ class TurnController:
         if held is not None:
             await self._end_held(held, event)
             return
-        if utterance.published:
-            if self._turn is not None:
-                await self._cut(self._turn, reason="new_input")
-            self._start_voice_turn(event)
-            return
-        if self._phase in ("thinking", "speaking") and self._policy is not None:
+        text = event.text
+        if utterance.keyword is not None:
+            text = _after_keyword(event.text, utterance.keyword)
+        elif self._phase in ("thinking", "speaking") and self._policy is not None:
             verdict = self._policy.on_utterance_end(_final_update(event), self._phase)
             if verdict is not None and verdict.action == "interrupt":
                 await self._barge_in(verdict, event.utterance_id, event.heard_at_ms)
+                text = verdict.remainder
+        elif self._phase == "idle" and utterance.published and self._policy is not None:
+            verdict = self._policy.on_utterance_end(_final_update(event), self._phase)
+            self._send_idle_ignored(utterance, verdict)
+        if not utterance.published:
+            return  # unnamed speech that interrupted nothing closes silently (v5)
+        if utterance.keyword is not None and not text:
+            # A keyword interrupt consumed it with nothing after the keyword (v2's closing
+            # messages), in whichever phase it ends: no turn starts, and a typed turn goes on.
+            self._send_control(
+                VoiceDecisionDropped(turn_id=None, reason="keyword", detail=_ended_detail(event))
+            )
+            return
+        if self._turn is not None:
+            await self._cut(self._turn, reason="new_input")
+        self._start_voice_turn(event, text)
 
     async def _end_held(self, turn: _Turn, event: UtteranceEnded) -> None:
         """The held utterance's end: a stop keyword cancels, any other end releases.
@@ -1179,15 +1269,7 @@ class TurnController:
                 await self._cancel_held(turn)
                 self._send_control(
                     VoiceDecisionDropped(
-                        turn_id=None,
-                        reason="keyword",
-                        detail=DroppedDetail(
-                            utterance_id=event.utterance_id,
-                            duration_ms=event.duration_ms,
-                            text=event.text,
-                            no_speech_prob=event.no_speech_prob,
-                            avg_logprob=event.avg_logprob,
-                        ),
+                        turn_id=None, reason="keyword", detail=_ended_detail(event)
                     )
                 )
                 return
@@ -1454,19 +1536,40 @@ class TurnController:
         """Arbitration verdicts for this controller's claims: T11e."""
 
     async def _on_barge_in_report(self, message: BargeInReport) -> None:
+        """An endpoint's keyword: it interrupts only audio playing now (v1); every other verdict
+        goes out as `barge_in_ignored`, naming no utterance, since no transcript produced it
+        (v2 :931-935).
+
+        A report naming any turn but the one in flight is counted stale and answered
+        `stale_turn`, whatever the policy would say: the controller knows that turn ended.
+        """
         turn = self._turn
+        now = self._clock.now_ms()
         if turn is None or turn.turn_id != message.turn_id or turn.ending:
             self._count_stale()
+            if self._policy is not None:
+                verdict = self._policy.on_endpoint_report(message.turn_id, message.keyword, now)
+                stale = BargeInVerdict(
+                    action="ignored",
+                    reason="stale_turn",
+                    keyword=verdict.keyword if verdict is not None else message.keyword,
+                    text="",
+                    remainder="",
+                    phase=None,
+                )
+                self._send_ignored(message.turn_id, stale, None)
             return
         if self._policy is None or self._phase != "speaking":
             # An endpoint verdict carries no phase, so the controller checks it: only audio
             # the client is playing can be barged in on by an endpoint keyword.
             return
-        verdict = self._policy.on_endpoint_report(
-            message.turn_id, message.keyword, self._clock.now_ms()
-        )
-        if verdict is not None and verdict.action == "interrupt":
+        verdict = self._policy.on_endpoint_report(message.turn_id, message.keyword, now)
+        if verdict is None:
+            return
+        if verdict.action == "interrupt":
             await self._barge_in(verdict, None, None)
+        else:
+            self._send_ignored(turn.turn_id, verdict, None)
 
     async def _on_playback_progress(self, message: PlaybackProgress) -> None:
         turn = self._current(message.turn_id)
@@ -1520,8 +1623,14 @@ class TurnController:
             return "tts"
         return "text"
 
-    def _send_end_of_utterance(self, turn_id: str, event: UtteranceEnded) -> None:
-        """The end's `endpoint`, `speech_ended` and the utterance's `transcription`."""
+    def _send_end_of_utterance(
+        self, turn_id: str, event: UtteranceEnded, text: str | None = None
+    ) -> None:
+        """The end's `endpoint`, `speech_ended` and the utterance's `transcription`.
+
+        The `transcription` carries what the turn takes from the utterance (v2's closing
+        messages): its whole text, or `text`, the part after a keyword that interrupted.
+        """
         self._send_control(
             VoiceDecisionEndpoint(
                 turn_id=turn_id,
@@ -1534,15 +1643,21 @@ class TurnController:
             )
         )
         self._send_control(VadStatusMessage(status="speech_ended"))
-        self._send_control(TranscriptionMessage(text=event.text, utterance_id=event.utterance_id))
+        self._send_control(
+            TranscriptionMessage(
+                text=event.text if text is None else text, utterance_id=event.utterance_id
+            )
+        )
 
-    def _start_voice_turn(self, event: UtteranceEnded) -> None:
+    def _start_voice_turn(self, event: UtteranceEnded, text: str | None = None) -> None:
+        """Start the turn the end opens; `text`, when given, is its turn text (the remainder)."""
         turn_id = self._next_turn_id()
-        self._send_end_of_utterance(turn_id, event)
+        turn_text = event.text if text is None else text
+        self._send_end_of_utterance(turn_id, event, turn_text)
         # Timings count from the end of speech: the utterance's last frame less its silence.
         marks = {"eot_decided": event.heard_at_ms, "stt_final": self._clock.now_ms()}
         base = event.heard_at_ms - event.silence_ms
-        self._open_turn(turn_id, event.text, "voice", base_ms=base, marks=marks)
+        self._open_turn(turn_id, turn_text, "voice", base_ms=base, marks=marks)
 
     def _open_turn(
         self,
@@ -1994,9 +2109,19 @@ class TurnController:
     async def _barge_in(
         self, verdict: BargeInVerdict, utterance_id: str | None, heard_at_ms: int | None
     ) -> None:
+        """Cut the turn for a policy's `interrupt` verdict.
+
+        A transcript's verdict names its utterance, and that `barge_in` publishes it (v5
+        :421-424): from then on it is an ordinary utterance, whose turn text, when it ends, is
+        what follows the keyword.
+        """
         turn = self._turn
         if turn is None or turn.ending:
             return
+        utterance = self._utterances.get(utterance_id) if utterance_id is not None else None
+        if utterance is not None:
+            utterance.published = True
+            utterance.keyword = verdict.keyword
         self._send_control(
             VoiceDecisionBargeIn(
                 turn_id=turn.turn_id,
