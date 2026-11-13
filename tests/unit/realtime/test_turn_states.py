@@ -10,7 +10,8 @@ T11e part 1 adds the addressee rows (v5 :1172-1190) and their tests (v5 :1668-17
 arbitration bullets at :1709-1722), v4's muted wake, the mute bullets for unpublished candidates
 (v8 :248-270), "stop" or the name during a `HandOff` wait (v6 :1649-1650), and the controller's
 handling of wake verdicts (v9 :153-163, :296-300), with `FakeWakeArbiter` standing in for
-arbitration.
+arbitration. T11e part 2 runs the arbitration bullets (v5 :1709-1722) through two controllers
+that share one real `WakeArbiter`.
 
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
@@ -19,6 +20,7 @@ Every test drives the controller only through `post` and `close`, with the fakes
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import pytest
 import pytest_asyncio
@@ -39,12 +41,14 @@ from backend.realtime.turn import (
     VoiceStart,
     VoiceStop,
     Wake,
+    WakeArbiter,
     WakeRank,
 )
 
 from .turn_fakes import (
     Call,
     FailingSynthesizer,
+    FakeCallLater,
     Harness,
     Pause,
     RecordingIngress,
@@ -1111,6 +1115,52 @@ async def test_held_disconnect_cancels_without_trace():
     assert h.outbound.sent[mark:] == []
     assert h.responder.commits == []
     assert h.responder.closed == [0]
+
+
+async def test_held_overload_names_no_turn_and_the_turn_stays_held():
+    """A held turn sends nothing to the client (v1 :402-404), so no message may name it."""
+    h = make_harness([Token("One two. "), Pause()])
+    h.start_voice()
+    uid = await held(h)
+    mark = len(h.outbound.sent)
+
+    h.post(h.ingress.overload("vad", dropped_ms=60))
+    await h.settle()
+
+    assert names_since(h, mark) == ["voice_decision:overload"]
+    (overload,) = h.outbound.of("voice_decision:overload")
+    assert overload.turn_id is None
+    assert (overload.detail.lane, overload.detail.dropped_ms) == ("vad", 60)
+    assert h.controller.phase == "held"
+
+    # Released, the turn's own messages name it as usual; its `stream_start` comes first.
+    h.post(h.ingress.ended(uid, "what time is it"))
+    await h.settle()
+    turn_id = h.last_turn()
+    h.post(h.ingress.overload("kws", dropped_ms=20))
+    await h.settle()
+    assert h.outbound.of("voice_decision:overload")[-1].turn_id == turn_id
+
+
+@pytest.mark.parametrize(("backlog_ms", "reason"), [(0, "no_backlog"), (1500, "not_addressed")])
+async def test_held_endpoint_wake_rejected_names_no_turn(backlog_ms, reason):
+    """As with `overload`, a `wake_rejected` while held must not name the held turn."""
+    h = make_harness([Token("One two. "), Pause()])
+    h.start_voice()
+    await held(h)
+
+    h.post(Wake(keyword="mist", score=0.8, backlog_ms=backlog_ms, arrival=0.0))
+    await h.settle()
+    if backlog_ms:
+        h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.8))
+        await h.settle()
+        ((*_, uid),) = calls(h.ingress, "open_utterance")
+        h.post(h.ingress.partial(uid, "I missed the bus", gate=True))
+        await h.settle()
+
+    (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+    assert (rejected.reason, rejected.turn_id) == (reason, None)
+    assert h.outbound.queued_turn_ids() == []
 
 
 # == The cells of v2's table in idle, thinking, speaking and text (v2 :476-492) ==================
@@ -2529,3 +2579,228 @@ async def test_an_accepted_and_a_rejected_claim_are_each_settled_exactly_once():
     await h.settle()
 
     assert h.arbiter.settles == [(1, False), (2, True)]
+
+
+# == T11e part 2: arbitration through two controllers (v5 :1709-1722) ================================
+# Two sessions' controllers share one real `WakeArbiter`, whose window a fake `call_later` closes
+# when the test fires it. The window is `wake_arbitration_ms`, 250.
+
+FLOOR = SpotterCalibration(
+    # Every score from 0.7 up clamps to the false-accept floor, 0.1 an hour.
+    false_accepts=((0.5, 3.0), (0.7, 0.1)),
+    positive_quantile=((0.5, 0.0), (1.0, 1.0)),
+)
+
+
+@dataclass
+class TwoSessions:
+    a: Harness
+    b: Harness
+    arbiter: WakeArbiter
+    later: FakeCallLater
+    count: list[int]
+
+    async def settle(self) -> None:
+        await self.a.settle()
+
+    async def close_window(self) -> None:
+        self.later.fire()
+        await self.settle()
+
+
+def two_sessions(
+    *,
+    cal_a: SpotterCalibration | None = None,
+    cal_b: SpotterCalibration | None = None,
+    sessions: int = 2,
+) -> TwoSessions:
+    count = [sessions]
+    later = FakeCallLater()
+    shared = WakeArbiter(window_ms=250, sessions=lambda: count[0], call_later=later)
+    a = make_harness([Pause()], arbiter=shared, session_id="desk", id_prefix="a", calibration=cal_a)
+    b = make_harness([Pause()], arbiter=shared, session_id="room", id_prefix="b", calibration=cal_b)
+    a.start_voice()
+    b.start_voice()
+    return TwoSessions(a, b, shared, later, count)
+
+
+def rejected_reasons(h: Harness) -> list[str]:
+    return [item.reason for item in h.outbound.of("voice_decision:wake_rejected")]
+
+
+async def test_two_calibrated_hits_the_lower_false_accept_rate_proceeds_over_a_larger_margin():
+    # The two tables disagree with the margins: a's 0.6 (margin 0.1) reads 0.2 false accepts an
+    # hour, b's 0.9 (margin 0.4) reads 1.0.
+    cal_a = SpotterCalibration(
+        false_accepts=((0.5, 0.4), (0.7, 0.0)), positive_quantile=((0.5, 0.2), (0.7, 0.6))
+    )
+    cal_b = SpotterCalibration(
+        false_accepts=((0.8, 1.2), (1.0, 0.8)), positive_quantile=((0.8, 0.6), (1.0, 0.9))
+    )
+    s = two_sessions(cal_a=cal_a, cal_b=cal_b)
+    ua = await name_hit(s.a, score=0.6, arrival=100.0)
+    ub = await name_hit(s.b, score=0.9, arrival=0.0)
+
+    # Both wait in the window; neither decodes its gate partial yet.
+    assert calls(s.a.ingress, "request_gate_partial") == []
+    assert calls(s.b.ingress, "request_gate_partial") == []
+    await s.close_window()
+    assert calls(s.a.ingress, "request_gate_partial") == [
+        ("request_gate_partial", ua, GATE_THROUGH)
+    ]
+    assert calls(s.b.ingress, "request_gate_partial") == []
+    # The loser waits for the winner's verdict: nothing is rejected yet.
+    assert rejected_reasons(s.b) == []
+
+    await gate(s.a, ua, "mist what's up")
+
+    assert "vad_status:speech_started" in s.a.outbound.names()
+    assert rejected_reasons(s.b) == ["lost_arbitration"]
+    assert s.b.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_rejected",
+        "state_cycle:idle",
+    ]
+    assert calls(s.b.ingress, "drop") == [("drop", ub, "wake_lost")]
+    assert calls(s.b.ingress, "request_gate_partial") == []
+
+
+async def test_two_hits_at_the_false_accept_floor_the_higher_quantile_proceeds_though_second():
+    # The desktop's server hit arrives first; the room unit's `wake` arrives 120 ms later with
+    # the higher positive quantile (0.9 against 0.7), and both read the 0.1 floor.
+    s = two_sessions(cal_a=FLOOR, cal_b=FLOOR)
+    ua = await name_hit(s.a, score=0.85, arrival=1000.0)
+    s.b.post(Wake(keyword="mist", score=0.95, backlog_ms=1500, arrival=1120.0))
+    await s.settle()
+
+    await s.close_window()
+    assert calls(s.a.ingress, "request_gate_partial") == []
+    # The room unit won before its backlog arrived; its gate partial follows its `NameHeard`.
+    s.b.post(s.b.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.95))
+    await s.settle()
+    ((*_, ub),) = calls(s.b.ingress, "open_utterance")
+    assert calls(s.b.ingress, "request_gate_partial") == [("request_gate_partial", ub, 99 + 15)]
+
+    await gate(s.b, ub, "mist what's the time")
+
+    assert rejected_reasons(s.a) == ["lost_arbitration"]
+    assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
+    assert rejected_reasons(s.b) == []
+
+
+async def test_two_hits_equal_on_both_scales_the_earlier_arrival_proceeds():
+    s = two_sessions(cal_a=FLOOR, cal_b=FLOOR)
+    ua = await name_hit(s.a, score=0.8, arrival=60.0)  # claimed first, arrived later
+    ub = await name_hit(s.b, score=0.8, arrival=10.0)
+
+    await s.close_window()
+
+    assert calls(s.a.ingress, "request_gate_partial") == []
+    assert calls(s.b.ingress, "request_gate_partial") == [
+        ("request_gate_partial", ub, GATE_THROUGH)
+    ]
+    await gate(s.b, ub, "mist, are you there")
+    assert rejected_reasons(s.a) == ["lost_arbitration"]
+    assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
+
+
+@pytest.mark.parametrize(
+    ("cal_a", "score_a", "cal_b", "score_b", "winner"),
+    [
+        # A calibrated hit outranks an uncalibrated one with the far larger margin.
+        (None, 0.99, FLOOR, 0.71, "b"),
+        # Two uncalibrated hits rank by margin, whatever their arrival.
+        (None, 0.6, None, 0.9, "b"),
+        (None, 0.9, None, 0.6, "a"),
+    ],
+    ids=["calibrated-over-uncalibrated", "uncalibrated-larger-margin-b", "uncalibrated-a"],
+)
+async def test_calibrated_outranks_uncalibrated_and_uncalibrated_ranks_by_margin(
+    cal_a, score_a, cal_b, score_b, winner
+):
+    s = two_sessions(cal_a=cal_a, cal_b=cal_b)
+    ua = await name_hit(s.a, score=score_a, arrival=0.0)
+    ub = await name_hit(s.b, score=score_b, arrival=50.0)
+
+    await s.close_window()
+
+    won, lost = (s.a, s.b) if winner == "a" else (s.b, s.a)
+    won_uid = ua if winner == "a" else ub
+    assert calls(won.ingress, "request_gate_partial") == [
+        ("request_gate_partial", won_uid, GATE_THROUGH)
+    ]
+    assert calls(lost.ingress, "request_gate_partial") == []
+    await gate(won, won_uid, "mist what's up")
+    assert rejected_reasons(won) == []
+    assert rejected_reasons(lost) == ["lost_arbitration"]
+
+
+async def test_when_the_winner_is_rejected_the_runner_up_requests_its_gate_partial():
+    s = two_sessions()
+    ua = await name_hit(s.a, score=0.9, arrival=0.0)
+    ub = await name_hit(s.b, score=0.7, arrival=30.0)
+    await s.close_window()
+    assert calls(s.b.ingress, "request_gate_partial") == []
+
+    await gate(s.a, ua, "I missed the bus")
+    await s.settle()
+
+    assert rejected_reasons(s.a) == ["not_addressed"]
+    assert calls(s.b.ingress, "request_gate_partial") == [
+        ("request_gate_partial", ub, GATE_THROUGH)
+    ]
+    await gate(s.b, ub, "mist what's up")
+    assert rejected_reasons(s.b) == []
+    assert "vad_status:speech_started" in s.b.outbound.names()
+
+
+async def test_only_the_winners_gate_partial_is_requested_while_both_wait():
+    s = two_sessions()
+    ua = await name_hit(s.a, score=0.9, arrival=0.0)
+    await name_hit(s.b, score=0.7, arrival=30.0)
+
+    # Inside the window neither decodes; after it only the winner does, and the loser keeps
+    # waiting through any later events until the winner's verdict.
+    assert calls(s.a.ingress, "request_gate_partial") == []
+    assert calls(s.b.ingress, "request_gate_partial") == []
+    await s.close_window()
+    await s.a.clock.advance(1000)
+    await s.b.clock.advance(1000)
+
+    assert calls(s.a.ingress, "request_gate_partial") == [
+        ("request_gate_partial", ua, GATE_THROUGH)
+    ]
+    assert calls(s.b.ingress, "request_gate_partial") == []
+    assert rejected_reasons(s.b) == []
+
+
+async def test_with_one_session_no_wait_occurs():
+    s = two_sessions(sessions=1)
+    s.b.post(VoiceStop())  # one voice session; the other harness takes no part
+    await s.settle()
+
+    uid = await name_hit(s.a)
+
+    # The gate partial is requested in the name's own step: the clock never moved, and no window
+    # was opened.
+    assert s.a.clock.now == 0
+    assert s.later.timers == []
+    assert calls(s.a.ingress, "request_gate_partial") == [
+        ("request_gate_partial", uid, GATE_THROUGH)
+    ]
+
+
+async def test_a_dropped_waiting_candidate_withdraws_its_claim_and_the_other_proceeds_alone():
+    s = two_sessions()
+    ua = await name_hit(s.a, score=0.9, arrival=0.0)
+    ub = await name_hit(s.b, score=0.7, arrival=30.0)
+
+    s.a.post(s.a.ingress.dropped(ua, "noise"))  # the better candidate is dropped in the window
+    await s.settle()
+    await s.close_window()
+
+    assert calls(s.b.ingress, "request_gate_partial") == [
+        ("request_gate_partial", ub, GATE_THROUGH)
+    ]
+    assert calls(s.a.ingress, "request_gate_partial") == []
+    assert s.a.outbound.of("voice_decision:wake_rejected") == []

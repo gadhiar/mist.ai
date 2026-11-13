@@ -20,6 +20,8 @@ does not start with `test_`, so pytest does not collect it. Each test file impor
   `WaitGate` step waits on the scope's dispatch gate, as the handler does before a tool.
 - `FakeHost`: a `ReconfigureHost` that records its answers.
 - `FakeWakeArbiter`: a `WakeArbitration` whose verdicts a test grants or denies by hand.
+- `FakeCallLater`: the loop's `call_later` for a real `WakeArbiter`: it records each timer, and
+  a test fires it by hand.
 - `Harness` and `make_harness`: a controller wired to all of the above.
 """
 
@@ -73,6 +75,7 @@ from backend.realtime.turn import (
     TurnController,
     TurnPlacement,
     VoiceStart,
+    WakeArbitration,
     WakeRank,
 )
 from tests.fakes.speech import FakeSynthesizer
@@ -738,6 +741,28 @@ class FakeWakeArbiter:
         self._answer(claim_id, False)
 
 
+class FakeCallLater:
+    """A `call_later` that records each `(delay, callback)` and runs one only when told."""
+
+    def __init__(self) -> None:
+        self.timers: list[tuple[float, Callable[[], None]]] = []
+        self.fired = 0
+
+    def __call__(self, delay: float, callback: Callable[[], None]) -> object:
+        self.timers.append((delay, callback))
+        return object()
+
+    def fire(self) -> None:
+        """Run the oldest timer not yet run."""
+        _, callback = self.timers[self.fired]
+        self.fired += 1
+        callback()
+
+    @property
+    def pending(self) -> int:
+        return len(self.timers) - self.fired
+
+
 # -- The harness ---------------------------------------------------------------------------
 
 
@@ -849,14 +874,19 @@ def make_harness(
     calibration: SpotterCalibration | None = None,
     hit_lag_ms: int = 150,
     solo: bool = True,
+    arbiter: WakeArbitration | None = None,
+    session_id: str = "session-1",
+    id_prefix: str = "u",
 ) -> Harness:
     """A controller wired to every fake; `synthesizer=False` builds one with no TTS.
 
     `wake` configures the gate and the controller alike. With `solo=False` every wake claim waits
-    until the test grants or denies it, as it would with two sessions registered.
+    until the test grants or denies it, as it would with two sessions registered. `arbiter`, when
+    given, is wired in place of the fake one, so two harnesses can share one real `WakeArbiter`;
+    `Harness.arbiter` is then a `FakeWakeArbiter` nothing calls.
     """
     clock = FakeClock()
-    ids = IdCounter()
+    ids = IdCounter(id_prefix)
     outbound = RecordingOutbound(auto_take=auto_take)
     responder = FakeResponder(*scripts, commit_result=commit_result, clock=clock)
     recording_scene = RecordingScenePort()
@@ -868,18 +898,18 @@ def make_harness(
         synth = None
     else:
         synth = synthesizer
-    arbiter = FakeWakeArbiter(solo=solo)
+    fake_arbiter = FakeWakeArbiter(solo=solo)
     host = FakeHost()
     wake_config = wake or WakeConfig()
     barge = barge_in or BargeInConfig(arm_delay_ms=0)
     policy = KeywordBargeIn(barge, aec="headset", recent_tts_text=lambda _ms: "", clock=clock)
     kwargs: dict[str, object] = {
-        "session_id": "session-1",
+        "session_id": session_id,
         "responder": responder,
         "outbound": outbound,
         "host": host,
         "placement": placement or floor_placement,
-        "arbiter": arbiter,
+        "arbiter": fake_arbiter if arbiter is None else arbiter,
         "gate": default_gate(wake_config),
         "wake": wake_config,
         "calibration": calibration,
@@ -908,7 +938,7 @@ def make_harness(
         ingress=ingress,
         clock=clock,
         synth=synth,
-        arbiter=arbiter,
+        arbiter=fake_arbiter,
         host=host,
         ids=ids,
         policy=policy,

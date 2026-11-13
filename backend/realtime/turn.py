@@ -45,7 +45,8 @@ wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to t
 `VoiceStart`, `voice_stop` and `Reconfigure` rows, the held turn, and the keyword row: a
 transcript's keyword interrupt publishes its utterance, whose end then starts a turn from the
 text after the keyword or closes with `dropped keyword`. T11e adds the addressee rows, the
-handling of arbitration verdicts and the follow-up window; the arbiter itself is T11e's part 2.
+handling of arbitration verdicts and the follow-up window, then `outranks` and `WakeArbiter`, the
+one cross-session arbiter every voice session's controller shares.
 """
 
 from __future__ import annotations
@@ -309,6 +310,138 @@ class WakeArbitration(Protocol):
     def settle(self, claim_id: int, accepted: bool) -> None:
         """Report the gate's verdict for a winner, or withdraw a waiting claim."""
         ...
+
+
+def _calibrated(rank: WakeRank) -> bool:
+    return rank.false_accepts_per_hour is not None and rank.positive_quantile is not None
+
+
+def _rank_key(rank: WakeRank) -> tuple[int, float, float, float]:
+    """The sort key `outranks` compares; the lower key is the stronger hit."""
+    if _calibrated(rank):
+        assert rank.false_accepts_per_hour is not None  # noqa: S101 - `_calibrated` checked it
+        assert rank.positive_quantile is not None  # noqa: S101 - `_calibrated` checked it
+        return (0, rank.false_accepts_per_hour, -rank.positive_quantile, rank.arrival)
+    return (1, -rank.margin, 0.0, rank.arrival)
+
+
+def outranks(a: WakeRank, b: WakeRank) -> bool:
+    """Whether `a` heard the name more surely than `b` (v5 :336-351).
+
+    The two spotters' raw scores come from different models, so a calibrated rank is compared on
+    the shared scales: the lower false accepts per hour, then the higher positive quantile. Any
+    calibrated rank outranks an uncalibrated one, and two uncalibrated ranks compare by margin.
+    Arrival breaks a tie last, because it favours the transport with the shorter path, not the
+    better hit. A rank missing either scale counts as uncalibrated.
+    """
+    return _rank_key(a) < _rank_key(b)
+
+
+@dataclass(slots=True, eq=False)
+class _Claim:
+    """One candidate's entry in the arbiter, from its claim to its settle or its verdict."""
+
+    claim_id: int
+    session_id: str
+    rank: WakeRank
+    verdict: Callable[[bool], None]
+
+
+class WakeArbiter:
+    """Cross-session wake arbitration: of the names several sessions heard at once, one proceeds.
+
+    One per registry (T12); every voice session's controller holds the same instance. Claims made
+    within `window_ms` of the first compete, and when the window closes the best-ranked one is
+    told it may proceed. The rest wait on that winner's gate verdict: they lose when it is
+    accepted, and the next-ranked proceeds when it is rejected (v5 :352-360, v9 :132-151). A lone
+    session with nothing pending never waits.
+
+    `verdict` callbacks only post into their controller's mailbox, and every call runs on the
+    event loop's thread, so the arbiter takes no lock. Its state is updated before any callback
+    runs, so a callback that settles at once sees a consistent arbiter.
+
+    Args:
+        window_ms: How long the first claim waits for others (`wake_arbitration_ms`).
+        sessions: The number of voice sessions registered now.
+        call_later: Runs a callback after a delay in seconds; the running loop's `call_later`.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_ms: int,
+        sessions: Callable[[], int],
+        call_later: Callable[[float, Callable[[], None]], object],
+    ) -> None:
+        self._window_ms = window_ms
+        self._sessions = sessions
+        self._call_later = call_later
+        self._next_id = 0
+        self._waiting: dict[int, _Claim] = {}
+        self._winner: _Claim | None = None
+        self._window_open = False
+
+    def claim(self, session_id: str, rank: WakeRank, verdict: Callable[[bool], None]) -> int:
+        """Register a candidate and return its claim id.
+
+        With one session and no claim pending, `verdict(True)` runs before this returns and no
+        timer is set. Otherwise the claim joins the open window, or waits on an unsettled
+        winner, or opens a window.
+        """
+        self._next_id += 1
+        entry = _Claim(self._next_id, session_id, rank, verdict)
+        if self._sessions() <= 1 and not self._waiting and self._winner is None:
+            self._winner = entry
+            verdict(True)
+            return entry.claim_id
+        self._waiting[entry.claim_id] = entry
+        if not self._window_open and self._winner is None:
+            self._window_open = True
+            self._call_later(self._window_ms / 1000, self._close_window)
+        return entry.claim_id
+
+    def settle(self, claim_id: int, accepted: bool) -> None:
+        """Take the gate's verdict for the winner, or withdraw a claim.
+
+        Accepting the winner sends every other pending claim `verdict(False)`; rejecting it gives
+        the next-ranked claim `verdict(True)`. `accepted=False` on a waiting claim withdraws it
+        with no verdict to anyone, and on a claim the arbiter no longer holds (one that lost, or
+        is already settled) does nothing.
+
+        Raises:
+            ValueError: `accepted` is True for a claim that is not the unsettled winner.
+        """
+        winner = self._winner
+        if winner is not None and winner.claim_id == claim_id:
+            self._winner = None
+            if accepted:
+                losers = list(self._waiting.values())
+                self._waiting.clear()
+                for loser in losers:
+                    loser.verdict(False)
+            else:
+                self._grant_next()
+            return
+        if accepted:
+            raise ValueError(f"wake claim {claim_id} is not the winner and cannot be accepted")
+        self._waiting.pop(claim_id, None)
+
+    def _close_window(self) -> None:
+        self._window_open = False
+        self._grant_next()
+
+    def _grant_next(self) -> None:
+        """Give the best-ranked waiting claim `verdict(True)`, unless a window or winner stands."""
+        if self._window_open or self._winner is not None or not self._waiting:
+            return
+        best: _Claim | None = None
+        for entry in self._waiting.values():
+            if best is None or outranks(entry.rank, best.rank):
+                best = entry
+        assert best is not None  # noqa: S101 - `_waiting` is not empty
+        del self._waiting[best.claim_id]
+        self._winner = best
+        best.verdict(True)
 
 
 # -- Messages -------------------------------------------------------------------------------
@@ -1489,11 +1622,13 @@ class TurnController:
             await self._cancel_held(held)
 
     async def _on_overload(self, event: IngressOverload) -> None:
+        """`overload` names the turn in flight, but never a held one, which sent nothing (v1)."""
         if not self._accept(event):
             return
+        turn = self._turn
         self._send_control(
             VoiceDecisionOverload(
-                turn_id=self._turn.turn_id if self._turn is not None else None,
+                turn_id=turn.turn_id if turn is not None and not turn.held else None,
                 reason=event.lane,
                 detail=OverloadDetail(dropped_ms=event.dropped_ms, lane=event.lane),
             )
@@ -1560,8 +1695,11 @@ class TurnController:
         return self._settings.frame_ms if self._settings is not None else FRAME_MS
 
     def _turn_id_now(self) -> str | None:
+        """The turn a message may name now: none while it is held, since it sent nothing (v1)."""
         turn = self._turn
-        return turn.turn_id if turn is not None and not turn.ending else None
+        if turn is None or turn.ending or turn.held:
+            return None
+        return turn.turn_id
 
     def _candidate_of(self, utterance_id: str) -> _Wake | None:
         wake = self._candidate
