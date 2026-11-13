@@ -378,8 +378,16 @@ class RecordingIngress:
         self.ids = ids
         self.epoch = epoch
         self.calls: list[tuple[object, ...]] = []
-        self._seq = itertools.count(1)
+        self._counter = itertools.count(1)
+        self.emitted = 0
+        self.holding = False
+        self.close_result: UtteranceDropped | None = None
         self.first_pos: dict[str, int] = {}
+
+    def _next_seq(self) -> int:
+        """The next event's `event_seq`; a built event counts as emitted by ingress."""
+        self.emitted = next(self._counter)
+        return self.emitted
 
     # Levers
     def open_utterance(self, mode: str, from_pos: int) -> OpenedUtterance:
@@ -409,10 +417,11 @@ class RecordingIngress:
 
     def close(self) -> UtteranceDropped | None:
         self.calls.append(("close",))
-        return None
+        return self.close_result
 
     def idle_since(self) -> int | None:
-        return 0
+        """None while a test says ingress holds an utterance, else the last event's seq."""
+        return None if self.holding else self.emitted
 
     def handoff(self) -> IngressSeed:
         self.calls.append(("handoff",))
@@ -426,12 +435,12 @@ class RecordingIngress:
         return self.first_pos.setdefault(uid, 100)
 
     def started(self, uid: str) -> SpeechStarted:
-        return SpeechStarted(self.epoch, next(self._seq), uid, self._pos(uid))
+        return SpeechStarted(self.epoch, self._next_seq(), uid, self._pos(uid))
 
     def partial(self, uid: str, text: str, *, heard_at_ms: int = 0) -> TranscriptPartial:
         return TranscriptPartial(
             epoch=self.epoch,
-            event_seq=next(self._seq),
+            event_seq=self._next_seq(),
             utterance_id=uid,
             first_pos=self._pos(uid),
             text=text,
@@ -443,7 +452,7 @@ class RecordingIngress:
 
     def candidate(self, uid: str, text: str, *, heard_at_ms: int = 0) -> EndpointCandidate:
         return EndpointCandidate(
-            self.epoch, next(self._seq), uid, self._pos(uid), text, heard_at_ms
+            self.epoch, self._next_seq(), uid, self._pos(uid), text, heard_at_ms
         )
 
     def ended(
@@ -451,7 +460,7 @@ class RecordingIngress:
     ) -> UtteranceEnded:
         return UtteranceEnded(
             epoch=self.epoch,
-            event_seq=next(self._seq),
+            event_seq=self._next_seq(),
             utterance_id=uid,
             first_pos=self._pos(uid),
             text=text,
@@ -467,7 +476,7 @@ class RecordingIngress:
     def dropped(self, uid: str, reason: str = "noise", text: str | None = None) -> UtteranceDropped:
         return UtteranceDropped(
             epoch=self.epoch,
-            event_seq=next(self._seq),
+            event_seq=self._next_seq(),
             utterance_id=uid,
             first_pos=self._pos(uid),
             reason=reason,  # type: ignore[arg-type]
@@ -478,7 +487,7 @@ class RecordingIngress:
         )
 
     def overload(self, lane: str = "vad", dropped_ms: int = 120) -> IngressOverload:
-        return IngressOverload(self.epoch, next(self._seq), lane, dropped_ms, None, None)
+        return IngressOverload(self.epoch, self._next_seq(), lane, dropped_ms, None, None)
 
 
 def default_gate(config: WakeConfig | None = None) -> AddresseeGate:
