@@ -52,9 +52,9 @@ from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.partitions import USER_ENTITY_ID
 from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
-from backend.llm.models import LLMResponse, UsageMetadata
+from backend.llm.models import LLMResponse, ThinkingConfig, UsageMetadata
 from backend.llm.models import ToolCall as LLMToolCall
-from backend.sentence_detector import SentenceBoundaryDetector
+from backend.sentence_detector import SentenceBoundaryDetector, find_clause_boundary
 from backend.vault.conventions import ConventionsLoader
 
 from .retrieval_trace import TurnTraceBuilder, refs_removed, trace_failed
@@ -1824,6 +1824,7 @@ class ConversationHandler:
         call_site: str,
         pass_num: int,
         state: StreamTurnState,
+        first_clause_min_chars: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream one LLM pass, sentence-gating content through the slop filter.
 
@@ -1864,12 +1865,34 @@ class ConversationHandler:
         generator (and its HTTP stream) in the same task, not several loop
         ticks later in the asyncgen finalizer.
 
+        With `first_clause_min_chars` set (a `tts` turn), the turn's first
+        emission is cut at `find_clause_boundary` instead of the sentence end,
+        so speech can start while the model is still writing the sentence.
+        TTS cuts its first segment with the same function, so the first Token
+        and the first segment end at the same character. "First" is read
+        from `state.emitted`, which spans both passes: a pass 1 that only
+        called a tool leaves the early cut to pass 2. The clause goes through
+        the same slop gate as a sentence, and everything after it is
+        sentence-gated as before.
+
+        Args:
+            request: The pass's LLM request.
+            session_id: The turn's session, for logs.
+            call_site: The pass's `llm_call_context` call site.
+            pass_num: 1 for the initial pass, 2 for the post-tool pass.
+            state: The turn's accumulator, mutated in place.
+            first_clause_min_chars: The earliest index the first clause may
+                be cut at; None keeps sentence gating throughout.
+
         Yields:
-            Token events, `pass_num=pass_num`, for each gated sentence
-            (including the trailing partial sentence flushed at end of
-            stream).
+            Token events, `pass_num=pass_num`, for the first clause when one
+            is cut early and for each gated sentence (including the trailing
+            partial sentence flushed at end of stream).
         """
         gate = SentenceBoundaryDetector()
+        # Text held for the first clause while no Token of the turn exists;
+        # it reaches `gate` only once the clause is out.
+        clause_buffer = ""
         emitted_text = ""
         # Whitespace the model wrote after the last emitted sentence. It is
         # held back, not emitted with that sentence, so it becomes the
@@ -1924,6 +1947,37 @@ class ConversationHandler:
             emitted_text += text if emitted_text else piece_text
             return Token(text=text, pass_num=pass_num)
 
+        def _feed(content: str) -> list[Token]:
+            """Cut the first clause early while the turn has no Token yet, else
+            sentence-gate.
+
+            The clause segment takes the whitespace that follows it in the
+            buffer, as a sentence segment does, so that whitespace becomes the
+            next Token's separator. A clause the slop gate strips to nothing
+            leaves the turn without a Token, so the next clause is cut early
+            in its place.
+            """
+            nonlocal clause_buffer
+            tokens: list[Token] = []
+            if first_clause_min_chars is not None and not state.emitted:
+                clause_buffer += content
+                while not state.emitted:
+                    cut = find_clause_boundary(clause_buffer, first_clause_min_chars)
+                    if cut is None:
+                        return tokens
+                    after = clause_buffer[cut:]
+                    end = cut + len(after) - len(after.lstrip())
+                    segment, clause_buffer = clause_buffer[:end], clause_buffer[end:]
+                    token = _gate_and_emit(segment)
+                    if token is not None:
+                        tokens.append(token)
+                content, clause_buffer = clause_buffer, ""
+            for segment in gate.feed_segments(content):
+                token = _gate_and_emit(segment)
+                if token is not None:
+                    tokens.append(token)
+            return tokens
+
         with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
             async with aclosing(self._provider.generate(request, stream=True)) as chunks:
                 async for chunk in chunks:
@@ -1932,10 +1986,8 @@ class ConversationHandler:
                             continue
                         if first_token_at is None:
                             first_token_at = time.monotonic()
-                        for segment in gate.feed_segments(chunk.content):
-                            token = _gate_and_emit(segment)
-                            if token is not None:
-                                yield token
+                        for token in _feed(chunk.content):
+                            yield token
                         continue
                     # Terminal chunk: content is always None by contract; everything
                     # else the partials did NOT carry lives here.
@@ -1944,6 +1996,13 @@ class ConversationHandler:
                     usage = chunk.usage
                     reasoning_content = chunk.reasoning_content
 
+        # A first clause that never reached a boundary is sentence-gated with
+        # the rest of the stream.
+        if clause_buffer:
+            for segment in gate.feed_segments(clause_buffer):
+                token = _gate_and_emit(segment)
+                if token is not None:
+                    yield token
         for segment in gate.flush_segments():
             token = _gate_and_emit(segment)
             if token is not None:
@@ -2250,6 +2309,20 @@ class ConversationHandler:
         # Set on the error path; yielded after the drain below, not from
         # inside the except block (see the comment there).
         error_token: Token | None = None
+        # A spoken turn waits on the model's first words, so it asks for the
+        # voice budget (0: no reasoning) on both passes. Being caller-set, it
+        # also stops `AdaptiveThinkingProvider` budgeting and retrying the
+        # pass. A typed turn leaves thinking unset, as before.
+        thinking = (
+            ThinkingConfig(budget_tokens=self.config.llm.voice_thinking_budget_tokens)
+            if scope.request.origin == "voice"
+            else None
+        )
+        first_clause_min_chars = (
+            self.config.llm.voice_first_segment_min_chars
+            if scope.request.channel == "tts"
+            else None
+        )
 
         try:
             # LLM autonomously decides to use tools
@@ -2262,6 +2335,7 @@ class ConversationHandler:
                 tools=self._tool_schemas,
                 temperature=self.config.llm.conversation_temperature,
                 max_tokens=self.config.llm.conversation_max_tokens,
+                thinking=thinking,
             )
             async with aclosing(
                 self._stream_llm_pass(
@@ -2270,6 +2344,7 @@ class ConversationHandler:
                     call_site="chat.initial",
                     pass_num=1,
                     state=state,
+                    first_clause_min_chars=first_clause_min_chars,
                 )
             ) as pass1_events:
                 async for stream_event in pass1_events:
@@ -2348,6 +2423,7 @@ class ConversationHandler:
                     messages=messages,
                     temperature=self.config.llm.conversation_temperature,
                     max_tokens=self.config.llm.conversation_max_tokens,
+                    thinking=thinking,
                 )
                 current_pass = 2
                 async with aclosing(
@@ -2357,6 +2433,7 @@ class ConversationHandler:
                         call_site="chat.final",
                         pass_num=2,
                         state=state,
+                        first_clause_min_chars=first_clause_min_chars,
                     )
                 ) as pass2_events:
                     async for stream_event in pass2_events:

@@ -128,6 +128,14 @@ class LLMConfig:
     # ever sent when the caller left `LLMRequest.thinking` unset; it never
     # overrides an explicit thinking config.
     tool_thinking_budget_tokens: int | None = 1024
+    # A spoken reply cannot start before its first words exist, so a voice
+    # turn sends this reasoning budget on both passes. 0 ends thinking at
+    # once. Being caller-set, it also keeps `AdaptiveThinkingProvider` from
+    # budgeting and retrying the turn.
+    voice_thinking_budget_tokens: int = 0
+    # The earliest character a `tts` turn's first emission may be cut at, so
+    # the first spoken segment is long enough to sound like a phrase.
+    voice_first_segment_min_chars: int = 40
     # Only roles whose URL variable is set. A factory, not an env read: the
     # class-level `os.getenv` defaults elsewhere in this module are baked in
     # at import (KNOWN_ISSUES.md), so the role variables are read in
@@ -155,7 +163,9 @@ class LLMConfig:
             ValueError: A role's model variable is set without its URL
                 variable, or a role's URL is not an `http` or `https` URL
                 with a host. Both fail at startup rather than at the first
-                turn's LLM call.
+                turn's LLM call. Also when `MIST_VOICE_THINKING_BUDGET_TOKENS`
+                or `MIST_VOICE_FIRST_SEGMENT_MIN_CHARS` is not a whole number
+                of zero or more.
         """
         backend = os.getenv("LLM_BACKEND", "llamacpp")
         default_url = "http://localhost:11434" if backend == "ollama" else "http://localhost:8080"
@@ -172,8 +182,34 @@ class LLMConfig:
             conversation_max_tokens=int(os.getenv("LLM_CONVERSATION_MAX_TOKENS", "1024")),
             backend=backend,
             tool_thinking_budget_tokens=tool_thinking_budget_tokens,
+            voice_thinking_budget_tokens=cls._non_negative_int_from_env(
+                "MIST_VOICE_THINKING_BUDGET_TOKENS", 0
+            ),
+            voice_first_segment_min_chars=cls._non_negative_int_from_env(
+                "MIST_VOICE_FIRST_SEGMENT_MIN_CHARS", 40
+            ),
             roles=cls._roles_from_env(default_model=model),
         )
+
+    @staticmethod
+    def _non_negative_int_from_env(name: str, default: int) -> int:
+        """Read a count that must be zero or more, naming `name` when it is not.
+
+        `ThinkingConfig` refuses a negative budget, so a negative budget would
+        otherwise fail every voice turn, far from the setting; a negative
+        minimum length can only be a typo. Either fails at startup with the
+        variable named, as does a value `int()` cannot read.
+        """
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number, got {raw!r}") from None
+        if value < 0:
+            raise ValueError(f"{name} must be zero or more, got {value}")
+        return value
 
     @staticmethod
     def _roles_from_env(default_model: str) -> dict[str, LLMEndpoint]:

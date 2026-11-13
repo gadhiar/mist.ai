@@ -80,6 +80,7 @@ def _handler(passes: list[ScriptedPass]) -> tuple[ConversationHandler, FakeStrea
     conn = FakeNeo4jConnection()
     graph_store = GraphStore(conn, FakeEmbeddingGenerator())
     config = build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+    config.llm.voice_first_segment_min_chars = 0
     provider = FakeStreamingLLMProvider(passes)
     handler = ConversationHandler(
         config=config,
