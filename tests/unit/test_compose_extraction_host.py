@@ -34,8 +34,10 @@ from pathlib import Path
 import yaml
 
 from tests.unit.test_compose_extraction import (
+    CHAT_TEMPLATE_FILE,
     EXPECTED_SERVER_DECLARATIONS,
     SERVER_ENV_PREFIX,
+    chat_template_mount_problems,
     declaration_problems,
     device_problems,
     model_path_problems,
@@ -151,6 +153,18 @@ class TestModelsVolumeIsParameterised:
         assert (
             "${MODELS_DIR" in models_mount
         ), f"models mount is not parameterised: {models_mount!r}"
+
+
+class TestTheChatTemplateIsLoadedFromTheRepository:
+    """T62: the host's llama-server loads the same shipped gpt-oss template as the local one."""
+
+    def test_the_host_llm_loads_the_shipped_template(self) -> None:
+        assert _env_dict(_host_llm())["LLAMA_ARG_CHAT_TEMPLATE_FILE"] == CHAT_TEMPLATE_FILE
+
+    def test_the_host_llm_mounts_the_template_directory_read_only(self) -> None:
+        # Resolved against this file's own directory, docker/extraction/.
+        assert "./chat_templates:/chat-templates:ro" in _host_llm()["volumes"]
+        assert chat_template_mount_problems(_host_llm(), HOST_COMPOSE_PATH.parent) == []
 
 
 class TestLlamaServerPins:

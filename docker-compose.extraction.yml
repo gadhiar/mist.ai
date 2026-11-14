@@ -63,6 +63,12 @@ services:
     # 127.0.0.1 port below, not this one.
     volumes:
       - ${MODELS_DIR:-./models}:/models:ro
+      # gpt-oss's chat template, shipped in the repository (T62): the model's
+      # own template, except that the system message's date is the request's
+      # `chat_template_kwargs.current_date` in place of llama-server's clock.
+      # The service withholds its serving identity unless /props serves these
+      # bytes. See docker/extraction/README.md, "Repeatable calls".
+      - ./docker/extraction/chat_templates:/chat-templates:ro
     # Every LLAMA_ARG_* and command flag of this service is declared to
     # mist-extraction-local as EXTRACTION_SERVER_<NAME> from the same
     # expression, or excluded with a reason in
@@ -84,6 +90,10 @@ services:
       # jinja on (llama_server_help_b11151.txt:626, default already enabled;
       # set explicitly, same as mist-llm, rather than relying on the default).
       - LLAMA_ARG_JINJA=1
+      # The shipped template from the mount above, in place of the one the
+      # model file embeds (T62; excluded from the declarations with its reason
+      # in tests/unit/test_compose_extraction.py).
+      - LLAMA_ARG_CHAT_TEMPLATE_FILE=/chat-templates/gpt-oss.jinja
       # Force reasoning on rather than relying on `-rea auto`'s "detect from
       # template" (README.md:594-596's citable reason for c9's own `-rea on`;
       # gpt-oss's Harmony reasoning is always-on per the T0 brief, this just

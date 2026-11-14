@@ -99,6 +99,13 @@ services:
       # load. CUDA_CACHE_PATH on a named volume makes that compile happen
       # once across container restarts rather than on every `up`.
       - mist-extraction-cuda-cache:/root/.nv/ComputeCache
+      # gpt-oss's chat template, shipped in the repository (T62), resolved
+      # against this file's directory: the model's own template, except that
+      # the system message's date is the request's
+      # `chat_template_kwargs.current_date` in place of llama-server's clock.
+      # The service withholds its serving identity unless /props serves these
+      # bytes. See docker/extraction/README.md, "Repeatable calls".
+      - ./chat_templates:/chat-templates:ro
     # Every LLAMA_ARG_* and command flag of this service is declared to
     # mist-extraction-host as EXTRACTION_SERVER_<NAME> from the same
     # expression, or excluded with a reason in
@@ -120,6 +127,9 @@ services:
       - LLAMA_ARG_N_PARALLEL=1
       - LLAMA_ARG_METRICS=1
       - LLAMA_ARG_JINJA=1
+      # The shipped template from the mount above, in place of the one the
+      # model file embeds (T62).
+      - LLAMA_ARG_CHAT_TEMPLATE_FILE=/chat-templates/gpt-oss.jinja
       - LLAMA_ARG_REASONING=on
       - LLAMA_ARG_THINK=deepseek
       - CUDA_CACHE_PATH=/root/.nv/ComputeCache
