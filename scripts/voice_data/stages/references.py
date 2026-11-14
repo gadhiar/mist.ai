@@ -1,15 +1,22 @@
 """Reference clips per state for the target and every teacher (Design 5).
 
-A state's references are 2-4 of its cleaned segments, each 3-12 s long and at or above the
+A state's references are 2-4 of its cleaned segments, each 3-12 s long, at or above the
 leave-one-out median SIM on every embedder (each clip against the centroid of the others, as
-`score.leave_one_out_scores` defines it). Among those, clips whose prosody sits nearest the
-state's median come first, the higher SNR breaking a tie, and each new source is taken before a
-second clip of a source already chosen. A state with fewer than two such clips is reported short
-and gets none: a clip outside the rules is never added to make up the number.
+`score.leave_one_out_scores` defines it), and with a verbatim transcript both ASR passes agree
+on. Among those, clips whose prosody sits nearest the state's median come first, the higher SNR
+breaking a tie, and each new source is taken before a second clip of a source already chosen. A
+state with fewer than two such clips is reported short and gets none: a clip outside the rules is
+never added to make up the number.
+
+The transcript rule exists because a teacher conditions on the reference's text as well as its
+audio (OmniVoice's `ref_text`, CosyVoice 3's zero-shot prompt), so a text the two ASRs disagree
+on, or no text at all, would steer the teacher wrongly. The text is written beside the WAV as
+`refs/<state>/<n>.private.txt`, the segment's `crisper` transcript as UTF-8 and nothing else.
 
 The prosody distance is `score.select`'s, so references and take selection agree on what "near
 the state's profile" means. The state's profile is the median of every member's prosody, and its
-spread their standard deviation, eligible or not.
+spread their standard deviation, eligible or not: a clip barred by its transcript still shows how
+the state sounds.
 """
 
 from __future__ import annotations
@@ -35,7 +42,11 @@ _FIELDS = ("f0_mean_hz", "f0_std_hz", "rate_sps", "energy_db")
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
-    """A confirmed, cleaned segment as a reference candidate; `sim` is its leave-one-out SIM."""
+    """A confirmed, cleaned segment as a reference candidate.
+
+    `sim` is its leave-one-out SIM, `transcript` its verbatim (`crisper`) text, and
+    `asr_disagree` whether the two ASR passes disagreed on it.
+    """
 
     segment_id: str
     source_id: str
@@ -44,6 +55,8 @@ class Candidate:
     snr_db: float
     prosody: Prosody
     sim: dict[str, float]
+    transcript: str
+    asr_disagree: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +75,13 @@ class StateChoice:
 
 
 def eligible(candidate: Candidate, medians: Mapping[str, float]) -> bool:
-    """Return whether the clip is 3-12 s and at the leave-one-out median or above everywhere."""
+    """Return whether the clip may be a reference.
+
+    It must have a transcript both ASR passes agree on, be 3-12 s long, and sit at the
+    leave-one-out median or above on every embedder.
+    """
+    if candidate.asr_disagree or not candidate.transcript.strip():
+        return False
     if not MIN_S <= candidate.duration_s <= MAX_S:
         return False
     return all(candidate.sim.get(name, float("-inf")) >= m for name, m in medians.items())
@@ -129,6 +148,18 @@ def choose(
 def reference_rel(state: str, number: int) -> str:
     """Return a reference's path relative to its target folder, as `target.json` records it."""
     return f"refs/{state}/{number}.wav"
+
+
+def write_transcript(path: Path, text: str) -> None:
+    """Write a reference's transcript as its UTF-8 bytes exactly, atomically.
+
+    Bytes rather than text mode, so no newline is translated and a later sha256 of the file is
+    the sha256 of the transcript itself.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".part")
+    part.write_bytes(text.encode("utf-8"))
+    os.replace(part, path)
 
 
 def write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:

@@ -3,9 +3,11 @@
 The host side of Design 5. `E` is a finished extract run and `R` a new run that holds its cleaned
 copy: `segments.jsonl` with transcripts, `audio/` at 24 kHz, `gates.json`, `refs.json` and
 `report.json`. The extract run is read-only to the job and stays as it was, so the clean-ab pack
-can play each segment before (`E`) and after (`R`) cleaning. The chosen references are written
-by the job into `R/refs/<state>/` and copied here to `targets/<T>/refs/<state>/`, where
-`target build` reads them. Seed stages stay on this host, so there is no executor option.
+can play each segment before (`E`) and after (`R`) cleaning. The chosen references, each a WAV
+with its verbatim transcript beside it as `<n>.private.txt`, are written by the job into
+`R/refs/<state>/` and copied here to `targets/<T>/refs/<state>/`, where `target build` reads
+them. The transcript is private text: it is copied as bytes and never printed. Seed stages stay
+on this host, so there is no executor option.
 
 Raj's labels (`seed/labels.csv`, from `pack import`) confirm segments when present: a listed
 segment takes the state he gave it, and a kept segment he did not list is dropped as `not-her`.
@@ -49,6 +51,11 @@ PRIMARY = "primary"
 NOT_HER = "not-her"
 RUN_ID = extract_cmd.RUN_ID
 REF_REL = re.compile(r"refs/(?P<state>[a-z]+)/(?P<n>[1-9][0-9]*)\.wav")
+
+
+def transcript_rel(state: str, number: int | str) -> str:
+    """Return the path of a reference's transcript, beside `refs/<state>/<number>.wav`."""
+    return f"{REFS_DIR}/{state}/{number}.private.txt"
 
 
 def run_rel(run_id: str) -> str:
@@ -228,23 +235,36 @@ def _finish(root: root_mod.Root, run_id: str, target_id: str) -> int:
 def place_references(
     root: root_mod.Root, run_dir: str, target_dir: str, refs: Mapping[str, object]
 ) -> int:
-    """Copy each reference the job chose into the target folder; return how many.
+    """Copy each reference the job chose, and its transcript, into the target folder.
+
+    Every path is checked before anything is copied, so a bad `refs.json` leaves the target
+    folder as it was. The transcript is copied as bytes and never read as text here.
+
+    Returns:
+        How many references were placed.
 
     Raises:
-        JobError: `refs.json` names a path outside the reference layout.
+        JobError: `refs.json` names a path outside the reference layout, or a reference has no
+            transcript beside it.
     """
     states = refs.get("states")
-    count = 0
+    rels: list[str] = []
     for state, entry in (states if isinstance(states, Mapping) else {}).items():
         for ref in entry.get("refs", []) if isinstance(entry, Mapping) else []:
             rel = ref.get("audio") if isinstance(ref, Mapping) else None
             match = REF_REL.fullmatch(rel) if isinstance(rel, str) else None
             if match is None or match["state"] != state or state not in SPEAKING_STATES:
                 raise JobError(f"{run_dir}/{REFS_NAME} names a reference outside refs/<state>/")
-            data = (root.path / run_dir / rel).read_bytes()
-            root.write_bytes(f"{target_dir}/{rel}", data)
-            count += 1
-    return count
+            text_rel = transcript_rel(state, match["n"])
+            if ref.get("transcript") != text_rel:
+                raise JobError(
+                    f"{run_dir}/{REFS_NAME}: reference {state}/{match['n']} has no transcript "
+                    "beside it"
+                )
+            rels += [rel, text_rel]
+    for rel in rels:
+        root.write_bytes(f"{target_dir}/{rel}", (root.path / run_dir / rel).read_bytes())
+    return len(rels) // 2
 
 
 def _num(value: object) -> str:

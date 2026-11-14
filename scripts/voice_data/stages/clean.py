@@ -22,8 +22,10 @@ The order is Design 5's:
    differences between a source's lines (sleepy against excited) survive.
 4. Both ASRs transcribe the cleaned clip (`transcribe`), the prosody is measured again with the
    timing ASR's word times, and the clip is written as 24 kHz mono FLAC under `audio/`.
-5. References per state are chosen from the confirmed segments (`references`) and written as
-   WAV PCM16 under `refs/<state>/`; the host copies them to `targets/<T>/refs/<state>/`.
+5. References per state are chosen from the confirmed segments both ASR passes agree on
+   (`references`) and written as WAV PCM16 under `refs/<state>/`, each with its segment's
+   `crisper` transcript beside it as `<n>.private.txt`; `refs.json` names both paths and never
+   the text. The host copies both to `targets/<T>/refs/<state>/`.
 
 The reference SIM reuses the embeddings of the cleaned audio before its gain: a scalar gain
 does not change a speaker embedding, and embedding every clip again would double the cost of the
@@ -473,6 +475,8 @@ class Cleaning:
                     snr_db=record.snr_db,
                     prosody=record.prosody,
                     sim={name: float(values[j]) for name, values in loo.items()},
+                    transcript=record.transcripts.get(transcribe.VERBATIM_KEY, ""),
+                    asr_disagree=transcribe.ASR_DISAGREE in record.reasons,
                 )
             )
         return references.choose(candidates, medians), medians
@@ -492,11 +496,14 @@ class Cleaning:
             refs = []
             for number, chosen in enumerate(choice.chosen, start=1):
                 rel = references.reference_rel(state, number)
+                text_rel = contract.transcript_rel(state, number)
                 references.write_wav(self.run_dir / rel, by_id[chosen.segment_id], RATE)
-                files.append(f"{self.run_rel}/{rel}")
+                references.write_transcript(self.run_dir / text_rel, chosen.transcript)
+                files += [f"{self.run_rel}/{rel}", f"{self.run_rel}/{text_rel}"]
                 refs.append(
                     {
                         "audio": rel,
+                        "transcript": text_rel,
                         "segment_id": chosen.segment_id,
                         "source_id": chosen.source_id,
                         "duration_s": round(chosen.duration_s, 3),

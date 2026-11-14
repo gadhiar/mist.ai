@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import importlib
 import json
 import re
@@ -27,6 +28,7 @@ from scripts.voice_data import cli, jobs
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.bindings.protocols import Transcript, Word
 from scripts.voice_data.commands import clean as clean_cmd
+from scripts.voice_data.errors import JobError
 from scripts.voice_data.records import Prosody, SegmentRecord, read_jsonl, write_jsonl
 from scripts.voice_data.stages import clean as clean_stage
 from scripts.voice_data.stages import prosody as prosody_mod
@@ -561,7 +563,7 @@ def test_references_are_written_under_targets_as_wav_pcm16_mono_24khz(main_run: 
             continue
         assert 2 <= len(entry["refs"]) <= 4
         assert sorted(p.name for p in folder.iterdir()) == sorted(
-            Path(r["audio"]).name for r in entry["refs"]
+            Path(r[key]).name for r in entry["refs"] for key in ("audio", "transcript")
         )
         for ref in entry["refs"]:
             assert ref["audio"].startswith(f"refs/{state}/")
@@ -574,6 +576,116 @@ def test_references_are_written_under_targets_as_wav_pcm16_mono_24khz(main_run: 
             assert all(ref["sim"][n] >= medians[n] for n in medians)
             written += 1
     assert written >= 2
+
+
+def all_refs(ran: Ran) -> list[tuple[str, dict]]:
+    states = ran.json("refs.json")["states"]
+    return [(state, ref) for state, entry in states.items() for ref in entry["refs"]]
+
+
+def assert_transcripts_beside_references(ran: Ran) -> None:
+    """Each reference WAV has its segment's `crisper` text beside it, in the run and the target."""
+    records = ran.records()
+    refs = all_refs(ran)
+    assert len(refs) >= 2
+    for state, ref in refs:
+        audio = Path(ref["audio"])
+        assert ref["transcript"] == f"refs/{state}/{audio.stem}.private.txt"
+        expected = records[ref["segment_id"]].transcripts["crisper"].encode("utf-8")
+        assert expected.strip()
+        for folder in (ran.run_dir, ran.root.path / "targets" / "t1"):
+            assert (folder / ref["audio"]).is_file()
+            assert (folder / ref["transcript"]).read_bytes() == expected
+
+
+def assert_no_transcript_outside_its_files(ran: Ran) -> None:
+    """The planted transcript is in no printed line and no file but the two that hold it."""
+    _assert_no_canary(ran.out + ran.err)
+    needle = CANARY.transcript.lower().encode("utf-8")
+    checked = 0
+    for path in ran.root.path.rglob("*"):
+        if not path.is_file() or path.name == "segments.jsonl":
+            continue
+        if path.name.endswith(".private.txt"):
+            continue
+        assert needle not in path.read_bytes().lower(), path.relative_to(ran.root.path)
+        checked += 1
+    assert list((ran.root.path / "runs").glob("job-*/*")), "the job log was not scanned"
+    assert checked > 0
+
+
+def test_each_reference_has_its_verbatim_transcript_beside_it(main_run: Ran) -> None:
+    assert_transcripts_beside_references(main_run)
+
+
+def test_reference_transcripts_are_listed_in_the_job_outputs(main_run: Ran) -> None:
+    outputs = main_run.json("outputs.json")["files"]
+    listed = {f["rel"]: f["sha256"] for f in outputs}
+    for _, ref in all_refs(main_run):
+        rel = f"seed/runs/c1/{ref['transcript']}"
+        data = (main_run.root.path / rel).read_bytes()
+        assert listed[rel] == hashlib.sha256(data).hexdigest()
+
+
+def test_a_disagreeing_segment_is_never_a_reference(main_run: Ran) -> None:
+    assert transcribe.ASR_DISAGREE in main_run.records()[DISAGREE].reasons
+    assert DISAGREE not in {ref["segment_id"] for _, ref in all_refs(main_run)}
+    neutral = main_run.json("refs.json")["states"]["neutral"]
+    assert neutral["members"] == 6
+
+
+def test_the_transcript_appears_only_in_segments_and_reference_transcripts(main_run: Ran) -> None:
+    assert_no_transcript_outside_its_files(main_run)
+
+
+TEXT_SEGS = SEGS[:5] + SEGS[6:8]
+
+
+@pytest.fixture(scope="module")
+def text_run(tmp_path_factory: pytest.TempPathFactory) -> Ran:
+    """A run whose segments each have their own text, non-ASCII included, both ASRs agreeing."""
+    root = make_root(tmp_path_factory.mktemp("clean-texts"), TEXT_SEGS)
+    texts = {s.seconds: f"{CANARY.transcript} café — {s.sid}" for s in TEXT_SEGS}
+    docker = StageDocker(
+        root,
+        clean_stage.Models(
+            embedders=embedders(),
+            enhancers=(FakeEnhancer("dehum", dehum),),
+            timing=ScriptedAsr("whisperx-large-v3", CANARY.transcript, texts),
+            verbatim=ScriptedAsr("crisperwhisper", CANARY.transcript, texts),
+            prosody=quick_prosody,
+        ),
+    )
+    executors: list[str] = []
+    code, out, err = run_clean(root, docker, *ARGS, executors=executors)
+    return Ran(root, code, out, err, docker, executors)
+
+
+def test_each_reference_transcript_is_its_own_segments_text(text_run: Ran) -> None:
+    assert text_run.code == 0, text_run.err
+    assert_transcripts_beside_references(text_run)
+    for _, ref in all_refs(text_run):
+        text = (text_run.run_dir / ref["transcript"]).read_text(encoding="utf-8")
+        assert text.endswith(ref["segment_id"])
+
+
+def test_per_segment_transcripts_appear_only_where_they_belong(text_run: Ran) -> None:
+    assert_no_transcript_outside_its_files(text_run)
+
+
+def test_placing_references_refuses_a_transcript_path_off_the_layout(tmp_path: Path) -> None:
+    root = root_mod.init_root(tmp_path / "voice-root", "private")
+    run_dir = "seed/runs/c1"
+    for name in ("1.wav", "1.private.txt", "2.private.txt"):
+        root.write_bytes(f"{run_dir}/refs/calm/{name}", b"x")
+    for transcript in (None, "refs/calm/2.private.txt", "refs/neutral/1.private.txt", "../x.txt"):
+        ref = {"audio": "refs/calm/1.wav", "segment_id": "seg-000001"}
+        if transcript is not None:
+            ref["transcript"] = transcript
+        refs = {"states": {"calm": {"refs": [ref]}}}
+        with pytest.raises(JobError):
+            clean_cmd.place_references(root, run_dir, "targets/t1", refs)
+    assert not (root.path / "targets" / "t1").exists()
 
 
 def test_states_without_two_candidates_are_reported_short(main_run: Ran) -> None:

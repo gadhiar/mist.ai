@@ -6,12 +6,14 @@ under `targets/<id>/refs/<state>/` is tested end to end in `test_clean.py`.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
 
+from scripts.voice_data.commands import clean as clean_cmd
 from scripts.voice_data.records import Prosody
 from scripts.voice_data.stages import references
 from scripts.voice_data.states import SPEAKING_STATES
@@ -28,6 +30,8 @@ def cand(
     snr: float = 30.0,
     sim: tuple[float, float] = (0.9, 0.8),
     rate: float = 4.0,
+    transcript: str = "a line both passes agree on",
+    disagree: bool = False,
 ) -> references.Candidate:
     return references.Candidate(
         segment_id=sid,
@@ -37,6 +41,8 @@ def cand(
         snr_db=snr,
         prosody=Prosody(f0_mean_hz=210.0, f0_std_hz=5.0, rate_sps=rate, energy_db=-20.0),
         sim={"wavlm-sv": sim[0], "ecapa": sim[1]},
+        transcript=transcript,
+        asr_disagree=disagree,
     )
 
 
@@ -145,6 +151,66 @@ def test_the_profile_comes_from_every_member_of_the_state() -> None:
     pool += [cand("near", "s2", rate=7.5), cand("mid", "s3", rate=5.0), cand("far", "s4", rate=2.0)]
     choice = references.choose(pool, MEDIANS)["neutral"]
     assert chosen_ids(choice)[0] == "near"
+
+
+# References come only from segments both ASR passes agree on (v2).
+
+
+def test_an_asr_disagree_candidate_is_never_chosen_even_when_it_ranks_highest() -> None:
+    # "x" sits on the state's prosody median and has the highest SNR, so it would rank first.
+    pool = [
+        cand("x", "s1", rate=4.0, snr=60.0, disagree=True),
+        cand("a", "s2", rate=4.0, snr=20.0),
+        cand("b", "s3", rate=4.0, snr=20.0),
+        cand("c", "s4", rate=4.0, snr=20.0),
+    ]
+    agreed = [replace(c, asr_disagree=False) if c.segment_id == "x" else c for c in pool]
+    assert chosen_ids(references.choose(agreed, MEDIANS)["neutral"])[0] == "x"
+    choice = references.choose(pool, MEDIANS)["neutral"]
+    assert "x" not in chosen_ids(choice)
+    assert sorted(chosen_ids(choice)) == ["a", "b", "c"]
+    assert choice.members == 4 and choice.eligible == 3
+
+
+@pytest.mark.parametrize("transcript", ["", "   ", "\n\t"])
+def test_a_candidate_with_no_verbatim_text_is_never_chosen(transcript: str) -> None:
+    pool = [cand("x", "s1", snr=60.0, transcript=transcript), cand("a", "s2"), cand("b", "s3")]
+    choice = references.choose(pool, MEDIANS)["neutral"]
+    assert sorted(chosen_ids(choice)) == ["a", "b"]
+    assert not references.eligible(pool[0], MEDIANS)
+
+
+def test_a_state_left_with_one_agreed_candidate_is_short_with_no_references() -> None:
+    pool = [
+        cand("x", "s1", "calm", snr=60.0, disagree=True),
+        cand("y", "s2", "calm", transcript=" "),
+        cand("a", "s3", "calm"),
+    ]
+    choice = references.choose(pool, MEDIANS)["calm"]
+    assert choice.short
+    assert choice.chosen == ()
+    assert choice.eligible == 1 and choice.members == 3
+
+
+def test_a_disagreeing_member_still_sets_the_state_profile() -> None:
+    # Three disagreeing clips at rate 8 pull the median there, so "near" ranks before "far".
+    pool = [cand(f"d{i}", "s1", rate=8.0, disagree=True) for i in range(3)]
+    pool += [cand("near", "s2", rate=7.5), cand("mid", "s3", rate=5.0), cand("far", "s4", rate=2.0)]
+    choice = references.choose(pool, MEDIANS)["neutral"]
+    assert chosen_ids(choice)[0] == "near"
+    assert choice.members == 6 and choice.eligible == 3
+
+
+def test_transcript_paths_lie_beside_their_reference() -> None:
+    assert clean_cmd.transcript_rel("calm", 2) == "refs/calm/2.private.txt"
+
+
+def test_a_transcript_is_written_as_its_utf8_bytes_exactly(tmp_path: Path) -> None:
+    path = tmp_path / "refs" / "neutral" / "1.private.txt"
+    text = "um, so\r\nthe café is — open "
+    references.write_transcript(path, text)
+    assert path.read_bytes() == text.encode("utf-8")
+    assert not list(path.parent.glob("*.part"))
 
 
 def test_reference_paths_follow_the_target_layout() -> None:
