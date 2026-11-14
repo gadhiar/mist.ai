@@ -89,6 +89,109 @@ def ring_retention_ms(turn: TurnConfig, wake: WakeConfig) -> int:
     )
 
 
+# -- Speech segments ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentStep:
+    """What one VAD window did: a segment it opened, or the one its silence closed.
+
+    Each is `(onset frame, last speech frame)`, inclusive. One window never does both.
+    """
+
+    started: tuple[int, int] | None
+    closed: tuple[int, int] | None
+
+
+_NO_STEP = SegmentStep(started=None, closed=None)
+
+
+class SpeechSegmentTracker:
+    """VAD windows to speech segments: the one place ingress's run and silence rules live.
+
+    A segment opens after `speech_start_windows` consecutive speech windows, at the first frame
+    of the run, and closes once `endpoint_silence_ms` of windows without speech follow its last
+    speech. The wake harness drives the same tracker, so it scores audio as ingress hears it.
+    """
+
+    __slots__ = ("_cfg", "_run", "_run_start", "_silence_samples", "_open")
+
+    def __init__(self, cfg: EndpointingConfig) -> None:
+        self._cfg = cfg
+        self._run = 0
+        self._run_start = 0
+        self._silence_samples = 0
+        self._open: tuple[int, int] | None = None
+
+    def window(self, speech: bool, first: int, last: int) -> SegmentStep:
+        """Take one window's verdict; `first` and `last` are the frames the window spans."""
+        segment = self._open
+        if speech and segment is not None:
+            self._open = (segment[0], last)
+            self._silence_samples = 0
+            return _NO_STEP
+        self._silence_samples += VAD_WINDOW_SAMPLES
+        if not speech:
+            self._run = 0
+            if segment is not None and self.silence_ms() >= self._cfg.endpoint_silence_ms:
+                self._open = None
+                return SegmentStep(started=None, closed=segment)
+            return _NO_STEP
+        if self._run == 0:
+            self._run_start = first
+        self._run += 1
+        if self._run < self._cfg.speech_start_windows:
+            return _NO_STEP
+        self._run = 0
+        self._silence_samples = 0
+        self._open = (self._run_start, last)
+        return SegmentStep(started=self._open, closed=None)
+
+    @property
+    def open_segment(self) -> tuple[int, int] | None:
+        """The segment still open, with its last speech frame so far, or None."""
+        return self._open
+
+    def silence_ms(self) -> int:
+        """The silence since the last speech window, or since the last restart."""
+        return self._silence_samples * 1000 // _SAMPLE_RATE
+
+    def restart_silence(self) -> None:
+        """Count the pause from now: ingress does so when a lever opens with no segment open."""
+        self._silence_samples = 0
+
+    def reset(self) -> tuple[int, int] | None:
+        """Forget the run and the open segment, which is returned, as when the VAD restarts.
+
+        The silence count is kept, as ingress's VAD restart on a mute always kept it.
+        """
+        segment = self._open
+        self._open = None
+        self._run = 0
+        return segment
+
+
+def onset_feed_start(onset: int, pre_roll_frames: int, fed_through: int | None) -> int:
+    """The first frame the spotter hears for a segment opening at `onset`.
+
+    The pre-roll before the onset, unless the spotter already heard part of it: a frame is
+    never fed twice.
+    """
+    start = onset - pre_roll_frames
+    if fed_through is not None:
+        start = max(start, fed_through + 1)
+    return start
+
+
+def onset_lead_frames(cfg: EndpointingConfig) -> int:
+    """The pre-roll, `pre_roll_ms`, in whole frames.
+
+    Ingress opens an utterance, feeds the spotter and starts a wake chain this many frames
+    before a speech onset, and the wake harness reads the same number from here.
+    """
+    return cfg.pre_roll_ms // FRAME_MS
+
+
 # -- Events ---------------------------------------------------------------------------------------
 
 
@@ -313,16 +416,6 @@ class _Frame:
     arrival_ms: int
 
 
-class _Segment:
-    """One stretch of speech: its onset frame and its last speech frame so far."""
-
-    __slots__ = ("start", "end")
-
-    def __init__(self, start: int, end: int) -> None:
-        self.start = start
-        self.end = end
-
-
 class _EndpointWake:
     __slots__ = ("keyword", "score", "arrival", "remaining", "first_pos", "last_pos")
 
@@ -492,7 +585,7 @@ class AudioIngress:
         self._ring_frames = max(1, retention_ms // FRAME_MS)
         self._queue: deque[_Frame] = deque()
         self._queue_cap = max(1, endpointing.max_backlog_ms // FRAME_MS)
-        self._pre_roll = endpointing.pre_roll_ms // FRAME_MS
+        self._pre_roll = onset_lead_frames(endpointing)
         self._wakeup: asyncio.Event | None = None
         self._worker: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
@@ -508,11 +601,8 @@ class AudioIngress:
         self._vad_offset = 0
         self._vad_buffered = 0
         self._vad_generation = 0
-        self._run = 0
-        self._run_start = 0
-        self._segment: _Segment | None = None
-        self._segments: deque[_Segment] = deque()
-        self._silence_samples = 0
+        self._tracker = SpeechSegmentTracker(endpointing)
+        self._segments: deque[tuple[int, int]] = deque()
         self._processed_pos: int | None = None
         self._current_pos = 0
 
@@ -674,10 +764,10 @@ class AudioIngress:
         if self._ring and wanted < self._ring[0].pos:
             missing = self._ring[0].pos - wanted
         utt = self._open(wanted)
-        if self._segment is None:
+        if self._tracker.open_segment is None:
             # A lever can open before the speech it was opened for, so the pause is counted
             # from the open, not from the last speech before it.
-            self._silence_samples = 0
+            self._tracker.restart_silence()
         if missing:
             self._send(
                 IngressOverload(
@@ -884,10 +974,9 @@ class AudioIngress:
         self._vad_frames.clear()
         self._vad_offset = 0
         self._vad_buffered = 0
-        self._run = 0
-        if self._segment is not None:
-            self._segments.append(self._segment)
-            self._segment = None
+        closed = self._tracker.reset()
+        if closed is not None:
+            self._segments.append(closed)
 
     def _vad_from(self) -> int | None:
         if self._closed or self._muted:
@@ -901,35 +990,20 @@ class AudioIngress:
         return self._processed_pos + 1
 
     def _silence_ms(self) -> int:
-        return self._silence_samples * 1000 // _SAMPLE_RATE
+        return self._tracker.silence_ms()
 
     # -- Speech segments --------------------------------------------------------------------------
 
     def _on_window(self, speech: bool, first: int, last: int) -> None:
-        segment = self._segment
-        if speech and segment is not None:
-            segment.end = last
-            self._silence_samples = 0
-            return
-        self._silence_samples += VAD_WINDOW_SAMPLES
-        if not speech:
-            self._run = 0
-            if segment is not None and self._silence_ms() >= self._cfg.endpoint_silence_ms:
-                self._segments.append(segment)
-                self._segment = None
-            return
-        if self._run == 0:
-            self._run_start = first
-        self._run += 1
-        if self._run >= self._cfg.speech_start_windows:
-            self._run = 0
-            self._silence_samples = 0
-            self._start_segment(self._run_start, last)
+        step = self._tracker.window(speech, first, last)
+        if step.closed is not None:
+            self._segments.append(step.closed)
+        if step.started is not None:
+            self._start_segment(step.started[0])
 
-    def _start_segment(self, onset: int, last: int) -> None:
-        self._segment = _Segment(onset, last)
+    def _start_segment(self, onset: int) -> None:
         oldest = self._ring[0].pos if self._ring else onset
-        while self._segments and self._segments[0].end < oldest:
+        while self._segments and self._segments[0][1] < oldest:
             self._segments.popleft()
         utt = self._utt
         if utt is not None:
@@ -947,18 +1021,19 @@ class AudioIngress:
         `join_gap_ms`, less the pre-roll; bounded below by the lookback, the floor, the ring's
         oldest frame and, for an endpoint, the backlog's first frame.
         """
-        segments = [segment for segment in self._segments if segment.start <= hit_pos]
-        if self._segment is not None and self._segment.start <= hit_pos:
-            segments.append(self._segment)
+        segments = [segment for segment in self._segments if segment[0] <= hit_pos]
+        current = self._tracker.open_segment
+        if current is not None and current[0] <= hit_pos:
+            segments.append(current)
         start = hit_pos
         if segments:
             index = len(segments) - 1
             while index > 0:
-                gap = segments[index].start - segments[index - 1].end - 1
+                gap = segments[index][0] - segments[index - 1][1] - 1
                 if gap * FRAME_MS > self._wake.join_gap_ms:
                     break
                 index -= 1
-            start = segments[index].start - self._pre_roll
+            start = segments[index][0] - self._pre_roll
         bounds = [start, hit_pos - self._wake.lookback_ms // FRAME_MS, self._floor]
         if self._ring:
             bounds.append(self._ring[0].pos)
@@ -971,9 +1046,7 @@ class AudioIngress:
     def _spot_onset(self, onset: int) -> None:
         if self._engines.spotter is None:
             return
-        start = onset - self._pre_roll
-        if self._kws_fed_through is not None:
-            start = max(start, self._kws_fed_through + 1)
+        start = onset_feed_start(onset, self._pre_roll, self._kws_fed_through)
         frames = [item for item in self._ring if start <= item.pos <= self._current_pos]
         self._kws_reset_pending = True
         self._kws_overload_reported = False
@@ -1121,7 +1194,7 @@ class AudioIngress:
                 utt.held.append(item)
         fed = self._kws_fed_through
         if (
-            self._segment is not None
+            self._tracker.open_segment is not None
             and self._engines.spotter is not None
             and (fed is None or item.pos > fed)
         ):
@@ -1133,7 +1206,7 @@ class AudioIngress:
             if utt.state == "speaking":
                 self._tick_partial(utt)
                 if (
-                    self._segment is None
+                    self._tracker.open_segment is None
                     and utt.last_pushed >= utt.first_pos
                     and self._silence_ms() >= self._cfg.endpoint_silence_ms
                 ):

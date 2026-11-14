@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import wave
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +23,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from backend.realtime.budget import EndpointingConfig
 from backend.realtime.engines.kws import read_manifest
+from backend.realtime.ingress import (
+    SegmentStep,
+    SpeechSegmentTracker,
+    onset_feed_start,
+    onset_lead_frames,
+)
 from backend.realtime.speech import NameHit
 from scripts.wake import eval_wake
 from scripts.wake import manifest as wake_manifest
@@ -449,6 +457,268 @@ def test_the_split_command_writes_the_training_subset_and_prints_its_sha256(
     assert printed == wake_manifest.subset_sha256(wake_manifest.load_manifest(path), "train")
     # The subset is itself a manifest the check accepts.
     assert len(wake_manifest.load_manifest(out).entries) == 2
+
+
+# -- The manifest: assigning splits -----------------------------------------------------------
+
+ASSIGN_DURATIONS = (800, 600, 1000, 400, 700, 900)
+ASSIGN_CONDITIONS = {
+    "positive": ("headset", "desk"),
+    "homophone": ("headset", "desk"),
+    "media": ("speakers", "tv"),
+}
+SPLIT_TARGETS = {"train": 0.6, "tune": 0.2, "test": 0.2}
+
+
+def assign_entries() -> list[dict[str, object]]:
+    """Six sessions per (label, condition), most without a split, some of them linked.
+
+    Homophone headset sessions 0 and 1 hold one sentence, written two ways, and session 1 also
+    holds a short positive, so those three recordings must share a split. Positive desk session
+    2 holds two recordings. Entry 0 carries a split, which `assign` replaces.
+    """
+    rows: list[dict[str, object]] = []
+    for label, conditions in ASSIGN_CONDITIONS.items():
+        for c_index, condition in enumerate(conditions):
+            for number, duration in enumerate(ASSIGN_DURATIONS):
+                phrase = {"positive": "hey mist", "homophone": f"sentence {c_index} {number}"}
+                rows.append(
+                    entry(
+                        f"clip{len(rows):02d}.wav",
+                        label,
+                        phrase=phrase.get(label, ""),
+                        condition=condition,
+                        session=f"{label}-{condition}-{number}",
+                        duration_ms=duration,
+                    )
+                )
+    for item in rows:
+        if item["session"] == "homophone-headset-1":
+            item["phrase"] = "Sentence  0 0."
+    rows.append(
+        entry(
+            f"clip{len(rows):02d}.wav",
+            condition="headset",
+            session="homophone-headset-1",
+            duration_ms=200,
+        )
+    )
+    rows.append(
+        entry(
+            f"clip{len(rows):02d}.wav", condition="desk", session="positive-desk-2", duration_ms=300
+        )
+    )
+    for index, item in enumerate(rows):
+        if index:
+            del item["split"]
+        else:
+            item["split"] = "test"
+    return rows
+
+
+def run_assign(path: Path, out: Path, seed: int) -> int:
+    return wake_manifest.main(
+        ["assign", "--manifest", str(path), "--seed", str(seed), "--out", str(out)]
+    )
+
+
+def split_groups(entries: Sequence[Mapping[str, object]]) -> list[list[Mapping[str, object]]]:
+    """Recordings linked by a session or a homophone sentence, transitively."""
+    groups: list[list[Mapping[str, object]]] = []
+    for item in entries:
+        joined = [
+            group
+            for group in groups
+            if any(
+                other["session"] == item["session"]
+                or (
+                    other["label"] == item["label"] == "homophone"
+                    and wake_manifest.phrase_key(str(other["phrase"]))
+                    == wake_manifest.phrase_key(str(item["phrase"]))
+                )
+                for other in group
+            )
+        ]
+        merged = [member for group in joined for member in group] + [item]
+        groups = [group for group in groups if group not in joined] + [merged]
+    return groups
+
+
+def test_assign_writes_splits_the_check_accepts(tmp_path: Path) -> None:
+    rows = assign_entries()
+    path = write_manifest(tmp_path, rows)
+    out = tmp_path / "out" / "assigned.json"
+
+    assert run_assign(path, out, 7) == 0
+
+    loaded = wake_manifest.load_manifest(out)
+    assert [item.file for item in loaded.entries] == [item["file"] for item in rows]
+    assert {item.split for item in loaded.entries} == set(wake_manifest.SPLITS)
+    written = json.loads(out.read_text(encoding="utf-8"))
+    assert written["root"] == str(tmp_path / "recordings")
+    for before, after in zip(rows, written["entries"], strict=True):
+        assert {key: value for key, value in after.items() if key != "split"} == {
+            key: value for key, value in before.items() if key != "split"
+        }
+    linked = {
+        item.split
+        for item in loaded.entries
+        if item.session in ("homophone-headset-0", "homophone-headset-1")
+    }
+    assert len(linked) == 1
+    assert len({item.split for item in loaded.entries if item.session == "positive-desk-2"}) == 1
+
+
+def test_assign_is_reproducible_by_seed(tmp_path: Path) -> None:
+    path = write_manifest(tmp_path, assign_entries())
+
+    assert run_assign(path, tmp_path / "a.json", 7) == 0
+    assert run_assign(path, tmp_path / "b.json", 7) == 0
+    assert run_assign(path, tmp_path / "c.json", 8) == 0
+
+    first = (tmp_path / "a.json").read_bytes()
+    assert first == (tmp_path / "b.json").read_bytes()
+    assert first != (tmp_path / "c.json").read_bytes()
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 7, 1234])
+def test_assign_keeps_each_split_within_one_group_of_its_share(tmp_path: Path, seed: int) -> None:
+    path = write_manifest(tmp_path, assign_entries())
+    out = tmp_path / "assigned.json"
+
+    assert run_assign(path, out, seed) == 0
+
+    entries = json.loads(out.read_text(encoding="utf-8"))["entries"]
+    by_key: dict[tuple[str, str], list[list[Mapping[str, object]]]] = {}
+    for group in split_groups(entries):
+        assert len({item["split"] for item in group}) == 1
+        totals: Counter[tuple[str, str]] = Counter()
+        for item in group:
+            totals[(str(item["label"]), str(item["condition"]))] += int(item["duration_ms"])
+        by_key.setdefault(totals.most_common(1)[0][0], []).append(group)
+    assert len(by_key) == 6
+    for key, groups in by_key.items():
+        assert len(groups) >= 5, key
+        durations = [sum(int(item["duration_ms"]) for item in group) for group in groups]
+        total = sum(durations)
+        largest = max(durations) / total
+        for split, target in SPLIT_TARGETS.items():
+            share = (
+                sum(
+                    duration
+                    for group, duration in zip(groups, durations, strict=True)
+                    if group[0]["split"] == split
+                )
+                / total
+            )
+            assert abs(share - target) <= largest + 1e-9, (key, split, share)
+
+
+def test_assign_refuses_one_audio_under_two_names_as_check_does(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_wav(tmp_path / "recordings" / "p" / "a.wav", tone_ms=1000)
+    (tmp_path / "recordings" / "p" / "copy.wav").write_bytes(
+        (tmp_path / "recordings" / "p" / "a.wav").read_bytes()
+    )
+    path = write_manifest(
+        tmp_path,
+        [entry("p/a.wav", split="train", session="s1"), entry("p/copy.wav", session="s2")],
+    )
+    out = tmp_path / "assigned.json"
+
+    assert wake_manifest.main(["check", "--manifest", str(path)]) == 2
+    checked = capsys.readouterr().err
+    assert run_assign(path, out, 7) == 2
+
+    message = capsys.readouterr().err
+    assert not out.exists()
+    for refusal in (checked, message):
+        assert "entry 0 (p/a.wav" in refusal and "entry 1 (p/copy.wav" in refusal
+        assert "hold audio with one sha256" in refusal
+
+
+def test_assign_checks_every_other_field_as_check_does(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_wav(tmp_path / "recordings" / "p" / "a.wav", tone_ms=500)
+    item = entry("p/a.wav", duration_ms=1000)
+    del item["split"]
+    path = write_manifest(tmp_path, [item])
+    out = tmp_path / "assigned.json"
+
+    assert run_assign(path, out, 7) == 2
+
+    assert "duration_ms" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_assign_refuses_an_out_that_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_manifest(tmp_path, assign_entries())
+    out = tmp_path / "assigned.json"
+    out.write_text("kept\n", encoding="utf-8")
+
+    assert run_assign(path, out, 7) == 2
+
+    assert "--out" in capsys.readouterr().err
+    assert out.read_text(encoding="utf-8") == "kept\n"
+
+
+def test_assign_prints_the_seed_and_shares_and_no_file_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = assign_entries()
+    path = write_manifest(tmp_path, rows)
+    out = tmp_path / "assigned.json"
+
+    assert run_assign(path, out, 7) == 0
+
+    captured = capsys.readouterr()
+    printed = captured.out + captured.err
+    assert captured.out.splitlines()[0] == "seed 7"
+    for label, conditions in ASSIGN_CONDITIONS.items():
+        for condition in conditions:
+            (line,) = (
+                text
+                for text in captured.out.splitlines()
+                if text.startswith(f"{label} {condition}:")
+            )
+            assert all(f"{split} " in line and "%" in line for split in wake_manifest.SPLITS)
+    for item in rows:
+        assert str(item["file"]) not in printed
+    for name in ("clip", ".wav", ".json", "assigned", "manifest", str(tmp_path)):
+        assert name not in printed
+
+
+# -- The harness: segmentation ----------------------------------------------------------------
+
+
+def test_the_harness_segments_through_ingress_s_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steps: list[SegmentStep] = []
+
+    class Recording(SpeechSegmentTracker):
+        def window(self, speech: bool, first: int, last: int) -> SegmentStep:
+            step = super().window(speech, first, last)
+            steps.append(step)
+            return step
+
+    monkeypatch.setattr(eval_wake, "SpeechSegmentTracker", Recording)
+    write_wav(tmp_path / "a.wav", tone_ms=640, silence_ms=640)
+    cfg = EndpointingConfig()
+
+    heard = eval_wake._listen(wake_manifest.read_pcm16(tmp_path / "a.wav"), EnergyVad(), cfg)
+
+    assert len(steps) == 1280 * RATE // 1000 // 512
+    closed = [step.closed for step in steps if step.closed is not None]
+    assert heard.segments == tuple(closed) and len(closed) == 1
+    (onset,) = (step.started[0] for step in steps if step.started is not None)
+    first_feed = heard.feeds[0]
+    assert first_feed.reset
+    assert first_feed.positions[0] == max(onset_feed_start(onset, onset_lead_frames(cfg), None), 0)
 
 
 # -- The harness: refusals --------------------------------------------------------------------

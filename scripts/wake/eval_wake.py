@@ -60,6 +60,12 @@ from backend.realtime.engines.silero_vad import (
     open_onnx_session,
 )
 from backend.realtime.errors import SpeechEngineError
+from backend.realtime.ingress import (
+    VAD_WINDOW_SAMPLES,
+    SpeechSegmentTracker,
+    onset_feed_start,
+    onset_lead_frames,
+)
 from backend.realtime.speech import (
     CancelToken,
     NameHit,
@@ -84,7 +90,6 @@ SAMPLE_RATE = 16000
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 FRAME_BYTES = FRAME_SAMPLES * 2
-VAD_WINDOW_SAMPLES = 512
 EVALUATED_SPLITS = ("tune", "test")
 
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -162,21 +167,21 @@ class _Heard:
 def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _Heard:
     """Segment one recording and decide which frames reach the spotter, as ingress does.
 
-    Speech starts after `speech_start_windows` consecutive VAD windows at or above
-    `vad_threshold`; the spotter then gets a fresh context and the frames from the onset less
-    the pre-roll, and every frame after it while the segment is open. A segment closes after
-    `endpoint_silence_ms` of silence. Ingress feeds the spotter only during speech, so audio it
-    never scores live is not scored here either.
+    Each VAD window at or above `vad_threshold` is speech, and ingress's own
+    `SpeechSegmentTracker` turns the windows into segments. When one opens, the spotter gets a
+    fresh context and the frames from `onset_feed_start`, then every frame after it while the
+    segment is open. Ingress feeds the spotter only during speech, so audio it never scores live
+    is not scored here either.
     """
     usable = len(pcm) // FRAME_BYTES * FRAME_BYTES
     frames = tuple(pcm[start : start + FRAME_BYTES] for start in range(0, usable, FRAME_BYTES))
     samples = np.frombuffer(pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0
     stream = vad.open_stream()
-    pre_roll = cfg.pre_roll_ms // FRAME_MS
+    tracker = SpeechSegmentTracker(cfg)
+    lead = onset_lead_frames(cfg)
     feeds: list[tuple[bool, list[int]]] = []
     segments: list[tuple[int, int]] = []
-    segment: list[int] | None = None
-    run = run_start = silence = window = 0
+    window = 0
     fed: int | None = None
     reset_pending = False
 
@@ -193,35 +198,23 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
             last = (start + VAD_WINDOW_SAMPLES - 1) // FRAME_SAMPLES
             window += 1
             speech = stream.score(samples[start : start + VAD_WINDOW_SAMPLES]) >= cfg.vad_threshold
-            if speech and segment is not None:
-                segment[1] = last
-                silence = 0
-                continue
-            silence += VAD_WINDOW_SAMPLES
-            if not speech:
-                run = 0
-                if segment is not None and silence * 1000 // SAMPLE_RATE >= cfg.endpoint_silence_ms:
-                    segments.append((segment[0], segment[1]))
-                    segment = None
-                continue
-            if run == 0:
-                run_start = first
-            run += 1
-            if run >= cfg.speech_start_windows:
-                run = silence = 0
-                segment = [run_start, last]
+            step = tracker.window(speech, first, last)
+            if step.closed is not None:
+                segments.append(step.closed)
+            if step.started is not None:
                 reset_pending = True
-                begin = max(run_start - pre_roll, 0 if fed is None else fed + 1)
+                # Ingress feeds what its ring holds; here that is the recording's own frames.
+                begin = max(onset_feed_start(step.started[0], lead, fed), 0)
                 if begin <= pos:
                     feed(range(begin, pos + 1), True)
                     reset_pending = False
                     fed = pos
-        if segment is not None and (fed is None or pos > fed):
+        if tracker.open_segment is not None and (fed is None or pos > fed):
             feed(range(pos, pos + 1), reset_pending)
             reset_pending = False
             fed = pos
-    if segment is not None:
-        segments.append((segment[0], segment[1]))
+    if tracker.open_segment is not None:
+        segments.append(tracker.open_segment)
     return _Heard(
         frames=frames,
         feeds=tuple(_Feed(reset, tuple(positions)) for reset, positions in feeds),
@@ -272,7 +265,7 @@ class _Driver:
         self._endpointing = settings.endpointing
         self._wake = settings.wake
         self._clock = clock
-        self._pre_roll = settings.endpointing.pre_roll_ms // FRAME_MS
+        self._lead = onset_lead_frames(settings.endpointing)
         # The live gate reads the stream's threshold for the self-media check, and the threshold
         # under test is the one the daily instance would run with.
         self._gates = {
@@ -385,7 +378,7 @@ class _Driver:
                 if gap * FRAME_MS > self._wake.join_gap_ms:
                     break
                 index -= 1
-            start = segments[index][0] - self._pre_roll
+            start = segments[index][0] - self._lead
         start = max(start, position - self._wake.lookback_ms // FRAME_MS, 0)
         end = min(position + self._wake.gate_tail_ms // FRAME_MS, len(heard.frames) - 1)
         return start, end

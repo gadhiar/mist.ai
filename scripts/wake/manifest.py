@@ -22,13 +22,27 @@ self-media check. Every file is 16 kHz mono PCM16 WAV, the format the uplink car
 `training` field records that hash, which is how the harness proves the model it measures was
 trained from this manifest's `train` split and not from anything `tune` or `test` holds.
 
+`assign` gives every entry a split, so a new set of recordings needs no hand-kept split list.
+Its entries may leave `split` out, and any `split` present is replaced; every other field is
+checked as `check` checks it. Recordings that `check` would refuse in two splits, those sharing
+a session or a homophone sentence, are linked transitively into one group, which goes to one
+split. Each group belongs to the (label, condition) holding most of its duration, so every
+condition of every label is split on its own. Within each, `random.Random(seed)` shuffles the
+groups and each goes to the split furthest below its 60/20/20 share of the duration, ties to
+train, then tune, then test. That keeps each split within one group's duration of its share,
+and the same seed always gives the same manifest. It prints the seed and each split's count and
+share, never a file name, and refuses an `--out` that exists.
+
     python -m scripts.wake.manifest check --manifest <path>
     python -m scripts.wake.manifest split --manifest <path> --split train --out <path>
+    python -m scripts.wake.manifest assign --manifest <path> --seed N --out <path>
 """
 
 import argparse
+import dataclasses
 import hashlib
 import json
+import random
 import re
 import sys
 import wave
@@ -38,10 +52,15 @@ from pathlib import Path
 
 LABELS = ("positive", "homophone", "media")
 SPLITS = ("train", "tune", "test")
+SPLIT_FIFTHS = {"train": 3, "tune": 1, "test": 1}
+"""Each split's target share of a (label, condition)'s duration, in fifths: 60/20/20."""
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2
 DURATION_TOLERANCE_MS = 20
 """One uplink frame: a `duration_ms` within this of the audio's length is accepted."""
+
+UNASSIGNED = "unassigned"
+"""The split of an entry `assign` has read and not yet placed; never written."""
 
 _MANIFEST_KEYS = frozenset({"root", "entries"})
 _REQUIRED = frozenset({"file", "label", "split", "phrase", "condition", "duration_ms", "session"})
@@ -152,21 +171,24 @@ def _text(value: object, key: str, name: str, *, empty: bool) -> str:
     return value
 
 
-def _entry(root: Path, index: int, value: object) -> Entry:
+def _entry(root: Path, index: int, value: object, *, assigning: bool = False) -> Entry:
+    """Check one entry; `assigning` ignores its `split` and reads it as `UNASSIGNED`."""
     file = value.get("file") if isinstance(value, dict) else None
     name = f"entry {index} ({file if isinstance(file, str) else '?'})"
     if not isinstance(value, dict):
         raise ManifestError(f"{name}: must be an object")
+    required = _REQUIRED - {"split"} if assigning else _REQUIRED
     unknown = sorted(set(value) - _REQUIRED - _OPTIONAL)
-    missing = sorted(_REQUIRED - set(value))
+    missing = sorted(required - set(value))
     if unknown:
         raise ManifestError(f"{name}: unknown keys {unknown}")
     if missing:
         raise ManifestError(f"{name}: missing keys {missing}")
     if value["label"] not in LABELS:
         raise ManifestError(f"{name}: label must be one of {list(LABELS)}, got {value['label']!r}")
-    if value["split"] not in SPLITS:
-        raise ManifestError(f"{name}: split must be one of {list(SPLITS)}, got {value['split']!r}")
+    split = UNASSIGNED if assigning else value["split"]
+    if not assigning and split not in SPLITS:
+        raise ManifestError(f"{name}: split must be one of {list(SPLITS)}, got {split!r}")
     session = _text(value["session"], "session", name, empty=False)
     phrase = _text(value["phrase"], "phrase", name, empty=True)
     condition = _text(value["condition"], "condition", name, empty=False)
@@ -191,7 +213,7 @@ def _entry(root: Path, index: int, value: object) -> Entry:
         file=file,
         path=path,
         label=value["label"],
-        split=value["split"],
+        split=split,
         phrase=phrase,
         condition=condition,
         duration_ms=duration_ms,
@@ -254,6 +276,13 @@ def load_manifest(path: Path) -> RecordingManifest:
             and file), or two splits share a file, its contents, a session or a homophone
             sentence (both entries named).
     """
+    root, entries = _read(path, assigning=False)
+    _check_splits(entries)
+    return RecordingManifest(path=Path(path), root=root, entries=entries)
+
+
+def _read(path: Path, *, assigning: bool) -> tuple[str, tuple[Entry, ...]]:
+    """The manifest's root as written and its entries, each checked on its own."""
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except OSError as exc:
@@ -270,9 +299,154 @@ def load_manifest(path: Path) -> RecordingManifest:
         raise ManifestError(f"{path}: root {root} is not a directory")
     if not isinstance(raw["entries"], list):
         raise ManifestError(f"{path}: entries must be a list")
-    entries = tuple(_entry(root_path, index, item) for index, item in enumerate(raw["entries"]))
+    entries = tuple(
+        _entry(root_path, index, item, assigning=assigning)
+        for index, item in enumerate(raw["entries"])
+    )
+    return root, entries
+
+
+# -- Assigning splits -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class KeyAssignment:
+    """One (label, condition)'s groups as `assign` placed them: each split's entries."""
+
+    label: str
+    condition: str
+    splits: Mapping[str, tuple[Entry, ...]]
+
+    @property
+    def duration_ms(self) -> int:
+        """The key's whole duration, which each split's share is a share of."""
+        return sum(item.duration_ms for entries in self.splits.values() for item in entries)
+
+
+def _linked_groups(entries: Sequence[Entry]) -> list[list[Entry]]:
+    """Entries sharing a session, or as homophones a sentence, transitively; in manifest order.
+
+    These are the two relations `_check_splits` refuses across splits, so each group must stay
+    in one split.
+    """
+    parent = list(range(len(entries)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        low, high = sorted((find(first), find(second)))
+        parent[high] = low
+
+    by_session: dict[str, int] = {}
+    by_phrase: dict[str, int] = {}
+    for index, item in enumerate(entries):
+        union(index, by_session.setdefault(item.session, index))
+        if item.label == "homophone":
+            union(index, by_phrase.setdefault(phrase_key(item.phrase), index))
+    groups: dict[int, list[Entry]] = {}
+    for index, item in enumerate(entries):
+        groups.setdefault(find(index), []).append(item)
+    return list(groups.values())
+
+
+def _group_key(group: Sequence[Entry]) -> tuple[str, str]:
+    """The (label, condition) holding most of the group's duration; ties by label, condition."""
+    totals: dict[tuple[str, str], int] = {}
+    for item in group:
+        key = (item.label, item.condition)
+        totals[key] = totals.get(key, 0) + item.duration_ms
+    return min(totals, key=lambda key: (-totals[key], LABELS.index(key[0]), key[1]))
+
+
+def assign_splits(entries: Sequence[Entry], seed: int) -> tuple[KeyAssignment, ...]:
+    """Place every linked group in a split, per (label, condition), reproducibly from `seed`.
+
+    A group goes to the split furthest below its share of the key's duration, so no split ends
+    further from its share than the largest group of the key: a split only receives a group
+    while it is the furthest below, and the deficits sum to zero at the end.
+    """
+    by_key: dict[tuple[str, str], list[list[Entry]]] = {}
+    for group in _linked_groups(entries):
+        by_key.setdefault(_group_key(group), []).append(group)
+    placed: list[KeyAssignment] = []
+    for label, condition in sorted(by_key, key=lambda key: (LABELS.index(key[0]), key[1])):
+        groups = by_key[(label, condition)]
+        # Not a security use: the seed only makes the split assignment reproducible.
+        random.Random(seed).shuffle(groups)  # nosec B311
+        total = sum(item.duration_ms for group in groups for item in group)
+        assigned = dict.fromkeys(SPLITS, 0)
+        members: dict[str, list[Entry]] = {split: [] for split in SPLITS}
+        for group in groups:
+            # Below-share in fifths of a millisecond, so the comparison is exact; `max` keeps
+            # the first of equals, which is train, then tune, then test.
+            split = max(SPLITS, key=lambda name: SPLIT_FIFTHS[name] * total - 5 * assigned[name])
+            assigned[split] += sum(item.duration_ms for item in group)
+            members[split].extend(group)
+        placed.append(
+            KeyAssignment(
+                label=label,
+                condition=condition,
+                splits={
+                    split: tuple(sorted(found, key=lambda item: item.index))
+                    for split, found in members.items()
+                },
+            )
+        )
+    return tuple(placed)
+
+
+def assigned_bytes(root: str, entries: Sequence[Entry], splits: Mapping[int, str]) -> bytes:
+    """The manifest with each entry's `split` set, in manifest order, written as `split` is."""
+    payload = {
+        "root": root,
+        "entries": [{**item.raw, "split": splits[item.index]} for item in entries],
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+    return (text + "\n").encode("utf-8")
+
+
+_OUT_EXISTS = "--out already exists; assign writes a new manifest, never over one"
+
+
+def _assign(manifest: Path, seed: int, out: Path) -> int:
+    """Write `manifest` with splits assigned to `out`, and print the seed and shares.
+
+    What it prints names no file, not even `out`, so a summary can be shared without exposing
+    the recordings' names. A refusal names the entries at fault, as `check` does.
+    """
+    if out.exists():
+        raise ManifestError(_OUT_EXISTS)
+    root, entries = _read(manifest, assigning=True)
+    # Every entry reads as one split here, so this refuses only a file or its audio listed twice.
     _check_splits(entries)
-    return RecordingManifest(path=Path(path), root=root, entries=entries)
+    placed = assign_splits(entries, seed)
+    splits = {
+        item.index: split
+        for key in placed
+        for split, members in key.splits.items()
+        for item in members
+    }
+    _check_splits([dataclasses.replace(item, split=splits[item.index]) for item in entries])
+    data = assigned_bytes(root, entries, splits)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with out.open("xb") as handle:
+            handle.write(data)
+    except FileExistsError as exc:
+        raise ManifestError(_OUT_EXISTS) from exc
+    print(f"seed {seed}")
+    for key in placed:
+        total = key.duration_ms
+        shares = ", ".join(
+            f"{split} {len(members)} ({sum(item.duration_ms for item in members) / total:.1%})"
+            for split, members in key.splits.items()
+        )
+        print(f"{key.label} {key.condition}: {shares}")
+    return 0
 
 
 def subset_bytes(manifest: RecordingManifest, split: str) -> bytes:
@@ -296,13 +470,19 @@ def _parser() -> argparse.ArgumentParser:
     split.add_argument("--manifest", required=True, type=Path)
     split.add_argument("--split", required=True, choices=SPLITS)
     split.add_argument("--out", required=True, type=Path)
+    assign = commands.add_parser("assign", help="write the manifest with every split assigned")
+    assign.add_argument("--manifest", required=True, type=Path)
+    assign.add_argument("--seed", required=True, type=int)
+    assign.add_argument("--out", required=True, type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run `check` or `split`; 0 on success, 2 when the manifest is refused."""
+    """Run `check`, `split` or `assign`; 0 on success, 2 when the manifest is refused."""
     args = _parser().parse_args(argv)
     try:
+        if args.command == "assign":
+            return _assign(args.manifest, args.seed, args.out)
         manifest = load_manifest(args.manifest)
     except ManifestError as exc:
         print(f"manifest: {exc}", file=sys.stderr)

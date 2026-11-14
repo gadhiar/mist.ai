@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import pytest_asyncio
 
+from backend.realtime import ingress as ingress_module
 from backend.realtime.budget import EndpointingConfig, TurnConfig, WakeConfig
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
@@ -32,11 +33,15 @@ from backend.realtime.ingress import (
     IngressSeed,
     NameHeard,
     OpenedUtterance,
+    SegmentStep,
     SpeechResumed,
+    SpeechSegmentTracker,
     SpeechStarted,
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
+    onset_feed_start,
+    onset_lead_frames,
     ring_retention_ms,
 )
 from backend.realtime.lanes import InferenceLane, LaneJobCancelled
@@ -1791,3 +1796,126 @@ class TestWithInferenceLanes:
                 lane.shutdown()
 
         assert [e.text for e in rig.of(UtteranceEnded)] == ["hello there"]
+
+
+# -- Speech segments ------------------------------------------------------------------------------
+
+
+def windows(
+    tracker: SpeechSegmentTracker, start: int, count: int, *, speech: bool
+) -> list[SegmentStep]:
+    """Score VAD windows `start` to `start + count - 1`, each spanning the frames it covers."""
+    return [
+        tracker.window(speech, index * 512 // FRAME_SAMPLES, (index * 512 + 511) // FRAME_SAMPLES)
+        for index in range(start, start + count)
+    ]
+
+
+NOTHING = SegmentStep(started=None, closed=None)
+
+
+def opened_tracker() -> SpeechSegmentTracker:
+    """Two silent windows, then three speech windows (2 to 4) opening a segment at frame 3."""
+    tracker = SpeechSegmentTracker(EndpointingConfig())
+    windows(tracker, 0, 2, speech=False)
+    *_, step = windows(tracker, 2, 3, speech=True)
+    assert step == SegmentStep(started=(3, 7), closed=None)
+    return tracker
+
+
+class TestSpeechSegmentTracker:
+    def test_a_run_shorter_than_speech_start_windows_opens_nothing(self):
+        tracker = SpeechSegmentTracker(EndpointingConfig())
+
+        steps = windows(tracker, 0, 2, speech=True)
+        steps += windows(tracker, 2, 1, speech=False)
+        steps += windows(tracker, 3, 2, speech=True)
+
+        assert steps == [NOTHING] * 5
+        assert tracker.open_segment is None
+
+    def test_speech_start_windows_in_a_row_open_a_segment_at_the_runs_first_frame(self):
+        tracker = opened_tracker()
+
+        assert tracker.open_segment == (3, 7)
+        assert tracker.silence_ms() == 0
+
+    def test_speech_extends_the_open_segment_and_clears_its_silence(self):
+        tracker = opened_tracker()
+        windows(tracker, 5, 3, speech=False)
+        assert tracker.silence_ms() == 96
+
+        assert windows(tracker, 8, 1, speech=True) == [NOTHING]
+
+        assert tracker.open_segment == (3, (8 * 512 + 511) // FRAME_SAMPLES)
+        assert tracker.silence_ms() == 0
+
+    def test_silence_closes_the_segment_at_endpoint_silence_ms(self):
+        tracker = opened_tracker()
+
+        steps = windows(tracker, 5, 7, speech=False)
+
+        # Six 32 ms windows are 192 ms, short of 200; the seventh closes it.
+        assert steps[:6] == [NOTHING] * 6
+        assert steps[6] == SegmentStep(started=None, closed=(3, 7))
+        assert tracker.open_segment is None
+        assert tracker.silence_ms() == 224
+
+    def test_restart_silence_counts_the_pause_again_from_zero(self):
+        tracker = opened_tracker()
+        windows(tracker, 5, 5, speech=False)
+
+        tracker.restart_silence()
+
+        assert tracker.silence_ms() == 0
+        steps = windows(tracker, 10, 7, speech=False)
+        assert steps[:6] == [NOTHING] * 6
+        assert steps[6].closed == (3, 7)
+
+    def test_reset_returns_the_open_segment_and_forgets_the_run(self):
+        tracker = opened_tracker()
+
+        assert tracker.reset() == (3, 7)
+        assert tracker.open_segment is None
+        assert tracker.reset() is None
+
+        windows(tracker, 5, 2, speech=True)
+        tracker.reset()
+        assert windows(tracker, 7, 2, speech=True) == [NOTHING] * 2
+        (step,) = windows(tracker, 9, 1, speech=True)
+        assert step.started == (7 * 512 // FRAME_SAMPLES, (9 * 512 + 511) // FRAME_SAMPLES)
+
+
+class TestOnsetFeed:
+    def test_the_feed_starts_a_pre_roll_before_the_onset(self):
+        assert onset_feed_start(40, PRE_ROLL, None) == 40 - PRE_ROLL
+        assert onset_feed_start(40, PRE_ROLL, 10) == 40 - PRE_ROLL
+
+    def test_the_feed_never_repeats_a_frame_already_fed(self):
+        assert onset_feed_start(40, PRE_ROLL, 30) == 31
+
+    def test_the_pre_roll_in_frames_comes_from_the_endpointing_config(self):
+        assert onset_lead_frames(EndpointingConfig()) == PRE_ROLL
+        assert onset_lead_frames(EndpointingConfig(pre_roll_ms=210)) == 10
+
+
+class TestIngressSegmentsThroughTheTracker:
+    @pytest.mark.asyncio
+    async def test_every_vad_window_goes_through_the_shared_tracker(self, monkeypatch):
+        steps: list[SegmentStep] = []
+
+        class Recording(SpeechSegmentTracker):
+            def window(self, speech: bool, first: int, last: int) -> SegmentStep:
+                step = super().window(speech, first, last)
+                steps.append(step)
+                return step
+
+        monkeypatch.setattr(ingress_module, "SpeechSegmentTracker", Recording)
+        rig = Rig()
+
+        await rig.quiet(640)
+        await rig.speak(320)
+
+        assert len(steps) == sum(len(stream.scores) for stream in rig.vad.streams)
+        assert [step.started[0] for step in steps if step.started is not None] == [32]
+        assert rig.of(SpeechStarted)[0].first_pos == 32 - PRE_ROLL
