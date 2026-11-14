@@ -384,9 +384,13 @@ def _marked(doc, mark):
     """`doc` with `mark` in every non-blank text, so a refusal that echoes one is caught."""
     if isinstance(doc, list):
         return [
-            dict(item, text=f"{item['text']} {mark}")
-            if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
-            else item
+            (
+                dict(item, text=f"{item['text']} {mark}")
+                if isinstance(item, dict)
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+                else item
+            )
             for item in doc
         ]
     if isinstance(doc, dict):

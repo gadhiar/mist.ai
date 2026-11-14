@@ -181,6 +181,7 @@ class Designer:
         return audio, int(rate)
 
     def peak(self, audio: object) -> float:
+        """Largest absolute sample before the clip to 16 bits, so the log shows any clipping."""
         return float(self._np.max(self._np.abs(audio))) if len(audio) else 0.0
 
     def write_wav(self, path: Path, audio: object, rate: int) -> None:
@@ -190,7 +191,9 @@ class Designer:
         try:
             handle = path.open("xb")
         except FileExistsError as exc:
-            raise core.OutputExistsError(f"{path} already exists; refusing to overwrite it") from exc
+            raise core.OutputExistsError(
+                f"{path} already exists; refusing to overwrite it"
+            ) from exc
         with handle, wave.open(handle, "wb") as clip:
             clip.setnchannels(1)
             clip.setsampwidth(2)
