@@ -23,7 +23,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from backend.realtime.budget import EndpointingConfig
 from backend.realtime.engines.kws import read_manifest
+from backend.realtime.ingress import (
+    SegmentStep,
+    SpeechSegmentTracker,
+    onset_feed_start,
+    onset_lead_frames,
+)
 from backend.realtime.speech import NameHit
 from scripts.wake import eval_wake
 from scripts.wake import manifest as wake_manifest
@@ -683,6 +690,35 @@ def test_assign_prints_the_seed_and_shares_and_no_file_name(
         assert str(item["file"]) not in printed
     for name in ("clip", ".wav", ".json", "assigned", "manifest", str(tmp_path)):
         assert name not in printed
+
+
+# -- The harness: segmentation ----------------------------------------------------------------
+
+
+def test_the_harness_segments_through_ingress_s_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steps: list[SegmentStep] = []
+
+    class Recording(SpeechSegmentTracker):
+        def window(self, speech: bool, first: int, last: int) -> SegmentStep:
+            step = super().window(speech, first, last)
+            steps.append(step)
+            return step
+
+    monkeypatch.setattr(eval_wake, "SpeechSegmentTracker", Recording)
+    write_wav(tmp_path / "a.wav", tone_ms=640, silence_ms=640)
+    cfg = EndpointingConfig()
+
+    heard = eval_wake._listen(wake_manifest.read_pcm16(tmp_path / "a.wav"), EnergyVad(), cfg)
+
+    assert len(steps) == 1280 * RATE // 1000 // 512
+    closed = [step.closed for step in steps if step.closed is not None]
+    assert heard.segments == tuple(closed) and len(closed) == 1
+    (onset,) = (step.started[0] for step in steps if step.started is not None)
+    first_feed = heard.feeds[0]
+    assert first_feed.reset
+    assert first_feed.positions[0] == max(onset_feed_start(onset, onset_lead_frames(cfg), None), 0)
 
 
 # -- The harness: refusals --------------------------------------------------------------------
