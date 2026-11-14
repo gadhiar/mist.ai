@@ -6,6 +6,7 @@ Dockerfile comes from `families.json`: the family whose `image` is `mist-voice-<
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -340,3 +341,34 @@ def test_extract_import_check_loads_tiger_and_sidon_from_their_clones() -> None:
     pins = pinned_versions("requirements-extract.txt")
     assert "torch-complex" in pins
     assert SpecifierSet("<3").contains(pins.get("typeguard", "3")), pins.get("typeguard")
+
+
+def import_check(dockerfile: str, venv: str) -> ast.Module:
+    """Parse the Python that a family image's final step runs in the family's own venv."""
+    final = instructions(DOCKER_DIR / dockerfile)[-1]
+    check = re.match(rf"RUN {re.escape(venv)}/bin/python -I -c '([^']*)'", final)
+    assert check, final
+    return ast.parse(check.group(1))
+
+
+def imported_modules(check: ast.Module) -> set[str]:
+    return {
+        alias.name
+        for node in ast.walk(check)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+
+def test_neutts_pins_the_torchao_built_for_its_torch() -> None:
+    # neucodec 0.0.6 declares torchao>=0.12.0 and no upper bound, so pip took torchao 0.18.0,
+    # whose float8 tensor module imports `ScalingType` from torch.nn.functional; torch 2.8.0
+    # lacks it and the H3 build check failed. torchao 0.13.0 is the release built against torch
+    # 2.8.0, and it stays below the 0.15.0 at which transformers 5.1.0 imports
+    # torchao.prototype.safetensors.
+    pins = pinned_versions("requirements-neutts.txt")
+    assert pins["torch"] == "2.8.0"
+    assert "torchao" in pins
+    assert SpecifierSet(">=0.12.0,==0.13.*").contains(pins["torchao"]), pins["torchao"]
+    check = import_check("train-neutts.Dockerfile", "/opt/venv-train-neutts")
+    assert {"torch", "neutts", "torchao", "scripts.voice_data"} <= imported_modules(check)
