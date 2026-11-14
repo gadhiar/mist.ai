@@ -1,7 +1,7 @@
 """Run 1's blind listening pack: the `listen-pack` subcommand (mist-model-host plan v2, task T5).
 
-The pack is built only from clips `tts` already saved, in each engine's stock voices; it
-synthesizes nothing. From each engine's timed pass with the model idle it takes repeat 1 of every
+Without `--from-dir`, the pack is built only from clips `tts` already saved, in each engine's
+stock voices; it synthesizes nothing. From each engine's timed pass with the model idle it takes repeat 1 of every
 line and acknowledgement in the engine's timing voice (`qwen3`, `turbo`, `original` at its 0.5
 settings, `pocket`), and from each engine's `listening.jsonl` every untimed clip: the
 listening-only voices, any `--extra-voice` `tts` was given, and `original`'s `expressive` setting
@@ -18,7 +18,14 @@ searched for every engine id, voice, setting, image, package and model repositor
 `speech_arms.json`, and the pack refuses to write a page that names one.
 
 The default seed is fresh for every pack and recorded only in the key, so nobody can recompute
-the labels from a committed constant. Stdlib only: the host runs it under a plain Python.
+the labels from a committed constant.
+
+`--from-dir <dir>` builds the same kind of pack from every WAV directly inside `<dir>` instead,
+such as `voice-design`'s candidates: seeded labels, the same loudness probe, the key (label to
+file name) in `listening-key/` and the same refusal of a page that names an arm. The directory
+must lie outside the repository, and the probe's container sees only it, read-only, as its one
+source directory. The page shows the clips as one block with no line text, since the pack knows
+nothing about what they say. Stdlib only: the host runs it under a plain Python.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import TypeVar
 
 from . import core, docker_cmds, tts_suite
 from .probes import listen_pack, tts_probe
@@ -58,6 +66,12 @@ ACK_FEELING = "short acknowledgement"
 CONTAINER_SPEECH = "/speech"
 CONTAINER_JOBS = "/jobs.json"
 CONTAINER_OUT = "/out"
+
+# `--from-dir`: where the directory appears under the probe's `tts/`, and the page's one block.
+FROM_DIR_MOUNT = "from-dir"
+FROM_DIR_GROUP = "all"
+FROM_DIR_TEXT = "Every clip in this folder"
+FROM_DIR_FEELING = "none given for these clips"
 
 # Names that identify an engine family without being an engine id, voice or repository name.
 FAMILY_TERMS = ("qwen", "chatterbox", "kyutai", "resemble", "resembleai")
@@ -200,12 +214,33 @@ def collect_clips(
     return clips
 
 
+@dataclass(frozen=True, slots=True)
+class DirClip:
+    """One WAV of a `--from-dir` pack: its file name and its path as the probe sees it."""
+
+    name: str
+    src: str
+
+
+def collect_dir_clips(from_dir: Path) -> list[DirClip]:
+    """Every `.wav` directly inside `from_dir`, by name; refuses a directory holding none."""
+    if not from_dir.is_dir():
+        raise core.InputError(f"--from-dir {from_dir} is not a directory")
+    names = sorted(p.name for p in from_dir.iterdir() if p.is_file() and p.suffix.lower() == ".wav")
+    if not names:
+        raise core.SpeechBenchError(f"--from-dir {from_dir} holds no WAV file")
+    return [DirClip(name, f"tts/{FROM_DIR_MOUNT}/{name}") for name in names]
+
+
+_Labelled = TypeVar("_Labelled", Clip, DirClip)
+
+
 # ---------------------------------------------------------------------------
 # Labels, groups and the page
 # ---------------------------------------------------------------------------
 
 
-def assign_labels(clips: Sequence[Clip], *, seed: int) -> dict[str, Clip]:
+def assign_labels(clips: Sequence[_Labelled], *, seed: int) -> dict[str, _Labelled]:
     """Label each clip from a seeded permutation of `c1` to `cN`; returned sorted by label.
 
     The labels are numbered for easy reading, and the permutation makes the number unrelated to
@@ -243,6 +278,20 @@ def page_groups(
             }
         )
     return groups
+
+
+def dir_groups(labelled: Mapping[str, DirClip], *, seed: int) -> list[dict]:
+    """A `--from-dir` page's one block: every clip, in a seeded order, with no line text."""
+    labels = list(labelled)
+    random.Random(f"{seed}:order").shuffle(labels)
+    return [
+        {
+            "line_id": FROM_DIR_GROUP,
+            "text": FROM_DIR_TEXT,
+            "feeling": FROM_DIR_FEELING,
+            "clips": labels,
+        }
+    ]
 
 
 def pack_id(seed: int) -> str:
@@ -303,16 +352,20 @@ def load_template(path: Path = TEMPLATE_PATH) -> str:
 # ---------------------------------------------------------------------------
 
 
-def pack_argv(*, repo_dir: str, speech_dir: str) -> list[str]:
+def pack_argv(*, repo_dir: str, speech_dir: str, from_dir: str | None = None) -> list[str]:
     """`docker run` of the probe: base image, no network, no GPU, only `clips/` writable.
 
-    The container sees the code, the saved `tts/` clips and the job list read-only, and the
-    page's `clips/` directory; it is never given the key or a models directory.
+    The container sees the code, the saved `tts/` clips (or, with `from_dir`, only that
+    directory, as `tts/from-dir/`) and the job list read-only, and the page's `clips/`
+    directory; it is never given the key or a models directory.
     """
     argv = ["docker", "run", "--rm", "--network", "none"]
     argv += docker_cmds.env_args({"PYTHONDONTWRITEBYTECODE": "1"})
     argv += docker_cmds.ro_mount(repo_dir, docker_cmds.REPO_MOUNT)
-    argv += docker_cmds.ro_mount(f"{speech_dir}/tts", f"{CONTAINER_SPEECH}/tts")
+    if from_dir is None:
+        argv += docker_cmds.ro_mount(f"{speech_dir}/tts", f"{CONTAINER_SPEECH}/tts")
+    else:
+        argv += docker_cmds.ro_mount(from_dir, f"{CONTAINER_SPEECH}/tts/{FROM_DIR_MOUNT}")
     argv += docker_cmds.ro_mount(f"{speech_dir}/{KEY_SUITE}/{JOBS_FILE}", CONTAINER_JOBS)
     argv += ["-v", f"{speech_dir}/{SUITE}/{CLIPS_DIR}:{CONTAINER_OUT}"]
     argv += ["-w", docker_cmds.REPO_MOUNT, IMAGE, "python", "-m", PROBE_MODULE]
@@ -332,6 +385,7 @@ class PackRequest:
     results_root: Path
     run: str
     seed: int
+    from_dir: Path | None = None
 
 
 def default_runner() -> tts_suite.ContainerRunner:
@@ -346,7 +400,17 @@ def _refuse_existing(speech: Path) -> None:
         )
 
 
-def _key_doc(request: PackRequest, labelled: Mapping[str, Clip], git_sha: str) -> dict:
+def _key_doc(
+    request: PackRequest,
+    labelled: Mapping[str, Clip] | Mapping[str, DirClip],
+    git_sha: str,
+    *,
+    from_dir: Path | None = None,
+) -> dict:
+    if from_dir is None:
+        source = {"source_condition": SOURCE_CONDITION}
+    else:
+        source = {"from_dir": str(from_dir)}
     return {
         "schema": 1,
         "run": request.run,
@@ -354,7 +418,7 @@ def _key_doc(request: PackRequest, labelled: Mapping[str, Clip], git_sha: str) -
         "created_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "seed": request.seed,
         "pack": pack_id(request.seed),
-        "source_condition": SOURCE_CONDITION,
+        **source,
         "target": {
             "integrated_lufs": listen_pack.TARGET_I,
             "true_peak_dbtp": listen_pack.TARGET_TP,
@@ -389,18 +453,28 @@ def build_pack(
     """Build the page and its sealed key; return the page's path.
 
     Refuses before any write: a results root inside the repository, an existing `listening/` or
-    `listening-key/`, a saved clip the collection refuses, and a page that would name an engine,
-    setting or voice. The page is written last, so a failed container leaves no page to open.
+    `listening-key/`, a saved clip the collection refuses (with `from_dir`: a directory inside the
+    repository or one holding no WAV), and a page that would name an engine, setting or voice.
+    The page is written last, so a failed container leaves no page to open.
     """
     tts = dict((arms if arms is not None else core.load_json(core.SPEECH_ARMS_PATH))["tts"])
-    lines = lines_doc if lines_doc is not None else core.load_json(core.LINES_PATH)
     speech = core.speech_root(request.results_root, request.run, repo_root=repo_root)
+    from_dir = None
+    if request.from_dir is not None:
+        from_dir = core.refuse_path_inside_repo(
+            request.from_dir, what="--from-dir", repo_root=repo_root
+        )
     _refuse_existing(speech)
-    clips = collect_clips(speech, tts, lines)
-    if not clips:
-        raise core.SpeechBenchError(f"tts saved no clips under {speech / 'tts'}")
-    labelled = assign_labels(clips, seed=request.seed)
-    groups = page_groups(labelled, lines, seed=request.seed)
+    if from_dir is None:
+        lines = lines_doc if lines_doc is not None else core.load_json(core.LINES_PATH)
+        clips = collect_clips(speech, tts, lines)
+        if not clips:
+            raise core.SpeechBenchError(f"tts saved no clips under {speech / 'tts'}")
+        labelled = assign_labels(clips, seed=request.seed)
+        groups = page_groups(labelled, lines, seed=request.seed)
+    else:
+        labelled = assign_labels(collect_dir_clips(from_dir), seed=request.seed)
+        groups = dir_groups(labelled, seed=request.seed)
     data = {
         "pack": pack_id(request.seed),
         "columns": list(RATINGS_COLUMNS),
@@ -420,13 +494,18 @@ def build_pack(
         request.results_root, request.run, SUITE, git_sha=sha, repo_root=repo_root
     )
     key_dir, page_dir = key_claim.path, page_claim.path
-    core.write_json_exclusive(key_dir / KEY_FILE, _key_doc(request, labelled, sha))
+    key = _key_doc(request, labelled, sha, from_dir=from_dir)
+    core.write_json_exclusive(key_dir / KEY_FILE, key)
     jobs = [{"label": label, "src": clip.src} for label, clip in labelled.items()]
     core.write_json_exclusive(key_dir / JOBS_FILE, {"clips": jobs})
     (page_dir / CLIPS_DIR).mkdir()
 
     output: list[str] = []
-    argv = pack_argv(repo_dir=repo_root.resolve().as_posix(), speech_dir=speech.as_posix())
+    argv = pack_argv(
+        repo_dir=repo_root.resolve().as_posix(),
+        speech_dir=speech.as_posix(),
+        from_dir=from_dir.as_posix() if from_dir is not None else None,
+    )
     log_path = key_dir / LOG_FILE
     code = runner.run(argv, log_path=log_path, on_line=output.append)
     if code != 0:
@@ -480,7 +559,9 @@ def cmd_listen_pack(args: argparse.Namespace) -> int:
         print(json.dumps(read_key(speech), indent=2, ensure_ascii=False))
         return 0
     seed = args.seed if args.seed is not None else secrets.randbits(32)
-    request = PackRequest(results_root=args.results_root, run=args.run, seed=seed)
+    request = PackRequest(
+        results_root=args.results_root, run=args.run, seed=seed, from_dir=args.from_dir
+    )
     build_pack(request, runner=default_runner())
     return 0
 
@@ -499,6 +580,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--seed",
         type=int,
         help="seed of the labels and the clip order (default: fresh, recorded only in the key)",
+    )
+    parser.add_argument(
+        "--from-dir",
+        type=Path,
+        help="build the pack from every WAV in this directory (outside the repository) instead",
     )
     parser.add_argument(
         "--show-key",
