@@ -6,9 +6,11 @@ Dockerfile comes from `families.json`: the family whose `image` is `mist-voice-<
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from packaging.specifiers import SpecifierSet
@@ -32,8 +34,10 @@ SCORE_CODE_CHECK = "/opt/venv-score/bin/python -I -c 'import scripts.voice_data'
 REQUIREMENT_LINE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.+!-]+"
     r"|[A-Za-z0-9][A-Za-z0-9._-]* @ git\+https://[^\s@]+@[0-9a-f]{40}"
+    r"|[A-Za-z0-9][A-Za-z0-9._-]* @ https://[^\s#]+/[^\s#/]+\.whl#sha256=[0-9a-f]{64}"
     r"|--(extra-)?index-url https://\S+"
 )
+COMMIT = re.compile(r"[0-9a-f]{40}")
 KEY_MATERIAL = re.compile(
     r"ssh-(rsa|ed25519|dss) |ecdsa-sha2-|BEGIN [A-Z ]*PRIVATE KEY|AAAA[0-9A-Za-z+/]{20}"
 )
@@ -234,7 +238,7 @@ UPSTREAM_BOUNDS = [
     ("requirements-omnivoice.txt", "gradio", "6.32.0", "huggingface-hub", ">=1.16.0,<3.0"),
     # pypi.org/pypi/transformers/5.19.0/json
     ("requirements-fish-s2.txt", "transformers", "5.19.0", "safetensors", ">=0.8.0"),
-    # pypi.org/pypi/vllm/0.22.0/json
+    # pypi.org/pypi/vllm/0.22.0/json; `row_applies` matches them to the +cu129 build too
     ("requirements-higgs3.txt", "vllm", "0.22.0", "transformers", VLLM_TRANSFORMERS),
     ("requirements-higgs3.txt", "vllm", "0.22.0", "tokenizers", ">=0.21.1"),
     # vllm-omni requirements/common.txt at the pinned commit
@@ -251,7 +255,11 @@ UPSTREAM_BOUNDS = [
 
 
 def pinned_versions(name: str) -> dict[str, str]:
-    """Map each requirement of a requirements file to its pinned version, or its git commit."""
+    """Map each requirement of a requirements file to its pinned version, or its git commit.
+
+    A requirement installed from a wheel URL takes the version its wheel file name carries,
+    local label included, so `+cu129` stays visible to the tests that need it.
+    """
     pins: dict[str, str] = {}
     for raw in (DOCKER_DIR / name).read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -260,6 +268,12 @@ def pinned_versions(name: str) -> dict[str, str]:
         if " @ git+" in line:
             package, url = line.split(" @ ", 1)
             pins[canonicalize_name(package)] = url.rsplit("@", 1)[1]
+        elif " @ https://" in line:
+            package, url = line.split(" @ ", 1)
+            wheel = unquote(urlsplit(url).path.rsplit("/", 1)[1])
+            distribution, version = wheel.split("-")[:2]
+            assert canonicalize_name(distribution) == canonicalize_name(package), line
+            pins[canonicalize_name(package)] = version
         else:
             package, version = line.split("==", 1)
             pins[canonicalize_name(package.split("[", 1)[0])] = version
@@ -282,6 +296,19 @@ def admits_some_version(spec: SpecifierSet) -> bool:
     return any(spec.contains(candidate, prereleases=True) for candidate in candidates)
 
 
+def row_applies(row_pin: str, pinned: str | None) -> bool:
+    """Whether an `UPSTREAM_BOUNDS` row's pin names the pinned version or commit.
+
+    A version row matches as PEP 440 `==` does, which ignores a local label, so the row for
+    vllm 0.22.0 also covers the `0.22.0+cu129` build of that release.
+    """
+    if pinned is None:
+        return False
+    if COMMIT.fullmatch(row_pin):
+        return pinned == row_pin
+    return SpecifierSet(f"=={row_pin}").contains(pinned, prereleases=True)
+
+
 @pytest.mark.parametrize("name", sorted({row[0] for row in UPSTREAM_BOUNDS}))
 def test_teacher_pins_meet_upstream_bounds(name: str) -> None:
     # pip resolves a family's whole requirements file at once, so a pin that falls outside a
@@ -290,7 +317,7 @@ def test_teacher_pins_meet_upstream_bounds(name: str) -> None:
     pins = pinned_versions(name)
     declared: dict[str, SpecifierSet] = {}
     for file, package, pin, dependency, specifier in UPSTREAM_BOUNDS:
-        if file == name and pins.get(package) == pin:
+        if file == name and row_applies(pin, pins.get(package)):
             declared[dependency] = declared.get(dependency, SpecifierSet()) & specifier
     assert declared, f"{name}: no row matches its pins"
     for dependency, spec in declared.items():
@@ -308,7 +335,7 @@ def test_upstream_bounds_cover_each_declaring_pin(name: str) -> None:
     declaring = {package for file, package, _, _, _ in UPSTREAM_BOUNDS if file == name}
     for package in declaring:
         rows = [row for row in UPSTREAM_BOUNDS if row[0] == name and row[1] == package]
-        assert any(row[2] == pins.get(package) for row in rows), f"{name}: {package}"
+        assert any(row_applies(row[2], pins.get(package)) for row in rows), f"{name}: {package}"
 
 
 def test_fish_s2_installs_portaudio_headers_before_its_venv() -> None:
@@ -340,3 +367,78 @@ def test_extract_import_check_loads_tiger_and_sidon_from_their_clones() -> None:
     pins = pinned_versions("requirements-extract.txt")
     assert "torch-complex" in pins
     assert SpecifierSet("<3").contains(pins.get("typeguard", "3")), pins.get("typeguard")
+
+
+def import_check(dockerfile: str, venv: str) -> ast.Module:
+    """Parse the Python that a family image's final step runs in the family's own venv."""
+    final = instructions(DOCKER_DIR / dockerfile)[-1]
+    check = re.match(rf"RUN {re.escape(venv)}/bin/python -I -c '([^']*)'", final)
+    assert check, final
+    return ast.parse(check.group(1))
+
+
+def imported_modules(check: ast.Module) -> set[str]:
+    return {
+        alias.name
+        for node in ast.walk(check)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+
+def test_neutts_pins_the_torchao_built_for_its_torch() -> None:
+    # neucodec 0.0.6 declares torchao>=0.12.0 and no upper bound, so pip took torchao 0.18.0,
+    # whose float8 tensor module imports `ScalingType` from torch.nn.functional; torch 2.8.0
+    # lacks it and the H3 build check failed. torchao 0.13.0 is the release built against torch
+    # 2.8.0, and it stays below the 0.15.0 at which transformers 5.1.0 imports
+    # torchao.prototype.safetensors.
+    pins = pinned_versions("requirements-neutts.txt")
+    assert pins["torch"] == "2.8.0"
+    assert "torchao" in pins
+    assert SpecifierSet(">=0.12.0,==0.13.*").contains(pins["torchao"]), pins["torchao"]
+    check = import_check("train-neutts.Dockerfile", "/opt/venv-train-neutts")
+    assert {"torch", "neutts", "torchao", "scripts.voice_data"} <= imported_modules(check)
+
+
+HIGGS3_TORCH_INDEX = "--extra-index-url https://download.pytorch.org/whl/cu129"
+VLLM_WHEEL = re.compile(
+    r"vllm @ https://github\.com/vllm-project/vllm/releases/download/v(?P<tag>[^/\s]+)/"
+    r"vllm-(?P<version>[^-\s]+)-[^\s#]+\.whl#sha256=[0-9a-f]{64}"
+)
+
+
+def test_higgs3_installs_vllm_and_torch_built_for_cuda_12_9() -> None:
+    # vLLM's PyPI wheels target CUDA 13 since v0.20.0: at dd7890d pip took the PyPI vllm 0.22.0
+    # and its `_C` extension could not load libcudart.so.13 beside the CUDA 12.8 torch. The
+    # release's only CUDA 12 x86_64 wheel is the +cu129 asset (there is no cu128 one), so vllm
+    # comes from that URL with its hash, and torch from the matching cu129 index.
+    lines = (DOCKER_DIR / "requirements-higgs3.txt").read_text(encoding="utf-8").splitlines()
+    assert [line for line in lines if line.startswith("--")] == [HIGGS3_TORCH_INDEX]
+    [vllm] = [line for line in lines if canonicalize_name(re.split(r"[ =@]", line)[0]) == "vllm"]
+    wheel = VLLM_WHEEL.fullmatch(vllm)
+    assert wheel, vllm
+    pins = pinned_versions("requirements-higgs3.txt")
+    assert pins["vllm"] == unquote(wheel.group("version")) == f"{wheel.group('tag')}+cu129"
+    # vllm 0.22.0 requires exactly these three, published for cp311 on the cu129 index.
+    torch = (pins["torch"], pins["torchaudio"], pins["torchvision"])
+    assert torch == ("2.11.0", "2.11.0", "0.26.0")
+
+
+def asserted_expressions(check: ast.Module) -> set[str]:
+    return {ast.unparse(node.test) for node in ast.walk(check) if isinstance(node, ast.Assert)}
+
+
+def test_higgs3_import_check_rejects_a_cuda_13_vllm() -> None:
+    # vllm._C links the CUDA driver library, which a docker build does not have, so the build
+    # cannot import it. The check asserts the CUDA build of both wheels instead, and a PyPI
+    # CUDA 13 vllm fails the image build.
+    check = import_check("teacher-higgs3.Dockerfile", "/opt/venv-teacher-higgs3")
+    modules = imported_modules(check)
+    assert {"importlib.metadata", "torch", "vllm", "vllm_omni", "scripts.voice_data"} <= modules
+    expected = {
+        'importlib.metadata.version("vllm").endswith("+cu129")',
+        'torch.version.cuda.startswith("12.9")',
+    }
+    assert {ast.unparse(ast.parse(e, mode="eval").body) for e in expected} <= (
+        asserted_expressions(check)
+    )
