@@ -2597,6 +2597,12 @@ class TurnController:
                     if chunk is None:
                         break
                     self._on_chunk(turn, index, segment, chunk)
+                turn.pacer.end_segment(index)
+                # A play task waiting for audio was woken by `end_segment`, which put it ahead
+                # of this task on the loop's ready queue: one yield lets it queue the segment's
+                # short last frame before the segment counts as synthesized, so `_ack_played`
+                # never sees a finished ack whose last frame is not yet queued.
+                await asyncio.sleep(0)
                 turn.synth_done_through = index
         except LaneJobCancelled:
             return
@@ -2627,8 +2633,10 @@ class TurnController:
     def _ack_played(self, turn: _Turn) -> bool:
         """Every frame of the ack queued so far has played and its synthesis is done.
 
-        The pacer keeps a segment's last frame shorter than `frame_ms` until the next segment
-        or the end arrives, so that short tail plays with the continuation.
+        `_synthesize` ends each segment in the pacer, and lets the play task step, before it
+        counts the segment as synthesized. By then the ack's last frame, even one shorter than
+        `frame_ms`, is queued or waits on the lead behind queued audio not yet played, so the
+        ack counts as played only once that frame has played too.
         """
         ledger = turn.ledger
         if ledger is None or turn.ack_last_index is None:

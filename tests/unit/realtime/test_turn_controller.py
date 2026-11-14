@@ -290,8 +290,9 @@ class TokenRecordingSynth(FakeSynthesizer):
 async def test_keyword_interrupt_while_speaking_cuts_before_the_next_token():
     pause = Pause()
     synth = TokenRecordingSynth()
-    # Two segments: the pacer holds a segment's last frame until the next segment starts, so
-    # the first sentence is fully queued, and can be heard, once the second has begun.
+    # Two segments. The first sentence's frames, its short last frame among them, are queued
+    # once its own audio ends; its 14 characters voice 700 ms, so the reported 700 ms covers
+    # it whole and none of the second.
     h = make_harness([Token("One two three. Four five. "), pause, Token("Six.")], synthesizer=synth)
     h.start_voice()
     await h.speak("hello")
@@ -983,6 +984,99 @@ async def test_a_turn_without_handoff_has_no_handoff_ack_key():
     assert "handoff_ack_ms" not in metrics(h)[0].timings
 
 
+def audio_sizes(h: Harness) -> list[int]:
+    return [len(f.payload) // 2 for f in frames(h, MsgType.AUDIO_CHUNK)]
+
+
+# "One moment." is 11 characters, 550 ms at 50 ms each: thirteen 40 ms frames (520 ms) and a
+# short last frame of 30 ms, 720 samples.
+ACK_FRAMES = [960] * 13 + [720]
+
+
+async def test_a_handoff_ack_counts_as_played_only_once_its_short_last_frame_has():
+    pause = Pause()
+    h = make_harness([HandOff("One moment."), pause, Token(" Here it is.")])
+    h.start_voice()
+    await h.speak("look it up")
+    turn_id = h.last_turn()
+    assert audio_sizes(h) == ACK_FRAMES
+
+    h.post(PlaybackProgress(turn_id=turn_id, played_ms=520))  # every full frame
+    await h.settle()
+    assert h.controller.phase == "speaking"
+
+    h.post(PlaybackProgress(turn_id=turn_id, played_ms=550))  # and the short last one
+    await h.settle()
+    assert h.controller.phase == "thinking"
+    pause.release()
+    await h.settle()
+
+
+class ReportingSynthesizer(FakeSynthesizer):
+    """Runs `on_end` inside the call that finds a segment's audio exhausted."""
+
+    def __init__(self, on_end: Callable[[], None]) -> None:
+        super().__init__()
+        self.on_end = on_end
+
+    def synthesize(self, segment, token):
+        chunks = super().synthesize(segment, token)
+
+        def ending():
+            yield from chunks
+            self.on_end()
+
+        return ending()
+
+
+async def test_a_handoff_ack_reported_played_as_its_synthesis_ends_waits_for_its_last_frame():
+    # The client reports every queued frame played inside the step that finds the ack's audio
+    # exhausted, so the report reaches the mailbox before the play task has queued the short
+    # last frame. The ack's synthesis must not count as done until that frame is queued.
+    pause = Pause()
+    reports: list[str] = []
+
+    def report() -> None:
+        if not reports:
+            reports.append(h.last_turn())
+            h.post(PlaybackProgress(turn_id=reports[0], played_ms=520))
+
+    h = make_harness(
+        [HandOff("One moment."), pause, Token(" Here it is.")],
+        synthesizer=ReportingSynthesizer(report),
+    )
+    h.start_voice()
+    await h.speak("look it up")
+
+    assert reports and audio_sizes(h) == ACK_FRAMES
+    assert h.controller.phase == "speaking"
+    h.post(PlaybackProgress(turn_id=reports[0], played_ms=550))
+    await h.settle()
+    assert h.controller.phase == "thinking"
+    pause.release()
+    await h.settle()
+
+
+async def test_a_segments_last_frame_is_queued_while_the_next_waits_on_the_lane():
+    pause = Pause()
+    h = make_harness([Token("Hello. "), pause, Token("World."), Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    h.lane.hold()
+
+    pause.release()
+    await h.settle()
+
+    # "Hello." voices 300 ms: seven full frames and a short one of 20 ms.
+    assert h.synth.segments == [TextSegment("Hello.", 0, 6)]
+    assert audio_sizes(h) == [960] * 7 + [480]
+    assert h.outbound.tokens() == ["Hello. ", "World."]
+    h.lane.open()
+    await h.settle()
+    assert h.synth.segments[1] == TextSegment("World.", 7, 13)
+    assert audio_sizes(h) == [960] * 7 + [480] + [960] * 7 + [480]
+
+
 # -- The shared fakes -------------------------------------------------------------------------------
 
 
@@ -1497,9 +1591,9 @@ async def test_record_the_cap_with_no_reports_stops_at_the_last_taken_token():
     await h.clock.advance(60_000)
     ledger = h.controller._turn.ledger
     assert ledger.source == "estimate"
-    # The pacer holds the last segment's final frame until the end, so the estimate stops
-    # short of token 5; it still runs past the tokens the sender took.
-    assert ledger.spoken_text().startswith("Alpha. Beta. Gamma. Delta")
+    # The estimate runs past the tokens the sender took, to the end of the last segment, the
+    # one token 4 completed; token 5 waits in the segmenter for the text after it.
+    assert ledger.spoken_text() == "Alpha. Beta. Gamma. Delta. Eps."
 
     h.post(Interrupt())
     await h.settle()

@@ -531,6 +531,101 @@ class TestFraming:
             harness.pacer.submit(0, _chunk(_segment("One."), 40))
 
 
+def _sizes(items: list[object]) -> list[int | str]:
+    """Each `0x01`'s sample count, and every other frame by its kind."""
+    return [
+        (
+            len(item.payload) // 2
+            if isinstance(item, Frame) and item.msg_type is MsgType.AUDIO_CHUNK
+            else kind
+        )
+        for item, kind in zip(items, _kinds(items), strict=True)
+    ]
+
+
+class TestEndSegment:
+    @pytest.mark.asyncio
+    async def test_end_segment_sends_the_short_last_frame_before_the_next_segment(self, harness):
+        harness.pacer.submit(0, _chunk(_segment("One."), 60))
+        await harness.start()
+        held = _drain(harness.lane)
+
+        harness.pacer.end_segment(0)
+        await _settle()
+        ended = _drain(harness.lane)
+        harness.pacer.submit(1, _chunk(_segment("Two.", 5), 40))
+        await _settle()
+
+        assert _sizes(held + ended) == [960, 480]
+        assert _sizes(_drain(harness.lane)) == [960]
+        assert harness.ledger.recorded_samples == 960 + 480 + 960
+
+    @pytest.mark.asyncio
+    async def test_end_segment_after_finish_changes_nothing(self, harness):
+        harness.pacer.submit(0, _chunk(_segment("One."), 60))
+        harness.pacer.finish()
+
+        harness.pacer.end_segment(0)
+        await harness.start()
+
+        assert _sizes(_drain(harness.lane)) == [960, 480, "0x02"]
+
+    @pytest.mark.asyncio
+    async def test_end_segment_after_end_unsent_queues_no_audio(self, harness):
+        harness.pacer.submit(0, _chunk(_segment("Never heard."), 60))
+        harness.pacer.end_unsent()
+
+        harness.pacer.end_segment(0)
+        await harness.start()
+
+        assert _sizes(_drain(harness.lane)) == ["0x02"]
+        assert harness.ledger.recorded_samples == 0
+
+    @pytest.mark.asyncio
+    async def test_end_segment_after_stop_queues_nothing(self, harness):
+        harness.pacer.submit(0, _chunk(_segment("One."), 60))
+        await harness.start()
+        before = len(harness.log)
+        harness.pacer.stop(harness.lane.purge(TURN).terminal)
+
+        harness.pacer.end_segment(0)
+        await harness.clock.advance(1000)
+
+        assert len(harness.log) == before
+        assert harness.lane.take() is None
+        assert _kinds(harness.control) == ["0x03", "playback_stop"]
+
+    @pytest.mark.asyncio
+    async def test_end_segment_of_an_index_with_no_pending_audio_changes_nothing(self, harness):
+        harness.pacer.end_segment(0)  # nothing submitted yet
+        harness.pacer.submit(0, _chunk(_segment("One."), 60))
+        await harness.start()
+
+        harness.pacer.end_segment(1)  # not submitted
+        await _settle()
+        before = _drain(harness.lane)
+        harness.pacer.submit(1, _chunk(_segment("Two.", 5), 60))
+        harness.pacer.end_segment(0)  # already closed by segment 1
+        await _settle()
+        after = _drain(harness.lane)
+
+        assert _sizes(before) == [960]
+        assert _sizes(after) == [480, 960]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("framed", [False, True], ids=["pending", "framed"])
+    async def test_a_submit_of_a_segment_that_has_ended_is_refused(self, harness, framed):
+        harness.pacer.submit(0, _chunk(_segment("One."), 80))
+        harness.pacer.end_segment(0)
+        if framed:
+            await harness.start()
+            assert _sizes(_drain(harness.lane)) == [960, 960]
+
+        with pytest.raises(ValueError):
+            harness.pacer.submit(0, _chunk(_segment("One."), 40))
+        harness.pacer.submit(1, _chunk(_segment("Two.", 5), 40))
+
+
 class TestPacing:
     @pytest.mark.asyncio
     async def test_with_the_reported_position_held_the_pacer_stops_at_max_lead(self, harness):
