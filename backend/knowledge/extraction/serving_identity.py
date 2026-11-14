@@ -19,7 +19,10 @@ What it covers, and why some settings are absent:
 - The request profile: the sampling and decoding fields each stage's request
   carries, recorded as sent, after the adapter has prepared it. A setting an
   adapter ignores (a reasoning effort under qwen or gemma) therefore does not
-  split epochs.
+  split epochs. It includes the prompt-cache flag, which the service sends
+  false on every request, so each prompt is processed from its first token.
+  The turn's date, which each request also carries for the chat template, is
+  per turn and no component.
 - The declared llama-server settings, `EXTRACTION_SERVER_<NAME>` on the
   service, which compose builds from the same `${...}` expression as the
   llama-server flag. Flags left at their default are covered by the image
@@ -33,6 +36,11 @@ What it covers, and why some settings are absent:
   re-extracting history and new turns only; a key here would override that
   choice. The run identity (`backend.knowledge.extraction.run_identity`)
   records code and settings together; it stays a record, never a key.
+- The chat template llama-server serves is not a component, because no other
+  is admitted: the service gives no serving identity unless the sha256 of the
+  template `/props` serves is the one its adapter pins
+  (`backend.extraction_service.adapters.CHAT_TEMPLATE_SHA256`). That pin is
+  code, so it is governed as code is.
 
 This module is a leaf: standard library only. The extraction service imports
 it, and so does the backend for `diff_components`, and the service image must
@@ -79,6 +87,11 @@ class StageRequestProfile:
         thinking_enabled: The thinking switch, or None when not sent.
         thinking_budget_tokens: The reasoning token budget, or None when not
             sent (unbudgeted).
+        cache_prompt: Whether llama-server may reuse a cached prompt prefix,
+            or None when not sent (llama-server's default, true). None, the
+            default, is left out of the flat form (`components_dict`), so an
+            identity bound before the field existed is still the identity of
+            the same setup.
     """
 
     stage: str
@@ -88,6 +101,7 @@ class StageRequestProfile:
     thinking_effort: str | None
     thinking_enabled: bool | None
     thinking_budget_tokens: int | None
+    cache_prompt: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +152,8 @@ _NESTED_FIELDS = frozenset({"requests", "server"})
 # that reproduces the earlier behaviour. A field at that value is left out of
 # the flat form, so those identities and their stored components do not move.
 _OMITTED_AT: Mapping[str, object] = MappingProxyType({"turn_plan": False})
+# The same rule for the profile fields, applied at every stage.
+_PROFILE_OMITTED_AT: Mapping[str, object] = MappingProxyType({"cache_prompt": None})
 
 
 def components_dict(c: ServingIdentityComponents) -> dict[str, str | int | float | bool | None]:
@@ -145,7 +161,8 @@ def components_dict(c: ServingIdentityComponents) -> dict[str, str | int | float
 
     The scalar fields keep their names; each profile field becomes
     `request.<stage>.<field>` and each declared setting `server.<key>`.
-    `turn_plan` appears only when True (`_OMITTED_AT`).
+    `turn_plan` appears only when True (`_OMITTED_AT`), and a stage's
+    `cache_prompt` only when sent (`_PROFILE_OMITTED_AT`).
 
     Raises:
         ValueError: Two profiles name one stage, or one server key is declared
@@ -163,7 +180,10 @@ def components_dict(c: ServingIdentityComponents) -> dict[str, str | int | float
             raise ValueError(f"two request profiles for stage {profile.stage!r}")
         seen_stages.add(profile.stage)
         for name in _PROFILE_FIELDS:
-            flat[f"request.{profile.stage}.{name}"] = getattr(profile, name)
+            value = getattr(profile, name)
+            if name in _PROFILE_OMITTED_AT and value is _PROFILE_OMITTED_AT[name]:
+                continue
+            flat[f"request.{profile.stage}.{name}"] = value
     seen_keys: set[str] = set()
     for key, value in c.server:
         if key in seen_keys:

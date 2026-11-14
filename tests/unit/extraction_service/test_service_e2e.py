@@ -22,7 +22,7 @@ from backend.extraction_service.schemas import (
 from backend.knowledge.ontologies.registry import active_pack
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from tests.unit.extraction_service.conftest import FAKE_BASE_URL, make_extract_request
-from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
+from tests.unit.extraction_service.fake_llama import FAKE_N_CTX, props_body_for
 
 
 @pytest.mark.asyncio
@@ -425,7 +425,7 @@ class TestInfoServingConfig:
             nonlocal fetches
             fetches += 1
             await held.wait()
-            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": FAKE_N_CTX}})
+            return httpx.Response(200, json=props_body_for(FAKE_N_CTX))
 
         source = LlamaPropsContextSize(http_client=_props_client(slow), base_url=FAKE_BASE_URL)
         app = create_app(service_settings, engine, health_probe, source)
@@ -606,7 +606,7 @@ class TestInfoServingConfig:
 
         def record(request: httpx.Request) -> httpx.Response:
             seen.append(str(request.url))
-            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 4096}})
+            return httpx.Response(200, json=props_body_for(4096))
 
         source = LlamaPropsContextSize(
             http_client=_props_client(record), base_url=service_settings.llm_base_url

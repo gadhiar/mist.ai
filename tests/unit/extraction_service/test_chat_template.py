@@ -15,12 +15,18 @@ Reversing both edits must give back the model's own template, whose sha256 is
 the one H30 printed for the 16,738 bytes of the GGUF key's value; that is also
 the sha256 of llama.cpp's `models/templates/openai-gpt-oss-120b.jinja` at
 b11151. Rendering is not tested: the test image has no llama.cpp.
+
+The service admits this file alone: `CHAT_TEMPLATE_SHA256` pins its sha256
+for the gpt-oss adapter, and `chat_template_problem` names any other template
+`/props` serves. Edit the file, the pin and this test together.
 """
 
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+
+from backend.extraction_service.adapters import CHAT_TEMPLATE_SHA256, chat_template_problem
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEMPLATE_PATH = REPO_ROOT / "docker" / "extraction" / "chat_templates" / "gpt-oss.jinja"
@@ -82,3 +88,44 @@ class TestTheShippedTemplateReadsNoClock:
         lines = [line for line in _shipped().split(b"\n") if b"current_date" in line]
 
         assert lines == [SHIPPED_DATE_LINE]
+
+
+class TestTheServiceAdmitsTheShippedTemplateAlone:
+    """The pin the service checks `/props` against, and the check itself (Acceptance 4)."""
+
+    def test_the_gpt_oss_pin_is_the_shipped_files_sha256(self):
+        expected = {"gptoss": hashlib.sha256(_shipped()).hexdigest()}
+
+        assert expected == CHAT_TEMPLATE_SHA256
+
+    def test_the_shipped_template_is_admitted_under_gpt_oss(self):
+        assert chat_template_problem("gptoss", hashlib.sha256(_shipped()).hexdigest()) is None
+
+    def test_another_template_or_none_is_refused_under_gpt_oss(self):
+        shipped = hashlib.sha256(_shipped()).hexdigest()
+
+        assert chat_template_problem("gptoss", MODEL_TEMPLATE_SHA256) == (
+            f"served chat template sha256 {MODEL_TEMPLATE_SHA256} != the gptoss adapter's "
+            f"{shipped}"
+        )
+        assert chat_template_problem("gptoss", None) == (
+            f"served chat template sha256 none != the gptoss adapter's {shipped}"
+        )
+
+    def test_qwen_and_gemma_are_refused_the_gpt_oss_template(self):
+        shipped = hashlib.sha256(_shipped()).hexdigest()
+
+        for adapter in ("qwen", "gemma"):
+            assert chat_template_problem(adapter, shipped) == (
+                f"served chat template sha256 {shipped} is the gptoss adapter's, "
+                f"not the {adapter} adapter's"
+            )
+
+    def test_qwen_and_gemma_are_admitted_any_other_template(self):
+        for adapter in ("qwen", "gemma"):
+            assert chat_template_problem(adapter, MODEL_TEMPLATE_SHA256) is None
+            assert chat_template_problem(adapter, None) is None
+
+    def test_an_unregistered_adapter_is_not_checked(self):
+        assert chat_template_problem("not-a-registered-adapter", None) is None
+        assert chat_template_problem("fake", MODEL_TEMPLATE_SHA256) is None

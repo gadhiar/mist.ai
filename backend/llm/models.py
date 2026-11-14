@@ -77,7 +77,17 @@ class ThinkingConfig(BaseModel):
 
 
 class LLMRequest(BaseModel):
-    """Parameters for an LLM generation call."""
+    """Parameters for an LLM generation call.
+
+    `cache_prompt` and `current_date` are llama-server request fields, sent
+    only when set, so a caller that sets neither sends the body it sent before
+    they existed. `cache_prompt` False has llama-server process the prompt from
+    its first token instead of reusing a cached prefix, whose values depend on
+    the batch shape that computed them. `current_date` is a chat template
+    variable (`chat_template_kwargs`): the extraction service's shipped gpt-oss
+    template writes it as the system message's date in place of the server's
+    clock.
+    """
 
     messages: list[dict[str, Any]]
     tools: list[dict] | None = None
@@ -87,6 +97,8 @@ class LLMRequest(BaseModel):
     json_mode: bool = False
     thinking: ThinkingConfig | None = None
     response_schema: dict[str, Any] | None = None
+    cache_prompt: bool | None = None
+    current_date: str | None = None
 
 
 class LLMResponse(BaseModel):

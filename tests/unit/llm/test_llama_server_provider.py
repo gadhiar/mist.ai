@@ -279,6 +279,66 @@ class TestBuildKwargsThinking:
             ThinkingConfig(budget_tokens=-1)
 
 
+class TestBuildKwargsRepeatableCalls:
+    """T62: the prompt-cache switch and the template's date travel in `extra_body`.
+
+    llama-server reads `cache_prompt` per request and each `chat_template_kwargs`
+    entry as a template variable, so the extraction engine can send every call
+    uncached and under the turn's date. A request that sets neither field must send
+    the body it sent before T62, since the backend's other callers set neither.
+    """
+
+    def test_cache_prompt_false_is_sent_at_the_top_level(self, provider: LlamaServerProvider):
+        request = LLMRequest(messages=[{"role": "user", "content": "hi"}], cache_prompt=False)
+
+        kwargs = provider._build_kwargs(request, stream=False)
+
+        assert kwargs["extra_body"] == {"cache_prompt": False}
+
+    def test_current_date_alone_is_the_only_template_kwarg(self, provider: LlamaServerProvider):
+        request = LLMRequest(
+            messages=[{"role": "user", "content": "hi"}], current_date="2026-06-13"
+        )
+
+        kwargs = provider._build_kwargs(request, stream=False)
+
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"current_date": "2026-06-13"}}
+
+    def test_current_date_sits_beside_the_effort(self, provider: LlamaServerProvider):
+        request = LLMRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=ThinkingConfig(effort="medium", budget_tokens=8192),
+            cache_prompt=False,
+            current_date="2026-06-13",
+        )
+
+        kwargs = provider._build_kwargs(request, stream=False)
+
+        assert kwargs["extra_body"] == {
+            "reasoning_budget_tokens": 8192,
+            "chat_template_kwargs": {
+                "reasoning_effort": "medium",
+                "current_date": "2026-06-13",
+            },
+            "cache_prompt": False,
+        }
+
+    def test_neither_field_sends_the_body_it_sent_before(self, provider: LlamaServerProvider):
+        request = LLMRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=ThinkingConfig(effort="low", budget_tokens=256),
+        )
+
+        kwargs = provider._build_kwargs(request, stream=False)
+
+        assert request.cache_prompt is None
+        assert request.current_date is None
+        assert kwargs["extra_body"] == {
+            "reasoning_budget_tokens": 256,
+            "chat_template_kwargs": {"reasoning_effort": "low"},
+        }
+
+
 class TestBuildKwargsResponseSchema:
     def test_response_schema_sets_json_schema_response_format(self, provider: LlamaServerProvider):
         schema = {"type": "object", "properties": {"a": {"type": "string"}}}

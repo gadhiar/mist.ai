@@ -106,23 +106,30 @@ class LlamaServerProvider(StreamingLLMProvider):
         `--reasoning-budget`, so "unbudgeted" must mean omitting the field,
         never sending -1 -- `ThinkingConfig` already rejects -1 at
         construction time). `chat_template_kwargs` is omitted entirely when
-        neither `effort` nor `enabled` is set.
+        none of `effort`, `enabled` and the request's `current_date` is set.
+
+        `cache_prompt` is sent when the request sets it, and `current_date`
+        goes in `chat_template_kwargs` when set, whether or not `thinking` is:
+        llama-server reads the first per request and each template kwarg as a
+        template variable. A request that sets neither sends the body it sent
+        before the two fields existed.
         """
         extra_body: dict = {}
         thinking = request.thinking
-        if thinking is None:
-            return extra_body
-
-        if thinking.budget_tokens is not None:
-            extra_body["reasoning_budget_tokens"] = thinking.budget_tokens
-
         chat_template_kwargs: dict = {}
-        if thinking.effort is not None:
-            chat_template_kwargs["reasoning_effort"] = thinking.effort
-        if thinking.enabled is not None:
-            chat_template_kwargs["enable_thinking"] = thinking.enabled
+        if thinking is not None:
+            if thinking.budget_tokens is not None:
+                extra_body["reasoning_budget_tokens"] = thinking.budget_tokens
+            if thinking.effort is not None:
+                chat_template_kwargs["reasoning_effort"] = thinking.effort
+            if thinking.enabled is not None:
+                chat_template_kwargs["enable_thinking"] = thinking.enabled
+        if request.current_date is not None:
+            chat_template_kwargs["current_date"] = request.current_date
         if chat_template_kwargs:
             extra_body["chat_template_kwargs"] = chat_template_kwargs
+        if request.cache_prompt is not None:
+            extra_body["cache_prompt"] = request.cache_prompt
 
         return extra_body
 

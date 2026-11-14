@@ -21,6 +21,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 from starlette.applications import Starlette
@@ -34,7 +35,36 @@ from starlette.routing import Route
 # at low effort has a serving identity.
 FAKE_N_CTX = 16384
 
+# The gpt-oss chat template both extraction llama-servers load (T62). The
+# service gives no serving identity under the gpt-oss adapter unless `/props`
+# serves exactly these bytes, so the fake serves them by default.
+SHIPPED_CHAT_TEMPLATE = (
+    (
+        Path(__file__).resolve().parents[3]
+        / "docker"
+        / "extraction"
+        / "chat_templates"
+        / "gpt-oss.jinja"
+    )
+    .read_bytes()
+    .decode("utf-8")
+)
+
 _USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+
+def props_body_for(
+    n_ctx: int = FAKE_N_CTX, *, template: str | None = SHIPPED_CHAT_TEMPLATE
+) -> dict:
+    """A `/props` body reporting `n_ctx` and serving `template`, or no template when None.
+
+    b11151 serves the context size at `default_generation_settings.n_ctx` and
+    the default template's source at `chat_template`.
+    """
+    body: dict = {"default_generation_settings": {"n_ctx": n_ctx}}
+    if template is not None:
+        body["chat_template"] = template
+    return body
 
 
 class StreamDroppedError(Exception):
@@ -75,9 +105,7 @@ class FakeLlamaState:
     chat_aborted: int = 0
     # GET /props: the status and JSON body to answer with.
     props_status: int = 200
-    props_body: object = field(
-        default_factory=lambda: {"default_generation_settings": {"n_ctx": FAKE_N_CTX}}
-    )
+    props_body: object = field(default_factory=props_body_for)
     props_requests: int = 0
 
     def next_response(self) -> str:

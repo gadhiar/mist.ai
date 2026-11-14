@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import time
 from collections import OrderedDict
@@ -45,7 +46,11 @@ from backend.extraction_contract.models import (
     error_envelope,
     is_compatible,
 )
-from backend.extraction_service.adapters import ModelFamilyAdapter, get_adapter
+from backend.extraction_service.adapters import (
+    ModelFamilyAdapter,
+    chat_template_problem,
+    get_adapter,
+)
 from backend.extraction_service.engine import (
     LIST_BATCH_MAX_UNITS,
     LIST_CONTEXT_MAX_UNITS,
@@ -134,16 +139,20 @@ class LlamaHealthProbe:
 
 @dataclass(frozen=True, slots=True)
 class PropsRead:
-    """One read of llama-server's context window.
+    """One read of llama-server's context window and the chat template it serves.
 
     Attributes:
         n_ctx: The context size `/props` reported, or None when it could not
             be read.
         error: Why `n_ctx` is None; None when it was read.
+        chat_template_sha256: The sha256 of the UTF-8 bytes of the
+            `chat_template` string `/props` served on the same GET, or None
+            when it served none or could not be read.
     """
 
     n_ctx: int | None
     error: str | None = None
+    chat_template_sha256: str | None = None
 
 
 class ContextSizeSource(Protocol):
@@ -159,7 +168,10 @@ class LlamaPropsContextSize:
 
     The field path is `default_generation_settings.n_ctx`, the same one
     `LlamaServerProvider.server_context_size` and
-    `backend.factories._probe_llama_server_n_ctx` parse.
+    `backend.factories._probe_llama_server_n_ctx` parse. The `chat_template`
+    string of the same response, the template llama-server renders prompts with, is
+    hashed for the service's template check; a body without one reads as no
+    template and does not fail the `n_ctx` read.
 
     Every read fetches: nothing is kept once a fetch has finished, so a
     llama-server restarted with another context size is seen on the next
@@ -190,13 +202,13 @@ class LlamaPropsContextSize:
 
     async def _read_once(self) -> PropsRead:
         try:
-            return PropsRead(n_ctx=await self._fetch())
+            return await self._fetch()
         except (LLMConnectionError, LLMResponseError) as exc:
             logger.warning("llama-server context size unavailable; ctx_size=null: %s", exc)
             return PropsRead(n_ctx=None, error=str(exc))
 
-    async def _fetch(self) -> int:
-        """GET `{base_url}/props` and return `default_generation_settings.n_ctx`.
+    async def _fetch(self) -> PropsRead:
+        """GET `{base_url}/props`: `default_generation_settings.n_ctx` and the template's sha256.
 
         Raises:
             LLMConnectionError: The request failed at the transport level.
@@ -219,7 +231,13 @@ class LlamaPropsContextSize:
         # bool is an int subclass; a JSON true/false is not a context size.
         if not isinstance(n_ctx, int) or isinstance(n_ctx, bool):
             raise LLMResponseError(f"GET {url} carried no int at default_generation_settings.n_ctx")
-        return n_ctx
+        template = data.get("chat_template")
+        template_sha256 = (
+            hashlib.sha256(template.encode("utf-8")).hexdigest()
+            if isinstance(template, str)
+            else None
+        )
+        return PropsRead(n_ctx=n_ctx, chat_template_sha256=template_sha256)
 
 
 class JobCancelledError(ExtractionServiceError):
@@ -497,7 +515,7 @@ def serving_identity_components(
 
 
 def _serving_identity_error(
-    settings: ServiceSettings, props: PropsRead, extract_cap: int
+    settings: ServiceSettings, props: PropsRead, extract_cap: int, adapter_name: str
 ) -> str | None:
     """Why the service has no serving identity for this call, or None when it has one.
 
@@ -506,6 +524,11 @@ def _serving_identity_error(
     exceed its context (medium's caps at low's 16,384 context) gets no
     identity, and `/v1/info` names the shortfall, the same way a declared
     context size that differs from the observed one is reported.
+
+    Once `/props` is read, the chat template it serves must be the one
+    `adapter_name`'s adapter pins (`chat_template_problem`). A llama-server on
+    the gpt-oss model's own template, which writes the server's clock date into
+    every prompt, therefore gets no identity under the gpt-oss adapter.
     """
     declared = dict(settings.server_config)
     problems: list[str] = []
@@ -529,6 +552,10 @@ def _serving_identity_error(
             f"extract cap {extract_cap} + prompt reserve {PROMPT_RESERVE_TOKENS} "
             f"> observed n_ctx {props.n_ctx}"
         )
+    if props.n_ctx is not None:
+        template_problem = chat_template_problem(adapter_name, props.chat_template_sha256)
+        if template_problem is not None:
+            problems.append(template_problem)
     return "; ".join(problems) or None
 
 
@@ -611,7 +638,9 @@ def create_app(
     async def serving_view() -> _ServingView:
         # Read for every call: the context size is observed, never cached.
         props = await ctx_size_source.read()
-        error = _serving_identity_error(settings, props, engine.stage_cap("extract"))
+        error = _serving_identity_error(
+            settings, props, engine.stage_cap("extract"), engine.adapter_name
+        )
         if props.n_ctx is None:
             return _ServingView(props=props, identity=None, components=None, error=error)
         components = serving_identity_components(settings, engine, props.n_ctx)

@@ -354,7 +354,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
         # Before T60's scope cap of 512, which moves scope_max_tokens and
         # code_sha256:
         # ci1-61591c98b4b3dbef9c3a252cd43c11ade626fafdc93eb4de6d1fa3afcff1e86e.
-        code_identity="ci1-b26a03224c323f3835ba8b00fa81462184a6e93e882190ce6e061385779483a7",
+        # Before T62's uncached requests and request date, which move
+        # code_sha256:
+        # ci1-b26a03224c323f3835ba8b00fa81462184a6e93e882190ce6e061385779483a7.
+        code_identity="ci1-2091315e85f9bb98b0d93e35ac0d4923d21a972d7e6d9dd155a78ca6cce6c688",
         date="2026-11-12",
         reason=(
             "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
@@ -373,7 +376,11 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "id, name and type and each relationship source, target and type, and a "
             "Metric that writes properties writes value, unit and quantity, unit and "
             "quantity possibly null; T60 sends scope with a cap of 512 in place of 96, so a "
-            "scope reply is no longer cut mid-answer. Re-extracts history."
+            "scope reply is no longer cut mid-answer; T62 sends every request with "
+            "`cache_prompt` false, so each prompt is processed from its first token, and "
+            "with the turn's reference date as `chat_template_kwargs.current_date`, which "
+            "the shipped gpt-oss template renders as the system message's date in place of "
+            "the server's clock. Re-extracts history."
         ),
     ),
 )
