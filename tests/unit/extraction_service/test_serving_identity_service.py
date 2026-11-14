@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -46,7 +47,13 @@ from backend.knowledge.extraction.serving_identity import (
     compute_serving_identity,
 )
 from tests.unit.extraction_service.conftest import make_extract_request
-from tests.unit.extraction_service.fake_llama import FAKE_N_CTX
+from tests.unit.extraction_service.fake_llama import (
+    FAKE_N_CTX,
+    SHIPPED_CHAT_TEMPLATE,
+    props_body_for,
+)
+
+_SHIPPED_TEMPLATE_SHA256 = hashlib.sha256(SHIPPED_CHAT_TEMPLATE.encode("utf-8")).hexdigest()
 
 _DERIVATION = {
     "signal_types": ["feedback"],
@@ -381,13 +388,21 @@ _CONSTRAINED_BY_FORMAT = {"json_schema": "schema", "json_object": "json_object",
 
 
 def _sent_profile(body: dict) -> dict:
-    """The profile fields of one captured request body, as llama-server received it."""
+    """The profile fields of one captured request body, as llama-server received it.
+
+    The template's `current_date` is left out: it is the turn's date, and no
+    profile field.
+    """
+    kwargs = {
+        k: v for k, v in (body.get("chat_template_kwargs") or {}).items() if k != "current_date"
+    }
     return {
         "temperature": body["temperature"],
         "top_p": body["top_p"],
         "constrained": _CONSTRAINED_BY_FORMAT[(body.get("response_format") or {}).get("type")],
-        "chat_template_kwargs": body.get("chat_template_kwargs"),
+        "chat_template_kwargs": kwargs or None,
         "reasoning_budget_tokens": body.get("reasoning_budget_tokens"),
+        "cache_prompt": body.get("cache_prompt"),
     }
 
 
@@ -403,6 +418,7 @@ def _expected_profile(profile: StageRequestProfile) -> dict:
         "constrained": profile.constrained,
         "chat_template_kwargs": kwargs or None,
         "reasoning_budget_tokens": profile.thinking_budget_tokens,
+        "cache_prompt": profile.cache_prompt,
     }
 
 
@@ -487,7 +503,7 @@ class TestInfoReportsTheServingIdentity:
     async def test_a_context_size_that_differs_from_the_declared_one_gives_no_identity(
         self, client, fake_llama_state
     ):
-        fake_llama_state.props_body = {"default_generation_settings": {"n_ctx": 4096}}
+        fake_llama_state.props_body = props_body_for(4096)
 
         data = (await client.get("/v1/info")).json()
 
@@ -515,7 +531,7 @@ class TestInfoReportsTheServingIdentity:
         self, client, fake_llama_state
     ):
         first = (await client.get("/v1/info")).json()
-        fake_llama_state.props_body = {"default_generation_settings": {"n_ctx": 32768}}
+        fake_llama_state.props_body = props_body_for(32768)
         second = (await client.get("/v1/info")).json()
 
         assert first["serving_identity"] is not None
@@ -523,10 +539,59 @@ class TestInfoReportsTheServingIdentity:
         assert second["serving_identity_components"]["n_ctx"] == 32768
         assert fake_llama_state.props_requests == 2
 
+    async def test_the_components_show_every_request_sent_uncached(self, client):
+        """T62: every stage sends `cache_prompt` false, a component at each stage."""
+        components = (await client.get("/v1/info")).json()["serving_identity_components"]
 
-def _at_context(settings: ServiceSettings, fake_llama_state, n_ctx: int) -> ServiceSettings:
-    """`settings` declaring `n_ctx`, with the fake llama-server reporting it."""
-    fake_llama_state.props_body = {"default_generation_settings": {"n_ctx": n_ctx}}
+        assert {k: v for k, v in components.items() if k.endswith(".cache_prompt")} == {
+            "request.scope.cache_prompt": False,
+            "request.extract.cache_prompt": False,
+            "request.derive.cache_prompt": False,
+        }
+
+    @pytest.mark.parametrize(
+        ("template", "observed"),
+        [
+            pytest.param(
+                SHIPPED_CHAT_TEMPLATE.replace(
+                    '{%- if current_date is defined %}{{- "Current date: " + current_date'
+                    ' + "\\n\\n" }}{%- endif %}',
+                    '{{- "Current date: " + strftime_now("%Y-%m-%d") + "\\n\\n" }}',
+                ),
+                None,
+                id="the-models-own-date-line",
+            ),
+            pytest.param(None, "none", id="no-template"),
+        ],
+    )
+    async def test_a_template_other_than_the_shipped_one_gives_no_identity(
+        self, client, fake_llama_state, template, observed
+    ):
+        """T62: a llama-server that would write its clock's date, or serves no template."""
+        fake_llama_state.props_body = props_body_for(FAKE_N_CTX, template=template)
+        if observed is None:
+            assert template != SHIPPED_CHAT_TEMPLATE
+            observed = hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+        data = (await client.get("/v1/info")).json()
+
+        assert data["serving_identity"] is None
+        assert data["serving_identity_error"] == (
+            f"served chat template sha256 {observed} != the gptoss adapter's "
+            f"{_SHIPPED_TEMPLATE_SHA256}"
+        )
+        assert data["serving_identity_components"]["n_ctx"] == FAKE_N_CTX
+
+
+def _at_context(
+    settings: ServiceSettings,
+    fake_llama_state,
+    n_ctx: int,
+    *,
+    template: str | None = SHIPPED_CHAT_TEMPLATE,
+) -> ServiceSettings:
+    """`settings` declaring `n_ctx`, with the fake llama-server reporting it and serving `template`."""
+    fake_llama_state.props_body = props_body_for(n_ctx, template=template)
     return _with_server_value(settings, "ctx_size", str(n_ctx))
 
 
@@ -623,6 +688,8 @@ class TestTheCapsMustFitTheContext:
             ),
             fake_llama_state,
             16384,
+            # Qwen and gemma pin no template; served gpt-oss's, they are refused.
+            template=None,
         )
 
         data = await self._info(settings, wired_llm, health_probe, ctx_size_source)
@@ -683,7 +750,7 @@ class TestExtractChecksTheServingIdentity:
         self, client, fake_llama_state
     ):
         expected = (await client.get("/v1/info")).json()["serving_identity"]
-        fake_llama_state.props_body = {"default_generation_settings": {"n_ctx": 32768}}
+        fake_llama_state.props_body = props_body_for(32768)
 
         response = await client.post(
             "/v1/extract", json=make_extract_request(serving_identity=expected)

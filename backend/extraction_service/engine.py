@@ -514,7 +514,8 @@ def _with_plan_block(messages: list[dict], plan_block: str) -> list[dict]:
 
     The block goes before everything a batch renders for itself, so the
     batches of one turn share a prefix that runs through the system prompt
-    and the whole block, and llama-server's prompt cache covers both.
+    and the whole block. Each call is still processed in full: every request
+    is sent with `cache_prompt` false (`_build_request`).
     """
     system, user, *rest = messages
     return [system, {**user, "content": plan_block + user["content"]}, *rest]
@@ -695,6 +696,7 @@ def _profile_of(stage: str, request: LLMRequest) -> StageRequestProfile:
         thinking_effort=None if thinking is None else thinking.effort,
         thinking_enabled=None if thinking is None else thinking.enabled,
         thinking_budget_tokens=None if thinking is None else thinking.budget_tokens,
+        cache_prompt=request.cache_prompt,
     )
 
 
@@ -770,14 +772,18 @@ class ExtractionEngine:
         off, since that switch is a component of its own. The turn plan call
         has no entry: it is sent as stage `extract`, with that stage's cap and
         thinking controls, and differs from a batch only in its messages and
-        in which schema constrains it.
+        in which schema constrains it. The date is left out too: it is the
+        turn's, and no profile field.
         """
         builders = {
             "scope": self._scope_request,
             "extract": self._extract_request,
             "derive": self._derive_request,
         }
-        return tuple(_profile_of(stage, builders[stage](messages=[])) for stage in REQUEST_STAGES)
+        return tuple(
+            _profile_of(stage, builders[stage](messages=[], current_date=None))
+            for stage in REQUEST_STAGES
+        )
 
     async def run(
         self, req: ExtractRequest, *, serving_identity: str | None = None
@@ -860,12 +866,22 @@ class ExtractionEngine:
         """Settings override the active adapter's default, when set."""
         return self._settings.constrained_mode or self._adapter.default_constrained_mode
 
-    def _build_request(self, *, messages: list[dict], max_tokens: int, schema: dict) -> LLMRequest:
+    def _build_request(
+        self, *, messages: list[dict], max_tokens: int, schema: dict, current_date: str | None
+    ) -> LLMRequest:
         """Build a model-agnostic LLMRequest for one stage call.
 
         The adapter's `prepare()` still needs to run on the result to add
         thinking controls -- this only sets the fields common to every
         stage plus the constrained-decoding fields.
+
+        Every request is sent with `cache_prompt` false, so llama-server
+        processes the prompt from its first token: a reused prefix's values
+        depend on the batch shape that computed them, so a call's output would
+        depend on the calls before it. `current_date` is the turn's reference
+        date, `YYYY-MM-DD`, which the shipped gpt-oss chat template writes as
+        the system message's date in place of the server's clock; None sends
+        no date.
         """
         mode = self._resolve_constrained_mode()
         return LLMRequest(
@@ -874,21 +890,27 @@ class ExtractionEngine:
             max_tokens=max_tokens,
             json_mode=(mode == "json_object"),
             response_schema=schema if mode == "schema" else None,
+            cache_prompt=False,
+            current_date=current_date,
         )
 
-    def _scope_request(self, *, messages: list[dict]) -> LLMRequest:
-        """Stage 1.5's request for `messages`, prepared by the adapter."""
+    def _scope_request(self, *, messages: list[dict], current_date: str | None) -> LLMRequest:
+        """Stage 1.5's request for `messages` on `current_date`, prepared by the adapter."""
         request = self._build_request(
-            messages=messages, max_tokens=self.stage_cap("scope"), schema=SCOPE_OUTPUT_SCHEMA
+            messages=messages,
+            max_tokens=self.stage_cap("scope"),
+            schema=SCOPE_OUTPUT_SCHEMA,
+            current_date=current_date,
         )
         return self._adapter.prepare(request, stage="scope")
 
-    def _extract_request(self, *, messages: list[dict]) -> LLMRequest:
-        """Stage 2's request for `messages`, prepared by the adapter."""
+    def _extract_request(self, *, messages: list[dict], current_date: str | None) -> LLMRequest:
+        """Stage 2's request for `messages` on `current_date`, prepared by the adapter."""
         request = self._build_request(
             messages=messages,
             max_tokens=self.stage_cap("extract"),
             schema=dict(self._pack.extraction_schema),
+            current_date=current_date,
         )
         return self._adapter.prepare(request, stage="extract")
 
@@ -906,7 +928,7 @@ class ExtractionEngine:
         )
         return [{"role": "system", "content": system_prompt}, *messages[1:]]
 
-    def _plan_request(self, *, messages: list[dict]) -> LLMRequest:
+    def _plan_request(self, *, messages: list[dict], current_date: str | None) -> LLMRequest:
         """The turn plan's request for `messages`, prepared by the adapter as stage `extract`.
 
         The plan is part of Stage 2, made with the extract stage's cap and
@@ -917,15 +939,17 @@ class ExtractionEngine:
             messages=messages,
             max_tokens=self.stage_cap("extract"),
             schema=PLAN_OUTPUT_SCHEMA,
+            current_date=current_date,
         )
         return self._adapter.prepare(request, stage="extract")
 
-    def _derive_request(self, *, messages: list[dict]) -> LLMRequest:
-        """Stage 9's request for `messages`, prepared by the adapter."""
+    def _derive_request(self, *, messages: list[dict], current_date: str | None) -> LLMRequest:
+        """Stage 9's request for `messages` on `current_date`, prepared by the adapter."""
         request = self._build_request(
             messages=messages,
             max_tokens=self.stage_cap("derive"),
             schema=DERIVATION_OUTPUT_SCHEMA,
+            current_date=current_date,
         )
         return self._adapter.prepare(request, stage="derive")
 
@@ -1001,7 +1025,10 @@ class ExtractionEngine:
             return ScopeOut(label="unknown", confidence=0.0), None
 
         start = time.perf_counter()
-        request = self._scope_request(messages=render_scope_messages(pre_processed))
+        request = self._scope_request(
+            messages=render_scope_messages(pre_processed),
+            current_date=pre_processed.reference_date.strftime("%Y-%m-%d"),
+        )
 
         try:
             response = await self._invoke(request)
@@ -1069,10 +1096,11 @@ class ExtractionEngine:
         """The turn's one plan call, over all of `units`. Never raises on a failed plan.
 
         The call goes out under the system message the batches use, rendered
-        for the same reference date, so llama-server's cached prefix holds
-        from the plan call through every batch. It is made once: an
-        unparsable plan gets no repair retry and a plan cut short at the cap
-        is not split, because the batches extract the same turn without it.
+        for the same reference date, and like every call it is processed in
+        full, since every request is sent with `cache_prompt` false. It is
+        made once: an unparsable plan gets no repair retry and a plan cut
+        short at the cap is not split, because the batches extract the same
+        turn without it.
 
         A call that fails at the transport, times out, stops at its output
         cap or returns a plan the strict parser rejects logs one
@@ -1092,7 +1120,10 @@ class ExtractionEngine:
             context=context,
             subject_scope=pre_processed.metadata.get("subject_scope", "unknown"),
         )
-        request = self._plan_request(messages=[system, {"role": "user", "content": user}])
+        request = self._plan_request(
+            messages=[system, {"role": "user", "content": user}],
+            current_date=pre_processed.reference_date.strftime("%Y-%m-%d"),
+        )
 
         payload: dict[str, Any] | None = None
         response: LLMResponse | None = None
@@ -1194,7 +1225,10 @@ class ExtractionEngine:
         for attempt in range(1, self._settings.max_attempts + 1):
             run.calls += 1
             run.attempts = max(run.attempts, attempt)
-            request = self._extract_request(messages=messages)
+            request = self._extract_request(
+                messages=messages,
+                current_date=batch.pre_processed.reference_date.strftime("%Y-%m-%d"),
+            )
 
             try:
                 response = await self._invoke(request, stream=True)
@@ -1253,7 +1287,8 @@ class ExtractionEngine:
                 signal_types=req.derivation.signal_types,
                 matched_patterns=req.derivation.matched_patterns,
                 existing_internal_entities=req.derivation.existing_internal_entities,
-            )
+            ),
+            current_date=parse_recorded_at(req.recorded_at).strftime("%Y-%m-%d"),
         )
 
         try:

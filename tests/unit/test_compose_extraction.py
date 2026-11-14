@@ -85,6 +85,11 @@ SERVER_SETTING_EXCLUSIONS: dict[str, str] = {
         "Keyed through EXTRACTION_MODEL_FILE: one expression feeds both, and "
         "`model_path_problems` pins them equal."
     ),
+    "LLAMA_ARG_CHAT_TEMPLATE_FILE": (
+        "The file's bytes change the output, not its path, and the service checks the "
+        "bytes: it withholds its serving identity unless `/props` serves the template "
+        "whose sha256 `CHAT_TEMPLATE_SHA256` pins for its adapter."
+    ),
 }
 
 # Command flags -> the `EXTRACTION_SERVER_<NAME>` each is declared as. An env var
@@ -583,6 +588,69 @@ class TestServerSettingExclusions:
         names = {key.upper() for key in required_server_keys()}
         assert names == {"IMAGE", "DEVICE", "CTX_SIZE"}
         assert names <= EXPECTED_SERVER_DECLARATIONS
+
+
+# T62: llama-server loads gpt-oss's chat template from the repository, so the
+# system message's date is the request's, not the server clock's.
+CHAT_TEMPLATE_DIR = REPO_ROOT / "docker" / "extraction" / "chat_templates"
+CHAT_TEMPLATE_MOUNT = "/chat-templates"
+CHAT_TEMPLATE_FILE = f"{CHAT_TEMPLATE_MOUNT}/gpt-oss.jinja"
+
+
+def chat_template_mount_problems(llm: dict, compose_dir: Path) -> list[str]:
+    """The service must mount the repository's template directory read-only and load its file.
+
+    A bind mount's source is resolved against the compose file's own directory,
+    as compose resolves it.
+    """
+    problems: list[str] = []
+    template_file = _env_dict(llm).get("LLAMA_ARG_CHAT_TEMPLATE_FILE")
+    if template_file != CHAT_TEMPLATE_FILE:
+        problems.append(f"LLAMA_ARG_CHAT_TEMPLATE_FILE={template_file!r} != {CHAT_TEMPLATE_FILE!r}")
+    mounts = [
+        str(entry).split(":")
+        for entry in llm.get("volumes", [])
+        if str(entry).split(":")[1:2] == [CHAT_TEMPLATE_MOUNT]
+    ]
+    if len(mounts) != 1:
+        problems.append(f"{len(mounts)} volumes mount {CHAT_TEMPLATE_MOUNT}, not one")
+        return problems
+    source, _target, *options = mounts[0]
+    if (compose_dir / source).resolve() != CHAT_TEMPLATE_DIR:
+        problems.append(f"{source!r} is not the repository's docker/extraction/chat_templates")
+    if options != ["ro"]:
+        problems.append(f"{CHAT_TEMPLATE_MOUNT} is mounted with {options!r}, not read-only")
+    return problems
+
+
+class TestTheChatTemplateIsLoadedFromTheRepository:
+    def test_the_local_llm_loads_the_shipped_template(self) -> None:
+        assert _env_dict(_local_llm())["LLAMA_ARG_CHAT_TEMPLATE_FILE"] == CHAT_TEMPLATE_FILE
+
+    def test_the_local_llm_mounts_the_template_directory_read_only(self) -> None:
+        assert "./docker/extraction/chat_templates:/chat-templates:ro" in _local_llm()["volumes"]
+        assert chat_template_mount_problems(_local_llm(), COMPOSE_PATH.parent) == []
+
+    def test_the_mounted_directory_holds_the_loaded_file(self) -> None:
+        assert (CHAT_TEMPLATE_DIR / "gpt-oss.jinja").is_file()
+
+    def test_the_check_can_fail(self) -> None:
+        llm = {"environment": ["LLAMA_ARG_CHAT_TEMPLATE_FILE=/x.jinja"], "volumes": ["./a:/b"]}
+
+        assert chat_template_mount_problems(llm, COMPOSE_PATH.parent) == [
+            "LLAMA_ARG_CHAT_TEMPLATE_FILE='/x.jinja' != '/chat-templates/gpt-oss.jinja'",
+            "0 volumes mount /chat-templates, not one",
+        ]
+
+    def test_a_writable_mount_fails_the_check(self) -> None:
+        llm = {
+            "environment": [f"LLAMA_ARG_CHAT_TEMPLATE_FILE={CHAT_TEMPLATE_FILE}"],
+            "volumes": ["./docker/extraction/chat_templates:/chat-templates"],
+        }
+
+        assert chat_template_mount_problems(llm, COMPOSE_PATH.parent) == [
+            "/chat-templates is mounted with [], not read-only"
+        ]
 
 
 class TestLocalLlmHasNoCudaCache:

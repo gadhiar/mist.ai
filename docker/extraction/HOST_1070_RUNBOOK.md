@@ -252,7 +252,8 @@ ctx-size default:
 | 14 | 6840 MiB | 1352 MiB | 481 | 14.9 | 51.8 s |
 
 No swap at any of these values. Idle VRAM is about 7560 MiB at `ncmoe=12`.
-The prompt cache works. Entity count varies slightly across `ncmoe` (4 vs 3
+The prompt cache works, though since T62 the service sends every request
+uncached (`docker/extraction/README.md`, "Repeatable calls"). Entity count varies slightly across `ncmoe` (4 vs 3
 entities on a fixed test conversation); relationships are identical. Prompt
 throughput across the sweep is approximately 500 t/s (the earlier recorded
 ~155 t/s figure was measured at the old ctx-8192/406-token setup and is

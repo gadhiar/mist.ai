@@ -97,18 +97,22 @@ on for this model; `EXTRACTION_REASONING_EFFORT` controls how much
 (see "Medium by default (local)"); the host file keeps `low`, the T0 brief's
 default.
 
-**Switching to the Qwen fallback (Qwen3.5-9B) is an env change only** --
-no code, no compose structure change:
+**Switching to the Qwen fallback (Qwen3.5-9B)** needs no code change. It
+sets three variables:
 
     EXTRACTION_MODEL_FILE=unsloth/Qwen3.5-9B-Q8_0.gguf   # scripts/model_bench arm c5's gguf
     EXTRACTION_ADAPTER=qwen
     EXTRACTION_MODEL_HASH=qwen-3.5-9b-q8-<your-suffix>   # any string; it defines the epoch
 
-Qwen has no `-ncmoe`/CPU-MoE story (arm `c5` runs it full-card, no
-`params_required: ["ncmoe"]`), so also drop `-ncmoe`/`-lm none`/`-b`/`-ub`
-overrides from the llama-server command if you switch -- this repo has not
-measured Qwen3.5-9B under CPU-MoE offload because the model has no MoE
-experts to offload.
+and edits the llama-server service. Qwen has no `-ncmoe`/CPU-MoE story (arm
+`c5` runs it full-card, no `params_required: ["ncmoe"]`), so drop the
+`-ncmoe`/`-lm none`/`-b`/`-ub` overrides from the llama-server command --
+this repo has not measured Qwen3.5-9B under CPU-MoE offload because the
+model has no MoE experts to offload. Drop `LLAMA_ARG_CHAT_TEMPLATE_FILE` and
+the `/chat-templates` mount too, so llama-server serves the template the
+Qwen file embeds: the shipped template is gpt-oss's (see "Repeatable
+calls"), and the service gives a qwen or gemma adapter served it no serving
+identity.
 
 Environment variables
 ----------------------
@@ -204,6 +208,10 @@ real `--help` capture for this build.
   GPU), same convention `mist-llm` uses.
 - `LLAMA_ARG_JINJA=1` -- jinja templating on (line 626; already the
   server's own default, set explicitly for clarity, same as `mist-llm`).
+- `LLAMA_ARG_CHAT_TEMPLATE_FILE=/chat-templates/gpt-oss.jinja` -- the
+  shipped gpt-oss template, mounted read-only from
+  `docker/extraction/chat_templates/`, in place of the one the model file
+  embeds. See "Repeatable calls".
 - `LLAMA_ARG_REASONING=on` (`-rea`, line 636) -- forces reasoning on rather
   than relying on `-rea auto`'s "detect from template" behavior, which this
   worker cannot verify live (no GPU/docker). Matches
@@ -257,6 +265,59 @@ honours the per-request budget is not measured here.
 `tests/unit/test_compose_extraction_host.py` (host) each assert
 `--reasoning-budget` is absent from their own llama-server command.
 
+Repeatable calls
+----------------
+
+Since T62, two runs of one configuration over the same turns send the same
+bytes and have each prompt processed the same way, whatever ran before them
+and on whatever day they run. Two settings make that so.
+
+**Every request is sent uncached.** Each request the service sends carries
+`cache_prompt: false`, at every stage, with no setting to change it. With the
+field true, llama-server's default, a prompt that shares a prefix with what
+the slot or the RAM cache holds is processed from the end of that prefix, and
+llama.cpp's own note on the field says the logits "are **not** guaranteed to
+be bit-for-bit identical for different batch sizes (prompt processing vs.
+token generation)" (llama.cpp b11151 `tools/server/README.md:587`). How much
+of a prompt was reused depended on the request before it, so one changed
+request could change every later output of a run. With the field false,
+llama-server processes every prompt from its first token. The cost is the
+prompt processing the cache saved: about 3.8 minutes on a 40-probe dev-lists
+run on the 4070 SUPER, and about 27 s per 13,075-token extract call on the
+1070 at its measured 483 tokens/s. `--cache-ram` stays as declared: with the
+field false it changes no output.
+
+**The system message's date is the turn's.** gpt-oss's chat template, as the
+model file embeds it, writes llama-server's clock date into every prompt
+(`strftime_now`), so a run on another day sent other bytes in every request.
+Both llama-servers instead load `docker/extraction/chat_templates/gpt-oss.jinja`
+(`LLAMA_ARG_CHAT_TEMPLATE_FILE`, mounted read-only at `/chat-templates`). It
+is the model's template byte for byte, with two edits: the date line reads
+the request's `chat_template_kwargs.current_date`, and renders no date line
+when a request sends none; and the assistant-content check that llama.cpp
+b11151 rewrites at load is rewritten in the file, so `/props` serves the
+file's bytes. The service sends the turn's reference date, the one the
+extraction prompt's `Today's date:` already states, as `current_date` on
+every request.
+
+**The service refuses another template.** It reads the sha256 of the
+template `/props` serves on every `/v1/info` and `/v1/extract` call. Under the
+gpt-oss adapter, a llama-server that serves any other template, the model's
+own included, or none, gets no serving identity, and
+`serving_identity_error` names the served hash, or none, and the pinned one; a qwen or gemma adapter served the
+gpt-oss template gets none either. A host that runs this service with an
+older compose file is refused this way rather than writing results under the
+clock's date.
+
+**Changing the template file.** Edit the file, then re-pin
+`CHAT_TEMPLATE_SHA256` in `backend/extraction_service/adapters.py` and the
+provenance test `tests/unit/extraction_service/test_chat_template.py`
+together, in the same commit. The provenance test reverses the two edits and
+checks the result against the sha256 of the model's own template; an edit
+beyond them needs that test changed to say what it is. pre-commit's
+`end-of-file-fixer` excludes the file, which ends without a newline as the
+model's does.
+
 Declared llama-server settings (`EXTRACTION_SERVER_*`)
 --------------------------------------------------------
 
@@ -303,7 +364,9 @@ flag and its declaration together.
   (transport), `LLAMA_ARG_METRICS`, `--no-webui` (UI and metrics), `-lm none`
   (the same weight bytes, loaded without mmap), `CUDA_CACHE_PATH` and
   `CUDA_CACHE_MAXSIZE` (a cache of the same PTX compile; the device is keyed),
-  and `LLAMA_ARG_MODEL`, which is keyed through `EXTRACTION_MODEL_FILE`.
+  `LLAMA_ARG_MODEL`, which is keyed through `EXTRACTION_MODEL_FILE`, and
+  `LLAMA_ARG_CHAT_TEMPLATE_FILE`: the file's bytes change the output, not its
+  path, and the service checks the bytes (see "Repeatable calls").
 
 **Changing any declared setting starts a new extraction epoch.** That
 includes `EXTRACTION_LLM_DEVICE`, `EXTRACTION_LLM_CTX_SIZE`, the ncmoe value
@@ -513,7 +576,8 @@ on the GTX 1070 (Pascal, 8 GB):
 | 14 | 6840 MiB | 1352 MiB | 481 | 14.9 | 51.8 s |
 
 No swap at any of these values. Idle VRAM is about 7560 MiB at `ncmoe=12`.
-The prompt cache works. Entity count varies slightly across `ncmoe` (4 vs 3
+The prompt cache works, though since T62 the service sends every request
+uncached (see "Repeatable calls"). Entity count varies slightly across `ncmoe` (4 vs 3
 entities on a fixed test conversation); relationships are identical. Prompt
 throughput across the sweep is approximately 500 t/s (the previously
 recorded ~155 t/s figure was measured at the old ctx-8192/406-token setup

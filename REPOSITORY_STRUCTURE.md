@@ -67,6 +67,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 ### Container builds (`docker/`)
 - `backend/` - The `mist-backend` Dockerfile
 - `extraction/` - The extraction service image, its host-1070 compose file and runbook
+- `extraction/chat_templates/` - The gpt-oss chat template both extraction llama-servers load: the model's own, with the system message's date taken from the request
 - `ollama/` - `init-models.sh`
 - `speech-bench/` - Dockerfiles and pinned requirements of the four speech-bench images (base, asr, pocket, qwen3)
 

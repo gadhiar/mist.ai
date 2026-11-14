@@ -65,7 +65,11 @@ repos:
         # hook, so both patterns are combined into a single regex).
         exclude: (\.md$|^tests/unit/model_bench/fixtures/host/llama_server_help_b\d+\.txt$)
       - id: end-of-file-fixer
-        exclude: \.md$
+        # docker/extraction/chat_templates/gpt-oss.jinja is gpt-oss's own chat
+        # template, which ends without a newline, with two edits; a newline added
+        # here would change the bytes llama-server serves and the service checks
+        # (tests/unit/extraction_service/test_chat_template.py).
+        exclude: (\.md$|^docker/extraction/chat_templates/gpt-oss\.jinja$)
       - id: check-yaml
       - id: check-toml
       - id: check-json

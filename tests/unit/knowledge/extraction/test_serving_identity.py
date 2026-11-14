@@ -85,6 +85,8 @@ _SCALAR_FIELDS = [
     if f.name not in ("requests", "server")
 ]
 _PROFILE_FIELDS = [f.name for f in dataclasses.fields(StageRequestProfile) if f.name != "stage"]
+# Profile fields left out of the flat form at their default, None (T62's cache flag).
+_OMITTED_WHEN_NONE = {"cache_prompt"}
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +141,7 @@ class TestComponentsDict:
                 f"request.{stage}.{name}": getattr(_profile(stage), name)
                 for stage in REQUEST_STAGES
                 for name in _PROFILE_FIELDS
+                if name not in _OMITTED_WHEN_NONE
             },
             "server.ctx_size": "16384",
             "server.device": "rtx4070s",
@@ -146,8 +149,14 @@ class TestComponentsDict:
         }
 
     def test_every_profile_field_is_flattened(self):
-        """Derived from the dataclass, so a field added later is flattened too."""
-        flat = components_dict(_components())
+        """Derived from the dataclass, so a field added later is flattened too.
+
+        A field left out at its default is flattened once it is set.
+        """
+        sent = {name: False for name in _OMITTED_WHEN_NONE}
+        flat = components_dict(
+            _components(requests=tuple(_profile(stage, **sent) for stage in REQUEST_STAGES))
+        )
 
         for stage in REQUEST_STAGES:
             for name in _PROFILE_FIELDS:
@@ -248,6 +257,37 @@ class TestTurnPlanComponent:
         on = components_dict(_components(turn_plan=True))
 
         assert diff_components(off, on) == ["turn_plan: <missing> != true"]
+
+
+# ---------------------------------------------------------------------------
+# The prompt-cache flag (T62): absent when not sent, so earlier identities do not move
+# ---------------------------------------------------------------------------
+
+
+def _with_cache_prompt(value: bool | None) -> ServingIdentityComponents:
+    return _components(
+        requests=tuple(_profile(stage, cache_prompt=value) for stage in REQUEST_STAGES)
+    )
+
+
+class TestCachePromptComponent:
+    def test_it_is_not_sent_by_default(self):
+        assert _profile("scope").cache_prompt is None
+
+    def test_not_sent_flattens_as_before_the_field_existed(self):
+        assert components_dict(_with_cache_prompt(None)) == _FLAT_WITHOUT_TURN_PLAN
+        assert compute_serving_identity(_with_cache_prompt(None)) == _IDENTITY_WITHOUT_TURN_PLAN
+
+    def test_false_adds_one_key_per_stage(self):
+        assert components_dict(_with_cache_prompt(False)) == {
+            **_FLAT_WITHOUT_TURN_PLAN,
+            "request.scope.cache_prompt": False,
+            "request.extract.cache_prompt": False,
+            "request.derive.cache_prompt": False,
+        }
+
+    def test_false_moves_the_identity(self):
+        assert compute_serving_identity(_with_cache_prompt(False)) != _IDENTITY_WITHOUT_TURN_PLAN
 
 
 # ---------------------------------------------------------------------------

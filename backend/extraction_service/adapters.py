@@ -7,6 +7,15 @@ stripping any family-specific markup (Harmony channel tags, a leading
 `<think>` block). Swapping models is a configuration change: pick a
 different `adapter_name` via `get_adapter()`, plus a different model file
 and `model_hash` -- no engine code changes.
+
+`CHAT_TEMPLATE_SHA256` pins the chat template an adapter's llama-server must
+serve, and `chat_template_problem` says when `/props` serves another. The
+gpt-oss template the model file embeds writes the server's clock date into
+every prompt, so llama-server loads the repository's copy
+(`docker/extraction/chat_templates/gpt-oss.jinja`), which writes the request's
+`current_date` instead; the service gives no serving identity while another
+template is served. The pin is a module-level mapping, not an adapter
+attribute, because the adapters are slots dataclasses.
 """
 
 from __future__ import annotations
@@ -200,6 +209,46 @@ _ADAPTERS: dict[str, type] = {
     "qwen": QwenAdapter,
     "gemma": GemmaAdapter,
 }
+
+# The sha256 of the chat template each adapter's llama-server must serve on
+# `/props`, as the UTF-8 bytes of its `chat_template` string. gptoss's is
+# `docker/extraction/chat_templates/gpt-oss.jinja`; re-pin it with that file's
+# provenance test (tests/unit/extraction_service/test_chat_template.py) in the
+# commit that edits the file. Qwen and gemma pin none.
+CHAT_TEMPLATE_SHA256: dict[str, str] = {
+    "gptoss": "a7dd4be8cc1fcefeab5348d597d1064731af053a9a8ba3ab61fdc8bc8cff62f6",
+}
+
+
+def chat_template_problem(adapter_name: str, served_sha256: str | None) -> str | None:
+    """Why the chat template llama-server serves is wrong for `adapter_name`, or None.
+
+    An adapter `CHAT_TEMPLATE_SHA256` pins must be served exactly that
+    template; any other, or none, is a problem. A registered adapter it does
+    not pin must not be served another adapter's pinned template, so a switch
+    to qwen that keeps gpt-oss's template is refused. A name `_ADAPTERS` does
+    not register gets no check.
+
+    Args:
+        adapter_name: The engine's adapter name.
+        served_sha256: The sha256 of the template `/props` serves, or None
+            when it serves none.
+    """
+    if adapter_name not in _ADAPTERS:
+        return None
+    expected = CHAT_TEMPLATE_SHA256.get(adapter_name)
+    if expected is not None:
+        if served_sha256 == expected:
+            return None
+        observed = "none" if served_sha256 is None else served_sha256
+        return f"served chat template sha256 {observed} != the {adapter_name} adapter's {expected}"
+    for owner, pinned in CHAT_TEMPLATE_SHA256.items():
+        if served_sha256 == pinned:
+            return (
+                f"served chat template sha256 {served_sha256} is the {owner} adapter's, "
+                f"not the {adapter_name} adapter's"
+            )
+    return None
 
 
 def get_adapter(
