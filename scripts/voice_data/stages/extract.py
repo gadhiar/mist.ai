@@ -13,7 +13,11 @@ The order is Design 4's:
    best 3 s VAD speech windows to the solo clips, else to its own timestamp anchors, cut from its
    own output; the best is kept and the downmix goes through it too.
 3. The anchors must agree, timestamp anchors cut from their source's chosen output; else the run
-   stops with the result `anchors-disagree` (the host exits 3).
+   stops with the result `anchors-disagree` (the host exits 3). When `seed/sdh/` is mounted, the
+   SDH spans `stages/sdh.py` holds as anchors are cut the same way and checked against the
+   centroid of these anchors: one below the Anchors gate on either embedder is dropped and
+   counted, and the rest join the anchor centroid that retrieval uses. They never enter the
+   agreement check, so they can neither cause nor mask `anchors-disagree`.
 4. Diarization on the separated centre channel; the first retrieval pass names each episode's
    primary and flagged clusters; the target model and the 1.5 s window model are built from
    primary turns that touch no overlap.
@@ -60,6 +64,7 @@ from ..commands import extract as contract
 from ..records import Prosody, SegmentRecord
 from ..states import SPEAKING_STATES
 from . import propose_states, retrieve, segments
+from . import sdh as sdh_stage
 from .ingest import decode_argv
 from .prosody import prosody as measure_prosody
 
@@ -207,6 +212,8 @@ class SourceWork:
     offcentre_embs: list[retrieve.Embedding]
     roles: dict[str, retrieve.ClusterRole] = field(default_factory=dict)
     rivals: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    # One per SDH anchor span of the source, in order; `None` when the cut is too short to embed.
+    sdh_embs: list[retrieve.Embedding | None] = field(default_factory=list)
 
     @property
     def channels(self) -> tuple[str, ...]:
@@ -450,6 +457,12 @@ class Extraction:
         self.sources = _sources(self.plan)
         self.by_id = {s.source_id: s for s in self.sources}
         self.anchors = _timestamp_anchors(self.plan, set(self.by_id))
+        try:
+            self.sdh = sdh_stage.read_spans(
+                data, self.by_id, self.limits.anchor_min_s, self.limits.anchor_max_s
+            )
+        except sdh_stage.StageError as exc:
+            raise StageError(str(exc)) from exc
         self.clips = reference_clips(data)
         self.separators = {s.name: s for s in models.separators}
         self.rules = propose_states.load_rules()
@@ -513,6 +526,7 @@ class Extraction:
             )
         main = channels[source.primary_channel]
         anchors = self._anchor_cuts(source.source_id, main, rate)
+        sdh_embs = self._sdh_cuts(source.source_id, main, rate)
         turns = sorted(self.models.diarizer.turns(main, rate), key=lambda t: t.start_s)
         overlaps = list(self.models.diarizer.overlaps(main, rate))
         speech = {name: list(self.models.vad.speech(a, rate)) for name, a in channels.items()}
@@ -553,8 +567,73 @@ class Extraction:
             quality=quality,
             offcentre=offcentre,
             offcentre_embs=offcentre_embs,
+            sdh_embs=sdh_embs,
         )
         return work, anchors
+
+    def _sdh_cuts(self, sid: str, audio: np.ndarray, rate: int) -> list[retrieve.Embedding | None]:
+        # Cut from the chosen separator's output, as Raj's timestamp anchors are. A span that
+        # runs past the track's end yields a short cut, which is dropped rather than embedded.
+        spans = self.sdh.get(sid)
+        if spans is None:
+            return []
+        found: list[retrieve.Embedding | None] = []
+        for span in spans.anchors:
+            clip = cut(audio, rate, Span(span.start_s, span.end_s))
+            long_enough = len(clip) >= self.limits.anchor_min_s * rate - 1
+            found.append(self._embed(clip, rate) if long_enough else None)
+        return found
+
+    def _sdh_anchors(
+        self, works: Sequence[SourceWork], anchors: Sequence[retrieve.Embedding]
+    ) -> tuple[dict[str, np.ndarray], dict[str, int] | None]:
+        """Return the anchor centroid retrieval uses, and the SDH counts for the report.
+
+        Each SDH anchor's SIM is taken to the centroid of Raj's anchors alone, his ground truth;
+        one below the Anchors gate on either embedder is dropped.
+        """
+        own = retrieve.centroids(anchors)
+        if not self.sdh:
+            return own, None
+        floor = self.limits.anchor_sim_min - retrieve.EPS
+        joined: list[retrieve.Embedding] = []
+        dropped = dropped_offscreen = 0
+        for work in works:
+            spans = self.sdh.get(work.source.source_id)
+            if spans is None:
+                continue
+            for span, emb in zip(spans.anchors, work.sdh_embs, strict=True):
+                if emb is not None and all(v >= floor for v in retrieve.sims(emb, own).values()):
+                    joined.append(emb)
+                else:
+                    dropped += 1
+                    dropped_offscreen += span.offscreen
+        every = list(self.sdh.values())
+
+        def total(name: str) -> int:
+            return sum(len(getattr(s, name)) for s in every)
+
+        def offscreen(name: str) -> int:
+            return sum(span.offscreen for s in every for span in getattr(s, name))
+
+        counts = {
+            "sources": len(every),
+            "found": sum(s.found for s in every),
+            "found_offscreen": sum(s.found_offscreen for s in every),
+            "multi": sum(s.multi for s in every),
+            "merged": total("merged"),
+            "merged_offscreen": offscreen("merged"),
+            "kept": total("kept"),
+            "kept_offscreen": offscreen("kept"),
+            "held_out": total("held_out"),
+            "held_out_offscreen": offscreen("held_out"),
+            "anchors": total("anchors"),
+            "dropped": dropped,
+            "dropped_offscreen": dropped_offscreen,
+            "joined": len(joined),
+        }
+        print(f"extract: sdh anchors {len(joined)} joined, {dropped} dropped")
+        return retrieve.centroids([*anchors, *joined]), counts
 
     def _load(self, work: SourceWork) -> dict[str, np.ndarray]:
         return {name: np.load(path, mmap_mode="r") for name, path in work.scratch.items()}
@@ -607,7 +686,10 @@ class Extraction:
             detail = {"anchors": self._anchor_rows(anchor_sims)}
             if not agree:
                 return self._result("anchors-disagree", detail, written)
-            return self._retrieve(works, retrieve.centroids(anchors), detail, written)
+            centroid, sdh_counts = self._sdh_anchors(works, anchors)
+            if sdh_counts is not None:
+                detail["sdh"] = sdh_counts
+            return self._retrieve(works, centroid, detail, written)
 
     def _anchor_rows(self, sims: Sequence[Mapping[str, float]]) -> list[dict[str, object]]:
         names = [f"clip-{i}" for i in range(1, len(self.clips) + 1)]
@@ -1034,6 +1116,7 @@ class Extraction:
                 "timestamps": len(self.anchors),
                 "sim": detail.get("anchors", []),
             },
+            "sdh": detail.get("sdh"),
             "rehearsal": None,
             "thresholds": dict(sorted(self.thresholds.items())),
         }

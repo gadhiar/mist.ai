@@ -42,6 +42,7 @@ from scripts.voice_data.records import Prosody, SegmentRecord, SourceRecord, rea
 from scripts.voice_data.stages import extract as extract_stage
 from scripts.voice_data.stages import prosody as prosody_mod
 from scripts.voice_data.stages import retrieve
+from scripts.voice_data.stages import sdh as sdh_stage
 from scripts.voice_data.stages.ingest import decode_argv
 from scripts.voice_data.stages.score import spectrum_distance_db
 from scripts.voice_data.stages.segments import span_quality
@@ -1090,6 +1091,103 @@ def test_no_canary_in_output_argv_or_written_files(tmp_path: Path) -> None:
         _assert_clean(path.read_bytes().decode("latin-1"), canaries)
         checked += 1
     assert checked >= 6
+
+
+# SDH anchors (T27), on the small episode. Her cues go through the scan stage's own parser from an
+# SRT text built here, so a planted cue text and label meet the whole path to the report.
+
+SDH_LABEL = "SPEAKER-QZV"
+# (start, end, text): target lines sit at 0.5-4.5, 4.9-8.9, 13.7-17.7, 18.1-22.1, 22.5-26.5 and
+# 31.3-35.3 s, the other voice at 9.3-13.3 and 26.9-30.9 s.
+SDH_TRACK = (
+    (0.6, 4.4, "[{label}] {text} one"),
+    (4.9, 8.9, "-[{label}] {text} two\n- Someone else."),  # multi: never a span
+    (9.4, 13.2, "[{label}]: {text} three"),  # mislabelled other voice: dropped by the check
+    (13.8, 17.6, "<i>[{label}] {text} four</i>"),  # offscreen
+    (18.2, 22.0, "[{label}] {text} five"),
+    (27.0, 30.8, "[{label}] {text} six"),  # the 5th kept span, held out: the other voice
+    (31.4, 35.2, "[{label}] {text} seven"),
+    (35.9, 36.4, "[{label}] {text} eight"),  # too short to keep
+)
+
+
+def _stamp(seconds: float) -> str:
+    return f"00:00:{seconds:06.3f}".replace(".", ",")
+
+
+def write_sdh(root: root_mod.Root, label: str = SDH_LABEL) -> None:
+    """Write `config/sdh.json` and src-0001's cue file as `sdh scan` would."""
+    text = Canaries().transcript
+    srt = "\n".join(
+        f"{n}\n{_stamp(a)} --> {_stamp(b)}\n{line.format(label=label, text=text)}\n"
+        for n, (a, b, line) in enumerate(SDH_TRACK, 1)
+    )
+    cues, total = sdh_stage.her_cues(srt, [label])
+    assert (total, len(cues)) == (8, 8)
+    (root.path / "config" / "sdh.json").write_text(json.dumps({"labels": [label]}), "utf-8")
+    write_jsonl(root, "seed/sdh/src-0001.jsonl", [c.to_json() for c in cues])
+
+
+@pytest.fixture(scope="module")
+def sdh_run(tmp_path_factory: pytest.TempPathFactory) -> Ran:
+    base = tmp_path_factory.mktemp("sdh")
+    episode = small_episode()
+    root = make_root(base, episode, clips={"solo.wav": take("target", 6.0, 1)})
+    write_sdh(root)
+    docker = StageDocker(root, models_for(episode, main_prototypes()))
+    code, out, err = extract(root, docker)
+    run_dir = root.path / "seed" / "runs" / "r1"
+    report = json.loads((run_dir / "report.json").read_text()) if code == 0 else {}
+    return Ran(root, episode, code, out, err, [], report, docker)
+
+
+def test_sdh_spans_become_checked_anchors_with_every_fifth_held_out(sdh_run: Ran) -> None:
+    assert sdh_run.code == 0, sdh_run.err
+    # Held out, the other voice at 27.0 s is never an anchor, so only the one at 9.4 s is dropped.
+    assert sdh_run.report["sdh"] == {
+        "sources": 1, "found": 8, "found_offscreen": 1, "multi": 1, "merged": 7,
+        "merged_offscreen": 1, "kept": 6, "kept_offscreen": 1, "held_out": 1,
+        "held_out_offscreen": 0, "anchors": 5, "dropped": 1, "dropped_offscreen": 0, "joined": 4,
+    }  # fmt: skip
+    assert [row["anchor"] for row in sdh_run.report["anchors"]["sim"]] == ["clip-1"]
+    assert "sdh spans: sources 1, found 8, found_offscreen 1, multi 1, merged 7" in sdh_run.out
+    assert "held_out 1, held_out_offscreen 0, anchors 5, dropped 1" in sdh_run.out
+    (argv,) = sdh_run.docker.argvs
+    assert f"{sdh_run.root.path / 'seed' / 'sdh'}:/data/seed/sdh:ro" in argv
+
+
+def test_no_sdh_cue_text_or_label_leaves_the_extract_path(sdh_run: Ran) -> None:
+    planted = {
+        sdh_run.root.path / "config" / "sdh.json",
+        sdh_run.root.path / "seed" / "reference" / "solo.wav",
+    }
+    texts = [sdh_run.out, sdh_run.err, *("\n".join(a) for a in sdh_run.docker.argvs)]
+    for path in sdh_run.root.path.rglob("*"):
+        if path.is_file() and path not in planted:
+            texts += [path.as_posix(), path.read_bytes().decode("latin-1")]
+    assert len(texts) > 8
+    for text in texts:
+        assert SDH_LABEL.lower() not in text.lower()
+        assert Canaries().transcript not in text.lower()
+
+
+def test_anchors_that_disagree_still_exit_3_with_sdh_spans(tmp_path: Path) -> None:
+    csv = "source,start_s,end_s\nshow/episode one.mkv,9.3,13.3\n"
+    root, docker = _small_root(
+        tmp_path, clips={"solo.wav": take("target", 8.0, 1)}, anchors_csv=csv
+    )
+    write_sdh(root)
+    code, out, err = extract(root, docker)
+    assert code == 3, err
+    assert "anchor clip-1" in out and "anchor time-1" in out and "anchor time-2" not in out
+
+
+def test_sdh_spans_without_seed_anchors_still_exit_2(tmp_path: Path) -> None:
+    root, docker = _small_root(tmp_path)
+    write_sdh(root)
+    code, _, err = extract(root, docker)
+    assert code == 2 and "no anchor" in err
+    assert docker.argvs == []
 
 
 def _assert_clean(text: str, canaries: Canaries) -> None:

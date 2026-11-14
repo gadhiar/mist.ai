@@ -9,6 +9,10 @@ the source relative to `seed/raw/`), or both. A row names a source by its file, 
 turns each row into a source id before the plan is written: no file name reaches the job, its
 argv or its output. No anchor at all exits 2; anchors that disagree exit 3.
 
+When `sdh scan` has run, `seed/sdh/` is mounted too and the job adds the target's SDH spans as
+extra anchors, each checked against these (`stages/sdh.py`, `stages/extract.py`). They never
+count toward either exit: SDH spans alone are no anchor.
+
 The stage imports the file names and patterns below, so host and job share one definition.
 """
 
@@ -29,6 +33,7 @@ from .. import root as root_mod
 from ..errors import GateError, InputError, JobError
 from ..records import JobInput, SourceRecord, read_json, read_jsonl, sha256_file, write_json
 from . import ingest as ingest_cmd
+from . import sdh as sdh_cmd
 
 FAMILY = "extract"
 MODULE = "scripts.voice_data.stages.extract"
@@ -213,6 +218,9 @@ def run(args: argparse.Namespace) -> int:
     inputs = [JobInput(rel=r.track, sha256=sha256_file(root.path / r.track)) for r in records]
     if clips:
         inputs.append(_reference_input(clips))
+    sdh = sdh_cmd.sdh_input(root)
+    if sdh is not None:
+        inputs.append(sdh)
     job = jobs.JobSpec(
         job_id=_job_id(root),
         family=FAMILY,
@@ -295,6 +303,7 @@ def report_lines(report: Mapping[str, object]) -> list[str]:
     lines.append(f"  kept from the downmix: {_table(report.get('channel_reasons'))}")
     lines.append(f"  one speaker: {_table(report.get('one_speaker'))}")
     lines.append(f"  purity p10 margin {_num(report.get('purity_p10'))}")
+    lines.append(f"  sdh spans: {_table(report.get('sdh'))}")
     for key in ("distribution", "windows"):
         dist = report.get(key)
         if isinstance(dist, Mapping):
