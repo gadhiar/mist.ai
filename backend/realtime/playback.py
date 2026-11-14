@@ -488,10 +488,11 @@ class _FrameAudio:
 class PlaybackPacer:
     """Frames and paces one tag's synthesized audio onto the `turn` lane.
 
-    The synthesize step hands audio over with `submit` and `finish`, and the turn's play task
-    runs `run`, which queues the frames as the lead allows and the `0x02` once all audio is
-    queued. A frame never spans two segments, so each segment starts on a frame boundary; a
-    segment's last frame may be shorter than 40 ms.
+    The synthesize step hands audio over with `submit`, `end_segment` and `finish`, and the
+    turn's play task runs `run`, which queues the frames as the lead allows and the `0x02` once
+    all audio is queued. A frame never spans two segments, so each segment starts on a frame
+    boundary; a segment's last frame may be shorter than 40 ms, and it is queued once the
+    segment is known to end: at its `end_segment`, the next segment's first chunk or `finish`.
 
     Each 0x01 is recorded in the ledger only when the turn sink's `put` returns True; a frame
     kept back is recorded by `record_flushed` when the controller later queues it. Audio that
@@ -538,6 +539,7 @@ class PlaybackPacer:
         self._max_lead_samples = config.max_lead_ms * sample_rate // 1000
         self._pending: deque[_PendingSegment] = deque()
         self._last_index: int | None = None
+        self._last_ended_segment: int | None = None  # the last segment `end_segment` closed
         self._kept: dict[int, _FrameAudio] = {}
         self._seq = 0
         self._handed = 0  # samples handed to the turn sink: the stream's sample offset
@@ -559,12 +561,15 @@ class PlaybackPacer:
         `finish`, `end_unsent` or `stop` is dropped.
 
         Raises:
-            ValueError: `segment_index` is lower than the last segment's.
+            ValueError: `segment_index` is lower than the last segment's, or `end_segment`
+                has ended it.
         """
         if self._finished or self._ended:
             return
         if self._last_index is not None and segment_index < self._last_index:
             raise ValueError(f"segment {segment_index} arrived after segment {self._last_index}")
+        if self._last_ended_segment is not None and segment_index <= self._last_ended_segment:
+            raise ValueError(f"segment {segment_index} arrived after it ended")
         tail = self._pending[-1] if self._pending else None
         if tail is None or tail.index != segment_index:
             if tail is not None:
@@ -575,6 +580,25 @@ class PlaybackPacer:
         tail.synthesized += len(chunk.pcm16) // PCM16_SAMPLE_BYTES
         self._last_index = segment_index
         self._ledger.note_synthesized(segment_index, chunk.segment, tail.synthesized)
+        self._wake.set()
+
+    def end_segment(self, segment_index: int) -> None:
+        """Segment `segment_index` has all its audio: `run` queues its last frame as the lead
+        allows, without waiting for more audio.
+
+        Without it that frame, when shorter than `frame_ms`, waits for the next segment's
+        first chunk or `finish`, so for the reply's next text and its synthesis. It does
+        nothing when no open pending segment has that index (one never submitted, or already
+        closed), and after `finish`, `end_unsent` or `stop`.
+        """
+        if self._finished or self._ended or not self._pending:
+            return
+        # Only the newest pending segment can be open: a later segment's chunk closes the rest.
+        tail = self._pending[-1]
+        if tail.index != segment_index or tail.closed:
+            return
+        tail.closed = True
+        self._last_ended_segment = segment_index
         self._wake.set()
 
     def finish(self) -> None:
