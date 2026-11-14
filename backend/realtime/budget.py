@@ -181,6 +181,95 @@ class BargeInConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PeakingBand:
+    """One peaking biquad of the character stage's EQ (RBJ Audio EQ Cookbook, `peakingEQ`).
+
+    `q` is the cookbook's Q in `alpha = sin(w0) / (2 * Q)`, not a bandwidth in octaves.
+    """
+
+    freq_hz: float
+    gain_db: float
+    q: float
+
+
+@dataclass(frozen=True, slots=True)
+class DetunedCopy:
+    """One copy of the detuned double: its pitch offset and the centre of its read delay."""
+
+    cents: float
+    delay_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class CharacterConfig:
+    """Her character stage (`backend/realtime/character.py`), set from Raj's ear tests.
+
+    The values are the ear test's (H20): a 2nd-order Butterworth high-pass, three peaking EQ
+    bands, a 4:1 compressor on the 8 ms RMS of the EQ output smoothed over 15 ms of linear gain,
+    and a detuned double of two copies, +15 cents centred 9 ms behind the dry voice and -15 cents
+    centred 14 ms behind it, each mixed at `double_gain`. Each copy's read delay sweeps within
+    `delay_ms +- sweep_ms / 2`, and its splices crossfade over `splice_ms`.
+
+    `threshold_dbfs` is absolute because a stream cannot see a whole clip: the ear test's
+    threshold was 26 dB below the maximum of the clip's own 8 ms RMS envelope, and the median of
+    that maximum on the clips Raj heard was -14.47 dBFS, so -40.47 dBFS, rounded to -40.5.
+    """
+
+    highpass_hz: float = 100.0
+    bands: tuple[PeakingBand, ...] = (
+        PeakingBand(300.0, -3.0, 1.0),
+        PeakingBand(4000.0, 4.0, 1.0),
+        PeakingBand(9000.0, 2.0, 0.8),
+    )
+    rms_window_ms: float = 8.0
+    threshold_dbfs: float = -40.5
+    ratio: float = 4.0
+    gain_smoothing_ms: float = 15.0
+    copies: tuple[DetunedCopy, ...] = (DetunedCopy(15.0, 9.0), DetunedCopy(-15.0, 14.0))
+    double_gain: float = 0.35  # per copy; Raj's pick
+    sweep_ms: float = 12.0
+    splice_ms: float = 4.0
+    # The ear test matched each clip's whole-clip RMS to its input's; a stream cannot, so a fixed
+    # gain does it for typical TTS output. Derived on a proxy for it (no clip may be read): the
+    # 200 Hz test vowel (harmonics to 11 kHz, -12 dB per octave), 3 s, under 12 syllables of a
+    # 200 ms Hann window and 50 ms of silence with peaks cycling 0, -6 and -12 dB, scaled so its
+    # EQ output's 8 ms RMS envelope peaks at -14.47 dBFS. The value is 20 * log10 of the input's
+    # RMS over the stage output's RMS with this gain at 0 dB, over the input's length, rounded to
+    # 0.1 dB: 14.853, so 14.9. `test_default_output_gain_keeps_the_input_loudness` recomputes it.
+    output_gain_db: float = 14.9
+
+    def __post_init__(self) -> None:
+        # Every frequency lies below the Nyquist frequency of the 24 kHz downlink, and each
+        # copy's shortest read stays at least 1 ms behind the input, beyond the reach of the
+        # interpolator's forward taps.
+        frequencies = (self.highpass_hz, *(band.freq_hz for band in self.bands))
+        for freq in frequencies:
+            if not 0.0 < freq < 12000.0:
+                raise ValueError(f"character stage frequency {freq} Hz must lie in (0, 12000) Hz")
+        for band in self.bands:
+            if not band.q > 0.0:
+                raise ValueError(
+                    f"peaking band at {band.freq_hz} Hz has q {band.q}; it must be > 0"
+                )
+        if not self.ratio >= 1.0:
+            raise ValueError(f"compressor ratio {self.ratio} must be at least 1")
+        if not 0.0 <= self.double_gain <= 1.0:
+            raise ValueError(f"double_gain {self.double_gain} must lie in [0, 1]")
+        if not (self.rms_window_ms > 0.0 and self.gain_smoothing_ms > 0.0 and self.splice_ms > 0.0):
+            raise ValueError("rms_window_ms, gain_smoothing_ms and splice_ms must be positive")
+        for copy in self.copies:
+            if copy.delay_ms - self.sweep_ms / 2 < 1.0:
+                raise ValueError(
+                    f"copy at {copy.cents} cents reads as little as "
+                    f"{copy.delay_ms - self.sweep_ms / 2} ms behind; the least is 1 ms"
+                )
+        if not self.splice_ms < self.sweep_ms / 2:
+            raise ValueError(
+                f"splice_ms {self.splice_ms} must be below half of sweep_ms {self.sweep_ms}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PlaybackConfig:
     """Downlink pacing and the client's playback buffer."""
 
