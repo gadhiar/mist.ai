@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import server
+from backend.chat.conversation_handler import CapabilityOnlyTurn
 from backend.chat.stream_events import Complete, Token, WSEvent
 from backend.config import VoiceConfig
 from backend.errors import GpuYieldedError
@@ -391,6 +392,16 @@ class ScriptedCapabilityHandler:
         return self.answer
 
 
+_SUPERSEDED = {
+    "type": "action_resolved",
+    "proposal_id": "p1",
+    "session_id": "s1",
+    "decision": "superseded",
+    "outcomes": [],
+}
+_UNHANDLED = CapabilityOnlyTurn(handled=False, events=())
+
+
 def _answered_events() -> list:
     return [
         WSEvent(payload=dict(_STARTED)),
@@ -398,6 +409,29 @@ def _answered_events() -> list:
         Token(text=_REPLY),
         Complete(final_response=_REPLY, tool_calls_used=1, duration_ms=3.0),
     ]
+
+
+def _answered_turn() -> CapabilityOnlyTurn:
+    return CapabilityOnlyTurn(handled=True, events=tuple(_answered_events()))
+
+
+class GatedQueue(asyncio.Queue):
+    """A queue whose every put waits for `gate`, so a test can see whether a writer waited."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+
+    async def put(self, item) -> None:
+        await self.gate.wait()
+        await super().put(item)
+
+
+def _drain_now(queue: asyncio.Queue) -> list:
+    items = []
+    while not queue.empty():
+        items.append(queue.get_nowait())
+    return items
 
 
 def _trim(text: str) -> str:
@@ -459,7 +493,7 @@ def _comparable(messages: list[dict]) -> list[dict]:
 @pytest.mark.asyncio
 async def test_a_handled_capability_turn_streams_like_a_text_turn():
     queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_answered_events())
+    handler = ScriptedCapabilityHandler(_answered_turn())
     processor, model_calls = _processor(queue, handler)
 
     answered = await asyncio.to_thread(
@@ -498,7 +532,7 @@ async def test_a_handled_capability_turn_streams_like_a_text_turn():
 @pytest.mark.asyncio
 async def test_an_unhandled_capability_turn_sends_nothing_and_calls_no_model():
     queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(None)
+    handler = ScriptedCapabilityHandler(_UNHANDLED)
     processor, model_calls = _processor(queue, handler)
 
     answered = await asyncio.to_thread(
@@ -514,6 +548,57 @@ async def test_an_unhandled_capability_turn_sends_nothing_and_calls_no_model():
     assert model_calls == []
     assert queue.empty()
     assert not processor.generation_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_an_unhandled_capability_turn_sends_what_its_pre_llm_step_drained():
+    # A message that superseded a live proposal is still refused, but every client must
+    # learn that the proposal is gone; the payload is on the queue before the call returns,
+    # so it is queued before the caller sends the refusal.
+    queue: asyncio.Queue = asyncio.Queue()
+    handler = ScriptedCapabilityHandler(
+        CapabilityOnlyTurn(handled=False, events=(WSEvent(payload=dict(_SUPERSEDED)),))
+    )
+    processor, model_calls = _processor(queue, handler)
+
+    answered = await asyncio.to_thread(
+        processor._process_conversation_turn,
+        "tell me a story",
+        session_id="s1",
+        capability_only=True,
+    )
+    sent = _drain_now(queue)
+
+    assert answered is False
+    assert sent == [json.dumps(_SUPERSEDED)]
+    assert model_calls == []
+    assert not processor.generation_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_an_unhandled_capability_turn_returns_only_after_its_puts_finish():
+    queue = GatedQueue()
+    handler = ScriptedCapabilityHandler(
+        CapabilityOnlyTurn(handled=False, events=(WSEvent(payload=dict(_SUPERSEDED)),))
+    )
+    processor, _model_calls = _processor(queue, handler)
+
+    turn = asyncio.ensure_future(
+        asyncio.to_thread(
+            processor._process_conversation_turn,
+            "tell me a story",
+            session_id="s1",
+            capability_only=True,
+        )
+    )
+    await asyncio.sleep(0.2)
+    returned_before_the_put = turn.done()
+    queue.gate.set()
+    answered = await asyncio.wait_for(turn, timeout=5.0)
+
+    assert returned_before_the_put is False
+    assert answered is False
+    assert _drain_now(queue) == [json.dumps(_SUPERSEDED)]
 
 
 @pytest.mark.asyncio
@@ -536,7 +621,7 @@ async def test_a_capability_turn_with_no_conversation_handler_is_unhandled():
 @pytest.mark.asyncio
 async def test_a_capability_turn_while_a_turn_is_in_flight_is_unhandled_and_not_queued():
     queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_answered_events())
+    handler = ScriptedCapabilityHandler(_answered_turn())
     processor, model_calls = _processor(queue, handler)
     processor.generation_lock.acquire()
     try:
@@ -560,7 +645,7 @@ async def test_a_capability_turn_while_a_turn_is_in_flight_is_unhandled_and_not_
 @pytest.mark.asyncio
 async def test_a_capability_turn_does_not_respawn_a_queued_model_turn():
     queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_answered_events())
+    handler = ScriptedCapabilityHandler(_answered_turn())
     processor, model_calls = _processor(queue, handler)
     processor.latest_user_input = ("what is the weather", "s1")
 
