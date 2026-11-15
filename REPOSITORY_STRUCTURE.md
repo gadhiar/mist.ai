@@ -92,7 +92,7 @@ backend/
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 ├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
 ├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
-├── user_timezone.py             # MIST_TIMEZONE resolver for alarms, timers and the clock (usage views resolve in event_store/usage.py)
+├── user_timezone.py             # MIST_TIMEZONE resolver for alarms, timers and the clock
 │
 ├── capabilities/                # Tools that act on the world (README.md: adding one)
 │   ├── host.py                  # CapabilityHost: admits, decides, runs and logs every call

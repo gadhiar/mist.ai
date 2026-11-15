@@ -153,7 +153,8 @@ capture (`scripts/backup/stores.py::LIVE_STORE_FILENAMES`):
   occurrence found more than the grace window late (`MIST_ALARM_MISSED_GRACE_S`, never under
   60 s) is missed, reason `late`.
 - `RingRouter` (`alarms/ringing.py`) rings each occurrence on the endpoints its `ring_on` names
-  (`all` by default). Today the one endpoint is `desktop`, every connection of the WebSocket,
+  (`all` for a new record; a record set again keeps the target it was last armed with,
+  `alarms/records.py`, `ArmRequest`). Today the one endpoint is `desktop`, every connection of the WebSocket,
   present while a client is connected. When none of the named endpoints is present, the ring
   goes to every present endpoint instead and a `fallback` event is recorded.
 - A ring counts as heard only when an endpoint acknowledges playing it (an `alarm_report` of

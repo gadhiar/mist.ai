@@ -74,8 +74,9 @@ never reach real lights or music. A prefix on the command above would not do it:
 from `.env` through `env_file` only. After the health wait below,
 `curl -s http://localhost:8001/capabilities` must answer `"enabled":false`.
 Note the line's value first. After the run, put it back in `.env` and recreate the backend with
-`docker compose up -d --force-recreate mist-backend`; if it was `true`, the same `curl` must
-answer `"enabled":true`.
+`docker compose up -d --force-recreate mist-backend`; if it was `true`, the same `curl` should
+answer `"enabled":true`, unless something else in `.env` keeps the host off (for example
+`MIST_ALLOWED_ORIGINS=*` or an isolation flag), in which case its `reason` names it.
 
 **Three env-var traps to NOT skip:**
 
