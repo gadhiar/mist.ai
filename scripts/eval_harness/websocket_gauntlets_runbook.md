@@ -73,6 +73,9 @@ never reach real lights or music. A prefix on the command above would not do it:
 `docker-compose.yml` has no `environment` entry for that variable, so the backend reads it
 from `.env` through `env_file` only. After the health wait below,
 `curl -s http://localhost:8001/capabilities` must answer `"enabled":false`.
+Note the line's value first. After the run, put it back in `.env` and recreate the backend with
+`docker compose up -d --force-recreate mist-backend`; if it was `true`, the same `curl` must
+answer `"enabled":true`.
 
 **Three env-var traps to NOT skip:**
 
