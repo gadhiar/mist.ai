@@ -178,6 +178,46 @@ def _info_response_1_2_0() -> InfoResponse:
     )
 
 
+_SERVING_IDENTITY = "si1-" + "b" * 64
+
+_SERVING_IDENTITY_COMPONENTS: dict[str, str | int | float | bool | None] = {
+    "adapter": "gptoss",
+    "n_ctx": 16384,
+    "scope_enabled": True,
+    "request.scope.temperature": 0.0,
+    "request.scope.thinking_budget_tokens": None,
+    "server.device": "rtx4070s",
+}
+
+
+def _expect_stamps_1_3_0() -> ExpectStamps:
+    return _expect_stamps().model_copy(update={"serving_identity": _SERVING_IDENTITY})
+
+
+def _result_stamps_1_3_0() -> ResultStamps:
+    return _result_stamps_1_2_0().model_copy(update={"serving_identity": _SERVING_IDENTITY})
+
+
+def _info_response_1_3_0() -> InfoResponse:
+    return _info_response_1_2_0().model_copy(
+        update={
+            "contract_version": "1.3.0",
+            "serving_identity": _SERVING_IDENTITY,
+            "serving_identity_components": dict(_SERVING_IDENTITY_COMPONENTS),
+        }
+    )
+
+
+def _info_response_1_3_0_without_an_identity() -> InfoResponse:
+    return _info_response_1_2_0().model_copy(
+        update={
+            "contract_version": "1.3.0",
+            "serving_identity_error": "declared llama-server settings missing: "
+            "EXTRACTION_SERVER_DEVICE",
+        }
+    )
+
+
 # The /v1/info body a contract 1.0.0 server sends: the seven original fields
 # and nothing else.
 _INFO_1_0_0_PAYLOAD = {
@@ -248,9 +288,18 @@ def _checked_cutover_status() -> CutoverStatus:
     )
 
 
+def _service_status_1_3_0() -> ServiceStatus:
+    return _service_status().model_copy(update={"serving_identity": _SERVING_IDENTITY})
+
+
+def _cutover_status_1_3_0() -> CutoverStatus:
+    return _cutover_status().model_copy(update={"target_serving_identity": _SERVING_IDENTITY})
+
+
 ROUND_TRIP_FIXTURES = [
     _history_message,
     _expect_stamps,
+    _expect_stamps_1_3_0,
     _derivation_input,
     _extract_request,
     _scope_out,
@@ -258,6 +307,7 @@ ROUND_TRIP_FIXTURES = [
     _derivation_out,
     _result_stamps,
     _result_stamps_1_2_0,
+    _result_stamps_1_3_0,
     _timings_ms,
     _extract_response,
     _extract_response_1_2_0,
@@ -266,9 +316,13 @@ ROUND_TRIP_FIXTURES = [
     _health_response,
     _info_response,
     _info_response_1_2_0,
+    _info_response_1_3_0,
+    _info_response_1_3_0_without_an_identity,
     _service_status,
+    _service_status_1_3_0,
     _last_job,
     _cutover_status,
+    _cutover_status_1_3_0,
     _checked_cutover_status,
     _extraction_status,
 ]
@@ -386,11 +440,104 @@ class TestInfoResponseServingConfig:
 
 
 class TestContractVersion:
-    def test_the_contract_is_1_2_0(self):
-        assert CONTRACT_VERSION == "1.2.0"
+    def test_the_contract_is_1_3_0(self):
+        assert CONTRACT_VERSION == "1.3.0"
 
     def test_this_contract_accepts_its_own_version(self):
         assert is_compatible(CONTRACT_VERSION) is True
+
+    @pytest.mark.parametrize("version", ["1.2.0", "1.3.0"])
+    def test_a_1_2_0_and_a_1_3_0_peer_are_compatible(self, version):
+        assert is_compatible(version) is True
+
+
+class TestServingIdentityFields:
+    """Contract 1.3.0 adds the serving identity, optional everywhere on the wire."""
+
+    def test_a_1_2_0_info_validates_to_no_serving_identity(self):
+        payload = _info_response_1_2_0().model_dump(mode="json")
+        for name in ("serving_identity", "serving_identity_components", "serving_identity_error"):
+            del payload[name]
+
+        info = InfoResponse.model_validate(payload)
+
+        assert info.contract_version == "1.2.0"
+        assert info.serving_identity is None
+        assert info.serving_identity_components is None
+        assert info.serving_identity_error is None
+        assert info.run_identity == "ri1-" + "a" * 64
+
+    def test_info_gains_exactly_the_three_serving_identity_fields(self):
+        fields_1_2_0 = {
+            *_INFO_1_0_0_PAYLOAD,
+            "constrained_mode",
+            "reasoning_effort",
+            "temperature",
+            "ctx_size",
+            "run_identity",
+            "run_identity_components",
+        }
+
+        assert set(InfoResponse.model_fields) - fields_1_2_0 == {
+            "serving_identity",
+            "serving_identity_components",
+            "serving_identity_error",
+        }
+
+    def test_a_1_2_0_request_expects_no_serving_identity(self):
+        payload = _extract_request().model_dump(mode="json")
+        del payload["expect"]["serving_identity"]
+
+        request = ExtractRequest.model_validate(payload)
+
+        assert request.expect.serving_identity is None
+
+    def test_a_1_2_0_result_carries_no_serving_identity(self):
+        payload = _extract_response_1_2_0().model_dump(mode="json")
+        del payload["stamps"]["serving_identity"]
+
+        response = ExtractResponse.model_validate(payload)
+
+        assert response.stamps.serving_identity is None
+        assert response.stamps.run_identity == "ri1-" + "a" * 64
+
+    def test_the_components_keep_their_json_types(self):
+        dumped = _info_response_1_3_0().model_dump(mode="json")
+
+        restored = InfoResponse.model_validate(dumped).serving_identity_components
+
+        assert restored == _SERVING_IDENTITY_COMPONENTS
+        assert {k: type(v) for k, v in restored.items()} == {
+            k: type(v) for k, v in _SERVING_IDENTITY_COMPONENTS.items()
+        }
+
+    def test_a_component_that_is_not_a_scalar_is_rejected(self):
+        payload = _info_response_1_3_0().model_dump(mode="json")
+        payload["serving_identity_components"] = {"server": {"device": "x"}}
+
+        with pytest.raises(ValidationError):
+            InfoResponse.model_validate(payload)
+
+    def test_the_status_fields_default_to_none(self):
+        assert _service_status().serving_identity is None
+        assert _cutover_status().target_serving_identity is None
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            ExpectStamps,
+            ExtractRequest,
+            ResultStamps,
+            ExtractResponse,
+            InfoResponse,
+            ServiceStatus,
+            CutoverStatus,
+            ExtractionStatus,
+        ],
+    )
+    def test_no_model_forbids_unknown_fields(self, model):
+        """An older peer must ignore the fields a newer one adds."""
+        assert model.model_config.get("extra") != "forbid"
 
 
 class TestRunIdentityFields:

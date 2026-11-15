@@ -158,6 +158,30 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "at EXTRACT_MAX_TOKENS is split in two and retried. Re-extracts history."
         ),
     ),
+    CodeRevision(
+        extraction_version="2026-11-06-r6",
+        code_identity="ci1-29646c2d855e3c09f3147ea73eaf8ca32c9f43c949ccf1d8529aea8f2152d328",
+        date="2026-11-09",
+        reason=(
+            "Serving identity (MIS-196): each stage's request is built by its own method, "
+            "which ExtractionEngine.request_profile also calls, and run() stamps the "
+            "serving identity it is given. Every request is sent exactly as before. New "
+            "turns only."
+        ),
+    ),
+    CodeRevision(
+        extraction_version="2026-11-06-r6",
+        code_identity="ci1-6ed7f68d0599961f548ea162e1282b43367786e813638813f2343539878ab8c6",
+        date="2026-11-09",
+        reason=(
+            "Stage caps by reasoning effort (T32): STAGE_CAPS gives each stage the cap of "
+            "the effort the adapter sends it, low (96, 2048, 400) and medium and high "
+            "(1024, 32768, 400), with derive sent at low effort under every setting; "
+            "_invoke logs an `extraction length stop:` line with counts and a repetition "
+            "flag; LlamaServerProvider takes the client timeout. At low effort every "
+            "request is sent exactly as before. New turns only."
+        ),
+    ),
 )
 
 

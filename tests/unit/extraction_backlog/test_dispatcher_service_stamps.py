@@ -56,7 +56,19 @@ async def test_the_other_stamps_are_stored_beside_it(backlog_world, ts):
         "llama_cpp_build": "b0",
         "adapter": "fake",
         "run_identity": _RUN_IDENTITY,
+        "serving_identity": backlog_world.service.serving_identity,
     }
+
+
+@pytest.mark.asyncio
+async def test_both_identities_are_stored_beside_the_stamps(backlog_world, ts):
+    """The row records the full identity it was written under (contract 1.3.0)."""
+    service_stamps = (await _extract_one(backlog_world, ts))["service_stamps"]
+
+    assert service_stamps["serving_identity"] == backlog_world.service.serving_identity
+    assert service_stamps["dispatch_identity"] == backlog_world.dispatch_identity().identity
+    assert service_stamps["serving_identity"].startswith("si1-")
+    assert service_stamps["dispatch_identity"].startswith("di1-")
 
 
 @pytest.mark.asyncio

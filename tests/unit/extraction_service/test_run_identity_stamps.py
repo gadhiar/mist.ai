@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 
 import httpx
 import pytest
@@ -31,6 +31,7 @@ from backend.extraction_service.engine import (
 )
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.extraction.run_identity import code_sha256, compute_run_identity
+from backend.knowledge.extraction.serving_identity import REQUEST_STAGES
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from tests.unit.extraction_service.conftest import make_extract_request
 
@@ -112,7 +113,7 @@ class TestServiceReportsOneIdentity:
         async with await _client_for(built_app) as client:
             data = (await client.get("/v1/info")).json()
 
-        assert data["contract_version"] == "1.2.0"
+        assert data["contract_version"] == "1.3.0"
         assert data["run_identity"] == compute_run_identity(components)
         assert data["run_identity_components"] == dataclasses.asdict(components)
 
@@ -172,12 +173,16 @@ class TestServiceReportsOneIdentity:
         assert first["stamps"]["run_identity"] == again["stamps"]["run_identity"] == identity
 
     async def test_the_identity_is_not_part_of_the_epoch_check(self, built_app):
-        """`expect` still carries two stamps; a run identity is never asked for."""
+        """`expect` never asks for a run identity: the serving identity is what is keyed."""
         async with await _client_for(built_app) as client:
             response = await client.post("/v1/extract", json=make_extract_request())
 
         assert response.status_code == 200
-        assert set(ExpectStamps.model_fields) == {"extraction_version", "model_hash"}
+        assert set(ExpectStamps.model_fields) == {
+            "extraction_version",
+            "model_hash",
+            "serving_identity",
+        }
 
     async def test_an_app_built_without_an_identity_reports_none(self, service_app, client):
         """`create_app` alone, as a test wires it, stamps nothing it was not given."""
@@ -221,6 +226,23 @@ class TestBuildAppFromEnv:
         assert seen["settings"].llama_cpp_build == "b99999"
         assert isinstance(seen["llm"], app_module.LlamaServerProvider)
         assert isinstance(seen["http_client"], httpx.AsyncClient)
+
+    def test_it_gives_the_llm_clients_the_service_timeout(self, monkeypatch):
+        """The client and the engine's `asyncio.wait_for` bound each call by the same timeout."""
+        monkeypatch.setenv("EXTRACTION_MODEL_HASH", "env-model-hash")
+        monkeypatch.setenv("EXTRACTION_LLM_TIMEOUT_SECONDS", "1500")
+        seen = {}
+
+        def spy(settings, llm, http_client):
+            seen.update(settings=settings, llm=llm)
+            return "app"
+
+        monkeypatch.setattr(app_module, "build_app", spy)
+
+        app_module.build_app_from_env()
+
+        assert seen["settings"].llm_timeout_seconds == 1500.0
+        assert seen["llm"]._async_client.timeout == httpx.Timeout(1500.0, connect=5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -281,17 +303,27 @@ def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):
 @pytest.mark.parametrize(
     "name",
     [
-        "SCOPE_MAX_TOKENS",
-        "EXTRACT_MAX_TOKENS",
-        "DERIVE_MAX_TOKENS",
+        "scope",
+        "extract",
+        "derive",
         "ONTOLOGY_VERSION",
         "EXTRACTION_VERSION",
     ],
 )
 def test_a_limit_or_version_change_moves_the_identity(service_settings, monkeypatch, name):
     before = _identity(service_settings)
-    value = getattr(app_module, name)
-    monkeypatch.setattr(app_module, name, value + 1 if isinstance(value, int) else value + "x")
+    if name in REQUEST_STAGES:
+        # The caps are read from STAGE_CAPS at the effort each stage is sent at.
+        low = engine_module.STAGE_CAPS["low"]
+        moved = dataclasses.replace(low, **{name: getattr(low, name) + 1})
+        monkeypatch.setattr(
+            engine_module,
+            "STAGE_CAPS",
+            MappingProxyType({**engine_module.STAGE_CAPS, "low": moved}),
+        )
+    else:
+        value = getattr(app_module, name)
+        monkeypatch.setattr(app_module, name, value + 1 if isinstance(value, int) else value + "x")
 
     assert _identity(service_settings) != before
 

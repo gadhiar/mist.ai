@@ -22,10 +22,10 @@ import importlib
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import Any
 
 from openai import APIError
@@ -53,7 +53,7 @@ from backend.extraction_service.schemas import (
     EXTRACTION_OUTPUT_SCHEMA,
     SCOPE_OUTPUT_SCHEMA,
 )
-from backend.extraction_service.settings import ConstrainedMode, ServiceSettings
+from backend.extraction_service.settings import ConstrainedMode, ReasoningEffort, ServiceSettings
 from backend.knowledge.extraction.internal_derivation import (
     parse_derivation_output,
     render_derivation_messages,
@@ -75,6 +75,7 @@ from backend.knowledge.extraction.scope_classifier import (
     parse_scope_output,
     render_scope_messages,
 )
+from backend.knowledge.extraction.serving_identity import REQUEST_STAGES, StageRequestProfile
 from backend.knowledge.extraction.structure_splitter import (
     InputUnit,
     batch_units,
@@ -84,7 +85,7 @@ from backend.knowledge.extraction.structure_splitter import (
     split_structured,
 )
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
-from backend.llm.models import LLMRequest
+from backend.llm.models import LLMRequest, LLMResponse
 from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
@@ -105,12 +106,64 @@ _REPAIR_INSTRUCTION = (
     "markdown code fences, no explanation."
 )
 
-# Output token limits, one per LLM-calling stage. Named so the run identity
-# can record them: a limit that cuts an output short changes what the stage
-# returns as surely as a prompt edit does.
+# Output token limits at low reasoning effort, one per LLM-calling stage. Named
+# so the run identity can record them: a limit that cuts an output short
+# changes what the stage returns as surely as a prompt edit does.
 SCOPE_MAX_TOKENS = 96
 EXTRACT_MAX_TOKENS = 2048
 DERIVE_MAX_TOKENS = 400
+
+
+@dataclass(frozen=True, slots=True)
+class StageCaps:
+    """The output token cap of each LLM-calling stage, at one reasoning effort.
+
+    The fields are named as the stages are in `REQUEST_STAGES`, so a stage's
+    cap is `getattr(caps, stage)`.
+    """
+
+    scope: int
+    extract: int
+    derive: int
+
+
+# A model reasoning at medium or high effort spends its output tokens on
+# reasoning before the answer, so low's caps would cut most calls short. The
+# medium extract cap sits above the longest extract call that stopped on its
+# own at high effort (28,916 tokens) and cuts a runaway call a third sooner than
+# the 49,152 that run used. High takes medium's caps; no run has measured them
+# at high. Derive keeps 400 at every effort because the adapters send derive at
+# low effort under every setting (`GptOssAdapter.stage_effort`).
+STAGE_CAPS: Mapping[str, StageCaps] = MappingProxyType(
+    {
+        "low": StageCaps(
+            scope=SCOPE_MAX_TOKENS, extract=EXTRACT_MAX_TOKENS, derive=DERIVE_MAX_TOKENS
+        ),
+        "medium": StageCaps(scope=1024, extract=32768, derive=DERIVE_MAX_TOKENS),
+        "high": StageCaps(scope=1024, extract=32768, derive=DERIVE_MAX_TOKENS),
+    }
+)
+
+# The context a prompt may take beside the extract cap: above the largest
+# prompt measured on the r6 prompt (9,327 tokens). The service withholds its
+# serving identity when the extract cap plus this reserve exceeds the context
+# llama-server reports (`backend.extraction_service.app._serving_identity_error`).
+PROMPT_RESERVE_TOKENS: int = 10240
+
+
+def stage_caps(effort: ReasoningEffort | None) -> StageCaps:
+    """The caps for `effort`; None, an adapter that sends no effort, gets low's."""
+    return STAGE_CAPS["low" if effort is None else effort]
+
+
+def effective_cap(adapter: ModelFamilyAdapter, stage: str) -> int:
+    """The output token cap `stage` is sent with under `adapter`.
+
+    It follows the effort the adapter applies to that stage, not the
+    configured effort, so an adapter that sends no effort keeps low's caps.
+    """
+    return getattr(stage_caps(adapter.stage_effort(stage)), stage)
+
 
 # The Stage 2 list pass's limits: the most units one call extracts, and the
 # most earlier units of the same message a later batch sees as context. Small
@@ -177,6 +230,11 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
         "would move the code identity each new entry has to name, so the drift guard "
         "could never pass",
     ),
+    (
+        "backend.knowledge.extraction.serving_identity",
+        "the serving identity's types and hash: request_profile reads the requests the "
+        "stages build and changes none of them",
+    ),
 )
 
 
@@ -203,7 +261,7 @@ class ExtractionTimeoutError(ExtractionServiceError):
 
 
 class _OutputTruncatedError(ExtractionServiceError):
-    """A Stage 2 output stopped at `EXTRACT_MAX_TOKENS` (`finish_reason == "length"`).
+    """A Stage 2 output stopped at the extract cap (`finish_reason == "length"`).
 
     Internal to Stage 2: the batch is split and retried, and only a single
     unit cut short leaves the engine, as `UpstreamLLMError`.
@@ -384,6 +442,77 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def repetition_flag(
+    text: str, *, tail_chars: int = 2000, probe_chars: int = 200, min_count: int = 3
+) -> bool:
+    """True when the last `probe_chars` of `text`'s tail occur `min_count` times in that tail.
+
+    The tail is the last `tail_chars` characters. A model stuck in a loop
+    repeats its last stretch of text, so any loop whose period is at most
+    `tail_chars / min_count` characters (about 666 at the defaults) is
+    flagged, while text still making progress is not. Occurrences may
+    overlap, so a loop shorter than the probe counts every repetition.
+    """
+    tail = text[-tail_chars:]
+    if len(tail) < probe_chars:
+        return False
+    probe = tail[-probe_chars:]
+    count = 0
+    start = tail.find(probe)
+    while start != -1:
+        count += 1
+        if count >= min_count:
+            return True
+        start = tail.find(probe, start + 1)
+    return False
+
+
+def _log_length_stop(request: LLMRequest, response: LLMResponse) -> None:
+    """Log a call that stopped at its cap: counts and the repetition flag, never text.
+
+    The cap names the stage, since the three caps differ at every effort. The
+    response text stays out of the log because production turns are real
+    conversations; the flag is what tells a repetition loop from reasoning
+    that was still progressing when the cap cut it.
+    """
+    reasoning = response.reasoning_content or ""
+    content = response.content or ""
+    completion_tokens = None if response.usage is None else response.usage.completion_tokens
+    logger.warning(
+        "extraction length stop: cap %d completion_tokens %s reasoning_chars %d "
+        "content_chars %d repeat %s",
+        request.max_tokens,
+        completion_tokens,
+        len(reasoning),
+        len(content),
+        "true" if repetition_flag(reasoning[-2000:] + content) else "false",
+    )
+
+
+def _profile_of(stage: str, request: LLMRequest) -> StageRequestProfile:
+    """The output-changing fields of `request`, read as the provider sends them.
+
+    The constraint follows `LlamaServerProvider._build_kwargs`: a schema wins
+    over JSON mode, and neither means an unconstrained reply.
+    """
+    if request.response_schema is not None:
+        constrained = "schema"
+    elif request.json_mode:
+        constrained = "json_object"
+    else:
+        constrained = "none"
+    thinking = request.thinking
+    return StageRequestProfile(
+        stage=stage,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        constrained=constrained,
+        thinking_effort=None if thinking is None else thinking.effort,
+        thinking_enabled=None if thinking is None else thinking.enabled,
+        thinking_budget_tokens=None if thinking is None else thinking.budget_tokens,
+    )
+
+
 class ExtractionEngine:
     """Runs Stages 1 / 1.5 / 2 / 9 for one `ExtractRequest`.
 
@@ -427,8 +556,36 @@ class ExtractionEngine:
         """The run identity this engine stamps on every result."""
         return self._run_identity
 
-    async def run(self, req: ExtractRequest) -> ExtractResponse:
+    def stage_cap(self, stage: str) -> int:
+        """The output token cap `stage`'s request is sent with (`effective_cap`)."""
+        return effective_cap(self._adapter, stage)
+
+    def request_profile(self) -> tuple[StageRequestProfile, ...]:
+        """The output-changing fields of each stage's request, in `REQUEST_STAGES` order.
+
+        Each profile comes from the builder the stage itself calls, so it is
+        the request as sent, after the adapter has prepared it: a setting the
+        adapter ignores is absent. The messages are left empty, because the
+        profile records how a request is sampled and constrained, not what it
+        says. Every stage is listed, Stage 1.5 even when `scope_enabled` is
+        off, since that switch is a component of its own.
+        """
+        builders = {
+            "scope": self._scope_request,
+            "extract": self._extract_request,
+            "derive": self._derive_request,
+        }
+        return tuple(_profile_of(stage, builders[stage](messages=[])) for stage in REQUEST_STAGES)
+
+    async def run(
+        self, req: ExtractRequest, *, serving_identity: str | None = None
+    ) -> ExtractResponse:
         """Run the full stage sequence for one job and build its response.
+
+        Args:
+            req: The job.
+            serving_identity: The serving identity the caller computed for this
+                job, stamped on the result. None stamps none.
 
         Raises:
             InvalidRequestError: `req.recorded_at` is not ISO-8601; raised
@@ -474,6 +631,7 @@ class ExtractionEngine:
                 llama_cpp_build=self._settings.llama_cpp_build,
                 adapter=self._adapter.name,
                 run_identity=self._run_identity,
+                serving_identity=serving_identity,
             ),
             timings_ms=TimingsMs(
                 scope=scope_ms,
@@ -506,17 +664,49 @@ class ExtractionEngine:
             response_schema=schema if mode == "schema" else None,
         )
 
+    def _scope_request(self, *, messages: list[dict]) -> LLMRequest:
+        """Stage 1.5's request for `messages`, prepared by the adapter."""
+        request = self._build_request(
+            messages=messages, max_tokens=self.stage_cap("scope"), schema=SCOPE_OUTPUT_SCHEMA
+        )
+        return self._adapter.prepare(request, stage="scope")
+
+    def _extract_request(self, *, messages: list[dict]) -> LLMRequest:
+        """Stage 2's request for `messages`, prepared by the adapter."""
+        request = self._build_request(
+            messages=messages,
+            max_tokens=self.stage_cap("extract"),
+            schema=EXTRACTION_OUTPUT_SCHEMA,
+        )
+        return self._adapter.prepare(request, stage="extract")
+
+    def _derive_request(self, *, messages: list[dict]) -> LLMRequest:
+        """Stage 9's request for `messages`, prepared by the adapter."""
+        request = self._build_request(
+            messages=messages,
+            max_tokens=self.stage_cap("derive"),
+            schema=DERIVATION_OUTPUT_SCHEMA,
+        )
+        return self._adapter.prepare(request, stage="derive")
+
     async def _invoke(self, request: LLMRequest):
         """Invoke the LLM under the configured timeout.
+
+        A response that stopped at its output cap is logged (`_log_length_stop`)
+        before it is returned, so before the stage that called raises, retries
+        or degrades on it.
 
         Raises:
             TimeoutError: The call exceeded `settings.llm_timeout_seconds`.
             openai.APIError / LLMConnectionError / LLMResponseError: The
                 transport or provider failed.
         """
-        return await asyncio.wait_for(
+        response = await asyncio.wait_for(
             self._llm.invoke(request), timeout=self._settings.llm_timeout_seconds
         )
+        if response.finish_reason == "length":
+            _log_length_stop(request, response)
+        return response
 
     async def _run_scope(
         self, pre_processed: PreProcessedInput, warnings: list[str]
@@ -528,12 +718,7 @@ class ExtractionEngine:
             return ScopeOut(label="unknown", confidence=0.0), None
 
         start = time.perf_counter()
-        request = self._build_request(
-            messages=render_scope_messages(pre_processed),
-            max_tokens=SCOPE_MAX_TOKENS,
-            schema=SCOPE_OUTPUT_SCHEMA,
-        )
-        request = self._adapter.prepare(request, stage="scope")
+        request = self._scope_request(messages=render_scope_messages(pre_processed))
 
         try:
             response = await self._invoke(request)
@@ -583,7 +768,7 @@ class ExtractionEngine:
     ) -> None:
         """Extract `units[start:start + size]`, halving the batch while its output is cut short.
 
-        An output that stops at `EXTRACT_MAX_TOKENS` is never repaired: the
+        An output that stops at the extract cap is never repaired: the
         repair retry would ask for the same output under the same limit. The
         batch is split in two and each half extracted in turn, each seeing
         the units before it as context, down to single units.
@@ -599,7 +784,7 @@ class ExtractionEngine:
         except _OutputTruncatedError as exc:
             if size == 1:
                 raise UpstreamLLMError(
-                    f"extraction output truncated at max_tokens ({EXTRACT_MAX_TOKENS}) "
+                    f"extraction output truncated at max_tokens ({self.stage_cap('extract')}) "
                     "on a single unit"
                 ) from exc
             half = (size + 1) // 2
@@ -641,10 +826,7 @@ class ExtractionEngine:
         for attempt in range(1, self._settings.max_attempts + 1):
             run.calls += 1
             run.attempts = max(run.attempts, attempt)
-            request = self._build_request(
-                messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
-            )
-            request = self._adapter.prepare(request, stage="extract")
+            request = self._extract_request(messages=messages)
 
             try:
                 response = await self._invoke(request)
@@ -658,7 +840,7 @@ class ExtractionEngine:
 
             if response.finish_reason == "length":
                 raise _OutputTruncatedError(
-                    f"Extraction output reached max_tokens={EXTRACT_MAX_TOKENS}"
+                    f"Extraction output reached max_tokens={request.max_tokens}"
                     f" (attempt {attempt}/{self._settings.max_attempts})"
                 )
             raw = self._adapter.final_text(response)
@@ -693,18 +875,15 @@ class ExtractionEngine:
             return None, None
 
         start = time.perf_counter()
-        request = self._build_request(
+        request = self._derive_request(
             messages=render_derivation_messages(
                 utterance=req.utterance,
                 assistant_response=req.derivation.assistant_response,
                 signal_types=req.derivation.signal_types,
                 matched_patterns=req.derivation.matched_patterns,
                 existing_internal_entities=req.derivation.existing_internal_entities,
-            ),
-            max_tokens=DERIVE_MAX_TOKENS,
-            schema=DERIVATION_OUTPUT_SCHEMA,
+            )
         )
-        request = self._adapter.prepare(request, stage="derive")
 
         try:
             response = await self._invoke(request)

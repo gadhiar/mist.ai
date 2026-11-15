@@ -53,7 +53,7 @@ services:
       - TTS_EXAGGERATION=${TTS_EXAGGERATION:-0.5}
       - TTS_TEMPERATURE=${TTS_TEMPERATURE:-0.8}
       - TTS_CFG_WEIGHT=${TTS_CFG_WEIGHT:-0.5}
-      - VOICE_PROFILE=${VOICE_PROFILE:-friday}
+      - VOICE_PROFILE=${VOICE_PROFILE:-mist}
       - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
     # Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root container user.
     # UID 1000 matches the conventional first user on Linux hosts so bind-

@@ -231,7 +231,10 @@ CREATE INDEX IF NOT EXISTS idx_extraction_attempts_turn
 -- are recorded in `extraction_attempts` under epoch_id = -cutover_id, a
 -- namespace no ledger row can occupy (ledger ids are AUTOINCREMENT, >= 1).
 --
--- A new table, so `CREATE TABLE IF NOT EXISTS` is the whole migration.
+-- A new table, so `CREATE TABLE IF NOT EXISTS` is the whole migration. The
+-- binding columns below `updated_at` came later; `EventStore.initialize()`
+-- adds them to an older table with a guarded ALTER, so a row written before
+-- them reads as an unbound candidate (all NULL).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS epoch_cutover (
     cutover_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,7 +249,56 @@ CREATE TABLE IF NOT EXISTS epoch_cutover (
     rebuilt_through_event_id TEXT,            -- last turn the passing check replayed
     check_report TEXT,                        -- JSON, the latest check (pass or fail)
     promoted_epoch_id INTEGER,                -- the ledger row promotion appended
-    updated_at TEXT NOT NULL                  -- ISO-8601
+    updated_at TEXT NOT NULL,                 -- ISO-8601
+    -- The candidate's identity binding, written once by `bind_cutover_identity`
+    -- and copied to `epoch_identity` by promotion. NULL serving_identity:
+    -- unbound. Same meaning as the `epoch_identity` columns of the same names.
+    serving_identity TEXT,
+    serving_components TEXT,                  -- JSON
+    dispatch_identity TEXT,
+    dispatch_components TEXT,                 -- JSON
+    identity_namespace TEXT,                  -- NULL: the 3-part cache key
+    binding_source TEXT,                      -- adopted, first-contact, operator
+    binding_evidence TEXT,                    -- JSON
+    bound_at TEXT                             -- ISO-8601
+);
+
+-- ---------------------------------------------------------------------------
+-- Epoch identity (mist-extraction-epoch-identity). The ledger triple does not
+-- cover the serving settings (the extraction service's `si1-` serving
+-- identity) or the backend's dispatch settings (`di1-` dispatch identity), so
+-- an epoch is bound to both once, here, and its ledger row and epoch_id never
+-- change. identity_namespace is the extraction cache namespace the epoch reads
+-- and writes: NULL is the 3-part key every row written before this table used;
+-- otherwise `serving_identity+dispatch_identity`.
+--
+-- source: 'promoted' (copied from the cutover's binding in the promotion
+-- transaction), 'adopted' (existing rows agree with the service),
+-- 'first-contact' (no rows yet), 'operator' (`admin epoch accept`).
+-- Written once, never updated: `EventStore.bind_epoch_identity`.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS epoch_identity (
+    epoch_id INTEGER PRIMARY KEY,             -- epoch_ledger.epoch_id
+    serving_identity TEXT NOT NULL,
+    serving_components TEXT NOT NULL,         -- JSON, the service's components
+    dispatch_identity TEXT NOT NULL,
+    dispatch_components TEXT NOT NULL,        -- JSON
+    identity_namespace TEXT,                  -- NULL: the 3-part cache key
+    source TEXT NOT NULL,                     -- promoted, adopted, first-contact, operator
+    evidence TEXT NOT NULL,                   -- JSON, what the binding verified
+    bound_at TEXT NOT NULL                    -- ISO-8601
+);
+
+-- An operator's acceptance of a live identity for one target, which the
+-- dispatcher binds with source 'operator' while the live identities equal
+-- these. target_id is an epoch_id, or -cutover_id for a candidate (the
+-- convention `extraction_attempts` uses, above).
+CREATE TABLE IF NOT EXISTS epoch_identity_acceptance (
+    target_id INTEGER PRIMARY KEY,
+    serving_identity TEXT NOT NULL,
+    dispatch_identity TEXT NOT NULL,
+    note TEXT NOT NULL,
+    accepted_at TEXT NOT NULL                 -- ISO-8601
 );
 
 -- ---------------------------------------------------------------------------

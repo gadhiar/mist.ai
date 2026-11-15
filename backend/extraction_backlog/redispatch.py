@@ -33,7 +33,8 @@ EXIT CODES
   fingerprints were identical (a partial apply proves nothing). After an
   apply that raised, the graph may be partially re-written: compare it with
   the backup.
-- 2: refused, nothing applied and the graph not opened: no active epoch; the
+- 2: refused, nothing applied and, but for the last case, the graph not
+  opened: no active epoch; the
   turn has no `applied` marker in `extraction_applied` for the active epoch
   (a `curated`-only marker is not applied); no cache row for the turn under
   the active epoch's `extraction_version` / `model_hash`; the cache row is a
@@ -41,7 +42,14 @@ EXIT CODES
   not in the conversation log; this environment's writer stamps differ from
   the active epoch (the dispatcher's own guard,
   `ExtractionDispatcher._writer_stamp_mismatch`, which would also refuse to
-  apply); or the backend is not positively down.
+  apply); or the backend is not positively down. One more refusal comes after
+  the graph is opened, because what it compares is read off the pipeline built
+  with it, and still before the first fingerprint, so nothing is applied and
+  the graph is closed: the active epoch is bound and the dispatch identity of
+  that pipeline and this environment's `DispatcherSettings` differs from the
+  binding's (the dispatcher's own guard,
+  `ExtractionDispatcher._dispatch_identity_guard`, which would also refuse to
+  apply).
 - 3: the fingerprints differ. A bounded summary is printed: element counts
   before and after, the added / removed / changed counts, each differing
   property name with how many elements it changed on, and the first
@@ -120,6 +128,8 @@ from backend.knowledge.eval_isolation import LIVE_WS_ENDPOINTS, EvalIsolationErr
 from backend.knowledge.extraction.pipeline import ApplyReport, TurnToApply
 from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
 
+from .dispatch_identity import DispatchIdentity, dispatch_identity_for
+from .settings import DispatcherSettings
 from .store import STAGE_APPLIED, BacklogStore, Epoch
 
 if TYPE_CHECKING:
@@ -518,15 +528,19 @@ ApplyTurn = Callable[[TurnToApply, Mapping[str, Any], "ApplyProgress"], Awaitabl
 
 @dataclass(frozen=True, slots=True)
 class RedispatchGraph:
-    """The graph side of the check, opened only after every refusal has passed.
+    """The graph side of the check, opened once every refusal not needing it has passed.
 
     `apply_turn` is `ExtractionPipeline.apply_cached_turn` in production;
     `fingerprint` reads the graph `apply_turn` writes; `close` releases both.
+    `dispatch_identity` is what a dispatcher over that pipeline and this
+    environment's `DispatcherSettings` computes; it is here because the gates it
+    hashes are read off the built pipeline.
     """
 
     apply_turn: ApplyTurn
     fingerprint: Callable[[], Awaitable[GraphFingerprint]]
     close: Callable[[], None]
+    dispatch_identity: DispatchIdentity
 
 
 def _writer_stamp_mismatch(writer_stamps: RebuildStamps, epoch: Epoch) -> str | None:
@@ -536,6 +550,33 @@ def _writer_stamp_mismatch(writer_stamps: RebuildStamps, epoch: Epoch) -> str | 
     return ExtractionDispatcher._writer_stamp_mismatch(
         SimpleNamespace(_writer_stamps=writer_stamps), epoch  # type: ignore[arg-type]
     )
+
+
+def _dispatch_identity_mismatch(
+    store: BacklogStore, epoch: Epoch, dispatch_identity: DispatchIdentity
+) -> str | None:
+    """The dispatcher's own guard on the dispatch identity, as its reason; None to proceed.
+
+    `ExtractionDispatcher._dispatch_identity_guard` is called on a stand-in
+    holding only what it reads, so the refusal and its reason are the
+    dispatcher's: an unbound epoch, or one bound to this identity, passes.
+    """
+    from .dispatcher import ExtractionDispatcher
+
+    reasons: list[str] = []
+    stand_in = SimpleNamespace(
+        _dispatch_id=dispatch_identity,
+        _store=store,
+        _dispatch_mismatch_logged=epoch.epoch_id,  # no ERROR log from a CLI check
+        _settings=SimpleNamespace(stall_recheck_s=0.0),
+        _set_state=lambda _state, *, reason: reasons.append(reason),
+    )
+    stalled = ExtractionDispatcher._dispatch_identity_guard(
+        stand_in, epoch  # type: ignore[arg-type]
+    )
+    if stalled is None:
+        return None
+    return reasons[-1]
 
 
 def _refuse(out: TextIO, reason: str) -> int:
@@ -562,7 +603,9 @@ async def run_redispatch_check(
         writer_stamps: The stamps a backend started from this environment
             writes (`factories.writer_stamps_from_config`).
         backend_probe: Called once, after the store checks pass.
-        open_graph: Called once, only after every refusal check has passed.
+        open_graph: Called once, only after every refusal check that does not
+            need the pipeline has passed; the dispatch identity check runs on
+            what it returns, before the first fingerprint.
         out: Where the report goes.
         diff_limit: How many differing keys the exit-3 summary lists.
 
@@ -639,6 +682,12 @@ async def run_redispatch_check(
         )
         return EXIT_CANNOT_RUN
     try:
+        # Checked here, not with the writer stamps above: the gates the
+        # dispatch identity hashes are read off the pipeline `open_graph` built.
+        # Before the first fingerprint, so a refusal applies nothing.
+        mismatch = _dispatch_identity_mismatch(store, epoch, graph.dispatch_identity)
+        if mismatch is not None:
+            return _refuse(out, mismatch)
         try:
             before = await graph.fingerprint()
         except _GRAPH_ERRORS as exc:
@@ -753,5 +802,12 @@ def open_live_graph_from_env(config: KnowledgeConfig) -> RedispatchGraph:
         return await fetch_graph_fingerprint(executor)
 
     return RedispatchGraph(
-        apply_turn=pipeline.apply_cached_turn, fingerprint=fingerprint, close=close
+        apply_turn=pipeline.apply_cached_turn,
+        fingerprint=fingerprint,
+        close=close,
+        # What the backend's dispatcher over this pipeline computes
+        # (`ExtractionDispatcher.__init__`, settings from the same environment).
+        dispatch_identity=dispatch_identity_for(
+            pipeline.dispatch_gate_settings(), DispatcherSettings.from_env()
+        ),
     )

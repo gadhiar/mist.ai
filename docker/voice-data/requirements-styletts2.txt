@@ -1,0 +1,20 @@
+# /opt/venv-train-styletts2: StyleTTS2's unpinned upstream list, pinned by H2. The code is cloned
+# in train-styletts2.Dockerfile.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+SoundFile==0.13.1
+munch==4.0.0
+pydub==0.25.1
+pyyaml==6.0.2
+librosa==0.11.0
+nltk==3.9.1
+matplotlib==3.10.0
+accelerate==1.8.1
+transformers==4.57.6
+einops==0.8.1
+einops-exts==0.0.4
+tqdm==4.67.1
+phonemizer==3.6.0
+numpy==2.2.6
+monotonic-align @ git+https://github.com/resemble-ai/monotonic_align@c6e5e6cb19882164027eb6e35118e841eed9298e

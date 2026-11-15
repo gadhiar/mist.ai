@@ -22,7 +22,11 @@ from pydantic import BaseModel, Field
 # 1.1.0: additive -- InfoResponse gained four optional serving-config fields.
 # 1.2.0: additive -- ResultStamps.run_identity, and InfoResponse.run_identity
 # with its components, all optional; ExtractResponse.stage2_calls, default 1.
-CONTRACT_VERSION = "1.2.0"
+# 1.3.0: additive -- the serving identity: ExpectStamps.serving_identity,
+# ResultStamps.serving_identity, InfoResponse.serving_identity with its
+# components and error, ServiceStatus.serving_identity and
+# CutoverStatus.target_serving_identity, all optional.
+CONTRACT_VERSION = "1.3.0"
 CONTRACT_MAJOR = 1
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -73,10 +77,17 @@ class ExpectStamps(BaseModel):
     backend is responsible for composing its own graph-write stamp; this
     field only carries the bare LLM identity the service is expected to
     report back in `ResultStamps.model_hash`.
+
+    Attributes:
+        serving_identity: The serving identity the epoch is bound to (contract
+            1.3.0). The service refuses the job with `epoch_mismatch` when its
+            own identity differs. None asks for no check, which is what a
+            pre-1.3.0 backend sends.
     """
 
     extraction_version: str
     model_hash: str
+    serving_identity: str | None = None
 
 
 class DerivationInput(BaseModel):
@@ -155,6 +166,11 @@ class ResultStamps(BaseModel):
             adapter, the model and the llama.cpp build. It is recorded, not
             matched: no epoch or cache key reads it. None means not reported,
             by a pre-1.2.0 service or one wired without it.
+        serving_identity: The serving identity the service computed for this
+            job (contract 1.3.0): one hash over every serving setting that
+            changes extraction output, which an epoch is keyed on. None means
+            not reported, by a pre-1.3.0 service, or one that could not compute
+            it (see `InfoResponse.serving_identity_error`).
     """
 
     extraction_version: str
@@ -163,6 +179,7 @@ class ResultStamps(BaseModel):
     llama_cpp_build: str
     adapter: str
     run_identity: str | None = None
+    serving_identity: str | None = None
 
 
 class TimingsMs(BaseModel):
@@ -284,7 +301,8 @@ class InfoResponse(BaseModel):
     The four fields after `location_label` were added in contract 1.1.0 and
     describe the serving configuration a result was produced under, so a
     gauntlet run can record what it measured; the two `run_identity` fields
-    were added in 1.2.0. Each defaults to None: a 1.0.0 server's payload (the
+    were added in 1.2.0, and the three `serving_identity` fields in 1.3.0.
+    Each defaults to None: a 1.0.0 server's payload (the
     first seven fields only) still validates, and None always means "not
     reported" -- an older server, or a value the service could not read
     (`ctx_size` when llama-server's `/props` was unavailable).
@@ -303,6 +321,17 @@ class InfoResponse(BaseModel):
             stamped with (contract 1.2.0), computed once at service start.
         run_identity_components: The values `run_identity` hashes, by name,
             so a report can say which of them two runs differ in.
+        serving_identity: The serving identity of this call (contract 1.3.0),
+            computed from llama-server's `/props` read for it. None when it
+            cannot be computed; `serving_identity_error` says why.
+        serving_identity_components: The flat values `serving_identity`
+            hashes, so a backend can name the settings two identities differ
+            in. Reported whenever `/props` gave a context size, with or
+            without an identity.
+        serving_identity_error: Why `serving_identity` is None: a required
+            `EXTRACTION_SERVER_*` declaration is missing, `/props` is
+            unreadable, or the declared context size differs from the observed
+            one. None when the identity is reported, or by a pre-1.3.0 service.
     """
 
     contract_version: str
@@ -318,6 +347,9 @@ class InfoResponse(BaseModel):
     ctx_size: int | None = None
     run_identity: str | None = None
     run_identity_components: dict[str, str | int | float | bool | None] | None = None
+    serving_identity: str | None = None
+    serving_identity_components: dict[str, str | int | float | bool | None] | None = None
+    serving_identity_error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +358,12 @@ class InfoResponse(BaseModel):
 
 
 class ServiceStatus(BaseModel):
-    """Extraction service reachability/identity, as observed by the backend."""
+    """Extraction service reachability/identity, as observed by the backend.
+
+    Attributes:
+        serving_identity: The serving identity the service last reported
+            (contract 1.3.0). None when it reported none, or is unknown.
+    """
 
     reachable: bool
     location_label: str | None
@@ -334,6 +371,7 @@ class ServiceStatus(BaseModel):
     extraction_version: str | None
     contract_version: str | None
     last_health_ms: int | None
+    serving_identity: str | None = None
 
 
 class LastJob(BaseModel):
@@ -348,13 +386,19 @@ class LastJob(BaseModel):
 
 
 class CutoverStatus(BaseModel):
-    """Progress of a model/version cutover in flight, when one is running."""
+    """Progress of a model/version cutover in flight, when one is running.
+
+    Attributes:
+        target_serving_identity: The serving identity the candidate is bound
+            to (contract 1.3.0). None while it is unbound.
+    """
 
     state: Literal["filling", "ready", "checked", "promoted", "abandoned"]
     target_extraction_version: str
     target_model_hash: str
     covered: int
     total: int
+    target_serving_identity: str | None = None
 
 
 class ExtractionStatus(BaseModel):
