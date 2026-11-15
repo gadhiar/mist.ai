@@ -70,6 +70,9 @@ MUSIC_REASON = "unreachable"
 ROUTED_LIGHTS_REQUEST = "it is too dark in the bedroom"
 """Routed to lights by the keyword "dark", and matched by no fast-path row."""
 
+SCHEDULER_SLEEP_TASK = "alarm-scheduler-sleep"
+"""The name of the task in which `AlarmScheduler._sleep` calls `Clock.sleep`."""
+
 
 def _fixed_zone(key: str = ZONE_NAME, offset_s: int = 0) -> ZoneInfo:
     """A `ZoneInfo` with one fixed offset, built from TZif v1 bytes, no tz database needed."""
@@ -81,13 +84,43 @@ def _fixed_zone(key: str = ZONE_NAME, offset_s: int = 0) -> ZoneInfo:
 ZONE = _fixed_zone()
 
 
+class _TaskClock(FakeClock):
+    """A `FakeClock` that also records the deadline of each pending sleep by its task's name.
+
+    The host has several tasks sleeping on the clock at once (the status watcher, the lights
+    catalog refresh, the Home Assistant reconnect backoff), so a count of pending sleepers can
+    be met by the wrong one. The name tells the alarm scheduler's sleep apart from the rest.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending: dict[asyncio.Task[object], datetime] = {}
+
+    async def sleep(self, seconds: float) -> None:
+        task = asyncio.current_task()
+        if seconds <= 0 or task is None:
+            await super().sleep(seconds)
+            return
+        # Recorded in the same step as `FakeClock.sleep` registers the sleeper, so a deadline
+        # seen here is one `advance` will wake.
+        self._pending[task] = self.now() + timedelta(seconds=seconds)
+        try:
+            await super().sleep(seconds)
+        finally:
+            self._pending.pop(task, None)
+
+    def deadline_of(self, task_name: str) -> datetime | None:
+        """The deadline of the pending sleep of the task named `task_name`, if it has one."""
+        return next((d for t, d in self._pending.items() if t.get_name() == task_name), None)
+
+
 @dataclass
 class Offline:
     """One offline host and what it was given."""
 
     build: CapabilityBuild
     host: CapabilityHost
-    clock: FakeClock
+    clock: _TaskClock
     power: FakePower
     tiers: FakeTiers
     sink: RecordingEventSink
@@ -160,7 +193,7 @@ class _Builder:
             home_assistant.open_failures.append(connect_refused())
             return home_assistant.transport()
 
-        clock = FakeClock()
+        clock = _TaskClock()
         power = FakePower(level)
         tiers = tiers if tiers is not None else FakeTiers({"interaction": PROVIDER})
         sink = RecordingEventSink()
@@ -241,13 +274,29 @@ async def _seed_alarm(builder: _Builder) -> None:
     builder.builds.remove(before.build)
 
 
+async def _advance_with_scheduler(rig: Offline, to: datetime) -> None:
+    """Move the clock to `to` one alarm scheduler sleep at a time.
+
+    The scheduler reads the store on a worker thread, then starts its sleep in a task of its
+    own, so its sleep is registered some loop iterations after it computed the duration. Time
+    that moves in that gap pushes the deadline past the one it computed, and past `to`. Each
+    step therefore waits until the scheduler's own sleep is registered and advances exactly to
+    its deadline, and the clock stays there while the scheduler ticks and sleeps again.
+    """
+    while rig.clock.now() < to:
+        await _until(lambda: rig.clock.deadline_of(SCHEDULER_SLEEP_TASK) is not None)
+        deadline = rig.clock.deadline_of(SCHEDULER_SLEEP_TASK)
+        assert deadline is not None and deadline <= to, f"scheduler sleeps until {deadline}"
+        await rig.clock.advance((deadline - rig.clock.now()).total_seconds())
+
+
 async def _advance_to_ring(rig: Offline) -> None:
     """Move the clock to 07:05, then wait for the ring the scheduler sends from its own task.
 
-    The scheduler sleeps in an inner task and reads the store on a worker thread, so its ring
-    can land after `advance` returns; the clock stays at 07:05 while the test waits.
+    The scheduler's tick at 07:05 runs after the `advance` that woke it returns; the clock
+    stays at 07:05 while the test waits.
     """
-    await rig.clock.advance((ALARM_AT - DEFAULT_START).total_seconds())
+    await _advance_with_scheduler(rig, ALARM_AT)
     await _until(lambda: bool(_fired(rig.sink)))
 
 
@@ -351,7 +400,7 @@ class TestOfflineDegradation:
 
         await _advance_to_ring(rig)
         (fired,) = _fired(rig.sink)
-        await rig.clock.advance(RING_TIMEOUT_S)
+        await _advance_with_scheduler(rig, ALARM_AT + timedelta(seconds=RING_TIMEOUT_S))
         await _until(lambda: bool(_missed(rig.sink)))
 
         assert _missed(rig.sink) == [(fired["alarm_id"], "unheard")]
