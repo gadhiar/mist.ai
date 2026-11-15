@@ -179,9 +179,16 @@ def _day(date: str, **changes: object) -> dict[str, object]:
         "by_level": {"full": 0, "low": 0, "off": 0},
         "by_status": {},
         "turn_ms": {"p50": None, "p90": None},
+        "turn_ms_by_level": _levels(),
     }
     day.update(changes)
     return day
+
+
+def _levels(**changes: dict[str, int | None]) -> dict[str, dict[str, int | None]]:
+    """A day's `turn_ms_by_level`: every level null unless changed."""
+    null = {"p50": None, "p90": None}
+    return {"full": null, "low": null, "off": null} | changes
 
 
 def _alarms(date: str, **changes: int) -> dict[str, object]:
@@ -234,6 +241,9 @@ class TestShape:
                     by_level={"full": 1, "low": 1, "off": 0},
                     by_status={"ok": 2},
                     turn_ms={"p50": 120, "p90": 900},
+                    turn_ms_by_level=_levels(
+                        full={"p50": 120, "p90": 120}, low={"p50": 900, "p90": 900}
+                    ),
                 ),
                 _day(
                     "2026-01-04",
@@ -243,6 +253,7 @@ class TestShape:
                     by_level={"full": 0, "low": 0, "off": 1},
                     by_status={"pending_confirmation": 1},
                     turn_ms={"p50": 2500, "p90": 2500},
+                    turn_ms_by_level=_levels(off={"p50": 2500, "p90": 2500}),
                 ),
             ],
             "alarms": [
@@ -282,6 +293,23 @@ class TestShape:
         assert body["alarms_since"] is None
         assert body["alarms"] == [_alarms("2026-01-05")]
         assert body["days"][0]["invocations"] == 1
+
+    def test_each_level_answers_its_own_p50_and_p90(self, endpoint):
+        rig = endpoint.rig()
+        rig.actions(
+            _row(datetime(2026, 1, 5, 6, 0, tzinfo=UTC), power_level="full", turn_ms=1000),
+            _row(datetime(2026, 1, 5, 6, 10, tzinfo=UTC), power_level="low", turn_ms=500),
+            _row(datetime(2026, 1, 5, 6, 20, tzinfo=UTC), power_level="full", turn_ms=100),
+        )
+
+        body = endpoint.client.get("/capabilities/usage", params={"days": 1}).json()
+
+        # A swapped p50 and p90, or one level's rows read as another's, changes this body.
+        assert body["days"][0]["turn_ms_by_level"] == {
+            "full": {"p50": 100, "p90": 1000},
+            "low": {"p50": 500, "p90": 500},
+            "off": {"p50": None, "p90": None},
+        }
 
 
 # -- Time zone -----------------------------------------------------------------------------------

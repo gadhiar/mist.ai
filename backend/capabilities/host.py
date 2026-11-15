@@ -631,6 +631,10 @@ class CapabilityHost(CapabilityTurnPort):
             "by_level": dict(day.by_level),
             "by_status": self._redacted_counts(day.by_status),
             "turn_ms": {"p50": day.turn_ms_p50, "p90": day.turn_ms_p90},
+            "turn_ms_by_level": {
+                level: {"p50": latency.p50, "p90": latency.p90}
+                for level, latency in day.turn_ms_by_level.items()
+            },
         }
 
     def _redacted_counts(self, counts: Mapping[str, int]) -> dict[str, int]:

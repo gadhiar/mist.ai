@@ -10,7 +10,13 @@ from typing import TypeVar
 
 import pytest
 
-from backend.capabilities.action_log import MAX_ROWS, ActionLog, ActionLogEntry, DayUsage
+from backend.capabilities.action_log import (
+    MAX_ROWS,
+    ActionLog,
+    ActionLogEntry,
+    DayUsage,
+    TurnLatency,
+)
 from backend.capabilities.contracts import InvocationContext
 from backend.capabilities.db import CapabilitiesDb
 from backend.capabilities.decoder import ActionDecoder
@@ -316,6 +322,12 @@ class TestFailures:
 # -- Usage -----------------------------------------------------------------------------------------
 
 NOW = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
+NO_LATENCY = TurnLatency(p50=None, p90=None)
+
+
+def _levels(**changes: TurnLatency) -> dict[str, TurnLatency]:
+    """The per-level latency of a day: every level null unless changed."""
+    return {"full": NO_LATENCY, "low": NO_LATENCY, "off": NO_LATENCY} | changes
 
 
 def _empty_day(day: date) -> DayUsage:
@@ -328,6 +340,7 @@ def _empty_day(day: date) -> DayUsage:
         by_status={},
         turn_ms_p50=None,
         turn_ms_p90=None,
+        turn_ms_by_level=_levels(),
     )
 
 
@@ -392,6 +405,11 @@ class TestUsage:
                 by_status={"ok": 2, "pending_confirmation": 1, "denied": 1},
                 turn_ms_p50=200,
                 turn_ms_p90=300,
+                turn_ms_by_level=_levels(
+                    full=TurnLatency(p50=100, p90=100),
+                    low=TurnLatency(p50=200, p90=200),
+                    off=TurnLatency(p50=300, p90=300),
+                ),
             ),
             DayUsage(
                 date=date(2026, 1, 4),
@@ -402,6 +420,7 @@ class TestUsage:
                 by_status={"error": 1},
                 turn_ms_p50=50,
                 turn_ms_p90=50,
+                turn_ms_by_level=_levels(full=TurnLatency(p50=50, p90=50)),
             ),
             _empty_day(date(2026, 1, 3)),
         )
@@ -415,6 +434,92 @@ class TestUsage:
         (today,) = (await log.usage(1, UTC, now=NOW)).days
 
         assert (today.turn_ms_p50, today.turn_ms_p90) == (50, 90)
+
+    @pytest.mark.asyncio
+    async def test_each_level_gets_its_own_nearest_rank_percentiles(self, tmp_path):
+        log = ActionLog(CapabilitiesDb(str(tmp_path / "capabilities.db")))
+        # Levels interleaved and out of order, so neither the insertion order nor a neighbouring
+        # level's values can give a level its percentiles.
+        await _seed(
+            log,
+            *(
+                {"power_level": level, "turn_ms": ms}
+                for level, ms in (
+                    ("full", 140),
+                    ("low", 900),
+                    ("full", 110),
+                    ("off", 7),
+                    ("low", 50),
+                    ("full", 130),
+                    ("low", 60),
+                    ("full", 120),
+                )
+            ),
+        )
+
+        (today,) = (await log.usage(1, UTC, now=NOW)).days
+
+        assert today.turn_ms_by_level == _levels(
+            full=TurnLatency(p50=120, p90=140),
+            low=TurnLatency(p50=60, p90=900),
+            off=TurnLatency(p50=7, p90=7),
+        )
+        # The day-wide percentiles pool every row, as before: 7, 50, 60, 110, 120, 130, 140, 900.
+        assert (today.turn_ms_p50, today.turn_ms_p90) == (110, 900)
+
+    @pytest.mark.asyncio
+    async def test_a_level_with_no_turn_ms_or_no_rows_is_null(self, tmp_path):
+        log = ActionLog(CapabilitiesDb(str(tmp_path / "capabilities.db")))
+        await _seed(
+            log,
+            {"power_level": "full", "turn_ms": 300},
+            # Logged at `low` by a writer that did not know the turn time.
+            {"power_level": "low"},
+            {"power_level": "low"},
+        )
+
+        (today,) = (await log.usage(1, UTC, now=NOW)).days
+
+        assert today.by_level == {"full": 1, "low": 2, "off": 0}
+        assert today.turn_ms_by_level == _levels(full=TurnLatency(p50=300, p90=300))
+
+    @pytest.mark.asyncio
+    async def test_a_row_with_no_level_counts_day_wide_and_in_no_level(self, tmp_path):
+        log = ActionLog(CapabilitiesDb(str(tmp_path / "capabilities.db")))
+        await _seed(
+            log,
+            {"power_level": "full", "turn_ms": 100},
+            # Written before the power port: a turn time but no level.
+            {"turn_ms": 5000},
+        )
+
+        (today,) = (await log.usage(1, UTC, now=NOW)).days
+
+        assert (today.turn_ms_p50, today.turn_ms_p90) == (100, 5000)
+        assert today.turn_ms_by_level == _levels(full=TurnLatency(p50=100, p90=100))
+
+    @pytest.mark.asyncio
+    async def test_every_empty_day_carries_every_level_with_nulls(self, tmp_path):
+        log = ActionLog(CapabilitiesDb(str(tmp_path / "capabilities.db")))
+        await _seed(log, {"power_level": "off", "turn_ms": 40})
+
+        usage = await log.usage(3, UTC, now=NOW)
+
+        empty = {"full": NO_LATENCY, "low": NO_LATENCY, "off": NO_LATENCY}
+        assert [day.turn_ms_by_level for day in usage.days] == [
+            _levels(off=TurnLatency(p50=40, p90=40)),
+            empty,
+            empty,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_per_level_latency_cannot_be_changed(self, tmp_path):
+        log = ActionLog(CapabilitiesDb(str(tmp_path / "capabilities.db")))
+
+        (today,) = (await log.usage(1, UTC, now=NOW)).days
+
+        with pytest.raises(TypeError):
+            today.turn_ms_by_level["full"] = TurnLatency(p50=1, p90=1)  # type: ignore[index]
 
     @pytest.mark.asyncio
     async def test_every_day_is_present_newest_first_on_an_empty_log(self, tmp_path):

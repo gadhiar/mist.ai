@@ -12,8 +12,10 @@ import asyncio
 import logging
 import sqlite3
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, tzinfo
+from types import MappingProxyType
 
 from backend.errors import CapabilityStoreError, MistError
 
@@ -119,6 +121,19 @@ class ActionLogEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnLatency:
+    """The nearest-rank p50 and p90 of a set of `turn_ms` values; both None when it is empty.
+
+    Attributes:
+        p50: The nearest-rank median.
+        p90: The nearest-rank 90th percentile.
+    """
+
+    p50: int | None
+    p90: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class DayUsage:
     """The invocations logged on one local date, counts and latency only.
 
@@ -132,6 +147,11 @@ class DayUsage:
         by_status: Rows per outcome status, for the statuses that occur.
         turn_ms_p50: The nearest-rank median of the day's `turn_ms`; None when no row has one.
         turn_ms_p90: The nearest-rank 90th percentile, likewise.
+        turn_ms_by_level: The same percentiles per `USAGE_LEVELS` key, every key present and in
+            that order, each over the rows logged at that level; a level with no row holding a
+            `turn_ms` reads None in both. A row with no level counts in `turn_ms_p50` and
+            `turn_ms_p90` and in no key, as in `by_level`. Read-only, so a frozen `DayUsage`
+            cannot be changed through it.
     """
 
     date: date
@@ -142,6 +162,7 @@ class DayUsage:
     by_status: dict[str, int]
     turn_ms_p50: int | None
     turn_ms_p90: int | None
+    turn_ms_by_level: Mapping[str, TurnLatency]
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +341,7 @@ def _day_usage(day: date, rows: list[tuple[object, ...]]) -> DayUsage:
     by_source = dict.fromkeys(USAGE_SOURCES, 0)
     by_level = dict.fromkeys(USAGE_LEVELS, 0)
     turn_ms: list[int] = []
+    turn_ms_per_level: dict[str, list[int]] = {level: [] for level in USAGE_LEVELS}
     for capability, source, status, level, elapsed in rows:
         by_capability[str(capability)] += 1
         by_status[str(status)] += 1
@@ -329,6 +351,8 @@ def _day_usage(day: date, rows: list[tuple[object, ...]]) -> DayUsage:
             by_level[level] += 1  # type: ignore[index]
         if isinstance(elapsed, int):
             turn_ms.append(elapsed)
+            if level in turn_ms_per_level:
+                turn_ms_per_level[level].append(elapsed)  # type: ignore[index]
     turn_ms.sort()
     return DayUsage(
         date=day,
@@ -339,4 +363,12 @@ def _day_usage(day: date, rows: list[tuple[object, ...]]) -> DayUsage:
         by_status=dict(by_status),
         turn_ms_p50=_nearest_rank(turn_ms, 50),
         turn_ms_p90=_nearest_rank(turn_ms, 90),
+        turn_ms_by_level=MappingProxyType(
+            {level: _turn_latency(values) for level, values in turn_ms_per_level.items()}
+        ),
     )
+
+
+def _turn_latency(values: list[int]) -> TurnLatency:
+    ordered = sorted(values)
+    return TurnLatency(p50=_nearest_rank(ordered, 50), p90=_nearest_rank(ordered, 90))
