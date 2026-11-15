@@ -26,8 +26,33 @@ ones, loaded only from `/opt/models` (Design point 17): the embedder from
 `--rerank-model` overrides. `--threads N` sets torch's intra-op thread count before any model
 loads; without it torch keeps its default.
 
+`--probes PATH` picks the probe file, by default the fixture directory's `probes.jsonl`; the
+held-out runs pass `heldout_probes.jsonl`. The facts, notes and corrections stay the fixture
+directory's.
+
+`--device` places the reranker and `--embedder-device` the embedder, by default on `--device`;
+each record names the embedder's device as `embedder_device`.
+
 `--cpu-load-procs N` runs N busy-loop processes for the whole run, to measure the critical path
-with the CPU contended the way a speaking turn contends it.
+with the CPU contended the way a speaking turn contends it. `--gpu-load-procs N` runs N
+processes each looping a matmul on `cuda` for the whole run, to measure it with the GPU
+contended; it is refused with exit 2 when CUDA is unavailable.
+
+`--vram-log PATH` writes the process's GPU memory, in MiB, at named points (`VramRecorder`):
+`before_cuda`, NVML's device-wide used memory before anything in the process touches CUDA;
+`context`, once the process holds its CUDA context; `stt`, with `--vram-stt`; `loaded`, once
+the reranker loads; `after_run`, after the last probe; and `released`, after the reranker's
+`release()` and the Whisper model's release, as gaming mode releases both. From `context` on
+each point also carries `mem_get_info`'s used memory and the caching allocator's four counts.
+The derived figures are differences of NVML used memory: `process_mib` (after_run less
+before_cuda, the gated figure), `context_mib`, `stt_mib`, `marginal_mib` (the reranker's own
+share) and `residual_mib` (what a gaming release leaves). The log needs CUDA and NVML, and is
+refused with exit 2 when the embedder would be on CUDA or with `--gpu-load-procs`, since either
+would share the device-wide figure. `--vram-stt MODEL` loads that Whisper model on `cuda` before
+the reranker and transcribes one fixed 30 s clip with `fp16=False`, as the speech path does, so
+the process holds what the backend holds after a voice turn; it needs `--vram-log`. NVML,
+torch's CUDA calls, the Whisper loader and the GPU load come through `GpuAccess`, which tests
+replace.
 
 `--placement` builds the block for `user_prefix` (the default) or `system_tail`; it changes
 only the wording of the user's past words inside the block (block.py, `BlockPlacement`).
@@ -49,10 +74,11 @@ after each fetch returns, never inside the timed path.
 Usage, from the repository root (`/app` in the image), so `backend` imports:
     python -m scripts.eval_harness.memory_recall_run --output run.jsonl
         [--embedder fake|real] [--reranker fake|real] [--device cpu|cuda]
-        [--rerank-model PATH] [--threads N] [--placement user_prefix|system_tail]
-        [--cpu-load-procs N] [--rescan-facts N --rescan-log FILE] [--trace FILE]
-        [--block-tokens N] [--min-score X] [--rerank-top-n N]
-        [--list-max-items N] [--deadline-ms N] [--fixture-dir DIR]
+        [--embedder-device cpu|cuda] [--rerank-model PATH] [--threads N]
+        [--placement user_prefix|system_tail] [--cpu-load-procs N] [--gpu-load-procs N]
+        [--vram-log FILE [--vram-stt MODEL]] [--rescan-facts N --rescan-log FILE]
+        [--trace FILE] [--block-tokens N] [--min-score X] [--rerank-top-n N]
+        [--list-max-items N] [--deadline-ms N] [--fixture-dir DIR] [--probes FILE]
 """
 
 from __future__ import annotations
@@ -60,6 +86,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import gc
 import hashlib
 import json
 import math
@@ -75,6 +102,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+import numpy as np
 import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -135,6 +163,16 @@ Device = Literal["cpu", "cuda"]
 _LOAD_JOIN_TIMEOUT_S = 5.0
 # Busy-loop iterations between checks of the stop event, so a check costs little of the load.
 _SPIN_BATCH = 100_000
+# The GPU load: square fp32 matrices of this side, and matmuls queued between synchronizes and
+# checks of the stop event.
+_MATMUL_SIZE = 2048
+_MATMUL_BATCH = 16
+# `--vram-stt`'s clip: 30 s at Whisper's 16 kHz, low-level noise from a fixed seed.
+_STT_SAMPLE_RATE = 16_000
+_STT_CLIP_S = 30
+_STT_CLIP_SEED = 0
+_STT_CLIP_LEVEL = 0.1
+_MIB = 1024 * 1024
 
 
 # -- the models ------------------------------------------------------------------------------
@@ -249,6 +287,13 @@ class TokenReranker:
         if budget_ms <= 0:
             return 0
         return int(budget_ms * self.pairs_per_ms)
+
+    def release(self) -> None:
+        """Nothing: the fake holds no model memory, so `--vram-log` runs release it as a no-op."""
+
+    def reload(self) -> bool:
+        """True: there is no model to load again."""
+        return True
 
 
 def _model_path(path: str | Path) -> str:
@@ -621,6 +666,7 @@ def run_record(
     *,
     counter: ApproximateTokenCounter,
     cpu_load_procs: int,
+    embedder_device: Device,
 ) -> dict[str, object]:
     """One run-file record: the scorer's keys and the per-probe measurements."""
     timings = result.timings
@@ -642,6 +688,7 @@ def run_record(
         "degraded_reason": result.degraded_reason,
         "delta_tokens_est": counter.count(result.block_text or "") + counter.count(probe.query),
         "cpu_load_procs": cpu_load_procs,
+        "embedder_device": embedder_device,
     }
 
 
@@ -655,10 +702,15 @@ class Fixture:
     corrections: tuple[Correction, ...]
 
     @classmethod
-    def load(cls, directory: Path = FIXTURE_DIR) -> Fixture:
-        """Every file the run needs from `directory`."""
+    def load(cls, directory: Path = FIXTURE_DIR, probes: Path | None = None) -> Fixture:
+        """Every file the run needs from `directory`, the probes from `probes` when given.
+
+        Args:
+            directory: The fixture directory.
+            probes: The probe file; None reads `directory`'s `probes.jsonl`.
+        """
         return cls(
-            probes=load_probes(directory / "probes.jsonl"),
+            probes=load_probes(probes if probes is not None else directory / "probes.jsonl"),
             facts=load_facts(directory / "facts.jsonl"),
             notes=load_vault_notes(directory / "vault_notes.jsonl"),
             corrections=load_corrections(directory / "corrections.jsonl"),
@@ -808,6 +860,7 @@ def trace_header(
     return {
         "record": "run",
         "device": args.device,
+        "embedder_device": args.embedder_device,
         "threads": torch.get_num_threads(),
         "embedder": args.embedder,
         "embedder_path": str(EMBEDDER_PATH) if args.embedder == "real" else None,
@@ -819,6 +872,7 @@ def trace_header(
         "placement": args.placement,
         "rescan_facts": args.rescan_facts or 0,
         "cpu_load_procs": args.cpu_load_procs,
+        "gpu_load_procs": args.gpu_load_procs,
     }
 
 
@@ -1247,6 +1301,7 @@ async def run_fixture(
     workdir: Path,
     probes: Sequence[Probe] | None = None,
     cpu_load_procs: int = 0,
+    embedder_device: Device = "cpu",
     placement: BlockPlacement = "user_prefix",
     rescan: ForcedRescan | None = None,
     trace: TraceSetup | None = None,
@@ -1254,6 +1309,8 @@ async def run_fixture(
     """Run each probe through a real fetcher over indexes built in `workdir`.
 
     Args:
+        embedder_device: The device the command line placed the embedder on, written in each
+            record; the fakes run in Python, so the default suits them.
         placement: The placement the block builder words the block for.
         rescan: Forced rescans to run on the run's `memory-index` executor for the whole
             run; started here and stopped before the executors shut down.
@@ -1337,6 +1394,7 @@ async def run_fixture(
                     outcome.lists,
                     counter=counter,
                     cpu_load_procs=cpu_load_procs,
+                    embedder_device=embedder_device,
                 )
                 if tracer is not None:
                     await tracer.trace(probe, outcome, indexed_notes=indexed_notes)
@@ -1388,16 +1446,37 @@ def _default_context() -> multiprocessing.context.BaseContext:
     return multiprocessing.get_context("spawn")
 
 
+def matmul_loop(stop: _Event, device: str, size: int = _MATMUL_SIZE) -> None:
+    """Keep `device` busy with square matmuls until `stop` is set.
+
+    A batch of matmuls is queued, then waited for on CUDA, before each check of `stop`, so the
+    queue stays short and the process stops within a batch of being told.
+    """
+    a = torch.randn(size, size, device=device)
+    b = torch.randn(size, size, device=device)
+    on_cuda = torch.device(device).type == "cuda"
+    while not stop.is_set():
+        for _ in range(_MATMUL_BATCH):
+            torch.matmul(a, b)
+        if on_cuda:
+            torch.cuda.synchronize(device)
+
+
 @contextlib.contextmanager
-def cpu_load(
+def _load_processes(
     procs: int,
     *,
-    process_factory: Callable[..., _Process] | None = None,
-    event_factory: Callable[[], _Event] | None = None,
-    clock: Callable[[], float] = time.monotonic,
-    join_timeout_s: float = _LOAD_JOIN_TIMEOUT_S,
+    what: str,
+    name: str,
+    target: Callable[..., None],
+    args: tuple[object, ...],
+    context: multiprocessing.context.BaseContext,
+    process_factory: Callable[..., _Process] | None,
+    event_factory: Callable[[], _Event] | None,
+    clock: Callable[[], float],
+    join_timeout_s: float,
 ) -> Iterator[list[_Process]]:
-    """Run `procs` busy-loop processes for the body, then stop them.
+    """Run `procs` processes of `target(stop, *args)` for the body, then stop them.
 
     Stopping sets the shared event and joins each process within `join_timeout_s` in total,
     by `clock`; a process still alive then is terminated.
@@ -1406,17 +1485,18 @@ def cpu_load(
         ValueError: `procs` is negative.
     """
     if procs < 0:
-        raise ValueError(f"cpu load processes must not be negative, got {procs}")
+        raise ValueError(f"{what} load processes must not be negative, got {procs}")
     if procs == 0:
         yield []
         return
-    context = _default_context()
     make_process = process_factory or context.Process
     stop = (event_factory or context.Event)()
     started: list[_Process] = []
     try:
         for n in range(procs):
-            process = make_process(target=spin, args=(stop,), name=f"memory-load-{n}", daemon=True)
+            process = make_process(
+                target=target, args=(stop, *args), name=f"{name}-{n}", daemon=True
+            )
             process.start()
             started.append(process)
         yield started
@@ -1429,6 +1509,312 @@ def cpu_load(
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1.0)
+
+
+def cpu_load(
+    procs: int,
+    *,
+    process_factory: Callable[..., _Process] | None = None,
+    event_factory: Callable[[], _Event] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    join_timeout_s: float = _LOAD_JOIN_TIMEOUT_S,
+) -> contextlib.AbstractContextManager[list[_Process]]:
+    """Run `procs` busy-loop processes for the body, then stop them (`_load_processes`).
+
+    Raises:
+        ValueError: `procs` is negative.
+    """
+    return _load_processes(
+        procs,
+        what="cpu",
+        name="memory-load",
+        target=spin,
+        args=(),
+        context=_default_context(),
+        process_factory=process_factory,
+        event_factory=event_factory,
+        clock=clock,
+        join_timeout_s=join_timeout_s,
+    )
+
+
+def gpu_load(
+    procs: int,
+    *,
+    process_factory: Callable[..., _Process] | None = None,
+    event_factory: Callable[[], _Event] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    join_timeout_s: float = _LOAD_JOIN_TIMEOUT_S,
+) -> contextlib.AbstractContextManager[list[_Process]]:
+    """Run `procs` processes looping matmuls on `cuda` for the body, then stop them.
+
+    Each process makes its own CUDA context, so the processes are spawned rather than forked: a
+    forked child cannot use CUDA once its parent has initialized it. The caller checks that
+    CUDA is available first. Stopping is `_load_processes`'s.
+
+    Raises:
+        ValueError: `procs` is negative.
+    """
+    return _load_processes(
+        procs,
+        what="gpu",
+        name="memory-gpu-load",
+        target=matmul_loop,
+        args=("cuda",),
+        context=multiprocessing.get_context("spawn"),
+        process_factory=process_factory,
+        event_factory=event_factory,
+        clock=clock,
+        join_timeout_s=join_timeout_s,
+    )
+
+
+# -- GPU memory ------------------------------------------------------------------------------
+
+
+class GpuUnavailableError(RuntimeError):
+    """NVML or CUDA, which a GPU measurement needs, is not available to the process."""
+
+
+class NvmlReader(Protocol):
+    """Device-wide used memory, read through NVML, which never touches CUDA."""
+
+    def used_bytes(self) -> int:
+        """The device's used memory in bytes, every process's and the driver's."""
+        ...
+
+    def close(self) -> None:
+        """Release NVML."""
+        ...
+
+
+class PynvmlReader:
+    """NVML through pynvml, on GPU index 0, the one device the run's `cuda` names.
+
+    Args:
+        nvml: The imported pynvml module.
+        handle: The device's NVML handle.
+    """
+
+    def __init__(self, nvml: object, handle: object) -> None:
+        self._nvml = nvml
+        self._handle = handle
+
+    @classmethod
+    def open(cls, index: int = 0) -> PynvmlReader:
+        """Initialize NVML and take device `index`'s handle.
+
+        Raises:
+            GpuUnavailableError: pynvml is not installed, or NVML cannot initialize or find the
+                device.
+        """
+        try:
+            import pynvml
+        except ImportError as exc:
+            raise GpuUnavailableError(f"NVML is not available: {exc}") from exc
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        except pynvml.NVMLError as exc:
+            raise GpuUnavailableError(f"NVML is not available: {exc}") from exc
+        return cls(pynvml, handle)
+
+    def used_bytes(self) -> int:
+        """The device's used memory in bytes, every process's and the driver's."""
+        return int(self._nvml.nvmlDeviceGetMemoryInfo(self._handle).used)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        """Shut NVML down; an error doing so is ignored, since the readings are taken."""
+        nvml_error = self._nvml.NVMLError  # type: ignore[attr-defined]
+        with contextlib.suppress(nvml_error):
+            self._nvml.nvmlShutdown()  # type: ignore[attr-defined]
+
+
+class TorchCuda:
+    """The CUDA calls the VRAM log makes, through one torch module, so a test can pass a fake.
+
+    Args:
+        module: The torch module; tests pass a recording stand-in.
+    """
+
+    def __init__(self, module: object = torch) -> None:
+        self._torch = module
+
+    def is_available(self) -> bool:
+        """Whether torch can use CUDA."""
+        return bool(self._torch.cuda.is_available())  # type: ignore[attr-defined]
+
+    def create_context(self) -> None:
+        """Create the process's CUDA context: a one-element tensor on `cuda`, then a synchronize.
+
+        `torch.cuda.init()` alone initializes torch's CUDA state without necessarily creating
+        the context, so the figure after it could miss the context's memory.
+        """
+        self._torch.ones(1, device="cuda")  # type: ignore[attr-defined]
+        self._torch.cuda.synchronize()  # type: ignore[attr-defined]
+
+    def reading(self) -> dict[str, int]:
+        """The device's used memory by `mem_get_info` and the caching allocator's counts, in bytes.
+
+        Synchronizes first, so work still queued has finished before the counts are read.
+        """
+        cuda = self._torch.cuda  # type: ignore[attr-defined]
+        cuda.synchronize()
+        free, total = cuda.mem_get_info()
+        return {
+            "mem_get_info_used": int(total - free),
+            "memory_allocated": int(cuda.memory_allocated()),
+            "max_memory_allocated": int(cuda.max_memory_allocated()),
+            "memory_reserved": int(cuda.memory_reserved()),
+            "max_memory_reserved": int(cuda.max_memory_reserved()),
+        }
+
+    def empty_cache(self) -> None:
+        """Return the caching allocator's unused blocks to the driver."""
+        self._torch.cuda.empty_cache()  # type: ignore[attr-defined]
+
+
+class SttModel(Protocol):
+    """The Whisper model's one call the VRAM log makes."""
+
+    def transcribe(self, audio: np.ndarray, **kwargs: object) -> object:
+        """Transcribe 16 kHz mono float audio."""
+        ...
+
+
+def load_whisper_model(name: str) -> SttModel:
+    """Load Whisper model `name` on `cuda`; `whisper` is imported only here, for `--vram-stt`."""
+    import whisper
+
+    return whisper.load_model(name, device="cuda")
+
+
+def stt_clip() -> np.ndarray:
+    """The clip `--vram-stt` transcribes: 30 s at 16 kHz of low-level noise from a fixed seed."""
+    rng = np.random.default_rng(_STT_CLIP_SEED)
+    samples = rng.standard_normal(_STT_SAMPLE_RATE * _STT_CLIP_S) * _STT_CLIP_LEVEL
+    return samples.astype(np.float32)
+
+
+@dataclass(frozen=True, slots=True)
+class GpuAccess:
+    """What the GPU flags reach the GPU through; tests pass fakes for each.
+
+    Attributes:
+        cuda: Torch's CUDA calls.
+        open_nvml: Opens the NVML reader; raises GpuUnavailableError without NVML.
+        load_whisper: Loads a Whisper model on `cuda` by name.
+        load_procs: Runs N GPU load processes for a `with` body.
+    """
+
+    cuda: TorchCuda
+    open_nvml: Callable[[], NvmlReader]
+    load_whisper: Callable[[str], SttModel]
+    load_procs: Callable[[int], contextlib.AbstractContextManager[object]]
+
+
+def default_gpu_access() -> GpuAccess:
+    """The real GPU: torch, pynvml, openai-whisper and spawned matmul processes."""
+    return GpuAccess(
+        cuda=TorchCuda(torch),
+        open_nvml=PynvmlReader.open,
+        load_whisper=load_whisper_model,
+        load_procs=gpu_load,
+    )
+
+
+def _mib(value: int) -> float:
+    return round(value / _MIB, 3)
+
+
+class VramRecorder:
+    """Reads the process's GPU memory at the `--vram-log` points and derives the figures.
+
+    `start` opens NVML and reads `before_cuda` before any CUDA call, then checks CUDA, creates
+    the context and reads `context`; with an STT model name it loads that Whisper model,
+    transcribes `stt_clip()` once with `fp16=False` and reads `stt`. The caller reads `loaded`
+    and `after_run` with `read`, and `release` releases the reranker and the Whisper model
+    before it reads `released`.
+
+    Args:
+        gpu: The GPU access.
+        stt_model: The Whisper model to load, or None for no STT point.
+    """
+
+    def __init__(self, gpu: GpuAccess, *, stt_model: str | None) -> None:
+        self._gpu = gpu
+        self._stt_name = stt_model
+        self._stt: SttModel | None = None
+        self._nvml: NvmlReader | None = None
+        self.points: dict[str, dict[str, float]] = {}
+
+    def start(self) -> None:
+        """Read `before_cuda`, make the context and read `context`, then the STT point.
+
+        Raises:
+            GpuUnavailableError: NVML or CUDA is not available.
+        """
+        self._nvml = self._gpu.open_nvml()
+        self.points["before_cuda"] = {"nvml_used": _mib(self._nvml.used_bytes())}
+        if not self._gpu.cuda.is_available():
+            raise GpuUnavailableError("CUDA is not available")
+        self._gpu.cuda.create_context()
+        self.read("context")
+        if self._stt_name is not None:
+            model = self._gpu.load_whisper(self._stt_name)
+            model.transcribe(stt_clip(), fp16=False)
+            self._stt = model
+            del model
+            self.read("stt")
+
+    def read(self, point: str) -> None:
+        """Record `point`: NVML used memory, then torch's readings, all in MiB."""
+        if self._nvml is None:
+            raise RuntimeError("VramRecorder.read before start")
+        cuda = self._gpu.cuda.reading()
+        reading = {"nvml_used": _mib(self._nvml.used_bytes())}
+        reading.update({key: _mib(value) for key, value in cuda.items()})
+        self.points[point] = reading
+
+    def release(self, reranker: Reranker) -> None:
+        """Release the reranker, drop the Whisper model and empty the cache, then read `released`."""
+        reranker.release()
+        self._stt = None
+        gc.collect()
+        self._gpu.cuda.empty_cache()
+        self.read("released")
+
+    def close(self) -> None:
+        """Shut the NVML reader down, if it was opened."""
+        if self._nvml is not None:
+            self._nvml.close()
+            self._nvml = None
+
+    def derived(self) -> dict[str, float | None]:
+        """The figures over NVML used memory, each a difference of two points."""
+
+        def used(point: str) -> float:
+            return self.points[point]["nvml_used"]
+
+        has_stt = "stt" in self.points
+        return {
+            "process_mib": round(used("after_run") - used("before_cuda"), 3),
+            "context_mib": round(used("context") - used("before_cuda"), 3),
+            "stt_mib": round(used("stt") - used("context"), 3) if has_stt else None,
+            "marginal_mib": round(used("after_run") - used("stt" if has_stt else "context"), 3),
+            "residual_mib": round(used("released") - used("before_cuda"), 3),
+        }
+
+    def log(self, *, device: Device, embedder_device: Device) -> dict[str, object]:
+        """The `--vram-log` file's content."""
+        return {
+            "unit": "MiB",
+            "device": device,
+            "embedder_device": embedder_device,
+            "vram_stt": self._stt_name,
+            "points": dict(self.points),
+            "derived": self.derived(),
+        }
 
 
 # -- the command -----------------------------------------------------------------------------
@@ -1464,7 +1850,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True, help="run file to write (JSONL)")
     parser.add_argument("--embedder", choices=("fake", "real"), default="fake")
     parser.add_argument("--reranker", choices=("fake", "real"), default="fake")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument(
+        "--device", choices=("cpu", "cuda"), default="cpu", help="the reranker's device"
+    )
+    parser.add_argument(
+        "--embedder-device",
+        choices=("cpu", "cuda"),
+        help="the embedder's device; defaults to --device",
+    )
     parser.add_argument(
         "--rerank-model", help="cross-encoder directory under /opt/models; overrides the config"
     )
@@ -1475,6 +1868,17 @@ def _parser() -> argparse.ArgumentParser:
         "--placement", choices=("user_prefix", "system_tail"), default="user_prefix"
     )
     parser.add_argument("--cpu-load-procs", type=int, default=0, help="busy-loop processes")
+    parser.add_argument(
+        "--gpu-load-procs", type=int, default=0, help="processes looping a matmul on cuda"
+    )
+    parser.add_argument(
+        "--vram-log", type=Path, help="GPU memory at each point of the run to write (JSON, MiB)"
+    )
+    parser.add_argument(
+        "--vram-stt",
+        metavar="MODEL",
+        help="Whisper model to load on cuda and run once before the reranker; needs --vram-log",
+    )
     parser.add_argument(
         "--rescan-facts",
         type=_positive_int,
@@ -1488,27 +1892,103 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-max-items", type=int)
     parser.add_argument("--deadline-ms", type=int)
     parser.add_argument("--fixture-dir", type=Path, default=FIXTURE_DIR)
+    parser.add_argument(
+        "--probes", type=Path, help="probe file to run; defaults to the fixture's probes.jsonl"
+    )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the fixture and write the run file; print the scorer's overall metrics."""
+def _check_gpu_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse, with exit 2, the GPU flag combinations whose figures would mislead."""
+    if args.vram_stt is not None and args.vram_log is None:
+        parser.error("--vram-stt needs --vram-log, which records what the model holds")
+    if args.vram_log is None:
+        return
+    if args.embedder_device == "cuda":
+        parser.error(
+            "--vram-log needs the embedder off the GPU (--embedder-device cpu): "
+            "its memory would be counted in the reranker's figure"
+        )
+    if args.gpu_load_procs:
+        parser.error(
+            "--vram-log cannot run with --gpu-load-procs: the load processes' memory would "
+            "be counted in the device-wide figure"
+        )
+
+
+def main(argv: Sequence[str] | None = None, *, gpu: GpuAccess | None = None) -> int:
+    """Run the fixture and write the run file; print the scorer's overall metrics.
+
+    Args:
+        argv: The command line; None reads `sys.argv`.
+        gpu: What the GPU flags reach the GPU through; None is the real GPU.
+    """
     parser = _parser()
     args = parser.parse_args(argv)
     if args.rescan_facts is not None and args.rescan_log is None:
         parser.error("--rescan-facts needs --rescan-log, the record that the rescans ran")
+    if args.embedder_device is None:
+        args.embedder_device = args.device
+    _check_gpu_flags(parser, args)
+    gpu = gpu if gpu is not None else default_gpu_access()
+    if args.gpu_load_procs and not gpu.cuda.is_available():
+        parser.error("--gpu-load-procs needs CUDA, which is not available")
     if args.threads is not None:
         torch.set_num_threads(args.threads)
     config = config_from_args(args)
-    fixture = Fixture.load(args.fixture_dir)
+    fixture = Fixture.load(args.fixture_dir, probes=args.probes)
     rescan = (
         ForcedRescan(args.rescan_facts, rescan_template(fixture))
         if args.rescan_facts is not None
         else None
     )
-    with cpu_load(args.cpu_load_procs):
-        embedder = build_embedder(args.embedder, device=args.device)
+    vram = VramRecorder(gpu, stt_model=args.vram_stt) if args.vram_log is not None else None
+    try:
+        records = _run(args, config, fixture, rescan, gpu, vram, parser)
+        vram_log = (
+            vram.log(device=args.device, embedder_device=args.embedder_device)
+            if vram is not None
+            else None
+        )
+    finally:
+        if vram is not None:
+            vram.close()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    if rescan is not None:
+        args.rescan_log.parent.mkdir(parents=True, exist_ok=True)
+        args.rescan_log.write_text(json.dumps(rescan.log(), indent=2) + "\n", encoding="utf-8")
+    if vram_log is not None:
+        args.vram_log.parent.mkdir(parents=True, exist_ok=True)
+        args.vram_log.write_text(json.dumps(vram_log, indent=2) + "\n", encoding="utf-8")
+    report = score_run(fixture.probes, [parse_run_record(record) for record in records])
+    print(json.dumps(report.overall.to_json(), indent=2, sort_keys=True))
+    print(f"wrote {len(records)} records to {args.output}", file=sys.stderr)
+    return 0
+
+
+def _run(
+    args: argparse.Namespace,
+    config: MemoryConfig,
+    fixture: Fixture,
+    rescan: ForcedRescan | None,
+    gpu: GpuAccess,
+    vram: VramRecorder | None,
+    parser: argparse.ArgumentParser,
+) -> list[dict[str, object]]:
+    """Load the models and run the fixture under the asked-for load, reading the VRAM points."""
+    with cpu_load(args.cpu_load_procs), gpu.load_procs(args.gpu_load_procs):
+        if vram is not None:
+            try:
+                vram.start()
+            except GpuUnavailableError as exc:
+                parser.error(f"--vram-log: {exc}")
+        embedder = build_embedder(args.embedder, device=args.embedder_device)
         built = build_reranker(args.reranker, device=args.device, config=config)
+        if vram is not None:
+            vram.read("loaded")
         trace = (
             TraceSetup(
                 path=args.trace,
@@ -1527,22 +2007,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reranker=built.reranker,
                     workdir=Path(workdir),
                     cpu_load_procs=args.cpu_load_procs,
+                    embedder_device=args.embedder_device,
                     placement=args.placement,
                     rescan=rescan,
                     trace=trace,
                 )
             )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-    if rescan is not None:
-        args.rescan_log.parent.mkdir(parents=True, exist_ok=True)
-        args.rescan_log.write_text(json.dumps(rescan.log(), indent=2) + "\n", encoding="utf-8")
-    report = score_run(fixture.probes, [parse_run_record(record) for record in records])
-    print(json.dumps(report.overall.to_json(), indent=2, sort_keys=True))
-    print(f"wrote {len(records)} records to {args.output}", file=sys.stderr)
-    return 0
+        if vram is not None:
+            vram.read("after_run")
+            vram.release(built.reranker)
+    return records
 
 
 if __name__ == "__main__":
@@ -1555,28 +2029,40 @@ __all__ = [
     "CrossEncoderCapture",
     "Fixture",
     "ForcedRescan",
+    "GpuAccess",
+    "GpuUnavailableError",
     "NoteFile",
+    "NvmlReader",
     "ProbeTracer",
+    "PynvmlReader",
     "RecordingEmbedder",
     "RecordingReranker",
     "SentenceTransformerEmbedder",
+    "SttModel",
     "TokenEmbedder",
     "TokenReranker",
+    "TorchCuda",
     "TraceSetup",
+    "VramRecorder",
     "build_embedder",
     "build_reranker",
     "content_stems",
     "cpu_load",
+    "default_gpu_access",
     "fact_row",
     "facts_known_at",
+    "gpu_load",
+    "load_whisper_model",
     "logit",
     "main",
+    "matmul_loop",
     "notes_known_at",
     "rescan_template",
     "run_fixture",
     "run_items",
     "run_record",
     "spin",
+    "stt_clip",
     "synthetic_facts",
     "trace_header",
     "word_pair_tokens",
