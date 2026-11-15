@@ -61,7 +61,7 @@ LOG_FILE = "design-log.jsonl"
 CANDIDATE_GLOB = "cand-*.wav"
 CANDIDATE_PREFIX = "CANDIDATE "
 DONE_PREFIX = "DESIGN_DONE"
-PACKAGES = ("qwen-tts", "torch", "transformers", "numpy")
+PACKAGES = ("torch", "transformers", "numpy")
 
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
@@ -140,12 +140,29 @@ def spoken_text(lines: Sequence[Item]) -> str:
     return " ".join(line.text.strip() for line in lines)
 
 
-def package_versions(packages: Sequence[str] = PACKAGES) -> dict[str, str | None]:
-    """Installed version of each package, `None` for one that is not installed."""
+def package_versions(
+    packages: Sequence[str] = PACKAGES,
+    *,
+    distributions: Callable[[], Mapping[str, Sequence[str]]] = (
+        importlib.metadata.packages_distributions
+    ),
+    version: Callable[[str], str] = importlib.metadata.version,
+) -> dict[str, str | None]:
+    """The version of each distribution providing `qwen_tts`, then of each of `packages`.
+
+    The entry module's distribution is looked up rather than named: the qwen3 image pins
+    `qwen-tts-hf`, not `qwen-tts` (`docker/speech-bench/requirements-qwen3.txt`), and which of
+    its installed distributions provides `qwen_tts` is read from the metadata, not assumed. A
+    module no distribution provides is logged under the module's own name as `None`, and so is a
+    package that is not installed.
+    """
     versions: dict[str, str | None] = {}
-    for name in packages:
+    providers = list(dict.fromkeys(distributions().get(ENTRY_MODULE, ())))
+    if not providers:
+        versions[ENTRY_MODULE] = None
+    for name in [*providers, *packages]:
         try:
-            versions[name] = importlib.metadata.version(name)
+            versions[name] = version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     return versions
@@ -181,6 +198,7 @@ class Designer:
         return audio, int(rate)
 
     def peak(self, audio: object) -> float:
+        """Largest absolute sample before the clip to 16 bits, so the log shows any clipping."""
         return float(self._np.max(self._np.abs(audio))) if len(audio) else 0.0
 
     def write_wav(self, path: Path, audio: object, rate: int) -> None:
@@ -190,7 +208,9 @@ class Designer:
         try:
             handle = path.open("xb")
         except FileExistsError as exc:
-            raise core.OutputExistsError(f"{path} already exists; refusing to overwrite it") from exc
+            raise core.OutputExistsError(
+                f"{path} already exists; refusing to overwrite it"
+            ) from exc
         with handle, wave.open(handle, "wb") as clip:
             clip.setnchannels(1)
             clip.setsampwidth(2)

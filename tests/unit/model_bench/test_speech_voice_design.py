@@ -384,9 +384,13 @@ def _marked(doc, mark):
     """`doc` with `mark` in every non-blank text, so a refusal that echoes one is caught."""
     if isinstance(doc, list):
         return [
-            dict(item, text=f"{item['text']} {mark}")
-            if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
-            else item
+            (
+                dict(item, text=f"{item['text']} {mark}")
+                if isinstance(item, dict)
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+                else item
+            )
             for item in doc
         ]
     if isinstance(doc, dict):
@@ -544,10 +548,40 @@ def test_the_probe_emits_one_candidate_line_per_candidate_and_a_done_count(tmp_p
     assert_no_text(capsys.readouterr())
 
 
-def test_package_versions_report_a_missing_package_as_none():
+INSTALLED = {"qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"}
+
+
+def _version(name: str) -> str:
+    if name not in INSTALLED:
+        raise design_probe.importlib.metadata.PackageNotFoundError(name)
+    return INSTALLED[name]
+
+
+def test_package_versions_log_the_distribution_that_provides_qwen_tts():
+    versions = design_probe.package_versions(
+        ("torch",),
+        distributions=lambda: {"qwen_tts": ["qwen-tts-hf"], "torch": ["torch"]},
+        version=_version,
+    )
+
+    assert versions == {"qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"}
+
+
+def test_package_versions_report_a_missing_package_and_an_unprovided_module_as_none():
+    versions = design_probe.package_versions(
+        ("zz-no-such-package-xyz",), distributions=dict, version=_version
+    )
+
+    assert versions == {design_probe.ENTRY_MODULE: None, "zz-no-such-package-xyz": None}
+
+
+def test_package_versions_default_to_the_installed_metadata():
     versions = design_probe.package_versions(("zz-no-such-package-xyz",))
 
-    assert versions == {"zz-no-such-package-xyz": None}
+    assert versions["zz-no-such-package-xyz"] is None
+    assert design_probe.ENTRY_MODULE in versions or any(
+        name.startswith("qwen-tts") for name in versions
+    )
 
 
 # ---------------------------------------------------------------------------
