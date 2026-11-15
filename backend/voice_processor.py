@@ -500,9 +500,21 @@ class VoiceProcessor:
         log_timestamp(f"TTS consumer done ({tts_total:.2f}s, {chunk_count} chunks)")
 
     def _process_conversation_turn(
-        self, user_text, request_id: str | None = None, session_id: str | None = None
-    ):
+        self,
+        user_text,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        *,
+        capability_only: bool = False,
+    ) -> bool:
         """Process one conversation turn with LLM-TTS pipeline parallelism.
+
+        With `capability_only` (gaming mode holds the GPU), the conversation
+        handler's `handle_capability_only` answers instead of the model path, and
+        its events stream through the same output path a text turn uses. Nothing
+        is sent when it answers nothing, when there is no conversation handler, or
+        when another turn holds the generation lock; such a turn is neither queued
+        nor drained into a model turn, because the provider must not be called.
 
         Args:
             user_text: The user's utterance for this turn.
@@ -516,8 +528,17 @@ class VoiceProcessor:
                 leaves the ambient value untouched, which is what the
                 pending-input respawn needs -- `spawn_with_context` already
                 copied the in-flight turn's session into that thread.
+            capability_only: Answer from the capability host alone.
+
+        Returns:
+            False when a `capability_only` turn sent nothing, so the caller
+            sends its refusal; True otherwise, including a turn queued behind
+            the one in flight and a turn that ended in an error event.
         """
         if not self.generation_lock.acquire(blocking=False):
+            if capability_only:
+                log_timestamp("Generation in progress; capability-only turn not answered")
+                return False
             # Latest-wins queueing (mirrors the voice path): the in-flight
             # turn's finally-block drain picks this up. Silently dropping the
             # input left the FE turn promise waiting forever
@@ -531,7 +552,7 @@ class VoiceProcessor:
                 # both of which arrive with their session already published).
                 self.latest_user_input = (user_text, session_id or current_session_id.get())
             log_timestamp("Generation already in progress; queued latest input")
-            return
+            return True
 
         # Hoisted above try: the finally path must reach the queue (and know
         # whether a consumer exists) even when the failure happens before the
@@ -542,6 +563,7 @@ class VoiceProcessor:
         turn_epoch = self._turn_epoch
 
         try:
+            from backend.chat.stream_events import Complete, Token, WSEvent
             from backend.sentence_detector import SentenceBoundaryDetector
 
             if request_id is None:
@@ -550,6 +572,39 @@ class VoiceProcessor:
                 current_request_id.set(request_id)
             if session_id is not None:
                 current_session_id.set(session_id)
+
+            # The capability-only answer is resolved before anything is sent,
+            # so an unanswered message leaves the client exactly as a refused
+            # one does. Its events become the items the model path would yield.
+            capability_items: list[str | dict] | None = None
+            if capability_only:
+                knowledge = getattr(self.models, "knowledge", None)
+                handler = (
+                    knowledge.conversation_handler
+                    if knowledge is not None and knowledge.is_enabled()
+                    else None
+                )
+                events = None
+                if handler is not None:
+                    events = asyncio.run_coroutine_threadsafe(
+                        handler.handle_capability_only(
+                            user_text, session_id or current_session_id.get()
+                        ),
+                        self.loop,
+                    ).result()
+                if events is None:
+                    return False
+                current_turn_complete.set(None)
+                current_turn_error.set(None)
+                capability_items = []
+                for event in events:
+                    if isinstance(event, Token):
+                        capability_items.append(event.text)
+                    elif isinstance(event, WSEvent):
+                        capability_items.append(event.payload)
+                    elif isinstance(event, Complete):
+                        current_turn_complete.set(event)
+
             log_timestamp(f"Starting conversation turn for: '{user_text}'")
 
             self.interrupt_flag.clear()
@@ -591,7 +646,12 @@ class VoiceProcessor:
 
             first_token_seen = False
             interrupted = False
-            for item in self.models.generate_llm_response(user_text):
+            items = (
+                capability_items
+                if capability_items is not None
+                else self.models.generate_llm_response(user_text)
+            )
+            for item in items:
                 if self.interrupt_flag.is_set():
                     log_timestamp("LLM generation interrupted")
                     interrupted = True
@@ -718,13 +778,20 @@ class VoiceProcessor:
 
         except Exception as e:
             logger.error("Error in conversation turn: %s", e, exc_info=True)
+            # A capability's exception text can carry a token or key, and this
+            # path has no host to redact it, so the client gets no exception text.
+            message = (
+                "Capability command failed; see the server log."
+                if capability_only
+                else f"Generation error: {e}"
+            )
             asyncio.run_coroutine_threadsafe(
                 self.message_queue.put(
                     json.dumps(
                         {
                             "type": "error",
                             "kind": "model",
-                            "message": f"Generation error: {e}",
+                            "message": message,
                             "retriable": True,
                             "context": None,
                         }
@@ -749,9 +816,14 @@ class VoiceProcessor:
             self.is_speaking = False
             self.generation_lock.release()
 
-            # Check for pending input
+            # Check for pending input. A capability-only turn leaves it queued:
+            # draining it would run a model turn while gaming mode holds the GPU.
             with self.input_lock:
-                if self.latest_user_input and not self.interrupt_flag.is_set():
+                if (
+                    not capability_only
+                    and self.latest_user_input
+                    and not self.interrupt_flag.is_set()
+                ):
                     pending_input, pending_session_id = self.latest_user_input
                     self.latest_user_input = None
                     log_timestamp(f"Processing pending input: '{pending_input}'")
@@ -768,6 +840,7 @@ class VoiceProcessor:
                             session_id=pending_session_id,
                         )
                     )
+        return True
 
     def process_complete_audio(self, audio_data, sample_rate, session_id: str | None = None):
         """Process complete audio from client (no VAD needed; the client controls recording window).
