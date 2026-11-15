@@ -850,6 +850,7 @@ def test_score_reports_extraction_against_the_truth(extracted: Extracted, scored
     for row in s["impostor_clusters"]:
         assert row["status"] == "flagged" and row["identified_by"] == "segments"
         assert row["median_sim"] == {"wavlm-sv": 0.66, "ecapa": 0.62}
+        assert row["stray_records"] == []
 
 
 def test_score_reports_whether_each_effect_survived(scored: Scored) -> None:
@@ -876,26 +877,102 @@ def test_score_reports_every_h6_gate(scored: Scored) -> None:
         assert isinstance(entries[key]["value"], float), key
 
 
-def test_impostor_cluster_not_admitted_reports_the_best_other_cluster() -> None:
-    line = pkg.TruthLine(
-        "ep01", "a" * 64, 1, "impostor", "121", 1.0, 4.0, None, None, None, "x", False
-    )
+def _probe_line(n: int, speaker: str, start: float) -> pkg.TruthLine:
+    target = speaker == "target"
+    return pkg.TruthLine(
+        "ep01", "a" * 64, n, speaker, "" if target else "121", start, start + 3.5,
+        "neutral" if target else None, "default" if target else None,
+        "centre" if target else None, "x", False,
+    )  # fmt: skip
+
+
+PROBE_LINES = [
+    _probe_line(1, "target", 1.0),
+    _probe_line(2, "impostor", 5.0),
+    _probe_line(3, "target", 9.0),
+    _probe_line(4, "impostor", 13.0),
+    _probe_line(5, "target", 17.0),
+    _probe_line(6, "impostor", 21.0),
+]
+
+
+def _probe(
+    placed: Sequence[tuple[int, str, str, bool]], spk02_role: str = "other"
+) -> tuple[list[dict], dict[str, dict]]:
+    """Score one episode whose records are (truth line, diarizer label, cluster, kept)."""
     record = SourceRecord(
         "src-0001", "p", "matroska", 1, 0, (), 1, 0, None, "eac3", None, 1, "packets", 48000, 6,
-        "5.1", 10.0, False, 1, "a" * 64, "t", "FC",
+        "5.1", 30.0, False, 1, "a" * 64, "t", "FC",
     )  # fmt: skip
-    eps = rehearsal_cmd.score_mod.Episodes([line], [record])
+    score_mod = rehearsal_cmd.score_mod
+    eps = score_mod.Episodes(PROBE_LINES, [record])
+    segments = [
+        _segment(i, "src-0001", PROBE_LINES[n - 1], diar_cluster=label, cluster=cluster, kept=kept)
+        for i, (n, label, cluster, kept) in enumerate(placed, start=1)
+    ]
     report = {"sources": [{"source_id": "src-0001", "clusters": [
         {"diar_cluster": "spk-01", "role": "primary", "median_sim": {"ecapa": 0.8}},
-        {"diar_cluster": "spk-02", "role": "other", "median_sim": {"ecapa": 0.5}},
+        {"diar_cluster": "spk-02", "role": spk02_role, "median_sim": {"ecapa": 0.55}},
         {"diar_cluster": "spk-03", "role": "other", "median_sim": {"ecapa": 0.2}},
     ]}]}  # fmt: skip
-    rows = rehearsal_cmd.score_mod.impostor_clusters(eps, [], report)
+    rows = score_mod.impostor_clusters(eps, segments, report)
+    gates_found = score_mod.gate_values(eps, segments, rows, None, {"retrieval.anchor_floor": 0.6})
+    return rows, gates_found
+
+
+def test_a_stray_impostor_record_in_the_primary_cluster_is_not_its_cluster() -> None:
+    # The review's probe: one dropped impostor record diarized into the target's primary cluster,
+    # and the impostor's own cluster (spk-02) not admitted, so it left no records.
+    rows, found = _probe(
+        [(1, "spk-01", "primary", True), (3, "spk-01", "primary", True),
+         (5, "spk-01", "primary", True), (2, "spk-01", "primary", False)]
+    )  # fmt: skip
     assert rows == [
         {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-02",
-         "status": "not admitted", "median_sim": {"ecapa": 0.5},
-         "identified_by": "highest non-admitted cluster"}
+         "status": "not admitted", "median_sim": {"ecapa": 0.55},
+         "identified_by": "upper bound: highest non-admitted cluster",
+         "stray_records": [{"diar_cluster": "spk-01", "role": "primary", "records": 1}]}
     ]  # fmt: skip
+    floor = found["retrieval.anchor_floor"]
+    assert floor["impostor_primary_episodes"] == 0
+    assert floor["impostor_median_max"] is None
+    assert floor["non_admitted_median_upper_bound_max"] == 0.55
+    assert floor["impostor_stray_records"] == 1
+    lines = rehearsal_cmd.score_mod.impostor_cluster_lines(rows)
+    assert lines == [
+        "  ep01 (src-0001) impostor cluster: not admitted, median ecapa 0.550 (upper bound: "
+        "highest non-admitted cluster); stray impostor records in admitted clusters: primary 1"
+    ]
+
+
+def test_the_impostor_cluster_is_the_admitted_one_its_records_hold_the_majority_of() -> None:
+    rows, found = _probe(
+        [(1, "spk-01", "primary", True), (3, "spk-01", "primary", True),
+         (2, "spk-01", "primary", False), (4, "spk-02", "flagged", True),
+         (6, "spk-02", "flagged", True), (5, "spk-02", "flagged", True)],
+        spk02_role="flagged",
+    )  # fmt: skip
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["diar_cluster"], row["status"], row["identified_by"]) == (
+        "spk-02", "flagged", "segments",
+    )  # fmt: skip
+    assert row["median_sim"] == {"ecapa": 0.55}
+    assert row["stray_records"] == [{"diar_cluster": "spk-01", "role": "primary", "records": 1}]
+    floor = found["retrieval.anchor_floor"]
+    assert floor["impostor_median_max"] == 0.55 and floor["impostor_primary_episodes"] == 0
+    assert floor["non_admitted_median_upper_bound_max"] is None
+
+
+def test_an_impostor_majority_primary_cluster_reports_primary() -> None:
+    rows, found = _probe(
+        [(2, "spk-01", "primary", True), (4, "spk-01", "primary", True),
+         (1, "spk-01", "primary", True), (3, "spk-02", "flagged", True)],
+        spk02_role="flagged",
+    )  # fmt: skip
+    assert rows[0]["status"] == "primary" and rows[0]["median_sim"] == {"ecapa": 0.8}
+    assert rows[0]["stray_records"] == []
+    assert found["retrieval.anchor_floor"]["impostor_primary_episodes"] == 1
 
 
 # ---------------------------------------------------------------------------

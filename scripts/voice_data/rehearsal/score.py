@@ -232,15 +232,25 @@ def downmix_recovery(
     return found
 
 
+BY_SEGMENTS = "segments"
+UPPER_BOUND = "upper bound: highest non-admitted cluster"
+
+
 def impostor_clusters(
     eps: Episodes, segments: Sequence[SegmentRecord], report: Mapping[str, object]
 ) -> list[dict[str, object]]:
     """Return each episode's impostor cluster: its status and median SIM to the anchor centroid.
 
-    The cluster is the diarizer label most of the impostor's segment records carry. Clusters not
-    admitted leave no segment records, so when none is found the impostor's cluster was not
-    admitted, and the highest median among the episode's non-admitted clusters is reported in
-    its place (`identified_by` says which).
+    Extract writes segment records for admitted clusters only (primary or flagged), kept or
+    dropped. An admitted cluster is the impostor's when more than half of its records in the
+    episode are the impostor's (`Episodes.who`); a few impostor turns the diarizer put in another
+    admitted cluster, the target's primary one most likely, do not make that cluster the
+    impostor's, and are counted per cluster in `stray_records`. When several admitted clusters
+    are the impostor's, the row names the worst: primary before flagged, then the higher median.
+
+    When no admitted cluster is the impostor's, its cluster was not admitted and left no records,
+    so which cluster it was is unknown: the row reports the highest median among the episode's
+    non-admitted clusters, an upper bound on the impostor's (`identified_by` says so).
     """
     clusters_by_source: dict[str, list[Mapping[str, object]]] = {}
     for source in report.get("sources") or []:  # type: ignore[union-attr]
@@ -249,37 +259,57 @@ def impostor_clusters(
     rows = []
     for sid in sorted(eps.lines):
         clusters = {str(c.get("diar_cluster")): c for c in clusters_by_source.get(sid, [])}
-        labels = Counter(
-            s.diar_cluster
-            for s in segments
-            if s.source_id == sid and s.diar_cluster and eps.who(s) == "impostor"
-        )
+        records: Counter[str] = Counter()
+        impostor: Counter[str] = Counter()
+        for seg in segments:
+            if seg.source_id == sid and seg.diar_cluster:
+                records[seg.diar_cluster] += 1
+                impostor[seg.diar_cluster] += eps.who(seg) == "impostor"
+        own, stray = [], []
+        for label in sorted(impostor):
+            role = clusters.get(label, {}).get("role")
+            if role not in (PRIMARY, FLAGGED) or not impostor[label]:
+                continue
+            if 2 * impostor[label] > records[label]:
+                own.append(clusters[label])
+            else:
+                stray.append({"diar_cluster": label, "role": role, "records": impostor[label]})
         row: dict[str, object] = {"episode": eps.episode[sid], "source_id": sid}
-        if labels:
-            label = labels.most_common(1)[0][0]
-            cluster = clusters.get(str(label), {})
-            role = cluster.get("role")
+        if own:
+            worst = max(own, key=lambda c: (c.get("role") == PRIMARY, _mean(c.get("median_sim"))))
             row.update(
-                diar_cluster=label,
-                status=role if role in (PRIMARY, FLAGGED) else NOT_ADMITTED,
-                median_sim=cluster.get("median_sim"),
-                identified_by="segments",
+                diar_cluster=worst.get("diar_cluster"),
+                status=worst.get("role"),
+                median_sim=worst.get("median_sim"),
+                identified_by=BY_SEGMENTS,
             )
         else:
             rest = [c for c in clusters.values() if c.get("role") not in (PRIMARY, FLAGGED)]
-            best = max(
-                rest,
-                key=lambda c: _mean(c.get("median_sim")),
-                default=None,
-            )
+            best = max(rest, key=lambda c: _mean(c.get("median_sim")), default=None)
             row.update(
                 diar_cluster=None if best is None else best.get("diar_cluster"),
                 status=NOT_ADMITTED,
                 median_sim=None if best is None else best.get("median_sim"),
-                identified_by="none" if best is None else "highest non-admitted cluster",
+                identified_by="none" if best is None else UPPER_BOUND,
             )
+        row["stray_records"] = stray
         rows.append(row)
     return rows
+
+
+def impostor_cluster_lines(rows: Sequence[Mapping[str, object]]) -> list[str]:
+    """Return each episode's impostor cluster row as printed."""
+    lines = []
+    for row in rows:
+        by_role: Counter[str] = Counter()
+        for entry in row.get("stray_records") or []:  # type: ignore[union-attr]
+            by_role[str(entry["role"])] += int(entry["records"])
+        lines.append(
+            f"  {row['episode']} ({row['source_id']}) impostor cluster: {row['status']}, median "
+            f"{_table(row['median_sim'])} ({row['identified_by']}); stray impostor records in "
+            f"admitted clusters: {_table(dict(sorted(by_role.items())))}"
+        )
+    return lines
 
 
 def _mean(table: object) -> float:
@@ -287,6 +317,23 @@ def _mean(table: object) -> float:
         return -math.inf
     values = [float(v) for v in table.values() if isinstance(v, int | float)]
     return sum(values) / len(values) if values else -math.inf
+
+
+def _median_max(rows: Sequence[Mapping[str, object]], identified_by: str) -> float | None:
+    """Return the highest mean median SIM of the rows identified one way, or `None`.
+
+    `impostor_median_max` takes the rows whose cluster the impostor's records identified; the
+    upper-bound rows go to their own entry, so a non-admitted episode's bound is never read as
+    the impostor's median.
+    """
+    return max(
+        (
+            round(_mean(row.get("median_sim")), 3)
+            for row in rows
+            if row.get("identified_by") == identified_by and row.get("median_sim")
+        ),
+        default=None,
+    )
 
 
 def _sims(segs: Sequence[SegmentRecord]) -> dict[str, list[float]]:
@@ -346,11 +393,12 @@ def gate_values(
                 "not calibrated: H6 keeps the anchor floor at its recorded value and lowers it "
                 "only to exercise the flagged path"
             )
-            entry["impostor_median_max"] = max(
-                (round(_mean(c.get("median_sim")), 3) for c in clusters if c.get("median_sim")),
-                default=None,
-            )
+            entry["impostor_median_max"] = _median_max(clusters, BY_SEGMENTS)
+            entry["non_admitted_median_upper_bound_max"] = _median_max(clusters, UPPER_BOUND)
             entry["impostor_primary_episodes"] = sum(c.get("status") == PRIMARY for c in clusters)
+            entry["impostor_stray_records"] = sum(
+                int(s["records"]) for c in clusters for s in c.get("stray_records") or []  # type: ignore[union-attr]
+            )
         elif key in ("segment.snr_min_db", "segment.c50_min_db"):
             field = "snr_db" if key == "segment.snr_min_db" else "c50_db"
             values = [getattr(s, field) for s in true_fc if math.isfinite(getattr(s, field))]
@@ -450,11 +498,7 @@ def score_lines(score: Mapping[str, object]) -> list[str]:
             f"  {geometry} lines recovered from the downmix: {_num(row['recovered'])} of "
             f"{_num(row['lines'])}; by reason: {_table(row['by_reason'])}"
         )
-    for row in score["impostor_clusters"]:  # type: ignore[union-attr]
-        lines.append(
-            f"  {row['episode']} ({row['source_id']}) impostor cluster: {row['status']}, median "
-            f"{_table(row['median_sim'])} ({row['identified_by']})"
-        )
+    lines += impostor_cluster_lines(score["impostor_clusters"])  # type: ignore[arg-type]
     effects = score.get("effects") or {}
     comb = effects.get("comb") if isinstance(effects, Mapping) else None
     if isinstance(comb, Mapping):
