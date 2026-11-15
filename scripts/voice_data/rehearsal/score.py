@@ -263,6 +263,8 @@ def downmix_recovery(
 
 BY_SEGMENTS = "segments"
 UPPER_BOUND = "upper bound: highest non-admitted cluster"
+MERGED = "merged"
+MERGED_MEDIAN = "merged cluster's median: the impostor holds at most half its records"
 
 
 def impostor_clusters(
@@ -272,14 +274,32 @@ def impostor_clusters(
 
     Extract writes segment records for admitted clusters only (primary or flagged), kept or
     dropped. An admitted cluster is the impostor's when more than half of its records in the
-    episode are the impostor's (`Episodes.who`); a few impostor turns the diarizer put in another
-    admitted cluster, the target's primary one most likely, do not make that cluster the
-    impostor's, and are counted per cluster in `stray_records`. When several admitted clusters
+    episode are the impostor's (`Episodes.who`). Impostor records in an admitted cluster that is
+    not the impostor's are counted per cluster in `stray_records`. When several admitted clusters
     are the impostor's, the row names the worst: primary before flagged, then the higher median.
 
-    When no admitted cluster is the impostor's, its cluster was not admitted and left no records,
-    so which cluster it was is unknown: the row reports the highest median among the episode's
-    non-admitted clusters, an upper bound on the impostor's (`identified_by` says so).
+    When no admitted cluster is the impostor's, the row measures how much of the impostor's
+    speech in the episode (the union of its ground-truth lines) the impostor records in admitted
+    clusters cover. The denominator is all of that speech, not only the speech extraction could
+    keep, because extract drafts a record for each turn of an admitted cluster
+    (`stages/extract.py:782-797`) whether or not it is kept: a turn too short to embed (:534-538,
+    :848-849), a turn that fails retrieval (:864-880), a cut of the wrong length (:912-915, from
+    `segments.cut_line`) and a cut that touches overlap (:917-920) are each drafted, and
+    `_records` writes every draft (:967-1016). A passing turn's records leave out what
+    `cut_line` trims (`stages/segments.py:87-103`): the turn's edges outside VAD speech, the
+    pauses between segments when a long turn is cut, and the whole turn when VAD finds no speech
+    in it.
+
+    - When admitted clusters cover more than half of the impostor's speech, the impostor is
+      merged into clusters it holds no majority of: the status is `merged`, `merged_into` is the
+      role of the admitted cluster covering the most of it (primary before flagged on a tie),
+      `diar_cluster` names that cluster, and `median_sim` is that cluster's median, of a cluster
+      in which the impostor holds at most half the records (`identified_by` says so). Its
+      impostor records stay counted in `stray_records`.
+    - Otherwise the row reports the highest median among the episode's non-admitted clusters,
+      an upper bound on the impostor's own cluster's median, with the status `not admitted`;
+      which non-admitted cluster was the impostor's is unknown, as non-admitted clusters leave
+      no records (`stages/extract.py:783-787`).
     """
     clusters_by_source: dict[str, list[Mapping[str, object]]] = {}
     for source in report.get("sources") or []:  # type: ignore[union-attr]
@@ -290,10 +310,13 @@ def impostor_clusters(
         clusters = {str(c.get("diar_cluster")): c for c in clusters_by_source.get(sid, [])}
         records: Counter[str] = Counter()
         impostor: Counter[str] = Counter()
+        spans: dict[str, list[Interval]] = {}
         for seg in segments:
             if seg.source_id == sid and seg.diar_cluster:
                 records[seg.diar_cluster] += 1
-                impostor[seg.diar_cluster] += eps.who(seg) == "impostor"
+                if eps.who(seg) == "impostor":
+                    impostor[seg.diar_cluster] += 1
+                    spans.setdefault(seg.diar_cluster, []).append((seg.start_s, seg.end_s))
         own, stray = [], []
         for label in sorted(impostor):
             role = clusters.get(label, {}).get("role")
@@ -304,6 +327,10 @@ def impostor_clusters(
             else:
                 stray.append({"diar_cluster": label, "role": role, "records": impostor[label]})
         row: dict[str, object] = {"episode": eps.episode[sid], "source_id": sid}
+        speech = union([(ln.start_s, ln.end_s) for ln in eps.of(sid, "impostor")])
+        merged = _merged_into(
+            speech, [(str(s["diar_cluster"]), str(s["role"])) for s in stray], spans
+        )
         if own:
             worst = max(own, key=lambda c: (c.get("role") == PRIMARY, _mean(c.get("median_sim"))))
             row.update(
@@ -311,6 +338,15 @@ def impostor_clusters(
                 status=worst.get("role"),
                 median_sim=worst.get("median_sim"),
                 identified_by=BY_SEGMENTS,
+            )
+        elif merged is not None:
+            label, role = merged
+            row.update(
+                diar_cluster=label,
+                status=MERGED,
+                merged_into=role,
+                median_sim=clusters[label].get("median_sim"),
+                identified_by=MERGED_MEDIAN,
             )
         else:
             rest = [c for c in clusters.values() if c.get("role") not in (PRIMARY, FLAGGED)]
@@ -326,15 +362,37 @@ def impostor_clusters(
     return rows
 
 
+def _merged_into(
+    speech: Sequence[Interval],
+    admitted: Sequence[tuple[str, str]],
+    spans: Mapping[str, Sequence[Interval]],
+) -> tuple[str, str] | None:
+    """Return the label and role of the admitted cluster the impostor is merged into, or `None`.
+
+    `speech` is the impostor's speech in the episode, `admitted` the (label, role) of each
+    admitted cluster holding impostor records, and `spans` those records' spans by label. The
+    impostor is merged when the clusters' records together cover more than half of `speech`; the
+    cluster named is the one covering the most, primary before flagged on a tie.
+    """
+    every = [span for label, _ in admitted for span in spans[label]]
+    if not admitted or 2 * length(intersect(speech, union(every))) <= length(speech):
+        return None
+    covered = {label: length(intersect(speech, union(spans[label]))) for label, _ in admitted}
+    return max(admitted, key=lambda entry: (covered[entry[0]], entry[1] == PRIMARY))
+
+
 def impostor_cluster_lines(rows: Sequence[Mapping[str, object]]) -> list[str]:
-    """Return each episode's impostor cluster row as printed."""
+    """Return each episode's impostor cluster row as printed; a merged row names its role."""
     lines = []
     for row in rows:
         by_role: Counter[str] = Counter()
         for entry in row.get("stray_records") or []:  # type: ignore[union-attr]
             by_role[str(entry["role"])] += int(entry["records"])
+        status = row["status"]
+        if status == MERGED:
+            status = f"merged into {row['merged_into']}"
         lines.append(
-            f"  {row['episode']} ({row['source_id']}) impostor cluster: {row['status']}, median "
+            f"  {row['episode']} ({row['source_id']}) impostor cluster: {status}, median "
             f"{_table(row['median_sim'])} ({row['identified_by']}); stray impostor records in "
             f"admitted clusters: {_table(dict(sorted(by_role.items())))}"
         )
@@ -353,7 +411,8 @@ def _median_max(rows: Sequence[Mapping[str, object]], identified_by: str) -> flo
 
     `impostor_median_max` takes the rows whose cluster the impostor's records identified; the
     upper-bound rows go to their own entry, so a non-admitted episode's bound is never read as
-    the impostor's median.
+    the impostor's median. Merged rows go to neither: they are counted by role in
+    `impostor_merged_episodes` instead.
     """
     return max(
         (
@@ -442,6 +501,10 @@ def gate_values(
             entry["impostor_median_max"] = _median_max(clusters, BY_SEGMENTS)
             entry["non_admitted_median_upper_bound_max"] = _median_max(clusters, UPPER_BOUND)
             entry["impostor_primary_episodes"] = sum(c.get("status") == PRIMARY for c in clusters)
+            merged = Counter(
+                str(c.get("merged_into")) for c in clusters if c.get("status") == MERGED
+            )
+            entry["impostor_merged_episodes"] = dict(sorted(merged.items()))
             entry["impostor_stray_records"] = sum(
                 int(s["records"]) for c in clusters for s in c.get("stray_records") or []  # type: ignore[union-attr]
             )
