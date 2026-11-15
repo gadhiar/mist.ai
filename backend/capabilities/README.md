@@ -182,11 +182,12 @@ is `normal` and `off` while it is `yielded` or `resume_failed`, so nothing sets 
 While gaming mode is `yielded` or `resume_failed`, the WebSocket refuses spoken messages, because
 Whisper is released. With a host, a typed message goes to
 `ConversationHandler.handle_capability_only`, which runs only `pre_llm` and calls no model: a
-message it handles is answered as a normal text turn, and any other gets the yielded reply. Any
+message it handles is answered as a normal text turn, and any other gets the gate's refusal,
+the yielded message while `yielded` and the resume-failed message while `resume_failed`. Any
 payload `pre_llm` drained for an unhandled message, such as the `action_resolved` of a proposal
-the message superseded, is put on the broadcast queue for every client before that reply is
-sent (`VoiceProcessor._process_conversation_turn`). With no host (capabilities disabled), every typed message gets the yielded reply
-(`backend/server.py`, the `audio` and `text` gate).
+the message superseded, is put on the broadcast queue for every client before that refusal is
+sent (`VoiceProcessor._process_conversation_turn`). With no host (capabilities disabled), every
+typed message gets the same refusal (`backend/server.py`, the `audio` and `text` gate).
 
 ## The usage view
 

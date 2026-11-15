@@ -412,8 +412,9 @@ set ring and time out on schedule, because the scheduler needs no model. Spoken 
 refused, because Whisper is released. A typed message goes to the capability host's model-free
 step alone: one it handles (a ringing alarm or timer, a yes or no to a waiting proposal, or a
 fast-path command such as "set a timer for 10 minutes") is answered with no model call, and any
-other typed message gets the yielded reply. With capabilities off
-(`MIST_CAPABILITIES_ENABLED=false`, so no host), every typed message gets the yielded reply.
+other typed message gets the refusal: the yielded message, or the resume-failed message when
+the speech model could not be reloaded after gaming mode. With capabilities off
+(`MIST_CAPABILITIES_ENABLED=false`, so no host), every typed message gets that refusal.
 
 Rollback, behaviour: set `MIST_CAPABILITIES_ENABLED=false` in `daily.env` and run `up`. No host
 is built, and the WebSocket and `/capabilities` answer as disabled. Rollback, code:
