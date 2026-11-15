@@ -510,6 +510,7 @@ def test_fallback_geometry_fails_the_centre_and_passes_the_downmix(built: Built)
     snr_gate, c50_gate = g.value("segment.snr_min_db"), g.value("segment.c50_min_db")
     fallback = [ln for ln in lines if ln.geometry == "fallback"]
     assert len(fallback) >= 3
+    assert built.build["fallback"]["copy_db"] == -15.0  # the plan's "a copy 15 dB down"
     for line in fallback:
         dry = dry_line(built.root.path, line.clip)
         a = int(line.start_s * mix.RATE)

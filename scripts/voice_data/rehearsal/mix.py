@@ -20,11 +20,14 @@ The mix, per episode:
   cleaning gate's spectrum check sees it);
 - dialogue sits in the centre (FC), except the off-centre lines (front left and right only, each
   3 dB down) and the fallback lines: the dry line in FL and FR at full level, and in FC only a
-  copy 20 dB down convolved with a reverb tail (RT60 1.5 s, 6 dB below the direct sound, so a
-  full mono downmix stays about 10 dB above the C50 gate) under a burst of MUSAN noise band-passed to
+  copy 15 dB down (`FALLBACK_COPY_DB`, the plan's figure) convolved with a reverb tail (RT60
+  1.5 s, 6 dB below the direct sound) under a burst of MUSAN noise band-passed to
   `BURST_BAND_HZ`, 20 dB below the line. The centre cut fails SNR and C50 whether or not a
   separator removes the burst, and the `-ac 1` downmix, dominated by the dry left and right
-  speech, passes;
+  speech, passes. On the synthetic voices of `test_rehearsal.py`, at 15 dB down, the geometry
+  test measured the FC cut at SNR -2.0 to 0.4 dB and C50 -3.6 to -3.4 dB, and the downmix at
+  SNR about 23.3 dB and C50 23.2 to 25.1 dB: 3 to 5 dB above the default 20 dB C50 gate, the
+  narrowest margin;
 - a MUSAN music bed in FL, FR and the surrounds (low-passed into the LFE), ducked under dialogue,
   and MUSAN noise effects between lines.
 
@@ -85,7 +88,7 @@ SURROUND_DB = -3.0
 EFFECTS_DB = -18.0
 EFFECTS_EVERY_S = 30.0
 OFF_CENTRE_GAIN = math.sqrt(0.5)
-FALLBACK_COPY_DB = -20.0
+FALLBACK_COPY_DB = -15.0
 TAIL_DB = -6.0
 RT60_S = 1.5
 TAIL_S = 1.6
