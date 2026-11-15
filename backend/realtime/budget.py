@@ -323,13 +323,19 @@ class CharacterConfig:
 
 @dataclass(frozen=True, slots=True)
 class PlaybackConfig:
-    """Downlink pacing and the client's playback buffer."""
+    """Downlink pacing, the client's playback buffer, and the character stage before the pacer.
+
+    `character` configures the stage every spoken reply passes through before it is framed.
+    None, the default here, leaves the engine's audio as it is; `load_voice_settings` sets
+    `CharacterConfig()` unless `MIST_VOICE_CHARACTER` is false.
+    """
 
     client_prebuffer_ms: int = 80
     max_lead_ms: int = 500
     fade_ms: int = 30
     progress_interval_ms: int = 100
     frame_ms: int = 40
+    character: CharacterConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -860,6 +866,12 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     any of `phrases`, `address_starts`, `stop_before` and `greetings`, each a list of strings
     that replaces that set; a key it omits keeps its default.
 
+    `MIST_VOICE_CHARACTER` (default true) runs every spoken reply through the character stage,
+    `CharacterConfig()`; false turns off the whole stage, its limiter included, which has no
+    variable of its own. `MIST_VOICE_CHARACTER_DOUBLE_GAIN` (default 0.35) is the detuned
+    double's gain per copy, from 0 to 1. It is checked even with the stage off, so a bad value
+    fails at startup rather than when the stage is next turned on.
+
     Raises:
         ValueError: A set variable is malformed or removed; the message starts with the
             variable's name.
@@ -898,10 +910,13 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         barge_in,
         alarm_stop_keywords=_alarm_stop_keywords(env, "MIST_VOICE_ALARM_STOP_KEYWORDS", barge_in),
     )
+    double_gain = env.probability("MIST_VOICE_CHARACTER_DOUBLE_GAIN", CharacterConfig().double_gain)
+    character_on = env.boolean("MIST_VOICE_CHARACTER", True)
     playback = PlaybackConfig(
         client_prebuffer_ms=env.integer(
             "MIST_VOICE_CLIENT_PREBUFFER_MS", PlaybackConfig().client_prebuffer_ms
         ),
+        character=CharacterConfig(double_gain=double_gain) if character_on else None,
     )
     segmenter = SegmenterConfig(
         max_segment_chars=env.integer(

@@ -74,6 +74,7 @@ from .budget import (
     VoiceLatencyBudget,
     WakeConfig,
 )
+from .character import CharacterStage
 from .errors import SpeechEngineError
 from .ingress import (
     FRAME_MS,
@@ -693,7 +694,8 @@ class _Turn:
     """One turn's state, owned by the mailbox task.
 
     A held turn (`held`) answers `utterance_id`, whose end is not yet confirmed; until its
-    release every output it makes waits in `kept`, in the order it was made.
+    release every output it makes waits in `kept`, in the order it was made. `character` is the
+    reply's character stage, built with its pacer; None when the stage is off.
     """
 
     turn_id: str
@@ -714,6 +716,7 @@ class _Turn:
     segmenter: SpeechSegmenter | None = None
     ledger: PlaybackLedger | None = None
     pacer: PlaybackPacer | None = None
+    character: CharacterStage | None = None
     token: CancelToken = field(default_factory=CancelToken)
     segments: asyncio.Queue[tuple[int, TextSegment] | None] = field(default_factory=asyncio.Queue)
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
@@ -2541,6 +2544,10 @@ class TurnController:
             config=self._playback_config,
             listener=turn.scene,
         )
+        character = self._playback_config.character
+        if character is not None and self._synthesizer is not None:
+            # One stage per reply: its state runs from silence at the reply's start.
+            turn.character = CharacterStage(character, sample_rate=self._synthesizer.sample_rate)
         self._spawn(turn, self._synthesize(turn), "synthesize")
         self._spawn(turn, self._play(turn), "play")
 
@@ -2578,10 +2585,32 @@ class TurnController:
             self._post_internal(_StreamEnded(turn.turn_id, failed=True))
 
     async def _synthesize(self, turn: _Turn) -> None:
+        """Synthesize each segment on the TTS lane and hand its audio to the pacer.
+
+        With a character stage, each chunk is pulled from the engine and run through the stage
+        in one lane job, so the stage's work stays off the event loop; its pcm is replaced and
+        its `samples` kept, as the stage returns as many samples as it takes. After a segment's
+        last chunk the stage's tail, the copies finishing the segment's last syllable, is one
+        more chunk of that segment, with the last chunk's `state`, so it is framed inside the
+        segment and the ledger counts it there. A stage error ends the lane's worker, which
+        fails the job with `SpeechEngineError`, so it takes the engine-failure path.
+        """
         assert self._synthesizer is not None and self._tts_lane is not None  # noqa: S101
         assert turn.pacer is not None  # noqa: S101
         synthesizer = self._synthesizer
         lane = self._tts_lane
+        character = turn.character
+
+        def pull(step: Callable[[], SynthChunk]) -> SynthChunk | None:
+            """The engine's next chunk, through the stage when there is one; None at the end."""
+            try:
+                chunk = step()
+            except StopIteration:
+                return None
+            if character is None:
+                return chunk
+            return dataclasses.replace(chunk, pcm16=character.process(chunk.pcm16))
+
         try:
             while True:
                 item = await turn.segments.get()
@@ -2592,11 +2621,22 @@ class TurnController:
                 chunks = await lane.run(
                     synthesizer.synthesize, segment, turn.token, token=turn.token
                 )
+                last: SynthChunk | None = None
                 while True:
-                    chunk = await lane.run(next, chunks, None, token=turn.token)
+                    chunk = await lane.run(pull, chunks.__next__, token=turn.token)
                     if chunk is None:
                         break
                     self._on_chunk(turn, index, segment, chunk)
+                    last = chunk
+                if character is not None and last is not None:
+                    tail = await lane.run(character.end_segment, token=turn.token)
+                    if tail:
+                        self._on_chunk(
+                            turn,
+                            index,
+                            segment,
+                            dataclasses.replace(last, pcm16=tail, samples=len(tail) // 2),
+                        )
                 turn.pacer.end_segment(index)
                 # A play task waiting for audio was woken by `end_segment`, which put it ahead
                 # of this task on the loop's ready queue: one yield lets it queue the segment's
@@ -2811,9 +2851,29 @@ class TurnController:
             self._send_turn(turn, StateCycleMessage(state="think", turn_id=turn.turn_id))
 
     async def _on_play_ended(self, event: _PlayEnded) -> None:
+        """The pacer's run has ended, so no more audio passes the stage and its counts are final.
+
+        A clipped sample is hard-clipped distortion, which only a stage without its limiter
+        lets through, so it is a WARNING; the limiter's count, the samples it found above its
+        knee, is an INFO line. Each carries the turn id and its count, never the reply's text.
+        """
         turn = self._current(event.turn_id)
         if turn is None:
             return
+        stage = turn.character
+        if stage is not None:
+            if stage.clipped_samples > 0:
+                logger.warning(
+                    "turn %s: the character stage clipped %d samples",
+                    turn.turn_id,
+                    stage.clipped_samples,
+                )
+            if stage.limited_samples > 0:
+                logger.info(
+                    "turn %s: the character stage's limiter limited %d samples",
+                    turn.turn_id,
+                    stage.limited_samples,
+                )
         turn.tag_ended = True
         self._end_scene(turn)
         await self._maybe_complete(turn)
