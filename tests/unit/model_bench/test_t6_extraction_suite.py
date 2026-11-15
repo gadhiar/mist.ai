@@ -971,3 +971,181 @@ def test_summary_json_extraction_quality_key_present():
     assert "extraction_quality" in summary
     assert summary["extraction_quality"]["c0"]["rel_precision"] == 0.85
     assert summary["extraction_quality"]["a3"] is None
+
+
+# ---------------------------------------------------------------------------
+# Aligned relation scoring (plan v8, D8): per-probe counts, the paired
+# difference interval, and the summary's aligned figures
+# ---------------------------------------------------------------------------
+
+
+def test_per_probe_aligned_rel_counts_derives_tp_from_gold_minus_aligned_fn():
+    per_probe = [
+        {
+            "tag": "p1",
+            "gold_relationships": 3,
+            "rel_fps": [["a", "USES", "b"], ["e", "USES", "f"]],
+            "rel_fns": [["c", "USES", "d"], ["g", "USES", "h"]],
+            "aligned_rel_fps": [["a", "USES", "b"]],
+            "aligned_rel_fns": [["c", "USES", "d"]],
+        }
+    ]
+    assert extraction_probe.per_probe_aligned_rel_counts(per_probe) == {"p1": (2, 1, 1)}
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [("recall", 0.75 - 0.5), ("precision", 0.75 - 1.0), ("f1", 0.75 - 2 / 3)],
+)
+def test_paired_difference_single_tag_is_second_minus_first(kind, expected):
+    """With one tag every replicate draws it, so each is the point difference."""
+    ci = extraction_probe.cluster_bootstrap_paired_difference_ci(
+        {"only": (2, 0, 2)},
+        {"only": (3, 1, 1)},
+        n_replicates=20,
+        seed=4,
+        confidence=0.95,
+        kind=kind,
+    )
+    assert ci == (pytest.approx(expected), pytest.approx(expected))
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_paired_difference_resamples_the_same_tags_for_both_runs(seed):
+    """One replicate, drawn as the function draws it: both runs pool the same tags."""
+    first = {"p1": (2, 0, 1), "p2": (0, 1, 3), "p3": (1, 0, 0)}
+    second = {"p1": (3, 0, 0), "p2": (1, 2, 2), "p3": (0, 0, 1)}
+    tags = sorted(first)
+    rng = random.Random(seed)
+    drawn = [tags[rng.randrange(len(tags))] for _ in tags]
+
+    def recall(counts):
+        tp = sum(counts[t][0] for t in drawn)
+        fn = sum(counts[t][2] for t in drawn)
+        return tp / (tp + fn) if (tp + fn) else 1.0
+
+    expected = recall(second) - recall(first)
+    ci = extraction_probe.cluster_bootstrap_paired_difference_ci(
+        first, second, n_replicates=1, seed=seed, confidence=0.95, kind="recall"
+    )
+    assert ci == (pytest.approx(expected), pytest.approx(expected))
+
+
+def test_paired_difference_equal_seeds_give_equal_intervals():
+    first = {"p1": (2, 0, 1), "p2": (0, 1, 3), "p3": (1, 0, 0)}
+    second = {"p1": (3, 0, 0), "p2": (1, 2, 2), "p3": (0, 0, 1)}
+    kwargs = {"n_replicates": 400, "seed": 9, "confidence": 0.95, "kind": "precision"}
+    one = extraction_probe.cluster_bootstrap_paired_difference_ci(first, second, **kwargs)
+    two = extraction_probe.cluster_bootstrap_paired_difference_ci(first, second, **kwargs)
+    assert one == two
+    assert one is not None
+    assert -1.0 <= one[0] <= one[1] <= 1.0
+
+
+def test_paired_difference_refuses_differing_tags():
+    with pytest.raises(ValueError, match="tags"):
+        extraction_probe.cluster_bootstrap_paired_difference_ci(
+            {"p1": (1, 0, 0)},
+            {"p2": (1, 0, 0)},
+            n_replicates=10,
+            seed=0,
+            confidence=0.95,
+            kind="recall",
+        )
+
+
+@pytest.mark.parametrize("kind", ["", "Recall", "accuracy"])
+def test_paired_difference_refuses_an_unknown_kind(kind):
+    with pytest.raises(ValueError, match="kind"):
+        extraction_probe.cluster_bootstrap_paired_difference_ci(
+            {"p1": (1, 0, 0)},
+            {"p1": (1, 0, 0)},
+            n_replicates=10,
+            seed=0,
+            confidence=0.95,
+            kind=kind,
+        )
+
+
+def test_paired_difference_is_none_with_no_tags():
+    ci = extraction_probe.cluster_bootstrap_paired_difference_ci(
+        {}, {}, n_replicates=10, seed=0, confidence=0.95, kind="recall"
+    )
+    assert ci is None
+
+
+def _aligned_report() -> Report:
+    """A real scorer report on invented probes: one n1 id found aligned and missed exact."""
+    from scripts.eval_harness.score_extraction_run import (
+        GoldEntity,
+        GoldProbe,
+        GoldRel,
+        Produced,
+        score_run,
+    )
+
+    user = GoldEntity("user", "User")
+    probes = [
+        GoldProbe(
+            tag=f"syn-0{i}-tools",
+            utterance=f"I use the Quillpad {i}",
+            entities=(user, GoldEntity(f"quillpad-{i}", "Tool")),
+            relationships=(GoldRel("user", "User", "USES", f"quillpad-{i}", "Tool"),),
+        )
+        for i in range(1, 4)
+    ]
+
+    def produced(i: int, tool_id: str) -> Produced:
+        ents = (user, GoldEntity(tool_id, "Tool"))
+        return Produced(
+            utterance=f"I use the Quillpad {i}",
+            parse_ok=True,
+            entities=ents,
+            entity_type_by_id={e.id: e.type for e in ents},
+            relationships=(
+                {"source": "user", "predicate": "USES", "target": tool_id, "properties": {}},
+            ),
+        )
+
+    index = {
+        "I use the Quillpad 1": produced(1, "the-quillpad-1"),
+        "I use the Quillpad 2": produced(2, "quillpad-2"),
+    }
+    return score_run(probes, index)
+
+
+def test_build_summary_carries_the_aligned_figures(tmp_path):
+    report = _aligned_report()
+    summary = _summary_for(report, tmp_path, seed=3, b=200)
+    counts = extraction_probe.per_probe_aligned_rel_counts(report.per_probe)
+    for key, value, kind in [
+        ("aligned_relationship_recall", report.aligned_rel_recall, "recall"),
+        ("aligned_relationship_precision", report.aligned_rel_precision, "precision"),
+        ("aligned_relationship_f1", report.aligned_rel_f1, "f1"),
+    ]:
+        direct = extraction_probe.cluster_bootstrap_ratio_ci(
+            counts, n_replicates=200, seed=3, confidence=0.95, kind=kind
+        )
+        assert summary[key] == {"value": value, "ci95": direct}, key
+    assert summary["aligned_relationship_recall"]["value"] == pytest.approx(2 / 3)
+    assert summary["rel_recall"] == pytest.approx(1 / 3)
+    assert summary["id_agreement"] == report.id_agreement == pytest.approx(3 / 4)
+
+
+def test_build_summary_aligned_figures_are_none_for_a_report_without_them():
+    summary = extraction_probe.build_summary(
+        _FakeReport(),
+        gold_path=Path(_REPO_ROOT / extraction_probe.DEFAULT_GOLD_CORPUS),
+        ontology_version="1.4.0",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+    for key in (
+        "aligned_relationship_recall",
+        "aligned_relationship_precision",
+        "aligned_relationship_f1",
+        "id_agreement",
+    ):
+        assert summary[key] is None, key

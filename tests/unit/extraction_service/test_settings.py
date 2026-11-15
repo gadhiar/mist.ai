@@ -1,5 +1,9 @@
 """Tests for ServiceSettings.from_env()."""
 
+import os
+
+import pytest
+
 from backend.extraction_service.settings import ServiceSettings
 
 _ALL_ENV_VARS = [
@@ -69,3 +73,63 @@ class TestServiceSettingsFromEnv:
 
         monkeypatch.setenv("EXTRACTION_SCOPE_ENABLED", "yes")
         assert ServiceSettings.from_env().scope_enabled is True
+
+
+def _clear_server_env(monkeypatch) -> None:
+    for key in list(os.environ):
+        if key.startswith("EXTRACTION_SERVER"):
+            monkeypatch.delenv(key)
+
+
+class TestServerConfigFromEnv:
+    """The declared llama-server settings, `EXTRACTION_SERVER_<NAME>` (MIS-196)."""
+
+    def test_none_declared_is_empty(self, monkeypatch):
+        _clear_server_env(monkeypatch)
+
+        assert ServiceSettings.from_env().server_config == ()
+
+    def test_every_declared_setting_is_read_lower_cased_stripped_and_sorted(self, monkeypatch):
+        _clear_server_env(monkeypatch)
+        monkeypatch.setenv("EXTRACTION_SERVER_N_CPU_MOE", " 24 ")
+        monkeypatch.setenv("EXTRACTION_SERVER_DEVICE", "rtx4070s")
+        monkeypatch.setenv("EXTRACTION_SERVER_IMAGE", "ghcr.io/ggml-org/llama.cpp@sha256:ab\n")
+        monkeypatch.setenv("EXTRACTION_SERVER_CTX_SIZE", "16384")
+
+        assert ServiceSettings.from_env().server_config == (
+            ("ctx_size", "16384"),
+            ("device", "rtx4070s"),
+            ("image", "ghcr.io/ggml-org/llama.cpp@sha256:ab"),
+            ("n_cpu_moe", "24"),
+        )
+
+    def test_an_empty_declaration_is_kept_as_declared(self, monkeypatch):
+        """An unset `${VAR:-}` arrives as an empty string; the service reports it so."""
+        _clear_server_env(monkeypatch)
+        monkeypatch.setenv("EXTRACTION_SERVER_DEVICE", "  ")
+
+        assert ServiceSettings.from_env().server_config == (("device", ""),)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param("EXTRACTION_SERVER", id="the-prefix-without-a-name"),
+            pytest.param("EXTRACTION_SERVER_", id="the-prefix-with-an-empty-name"),
+            pytest.param("EXTRACTION_SERVERS_DEVICE", id="another-prefix"),
+            pytest.param("EXTRACTION_LLM_BASE_URL", id="another-service-setting"),
+        ],
+    )
+    def test_other_variables_are_not_declarations(self, monkeypatch, name):
+        _clear_server_env(monkeypatch)
+        monkeypatch.setenv(name, "x")
+
+        assert ServiceSettings.from_env().server_config == ()
+
+    def test_a_setting_declared_twice_is_refused(self):
+        with pytest.raises(ValueError, match="device"):
+            ServiceSettings(
+                llm_base_url="http://x",
+                model_hash="m",
+                model_file="f",
+                server_config=(("device", "a"), ("device", "b")),
+            )

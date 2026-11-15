@@ -252,6 +252,29 @@ class TestFactory:
         assert writer == curation._graph_writer._rebuild_stamps
         assert writer == curation._engine._stamps
 
+    def test_the_dispatch_identity_is_the_handler_pipelines_and_the_settings(self):
+        """The factory adds no parameter: the identity comes from what the dispatcher runs."""
+        from backend.extraction_backlog.dispatch_identity import dispatch_identity_for
+        from backend.factories import build_extraction_dispatcher
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        pipeline = world.build_pipeline()
+        settings = DispatcherSettings(mode="off", history_messages=7)
+
+        dispatcher = build_extraction_dispatcher(
+            build_test_config(),
+            pipeline=pipeline,
+            event_store=world.event_store,
+            settings=settings,
+            extraction_cache=world.cache,
+        )
+
+        assert dispatcher.dispatch_identity == dispatch_identity_for(
+            pipeline.dispatch_gate_settings(), settings
+        )
+        assert dispatcher.dispatch_identity.components["history_messages"] == 7
+
 
 class TestAdminCli:
     def test_status_prints_the_backlog_counts(self, ts):

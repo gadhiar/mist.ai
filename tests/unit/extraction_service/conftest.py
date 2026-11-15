@@ -21,9 +21,23 @@ from backend.extraction_service.engine import ExtractionEngine
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from backend.llm.llama_server_provider import LlamaServerProvider
-from tests.unit.extraction_service.fake_llama import FakeLlamaState, build_fake_llama_app
+from tests.unit.extraction_service.fake_llama import (
+    FAKE_N_CTX,
+    FakeLlamaState,
+    build_fake_llama_app,
+)
 
 FAKE_BASE_URL = "http://fake-llama"
+
+# The `EXTRACTION_SERVER_*` declarations a compose file gives the service, as
+# `ServiceSettings.from_env` reads them: the required three, with the declared
+# context size equal to the one the fake llama-server reports, so the service
+# has a serving identity unless a test takes one away.
+FAKE_SERVER_CONFIG: tuple[tuple[str, str], ...] = (
+    ("ctx_size", str(FAKE_N_CTX)),
+    ("device", "test-gpu"),
+    ("image", "test-llama-server@sha256:" + "0" * 64),
+)
 
 
 @pytest.fixture
@@ -96,6 +110,7 @@ def service_settings() -> ServiceSettings:
         max_attempts=2,
         llm_timeout_seconds=10.0,
         idempotency_cache_size=8,
+        server_config=FAKE_SERVER_CONFIG,
     )
 
 
@@ -138,8 +153,16 @@ def make_extract_request(
     model_hash: str = "test-model-hash",
     contract_version: str = "1.0.0",
     derivation: dict | None = None,
+    serving_identity: str | None = None,
 ) -> dict:
-    """Build a valid ExtractRequest body as a plain dict, for httpx POSTs."""
+    """Build a valid ExtractRequest body as a plain dict, for httpx POSTs.
+
+    `expect.serving_identity` is sent only when `serving_identity` is given, so
+    the default body is the one a pre-1.3.0 backend sends.
+    """
+    expect: dict[str, str] = {"extraction_version": extraction_version, "model_hash": model_hash}
+    if serving_identity is not None:
+        expect["serving_identity"] = serving_identity
     return {
         "contract_version": contract_version,
         "job_id": job_id,
@@ -151,6 +174,6 @@ def make_extract_request(
         "turn_index": 0,
         "utterance": utterance,
         "conversation_history": [],
-        "expect": {"extraction_version": extraction_version, "model_hash": model_hash},
+        "expect": expect,
         "derivation": derivation,
     }

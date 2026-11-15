@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from openai import DEFAULT_TIMEOUT
 from pydantic import ValidationError
 
 from backend.errors import LLMResponseError
@@ -119,6 +120,30 @@ def _default_request() -> LLMRequest:
 @pytest.fixture()
 def provider() -> LlamaServerProvider:
     return LlamaServerProvider(base_url="http://localhost:8080", model="test-model")
+
+
+# ---------------------------------------------------------------------------
+# The client timeout
+# ---------------------------------------------------------------------------
+
+
+class TestClientTimeout:
+    def test_a_timeout_reaches_both_clients_with_a_short_connect(self):
+        provider = LlamaServerProvider(
+            base_url="http://localhost:8080", model="test-model", timeout=900.0
+        )
+
+        expected = httpx.Timeout(900.0, connect=5.0)
+        assert provider._async_client.timeout == expected
+        assert provider._sync_client.timeout == expected
+
+    def test_no_timeout_keeps_the_sdk_default(self, provider: LlamaServerProvider):
+        assert provider._async_client.timeout == DEFAULT_TIMEOUT
+        assert provider._sync_client.timeout == DEFAULT_TIMEOUT
+
+    def test_the_timeout_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            LlamaServerProvider("http://localhost:8080", "test-model", 900.0)  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

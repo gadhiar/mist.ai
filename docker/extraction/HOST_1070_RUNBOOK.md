@@ -111,6 +111,7 @@ it) -- compose loads `.env` from the directory of the compose file you pass with
 `-f`, not the invoking shell's working directory:
 
     EXTRACTION_MODEL_HASH=<the epoch name for this file, e.g. gpt-oss-20b-mxfp4-<sha8>>
+    EXTRACTION_LLM_DEVICE=gtx-1070  # required, no default: the GPU keys the epoch
     TS_AUTHKEY=<a tailnet auth key, see step 6>
     EXTRACTION_HOST_NCMOE=24       # all experts on CPU (verified block_count=24
                                     # via GGUF metadata); step 5 measures a tighter fit
@@ -120,6 +121,31 @@ it) -- compose loads `.env` from the directory of the compose file you pass with
 
 Every other `EXTRACTION_*` variable has a default; `docker/extraction/README.md`
 section "Environment variables" lists them.
+
+**`EXTRACTION_LLM_DEVICE` and the declared llama-server settings.**
+`EXTRACTION_LLM_DEVICE` is required with no default, like
+`EXTRACTION_MODEL_HASH`: without it `docker compose config` fails. Name the
+GPU this host runs llama-server on, e.g. `gtx-1070`. `compose.host.yml` passes
+it to the extraction service as `EXTRACTION_SERVER_DEVICE`, beside the rest of
+the `EXTRACTION_SERVER_*` family: one declaration per keyed llama-server
+setting (image, ctx size, ncmoe, batch and ubatch, GPU layers, parallel slots,
+cache RAM, jinja, reasoning, think format, temp, top_p), each built from the
+same expression as the flag. Do not set `EXTRACTION_SERVER_*` in `.env`; set
+the source variable instead (`EXTRACTION_LLM_CTX_SIZE`, `EXTRACTION_HOST_NCMOE`,
+`LLM_CACHE_RAM_MIB`), which changes the flag and its declaration together.
+`docker/extraction/README.md` section "Declared llama-server settings" lists
+them all.
+
+**Changing any declared setting starts a new extraction epoch.** The service
+folds every declared setting into the serving identity it reports on
+`/v1/info`, so a change to `EXTRACTION_LLM_DEVICE`, `EXTRACTION_LLM_CTX_SIZE`,
+`EXTRACTION_HOST_NCMOE` (including the step 5 opt-in to `13`), `LLM_CACHE_RAM_MIB`
+or any flag in `compose.host.yml` gives this host a different identity. The
+backend then refuses it, naming each setting that differs, until the operator
+cuts over to a new epoch with `admin cutover begin --settings-change` (see
+`backend/extraction_backlog/CUTOVER.md`). Moving canonical extraction between
+this 1070 and the 4070 is such a change too: the two GPUs never share an
+epoch.
 
 **`EXTRACTION_CONSTRAINED_MODE` may stay unset.** The `gptoss` adapter's
 default constrained mode is now `schema`. It used to be `none`, which on

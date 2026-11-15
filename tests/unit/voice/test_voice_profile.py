@@ -191,8 +191,8 @@ class TestVoiceProfileRegistry:
             profiles_dir=fake_profile_dir,
             project_root=fake_profile_dir.parent,
         )
-        # Default is 'jarvis', but only 'testvoice' exists -> KeyError
-        with pytest.raises(KeyError, match="jarvis"):
+        # Default is 'mist', but only 'testvoice' exists -> KeyError
+        with pytest.raises(KeyError, match="mist"):
             registry.get_active()
 
     def test_skip_null_weights(self, tmp_path):

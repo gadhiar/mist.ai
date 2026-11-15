@@ -9,6 +9,18 @@ a result, a gauntlet run or a report can say exactly which setup it came
 from, and two runs can be compared knowing whether they measured the same
 thing (MIS-188). It is recorded, not keyed: nothing matches on it.
 
+What an epoch is keyed on, beyond the (ontology_version, extraction_version,
+model_hash) triple, is the serving identity
+(`backend.knowledge.extraction.serving_identity`, MIS-196). The two differ
+on purpose. The run identity covers code, which `EXTRACTION_VERSION` and
+`CODE_REVISIONS` govern so that a code change can apply to new turns only, and
+a key on code would override that choice. The serving identity leaves code out
+and covers what the run identity cannot see: the context size llama-server
+reports, `top_p` and the rest of each request as sent, and the declared
+llama-server launch settings. The fields both hold (adapter, llama_cpp_build,
+max_attempts, scope_enabled) carry the same values, which a test in
+`tests/unit/extraction_service/test_serving_identity_service.py` checks.
+
 The code side is hashed from source with comments, docstrings, blank lines
 and trailing whitespace removed, so editing an explanation does not move it
 and any other edit does. Removal works on positions: `ast` finds docstrings,

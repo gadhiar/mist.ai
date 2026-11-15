@@ -18,9 +18,7 @@
 | File | Responsibility |
 |------|---------------|
 | `backend/audio_protocol.py` | Binary frame builder, RMS normalization, fade-out generation, PCM16 conversion. Taken from `feat/voice-streaming-pipeline` branch unchanged. |
-| `voice_profiles/friday/personality.yaml` | FRIDAY personality config (openers, speaking style, mannerisms) |
-| `voice_profiles/jarvis/personality.yaml` | Jarvis personality config (stub) |
-| `voice_profiles/cortana/personality.yaml` | Cortana personality config (stub) |
+| `voice_profiles/mist/personality.yaml` | M.I.S.T personality config (openers, speaking style, mannerisms) |
 
 ### Backend -- Modified Files
 | File | Changes |
@@ -56,9 +54,9 @@
 
 **No code is written until all tickets exist.**
 
-- [ ] **Step 1: Update MIS-45 (FRIDAY Voice Research) to Done**
+- [ ] **Step 1: Update MIS-45 (Voice Research) to Done**
 
-Mark as Done with comment: "FRIDAY voice profile created (46.2s reference WAV), all 3 profiles migrated to Chatterbox, default profile switched to friday."
+Mark as Done with comment: "Default voice profile created (46.2s reference WAV), all 3 profiles migrated to Chatterbox, default profile switched to it."
 
 - [ ] **Step 2: Update MIS-76 (Voice Streaming E2E) description**
 
@@ -74,7 +72,7 @@ Description: "Remove 6s duration-based pre-buffer from audio_playback_service.da
 
 Title: "Personality profile system + first-utterance priming"
 Project: Voice, Priority: High, Label: Feature
-Description: "Create personality config YAML per voice profile (openers, speaking style, mannerisms, address form). Template voice system prompt from personality config in generate_tokens_streaming(). Bypass 40-char sentence coalescing for first sentence in each turn. Write initial FRIDAY personality config."
+Description: "Create personality config YAML per voice profile (openers, speaking style, mannerisms, address form). Template voice system prompt from personality config in generate_tokens_streaming(). Bypass 40-char sentence coalescing for first sentence in each turn. Write initial M.I.S.T personality config."
 
 - [ ] **Step 5: Create ticket -- Flutter Profiles screen**
 
@@ -82,11 +80,11 @@ Title: "Flutter Profiles screen -- unified voice + personality management"
 Project: Frontend, Priority: Medium, Label: Feature
 Description: "Replace Voice Profiles stub screen with unified profile management UI. Display TTS voice settings (reference audio, exaggeration, temperature) and personality config (openers, speaking style, mannerisms) side by side. Allow editing personality YAML from Flutter UI."
 
-- [ ] **Step 6: Create ticket -- FRIDAY personality review**
+- [ ] **Step 6: Create ticket -- M.I.S.T personality review**
 
-Title: "FRIDAY personality review and finalization"
+Title: "M.I.S.T personality review and finalization"
 Project: Voice, Priority: Medium, Label: Improvement
-Description: "Dedicated pass to review and tune FRIDAY personality profile. Test openers for natural feel, adjust mannerisms frequency, verify speaking style produces conversational output. Iterate on personality.yaml until voice interactions feel authentic."
+Description: "Dedicated pass to review and tune the M.I.S.T personality profile. Test openers for natural feel, adjust mannerisms frequency, verify speaking style produces conversational output. Iterate on personality.yaml until voice interactions feel authentic."
 
 - [ ] **Step 7: Create ticket -- Streaming TTS research**
 
@@ -658,12 +656,10 @@ Remove old JSON audio message handling."
 
 ---
 
-## Task 7: Personality Config Structure + FRIDAY Config
+## Task 7: Personality Config Structure + M.I.S.T Config
 
 **Files:**
-- Create: `voice_profiles/friday/personality.yaml`
-- Create: `voice_profiles/jarvis/personality.yaml`
-- Create: `voice_profiles/cortana/personality.yaml`
+- Create: `voice_profiles/mist/personality.yaml`
 - Create: `tests/unit/test_personality_config.py`
 
 - [ ] **Step 1: Write the test for personality config loading**
@@ -729,45 +725,36 @@ def _build_voice_system_prompt(personality: dict) -> str:
 class TestPersonalityConfig:
     """Test personality config loading and prompt generation."""
 
-    def test_friday_personality_exists(self):
-        config = _load_personality("friday")
-        assert config, "friday/personality.yaml should exist and be non-empty"
+    def test_mist_personality_exists(self):
+        config = _load_personality("mist")
+        assert config, "mist/personality.yaml should exist and be non-empty"
 
-    def test_friday_has_required_fields(self):
-        config = _load_personality("friday")
+    def test_mist_has_required_fields(self):
+        config = _load_personality("mist")
         assert "name" in config
         assert "characteristic_openers" in config
         assert "speaking_style" in config
         assert len(config["characteristic_openers"]) >= 3
 
-    def test_friday_openers_are_short(self):
+    def test_mist_openers_are_short(self):
         """Openers must be short enough for fast first TTS."""
-        config = _load_personality("friday")
+        config = _load_personality("mist")
         for opener in config["characteristic_openers"]:
             assert len(opener) <= 40, (
                 f"Opener too long for first-utterance priming: "
                 f"'{opener}' ({len(opener)} chars, max 40)"
             )
 
-    def test_friday_prompt_generation(self):
-        config = _load_personality("friday")
+    def test_mist_prompt_generation(self):
+        config = _load_personality("mist")
         prompt = _build_voice_system_prompt(config)
-        assert "FRIDAY" in prompt
+        assert "M.I.S.T" in prompt
         assert "opening phrase" in prompt
-        assert "Boss" in prompt
 
     def test_empty_personality_fallback(self):
         prompt = _build_voice_system_prompt({})
         assert "M.I.S.T" in prompt
         assert "concise" in prompt
-
-    def test_jarvis_stub_loads(self):
-        config = _load_personality("jarvis")
-        assert isinstance(config, dict)
-
-    def test_cortana_stub_loads(self):
-        config = _load_personality("cortana")
-        assert isinstance(config, dict)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -778,97 +765,50 @@ docker compose run --rm --no-deps mist-backend pytest tests/unit/test_personalit
 
 Expected: FAIL (personality.yaml files don't exist yet).
 
-- [ ] **Step 3: Create FRIDAY personality config**
+- [ ] **Step 3: Create M.I.S.T personality config**
 
-Create `voice_profiles/friday/personality.yaml`:
+Create `voice_profiles/mist/personality.yaml`:
 
 ```yaml
-name: FRIDAY
-address_form: Boss
+name: M.I.S.T
+address_form: null
 characteristic_openers:
-  - "Sure thing, Boss."
   - "Got it."
   - "Right away."
-  - "On it, Boss."
   - "Here's what I found."
   - "One moment."
   - "Working on it."
   - "Right."
 speaking_style: |
-  Concise, professional, slightly warm. Military-assistant cadence.
+  Concise, professional, slightly warm.
   Favor short declarative sentences. No filler or hedging.
-  Address the user as "Boss" occasionally but not every response.
   Lead with action or acknowledgment, then substance.
   Keep voice responses to 1-3 sentences for simple questions.
   For detailed requests, provide thorough but structured answers.
 mannerisms:
-  - 'Uses "Boss" as form of address (2-3x per conversation, not every turn)'
   - Dry humor when appropriate
   - Never says "I think" -- states things directly
   - Avoids unnecessary qualifiers and hedging
   - Prioritizes correctness and accuracy
 ```
 
-- [ ] **Step 4: Create Jarvis personality stub**
-
-Create `voice_profiles/jarvis/personality.yaml`:
-
-```yaml
-name: JARVIS
-address_form: Sir
-characteristic_openers:
-  - "Right away, Sir."
-  - "Of course."
-  - "Certainly, Sir."
-  - "At once."
-speaking_style: |
-  Formal British butler cadence. Dry humor. Precise and measured.
-  Address the user as "Sir" occasionally.
-mannerisms:
-  - 'Uses "Sir" as form of address'
-  - Understated, formal tone
-  - Dry humor, subtle and understated
-```
-
-- [ ] **Step 5: Create Cortana personality stub**
-
-Create `voice_profiles/cortana/personality.yaml`:
-
-```yaml
-name: Cortana
-address_form: null
-characteristic_openers:
-  - "On it."
-  - "I've got this."
-  - "Here we go."
-  - "Let me check."
-speaking_style: |
-  Direct, confident, slightly playful. No formal address.
-  Balances warmth with efficiency.
-mannerisms:
-  - No formal address form
-  - Confident and slightly playful tone
-  - Direct without being curt
-```
-
-- [ ] **Step 6: Run tests to verify they pass**
+- [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
 docker compose run --rm --no-deps mist-backend pytest tests/unit/test_personality_config.py -v
 ```
 
-Expected: All 7 tests PASS.
+Expected: All 5 tests PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add voice_profiles/ tests/unit/test_personality_config.py
-git commit -m "feat(voice): add personality config system with FRIDAY profile
+git commit -m "feat(voice): add personality config system with mist profile
 
 YAML-based personality configs per voice profile: openers, speaking
-style, mannerisms, address form. FRIDAY personality written with
-short characteristic openers for first-utterance priming. Jarvis
-and Cortana stubs included."
+style, mannerisms, address form. M.I.S.T personality written with
+short characteristic openers for first-utterance priming."
 ```
 
 ---
@@ -895,7 +835,7 @@ def _load_personality(self, profile_name: str) -> dict:
     """Load personality config for a voice profile.
 
     Args:
-        profile_name: Name of the voice profile (e.g., 'friday').
+        profile_name: Name of the voice profile (e.g., 'mist').
 
     Returns:
         Personality config dict, or empty dict if not found.
@@ -977,7 +917,7 @@ In `generate_tokens_streaming()`, replace the hardcoded `system_prompt` (lines ~
 
 ```python
         # Step 2: Build voice-optimized messages with personality
-        voice_profile = getattr(self, "_voice_profile", "friday")
+        voice_profile = getattr(self, "_voice_profile", "mist")
         personality = self._load_personality(voice_profile)
         system_prompt = self._build_voice_system_prompt(personality)
 ```
@@ -998,11 +938,11 @@ In `backend/voice_processor.py`, find where KnowledgeIntegration is initialized 
 ```python
 # After self.knowledge_integration is created:
 if self.knowledge_integration and self.knowledge_integration.enabled:
-    voice_profile = self.config.voice_profile or "friday"
+    voice_profile = self.config.voice_profile or "mist"
     self.knowledge_integration.set_voice_profile(voice_profile)
 ```
 
-Verify that `self.config.voice_profile` or equivalent exists by reading `backend/config.py`. The config key is `VOICE_PROFILE` from `.env` (currently defaults to `friday`).
+Verify that `self.config.voice_profile` or equivalent exists by reading `backend/config.py`. The config key is `VOICE_PROFILE` from `.env` (currently defaults to `mist`).
 
 - [ ] **Step 4: Run tests**
 
@@ -1066,7 +1006,7 @@ While audio is playing, start speaking. Verify:
 
 - [ ] **Step 6: Validate first-utterance priming**
 
-Check backend logs for TTS timing. The first TTS chunk should be short (opener like "Sure thing, Boss." or "Got it."). Verify:
+Check backend logs for TTS timing. The first TTS chunk should be short (opener like "Got it." or "Right away."). Verify:
 - First sentence is under 40 chars
 - TTS generation for first chunk is faster than before (~0.8-1.0s vs ~2.5s)
 - TTFA improved from ~4-5s to ~2.5-3.5s
@@ -1140,7 +1080,7 @@ After E2E validation passes:
 Update to reflect:
 - Binary WebSocket transport active
 - Adaptive pre-buffering (first-chunk immediate, no 6s delay)
-- Personality profile system active (FRIDAY default)
+- Personality profile system active (`mist` default)
 - Expected TTFA: ~2.5-3.5s
 - feat/voice-streaming-pipeline branch merged/integrated
 

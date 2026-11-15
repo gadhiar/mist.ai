@@ -472,6 +472,7 @@ class TestRunIdentityCoverage:
             "backend.errors",
             "backend.extraction_contract.models",
             "backend.extraction_service.settings",
+            "backend.knowledge.extraction.serving_identity",
             "backend.knowledge.version_stamps",
             "backend.llm.models",
             "backend.llm.provider",

@@ -289,6 +289,10 @@ class TestActiveEpoch:
         self, backlog_world, monkeypatch
     ):
         world = backlog_world
+        # Bound, as a running instance is after the upgrade: an unbound epoch is
+        # bound at its first `/v1/info` contact before any head is acted on,
+        # because the namespace its skip row goes to depends on the binding.
+        world.bind_active_epoch()
         capability = _log(world, index=0, minute=0, answered_by="capability")
         dispatcher = world.build_dispatcher()
 
@@ -340,6 +344,7 @@ class TestActiveEpoch:
         self, backlog_world
     ):
         world = backlog_world
+        world.bind_active_epoch()
         capability = _log(world, index=0, minute=0, answered_by="capability")
         _active_put(
             world,
@@ -363,6 +368,7 @@ class TestActiveEpoch:
         self, backlog_world
     ):
         world = backlog_world
+        world.bind_active_epoch()
         world.service.down = True
         model = _log(world, index=1, minute=5, answered_by="model")
         dispatcher = world.build_dispatcher()
@@ -442,6 +448,28 @@ def _begin_cutover(world: BacklogWorld) -> None:
     world.service.model_hash = CANDIDATE
 
 
+def _bind_open_cutover(world: BacklogWorld) -> None:
+    """Bind the open candidate in the 3-part namespace, as first contact does.
+
+    For a test that asserts no service contact: an unbound candidate is bound
+    at its first `/v1/info` contact before its head is acted on.
+    """
+    cutover = world.store.open_cutover()
+    assert cutover is not None
+    dispatch = world.dispatch_identity()
+    assert world.event_store.bind_cutover_identity(
+        cutover.cutover_id,
+        serving_identity=world.service.serving_identity,
+        serving_components=dict(world.service.serving_components),
+        dispatch_identity=dispatch.identity,
+        dispatch_components=dict(dispatch.components),
+        identity_namespace=None,
+        source="first-contact",
+        evidence={"rule": "5b"},
+        bound_at="2026-09-01T00:00:00+00:00",
+    )
+
+
 def _capability_rows(cache: ExtractionCache) -> list[dict]:
     rows = (
         cache._get_connection()
@@ -462,6 +490,7 @@ class TestCutoverFill:
         world = backlog_world
         capability = _log(world, index=0, minute=0, answered_by="capability")
         _begin_cutover(world)
+        _bind_open_cutover(world)
         dispatcher = world.build_dispatcher()
         cutover = world.store.open_cutover()
         assert cutover is not None

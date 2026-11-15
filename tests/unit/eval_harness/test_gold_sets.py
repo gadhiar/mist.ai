@@ -484,8 +484,17 @@ _GOLD_BY_SET = {"dev-lists": _DEV_GOLD, "heldout": _HELDOUT_GOLD}
 _GOLD_SIZE_RANGE = {"dev-lists": (40, 40), "heldout": (190, 210)}
 _GOLD_ROW_FIELDS = {"utterance", "tag", "expected_entities", "expected_relationships"}
 _GOLD_ENTITY_FIELDS = {"id", "type"}
+# The extraction contract's optional keys, read by `iter_gold_probes`: an entity's other
+# accepted ids, an edge's other accepted predicates, and the beyond-the-prompt flag.
+_GOLD_ENTITY_OPTIONAL = {"alternatives"}
 _GOLD_EDGE_REQUIRED = {"source", "source_type", "predicate", "target", "target_type"}
-_GOLD_EDGE_OPTIONAL = {"valid_from", "valid_to", "assertion_kind"}
+_GOLD_EDGE_OPTIONAL = {
+    "valid_from",
+    "valid_to",
+    "assertion_kind",
+    "predicate_alternatives",
+    "beyond_prompt",
+}
 _HELDOUT_LIST_MIN = 40
 _HELDOUT_NOFACT_MIN = 20
 _PROMPT_ANCHOR_IDS = {"user", "mist-identity"}
@@ -547,7 +556,7 @@ def test_gold_rows_follow_the_sixty_probe_schema(set_name):
         bad += [
             (row["tag"], sorted(e))
             for e in row["expected_entities"]
-            if set(e) != _GOLD_ENTITY_FIELDS
+            if not _GOLD_ENTITY_FIELDS <= set(e) <= _GOLD_ENTITY_FIELDS | _GOLD_ENTITY_OPTIONAL
         ]
         for rel in row["expected_relationships"]:
             keys = set(rel)
@@ -683,6 +692,408 @@ def test_heldout_ids_avoid_the_prompts_example_entities_outright():
     example_ids = {canonical_id(t) for t in _prompt_entity_terms()}
 
     assert sorted(set(_PROMPT_WORD_EXEMPTIONS) & example_ids) == []
+
+
+# --- The extraction contract's optional gold keys --------------------------------------------
+
+# Every gold set the scorer reads, the 60 probes included, is held to the optional-key rules.
+_ALL_GOLD_PARAMS = [pytest.param(p, id=p.name) for p in (_SIXTY, _DEV_GOLD, _HELDOUT_GOLD)]
+
+# The edges H8 added to dev-lists by labelling rules the production prompt does not carry:
+# the edges of today's gold that the pre-H8 gold (`4f5ceed`) lacks, as
+# `diagnose_list_misses._beyond_prompt` computed them before the Event relabel renamed any
+# endpoint. Pinned here because a test that read the parent commit would break in a shallow
+# checkout and after a squash merge. The dvl-30 keys carry the relabelled Event ids.
+_BEYOND_PROMPT_EDGES = {
+    ("dvl-01-list-dash-current-tools", "fish", "IS_A", "shell"),
+    ("dvl-01-list-dash-current-tools", "helix", "IS_A", "editor"),
+    ("dvl-17-list-ref-middle-editor", "kakoune", "IS_A", "editor"),
+    (
+        "dvl-30-list-checkbox-planning-decisions",
+        "planning-2026-06-13",
+        "RELATED_TO",
+        "move-docs-site-to-astro",
+    ),
+    (
+        "dvl-30-list-checkbox-planning-decisions",
+        "planning-2026-06-13",
+        "RELATED_TO",
+        "freeze-features-2026-11-28",
+    ),
+    ("dvl-34-list-long-weekly-habits", "user", "KNOWS_PERSON", "sister"),
+}
+
+
+def _optional_key_faults(rows: list[dict]) -> Counter:
+    """Count each kind of malformed optional key, so a held-out failure shows no label."""
+    faults: Counter = Counter()
+    predicates = set(EXTRACTABLE_RELATIONSHIP_TYPES)
+    for row in rows:
+        ids = [e["id"] for e in row["expected_entities"]]
+        claimed = list(ids)
+        for entity in row["expected_entities"]:
+            if "alternatives" not in entity:
+                continue
+            alternatives = entity["alternatives"]
+            if not isinstance(alternatives, list) or not alternatives:
+                faults["alternatives not a non-empty list"] += 1
+                continue
+            for alt in alternatives:
+                if not isinstance(alt, str) or canonical_id(alt) != alt:
+                    faults["alternative not a canonical id"] += 1
+                elif alt in ids:
+                    faults["alternative equal to an entity id of its probe"] += 1
+                elif alt in claimed:
+                    faults["alternative repeated within its probe"] += 1
+                claimed.append(alt)
+        for rel in row["expected_relationships"]:
+            if "beyond_prompt" in rel and rel["beyond_prompt"] is not True:
+                faults["beyond_prompt written other than true"] += 1
+            if "predicate_alternatives" not in rel:
+                continue
+            others = rel["predicate_alternatives"]
+            if not isinstance(others, list) or not others:
+                faults["predicate_alternatives not a non-empty list"] += 1
+                continue
+            if len(set(others)) != len(others) or rel["predicate"] in others:
+                faults["predicate alternative repeated"] += 1
+            for other in others:
+                if other not in predicates:
+                    faults["predicate alternative not extractable"] += 1
+                elif not _types_allowed(other, rel["source_type"], rel["target_type"]):
+                    faults["predicate alternative refused for the edge's types"] += 1
+    return faults
+
+
+@pytest.mark.parametrize("path", _ALL_GOLD_PARAMS)
+def test_optional_gold_keys_are_well_formed(path):
+    assert _optional_key_faults(_gold_rows(path)) == Counter()
+
+
+def test_optional_key_check_names_each_fault_on_synthetic_rows():
+    def edge(**extra: object) -> dict:
+        return {
+            "source": "user",
+            "source_type": "User",
+            "predicate": "USES",
+            "target": "helix",
+            "target_type": "Technology",
+            **extra,
+        }
+
+    row = {
+        "tag": "syn-01",
+        "utterance": "I use Helix and Zed.",
+        "expected_entities": [
+            {"id": "user", "type": "User"},
+            {"id": "helix", "type": "Technology", "alternatives": ["helix-editor", "Helix"]},
+            {"id": "zed", "type": "Technology", "alternatives": ["helix", "helix-editor"]},
+        ],
+        "expected_relationships": [
+            edge(beyond_prompt=True, predicate_alternatives=["PREFERS"]),
+            edge(beyond_prompt=False),
+            edge(predicate_alternatives=["USES"]),
+            edge(predicate_alternatives=["MILESTONE_OF"]),
+            edge(predicate_alternatives=["WORKS_AT"]),
+            edge(predicate_alternatives=[]),
+        ],
+    }
+
+    assert _optional_key_faults([row]) == Counter(
+        {
+            "alternative not a canonical id": 1,
+            "alternative equal to an entity id of its probe": 1,
+            "alternative repeated within its probe": 1,
+            "beyond_prompt written other than true": 1,
+            "predicate alternative repeated": 1,
+            "predicate alternative not extractable": 1,
+            "predicate alternative refused for the edge's types": 1,
+            "predicate_alternatives not a non-empty list": 1,
+        }
+    )
+
+
+def test_dev_lists_flags_exactly_the_six_beyond_prompt_edges():
+    flagged = {
+        (row["tag"], rel["source"], rel["predicate"], rel["target"])
+        for row in _gold_rows(_DEV_GOLD)
+        for rel in row["expected_relationships"]
+        if rel.get("beyond_prompt")
+    }
+
+    assert flagged == _BEYOND_PROMPT_EDGES
+
+
+# The dev-lists entities that carry other accepted ids, each a case N1's last sentence admits:
+# two forms fit and neither is a phrase of the utterance's own. None does: with N1's habit
+# clause suspended (it has no carrier), dvl-08's habits take the utterance's own `swim` and
+# `call-parents`, the forms that were their alternatives.
+_ID_ALTERNATIVES: dict[tuple[str, str], list[str]] = {}
+# LABELLING names no two predicates for one shape that a dev-lists edge fits, so none has any.
+_PREDICATE_ALTERNATIVES: dict[tuple[str, str, str, str], list[str]] = {}
+
+
+def test_dev_lists_alternatives_are_exactly_the_named_cases():
+    rows = _gold_rows(_DEV_GOLD)
+    ids = {
+        (row["tag"], e["id"]): e["alternatives"]
+        for row in rows
+        for e in row["expected_entities"]
+        if "alternatives" in e
+    }
+    predicates = {
+        (row["tag"], r["source"], r["predicate"], r["target"]): r["predicate_alternatives"]
+        for row in rows
+        for r in row["expected_relationships"]
+        if "predicate_alternatives" in r
+    }
+
+    assert ids == _ID_ALTERNATIVES
+    assert predicates == _PREDICATE_ALTERNATIVES
+
+
+# --- The Event id rule (the extraction contract ADR, Event id rule E-b) ----------------------
+
+# An Event id is the utterance's own phrase for it, articles and possessive pronouns dropped,
+# a named owner kept without its `'s`, a place kept as worded, no date word, and the one day
+# its `OCCURRED_ON` edge dates it to appended as `-YYYY-MM-DD`. The date words are the ADR's
+# closed list. A bare day number is left to the labeller, because a number can name the event
+# itself (`sprint-12`, `tram-28`); a name word that is also a date word (`may`, `sun`) would
+# need an exemption here naming its probe.
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_SUFFIX = re.compile(r"-(\d{4}-\d{2}-\d{2})$")
+_ARTICLES = frozenset({"a", "an", "the"})
+_POSSESSIVE_PRONOUNS = frozenset({"my", "our", "your", "his", "her", "their", "its"})
+_WEEKDAYS = frozenset(
+    "monday tuesday wednesday thursday friday saturday sunday"
+    " mon tue tues wed thu thurs fri sat sun".split()
+)
+_DATE_WORDS = _WEEKDAYS | frozenset(
+    "january february march april may june july august september october november december"
+    " jan feb mar apr jun jul aug sep sept oct nov dec"
+    " today tonight tomorrow yesterday".split()
+)
+_RELATIVE_HEADS = frozenset({"this", "next", "last"})
+_RELATIVE_UNITS = _WEEKDAYS | frozenset({"week", "weekend", "month", "year"})
+_ORDINAL_DAY = re.compile(r"^\d{1,2}(?:st|nd|rd|th)$")
+_YEAR = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _is_date_word(tokens: list[str], i: int) -> bool:
+    token = tokens[i]
+    if token in _DATE_WORDS or _ORDINAL_DAY.match(token) or _YEAR.match(token):
+        return True
+    after = tokens[i + 1] if i + 1 < len(tokens) else ""
+    before = tokens[i - 1] if i > 0 else ""
+    return (token in _RELATIVE_HEADS and after in _RELATIVE_UNITS) or (
+        token in _RELATIVE_UNITS and before in _RELATIVE_HEADS
+    )
+
+
+def _phrase_words(utterance: str) -> list[str]:
+    """The utterance's words as an Event id may use them, in order."""
+    text = _ISO_DATE.sub(" ", utterance.lower().replace("’", "'"))
+    words = [re.sub(r"'s$", "", w) for w in re.findall(r"[a-z0-9]+(?:'[a-z]+)?", text)]
+    words = [w for w in words if w not in _ARTICLES and w not in _POSSESSIVE_PRONOUNS]
+    return [w for i, w in enumerate(words) if not _is_date_word(words, i)]
+
+
+def _is_run_of(part: list[str], whole: list[str]) -> bool:
+    return any(whole[i : i + len(part)] == part for i in range(len(whole) - len(part) + 1))
+
+
+def _event_rule_faults(row: dict) -> list[tuple[str, str]]:
+    """(event id, fault) for each Event of one gold row that breaks the Event id rule."""
+    types = {e["id"]: e["type"] for e in row["expected_entities"]}
+    words = _phrase_words(row["utterance"])
+    faults = []
+    for event in (i for i, t in types.items() if t == "Event"):
+        edges = row["expected_relationships"]
+        days = [
+            r["target"]
+            for r in edges
+            if r["source"] == event
+            and r["predicate"] == "OCCURRED_ON"
+            and types.get(r["target"]) == "Date"
+        ]
+        suffix = _ISO_SUFFIX.search(event)
+        if len(days) == 1:
+            if suffix is None or suffix.group(1) != days[0]:
+                faults.append((event, "date suffix"))
+        elif _ISO_DATE.search(event):
+            faults.append((event, "date suffix"))
+        stem = event[: suffix.start()] if suffix else event
+        tokens = stem.split("-")
+        dated = [i for i in range(len(tokens)) if _is_date_word(tokens, i)]
+        if dated:
+            faults.append((event, "date word"))
+        if not _is_run_of([t for i, t in enumerate(tokens) if i not in dated], words):
+            faults.append((event, "not the utterance's phrase"))
+        for rel in edges:
+            owner = rel["source"]
+            if rel["predicate"] != "EXPERIENCED" or rel["target"] != event or owner == "user":
+                continue
+            possessive = rf"\b{re.escape(owner.replace('-', ' '))}['’]s\b"
+            if re.search(possessive, row["utterance"], re.I) and not stem.startswith(f"{owner}-"):
+                faults.append((event, "owner"))
+    return faults
+
+
+def _event_row(utterance: str, event: str, day: str | None = None, owner: str | None = None):
+    entities = [{"id": event, "type": "Event"}]
+    edges = []
+    if day:
+        entities.append({"id": day, "type": "Date"})
+        edges.append(
+            {
+                "source": event,
+                "source_type": "Event",
+                "predicate": "OCCURRED_ON",
+                "target": day,
+                "target_type": "Date",
+            }
+        )
+    if owner:
+        entities.append({"id": owner, "type": "Person"})
+        edges.append(
+            {
+                "source": owner,
+                "source_type": "Person",
+                "predicate": "EXPERIENCED",
+                "target": event,
+                "target_type": "Event",
+            }
+        )
+    return {
+        "tag": "syn",
+        "utterance": utterance,
+        "expected_entities": entities,
+        "expected_relationships": edges,
+    }
+
+
+_PARTY = "Noor's graduation party is on 2026-05-30."
+_OFFSITE = "The May 30 offsite went well."
+
+
+@pytest.mark.parametrize(
+    ("utterance", "event", "day", "owner", "faults"),
+    [
+        (_PARTY, "noor-graduation-party-2026-05-30", "2026-05-30", "noor", []),
+        (_PARTY, "graduation-party-2026-05-30", "2026-05-30", "noor", ["owner"]),
+        (_PARTY, "noor-graduation-party", "2026-05-30", "noor", ["date suffix"]),
+        (_PARTY, "noor-graduation-party-2026-05-31", "2026-05-30", "noor", ["date suffix"]),
+        (_OFFSITE, "offsite-2026-05-30", "2026-05-30", None, []),
+        (_OFFSITE, "may-offsite-2026-05-30", "2026-05-30", None, ["date word"]),
+        (_OFFSITE, "offsite", None, None, []),
+        (_OFFSITE, "offsite-2026-05-30", None, None, ["date suffix"]),
+        (_OFFSITE, "team-offsite", None, None, ["not the utterance's phrase"]),
+        ("Our team dinner is next week.", "team-dinner", None, None, []),
+        ("Sprint 12 demo on 2026-05-29.", "sprint-12-demo-2026-05-29", "2026-05-29", None, []),
+        ("Signed the lease in Bruges.", "signed-lease-in-bruges", None, None, []),
+        ("Decisions from today's planning:", "planning-2026-06-13", "2026-06-13", None, []),
+    ],
+)
+def test_event_rule_check_on_synthetic_rows(utterance, event, day, owner, faults):
+    found = [fault for _, fault in _event_rule_faults(_event_row(utterance, event, day, owner))]
+
+    assert found == faults
+
+
+def test_every_dev_lists_event_id_follows_the_event_rule():
+    """The 60 and held-out keep their gold Event ids until their own relabel."""
+    faults = [(row["tag"], *f) for row in _gold_rows(_DEV_GOLD) for f in _event_rule_faults(row)]
+
+    assert faults == []
+
+
+# --- Gold invents no id (the extraction contract ADR, Decision 3) ----------------------------
+
+# Types whose ids a rule with a carrier builds rather than the utterance's words: the user
+# anchor (Rule 1), ISO Date ids (Rules 5, 13, 16), value-first Metric ids (the Metric rail) and
+# Event ids (E-b, checked above).
+_BUILT_ID_TYPES = frozenset({"User", "Date", "Metric", "Event"})
+# Other dev-lists ids that are not a run of the utterance's words, each kept by the register
+# convention named. A test below fails an entry that no longer needs keeping.
+_CONVENTION_KEPT_IDS = {
+    ("dvl-09-list-dash-next-year-goals", "get-pilots-license"): "N2 goal id",
+    ("dvl-09-list-dash-next-year-goals", "ship-saltmere"): "N2 goal id",
+    ("dvl-17-list-ref-middle-editor", "editor"): "N14 kind noun",
+    ("dvl-29-list-heading-work-personal", "training-for-10k"): "N2 goal id",
+}
+# An id that is a contiguous run of the utterance's words naming the entity is the utterance's
+# own phrase, and a labeller neither lengthens nor shortens it (lead ruling under Decision 3).
+# These two had been lengthened ("for my book club", "everywhere") and are restored.
+_ENTITY_NAME_RUNS = {
+    ("dvl-26-list-plus-side-projects", "discord-bot"),
+    ("dvl-40-list-long-nested-opinions", "dark-mode"),
+}
+
+
+def test_ids_that_are_runs_naming_the_entity_are_not_lengthened():
+    ids = {(row["tag"], e["id"]) for row in _gold_rows(_DEV_GOLD) for e in row["expected_entities"]}
+
+    assert sorted(_ENTITY_NAME_RUNS - ids) == []
+
+
+def _utterance_word_runs(utterance: str) -> list[list[str]]:
+    """The utterance's words with possessive pronouns dropped (N1), in two spellings.
+
+    A possessive `'s` either joins its word, as `canonical_id` leaves a title ("The Manager's
+    Path" is `managers-path`), or drops, as an owner's name stands alone (`ilse`).
+    """
+    text = utterance.lower().replace("’", "'")
+    spellings = (text.replace("'", ""), re.sub(r"'s\b", "", text))
+    return [
+        [w for w in re.findall(r"[a-z0-9]+", s) if w not in _POSSESSIVE_PRONOUNS] for s in spellings
+    ]
+
+
+def _is_utterance_phrase(entity_id: str, utterance: str) -> bool:
+    tokens = entity_id.split("-")
+    return any(_is_run_of(tokens, words) for words in _utterance_word_runs(utterance))
+
+
+@pytest.mark.parametrize(
+    ("utterance", "entity_id", "expected"),
+    [
+        ("+ call my parents each Thursday", "call-parents", True),
+        ("+ call my parents each Thursday", "calling-parents", False),
+        ("* watering the plants every other day", "watering-the-plants", True),
+        ("* watering the plants every other day", "watering-plants", False),
+        ("25. The Manager's Path", "managers-path", True),
+        ("Ilse's thesis defense", "ilse", True),
+        ("+ a CLI for splitting bills", "bill-splitting-cli", False),
+    ],
+)
+def test_utterance_phrase_check_on_synthetic_rows(utterance, entity_id, expected):
+    assert _is_utterance_phrase(entity_id, utterance) is expected
+
+
+def test_every_other_dev_lists_id_is_the_utterance_phrase():
+    invented = [
+        (row["tag"], e["id"])
+        for row in _gold_rows(_DEV_GOLD)
+        for e in row["expected_entities"]
+        if e["type"] not in _BUILT_ID_TYPES
+        and (row["tag"], e["id"]) not in _CONVENTION_KEPT_IDS
+        and not _is_utterance_phrase(e["id"], row["utterance"])
+    ]
+
+    assert invented == []
+
+
+def test_every_convention_kept_id_is_still_needed():
+    rows = {row["tag"]: row for row in _gold_rows(_DEV_GOLD)}
+    stale = [
+        key
+        for key in _CONVENTION_KEPT_IDS
+        if key[0] not in rows
+        or key[1] not in {e["id"] for e in rows[key[0]]["expected_entities"]}
+        or _is_utterance_phrase(key[1], rows[key[0]]["utterance"])
+    ]
+
+    assert stale == []
 
 
 # --- Labelling rules from the H8 check (N11 to N16 in LABELLING.md) ---------------------------
