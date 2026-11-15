@@ -2526,12 +2526,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             # Handle different message types
+            yielded_refusal = None
             if msg_type in ("audio", "text"):
                 # Gaming mode: refuse the turn before it is processed or
                 # recorded. Every other message type is handled as usual.
-                refusal = _yielded_turn_refusal()
-                if refusal is not None:
-                    await websocket.send_json(refusal)
+                # With a capability host, a `text` message is first offered to
+                # the capability-only turn below, and refused only when nothing
+                # answers it, so alarms and timers stay usable while yielded.
+                yielded_refusal = _yielded_turn_refusal()
+                if yielded_refusal is not None and (
+                    msg_type == "audio" or _capability_host() is None
+                ):
+                    await websocket.send_json(yielded_refusal)
                     continue
 
             if msg_type == "audio":
@@ -2574,6 +2580,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Text message (manual input)
                 user_text = data.get("text", "")
                 if not user_text:
+                    if yielded_refusal is not None:
+                        await websocket.send_json(yielded_refusal)
                     continue
                 logger.info(f"Text message from client: '{user_text}'")
 
@@ -2581,8 +2589,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 # the user message optimistically in sendTextMessage().
                 # Voice path sends its own transcription from _process_user_speech().
 
-                # Process (will spawn thread internally)
                 loop = asyncio.get_running_loop()
+                if yielded_refusal is not None:
+                    # Gaming mode with a host: only the capability host's
+                    # model-free step may answer; the provider is never called.
+                    answered = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            voice_processor._process_conversation_turn,
+                            user_text,
+                            session_id=session_id,
+                            capability_only=True,
+                        ),
+                    )
+                    if not answered:
+                        await websocket.send_json(yielded_refusal)
+                    continue
+
+                # Process (will spawn thread internally)
                 await loop.run_in_executor(
                     None,
                     functools.partial(

@@ -2708,6 +2708,87 @@ class ConversationHandler:
             duration_ms=duration_ms,
         )
 
+    async def handle_capability_only(self, text: str, session_id: str) -> list[StreamEvent] | None:
+        """Answer `text` from the capability host alone, for while gaming mode holds the GPU.
+
+        Runs only `host.pre_llm`, through `_capability_pre_llm` (a ringing item, a proposal
+        decision, the fast path), so no path here reaches the provider, retrieval or the
+        action decode. A handled message is recorded as `handle_message_streaming` records a
+        turn `pre_llm` answers: history (after any decisions made on screen), the vault path,
+        and the event-store row with `answered_by="capability"`, so no extraction is
+        scheduled. A leading "yes" that resolved a proposal counts as handled even when its
+        remainder is not, because the proposal already ran; the remainder gets no answer.
+
+        A message nothing handles leaves no trace: no history, no row, and no `record_turn`,
+        so the caller can refuse it as before. The pre-LLM step may still have superseded a
+        live proposal; the in-turn payloads drained then are not returned.
+
+        Returns:
+            The turn's events, as `handle_message_streaming` yields them for the same turn
+            (tool-event pairs and drained payloads, the reply as Tokens, then one Complete),
+            or None when no host is attached or nothing handled the message.
+        """
+        host = self._capability_host
+        if host is None:
+            return None
+        received_at = time.monotonic()
+        state = _StreamTurnState()
+        pre = _PreTurnResult(utterance=text)
+        events: list[StreamEvent] = []
+        tool_calls_used = 0
+        async for stream_event in self._capability_pre_llm(
+            host,
+            session_id=session_id,
+            turn_id=str(uuid.uuid4()),
+            received_at=received_at,
+            state=state,
+            result=pre,
+        ):
+            if (
+                isinstance(stream_event, WSEvent)
+                and stream_event.payload.get("type") == "tool_call_started"
+            ):
+                tool_calls_used += 1
+            events.append(stream_event)
+        # `_capability_pre_llm` replaces `utterance` only after a handled resolution that left a
+        # remainder; a remainder is a strict suffix of the message, so it never equals it.
+        if not pre.answered and pre.utterance == text:
+            return None
+
+        host.record_turn(session_id, pre.used)
+        session = self.get_or_create_session(session_id)
+        for role, content in self._capability_history.pop(session_id, []):
+            session.add_message(role, content)
+        session.add_message("user", text)
+        session.add_message("assistant", state.emitted)
+        self._get_or_allocate_vault_path(session_id, first_utterance=text)
+        # The per-turn state `handle_message_streaming` sets, so the recorded trace is the one
+        # its pre-LLM branch records.
+        self._current_session_id = session_id
+        self._current_turn_index += 1
+        self._turn_trace = TurnTraceBuilder()
+        self._turn_trace_failed = False
+        self._turn_tool_call = 0
+        try:
+            self._record_turn_event(
+                session_id=session_id,
+                user_message=text,
+                assistant_message=state.emitted,
+                trace=self._turn_trace_payload(),
+                answered_by="capability",
+            )
+        finally:
+            self._turn_trace = None
+        events.extend(WSEvent(payload=payload) for payload in host.drain_events(session_id))
+        events.append(
+            Complete(
+                final_response=state.emitted,
+                tool_calls_used=tool_calls_used,
+                duration_ms=(time.monotonic() - received_at) * 1000,
+            )
+        )
+        return events
+
     async def _extract_knowledge_async(
         self,
         utterance: str,
