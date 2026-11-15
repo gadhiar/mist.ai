@@ -19,6 +19,7 @@ import pytest
 
 from backend.chat.conversation_handler import ConversationHandler
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
+from backend.chat.turn_scope import TurnScope
 from backend.errors import LLMConnectionError
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
@@ -528,7 +529,7 @@ class _StubDispatch:
     query_knowledge_graph's own behavior.
     """
 
-    async def __call__(self, tool_call: LLMToolCall) -> str:
+    async def __call__(self, scope: TurnScope, tool_call: LLMToolCall) -> str:
         return "stub tool result"
 
 
@@ -555,7 +556,7 @@ class TestToolCallTurnStreaming:
         handler = _make_streaming_handler(provider)
         dispatch_calls: list[LLMToolCall] = []
 
-        async def counting_dispatch(tc):
+        async def counting_dispatch(scope, tc):
             dispatch_calls.append(tc)
             return "stub tool result"
 

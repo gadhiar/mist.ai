@@ -182,6 +182,19 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "request is sent exactly as before. New turns only."
         ),
     ),
+    CodeRevision(
+        extraction_version="2026-11-06-r6",
+        code_identity="ci1-83ac07ccf90f342a008a9d6472f03331e2e09a5c0c941d8b069f44c97c778105",
+        date="2026-11-12",
+        reason=(
+            "Two provider changes: LlamaServerProvider.generate closes the stream it "
+            "opened in `finally`; and cached prompt tokens (T17), where _parse_usage reads "
+            "usage.prompt_tokens_details.cached_tokens into cached_prompt_tokens, and "
+            "generate and generate_sync fill it from llama-server's timings.cache_n when "
+            "the usage gave none. Neither change touches _build_kwargs or a create call, "
+            "so every request is sent exactly as before. New turns only."
+        ),
+    ),
 )
 
 

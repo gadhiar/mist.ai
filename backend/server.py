@@ -702,7 +702,7 @@ class CurationDependencies:
 
 
 def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
-    """Pull the curation scheduler's live collaborators off the ConversationHandler.
+    """Pull the curation scheduler's live collaborators off the handler and voice processor.
 
     Until 2026-08-03 `lifespan` called `build_curation_scheduler(knowledge_config)`
     and nothing else, leaving `event_store`, `tracker` and `llm_provider` at
@@ -720,12 +720,18 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
         zero patterns, always, so no Skill / KNOWS / MistCapability /
         HAS_CAPABILITY was ever derived.
 
-    `llm_provider` is taken from the handler rather than left to the factory's
-    own `build_llm_provider(config)`: the factory's call passes no
-    `debug_logger`, so the deriver's LLM calls would be structurally invisible
-    to the `phase: "llm_call"` JSONL stream even with the gate on, and a
-    second `LlamaServerProvider` means a duplicate pair of OpenAI clients
-    (and connection pools) that nothing closes.
+    `llm_provider` is the base provider, `voice_processor._llm_provider`: the
+    object `VoiceProcessor` builds and injects into `build_conversation_handler`,
+    which the extraction pipeline holds and `/health` probes
+    (`_health_llm_provider`). It is not the handler's `_provider`, because with
+    the conversation role set (`MIST_LLM_CONVERSATION_URL`) the handler holds
+    the role's provider, and curation stays on `LLM_SERVER_URL` and `MODEL`.
+    With the role unset the two are one object. It is supplied rather than
+    left to the factory's own `build_llm_provider(config)`: the factory's call
+    passes no `debug_logger`, so the deriver's LLM calls would be structurally
+    invisible to the `phase: "llm_call"` JSONL stream even with the gate on,
+    and a second `LlamaServerProvider` means a duplicate pair of OpenAI
+    clients (and connection pools) that nothing closes.
 
     Extracted from `lifespan()` for the same testability reason as
     `_build_session_note_catchup`: WHICH object each dependency points at is
@@ -737,8 +743,9 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     broadcast and the shutdown drain already use.
 
     Returns:
-        A `CurationDependencies` holding the live handler's own objects, or
-        all-None with `handler_found=False` when no handler is reachable.
+        A `CurationDependencies` holding the live handler's own event store
+        and tracker and the voice processor's base provider, or all-None with
+        `handler_found=False` when no handler is reachable.
     """
     handler = (
         voice_processor.models.knowledge.conversation_handler
@@ -755,7 +762,7 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     return CurationDependencies(
         event_store=handler.event_store,
         tracker=handler._tool_usage_tracker,
-        llm_provider=handler._provider,
+        llm_provider=getattr(voice_processor, "_llm_provider", None),
         handler_found=True,
     )
 
