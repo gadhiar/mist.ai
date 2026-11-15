@@ -500,8 +500,33 @@ class TestCharacterStage:
         reference = _offline_dry(whole, config)[-len(gap) :]
         echo_bound = 2 * config.double_gain * np.max(np.abs(reference))
         assert np.max(np.abs(gap - reference)) <= 1 + echo_bound
-        reads_only_the_tail = round(FS * (9.0 - 6.0) / 1000)
-        assert np.max(np.abs(gap[:reads_only_the_tail] - reference[:reads_only_the_tail])) <= 1
+        # The first 3 ms (72 samples, the 9 ms copy's shortest delay) hold to 1 LSB because the
+        # copies add less than 1 LSB there, not because they read only the tail: the
+        # interpolator's 16 forward taps reach the gap from sample 72 - 16 = 56 at that delay.
+        copies_below_one_lsb = round(FS * (9.0 - 6.0) / 1000)
+        assert np.max(np.abs(gap[:copies_below_one_lsb] - reference[:copies_below_one_lsb])) <= 1
+
+    def test_before_the_forward_taps_reach_the_gap_the_copies_add_nothing(self) -> None:
+        """Through the gap's first 56 samples every copy read lies in the tail's silence.
+
+        The 9 ms copy's shortest delay is 72 samples and the interpolator reads 16 samples ahead
+        of its read point, so the first gap sample a copy can touch is sample 56. Before it the
+        copies are exactly 0, and the stage equals the same stage without the double.
+        """
+        vowel = _pcm(_at_reference_level(_vowel(200.0, 1.0)))
+        silence = bytes(2 * round(0.5 * FS))
+        stage = CharacterStage(CharacterConfig(), sample_rate=FS)
+        stage.process(vowel)
+        dry = CharacterStage(_dry_only(), sample_rate=FS)
+        dry.process(vowel)
+        dry.process(bytes(2 * stage.tail_samples))
+        stage.end_segment()
+
+        gap = _samples(stage.process(silence))
+
+        dry_gap = _samples(dry.process(silence))
+        tail_only = round(FS * (9.0 - 6.0) / 1000) - 16
+        assert np.array_equal(gap[:tail_only], dry_gap[:tail_only])
 
     def test_counts_the_samples_it_clips(self) -> None:
         config = CharacterConfig(double_gain=0.0, ratio=1.0, output_gain_db=12.0)
