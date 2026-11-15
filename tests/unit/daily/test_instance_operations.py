@@ -1482,9 +1482,13 @@ def test_unregister_script_removes_the_task():
     removals = ps_statements(code, "Unregister-ScheduledTask")
     ours = [r for r in removals if f"-TaskName '{TASK_NAME}' -Confirm:$false" in r]
     assert len(ours) == 1
-    # The one other removal is T14's gaming watch task (tests/unit/daily/test_gamewatch.py).
+    # The other removals are T14's gaming watch task (tests/unit/daily/test_gamewatch.py) and
+    # the extraction window task (tests/unit/daily/test_night_task.py).
     assert [r for r in removals if r not in ours] == [
-        r for r in removals if "-TaskName 'MIST gaming watch' -Confirm:$false" in r
+        r
+        for r in removals
+        if "-TaskName 'MIST gaming watch' -Confirm:$false" in r
+        or "-TaskName 'MIST extraction window' -Confirm:$false" in r
     ]
-    assert len(removals) == 2
+    assert len(removals) == 3
     assert "powershell -ExecutionPolicy Bypass -File" in ps_header(UNREGISTER)
