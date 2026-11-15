@@ -17,5 +17,5 @@ RUN test -n "$GIT_SHA" \
 
 COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/
 COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/
-RUN /opt/venv-teacher-higgs3/bin/python -I -c 'import torch, torchaudio, torchvision, vllm, vllm_omni, transformers, scripts.voice_data' \
+RUN /opt/venv-teacher-higgs3/bin/python -I -c 'import importlib.metadata, torch, torchaudio, torchvision, vllm, vllm_omni, transformers, scripts.voice_data; assert importlib.metadata.version("vllm").endswith("+cu129"), importlib.metadata.version("vllm"); assert torch.version.cuda.startswith("12.9"), torch.version.cuda' \
  && /opt/venv-score/bin/python -I -c 'import scripts.voice_data'

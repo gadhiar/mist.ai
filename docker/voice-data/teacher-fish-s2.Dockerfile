@@ -4,8 +4,14 @@
 # FROM the code-free `runtime` stage of base.Dockerfile: `images build` tags it
 # mist-voice-runtime:<first 12 hex> and passes it as BASE_IMAGE, so a new commit reuses the
 # venv layers below and rebuilds only the last four steps.
+# fish-speech lists pyaudio unpinned, and PyAudio 0.2.14 publishes wheels for Windows only, so
+# pip builds it from its sdist against the portaudio headers.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends portaudio19-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY docker/voice-data/requirements-fish-s2.txt /opt/mist-voice/requirements/requirements-fish-s2.txt
 RUN python3.11 -m venv /opt/venv-teacher-fish-s2 \

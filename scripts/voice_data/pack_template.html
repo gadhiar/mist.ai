@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind listening</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    line-height: 1.45;
+    color: #1d1d1f;
+    background: #f6f6f4;
+    max-width: 68rem;
+    margin: 0 auto;
+    padding: 0 1rem 4rem;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #f6f6f4;
+    border-bottom: 1px solid #d8d8d4;
+    padding: 0.75rem 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    align-items: center;
+  }
+  header h1 { font-size: 1.3rem; margin: 0; }
+  #progress { margin: 0; color: #444; }
+  button { font: inherit; padding: 0.35rem 0.9rem; cursor: pointer; }
+  .intro { max-width: 46rem; }
+  section.block {
+    background: #fff;
+    border: 1px solid #d8d8d4;
+    border-radius: 6px;
+    padding: 0.75rem 1rem 1rem;
+    margin: 1.25rem 0;
+  }
+  section.block h2 { font-size: 1rem; font-weight: 600; color: #444; margin: 0; }
+  .note { margin: 0.35rem 0 0.75rem; color: #444; }
+  .line { font-size: 1.1rem; margin: 0; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-top: 1px solid #eee; vertical-align: top; }
+  th { font-size: 0.85rem; font-weight: 600; color: #555; }
+  td.label { font-family: ui-monospace, monospace; white-space: nowrap; }
+  tr.complete td.label::after { content: " \2713"; color: #2a7d4f; }
+  td.field label { white-space: nowrap; margin-right: 0.5rem; cursor: pointer; }
+  td.field input[type="text"] { width: 14rem; font: inherit; }
+  .clip { display: flex; align-items: center; gap: 0.4rem; margin: 0.15rem 0; }
+  .clip-name { font-weight: 600; min-width: 1rem; }
+  audio { height: 2rem; max-width: 16rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Blind listening</h1>
+  <p id="progress"></p>
+  <button id="export" type="button">Export ratings.csv</button>
+</header>
+<main>
+  <div class="intro" id="intro"></div>
+  <p class="intro">Labels are random and the order is shuffled. Your answers are kept in this
+  browser between sittings. When every row is done, export and save the file as
+  <code>ratings.csv</code>.</p>
+  <div id="blocks"></div>
+</main>
+<script id="pack-data" type="application/json">__PACK_DATA__</script>
+<script>
+"use strict";
+
+const DATA = JSON.parse(document.getElementById("pack-data").textContent);
+const STORE = "voice-pack-" + DATA.pack;
+const ENTRIES = [];
+for (const group of DATA.groups) {
+  for (const item of group.items) {
+    ENTRIES.push({ group: group, item: item });
+  }
+}
+const answers = restore();
+
+function restore() {
+  let saved = {};
+  try {
+    saved = JSON.parse(window.localStorage.getItem(STORE) || "{}");
+  } catch (err) {
+    saved = {};
+  }
+  return { values: saved.values || {}, picks: saved.picks || {} };
+}
+
+function persist() {
+  try {
+    window.localStorage.setItem(STORE, JSON.stringify(answers));
+  } catch (err) {
+    // No storage on this page: answers last until the tab closes, so export before closing.
+  }
+}
+
+function el(tag, attrs, text) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attrs || {})) {
+    node.setAttribute(name, value);
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function pickKey(group, name) {
+  return group.id + "/" + name;
+}
+
+// A stored answer, else the item's preselected value, else nothing (a flag defaults to 0).
+function current(item, name) {
+  const own = answers.values[item.label];
+  if (own && own[name] !== undefined) {
+    return own[name];
+  }
+  if (item.defaults && item.defaults[name] !== undefined) {
+    return String(item.defaults[name]);
+  }
+  return DATA.fields[name].type === "flag" ? "0" : "";
+}
+
+function store(item, name, value) {
+  answers.values[item.label] = answers.values[item.label] || {};
+  answers.values[item.label][name] = String(value);
+  persist();
+  refresh();
+}
+
+function valid(group, item, name) {
+  const field = DATA.fields[name];
+  const value = current(item, name);
+  if (field.type === "scale") {
+    const number = Number(value);
+    return /^[0-9]+$/.test(value) && number >= field.min && number <= field.max;
+  }
+  if (field.type === "choice") {
+    return field.options.includes(value);
+  }
+  if (field.type === "flag") {
+    return value === "0" || value === "1";
+  }
+  if (field.type === "pick") {
+    return Boolean(answers.picks[pickKey(group, name)]);
+  }
+  if (field.type === "text") {
+    const rule = field.required_if;
+    if (rule && current(item, rule[0]) === rule[1]) {
+      return value.trim() !== "";
+    }
+    return true;
+  }
+  return false;
+}
+
+function complete(group, item) {
+  return item.fields.every((name) => valid(group, item, name));
+}
+
+function radios(cell, item, name, options) {
+  for (const option of options) {
+    const id = item.label + "-" + name + "-" + option;
+    const input = el("input", { type: "radio", name: item.label + "-" + name, id: id });
+    input.checked = current(item, name) === option;
+    input.addEventListener("change", () => store(item, name, option));
+    const tag = el("label", { for: id });
+    tag.append(input, " " + option);
+    cell.append(tag);
+  }
+}
+
+function widget(group, item, name) {
+  const field = DATA.fields[name];
+  const cell = el("td", { class: "field" });
+  if (field.type === "scale") {
+    const options = [];
+    for (let value = field.min; value <= field.max; value++) {
+      options.push(String(value));
+    }
+    radios(cell, item, name, options);
+  } else if (field.type === "choice") {
+    radios(cell, item, name, field.options);
+  } else if (field.type === "flag") {
+    const id = item.label + "-" + name;
+    const input = el("input", { type: "checkbox", id: id });
+    input.checked = current(item, name) === "1";
+    input.addEventListener("change", () => store(item, name, input.checked ? "1" : "0"));
+    const tag = el("label", { for: id });
+    tag.append(input, " " + field.title);
+    cell.append(tag);
+  } else if (field.type === "pick") {
+    const key = pickKey(group, name);
+    const input = el("input", {
+      type: "radio",
+      name: "pick-" + key,
+      "aria-label": field.title + ": " + item.label,
+    });
+    input.checked = answers.picks[key] === item.label;
+    input.addEventListener("change", () => {
+      answers.picks[key] = item.label;
+      persist();
+      refresh();
+    });
+    cell.append(input);
+  } else if (field.type === "text") {
+    const input = el("input", { type: "text", "aria-label": field.title + ": " + item.label });
+    input.value = current(item, name);
+    input.addEventListener("input", () => store(item, name, input.value));
+    cell.append(input);
+  }
+  return cell;
+}
+
+function render() {
+  document.getElementById("title").textContent = DATA.title;
+  const intro = document.getElementById("intro");
+  for (const paragraph of DATA.intro) {
+    intro.append(el("p", {}, paragraph));
+  }
+  const container = document.getElementById("blocks");
+  DATA.groups.forEach((group, index) => {
+    const section = el("section", { class: "block" });
+    section.append(el("h2", {}, group.heading + " (block " + (index + 1) + " of " +
+      DATA.groups.length + ")"));
+    if (group.note) {
+      section.append(el("p", { class: "note" }, group.note));
+    }
+    const names = Object.keys(DATA.fields).filter(
+      (name) => group.items.some((item) => item.fields.includes(name)));
+    const table = el("table");
+    const head = el("tr");
+    head.append(el("th", {}, "Row"), el("th", {}, ""));
+    for (const name of names) {
+      head.append(el("th", {}, DATA.fields[name].title));
+    }
+    table.append(head);
+    for (const item of group.items) {
+      const row = el("tr", { id: "row-" + item.label });
+      row.append(el("td", { class: "label" }, item.label));
+      const body = el("td");
+      if (item.text) {
+        body.append(el("p", { class: "line" }, "“" + item.text + "”"));
+      }
+      for (const clip of item.clips) {
+        const line = el("div", { class: "clip" });
+        if (clip.name) {
+          line.append(el("span", { class: "clip-name" }, clip.name));
+        }
+        line.append(el("audio", { controls: "", preload: "none", src: "clips/" + clip.label + ".flac" }));
+        body.append(line);
+      }
+      row.append(body);
+      for (const name of names) {
+        row.append(item.fields.includes(name) ? widget(group, item, name) : el("td"));
+      }
+      table.append(row);
+    }
+    section.append(table);
+    container.append(section);
+  });
+}
+
+function doneCount() {
+  let done = 0;
+  for (const entry of ENTRIES) {
+    done += complete(entry.group, entry.item) ? 1 : 0;
+  }
+  return done;
+}
+
+function refresh() {
+  for (const entry of ENTRIES) {
+    document.getElementById("row-" + entry.item.label)
+      .classList.toggle("complete", complete(entry.group, entry.item));
+  }
+  document.getElementById("progress").textContent =
+    doneCount() + " of " + ENTRIES.length + " rows done";
+}
+
+function cell(value) {
+  const text = value === undefined || value === null ? "" : String(value);
+  return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+function ratingsCsv() {
+  const rows = [DATA.columns.join(",")];
+  for (const entry of ENTRIES) {
+    const row = { label: entry.item.label, line_id: entry.group.id };
+    for (const name of entry.item.fields) {
+      if (DATA.fields[name].type === "pick") {
+        row[name] = answers.picks[pickKey(entry.group, name)] === entry.item.label ? 1 : 0;
+      } else {
+        row[name] = current(entry.item, name);
+      }
+    }
+    rows.push(DATA.columns.map((column) => cell(row[column])).join(","));
+  }
+  return rows.join("\n") + "\n";
+}
+
+function exportRatings() {
+  const left = ENTRIES.length - doneCount();
+  if (left > 0 && !window.confirm(left + " rows are not done. Export anyway?")) {
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([ratingsCsv()], { type: "text/csv" }));
+  const link = el("a", { href: url, download: DATA.ratings_file });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// One clip at a time: starting one pauses any other that is playing.
+document.addEventListener("play", (event) => {
+  for (const audio of document.querySelectorAll("audio")) {
+    if (audio !== event.target) {
+      audio.pause();
+    }
+  }
+}, true);
+
+document.getElementById("export").addEventListener("click", exportRatings);
+render();
+refresh();
+</script>
+</body>
+</html>

@@ -1,9 +1,10 @@
 # /opt/venv-teacher-higgs3: Higgs TTS 3 served through vLLM-Omni (H2 pins). vllm-omni's PyPI
-# release is unverified for Higgs v3, so the recipe's git commit is the pin.
---extra-index-url https://download.pytorch.org/whl/cu128
+# release is unverified for Higgs v3, so the recipe's git commit is the pin. transformers stays
+# below 5.9.0, the bound vllm-omni's requirements/common.txt sets at that commit.
+--extra-index-url https://download.pytorch.org/whl/cu129
 torch==2.11.0
 torchaudio==2.11.0
 torchvision==0.26.0
-vllm==0.22.0
-transformers==5.19.0
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.22.0/vllm-0.22.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=405319a7fde1af416eef6cbab0315d354d8b9c1a45b97097a9f1c3707bf05f74
+transformers==5.8.1
 vllm-omni @ git+https://github.com/vllm-project/vllm-omni@36e048fd7005400e4089079104e1f204cfdac569
