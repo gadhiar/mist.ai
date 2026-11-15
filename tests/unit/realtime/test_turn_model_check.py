@@ -40,22 +40,34 @@ Reductions. Each is sound for the reason given; the search uses no other.
   its ingress emitted, the epoch as whether an event's ingress is the adopted one, the tag
   counter as which turn's tag a frame carries. No transition and no checked property reads the
   values left out, so two states that differ only in them have the same successors and verdicts.
-- Eager controller steps. With a message in the mailbox and the controller free, the search
-  takes the controller step and tries no environment action before it except one that changes
-  state the step's handling reads (`NONCOMMUTING`): the sender's take and the responder's next
-  step (read by `purge_turn` and the pacer's `stop`), every ingress action (read by
-  `open_utterance`, `drop`, `close`, `handoff` and the quiescent check's `idle_since`), the clock
-  (read by the policy and the stall's grace), the end of the stall, the synthesizer's failure,
-  mute, and `voice_stop` (whose answers the host reads), and a stopped ingress's `late_` events
-  (read by `close()`). Every other action only appends a message to the mailbox's tail or
-  answers a claim through `FakeWakeArbiter`, which the step does not read, so both orders reach
-  the same state. One exception: while a stopped ingress still holds an utterance open,
-  `voice_start` is also tried before the step. It commutes with the step, but the step closes
-  the ingress and so disables a `late_` event that could follow `voice_start`: the order
-  `VoiceStop`, `VoiceStart`, late event is reached only that way.
+- Eager controller steps, only where they meet C1. With a message in the mailbox and the
+  controller free, the step and the actions its handling can observe form a persistent set only
+  if no action outside the set, taken first, depends on one inside it (the ample-set condition
+  C1). Nearly every environment action appends to the mailbox: the ingress actions, the `late_`
+  events, `name`, `endpoint_name` and the gate answers post an ingress event; `mute`, `unmute`,
+  `voice_stop`, `voice_start`, the wakes, the reconfigures, `interrupt`, `playback_done` and
+  `text` post their message; `grant` and `deny` settle a claim whose verdict the controller posts;
+  `say`, `hint`, `hint_out`, `handoff` and `done` feed the responder, whose stream task posts a
+  `_StreamItem`; `advance` and `tool_end` are counted as appending, which can only widen the
+  search. Two appends do not commute (the mailbox then holds their messages in the other order),
+  so an append outside the set depends on every append inside it. The step can also disable an
+  action outside it (end the turn `interrupt` and `playback_done` need, or push a claim out of
+  the two `grant` and `deny` answer), and `voice_start` enables the ingress actions it observes.
+  So the step is eager only when every enabled action is the step, `take`, `synth_fail` or
+  `text` (`EAGER_SAFE`), and then only `text` waits for it. `take` and `synth_fail` post
+  nothing: `TurnLane.take` wakes no task, and the failure is a field the next synthesis reads.
+  `text` appends a message the step does not read (the controller reads its mailbox only at
+  the head, `turn.py` `_run`), no other action's guard reads what it changes, and no step
+  invariant reads the mailbox; so the step first reaches the same state, and the state it skips has the
+  verdicts of the one before it. An earlier filter tried before the step every action the step
+  could observe, and missed each order in which an append outside that set came before one
+  inside it; `reconfigure behind a voice restart` is the witness.
 
-Every path is replayed from its start state: no controller state is copied. Visited states are
-kept with the most depth left they were reached with, and one is searched again only with more.
+Every path is replayed from its start state: no controller state is copied. A state's first child
+continues on its parent's world, which is the world its replay would build; the others replay.
+Replay checks the invariants of a path's last step only: the search checked every earlier step
+as the last step of its own edge, and replay is deterministic. Visited states are kept with the
+most depth left they were reached with, and one is searched again only with more.
 
 Reach. `REACH` names each order of v2 :2026-2031 that v5 :1751 keeps, with its start state and
 the depth it needs, and a reach run asserts that the search visited it at exactly that depth. An
@@ -65,7 +77,8 @@ replayed. The snapshot leaves out history an order reads, so each order's progre
 its steps the path holds) joins the visited key: a path pruned as visited then has a twin with
 the same progress and at least as much depth left, whose continuations finish the order if the
 pruned path's would. Without it, B1(c)'s text step was pruned: handling the text before or
-after v opens reaches one snapshot, and only one of the two holds the step.
+after v opens reaches one snapshot, and only one of the two holds the step. One more entry,
+`reconfigure behind a voice restart`, is not a v2 order: it shows that the eager step meets C1.
 
 Two orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
 frameless `0x02` is fifth on the lane and each take moves one item. B1(d) needs 4 from
@@ -181,39 +194,9 @@ REPLY = "Hi. "
 ACK = "One moment. "
 CLOSING = ("transcription", "voice_decision:dropped")
 
-NONCOMMUTING = frozenset(
-    {
-        "take",
-        "say",
-        "hint",
-        "hint_out",
-        "handoff",
-        "done",
-        "vad",
-        "partial",
-        "partial_stop",
-        "candidate",
-        "resumed",
-        "end",
-        "drop",
-        "name",
-        "endpoint_name",
-        "gate_yes",
-        "gate_no",
-        "advance",
-        "tool_end",
-        "synth_fail",
-        "mute",
-        "unmute",
-        "voice_stop",
-        "late_partial",
-        "late_partial_stop",
-        "late_candidate",
-        "late_resumed",
-        "late_end",
-        "late_drop",
-    }
-)
+EAGER_SAFE = frozenset({"deliver", "take", "synth_fail", "text"})
+"""The actions under which the controller step is eager; only `text` then waits for it (C1)."""
+
 OPEN_EVENTS = ("partial", "partial_stop", "candidate", "resumed", "end", "drop")
 """The events of an ingress's open utterance; a stopped ingress emits them as `late_` actions."""
 
@@ -468,8 +451,14 @@ class ModelHost(FakeHost):
         self.world = world
 
     def apply(self, request, seed):
+        """Check the swap against the ingress the controller replaces (`_maybe_reconfigure`).
+
+        That is the session's latest ingress unless a `VoiceStart` already queued behind the
+        request gave the session a newer one; the environment then keeps driving the newer one,
+        and the controller closes this request's ingress when it handles the `VoiceStop` before it.
+        """
         world = self.world
-        old = world.ingress
+        old = world.controller._ingress
         if old is not None and old.open_uid is not None:
             world.fail("swap", f"apply while the old ingress holds {old.open_uid} open")
         if old is not None and any(
@@ -480,7 +469,8 @@ class ModelHost(FakeHost):
             world.fail("M66", "a reconfigure applied while a turn is open")
         super().apply(request, seed)
         start = world.new_start()
-        world.ingress = start.ingress  # type: ignore[assignment]
+        if world.ingress is old:
+            world.ingress = start.ingress  # type: ignore[assignment]
         return start
 
 
@@ -539,6 +529,8 @@ class World:
     accepted: set[str] = field(default_factory=set)
     handled: list[Handled] = field(default_factory=list)
     stopped: ModelIngress | None = None
+    checking: bool = True
+    """Whether a step's invariants run; `replay` clears it for a prefix the search has checked."""
 
     def __post_init__(self) -> None:
         self.outbound = ModelOutbound(self)
@@ -711,7 +703,8 @@ class World:
             )
             if settled and self.footprint() != footprint:
                 self.fail("settle once", f"the verdict for settled claim {message.claim_id} acted")
-            self.check_message(step)
+            if self.checking:
+                self.check_message(step)
 
         return handle
 
@@ -733,6 +726,9 @@ class World:
         turn = c._turn
         if isinstance(message, Reconfigure) and message.refusal is None:
             facts.add("servable")
+            stops = [n for n, m in enumerate(queued) if isinstance(m, VoiceStop)]
+            if stops and any(isinstance(m, VoiceStart) for m in queued[stops[0] + 1 :]):
+                facts.add("voice restart queued")
         if isinstance(message, Text) and turn is not None and turn.held:
             # B1(c): the held utterance's end is queued behind the text; ingress is on the next.
             held = turn.utterance_id
@@ -892,9 +888,8 @@ class World:
             actions.append("tool_end")
         if self.outbound.lane_items():
             actions.append("take")
-        if search and can_deliver:
-            before = NONCOMMUTING | {"voice_start"} if late else NONCOMMUTING
-            return ["deliver"] + [a for a in actions[1:] if a in before]
+        if search and can_deliver and set(actions) <= EAGER_SAFE:
+            return [a for a in actions if a != "text"]
         return actions
 
     async def act(self, label: str) -> None:
@@ -910,7 +905,8 @@ class World:
             await quiesce()
         self.labels.append(label)
         self._ever |= self.published()
-        self.check_step(label)
+        if self.checking:
+            self.check_step(label)
 
     def _feed(self, step: object) -> None:
         index = self.stream_waiting()
@@ -1584,9 +1580,10 @@ START_STATES: dict[str, tuple[str, ...]] = {
 """Each start state's prefix, run eagerly. Every one but `off` has voice on, unmuted."""
 
 
-async def build(start: str) -> World:
-    world = World()
+async def build(start: str, *, checking: bool = True) -> World:
+    world = World(checking=checking)
     await world.run_eager(START_STATES[start])
+    world.checking = True
     world.env = 0
     world.starts = 0
     world.texts = 0
@@ -1762,6 +1759,16 @@ REACH: tuple[Reach, ...] = (
             handled("UtteranceEnded", before="held", after="text"),
         ),
     ),
+    # Not a v2 order: the witness that the eager step meets C1. A servable `Reconfigure` is handled
+    # with `VoiceStop` and then `VoiceStart` queued behind it, the race whose apply exposed the
+    # harness's swap check. A reduction that skips `voice_start` while the request waits never
+    # reaches it.
+    Reach(
+        "reconfigure behind a voice restart",
+        "idle",
+        3,
+        (handled("Reconfigure", before="idle", fact="voice restart queued"),),
+    ),
     # v2 :2028-2029, B8: from `thinking`, the failure, then `playback_done` before the
     # responder's completion. Its frameless `0x02` is fifth on the lane, so it needs depth 8.
     Reach(
@@ -1778,10 +1785,27 @@ REACH: tuple[Reach, ...] = (
 
 
 async def replay(start: str, path: tuple[str, ...]) -> World:
-    world = await build(start)
+    """Replay `path`, checking the invariants of its last step only.
+
+    The search replays `path[:-1]` (and the start's prefix, at `()`) before it pushes `path`,
+    and replay is deterministic, so every earlier step was checked as the last step of its own
+    edge; checking it again cannot fail.
+    """
+    world = await build(start, checking=not path)
     try:
-        for label in path:
+        for index, label in enumerate(path):
+            world.checking = index == len(path) - 1
             await world.act(label)
+    except Violation as error:
+        await world.close()
+        raise AssertionError(f"{start} after {list(path)}: {error}") from error
+    return world
+
+
+async def extend(world: World, start: str, path: tuple[str, ...]) -> World:
+    """Take `path`'s last action on the world at `path[:-1]`, with its invariants checked."""
+    try:
+        await world.act(path[-1])
     except Violation as error:
         await world.close()
         raise AssertionError(f"{start} after {list(path)}: {error}") from error
@@ -1800,11 +1824,14 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
     orders = [order for order in REACH if order.start == start]
     began = time.perf_counter()
     visited: dict[tuple[object, ...], int] = {}
-    stack: list[tuple[str, ...]] = [()]
+    # A path, and its parent's world when this is the parent's first child: that one continues
+    # on the parent's world, which is the world its replay would build; the others replay.
+    stack: list[tuple[tuple[str, ...], World | None]] = [((), None)]
     while stack:
-        path = stack.pop()
-        world = await replay(start, path)
+        path, parent = stack.pop()
+        world = await replay(start, path) if parent is None else await extend(parent, start, path)
         stats.edges += 1
+        kept = False
         try:
             progress = tuple(order.progress(world) for order in orders)
             for order, done in zip(orders, progress):
@@ -1832,10 +1859,13 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
                         f"{start} after {list(path)}, drained {world.labels[len(path):]}: {error}"
                     ) from error
                 continue
-            for label in reversed(actions):
-                stack.append((*path, label))
+            for label in reversed(actions[1:]):
+                stack.append(((*path, label), None))
+            stack.append(((*path, actions[0]), world))
+            kept = True
         finally:
-            await world.close()
+            if not kept:
+                await world.close()
     stats.seconds = time.perf_counter() - began
     return stats
 
