@@ -6,10 +6,12 @@ episodes can sit anywhere under `seed/raw/`. A segment is the target's (or the i
 that speaker's lines cover at least half of it.
 
 Precision is over the kept primary-cluster segments (the seed before Raj's labels): the share
-that are the target's. Recall is over the target's speech that no other speaker overlaps (the
-extraction drops overlapped speech by design): the share covered by kept segments, primary or
-flagged, since flagged segments come back through the labels pack. The effect measures come from
-the `effects` job step (`mix.py`); everything else here needs no audio.
+that are the target's. Recall, H6's figure, is over the speech extraction can keep by rule: the
+target's speech that no other speaker overlaps, in spans of at least `segment.min_s` (extract
+drops overlapped speech and shorter segments by design). It is the share covered by kept
+segments, primary or flagged, since flagged segments come back through the labels pack.
+All-target recall, over all the target's speech, is reported beside it. The effect measures come
+from the `effects` job step (`mix.py`); everything else here needs no audio.
 """
 
 from __future__ import annotations
@@ -36,7 +38,9 @@ NOT_MEASURED = {
         "not windows"
     ),
     "ingest.bandwidth_cutoff_db": (
-        "the rehearsal's encodes are full band, so they hold no band limit to calibrate against"
+        "the rehearsal's encodes are band-limited only by their codecs (the T12 review measured "
+        "E-AC-3 at 640 kb/s to about 20.5 kHz and AAC to about 18 kHz), and the build sets and "
+        "records no known band limit, so the ground truth holds no cutoff to calibrate against"
     ),
     "bakeoff.weak_rating_below": NOT_RATED,
     "text.reject_max": NOT_RATED,
@@ -142,33 +146,58 @@ class Episodes:
         return majority(seg.start_s, seg.end_s, self.of(seg.source_id, "target"))
 
 
-def extraction(eps: Episodes, segments: Sequence[SegmentRecord]) -> dict[str, object]:
-    """Return precision, recall and the per-cluster counts of the kept segments."""
+def keepable(lines: Sequence[TruthLine], min_s: float) -> list[Interval]:
+    """Return the target speech extraction can keep by rule: unoverlapped, `min_s` or longer.
+
+    Extract drops any segment that touches overlap (`segment.overlap_max_ms` is 0) and any
+    shorter than `segment.min_s`, so the target's speech less every other speaker's lines, in
+    spans of at least `min_s`, is all it can keep. Splits at VAD pauses and the diarizer's own
+    turn edges are not in the ground truth, so they are not taken out.
+    """
+    targets = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker == "target"])
+    others = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker != "target"])
+    return [(a, b) for a, b in subtract(targets, others) if b - a >= min_s]
+
+
+def extraction(eps: Episodes, segments: Sequence[SegmentRecord], min_s: float) -> dict[str, object]:
+    """Return precision, recall and the per-cluster counts of the kept segments.
+
+    Two recalls, each the share of a span of target speech that kept segments (primary or
+    flagged) cover. `recall`, H6's figure, is over the speech extraction can keep (`keepable`,
+    with `min_s` the `segment.min_s` gate in force): it does not charge extraction with the
+    overlapped speech and short lines it drops by design. `recall_all_target` is over all the
+    target's speech, beside it.
+    """
     own = [s for s in segments if s.source_id in eps.lines]
     primary = [s for s in own if s.kept and s.cluster == PRIMARY]
     kept = [s for s in own if s.kept]
     true_primary = [s for s in primary if eps.who(s) == "target"]
     true_kept = [s for s in kept if eps.who(s) == "target"]
-    target_s = covered_s = 0.0
+    keep_s = keep_covered_s = target_s = target_covered_s = 0.0
     for sid, lines in eps.lines.items():
-        targets = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker == "target"])
-        others = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker != "target"])
-        eligible = subtract(targets, others)
         spans = union([(s.start_s, s.end_s) for s in kept if s.source_id == sid])
-        target_s += length(eligible)
-        covered_s += length(intersect(eligible, spans))
+        can_keep = keepable(lines, min_s)
+        keep_s += length(can_keep)
+        keep_covered_s += length(intersect(can_keep, spans))
+        targets = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker == "target"])
+        target_s += length(targets)
+        target_covered_s += length(intersect(targets, spans))
     primary_s = sum(s.end_s - s.start_s for s in primary)
     true_s = sum(overlap_s(s.start_s, s.end_s, eps.of(s.source_id, "target")) for s in primary)
     return {
         "precision": _ratio(len(true_primary), len(primary)),
         "precision_time": _ratio(true_s, primary_s),
         "precision_with_flagged": _ratio(len(true_kept), len(kept)),
-        "recall": _ratio(covered_s, target_s),
+        "recall": _ratio(keep_covered_s, keep_s),
+        "recall_all_target": _ratio(target_covered_s, target_s),
         "kept_primary": len(primary),
         "kept_flagged": len(kept) - len(primary),
         "true_primary": len(true_primary),
+        "min_s": min_s,
+        "keepable_s": round(keep_s, 3),
+        "keepable_covered_s": round(keep_covered_s, 3),
         "target_s": round(target_s, 3),
-        "covered_s": round(covered_s, 3),
+        "target_covered_s": round(target_covered_s, 3),
     }
 
 
@@ -232,15 +261,25 @@ def downmix_recovery(
     return found
 
 
+BY_SEGMENTS = "segments"
+UPPER_BOUND = "upper bound: highest non-admitted cluster"
+
+
 def impostor_clusters(
     eps: Episodes, segments: Sequence[SegmentRecord], report: Mapping[str, object]
 ) -> list[dict[str, object]]:
     """Return each episode's impostor cluster: its status and median SIM to the anchor centroid.
 
-    The cluster is the diarizer label most of the impostor's segment records carry. Clusters not
-    admitted leave no segment records, so when none is found the impostor's cluster was not
-    admitted, and the highest median among the episode's non-admitted clusters is reported in
-    its place (`identified_by` says which).
+    Extract writes segment records for admitted clusters only (primary or flagged), kept or
+    dropped. An admitted cluster is the impostor's when more than half of its records in the
+    episode are the impostor's (`Episodes.who`); a few impostor turns the diarizer put in another
+    admitted cluster, the target's primary one most likely, do not make that cluster the
+    impostor's, and are counted per cluster in `stray_records`. When several admitted clusters
+    are the impostor's, the row names the worst: primary before flagged, then the higher median.
+
+    When no admitted cluster is the impostor's, its cluster was not admitted and left no records,
+    so which cluster it was is unknown: the row reports the highest median among the episode's
+    non-admitted clusters, an upper bound on the impostor's (`identified_by` says so).
     """
     clusters_by_source: dict[str, list[Mapping[str, object]]] = {}
     for source in report.get("sources") or []:  # type: ignore[union-attr]
@@ -249,37 +288,57 @@ def impostor_clusters(
     rows = []
     for sid in sorted(eps.lines):
         clusters = {str(c.get("diar_cluster")): c for c in clusters_by_source.get(sid, [])}
-        labels = Counter(
-            s.diar_cluster
-            for s in segments
-            if s.source_id == sid and s.diar_cluster and eps.who(s) == "impostor"
-        )
+        records: Counter[str] = Counter()
+        impostor: Counter[str] = Counter()
+        for seg in segments:
+            if seg.source_id == sid and seg.diar_cluster:
+                records[seg.diar_cluster] += 1
+                impostor[seg.diar_cluster] += eps.who(seg) == "impostor"
+        own, stray = [], []
+        for label in sorted(impostor):
+            role = clusters.get(label, {}).get("role")
+            if role not in (PRIMARY, FLAGGED) or not impostor[label]:
+                continue
+            if 2 * impostor[label] > records[label]:
+                own.append(clusters[label])
+            else:
+                stray.append({"diar_cluster": label, "role": role, "records": impostor[label]})
         row: dict[str, object] = {"episode": eps.episode[sid], "source_id": sid}
-        if labels:
-            label = labels.most_common(1)[0][0]
-            cluster = clusters.get(str(label), {})
-            role = cluster.get("role")
+        if own:
+            worst = max(own, key=lambda c: (c.get("role") == PRIMARY, _mean(c.get("median_sim"))))
             row.update(
-                diar_cluster=label,
-                status=role if role in (PRIMARY, FLAGGED) else NOT_ADMITTED,
-                median_sim=cluster.get("median_sim"),
-                identified_by="segments",
+                diar_cluster=worst.get("diar_cluster"),
+                status=worst.get("role"),
+                median_sim=worst.get("median_sim"),
+                identified_by=BY_SEGMENTS,
             )
         else:
             rest = [c for c in clusters.values() if c.get("role") not in (PRIMARY, FLAGGED)]
-            best = max(
-                rest,
-                key=lambda c: _mean(c.get("median_sim")),
-                default=None,
-            )
+            best = max(rest, key=lambda c: _mean(c.get("median_sim")), default=None)
             row.update(
                 diar_cluster=None if best is None else best.get("diar_cluster"),
                 status=NOT_ADMITTED,
                 median_sim=None if best is None else best.get("median_sim"),
-                identified_by="none" if best is None else "highest non-admitted cluster",
+                identified_by="none" if best is None else UPPER_BOUND,
             )
+        row["stray_records"] = stray
         rows.append(row)
     return rows
+
+
+def impostor_cluster_lines(rows: Sequence[Mapping[str, object]]) -> list[str]:
+    """Return each episode's impostor cluster row as printed."""
+    lines = []
+    for row in rows:
+        by_role: Counter[str] = Counter()
+        for entry in row.get("stray_records") or []:  # type: ignore[union-attr]
+            by_role[str(entry["role"])] += int(entry["records"])
+        lines.append(
+            f"  {row['episode']} ({row['source_id']}) impostor cluster: {row['status']}, median "
+            f"{_table(row['median_sim'])} ({row['identified_by']}); stray impostor records in "
+            f"admitted clusters: {_table(dict(sorted(by_role.items())))}"
+        )
+    return lines
 
 
 def _mean(table: object) -> float:
@@ -287,6 +346,23 @@ def _mean(table: object) -> float:
         return -math.inf
     values = [float(v) for v in table.values() if isinstance(v, int | float)]
     return sum(values) / len(values) if values else -math.inf
+
+
+def _median_max(rows: Sequence[Mapping[str, object]], identified_by: str) -> float | None:
+    """Return the highest mean median SIM of the rows identified one way, or `None`.
+
+    `impostor_median_max` takes the rows whose cluster the impostor's records identified; the
+    upper-bound rows go to their own entry, so a non-admitted episode's bound is never read as
+    the impostor's median.
+    """
+    return max(
+        (
+            round(_mean(row.get("median_sim")), 3)
+            for row in rows
+            if row.get("identified_by") == identified_by and row.get("median_sim")
+        ),
+        default=None,
+    )
 
 
 def _sims(segs: Sequence[SegmentRecord]) -> dict[str, list[float]]:
@@ -300,10 +376,31 @@ def _sims(segs: Sequence[SegmentRecord]) -> dict[str, list[float]]:
 
 def _p02_floor(values: Sequence[float], below: Sequence[float]) -> dict[str, object]:
     entry: dict[str, object] = {"value": round(percentile(values, 2), 3), "n": len(values)}
+    entry["fallback_fc_n"] = len(below)
     if below:
         entry["fallback_fc_max"] = round(max(below), 3)
         entry["separates"] = max(below) < entry["value"]  # type: ignore[operator]
     return entry
+
+
+def fallback_fc(build: object, eps: Episodes) -> dict[str, list[float]]:
+    """Return the centre-cut SNR and C50 the build measured on the scored episodes' fallback lines.
+
+    Extract writes no centre-cut record for a fallback line whose downmix passes, so these come
+    from `build.json` (`mix.measure_fallback`), for the episodes the inventory matched only.
+    """
+    scored = {lines[0].episode_sha256 for lines in eps.lines.values() if lines}
+    found: dict[str, list[float]] = {"snr_db": [], "c50_db": []}
+    episodes = build.get("episodes") if isinstance(build, Mapping) else None
+    for ep in episodes if isinstance(episodes, list) else []:
+        if not isinstance(ep, Mapping) or ep.get("sha256") not in scored:
+            continue
+        for row in ep.get("fallback_fc") or []:
+            for field, values in found.items():
+                value = row.get(field) if isinstance(row, Mapping) else None
+                if isinstance(value, int | float) and math.isfinite(value):
+                    values.append(float(value))
+    return found
 
 
 def gate_values(
@@ -312,21 +409,17 @@ def gate_values(
     clusters: Sequence[Mapping[str, object]],
     effects: Mapping[str, object] | None,
     h6_gates: Mapping[str, float],
+    fallback: Mapping[str, Sequence[float]],
 ) -> dict[str, dict[str, object]]:
     """Return, for each H6-calibrated gate, the value the ground truth supports, or why not.
 
     Each entry holds `default` (the gate's value in force), and either `value` with its `basis`
-    or `value` null with `reason`.
+    or `value` null with `reason`. `fallback` is `fallback_fc`'s result: the SNR and C50 floors
+    are compared against it, since the calibrated floors must still fail the fallback lines'
+    centre cut for the downmix path to run.
     """
     true_kept = [s for s in segments if s.kept and eps.who(s) == "target"]
     true_fc = [s for s in true_kept if s.channel == "FC"]
-    fallback_fc = [
-        s
-        for s in segments
-        if s.channel == "FC"
-        and (line := eps.target_line(s)) is not None
-        and line.geometry == "fallback"
-    ]
     sims = _sims(true_kept)
     out: dict[str, dict[str, object]] = {}
     for key, default in sorted(h6_gates.items()):
@@ -346,21 +439,23 @@ def gate_values(
                 "not calibrated: H6 keeps the anchor floor at its recorded value and lowers it "
                 "only to exercise the flagged path"
             )
-            entry["impostor_median_max"] = max(
-                (round(_mean(c.get("median_sim")), 3) for c in clusters if c.get("median_sim")),
-                default=None,
-            )
+            entry["impostor_median_max"] = _median_max(clusters, BY_SEGMENTS)
+            entry["non_admitted_median_upper_bound_max"] = _median_max(clusters, UPPER_BOUND)
             entry["impostor_primary_episodes"] = sum(c.get("status") == PRIMARY for c in clusters)
+            entry["impostor_stray_records"] = sum(
+                int(s["records"]) for c in clusters for s in c.get("stray_records") or []  # type: ignore[union-attr]
+            )
         elif key in ("segment.snr_min_db", "segment.c50_min_db"):
             field = "snr_db" if key == "segment.snr_min_db" else "c50_db"
             values = [getattr(s, field) for s in true_fc if math.isfinite(getattr(s, field))]
             if values:
-                below = [getattr(s, field) for s in fallback_fc if math.isfinite(getattr(s, field))]
-                entry.update(_p02_floor(values, below))
+                entry.update(_p02_floor(values, fallback.get(field, [])))
                 entry["basis"] = (
                     f"p02 of the true target centre-channel segments' {field}; "
-                    "fallback_fc_max is the highest centre cut of a fallback line, which must "
-                    "fall below it"
+                    "fallback_fc_max is the highest centre-cut value the build measured on a "
+                    "fallback line (speech band against burst band, and C50 deconvolved from "
+                    "the known line: the build's estimators, not extract's), which must fall "
+                    "below it"
                 )
             else:
                 entry["reason"] = "no kept centre-channel segment is the target's"
@@ -433,7 +528,11 @@ def score_lines(score: Mapping[str, object]) -> list[str]:
         f"  precision {_num(ex['precision'])} ({_num(ex['true_primary'])} of "  # type: ignore[index]
         f"{_num(ex['kept_primary'])} primary segments; time {_num(ex['precision_time'])}; "  # type: ignore[index]
         f"with flagged {_num(ex['precision_with_flagged'])})",  # type: ignore[index]
-        f"  recall {_num(ex['recall'])} ({_num(ex['covered_s'])} of {_num(ex['target_s'])} s)",  # type: ignore[index]
+        f"  recall {_num(ex['recall'])} over the speech extraction can keep "  # type: ignore[index]
+        f"({_num(ex['keepable_covered_s'])} of {_num(ex['keepable_s'])} s: unoverlapped, "  # type: ignore[index]
+        f"spans of {_num(ex['min_s'])} s or more); all-target recall "  # type: ignore[index]
+        f"{_num(ex['recall_all_target'])} ({_num(ex['target_covered_s'])} of "  # type: ignore[index]
+        f"{_num(ex['target_s'])} s)",  # type: ignore[index]
     ]
     acc = score["state_accuracy"]
     lines.append(f"  state accuracy {_num(acc['accuracy'])} over {_num(acc['n'])} segments")  # type: ignore[index]
@@ -450,11 +549,7 @@ def score_lines(score: Mapping[str, object]) -> list[str]:
             f"  {geometry} lines recovered from the downmix: {_num(row['recovered'])} of "
             f"{_num(row['lines'])}; by reason: {_table(row['by_reason'])}"
         )
-    for row in score["impostor_clusters"]:  # type: ignore[union-attr]
-        lines.append(
-            f"  {row['episode']} ({row['source_id']}) impostor cluster: {row['status']}, median "
-            f"{_table(row['median_sim'])} ({row['identified_by']})"
-        )
+    lines += impostor_cluster_lines(score["impostor_clusters"])  # type: ignore[arg-type]
     effects = score.get("effects") or {}
     comb = effects.get("comb") if isinstance(effects, Mapping) else None
     if isinstance(comb, Mapping):

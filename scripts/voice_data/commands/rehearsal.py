@@ -28,7 +28,6 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
 
 from .. import gates as gates_mod
 from .. import jobs, packs
@@ -261,7 +260,7 @@ def run_answer(args: argparse.Namespace) -> int:
     writer.writerow(columns)
     for label in sorted(rows):
         writer.writerow([label if c == "label" else rows[label][c] for c in columns])
-    rel = f"{pkg.ANSWERS_REL}/{args.pack}/{packs.RATINGS_FILE}"
+    rel = ratings_rel(args.pack)
     root.write_bytes(rel, out.getvalue().encode("utf-8"))
     marked = sum(r["not_her"] == "1" for r in rows.values())
     print(
@@ -270,6 +269,11 @@ def run_answer(args: argparse.Namespace) -> int:
         f"{args.pack} --ratings <root>/{rel}"
     )
     return 0
+
+
+def ratings_rel(pack: str) -> str:
+    """Return the root-relative ratings file `answer` writes for a pack and tells the lead."""
+    return f"{pkg.ANSWERS_REL}/{pack}/{packs.RATINGS_FILE}"
 
 
 def answer_rows(
@@ -403,22 +407,24 @@ def run_score(args: argparse.Namespace) -> int:
         "clean_run": clean_run,
         "episodes": len(eps.lines),
         "sources_not_in_truth": eps.unmatched,
-        "extraction": score_mod.extraction(eps, segments),
+        "extraction": score_mod.extraction(eps, segments, gates.value("segment.min_s")),
         "state_accuracy": score_mod.state_accuracy(eps, segments),
         "impostor": score_mod.impostor_turns(eps, segments, labels),
         "downmix": score_mod.downmix_recovery(eps, segments, layouts),
         "impostor_clusters": clusters,
         "effects": {"comb": effects.get("comb"), "eq": effects.get("eq")},
         "identity_windows": effects.get("identity_windows"),
-        "gates": score_mod.gate_values(eps, segments, clusters, effects, h6),
+        "gates": score_mod.gate_values(
+            eps,
+            segments,
+            clusters,
+            effects,
+            h6,
+            score_mod.fallback_fc(read_json(root.path / pkg.BUILD_REL), eps),
+        ),
     }
     write_json(root, f"{folder}/{pkg.SCORE_NAME}", result)
     for line in score_mod.score_lines(result):
         print(line)
     print(f"  written to {folder}/{pkg.SCORE_NAME}")
     return 0
-
-
-def ratings_path(root: root_mod.Root, pack: str) -> Path:
-    """Return where `answer` writes a pack's ratings file."""
-    return root.path / pkg.ANSWERS_REL / pack / packs.RATINGS_FILE

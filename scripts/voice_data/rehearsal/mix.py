@@ -6,7 +6,9 @@ with `public/` mounted read-only. Two steps:
 - `build` (`rehearsal build`): reads `rehearsal/build-plan.json`, checks every public file's
   sha256 against `sources.json` before it reads any, chooses the impostor with ECAPA, mixes
   the episodes in 5.1 at 48 kHz, encodes them with ffmpeg and writes `rehearsal/episodes/`,
-  `truth.jsonl`, `build.json` and the solo anchor clip `reference/anchor.wav`.
+  `truth.jsonl`, `build.json` and the solo anchor clip `reference/anchor.wav`. It decodes each
+  5.1 episode's centre channel and records every fallback line's centre-cut SNR and C50 in
+  `build.json` (`measure_fallback`).
 - `effects` (`rehearsal score --run R`): reads `rehearsal/scores/<R>/effects-plan.json` and
   measures whether each in-show effect survived cleaning, and the identity-window floor of the
   stand-in target.
@@ -20,11 +22,14 @@ The mix, per episode:
   cleaning gate's spectrum check sees it);
 - dialogue sits in the centre (FC), except the off-centre lines (front left and right only, each
   3 dB down) and the fallback lines: the dry line in FL and FR at full level, and in FC only a
-  copy 20 dB down convolved with a reverb tail (RT60 1.5 s, 6 dB below the direct sound, so a
-  full mono downmix stays about 10 dB above the C50 gate) under a burst of MUSAN noise band-passed to
+  copy 15 dB down (`FALLBACK_COPY_DB`, the plan's figure) convolved with a reverb tail (RT60
+  1.5 s, 6 dB below the direct sound) under a burst of MUSAN noise band-passed to
   `BURST_BAND_HZ`, 20 dB below the line. The centre cut fails SNR and C50 whether or not a
   separator removes the burst, and the `-ac 1` downmix, dominated by the dry left and right
-  speech, passes;
+  speech, passes. On the synthetic voices of `test_rehearsal.py`, at 15 dB down, the geometry
+  test measured the FC cut at SNR -2.0 to 0.4 dB and C50 -3.6 to -3.4 dB, and the downmix at
+  SNR about 23.3 dB and C50 23.2 to 25.1 dB: 3 to 5 dB above the default 20 dB C50 gate, the
+  narrowest margin;
 - a MUSAN music bed in FL, FR and the surrounds (low-passed into the LFE), ducked under dialogue,
   and MUSAN noise effects between lines.
 
@@ -85,7 +90,7 @@ SURROUND_DB = -3.0
 EFFECTS_DB = -18.0
 EFFECTS_EVERY_S = 30.0
 OFF_CENTRE_GAIN = math.sqrt(0.5)
-FALLBACK_COPY_DB = -20.0
+FALLBACK_COPY_DB = -15.0
 TAIL_DB = -6.0
 RT60_S = 1.5
 TAIL_S = 1.6
@@ -307,6 +312,89 @@ def fallback_copy(dry: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     from scipy.signal import fftconvolve
 
     return fftconvolve(dry * 10.0 ** (FALLBACK_COPY_DB / 20.0), reverb_tail(rng))
+
+
+# ---------------------------------------------------------------------------
+# The fallback lines' centre cut, measured
+# ---------------------------------------------------------------------------
+
+
+def band_power(audio: np.ndarray, band: tuple[float, float], rate: int = RATE) -> float:
+    """Return the clip's spectral power within `band`."""
+    spectrum = np.abs(np.fft.rfft(audio)) ** 2
+    freqs = np.fft.rfftfreq(len(audio), 1.0 / rate)
+    return float(spectrum[(freqs >= band[0]) & (freqs < band[1])].sum())
+
+
+def snr_db(window: np.ndarray) -> float:
+    """Return the speech band's power against the burst band's, in dB."""
+    return 10 * math.log10(band_power(window, SPEECH_BAND_HZ) / band_power(window, BURST_BAND_HZ))
+
+
+def c50_db(dry: np.ndarray, wet: np.ndarray) -> float:
+    """C50 of the response from the known `dry` line to `wet`, weighted by the line's spectrum.
+
+    The response is deconvolved in the speech band. Its early part runs from 10 ms before the
+    direct path (the codecs delay it by under 25 ms) to 50 ms after, its late part from there to
+    the end of the reverb tail; each part's energy is that of `dry` through it, so a bin weighs
+    what the line puts in it and the line's weak bins do not inflate the estimate's noise.
+    """
+    n = len(wet)
+    x = np.fft.rfft(dry, n)
+    y = np.fft.rfft(wet, n)
+    freqs = np.fft.rfftfreq(n, 1.0 / RATE)
+    band = (freqs >= SPEECH_BAND_HZ[0]) & (freqs < SPEECH_BAND_HZ[1])
+    power = np.abs(x) ** 2
+    eps = 1e-4 * power[band].mean()
+    h = np.fft.irfft(np.where(band, y * np.conj(x) / (power + eps), 0.0), n)
+    ms = RATE // 1000
+
+    def through(lo_ms: int, hi_ms: int) -> float:
+        lags = np.arange(lo_ms * ms, hi_ms * ms) % n
+        part = np.zeros(n)
+        part[lags] = h[lags]
+        return float(np.sum(np.fft.irfft(x * np.fft.rfft(part), n) ** 2))
+
+    return 10 * math.log10(through(-10, 50) / through(50, int(TAIL_S * 1000)))
+
+
+def decode_fc(path: Path, codec: str) -> np.ndarray:
+    """Return an encoded episode's centre channel at `RATE`, decoded as ingest decodes it.
+
+    Raises:
+        StageError: ffmpeg exited non-zero.
+    """
+    from ..stages.ingest import decode_argv
+
+    proc = subprocess.run(decode_argv(str(path), codec, "FC"), capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise StageError(f"decoding an episode's centre channel: ffmpeg exited {proc.returncode}")
+    return np.frombuffer(proc.stdout, dtype="<f4").astype(np.float64)
+
+
+def measure_fallback(fc: np.ndarray, turns: Sequence[Turn]) -> list[dict[str, float]]:
+    """Return each fallback line's centre-cut SNR and C50 (`snr_db`, `c50_db`), by line number.
+
+    Extract records no centre-cut values for a fallback line whose downmix passes (it writes the
+    downmix record only), so the build measures them on the decoded episode. These are the
+    build's own estimators, not extract's quality model: `rehearsal score` reports them beside
+    the calibrated floors as a check that the floors still fail the fallback lines' centre cut.
+    """
+    found = []
+    for number, turn in enumerate(turns, start=1):
+        if turn.geometry != "fallback":
+            continue
+        a = int(turn.start_s * RATE)
+        b = a + len(turn.audio)
+        tail = b + int(TAIL_S * RATE)
+        found.append(
+            {
+                "line": number,
+                "snr_db": round(snr_db(fc[a:b]), 2),
+                "c50_db": round(c50_db(turn.audio, fc[a:tail]), 2),
+            }
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +988,10 @@ def build(data: Path) -> list[str]:
                 )
             )
         target_turns = [t for t in turns if t.speaker == "target"]
+        codec = "eac3" if fmt == EAC3_MKV else "aac"
+        fallback_fc = []
+        if fmt != STEREO_MP4:
+            fallback_fc = measure_fallback(decode_fc(data / rel, codec), turns)
         records.append(
             {
                 "episode": name,
@@ -907,7 +999,7 @@ def build(data: Path) -> list[str]:
                 "sha256": digest,
                 "format": fmt,
                 "video_codec": video,
-                "audio_codec": "eac3" if fmt == EAC3_MKV else "aac",
+                "audio_codec": codec,
                 "layout": "stereo" if fmt == STEREO_MP4 else "5.1",
                 "duration_s": seconds,
                 "master_gain": round(master, 6),
@@ -916,6 +1008,7 @@ def build(data: Path) -> list[str]:
                 "impostor_lines": sum(t.speaker == "impostor" for t in turns),
                 "other_speakers": [s.speaker for s in others],
                 "fallback_lines": sum(t.geometry == "fallback" for t in target_turns),
+                "fallback_fc": fallback_fc,
                 "off_centre_lines": sum(t.geometry == "off-centre" for t in target_turns),
                 "overlapping_lines": sum(t.overlap for t in turns),
                 "bursts": bursts,
