@@ -21,6 +21,14 @@ row whose view it changes at the next diff. The embedder runs holding neither a 
 nor a transaction (the resource-lifetime rule): the stored hashes are read, the new texts
 embedded, and then one write transaction applies every change. Searches run on a separate read-only connection, so under WAL
 they read the last committed snapshot instead of waiting for a write.
+
+Beside the facts the index keeps their facets (backend/memory/facets.py): each subject, relation
+and object type held by two or more stored fact keys, with the facet's own view
+(`render_facet_view`). Every write keeps the facet tables equal to `facets_of` over the stored
+rows, in the same transaction as the fact rows, and embeds new or changed facet views in the
+same embedder call as the fact views, so a rescan that fails leaves facts and facets as they
+were. A facet stores no members: `facet_members_many` reads them from the fact rows when the
+facet is fetched, and keeps those current at the turn's `now`.
 """
 
 from __future__ import annotations
@@ -38,11 +46,18 @@ from datetime import UTC, datetime, tzinfo
 from backend.errors import MemoryIndexError
 from backend.interfaces import EmbeddingProvider
 
+from .facets import FacetMemberRow, FacetSpec, facet_key, facets_of
 from .fact_render import render_fact
 from .fts import build_or_query, fold, words
 from .index_db import EMBEDDING_DIMENSION, read_transaction, write_transaction
 from .models import FactRow
-from .retrieval_view import DEFAULT_FACT_VIEW, FACT_VIEWS, ViewSpec, render_fact_view
+from .retrieval_view import (
+    DEFAULT_FACT_VIEW,
+    FACT_VIEWS,
+    ViewSpec,
+    render_facet_view,
+    render_fact_view,
+)
 from .type_terms import type_terms_text
 
 # The "always / since forever" lower bound, `ALWAYS` in backend/knowledge/curation/intervals.py,
@@ -82,6 +97,27 @@ _NAME_SQL = (
     "SELECT f.row_key, f.fact_key, f.subject_name, f.object_name, bm25(facts_fts) AS rank "
     "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
     "WHERE facts_fts MATCH ? ORDER BY rank, f.row_key LIMIT ?"
+)
+
+# Bumped when the hashed facet fields change, as `_HASH_VERSION` is for the fact rows.
+_FACET_HASH_VERSION = 1
+
+# In `IndexedFacet` field order.
+_FACET_COLUMNS = (
+    "facet_key, subject_id, subject_name, subject_type, rel_type, object_type, view_text"
+)
+
+# The fact columns `facets_of` groups by, in `_MemberRow` field order.
+_MEMBER_COLUMNS = (
+    "row_key, fact_key, subject_id, subject_name, subject_type, rel_type, object_type, "
+    "recorded_at"
+)
+
+# bm25-ordered MATCH queries over the facet mirror, one row per facet.
+_FACET_FTS_SQL = (
+    "SELECT f.facet_key, f.subject_name, bm25(facets_fts) AS rank "
+    "FROM facets_fts JOIN facets f ON f.id = facets_fts.rowid "
+    "WHERE facets_fts MATCH ? ORDER BY rank, f.facet_key LIMIT ?"
 )
 
 
@@ -157,6 +193,42 @@ def content_hash(row: FactRow, text: str, view_text: str) -> str:
     ]
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _facet_hash(facet: FacetSpec, view_text: str) -> str:
+    """Hash of everything a facet row stores, so any change to it rewrites the row.
+
+    The members are left out: the row holds none, so a new member leaves it as it is.
+    """
+    payload = [
+        _FACET_HASH_VERSION,
+        view_text,
+        facet.facet_key,
+        facet.subject_id,
+        facet.subject_name,
+        facet.subject_type,
+        facet.rel_type,
+        facet.object_type,
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedFacet:
+    """One facet as stored in the index: its group and its embedded view.
+
+    Its members are the fact rows of the same subject, relation and object type;
+    `FactIndex.facet_members_many` reads those current at a given time.
+    """
+
+    facet_key: str
+    subject_id: str
+    subject_name: str
+    subject_type: str | None
+    rel_type: str
+    object_type: str
+    view_text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,8 +317,17 @@ def _recorded_order(version: IndexedFact) -> tuple[str, str]:
 
 @dataclass(frozen=True, slots=True)
 class DiffReport:
-    """What one write changed, by row: counts of inserted, updated, deleted and unchanged rows,
-    and how many texts were embedded.
+    """What one write changed.
+
+    Attributes:
+        inserted: Fact rows added.
+        updated: Fact rows rewritten.
+        deleted: Fact rows removed.
+        unchanged: Fact rows skipped, their content hash unchanged.
+        embedded: Fact view texts embedded. The facet views embedded in the same call are not
+            counted here; each is a facet in `facets_written`.
+        facets_written: Facets added or rewritten.
+        facets_deleted: Facets removed, having fewer than two fact keys left.
     """
 
     inserted: int = 0
@@ -254,6 +335,8 @@ class DiffReport:
     deleted: int = 0
     unchanged: int = 0
     embedded: int = 0
+    facets_written: int = 0
+    facets_deleted: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,14 +347,55 @@ class _Prepared:
     content_hash: str
 
 
+# A facet's group: subject id, relation type and object type.
+_Group = tuple[str, str, str | None]
+
+
 @dataclass(frozen=True, slots=True)
 class _Stored:
     content_hash: str
     view_text: str
+    group: _Group
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredFacet:
+    content_hash: str
+    view_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberRow:
+    """The stored fields of one fact row that `facets_of` reads (`FacetMemberRow`)."""
+
+    row_key: str
+    fact_key: str
+    subject_id: str
+    subject_name: str
+    subject_type: str | None
+    rel_type: str
+    object_type: str | None
+    recorded_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedFacet:
+    facet: FacetSpec
+    view_text: str
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FacetChanges:
+    """The facet writes one apply makes: rows to write, which of them to embed, keys to drop."""
+
+    writes: tuple[_PreparedFacet, ...] = ()
+    to_embed: tuple[_PreparedFacet, ...] = ()
+    delete_keys: tuple[str, ...] = ()
 
 
 class FactIndex:
-    """The `facts` table of `memory_index.db` and its FTS5 and vec0 mirrors.
+    """The `facts` table of `memory_index.db`, the `facets` grouped from it, and their mirrors.
 
     Writes go through the writer connection; searches and lookups go through the reader, a
     second WAL connection to the same file, so a search reads the last committed snapshot and
@@ -350,8 +474,16 @@ class FactIndex:
         """
         prepared = self._prepare(rows)
         with self._write_lock:
-            existing = self._read_stored([item.row.row_key for item in prepared])
-            return self._apply(prepared, existing, delete_keys=())
+            with self._writer_lock, _index_errors("read"), read_transaction(self._writer):
+                existing = self._read_stored([item.row.row_key for item in prepared])
+                # A row can leave one group and join another, so both groups are read.
+                groups = {_group(item.row) for item in prepared}
+                groups.update(stored.group for stored in existing.values())
+                members = self._read_members(groups)
+                stored_facets = self._read_stored_facets(_facet_keys(groups))
+            members.update((item.row.row_key, item.row) for item in prepared)
+            facets = self._facet_changes(members.values(), stored_facets)
+            return self._apply(prepared, existing, delete_keys=(), facets=facets)
 
     def diff_apply(self, snapshot: Iterable[FactRow]) -> DiffReport:
         """Make the table equal to `snapshot`: delete absent rows, upsert the rest.
@@ -375,27 +507,40 @@ class FactIndex:
         prepared = self._prepare(snapshot)
         wanted = {item.row.row_key for item in prepared}
         with self._write_lock:
-            existing = self._read_stored(None)
+            with self._writer_lock, _index_errors("read"), read_transaction(self._writer):
+                existing = self._read_stored(None)
+                stored_facets = self._read_stored_facets(None)
             delete_keys = tuple(sorted(key for key in existing if key not in wanted))
-            return self._apply(prepared, existing, delete_keys=delete_keys)
+            # The snapshot is every row the table holds after the apply.
+            facets = self._facet_changes([item.row for item in prepared], stored_facets)
+            return self._apply(prepared, existing, delete_keys=delete_keys, facets=facets)
 
     def delete(self, row_keys: Iterable[str]) -> int:
         """Remove the rows with these keys from the table and both mirrors.
+
+        A facet left with fewer than two fact keys goes too. One whose view the removal changes
+        (its newest member named the subject differently) is rewritten and re-embedded, the
+        embedding computed before the write transaction opens.
 
         Returns:
             How many rows existed and were removed.
 
         Raises:
-            MemoryIndexError: The database fails.
+            MemoryIndexError: The database fails, or the embedder fails as for `upsert`;
+                nothing is removed.
+            EmbeddingError: The embedder raised it; it propagates unchanged.
         """
         keys = list(dict.fromkeys(row_keys))
-        with (
-            self._write_lock,
-            self._writer_lock,
-            _index_errors("delete"),
-            write_transaction(self._writer),
-        ):
-            return sum(self._delete_row(key) for key in keys)
+        with self._write_lock:
+            with self._writer_lock, _index_errors("read"), read_transaction(self._writer):
+                existing = self._read_stored(keys)
+                groups = {stored.group for stored in existing.values()}
+                members = self._read_members(groups)
+                stored_facets = self._read_stored_facets(_facet_keys(groups))
+            remaining = [row for key, row in members.items() if key not in existing]
+            facets = self._facet_changes(remaining, stored_facets)
+            report = self._apply([], existing, delete_keys=tuple(keys), facets=facets)
+            return report.deleted
 
     # -- reads, all on the reader ---------------------------------------------------------------
 
@@ -570,6 +715,149 @@ class FactIndex:
             )
             return self._groups(ranked)
 
+    # -- facets, all on the reader ----------------------------------------------------------------
+
+    def search_facets_fts(self, query_text: str, *, limit: int = 20) -> list[IndexedFacet]:
+        """Facets whose view, subject name or type terms share a content word with the query.
+
+        Best bm25 first, with the same OR-mode expression `search_fts` uses, so "which
+        organisations am I a member of?" finds the facet worded "You are a member of an
+        organization, organisation or company." through its type's terms.
+
+        Args:
+            query_text: The user's text, unescaped.
+            limit: Most facets to return.
+
+        Raises:
+            MemoryIndexError: The database fails.
+        """
+        _check_limit(limit)
+        expression = build_or_query(query_text)
+        if expression is None:
+            return []
+        with self._reader_lock, _index_errors("facet FTS search"), read_transaction(self._reader):
+            rows = self._reader.execute(_FACET_FTS_SQL, (expression, limit)).fetchall()
+            return self._load_facets([key for key, _name, _rank in rows])
+
+    def search_facets_vector(
+        self, embedding: Sequence[float], *, limit: int = 20
+    ) -> list[IndexedFacet]:
+        """Facets whose view is nearest to `embedding` by cosine distance, nearest first.
+
+        Args:
+            embedding: The query's 384-d embedding.
+            limit: Most facets to return; sqlite-vec's ceiling on `k` caps it.
+
+        Raises:
+            ValueError: The embedding is not 384-d.
+            MemoryIndexError: The database fails.
+        """
+        _check_limit(limit)
+        if len(embedding) != EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"query embedding must have {EMBEDDING_DIMENSION} dimensions, "
+                f"got {len(embedding)}"
+            )
+        packed = _PACK.pack(*embedding)
+        with (
+            self._reader_lock,
+            _index_errors("facet vector search"),
+            read_transaction(self._reader),
+        ):
+            rows = self._reader.execute(
+                "SELECT f.facet_key FROM facets_vec v JOIN facets f ON f.id = v.rowid "
+                "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance, f.facet_key",
+                (packed, min(limit, _VEC_MAX_K)),
+            ).fetchall()
+            return self._load_facets([key for (key,) in rows])
+
+    def search_facet_names(self, texts: Sequence[str], *, limit: int = 20) -> list[IndexedFacet]:
+        """Facets whose subject's name occurs whole in one of `texts`, for entity anchoring.
+
+        The rule `search_names` applies: FTS over the subject name finds candidates, and one is
+        kept only when its name occurs in a text as a whole run of words, so "Ana Lima" is not
+        anchored by a text that names only "Ana" or only "Ana Costa".
+
+        Args:
+            texts: The query and the recent user turns.
+            limit: Most facets to return.
+
+        Raises:
+            MemoryIndexError: The database fails.
+        """
+        _check_limit(limit)
+        expression = build_or_query("\n".join(texts))
+        if expression is None:
+            return []
+        haystacks = [f" {' '.join(words(text))} " for text in texts]
+        bound = limit * _ROWS_PER_FACT
+        with self._reader_lock, _index_errors("facet name search"), read_transaction(self._reader):
+            # A word such as "user" can match many facets the whole-name rule then drops, so
+            # the row bound doubles while too few facets are kept and more rows remain.
+            while True:
+                rows = self._reader.execute(
+                    _FACET_FTS_SQL, (f"{{subject_name}} : ({expression})", bound)
+                ).fetchall()
+                keys = [key for key, name, _rank in rows if _named_in(name, haystacks)]
+                if len(keys) >= limit or len(rows) < bound:
+                    break
+                bound *= 2
+            return self._load_facets(keys[:limit])
+
+    def facet_members_many(
+        self, facet_keys: Iterable[str], *, now: datetime
+    ) -> dict[str, tuple[IndexedFact, ...]]:
+        """The members of each facet current at `now`, every facet in one read.
+
+        A member is a fact key of the facet's subject, relation and object type. Facets are
+        grouped over every stored version, so a member with no version current at `now`
+        (`IndexedFact.is_current_at`) is left out, and a facet may have fewer than two members
+        left; the caller decides what that means.
+
+        Args:
+            facet_keys: The facets to look up; a repeated key is read once.
+            now: The turn's instant, timezone-aware.
+
+        Returns:
+            Each requested key mapped to its members, one version per fact key (the one
+            `FactGroup.current_at` would pick), newest recorded first and then by fact key. An
+            unknown key maps to an empty tuple.
+
+        Raises:
+            ValueError: `now` is naive.
+            MemoryIndexError: The database fails.
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        keys = list(dict.fromkeys(facet_keys))
+        rows_by_key: dict[str, list[tuple[object, ...]]] = {}
+        with (
+            self._reader_lock,
+            _index_errors("facet member lookup"),
+            read_transaction(self._reader),
+        ):
+            for facet in self._load_facets(keys):
+                rows_by_key[facet.facet_key] = self._reader.execute(
+                    # `_COLUMNS` is a module constant
+                    f"SELECT {_COLUMNS} FROM facts "  # nosec B608
+                    "WHERE subject_id = ? AND rel_type = ? AND object_type = ?",
+                    (facet.subject_id, facet.rel_type, facet.object_type),
+                ).fetchall()
+        members: dict[str, tuple[IndexedFact, ...]] = {}
+        for key in keys:
+            chosen: dict[str, IndexedFact] = {}
+            for fact in (IndexedFact(*row) for row in rows_by_key.get(key, ())):
+                if not fact.is_current_at(now):
+                    continue
+                kept = chosen.get(fact.fact_key)
+                if kept is None or _recorded_order(fact) > _recorded_order(kept):
+                    chosen[fact.fact_key] = fact
+            # Two stable passes: fact key ascending, then recorded descending.
+            ordered = sorted(chosen.values(), key=lambda fact: fact.fact_key)
+            ordered.sort(key=lambda fact: fact.recorded_at or "", reverse=True)
+            members[key] = tuple(ordered)
+        return members
+
     # -- internals ------------------------------------------------------------------------------
 
     def _bounded_ranking(
@@ -607,30 +895,103 @@ class FactIndex:
         return prepared
 
     def _read_stored(self, row_keys: list[str] | None) -> dict[str, _Stored]:
-        """Stored hash and view text by `row_key`: of these keys, or of every row when None.
+        """Stored hash, view text and group by `row_key`: of these keys, or of every row.
 
-        Read on the writer, as part of the write: a search on the reader does not wait for it.
+        Read on the writer, as part of the write, so a search on the reader does not wait for
+        it; the caller holds the writer lock and a read transaction.
         """
+        select = "SELECT row_key, content_hash, view_text, subject_id, rel_type, object_type"
+        if row_keys is None:
+            cursors = [self._writer.execute(f"{select} FROM facts")]
+        else:
+            cursors = [
+                self._writer.execute(
+                    # constant columns, and the IN list holds only `?` placeholders
+                    f"{select} FROM facts "  # nosec B608
+                    f"WHERE row_key IN ({_placeholders(len(chunk))})",
+                    chunk,
+                )
+                for chunk in _chunks(row_keys)
+            ]
         stored: dict[str, _Stored] = {}
-        with self._writer_lock, _index_errors("read"), read_transaction(self._writer):
-            if row_keys is None:
-                cursors = [
-                    self._writer.execute("SELECT row_key, content_hash, view_text FROM facts")
-                ]
-            else:
-                cursors = [
-                    self._writer.execute(
-                        # the IN list holds only `?` placeholders
-                        "SELECT row_key, content_hash, view_text FROM facts "  # nosec B608
-                        f"WHERE row_key IN ({_placeholders(len(chunk))})",
-                        chunk,
-                    )
-                    for chunk in _chunks(row_keys)
-                ]
-            for cursor in cursors:
-                for row_key, hashed, view_text in cursor:
-                    stored[row_key] = _Stored(hashed, view_text)
+        for cursor in cursors:
+            for row_key, hashed, view_text, subject_id, rel_type, object_type in cursor:
+                stored[row_key] = _Stored(hashed, view_text, (subject_id, rel_type, object_type))
         return stored
+
+    def _read_members(self, groups: Iterable[_Group]) -> dict[str, FacetMemberRow]:
+        """Every stored row of these groups by `row_key`, with the fields facets group by.
+
+        On the writer, under the caller's lock and read transaction. A group with no object
+        type can hold no facet, so it is not read. Each read is served by
+        `idx_facts_siblings`, whose leading columns are the subject and the relation.
+        """
+        members: dict[str, FacetMemberRow] = {}
+        for subject_id, rel_type, object_type in sorted(_typed(groups)):
+            rows = self._writer.execute(
+                # `_MEMBER_COLUMNS` is a module constant
+                f"SELECT {_MEMBER_COLUMNS} FROM facts "  # nosec B608
+                "WHERE subject_id = ? AND rel_type = ? AND object_type = ?",
+                (subject_id, rel_type, object_type),
+            )
+            for row in rows:
+                member = _MemberRow(*row)
+                members[member.row_key] = member
+        return members
+
+    def _read_stored_facets(self, facet_keys: list[str] | None) -> dict[str, _StoredFacet]:
+        """Stored hash and view text by `facet_key`: of these keys, or of every facet.
+
+        On the writer, under the caller's lock and read transaction.
+        """
+        select = "SELECT facet_key, content_hash, view_text FROM facets"
+        if facet_keys is None:
+            cursors = [self._writer.execute(select)]
+        else:
+            cursors = [
+                self._writer.execute(
+                    # the IN list holds only `?` placeholders
+                    f"{select} WHERE facet_key IN ({_placeholders(len(chunk))})",  # nosec B608
+                    chunk,
+                )
+                for chunk in _chunks(facet_keys)
+            ]
+        return {
+            key: _StoredFacet(hashed, view_text)
+            for cursor in cursors
+            for key, hashed, view_text in cursor
+        }
+
+    def _facet_changes(
+        self, rows_after: Iterable[FacetMemberRow], stored: dict[str, _StoredFacet]
+    ) -> _FacetChanges:
+        """The facet writes that make the stored facets equal to `facets_of(rows_after)`.
+
+        `rows_after` is every row the write leaves in the groups `stored` was read for. A
+        facet whose relation has no template has no view, so it is not stored. A facet is
+        rewritten when its hash changes and re-embedded only when its view text does.
+        """
+        wanted: dict[str, _PreparedFacet] = {}
+        for facet in facets_of(rows_after).values():
+            view_text = render_facet_view(facet, self._view)
+            if view_text is not None:
+                wanted[facet.facet_key] = _PreparedFacet(
+                    facet, view_text, _facet_hash(facet, view_text)
+                )
+        writes: list[_PreparedFacet] = []
+        to_embed: list[_PreparedFacet] = []
+        for key, item in wanted.items():
+            kept = stored.get(key)
+            if kept is not None and kept.content_hash == item.content_hash:
+                continue
+            writes.append(item)
+            if kept is None or kept.view_text != item.view_text:
+                to_embed.append(item)
+        return _FacetChanges(
+            writes=tuple(writes),
+            to_embed=tuple(to_embed),
+            delete_keys=tuple(sorted(key for key in stored if key not in wanted)),
+        )
 
     def _apply(
         self,
@@ -638,6 +999,7 @@ class FactIndex:
         existing: dict[str, _Stored],
         *,
         delete_keys: tuple[str, ...],
+        facets: _FacetChanges,
     ) -> DiffReport:
         writes: list[_Prepared] = []
         to_embed: list[_Prepared] = []
@@ -656,22 +1018,33 @@ class FactIndex:
             if stored is None or stored.view_text != item.view_text:
                 to_embed.append(item)
 
-        vectors = self._embed([item.view_text for item in to_embed])
+        # One embedder call for the fact views and the facet views together.
+        vectors = self._embed(
+            [item.view_text for item in to_embed] + [item.view_text for item in facets.to_embed]
+        )
         embedding_by_key = {item.row.row_key: vector for item, vector in zip(to_embed, vectors)}
+        facet_embedding_by_key = {
+            item.facet.facet_key: vector
+            for item, vector in zip(facets.to_embed, vectors[len(to_embed) :])
+        }
 
-        if writes or delete_keys:
+        deleted = facets_deleted = 0
+        if writes or delete_keys or facets.writes or facets.delete_keys:
             with self._writer_lock, _index_errors("write"), write_transaction(self._writer):
                 deleted = sum(self._delete_row(key) for key in delete_keys)
                 for item in writes:
                     self._write_row(item, embedding_by_key.get(item.row.row_key))
-        else:
-            deleted = 0
+                facets_deleted = sum(self._delete_facet(key) for key in facets.delete_keys)
+                for facet in facets.writes:
+                    self._write_facet(facet, facet_embedding_by_key.get(facet.facet.facet_key))
         return DiffReport(
             inserted=inserted,
             updated=updated,
             deleted=deleted,
             unchanged=unchanged,
             embedded=len(to_embed),
+            facets_written=len(facets.writes),
+            facets_deleted=facets_deleted,
         )
 
     def _embed(self, texts: list[str]) -> list[bytes]:
@@ -776,6 +1149,78 @@ class FactIndex:
         self._writer.execute("DELETE FROM facts WHERE id = ?", (row_id,))
         return 1
 
+    def _write_facet(self, item: _PreparedFacet, embedding: bytes | None) -> None:
+        """Write one facet row and its FTS mirror, and its vector when its view was embedded.
+
+        The row keeps its `id` on update, so the mirrors stay joined to it.
+        """
+        facet = item.facet
+        self._writer.execute(
+            "INSERT INTO facets (facet_key, subject_id, subject_name, subject_type, rel_type, "
+            "object_type, view_text, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(facet_key) DO UPDATE SET "
+            "subject_id = excluded.subject_id, subject_name = excluded.subject_name, "
+            "subject_type = excluded.subject_type, rel_type = excluded.rel_type, "
+            "object_type = excluded.object_type, view_text = excluded.view_text, "
+            "content_hash = excluded.content_hash",
+            (
+                facet.facet_key,
+                facet.subject_id,
+                facet.subject_name,
+                facet.subject_type,
+                facet.rel_type,
+                facet.object_type,
+                item.view_text,
+                item.content_hash,
+            ),
+        )
+        (facet_id,) = self._writer.execute(
+            "SELECT id FROM facets WHERE facet_key = ?", (facet.facet_key,)
+        ).fetchone()
+        self._writer.execute("DELETE FROM facets_fts WHERE rowid = ?", (facet_id,))
+        self._writer.execute(
+            "INSERT INTO facets_fts (rowid, view_text, subject_name, type_terms) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                facet_id,
+                fold(item.view_text),
+                fold(facet.subject_name),
+                fold(type_terms_text(facet.subject_type, facet.object_type)),
+            ),
+        )
+        if embedding is not None:
+            self._writer.execute("DELETE FROM facets_vec WHERE rowid = ?", (facet_id,))
+            self._writer.execute(
+                "INSERT INTO facets_vec (rowid, embedding) VALUES (?, ?)", (facet_id, embedding)
+            )
+
+    def _delete_facet(self, key: str) -> int:
+        found = self._writer.execute("SELECT id FROM facets WHERE facet_key = ?", (key,)).fetchone()
+        if found is None:
+            return 0
+        (facet_id,) = found
+        self._writer.execute("DELETE FROM facets_vec WHERE rowid = ?", (facet_id,))
+        self._writer.execute("DELETE FROM facets_fts WHERE rowid = ?", (facet_id,))
+        self._writer.execute("DELETE FROM facets WHERE id = ?", (facet_id,))
+        return 1
+
+    def _load_facets(self, facet_keys: list[str]) -> list[IndexedFacet]:
+        """The stored facets with these keys, in the order given; read on the reader, under
+        the reader lock. An unknown key is left out.
+        """
+        found: dict[str, IndexedFacet] = {}
+        for chunk in _chunks(facet_keys):
+            rows = self._reader.execute(
+                # constant columns, and the IN list holds only `?` placeholders
+                f"SELECT {_FACET_COLUMNS} FROM facets "  # nosec B608
+                f"WHERE facet_key IN ({_placeholders(len(chunk))})",
+                chunk,
+            )
+            for row in rows:
+                facet = IndexedFacet(*row)
+                found[facet.facet_key] = facet
+        return [found[key] for key in facet_keys if key in found]
+
     def _groups(self, ranked: list[tuple[str, list[str], float]]) -> list[FactGroup]:
         versions = self._load_versions([fact for fact, _, _ in ranked])
         return [
@@ -822,6 +1267,24 @@ def _rank_by_fact(
         else:
             entry[0].append(row_key)
     return [(fact, matched, score) for fact, (matched, score) in order.items()]
+
+
+def _group(row: FacetMemberRow) -> _Group:
+    return (row.subject_id, row.rel_type, row.object_type)
+
+
+def _typed(groups: Iterable[_Group]) -> set[tuple[str, str, str]]:
+    """The groups with an object type, the only ones that can form a facet."""
+    return {
+        (subject_id, rel_type, object_type)
+        for subject_id, rel_type, object_type in groups
+        if object_type
+    }
+
+
+def _facet_keys(groups: Iterable[_Group]) -> list[str]:
+    """The facet key of each group that has an object type, sorted."""
+    return sorted(facet_key(*group) for group in _typed(groups))
 
 
 def _named_in(name: str, haystacks: list[str]) -> bool:

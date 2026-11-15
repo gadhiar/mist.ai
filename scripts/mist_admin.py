@@ -2555,9 +2555,16 @@ def cmd_uptime(args: argparse.Namespace) -> int:
 # Memory index (mist-read-path)
 # ---------------------------------------------------------------------------
 
-# Every table `index_db.FACTS_DDL` creates. Each virtual table takes its shadow tables with it
-# when dropped, and `facts` takes its indexes.
-FACT_INDEX_TABLES: tuple[str, ...] = ("facts_vec", "facts_fts", "facts")
+# Every table `index_db.FACTS_DDL` creates: the facts and the facets grouped from them. Each
+# virtual table takes its shadow tables with it when dropped, and `facts` takes its indexes.
+FACT_INDEX_TABLES: tuple[str, ...] = (
+    "facts_vec",
+    "facts_fts",
+    "facts",
+    "facets_vec",
+    "facets_fts",
+    "facets",
+)
 
 _MEMORY_INDEX_FILENAME = "memory_index.db"
 _IN_MEMORY = ":memory:"
@@ -2624,7 +2631,10 @@ def _build_fact_rebuild_graph(config: Any) -> FactRebuildGraph:
 
 
 def _drop_fact_tables(writer: Any, embedding_model_id: str) -> int:
-    """Drop and recreate the fact tables empty, marking the index `rebuilding`, in one commit.
+    """Drop and recreate the fact and facet tables empty, marking the index `rebuilding`.
+
+    One commit does both, so the refill rebuilds the facets from the refilled facts rather than
+    keeping facets grouped from the facts it dropped.
 
     The mark is the in-place rebuild state `index_db` defines: until `IndexRebuild.complete`
     clears it after the refill, every reader of the file, the running server's included,

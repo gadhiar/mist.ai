@@ -28,6 +28,14 @@ Tables:
 - `facts_fts`: FTS5 over the served text, the subject and object names, and the type terms
   of both entity types (`type_terms.type_terms_text`), each stored in `fts.fold` form.
 - `facts_vec`: sqlite-vec `vec0` table of the view text's embedding, cosine distance.
+- `facets`: one row per facet (backend/memory/facets.py) of the stored fact versions: a
+  subject, a relation and an object type held by two or more fact keys, keyed by `facet_key`,
+  with the subject as last recorded and the facet's view (`render_facet_view`). It holds no
+  members: they are the `facts` rows of its subject, relation and object type, read when the
+  facet is fetched.
+- `facets_fts`: FTS5 over the facet's view text, its subject name and the type terms of its
+  subject and object types, folded as `facts_fts` is.
+- `facets_vec`: sqlite-vec `vec0` table of the facet view's embedding, cosine distance.
 - `index_meta`: `schema_version`, `embedding_model_id`, the rebuild state and its target
   versions while a rebuild runs, and the refresh watermarks.
 
@@ -58,7 +66,8 @@ logger = logging.getLogger(__name__)
 
 # 2: `facts.subject_type`, `facts.object_type`, `facts_fts.type_terms`, `idx_facts_siblings`.
 # 3: `facts.view_text`, the fact view `facts_vec` holds the embedding of.
-SCHEMA_VERSION = 3
+# 4: `facets`, `facets_fts` and `facets_vec`.
+SCHEMA_VERSION = 4
 EMBEDDING_DIMENSION = 384  # all-MiniLM-L6-v2, the embedder the vault sidecar also uses
 
 META_SCHEMA_VERSION = "schema_version"
@@ -122,6 +131,32 @@ FACTS_DDL: tuple[str, ...] = (
     """,
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
+        embedding float[{EMBEDDING_DIMENSION}] distance_metric=cosine
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS facets (
+        id           INTEGER PRIMARY KEY,
+        facet_key    TEXT NOT NULL UNIQUE,
+        subject_id   TEXT NOT NULL,
+        subject_name TEXT NOT NULL,
+        subject_type TEXT,
+        rel_type     TEXT NOT NULL,
+        object_type  TEXT NOT NULL,
+        view_text    TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS facets_fts USING fts5(
+        view_text,
+        subject_name,
+        type_terms,
+        tokenize='porter unicode61'
+    )
+    """,
+    f"""
+    CREATE VIRTUAL TABLE IF NOT EXISTS facets_vec USING vec0(
         embedding float[{EMBEDDING_DIMENSION}] distance_metric=cosine
     )
     """,

@@ -205,10 +205,28 @@ def _dump(path: Path) -> dict[str, list[tuple]]:
                 "SELECT f.row_key, v.embedding FROM facts_vec v "
                 "JOIN facts f ON f.id = v.rowid ORDER BY f.row_key"
             ).fetchall(),
+            "facets": conn.execute(
+                "SELECT facet_key, subject_id, subject_name, subject_type, rel_type, object_type, "
+                "view_text, content_hash FROM facets ORDER BY facet_key"
+            ).fetchall(),
+            "facets_fts": conn.execute(
+                "SELECT f.facet_key, t.view_text, t.subject_name, t.type_terms "
+                "FROM facets_fts t JOIN facets f ON f.id = t.rowid ORDER BY f.facet_key"
+            ).fetchall(),
+            "facets_vec": conn.execute(
+                "SELECT f.facet_key, v.embedding FROM facets_vec v "
+                "JOIN facets f ON f.id = v.rowid ORDER BY f.facet_key"
+            ).fetchall(),
             "orphans": conn.execute(
                 "SELECT 'fts', rowid FROM facts_fts WHERE rowid NOT IN (SELECT id FROM facts) "
                 "UNION ALL "
-                "SELECT 'vec', rowid FROM facts_vec WHERE rowid NOT IN (SELECT id FROM facts)"
+                "SELECT 'vec', rowid FROM facts_vec WHERE rowid NOT IN (SELECT id FROM facts) "
+                "UNION ALL "
+                "SELECT 'facet fts', rowid FROM facets_fts "
+                "WHERE rowid NOT IN (SELECT id FROM facets) "
+                "UNION ALL "
+                "SELECT 'facet vec', rowid FROM facets_vec "
+                "WHERE rowid NOT IN (SELECT id FROM facets)"
             ).fetchall(),
             "index_meta": conn.execute("SELECT key, value FROM index_meta ORDER BY key").fetchall(),
         }
@@ -339,6 +357,10 @@ class TestRebuildEqualsIncremental:
         )
 
         assert _dump(rebuilt) == _dump(incremental)
+        # Every `_FINAL` fact is the user using a technology: one facet, which the incremental
+        # index already held and the rebuild wrote anew, since the drop took the facet tables.
+        assert len(_dump(rebuilt)["facets"]) == 1
+        assert (result.report.facets_written, result.report.facets_deleted) == (1, 0)
         assert result.dropped_rows == len(_STEP_1) + 1
         assert result.rows == len(_FINAL)
         assert result.report.inserted == len(_FINAL)
