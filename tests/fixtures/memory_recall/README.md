@@ -306,9 +306,11 @@ file is one more dev set, and the floors need a new held-out set.
 
 The probes were written from the corpus files and the rules on this page, without reading
 probes.jsonl. Every probe follows the Probe authoring rules above, and the fixture test runs each
-per-probe rule over both files. The file-level counts above (the probe total, every kind present,
-40 percent paraphrase, the lexical noise minimum, the shape minimums, one probe per correction)
-belong to the dev set.
+per-probe rule over both files. The file-level rules hold on this file with its own kind set,
+`fact`, `note`, `correction` and `noise`, the kinds the first PR gates on: every one of those
+kinds is present and no other, at least 40 percent of probes are tagged lexical false, at least
+ten noise probes are tagged lexical true, each new shape has at least 12 probes, and each
+correction has exactly one probe. The 120-probe total belongs to the dev set alone.
 
 The corpus fixes the targets of a list, correction or type-scoped probe, so such a probe can
 differ from its dev twin only in wording. Where a held-out probe and a dev probe have the same
@@ -323,6 +325,18 @@ Minimums for the `fact` probes:
 - at least 43 `plain`, at least 27 of them lexical false;
 - 12 `list_item`, three per list utterance, at least 8 of them lexical false;
 - at least 14 `type_scoped`, every one lexical false.
+
+Minimums for the other kinds:
+
+- at least 29 `note` probes, at least 12 of them tagged lexical false;
+- one `correction` probe per correction in corrections.jsonl, forbidding exactly its
+  suppression set; a `correct` probe expects the replacement fact and a `forget` probe expects
+  nothing;
+- at least 20 `noise` probes, at least ten of them tagged lexical true.
+
+The pooled recall classes of `PR1_GATES` (`scripts/eval_harness/memory_recall_gate.py`), the
+fact, note and correction probes that expect something, hold at least 103 probes, at least 63 of
+them tagged lexical false.
 
 ## Scoring a run
 

@@ -76,6 +76,7 @@ from scripts.eval_harness.memory_recall import (  # noqa: E402
     parse_turn,
     parse_vault_note,
 )
+from scripts.eval_harness.memory_recall_gate import PR1_GATES  # noqa: E402
 
 # Design point 11 and the Phase B defaults (MIST_CONVERSATION_IDLE_GAP_MIN,
 # MIST_EPISODE_MAX_TURNS, MIST_EPISODE_MAX_TOKENS).
@@ -861,7 +862,7 @@ class TestProbes:
                 assert probe.conversation_start, probe.probe_id
 
     def test_each_correction_has_one_probe(self, fixture: Fixture) -> None:
-        """A file-level rule of the dev set; the held-out set's correction probes are its own."""
+        """A file-level rule, here on the dev set; TestHeldOutProbes checks the held-out set."""
         asked = Counter(p.correction_id for p in fixture.probes if p.kind == "correction")
 
         assert asked == Counter(c.correction_id for c in fixture.corrections)
@@ -974,6 +975,59 @@ HELDOUT_TYPE_SCOPED_MINIMUM = 14
 # Shared content stems over their union, between a held-out query and a dev query that share a
 # reference set. Above this, a held-out probe re-asks a dev probe and measures nothing new.
 MAX_QUERY_OVERLAP = 0.5
+# The held-out set's own file-level rules (plan task T55). Its kinds are the ones PR 1 gates on:
+# the episode, continuity and temporal kinds wait for phase 2.
+HELDOUT_KINDS = ("fact", "note", "correction", "noise")
+HELDOUT_PARAPHRASE_SHARE = 0.40
+HELDOUT_NOTE_MINIMUM = 29
+HELDOUT_NOTE_PARAPHRASE_MINIMUM = 12
+HELDOUT_NOISE_MINIMUM = 20
+HELDOUT_LEXICAL_NOISE_MINIMUM = 10
+# The pooled recall classes of `PR1_GATES`, by name, and the probes each must average over.
+HELDOUT_POOLED_MINIMUMS = {
+    "recall phase 1 pooled": 103,
+    "recall phase 1 pooled, paraphrase": 63,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldOutProfile:
+    """The held-out file's counts, so a file-level test holds no probe row as a local.
+
+    pytest runs with `--showlocals`, and a failing test would otherwise print every held-out
+    query and rationale, which spends the set.
+    """
+
+    total: int
+    kinds: Counter[str]
+    paraphrase_by_kind: Counter[str]
+    lexical_by_kind: Counter[str]
+    shapes: Counter[str]
+    corrections_asked: Counter[str | None]
+    forget_probes_expecting: tuple[str, ...]
+    gate_counts: dict[str, int]
+
+
+def _heldout_profile() -> _HeldOutProfile:
+    probes = load_probes(FIXTURE_DIR / HELDOUT_PROBES)
+    actions = {c.correction_id: c.action for c in load_corrections()}
+    gates = {gate.name: gate.predicate for gate in PR1_GATES if gate.predicate is not None}
+    return _HeldOutProfile(
+        total=len(probes),
+        kinds=Counter(p.kind for p in probes),
+        paraphrase_by_kind=Counter(p.kind for p in probes if not p.lexical),
+        lexical_by_kind=Counter(p.kind for p in probes if p.lexical),
+        shapes=Counter(p.shape for p in probes),
+        corrections_asked=Counter(p.correction_id for p in probes if p.kind == "correction"),
+        forget_probes_expecting=tuple(
+            p.probe_id
+            for p in probes
+            if p.expected and actions.get(p.correction_id or "") == "forget"
+        ),
+        gate_counts={
+            name: sum(1 for p in probes if gates[name](p)) for name in HELDOUT_POOLED_MINIMUMS
+        },
+    )
 
 
 def _reference_set(probe: Probe) -> frozenset[ItemRef]:
@@ -1069,6 +1123,61 @@ class TestHeldOutProbes:
 
         assert set(asked) == lists
         assert set(asked.values()) == {HELDOUT_LIST_PROBES_PER_LIST}
+
+    def test_every_heldout_kind_is_present_and_no_other(self) -> None:
+        """The held-out set carries the kinds PR 1 gates on, not the dev set's seven."""
+        profile = _heldout_profile()
+
+        assert set(profile.kinds) == set(HELDOUT_KINDS)
+
+    def test_at_least_forty_percent_of_heldout_probes_are_paraphrase(self) -> None:
+        profile = _heldout_profile()
+        paraphrase = sum(profile.paraphrase_by_kind.values())
+
+        assert paraphrase / profile.total >= HELDOUT_PARAPHRASE_SHARE
+
+    def test_each_new_shape_meets_its_minimum_on_the_heldout_set(self) -> None:
+        profile = _heldout_profile()
+
+        assert set(profile.shapes) == set(PROBE_SHAPES)
+        assert profile.shapes["list_item"] >= NEW_SHAPE_MINIMUM
+        assert profile.shapes["type_scoped"] >= NEW_SHAPE_MINIMUM
+
+    def test_note_probe_minimums(self) -> None:
+        profile = _heldout_profile()
+
+        assert profile.kinds["note"] >= HELDOUT_NOTE_MINIMUM
+        assert profile.paraphrase_by_kind["note"] >= HELDOUT_NOTE_PARAPHRASE_MINIMUM
+
+    def test_noise_probe_minimums(self) -> None:
+        """T9 floors empty_on_noise at 0.90 on lexical probes; ten leave room for one miss."""
+        profile = _heldout_profile()
+
+        assert profile.kinds["noise"] >= HELDOUT_NOISE_MINIMUM
+        assert profile.lexical_by_kind["noise"] >= HELDOUT_LEXICAL_NOISE_MINIMUM
+
+    def test_each_correction_has_one_heldout_probe(self) -> None:
+        profile = _heldout_profile()
+
+        assert profile.corrections_asked == Counter(c.correction_id for c in load_corrections())
+
+    def test_a_heldout_forget_probe_expects_nothing(self) -> None:
+        """After a forget nothing is right to serve, so recall is undefined and only the leak
+        is measured; a `correct` probe's expected replacement is checked per probe above.
+        """
+        profile = _heldout_profile()
+
+        assert profile.forget_probes_expecting == ()
+
+    def test_pooled_recall_classes_meet_their_minimums(self) -> None:
+        """PR 1's pooled floors average over the fact, note and correction probes that expect
+        something, picked by the gates' own predicates, so the counts are the ones the gate
+        measures.
+        """
+        profile = _heldout_profile()
+
+        for name, minimum in HELDOUT_POOLED_MINIMUMS.items():
+            assert profile.gate_counts[name] >= minimum, name
 
     def test_no_query_re_asks_a_dev_probe(self) -> None:
         """A held-out probe with a dev probe's reference set, or any two noise probes, must
