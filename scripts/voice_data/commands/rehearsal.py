@@ -28,7 +28,6 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
 
 from .. import gates as gates_mod
 from .. import jobs, packs
@@ -261,7 +260,7 @@ def run_answer(args: argparse.Namespace) -> int:
     writer.writerow(columns)
     for label in sorted(rows):
         writer.writerow([label if c == "label" else rows[label][c] for c in columns])
-    rel = f"{pkg.ANSWERS_REL}/{args.pack}/{packs.RATINGS_FILE}"
+    rel = ratings_rel(args.pack)
     root.write_bytes(rel, out.getvalue().encode("utf-8"))
     marked = sum(r["not_her"] == "1" for r in rows.values())
     print(
@@ -270,6 +269,11 @@ def run_answer(args: argparse.Namespace) -> int:
         f"{args.pack} --ratings <root>/{rel}"
     )
     return 0
+
+
+def ratings_rel(pack: str) -> str:
+    """Return the root-relative ratings file `answer` writes for a pack and tells the lead."""
+    return f"{pkg.ANSWERS_REL}/{pack}/{packs.RATINGS_FILE}"
 
 
 def answer_rows(
@@ -424,8 +428,3 @@ def run_score(args: argparse.Namespace) -> int:
         print(line)
     print(f"  written to {folder}/{pkg.SCORE_NAME}")
     return 0
-
-
-def ratings_path(root: root_mod.Root, pack: str) -> Path:
-    """Return where `answer` writes a pack's ratings file."""
-    return root.path / pkg.ANSWERS_REL / pack / packs.RATINGS_FILE

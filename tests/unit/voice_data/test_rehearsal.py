@@ -736,7 +736,10 @@ def answered(extracted: Extracted) -> Answered:
         code, out, err = run_cli(
             ["--root", str(root.path), "rehearsal", "answer", "--pack", built.pack_id]
         )
-        ratings = rehearsal_cmd.ratings_path(root, built.pack_id)
+        # The path answer itself wrote to and printed, as the lead follows it in H6.
+        rel = rehearsal_cmd.ratings_rel(built.pack_id)
+        assert f"ratings written to {rel};" in out
+        ratings = root.path / rel
         icode, _, ierr = run_cli(
             [
                 "--root",
@@ -760,7 +763,8 @@ def test_answer_writes_ratings_that_pack_import_accepts(
     assert answered.code == 0, answered.err
     assert answered.import_code == 0, answered.import_err
     rel = f"{pkg.ANSWERS_REL}/{answered.pack}/{packs.RATINGS_FILE}"
-    assert rel in answered.out
+    assert rehearsal_cmd.ratings_rel(answered.pack) == rel and rel in answered.out
+    assert (extracted.built.root.path / rel).is_file()
     eps = rehearsal_cmd._episodes(extracted.built.root)[0]
     kept = [s for s in extracted.segments if s.kept]
     target = {s.segment_id: eps.target_line(s).state for s in kept if eps.who(s) == "target"}  # type: ignore[union-attr]
