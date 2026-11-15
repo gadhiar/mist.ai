@@ -1,6 +1,6 @@
 """MIS-140 T1: a full synthetic capture, and the refusals that precede one.
 
-Everything here is built in the worktree: three WAL-mode SQLite stores, a vault
+Everything here is built in the worktree: four WAL-mode SQLite stores, a vault
 tree standing in for `mist-memory/` (absent from every worktree, because it is
 gitignored with zero tracked files), and a graph fake. The container has no
 network and reaches neither the live stack nor Neo4j.
@@ -40,7 +40,7 @@ from scripts.backup.manifest import (
 )
 from scripts.backup.stores import LIVE_STORE_FILENAMES, STORES_DIRNAME
 
-from .conftest import STALE_BACKUP_FILENAMES, STAMPS
+from .conftest import SECRET_FILES, STALE_BACKUP_FILENAMES, STAMPS, plant_secrets
 
 
 def dump(backup_root, connection, state_root, vault_root, **overrides):
@@ -158,6 +158,13 @@ class TestTheManifest:
     def test_it_records_per_store_row_counts(self, manifest):
         assert manifest.stores["event_store.db"]["row_counts"] == {"conversation_turn_events": 3}
         assert manifest.stores["vault_sidecar.db"]["row_counts"] == {"vault_chunks": 5}
+        assert manifest.stores["capabilities.db"]["row_counts"] == {"alarm_records": 4}
+
+    def test_it_captures_the_capabilities_store(self, backup_root, manifest):
+        assert manifest.stores["capabilities.db"]["present"] is True
+        assert manifest.stores["capabilities.db"]["file"] == f"{STORES_DIRNAME}/capabilities.db"
+        assert f"{STORES_DIRNAME}/capabilities.db" in manifest.files
+        assert (backup_root / "test-artifact" / STORES_DIRNAME / "capabilities.db").is_file()
 
     def test_it_records_graph_and_vault_counts(self, manifest):
         assert manifest.graph["nodes"] == 2
@@ -218,6 +225,23 @@ class TestArtifactIntegrity:
             assert stale not in names
         manifest = read_manifest(report.artifact_dir)
         assert set(manifest.stores) == set(LIVE_STORE_FILENAMES)
+
+    def test_no_capability_token_reaches_the_artifact(
+        self, backup_root, graph_connection, state_root, vault_root, tmp_path
+    ):
+        # `tmp_path` stands in for the instance root: `state_root` and `vault_root` sit in it as
+        # `state/` and `mist-memory/` do, and `secrets/` beside them. A token is also planted in
+        # `state/secrets/`, the dev stack's token directory, which is under the store root.
+        plant_secrets(tmp_path / "secrets")
+        plant_secrets(state_root / "secrets")
+        report = dump(backup_root, graph_connection, state_root, vault_root)
+        files = [p for p in report.artifact_dir.rglob("*") if p.is_file()]
+        assert files
+        assert not {p.name for p in report.artifact_dir.rglob("*")} & {"secrets", *SECRET_FILES}
+        for path in files:
+            payload = path.read_bytes()
+            for content in SECRET_FILES.values():
+                assert content.strip().encode() not in payload, path
 
     def test_an_existing_artifact_is_never_overwritten(
         self, backup_root, graph_connection, state_root, vault_root
