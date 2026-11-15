@@ -59,8 +59,8 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `verify.py` - Compares a restored graph, stores and vault with the artifact they came from
 - `model_bench/` - Model bench host drivers; `scripts/model_bench/README.md` documents both
   - `bench_host.py` - Stops MIST, serves a pinned llama-server as `mist-bench-llm`, restores the stack
-  - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report
-  - `speech/` - The speech suites (`tts`, `cache`, `stt`, `turn`, `fit`, `lowtier`, `chain`, `game-session`, `listen-pack`, `report`), their committed inputs, and `report.py`, which writes `numbers.json` and `REPORT.md`
+  - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report; it also designs voices
+  - `speech/` - The speech suites (`tts`, `cache`, `stt`, `turn`, `fit`, `lowtier`, `chain`, `game-session`, `listen-pack`, `voice-design`, `report`), their committed inputs, and `report.py`, which writes `numbers.json` and `REPORT.md`
   - `speech/probes/` - The engine code the speech-bench containers run (synthesis, recognition, end of turn, the load generator)
 
 ### Container builds (`docker/`)
