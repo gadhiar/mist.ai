@@ -82,8 +82,6 @@ class CapabilitiesConfig:
 
     enabled: bool
     capabilities: tuple[str, ...]
-    ws_allowed_origins: tuple[str, ...]
-    backend_bind_addr: str
     timezone: str | None
     db_path: str
     policy_file: str | None
@@ -134,9 +132,6 @@ def load_capabilities_config(env: Mapping[str, str]) -> CapabilitiesConfig:
     return CapabilitiesConfig(
         enabled=_bool(env, "MIST_CAPABILITIES_ENABLED", default=False),
         capabilities=_capabilities(env),
-        ws_allowed_origins=_list(env, "MIST_WS_ALLOWED_ORIGINS", default=()),
-        # Compose binds port 8001 on this address; the value is only parsed here.
-        backend_bind_addr=_text(env, "MIST_BACKEND_BIND_ADDR") or "0.0.0.0",  # nosec B104
         timezone=_text(env, "MIST_TIMEZONE"),
         db_path=_text(env, "MIST_CAPABILITIES_DB_PATH") or "data/capabilities.db",
         policy_file=_text(env, "MIST_CAPABILITY_POLICY_FILE"),
