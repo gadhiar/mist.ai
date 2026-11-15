@@ -4,7 +4,9 @@ THE STORE SET IS ENUMERATED ON PURPOSE. `scripts/hydration/snapshot.py` globs
 instead (`grep -n 'dev_root.glob' scripts/hydration/snapshot.py` -> :519), and
 that is correct only because `dev-state/` is a directory the hydration tool
 creates and owns. The LIVE `./data` is not clean. Listed on the live deployment
-it holds five `.db` files: the three named below, plus
+when this list was written, it held five `.db` files: `event_store.db`,
+`extraction_cache.db` and `vault_sidecar.db` (the whole set until
+`capabilities.db` was added to it later), plus
 `event_store.pre-r1.4-backup-2026-07-31.db` (212992 bytes) and
 `event_store.pre-reset-backup-2026-06-09.db` (14331904 bytes). A glob sweeps
 both into every backup: the artifact doubles in size, and it gains a second,
