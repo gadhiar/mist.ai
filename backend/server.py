@@ -2036,6 +2036,40 @@ async def get_capabilities(request: Request) -> dict | JSONResponse:
     return _capabilities_payload()
 
 
+@app.get("/capabilities/usage", response_model=None)
+async def get_capability_usage(
+    request: Request, days: int = Query(7, ge=1, le=90)
+) -> dict | JSONResponse:
+    """Capability use and alarm events per local day: the milestone metric's source.
+
+    The body is `CapabilityHost.usage`'s: `tz`, `since`, `alarms_since`, and `days` and
+    `alarms`, newest first with one entry per day. It holds names, dates and numbers, never an
+    argument, summary or secret. The Origin rule is `GET /capabilities`'s: a refused `Origin`
+    gets 403, none or an allowed one gets the body.
+
+    - `days` (1-90, default 7); out of range is a 422 from the query validation.
+    - With no host the body is `{"enabled": false, "reason"}`, as `GET /capabilities` reports.
+    - A capabilities database that cannot be read is a 503 with
+      `{"error": "store_unavailable"}`, as the `/usage` views answer.
+    """
+    if not origin_allowed(request.headers.get("origin"), allowed_origins()):
+        return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
+    host = _capability_host()
+    if host is None:
+        build = _capability_build
+        return {
+            "enabled": False,
+            "reason": _capability_reason(
+                build.disabled_reason if build is not None else "capabilities not started"
+            ),
+        }
+    try:
+        return await host.usage(days)
+    except MistError as exc:
+        logger.warning("GET /capabilities/usage: %s", _capability_reason(str(exc)))
+        return JSONResponse(status_code=503, content={"error": "store_unavailable"})
+
+
 @app.get("/usage/turns-per-day")
 async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
     """Real-origin turns per local day, counts only: ADR-042's measure of real use.

@@ -1268,6 +1268,26 @@ class SchedulerAlarmControl:
             snoozed_until=snoozed_until,
         )
 
+    async def event_counts(self, since: datetime, tz: tzinfo) -> dict[str, dict[str, int]]:
+        """Return `AlarmRecords.event_counts`, for the usage view.
+
+        Unlike the actions it does not require a running scheduler: the trail records what
+        happened, and the usage view reads it while alarms are unavailable too.
+
+        Raises:
+            ValueError: `since` is naive.
+            CapabilityStoreError: The store cannot be read.
+        """
+        return await self._records.event_counts(since, tz)
+
+    async def oldest_event_at(self) -> datetime | None:
+        """Return `AlarmRecords.oldest_event_at`, for the usage view's `alarms_since`.
+
+        Raises:
+            CapabilityStoreError: The store cannot be read, or the oldest event is damaged.
+        """
+        return await self._records.oldest_event_at()
+
     def _require_running(self) -> None:
         health = self._scheduler.health()
         if health.state != "running":

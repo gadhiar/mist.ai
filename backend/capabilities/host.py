@@ -56,11 +56,12 @@ import dataclasses
 import functools
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -75,9 +76,10 @@ from backend.errors import (
     MistError,
     TimeParseError,
 )
+from backend.event_store.usage import TIMEZONE_ENV, resolve_timezone
 from backend.llm.models import ToolCall
 
-from .action_log import ActionLog, ActionLogEntry
+from .action_log import ActionLog, ActionLogEntry, DayUsage
 from .alarms.records import ReportOutcome, ReportResult
 from .clock import Clock
 from .config import CapabilitiesConfig
@@ -180,6 +182,19 @@ ALARMS_NOT_BUILT_REASON = "alarms and timers are not in MIST_CAPABILITIES"
 ALARM_CONTROL_NOT_WIRED_REASON = "alarm control is not wired"
 """The `alarm_action` reason when alarms or timers is built but no `AlarmControl` was passed."""
 
+# The usage view's per-day alarm keys, each with the event-trail kind it counts.
+_USAGE_ALARM_KINDS: tuple[tuple[str, str], ...] = (
+    ("fired", "fired"),
+    ("stopped", "stopped"),
+    ("timed_out", "timed_out"),
+    ("snoozed", "snoozed"),
+    ("missed_late", "missed:late"),
+    ("missed_unheard", "missed:unheard"),
+    ("dismissed", "dismissed"),
+    ("reported", "reported"),
+    ("fallback", "fallback"),
+)
+
 # The capabilities whose status gates `alarm_action`, in order: timers stand in for alarms
 # only when alarms is not built.
 _ALARM_GATES = ("alarms", "timers")
@@ -250,6 +265,25 @@ class AlarmControl(Protocol):
             CapabilityStoreError: The alarm store cannot be read or written.
             CapabilityUnavailableError: The scheduler is not running; the message is its
                 health reason.
+        """
+        ...
+
+    async def event_counts(self, since: datetime, tz: tzinfo) -> dict[str, dict[str, int]]:
+        """Count the event trail from `since` per local ISO date in `tz` and event kind.
+
+        Missed events are split by reason, as `missed:late` and `missed:unheard`. It answers
+        whatever the scheduler's health, so the usage view reads it while alarms are down.
+
+        Raises:
+            CapabilityStoreError: The alarm store cannot be read.
+        """
+        ...
+
+    async def oldest_event_at(self) -> datetime | None:
+        """Return the time of the oldest event the capped trail holds; None when it is empty.
+
+        Raises:
+            CapabilityStoreError: The alarm store cannot be read.
         """
         ...
 
@@ -543,6 +577,69 @@ class CapabilityHost(CapabilityTurnPort):
         stats = self._stats.snapshot()
         stats["status_watcher"] = self._watcher_state()
         return stats
+
+    async def usage(self, days: int) -> dict[str, object]:
+        """Return the `GET /capabilities/usage` body: use and alarm events per local day.
+
+        Unlike `stats`, which counts since the host was built, this reads the stores, so it
+        spans restarts. Days are local dates in `MIST_TIMEZONE`, resolved per call as
+        `GET /usage/turns-per-day` resolves it, so both views count the same dates; unset or
+        unknown counts in UTC and `tz` says `UTC`. The view answers while alarms are
+        unavailable; with no alarm control the alarm days are zero and `alarms_since` is None.
+
+        The action log is read without its argument, summary or reason text, and the one text
+        that comes from a stored row, a capability or status name, passes through `redact`.
+
+        Raises:
+            ValueError: `days` is outside 1 to 90.
+            CapabilityStoreError: The action log or the alarm trail cannot be read.
+        """
+        tz, tz_name = resolve_timezone(os.getenv(TIMEZONE_ENV))
+        now = self._clock.now()
+        actions = await self._log.usage(days, tz, now=now)
+        events: dict[str, dict[str, int]] = {}
+        alarms_since: datetime | None = None
+        if self._alarm_control is not None:
+            # A day past the window is enough: the oldest local midnight asked for is at most
+            # `days` days and a DST hour before now. Events outside the dates are not reported.
+            since = now - timedelta(days=days + 1)
+            events = await self._alarm_control.event_counts(since, tz)
+            alarms_since = await self._alarm_control.oldest_event_at()
+        return {
+            "tz": redact(tz_name, self._secrets),
+            "since": actions.since.isoformat() if actions.since is not None else None,
+            "alarms_since": alarms_since.isoformat() if alarms_since is not None else None,
+            "days": [self._day_usage_payload(day) for day in actions.days],
+            "alarms": [
+                {
+                    "date": day.date.isoformat(),
+                    **{
+                        key: events.get(day.date.isoformat(), {}).get(kind, 0)
+                        for key, kind in _USAGE_ALARM_KINDS
+                    },
+                }
+                for day in actions.days
+            ],
+        }
+
+    def _day_usage_payload(self, day: DayUsage) -> dict[str, object]:
+        return {
+            "date": day.date.isoformat(),
+            "invocations": day.invocations,
+            "by_capability": self._redacted_counts(day.by_capability),
+            "by_source": dict(day.by_source),
+            "by_level": dict(day.by_level),
+            "by_status": self._redacted_counts(day.by_status),
+            "turn_ms": {"p50": day.turn_ms_p50, "p90": day.turn_ms_p90},
+        }
+
+    def _redacted_counts(self, counts: Mapping[str, int]) -> dict[str, int]:
+        """Redact each key; keys that redact to the same text are summed."""
+        redacted: dict[str, int] = {}
+        for key, count in counts.items():
+            name = redact(key, self._secrets)
+            redacted[name] = redacted.get(name, 0) + count
+        return redacted
 
     # -- Status broadcast, connect snapshot and alarm actions ------------------------------
 
