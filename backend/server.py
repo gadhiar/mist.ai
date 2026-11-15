@@ -14,12 +14,13 @@ import sqlite3
 import sys
 import time
 import uuid
+from collections.abc import Coroutine
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -36,6 +37,7 @@ import uvicorn
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 
 # `python backend/server.py` makes CPython prepend the SCRIPT's directory --
 # backend/ -- to sys.path, but not the repository root. The root has to be added
@@ -58,7 +60,14 @@ from backend.capabilities.config import (  # isort:skip
     CapabilitiesConfig,
     load_capabilities_config,
 )
-from backend.capabilities.events import QueueEventSink  # isort:skip
+from backend.capabilities.contracts import ToolOutcome  # isort:skip
+from backend.capabilities.events import (  # isort:skip
+    ActionDecisionMessage,
+    AlarmActionMessage,
+    AlarmReportMessage,
+    QueueEventSink,
+    alarm_action_result_payload,
+)
 from backend.capabilities.power import (  # isort:skip
     GpuYieldPower,
     PowerState,
@@ -124,6 +133,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from backend.capabilities.host import CapabilityHost
+    from backend.chat.conversation_handler import ConversationHandler
     from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import EventStoreProvider
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
@@ -232,8 +242,10 @@ logger = logging.getLogger(__name__)
 # v1.1.0 (2026-05-25): documents vault_results + system_status (shipped 2026-05-11).
 # v1.2.0 (2026-09-22): uptime_* fields in the ADR; this constant was not bumped then.
 # v1.3.0 (2026-09-26, MIS-171): additive `extraction_status` outbound message.
+# v1.4.0 (goal mist-capabilities): additive capability messages, listed in the
+# `websocket_endpoint` docstring.
 # Pinned by tests/unit/test_server_protocol_version.py.
-PROTOCOL_VERSION = "1.3.0"
+PROTOCOL_VERSION = "1.4.0"
 
 # Global state
 active_connections: set[WebSocket] = set()
@@ -295,8 +307,16 @@ _capability_build: CapabilityBuild | None = None
 _capability_config: CapabilitiesConfig | None = None
 _capability_power: PowerState | None = None
 _capability_secrets = SecretRegistry()
-# A `reason` in `GET /capabilities` is cut to this many characters.
+# A `reason` in `GET /capabilities`, and the text of a capability failure or a
+# validation error answered on the WebSocket, is cut to this many characters.
 CAPABILITY_REASON_MAX_CHARS = 200
+# The inbound WebSocket messages that reach the capability host.
+CAPABILITY_MESSAGE_TYPES = frozenset({"action_decision", "alarm_action", "alarm_report"})
+# The endpoint of the daily WebSocket, recorded as the actor of each alarm
+# action and report that arrives on it. A payload never names its own endpoint.
+WS_ENDPOINT = "desktop"
+_T = TypeVar("_T")
+_M = TypeVar("_M", bound=BaseModel)
 
 # `probe_loop` value for "the registry was never constructed", distinct from
 # `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
@@ -2160,6 +2180,211 @@ def _reset_voice_state_if_last_connection() -> bool:
     return True
 
 
+async def _run_capability_call(
+    call: Coroutine[object, object, _T], what: str
+) -> tuple[_T | None, BaseException | None]:
+    """Run one capability call as its own task, and return its result or its failure.
+
+    The receive loop's catch-all ends the connection, so no capability exception
+    may reach it. `asyncio.wait` returns when the task ends instead of
+    re-raising, and the outcome is read from `task.cancelled()` and then
+    `task.exception()`, so any exception is contained without a broad `except`
+    clause (CLAUDE.md, Errors). The task only computes; the endpoint sends what
+    it returns, so a send to a client that has gone still takes the disconnect
+    path.
+
+    If the endpoint is cancelled while it waits, the `finally` cancels the task,
+    so no capability call outlives its connection.
+
+    Returns:
+        `(result, None)` when the call returned; `(None, exception)` when it
+        raised, logged here at ERROR with its traceback; `(None, None)` when it
+        was cancelled, which the caller answers with nothing.
+    """
+    task = asyncio.create_task(call, name=f"capability-{what}")
+    try:
+        await asyncio.wait({task})
+    finally:
+        if not task.done():
+            task.cancel()
+    if task.cancelled():
+        logger.info("Capability call %s was cancelled; nothing is sent", what)
+        return None, None
+    error = task.exception()
+    if error is not None:
+        logger.error("Capability call %s failed", what, exc_info=error)
+        return None, error
+    return task.result(), None
+
+
+def _capability_failure_text(host: "CapabilityHost", error: BaseException) -> str:
+    """The client's text for an unexpected capability failure: class and message, redacted."""
+    text = host.redact(f"{type(error).__name__}: {error}")
+    return text[:CAPABILITY_REASON_MAX_CHARS]
+
+
+def _ws_error(kind: str, message: str) -> dict[str, object]:
+    """The ADR-017 `error` event, never retriable, for a capability message."""
+    return {
+        "type": "error",
+        "kind": kind,
+        "message": message,
+        "retriable": False,
+        "context": None,
+    }
+
+
+def _validate_capability_message(model: type[_M], data: dict[str, object]) -> _M | str:
+    """Return the validated message, or the text of the `validation` error that answers it.
+
+    The text names each failing field with pydantic's message and never the
+    input value, so a client's payload is not echoed back.
+    """
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or 'message'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        return f"invalid {data.get('type')}: {problems}"[:CAPABILITY_REASON_MAX_CHARS]
+
+
+async def _send_capability_snapshot(websocket: WebSocket) -> None:
+    """Send the host's connect snapshot on this socket, or nothing when there is no host.
+
+    The payloads go to the connecting client only, as `session_started` does.
+    A failure building them is answered with a `server` error and the
+    connection goes on.
+    """
+    host = _capability_host()
+    if host is None:
+        return
+    events, error = await _run_capability_call(host.snapshot_events(), "connect snapshot")
+    if error is not None:
+        await websocket.send_json(_ws_error("server", _capability_failure_text(host, error)))
+        return
+    for payload in events or ():
+        await websocket.send_json(payload)
+
+
+async def _decided_payloads(
+    handler: "ConversationHandler", session_id: str, message: ActionDecisionMessage
+) -> list[str]:
+    """Decide a proposal and serialise what to broadcast, inside the contained task."""
+    payloads = await handler.decide_proposal(session_id, message.proposal_id, message.decision)
+    return [json.dumps(payload) for payload in payloads]
+
+
+async def _alarm_action_result(
+    host: "CapabilityHost", message: AlarmActionMessage
+) -> dict[str, object]:
+    """Run a client's alarm action and build its `alarm_action_result`."""
+    outcome = await host.alarm_action(
+        message.alarm_id, message.action, message.minutes, endpoint=WS_ENDPOINT
+    )
+    return alarm_action_result_payload(
+        message.alarm_id, message.action, message.request_id, outcome, datetime.now(UTC)
+    )
+
+
+async def _alarm_report_result(
+    host: "CapabilityHost", message: AlarmReportMessage
+) -> dict[str, object]:
+    """Apply an endpoint's alarm report and build its `alarm_action_result`."""
+    outcome = await host.alarm_report(message, endpoint=WS_ENDPOINT)
+    return alarm_action_result_payload(
+        message.alarm_id, "report", message.request_id, outcome, datetime.now(UTC)
+    )
+
+
+def _failed_alarm_result(
+    host: "CapabilityHost",
+    alarm_id: str,
+    action: Literal["stop", "snooze", "dismiss", "report"],
+    request_id: str | None,
+    error: BaseException,
+) -> dict[str, object]:
+    """The `alarm_action_result` for an unexpected exception: `failed`, in place of `error`."""
+    reason = _capability_failure_text(host, error)
+    outcome = ToolOutcome(status="error", summary=f"Alarm {action} failed.", reason=reason)
+    return alarm_action_result_payload(alarm_id, action, request_id, outcome, datetime.now(UTC))
+
+
+async def _handle_capability_message(
+    websocket: WebSocket, data: dict[str, object], session_id: str
+) -> None:
+    """Answer `action_decision`, `alarm_action` or `alarm_report` from this connection.
+
+    Each capability call runs through `_run_capability_call`, and every send
+    happens here, in the receive loop's `try`, so a client that has gone takes
+    the disconnect path. `action_decision`'s payloads are broadcast (every
+    capability payload is, until turns are routed per connection); an alarm
+    action or report gets exactly one `alarm_action_result`, on this socket.
+    """
+    host = _capability_host()
+    if host is None:
+        await websocket.send_json(_ws_error("validation", "capabilities disabled"))
+        return
+    msg_type = data.get("type")
+    if msg_type == "action_decision":
+        await _handle_action_decision(websocket, host, data, session_id)
+        return
+    if msg_type == "alarm_action":
+        action = _validate_capability_message(AlarmActionMessage, data)
+        if isinstance(action, str):
+            await websocket.send_json(_ws_error("validation", action))
+            return
+        result, error = await _run_capability_call(
+            _alarm_action_result(host, action), "alarm_action"
+        )
+        if error is not None:
+            result = _failed_alarm_result(
+                host, action.alarm_id, action.action, action.request_id, error
+            )
+    else:
+        report = _validate_capability_message(AlarmReportMessage, data)
+        if isinstance(report, str):
+            await websocket.send_json(_ws_error("validation", report))
+            return
+        result, error = await _run_capability_call(
+            _alarm_report_result(host, report), "alarm_report"
+        )
+        if error is not None:
+            result = _failed_alarm_result(host, report.alarm_id, "report", report.request_id, error)
+    if result is not None:
+        await websocket.send_json(result)
+
+
+async def _handle_action_decision(
+    websocket: WebSocket, host: "CapabilityHost", data: dict[str, object], session_id: str
+) -> None:
+    """Resolve a proposal for this connection's own session, and broadcast what it produced.
+
+    `decide_proposal` belongs to the conversation handler, which merges the
+    decision into the session's history. With no handler no turn reached the
+    host, so there is no proposal to decide, and the client is told so.
+    """
+    decision = _validate_capability_message(ActionDecisionMessage, data)
+    if isinstance(decision, str):
+        await websocket.send_json(_ws_error("validation", decision))
+        return
+    handler = _health_conversation_handler()
+    if handler is None:
+        await websocket.send_json(
+            _ws_error("server", "no conversation handler, so no proposal can be decided")
+        )
+        return
+    payloads, error = await _run_capability_call(
+        _decided_payloads(handler, session_id, decision), "action_decision"
+    )
+    if error is not None:
+        await websocket.send_json(_ws_error("server", _capability_failure_text(host, error)))
+        return
+    for payload in payloads or ():
+        await message_queue.put(payload)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for voice + text conversation.
@@ -2169,7 +2394,8 @@ async def websocket_endpoint(websocket: WebSocket):
     the surface; field-level schemas live in the ADR.
 
     Inbound (client -> server):
-        audio, text, interrupt, reset_vad, log_config, subscribe_logs
+        audio, text, interrupt, reset_vad, log_config, subscribe_logs,
+        action_decision, alarm_action, alarm_report (1.4.0)
 
     Outbound (server -> client):
         session_started, heartbeat, health_status, system_status,
@@ -2178,8 +2404,21 @@ async def websocket_endpoint(websocket: WebSocket):
         tool_call_started / tool_call_completed, cards_summon /
         cards_dismiss, graph_subgraph, vault_results, form_switch,
         discriminated error, status, log_config_ack, log,
+        capabilities_status, alarm_state, action_proposed, action_resolved,
+        alarm_fired, alarm_action_result (1.4.0),
         plus binary audio frames (MIST protocol: MSG_AUDIO_CHUNK /
         MSG_AUDIO_COMPLETE).
+
+    With a capability host, the connect snapshot (`capabilities_status`, then
+    `alarm_state` when the alarm state can be read) follows `session_started`
+    on this socket only, as does the one `alarm_action_result` answering each
+    valid `alarm_action` or `alarm_report`, and any `error` answering a
+    capability message. `action_proposed`, `action_resolved`, `alarm_fired`,
+    and later `capabilities_status` and `alarm_state` changes are broadcast.
+    With no host, the snapshot is not sent and the three inbound capability
+    messages get a `validation` error, "capabilities disabled".
+    Each capability call runs through `_run_capability_call`, so a capability's
+    exception is answered on this socket and never ends the connection.
 
     A browser origin outside `allowed_origins()` is closed with 1008 before
     `accept`, because browsers apply no CORS to WebSockets (`backend/origins.py`).
@@ -2232,6 +2471,9 @@ async def websocket_endpoint(websocket: WebSocket):
     )
 
     try:
+        # First inside the `try`, so a client that has gone before the snapshot
+        # reaches it takes the disconnect path and its cleanup below.
+        await _send_capability_snapshot(websocket)
         while True:
             # Receive message from client
             data = await websocket.receive_json()
@@ -2409,6 +2651,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"Log streaming: {'enabled' if enabled else 'disabled'}",
                     }
                 )
+
+            elif msg_type in CAPABILITY_MESSAGE_TYPES:
+                await _handle_capability_message(websocket, data, session_id)
 
             else:
                 logger.warning(f"Unknown message type: {msg_type}")
