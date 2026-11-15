@@ -201,3 +201,59 @@ class TestModelsRootResolution:
         EmbeddingGenerator(_MODEL, device="cpu")
 
         assert recorded_constructions == []
+
+
+class TestAttentionImplementation:
+    """A chosen attention kernel reaches `SentenceTransformer` on both load branches.
+
+    The need gate runs a ModernBERT embedder on CPU with CUDA visible, where the
+    default load picked a Triton kernel that cannot run a CPU forward (H20), so
+    it asks for `sdpa`. Without the keyword both calls stay as the tests above pin them.
+    """
+
+    def test_baked_path_passes_the_attention_implementation(
+        self, recorded_constructions: list[tuple[tuple, dict]], models_root: Path
+    ) -> None:
+        (models_root / _MODEL).mkdir()
+        generator = EmbeddingGenerator(_MODEL, device="cpu", attn_implementation="sdpa")
+
+        generator._get_model()
+
+        assert recorded_constructions == [
+            (
+                (str(models_root / _MODEL),),
+                {
+                    "device": "cpu",
+                    "local_files_only": True,
+                    "model_kwargs": {"attn_implementation": "sdpa"},
+                },
+            )
+        ]
+
+    def test_by_name_passes_the_attention_implementation(
+        self, recorded_constructions: list[tuple[tuple, dict]], models_root: Path
+    ) -> None:
+        generator = EmbeddingGenerator(_MODEL, device="cpu", attn_implementation="sdpa")
+
+        generator._get_model()
+
+        assert recorded_constructions == [
+            ((_MODEL,), {"device": "cpu", "model_kwargs": {"attn_implementation": "sdpa"}})
+        ]
+
+    def test_explicit_none_leaves_both_calls_unchanged(
+        self, recorded_constructions: list[tuple[tuple, dict]], models_root: Path
+    ) -> None:
+        (models_root / _MODEL).mkdir()
+        baked = EmbeddingGenerator(_MODEL, device="cpu", attn_implementation=None)
+        by_name = EmbeddingGenerator(
+            _MODEL, device="cpu", models_root=str(models_root / "absent"), attn_implementation=None
+        )
+
+        baked._get_model()
+        by_name._get_model()
+
+        assert recorded_constructions == [
+            ((str(models_root / _MODEL),), {"device": "cpu", "local_files_only": True}),
+            ((_MODEL,), {"device": "cpu"}),
+        ]
