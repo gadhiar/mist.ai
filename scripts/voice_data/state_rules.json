@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "about": "State proposals (T7): each kept segment of a run is placed by its arousal quantile within the run and the z-scores of its F0 mean, speech rate and active energy within the run, and proposed the state whose centre is nearest under the feature weights. The margin is the distance to the second-nearest centre less the distance to the nearest. Raj confirms every proposal in the labels pack, so these numbers order the pack and set defaults; they gate nothing.",
+  "features": {
+    "arousal_q": {"weight": 4.0, "[E]": "weight of the arousal quantile (0..1) against the z-scores; H6 calibrates on the rehearsal"},
+    "f0_z": {"weight": 1.0, "[E]": "weight of the F0-mean z-score; H6 calibrates on the rehearsal"},
+    "rate_z": {"weight": 1.0, "[E]": "weight of the speech-rate z-score; H6 calibrates on the rehearsal"},
+    "energy_z": {"weight": 1.0, "[E]": "weight of the active-energy z-score; H6 calibrates on the rehearsal"}
+  },
+  "states": {
+    "neutral": {"centre": {"arousal_q": 0.5, "f0_z": 0.0, "rate_z": 0.0, "energy_z": 0.0, "[E]": "neutral's centre; H6 calibrates on the rehearsal"}},
+    "calm": {"centre": {"arousal_q": 0.3, "f0_z": -0.5, "rate_z": -0.6, "energy_z": -0.6, "[E]": "calm's centre; H6 calibrates on the rehearsal"}},
+    "awake": {"centre": {"arousal_q": 0.7, "f0_z": 0.4, "rate_z": 0.6, "energy_z": 0.6, "[E]": "awake's centre; H6 calibrates on the rehearsal"}},
+    "sleepy": {"centre": {"arousal_q": 0.1, "f0_z": -1.0, "rate_z": -1.2, "energy_z": -1.2, "[E]": "sleepy's centre; H6 calibrates on the rehearsal"}},
+    "excited": {"centre": {"arousal_q": 0.9, "f0_z": 1.2, "rate_z": 1.2, "energy_z": 1.2, "[E]": "excited's centre; H6 calibrates on the rehearsal"}}
+  }
+}
