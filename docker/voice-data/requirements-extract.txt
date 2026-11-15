@@ -31,3 +31,5 @@ pyyaml==6.0.2
 # check_argument_types, which typeguard 2.x provides and 4.x does not.
 torch-complex==0.4.4
 typeguard==2.13.3
+# The extract and clean stages load the ECAPA speaker embedder in this venv, at venv-score's pin.
+speechbrain==1.1.2

@@ -386,6 +386,16 @@ def imported_modules(check: ast.Module) -> set[str]:
     }
 
 
+def test_extract_venv_loads_ecapa_at_the_score_pin() -> None:
+    # The extract and clean stages load the ECAPA speaker embedder in-process in venv-extract,
+    # so speechbrain is installed there at venv-score's pin and the image build imports it.
+    extract = pinned_versions("requirements-extract.txt")
+    score = pinned_versions("requirements-score.txt")
+    assert extract.get("speechbrain") == score["speechbrain"], extract.get("speechbrain")
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    assert "speechbrain.inference.speaker" in imported_modules(check)
+
+
 def test_neutts_pins_the_torchao_built_for_its_torch() -> None:
     # neucodec 0.0.6 declares torchao>=0.12.0 and no upper bound, so pip took torchao 0.18.0,
     # whose float8 tensor module imports `ScalingType` from torch.nn.functional; torch 2.8.0
