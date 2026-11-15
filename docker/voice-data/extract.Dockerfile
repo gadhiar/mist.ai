@@ -29,5 +29,5 @@ RUN test -n "$GIT_SHA" \
 
 COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/
 COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/
-RUN /opt/venv-extract/bin/python -I -c 'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER", "/opt/mist-voice/upstream/Sidon/src"]; import torch,torchaudio, torchvision, torchcodec, whisperx, pyannote.audio, faster_whisper, ctranslate2, silero_vad, transformers, accelerate, huggingface_hub, numpy, pandas, nltk, omegaconf, scipy, librosa, soundfile, safetensors, einops, beartype, rotary_embedding_torch, ml_collections, yaml, look2hear.models, sidon.cleansing, scripts.voice_data' \
+RUN /opt/venv-extract/bin/python -I -c 'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER", "/opt/mist-voice/upstream/Sidon/src"]; import torch,torchaudio, torchvision, torchcodec, whisperx, pyannote.audio, faster_whisper, ctranslate2, silero_vad, transformers, accelerate, huggingface_hub, numpy, pandas, nltk, omegaconf, scipy, librosa, soundfile, safetensors, einops, beartype, rotary_embedding_torch, ml_collections, yaml, speechbrain.inference.speaker, look2hear.models, sidon.cleansing, scripts.voice_data' \
  && /opt/venv-score/bin/python -I -c 'import scripts.voice_data'
