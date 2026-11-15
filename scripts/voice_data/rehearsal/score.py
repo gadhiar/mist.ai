@@ -6,10 +6,12 @@ episodes can sit anywhere under `seed/raw/`. A segment is the target's (or the i
 that speaker's lines cover at least half of it.
 
 Precision is over the kept primary-cluster segments (the seed before Raj's labels): the share
-that are the target's. Recall is over the target's speech that no other speaker overlaps (the
-extraction drops overlapped speech by design): the share covered by kept segments, primary or
-flagged, since flagged segments come back through the labels pack. The effect measures come from
-the `effects` job step (`mix.py`); everything else here needs no audio.
+that are the target's. Recall, H6's figure, is over the speech extraction can keep by rule: the
+target's speech that no other speaker overlaps, in spans of at least `segment.min_s` (extract
+drops overlapped speech and shorter segments by design). It is the share covered by kept
+segments, primary or flagged, since flagged segments come back through the labels pack.
+All-target recall, over all the target's speech, is reported beside it. The effect measures come
+from the `effects` job step (`mix.py`); everything else here needs no audio.
 """
 
 from __future__ import annotations
@@ -144,33 +146,58 @@ class Episodes:
         return majority(seg.start_s, seg.end_s, self.of(seg.source_id, "target"))
 
 
-def extraction(eps: Episodes, segments: Sequence[SegmentRecord]) -> dict[str, object]:
-    """Return precision, recall and the per-cluster counts of the kept segments."""
+def keepable(lines: Sequence[TruthLine], min_s: float) -> list[Interval]:
+    """Return the target speech extraction can keep by rule: unoverlapped, `min_s` or longer.
+
+    Extract drops any segment that touches overlap (`segment.overlap_max_ms` is 0) and any
+    shorter than `segment.min_s`, so the target's speech less every other speaker's lines, in
+    spans of at least `min_s`, is all it can keep. Splits at VAD pauses and the diarizer's own
+    turn edges are not in the ground truth, so they are not taken out.
+    """
+    targets = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker == "target"])
+    others = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker != "target"])
+    return [(a, b) for a, b in subtract(targets, others) if b - a >= min_s]
+
+
+def extraction(eps: Episodes, segments: Sequence[SegmentRecord], min_s: float) -> dict[str, object]:
+    """Return precision, recall and the per-cluster counts of the kept segments.
+
+    Two recalls, each the share of a span of target speech that kept segments (primary or
+    flagged) cover. `recall`, H6's figure, is over the speech extraction can keep (`keepable`,
+    with `min_s` the `segment.min_s` gate in force): it does not charge extraction with the
+    overlapped speech and short lines it drops by design. `recall_all_target` is over all the
+    target's speech, beside it.
+    """
     own = [s for s in segments if s.source_id in eps.lines]
     primary = [s for s in own if s.kept and s.cluster == PRIMARY]
     kept = [s for s in own if s.kept]
     true_primary = [s for s in primary if eps.who(s) == "target"]
     true_kept = [s for s in kept if eps.who(s) == "target"]
-    target_s = covered_s = 0.0
+    keep_s = keep_covered_s = target_s = target_covered_s = 0.0
     for sid, lines in eps.lines.items():
-        targets = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker == "target"])
-        others = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker != "target"])
-        eligible = subtract(targets, others)
         spans = union([(s.start_s, s.end_s) for s in kept if s.source_id == sid])
-        target_s += length(eligible)
-        covered_s += length(intersect(eligible, spans))
+        can_keep = keepable(lines, min_s)
+        keep_s += length(can_keep)
+        keep_covered_s += length(intersect(can_keep, spans))
+        targets = union([(ln.start_s, ln.end_s) for ln in lines if ln.speaker == "target"])
+        target_s += length(targets)
+        target_covered_s += length(intersect(targets, spans))
     primary_s = sum(s.end_s - s.start_s for s in primary)
     true_s = sum(overlap_s(s.start_s, s.end_s, eps.of(s.source_id, "target")) for s in primary)
     return {
         "precision": _ratio(len(true_primary), len(primary)),
         "precision_time": _ratio(true_s, primary_s),
         "precision_with_flagged": _ratio(len(true_kept), len(kept)),
-        "recall": _ratio(covered_s, target_s),
+        "recall": _ratio(keep_covered_s, keep_s),
+        "recall_all_target": _ratio(target_covered_s, target_s),
         "kept_primary": len(primary),
         "kept_flagged": len(kept) - len(primary),
         "true_primary": len(true_primary),
+        "min_s": min_s,
+        "keepable_s": round(keep_s, 3),
+        "keepable_covered_s": round(keep_covered_s, 3),
         "target_s": round(target_s, 3),
-        "covered_s": round(covered_s, 3),
+        "target_covered_s": round(target_covered_s, 3),
     }
 
 
@@ -501,7 +528,11 @@ def score_lines(score: Mapping[str, object]) -> list[str]:
         f"  precision {_num(ex['precision'])} ({_num(ex['true_primary'])} of "  # type: ignore[index]
         f"{_num(ex['kept_primary'])} primary segments; time {_num(ex['precision_time'])}; "  # type: ignore[index]
         f"with flagged {_num(ex['precision_with_flagged'])})",  # type: ignore[index]
-        f"  recall {_num(ex['recall'])} ({_num(ex['covered_s'])} of {_num(ex['target_s'])} s)",  # type: ignore[index]
+        f"  recall {_num(ex['recall'])} over the speech extraction can keep "  # type: ignore[index]
+        f"({_num(ex['keepable_covered_s'])} of {_num(ex['keepable_s'])} s: unoverlapped, "  # type: ignore[index]
+        f"spans of {_num(ex['min_s'])} s or more); all-target recall "  # type: ignore[index]
+        f"{_num(ex['recall_all_target'])} ({_num(ex['target_covered_s'])} of "  # type: ignore[index]
+        f"{_num(ex['target_s'])} s)",  # type: ignore[index]
     ]
     acc = score["state_accuracy"]
     lines.append(f"  state accuracy {_num(acc['accuracy'])} over {_num(acc['n'])} segments")  # type: ignore[index]

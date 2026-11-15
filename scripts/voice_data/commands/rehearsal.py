@@ -407,7 +407,7 @@ def run_score(args: argparse.Namespace) -> int:
         "clean_run": clean_run,
         "episodes": len(eps.lines),
         "sources_not_in_truth": eps.unmatched,
-        "extraction": score_mod.extraction(eps, segments),
+        "extraction": score_mod.extraction(eps, segments, gates.value("segment.min_s")),
         "state_accuracy": score_mod.state_accuracy(eps, segments),
         "impostor": score_mod.impostor_turns(eps, segments, labels),
         "downmix": score_mod.downmix_recovery(eps, segments, layouts),

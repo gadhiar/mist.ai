@@ -803,7 +803,10 @@ def test_score_reports_extraction_against_the_truth(extracted: Extracted, scored
     ex = s["extraction"]
     assert ex["kept_primary"] == exp["primary"] and ex["true_primary"] == exp["true_primary"]
     assert ex["precision"] == round(exp["true_primary"] / exp["primary"], 4) < 1.0
-    assert 0.5 < ex["recall"] < 1.0
+    assert ex["min_s"] == gates.load(None).value("segment.min_s")
+    assert 0.0 < ex["keepable_s"] < ex["target_s"]
+    assert 0.5 < ex["recall"] <= 1.0 and 0.0 < ex["recall_all_target"] < ex["recall"]
+    assert "recall" in scored.out and "all-target recall" in scored.out
     acc = s["state_accuracy"]
     assert acc["n"] - sum(r["correct"] for r in acc["per_state"].values()) == exp["wrong_state"]
     assert s["impostor"] == {
@@ -941,6 +944,37 @@ def test_the_impostor_cluster_is_the_admitted_one_its_records_hold_the_majority_
     floor = found["retrieval.anchor_floor"]
     assert floor["impostor_median_max"] == 0.55 and floor["impostor_primary_episodes"] == 0
     assert floor["non_admitted_median_upper_bound_max"] is None
+
+
+def test_recall_is_over_the_speech_extraction_can_keep_with_all_target_recall_beside() -> None:
+    def line(n: int, speaker: str, start: float, end: float) -> pkg.TruthLine:
+        target = speaker == "target"
+        return replace(
+            _probe_line(n, speaker, start), end_s=end, speaker_id="" if target else "260"
+        )
+
+    lines = [
+        line(1, "target", 1.0, 5.0),  # 4 s, keepable whole
+        line(2, "target", 6.0, 8.0),  # 2 s, below segment.min_s: dropped by rule
+        line(3, "target", 10.0, 15.0),  # overlapped from 14 s: 10-14 keepable
+        line(4, "other", 14.0, 16.0),
+        line(5, "other", 19.0, 21.5),
+        line(6, "target", 20.0, 23.0),  # 21.5-23 left after the overlap: 1.5 s, dropped
+    ]
+    record = SourceRecord(
+        "src-0001", "p", "matroska", 1, 0, (), 1, 0, None, "eac3", None, 1, "packets", 48000, 6,
+        "5.1", 30.0, False, 1, "a" * 64, "t", "FC",
+    )  # fmt: skip
+    eps = rehearsal_cmd.score_mod.Episodes(lines, [record])
+    segments = [
+        _segment(1, "src-0001", lines[0]),  # 1.1-4.9
+        _segment(2, "src-0001", lines[2], start_s=10.1, end_s=13.9),
+    ]
+    ex = rehearsal_cmd.score_mod.extraction(eps, segments, min_s=3.0)
+    assert (ex["keepable_s"], ex["keepable_covered_s"]) == (8.0, 7.6)
+    assert (ex["target_s"], ex["target_covered_s"]) == (14.0, 7.6)
+    assert ex["recall"] == 0.95 and ex["recall_all_target"] == round(7.6 / 14.0, 4)
+    assert ex["min_s"] == 3.0
 
 
 def test_an_impostor_majority_primary_cluster_reports_primary() -> None:
