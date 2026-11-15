@@ -178,6 +178,10 @@ One row per probe: a user turn and the block it should and should not produce.
 Item kinds are `fact` (id is the `fact_key`), `episode` (the `episode_id`), `exchange` (the turn's
 `event_id`) and `note` (the `path`).
 
+### heldout_probes.jsonl
+
+The held-out probe set, in the same schema as probes.jsonl; see Held-out probes.
+
 ## Segmentation rule
 
 Conversations and episodes follow Design point 11, with the Phase B defaults.
@@ -287,6 +291,52 @@ crossword forgets reach `ideas/someday.md`.
   At least 40 percent of probes are tagged lexical false, and at least ten noise probes are
   tagged lexical true, so one miss still clears T9's 0.90 empty_on_noise floor. The fixture test
   recomputes every tag.
+
+## Held-out probes
+
+`heldout_probes.jsonl` is a second probe set over the same corpus, in probes.jsonl's schema, with
+ids `ho-<kind>-NN`. The read path's first PR is judged on it: its recall floors are measured
+here. Every read-path setting is chosen on the dev set, probes.jsonl, and none on this file, so
+a floor measured here says how memory works on probes nothing was tuned on.
+
+A held-out set is spent once it is studied. Scoring a run here and reading the aggregate report
+keeps it held out; reading a run probe by probe (which probe missed, which item the block served
+instead) spends it, because the next change is then tuned to those probes. After that read, the
+file is one more dev set, and the floors need a new held-out set.
+
+The probes were written from the corpus files and the rules on this page, without reading
+probes.jsonl. Every probe follows the Probe authoring rules above, and the fixture test runs each
+per-probe rule over both files. The file-level rules hold on this file with its own kind set,
+`fact`, `note`, `correction` and `noise`, the kinds the first PR gates on: every one of those
+kinds is present and no other, at least 40 percent of probes are tagged lexical false, at least
+ten noise probes are tagged lexical true, each new shape has at least 12 probes, and each
+correction has exactly one probe. The 120-probe total belongs to the dev set alone.
+
+The corpus fixes the targets of a list, correction or type-scoped probe, so such a probe can
+differ from its dev twin only in wording. Where a held-out probe and a dev probe have the same
+reference set (the expected items, else the forbidden ones), and for every pair of noise probes,
+the Jaccard overlap of their queries' content stems (the crude stems above, shared over union) is
+at most 0.5. A failure names the pair and the overlap, not the dev query; fix it by rewording the
+held-out probe.
+
+Minimums for the `fact` probes:
+
+- at least 69 in all, at least 49 of them tagged lexical false;
+- at least 43 `plain`, at least 27 of them lexical false;
+- 12 `list_item`, three per list utterance, at least 8 of them lexical false;
+- at least 14 `type_scoped`, every one lexical false.
+
+Minimums for the other kinds:
+
+- at least 29 `note` probes, at least 12 of them tagged lexical false;
+- one `correction` probe per correction in corrections.jsonl, forbidding exactly its
+  suppression set; a `correct` probe expects the replacement fact and a `forget` probe expects
+  nothing;
+- at least 20 `noise` probes, at least ten of them tagged lexical true.
+
+The pooled recall classes of `PR1_GATES` (`scripts/eval_harness/memory_recall_gate.py`), the
+fact, note and correction probes that expect something, hold at least 103 probes, at least 63 of
+them tagged lexical false.
 
 ## Scoring a run
 
