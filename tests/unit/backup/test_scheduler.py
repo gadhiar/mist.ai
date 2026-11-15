@@ -431,7 +431,7 @@ class TestSuccessRule:
         assert raw["last_success_counts"] == {
             "graph_nodes": 42,
             "vault_corpus_files": 13,
-            "stores": ["event_store.db", "vault_sidecar.db"],
+            "stores": ["capabilities.db", "event_store.db", "vault_sidecar.db"],
         }
         assert raw["last_success_at"] == "2026-10-23T03:00:00Z"
         assert raw["last_exit_code"] == 0
@@ -954,7 +954,7 @@ class TestAcceptSuspect:
         assert raw["last_success_counts"] == {
             "graph_nodes": 30,
             "vault_corpus_files": 4,
-            "stores": ["event_store.db", "vault_sidecar.db"],
+            "stores": ["capabilities.db", "event_store.db", "vault_sidecar.db"],
         }
         assert list(raw) == ITEM_6_KEYS
 

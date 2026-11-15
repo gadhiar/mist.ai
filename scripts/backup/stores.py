@@ -41,12 +41,16 @@ from .errors import BackupError
 # is missing ("no such module: vec0") instead of quoting the whole error.
 _NO_SUCH_MODULE = re.compile(r"no such module: (\S+)")
 
-# The three stores that hold state which cannot be rebuilt from anything else.
-# Enumerated, never discovered -- see the module docstring.
+# The four stores that hold state which cannot be rebuilt from anything else.
+# Enumerated, never discovered -- see the module docstring. `capabilities.db`
+# holds alarms, timers, their events and the capability action log. The token
+# files the capabilities use live in `<root>/secrets/`, outside the state root,
+# and are never captured.
 LIVE_STORE_FILENAMES: tuple[str, ...] = (
     "event_store.db",
     "extraction_cache.db",
     "vault_sidecar.db",
+    "capabilities.db",
 )
 
 # Subdirectory of the artifact the stores are written into.

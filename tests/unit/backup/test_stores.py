@@ -1,7 +1,7 @@
-"""MIS-140 T1: the SQLite leg captures three NAMED stores and nothing else.
+"""MIS-140 T1: the SQLite leg captures the NAMED stores and nothing else.
 
-The central test here is the negative one. Live `./data` holds five `.db` files:
-the three stores below plus `event_store.pre-r1.4-backup-2026-07-31.db` and
+The central test here is the negative one. Live `./data` held five `.db` files:
+the first three stores below plus `event_store.pre-r1.4-backup-2026-07-31.db` and
 `event_store.pre-reset-backup-2026-06-09.db` (14331904 bytes). A `*.db` glob --
 which is what `scripts/hydration/snapshot.py:519` does, correctly, against a
 directory it owns -- sweeps both into the artifact, doubling it and giving a
@@ -26,7 +26,13 @@ from scripts.backup.stores import (
     uncounted_from_captures,
 )
 
-from .conftest import STALE_BACKUP_FILENAMES, make_store, requires_sqlite_vec
+from .conftest import (
+    SECRET_FILES,
+    STALE_BACKUP_FILENAMES,
+    make_store,
+    plant_secrets,
+    requires_sqlite_vec,
+)
 
 
 def _no_extension(conn) -> None:
@@ -34,7 +40,15 @@ def _no_extension(conn) -> None:
 
 
 class TestNamedNotGlobbed:
-    def test_captures_exactly_the_three_named_stores(self, state_root, tmp_path):
+    def test_the_store_set_is_the_four_named_stores_with_capabilities_last(self):
+        assert LIVE_STORE_FILENAMES == (
+            "event_store.db",
+            "extraction_cache.db",
+            "vault_sidecar.db",
+            "capabilities.db",
+        )
+
+    def test_captures_exactly_the_named_stores(self, state_root, tmp_path):
         artifact = tmp_path / "artifact"
         artifact.mkdir()
         capture_stores(state_root, artifact)
@@ -62,6 +76,17 @@ class TestNamedNotGlobbed:
         artifact.mkdir()
         capture_stores(state_root, artifact)
         assert not (artifact / STORES_DIRNAME / "some_future_store.db").exists()
+
+    def test_capability_tokens_are_never_captured(self, state_root, tmp_path):
+        # `<root>/secrets/` sits beside `state/`; `state/secrets/` is where the dev stack keeps
+        # the Spotify token. Neither is a named store, so neither is read.
+        plant_secrets(tmp_path / "secrets")
+        plant_secrets(state_root / "secrets")
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        capture_stores(state_root, artifact)
+        names = {p.name for p in artifact.rglob("*")}
+        assert not names & {"secrets", *SECRET_FILES}
 
     def test_the_derived_vector_store_is_not_captured(self, state_root, tmp_path):
         artifact = tmp_path / "artifact"
@@ -118,6 +143,7 @@ class TestRowCounts:
         assert captures["event_store.db"].row_counts == {"conversation_turn_events": 3}
         assert captures["extraction_cache.db"].row_counts == {"extraction_cache": 2}
         assert captures["vault_sidecar.db"].row_counts == {"vault_chunks": 5}
+        assert captures["capabilities.db"].row_counts == {"alarm_records": 4}
 
     def test_a_table_added_to_a_store_is_counted_without_a_code_change(self, state_root, tmp_path):
         conn = sqlite3.connect(str(state_root / "event_store.db"))

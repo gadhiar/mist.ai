@@ -74,6 +74,7 @@ Captured, in one artifact directory:
 | `stores/event_store.db`      | conversation sessions, turn events, epoch ledger                |
 | `stores/extraction_cache.db` | cached extraction results                                       |
 | `stores/vault_sidecar.db`    | vault chunk index, with its embeddings                          |
+| `stores/capabilities.db`     | alarms, timers, their events, and the capability action log     |
 | `graph.json`                 | every node and relationship, all partitions, INCLUDING embeddings |
 | `vault/`                     | a copy of the whole `mist-memory/` tree, `.git` INCLUDED          |
 | `manifest.json`              | layout version, `created_at`, per-file sha256, row counts, uncounted tables, graph counts, both vault file counts, git HEAD, producer stamps |
