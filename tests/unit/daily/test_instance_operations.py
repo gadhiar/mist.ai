@@ -286,6 +286,14 @@ def containers_responses(root: Root, mismatched: dict[str, str] | None = None) -
     return responses
 
 
+def extraction_label_ps(project: str, service: str) -> tuple[str, ...]:
+    return (
+        *project_ps(project),
+        "--filter",
+        f"label=com.docker.compose.service={service}",
+    )
+
+
 def up_responses(root: Root, services=("mist-neo4j", "mist-llm", "mist-backend")) -> dict:
     responses = {
         DOCKER_INFO: ok("27.0.0\n"),
@@ -293,6 +301,10 @@ def up_responses(root: Root, services=("mist-neo4j", "mist-llm", "mist-backend")
         NETWORK_INSPECT: ok("[]"),
         (*root.base(), "up", "-d", *services): ok(),
         (*root.base(), "--profile", "backup", "up", "-d", "mist-backup"): ok(),
+        # `switch` lists the extraction containers by label before it moves daily.env; these
+        # releases predate night extraction, so `up` itself makes no extraction call.
+        extraction_label_ps(root.project, "mist-extraction-llm"): ok(),
+        extraction_label_ps(root.project, "mist-extraction"): ok(),
     }
     responses.update(containers_responses(root))
     return responses
@@ -812,8 +824,8 @@ def test_up_fails_when_compose_up_fails(make_ctx, daily):
 # --- down and the no-volume-deletion rule ----------------------------------------------------
 
 
-def test_down_stops_the_project_including_mist_backup(make_ctx, daily):
-    stop = (*daily.base(), "--profile", "backup", "stop")
+def test_down_stops_the_project_including_mist_backup_and_extraction(make_ctx, daily):
+    stop = (*daily.base(), "--profile", "backup", "--profile", "extraction", "stop")
     runner = FakeRunner({stop: ok()})
     assert run(make_ctx(runner), "down", "--root", str(daily.path)) == 0
     assert runner.calls == [list(stop)]
@@ -895,7 +907,7 @@ def test_every_command_argv_recorded_here_is_volume_safe(make_ctx, daily):
     runner = FakeRunner(
         {
             **up_responses(daily),
-            (*daily.base(), "--profile", "backup", "stop"): ok(),
+            (*daily.base(), "--profile", "backup", "--profile", "extraction", "stop"): ok(),
         }
     )
     ctx = make_ctx(runner)
@@ -1037,6 +1049,7 @@ def test_status_prints_only_the_specified_lines(make_ctx, daily, capsys):
     assert capsys.readouterr().out.splitlines() == [
         f"backend: tag {TAG}, image {IMAGE_ID} match, revision {SHA}",
         "gaming-mode: yielded since 2026-10-23T08:00:00Z by watcher",
+        f"extraction: none in release {TAG}",
         "health: degraded",
         "  neo4j: up ok",
         "  llm: up ok",
@@ -1106,6 +1119,7 @@ def test_status_says_so_when_the_backend_and_endpoints_are_down(make_ctx, daily,
     assert capsys.readouterr().out.splitlines() == [
         "backend: not running",
         "gaming-mode: normal",
+        f"extraction: none in release {TAG}",
         "health: unreachable",
         "turns-per-day: unreachable",
     ]
@@ -1122,7 +1136,8 @@ def test_status_exits_1_when_the_container_listing_fails(make_ctx, daily, capsys
     assert "daemon busy" in lines[1]
     # The rest of the report still prints.
     assert lines[2].startswith("gaming-mode: ")
-    assert lines[3] == "health: degraded"
+    assert lines[3].startswith("extraction: ")
+    assert lines[4] == "health: degraded"
 
 
 # --- The loopback fetch ----------------------------------------------------------------------
