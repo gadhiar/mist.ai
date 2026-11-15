@@ -73,7 +73,7 @@ How the top-level status is derived, so a reader can reproduce it
     effective(c) = "down"    if c["status"] in ("down", "timeout")
                  = "unknown" if c["status"] is None or c["stale"]
                  = "yielded" if c["status"] == "yielded"
-                 = "up"      otherwise
+                 = "up"      otherwise, which is "up" or "paused"
 
     status = "unhealthy" if any(effective(c) == "down" and c["severity"] == "fatal")
              "yielded"   elif any(effective(c) == "yielded")
@@ -98,6 +98,15 @@ degrading check is still listed with its reason. A yielded check records
 `consecutive_failures` 0 and is never `down`, so it never makes
 `restart_recommended` true: restarting would not bring back a model stopped
 on purpose.
+
+`paused` is a check status a probe signals with `ProbePaused`: a dependency
+MIST can serve without was stopped on purpose by its schedule. Today only
+`extraction_service` reports it, while the daily instance's host CLI holds
+night extraction off (`backend/extraction_hold.py`). It reads as up, so a
+daily instance with extraction waiting for night reads `healthy` all day
+rather than `degraded`. Like `yielded`, it records `consecutive_failures` 0
+and is never `down`, so it never makes `restart_recommended` true, and a
+stale paused check reads unknown like any stale check.
 
 `derive_status` implements exactly that, takes no clock and performs no I/O.
 
@@ -132,6 +141,7 @@ from backend.extraction_backlog.errors import (
     InferenceUnreachableError,
 )
 from backend.extraction_contract.models import ExtractionStatus, HealthResponse
+from backend.extraction_hold import ExtractionHold
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +162,11 @@ logger = logging.getLogger(__name__)
 #   renders `status: "yielded"`, not `down`.
 # - `resume_failed`: the yield ended but the models did not reload; that is a
 #   fault, so the check renders `down`.
+#
+# The paused-extraction term, read from the host CLI's paused marker:
+# - `extraction_paused`: the extraction service was stopped on purpose, outside
+#   its night window or by the operator; the check renders `status: "paused"`,
+#   not `down`.
 #
 # The extraction and backup terms, one per row of their checks:
 # - `epoch_mismatch`: the dispatcher refuses to dispatch because the service's
@@ -181,6 +196,7 @@ PROBE_REASONS: frozenset[str] = frozenset(
         "task_dead",
         "gpu_yielded",
         "resume_failed",
+        "extraction_paused",
         "epoch_mismatch",
         "service_degraded",
         "stalled",
@@ -204,7 +220,7 @@ DEFAULT_BACKUP_MAX_AGE_HOURS = 26.0
 Severity = Literal["fatal", "degrades"]
 
 
-# N818 asks for an `Error` suffix. These three are control-flow signals a probe
+# N818 asks for an `Error` suffix. These four are control-flow signals a probe
 # raises to report an outcome, not I/O faults, and the names are part of the
 # probe protocol that `backend/server.py` wiring will import.
 class ProbeUnavailable(MistError):  # noqa: N818
@@ -231,6 +247,16 @@ class ProbeYielded(MistError):  # noqa: N818
     """
 
 
+class ProbePaused(MistError):  # noqa: N818
+    """Raised by a probe when a dependency MIST can serve without was stopped by schedule.
+
+    Renders as `status: "paused"` with the supplied reason and
+    `consecutive_failures` 0. Unlike `yielded` it does not change the
+    top-level status: `derive_status` reads it as up, because MIST still
+    holds a conversation and the work waits for its window.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class CheckResult:
     """One dependency's last recorded probe outcome.
@@ -239,12 +265,13 @@ class CheckResult:
     read-time clock, so storing them would freeze a lie into the cache.
 
     Attributes:
-        status: `up`, `down`, `timeout`, `yielded`, or None meaning NOT MEASURED.
+        status: `up`, `down`, `timeout`, `yielded`, `paused`, or None meaning
+            NOT MEASURED.
         reason: A member of `PROBE_REASONS`, or None for a timeout.
         measured_at: Monotonic timestamp of the record. None iff never probed.
         latency_ms: Wall duration of the probe, None when nothing was measured.
         consecutive_failures: Count of consecutive `down`/`timeout` records;
-            any other record, `yielded` included, resets it to 0.
+            any other record, `yielded` and `paused` included, resets it to 0.
         severity: Whether a failure here stops MIST serving.
         restart_repairs: Whether restarting the process plausibly fixes it.
     """
@@ -263,8 +290,9 @@ class Probe(Protocol):
 
     `check` signals by control flow: returning normally means up, raising
     `ProbeUnavailable` means not measured, raising `ProbeFailed` means down,
-    raising `ProbeYielded` means stopped on purpose, and anything else is
-    treated as a `query_failed` down by the registry.
+    raising `ProbeYielded` means stopped on purpose, raising `ProbePaused`
+    means stopped by schedule, and anything else is treated as a
+    `query_failed` down by the registry.
     """
 
     name: str
@@ -732,6 +760,21 @@ class ExtractionServiceProbe:
     `start_failed` is the server's record that the dispatcher raised at boot,
     which a None dispatcher alone cannot tell apart from one never configured.
 
+    On the daily instance the service is stopped on purpose for most of the
+    day: the host CLI runs it only inside the night window and stops it for
+    games. Two states, read before anything else, keep that from reading as
+    an outage, in this order:
+    1. `yield_state` (`GpuYield.state`) reads `yielded`: gaming mode holds the
+       GPU, so the check renders `yielded` (`gpu_yielded`), as `LLMProbe`
+       does. It comes first because a game stops extraction whatever its
+       schedule says, and the top-level status already reads `yielded` then.
+    2. `hold_state` (`ExtractionHoldReader.current`) returns a hold: the
+       paused marker is current, so the check renders `paused`
+       (`extraction_paused`), which `derive_status` reads as up.
+    Neither calls the service, since a service stopped on purpose can only
+    answer "unreachable". Both default to None, which is how the dev stack,
+    with no `MIST_OPS_DIR`, keeps the probe exactly as it was.
+
     `severity="degrades"`: conversation goes on, and turns are logged for later
     extraction. `restart_repairs=False`: the host is a separate machine.
     """
@@ -741,6 +784,9 @@ class ExtractionServiceProbe:
         inference: ExtractionServiceHealthSource,
         get_dispatcher: Callable[[], ExtractionDispatcherHealthSource | None],
         start_failed: Callable[[], bool],
+        *,
+        yield_state: Callable[[], str] | None = None,
+        hold_state: Callable[[], ExtractionHold | None] | None = None,
     ) -> None:
         self.name = "extraction_service"
         self.severity: Severity = "degrades"
@@ -749,9 +795,17 @@ class ExtractionServiceProbe:
         self._inference = inference
         self._get_dispatcher = get_dispatcher
         self._start_failed = start_failed
+        self._yield_state = yield_state
+        self._hold_state = hold_state
 
     async def check(self) -> None:
-        """Evaluate item 3's `extraction_service` rows, top-down."""
+        """Report a yield or a hold, else evaluate item 3's `extraction_service` rows."""
+        if self._yield_state is not None and self._yield_state() == "yielded":
+            raise ProbeYielded("gpu_yielded")
+        # The reader opens a file, so it runs off the event loop's thread.
+        if self._hold_state is not None and await asyncio.to_thread(self._hold_state) is not None:
+            raise ProbePaused("extraction_paused")
+
         if self._start_failed():
             raise ProbeFailed("unavailable_at_boot")
         dispatcher = self._get_dispatcher()
@@ -981,7 +1035,9 @@ def derive_status(
 
     A check whose status is `yielded` maps to `yielded` only once it is
     neither down nor null-or-stale, and the top-level `yielded` sits between
-    `unhealthy` and `degraded`; the module docstring says why.
+    `unhealthy` and `degraded`; the module docstring says why. A `paused`
+    check reads as up under the same condition, so it alone never moves the
+    status off `healthy`.
 
     An empty mapping is `unhealthy`, not `healthy`: the `any(...)` calls below
     are False over an empty iterable, so without this guard a registry that
@@ -1010,6 +1066,7 @@ def derive_status(
         elif check["status"] == "yielded":
             effective[name] = "yielded"
         else:
+            # `up`, or `paused`: stopped by schedule, which MIST serves without.
             effective[name] = "up"
 
     if any(
@@ -1122,12 +1179,23 @@ class HealthRegistry:
             # completion that is genuinely late.
             task.add_done_callback(functools.partial(self._drain_late_failure, probe))
             self._record(probe, started, status="timeout", reason=None, measured=True)
+        except asyncio.CancelledError:
+            # The loop itself was cancelled, at shutdown. The shield exists to
+            # outlive a timeout, not the loop: a probe left running here (one
+            # suspended in `asyncio.to_thread`, say) would be destroyed while
+            # still pending when the event loop closes. Cancelling a thread-backed
+            # await returns at once; the thread itself finishes on its own.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         except ProbeUnavailable as exc:
             self._record(probe, started, status=None, reason=str(exc), measured=False)
         except ProbeFailed as exc:
             self._record(probe, started, status="down", reason=str(exc), measured=True)
         except ProbeYielded as exc:
             self._record(probe, started, status="yielded", reason=str(exc), measured=True)
+        except ProbePaused as exc:
+            self._record(probe, started, status="paused", reason=str(exc), measured=True)
         except Exception as exc:  # noqa: BLE001
             # The one justified bare catch in this module, mirroring the one in
             # `system_status_loop` in `backend/server.py`. Cited by symbol: that
