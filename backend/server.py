@@ -33,8 +33,9 @@ if sys.platform == "win32":
 import httpx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # `python backend/server.py` makes CPython prepend the SCRIPT's directory --
 # backend/ -- to sys.path, but not the repository root. The root has to be added
@@ -52,14 +53,35 @@ sys.path.insert(0, str(project_root))
 # ambiguous with dependencies/csm/config.py -- which is what the old
 # "import config BEFORE voice_processor" ordering existed to work around. The
 # qualified name removes both hazards outright.
+from backend.capabilities.clock import SystemClock  # isort:skip
+from backend.capabilities.config import (  # isort:skip
+    CapabilitiesConfig,
+    load_capabilities_config,
+)
+from backend.capabilities.events import QueueEventSink  # isort:skip
+from backend.capabilities.power import (  # isort:skip
+    GpuYieldPower,
+    PowerState,
+    SingleModelTiers,
+)
+from backend.capabilities.replies import NoAddress  # isort:skip
+from backend.capabilities.secrets import (  # isort:skip
+    EnvSecretSource,
+    SecretRegistry,
+    install_log_redaction,
+    redact,
+)
+from backend.chat.context_budget import ApproximateTokenCounter  # isort:skip
 from backend.config import DEFAULT_CONFIG  # isort:skip
-from backend.errors import MistError  # isort:skip
+from backend.errors import CapabilityConfigError, MistError  # isort:skip
 from backend.event_store.status_intervals import (  # isort:skip
     degraded_beneath,
     record_status_tick,
 )
 from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
+    CapabilityBuild,
+    build_capability_host,
     build_curation_scheduler,
     build_extraction_dispatcher,
     build_phase3_components,
@@ -78,6 +100,7 @@ from backend.health import (  # isort:skip
     BackupProbe,
     BroadcasterProbe,
     BroadcasterState,
+    CapabilitiesProbe,
     EventStoreProbe,
     ExtractionBacklogProbe,
     ExtractionServiceHealthSource,
@@ -100,6 +123,7 @@ from backend.origins import allowed_origins, origin_allowed  # isort:skip
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from backend.capabilities.host import CapabilityHost
     from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import EventStoreProvider
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
@@ -260,6 +284,19 @@ EXTRACTION_HEALTH_CLIENT_TIMEOUT_S = 2.0
 # Gaming mode (`backend/gpu_yield.py`). None when `MIST_OPS_DIR` is unset, or
 # set while TTS is on: the backend is then never yielded.
 _gpu_yield: GpuYield | None = None
+
+# Capabilities (`backend/capabilities/`). `lifespan` builds them before the
+# voice processor. `_capability_build` holds the host, or the reason there is
+# none, which `GET /capabilities` reports; None before `lifespan` runs.
+# `_capability_config` is None when the capability variables do not parse.
+# The secret registry exists from import, so the log redaction `lifespan`
+# installs first covers every secret the host registers later.
+_capability_build: CapabilityBuild | None = None
+_capability_config: CapabilitiesConfig | None = None
+_capability_power: PowerState | None = None
+_capability_secrets = SecretRegistry()
+# A `reason` in `GET /capabilities` is cut to this many characters.
+CAPABILITY_REASON_MAX_CHARS = 200
 
 # `probe_loop` value for "the registry was never constructed", distinct from
 # `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
@@ -956,6 +993,74 @@ def _event_store_configured() -> bool:
     return KnowledgeConfig.from_env().event_store.enabled
 
 
+def _capability_host() -> "CapabilityHost | None":
+    """Reach the capability host, or None when `lifespan` built none.
+
+    Read at each call, as the other health accessors are, so the probe and
+    `GET /capabilities` follow whatever build is current.
+    """
+    build = _capability_build
+    return build.host if build is not None else None
+
+
+def _desktop_present() -> bool:
+    """Whether a client is connected, so the desktop ring endpoint can ring."""
+    return bool(active_connections)
+
+
+def _capability_tiers(power: PowerState) -> SingleModelTiers:
+    """The action decode's tiers over the voice processor's one provider.
+
+    The provider is read through `_health_llm_provider` at each call, because
+    it exists only once `VoiceProcessor.initialize()` has built it: before
+    that the decode is unavailable, after it available. The same object is
+    passed to the host and the conversation handler, so they cannot disagree.
+    """
+    return SingleModelTiers(_health_llm_provider, power)
+
+
+def _read_secret_file(path: str) -> str:
+    """Read a `*_FILE` secret, such as a Docker secret holding the Home Assistant token."""
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _attach_capability_host(tiers: SingleModelTiers) -> None:
+    """Attach the built host to the live conversation handler, if both exist.
+
+    Called once `initialize()` has returned, since the handler exists only
+    then. With no handler (knowledge integration off, or its build failed)
+    the host still serves alarm actions and the status surface, but no turn
+    reaches it, which is logged.
+    """
+    host = _capability_host()
+    if host is None:
+        return
+    handler = _health_conversation_handler()
+    if handler is None:
+        logger.warning("Capability host built but no conversation handler exists; turns skip it")
+        return
+    handler.attach_capability_host(host, tiers=tiers)
+    logger.info("Capability host attached to the conversation handler")
+
+
+async def _stop_capability_host() -> None:
+    """Stop the host, then close what the build owns (database, Spotify client).
+
+    A no-op when no host was built. A failure is logged and shutdown goes on.
+    """
+    build = _capability_build
+    if build is None or build.host is None:
+        return
+    try:
+        await build.host.stop()
+    except (MistError, sqlite3.Error, OSError) as e:
+        logger.warning("Capability host stop error (non-fatal): %s", e)
+    try:
+        await build.close()
+    except (MistError, sqlite3.Error, OSError, httpx.HTTPError) as e:
+        logger.warning("Capability build close error (non-fatal): %s", e)
+
+
 async def _initialize_voice_processor(processor: VoiceProcessor, *, yielded: bool = False) -> None:
     """Load the model stack and only then publish readiness.
 
@@ -1048,8 +1153,9 @@ def _build_health_registry(
     extraction_inference: ExtractionServiceHealthSource,
     probe_settings: HealthProbeSettings,
     yield_state: "Callable[[], str] | None" = None,
+    capability_host: "Callable[[], CapabilityHost | None] | None" = None,
 ) -> HealthRegistry:
-    """Construct the eight dependency probes and the registry that runs them.
+    """Construct the dependency probes and the registry that runs them.
 
     Every accessor is a callable that reads module state WHEN THE PROBE RUNS,
     never a value captured here. `voice_processor`, `vault_sidecar` and the
@@ -1082,6 +1188,9 @@ def _build_health_registry(
         yield_state: `GpuYield.state`, so the llm check reads `yielded` while
             gaming mode holds the GPU and `down` (`resume_failed`) while the
             reload fails. None without gaming mode.
+        capability_host: The capability host's accessor, read at each check.
+            None when no host was built: the `capabilities` check is then
+            absent rather than unmeasured, which would derive `degraded`.
 
     Returns:
         A registry whose `run_forever` the caller schedules.
@@ -1104,6 +1213,8 @@ def _build_health_registry(
         ExtractionBacklogProbe(dispatcher, checked_extraction_status, start_failed, probe_settings),
         BackupProbe(probe_settings, lambda: datetime.now(UTC)),
     ]
+    if capability_host is not None:
+        probes.append(CapabilitiesProbe(capability_host))
     return HealthRegistry(
         probes,
         monotonic=time.monotonic,
@@ -1258,12 +1369,17 @@ async def _stop_uptime_recorder(task: "asyncio.Task | None") -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
+    # First, before any handler is attached or any secret loaded: the record
+    # factory redacts every record created from here on, whichever handler
+    # (the DEBUG file log below, the WebSocket log handler later) emits it.
+    install_log_redaction(_capability_secrets)
     configure_file_logging(_resolve_log_dir())
 
     global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
     global _broadcaster_state, _health_registry, _health_probe_executor
     global _extraction_health_client, _gpu_yield
+    global _capability_build, _capability_config, _capability_power
 
     # Startup
     logger.info("=" * 60)
@@ -1333,6 +1449,52 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Vault layer initialization failed (continuing without vault): %s", e)
 
+    # Gaming mode, built before the model load so a backend that boots while
+    # the marker exists skips Whisper and the LLM warmup, and before the
+    # capability host, whose power level reads it. Its poll starts only after
+    # initialize() returns, so a marker that came or went during the load is
+    # acted on by the first poll.
+    _gpu_yield = _build_gpu_yield(
+        os.environ.get("MIST_OPS_DIR"),
+        tts_enabled=bool(config.tts_enabled),
+        poll_s=gpu_yield_poll_s(),
+    )
+
+    # Capabilities: built and started before the voice processor exists and
+    # before the model load, so an alarm due at boot rings without waiting
+    # for the models. The decode tiers read the provider lazily (see
+    # `_capability_tiers`), so the host is ready before the provider is.
+    _capability_power = GpuYieldPower(_gpu_yield)
+    capability_tiers = _capability_tiers(_capability_power)
+    try:
+        _capability_config = load_capabilities_config(os.environ)
+    except CapabilityConfigError as e:
+        logger.error("Capability configuration invalid; no capability host: %s", e)
+        _capability_config = None
+        _capability_build = CapabilityBuild(
+            host=None, disabled_reason=f"capability config invalid: {e}"
+        )
+    else:
+        _capability_build = build_capability_host(
+            _capability_config,
+            event_sink=QueueEventSink(loop, message_queue),
+            secret_source=EnvSecretSource(os.environ, _read_secret_file),
+            secret_registry=_capability_secrets,
+            clock=SystemClock(),
+            # No embedder exists before the model load; the router's
+            # embedding stage stays off until one is wired.
+            embedder=None,
+            token_counter=ApproximateTokenCounter(),
+            # None: the factory uses the MCP SDK transport for lights.
+            transport_factory=None,
+            power=_capability_power,
+            tiers=capability_tiers,
+            register=NoAddress(),
+            desktop_present=_desktop_present,
+        )
+    if _capability_build.host is not None:
+        await _capability_build.host.start()
+
     # Initialize voice processor with the server-owned vault_writer, sidecar,
     # and invalidation_bus so that the voice-path ConversationHandler shares a
     # single started writer, the retriever routes to the same initialized sidecar
@@ -1345,21 +1507,13 @@ async def lifespan(app: FastAPI):
         vault_sidecar=vault_sidecar,
         invalidation_bus=vault_invalidation_bus,
     )
-    # Gaming mode, built before the model load so a backend that boots while
-    # the marker exists skips Whisper and the LLM warmup. Its poll starts only
-    # after initialize() returns, so a marker that came or went during the
-    # load is acted on by the first poll.
-    _gpu_yield = _build_gpu_yield(
-        os.environ.get("MIST_OPS_DIR"),
-        tts_enabled=bool(config.tts_enabled),
-        poll_s=gpu_yield_poll_s(),
-    )
     yield_state = _gpu_yield.state if _gpu_yield is not None else None
     defer_llm_jobs = _gpu_yield.is_yielded if _gpu_yield is not None else None
     # Sets `_models_ready` only once initialize() has returned, so
     # `/health.models_loaded` reports a state the process has actually reached
     # rather than the mere existence of the object above.
     await _initialize_voice_processor(voice_processor, yielded=_gpu_is_yielded())
+    _attach_capability_host(capability_tiers)
     gpu_yield_task: asyncio.Task | None = None
     if _gpu_yield is not None:
         gpu_yield_task = asyncio.create_task(_gpu_yield.run_forever(), name="gpu-yield")
@@ -1394,6 +1548,7 @@ async def lifespan(app: FastAPI):
         RemoteExtractionInference(_extraction_health_client, _extraction_service_url()),
         HealthProbeSettings.from_env(),
         yield_state=yield_state,
+        capability_host=_capability_host if _capability_host() is not None else None,
     )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
@@ -1551,6 +1706,10 @@ async def lifespan(app: FastAPI):
             await ch.aclose()
     except Exception as e:  # noqa: BLE001
         logger.warning("ConversationHandler aclose error (non-fatal): %s", e)
+
+    # After the handler drain, so no turn is still calling the host; then the
+    # build closes the database and the Spotify client the host used.
+    await _stop_capability_host()
 
     # T2a: stop the extraction dispatcher AFTER the handler drain above (which
     # waits on the backlog). A job still waiting on the service is abandoned
@@ -1780,6 +1939,81 @@ async def get_extraction_status():
     from backend.extraction_backlog.status import extraction_status
 
     return extraction_status(extraction_dispatcher).model_dump(mode="json")
+
+
+def _capability_reason(text: str | None) -> str | None:
+    """Redact a reason and cut it to `CAPABILITY_REASON_MAX_CHARS`."""
+    if text is None:
+        return None
+    return redact(text, _capability_secrets)[:CAPABILITY_REASON_MAX_CHARS]
+
+
+def _capability_secret_presence(config: CapabilitiesConfig | None) -> list[dict]:
+    """Whether each configured capability's secret is present; never a value.
+
+    The Home Assistant token counts as present when `MIST_HA_TOKEN` or
+    `MIST_HA_TOKEN_FILE` is set, and the Spotify token when its file exists,
+    which the authorize CLI writes at any time, so it is checked per request.
+    """
+    if config is None:
+        return []
+    secrets: list[dict] = []
+    if "lights" in config.capabilities and config.lights.ha_mcp_url is not None:
+        secrets.append({"name": "MIST_HA_TOKEN", "present": config.lights.ha_token_configured})
+    if "music" in config.capabilities and config.music.spotify_client_id is not None:
+        token_file = Path(config.music.spotify_token_path)
+        secrets.append({"name": "MIST_SPOTIFY_TOKEN_PATH", "present": token_file.is_file()})
+    return secrets
+
+
+def _capabilities_payload() -> dict:
+    """The `GET /capabilities` body: the build, each capability, secrets and stats.
+
+    Every reason passes through `redact` and is capped, and no secret value is
+    read here, so the body is safe for any allowed page to read.
+    """
+    build = _capability_build
+    host = build.host if build is not None else None
+    power = _capability_power
+    capabilities: list[dict] = []
+    if build is not None and host is not None:
+        statuses = {status.name: status for status in host.statuses()}
+        for capability in build.capabilities:
+            status = statuses[capability.name]
+            capabilities.append(
+                {
+                    "name": capability.name,
+                    "state": status.state,
+                    "reason": _capability_reason(status.reason),
+                    "tools": [spec.name for spec in capability.tools()],
+                    "provider_tools": list(capability.provider_tools()),
+                }
+            )
+    return {
+        "enabled": host is not None,
+        "reason": _capability_reason(
+            build.disabled_reason if build is not None else "capabilities not started"
+        ),
+        "power_level": power.level() if power is not None else None,
+        "decode_available": host.decode_available() if host is not None else False,
+        "capabilities": capabilities,
+        "secrets": _capability_secret_presence(_capability_config),
+        "stats": host.stats() if host is not None else {},
+    }
+
+
+@app.get("/capabilities", response_model=None)
+async def get_capabilities(request: Request) -> dict | JSONResponse:
+    """The capability host's state, for the status view and the live checks.
+
+    CORS allows the configured origins only, but a page a browser loads from
+    any site can still send this request, so the same Origin rule as `/ws`
+    applies: a request whose `Origin` the allowlist refuses gets 403, and one
+    with no `Origin` (a local program) or an allowed one gets the body.
+    """
+    if not origin_allowed(request.headers.get("origin"), allowed_origins()):
+        return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
+    return _capabilities_payload()
 
 
 @app.get("/usage/turns-per-day")

@@ -7,8 +7,11 @@ services:
       context: .
       dockerfile: docker/backend/Dockerfile
     container_name: mist-backend
+    # Loopback by default, so other hosts on the LAN cannot reach the backend,
+    # which can switch lights and music. MIST_BACKEND_BIND_ADDR=0.0.0.0
+    # publishes it on every interface.
     ports:
-      - "8001:8001"
+      - "${MIST_BACKEND_BIND_ADDR:-127.0.0.1}:8001:8001"
     # The full documented config surface reaches the backend process via
     # env_file (deep review drift-hygiene-3: the explicit allowlist below
     # silently dropped most .env knobs, including in-span operator-tuning
@@ -55,6 +58,10 @@ services:
       - TTS_CFG_WEIGHT=${TTS_CFG_WEIGHT:-0.5}
       - VOICE_PROFILE=${VOICE_PROFILE:-mist}
       - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
+      # Capabilities: the alarm, timer and action-log database and the Spotify
+      # token file, on the ./data bind mount below (both gitignored).
+      - MIST_CAPABILITIES_DB_PATH=${MIST_CAPABILITIES_DB_PATH:-/app/data/capabilities.db}
+      - MIST_SPOTIFY_TOKEN_PATH=${MIST_SPOTIFY_TOKEN_PATH:-/app/data/secrets/spotify_token.json}
     # Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root container user.
     # UID 1000 matches the conventional first user on Linux hosts so bind-
     # mounted host directories (./data, ./logs, ./mist-memory) are writable
