@@ -347,10 +347,31 @@ def _sims(segs: Sequence[SegmentRecord]) -> dict[str, list[float]]:
 
 def _p02_floor(values: Sequence[float], below: Sequence[float]) -> dict[str, object]:
     entry: dict[str, object] = {"value": round(percentile(values, 2), 3), "n": len(values)}
+    entry["fallback_fc_n"] = len(below)
     if below:
         entry["fallback_fc_max"] = round(max(below), 3)
         entry["separates"] = max(below) < entry["value"]  # type: ignore[operator]
     return entry
+
+
+def fallback_fc(build: object, eps: Episodes) -> dict[str, list[float]]:
+    """Return the centre-cut SNR and C50 the build measured on the scored episodes' fallback lines.
+
+    Extract writes no centre-cut record for a fallback line whose downmix passes, so these come
+    from `build.json` (`mix.measure_fallback`), for the episodes the inventory matched only.
+    """
+    scored = {lines[0].episode_sha256 for lines in eps.lines.values() if lines}
+    found: dict[str, list[float]] = {"snr_db": [], "c50_db": []}
+    episodes = build.get("episodes") if isinstance(build, Mapping) else None
+    for ep in episodes if isinstance(episodes, list) else []:
+        if not isinstance(ep, Mapping) or ep.get("sha256") not in scored:
+            continue
+        for row in ep.get("fallback_fc") or []:
+            for field, values in found.items():
+                value = row.get(field) if isinstance(row, Mapping) else None
+                if isinstance(value, int | float) and math.isfinite(value):
+                    values.append(float(value))
+    return found
 
 
 def gate_values(
@@ -359,21 +380,17 @@ def gate_values(
     clusters: Sequence[Mapping[str, object]],
     effects: Mapping[str, object] | None,
     h6_gates: Mapping[str, float],
+    fallback: Mapping[str, Sequence[float]],
 ) -> dict[str, dict[str, object]]:
     """Return, for each H6-calibrated gate, the value the ground truth supports, or why not.
 
     Each entry holds `default` (the gate's value in force), and either `value` with its `basis`
-    or `value` null with `reason`.
+    or `value` null with `reason`. `fallback` is `fallback_fc`'s result: the SNR and C50 floors
+    are compared against it, since the calibrated floors must still fail the fallback lines'
+    centre cut for the downmix path to run.
     """
     true_kept = [s for s in segments if s.kept and eps.who(s) == "target"]
     true_fc = [s for s in true_kept if s.channel == "FC"]
-    fallback_fc = [
-        s
-        for s in segments
-        if s.channel == "FC"
-        and (line := eps.target_line(s)) is not None
-        and line.geometry == "fallback"
-    ]
     sims = _sims(true_kept)
     out: dict[str, dict[str, object]] = {}
     for key, default in sorted(h6_gates.items()):
@@ -403,12 +420,13 @@ def gate_values(
             field = "snr_db" if key == "segment.snr_min_db" else "c50_db"
             values = [getattr(s, field) for s in true_fc if math.isfinite(getattr(s, field))]
             if values:
-                below = [getattr(s, field) for s in fallback_fc if math.isfinite(getattr(s, field))]
-                entry.update(_p02_floor(values, below))
+                entry.update(_p02_floor(values, fallback.get(field, [])))
                 entry["basis"] = (
                     f"p02 of the true target centre-channel segments' {field}; "
-                    "fallback_fc_max is the highest centre cut of a fallback line, which must "
-                    "fall below it"
+                    "fallback_fc_max is the highest centre-cut value the build measured on a "
+                    "fallback line (speech band against burst band, and C50 deconvolved from "
+                    "the known line: the build's estimators, not extract's), which must fall "
+                    "below it"
                 )
             else:
                 entry["reason"] = "no kept centre-channel segment is the target's"

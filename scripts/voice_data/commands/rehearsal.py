@@ -410,7 +410,14 @@ def run_score(args: argparse.Namespace) -> int:
         "impostor_clusters": clusters,
         "effects": {"comb": effects.get("comb"), "eq": effects.get("eq")},
         "identity_windows": effects.get("identity_windows"),
-        "gates": score_mod.gate_values(eps, segments, clusters, effects, h6),
+        "gates": score_mod.gate_values(
+            eps,
+            segments,
+            clusters,
+            effects,
+            h6,
+            score_mod.fallback_fc(read_json(root.path / pkg.BUILD_REL), eps),
+        ),
     }
     write_json(root, f"{folder}/{pkg.SCORE_NAME}", result)
     for line in score_mod.score_lines(result):

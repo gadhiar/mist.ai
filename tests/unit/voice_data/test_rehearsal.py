@@ -299,46 +299,6 @@ def dry_line(root: Path, clip: str) -> np.ndarray:
     return mix.normalise(mix.in_show(mix.trim(mix.resample(audio, rate), mix.RATE), mix.RATE), 0.05)
 
 
-def band_power(audio: np.ndarray, band: tuple[float, float]) -> float:
-    spectrum = np.abs(np.fft.rfft(audio)) ** 2
-    freqs = np.fft.rfftfreq(len(audio), 1.0 / mix.RATE)
-    return float(spectrum[(freqs >= band[0]) & (freqs < band[1])].sum())
-
-
-def snr_db(window: np.ndarray) -> float:
-    """Speech band against burst band, in dB."""
-    return 10 * math.log10(
-        band_power(window, mix.SPEECH_BAND_HZ) / band_power(window, mix.BURST_BAND_HZ)
-    )
-
-
-def c50_db(dry: np.ndarray, wet: np.ndarray) -> float:
-    """C50 of the response from the known `dry` line to `wet`, weighted by the line's spectrum.
-
-    The response is deconvolved in the speech band. Its early part runs from 10 ms before the
-    direct path (the codecs delay it by under 25 ms) to 50 ms after, its late part from there to
-    the end of the reverb tail; each part's energy is that of `dry` through it, so a bin weighs
-    what the line puts in it and the line's weak bins do not inflate the estimate's noise.
-    """
-    n = len(wet)
-    x = np.fft.rfft(dry, n)
-    y = np.fft.rfft(wet, n)
-    freqs = np.fft.rfftfreq(n, 1.0 / mix.RATE)
-    band = (freqs >= mix.SPEECH_BAND_HZ[0]) & (freqs < mix.SPEECH_BAND_HZ[1])
-    power = np.abs(x) ** 2
-    eps = 1e-4 * power[band].mean()
-    h = np.fft.irfft(np.where(band, y * np.conj(x) / (power + eps), 0.0), n)
-    ms = mix.RATE // 1000
-
-    def through(lo_ms: int, hi_ms: int) -> float:
-        lags = np.arange(lo_ms * ms, hi_ms * ms) % n
-        part = np.zeros(n)
-        part[lags] = h[lags]
-        return float(np.sum(np.fft.irfft(x * np.fft.rfft(part), n) ** 2))
-
-    return 10 * math.log10(through(-10, 50) / through(50, int(mix.TAIL_S * 1000)))
-
-
 # ---------------------------------------------------------------------------
 # sources.json
 # ---------------------------------------------------------------------------
@@ -511,20 +471,27 @@ def test_fallback_geometry_fails_the_centre_and_passes_the_downmix(built: Built)
     fallback = [ln for ln in lines if ln.geometry == "fallback"]
     assert len(fallback) >= 3
     assert built.build["fallback"]["copy_db"] == -15.0  # the plan's "a copy 15 dB down"
+    # The build measures each fallback line's centre cut as this test does, for the score.
+    recorded = {r["line"]: r for r in ep["fallback_fc"]}
+    assert sorted(recorded) == sorted(ln.line for ln in fallback)
     for line in fallback:
         dry = dry_line(built.root.path, line.clip)
         a = int(line.start_s * mix.RATE)
         b = a + len(dry)
         tail = b + int(mix.TAIL_S * mix.RATE)
-        snr = (snr_db(fc[a:b]), snr_db(down[a:b]))
-        c50 = (c50_db(dry, fc[a:tail]), c50_db(dry, down[a:tail]))
+        snr = (mix.snr_db(fc[a:b]), mix.snr_db(down[a:b]))
+        c50 = (mix.c50_db(dry, fc[a:tail]), mix.c50_db(dry, down[a:tail]))
         assert snr[0] < snr_gate < snr[1], snr
         assert c50[0] < c50_gate < c50[1], c50
+        assert recorded[line.line]["snr_db"] == pytest.approx(snr[0], abs=0.01)
+        assert recorded[line.line]["c50_db"] == pytest.approx(c50[0], abs=0.01)
     for line in (ln for ln in lines if ln.geometry == "off-centre"):
         a, b = int(line.start_s * mix.RATE), int(line.end_s * mix.RATE)
-        assert band_power(down[a:b], mix.SPEECH_BAND_HZ) > 100 * band_power(
+        assert mix.band_power(down[a:b], mix.SPEECH_BAND_HZ) > 100 * mix.band_power(
             fc[a:b], mix.SPEECH_BAND_HZ
         )
+    assert _episode(built, "aac-mkv")[0]["fallback_fc"]
+    assert _episode(built, "stereo-mp4")[0]["fallback_fc"] == []  # no centre channel
 
 
 def test_target_lines_carry_both_effects(built: Built) -> None:
@@ -676,11 +643,8 @@ def extracted(built: Built) -> Extracted:
                 )  # fmt: skip
                 expected["off"] += 1
             elif line.speaker == "target" and line.geometry == "fallback" and surround:
-                segments.append(
-                    _segment(n, sid, line, snr_db=4.0, c50_db=-1.0, kept=False,
-                             reasons=("snr",), audio="")
-                )  # fmt: skip
-                n += 1
+                # Extract writes one record, the downmix's, when the centre cut fails and the
+                # downmix passes; the centre cut's SNR and C50 are not recorded.
                 segments.append(
                     _segment(n, sid, line, channel="downmix", channel_reason="fc-failed:snr")
                 )
@@ -862,14 +826,19 @@ def test_score_reports_whether_each_effect_survived(scored: Scored) -> None:
     assert "comb filter survived: yes" in scored.out and "EQ survived: yes" in scored.out
 
 
-def test_score_reports_every_h6_gate(scored: Scored) -> None:
+def test_score_reports_every_h6_gate(built: Built, scored: Scored) -> None:
     h6 = {k for k, d in gates.load_defaults().items() if d.h6}
     entries = scored.score["gates"]
     assert set(entries) == h6
     for key, entry in entries.items():
         assert (entry["value"] is None) == bool(entry.get("reason")), key
         assert key in scored.out
-    assert entries["segment.snr_min_db"]["separates"] is True
+    for key, field in (("segment.snr_min_db", "snr_db"), ("segment.c50_min_db", "c50_db")):
+        measured = [r[field] for e in built.build["episodes"] for r in e["fallback_fc"]]
+        assert len(measured) >= 6  # both 5.1 episodes' fallback lines
+        assert entries[key]["fallback_fc_max"] == round(max(measured), 3)
+        assert entries[key]["fallback_fc_n"] == len(measured)
+        assert entries[key]["separates"] is True
     assert entries["segment.c50_min_db"]["value"] == 40.0
     assert entries["retrieval.anchor_floor"]["value"] is None
     assert entries["text.reject_max"]["value"] is None
@@ -917,7 +886,9 @@ def _probe(
         {"diar_cluster": "spk-03", "role": "other", "median_sim": {"ecapa": 0.2}},
     ]}]}  # fmt: skip
     rows = score_mod.impostor_clusters(eps, segments, report)
-    gates_found = score_mod.gate_values(eps, segments, rows, None, {"retrieval.anchor_floor": 0.6})
+    gates_found = score_mod.gate_values(
+        eps, segments, rows, None, {"retrieval.anchor_floor": 0.6}, {}
+    )
     return rows, gates_found
 
 
