@@ -7,9 +7,14 @@ object's type gloss so a question that names a type ("which organisations ...") 
 word with it, and F3 also drops the temporal qualifier. Notes have two views: the chunk's
 content (N0), or the note's title and the chunk's heading before it (N1), so a chunk whose body
 never names its subject still carries it. Whether any of these scores better than the served
-text is not assumed here: H13 (plan mist-read-path v5) measures every view on the dev probes
-with scripts/eval_harness/memory_view_probe.py and picks one fact view and one note view. The
-served text never changes with the view.
+text is not assumed here: H18 (plan mist-read-path v7, A39) runs the fetcher over the dev probes
+across a grid of settings, the fact view among them, and picks the fact view by a rule fixed
+before it runs; the note view is N0, H13's note choice. The served text never changes with the view.
+
+A facet, a group of facts sharing a subject, a relation and an object type
+(backend/memory/facets.py), has a view of its own: the relation's sentence with the object type's
+words in the object slot, "You are a member of an organization, organisation or company.", so a
+question that names the type matches the group as a whole.
 """
 
 from __future__ import annotations
@@ -20,9 +25,11 @@ from datetime import UTC, tzinfo
 from types import MappingProxyType
 from typing import Protocol
 
+from .facets import FacetSpec
+
 # `_template` and `_row_qualifier` are fact_render's own fallback and qualifier rules, reused
 # so a view's verb fallback and its time words cannot drift from the served sentence's.
-from .fact_render import RenderableFact, _row_qualifier, _template, render_fact
+from .fact_render import FACT_TEMPLATES, RenderableFact, _row_qualifier, _template, render_fact
 from .type_terms import TYPE_TERMS
 
 # The ontology type of the user's own node: a fact whose subject or object has it is about the
@@ -34,6 +41,10 @@ _YOU = "you"
 
 # Endings after which a joined part needs no full stop of its own.
 _SENTENCE_ENDS = (".", "!", "?", ":")
+
+# First letters that take "an" in a facet's object slot. Every first term in `TYPE_TERMS` but
+# User's ("user", never a facet's object type) is read with the sound of its first letter.
+_VOWELS = frozenset("aeiou")
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +213,39 @@ def render_fact_view(row: ViewableFact, spec: ViewSpec, tz: tzinfo = UTC) -> str
     return f"{sentence}."
 
 
+def render_facet_view(facet: FacetSpec, spec: ViewSpec) -> str | None:
+    """Render a facet as one sentence that words the group, not its members.
+
+    The object slot holds the object type's `TYPE_TERMS` words, so a question that names the
+    type in any of its words shares one with the view. Member names are left out so the text
+    does not change as members are added and shares no name with an unrelated query; the
+    temporal qualifier is left out because each member has its own.
+
+    Args:
+        facet: The facet.
+        spec: The fact view; only `second_person` applies, since the object slot is already the
+            type's words and the facet has no single qualifier.
+
+    Returns:
+        Under a second-person view with a `User` subject the `SECOND_PERSON_TEMPLATES` entry,
+        otherwise the `FACT_TEMPLATES` entry with the subject's name, for example "Ana
+        recommends a document or doc."; None for a relation in neither table, or an object type
+        outside `TYPE_TERMS`.
+    """
+    terms = TYPE_TERMS.get(facet.object_type)
+    if not terms:
+        return None
+    if spec.second_person and facet.subject_type == USER_TYPE:
+        template = SECOND_PERSON_TEMPLATES.get(facet.rel_type)
+    else:
+        template = FACT_TEMPLATES.get(facet.rel_type)
+    if template is None:
+        return None
+    article = "an" if terms[0][:1] in _VOWELS else "a"
+    words = terms[0] if len(terms) == 1 else f"{', '.join(terms[:-1])} or {terms[-1]}"
+    return template.format(s=facet.subject_name, o=f"{article} {words}") + "."
+
+
 def render_note_view(
     title: str | None, heading: str | None, content: str, spec: NoteViewSpec
 ) -> str:
@@ -239,6 +283,7 @@ __all__ = [
     "NoteViewSpec",
     "ViewSpec",
     "ViewableFact",
+    "render_facet_view",
     "render_fact_view",
     "render_note_view",
 ]

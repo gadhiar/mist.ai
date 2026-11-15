@@ -12,6 +12,8 @@ from datetime import timedelta, timezone
 
 import pytest
 
+from backend.memory import retrieval_view
+from backend.memory.facets import FacetSpec, facet_key
 from backend.memory.fact_render import FACT_TEMPLATES, render_fact
 from backend.memory.models import FactRow
 from backend.memory.retrieval_view import (
@@ -20,6 +22,7 @@ from backend.memory.retrieval_view import (
     SECOND_PERSON_TEMPLATES,
     NoteViewSpec,
     ViewSpec,
+    render_facet_view,
     render_fact_view,
     render_note_view,
 )
@@ -55,6 +58,24 @@ def _row(
         recorded_at="2024-03-05T10:00:00+00:00",
         confidence=0.9,
         source_utterance_id=None,
+    )
+
+
+def _facet(
+    *,
+    subject_name: str = "Wren",
+    subject_type: str | None = "User",
+    rel_type: str = "MEMBER_OF",
+    object_type: str = "Organization",
+) -> FacetSpec:
+    return FacetSpec(
+        facet_key=facet_key("s1", rel_type, object_type),
+        subject_id="s1",
+        subject_name=subject_name,
+        subject_type=subject_type,
+        rel_type=rel_type,
+        object_type=object_type,
+        member_keys=("k1", "k2"),
     )
 
 
@@ -207,6 +228,85 @@ class TestFactViews:
         row = _row(valid_from="2020", valid_to="2024-06")
         assert render_fact(row) == "Wren works at Brightgrid from 2020 until June 2024."
         assert render_fact_view(row, FACT_VIEWS["F3"]) == "You work at Brightgrid (organization)."
+
+
+class TestFacetViews:
+    @pytest.mark.parametrize("view", ["F2", "F3"])
+    def test_a_user_subject_reads_in_the_second_person(self, view):
+        assert render_facet_view(_facet(), FACT_VIEWS[view]) == (
+            "You are a member of an organization, organisation or company."
+        )
+
+    def test_a_user_subject_without_second_person_reads_by_name(self):
+        assert render_facet_view(_facet(), FACT_VIEWS["F0"]) == (
+            "Wren is a member of an organization, organisation or company."
+        )
+
+    def test_a_named_subject_takes_the_fact_template(self):
+        facet = _facet(
+            subject_name="Ana", subject_type="Person", rel_type="RECOMMENDS", object_type="Document"
+        )
+        for view in FACT_VIEWS.values():
+            assert render_facet_view(facet, view) == "Ana recommends a document or doc.", view.id
+
+    def test_the_article_follows_the_first_terms_first_letter(self):
+        assert render_facet_view(
+            _facet(rel_type="USES", object_type="Technology"), FACT_VIEWS["F3"]
+        ) == ("You use a technology, tech, tool or software.")
+        assert render_facet_view(
+            _facet(rel_type="EXPERIENCED", object_type="Event"), FACT_VIEWS["F3"]
+        ) == ("You experienced an event.")
+        assert (
+            render_facet_view(
+                _facet(rel_type="INTERESTED_IN", object_type="Abstraction"), FACT_VIEWS["F3"]
+            )
+            == "You are interested in an abstraction."
+        )
+
+    def test_a_one_term_type_has_no_list(self):
+        assert render_facet_view(
+            _facet(rel_type="WORKS_ON", object_type="Project"), FACT_VIEWS["F2"]
+        ) == ("You work on a project.")
+
+    def test_a_two_term_type_joins_with_or_alone(self):
+        assert render_facet_view(
+            _facet(rel_type="KNOWS_PERSON", object_type="Person"), FACT_VIEWS["F2"]
+        ) == ("You know a person or people.")
+
+    @pytest.mark.parametrize("rel_type", sorted(FACT_TEMPLATES))
+    def test_every_fact_template_key_renders(self, rel_type):
+        named = _facet(subject_name="Ana", subject_type="Person", rel_type=rel_type)
+        assert render_facet_view(named, FACT_VIEWS["F3"]) == (
+            FACT_TEMPLATES[rel_type].format(s="Ana", o="an organization, organisation or company")
+            + "."
+        )
+        user = _facet(rel_type=rel_type)
+        assert render_facet_view(user, FACT_VIEWS["F3"]) == (
+            SECOND_PERSON_TEMPLATES[rel_type].format(o="an organization, organisation or company")
+            + "."
+        )
+
+    def test_a_relation_in_neither_table_renders_none(self):
+        for subject_type in ("User", "Person"):
+            facet = _facet(rel_type="SAILED_WITH", subject_type=subject_type)
+            for view in FACT_VIEWS.values():
+                assert render_facet_view(facet, view) is None, (subject_type, view.id)
+
+    def test_no_member_names_and_no_qualifier(self):
+        text = render_facet_view(_facet(), FACT_VIEWS["F2"])
+        assert text is not None
+        assert "k1" not in text and "since" not in text
+
+    def test_is_exported(self):
+        assert "render_facet_view" in retrieval_view.__all__
+
+
+class TestModuleDocstring:
+    def test_names_h18_as_what_picks_the_view(self):
+        doc = retrieval_view.__doc__ or ""
+        assert "H18" in doc
+        assert "A39" in doc
+        assert "H13 (plan mist-read-path v5) measures" not in doc
 
 
 class TestNoteViews:
