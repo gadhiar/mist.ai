@@ -11,6 +11,9 @@ text is not assumed here: H18 (plan mist-read-path v7, A39) runs the fetcher ove
 across a grid of settings, the fact view among them, and picks the fact view by a rule fixed
 before it runs; the note view is N0, H13's note choice. The served text never changes with the view.
 
+The fact index (backend/memory/fact_index.py) embeds the view `MemoryConfig.fact_view` names and
+stores it beside the served text; a note candidate carries no view text, since N0 is its content.
+
 A facet, a group of facts sharing a subject, a relation and an object type
 (backend/memory/facets.py), has a view of its own: the relation's sentence with the object type's
 words in the object slot, "You are a member of an organization, organisation or company.", so a
@@ -86,6 +89,11 @@ FACT_VIEWS: Mapping[str, ViewSpec] = MappingProxyType(
         "F3": ViewSpec("F3", second_person=True, type_gloss=True, qualifiers=False),
     }
 )
+
+# The fact view the index embeds unless told otherwise. It is a setting, not a finding:
+# `MemoryConfig.fact_view` (`MIST_MEMORY_FACT_VIEW`) defaults to the same id, which a test pins,
+# and H18 chooses the value the setting ships with.
+DEFAULT_FACT_VIEW = "F3"
 
 NOTE_VIEWS: Mapping[str, NoteViewSpec] = MappingProxyType(
     {
@@ -276,6 +284,7 @@ def _gloss(type_name: str | None) -> str | None:
 
 
 __all__ = [
+    "DEFAULT_FACT_VIEW",
     "FACT_VIEWS",
     "NOTE_VIEWS",
     "SECOND_PERSON_TEMPLATES",

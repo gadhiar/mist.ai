@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+import sqlite_vec
 
 from backend.errors import MemoryIndexError
 from backend.memory.index_db import (
@@ -70,9 +71,9 @@ def _insert_fact(conn: sqlite3.Connection, row_key: str) -> None:
     with write_transaction(conn):
         conn.execute(
             "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, rel_type, "
-            "object_id, object_name, text, confidence, content_hash) "
+            "object_id, object_name, text, confidence, content_hash, view_text) "
             "VALUES (?, 'fk', 'user', 'User', 'USES', 'kestrel', 'Kestrel', 'User uses Kestrel.', "
-            "0.9, 'h')",
+            "0.9, 'h', 'You use Kestrel.')",
             (row_key,),
         )
 
@@ -129,9 +130,9 @@ def test_memory_path_opens_without_a_file(opened: Callable) -> None:
     assert _schema_names(conn) >= _SCHEMA_OBJECTS
 
 
-def test_schema_version_is_two() -> None:
-    # 2 added the entity types and the FTS type terms; a version 1 file has neither.
-    assert SCHEMA_VERSION == 2
+def test_schema_version_is_three() -> None:
+    # 2 added the entity types and the FTS type terms; 3 added the embedded view text.
+    assert SCHEMA_VERSION == 3
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -142,6 +143,13 @@ def test_facts_carry_both_entity_types(writer: sqlite3.Connection) -> None:
     columns = _columns(writer, "facts")
 
     assert {"subject_type", "object_type"} <= set(columns)
+
+
+def test_facts_carry_the_view_text_as_their_last_column(writer: sqlite3.Connection) -> None:
+    # Last, because `IndexedFact` is built from the row positionally and ends with it.
+    assert _columns(writer, "facts")[-1] == "view_text"
+    not_null = {row[1]: row[3] for row in writer.execute("PRAGMA table_info(facts)")}
+    assert not_null["view_text"] == 1
 
 
 def test_fts_mirror_has_a_type_terms_column(writer: sqlite3.Connection) -> None:
@@ -219,6 +227,56 @@ def test_a_version_1_file_is_rebuilt_in_place_to_this_schema(
     (warning,) = _warnings(caplog)
     assert "schema 1" in warning and f"schema {SCHEMA_VERSION}" in warning
     assert _MODEL in warning
+
+
+def _write_v2_file(path: Path) -> None:
+    """A schema 2 file: today's tables without `facts.view_text`, holding one row."""
+    conn = sqlite3.connect(path)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE facts (id INTEGER PRIMARY KEY, row_key TEXT NOT NULL UNIQUE, "
+        "fact_key TEXT NOT NULL, subject_id TEXT NOT NULL, subject_name TEXT NOT NULL, "
+        "subject_type TEXT, rel_type TEXT NOT NULL, object_id TEXT NOT NULL, "
+        "object_name TEXT NOT NULL, object_type TEXT, text TEXT NOT NULL, valid_from TEXT, "
+        "valid_to TEXT, recorded_at TEXT, confidence REAL NOT NULL, source_utterance_id TEXT, "
+        "content_hash TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(text, subject_name, object_name, type_terms, "
+        "tokenize='porter unicode61')"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE facts_vec USING vec0(embedding float[384] distance_metric=cosine)"
+    )
+    conn.execute(
+        "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, rel_type, object_id, "
+        "object_name, text, confidence, content_hash) "
+        "VALUES ('rk-v2', 'fk', 'user', 'User', 'USES', 'vim', 'Vim', 'User uses Vim.', 0.9, 'h')"
+    )
+    conn.execute("INSERT INTO index_meta VALUES ('schema_version', '2')")
+    conn.execute("INSERT INTO index_meta VALUES ('embedding_model_id', ?)", (_MODEL,))
+    conn.commit()
+    conn.close()
+
+
+def test_a_version_2_file_is_rebuilt_in_place_with_the_view_text(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_v2_file(db_path)
+    inode = db_path.stat().st_ino
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id=_MODEL))
+
+    assert "view_text" in _columns(conn, "facts")
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert get_meta(conn, META_INDEX_STATE) == STATE_REBUILDING
+    assert get_meta(conn, META_REBUILD_SCHEMA_VERSION) == "3"
+    assert db_path.stat().st_ino == inode
+    (warning,) = _warnings(caplog)
+    assert "schema 2" in warning and "schema 3" in warning
 
 
 def test_a_stale_model_rebuilds_and_stores_rebuilding_with_the_old_versions(

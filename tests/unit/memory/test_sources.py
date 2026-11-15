@@ -239,42 +239,57 @@ async def _gather(
     return await _source(idx, k=k).gather(query, embedder.generate_embedding(query), **kwargs)
 
 
+def _by_path(candidates: list) -> dict[str, object]:
+    """Candidates by note path; each path appears once, so the mapping loses nothing."""
+    by_path = {c.source.path: c for c in candidates}
+    assert len(by_path) == len(candidates)
+    return by_path
+
+
 @pytest.mark.asyncio
 async def test_notes_become_note_candidates_with_path_heading_and_author(
-    sidecar: VaultSidecarIndex, fake_embedder: FakeEmbedder
-) -> None:
-    candidates = await _gather(sidecar, fake_embedder)
-
-    by_id = {c.item_id: c for c in candidates}
-    file_level = by_id["projects/kestrel.md#(file)"]
-    stack = by_id["projects/kestrel.md#Stack"]
-    assert file_level.kind == "note"
-    assert file_level.source == NoteSource("projects/kestrel.md", None, "user")
-    assert stack.source == NoteSource("projects/kestrel.md", "Stack", "user")
-    assert stack.text == "The kestrel parser rewrite uses rust."
-    assert by_id["notes/garden.md#(file)"].source.authored_by == "mist"
-    assert note_item_id("projects/kestrel.md", None) == "projects/kestrel.md#(file)"
-
-
-@pytest.mark.asyncio
-async def test_note_ranks_are_the_sidecar_leg_ranks_as_two_pools(
     sidecar: VaultSidecarIndex, fake_embedder: FakeEmbedder
 ) -> None:
     rows = await sidecar.query_hybrid_readonly(
         fake_embedder.generate_embedding(_QUERY), _QUERY, k=20, match="any"
     )
-    expected = {
-        note_item_id(r["path"], r["heading"]): (r["vector_rank"], r["fts_rank"]) for r in rows
-    }
+    first = next(r for r in rows if r["path"] == "projects/kestrel.md")
+
+    candidates = await _gather(sidecar, fake_embedder)
+
+    kestrel = _by_path(candidates)["projects/kestrel.md"]
+    assert kestrel.kind == "note"
+    # The note's first chunk in the sidecar's order stands for it.
+    assert kestrel.item_id == note_item_id(first["path"], first["heading"])
+    assert kestrel.source == NoteSource("projects/kestrel.md", first["heading"], "user")
+    assert kestrel.text == first["content"]
+    assert kestrel.view_text is None
+    assert _by_path(candidates)["notes/garden.md"].source.authored_by == "mist"
+    assert note_item_id("projects/kestrel.md", None) == "projects/kestrel.md#(file)"
+
+
+@pytest.mark.asyncio
+async def test_note_ranks_are_the_best_sidecar_leg_ranks_of_the_path_as_two_pools(
+    sidecar: VaultSidecarIndex, fake_embedder: FakeEmbedder
+) -> None:
+    rows = await sidecar.query_hybrid_readonly(
+        fake_embedder.generate_embedding(_QUERY), _QUERY, k=20, match="any"
+    )
+    expected: dict[str, dict[str, int]] = {}
+    for row in rows:
+        best = expected.setdefault(row["path"], {})
+        for pool, rank in (
+            (NOTE_VECTOR_POOL, row["vector_rank"]),
+            (NOTE_FTS_POOL, row["fts_rank"]),
+        ):
+            if rank is not None:
+                best[pool] = min(best.get(pool, rank), rank)
 
     candidates = await _gather(sidecar, fake_embedder)
 
     assert candidates
     for candidate in candidates:
-        vector_rank, fts_rank = expected[candidate.item_id]
-        assert set(candidate.ranks) <= {NOTE_VECTOR_POOL, NOTE_FTS_POOL}
-        assert candidate.ranks.get(NOTE_VECTOR_POOL) == vector_rank
-        assert candidate.ranks.get(NOTE_FTS_POOL) == fts_rank
+        assert dict(candidate.ranks) == expected[candidate.source.path]
 
 
 @pytest.mark.asyncio
@@ -283,11 +298,81 @@ async def test_a_leg_that_missed_is_omitted_and_match_any_keeps_the_lexical_hit(
 ) -> None:
     candidates = await _gather(sidecar, fake_embedder)
 
-    by_id = {c.item_id: c for c in candidates}
+    by_path = _by_path(candidates)
     # "banana" is in no note, yet the kestrel note keeps its FTS rank (match="any").
-    assert NOTE_FTS_POOL in by_id["projects/kestrel.md#Stack"].ranks
+    assert NOTE_FTS_POOL in by_path["projects/kestrel.md"].ranks
     # The garden note shares no query word: only the vector leg found it.
-    assert by_id["notes/garden.md#(file)"].ranks.keys() == {NOTE_VECTOR_POOL}
+    assert by_path["notes/garden.md"].ranks.keys() == {NOTE_VECTOR_POOL}
+
+
+class _ScriptedSidecar:
+    """Returns fixed rows, best fused rank first, cut at `k`, and records each `k` asked for."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.asked: list[int] = []
+
+    async def query_hybrid_readonly(
+        self, embedding: list[float], text: str, *, k: int, match: str
+    ) -> list[dict[str, object]]:
+        self.asked.append(k)
+        return self.rows[:k]
+
+
+def _chunk(
+    path: str, heading: str | None, vector_rank: int | None, fts_rank: int | None
+) -> dict[str, object]:
+    return {
+        "path": path,
+        "heading": heading,
+        "content": f"{path} {heading} content",
+        "frontmatter": None,
+        "mtime": 1,
+        "vector_rank": vector_rank,
+        "fts_rank": fts_rank,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_note_returned_as_three_chunks_is_one_candidate_with_the_best_rank_per_pool(
+    fake_embedder: FakeEmbedder,
+) -> None:
+    sidecar = _ScriptedSidecar(
+        [
+            _chunk("notes/bread.md", "Method", None, 4),
+            _chunk("notes/other.md", None, 2, None),
+            _chunk("notes/bread.md", "Flour", 5, 1),
+            _chunk("notes/bread.md", None, 3, 6),
+        ]
+    )
+
+    candidates = await VaultCandidates(sidecar, vault_root=_VAULT_ROOT, tz=_TZ, k=10).gather(
+        _QUERY, fake_embedder.generate_embedding(_QUERY)
+    )
+
+    assert [c.source.path for c in candidates] == ["notes/bread.md", "notes/other.md"]
+    bread = candidates[0]
+    assert dict(bread.ranks) == {NOTE_VECTOR_POOL: 3, NOTE_FTS_POOL: 1}
+    # Its text, id and heading are the first chunk's; the note view is N0, so no view text.
+    assert bread.item_id == "notes/bread.md#Method"
+    assert bread.source.heading == "Method"
+    assert bread.text == "notes/bread.md Method content"
+    assert bread.view_text is None
+
+
+@pytest.mark.asyncio
+async def test_the_fetch_counts_paths_toward_k(fake_embedder: FakeEmbedder) -> None:
+    rows = [_chunk("notes/bread.md", f"Part {n}", n, None) for n in range(1, 5)]
+    rows += [_chunk("notes/other.md", None, 5, None), _chunk("notes/third.md", None, 6, None)]
+    sidecar = _ScriptedSidecar(rows)
+
+    candidates = await VaultCandidates(sidecar, vault_root=_VAULT_ROOT, tz=_TZ, k=2).gather(
+        _QUERY, fake_embedder.generate_embedding(_QUERY)
+    )
+
+    # Four chunks of one note fill the first fetch of 2k rows with one path, so it asks again.
+    assert sidecar.asked == [4, 8]
+    assert [c.source.path for c in candidates] == ["notes/bread.md", "notes/other.md"]
 
 
 _EXCLUDED = {"users/user.md", "episodes/2026-10-22-e1.md", "sessions/2026-10-01-legacy.md"}
@@ -393,10 +478,12 @@ async def test_k_caps_the_pool_and_exclusions_are_refilled(
         "legacy_note_paths": {"sessions/2026-10-01-legacy.md"},
     }
 
-    candidates = await _gather(sidecar, fake_embedder, k=3, **excluded)
+    candidates = await _gather(sidecar, fake_embedder, k=2, **excluded)
 
-    assert len(candidates) == 3
-    assert {c.source.path for c in candidates} <= {"projects/kestrel.md", "notes/garden.md"}
+    assert [c.source.path for c in candidates].count("projects/kestrel.md") == 1
+    assert {c.source.path for c in candidates} == {"projects/kestrel.md", "notes/garden.md"}
+    one = await _gather(sidecar, fake_embedder, k=1, **excluded)
+    assert len(one) == 1
 
 
 @pytest.mark.asyncio
@@ -434,9 +521,9 @@ async def test_stopwords_do_not_give_an_unrelated_note_a_lexical_rank(
 
     candidates = await _gather(sidecar, fake_embedder, query="the kestrel !")
 
-    by_id = {c.item_id: c for c in candidates}
-    assert NOTE_FTS_POOL not in by_id["notes/weather.md#(file)"].ranks
-    assert NOTE_FTS_POOL in by_id["projects/kestrel.md#(file)"].ranks
+    by_path = _by_path(candidates)
+    assert NOTE_FTS_POOL not in by_path["notes/weather.md"].ranks
+    assert NOTE_FTS_POOL in by_path["projects/kestrel.md"].ranks
 
 
 @pytest.mark.asyncio
@@ -454,17 +541,17 @@ async def test_a_note_dates_from_last_updated_and_falls_back_to_its_mtime(
 
     candidates = await _gather(sidecar, fake_embedder)
 
-    by_id = {c.item_id: c for c in candidates}
+    by_path = _by_path(candidates)
     # A date-only `last_updated` (what MIST writes) names a local day, kept as its midnight so
     # recency scoring is unchanged, and flagged so the block never invents a part of the day.
-    dated = by_id["projects/kestrel.md#Stack"]
+    dated = by_path["projects/kestrel.md"]
     assert dated.when == datetime(2026, 10, 20, tzinfo=_TZ)
     assert dated.when_is_day is True
     # A datetime `last_updated` and the mtime are instants.
-    timed = by_id["notes/parser-log.md#(file)"]
+    timed = by_path["notes/parser-log.md"]
     assert timed.when == datetime(2026, 10, 21, 9, 30, tzinfo=_TZ)
     assert timed.when_is_day is False
-    from_mtime = by_id["notes/garden.md#(file)"]
+    from_mtime = by_path["notes/garden.md"]
     assert from_mtime.when == datetime.fromtimestamp(_GARDEN_MTIME, UTC)
     assert from_mtime.when_is_day is False
 

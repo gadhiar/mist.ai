@@ -23,7 +23,9 @@ from backend.errors import MemoryConfigError
 from backend.user_timezone import USER_TIMEZONE_ENV, ZoneLoader, resolve_user_timezone
 
 from .models import ServingProfile
+from .retrieval_view import FACT_VIEWS
 
+FactViewId = Literal["F0", "F1", "F2", "F3"]
 RerankBackend = Literal["local", "remote", "off"]
 RerankDevice = Literal["cpu", "cuda"]
 RemoteScoreKind = Literal["logit", "probability"]
@@ -86,6 +88,7 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_BLOCK_TOKENS_LOW",
     "MIST_MEMORY_LIST_MAX_ITEMS",
     "MIST_MEMORY_RESCAN_INTERVAL_S",
+    "MIST_MEMORY_FACT_VIEW",
     USER_TIMEZONE_ENV,
 )
 
@@ -220,6 +223,10 @@ class MemoryConfig:
         list_max_items: Most siblings one list item can bring into the block, 2 to 25.
         rescan_interval_s: Seconds between two rescans of the graph for changed facts, at
             least 30.
+        fact_view: The fact view the index embeds, F0 to F3 (`retrieval_view.FACT_VIEWS`).
+            The index's content hash covers the view text, so a FactIndex built with a changed
+            setting rewrites and re-embeds, at its next diff, every row whose view text the
+            change alters. The default equals `retrieval_view.DEFAULT_FACT_VIEW`.
         tz: Zone used to read temporal phrases, from `MIST_TIMEZONE`. Resolved once in
             `from_env`.
         tz_name: The IANA name `tz` came from, or None when `tz` is UTC because
@@ -247,6 +254,7 @@ class MemoryConfig:
     block_tokens_low: int = 0
     list_max_items: int = 10
     rescan_interval_s: int = 300
+    fact_view: FactViewId = "F3"
     tz: tzinfo = UTC
     tz_name: str | None = None
 
@@ -278,6 +286,7 @@ class MemoryConfig:
         _require_choice("rerank_backend", self.rerank_backend, _RERANK_BACKENDS)
         _require_choice("rerank_device", self.rerank_device, _RERANK_DEVICES)
         _require_choice("rerank_remote_scores", self.rerank_remote_scores, _REMOTE_SCORE_KINDS)
+        _require_choice("fact_view", self.fact_view, tuple(FACT_VIEWS))
         weights = (self.rerank_weight, self.recency_weight, self.confidence_weight)
         if any(weight < 0 for weight in weights):
             raise MemoryConfigError(f"weights must not be negative, got {weights}")
@@ -337,6 +346,7 @@ class MemoryConfig:
             block_tokens_low=_env_int("MIST_MEMORY_BLOCK_TOKENS_LOW", 0),
             list_max_items=_env_int("MIST_MEMORY_LIST_MAX_ITEMS", 10),
             rescan_interval_s=_env_int("MIST_MEMORY_RESCAN_INTERVAL_S", 300),
+            fact_view=_env("MIST_MEMORY_FACT_VIEW") or "F3",  # type: ignore[arg-type]
             tz=tz,
             tz_name=tz_name,
         )

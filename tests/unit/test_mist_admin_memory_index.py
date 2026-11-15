@@ -48,7 +48,15 @@ from backend.memory.index_db import (  # noqa: E402
     open_reader,
 )
 from backend.memory.models import FactRow, fact_key  # noqa: E402
+from backend.memory.retrieval_view import (  # noqa: E402
+    DEFAULT_FACT_VIEW,
+    FACT_VIEWS,
+    ViewSpec,
+    render_fact_view,
+)
 from tests.fakes.memory_fakes import FakeEmbedder  # noqa: E402
+
+_DEFAULT_VIEW = FACT_VIEWS[DEFAULT_FACT_VIEW]
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection  # noqa: E402
 
 _MODEL = "all-MiniLM-L6-v2"
@@ -208,15 +216,70 @@ def _dump(path: Path) -> dict[str, list[tuple]]:
         conn.close()
 
 
-def _config(tmp_path: Path, *, index_path: str | None = None) -> KnowledgeConfig:
+def _view_texts(path: Path) -> list[str]:
+    """Every stored row's embedded view text, sorted."""
+    conn = open_reader(path, embedding_model_id=_MODEL)
+    try:
+        return sorted(text for (text,) in conn.execute("SELECT view_text FROM facts"))
+    finally:
+        conn.close()
+
+
+def _expected_view_texts(view: ViewSpec) -> list[str]:
+    """The view text of each `_FINAL` record under `view`, sorted."""
+    fields = (
+        "subject_id",
+        "subject_name",
+        "subject_type",
+        "rel_type",
+        "object_id",
+        "object_name",
+        "object_type",
+        "valid_from",
+        "valid_to",
+        "recorded_at",
+        "confidence",
+        "source_utterance_id",
+    )
+    rows = [
+        FactRow(row_key="-", fact_key="-", **{name: record[name] for name in fields})
+        for record in _FINAL
+    ]
+    return sorted(render_fact_view(row, view, UTC) for row in rows)
+
+
+def _config(
+    tmp_path: Path, *, index_path: str | None = None, fact_view: str = "F3"
+) -> KnowledgeConfig:
     return KnowledgeConfig(
         neo4j=Neo4jConfig(),
         llm=LLMConfig(),
         embedding=EmbeddingConfig(model_name=_MODEL, device="cpu"),
         extraction=ExtractionConfig(),
         event_store=EventStoreConfig(db_path=str(tmp_path / "store" / "event_store.db")),
-        memory=MemoryConfig(index_path=index_path),
+        memory=MemoryConfig(index_path=index_path, fact_view=fact_view),  # type: ignore[arg-type]
     )
+
+
+class _RecordingFactIndex(FactIndex):
+    """A FactIndex that records the view each construction is given."""
+
+    views: list[ViewSpec] = []
+
+    def __init__(self, *args: object, view: ViewSpec, **kwargs: object) -> None:
+        type(self).views.append(view)
+        super().__init__(*args, view=view, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def recorded_views(monkeypatch: pytest.MonkeyPatch) -> list[ViewSpec]:
+    """Swap in `_RecordingFactIndex` where the rebuild imports FactIndex; the views it saw."""
+    import backend.memory.fact_index as fact_index_module
+
+    views: list[ViewSpec] = []
+    monkeypatch.setattr(_RecordingFactIndex, "views", views)
+    monkeypatch.setattr(fact_index_module, "FactIndex", _RecordingFactIndex)
+    return views
 
 
 @dataclass
@@ -269,6 +332,7 @@ class TestRebuildEqualsIncremental:
                 index_path=rebuilt,
                 embedding_model_id=_MODEL,
                 tz=UTC,
+                view=_DEFAULT_VIEW,
                 debounce_s=0.0,
                 rescan_interval_s=300.0,
             )
@@ -292,6 +356,7 @@ class TestRebuildEqualsIncremental:
                 index_path=path,
                 embedding_model_id=_MODEL,
                 tz=UTC,
+                view=_DEFAULT_VIEW,
                 debounce_s=0.0,
                 rescan_interval_s=300.0,
             )
@@ -304,6 +369,27 @@ class TestRebuildEqualsIncremental:
         finally:
             reader.close()
         assert META_INDEX_STATE not in keys
+
+    def test_the_rebuild_indexes_under_the_view_it_is_given(
+        self, tmp_path: Path, recorded_views: list[ViewSpec]
+    ) -> None:
+        path = tmp_path / "memory_index.db"
+
+        asyncio.run(
+            mist_admin.rebuild_fact_index(
+                executor=FakeGraph(_FINAL).executor,
+                embedder=FakeEmbedder(),
+                index_path=path,
+                embedding_model_id=_MODEL,
+                tz=UTC,
+                view=FACT_VIEWS["F1"],
+                debounce_s=0.0,
+                rescan_interval_s=300.0,
+            )
+        )
+
+        assert recorded_views == [FACT_VIEWS["F1"]]
+        assert _view_texts(path) == _expected_view_texts(FACT_VIEWS["F1"])
 
     def test_the_dropped_tables_are_every_table_the_fact_ddl_creates(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -350,6 +436,19 @@ class TestCommand:
         reference = tmp_path / "reference" / "memory_index.db"
         _build_incrementally(reference, [_FINAL])
         assert _dump(path) == _dump(reference)
+
+    @pytest.mark.parametrize("view", ["F0", "F2", "F3"])
+    def test_the_rebuild_passes_the_configured_fact_view_to_the_index(
+        self, cli: _Cli, tmp_path: Path, recorded_views: list[ViewSpec], view: str
+    ) -> None:
+        path = tmp_path / "memory_index.db"
+        cli.config = _config(tmp_path, fact_view=view)
+
+        rc = mist_admin.main(["memory-index-rebuild", "--facts", "--index-path", str(path)])
+
+        assert rc == 0
+        assert recorded_views == [FACT_VIEWS[view]]
+        assert _view_texts(path) == _expected_view_texts(FACT_VIEWS[view])
 
     def test_the_index_defaults_to_beside_the_event_store(
         self, cli: _Cli, tmp_path: Path, capsys: pytest.CaptureFixture[str]

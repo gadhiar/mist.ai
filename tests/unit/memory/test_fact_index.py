@@ -5,16 +5,18 @@ import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
 
 from backend.errors import EmbeddingError, MemoryIndexError
+from backend.memory import retrieval_view
 from backend.memory.fact_index import FactIndex, content_hash, fact_row_key, structural_row_key
 from backend.memory.fact_render import render_fact
 from backend.memory.index_db import open_index, open_reader, write_transaction
 from backend.memory.models import FactRow, fact_key
+from backend.memory.retrieval_view import FACT_VIEWS, render_fact_view
 from tests.fakes.memory_fakes import FakeEmbedder
 
 _MODEL = "all-MiniLM-L6-v2"
@@ -94,8 +96,20 @@ def reader(conn: sqlite3.Connection, db_path: Path) -> Iterator[sqlite3.Connecti
 def index(
     conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
 ) -> FactIndex:
-    """A FactIndex writing on `conn` and searching on `reader`, rendering in UTC."""
+    """A FactIndex writing on `conn` and searching on `reader`, rendering in UTC, default view."""
     return FactIndex(conn, fake_embedder, tz=UTC, reader=reader)
+
+
+def _viewed(
+    conn: sqlite3.Connection,
+    reader: sqlite3.Connection,
+    embedder: FakeEmbedder,
+    view: str,
+    *,
+    tz: tzinfo = UTC,
+) -> FactIndex:
+    """A FactIndex on the same connections that embeds the fact view `view`."""
+    return FactIndex(conn, embedder, tz=tz, reader=reader, view=FACT_VIEWS[view])
 
 
 # -- upsert and delete -------------------------------------------------------------------------
@@ -111,13 +125,52 @@ def test_upsert_stores_the_row_under_its_row_key(index: FactIndex) -> None:
     assert stored.fact_key == row.fact_key
     assert stored.source_utterance_id == "utt-7"
     assert stored.text == "User works at Acme."
-    assert stored.content_hash == content_hash(row, "User works at Acme.")
+    assert stored.view_text == "You work at Acme (organization)."
+    assert stored.content_hash == content_hash(
+        row, "User works at Acme.", "You work at Acme (organization)."
+    )
 
 
-def test_upsert_embeds_the_rendered_text(index: FactIndex, fake_embedder: FakeEmbedder) -> None:
-    index.upsert([_fact("rk-acme", "Acme")])
+def test_upsert_embeds_the_default_view_f3_not_the_served_text(
+    index: FactIndex, fake_embedder: FakeEmbedder
+) -> None:
+    index.upsert([_fact("rk-acme", "Acme", valid_from="2024-03-05")])
 
-    assert fake_embedder.calls == ["User works at Acme."]
+    # F3: second person, the object's type gloss, no temporal qualifier.
+    assert fake_embedder.calls == ["You work at Acme (organization)."]
+    stored = index.get("rk-acme")
+    assert stored is not None
+    assert stored.text == "User works at Acme since 5 March 2024."
+
+
+def test_every_read_carries_the_view_text(index: FactIndex) -> None:
+    row = _fact("rk-acme", "Acme", source_utterance_id="utt-7")
+    index.upsert([row])
+    view = "You work at Acme (organization)."
+    now = _at("2026-06-01T00:00:00")
+
+    got = index.get("rk-acme")
+    (version,) = index.versions(row.fact_key)
+    (sibling,) = index.siblings("user", "WORKS_AT", "utt-7", now=now)
+    (group,) = index.search_fts("acme")
+
+    assert got is not None
+    assert {got.view_text, version.view_text, sibling.view_text} == {view}
+    assert group.versions[0].view_text == view
+
+
+@pytest.mark.parametrize("view", list(FACT_VIEWS))
+def test_upsert_embeds_the_view_it_is_given(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder, view: str
+) -> None:
+    row = _fact("rk-acme", "Acme", valid_from="2024-03-05")
+
+    _viewed(conn, reader, fake_embedder, view).upsert([row])
+
+    expected = render_fact_view(row, FACT_VIEWS[view], UTC)
+    assert fake_embedder.calls == [expected]
+    stored = reader.execute("SELECT view_text FROM facts WHERE row_key = 'rk-acme'").fetchone()
+    assert stored == (expected,)
 
 
 def test_upsert_skips_the_embed_when_the_content_hash_is_unchanged(
@@ -128,23 +181,42 @@ def test_upsert_skips_the_embed_when_the_content_hash_is_unchanged(
 
     report = index.upsert([row])
 
-    assert fake_embedder.calls == ["User works at Acme."]
+    assert fake_embedder.calls == ["You work at Acme (organization)."]
     assert (report.inserted, report.updated, report.unchanged, report.embedded) == (0, 0, 1, 0)
 
 
-def test_upsert_re_embeds_when_the_rendering_changes(
-    index: FactIndex, fake_embedder: FakeEmbedder
+def test_upsert_re_embeds_when_the_view_changes(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
 ) -> None:
+    # F2 keeps the qualifier, so a new end date changes the view as well as the served text.
+    index = _viewed(conn, reader, fake_embedder, "F2")
     row = _fact("rk-acme", "Acme")
     index.upsert([row])
 
     report = index.upsert([replace(row, valid_to="2026-03-01")])
 
-    assert fake_embedder.calls[-1] == "User works at Acme until 1 March 2026."
+    assert fake_embedder.calls[-1] == "You work at Acme (organization) until 1 March 2026."
     assert (report.updated, report.embedded) == (1, 1)
     stored = index.get("rk-acme")
     assert stored is not None
     assert stored.text == "User works at Acme until 1 March 2026."
+
+
+def test_a_served_text_change_the_view_drops_rewrites_without_re_embedding(
+    index: FactIndex, fake_embedder: FakeEmbedder
+) -> None:
+    # F3 drops the qualifier: the served text changes, the embedded view does not.
+    row = _fact("rk-acme", "Acme")
+    index.upsert([row])
+
+    report = index.upsert([replace(row, valid_to="2026-03-01")])
+
+    assert (report.updated, report.embedded) == (1, 0)
+    assert len(fake_embedder.calls) == 1
+    stored = index.get("rk-acme")
+    assert stored is not None
+    assert stored.text == "User works at Acme until 1 March 2026."
+    assert stored.view_text == "You work at Acme (organization)."
 
 
 def test_served_field_change_updates_the_row_without_re_embedding(
@@ -165,15 +237,16 @@ def test_served_field_change_updates_the_row_without_re_embedding(
 def test_a_different_zone_changes_the_hash_and_re_embeds(
     conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
 ) -> None:
+    # Under a view that keeps the qualifier, whose date the zone moves.
     row = _fact("rk-acme", "Acme", valid_from="2026-03-01T23:30:00+00:00")
-    FactIndex(conn, fake_embedder, tz=UTC, reader=reader).upsert([row])
+    _viewed(conn, reader, fake_embedder, "F2").upsert([row])
     east = timezone(timedelta(hours=5))
 
-    report = FactIndex(conn, fake_embedder, tz=east, reader=reader).upsert([row])
+    report = _viewed(conn, reader, fake_embedder, "F2", tz=east).upsert([row])
 
     assert render_fact(row, UTC) != render_fact(row, east)
     assert (report.updated, report.embedded) == (1, 1)
-    assert fake_embedder.calls[-1] == "User works at Acme since 2 March 2026."
+    assert fake_embedder.calls[-1] == "You work at Acme (organization) since 2 March 2026."
 
 
 def test_delete_removes_the_row_from_every_search(index: FactIndex) -> None:
@@ -241,8 +314,9 @@ def test_an_embedder_failure_raises_memory_index_error_and_writes_nothing(
     before = _snapshot_of(conn)
     original = error_type("cannot embed 'User works at Northwind.'")
     failing = FactIndex(conn, _FailingEmbedder(original), tz=UTC, reader=reader)
-    # rk-a changes its text, rk-c is new and rk-b is absent, so diff_apply would also delete.
-    rows = [_fact("rk-a", "Acme", valid_to="2026-03-01"), _fact("rk-c", "Northwind")]
+    # rk-a changes its view (the type gloss), rk-c is new and rk-b is absent, so diff_apply
+    # would also delete.
+    rows = [_fact("rk-a", "Acme", object_type="Project"), _fact("rk-c", "Northwind")]
 
     with pytest.raises(MemoryIndexError) as caught:
         getattr(failing, method)(rows)
@@ -668,14 +742,20 @@ def test_name_search_fetches_a_bounded_number_of_rows(
 # -- diff_apply --------------------------------------------------------------------------------
 
 
-def _table(index: FactIndex, conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+def _table(index: FactIndex, conn: sqlite3.Connection) -> dict[str, tuple[str, str | None, str]]:
     rows = conn.execute("SELECT row_key FROM facts").fetchall()
-    out: dict[str, tuple[str, str]] = {}
+    out: dict[str, tuple[str, str | None, str]] = {}
     for (row_key,) in rows:
         stored = index.get(row_key)
         assert stored is not None
-        out[row_key] = (stored.text, stored.content_hash)
+        out[row_key] = (stored.text, stored.view_text, stored.content_hash)
     return out
+
+
+def _expected_row(row: FactRow, view: str = "F3") -> tuple[str, str, str]:
+    text = render_fact(row)
+    view_text = render_fact_view(row, FACT_VIEWS[view])
+    return text, view_text, content_hash(row, text, view_text)
 
 
 def test_diff_apply_leaves_the_table_equal_to_the_snapshot(
@@ -690,9 +770,7 @@ def test_diff_apply_leaves_the_table_equal_to_the_snapshot(
     report = index.diff_apply(snapshot)
 
     assert (report.inserted, report.updated, report.deleted, report.unchanged) == (1, 1, 1, 0)
-    assert _table(index, conn) == {
-        row.row_key: (render_fact(row), content_hash(row, render_fact(row))) for row in snapshot
-    }
+    assert _table(index, conn) == {row.row_key: _expected_row(row) for row in snapshot}
     assert conn.execute("SELECT count(*) FROM facts_fts").fetchone()[0] == 2
     assert conn.execute("SELECT count(*) FROM facts_vec").fetchone()[0] == 2
 
@@ -719,6 +797,147 @@ def test_diff_apply_of_an_empty_snapshot_empties_the_index(
 
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM facts_vec").fetchone()[0] == 0
+
+
+# -- the embedded view -------------------------------------------------------------------------
+
+
+def _vectors(conn: sqlite3.Connection) -> dict[str, bytes]:
+    return dict(
+        conn.execute(
+            "SELECT f.row_key, v.embedding FROM facts_vec v JOIN facts f ON f.id = v.rowid"
+        ).fetchall()
+    )
+
+
+def _dated_snapshot() -> list[FactRow]:
+    """Facts that each carry a qualifier, so F2's view and F3's differ for every one."""
+    return [
+        _fact("rk-acme", "Acme", valid_from="2024-03-05"),
+        _fact("rk-rust", "Rust", rel_type="LEARNING", object_type="Skill", valid_from="2025-01-02"),
+        _fact(
+            "rk-ana",
+            "Kestrel",
+            subject_name="Ana",
+            subject_type="Person",
+            rel_type="WORKS_ON",
+            object_type="Project",
+            valid_to="2026-02-01",
+        ),
+    ]
+
+
+def test_a_diff_apply_under_another_view_rewrites_and_re_embeds_every_row(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    snapshot = _dated_snapshot()
+    _viewed(conn, reader, fake_embedder, "F2").diff_apply(snapshot)
+    before = _vectors(conn)
+
+    report = _viewed(conn, reader, fake_embedder, "F3").diff_apply(snapshot)
+
+    assert (report.inserted, report.updated, report.deleted, report.unchanged) == (0, 3, 0, 0)
+    assert report.embedded == len(snapshot)
+    assert fake_embedder.calls[-3:] == [render_fact_view(row, FACT_VIEWS["F3"]) for row in snapshot]
+    after = _vectors(conn)
+    assert after.keys() == before.keys()
+    assert all(after[key] != before[key] for key in after)
+    index = _viewed(conn, reader, fake_embedder, "F3")
+    assert _table(index, conn) == {row.row_key: _expected_row(row, "F3") for row in snapshot}
+
+
+def test_a_diff_apply_under_the_same_view_embeds_nothing(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    snapshot = _dated_snapshot()
+    _viewed(conn, reader, fake_embedder, "F2").diff_apply(snapshot)
+
+    report = _viewed(conn, reader, fake_embedder, "F2").diff_apply(snapshot)
+
+    assert (report.updated, report.unchanged, report.embedded) == (0, 3, 0)
+
+
+def test_a_subject_type_changed_to_user_keeps_the_text_and_re_embeds(
+    index: FactIndex, fake_embedder: FakeEmbedder
+) -> None:
+    row = _fact("rk-acme", "Acme", subject_type="Person")
+    index.upsert([row])
+
+    report = index.upsert([replace(row, subject_type="User")])
+
+    assert (report.updated, report.embedded) == (1, 1)
+    assert fake_embedder.calls == [
+        "User works at Acme (organization).",
+        "You work at Acme (organization).",
+    ]
+    stored = index.get("rk-acme")
+    assert stored is not None
+    assert stored.text == "User works at Acme."
+
+
+def _snapshot_of_two_relations() -> list[FactRow]:
+    return [
+        _fact("rk-acme", "Acme"),
+        _fact("rk-brightgrid", "Brightgrid"),
+        _fact("rk-vim", "Vim", rel_type="USES", object_type="Technology"),
+        _fact("rk-ana", "Ana", rel_type="KNOWS", object_type="Person"),
+    ]
+
+
+def test_a_patched_second_person_template_re_embeds_exactly_its_rows(
+    index: FactIndex, fake_embedder: FakeEmbedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = _snapshot_of_two_relations()
+    index.diff_apply(snapshot)
+    calls_before = len(fake_embedder.calls)
+    patched = dict(retrieval_view.SECOND_PERSON_TEMPLATES, WORKS_AT="You are employed at {o}")
+    monkeypatch.setattr(retrieval_view, "SECOND_PERSON_TEMPLATES", patched)
+
+    report = index.diff_apply(snapshot)
+
+    assert (report.updated, report.unchanged, report.embedded) == (2, 2, 2)
+    assert fake_embedder.calls[calls_before:] == [
+        "You are employed at Acme (organization).",
+        "You are employed at Brightgrid (organization).",
+    ]
+    stored = index.get("rk-acme")
+    assert stored is not None
+    assert stored.text == "User works at Acme."
+
+
+def test_an_unpatched_snapshot_re_embeds_nothing(
+    index: FactIndex, fake_embedder: FakeEmbedder
+) -> None:
+    snapshot = _snapshot_of_two_relations()
+    index.diff_apply(snapshot)
+
+    report = index.diff_apply(snapshot)
+
+    assert (report.updated, report.unchanged, report.embedded) == (0, 4, 0)
+
+
+def test_fts_indexes_the_served_text_and_vector_search_the_view(
+    index: FactIndex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The gloss word is also a type term, so a patched template supplies a word that only the
+    # view holds.
+    patched = dict(retrieval_view.SECOND_PERSON_TEMPLATES, WORKS_AT="You moonlight at {o}")
+    monkeypatch.setattr(retrieval_view, "SECOND_PERSON_TEMPLATES", patched)
+    index.upsert([_fact("rk-acme", "Acme"), _fact("rk-rust", "Rust", rel_type="LEARNING")])
+    query = FakeEmbedder().generate_embedding("moonlight")
+
+    assert index.search_fts("moonlight") == []
+    assert index.search_vector(query, limit=1)[0].versions[0].row_key == "rk-acme"
+    assert [group.versions[0].row_key for group in index.search_fts("works acme")] == ["rk-acme"]
+
+
+def test_the_content_hash_covers_the_view_text() -> None:
+    row = _fact("rk-acme", "Acme")
+    text = render_fact(row)
+
+    assert content_hash(row, text, "You work at Acme.") != content_hash(
+        row, text, "You work at Acme (organization)."
+    )
 
 
 # -- versions and read-time currency -----------------------------------------------------------
@@ -858,9 +1077,14 @@ def test_an_untyped_row_stores_no_type(index: FactIndex) -> None:
 def test_the_content_hash_covers_both_entity_types() -> None:
     row = _fact("rk-acme", "Acme")
     text = render_fact(row)
+    view = "You work at Acme."
 
-    assert content_hash(row, text) != content_hash(replace(row, object_type="Project"), text)
-    assert content_hash(row, text) != content_hash(replace(row, subject_type="Person"), text)
+    assert content_hash(row, text, view) != content_hash(
+        replace(row, object_type="Project"), text, view
+    )
+    assert content_hash(row, text, view) != content_hash(
+        replace(row, subject_type="Person"), text, view
+    )
 
 
 def test_a_type_scoped_query_matches_a_fact_by_its_type_with_no_name_in_it(
@@ -905,6 +1129,22 @@ def test_an_untyped_fact_is_not_matched_by_a_type_term(index: FactIndex) -> None
 
 
 def test_a_type_change_rewrites_the_type_terms_without_re_embedding(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    # F1 has no type gloss, so its view, and so the embedding, do not depend on the type.
+    index = _viewed(conn, reader, fake_embedder, "F1")
+    row = _fact("rk-kestrel", "Kestrel", rel_type="USES", object_type="Concept")
+    index.upsert([row])
+
+    report = index.upsert([replace(row, object_type="Technology")])
+
+    assert (report.updated, report.embedded) == (1, 0)
+    assert len(fake_embedder.calls) == 1
+    assert [group.fact_key for group in index.search_fts("technology")] == [row.fact_key]
+    assert index.search_fts("concept") == []
+
+
+def test_an_object_type_change_re_embeds_under_a_glossed_view(
     index: FactIndex, fake_embedder: FakeEmbedder
 ) -> None:
     row = _fact("rk-kestrel", "Kestrel", rel_type="USES", object_type="Concept")
@@ -912,11 +1152,8 @@ def test_a_type_change_rewrites_the_type_terms_without_re_embedding(
 
     report = index.upsert([replace(row, object_type="Technology")])
 
-    # The rendered text and so the embedding do not depend on the type.
-    assert (report.updated, report.embedded) == (1, 0)
-    assert len(fake_embedder.calls) == 1
-    assert [group.fact_key for group in index.search_fts("technology")] == [row.fact_key]
-    assert index.search_fts("concept") == []
+    assert (report.updated, report.embedded) == (1, 1)
+    assert fake_embedder.calls == ["You use Kestrel (concept).", "You use Kestrel (technology)."]
 
 
 def test_name_search_ignores_the_type_terms(index: FactIndex) -> None:

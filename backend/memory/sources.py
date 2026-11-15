@@ -8,7 +8,8 @@ store (ADR-010 Invariant 4, last clause).
   returns each fact once with every indexed version, because which version is offered depends
   on the turn's `now`, which T9 applies.
 - VaultCandidates queries the vault sidecar on its read-only connection in match-any mode and
-  returns note Candidates, minus the notes the block must never show twice or at all.
+  returns one note Candidate per path, minus the notes the block must never show twice or at
+  all.
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ import json
 import logging
 import os
 import posixpath
-from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from pathlib import PurePosixPath
 
@@ -190,12 +191,16 @@ class VaultCandidates:
     turn never waits behind the file watcher's reindex, and in `match="any"` so one query word
     absent from every note does not empty the lexical leg.
 
-    Each kept chunk becomes a `note` Candidate whose ranks are the sidecar's own per-leg ranks,
-    as two pools: `note_vector` (`vector_rank`) and `note_fts` (`fts_rank`), with a leg that
-    missed the chunk omitted. The sidecar's single fused RRF rank is not used: ranking.py fuses
-    every pool with RRF, so a note carrying one fused rank would get half the pool count a fact
-    gets and could never collect the agreement bonus of two legs. The ranks are the sidecar's
-    as returned, so a dropped note leaves a gap in them rather than promoting the next one.
+    The sidecar returns chunks; the pool yields one `note` Candidate per note path, so one note
+    holds one shortlist slot. The candidate is the path's first kept chunk in the sidecar's
+    order (its text, item id and heading), and its ranks are the sidecar's own per-leg ranks,
+    as two pools: `note_vector` (`vector_rank`) and `note_fts` (`fts_rank`), each the best over
+    the path's kept chunks, with a leg that missed every chunk omitted. The sidecar's single
+    fused RRF rank is not used: ranking.py fuses every pool with RRF, so a note carrying one
+    fused rank would get half the pool count a fact gets and could never collect the agreement
+    bonus of two legs. The ranks are the sidecar's as returned, so a dropped note, or a chunk
+    folded into its note, leaves a gap in them rather than promoting the next one. The note
+    view is N0, the chunk's content, so a note candidate has no `view_text`.
 
     The lexical leg gets the query's content words only (`fts.query_tokens`, the tokens the
     fact pool's FTS query uses): under OR, a stopword such as "the" matches nearly every note
@@ -259,7 +264,10 @@ class VaultCandidates:
         rendered_episode_paths: Collection[str] = frozenset(),
         legacy_note_paths: Collection[str] = frozenset(),
     ) -> list[Candidate]:
-        """Query the sidecar and return up to `k` note Candidates in the sidecar's order.
+        """Query the sidecar and return up to `k` note Candidates, one per path, in its order.
+
+        `k` counts paths, not chunks: a fetch whose kept chunks name fewer than `k` paths asks
+        again for more rows, as it does when exclusions leave it short.
 
         Args:
             query_text: The user's text for this turn.
@@ -269,7 +277,8 @@ class VaultCandidates:
             legacy_note_paths: Vault paths of legacy session notes superseded by episodes.
 
         Returns:
-            Note Candidates, best sidecar RRF first, at most `k`.
+            Note Candidates, at most `k` and one per path, ordered by each path's first chunk
+            in the sidecar's order (best fused RRF first).
 
         Raises:
             SidecarIndexError: The sidecar is not initialized or its database fails.
@@ -283,7 +292,8 @@ class VaultCandidates:
             rows = await self._sidecar.query_hybrid_readonly(
                 embedding, lexical_text, k=fetch, match="any"
             )
-            kept = [c for c in (self._candidate(row, excluded) for row in rows) if c is not None]
+            chunks = ((str(row.get("path")), self._candidate(row, excluded)) for row in rows)
+            kept = _one_per_path((path, c) for path, c in chunks if c is not None)
             if len(kept) >= self._k or len(rows) < fetch or fetch >= self._k * _MAX_FETCH_FACTOR:
                 return kept[: self._k]
             fetch *= 2
@@ -319,6 +329,27 @@ class VaultCandidates:
             ranks=ranks,
             when_is_day=when_is_day,
         )
+
+
+def _one_per_path(chunks: Iterable[tuple[str, Candidate]]) -> list[Candidate]:
+    """Collapse `(path, chunk candidate)` pairs, in the sidecar's order, to one per note path.
+
+    A note stands for itself once, so its chunks do not take several shortlist slots. The
+    candidate is the path's first chunk in the sidecar's order, which gives its text, item id,
+    heading and time; each pool rank is the best (lowest) over the path's chunks, so a later
+    chunk's vector hit is kept when the first chunk was found by FTS alone.
+    """
+    by_path: dict[str, Candidate] = {}
+    for path, chunk in chunks:
+        first = by_path.get(path)
+        if first is None:
+            by_path[path] = chunk
+            continue
+        ranks = dict(first.ranks)
+        for pool, rank in chunk.ranks.items():
+            ranks[pool] = min(ranks.get(pool, rank), rank)
+        by_path[path] = replace(first, ranks=ranks)
+    return list(by_path.values())
 
 
 @dataclass(frozen=True, slots=True)

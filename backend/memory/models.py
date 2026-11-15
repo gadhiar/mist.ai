@@ -442,6 +442,9 @@ class Candidate:
             `last_updated` is a date, kept as that day's midnight in the configured zone so
             recency is measured as before. The block then dates the item by its day alone,
             because a part of the day read off midnight is a time nobody said.
+        view_text: The item's retrieval view (backend/memory/retrieval_view.py), such as the
+            fact view the index embedded; None when the item has no view apart from `text`, as
+            for a note, whose view is N0, its content.
     """
 
     kind: ItemKind
@@ -454,6 +457,7 @@ class Candidate:
     span_start: datetime | None = None
     span_end: datetime | None = None
     when_is_day: bool = False
+    view_text: str | None = None
 
     def __post_init__(self) -> None:
         """Reject a candidate whose source does not match its kind."""

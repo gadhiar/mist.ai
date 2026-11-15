@@ -10,10 +10,16 @@ pick the version current at the turn's `now` even when only a past version match
 Currency is decided at read time (`IndexedFact.is_current_at`), so the passage of time never
 needs a refresh.
 
-A write skips rows whose content hash is unchanged and re-embeds only rows whose rendered text
-changed. The embedder runs holding neither a connection lock nor a transaction (the
-resource-lifetime rule): the stored hashes are read, the new texts embedded, and then one write
-transaction applies every change. Searches run on a separate read-only connection, so under WAL
+Each row holds two texts. `text` is the sentence the block serves (`render_fact`), which the FTS
+mirror indexes with the names and type terms. `view_text` is the fact view the index was built
+with (`retrieval_view.render_fact_view` under the configured `ViewSpec`), which the vector mirror
+embeds, so the vector pool ranks by the view while what is served stays the same.
+
+A write skips rows whose content hash is unchanged and re-embeds only rows whose view text
+changed. The hash covers both texts, so a changed view setting rewrites, and re-embeds, every
+row whose view it changes at the next diff. The embedder runs holding neither a connection lock
+nor a transaction (the resource-lifetime rule): the stored hashes are read, the new texts
+embedded, and then one write transaction applies every change. Searches run on a separate read-only connection, so under WAL
 they read the last committed snapshot instead of waiting for a write.
 """
 
@@ -36,16 +42,17 @@ from .fact_render import render_fact
 from .fts import build_or_query, fold, words
 from .index_db import EMBEDDING_DIMENSION, read_transaction, write_transaction
 from .models import FactRow
+from .retrieval_view import DEFAULT_FACT_VIEW, FACT_VIEWS, ViewSpec, render_fact_view
 from .type_terms import type_terms_text
 
 # The "always / since forever" lower bound, `ALWAYS` in backend/knowledge/curation/intervals.py,
 # copied for the reason fact_render.py gives (importing it loads the curation pipeline).
 _ALWAYS = "-inf"
 
-# Bumped when the hashed fields change, so every row re-hashes (and re-embeds if its text
+# Bumped when the hashed fields change, so every row re-hashes (and re-embeds if its view text
 # changed) after an upgrade instead of keeping a hash computed another way. 2 added the
-# entity types.
-_HASH_VERSION = 2
+# entity types, 3 the view text.
+_HASH_VERSION = 3
 
 # Keys per `IN (...)` list: below SQLite's historical 999-variable limit.
 _IN_CHUNK = 500
@@ -59,7 +66,7 @@ _PACK = struct.Struct(f"<{EMBEDDING_DIMENSION}f")
 _COLUMNS = (
     "row_key, fact_key, subject_id, subject_name, subject_type, rel_type, object_id, "
     "object_name, object_type, text, valid_from, valid_to, recorded_at, confidence, "
-    "source_utterance_id, content_hash"
+    "source_utterance_id, content_hash, view_text"
 )
 
 # First row bound of a MATCH query, per fact wanted; most facts have one or two versions.
@@ -113,16 +120,19 @@ def structural_row_key(fact_key: str) -> str:
     return fact_row_key(fact_key, None)
 
 
-def content_hash(row: FactRow, text: str) -> str:
+def content_hash(row: FactRow, text: str, view_text: str) -> str:
     """Hash of everything a row embeds or serves, so any change to it rewrites the row.
 
-    It covers the rendered `text`, which depends on the zone the index renders in, so a zone
-    change re-embeds, and every stored field the fetcher can serve. `row_key` is left out: it is
-    the identity the hash is stored under, not content.
+    It covers the served `text` and the embedded `view_text`, both of which can depend on the
+    zone the index renders in, and every stored field the fetcher can serve. Covering the view
+    text is what makes a changed view setting rewrite the rows whose view it changes. `row_key`
+    is left out: it is the identity the hash is stored under, not content.
 
     Args:
         row: The fact version.
-        text: Its rendered sentence, as `render_fact` produced it for the index's zone.
+        text: Its served sentence, as `render_fact` produced it for the index's zone.
+        view_text: Its fact view, as `render_fact_view` produced it for the index's view and
+            zone.
 
     Returns:
         A hex SHA-256 digest.
@@ -130,6 +140,7 @@ def content_hash(row: FactRow, text: str) -> str:
     payload = [
         _HASH_VERSION,
         text,
+        view_text,
         row.fact_key,
         row.subject_id,
         row.subject_name,
@@ -150,7 +161,12 @@ def content_hash(row: FactRow, text: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class IndexedFact:
-    """One fact version as stored in the index: the FactRow fields plus its text and hash."""
+    """One fact version as stored in the index: the FactRow fields, its texts and its hash.
+
+    `text` is the served sentence and `view_text` the fact view the index embedded. Every read
+    of the index fills `view_text`; its None default serves only a fact built outside the index,
+    such as a test's, which has no embedding either.
+    """
 
     row_key: str
     fact_key: str
@@ -168,6 +184,7 @@ class IndexedFact:
     confidence: float
     source_utterance_id: str | None
     content_hash: str
+    view_text: str | None = None
 
     def is_current_at(self, now: datetime) -> bool:
         """Whether this version holds at `now`, by graph_store's C1 currency predicate.
@@ -243,13 +260,14 @@ class DiffReport:
 class _Prepared:
     row: FactRow
     text: str
+    view_text: str
     content_hash: str
 
 
 @dataclass(frozen=True, slots=True)
 class _Stored:
     content_hash: str
-    text: str
+    view_text: str
 
 
 class FactIndex:
@@ -272,13 +290,16 @@ class FactIndex:
 
     Args:
         writer: Connection from `index_db.open_index`.
-        embedder: Embeds rendered fact text (all-MiniLM-L6-v2 in production).
+        embedder: Embeds each fact's view text (all-MiniLM-L6-v2 in production).
         tz: Zone timestamp bounds are rendered in, `MemoryConfig.tz`. It is required because
-            the rendered text, and so the hash and the embedding, depends on it.
+            the rendered texts, and so the hash and the embedding, depend on it.
         reader: Connection from `index_db.open_reader` on the same file. It is required, so
             the caller chooses the connection searches use. A `:memory:` index has no second
             connection and passes its writer here; searches then run on the writer under its
             lock and wait for a running write. A file-backed index given its writer raises.
+        view: The fact view to embed, `FACT_VIEWS[MemoryConfig.fact_view]` in production.
+            Rows written under another view are rewritten and re-embedded at the next write
+            that includes them, wherever their view text differs.
 
     Raises:
         ValueError: `reader` is `writer` and the writer's database is a file, which would
@@ -292,6 +313,7 @@ class FactIndex:
         *,
         tz: tzinfo,
         reader: sqlite3.Connection,
+        view: ViewSpec = FACT_VIEWS[DEFAULT_FACT_VIEW],
     ):
         shared = reader is writer
         if shared and _main_database_file(writer):
@@ -302,6 +324,7 @@ class FactIndex:
         self._writer = writer
         self._embedder = embedder
         self._tz = tz
+        self._view = view
         self._writer_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._reader = reader
@@ -579,31 +602,34 @@ class FactIndex:
                 raise ValueError(f"row_key {row.row_key!r} appears more than once")
             seen.add(row.row_key)
             text = render_fact(row, self._tz)
-            prepared.append(_Prepared(row, text, content_hash(row, text)))
+            view_text = render_fact_view(row, self._view, self._tz)
+            prepared.append(_Prepared(row, text, view_text, content_hash(row, text, view_text)))
         return prepared
 
     def _read_stored(self, row_keys: list[str] | None) -> dict[str, _Stored]:
-        """Stored hash and text by `row_key`: of these keys, or of every row when None.
+        """Stored hash and view text by `row_key`: of these keys, or of every row when None.
 
         Read on the writer, as part of the write: a search on the reader does not wait for it.
         """
         stored: dict[str, _Stored] = {}
         with self._writer_lock, _index_errors("read"), read_transaction(self._writer):
             if row_keys is None:
-                cursors = [self._writer.execute("SELECT row_key, content_hash, text FROM facts")]
+                cursors = [
+                    self._writer.execute("SELECT row_key, content_hash, view_text FROM facts")
+                ]
             else:
                 cursors = [
                     self._writer.execute(
                         # the IN list holds only `?` placeholders
-                        "SELECT row_key, content_hash, text FROM facts "  # nosec B608
+                        "SELECT row_key, content_hash, view_text FROM facts "  # nosec B608
                         f"WHERE row_key IN ({_placeholders(len(chunk))})",
                         chunk,
                     )
                     for chunk in _chunks(row_keys)
                 ]
             for cursor in cursors:
-                for row_key, hashed, text in cursor:
-                    stored[row_key] = _Stored(hashed, text)
+                for row_key, hashed, view_text in cursor:
+                    stored[row_key] = _Stored(hashed, view_text)
         return stored
 
     def _apply(
@@ -626,10 +652,11 @@ class FactIndex:
             else:
                 updated += 1
             writes.append(item)
-            if stored is None or stored.text != item.text:
+            # The vector mirror holds the view's embedding, so only a new view needs one.
+            if stored is None or stored.view_text != item.view_text:
                 to_embed.append(item)
 
-        vectors = self._embed([item.text for item in to_embed])
+        vectors = self._embed([item.view_text for item in to_embed])
         embedding_by_key = {item.row.row_key: vector for item, vector in zip(to_embed, vectors)}
 
         if writes or delete_keys:
@@ -674,16 +701,17 @@ class FactIndex:
         return packed
 
     def _write_row(self, item: _Prepared, embedding: bytes | None) -> None:
-        """Write one row and its FTS mirror, and its vector when it was re-embedded.
+        """Write one row and its FTS mirror, and its vector when its view was re-embedded.
 
-        The row keeps its `id` on update, so the mirrors stay joined to it.
+        The row keeps its `id` on update, so the mirrors stay joined to it. The FTS mirror takes
+        the served text, as before views existed; only the vector mirror holds the view.
         """
         row = item.row
         self._writer.execute(
             "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, subject_type, "
             "rel_type, object_id, object_name, object_type, text, valid_from, valid_to, "
-            "recorded_at, confidence, source_utterance_id, content_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "recorded_at, confidence, source_utterance_id, content_hash, view_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(row_key) DO UPDATE SET "
             "fact_key = excluded.fact_key, subject_id = excluded.subject_id, "
             "subject_name = excluded.subject_name, subject_type = excluded.subject_type, "
@@ -693,7 +721,7 @@ class FactIndex:
             "valid_to = excluded.valid_to, recorded_at = excluded.recorded_at, "
             "confidence = excluded.confidence, "
             "source_utterance_id = excluded.source_utterance_id, "
-            "content_hash = excluded.content_hash",
+            "content_hash = excluded.content_hash, view_text = excluded.view_text",
             (
                 row.row_key,
                 row.fact_key,
@@ -711,6 +739,7 @@ class FactIndex:
                 row.confidence,
                 row.source_utterance_id,
                 item.content_hash,
+                item.view_text,
             ),
         )
         (row_id,) = self._writer.execute(
