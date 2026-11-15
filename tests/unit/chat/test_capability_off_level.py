@@ -2,13 +2,16 @@
 
 `ConversationHandler.handle_capability_only` runs only the host's pre-LLM step (a ringing item,
 a proposal decision, the fast path). A message it answers is recorded as a turn answered by a
-capability, with no extraction; a message nothing answers returns None, records nothing and
-leaves the session untouched, so the server can refuse it as before. No path here may reach
-the provider, so every handler is built over a provider that fails when called.
+capability, with no extraction. A message nothing answers comes back unhandled, records nothing
+and leaves the session untouched, so the server can refuse it as before; it still carries the
+payloads the pre-LLM step drained, such as a superseded proposal's `action_resolved`. None
+means only that no host is attached. No path here may reach the provider, so every handler is
+built over a provider that fails when called.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +21,7 @@ import pytest
 from backend.capabilities.action_log import ActionLog
 from backend.capabilities.contracts import (
     ActionRecord,
+    DecodeReply,
     FastIntent,
     PreTurnResolution,
     ToolOutcome,
@@ -31,7 +35,7 @@ from backend.capabilities.power import FixedTiers
 from backend.capabilities.router import RouterConfig, ToolRouter
 from backend.capabilities.secrets import SecretRegistry
 from backend.chat.context_budget import ApproximateTokenCounter
-from backend.chat.conversation_handler import ConversationHandler
+from backend.chat.conversation_handler import CapabilityOnlyTurn, ConversationHandler
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.knowledge.models import RetrievalResult
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
@@ -45,6 +49,7 @@ from tests.unit.capabilities.fakes import (
     FakeCapability,
     FakeClock,
     RecordingEventSink,
+    ScriptedDecode,
     make_tool_spec,
 )
 from tests.unit.conftest import make_test_conventions_loader
@@ -251,6 +256,13 @@ def _history(handler: ConversationHandler, session_id: str = "s1") -> list[tuple
     return [(m.role, m.content) for m in handler.sessions[session_id].messages]
 
 
+def _answered(turn: CapabilityOnlyTurn | None) -> tuple[StreamEvent, ...]:
+    """The events of a handled turn; fails the test when the message was not handled."""
+    assert turn is not None
+    assert turn.handled is True
+    return turn.events
+
+
 # --- The fast path ------------------------------------------------------------
 
 
@@ -262,11 +274,10 @@ class TestFastPathAtOff:
         handler, provider, _store = _make_handler(host)
 
         try:
-            events = await handler.handle_capability_only(_TIMER, "s1")
+            events = _answered(await handler.handle_capability_only(_TIMER, "s1"))
         finally:
             await host.stop()
 
-        assert events is not None
         assert provider.calls == []
         assert [tool for tool, _args, _ctx in timers.invocations] == ["timers.start"]
         assert [(p["type"], p["name"]) for p in _payloads(events)] == [
@@ -286,11 +297,13 @@ class TestFastPathAtOff:
         handler, provider, store = _make_handler(host)
 
         try:
-            events = await handler.handle_capability_only(_STORY, "s1")
+            turn = await handler.handle_capability_only(_STORY, "s1")
         finally:
             await host.stop()
 
-        assert events is None
+        assert turn is not None
+        assert turn.handled is False
+        assert turn.events == ()
         assert provider.calls == []
         assert store.events == []
         assert "s1" not in handler.sessions
@@ -319,11 +332,10 @@ class TestRingingAtOff:
         handler, provider, store = _make_handler(host)
 
         try:
-            events = await handler.handle_capability_only("stop", "s1")
+            events = _answered(await handler.handle_capability_only("stop", "s1"))
         finally:
             await host.stop()
 
-        assert events is not None
         assert provider.calls == []
         assert "Alarm stopped." in _text(events)
         assert [e.answered_by for e in store.events] == ["capability"]
@@ -340,11 +352,10 @@ class TestRecordingAtOff:
         handler, _provider, store = _make_handler(host, dispatcher=dispatcher)
 
         try:
-            events = await handler.handle_capability_only(_TIMER, "s1")
+            events = _answered(await handler.handle_capability_only(_TIMER, "s1"))
         finally:
             await host.stop()
 
-        assert events is not None
         assert [(e.user_utterance, e.system_response, e.answered_by) for e in store.events] == [
             (_TIMER, _complete(events).final_response, "capability")
         ]
@@ -386,7 +397,10 @@ class TestRecordingAtOff:
         port = _ScriptedPort([None])
         handler, _provider, store = _make_handler(port)
 
-        assert await handler.handle_capability_only(_STORY, "s1") is None
+        turn = await handler.handle_capability_only(_STORY, "s1")
+
+        assert turn is not None
+        assert turn.handled is False
         assert port.record_turn_calls == []
         assert store.events == []
 
@@ -400,9 +414,8 @@ class TestDecisionsAtOff:
         port = _ScriptedPort([_handled("Turned the lights on.", _record())])
         handler, provider, store = _make_handler(port)
 
-        events = await handler.handle_capability_only("yes", "s1")
+        events = _answered(await handler.handle_capability_only("yes", "s1"))
 
-        assert events is not None
         assert provider.calls == []
         assert _text(events) == "Turned the lights on."
         assert [e.answered_by for e in store.events] == ["capability"]
@@ -414,9 +427,8 @@ class TestDecisionsAtOff:
         port = _ScriptedPort([_handled("Turned the lights on.", _record(), remainder=_STORY), None])
         handler, provider, store = _make_handler(port)
 
-        events = await handler.handle_capability_only(f"yes, and {_STORY}", "s1")
+        events = _answered(await handler.handle_capability_only(f"yes, and {_STORY}", "s1"))
 
-        assert events is not None
         assert provider.calls == []
         assert port.pre_llm_calls == [f"yes, and {_STORY}", _STORY]
         assert _complete(events).final_response == "Turned the lights on."
@@ -450,7 +462,73 @@ class TestDecisionsAtOff:
         )
         handler, _provider, _store = _make_handler(port)
 
-        events = await handler.handle_capability_only("yes", "s1")
+        events = _answered(await handler.handle_capability_only("yes", "s1"))
 
-        assert events is not None
         assert resolved in _payloads(events)
+
+
+# --- A live proposal superseded at off ------------------------------------------------
+
+
+def _lock() -> FakeCapability:
+    """A capability whose one tool always waits for a yes."""
+    return FakeCapability(
+        "lock", tools=(make_tool_spec("lock.open", default_policy="confirm"),), keywords=("lock",)
+    )
+
+
+async def _propose(host: CapabilityHost, session_id: str = "s1") -> str:
+    """Make a proposal live through the model path, as the host tests do, and drain its event."""
+    plan = host.plan_turn(session_id, "open the lock", [])
+    reply = DecodeReply(
+        content=json.dumps({"calls": [{"tool": "lock.open", "args": {}}], "also_reply": False}),
+        finish_reason="stop",
+    )
+    result = await host.run_actions(
+        session_id, "turn-0", "open the lock", plan, ScriptedDecode(reply)
+    )
+    host.drain_events(session_id)
+    (proposal_id,) = {r.outcome.proposal_id for r in result.records if r.outcome.proposal_id}
+    return proposal_id
+
+
+class TestSupersededAtOff:
+    @pytest.mark.asyncio
+    async def test_an_unhandled_message_returns_the_superseded_resolution(self):
+        lock = _lock()
+        host = _real_host(lock)
+        handler, provider, store = _make_handler(host)
+        recorded: list[tuple[str, list[str]]] = []
+        host.record_turn = lambda session_id, used: recorded.append(  # type: ignore[method-assign]
+            (session_id, list(used))
+        )
+
+        try:
+            proposal_id = await _propose(host)
+            turn = await handler.handle_capability_only(_STORY, "s1")
+        finally:
+            await host.stop()
+
+        assert turn is not None
+        assert turn.handled is False
+        assert len(turn.events) == 1
+        (event,) = turn.events
+        assert isinstance(event, WSEvent)
+        assert (event.payload["type"], event.payload["proposal_id"]) == (
+            "action_resolved",
+            proposal_id,
+        )
+        assert event.payload["decision"] == "superseded"
+        assert not any(isinstance(e, Token | Complete) for e in turn.events)
+        assert lock.invocations == []
+        assert provider.calls == []
+        assert store.events == []
+        assert "s1" not in handler.sessions
+        assert recorded == []
+
+    @pytest.mark.asyncio
+    async def test_the_result_is_a_frozen_value(self):
+        turn = CapabilityOnlyTurn(handled=False, events=())
+
+        with pytest.raises(AttributeError):
+            turn.handled = True  # type: ignore[misc]

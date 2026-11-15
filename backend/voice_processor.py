@@ -511,10 +511,14 @@ class VoiceProcessor:
 
         With `capability_only` (gaming mode holds the GPU), the conversation
         handler's `handle_capability_only` answers instead of the model path, and
-        its events stream through the same output path a text turn uses. Nothing
-        is sent when it answers nothing, when there is no conversation handler, or
-        when another turn holds the generation lock; such a turn is neither queued
-        nor drained into a model turn, because the provider must not be called.
+        its events stream through the same output path a text turn uses. A message
+        it does not handle opens no stream: only the payloads its pre-LLM step
+        drained (such as a superseded proposal's `action_resolved`) go on
+        `message_queue`, and this call returns only after each put has finished,
+        so they are queued before the caller sends its refusal. With no
+        conversation handler, or while another turn holds the generation lock,
+        nothing is sent. Such a turn is neither queued nor drained into a model
+        turn, because the provider must not be called.
 
         Args:
             user_text: The user's utterance for this turn.
@@ -531,9 +535,9 @@ class VoiceProcessor:
             capability_only: Answer from the capability host alone.
 
         Returns:
-            False when a `capability_only` turn sent nothing, so the caller
-            sends its refusal; True otherwise, including a turn queued behind
-            the one in flight and a turn that ended in an error event.
+            False when a `capability_only` message was not answered, so the
+            caller sends its refusal; True otherwise, including a turn queued
+            behind the one in flight and a turn that ended in an error event.
         """
         if not self.generation_lock.acquire(blocking=False):
             if capability_only:
@@ -574,8 +578,8 @@ class VoiceProcessor:
                 current_session_id.set(session_id)
 
             # The capability-only answer is resolved before anything is sent,
-            # so an unanswered message leaves the client exactly as a refused
-            # one does. Its events become the items the model path would yield.
+            # so an unanswered message opens no stream and changes no state
+            # cycle. Its events become the items the model path would yield.
             capability_items: list[str | dict] | None = None
             if capability_only:
                 knowledge = getattr(self.models, "knowledge", None)
@@ -584,20 +588,33 @@ class VoiceProcessor:
                     if knowledge is not None and knowledge.is_enabled()
                     else None
                 )
-                events = None
+                turn = None
                 if handler is not None:
-                    events = asyncio.run_coroutine_threadsafe(
+                    turn = asyncio.run_coroutine_threadsafe(
                         handler.handle_capability_only(
                             user_text, session_id or current_session_id.get()
                         ),
                         self.loop,
                     ).result()
-                if events is None:
+                if turn is None:
+                    return False
+                if not turn.handled:
+                    # The payloads an unhandled message drained (a superseded
+                    # proposal's `action_resolved`) were cleared from the host's
+                    # buffer, so they go out now or never. This worker thread
+                    # blocks on each put until the loop has run it, so all are
+                    # on the broadcast queue before the caller sends its refusal.
+                    for event in turn.events:
+                        if isinstance(event, WSEvent):
+                            asyncio.run_coroutine_threadsafe(
+                                self.message_queue.put(json.dumps(event.payload)),
+                                self.loop,
+                            ).result()
                     return False
                 current_turn_complete.set(None)
                 current_turn_error.set(None)
                 capability_items = []
-                for event in events:
+                for event in turn.events:
                     if isinstance(event, Token):
                         capability_items.append(event.text)
                     elif isinstance(event, WSEvent):

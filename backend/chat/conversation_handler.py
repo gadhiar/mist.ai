@@ -855,6 +855,28 @@ class _ActionsOutcome:
     result: ActionResult | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CapabilityOnlyTurn:
+    """What `ConversationHandler.handle_capability_only` made of one message at the off level.
+
+    `handled` says whether the host's model-free step answered the message, so the caller
+    does not have to infer it from the shape of `events`. An unhandled message can still
+    carry events: the session's in-turn payloads that the pre-LLM step drained, such as the
+    `action_resolved` of a proposal the message superseded. They are the host's, and every
+    connected client needs them, whether or not the message is then refused.
+
+    Attributes:
+        handled: True when the message was answered and recorded as a turn.
+        events: For a handled message, the turn's events in the order
+            `handle_message_streaming` yields them (tool-event pairs and drained payloads,
+            the reply as Tokens, then one Complete). For an unhandled one, only the drained
+            payloads as `WSEvent`s, in order, with no Token and no Complete.
+    """
+
+    handled: bool
+    events: tuple[StreamEvent, ...]
+
+
 # Statuses whose completed tool event carries no `error`: the call ran, or waits for a yes.
 _NON_ERROR_STATUSES = frozenset({"ok", "pending_confirmation"})
 
@@ -2708,7 +2730,7 @@ class ConversationHandler:
             duration_ms=duration_ms,
         )
 
-    async def handle_capability_only(self, text: str, session_id: str) -> list[StreamEvent] | None:
+    async def handle_capability_only(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
         """Answer `text` from the capability host alone, for while gaming mode holds the GPU.
 
         Runs only `host.pre_llm`, through `_capability_pre_llm` (a ringing item, a proposal
@@ -2719,14 +2741,17 @@ class ConversationHandler:
         scheduled. A leading "yes" that resolved a proposal counts as handled even when its
         remainder is not, because the proposal already ran; the remainder gets no answer.
 
-        A message nothing handles leaves no trace: no history, no row, and no `record_turn`,
+        A message nothing handles is not recorded: no history, no row, and no `record_turn`,
         so the caller can refuse it as before. The pre-LLM step may still have superseded a
-        live proposal; the in-turn payloads drained then are not returned.
+        live proposal, which buffers its `action_resolved`. `drain_events` clears that buffer,
+        so a later turn cannot send it; the result carries those payloads for the caller to
+        send before its refusal, so no client keeps showing the proposal as waiting.
 
         Returns:
-            The turn's events, as `handle_message_streaming` yields them for the same turn
-            (tool-event pairs and drained payloads, the reply as Tokens, then one Complete),
-            or None when no host is attached or nothing handled the message.
+            None only when no host is attached. Otherwise a `CapabilityOnlyTurn`: handled, with
+            the turn's events as `handle_message_streaming` yields them for the same turn
+            (tool-event pairs and drained payloads, the reply as Tokens, then one Complete);
+            or unhandled, with only the `WSEvent`s of the payloads the pre-LLM step drained.
         """
         host = self._capability_host
         if host is None:
@@ -2753,7 +2778,9 @@ class ConversationHandler:
         # `_capability_pre_llm` replaces `utterance` only after a handled resolution that left a
         # remainder; a remainder is a strict suffix of the message, so it never equals it.
         if not pre.answered and pre.utterance == text:
-            return None
+            # Only the unhandled branch of `_capability_pre_llm` ran, and it yields drained
+            # payloads alone.
+            return CapabilityOnlyTurn(handled=False, events=tuple(events))
 
         host.record_turn(session_id, pre.used)
         session = self.get_or_create_session(session_id)
@@ -2787,7 +2814,7 @@ class ConversationHandler:
                 duration_ms=(time.monotonic() - received_at) * 1000,
             )
         )
-        return events
+        return CapabilityOnlyTurn(handled=True, events=tuple(events))
 
     async def _extract_knowledge_async(
         self,
