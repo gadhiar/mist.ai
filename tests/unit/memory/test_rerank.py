@@ -3,15 +3,23 @@
 Every test injects FakeCrossEncoderClass in place of `sentence_transformers.CrossEncoder`, so no
 weights are loaded and no network is touched. The cost calibration runs against FakeClock: the
 fake model advances the clock by a scripted cost per call, so the measured costs are exact.
+
+The release and reload tests hold a load or a forward pass open on a `threading.Event` and wait
+for each step with a bounded `Event.wait` or `Thread.join`; none sleeps to let a thread run.
 """
 
 from __future__ import annotations
 
+import gc
 import inspect
 import math
+import sys
+import threading
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
 
 import pytest
 
@@ -19,6 +27,14 @@ from backend.errors import MemoryRerankError
 from backend.memory.config import MEMORY_ENV_VARS, MemoryConfig
 from backend.memory.rerank import CrossEncoderReranker, NullReranker, Reranker
 from tests.fakes.memory_fakes import FakeClock
+
+# Upper bound on every wait for another thread. A healthy run never comes near it; it only turns
+# a deadlock into a failure instead of a hung suite.
+_WAIT_S = 5.0
+
+# Predict calls one calibration makes: the untimed first call, then one pair and the whole batch
+# in each of three rounds.
+_WARM_UP_CALLS = 7
 
 
 def _sigmoid(x: float) -> float:
@@ -46,6 +62,8 @@ class FakeCrossEncoderModel:
     ) -> list[float]:
         owner = self.owner
         call_index = len(self.predict_calls)
+        if owner.on_predict is not None:
+            owner.on_predict(call_index)
         self.predict_calls.append(
             {
                 "sentences": list(sentences),
@@ -78,7 +96,9 @@ class FakeCrossEncoderClass:
     """Stands in for the `sentence_transformers.CrossEncoder` class: calling it loads a model.
 
     The constructor keywords the reranker passes are recorded on the model it returns, so a test
-    can assert the device and `local_files_only` it received.
+    can assert the device and `local_files_only` it received. `on_load` runs at the start of each
+    load and `on_predict` at the start of each `predict` with that model's call index, so a thread
+    test can hold either open on an event.
     """
 
     clock: FakeClock | None = None
@@ -91,11 +111,15 @@ class FakeCrossEncoderClass:
     predict_error: Exception | None = None
     drop_one_score: bool = False
     labels: int = 1
+    on_load: Callable[[], object] | None = None
+    on_predict: Callable[[int], object] | None = None
     built: list[FakeCrossEncoderModel] = field(default_factory=list)
 
     def __call__(
         self, model_name: str, *, device: str, local_files_only: bool
     ) -> FakeCrossEncoderModel:
+        if self.on_load is not None:
+            self.on_load()
         if self.load_error is not None:
             raise self.load_error
         model = FakeCrossEncoderModel(self, model_name, device, local_files_only)
@@ -123,6 +147,7 @@ def _build(
     device: str = "cpu",
     clock: FakeClock | None = None,
     batch_size: int = 32,
+    load: bool = True,
 ) -> CrossEncoderReranker:
     return CrossEncoderReranker(
         str(model_dir),
@@ -130,7 +155,88 @@ def _build(
         cross_encoder_cls=fake_class,
         clock=(clock or FakeClock()).monotonic,
         batch_size=batch_size,
+        load=load,
     )
+
+
+def _wait(event: threading.Event) -> None:
+    assert event.wait(_WAIT_S), "the other thread never reached the expected step"
+
+
+class _Run(threading.Thread):
+    """Runs `fn` on its own thread and keeps what it returned or the error it raised."""
+
+    def __init__(self, fn: Callable[[], object]) -> None:
+        super().__init__(daemon=True)
+        self._fn = fn
+        self.result: object = None
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            self.result = self._fn()
+        except (MemoryRerankError, AssertionError, threading.BrokenBarrierError) as exc:
+            self.error = exc
+
+    def finish(self) -> _Run:
+        """Join within `_WAIT_S` and fail if the thread is still running."""
+        self.join(_WAIT_S)
+        assert not self.is_alive(), "the thread did not finish: it is waiting on something"
+        return self
+
+
+class _WatchedLock:
+    """A lock that sets `contended` when a thread finds it held and has to wait for it.
+
+    Put in place of the reranker's lock, it lets a test know a second thread is blocked on the
+    lock rather than not yet started, without sleeping.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self) -> _WatchedLock:
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._lock.release()
+
+
+@pytest.fixture
+def freed(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records `gc.collect` and `torch.cuda.empty_cache` calls, in order, in place of both."""
+    import torch
+
+    calls: list[str] = []
+
+    def collect(*args: object, **kwargs: object) -> int:
+        calls.append("gc.collect")
+        return 0
+
+    monkeypatch.setattr(gc, "collect", collect)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    return calls
+
+
+# The real collector, kept before `freed` replaces `gc.collect`.
+_REAL_COLLECT = gc.collect
+
+
+def _assert_unreferenced(fake_class: FakeCrossEncoderClass, index: int) -> None:
+    """The model the fake built at `index` has no reference left once the fake drops its own."""
+    ref = weakref.ref(fake_class.built[index])
+    fake_class.built.clear()
+    _REAL_COLLECT()
+    assert ref() is None, "the reranker still holds the model it was meant to drop"
 
 
 # -- Protocol ---------------------------------------------------------------------------------
@@ -149,7 +255,7 @@ def test_score_signature_matches_the_protocol_including_optional_budget() -> Non
 
 @pytest.mark.parametrize("cls", [CrossEncoderReranker, NullReranker])
 def test_implementations_share_the_protocol_signatures(cls: type) -> None:
-    for name in ("score", "pairs_within"):
+    for name in ("score", "pairs_within", "release", "reload"):
         expected = inspect.signature(getattr(Reranker, name))
         actual = inspect.signature(getattr(cls, name))
 
@@ -538,6 +644,362 @@ def test_multi_label_output_in_score_raises(model_dir: Path) -> None:
         reranker.score("query", ["a", "b"])
 
 
+# -- Release and reload -----------------------------------------------------------------------
+
+
+def test_score_after_release_raises_naming_path_and_device(model_dir: Path) -> None:
+    reranker = _build(model_dir, FakeCrossEncoderClass(), device="cuda")
+
+    reranker.release()
+
+    with pytest.raises(MemoryRerankError, match="released") as excinfo:
+        reranker.score("private query", ["private passage"])
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+    assert "private" not in str(excinfo.value)
+
+
+def test_release_drops_the_model_and_its_calibration(model_dir: Path) -> None:
+    clock = FakeClock()
+    fake_class = FakeCrossEncoderClass(clock=clock, overhead_ms=4.0, ms_per_pair=2.0)
+    reranker = _build(model_dir, fake_class, clock=clock)
+
+    reranker.release()
+
+    assert reranker.cost_per_pair_ms is None
+    assert reranker.call_overhead_ms is None
+    _assert_unreferenced(fake_class, 0)
+
+
+@pytest.mark.parametrize(
+    ("budget_ms", "expected"),
+    [
+        pytest.param(10.0, sys.maxsize, id="positive"),
+        pytest.param(0.001, sys.maxsize, id="tiny"),
+        pytest.param(math.inf, sys.maxsize, id="inf"),
+        pytest.param(0.0, 0, id="zero"),
+        pytest.param(-10.0, 0, id="negative"),
+        pytest.param(math.nan, 0, id="nan"),
+    ],
+)
+def test_pairs_within_while_released_lets_score_report_the_fault(
+    model_dir: Path, budget_ms: float, expected: int
+) -> None:
+    reranker = _build(model_dir, FakeCrossEncoderClass())
+    reranker.release()
+
+    assert reranker.pairs_within(budget_ms) == expected
+
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [
+        pytest.param("cuda", ["gc.collect", "empty_cache"], id="cuda"),
+        pytest.param("cpu", ["gc.collect"], id="cpu"),
+    ],
+)
+def test_release_collects_then_empties_the_cuda_cache_once(
+    model_dir: Path, freed: list[str], device: str, expected: list[str]
+) -> None:
+    reranker = _build(model_dir, FakeCrossEncoderClass(), device=device)
+
+    reranker.release()
+
+    assert freed == expected
+
+
+def test_a_second_release_is_a_no_op(model_dir: Path, freed: list[str]) -> None:
+    fake_class = FakeCrossEncoderClass()
+    reranker = _build(model_dir, fake_class, device="cuda")
+    reranker.release()
+
+    reranker.release()
+
+    assert freed == ["gc.collect", "empty_cache"]
+    assert len(fake_class.built) == 1
+    with pytest.raises(MemoryRerankError, match="released"):
+        reranker.score("query", ["a"])
+
+
+def test_each_release_after_a_reload_frees_again(model_dir: Path, freed: list[str]) -> None:
+    reranker = _build(model_dir, FakeCrossEncoderClass(), device="cuda")
+    reranker.release()
+    assert reranker.reload() is True
+
+    reranker.release()
+
+    assert freed == ["gc.collect", "empty_cache"] * 2
+
+
+def test_reload_loads_through_the_factory_again_and_recalibrates(model_dir: Path) -> None:
+    clock = FakeClock()
+    fake_class = FakeCrossEncoderClass(
+        clock=clock, overhead_ms=4.0, ms_per_pair=2.0, logits={"a": 1.0}
+    )
+    reranker = _build(model_dir, fake_class, device="cuda", clock=clock)
+    reranker.release()
+    fake_class.overhead_ms, fake_class.ms_per_pair = 6.0, 3.0
+
+    assert reranker.reload() is True
+
+    assert len(fake_class.built) == 2
+    reloaded = fake_class.built[1]
+    assert (reloaded.model_name, reloaded.device, reloaded.local_files_only) == (
+        str(model_dir),
+        "cuda",
+        True,
+    )
+    assert len(reloaded.predict_calls) == _WARM_UP_CALLS
+    assert reranker.cost_per_pair_ms == pytest.approx(3.0)
+    assert reranker.call_overhead_ms == pytest.approx(6.0)
+    assert reranker.score("query", ["a"]) == pytest.approx([_sigmoid(1.0)])
+    assert len(reloaded.predict_calls) == _WARM_UP_CALLS + 1
+
+
+def test_reload_while_loaded_returns_true_without_loading(model_dir: Path) -> None:
+    fake_class = FakeCrossEncoderClass()
+    reranker = _build(model_dir, fake_class)
+
+    assert reranker.reload() is True
+
+    assert len(fake_class.built) == 1
+
+
+def test_load_false_checks_the_directory_and_loads_nothing(model_dir: Path) -> None:
+    fake_class = FakeCrossEncoderClass()
+
+    reranker = _build(model_dir, fake_class, device="cuda", load=False)
+
+    assert fake_class.built == []
+    assert reranker.pairs_within(10.0) == sys.maxsize
+    assert reranker.cost_per_pair_ms is None
+    with pytest.raises(MemoryRerankError, match="released") as excinfo:
+        reranker.score("query", ["a"])
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+
+
+def test_load_false_then_reload_loads_and_calibrates(model_dir: Path) -> None:
+    clock = FakeClock()
+    fake_class = FakeCrossEncoderClass(clock=clock, overhead_ms=4.0, ms_per_pair=2.0)
+    reranker = _build(model_dir, fake_class, clock=clock, load=False)
+
+    assert reranker.reload() is True
+
+    assert len(fake_class.model.predict_calls) == _WARM_UP_CALLS
+    assert reranker.cost_per_pair_ms == pytest.approx(2.0)
+    assert reranker.pairs_within(50.0) == 23
+
+
+def test_load_false_still_refuses_a_missing_path(tmp_path: Path) -> None:
+    fake_class = FakeCrossEncoderClass()
+
+    with pytest.raises(MemoryRerankError, match="not-baked"):
+        _build(tmp_path / "not-baked", fake_class, load=False)
+
+    assert fake_class.built == []
+
+
+def test_load_false_still_refuses_an_unknown_device(model_dir: Path) -> None:
+    with pytest.raises(MemoryRerankError, match="mps"):
+        _build(model_dir, FakeCrossEncoderClass(), device="mps", load=False)
+
+
+def test_load_false_still_reads_tokenizer_json(model_dir: Path) -> None:
+    (model_dir / "tokenizer.json").write_bytes(b'{"version": "1.0", "truncation": nu')
+
+    with pytest.raises(MemoryRerankError, match="tokenizer.json"):
+        _build(model_dir, FakeCrossEncoderClass(), load=False)
+
+
+def test_reload_whose_load_fails_raises_and_stays_released(model_dir: Path) -> None:
+    error = OSError("model.safetensors not found")
+    fake_class = FakeCrossEncoderClass(load_error=error)
+    reranker = _build(model_dir, fake_class, device="cuda", load=False)
+
+    with pytest.raises(MemoryRerankError) as excinfo:
+        reranker.reload()
+
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+    assert excinfo.value.__cause__ is error
+    assert reranker.pairs_within(10.0) == sys.maxsize
+    with pytest.raises(MemoryRerankError, match="released"):
+        reranker.score("query", ["a"])
+    fake_class.load_error = None
+    assert reranker.reload() is True
+
+
+def test_reload_whose_warm_up_fails_raises_stays_released_and_drops_the_model(
+    model_dir: Path, freed: list[str]
+) -> None:
+    fake_class = FakeCrossEncoderClass(predict_error=RuntimeError("CUDA out of memory"))
+    reranker = _build(model_dir, fake_class, device="cuda", load=False)
+
+    with pytest.raises(MemoryRerankError, match="warm-up") as excinfo:
+        reranker.reload()
+
+    assert "cuda" in str(excinfo.value)
+    assert reranker.cost_per_pair_ms is None
+    with pytest.raises(MemoryRerankError, match="released"):
+        reranker.score("query", ["a"])
+    assert freed == ["gc.collect", "empty_cache"]
+    # Checked while the error is still alive: its traceback must not keep the model either.
+    _assert_unreferenced(fake_class, 0)
+
+
+def test_release_during_a_forward_pass_completes_after_it(
+    model_dir: Path, freed: list[str]
+) -> None:
+    entered, gate = threading.Event(), threading.Event()
+    fake_class = FakeCrossEncoderClass(logits={"a": 1.0})
+    reranker = _build(model_dir, fake_class, device="cuda")
+
+    def hold_the_scoring_pass(call_index: int) -> None:
+        if call_index == _WARM_UP_CALLS:
+            entered.set()
+            _wait(gate)
+            freed.append("forward pass done")
+
+    fake_class.on_predict = hold_the_scoring_pass
+    lock = _WatchedLock()
+    reranker._lock = lock  # type: ignore[assignment]
+    scoring = _Run(lambda: reranker.score("query", ["a"]))
+    scoring.start()
+    _wait(entered)
+
+    releasing = _Run(reranker.release)
+    releasing.start()
+    _wait(lock.contended)
+
+    assert releasing.is_alive()
+    assert freed == []
+    gate.set()
+    scoring.finish()
+    releasing.finish()
+    assert scoring.error is None
+    assert scoring.result == pytest.approx([_sigmoid(1.0)])
+    assert releasing.error is None
+    assert freed == ["forward pass done", "gc.collect", "empty_cache"]
+    with pytest.raises(MemoryRerankError, match="released"):
+        reranker.score("query", ["a"])
+
+
+def test_score_during_a_reload_raises_at_once_instead_of_waiting_for_the_load(
+    model_dir: Path,
+) -> None:
+    loading, gate = threading.Event(), threading.Event()
+
+    def hold_the_load() -> None:
+        loading.set()
+        _wait(gate)
+
+    fake_class = FakeCrossEncoderClass(on_load=hold_the_load, logits={"a": 1.0})
+    reranker = _build(model_dir, fake_class, load=False)
+    reloading = _Run(reranker.reload)
+    reloading.start()
+    _wait(loading)
+
+    scoring = _Run(lambda: reranker.score("query", ["a"]))
+    scoring.start()
+    scoring.finish()
+
+    assert isinstance(scoring.error, MemoryRerankError)
+    assert "released" in str(scoring.error)
+    gate.set()
+    reloading.finish()
+    assert reloading.error is None
+    assert reloading.result is True
+    assert reranker.score("query", ["a"]) == pytest.approx([_sigmoid(1.0)])
+
+
+def test_release_during_a_reload_load_returns_at_once_and_supersedes_it(
+    model_dir: Path, freed: list[str]
+) -> None:
+    loading, gate = threading.Event(), threading.Event()
+
+    def hold_the_load() -> None:
+        loading.set()
+        _wait(gate)
+
+    fake_class = FakeCrossEncoderClass(on_load=hold_the_load)
+    reranker = _build(model_dir, fake_class, device="cuda", load=False)
+    reloading = _Run(reranker.reload)
+    reloading.start()
+    _wait(loading)
+
+    releasing = _Run(reranker.release)
+    releasing.start()
+    releasing.finish()
+
+    assert releasing.error is None
+    assert freed == []  # nothing was loaded for the release to free
+    gate.set()
+    reloading.finish()
+    assert reloading.error is None
+    assert reloading.result is False
+    assert fake_class.built[0].predict_calls == []  # superseded before calibrating
+    assert freed == ["gc.collect", "empty_cache"]
+    assert reranker.pairs_within(10.0) == sys.maxsize
+    with pytest.raises(MemoryRerankError, match="released"):
+        reranker.score("query", ["a"])
+    _assert_unreferenced(fake_class, 0)
+
+
+def test_release_during_a_reload_calibration_returns_at_once_and_supersedes_it(
+    model_dir: Path, freed: list[str]
+) -> None:
+    calibrating, gate = threading.Event(), threading.Event()
+
+    def hold_the_first_warm_up_call(call_index: int) -> None:
+        if call_index == 0:
+            calibrating.set()
+            _wait(gate)
+
+    fake_class = FakeCrossEncoderClass(on_predict=hold_the_first_warm_up_call)
+    reranker = _build(model_dir, fake_class, device="cuda", load=False)
+    reloading = _Run(reranker.reload)
+    reloading.start()
+    _wait(calibrating)
+
+    releasing = _Run(reranker.release)
+    releasing.start()
+    releasing.finish()
+
+    assert releasing.error is None
+    assert freed == []
+    gate.set()
+    reloading.finish()
+    assert reloading.error is None
+    assert reloading.result is False
+    assert freed == ["gc.collect", "empty_cache"]
+    assert reranker.cost_per_pair_ms is None
+    with pytest.raises(MemoryRerankError, match="released"):
+        reranker.score("query", ["a"])
+    _assert_unreferenced(fake_class, 0)
+
+
+def test_two_racing_reloads_leave_one_model_and_both_return_true(model_dir: Path) -> None:
+    # Neither load finishes until both have started, so the two reloads overlap.
+    both_loading = threading.Barrier(2, timeout=_WAIT_S)
+    fake_class = FakeCrossEncoderClass(on_load=both_loading.wait, logits={"a": 1.0})
+    reranker = _build(model_dir, fake_class, load=False)
+    first, second = _Run(reranker.reload), _Run(reranker.reload)
+
+    first.start()
+    second.start()
+    first.finish()
+    second.finish()
+
+    assert (first.error, second.error) == (None, None)
+    assert (first.result, second.result) == (True, True)
+    assert len(fake_class.built) == 2
+    before = [len(model.predict_calls) for model in fake_class.built]
+    assert reranker.score("query", ["a"]) == pytest.approx([_sigmoid(1.0)])
+    after = [len(model.predict_calls) for model in fake_class.built]
+    assert sorted(a - b for a, b in zip(after, before)) == [0, 1]
+
+
 # -- NullReranker -----------------------------------------------------------------------------
 
 
@@ -552,6 +1014,17 @@ def test_null_reranker_fits_no_pairs(budget_ms: float) -> None:
 
 def test_null_reranker_returns_no_scores_for_the_pairs_it_was_cut_to() -> None:
     assert NullReranker().score("query", [], budget_ms=50.0) == []
+
+
+def test_null_reranker_release_and_reload_change_nothing() -> None:
+    reranker = NullReranker()
+
+    reranker.release()
+    reranker.release()
+    assert reranker.reload() is True
+    assert reranker.reload() is True
+    assert reranker.pairs_within(50.0) == 0
+    assert reranker.score("query", []) == []
 
 
 def test_null_reranker_refuses_to_invent_scores() -> None:

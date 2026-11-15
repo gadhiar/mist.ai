@@ -215,6 +215,13 @@ class HttpReranker:
         """
         return self._max_pairs if budget_ms >= _MIN_BUDGET_MS else 0
 
+    def release(self) -> None:
+        """Nothing to free: the model lives on the remote host, not on this machine's GPU."""
+
+    def reload(self) -> bool:
+        """Nothing to load: the model is the remote host's, and `release` dropped nothing here."""
+        return True
+
     def _post(self, payload: dict[str, object], timeout_ms: float) -> object:
         """Send one rerank request and return its decoded JSON body.
 

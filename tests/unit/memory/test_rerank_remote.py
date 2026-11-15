@@ -81,7 +81,7 @@ def _needs_reranker(reranker: Reranker) -> Reranker:
 
 
 def test_implements_the_reranker_protocol_signatures() -> None:
-    for name in ("score", "pairs_within"):
+    for name in ("score", "pairs_within", "release", "reload"):
         expected = inspect.signature(getattr(Reranker, name))
         actual = inspect.signature(getattr(HttpReranker, name))
         assert list(actual.parameters) == list(expected.parameters)
@@ -359,3 +359,17 @@ def test_credentials_in_the_base_url_stay_out_of_errors() -> None:
 )
 def test_pairs_within_is_the_ceiling_from_five_ms(budget_ms, expected) -> None:
     assert _reranker(_results(), max_pairs=12).pairs_within(budget_ms) == expected
+
+
+def test_release_and_reload_change_nothing() -> None:
+    recorder = Recorder(_results((0, 2.0)))
+    reranker = _reranker(recorder, max_pairs=12)
+
+    reranker.release()
+    reranker.release()
+    assert reranker.reload() is True
+    assert reranker.reload() is True
+
+    assert recorder.requests == []
+    assert reranker.pairs_within(50.0) == 12
+    assert reranker.score("query", ["a"]) == pytest.approx([_sigmoid(2.0)])
