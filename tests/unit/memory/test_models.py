@@ -544,6 +544,19 @@ class TestFactRowAndCandidate:
         assert candidate.ranks == {"fts": 1, "vector": 3}
         assert candidate.span_start is None and candidate.span_end is None
 
+    def test_a_candidate_time_is_an_instant_unless_flagged_as_a_day(self):
+        item = _fact_item()
+        candidate = Candidate(
+            kind="fact",
+            item_id=item.item_id,
+            text=item.text,
+            when=item.when,
+            source=item.source,
+            ranks={"fts": 1},
+        )
+
+        assert candidate.when_is_day is False
+
     def test_candidate_kind_must_match_source(self):
         with pytest.raises(ValueError, match="source"):
             Candidate(

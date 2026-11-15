@@ -19,7 +19,7 @@ import os
 import posixpath
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, date, datetime, tzinfo
 from pathlib import PurePosixPath
 
 from backend.interfaces import SidecarIndexProtocol
@@ -206,10 +206,11 @@ class VaultCandidates:
     file-level chunk, while `NoteSource.heading` stays None for such a chunk. `authored_by` is
     read from the frontmatter the sidecar stores with each chunk.
 
-    `when`, the instant recency is measured from, is the frontmatter `last_updated`. MIST
-    writes it as a date (writer.py, `now_iso[:10]`), read as midnight in the configured zone;
-    a naive datetime is read in that zone and an aware one as given. Without a readable
-    `last_updated`, `when` is the file mtime the sidecar stored at indexing, in UTC.
+    `when`, the time recency is measured from, is the frontmatter `last_updated`. MIST writes
+    it as a date (writer.py, `last_updated=today`), read as midnight in the configured zone
+    with `when_is_day` set, so the block names the day and no part of it; a naive datetime is
+    read in that zone and an aware one as given. Without a readable `last_updated`, `when` is
+    the file mtime the sidecar stored at indexing, in UTC.
 
     Dropped before the pool is cut to `k`:
 
@@ -308,13 +309,15 @@ class VaultCandidates:
             return None
         raw_heading = row.get("heading")
         heading = str(raw_heading) if raw_heading is not None else None
+        when, when_is_day = _note_when(frontmatter, row.get("mtime"), self._tz)
         return Candidate(
             kind="note",
             item_id=note_item_id(path, heading),
             text=content,
-            when=_note_when(frontmatter, row.get("mtime"), self._tz),
+            when=when,
             source=NoteSource(path=path, heading=heading, authored_by=authored_by),
             ranks=ranks,
+            when_is_day=when_is_day,
         )
 
 
@@ -382,23 +385,33 @@ def _authored_by(frontmatter: Mapping[str, object] | None) -> str | None:
 
 def _note_when(
     frontmatter: Mapping[str, object] | None, mtime: object, tz: tzinfo
-) -> datetime | None:
-    """The instant a note's recency is measured from.
+) -> tuple[datetime | None, bool]:
+    """The time a note's recency is measured from, and whether it names a day.
 
-    The frontmatter `last_updated` first: a date or a naive datetime is read in `tz` (MIST
-    writes a date, which names the user's day, not UTC's), an aware datetime as given. The
-    sidecar serializes YAML dates and datetimes with `str`, so a datetime may arrive with a
-    space before the time, which `fromisoformat` accepts. Without a readable `last_updated`,
-    the stored mtime (integer seconds) as a UTC instant; None when that is absent too.
+    The frontmatter `last_updated` first. A date (what MIST writes, naming the user's day, not
+    UTC's) is that day's midnight in `tz`, flagged as a day: recency is measured from the
+    midnight as before, while the block dates the note by the day alone instead of reading
+    "early morning" off the midnight. A naive datetime is read in `tz`, an aware one as given;
+    both are instants. The sidecar serializes YAML dates and datetimes with `str`, so a
+    datetime may arrive with a space before the time, which `fromisoformat` accepts. Without a
+    readable `last_updated`, the stored mtime (integer seconds) as a UTC instant; None when
+    that is absent too. Only a date-only `last_updated` is flagged as a day.
     """
     raw = frontmatter.get("last_updated") if frontmatter is not None else None
     if isinstance(raw, str):
+        text = raw.strip()
         try:
-            parsed = datetime.fromisoformat(raw.strip())
+            day = date.fromisoformat(text)
+        except ValueError:
+            day = None
+        if day is not None:
+            return datetime(day.year, day.month, day.day, tzinfo=tz), True
+        try:
+            parsed = datetime.fromisoformat(text)
         except ValueError:
             parsed = None
         if parsed is not None:
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=tz)
+            return (parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=tz)), False
     if isinstance(mtime, int | float) and not isinstance(mtime, bool):
-        return datetime.fromtimestamp(mtime, UTC)
-    return None
+        return datetime.fromtimestamp(mtime, UTC), False
+    return None, False
