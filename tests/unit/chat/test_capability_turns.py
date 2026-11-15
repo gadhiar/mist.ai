@@ -1001,6 +1001,28 @@ class TestAlsoReply:
         assert defaulted == plain
         assert [m for m in with_block if m["content"] != _BLOCK] == plain
 
+    def test_the_block_follows_the_history_and_counts_in_the_delta(self):
+        # The block varies per turn, so it must stay out of the cached prefix and the history.
+        handler, _provider, _ = _make_handler()
+        session = handler.get_or_create_session("s1", "User")
+        session.add_message("user", "earlier question")
+        session.add_message("assistant", "earlier answer")
+
+        plain = handler._build_messages(session, 10, pending_user_message="hello")
+        layout = handler._build_messages(
+            session, 10, pending_user_message="hello", capability_block=_BLOCK
+        )
+
+        contents = [m["content"] for m in layout.messages]
+        block_at = contents.index(_BLOCK)
+        assert contents.index("earlier answer") < block_at < len(contents) - 1
+        assert layout.messages[block_at]["role"] == "system"
+        assert layout.prefix_fingerprint == plain.prefix_fingerprint
+        assert layout.prefix_tokens_est == plain.prefix_tokens_est
+        assert layout.history_tokens_est == plain.history_tokens_est
+        block_tokens = handler._prompt_counter.count(_BLOCK)
+        assert layout.delta_tokens_est == plain.delta_tokens_est + block_tokens
+
 
 # --- The decode prompt holds no turn context ----------------------------------
 

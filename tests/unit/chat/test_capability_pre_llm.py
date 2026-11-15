@@ -709,6 +709,44 @@ class TestErrorBackstop:
         assert _complete(events).final_response == "I encountered an error: bad key ***"
 
 
+# --- Held turns ---------------------------------------------------------------
+
+
+class TestHeldTurn:
+    @pytest.mark.asyncio
+    async def test_a_held_turn_makes_no_host_or_model_call_until_released(self):
+        # `pre_llm` can have effects, and a held turn must stay cancellable without trace, so
+        # with a host attached the turn waits for its dispatch gate before anything else.
+        port = _FakePort([None])
+        handler, provider, store = _make_handler([ScriptedPass(chunks=["Hi there."])], port=port)
+        scope = handler.open_turn(
+            TurnRequest(
+                session_id="s1", user_text="hello there", origin="text", channel="text", held=True
+            )
+        )
+        events: list[StreamEvent] = []
+
+        async def _drain() -> None:
+            async for event in handler.stream_turn(scope):
+                events.append(event)
+
+        task = asyncio.create_task(_drain())
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        assert port.pre_llm_calls == []
+        assert provider.calls == []
+        assert events == []
+
+        scope.dispatch_gate.set()
+        await asyncio.wait_for(task, timeout=5)
+
+        assert [call["utterance"] for call in port.pre_llm_calls] == ["hello there"]
+        assert len(provider.calls) == 1
+        assert _complete(events).final_response == "Hi there."
+        assert store.events == []
+
+
 # --- decide_proposal ----------------------------------------------------------
 
 
