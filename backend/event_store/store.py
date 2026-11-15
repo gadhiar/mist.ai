@@ -62,6 +62,11 @@ _DEFAULT_DB_DIR = Path.home() / ".mist"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "event_store.db"
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+# Added to `conversation_turn_events` after databases already existed, so `initialize()`
+# migrates them. Order matches schema.sql, so a migrated table lists them in the same order
+# as a fresh one.
+_TURN_OUTCOME_COLUMNS = ("turn_outcome", "generated_response", "turn_modality")
+
 
 class EventStore:
     """Append-only event store backed by SQLite.
@@ -136,13 +141,23 @@ class EventStore:
             )
             logger.info("Event store: added `provisional` column to epoch_ledger")
 
-        # T31: `answered_by` (who answered the turn), same guard shape again.
-        # Nullable with no default, so every existing row stays NULL, which
-        # `backend.extraction_backlog.eligibility.policy_skip_reason` reads as
-        # a model-answered turn.
+        # MIS-127: the turn outcome columns, under the same guard and for the same
+        # reason as `origin` above. They are nullable with no default, so SQLite leaves
+        # every existing row NULL: a turn logged before the change has no recorded
+        # outcome, and inventing 'completed' for it would claim something never observed.
         turn_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(conversation_turn_events)")
         }
+        for column in _TURN_OUTCOME_COLUMNS:
+            if column not in turn_columns:
+                conn.execute(f"ALTER TABLE conversation_turn_events ADD COLUMN {column} TEXT")
+                logger.info("Event store: added `%s` column to conversation_turn_events", column)
+
+        # T31: `answered_by` (who answered the turn), same guard shape again.
+        # Nullable with no default, so every existing row stays NULL, which
+        # `backend.extraction_backlog.eligibility.policy_skip_reason` reads as
+        # a model-answered turn. Added after the turn outcome columns, as
+        # schema.sql lists it, so a migrated table has a fresh one's column order.
         if "answered_by" not in turn_columns:
             conn.execute("ALTER TABLE conversation_turn_events ADD COLUMN answered_by TEXT")
             logger.info("Event store: added `answered_by` column to conversation_turn_events")
@@ -271,14 +286,18 @@ class EventStore:
                     context_window, retrieval_context, tool_calls,
                     audio_hash, audio_format, audio_duration_ms, audio_sample_rate,
                     stt_model, tts_model, llm_model, llm_parameters,
-                    ontology_version, answered_by
+                    ontology_version,
+                    turn_outcome, generated_response, turn_modality,
+                    answered_by
                 ) VALUES (
                     :event_id, :session_id, :turn_index, :timestamp,
                     :user_utterance, :system_response,
                     :context_window, :retrieval_context, :tool_calls,
                     :audio_hash, :audio_format, :audio_duration_ms, :audio_sample_rate,
                     :stt_model, :tts_model, :llm_model, :llm_parameters,
-                    :ontology_version, :answered_by
+                    :ontology_version,
+                    :turn_outcome, :generated_response, :turn_modality,
+                    :answered_by
                 )
                 """,
                 row,

@@ -11,11 +11,17 @@ It also pins `pyarrow`, which `lancedb` imports. pyarrow 26 needs NumPy 2 at imp
 unbounded `pyarrow` range resolves to a release whose import fails. The pin stays at the
 last release that imports under numpy 1.26 until `chatterbox-tts` allows numpy 2.
 
-`requirements.txt` carries the exact pins the image installs; `pyproject.toml` carries the
-matching ranges (`mcp>=2.3`, `tzdata>=2026.5`, `pyarrow>=17.0,<26`), and both are checked.
+And it pins `scipy`, which her character stage (`backend/realtime/character.py`) uses for its
+EQ cascade. scipy reached the image only as a dependency of librosa, pyloudnorm, scikit-learn
+and sentence-transformers, so nothing kept it there; the pin is the version the stage was
+verified on.
 
-Static on purpose: the test parses both files and never imports `mcp`, `tzdata` or
-`pyarrow`, so it passes in an image that does not have them installed yet. Specifiers are
+`requirements.txt` carries the exact pins the image installs; `pyproject.toml` carries the
+matching ranges (`mcp>=2.3`, `tzdata>=2026.5`, `pyarrow>=17.0,<26`, `scipy>=1.11,<2`), and both
+are checked.
+
+Static on purpose: the test parses both files and never imports `mcp`, `tzdata`, `pyarrow` or
+`scipy`, so it passes in an image that does not have them installed yet. Specifiers are
 compared as strings rather than through `packaging`, which is not a declared dependency.
 """
 
@@ -72,6 +78,20 @@ class TestCapabilityDependenciesArePinned:
         ), f"tzdata is pinned to {pins['tzdata']!r}; the capability layer expects 2026.5"
 
 
+SCIPY_PIN = "1.17.1"
+
+
+class TestScipyIsPinnedForTheCharacterStage:
+    def test_scipy_is_pinned_exactly(self) -> None:
+        pins = _pinned_requirements()
+
+        assert "scipy" in pins, f"requirements.txt must pin `scipy=={SCIPY_PIN}` exactly"
+        assert pins["scipy"] == SCIPY_PIN, (
+            f"scipy is pinned to {pins['scipy']!r}; the character stage was verified on "
+            f"{SCIPY_PIN}, the version the backend image installs"
+        )
+
+
 PYARROW_PIN = "25.0.1"
 
 
@@ -91,6 +111,7 @@ PYPROJECT_RANGES = {
     "mcp": {">=2.3"},
     "tzdata": {">=2026.5"},
     "pyarrow": {">=17.0", "<26"},
+    "scipy": {">=1.11", "<2"},
 }
 
 # `name[extras] specifiers ; marker`; extras and marker are not needed for these entries.
@@ -117,7 +138,7 @@ def _pyproject_dependencies() -> dict[str, set[str]]:
 
 
 class TestPyprojectRangesMatchPins:
-    def test_pyproject_declares_capability_and_pyarrow_ranges(self) -> None:
+    def test_pyproject_declares_capability_pyarrow_and_scipy_ranges(self) -> None:
         ranges = _pyproject_dependencies()
 
         for name, expected in PYPROJECT_RANGES.items():

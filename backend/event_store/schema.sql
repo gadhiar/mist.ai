@@ -53,10 +53,18 @@ CREATE TABLE IF NOT EXISTS conversation_turn_events (
     -- Immutability timestamp
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
 
+    -- Turn outcome (MIS-127). NULL on every turn logged before these columns existed.
+    -- Kept after the original columns so a fresh database and one migrated by
+    -- EventStore.initialize(), whose ALTER TABLE ADD COLUMN appends, have the same column order.
+    turn_outcome TEXT,                       -- 'completed', 'interrupted', 'superseded', 'error'
+    generated_response TEXT,                 -- full generated text; longer than system_response
+                                             -- when an interrupted turn logs only what was heard
+    turn_modality TEXT,                      -- 'voice', 'text'
+
     -- Who answered the turn: 'model' or 'capability' (a capability's template
     -- was the whole reply). NULL: recorded before the column existed, read as
-    -- 'model'. Last, so `EventStore.initialize`'s ALTER TABLE on an older
-    -- database gives the same column order as this CREATE.
+    -- 'model'. Last, after the turn outcome columns, so `EventStore.initialize`'s
+    -- ALTER TABLE on an older database gives the same column order as this CREATE.
     answered_by TEXT
 );
 

@@ -9,21 +9,31 @@ Enables LLM to autonomously:
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import hashlib
+import itertools
+import json
 import logging
 import math
 import random
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, field
+from contextlib import aclosing
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from backend.capabilities.contracts import DecodeReply
 from backend.capabilities.tool_events import tool_event_fields
-from backend.chat.context_budget import ContextBudgetPlanner
+from backend.chat.context_budget import (
+    ApproximateTokenCounter,
+    ContextBudgetPlanner,
+    PromptStats,
+    TurnDeltaPart,
+    get_history_strategy,
+)
 from backend.chat.hydration_clock import HydrationClockError
 from backend.chat.mist_context import MistContext
 from backend.chat.session_synthesizer import SessionSynthesizer
@@ -33,7 +43,7 @@ from backend.errors import CapabilityUnavailableError
 from backend.event_store.models import AnsweredBy, ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.extraction_backlog.eligibility import policy_skip_reason
-from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig
 from backend.knowledge.models import (
     ConversationSession,
     RetrievalFilters,
@@ -48,10 +58,11 @@ from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
 from backend.llm.models import LLMResponse, ThinkingConfig, UsageMetadata
 from backend.llm.models import ToolCall as LLMToolCall
-from backend.sentence_detector import SentenceBoundaryDetector
+from backend.sentence_detector import SentenceBoundaryDetector, find_clause_boundary
 from backend.vault.conventions import ConventionsLoader
 
 from .retrieval_trace import TurnTraceBuilder, refs_removed, trace_failed
+from .turn_scope import CommitResult, StreamTurnState, TurnDelivery, TurnRequest, TurnScope
 
 if TYPE_CHECKING:
     from backend.capabilities.contracts import (
@@ -742,34 +753,133 @@ def _format_user_profile_block(body: str) -> str:
     return f"=== WHAT YOU KNOW ABOUT THE USER (user profile) ===\n\n{body.strip()}\n"
 
 
-@dataclass
-class _StreamTurnState:
-    """Mutable accumulator threaded through both LLM passes of one streaming turn.
+# ---------------------------------------------------------------------------
+# Per-turn delta (cache-stable prompt layout)
+#
+# Everything that varies per turn is rendered after the history, in the final
+# user message (or one system message directly before it), so the stable
+# prefix and the history of one prompt are a prefix of the next prompt and
+# llama-server can reuse its KV cache for them.
+# ---------------------------------------------------------------------------
 
-    Async generators cannot `return` a value (PEP 525 forbids `return expr`
-    inside one), so `ConversationHandler._stream_llm_pass` communicates its
-    result by mutating an instance of this class rather than returning one.
+# The fixed lines `TurnRequest.interruption_note` renders as. They never quote
+# the cut-off reply: history already holds what the user heard as the
+# assistant message.
+_INTERRUPTION_NOTES: dict[str, str] = {
+    "mid_reply": (
+        "The user interrupted your previous reply; the assistant message above is the part "
+        "they heard."
+    ),
+    "before_reply": "The user interrupted your previous turn before you said anything.",
+}
 
-    `emitted` is the turn-wide concatenation of every Token piece yielded so
-    far, across both passes -- it becomes `Complete.final_response` verbatim
-    (T3/v2 contract: final_response is exactly what was streamed, not a
-    separately post-filtered copy of it).
+# The `register` delta part of every `tts`-channel turn. A spoken reply should
+# be brief, a typed one need not be; asking in the delta rather than the prefix
+# keeps one cached prefix for both kinds of turn.
+SPOKEN_REGISTER_TEXT = (
+    "This reply is spoken. Answer in one to three short sentences, and offer more on screen "
+    "or on request."
+)
 
-    The `pass_*` dicts are keyed by pass_num (1 or 2) and reconstruct what
-    the pre-streaming code carried in a single `LLMResponse` per pass, built
-    from what actually streamed and passed the slop gate. This lets the
-    tool-call correlation message and the debug-logger turn record stay
-    byte-for-byte compatible with the pre-v2 shape.
+# `register` goes last, next to the user's words it shapes the answer to.
+_DELTA_ORDER: tuple[str, ...] = (
+    "clock",
+    "interruption",
+    "retrieval",
+    "memory",
+    "live_advisory",
+    "register",
+)
+
+_DELTA_LABELS: dict[str, str] = {
+    "clock": "=== CURRENT TIME ===",
+    "interruption": "=== INTERRUPTION ===",
+    "retrieval": "=== RETRIEVED CONTEXT ===",
+    "memory": "=== MEMORY ===",
+    "live_advisory": "=== LIVE DATA ADVISORY ===",
+    "register": "=== SPOKEN REPLY ===",
+}
+
+_USER_MESSAGE_LABEL = "=== USER MESSAGE ==="
+
+
+def _render_turn_delta(
+    parts: list[TurnDeltaPart], user_text: str, placement: str
+) -> tuple[list[dict[str, str]], str]:
+    """Render the delta parts and the user's words as the prompt's last message(s).
+
+    With no parts the final message is the user's text unchanged. Otherwise
+    each part becomes a labelled block, in `_DELTA_ORDER`. `user_prefix`
+    puts the blocks ahead of the labelled user text in one user message;
+    `system_tail` puts them in one system message directly before the plain
+    user message.
+
+    Returns:
+        The message list to append after the history, and the rendered delta
+        text alone (without the user's words) for token accounting.
+    """
+    if not parts:
+        return [{"role": "user", "content": user_text}], ""
+    ordered = sorted(parts, key=lambda part: _DELTA_ORDER.index(part.kind))
+    delta_text = "\n\n".join(f"{_DELTA_LABELS[part.kind]}\n{part.text}" for part in ordered)
+    if placement == "system_tail":
+        return [
+            {"role": "system", "content": delta_text},
+            {"role": "user", "content": user_text},
+        ], delta_text
+    return [
+        {"role": "user", "content": f"{delta_text}\n\n{_USER_MESSAGE_LABEL}\n{user_text}"}
+    ], delta_text
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class PromptLayout:
+    """The prompt `_build_messages` composed, with what the turn reports about it.
+
+    Attributes:
+        messages: The message list for the LLM: stable prefix, history, the
+            capability actions block when there is one, then the delta and the
+            user's words.
+        prefix_fingerprint: `(component, sha256)` for each stable-prefix
+            component and the tool schemas, in a fixed order, so the handler
+            can tell which one changed between turns.
+        prefix_tokens_est: Estimated tokens of the prefix messages and tools.
+        history_tokens_est: Estimated tokens of the history messages shown.
+        delta_tokens_est: Estimated tokens of the rendered delta text, plus
+            the capability actions block when there is one.
+        history_compacted: The history selection's `compacted`.
     """
 
-    emitted: str = ""
-    pass_text: dict[int, str] = field(default_factory=dict)
-    pass_tool_calls: dict[int, list[LLMToolCall] | None] = field(default_factory=dict)
-    pass_finish_reason: dict[int, str | None] = field(default_factory=dict)
-    pass_usage: dict[int, UsageMetadata | None] = field(default_factory=dict)
-    pass_reasoning: dict[int, str | None] = field(default_factory=dict)
-    pass_ttft_ms: dict[int, float | None] = field(default_factory=dict)
-    pass_duration_ms: dict[int, float] = field(default_factory=dict)
+    messages: list[dict[str, Any]]
+    prefix_fingerprint: tuple[tuple[str, str], ...]
+    prefix_tokens_est: int
+    history_tokens_est: int
+    delta_tokens_est: int
+    history_compacted: Literal["none", "step", "budget"]
+
+
+def _pass_response(state: StreamTurnState, pass_num: int) -> LLMResponse | None:
+    """Rebuild one finished pass as the single `LLMResponse` the pre-v2 code carried.
+
+    Built from what actually streamed and passed the slop gate, so the
+    tool-call correlation message and the debug-logger turn record keep the
+    pre-v2 shape. None when the pass never finished (it was cancelled, or a
+    tool-free turn has no pass 2).
+    """
+    if pass_num not in state.pass_text:
+        return None
+    return LLMResponse(
+        content=state.pass_text[pass_num] or None,
+        tool_calls=state.pass_tool_calls.get(pass_num),
+        reasoning_content=state.pass_reasoning.get(pass_num),
+        finish_reason=state.pass_finish_reason.get(pass_num),
+        usage=state.pass_usage.get(pass_num),
+        partial=False,
+    )
 
 
 class _PassEmitter:
@@ -780,7 +890,7 @@ class _PassEmitter:
     sentence, and voice speaks it the same way.
     """
 
-    def __init__(self, gate: Callable[[str], str], state: _StreamTurnState, pass_num: int) -> None:
+    def __init__(self, gate: Callable[[str], str], state: StreamTurnState, pass_num: int) -> None:
         self._gate = gate
         self._state = state
         self._pass_num = pass_num
@@ -953,6 +1063,7 @@ class ConversationHandler:
         hydration_clock: HydrationClock | None = None,
         session_origin: str = "real",
         extraction_dispatcher: ExtractionDispatcher | None = None,
+        register_prompt: str | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -972,8 +1083,9 @@ class ConversationHandler:
                 `MIST_DEBUG_JSONL` is unset the logger yields no-op records.
             budget_planner: Optional ContextBudgetPlanner (Cluster 6). When
                 None and `config.context_budget.enabled` is True, one is
-                constructed from `config.context_budget`. When disabled, the
-                handler falls back to legacy pre-Cluster-6 message assembly.
+                constructed from `config.context_budget`. When disabled,
+                retrieval is not pruned and the history strategy selects the
+                window with no token limit.
             vault_writer: Optional VaultWriterProtocol (Cluster 8 Phase 5).
                 When set, `end_session` renders one synthesis-only session
                 note (R1.3.1). None disables the vault layer entirely.
@@ -1010,7 +1122,15 @@ class ConversationHandler:
                 most tests), the in-process `_extract_knowledge_async` path runs
                 exactly as before. May also be attached after construction with
                 `attach_extraction_dispatcher`.
+            register_prompt: The fixed register line every turn shares (how
+                MIST speaks and addresses the user), built by the caller; the
+                handler only places it. Placed in the stable prefix right after
+                the persona block and charged as fixed cost, because it is the
+                same on every turn and so belongs to the cached prefix. None
+                adds nothing. The per-turn ask for a short spoken reply is a
+                separate `register` delta part, not this.
         """
+        self._register_prompt = register_prompt
         self.config = config
         # Injectable clock (DI seam). Default = real wall-clock so production
         # behavior is unchanged; the replay path supplies a fixed value.
@@ -1064,6 +1184,26 @@ class ConversationHandler:
             self._budget_planner = ContextBudgetPlanner(config.context_budget)
         else:
             self._budget_planner = None
+
+        # Prompt layout settings and the history strategy. With the planner
+        # disabled the strategy still chooses the history window (with no
+        # token limit), so the stepped window keeps the prompt cache-stable
+        # either way.
+        if self._budget_planner is not None:
+            self._context_budget_config = self._budget_planner.config
+            self._history_strategy = self._budget_planner.history_strategy
+            self._prompt_counter = self._budget_planner.counter
+        else:
+            self._context_budget_config = (
+                getattr(config, "context_budget", None) or ContextBudgetConfig()
+            )
+            self._history_strategy = get_history_strategy(
+                self._context_budget_config.history_strategy
+            )
+            self._prompt_counter = ApproximateTokenCounter()
+        # Session id -> the previous turn's `PromptLayout.prefix_fingerprint`,
+        # to detect and name a stable-prefix change (see `_note_prefix_change`).
+        self._prefix_fingerprints: dict[str, tuple[tuple[str, str], ...]] = {}
 
         # LLM provider (replaces ChatOllama)
         self._provider = llm_provider
@@ -1157,28 +1297,14 @@ class ConversationHandler:
         self._slop_detector = SlopDetector()
         self._slop_max_regen_attempts = 2
 
-        # ADR-017 Wave 2: per-turn FE-bound event buffer. Reset at the top of
-        # every handle_message; appended during tool dispatch
-        # (tool_call_started/completed, cards_summon/dismiss, graph_subgraph);
-        # drained by handle_message_streaming as WSEvent yields before Token
-        # chars so the bridge forwards them to the canonical message_queue.
-        self._turn_ws_events: list[dict[str, Any]] = []
-
-        # ADR-017 Wave 2: per-turn context used by tool handlers that need
-        # session/turn awareness (graph_subgraph distant-points RNG seed).
-        # Set at the top of handle_message; read inside dispatch handlers.
-        self._current_session_id: str | None = None
-        self._current_turn_index: int = 0
-
-        # Retrieval trace (`retrieval_context["trace"]`): one builder per turn,
-        # made at the top of `handle_message_streaming` and dropped once the
-        # turn is recorded, so a feed outside a turn is a no-op. A builder
-        # error marks the turn's trace failed instead of breaking the turn.
-        # `_turn_tool_call` is the 1-based position of the tool call being
-        # dispatched, which the trace records as `call`.
-        self._turn_trace: TurnTraceBuilder | None = None
-        self._turn_trace_failed: bool = False
-        self._turn_tool_call: int = 0
+        # Source of `TurnScope.turn_index`. Per-turn state (the ADR-017
+        # FE-bound event buffer, session id, turn index, retrieval trace)
+        # lives on the `TurnScope` each turn creates, not on this shared
+        # handler, so overlapping turns cannot see each other's events or
+        # trace. The counter itself stays handler-wide and monotonic: a
+        # session's graph seeds keep the values they had when the index was a
+        # handler attribute.
+        self._turn_indices = itertools.count(1)
 
         # Capabilities: None until `attach_capability_host`, and every turn is today's turn
         # while it is None. `_capability_history` holds, per session, the history entries of
@@ -1187,11 +1313,19 @@ class ConversationHandler:
         self._capability_host: CapabilityTurnPort | None = None
         self._capability_tiers: TierProviders | None = None
         self._capability_history: dict[str, list[tuple[str, str]]] = {}
+        # `TurnScope.turn_index` of each streamed turn a capability's template answered with no
+        # model pass, so `commit_turn` records it as `answered_by="capability"` and keeps it out
+        # of extraction. Held here rather than on `TurnScope` because the scope is the contract
+        # the realtime controller shares; `commit_turn` removes the index, and the text path
+        # removes it again in its `finally` for a turn that never commits.
+        self._capability_answered_turns: set[int] = set()
 
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
     async def _handle_query_knowledge_graph(
         self,
+        scope: TurnScope,
+        /,
         query: str,
         entity_types: list[str] | None = None,
         relationship_types: list[str] | None = None,
@@ -1201,9 +1335,15 @@ class ConversationHandler:
         """Execute the query_knowledge_graph tool.
 
         ADR-017 Wave 2: on successful retrieval with at least one fact,
-        appends a graph_subgraph WS event to the per-turn buffer so the
-        FE graph form can render the focal + neighbors. Empty retrievals
-        skip the emit (the FE keeps prior graphData).
+        appends a graph_subgraph WS event to `scope`'s buffer, seeded with
+        `scope.graph_seed`, so the FE graph form can render the focal +
+        neighbors. Empty retrievals skip the emit (the FE keeps prior
+        graphData).
+
+        `scope` is positional-only, like every tool handler's, which keeps
+        it out of the keyword namespace the LLM's arguments arrive in: a
+        model-supplied `scope` argument fails with a `TypeError` naming the
+        positional-only parameter.
 
         LLM-context split (BE/FE differentiation):
         - 'compact' (default): the LLM-facing result is the focal entity
@@ -1220,7 +1360,7 @@ class ConversationHandler:
             raise ValueError(f"invalid verbosity: {verbosity!r}; must be 'compact' or 'full'")
         try:
             tool_result, result = await self._query_knowledge_graph(
-                query, entity_types, relationship_types, limit, verbosity
+                scope, query, entity_types, relationship_types, limit, verbosity
             )
         except Exception as e:
             logger.error("Error querying knowledge graph: %s", e)
@@ -1229,20 +1369,22 @@ class ConversationHandler:
         # Fed after the `try`, so no trace error can be caught there and
         # change the tool result the model gets.
         self._feed_trace(
+            scope,
             lambda trace: trace.tool_retrieved(
                 "query_knowledge_graph",
-                call=self._turn_tool_call,
+                call=scope.tool_call_index,
                 limit=limit,
                 candidates=result.candidates,
                 unlisted_refs=(
                     _kg_compact_unlisted_refs(result.facts) if verbosity == "compact" else ()
                 ),
-            )
+            ),
         )
         return tool_result
 
     async def _query_knowledge_graph(
         self,
+        scope: TurnScope,
         query: str,
         entity_types: list[str] | None,
         relationship_types: list[str] | None,
@@ -1270,12 +1412,9 @@ class ConversationHandler:
         # ADR-017 Wave 2: emit graph_subgraph alongside the textual
         # tool result so the FE renders the focal + depth-1 neighborhood
         # for this query. Seed RNG with session+turn for layout stability.
-        graph_payload = _build_graph_subgraph_payload(
-            result,
-            seed=f"{self._current_session_id}:{self._current_turn_index}",
-        )
+        graph_payload = _build_graph_subgraph_payload(result, seed=scope.graph_seed)
         if graph_payload is not None:
-            self._turn_ws_events.append(graph_payload)
+            scope.emit(graph_payload)
 
         if verbosity == "full":
             return result.formatted_context, result
@@ -1283,6 +1422,8 @@ class ConversationHandler:
 
     async def _handle_query_vault(
         self,
+        scope: TurnScope,
+        /,
         query: str,
         limit: int = 5,
         display_hint: str = "auto",
@@ -1307,18 +1448,20 @@ class ConversationHandler:
             raise ValueError(f"limit must be between 1 and 10; got {limit}")
 
         try:
-            tool_result, result, facts_before = await self._query_vault(query, limit, display_hint)
+            tool_result, result, facts_before = await self._query_vault(
+                scope, query, limit, display_hint
+            )
         except Exception as e:
             logger.error("Error querying vault: %s", e)
             return f"Error searching vault: {e!s}"
 
         # Fed after the `try`, so no trace error can be caught there and
         # change the tool result the model gets.
-        self._trace_vault_tool(result, facts_before, limit)
+        self._trace_vault_tool(scope, result, facts_before, limit)
         return tool_result
 
     async def _query_vault(
-        self, query: str, limit: int, display_hint: str
+        self, scope: TurnScope, query: str, limit: int, display_hint: str
     ) -> tuple[str, RetrievalResult, list[RetrievedFact]]:
         """Run the `query_vault` retrieval.
 
@@ -1377,7 +1520,7 @@ class ConversationHandler:
 
         vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
         if vault_facts:
-            self._turn_ws_events.append(
+            scope.emit(
                 _build_vault_results_payload(
                     query=query,
                     facts=vault_facts,
@@ -1408,54 +1551,63 @@ class ConversationHandler:
             trace.auto_inject_ran(retrieval_result.candidates, limit=limit)
 
     def _trace_vault_tool(
-        self, result: RetrievalResult, facts_before: list[RetrievedFact], limit: int
+        self,
+        scope: TurnScope,
+        result: RetrievalResult,
+        facts_before: list[RetrievedFact],
+        limit: int,
     ) -> None:
         """Feed one `query_vault` retrieval to the turn's trace, with its profile dedup."""
         self._feed_trace(
+            scope,
             lambda trace: trace.tool_retrieved(
                 "query_vault",
-                call=self._turn_tool_call,
+                call=scope.tool_call_index,
                 limit=limit,
                 candidates=result.candidates,
                 deduped_refs=refs_removed(facts_before, result.facts),
-            )
+            ),
         )
 
-    def _feed_trace(self, feed: Callable[[TurnTraceBuilder], None]) -> None:
-        """Run one feed against the turn's trace builder, if the turn has one.
+    def _feed_trace(
+        self, scope: TurnScope | None, feed: Callable[[TurnTraceBuilder], None]
+    ) -> None:
+        """Run one feed against `scope`'s trace builder, if it has one.
 
-        The trace records a turn; it must never change or break one. A
-        builder error marks the turn's trace failed, logged by class only so
-        no fact text reaches the log, and later feeds this turn are skipped.
+        A no-op without a scope (a direct `_build_messages` call), on a scope
+        with no builder (built outside `open_turn`, or already committed),
+        or once the turn's trace has failed. The trace records a turn; it
+        must never change or break one. A builder error marks the turn's
+        trace failed, logged by class only so no fact text reaches the log,
+        and later feeds this turn are skipped.
         """
-        trace = self._turn_trace
-        if trace is None or self._turn_trace_failed:
+        if scope is None or scope.trace is None or scope.trace_failed:
             return
         try:
-            feed(trace)
+            feed(scope.trace)
         except (TypeError, ValueError, KeyError) as exc:
-            self._turn_trace_failed = True
+            scope.trace_failed = True
             logger.error("[TRACE] Retrieval trace builder failed: %s", type(exc).__name__)
 
-    def _turn_trace_payload(self) -> dict[str, Any] | None:
-        """Render the turn's trace for `retrieval_context["trace"]`.
+    def _turn_trace_payload(self, scope: TurnScope) -> dict[str, Any] | None:
+        """Render `scope`'s trace for `retrieval_context["trace"]`.
 
-        None outside a turn. `trace_failed()` when a feed or the render
-        failed, so the row still says a trace was attempted.
+        None when the scope has no builder. `trace_failed()` when a feed or
+        the render failed, so the row still says a trace was attempted.
         """
-        trace = self._turn_trace
+        trace = scope.trace
         if trace is None:
             return None
-        if self._turn_trace_failed:
+        if scope.trace_failed:
             return trace_failed()
         try:
             return trace.build()
         except (TypeError, ValueError, KeyError) as exc:
-            self._turn_trace_failed = True
+            scope.trace_failed = True
             logger.error("[TRACE] Retrieval trace render failed: %s", type(exc).__name__)
             return trace_failed()
 
-    async def _handle_switch_form(self, form: str, reason: str) -> str:
+    async def _handle_switch_form(self, scope: TurnScope, /, form: str, reason: str) -> str:
         """Execute the frontend.switch_form tool.
 
         Appends a form_switch WS event with the target form + reason per
@@ -1466,7 +1618,7 @@ class ConversationHandler:
             raise ValueError(f"invalid form: {form!r}; must be one of ['ring', 'cloud', 'graph']")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
-        self._turn_ws_events.append(
+        scope.emit(
             {
                 "type": "form_switch",
                 "form": form,
@@ -1475,11 +1627,13 @@ class ConversationHandler:
         )
         return f"Switched to {form} form"
 
-    async def _handle_summon_cards(self, header: str, cards: list[dict[str, Any]]) -> str:
+    async def _handle_summon_cards(
+        self, scope: TurnScope, /, header: str, cards: list[dict[str, Any]]
+    ) -> str:
         """Execute the frontend.summon_cards tool.
 
         Normalizes each card's pattern (default 'lines'), validates against
-        the closed enum, then appends a cards_summon WS event to the per-turn
+        the closed enum, then appends a cards_summon WS event to `scope`'s
         buffer per ADR-017 Wave 2. Returns a short string to the LLM so the
         final-pass response can reference what was displayed.
         """
@@ -1502,22 +1656,20 @@ class ConversationHandler:
                     f" must be one of {sorted(_VALID_CARD_PATTERNS)}"
                 )
             normalized.append({"id": card_id, "label": label, "pattern": pattern})
-        self._turn_ws_events.append(
-            {"type": "cards_summon", "panel": {"header": header, "cards": normalized}}
-        )
+        scope.emit({"type": "cards_summon", "panel": {"header": header, "cards": normalized}})
         return f"Displayed {len(normalized)} cards"
 
-    async def _handle_dismiss_cards(self) -> str:
+    async def _handle_dismiss_cards(self, scope: TurnScope, /) -> str:
         """Execute the frontend.dismiss_cards tool.
 
-        Appends a cards_dismiss WS event (empty payload per ADR-017) to the
-        per-turn buffer. Returns a short string to the LLM.
+        Appends a cards_dismiss WS event (empty payload per ADR-017) to
+        `scope`'s buffer. Returns a short string to the LLM.
         """
-        self._turn_ws_events.append({"type": "cards_dismiss"})
+        scope.emit({"type": "cards_dismiss"})
         return "Dismissed cards panel"
 
-    async def _dispatch_tool(self, tool_call: LLMToolCall) -> str:
-        """Dispatch a tool call to its handler.
+    async def _dispatch_tool(self, scope: TurnScope, tool_call: LLMToolCall) -> str:
+        """Dispatch a tool call to its handler, within the turn's `scope`.
 
         Raises ToolNotFoundError when the LLM calls a tool name not in the
         handler registry. The observability wrap catches and emits as a
@@ -1534,14 +1686,16 @@ class ConversationHandler:
         handler = handlers.get(tool_call.name)
         if handler is None:
             raise _ToolNotFoundError(tool_call.name)
-        return await handler(**tool_call.arguments)
+        return await handler(scope, **tool_call.arguments)
 
-    async def _dispatch_tool_with_observability(self, tool_call: LLMToolCall) -> str:
+    async def _dispatch_tool_with_observability(
+        self, scope: TurnScope, tool_call: LLMToolCall
+    ) -> str:
         """Dispatch a tool call with FE-bound observability events.
 
         Appends tool_call_started before _dispatch_tool runs and
-        tool_call_completed after (success or failure) into the per-turn
-        WS event buffer. Returns the tool result string; on exception,
+        tool_call_completed after (success or failure) into `scope`'s WS
+        event buffer. Returns the tool result string; on exception,
         substitutes a "Tool error: ..." sentinel and records a sanitized
         error label on the completed event (type name + message; no
         repr() that could leak module paths or internal state).
@@ -1554,8 +1708,8 @@ class ConversationHandler:
         # and JSONL records all join on ONE tool_call_id (ADR-017 UUID
         # convention); mint only when the provider sent none.
         tool_call_id = tool_call.id or str(uuid.uuid4())
-        self._turn_tool_call += 1
-        self._turn_ws_events.append(
+        scope.tool_call_index += 1
+        scope.emit(
             {
                 "type": "tool_call_started",
                 "tool_call_id": tool_call_id,
@@ -1566,7 +1720,7 @@ class ConversationHandler:
         start = time.perf_counter()
         error: str | None = None
         try:
-            tool_result = await self._dispatch_tool(tool_call)
+            tool_result = await self._dispatch_tool(scope, tool_call)
         except _ToolNotFoundError as exc:
             tool_result = (
                 f"Tool not found: {exc.tool_name}." " Pick a tool from the registered catalog."
@@ -1579,7 +1733,7 @@ class ConversationHandler:
             # detail that the FE has no business displaying.
             error = f"{type(exc).__name__}: {exc}"
         duration_ms = int((time.perf_counter() - start) * 1000)
-        self._turn_ws_events.append(
+        scope.emit(
             {
                 "type": "tool_call_completed",
                 "tool_call_id": tool_call_id,
@@ -1589,6 +1743,48 @@ class ConversationHandler:
                 "error": error,
             }
         )
+        return tool_result
+
+    async def _run_dispatched_tool(self, scope: TurnScope, tool_call: LLMToolCall) -> str:
+        """Run one dispatched tool to completion and put its result on `scope`.
+
+        Runs as its own task (see `stream_turn`), so it finishes, and its
+        result reaches `scope.tool_results` for the commit, even when the
+        stream that dispatched it was cancelled. Tool usage is recorded here
+        for the same reason.
+
+        ADR-017 Wave 2: `_dispatch_tool_with_observability` emits
+        tool_call_started before `_dispatch_tool` runs and
+        tool_call_completed after (success or failure) into the scope's
+        buffer; the stream drains them right after the tool returns.
+        """
+        tool_result = await self._dispatch_tool_with_observability(scope, tool_call)
+        scope.tool_results.append(
+            {
+                "name": tool_call.name,
+                "result": tool_result,
+                "tool_call_id": tool_call.id,
+            }
+        )
+
+        # Record tool usage for skill derivation
+        if self._tool_usage_tracker is not None:
+            from backend.knowledge.extraction.tool_usage_tracker import (
+                ToolCallRecord,
+                classify_tool_type,
+            )
+
+            self._tool_usage_tracker.record(
+                ToolCallRecord(
+                    tool_name=tool_call.name,
+                    tool_type=classify_tool_type(tool_call.name),
+                    context=str(tool_call.arguments)[:500],
+                    success=not tool_result.startswith("Tool not found:"),
+                    timestamp=datetime.now(UTC),
+                    session_id=scope.session_id,
+                    event_id="",
+                )
+            )
         return tool_result
 
     def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
@@ -1792,19 +1988,42 @@ class ConversationHandler:
         )
         return self._slop_detector.strip_fixable(sentence)
 
-    def _pop_turn_ws_events(self) -> list[dict[str, Any]]:
-        """Atomically drain the per-turn ADR-017 WS event buffer.
+    def open_turn(self, request: TurnRequest) -> TurnScope:
+        """Create the `TurnScope` for a turn that is starting.
 
-        Used both for the inline drain right after each tool dispatch (so
-        tool_call_started/completed reach the caller as they happen rather
-        than batched at end of turn, T3/v2) and for the top-level `finally`
-        safety net in `handle_message_streaming` that guarantees no
-        `tool_call_started` is ever left unpaired even if something raises
-        between the two.
+        `next()` on the counter has no await around it, so two turns starting
+        concurrently always get distinct indices. The session object is
+        created here if it is new, but no history is written: the user's
+        message reaches history only through `commit_turn`, so a turn
+        cancelled without trace leaves none.
+
+        Raises:
+            ValueError: `request.origin` is `system`. No producer of
+                MIST-initiated turns exists yet, and recording one as a user
+                turn would put words in the user's mouth.
         """
-        events = self._turn_ws_events
-        self._turn_ws_events = []
-        return events
+        if request.origin == "system":
+            raise ValueError("origin 'system' is reserved: nothing produces system turns yet")
+        self.get_or_create_session(request.session_id, request.user_id)
+        scope = TurnScope(
+            session_id=request.session_id,
+            turn_index=next(self._turn_indices),
+            request=request,
+        )
+        if not request.held:
+            scope.dispatch_gate.set()
+        scope.trace = TurnTraceBuilder()
+        return scope
+
+    def prefetch(self, session_id: str, partial_text: str | None) -> None:
+        """Hint that a turn for `session_id` is forming; returns at once.
+
+        The turn controller calls this on speech start, partials and endpoint
+        candidates so a read-path prefetch (memory retrieval ahead of the
+        endpoint) can plug in later without changing who owns cancellation.
+        The conversation handler has nothing to prefetch yet.
+        """
+        return None
 
     async def _stream_llm_pass(
         self,
@@ -1813,7 +2032,8 @@ class ConversationHandler:
         session_id: str,
         call_site: str,
         pass_num: int,
-        state: _StreamTurnState,
+        state: StreamTurnState,
+        first_clause_min_chars: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream one LLM pass, sentence-gating content through the slop filter.
 
@@ -1849,10 +2069,34 @@ class ConversationHandler:
         usage, reasoning_content, time-to-first-token, and total duration.
         The caller reads `state` after this generator is exhausted.
 
+        The provider stream is iterated inside `contextlib.aclosing`, so a
+        cancellation or `aclose()` of this generator closes the provider's
+        generator (and its HTTP stream) in the same task, not several loop
+        ticks later in the asyncgen finalizer.
+
+        With `first_clause_min_chars` set (a `tts` turn), the turn's first
+        emission is cut at `find_clause_boundary` instead of the sentence end,
+        so speech can start while the model is still writing the sentence.
+        TTS cuts its first segment with the same function, so the first Token
+        and the first segment end at the same character. "First" is read
+        from `state.emitted`, which spans both passes: a pass 1 that only
+        called a tool leaves the early cut to pass 2. The clause goes through
+        the same slop gate as a sentence, and everything after it is
+        sentence-gated as before.
+
+        Args:
+            request: The pass's LLM request.
+            session_id: The turn's session, for logs.
+            call_site: The pass's `llm_call_context` call site.
+            pass_num: 1 for the initial pass, 2 for the post-tool pass.
+            state: The turn's accumulator, mutated in place.
+            first_clause_min_chars: The earliest index the first clause may
+                be cut at; None keeps sentence gating throughout.
+
         Yields:
-            Token events, `pass_num=pass_num`, for each gated sentence
-            (including the trailing partial sentence flushed at end of
-            stream).
+            Token events, `pass_num=pass_num`, for the first clause when one
+            is cut early and for each gated sentence (including the trailing
+            partial sentence flushed at end of stream).
         """
         gate = SentenceBoundaryDetector()
         emitter = _PassEmitter(
@@ -1860,6 +2104,9 @@ class ConversationHandler:
             state,
             pass_num,
         )
+        # Text held for the first clause while no Token of the turn exists;
+        # it reaches `gate` only once the clause is out.
+        clause_buffer = ""
         tool_calls: list[LLMToolCall] | None = None
         finish_reason: str | None = None
         usage: UsageMetadata | None = None
@@ -1867,25 +2114,62 @@ class ConversationHandler:
         t_start = time.monotonic()
         first_token_at: float | None = None
 
-        with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
-            async for chunk in self._provider.generate(request, stream=True):
-                if chunk.partial:
-                    if not chunk.content:
-                        continue
-                    if first_token_at is None:
-                        first_token_at = time.monotonic()
-                    for segment in gate.feed_segments(chunk.content):
-                        token = emitter.emit(segment)
-                        if token is not None:
-                            yield token
-                    continue
-                # Terminal chunk: content is always None by contract; everything
-                # else the partials did NOT carry lives here.
-                tool_calls = chunk.tool_calls
-                finish_reason = chunk.finish_reason
-                usage = chunk.usage
-                reasoning_content = chunk.reasoning_content
+        def _feed(content: str) -> list[Token]:
+            """Cut the first clause early while the turn has no Token yet, else
+            sentence-gate.
 
+            The clause segment takes the whitespace that follows it in the
+            buffer, as a sentence segment does, so that whitespace becomes the
+            next Token's separator. A clause the slop gate strips to nothing
+            leaves the turn without a Token, so the next clause is cut early
+            in its place.
+            """
+            nonlocal clause_buffer
+            tokens: list[Token] = []
+            if first_clause_min_chars is not None and not state.emitted:
+                clause_buffer += content
+                while not state.emitted:
+                    cut = find_clause_boundary(clause_buffer, first_clause_min_chars)
+                    if cut is None:
+                        return tokens
+                    after = clause_buffer[cut:]
+                    end = cut + len(after) - len(after.lstrip())
+                    segment, clause_buffer = clause_buffer[:end], clause_buffer[end:]
+                    token = emitter.emit(segment)
+                    if token is not None:
+                        tokens.append(token)
+                content, clause_buffer = clause_buffer, ""
+            for segment in gate.feed_segments(content):
+                token = emitter.emit(segment)
+                if token is not None:
+                    tokens.append(token)
+            return tokens
+
+        with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
+            async with aclosing(self._provider.generate(request, stream=True)) as chunks:
+                async for chunk in chunks:
+                    if chunk.partial:
+                        if not chunk.content:
+                            continue
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
+                        for token in _feed(chunk.content):
+                            yield token
+                        continue
+                    # Terminal chunk: content is always None by contract; everything
+                    # else the partials did NOT carry lives here.
+                    tool_calls = chunk.tool_calls
+                    finish_reason = chunk.finish_reason
+                    usage = chunk.usage
+                    reasoning_content = chunk.reasoning_content
+
+        # A first clause that never reached a boundary is sentence-gated with
+        # the rest of the stream.
+        if clause_buffer:
+            for segment in gate.feed_segments(clause_buffer):
+                token = emitter.emit(segment)
+                if token is not None:
+                    yield token
         for segment in gate.flush_segments():
             token = emitter.emit(segment)
             if token is not None:
@@ -1909,7 +2193,7 @@ class ConversationHandler:
         state.pass_duration_ms[pass_num] = duration_ms
 
     def _template_tokens(
-        self, text: str, *, session_id: str, state: _StreamTurnState, pass_num: int = 1
+        self, text: str, *, session_id: str, state: StreamTurnState, pass_num: int = 1
     ) -> list[Token]:
         """Split a templated reply into the Token events a model reply of that text would give.
 
@@ -1933,7 +2217,7 @@ class ConversationHandler:
         session_id: str,
         turn_id: str,
         received_at: float,
-        state: _StreamTurnState,
+        state: StreamTurnState,
         result: _PreTurnResult,
     ) -> AsyncIterator[StreamEvent]:
         """Ask the host to answer the turn before the model, and stream what it answered.
@@ -2009,8 +2293,9 @@ class ConversationHandler:
         `pre.used` with the records' capabilities.
         """
         session_id = session.session_id
-        # The last message is this turn's own; the decode receives the utterance separately.
-        recent = [(m.role, m.content) for m in session.messages[:-1]]
+        # `stream_turn` writes no history, so every stored message predates this turn's user
+        # message; the decode receives the utterance separately.
+        recent = [(m.role, m.content) for m in session.messages]
         plan = host.plan_turn(session_id, pre.utterance, recent, received_at=received_at)
         if plan.decode is None:
             return
@@ -2067,7 +2352,7 @@ class ConversationHandler:
         parts: list[str] = []
         finish_reason: str | None = None
         with llm_call_context(session_id=session_id, call_site="chat.capability_actions"):
-            async with contextlib.aclosing(provider.generate(request, stream=True)) as stream:
+            async with aclosing(provider.generate(request, stream=True)) as stream:
                 async for chunk in stream:
                     if chunk.content:
                         parts.append(chunk.content)
@@ -2091,10 +2376,10 @@ class ConversationHandler:
           catching, and that exception propagates out of the `async for`
           below exactly as it would out of any other iteration -- this
           method adds no try/except of its own.
-        - The error-turn recording on any other exception happens inside
-          `handle_message_streaming`'s own except block (session message,
-          event-store record); this method never sees or handles that
-          exception, it just receives the resulting Complete.
+        - On any other exception `stream_turn` takes its error path and
+          `handle_message_streaming` commits the turn with outcome `error`
+          (session messages, event-store record); this method never sees or
+          handles that exception, it just receives the resulting Complete.
 
         LLM decides autonomously whether to:
         1. Query knowledge graph for context
@@ -2148,9 +2433,14 @@ class ConversationHandler:
         correlation) except that the resulting `tool_call_started` /
         `tool_call_completed` WS events are now yielded immediately after
         each dispatch instead of being buffered for one drain at the end
-        of the turn -- the `finally` drain below is now a safety net
-        against an orphaned `tool_call_started`, not the primary delivery
-        path.
+        of the turn -- the end-of-stream drain in `stream_turn` is now a
+        safety net against an orphaned `tool_call_started`, not the
+        primary delivery path.
+
+        Since MIS-127 the pipeline itself is `stream_turn`, which writes
+        nothing durable, and the recording is `commit_turn`; this method is
+        `open_turn` + `stream_turn` + `commit_turn` for a typed message
+        whose every token was delivered.
 
         Slop filtering is the one materially different piece. Pre-v2
         `_post_filter_response` could regenerate the entire response (up
@@ -2193,7 +2483,7 @@ class ConversationHandler:
         With a capability host attached (`attach_capability_host`), the turn
         first asks `host.pre_llm`. A ringing item, a proposal decision or a
         fast-path intent is answered there: its tool events and its templated
-        reply stream like a normal reply's, the turn is recorded with no
+        reply stream like a normal reply's, the turn is committed with no
         extraction, and no LLM call is made (`_capability_pre_llm`). Otherwise,
         with tiers attached too, the host routes the turn and runs the calls a
         constrained decode chooses (`_capability_actions`): calls that answer
@@ -2201,9 +2491,9 @@ class ConversationHandler:
         passes; calls that also need an answer give today's passes an actions
         block and append their notices after the final text. With no calls the
         turn is today's, plus any decode-failure notice. Without a host the turn
-        is today's. Either way the turn's `try` covers prompt assembly too, so
-        an exception from `_get_or_fetch_mist_context` or `_build_messages`
-        gets the recorded error turn.
+        is today's. Either way `stream_turn`'s `try` covers prompt assembly
+        too, so an exception from `_get_or_fetch_mist_context` or
+        `_build_messages` gets the committed error turn.
 
         Thinking and Filler events are reserved for future iterations and
         are not emitted here.
@@ -2220,41 +2510,109 @@ class ConversationHandler:
             2, plus one error Token on the error path), and a single
             terminal Complete event.
         """
-        # The monotonic time this message was received, from which capability
-        # calls measure their `turn_ms`.
+        # MIS-127: `open_turn` + `stream_turn` + `commit_turn`. A text caller
+        # that drains the stream delivered every token, so the turn commits
+        # as `completed` (or `error` when the stream took its error path)
+        # with the streamed text as delivered. The commit runs before
+        # Complete is passed on, so a caller that stops at Complete still
+        # finds the turn recorded. A caller that stops before Complete
+        # commits nothing. That includes stopping at the error Token, which
+        # the error path yields before Complete; before the split, the error
+        # turn was recorded before that Token was yielded.
+        scope = self.open_turn(
+            TurnRequest(
+                session_id=session_id,
+                user_text=user_message,
+                origin="text",
+                channel="text",
+                user_id=user_id,
+                max_history=max_history,
+            )
+        )
+        try:
+            async with aclosing(self.stream_turn(scope)) as events:
+                async for event in events:
+                    if isinstance(event, Complete):
+                        self.commit_turn(
+                            scope,
+                            TurnDelivery(
+                                outcome="error" if scope.error is not None else "completed",
+                                delivered_text=event.final_response,
+                                stt_model=None,
+                                tts_model=None,
+                            ),
+                        )
+                    yield event
+        finally:
+            # `commit_turn` removes the turn's capability mark; a turn that
+            # stopped before Complete commits nothing, so it is removed here.
+            self._capability_answered_turns.discard(scope.turn_index)
+
+    async def stream_turn(self, scope: TurnScope) -> AsyncIterator[StreamEvent]:
+        """Run one opened turn's pipeline and stream its events; write nothing durable.
+
+        Retrieval, prompt assembly, both LLM passes and tool dispatch, as
+        `handle_message_streaming` describes. Session history and the event
+        log are left untouched: the user's message is put into the prompt
+        without being added to history, and everything the commit needs
+        (generated text, tool calls and results, the context window, the
+        retrieval result) is kept on `scope`. So a turn cancelled at any
+        point leaves no trace until the caller decides how to commit it.
+
+        Capabilities are the exception, because what they write has happened
+        whatever becomes of this turn. Decisions made on screen since the
+        last turn (`decide_proposal`) enter history before the prompt is
+        built, and a capability call has its effect when it runs. With a host
+        attached, the turn therefore waits for `scope.dispatch_gate` before
+        its first host call, as tool dispatch waits for it, so a held turn
+        makes no capability call and can still be cancelled without trace. A
+        turn a capability's template answered is marked for `commit_turn`,
+        which records it with `answered_by="capability"` and no extraction.
+
+        Cancellation-safe: `CancelledError` and `GeneratorExit` pass through
+        untouched (only `Exception` reaches the error path), nothing yields
+        inside an `except` or `finally` block, so `aclose()` never raises
+        `RuntimeError`, and each LLM pass is iterated inside
+        `contextlib.aclosing` so the provider's stream closes in the same
+        task.
+
+        Args:
+            scope: The scope `open_turn` returned.
+
+        Yields:
+            WSEvent, Token and a terminal Complete, as
+            `handle_message_streaming` describes.
+
+        Raises:
+            ValueError: `scope` was not created by `open_turn`.
+        """
+        if scope.request is None:
+            raise ValueError("stream_turn needs a scope created by open_turn")
+        session_id = scope.request.session_id
+        user_message = scope.request.user_text
+        user_id = scope.request.user_id
+        max_history = scope.request.max_history
+        # The monotonic time the turn started, from which capability calls
+        # measure their `turn_ms`.
         received_at = time.monotonic()
-        # ADR-017 Wave 2: clear per-turn FE-bound event buffer. Events
-        # (tool_call_*, cards_*, graph_subgraph) accumulate here during this
-        # turn and are drained as WSEvent yields, inline after each tool
-        # dispatch and as a safety net in the top-level `finally` below.
-        self._turn_ws_events = []
-        self._current_session_id = session_id
-        self._current_turn_index += 1
-        self._turn_trace = TurnTraceBuilder()
-        self._turn_trace_failed = False
-        self._turn_tool_call = 0
         # Read once, so a host attached mid-turn changes only later turns.
         host = self._capability_host
 
-        # Get or create session
         session = self.get_or_create_session(session_id, user_id)
 
         # Decisions made on screen since the last turn enter history before
-        # this turn's user message. In-memory appends only: no I/O and no
-        # capability code, so this stays outside the turn's `try`.
+        # this turn's prompt is built, so they precede the user's message. In-memory
+        # appends only: no I/O and no capability code, so this stays outside
+        # the turn's `try`.
         for role, content in self._capability_history.pop(session_id, []):
             session.add_message(role, content)
 
-        # Add user message to history
-        session.add_message("user", user_message)
-
         start = time.monotonic()
-        state = _StreamTurnState()
+        state = scope.stream
         tool_calls_used = 0
-        final_text = ""
         # Pass in flight, so an error Token carries the pass it interrupted.
         current_pass = 1
-        # Set on the error path; yielded after the `finally` drain, not from
+        # Set on the error path; yielded after the drain below, not from
         # inside the except block (see the comment there).
         error_token: Token | None = None
         pre = _PreTurnResult(utterance=user_message)
@@ -2263,14 +2621,30 @@ class ConversationHandler:
         actions = _ActionsOutcome()
         retrieval_result: RetrievalResult | None = None
         mist_context: MistContext | None = None
+        # A spoken turn waits on the model's first words, so it asks for the
+        # voice budget (0: no reasoning) on both passes. Being caller-set, it
+        # also stops `AdaptiveThinkingProvider` budgeting and retrying the
+        # pass. A typed turn leaves thinking unset, as before.
+        thinking = (
+            ThinkingConfig(budget_tokens=self.config.llm.voice_thinking_budget_tokens)
+            if scope.request.origin == "voice"
+            else None
+        )
+        first_clause_min_chars = (
+            self.config.llm.voice_first_segment_min_chars
+            if scope.request.channel == "tts"
+            else None
+        )
 
-        # The turn's `try` starts right after the user message is recorded, so
-        # capability code, retrieval, the mist context and prompt assembly all
-        # run under the error backstop below: an unexpected exception from any
-        # of them gives the recorded error turn rather than escaping the
-        # generator with the user message left unanswered.
+        # The turn's `try` covers capability code, retrieval, the mist context
+        # and prompt assembly as well as the passes: an unexpected exception
+        # from any of them takes the error path below rather than escaping
+        # the generator with the user's message unanswered.
         try:
             if host is not None:
+                # A capability call has its effect when it runs, so a held
+                # turn makes none until the controller releases it.
+                await scope.dispatch_gate.wait()
                 async for stream_event in self._capability_pre_llm(
                     host,
                     session_id=session_id,
@@ -2289,7 +2663,7 @@ class ConversationHandler:
             if not pre.answered:
                 # When pre-LLM handled a leading "yes" and left a remainder,
                 # `pre.utterance` holds it for routing and the action decode;
-                # retrieval and history still read the whole user message.
+                # retrieval and the prompt still read the whole user message.
                 #
                 # Auto-inject runs against the vault sidecar only, per ADR-010
                 # invariant 4 ("No semantic read cross-pollination. Reasoning
@@ -2335,9 +2709,10 @@ class ConversationHandler:
                 # Fed after the retrieval's own `try`, so a trace error can never be
                 # caught there and turn into a failed retrieval.
                 self._feed_trace(
+                    scope,
                     lambda trace: self._trace_auto_inject(
                         trace, auto_inject_enabled, retrieval_result
-                    )
+                    ),
                 )
 
                 mist_context = await self._get_or_fetch_mist_context(session_id)
@@ -2374,34 +2749,41 @@ class ConversationHandler:
                 host.record_turn(session_id, pre.used)
 
             if pre.answered:
-                # A command answered from a template: recorded as a turn, with
-                # no extraction scheduled, because the text is a command and
-                # the reply a template, not knowledge.
-                final_text = state.emitted
-                session.add_message("assistant", final_text)
-                self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
-                self._record_turn_event(
-                    session_id=session_id,
-                    user_message=user_message,
-                    assistant_message=final_text,
-                    trace=self._turn_trace_payload(),
-                    answered_by="capability",
-                )
+                # A command answered from a template: `commit_turn` records it
+                # with no extraction scheduled, because the text is a command
+                # and the reply a template, not knowledge.
+                self._capability_answered_turns.add(scope.turn_index)
             else:
-                # On a turn whose calls also need an answer, today's passes read
+                # On a turn whose calls also need an answer, the passes read
                 # the actions block; with no calls the prompt is today's.
                 action_result = actions.result
-                messages = self._build_messages(
+                layout = self._build_messages(
                     session,
                     max_history,
                     retrieval_result=retrieval_result,
                     mist_context=mist_context,
                     max_output_tokens=self.config.llm.conversation_max_tokens,
+                    pending_user_message=user_message,
+                    interruption_note=scope.request.interruption_note,
+                    scope=scope,
+                    channel=scope.request.channel,
                     capability_block=(
                         action_result.block
                         if action_result is not None and action_result.records
                         else None
                     ),
+                )
+                messages = list(layout.messages)
+                scope.context_window = messages
+                scope.retrieval_result = retrieval_result
+                scope.prompt_stats = PromptStats(
+                    prefix_tokens_est=layout.prefix_tokens_est,
+                    history_tokens_est=layout.history_tokens_est,
+                    delta_tokens_est=layout.delta_tokens_est,
+                    prompt_tokens=None,
+                    cached_tokens=None,
+                    prefix_changed=self._note_prefix_change(session_id, layout.prefix_fingerprint),
+                    history_compacted=layout.history_compacted,
                 )
 
                 # LLM autonomously decides to use tools
@@ -2414,45 +2796,59 @@ class ConversationHandler:
                     tools=self._tool_schemas,
                     temperature=self.config.llm.conversation_temperature,
                     max_tokens=self.config.llm.conversation_max_tokens,
+                    thinking=thinking,
                 )
-                async for stream_event in self._stream_llm_pass(
-                    request,
-                    session_id=session_id,
-                    call_site="chat.initial",
-                    pass_num=1,
-                    state=state,
-                ):
-                    yield stream_event
+                async with aclosing(
+                    self._stream_llm_pass(
+                        request,
+                        session_id=session_id,
+                        call_site="chat.initial",
+                        pass_num=1,
+                        state=state,
+                        first_clause_min_chars=first_clause_min_chars,
+                    )
+                ) as pass1_events:
+                    async for stream_event in pass1_events:
+                        yield stream_event
 
-                pass1_response = LLMResponse(
-                    content=state.pass_text.get(1) or None,
-                    tool_calls=state.pass_tool_calls.get(1),
-                    reasoning_content=state.pass_reasoning.get(1),
-                    finish_reason=state.pass_finish_reason.get(1),
-                    usage=state.pass_usage.get(1),
-                    partial=False,
-                )
+                pass1_response = _pass_response(state, 1)
+                # Pass 1 is the request this layout was built for; pass 2 adds
+                # tool messages, so its counts describe a longer prompt.
+                pass1_usage = state.pass_usage.get(1)
+                if pass1_usage is not None:
+                    scope.prompt_stats = replace(
+                        scope.prompt_stats,
+                        prompt_tokens=pass1_usage.prompt_tokens,
+                        cached_tokens=pass1_usage.cached_prompt_tokens,
+                    )
 
-                # Check if LLM made tool calls
-                tool_calls = []
-                tool_results = []
-                pass2_response: LLMResponse | None = None
-
-                if pass1_response.tool_calls:
+                if pass1_response is not None and pass1_response.tool_calls:
                     logger.info("[TOOLS] LLM made %d tool calls", len(pass1_response.tool_calls))
+
+                    # A held turn may still be cancelled without trace, so it
+                    # streams but dispatches nothing until the controller sets
+                    # the gate. A cancel here dispatches and records nothing.
+                    await scope.dispatch_gate.wait()
 
                     # Execute tool calls
                     for tc in pass1_response.tool_calls:
                         logger.info("[TOOLS] Executing tool: %s", tc.name)
                         logger.info("[TOOLS]   Args: %s", tc.arguments)
 
-                        # ADR-017 Wave 2: dispatch with observability wrap. Emits
-                        # tool_call_started before _dispatch_tool runs and
-                        # tool_call_completed after (success or failure) into the
-                        # per-turn buffer. T3/v2: drained immediately below so the
-                        # pair reaches the caller as it happens.
-                        tool_result = await self._dispatch_tool_with_observability(tc)
-                        for payload in self._pop_turn_ws_events():
+                        # Listed on the scope at dispatch, before the await, so a
+                        # turn cancelled while the tool runs still records it.
+                        scope.tool_dispatched = True
+                        scope.tool_calls.append({"name": tc.name, "args": tc.arguments})
+
+                        # Each tool runs as its own task held by the scope and is
+                        # awaited through `asyncio.shield`: cancelling this stream
+                        # (a barge-in) must not abandon a tool that may already
+                        # have had effects. The controller waits for it with
+                        # `scope.wait_tools` and commits its real result.
+                        tool_task = asyncio.create_task(self._run_dispatched_tool(scope, tc))
+                        scope.tool_tasks.append(tool_task)
+                        tool_result = await asyncio.shield(tool_task)
+                        for payload in scope.drain_ws_events():
                             if payload.get("type") == "tool_call_started":
                                 tool_calls_used += 1
                             yield WSEvent(payload=payload)
@@ -2463,36 +2859,6 @@ class ConversationHandler:
                         )
                         logger.info("[TOOLS]   Result: %s", result_preview)
 
-                        tool_calls.append({"name": tc.name, "args": tc.arguments})
-                        tool_results.append(
-                            {
-                                "name": tc.name,
-                                "result": tool_result,
-                                "tool_call_id": tc.id,
-                            }
-                        )
-
-                        # Record tool usage for skill derivation
-                        if self._tool_usage_tracker is not None:
-                            from datetime import UTC
-
-                            from backend.knowledge.extraction.tool_usage_tracker import (
-                                ToolCallRecord,
-                                classify_tool_type,
-                            )
-
-                            self._tool_usage_tracker.record(
-                                ToolCallRecord(
-                                    tool_name=tc.name,
-                                    tool_type=classify_tool_type(tc.name),
-                                    context=str(tc.arguments)[:500],
-                                    success=not tool_result.startswith("Tool not found:"),
-                                    timestamp=datetime.now(UTC),
-                                    session_id=session_id,
-                                    event_id="",
-                                )
-                            )
-
                     # Build assistant message with tool_calls for correlation
                     assistant_msg = {
                         "role": "assistant",
@@ -2501,7 +2867,7 @@ class ConversationHandler:
                     }
                     messages.append(assistant_msg)
 
-                    for result in tool_results:
+                    for result in scope.tool_results:
                         messages.append(
                             {
                                 "role": "tool",
@@ -2518,28 +2884,25 @@ class ConversationHandler:
                         messages=messages,
                         temperature=self.config.llm.conversation_temperature,
                         max_tokens=self.config.llm.conversation_max_tokens,
+                        thinking=thinking,
                     )
                     current_pass = 2
-                    async for stream_event in self._stream_llm_pass(
-                        final_request,
-                        session_id=session_id,
-                        call_site="chat.final",
-                        pass_num=2,
-                        state=state,
-                    ):
-                        yield stream_event
+                    async with aclosing(
+                        self._stream_llm_pass(
+                            final_request,
+                            session_id=session_id,
+                            call_site="chat.final",
+                            pass_num=2,
+                            state=state,
+                            first_clause_min_chars=first_clause_min_chars,
+                        )
+                    ) as pass2_events:
+                        async for stream_event in pass2_events:
+                            yield stream_event
 
-                    pass2_response = LLMResponse(
-                        content=state.pass_text.get(2) or None,
-                        tool_calls=state.pass_tool_calls.get(2),
-                        reasoning_content=state.pass_reasoning.get(2),
-                        finish_reason=state.pass_finish_reason.get(2),
-                        usage=state.pass_usage.get(2),
-                        partial=False,
-                    )
                     logger.info(
                         "[TOOLS] Final response: %s...",
-                        (pass2_response.content or "")[:100],
+                        (state.pass_text.get(2) or "")[:100],
                     )
 
                 # else: no-tool path -- pass 1 declined to tool-call, its
@@ -2552,7 +2915,8 @@ class ConversationHandler:
                 # sentence, inside _stream_llm_pass -- state.emitted IS the
                 # post-filter text. No separate post-filter call here (see the
                 # docstring above for why whole-response regeneration is no
-                # longer available once content has streamed).
+                # longer available once content has streamed). Recording is
+                # `commit_turn`'s job, after the caller knows what was delivered.
                 #
                 # Each capability notice follows the final text, so the user
                 # hears a pending, failed or undecoded action whatever the
@@ -2563,112 +2927,19 @@ class ConversationHandler:
                             notice, session_id=session_id, state=state, pass_num=current_pass
                         ):
                             yield token
-                assistant_message = state.emitted
-
-                # Add assistant response to history
-                session.add_message(
-                    "assistant",
-                    assistant_message,
-                    tool_calls=tool_calls if tool_calls else None,
-                    tool_results=tool_results if tool_results else None,
-                )
-
-                # --- Step 0: Vault path cache priming ---
-                # Pure path computation, no I/O. The path is not threaded into
-                # extraction (R1.3: the vault is not a fact source); allocation
-                # happens here so the slug is derived from the first utterance
-                # rather than the opaque session_id, and stays stable for the
-                # session's lifetime (read later by `end_session`).
-                #
-                # R1.3.1: there is no more per-turn vault write to prime a cache
-                # for -- the vault is written once, at session end. The call is
-                # kept purely so `end_session` has a path to write to; the
-                # return value is deliberately discarded here.
-                self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
-
-                # --- Event Store Write (Layer 1) ---
-                # Synchronous, <5ms target. Happens BEFORE any async extraction.
-                # R1.3.1: this is also the sole source `end_session` reads from
-                # to synthesize the session-end vault note -- there is no
-                # separate per-turn vault write to keep in sync with it.
-                event_id, recorded_at = self._record_turn_event(
-                    session_id=session_id,
-                    user_message=user_message,
-                    assistant_message=assistant_message,
-                    context_window=messages,
-                    retrieval_result=retrieval_result,
-                    tool_calls=tool_calls if tool_calls else None,
-                    trace=self._turn_trace_payload(),
-                )
-
-                # Debug JSONL: record this turn and attach the TurnRecord to the
-                # background extraction task so the extraction phase flushes a
-                # second JSONL line keyed by event_id.
-                turn_record = None
-                if self._debug_logger is not None and event_id:
-                    turn_record = self._debug_logger.begin_turn(
-                        event_id=event_id,
-                        session_id=session_id,
-                        user_id=user_id,
-                        utterance=user_message,
-                    )
-                    if retrieval_result is not None:
-                        turn_record.record_retrieval(retrieval_result)
-                    turn_record.record_llm_response(
-                        pass1_response, pass_num=1, timing_ms=state.pass_duration_ms.get(1, 0.0)
-                    )
-                    if pass2_response is not None:
-                        turn_record.record_llm_response(
-                            pass2_response, pass_num=2, timing_ms=state.pass_duration_ms.get(2, 0.0)
-                        )
-                    turn_record.flush_turn()
-
-                # Fire-and-forget background extraction. Tracked so end_session/
-                # aclose can drain instead of abandoning to GC.
-                #
-                # T2a: with an extraction dispatcher attached, the turn is already
-                # durable in the event log, which IS the backlog -- waking the
-                # dispatcher is all that is needed, and extraction runs out of
-                # process, in log order. The in-process task below (main chat
-                # model) is the path only when no dispatcher is attached.
-                if event_id and self._extraction_dispatcher is not None:
-                    self._extraction_dispatcher.wake()
-                elif event_id:
-                    task = asyncio.create_task(
-                        self._extract_knowledge_async(
-                            utterance=user_message,
-                            conversation_history=session.get_history(max_history),
-                            event_id=event_id,
-                            session_id=session_id,
-                            turn_record=turn_record,
-                            recorded_at=recorded_at,
-                        )
-                    )
-                    self._extraction_tasks[task] = session_id
-                    task.add_done_callback(lambda t: self._extraction_tasks.pop(t, None))
-
-                final_text = assistant_message
 
         except Exception as e:
             # HYDRATION ABORTS; live recovers. Recording an error turn is right
             # when a human is on the other end: the error text is streamed to
             # them as a Token below, so the recorded turn is exactly what they
             # saw, and the transcript stays honest. During hydration it is
-            # contamination: the
-            # turn below would be written with the corpus's AUTHORED timestamp
-            # and origin='real', making a fabricated "I encountered an error"
-            # turn structurally indistinguishable from a genuine one, and the
-            # `live == rebuilt` gate would compare it without complaint. Worse,
-            # `handle_message` returns that string NORMALLY, so `run_chat` scores
-            # the turn ok=True and `mist_admin hydrate` reports "Complete".
-            #
-            # This also stops swallowing HydrationClockError. Before it, that
-            # error was caught here and `_record_turn_event` was called AGAIN
-            # below, raising the same error from inside this except block --
-            # masking the original traceback, and turning the intended fail-loud
-            # into "fail every remaining turn one at a time" (an hour of
-            # inference on 87 turns, plus error messages polluting session
-            # history that later turns then read as context).
+            # contamination: the turn would be written with the corpus's
+            # AUTHORED timestamp and origin='real', making a fabricated "I
+            # encountered an error" turn structurally indistinguishable from a
+            # genuine one, and the `live == rebuilt` gate would compare it
+            # without complaint. Worse, `handle_message` returns that string
+            # NORMALLY, so `run_chat` scores the turn ok=True and `mist_admin
+            # hydrate` reports "Complete".
             if self._hydration_clock is not None:
                 raise
             logger.error(f"Error handling message: {e}", exc_info=True)
@@ -2679,53 +2950,44 @@ class ConversationHandler:
                 error_msg = host.redact(error_msg)
             # Sentences that streamed before the failure have already reached
             # the user, so the error text is appended after them (as its own
-            # paragraph) rather than replacing them. The recorded turn is the
-            # full concatenation of every Token, error included -- the same
-            # string `Complete.final_response` carries.
+            # paragraph) rather than replacing them. A commit of this turn
+            # records the full concatenation of every Token, error included --
+            # the same string `Complete.final_response` carries.
             error_text = ("\n\n" if state.emitted else "") + error_msg
             state.emitted += error_text
-            error_token = Token(text=error_text, pass_num=current_pass)
-            final_text = state.emitted
-            session.add_message("assistant", final_text)
-            # Record the error turn to event store
-            self._record_turn_event(
-                session_id=session_id,
-                user_message=user_message,
-                assistant_message=final_text,
-                trace=self._turn_trace_payload(),
-            )
+            scope.error = error_msg
+            error_token = Token(text=error_text, pass_num=current_pass, is_error=True)
 
-        finally:
-            # The turn is recorded (or abandoned) by now; later feeds, such as
-            # a direct `_build_messages` call, must not reach this builder.
-            self._turn_trace = None
-            # ADR-017 Wave 2 safety net: any WS event not already drained
-            # inline above (normally none -- see the per-dispatch drain in
-            # the tool loop) is drained here so tool_call_started never
-            # orphans a missing tool_call_completed, even across an
-            # exception raised between the two.
-            for payload in self._pop_turn_ws_events():
-                if payload.get("type") == "tool_call_started":
-                    tool_calls_used += 1
+        # ADR-017 Wave 2 safety net: any WS event not already drained inline
+        # above (normally none -- see the per-dispatch drain in the tool loop)
+        # is drained here so tool_call_started never orphans a missing
+        # tool_call_completed after the error path. Not in a `finally`: a
+        # yield there would run while a cancellation propagates, handing the
+        # consumer an event in place of its `CancelledError`, and a yield
+        # after `GeneratorExit` makes `aclose()` raise `RuntimeError`. A
+        # cancelled turn's undrained events stay on the scope.
+        for payload in scope.drain_ws_events():
+            if payload.get("type") == "tool_call_started":
+                tool_calls_used += 1
+            yield WSEvent(payload=payload)
+        # The same net for the host's in-turn buffer, and outside a `finally`
+        # for the same reason: a payload buffered before a capability call
+        # raised still reaches this turn's client.
+        if host is not None:
+            for payload in host.drain_events(session_id):
                 yield WSEvent(payload=payload)
-            # The same net for the host's in-turn buffer: a payload buffered
-            # before a capability call raised still reaches this turn's client.
-            if host is not None:
-                for payload in host.drain_events(session_id):
-                    yield WSEvent(payload=payload)
 
-        # The error Token is yielded here, after the `finally` drain, rather
-        # than from inside the except block, so a consumer's `aclose()` at
-        # this yield raises GeneratorExit outside the exception handler (not
-        # chained to the provider error as its __context__). The error turn is
-        # already recorded by this point either way.
+        # The error Token is yielded here, after the drain, rather than from
+        # inside the except block, so a consumer's `aclose()` at this yield
+        # raises GeneratorExit outside the exception handler (not chained to
+        # the provider error as its __context__).
         if error_token is not None:
             yield error_token
 
         duration_ms = (time.monotonic() - start) * 1000
 
         yield Complete(
-            final_response=final_text,
+            final_response=state.emitted,
             tool_calls_used=tool_calls_used,
             duration_ms=duration_ms,
         )
@@ -2735,17 +2997,17 @@ class ConversationHandler:
 
         Runs only `host.pre_llm`, through `_capability_pre_llm` (a ringing item, a proposal
         decision, the fast path), so no path here reaches the provider, retrieval or the
-        action decode. A handled message is recorded as `handle_message_streaming` records a
-        turn `pre_llm` answers: history (after any decisions made on screen), the vault path,
-        and the event-store row with `answered_by="capability"`, so no extraction is
+        action decode. A handled message is committed as `commit_turn` commits a streamed turn
+        the pre-LLM step answered: history (after any decisions made on screen), the vault
+        path, and the event-store row with `answered_by="capability"`, so no extraction is
         scheduled. A leading "yes" that resolved a proposal counts as handled even when its
         remainder is not, because the proposal already ran; the remainder gets no answer.
 
-        A message nothing handles is not recorded: no history, no row, and no `record_turn`,
-        so the caller can refuse it as before. The pre-LLM step may still have superseded a
-        live proposal, which buffers its `action_resolved`. `drain_events` clears that buffer,
-        so a later turn cannot send it; the result carries those payloads for the caller to
-        send before its refusal, so no client keeps showing the proposal as waiting.
+        A message nothing handles is not recorded: no history, no row, no turn index and no
+        `record_turn`, so the caller can refuse it as before. The pre-LLM step may still have
+        superseded a live proposal, which buffers its `action_resolved`. `drain_events` clears
+        that buffer, so a later turn cannot send it; the result carries those payloads for the
+        caller to send before its refusal, so no client keeps showing the proposal as waiting.
 
         Returns:
             None only when no host is attached. Otherwise a `CapabilityOnlyTurn`: handled, with
@@ -2757,7 +3019,7 @@ class ConversationHandler:
         if host is None:
             return None
         received_at = time.monotonic()
-        state = _StreamTurnState()
+        state = StreamTurnState()
         pre = _PreTurnResult(utterance=text)
         events: list[StreamEvent] = []
         tool_calls_used = 0
@@ -2786,26 +3048,23 @@ class ConversationHandler:
         session = self.get_or_create_session(session_id)
         for role, content in self._capability_history.pop(session_id, []):
             session.add_message(role, content)
-        session.add_message("user", text)
-        session.add_message("assistant", state.emitted)
-        self._get_or_allocate_vault_path(session_id, first_utterance=text)
-        # The per-turn state `handle_message_streaming` sets, so the recorded trace is the one
-        # its pre-LLM branch records.
-        self._current_session_id = session_id
-        self._current_turn_index += 1
-        self._turn_trace = TurnTraceBuilder()
-        self._turn_trace_failed = False
-        self._turn_tool_call = 0
-        try:
-            self._record_turn_event(
-                session_id=session_id,
-                user_message=text,
-                assistant_message=state.emitted,
-                trace=self._turn_trace_payload(),
-                answered_by="capability",
-            )
-        finally:
-            self._turn_trace = None
+        # Opened only now, so an unhandled message takes no turn index. The scope carries the
+        # streamed text and a fresh trace builder, and the commit writes what `commit_turn`
+        # writes for a streamed turn the pre-LLM step answered.
+        scope = self.open_turn(
+            TurnRequest(session_id=session_id, user_text=text, origin="text", channel="text")
+        )
+        scope.stream = state
+        self._capability_answered_turns.add(scope.turn_index)
+        self.commit_turn(
+            scope,
+            TurnDelivery(
+                outcome="completed",
+                delivered_text=state.emitted,
+                stt_model=None,
+                tts_model=None,
+            ),
+        )
         events.extend(WSEvent(payload=payload) for payload in host.drain_events(session_id))
         events.append(
             Complete(
@@ -2815,6 +3074,222 @@ class ConversationHandler:
             )
         )
         return CapabilityOnlyTurn(handled=True, events=tuple(events))
+
+    def commit_turn(self, scope: TurnScope, delivery: TurnDelivery) -> CommitResult:
+        """Write a streamed turn to session history and the event log, once.
+
+        `delivery.delivered_text` (what reached the user) becomes the
+        assistant message in history and the row's `system_response`; when
+        the outcome is not `completed`, the full generated text is kept
+        beside it in `generated_response`, even when the two are equal (as
+        on a text turn's error), and extraction never reads it. So
+        the conversation and the rebuilt graph follow what the user heard,
+        and the rest stays inspectable. A cut-off reply reaches the model
+        through the next request's `interruption_note`, not by rewriting
+        this message.
+
+        Synchronous on purpose: no await between the first write and the
+        last, so a cancellation cannot leave a half-written turn.
+        Idempotent per scope: a second call returns the first result and
+        writes nothing.
+
+        An `error` outcome records as the error path always has: history,
+        and a row without context window, retrieval or tool calls; no
+        extraction. A turn `stream_turn` marked as answered by a
+        capability's template records history, the vault path and a row with
+        `answered_by="capability"`, also without context window, retrieval
+        or tool calls (no model pass ran); no debug turn record and no
+        extraction. Every other outcome records as a completed turn does:
+        the session's vault path is primed, the row carries the context
+        window, retrieval context and tool calls, the debug turn record is
+        flushed, and extraction is woken or started.
+
+        Args:
+            scope: The turn's scope, after `stream_turn` finished or was
+                cancelled.
+            delivery: What the caller delivered and the outcome to record.
+
+        Returns:
+            `CommitResult(True, event_id, None)` on a recorded row;
+            `CommitResult(False, None, None)` with the event store disabled;
+            `CommitResult(False, None, error)` when the write failed. The
+            write failure is logged by `_record_turn_event` and never raised,
+            so a broken store cannot end a conversation.
+
+        Raises:
+            ValueError: `scope` was not created by `open_turn`.
+            HydrationClockError: Only under a hydration clock, from
+                `_record_turn_event`, which never swallows it.
+        """
+        if scope.commit_result is not None:
+            return scope.commit_result
+        if scope.request is None:
+            raise ValueError("commit_turn needs a scope created by open_turn")
+        # Removed whatever the outcome, so the mark never outlives its turn.
+        answered_by_capability = scope.turn_index in self._capability_answered_turns
+        self._capability_answered_turns.discard(scope.turn_index)
+        request = scope.request
+        session_id = request.session_id
+        user_message = request.user_text
+        session = self.get_or_create_session(session_id, request.user_id)
+        tool_calls = [dict(entry) for entry in scope.tool_calls] or None
+        if tool_calls and delivery.tool_effect_unknown:
+            # A tool still running (or cancelled) at commit may or may not
+            # have had its effect; the row says so rather than guessing.
+            for entry, task in zip(tool_calls, scope.tool_tasks, strict=False):
+                if not task.done() or task.cancelled():
+                    entry["effect_unknown"] = True
+        tool_results = list(scope.tool_results) or None
+        generated_response = None if delivery.outcome == "completed" else scope.generated_text
+        outcome_fields = {
+            "turn_outcome": delivery.outcome,
+            "generated_response": generated_response,
+            "turn_modality": request.origin,
+            "stt_model": delivery.stt_model,
+            "tts_model": delivery.tts_model,
+        }
+
+        # Rendered once for both write paths below, then dropped, so a feed
+        # after the commit (a shielded tool finishing late, a direct
+        # `_build_messages` call) reaches no builder.
+        trace = self._turn_trace_payload(scope)
+        scope.trace = None
+
+        session.add_message("user", user_message)
+        if delivery.outcome == "error":
+            session.add_message("assistant", delivery.delivered_text)
+            event_id, _recorded_at = self._record_turn_event(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=delivery.delivered_text,
+                trace=trace,
+                **outcome_fields,
+            )
+            scope.commit_result = self._commit_result(event_id)
+            return scope.commit_result
+
+        if answered_by_capability:
+            # A command answered from a template: recorded as a turn, with no
+            # extraction scheduled, because the text is a command and the
+            # reply a template, not knowledge. The vault path is still
+            # allocated, so `end_session` has a path to write to.
+            session.add_message("assistant", delivery.delivered_text)
+            self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
+            event_id, _recorded_at = self._record_turn_event(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=delivery.delivered_text,
+                trace=trace,
+                answered_by="capability",
+                **outcome_fields,
+            )
+            scope.commit_result = self._commit_result(event_id)
+            return scope.commit_result
+
+        session.add_message(
+            "assistant",
+            delivery.delivered_text,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+        )
+
+        # --- Step 0: Vault path cache priming ---
+        # Pure path computation, no I/O. The path is not threaded into
+        # extraction (R1.3: the vault is not a fact source); allocation
+        # happens here so the slug is derived from the first utterance
+        # rather than the opaque session_id, and stays stable for the
+        # session's lifetime (read later by `end_session`).
+        #
+        # R1.3.1: there is no more per-turn vault write to prime a cache
+        # for -- the vault is written once, at session end. The call is
+        # kept purely so `end_session` has a path to write to; the
+        # return value is deliberately discarded here.
+        self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
+
+        # --- Event Store Write (Layer 1) ---
+        # Synchronous, <5ms target. Happens BEFORE any async extraction.
+        # R1.3.1: this is also the sole source `end_session` reads from
+        # to synthesize the session-end vault note -- there is no
+        # separate per-turn vault write to keep in sync with it.
+        event_id, recorded_at = self._record_turn_event(
+            session_id=session_id,
+            user_message=user_message,
+            assistant_message=delivery.delivered_text,
+            context_window=scope.context_window,
+            retrieval_result=scope.retrieval_result,
+            tool_calls=tool_calls,
+            trace=trace,
+            **outcome_fields,
+        )
+
+        # Debug JSONL: record this turn and attach the TurnRecord to the
+        # background extraction task so the extraction phase flushes a
+        # second JSONL line keyed by event_id. A pass that never finished
+        # (the turn was cancelled during it) has no response to record.
+        turn_record = None
+        if self._debug_logger is not None and event_id:
+            turn_record = self._debug_logger.begin_turn(
+                event_id=event_id,
+                session_id=session_id,
+                user_id=request.user_id,
+                utterance=user_message,
+            )
+            if scope.retrieval_result is not None:
+                turn_record.record_retrieval(scope.retrieval_result)
+            for pass_num in (1, 2):
+                pass_response = _pass_response(scope.stream, pass_num)
+                if pass_response is not None:
+                    turn_record.record_llm_response(
+                        pass_response,
+                        pass_num=pass_num,
+                        timing_ms=scope.stream.pass_duration_ms.get(pass_num, 0.0),
+                    )
+            turn_record.flush_turn()
+
+        # Fire-and-forget background extraction. Tracked so end_session/
+        # aclose can drain instead of abandoning to GC.
+        #
+        # T2a: with an extraction dispatcher attached, the turn is already
+        # durable in the event log, which IS the backlog -- waking the
+        # dispatcher is all that is needed, and extraction runs out of
+        # process, in log order. The in-process task below (main chat
+        # model) is the path only when no dispatcher is attached.
+        if event_id and self._extraction_dispatcher is not None:
+            self._extraction_dispatcher.wake()
+        elif event_id:
+            task = asyncio.create_task(
+                self._extract_knowledge_async(
+                    utterance=user_message,
+                    conversation_history=session.get_history(request.max_history),
+                    event_id=event_id,
+                    session_id=session_id,
+                    turn_record=turn_record,
+                    recorded_at=recorded_at,
+                )
+            )
+            self._extraction_tasks[task] = session_id
+            task.add_done_callback(lambda t: self._extraction_tasks.pop(t, None))
+
+        scope.commit_result = self._commit_result(event_id)
+        return scope.commit_result
+
+    def _commit_result(self, event_id: str | None) -> CommitResult:
+        """Tell a disabled event store from a failed write.
+
+        `_record_turn_event` returns `(None, None)` in both cases, so the
+        store itself is checked, not the return value. A disabled store is
+        not a failure: the controller must not report it as
+        `record_failed`.
+        """
+        if self.event_store is None:
+            return CommitResult(recorded=False, event_id=None, error=None)
+        if event_id is None:
+            return CommitResult(
+                recorded=False,
+                event_id=None,
+                error="event store write failed; the handler log has the cause",
+            )
+        return CommitResult(recorded=True, event_id=event_id, error=None)
 
     async def _extract_knowledge_async(
         self,
@@ -3418,13 +3893,23 @@ class ConversationHandler:
         context_window: list[dict[str, str]] | None = None,
         retrieval_result: RetrievalResult | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        *,
         trace: dict[str, Any] | None = None,
+        turn_outcome: str | None = None,
+        generated_response: str | None = None,
+        turn_modality: str | None = None,
+        stt_model: str | None = None,
+        tts_model: str | None = None,
         answered_by: AnsweredBy = "model",
     ) -> tuple[str | None, str | None]:
         """Record a conversation turn to the event store.
 
         Synchronous write, targets <5ms. Failures are logged but never
         propagated -- the event store must not break the conversation flow.
+
+        The outcome fields are keyword-only with `None` defaults so the
+        other caller, `scripts/mist_admin.py`'s extraction-only path, and
+        test doubles with the older signature keep working unchanged.
 
         Args:
             session_id: External session identifier.
@@ -3438,6 +3923,18 @@ class ConversationHandler:
                 keep their own condition. None (callers outside a turn, such
                 as the extraction-only admin path) leaves `retrieval_context`
                 as it was.
+            turn_outcome: `completed`, `interrupted`, `superseded` or
+                `error`; None when the caller does not say.
+            generated_response: The full generated text. `commit_turn`
+                passes it for every outcome other than `completed`, whether
+                or not it equals `assistant_message` (on a text turn that
+                ended in an error the two are the same text); None when the
+                outcome is `completed` or the caller does not pass it.
+            turn_modality: `voice` or `text`. The session's first recorded
+                turn also sets `conversation_sessions.input_modality`
+                (`text` when None).
+            stt_model: Speech-to-text model for a voice turn.
+            tts_model: Text-to-speech model for a spoken reply.
             answered_by: `"capability"` only for a turn a capability's template
                 answered with no model pass; such a turn stays out of
                 extraction, self-reflection and session notes
@@ -3462,8 +3959,12 @@ class ConversationHandler:
             # doubles as both the existence check and the turn_index source.
             es_session = self.event_store.get_session(session_id)
             if es_session is None:
+                # A session's modality is its first turn's; later turns of
+                # another modality carry their own in `turn_modality`.
                 self.event_store.start_session(
-                    session_id, input_modality="text", origin=self._session_origin
+                    session_id,
+                    input_modality=turn_modality or "text",
+                    origin=self._session_origin,
                 )
                 turn_index = 0
             else:
@@ -3500,9 +4001,14 @@ class ConversationHandler:
                 context_window=context_window,
                 retrieval_context=retrieval_context,
                 tool_calls=tool_calls,
+                stt_model=stt_model,
+                tts_model=tts_model,
                 llm_model=self._provider.model,
                 llm_parameters={"temperature": 0.7},
                 ontology_version=self.config.ontology_version,
+                turn_outcome=turn_outcome,
+                generated_response=generated_response,
+                turn_modality=turn_modality,
                 answered_by=answered_by,
             )
 
@@ -3824,40 +4330,73 @@ class ConversationHandler:
         mist_context: MistContext | None = None,
         max_output_tokens: int = 400,
         *,
+        pending_user_message: str,
+        interruption_note: Literal["mid_reply", "before_reply"] | None = None,
+        scope: TurnScope | None = None,
+        channel: Literal["tts", "text"] = "text",
         capability_block: str | None = None,
-    ) -> list[dict[str, str]]:
-        """Build message list for LLM.
+    ) -> PromptLayout:
+        """Compose the turn's prompt in cache-stable order.
 
-        Ordering:
-          1. Persona block from MistContext (when provided) -- identity + HARD RULES
-          2. Static system template -- tool availability, strategy, guidelines
-          3. Capability actions block (when this turn's calls also need an answer)
-          4. Retrieval context (when auto-RAG produced facts) — budget-pruned
-          5. Live-data advisory (when retrieval requires MCP)
-          6. Conversation history — budget-pruned via history strategy
+        llama-server reuses its KV cache up to the first token that differs
+        from the previous prompt, so the layout keeps everything that varies
+        per turn at the end:
 
-        Cluster 6: when `self._budget_planner` is not None, a BudgetPlan is
-        computed before composition. The planner prunes retrieval context by
-        fact-priority score and history by strategy (sliding-window default)
-        so the total prompt fits within
+          1. Stable prefix: persona block (MistContext, when provided),
+             register prompt (when the handler has one), static system
+             template (with the capability host's action-honesty sentence
+             when a host is attached), MIST.md conventions, user profile.
+          2. History: the window the history strategy selects from the
+             session's full history (`stable_window` moves its start only
+             in steps), raw user text as stored.
+          3. Capability actions block (when this turn's calls also need an
+             answer), as one system message: it varies per turn, so it opens
+             the tail, ahead of the delta.
+          4. Delta and user text: the interruption note, retrieval context,
+             live-data advisory and, on a `tts` turn, the spoken-reply
+             register as labelled blocks in the final user
+             message ahead of the user's words (`delta_placement`
+             `user_prefix`), or as one system message directly before it
+             (`system_tail`). Nothing else follows the history.
+
+        The history window is chosen over the session history plus the
+        pending user message, so the window counts the turn's own message;
+        that message is always sent, as the final user message, even when
+        the budget has no room left for history.
+
+        When `self._budget_planner` is not None it prunes retrieval to the
+        delta budget and history by strategy so the prompt fits within
         `config.context_budget.context_window - max_output_tokens - reserves`.
+        Without it, retrieval is sent whole and the strategy selects the
+        window with no token limit.
 
         Args:
-            session: Conversation session
-            max_history: Maximum history messages to include (upper bound;
-                the budget planner may prune further).
-            retrieval_result: Optional hybrid retrieval result from auto-RAG
+            session: Conversation session.
+            max_history: History message cap handed to the history strategy.
+            retrieval_result: Optional hybrid retrieval result from auto-RAG.
             mist_context: Optional MistContext to prepend as persona block.
                 When None, falls back to the legacy full static template.
             max_output_tokens: Expected output budget for the coming LLM call.
                 Subtracted from the total budget so pruning leaves headroom.
+            pending_user_message: The current turn's user message, not yet
+                in session history (`stream_turn` writes no history; the
+                commit adds it, raw).
+            interruption_note: The request's note about the previous turn
+                being cut off, rendered as one fixed line in the delta.
+            scope: The turn whose trace receives the profile-dedup and
+                budget feeds. None (a direct call outside a turn) feeds
+                nothing.
+            channel: Where the reply goes. A `tts` turn's delta carries the
+                `register` part asking for a short spoken reply.
             capability_block: The actions block of this turn's capability calls
                 (`ActionResult.block`). It is never pruned, so the planner
-                charges it as a fixed segment; None, the default, leaves the
-                messages as they are without capabilities.
+                charges it as a fixed segment, and the layout counts it in
+                `delta_tokens_est`; None, the default, leaves the messages as
+                they are without capabilities.
 
         Returns:
-            List of messages for LLM, budget-compliant when planner is active.
+            The `PromptLayout`: the messages plus the prefix fingerprint and
+            token estimates the turn reports.
         """
         # Compute persona + static text first so the planner can account for them.
         persona_text = mist_context.as_system_prompt_block() if mist_context is not None else None
@@ -3891,22 +4430,47 @@ class ConversationHandler:
             facts_before = retrieval_result.facts
             self._dedup_profile_from_retrieval(retrieval_result, profile_path)
             self._feed_trace(
+                scope,
                 lambda trace: trace.auto_inject_profile_dedup(
                     refs_removed(facts_before, retrieval_result.facts)
+                ),
+            )
+
+        # Delta parts charged whole: the interruption note and the live-data
+        # advisory. Retrieval is added after planning, pruned to what is left.
+        whole_parts: list[TurnDeltaPart] = []
+        if interruption_note is not None:
+            whole_parts.append(
+                TurnDeltaPart(
+                    kind="interruption",
+                    text=_INTERRUPTION_NOTES[interruption_note],
+                    prunable=False,
                 )
             )
-
-        # Live-data advisory is a fixed-cost segment when present.
-        live_advisory_text: str | None = None
         if retrieval_result and retrieval_result.requires_mcp and retrieval_result.suggested_tools:
-            live_advisory_text = (
-                "=== LIVE DATA ADVISORY ===\n"
-                "This query appears to request real-time information. Consider using\n"
-                "available tools for current data rather than relying on stored knowledge.\n"
-                "Suggested tools: %s" % ", ".join(retrieval_result.suggested_tools)
+            whole_parts.append(
+                TurnDeltaPart(
+                    kind="live_advisory",
+                    text=(
+                        "This query appears to request real-time information. Consider using\n"
+                        "available tools for current data rather than relying on stored "
+                        "knowledge.\nSuggested tools: %s"
+                        % ", ".join(retrieval_result.suggested_tools)
+                    ),
+                    prunable=False,
+                )
+            )
+        if channel == "tts":
+            whole_parts.append(
+                TurnDeltaPart(kind="register", text=SPOKEN_REGISTER_TEXT, prunable=False)
             )
 
-        raw_history = session.get_history(max_history)
+        # The full history plus the pending message: the strategy chooses the
+        # window, so the start can stay put across turns instead of sliding.
+        full_history = [
+            *session.get_history(None),
+            {"role": "user", "content": pending_user_message},
+        ]
 
         # Pre-load the conventions block so the planner can charge it as a
         # fixed segment (it is appended unconditionally below). Formatted
@@ -3924,8 +4488,7 @@ class ConversationHandler:
                 persona_text=persona_text,
                 static_text=static_template,
                 retrieval_result=retrieval_result,
-                live_advisory_text=live_advisory_text,
-                history=raw_history,
+                history=full_history,
                 tools=self._tool_schemas,
                 max_output_tokens=max_output_tokens,
                 # Always-injected blocks below MUST be charged as fixed cost
@@ -3933,15 +4496,27 @@ class ConversationHandler:
                 # 256-token safety margin (deep review phase1-conversation-1).
                 extra_fixed_texts=[
                     t
-                    for t in (conventions_message, profile_block, capability_block)
+                    for t in (
+                        self._register_prompt,
+                        conventions_message,
+                        profile_block,
+                        capability_block,
+                    )
                     if t is not None
                 ],
+                max_history=max_history,
+                delta_parts=whole_parts,
             )
             retrieval_text = plan.pruned_retrieval_text
-            history = plan.pruned_history
+            window = plan.pruned_history
+            history_compacted = plan.history_compacted
             # Covers the minimal fallback too: a plan that does not fit is
             # recorded with `fits` false, and its facts as `dropped_no_fit`.
-            self._feed_trace(lambda trace: trace.budget_planned(plan, history_raw=len(raw_history)))
+            # `history_raw` counts the list the planner chose the window
+            # from, so `history_kept` (the window) never exceeds it.
+            self._feed_trace(
+                scope, lambda trace: trace.budget_planned(plan, history_raw=len(full_history))
+            )
             if not plan.fits:
                 logger.warning(
                     "[BUDGET] Context budget exceeded: fixed_cost=%d total_budget=%d. "
@@ -3949,78 +4524,47 @@ class ConversationHandler:
                     plan.fixed_cost,
                     plan.total_budget,
                 )
-            elif plan.facts_dropped or len(history) < len(raw_history):
+            elif plan.facts_dropped or plan.history_compacted == "budget":
                 logger.info(
                     "[BUDGET] Pruned: retrieval=%d used / %d budget (%d facts kept, %d dropped) | "
-                    "history=%d used / %d budget (%d kept / %d raw) | fixed_cost=%d total=%d",
+                    "history=%d used / %d budget (%d kept / %d in session) | fixed_cost=%d "
+                    "total=%d",
                     plan.retrieval_used,
                     plan.retrieval_budget,
                     plan.facts_kept,
                     plan.facts_dropped,
                     plan.history_used,
                     plan.history_budget,
-                    len(history),
-                    len(raw_history),
+                    len(window),
+                    len(full_history),
                     plan.fixed_cost,
                     plan.total_budget,
                 )
         else:
-            # Legacy behavior (budget disabled): full retrieval text, no history pruning.
+            # Budget disabled: full retrieval text; the strategy still picks
+            # the window, with no token limit.
             retrieval_text = (
                 retrieval_result.formatted_context
                 if retrieval_result and retrieval_result.total_facts > 0
                 else None
             )
-            history = raw_history
+            selection = self._history_strategy.select(
+                full_history,
+                sys.maxsize,
+                self._prompt_counter,
+                max_messages=max_history,
+                high_water_factor=self._context_budget_config.history_high_water_factor,
+            )
+            window = selection.messages
+            history_compacted = selection.compacted
 
-        # --- Compose messages ---
-        # Ordering rationale (KV-cache discipline, G6 in parity audit v2.1):
-        # llama.cpp's KV cache is prefix-based -- once a token mismatches, all
-        # subsequent positions must re-process. So stable content goes at the
-        # front; variable content goes at the tail. Order:
-        #   1. Persona block       (stable within session; cached MistContext)
-        #   2. Static template     (stable across all sessions)
-        #   3. MIST.md             (stable across turns; mtime-cached)
-        #   4. Retrieval text      (VARIES per turn -- breaks cache here)
-        #   5. Live-data advisory  (conditional, varies)
-        #   6. History             (variable, growing tail)
-        # Pre-2026-05-25 the order was 1,2,4,5,3,6 which broke MIST.md cache
-        # reuse every turn even though its content was unchanged.
-        messages: list[dict[str, str]] = []
+        # The window is a tail of `full_history`, whose last element is the
+        # pending message. That message is sent below as the final user
+        # message, with the delta, whether or not the window kept it.
+        window_start = len(full_history) - len(window)
+        history = full_history[min(window_start, len(full_history) - 1) : -1]
 
-        # 1. Persona block (Cluster 3)
-        if persona_text is not None:
-            messages.append({"role": "system", "content": persona_text})
-
-        # 2. Static system template
-        messages.append({"role": "system", "content": static_template})
-
-        # 3. Vault conventions (ADR-014): MIST.md auto-load as user message.
-        # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt
-        # position. Placed before retrieval to preserve KV-cache reuse across
-        # turns (parity audit v2.1 G6). Omitted when no conventions file
-        # exists (vault-less or test contexts).
-        if conventions_message is not None:
-            messages.append({"role": "user", "content": conventions_message})
-
-        # 3b. User profile (ADR-010): always-inject the known user's curated
-        # users/<user_id>.md body, independent of retrieval similarity/intent
-        # -- the analog of the MIST.md conventions always-inject above. Placed
-        # in the stable prefix (before variable retrieval/advisory/history) so
-        # it does not break KV-cache reuse across turns, and deduped against
-        # the auto-inject earlier so the body appears exactly once. Omitted
-        # when no profile file exists (graceful skip).
-        if profile_block is not None:
-            logger.debug("[USER-PROFILE] Injecting curated profile from %s", profile_path)
-            messages.append({"role": "user", "content": profile_block})
-
-        # 3c. Capability actions block: this turn's call outcomes, already
-        # decided, so the model describes them rather than deciding them. It
-        # varies per turn, so it starts the variable tail, ahead of retrieval.
-        if capability_block:
-            messages.append({"role": "system", "content": capability_block})
-
-        # 4. Retrieval context (pruned by planner when active)
+        parts = list(whole_parts)
         if retrieval_text:
             if retrieval_result:
                 logger.info(
@@ -4029,16 +4573,126 @@ class ConversationHandler:
                     retrieval_result.total_facts,
                     retrieval_result.document_chunks_used,
                 )
-            messages.append({"role": "system", "content": retrieval_text})
+            parts.append(TurnDeltaPart(kind="retrieval", text=retrieval_text, prunable=True))
+        final_messages, delta_text = _render_turn_delta(
+            parts, pending_user_message, self._context_budget_config.delta_placement
+        )
 
-        # 5. Live-data advisory
-        if live_advisory_text:
-            messages.append({"role": "system", "content": live_advisory_text})
+        # --- Compose messages ---
+        # Ordering rationale (KV-cache discipline, G6 in parity audit v2.1):
+        # llama.cpp's KV cache is prefix-based -- once a token mismatches, all
+        # subsequent positions must re-process. So stable content goes at the
+        # front and everything that varies per turn goes last:
+        #   1. Persona block       (stable within session; cached MistContext)
+        #   1b. Register prompt    (fixed for the handler's lifetime)
+        #   2. Static template     (stable across all sessions)
+        #   3. MIST.md             (stable across turns; mtime-cached)
+        #   3b. User profile       (stable until the profile file changes)
+        #   4. History             (append-only between stepped window moves)
+        #   4b. Capability block   (VARIES per turn: this turn's call outcomes)
+        #   5. Delta + user text   (VARIES per turn: note, retrieval, advisory)
+        # Before the cache-stable layout, retrieval and the advisory sat
+        # between the prefix and the history, so a new retrieval block broke
+        # the cache for the whole history on every turn.
+        messages: list[dict[str, str]] = []
 
-        # 6. Conversation history
+        # 1. Persona block (Cluster 3)
+        if persona_text is not None:
+            messages.append({"role": "system", "content": persona_text})
+
+        # 1b. Register prompt: the same on every turn, so it is prefix.
+        if self._register_prompt is not None:
+            messages.append({"role": "system", "content": self._register_prompt})
+
+        # 2. Static system template
+        messages.append({"role": "system", "content": static_template})
+
+        # 3. Vault conventions (ADR-014): MIST.md auto-load as user message.
+        # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt
+        # position. Placed in the stable prefix to preserve KV-cache reuse
+        # across turns (parity audit v2.1 G6). Omitted when no conventions
+        # file exists (vault-less or test contexts).
+        if conventions_message is not None:
+            messages.append({"role": "user", "content": conventions_message})
+
+        # 3b. User profile (ADR-010): always-inject the known user's curated
+        # users/<user_id>.md body, independent of retrieval similarity/intent
+        # -- the analog of the MIST.md conventions always-inject above. Placed
+        # in the stable prefix (before history and the delta) so it does not
+        # break KV-cache reuse across turns, and deduped against the
+        # auto-inject earlier so the body appears exactly once. Omitted when
+        # no profile file exists (graceful skip).
+        if profile_block is not None:
+            logger.debug("[USER-PROFILE] Injecting curated profile from %s", profile_path)
+            messages.append({"role": "user", "content": profile_block})
+
+        prefix_messages = list(messages)
+
+        # 4. Conversation history (raw, as stored)
         messages.extend(history)
 
-        return messages
+        # 4b. Capability actions block: this turn's call outcomes, already
+        # decided, so the model describes them rather than deciding them. It
+        # varies per turn, so it opens the tail after the history, ahead of
+        # the delta.
+        if capability_block:
+            messages.append({"role": "system", "content": capability_block})
+
+        # 5. The delta and the user's words, last.
+        messages.extend(final_messages)
+
+        tools_json = json.dumps(self._tool_schemas, sort_keys=True)
+        counter = self._prompt_counter
+        # The actions block sits in the tail with the delta, so it counts there.
+        delta_tokens_est = counter.count(delta_text)
+        if capability_block:
+            delta_tokens_est += counter.count(capability_block)
+        return PromptLayout(
+            messages=messages,
+            prefix_fingerprint=(
+                ("persona", _sha256(persona_text or "")),
+                ("register prompt", _sha256(self._register_prompt or "")),
+                ("static template", _sha256(static_template)),
+                ("MIST.md conventions", _sha256(conventions_message or "")),
+                ("user profile", _sha256(profile_block or "")),
+                ("tool schemas", _sha256(tools_json)),
+            ),
+            prefix_tokens_est=counter.count_messages(prefix_messages) + counter.count(tools_json),
+            history_tokens_est=counter.count_messages(history),
+            delta_tokens_est=delta_tokens_est,
+            history_compacted=history_compacted,
+        )
+
+    def _note_prefix_change(
+        self, session_id: str, fingerprint: tuple[tuple[str, str], ...]
+    ) -> bool:
+        """Record this turn's stable-prefix fingerprint; log and report a change.
+
+        A changed prefix means llama-server re-processes the whole prompt,
+        so the log names which component moved. The persona comes from the
+        per-session `MistContext` cache, so a changed persona means that
+        entry was evicted and refetched with new content. The first turn of a session has nothing to compare against
+        and reports no change.
+
+        Args:
+            session_id: The session the turn belongs to.
+            fingerprint: `PromptLayout.prefix_fingerprint` for this turn.
+
+        Returns:
+            True when the session had a previous fingerprint and it differs.
+        """
+        previous = self._prefix_fingerprints.get(session_id)
+        self._prefix_fingerprints[session_id] = fingerprint
+        if previous is None or previous == fingerprint:
+            return False
+        old = dict(previous)
+        changed = [name for name, digest in fingerprint if old.get(name) != digest]
+        logger.info(
+            "[PROMPT] Stable prefix changed for session %s: %s",
+            session_id,
+            ", ".join(changed),
+        )
+        return True
 
     def clear_session(self, session_id: str):
         """Clear a conversation session."""
@@ -4056,6 +4710,7 @@ class ConversationHandler:
                     logger.error("Failed to end event store session: %s", e)
             # Evict cached MistContext so the next session gets a fresh fetch.
             self._mist_context_cache.pop(session_id, None)
+            self._prefix_fingerprints.pop(session_id, None)
             logger.info(f"Cleared session: {session_id}")
 
     def get_session_info(self, session_id: str) -> dict[str, Any] | None:

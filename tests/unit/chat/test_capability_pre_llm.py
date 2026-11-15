@@ -22,6 +22,7 @@ from backend.capabilities.contracts import ActionRecord, PreTurnResolution, Tool
 from backend.chat.conversation_handler import KNOWLEDGE_TOOL_SCHEMAS, ConversationHandler
 from backend.chat.retrieval_trace import TurnTraceBuilder
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
+from backend.chat.turn_scope import TurnRequest, TurnScope
 from backend.knowledge.models import RetrievalResult
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
@@ -229,6 +230,20 @@ async def _collect(
             user_message=message, session_id=session_id
         )
     ]
+
+
+def _capture_scopes(handler: ConversationHandler) -> list[TurnScope]:
+    """Record each `TurnScope` the handler opens, so a test can reach a turn's own state."""
+    scopes: list[TurnScope] = []
+    open_turn = handler.open_turn
+
+    def _open_turn(request: TurnRequest) -> TurnScope:
+        scope = open_turn(request)
+        scopes.append(scope)
+        return scope
+
+    handler.open_turn = _open_turn  # type: ignore[method-assign]
+    return scopes
 
 
 def _payloads(events: list[StreamEvent]) -> list[dict[str, Any]]:
@@ -492,11 +507,12 @@ class TestHandledTurn:
     async def test_trace_is_built_and_reset_with_nothing_added(self):
         port = _FakePort([_handled("Timer set.", _record())])
         handler, _provider, store = _make_handler(port=port)
+        scopes = _capture_scopes(handler)
 
         await _collect(handler, "set a timer for 10 minutes")
 
         assert store.events[0].retrieval_context == {"trace": TurnTraceBuilder().build()}
-        assert handler._turn_trace is None
+        assert scopes[0].trace is None
 
     @pytest.mark.asyncio
     async def test_drained_payloads_are_yielded_on_each_pass(self):
@@ -666,7 +682,8 @@ class TestErrorBackstop:
         port = _FakePort([RuntimeError(f"hook failed with {_SECRET}")])
         handler, provider, store = _make_handler(port=port)
         orphan = {"type": "tool_call_started", "tool_call_id": "orphan", "name": "x"}
-        port.before_raise.append(lambda: handler._turn_ws_events.append(orphan))
+        scopes = _capture_scopes(handler)
+        port.before_raise.append(lambda: scopes[0].emit(orphan))
 
         events = await _collect(handler, "stop")
 

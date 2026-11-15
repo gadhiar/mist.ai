@@ -122,7 +122,8 @@ class TestAlwaysInjectProfile:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         assert _PROFILE_SENTINEL in _assembled_text(messages)
 
@@ -141,7 +142,8 @@ class TestAlwaysInjectProfile:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         profile_msgs = [m for m in messages if _PROFILE_SENTINEL in m.get("content", "")]
         assert len(profile_msgs) == 1
@@ -163,7 +165,8 @@ class TestAlwaysInjectProfile:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         profile_index = next(
             i for i, m in enumerate(messages) if _PROFILE_SENTINEL in m.get("content", "")
@@ -190,7 +193,8 @@ class TestUserIdCasingResolution:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         assert _PROFILE_SENTINEL in _assembled_text(messages)
 
@@ -210,7 +214,8 @@ class TestUserIdCasingResolution:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         assert _PROFILE_SENTINEL in _assembled_text(messages)
 
@@ -285,7 +290,8 @@ class TestDedupAgainstAutoInject:
             max_history=10,
             retrieval_result=retrieval,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         text = _assembled_text(messages)
         assert text.count(_PROFILE_SENTINEL) == 1
@@ -293,13 +299,15 @@ class TestDedupAgainstAutoInject:
         assert "Unrelated prose block about something else." in text
 
         # The single occurrence must be the always-present labeled profile
-        # block (a user-role message), NOT the retrieval "Relevant prose"
-        # system block -- proving dedup removed the auto-inject copy and the
-        # always-block is the source of truth. Without dedup this would be 2.
+        # block in the stable prefix, NOT the retrieval "Relevant prose" block
+        # in the final user message -- proving dedup removed the auto-inject
+        # copy and the always-block is the source of truth. Without dedup
+        # this would be 2.
         occurrence_msgs = [m for m in messages if _PROFILE_SENTINEL in m.get("content", "")]
         assert len(occurrence_msgs) == 1
         assert occurrence_msgs[0]["role"] == "user"
         assert "WHAT YOU KNOW ABOUT THE USER" in occurrence_msgs[0]["content"]
+        assert occurrence_msgs[0] is not messages[-1]
 
     def test_dedup_drops_profile_chunk_from_retrieval_facts(self, tmp_path: Path) -> None:
         """The profile chunk is removed from the retrieval facts so it is not
@@ -317,6 +325,7 @@ class TestDedupAgainstAutoInject:
             max_history=10,
             retrieval_result=retrieval,
             mist_context=None,
+            pending_user_message="and one more thing",
         )
 
         remaining_paths = [
@@ -344,7 +353,8 @@ class TestGracefulAbsence:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         # Assembly succeeded (at least the static template + history are present)
         assert any(m["role"] == "system" for m in messages)
@@ -366,7 +376,8 @@ class TestGracefulAbsence:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="and one more thing",
+        ).messages
 
         # someone-else.md must NOT be injected (only the resolved user's file).
         assert _PROFILE_SENTINEL not in _assembled_text(messages)
@@ -397,7 +408,8 @@ def test_profile_resolution_matrix(
         max_history=10,
         retrieval_result=None,
         mist_context=None,
-    )
+        pending_user_message="and one more thing",
+    ).messages
 
     present = _PROFILE_SENTINEL in _assembled_text(messages)
     assert present is should_find

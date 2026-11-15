@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncGenerator, Generator, Iterator
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -119,19 +119,27 @@ class InstrumentedStreamingLLMProvider(StreamingLLMProvider):
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
-        """Delegate to inner.generate and emit llm_call record on final yield."""
+        """Delegate to inner.generate and emit llm_call record on final yield.
+
+        The inner generator is iterated inside `contextlib.aclosing`, so when
+        this generator is closed (its consumer was cancelled or stopped), the
+        close reaches the inner generator in the same task. Iterated bare, the
+        inner generator would be left for the event loop's asyncgen finalizer,
+        and the provider's HTTP stream would stay open until it ran.
+        """
         start = time.perf_counter()
-        async for response in self._inner.generate(request, stream=stream):
-            if not response.partial and self._logger.llm_call_enabled:
-                latency_ms = (time.perf_counter() - start) * 1000.0
-                self._logger.record_llm_call(
-                    request=request,
-                    response=response,
-                    latency_ms=latency_ms,
-                    model=self.model,
-                    **_filter_context(get_llm_call_context()),
-                )
-            yield response
+        async with aclosing(self._inner.generate(request, stream=stream)) as inner:
+            async for response in inner:
+                if not response.partial and self._logger.llm_call_enabled:
+                    latency_ms = (time.perf_counter() - start) * 1000.0
+                    self._logger.record_llm_call(
+                        request=request,
+                        response=response,
+                        latency_ms=latency_ms,
+                        model=self.model,
+                        **_filter_context(get_llm_call_context()),
+                    )
+                yield response
 
     def generate_sync(
         self, request: LLMRequest, *, stream: bool = False

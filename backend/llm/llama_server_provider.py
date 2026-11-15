@@ -22,6 +22,21 @@ from backend.llm.provider import StreamingLLMProvider
 logger = logging.getLogger(__name__)
 
 
+async def _close_stream(stream: object) -> None:
+    """Close a streaming chat-completions response.
+
+    The openai client returns an `AsyncStream`, whose async `close()` closes
+    the underlying HTTP response. Any other async iterator handed back in its
+    place (an async generator has `aclose()`, not `close()`) is closed through
+    `aclose()` when it has one.
+    """
+    close = getattr(stream, "close", None)
+    if close is None:
+        close = getattr(stream, "aclose", None)
+    if close is not None:
+        await close()
+
+
 class LlamaServerProvider(StreamingLLMProvider):
     """StreamingLLMProvider backed by llama-server's OpenAI-compatible API."""
 
@@ -129,14 +144,48 @@ class LlamaServerProvider(StreamingLLMProvider):
         ]
 
     def _parse_usage(self, raw_usage) -> UsageMetadata | None:
-        """Parse OpenAI usage into our UsageMetadata."""
+        """Parse OpenAI usage into our UsageMetadata.
+
+        The cached count comes from `prompt_tokens_details.cached_tokens`
+        when the server sends it; `_with_cache_n` covers servers that report
+        it only in `timings`.
+        """
         if not raw_usage:
             return None
+        details = getattr(raw_usage, "prompt_tokens_details", None)
         return UsageMetadata(
             prompt_tokens=raw_usage.prompt_tokens,
             completion_tokens=raw_usage.completion_tokens,
             total_tokens=raw_usage.total_tokens,
+            cached_prompt_tokens=getattr(details, "cached_tokens", None),
         )
+
+    @staticmethod
+    def _cache_n(raw: object) -> int | None:
+        """Return llama-server's `timings.cache_n` from a parsed response or chunk.
+
+        `timings` is not in the OpenAI schema; the client keeps it in the
+        model's `model_extra`, as a plain dict.
+        """
+        extra = getattr(raw, "model_extra", None)
+        if not isinstance(extra, dict):
+            return None
+        timings = extra.get("timings")
+        if not isinstance(timings, dict):
+            return None
+        cache_n = timings.get("cache_n")
+        return cache_n if isinstance(cache_n, int) and not isinstance(cache_n, bool) else None
+
+    @staticmethod
+    def _with_cache_n(usage: UsageMetadata | None, cache_n: int | None) -> UsageMetadata | None:
+        """Fill `cached_prompt_tokens` from `timings.cache_n` when usage gave none."""
+        if cache_n is None:
+            return usage
+        if usage is None:
+            return UsageMetadata(cached_prompt_tokens=cache_n)
+        if usage.cached_prompt_tokens is not None:
+            return usage
+        return usage.model_copy(update={"cached_prompt_tokens": cache_n})
 
     def _accumulate_tool_call_deltas(self, acc: dict[int, dict[str, Any]], deltas) -> None:
         """Fold one chunk's tool_call delta fragments into the running accumulator.
@@ -188,45 +237,59 @@ class LlamaServerProvider(StreamingLLMProvider):
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
-        """Generate via async OpenAI client. Yields partial or complete responses."""
+        """Generate via async OpenAI client. Yields partial or complete responses.
+
+        The streaming HTTP response is closed in `finally`, so a consumer
+        that stops early (a cancelled turn, a `break` followed by `aclose()`)
+        releases the llama-server connection at that moment instead of
+        leaving the server generating tokens nobody reads.
+        """
         kwargs = self._build_kwargs(request, stream)
 
         if stream:
             response = await self._async_client.chat.completions.create(**kwargs)
-            tool_call_acc: dict[int, dict[str, Any]] = {}
-            reasoning_parts: list[str] = []
-            finish_reason: str | None = None
-            usage: UsageMetadata | None = None
-            async for chunk in response:
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage:
-                    usage = self._parse_usage(chunk_usage)
-                if not chunk.choices:
-                    # The final usage-only chunk (stream_options.include_usage)
-                    # has no choices at all.
-                    continue
-                choice = chunk.choices[0]
-                delta = choice.delta
-                content = getattr(delta, "content", None)
-                if content:
-                    yield LLMResponse(content=content, partial=True)
-                reasoning_piece = getattr(delta, "reasoning_content", None)
-                if reasoning_piece:
-                    reasoning_parts.append(reasoning_piece)
-                tool_call_deltas = getattr(delta, "tool_calls", None)
-                if tool_call_deltas:
-                    self._accumulate_tool_call_deltas(tool_call_acc, tool_call_deltas)
-                choice_finish_reason = getattr(choice, "finish_reason", None)
-                if choice_finish_reason:
-                    finish_reason = choice_finish_reason
-            yield LLMResponse(
-                content=None,
-                tool_calls=self._finalize_tool_calls(tool_call_acc),
-                reasoning_content="".join(reasoning_parts) or None,
-                finish_reason=finish_reason,
-                usage=usage,
-                partial=False,
-            )
+            try:
+                tool_call_acc: dict[int, dict[str, Any]] = {}
+                reasoning_parts: list[str] = []
+                finish_reason: str | None = None
+                usage: UsageMetadata | None = None
+                cache_n: int | None = None
+                async for chunk in response:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage:
+                        usage = self._parse_usage(chunk_usage)
+                    # Any chunk may carry `timings`; the last one seen wins.
+                    chunk_cache_n = self._cache_n(chunk)
+                    if chunk_cache_n is not None:
+                        cache_n = chunk_cache_n
+                    if not chunk.choices:
+                        # The final usage-only chunk (stream_options.include_usage)
+                        # has no choices at all.
+                        continue
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    content = getattr(delta, "content", None)
+                    if content:
+                        yield LLMResponse(content=content, partial=True)
+                    reasoning_piece = getattr(delta, "reasoning_content", None)
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                    tool_call_deltas = getattr(delta, "tool_calls", None)
+                    if tool_call_deltas:
+                        self._accumulate_tool_call_deltas(tool_call_acc, tool_call_deltas)
+                    choice_finish_reason = getattr(choice, "finish_reason", None)
+                    if choice_finish_reason:
+                        finish_reason = choice_finish_reason
+                yield LLMResponse(
+                    content=None,
+                    tool_calls=self._finalize_tool_calls(tool_call_acc),
+                    reasoning_content="".join(reasoning_parts) or None,
+                    finish_reason=finish_reason,
+                    usage=self._with_cache_n(usage, cache_n),
+                    partial=False,
+                )
+            finally:
+                await _close_stream(response)
         else:
             response = await self._async_client.chat.completions.create(**kwargs)
             message = response.choices[0].message
@@ -236,7 +299,9 @@ class LlamaServerProvider(StreamingLLMProvider):
                 reasoning_content=getattr(message, "reasoning_content", None),
                 finish_reason=getattr(response.choices[0], "finish_reason", None),
                 partial=False,
-                usage=self._parse_usage(response.usage),
+                usage=self._with_cache_n(
+                    self._parse_usage(response.usage), self._cache_n(response)
+                ),
             )
 
     def generate_sync(
@@ -251,10 +316,14 @@ class LlamaServerProvider(StreamingLLMProvider):
             reasoning_parts: list[str] = []
             finish_reason: str | None = None
             usage: UsageMetadata | None = None
+            cache_n: int | None = None
             for chunk in response:
                 chunk_usage = getattr(chunk, "usage", None)
                 if chunk_usage:
                     usage = self._parse_usage(chunk_usage)
+                chunk_cache_n = self._cache_n(chunk)
+                if chunk_cache_n is not None:
+                    cache_n = chunk_cache_n
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -276,7 +345,7 @@ class LlamaServerProvider(StreamingLLMProvider):
                 tool_calls=self._finalize_tool_calls(tool_call_acc),
                 reasoning_content="".join(reasoning_parts) or None,
                 finish_reason=finish_reason,
-                usage=usage,
+                usage=self._with_cache_n(usage, cache_n),
                 partial=False,
             )
         else:
@@ -288,7 +357,9 @@ class LlamaServerProvider(StreamingLLMProvider):
                 reasoning_content=getattr(message, "reasoning_content", None),
                 finish_reason=getattr(response.choices[0], "finish_reason", None),
                 partial=False,
-                usage=self._parse_usage(response.usage),
+                usage=self._with_cache_n(
+                    self._parse_usage(response.usage), self._cache_n(response)
+                ),
             )
 
     async def health_check(self) -> bool:

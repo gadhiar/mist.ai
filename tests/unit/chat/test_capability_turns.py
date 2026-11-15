@@ -43,6 +43,7 @@ from backend.capabilities.secrets import SecretRegistry
 from backend.chat.context_budget import ApproximateTokenCounter, ContextBudgetPlanner
 from backend.chat.conversation_handler import KNOWLEDGE_TOOL_SCHEMAS, ConversationHandler
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
+from backend.chat.turn_scope import TurnRequest, TurnScope
 from backend.errors import ActionDecodeError, CapabilityUnavailableError
 from backend.knowledge.models import RetrievalResult, RetrievedFact
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
@@ -386,7 +387,7 @@ class _Dispatch:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def __call__(self, tool_call: LLMToolCall) -> str:
+    async def __call__(self, scope: TurnScope, tool_call: LLMToolCall) -> str:
         self.calls.append(tool_call.name)
         return "stub tool result"
 
@@ -460,6 +461,20 @@ async def _collect(
             user_message=message, session_id=session_id
         )
     ]
+
+
+def _capture_scopes(handler: ConversationHandler) -> list[TurnScope]:
+    """Record each `TurnScope` the handler opens, so a test can reach a turn's own state."""
+    scopes: list[TurnScope] = []
+    open_turn = handler.open_turn
+
+    def _open_turn(request: TurnRequest) -> TurnScope:
+        scope = open_turn(request)
+        scopes.append(scope)
+        return scope
+
+    handler.open_turn = _open_turn  # type: ignore[method-assign]
+    return scopes
 
 
 def _payloads(events: list[StreamEvent]) -> list[dict[str, Any]]:
@@ -735,11 +750,12 @@ class TestErrorBackstop:
         assert _main_calls(provider) == []
 
     @pytest.mark.asyncio
-    async def test_the_finally_drain_still_pairs_every_started_event(self):
+    async def test_the_end_of_turn_drain_still_pairs_every_started_event(self):
         port = _Port(plan=_plan(), result=RuntimeError("boom"))
         handler, _provider, _ = _make_handler([_decode_pass()], port=port)
         orphan = {"type": "tool_call_started", "tool_call_id": "orphan", "name": "x"}
-        port.before_raise.append(lambda: handler._turn_ws_events.append(orphan))
+        scopes = _capture_scopes(handler)
+        port.before_raise.append(lambda: scopes[0].emit(orphan))
 
         events = await _collect(handler, "set a timer")
 
@@ -973,11 +989,14 @@ class TestAlsoReply:
     def test_build_messages_default_keeps_todays_messages(self):
         handler, _provider, _ = _make_handler()
         session = handler.get_or_create_session("s1", "User")
-        session.add_message("user", "hello")
 
-        plain = handler._build_messages(session, 10)
-        defaulted = handler._build_messages(session, 10, capability_block=None)
-        with_block = handler._build_messages(session, 10, capability_block=_BLOCK)
+        def _messages(**extra: Any) -> list[dict[str, Any]]:
+            layout = handler._build_messages(session, 10, pending_user_message="hello", **extra)
+            return layout.messages
+
+        plain = _messages()
+        defaulted = _messages(capability_block=None)
+        with_block = _messages(capability_block=_BLOCK)
 
         assert defaulted == plain
         assert [m for m in with_block if m["content"] != _BLOCK] == plain
