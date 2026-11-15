@@ -36,7 +36,9 @@ NOT_MEASURED = {
         "not windows"
     ),
     "ingest.bandwidth_cutoff_db": (
-        "the rehearsal's encodes are full band, so they hold no band limit to calibrate against"
+        "the rehearsal's encodes are band-limited only by their codecs (the T12 review measured "
+        "E-AC-3 at 640 kb/s to about 20.5 kHz and AAC to about 18 kHz), and the build sets and "
+        "records no known band limit, so the ground truth holds no cutoff to calibrate against"
     ),
     "bakeoff.weak_rating_below": NOT_RATED,
     "text.reject_max": NOT_RATED,

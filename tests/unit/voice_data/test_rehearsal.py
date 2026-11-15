@@ -846,6 +846,9 @@ def test_score_reports_every_h6_gate(built: Built, scored: Scored) -> None:
     assert entries["segment.c50_min_db"]["value"] == 40.0
     assert entries["retrieval.anchor_floor"]["value"] is None
     assert entries["text.reject_max"]["value"] is None
+    # The encodes are band-limited by their codecs (E-AC-3 near 20.5 kHz, AAC near 18 kHz).
+    bandwidth = entries["ingest.bandwidth_cutoff_db"]["reason"]
+    assert "full band" not in bandwidth and "no known band limit" in bandwidth
     for key in ("anchors.sim_min", "cleaning.spectrum_max_db", "state_floor.offset.neutral",
                 "state_floor.rehearsal_identity_window_floor"):  # fmt: skip
         assert isinstance(entries[key]["value"], float), key
