@@ -68,6 +68,12 @@ MSYS_NO_PATHCONV=1 \
   docker compose up -d --force-recreate mist-backend
 ```
 
+Before recreating, set `MIST_CAPABILITIES_ENABLED=false` in `.env`: gauntlet utterances must
+never reach real lights or music. A prefix on the command above would not do it:
+`docker-compose.yml` has no `environment` entry for that variable, so the backend reads it
+from `.env` through `env_file` only. After the health wait below,
+`curl -s http://localhost:8001/capabilities` must answer `"enabled":false`.
+
 **Three env-var traps to NOT skip:**
 
 1. `MSYS_NO_PATHCONV=1` is required on Git Bash when passing
