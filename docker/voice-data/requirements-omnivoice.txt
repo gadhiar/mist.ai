@@ -1,0 +1,14 @@
+# /opt/venv-teacher-omnivoice: OmniVoice from PyPI (H2 pins). huggingface-hub is resolved at H3.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+omnivoice==0.2.1
+transformers==5.19.0
+accelerate==1.8.1
+gradio==5.45.0
+librosa==0.11.0
+numpy==2.2.6
+pydub==0.25.1
+soundfile==0.13.1
+tensorboardx==2.6.5
+webdataset==1.0.2

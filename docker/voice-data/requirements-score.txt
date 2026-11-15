@@ -1,0 +1,14 @@
+# /opt/venv-score, in every image: speaker similarity, CER, arousal and pyin (H2 pins).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+transformers==4.57.6
+huggingface-hub==0.36.2
+speechbrain==1.1.2
+librosa==0.11.0
+soundfile==0.13.1
+numpy==2.2.6
+scipy==1.15.3
+safetensors==0.5.2
+accelerate==1.8.1
+sentencepiece==0.2.1
