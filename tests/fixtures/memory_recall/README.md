@@ -397,3 +397,13 @@ probes it averages over. The module docstring defines each metric.
    - facts: every row typed; at least three list utterances whose sibling texts sum past 300
      tokens, with `RECOMMENDS` and `HAS_HABIT` among them;
    - probes: at least 12 `list_item` and 12 `type_scoped`.
+
+## Follow-up probes
+
+`followup_probes.jsonl` holds pairs of user turns for the need gate's follow-up path: a
+`previous` turn that needs memory and a `query` that follows it, labelled `need` when the
+follow-up points back into the previous turn and `no_need` when it turns to the world or the
+device. A fresh author wrote it from the labels' definitions alone, without reading any probe,
+fact or note in this fixture. It is dev only: there is no held-out follow-up set, and the
+selection grid (host step H18) decides one setting on it, whether the gate also scores a closed
+follow-up joined to the turn before it (`need_context`).
