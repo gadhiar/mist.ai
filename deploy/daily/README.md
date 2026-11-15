@@ -409,9 +409,11 @@ the new environment.
 
 At the off level, while gaming mode is on, the backend keeps running: alarms and timers already
 set ring and time out on schedule, because the scheduler needs no model. Spoken messages are
-refused, because Whisper is released. A typed message is answered only by a release whose yield
-gate passes typed text to the capability host's model-free fast path; in a release without
-that path, every typed message gets the yielded reply too.
+refused, because Whisper is released. A typed message goes to the capability host's model-free
+step alone: one it handles (a ringing alarm or timer, a yes or no to a waiting proposal, or a
+fast-path command such as "set a timer for 10 minutes") is answered with no model call, and any
+other typed message gets the yielded reply. With capabilities off
+(`MIST_CAPABILITIES_ENABLED=false`, so no host), every typed message gets the yielded reply.
 
 Rollback, behaviour: set `MIST_CAPABILITIES_ENABLED=false` in `daily.env` and run `up`. No host
 is built, and the WebSocket and `/capabilities` answer as disabled. Rollback, code:
