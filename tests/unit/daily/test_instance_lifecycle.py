@@ -30,6 +30,7 @@ FIXED_NOW = datetime(2026, 10, 23, 9, 30, 5, tzinfo=UTC)
 FIXED_STAMP = "2026-10-23T09:30:05Z"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE_ID = "sha256:" + "f" * 64
+EXTRACTION_IMAGE_ID = "sha256:" + "e" * 64
 TAG = "daily-2026.10.23"
 REPO_ARG = str(REPO_ROOT)
 EIGHT_DIRS = ("state", "mist-memory", "logs", "ops", "models", "release", "retired", "bin")
@@ -528,7 +529,12 @@ def test_retire_removes_only_the_markers_and_registry_line(make_ctx, root, regis
 # --- release-build ---------------------------------------------------------------------------
 
 
-def make_archive(*, with_compose: bool = True, extra: tarfile.TarInfo | None = None) -> bytes:
+def make_archive(
+    *,
+    with_compose: bool = True,
+    with_extraction: bool = True,
+    extra: tarfile.TarInfo | None = None,
+) -> bytes:
     """A small release archive; `extra` is one more member, a file holding `EXTRA_DATA`."""
     files = {
         "deploy/daily/daily.env.example": b"MIST_RELEASE_TAG=<release-tag>\n",
@@ -537,10 +543,14 @@ def make_archive(*, with_compose: bool = True, extra: tarfile.TarInfo | None = N
         "scripts/daily/instance.py": b"print('instance')\n",
         "scripts/backup/dump.py": b"dump\n",
         "docker/backend/Dockerfile": b"FROM scratch\n",
+        "docker/extraction/README.md": b"extraction\n",
+        "docker/extraction/chat_templates/gpt-oss.jinja": b"{{ messages }}\n",
         "backend/server.py": b"server\n",
     }
     if with_compose:
         files["deploy/daily/compose.yml"] = b"services: {}\n"
+    if with_extraction:
+        files["docker/extraction/Dockerfile"] = b"FROM scratch\n"
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as tar:
         for name, data in files.items():
@@ -588,8 +598,22 @@ def docker_build(tag: str, commit: str = SHA) -> list[str]:
     ]
 
 
-def inspect(tag: str) -> list[str]:
-    return ["docker", "image", "inspect", "--format", "{{.Id}}", f"mist-backend:{tag}"]
+def inspect(tag: str, repository: str = "mist-backend") -> list[str]:
+    return ["docker", "image", "inspect", "--format", "{{.Id}}", f"{repository}:{tag}"]
+
+
+def extraction_build(tag: str, commit: str = SHA) -> list[str]:
+    return [
+        "docker",
+        "build",
+        "-f",
+        "docker/extraction/Dockerfile",
+        "-t",
+        f"mist-extraction:{tag}",
+        "--label",
+        f"org.opencontainers.image.revision={commit}",
+        "-",
+    ]
 
 
 def release_calls(repo: str = REPO_ARG, tag: str = TAG) -> list[list[str]]:
@@ -600,6 +624,8 @@ def release_calls(repo: str = REPO_ARG, tag: str = TAG) -> list[list[str]]:
         git(repo, "archive", "--format=tar", SHA),
         docker_build(tag),
         inspect(tag),
+        extraction_build(tag),
+        inspect(tag, "mist-extraction"),
     ]
 
 
@@ -611,6 +637,8 @@ def release_responses(repo: str = REPO_ARG, tag: str = TAG, **overrides) -> dict
         ok(ARCHIVE),
         ok(b"built\n"),
         ok(IMAGE_ID.encode() + b"\n"),
+        ok(b"built\n"),
+        ok(EXTRACTION_IMAGE_ID.encode() + b"\n"),
     ]
     responses = {tuple(argv): result for argv, result in zip(release_calls(repo, tag), results)}
     for index, result in overrides.items():
@@ -628,27 +656,60 @@ def release_build(make_ctx, runner, root: Path, *args: str) -> int:
     return run(make_ctx(runner), "release-build", *args, "--root", str(root))
 
 
+def release_records(root: Path) -> list[str]:
+    """The release records in `ops/`; init's `extraction-mode` is not one."""
+    return sorted(p.name for p in (root / "ops").iterdir() if p.name.startswith("release-"))
+
+
 @pytest.mark.parametrize("tag", [TAG, "daily-2026.10.23.2"])
-def test_release_build_pipes_the_archive_into_docker_build(make_ctx, built_root, tag):
+def test_release_build_pipes_the_archive_into_both_docker_builds(make_ctx, built_root, tag):
     runner = FakeRunner(release_responses(tag=tag))
     assert release_build(make_ctx, runner, built_root, tag, "--repo", REPO_ARG) == 0
     assert runner.calls == release_calls(tag=tag)
+    # The extraction image is built from the same archive, labelled with the tag's commit.
     assert runner.stdin[runner.calls.index(docker_build(tag))] == ARCHIVE
+    assert runner.stdin[runner.calls.index(extraction_build(tag))] == ARCHIVE
     record = json.loads((built_root / "ops" / f"release-{tag}.json").read_text(encoding="utf-8"))
-    assert record == {"tag": tag, "commit": SHA, "image_id": IMAGE_ID, "built_at": FIXED_STAMP}
+    assert record == {
+        "tag": tag,
+        "commit": SHA,
+        "image_id": IMAGE_ID,
+        "extraction_image_id": EXTRACTION_IMAGE_ID,
+        "built_at": FIXED_STAMP,
+    }
 
 
-def test_release_build_extracts_deploy_and_scripts_daily_only(make_ctx, built_root):
+def test_release_build_extracts_deploy_scripts_daily_and_chat_templates_only(make_ctx, built_root):
     runner = FakeRunner(release_responses())
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 0
     assert all_files(built_root / "release" / TAG) == {
         "deploy/README.md": b"deploy\n",
         "deploy/daily/compose.yml": b"services: {}\n",
         "deploy/daily/daily.env.example": b"MIST_RELEASE_TAG=<release-tag>\n",
+        "docker/extraction/chat_templates/gpt-oss.jinja": b"{{ messages }}\n",
         "scripts/daily/__init__.py": b"",
         "scripts/daily/instance.py": b"print('instance')\n",
     }
     assert [p.name for p in (built_root / "release").iterdir()] == [TAG]
+
+
+def test_release_build_refuses_an_archive_without_the_extraction_dockerfile(make_ctx, built_root):
+    runner = FakeRunner(release_responses(c3=ok(make_archive(with_extraction=False))))
+    assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 2
+    assert runner.calls == release_calls()[:4]
+    assert release_records(built_root) == []
+    assert list((built_root / "release").iterdir()) == []
+
+
+@pytest.mark.parametrize("failing", ["c6", "c7"])
+def test_release_build_writes_nothing_when_the_extraction_image_fails(
+    make_ctx, built_root, failing, capsys
+):
+    runner = FakeRunner(release_responses(**{failing: fail(1, b"extraction step failed")}))
+    assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 1
+    assert list((built_root / "release").iterdir()) == []
+    assert not (built_root / "ops" / f"release-{TAG}.json").exists()
+    assert f"mist-extraction:{TAG}" in capsys.readouterr().err
 
 
 def test_release_build_replaces_an_earlier_extraction_of_the_tag(make_ctx, built_root):
@@ -680,7 +741,7 @@ def test_release_build_refuses_an_unsafe_archive_member(make_ctx, built_root, tm
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 2
     assert runner.calls == release_calls()[:4]
     assert list((built_root / "release").iterdir()) == []
-    assert list((built_root / "ops").iterdir()) == []
+    assert release_records(built_root) == []
     assert not (built_root / "escape").exists()
     assert not (tmp_path / "escape").exists()
 
@@ -770,7 +831,7 @@ def test_release_build_refuses_an_unannotated_tag(make_ctx, built_root):
     runner = FakeRunner(release_responses(c0=ok(b"commit\n")))
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 2
     assert runner.calls == release_calls()[:1]
-    assert list((built_root / "ops").iterdir()) == []
+    assert release_records(built_root) == []
 
 
 def test_release_build_refuses_a_missing_tag(make_ctx, built_root):
@@ -784,7 +845,7 @@ def test_release_build_refuses_a_tag_not_on_origin_main(make_ctx, built_root, co
     runner = FakeRunner(release_responses(c2=fail(code, b"")))
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 2
     assert runner.calls == release_calls()[:3]
-    assert list((built_root / "ops").iterdir()) == []
+    assert release_records(built_root) == []
     assert list((built_root / "release").iterdir()) == []
 
 
@@ -805,14 +866,14 @@ def test_release_build_fails_with_exit_1_when_docker_build_fails(make_ctx, built
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 1
     assert runner.calls == release_calls()[:5]
     assert list((built_root / "release").iterdir()) == []
-    assert list((built_root / "ops").iterdir()) == []
+    assert release_records(built_root) == []
     assert "step 7 failed" in capsys.readouterr().err
 
 
 def test_release_build_names_the_state_when_inspect_fails(make_ctx, built_root, capsys):
     runner = FakeRunner(release_responses(c5=fail(1)))
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 1
-    assert list((built_root / "ops").iterdir()) == []
+    assert release_records(built_root) == []
     assert f"mist-backend:{TAG}" in capsys.readouterr().err
 
 
@@ -826,6 +887,8 @@ def test_release_build_rehearsal_skips_the_ancestry_check(make_ctx, built_root):
             tuple(git(REPO_ARG, "archive", "--format=tar", SHA)): ok(ARCHIVE),
             tuple(docker_build(tag)): ok(),
             tuple(inspect(tag)): ok(IMAGE_ID.encode()),
+            tuple(extraction_build(tag)): ok(),
+            tuple(inspect(tag, "mist-extraction")): ok(EXTRACTION_IMAGE_ID.encode()),
         }
     )
     assert (
@@ -837,9 +900,12 @@ def test_release_build_rehearsal_skips_the_ancestry_check(make_ctx, built_root):
         git(REPO_ARG, "archive", "--format=tar", SHA),
         docker_build(tag),
         inspect(tag),
+        extraction_build(tag),
+        inspect(tag, "mist-extraction"),
     ]
     record = json.loads((built_root / "ops" / f"release-{tag}.json").read_text(encoding="utf-8"))
     assert record["tag"] == tag
+    assert record["extraction_image_id"] == EXTRACTION_IMAGE_ID
     assert (built_root / "release" / tag / "deploy" / "daily" / "compose.yml").is_file()
 
 
