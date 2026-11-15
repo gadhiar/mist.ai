@@ -17,7 +17,11 @@ The harness:
 - `ModelIngress` follows T6's contract on top of `RecordingIngress`: one utterance open at a
   time, opened only while engaged, events numbered by epoch and `event_seq`, a gate decode that
   returns only on its own action, a mute that drops the open utterance ahead of `Mute`, and an
-  `open_utterance` on a muted ingress whose drop follows the current step (v8).
+  `open_utterance` on a muted ingress whose drop follows the current step (v8). An ingress the
+  session has stopped keeps emitting its open utterance's events (the `late_` actions) until the
+  controller calls its `close()` at `VoiceStop`'s handling, as the real ingress does
+  (`ingress.py` `close()`; `turn.py` `_close_ingress`): this is how B1(b)'s old-epoch end
+  reaches the mailbox behind `VoiceStart`.
 - `ModelResponder` streams what the search feeds it, one step per action; `ModelHost` answers
   reconfigures and checks swap safety at each `apply`; `ModelOutbound` sends `control` at once
   and queues `turn` items on the real `TurnLane` until the sender's `take`.
@@ -42,12 +46,33 @@ Reductions. Each is sound for the reason given; the search uses no other.
   step (read by `purge_turn` and the pacer's `stop`), every ingress action (read by
   `open_utterance`, `drop`, `close`, `handoff` and the quiescent check's `idle_since`), the clock
   (read by the policy and the stall's grace), the end of the stall, the synthesizer's failure,
-  mute, and `voice_stop` (whose answers the host reads). Every other action only appends a
-  message to the mailbox's tail or answers a claim through `FakeWakeArbiter`, which the step
-  does not read, so both orders reach the same state.
+  mute, and `voice_stop` (whose answers the host reads), and a stopped ingress's `late_` events
+  (read by `close()`). Every other action only appends a message to the mailbox's tail or
+  answers a claim through `FakeWakeArbiter`, which the step does not read, so both orders reach
+  the same state. One exception: while a stopped ingress still holds an utterance open,
+  `voice_start` is also tried before the step. It commutes with the step, but the step closes
+  the ingress and so disables a `late_` event that could follow `voice_start`: the order
+  `VoiceStop`, `VoiceStart`, late event is reached only that way.
 
 Every path is replayed from its start state: no controller state is copied. Visited states are
 kept with the most depth left they were reached with, and one is searched again only with more.
+
+Reach. `REACH` names each order of v2 :2026-2031 that v5 :1751 keeps, with its start state and
+the depth it needs, and a reach run asserts that the search visited it at exactly that depth. An
+order is a sequence of handled mailbox messages (`World.handled`), each with the phase before
+and after its handling and the facts it saw. An order counts only on a concrete path the search
+replayed. The snapshot leaves out history an order reads, so each order's progress (how many of
+its steps the path holds) joins the visited key: a path pruned as visited then has a twin with
+the same progress and at least as much depth left, whose continuations finish the order if the
+pruned path's would. Without it, B1(c)'s text step was pruned: handling the text before or
+after v opens reaches one snapshot, and only one of the two holds the step.
+
+Two orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
+frameless `0x02` is fifth on the lane and each take moves one item. B1(d) needs 4 from
+`speaking`: a name, the lost verdict, w's end and v's VAD start. Each one's reach run searches
+only the actions that the order and its alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`) to its
+own depth: every sequence of those actions, with the same reductions and invariants, and no
+other action. The default depths stay as ruled.
 """
 
 from __future__ import annotations
@@ -72,7 +97,14 @@ from backend.realtime.budget import (
     TurnConfig,
     WakeConfig,
 )
-from backend.realtime.ingress import FRAME_MS, IngressSeed, OpenedUtterance, ring_retention_ms
+from backend.realtime.ingress import (
+    FRAME_MS,
+    IngressSeed,
+    OpenedUtterance,
+    SpeechStarted,
+    UtteranceEnded,
+    ring_retention_ms,
+)
 from backend.realtime.protocol import (
     Frame,
     MsgType,
@@ -174,8 +206,16 @@ NONCOMMUTING = frozenset(
         "mute",
         "unmute",
         "voice_stop",
+        "late_partial",
+        "late_partial_stop",
+        "late_candidate",
+        "late_resumed",
+        "late_end",
+        "late_drop",
     }
 )
+OPEN_EVENTS = ("partial", "partial_stop", "candidate", "resumed", "end", "drop")
+"""The events of an ingress's open utterance; a stopped ingress emits them as `late_` actions."""
 
 
 class Violation(AssertionError):  # noqa: N818 - a violation, not an error in the harness
@@ -203,6 +243,16 @@ def named_utterance(item: object) -> str | None:
     if uid is None:
         uid = getattr(getattr(item, "detail", None), "utterance_id", None)
     return uid if isinstance(uid, str) else None
+
+
+def end_then_start(queued: list[object], uid: str) -> bool:
+    """Whether `uid`'s `UtteranceEnded` is queued, and another utterance's start behind it."""
+    ends = [
+        n for n, m in enumerate(queued) if isinstance(m, UtteranceEnded) and m.utterance_id == uid
+    ]
+    return bool(ends) and any(
+        isinstance(m, SpeechStarted) and m.utterance_id != uid for m in queued[ends[0] + 1 :]
+    )
 
 
 def item_turn(item: object) -> str | None:
@@ -305,6 +355,8 @@ class ModelIngress(RecordingIngress):
     def close(self) -> None:
         super().close()
         self.closed = True
+        if self.world.stopped is self:
+            self.world.stopped = None
         self.open_uid = None
         self.gate_asks = []
         self.known.clear()
@@ -447,6 +499,16 @@ class Step:
     phase: str
 
 
+@dataclass(frozen=True, slots=True)
+class Handled:
+    """One handled mailbox message, as the reach runs read it."""
+
+    kind: str
+    before: str
+    after: str
+    facts: frozenset[str]
+
+
 @dataclass
 class World:
     """One path's world, built afresh for every replay."""
@@ -475,6 +537,8 @@ class World:
     handling: Step | None = None
     labels: list[str] = field(default_factory=list)
     accepted: set[str] = field(default_factory=set)
+    handled: list[Handled] = field(default_factory=list)
+    stopped: ModelIngress | None = None
 
     def __post_init__(self) -> None:
         self.outbound = ModelOutbound(self)
@@ -621,10 +685,30 @@ class World:
             )
             if isinstance(message, PlaybackDone):
                 self.done_handled.add(message.turn_id)
+            facts = self.facts_before(message)
+            queued = list(self.mailbox.items)
+            ingress = self.ingress
+            levers = len(ingress.calls) if ingress is not None else 0
             try:
                 await handler(message)
             finally:
                 self.handling = None
+            if any(purge.terminal for _, purge in self.outbound.purges[step.purges_from :]):
+                facts.add("purged 0x02")
+            if isinstance(message, WakeVerdict) and not message.proceed and ingress is not None:
+                # B1(d): the lost claim's drop names w, whose end and then v's start are queued.
+                lost = [
+                    call[1]
+                    for call in ingress.calls[levers:]
+                    if call[0] == "drop" and call[2] == "wake_lost"
+                ]
+                if any(end_then_start(queued, w) for w in lost):
+                    facts.add("lost w, w's end and v's start queued")
+            self.handled.append(
+                Handled(
+                    type(message).__name__, step.phase, self.controller._phase, frozenset(facts)
+                )
+            )
             if settled and self.footprint() != footprint:
                 self.fail("settle once", f"the verdict for settled claim {message.claim_id} acted")
             self.check_message(step)
@@ -640,6 +724,40 @@ class World:
             len(self.arbiter.settles),
             len(self.responder.requests),
         )
+
+    def facts_before(self, message: object) -> set[str]:
+        """What a reach order needs from the mailbox and the fakes as `message` is handled."""
+        c = self.controller
+        facts: set[str] = set()
+        queued = list(self.mailbox.items)
+        turn = c._turn
+        if isinstance(message, Reconfigure) and message.refusal is None:
+            facts.add("servable")
+        if isinstance(message, Text) and turn is not None and turn.held:
+            # B1(c): the held utterance's end is queued behind the text; ingress is on the next.
+            held = turn.utterance_id
+            ingress = self.ingress
+            ended = any(isinstance(m, UtteranceEnded) and m.utterance_id == held for m in queued)
+            if ended and ingress is not None and ingress.open_uid not in (None, held):
+                facts.add("held end queued, next open")
+        if isinstance(message, VoiceStop):
+            # B1(b): a `VoiceStart`, then the closing ingress's end of a published utterance.
+            starts = [n for n, m in enumerate(queued) if isinstance(m, VoiceStart)]
+            published = self.published()
+            if starts and any(
+                isinstance(m, UtteranceEnded)
+                and m.epoch == c._epoch
+                and m.utterance_id in published
+                for m in queued[starts[0] + 1 :]
+            ):
+                facts.add("old end behind VoiceStart")
+        if (
+            isinstance(message, PlaybackDone)
+            and turn is not None
+            and turn.scope.turn_index not in self.responder.finished
+        ):
+            facts.add("generation open")
+        return facts
 
     def published(self) -> frozenset[str]:
         return frozenset(
@@ -745,6 +863,9 @@ class World:
                 actions += ["reconfigure", "reconfigure_refused"]
         elif self.starts < MAX_STARTS:
             actions.append("voice_start")
+        late = self.stopped is not None and self.stopped.open_uid is not None
+        if late:
+            actions += [f"late_{event}" for event in OPEN_EVENTS]
         for index, claim in enumerate(self.arbiter.claims[-2:]):
             if not claim.answered:
                 number = len(self.arbiter.claims[:-2]) + index
@@ -772,7 +893,8 @@ class World:
         if self.outbound.lane_items():
             actions.append("take")
         if search and can_deliver:
-            return ["deliver"] + [a for a in actions[1:] if a in NONCOMMUTING]
+            before = NONCOMMUTING | {"voice_start"} if late else NONCOMMUTING
+            return ["deliver"] + [a for a in actions[1:] if a in before]
         return actions
 
     async def act(self, label: str) -> None:
@@ -797,6 +919,9 @@ class World:
 
     async def _env(self, label: str) -> None:  # noqa: C901 - one branch per action
         ingress = self.ingress
+        if label.startswith("late_"):
+            # The stopped ingress, still emitting until the controller closes it.
+            ingress, label = self.stopped, label.removeprefix("late_")
         name, _, arg = label.partition(":")
         if name == "vad":
             assert ingress is not None
@@ -874,6 +999,7 @@ class World:
             self.voice_on = False
             if ingress is not None:
                 ingress.expecting = False
+                self.stopped = None if ingress.closed else ingress
             self.post(VoiceStop())
         elif name in ("reconfigure", "reconfigure_refused"):
             self.starts += 1
@@ -1287,6 +1413,7 @@ class World:
                 i.emitted == c._handled_seq if i is ingress else None,
                 i is ingress,
                 i is self.ingress,
+                i is self.stopped,
                 tuple(sorted(u(k) for k in i.known)),
             )
             for i in self.ingresses
@@ -1464,6 +1591,7 @@ async def build(start: str) -> World:
     world.starts = 0
     world.texts = 0
     world.labels = []
+    world.handled = []
     return world
 
 
@@ -1492,7 +1620,161 @@ class Stats:
     edges: int = 0
     leaves: int = 0
     seconds: float = 0.0
-    labels: set[str] = field(default_factory=set)
+    reached: dict[str, int] = field(default_factory=dict)
+    """Each named order the search visited, with the fewest environment actions it took."""
+
+
+# -- Reach: the named orders ------------------------------------------------------------------
+
+
+def handled(
+    kind: str, *, before: str | None = None, after: str | None = None, fact: str | None = None
+) -> Callable[[Handled], bool]:
+    """One handled message of an order: its type, and the phase and fact it must show."""
+
+    def matches(entry: Handled) -> bool:
+        return (
+            entry.kind == kind
+            and (before is None or entry.before == before)
+            and (after is None or entry.after == after)
+            and (fact is None or fact in entry.facts)
+        )
+
+    return matches
+
+
+@dataclass(frozen=True)
+class Reach:
+    """A named order: handled messages in this order, from `start`, at `depth` actions."""
+
+    name: str
+    start: str
+    depth: int
+    steps: tuple[Callable[[Handled], bool], ...]
+    alphabet: frozenset[str] | None = None
+    """None for the full alphabet at the start's default depth; else a narrowed search."""
+
+    def progress(self, world: World) -> int:
+        """How many steps the path's handled messages hold in order, others between.
+
+        Matching each step at its earliest entry is never worse than a later one, so this count
+        is all a continuation needs to know about the path's past for this order.
+        """
+        done = 0
+        for entry in world.handled:
+            if done < len(self.steps) and self.steps[done](entry):
+                done += 1
+        return done
+
+
+B8_DEPTH = 8
+B8_ALPHABET = frozenset({"synth_fail", "say", "take", "playback_done", "done"})
+"""B8's actions and its alternatives': arm the failure, a token to fail on, the sender's takes up
+to the frameless `0x02`, the client's `playback_done`, and the responder's completion."""
+
+B1D_DEPTH = 4
+B1D_ALPHABET = frozenset({"name", "grant", "deny", "end", "drop", "vad"})
+"""B1(d)'s actions and its alternatives': a name that opens w and claims, the claim's verdict
+either way, w's end or its drop by ingress, and the VAD start of v."""
+
+REACH: tuple[Reach, ...] = (
+    # v2 :2027-2028, a servable `Reconfigure` while speaking and while a turn is held, which
+    # waits for a quiescent point.
+    Reach(
+        "reconfigure while speaking",
+        "speaking",
+        1,
+        (handled("Reconfigure", before="speaking", after="speaking", fact="servable"),),
+    ),
+    Reach(
+        "reconfigure while held",
+        "held",
+        1,
+        (handled("Reconfigure", before="held", after="held", fact="servable"),),
+    ),
+    # v2 :1479-1482, B5: the last frames and the `0x02` queued and not taken, then a cut that
+    # purges the `0x02` (the stream's end, then an interrupt).
+    Reach(
+        "B5",
+        "speaking",
+        2,
+        (
+            handled("_StreamEnded", before="speaking"),
+            handled("Interrupt", before="speaking", fact="purged 0x02"),
+        ),
+    ),
+    # v2 :1655-1656, B1(b): `VoiceStop`, `VoiceStart`, then the old ingress's end of a published
+    # utterance, which is dropped as an old-epoch event.
+    Reach(
+        "B1(b)",
+        "held",
+        3,
+        (
+            handled("VoiceStop", before="held", fact="old end behind VoiceStart"),
+            handled("VoiceStart"),
+            handled("UtteranceEnded"),
+        ),
+    ),
+    # v2 :1657-1659, B1(c): `held` on u, ingress has ended u and opened v, and the mailbox holds
+    # the text, then u's end.
+    Reach(
+        "B1(c)",
+        "held",
+        3,
+        (
+            handled("Text", before="held", fact="held end queued, next open"),
+            handled("UtteranceEnded", before="text"),
+        ),
+    ),
+    # v2 :1660-1662, B1(d) in its v5 form: v5 has no `WakeLost`; a lost claim drops w with
+    # `wake_lost` (`turn.py` `_reject`). The verdict is handled with w's end and v's start
+    # queued behind it. Ingress is dormant in `idle` (v5 :1177), so this runs from `speaking`,
+    # and it needs depth 4: name, deny, end, vad.
+    Reach(
+        "B1(d)",
+        "speaking",
+        B1D_DEPTH,
+        (
+            handled("WakeVerdict", before="speaking", fact="lost w, w's end and v's start queued"),
+            handled("UtteranceEnded", before="speaking"),
+            handled("SpeechStarted", before="speaking"),
+        ),
+        alphabet=B1D_ALPHABET,
+    ),
+    # v2 :2029-2030, B9: from `thinking`, a VAD start, then the failure, which moves to `text`.
+    Reach(
+        "B9",
+        "thinking_tool",
+        3,
+        (
+            handled("SpeechStarted", before="thinking"),
+            handled("_SynthFailed", before="thinking", after="text"),
+        ),
+    ),
+    # v2 :2030-2031, N13 and B10: from `held`, the failure, then the utterance's end, which
+    # releases the turn into `text`.
+    Reach(
+        "B10/N13",
+        "held",
+        3,
+        (
+            handled("_SynthFailed", before="held", after="held"),
+            handled("UtteranceEnded", before="held", after="text"),
+        ),
+    ),
+    # v2 :2028-2029, B8: from `thinking`, the failure, then `playback_done` before the
+    # responder's completion. Its frameless `0x02` is fifth on the lane, so it needs depth 8.
+    Reach(
+        "B8",
+        "thinking_tool",
+        B8_DEPTH,
+        (
+            handled("_SynthFailed", before="thinking", after="text"),
+            handled("PlaybackDone", fact="generation open"),
+        ),
+        alphabet=B8_ALPHABET,
+    ),
+)
 
 
 async def replay(start: str, path: tuple[str, ...]) -> World:
@@ -1506,10 +1788,16 @@ async def replay(start: str, path: tuple[str, ...]) -> World:
     return world
 
 
-async def search(start: str, depth: int) -> Stats:
-    """Depth-first over every bounded path from `start`; raises on the first violation."""
+async def search(start: str, depth: int, alphabet: frozenset[str] | None = None) -> Stats:
+    """Depth-first over every bounded path from `start`; raises on the first violation.
+
+    `alphabet`, when given, narrows the environment actions to those named; controller steps
+    are always taken. Each of the start's named orders adds its progress to the visited key, so
+    a path pruned as visited has a twin with the same progress and at least its depth left.
+    """
     check_preconditions(depth)
     stats = Stats()
+    orders = [order for order in REACH if order.start == start]
     began = time.perf_counter()
     visited: dict[tuple[object, ...], int] = {}
     stack: list[tuple[str, ...]] = [()]
@@ -1518,13 +1806,19 @@ async def search(start: str, depth: int) -> Stats:
         world = await replay(start, path)
         stats.edges += 1
         try:
+            progress = tuple(order.progress(world) for order in orders)
+            for order, done in zip(orders, progress):
+                if done == len(order.steps):
+                    stats.reached[order.name] = min(stats.reached.get(order.name, depth), world.env)
             left = depth - world.env
-            snap = world.snapshot()
+            snap = (world.snapshot(), progress)
             if visited.get(snap, -1) >= left:
                 continue
             visited[snap] = left
             stats.states += 1
             actions = world.enabled()
+            if alphabet is not None:
+                actions = [a for a in actions if a == "deliver" or a.partition(":")[0] in alphabet]
             if left > 0 or "deliver" in actions:
                 actions = [a for a in actions if a == "deliver" or left > 0]
             else:
@@ -1538,7 +1832,6 @@ async def search(start: str, depth: int) -> Stats:
                         f"{start} after {list(path)}, drained {world.labels[len(path):]}: {error}"
                     ) from error
                 continue
-            stats.labels.update(a.partition(":")[0] for a in actions)
             for label in reversed(actions):
                 stack.append((*path, label))
         finally:
@@ -1556,7 +1849,7 @@ async def _quiet_loop():
 @pytest.mark.parametrize("start", sorted(START_STATES))
 async def test_every_bounded_path_keeps_every_invariant(start):
     depth = depth_for(start)
-    stats = await search(start, depth)
+    stats = await searched(start, depth)
     print(
         f"\nmodel-check start={start} depth={depth} states={stats.states} "
         f"edges={stats.edges} leaves={stats.leaves} seconds={stats.seconds:.1f}"
@@ -1567,6 +1860,36 @@ async def test_every_bounded_path_keeps_every_invariant(start):
 async def test_a_depth_past_the_bounds_fails_before_any_state_is_visited():
     with pytest.raises(AssertionError, match="precondition: 6 start frames plus depth 9 reach 15"):
         await search("held", 9)
+
+
+_SEARCHED: dict[tuple[str, int, frozenset[str] | None], Stats] = {}
+
+
+async def searched(start: str, depth: int, alphabet: frozenset[str] | None = None) -> Stats:
+    """`search` with no fault planted, run once per bound, so the reach runs reuse its result."""
+    assert PLANT is None, "a planted search is never shared"
+    key = (start, depth, alphabet)
+    if key not in _SEARCHED:
+        _SEARCHED[key] = await search(start, depth, alphabet)
+    return _SEARCHED[key]
+
+
+@pytest.mark.parametrize("order", REACH, ids=[order.name for order in REACH])
+async def test_the_search_visits_each_named_order(order):
+    depth = depth_for(order.start) if order.alphabet is None else order.depth
+    stats = await searched(order.start, depth, order.alphabet)
+    if order.alphabet is not None:
+        print(
+            f"\nmodel-check start={order.start} depth={depth} narrowed={sorted(order.alphabet)} "
+            f"states={stats.states} edges={stats.edges} leaves={stats.leaves} "
+            f"seconds={stats.seconds:.1f}"
+        )
+    assert (
+        order.name in stats.reached
+    ), f"{order.name} not visited from {order.start} at depth {depth}; it needs {order.depth}"
+    assert (
+        stats.reached[order.name] == order.depth
+    ), f"{order.name} first visited at depth {stats.reached[order.name]}, stated {order.depth}"
 
 
 # -- Teeth: each plants one fault in the controller, and the search must name its invariant ----
