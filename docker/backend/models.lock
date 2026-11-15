@@ -32,8 +32,8 @@ revision = "7b0235231ca2674cb8ca8f022859a6eba2b1c968"
 license = "Apache-2.0"
 target = "/opt/models/ms-marco-MiniLM-L-12-v2"
 
-# Embedder for the offline recall eval. The production embedder still loads
-# all-MiniLM-L6-v2 by name into the mist-hf-cache volume; this copy does not change that.
+# Embedder for the offline recall eval and the production embedder, which loads this copy
+# and falls back to loading all-MiniLM-L6-v2 by name only where /opt/models lacks it.
 [[model]]
 name = "all-MiniLM-L6-v2"
 repo = "sentence-transformers/all-MiniLM-L6-v2"
