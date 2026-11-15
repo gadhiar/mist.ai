@@ -26,6 +26,7 @@ commit's `snapshots/<sha>` folder resolves with `local_files_only`.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import hashlib
 import http.client
@@ -37,7 +38,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 from .. import jobs
@@ -48,6 +49,16 @@ SCHEMA = 1
 CHUNK_BYTES = 1 << 20
 TIMEOUT_S = 60.0
 HUB_LOGGER = "huggingface_hub"
+EXTRACT = "extract"
+SCORE = "score"
+DEVICES = ("cpu", "cuda")
+UPSTREAM = Path("/opt/mist-voice/upstream")
+QUIET_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    "TQDM_DISABLE": "1",
+    "TRANSFORMERS_VERBOSITY": "error",
+}
 
 
 class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
@@ -107,6 +118,104 @@ def snapshot_dir(repository: str, revision: str, *, repo_type: str = "model") ->
     except (OSError, ValueError) as exc:
         raise JobError(f"{repository} is not in the cache; run fetch") from exc
     return Path(path)
+
+
+# Reading the cache from a binding.
+
+
+def model_entry(family: str, model_id: str) -> Mapping[str, object]:
+    """Return a model's `families.json` entry.
+
+    Raises:
+        JobError: The family has no such model.
+    """
+    models = jobs.load_families().get(family, {}).get("models", {})
+    entry = models.get(model_id) if isinstance(models, dict) else None
+    if not isinstance(entry, dict):
+        raise JobError(f"family {family} has no model {model_id}")
+    return entry
+
+
+def model_dir(family: str, model_id: str) -> Path:
+    """Return a Hugging Face model's snapshot folder at its pinned revision, offline.
+
+    Raises:
+        JobError: The model is unknown, not a Hugging Face model, or not in the cache.
+    """
+    entry = model_entry(family, model_id)
+    if entry.get("kind") != "hf":
+        raise JobError(f"model {model_id} is not a Hugging Face model")
+    return snapshot_dir(
+        str(entry["repository"]),
+        str(entry["revision"]),
+        repo_type=str(entry.get("repo_type") or "model"),
+    )
+
+
+def model_file(family: str, model_id: str, name: str) -> Path:
+    """Return one file of a model's cached snapshot.
+
+    Raises:
+        JobError: The snapshot or the file is not in the cache.
+    """
+    path = model_dir(family, model_id) / name
+    if not path.is_file():
+        raise JobError(f"model {model_id} has no {name} in the cache; run fetch")
+    return path
+
+
+def cache_file(family: str, model_id: str) -> Path:
+    """Return a `url` model's file under the cache.
+
+    Raises:
+        JobError: The model is not a `url` model, or its file is not in the cache.
+    """
+    entry = model_entry(family, model_id)
+    if entry.get("kind") != "url":
+        raise JobError(f"model {model_id} is not a url model")
+    path = cache_root() / str(entry["dest"])
+    if not path.is_file():
+        raise JobError(f"model {model_id} is not in the cache; run fetch")
+    return path
+
+
+def prepare(device: str, *loggers: str) -> None:
+    """Set offline mode and errors-only output before a binding imports its library.
+
+    Offline mode and the progress-bar switches are environment variables the libraries read
+    when they are imported, so this runs first in every `load`. A library's log can carry a
+    transcript, and its progress bars fill the job log, so both are kept to errors.
+
+    Raises:
+        JobError: `device` is neither `cpu` nor `cuda`.
+    """
+    if device not in DEVICES:
+        raise JobError(f"device {device} is not one of {', '.join(DEVICES)}")
+    os.environ.update(QUIET_ENV)
+    for name in (HUB_LOGGER, *loggers):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
+@contextlib.contextmanager
+def library_errors(model_id: str) -> Iterator[None]:
+    """Turn a model library's failure into `JobError`, naming the model id and error class only.
+
+    Library messages can carry paths or text, so they stay in the chained traceback in the job
+    log. Errors outside these classes are bugs in the binding and surface as themselves.
+    """
+    try:
+        yield
+    except JobError:
+        raise
+    except (RuntimeError, OSError, ValueError, ImportError) as exc:
+        raise JobError(f"{model_id}: {type(exc).__name__}") from exc
+
+
+def on_path(folder: Path) -> None:
+    """Put an upstream clone at the front of `sys.path`, once; `-I` keeps it off otherwise."""
+    entry = str(folder)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
 
 
 def sha256_file(path: Path) -> str:
