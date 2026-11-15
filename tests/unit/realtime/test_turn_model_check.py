@@ -58,10 +58,21 @@ Reductions. Each is sound for the reason given; the search uses no other.
   nothing: `TurnLane.take` wakes no task, and the failure is a field the next synthesis reads.
   `text` appends a message the step does not read (the controller reads its mailbox only at
   the head, `turn.py` `_run`), no other action's guard reads what it changes, and no step
-  invariant reads the mailbox; so the step first reaches the same state, and the state it skips has the
-  verdicts of the one before it. An earlier filter tried before the step every action the step
-  could observe, and missed each order in which an append outside that set came before one
-  inside it; `reconfigure behind a voice restart` is the witness.
+  invariant reads the mailbox. So `text` commutes with the step when the step posts nothing,
+  and the state it skips has the verdicts of the one before it. A step can post, though: from
+  `idle`, after `reconfigure_refused`, `reconfigure_refused`, `name`, `mute` and `voice_stop`,
+  the step is eager (no `voice_start` is left), and the step on the name opens on the
+  controller's ingress, which it holds until it handles the `VoiceStop`; that ingress is muted,
+  so the open posts a muted drop after the step. Which steps post is not listed here (the
+  controller's own tasks post `_AudioStarted`, `_SynthFailed`, `_PlayEnded` and `_AckPlayed`
+  too): the search sees it, as the step's mailbox no shorter than before it, and then takes
+  the actions that waited before the step as well (`Waited`). The parent's visited entry stays
+  sound, since the step is the parent's first child and is taken right after it, so every
+  action of the parent is on the stack before any other path can reach it. With that, the eager step
+  meets C1 at every depth. `text ahead of a step's muted drop` is the witness; an earlier
+  filter tried before the step every action the step could observe, and missed each order in
+  which an append outside that set came before one inside it, with `reconfigure behind a voice
+  restart` as its witness.
 
 Every path is replayed from its start state: no controller state is copied. A state's first child
 continues on its parent's world, which is the world its replay would build; the others replay.
@@ -77,15 +88,18 @@ replayed. The snapshot leaves out history an order reads, so each order's progre
 its steps the path holds) joins the visited key: a path pruned as visited then has a twin with
 the same progress and at least as much depth left, whose continuations finish the order if the
 pruned path's would. Without it, B1(c)'s text step was pruned: handling the text before or
-after v opens reaches one snapshot, and only one of the two holds the step. One more entry,
-`reconfigure behind a voice restart`, is not a v2 order: it shows that the eager step meets C1.
+after v opens reaches one snapshot, and only one of the two holds the step. Two more entries,
+`reconfigure behind a voice restart` and `text ahead of a step's muted drop`, are not v2
+orders: they show that the eager step meets C1.
 
-Two orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
+Three orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
 frameless `0x02` is fifth on the lane and each take moves one item. B1(d) needs 4 from
-`speaking`: a name, the lost verdict, w's end and v's VAD start. Each one's reach run searches
-only the actions that the order and its alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`) to its
-own depth: every sequence of those actions, with the same reductions and invariants, and no
-other action. The default depths stay as ruled.
+`speaking`: a name, the lost verdict, w's end and v's VAD start. The posting-step witness needs
+6 from `idle`. Each one's reach run searches only the actions that the order and its
+alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`, `POSTING_ALPHABET`) to its own depth: every
+sequence of those actions, with the same reductions and invariants, and no other action. A
+search keys its visited states on the progress of its start's full-alphabet orders and of its
+own narrowed ones only. The default depths stay as ruled.
 """
 
 from __future__ import annotations
@@ -115,6 +129,7 @@ from backend.realtime.ingress import (
     IngressSeed,
     OpenedUtterance,
     SpeechStarted,
+    UtteranceDropped,
     UtteranceEnded,
     ring_retention_ms,
 )
@@ -729,6 +744,14 @@ class World:
             stops = [n for n, m in enumerate(queued) if isinstance(m, VoiceStop)]
             if stops and any(isinstance(m, VoiceStart) for m in queued[stops[0] + 1 :]):
                 facts.add("voice restart queued")
+        if (
+            isinstance(message, Text)
+            and self.starts >= MAX_STARTS
+            and any(isinstance(m, UtteranceDropped) and m.reason == "muted" for m in queued)
+        ):
+            # The posting-step witness: a muted drop queued behind the text, with no `voice_start`
+            # left to keep the step before the text from being eager.
+            facts.add("muted drop queued, starts spent")
         if isinstance(message, Text) and turn is not None and turn.held:
             # B1(c): the held utterance's end is queued behind the text; ingress is on the next.
             held = turn.utterance_id
@@ -1674,6 +1697,11 @@ B1D_ALPHABET = frozenset({"name", "grant", "deny", "end", "drop", "vad"})
 """B1(d)'s actions and its alternatives': a name that opens w and claims, the claim's verdict
 either way, w's end or its drop by ingress, and the VAD start of v."""
 
+POSTING_DEPTH = 6
+POSTING_ALPHABET = frozenset({"reconfigure_refused", "name", "mute", "voice_stop", "text"})
+"""The posting-step witness's actions: two refused reconfigures to spend the voice starts, a
+name, the mute and `voice_stop` that leave the controller a muted ingress, and the text."""
+
 REACH: tuple[Reach, ...] = (
     # v2 :2027-2028, a servable `Reconfigure` while speaking and while a turn is held, which
     # waits for a quiescent point.
@@ -1769,6 +1797,20 @@ REACH: tuple[Reach, ...] = (
         3,
         (handled("Reconfigure", before="idle", fact="voice restart queued"),),
     ),
+    # Not a v2 order: the witness that an eager step which posts still lets the text go first.
+    # After two refused reconfigures, a name, a mute and `voice_stop`, the step on the name opens
+    # on the controller's muted ingress and posts its drop; the text queued before that step is
+    # handled ahead of the drop only if the search takes it before the eager step.
+    Reach(
+        "text ahead of a step's muted drop",
+        "idle",
+        POSTING_DEPTH,
+        (
+            handled("VoiceStop"),
+            handled("Text", fact="muted drop queued, starts spent"),
+        ),
+        alphabet=POSTING_ALPHABET,
+    ),
     # v2 :2028-2029, B8: from `thinking`, the failure, then `playback_done` before the
     # responder's completion. Its frameless `0x02` is fifth on the lane, so it needs depth 8.
     Reach(
@@ -1812,25 +1854,49 @@ async def extend(world: World, start: str, path: tuple[str, ...]) -> World:
     return world
 
 
+@dataclass(frozen=True, slots=True)
+class Waited:
+    """An eager step's parent: its mailbox length, and the actions that waited for the step."""
+
+    mailbox: int
+    actions: tuple[str, ...]
+
+
 async def search(start: str, depth: int, alphabet: frozenset[str] | None = None) -> Stats:
     """Depth-first over every bounded path from `start`; raises on the first violation.
 
     `alphabet`, when given, narrows the environment actions to those named; controller steps
-    are always taken. Each of the start's named orders adds its progress to the visited key, so
-    a path pruned as visited has a twin with the same progress and at least its depth left.
+    are always taken. Each of the start's named orders over the full alphabet, and each over
+    `alphabet`, adds its progress to the visited key, so a path pruned as visited has a twin
+    with the same progress and at least its depth left.
     """
     check_preconditions(depth)
     stats = Stats()
-    orders = [order for order in REACH if order.start == start]
+    orders = [
+        order for order in REACH if order.start == start and order.alphabet in (None, alphabet)
+    ]
     began = time.perf_counter()
     visited: dict[tuple[object, ...], int] = {}
-    # A path, and its parent's world when this is the parent's first child: that one continues
-    # on the parent's world, which is the world its replay would build; the others replay.
-    stack: list[tuple[tuple[str, ...], World | None]] = [((), None)]
+
+    def bounded(actions: list[str], left: int) -> list[str]:
+        if alphabet is not None:
+            actions = [a for a in actions if a == "deliver" or a.partition(":")[0] in alphabet]
+        return [a for a in actions if a == "deliver" or left > 0]
+
+    # A path; its parent's world when this is the parent's first child, which continues on the
+    # parent's world (the world its replay would build) while the others replay; and, when the
+    # parent stepped eagerly, the parent's mailbox length and the actions that waited for the
+    # step, which are explored before the step after all if the step posts.
+    stack: list[tuple[tuple[str, ...], World | None, Waited | None]] = [((), None, None)]
     while stack:
-        path, parent = stack.pop()
+        path, parent, waited = stack.pop()
         world = await replay(start, path) if parent is None else await extend(parent, start, path)
         stats.edges += 1
+        if waited is not None and len(world.mailbox.items) >= waited.mailbox:
+            # The step posted (the mailbox lost its head and still did not shrink), so it does
+            # not commute with an append: take each waiting action before it as well.
+            for label in reversed(waited.actions):
+                stack.append(((*path[:-1], label), None, None))
         kept = False
         try:
             progress = tuple(order.progress(world) for order in orders)
@@ -1843,13 +1909,10 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
                 continue
             visited[snap] = left
             stats.states += 1
-            actions = world.enabled()
-            if alphabet is not None:
-                actions = [a for a in actions if a == "deliver" or a.partition(":")[0] in alphabet]
-            if left > 0 or "deliver" in actions:
-                actions = [a for a in actions if a == "deliver" or left > 0]
-            else:
-                actions = []
+            actions = bounded(world.enabled(), left)
+            waiting = tuple(
+                a for a in bounded(world.enabled(search=False), left) if a not in actions
+            )
             if not actions:
                 stats.leaves += 1
                 try:
@@ -1860,8 +1923,9 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
                     ) from error
                 continue
             for label in reversed(actions[1:]):
-                stack.append(((*path, label), None))
-            stack.append(((*path, actions[0]), world))
+                stack.append(((*path, label), None, None))
+            step = Waited(len(world.mailbox.items), waiting) if waiting else None
+            stack.append(((*path, actions[0]), world, step))
             kept = True
         finally:
             if not kept:
