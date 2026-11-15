@@ -21,8 +21,6 @@ FAKE_TOKEN = "fake-ha-token-for-tests"
 FULL_ENV = {
     "MIST_CAPABILITIES_ENABLED": "true",
     "MIST_CAPABILITIES": "clock, lights ,music",
-    "MIST_WS_ALLOWED_ORIGINS": " http://localhost:1420 , tauri://localhost ",
-    "MIST_BACKEND_BIND_ADDR": "127.0.0.1",
     "MIST_TIMEZONE": "Etc/UTC",
     "MIST_CAPABILITIES_DB_PATH": "/tmp/caps.db",
     "MIST_CAPABILITY_POLICY_FILE": "/tmp/policy.yaml",
@@ -55,8 +53,6 @@ class TestDefaults:
         assert config == CapabilitiesConfig(
             enabled=False,
             capabilities=("clock", "alarms", "timers", "lights", "music"),
-            ws_allowed_origins=(),
-            backend_bind_addr="0.0.0.0",
             timezone=None,
             db_path="data/capabilities.db",
             policy_file=None,
@@ -101,8 +97,6 @@ class TestEveryVariable:
         assert config == CapabilitiesConfig(
             enabled=True,
             capabilities=("clock", "lights", "music"),
-            ws_allowed_origins=("http://localhost:1420", "tauri://localhost"),
-            backend_bind_addr="127.0.0.1",
             timezone="Etc/UTC",
             db_path="/tmp/caps.db",
             policy_file="/tmp/policy.yaml",
