@@ -496,7 +496,8 @@ class TestOneShotRefresh:
         first = await refresher.refresh()
         second = await refresher.refresh()
 
-        assert first == DiffReport(inserted=5, embedded=5)
+        # The five facts are the user using a technology: one facet.
+        assert first == DiffReport(inserted=5, embedded=5, facets_written=1)
         assert second == DiffReport(unchanged=5)
         assert index.count() == 5
 
@@ -965,7 +966,7 @@ class TestRebuild:
 
         report = await refresher.refresh()
 
-        assert report == DiffReport(inserted=2, embedded=2)
+        assert report == DiffReport(inserted=2, embedded=2, facets_written=1)
         assert degraded_reason(reader) is None
         # The completed rebuild is not checked again: a second refresh does not reopen it.
         assert await refresher.refresh() == DiffReport(unchanged=2)
@@ -1140,10 +1141,12 @@ class TestScale:
         with capsys.disabled():
             print(
                 f"\n10k-fact rescan with FakeEmbedder, {backing}: cold {cold_s:.2f} s "
-                f"({first.embedded} embedded, {cold_pages} pages), unchanged {warm_s:.2f} s"
+                f"({first.embedded} embedded, {first.facets_written} facet of 10000 members, "
+                f"{cold_pages} pages), unchanged {warm_s:.2f} s"
             )
         assert cold_pages <= 3  # two full pages and the empty one that ends the scan
-        assert first == DiffReport(inserted=10_000, embedded=10_000)
+        # Every fact is the user using a technology, so the rescan also keeps one facet.
+        assert first == DiffReport(inserted=10_000, embedded=10_000, facets_written=1)
         assert second == DiffReport(unchanged=10_000)
         assert cold_s < 5.0
         assert warm_s < 5.0

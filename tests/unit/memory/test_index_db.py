@@ -32,7 +32,15 @@ from backend.memory.index_db import (
 )
 
 _MODEL = "all-MiniLM-L6-v2"
-_SCHEMA_OBJECTS = {"facts", "facts_fts", "facts_vec", "index_meta"}
+_SCHEMA_OBJECTS = {
+    "facts",
+    "facts_fts",
+    "facts_vec",
+    "facets",
+    "facets_fts",
+    "facets_vec",
+    "index_meta",
+}
 
 
 @pytest.fixture
@@ -130,9 +138,10 @@ def test_memory_path_opens_without_a_file(opened: Callable) -> None:
     assert _schema_names(conn) >= _SCHEMA_OBJECTS
 
 
-def test_schema_version_is_three() -> None:
-    # 2 added the entity types and the FTS type terms; 3 added the embedded view text.
-    assert SCHEMA_VERSION == 3
+def test_schema_version_is_four() -> None:
+    # 2 added the entity types and the FTS type terms; 3 added the embedded view text; 4 added
+    # the facet tables.
+    assert SCHEMA_VERSION == 4
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -154,6 +163,45 @@ def test_facts_carry_the_view_text_as_their_last_column(writer: sqlite3.Connecti
 
 def test_fts_mirror_has_a_type_terms_column(writer: sqlite3.Connection) -> None:
     assert _columns(writer, "facts_fts") == ["text", "subject_name", "object_name", "type_terms"]
+
+
+def test_facets_carry_their_key_group_view_and_hash(writer: sqlite3.Connection) -> None:
+    info = {row[1]: (row[2], row[3]) for row in writer.execute("PRAGMA table_info(facets)")}
+
+    assert list(info) == [
+        "id",
+        "facet_key",
+        "subject_id",
+        "subject_name",
+        "subject_type",
+        "rel_type",
+        "object_type",
+        "view_text",
+        "content_hash",
+    ]
+    assert info["view_text"] == ("TEXT", 1)
+    assert info["content_hash"] == ("TEXT", 1)
+    unique = [
+        row
+        for row in writer.execute("PRAGMA index_list(facets)")
+        if row[2] == 1
+        and [col[2] for col in writer.execute(f"PRAGMA index_info({row[1]})")] == ["facet_key"]
+    ]
+    assert unique
+
+
+def test_the_facet_fts_mirror_holds_the_view_the_name_and_the_type_terms(
+    writer: sqlite3.Connection,
+) -> None:
+    assert _columns(writer, "facets_fts") == ["view_text", "subject_name", "type_terms"]
+    (sql,) = writer.execute("SELECT sql FROM sqlite_master WHERE name = 'facets_fts'").fetchone()
+    assert "porter unicode61" in sql
+
+
+def test_the_facet_vectors_are_384_d_by_cosine(writer: sqlite3.Connection) -> None:
+    (sql,) = writer.execute("SELECT sql FROM sqlite_master WHERE name = 'facets_vec'").fetchone()
+
+    assert "vec0" in sql and "float[384]" in sql and "distance_metric=cosine" in sql
 
 
 def test_sibling_lookup_is_indexed(writer: sqlite3.Connection) -> None:
@@ -273,10 +321,63 @@ def test_a_version_2_file_is_rebuilt_in_place_with_the_view_text(
     assert "view_text" in _columns(conn, "facts")
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
     assert get_meta(conn, META_INDEX_STATE) == STATE_REBUILDING
-    assert get_meta(conn, META_REBUILD_SCHEMA_VERSION) == "3"
+    assert get_meta(conn, META_REBUILD_SCHEMA_VERSION) == "4"
     assert db_path.stat().st_ino == inode
     (warning,) = _warnings(caplog)
-    assert "schema 2" in warning and "schema 3" in warning
+    assert "schema 2" in warning and "schema 4" in warning
+
+
+def _write_v3_file(path: Path) -> None:
+    """A schema 3 file: the fact tables with `view_text`, no facet tables, one row."""
+    conn = sqlite3.connect(path)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE facts (id INTEGER PRIMARY KEY, row_key TEXT NOT NULL UNIQUE, "
+        "fact_key TEXT NOT NULL, subject_id TEXT NOT NULL, subject_name TEXT NOT NULL, "
+        "subject_type TEXT, rel_type TEXT NOT NULL, object_id TEXT NOT NULL, "
+        "object_name TEXT NOT NULL, object_type TEXT, text TEXT NOT NULL, valid_from TEXT, "
+        "valid_to TEXT, recorded_at TEXT, confidence REAL NOT NULL, source_utterance_id TEXT, "
+        "content_hash TEXT NOT NULL, view_text TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(text, subject_name, object_name, type_terms, "
+        "tokenize='porter unicode61')"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE facts_vec USING vec0(embedding float[384] distance_metric=cosine)"
+    )
+    conn.execute(
+        "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, rel_type, object_id, "
+        "object_name, text, confidence, content_hash, view_text) "
+        "VALUES ('rk-v3', 'fk', 'user', 'User', 'USES', 'vim', 'Vim', 'User uses Vim.', 0.9, 'h', "
+        "'You use Vim.')"
+    )
+    conn.execute("INSERT INTO index_meta VALUES ('schema_version', '3')")
+    conn.execute("INSERT INTO index_meta VALUES ('embedding_model_id', ?)", (_MODEL,))
+    conn.commit()
+    conn.close()
+
+
+def test_a_version_3_file_is_rebuilt_in_place_with_the_facet_tables(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_v3_file(db_path)
+    inode = db_path.stat().st_ino
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id=_MODEL))
+
+    assert {"facets", "facets_fts", "facets_vec"} <= _schema_names(conn)
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM facets").fetchone()[0] == 0
+    assert get_meta(conn, META_INDEX_STATE) == STATE_REBUILDING
+    assert get_meta(conn, META_REBUILD_SCHEMA_VERSION) == "4"
+    assert get_meta(conn, META_SCHEMA_VERSION) == "3"
+    assert db_path.stat().st_ino == inode
+    (warning,) = _warnings(caplog)
+    assert "schema 3" in warning and "schema 4" in warning
 
 
 def test_a_stale_model_rebuilds_and_stores_rebuilding_with_the_old_versions(
@@ -385,6 +486,7 @@ def test_a_reader_open_across_the_rebuild_keeps_working(db_path: Path, opened: C
     assert reader.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
     assert reader.execute("SELECT count(*) FROM facts_vec").fetchone()[0] == 0
     assert reader.execute("SELECT count(*) FROM facts_fts").fetchone()[0] == 0
+    assert reader.execute("SELECT count(*) FROM facets").fetchone()[0] == 0
     assert degraded_reason(reader) == "index_rebuilding"
 
 

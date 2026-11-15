@@ -1,6 +1,8 @@
 """Tests for backend.memory.fact_index: every latest-belief fact version, searchable three ways."""
 
+import math
 import sqlite3
+import struct
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -12,11 +14,18 @@ import pytest
 
 from backend.errors import EmbeddingError, MemoryIndexError
 from backend.memory import retrieval_view
-from backend.memory.fact_index import FactIndex, content_hash, fact_row_key, structural_row_key
+from backend.memory.facets import facet_key, facets_of
+from backend.memory.fact_index import (
+    FactIndex,
+    IndexedFacet,
+    content_hash,
+    fact_row_key,
+    structural_row_key,
+)
 from backend.memory.fact_render import render_fact
 from backend.memory.index_db import open_index, open_reader, write_transaction
 from backend.memory.models import FactRow, fact_key
-from backend.memory.retrieval_view import FACT_VIEWS, render_fact_view
+from backend.memory.retrieval_view import FACT_VIEWS, render_facet_view, render_fact_view
 from tests.fakes.memory_fakes import FakeEmbedder
 
 _MODEL = "all-MiniLM-L6-v2"
@@ -294,11 +303,23 @@ class _FailingEmbedder:
         raise self.error
 
 
-def _snapshot_of(conn: sqlite3.Connection) -> tuple[list[tuple[object, ...]], int, int]:
+def _snapshot_of(conn: sqlite3.Connection) -> tuple[object, ...]:
+    """Every fact and facet row, both mirrors' contents, keyed so rowids do not matter."""
     rows = conn.execute("SELECT row_key, content_hash, text FROM facts ORDER BY row_key").fetchall()
     fts = conn.execute("SELECT count(*) FROM facts_fts").fetchone()[0]
     vec = conn.execute("SELECT count(*) FROM facts_vec").fetchone()[0]
-    return rows, fts, vec
+    facets = conn.execute(
+        "SELECT facet_key, subject_name, view_text, content_hash FROM facets ORDER BY facet_key"
+    ).fetchall()
+    facet_fts = conn.execute(
+        "SELECT f.facet_key, t.view_text, t.subject_name, t.type_terms "
+        "FROM facets_fts t JOIN facets f ON f.id = t.rowid ORDER BY f.facet_key"
+    ).fetchall()
+    facet_vec = conn.execute(
+        "SELECT f.facet_key, v.embedding FROM facets_vec v JOIN facets f ON f.id = v.rowid "
+        "ORDER BY f.facet_key"
+    ).fetchall()
+    return rows, fts, vec, facets, facet_fts, facet_vec
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, OSError, ValueError])
@@ -312,6 +333,7 @@ def test_an_embedder_failure_raises_memory_index_error_and_writes_nothing(
 ) -> None:
     index.upsert([_fact("rk-a", "Acme"), _fact("rk-b", "Kestrel")])
     before = _snapshot_of(conn)
+    assert before[3], "Acme and Kestrel form a facet, so the snapshot covers the facet tables"
     original = error_type("cannot embed 'User works at Northwind.'")
     failing = FactIndex(conn, _FailingEmbedder(original), tz=UTC, reader=reader)
     # rk-a changes its view (the type gloss), rk-c is new and rk-b is absent, so diff_apply
@@ -339,7 +361,7 @@ def test_an_embedding_error_propagates_unchanged(
         failing.upsert([_fact("rk-a", "Acme")])
 
     assert caught.value is original
-    assert _snapshot_of(conn) == ([], 0, 0)
+    assert _snapshot_of(conn) == ([], 0, 0, [], [], [])
 
 
 def test_a_database_failure_raises_memory_index_error(
@@ -896,9 +918,12 @@ def test_a_patched_second_person_template_re_embeds_exactly_its_rows(
     report = index.diff_apply(snapshot)
 
     assert (report.updated, report.unchanged, report.embedded) == (2, 2, 2)
+    # The two WORKS_AT facts form a facet, worded by the same template, so it re-embeds too.
+    assert (report.facets_written, report.facets_deleted) == (1, 0)
     assert fake_embedder.calls[calls_before:] == [
         "You are employed at Acme (organization).",
         "You are employed at Brightgrid (organization).",
+        "You are employed at an organization, organisation or company.",
     ]
     stored = index.get("rk-acme")
     assert stored is not None
@@ -1269,3 +1294,541 @@ def test_siblings_reject_a_naive_now(index: FactIndex) -> None:
 
     with pytest.raises(ValueError, match="aware"):
         index.siblings("user", "USES", "utt-list", now=datetime(2026, 6, 1))
+
+
+# -- facets: upkeep ----------------------------------------------------------------------------
+
+_ORGS = facet_key("user", "MEMBER_OF", "Organization")
+_TOOLS = facet_key("user", "USES", "Technology")
+_ANA_DOCS = facet_key("ana", "RECOMMENDS", "Document")
+
+
+def _member(
+    row_key: str,
+    object_name: str,
+    *,
+    rel_type: str = "MEMBER_OF",
+    object_type: str = "Organization",
+    **overrides: object,
+) -> FactRow:
+    """A fact that belongs to a facet: by default the user is a member of an organisation."""
+    return _fact(
+        row_key,
+        object_name,
+        rel_type=rel_type,
+        object_type=object_type,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def _recommends(
+    row_key: str, object_name: str, *, subject_name: str = "Ana", recorded_at: str
+) -> FactRow:
+    """Ana, a person, recommends a document; `subject_id` stays `ana` whatever the name."""
+    row = _member(
+        row_key,
+        object_name,
+        rel_type="RECOMMENDS",
+        object_type="Document",
+        subject_name="Ana",
+        subject_type="Person",
+        recorded_at=recorded_at,
+    )
+    return replace(row, subject_name=subject_name)
+
+
+def _facets(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """Stored facets by key: subject name and view text."""
+    return {
+        key: (name, view)
+        for key, name, view in conn.execute(
+            "SELECT facet_key, subject_name, view_text FROM facets"
+        ).fetchall()
+    }
+
+
+def _facet_vectors(conn: sqlite3.Connection) -> dict[str, bytes]:
+    return dict(
+        conn.execute(
+            "SELECT f.facet_key, v.embedding FROM facets_vec v JOIN facets f ON f.id = v.rowid"
+        ).fetchall()
+    )
+
+
+def _packed(vector: list[float]) -> bytes:
+    return struct.pack(f"<{len(vector)}f", *vector)
+
+
+def _mirror_counts(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    return tuple(  # type: ignore[return-value]
+        conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # nosec B608
+        for table in ("facets", "facets_fts", "facets_vec")
+    )
+
+
+class _BatchEmbedder(FakeEmbedder):
+    """A FakeEmbedder that records each `generate_embeddings` batch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[str]] = []
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        self.batches.append(list(texts))
+        return super().generate_embeddings(texts)
+
+
+def test_a_second_member_creates_the_facet(index: FactIndex, conn: sqlite3.Connection) -> None:
+    first = index.upsert([_member("rk-gull", "Gullwing Club")])
+    assert _mirror_counts(conn) == (0, 0, 0)
+    assert first.facets_written == 0
+
+    second = index.upsert([_member("rk-kestrel", "Kestrel Society")])
+
+    view = "You are a member of an organization, organisation or company."
+    assert _facets(conn) == {_ORGS: ("User", view)}
+    assert _mirror_counts(conn) == (1, 1, 1)
+    assert _facet_vectors(conn) == {_ORGS: _packed(FakeEmbedder().generate_embedding(view))}
+    assert (second.facets_written, second.facets_deleted) == (1, 0)
+
+
+def test_a_third_member_leaves_the_facet_as_it_is(
+    index: FactIndex, conn: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    index.upsert([_member("rk-gull", "Gullwing Club"), _member("rk-kestrel", "Kestrel Society")])
+    before = _snapshot_of(conn)[3:]
+
+    report = index.upsert([_member("rk-heron", "Heron Guild")])
+
+    # The view words the group, not its members, so a new member changes nothing stored.
+    assert _snapshot_of(conn)[3:] == before
+    assert report.facets_written == 0
+    assert fake_embedder.calls[-1] == render_fact_view(
+        _member("rk-heron", "Heron Guild"), FACT_VIEWS["F3"]
+    )
+
+
+@pytest.mark.parametrize("way", ["delete", "diff_apply", "retype"])
+def test_deleting_a_member_leaves_one_and_removes_the_facet(
+    index: FactIndex, conn: sqlite3.Connection, way: str
+) -> None:
+    gull, kestrel = _member("rk-gull", "Gullwing Club"), _member("rk-kestrel", "Kestrel Society")
+    index.upsert([gull, kestrel])
+    assert _mirror_counts(conn) == (1, 1, 1)
+
+    if way == "delete":
+        assert index.delete(["rk-kestrel"]) == 1
+    elif way == "diff_apply":
+        assert index.diff_apply([gull]).facets_deleted == 1
+    else:
+        # The member moves to another type's group; its old group is left with one.
+        assert index.upsert([replace(kestrel, object_type="Project")]).facets_deleted == 1
+
+    assert _mirror_counts(conn) == (0, 0, 0)
+    assert index.get("rk-gull") is not None
+
+
+def test_renaming_the_subject_rewrites_and_re_embeds_its_view(
+    index: FactIndex, conn: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    rows = [
+        _recommends("rk-guide", "Field Guide", recorded_at="2026-01-01T00:00:00+00:00"),
+        _recommends("rk-atlas", "Shore Atlas", recorded_at="2026-01-02T00:00:00+00:00"),
+    ]
+    index.diff_apply(rows)
+    before = _facet_vectors(conn)
+    assert _facets(conn) == {_ANA_DOCS: ("Ana", "Ana recommends a document or doc.")}
+
+    report = index.diff_apply([replace(row, subject_name="Anna") for row in rows])
+
+    view = "Anna recommends a document or doc."
+    assert _facets(conn) == {_ANA_DOCS: ("Anna", view)}
+    assert (report.facets_written, report.facets_deleted) == (1, 0)
+    assert view in fake_embedder.calls
+    assert _facet_vectors(conn)[_ANA_DOCS] != before[_ANA_DOCS]
+    assert _facet_vectors(conn) == {_ANA_DOCS: _packed(FakeEmbedder().generate_embedding(view))}
+    (folded_name,) = conn.execute("SELECT subject_name FROM facets_fts").fetchone()
+    assert folded_name == "anna"
+
+
+def test_a_different_view_rewrites_every_facet(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    snapshot = [
+        _member("rk-gull", "Gullwing Club"),
+        _member("rk-kestrel", "Kestrel Society"),
+        _member("rk-vim", "Vim", rel_type="USES", object_type="Technology"),
+        _member("rk-zig", "Zig", rel_type="USES", object_type="Technology"),
+    ]
+    _viewed(conn, reader, fake_embedder, "F0").diff_apply(snapshot)
+    before = _facet_vectors(conn)
+    assert _facets(conn)[_TOOLS][1] == "User uses a technology, tech, tool or software."
+
+    report = _viewed(conn, reader, fake_embedder, "F3").diff_apply(snapshot)
+
+    assert (report.facets_written, report.facets_deleted) == (2, 0)
+    expected = {
+        spec.facet_key: (spec.subject_name, render_facet_view(spec, FACT_VIEWS["F3"]))
+        for spec in facets_of(snapshot).values()
+    }
+    assert _facets(conn) == expected
+    assert expected[_TOOLS][1] == "You use a technology, tech, tool or software."
+    after = _facet_vectors(conn)
+    assert after.keys() == before.keys() == {_ORGS, _TOOLS}
+    assert all(after[key] != before[key] for key in after)
+
+
+def test_diff_apply_keeps_the_facets_equal_to_facets_of_the_snapshot(
+    index: FactIndex, conn: sqlite3.Connection
+) -> None:
+    index.diff_apply([_member("rk-gull", "Gullwing Club"), _member("rk-heron", "Heron Guild")])
+    snapshot = [
+        _member("rk-vim", "Vim", rel_type="USES", object_type="Technology"),
+        _member("rk-zig", "Zig", rel_type="USES", object_type="Technology"),
+        _recommends("rk-guide", "Field Guide", recorded_at="2026-01-01T00:00:00+00:00"),
+        _recommends("rk-atlas", "Shore Atlas", recorded_at="2026-01-02T00:00:00+00:00"),
+        # One member only, and an object type that never forms a facet.
+        _member("rk-gull", "Gullwing Club"),
+        _member("rk-ana", "Ana", rel_type="KNOWS", object_type="User"),
+        _member("rk-ben", "Ben", rel_type="KNOWS", object_type="User"),
+    ]
+
+    report = index.diff_apply(snapshot)
+
+    expected = {
+        spec.facet_key: (spec.subject_name, render_facet_view(spec, FACT_VIEWS["F3"]))
+        for spec in facets_of(snapshot).values()
+    }
+    assert set(expected) == {_TOOLS, _ANA_DOCS}
+    assert _facets(conn) == expected
+    assert _mirror_counts(conn) == (2, 2, 2)
+    assert (report.facets_written, report.facets_deleted) == (2, 1)
+
+
+def test_a_group_whose_relation_has_no_view_is_not_a_stored_facet(
+    index: FactIndex, conn: sqlite3.Connection
+) -> None:
+    index.upsert(
+        [
+            _member("rk-a", "Gullwing Club", rel_type="FUNDED_BY"),
+            _member("rk-b", "Kestrel Society", rel_type="FUNDED_BY"),
+        ]
+    )
+
+    assert _mirror_counts(conn) == (0, 0, 0)
+
+
+def _three_recommendations() -> list[FactRow]:
+    """Three of Ana's recommendations; the newest names her Anna, so the facet does too."""
+    return [
+        _recommends("rk-guide", "Field Guide", recorded_at="2026-01-01T00:00:00+00:00"),
+        _recommends("rk-atlas", "Shore Atlas", recorded_at="2026-01-02T00:00:00+00:00"),
+        _recommends(
+            "rk-chart",
+            "Tide Chart",
+            subject_name="Anna",
+            recorded_at="2026-01-03T00:00:00+00:00",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("method", ["upsert", "diff_apply", "delete"])
+def test_an_embedder_failing_mid_apply_leaves_facts_and_facets_as_they_were(
+    index: FactIndex, conn: sqlite3.Connection, reader: sqlite3.Connection, method: str
+) -> None:
+    rows = _three_recommendations()
+    index.diff_apply(rows)
+    assert _facets(conn)[_ANA_DOCS][0] == "Anna"
+    before = _snapshot_of(conn)
+    failing = FactIndex(conn, _FailingEmbedder(RuntimeError("model gone")), tz=UTC, reader=reader)
+
+    with pytest.raises(MemoryIndexError):
+        if method == "upsert":
+            failing.upsert([_recommends("rk-map", "Bay Map", recorded_at="2026-01-04")])
+        elif method == "diff_apply":
+            # Dropping Anna's row renames the facet, so its view needs an embedding.
+            failing.diff_apply(rows[:2])
+        else:
+            failing.delete(["rk-chart"])
+
+    assert _snapshot_of(conn) == before
+
+
+def test_delete_re_embeds_a_facet_whose_view_it_changes(
+    index: FactIndex, conn: sqlite3.Connection
+) -> None:
+    index.diff_apply(_three_recommendations())
+
+    assert index.delete(["rk-chart"]) == 1
+
+    view = "Ana recommends a document or doc."
+    assert _facets(conn) == {_ANA_DOCS: ("Ana", view)}
+    assert _facet_vectors(conn) == {_ANA_DOCS: _packed(FakeEmbedder().generate_embedding(view))}
+
+
+def test_a_facet_write_that_fails_rolls_the_fact_rows_back_with_it(
+    index: FactIndex, conn: sqlite3.Connection
+) -> None:
+    index.upsert([_member("rk-gull", "Gullwing Club")])
+    before = _snapshot_of(conn)
+    conn.execute(
+        "CREATE TRIGGER refuse_facets BEFORE INSERT ON facets "
+        "BEGIN SELECT RAISE(ABORT, 'facet write refused'); END"
+    )
+
+    with pytest.raises(MemoryIndexError, match="facet write refused"):
+        index.diff_apply([_member("rk-gull", "Gullwing Club"), _member("rk-heron", "Heron Guild")])
+
+    assert _snapshot_of(conn) == before
+
+
+def test_one_apply_makes_one_embed_call(
+    conn: sqlite3.Connection, reader: sqlite3.Connection
+) -> None:
+    embedder = _BatchEmbedder()
+    index = FactIndex(conn, embedder, tz=UTC, reader=reader)
+    rows = [
+        _member("rk-gull", "Gullwing Club"),
+        _member("rk-kestrel", "Kestrel Society"),
+        _member("rk-vim", "Vim", rel_type="USES", object_type="Technology"),
+        _member("rk-zig", "Zig", rel_type="USES", object_type="Technology"),
+    ]
+
+    report = index.diff_apply(rows)
+
+    (batch,) = embedder.batches
+    facet_views = sorted(
+        view
+        for spec in facets_of(rows).values()
+        if (view := render_facet_view(spec, FACT_VIEWS["F3"]))
+    )
+    assert batch[: len(rows)] == [render_fact_view(row, FACT_VIEWS["F3"]) for row in rows]
+    assert sorted(batch[len(rows) :]) == facet_views
+    assert (report.embedded, report.facets_written) == (4, 2)
+
+
+# -- facets: search ----------------------------------------------------------------------------
+
+
+def _two_facets() -> list[FactRow]:
+    return [
+        _member("rk-gull", "Gullwing Club"),
+        _member("rk-kestrel", "Kestrel Society"),
+        _member("rk-vim", "Vim", rel_type="USES", object_type="Technology"),
+        _member("rk-zig", "Zig", rel_type="USES", object_type="Technology"),
+    ]
+
+
+def test_search_facets_fts_finds_a_facet_by_a_type_term_the_query_uses(
+    index: FactIndex,
+) -> None:
+    index.diff_apply(_two_facets())
+
+    found = index.search_facets_fts("which organisations am I a member of?")
+
+    assert found[0] == IndexedFacet(
+        facet_key=_ORGS,
+        subject_id="user",
+        subject_name="User",
+        subject_type="User",
+        rel_type="MEMBER_OF",
+        object_type="Organization",
+        view_text="You are a member of an organization, organisation or company.",
+    )
+    assert _TOOLS not in [facet.facet_key for facet in found[:1]]
+    # The view words the group, so a member's name does not find it.
+    assert index.search_facets_fts("Gullwing") == []
+    assert index.search_facets_fts("?!") == []
+
+
+def test_search_facets_fts_respects_its_limit(index: FactIndex) -> None:
+    index.diff_apply(_two_facets())
+
+    assert len(index.search_facets_fts("user organisation technology", limit=1)) == 1
+    with pytest.raises(ValueError):
+        index.search_facets_fts("organisation", limit=0)
+
+
+class _TableEmbedder(FakeEmbedder):
+    """FakeEmbedder, except for the texts given a vector by hand."""
+
+    def __init__(self, table: dict[str, list[float]]) -> None:
+        super().__init__()
+        self.table = table
+
+    def generate_embedding(self, text: str) -> list[float]:
+        if text in self.table:
+            self.calls.append(text)
+            return self.table[text]
+        return super().generate_embedding(text)
+
+
+def _basis(*weights: float) -> list[float]:
+    """A unit 384-d vector with `weights` in its first dimensions."""
+    norm = math.sqrt(sum(weight * weight for weight in weights))
+    return [weight / norm for weight in weights] + [0.0] * (384 - len(weights))
+
+
+def test_search_facets_vector_ranks_by_cosine(
+    conn: sqlite3.Connection, reader: sqlite3.Connection
+) -> None:
+    rows = [
+        *_two_facets(),
+        _member("rk-ana", "Ana", rel_type="KNOWS", object_type="Person"),
+        _member("rk-ben", "Ben", rel_type="KNOWS", object_type="Person"),
+    ]
+    people = facet_key("user", "KNOWS", "Person")
+    views = {
+        spec.facet_key: render_facet_view(spec, FACT_VIEWS["F3"])
+        for spec in facets_of(rows).values()
+    }
+    vectors = {_ORGS: _basis(1.0), _TOOLS: _basis(1.0, 1.0), people: _basis(0.0, 1.0)}
+    embedder = _TableEmbedder({views[key]: vector for key, vector in vectors.items()})
+    index = FactIndex(conn, embedder, tz=UTC, reader=reader)
+    index.diff_apply(rows)
+    query = _basis(3.0, 1.0)
+
+    # By hand: 3/sqrt(10) = 0.949, 4/sqrt(20) = 0.894 and 1/sqrt(10) = 0.316.
+    cosine = {key: sum(q * v for q, v in zip(query, vector)) for key, vector in vectors.items()}
+    assert sorted(cosine, key=cosine.__getitem__, reverse=True) == [_ORGS, _TOOLS, people]
+
+    found = index.search_facets_vector(query)
+
+    assert [facet.facet_key for facet in found] == [_ORGS, _TOOLS, people]
+    assert [facet.view_text for facet in found] == [views[_ORGS], views[_TOOLS], views[people]]
+    assert [facet.facet_key for facet in index.search_facets_vector(query, limit=2)] == [
+        _ORGS,
+        _TOOLS,
+    ]
+
+
+def test_search_facets_vector_rejects_a_wrong_dimension(index: FactIndex) -> None:
+    with pytest.raises(ValueError, match="384"):
+        index.search_facets_vector([0.1, 0.2])
+
+
+def test_search_facets_vector_on_an_index_without_facets_returns_nothing(
+    index: FactIndex,
+) -> None:
+    index.upsert([_member("rk-gull", "Gullwing Club")])
+
+    assert index.search_facets_vector(FakeEmbedder().generate_embedding("anything")) == []
+
+
+def _named_subjects() -> list[FactRow]:
+    def document(row_key: str, name: str, subject: str) -> FactRow:
+        return _member(
+            row_key,
+            name,
+            rel_type="RECOMMENDS",
+            object_type="Document",
+            subject_name=subject,
+            subject_type="Person",
+        )
+
+    return [
+        document("rk-lima-1", "Field Guide", "Ana Lima"),
+        document("rk-lima-2", "Shore Atlas", "Ana Lima"),
+        document("rk-costa-1", "Tide Chart", "Ana Costa"),
+        document("rk-costa-2", "Bay Map", "Ana Costa"),
+    ]
+
+
+def test_search_facet_names_finds_a_facet_by_its_subjects_whole_name(index: FactIndex) -> None:
+    index.diff_apply(_named_subjects())
+    lima = facet_key("ana lima", "RECOMMENDS", "Document")
+
+    found = index.search_facet_names(["what does Ana Lima recommend?"])
+
+    assert [facet.facet_key for facet in found] == [lima]
+    assert found[0].subject_name == "Ana Lima"
+
+
+def test_search_facet_names_ignores_a_name_that_only_shares_a_word(index: FactIndex) -> None:
+    index.diff_apply(_named_subjects())
+
+    assert index.search_facet_names(["what does Ana recommend?", "Costa Rica trip"]) == []
+
+
+def test_search_facet_names_reads_every_text_given(index: FactIndex) -> None:
+    index.diff_apply(_named_subjects())
+
+    found = index.search_facet_names(["any books?", "I met Ana Costa today"])
+
+    assert [facet.subject_name for facet in found] == ["Ana Costa"]
+
+
+# -- facets: members ---------------------------------------------------------------------------
+
+
+def _members_fixture() -> list[FactRow]:
+    return [
+        _member("rk-gull", "Gullwing Club", recorded_at="2026-01-01T00:00:00+00:00"),
+        # Two versions of one fact: only the second holds at `_NOW`.
+        _member(
+            "rk-kestrel-1",
+            "Kestrel Society",
+            valid_from="2019",
+            valid_to="2020",
+            recorded_at="2019-01-01T00:00:00+00:00",
+        ),
+        _member(
+            "rk-kestrel-2",
+            "Kestrel Society",
+            valid_from="2022",
+            recorded_at="2022-01-01T00:00:00+00:00",
+        ),
+        # Closed before `_NOW`: no current version.
+        _member(
+            "rk-heron",
+            "Heron Guild",
+            valid_to="2026-03-01T00:00:00+00:00",
+            recorded_at="2026-02-01T00:00:00+00:00",
+        ),
+        _member("rk-vim", "Vim", rel_type="USES", object_type="Technology"),
+        _member("rk-zig", "Zig", rel_type="USES", object_type="Technology"),
+    ]
+
+
+def test_facet_members_many_leaves_out_a_member_with_no_current_version(
+    index: FactIndex,
+) -> None:
+    index.diff_apply(_members_fixture())
+
+    members = index.facet_members_many([_ORGS], now=_NOW)
+
+    assert "rk-heron" not in [fact.row_key for fact in members[_ORGS]]
+
+
+def test_facet_members_many_returns_one_version_per_fact_key_newest_recorded_first(
+    index: FactIndex,
+) -> None:
+    index.diff_apply(_members_fixture())
+
+    members = index.facet_members_many([_ORGS], now=_NOW)
+
+    assert [fact.row_key for fact in members[_ORGS]] == ["rk-gull", "rk-kestrel-2"]
+    assert all(fact.view_text for fact in members[_ORGS])
+
+
+def test_facet_members_many_answers_several_facets_in_one_read(
+    index: FactIndex, reader: sqlite3.Connection
+) -> None:
+    index.diff_apply(_members_fixture())
+    unknown = facet_key("user", "MEMBER_OF", "Project")
+    statements: list[str] = []
+    reader.set_trace_callback(statements.append)
+    try:
+        members = index.facet_members_many([_ORGS, _TOOLS, unknown], now=_NOW)
+    finally:
+        reader.set_trace_callback(None)
+
+    assert [statement for statement in statements if statement.startswith("BEGIN")] == ["BEGIN"]
+    assert {fact.object_name for fact in members[_TOOLS]} == {"Vim", "Zig"}
+    assert [fact.row_key for fact in members[_ORGS]] == ["rk-gull", "rk-kestrel-2"]
+    assert members[unknown] == ()
+
+
+def test_facet_members_many_rejects_a_naive_now(index: FactIndex) -> None:
+    with pytest.raises(ValueError, match="aware"):
+        index.facet_members_many([_ORGS], now=datetime(2026, 6, 1))
