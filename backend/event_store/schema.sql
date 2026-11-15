@@ -51,7 +51,15 @@ CREATE TABLE IF NOT EXISTS conversation_turn_events (
     ontology_version TEXT NOT NULL DEFAULT '1.0.0',
 
     -- Immutability timestamp
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    -- Turn outcome (MIS-127). NULL on every turn logged before these columns existed.
+    -- Kept last so a fresh database and one migrated by EventStore.initialize(), whose
+    -- ALTER TABLE ADD COLUMN appends, have the same column order.
+    turn_outcome TEXT,                       -- 'completed', 'interrupted', 'superseded', 'error'
+    generated_response TEXT,                 -- full generated text; longer than system_response
+                                             -- when an interrupted turn logs only what was heard
+    turn_modality TEXT                       -- 'voice', 'text'
 );
 
 -- Re-extraction job tracking (Phase 5)

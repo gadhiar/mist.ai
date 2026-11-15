@@ -82,6 +82,7 @@ def test_registry_lists_the_suite_modules_and_their_subcommands_in_order():
         ("lowtier_suite", ("lowtier", "remote-memory")),
         ("chain", ("chain",)),
         ("game_suite", ("game-session",)),
+        ("voice_design", ("voice-design",)),
         ("report", ("report",)),
     ]
     assert all(spec.package == "scripts.model_bench.speech" for spec in speech_bench.SUITE_REGISTRY)

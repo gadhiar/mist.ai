@@ -65,6 +65,7 @@ SUITE_REGISTRY: tuple[SuiteSpec, ...] = (
     SuiteSpec("lowtier_suite", ("lowtier", "remote-memory")),
     SuiteSpec("chain", ("chain",)),
     SuiteSpec("game_suite", ("game-session",)),
+    SuiteSpec("voice_design", ("voice-design",)),
     SuiteSpec("report", ("report",)),
 )
 
