@@ -977,7 +977,7 @@ def test_an_impostor_merged_into_the_primary_cluster_reads_primary() -> None:
 def test_turns_joining_target_and_impostor_lines_read_merged_into_primary() -> None:
     # The review's probe E: all nine lines in spk-01, primary, each turn joining a target line
     # and the impostor line after it. `Episodes.who` gives four records to no one and the last
-    # to the target, so the impostor holds no record, yet the cluster covers all its speech.
+    # to the target, so the impostor holds no record, yet the cluster covers most of its speech.
     turns = [(1.0 + 8.0 * k + 0.1, 1.0 + 8.0 * k + 7.4) for k in range(4)]
     rows, found = _probe(
         [(n, "spk-01", "primary", True) for n in (1, 3, 5, 7, 9)],

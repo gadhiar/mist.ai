@@ -287,15 +287,15 @@ def impostor_clusters(
     speaker's lines by half, so `Episodes.who` gives it to no one, yet the impostor speech in it
     went into that turn's cluster. A record split between both speakers adds to the coverage the
     part of it on the impostor's lines; it counts toward the impostor's majority and
-    `stray_records` only when `Episodes.who` gives it to the impostor. The denominator is all of the impostor's speech,
-    not only the speech extraction could keep, because extract drafts a record for each turn of
-    an admitted cluster (`stages/extract.py:782-797`) whether or not it is kept: a turn too short
-    to embed (:534-538, :848-849), a turn that fails retrieval (:864-880), a cut of the wrong
-    length (:912-915, from `segments.cut_line`) and a cut that touches overlap (:917-920) are each
-    drafted, and `_records` writes every draft (:967-1016). A passing turn's records leave out
-    what `cut_line` trims (`stages/segments.py:87-103`): the turn's edges outside VAD speech, the
-    pauses between segments when a long turn is cut, and the whole turn when VAD finds no speech
-    in it.
+    `stray_records` only when `Episodes.who` gives it to the impostor. The denominator is all of
+    the impostor's speech, not only the speech extraction could keep, because extract drafts a
+    record for each turn of an admitted cluster (`stages/extract.py:782-797`) whether or not it is
+    kept: a turn too short to embed (:534-538, :848-849), a turn that fails retrieval (:864-880), a
+    cut of the wrong length (:912-915, from `segments.cut_line`) and a cut that touches overlap
+    (:917-920) are each drafted, and `_records` writes every draft (:967-1016). A passing turn's
+    records leave out what `cut_line` trims (`stages/segments.py:87-103`): the turn's edges outside
+    VAD speech, the pauses between segments when a long turn is cut, and the whole turn when VAD
+    finds no speech in it.
 
     - When the admitted clusters together cover more than half of the impostor's speech, the
       impostor is merged into the admitted cluster covering the most of it (primary before
@@ -393,7 +393,7 @@ def _merged_into(
 
 
 def impostor_cluster_lines(rows: Sequence[Mapping[str, object]]) -> list[str]:
-    """Return each episode's impostor cluster row as printed; a merged row says so by its role."""
+    """Return each episode's impostor cluster row as printed; a merged row shows `MERGED_MEDIAN`."""
     lines = []
     for row in rows:
         by_role: Counter[str] = Counter()
