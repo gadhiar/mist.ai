@@ -201,6 +201,44 @@ class DetunedCopy:
 
 
 @dataclass(frozen=True, slots=True)
+class LimiterConfig:
+    """The peak limiter that ends the character stage (`character.PeakLimiter`).
+
+    The ear test had no limiter; these values were chosen with it, after the stage could clip a
+    loud onset, and each keeps the stage's sound below the peaks.
+
+    - `knee_dbfs`, -1 dBFS: samples at or below it pass unchanged. The stage's level tests hold
+      settled speech at the reference level at or below -1 dBFS, and its settled peaks on their
+      signals measure -12.3 to -9.8 dBFS, so the knee leaves every settled sample alone; the
+      1 dB above it is room for the soft curve.
+    - `hold_ms`, 10 ms: one period of a 100 Hz voice, so a crest no deeper than one before it
+      within the hold is scaled by the same gain rather than bent.
+    - `release_ms`, 10 ms, linear in dB: short enough that hold plus release, 20 ms, ends inside
+      each segment's tail (`CharacterConfig.__post_init__` checks that), and no longer than the
+      hold, so the release starts without a jump. A linear release ends; an exponential one
+      would never let the gain back to exactly 0 dB.
+    """
+
+    knee_dbfs: float = -1.0
+    hold_ms: float = 10.0
+    release_ms: float = 10.0
+
+    def __post_init__(self) -> None:
+        ceiling_dbfs = 20.0 * math.log10(32767.0 / 32768.0)
+        if not self.knee_dbfs < ceiling_dbfs:
+            raise ValueError(
+                f"limiter knee {self.knee_dbfs} dBFS must lie below the PCM16 ceiling, "
+                f"{ceiling_dbfs:.6f} dBFS"
+            )
+        if not (self.hold_ms > 0.0 and self.release_ms > 0.0):
+            raise ValueError("limiter hold_ms and release_ms must be positive")
+        if self.release_ms > self.hold_ms:
+            raise ValueError(
+                f"limiter release_ms {self.release_ms} must not exceed hold_ms {self.hold_ms}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class CharacterConfig:
     """Her character stage (`backend/realtime/character.py`), set from Raj's ear tests.
 
@@ -208,7 +246,10 @@ class CharacterConfig:
     bands, a 4:1 compressor on the 8 ms RMS of the EQ output smoothed over 15 ms of linear gain,
     and a detuned double of two copies, +15 cents centred 9 ms behind the dry voice and -15 cents
     centred 14 ms behind it, each mixed at `double_gain`. Each copy's read delay sweeps within
-    `delay_ms +- sweep_ms / 2`, and its splices crossfade over `splice_ms`.
+    `delay_ms +- sweep_ms / 2`, and its splices crossfade over `splice_ms`. The exception is
+    `limiter`: the ear test had none, and `LimiterConfig` says why its values were chosen.
+    `limiter=None` turns it off, so the output is rounded and hard-clipped, with the clipped
+    samples counted, as before the limiter existed.
 
     `threshold_dbfs` is absolute because a stream cannot see a whole clip: the ear test's
     threshold was 26 dB below the maximum of the clip's own 8 ms RMS envelope, and the median of
@@ -237,6 +278,7 @@ class CharacterConfig:
     # RMS over the stage output's RMS with this gain at 0 dB, over the input's length, rounded to
     # 0.1 dB: 14.853, so 14.9. `test_default_output_gain_keeps_the_input_loudness` recomputes it.
     output_gain_db: float = 14.9
+    limiter: LimiterConfig | None = LimiterConfig()
 
     def __post_init__(self) -> None:
         # Every frequency lies below the Nyquist frequency of the 24 kHz downlink, and each
@@ -267,6 +309,16 @@ class CharacterConfig:
             raise ValueError(
                 f"splice_ms {self.splice_ms} must be below half of sweep_ms {self.sweep_ms}"
             )
+        # The limiter's memory must end inside each segment's tail, which lasts as long as the
+        # copies' longest read, so no segment's limiting reaches the next.
+        if self.limiter is not None and self.double_gain > 0.0 and self.copies:
+            memory_ms = self.limiter.hold_ms + self.limiter.release_ms
+            longest_ms = max(copy.delay_ms for copy in self.copies) + self.sweep_ms / 2
+            if memory_ms > longest_ms:
+                raise ValueError(
+                    f"limiter hold_ms plus release_ms, {memory_ms} ms, outlasts the segment "
+                    f"tail's {longest_ms} ms"
+                )
 
 
 @dataclass(frozen=True, slots=True)

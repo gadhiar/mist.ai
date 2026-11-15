@@ -1,35 +1,44 @@
-"""Tests for her character stage: the EQ, the compressor, the detuned double and the stage.
+"""Tests for her character stage: the EQ, compressor, detuned double, limiter and the stage.
 
 Every signal here is synthesized in the test: a steady harmonic vowel (harmonics of f0 up to
-11 kHz, amplitudes falling 12 dB per octave), sines, DC and impulses. No audio file is read or
-written. Each reference is computed offline over the whole array, from the definitions the plan
-and the ear test give, and the streamed stage must match it:
+11 kHz, amplitudes falling 12 dB per octave), the same vowel under syllables, sines, DC, noise and
+impulses. No audio file is read or written. Each reference is computed offline over the whole
+array, from the definitions the plan and the ear test give, and the streamed stage must match it:
 
 - the dry chain against `scipy.signal.sosfilt` with coefficients built here from the RBJ Audio EQ
   Cookbook's peaking formula and a 2nd-order Butterworth high-pass;
 - the compressor against a whole-array trailing 8 ms RMS, the static 4:1 law above
   `threshold_dbfs`, and a trailing 15 ms boxcar on linear gain;
 - each copy against what a perfect pitch shifter would do: every harmonic moved by the copy's
-  ratio with its level kept, and nothing else in the spectrum.
+  ratio with its level kept, and nothing else in the spectrum;
+- the limiter against the same stage without it (`limiter=None`): the two may differ only within
+  the limiter's reach of a sample at or above the knee.
 
 The tolerances are the plan's Test strategy's: 1 LSB where only float rounding can differ, and
 measurement bounds elsewhere that a wrong ratio, a wrong coefficient or a comb would fail by a
 wide margin.
 """
 
+import dataclasses
+import hashlib
 import math
 import time
+from collections.abc import Callable
 
 import numpy as np
 import pytest
 from scipy.signal import butter, sosfilt, sosfreqz
 
-from backend.realtime.budget import CharacterConfig, DetunedCopy, PeakingBand
+from backend.realtime.budget import CharacterConfig, DetunedCopy, LimiterConfig, PeakingBand
 from backend.realtime.character import (
+    PCM16_CEILING,
     CharacterStage,
     Compressor,
     DetunedVoice,
+    PeakLimiter,
     dry_chain_sos,
+    knee_curve,
+    limiter_reach_samples,
 )
 
 FS = 24000
@@ -38,6 +47,21 @@ FULL_SCALE = 32768.0
 # the compressor's input (the EQ output).
 REFERENCE_DBFS = -14.47
 CLIP_CEILING = round(FULL_SCALE * 10 ** (-1.0 / 20.0))  # -1 dBFS in PCM16 steps
+# The default limiter's knee in full-scale units, and the PCM16 step at or above which a rounded
+# sample may have passed it unrounded: rounding moves a value by at most half a step.
+KNEE = 10 ** (-1.0 / 20.0)
+KNEE_STEPS = math.floor(FULL_SCALE * KNEE)
+# The default limiter's hold and release at 24 kHz, and the samples an over can change.
+HOLD = RELEASE = 240
+REACH = HOLD + RELEASE - 1
+# sha256 of the stage's PCM16 output at 311a4ace, before the limiter existed: the abrupt-syllable
+# vowel at f0 200 Hz through `CharacterStage(CharacterConfig())` with the double on, in 80 ms
+# chunks, plus `end_segment()`'s tail; 72496 samples, 84 of them clipped. Computed in the
+# container runner at that commit (the command is in the commit body). The runner's CPU has
+# AVX512, so another numpy build may round differently in the last place; if CI and the runner
+# disagree, look here first.
+BASE_DIGEST = "72cef2274e7479c68adb539198e7f1a85bc2ef84e877cc42f4cef5372dd5afd1"
+BASE_CLIPPED = 84
 
 
 def _vowel(f0: float, seconds: float) -> np.ndarray:
@@ -85,10 +109,15 @@ def _offline_compressor(e: np.ndarray, config: CharacterConfig) -> np.ndarray:
     return e * gain
 
 
+def _offline_dry_unrounded(x: np.ndarray, config: CharacterConfig) -> np.ndarray:
+    """The dry path in PCM16 steps before rounding: EQ, compressor and output gain, no copies."""
+    y = _offline_compressor(sosfilt(_reference_sos(config), x), config)
+    return 10 ** (config.output_gain_db / 20) * y * FULL_SCALE
+
+
 def _offline_dry(x: np.ndarray, config: CharacterConfig) -> np.ndarray:
     """The dry path in PCM16 steps: EQ, compressor and output gain, no copies."""
-    y = _offline_compressor(sosfilt(_reference_sos(config), x), config)
-    return np.rint(10 ** (config.output_gain_db / 20) * y * FULL_SCALE)
+    return np.rint(_offline_dry_unrounded(x, config))
 
 
 def _max_trailing_rms_dbfs(x: np.ndarray) -> float:
@@ -114,6 +143,40 @@ def _calibration_proxy() -> np.ndarray:
         start = index * (syllable + gap)
         envelope[start : start + syllable] = np.hanning(syllable) * 10 ** (-6 * (index % 3) / 20)
     return _at_reference_level(vowel * envelope)
+
+
+def _abrupt_syllables(f0: float) -> np.ndarray:
+    """The vowel at `f0` under 12 rectangular syllables, at H20's reference level.
+
+    As `_calibration_proxy`, but each 200 ms syllable starts and stops at once. The compressor's
+    gain starts each onset near unity, so the stage's output passes the knee at the onsets of the
+    four 0 dB syllables and, without the limiter, clips there.
+    """
+    vowel = _vowel(f0, 3.0)
+    syllable, gap = round(0.2 * FS), round(0.05 * FS)
+    envelope = np.zeros(len(vowel))
+    for index in range(12):
+        start = index * (syllable + gap)
+        envelope[start : start + syllable] = 10 ** (-6 * (index % 3) / 20)
+    return _at_reference_level(vowel * envelope)
+
+
+def _within_reach(loud: np.ndarray) -> np.ndarray:
+    """True at each sample that a `loud` sample at or before it, by fewer than `REACH`, can change."""
+    return np.convolve(loud.astype(np.int64), np.ones(REACH, dtype=np.int64))[: len(loud)] > 0
+
+
+def _thd_db(x: np.ndarray, f0: float) -> float:
+    """Harmonic over fundamental power in dB: Hann window, each harmonic read over +-3 bins."""
+    power = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+    bin_hz = FS / len(x)
+
+    def band(k: int) -> float:
+        centre = round(k * f0 / bin_hz)
+        return float(power[centre - 3 : centre + 4].sum())
+
+    top = int((FS / 2 - 4 * bin_hz) // f0)
+    return 10 * math.log10(sum(band(k) for k in range(2, top + 1)) / band(1))
 
 
 def _run(stage: CharacterStage, pcm: bytes, sizes: list[int]) -> bytes:
@@ -222,6 +285,69 @@ class TestCharacterConfig:
     def test_accepts_the_edges_of_each_range(self) -> None:
         CharacterConfig(ratio=1.0, double_gain=0.0, copies=(DetunedCopy(15.0, 7.0),))
         CharacterConfig(double_gain=1.0, splice_ms=5.99)
+
+    def test_the_limiter_is_on_by_default(self) -> None:
+        assert CharacterConfig().limiter == LimiterConfig()
+
+    def test_refuses_a_limiter_whose_memory_outlasts_the_tail(self) -> None:
+        # The default double's longest read is 14 + 12 / 2 = 20 ms, and 15 + 10 is past it.
+        with pytest.raises(ValueError):
+            CharacterConfig(limiter=LimiterConfig(hold_ms=15.0))
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"double_gain": 0.0}, id="double-gain-zero"),
+            pytest.param({"copies": ()}, id="no-copies"),
+        ],
+    )
+    def test_without_the_double_any_hold_is_accepted(self, overrides: dict) -> None:
+        CharacterConfig(limiter=LimiterConfig(hold_ms=15.0), **overrides)
+
+    def test_accepts_a_limiter_that_ends_exactly_with_the_tail_or_none(self) -> None:
+        CharacterConfig(limiter=LimiterConfig(hold_ms=10.0, release_ms=10.0))
+        CharacterConfig(limiter=None)
+
+
+class TestLimiterConfig:
+    def test_defaults(self) -> None:
+        config = LimiterConfig()
+
+        assert config.knee_dbfs == -1.0
+        assert config.hold_ms == 10.0
+        assert config.release_ms == 10.0
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"knee_dbfs": 0.0}, id="knee-at-0-dbfs"),
+            pytest.param({"knee_dbfs": 20 * math.log10(32767 / 32768)}, id="knee-at-the-ceiling"),
+            pytest.param({"knee_dbfs": float("nan")}, id="knee-nan"),
+            pytest.param({"hold_ms": 0.0}, id="hold-zero"),
+            pytest.param({"hold_ms": -1.0}, id="hold-negative"),
+            pytest.param({"release_ms": 0.0}, id="release-zero"),
+            pytest.param({"release_ms": -1.0}, id="release-negative"),
+            pytest.param({"release_ms": 10.5}, id="release-above-hold"),
+        ],
+    )
+    def test_refuses_a_value_the_limiter_cannot_honour(self, overrides: dict) -> None:
+        with pytest.raises(ValueError):
+            LimiterConfig(**overrides)
+
+    def test_accepts_the_edges_of_each_range(self) -> None:
+        LimiterConfig(knee_dbfs=-0.001, hold_ms=10.0, release_ms=10.0)
+        LimiterConfig(hold_ms=0.01, release_ms=0.005)
+
+    def test_the_reach_is_hold_plus_release_less_one(self) -> None:
+        assert limiter_reach_samples(LimiterConfig(), sample_rate=FS) == REACH == 479
+        assert limiter_reach_samples(
+            LimiterConfig(hold_ms=5.0, release_ms=2.0), sample_rate=FS
+        ) == (120 + 48 - 1)
+
+    def test_hold_and_release_are_at_least_one_sample(self) -> None:
+        tiny = LimiterConfig(hold_ms=0.01, release_ms=0.01)
+
+        assert limiter_reach_samples(tiny, sample_rate=FS) == 1
 
 
 # --- dry chain -------------------------------------------------------------------------------
@@ -392,6 +518,159 @@ class TestDetunedVoice:
         assert np.all(later == 0.0)
 
 
+# --- limiter ---------------------------------------------------------------------------------
+
+
+def _limiter() -> PeakLimiter:
+    return PeakLimiter(LimiterConfig(), sample_rate=FS)
+
+
+class TestKneeCurve:
+    def test_is_the_identity_at_and_below_the_knee(self) -> None:
+        a = np.append(np.linspace(0.0, KNEE, 10001), KNEE)
+
+        assert np.array_equal(knee_curve(a, knee_dbfs=-1.0), a)
+
+    @pytest.mark.parametrize("e", [1e-3, 1e-4, 1e-5])
+    def test_leaves_the_identity_by_the_cube_of_the_distance_past_the_knee(self, e: float) -> None:
+        """F and its first two derivatives match the identity's at the knee.
+
+        Above the knee f is `K + (c - K) tanh((a - K) / (c - K))`, whose Taylor series departs
+        from `a` by `-(a - K)^3 / (3 (c - K)^2)`: no constant, linear or square term.
+        """
+        a = KNEE + e
+        past = a - KNEE
+
+        departure = knee_curve(np.array([a]), knee_dbfs=-1.0)[0] - a
+
+        cubic = -(past**3) / (3 * (PCM16_CEILING - KNEE) ** 2)
+        assert departure == pytest.approx(cubic, rel=0.05)
+
+    def test_rises_and_never_passes_the_ceiling(self) -> None:
+        a = np.geomspace(KNEE, 1e6, 200001)
+
+        f = knee_curve(a, knee_dbfs=-1.0)
+
+        assert PCM16_CEILING == 32767 / 32768
+        assert np.all(np.diff(f) >= 0.0)
+        assert np.max(f) <= PCM16_CEILING
+
+    @pytest.mark.parametrize(
+        "order",
+        [
+            pytest.param(1, id="rising"),
+            pytest.param(-1, id="falling"),
+        ],
+    )
+    def test_a_sweep_of_overs_rounds_inside_pcm16(self, order: int) -> None:
+        magnitudes = np.geomspace(KNEE, 1e6, 20001)[::order]
+        signs = np.where(np.arange(len(magnitudes)) % 2, -1.0, 1.0)
+
+        out = _limiter().process(signs * magnitudes)
+
+        assert np.max(np.abs(np.rint(out * FULL_SCALE))) <= 32767
+
+
+class TestPeakLimiter:
+    def test_gain_holds_then_releases_linearly_in_db(self) -> None:
+        x = np.full(2000, 0.1)
+        m = 300
+        x[m] = 2.0
+        limiter = _limiter()
+
+        out = limiter.process(x)
+
+        gain_db = 20 * np.log10(out / x)
+        depth = 20 * math.log10(knee_curve(np.array([2.0]), knee_dbfs=-1.0)[0] / 2.0)
+        release = np.arange(m + HOLD, m + HOLD + RELEASE - 1)
+        assert np.array_equal(out[:m], x[:m])
+        assert np.max(np.abs(gain_db[m : m + HOLD] - depth)) <= 1e-9
+        expected = depth * (m + HOLD + RELEASE - 1 - release) / RELEASE
+        assert np.max(np.abs(gain_db[release] - expected)) <= 1e-9
+        assert np.array_equal(out[m + REACH :], x[m + REACH :])
+        assert limiter.limited_samples == 1
+
+    def test_outside_every_overs_reach_the_input_passes_bit_for_bit(self) -> None:
+        rng = np.random.default_rng(53)
+        x = rng.uniform(-0.85, 0.85, 6000)
+        overs = [600, 1200, 2500, 3200, 4000]  # each more than `REACH` after the last
+        x[overs] = [2.0, -1.2, 0.95, 40.0, -0.9]
+        loud = np.abs(x) > KNEE
+        sizes = [int(n) for n in rng.integers(1, 700, size=40)]
+        limiter = _limiter()
+
+        out = []
+        position = 0
+        for size in sizes:
+            out.append(limiter.process(x[position : position + size]))
+            position += size
+        out = np.concatenate(out + [limiter.process(x[position:])])
+
+        reach = _within_reach(loud)
+        assert np.count_nonzero(loud) == len(overs)
+        assert np.any(out[reach] != x[reach])
+        assert np.array_equal(out[~reach], x[~reach])
+
+    @pytest.mark.parametrize("over_db", [0.5, 1.0, 3.0])
+    @pytest.mark.parametrize("f0", [200.0, 1000.0])
+    def test_a_sustained_over_is_scaled_not_distorted(self, f0: float, over_db: float) -> None:
+        x = 10 ** (over_db / 20) * np.sin(2 * np.pi * f0 * np.arange(round(0.06 * FS)) / FS)
+        settled = slice(round(0.01 * FS), len(x))
+
+        out = _limiter().process(x)
+
+        assert _thd_db(out[settled], f0) < -80.0
+        assert _thd_db(np.clip(x, -1.0, 1.0)[settled], f0) > -35.0
+
+    @pytest.mark.parametrize("size", [1, 7, 240, 1000])
+    def test_output_does_not_depend_on_chunking(self, size: int) -> None:
+        x = 1.5 * _vowel(200.0, 0.3)
+        whole = _limiter().process(x)
+        limiter = _limiter()
+
+        chunked = np.concatenate([limiter.process(x[i : i + size]) for i in range(0, len(x), size)])
+
+        assert np.array_equal(chunked, whole)
+
+    def test_an_empty_chunk_returns_nothing(self) -> None:
+        assert len(_limiter().process(np.zeros(0))) == 0
+
+    def test_counts_the_samples_above_the_knee(self) -> None:
+        limiter = _limiter()
+
+        limiter.process(np.array([KNEE, -KNEE, 0.5, 0.9, -2.0]))
+        limiter.process(np.array([1.0]))
+
+        assert limiter.limited_samples == 3
+
+    def test_reset_restores_0_db_and_keeps_the_count(self) -> None:
+        limiter = _limiter()
+        limiter.process(np.array([0.1, 3.0, 0.1]))
+        quiet = np.full(100, 0.5)
+
+        limiter.reset()
+        out = limiter.process(quiet)
+
+        assert np.array_equal(out, quiet)
+        assert limiter.limited_samples == 1
+
+    def test_twenty_seconds_of_overs_cost_under_half_a_second_of_cpu(self) -> None:
+        """A PCM16 input cannot keep the limiter busy, since the compressor holds it down; noise
+        uniform in [-4, 4] full scale is above the knee at most samples.
+        """
+        x = np.random.default_rng(53).uniform(-4.0, 4.0, 20 * FS)
+
+        timings = []
+        for _ in range(3):
+            limiter = _limiter()
+            start = time.process_time()
+            for offset in range(0, len(x), 1920):
+                limiter.process(x[offset : offset + 1920])
+            timings.append(time.process_time() - start)
+
+        assert min(timings) < 0.5, f"best of 3: {min(timings):.3f} s"
+
+
 # --- the stage -------------------------------------------------------------------------------
 
 
@@ -529,7 +808,7 @@ class TestCharacterStage:
         assert np.array_equal(gap[:tail_only], dry_gap[:tail_only])
 
     def test_counts_the_samples_it_clips(self) -> None:
-        config = CharacterConfig(double_gain=0.0, ratio=1.0, output_gain_db=12.0)
+        config = CharacterConfig(double_gain=0.0, ratio=1.0, output_gain_db=12.0, limiter=None)
         x = 0.5 * np.sin(2 * np.pi * 1000.0 * np.arange(FS // 10) / FS)
         stage = CharacterStage(config, sample_rate=FS)
 
@@ -545,10 +824,178 @@ class TestCharacterStage:
         assert stage.clipped_samples == pytest.approx(expected, abs=2)
         assert out.max() == 32767
         assert out.min() == -32768
+        assert stage.limited_samples == 0
+
+    def test_with_the_limiter_the_clip_counts_input_clips_nothing(self) -> None:
+        config = CharacterConfig(double_gain=0.0, ratio=1.0, output_gain_db=12.0)
+        x = 0.5 * np.sin(2 * np.pi * 1000.0 * np.arange(FS // 10) / FS)
+        stage = CharacterStage(config, sample_rate=FS)
+
+        out = _samples(stage.process(_pcm(x)))
+
+        assert stage.clipped_samples == 0
+        assert stage.limited_samples > 0
+        assert np.max(np.abs(out)) <= 32767
 
     def test_refuses_a_band_at_or_above_nyquist(self) -> None:
         with pytest.raises(ValueError):
             CharacterStage(CharacterConfig(), sample_rate=16000)
+
+
+def _both(config: CharacterConfig, pcm: bytes, sizes: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    """The stage's output with `config`'s limiter and with `limiter=None`, in the same chunks."""
+    limited = _samples(_run(CharacterStage(config, sample_rate=FS), pcm, sizes))
+    plain_config = dataclasses.replace(config, limiter=None)
+    plain = _samples(_run(CharacterStage(plain_config, sample_rate=FS), pcm, sizes))
+    return limited, plain
+
+
+class TestLimiterInTheStage:
+    def test_without_the_limiter_the_output_is_the_bases(self) -> None:
+        """A characterization test: `limiter=None` reproduces 311a4ace's bytes, clips counted."""
+        stage = CharacterStage(CharacterConfig(limiter=None), sample_rate=FS)
+
+        out = _run(stage, _pcm(_abrupt_syllables(200.0)), [1920])
+
+        assert len(out) // 2 == 72000 + stage.tail_samples
+        assert hashlib.sha256(out).hexdigest() == BASE_DIGEST
+        assert stage.clipped_samples == BASE_CLIPPED
+
+    @pytest.mark.parametrize("f0", F0S)
+    def test_no_sample_clips(self, f0: float) -> None:
+        stage = CharacterStage(CharacterConfig(), sample_rate=FS)
+
+        out = _samples(_run(stage, _pcm(_abrupt_syllables(f0)), [1920]))
+
+        assert stage.limited_samples > 0
+        assert stage.clipped_samples == 0
+        assert np.max(np.abs(out)) <= 32767
+
+    def test_counts_the_samples_above_the_knee(self) -> None:
+        config = _dry_only()
+        x = _abrupt_syllables(200.0)
+        stage = CharacterStage(config, sample_rate=FS)
+
+        _run(stage, _pcm(x), [1920])
+
+        unrounded = _offline_dry_unrounded(_samples(_pcm(x)) / FULL_SCALE, config)
+        expected = int(np.count_nonzero(np.abs(unrounded) > KNEE * FULL_SCALE))
+        assert expected > 0
+        assert stage.limited_samples == expected
+
+    @pytest.mark.parametrize("f0", F0S)
+    def test_changes_only_samples_within_reach_of_a_peak(self, f0: float) -> None:
+        limited, plain = _both(CharacterConfig(), _pcm(_abrupt_syllables(f0)), [1920])
+
+        differs = limited != plain
+        reach = _within_reach(np.abs(plain) >= KNEE_STEPS)
+        assert np.any(differs)
+        assert not np.any(differs & ~reach)
+
+    def test_a_stage_without_the_limiter_limits_nothing(self) -> None:
+        stage = CharacterStage(CharacterConfig(limiter=None), sample_rate=FS)
+
+        _run(stage, _pcm(_abrupt_syllables(200.0)), [1920])
+
+        assert stage.limited_samples == 0
+
+    @pytest.mark.parametrize(
+        "sizes",
+        [
+            pytest.param([1], id="1"),
+            pytest.param([7], id="7"),
+            pytest.param([480], id="480"),
+            pytest.param([960], id="960"),
+            pytest.param([4096], id="4096"),
+            pytest.param(
+                [int(n) for n in np.random.default_rng(53).integers(1, 3000, size=200)],
+                id="seeded-random",
+            ),
+        ],
+    )
+    def test_output_does_not_depend_on_chunking(self, sizes: list[int]) -> None:
+        pcm = _pcm(_abrupt_syllables(200.0))
+        whole = _samples(_run(CharacterStage(CharacterConfig(), sample_rate=FS), pcm, [len(pcm)]))
+
+        chunked = _samples(_run(CharacterStage(CharacterConfig(), sample_rate=FS), pcm, sizes))
+
+        assert len(chunked) == len(whole)
+        assert np.max(np.abs(chunked - whole)) <= 1
+
+    @pytest.mark.parametrize("double_gain", [0.35, 0.0], ids=["double-on", "double-off"])
+    def test_no_segments_limiting_reaches_the_next(self, double_gain: float) -> None:
+        """A segment ending on an over leaves the next segment as if there were no limiter.
+
+        Without the double there is no tail, so only `end_segment`'s reset keeps the over's hold
+        and release out of the next segment.
+        """
+        burst = round(0.005 * FS)
+        loud_end = np.concatenate(
+            (0.02 * _vowel(200.0, 0.2), 0.5 * np.sin(2 * np.pi * 1000.0 * np.arange(burst) / FS))
+        )
+        quiet = _pcm(0.02 * _vowel(200.0, 0.3))
+        heads, nexts = [], []
+        for limiter in (LimiterConfig(), None):
+            config = CharacterConfig(double_gain=double_gain, limiter=limiter)
+            stage = CharacterStage(config, sample_rate=FS)
+            heads.append(_samples(stage.process(_pcm(loud_end))))
+            stage.end_segment()
+            nexts.append(stage.process(quiet))
+
+        assert np.max(np.abs(heads[1][-burst:])) >= KNEE_STEPS
+        assert np.max(np.abs(_samples(nexts[1]))) < KNEE_STEPS
+        assert nexts[0] == nexts[1]
+
+    def test_an_impulse_above_the_knee_still_leaves_at_once(self) -> None:
+        stage = CharacterStage(_dry_only(), sample_rate=FS)
+        impulse = np.zeros(1000)
+        impulse[137] = 0.9
+
+        out = _samples(stage.process(_pcm(impulse)))
+
+        assert stage.limited_samples > 0
+        assert np.all(out[:137] == 0)
+        assert out[137] != 0
+
+
+class TestLimiterLeavesTheRestAlone:
+    """Below the knee the stage's output is byte-identical with and without the limiter."""
+
+    @pytest.mark.parametrize(
+        ("config", "signal", "chunk"),
+        [
+            pytest.param(CharacterConfig(), _calibration_proxy, 1920, id="calibration-proxy"),
+            pytest.param(
+                _neutral_compressor(double_gain=0.0),
+                lambda: 0.3 * _vowel(200.0, 1.0),
+                480,
+                id="eq-test-input",
+            ),
+        ],
+    )
+    def test_an_input_below_the_knee(
+        self, config: CharacterConfig, signal: Callable[[], np.ndarray], chunk: int
+    ) -> None:
+        pcm = _pcm(signal())
+        stage = CharacterStage(config, sample_rate=FS)
+
+        limited = _run(stage, pcm, [chunk])
+
+        plain_stage = CharacterStage(dataclasses.replace(config, limiter=None), sample_rate=FS)
+        plain = _run(plain_stage, pcm, [chunk])
+        assert stage.limited_samples == 0
+        assert limited == plain
+
+    @pytest.mark.parametrize("f0", F0S)
+    def test_a_steady_vowel_after_its_onsets_reach(self, f0: float) -> None:
+        limited, plain = _both(
+            CharacterConfig(), _pcm(_at_reference_level(_vowel(f0, 3.0))), [1920]
+        )
+
+        loud = np.flatnonzero(np.abs(plain) >= KNEE_STEPS)
+        start = int(loud[-1]) + REACH if len(loud) else 0
+        assert start < round(0.05 * FS)
+        assert np.array_equal(limited[start:], plain[start:])
 
 
 # --- level, calibration and cost ---------------------------------------------------------------
@@ -569,8 +1016,8 @@ class TestLevel:
     ) -> None:
         """A vowel that starts at full level is the design doc's loud first syllable.
 
-        The compressor's gain starts at unity, so its first 15 ms may clip, and the stage counts
-        that; once the gain has settled nothing reaches -1 dBFS.
+        The compressor's gain starts at unity, so its first 15 ms may pass the limiter's knee, and
+        the limiter takes them; once the gain has settled nothing reaches -1 dBFS.
         """
         stage = CharacterStage(CharacterConfig(), sample_rate=FS)
 
