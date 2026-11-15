@@ -198,7 +198,8 @@ body holds names, dates and numbers, never an argument, summary or secret:
 - `days`: per day, `invocations`, and counts `by_capability`, `by_source` (`fastpath`,
   `model`, `proposal`), `by_level` (`full`, `low`, `off`) and `by_status`; `turn_ms`, the p50
   and p90 of the time from a message's receipt to each action's outcome; and `turn_ms_by_level`,
-  the same p50 and p90 for each of `full`, `low` and `off`, null where that level has no row;
+  the same p50 and p90 for each of `full`, `low` and `off`, null where no row at that level holds
+  a `turn_ms` (a row with no level counts in `turn_ms` only);
 - `alarms`: per day, the counts of `fired`, `stopped`, `timed_out`, `snoozed`, `missed_late`,
   `missed_unheard`, `dismissed`, `reported` and `fallback`.
 
