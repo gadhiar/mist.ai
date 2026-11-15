@@ -113,6 +113,7 @@ from backend.memory.block import BlockPlacement, MemoryBlockBuilder, PlacedList
 from backend.memory.config import MemoryConfig
 from backend.memory.fact_index import DiffReport, FactIndex, IndexedFact
 from backend.memory.fetcher import (
+    GATE_EXECUTOR,
     INDEX_EXECUTOR,
     MODEL_EXECUTOR,
     FetcherExecutors,
@@ -1331,7 +1332,11 @@ async def run_fixture(
     )
     sidecar.initialize()
     executors = build_memory_executors()
-    pools = FetcherExecutors(index=executors[INDEX_EXECUTOR], model=executors[MODEL_EXECUTOR])
+    pools = FetcherExecutors(
+        index=executors[INDEX_EXECUTOR],
+        model=executors[MODEL_EXECUTOR],
+        gate=executors[GATE_EXECUTOR],
+    )
     tracer: ProbeTracer | None = None
     try:
         index = FactIndex(writer, embedder, tz=config.tz, reader=reader)
@@ -1360,6 +1365,10 @@ async def run_fixture(
             block_builder=MemoryBlockBuilder(counter=counter, config=config, placement=placement),
             config=config,
             executors=pools,
+            # No gate and no follow-up path: every figure is the ungated fetch's.
+            need_gate=None,
+            need_mode="on",
+            need_context=False,
             clock=SystemClock(),
             index_state=probe_state,
             notes=VaultCandidates(sidecar, vault_root=str(workdir / "vault"), tz=config.tz),

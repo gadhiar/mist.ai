@@ -23,14 +23,18 @@ from backend.errors import MemoryConfigError
 from backend.user_timezone import USER_TIMEZONE_ENV, ZoneLoader, resolve_user_timezone
 
 from .models import ServingProfile
+from .need_gate import NEED_EMBEDDERS
 from .retrieval_view import FACT_VIEWS
 
 FactViewId = Literal["F0", "F1", "F2", "F3"]
 RerankBackend = Literal["local", "remote", "off"]
 RerankDevice = Literal["cpu", "cuda"]
 RemoteScoreKind = Literal["logit", "probability"]
+NeedGateMode = Literal["on", "shadow", "off"]
+NeedEmbedderName = Literal["shared", "bge-small-en-v1.5", "granite-embedding-small-english-r2"]
 TzResolver = ZoneLoader
 
+_NEED_GATE_MODES: tuple[str, ...] = ("on", "shadow", "off")
 _RERANK_BACKENDS: tuple[str, ...] = ("local", "remote", "off")
 _RERANK_DEVICES: tuple[str, ...] = ("cpu", "cuda")
 _REMOTE_SCORE_KINDS: tuple[str, ...] = ("logit", "probability")
@@ -89,6 +93,9 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_LIST_MAX_ITEMS",
     "MIST_MEMORY_RESCAN_INTERVAL_S",
     "MIST_MEMORY_FACT_VIEW",
+    "MIST_MEMORY_NEED_GATE",
+    "MIST_MEMORY_NEED_EMBEDDER",
+    "MIST_MEMORY_NEED_CONTEXT",
     USER_TIMEZONE_ENV,
 )
 
@@ -227,6 +234,17 @@ class MemoryConfig:
             The index's content hash covers the view text, so a FactIndex built with a changed
             setting rewrites and re-embeds, at its next diff, every row whose view text the
             change alters. The default equals `retrieval_view.DEFAULT_FACT_VIEW`.
+        need_gate: Whether each fetch asks the need gate first. `on` acts on its band,
+            `shadow` decides and traces, then serves the fetch as open, and `off` builds no
+            gate, so nothing reads the need bank or the gate model file. `off` is the rollback
+            lever when either of those is what broke.
+        need_embedder: The gate embedder, a `need_gate.NEED_EMBEDDERS` name. `shared` reuses
+            the fetch's own query vector; another name embeds the query a second time, with
+            that model's query prefix, on the `memory-gate` executor. A placeholder default
+            until the gate's selection run sets it.
+        need_context: Whether a closed or band query that follows a fetch which served memory
+            is also judged by the previous user turn joined to it, taking the higher
+            probability.
         tz: Zone used to read temporal phrases, from `MIST_TIMEZONE`. Resolved once in
             `from_env`.
         tz_name: The IANA name `tz` came from, or None when `tz` is UTC because
@@ -255,6 +273,9 @@ class MemoryConfig:
     list_max_items: int = 10
     rescan_interval_s: int = 300
     fact_view: FactViewId = "F3"
+    need_gate: NeedGateMode = "on"
+    need_embedder: NeedEmbedderName = "shared"
+    need_context: bool = True
     tz: tzinfo = UTC
     tz_name: str | None = None
 
@@ -287,6 +308,10 @@ class MemoryConfig:
         _require_choice("rerank_device", self.rerank_device, _RERANK_DEVICES)
         _require_choice("rerank_remote_scores", self.rerank_remote_scores, _REMOTE_SCORE_KINDS)
         _require_choice("fact_view", self.fact_view, tuple(FACT_VIEWS))
+        _require_choice("need_gate", self.need_gate, _NEED_GATE_MODES)
+        _require_choice("need_embedder", self.need_embedder, tuple(NEED_EMBEDDERS))
+        if not isinstance(self.need_context, bool):
+            raise MemoryConfigError(f"need_context must be a bool, got {self.need_context!r}")
         weights = (self.rerank_weight, self.recency_weight, self.confidence_weight)
         if any(weight < 0 for weight in weights):
             raise MemoryConfigError(f"weights must not be negative, got {weights}")
@@ -347,6 +372,9 @@ class MemoryConfig:
             list_max_items=_env_int("MIST_MEMORY_LIST_MAX_ITEMS", 10),
             rescan_interval_s=_env_int("MIST_MEMORY_RESCAN_INTERVAL_S", 300),
             fact_view=_env("MIST_MEMORY_FACT_VIEW") or "F3",  # type: ignore[arg-type]
+            need_gate=_env("MIST_MEMORY_NEED_GATE") or "on",  # type: ignore[arg-type]
+            need_embedder=_env("MIST_MEMORY_NEED_EMBEDDER") or "shared",  # type: ignore[arg-type]
+            need_context=_env_bool("MIST_MEMORY_NEED_CONTEXT", True),
             tz=tz,
             tz_name=tz_name,
         )

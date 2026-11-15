@@ -20,7 +20,12 @@ from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 ItemKind = Literal["fact", "episode", "exchange", "note"]
 SummaryState = Literal["raw", "summarized"]
 DegradedReason = Literal[
-    "deadline", "index_error", "index_rebuilding", "reranker_unavailable", "context_budget"
+    "deadline",
+    "index_error",
+    "index_rebuilding",
+    "reranker_unavailable",
+    "context_budget",
+    "need_unknown",
 ]
 ServingLevel = Literal["full", "low", "off"]
 ServingTier = Literal["top", "interaction"]
@@ -28,8 +33,11 @@ CandidateSource = Literal["graph", "vault", "episode", "exchange"]
 CandidateDisposition = Literal[
     "injected", "dropped_min_score", "dropped_budget", "dropped_no_fit", "dropped_suppressed"
 ]
-StageSkipReason = Literal["off", "zero_budget", "error"]
+StageSkipReason = Literal["off", "zero_budget", "error", "no_need"]
 PrefetchReuse = Literal["block", "stage1", "none"]
+NeedMode = Literal["on", "shadow"]
+NeedBand = Literal["closed", "band", "open"]
+NeedDegraded = Literal["deadline", "need_unknown"]
 
 _DEGRADED_REASONS: tuple[str, ...] = (
     "deadline",
@@ -37,6 +45,7 @@ _DEGRADED_REASONS: tuple[str, ...] = (
     "index_rebuilding",
     "reranker_unavailable",
     "context_budget",
+    "need_unknown",
 )
 _SERVING_LEVELS: tuple[str, ...] = ("full", "low", "off")
 _SERVING_TIERS: tuple[str, ...] = ("top", "interaction")
@@ -48,8 +57,11 @@ _CANDIDATE_DISPOSITIONS: tuple[str, ...] = (
     "dropped_no_fit",
     "dropped_suppressed",
 )
-_STAGE_SKIP_REASONS: tuple[str, ...] = ("off", "zero_budget", "error")
+_STAGE_SKIP_REASONS: tuple[str, ...] = ("off", "zero_budget", "error", "no_need")
 _PREFETCH_REUSES: tuple[str, ...] = ("block", "stage1", "none")
+_NEED_MODES: tuple[str, ...] = ("on", "shadow")
+_NEED_BANDS: tuple[str, ...] = ("closed", "band", "open")
+_NEED_DEGRADED: tuple[str, ...] = ("deadline", "need_unknown")
 
 
 def _require_choice(field_name: str, value: object, choices: tuple[str, ...]) -> None:
@@ -276,6 +288,105 @@ class MemoryCandidate:
             raise ValueError(f"item must be at least 1, got {self.item}")
 
 
+def _band_of(p: float, theta_low: float, theta_high: float) -> str:
+    if p < theta_low:
+        return "closed"
+    if p < theta_high:
+        return "band"
+    return "open"
+
+
+def _require_probability(field_name: str, value: float) -> None:
+    if not 0.0 <= value <= 1.0:  # also false for NaN
+        raise ValueError(f"{field_name} must be in [0, 1], got {value!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class NeedTrace:
+    """What the need gate decided for one fetch: numbers and bank ids, never text.
+
+    In `on` mode the fetch acts on `band`; in `shadow` mode the gate decides and is traced, and
+    the fetch is served as open. A gate vector that missed the deadline or failed leaves the
+    gate closed with `degraded` naming why, which is what `on` acts on; a shadow fetch records
+    it here and leaves its own `degraded_reason` to the rest of the fetch.
+
+    Attributes:
+        mode: `on` or `shadow`. With the gate off the fetch has no `NeedTrace`.
+        band: `closed` below `theta_low`, `band` from `theta_low` up to `theta_high`, `open`
+            at `theta_high` and above; `closed` when `degraded` is set.
+        p: The turn's need probability: the query's, or the follow-up context's when that is
+            higher. None only when `degraded` is set before the query vector was decided.
+        theta_low: The gate model's lower threshold.
+        theta_high: The gate model's upper threshold.
+        band_k: The gate model's entry count for a band turn.
+        need_ids: The nearest need exemplars of the decision `p` came from, nearest first.
+        no_need_ids: The same for no-need exemplars.
+        context: Whether the follow-up context's probability was the higher and moved the
+            band, so that the context, not the query alone, decided the band.
+        context_p: The follow-up context's probability, when the gate waited for it and it
+            arrived; None otherwise.
+        degraded: `deadline` for a gate vector that missed the deadline, `need_unknown` for an
+            embedder error or a vector the gate refused; None when the gate decided.
+    """
+
+    mode: NeedMode
+    band: NeedBand
+    p: float | None
+    theta_low: float
+    theta_high: float
+    band_k: int
+    need_ids: tuple[str, ...]
+    no_need_ids: tuple[str, ...]
+    context: bool
+    context_p: float | None
+    degraded: NeedDegraded | None
+
+    def __post_init__(self) -> None:
+        """Reject a decision whose band, probabilities or degradation contradict each other."""
+        _require_choice("mode", self.mode, _NEED_MODES)
+        _require_choice("band", self.band, _NEED_BANDS)
+        if self.degraded is not None:
+            _require_choice("degraded", self.degraded, _NEED_DEGRADED)
+        _require_probability("theta_low", self.theta_low)
+        _require_probability("theta_high", self.theta_high)
+        if self.theta_low > self.theta_high:
+            raise ValueError(
+                f"theta_low must not exceed theta_high, got {self.theta_low} > {self.theta_high}"
+            )
+        if self.band_k < 1:
+            raise ValueError(f"band_k must be at least 1, got {self.band_k}")
+        if self.p is not None:
+            _require_probability("p", self.p)
+        if self.context_p is not None:
+            _require_probability("context_p", self.context_p)
+        if self.degraded is not None:
+            if self.band != "closed":
+                raise ValueError(
+                    f"a degraded decision is closed, got band={self.band!r} "
+                    f"degraded={self.degraded!r}"
+                )
+            if self.context or self.context_p is not None:
+                raise ValueError("a degraded decision has no context probability")
+            return
+        if self.p is None:
+            raise ValueError("p is set whenever the gate decided")
+        expected = _band_of(self.p, self.theta_low, self.theta_high)
+        if self.band != expected:
+            raise ValueError(
+                f"band must follow p: p={self.p} gives {expected!r}, got {self.band!r}"
+            )
+        if self.context and self.context_p != self.p:
+            raise ValueError(
+                f"a context that moved the band gives the turn's p, got context_p="
+                f"{self.context_p!r} p={self.p}"
+            )
+        if self.context_p is not None and self.context_p > self.p:
+            raise ValueError(
+                f"p is the higher of the query's and the context's, got context_p="
+                f"{self.context_p} p={self.p}"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryStage:
     """What one turn's fetch did, carried from the fetcher to the trace builder.
@@ -284,7 +395,8 @@ class MemoryStage:
     did not run (`ran` false) names why in `skip_reason`; a turn with memory disabled has no
     stage at all. No field holds text, so nothing the user said reaches the trace through it.
     Candidates arrive in the order the fetcher keeps them; capping them for the trace is the
-    trace builder's, which counts the rest in `truncated`.
+    trace builder's, which counts the rest in `truncated`. `need` is set whenever the need
+    gate was asked; a closed `on` gate skips the stage with `no_need`.
     """
 
     ran: bool
@@ -302,6 +414,7 @@ class MemoryStage:
     timings: FetchTimings
     candidates: tuple[MemoryCandidate, ...]
     truncated: int = 0
+    need: NeedTrace | None = None
 
     def __post_init__(self) -> None:
         """Reject a stage whose fields contradict each other or the trace's value sets."""
@@ -312,6 +425,17 @@ class MemoryStage:
             )
         if self.skip_reason is not None:
             _require_choice("skip_reason", self.skip_reason, _STAGE_SKIP_REASONS)
+        if self.skip_reason == "no_need":
+            need = self.need
+            if need is None:
+                raise ValueError("a no_need skip carries the gate's decision")
+            if need.mode != "on":
+                raise ValueError("a shadow decision never skips the stage (no_need)")
+            if need.band != "closed" or need.degraded is not None:
+                raise ValueError(
+                    "a no_need skip is a closed decision; a degraded one runs with its reason, "
+                    f"got band={need.band!r} degraded={need.degraded!r}"
+                )
         _require_choice("level", self.level, _SERVING_LEVELS)
         _require_choice("tier", self.tier, _SERVING_TIERS)
         if self.degraded_reason is not None:

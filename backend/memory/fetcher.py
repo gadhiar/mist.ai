@@ -12,11 +12,20 @@ in two stages (Design point 8):
   pool, RRF fusion, the cross-encoder on the pairs that fit the time left, the weighted score,
   the `min_score` threshold, suppression, sibling expansion (plan v2 V7) and packing.
 
+The need gate, when one is given, decides in stage 2, beside the pools and before the
+cross-encoder, how likely the turn needs memory. In `on` mode a closed decision ends the fetch
+with no block (`skip_reason="no_need"`) and cancels the pools; a band or open one proceeds. A
+gate vector that misses the deadline closes it as `deadline`, an embedder error or a refused
+vector as `need_unknown`. In `shadow` mode the gate waits and decides at the same point, is
+traced, and the fetch is served as open. A closed or band query that follows a fetch which
+served memory is also judged by the previous user turn joined to it, taking the higher
+probability. The decision is traced as `MemoryStage.need`.
+
 Blocking work runs on the injected executors: SQLite on `memory-index`, the query embedding and
-the rerank on `memory-model`. A thread cannot be cancelled, so at the deadline the fetcher stops
-waiting, discards whatever arrives late and returns what has finished, marked
-`degraded_reason="deadline"`. The time a call spent queued behind earlier work is counted as
-`queue_wait_ms`.
+the rerank on `memory-model`, the gate's own embeddings on `memory-gate`. A thread cannot be
+cancelled, so at the deadline the fetcher stops waiting, discards whatever arrives late and
+returns what has finished, marked `degraded_reason="deadline"`. The time a call spent queued
+behind earlier work is counted as `queue_wait_ms`.
 
 `prefetch(session_id, text)` runs the whole fetch for the latest words of a session, one in
 flight per session, and keeps the last completed result with its normalised text. At the
@@ -37,6 +46,7 @@ import hashlib
 import logging
 import math
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor
@@ -63,11 +73,15 @@ from .models import (
     MemoryRequest,
     MemoryResult,
     MemoryStage,
+    NeedDegraded,
+    NeedMode,
+    NeedTrace,
     NoteSource,
     PrefetchReuse,
     ServingProfile,
     StageSkipReason,
 )
+from .need_gate import NeedDecision, NeedGate, context_text
 from .ranking import FusedCandidate, ScoredCandidate, fuse, score_shortlist
 from .rerank import NullReranker, Reranker
 from .sources import (
@@ -87,6 +101,13 @@ T = TypeVar("T")
 # Executor names the runtime builds and the factory passes in (Design point 8).
 INDEX_EXECUTOR = "memory-index"
 MODEL_EXECUTOR = "memory-model"
+GATE_EXECUTOR = "memory-gate"
+
+# How the fetch acts on the need gate's band; with the gate off the fetcher gets no gate.
+_NEED_MODES: tuple[str, ...] = ("on", "shadow")
+
+# The bands after which a session's next fetch may be a follow-up of one that served memory.
+_SERVED_BANDS = frozenset({"band", "open"})
 
 # How long a cached stage 1 and a completed prefetch stay valid.
 STAGE1_TTL_S = 30.0
@@ -134,6 +155,7 @@ _SOURCE_BY_KIND: dict[str, CandidateSource] = {
 _DEGRADED_PRIORITY: tuple[DegradedReason, ...] = (
     "index_error",
     "index_rebuilding",
+    "need_unknown",
     "deadline",
     "reranker_unavailable",
 )
@@ -212,15 +234,19 @@ class SystemClock:
 
 @dataclass(frozen=True, slots=True)
 class FetcherExecutors:
-    """The two executors the fetcher submits blocking work to; the runtime owns them.
+    """The three executors the fetcher submits blocking work to; the runtime owns them.
 
     Attributes:
         index: `memory-index`, for SQLite reads (two threads, shared with the refresher).
         model: `memory-model`, for the query embedding and the rerank (one thread).
+        gate: `memory-gate`, for the need gate's own embeddings: a gate embedder's query
+            vector and the follow-up context's (one thread). They are CPU work of their own,
+            so they never queue behind the cross-encoder or ahead of it.
     """
 
     index: Executor
     model: Executor
+    gate: Executor
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +352,9 @@ class _Session:
     # Work stamped with a generation below this was started before the session's last
     # invalidate and is never reused.
     floor: int = 0
+    # The session's last fetch served memory: its gate's band was band or open (in shadow
+    # mode, the band the gate decided), so the next one may be a follow-up of it.
+    served: bool = False
 
 
 @dataclass(slots=True)
@@ -374,7 +403,15 @@ class MemoryFetcher:
         block_builder: Packs and renders the block; built with the same `config`.
         config: The memory settings: deadline, `min_score`, `rerank_top_n`,
             `list_max_items`, the zone, and the budget per serving level.
-        executors: The `memory-index` and `memory-model` executors.
+        executors: The `memory-index`, `memory-model` and `memory-gate` executors.
+        need_gate: The need gate, or None when `MIST_MEMORY_NEED_GATE` is off: every fetch is
+            then open and traces no `need`. When the gate `shares_query_vector`, it decides on
+            the fetch's own query vector and its embedder is the fetch's model; the fetcher
+            then serializes its calls into that model across the model and gate threads.
+        need_mode: `on` acts on the gate's band; `shadow` decides, traces and serves as open.
+            Read only when `need_gate` is set.
+        need_context: Whether a closed or band query after a fetch that served memory is also
+            judged by the previous user turn joined to it.
         clock: Monotonic seconds for the deadline and the wall clock for a prefetch's `now`.
         index_state: Returns the index's degraded reason, `index_db.degraded_reason` on a
             connection of its own (`runtime.IndexStateProbe`); checked on every fetch.
@@ -385,7 +422,8 @@ class MemoryFetcher:
         prefetch_deadline_ms: The budget of a prefetch's whole fetch.
 
     Raises:
-        ValueError: `pool_size` or `prefetch_deadline_ms` is not positive.
+        ValueError: `pool_size` or `prefetch_deadline_ms` is not positive, or `need_mode` is
+            not `on` or `shadow` while a gate is given.
     """
 
     def __init__(
@@ -397,6 +435,9 @@ class MemoryFetcher:
         block_builder: MemoryBlockBuilder,
         config: MemoryConfig,
         executors: FetcherExecutors,
+        need_gate: NeedGate | None,
+        need_mode: NeedMode,
+        need_context: bool,
         clock: FetchClock,
         index_state: Callable[[], DegradedReason | None],
         notes: NoteSearch | None = None,
@@ -409,12 +450,23 @@ class MemoryFetcher:
             raise ValueError(f"pool_size must be positive, got {pool_size}")
         if not prefetch_deadline_ms > 0:
             raise ValueError(f"prefetch_deadline_ms must be positive, got {prefetch_deadline_ms}")
+        if need_gate is not None and need_mode not in _NEED_MODES:
+            raise ValueError(f"need_mode must be one of {_NEED_MODES}, got {need_mode!r}")
         self._index = index
         self._embedder = embedder
         self._reranker = reranker
         self._builder = block_builder
         self._config = config
         self._executors = executors
+        self._need_gate = need_gate
+        self._need_mode = need_mode
+        self._need_context = need_context
+        # Under a shared gate embedder the context embedding (gate thread) and the fetch's own
+        # query embedding (model thread) call one model object, which nothing else serializes
+        # (EmbeddingGenerator.generate_embedding takes no lock); this lock does.
+        self._shared_embed_lock = (
+            threading.Lock() if need_gate is not None and need_gate.shares_query_vector else None
+        )
         self._clock = clock
         self._index_state = index_state
         self._notes = notes
@@ -454,7 +506,7 @@ class MemoryFetcher:
             outcome = FetchOutcome(
                 result=self._skipped(request, "error", self._timings(started, ledger, None))
             )
-        self._remember(request)
+        self._remember(request, outcome)
         return outcome
 
     async def prefetch(self, session_id: str, partial_text: str | None = None) -> None:
@@ -571,7 +623,9 @@ class MemoryFetcher:
         ledger.stage1_s = self._clock.monotonic() - stage1_started
 
         try:
-            return await self._stage2(request, stage1, deadline, started, ledger, reuse)
+            return await self._stage2(
+                request, stage1, deadline, started, ledger, reuse, served=session.served
+            )
         except _IndexFailedError:
             return self._empty(request, started, ledger, "index_error", reuse)
 
@@ -603,11 +657,52 @@ class MemoryFetcher:
         started: float,
         ledger: _Ledger,
         reuse: PrefetchReuse,
+        *,
+        served: bool,
     ) -> FetchOutcome:
         now = request.now
         window = parse_window(request.query_text, now=now, tz=self._config.tz)
         stage2_started = self._clock.monotonic()
-        candidates, versions = await self._pools(request, stage1, deadline, ledger)
+        query = request.query_text
+        embed_task: asyncio.Task[list[float]] | None = None
+        need_task: asyncio.Task[NeedTrace] | None = None
+        if query.strip():
+            # The fetch's own query embedding first, then the gate's work, so the gate's
+            # vectors are submitted beside it at the start of the stage.
+            embed_task = asyncio.ensure_future(
+                self._call(
+                    self._executors.model,
+                    self._embed_query,
+                    query,
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+            )
+            if self._need_gate is not None:
+                need_task = asyncio.ensure_future(
+                    self._decide_need(request, embed_task, deadline, ledger, served=served)
+                )
+        pools_task = asyncio.ensure_future(
+            self._pools(request, stage1, deadline, ledger, embed_task)
+        )
+        need: NeedTrace | None = None
+        try:
+            if need_task is not None:
+                # The gate decides before the cross-encoder in both modes, so a shadow fetch
+                # does all the work a gated one does.
+                need = await need_task
+                if self._need_mode == "on" and need.band == "closed":
+                    pools_task.cancel()
+                    await asyncio.gather(pools_task, return_exceptions=True)
+                    ledger.stage2_s = self._clock.monotonic() - stage2_started
+                    return self._closed(request, started, ledger, reuse, need)
+            candidates, versions = await pools_task
+        finally:
+            for task in (need_task, pools_task, embed_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            if embed_task is not None and embed_task.done() and not embed_task.cancelled():
+                embed_task.exception()  # retrieved, so asyncio does not report it as never read
         ledger.stage2_s = self._clock.monotonic() - stage2_started
 
         fused = fuse(candidates)
@@ -668,6 +763,7 @@ class MemoryFetcher:
             timings=timings,
             candidates=tuple(ordered[:STAGE_CANDIDATE_CAP]),
             truncated=max(0, len(ordered) - STAGE_CANDIDATE_CAP),
+            need=need,
         )
         result = MemoryResult(
             items=block.items,
@@ -687,27 +783,28 @@ class MemoryFetcher:
         )
 
     async def _pools(
-        self, request: MemoryRequest, stage1: _Stage1, deadline: float, ledger: _Ledger
+        self,
+        request: MemoryRequest,
+        stage1: _Stage1,
+        deadline: float,
+        ledger: _Ledger,
+        embed_task: asyncio.Task[list[float]] | None,
     ) -> tuple[list[Candidate], dict[str, IndexedFact]]:
         """Run the fact and note pools concurrently and turn their hits into candidates.
 
         Each pool has the deadline to itself; one that misses it is left out and the fetch is
         marked `deadline`, so the candidates of the pools that finished still rank. An index
         failure in any pool fails the fetch (`index_error`). An embedder failure costs the
-        vector and note pools only.
+        vector and note pools only. `embed_task` is the query's embedding, which stage 2
+        starts and owns because the need gate may decide on the same vector; None for a blank
+        query, which has no pools.
         """
         query = request.query_text
-        if not query.strip():
+        if embed_task is None or not query.strip():
             return [], {}
+        own_embedding = embed_task
         index = self._executors.index
-        model = self._executors.model
         limit = self._pool_size
-
-        embed_task = asyncio.ensure_future(
-            self._call(
-                model, self._embedder.generate_embedding, query, deadline=deadline, ledger=ledger
-            )
-        )
 
         async def fts() -> list[FactGroup]:
             return await self._call(
@@ -727,7 +824,7 @@ class MemoryFetcher:
 
         async def embedding() -> list[float] | None:
             try:
-                return await self._await(embed_task, deadline=deadline)
+                return await self._await(own_embedding, deadline=deadline)
             except _EMBEDDER_ERRORS as exc:
                 logger.warning(
                     "memory query embedding failed with %s; the vector and note pools are "
@@ -777,9 +874,13 @@ class MemoryFetcher:
         try:
             await asyncio.wait(tasks.values())
         finally:
-            for task in (*tasks.values(), embed_task):
+            # A closed gate cancels the pools; those already finished are read here so asyncio
+            # does not report their exceptions as never retrieved.
+            for task in tasks.values():
                 if not task.done():
                     task.cancel()
+                elif not task.cancelled():
+                    task.exception()
         found: dict[str, object] = {}
         for name, task in tasks.items():
             exc = task.exception()
@@ -792,8 +893,6 @@ class MemoryFetcher:
                 raise _IndexFailedError from exc
             else:
                 raise exc
-        if embed_task.done() and not embed_task.cancelled():
-            embed_task.exception()  # retrieved, so asyncio does not report it as never read
 
         query_anchors: list[FactGroup] = list(found.get(ENTITY_POOL, []))  # type: ignore[arg-type]
         seen = {group.fact_key for group in query_anchors}
@@ -966,6 +1065,115 @@ class MemoryFetcher:
         items.extend(lists)
         return items
 
+    # -- the need gate --------------------------------------------------------------------------
+
+    def _embed_query(self, text: str) -> list[float]:
+        """The fetch's own query embedding, on the model thread."""
+        lock = self._shared_embed_lock
+        if lock is None:
+            return self._embedder.generate_embedding(text)
+        with lock:
+            return self._embedder.generate_embedding(text)
+
+    def _gate_embed(self, gate: NeedGate, text: str) -> list[float]:
+        """One of the gate's own embeddings, on the gate thread."""
+        lock = self._shared_embed_lock
+        if lock is None:
+            return gate.embed_query(text)
+        with lock:
+            return gate.embed_query(text)
+
+    async def _decide_need(
+        self,
+        request: MemoryRequest,
+        own_embedding: asyncio.Task[list[float]],
+        deadline: float,
+        ledger: _Ledger,
+        *,
+        served: bool,
+    ) -> NeedTrace:
+        """The gate's decision for the turn, within the fetch's deadline.
+
+        The gate's vectors are submitted at once: the query's on the gate thread (or the
+        fetch's own vector, when the gate shares it), then the follow-up context's when the
+        session's last fetch served memory and the request carries a recent turn. The query
+        decides first. An open query never waits for the context, whose result is discarded;
+        a closed or band one waits for it and takes the higher probability and its band. A
+        vector that misses the deadline closes the gate as `deadline`, an embedder error or a
+        vector `decide` refuses as `need_unknown`.
+        """
+        gate = self._need_gate
+        if gate is None:
+            raise RuntimeError("the need gate is decided only when one is given")
+        query = request.query_text
+        mode = self._need_mode
+        executor = self._executors.gate
+        query_vector: asyncio.Future[list[float]] = (
+            own_embedding
+            if gate.shares_query_vector
+            else asyncio.ensure_future(
+                self._call(
+                    executor, self._gate_embed, gate, query, deadline=deadline, ledger=ledger
+                )
+            )
+        )
+        previous = _previous_turn(request) if self._need_context and served else None
+        context_vector: asyncio.Future[list[float]] | None = None
+        if previous is not None:
+            context_vector = asyncio.ensure_future(
+                self._call(
+                    executor,
+                    self._gate_embed,
+                    gate,
+                    context_text(previous, query),
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+            )
+        try:
+            try:
+                decision = gate.decide(await self._await(query_vector, deadline=deadline))
+            except _LateError:
+                return _degraded_need(gate, mode, "deadline", None)
+            except _EMBEDDER_ERRORS as exc:
+                logger.warning("memory need gate could not score the query: %s", exc)
+                return _degraded_need(gate, mode, "need_unknown", None)
+            if decision.band == "open" or context_vector is None:
+                return _need_trace(mode, decision, None)
+            try:
+                context = gate.decide(await self._await(context_vector, deadline=deadline))
+            except _LateError:
+                return _degraded_need(gate, mode, "deadline", decision)
+            except _EMBEDDER_ERRORS as exc:
+                logger.warning("memory need gate could not score the follow-up context: %s", exc)
+                return _degraded_need(gate, mode, "need_unknown", decision)
+            return _need_trace(mode, decision, context)
+        finally:
+            for vector in (query_vector, context_vector):
+                if vector is not None and vector is not own_embedding:
+                    if not vector.done():
+                        vector.cancel()
+                    elif not vector.cancelled():
+                        vector.exception()  # retrieved, so asyncio does not report it
+
+    def _closed(
+        self,
+        request: MemoryRequest,
+        started: float,
+        ledger: _Ledger,
+        reuse: PrefetchReuse,
+        need: NeedTrace,
+    ) -> FetchOutcome:
+        """The outcome of a fetch the `on` gate closed: skipped for `no_need`, or degraded."""
+        if need.degraded is None:
+            timings = self._timings(started, ledger, reuse)
+            return FetchOutcome(
+                result=self._skipped(request, "no_need", timings, reuse=reuse, need=need)
+            )
+        ledger.reasons.add(need.degraded)
+        reason = ledger.reason() or need.degraded
+        return self._empty(request, started, ledger, reason, reuse, need=need)
+
     # -- prefetch -------------------------------------------------------------------------------
 
     def _prefetch(self, session_id: str, partial_text: str | None) -> None:
@@ -1059,7 +1267,9 @@ class MemoryFetcher:
             )
             if state is not None:
                 return None
-            outcome = await self._stage2(request, stage1, deadline, started, ledger, "none")
+            outcome = await self._stage2(
+                request, stage1, deadline, started, ledger, "none", served=session.served
+            )
         except (_LateError, _GoneError, _IndexFailedError):
             return None
         except _CONTAINED_ERRORS as exc:
@@ -1187,9 +1397,15 @@ class MemoryFetcher:
         session.touched = now
         return session
 
-    def _remember(self, request: MemoryRequest) -> None:
-        """Keep what the session's next prefetch borrows: its words become a recent turn."""
+    def _remember(self, request: MemoryRequest, outcome: FetchOutcome) -> None:
+        """Keep what the session's next fetch and prefetch borrow.
+
+        The words become a recent turn, and whether the fetch served memory decides whether
+        the next one may be judged as its follow-up.
+        """
         session = self._session(request.session_id)
+        need = outcome.result.stage.need
+        session.served = need is not None and need.band in _SERVED_BANDS
         turns = (*request.recent_user_turns, request.query_text)
         session.context = _Context(
             conversation_id=request.conversation_id,
@@ -1227,6 +1443,8 @@ class MemoryFetcher:
         ledger: _Ledger,
         reason: DegradedReason,
         reuse: PrefetchReuse,
+        *,
+        need: NeedTrace | None = None,
     ) -> FetchOutcome:
         """A stage that ran but serves no block, for `reason`."""
         timings = self._timings(started, ledger, reuse)
@@ -1246,6 +1464,7 @@ class MemoryFetcher:
             narrative_suppressed=0,
             timings=timings,
             candidates=(),
+            need=need,
         )
         return FetchOutcome(
             result=MemoryResult(
@@ -1264,7 +1483,13 @@ class MemoryFetcher:
         )
 
     def _skipped(
-        self, request: MemoryRequest, reason: StageSkipReason, timings: FetchTimings
+        self,
+        request: MemoryRequest,
+        reason: StageSkipReason,
+        timings: FetchTimings,
+        *,
+        reuse: PrefetchReuse = "none",
+        need: NeedTrace | None = None,
     ) -> MemoryResult:
         """A stage that did not run, for `reason`; no block and no degradation."""
         budget = self._budget(request)
@@ -1277,12 +1502,13 @@ class MemoryFetcher:
             budget_tokens=budget,
             tokens=0,
             degraded_reason=None,
-            prefetch_reuse="none",
+            prefetch_reuse=reuse,
             reranked=0,
             suppressed=0,
             narrative_suppressed=0,
             timings=timings,
             candidates=(),
+            need=need,
         )
         return MemoryResult(
             items=(),
@@ -1315,6 +1541,65 @@ def jaccard(left: str, right: str) -> float:
 
 def _anchor_texts(turns: Sequence[str]) -> tuple[str, ...]:
     return tuple(text for text in turns[-ANCHOR_TURNS:] if text and text.strip())
+
+
+def _previous_turn(request: MemoryRequest) -> str | None:
+    """The last non-blank recent user turn, which a follow-up is judged by; None for none."""
+    for turn in reversed(request.recent_user_turns):
+        if turn and turn.strip():
+            return turn
+    return None
+
+
+def _need_trace(mode: NeedMode, query: NeedDecision, context: NeedDecision | None) -> NeedTrace:
+    """The turn's decision: the query's, or the context's when its probability is higher.
+
+    A higher probability never lowers the band, so the turn's band is the higher one's.
+    `context` marks a context that also moved the band; the nearest exemplars come from the
+    decision the probability came from.
+    """
+    chosen = query
+    moved = False
+    if context is not None and context.p > query.p:
+        chosen = context
+        moved = context.band != query.band
+    return NeedTrace(
+        mode=mode,
+        band=chosen.band,
+        p=chosen.p,
+        theta_low=chosen.theta_low,
+        theta_high=chosen.theta_high,
+        band_k=chosen.band_k,
+        need_ids=chosen.need_ids,
+        no_need_ids=chosen.no_need_ids,
+        context=moved,
+        context_p=None if context is None else context.p,
+        degraded=None,
+    )
+
+
+def _degraded_need(
+    gate: NeedGate, mode: NeedMode, reason: NeedDegraded, query: NeedDecision | None
+) -> NeedTrace:
+    """A closed decision for a gate vector that was late or failed.
+
+    It keeps the query's probability and exemplars when the query was decided and only the
+    follow-up context's vector failed; the thresholds are the gate model's.
+    """
+    model = gate.model
+    return NeedTrace(
+        mode=mode,
+        band="closed",
+        p=None if query is None else query.p,
+        theta_low=model.theta_low,
+        theta_high=model.theta_high,
+        band_k=model.band_k,
+        need_ids=() if query is None else query.need_ids,
+        no_need_ids=() if query is None else query.no_need_ids,
+        context=False,
+        context_p=None,
+        degraded=reason,
+    )
 
 
 def _serving(context: _Context) -> ServingProfile:
@@ -1398,6 +1683,7 @@ def _stage_candidate(
 
 
 __all__ = [
+    "GATE_EXECUTOR",
     "INDEX_EXECUTOR",
     "MODEL_EXECUTOR",
     "FactSearch",
