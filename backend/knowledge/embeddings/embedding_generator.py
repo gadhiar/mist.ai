@@ -5,11 +5,17 @@ Enables semantic search on the knowledge graph.
 """
 
 import logging
+from pathlib import Path
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+
+# Where the backend image bakes its pinned model copies (Dockerfile step 7,
+# `docker/backend/models.lock`). Read when a generator is constructed rather than
+# bound at import, so a test can point it elsewhere.
+DEFAULT_MODELS_ROOT = "/opt/models"
 
 
 class EmbeddingGenerator:
@@ -27,7 +33,13 @@ class EmbeddingGenerator:
         # Returns list of 384 floats
     """
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: str | None = None):
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        device: str | None = None,
+        *,
+        models_root: str | None = None,
+    ):
         """Initialize embedding generator.
 
         Args:
@@ -35,14 +47,20 @@ class EmbeddingGenerator:
                 Options:
                 - all-MiniLM-L6-v2 (default): Fast, 384d, good quality
                 - all-mpnet-base-v2: Slower, 768d, better quality
+                It stays the model's identity wherever the weights load from;
+                `compose_model_hash` stamps this name, not the load path.
             device: Torch device the model loads onto, such as `cpu`, `cuda`
                 or `cuda:1`. None lets sentence-transformers choose, which
                 means CUDA whenever it is available, so runtime callers pass
                 `config.embedding.resolved_device()` to keep the model where
                 `EMBEDDING_DEVICE` says.
+            models_root: Directory holding baked model copies, one
+                subdirectory per model name. None means `DEFAULT_MODELS_ROOT`,
+                the path the backend image bakes into.
         """
         self.model_name = model_name
         self.device = device
+        self.models_root = DEFAULT_MODELS_ROOT if models_root is None else models_root
         self._model = None
         logger.info(f"EmbeddingGenerator initialized with model: {model_name}, device: {device}")
 
@@ -50,11 +68,24 @@ class EmbeddingGenerator:
         """Lazy load the embedding model.
 
         Only loads model when first needed to save memory and startup time.
+        When `<models_root>/<model_name>` is a directory, the pinned copy the
+        image baked loads from it with `local_files_only=True`, so the load
+        needs no network. Anywhere else, such as outside the image, the model
+        loads by name as before. A `model_name` that is already an absolute
+        path also loads as given: `Path` joining would return it unchanged and
+        switch that caller to `local_files_only=True` without its asking.
         """
         if self._model is None:
-            logger.info(f"Loading embedding model: {self.model_name}")
-            self._model = SentenceTransformer(self.model_name, device=self.device)
-            logger.info("Embedding model loaded successfully")
+            local_path = Path(self.models_root) / self.model_name
+            if not Path(self.model_name).is_absolute() and local_path.is_dir():
+                self._model = SentenceTransformer(
+                    str(local_path), device=self.device, local_files_only=True
+                )
+                source = str(local_path)
+            else:
+                self._model = SentenceTransformer(self.model_name, device=self.device)
+                source = "its name"
+            logger.info(f"Embedding model {self.model_name} loaded from {source}")
         return self._model
 
     def warmup(self) -> None:

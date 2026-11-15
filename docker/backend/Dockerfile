@@ -133,9 +133,9 @@ RUN pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"
 # This block alone runs as root, because only root can create /opt/models; the weights stay
 # root-owned and read-only to appuser, so the runtime cannot alter them. Nothing is
 # installed here, and PYTHONDONTWRITEBYTECODE keeps root from leaving .pyc files in
-# appuser's venv. No global HF offline flag is set: the production embedder still loads
-# all-MiniLM-L6-v2 by name into the mist-hf-cache volume, and the reranker loads its path
-# with local_files_only=True.
+# appuser's venv. No global HF offline flag is set: the production embedder loads this
+# baked all-MiniLM-L6-v2 copy with local_files_only=True, and the reranker loads its path
+# the same way.
 USER root
 COPY docker/backend/models.lock scripts/check_models_lock.py /opt/models/
 RUN export PYTHONDONTWRITEBYTECODE=1 HF_HUB_DISABLE_TELEMETRY=1 \
