@@ -326,8 +326,10 @@ class PlaybackConfig:
     """Downlink pacing, the client's playback buffer, and the character stage before the pacer.
 
     `character` configures the stage every spoken reply passes through before it is framed.
-    None, the default here, leaves the engine's audio as it is; `load_voice_settings` sets
-    `CharacterConfig()` unless `MIST_VOICE_CHARACTER` is false.
+    None, the default here, leaves the engine's audio as it is. `load_voice_settings` sets None
+    when `MIST_VOICE_CHARACTER` is false; otherwise it sets a `CharacterConfig` whose
+    `double_gain` comes from `MIST_VOICE_CHARACTER_DOUBLE_GAIN` when that is set, with every
+    other field at its default.
     """
 
     client_prebuffer_ms: int = 80
