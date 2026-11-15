@@ -17,7 +17,10 @@ does not describe its query would move each of those numbers silently. This file
   block, each turn stating its whole list;
 - the probe authoring rules: availability at the probe's `now`, correction suppression, the
   lexical tag (judged against the text the index serves, a fact's `render_fact` sentence), and
-  the `list_item` and `type_scoped` shapes.
+  the `list_item` and `type_scoped` shapes;
+- the held-out probe set: every per-probe rule above, its own minimums, ids unique across both
+  probe files, and a cap on how close a held-out query may come to a dev query with the same
+  reference set.
 
 The segmentation here is written independently of any backend segmenter on purpose: it is the
 reference T17's segmenter must reproduce, so it must not share that segmenter's code. It depends
@@ -32,7 +35,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -84,6 +87,12 @@ SUMMARY_MAX_WORDS = 80
 BLOCK_CAP_TOKENS = 300
 NEW_SHAPE_MINIMUM = 12
 
+# The dev set every setting is chosen on, and the held-out set the read path's first PR is
+# judged on. The per-probe rules hold for both; the file-level counts are each file's own.
+DEV_PROBES = "probes.jsonl"
+HELDOUT_PROBES = "heldout_probes.jsonl"
+PROBE_FILES = (DEV_PROBES, HELDOUT_PROBES)
+
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -116,6 +125,17 @@ def fixture() -> Fixture:
     )
 
 
+@pytest.fixture(scope="module", params=PROBE_FILES)
+def probed(request: pytest.FixtureRequest, fixture: Fixture) -> Fixture:
+    """The corpus with one probe file's probes, so every per-probe rule runs on both files."""
+    return replace(fixture, probes=load_probes(FIXTURE_DIR / request.param))
+
+
+@pytest.fixture(scope="module")
+def heldout(fixture: Fixture) -> Fixture:
+    return replace(fixture, probes=load_probes(FIXTURE_DIR / HELDOUT_PROBES))
+
+
 def _first_row(name: str) -> dict[str, object]:
     line = (FIXTURE_DIR / name).read_text(encoding="utf-8").splitlines()[0]
     return json.loads(line)
@@ -127,7 +147,8 @@ PARSERS: list[tuple[str, Callable[[Mapping[str, object]], object]]] = [
     ("episodes.jsonl", parse_episode),
     ("vault_notes.jsonl", parse_vault_note),
     ("corrections.jsonl", parse_correction),
-    ("probes.jsonl", parse_probe),
+    (DEV_PROBES, parse_probe),
+    (HELDOUT_PROBES, parse_probe),
 ]
 
 
@@ -159,7 +180,7 @@ class TestSchemas:
             with pytest.raises(ValueError, match=key):
                 parse(partial)
 
-    def test_every_id_is_unique_within_its_file(self, fixture: Fixture) -> None:
+    def test_every_id_is_unique_within_its_file(self, fixture: Fixture, heldout: Fixture) -> None:
         for ids in (
             [f.row_key for f in fixture.facts],
             [t.event_id for t in fixture.turns],
@@ -167,6 +188,7 @@ class TestSchemas:
             [n.path for n in fixture.notes],
             [c.correction_id for c in fixture.corrections],
             [p.probe_id for p in fixture.probes],
+            [p.probe_id for p in heldout.probes],
         ):
             duplicates = [item for item, count in Counter(ids).items() if count > 1]
             assert duplicates == []
@@ -795,25 +817,25 @@ def _lexical_violation(probe: Probe, texts: dict[ItemRef, str]) -> str | None:
 
 
 class TestProbes:
-    def test_every_referenced_item_exists(self, fixture: Fixture) -> None:
-        texts = _item_texts(fixture)
-        for probe in fixture.probes:
+    def test_every_referenced_item_exists(self, probed: Fixture) -> None:
+        texts = _item_texts(probed)
+        for probe in probed.probes:
             for ref in (*probe.expected, *probe.acceptable, *probe.forbidden, *probe.distractors):
                 assert ref in texts, (probe.probe_id, ref)
 
-    def test_reference_lists_do_not_overlap(self, fixture: Fixture) -> None:
-        for probe in fixture.probes:
+    def test_reference_lists_do_not_overlap(self, probed: Fixture) -> None:
+        for probe in probed.probes:
             lists = [probe.expected, probe.acceptable, probe.forbidden, probe.distractors]
             flat = [ref for refs in lists for ref in refs]
             assert len(flat) == len(set(flat)), probe.probe_id
 
-    def test_probes_are_asked_after_the_history_closes(self, fixture: Fixture) -> None:
+    def test_probes_are_asked_after_the_history_closes(self, probed: Fixture) -> None:
         """Every conversation is idle past the gap, so every episode is closed and indexed."""
-        for probe in fixture.probes:
-            assert probe.now > fixture.history_end + CONVERSATION_GAP, probe.probe_id
+        for probe in probed.probes:
+            assert probe.now > probed.history_end + CONVERSATION_GAP, probe.probe_id
 
-    def test_kind_rules(self, fixture: Fixture) -> None:
-        corrections = {c.correction_id for c in fixture.corrections}
+    def test_kind_rules(self, probed: Fixture) -> None:
+        corrections = {c.correction_id for c in probed.corrections}
         expected_kinds = {
             "fact": {"fact"},
             "note": {"note"},
@@ -821,7 +843,7 @@ class TestProbes:
             "continuity": {"episode"},
             "temporal": {"episode"},
         }
-        for probe in fixture.probes:
+        for probe in probed.probes:
             if probe.kind == "noise":
                 assert not (probe.expected or probe.acceptable or probe.forbidden)
             if probe.kind == "correction":
@@ -833,64 +855,65 @@ class TestProbes:
                 assert probe.expected, probe.probe_id
                 assert {ref.kind for ref in probe.expected} <= expected_kinds[probe.kind]
 
-    def test_continuity_probes_open_a_conversation(self, fixture: Fixture) -> None:
-        for probe in fixture.probes:
+    def test_continuity_probes_open_a_conversation(self, probed: Fixture) -> None:
+        for probe in probed.probes:
             if probe.kind == "continuity":
                 assert probe.conversation_start, probe.probe_id
 
     def test_each_correction_has_one_probe(self, fixture: Fixture) -> None:
+        """A file-level rule of the dev set; the held-out set's correction probes are its own."""
         asked = Counter(p.correction_id for p in fixture.probes if p.kind == "correction")
 
         assert asked == Counter(c.correction_id for c in fixture.corrections)
 
-    def test_expected_and_acceptable_items_are_available_at_now(self, fixture: Fixture) -> None:
-        for probe in fixture.probes:
-            available = _available_at(fixture, probe.now)
+    def test_expected_and_acceptable_items_are_available_at_now(self, probed: Fixture) -> None:
+        for probe in probed.probes:
+            available = _available_at(probed, probe.now)
             for ref in (*probe.expected, *probe.acceptable):
                 assert ref in available, (probe.probe_id, ref)
 
     def test_correction_probes_forbid_everything_the_correction_suppresses(
-        self, fixture: Fixture
+        self, probed: Fixture
     ) -> None:
-        corrections = {c.correction_id: c for c in fixture.corrections}
+        corrections = {c.correction_id: c for c in probed.corrections}
         replacements = {
             f.source_correction_id: ItemRef("fact", f.fact_key)
-            for f in fixture.facts
+            for f in probed.facts
             if f.source_correction_id
         }
-        for probe in fixture.probes:
+        for probe in probed.probes:
             if probe.kind != "correction":
                 continue
             correction = corrections[probe.correction_id or ""]
             assert probe.now > correction.recorded_at, probe.probe_id
-            assert set(probe.forbidden) == _suppressed_by(fixture, correction), probe.probe_id
+            assert set(probe.forbidden) == _suppressed_by(probed, correction), probe.probe_id
             if correction.action == "correct":
                 assert replacements[correction.correction_id] in probe.expected
 
-    def test_no_probe_expects_an_item_a_prior_correction_suppresses(self, fixture: Fixture) -> None:
-        suppressions = [(c.recorded_at, _suppressed_by(fixture, c)) for c in fixture.corrections]
-        for probe in fixture.probes:
+    def test_no_probe_expects_an_item_a_prior_correction_suppresses(self, probed: Fixture) -> None:
+        suppressions = [(c.recorded_at, _suppressed_by(probed, c)) for c in probed.corrections]
+        for probe in probed.probes:
             for recorded_at, suppressed in suppressions:
                 if recorded_at < probe.now:
                     assert not suppressed & {*probe.expected, *probe.acceptable}, probe.probe_id
 
-    def test_list_item_probes_expect_every_sibling_of_one_utterance(self, fixture: Fixture) -> None:
+    def test_list_item_probes_expect_every_sibling_of_one_utterance(self, probed: Fixture) -> None:
         """Recall on a list probe measures how much of one list survives the block cap."""
         lists = {
             frozenset(ItemRef("fact", fact.fact_key) for fact in facts)
-            for facts in _sibling_groups(fixture).values()
+            for facts in _sibling_groups(probed).values()
         }
-        for probe in fixture.probes:
+        for probe in probed.probes:
             if probe.shape == "list_item":
                 assert probe.kind == "fact", probe.probe_id
                 assert frozenset(probe.expected) in lists, probe.probe_id
 
-    def test_type_scoped_probes_name_a_type_not_an_entity(self, fixture: Fixture) -> None:
+    def test_type_scoped_probes_name_a_type_not_an_entity(self, probed: Fixture) -> None:
         """A type-scoped probe expects every served fact of one object type for its subject and
         relation, and its query names none of those objects, so only the type can find them.
         """
-        rows = {fact.fact_key: fact for fact in fixture.facts}
-        for probe in fixture.probes:
+        rows = {fact.fact_key: fact for fact in probed.facts}
+        for probe in probed.probes:
             if probe.shape != "type_scoped":
                 continue
             assert probe.kind == "fact" and probe.expected, probe.probe_id
@@ -901,16 +924,16 @@ class TestProbes:
             for fact in facts:
                 assert not _whole_word(fact.object_name, probe.query), (probe.probe_id, fact)
             suppressed: set[ItemRef] = set()
-            for correction in fixture.corrections:
+            for correction in probed.corrections:
                 if correction.recorded_at < probe.now:
-                    suppressed |= _suppressed_by(fixture, correction)
+                    suppressed |= _suppressed_by(probed, correction)
             scopes = {(fact.subject_id, fact.relation) for fact in facts}
             in_scope = {
                 ItemRef("fact", fact.fact_key)
-                for fact in fixture.facts
+                for fact in probed.facts
                 if (fact.subject_id, fact.relation) in scopes and fact.object_type in types
             }
-            served = (in_scope & _available_at(fixture, probe.now)) - suppressed
+            served = (in_scope & _available_at(probed, probe.now)) - suppressed
             assert set(probe.expected) == served, probe.probe_id
 
     def test_a_fact_is_judged_by_its_rendered_sentence(self, fixture: Fixture) -> None:
@@ -924,12 +947,169 @@ class TestProbes:
         assert "Wren prefers cortado since 12 January 2026." in text
         assert "usual coffee order" not in text
 
-    def test_lexical_tags_describe_the_query(self, fixture: Fixture) -> None:
-        texts = _item_texts(fixture)
+    def test_lexical_tags_describe_the_query(self, probed: Fixture) -> None:
+        texts = _item_texts(probed)
         violations = {
             probe.probe_id: problem
-            for probe in fixture.probes
+            for probe in probed.probes
             if (problem := _lexical_violation(probe, texts)) is not None
         }
 
         assert violations == {}
+
+
+# ---------------------------------------------------------------------------
+# Held-out probes
+# ---------------------------------------------------------------------------
+
+# The held-out fact minimums (plan task T54). The corpus fixes the targets of a list or a
+# type-scoped probe, so only the wording separates such a probe from its dev twin.
+HELDOUT_FACT_MINIMUM = 69
+HELDOUT_FACT_PARAPHRASE_MINIMUM = 49
+HELDOUT_PLAIN_MINIMUM = 43
+HELDOUT_PLAIN_PARAPHRASE_MINIMUM = 27
+HELDOUT_LIST_PROBES_PER_LIST = 3
+HELDOUT_LIST_PARAPHRASE_MINIMUM = 8
+HELDOUT_TYPE_SCOPED_MINIMUM = 14
+# Shared content stems over their union, between a held-out query and a dev query that share a
+# reference set. Above this, a held-out probe re-asks a dev probe and measures nothing new.
+MAX_QUERY_OVERLAP = 0.5
+
+
+def _reference_set(probe: Probe) -> frozenset[ItemRef]:
+    """The items the lexical tag is judged against: the expected ones, else the forbidden."""
+    return frozenset(probe.expected or probe.forbidden)
+
+
+def _query_stems(probe: Probe) -> set[str]:
+    return {_stem(token) for token in _content_tokens(probe.query)}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    union = a | b
+    return len(a & b) / len(union) if union else 1.0
+
+
+def _overlap_failures(
+    heldout_probes: tuple[Probe, ...], dev_probes: tuple[Probe, ...]
+) -> list[str]:
+    """One message per held-out and dev pair whose queries overlap past the cap.
+
+    A pair is compared when both probes have the same reference set, or both are noise. A
+    message names the two ids and the overlap and never a query or a stem, so fixing a failure
+    does not mean reading the dev query.
+    """
+    failures = []
+    for held in heldout_probes:
+        reference = _reference_set(held)
+        for dev in dev_probes:
+            both_noise = held.kind == dev.kind == "noise"
+            if not (both_noise or (reference and reference == _reference_set(dev))):
+                continue
+            overlap = _jaccard(_query_stems(held), _query_stems(dev))
+            if overlap > MAX_QUERY_OVERLAP:
+                failures.append(
+                    f"{held.probe_id} and {dev.probe_id} overlap {overlap:.2f} "
+                    f"(cap {MAX_QUERY_OVERLAP})"
+                )
+    return failures
+
+
+def _made_up_probe(probe_id: str, query: str, expected: tuple[ItemRef, ...]) -> Probe:
+    return Probe(
+        probe_id=probe_id,
+        kind="fact",
+        lexical=False,
+        query=query,
+        now=datetime(2026, 3, 16, tzinfo=UTC),
+        conversation_start=True,
+        expected=expected,
+        acceptable=(),
+        forbidden=(),
+        distractors=(),
+        correction_id=None,
+        rationale="",
+    )
+
+
+class TestHeldOutProbes:
+    def test_probe_ids_are_unique_across_both_files(self, heldout: Fixture) -> None:
+        """A run file keys its records by probe id, so one id in both sets would merge them."""
+        dev_ids = {probe.probe_id for probe in load_probes(FIXTURE_DIR / DEV_PROBES)}
+        heldout_ids = {probe.probe_id for probe in heldout.probes}
+
+        assert dev_ids & heldout_ids == set()
+
+    def test_probe_ids_name_the_heldout_set_and_their_kind(self, heldout: Fixture) -> None:
+        for probe in heldout.probes:
+            assert re.fullmatch(rf"ho-{probe.kind}-\d{{2,}}", probe.probe_id), probe.probe_id
+
+    def test_fact_probe_minimums(self, heldout: Fixture) -> None:
+        facts = [probe for probe in heldout.probes if probe.kind == "fact"]
+        plain = [probe for probe in facts if probe.shape == "plain"]
+        list_items = [probe for probe in facts if probe.shape == "list_item"]
+        type_scoped = [probe for probe in facts if probe.shape == "type_scoped"]
+
+        assert len(facts) >= HELDOUT_FACT_MINIMUM
+        assert sum(not p.lexical for p in facts) >= HELDOUT_FACT_PARAPHRASE_MINIMUM
+        assert len(plain) >= HELDOUT_PLAIN_MINIMUM
+        assert sum(not p.lexical for p in plain) >= HELDOUT_PLAIN_PARAPHRASE_MINIMUM
+        assert sum(not p.lexical for p in list_items) >= HELDOUT_LIST_PARAPHRASE_MINIMUM
+        assert len(type_scoped) >= HELDOUT_TYPE_SCOPED_MINIMUM
+        assert all(not p.lexical for p in type_scoped), "every type-scoped probe is a paraphrase"
+
+    def test_each_list_utterance_has_three_list_probes(self, heldout: Fixture) -> None:
+        lists = {
+            frozenset(ItemRef("fact", fact.fact_key) for fact in facts)
+            for facts in _list_utterances(heldout).values()
+        }
+        asked = Counter(
+            frozenset(probe.expected) for probe in heldout.probes if probe.shape == "list_item"
+        )
+
+        assert set(asked) == lists
+        assert set(asked.values()) == {HELDOUT_LIST_PROBES_PER_LIST}
+
+    def test_no_query_re_asks_a_dev_probe(self) -> None:
+        """A held-out probe with a dev probe's reference set, or any two noise probes, must
+        differ in wording: their content stems overlap by at most half their union.
+
+        The failure names the pair and the overlap, not the dev query, so fixing it means
+        rewording the held-out probe without reading the dev set. Both files are loaded inside
+        the call, so no probe row is a local of this frame (pytest runs with `--showlocals`).
+        """
+        failures = _overlap_failures(
+            load_probes(FIXTURE_DIR / HELDOUT_PROBES), load_probes(FIXTURE_DIR / DEV_PROBES)
+        )
+
+        assert not failures, "; ".join(failures)
+
+    def test_an_overlap_failure_names_the_ids_and_the_figure_not_the_words(self) -> None:
+        """Fixing a failure must not mean reading the dev query, so the message carries neither
+        query nor any of their stems.
+        """
+        fact = ItemRef("fact", "k1")
+        held = _made_up_probe("ho-fact-98", "quartz lantern meadow", (fact,))
+        dev = _made_up_probe("fact-98", "quartz lantern meadow river", (fact,))
+
+        message = "; ".join(_overlap_failures((held,), (dev,)))
+
+        assert "ho-fact-98" in message
+        assert "fact-98" in message.replace("ho-fact-98", "")
+        assert "0.75" in message
+        for word in ("quartz", "lantern", "meadow", "river"):
+            assert word not in message
+
+    def test_the_overlap_cap_reads_reference_sets_and_crude_stems(self) -> None:
+        """A forget probe's reference set is its forbidden items, and an inflection is no
+        rewording: "bicycles" and "bicycle" share a stem.
+        """
+        fact = ItemRef("fact", "k1")
+        other = ItemRef("fact", "k2")
+        base = _made_up_probe("x", "which red bicycle", (fact,))
+        forget = replace(base, kind="correction", expected=(), forbidden=(fact,))
+
+        assert _reference_set(base) == _reference_set(forget) == frozenset({fact})
+        assert _reference_set(replace(base, expected=(other,))) != _reference_set(base)
+        reworded = replace(base, query="red bicycles bell")
+        assert _jaccard(_query_stems(base), _query_stems(reworded)) == 2 / 3
