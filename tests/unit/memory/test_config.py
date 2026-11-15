@@ -15,6 +15,7 @@ import backend.user_timezone as user_timezone
 from backend.errors import MemoryConfigError, MistError
 from backend.memory.config import MEMORY_ENV_VARS, RETIRED_MEMORY_ENV_VARS, MemoryConfig
 from backend.memory.models import ServingProfile
+from backend.memory.retrieval_view import DEFAULT_FACT_VIEW, FACT_VIEWS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -87,6 +88,11 @@ class TestDefaults:
         assert config.rescan_interval_s == 300
         assert config.tz is UTC
         assert config.tz_name is None
+        assert config.fact_view == "F3"
+
+    def test_the_fact_view_default_is_the_index_default(self):
+        # Two literals, kept equal: the index's own default and the setting's.
+        assert MemoryConfig().fact_view == DEFAULT_FACT_VIEW
 
     def test_is_frozen(self):
         config = MemoryConfig()
@@ -119,6 +125,7 @@ class TestFromEnv:
             "MIST_MEMORY_BLOCK_TOKENS_LOW": "120",
             "MIST_MEMORY_LIST_MAX_ITEMS": "6",
             "MIST_MEMORY_RESCAN_INTERVAL_S": "45",
+            "MIST_MEMORY_FACT_VIEW": "F2",
         }
         for name, value in values.items():
             monkeypatch.setenv(name, value)
@@ -148,6 +155,7 @@ class TestFromEnv:
         assert config.block_tokens_low == 120
         assert config.list_max_items == 6
         assert config.rescan_interval_s == 45
+        assert config.fact_view == "F2"
 
     def test_a_blank_variable_counts_as_unset(self, monkeypatch):
         """Compose passes `${VAR:-}` through as an empty string, which must mean the default."""
@@ -360,6 +368,9 @@ class TestValidation:
             ({"list_max_items": 1}, "list_max_items"),
             ({"list_max_items": 26}, "list_max_items"),
             ({"rescan_interval_s": 29}, "rescan_interval_s"),
+            ({"fact_view": "F4"}, "fact_view"),
+            ({"fact_view": "f3"}, "fact_view"),
+            ({"fact_view": "N0"}, "fact_view"),
         ],
     )
     def test_rejects_invalid_values(self, overrides, fragment):
@@ -418,6 +429,16 @@ class TestValidation:
         monkeypatch.setenv("MIST_MEMORY_RERANK_BACKEND", "remote")
 
         with pytest.raises(MemoryConfigError, match="rerank_url"):
+            MemoryConfig.from_env(tz_resolver=_never_called)
+
+    @pytest.mark.parametrize("view", list(FACT_VIEWS))
+    def test_every_fact_view_is_accepted(self, view):
+        assert MemoryConfig(fact_view=view).fact_view == view
+
+    def test_from_env_rejects_an_unknown_fact_view(self, monkeypatch):
+        monkeypatch.setenv("MIST_MEMORY_FACT_VIEW", "F9")
+
+        with pytest.raises(MemoryConfigError, match="fact_view"):
             MemoryConfig.from_env(tz_resolver=_never_called)
 
     @pytest.mark.parametrize(
@@ -586,6 +607,7 @@ class TestEnvExampleDocumentsEveryVariable:
         assert int(documented["MIST_MEMORY_BLOCK_TOKENS_LOW"]) == defaults.block_tokens_low
         assert int(documented["MIST_MEMORY_LIST_MAX_ITEMS"]) == defaults.list_max_items
         assert int(documented["MIST_MEMORY_RESCAN_INTERVAL_S"]) == defaults.rescan_interval_s
+        assert documented["MIST_MEMORY_FACT_VIEW"] == defaults.fact_view
 
     def test_retired_variables_are_not_documented(self):
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")

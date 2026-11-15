@@ -17,6 +17,7 @@ from backend.memory.facets import FacetSpec, facet_key
 from backend.memory.fact_render import FACT_TEMPLATES, render_fact
 from backend.memory.models import FactRow
 from backend.memory.retrieval_view import (
+    DEFAULT_FACT_VIEW,
     FACT_VIEWS,
     NOTE_VIEWS,
     SECOND_PERSON_TEMPLATES,
@@ -97,6 +98,10 @@ class TestSpecs:
         assert FACT_VIEWS["F3"] == ViewSpec("F3", True, True, False)
         for key, spec in FACT_VIEWS.items():
             assert spec.id == key
+
+    def test_the_default_fact_view_is_f3(self):
+        assert DEFAULT_FACT_VIEW == "F3"
+        assert DEFAULT_FACT_VIEW in FACT_VIEWS
 
     def test_note_views_are_n0_and_n1(self):
         assert {"N0": NoteViewSpec("N0", False), "N1": NoteViewSpec("N1", True)} == NOTE_VIEWS

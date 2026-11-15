@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from backend.knowledge.seed.models import SeedDocument
     from backend.memory.fact_index import DiffReport
     from backend.memory.fact_source import QueryExecutor
+    from backend.memory.retrieval_view import ViewSpec
 
 # Make `backend` importable when running from the host (mist-ai is not pip-installed).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2671,14 +2672,17 @@ async def rebuild_fact_index(
     index_path: str | Path,
     embedding_model_id: str,
     tz: tzinfo,
+    view: ViewSpec,
     debounce_s: float,
     rescan_interval_s: float,
 ) -> FactRebuildResult:
     """Drop the fact tables of `index_path` and refill them from the graph.
 
     The refill is one `FactIndexRefresher.refresh()`, the full rescan and diff the live
-    refresher runs, into the emptied tables, so the rows equal the ones live refreshes build;
-    the refresher then completes the rebuild state `_drop_fact_tables` set. Between the drop
+    refresher runs, into the emptied tables, so the rows equal the ones live refreshes build
+    under the same fact `view`; the refresher then completes the rebuild state
+    `_drop_fact_tables` set. `view` is required so the rebuild cannot embed a view other than
+    the configured one by default. Between the drop
     and that completion the index serves no facts. A running server's refresher may write the
     same rows meanwhile: both write the graph's current facts, and SQLite serialises the
     writes.
@@ -2697,7 +2701,7 @@ async def rebuild_fact_index(
         dropped = _drop_fact_tables(writer, embedding_model_id)
         reader = open_reader(index_path, embedding_model_id=embedding_model_id)
         try:
-            index = FactIndex(writer, embedder, tz=tz, reader=reader)
+            index = FactIndex(writer, embedder, tz=tz, reader=reader, view=view)
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-index") as pool:
                 refresher = FactIndexRefresher(
                     GraphFactSource(executor),
@@ -2731,6 +2735,7 @@ def cmd_memory_index_rebuild(args: argparse.Namespace) -> int:
     on a usage error before this runs.
     """
     from backend.errors import MistError
+    from backend.memory.retrieval_view import FACT_VIEWS
 
     be = _load_backend()
     config = be.get_config()
@@ -2753,6 +2758,7 @@ def cmd_memory_index_rebuild(args: argparse.Namespace) -> int:
                 index_path=index_path,
                 embedding_model_id=config.embedding.model_name,
                 tz=config.memory.tz,
+                view=FACT_VIEWS[config.memory.fact_view],
                 debounce_s=config.memory.refresh_debounce_s,
                 rescan_interval_s=config.memory.rescan_interval_s,
             )

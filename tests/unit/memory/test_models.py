@@ -557,6 +557,30 @@ class TestFactRowAndCandidate:
 
         assert candidate.when_is_day is False
 
+    def test_a_candidate_has_no_view_text_unless_given_one(self):
+        item = _fact_item()
+        plain = Candidate(
+            kind="fact",
+            item_id=item.item_id,
+            text=item.text,
+            when=item.when,
+            source=item.source,
+            ranks={"fts": 1},
+        )
+        viewed = Candidate(
+            kind="fact",
+            item_id=item.item_id,
+            text=item.text,
+            when=item.when,
+            source=item.source,
+            ranks={"fts": 1},
+            view_text="You use Python (technology).",
+        )
+
+        assert plain.view_text is None
+        assert viewed.view_text == "You use Python (technology)."
+        assert viewed.text == item.text
+
     def test_candidate_kind_must_match_source(self):
         with pytest.raises(ValueError, match="source"):
             Candidate(

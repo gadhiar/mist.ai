@@ -22,11 +22,12 @@ a partial index never opens as valid.
 Tables:
 
 - `facts`: one row per latest-belief fact version, keyed by `row_key` and grouped by
-  `fact_key` when read, with the subject's and object's entity types. `id` is the rowid the
-  two mirrors share; `idx_facts_siblings` serves `FactIndex.siblings`.
-- `facts_fts`: FTS5 over the rendered text, the subject and object names, and the type terms
+  `fact_key` when read, with the subject's and object's entity types, the served text and the
+  fact view (`view_text`, retrieval_view.py) the index embeds. `id` is the rowid the two
+  mirrors share; `idx_facts_siblings` serves `FactIndex.siblings`.
+- `facts_fts`: FTS5 over the served text, the subject and object names, and the type terms
   of both entity types (`type_terms.type_terms_text`), each stored in `fts.fold` form.
-- `facts_vec`: sqlite-vec `vec0` table of the rendered text's embedding, cosine distance.
+- `facts_vec`: sqlite-vec `vec0` table of the view text's embedding, cosine distance.
 - `index_meta`: `schema_version`, `embedding_model_id`, the rebuild state and its target
   versions while a rebuild runs, and the refresh watermarks.
 
@@ -56,7 +57,8 @@ from .models import DegradedReason
 logger = logging.getLogger(__name__)
 
 # 2: `facts.subject_type`, `facts.object_type`, `facts_fts.type_terms`, `idx_facts_siblings`.
-SCHEMA_VERSION = 2
+# 3: `facts.view_text`, the fact view `facts_vec` holds the embedding of.
+SCHEMA_VERSION = 3
 EMBEDDING_DIMENSION = 384  # all-MiniLM-L6-v2, the embedder the vault sidecar also uses
 
 META_SCHEMA_VERSION = "schema_version"
@@ -102,7 +104,8 @@ FACTS_DDL: tuple[str, ...] = (
         recorded_at         TEXT,
         confidence          REAL NOT NULL,
         source_utterance_id TEXT,
-        content_hash        TEXT NOT NULL
+        content_hash        TEXT NOT NULL,
+        view_text           TEXT NOT NULL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key)",
