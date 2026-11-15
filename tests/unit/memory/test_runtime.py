@@ -13,9 +13,12 @@ import pytest
 from backend.errors import MemoryIndexError
 from backend.knowledge.config import EventStoreConfig
 from backend.memory.config import MemoryConfig
-from backend.memory.fetcher import INDEX_EXECUTOR, MODEL_EXECUTOR
+from backend.memory.fetcher import GATE_EXECUTOR, INDEX_EXECUTOR, MODEL_EXECUTOR
 from backend.memory.index_db import STATE_REBUILDING, open_index, set_meta, write_transaction
 from backend.memory.runtime import (
+    GATE_THREADS,
+    INDEX_THREADS,
+    MODEL_THREADS,
     IndexStateProbe,
     MemoryRuntime,
     build_memory_executors,
@@ -133,19 +136,40 @@ def test_mark_dirty_is_synchronous_and_only_marks_the_refresher(
 def test_the_executors_are_named_and_sized(runtime: MemoryRuntime) -> None:
     executors = runtime.executors_by_name
 
-    assert set(executors) == {INDEX_EXECUTOR, MODEL_EXECUTOR}
-    assert executors[INDEX_EXECUTOR]._max_workers == 2
-    assert executors[MODEL_EXECUTOR]._max_workers == 1
+    assert set(executors) == {INDEX_EXECUTOR, MODEL_EXECUTOR, GATE_EXECUTOR}
+    assert executors[INDEX_EXECUTOR]._max_workers == INDEX_THREADS == 2
+    assert executors[MODEL_EXECUTOR]._max_workers == MODEL_THREADS == 1
+    assert executors[GATE_EXECUTOR]._max_workers == GATE_THREADS == 1
     assert _ran_on(runtime, MODEL_EXECUTOR).startswith("memory-model")
+    assert _ran_on(runtime, GATE_EXECUTOR).startswith("memory-gate")
     assert runtime.executors.index is executors[INDEX_EXECUTOR]
     assert runtime.executors.model is executors[MODEL_EXECUTOR]
+    assert runtime.executors.gate is executors[GATE_EXECUTOR]
 
 
-def test_a_runtime_needs_both_executors(refresher: FakeRefresher) -> None:
+def test_the_gate_executor_is_its_own_thread(runtime: MemoryRuntime) -> None:
+    """The gate's embeddings never queue behind the cross-encoder on the model thread."""
+    hold = threading.Event()
+    executors = runtime.executors
+    held = executors.model.submit(hold.wait, 5)
+    try:
+        name = executors.gate.submit(lambda: threading.current_thread().name).result(timeout=5)
+    finally:
+        hold.set()
+        held.result(timeout=5)
+
+    assert name.startswith("memory-gate")
+
+
+@pytest.mark.parametrize("missing", [MODEL_EXECUTOR, GATE_EXECUTOR])
+def test_a_runtime_needs_every_executor(refresher: FakeRefresher, missing: str) -> None:
     executors = build_memory_executors()
     try:
-        with pytest.raises(ValueError, match="memory-model"):
-            MemoryRuntime(refresher, {INDEX_EXECUTOR: executors[INDEX_EXECUTOR]})  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match=missing):
+            MemoryRuntime(
+                refresher,  # type: ignore[arg-type]
+                {name: pool for name, pool in executors.items() if name != missing},
+            )
     finally:
         for executor in executors.values():
             executor.shutdown(wait=True)

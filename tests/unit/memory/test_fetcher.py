@@ -14,9 +14,11 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,8 +28,10 @@ from backend.memory.block import HEADER, MemoryBlockBuilder
 from backend.memory.config import MemoryConfig
 from backend.memory.fact_index import FactGroup, FactIndex, IndexedFact
 from backend.memory.fetcher import (
+    _DEGRADED_PRIORITY,
     STAGE_CANDIDATE_CAP,
     FetcherExecutors,
+    FetchOutcome,
     MemoryFetcher,
     SystemClock,
     jaccard,
@@ -38,10 +42,12 @@ from backend.memory.models import (
     Candidate,
     FactRow,
     MemoryRequest,
+    NeedTrace,
     NoteSource,
     ServingProfile,
     fact_key,
 )
+from backend.memory.need_gate import NeedDecision, context_text
 from backend.memory.rerank import NullReranker
 from tests.fakes.memory_fakes import FakeClock, FakeEmbedder, FakeReranker, FakeTokenCounter
 
@@ -224,9 +230,10 @@ def index(fact_index: FactIndex) -> HookedIndex:
 def executors() -> Iterator[FetcherExecutors]:
     index_pool = ThreadPoolExecutor(2, thread_name_prefix="memory-index")
     model_pool = ThreadPoolExecutor(1, thread_name_prefix="memory-model")
-    yield FetcherExecutors(index=index_pool, model=model_pool)
-    index_pool.shutdown(wait=True, cancel_futures=True)
-    model_pool.shutdown(wait=True, cancel_futures=True)
+    gate_pool = ThreadPoolExecutor(1, thread_name_prefix="memory-gate")
+    yield FetcherExecutors(index=index_pool, model=model_pool, gate=gate_pool)
+    for pool in (index_pool, model_pool, gate_pool):
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 @pytest.fixture
@@ -261,6 +268,9 @@ def _fetcher(
     notes: StaticNotes | None = None,
     suppression: StaticSuppression | None = None,
     pool_size: int = 20,
+    need_gate: object | None = None,
+    need_mode: str = "on",
+    need_context: bool = True,
 ) -> MemoryFetcher:
     config = config or _config()
     return MemoryFetcher(
@@ -277,6 +287,9 @@ def _fetcher(
         notes=notes,
         suppression=suppression,
         pool_size=pool_size,
+        need_gate=need_gate,  # type: ignore[arg-type]
+        need_mode=need_mode,  # type: ignore[arg-type]
+        need_context=need_context,
     )
 
 
@@ -637,8 +650,9 @@ async def test_queue_wait_is_recorded(fact_index: FactIndex, index: HookedIndex)
     fact_index.upsert([_fact("Tidewater Survey")])
     index_pool = ThreadPoolExecutor(1, thread_name_prefix="memory-index")
     model_pool = ThreadPoolExecutor(1, thread_name_prefix="memory-model")
+    gate_pool = ThreadPoolExecutor(1, thread_name_prefix="memory-gate")
     try:
-        executors = FetcherExecutors(index=index_pool, model=model_pool)
+        executors = FetcherExecutors(index=index_pool, model=model_pool, gate=gate_pool)
         index_pool.submit(time.sleep, 0.1)  # earlier work holding the only index thread
 
         result = await _fetcher(index, executors, clock=SystemClock()).fetch(
@@ -647,6 +661,7 @@ async def test_queue_wait_is_recorded(fact_index: FactIndex, index: HookedIndex)
     finally:
         index_pool.shutdown(wait=True)
         model_pool.shutdown(wait=True)
+        gate_pool.shutdown(wait=True)
 
     assert result.timings.queue_wait_ms >= 50.0
     assert result.timings.total_ms >= result.timings.queue_wait_ms / 2
@@ -897,6 +912,9 @@ async def test_a_running_prefetch_past_the_deadline_gives_a_deadline_result(
     await fetcher.prefetch("s1", _QUERY)
 
     result = await fetcher.fetch(_request(_QUERY, turns=turns))
+    # Let the prefetch finish on this loop, so none of its tasks outlives the test.
+    release.set()
+    await _settle()
 
     assert result.degraded_reason == "deadline" and result.items == ()
 
@@ -1027,6 +1045,723 @@ async def test_a_prefetch_finished_after_invalidate_is_not_kept(
     result = await fetcher.fetch(_request(_QUERY, turns=turns))
 
     assert result.stage.prefetch_reuse != "block"
+
+
+# -- the need gate ----------------------------------------------------------------------------
+
+_THETA_LOW = 0.3
+_THETA_HIGH = 0.6
+_TIMER = "set a timer for ten minutes"
+_FIRST = "where does the user work these days"
+_FOLLOW = "and her sister"
+_CONTEXT = context_text(_FIRST, _FOLLOW)
+_NEED_IDS = ("a-need-001", "b-need-002")
+_NO_NEED_IDS = ("a-no-need-001", "b-no-need-002")
+
+
+class FakeGate:
+    """`NeedGate`'s attributes and calls with scripted probabilities, no bank and no model file.
+
+    A vector's probability is the scripted one of the text whose FakeEmbedder vector it is,
+    else `default`; FakeEmbedder is deterministic, so an unrecorded twin computes the keys.
+    `embedded` records each `embed_query` text with the thread it ran on, `decided` each
+    probability `decide` returned.
+    """
+
+    def __init__(
+        self,
+        scores: dict[str, float] | None = None,
+        *,
+        default: float = 0.9,
+        shares_query_vector: bool = False,
+        embedder: object | None = None,
+        events: list[str] | None = None,
+        refuse: bool = False,
+        before_decide: Callable[[], None] | None = None,
+    ) -> None:
+        self.embedder = embedder if embedder is not None else FakeEmbedder()
+        self.shares_query_vector = shares_query_vector
+        self.query_prefix = ""
+        self.model = SimpleNamespace(theta_low=_THETA_LOW, theta_high=_THETA_HIGH, band_k=1)
+        twin = FakeEmbedder()
+        self._scores = {
+            tuple(twin.generate_embedding(text)): p for text, p in (scores or {}).items()
+        }
+        self.default = default
+        self.events = events
+        self.refuse = refuse
+        self.before_decide = before_decide
+        self.embedded: list[tuple[str, str]] = []
+        self.decided: list[float] = []
+
+    def embed_query(self, text: str) -> list[float]:
+        self.embedded.append((text, threading.current_thread().name))
+        return self.embedder.generate_embedding(self.query_prefix + text)  # type: ignore[attr-defined]
+
+    def decide(self, vector: Sequence[float]) -> NeedDecision:
+        if self.refuse:
+            raise ValueError("a query vector of length 3; the bank's vectors have length 384")
+        if self.before_decide is not None:
+            self.before_decide()
+        p = self._scores.get(tuple(vector), self.default)
+        self.decided.append(p)
+        if self.events is not None:
+            self.events.append("decide")
+        band = "closed" if p < _THETA_LOW else "band" if p < _THETA_HIGH else "open"
+        return NeedDecision(
+            band=band,  # type: ignore[arg-type]
+            p=p,
+            theta_low=_THETA_LOW,
+            theta_high=_THETA_HIGH,
+            band_k=1,
+            need_ids=_NEED_IDS,
+            no_need_ids=_NO_NEED_IDS,
+        )
+
+    def texts(self) -> list[str]:
+        return [text for text, _ in self.embedded]
+
+
+class WrappingEmbedder:
+    """Another object around the same model, as the harness's `--trace` wraps the embedder."""
+
+    def __init__(self, inner: FakeEmbedder) -> None:
+        self.inner = inner
+        self.calls = 0
+
+    def generate_embedding(self, text: str) -> list[float]:
+        self.calls += 1
+        return self.inner.generate_embedding(text)
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return self.inner.generate_embeddings(texts)
+
+
+class HookedEmbedder(FakeEmbedder):
+    """A FakeEmbedder that runs `hook(text)` before embedding a text `applies(text)` selects."""
+
+    def __init__(
+        self, hook: Callable[[str], None], applies: Callable[[str], bool] = lambda _: True
+    ) -> None:
+        super().__init__()
+        self.hook = hook
+        self.applies = applies
+
+    def generate_embedding(self, text: str) -> list[float]:
+        if self.applies(text):
+            self.hook(text)
+        return super().generate_embedding(text)
+
+
+class FailingOn(FakeEmbedder):
+    """Raises the production embedder's error for a text `applies(text)` selects."""
+
+    def __init__(self, applies: Callable[[str], bool] = lambda _: True) -> None:
+        super().__init__()
+        self.applies = applies
+
+    def generate_embedding(self, text: str) -> list[float]:
+        if self.applies(text):
+            raise EmbeddingError("embedder down")
+        return super().generate_embedding(text)
+
+
+class RecordingExecutor(Executor):
+    """Records each submission by the executor's name in a shared event list."""
+
+    def __init__(self, inner: Executor, name: str, events: list[str]) -> None:
+        self.inner = inner
+        self.name = name
+        self.events = events
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:  # type: ignore[no-untyped-def]
+        self.events.append(self.name)
+        return self.inner.submit(fn, *args, **kwargs)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        """The fixture owns the inner executor."""
+
+
+def _is_context(text: str) -> bool:
+    return "\n" in text
+
+
+def _without_need(outcome: FetchOutcome) -> FetchOutcome:
+    result = outcome.result
+    return replace(outcome, result=replace(result, stage=replace(result.stage, need=None)))
+
+
+def _trace(band: str, p: float | None, **overrides: object) -> NeedTrace:
+    values: dict[str, object] = {
+        "mode": "on",
+        "band": band,
+        "p": p,
+        "theta_low": _THETA_LOW,
+        "theta_high": _THETA_HIGH,
+        "band_k": 1,
+        "need_ids": _NEED_IDS,
+        "no_need_ids": _NO_NEED_IDS,
+        "context": False,
+        "context_p": None,
+        "degraded": None,
+    }
+    values.update(overrides)
+    return NeedTrace(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_gate_serves_no_block_and_makes_no_rerank_call(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    reranker = FakeReranker()
+    gate = FakeGate({_TIMER: 0.1})
+
+    result = await _fetcher(index, executors, reranker=reranker, need_gate=gate).fetch(
+        _request(_TIMER)
+    )
+
+    assert result.items == () and result.block_text is None and not result.degraded
+    assert result.stage.ran is False and result.stage.skip_reason == "no_need"
+    assert result.stage.need == _trace("closed", 0.1)
+    assert reranker.calls == [] and result.reranked == 0
+
+
+@pytest.mark.asyncio
+async def test_a_band_turn_proceeds_as_open_and_traces_its_band(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    reranker = FakeReranker()
+    gate = FakeGate({"tidewater survey": 0.45})
+
+    result = await _fetcher(index, executors, reranker=reranker, need_gate=gate).fetch(
+        _request("tidewater survey")
+    )
+
+    assert [item.item_id for item in result.items] == [_key("Tidewater Survey")]
+    assert result.stage.ran and result.stage.need == _trace("band", 0.45)
+    assert reranker.calls
+
+
+@pytest.mark.asyncio
+async def test_an_open_gate_serves_the_block_and_traces_its_decision(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    gate = FakeGate({"tidewater survey": 0.8})
+
+    outcome = await _fetcher(index, executors, need_gate=gate).fetch_outcome(
+        _request("tidewater survey")
+    )
+    ungated = await _fetcher(index, executors).fetch_outcome(_request("tidewater survey"))
+
+    assert outcome.result.stage.need == _trace("open", 0.8)
+    assert _without_need(outcome) == ungated
+
+
+@pytest.mark.parametrize("mode", ["on", "shadow"])
+@pytest.mark.asyncio
+async def test_without_a_gate_every_fetch_is_open_and_traces_no_need(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, mode: str
+) -> None:
+    """`MIST_MEMORY_NEED_GATE=off` gives the fetcher no gate; `need_mode` is then not read."""
+    fact_index.upsert([_fact("Tidewater Survey")])
+    fetcher = _fetcher(index, executors, need_gate=None, need_mode=mode)
+
+    result = await fetcher.fetch(_request("tidewater survey"))
+
+    assert result.stage.need is None
+    assert [item.item_id for item in result.items] == [_key("Tidewater Survey")]
+
+
+def test_the_degraded_priority_ranks_need_unknown_after_the_index_reasons() -> None:
+    assert _DEGRADED_PRIORITY == (
+        "index_error",
+        "index_rebuilding",
+        "need_unknown",
+        "deadline",
+        "reranker_unavailable",
+    )
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["same-object", "wrapped"])
+@pytest.mark.asyncio
+async def test_a_gate_sharing_the_query_vector_embeds_once_per_fetch(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, wrapped: bool
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    model = FakeEmbedder()
+    gate = FakeGate(shares_query_vector=True, embedder=model)
+    fetch_embedder = WrappingEmbedder(model) if wrapped else model
+    fetcher = _fetcher(index, executors, embedder=fetch_embedder, need_gate=gate)
+
+    for n, text in enumerate(("tidewater survey", "where is tidewater survey"), start=1):
+        result = await fetcher.fetch(_request(text, session=f"s{n}"))
+        assert len(model.calls) == n
+        assert result.stage.need is not None
+
+    assert gate.embedded == [] and len(gate.decided) == 2
+
+
+@pytest.mark.asyncio
+async def test_another_gate_embedder_runs_on_the_gate_executor_while_the_model_is_busy(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, release: threading.Event
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    held = executors.model.submit(release.wait, _WAIT_S)
+    embedder = FakeEmbedder()
+    gate = FakeGate({_TIMER: 0.1})
+    try:
+        result = await asyncio.wait_for(
+            _fetcher(index, executors, embedder=embedder, need_gate=gate).fetch(_request(_TIMER)),
+            timeout=_WAIT_S,
+        )
+
+        [(text, thread)] = gate.embedded
+        assert text == _TIMER and thread.startswith("memory-gate")
+        assert result.stage.skip_reason == "no_need"
+        assert embedder.calls == []  # the fetch's own embedding still waits for the model thread
+    finally:
+        release.set()
+        held.result(timeout=_WAIT_S)
+
+
+@pytest.mark.asyncio
+async def test_a_late_gate_vector_closes_with_deadline(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    clock = FakeClock()
+    reranker = FakeReranker()
+    gate = FakeGate(embedder=HookedEmbedder(lambda _: clock.advance(ms=_ROOMY_MS + 10)))
+
+    result = await _fetcher(index, executors, clock=clock, reranker=reranker, need_gate=gate).fetch(
+        _request("tidewater survey")
+    )
+
+    assert result.degraded_reason == "deadline" and result.items == ()
+    assert result.stage.ran
+    assert result.stage.need == _trace(
+        "closed", None, need_ids=(), no_need_ids=(), degraded="deadline"
+    )
+    assert reranker.calls == []
+
+
+@pytest.mark.parametrize(
+    "case", ["gate-embedder-raises", "decide-refuses", "shared-embedder-raises"]
+)
+@pytest.mark.asyncio
+async def test_a_failed_gate_vector_closes_with_need_unknown(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, case: str
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    reranker = FakeReranker()
+    embedder: object = FakeEmbedder()
+    if case == "gate-embedder-raises":
+        gate = FakeGate(embedder=FailingEmbedder())
+    elif case == "decide-refuses":
+        gate = FakeGate(refuse=True)
+    else:
+        embedder = FailingEmbedder()
+        gate = FakeGate(shares_query_vector=True, embedder=embedder)
+
+    result = await _fetcher(
+        index, executors, embedder=embedder, reranker=reranker, need_gate=gate
+    ).fetch(_request("tidewater survey"))
+
+    assert result.degraded_reason == "need_unknown" and result.items == ()
+    assert result.stage.ran
+    assert result.stage.need == _trace(
+        "closed", None, need_ids=(), no_need_ids=(), degraded="need_unknown"
+    )
+    assert reranker.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_prefetch_is_gated_and_its_reused_outcome_keeps_its_need(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    reranker = FakeReranker()
+    gate = FakeGate({_QUERY: 0.1})
+    fetcher = _fetcher(index, executors, reranker=reranker, need_gate=gate, need_context=False)
+    turns = await _warm(fetcher)
+    reranks = len(reranker.calls)
+    await fetcher.prefetch("s1", "Where does  the user WORK these days")
+    await _settle()
+    assert gate.decided[-1] == 0.1
+    decided = len(gate.decided)
+
+    result = await fetcher.fetch(_request(_QUERY, turns=turns))
+
+    assert result.stage.prefetch_reuse == "block" and result.stage.skip_reason == "no_need"
+    assert result.stage.need == _trace("closed", 0.1)
+    assert len(gate.decided) == decided and len(reranker.calls) == reranks
+
+
+@pytest.mark.asyncio
+async def test_a_blank_query_keeps_the_ungated_empty_result(
+    index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    gate = FakeGate(default=0.1)
+
+    gated = await _fetcher(index, executors, need_gate=gate).fetch_outcome(_request("   "))
+    ungated = await _fetcher(index, executors).fetch_outcome(_request("   "))
+
+    assert gated == ungated and gated.result.stage.need is None
+    assert gate.embedded == [] and gate.decided == []
+
+
+# -- shadow mode ------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_shadow_gate_that_would_close_serves_the_open_block(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    reranker = FakeReranker()
+    gate = FakeGate({"tidewater survey": 0.1})
+
+    shadow = await _fetcher(
+        index, executors, reranker=reranker, need_gate=gate, need_mode="shadow"
+    ).fetch_outcome(_request("tidewater survey"))
+    ungated = await _fetcher(index, executors).fetch_outcome(_request("tidewater survey"))
+
+    stage = shadow.result.stage
+    assert stage.ran and stage.skip_reason is None
+    assert stage.need == _trace("closed", 0.1, mode="shadow")
+    assert [item.item_id for item in shadow.result.items] == [_key("Tidewater Survey")]
+    assert reranker.calls
+    assert _without_need(shadow) == ungated
+
+
+@pytest.mark.parametrize(("mode", "p"), [("on", 0.9), ("on", 0.45), ("shadow", 0.1)])
+@pytest.mark.asyncio
+async def test_the_cross_encoder_starts_after_the_gate_decides(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, mode: str, p: float
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    events: list[str] = []
+    recorded = FetcherExecutors(
+        index=executors.index,
+        model=RecordingExecutor(executors.model, "model", events),
+        gate=RecordingExecutor(executors.gate, "gate", events),
+    )
+    slow = HookedEmbedder(lambda _: time.sleep(0.2))  # the pools finish long before it
+    gate = FakeGate({"tidewater survey": p}, embedder=slow, events=events)
+    reranker = FakeReranker()
+
+    result = await _fetcher(
+        index, recorded, reranker=reranker, need_gate=gate, need_mode=mode
+    ).fetch(_request("tidewater survey"))
+
+    assert reranker.calls and result.items
+    assert events.count("model") == 2  # the fetch's own query embedding, then the rerank
+    rerank_submitted = len(events) - 1 - events[::-1].index("model")
+    assert events.index("gate") < events.index("decide") < rerank_submitted
+
+
+@pytest.mark.asyncio
+async def test_a_late_shadow_vector_leaves_the_outcome_of_an_ungated_fetch_past_its_deadline(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    """The shared gate's vector is the fetch's own; it arrives after the deadline in both runs.
+
+    Both pools and the embedding start before the clock moves, and the pools return only after
+    it, so the two runs see the same expired deadline at the same points.
+    """
+    fact_index.upsert([_fact("Tidewater Survey")])
+
+    async def run(gated: bool) -> FetchOutcome:
+        clock = FakeClock()
+        started = threading.Barrier(3)
+        moved = threading.Event()
+
+        def pool_hook() -> None:
+            started.wait(_WAIT_S)
+            moved.wait(_WAIT_S)
+
+        def expire(_: str) -> None:
+            started.wait(_WAIT_S)
+            clock.advance(ms=_ROOMY_MS + 10)
+            moved.set()
+
+        index.hooks["search_fts"] = pool_hook
+        index.hooks["search_names"] = pool_hook
+        embedder = HookedEmbedder(expire)
+        gate = FakeGate(shares_query_vector=True, embedder=embedder) if gated else None
+        try:
+            return await _fetcher(
+                index,
+                executors,
+                clock=clock,
+                embedder=embedder,
+                need_gate=gate,
+                need_mode="shadow",
+            ).fetch_outcome(_request("tidewater survey"))
+        finally:
+            moved.set()
+            index.hooks.clear()
+
+    shadow = await run(gated=True)
+    ungated = await run(gated=False)
+
+    assert shadow.result.stage.need == _trace(
+        "closed", None, mode="shadow", need_ids=(), no_need_ids=(), degraded="deadline"
+    )
+    assert shadow.result.degraded_reason == "deadline"
+    assert _without_need(shadow) == ungated
+
+
+@pytest.mark.parametrize("case", ["gate-embedder-raises", "decide-refuses"])
+@pytest.mark.asyncio
+async def test_a_failed_shadow_vector_leaves_the_outcome_of_an_ungated_fetch(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, case: str
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    gate = (
+        FakeGate(embedder=FailingEmbedder())
+        if case == "gate-embedder-raises"
+        else FakeGate(refuse=True)
+    )
+
+    shadow = await _fetcher(index, executors, need_gate=gate, need_mode="shadow").fetch_outcome(
+        _request("tidewater survey")
+    )
+    ungated = await _fetcher(index, executors).fetch_outcome(_request("tidewater survey"))
+
+    assert shadow.result.stage.need == _trace(
+        "closed", None, mode="shadow", need_ids=(), no_need_ids=(), degraded="need_unknown"
+    )
+    assert shadow.result.degraded_reason is None and shadow.result.items
+    assert _without_need(shadow) == ungated
+
+
+# -- follow-ups -------------------------------------------------------------------------------
+
+
+async def _after_a_served_fetch(fetcher: MemoryFetcher) -> tuple[str, ...]:
+    """One fetch of `_FIRST` in session s1; returns the turns the follow-up carries."""
+    await fetcher.fetch(_request(_FIRST))
+    return (_FIRST,)
+
+
+@pytest.mark.parametrize(
+    ("query_p", "context_p", "band", "p", "moved"),
+    [
+        (0.1, 0.9, "open", 0.9, True),
+        (0.45, 0.9, "open", 0.9, True),
+        (0.1, 0.45, "band", 0.45, True),
+        (0.1, 0.2, "closed", 0.2, False),
+        (0.45, 0.35, "band", 0.45, False),
+    ],
+    ids=["closed-to-open", "band-to-open", "closed-to-band", "higher-same-band", "lower"],
+)
+@pytest.mark.asyncio
+async def test_a_follow_up_takes_the_higher_probability_and_its_band(
+    fact_index: FactIndex,
+    index: HookedIndex,
+    executors: FetcherExecutors,
+    query_p: float,
+    context_p: float,
+    band: str,
+    p: float,
+    moved: bool,
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    gate = FakeGate({_FIRST: 0.9, _FOLLOW: query_p, _CONTEXT: context_p})
+    fetcher = _fetcher(index, executors, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+
+    result = await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert result.stage.need == _trace(band, p, context=moved, context_p=context_p)
+    assert (result.stage.skip_reason == "no_need") == (band == "closed")
+
+
+@pytest.mark.asyncio
+async def test_an_open_query_does_not_take_the_context_probability(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    gate = FakeGate({_FIRST: 0.9, _FOLLOW: 0.7, _CONTEXT: 0.95})
+    fetcher = _fetcher(index, executors, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+
+    result = await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert result.stage.need == _trace("open", 0.7)
+
+
+@pytest.mark.parametrize(
+    "case", ["no-recent-turns", "after-a-closed-fetch", "context-off", "after-a-shadow-close"]
+)
+@pytest.mark.asyncio
+async def test_no_context_embedding_without_turns_a_served_fetch_or_the_setting(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, case: str
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    first_p = 0.1 if case in ("after-a-closed-fetch", "after-a-shadow-close") else 0.9
+    gate = FakeGate({_FIRST: first_p, _FOLLOW: 0.1, _CONTEXT: 0.9})
+    fetcher = _fetcher(
+        index,
+        executors,
+        need_gate=gate,
+        need_context=case != "context-off",
+        need_mode="shadow" if case == "after-a-shadow-close" else "on",
+    )
+    turns = await _after_a_served_fetch(fetcher)
+
+    result = await fetcher.fetch(
+        _request(_FOLLOW, turns=() if case == "no-recent-turns" else turns)
+    )
+
+    assert gate.texts() == [_FIRST, _FOLLOW]
+    assert result.stage.need is not None and result.stage.need.context_p is None
+
+
+@pytest.mark.asyncio
+async def test_a_shadow_fetch_that_decided_band_starts_the_context_path(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    gate = FakeGate({_FIRST: 0.45, _FOLLOW: 0.1, _CONTEXT: 0.9})
+    fetcher = _fetcher(index, executors, need_gate=gate, need_mode="shadow")
+    turns = await _after_a_served_fetch(fetcher)
+
+    result = await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert gate.texts() == [_FIRST, _FOLLOW, _CONTEXT]
+    assert result.stage.need == _trace("open", 0.9, mode="shadow", context=True, context_p=0.9)
+
+
+@pytest.mark.asyncio
+async def test_the_context_embedding_runs_on_the_gate_executor_after_the_query(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    gate = FakeGate({_FIRST: 0.9, _FOLLOW: 0.1, _CONTEXT: 0.9})
+    fetcher = _fetcher(index, executors, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+    gate.embedded.clear()
+
+    await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert gate.texts() == [_FOLLOW, _CONTEXT]
+    assert all(thread.startswith("memory-gate") for _, thread in gate.embedded)
+
+
+@pytest.mark.asyncio
+async def test_an_open_query_never_waits_for_its_context_vector(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, release: threading.Event
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    started = threading.Event()
+
+    def hold(_: str) -> None:
+        started.set()
+        release.wait(_WAIT_S)
+
+    blocked = HookedEmbedder(hold, applies=_is_context)
+    gate = FakeGate({_FIRST: 0.9, _FOLLOW: 0.8, _CONTEXT: 0.1}, embedder=blocked)
+    fetcher = _fetcher(index, executors, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+    # The query decides only once the context embedding holds the gate thread.
+    gate.before_decide = lambda: started.wait(_WAIT_S)
+
+    result = await asyncio.wait_for(
+        fetcher.fetch(_request(_FOLLOW, turns=turns)), timeout=_WAIT_S / 2
+    )
+
+    assert started.is_set() and not release.is_set()
+    assert result.stage.need == _trace("open", 0.8)
+    assert result.stage.ran and result.stage.skip_reason is None
+
+
+@pytest.mark.asyncio
+async def test_a_closed_query_waits_for_its_context_vector(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    slow = HookedEmbedder(lambda _: time.sleep(0.2), applies=_is_context)
+    gate = FakeGate({_FIRST: 0.9, _FOLLOW: 0.1, _CONTEXT: 0.9}, embedder=slow)
+    fetcher = _fetcher(index, executors, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+
+    result = await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert result.stage.need == _trace("open", 0.9, context=True, context_p=0.9)
+    assert result.stage.ran and result.stage.skip_reason is None
+
+
+@pytest.mark.parametrize(("case", "reason"), [("late", "deadline"), ("raises", "need_unknown")])
+@pytest.mark.asyncio
+async def test_a_late_or_failed_context_vector_leaves_the_gate_closed(
+    fact_index: FactIndex,
+    index: HookedIndex,
+    executors: FetcherExecutors,
+    case: str,
+    reason: str,
+) -> None:
+    fact_index.upsert([_fact("Tidewater Survey")])
+    clock = FakeClock()
+    decided = threading.Event()
+
+    def expire(_: str) -> None:
+        decided.wait(_WAIT_S)  # the query's vector is in time and decided first
+        clock.advance(ms=_ROOMY_MS + 10)
+
+    embedder = (
+        HookedEmbedder(expire, applies=_is_context) if case == "late" else FailingOn(_is_context)
+    )
+    gate = FakeGate({_FIRST: 0.9, _FOLLOW: 0.1, _CONTEXT: 0.9}, embedder=embedder)
+    fetcher = _fetcher(index, executors, clock=clock, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+    gate.before_decide = decided.set
+
+    result = await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert result.degraded_reason == reason and result.items == ()
+    assert result.stage.need == _trace("closed", 0.1, degraded=reason)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_embedder_is_never_called_from_two_threads_at_once(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    """Under `shared` the context embedding (gate thread) and the fetch's own query embedding
+    (model thread) use one embedder object; the fetcher serializes the two calls.
+    """
+    fact_index.upsert([_fact("Tidewater Survey")])
+    lock = threading.Lock()
+    active = [0]
+    peak = [0]
+    threads: list[str] = []
+
+    def overlap(_: str) -> None:
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            threads.append(threading.current_thread().name)
+        time.sleep(0.1)
+        with lock:
+            active[0] -= 1
+
+    shared = HookedEmbedder(overlap)
+    gate = FakeGate(
+        {_FIRST: 0.9, _FOLLOW: 0.1, _CONTEXT: 0.9}, shares_query_vector=True, embedder=shared
+    )
+    fetcher = _fetcher(index, executors, embedder=shared, need_gate=gate)
+    turns = await _after_a_served_fetch(fetcher)
+    threads.clear()
+
+    result = await fetcher.fetch(_request(_FOLLOW, turns=turns))
+
+    assert sorted(name.split("_")[0] for name in threads) == ["memory-gate", "memory-model"]
+    assert peak[0] == 1
+    assert result.stage.need == _trace("open", 0.9, context=True, context_p=0.9)
 
 
 # -- helpers ----------------------------------------------------------------------------------

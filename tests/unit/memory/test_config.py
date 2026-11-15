@@ -13,11 +13,22 @@ import pytest
 
 import backend.user_timezone as user_timezone
 from backend.errors import MemoryConfigError, MistError
-from backend.memory.config import MEMORY_ENV_VARS, RETIRED_MEMORY_ENV_VARS, MemoryConfig
+from backend.memory.config import (
+    MEMORY_ENV_VARS,
+    RETIRED_MEMORY_ENV_VARS,
+    MemoryConfig,
+    NeedEmbedderName,
+)
 from backend.memory.models import ServingProfile
+from backend.memory.need_gate import NEED_EMBEDDERS
 from backend.memory.retrieval_view import DEFAULT_FACT_VIEW, FACT_VIEWS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_NEED_VARIABLES = (
+    "MIST_MEMORY_NEED_GATE",
+    "MIST_MEMORY_NEED_EMBEDDER",
+    "MIST_MEMORY_NEED_CONTEXT",
+)
 
 
 def _documented(text: str) -> dict[str, str]:
@@ -89,6 +100,14 @@ class TestDefaults:
         assert config.tz is UTC
         assert config.tz_name is None
         assert config.fact_view == "F3"
+        assert config.need_gate == "on"
+        assert config.need_embedder == "shared"
+        assert config.need_context is True
+
+    def test_there_is_no_neighbour_setting(self):
+        """The gate model's form carries its own neighbour count; no setting can drift from it."""
+        assert not hasattr(MemoryConfig(), "need_neighbours")
+        assert "MIST_MEMORY_NEED_NEIGHBOURS" not in MEMORY_ENV_VARS
 
     def test_the_fact_view_default_is_the_index_default(self):
         # Two literals, kept equal: the index's own default and the setting's.
@@ -126,6 +145,9 @@ class TestFromEnv:
             "MIST_MEMORY_LIST_MAX_ITEMS": "6",
             "MIST_MEMORY_RESCAN_INTERVAL_S": "45",
             "MIST_MEMORY_FACT_VIEW": "F2",
+            "MIST_MEMORY_NEED_GATE": "shadow",
+            "MIST_MEMORY_NEED_EMBEDDER": "bge-small-en-v1.5",
+            "MIST_MEMORY_NEED_CONTEXT": "false",
         }
         for name, value in values.items():
             monkeypatch.setenv(name, value)
@@ -156,6 +178,21 @@ class TestFromEnv:
         assert config.list_max_items == 6
         assert config.rescan_interval_s == 45
         assert config.fact_view == "F2"
+        assert config.need_gate == "shadow"
+        assert config.need_embedder == "bge-small-en-v1.5"
+        assert config.need_context is False
+
+    @pytest.mark.parametrize("mode", ["on", "shadow", "off"])
+    def test_every_need_gate_mode_is_read(self, monkeypatch, mode):
+        monkeypatch.setenv("MIST_MEMORY_NEED_GATE", mode)
+
+        assert MemoryConfig.from_env(tz_resolver=_never_called).need_gate == mode
+
+    @pytest.mark.parametrize("name", sorted(NEED_EMBEDDERS))
+    def test_every_need_embedder_name_is_read(self, monkeypatch, name):
+        monkeypatch.setenv("MIST_MEMORY_NEED_EMBEDDER", name)
+
+        assert MemoryConfig.from_env(tz_resolver=_never_called).need_embedder == name
 
     def test_a_blank_variable_counts_as_unset(self, monkeypatch):
         """Compose passes `${VAR:-}` through as an empty string, which must mean the default."""
@@ -185,6 +222,7 @@ class TestFromEnv:
             ("MIST_MEMORY_CONTINUITY_SHARE", "a third"),
             ("MIST_MEMORY_WEIGHTS", "0.8,0.2"),
             ("MIST_MEMORY_WEIGHTS", "0.8,x,0.1"),
+            ("MIST_MEMORY_NEED_CONTEXT", "sometimes"),
         ],
     )
     def test_an_unparsable_value_names_its_variable(self, monkeypatch, name, raw):
@@ -371,6 +409,12 @@ class TestValidation:
             ({"fact_view": "F4"}, "fact_view"),
             ({"fact_view": "f3"}, "fact_view"),
             ({"fact_view": "N0"}, "fact_view"),
+            ({"need_gate": "auto"}, "need_gate"),
+            ({"need_gate": "ON"}, "need_gate"),
+            ({"need_gate": True}, "need_gate"),
+            ({"need_embedder": "all-MiniLM-L6-v2"}, "need_embedder"),
+            ({"need_embedder": ""}, "need_embedder"),
+            ({"need_context": "yes"}, "need_context"),
         ],
     )
     def test_rejects_invalid_values(self, overrides, fragment):
@@ -440,6 +484,27 @@ class TestValidation:
 
         with pytest.raises(MemoryConfigError, match="fact_view"):
             MemoryConfig.from_env(tz_resolver=_never_called)
+
+    @pytest.mark.parametrize(
+        ("name", "raw", "fragment"),
+        [
+            ("MIST_MEMORY_NEED_GATE", "true", "need_gate"),
+            ("MIST_MEMORY_NEED_EMBEDDER", "bge-small", "need_embedder"),
+        ],
+    )
+    def test_from_env_rejects_an_unknown_need_setting(self, monkeypatch, name, raw, fragment):
+        monkeypatch.setenv(name, raw)
+
+        with pytest.raises(MemoryConfigError, match=fragment):
+            MemoryConfig.from_env(tz_resolver=_never_called)
+
+    @pytest.mark.parametrize("name", sorted(NEED_EMBEDDERS))
+    def test_every_need_embedder_name_is_accepted(self, name):
+        assert MemoryConfig(need_embedder=name).need_embedder == name
+
+    def test_the_need_embedder_type_names_the_need_embedders(self):
+        """The setting's Literal and the gate's table stay one list of names."""
+        assert NeedEmbedderName.__args__ == tuple(NEED_EMBEDDERS)  # type: ignore[attr-defined]
 
     @pytest.mark.parametrize(
         "name",
@@ -608,6 +673,29 @@ class TestEnvExampleDocumentsEveryVariable:
         assert int(documented["MIST_MEMORY_LIST_MAX_ITEMS"]) == defaults.list_max_items
         assert int(documented["MIST_MEMORY_RESCAN_INTERVAL_S"]) == defaults.rescan_interval_s
         assert documented["MIST_MEMORY_FACT_VIEW"] == defaults.fact_view
+        assert documented["MIST_MEMORY_NEED_GATE"] == defaults.need_gate
+        assert documented["MIST_MEMORY_NEED_EMBEDDER"] == defaults.need_embedder
+        assert documented["MIST_MEMORY_NEED_CONTEXT"] == "true"
+
+    def test_the_need_settings_follow_the_fact_view_in_order(self):
+        """The new variables join `MEMORY_ENV_VARS` in `.env.example` order."""
+        text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        names = ["MIST_MEMORY_FACT_VIEW", *_NEED_VARIABLES]
+
+        positions = [text.index(f"# {name}=") for name in names]
+
+        assert positions == sorted(positions)
+        index = MEMORY_ENV_VARS.index("MIST_MEMORY_FACT_VIEW")
+        assert MEMORY_ENV_VARS[index + 1 : index + 4] == _NEED_VARIABLES
+
+    def test_the_need_embedder_comment_names_every_embedder(self):
+        text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        section = text[
+            text.index("# MIST_MEMORY_FACT_VIEW=") : text.index("# MIST_MEMORY_NEED_CONTEXT=")
+        ]
+
+        for name in NEED_EMBEDDERS:
+            assert name in section, name
 
     def test_retired_variables_are_not_documented(self):
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")

@@ -1,10 +1,12 @@
 """The memory read path's lifecycle: the refresher, the named executors and the index location.
 
-`MemoryRuntime` owns what outlives one fetch: the FactIndexRefresher's task and the two thread
-pools, `memory-index` (SQLite reads and the refresher's writes, two threads) and
+`MemoryRuntime` owns what outlives one fetch: the FactIndexRefresher's task and the three
+thread pools, `memory-index` (SQLite reads and the refresher's writes, two threads),
 `memory-model` (the query embedding and the rerank, one thread, so a CPU cross-encoder never
-runs twice at once). The handler starts it at startup and closes it at shutdown; the listeners
-of T33 and T34 call `mark_dirty` through their own async adapters.
+runs twice at once) and `memory-gate` (the need gate's own embeddings, one thread, so they
+never queue behind the cross-encoder or ahead of it). The handler starts it at startup and
+closes it at shutdown; the listeners of T33 and T34 call `mark_dirty` through their own async
+adapters.
 
 `memory_index_path` resolves the index file the way `mist_admin memory-index-rebuild` does, so
 the serving process and the admin command always open the same file.
@@ -24,7 +26,7 @@ from typing import Protocol
 from backend.errors import MemoryIndexError
 
 from .config import MemoryConfig
-from .fetcher import INDEX_EXECUTOR, MODEL_EXECUTOR, FetcherExecutors
+from .fetcher import GATE_EXECUTOR, INDEX_EXECUTOR, MODEL_EXECUTOR, FetcherExecutors
 from .index_db import MEMORY_PATH, degraded_reason, open_reader
 from .models import DegradedReason
 
@@ -32,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 INDEX_THREADS = 2
 MODEL_THREADS = 1
+GATE_THREADS = 1
+
+_EXECUTOR_NAMES: tuple[str, ...] = (INDEX_EXECUTOR, MODEL_EXECUTOR, GATE_EXECUTOR)
 
 # The file name beside the event store; mist_admin's `_MEMORY_INDEX_FILENAME` is the same.
 MEMORY_INDEX_FILENAME = "memory_index.db"
@@ -60,10 +65,14 @@ class Refresher(Protocol):
 
 
 def build_memory_executors() -> dict[str, ThreadPoolExecutor]:
-    """The two named executors the fetcher and the refresher share; the runtime closes them."""
+    """The three named executors the fetcher and the refresher share; the runtime closes them.
+
+    The refresher uses `memory-index` only; the fetcher uses all three.
+    """
     return {
         INDEX_EXECUTOR: ThreadPoolExecutor(INDEX_THREADS, thread_name_prefix=INDEX_EXECUTOR),
         MODEL_EXECUTOR: ThreadPoolExecutor(MODEL_THREADS, thread_name_prefix=MODEL_EXECUTOR),
+        GATE_EXECUTOR: ThreadPoolExecutor(GATE_THREADS, thread_name_prefix=GATE_EXECUTOR),
     }
 
 
@@ -145,7 +154,7 @@ class MemoryRuntime:
     """
 
     def __init__(self, refresher: Refresher, executors: Mapping[str, ThreadPoolExecutor]) -> None:
-        missing = [name for name in (INDEX_EXECUTOR, MODEL_EXECUTOR) if name not in executors]
+        missing = [name for name in _EXECUTOR_NAMES if name not in executors]
         if missing:
             raise ValueError(f"MemoryRuntime needs the executors {missing}")
         self._refresher = refresher
@@ -157,7 +166,9 @@ class MemoryRuntime:
     def executors(self) -> FetcherExecutors:
         """The executors as the fetcher takes them."""
         return FetcherExecutors(
-            index=self._executors[INDEX_EXECUTOR], model=self._executors[MODEL_EXECUTOR]
+            index=self._executors[INDEX_EXECUTOR],
+            model=self._executors[MODEL_EXECUTOR],
+            gate=self._executors[GATE_EXECUTOR],
         )
 
     @property
@@ -200,6 +211,7 @@ class MemoryRuntime:
 
 
 __all__ = [
+    "GATE_THREADS",
     "INDEX_THREADS",
     "MEMORY_INDEX_FILENAME",
     "MODEL_THREADS",

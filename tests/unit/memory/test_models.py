@@ -21,6 +21,7 @@ from backend.memory.models import (
     MemoryRequest,
     MemoryResult,
     MemoryStage,
+    NeedTrace,
     NoteSource,
     ServingProfile,
     TimeWindow,
@@ -47,8 +48,22 @@ _STAGE_KEYS = {
     "timings",
     "candidates",
     "truncated",
+    "need",
 }
 _CANDIDATE_KEYS = {"source", "ref", "alt_ref", "rank", "score", "item", "disposition"}
+_NEED_KEYS = {
+    "mode",
+    "band",
+    "p",
+    "theta_low",
+    "theta_high",
+    "band_k",
+    "need_ids",
+    "no_need_ids",
+    "context",
+    "context_p",
+    "degraded",
+}
 
 
 def _candidate(**overrides) -> MemoryCandidate:
@@ -94,6 +109,36 @@ def _stage(**overrides) -> MemoryStage:
     }
     values.update(overrides)
     return MemoryStage(**values)
+
+
+def _need(**overrides) -> NeedTrace:
+    values = {
+        "mode": "on",
+        "band": "open",
+        "p": 0.8,
+        "theta_low": 0.3,
+        "theta_high": 0.6,
+        "band_k": 2,
+        "need_ids": ("a-need-001", "b-need-004", "a-need-019"),
+        "no_need_ids": ("b-no-need-002", "a-no-need-010", "a-no-need-003"),
+        "context": False,
+        "context_p": None,
+        "degraded": None,
+    }
+    values.update(overrides)
+    return NeedTrace(**values)
+
+
+def _closed_stage(**need_overrides) -> MemoryStage:
+    return _stage(
+        ran=False,
+        skip_reason="no_need",
+        tokens=0,
+        prefetch_reuse="none",
+        timings=FetchTimings(),
+        candidates=(),
+        need=_need(band="closed", p=0.1, **need_overrides),
+    )
 
 
 def _fact_item(ref: str = "m1", score: float = 0.9) -> MemoryItem:
@@ -380,9 +425,9 @@ class TestMemoryStage:
 
     def test_no_field_carries_text(self):
         """The trace holds refs and numbers only; text stays in the block."""
-        names = {f.name for f in dataclasses.fields(MemoryStage)} | _CANDIDATE_KEYS
+        names = {f.name for f in dataclasses.fields(MemoryStage)} | _CANDIDATE_KEYS | _NEED_KEYS
 
-        assert not names & {"text", "block_text", "query_text"}
+        assert not names & {"text", "block_text", "query_text", "context_text"}
 
     def test_a_ran_stage_builds_with_its_defaults(self):
         stage = _stage()
@@ -390,9 +435,51 @@ class TestMemoryStage:
         assert stage.ran is True
         assert stage.skip_reason is None
         assert stage.truncated == 0
+        assert stage.need is None
         assert [c.disposition for c in stage.candidates] == ["injected", "dropped_min_score"]
 
-    @pytest.mark.parametrize("reason", ["off", "zero_budget", "error"])
+    def test_a_ran_stage_carries_the_need_decision(self):
+        need = _need(band="band", p=0.45)
+
+        assert _stage(need=need).need is need
+
+    def test_a_closed_gate_skips_the_stage_for_no_need(self):
+        stage = _closed_stage()
+
+        assert stage.ran is False and stage.skip_reason == "no_need"
+        assert stage.need is not None and stage.need.band == "closed"
+
+    @pytest.mark.parametrize(
+        ("need", "fragment"),
+        [
+            (None, "no_need"),
+            (_need(mode="shadow", band="closed", p=0.1), "shadow"),
+            (_need(band="band", p=0.45), "closed"),
+            (_need(band="closed", p=None, degraded="deadline"), "degraded"),
+        ],
+        ids=["no-decision", "shadow", "band", "degraded"],
+    )
+    def test_no_need_is_an_on_mode_closed_decision(self, need, fragment):
+        """A shadow decision never sets `skip_reason`; a degraded close runs with its reason."""
+        with pytest.raises(ValueError, match=fragment):
+            _stage(
+                ran=False,
+                skip_reason="no_need",
+                tokens=0,
+                prefetch_reuse="none",
+                timings=FetchTimings(),
+                candidates=(),
+                need=need,
+            )
+
+    def test_a_degraded_close_runs_with_its_reason(self):
+        need = _need(band="closed", p=None, degraded="need_unknown")
+
+        stage = _stage(degraded_reason="need_unknown", tokens=0, candidates=(), need=need)
+
+        assert stage.ran and stage.need is need
+
+    @pytest.mark.parametrize("reason", ["off", "zero_budget", "error", "no_need"])
     def test_a_skipped_stage_names_its_reason(self, reason):
         stage = _stage(
             ran=False,
@@ -401,6 +488,7 @@ class TestMemoryStage:
             prefetch_reuse="none",
             timings=FetchTimings(),
             candidates=(),
+            need=_need(band="closed", p=0.1) if reason == "no_need" else None,
         )
 
         assert stage.skip_reason == reason
@@ -421,6 +509,7 @@ class TestMemoryStage:
             "index_rebuilding",
             "reranker_unavailable",
             "context_budget",
+            "need_unknown",
         ],
     )
     def test_every_degraded_reason_is_accepted(self, reason):
@@ -457,6 +546,89 @@ class TestMemoryStage:
         with pytest.raises(dataclasses.FrozenInstanceError):
             stage.tokens = 0  # type: ignore[misc]
         assert not hasattr(stage, "__dict__")
+
+
+class TestNeedTrace:
+    def test_fields_are_the_trace_need_keys(self):
+        assert {f.name for f in dataclasses.fields(NeedTrace)} == _NEED_KEYS
+
+    def test_an_open_decision_builds_with_every_field(self):
+        need = _need()
+
+        assert (need.mode, need.band, need.p) == ("on", "open", 0.8)
+        assert (need.theta_low, need.theta_high, need.band_k) == (0.3, 0.6, 2)
+        assert need.need_ids == ("a-need-001", "b-need-004", "a-need-019")
+        assert need.no_need_ids == ("b-no-need-002", "a-no-need-010", "a-no-need-003")
+        assert (need.context, need.context_p, need.degraded) == (False, None, None)
+
+    @pytest.mark.parametrize("mode", ["on", "shadow"])
+    def test_every_mode_is_accepted(self, mode):
+        assert _need(mode=mode).mode == mode
+
+    @pytest.mark.parametrize(
+        ("band", "p"), [("closed", 0.0), ("closed", 0.29), ("band", 0.3), ("band", 0.59)]
+    )
+    def test_every_band_follows_its_probability(self, band, p):
+        assert _need(band=band, p=p).band == band
+
+    @pytest.mark.parametrize("p", [0.6, 1.0])
+    def test_open_starts_at_theta_high(self, p):
+        assert _need(band="open", p=p).band == "open"
+
+    @pytest.mark.parametrize("degraded", ["deadline", "need_unknown"])
+    def test_every_degraded_reason_closes_without_a_probability(self, degraded):
+        need = _need(band="closed", p=None, need_ids=(), no_need_ids=(), degraded=degraded)
+
+        assert need.degraded == degraded and need.p is None
+
+    def test_a_degraded_context_keeps_the_query_probability(self):
+        need = _need(band="closed", p=0.1, degraded="deadline")
+
+        assert need.p == 0.1 and need.context_p is None
+
+    def test_a_context_that_moves_the_band_is_the_turn_probability(self):
+        need = _need(band="open", p=0.9, context=True, context_p=0.9)
+
+        assert need.context and need.p == need.context_p
+
+    def test_a_lower_context_probability_is_recorded_without_the_flag(self):
+        need = _need(band="closed", p=0.2, context_p=0.1)
+
+        assert not need.context and need.context_p == 0.1
+
+    @pytest.mark.parametrize(
+        ("overrides", "fragment"),
+        [
+            ({"mode": "off"}, "mode"),
+            ({"band": "half"}, "band"),
+            ({"degraded": "timeout", "band": "closed", "p": None}, "degraded"),
+            ({"p": None}, "p"),
+            ({"p": 1.5}, "p"),
+            ({"p": float("nan")}, "p"),
+            ({"context_p": -0.1}, "context_p"),
+            ({"theta_low": 0.7}, "theta_low"),
+            ({"theta_high": 1.2, "p": 1.0}, "theta_high"),
+            ({"band_k": 0}, "band_k"),
+            ({"band": "closed"}, "band"),
+            ({"band": "band", "p": 0.2}, "band"),
+            ({"band": "open", "p": 0.59}, "band"),
+            ({"degraded": "deadline"}, "closed"),
+            ({"degraded": "deadline", "band": "closed", "p": None, "context_p": 0.4}, "context"),
+            ({"context": True}, "context_p"),
+            ({"context": True, "context_p": 0.7}, "context_p"),
+            ({"context_p": 0.95}, "context_p"),
+        ],
+    )
+    def test_rejects_invalid_values(self, overrides, fragment):
+        with pytest.raises(ValueError, match=fragment):
+            _need(**overrides)
+
+    def test_is_frozen_and_slotted(self):
+        need = _need()
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            need.p = 0.1  # type: ignore[misc]
+        assert not hasattr(need, "__dict__")
 
 
 class TestTimeWindow:
