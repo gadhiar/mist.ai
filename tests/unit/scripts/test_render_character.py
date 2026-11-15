@@ -352,6 +352,9 @@ def test_refuses_an_earlier_render_inside_the_checkout(
 
     _assert_refused(code, target, printed, tmp_path)
     assert str(REPO_ROOT) not in printed
+    # The path does not exist, so the missing-file refusal would also exit 2; only this reason
+    # shows that the checkout check refused it first.
+    assert "--compare-to lies inside the checkout" in printed
 
 
 def test_refuses_a_missing_earlier_render(
