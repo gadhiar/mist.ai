@@ -438,6 +438,10 @@ class Candidate:
             derives from the source.
         span_start: Start of the span an episode covers, for the window-match term.
         span_end: End of that span.
+        when_is_day: True when `when` names a local day rather than an instant: a note whose
+            `last_updated` is a date, kept as that day's midnight in the configured zone so
+            recency is measured as before. The block then dates the item by its day alone,
+            because a part of the day read off midnight is a time nobody said.
     """
 
     kind: ItemKind
@@ -449,6 +453,7 @@ class Candidate:
     confidence: float | None = None
     span_start: datetime | None = None
     span_end: datetime | None = None
+    when_is_day: bool = False
 
     def __post_init__(self) -> None:
         """Reject a candidate whose source does not match its kind."""

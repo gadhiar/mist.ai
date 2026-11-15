@@ -443,44 +443,79 @@ async def test_stopwords_do_not_give_an_unrelated_note_a_lexical_rank(
 async def test_a_note_dates_from_last_updated_and_falls_back_to_its_mtime(
     sidecar: VaultSidecarIndex, fake_embedder: FakeEmbedder
 ) -> None:
+    sidecar.upsert_file(
+        "notes/parser-log.md",
+        "Kestrel parser log.",
+        10,
+        {"authored_by": "mist", "last_updated": datetime(2026, 10, 21, 9, 30)},
+    )
     rows = sidecar.query_hybrid(fake_embedder.generate_embedding(_QUERY), _QUERY, k=20)
     assert {r["path"]: r["mtime"] for r in rows}["notes/garden.md"] == _GARDEN_MTIME
 
     candidates = await _gather(sidecar, fake_embedder)
 
     by_id = {c.item_id: c for c in candidates}
-    assert by_id["projects/kestrel.md#Stack"].when == datetime(2026, 10, 20, tzinfo=_TZ)
-    assert by_id["notes/garden.md#(file)"].when == datetime.fromtimestamp(_GARDEN_MTIME, UTC)
+    # A date-only `last_updated` (what MIST writes) names a local day, kept as its midnight so
+    # recency scoring is unchanged, and flagged so the block never invents a part of the day.
+    dated = by_id["projects/kestrel.md#Stack"]
+    assert dated.when == datetime(2026, 10, 20, tzinfo=_TZ)
+    assert dated.when_is_day is True
+    # A datetime `last_updated` and the mtime are instants.
+    timed = by_id["notes/parser-log.md#(file)"]
+    assert timed.when == datetime(2026, 10, 21, 9, 30, tzinfo=_TZ)
+    assert timed.when_is_day is False
+    from_mtime = by_id["notes/garden.md#(file)"]
+    assert from_mtime.when == datetime.fromtimestamp(_GARDEN_MTIME, UTC)
+    assert from_mtime.when_is_day is False
+
+
+_MTIME_WHEN = datetime.fromtimestamp(1_700_000_000, UTC)
 
 
 @pytest.mark.parametrize(
-    ("last_updated", "expected"),
+    ("last_updated", "expected", "is_day"),
     [
-        pytest.param("2026-10-20", datetime(2026, 10, 20, tzinfo=_TZ), id="date-in-zone"),
+        pytest.param("2026-10-20", datetime(2026, 10, 20, tzinfo=_TZ), True, id="date-in-zone"),
         pytest.param(
-            "2026-10-20T09:30:00", datetime(2026, 10, 20, 9, 30, tzinfo=_TZ), id="naive-in-zone"
+            " 2026-10-20 ", datetime(2026, 10, 20, tzinfo=_TZ), True, id="date-with-spaces"
+        ),
+        pytest.param(
+            "2026-10-20T00:00:00",
+            datetime(2026, 10, 20, tzinfo=_TZ),
+            False,
+            id="midnight-datetime-is-an-instant",
+        ),
+        pytest.param(
+            "2026-10-20T09:30:00",
+            datetime(2026, 10, 20, 9, 30, tzinfo=_TZ),
+            False,
+            id="naive-in-zone",
         ),
         pytest.param(
             "2026-10-20 09:30:00+02:00",
             datetime(2026, 10, 20, 9, 30, tzinfo=timezone(timedelta(hours=2))),
+            False,
             id="aware-as-given",
         ),
-        pytest.param("last week", datetime.fromtimestamp(1_700_000_000, UTC), id="not-a-date"),
-        pytest.param(None, datetime.fromtimestamp(1_700_000_000, UTC), id="absent"),
-        pytest.param(20261020, datetime.fromtimestamp(1_700_000_000, UTC), id="not-a-string"),
+        pytest.param("last week", _MTIME_WHEN, False, id="not-a-date"),
+        pytest.param(None, _MTIME_WHEN, False, id="absent"),
+        pytest.param(20261020, _MTIME_WHEN, False, id="not-a-string"),
     ],
 )
-def test_note_when_reads_each_form_of_last_updated(last_updated: object, expected: datetime):
+def test_note_when_reads_each_form_of_last_updated(
+    last_updated: object, expected: datetime, is_day: bool
+) -> None:
     frontmatter = {} if last_updated is None else {"last_updated": last_updated}
 
-    when = _note_when(frontmatter, 1_700_000_000, _TZ)
+    when, when_is_day = _note_when(frontmatter, 1_700_000_000, _TZ)
 
     assert when == expected
-    assert when.utcoffset() == expected.utcoffset()
+    assert when is not None and when.utcoffset() == expected.utcoffset()
+    assert when_is_day is is_day
 
 
 def test_note_when_is_none_without_last_updated_or_mtime() -> None:
-    assert _note_when(None, None, _TZ) is None
+    assert _note_when(None, None, _TZ) == (None, False)
 
 
 def test_a_non_positive_k_is_refused(sidecar: VaultSidecarIndex) -> None:
