@@ -207,9 +207,12 @@ def test_the_scorer_accepts_the_record_with_its_ranks() -> None:
         [_LIST],
         counter=ApproximateTokenCounter(),
         cpu_load_procs=0,
+        embedder_device="cuda",
     )
 
     parsed = parse_run_record(record)
+
+    assert record["embedder_device"] == "cuda"
 
     assert [(item.ref, item.id, item.rank) for item in parsed.items] == [
         (entry["ref"], entry["id"], entry["rank"]) for entry in _EXPECTED
@@ -223,7 +226,12 @@ def test_the_record_carries_the_scored_shortlist_size() -> None:
     probe = load_probes(FIXTURE_DIR / "probes.jsonl")[0]
 
     record = run_record(
-        probe, truncated, [_LIST], counter=ApproximateTokenCounter(), cpu_load_procs=0
+        probe,
+        truncated,
+        [_LIST],
+        counter=ApproximateTokenCounter(),
+        cpu_load_procs=0,
+        embedder_device="cpu",
     )
 
     assert record["shortlisted"] == len(_CANDIDATES) + 3

@@ -6,11 +6,15 @@ and any difference in their encode arguments, or in what they do without encodin
 
 The reranker side: real models load from `/opt/models` only, `--rerank-model` included, and
 the trace counts a pair's tokens with the tokenizer of the cross-encoder the reranker loaded.
+
+Placement: `--device` places the reranker and `--embedder-device`, defaulting to `--device`,
+places the embedder; each record names the embedder's device.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Callable
 from pathlib import Path
@@ -215,6 +219,50 @@ def test_the_fake_reranker_counts_whitespace_words() -> None:
 def test_logit_inverts_the_sigmoid_within_the_clamp(p: float, expected: float) -> None:
     assert harness.logit(p) == pytest.approx(expected)
     assert harness.logit(1.0) == pytest.approx(-harness.logit(0.0))
+
+
+@pytest.fixture
+def placements(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """The device each model of the run is built on."""
+    seen: dict[str, list[str]] = {"embedder": [], "reranker": []}
+    build_embedder, build_reranker = harness.build_embedder, harness.build_reranker
+
+    def embedder(choice: str, *, device: str) -> Any:
+        seen["embedder"].append(device)
+        return build_embedder(choice, device=device)  # type: ignore[arg-type]
+
+    def reranker(choice: str, *, device: str, config: Any) -> Any:
+        seen["reranker"].append(device)
+        return build_reranker(choice, device=device, config=config)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(harness, "build_embedder", embedder)
+    monkeypatch.setattr(harness, "build_reranker", reranker)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("argv", "embedder", "reranker"),
+    [
+        pytest.param([], "cpu", "cpu", id="default"),
+        pytest.param(["--device", "cuda"], "cuda", "cuda", id="one-placement"),
+        pytest.param(["--device", "cuda", "--embedder-device", "cpu"], "cpu", "cuda", id="split"),
+        pytest.param(["--embedder-device", "cuda"], "cuda", "cpu", id="embedder-on-cuda"),
+    ],
+)
+def test_device_places_the_reranker_and_embedder_device_the_embedder(
+    tmp_path: Path,
+    placements: dict[str, list[str]],
+    argv: list[str],
+    embedder: str,
+    reranker: str,
+) -> None:
+    output = tmp_path / "run.jsonl"
+
+    assert harness.main(["--output", str(output), *argv]) == 0
+
+    assert placements == {"embedder": [embedder], "reranker": [reranker]}
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert {json.loads(line)["embedder_device"] for line in lines} == {embedder}
 
 
 def test_a_rerank_model_outside_opt_models_is_refused(tmp_path: Path) -> None:
