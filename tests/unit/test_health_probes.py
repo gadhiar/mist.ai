@@ -29,6 +29,7 @@ from backend.extraction_contract.models import (
     ServiceStatus,
     error_envelope,
 )
+from backend.extraction_hold import EXTRACTION_PAUSED_MARKER, ExtractionHold, ExtractionHoldReader
 from backend.health import (
     PROBE_REASONS,
     BackupProbe,
@@ -42,6 +43,7 @@ from backend.health import (
     LLMProbe,
     Neo4jProbe,
     ProbeFailed,
+    ProbePaused,
     ProbeUnavailable,
     ProbeYielded,
     VaultSidecarProbe,
@@ -548,6 +550,13 @@ MATRIX = [
     ({"a": _check("up"), "b": _check("yielded", severity="fatal", stale=True)}, "alive"),
     ({"a": _check(None), "b": _check("yielded", severity="fatal")}, "alive"),
     ({"a": _check("up"), "b": _check("yielded", severity="fatal")}, "dead"),
+    ({"a": _check("up", severity="fatal"), "b": _check("paused")}, "alive"),
+    ({"a": _check("down"), "b": _check("paused")}, "alive"),
+    ({"a": _check("up", severity="fatal"), "b": _check("paused", stale=True)}, "alive"),
+    ({"a": _check("yielded", severity="fatal"), "b": _check("paused")}, "alive"),
+    ({"a": _check("down", severity="fatal"), "b": _check("paused")}, "alive"),
+    ({"a": _check("paused", restart_repairs=True, failures=9)}, "alive"),
+    ({"a": _check("up", severity="fatal"), "b": _check("paused")}, "dead"),
 ]
 
 
@@ -837,11 +846,17 @@ async def service_probe():
     """
     clients: list[httpx.AsyncClient] = []
 
-    def build(service: FakeExtractionService, dispatcher, *, start_failed: bool = False):
+    def build(
+        service: FakeExtractionService,
+        dispatcher,
+        *,
+        start_failed: bool = False,
+        **state,
+    ):
         client = httpx.AsyncClient(transport=httpx.MockTransport(service))
         clients.append(client)
         inference = RemoteExtractionInference(client, SERVICE_URL)
-        return ExtractionServiceProbe(inference, lambda: dispatcher, lambda: start_failed)
+        return ExtractionServiceProbe(inference, lambda: dispatcher, lambda: start_failed, **state)
 
     yield build
     for client in clients:
@@ -1353,10 +1368,16 @@ _ELEVEN_NEW_REASONS = frozenset(
 )
 
 
+# The daily instance's night extraction: the service stopped on purpose.
+_DAILY_INSTANCE_REASONS = frozenset({"extraction_paused"})
+
+
 def test_the_vocabulary_gains_exactly_the_eleven_new_reasons():
     """A word added here is a promise about `/health`, so the set is pinned whole."""
     assert len(_ELEVEN_NEW_REASONS) == 11
-    assert PROBE_REASONS == _REASONS_BEFORE_THIS_GOAL | _ELEVEN_NEW_REASONS
+    assert PROBE_REASONS == (
+        _REASONS_BEFORE_THIS_GOAL | _ELEVEN_NEW_REASONS | _DAILY_INSTANCE_REASONS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1475,3 +1496,245 @@ class TestDeriveStatusYielded:
         checks = {"llm": _check("yielded", severity="fatal", restart_repairs=True, failures=99)}
 
         assert derive_status(checks, "alive", settled_failures=5) == ("yielded", False)
+
+
+# ---------------------------------------------------------------------------
+# The paused status: extraction stopped on purpose outside its night window
+# ---------------------------------------------------------------------------
+
+_PAUSED_SINCE = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
+
+
+class FakeHold:
+    """The hold-state callable: a fixed answer, with every read counted."""
+
+    def __init__(self, hold: ExtractionHold | None) -> None:
+        self.hold = hold
+        self.calls = 0
+
+    def __call__(self) -> ExtractionHold | None:
+        self.calls += 1
+        return self.hold
+
+
+def _paused(reason: str = "window") -> FakeHold:
+    return FakeHold(ExtractionHold(since=_PAUSED_SINCE, reason=reason, until=None))
+
+
+class TestExtractionServiceProbePaused:
+    @pytest.mark.parametrize("name", ["yield_state", "hold_state"])
+    def test_the_state_callables_are_keyword_only_and_default_to_none(self, name):
+        """Left out, as on the dev stack without `MIST_OPS_DIR`, the probe is as before."""
+        parameter = inspect.signature(ExtractionServiceProbe).parameters[name]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+    @pytest.mark.asyncio
+    async def test_yielded_renders_yielded_before_the_hold_and_without_a_call(
+        self, clock, service_probe
+    ):
+        """Gaming mode stops extraction too; the yield is the truer reason."""
+        service = FakeExtractionService(_refusing)
+        hold = _paused("gaming")
+        probe = service_probe(
+            service, FakeDispatcher(), yield_state=lambda: "yielded", hold_state=hold
+        )
+
+        check = await run_single(clock, probe)
+
+        assert (check["status"], check["reason"]) == ("yielded", "gpu_yielded")
+        assert check["consecutive_failures"] == 0
+        assert service.calls == 0
+        assert hold.calls == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["window", "mode", "gaming", "starting", "unconfigured"])
+    async def test_a_hold_renders_paused_without_calling_the_service(
+        self, clock, service_probe, reason
+    ):
+        service = FakeExtractionService(_refusing)
+        probe = service_probe(
+            service, FakeDispatcher(), yield_state=lambda: "normal", hold_state=_paused(reason)
+        )
+
+        check = await run_single(clock, probe)
+
+        assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+        assert check["consecutive_failures"] == 0
+        assert check["latency_ms"] is not None
+        assert service.calls == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("dispatcher", "start_failed"),
+        [
+            pytest.param(None, False, id="no-dispatcher"),
+            pytest.param(FakeDispatcher(mode="off", state="disabled"), False, id="mode-off"),
+            pytest.param(FakeDispatcher(), True, id="start-failed"),
+        ],
+    )
+    async def test_the_hold_is_decided_before_todays_rows(
+        self, clock, service_probe, dispatcher, start_failed
+    ):
+        """The plan's order: yield, then hold, then the probe as it was."""
+        probe = service_probe(
+            FakeExtractionService(_answering()),
+            dispatcher,
+            start_failed=start_failed,
+            hold_state=_paused(),
+        )
+
+        check = await run_single(clock, probe)
+
+        assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["normal", "resume_failed"])
+    async def test_no_hold_and_no_yield_probes_as_before(self, clock, service_probe, state):
+        """`resume_failed` is the llm check's fault to report, not this one's."""
+        service = FakeExtractionService(_refusing)
+        hold = FakeHold(None)
+        probe = service_probe(service, FakeDispatcher(), yield_state=lambda: state, hold_state=hold)
+
+        check = await run_single(clock, probe)
+
+        assert (check["status"], check["reason"]) == ("down", "unreachable")
+        assert service.calls == 1
+        assert hold.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_a_marker_past_its_until_reads_the_service_again(
+        self, clock, service_probe, tmp_path
+    ):
+        """A start that hung past its deadline is a stopped service, reported down."""
+        marker = tmp_path / EXTRACTION_PAUSED_MARKER
+        marker.write_text(
+            json.dumps(
+                {
+                    "v": 1,
+                    "since": "2026-09-22T23:30:00Z",
+                    "reason": "starting",
+                    "until": "2026-09-22T23:40:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        reader = ExtractionHoldReader(marker, wall_clock=clock.wall)
+        service = FakeExtractionService(_refusing)
+        probe = service_probe(service, FakeDispatcher(), hold_state=reader.current)
+
+        check = await run_single(clock, probe)
+
+        assert (check["status"], check["reason"]) == ("down", "unreachable")
+        assert service.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_a_live_marker_reads_paused_and_its_removal_reads_the_service(
+        self, clock, service_probe, tmp_path
+    ):
+        marker = tmp_path / EXTRACTION_PAUSED_MARKER
+        marker.write_text(
+            json.dumps({"v": 1, "since": "2026-09-22T10:00:00Z", "reason": "mode", "until": None}),
+            encoding="utf-8",
+        )
+        reader = ExtractionHoldReader(marker, wall_clock=clock.wall)
+        service = FakeExtractionService(_answering())
+        probe = service_probe(service, FakeDispatcher(), hold_state=reader.current)
+        registry = build_registry(clock, [probe])
+
+        await registry.run_once()
+        paused = registry.snapshot()["checks"]["extraction_service"]
+        marker.unlink()
+        await registry.run_once()
+        running = registry.snapshot()["checks"]["extraction_service"]
+
+        assert paused["status"] == "paused"
+        assert running["status"] == "up"
+        assert service.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_paused_probe_resets_failures_and_never_recommends_a_restart(clock):
+    """A night spent unreachable, then the marker: the count starts again from 0."""
+    outcome = {"raise": ProbeFailed("unreachable")}
+
+    async def behaviour() -> None:
+        raise outcome["raise"]
+
+    probe = StubProbe("night_service", behaviour, restart_repairs=True)
+    registry = build_registry(clock, [probe])
+    for _ in range(SETTLED_FAILURES + 1):
+        await registry.run_once()
+    assert registry.snapshot()["restart_recommended"] is True
+
+    outcome["raise"] = ProbePaused("extraction_paused")
+    await registry.run_once()
+    snapshot = registry.snapshot()
+
+    check = snapshot["checks"]["night_service"]
+    assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+    assert check["consecutive_failures"] == 0
+    assert check["latency_ms"] is not None
+    assert snapshot["status"] == "healthy"
+    assert snapshot["restart_recommended"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_loop_cancels_a_probe_in_flight(clock):
+    """The shield outlives a timeout, not the loop: shutdown leaves no probe pending.
+
+    A probe left running past the loop is destroyed while still pending when
+    the event loop closes, which asyncio reports as an error at exit.
+    """
+    release = threading.Event()
+
+    async def reading_a_file() -> None:
+        await asyncio.to_thread(release.wait, 5.0)
+
+    probe = StubProbe("slow_reader", reading_a_file, timeout_seconds=5.0)
+    registry = build_registry(clock, [probe])
+    loop_task = asyncio.create_task(registry.run_forever())
+    while probe.calls == 0:
+        await asyncio.sleep(0)
+
+    loop_task.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    release.set()
+
+    assert pending == []
+
+
+class TestDeriveStatusPaused:
+    def test_paused_with_everything_else_up_is_healthy(self):
+        """The daily instance reads healthy all day while extraction waits for night."""
+        checks = {
+            "llm": _check("up", severity="fatal"),
+            "neo4j": _check("up"),
+            "extraction_service": _check("paused"),
+        }
+
+        assert derive_status(checks, "alive") == ("healthy", False)
+
+    def test_paused_beside_a_degraded_check_is_degraded(self):
+        checks = {
+            "llm": _check("up", severity="fatal"),
+            "backup": _check("down"),
+            "extraction_service": _check("paused"),
+        }
+
+        assert derive_status(checks, "alive") == ("degraded", False)
+
+    def test_a_stale_paused_check_reads_unknown_so_the_status_is_degraded(self):
+        checks = {
+            "llm": _check("up", severity="fatal"),
+            "extraction_service": _check("paused", stale=True),
+        }
+
+        assert derive_status(checks, "alive")[0] == "degraded"
+
+    def test_a_paused_check_never_recommends_a_restart_at_any_failure_count(self):
+        checks = {"extraction_service": _check("paused", restart_repairs=True, failures=99)}
+
+        assert derive_status(checks, "alive", settled_failures=5) == ("healthy", False)
