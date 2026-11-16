@@ -16,7 +16,7 @@ import pytest
 
 PACKAGE = Path(__file__).resolve().parents[3] / "scripts" / "voice_data"
 EXEMPT_DIRS = ("stages", "bindings", "teachers", "students", "convert", "bench/probes")
-EXEMPT_FILES = ("rehearsal/mix.py",)
+EXEMPT_FILES = ("rehearsal/mix.py", "rehearsal/calibrate.py")
 
 
 def is_host_module(rel: str) -> bool:
@@ -81,6 +81,7 @@ def test_checker_allows_scripts_imports() -> None:
         ("students/b.py", False),
         ("convert/c.py", False),
         ("rehearsal/mix.py", False),
+        ("rehearsal/calibrate.py", False),
         ("bench/probes/p.py", False),
     ],
 )
