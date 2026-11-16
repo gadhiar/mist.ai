@@ -30,7 +30,9 @@ The order is Design 4's:
    check; a centre-channel cut failing SNR, C50 or the window check is retried from the downmix
    (`fc-failed:<gate>`). Every drop is a record with its reasons.
 7. States are proposed for kept segments, and `report.json` is written with the keys the seed
-   gate reads.
+   gate reads. `turns.jsonl` records every diarized turn, whatever its cluster's role, with the
+   SIMs and per-embedder gaps retrieval measured on it, so a scorer can tell which cluster held
+   which speaker.
 
 Models come from `load_models`, which T11's bindings serve; tests pass fakes through it.
 """
@@ -754,16 +756,19 @@ class Extraction:
             drafts.extend(sorted(source_drafts, key=lambda d: (d.span.start_s, d.span.end_s)))
         records, proposals = self._records(drafts, audio_dir, written)
         report = self._report(works, records, drafts, model, windows, detail)
+        turns = turn_records(works, anchor_centroid, model, self.limits.margin)
         run_rel = contract.run_rel(self.run_id)
         seg_rel = f"{run_rel}/{contract.SEGMENTS_NAME}"
         _write_text(self.data / seg_rel, "".join(json.dumps(r.to_json()) + "\n" for r in records))
+        turns_rel = f"{run_rel}/{contract.TURNS_NAME}"
+        _write_text(self.data / turns_rel, "".join(json.dumps(t.to_json()) + "\n" for t in turns))
         prop_rel = f"{run_rel}/{contract.PROPOSALS_NAME}"
         _write_text(self.data / prop_rel, "".join(json.dumps(p) + "\n" for p in proposals))
         report_rel = f"{run_rel}/{contract.REPORT_NAME}"
         _write_json(self.data / report_rel, report)
         kept = sum(r.kept for r in records)
-        print(f"extract: {len(records)} segments, {kept} kept")
-        return self._result("ok", detail, [*written, seg_rel, prop_rel, report_rel])
+        print(f"extract: {len(records)} segments, {kept} kept, {len(turns)} turns recorded")
+        return self._result("ok", detail, [*written, seg_rel, turns_rel, prop_rel, report_rel])
 
     # The second pass and the segment gates.
 
@@ -805,7 +810,8 @@ class Extraction:
         primary = work.source.primary_channel
         for turn, emb in zip(work.turns, work.turn_embs, strict=True):
             # Turns of clusters not admitted are other speakers, not candidates, so they leave no
-            # record; a turn too short to embed is a candidate when its cluster is admitted.
+            # segment record (`turn_records` holds them); a turn too short to embed is a
+            # candidate when its cluster is admitted.
             role = work.roles.get(turn.speaker)
             if role is None or role.role == retrieve.OTHER:
                 continue
@@ -1064,6 +1070,8 @@ class Extraction:
         for work in works:
             sid = work.source.source_id
             own = [r for r in records if r.source_id == sid]
+            seconds = cluster_seconds(work.turns)
+            primary = [r.label for r in work.roles.values() if r.role == retrieve.PRIMARY]
             sources.append(
                 {
                     "source_id": sid,
@@ -1072,11 +1080,13 @@ class Extraction:
                     "separator_scores": {
                         k: None if v is None else round(v, 4) for k, v in work.scores.items()
                     },
+                    "primary_s": seconds[primary[0]] if primary else 0.0,
                     "clusters": [
                         {
                             "diar_cluster": role.label,
                             "role": role.role,
                             "turns": role.turns,
+                            "seconds": seconds[role.label],
                             "median_sim": {k: round(v, 4) for k, v in role.median_sim.items()},
                         }
                         for role in work.roles.values()
@@ -1144,6 +1154,68 @@ class Extraction:
             "rehearsal": None,
             "thresholds": dict(sorted(self.thresholds.items())),
         }
+
+
+def cluster_seconds(turns: Sequence[Turn]) -> dict[str, float]:
+    """Return each diarizer label's seconds over all its turns, those too short to embed too."""
+    seconds: dict[str, float] = {}
+    for turn in turns:
+        seconds[turn.speaker] = seconds.get(turn.speaker, 0.0) + (turn.end_s - turn.start_s)
+    return {label: round(value, 3) for label, value in seconds.items()}
+
+
+def _rounded(values: Mapping[str, float]) -> dict[str, float]:
+    return {name: round(float(value), 4) for name, value in values.items()}
+
+
+def turn_records(
+    works: Sequence[SourceWork],
+    anchor_centroid: Mapping[str, np.ndarray],
+    model: retrieve.TargetModel | None,
+    margin: Mapping[str, float],
+) -> list[contract.TurnRecord]:
+    """Return one record per diarized turn of every source, sorted by source and start.
+
+    It writes down what retrieval already computed and embeds nothing: each turn's centre-channel
+    embedding from the first loop, the anchor centroid, the target model and the source's rival
+    centroids. `retrieve.judge` is run on every embedded turn, whatever its role, so a turn of a
+    non-admitted cluster carries the gaps a scorer needs to say how far another speaker sat from
+    the target. A label with no embedded turn has no role from `retrieve.cluster_roles`; its
+    turns are recorded as `other`, as the second pass treats them.
+    """
+    rows: list[contract.TurnRecord] = []
+    for work in works:
+        for index, (turn, emb) in enumerate(zip(work.turns, work.turn_embs, strict=True)):
+            role = work.roles.get(turn.speaker)
+            sim_anchor = sim_target = gaps = None
+            passed: bool | None = None
+            reasons: tuple[str, ...] = ()
+            if emb is not None:
+                sim_anchor = _rounded(retrieve.sims(emb, anchor_centroid))
+                if model is not None:
+                    verdict = retrieve.judge(emb, model, work.rivals, margin)
+                    sim_target = _rounded(verdict.sim)
+                    gaps = None if verdict.gaps is None else _rounded(verdict.gaps)
+                    passed, reasons = verdict.passed, verdict.reasons
+            span = Span(turn.start_s, turn.end_s)
+            rows.append(
+                contract.TurnRecord(
+                    source_id=work.source.source_id,
+                    turn=index,
+                    start_s=round(turn.start_s, 3),
+                    end_s=round(turn.end_s, 3),
+                    diar_cluster=turn.speaker,
+                    role=retrieve.OTHER if role is None else role.role,
+                    embedded=emb is not None,
+                    touches_overlap=segments.intersects(span, work.overlaps),
+                    sim_anchor=sim_anchor,
+                    sim_target=sim_target,
+                    gaps=gaps,
+                    passed=passed,
+                    reasons=reasons,
+                )
+            )
+    return sorted(rows, key=lambda r: (r.source_id, r.start_s, r.turn))
 
 
 def _distribution(model: retrieve.TargetModel | None) -> dict[str, object] | None:

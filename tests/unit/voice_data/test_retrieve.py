@@ -287,6 +287,13 @@ def test_each_embedder_is_held_to_its_own_margin() -> None:
     assert dropped.reasons == ("margin:wavlm-sv",)
 
 
+def test_the_verdict_carries_each_embedders_gap_and_the_margin_is_their_minimum() -> None:
+    turn, model, rivals = _gap_case()
+    verdict = retrieve.judge(turn, model, rivals, margin_min={"wavlm-sv": 0.0, "ecapa": 0.1})
+    assert verdict.gaps == {"wavlm-sv": pytest.approx(-0.01), "ecapa": pytest.approx(0.70)}
+    assert verdict.margin == min(verdict.gaps.values())
+
+
 def test_a_mapping_without_an_embedder_the_clips_carry_is_refused() -> None:
     turn, model, rivals = _gap_case()
     wavlm_only = {"wavlm-sv": 0.6}
@@ -301,7 +308,7 @@ def test_a_mapping_without_an_embedder_the_clips_carry_is_refused() -> None:
 def test_no_rival_means_no_margin_and_no_margin_reason() -> None:
     model = _model(_episode(impostor=False))
     verdict = retrieve.judge(emb(TARGET, 5), model, {}, margin_min=MARGIN)
-    assert verdict.margin is None
+    assert verdict.margin is None and verdict.gaps is None
     assert verdict.passed
 
 

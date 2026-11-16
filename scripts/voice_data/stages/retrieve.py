@@ -53,16 +53,19 @@ class TargetModel:
 
 @dataclass(frozen=True, slots=True)
 class Verdict:
-    """The second pass on one clip: whether it is kept, why not, its SIMs and its margin.
+    """The second pass on one clip: whether it is kept, why not, its SIMs, gaps and margin.
 
-    `margin` is the smallest, over embedders, of the clip's SIM to the target less its highest
-    SIM to a rival cluster; `None` when its episode has no rival.
+    `gaps` holds, per embedder, the clip's SIM to the target less its highest SIM to a rival
+    cluster, and `margin` is the smallest of them; both are `None` when its episode has no
+    rival. Each gap is kept because each embedder is held to its own margin value, so the
+    smallest alone cannot say which embedder failed or by how much.
     """
 
     passed: bool
     reasons: tuple[str, ...]
     sim: dict[str, float]
     margin: float | None
+    gaps: dict[str, float] | None
 
 
 def _names(embs: Sequence[Mapping[str, np.ndarray]]) -> list[str]:
@@ -238,6 +241,7 @@ def judge(
     floors = [f"floor:{name}" for name in sim if not sim[name] >= model.floor[name] - EPS]
     margins: list[str] = []
     margin = None
+    gaps: dict[str, float] | None = None
     if rivals:
         gaps = {}
         for name in sim:
@@ -247,7 +251,7 @@ def judge(
                 margins.append(f"margin:{name}")
         margin = min(gaps.values())
     reasons = tuple(floors + margins)
-    return Verdict(passed=not reasons, reasons=reasons, sim=sim, margin=margin)
+    return Verdict(passed=not reasons, reasons=reasons, sim=sim, margin=margin, gaps=gaps)
 
 
 def candidate_score(

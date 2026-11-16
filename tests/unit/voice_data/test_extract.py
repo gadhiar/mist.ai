@@ -895,6 +895,156 @@ def test_every_other_kept_surround_segment_is_fc(surround_run: Ran) -> None:
     }
 
 
+# The turn record, on a three-cluster episode: the target (primary), the impostor (flagged at its
+# designed 0.8) and another voice (other).
+
+TURN_FIELDS = {
+    "source_id", "turn", "start_s", "end_s", "diar_cluster", "role", "embedded",
+    "touches_overlap", "sim_anchor", "sim_target", "gaps", "passed", "reasons",
+}  # fmt: skip
+
+
+def turn_episode() -> Episode:
+    """Six target lines, two impostor and two other-voice lines, then a 0.4 s target turn.
+
+    The diarizer reports an overlap on the last second of the first other-voice turn.
+    """
+    b = Builder()
+    for i in range(6):
+        b.line("target", 4.0, "calm")
+        if i % 3 == 1:
+            b.line("impostor", 4.0, "impostor")
+        if i % 3 == 2:
+            b.line("other_a", 4.0, "other")
+    b.line("target", 0.4, "short")
+    first = b.groups["other"][0]
+    b.overlaps.append(Span(first.end_s - 1.0, first.end_s))
+    return b.build()
+
+
+@dataclass
+class TurnRun:
+    ran: Ran
+    rows: list[dict]
+    outputs: list[str]
+
+
+def _turn_run(base: Path, overlay: Mapping[str, float] | None = None) -> TurnRun:
+    episode = turn_episode()
+    root = make_root(base, episode, clips={"solo.wav": take("target", 6.0, 1)})
+    if overlay is not None:
+        (root.path / "config" / "gates.json").write_text(json.dumps(overlay), encoding="utf-8")
+    docker = StageDocker(root, models_for(episode, main_prototypes()))
+    code, out, err = extract(root, docker)
+    run_dir = root.path / "seed" / "runs" / "r1"
+    assert code == 0, err
+    report = json.loads((run_dir / "report.json").read_text())
+    text = (run_dir / extract_cmd.TURNS_NAME).read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in text.splitlines()]
+    outputs = json.loads((run_dir / "outputs.json").read_text())["files"]
+    ran = Ran(root, episode, code, out, err, [], report, docker)
+    return TurnRun(ran, rows, [f["rel"] for f in outputs])
+
+
+@pytest.fixture(scope="module")
+def turn_run(tmp_path_factory: pytest.TempPathFactory) -> TurnRun:
+    return _turn_run(tmp_path_factory.mktemp("turns"))
+
+
+@pytest.fixture(scope="module")
+def no_target_run(tmp_path_factory: pytest.TempPathFactory) -> TurnRun:
+    # No cluster reaches an anchor floor above 1, so none is primary and no target model exists.
+    return _turn_run(tmp_path_factory.mktemp("no-target"), {"retrieval.anchor_floor.ecapa": 1.5})
+
+
+def test_every_turn_of_a_three_cluster_source_has_a_row(turn_run: TurnRun) -> None:
+    turns = turn_run.ran.episode.turns
+    rows = turn_run.rows
+    assert extract_cmd.TURNS_NAME == "turns.jsonl"
+    assert "seed/runs/r1/turns.jsonl" in turn_run.outputs
+    assert len(rows) == len(turns) == 11
+    assert all(set(row) == TURN_FIELDS for row in rows)
+    assert [row["turn"] for row in rows] == list(range(len(turns)))
+    for row, turn in zip(rows, sorted(turns, key=lambda t: t.start_s), strict=True):
+        assert row["source_id"] == "src-0001"
+        assert (row["start_s"], row["end_s"]) == (round(turn.start_s, 3), round(turn.end_s, 3))
+        assert row["diar_cluster"] == turn.speaker
+    roles = {row["diar_cluster"]: row["role"] for row in rows}
+    assert roles == {"spk-01": "primary", "spk-03": "flagged", "spk-04": "other"}
+    others = [row for row in rows if row["role"] == "other"]
+    assert len(others) == 2
+    for row in others:
+        assert row["embedded"] is True
+        assert row["sim_anchor"] == {"wavlm-sv": pytest.approx(0.1), "ecapa": pytest.approx(0.1)}
+        assert row["sim_target"] == {"wavlm-sv": pytest.approx(0.1), "ecapa": pytest.approx(0.1)}
+        # The sole rival is the other voice's own cluster, so its gap is 0.1 less 1.0.
+        assert row["gaps"] == {"wavlm-sv": pytest.approx(-0.9), "ecapa": pytest.approx(-0.9)}
+        assert row["passed"] is False and "margin:ecapa" in row["reasons"]
+    for row in rows:
+        for key in ("sim_anchor", "sim_target", "gaps"):
+            assert all(round(v, 4) == v for v in (row[key] or {}).values())
+    target = [row for row in rows if row["role"] == "primary" and row["embedded"]]
+    assert len(target) == 6
+    assert all(row["passed"] is True and row["reasons"] == [] for row in target)
+    impostor = [row for row in rows if row["role"] == "flagged"]
+    assert [row["sim_target"]["wavlm-sv"] for row in impostor] == [pytest.approx(0.8)] * 2
+
+
+def test_a_turn_under_half_a_second_is_not_embedded(turn_run: TurnRun) -> None:
+    (short,) = (row for row in turn_run.rows if row["end_s"] - row["start_s"] < 0.5)
+    assert (short["diar_cluster"], short["role"], short["embedded"]) == ("spk-01", "primary", False)
+    assert short["sim_anchor"] is None and short["sim_target"] is None and short["gaps"] is None
+    assert short["passed"] is None and short["reasons"] == []
+
+
+def test_a_turn_meeting_an_overlap_is_marked(turn_run: TurnRun) -> None:
+    first = turn_run.ran.episode.groups["other"][0]
+    touching = [row for row in turn_run.rows if row["touches_overlap"]]
+    assert [(row["start_s"], row["diar_cluster"]) for row in touching] == [
+        (round(first.start_s, 3), "spk-04")
+    ]
+
+
+def test_with_no_target_model_the_target_sims_gaps_and_verdicts_are_null(
+    no_target_run: TurnRun,
+) -> None:
+    rows = no_target_run.rows
+    assert no_target_run.ran.report["distribution"] is None
+    assert len(rows) == 11 and {row["role"] for row in rows} == {"other"}
+    for row in rows:
+        assert row["sim_target"] is None and row["gaps"] is None
+        assert row["passed"] is None and row["reasons"] == []
+        assert (row["sim_anchor"] is not None) == row["embedded"]
+    (source,) = no_target_run.ran.report["sources"]
+    assert source["primary_s"] == 0
+
+
+def test_the_report_gives_each_clusters_seconds_and_the_primary_seconds(
+    turn_run: TurnRun,
+) -> None:
+    (source,) = turn_run.ran.report["sources"]
+    seconds = {c["diar_cluster"]: c["seconds"] for c in source["clusters"]}
+    # A cluster's seconds count every one of its turns, the 0.4 s one too.
+    assert seconds == {"spk-01": 24.4, "spk-03": 8.0, "spk-04": 8.0}
+    assert source["primary_s"] == 24.4
+    out = turn_run.ran.out
+    assert "src-0001: separator none" in out and "primary 24.400 s" in out
+    assert "spk-01 primary: 6 turns, 24.400 s, median" in out
+    assert "spk-04 other: 2 turns, 8.000 s, median" in out
+
+
+def test_anchor_lines_mark_each_embedder_below_its_value() -> None:
+    rows = [
+        {"anchor": "clip-1", "sim": {"wavlm-sv": 0.85, "ecapa": 0.40}},
+        {"anchor": "time-1", "sim": {"wavlm-sv": 0.79, "ecapa": 0.50}},
+    ]
+    thresholds = {"anchors.sim_min.wavlm-sv": 0.8, "anchors.sim_min.ecapa": 0.45}
+    assert extract_cmd.anchor_lines(rows, thresholds) == [
+        "  anchor clip-1: wavlm-sv 0.850, ecapa 0.400 below",
+        "  anchor time-1: wavlm-sv 0.790 below, ecapa 0.500",
+    ]
+
+
 # Separator choice, on a synthetic episode with the spectral fake embedder.
 
 
@@ -1051,6 +1201,8 @@ def test_anchors_that_disagree_exit_3(tmp_path: Path) -> None:
     assert code == 3, err
     assert "anchors disagree" in err
     assert "anchor clip-1" in out and "anchor time-1" in out
+    # Two anchors: each one's SIM is to the other, so both fall below the default 0.6.
+    assert "wavlm-sv 0.100 below, ecapa 0.100 below" in out
     assert not (root.path / "seed" / "runs" / "r1" / "segments.jsonl").exists()
 
 
