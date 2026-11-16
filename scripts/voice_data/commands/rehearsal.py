@@ -1,6 +1,6 @@
-"""`rehearsal build|answer|score`: public stand-in episodes, their labels answers and their score.
+"""`rehearsal build|anchors|answer|score`: stand-in episodes, anchors, labels answers and score.
 
-All three run on a root of kind `rehearsal` only, so a private root's episodes, keys and labels
+All four run on a root of kind `rehearsal` only, so a private root's episodes, keys and labels
 are never mixed with the stand-in's.
 
 - `build [--episodes N] [--minutes M] [--seed S]` runs the `build` step of `rehearsal/mix.py` as
@@ -8,6 +8,10 @@ are never mixed with the stand-in's.
   `rehearsal/episodes/`, the ground truth to `rehearsal/truth.jsonl` and `rehearsal/build.json`,
   and the solo anchor clip to `seed/reference/rehearsal-anchor.wav`. Every package writer refuses
   `seed/raw/`, so the lead moves the episodes to `seed/raw/rehearsal/` before `ingest` (H6).
+- `anchors` writes `seed/anchors.csv` after `ingest`: one timestamp row for each speaking state
+  but neutral, which the solo clip covers, so extract checks anchors across registers as it will
+  with Raj's. The ground truth picks each row by a fixed rule (`anchor_rows`), never by a score.
+  It prints `time-<n> <state> <source_id>` for data row n.
 - `answer --pack P` answers a labels pack from the ground truth: each segment's true state, and
   "not her" for every segment that is not the target's. It writes
   `rehearsal/answers/<P>/ratings.csv` for `pack import`.
@@ -44,6 +48,7 @@ from ..records import (
     write_json,
 )
 from ..rehearsal import score as score_mod
+from ..states import NEUTRAL_STATE, SPEAKING_STATES
 from . import clean as clean_cmd
 from . import extract as extract_cmd
 from . import ingest as ingest_cmd
@@ -56,13 +61,14 @@ _PACK_ID = re.compile(r"[0-9a-f]{16}")
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
-    """Add the `rehearsal` command and its three actions."""
+    """Add the `rehearsal` command and its four actions."""
     parser = subparsers.add_parser(
         "rehearsal",
         help="public stand-in episodes with ground truth (rehearsal roots only)",
         description=(
-            "Build stand-in episodes from public speech, answer a labels pack from their ground "
-            "truth, or score an extraction run against it. Runs on a root of kind rehearsal."
+            "Build stand-in episodes from public speech, write anchor rows or answer a labels "
+            "pack from their ground truth, or score an extraction run against it. Runs on a root "
+            "of kind rehearsal."
         ),
     )
     actions = parser.add_subparsers(dest="rehearsal_action", metavar="ACTION", required=True)
@@ -71,6 +77,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     build.add_argument("--minutes", type=float, default=pkg.DEFAULT_MINUTES)
     build.add_argument("--seed", type=int, default=pkg.DEFAULT_SEED)
     build.set_defaults(func=run_build)
+    anchors = actions.add_parser(
+        "anchors", help="write seed/anchors.csv: one ground-truth row per non-neutral state"
+    )
+    anchors.set_defaults(func=run_anchors)
     answer = actions.add_parser("answer", help="write a labels pack's ratings from the truth")
     answer.add_argument("--pack", required=True, help="the labels pack id")
     answer.set_defaults(func=run_answer)
@@ -198,6 +208,102 @@ def build_lines(build: Mapping[str, object]) -> list[str]:
         "seed/raw/rehearsal/ before ingest"
     )
     return lines
+
+
+# ---------------------------------------------------------------------------
+# anchors
+# ---------------------------------------------------------------------------
+
+
+def run_anchors(args: argparse.Namespace) -> int:
+    """Write `seed/anchors.csv` from the ground truth and print one line per row.
+
+    The lines name the state and the source id only, so the lead can report them and mark a row
+    `extract` flags by its number without any file name reaching the output.
+    """
+    root = open_rehearsal(args.root)
+    if (root.path / extract_cmd.ANCHORS_REL).exists():
+        raise InputError(
+            f"refused: {extract_cmd.ANCHORS_REL} exists; this root already holds anchor rows"
+        )
+    truth = pkg.read_truth(root.path / pkg.TRUTH_REL)
+    inventory_path = root.path / INVENTORY_REL
+    if not inventory_path.is_file():
+        raise InputError(f"refused: {INVENTORY_REL} is missing; run ingest first")
+    inventory = read_jsonl(inventory_path, SourceRecord)
+    gates = gates_mod.load(root.path)
+    min_s, max_s = gates.value("anchors.min_s"), gates.value("anchors.max_s")
+    rows = anchor_rows(truth, inventory, min_s, max_s)
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(extract_cmd.ANCHORS_HEADER)
+    for line, _, source in rows:
+        writer.writerow([source, line.start_s, line.end_s])
+    root.write_bytes(extract_cmd.ANCHORS_REL, out.getvalue().encode("utf-8"))
+    for number, (line, record, _) in enumerate(rows, start=1):
+        print(f"time-{number} {line.state} {record.source_id}")
+    return 0
+
+
+def anchor_rows(
+    truth: Sequence[pkg.TruthLine],
+    inventory: Sequence[SourceRecord],
+    min_s: float,
+    max_s: float,
+) -> list[tuple[pkg.TruthLine, SourceRecord, str]]:
+    """Return each non-neutral state's anchor: its truth line, its episode's record, its source.
+
+    The rule is fixed rather than scored, so the rows stand in for ones Raj picks by ear: for each
+    state in `SPEAKING_STATES` order but neutral, the first target line in truth order in that
+    state with geometry `centre`, no overlap, and a length from `min_s` to `max_s` (the test
+    `read_anchors` applies). The n-th of those states starts its search at the n-th episode in
+    truth order (counted round when there are fewer), so the rows spread across episodes; it moves
+    on through later episodes and wraps. The source is the path, relative to `seed/raw/`, of the
+    inventory record whose `sha256` is the line's `episode_sha256`.
+
+    Raises:
+        InputError: An episode's sha256 is not in the inventory, the record holding it is not
+            under `seed/raw/`, or a state has no qualifying line.
+    """
+    by_sha: dict[str, SourceRecord] = {}
+    for record in inventory:
+        by_sha.setdefault(record.sha256, record)
+    for line in truth:
+        if line.episode_sha256 not in by_sha:
+            raise InputError(
+                f"refused: episode {line.episode}'s sha256 is not in {INVENTORY_REL}; move the "
+                "episodes to seed/raw/rehearsal/ and run ingest first"
+            )
+    episodes = list(dict.fromkeys(line.episode for line in truth))
+    states = [state for state in SPEAKING_STATES if state != NEUTRAL_STATE]
+    prefix = f"{root_mod.SEED_RAW}/"
+    rows: list[tuple[pkg.TruthLine, SourceRecord, str]] = []
+    for number, state in enumerate(states):
+        start = number % len(episodes) if episodes else 0
+        found = next(
+            (
+                line
+                for episode in episodes[start:] + episodes[:start]
+                for line in truth
+                if line.episode == episode
+                and line.speaker == "target"
+                and line.state == state
+                and line.geometry == "centre"
+                and not line.overlap
+                and min_s <= line.end_s - line.start_s <= max_s
+            ),
+            None,
+        )
+        if found is None:
+            raise InputError(
+                f"refused: no target line in state {state} is centre, unoverlapped and "
+                f"{min_s:g}-{max_s:g} s long"
+            )
+        record = by_sha[found.episode_sha256]
+        if not record.path.startswith(prefix):
+            raise InputError(f"refused: source {record.source_id} is not under {root_mod.SEED_RAW}")
+        rows.append((found, record, record.path[len(prefix) :]))
+    return rows
 
 
 # ---------------------------------------------------------------------------
