@@ -185,6 +185,9 @@ DESIGNED = {
     "damaged": _designed(0.3, 5),
     "music": _designed(0.0, 6),
     "silence": _designed(0.0, 7),
+    # The target and the impostor through the low-pass separator of the separator-choice cases.
+    "target_dme": _designed(0.9, 6),
+    "impostor_dme": _designed(0.85, 7),
 }
 
 
@@ -1105,6 +1108,226 @@ def test_a_candidate_without_a_reference_scores_none() -> None:
 def test_a_separator_named_none_is_refused() -> None:
     with pytest.raises(extract_stage.StageError):
         extract_stage.separate(np.zeros(RATE, dtype=np.float32), RATE, (Distorter("none", 1.0),))
+
+
+# Separator choice on the provisional target turns. Through the low-pass `dme`, the target sits at
+# 0.9 to the solo clip and the impostor at 0.85; through `none` they sit at 1.0 and 0.8. When the
+# impostor holds most windows, the median of the best windows is the impostor's, so `dme` wins on
+# windows, while on the target's own turns `none` wins.
+
+DME_CUTOFF_HZ = 1500.0
+
+
+class CountingDiarizer(FakeDiarizer):
+    """The scripted diarizer, keeping the audio of each `turns` call."""
+
+    def __init__(self, turns: Sequence[Turn] = (), overlaps: Sequence[Span] = ()) -> None:
+        super().__init__(turns, overlaps)
+        self.heard: list[np.ndarray] = []
+
+    def turns(self, audio: np.ndarray, sample_rate: int) -> list[Turn]:
+        self.heard.append(audio)
+        return super().turns(audio, sample_rate)
+
+
+def choice_episode(target_lines: int, impostor_lines: int) -> Episode:
+    """The target's and the impostor's 4 s lines, interleaved, the impostor's first."""
+    b = Builder()
+    for i in range(max(target_lines, impostor_lines)):
+        if i < impostor_lines:
+            b.line("impostor", 4.0, "impostor")
+        if i < target_lines:
+            b.line("target", 4.0, "calm")
+    return b.build()
+
+
+def choice_models(episode: Episode) -> extract_stage.Models:
+    target, impostor = take("target", 6.0, 500), take("impostor", 6.0, 502)
+    prototypes = {
+        "target": [target],
+        "impostor": [impostor],
+        "target_dme": [lowpass(target, DME_CUTOFF_HZ)],
+        "impostor_dme": [lowpass(impostor, DME_CUTOFF_HZ)],
+    }
+    voices = Voices(prototypes)
+    return extract_stage.Models(
+        separators=(Distorter("dme", DME_CUTOFF_HZ),),  # type: ignore[arg-type]
+        embedders=(
+            PrototypeEmbedder("wavlm-sv", voices, seed=1),
+            PrototypeEmbedder("ecapa", voices, seed=2),
+        ),
+        diarizer=CountingDiarizer(episode.turns, episode.overlaps),
+        vad=FakeVad(range_db=20.0),
+        quality=FakeQualityEstimator(),
+        arousal=FakeArousal(),
+        prosody=quick_prosody,
+    )
+
+
+def _choice_run(base: Path, target_lines: int, impostor_lines: int) -> Ran:
+    episode = choice_episode(target_lines, impostor_lines)
+    return run_episode(base, episode, choice_models(episode), take("target", 8.0, 700))
+
+
+def _job_log(ran: Ran) -> str:
+    (log,) = (ran.root.path / "runs").glob("job-*/log.txt")
+    return log.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def flip_run(tmp_path_factory: pytest.TempPathFactory) -> Ran:
+    return _choice_run(tmp_path_factory.mktemp("flip"), target_lines=4, impostor_lines=12)
+
+
+def test_a_window_winner_on_another_speakers_windows_loses_on_the_target_turns(
+    flip_run: Ran,
+) -> None:
+    assert flip_run.code == 0, flip_run.err
+    (source,) = flip_run.report["sources"]
+    assert source["separator_window_scores"] == {
+        "none": pytest.approx(0.8),
+        "dme": pytest.approx(0.85),
+    }
+    assert source["separator_provisional"] == "dme"
+    assert source["separator_basis"] == "turns"
+    assert source["separator_turns"] == 4
+    assert source["separator_scores"] == {"none": pytest.approx(1.0), "dme": pytest.approx(0.9)}
+    assert source["separator"] == "none"
+    assert source["separator_rediarized"] is True
+    assert all(r.separator == "none" for r in flip_run.records)
+
+
+def test_the_diarizer_runs_again_on_the_chosen_output_when_the_choice_flips(flip_run: Ran) -> None:
+    diarizer = flip_run.docker.models.diarizer
+    assert isinstance(diarizer, CountingDiarizer)
+    first, second = diarizer.heard
+    voices = Voices(
+        {
+            "target": [take("target", 6.0, 500)],
+            "target_dme": [lowpass(take("target", 6.0, 500), DME_CUTOFF_HZ)],
+        }
+    )
+    span = flip_run.episode.groups["calm"][0]
+    at = slice(int(span.start_s * RATE), int(span.end_s * RATE))
+    assert voices.voice(first[at], RATE) == "target_dme"
+    assert voices.voice(second[at], RATE) == "target"
+    # The kept segments are cut from the second diarization, on `none`, at the target's 1.0.
+    kept = [r for r in flip_run.records if r.kept and r.cluster == "primary"]
+    assert kept and all(r.sim == {"wavlm-sv": pytest.approx(1.0), "ecapa": pytest.approx(1.0)}
+                        for r in kept)  # fmt: skip
+
+
+def test_the_log_and_the_report_lines_name_both_candidates_and_the_basis(flip_run: Ran) -> None:
+    assert (
+        "extract: src-0001 separator none (provisional dme, basis turns, 4 turns scored, "
+        "diarized again)" in _job_log(flip_run)
+    )
+    assert "src-0001: separator none (none 1.000, dme 0.900)" in flip_run.out
+    assert (
+        "    separator basis turns: provisional dme, chosen none, 4 turns scored, diarized again"
+        in flip_run.out
+    )
+    assert "    window scores: none 0.800, dme 0.850" in flip_run.out
+
+
+def test_when_the_turn_scores_agree_the_provisional_turns_are_kept(tmp_path: Path) -> None:
+    ran = _choice_run(tmp_path, target_lines=12, impostor_lines=4)
+    assert ran.code == 0, ran.err
+    (source,) = ran.report["sources"]
+    assert source["separator_window_scores"] == {
+        "none": pytest.approx(1.0),
+        "dme": pytest.approx(0.9),
+    }
+    assert (source["separator_provisional"], source["separator"]) == ("none", "none")
+    assert (source["separator_basis"], source["separator_turns"]) == ("turns", 12)
+    assert source["separator_scores"] == {"none": pytest.approx(1.0), "dme": pytest.approx(0.9)}
+    assert source["separator_rediarized"] is False
+    diarizer = ran.docker.models.diarizer
+    assert isinstance(diarizer, CountingDiarizer) and len(diarizer.heard) == 1
+    assert "basis turns, 12 turns scored, diarized once)" in _job_log(ran)
+
+
+def _direct_choice(
+    diarizer: CountingDiarizer, references: Mapping[str, Mapping[str, np.ndarray] | None]
+) -> tuple[extract_stage.SeparatorChoice, dict[str, float | None]]:
+    episode = choice_episode(4, 12)
+    models = choice_models(episode)
+    models = extract_stage.Models(
+        separators=models.separators, embedders=models.embedders, diarizer=diarizer,
+        vad=models.vad, quality=models.quality, arousal=models.arousal,
+    )  # fmt: skip
+    outputs = extract_stage.separate(episode.audio, RATE, models.separators)
+    windows = extract_stage.candidate_scores(outputs, RATE, models, references)
+    choice = extract_stage.separator_choice(outputs, RATE, models, references)
+    return choice, windows
+
+
+def _solo_reference(models: extract_stage.Models) -> dict[str, np.ndarray]:
+    return retrieve.centroids(
+        [extract_stage.embed(models.embedders, take("target", 8.0, 700), RATE)]
+    )
+
+
+def _no_span_diarizers() -> dict[str, CountingDiarizer]:
+    turns = choice_episode(4, 12).turns
+    every = [Span(t.start_s, t.end_s) for t in turns]
+    return {
+        "no-turn": CountingDiarizer(),
+        "every-turn-overlapped": CountingDiarizer(turns, every),
+        "every-turn-too-short": CountingDiarizer(
+            [Turn(t.start_s, t.start_s + 0.4, t.speaker) for t in turns]
+        ),
+    }
+
+
+@pytest.mark.parametrize("case", sorted(_no_span_diarizers()))
+def test_with_no_span_the_window_scores_decide(case: str) -> None:
+    diarizer = _no_span_diarizers()[case]
+    reference = _solo_reference(choice_models(choice_episode(4, 12)))
+    choice, windows = _direct_choice(diarizer, {"none": reference, "dme": reference})
+    assert (choice.basis, choice.spans, choice.rediarized) == ("windows", 0, False)
+    assert choice.provisional == choice.separator == "dme"
+    assert choice.scores == choice.window_scores == windows
+    assert len(diarizer.heard) == 1
+
+
+def test_with_no_reference_the_window_scores_decide() -> None:
+    diarizer = CountingDiarizer(choice_episode(4, 12).turns)
+    choice, windows = _direct_choice(diarizer, {"none": None, "dme": None})
+    assert windows == {"none": None, "dme": None}
+    assert (choice.basis, choice.spans, choice.rediarized) == ("windows", 0, False)
+    assert choice.provisional == choice.separator == "none"
+    assert choice.scores == choice.window_scores == windows
+    assert len(diarizer.heard) == 1
+
+
+def test_report_lines_print_the_basis_both_candidates_and_both_score_sets() -> None:
+    source = {
+        "source_id": "src-0002", "separator": "roformer", "primary_s": 12.0,
+        "separator_scores": {"none": 0.61, "dme": 0.7, "roformer": 0.72},
+        "separator_basis": "turns",
+        "separator_window_scores": {"none": 0.5, "dme": 0.9, "roformer": 0.8},
+        "separator_provisional": "dme", "separator_turns": 7, "separator_rediarized": True,
+        "kept": 3, "flagged": 0, "dropped": 1, "clusters": [],
+    }  # fmt: skip
+    lines = extract_cmd.report_lines({"run": "r1", "sources": [source]})
+    at = lines.index(
+        "  src-0002: separator roformer (none 0.610, dme 0.700, roformer 0.720); primary 12.000 "
+        "s; kept 3, flagged 0, dropped 1"
+    )
+    assert lines[at + 1 : at + 3] == [
+        "    separator basis turns: provisional dme, chosen roformer, 7 turns scored, "
+        "diarized again",
+        "    window scores: none 0.500, dme 0.900, roformer 0.800",
+    ]
+
+
+def test_report_lines_still_print_a_report_without_the_basis() -> None:
+    source = {"source_id": "src-0001", "separator": "none", "separator_scores": {"none": 0.9}}
+    lines = extract_cmd.report_lines({"run": "r1", "sources": [source]})
+    (line,) = (x for x in lines if x.startswith("  src-0001"))
+    assert line.startswith("  src-0001: separator none (none 0.900); primary none s")
+    assert not [x for x in lines if "separator basis" in x or "window scores" in x]
 
 
 # Per-embedder gate values: the plan's thresholds hold one value per embedder for the anchor

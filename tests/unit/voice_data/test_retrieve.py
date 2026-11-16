@@ -171,6 +171,47 @@ def test_equal_medians_go_to_the_cluster_with_more_turns() -> None:
     assert roles["spk-01"].role == "flagged"
 
 
+# The provisional target cluster: `cluster_roles`' ranking of its primary, with no floor.
+
+
+def _primary(turns: list[tuple[str, retrieve.Embedding]]) -> str | None:
+    roles = _roles(turns)
+    return next((label for label, r in roles.items() if r.role == "primary"), None)
+
+
+@pytest.mark.parametrize(
+    "turns",
+    [
+        _turns("spk-01", OTHER_A, 5, 1)
+        + _turns("spk-02", TARGET, 8, 2)
+        + _turns("spk-03", OTHER_B, 5, 3),
+        _turns("spk-01", TARGET, 8, 1) + _turns("spk-02", IMPOSTOR, 6, 2),
+        _turns("spk-02", IMPOSTOR, 6, 2) + _turns("spk-01", TARGET, 3, 1),
+        [("spk-01", emb(TARGET, 5, 0.0))] * 3 + [("spk-02", emb(TARGET, 5, 0.0))] * 5,
+        [("spk-02", emb(TARGET, 5, 0.0))] * 4 + [("spk-01", emb(TARGET, 5, 0.0))] * 4,
+    ],
+    ids=["nearest", "impostor", "order", "more-turns", "first-label"],
+)
+def test_best_cluster_is_the_cluster_roles_primary(
+    turns: list[tuple[str, retrieve.Embedding]],
+) -> None:
+    primary = _primary(turns)
+    assert primary is not None
+    assert retrieve.best_cluster(turns, _anchor_centroid()) == primary
+
+
+def test_best_cluster_has_no_floor() -> None:
+    # No cluster reaches the floor, so `cluster_roles` names no primary; the nearest still ranks
+    # first.
+    turns = _turns("spk-01", OTHER_B, 4, 1) + _turns("spk-02", OTHER_A, 4, 2)
+    assert _primary(turns) is None
+    assert retrieve.best_cluster(turns, _anchor_centroid()) == "spk-02"
+
+
+def test_best_cluster_of_no_turn_is_none() -> None:
+    assert retrieve.best_cluster([], _anchor_centroid()) is None
+
+
 # The second pass.
 
 

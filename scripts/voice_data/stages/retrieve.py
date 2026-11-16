@@ -133,6 +133,50 @@ def _by_label(turns: Sequence[tuple[str, Embedding]]) -> dict[str, list[Embeddin
     return dict(sorted(grouped.items()))
 
 
+def _medians(
+    turns: Sequence[tuple[str, Embedding]], centre: Mapping[str, np.ndarray]
+) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
+    """Return each cluster's median SIM to `centre` per embedder, and its turn count."""
+    medians: dict[str, dict[str, float]] = {}
+    counts: dict[str, int] = {}
+    for label, embs in _by_label(turns).items():
+        counts[label] = len(embs)
+        medians[label] = {
+            name: float(np.median([cosine(e[name], vector) for e in embs]))
+            for name, vector in centre.items()
+        }
+    return medians, counts
+
+
+def _first(
+    labels: Sequence[str], medians: Mapping[str, Mapping[str, float]], counts: Mapping[str, int]
+) -> str | None:
+    """Rank `labels` by the mean of their medians, ties to more turns and then the first label."""
+    if not labels:
+        return None
+    means = {lb: float(np.mean(list(medians[lb].values()))) for lb in labels}
+    best = max(means.values())
+    tied = [lb for lb in labels if means[lb] >= best - EPS]
+    return min(tied, key=lambda lb: (-counts[lb], lb))
+
+
+def best_cluster(
+    turns: Sequence[tuple[str, Embedding]], centre: Mapping[str, np.ndarray]
+) -> str | None:
+    """Return the cluster `cluster_roles` would make primary if no floor applied.
+
+    The separator choice takes it as the provisional target cluster, ranked against a
+    candidate's reference (the solo clips, or the candidate's own timestamp anchors). It has no
+    floor because the floors are calibrated against the centroid of a full anchor set, so
+    against a reference of fewer anchors a floored cluster would often be missing.
+
+    Returns:
+        The label, or `None` with no turn.
+    """
+    medians, counts = _medians(turns, centre)
+    return _first(list(medians), medians, counts)
+
+
 def cluster_roles(
     turns: Sequence[tuple[str, Embedding]],
     anchor_centroid: Mapping[str, np.ndarray],
@@ -156,25 +200,13 @@ def cluster_roles(
         ValueError: `floor` lacks an embedder of the anchor centroid.
     """
     _require(floor, anchor_centroid, "the anchor floor")
-    medians: dict[str, dict[str, float]] = {}
-    counts: dict[str, int] = {}
-    for label, embs in _by_label(turns).items():
-        counts[label] = len(embs)
-        medians[label] = {
-            name: float(np.median([cosine(e[name], centre) for e in embs]))
-            for name, centre in anchor_centroid.items()
-        }
+    medians, counts = _medians(turns, anchor_centroid)
     reaching = [
         label
         for label, row in medians.items()
         if all(v >= floor[name] - EPS for name, v in row.items())
     ]
-    primary = None
-    if reaching:
-        means = {lb: float(np.mean(list(medians[lb].values()))) for lb in reaching}
-        best = max(means.values())
-        tied = [lb for lb in reaching if means[lb] >= best - EPS]
-        primary = min(tied, key=lambda lb: (-counts[lb], lb))
+    primary = _first(reaching, medians, counts)
     roles = {}
     for label, row in medians.items():
         role = PRIMARY if label == primary else FLAGGED if label in reaching else OTHER
