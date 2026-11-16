@@ -861,12 +861,21 @@ def test_score_reports_every_h6_gate(built: Built, scored: Scored) -> None:
         assert entries[key]["fallback_fc_n"] == len(measured)
         assert entries[key]["separates"] is True
     assert entries["segment.c50_min_db"]["value"] == 40.0
-    assert entries["retrieval.anchor_floor"]["value"] is None
     assert entries["text.reject_max"]["value"] is None
+    # The per-embedder retrieval and anchor values are H20's, not H6's, so no gate entry names
+    # them; the impostor statistics that informed the anchor floor sit under `retrieval`.
+    assert not [k for k in entries if k.split(".")[0] in ("anchors", "retrieval")]
+    assert scored.score["retrieval"] == {
+        "impostor_median_max": 0.64,
+        "non_admitted_median_upper_bound_max": None,
+        "impostor_primary_episodes": 0,
+        "impostor_merged_episodes": {},
+        "impostor_stray_records": 0,
+    }
     # The encodes are band-limited by their codecs (E-AC-3 near 20.5 kHz, AAC near 18 kHz).
     bandwidth = entries["ingest.bandwidth_cutoff_db"]["reason"]
     assert "full band" not in bandwidth and "no known band limit" in bandwidth
-    for key in ("anchors.sim_min", "cleaning.spectrum_max_db", "state_floor.offset.neutral",
+    for key in ("cleaning.spectrum_max_db", "state_floor.offset.neutral",
                 "state_floor.rehearsal_identity_window_floor"):  # fmt: skip
         assert isinstance(entries[key]["value"], float), key
 
@@ -901,10 +910,11 @@ def _probe(
     spk02_role: str = "other",
     lines: Sequence[pkg.TruthLine] = PROBE_LINES,
     spans: Sequence[tuple[float, float] | None] = (),
-) -> tuple[list[dict], dict[str, dict]]:
+) -> tuple[list[dict], dict[str, object]]:
     """Score one episode whose records are (truth line, diarizer label, cluster, kept).
 
     A record spans its truth line less 0.1 s at each end, unless `spans` gives it a span.
+    Returns the impostor cluster rows and `retrieval_summary` of them.
     """
     record = SourceRecord(
         "src-0001", "p", "matroska", 1, 0, (), 1, 0, None, "eac3", None, 1, "packets", 48000, 6,
@@ -928,16 +938,13 @@ def _probe(
         {"diar_cluster": "spk-03", "role": "other", "median_sim": {"ecapa": 0.2}},
     ]}]}  # fmt: skip
     rows = score_mod.impostor_clusters(eps, segments, report)
-    gates_found = score_mod.gate_values(
-        eps, segments, rows, None, {"retrieval.anchor_floor": 0.6}, {}
-    )
-    return rows, gates_found
+    return rows, score_mod.retrieval_summary(rows)
 
 
 def test_a_stray_impostor_record_in_the_primary_cluster_is_not_its_cluster() -> None:
     # The round-1 probe: one dropped impostor record diarized into the target's primary cluster,
     # covering a third of the impostor's speech; the rest is in spk-02, not admitted.
-    rows, found = _probe(
+    rows, summary = _probe(
         [(1, "spk-01", "primary", True), (3, "spk-01", "primary", True),
          (5, "spk-01", "primary", True), (2, "spk-01", "primary", False)]
     )  # fmt: skip
@@ -947,12 +954,11 @@ def test_a_stray_impostor_record_in_the_primary_cluster_is_not_its_cluster() -> 
          "identified_by": "upper bound: highest non-admitted cluster",
          "stray_records": [{"diar_cluster": "spk-01", "role": "primary", "records": 1}]}
     ]  # fmt: skip
-    floor = found["retrieval.anchor_floor"]
-    assert floor["impostor_primary_episodes"] == 0
-    assert floor["impostor_median_max"] is None
-    assert floor["non_admitted_median_upper_bound_max"] == 0.55
-    assert floor["impostor_stray_records"] == 1
-    assert floor["impostor_merged_episodes"] == {}
+    assert summary["impostor_primary_episodes"] == 0
+    assert summary["impostor_median_max"] is None
+    assert summary["non_admitted_median_upper_bound_max"] == 0.55
+    assert summary["impostor_stray_records"] == 1
+    assert summary["impostor_merged_episodes"] == {}
     lines = rehearsal_cmd.score_mod.impostor_cluster_lines(rows)
     assert lines == [
         "  ep01 (src-0001) impostor cluster: not admitted, median ecapa 0.550 (upper bound: "
@@ -969,18 +975,19 @@ MERGED_BY = (
 def test_an_impostor_merged_into_the_primary_cluster_reads_primary() -> None:
     # The PR review's probe: all five target and four impostor records in spk-01, primary. The
     # impostor has no cluster of its own, so no non-admitted cluster bounds its median.
-    rows, found = _probe([(n, "spk-01", "primary", True) for n in range(1, 10)], lines=MERGE_LINES)
+    rows, summary = _probe(
+        [(n, "spk-01", "primary", True) for n in range(1, 10)], lines=MERGE_LINES
+    )
     assert rows == [
         {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-01",
          "status": "primary", "median_sim": {"ecapa": 0.8}, "identified_by": MERGED_BY,
          "stray_records": [{"diar_cluster": "spk-01", "role": "primary", "records": 4}]}
     ]  # fmt: skip
-    floor = found["retrieval.anchor_floor"]
-    assert floor["impostor_merged_episodes"] == {"primary": 1}
-    assert floor["impostor_primary_episodes"] == 1
-    assert floor["impostor_median_max"] is None
-    assert floor["non_admitted_median_upper_bound_max"] is None
-    assert floor["impostor_stray_records"] == 4
+    assert summary["impostor_merged_episodes"] == {"primary": 1}
+    assert summary["impostor_primary_episodes"] == 1
+    assert summary["impostor_median_max"] is None
+    assert summary["non_admitted_median_upper_bound_max"] is None
+    assert summary["impostor_stray_records"] == 4
     lines = rehearsal_cmd.score_mod.impostor_cluster_lines(rows)
     assert lines == [
         f"  ep01 (src-0001) impostor cluster: primary ({MERGED_BY}), median ecapa 0.800; stray "
@@ -993,7 +1000,7 @@ def test_turns_joining_target_and_impostor_lines_read_merged_into_primary() -> N
     # and the impostor line after it. `Episodes.who` gives four records to no one and the last
     # to the target, so the impostor holds no record, yet the cluster covers most of its speech.
     turns = [(1.0 + 8.0 * k + 0.1, 1.0 + 8.0 * k + 7.4) for k in range(4)]
-    rows, found = _probe(
+    rows, summary = _probe(
         [(n, "spk-01", "primary", True) for n in (1, 3, 5, 7, 9)],
         lines=MERGE_LINES,
         spans=[*turns, None],
@@ -1003,12 +1010,11 @@ def test_turns_joining_target_and_impostor_lines_read_merged_into_primary() -> N
          "status": "primary", "median_sim": {"ecapa": 0.8}, "identified_by": MERGED_BY,
          "stray_records": []}
     ]  # fmt: skip
-    floor = found["retrieval.anchor_floor"]
-    assert floor["impostor_primary_episodes"] == 1
-    assert floor["impostor_merged_episodes"] == {"primary": 1}
-    assert floor["impostor_median_max"] is None
-    assert floor["non_admitted_median_upper_bound_max"] is None
-    assert floor["impostor_stray_records"] == 0
+    assert summary["impostor_primary_episodes"] == 1
+    assert summary["impostor_merged_episodes"] == {"primary": 1}
+    assert summary["impostor_median_max"] is None
+    assert summary["non_admitted_median_upper_bound_max"] is None
+    assert summary["impostor_stray_records"] == 0
 
 
 def test_target_records_overlapping_the_impostor_briefly_leave_it_not_admitted() -> None:
@@ -1019,7 +1025,7 @@ def test_target_records_overlapping_the_impostor_briefly_leave_it_not_admitted()
         _probe_line(3, "target", 9.0), _probe_line(4, "impostor", 12.0),
         _probe_line(5, "target", 17.0), _probe_line(6, "impostor", 20.0),
     ]  # fmt: skip
-    rows, found = _probe(
+    rows, summary = _probe(
         [(n, "spk-01", "primary", True) for n in (1, 3, 5)],
         lines=lines,
         spans=[(1.1, 5.5), (9.1, 13.5), (17.1, 21.5)],
@@ -1029,16 +1035,15 @@ def test_target_records_overlapping_the_impostor_briefly_leave_it_not_admitted()
          "status": "not admitted", "median_sim": {"ecapa": 0.55},
          "identified_by": "upper bound: highest non-admitted cluster", "stray_records": []}
     ]  # fmt: skip
-    floor = found["retrieval.anchor_floor"]
-    assert floor["impostor_primary_episodes"] == 0
-    assert floor["impostor_merged_episodes"] == {}
-    assert floor["non_admitted_median_upper_bound_max"] == 0.55
+    assert summary["impostor_primary_episodes"] == 0
+    assert summary["impostor_merged_episodes"] == {}
+    assert summary["non_admitted_median_upper_bound_max"] == 0.55
 
 
 def test_an_impostor_merged_into_a_flagged_cluster_names_the_one_covering_most_of_it() -> None:
     # spk-02 (flagged) holds two of the four impostor lines among three target ones, spk-01
     # (primary) one among two: the flagged cluster covers the most impostor speech.
-    rows, found = _probe(
+    rows, summary = _probe(
         [(1, "spk-02", "flagged", True), (3, "spk-02", "flagged", True),
          (5, "spk-02", "flagged", True), (2, "spk-02", "flagged", False),
          (4, "spk-02", "flagged", True), (7, "spk-01", "primary", True),
@@ -1052,15 +1057,14 @@ def test_an_impostor_merged_into_a_flagged_cluster_names_the_one_covering_most_o
     )  # fmt: skip
     assert "merged_into" not in row
     assert row["median_sim"] == {"ecapa": 0.55}
-    floor = found["retrieval.anchor_floor"]
-    assert floor["impostor_merged_episodes"] == {"flagged": 1}
-    assert floor["impostor_primary_episodes"] == 0
-    assert floor["impostor_median_max"] is None
-    assert floor["non_admitted_median_upper_bound_max"] is None
+    assert summary["impostor_merged_episodes"] == {"flagged": 1}
+    assert summary["impostor_primary_episodes"] == 0
+    assert summary["impostor_median_max"] is None
+    assert summary["non_admitted_median_upper_bound_max"] is None
 
 
 def test_the_impostor_cluster_is_the_admitted_one_its_records_hold_the_majority_of() -> None:
-    rows, found = _probe(
+    rows, summary = _probe(
         [(1, "spk-01", "primary", True), (3, "spk-01", "primary", True),
          (2, "spk-01", "primary", False), (4, "spk-02", "flagged", True),
          (6, "spk-02", "flagged", True), (5, "spk-02", "flagged", True)],
@@ -1073,9 +1077,8 @@ def test_the_impostor_cluster_is_the_admitted_one_its_records_hold_the_majority_
     )  # fmt: skip
     assert row["median_sim"] == {"ecapa": 0.55}
     assert row["stray_records"] == [{"diar_cluster": "spk-01", "role": "primary", "records": 1}]
-    floor = found["retrieval.anchor_floor"]
-    assert floor["impostor_median_max"] == 0.55 and floor["impostor_primary_episodes"] == 0
-    assert floor["non_admitted_median_upper_bound_max"] is None
+    assert summary["impostor_median_max"] == 0.55 and summary["impostor_primary_episodes"] == 0
+    assert summary["non_admitted_median_upper_bound_max"] is None
 
 
 def test_recall_is_over_the_speech_extraction_can_keep_with_all_target_recall_beside() -> None:
@@ -1110,14 +1113,14 @@ def test_recall_is_over_the_speech_extraction_can_keep_with_all_target_recall_be
 
 
 def test_an_impostor_majority_primary_cluster_reports_primary() -> None:
-    rows, found = _probe(
+    rows, summary = _probe(
         [(2, "spk-01", "primary", True), (4, "spk-01", "primary", True),
          (1, "spk-01", "primary", True), (3, "spk-02", "flagged", True)],
         spk02_role="flagged",
     )  # fmt: skip
     assert rows[0]["status"] == "primary" and rows[0]["median_sim"] == {"ecapa": 0.8}
     assert rows[0]["stray_records"] == []
-    assert found["retrieval.anchor_floor"]["impostor_primary_episodes"] == 1
+    assert summary["impostor_primary_episodes"] == 1
 
 
 # ---------------------------------------------------------------------------

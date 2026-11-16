@@ -14,9 +14,6 @@ from scripts.voice_data.states import NEUTRAL_STATE, SPEAKING_STATES
 
 # Every value the Interfaces table marks [E], plus the T5 bandwidth cutoff: H6 calibrates these.
 CALIBRATED = {
-    "anchors.sim_min": 0.6,
-    "retrieval.anchor_floor": 0.6,
-    "retrieval.margin": 0.1,
     "segment.snr_min_db": 15,
     "segment.c50_min_db": 20,
     "segment.window_percentile": 2,
@@ -28,6 +25,21 @@ CALIBRATED = {
     "ingest.bandwidth_cutoff_db": 40,
     **{f"state_floor.offset.{state}": 0 for state in SPEAKING_STATES},
 }
+
+# One value per embedder, set by H20 on public speakers no rehearsal episode uses; H6 tests them
+# unchanged, so they are not H6's to calibrate. The values are placeholders until H20 runs.
+PUBLIC = {
+    "anchors.sim_min.wavlm-sv": 0.6,
+    "anchors.sim_min.ecapa": 0.6,
+    "retrieval.anchor_floor.wavlm-sv": 0.6,
+    "retrieval.anchor_floor.ecapa": 0.6,
+    "retrieval.margin.wavlm-sv": 0.1,
+    "retrieval.margin.ecapa": 0.1,
+}
+PUBLIC_NOTE_END = (
+    "Placeholder: H20 (`calibrate run`) sets it on public speakers no episode uses, at the "
+    "false-accept rate in `calibration.json`; H6 tests it unchanged."
+)
 
 FIXED = {
     "anchors.min_s": 3,
@@ -83,6 +95,21 @@ def test_calibrated_gates_are_marked_for_h6(key: str, value: float) -> None:
     assert default.h6 is True
 
 
+@pytest.mark.parametrize(("key", "value"), sorted(PUBLIC.items()))
+def test_per_embedder_gates_are_set_by_h20_not_h6(key: str, value: float) -> None:
+    default = gates.load(None).defaults[key]
+    assert default.value == value
+    assert default.h6 is False
+    assert "H20" in default.note
+    assert default.note.endswith(PUBLIC_NOTE_END)
+
+
+def test_h6_calibrates_fourteen_gates() -> None:
+    h6 = {k for k, d in gates.load(None).defaults.items() if d.h6}
+    assert h6 == set(CALIBRATED)
+    assert len(h6) == 14
+
+
 @pytest.mark.parametrize(("key", "value"), sorted(FIXED.items()))
 def test_fixed_gates_are_not_calibrated(key: str, value: float) -> None:
     default = gates.load(None).defaults[key]
@@ -97,21 +124,22 @@ def test_no_overlay_gives_defaults(private_root: Root) -> None:
 
 
 def test_overlay_changes_only_its_keys(private_root: Root) -> None:
-    _overlay(private_root, {"retrieval.margin": 0.15, "state_floor.offset.calm": 0.02})
+    _overlay(private_root, {"retrieval.margin.ecapa": -0.02, "state_floor.offset.calm": 0.02})
     loaded = gates.load(private_root.path)
     effective = loaded.effective()
     defaults = {k: d.value for k, d in loaded.defaults.items()}
     changed = {k for k in effective if effective[k] != defaults[k]}
-    assert changed == {"retrieval.margin", "state_floor.offset.calm"}
-    assert effective["retrieval.margin"] == 0.15
+    assert changed == {"retrieval.margin.ecapa", "state_floor.offset.calm"}
+    assert effective["retrieval.margin.ecapa"] == -0.02
+    assert effective["retrieval.margin.wavlm-sv"] == 0.1
     assert loaded.value("state_floor.offset.calm") == 0.02
-    assert loaded.value("anchors.sim_min") == 0.6
+    assert loaded.value("anchors.sim_min.ecapa") == 0.6
 
 
 def test_effective_is_a_copy(private_root: Root) -> None:
     loaded = gates.load(private_root.path)
-    loaded.effective()["anchors.sim_min"] = 0.0
-    assert loaded.value("anchors.sim_min") == 0.6
+    loaded.effective()["anchors.sim_min.wavlm-sv"] = 0.0
+    assert loaded.value("anchors.sim_min.wavlm-sv") == 0.6
 
 
 def test_overlay_unknown_key_is_input_error(private_root: Root) -> None:
@@ -120,9 +148,17 @@ def test_overlay_unknown_key_is_input_error(private_root: Root) -> None:
         gates.load(private_root.path)
 
 
+def test_an_overlay_naming_a_shared_retrieval_key_is_refused(private_root: Root) -> None:
+    # The one value for both embedders is gone; an overlay written before v5 must fail loudly
+    # rather than leave the per-embedder placeholders silently in force.
+    _overlay(private_root, {"retrieval.anchor_floor": 0.5})
+    with pytest.raises(InputError, match="unknown gate"):
+        gates.load(private_root.path)
+
+
 @pytest.mark.parametrize("bad", ["0.5", True, None, [0.5], {"value": 0.5}])
 def test_overlay_non_number_is_input_error(private_root: Root, bad: object) -> None:
-    _overlay(private_root, {"anchors.sim_min": bad})
+    _overlay(private_root, {"anchors.sim_min.wavlm-sv": bad})
     with pytest.raises(InputError, match="number"):
         gates.load(private_root.path)
 

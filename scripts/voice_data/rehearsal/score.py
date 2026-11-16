@@ -32,7 +32,6 @@ NOT_ADMITTED = "not admitted"
 NOT_RATED = "a rating by Raj; the rehearsal holds no ratings to inform it"
 # Why each [E] gate the rehearsal cannot inform is "not measured".
 NOT_MEASURED = {
-    "retrieval.margin": "segments.jsonl records no per-turn margin to the rival clusters",
     "segment.window_percentile": (
         "a percentile of the target's own window distribution; the ground truth marks lines, "
         "not windows"
@@ -474,10 +473,30 @@ def fallback_fc(build: object, eps: Episodes) -> dict[str, list[float]]:
     return found
 
 
+def retrieval_summary(clusters: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Return the impostor's cluster statistics over the episodes, for retrieval's values.
+
+    The anchor floor, the anchor check and the margin are set per embedder by H20 on public
+    speakers, not by H6, so these are no gate entry; they show where the impostor's cluster
+    fell at the values the run used.
+    """
+    merged = Counter(
+        str(c.get("status")) for c in clusters if c.get("identified_by") == MERGED_MEDIAN
+    )
+    return {
+        "impostor_median_max": _median_max(clusters, BY_SEGMENTS),
+        "non_admitted_median_upper_bound_max": _median_max(clusters, UPPER_BOUND),
+        "impostor_primary_episodes": sum(c.get("status") == PRIMARY for c in clusters),
+        "impostor_merged_episodes": dict(sorted(merged.items())),
+        "impostor_stray_records": sum(
+            int(s["records"]) for c in clusters for s in c.get("stray_records") or []  # type: ignore[union-attr]
+        ),
+    }
+
+
 def gate_values(
     eps: Episodes,
     segments: Sequence[SegmentRecord],
-    clusters: Sequence[Mapping[str, object]],
     effects: Mapping[str, object] | None,
     h6_gates: Mapping[str, float],
     fallback: Mapping[str, Sequence[float]],
@@ -497,29 +516,6 @@ def gate_values(
         entry: dict[str, object] = {"default": default, "value": None}
         if key in NOT_MEASURED:
             entry["reason"] = NOT_MEASURED[key]
-        elif key == "anchors.sim_min":
-            if sims:
-                entry["value"] = round(min(percentile(v, 2) for v in sims.values()), 3)
-                entry["basis"] = (
-                    "p02 of the true target segments' SIM to the target centroid, lower embedder"
-                )
-            else:
-                entry["reason"] = "no kept segment is the target's"
-        elif key == "retrieval.anchor_floor":
-            entry["reason"] = (
-                "not calibrated: H6 keeps the anchor floor at its recorded value and lowers it "
-                "only to exercise the flagged path"
-            )
-            entry["impostor_median_max"] = _median_max(clusters, BY_SEGMENTS)
-            entry["non_admitted_median_upper_bound_max"] = _median_max(clusters, UPPER_BOUND)
-            entry["impostor_primary_episodes"] = sum(c.get("status") == PRIMARY for c in clusters)
-            merged = Counter(
-                str(c.get("status")) for c in clusters if c.get("identified_by") == MERGED_MEDIAN
-            )
-            entry["impostor_merged_episodes"] = dict(sorted(merged.items()))
-            entry["impostor_stray_records"] = sum(
-                int(s["records"]) for c in clusters for s in c.get("stray_records") or []  # type: ignore[union-attr]
-            )
         elif key in ("segment.snr_min_db", "segment.c50_min_db"):
             field = "snr_db" if key == "segment.snr_min_db" else "c50_db"
             values = [getattr(s, field) for s in true_fc if math.isfinite(getattr(s, field))]

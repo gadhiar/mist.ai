@@ -15,7 +15,8 @@ The order is Design 4's:
 3. The anchors must agree, timestamp anchors cut from their source's chosen output; else the run
    stops with the result `anchors-disagree` (the host exits 3). When `seed/sdh/` is mounted, the
    SDH spans `stages/sdh.py` holds as anchors are cut the same way and checked against the
-   centroid of these anchors: one below the Anchors gate on either embedder is dropped and
+   centroid of these anchors: one below that embedder's Anchors value on either embedder (each
+   embedder has its own, since their cosines sit on different scales) is dropped and
    counted, and the rest join the anchor centroid that retrieval uses. They never enter the
    agreement check, so they can neither cause nor mask `anchors-disagree`.
 4. Diarization on the separated centre channel; the first retrieval pass names each episode's
@@ -133,13 +134,17 @@ def load_models(device: str) -> Models:
 
 @dataclass(frozen=True, slots=True)
 class Limits:
-    """The gate values the run uses, from the plan's effective thresholds."""
+    """The gate values the run uses, from the plan's effective thresholds.
+
+    The anchor check, the anchor floor and the margin hold one value per embedder name, since
+    the embedders' cosines sit on different scales.
+    """
 
     anchor_min_s: float
     anchor_max_s: float
-    anchor_sim_min: float
-    anchor_floor: float
-    margin: float
+    anchor_sim_min: dict[str, float]
+    anchor_floor: dict[str, float]
+    margin: dict[str, float]
     loo_percentile: float
     min_s: float
     max_s: float
@@ -153,18 +158,25 @@ class Limits:
     purity_percentile: float
 
     @classmethod
-    def from_thresholds(cls, values: Mapping[str, float]) -> Limits:
-        """Read the gate keys the stage uses.
+    def from_thresholds(cls, values: Mapping[str, float], embedders: Sequence[str]) -> Limits:
+        """Read the gate keys the stage uses; per-embedder gates as `<key>.<embedder name>`.
+
+        Args:
+            values: The plan's effective thresholds.
+            embedders: The names of the run's embedders.
 
         Raises:
-            StageError: A key is missing.
+            StageError: A key is missing; the message names every missing key.
         """
+        # Each prefix takes an embedder name: `retrieval.margin.ecapa`.
+        per_embedder = {
+            "anchor_sim_min": "anchors.sim_min.",
+            "anchor_floor": "retrieval.anchor_floor.",
+            "margin": "retrieval.margin.",
+        }
         keys = {
             "anchor_min_s": "anchors.min_s",
             "anchor_max_s": "anchors.max_s",
-            "anchor_sim_min": "anchors.sim_min",
-            "anchor_floor": "retrieval.anchor_floor",
-            "margin": "retrieval.margin",
             "loo_percentile": "retrieval.loo_percentile",
             "min_s": "segment.min_s",
             "max_s": "segment.max_s",
@@ -177,10 +189,17 @@ class Limits:
             "window_percentile": "segment.window_percentile",
             "purity_percentile": "seed.purity_percentile",
         }
-        missing = [gate for gate in keys.values() if gate not in values]
+        wanted = list(keys.values())
+        wanted += [f"{prefix}{e}" for prefix in per_embedder.values() for e in embedders]
+        missing = [gate for gate in wanted if gate not in values]
         if missing:
             raise StageError(f"the plan's thresholds lack {', '.join(missing)}")
-        return cls(**{name: float(values[gate]) for name, gate in keys.items()})
+        scalars = {name: float(values[gate]) for name, gate in keys.items()}
+        per = {
+            name: {e: float(values[f"{prefix}{e}"]) for e in embedders}
+            for name, prefix in per_embedder.items()
+        }
+        return cls(**scalars, **per)
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,7 +472,7 @@ class Extraction:
         self.models = models
         self.plan = _read_plan(data, run_id)
         self.thresholds = {str(k): float(v) for k, v in self.plan["thresholds"].items()}  # type: ignore[attr-defined]
-        self.limits = Limits.from_thresholds(self.thresholds)
+        self.limits = Limits.from_thresholds(self.thresholds, [e.name for e in models.embedders])
         self.sources = _sources(self.plan)
         self.by_id = {s.source_id: s for s in self.sources}
         self.anchors = _timestamp_anchors(self.plan, set(self.by_id))
@@ -590,12 +609,17 @@ class Extraction:
         """Return the anchor centroid retrieval uses, and the SDH counts for the report.
 
         Each SDH anchor's SIM is taken to the centroid of Raj's anchors alone, his ground truth;
-        one below the Anchors gate on either embedder is dropped.
+        one below that embedder's Anchors value on either embedder is dropped.
         """
         own = retrieve.centroids(anchors)
         if not self.sdh:
             return own, None
-        floor = self.limits.anchor_sim_min - retrieve.EPS
+        sim_min = self.limits.anchor_sim_min
+
+        def reaches(emb: retrieve.Embedding) -> bool:
+            found = retrieve.sims(emb, own)
+            return all(v >= sim_min[name] - retrieve.EPS for name, v in found.items())
+
         joined: list[retrieve.Embedding] = []
         dropped = dropped_offscreen = 0
         for work in works:
@@ -603,7 +627,7 @@ class Extraction:
             if spans is None:
                 continue
             for span, emb in zip(spans.anchors, work.sdh_embs, strict=True):
-                if emb is not None and all(v >= floor for v in retrieve.sims(emb, own).values()):
+                if emb is not None and reaches(emb):
                     joined.append(emb)
                 else:
                     dropped += 1

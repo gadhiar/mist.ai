@@ -137,11 +137,11 @@ def test_rehearsal_precision_boundary(precision: float, passed: bool) -> None:
 
 def test_rehearsal_at_other_thresholds_fails() -> None:
     report = _report()
-    report["rehearsal"]["thresholds"]["retrieval.margin"] = 0.05  # type: ignore[index]
+    report["rehearsal"]["thresholds"]["retrieval.margin.wavlm-sv"] = 0.05  # type: ignore[index]
     result = seed_gate.evaluate(report, THRESHOLDS)
     criterion = _criterion(result, "rehearsal precision")
     assert criterion.passed is False
-    assert "retrieval.margin" in criterion.detail
+    assert "retrieval.margin.wavlm-sv" in criterion.detail
 
 
 def test_missing_rehearsal_fails() -> None:
