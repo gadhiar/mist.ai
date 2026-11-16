@@ -2379,3 +2379,95 @@ def test_every_check_that_reads_dev_general_is_under_the_print_guard():
     )
 
     assert unguarded == []
+
+
+# --- The dev-general gold (plan v26 T70) -----------------------------------------------------
+
+# The agreement of the two blind passes was written to `agreement.json` before any difference
+# was ruled on, so a reader can trust the figure only if the same inputs give the same file
+# again: the module recomputes it from the passes, with the gold file fixing the probes. Each
+# ruling is in `adjudication.md`. The gold is pinned by counts alone, so a failure prints no
+# dev-general label.
+_DEV_GENERAL_AGREEMENT = _DEV_GENERAL_DIR / "agreement.json"
+_DEV_GENERAL_PASS_A = _DEV_GENERAL_DIR / "pass-a.jsonl"
+_DEV_GENERAL_PASS_B = _DEV_GENERAL_DIR / "pass-b.jsonl"
+_DEV_GENERAL_GOLD_COUNTS = {"entities": 128, "relationships": 74}
+
+
+def test_dev_general_agreement_is_what_the_module_recomputes_from_the_passes(tmp_path):
+    from scripts.eval_harness.selection_agreement import main
+
+    out = tmp_path / "agreement.json"
+    recorded = _DEV_GENERAL_AGREEMENT.is_file()
+
+    if recorded:
+        main(
+            [
+                "--pass-a",
+                str(_DEV_GENERAL_PASS_A),
+                "--pass-b",
+                str(_DEV_GENERAL_PASS_B),
+                "--selection",
+                str(_DEV_GENERAL),
+                "--recorded",
+                str(_DEV_GENERAL_AGREEMENT),
+                "--out",
+                str(out),
+            ]
+        )
+    same = recorded and out.read_bytes() == _DEV_GENERAL_AGREEMENT.read_bytes()
+
+    assert recorded, "the dev-general agreement.json is missing"
+    assert same
+
+
+def test_dev_general_gold_is_60_rows_with_nofact_rows_empty_and_the_rest_relational():
+    rows = _dev_general_rows()
+
+    size = len(rows)
+    filled_nofact = [
+        r["tag"] for r in rows if _dev_general_category(r["tag"]) == "nofact" and not _is_empty(r)
+    ]
+    unrelated = [
+        r["tag"]
+        for r in rows
+        if _dev_general_category(r["tag"]) != "nofact" and not r["expected_relationships"]
+    ]
+    counts = {
+        "entities": sum(len(r["expected_entities"]) for r in rows),
+        "relationships": sum(len(r["expected_relationships"]) for r in rows),
+    }
+
+    assert size == _DEV_GENERAL_SIZE
+    assert filled_nofact == []
+    assert unrelated == []
+    assert counts == _DEV_GENERAL_GOLD_COUNTS
+
+
+def _dev_general_gold_ids_the_rails_move() -> tuple[int, int]:
+    """How many dev-general gold ids, alternatives and endpoints there are, and how many move."""
+    checked = moved = 0
+    for row in _dev_general_rows():
+        for entity in row["expected_entities"]:
+            for gold_id in (entity["id"], *entity.get("alternatives", ())):
+                checked += 1
+                moved += stored_entity_id(gold_id, entity["type"]) != gold_id
+        for rel in row["expected_relationships"]:
+            for end in ("source", "target"):
+                checked += 1
+                moved += stored_entity_id(rel[end], rel[f"{end}_type"]) != rel[end]
+    return checked, moved
+
+
+def test_every_dev_general_gold_id_is_a_fixed_point_of_the_id_rails():
+    """A gold id the rails would move is never an id the graph stores, so it could never match.
+
+    Counted rather than listed, as the held-out check is, so a failure prints no id. An empty
+    gold checks nothing, so the count of ids checked has to be the gold's.
+    """
+    checked, moved = _dev_general_gold_ids_the_rails_move()
+
+    expected = _DEV_GENERAL_GOLD_COUNTS["entities"] + 2 * _DEV_GENERAL_GOLD_COUNTS["relationships"]
+
+    assert checked == expected, f"{checked} dev-general gold ids were checked"
+    assert moved == 0, f"{moved} dev-general gold ids are not fixed points of the id rails"
