@@ -30,7 +30,8 @@ optional; the job refuses (exit 1) a plan that breaks any rule, naming ids and c
         "reported_n": [5],          # cluster sizes reported, never used; each <= 40
         "draws": 10,                # clusters drawn per pair and size
         "anchor_k": [1, 2, 4],      # anchor subsets holding the solo clip; each 1-5
-        "bootstrap": 1000           # speaker-level resamples
+        "bootstrap": 1000,          # speaker-level resamples
+        "anchor_sets": 10           # anchor sets drawn per speaker, draw 1 the pool's; >= 1
       },
       "datasets": [                 # 1 or 2, names unique; never pooled
         {
@@ -74,9 +75,17 @@ remainder of 0.5 s or more is kept; a RAVDESS clip is one piece. A speaker with 
 pieces, or without the solo clip or the four anchors, is ineligible, and the job refuses when a
 dataset has fewer than three eligible speakers of either sex.
 
+Anchor sets (Design, Anchor-set draws). The pool's solo clip and four anchors are draw 1. Each
+eligible speaker's later draws, up to `anchor_sets`, reshuffle the speaker's clips in path order
+with a stream seeded by the seed, the dataset, the speaker and the draw number, and build the
+solo clip and four anchors from them as the pool does; a later draw may reuse a file draw 1 cut
+into pieces. A draw that cannot form a set is skipped and counted. Only the anchor check's target
+trials read the later draws: impostor trials, the floor and the margin read draw 1.
+
 Trials pair two speakers of one sex within one dataset, in both orders, and score them with
 extract's own `retrieve.centroids` and `retrieve.sims` (`score.cosine` underneath). The
-threshold rule reads impostor trials only. Target trials give the reported miss rates.
+threshold rule reads impostor trials only. Target trials give the reported miss rates; each
+records its owner's speaker index, and a margin target trial its rivals' too.
 
 Output: `calibration.json` and `outputs.json` beside the plan. Printed lines and messages name
 ids and counts, never a file.
@@ -144,6 +153,8 @@ CALM = "calm"
 SOLO = "solo"
 MIXED = "mixed"
 ALL = "all"
+OTHERS = "others"
+SETS = "sets"
 BOTH = "both"
 RAVDESS_REGISTERS = {
     "01": NEUTRAL,
@@ -166,7 +177,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # Random streams, each seeded from the plan's seed and its own keys, so one speaker's shuffle or
 # one pair's draws do not move when another speaker joins the plan.
-_SHUFFLE, _DRAWS, _TARGET, _RIVALS, _BOOT = range(5)
+_SHUFFLE, _DRAWS, _TARGET, _RIVALS, _BOOT, _SETS = range(6)
 
 
 def _key(text: str) -> int:
@@ -208,6 +219,7 @@ class TrialParams:
     draws: int = 10
     anchor_k: tuple[int, ...] = (1, 2, 4)
     bootstrap: int = 1000
+    anchor_sets: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +313,7 @@ def _trials(raw: object, problems: list[str]) -> TrialParams:
         and bool(raw["piece_s"])
         and all(_is_number(v) and v > 0 for v in raw["piece_s"])
     )
-    for name in ("max_pieces", "model_pieces", "rival_pieces", "draws", "bootstrap"):
+    for name in ("max_pieces", "model_pieces", "rival_pieces", "draws", "bootstrap", "anchor_sets"):
         ok = ok and _is_int(raw[name]) and raw[name] > 0
     for name in ("cluster_n", "reported_n", "anchor_k"):
         ok = ok and isinstance(raw[name], list) and all(_is_int(v) and v > 0 for v in raw[name])
@@ -318,6 +330,7 @@ def _trials(raw: object, problems: list[str]) -> TrialParams:
         draws=raw["draws"],
         anchor_k=tuple(raw["anchor_k"]),
         bootstrap=raw["bootstrap"],
+        anchor_sets=raw["anchor_sets"],
     )
     sizes = params.cluster_n + params.reported_n
     if not (
@@ -692,6 +705,80 @@ def _short(count: int) -> str:
     return f"{count} pieces, under {MIN_PIECES}"
 
 
+@dataclass(frozen=True, slots=True)
+class AnchorAudio:
+    """One anchor set in R2's shape, as audio: the solo clip and four timestamp anchors."""
+
+    solo: np.ndarray
+    solo_registers: tuple[str, ...]
+    rows: tuple[Clip, ...]
+
+
+def librittsr_set(items: Sequence[Clip], rate: int) -> tuple[AnchorAudio, set[int]] | str:
+    """Build a LibriTTS-R anchor set from shuffled clips.
+
+    The solo clip joins clips to 12-20 s, and the rows are the next four files of 3-30 s.
+
+    Returns:
+        The set and the indices of the clips it took, or the reason no set forms.
+    """
+    solo = join(items, ANCHOR_MIN_S, ANCHOR_MAX_S, rate)
+    if solo is None:
+        return "no 12-20 s solo clip"
+    used = set(solo[0])
+    rows = [
+        i
+        for i in range(len(items))
+        if i not in used and ROW_MIN_S <= len(items[i].audio) / rate <= ROW_MAX_S
+    ][:ANCHOR_ROWS]
+    if len(rows) < ANCHOR_ROWS:
+        return f"{len(rows)} anchors of 3-30 s, under {ANCHOR_ROWS}"
+    found = AnchorAudio(
+        solo=solo[1],
+        solo_registers=(NEUTRAL,) * len(solo[0]),
+        rows=tuple(items[i] for i in rows),
+    )
+    return found, used | set(rows)
+
+
+def ravdess_set(clips: Sequence[Clip], rate: int) -> tuple[AnchorAudio, set[int]] | str:
+    """Build a RAVDESS anchor set from shuffled clips.
+
+    The solo clip joins neutral and then calm clips to 12-20 s; each row joins the clips of one
+    register of `RAVDESS_ANCHORS` that the solo clip left, to 3-30 s.
+
+    Returns:
+        The set and the indices of the clips it took, or the reason no set forms.
+    """
+    order = [i for i, c in enumerate(clips) if c.register == NEUTRAL]
+    order += [i for i, c in enumerate(clips) if c.register == CALM]
+    solo = join([clips[i] for i in order], ANCHOR_MIN_S, ANCHOR_MAX_S, rate)
+    if solo is None:
+        return "no 12-20 s solo clip of neutral and calm clips"
+    used = {order[j] for j in solo[0]}
+    rows = []
+    for register in RAVDESS_ANCHORS:
+        free = [i for i, c in enumerate(clips) if c.register == register and i not in used]
+        got = join([clips[i] for i in free], ROW_MIN_S, ROW_MAX_S, rate)
+        if got is None:
+            return f"no 3-30 s {register} anchor"
+        used |= {free[j] for j in got[0]}
+        rows.append(Clip(got[1], register))
+    found = AnchorAudio(
+        solo=solo[1],
+        solo_registers=tuple(clips[order[j]].register for j in solo[0]),
+        rows=tuple(rows),
+    )
+    return found, used
+
+
+def anchor_set(
+    dataset: str, clips: Sequence[Clip], rate: int
+) -> tuple[AnchorAudio, set[int]] | str:
+    """Build one anchor set from shuffled clips, the way `dataset`'s pool builds draw 1."""
+    return ravdess_set(clips, rate) if dataset == RAVDESS else librittsr_set(clips, rate)
+
+
 def librittsr_pool(clips: Sequence[np.ndarray], rate: int, params: TrialParams) -> Pool | str:
     """Build a LibriTTS-R speaker's pool from their shuffled clips.
 
@@ -699,19 +786,14 @@ def librittsr_pool(clips: Sequence[np.ndarray], rate: int, params: TrialParams) 
         The pool, or the reason the speaker is ineligible.
     """
     items = [Clip(np.asarray(c), NEUTRAL) for c in clips]
-    solo = join(items, ANCHOR_MIN_S, ANCHOR_MAX_S, rate)
-    if solo is None:
-        return "no 12-20 s solo clip"
-    used = set(solo[0])
-    rest = [i for i in range(len(items)) if i not in used]
-    anchors = [i for i in rest if ROW_MIN_S <= len(items[i].audio) / rate <= ROW_MAX_S]
-    anchors = anchors[:ANCHOR_ROWS]
-    if len(anchors) < ANCHOR_ROWS:
-        return f"{len(anchors)} anchors of 3-30 s, under {ANCHOR_ROWS}"
+    got = librittsr_set(items, rate)
+    if isinstance(got, str):
+        return got
+    anchors, used = got
     pieces: list[Clip] = []
     position = 0
-    for index in rest:
-        if index in anchors:
+    for index in range(len(items)):
+        if index in used:
             continue
         cuts, position = cut(items[index].audio, rate, params.piece_s, position)
         pieces += [Clip(p, NEUTRAL) for p in cuts]
@@ -721,9 +803,9 @@ def librittsr_pool(clips: Sequence[np.ndarray], rate: int, params: TrialParams) 
     if len(pieces) < MIN_PIECES:
         return _short(len(pieces))
     return Pool(
-        solo=solo[1],
-        solo_registers=(NEUTRAL,) * len(solo[0]),
-        anchors=tuple(items[i] for i in anchors),
+        solo=anchors.solo,
+        solo_registers=anchors.solo_registers,
+        anchors=anchors.rows,
         pieces=tuple(pieces),
     )
 
@@ -734,31 +816,45 @@ def ravdess_pool(clips: Sequence[Clip], rate: int, params: TrialParams) -> Pool 
     Returns:
         The pool, or the reason the actor is ineligible.
     """
-    order = [i for i, c in enumerate(clips) if c.register == NEUTRAL]
-    order += [i for i, c in enumerate(clips) if c.register == CALM]
-    solo = join([clips[i] for i in order], ANCHOR_MIN_S, ANCHOR_MAX_S, rate)
-    if solo is None:
-        return "no 12-20 s solo clip of neutral and calm clips"
-    used = {order[j] for j in solo[0]}
-    anchors = []
-    for register in RAVDESS_ANCHORS:
-        free = [i for i, c in enumerate(clips) if c.register == register and i not in used]
-        got = join([clips[i] for i in free], ROW_MIN_S, ROW_MAX_S, rate)
-        if got is None:
-            return f"no 3-30 s {register} anchor"
-        used |= {free[j] for j in got[0]}
-        anchors.append(Clip(got[1], register))
+    got = ravdess_set(clips, rate)
+    if isinstance(got, str):
+        return got
+    anchors, used = got
     shortest = int(round(MIN_EMBED_S * rate))
     pieces = [c for i, c in enumerate(clips) if i not in used and len(c.audio) >= shortest]
     pieces = pieces[: params.max_pieces]
     if len(pieces) < MIN_PIECES:
         return _short(len(pieces))
     return Pool(
-        solo=solo[1],
-        solo_registers=tuple(clips[order[j]].register for j in solo[0]),
-        anchors=tuple(anchors),
+        solo=anchors.solo,
+        solo_registers=anchors.solo_registers,
+        anchors=anchors.rows,
         pieces=tuple(pieces),
     )
+
+
+def anchor_draws(
+    clips: Sequence[Clip], dataset: str, speaker: str, seed: int, count: int, rate: int
+) -> tuple[list[AnchorAudio], int]:
+    """Draw a speaker's anchor sets 2 to `count` (Design, Anchor-set draws).
+
+    Each draw reshuffles `clips`, the speaker's clips in path order, with its own stream, so a
+    draw does not move when `count` or another speaker changes. Draw 1 is the pool's and is not
+    drawn here.
+
+    Returns:
+        The sets that formed, in draw order, and how many draws could not form one.
+    """
+    found: list[AnchorAudio] = []
+    skipped = 0
+    for draw in range(2, count + 1):
+        order = _rng(seed, _SETS, _key(dataset), _key(speaker), draw).permutation(len(clips))
+        got = anchor_set(dataset, [clips[int(i)] for i in order], rate)
+        if isinstance(got, str):
+            skipped += 1
+        else:
+            found.append(got[0])
+    return found, skipped
 
 
 def require_speakers(dataset: str, eligible: Mapping[str, int]) -> None:
@@ -782,8 +878,20 @@ def require_speakers(dataset: str, eligible: Mapping[str, int]) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class AnchorSet:
+    """One embedded anchor set: the solo clip first among five anchors, each one's register."""
+
+    anchors: tuple[Embedding, ...]
+    registers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Speaker:
-    """An eligible speaker's embeddings: the solo clip first among the five anchors."""
+    """An eligible speaker's embeddings: the solo clip first among the five anchors.
+
+    `anchors` is draw 1, which every impostor trial, the floor and the margin read; `draws`
+    holds the later anchor sets that formed, and `skipped` counts the later draws that did not.
+    """
 
     dataset: str
     speaker: str
@@ -792,6 +900,12 @@ class Speaker:
     anchor_registers: tuple[str, ...]
     pieces: tuple[Embedding, ...]
     registers: tuple[str, ...]
+    draws: tuple[AnchorSet, ...] = ()
+    skipped: int = 0
+
+    def anchor_sets(self) -> tuple[AnchorSet, ...]:
+        """Return every drawn anchor set, draw 1 first."""
+        return (AnchorSet(self.anchors, self.anchor_registers), *self.draws)
 
 
 def embed(embedders: Sequence[object], audio: np.ndarray, rate: int) -> Embedding:
@@ -802,20 +916,38 @@ def embed(embedders: Sequence[object], audio: np.ndarray, rate: int) -> Embeddin
     }
 
 
+def embed_set(embedders: Sequence[object], found: AnchorAudio, rate: int) -> AnchorSet:
+    """Embed one anchor set: the solo clip, then its four rows."""
+    return AnchorSet(
+        anchors=tuple(
+            embed(embedders, a, rate) for a in [found.solo, *(c.audio for c in found.rows)]
+        ),
+        registers=(SOLO, *(c.register for c in found.rows)),
+    )
+
+
 def embed_pool(
-    embedders: Sequence[object], pool: Pool, dataset: str, speaker: str, sex: str, rate: int
+    embedders: Sequence[object],
+    pool: Pool,
+    dataset: str,
+    speaker: str,
+    sex: str,
+    rate: int,
+    draws: Sequence[AnchorAudio] = (),
+    skipped: int = 0,
 ) -> Speaker:
-    """Embed a pool once: the solo clip, the four anchors and every piece."""
+    """Embed a pool once, the solo clip, the four anchors and every piece, and the later draws."""
+    first = embed_set(embedders, AnchorAudio(pool.solo, pool.solo_registers, pool.anchors), rate)
     return Speaker(
         dataset=dataset,
         speaker=speaker,
         sex=sex,
-        anchors=tuple(
-            embed(embedders, a, rate) for a in [pool.solo, *(c.audio for c in pool.anchors)]
-        ),
-        anchor_registers=(SOLO, *(c.register for c in pool.anchors)),
+        anchors=first.anchors,
+        anchor_registers=first.registers,
         pieces=tuple(embed(embedders, c.audio, rate) for c in pool.pieces),
         registers=tuple(c.register for c in pool.pieces),
+        draws=tuple(embed_set(embedders, d, rate) for d in draws),
+        skipped=skipped,
     )
 
 
@@ -831,10 +963,17 @@ class FormTrials:
 
 @dataclass(frozen=True, slots=True)
 class TargetTrials:
-    """One form's target trials in one dataset, reported only, with each trial's register."""
+    """One form's target trials in one dataset, with each trial's register and speakers.
+
+    `owners` holds each trial's speaker index (into `DatasetTrials.sexes`), and `rivals` the
+    indices of the speakers whose rival centroids a margin trial was measured against (empty for
+    other forms), so a resample or a left-out speaker can find every trial a speaker is part of.
+    """
 
     scores: np.ndarray
     registers: tuple[str, ...]
+    owners: np.ndarray
+    rivals: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -881,7 +1020,11 @@ def dataset_trials(
       A's anchors that holds A's solo clip.
 
     Target trials: clusters of A's own pieces; A's held-out pieces against up to three other
-    same-sex speakers' rival centroids; each of A's anchors against the centroid of the others.
+    same-sex speakers' rival centroids; for every anchor set A drew, each anchor against the
+    centroid of the other four (`others`, the anchor's register) and the set as a whole (`sets`):
+    per embedder, the minimum over its anchors of `retrieve.anchor_check`'s SIMs, which reaches a
+    value exactly when every anchor does, so the set passes at a pair exactly when the check
+    does. A set's register is `mixed` for RAVDESS and `neutral` otherwise.
     """
     names = tuple(names)
     dkey = _key(name)
@@ -903,8 +1046,10 @@ def dataset_trials(
         }
         for s in speakers
     ]
+    set_register = MIXED if name == RAVDESS else NEUTRAL
+    unset = {n: 0.0 for n in names}  # `anchor_check` needs values; only its SIMs are read
     rows: dict[tuple[str, str], tuple[list, list, list]] = {}
-    targets: dict[tuple[str, str], tuple[list, list]] = {}
+    targets: dict[tuple[str, str], tuple[list, list, list, list]] = {}
 
     def add(gate: str, form: str, a: int, b: int, row: Sequence[float]) -> None:
         scores, left, right = rows.setdefault((gate, form), ([], [], []))
@@ -912,10 +1057,19 @@ def dataset_trials(
         left.append(a)
         right.append(b)
 
-    def add_target(gate: str, form: str, row: Sequence[float], register: str) -> None:
-        scores, registers = targets.setdefault((gate, form), ([], []))
+    def add_target(
+        gate: str,
+        form: str,
+        row: Sequence[float],
+        register: str,
+        owner: int,
+        rivals: Sequence[int] = (),
+    ) -> None:
+        scores, registers, owners, rival_rows = targets.setdefault((gate, form), ([], [], [], []))
         scores.append(list(row))
         registers.append(register)
+        owners.append(owner)
+        rival_rows.append(tuple(rivals))
 
     for ia, a in enumerate(speakers):
         for ib, b in enumerate(speakers):
@@ -948,7 +1102,8 @@ def dataset_trials(
                 idx = rng.choice(len(a.pieces), size=n, replace=False)
                 register = _register([a.registers[i] for i in idx])
                 for anchor, scores in own.items():
-                    add_target(FLOOR, f"{anchor}/n{n}", np.median(scores[idx], axis=0), register)
+                    median = np.median(scores[idx], axis=0)
+                    add_target(FLOOR, f"{anchor}/n{n}", median, register, ia)
         others = [i for i, s in enumerate(speakers) if i != ia and s.sex == a.sex]
         order = _rng(seed, _RIVALS, dkey, _key(a.speaker)).permutation(len(others))
         chosen = [others[int(i)] for i in order[:TARGET_RIVALS]]
@@ -959,12 +1114,13 @@ def dataset_trials(
                 to_a = retrieve.sims(held, model[ia])
                 nearest = [retrieve.sims(held, rival[c]) for c in chosen]
                 gap = [to_a[n] - max(s[n] for s in nearest) for n in names]
-                add_target(MARGIN, "rival", gap, register)
-        for j, anchor in enumerate(a.anchors):
-            centre = retrieve.centroids([x for i, x in enumerate(a.anchors) if i != j])
-            add_target(
-                SIM_MIN, "others", _row(retrieve.sims(anchor, centre), names), a.anchor_registers[j]
-            )
+                add_target(MARGIN, "rival", gap, register, ia, chosen)
+        for drawn in a.anchor_sets():
+            _, found = retrieve.anchor_check(list(drawn.anchors), unset)
+            for sims, register in zip(found, drawn.registers):
+                add_target(SIM_MIN, OTHERS, _row(sims, names), register, ia)
+            least = [min(sims[n] for sims in found) for n in names]
+            add_target(SIM_MIN, SETS, least, set_register, ia)
 
     sex_count: dict[str, int] = {}
     for s in speakers:
@@ -982,10 +1138,12 @@ def dataset_trials(
         )
         (reported if form in reported_forms else impostor)[gate][form] = trials
     target: dict[str, dict[str, TargetTrials]] = {gate: {} for gate in GATES}
-    for (gate, form), (scores, registers) in targets.items():
+    for (gate, form), (scores, registers, owners, rival_rows) in targets.items():
         target[gate][form] = TargetTrials(
             scores=np.asarray(scores, dtype=np.float64).reshape(-1, len(names)),
             registers=tuple(registers),
+            owners=np.asarray(owners, dtype=np.int64),
+            rivals=tuple(rival_rows),
         )
     return DatasetTrials(
         name=name,
@@ -1325,17 +1483,28 @@ def _admit(
     loaded: list[Speaker],
     excluded: list[tuple[str, str, str]],
     embedders: Sequence[object],
-    pool: Pool | str,
+    clips: Sequence[Clip],
+    plan: Plan,
     dataset: str,
     speaker: str,
     sex: str,
 ) -> None:
+    """Pool a speaker's clips, given in path order, and embed the pool and its later draws."""
+    shuffled = _shuffled(clips, plan.seed, dataset, speaker)
+    if dataset == RAVDESS:
+        pool = ravdess_pool(shuffled, RATE, plan.trials)
+    else:
+        pool = librittsr_pool([c.audio for c in shuffled], RATE, plan.trials)
     if isinstance(pool, str):
         excluded.append((speaker, sex, pool))
         print(f"calibrate: {dataset} speaker {speaker} ({sex}) excluded: {pool}")
         return
-    loaded.append(embed_pool(embedders, pool, dataset, speaker, sex, RATE))
-    print(f"calibrate: {dataset} speaker {speaker} ({sex}): {len(pool.pieces)} pieces embedded")
+    draws, skipped = anchor_draws(clips, dataset, speaker, plan.seed, plan.trials.anchor_sets, RATE)
+    loaded.append(embed_pool(embedders, pool, dataset, speaker, sex, RATE, draws, skipped))
+    print(
+        f"calibrate: {dataset} speaker {speaker} ({sex}): {len(pool.pieces)} pieces and "
+        f"{1 + len(draws)} anchor sets embedded, {skipped} draws skipped"
+    )
 
 
 def load_dataset(
@@ -1348,18 +1517,17 @@ def load_dataset(
         path = data / dataset.archive[0]
         for actor, sex in ravdess_actors(path).items():
             clips = read_ravdess(path, RATE, actors=(actor,))[actor]
-            pool = ravdess_pool(_shuffled(clips, plan.seed, dataset.name, actor), RATE, plan.trials)
-            _admit(speakers, excluded, embedders, pool, dataset.name, actor, sex)
+            _admit(speakers, excluded, embedders, clips, plan, dataset.name, actor, sex)
         digest = dataset.archive[1]
     else:
         for entry in dataset.speakers:
-            audios = []
+            clips = []
             for rel, _ in entry.files:
                 audio, native = read_audio(data / rel)
-                audios.append(resample(trim(audio, native), native, RATE))
-            shuffled = _shuffled(audios, plan.seed, dataset.name, entry.speaker)
-            pool = librittsr_pool(shuffled, RATE, plan.trials)
-            _admit(speakers, excluded, embedders, pool, dataset.name, entry.speaker, entry.sex)
+                clips.append(Clip(resample(trim(audio, native), native, RATE), NEUTRAL))
+            _admit(
+                speakers, excluded, embedders, clips, plan, dataset.name, entry.speaker, entry.sex
+            )
         manifest = json.dumps(sorted(dataset.files().items())).encode("utf-8")
         digest = hashlib.sha256(manifest).hexdigest()
     return Loaded(plan=dataset, speakers=speakers, excluded=excluded, digest=digest)
@@ -1446,6 +1614,13 @@ def report(
             }
             for d in loaded
         ],
+        "anchor_sets": {
+            d.plan.name: {
+                "drawn": sum(len(s.anchor_sets()) for s in d.speakers),
+                "skipped": sum(s.skipped for s in d.speakers),
+            }
+            for d in loaded
+        },
         "embedders": {n: {"revision": r} for n, r in plan.embedders.items()},
         "trials": {
             **{k: list(v) if isinstance(v, tuple) else v for k, v in params.items()},
@@ -1487,6 +1662,10 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
                 f"calibrate: {dataset['name']} {sex}: {row['eligible']} eligible, "
                 f"{row['excluded']} excluded"
             )
+    for dataset, row in result["anchor_sets"].items():  # type: ignore[attr-defined]
+        lines.append(
+            f"calibrate: {dataset} anchor sets: {row['drawn']} drawn, {row['skipped']} skipped"
+        )
     for gate, entry in result["gates"].items():  # type: ignore[attr-defined]
         for name, value in entry["values"].items():
             by = entry["set_by"][name]
