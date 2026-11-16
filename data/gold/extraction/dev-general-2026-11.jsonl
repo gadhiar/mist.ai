@@ -1,0 +1,60 @@
+{"utterance": "I use Obsidian for my reading notes.", "tag": "dvg-01-core-obsidian-reading-notes", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I really dislike open-plan offices.", "tag": "dvg-02-core-dislikes-open-plan-offices", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I am employed by Ruddlesmoor Glassworks as a kiln technician.", "tag": "dvg-03-core-works-at-ruddlesmoor", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I prefer paper notebooks to apps when I'm sketching out ideas.", "tag": "dvg-04-core-prefers-paper-notebooks", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I don't like Kubernetes for small hobby projects. It's far more than I need.", "tag": "dvg-05-core-negated-kubernetes", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Honestly, I'm not a fan of YAML config files.", "tag": "dvg-06-core-negated-yaml-config", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I run Syncthing on every machine I own.", "tag": "dvg-07-core-uses-syncthing", "expected_entities": [], "expected_relationships": []}
+{"utterance": "For my terminal I prefer Fish to Zsh.", "tag": "dvg-08-core-prefers-fish-to-zsh", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I prefer cycling to work over taking the bus.", "tag": "dvg-09-core-prefers-cycling-to-work", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I'm a nurse at the Wyndral Clinic in Galway.", "tag": "dvg-10-core-works-at-wyndral-clinic", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I gave a talk on property-based testing at the Lintwater meetup on 12 March 2024.", "tag": "dvg-11-event-talk-at-lintwater-meetup", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I finished my first marathon on 9 April 2023.", "tag": "dvg-12-event-first-marathon", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I launched the website for my pottery shop on 18 November 2022.", "tag": "dvg-13-event-launched-pottery-site", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I attended a Kotlin workshop on 5 October 2021.", "tag": "dvg-14-event-kotlin-workshop", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I graduated with my nursing degree on 30 January 2020.", "tag": "dvg-15-event-graduated-nursing-degree", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My Larchfield indexer processes 850 documents per minute.", "tag": "dvg-16-metric-larchfield-indexer-throughput", "expected_entities": [], "expected_relationships": []}
+{"utterance": "The test suite of my Gorsey budgeting app finishes in 42 seconds.", "tag": "dvg-17-metric-gorsey-test-suite-time", "expected_entities": [], "expected_relationships": []}
+{"utterance": "On my Raspberry Pi, SQLite answers a typical query in 3 ms.", "tag": "dvg-18-metric-sqlite-query-time", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I'm learning Japanese, mostly through graded readers.", "tag": "dvg-19-skill-learning-japanese", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I'd call myself an expert in Terraform.", "tag": "dvg-20-skill-expert-terraform", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I struggle with CSS grid every time I lay out a page.", "tag": "dvg-21-skill-struggles-css-grid", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I've enrolled in an evening class and start learning Welsh on 7 September 2026.", "tag": "dvg-22-skill-learning-welsh-from-september", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I know Elixir well, and I'm learning Gleam alongside it.", "tag": "dvg-23-skill-knows-elixir-learning-gleam", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My friend Henrike starts as a dispatcher at Saltbridge Ferries in August 2026.", "tag": "dvg-24-thirdparty-henrike-starts-at-saltbridge", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My neighbour Tobiah is an expert in beekeeping.", "tag": "dvg-25-thirdparty-tobiah-beekeeping", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My cousin Radka uses Blender for her architecture renders.", "tag": "dvg-26-thirdparty-radka-uses-blender", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My old flatmate Leofric works at Penhallow Acoustics. He recommended KiCad to me for designing circuit boards.", "tag": "dvg-27-thirdparty-leofric-recommends-kicad", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My sailing instructor Eluned is an expert in celestial navigation, and she recommended the book The Annapolis Book of Seamanship to me.", "tag": "dvg-28-thirdparty-eluned-recommends-book", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I have worked at Embergrove Studios since March 2022.", "tag": "dvg-29-validtime-embergrove-since", "expected_entities": [], "expected_relationships": []}
+{"utterance": "From 2019 to 2021 I used Vim as my main editor.", "tag": "dvg-30-validtime-vim-span", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I've been a member of the Thistlebrook Fencing Society since January 2018.", "tag": "dvg-31-validtime-fencing-society-since", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I'm working on the Orrin route planner until the end of September 2026.", "tag": "dvg-32-validtime-orrin-until", "expected_entities": [], "expected_relationships": []}
+{"utterance": "My contract with Pelling and Rowe runs until 31 March 2027.", "tag": "dvg-33-validtime-contract-until", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Could you set a timer for the pasta?", "tag": "dvg-34-nofact-pasta-timer", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Good morning! How are you getting on?", "tag": "dvg-35-nofact-greeting", "expected_entities": [], "expected_relationships": []}
+{"utterance": "What's the difference between a mutex and a semaphore?", "tag": "dvg-36-nofact-mutex-question", "expected_entities": [], "expected_relationships": []}
+{"utterance": "If I ever moved to Norway, I'd probably take up cross-country skiing. It's only a thought, though.", "tag": "dvg-37-nofact-norway-hypothetical", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Please draft a short thank-you note to my team for the launch.", "tag": "dvg-38-nofact-thank-you-note", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Is it worth carrying an umbrella around Edinburgh?", "tag": "dvg-39-nofact-umbrella-question", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Kafka Streams is part of Apache Kafka.", "tag": "dvg-40-structural-kafka-streams-part-of-kafka", "expected_entities": [], "expected_relationships": []}
+{"utterance": "The planner module is part of the Brindlecote scheduling service.", "tag": "dvg-41-structural-planner-module-part-of-brindlecote", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Sourdough is a type of bread.", "tag": "dvg-42-structural-sourdough-kind-of-bread", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I stopped using Evernote in August 2023.", "tag": "dvg-43-cease-stopped-evernote", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I left Marlow Kettleworks at the end of February 2025.", "tag": "dvg-44-cease-left-marlow-kettleworks", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I'm no longer learning Mandarin. I gave it up.", "tag": "dvg-45-cease-no-longer-learning-mandarin", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I gave up on Nix and don't use it anymore.", "tag": "dvg-46-cease-gave-up-nix", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I cancelled my membership of the Copperline Cycling Club in September 2024.", "tag": "dvg-47-cease-cancelled-copperline-club", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Scratch what I said about working at Greyfriar Analytics. I only ever interviewed there.", "tag": "dvg-48-retract-never-worked-at-greyfriar", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I misspoke: I don't use Pulumi at all, I've only read about it.", "tag": "dvg-49-retract-misspoke-pulumi", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Correction: I was never learning Icelandic, I only bought the textbook.", "tag": "dvg-50-retract-never-learning-icelandic", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I was wrong when I said I'm an expert in Go. I've barely touched it.", "tag": "dvg-51-retract-wrong-about-go", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Forget what I told you about liking jazz fusion, that was never true.", "tag": "dvg-52-retract-forget-jazz-fusion", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I switched from Firefox to Vivaldi in April 2025.", "tag": "dvg-53-pair-firefox-to-vivaldi", "expected_entities": [], "expected_relationships": []}
+{"utterance": "In October 2025 I left Tidewell Logistics and joined Fenmarch Robotics.", "tag": "dvg-54-pair-tidewell-to-fenmarch", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I swim at the lido every morning before work.", "tag": "dvg-55-habit-swim-at-lido", "expected_entities": [], "expected_relationships": []}
+{"utterance": "Twice a month I volunteer at the Kestrelford food bank.", "tag": "dvg-56-habit-volunteer-food-bank", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I phone my parents every evening after dinner.", "tag": "dvg-57-habit-phone-parents", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I have tracked my tasks in Taskwarrior since 2 May 2024.", "tag": "dvg-58-datekind-taskwarrior-since", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I start at Ashcombe Maritime on 1 September 2026.", "tag": "dvg-59-datekind-starts-at-ashcombe", "expected_entities": [], "expected_relationships": []}
+{"utterance": "I'm closing on my house on 19 October 2026.", "tag": "dvg-60-datekind-closing-on-house", "expected_entities": [], "expected_relationships": []}

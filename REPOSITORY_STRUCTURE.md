@@ -78,6 +78,8 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 ### Gold sets (`data/gold/`)
 - `data/gold/extraction/` - Extraction gold sets (dev lists, held out) and the labelling guide (`LABELLING.md`)
 - `data/gold/extraction/selection-2026-11.jsonl` - The selection gold set: 240 list and 40 prose probes adjudicated from two blind label passes; the verdict set
+- `data/gold/extraction/dev-general-2026-11.jsonl` - The dev-general set: 60 prose probes in the 60-probe set's category mix, written with empty gold for two blind label passes to fill
+- `data/gold/extraction/dev-general-2026-11/` - The dev-general set's design (one tag, category and intent per probe), and later its two blind label passes, their agreement and the adjudication log
 - `data/gold/extraction/labelling/relabel-v11-2026-11.md` - The log of the v11 relabel of gold ids under the extraction contract and the id rails
 - `data/gold/extraction/labelling/selection-2026-11/` - The selection set's design, its two blind label passes, the agreement measured before adjudication, the adjudication log, the prompt-word exemptions the gold-set test loads, and a README
 - `data/gold/retrieval/` - Retrieval queries over the dev gold facts, with a README
