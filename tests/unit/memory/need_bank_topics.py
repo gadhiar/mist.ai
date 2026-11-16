@@ -42,6 +42,7 @@ Side = Literal["need_heavy", "no_need_heavy", "both"]
 # plain singular, or to itself, kept whole. Reviewers add to this list.
 FOLD_EXCEPTIONS: dict[str, str] = {
     # Kept whole: the fold would merge them with an unrelated word.
+    "clothes": "clothes",  # garments, not the verb clothe
     "eighties": "eighties",  # the decade, not the number eighty
     "hits": "hits",  # popular songs, not hit the gym
     "lands": "lands",  # a flight landing, not where a decision landed
@@ -58,7 +59,7 @@ FOLD_EXCEPTIONS: dict[str, str] = {
     "downstairs": "downstairs",
     "lens": "lens",
     "upstairs": "upstairs",
-    # Kept whole: the fold is not a readable word. Neither occurs in a bank row yet; both are
+    # Kept whole: the fold is not a readable word. Series occurs in no bank row yet; it is
     # listed ahead of the rows authors will write.
     "gas": "gas",
     "series": "series",
@@ -67,6 +68,7 @@ FOLD_EXCEPTIONS: dict[str, str] = {
     # from reading the token as a misspelling.
     "ca\x66": "cafe",
     # Mapped to the plain singular the fold misses.
+    "calories": "calorie",
     "causes": "cause",
     "goes": "go",
     "movies": "movie",

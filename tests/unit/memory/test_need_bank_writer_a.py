@@ -1,7 +1,7 @@
 """Checks on the first writer's bank of labelled need/no_need user turns.
 
-The need gate decides, per message, whether a reply needs the user's stored memories. It is fit
-on this bank and tested against a second writer's bank, so these tests hold the bank to its
+The need gate decides, per message, whether a reply needs the user's stored memories. Each
+writer's rows are scored by a gate fit on the other writers, so these tests hold the bank to its
 schema, its coverage floors, the public-repository rules (no contact details), and a ceiling on
 lexical overlap with the recall probes, so the gate is not fit on near-copies of eval queries.
 Failure messages name row ids only, never a text, so a failing run does not echo the rows.

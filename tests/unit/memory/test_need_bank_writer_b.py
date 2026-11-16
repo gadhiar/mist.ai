@@ -1,9 +1,10 @@
 """Checks on the second writer's need bank, `backend/memory/need_bank/writer_b.jsonl`.
 
 The bank holds labelled user turns for the gate that decides, per message, whether to fetch the
-user's memories. Two writers authored independent banks so that a model fit on one is tested on
-the other; these tests keep this bank well formed, free of contact details, and apart from both
-the recall probes and the first writer's rows, so no text leaks across a fold or into the eval.
+user's memories. Writers authored independent banks, and each writer's rows are scored by a gate
+fit on the other writers; these tests keep this bank well formed, free of contact details, and
+apart from both the recall probes and the first writer's rows, so no text leaks across a fold or
+into the eval.
 
 The file is read here by a plain JSON-lines reader rather than any loader module, so these checks
 do not wait on, or move with, the code that consumes the bank.
