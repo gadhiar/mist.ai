@@ -24,6 +24,7 @@ import hashlib
 import io
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -31,7 +32,15 @@ from .. import gates as gates_mod
 from .. import jobs
 from .. import root as root_mod
 from ..errors import GateError, InputError, JobError
-from ..records import JobInput, SourceRecord, read_json, read_jsonl, sha256_file, write_json
+from ..records import (
+    JobInput,
+    SourceRecord,
+    _Record,
+    read_json,
+    read_jsonl,
+    sha256_file,
+    write_json,
+)
 from . import ingest as ingest_cmd
 from . import sdh as sdh_cmd
 
@@ -47,8 +56,11 @@ PLAN_NAME = "extract-plan.json"
 RESULT_NAME = "extract-result.json"
 REPORT_NAME = "report.json"
 SEGMENTS_NAME = "segments.jsonl"
+TURNS_NAME = "turns.jsonl"
 PROPOSALS_NAME = "proposals.jsonl"
 AUDIO_DIR = "audio"
+# A SIM equal to a gate value up to rounding meets it, as in `stages/retrieve.py`.
+EPS = 1e-9
 # A run id names a folder under `seed/runs/`, so it is one plain path segment.
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # Source facts the report copies from the inventory: codec facts, never the path.
@@ -70,6 +82,37 @@ def run_rel(run_id: str) -> str:
     return f"seed/runs/{run_id}"
 
 
+@dataclass(frozen=True, slots=True)
+class TurnRecord(_Record):
+    """One line of a run's `turns.jsonl`: a diarized turn, its role and what retrieval measured.
+
+    Segment records cover admitted clusters only, so without this record a turn of a cluster
+    that is not admitted leaves no trace, and a scorer cannot tell which cluster held a given
+    speaker. Every turn of every source has one, whatever its role. It holds times and scores
+    only, like a segment record: no file name, text or audio.
+
+    `turn` is the turn's index in its source's turns, sorted by start. `sim_anchor` is its SIM
+    to the anchor centroid retrieval used and `sim_target` its SIM to the target centroid;
+    `gaps` is `retrieve.Verdict.gaps`, and `passed` and `reasons` are `retrieve.judge` on the
+    turn's own embedding. All are `None` (and `reasons` empty) where they were not measured: a
+    turn too short to embed, a run with no target model, or (for `gaps`) a source with no rival.
+    """
+
+    source_id: str
+    turn: int
+    start_s: float
+    end_s: float
+    diar_cluster: str
+    role: str
+    embedded: bool
+    touches_overlap: bool
+    sim_anchor: dict[str, float] | None
+    sim_target: dict[str, float] | None
+    gaps: dict[str, float] | None
+    passed: bool | None
+    reasons: tuple[str, ...]
+
+
 def register(subparsers: argparse._SubParsersAction) -> None:
     """Add the `extract` command."""
     parser = subparsers.add_parser(
@@ -77,7 +120,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="dialogue extraction and target-speaker retrieval (local jobs only)",
         description=(
             "Extract the target's dialogue from every ingested source into seed/runs/<run>: "
-            "segments.jsonl, audio/, proposals.jsonl and report.json. Runs on this host only."
+            "segments.jsonl, turns.jsonl, audio/, proposals.jsonl and report.json. Runs on this "
+            "host only."
         ),
     )
     parser.add_argument("--run", required=True, help="the run id, a new folder under seed/runs")
@@ -201,7 +245,8 @@ def run(args: argparse.Namespace) -> int:
             f"refused: no anchor; place a solo clip in {REFERENCE_REL}/ or rows in {ANCHORS_REL}"
         )
     run_dir = run_rel(args.run)
-    if any((root.path / run_dir / name).exists() for name in (SEGMENTS_NAME, REPORT_NAME)):
+    finished = (SEGMENTS_NAME, TURNS_NAME, REPORT_NAME)
+    if any((root.path / run_dir / name).exists() for name in finished):
         raise InputError(f"refused: {run_dir} already holds a run; choose a new run id")
     for record in records:
         if not (root.path / record.track).is_file():
@@ -233,10 +278,10 @@ def run(args: argparse.Namespace) -> int:
         network=False,
     )
     jobs.executor_for("local", root=root, docker=make_docker()).run(job)
-    return _finish(root, args.run)
+    return _finish(root, args.run, thresholds)
 
 
-def _finish(root: root_mod.Root, run_id: str) -> int:
+def _finish(root: root_mod.Root, run_id: str, thresholds: Mapping[str, float]) -> int:
     result = read_json(root.path / run_rel(run_id) / RESULT_NAME)
     status = result.get("status") if isinstance(result, dict) else None
     if status == "no-anchor":
@@ -245,7 +290,7 @@ def _finish(root: root_mod.Root, run_id: str) -> int:
         bad = ", ".join(str(a) for a in result.get("anchors", []))  # type: ignore[union-attr]
         raise InputError(f"refused: anchors must be 3-30 s; out of range: {bad}")
     if status == "anchors-disagree":
-        for line in anchor_lines(result.get("anchors", [])):  # type: ignore[union-attr]
+        for line in anchor_lines(result.get("anchors", []), thresholds):  # type: ignore[union-attr]
             print(line)
         raise GateError(f"anchors disagree in run {run_id}; each SIM above is to the others")
     if status != "ok":
@@ -276,15 +321,27 @@ def _table(table: object) -> str:
     return ", ".join(f"{k} {_num(v)}" for k, v in table.items())
 
 
-def anchor_lines(rows: object) -> list[str]:
-    """Return one line per anchor: its opaque name and its SIM to the others per embedder."""
+def anchor_lines(rows: object, thresholds: Mapping[str, float]) -> list[str]:
+    """Return one line per anchor: its opaque name and its SIM to the others per embedder.
+
+    Each embedder has its own Anchors value (`anchors.sim_min.<embedder>`), so a SIM under its
+    embedder's value is marked `below`: one number cannot be read against another embedder's
+    scale, and the mark names which value an anchor failed.
+    """
     if not isinstance(rows, list):
         return []
-    return [
-        f"  anchor {row.get('anchor')}: {_table(row.get('sim'))}"
-        for row in rows
-        if isinstance(row, Mapping)
-    ]
+    lines = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        sims = row.get("sim")
+        parts = []
+        for name, value in sims.items() if isinstance(sims, Mapping) else ():
+            sim_min = thresholds.get(f"anchors.sim_min.{name}")
+            below = isinstance(value, int | float) and sim_min is not None and value < sim_min - EPS
+            parts.append(f"{name} {_num(value)}{' below' if below else ''}")
+        lines.append(f"  anchor {row.get('anchor')}: {', '.join(parts) or 'none'}")
+    return lines
 
 
 def report_lines(report: Mapping[str, object]) -> list[str]:
@@ -318,14 +375,16 @@ def report_lines(report: Mapping[str, object]) -> list[str]:
             continue
         lines.append(
             f"  {source.get('source_id')}: separator {source.get('separator')} "
-            f"({_table(source.get('separator_scores'))}); kept {_num(source.get('kept'))}, "
-            f"flagged {_num(source.get('flagged'))}, dropped {_num(source.get('dropped'))}"
+            f"({_table(source.get('separator_scores'))}); primary {_num(source.get('primary_s'))} "
+            f"s; kept {_num(source.get('kept'))}, flagged {_num(source.get('flagged'))}, "
+            f"dropped {_num(source.get('dropped'))}"
         )
         clusters = source.get("clusters")
         for cluster in clusters if isinstance(clusters, list) else []:
             lines.append(
                 f"    {cluster.get('diar_cluster')} {cluster.get('role')}: "
-                f"{_num(cluster.get('turns'))} turns, median {_table(cluster.get('median_sim'))}"
+                f"{_num(cluster.get('turns'))} turns, {_num(cluster.get('seconds'))} s, "
+                f"median {_table(cluster.get('median_sim'))}"
             )
     thresholds = report.get("thresholds")
     if isinstance(thresholds, Mapping):
