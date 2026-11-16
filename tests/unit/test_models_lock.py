@@ -481,7 +481,16 @@ class TestDockerfile:
         assert re.search(r"chmod -R a\+rX /opt/models", download), download
 
     def test_no_global_hf_offline_flag(self) -> None:
-        """The production embedder loads all-MiniLM-L6-v2 by name; a global flag changes that."""
+        """The baked models already load offline; a global flag would stop the Hub loads.
+
+        The read-path models load from `/opt/models` with `local_files_only=True`
+        (backend/knowledge/embeddings/embedding_generator.py:101-103,
+        backend/memory/rerank.py:465-467), so they need no flag. What a flag in the image would
+        break is every load that still reaches the Hub: Chatterbox's `from_pretrained` (src/multimodal/tts.py:276)
+        calls `hf_hub_download` for each of its files, and `EmbeddingGenerator` loads a model
+        that is not baked by its name (embedding_generator.py:106). Under the flag, each fails
+        unless its files are already in the Hugging Face cache.
+        """
         for instruction in _dockerfile_instructions():
             if instruction.startswith(("ENV ", "ARG ")):
                 assert "HF_HUB_OFFLINE" not in instruction, instruction
