@@ -1,4 +1,5 @@
-"""The calibration job: pools, trials, the threshold rule and the bootstrap (T32, T35, T36).
+"""The calibration job: pools, trials, the threshold rule and the bootstrap (T32, T35, T36), and
+the left-out miss, the ceilings, the refusal and the operating curve (T39).
 
 Every test runs on synthetic embeddings or tiny synthetic audio; `load_embedders` is replaced by
 fakes, so no model is ever loaded.
@@ -109,11 +110,23 @@ MATCHED = {
 }
 """Decision 18's matched forms, as `calibrate run` writes them into the plan."""
 MATCHED_PLAN = {gate: list(forms) for gate, forms in MATCHED.items()}
+CEILINGS = {calibrate.SIM_MIN: 0.05, calibrate.FLOOR: 0.05, calibrate.MARGIN: 0.10}
+"""Decision 17's ceilings, as `calibrate run` writes them into the plan."""
+OPEN = {gate: 1.0 for gate in calibrate.GATES}
+"""Ceilings no left-out miss can be over, for tests about anything but the refusal."""
+CURVE = (0.005, 0.01, 0.02, 0.05)
 
 
 def _summary(datasets: Sequence[calibrate.DatasetTrials], seed: int = 7, alpha: float = 0.01):
     return calibrate.summarise(
-        datasets, alpha=alpha, seed=seed, bootstrap=30, names=NAMES, matched=MATCHED
+        datasets,
+        alpha=alpha,
+        seed=seed,
+        bootstrap=30,
+        names=NAMES,
+        matched=MATCHED,
+        ceilings=CEILINGS,
+        curve_alphas=CURVE,
     )
 
 
@@ -616,6 +629,158 @@ def test_a_target_trial_counts_as_many_times_as_its_owner_is_drawn() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Leave one speaker out, the ceilings and the operating curve (T39)
+# ---------------------------------------------------------------------------
+
+
+def _toy(
+    gate: str,
+    form: str,
+    scores: Sequence[Sequence[float]],
+    rivals: Sequence[Sequence[int]],
+    impostor: Sequence[float],
+) -> calibrate.DatasetTrials:
+    """One dataset of one sex: speaker i owns target trial i; every ordered pair is an impostor
+    trial at the same low scores, so no impostor ever binds above them.
+    """
+    count = len(scores)
+    pairs = [(a, b) for a in range(count) for b in range(count) if a != b]
+    empty: dict = {g: {} for g in calibrate.GATES}
+    trials = calibrate.FormTrials(
+        scores=np.tile(np.asarray(impostor, dtype=np.float64), (len(pairs), 1)),
+        a=np.array([a for a, _ in pairs], dtype=np.int64),
+        b=np.array([b for _, b in pairs], dtype=np.int64),
+        pairs=len(pairs),
+    )
+    target = calibrate.TargetTrials(
+        scores=np.asarray(scores, dtype=np.float64),
+        registers=("neutral",) * count,
+        owners=np.arange(count, dtype=np.int64),
+        rivals=tuple(tuple(r) for r in rivals),
+    )
+    return calibrate.DatasetTrials(
+        name="d",
+        sexes=("female",) * count,
+        impostor={**empty, gate: {"f": trials}},
+        reported=empty,
+        target={**empty, gate: {form: target}},
+    )
+
+
+# Speaker 0's set sits alone at 0.4 on the first embedder, the others' at 0.8. Every impostor sits
+# at 0.1, so the rule takes the largest v1 that misses no weighed target: the lowest one's score.
+MOVER = [[0.4, 0.9], [0.8, 0.9], [0.8, 0.9], [0.8, 0.9]]
+
+
+def test_a_speaker_whose_trials_alone_move_the_pair_is_scored_at_the_pair_without_it() -> None:
+    trials = _toy(calibrate.SIM_MIN, "sets", MOVER, [()] * 4, [0.1, 0.1])
+    prepared = calibrate.gate_trials([trials], calibrate.SIM_MIN, ("sets",))
+    whole = calibrate.solve(prepared, 100)
+    assert whole.values == (0.4, 0.1) and whole.miss == 0.0
+    left = calibrate.leave_one_out([trials], calibrate.SIM_MIN, ("sets",), prepared, 100)
+    # Without speaker 0 the pair rises to 0.8, where speaker 0's own set misses; without any
+    # other speaker it stays at 0.4, where that speaker's set passes.
+    assert left.pairs[("d", 0)] == (8000, 1000)
+    assert all(left.pairs[("d", s)] == (4000, 1000) for s in (1, 2, 3))
+    assert left.missed[("d", "sets")].tolist() == [True, False, False, False]
+    assert left.rates == {("d", "sets"): 0.25}
+    assert (left.miss, left.worst) == (0.25, ("d", "sets"))
+
+
+def test_a_speaker_who_is_only_a_margin_trials_rival_is_left_out_of_that_trials_solve() -> None:
+    # Speaker 4 owns the trial at 0.5 and is one of the rivals of speaker 1's trial at 0.3, and of
+    # no other. Leaving 4 out drops both, so the rest, at 0.8, set v1 and 4's own trial misses.
+    scores = [[0.8, 0.9], [0.3, 0.9], [0.8, 0.9], [0.8, 0.9], [0.5, 0.9], [0.8, 0.9]]
+    rivals = [(2, 3, 5), (0, 2, 4), (0, 3, 5), (0, 2, 5), (0, 2, 3), (0, 2, 3)]
+    trials = _toy(calibrate.MARGIN, "rival", scores, rivals, [-0.5, -0.5])
+    prepared = calibrate.gate_trials([trials], calibrate.MARGIN, ("rival",))
+    left = calibrate.leave_one_out([trials], calibrate.MARGIN, ("rival",), prepared, 100)
+    assert left.pairs[("d", 4)][0] == 8000
+    assert bool(left.missed[("d", "rival")][4])
+    # Dropping only the trial speaker 4 owns would keep speaker 1's, whose 0.3 sets v1, and 4's
+    # own trial would pass there.
+    owners = trials.target[calibrate.MARGIN]["rival"].owners
+    kept = {("d", "rival"): (owners != 4).astype(np.int64)}
+    assert calibrate.solve(prepared, 100, None, kept).values[0] == 0.3
+
+
+def test_a_left_out_miss_equal_to_its_ceiling_is_within_it_and_just_above_is_over() -> None:
+    trials = _toy(calibrate.SIM_MIN, "sets", MOVER, [()] * 4, [0.1, 0.1])
+    prepared = calibrate.gate_trials([trials], calibrate.SIM_MIN, ("sets",))
+    whole = calibrate.solve(prepared, 100)
+    left = calibrate.leave_one_out([trials], calibrate.SIM_MIN, ("sets",), prepared, 100)
+    at = calibrate.objective(whole, left, 0.25)
+    assert (at.miss, at.loso_miss, at.dataset, at.form, at.ceiling) == (
+        0.0,
+        0.25,
+        "d",
+        "sets",
+        0.25,
+    )
+    assert at.within
+    assert not calibrate.objective(whole, left, 0.2499).within
+
+
+def test_the_curve_has_one_row_per_alpha_and_its_row_at_alpha_is_the_chosen_pair() -> None:
+    libri = calibrate.dataset_trials(
+        "librittsr", make_speakers({"female": 4, "male": 3}), SMALL, seed=1, names=NAMES
+    )
+    summary = _summary([libri], alpha=0.02)
+    for gate in calibrate.GATES:
+        rows = summary.curve[gate]
+        assert [row.alpha for row in rows] == list(CURVE)
+        [at] = [row for row in rows if row.alpha == 0.02]
+        solution, objective = summary.solutions[gate], summary.objectives[gate]
+        assert at.values == summary.values[gate] == solution.values
+        assert (at.miss, at.loso_miss, at.largest_far) == (
+            solution.miss,
+            objective.loso_miss,
+            solution.far,
+        )
+        for row in rows:
+            assert row.largest_far <= row.alpha
+            for form in libri.impostor[gate].values():
+                assert calibrate.joint_far(form.scores, row.values) <= row.alpha
+        # More false-accept budget never misses more in sample.
+        misses = [row.miss for row in rows]
+        assert misses == sorted(misses, reverse=True)
+        assert objective.loso_miss == summary.left_out[gate].miss
+        assert objective.within == (objective.loso_miss <= CEILINGS[gate])
+
+
+def test_the_summary_refuses_curve_alphas_without_the_plans_alpha() -> None:
+    libri = calibrate.dataset_trials(
+        "librittsr", make_speakers({"female": 3, "male": 3}), SMALL, seed=1, names=NAMES
+    )
+    with pytest.raises(StageError, match="alpha"):
+        calibrate.summarise(
+            [libri],
+            alpha=0.03,
+            seed=1,
+            bootstrap=2,
+            names=NAMES,
+            matched=MATCHED,
+            ceilings=CEILINGS,
+            curve_alphas=CURVE,
+        )
+
+
+def test_the_job_restates_the_embedder_order_of_target() -> None:
+    from scripts.voice_data import target
+
+    assert calibrate.EMBEDDERS == target.EMBEDDERS == NAMES
+
+
+def test_both_docstrings_describe_the_ceilings_the_refusal_and_the_curve() -> None:
+    from scripts.voice_data.commands import calibrate as command
+
+    for module in (calibrate, command):
+        text = " ".join((module.__doc__ or "").split()).lower()
+        for phrase in ("leave one speaker out", "ceiling", "refused", "curve", "curve_alphas"):
+            assert phrase in text, (module.__name__, phrase)
+
+
+# ---------------------------------------------------------------------------
 # Pools
 # ---------------------------------------------------------------------------
 
@@ -970,6 +1135,8 @@ def write_plan(data: Path, ravdess: bool = True, **overrides: object) -> dict:
             "anchor_sets": 10,
         },
         "matched": MATCHED_PLAN,
+        "ceilings": dict(OPEN),
+        "curve_alphas": list(CURVE),
         "datasets": datasets,
     }
     plan.update(overrides)
@@ -1041,6 +1208,9 @@ def test_main_writes_calibration_and_outputs_beside_the_plan(
     for name in NAMES:
         assert result["keys"][f"{calibrate.FLOOR}.{name}"] == floor["values"][name]
     assert result["matched"] == MATCHED_PLAN
+    assert (result["status"], result["refusals"]) == ("calibrated", [])
+    assert result["ceilings"] == OPEN
+    assert result["curve_alphas"] == list(CURVE)
     for gate, entry in result["gates"].items():
         assert set(entry) == {
             "values",
@@ -1051,8 +1221,17 @@ def test_main_writes_calibration_and_outputs_beside_the_plan(
             "reported",
             "misses",
             "equal_beta",
+            "curve",
             "bootstrap",
         }
+        assert [row["alpha"] for row in entry["curve"]] == list(CURVE)
+        [at] = [row for row in entry["curve"] if row["alpha"] == result["alpha"]]
+        assert set(at) == {"alpha", "values", "miss", "loso_miss", "largest_far"}
+        assert at["values"] == entry["values"]
+        assert (at["miss"], at["loso_miss"]) == (
+            entry["objective"]["miss"],
+            entry["objective"]["loso_miss"],
+        )
         fars = [
             (row["joint_far"], dataset, form)
             for dataset, forms in entry["forms"].items()
@@ -1070,14 +1249,35 @@ def test_main_writes_calibration_and_outputs_beside_the_plan(
             for form in MATCHED[gate]
         ]
         objective = entry["objective"]
-        assert set(objective) == {"miss", "mean_miss"}
+        assert set(objective) == {
+            "miss",
+            "mean_miss",
+            "loso_miss",
+            "dataset",
+            "form",
+            "ceiling",
+            "within",
+        }
         assert objective["miss"] == max(matched_rates)
         assert objective["mean_miss"] == pytest.approx(np.mean(matched_rates), abs=1e-6)
+        loso_rates = {
+            (dataset, form): entry["misses"][dataset][form]["all"]["loso_rate"]
+            for dataset in ("librittsr", "ravdess")
+            for form in MATCHED[gate]
+        }
+        assert objective["loso_miss"] == max(loso_rates.values())
+        assert loso_rates[(objective["dataset"], objective["form"])] == objective["loso_miss"]
+        assert (objective["ceiling"], objective["within"]) == (1.0, True)
         assert set(entry["equal_beta"]) == {"values", "miss", "mean_miss"}
         assert objective["miss"] <= entry["equal_beta"]["miss"]
         for forms in entry["misses"].values():
             for rows in forms.values():
-                assert all("rate_interval" in row for row in rows.values())
+                for row in rows.values():
+                    assert {"rate_interval", "loso_missed", "loso_rate"} <= set(row)
+                    assert row["loso_rate"] == round(row["loso_missed"] / row["trials"], 6)
+                # Each register's left-out misses add up to the form's.
+                parts = [row["loso_missed"] for register, row in rows.items() if register != "all"]
+                assert sum(parts) == rows["all"]["loso_missed"]
     for key in keys:
         assert key in out
     for text in ("binding", "objective", "equal split", "FAR"):
@@ -1110,7 +1310,8 @@ def test_the_log_prints_every_miss_rate_per_dataset_form_and_register(
                     line = (
                         f"calibrate: {gate} {dataset} {form} {register}: missed "
                         f"{row['missed']} of {row['trials']} trials, rate {row['rate']}, "
-                        f"interval {span}; by wavlm-sv only {by['wavlm-sv']}, ecapa only "
+                        f"interval {span}; left out missed {row['loso_missed']}, rate "
+                        f"{row['loso_rate']}; by wavlm-sv only {by['wavlm-sv']}, ecapa only "
                         f"{by['ecapa']}, both {by['both']}"
                     )
                     assert line in lines, line
@@ -1128,9 +1329,19 @@ def test_the_log_prints_every_miss_rate_per_dataset_form_and_register(
         }
         dataset, form = max(rates, key=rates.get)
         assert (
-            f"calibrate: {gate} objective: largest matched miss {objective['miss']} "
-            f"({dataset} {form}), mean matched miss {objective['mean_miss']}"
+            f"calibrate: {gate} objective: largest matched miss {objective['miss']} in sample "
+            f"({dataset} {form}), {objective['loso_miss']} left out ({objective['dataset']} "
+            f"{objective['form']}), ceiling {objective['ceiling']} (within); mean matched miss "
+            f"{objective['mean_miss']}"
         ) in lines
+        for row in entry["curve"]:
+            pair = ", ".join(f"{n} {v}" for n, v in row["values"].items())
+            chosen = " (chosen)" if row["alpha"] == result["alpha"] else ""
+            assert (
+                f"calibrate: {gate} curve at alpha {row['alpha']}{chosen}: {pair}; largest "
+                f"matched miss {row['miss']} in sample, {row['loso_miss']} left out; largest "
+                f"FAR {row['largest_far']}"
+            ) in lines
         binding = entry["binding"]
         assert (
             f"calibrate: {gate} binding: {binding['dataset']} {binding['form']}, joint FAR "
@@ -1141,6 +1352,7 @@ def test_the_log_prints_every_miss_rate_per_dataset_form_and_register(
             f"calibrate: {gate} equal split: {values}; largest matched miss {split['miss']}, "
             f"mean matched miss {split['mean_miss']}"
         ) in lines
+    assert "calibrate: status calibrated: every gate is within its ceiling" in lines
     assert re.search(r"\.(wav|zip)\b|public/", out) is None
 
 
@@ -1212,6 +1424,72 @@ def test_the_job_draws_anchor_sets_and_sets_the_keys_from_the_rule(
     assert re.search(r"\.(wav|zip)\b|public/", out) is None
 
 
+def test_a_gate_over_its_ceiling_writes_a_refused_calibration_and_exits_1(
+    tmp_path: Path,
+    fakes: list[ToneEmbedder],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Every anchor set sinks below any impostor, so each one misses wherever the pair sits: the
+    # anchor check's left-out miss is 1, over Decision 17's 0.05. The other gates' ceilings are 1.
+    built = calibrate.dataset_trials
+
+    def sunk(*args: object, **kwargs: object) -> calibrate.DatasetTrials:
+        trials = built(*args, **kwargs)
+        forms = dict(trials.target[calibrate.SIM_MIN])
+        forms["sets"] = dataclasses.replace(forms["sets"], scores=forms["sets"].scores - 3.0)
+        return dataclasses.replace(trials, target={**trials.target, calibrate.SIM_MIN: forms})
+
+    monkeypatch.setattr(calibrate, "dataset_trials", sunk)
+    data = tmp_path / "data"
+    write_plan(data, ceilings={**OPEN, calibrate.SIM_MIN: CEILINGS[calibrate.SIM_MIN]})
+    assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 1
+    out, err = capsys.readouterr()
+    result = json.loads((data / FOLDER_REL / "calibration.json").read_text(encoding="utf-8"))
+    assert result["status"] == "refused" and "keys" not in result
+    objective = result["gates"][calibrate.SIM_MIN]["objective"]
+    assert (objective["loso_miss"], objective["ceiling"], objective["within"]) == (1.0, 0.05, False)
+    assert objective["form"] == "sets"
+    assert result["refusals"] == [
+        {
+            "gate": calibrate.SIM_MIN,
+            "loso_miss": 1.0,
+            "ceiling": 0.05,
+            "dataset": objective["dataset"],
+            "form": "sets",
+        }
+    ]
+    for gate in (calibrate.FLOOR, calibrate.MARGIN):
+        assert result["gates"][gate]["objective"]["within"] is True
+    # Every number is still written: the values, the misses and the curve.
+    for entry in result["gates"].values():
+        assert set(entry["values"]) == set(NAMES) and entry["misses"] and entry["curve"]
+    errors = [line for line in err.splitlines() if line.startswith("error: ")]
+    assert errors == [
+        f"error: {calibrate.SIM_MIN} is over its ceiling: left-out miss 1.0 "
+        f"({objective['dataset']} sets) is above 0.05; calibration c1 is refused and sets no "
+        "values"
+    ]
+    assert "calibrate: status refused: 1 of 3 gates over their ceilings" in out.splitlines()
+    assert "calibrate: key " not in out
+    assert not (data / FOLDER_REL / "outputs.json").exists()
+    assert re.search(r"\.(wav|zip)\b|public/", out + err) is None
+
+
+def test_the_job_refuses_embedders_in_another_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        calibrate, "load_embedders", lambda: [ToneEmbedder("ecapa"), ToneEmbedder("wavlm-sv")]
+    )
+    data = tmp_path / "data"
+    write_plan(data, ravdess=False)
+    assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 1
+    err = capsys.readouterr().err
+    assert "order" in err and "wavlm-sv, ecapa" in err
+    assert not (data / FOLDER_REL / "calibration.json").exists()
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     [
@@ -1226,6 +1504,23 @@ def test_the_job_draws_anchor_sets_and_sets_the_keys_from_the_rule(
         ({"matched": {**MATCHED_PLAN, calibrate.SIM_MIN: ["k4"]}}, "k4"),
         ({"matched": {**MATCHED_PLAN, calibrate.FLOOR: ["centroid/n15"]}}, "centroid/n15"),
         ({"matched": {**MATCHED_PLAN, calibrate.MARGIN: []}}, "matched"),
+        ({"ceilings": _MISSING}, "ceilings"),
+        ({"ceilings": [0.05, 0.05, 0.1]}, "ceilings"),
+        ({"ceilings": {calibrate.SIM_MIN: 0.05, calibrate.FLOOR: 0.05}}, calibrate.MARGIN),
+        ({"ceilings": {**CEILINGS, calibrate.FLOOR: 0}}, calibrate.FLOOR),
+        ({"ceilings": {**CEILINGS, calibrate.FLOOR: -0.1}}, calibrate.FLOOR),
+        ({"ceilings": {**CEILINGS, calibrate.MARGIN: 1.5}}, calibrate.MARGIN),
+        ({"ceilings": {**CEILINGS, calibrate.MARGIN: "0.1"}}, calibrate.MARGIN),
+        ({"ceilings": {**CEILINGS, calibrate.SIM_MIN: True}}, calibrate.SIM_MIN),
+        ({"ceilings": {**CEILINGS, "retrieval.flag": 0.1}}, "retrieval.flag"),
+        ({"curve_alphas": _MISSING}, "curve_alphas"),
+        ({"curve_alphas": 0.01}, "curve_alphas"),
+        ({"curve_alphas": [0.01, 0.01234]}, "curve_alphas"),
+        ({"curve_alphas": [0.01, 0.6]}, "curve_alphas"),
+        ({"curve_alphas": [0.0, 0.01]}, "curve_alphas"),
+        ({"curve_alphas": [0.01, "0.02"]}, "curve_alphas"),
+        ({"curve_alphas": [0.01, 0.01]}, "curve_alphas"),
+        ({"curve_alphas": [0.005, 0.02]}, "lacks the plan's alpha"),
     ],
 )
 def test_a_malformed_plan_refuses(
@@ -1246,6 +1541,8 @@ def test_a_malformed_plan_refuses(
         "embedders": {"wavlm-sv": {"revision": "a"}, "ecapa": {"revision": "b"}},
         "trials": dataclasses.asdict(calibrate.TrialParams()),
         "matched": MATCHED_PLAN,
+        "ceilings": dict(CEILINGS),
+        "curve_alphas": list(CURVE),
         "datasets": [
             {
                 "name": "librittsr",

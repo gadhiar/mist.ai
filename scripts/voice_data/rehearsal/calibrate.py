@@ -38,6 +38,11 @@ optional; the job refuses (exit 1) a plan that breaks any rule, naming ids and c
         "retrieval.anchor_floor": ["centroid/n10", "centroid/n20", "centroid/n30"],
         "retrieval.margin": ["rival"]         # minimises
       },
+      "ceilings": {                 # exactly the three gates; each a number in (0, 1]
+        "anchors.sim_min": 0.05, "retrieval.anchor_floor": 0.05, "retrieval.margin": 0.10
+      },
+      "curve_alphas": [0.005, 0.01, 0.02, 0.05],  # unique, each on the 0.0001 grid in
+                                                   # (0, 0.5]; holds `alpha`
       "datasets": [                # 1 or 2, names unique; never pooled
         {
           "name": "librittsr",
@@ -91,7 +96,8 @@ Trials pair two speakers of one sex within one dataset, in both orders, and scor
 extract's own `retrieve.centroids` and `retrieve.sims` (`score.cosine` underneath). Each target
 trial records its owner's speaker index, and a margin target trial its rivals' too.
 
-The threshold rule (A22), per gate, with e1 WavLM-SV and e2 ECAPA in `EMBEDDERS` order:
+The threshold rule (A22), per gate, with e1 WavLM-SV and e2 ECAPA in `EMBEDDERS` order (the job
+refuses embedders loaded in another order):
 
 1. A pair (v1, v2) accepts a trial when each embedder's score is at or above its value less
    `EPS`, extract's rule. A form's FAR is the share of its impostor trials accepted; its miss the
@@ -115,8 +121,28 @@ e1's order, and a heap gives each prefix's bound on v2. The bootstrap re-solves 
 `bootstrap` speaker resamples: an impostor trial counts the copies of A times those of B, and a
 target trial its owner's copies.
 
-Output: `calibration.json` and `outputs.json` beside the plan. Printed lines and messages name
-ids and counts, never a file.
+Leave one speaker out (T39). The in-sample miss is optimistic, since the pair was chosen on the
+trials that score it. So for each speaker s of each dataset the rule is solved again with weight
+0 on every trial s takes part in: a target trial s owns, a margin target trial s is one of the
+three rivals of, and an impostor trial s is A or B of; the other dataset stays whole. s's own
+target trials, of every target form, are scored at that pair, and pooled over speakers they give
+each form's `loso_missed` and `loso_rate` per register. A gate's `loso_miss` is the largest
+pooled rate over its matched forms of both datasets.
+
+Ceilings and the refusal (Decision 17). A gate is over its ceiling when its `loso_miss` is
+strictly greater than its entry in `ceilings`; equal is within. When any gate is over, the
+calibration is refused: `calibration.json` is still written, with `status` `refused`, each such
+gate in `refusals`, every number, and no `keys`; the job prints one `error:` line per gate over
+its ceiling, writes no `outputs.json`, and exits 1, so `calibrate run` applies nothing. Within
+every ceiling, `status` is `calibrated` and `keys` holds the six values.
+
+The operating curve. For each alpha of `curve_alphas` the rule and the leave-one-out run again,
+and each gate's `curve` holds that alpha's pair, its largest matched miss in sample and left
+out, and its largest impostor FAR. The plan's alpha is one of them, so its row is the chosen
+pair, and the curve shows what each false-accept budget costs on public speakers.
+
+Output: `calibration.json` and, unless refused, `outputs.json` beside the plan. Printed lines
+and messages name ids and counts, never a file.
 """
 
 from __future__ import annotations
@@ -167,10 +193,18 @@ MIN_PIECES = 40
 MIN_ELIGIBLE = 3
 TARGET_RIVALS = 3
 
+EMBEDDERS = ("wavlm-sv", "ecapa")
+"""`target.EMBEDDERS`, restated rather than imported, so the score image never loads `target`'s
+host-side imports (`commands.clean`, `identity`, `records`, `root`). The rule's e1 and e2 are
+these in this order, so the job refuses embedders loaded in any other; a test pins the two
+tuples equal."""
+
 SIM_MIN = "anchors.sim_min"
 FLOOR = "retrieval.anchor_floor"
 MARGIN = "retrieval.margin"
 GATES = (SIM_MIN, FLOOR, MARGIN)
+CALIBRATED = "calibrated"
+REFUSED = "refused"
 PLAN_KIND = "calibration-plan"
 CALIBRATION_NAME = "calibration.json"
 LIBRITTSR = "librittsr"
@@ -290,6 +324,8 @@ class Plan:
     embedders: dict[str, str]
     trials: TrialParams
     matched: dict[str, tuple[str, ...]]
+    ceilings: dict[str, float]
+    curve_alphas: tuple[float, ...]
     datasets: tuple[DatasetPlan, ...]
 
 
@@ -419,6 +455,44 @@ def _matched(raw: object, params: TrialParams, problems: list[str]) -> dict[str,
     return found
 
 
+def _ceilings(raw: object, problems: list[str]) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        problems.append("ceilings is missing or not an object")
+        return {}
+    unknown = sorted(str(key) for key in raw if key not in GATES)
+    if unknown:
+        problems.append(f"ceilings names {', '.join(unknown)}, not a gate")
+    found: dict[str, float] = {}
+    for gate in GATES:
+        if gate not in raw:
+            problems.append(f"ceilings gives {gate} no ceiling")
+        elif not _is_number(raw[gate]) or not 0 < raw[gate] <= 1:
+            problems.append(f"the ceiling of {gate} is not a number in (0, 1]")
+        else:
+            found[gate] = float(raw[gate])
+    return found
+
+
+def _curve_alphas(raw: object, alpha: object, problems: list[str]) -> tuple[float, ...]:
+    if not isinstance(raw, list) or not raw:
+        problems.append("curve_alphas is missing or not a list of alphas")
+        return ()
+    units = []
+    for value in raw:
+        try:
+            if not _is_number(value):
+                raise StageError("curve alpha")
+            units.append(_alpha_units(float(value)))
+        except StageError:
+            problems.append("curve_alphas holds an alpha off the 0.0001 grid in (0, 0.5]")
+            return ()
+    if len(set(units)) != len(units):
+        problems.append("curve_alphas names an alpha twice")
+    if _is_number(alpha) and round(float(alpha) * GRID) not in units:  # type: ignore[arg-type]
+        problems.append("curve_alphas lacks the plan's alpha")
+    return tuple(float(v) for v in raw)
+
+
 def _excluded(raw: object, name: str, problems: list[str]) -> tuple[tuple[str, str, str], ...]:
     if raw is None:
         return ()
@@ -539,6 +613,8 @@ def parse_plan(raw: object) -> Plan:
         problems.append("the plan names no embedder")
     trials = _trials(raw.get("trials"), problems)
     matched = _matched(raw.get("matched"), trials, problems)
+    ceilings = _ceilings(raw.get("ceilings"), problems)
+    curve_alphas = _curve_alphas(raw.get("curve_alphas"), alpha, problems)
     datasets: list[DatasetPlan] = []
     raw_datasets = raw.get("datasets")
     if not isinstance(raw_datasets, list) or not 1 <= len(raw_datasets) <= len(DATASETS):
@@ -563,6 +639,8 @@ def parse_plan(raw: object) -> Plan:
         embedders=embedders,
         trials=trials,
         matched=matched,
+        ceilings=ceilings,
+        curve_alphas=curve_alphas,
         datasets=tuple(datasets),
     )
 
@@ -1691,6 +1769,140 @@ def gate_weights(
     return impostor, target
 
 
+# ---------------------------------------------------------------------------
+# Leave one speaker out, the ceilings and the operating curve (T39)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LeftOut:
+    """One gate's leave-one-speaker-out at one alpha.
+
+    `pairs` holds each (dataset, speaker index)'s pair in grid units, solved without every trial
+    the speaker takes part in. `missed` holds, for every target form of the gate per (dataset,
+    form), which trials miss at their owner's pair. `rates` is each matched form's pooled miss,
+    `miss` the largest of them and `worst` the form that sets it (the first in order on a tie;
+    `None` with no matched trial).
+    """
+
+    pairs: dict[tuple[str, int], tuple[int, int]]
+    missed: dict[Key, np.ndarray]
+    rates: dict[Key, float]
+    miss: float
+    worst: Key | None
+
+
+def _rival_rows(target: TargetTrials) -> np.ndarray:
+    """Return each trial's rival indices as one row, padded with -1, which no speaker is."""
+    width = max((len(r) for r in target.rivals), default=0)
+    rows = np.full((len(target.rivals), max(width, 1)), -1, dtype=np.int64)
+    for i, rivals in enumerate(target.rivals):
+        rows[i, : len(rivals)] = rivals
+    return rows
+
+
+def leave_one_out(
+    datasets: Sequence[DatasetTrials],
+    gate: str,
+    matched: Sequence[str],
+    prepared: GateTrials,
+    alpha_units: int,
+) -> LeftOut:
+    """Solve the gate once per speaker without the speaker, and score its own trials there.
+
+    Speaker s of a dataset weighs 0 in every trial it takes part in: an impostor trial it is A
+    or B of, a target trial it owns, and a margin target trial it is one of the rivals of. The
+    other dataset stays whole. Each target trial, of every target form, is then scored at its
+    owner's pair, so the pooled miss is out of sample (Design, Leave one speaker out).
+
+    Raises:
+        StageError: Leaving a speaker out leaves the gate no impostor trial.
+    """
+    impostor = {(d.name, f): t for d in datasets for f, t in d.impostor[gate].items()}
+    targets = {
+        (d.name, f): d.target[gate][f] for d in datasets for f in matched if f in d.target[gate]
+    }
+    rivals = {key: _rival_rows(t) for key, t in targets.items()}
+    whole_i = {key: np.ones(len(t.scores), dtype=np.int64) for key, t in impostor.items()}
+    whole_t = {key: np.ones(len(t.scores), dtype=np.int64) for key, t in targets.items()}
+    pairs: dict[tuple[str, int], tuple[int, int]] = {}
+    for d in datasets:
+        for s in range(len(d.sexes)):
+            impostor_w, target_w = dict(whole_i), dict(whole_t)
+            for key, t in impostor.items():
+                if key[0] == d.name:
+                    impostor_w[key] = ((t.a != s) & (t.b != s)).astype(np.int64)
+            for key, t in targets.items():
+                if key[0] == d.name:
+                    part = (t.owners == s) | (rivals[key] == s).any(axis=1)
+                    target_w[key] = (~part).astype(np.int64)
+            found = solve(prepared, alpha_units, impostor_w, target_w)
+            if found is None:
+                raise StageError(f"{gate} has no impostor trial without {d.name} speaker {s + 1}")
+            pairs[(d.name, s)] = found.units
+    missed: dict[Key, np.ndarray] = {}
+    for d in datasets:
+        for form, t in d.target[gate].items():
+            units = _accept_units(t.scores).reshape(-1, 2)
+            at = np.array([pairs[(d.name, int(o))] for o in t.owners], dtype=np.int64)
+            missed[(d.name, form)] = ~(units >= at.reshape(-1, 2)).all(axis=1)
+    rates = {key: float(missed[key].mean()) for key in targets if len(missed[key])}
+    worst = max(rates, key=lambda key: rates[key]) if rates else None
+    return LeftOut(
+        pairs=pairs,
+        missed=missed,
+        rates=rates,
+        miss=rates[worst] if worst is not None else 0.0,
+        worst=worst,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Objective:
+    """A gate's objective: the largest matched miss in sample and left out, and its ceiling.
+
+    `dataset` and `form` set `loso_miss`. `within` is false only when `loso_miss` is strictly
+    greater than `ceiling` (Decision 17): a miss equal to its ceiling is within it.
+    """
+
+    miss: float
+    mean_miss: float
+    loso_miss: float
+    dataset: str
+    form: str
+    ceiling: float
+    within: bool
+
+
+def objective(solution: Solution, left_out: LeftOut, ceiling: float) -> Objective:
+    """Return the gate's objective at the chosen pair and whether it is within `ceiling`."""
+    dataset, form = left_out.worst if left_out.worst is not None else ("", "")
+    return Objective(
+        miss=solution.miss,
+        mean_miss=solution.mean_miss,
+        loso_miss=left_out.miss,
+        dataset=dataset,
+        form=form,
+        ceiling=ceiling,
+        # A pooled miss k/n against a 4-decimal ceiling differs by far more than TIE unless the
+        # two are equal, so TIE only absorbs float rounding at equality.
+        within=not left_out.miss > ceiling + TIE,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CurveRow:
+    """The rule at one alpha of the plan's `curve_alphas`: the pair, its largest matched miss in
+    sample and left out, and its largest impostor FAR.
+    """
+
+    alpha: float
+    values: tuple[float, float]
+    miss: float
+    loso_miss: float
+    largest_far: float
+
+
 @dataclass(frozen=True, slots=True)
 class EqualSplit:
     """v5's equal-split pair on the same trials, and its matched misses (`equal_beta`)."""
@@ -1708,11 +1920,15 @@ class Summary:
     interval at the chosen values per gate and (dataset, form), reported forms included;
     `miss_intervals` each target form's miss interval at the chosen values per register, `all`
     included. `resamples` counts, per gate, the resamples that gave values (one whose speakers
-    are all copies of one per sex has no pair).
+    are all copies of one per sex has no pair). `left_out` and `objectives` are at the plan's
+    alpha; `curve` holds one row per curve alpha, in the plan's order.
     """
 
     values: dict[str, tuple[float, ...]]
     solutions: dict[str, Solution]
+    left_out: dict[str, LeftOut]
+    objectives: dict[str, Objective]
+    curve: dict[str, tuple[CurveRow, ...]]
     equal: dict[str, EqualSplit]
     intervals: dict[str, tuple[tuple[float, float] | None, ...]]
     far_intervals: dict[str, dict[Key, tuple[float, float] | None]]
@@ -1764,8 +1980,15 @@ def summarise(
     bootstrap: int,
     names: Sequence[str],
     matched: Mapping[str, Sequence[str]],
+    *,
+    ceilings: Mapping[str, float],
+    curve_alphas: Sequence[float],
 ) -> Summary:
-    """Set each gate's values by the threshold rule and bootstrap their intervals.
+    """Set each gate's values by the threshold rule, leave each speaker out, and bootstrap.
+
+    The rule and the leave-one-out run at every alpha of `curve_alphas`, which holds `alpha`, so
+    the curve's row at `alpha` is the chosen pair itself. Each gate's objective reads its
+    left-out miss against `ceilings`.
 
     The bootstrap resamples speakers with replacement within each sex and dataset and solves the
     rule again on each resample. A pair of copies of A and B carries the original (A, B) trials,
@@ -1773,18 +1996,33 @@ def summarise(
     a copy of itself; a target trial weighs its owner's copies.
 
     Raises:
-        StageError: A gate has no trial, alpha is off the grid, or `names` is not two embedders.
+        StageError: A gate has no trial, an alpha is off the grid, `curve_alphas` lacks `alpha`,
+            or `names` is not two embedders.
     """
     if len(names) != 2:
         raise StageError("the threshold rule takes exactly two embedders")
     alpha_units = _alpha_units(alpha)
+    curve_units = [_alpha_units(a) for a in curve_alphas]
+    if alpha_units not in curve_units:
+        raise StageError("curve_alphas lacks the plan's alpha")
     prepared = {gate: gate_trials(datasets, gate, matched[gate]) for gate in GATES}
     solutions: dict[str, Solution] = {}
+    left_out: dict[str, LeftOut] = {}
+    curve: dict[str, tuple[CurveRow, ...]] = {}
     for gate in GATES:
-        found = solve(prepared[gate], alpha_units)
-        if found is None:
-            raise StageError(f"{gate} has no trial")
-        solutions[gate] = found
+        rows = []
+        for at, units in zip(curve_alphas, curve_units):
+            found = solve(prepared[gate], units)
+            if found is None:
+                raise StageError(f"{gate} has no trial")
+            left = leave_one_out(datasets, gate, matched[gate], prepared[gate], units)
+            rows.append(CurveRow(float(at), found.values, found.miss, left.miss, found.far))
+            if units == alpha_units:
+                solutions[gate], left_out[gate] = found, left
+        curve[gate] = tuple(rows)
+    objectives = {
+        gate: objective(solutions[gate], left_out[gate], ceilings[gate]) for gate in GATES
+    }
     values = {gate: solutions[gate].values for gate in GATES}
     equal = {gate: _equal_split(datasets, gate, prepared[gate], alpha_units) for gate in GATES}
     every = {
@@ -1861,6 +2099,9 @@ def summarise(
     return Summary(
         values=values,
         solutions=solutions,
+        left_out=left_out,
+        objectives=objectives,
+        curve=curve,
         equal=equal,
         intervals=intervals,
         far_intervals=far_intervals,
@@ -1901,6 +2142,15 @@ def misses(
                 }
             found[gate][form] = rows
     return found
+
+
+def left_out_counts(target: TargetTrials, missed: np.ndarray) -> dict[str, int]:
+    """Return how many of a form's trials miss at their owner's left-out pair, per register."""
+    registers = np.asarray(target.registers)
+    counts = {ALL: int(np.count_nonzero(missed))}
+    for register in sorted(set(target.registers)):
+        counts[register] = int(np.count_nonzero(missed & (registers == register)))
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -2024,27 +2274,39 @@ def report(
                     }
                     for form, t in d.reported[gate].items()
                 }
-            miss[d.name] = {
-                form: {
+            miss[d.name] = {}
+            for form, rows in missed[d.name][gate].items():
+                lost = left_out_counts(
+                    d.target[gate][form], summary.left_out[gate].missed[(d.name, form)]
+                )
+                miss[d.name][form] = {
                     register: {
                         "trials": row["trials"],
                         "missed": row["missed"],
                         "rate": row["rate"],
+                        "loso_missed": lost[register],
+                        "loso_rate": (
+                            round(lost[register] / row["trials"], 6) if row["trials"] else 0.0
+                        ),
                         "rate_interval": summary.miss_intervals[gate][(d.name, form)][register],
                         "by": row["by"],
                     }
                     for register, row in rows.items()
                 }
-                for form, rows in missed[d.name][gate].items()
-            }
         binding = solution.binding
         equal = summary.equal[gate]
+        judged = summary.objectives[gate]
         gates[gate] = {
             "values": dict(zip(names, chosen)),
             "intervals": dict(zip(names, summary.intervals[gate])),
             "objective": {
-                "miss": round(solution.miss, 6),
-                "mean_miss": round(solution.mean_miss, 6),
+                "miss": round(judged.miss, 6),
+                "mean_miss": round(judged.mean_miss, 6),
+                "loso_miss": round(judged.loso_miss, 6),
+                "dataset": judged.dataset,
+                "form": judged.form,
+                "ceiling": judged.ceiling,
+                "within": judged.within,
             },
             "binding": {
                 "dataset": binding[0],
@@ -2059,12 +2321,35 @@ def report(
                 "miss": round(equal.miss, 6),
                 "mean_miss": round(equal.mean_miss, 6),
             },
+            "curve": [
+                {
+                    "alpha": row.alpha,
+                    "values": dict(zip(names, row.values)),
+                    "miss": round(row.miss, 6),
+                    "loso_miss": round(row.loso_miss, 6),
+                    "largest_far": round(row.largest_far, 6),
+                }
+                for row in summary.curve[gate]
+            ],
             "bootstrap": {"resamples": bootstrap, "used": summary.resamples[gate]},
         }
+    refusals = [
+        {
+            "gate": gate,
+            "loso_miss": gates[gate]["objective"]["loso_miss"],
+            "ceiling": judged.ceiling,
+            "dataset": judged.dataset,
+            "form": judged.form,
+        }
+        for gate, judged in summary.objectives.items()
+        if not judged.within
+    ]
     params = asdict(plan.trials)
-    return {
+    found = {
         "schema": SCHEMA,
         "id": plan.id,
+        "status": REFUSED if refusals else CALIBRATED,
+        "refusals": refusals,
         "alpha": plan.alpha,
         "seed": plan.seed,
         "datasets": [
@@ -2089,6 +2374,8 @@ def report(
         },
         "embedders": {n: {"revision": r} for n, r in plan.embedders.items()},
         "matched": {gate: list(plan.matched[gate]) for gate in GATES},
+        "ceilings": {gate: plan.ceilings[gate] for gate in GATES},
+        "curve_alphas": list(plan.curve_alphas),
         "trials": {
             **{k: list(v) if isinstance(v, tuple) else v for k, v in params.items()},
             "min_pieces": MIN_PIECES,
@@ -2104,8 +2391,12 @@ def report(
             "beta_max": BETA_MAX / GRID,
         },
         "gates": gates,
-        "keys": {f"{gate}.{n}": v for gate in GATES for n, v in zip(names, summary.values[gate])},
     }
+    if not refusals:
+        found["keys"] = {
+            f"{gate}.{n}": v for gate in GATES for n, v in zip(names, summary.values[gate])
+        }
+    return found
 
 
 def _span(interval: object) -> str:
@@ -2119,9 +2410,11 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
     """Return the printed summary, naming no file.
 
     Per gate: the values and intervals, the binding impostor form, the objective (the largest
-    matched miss and the form that sets it, and the mean), v5's equal-split pair beside it, each
-    form's FAR and counts, and every target miss rate per dataset, form and register with its
-    interval and the embedders that missed it, so a run can be judged from its log alone.
+    matched miss in sample and left out, the forms that set them, the ceiling and the mean),
+    v5's equal-split pair beside it, each form's FAR and counts, every target miss rate per
+    dataset, form and register, in sample with its interval and left out, with the embedders
+    that missed it, and the operating curve. Last, the status. So a run can be judged from its
+    log alone.
     """
     lines = []
     for dataset in result["datasets"]:  # type: ignore[attr-defined]
@@ -2155,9 +2448,12 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
             dataset, form = max(rates, key=rates.__getitem__)
             where = f" ({dataset} {form})"
         objective = entry["objective"]
+        verdict = "within" if objective["within"] else "over"
         lines.append(
-            f"calibrate: {gate} objective: largest matched miss {objective['miss']}{where}, "
-            f"mean matched miss {objective['mean_miss']}"
+            f"calibrate: {gate} objective: largest matched miss {objective['miss']} in sample"
+            f"{where}, {objective['loso_miss']} left out ({objective['dataset']} "
+            f"{objective['form']}), ceiling {objective['ceiling']} ({verdict}); mean matched "
+            f"miss {objective['mean_miss']}"
         )
         equal = entry["equal_beta"]
         pair = ", ".join(f"{name} {value}" for name, value in equal["values"].items())
@@ -2189,8 +2485,24 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
                     lines.append(
                         f"calibrate: {gate} {dataset} {form} {register}: missed {row['missed']} "
                         f"of {row['trials']} trials, rate {row['rate']}, interval "
-                        f"{_span(row['rate_interval'])}; by {by}"
+                        f"{_span(row['rate_interval'])}; left out missed {row['loso_missed']}, "
+                        f"rate {row['loso_rate']}; by {by}"
                     )
+        for row in entry["curve"]:
+            pair = ", ".join(f"{name} {value}" for name, value in row["values"].items())
+            chosen = " (chosen)" if row["alpha"] == result["alpha"] else ""
+            lines.append(
+                f"calibrate: {gate} curve at alpha {row['alpha']}{chosen}: {pair}; largest "
+                f"matched miss {row['miss']} in sample, {row['loso_miss']} left out; largest "
+                f"FAR {row['largest_far']}"
+            )
+    over = len(result["refusals"])  # type: ignore[arg-type]
+    if over:
+        lines.append(
+            f"calibrate: status {REFUSED}: {over} of {len(GATES)} gates over their ceilings"
+        )
+    else:
+        lines.append(f"calibrate: status {CALIBRATED}: every gate is within its ceiling")
     return lines
 
 
@@ -2201,12 +2513,16 @@ def _write_json(path: Path, payload: object) -> None:
     os.replace(part, path)
 
 
-def run(data: Path, plan_rel: str) -> list[str]:
-    """Run the calibration; return the root-relative files written.
+def run(data: Path, plan_rel: str) -> tuple[list[str], dict]:
+    """Run the calibration; return the root-relative files written and `calibration.json`.
+
+    `calibration.json` is written whatever its `status`; a refused one holds every number and
+    no `keys`, and its `refusals` name each gate over its ceiling.
 
     Raises:
         StageError: The plan is refused, a file is missing or altered, the embedders differ from
-            the plan's, or a dataset has too few eligible speakers.
+            the plan's or come in another order than `EMBEDDERS`, or a dataset has too few
+            eligible speakers.
     """
     parts = PurePosixPath(plan_rel).parts
     if not parts or plan_rel.startswith("/") or any(p in ("..", ".") for p in parts):
@@ -2221,6 +2537,11 @@ def run(data: Path, plan_rel: str) -> list[str]:
             f"the job loaded {len(names)} embedders that differ from the plan's "
             f"{len(plan.embedders)}"
         )
+    if names != EMBEDDERS:
+        raise StageError(
+            f"the job loaded the embedders in the order {', '.join(names)}; the threshold rule "
+            f"takes them in the order {', '.join(EMBEDDERS)}"
+        )
     loaded: list[Loaded] = []
     trials: list[DatasetTrials] = []
     for dataset in plan.datasets:
@@ -2228,28 +2549,54 @@ def run(data: Path, plan_rel: str) -> list[str]:
         require_speakers(dataset.name, {s: c["eligible"] for s, c in _counts(found).items()})
         loaded.append(found)
         trials.append(dataset_trials(dataset.name, found.speakers, plan.trials, plan.seed, names))
-    summary = summarise(trials, plan.alpha, plan.seed, plan.trials.bootstrap, names, plan.matched)
+    summary = summarise(
+        trials,
+        plan.alpha,
+        plan.seed,
+        plan.trials.bootstrap,
+        names,
+        plan.matched,
+        ceilings=plan.ceilings,
+        curve_alphas=plan.curve_alphas,
+    )
     result = report(plan, loaded, trials, summary, names, plan.trials.bootstrap)
     folder = PurePosixPath(plan_rel).parent
     rel = (folder / CALIBRATION_NAME).as_posix()
     _write_json(data / rel, result)
     for line in summary_lines(result):
         print(line)
-    for key, value in result["keys"].items():
+    for key, value in result.get("keys", {}).items():
         print(f"calibrate: key {key} = {value}")
-    return [rel]
+    return [rel], result
+
+
+def refusal_line(plan_id: str, refusal: Mapping[str, object]) -> str:
+    """Return the `error:` line for one gate over its ceiling."""
+    return (
+        f"error: {refusal['gate']} is over its ceiling: left-out miss {refusal['loso_miss']} "
+        f"({refusal['dataset']} {refusal['form']}) is above {refusal['ceiling']}; calibration "
+        f"{plan_id} is refused and sets no values"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the job; write `outputs.json` beside the plan for the executor to verify."""
+    """Run the job; write `outputs.json` beside the plan for the executor to verify.
+
+    A refused calibration still leaves `calibration.json`, but no `outputs.json`: the job prints
+    one `error:` line per gate over its ceiling and exits 1, so `calibrate run` applies nothing.
+    """
     parser = argparse.ArgumentParser(prog="scripts.voice_data.rehearsal.calibrate")
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--plan", required=True)
     args = parser.parse_args(argv)
     try:
-        written = run(args.data, args.plan)
+        written, result = run(args.data, args.plan)
     except StageError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result["status"] == REFUSED:
+        for refusal in result["refusals"]:
+            print(refusal_line(result["id"], refusal), file=sys.stderr)
         return 1
     folder = PurePosixPath(args.plan).parent
     files = [{"rel": rel, "sha256": sha256_file(args.data / rel)} for rel in written]

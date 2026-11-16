@@ -243,6 +243,46 @@ class CannedDocker:
         return 0
 
 
+REFUSAL = (
+    "error: anchors.sim_min is over its ceiling: left-out miss 0.0833 (ravdess sets) is above "
+    "0.05; calibration c1 is refused and sets no values"
+)
+
+
+def write_refused(root: root_mod.Root) -> None:
+    """A `calibration.json` as the job writes it over a ceiling: every number, and no `keys`."""
+    gate = {"values": {"wavlm-sv": 0.9, "ecapa": 0.5}, "objective": {"loso_miss": 0.0833}}
+    refusal = {
+        "gate": "anchors.sim_min",
+        "loso_miss": 0.0833,
+        "ceiling": 0.05,
+        "dataset": "ravdess",
+        "form": "sets",
+    }
+    result = {
+        "schema": 1,
+        "id": "c1",
+        "status": "refused",
+        "refusals": [refusal],
+        "gates": {"anchors.sim_min": gate},
+    }
+    write_json(root, RESULT_REL, result)
+
+
+class RefusedDocker(CannedDocker):
+    """A `DockerOps` whose job writes a refused `calibration.json`, prints the error and exits 1."""
+
+    def run_logged(self, argv: Sequence[str], log: Path) -> int:
+        self.argvs.append(list(argv))
+        write_refused(self.root)
+        log.write_text(
+            "calibrate: anchors.sim_min objective: largest matched miss 0.05 in sample\n"
+            "calibrate: status refused: 1 of 3 gates over their ceilings\n" + REFUSAL + "\n",
+            encoding="utf-8",
+        )
+        return 1
+
+
 class ToneEmbedder:
     """A cheap deterministic embedder: a fixed projection of the clip's log band spectrum."""
 
@@ -342,6 +382,14 @@ def test_run_plans_public_speakers_runs_the_job_and_applies_its_values(
         "retrieval.margin": ["rival"],
     }
     assert plan["matched"] == calibrate_cmd.MATCHED
+    assert plan["ceilings"] == {
+        "anchors.sim_min": 0.05,
+        "retrieval.anchor_floor": 0.05,
+        "retrieval.margin": 0.10,
+    }
+    assert plan["ceilings"] == calibrate_cmd.CEILINGS
+    assert plan["curve_alphas"] == [0.005, 0.01, 0.02, 0.05] == calibrate_cmd.CURVE_ALPHAS
+    assert plan["alpha"] in plan["curve_alphas"]
     libri, ravdess = plan["datasets"]
     assert (libri["name"], libri["licence"], libri["subset"]) == (
         "librittsr",
@@ -413,6 +461,24 @@ def test_run_exits_4_and_prints_the_refusal_when_the_job_fails(tmp_path: Path, d
     assert not (root.path / OVERLAY_REL).exists()
 
 
+def test_run_exits_4_and_applies_nothing_when_the_job_refuses_the_calibration(
+    tmp_path: Path, docker_for
+) -> None:
+    root = make_root(tmp_path)
+    write_json(root, OVERLAY_REL, {"segment.min_s": 1.25})
+    docker_for(RefusedDocker(root))
+    code, out, err = calibrate(root, "run", "--id", "c1")
+    assert code == 4
+    assert REFUSAL in out.splitlines()
+    assert "calibrate: status refused: 1 of 3 gates over their ceilings" in out
+    assert overlay(root) == {"segment.min_s": 1.25}
+    assert no_file_names(out + err)
+    for action in ("apply", "check"):
+        code, _, err = calibrate(root, action, "--id", "c1")
+        assert code == 2 and "calibration c1 was refused" in err, action
+    assert overlay(root) == {"segment.min_s": 1.25}
+
+
 def test_run_refuses_a_build_speaker_the_sources_do_not_list(tmp_path: Path, docker_for) -> None:
     root = make_root(tmp_path)
     build = json.loads((root.path / "rehearsal/build.json").read_text(encoding="utf-8"))
@@ -438,9 +504,13 @@ def test_the_job_runs_end_to_end_on_the_plan_run_wrote(
     digest = hashlib.sha256((root.path / ARCHIVE_REL).read_bytes()).hexdigest()
     monkeypatch.setattr(calibrate_cmd, "RAVDESS_ARCHIVE_SHA256", digest)
     monkeypatch.setattr(calibrate_cmd, "TRIALS", {**calibrate_cmd.TRIALS, "bootstrap": 5})
+    # Synthetic tones are no stand-in for speakers, so Decision 17's ceilings would refuse them;
+    # a ceiling of 1 holds any left-out miss, and this test is about the path, not the numbers.
+    monkeypatch.setattr(calibrate_cmd, "CEILINGS", {gate: 1.0 for gate in GATES})
     docker_for(JobDocker(root))
     code, out, err = calibrate(root, "run", "--id", "c1")
     assert code == 0, err + out
+    assert "calibrate: status calibrated: every gate is within its ceiling" in out
     result = json.loads((root.path / RESULT_REL).read_text(encoding="utf-8"))
     libri = result["datasets"][0]
     assert {sex: row["eligible"] for sex, row in libri["speakers"].items()} == {
@@ -456,6 +526,29 @@ def test_the_job_runs_end_to_end_on_the_plan_run_wrote(
     assert code == 0, err
 
 
+def test_the_job_refuses_end_to_end_at_decision_17s_ceilings(
+    tmp_path: Path, docker_for, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On synthetic tones the anchor sets' left-out miss is far over 0.05, so the real job refuses.
+    root = make_root(tmp_path, audio=True)
+    digest = hashlib.sha256((root.path / ARCHIVE_REL).read_bytes()).hexdigest()
+    monkeypatch.setattr(calibrate_cmd, "RAVDESS_ARCHIVE_SHA256", digest)
+    monkeypatch.setattr(calibrate_cmd, "TRIALS", {**calibrate_cmd.TRIALS, "bootstrap": 5})
+    docker_for(JobDocker(root))
+    code, out, err = calibrate(root, "run", "--id", "c1")
+    assert code == 4
+    result = json.loads((root.path / RESULT_REL).read_text(encoding="utf-8"))
+    assert result["status"] == "refused" and "keys" not in result
+    assert result["ceilings"] == calibrate_cmd.CEILINGS
+    over = [row["gate"] for row in result["refusals"]]
+    assert "anchors.sim_min" in over
+    errors = [line for line in out.splitlines() if line.startswith("error: ")]
+    assert [line.split()[1] for line in errors] == over
+    assert all("is over its ceiling" in line for line in errors)
+    assert not (root.path / OVERLAY_REL).exists()
+    assert no_file_names(out + err)
+
+
 # ---------------------------------------------------------------------------
 # apply and check
 # ---------------------------------------------------------------------------
@@ -465,7 +558,30 @@ def write_result(root: root_mod.Root, keys: dict | None = None) -> None:
     write_json(root, RESULT_REL, {"schema": 1, "id": "c1", "keys": keys or dict(CANNED)})
 
 
+@pytest.mark.parametrize("action", ["apply", "check"])
+def test_apply_and_check_refuse_a_refused_calibration(tmp_path: Path, action: str) -> None:
+    root = make_root(tmp_path)
+    write_refused(root)
+    code, out, err = calibrate(root, action, "--id", "c1")
+    assert code == 2
+    assert "calibration c1 was refused" in err
+    assert not (root.path / OVERLAY_REL).exists()
+
+
+def test_a_calibrated_status_applies_like_a_file_without_one(tmp_path: Path) -> None:
+    root = make_root(tmp_path)
+    write_json(
+        root,
+        RESULT_REL,
+        {"schema": 1, "id": "c1", "status": "calibrated", "refusals": [], "keys": dict(CANNED)},
+    )
+    code, _, err = calibrate(root, "apply", "--id", "c1")
+    assert code == 0, err
+    assert overlay(root) == CANNED
+
+
 def test_apply_creates_a_missing_overlay(tmp_path: Path) -> None:
+    # c1's file has no `status`, as every calibration before T39 does, and still applies.
     root = make_root(tmp_path)
     write_result(root)
     assert not (root.path / OVERLAY_REL).exists()
