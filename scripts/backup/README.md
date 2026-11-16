@@ -74,11 +74,13 @@ Captured, in one artifact directory:
 | `stores/event_store.db`      | conversation sessions, turn events, epoch ledger                |
 | `stores/extraction_cache.db` | cached extraction results                                       |
 | `stores/vault_sidecar.db`    | vault chunk index, with its embeddings                          |
+| `stores/capabilities.db`     | alarms, timers, their events, and the capability action log     |
 | `graph.json`                 | every node and relationship, all partitions, INCLUDING embeddings |
 | `vault/`                     | a copy of the whole `mist-memory/` tree, `.git` INCLUDED          |
 | `manifest.json`              | layout version, `created_at`, per-file sha256, row counts, uncounted tables, graph counts, both vault file counts, git HEAD, producer stamps |
 
-The three stores are captured BY NAME, never by glob. The live `./data` also holds
+The stores in `LIVE_STORE_FILENAMES` (`stores.py`) are captured BY NAME, never by glob. The live
+`./data` also holds
 `event_store.pre-r1.4-backup-2026-07-31.db` and `event_store.pre-reset-backup-2026-06-09.db`; a
 glob would sweep both in, and a hurried restore could then load a months-old event store.
 
@@ -369,9 +371,9 @@ failure is in.
 
 - Each store is committed by one `os.replace` onto its live name. That rename either happened or
   it did not; there is no half-written store, and the target never sees a truncated `.db`.
-- THREE STORES ARE THREE ATOMIC OPERATIONS, NOT ONE. A failure at store 2 of 3 leaves store 1
-  holding the artifact's copy and stores 2 and 3 holding the target's own, so the target is a
-  mixture of two points in time. `stores_committed` in the marker names exactly which ones moved.
+- EACH STORE IS ITS OWN ATOMIC OPERATION; THE SET IS NOT ONE. A failure at the second store
+  leaves the first holding the artifact's copy and the rest holding the target's own, so the
+  target is a mixture of two points in time. `stores_committed` in the marker names exactly which ones moved.
 - The vault swap is TWO RENAMES, not one, because Windows cannot rename a directory onto an
   existing one. There is therefore a window in which `vault/` DOES NOT EXIST: the target's tree is
   at `vault.previous/` and the artifact's is at `vault.incoming/`. Both trees are intact in that
@@ -407,7 +409,7 @@ Named, because a runbook listing only the handled ones reads as a guarantee:
 - A DRIVER DISCONNECT, A SERVER RESTART OR A FULL DISK DURING ANY LEG. Nothing holds a
   transaction across phases, so each of these leaves the target wherever the interrupted phase had
   reached. The marker is the record of which phase that was.
-- A STORE-LEG FAILURE AT STORE 2 OF 3, as above: a target that is a mixture of two points in time
+- A STORE-LEG FAILURE AFTER THE FIRST STORE, as above: a target that is a mixture of two points in time
   rather than either of them. The commonest cause of a failed rename is a backend still running
   against the target and holding a store open.
 - PHASE 6'S REMOVAL OF `vault.previous` IS NOT A FAILURE MODE OF THE RESTORE. It is the one step
@@ -637,7 +639,7 @@ note. On an artifact taken before that key existed it is absent altogether -- se
 
 The rehearsal has passed when: nodes and relationships match between (a) and (c), the embedding
 line prints `True`, the restored `corpus_file_count` equals the artifact's, and `ls ./dev-state`
-shows the three stores and a `vault/` tree from the artifact, with no `restore.in-progress.json`,
+shows each store in `LIVE_STORE_FILENAMES` and a `vault/` tree from the artifact, with no `restore.in-progress.json`,
 no `*.incoming` and no `vault.previous/` left behind.
 
 ### 4.9 What the unit tier cannot prove, and why this rehearsal is the gate

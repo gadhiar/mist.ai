@@ -219,7 +219,17 @@ def write_marker(directory: Path) -> None:
 @pytest.fixture
 def daily(tmp_path, registry, backup_dir) -> Root:
     path = (tmp_path / "instances" / "daily").resolve()
-    for sub in ("state", "mist-memory", "logs", "ops", "models", "release", "retired", "bin"):
+    for sub in (
+        "state",
+        "mist-memory",
+        "logs",
+        "ops",
+        "models",
+        "release",
+        "retired",
+        "bin",
+        "secrets",
+    ):
         (path / sub).mkdir(parents=True, exist_ok=True)
     for directory in (path, path / "state", path / "mist-memory"):
         write_marker(directory)
@@ -1661,6 +1671,16 @@ def test_restore_runbook_says_one_drill_at_a_time_and_what_refuses_otherwise():
         "`drill-restore` refuses a drill that has already verified",
     ):
         assert refusal in text, refusal
+
+
+def test_restore_runbook_says_to_reissue_the_capability_tokens():
+    text = " ".join(RESTORE_MD.read_text(encoding="utf-8").split())
+    assert (
+        "after a restore onto a new instance root, re-issue the HA and Spotify tokens; "
+        "`<root>/secrets/` is not backed up"
+    ) in text
+    for path in ("`<root>/secrets/ha_token`", "`<root>/secrets/spotify_token.json`"):
+        assert path in text, path
 
 
 def test_backup_readme_section_6_describes_the_scheduler():

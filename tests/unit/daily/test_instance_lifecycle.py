@@ -32,7 +32,17 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE_ID = "sha256:" + "f" * 64
 TAG = "daily-2026.10.23"
 REPO_ARG = str(REPO_ROOT)
-EIGHT_DIRS = ("state", "mist-memory", "logs", "ops", "models", "release", "retired", "bin")
+ROOT_DIRS = (
+    "state",
+    "mist-memory",
+    "logs",
+    "ops",
+    "models",
+    "release",
+    "retired",
+    "bin",
+    "secrets",
+)
 MARKER = ".mist-live-instance"
 
 
@@ -255,7 +265,7 @@ def test_init_rejects_an_unknown_instance_name(make_ctx, root):
 
 def test_init_creates_the_layout_markers_and_registry_line(make_ctx, root, registry):
     assert run(make_ctx(), "init", "--root", str(root)) == 0
-    for name in EIGHT_DIRS:
+    for name in ROOT_DIRS:
         assert (root / name).is_dir(), name
     expected = {"v": 1, "instance": "daily", "created_at": FIXED_STAMP}
     for directory in (root, root / "state", root / "mist-memory"):
