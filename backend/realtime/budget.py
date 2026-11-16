@@ -868,10 +868,11 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     any of `phrases`, `address_starts`, `stop_before` and `greetings`, each a list of strings
     that replaces that set; a key it omits keeps its default.
 
-    `MIST_VOICE_CHARACTER` (default true) runs every spoken reply through the character stage,
-    `CharacterConfig()`; false turns off the whole stage, its limiter included, which has no
-    variable of its own. `MIST_VOICE_CHARACTER_DOUBLE_GAIN` (default 0.35) is the detuned
-    double's gain per copy, from 0 to 1. It is checked even with the stage off, so a bad value
+    `MIST_VOICE_CHARACTER` (default true) runs every spoken reply through the character stage, a
+    `CharacterConfig` with every field at its default except `double_gain`; false turns off the
+    whole stage, its limiter included, which has no variable of its own.
+    `MIST_VOICE_CHARACTER_DOUBLE_GAIN` (default 0.35) is that `double_gain`, the detuned double's
+    gain per copy, from 0 to 1. It is checked even with the stage off, so a bad value
     fails at startup rather than when the stage is next turned on.
 
     Raises:
