@@ -10,9 +10,19 @@ takes the one that misses the fewest target trials of its `MATCHED` forms (the l
 first, then the mean), with ties to the lower largest FAR and then the higher WavLM-SV value.
 v5's equal split of alpha between the embedders is written beside it only for comparison.
 
-- `run --id C` writes `rehearsal/calibration/<C>/calibration-plan.json`, runs the job in the
-  `score` image on the CPU with no network and `public/` mounted read-only, prints the job's
-  lines and then applies its values. The plan lists every LibriTTS-R speaker of the build plan's
+The job also measures each gate's miss out of sample, by leave one speaker out: for each
+speaker it solves the rule without every trial that speaker takes part in, and scores the
+speaker's own trials there. Each gate has a ceiling on that left-out miss (`CEILINGS`, Decision
+17); a gate strictly over its ceiling makes the job write a calibration with `status`
+`refused`, every number and no `keys`, print one `error:` line per such gate and exit 1, so
+`run` exits 4 and applies nothing. Beside the values the job reports an operating curve: the
+pair, its misses in sample and left out, and its largest false-accept rate at each alpha of
+`CURVE_ALPHAS`, which holds `ALPHA`, so Raj can see what each budget costs on public speakers.
+
+- `run --id C` writes `rehearsal/calibration/<C>/calibration-plan.json`, with `ALPHA`, `SEED`,
+  `TRIALS`, `MATCHED`, `CEILINGS` and `CURVE_ALPHAS`, runs the job in the `score` image on the
+  CPU with no network and `public/` mounted read-only, prints the job's lines and then applies
+  its values. The plan lists every LibriTTS-R speaker of the build plan's
   sources that `rehearsal/build.json` does not name, with each file's sha256; every speaker the
   build names (the target, the impostor and each episode's other speakers) is listed as
   excluded. The job's own rule decides which listed speakers are eligible. RAVDESS's speech
@@ -21,6 +31,9 @@ v5's equal split of alpha between the embedders is written beside it only for co
   other key and creating the file when it is missing.
 - `check --id C` exits 0 when `config/gates.json` holds the six values exactly, and 3 naming each
   key that differs.
+- `apply`, `check` and `lower` exit 2 with "calibration C was refused" on a refused
+  calibration. A `calibration.json` with no `status`, as every one before the ceilings is,
+  reads as calibrated.
 - `lower --score R --id C` sets each `retrieval.anchor_floor.<e>` to the lower of its current
   value and score run R's `retrieval.flag_floor` for e, and touches no other key, so a floor the
   impostor's cluster already reaches is never raised. It refuses a null flag floor, a run whose
@@ -84,6 +97,17 @@ MATCHED: Mapping[str, list[str]] = {
 """The target forms whose miss each gate's values minimise (Decision 18): the trials R2's
 anchors produce, a whole anchor set, a cluster against the five-anchor centroid, and a turn
 against the target's model and three rivals."""
+CEILINGS: Mapping[str, float] = {
+    "anchors.sim_min": 0.05,
+    "retrieval.anchor_floor": 0.05,
+    "retrieval.margin": 0.10,
+}
+"""Each gate's ceiling on its largest matched left-out miss (Decision 17): 5% of anchor sets,
+5% of target clusters, 10% of target turns. Strictly over it, the calibration is refused."""
+CURVE_ALPHAS: list[float] = [0.005, 0.01, 0.02, 0.05]
+"""The alphas of the operating curve; `ALPHA` is one of them, so its row is the chosen pair."""
+REFUSED = "refused"
+"""`calibration.json`'s `status` when a gate is over its ceiling."""
 
 LIBRITTSR = "librittsr"
 RAVDESS = "ravdess"
@@ -246,6 +270,8 @@ def calibration_plan(root: root_mod.Root, cal_id: str) -> dict[str, object]:
         "embedders": _revisions(),
         "trials": json.loads(json.dumps(dict(TRIALS))),
         "matched": json.loads(json.dumps(dict(MATCHED))),
+        "ceilings": dict(CEILINGS),
+        "curve_alphas": list(CURVE_ALPHAS),
         "datasets": [
             {
                 "name": LIBRITTSR,
@@ -351,12 +377,18 @@ def read_keys(root: root_mod.Root, cal_id: str) -> dict[str, float]:
     """Return calibration `cal_id`'s six values, in `KEYS` order.
 
     Raises:
-        InputError: The calibration is missing, or its `keys` are not the six numbers.
+        InputError: The calibration is missing or was refused, or its `keys` are not the six
+            numbers.
     """
     path = root.path / folder_rel(cal_id) / RESULT_NAME
     if not path.is_file():
         raise InputError(f"refused: calibration {cal_id} has no {RESULT_NAME}; run it first")
     data = read_json(path)
+    if isinstance(data, Mapping) and data.get("status") == REFUSED:
+        raise InputError(
+            f"refused: calibration {cal_id} was refused: a gate's left-out miss is over its "
+            "ceiling, so it sets no values"
+        )
     keys = data.get("keys") if isinstance(data, Mapping) else None
     if (
         not isinstance(keys, Mapping)
