@@ -16,8 +16,85 @@ import pytest
 from backend.event_store.models import ANSWERED_BY_VALUES, ConversationTurnEvent
 from backend.event_store.store import EventStore
 
+from .test_turn_outcome import _build_base_database
+
 _LOGGER = "backend.event_store.store"
 _ADDED = "added `answered_by` column"
+
+# The two tables exactly as `schema.sql` created them before `answered_by` (afb17c07),
+# comments included: SQLite's ALTER TABLE edits the stored DDL text, comments and all, so a
+# migration test that strips them, or that drops the column from today's table, tests a
+# different text. Dropping it is also not portable: the SQLite on CI, dropping a last column,
+# cuts from the nearest ',' in the raw text before it, which in today's DDL sits inside the
+# `--` comment above `answered_by`, and fails with "incomplete input".
+_SESSIONS_TABLE_BEFORE_ANSWERED_BY = """\
+CREATE TABLE IF NOT EXISTS conversation_sessions (
+    session_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,                -- ISO-8601
+    ended_at TEXT,                           -- ISO-8601, NULL if still active
+    turn_count INTEGER DEFAULT 0,
+    input_modality TEXT DEFAULT 'voice',     -- 'voice', 'text', 'api'
+    origin TEXT NOT NULL DEFAULT 'real'      -- 'real', 'test', 'seed'
+);
+"""
+
+_TURN_TABLE_BEFORE_ANSWERED_BY = """\
+CREATE TABLE IF NOT EXISTS conversation_turn_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES conversation_sessions(session_id),
+    turn_index INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,                 -- ISO-8601
+
+    -- Raw conversation data (NEVER changes)
+    user_utterance TEXT NOT NULL,
+    system_response TEXT NOT NULL,
+
+    -- Context window (what the LLM actually saw)
+    context_window TEXT,                     -- JSON: [{"role": "user", "content": "..."}, ...]
+
+    -- RAG context (what retrieval injected)
+    retrieval_context TEXT,                  -- JSON: {"doc_chunks": [...], "graph_facts": [...]}
+
+    -- Tool usage
+    tool_calls TEXT,                         -- JSON: [{"name": "...", "args": {...}, "result_summary": "..."}]
+
+    -- Audio reference
+    audio_hash TEXT,                         -- SHA-256 of audio file in archive
+    audio_format TEXT,                       -- "wav", "opus"
+    audio_duration_ms INTEGER,
+    audio_sample_rate INTEGER,
+
+    -- Model metadata
+    stt_model TEXT,
+    tts_model TEXT,
+    llm_model TEXT,
+    llm_parameters TEXT,                     -- JSON: {"temperature": 0.7, "top_p": 1.0, ...}
+
+    -- Versioning
+    ontology_version TEXT NOT NULL DEFAULT '1.0.0',
+
+    -- Immutability timestamp
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    -- Turn outcome (MIS-127). NULL on every turn logged before these columns existed.
+    -- Kept last so a fresh database and one migrated by EventStore.initialize(), whose
+    -- ALTER TABLE ADD COLUMN appends, have the same column order.
+    turn_outcome TEXT,                       -- 'completed', 'interrupted', 'superseded', 'error'
+    generated_response TEXT,                 -- full generated text; longer than system_response
+                                             -- when an interrupted turn logs only what was heard
+    turn_modality TEXT                       -- 'voice', 'text'
+);
+"""
+
+_OLD_TURN = """\
+INSERT INTO conversation_sessions (session_id, started_at, input_modality)
+VALUES ('s1', '2026-09-01T10:00:00+00:00', 'text');
+INSERT INTO conversation_turn_events (
+    event_id, session_id, turn_index, timestamp, user_utterance, system_response
+) VALUES (
+    'old-turn', 's1', 0, '2026-09-01T10:00:00+00:00', 'set a timer for ten minutes', 'Timer set.'
+);
+"""
 
 
 def _event(**overrides) -> ConversationTurnEvent:
@@ -118,15 +195,26 @@ class TestRoundTrip:
 class TestMigration:
     def _old_database(self, path) -> str:
         """A database whose turn table predates `answered_by`, holding one turn."""
-        store = _store(path)
-        store.start_session("s1", input_modality="text")
-        event_id = store.append_turn(_event(event_id="old-turn"))
-        store.close()
         conn = sqlite3.connect(path)
-        conn.execute("ALTER TABLE conversation_turn_events DROP COLUMN answered_by")
-        conn.commit()
-        conn.close()
-        return event_id
+        try:
+            conn.executescript(
+                _SESSIONS_TABLE_BEFORE_ANSWERED_BY + _TURN_TABLE_BEFORE_ANSWERED_BY + _OLD_TURN
+            )
+        finally:
+            conn.close()
+        return "old-turn"
+
+    def test_the_old_database_has_no_answered_by_column(self, tmp_path):
+        path = tmp_path / "old.db"
+        self._old_database(path)
+        conn = sqlite3.connect(path)
+        try:
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(conversation_turn_events)")]
+        finally:
+            conn.close()
+
+        assert "answered_by" not in columns
+        assert columns[-1] == "turn_modality"
 
     def test_initialize_adds_the_column_and_leaves_old_rows_null(self, tmp_path, caplog):
         path = tmp_path / "old.db"
@@ -183,3 +271,19 @@ class TestMigration:
         row = store.get_turn(event_id)
         assert row is not None
         assert row["answered_by"] == "capability"
+
+    def test_a_database_from_before_the_turn_outcome_columns_gains_all_four_in_order(
+        self, tmp_path
+    ):
+        old = tmp_path / "pre-mis-127.db"
+        _build_base_database(old)
+        migrated = _store(old)
+        fresh = _store(tmp_path / "fresh.db")
+
+        assert _columns(migrated) == _columns(fresh)
+        assert _columns(migrated)[-4:] == [
+            "turn_outcome",
+            "generated_response",
+            "turn_modality",
+            "answered_by",
+        ]
