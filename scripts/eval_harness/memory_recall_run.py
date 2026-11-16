@@ -5,10 +5,15 @@ from `facts.jsonl` and a vault sidecar from `vault_notes.jsonl`. It then runs on
 `MemoryFetcher.fetch` per probe, as a new session with no earlier turns, and writes one JSONL
 record per probe in the shape `memory_recall.py --run` scores.
 
-The indexes hold what MIST would have known at each probe's `now`: a fact once it is recorded
-and until a correction removes it, a note once it is created. Probes run in `now` order and the
-indexes are brought to each `now` before its probes run. Within one `now` every probe sees the
-same indexes, and the fetcher filters each fact's versions against that `now`.
+The indexes hold what MIST would have known at each probe's `now`: a fact once it is recorded,
+a note once it is created. A correction does not take its fact out of the index: the walk
+records each fixture correction through `CorrectionService`, at its `recorded_at`, in an event
+store of its own in the work directory, and each fetcher suppresses at read time what that log
+names (`corrections.LoggedSuppression`), the read path T33 and T34 wire into the backend; a
+recorded listener drops each fetcher's cached stage 1. Probes run in `now` order and the
+indexes and the log are brought to each `now` before its probes run. Within one `now` every
+probe sees the same indexes and log, and the fetcher filters each fact's versions against that
+`now`.
 
 Each record carries, beside the scorer's keys (`probe_id`, `items`, `tokens`,
 `budget_tokens`): the fetch's timings in milliseconds, with `total_ms` as `critical_path_ms`;
@@ -132,11 +137,19 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from backend.chat.context_budget import ApproximateTokenCounter
 from backend.errors import MemoryConfigError, MistError
+from backend.event_store.store import EventStore
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.config import SidecarIndexConfig
 from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
 from backend.memory.block import BlockPlacement, MemoryBlockBuilder, PlacedList
 from backend.memory.config import MemoryConfig
+from backend.memory.corrections import (
+    CorrectedFact,
+    CorrectionRecord,
+    CorrectionService,
+    CorrectionSurface,
+    LoggedSuppression,
+)
 from backend.memory.fact_index import DiffReport, FactIndex, IndexedFact
 from backend.memory.fetcher import (
     GATE_EXECUTOR,
@@ -466,15 +479,84 @@ def fact_row(fact: Fact) -> FactRow:
 def facts_known_at(
     facts: Sequence[Fact], corrections: Sequence[Correction], now: datetime
 ) -> list[FactRow]:
-    """The fact versions the graph holds at `now`: recorded by then, not corrected away.
+    """The fact versions the graph holds at `now`: every one recorded by then.
 
-    A forget or correct removes the fact it names from the graph when it is recorded; a
-    corrected fact's replacement is its own fixture row, recorded at the correction.
+    A corrected fact stays: the read path suppresses it through the correction log
+    (`record_due_corrections`), as the backend does before T22 changes the graph. A corrected
+    fact's replacement is its own fixture row, recorded at the correction. `corrections` is not
+    read; it stays in the signature for the callers that pass the fixture's log, such as
+    `memory_view_probe`.
     """
-    removed = {c.fact_key for c in corrections if c.recorded_at <= now}
-    return [
-        fact_row(fact) for fact in facts if fact.recorded_at <= now and fact.fact_key not in removed
-    ]
+    del corrections  # suppressed at read time, not removed here
+    return [fact_row(fact) for fact in facts if fact.recorded_at <= now]
+
+
+def record_due_corrections(
+    service: CorrectionService,
+    corrections: Sequence[Correction],
+    now: datetime,
+    recorded: set[str],
+) -> list[CorrectionRecord]:
+    """Record each fixture correction due by `now` and not yet in `recorded`, in log order.
+
+    Each is recorded at its own `recorded_at`, under its own id and origin, so the log holds
+    what the backend's would. `recorded` gains each id recorded.
+
+    Returns:
+        The records made, in (`recorded_at`, `correction_id`) order.
+    """
+    due = sorted(
+        (c for c in corrections if c.recorded_at <= now and c.correction_id not in recorded),
+        key=lambda c: (c.recorded_at, c.correction_id),
+    )
+    records: list[CorrectionRecord] = []
+    for correction in due:
+        fact = CorrectedFact(
+            subject_id=correction.subject_id,
+            subject_name=correction.subject_name,
+            relation=correction.relation,
+            object_id=correction.object_id,
+            object_name=correction.object_name,
+        )
+        surface = _SURFACES.get(correction.surface)
+        if surface is None:
+            raise ValueError(f"correction {correction.correction_id} has an unknown surface")
+        if correction.action == "correct":
+            if correction.replacement_object_name is None:
+                raise ValueError(f"correction {correction.correction_id} has no replacement")
+            record = service.correct(
+                correction.fact_key,
+                correction.replacement_object_name,
+                surface,
+                fact=fact,
+                session_id=correction.session_id,
+                conversation_id=correction.conversation_id,
+                turn_index=correction.turn_index,
+                source_event_id=correction.source_event_id,
+                origin=correction.origin,
+                recorded_at=correction.recorded_at,
+                correction_id=correction.correction_id,
+            )
+        else:
+            record = service.forget(
+                correction.fact_key,
+                surface,
+                fact=fact,
+                session_id=correction.session_id,
+                conversation_id=correction.conversation_id,
+                turn_index=correction.turn_index,
+                source_event_id=correction.source_event_id,
+                origin=correction.origin,
+                recorded_at=correction.recorded_at,
+                correction_id=correction.correction_id,
+            )
+        records.append(record)
+        recorded.add(correction.correction_id)
+    return records
+
+
+# A fixture correction's surface as `CorrectionService` takes it.
+_SURFACES: dict[str, CorrectionSurface] = {"ws": "ws", "tool": "tool", "cli": "cli"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,9 +826,10 @@ def run_items(
 def dropped_dispositions(outcome: FetchOutcome) -> dict[tuple[str, str], str]:
     """The disposition of each candidate that left the shortlist before the order.
 
-    A suppressed fact, a facet without members and a facet whose member lookup was late are
-    not in `outcome.ranked`, so the trace gives them no rank; the stage still records each,
-    ranked after every ordered candidate and carrying its pool rank, which is its 1-based
+    A suppressed fact or note, a note whose whole-text read was late or failed, a facet
+    without members and a facet whose member lookup was late are not in `outcome.ranked`, so
+    the trace gives them no rank; the stage still records each, ranked after every ordered
+    candidate and carrying its pool rank, which is its 1-based
     place in `outcome.fused`. Keyed by `(kind, item_id)`.
     """
     ordered = len(outcome.ranked)
@@ -1367,6 +1450,7 @@ class ProbeTracer:
                             fused_at,
                             ranked_at,
                             disposition,
+                            dropped,
                             block_ids,
                             indexed_notes,
                         )
@@ -1418,9 +1502,11 @@ class ProbeTracer:
         fused_at: dict[tuple[str, str], int],
         ranked_at: dict[tuple[str, str], int],
         disposition: Callable[[int | None], str | None],
+        dropped: dict[tuple[str, str], str],
         block_ids: dict[str, set[str]],
         indexed_notes: set[str],
     ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """A note target; one dropped before the order, as if suppressed, keeps that reason."""
         path = str(base["id"])
         fused_positions = [fused_at[key] for key in keys if key in fused_at]
         ranks = sorted(ranked_at[key] for key in keys if key in ranked_at)
@@ -1443,8 +1529,10 @@ class ProbeTracer:
             )
         if "injected" in dispositions:
             chosen: str | None = "injected"
+        elif dispositions:
+            chosen = dispositions[0]
         else:
-            chosen = dispositions[0] if dispositions else None
+            chosen = next((dropped[key] for key in keys if key in dropped), None)
         oracle: dict[str, object] | None = {"chunks": chunks, "max": None} if chunks else None
         target = {
             **base,
@@ -1685,6 +1773,10 @@ async def _walk(
         SidecarIndexConfig(db_path=str(workdir / "vault_sidecar.db")), embedder
     )
     sidecar.initialize()
+    # The correction log, in a store of the run's own; each correction is stamped explicitly.
+    event_store = EventStore(db_path=str(workdir / "event_store.db"))
+    event_store.initialize()
+    corrections = CorrectionService(event_store, now_fn=SystemClock().now)
     executors = build_memory_executors()
     pools = FetcherExecutors(
         index=executors[INDEX_EXECUTOR],
@@ -1731,9 +1823,13 @@ async def _walk(
                 clock=SystemClock(),
                 index_state=probe_state,
                 notes=notes,
+                suppression=LoggedSuppression(event_store),
             )
             for setting in settings
         ]
+        for fetcher in fetchers:
+            corrections.add_recorded_listener(_invalidator(fetcher))
+        recorded: set[str] = set()
         apply = index.diff_apply
         if rescan is not None:
             rescan.start(index, executors[INDEX_EXECUTOR])
@@ -1743,6 +1839,7 @@ async def _walk(
         indexed_notes: set[str] = set()
         for step, now in enumerate(nows):
             apply(facts_known_at(fixture.facts, fixture.corrections, now))
+            record_due_corrections(corrections, fixture.corrections, now, recorded)
             for path, note in notes_known_at(fixture.notes, now).items():
                 if path not in indexed_notes:
                     sidecar.upsert_file(path, note.content, note.mtime, note.frontmatter)
@@ -1807,10 +1904,24 @@ async def _walk(
             tracer.close()
         for executor in executors.values():
             executor.shutdown(wait=True, cancel_futures=True)
+        event_store.close()
         sidecar.close()
         probe_state.close()
         reader.close()
         writer.close()
+
+
+def _invalidator(fetcher: MemoryFetcher) -> Callable[[CorrectionRecord], None]:
+    """The recorded listener that drops `fetcher`'s cached stage 1 and blocks.
+
+    An adapter, as `CorrectionService.add_recorded_listener` requires: the bare
+    `fetcher.invalidate` would take the record as a session id and drop nothing.
+    """
+
+    def invalidate(record: CorrectionRecord) -> None:
+        fetcher.invalidate()
+
+    return invalidate
 
 
 # -- CPU load --------------------------------------------------------------------------------

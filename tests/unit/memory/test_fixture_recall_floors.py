@@ -1,20 +1,23 @@
 """Recall floors of the fetcher on the fixture, with the weight-free fakes, through the need gate.
 
 The run goes through the harness (scripts/eval_harness/memory_recall_run.py) over the fact,
-note and noise probes, with a MemoryConfig whose fact view, `rerank_top_n`, `select_k`, list
-cap, facets and block budget are set here, so a change to the defaults cannot move the floors.
-Lexical probes are held to the floors; paraphrase probes need a real embedder, so their metrics
-are printed only.
+note, noise and correction probes, with a MemoryConfig whose fact view, `rerank_top_n`,
+`select_k`, list cap, facets and block budget are set here, so a change to the defaults cannot
+move the floors. The recall figures are scored over the fact, note and noise probes alone; the
+correction probes are held to `forgotten_leak` 0, which the harness's correction log (T21)
+keeps. Lexical probes are held to the floors; paraphrase probes need a real embedder, so their
+metrics are printed only.
 
 The run is gated, and the gate checks the gating path, not the gate's quality. The real bank
 (`load_bank`), `fit_form` (logistic, c 1), `NeedGate.decide` and the harness's gating path all
 run; only the gate's embedder is an oracle. It keys on each row's fixture label alone: a bank
-row by its `label`, a fact or note probe as need and a noise probe as no-need, by the probe's
-kind; it never sees text a run produces, and refuses any text it has no label for. The
-thresholds are the Test strategy's: theta_low is the larger of theta(0.98) over the recall
-probes and the float just above the top noise probe's p, theta_high the larger of theta_low and
-theta(0.88), band_k 2, need_context off. So the noise floor holds by construction and is no
-evidence that need and no-need turns separate: the real gate's noise and recall are measured at
+row by its `label`, a fact, note or correction probe as need and a noise probe as no-need, by
+the probe's kind; it never sees text a run produces, and refuses any text it has no label for.
+The thresholds are the Test strategy's, fit on the fact, note and noise probes alone: theta_low
+is the larger of theta(0.98) over the recall probes and the float just above the top noise
+probe's p, theta_high the larger of theta_low and theta(0.88), band_k 2, need_context off.
+So the noise floor holds by construction and is no evidence that need and no-need turns
+separate: the real gate's noise and recall are measured at
 the read path's H4 and H18 gates. What the floors do show is that a gate on the path changes no
 recall figure: the same walk runs ungated beside it, and the two must agree.
 
@@ -65,6 +68,7 @@ from scripts.eval_harness.memory_recall_run import (
 
 _KINDS = ("fact", "note", "noise")
 _RECALL_KINDS = ("fact", "note")
+_CORRECTION = "correction"
 # Every setting whose default H18 may still choose is pinned, so no default moves a figure.
 _CONFIG = MemoryConfig(
     fact_view="F3",
@@ -106,7 +110,7 @@ class _LabelOracle:
 def _labels(bank: NeedBank, probes: Sequence[Probe]) -> dict[str, str]:
     labels: dict[str, str] = {}
     rows = [(exemplar.text, exemplar.label) for exemplar in bank.exemplars]
-    rows += [(p.query, "need" if p.kind in _RECALL_KINDS else "no_need") for p in probes]
+    rows += [(p.query, "no_need" if p.kind == "noise" else "need") for p in probes]
     for text, label in rows:
         if labels.setdefault(text, label) != label:
             raise AssertionError(f"{text!r} carries both labels")
@@ -167,6 +171,9 @@ class _Reports:
     """The gated run scored over every probe and over its lexical probes, and the ungated one.
 
     Attributes:
+        full: The gated run over the fact, note and noise probes.
+        corrections: The gated run over the correction probes.
+        probes: Every probe run, the correction probes last.
         bands: Each probe's band from the gated run's `need` trace.
         gate_texts: Every text the gate embedded during the run, in order.
     """
@@ -174,6 +181,7 @@ class _Reports:
     full: RecallReport
     lexical: RecallReport
     ungated_lexical: RecallReport
+    corrections: RecallReport
     probes: tuple[Probe, ...]
     bands: Mapping[str, str]
     gate_texts: tuple[str, ...]
@@ -194,10 +202,12 @@ def _lexical(probes: Sequence[Probe], records: Sequence[dict[str, object]]) -> R
 def reports(tmp_path_factory: pytest.TempPathFactory) -> _Reports:
     fixture = Fixture.load()
     probes = [probe for probe in fixture.probes if probe.kind in _KINDS]
+    corrections = [probe for probe in fixture.probes if probe.kind == _CORRECTION]
+    run = probes + corrections
     bank = load_bank()
-    oracle = _LabelOracle(_labels(bank, probes))
+    oracle = _LabelOracle(_labels(bank, run))
     workdir: Path = tmp_path_factory.mktemp("recall-floors")
-    gated, ungated = asyncio.run(
+    gated_all, ungated_all = asyncio.run(
         run_settings(
             fixture,
             settings=[
@@ -207,13 +217,18 @@ def reports(tmp_path_factory: pytest.TempPathFactory) -> _Reports:
             embedder=TokenEmbedder(),
             reranker=TokenReranker(),
             workdir=workdir,
-            probes=probes,
+            probes=run,
         )
     )
+    # Records come back in `run`'s order, so the first `len(probes)` are the recall probes'.
+    gated, ungated = gated_all[: len(probes)], ungated_all[: len(probes)]
     full = score_run(probes, [parse_run_record(record) for record in gated])
+    corrected = score_run(
+        corrections, [parse_run_record(record) for record in gated_all[len(probes) :]]
+    )
     _print("paraphrase", full.by_lexical["paraphrase"])
     bands: dict[str, str] = {}
-    for record in gated:
+    for record in gated_all:
         need = record["need"]
         assert isinstance(need, dict)
         bands[str(record["probe_id"])] = str(need["band"])
@@ -221,7 +236,8 @@ def reports(tmp_path_factory: pytest.TempPathFactory) -> _Reports:
         full=full,
         lexical=_lexical(probes, gated),
         ungated_lexical=_lexical(probes, ungated),
-        probes=tuple(probes),
+        corrections=corrected,
+        probes=tuple(run),
         bands=bands,
         gate_texts=tuple(oracle.texts),
     )
@@ -232,7 +248,7 @@ def test_the_gating_path_decides_every_probe_from_its_query_alone(reports: _Repo
     # gate saw each probe's own query once and nothing else. The bands follow from the oracle.
     assert sorted(reports.gate_texts) == sorted(probe.query for probe in reports.probes)
     for probe in reports.probes:
-        expected = "open" if probe.kind in _RECALL_KINDS else "closed"
+        expected = "closed" if probe.kind == "noise" else "open"
         assert reports.bands[probe.probe_id] == expected, probe.probe_id
 
 
@@ -256,6 +272,14 @@ def test_lexical_probes_reach_the_floors(reports: _Reports) -> None:
     assert overall.mrr is not None and overall.mrr >= 0.70
     assert overall.forgotten_leak in (None, 0.0)
     assert overall.budget_ok == 1.0
+
+
+def test_no_correction_probe_serves_a_forgotten_item(reports: _Reports) -> None:
+    # The index keeps every corrected fact; the harness's correction log suppresses them.
+    metrics = reports.corrections.overall
+    _print("corrections", metrics)
+    assert metrics.forgotten_probes == 10
+    assert metrics.forgotten_leak == 0.0
 
 
 def test_lexical_noise_probes_stay_empty(reports: _Reports) -> None:
