@@ -1,4 +1,4 @@
-"""The memory block: scored items packed into a token budget and rendered as quoted background.
+"""The memory block: ordered items packed into a token budget and rendered as quoted background.
 
 The block is the only text the read path puts in front of the model, so three properties are
 held here rather than left to the caller:
@@ -86,7 +86,7 @@ Speaker = Literal["user", "assistant"]
 BlockPlacement = Literal["user_prefix", "system_tail"]
 # What packing did with a candidate. `dropped_no_fit`: the item does not fit the budget even as
 # the block's only item, so a larger budget, not fewer rivals, would have placed it.
-# `dropped_budget`: it fits alone, but better-scored items took the room.
+# `dropped_budget`: it fits alone, but items earlier in the fetch's order took the room.
 PackingDisposition = Literal["injected", "dropped_budget", "dropped_no_fit"]
 _PACKING_DISPOSITIONS: tuple[str, ...] = ("injected", "dropped_budget", "dropped_no_fit")
 
@@ -221,16 +221,17 @@ class FactList:
     """Sibling facts of one utterance, served as one block item in one sentence.
 
     "I use Vim, Rust and Zig" is three facts sharing `subject_id`, `rel_type` and
-    `source_utterance_id`. The fetcher expands a list when enough of them score (plan v2 V7),
-    and the block renders it with fact_render's `render_fact_list`, under one ref, ranked and
-    dated by its best-scored member.
+    `source_utterance_id`. The fetcher expands a list when two or more of them are selected
+    alone, or when a selected facet's members share an utterance, and the block renders it with
+    fact_render's `render_fact_list`, under one ref, packed and dated by its earliest member
+    (the lowest `position`).
 
     Attributes:
         facts: Every sibling the item lists, in the order the sentence names them
             (`FactIndex.siblings` order); at least two, each fact once.
-        scored: The members ranking scored, each one of `facts`; at least one. Each gets a
-            packing outcome. A sibling only the expansion brought in is not a candidate and
-            gets none.
+        scored: The members that carry a fetch position, each one of `facts`; at least one.
+            Each gets a packing outcome. A sibling only the expansion brought in is not a
+            candidate and gets none.
 
     Raises:
         ValueError: Fewer than two facts, a fact twice, facts that are not siblings of one
@@ -278,7 +279,7 @@ class PackingOutcome:
     """What packing did with one candidate, for the trace's candidate dispositions.
 
     Attributes:
-        candidate: The candidate as ranking scored it.
+        candidate: The candidate as ranking ordered it.
         disposition: `injected`, `dropped_budget` or `dropped_no_fit` (see
             `PackingDisposition`).
         item: The 1-based block position of the item that carries it (the n of `mn`) when
@@ -318,7 +319,7 @@ class MemoryBlock:
 
     Attributes:
         items: The items placed, in block order, numbered m1..mN; empty when nothing fit. A
-            list is one item: named by its best-scored member (`item_id`, `source`, `when`,
+            list is one item: named by its earliest member (`item_id`, `source`, `when`,
             `score`), with the list's sentence as its `text`.
         text: The rendered block, or None when no item was placed.
         tokens: `text`'s count under the builder's TokenCounter; 0 without text.
@@ -326,7 +327,7 @@ class MemoryBlock:
         reserved_tokens: The continuity reserve this turn held for episodes and exchanges; 0
             when the turn had neither a temporal window nor a conversation start.
         outcomes: One per candidate given, a list's scored members each, in packing order
-            (best score first).
+            (lowest `position` first).
         lists: The fact lists placed, in block order, with their refs, so a reader can flatten
             a list item back into its facts.
     """
@@ -345,10 +346,10 @@ class _Entry:
     """One would-be item with its rendered body, computed once and reused by every trial render.
 
     Attributes:
-        lead: The candidate that names and ranks the item: the candidate itself, or a list's
-            best-scored member.
-        members: The candidates the item carries, in score order: the candidate alone, or a
-            list's scored members.
+        lead: The candidate that names and orders the item: the candidate itself, or a list's
+            earliest member.
+        members: The candidates the item carries, in position order: the candidate alone, or
+            a list's scored members.
         body: The item's line after its ref.
         text: The `MemoryItem` text: the candidate's stored text, or the list's sentence.
         facts: The list, for a list item.
@@ -365,17 +366,19 @@ class _Entry:
         return self.lead.candidate.kind
 
     @property
-    def order_key(self) -> tuple[float, str, str]:
-        return _score_key(self.lead)
+    def order_key(self) -> tuple[int, str, str]:
+        return _position_key(self.lead)
 
 
 class MemoryBlockBuilder:
-    """Packs scored candidates into a block within the turn's token budget.
+    """Packs ordered candidates into a block within the turn's token budget.
 
-    Packing is greedy by score. When the turn names a temporal window or starts a conversation,
-    episodes and exchanges first get up to `continuity_share` of the budget, best first; then
-    every remaining item, of any kind, competes by score for what is left of the whole budget,
-    so whatever the continuity items did not use flows back. An item that does not fit is
+    Packing is greedy in the fetch's order (`ScoredCandidate.position`), not by score, so a
+    dated window's items keep their precedence when the budget binds. When the turn names a
+    temporal window or starts a conversation, episodes and exchanges first get up to
+    `continuity_share` of the budget, earliest first; then every remaining item, of any kind,
+    is tried in that order for what is left of the whole budget, so whatever the continuity
+    items did not use flows back. An item that does not fit is
     skipped and smaller ones after it still get their turn. A fact list is one item, packed
     whole or not at all.
     """
@@ -414,9 +417,9 @@ class MemoryBlockBuilder:
         """Pack and render one turn's block.
 
         Args:
-            scored: Ranking's output, with each expanded sibling list as one `FactList`; any
-                order, since packing sorts by score (a list by its best member), then item id,
-                then kind.
+            scored: The fetch's selection, with each expanded list as one `FactList`; any
+                order, since packing sorts by `position` (a list by its earliest member), then
+                item id, then kind.
             request: The turn's request: `now` dates the conversation items,
                 `conversation_start` flags the continuity reserve, `serving` picks the
                 configured budget, and `budget_tokens`, when set, lowers it.
@@ -509,7 +512,7 @@ class MemoryBlockBuilder:
     def _entry(self, item: ScoredCandidate | FactList, now: datetime) -> _Entry:
         """Render one would-be item's body once, for every trial render to reuse."""
         if isinstance(item, FactList):
-            members = tuple(sorted(item.scored, key=_score_key))
+            members = tuple(sorted(item.scored, key=_position_key))
             sentence = render_fact_list(item.facts, self._config.tz)
             # Siblings share one utterance, so the lead member's time dates the whole list.
             body = self._dated(_one_line(sentence), members[0].candidate, now)
@@ -577,13 +580,16 @@ class MemoryBlockBuilder:
         return f'{self._verbs[match.group(1).lower()]} "{words}".'
 
 
-def _score_key(scored: ScoredCandidate) -> tuple[float, str, str]:
-    """Best score first, then item id and kind, so equal scores order the same every turn."""
-    return (-scored.score, scored.candidate.item_id, scored.candidate.kind)
+def _position_key(scored: ScoredCandidate) -> tuple[int, str, str]:
+    """The fetch's order, then item id and kind, so a shared position orders the same each turn.
+
+    Expansion gives a member the position of the candidate that brought it, so positions repeat.
+    """
+    return (scored.position, scored.candidate.item_id, scored.candidate.kind)
 
 
 def _layout(chosen: Iterable[_Entry]) -> list[_Entry]:
-    """`chosen` in block order: by section, then by score within each section."""
+    """`chosen` in block order: by section, then by fetch position within each section."""
     chosen = list(chosen)
     placed: list[_Entry] = []
     for _, kinds in _SECTIONS:
@@ -615,7 +621,7 @@ def _ref(position: int) -> str:
 
 
 def _item(entry: _Entry, position: int) -> MemoryItem:
-    """The placed entry as the item the turn records; a list is named by its best member."""
+    """The placed entry as the item the turn records; a list is named by its earliest member."""
     candidate = entry.lead.candidate
     return MemoryItem(
         ref=_ref(position),

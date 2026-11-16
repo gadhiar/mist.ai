@@ -15,10 +15,12 @@ import pytest
 from backend.chat.context_budget import ApproximateTokenCounter
 from backend.memory.block import FactList, PlacedList
 from backend.memory.fact_index import IndexedFact
+from backend.memory.fetcher import FetchOutcome
 from backend.memory.models import (
     Candidate,
     CandidateDisposition,
     CandidateSource,
+    FacetSource,
     FactSource,
     FetchTimings,
     MemoryCandidate,
@@ -27,9 +29,9 @@ from backend.memory.models import (
     MemoryStage,
     NoteSource,
 )
-from backend.memory.ranking import ScoredCandidate
+from backend.memory.ranking import FusedCandidate, ScoredCandidate
 from scripts.eval_harness.memory_recall import FIXTURE_DIR, load_probes, parse_run_record
-from scripts.eval_harness.memory_recall_run import run_items, run_record
+from scripts.eval_harness.memory_recall_run import dropped_dispositions, run_items, run_record
 
 
 def _fact(fact_key: str, object_name: str) -> IndexedFact:
@@ -62,7 +64,7 @@ def _fact_source(fact: IndexedFact) -> FactSource:
     )
 
 
-def _scored(fact: IndexedFact, score: float) -> ScoredCandidate:
+def _scored(fact: IndexedFact, score: float, position: int = 1) -> ScoredCandidate:
     return ScoredCandidate(
         candidate=Candidate(
             kind="fact",
@@ -74,8 +76,10 @@ def _scored(fact: IndexedFact, score: float) -> ScoredCandidate:
             confidence=fact.confidence,
         ),
         score=score,
-        relevance=score,
-        reranked=True,
+        position=position,
+        pool_rank=position,
+        ce_rank=position,
+        p_ce=score,
         time_term=0.0,
         window_applied=False,
         confidence=fact.confidence,
@@ -111,7 +115,7 @@ def _candidate(
 ) -> MemoryCandidate:
     return MemoryCandidate(
         source=source,
-        ref=f"{source}:{rank}",
+        ref=f"facet:{rank}" if source == "facet" else f"{source}:{rank}",
         alt_ref=f"{source}:{rank}:alt" if source == "graph" else None,
         rank=rank,
         score=1.0 / rank,
@@ -180,7 +184,7 @@ _CANDIDATES = (
     _candidate("graph", 5, "injected", 1),
     _candidate("vault", 6, "injected", 4),
     _candidate("graph", 7, "dropped_budget", None),
-    _candidate("vault", 8, "dropped_min_score", None),
+    _candidate("vault", 8, "dropped_rank", None),
 )
 
 _EXPECTED = [
@@ -243,3 +247,67 @@ def test_an_item_without_an_injected_candidate_is_refused() -> None:
 
     with pytest.raises(ValueError, match="m2"):
         run_items(_result(_ITEMS, candidates), [_LIST])
+
+
+def test_a_facet_member_carries_the_facets_rank_when_it_is_lower() -> None:
+    # A facet ranked 2 placed Tea (ranked 6 alone, so packed at the facet's 2) at m2, and
+    # Swim, which no pool returned, at m1. Its first placed member is m1, where its stage
+    # candidate is injected; the other member, m2, still stands for it through `selected`.
+    facet = _candidate("facet", 2, "injected", 1)
+    tea = _candidate("graph", 6, "injected", 2)
+    items = (_fact_item("m1", _SWIM, 0.5), _fact_item("m2", _TEA, 0.5))
+    selected = (_scored(_SWIM, 0.5, position=2), _scored(_TEA, 0.5, position=2))
+
+    run = run_items(_result(items, (facet, tea)), [], selected)
+
+    assert [(entry["ref"], entry["rank"]) for entry in run] == [("m1", 2), ("m2", 2)]
+
+
+def test_a_member_that_is_only_a_facets_has_its_rank_from_selected() -> None:
+    # Swim has no stage candidate of its own; without `selected` it has no rank.
+    items = (_fact_item("m1", _TEA, 0.5), _fact_item("m2", _SWIM, 0.5))
+    candidates = (_candidate("graph", 1, "injected", 1), _candidate("facet", 3, "injected", 1))
+
+    with pytest.raises(ValueError, match="m2"):
+        run_items(_result(items, candidates), [])
+    run = run_items(_result(items, candidates), [], (_scored(_SWIM, 0.5, position=3),))
+    assert [(entry["ref"], entry["rank"]) for entry in run] == [("m1", 1), ("m2", 3)]
+
+
+def test_a_candidate_dropped_before_the_order_keeps_its_disposition_for_the_trace() -> None:
+    # Tea is ordered; Swim (suppressed) and a facet (memberless) left the shortlist before the
+    # order, so `ranked` lacks them and the stage traces them after it, by pool rank.
+    tea = _scored(_TEA, 0.5)
+    swim = replace(_scored(_SWIM, 0.5, position=2), ce_rank=None, p_ce=None)
+    facet = Candidate(
+        kind="facet",
+        item_id="facet-habits",
+        text="Wren's habits",
+        when=None,
+        source=FacetSource(
+            facet_key="facet-habits", subject_id="user", rel_type="HAS_HABIT", object_type="Habit"
+        ),
+        ranks={"facet_fts": 1},
+        confidence=1.0,
+    )
+    fused = (
+        FusedCandidate(candidate=facet, rrf=0.03, pool_rank=1),
+        FusedCandidate(candidate=tea.candidate, rrf=0.02, pool_rank=2),
+        FusedCandidate(candidate=swim.candidate, rrf=0.01, pool_rank=3),
+    )
+    candidates = (
+        replace(_candidate("graph", 1, "injected", 1), pool_rank=2),
+        replace(_candidate("facet", 2, "dropped_no_members", None), pool_rank=1),
+        replace(_candidate("graph", 3, "dropped_suppressed", None), pool_rank=3),
+    )
+    outcome = FetchOutcome(
+        result=_result((_fact_item("m1", _TEA, 0.5),), candidates),
+        fused=fused,
+        ranked=(tea,),
+        selected=(tea,),
+    )
+
+    assert dropped_dispositions(outcome) == {
+        ("facet", "facet-habits"): "dropped_no_members",
+        ("fact", _SWIM.fact_key): "dropped_suppressed",
+    }

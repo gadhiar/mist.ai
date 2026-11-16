@@ -13,6 +13,7 @@ from backend.memory.models import (
     Candidate,
     EpisodeSource,
     ExchangeSource,
+    FacetSource,
     FactRow,
     FactSource,
     FetchTimings,
@@ -50,7 +51,26 @@ _STAGE_KEYS = {
     "truncated",
     "need",
 }
-_CANDIDATE_KEYS = {"source", "ref", "alt_ref", "rank", "score", "item", "disposition"}
+_CANDIDATE_KEYS = {
+    "source",
+    "ref",
+    "alt_ref",
+    "rank",
+    "score",
+    "item",
+    "disposition",
+    "pool_rank",
+    "ce_rank",
+    "p_ce",
+}
+_DROPPED = (
+    "dropped_rank",
+    "dropped_budget",
+    "dropped_no_fit",
+    "dropped_suppressed",
+    "dropped_no_members",
+    "dropped_late",
+)
 _NEED_KEYS = {
     "mode",
     "band",
@@ -103,7 +123,7 @@ def _stage(**overrides) -> MemoryStage:
                 alt_ref=None,
                 rank=2,
                 item=None,
-                disposition="dropped_min_score",
+                disposition="dropped_rank",
             ),
         ),
     }
@@ -384,21 +404,36 @@ class TestMemoryCandidate:
         with pytest.raises(ValueError, match="alt_ref"):
             _candidate(alt_ref=None)
 
-    @pytest.mark.parametrize("source", ["vault", "episode", "exchange"])
+    @pytest.mark.parametrize("source", ["vault", "episode", "exchange", "facet"])
     def test_only_a_graph_candidate_has_an_alt_ref(self, source):
         with pytest.raises(ValueError, match="alt_ref"):
             _candidate(source=source, ref=f"{source}:00000000000000000001")
 
-        assert _candidate(source=source, alt_ref=None).alt_ref is None
+        ref = f"{source}:00000000000000000001"
+        assert _candidate(source=source, ref=ref, alt_ref=None).alt_ref is None
+
+    def test_a_facet_candidate_is_named_by_its_facet_key(self):
+        candidate = _candidate(source="facet", ref="facet:" + "a" * 64, alt_ref=None)
+
+        assert candidate.ref == "facet:" + "a" * 64
+        with pytest.raises(ValueError, match="facet:"):
+            _candidate(source="facet", ref="graph:0123456789abcdef0123", alt_ref=None)
+
+    def test_the_ranks_default_to_none(self):
+        candidate = _candidate()
+
+        assert (candidate.pool_rank, candidate.ce_rank, candidate.p_ce) == (None, None, None)
+
+    def test_the_ranks_build_when_set(self):
+        candidate = _candidate(pool_rank=4, ce_rank=1, p_ce=0.93)
+
+        assert (candidate.pool_rank, candidate.ce_rank, candidate.p_ce) == (4, 1, 0.93)
 
     def test_an_injected_candidate_has_a_block_position(self):
         with pytest.raises(ValueError, match="item"):
             _candidate(item=None)
 
-    @pytest.mark.parametrize(
-        "disposition",
-        ["dropped_min_score", "dropped_budget", "dropped_no_fit", "dropped_suppressed"],
-    )
+    @pytest.mark.parametrize("disposition", _DROPPED)
     def test_a_dropped_candidate_has_no_block_position(self, disposition):
         with pytest.raises(ValueError, match="item"):
             _candidate(disposition=disposition, item=2)
@@ -410,8 +445,13 @@ class TestMemoryCandidate:
         [
             ({"source": "vector", "alt_ref": None}, "source"),
             ({"disposition": "kept"}, "disposition"),
+            ({"disposition": "dropped_min_score", "item": None}, "disposition"),
             ({"rank": 0}, "rank"),
             ({"item": 0}, "item"),
+            ({"pool_rank": 0}, "pool_rank"),
+            ({"ce_rank": 0}, "ce_rank"),
+            ({"p_ce": 1.5}, "p_ce"),
+            ({"p_ce": float("nan")}, "p_ce"),
         ],
     )
     def test_rejects_invalid_values(self, overrides, fragment):
@@ -436,7 +476,7 @@ class TestMemoryStage:
         assert stage.skip_reason is None
         assert stage.truncated == 0
         assert stage.need is None
-        assert [c.disposition for c in stage.candidates] == ["injected", "dropped_min_score"]
+        assert [c.disposition for c in stage.candidates] == ["injected", "dropped_rank"]
 
     def test_a_ran_stage_carries_the_need_decision(self):
         need = _need(band="band", p=0.45)
@@ -762,6 +802,50 @@ class TestFactRowAndCandidate:
                 when=None,
                 source=FactSource("k", "r", None, None),
                 ranks={"fts": 1},
+            )
+
+    def test_a_facet_candidate_carries_its_group(self):
+        source = FacetSource(
+            facet_key="f" * 64, subject_id="user", rel_type="MEMBER_OF", object_type="Organization"
+        )
+        view = "You are a member of an organization, organisation or company."
+
+        candidate = Candidate(
+            kind="facet",
+            item_id=source.facet_key,
+            text=view,
+            when=None,
+            source=source,
+            ranks={"fts": 1},
+            view_text=view,
+        )
+
+        assert candidate.kind == "facet" and candidate.source is source
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            source.rel_type = "USES"  # type: ignore[misc]
+        assert not hasattr(source, "__dict__")
+
+    @pytest.mark.parametrize(
+        ("kind", "source"),
+        [
+            ("facet", FactSource("k", "r", None, None)),
+            ("fact", FacetSource("k", "user", "USES", "Tool")),
+        ],
+    )
+    def test_a_facet_and_its_source_go_together(self, kind, source):
+        with pytest.raises(ValueError, match="source"):
+            Candidate(kind=kind, item_id="k", text="t", when=None, source=source, ranks={})
+
+    def test_no_served_item_is_a_facet(self):
+        with pytest.raises(ValueError, match="facet"):
+            MemoryItem(
+                ref="m1",
+                kind="facet",  # type: ignore[arg-type]
+                item_id="k",
+                text="t",
+                when=None,
+                score=0.1,
+                source=FacetSource("k", "user", "USES", "Tool"),  # type: ignore[arg-type]
             )
 
 

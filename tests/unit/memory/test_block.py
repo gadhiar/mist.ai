@@ -76,6 +76,15 @@ def _words(count: int, stem: str = "w") -> str:
     return " ".join(f"{stem}{index}" for index in range(count))
 
 
+def _position_of(score: float) -> int:
+    """A packing position for a test that names an order score: a higher one packs earlier.
+
+    The block packs by position (plan v7 A37); equal scores give equal positions, which then
+    fall to item id and kind, as equal scores did.
+    """
+    return 1 + round((1.0 - score) * 1000)
+
+
 def _scored(
     kind: ItemKind,
     item_id: str,
@@ -85,6 +94,7 @@ def _scored(
     when: datetime | None = None,
     when_is_day: bool = False,
     summary_state: SummaryState = "raw",
+    position: int | None = None,
 ) -> ScoredCandidate:
     if kind == "fact":
         source = FactSource(
@@ -114,8 +124,10 @@ def _scored(
     return ScoredCandidate(
         candidate=candidate,
         score=score,
-        relevance=score,
-        reranked=True,
+        position=position if position is not None else _position_of(score),
+        pool_rank=1,
+        ce_rank=1,
+        p_ce=score,
         time_term=0.0,
         window_applied=False,
         confidence=0.5,
@@ -186,8 +198,14 @@ SIBLINGS_SAID = datetime(2026, 10, 19, 18, 0, tzinfo=UTC)  # the utterance `utt-
 SIBLINGS_DATE = "Monday evening, 19 Oct"  # four words
 
 
-def _member(fact: IndexedFact, score: float, *, when: datetime = SIBLINGS_SAID) -> ScoredCandidate:
-    """A sibling that ranking scored, as the fetcher hands it to the block."""
+def _member(
+    fact: IndexedFact,
+    score: float,
+    *,
+    when: datetime = SIBLINGS_SAID,
+    position: int | None = None,
+) -> ScoredCandidate:
+    """A sibling that ranking ordered, as the fetcher hands it to the block."""
     source = FactSource(
         fact_key=fact.fact_key,
         row_key=fact.row_key,
@@ -206,8 +224,10 @@ def _member(fact: IndexedFact, score: float, *, when: datetime = SIBLINGS_SAID) 
     return ScoredCandidate(
         candidate=candidate,
         score=score,
-        relevance=score,
-        reranked=True,
+        position=position if position is not None else _position_of(score),
+        pool_rank=1,
+        ce_rank=1,
+        p_ce=score,
         time_term=0.0,
         window_applied=False,
         confidence=fact.confidence,
@@ -334,6 +354,55 @@ def test_packing_skips_an_item_that_does_not_fit_and_takes_a_smaller_one() -> No
     budget = FRAME + FACTS_HEADING + 1 + 10
     block = _builder(block_tokens=budget).build(scored, request=_request(), window=None)
     assert _ids(block) == ["small"]
+
+
+def test_packing_follows_position_not_order_score() -> None:
+    # The fetcher puts an item inside the user's dated window first (position 1) although an
+    # item outside it has the higher order score; with room for one, the in-window item wins.
+    inside = _scored("fact", "z-inside", _words(4), 0.01, position=1)
+    outside = _scored("fact", "a-outside", _words(4), 0.99, position=2)
+    budget = FRAME + FACTS_HEADING + (1 + 4)
+
+    block = _builder(block_tokens=budget).build([outside, inside], request=_request(), window=None)
+
+    assert _ids(block) == ["z-inside"]
+    assert _outcomes(block)["a-outside"] == ("dropped_budget", None)
+
+
+def test_a_list_packs_at_its_earliest_members_position() -> None:
+    facts = [_sibling("Vim"), _sibling("Rust"), _sibling("Zig")]
+    members = (_member(facts[0], 0.1, position=7), _member(facts[1], 0.1, position=2))
+    fact_list = FactList(facts=tuple(facts), scored=members)
+    single = _scored("fact", "f-tea", "User likes tea.", 0.99, position=3)
+    list_line = 1 + 4 + 6  # the ref, the four-word date and "User uses Vim, Rust and Zig."
+
+    roomy = _builder().build([single, fact_list], request=_request(), window=None)
+    crowded = _builder(block_tokens=FRAME + FACTS_HEADING + list_line).build(
+        [single, fact_list], request=_request(), window=None
+    )
+
+    assert roomy.text is not None
+    assert [line for line in roomy.text.splitlines() if line.startswith("[m")] == [
+        f"[m1] {SIBLINGS_DATE}: User uses Vim, Rust and Zig.",
+        "[m2] User likes tea.",
+    ]
+    assert roomy.items[0].item_id == facts[1].fact_key  # named by its earliest member
+    assert _outcomes(crowded)["f-tea"] == ("dropped_budget", None)
+    assert _outcomes(crowded)[facts[0].fact_key] == ("injected", 1)
+
+
+def test_a_later_smaller_item_fills_room_an_earlier_larger_one_left() -> None:
+    scored = [
+        _scored("fact", "first", _words(4), 0.5, position=1),
+        _scored("fact", "large", _words(12), 0.5, position=2),
+        _scored("fact", "small", _words(3), 0.5, position=3),
+    ]
+    budget = FRAME + FACTS_HEADING + (1 + 4) + (1 + 3) + 5
+
+    block = _builder(block_tokens=budget).build(scored, request=_request(), window=None)
+
+    assert _ids(block) == ["first", "small"]
+    assert _outcomes(block)["large"] == ("dropped_budget", None)
 
 
 def test_the_request_budget_lowers_the_configured_budget_but_never_raises_it() -> None:
@@ -993,7 +1062,7 @@ def test_an_outcome_rejects_a_disposition_packing_cannot_give() -> None:
     with pytest.raises(ValueError, match="disposition"):
         PackingOutcome(
             candidate=_scored("fact", "f1", "x", 0.5),
-            disposition="dropped_min_score",  # type: ignore[arg-type]
+            disposition="dropped_rank",  # type: ignore[arg-type]
             item=None,
         )
 

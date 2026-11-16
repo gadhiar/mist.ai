@@ -9,7 +9,6 @@ stops startup instead of degrading recall quietly.
 from __future__ import annotations
 
 import ipaddress
-import math
 import os
 import socket
 from collections.abc import Mapping
@@ -38,9 +37,9 @@ _NEED_GATE_MODES: tuple[str, ...] = ("on", "shadow", "off")
 _RERANK_BACKENDS: tuple[str, ...] = ("local", "remote", "off")
 _RERANK_DEVICES: tuple[str, ...] = ("cpu", "cuda")
 _REMOTE_SCORE_KINDS: tuple[str, ...] = ("logit", "probability")
-_WEIGHT_TOLERANCE = 1e-6
 _BLOCK_TOKENS_LOW_RANGE = (0, 300)
 _LIST_MAX_ITEMS_RANGE = (2, 25)
+_SELECT_K_RANGE = (1, 25)
 _MIN_RESCAN_INTERVAL_S = 30
 
 # Where `rerank_url` may point. The remote reranker is sent the query and the memory texts, so
@@ -67,6 +66,9 @@ _FALSE = frozenset({"false", "0", "no", "off"})
 RETIRED_MEMORY_ENV_VARS: Mapping[str, str] = {
     "MIST_MEMORY_BLOCK_ROLE": "MIST_CTX_BUDGET_DELTA_PLACEMENT",
     "MIST_MEMORY_TZ": USER_TIMEZONE_ENV,
+    # Selection is by rank: no item score is thresholded or weighted any more.
+    "MIST_MEMORY_MIN_SCORE": "MIST_MEMORY_SELECT_K",
+    "MIST_MEMORY_WEIGHTS": "MIST_MEMORY_SELECT_K",
 }
 
 # Phase A variables, in `.env.example` order. Tests clear these to isolate a run, and the
@@ -76,7 +78,7 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_ENABLED",
     "MIST_MEMORY_BLOCK_TOKENS",
     "MIST_MEMORY_CONTINUITY_SHARE",
-    "MIST_MEMORY_MIN_SCORE",
+    "MIST_MEMORY_SELECT_K",
     "MIST_MEMORY_DEADLINE_MS",
     "MIST_MEMORY_RERANK_BACKEND",
     "MIST_MEMORY_RERANK_MODEL",
@@ -86,11 +88,11 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_RERANK_REMOTE_MODEL",
     "MIST_MEMORY_RERANK_TIMEOUT_MS",
     "MIST_MEMORY_RERANK_REMOTE_SCORES",
-    "MIST_MEMORY_WEIGHTS",
     "MIST_MEMORY_INDEX_PATH",
     "MIST_MEMORY_REFRESH_DEBOUNCE_S",
     "MIST_MEMORY_BLOCK_TOKENS_LOW",
     "MIST_MEMORY_LIST_MAX_ITEMS",
+    "MIST_MEMORY_FACETS",
     "MIST_MEMORY_RESCAN_INTERVAL_S",
     "MIST_MEMORY_FACT_VIEW",
     "MIST_MEMORY_NEED_GATE",
@@ -144,22 +146,6 @@ def _env_float(name: str, default: float) -> float:
         raise MemoryConfigError(f"{name}={raw!r} is not a number") from exc
 
 
-def _env_weights(name: str, default: tuple[float, float, float]) -> tuple[float, float, float]:
-    raw = _env(name)
-    if raw is None:
-        return default
-    parts = [part.strip() for part in raw.split(",")]
-    if len(parts) != 3:
-        raise MemoryConfigError(
-            f"{name}={raw!r} needs three comma-separated weights (rerank, recency, confidence)"
-        )
-    try:
-        rerank, recency, confidence = (float(part) for part in parts)
-    except ValueError as exc:
-        raise MemoryConfigError(f"{name}={raw!r} holds a weight that is not a number") from exc
-    return rerank, recency, confidence
-
-
 def _reject_retired() -> None:
     """Fail on a retired variable that is still set, naming the variable that replaced it.
 
@@ -203,14 +189,15 @@ class MemoryConfig:
         block_tokens: Token budget of the memory block; a request can lower it per turn.
         continuity_share: Share of the budget reserved for episodes and exchanges when the
             turn has a temporal window or starts a conversation.
-        min_score: Items below this final score are dropped. 0.35 is a placeholder until the
-            fixture calibration.
+        select_k: Candidates the fetch selects by rank, 1 to 25 and at most `rerank_top_n`; a
+            facet counts as one. The block packs them, and what expansion brings, in order
+            within its budget. A placeholder default until the selection run sets it.
         deadline_ms: Critical-path budget of `fetch`, counted from the call and covering any
             wait on stage 1.
         rerank_backend: `local` cross-encoder, `remote` HTTP endpoint, or `off`.
         rerank_model: Local cross-encoder path; used by `local` only.
-        rerank_top_n: Ceiling on reranked pairs; the pairs scored are those that fit the
-            deadline.
+        rerank_top_n: Length of the shortlist the fused order is cut to, and so the ceiling
+            on reranked pairs; the pairs scored are those that fit the deadline.
         rerank_device: Device for the local cross-encoder.
         rerank_url: Base URL of the rerank server; required for `remote`. Its scheme must be
             http or https and its host private (`_require_private_rerank_url`), since the
@@ -219,15 +206,15 @@ class MemoryConfig:
         rerank_timeout_ms: Remote call timeout, capped at the deadline left when it starts.
         rerank_remote_scores: Whether the remote server returns logits (a sigmoid is applied)
             or probabilities.
-        rerank_weight: Weight of the rerank score in the final score.
-        recency_weight: Weight of recency (or the window-match term) in the final score.
-        confidence_weight: Weight of confidence in the final score.
         index_path: Path of `memory_index.db`; None means beside the event store, resolved by
             the factory, which also propagates `:memory:`.
         refresh_debounce_s: Minimum seconds between two index refreshes.
         block_tokens_low: Block budget at the low serving level, 0 to 300; 0 sends no block.
             `block_tokens` is the budget at full, and off gets none.
-        list_max_items: Most siblings one list item can bring into the block, 2 to 25.
+        list_max_items: Most facts one list item, or one facet's expansion, can bring into
+            the block, 2 to 25.
+        facets: Whether facets (a subject, relation and object type held by two or more
+            facts) are candidates, served as their current members.
         rescan_interval_s: Seconds between two rescans of the graph for changed facts, at
             least 30.
         fact_view: The fact view the index embeds, F0 to F3 (`retrieval_view.FACT_VIEWS`).
@@ -254,7 +241,7 @@ class MemoryConfig:
     enabled: bool = True
     block_tokens: int = 500
     continuity_share: float = 0.35
-    min_score: float = 0.35
+    select_k: int = 8
     deadline_ms: int = 50
     rerank_backend: RerankBackend = "local"
     rerank_model: str = "/opt/models/ms-marco-MiniLM-L-6-v2"
@@ -264,13 +251,11 @@ class MemoryConfig:
     rerank_remote_model: str | None = None
     rerank_timeout_ms: int = 40
     rerank_remote_scores: RemoteScoreKind = "logit"
-    rerank_weight: float = 0.8
-    recency_weight: float = 0.1
-    confidence_weight: float = 0.1
     index_path: str | None = None
     refresh_debounce_s: int = 30
     block_tokens_low: int = 0
-    list_max_items: int = 10
+    list_max_items: int = 25
+    facets: bool = True
     rescan_interval_s: int = 300
     fact_view: FactViewId = "F3"
     need_gate: NeedGateMode = "on"
@@ -287,12 +272,17 @@ class MemoryConfig:
             raise MemoryConfigError(
                 f"continuity_share must be in [0, 1], got {self.continuity_share}"
             )
-        if not 0.0 <= self.min_score <= 1.0:
-            raise MemoryConfigError(f"min_score must be in [0, 1], got {self.min_score}")
         if self.deadline_ms <= 0:
             raise MemoryConfigError(f"deadline_ms must be positive, got {self.deadline_ms}")
         if self.rerank_top_n <= 0:
             raise MemoryConfigError(f"rerank_top_n must be positive, got {self.rerank_top_n}")
+        _require_range("select_k", self.select_k, _SELECT_K_RANGE)
+        if self.select_k > self.rerank_top_n:
+            raise MemoryConfigError(
+                f"select_k must be at most rerank_top_n ({self.rerank_top_n}), got {self.select_k}"
+            )
+        if not isinstance(self.facets, bool):
+            raise MemoryConfigError(f"facets must be a bool, got {self.facets!r}")
         if self.refresh_debounce_s < 0:
             raise MemoryConfigError(
                 f"refresh_debounce_s must not be negative, got {self.refresh_debounce_s}"
@@ -312,11 +302,6 @@ class MemoryConfig:
         _require_choice("need_embedder", self.need_embedder, tuple(NEED_EMBEDDERS))
         if not isinstance(self.need_context, bool):
             raise MemoryConfigError(f"need_context must be a bool, got {self.need_context!r}")
-        weights = (self.rerank_weight, self.recency_weight, self.confidence_weight)
-        if any(weight < 0 for weight in weights):
-            raise MemoryConfigError(f"weights must not be negative, got {weights}")
-        if not math.isclose(sum(weights), 1.0, rel_tol=0.0, abs_tol=_WEIGHT_TOLERANCE):
-            raise MemoryConfigError(f"weights must sum to 1, got {weights} (sum {sum(weights)})")
         if self.rerank_backend == "remote":
             if not self.rerank_url:
                 raise MemoryConfigError("rerank_url is required when rerank_backend is remote")
@@ -344,15 +329,12 @@ class MemoryConfig:
                 fails validation, or `MIST_TIMEZONE` names a zone the resolver rejects.
         """
         _reject_retired()
-        rerank_weight, recency_weight, confidence_weight = _env_weights(
-            "MIST_MEMORY_WEIGHTS", (0.8, 0.1, 0.1)
-        )
         tz, tz_name = _resolve_tz(tz_resolver)
         return cls(
             enabled=_env_bool("MIST_MEMORY_ENABLED", True),
             block_tokens=_env_int("MIST_MEMORY_BLOCK_TOKENS", 500),
             continuity_share=_env_float("MIST_MEMORY_CONTINUITY_SHARE", 0.35),
-            min_score=_env_float("MIST_MEMORY_MIN_SCORE", 0.35),
+            select_k=_env_int("MIST_MEMORY_SELECT_K", 8),
             deadline_ms=_env_int("MIST_MEMORY_DEADLINE_MS", 50),
             rerank_backend=_env("MIST_MEMORY_RERANK_BACKEND") or "local",  # type: ignore[arg-type]
             rerank_model=_env("MIST_MEMORY_RERANK_MODEL") or "/opt/models/ms-marco-MiniLM-L-6-v2",
@@ -363,13 +345,11 @@ class MemoryConfig:
             rerank_timeout_ms=_env_int("MIST_MEMORY_RERANK_TIMEOUT_MS", 40),
             rerank_remote_scores=_env("MIST_MEMORY_RERANK_REMOTE_SCORES")  # type: ignore[arg-type]
             or "logit",
-            rerank_weight=rerank_weight,
-            recency_weight=recency_weight,
-            confidence_weight=confidence_weight,
             index_path=_env("MIST_MEMORY_INDEX_PATH"),
             refresh_debounce_s=_env_int("MIST_MEMORY_REFRESH_DEBOUNCE_S", 30),
             block_tokens_low=_env_int("MIST_MEMORY_BLOCK_TOKENS_LOW", 0),
-            list_max_items=_env_int("MIST_MEMORY_LIST_MAX_ITEMS", 10),
+            list_max_items=_env_int("MIST_MEMORY_LIST_MAX_ITEMS", 25),
+            facets=_env_bool("MIST_MEMORY_FACETS", True),
             rescan_interval_s=_env_int("MIST_MEMORY_RESCAN_INTERVAL_S", 300),
             fact_view=_env("MIST_MEMORY_FACT_VIEW") or "F3",  # type: ignore[arg-type]
             need_gate=_env("MIST_MEMORY_NEED_GATE") or "on",  # type: ignore[arg-type]

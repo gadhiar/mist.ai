@@ -181,7 +181,7 @@ class MemoryIndexError(MistError):
 class MemoryRerankError(MistError):
     """A reranker failed to load or to score.
 
-    The fetcher keeps the RRF scores and marks the result
+    The fetcher keeps the pool order and marks the result
     `reranker_unavailable`, so a reranker fault costs ranking quality, not
     the turn.
     """

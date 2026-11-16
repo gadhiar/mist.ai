@@ -312,7 +312,9 @@ def test_the_trace_opens_with_the_run_header(every_mode: dict[str, Path]) -> Non
     assert (header["embedder_path"], header["reranker_path"]) == (None, None)
     assert header["cost_per_pair_ms"] is None and header["call_overhead_ms"] is None
     assert header["config"]["deadline_ms"] == 10000
-    assert {"min_score", "rerank_top_n", "block_tokens", "rerank_weight"} <= set(header["config"])
+    config = set(header["config"])
+    assert {"select_k", "facets", "rerank_top_n", "block_tokens", "list_max_items"} <= config
+    assert not {"min_score", "rerank_weight", "recency_weight", "confidence_weight"} & config
 
 
 def test_the_trace_has_one_record_per_probe_matching_its_run_record(
@@ -326,7 +328,9 @@ def test_the_trace_has_one_record_per_probe_matching_its_run_record(
     for trace in traces:
         record = records[trace["probe_id"]]
         assert trace["record"] == "probe"
-        assert trace["shortlisted"] == record["shortlisted"] == len(trace["scored"])
+        # The record also counts the candidates dropped before the order (suppressed facts,
+        # facets without members), which the trace's ordered shortlist leaves out.
+        assert trace["shortlisted"] == len(trace["scored"]) <= record["shortlisted"]
         assert trace["reranked"] == record["reranked"]
         assert trace["rerank_matches_shortlist"] is True
         assert len(trace["embed_calls"]) == 1 and trace["embed_calls"][0]["wall_ms"] >= 0
@@ -334,7 +338,9 @@ def test_the_trace_has_one_record_per_probe_matching_its_run_record(
         assert positions == [n if n <= top_n else None for n in range(1, len(positions) + 1)]
         assert [s["rank"] for s in trace["scored"]] == list(range(1, len(trace["scored"]) + 1))
         for scored in trace["scored"]:
-            assert (scored["logit"] is None) == (not scored["reranked"])
+            assert scored["position"] == scored["rank"] and scored["pool_rank"] >= 1
+            assert (scored["logit"] is None) == (scored["ce_rank"] is None)
+            assert (scored["p_ce"] is None) == (scored["ce_rank"] is None)
         for call in trace["rerank_calls"]:
             assert call["pairs_scored"] == record["reranked"] == len(call["pair_tokens"])
             assert call["pairs_within"] >= call["pairs_scored"] and call["discarded"] == 0
@@ -364,6 +370,35 @@ def test_the_trace_follows_each_target_through_the_stages(every_mode: dict[str, 
             logits = [chunk["logit"] for chunk in oracle["chunks"]]
             assert logits and oracle["max"] == max(logits)
             assert all(chunk["heading"] and chunk["text"] for chunk in oracle["chunks"])
+
+
+# -- selection flags ----------------------------------------------------------------------------
+
+
+def test_min_score_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--output", str(tmp_path / "run.jsonl"), "--min-score", "0.3"])
+
+    assert exit_info.value.code == 2
+    assert not (tmp_path / "run.jsonl").exists()
+
+
+@pytest.mark.parametrize(("flag", "facets"), [("on", True), ("off", False)])
+def test_select_k_and_facets_reach_the_config(flag: str, facets: bool) -> None:
+    args = harness._parser().parse_args(
+        ["--output", "run.jsonl", "--select-k", "5", "--facets", flag]
+    )
+
+    config = harness.config_from_args(args)
+
+    assert (config.select_k, config.facets) == (5, facets)
+
+
+def test_facets_takes_only_on_or_off() -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        harness._parser().parse_args(["--output", "run.jsonl", "--facets", "yes"])
+
+    assert exit_info.value.code == 2
 
 
 # -- the probe file -----------------------------------------------------------------------------
