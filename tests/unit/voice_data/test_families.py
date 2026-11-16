@@ -132,6 +132,8 @@ def test_whisperx_alignment_model_is_a_url_model() -> None:
     model = load()["families"]["extract"]["models"]["whisperx-align-en"]
     assert model["kind"] == "url"
     assert model["dest"].startswith("torch/hub/checkpoints/")
+    # Trusted on first use: the hash of the first HTTPS download; no upstream hash exists.
+    assert model["sha256"] == "488fd4f16de84438ffc945334278c1b9fb9b7159a806c1080b16111a958c945d"
 
 
 @pytest.mark.parametrize("key", sorted(FAMILY_KEYS))
