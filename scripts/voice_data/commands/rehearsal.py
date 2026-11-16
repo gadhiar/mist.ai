@@ -17,7 +17,10 @@ are never mixed with the stand-in's.
   `rehearsal/answers/<P>/ratings.csv` for `pack import`.
 - `score --run R [--clean C]` scores extract run R (and the clean run C made from it, found by
   itself when there is one) against the ground truth; the effect measures run as the `effects`
-  step of the same job module. It writes `rehearsal/scores/<R>/score.json`.
+  step of the same job module. It writes `rehearsal/scores/<R>/score.json`, and, when the run
+  kept a primary segment, the precision record `rehearsal/scores/<R>/precision.json`: the run,
+  `extraction.precision` and the run's report `thresholds`, which H8 copies to the private root's
+  `config/rehearsal.json` for the seed gate (`seed_gate.rehearsal_record`, A24).
 
 Output names ids, counts, scores and root-relative paths; no public or private file name.
 """
@@ -493,7 +496,14 @@ def effects_plan(
 
 
 def run_score(args: argparse.Namespace) -> int:
-    """Score an extraction run, run the effects step, write and print the score."""
+    """Score an extraction run, run the effects step, write and print the score.
+
+    With a number `extraction.precision` it also writes the seed gate's precision record beside
+    the score; with no primary segment the precision is null and no record is written.
+    """
+    # Imported here so the change stays inside `run_score`, the one symbol T37 owns in this file.
+    from .. import seed_gate
+
     root = open_rehearsal(args.root)
     segments = _segments(root, args.run)
     turns = _turns(root, args.run)
@@ -546,8 +556,20 @@ def run_score(args: argparse.Namespace) -> int:
             score_mod.fallback_fc(read_json(root.path / pkg.BUILD_REL), eps),
         ),
     }
+    precision = result["extraction"]["precision"]  # type: ignore[index]
+    # Built before anything is written, so a report without number thresholds refuses cleanly.
+    record = (
+        None
+        if precision is None
+        else seed_gate.rehearsal_record(args.run, precision, report.get("thresholds"))  # type: ignore[arg-type]
+    )
     write_json(root, f"{folder}/{pkg.SCORE_NAME}", result)
     for line in score_mod.score_lines(result):
         print(line)
     print(f"  written to {folder}/{pkg.SCORE_NAME}")
+    if record is None:
+        print("no precision record: no primary segment")
+    else:
+        write_json(root, f"{folder}/{pkg.PRECISION_NAME}", record)
+        print(f"  precision record written to {folder}/{pkg.PRECISION_NAME}")
     return 0
