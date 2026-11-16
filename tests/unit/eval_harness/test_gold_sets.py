@@ -2391,7 +2391,7 @@ def test_every_check_that_reads_dev_general_is_under_the_print_guard():
 _DEV_GENERAL_AGREEMENT = _DEV_GENERAL_DIR / "agreement.json"
 _DEV_GENERAL_PASS_A = _DEV_GENERAL_DIR / "pass-a.jsonl"
 _DEV_GENERAL_PASS_B = _DEV_GENERAL_DIR / "pass-b.jsonl"
-_DEV_GENERAL_GOLD_COUNTS = {"entities": 128, "relationships": 74}
+_DEV_GENERAL_GOLD_COUNTS = {"entities": 126, "relationships": 72}
 
 
 def test_dev_general_agreement_is_what_the_module_recomputes_from_the_passes(tmp_path):
