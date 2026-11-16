@@ -4,6 +4,12 @@ All four actions run on a root of kind `rehearsal` only. The values are set by t
 job (`rehearsal/calibrate.py`) on public speakers that no rehearsal episode uses, so the
 rehearsal (H6) tests them rather than fitting them; gate values change only through this command.
 
+The job's threshold rule (A22): of the pairs of values, WavLM-SV's and ECAPA's, that hold the
+joint false-accept rate at or below `ALPHA` in every impostor form of each dataset, each gate
+takes the one that misses the fewest target trials of its `MATCHED` forms (the largest miss
+first, then the mean), with ties to the lower largest FAR and then the higher WavLM-SV value.
+v5's equal split of alpha between the embedders is written beside it only for comparison.
+
 - `run --id C` writes `rehearsal/calibration/<C>/calibration-plan.json`, runs the job in the
   `score` image on the CPU with no network and `public/` mounted read-only, prints the job's
   lines and then applies its values. The plan lists every LibriTTS-R speaker of the build plan's
@@ -70,6 +76,14 @@ TRIALS: Mapping[str, object] = {
     "anchor_sets": 10,
 }
 """The Design's trial parameters, in the plan's `trials` schema; `anchor_sets` is v6's (A23)."""
+MATCHED: Mapping[str, list[str]] = {
+    "anchors.sim_min": ["sets"],
+    "retrieval.anchor_floor": ["centroid/n10", "centroid/n20", "centroid/n30"],
+    "retrieval.margin": ["rival"],
+}
+"""The target forms whose miss each gate's values minimise (Decision 18): the trials R2's
+anchors produce, a whole anchor set, a cluster against the five-anchor centroid, and a turn
+against the target's model and three rivals."""
 
 LIBRITTSR = "librittsr"
 RAVDESS = "ravdess"
@@ -231,6 +245,7 @@ def calibration_plan(root: root_mod.Root, cal_id: str) -> dict[str, object]:
         "seed": SEED,
         "embedders": _revisions(),
         "trials": json.loads(json.dumps(dict(TRIALS))),
+        "matched": json.loads(json.dumps(dict(MATCHED))),
         "datasets": [
             {
                 "name": LIBRITTSR,

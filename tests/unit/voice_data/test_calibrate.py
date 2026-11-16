@@ -336,6 +336,12 @@ def test_run_plans_public_speakers_runs_the_job_and_applies_its_values(
         "bootstrap": 1000,
         "anchor_sets": 10,
     }
+    assert plan["matched"] == {
+        "anchors.sim_min": ["sets"],
+        "retrieval.anchor_floor": ["centroid/n10", "centroid/n20", "centroid/n30"],
+        "retrieval.margin": ["rival"],
+    }
+    assert plan["matched"] == calibrate_cmd.MATCHED
     libri, ravdess = plan["datasets"]
     assert (libri["name"], libri["licence"], libri["subset"]) == (
         "librittsr",
