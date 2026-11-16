@@ -1,5 +1,6 @@
 """The run modes: `--cpu-load-procs`, `--placement`, `--threads`, `--rescan-facts`, `--trace`,
-`--probes`, `--gpu-load-procs`, `--vram-log` and `--vram-stt`.
+`--probes`, `--gpu-load-procs`, `--vram-log` and `--vram-stt`; the need gate's flags and
+`--fact-view`; and `run_settings`.
 
 The busy-loop processes start for the run and stop after it; the block builder gets the
 placement asked for; torch's thread count is set before any model loads; forced rescans of the
@@ -7,10 +8,15 @@ fact index run for the whole run and are logged; and the trace writes a run head
 record per probe that agrees with the run file. The probe file can be chosen; the GPU load
 needs CUDA; and the VRAM log reads its points in order through injected NVML, torch and Whisper
 fakes, so no test here needs a GPU or Whisper's weights.
+
+The need gate's model files are written here with a zero weight vector, so every query gets
+`sigmoid(b)` and a test picks the band by `b`. A gate embedder given by path is a recording fake,
+so no test loads a model.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import multiprocessing
@@ -25,9 +31,42 @@ from typing import Any
 import numpy as np
 import pytest
 
+import backend.memory.need_gate as need_gate_module
 import scripts.eval_harness.memory_recall_run as harness
+from backend.memory.config import MemoryConfig
+from backend.memory.models import MemoryRequest
+from backend.memory.need_gate import (
+    NEED_EMBEDDERS,
+    NeedGate,
+    NeedKey,
+    load_bank,
+    load_models,
+    need_embedder_kwargs,
+    need_model_key,
+)
+from backend.memory.retrieval_view import FACT_VIEWS
 from scripts.eval_harness.memory_recall import FIXTURE_DIR, load_probes
-from scripts.eval_harness.memory_recall_run import cpu_load, gpu_load, main
+from scripts.eval_harness.memory_recall_run import (
+    FAKE_EMBEDDER_NAME,
+    FAKE_EMBEDDER_REVISION,
+    Fixture,
+    RunSetting,
+    TokenEmbedder,
+    TokenReranker,
+    cpu_load,
+    gpu_load,
+    main,
+    run_fixture,
+    run_settings,
+)
+
+
+@pytest.fixture(autouse=True)
+def _gate_off_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A run without `--need-gate` takes the config's mode, `on` by default, and no gate model
+    # file ships yet; the tests of the other flags run with the gate off through the
+    # environment, which `MemoryConfig.from_env` reads. A `--need-gate` flag overrides it.
+    monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "off")
 
 
 class FakeClock:
@@ -898,3 +937,624 @@ def test_nvml_unavailable_is_reported(monkeypatch: pytest.MonkeyPatch, module: o
 
     with pytest.raises(harness.GpuUnavailableError, match="NVML"):
         harness.PynvmlReader.open()
+
+
+# -- the need gate ------------------------------------------------------------------------------
+
+_SHA = "a" * 40
+_BGE = "bge-small-en-v1.5"
+_GRANITE = "granite-embedding-small-english-r2"
+_MINILM = "all-MiniLM-L6-v2"
+_LATENCY = ("critical_path_ms", "timings_ms")
+_NEED_FIELDS = {
+    "mode",
+    "band",
+    "p",
+    "theta_low",
+    "theta_high",
+    "band_k",
+    "need_ids",
+    "no_need_ids",
+    "context",
+    "context_p",
+    "degraded",
+}
+
+
+def _model_file(
+    path: Path,
+    *,
+    name: str,
+    revision: str,
+    prefix: str = "",
+    b: float = 0.0,
+    theta_low: float = 0.3,
+    theta_high: float = 0.7,
+) -> Path:
+    """A gate model file of one logistic record keyed to the shipped bank.
+
+    Its weights are zero, so every query's `p` is `sigmoid(b)`: 0.5 at `b` 0 (band), above
+    0.99 at 5 (open) and below 0.01 at -5 (closed).
+    """
+    key = NeedKey(load_bank().sha256, name, revision, prefix)
+    record = {
+        "key": need_model_key(key),
+        "bank_sha256": key.bank_sha256,
+        "embedder": {"name": name, "revision": revision},
+        "query_prefix": prefix,
+        "normalisation": "l2",
+        "form": "logistic",
+        "params": {"c": 1.0, "w": [0.0] * 384, "b": b},
+        "theta_low": theta_low,
+        "theta_high": theta_high,
+        "band_k": 2,
+        "recall_target": 0.98,
+        "source": "test",
+    }
+    path.write_text(json.dumps({"records": [record]}), encoding="utf-8")
+    return path
+
+
+def _fake_model(tmp_path: Path, *, b: float, revision: str = FAKE_EMBEDDER_REVISION) -> Path:
+    return _model_file(
+        tmp_path / "need_model.json", name=FAKE_EMBEDDER_NAME, revision=revision, b=b
+    )
+
+
+def _lock(tmp_path: Path, *names: str) -> Path:
+    """A models.lock holding one entry per name, each at revision `_SHA`."""
+    tables = [
+        "\n".join(
+            [
+                "[[model]]",
+                f'name = "{name}"',
+                f'repo = "owner/{name}"',
+                f'revision = "{_SHA}"',
+                'license = "Apache-2.0"',
+                f'target = "/opt/models/{name}"',
+            ]
+        )
+        for name in names
+    ]
+    path = tmp_path / "models.lock"
+    path.write_text("\n\n".join(tables) + "\n", encoding="utf-8")
+    return path
+
+
+def _probe_file(tmp_path: Path) -> Path:
+    """Three fact probes, two note probes and two noise probes of the fixture."""
+    lines = (FIXTURE_DIR / "probes.jsonl").read_text(encoding="utf-8").splitlines()
+    chosen: list[str] = []
+    for kind, count in (("fact", 3), ("note", 2), ("noise", 2)):
+        chosen += [line for line in lines if json.loads(line)["kind"] == kind][:count]
+    path = tmp_path / "gate_probes.jsonl"
+    path.write_text("\n".join(chosen) + "\n", encoding="utf-8")
+    return path
+
+
+def _gate_argv(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "--output",
+        str(tmp_path / "run.jsonl"),
+        "--probes",
+        str(_probe_file(tmp_path)),
+        "--deadline-ms",
+        "10000",
+        *extra,
+    ]
+
+
+def _exit_code(argv: list[str]) -> int | str | None:
+    with pytest.raises(SystemExit) as exited:
+        main(argv)
+    return exited.value.code
+
+
+def test_the_need_flags_and_the_fact_view_reach_the_config() -> None:
+    args = harness._parser().parse_args(
+        [
+            "--output",
+            "run.jsonl",
+            "--need-gate",
+            "shadow",
+            "--need-context",
+            "off",
+            "--fact-view",
+            "F1",
+            "--need-embedder",
+            f"/opt/models/{_BGE}",
+            "--need-embedder-name",
+            _BGE,
+            "--need-embedder-revision",
+            _SHA,
+        ]
+    )
+
+    config = harness.config_from_args(args)
+
+    assert (config.need_gate, config.need_context, config.fact_view, config.need_embedder) == (
+        "shadow",
+        False,
+        "F1",
+        _BGE,
+    )
+
+
+def test_without_need_flags_the_config_keeps_the_environments_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "shadow")
+    monkeypatch.setenv("MIST_MEMORY_NEED_CONTEXT", "false")
+    args = harness._parser().parse_args(["--output", "run.jsonl"])
+
+    config = harness.config_from_args(args)
+
+    assert (config.need_gate, config.need_context, config.need_embedder) == (
+        "shadow",
+        False,
+        "shared",
+    )
+
+
+def test_the_fact_view_reaches_the_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    views: list[object] = []
+    base = harness.FactIndex
+
+    class RecordingIndex(base):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            views.append(kwargs.get("view"))
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(harness, "FactIndex", RecordingIndex)
+
+    assert main(_gate_argv(tmp_path, "--fact-view", "F1")) == 0
+
+    assert views == [FACT_VIEWS["F1"]]
+
+
+@pytest.mark.parametrize("name", [_BGE, _GRANITE])
+def test_a_gate_embedder_is_built_with_exactly_its_specs_keywords(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    made: list[tuple[tuple[object, ...], dict[str, object], list[list[str]]]] = []
+
+    class RecordingGateEmbedder(TokenEmbedder):
+        """`EmbeddingGenerator` as the harness calls it; vectors are the token embedder's."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.batches: list[list[str]] = []
+            made.append((args, kwargs, self.batches))
+
+        def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+            self.batches.append(list(texts))
+            return super().generate_embeddings(texts)
+
+    monkeypatch.setattr(harness, "EmbeddingGenerator", RecordingGateEmbedder)
+    spec = NEED_EMBEDDERS[name]
+    path = f"/opt/models/{name}"
+    model = _model_file(
+        tmp_path / "model.json", name=name, revision=_SHA, prefix=spec.query_prefix, b=5.0
+    )
+
+    code = main(
+        _gate_argv(
+            tmp_path,
+            "--need-gate",
+            "on",
+            "--need-embedder",
+            path,
+            "--need-embedder-name",
+            name,
+            "--need-embedder-revision",
+            _SHA,
+            "--need-model",
+            str(model),
+        )
+    )
+
+    assert code == 0
+    assert [(args, kwargs) for args, kwargs, _ in made] == [
+        ((path,), {"device": "cpu", **need_embedder_kwargs(spec)})
+    ]
+    # bge-small has no attention setting, so its load gets no keyword; granite-r2 gets sdpa.
+    assert ("attn_implementation" in made[0][1]) == (spec.attn_implementation is not None)
+    bank_texts = made[0][2][0]
+    assert len(bank_texts) == len(load_bank().exemplars)
+    assert all(text.startswith(spec.query_prefix) for text in bank_texts)
+    records = _records(tmp_path / "run.jsonl")
+    assert {(r["need"]["mode"], r["need"]["band"]) for r in records} == {("on", "open")}
+
+
+def test_shared_takes_its_name_and_revision_from_the_models_lock_with_the_real_embedder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The real embedder is not loaded: the lock's entry is what the test is about.
+    monkeypatch.setattr(harness, "build_embedder", lambda choice, **kwargs: TokenEmbedder())
+    lock = _lock(tmp_path, "ms-marco-MiniLM-L-6-v2", _MINILM)
+    keyed_to_lock = _model_file(tmp_path / "lock_model.json", name=_MINILM, revision=_SHA, b=5.0)
+    keyed_to_fake = _fake_model(tmp_path, b=5.0)
+
+    def argv(model: Path) -> list[str]:
+        return _gate_argv(
+            tmp_path,
+            "--embedder",
+            "real",
+            "--models-lock",
+            str(lock),
+            "--need-gate",
+            "on",
+            "--need-model",
+            str(model),
+        )
+
+    assert main(argv(keyed_to_lock)) == 0
+    assert {r["need"]["band"] for r in _records(tmp_path / "run.jsonl")} == {"open"}
+    assert _exit_code(argv(keyed_to_fake)) == 2
+    assert "--need-model" in capsys.readouterr().err
+
+
+def test_shared_takes_the_fake_constants_with_the_fake_embedder(tmp_path: Path) -> None:
+    # The lock is not read for the fake embedder: it does not exist.
+    code = main(
+        _gate_argv(
+            tmp_path,
+            "--models-lock",
+            str(tmp_path / "absent.lock"),
+            "--need-gate",
+            "on",
+            "--need-model",
+            str(_fake_model(tmp_path, b=5.0)),
+        )
+    )
+
+    assert code == 0
+    assert {r["need"]["band"] for r in _records(tmp_path / "run.jsonl")} == {"open"}
+
+
+@pytest.mark.parametrize("names", [("ms-marco-MiniLM-L-6-v2",), None], ids=["no-entry", "absent"])
+def test_a_lock_without_the_fact_embedder_exits_2_naming_models_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    names: tuple[str, ...] | None,
+) -> None:
+    monkeypatch.setattr(harness, "build_embedder", lambda choice, **kwargs: TokenEmbedder())
+    lock = _lock(tmp_path, *names) if names is not None else tmp_path / "absent.lock"
+    model = _model_file(tmp_path / "lock_model.json", name=_MINILM, revision=_SHA, b=5.0)
+
+    code = _exit_code(
+        _gate_argv(
+            tmp_path,
+            "--embedder",
+            "real",
+            "--models-lock",
+            str(lock),
+            "--need-gate",
+            "on",
+            "--need-model",
+            str(model),
+        )
+    )
+
+    assert code == 2
+    assert "--models-lock" in capsys.readouterr().err
+    assert not (tmp_path / "run.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--need-embedder-name", _BGE],
+        ["--need-embedder-revision", _SHA],
+        ["--need-embedder", "shared", "--need-embedder-name", _BGE],
+    ],
+    ids=["name", "revision", "explicit-shared"],
+)
+def test_a_name_or_revision_with_shared_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], extra: list[str]
+) -> None:
+    assert _exit_code(_gate_argv(tmp_path, *extra)) == 2
+    assert "shared" in capsys.readouterr().err
+    assert not (tmp_path / "run.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [[], ["--need-embedder-name", _BGE], ["--need-embedder-revision", _SHA]],
+    ids=["neither", "no-revision", "no-name"],
+)
+def test_a_path_without_its_name_and_revision_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], extra: list[str]
+) -> None:
+    argv = _gate_argv(tmp_path, "--need-embedder", f"/opt/models/{_BGE}", *extra)
+
+    assert _exit_code(argv) == 2
+    err = capsys.readouterr().err
+    assert "--need-embedder-name" in err and "--need-embedder-revision" in err
+    assert not (tmp_path / "run.jsonl").exists()
+
+
+@pytest.mark.parametrize("mode", ["on", "shadow"])
+@pytest.mark.parametrize("model", ["other-key", "absent"])
+def test_a_gate_without_a_record_for_its_key_exits_2_naming_need_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: str, model: str
+) -> None:
+    path = (
+        _fake_model(tmp_path, b=5.0, revision="another-revision")
+        if model == "other-key"
+        else tmp_path / "absent.json"
+    )
+
+    code = _exit_code(_gate_argv(tmp_path, "--need-gate", mode, "--need-model", str(path)))
+
+    assert code == 2
+    assert "--need-model" in capsys.readouterr().err
+    assert not (tmp_path / "run.jsonl").exists()
+
+
+def test_with_the_gate_off_neither_the_bank_nor_the_model_file_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    absent = tmp_path / "absent"
+    monkeypatch.setattr(
+        need_gate_module,
+        "DEFAULT_BANK_PATHS",
+        (absent / "writer_a.jsonl", absent / "writer_b.jsonl"),
+    )
+    model = absent / "need_model.json"
+
+    assert main(_gate_argv(tmp_path, "--need-gate", "off", "--need-model", str(model))) == 0
+
+    assert all(r["need"] is None for r in _records(tmp_path / "run.jsonl"))
+    # The same paths are read, and refused, once the gate is on.
+    assert _exit_code(_gate_argv(tmp_path, "--need-gate", "on", "--need-model", str(model))) == 2
+
+
+def test_a_record_carries_the_need_trace_and_the_stage_ids(tmp_path: Path) -> None:
+    model = _fake_model(tmp_path, b=0.0)
+
+    assert main(_gate_argv(tmp_path, "--need-gate", "on", "--need-model", str(model))) == 0
+
+    records = _records(tmp_path / "run.jsonl")
+    for record in records:
+        need = record["need"]
+        assert set(need) == _NEED_FIELDS
+        assert (need["mode"], need["band"], need["band_k"]) == ("on", "band", 2)
+        assert need["p"] == pytest.approx(0.5)
+        assert (need["theta_low"], need["theta_high"]) == (0.3, 0.7)
+        assert len(need["need_ids"]) == len(need["no_need_ids"]) == 3
+        assert (need["context"], need["context_p"], need["degraded"]) == (False, None, None)
+        # A band turn is served at most `band_k` block entries.
+        assert len({item["ref"] for item in record["items"]}) <= 2
+        assert "cuts" not in record
+        stage_ids = record["stage_ids"]
+        assert set(stage_ids) == {"fused", "shortlisted", "selected"}
+        for ids in stage_ids.values():
+            assert all(
+                isinstance(i, str) and i.split(":", 1)[0] in {"fact", "facet", "note"} for i in ids
+            )
+        assert set(stage_ids["shortlisted"]) <= set(stage_ids["fused"])
+    assert any(r["stage_ids"]["selected"] for r in records)
+
+
+def test_a_closed_gate_serves_no_block(tmp_path: Path) -> None:
+    model = _fake_model(tmp_path, b=-5.0)
+
+    assert main(_gate_argv(tmp_path, "--need-gate", "on", "--need-model", str(model))) == 0
+
+    for record in _records(tmp_path / "run.jsonl"):
+        assert record["need"]["band"] == "closed"
+        assert record["items"] == [] and record["tokens"] == 0
+        assert record["stage_ids"] == {"fused": [], "shortlisted": [], "selected": []}
+
+
+def test_a_shadow_record_carries_each_cut_with_its_items_and_tokens(tmp_path: Path) -> None:
+    model = _fake_model(tmp_path, b=0.0)
+
+    assert main(_gate_argv(tmp_path, "--need-gate", "shadow", "--need-model", str(model))) == 0
+
+    records = _records(tmp_path / "run.jsonl")
+    assert {(r["need"]["mode"], r["need"]["band"]) for r in records} == {("shadow", "band")}
+    with_block = [r for r in records if r["tokens"] > 0]
+    assert with_block
+    # Served as open: some shadow band turn holds more than `band_k` entries.
+    assert any(len({item["ref"] for item in r["items"]}) > 2 for r in with_block)
+    for record in records:
+        if record["tokens"] == 0:
+            assert "cuts" not in record
+            continue
+        cuts = record["cuts"]
+        assert set(cuts) == {"1", "2"}
+        for k, cut in cuts.items():
+            assert set(cut) == {"items", "tokens"}
+            # Not bounded by the open block's count: a cut that drops an entry adds a line.
+            assert isinstance(cut["tokens"], int) and cut["tokens"] > 0
+            assert 1 <= len({item["ref"] for item in cut["items"]}) <= int(k)
+            assert all(set(item) == {"ref", "kind", "id", "score", "rank"} for item in cut["items"])
+
+
+# -- run_settings ------------------------------------------------------------------------------
+
+_BASE = MemoryConfig(deadline_ms=10_000, need_gate="off")
+
+
+def _fake_gate(tmp_path: Path, *, b: float) -> NeedGate:
+    model = load_models(_fake_model(tmp_path, b=b))[0]
+    return NeedGate(
+        TokenEmbedder(),
+        load_bank(),
+        model,
+        embedder_name=FAKE_EMBEDDER_NAME,
+        embedder_revision=FAKE_EMBEDDER_REVISION,
+        query_prefix="",
+        shares_query_vector=True,
+    )
+
+
+def _settings(tmp_path: Path) -> tuple[RunSetting, RunSetting]:
+    """An ungated setting and a gated one that selects fewer candidates."""
+    gated = replace(_BASE, need_gate="on", select_k=5)
+    return RunSetting(_BASE, None), RunSetting(gated, _fake_gate(tmp_path, b=0.0))
+
+
+def _some_probes(fixture: Fixture) -> tuple[object, ...]:
+    """Every tenth probe and every probe at a later `now` than the first, without repeats."""
+    first = fixture.probes[0].now
+    chosen = [*fixture.probes[::10], *(p for p in fixture.probes if p.now != first)]
+    return tuple({probe.probe_id: probe for probe in chosen}.values())
+
+
+def _strip(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [{k: v for k, v in record.items() if k not in _LATENCY} for record in records]
+
+
+def _walk(tmp_path: Path, name: str, settings: tuple[RunSetting, ...], **kwargs: Any) -> Any:
+    workdir = tmp_path / name
+    workdir.mkdir()
+    fixture = kwargs.pop("fixture")
+    return asyncio.run(
+        run_settings(
+            fixture,
+            settings=settings,
+            embedder=TokenEmbedder(),
+            reranker=TokenReranker(),
+            workdir=workdir,
+            **kwargs,
+        )
+    )
+
+
+def _fetches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, MemoryRequest]]:
+    """Every `fetch_outcome` call of the run: the fetcher and its request, in order."""
+    seen: list[tuple[object, MemoryRequest]] = []
+    original = harness.MemoryFetcher.fetch_outcome
+
+    async def fetch_outcome(self: object, request: MemoryRequest) -> object:
+        seen.append((self, request))
+        return await original(self, request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(harness.MemoryFetcher, "fetch_outcome", fetch_outcome)
+    return seen
+
+
+def test_two_settings_in_one_walk_equal_two_separate_runs(tmp_path: Path) -> None:
+    fixture = Fixture.load()
+    probes = _some_probes(fixture)
+    settings = _settings(tmp_path)
+
+    together = _walk(tmp_path, "together", settings, fixture=fixture, probes=probes)
+    apart = []
+    for n, setting in enumerate(settings):
+        workdir = tmp_path / f"apart-{n}"
+        workdir.mkdir()
+        apart.append(
+            asyncio.run(
+                run_fixture(
+                    fixture,
+                    config=setting.config,
+                    need_gate=setting.need_gate,
+                    embedder=TokenEmbedder(),
+                    reranker=TokenReranker(),
+                    workdir=workdir,
+                    probes=probes,
+                )
+            )
+        )
+
+    assert [_strip(records) for records in together] == [_strip(records) for records in apart]
+    assert [len(records) for records in together] == [len(probes)] * 2
+    # The settings differ in what they serve, so the equality is not of two copies of one.
+    assert _strip(together[0]) != _strip(together[1])
+
+
+def test_settings_of_two_fact_views_are_refused(tmp_path: Path) -> None:
+    settings = (RunSetting(_BASE, None), RunSetting(replace(_BASE, fact_view="F2"), None))
+
+    with pytest.raises(ValueError, match="fact view"):
+        _walk(tmp_path, "views", settings, fixture=Fixture.load())
+
+
+def test_a_setting_has_a_gate_exactly_when_its_config_asks_for_one(tmp_path: Path) -> None:
+    gate = _fake_gate(tmp_path, b=0.0)
+
+    with pytest.raises(ValueError, match="need_gate"):
+        RunSetting(_BASE, gate)
+    for mode in ("on", "shadow"):
+        with pytest.raises(ValueError, match="need_gate"):
+            RunSetting(replace(_BASE, need_gate=mode), None)
+        assert RunSetting(replace(_BASE, need_gate=mode), gate).need_gate is gate
+
+
+def test_warm_up_runs_before_each_now_and_records_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = Fixture.load()
+    probes = _some_probes(fixture)
+    settings = _settings(tmp_path)
+    seen = _fetches(monkeypatch)
+
+    warm = _walk(tmp_path, "warm", settings, fixture=fixture, probes=probes, warm_up=True)
+    with_warm_up = list(seen)
+    seen.clear()
+    cold = _walk(tmp_path, "cold", settings, fixture=fixture, probes=probes)
+
+    assert [_strip(records) for records in warm] == [_strip(records) for records in cold]
+    ups = [
+        (fetcher, request)
+        for fetcher, request in with_warm_up
+        if request.query_text == harness.WARM_UP_QUERY
+    ]
+    nows = sorted({probe.now for probe in probes})
+    assert [request.now for _, request in ups] == nows
+    assert len(with_warm_up) == len(seen) + len(nows)
+    # Each warm-up goes through the first setting's fetcher, before that `now`'s probes.
+    first_fetcher = next(f for f, r in with_warm_up if r.query_text != harness.WARM_UP_QUERY)
+    assert all(fetcher is first_fetcher for fetcher, _ in ups)
+    assert with_warm_up[0][1].query_text == harness.WARM_UP_QUERY
+    assert len({request.session_id for _, request in ups}) == len(nows)
+
+
+def test_each_followup_runs_two_fetches_per_setting_in_its_own_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = Fixture.load()
+    probes = _some_probes(fixture)[:5]
+    followups = (
+        ("cat", "I adopted a cat called Miso last week", "what does she like to eat?"),
+        ("trip", "We are planning the coast trip again", "where did we stay last time?"),
+    )
+    seen = _fetches(monkeypatch)
+
+    runs = _walk(
+        tmp_path,
+        "followups",
+        _settings(tmp_path),
+        fixture=fixture,
+        probes=probes,
+        followups=followups,
+    )
+
+    last = max(probe.now for probe in fixture.probes)
+    for n, records in enumerate(runs):
+        assert [r["probe_id"] for r in records[: len(probes)]] == [p.probe_id for p in probes]
+        tail = records[len(probes) :]
+        assert [(r["followup_id"], r["turn"]) for r in tail] == [
+            ("cat", "previous"),
+            ("cat", "query"),
+            ("trip", "previous"),
+            ("trip", "query"),
+        ]
+        for record in tail:
+            assert set(record) == {"followup_id", "turn", "need", *_LATENCY}
+            assert (record["need"] is None) == (n == 0)
+    for followup_id, previous, query in followups:
+        calls = [(f, r) for f, r in seen if r.session_id == f"followup-{followup_id}"]
+        assert len(calls) == 4
+        fetchers = [f for f, _ in calls]
+        assert fetchers[0] is fetchers[1] and fetchers[2] is fetchers[3]
+        assert fetchers[0] is not fetchers[2]
+        for pair in (calls[:2], calls[2:]):
+            (_, first), (_, second) = pair
+            assert (first.query_text, first.recent_user_turns) == (previous, ())
+            assert (second.query_text, second.recent_user_turns) == (query, (previous,))
+            assert first.now == second.now == last

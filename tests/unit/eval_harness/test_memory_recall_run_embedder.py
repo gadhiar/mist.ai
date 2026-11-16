@@ -53,6 +53,13 @@ def _vector(text: str) -> np.ndarray:
 
 
 @pytest.fixture(autouse=True)
+def _gate_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A run without `--need-gate` takes the config's mode, `on` by default, and no gate model
+    # file ships yet; these runs measure placement, so the gate is off through the environment.
+    monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "off")
+
+
+@pytest.fixture(autouse=True)
 def recording(monkeypatch: pytest.MonkeyPatch) -> type[RecordingSentenceTransformer]:
     RecordingSentenceTransformer.instances = []
     monkeypatch.setattr(harness, "SentenceTransformer", RecordingSentenceTransformer)

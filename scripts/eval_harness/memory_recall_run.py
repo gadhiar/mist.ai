@@ -71,6 +71,27 @@ or note its unbounded search ranks, its fused and shortlist positions, its dispo
 oracle logit from the reranker with no deadline (`ProbeTracer`). The trace's own work runs
 after each fetch returns, never inside the timed path.
 
+`--fact-view` sets the fact view the index embeds, overriding the config's.
+
+The need gate: `--need-gate on|shadow|off` overrides the config's mode, which without the flag
+is `MIST_MEMORY_NEED_GATE`'s, `on` by default. `--need-embedder shared` (the default) builds the
+gate on the fact embedder, sharing the fetch's query vector; its name and revision for the
+gate's key are the fact embedder's entry in `--models-lock` with `--embedder real`, and
+`FAKE_EMBEDDER_NAME` and `FAKE_EMBEDDER_REVISION` with `--embedder fake`. `--need-embedder PATH`
+loads a gate embedder from a directory under `/opt/models` on the CPU, as
+`EmbeddingGenerator(PATH, device="cpu", **need_embedder_kwargs(spec))`, and needs
+`--need-embedder-name` (a `NEED_EMBEDDERS` name, whose spec gives the query prefix and the
+attention setting) and `--need-embedder-revision`; both are refused with `shared`. The gate's
+model is the record for its key in `--need-model`, by default the shipped need_model.json; with
+the gate on or shadow and no such record the run exits 2 naming `--need-model`. With the gate
+off neither the need bank nor the model file is read. `--need-context on|off` overrides the
+config's `need_context`. Each record then carries `need`, the fetch's `NeedTrace` fields (None
+with the gate off), and `stage_ids`; a shadow record whose fetch built a block also carries
+`cuts`, the blocks a band turn would be served (`outcome_record`).
+
+`run_settings` runs several settings, each a config and its gate, over one walk of the fixture,
+so they share the index and its updates; the harness's command line runs one.
+
 Usage, from the repository root (`/app` in the image), so `backend` imports:
     python -m scripts.eval_harness.memory_recall_run --output run.jsonl
         [--embedder fake|real] [--reranker fake|real] [--device cpu|cuda]
@@ -79,7 +100,9 @@ Usage, from the repository root (`/app` in the image), so `backend` imports:
         [--vram-log FILE [--vram-stt MODEL]] [--rescan-facts N --rescan-log FILE]
         [--trace FILE] [--block-tokens N] [--rerank-top-n N] [--select-k N]
         [--facets on|off] [--list-max-items N] [--deadline-ms N] [--fixture-dir DIR]
-        [--probes FILE]
+        [--probes FILE] [--fact-view F0|F1|F2|F3] [--need-gate on|shadow|off]
+        [--need-embedder shared|PATH [--need-embedder-name NAME --need-embedder-revision SHA]]
+        [--models-lock FILE] [--need-model FILE] [--need-context on|off]
 """
 
 from __future__ import annotations
@@ -108,8 +131,10 @@ import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from backend.chat.context_budget import ApproximateTokenCounter
-from backend.errors import MistError
+from backend.errors import MemoryConfigError, MistError
+from backend.interfaces import EmbeddingProvider
 from backend.knowledge.config import SidecarIndexConfig
+from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
 from backend.memory.block import BlockPlacement, MemoryBlockBuilder, PlacedList
 from backend.memory.config import MemoryConfig
 from backend.memory.fact_index import DiffReport, FactIndex, IndexedFact
@@ -124,9 +149,29 @@ from backend.memory.fetcher import (
 )
 from backend.memory.fts import query_tokens
 from backend.memory.index_db import EMBEDDING_DIMENSION, open_index, open_reader
-from backend.memory.models import FactRow, MemoryRequest, MemoryResult, NoteSource
+from backend.memory.models import (
+    FactRow,
+    FetchTimings,
+    MemoryRequest,
+    MemoryResult,
+    NeedTrace,
+    NoteSource,
+)
+from backend.memory.need_gate import (
+    NEED_EMBEDDERS,
+    NeedBank,
+    NeedEmbedderSpec,
+    NeedGate,
+    NeedKey,
+    NeedModel,
+    load_bank,
+    load_models,
+    need_embedder_kwargs,
+    select_model,
+)
 from backend.memory.ranking import FusedCandidate, ScoredCandidate
 from backend.memory.rerank import CrossEncoderReranker, Reranker
+from backend.memory.retrieval_view import FACT_VIEWS
 from backend.memory.runtime import IndexStateProbe, build_memory_executors
 from backend.memory.sources import (
     ENTITY_POOL,
@@ -140,6 +185,7 @@ from backend.memory.sources import (
     note_item_id,
 )
 from backend.vault.sidecar_index import VaultSidecarIndex
+from scripts.check_models_lock import LockError, parse_lock
 from scripts.eval_harness.memory_recall import (
     FIXTURE_DIR,
     Correction,
@@ -157,6 +203,17 @@ from scripts.eval_harness.memory_recall import (
 MODELS_ROOT = Path("/opt/models")
 EMBEDDER_PATH = MODELS_ROOT / "all-MiniLM-L6-v2"
 EMBEDDING_MODEL_ID = "all-MiniLM-L6-v2"
+# The lock the image copies beside the models (Dockerfile, the model layer's COPY).
+DEFAULT_MODELS_LOCK = MODELS_ROOT / "models.lock"
+
+# The fake embedder's name and revision in a shared need gate's key. `TokenEmbedder` has no
+# weights, so its revision names the hashing it embeds by; change it with the vectors, so a gate
+# model fit to the old vectors no longer matches the key.
+FAKE_EMBEDDER_NAME = "token-embedder"
+FAKE_EMBEDDER_REVISION = "content-stems-sha256-v1"
+
+# What `run_settings`'s warm-up fetch asks.
+WARM_UP_QUERY = "what do you remember about me"
 
 ModelChoice = Literal["fake", "real"]
 Device = Literal["cpu", "cuda"]
@@ -722,12 +779,7 @@ def run_record(
         "tokens": result.tokens,
         "budget_tokens": result.budget_tokens,
         "critical_path_ms": round(timings.total_ms, 3),
-        "timings_ms": {
-            "stage1": round(timings.stage1_ms, 3),
-            "stage2": round(timings.stage2_ms, 3),
-            "rerank": round(timings.rerank_ms, 3),
-            "queue_wait": round(timings.queue_wait_ms, 3),
-        },
+        "timings_ms": _timings_ms(timings),
         "reranked": result.reranked,
         # The stage records one candidate per scored shortlist entry, capped, and counts the rest.
         "shortlisted": len(result.stage.candidates) + result.stage.truncated,
@@ -735,6 +787,94 @@ def run_record(
         "delta_tokens_est": counter.count(result.block_text or "") + counter.count(probe.query),
         "cpu_load_procs": cpu_load_procs,
         "embedder_device": embedder_device,
+    }
+
+
+def _timings_ms(timings: FetchTimings) -> dict[str, float]:
+    return {
+        "stage1": round(timings.stage1_ms, 3),
+        "stage2": round(timings.stage2_ms, 3),
+        "rerank": round(timings.rerank_ms, 3),
+        "queue_wait": round(timings.queue_wait_ms, 3),
+    }
+
+
+def need_json(need: NeedTrace | None) -> dict[str, object] | None:
+    """The `NeedTrace`'s fields as the run file holds them, its tuples as lists; None for none."""
+    if need is None:
+        return None
+    values: dict[str, object] = {}
+    for f in fields(need):
+        value = getattr(need, f.name)
+        values[f.name] = list(value) if isinstance(value, tuple) else value
+    return values
+
+
+def stage_ids(outcome: FetchOutcome) -> dict[str, list[str]]:
+    """Each stage's candidates as `kind:id`, in the stage's order.
+
+    `fused` is `FetchOutcome.fused` (pool order, before the `rerank_top_n` cut), `shortlisted`
+    is `FetchOutcome.ranked` (the shortlist after its drops, in position order) and `selected`
+    is `FetchOutcome.selected` (selection and expansion, in packing order), so a reader can see
+    at which stage an item left. All three are empty when stage 2 did not run.
+    """
+
+    def ids(entries: Sequence[FusedCandidate] | Sequence[ScoredCandidate]) -> list[str]:
+        return [f"{entry.candidate.kind}:{entry.candidate.item_id}" for entry in entries]
+
+    return {
+        "fused": ids(outcome.fused),
+        "shortlisted": ids(outcome.ranked),
+        "selected": ids(outcome.selected),
+    }
+
+
+def outcome_record(
+    probe: Probe,
+    outcome: FetchOutcome,
+    *,
+    counter: ApproximateTokenCounter,
+    cpu_load_procs: int,
+    embedder_device: Device,
+) -> dict[str, object]:
+    """`run_record` of a fetch's block, with the need gate's decision, stage ids and cuts.
+
+    `need` is `need_json` of the stage's `NeedTrace`, None when the fetch had no gate.
+    `stage_ids` is `stage_ids(outcome)`. `cuts` is present only when the outcome carries cut
+    blocks, which the fetcher builds in shadow mode for a fetch that built a block: for each
+    `band_k`, the cut block's items as `run_items` writes them and its token count.
+    """
+    record = run_record(
+        probe,
+        outcome.result,
+        outcome.lists,
+        counter=counter,
+        cpu_load_procs=cpu_load_procs,
+        embedder_device=embedder_device,
+        selected=outcome.selected,
+    )
+    record["need"] = need_json(outcome.result.stage.need)
+    record["stage_ids"] = stage_ids(outcome)
+    if outcome.cuts:
+        record["cuts"] = {
+            str(k): {
+                "items": run_items(cut.result, cut.lists, outcome.selected),
+                "tokens": cut.result.tokens,
+            }
+            for k, cut in sorted(outcome.cuts.items())
+        }
+    return record
+
+
+def followup_record(followup_id: str, turn: str, outcome: FetchOutcome) -> dict[str, object]:
+    """One fetch of a follow-up pair: which pair and turn, the gate's decision, its latency."""
+    timings = outcome.result.timings
+    return {
+        "followup_id": followup_id,
+        "turn": turn,
+        "need": need_json(outcome.result.stage.need),
+        "critical_path_ms": round(timings.total_ms, 3),
+        "timings_ms": _timings_ms(timings),
     }
 
 
@@ -1354,6 +1494,111 @@ class ProbeTracer:
         self._handle.flush()
 
 
+@dataclass(frozen=True, slots=True)
+class RunSetting:
+    """One fetcher's settings in a walk of the fixture.
+
+    Attributes:
+        config: The fetcher's and its block builder's memory settings. Its `need_gate` is the
+            gate's mode, and its `need_context` is passed to the fetcher.
+        need_gate: The gate, set exactly when `config.need_gate` is `on` or `shadow`.
+
+    Raises:
+        ValueError: A gate with `config.need_gate` off, or none with it on or shadow, so a
+            setting never runs ungated while its config says it is gated.
+    """
+
+    config: MemoryConfig
+    need_gate: NeedGate | None
+
+    def __post_init__(self) -> None:
+        gated = self.config.need_gate != "off"
+        if gated != (self.need_gate is not None):
+            given = "a gate" if self.need_gate is not None else "no gate"
+            raise ValueError(
+                f"a setting with need_gate {self.config.need_gate!r} was given {given}; it has "
+                "a gate exactly when need_gate is on or shadow"
+            )
+
+
+def _need_mode(config: MemoryConfig) -> Literal["on", "shadow"]:
+    # The fetcher reads its mode only when it has a gate; an `off` setting has none.
+    return "shadow" if config.need_gate == "shadow" else "on"
+
+
+def _check_settings(settings: Sequence[RunSetting]) -> None:
+    """Refuse settings that cannot share one index: it embeds one fact view in one zone."""
+    if not settings:
+        raise ValueError("a walk of the fixture needs at least one setting")
+    views = sorted({setting.config.fact_view for setting in settings})
+    if len(views) > 1:
+        raise ValueError(f"the settings of one walk share one fact view, got {views}")
+    zones = {setting.config.tz for setting in settings}
+    if len(zones) > 1:
+        raise ValueError(f"the settings of one walk share one zone, got {sorted(map(str, zones))}")
+
+
+async def run_settings(
+    fixture: Fixture,
+    *,
+    settings: Sequence[RunSetting],
+    embedder: TokenEmbedder | SentenceTransformerEmbedder,
+    reranker: Reranker,
+    workdir: Path,
+    probes: Sequence[Probe] | None = None,
+    cpu_load_procs: int = 0,
+    embedder_device: Device = "cpu",
+    placement: BlockPlacement = "user_prefix",
+    rescan: ForcedRescan | None = None,
+    warm_up: bool = False,
+    followups: Sequence[tuple[str, str, str]] = (),
+) -> list[list[dict[str, object]]]:
+    """Run each probe through one fetcher per setting, over one walk of the indexes.
+
+    The index and the sidecar are built once in `workdir` and brought to each `now` once; at
+    each `now` every probe of that `now` runs through each setting's fetcher, in the settings'
+    order. The fetchers share the models, the executors and the indexes, and each has its own
+    sessions and block builder.
+
+    Args:
+        settings: The settings; they share one fact view and one zone, which the index is
+            built with.
+        embedder_device: The device the embedder is on, written in each probe record.
+        placement: The placement every block builder words the block for.
+        rescan: Forced rescans for the whole walk, as `run_fixture`'s.
+        warm_up: Before each `now`'s probes, one fetch of `WARM_UP_QUERY` through the first
+            setting's fetcher, in a session of its own and recorded nowhere, so no setting's
+            latency carries the first read after an index update.
+        followups: `(id, previous, query)` triples. At the fixture's last `now` (its latest
+            probe's, walked even when `probes` leaves it out), each runs through each setting's
+            fetcher as two fetches in session `followup-<id>`: `previous` with no recent turn,
+            then `query` with `previous` as its one recent user turn.
+
+    Returns:
+        Per setting, in order: one record per probe (`outcome_record`), in the order of
+        `probes` (all the fixture's by default), then two records per follow-up
+        (`followup_record`), `previous` then `query`, in the order of `followups`.
+
+    Raises:
+        ValueError: No setting, or settings of two fact views or two zones.
+    """
+    return await _walk(
+        fixture,
+        settings=tuple(settings),
+        embedder=embedder,
+        reranker=reranker,
+        workdir=workdir,
+        probes=probes,
+        cpu_load_procs=cpu_load_procs,
+        embedder_device=embedder_device,
+        placement=placement,
+        rescan=rescan,
+        trace=None,
+        warm_up=warm_up,
+        followups=tuple(followups),
+    )
+
+
 async def run_fixture(
     fixture: Fixture,
     *,
@@ -1367,6 +1612,7 @@ async def run_fixture(
     placement: BlockPlacement = "user_prefix",
     rescan: ForcedRescan | None = None,
     trace: TraceSetup | None = None,
+    need_gate: NeedGate | None = None,
 ) -> list[dict[str, object]]:
     """Run each probe through a real fetcher over indexes built in `workdir`.
 
@@ -1378,11 +1624,58 @@ async def run_fixture(
             run; started here and stopped before the executors shut down.
         trace: Write the per-probe candidate trace (`ProbeTracer`); the fetcher then gets
             recording wrappers of the embedder and the reranker.
+        need_gate: The need gate, run in `config.need_gate`'s mode; set exactly when that is
+            `on` or `shadow` (`RunSetting`).
 
     Returns:
-        One record per probe, in the order of `probes` (all the fixture's by default).
+        One record per probe (`outcome_record`), in the order of `probes` (all the fixture's
+        by default).
+
+    Raises:
+        ValueError: A gate with `config.need_gate` off, or none with it on or shadow.
     """
+    runs = await _walk(
+        fixture,
+        settings=(RunSetting(config, need_gate),),
+        embedder=embedder,
+        reranker=reranker,
+        workdir=workdir,
+        probes=probes,
+        cpu_load_procs=cpu_load_procs,
+        embedder_device=embedder_device,
+        placement=placement,
+        rescan=rescan,
+        trace=trace,
+        warm_up=False,
+        followups=(),
+    )
+    return runs[0]
+
+
+async def _walk(
+    fixture: Fixture,
+    *,
+    settings: tuple[RunSetting, ...],
+    embedder: TokenEmbedder | SentenceTransformerEmbedder,
+    reranker: Reranker,
+    workdir: Path,
+    probes: Sequence[Probe] | None,
+    cpu_load_procs: int,
+    embedder_device: Device,
+    placement: BlockPlacement,
+    rescan: ForcedRescan | None,
+    trace: TraceSetup | None,
+    warm_up: bool,
+    followups: tuple[tuple[str, str, str], ...],
+) -> list[list[dict[str, object]]]:
+    """`run_settings`, and with one setting `run_fixture`, whose trace needs one fetcher."""
+    _check_settings(settings)
+    if trace is not None and len(settings) != 1:
+        raise ValueError("the trace follows one fetcher, so it needs exactly one setting")
+    first = settings[0].config
     chosen = tuple(probes if probes is not None else fixture.probes)
+    last = max(probe.now for probe in fixture.probes) if followups else None
+    nows = sorted({probe.now for probe in chosen} | ({last} if last is not None else set()))
     counter = ApproximateTokenCounter()
     index_path = workdir / "memory_index.db"
     writer = open_index(index_path, embedding_model_id=EMBEDDING_MODEL_ID)
@@ -1400,7 +1693,9 @@ async def run_fixture(
     )
     tracer: ProbeTracer | None = None
     try:
-        index = FactIndex(writer, embedder, tz=config.tz, reader=reader)
+        index = FactIndex(
+            writer, embedder, tz=first.tz, reader=reader, view=FACT_VIEWS[first.fact_view]
+        )
         fetch_embedder: TokenEmbedder | SentenceTransformerEmbedder | RecordingEmbedder = embedder
         fetch_reranker: Reranker = reranker
         if trace is not None:
@@ -1417,59 +1712,94 @@ async def run_fixture(
                 recorded_embedder=recorded_embedder,
                 recorded_reranker=recorded_reranker,
                 executors=pools,
-                config=config,
+                config=first,
             )
-        fetcher = MemoryFetcher(
-            index=index,
-            embedder=fetch_embedder,
-            reranker=fetch_reranker,
-            block_builder=MemoryBlockBuilder(counter=counter, config=config, placement=placement),
-            config=config,
-            executors=pools,
-            # No gate and no follow-up path: every figure is the ungated fetch's.
-            need_gate=None,
-            need_mode="on",
-            need_context=False,
-            clock=SystemClock(),
-            index_state=probe_state,
-            notes=VaultCandidates(sidecar, vault_root=str(workdir / "vault"), tz=config.tz),
-        )
+        notes = VaultCandidates(sidecar, vault_root=str(workdir / "vault"), tz=first.tz)
+        fetchers = [
+            MemoryFetcher(
+                index=index,
+                embedder=fetch_embedder,
+                reranker=fetch_reranker,
+                block_builder=MemoryBlockBuilder(
+                    counter=counter, config=setting.config, placement=placement
+                ),
+                config=setting.config,
+                executors=pools,
+                need_gate=setting.need_gate,
+                need_mode=_need_mode(setting.config),
+                need_context=setting.config.need_context,
+                clock=SystemClock(),
+                index_state=probe_state,
+                notes=notes,
+            )
+            for setting in settings
+        ]
         apply = index.diff_apply
         if rescan is not None:
             rescan.start(index, executors[INDEX_EXECUTOR])
             apply = rescan.apply
-        records: dict[str, dict[str, object]] = {}
+        records: list[dict[str, dict[str, object]]] = [{} for _ in settings]
+        followed: list[list[dict[str, object]]] = [[] for _ in settings]
         indexed_notes: set[str] = set()
-        for now in sorted({probe.now for probe in chosen}):
+        for step, now in enumerate(nows):
             apply(facts_known_at(fixture.facts, fixture.corrections, now))
             for path, note in notes_known_at(fixture.notes, now).items():
                 if path not in indexed_notes:
                     sidecar.upsert_file(path, note.content, note.mtime, note.frontmatter)
                     indexed_notes.add(path)
-            for probe in (p for p in chosen if p.now == now):
-                outcome = await fetcher.fetch_outcome(
+            if warm_up:
+                # A session per `now`: one reused across them would serve its cached block.
+                await fetchers[0].fetch_outcome(
                     MemoryRequest(
-                        session_id=f"probe-{probe.probe_id}",
+                        session_id=f"warm-up-{step}",
                         conversation_id=None,
-                        query_text=probe.query,
-                        now=probe.now,
+                        query_text=WARM_UP_QUERY,
+                        now=now,
                         recent_user_turns=(),
                         turn_index=0,
-                        conversation_start=probe.conversation_start,
                     )
                 )
-                records[probe.probe_id] = run_record(
-                    probe,
-                    outcome.result,
-                    outcome.lists,
-                    counter=counter,
-                    cpu_load_procs=cpu_load_procs,
-                    embedder_device=embedder_device,
-                    selected=outcome.selected,
+            for probe in (p for p in chosen if p.now == now):
+                request = MemoryRequest(
+                    session_id=f"probe-{probe.probe_id}",
+                    conversation_id=None,
+                    query_text=probe.query,
+                    now=probe.now,
+                    recent_user_turns=(),
+                    turn_index=0,
+                    conversation_start=probe.conversation_start,
                 )
-                if tracer is not None:
-                    await tracer.trace(probe, outcome, indexed_notes=indexed_notes)
-        return [records[probe.probe_id] for probe in chosen]
+                for n, fetcher in enumerate(fetchers):
+                    outcome = await fetcher.fetch_outcome(request)
+                    records[n][probe.probe_id] = outcome_record(
+                        probe,
+                        outcome,
+                        counter=counter,
+                        cpu_load_procs=cpu_load_procs,
+                        embedder_device=embedder_device,
+                    )
+                    if tracer is not None:
+                        await tracer.trace(probe, outcome, indexed_notes=indexed_notes)
+            if now == last:
+                for followup_id, previous, query in followups:
+                    turns = (("previous", previous, ()), ("query", query, (previous,)))
+                    for n, fetcher in enumerate(fetchers):
+                        for turn_index, (turn, text, recent) in enumerate(turns):
+                            outcome = await fetcher.fetch_outcome(
+                                MemoryRequest(
+                                    session_id=f"followup-{followup_id}",
+                                    conversation_id=None,
+                                    query_text=text,
+                                    now=now,
+                                    recent_user_turns=recent,
+                                    turn_index=turn_index,
+                                )
+                            )
+                            followed[n].append(followup_record(followup_id, turn, outcome))
+        return [
+            [records[n][probe.probe_id] for probe in chosen] + followed[n]
+            for n in range(len(settings))
+        ]
     finally:
         if rescan is not None:
             rescan.stop()
@@ -1908,7 +2238,126 @@ def config_from_args(args: argparse.Namespace) -> MemoryConfig:
         overrides["facets"] = args.facets == "on"
     if args.rerank_model is not None:
         overrides["rerank_model"] = _model_path(args.rerank_model)
+    if args.fact_view is not None:
+        overrides["fact_view"] = args.fact_view
+    if args.need_gate is not None:
+        overrides["need_gate"] = args.need_gate
+    if args.need_context is not None:
+        overrides["need_context"] = args.need_context == "on"
+    need_embedder = "shared" if args.need_embedder == "shared" else args.need_embedder_name
+    if need_embedder is not None:
+        overrides["need_embedder"] = need_embedder
     return replace(config, **overrides) if overrides else config
+
+
+@dataclass(frozen=True, slots=True)
+class NeedGatePlan:
+    """What the run's need gate is built from, read and checked before any model loads.
+
+    Attributes:
+        bank: The need bank, read once.
+        model: The model file's record for the gate's key.
+        spec: The gate embedder's `NEED_EMBEDDERS` spec: its query prefix and attention setting.
+        embedder_path: The gate embedder's directory; None for `shared`, which is the fact
+            embedder itself.
+        embedder_name: The gate embedder's name in the key.
+        embedder_revision: Its revision in the key.
+    """
+
+    bank: NeedBank
+    model: NeedModel
+    spec: NeedEmbedderSpec
+    embedder_path: str | None
+    embedder_name: str
+    embedder_revision: str
+
+
+def _locked_entry(parser: argparse.ArgumentParser, lock: Path, name: str) -> tuple[str, str]:
+    """`name`'s name and revision in the models lock; exit 2 naming `--models-lock` without."""
+    try:
+        entries = parse_lock(lock)
+    except LockError as exc:
+        parser.error(f"--models-lock: {exc}")
+    for entry in entries:
+        if entry.name == name:
+            return entry.name, entry.revision
+    parser.error(f"--models-lock: {lock} has no entry named {name!r}, the fact embedder")
+
+
+def plan_need_gate(
+    args: argparse.Namespace, config: MemoryConfig, parser: argparse.ArgumentParser
+) -> NeedGatePlan | None:
+    """Read the bank and the gate model, and pick the record for the run's key.
+
+    None with the gate off: then nothing is read, neither the bank, the model file nor the
+    lock. A `shared` gate's name and revision are the fact embedder's: its entry in
+    `--models-lock` with `--embedder real`, the `FAKE_EMBEDDER_*` constants with the fake. A
+    gate embedder given by path has the name and revision its flags give. The query prefix is
+    the spec's of `config.need_embedder`.
+
+    Exits 2 (`parser.error`) for an unreadable lock or one without the fact embedder, naming
+    `--models-lock`; for a bank `load_bank` refuses; and for a model file `load_models` refuses
+    or one with no record for the key, naming `--need-model`.
+    """
+    if config.need_gate == "off":
+        return None
+    spec = NEED_EMBEDDERS[config.need_embedder]
+    path: str | None = None
+    if args.need_embedder != "shared":
+        name, revision = args.need_embedder_name, args.need_embedder_revision
+        path = _model_path(args.need_embedder)
+    elif args.embedder == "fake":
+        name, revision = FAKE_EMBEDDER_NAME, FAKE_EMBEDDER_REVISION
+    else:
+        name, revision = _locked_entry(parser, args.models_lock, EMBEDDER_PATH.name)
+    try:
+        bank = load_bank()
+    except MemoryConfigError as exc:
+        parser.error(f"the need bank: {exc}")
+    key = NeedKey(bank.sha256, name, revision, spec.query_prefix)
+    try:
+        model = select_model(load_models(args.need_model), key)
+    except MemoryConfigError as exc:
+        parser.error(f"--need-model: {exc}")
+    return NeedGatePlan(
+        bank=bank,
+        model=model,
+        spec=spec,
+        embedder_path=path,
+        embedder_name=name,
+        embedder_revision=revision,
+    )
+
+
+def build_need_gate(
+    plan: NeedGatePlan, fact_embedder: TokenEmbedder | SentenceTransformerEmbedder
+) -> NeedGate:
+    """The gate the plan describes; it embeds the bank once, here.
+
+    A `shared` gate is built on the fact embedder and shares the fetch's query vector. A gate
+    embedder given by path loads on the CPU, as deployed, with exactly
+    `need_embedder_kwargs(plan.spec)` beyond its path and device.
+
+    Raises:
+        MemoryConfigError: The gate refuses the model (`NeedGate`).
+    """
+    if plan.embedder_path is None:
+        embedder: EmbeddingProvider = fact_embedder
+        shares = True
+    else:
+        embedder = EmbeddingGenerator(
+            plan.embedder_path, device="cpu", **need_embedder_kwargs(plan.spec)
+        )
+        shares = False
+    return NeedGate(
+        embedder,
+        plan.bank,
+        plan.model,
+        embedder_name=plan.embedder_name,
+        embedder_revision=plan.embedder_revision,
+        query_prefix=plan.spec.query_prefix,
+        shares_query_vector=shares,
+    )
 
 
 def _positive_int(text: str) -> int:
@@ -1970,7 +2419,76 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--probes", type=Path, help="probe file to run; defaults to the fixture's probes.jsonl"
     )
+    parser.add_argument(
+        "--fact-view", choices=tuple(FACT_VIEWS), help="the fact view the index embeds"
+    )
+    parser.add_argument(
+        "--need-gate",
+        choices=("on", "shadow", "off"),
+        help="the need gate's mode; defaults to the config's (MIST_MEMORY_NEED_GATE)",
+    )
+    parser.add_argument(
+        "--need-embedder",
+        default="shared",
+        metavar="shared|PATH",
+        help="shared builds the gate on the fact embedder; a PATH under /opt/models loads one",
+    )
+    parser.add_argument(
+        "--need-embedder-name",
+        choices=tuple(name for name in NEED_EMBEDDERS if name != "shared"),
+        help="the gate embedder's NEED_EMBEDDERS name; with a --need-embedder PATH only",
+    )
+    parser.add_argument(
+        "--need-embedder-revision",
+        metavar="SHA",
+        help="the gate embedder's revision; with a --need-embedder PATH only",
+    )
+    parser.add_argument(
+        "--models-lock",
+        type=Path,
+        default=DEFAULT_MODELS_LOCK,
+        help="the lock giving a shared gate the fact embedder's revision with --embedder real",
+    )
+    parser.add_argument(
+        "--need-model",
+        type=Path,
+        help="gate model file in need_model.json's format; defaults to the shipped file",
+    )
+    parser.add_argument(
+        "--need-context", choices=("on", "off"), help="judge a follow-up with its previous turn"
+    )
     return parser
+
+
+def _check_need_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse, with exit 2, a gate embedder's name or revision that does not fit its source.
+
+    `shared` takes the fact embedder's name and revision, so neither flag goes with it; a
+    PATH has no other source of them, so it needs both.
+    """
+    given = [
+        flag
+        for flag, value in (
+            ("--need-embedder-name", args.need_embedder_name),
+            ("--need-embedder-revision", args.need_embedder_revision),
+        )
+        if value is not None
+    ]
+    if args.need_embedder == "shared":
+        if given:
+            parser.error(
+                f"{' and '.join(given)} go with a --need-embedder PATH; shared takes the fact "
+                "embedder's name and revision"
+            )
+        return
+    if len(given) < 2:
+        parser.error(
+            "a --need-embedder PATH needs --need-embedder-name and --need-embedder-revision"
+        )
+    try:
+        _model_path(args.need_embedder)
+    except ValueError as exc:
+        parser.error(f"--need-embedder: {exc}")
 
 
 def _check_gpu_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -2005,6 +2523,7 @@ def main(argv: Sequence[str] | None = None, *, gpu: GpuAccess | None = None) -> 
     if args.embedder_device is None:
         args.embedder_device = args.device
     _check_gpu_flags(parser, args)
+    _check_need_flags(parser, args)
     gpu = gpu if gpu is not None else default_gpu_access()
     if args.gpu_load_procs and not gpu.cuda.is_available():
         parser.error("--gpu-load-procs needs CUDA, which is not available")
@@ -2012,6 +2531,7 @@ def main(argv: Sequence[str] | None = None, *, gpu: GpuAccess | None = None) -> 
         torch.set_num_threads(args.threads)
     config = config_from_args(args)
     fixture = Fixture.load(args.fixture_dir, probes=args.probes)
+    need_plan = plan_need_gate(args, config, parser)
     rescan = (
         ForcedRescan(args.rescan_facts, rescan_template(fixture))
         if args.rescan_facts is not None
@@ -2019,7 +2539,7 @@ def main(argv: Sequence[str] | None = None, *, gpu: GpuAccess | None = None) -> 
     )
     vram = VramRecorder(gpu, stt_model=args.vram_stt) if args.vram_log is not None else None
     try:
-        records = _run(args, config, fixture, rescan, gpu, vram, parser)
+        records = _run(args, config, fixture, rescan, gpu, vram, parser, need_plan)
         vram_log = (
             vram.log(device=args.device, embedder_device=args.embedder_device)
             if vram is not None
@@ -2052,8 +2572,11 @@ def _run(
     gpu: GpuAccess,
     vram: VramRecorder | None,
     parser: argparse.ArgumentParser,
+    need_plan: NeedGatePlan | None,
 ) -> list[dict[str, object]]:
-    """Load the models and run the fixture under the asked-for load, reading the VRAM points."""
+    """Load the models, build the need gate, and run the fixture under the asked-for load,
+    reading the VRAM points.
+    """
     with cpu_load(args.cpu_load_procs), gpu.load_procs(args.gpu_load_procs):
         if vram is not None:
             try:
@@ -2062,6 +2585,12 @@ def _run(
                 parser.error(f"--vram-log: {exc}")
         embedder = build_embedder(args.embedder, device=args.embedder_device)
         built = build_reranker(args.reranker, device=args.device, config=config)
+        need_gate: NeedGate | None = None
+        if need_plan is not None:
+            try:
+                need_gate = build_need_gate(need_plan, embedder)
+            except MemoryConfigError as exc:
+                parser.error(f"the need gate: {exc}")
         if vram is not None:
             vram.read("loaded")
         trace = (
@@ -2086,6 +2615,7 @@ def _run(
                     placement=args.placement,
                     rescan=rescan,
                     trace=trace,
+                    need_gate=need_gate,
                 )
             )
         if vram is not None:
@@ -2099,19 +2629,25 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "DEFAULT_MODELS_LOCK",
     "EMBEDDER_PATH",
+    "FAKE_EMBEDDER_NAME",
+    "FAKE_EMBEDDER_REVISION",
+    "WARM_UP_QUERY",
     "BuiltReranker",
     "CrossEncoderCapture",
     "Fixture",
     "ForcedRescan",
     "GpuAccess",
     "GpuUnavailableError",
+    "NeedGatePlan",
     "NoteFile",
     "NvmlReader",
     "ProbeTracer",
     "PynvmlReader",
     "RecordingEmbedder",
     "RecordingReranker",
+    "RunSetting",
     "SentenceTransformerEmbedder",
     "SttModel",
     "TokenEmbedder",
@@ -2120,6 +2656,7 @@ __all__ = [
     "TraceSetup",
     "VramRecorder",
     "build_embedder",
+    "build_need_gate",
     "build_reranker",
     "content_stems",
     "cpu_load",
@@ -2127,17 +2664,23 @@ __all__ = [
     "dropped_dispositions",
     "fact_row",
     "facts_known_at",
+    "followup_record",
     "gpu_load",
     "load_whisper_model",
     "logit",
     "main",
     "matmul_loop",
+    "need_json",
     "notes_known_at",
+    "outcome_record",
+    "plan_need_gate",
     "rescan_template",
     "run_fixture",
     "run_items",
     "run_record",
+    "run_settings",
     "spin",
+    "stage_ids",
     "stt_clip",
     "synthetic_facts",
     "trace_header",
