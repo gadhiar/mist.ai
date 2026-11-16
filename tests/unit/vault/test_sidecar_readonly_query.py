@@ -276,3 +276,100 @@ def test_the_protocol_declares_query_hybrid_readonly_with_match():
     method = SidecarIndexProtocol.query_hybrid_readonly
     assert inspect.iscoroutinefunction(method)
     assert inspect.signature(method).parameters["match"].default == "all"
+
+
+# -- path_texts_readonly (mist-read-path T21): a note's whole text, for read-time suppression --
+
+_SECTIONED = (
+    "# Pottery\n\nIntro line.\n\n## Thursdays\n\nWheel course.\n\n## Studio\n\nKiln Street Pottery."
+)
+
+
+@pytest.mark.asyncio
+async def test_path_texts_joins_every_chunk_of_each_path_in_chunk_order(sidecar):
+    sidecar.upsert_file("hobbies/pottery.md", _SECTIONED, 3)
+    stored = sidecar._conn.execute(
+        "SELECT content FROM vault_chunks WHERE path = ? ORDER BY chunk_id",
+        ("hobbies/pottery.md",),
+    ).fetchall()
+    assert len(stored) > 1  # the file-level chunk and the heading-block chunks
+
+    texts = await sidecar.path_texts_readonly(["hobbies/pottery.md", "notes/garden.md"])
+
+    assert texts == {
+        "hobbies/pottery.md": "\n\n".join(row[0] for row in stored),
+        "notes/garden.md": "Tomatoes and basil in the raised bed.",
+    }
+    assert "Kiln Street Pottery" in texts["hobbies/pottery.md"]
+
+
+@pytest.mark.asyncio
+async def test_path_texts_leaves_out_a_path_the_sidecar_does_not_hold(sidecar):
+    assert await sidecar.path_texts_readonly(["notes/gone.md"]) == {}
+    assert await sidecar.path_texts_readonly([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_path_texts_runs_on_the_read_thread_and_returns_during_a_write(sidecar):
+    holding = threading.Event()
+    release = threading.Event()
+    seen: list[str] = []
+    rows = sidecar._path_texts
+
+    def recording(conn, paths):
+        seen.append(threading.current_thread().name)
+        return rows(conn, paths)
+
+    sidecar._path_texts = recording
+
+    def hold_a_write_transaction() -> None:
+        conn = sidecar._conn
+        conn.execute("BEGIN EXCLUSIVE")
+        try:
+            conn.execute("DELETE FROM vault_chunks")
+            holding.set()
+            release.wait(_WAIT_S)
+        finally:
+            conn.execute("ROLLBACK")
+
+    writer = asyncio.ensure_future(sidecar.run_async(hold_a_write_transaction))
+    try:
+        assert await asyncio.to_thread(holding.wait, _WAIT_S)
+        texts = await asyncio.wait_for(
+            sidecar.path_texts_readonly(["notes/garden.md"]), timeout=_WAIT_S / 2
+        )
+    finally:
+        release.set()
+        await writer
+
+    assert texts == {"notes/garden.md": "Tomatoes and basil in the raised bed."}
+    assert len(seen) == 1 and seen[0].startswith("vault-sidecar-read")
+
+
+@pytest.mark.asyncio
+async def test_path_texts_on_an_in_memory_index_reads_on_the_writer():
+    idx = _make_index(":memory:")
+    try:
+        idx.upsert_file("notes/garden.md", "Tomatoes and basil in the raised bed.", 2)
+
+        texts = await idx.path_texts_readonly(["notes/garden.md"])
+
+        assert idx._reader is None
+        assert texts == {"notes/garden.md": "Tomatoes and basil in the raised bed."}
+    finally:
+        idx.close()
+
+
+@pytest.mark.asyncio
+async def test_path_texts_before_initialize_raises(tmp_path):
+    config = SidecarIndexConfig(db_path=str(tmp_path / "sidecar.db"))
+    idx = VaultSidecarIndex(config, FakeEmbeddingGenerator(dimension=_EMBEDDING_DIMENSION))
+
+    with pytest.raises(SidecarIndexError):
+        await idx.path_texts_readonly(["notes/garden.md"])
+
+
+def test_the_protocol_declares_path_texts_readonly():
+    method = SidecarIndexProtocol.path_texts_readonly
+    assert inspect.iscoroutinefunction(method)
+    assert list(inspect.signature(method).parameters) == ["self", "paths"]

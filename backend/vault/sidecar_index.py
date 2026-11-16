@@ -23,10 +23,12 @@ Retrieval methods:
 - `query_hybrid`: Reciprocal Rank Fusion (RRF) merge of both.
 - `query_hybrid_readonly`: the same merge, async, on a second read-only
   connection with its own `vault-sidecar-read` thread.
+- `path_texts_readonly`: each named path's whole text, async, on that same
+  connection and thread.
 
 The database runs in WAL, so the read-only connection reads the last
 committed snapshot while the writer holds a transaction: the memory read
-path's per-turn query never waits behind a filewatcher reindex. Every other
+path's per-turn reads never wait behind a filewatcher reindex. Every other
 method is sync; async callers (filewatcher, ConversationHandler) route them
 through `run_async`, the writer's single worker thread.
 """
@@ -38,6 +40,7 @@ import re
 import sqlite3
 import struct
 import time
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
@@ -295,8 +298,8 @@ class VaultSidecarIndex:
         results = idx.query_hybrid(embedding, text, k=5)
         idx.close()               # release both connections
 
-    Public methods are synchronous except `run_async` and
-    `query_hybrid_readonly`. Call the others from async code via `run_async`.
+    Public methods are synchronous except `run_async`, `query_hybrid_readonly`
+    and `path_texts_readonly`. Call the others from async code via `run_async`.
 
     Implements `SidecarIndexProtocol` from `backend.interfaces`.
     """
@@ -322,10 +325,10 @@ class VaultSidecarIndex:
         # keeps sqlite access serialized.
         self._worker: ThreadPoolExecutor | None = None
         # Read-only second connection and its own single thread, for
-        # `query_hybrid_readonly`. The writer's worker is shared with the
-        # filewatcher's `upsert_file`, which embeds every chunk inside its
-        # write transaction, so a turn's query queued there waits for the
-        # whole reindex. Under WAL this connection reads the last committed
+        # `query_hybrid_readonly` and `path_texts_readonly`. The writer's
+        # worker is shared with the filewatcher's `upsert_file`, which embeds
+        # every chunk inside its write transaction, so a turn's query queued
+        # there waits for the whole reindex. Under WAL this connection reads the last committed
         # snapshot instead. Both are opened by `initialize` and released by
         # `close`; the connection is used only on the read thread.
         self._reader: sqlite3.Connection | None = None
@@ -437,7 +440,7 @@ class VaultSidecarIndex:
         logger.info("VaultSidecarIndex initialized at %s", db_path)
 
     def _open_reader(self, db_path: Path) -> sqlite3.Connection:
-        """Open the read-only connection `query_hybrid_readonly` runs on.
+        """Open the read-only connection the `*_readonly` reads run on.
 
         `mode=ro` makes a stray write fail instead of taking the write lock,
         and refuses to create a missing file. sqlite-vec is loaded because the
@@ -857,6 +860,54 @@ class VaultSidecarIndex:
             rrf_k,
             match,
         )
+
+    async def path_texts_readonly(self, paths: Collection[str]) -> dict[str, str]:
+        """Each path's whole indexed text, on the read-only connection and its read thread.
+
+        The memory read path judges a note by every chunk of its path, not only the chunk a
+        query returned, so a corrected name in another section still suppresses the note
+        (mist-read-path T21). A path's text is its chunks' contents in chunk order (the
+        file-level chunk, then the heading blocks as first indexed), joined by a blank line;
+        each chunk is cut at `chunk_max_chars` as indexed. It runs where
+        `query_hybrid_readonly` runs and for the same reason: a `:memory:` index has no
+        second connection and reads on the writer's worker.
+
+        Args:
+            paths: The stored `path` values, as a query row carries them.
+
+        Returns:
+            Path to text, for each path the index holds; a path it does not hold is absent.
+
+        Raises:
+            SidecarIndexError: The index is not initialized or the database fails.
+        """
+        self._require_connection()
+        wanted = list(dict.fromkeys(paths))
+        if self._reader is None:
+            return await self.run_async(self._path_texts, self._conn, wanted)
+        reader = self._reader
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._ensure_read_worker(), self._path_texts, reader, wanted
+        )
+
+    def _path_texts(self, conn: sqlite3.Connection, paths: list[str]) -> dict[str, str]:
+        """`path_texts_readonly`'s read, one statement and so one snapshot, on `conn`."""
+        if not paths:
+            return {}
+        marks = ", ".join("?" * len(paths))
+        try:
+            rows = conn.execute(
+                f"SELECT path, content FROM vault_chunks WHERE path IN ({marks}) "  # nosec B608
+                "ORDER BY chunk_id",
+                paths,
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise SidecarIndexError(f"path_texts_readonly failed: {exc}") from exc
+        chunks: dict[str, list[str]] = {}
+        for row in rows:
+            chunks.setdefault(row[0], []).append(row[1])
+        return {path: "\n\n".join(parts) for path, parts in chunks.items()}
 
     def _hybrid_in_snapshot(
         self,

@@ -71,9 +71,10 @@ RETIRED_MEMORY_ENV_VARS: Mapping[str, str] = {
     "MIST_MEMORY_WEIGHTS": "MIST_MEMORY_SELECT_K",
 }
 
-# Phase A variables, in `.env.example` order. Tests clear these to isolate a run, and the
-# `.env.example` check walks this tuple, so a new variable added here must be documented there.
-# `MIST_TIMEZONE` is shared with usage counting and is documented once, in its own section.
+# The read path's variables (Phase A's, then Phase C's corrections switch), in `.env.example`
+# order. Tests clear these to isolate a run, and the `.env.example` check walks this tuple, so
+# a new variable added here must be documented there. `MIST_TIMEZONE` is shared with usage
+# counting and is documented once, in its own section.
 MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_ENABLED",
     "MIST_MEMORY_BLOCK_TOKENS",
@@ -98,6 +99,7 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_NEED_GATE",
     "MIST_MEMORY_NEED_EMBEDDER",
     "MIST_MEMORY_NEED_CONTEXT",
+    "MIST_MEMORY_CORRECTIONS_ENABLED",
     USER_TIMEZONE_ENV,
 )
 
@@ -182,7 +184,7 @@ def _resolve_tz(load_zone: TzResolver | None) -> tuple[tzinfo, str | None]:
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfig:
-    """Phase A settings of the memory read path.
+    """Settings of the memory read path: Phase A's and Phase C's corrections switch.
 
     Attributes:
         enabled: False restores the legacy vault-only auto-inject.
@@ -232,6 +234,9 @@ class MemoryConfig:
         need_context: Whether a closed or band query that follows a fetch which served memory
             is also judged by the previous user turn joined to it, taking the higher
             probability.
+        corrections_enabled: Whether the fetch reads the correction log and suppresses what
+            it names (Phase C). False is the rollback lever: suppression stops, and the
+            recorded corrections stay in the log.
         tz: Zone used to read temporal phrases, from `MIST_TIMEZONE`. Resolved once in
             `from_env`.
         tz_name: The IANA name `tz` came from, or None when `tz` is UTC because
@@ -261,6 +266,7 @@ class MemoryConfig:
     need_gate: NeedGateMode = "on"
     need_embedder: NeedEmbedderName = "shared"
     need_context: bool = True
+    corrections_enabled: bool = True
     tz: tzinfo = UTC
     tz_name: str | None = None
 
@@ -302,6 +308,10 @@ class MemoryConfig:
         _require_choice("need_embedder", self.need_embedder, tuple(NEED_EMBEDDERS))
         if not isinstance(self.need_context, bool):
             raise MemoryConfigError(f"need_context must be a bool, got {self.need_context!r}")
+        if not isinstance(self.corrections_enabled, bool):
+            raise MemoryConfigError(
+                f"corrections_enabled must be a bool, got {self.corrections_enabled!r}"
+            )
         if self.rerank_backend == "remote":
             if not self.rerank_url:
                 raise MemoryConfigError("rerank_url is required when rerank_backend is remote")
@@ -318,7 +328,7 @@ class MemoryConfig:
 
     @classmethod
     def from_env(cls, *, tz_resolver: TzResolver | None = None) -> MemoryConfig:
-        """Load the Phase A settings from `MIST_MEMORY_*` variables and `MIST_TIMEZONE`.
+        """Load the settings from `MIST_MEMORY_*` variables and `MIST_TIMEZONE`.
 
         Args:
             tz_resolver: Replaces the zone lookup inside `resolve_user_timezone`, which turns
@@ -355,6 +365,7 @@ class MemoryConfig:
             need_gate=_env("MIST_MEMORY_NEED_GATE") or "on",  # type: ignore[arg-type]
             need_embedder=_env("MIST_MEMORY_NEED_EMBEDDER") or "shared",  # type: ignore[arg-type]
             need_context=_env_bool("MIST_MEMORY_NEED_CONTEXT", True),
+            corrections_enabled=_env_bool("MIST_MEMORY_CORRECTIONS_ENABLED", True),
             tz=tz,
             tz_name=tz_name,
         )

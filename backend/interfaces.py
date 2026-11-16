@@ -7,6 +7,7 @@ implementations can be swapped for test doubles via dependency injection.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -150,6 +151,10 @@ class SidecarIndexProtocol(Protocol):
         match: Literal["all", "any"] = "all",
     ) -> list[dict]:
         """`query_hybrid` on a read-only connection that never waits behind a reindex."""
+        ...
+
+    async def path_texts_readonly(self, paths: Collection[str]) -> dict[str, str]:
+        """Each held path's chunks joined in chunk order, on that read-only connection."""
         ...
 
     def chunk_count(self) -> int: ...

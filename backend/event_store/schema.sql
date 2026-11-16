@@ -325,3 +325,62 @@ CREATE TABLE IF NOT EXISTS instance_status_intervals (
     started_at TEXT NOT NULL,                 -- ISO-8601 UTC
     last_seen_at TEXT NOT NULL                -- ISO-8601 UTC
 );
+
+-- ---------------------------------------------------------------------------
+-- Memory corrections (mist-read-path T21, Design point 12). A forget or a
+-- correct of one fact, recorded by `backend/memory/corrections.py`'s
+-- CorrectionService and suppressed by the read path from the moment it is
+-- logged. `memory_corrections` is the log: append-only, which the two
+-- triggers below enforce, so a rebuild replays exactly what the user asked.
+-- `memory_corrections_applied` is the graph's progress through it, keyed by
+-- (correction_id, epoch_id) like `extraction_applied`, so the log rows never
+-- change and a new epoch sees every correction as unapplied. Both are new
+-- tables, so `CREATE TABLE IF NOT EXISTS` is the whole migration.
+--
+-- recorded_at is ISO-8601 UTC with microseconds, one fixed width, so the
+-- text order is the time order: the log lists by (recorded_at,
+-- correction_id). source_event_id is the turn that issued the correction,
+-- NULL for one with no turn (ws, cli) or whose turn could not be appended.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_corrections (
+    correction_id TEXT PRIMARY KEY,           -- 'corr-' + uuid4 hex
+    recorded_at TEXT NOT NULL,                -- ISO-8601 UTC, microseconds
+    action TEXT NOT NULL CHECK (action IN ('forget', 'correct')),
+    fact_key TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    subject_name TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    object_name TEXT NOT NULL,
+    replacement_object_name TEXT,             -- set exactly for 'correct'
+    surface TEXT NOT NULL CHECK (surface IN ('ws', 'tool', 'cli')),
+    session_id TEXT,
+    conversation_id TEXT,
+    turn_index INTEGER,
+    source_event_id TEXT,
+    origin TEXT NOT NULL,
+    CHECK ((action = 'correct') = (replacement_object_name IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_corrections_order
+    ON memory_corrections(recorded_at, correction_id);
+
+CREATE TRIGGER IF NOT EXISTS memory_corrections_no_update
+BEFORE UPDATE ON memory_corrections
+BEGIN
+    SELECT RAISE(ABORT, 'memory_corrections is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_corrections_no_delete
+BEFORE DELETE ON memory_corrections
+BEGIN
+    SELECT RAISE(ABORT, 'memory_corrections is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS memory_corrections_applied (
+    correction_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'noop', 'unresolved')),
+    applied_at TEXT NOT NULL,                 -- ISO-8601
+    PRIMARY KEY (correction_id, epoch_id)
+);

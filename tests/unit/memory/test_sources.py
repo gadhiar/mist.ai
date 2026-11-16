@@ -610,6 +610,28 @@ def test_a_non_positive_k_is_refused(sidecar: VaultSidecarIndex) -> None:
         _source(sidecar, k=0)
 
 
+@pytest.mark.asyncio
+async def test_the_note_pool_reads_whole_note_texts_in_one_sidecar_read(
+    sidecar: VaultSidecarIndex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[tuple[str, ...]] = []
+    read = sidecar.path_texts_readonly
+
+    async def recording(paths):  # type: ignore[no-untyped-def]
+        asked.append(tuple(paths))
+        return await read(paths)
+
+    monkeypatch.setattr(sidecar, "path_texts_readonly", recording)
+
+    texts = await _source(sidecar).texts(["projects/kestrel.md", "notes/garden.md"])
+
+    assert asked == [("projects/kestrel.md", "notes/garden.md")]
+    assert set(texts) == {"projects/kestrel.md", "notes/garden.md"}
+    # Every chunk of the path: the file-level chunk and the `## Stack` block.
+    assert "uses rust" in texts["projects/kestrel.md"]
+    assert texts["notes/garden.md"] == "Tomatoes and basil grow well."
+
+
 def test_malformed_frontmatter_leaves_the_author_unknown() -> None:
     assert _authored_by(_frontmatter('{"authored_by": "user-edit"}')) == "user-edit"
     assert _frontmatter("{not json") is None

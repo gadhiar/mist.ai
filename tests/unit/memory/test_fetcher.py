@@ -26,6 +26,7 @@ from backend.errors import EmbeddingError, MemoryIndexError, MemoryRerankError
 from backend.knowledge.models import graph_ref, vault_ref
 from backend.memory.block import CLOSE_MARKER, HEADER, PARTIAL_LINE, MemoryBlockBuilder
 from backend.memory.config import MemoryConfig
+from backend.memory.corrections import Suppression
 from backend.memory.facets import facet_key
 from backend.memory.fact_index import FactGroup, FactIndex, IndexedFacet, IndexedFact
 from backend.memory.fetcher import (
@@ -251,12 +252,16 @@ class FailingEmbedder:
         raise EmbeddingError("embedder down")
 
 
+_FAR_FUTURE = datetime(9999, 12, 31, tzinfo=UTC)
+
+
 class StaticSuppression:
     def __init__(self, keys: frozenset[str]) -> None:
         self.keys = keys
 
-    def suppressed_fact_keys(self) -> frozenset[str]:
-        return self.keys
+    def suppression(self) -> Suppression:
+        # Corrected after every version a test records, so each version of a key is suppressed.
+        return Suppression(fact_keys={key: _FAR_FUTURE for key in self.keys})
 
 
 class StaticNotes:
