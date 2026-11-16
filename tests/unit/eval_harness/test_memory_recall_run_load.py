@@ -21,6 +21,7 @@ import contextlib
 import json
 import multiprocessing
 import sys
+import time
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
@@ -1545,7 +1546,7 @@ def test_each_followup_runs_two_fetches_per_setting_in_its_own_session(
             ("trip", "query"),
         ]
         for record in tail:
-            assert set(record) == {"followup_id", "turn", "need", *_LATENCY}
+            assert set(record) == {"followup_id", "turn", "need", *_LATENCY, *_FETCH_LATENCY}
             assert (record["need"] is None) == (n == 0)
     for followup_id, previous, query in followups:
         calls = [(f, r) for f, r in seen if r.session_id == f"followup-{followup_id}"]
@@ -1558,3 +1559,80 @@ def test_each_followup_runs_two_fetches_per_setting_in_its_own_session(
             assert (first.query_text, first.recent_user_turns) == (previous, ())
             assert (second.query_text, second.recent_user_turns) == (query, (previous,))
             assert first.now == second.now == last
+
+
+_FETCH_LATENCY = ("degraded_reason", "reranked", "shortlisted")
+_LATE_S = 3.0
+
+
+class _LateFor:
+    """A gate embedder that is late for one text: it sleeps past the fetch's deadline."""
+
+    def __init__(self, inner: TokenEmbedder, late_text: str) -> None:
+        self._inner = inner
+        self._late_text = late_text
+
+    def generate_embedding(self, text: str) -> list[float]:
+        if text == self._late_text:
+            time.sleep(_LATE_S)
+        return self._inner.generate_embedding(text)
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return [self.generate_embedding(text) for text in texts]
+
+
+def test_a_followup_record_carries_the_latency_fields_run_record_gives_its_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The selection grid's load check takes the deadline share and the rerank depth over
+    # follow-up fetches too (v7:416-418), so a follow-up record holds what `run_record` holds.
+    fixture = Fixture.load()
+    previous = next(p.query for p in fixture.probes if p.kind == "fact" and p.lexical)
+    late = "and the one before that?"
+    gate = NeedGate(
+        _LateFor(TokenEmbedder(), late),
+        load_bank(),
+        load_models(_fake_model(tmp_path, b=5.0))[0],
+        embedder_name=FAKE_EMBEDDER_NAME,
+        embedder_revision=FAKE_EMBEDDER_REVISION,
+        query_prefix="",
+    )
+    config = replace(_BASE, need_gate="on", deadline_ms=int(_LATE_S * 1000) - 1000)
+    outcomes: list[tuple[MemoryRequest, object]] = []
+    original = harness.MemoryFetcher.fetch_outcome
+
+    async def fetch_outcome(self: object, request: MemoryRequest) -> object:
+        outcome = await original(self, request)  # type: ignore[arg-type]
+        outcomes.append((request, outcome))
+        return outcome
+
+    monkeypatch.setattr(harness.MemoryFetcher, "fetch_outcome", fetch_outcome)
+
+    (records,) = _walk(
+        tmp_path,
+        "followup-latency",
+        (RunSetting(config, gate),),
+        fixture=fixture,
+        probes=fixture.probes[:1],
+        followups=(("late", previous, late),),
+    )
+
+    tail = records[1:]
+    fetched = [outcome for request, outcome in outcomes if request.session_id == "followup-late"]
+    assert [record["turn"] for record in tail] == ["previous", "query"]
+    for record, outcome in zip(tail, fetched, strict=True):
+        expected = harness.outcome_record(
+            fixture.probes[0],
+            outcome,  # type: ignore[arg-type]
+            counter=harness.ApproximateTokenCounter(),
+            cpu_load_procs=0,
+            embedder_device="cpu",
+        )
+        assert {k: record[k] for k in _FETCH_LATENCY} == {k: expected[k] for k in _FETCH_LATENCY}
+    shortlist, late_fetch = tail
+    # The open previous turn reranks a shortlist; the query's gate vector misses the deadline.
+    assert shortlist["degraded_reason"] is None
+    assert shortlist["reranked"] > 0 and shortlist["shortlisted"] > 0
+    assert late_fetch["degraded_reason"] == "deadline"
+    assert late_fetch["need"]["degraded"] == "deadline"
+    assert late_fetch["shortlisted"] == 0

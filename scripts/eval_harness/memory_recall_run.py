@@ -863,13 +863,20 @@ def run_record(
         "budget_tokens": result.budget_tokens,
         "critical_path_ms": round(timings.total_ms, 3),
         "timings_ms": _timings_ms(timings),
+        **_fetch_latency(result),
+        "delta_tokens_est": counter.count(result.block_text or "") + counter.count(probe.query),
+        "cpu_load_procs": cpu_load_procs,
+        "embedder_device": embedder_device,
+    }
+
+
+def _fetch_latency(result: MemoryResult) -> dict[str, object]:
+    """The fields `FetchLatency` reads beside the timings, shared by probe and follow-up records."""
+    return {
         "reranked": result.reranked,
         # The stage records one candidate per scored shortlist entry, capped, and counts the rest.
         "shortlisted": len(result.stage.candidates) + result.stage.truncated,
         "degraded_reason": result.degraded_reason,
-        "delta_tokens_est": counter.count(result.block_text or "") + counter.count(probe.query),
-        "cpu_load_procs": cpu_load_procs,
-        "embedder_device": embedder_device,
     }
 
 
@@ -950,7 +957,11 @@ def outcome_record(
 
 
 def followup_record(followup_id: str, turn: str, outcome: FetchOutcome) -> dict[str, object]:
-    """One fetch of a follow-up pair: which pair and turn, the gate's decision, its latency."""
+    """One fetch of a follow-up pair: which pair and turn, the gate's decision, its latency.
+
+    The latency fields are `run_record`'s, so a load check reads follow-up fetches as it reads
+    probe fetches.
+    """
     timings = outcome.result.timings
     return {
         "followup_id": followup_id,
@@ -958,6 +969,7 @@ def followup_record(followup_id: str, turn: str, outcome: FetchOutcome) -> dict[
         "need": need_json(outcome.result.stage.need),
         "critical_path_ms": round(timings.total_ms, 3),
         "timings_ms": _timings_ms(timings),
+        **_fetch_latency(outcome.result),
     }
 
 
