@@ -3,7 +3,8 @@
 A turn like "set a timer for ten minutes" needs nothing the user told MIST before; a turn like
 "what did I say my sister does?" needs nothing else. The fetch can skip, cut or serve memory by
 how likely the turn is to need it, so each query gets a probability from a classifier on frozen
-sentence embeddings, fit to a labelled bank of example turns written by two separate authors.
+sentence embeddings, fit to a labelled bank of example turns written by several separate authors,
+one file per writer.
 
 Two classifier forms compete, both pure numpy with no randomness, so a fit is reproducible from
 the bank alone:
@@ -15,8 +16,10 @@ the bank alone:
   same to no-need rows), mapped to a probability by Platt scaling fit on the bank's
   leave-one-out margins with Platt's smoothed targets and the same balanced weights.
 
-The form is chosen by cross-validation grouped by writer, at the operating point the gate works
-at: the share of no-need turns closed when the threshold keeps a recall target of need turns.
+The form is chosen by leave-one-writer-out cross-validation, each writer scored by a fit on every
+other writer, so the score is how the gate carries to an author it never saw. It is read at the
+operating point the gate works at: the share of no-need turns closed when the threshold keeps a
+recall target of need turns. The final fit is on every writer.
 Two thresholds give three bands: closed, band (a cut-down block) and open.
 
 The shipped model is a record keyed by the bank, the embedder's name and revision, the query
@@ -47,6 +50,8 @@ _HERE = Path(__file__).resolve().parent
 DEFAULT_BANK_PATHS: tuple[Path, ...] = (
     _HERE / "need_bank" / "writer_a.jsonl",
     _HERE / "need_bank" / "writer_b.jsonl",
+    _HERE / "need_bank" / "writer_c.jsonl",
+    _HERE / "need_bank" / "writer_d.jsonl",
 )
 DEFAULT_MODEL_PATH: Path = _HERE / "need_model.json"
 
@@ -837,9 +842,11 @@ def theta(probabilities: Sequence[float], r: float) -> float:
 
 @dataclass(frozen=True, slots=True)
 class CvResult:
-    """One candidate's writer-grouped cross-validation.
+    """One candidate's leave-one-writer-out cross-validation.
 
-    Fold 0 fits on the first writer (sorted) and scores the second; fold 1 the reverse.
+    Fold `i` scores the `i`-th writer (sorted) and fits on the others. `scored` names each fold's
+    writer, so a reader can tell which author a weak fold came from without recomputing the
+    order.
 
     Attributes:
         spec: The candidate.
@@ -849,8 +856,9 @@ class CvResult:
         auroc: Per fold, over the scored writer's rows.
         log_loss: Per fold, the mean cross-entropy.
         brier: Per fold, the mean squared error of `p`.
-        failed: The fit reached the iteration cap in some fold; every tuple is then empty and
-            `choose_form` skips the candidate.
+        failed: The fit reached the iteration cap in some fold; every tuple but `scored` is then
+            empty and `choose_form` skips the candidate.
+        scored: The writer each fold scores, in fold order; set for a failed candidate too.
     """
 
     spec: FormSpec
@@ -860,6 +868,7 @@ class CvResult:
     log_loss: tuple[float, ...]
     brier: tuple[float, ...]
     failed: bool = False
+    scored: tuple[str, ...] = ()
 
 
 def auroc(scores: Sequence[float], labels: Sequence[object]) -> float:
@@ -911,27 +920,31 @@ def grouped_cv(
     *,
     targets: Sequence[float] = (0.95, 0.98),
 ) -> tuple[CvResult, ...]:
-    """Cross-validate each candidate by writer: fit on one writer's rows, score the other's.
+    """Cross-validate each candidate leaving one writer out: score each writer, fit on the rest.
 
     Folding by writer keeps one author's phrasing out of both the fit and the scored rows, so the
-    closure measures how the gate carries to turns worded by someone else. The closure is read
-    at the operating point (`theta(R)` over the scored need rows) rather than over the whole
-    curve, because only that point decides what the gate closes.
+    closure measures how the gate carries to turns worded by someone else. Every writer is scored
+    once, against a fit on every other writer, so a writer whose rows were built to break a
+    confound the others share (a topic that always means need, say) is scored by a fit that
+    never saw them. The closure is read at the operating point (`theta(R)` over the scored need
+    rows) rather than over the whole curve, because only that point decides what the gate
+    closes.
 
     Args:
         vectors: One row per exemplar.
         labels: `need` or `no_need` per row.
-        writers: The writer per row; exactly two distinct writers.
+        writers: The writer per row; two or more distinct writers. Fold `i` scores the `i`-th
+            writer in sorted order.
         hard: Whether each row is a hard exemplar.
         specs: The candidates, in the order of the results.
         targets: The recall targets `R`.
 
     Returns:
-        One result per candidate. A candidate whose fit reaches the iteration cap in either fold
-        is marked failed.
+        One result per candidate. A candidate whose fit reaches the iteration cap in any fold is
+        marked failed.
 
     Raises:
-        ValueError: Other than two writers, a writer without both labels or without a hard
+        ValueError: Fewer than two writers, a writer without both labels or without a hard
             no-need row, mismatched lengths, or a target outside (0, 1].
     """
     x = np.asarray(vectors, dtype=np.float64)
@@ -943,9 +956,9 @@ def grouped_cv(
     for target in targets:
         if not (0.0 < target <= 1.0):
             raise ValueError(f"target {target} is outside (0, 1]")
-    names = sorted(set(writer_of.tolist()))
-    if len(names) != 2:
-        raise ValueError(f"grouped_cv folds by two writers, not {names}")
+    names = tuple(sorted(set(writer_of.tolist())))
+    if len(names) < 2:
+        raise ValueError(f"grouped_cv folds by two or more writers, not {list(names)}")
     label_values = np.where(need, "need", "no_need")
     for name in names:
         rows = writer_of == name
@@ -953,14 +966,13 @@ def grouped_cv(
             raise ValueError(f"writer {name!r} lacks rows of both labels")
         if not np.any(rows & ~need & hard_rows):
             raise ValueError(f"writer {name!r} has no hard no-need row")
-    folds = ((names[0], names[1]), (names[1], names[0]))
     results = []
     for spec in specs:
         closure, hard_closure, aurocs, log_losses, briers = [], [], [], [], []
         failed = False
-        for fit_writer, scored_writer in folds:
-            train = writer_of == fit_writer
+        for scored_writer in names:
             scored = writer_of == scored_writer
+            train = ~scored
             try:
                 params = fit_form(x[train], list(label_values[train]), spec)
             except NeedFitError:
@@ -987,7 +999,7 @@ def grouped_cv(
             log_losses.append(float(np.mean(-(y * np.log(clipped) + (~y) * np.log(1 - clipped)))))
             briers.append(float(np.mean((p - y) ** 2)))
         if failed:
-            results.append(CvResult(spec, (), (), (), (), (), failed=True))
+            results.append(CvResult(spec, (), (), (), (), (), failed=True, scored=names))
         else:
             results.append(
                 CvResult(
@@ -997,6 +1009,7 @@ def grouped_cv(
                     tuple(aurocs),
                     tuple(log_losses),
                     tuple(briers),
+                    scored=names,
                 )
             )
     return tuple(results)
@@ -1026,10 +1039,10 @@ def _preference(spec: FormSpec) -> tuple[int, float, int]:
 def choose_form(results: Sequence[CvResult], *, no_need_rows: int) -> FormSpec:
     """The candidate cross-validation chooses: the smoothest within one standard error of best.
 
-    The error is `sqrt(c * (1 - c) / m)`, `c` the best score and `m` the no-need rows in both
-    files: the closure's binomial error alone. It ignores the variance of `theta(R)`, so it
-    understates the true error and the rule prefers the smoother form less often than a full
-    error would.
+    The error is `sqrt(c * (1 - c) / m)`, `c` the best score and `m` the no-need rows in every
+    file, since each is scored in exactly one fold: the closure's binomial error alone. It
+    ignores the variance of `theta(R)`, so it understates the true error and the rule prefers
+    the smoother form less often than a full error would.
 
     Raises:
         ValueError: Every candidate failed, or `no_need_rows` is not positive.

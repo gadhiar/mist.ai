@@ -277,6 +277,8 @@ class TestDefaults:
         assert (
             here / "need_bank" / "writer_a.jsonl",
             here / "need_bank" / "writer_b.jsonl",
+            here / "need_bank" / "writer_c.jsonl",
+            here / "need_bank" / "writer_d.jsonl",
         ) == DEFAULT_BANK_PATHS
         assert here / "need_model.json" == DEFAULT_MODEL_PATH
 
@@ -603,6 +605,74 @@ def _cv_rows():
     return vectors, labels, writers, hard
 
 
+def _many_writer_rows(names: Sequence[str]):
+    """Four rows per writer, in the given writer order; the third coordinate is the row index.
+
+    Each writer has need rows at p 0.9 and 0.6, a no-need row at 0.1 and a hard no-need row at
+    0.4, so every fold closes the same share and only the rows each fold sees tell them apart.
+    """
+    pattern = (("need", False, 0.9), ("need", False, 0.6), ("no_need", False, 0.1))
+    pattern += (("no_need", True, 0.4),)
+    rows = [(name, label, h, p) for name in names for label, h, p in pattern]
+    vectors = [[p, 1.0, float(i)] for i, (_, _, _, p) in enumerate(rows)]
+    labels = [label for _, label, _, _ in rows]
+    writers = [writer for writer, _, _, _ in rows]
+    hard = [h for _, _, h, _ in rows]
+    return vectors, labels, writers, hard
+
+
+# A two-writer bank for the real fits; four need and four no-need rows each, so `knn n=3` fits.
+_TWO_WRITER_ROWS = [
+    ("a", "need", False, [1.0, 0.2, 0.1]),
+    ("a", "need", False, [0.9, 0.3, 0.0]),
+    ("a", "need", False, [0.8, 0.1, 0.4]),
+    ("a", "need", False, [0.6, 0.5, 0.2]),
+    ("a", "no_need", False, [0.1, 1.0, 0.0]),
+    ("a", "no_need", True, [0.2, 0.9, 0.3]),
+    ("a", "no_need", True, [0.5, 0.6, 0.1]),
+    ("a", "no_need", False, [0.0, 0.8, 0.5]),
+    ("b", "need", False, [0.95, 0.1, 0.3]),
+    ("b", "need", False, [0.7, 0.4, 0.1]),
+    ("b", "need", False, [0.4, 0.6, 0.3]),
+    ("b", "need", False, [0.85, 0.0, 0.5]),
+    ("b", "no_need", False, [0.15, 0.95, 0.1]),
+    ("b", "no_need", True, [0.6, 0.45, 0.2]),
+    ("b", "no_need", True, [0.3, 0.7, 0.4]),
+    ("b", "no_need", False, [0.05, 0.9, 0.2]),
+]
+
+# What the two-fold `grouped_cv` (base 08fe5d26) gave for `_TWO_WRITER_ROWS` at the default
+# targets, per scored writer: closure, hard closure, AUROC, log loss and Brier score. Its fold 0
+# fit on writer a and scored b; fold `i` now scores the `i`-th writer, so a comes first, and
+# each writer's figures must not move.
+_BASE_FIGURES = {
+    FormSpec("logistic", 0.1, None): {
+        "a": ((0.0, 0.0), (0.0, 0.0), 1.0, 0.6655913772689088, 0.23622770209680372),
+        "b": ((0.0, 0.0), (0.0, 0.0), 0.9375, 0.6659129720529093, 0.23639352146580286),
+    },
+    FormSpec("logistic", 1.0, None): {
+        "a": ((0.0, 0.0), (0.0, 0.0), 1.0, 0.5131282554509092, 0.16175844970021308),
+        "b": ((0.0, 0.0), (0.0, 0.0), 0.9375, 0.5281550247352662, 0.170467500449883),
+    },
+    FormSpec("logistic", 10.0, None): {
+        "a": ((0.75, 0.75), (0.5, 0.5), 1.0, 0.27467802041592826, 0.06661492905397999),
+        "b": ((0.5, 0.5), (0.0, 0.0), 0.9375, 0.3736015671097497, 0.12386262762666732),
+    },
+    FormSpec("logistic", 100.0, None): {
+        "a": ((0.75, 0.75), (0.5, 0.5), 1.0, 0.18375263080097937, 0.04136862603730776),
+        "b": ((0.75, 0.75), (0.5, 0.5), 0.9375, 0.4028882831299172, 0.15269448720955983),
+    },
+    FormSpec("knn", None, 1): {
+        "a": ((0.0, 0.0), (0.0, 0.0), 0.9375, 0.6400497585885038, 0.22354013744734552),
+        "b": ((0.5, 0.5), (0.0, 0.0), 0.9375, 0.41409154275416626, 0.1273773511920192),
+    },
+    FormSpec("knn", None, 3): {
+        "a": ((0.5, 0.5), (0.0, 0.0), 1.0, 0.3773408437043896, 0.10338508363415355),
+        "b": ((0.5, 0.5), (0.0, 0.0), 0.9375, 0.39176843211533013, 0.12466497357814368),
+    },
+}
+
+
 class _FakeForms:
     """Stands in for fit_form and probabilities: p is each vector's first coordinate."""
 
@@ -633,22 +703,48 @@ class TestGroupedCv:
         results = grouped_cv(vectors, labels, writers, hard, specs)
         return fake, results
 
-    def test_each_fold_trains_on_one_writer_and_scores_the_other(self, monkeypatch):
-        fake, _ = self._run(monkeypatch, (LOGISTIC_1,))
+    def test_each_fold_scores_one_writer_and_fits_on_the_other(self, monkeypatch):
+        fake, (result,) = self._run(monkeypatch, (LOGISTIC_1,))
         a_rows = tuple(float(i) for i in range(6))
         b_rows = tuple(float(i) for i in range(6, 13))
-        assert [rows for _, rows in fake.fits] == [a_rows, b_rows]
-        assert fake.scored == [(a_rows, b_rows), (b_rows, a_rows)]
+        assert [rows for _, rows in fake.fits] == [b_rows, a_rows]
+        assert fake.scored == [(b_rows, a_rows), (a_rows, b_rows)]
+        assert result.scored == ("a", "b")
+
+    @pytest.mark.parametrize("names", [("c", "a", "b"), ("d", "b", "a", "c")])
+    def test_one_fold_per_writer_scores_it_and_fits_on_every_other(self, monkeypatch, names):
+        fake = _FakeForms()
+        monkeypatch.setattr(need_gate, "fit_form", fake.fit_form)
+        monkeypatch.setattr(need_gate, "probabilities", fake.probabilities)
+        vectors, labels, writers, hard = _many_writer_rows(names)
+        (result,) = grouped_cv(vectors, labels, writers, hard, (LOGISTIC_1,))
+        ordered = tuple(sorted(names))
+
+        def rows(keep) -> tuple[float, ...]:
+            return tuple(float(i) for i, writer in enumerate(writers) if keep(writer))
+
+        fits = [rows(lambda w, name=name: w != name) for name in ordered]
+        assert result.scored == ordered
+        assert [fit for _, fit in fake.fits] == fits
+        assert fake.scored == [
+            (fit, rows(lambda w, name=name: w == name)) for fit, name in zip(fits, ordered)
+        ]
+        per_fold = (result.closure, result.hard_closure, result.auroc, result.log_loss)
+        assert [len(values) for values in per_fold + (result.brier,)] == [len(names)] * 5
+        # Each writer's need p are 0.9 and 0.6 and its no-need p 0.1 and 0.4 (the hard one):
+        # theta 0.3 at both targets closes the plain row and keeps the hard one.
+        assert result.closure == ((0.5, 0.5),) * len(names)
+        assert result.hard_closure == ((0.0, 0.0),) * len(names)
 
     def test_closure_and_hard_closure_by_hand(self, monkeypatch):
         _, (result,) = self._run(monkeypatch, (LOGISTIC_1,))
+        # Fold 0 scores writer a. Need p: 0.9 0.8 0.4 (N = 3).
+        #   R = 0.95 and 0.98: k = 3, the 3rd is 0.4, none below: theta 0.2. No-need 0.1 0.5
+        #   0.3: closed 0.1 -> 1/3; hard 0.5 0.3 -> 0/2.
         # Fold 1 scores writer b. Need p: 0.95 0.7 0.6 0.2 (N = 4).
         #   R = 0.95: k = 4, the 4th is 0.2, none below: theta 0.1. No-need 0.05 0.65 0.15:
         #   closed 0.05 -> 1/3; hard 0.65 -> 0/1.
         #   R = 0.98: k = 4, the same: 1/3 and 0.
-        # Fold 2 scores writer a. Need p: 0.9 0.8 0.4 (N = 3).
-        #   R = 0.95 and 0.98: k = 3, the 3rd is 0.4, none below: theta 0.2. No-need 0.1 0.5
-        #   0.3: closed 0.1 -> 1/3; hard 0.5 0.3 -> 0/2.
         assert result.closure == ((1 / 3, 1 / 3), (1 / 3, 1 / 3))
         assert result.hard_closure == ((0.0, 0.0), (0.0, 0.0))
         assert result.failed is False
@@ -671,9 +767,9 @@ class TestGroupedCv:
             terms = [(1 - p) ** 2 for p in pos] + [q**2 for q in neg]
             return sum(terms) / len(terms)
 
-        assert result.auroc == pytest.approx((pairs(b_need, b_no), pairs(a_need, a_no)))
-        assert result.log_loss == pytest.approx((log_loss(b_need, b_no), log_loss(a_need, a_no)))
-        assert result.brier == pytest.approx((brier(b_need, b_no), brier(a_need, a_no)))
+        assert result.auroc == pytest.approx((pairs(a_need, a_no), pairs(b_need, b_no)))
+        assert result.log_loss == pytest.approx((log_loss(a_need, a_no), log_loss(b_need, b_no)))
+        assert result.brier == pytest.approx((brier(a_need, a_no), brier(b_need, b_no)))
 
     def test_a_failing_candidate_is_marked_failed(self, monkeypatch):
         knn = FormSpec("knn", None, 1)
@@ -684,6 +780,34 @@ class TestGroupedCv:
         with pytest.raises(ValueError):
             cv_score(results[1])
 
+    def test_a_failed_candidate_keeps_the_scored_writers_and_no_figures(self, monkeypatch):
+        knn = FormSpec("knn", None, 1)
+        _, (_, result) = self._run(monkeypatch, (LOGISTIC_1, knn), failing={knn})
+        assert result.scored == ("a", "b")
+        assert (
+            result.closure,
+            result.hard_closure,
+            result.auroc,
+            result.log_loss,
+            result.brier,
+        ) == ((), (), (), (), ())
+
+    @pytest.mark.parametrize("spec", list(_BASE_FIGURES))
+    def test_two_writers_give_the_figures_of_the_two_fold_code(self, spec):
+        vectors = [vector for _, _, _, vector in _TWO_WRITER_ROWS]
+        labels = [label for _, label, _, _ in _TWO_WRITER_ROWS]
+        writers = [writer for writer, _, _, _ in _TWO_WRITER_ROWS]
+        hard = [h for _, _, h, _ in _TWO_WRITER_ROWS]
+        (result,) = grouped_cv(vectors, labels, writers, hard, (spec,))
+        assert result.scored == ("a", "b")
+        for fold, writer in enumerate(result.scored):
+            closure, hard_closure, auroc_, log_loss, brier = _BASE_FIGURES[spec][writer]
+            assert result.closure[fold] == closure
+            assert result.hard_closure[fold] == hard_closure
+            assert result.auroc[fold] == auroc_
+            assert result.log_loss[fold] == pytest.approx(log_loss, rel=1e-9)
+            assert result.brier[fold] == pytest.approx(brier, rel=1e-9)
+
     def test_real_fit_matches_fitting_one_writer_and_scoring_the_other(self):
         vectors = SEPARABLE_VECTORS + OVERLAP_VECTORS
         labels = SEPARABLE_LABELS + OVERLAP_LABELS
@@ -691,10 +815,11 @@ class TestGroupedCv:
         hard = [False] * 4 + [True, True] + [False] * 4 + [True, True]
         spec = FormSpec("logistic", 1.0, None)
         (result,) = grouped_cv(vectors, labels, writers, hard, (spec,), targets=(0.95,))
-        params = fit_form(vectors[:6], labels[:6], spec)
-        p = probabilities(vectors[6:], "logistic", params)
-        need_p = [float(v) for v, lab in zip(p, labels[6:]) if lab == "need"]
-        no_p = [float(v) for v, lab in zip(p, labels[6:]) if lab == "no_need"]
+        # Fold 0 scores writer a, fit on writer b.
+        params = fit_form(vectors[6:], labels[6:], spec)
+        p = probabilities(vectors[:6], "logistic", params)
+        need_p = [float(v) for v, lab in zip(p, labels[:6]) if lab == "need"]
+        no_p = [float(v) for v, lab in zip(p, labels[:6]) if lab == "no_need"]
         cut = theta(need_p, 0.95)
         assert result.closure[0] == (sum(v < cut for v in no_p) / len(no_p),)
 
@@ -710,17 +835,29 @@ class TestGroupedCv:
         with pytest.raises(ValueError, match="every candidate"):
             choose_form(results, no_need_rows=6)
 
-    def test_refuses_other_than_two_writers(self, monkeypatch):
+    def test_refuses_fewer_than_two_writers(self, monkeypatch):
         vectors, labels, _, hard = _cv_rows()
-        with pytest.raises(ValueError, match="two writers"):
+        with pytest.raises(ValueError, match="two or more writers"):
             grouped_cv(vectors, labels, ["a"] * len(labels), hard, (LOGISTIC_1,))
 
+    def test_refuses_a_writer_without_a_hard_no_need_row(self):
+        vectors, labels, writers, hard = _many_writer_rows(("a", "b", "c"))
+        hard = [h and writer != "c" for h, writer in zip(hard, writers)]
+        with pytest.raises(ValueError, match="writer 'c' has no hard no-need row"):
+            grouped_cv(vectors, labels, writers, hard, (LOGISTIC_1,))
 
-def _result(spec: FormSpec, score: float, *, failed: bool = False) -> CvResult:
+    def test_refuses_a_writer_without_both_labels(self):
+        vectors, labels, writers, hard = _many_writer_rows(("a", "b", "c"))
+        labels = ["no_need" if writer == "b" else label for label, writer in zip(labels, writers)]
+        with pytest.raises(ValueError, match="writer 'b' lacks rows of both labels"):
+            grouped_cv(vectors, labels, writers, hard, (LOGISTIC_1,))
+
+
+def _result(spec: FormSpec, score: float, *, failed: bool = False, folds: int = 2) -> CvResult:
     if failed:
         return CvResult(spec, (), (), (), (), (), failed=True)
-    closure = ((score, score), (score, score))
-    return CvResult(spec, closure, closure, (0.9, 0.9), (0.3, 0.3), (0.1, 0.1))
+    closure = ((score, score),) * folds
+    return CvResult(spec, closure, closure, (0.9,) * folds, (0.3,) * folds, (0.1,) * folds)
 
 
 class TestChooseForm:
@@ -780,6 +917,24 @@ class TestChooseForm:
     def test_refuses_a_non_positive_row_count(self):
         with pytest.raises(ValueError):
             choose_form([_result(LOGISTIC_1, 0.9)], no_need_rows=0)
+
+    def test_the_error_counts_the_no_need_rows_of_every_file(self, tmp_path):
+        paths = []
+        for name in "abc":
+            rows = [_row(f"{name}-need-001", name, "need", f"{name} needs memory")]
+            rows += [
+                _row(f"{name}-no-need-{i:03d}", name, "no_need", f"{name} plain {i}", hard=True)
+                for i in range(1, 101)
+            ]
+            paths.append(_write_jsonl(tmp_path / f"writer_{name}.jsonl", rows))
+        no_need_rows = sum(e.label == "no_need" for e in load_bank(paths).exemplars)
+        assert no_need_rows == 300
+        knn, logistic = FormSpec("knn", None, 1), FormSpec("logistic", 100.0, None)
+        results = [_result(knn, 0.90, folds=3), _result(logistic, 0.88, folds=3)]
+        # Over three files, m = 300: sqrt(0.9 * 0.1 / 300) = 0.0173 leaves 0.88 outside.
+        assert choose_form(results, no_need_rows=no_need_rows) == knn
+        # Two files' rows alone (m = 200, error 0.0212) would have let the smoother form in.
+        assert choose_form(results, no_need_rows=200) == logistic
 
 
 class TestAuroc:
