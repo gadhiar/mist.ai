@@ -28,7 +28,7 @@ import pytest
 import soundfile as sf
 from scipy.signal import lfilter
 
-from scripts.voice_data import cli, gates, packs
+from scripts.voice_data import cli, gates, packs, seed_gate
 from scripts.voice_data import rehearsal as pkg
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.commands import extract as extract_cmd
@@ -925,6 +925,46 @@ def test_score_refuses_a_run_without_a_turn_record(extracted: Extracted, scored:
     assert code == 2 and "run r0 has no turns.jsonl" in err
     assert len(extracted.built.docker.argvs) == calls
     assert not (root.path / pkg.SCORES_REL / "r0").exists()
+
+
+def test_score_writes_the_precision_record(extracted: Extracted, scored: Scored) -> None:
+    # The record carries the precision to the seed gate (A24): H8 copies it to the private
+    # root's config/rehearsal.json, where `gate` reads it with `read_rehearsal_record`.
+    assert scored.code == 0, scored.err
+    rel = f"{pkg.SCORES_REL}/r1/{pkg.PRECISION_NAME}"
+    assert pkg.PRECISION_NAME == "precision.json"
+    raw = json.loads((extracted.built.root.path / rel).read_text(encoding="utf-8"))
+    assert seed_gate.read_rehearsal_record(raw) == {
+        "schema": 1,
+        "kind": "rehearsal-precision",
+        "run": "r1",
+        "precision": scored.score["extraction"]["precision"],
+        "thresholds": gates.load(None).effective(),
+    }
+    assert f"  precision record written to {rel}" in scored.out.splitlines()
+    assert "no precision record" not in scored.out
+
+
+def test_score_without_a_primary_segment_writes_no_record(
+    extracted: Extracted, scored: Scored
+) -> None:
+    root = extracted.built.root
+    for name in ("turns.jsonl", "report.json"):
+        source = root.path / "seed" / "runs" / "r1" / name
+        root.write_bytes(f"seed/runs/r6/{name}", source.read_bytes())
+    flagged = [
+        replace(s, cluster="flagged") if s.cluster == "primary" else s for s in extracted.segments
+    ]
+    write_jsonl(root, "seed/runs/r6/segments.jsonl", flagged)
+    with patched(extracted.built.docker, extracted.built.sources):
+        code, out, err = run_cli(
+            ["--root", str(root.path), "rehearsal", "score", "--run", "r6", "--clean", "c1"]
+        )
+    assert code == 0, err
+    score = json.loads((root.path / pkg.SCORES_REL / "r6" / pkg.SCORE_NAME).read_text("utf-8"))
+    assert score["extraction"]["precision"] is None
+    assert "no precision record: no primary segment" in out.splitlines()
+    assert not (root.path / pkg.SCORES_REL / "r6" / pkg.PRECISION_NAME).exists()
 
 
 # The impostor's cluster, named from turn records of one episode.

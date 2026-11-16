@@ -14,6 +14,15 @@ stages write:
 - `rehearsal`: `{"precision": number, "thresholds": {...}}` from the rehearsal's score, or null;
 - `thresholds`: the gate values the run used.
 
+Extract writes `"rehearsal": null`, because the rehearsal runs in another root (A24). Its
+precision reaches the gate as a record instead: `rehearsal score` writes
+`rehearsal/scores/<R>/precision.json` (`rehearsal_record`), H8 copies it to the root's
+`config/rehearsal.json` (`REHEARSAL_RECORD_REL`), and `gate --run` evaluates with the record's
+`precision` and `thresholds` when the report's own `rehearsal` is null. The record's thresholds
+are compared with the run's as a report's would be, so a record from a rehearsal at other values
+fails as "thresholds differ"; `gate --check-record` makes the same comparison against the root's
+effective gate values before any job runs (`record_differences`).
+
 A criterion with `passed` `None` is reported, not gated: purity, minutes per channel, and minutes
 per state, where a state under `seed.state_seconds_min` is flagged for state-prompted teachers
 or conversion. Every line carries names and numbers only.
@@ -28,6 +37,9 @@ from .errors import InputError
 
 SOURCE_FACTS = ("codec", "bitrate_bps", "layout", "effective_bandwidth_hz")
 ONE_SPEAKER_COUNTS = ("kept_failing_retrieval", "kept_failing_window", "flagged_unconfirmed")
+REHEARSAL_RECORD_REL = "config/rehearsal.json"
+RECORD_SCHEMA = 1
+RECORD_KIND = "rehearsal-precision"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +187,78 @@ def evaluate(report: Mapping[str, object], thresholds: Mapping[str, float]) -> S
         criteria.append(Criterion(f"state {state}", None, detail))
     passed = all(c.passed is not False for c in criteria)
     return SeedGateResult(passed=passed, criteria=tuple(criteria))
+
+
+def _record_thresholds(thresholds: object, where: str) -> dict[str, object]:
+    if not isinstance(thresholds, Mapping):
+        raise InputError(f"{where}: thresholds is missing or not an object")
+    bad = sorted(str(k) for k, v in thresholds.items() if not _is_number(v))
+    if bad:
+        raise InputError(f"{where}: thresholds that are not numbers: {', '.join(bad)}")
+    return {str(k): v for k, v in thresholds.items()}
+
+
+def rehearsal_record(
+    run: str, precision: float, thresholds: Mapping[str, object]
+) -> dict[str, object]:
+    """Return the precision record `rehearsal score` writes for extract run `run`.
+
+    Args:
+        run: The rehearsal's extract run.
+        precision: The run's `extraction.precision`.
+        thresholds: The run's `report.json` `thresholds`, every key, so the gate can tell whether
+            the rehearsal ran at the values the gated run used.
+
+    Raises:
+        InputError: `thresholds` is not an object of numbers.
+    """
+    return {
+        "schema": RECORD_SCHEMA,
+        "kind": RECORD_KIND,
+        "run": run,
+        "precision": precision,
+        "thresholds": _record_thresholds(thresholds, f"refused: run {run}'s report"),
+    }
+
+
+def read_rehearsal_record(raw: object) -> dict[str, object]:
+    """Check a parsed precision record and return it.
+
+    Raises:
+        InputError: The record is not an object, has another `kind`, has no string `run`, no
+            number `precision`, or no object of numbers as `thresholds`; the message names
+            `REHEARSAL_RECORD_REL`, the file `gate` reads it from.
+    """
+    where = f"refused: {REHEARSAL_RECORD_REL}"
+    if not isinstance(raw, Mapping):
+        raise InputError(f"{where} is not a JSON object")
+    if raw.get("kind") != RECORD_KIND:
+        raise InputError(f"{where}: kind is not {RECORD_KIND}")
+    if not isinstance(raw.get("run"), str):
+        raise InputError(f"{where}: run is missing or not a string")
+    if not _is_number(raw.get("precision")):
+        raise InputError(f"{where}: precision is missing or not a number")
+    record = dict(raw)
+    record["thresholds"] = _record_thresholds(raw.get("thresholds"), where)
+    return record
+
+
+def record_differences(record: Mapping[str, object], thresholds: Mapping[str, object]) -> list[str]:
+    """Return the sorted keys whose value differs, or that only one side has.
+
+    A key present on one side only differs even when the other side's value would be `None`, so
+    a gate added since the rehearsal ran is named rather than passed over.
+
+    Raises:
+        InputError: The record has no object `thresholds` (`read_rehearsal_record` checks it).
+    """
+    theirs = record.get("thresholds")
+    if not isinstance(theirs, Mapping):
+        raise InputError(f"refused: {REHEARSAL_RECORD_REL}: thresholds is missing or not an object")
+    keys = set(theirs) | set(thresholds)
+    return sorted(
+        str(k) for k in keys if k not in theirs or k not in thresholds or theirs[k] != thresholds[k]
+    )
 
 
 def source_lines(report: Mapping[str, object]) -> list[str]:

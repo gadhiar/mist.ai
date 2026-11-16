@@ -40,6 +40,8 @@ SCORES_REL = f"{REHEARSAL_REL}/scores"
 EFFECTS_PLAN_NAME = "effects-plan.json"
 EFFECTS_NAME = "effects.json"
 SCORE_NAME = "score.json"
+# The precision record for the seed gate (`seed_gate.rehearsal_record`), beside `SCORE_NAME`.
+PRECISION_NAME = "precision.json"
 SEED_ANCHOR_REL = "seed/reference/rehearsal-anchor.wav"
 STEPS = ("build", "effects")
 
