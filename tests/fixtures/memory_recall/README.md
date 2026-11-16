@@ -407,3 +407,28 @@ device. A fresh author wrote it from the labels' definitions alone, without read
 fact or note in this fixture. It is dev only: there is no held-out follow-up set, and the
 selection grid (host step H18) decides one setting on it, whether the gate also scores a closed
 follow-up joined to the turn before it (`need_context`).
+
+## Fresh noise probes
+
+`fresh_noise_probes.jsonl` holds 23 noise probes in probes.jsonl's schema, with ids
+`fresh-noise-NN`. It is for one clean check of the chosen need gate before the held-out run, on
+probes that took part in no decision. The gate is fit on the need bank and chosen on the dev
+probes and the follow-up probes, so a turn from any of those has shaped it; only turns new to
+that choice show how it treats ones it was not chosen on.
+
+A fresh author wrote the file. The author saw only this page's noise definition and lexical rule
+(pasted, with one dev example redacted), conversations.jsonl, the fixture's facts and notes, and
+`test_memory_recall_fixture.py`. The author never saw probes.jsonl, heldout_probes.jsonl,
+followup_probes.jsonl, any need-bank file, or any model output.
+
+The selection grid (`scripts/eval_harness/memory_selection_grid.py`, host step H18) reads the
+file beside its other dev inputs, and refuses to run without it: a missing or empty file, or a
+row whose kind is not `noise`, is exit 2. Once the choice and its load check are final, the
+chosen setting's gate scores each probe once, by the call the fetcher makes. A probe whose `p`
+is at or above the chosen variant's `theta_low` is open. The check passes when no probe opens
+(`FRESH_OPEN_ALLOWED`, 0). The report's `fresh_check` gives each probe's `p` and names the open
+ones. On a failure the grid exits 5 and writes no need model, and it does not choose again.
+
+A result on this file never feeds a choice or a revision. The probes change no setting's score
+and no choice, and a gate, bank or threshold revised after reading the result would need a new
+fresh set.

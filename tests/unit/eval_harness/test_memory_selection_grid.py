@@ -13,15 +13,19 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from safetensors import SafetensorError
 
 import backend.memory.need_gate as need_gate_module
 import scripts.eval_harness.memory_selection_grid as grid
+from backend.errors import MemoryRerankError, MistError
 from backend.memory.need_gate import (
     FORM_CANDIDATES,
     CvResult,
@@ -34,7 +38,7 @@ from backend.memory.need_gate import (
     load_models,
     theta,
 )
-from scripts.eval_harness.memory_recall import ItemRef, Probe
+from scripts.eval_harness.memory_recall import FIXTURE_DIR, ItemRef, Probe
 from scripts.eval_harness.memory_recall_run import (
     FAKE_EMBEDDER_NAME,
     FAKE_EMBEDDER_REVISION,
@@ -95,6 +99,7 @@ _REPORT_KEYS = {
     "reported",
     "need_context",
     "choice",
+    "fresh_check",
     "need_model",
 }
 
@@ -425,6 +430,159 @@ def test_a_model_directory_that_does_not_exist_exits_2(
     assert absent in capsys.readouterr().err
 
 
+# --- exit 4: a model that exists but fails to load -----------------------------------------------
+
+_FACT_LOCK = (
+    '[[model]]\nname = "fact"\nrepo = "x/fact"\nrevision = "1"\nlicense = "MIT"\n'
+    'target = "fact"\n'
+)
+# Each loader `load_real_models` calls, and the directory under /opt/models it loads.
+_LOADERS = {
+    "SentenceTransformerEmbedder": "fact",
+    "build_reranker": "reranker",
+    "EmbeddingGenerator": BGE,
+    "warmup": BGE,
+}
+
+
+def _present_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], Path]:
+    """Argv naming three model directories that exist, and a lock with the fact embedder."""
+    root = tmp_path / "models"
+    monkeypatch.setattr(grid, "MODELS_ROOT", root)
+    for name in ("fact", "reranker", BGE):
+        (root / name).mkdir(parents=True)
+    argv = _argv("--need-embedder", f"{BGE}={root / BGE}@5c38", output=str(tmp_path / "grid.json"))
+    argv[argv.index("--embedder") + 1] = str(root / "fact")
+    argv[argv.index("--reranker") + 1] = str(root / "reranker")
+    lock = tmp_path / "models.lock"
+    lock.write_text(_FACT_LOCK, encoding="utf-8")
+    return argv, lock
+
+
+def _stub_loaders(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failing: str | None = None,
+    error: BaseException | None = None,
+) -> list[str]:
+    """Replace the four loaders: the one named `failing` raises `error`, every other one loads.
+
+    Unstubbed, the first loader would already fail on an empty directory (and `build_reranker`
+    refuses any path outside the real /opt/models), so a test would never reach a later loader.
+    Returns the paths each gate embedder's `warmup` ran for.
+    """
+    warmed: list[str] = []
+
+    def check(name: str) -> None:
+        if name == failing:
+            assert error is not None
+            raise error
+
+    class Fact:
+        def __init__(self, path: str, *, device: str) -> None:
+            check("SentenceTransformerEmbedder")
+
+    def build_reranker(choice: str, *, device: str, config: object) -> SimpleNamespace:
+        check("build_reranker")
+        return SimpleNamespace(reranker=TokenReranker())
+
+    class Generator:
+        def __init__(self, path: str, *, device: str, **kwargs: object) -> None:
+            check("EmbeddingGenerator")
+            self.path = path
+
+        def warmup(self) -> None:
+            check("warmup")
+            warmed.append(self.path)
+
+    monkeypatch.setattr(grid, "SentenceTransformerEmbedder", Fact)
+    monkeypatch.setattr(grid, "build_reranker", build_reranker)
+    monkeypatch.setattr(grid, "EmbeddingGenerator", Generator)
+    return warmed
+
+
+def test_load_errors_are_reranks_model_errors_and_the_rerank_and_import_errors() -> None:
+    assert (
+        OSError,
+        ValueError,
+        RuntimeError,
+        ImportError,
+        SafetensorError,
+        MemoryRerankError,
+    ) == grid._LOAD_ERRORS
+    assert issubclass(grid.GridLoadError, MistError)
+
+
+def test_load_real_models_loads_every_model_and_warms_each_gate_embedder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    warmed = _stub_loaders(monkeypatch)
+    models = grid.load_real_models(build_parser().parse_args(argv), models_lock=lock)
+    assert [g.name for g in models.gate_embedders] == ["shared", BGE]
+    assert warmed == [str(tmp_path / "models" / BGE)]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError, ValueError, RuntimeError, ImportError, SafetensorError, MemoryRerankError],
+)
+@pytest.mark.parametrize("loader", list(_LOADERS))
+def test_a_model_that_fails_to_load_raises_grid_load_error_naming_it(
+    loader: str, error: type[Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    _stub_loaders(monkeypatch, failing=loader, error=error(f"{loader} stub failure"))
+    with pytest.raises(grid.GridLoadError) as exc:
+        grid.load_real_models(build_parser().parse_args(argv), models_lock=lock)
+    directory = tmp_path / "models" / _LOADERS[loader]
+    assert str(exc.value) == f"{directory}: {error.__name__}: {loader} stub failure"
+    assert type(exc.value.__cause__) is error
+
+
+def test_a_type_error_from_a_loader_is_not_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A programming error keeps its traceback and Python's exit 1.
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    _stub_loaders(monkeypatch, failing="SentenceTransformerEmbedder", error=TypeError("stub"))
+    with pytest.raises(TypeError, match="stub"):
+        grid.load_real_models(build_parser().parse_args(argv), models_lock=lock)
+
+
+def test_main_exits_4_with_one_line_and_no_report_when_a_model_fails_to_load(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "grid.json"
+
+    def models(_args: object) -> Models:
+        raise grid.GridLoadError("/opt/models/fact: OSError: stub")
+
+    code = main(_argv(output=str(output)), models=models)
+    assert code == grid.EXIT_LOAD == 4
+    assert not output.exists()
+    err = capsys.readouterr().err
+    assert err == "memory_selection_grid: exit 4, /opt/models/fact: OSError: stub\n"
+
+
+def test_a_gate_embedder_whose_warmup_fails_exits_4_before_any_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    _stub_loaders(monkeypatch, failing="warmup", error=OSError("no weights"))
+
+    def no_fit(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a model failed to load, so nothing is fit")
+
+    monkeypatch.setattr(grid, "fit_gate", no_fit)
+    assert main(argv, models_lock=lock) == 4
+    assert not (tmp_path / "grid.json").exists()
+    directory = tmp_path / "models" / BGE
+    assert capsys.readouterr().err == (
+        f"memory_selection_grid: exit 4, {directory}: OSError: no weights\n"
+    )
+
+
 # --- step 1: the gate alone ----------------------------------------------------------------------
 
 
@@ -552,6 +710,39 @@ def test_a_failed_fit_is_reported_and_skipped(
     assert by_form["logistic c=1"]["failed"] == "final fit"
     assert by_form["logistic c=10"]["failed"] is None
     assert report["form"] == "logistic c=10"
+    # Each row names the writer each fold scores, a failed candidate's too.
+    writers = sorted({exemplar.writer for exemplar in bank.exemplars})
+    assert [row["scored"] for row in report["candidates"]] == [
+        list(result.scored) for result in fit.cv
+    ]
+    assert all(row["scored"] == writers for row in report["candidates"])
+
+
+def test_three_writers_give_three_folds_and_the_preference_reads_every_fold(
+    fixture: Fixture, followups: tuple[Followup, ...]
+) -> None:
+    # A bank of three writers: the cross-validation table holds a fold per writer, not two.
+    three = load_bank(need_gate_module.DEFAULT_BANK_PATHS[:3])
+    writers = sorted({exemplar.writer for exemplar in three.exemplars})
+    assert len(writers) == 3
+    fit = fit_gate(_oracle(BGE, three, fixture, followups), three, fixture.probes, followups)
+    rows = grid.cv_report(fit)["candidates"]
+    assert len(rows) == len(FORM_CANDIDATES)
+    for row in rows:
+        assert row["scored"] == writers
+        if row["failed"] is None:
+            assert len(row["closure"]) == len(row["hard_closure"]) == 3
+            assert all(len(fold) == len(grid.RECALL_TARGETS) for fold in row["closure"])
+            assert len(row["auroc"]) == len(row["log_loss"]) == len(row["brier"]) == 3
+    # The preferred-embedder rule compares every fold: above in two folds and equal in the
+    # third, at one target, is not above `shared` in each fold.
+    base = _cv("shared", [[0.80, 0.80]] * 3)
+    above = _cv(BGE, [[0.90, 0.90]] * 3)
+    equal_in_third = _cv(BGE, [[0.90, 0.90], [0.90, 0.90], [0.90, 0.80]])
+    below_in_third = _cv(BGE, [[0.95, 0.95], [0.95, 0.95], [0.79, 0.95]])
+    assert preferred_embedder({"shared": base, BGE: above}) == BGE
+    assert preferred_embedder({"shared": base, BGE: equal_in_third}) == "shared"
+    assert preferred_embedder({"shared": base, BGE: below_in_third}) == "shared"
 
 
 def test_every_candidate_failing_exits_1(
@@ -587,6 +778,8 @@ def test_every_candidate_failing_exits_1(
         assert report["cv"][name]["form"] is None
         assert {row["failed"] for row in report["cv"][name]["candidates"]} == {"cross-validation"}
     assert report["choice"] is None and report["need_model"] is None
+    # The real fresh file is read, but with no choice there is no gate to check it with.
+    assert report["fresh_check"] is None
 
 
 # --- step 2: shadow runs -------------------------------------------------------------------------
@@ -948,6 +1141,22 @@ def test_choose_breaks_ties_in_order(winner: dict, loser: dict) -> None:
     assert choose([small_b, small_a], None, order) == small_a
 
 
+@pytest.mark.parametrize("order", [("shared", BGE, GRANITE), ("shared", GRANITE, BGE)])
+def test_a_tie_between_two_other_embedders_goes_by_need_embedder_order(
+    order: tuple[str, ...],
+) -> None:
+    # Plan v9 M57: two gate embedders other than `shared`, equal on every earlier key, go by
+    # `--need-embedder` order. H18's command lists bge-small before granite-r2 (the first order).
+    bge = _scored(embedder=BGE)
+    granite = _scored(embedder=GRANITE)
+    first = order[1]
+    for results in ([bge, granite], [granite, bge]):
+        assert choose(results, None, order).setting.embedder == first  # rule 2
+        assert choose(results, "shared", order).setting.embedder == first  # rule 1 is empty
+        thin = [replace(r, margin=0.02) for r in results]
+        assert choose(thin, None, order).setting.embedder == first  # rule 3
+
+
 # --- the load check and need_context -------------------------------------------------------------
 
 
@@ -1143,6 +1352,11 @@ def test_main_exits_0_and_writes_the_need_model(
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["choice"]["margin"] >= 0.05
     assert report["choice"]["setting"]["embedder"] == GRANITE
+    # No `fresh_probes`: the real fresh file is read. The chosen oracle gate knows none of its
+    # texts, so it maps each to the no-need vector, below every eligible `theta_low`.
+    fresh = report["fresh_check"]
+    assert fresh["passed"] is True and fresh["open"] == []
+    assert len(fresh["p"]) == 23
     [model] = load_models(model_out)
     assert json.loads(model_out.read_text(encoding="utf-8")) == {"records": [report["need_model"]]}
     assert model.key == report["need_model"]["key"]
@@ -1166,6 +1380,9 @@ def test_main_exits_3_when_the_choice_has_margin_under_005(
     assert code == 3
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["choice"]["margin"] == pytest.approx(13 / 14 - 0.90)
+    # The real fresh file, as in the exit 0 test: the chosen oracle gate closes every probe.
+    assert report["choice"]["setting"]["embedder"] == GRANITE
+    assert report["fresh_check"]["passed"] is True
 
 
 def test_main_exits_1_when_no_setting_passes(
@@ -1180,12 +1397,222 @@ def test_main_exits_1_when_no_setting_passes(
         base=BASE,
         shadow_runner=_hand_runner(facts),
         load_runner=_passing_load_runner(fixture),
+        # A fresh probe the oracle gate would open: with no choice nothing is checked, so it
+        # changes neither the exit nor the report.
+        fresh_probes=(_open_fresh(fixture, "fresh-open-01"),),
     )
     assert code == 1
     assert not (tmp_path / "m.json").exists()
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["choice"] is None and report["settings"]
     assert all(s["verdict"] == "fail" for s in report["settings"])
+    assert report["fresh_check"] is None
+
+
+# --- the fresh check -----------------------------------------------------------------------------
+
+
+def _closed_fresh(probe_id: str) -> Probe:
+    """A fresh noise probe whose query the label oracle does not know: the no-need vector."""
+    return _probe(probe_id, "noise")
+
+
+def _open_fresh(fixture: Fixture, probe_id: str) -> Probe:
+    """A fresh noise probe worded as a dev need probe, so the label oracle gives it need's p."""
+    need = next(probe for probe in fixture.probes if grid.is_pr1_recall(probe))
+    return replace(_probe(probe_id, "noise"), query=need.query)
+
+
+def _oracle_models(bank: NeedBank, fixture: Fixture, followups: Sequence[Followup]) -> Models:
+    """The label oracle as the only gate embedder.
+
+    The fresh check's tests skip `shared`'s fit, the slowest part of a run: the oracle is the
+    choice either way.
+    """
+    return Models(
+        fact_embedder=TokenEmbedder(),
+        reranker=TokenReranker(),
+        gate_embedders=(_oracle(GRANITE, bank, fixture, followups),),
+    )
+
+
+def _fresh_main(
+    tmp_path: Path,
+    bank: NeedBank,
+    fixture: Fixture,
+    followups: Sequence[Followup],
+    fresh: Sequence[Probe],
+) -> tuple[int, dict[str, object], Path]:
+    output, model_out = tmp_path / "grid.json", tmp_path / "need_model.json"
+    code = main(
+        _argv("--need-model-output", str(model_out), output=str(output)),
+        models=lambda _args: _oracle_models(bank, fixture, followups),
+        points=(POINT,),
+        base=BASE,
+        shadow_runner=_hand_runner(),
+        load_runner=_passing_load_runner(fixture),
+        fresh_probes=fresh,
+    )
+    return code, json.loads(output.read_text(encoding="utf-8")), model_out
+
+
+def test_no_fresh_probe_may_open_by_ruling() -> None:
+    # Raj's ruling on plan v9 Decision 1 (16 Nov 2026): none of the fresh noise probes may open
+    # the chosen gate.
+    assert grid.FRESH_OPEN_ALLOWED == 0
+    assert grid.EXIT_FRESH == 5
+
+
+def test_a_fresh_probe_at_theta_low_is_open() -> None:
+    low = 0.4
+    p = {"fresh-a": low, "fresh-b": math.nextafter(low, 0.0)}
+    assert grid.fresh_check(p, low) == {
+        "passed": False,
+        "allowed": 0,
+        "open": ["fresh-a"],
+        "p": p,
+    }
+
+
+def test_the_real_fresh_file_loads_as_23_noise_probes() -> None:
+    probes = grid.load_fresh_probes()
+    assert len(probes) == 23 and {probe.kind for probe in probes} == {"noise"}
+
+
+def test_every_fresh_probe_closed_passes_and_writes_the_need_model(
+    tmp_path: Path, fixture: Fixture, bank: NeedBank, followups: tuple[Followup, ...]
+) -> None:
+    fresh = (_closed_fresh("fresh-a"), _closed_fresh("fresh-b"))
+    code, report, model_out = _fresh_main(tmp_path, bank, fixture, followups, fresh)
+    assert code == 0  # the choice's margin is at least 0.05
+    check = report["fresh_check"]
+    assert check["passed"] is True and check["allowed"] == 0 and check["open"] == []
+    assert set(check["p"]) == {"fresh-a", "fresh-b"}
+    low = report["choice"]["setting"]["theta_low"]
+    assert all(value < low for value in check["p"].values())
+    assert report["need_model"] is not None
+    assert json.loads(model_out.read_text(encoding="utf-8")) == {"records": [report["need_model"]]}
+
+
+def test_one_open_fresh_probe_fails_with_exit_5_and_no_need_model(
+    tmp_path: Path,
+    fixture: Fixture,
+    bank: NeedBank,
+    followups: tuple[Followup, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fresh = (_closed_fresh("fresh-a"), _open_fresh(fixture, "fresh-open-01"))
+    code, report, model_out = _fresh_main(tmp_path, bank, fixture, followups, fresh)
+    assert code == grid.EXIT_FRESH == 5
+    check = report["fresh_check"]
+    assert check["passed"] is False and check["open"] == ["fresh-open-01"]
+    assert check["p"]["fresh-open-01"] >= report["choice"]["setting"]["theta_low"]
+    assert report["need_model"] is None
+    assert not model_out.exists()
+    # The choice stands in the report; there is no second choice after a failed check.
+    assert report["choice"]["setting"]["embedder"] == GRANITE
+    assert len(report["load_checks"]) == 1
+    assert "exit 5" in capsys.readouterr().err
+
+
+def test_with_one_open_probe_allowed_one_passes_and_two_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fixture: Fixture,
+    bank: NeedBank,
+    followups: tuple[Followup, ...],
+) -> None:
+    monkeypatch.setattr(grid, "FRESH_OPEN_ALLOWED", 1)
+    one = (_closed_fresh("fresh-a"), _open_fresh(fixture, "fresh-open-01"))
+    code, report, model_out = _fresh_main(tmp_path / "one", bank, fixture, followups, one)
+    assert code == 0
+    check = report["fresh_check"]
+    assert check["passed"] is True and check["allowed"] == 1
+    assert check["open"] == ["fresh-open-01"]
+    assert model_out.exists()
+    two = (*one, _open_fresh(fixture, "fresh-open-02"))
+    code, report, model_out = _fresh_main(tmp_path / "two", bank, fixture, followups, two)
+    assert code == 5
+    assert report["fresh_check"]["open"] == ["fresh-open-01", "fresh-open-02"]
+    assert report["need_model"] is None and not model_out.exists()
+
+
+def test_the_fresh_probes_change_no_score_and_no_choice(
+    fixture: Fixture, bank: NeedBank, followups: tuple[Followup, ...]
+) -> None:
+    embedders = _oracle_models(bank, fixture, followups).gate_embedders
+
+    def run(fresh: Sequence[Probe]) -> dict[str, object]:
+        outcome = run_grid(
+            fixture,
+            followups,
+            bank,
+            embedders,
+            points=(POINT,),
+            base=BASE,
+            shadow_runner=_hand_runner(),
+            load_runner=_passing_load_runner(fixture),
+            source="H18 test",
+            fresh=fresh,
+        )
+        return json.loads(json.dumps(outcome.report))
+
+    without = run(())
+    assert without["fresh_check"] is None
+    passing = run((_closed_fresh("fresh-a"),))
+    assert passing["fresh_check"]["passed"] is True
+    drop = {"fresh_check"}
+    assert {k: v for k, v in passing.items() if k not in drop} == {
+        k: v for k, v in without.items() if k not in drop
+    }
+    # A failed check also withholds the need model, and changes nothing else.
+    failing = run((_open_fresh(fixture, "fresh-open-01"),))
+    assert failing["fresh_check"]["passed"] is False and failing["need_model"] is None
+    drop = {"fresh_check", "need_model"}
+    assert {k: v for k, v in failing.items() if k not in drop} == {
+        k: v for k, v in without.items() if k not in drop
+    }
+
+
+_DEV_FILES = (
+    "probes.jsonl",
+    "facts.jsonl",
+    "vault_notes.jsonl",
+    "corrections.jsonl",
+    grid.FOLLOWUP_FILE,
+)
+
+
+@pytest.mark.parametrize("case", ["not noise", "empty", "missing"])
+def test_a_fresh_file_that_is_missing_empty_or_not_all_noise_exits_2(
+    case: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The command never runs without the fresh check: the file is a dev input like the others.
+    directory = tmp_path / "fixture"
+    directory.mkdir()
+    for name in _DEV_FILES:
+        shutil.copyfile(FIXTURE_DIR / name, directory / name)
+    rows = (FIXTURE_DIR / grid.FRESH_NOISE_FILE).read_text(encoding="utf-8").splitlines()
+    fresh = directory / grid.FRESH_NOISE_FILE
+    if case == "not noise":
+        row = json.loads(rows[-1])
+        row["kind"] = "fact"
+        fresh.write_text("\n".join([*rows[:-1], json.dumps(row)]) + "\n", encoding="utf-8")
+    elif case == "empty":
+        fresh.write_text("", encoding="utf-8")
+
+    def never(_args: object) -> Models:
+        raise AssertionError("the fresh file is refused before any model loads")
+
+    output = tmp_path / "grid.json"
+    with pytest.raises(SystemExit) as exc:
+        main(_argv(output=str(output)), models=never, fixture_dir=directory)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert grid.FRESH_NOISE_FILE in err
+    if case == "not noise":
+        assert json.loads(rows[-1])["probe_id"] in err
+    assert not output.exists()
 
 
 def test_two_setting_grid_end_to_end(

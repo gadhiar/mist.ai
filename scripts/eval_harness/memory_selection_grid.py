@@ -9,7 +9,7 @@ Step 1, the gate alone, per gate embedder (`shared`, which is the fact embedder,
 `--need-embedder`): the bank is embedded with the embedder's query prefix; each form candidate is
 cross-validated by writer (`grouped_cv`) and the form chosen by `choose_form`; a candidate whose
 fit reaches the iteration cap is reported and skipped, in cross-validation and in the final fit
-on both writers alike. The fitted gate gives `p` for every dev probe and follow-up text by the
+on every writer alike. The fitted gate gives `p` for every dev probe and follow-up text by the
 call the fetcher makes. The variants are `R` in {0.95, 0.98} by `band_k` in {1, 2}, with
 `theta_low = theta(R)` and `theta_high = theta(R - 0.10)` over the dev probes of the PR 1 recall
 classes; a variant is eligible only when every dev noise probe has `p < theta_low`. The preferred
@@ -28,11 +28,19 @@ records derived from the shadow run by `derive_record`, and scored with `PR1_GAT
 `need_context` its gate's follow-up counts give, and a setting that misses a load gate is struck
 and the rule chooses again, up to three strikes.
 
+The fresh check, once the choice is final: the chosen setting's gate scores each of the fresh
+noise probes (`fresh_noise_probes.jsonl`, read by `load_fresh_probes`), which took part in no
+decision, once, by the fetcher's call. A probe with `p >= theta_low` is open, and the check
+passes when at most `FRESH_OPEN_ALLOWED` (0) are. Its result never changes a score or the choice.
+
 Exit 0: the choice has margin at least 0.05. Exit 3: the choice has margin under 0.05, to be
 flagged to the lead. Exit 1: no setting passes (as when every candidate of every gate embedder
 failed, which leaves no setting), or the load check struck three settings or every passing one.
-Exit 2: an input error, found before any model loads (`main` lists them). A model that exists
-but fails to load raises, so Python's exit 1 comes with a traceback.
+Exit 2: an input error, found before any model loads (`main` lists them). Exit 4: a model
+directory that exists fails to load; one stderr line names the directory and the error, and no
+report is written. Exit 5: the chosen gate opened more fresh noise probes than allowed; the
+report names them and no need model is written, and nothing is chosen again. Any other error
+still ends in a traceback with Python's exit 1.
 
 Usage, from the repository root (`/app` in the image):
     python scripts/eval_harness/memory_selection_grid.py --embedder PATH --reranker PATH
@@ -51,8 +59,9 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, tzinfo
+from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 # Run as a script path (H18's command), `sys.path` starts at this directory, not the repository
 # root the absolute imports below need.
@@ -60,7 +69,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.errors import MemoryConfigError  # noqa: E402
+from safetensors import SafetensorError  # noqa: E402
+
+from backend.errors import MemoryConfigError, MemoryRerankError, MistError  # noqa: E402
 from backend.interfaces import EmbeddingProvider  # noqa: E402
 from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator  # noqa: E402
 from backend.memory.config import MemoryConfig  # noqa: E402
@@ -93,6 +104,7 @@ from scripts.eval_harness.memory_recall import (  # noqa: E402
     FIXTURE_DIR,
     ItemRef,
     Probe,
+    load_probes,
     parse_run_record,
     score_run,
 )
@@ -117,6 +129,7 @@ from scripts.eval_harness.memory_recall_run import (  # noqa: E402
 )
 
 FOLLOWUP_FILE = "followup_probes.jsonl"
+FRESH_NOISE_FILE = "fresh_noise_probes.jsonl"
 SHARED = "shared"
 
 FACT_VIEWS_GRID = ("F2", "F3")
@@ -132,11 +145,28 @@ PREFERENCE_MARGIN = 0.05
 MAX_STRIKES = 3
 LOAD_CPU_PROCS = 8
 LOAD_RESCAN_FACTS = 2000
+# How many fresh noise probes the chosen gate may open and still pass: Raj's ruling on plan v9
+# Decision 1 (16 Nov 2026), none.
+FRESH_OPEN_ALLOWED = 0
 
 EXIT_GO = 0
 EXIT_STOP = 1
 EXIT_INPUT = 2
 EXIT_FLAG = 3
+EXIT_LOAD = 4
+EXIT_FRESH = 5
+
+# What a model directory that exists can raise while it loads: rerank.py's `_MODEL_ERRORS`, an
+# ImportError from a missing optional package, and the MemoryRerankError `CrossEncoderReranker`
+# turns those into. A TypeError or any other programming error is not caught.
+_LOAD_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    ImportError,
+    SafetensorError,
+    MemoryRerankError,
+)
 
 # A difference of two shares can land a rounding step under a bound it meets exactly.
 _TOLERANCE = 1e-9
@@ -189,6 +219,23 @@ def load_followups(path: Path = FIXTURE_DIR / FOLLOWUP_FILE) -> tuple[Followup, 
             raise ValueError(f"{where}: id, previous and query are non-empty strings")
         rows.append(Followup(row["id"], row["label"], row["previous"], row["query"]))
     return tuple(rows)
+
+
+def load_fresh_probes(path: Path = FIXTURE_DIR / FRESH_NOISE_FILE) -> tuple[Probe, ...]:
+    """Read the fresh noise probes, refusing a file that would leave the fresh check empty.
+
+    Raises:
+        ValueError: A malformed row, naming its line; a row whose kind is not `noise`, naming
+            its id; or a file with no probe.
+        OSError: The file cannot be read.
+    """
+    probes = load_probes(path)
+    if not probes:
+        raise ValueError(f"{path.name} holds no probe")
+    for probe in probes:
+        if probe.kind != "noise":
+            raise ValueError(f"{path.name}: {probe.probe_id} has kind {probe.kind!r}, not noise")
+    return probes
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,9 +357,9 @@ class GateFit:
         bank: The bank it was fit on.
         cv: Every candidate's cross-validation, in `FORM_CANDIDATES` order.
         cv_failed: The candidates whose fit failed in cross-validation.
-        fit_failed: The candidates cross-validation chose whose fit on both writers failed, in
+        fit_failed: The candidates cross-validation chose whose fit on every writer failed, in
             the order they were tried.
-        form: The candidate fit on both writers; None when every candidate failed.
+        form: The candidate fit on every writer; None when every candidate failed.
         params: Its fitted parameters; None with no form.
         gate: The shadow gate, with placeholder thresholds; None with no form.
         p: Each dev probe's probability, by probe id; empty with no form.
@@ -449,7 +496,7 @@ def fit_gate(
     """Step 1 for one gate embedder: choose the form, fit it, and score the dev texts.
 
     The form is `choose_form` over the candidates whose cross-validation did not fail. The
-    chosen one is fit on both writers with `fit`; when that fit fails, the candidate is skipped
+    chosen one is fit on every writer with `fit`; when that fit fails, the candidate is skipped
     and the form is chosen again from those left. Each dev probe's `p` and each follow-up's
     previous turn and query are scored as the fetcher scores a query (`_p`); the follow-up's
     joined text through the gate's own embedding, as the fetcher scores the context.
@@ -1081,8 +1128,8 @@ def _tie_key(setting: Setting, order: Sequence[str]) -> tuple[object, ...]:
     if setting.embedder == SHARED:
         rank = 0
     else:
-        # The plan ranks `shared` first and says nothing about two other embedders that tie;
-        # this grid's own rule puts them in `--need-embedder` order, so the result is stable.
+        # Plan v9 M57: a tie between two gate embedders other than `shared`, on every earlier
+        # key, goes by `--need-embedder` order, as built (H18's command lists bge-small first).
         rank = 1 + (order.index(setting.embedder) if setting.embedder in order else len(order))
     return (
         point.select_k,
@@ -1219,7 +1266,10 @@ def load_check(
 
 @dataclass(frozen=True, slots=True)
 class GridOutcome:
-    """The report, the exit code and the chosen gate's model record (None without a choice)."""
+    """The report, the exit code and the chosen gate's model record.
+
+    The record is None without a choice and after a failed fresh check.
+    """
 
     report: dict[str, object]
     exit_code: int
@@ -1229,7 +1279,8 @@ class GridOutcome:
 def cv_report(fit: GateFit) -> dict[str, object]:
     """One embedder's cross-validation table: each candidate per fold and target, and the form.
 
-    A candidate's `failed` is `cross-validation`, `final fit` or None.
+    A candidate's `failed` is `cross-validation`, `final fit` or None. Its `scored` names the
+    writer each fold scores, in fold order, so a weak fold can be traced to its author.
     """
     rows = []
     for result in fit.cv:
@@ -1243,6 +1294,7 @@ def cv_report(fit: GateFit) -> dict[str, object]:
             {
                 "form": result.spec.describe(),
                 "failed": failed,
+                "scored": list(result.scored),
                 "score": None if result.failed else cv_score(result),
                 "closure": [list(fold) for fold in result.closure],
                 "hard_closure": [list(fold) for fold in result.hard_closure],
@@ -1260,11 +1312,39 @@ def cv_report(fit: GateFit) -> dict[str, object]:
     }
 
 
-def exit_code(choice: Scored | None) -> int:
-    """0 for a choice with margin at least 0.05, 3 for one under it, 1 for no choice."""
+def exit_code(choice: Scored | None, fresh_passed: bool | None = None) -> int:
+    """The run's exit from its choice and the fresh check.
+
+    1 for no choice; 5 when the fresh check failed; otherwise 0 for a choice with margin at
+    least 0.05 and 3 for one under it.
+
+    Args:
+        fresh_passed: The fresh check's verdict; None when it did not run.
+    """
     if choice is None or choice.margin is None:
         return EXIT_STOP
+    if fresh_passed is False:
+        return EXIT_FRESH
     return EXIT_GO if choice.margin >= MIN_MARGIN - _TOLERANCE else EXIT_FLAG
+
+
+def fresh_check(p: Mapping[str, float], theta_low: float) -> dict[str, object]:
+    """The fresh check's verdict from each fresh probe's `p` under the chosen gate.
+
+    A probe is open (served, in the band or open) at `p >= theta_low`, the chosen variant's;
+    the check passes when at most `FRESH_OPEN_ALLOWED` probes are open.
+
+    Returns:
+        The report's `fresh_check`: `passed`, `allowed`, the `open` ids in the probes' order
+        and every probe's `p` by id.
+    """
+    opened = [probe_id for probe_id, value in p.items() if value >= theta_low]
+    return {
+        "passed": len(opened) <= FRESH_OPEN_ALLOWED,
+        "allowed": FRESH_OPEN_ALLOWED,
+        "open": opened,
+        "p": dict(p),
+    }
 
 
 def run_grid(
@@ -1279,12 +1359,19 @@ def run_grid(
     load_runner: LoadRunner,
     fit: Callable[[object, Sequence[object], FormSpec], dict[str, object]] = fit_form,
     source: str | None = None,
+    fresh: Sequence[Probe] = (),
 ) -> GridOutcome:
-    """Steps 1 to 3, the choice and the load check, over the dev probes.
+    """Steps 1 to 3, the choice and the load check over the dev probes, then the fresh check.
 
     An embedder whose every candidate failed has no gate and no settings; one with no eligible
     variant has no shadow runs. Each other embedder's shadow runs are one `shadow_runner` call
     per fact view, in the order the views first appear in `points`.
+
+    Once `load_check` has made the choice final, the chosen setting's gate scores each fresh
+    probe once, by the fetcher's call (`_p`), and `fresh_check` judges them against its
+    variant's `theta_low`. The fresh probes are read nowhere else, so they change no score and
+    no choice. A failed check leaves the choice in the report but withholds the need model, and
+    the rule does not choose again.
 
     Args:
         points: The retrieval settings; `GRID` for H18.
@@ -1294,6 +1381,7 @@ def run_grid(
             follow-up records.
         fit: The final fit of each embedder's chosen form.
         source: The `need_model` record's `source`; `H18 <today>` when None.
+        fresh: The fresh noise probes; empty (tests only) runs no fresh check.
     """
     probes = fixture.probes
     fits = {e.name: fit_gate(e, bank, probes, followups, fit=fit) for e in embedders}
@@ -1349,9 +1437,18 @@ def run_grid(
         run=gated_run,
     )
     choice = outcome.choice
+    fresh_report: dict[str, object] | None = None
+    if choice is not None and fresh:
+        chosen = gated[choice.setting.embedder]
+        gate = build_gate(chosen, variant_model(chosen, choice.setting.variant, source=source))
+        fresh_report = fresh_check(
+            {probe.probe_id: _p(gate, probe.query) for probe in fresh},
+            choice.setting.variant.theta_low,
+        )
+    fresh_passed = None if fresh_report is None else bool(fresh_report["passed"])
     need_model = (
         None
-        if choice is None
+        if choice is None or fresh_passed is False
         else need_model_record(
             gated[choice.setting.embedder], choice.setting.variant, source=source
         )
@@ -1415,9 +1512,10 @@ def run_grid(
                 "cost": choice.cost,
             }
         ),
+        "fresh_check": fresh_report,
         "need_model": need_model,
     }
-    return GridOutcome(report, exit_code(choice), need_model)
+    return GridOutcome(report, exit_code(choice, fresh_passed), need_model)
 
 
 # --- the command ---------------------------------------------------------------------------------
@@ -1425,6 +1523,36 @@ def run_grid(
 
 class GridInputError(ValueError):
     """An input the grid refuses before it runs: exit 2."""
+
+
+class GridLoadError(MistError):
+    """A model directory that exists failed to load: exit 4.
+
+    The message is `<directory>: <type>: <message>`, naming the directory and the error the
+    loader raised.
+    """
+
+
+_T = TypeVar("_T")
+
+
+def _load(directory: str, loader: Callable[[], _T]) -> _T:
+    """`loader()`, with any of `_LOAD_ERRORS` turned into GridLoadError naming `directory`."""
+    try:
+        return loader()
+    except _LOAD_ERRORS as exc:
+        raise GridLoadError(f"{directory}: {type(exc).__name__}: {exc}") from exc
+
+
+def _gate_model(name: str, path: str) -> EmbeddingGenerator:
+    """A gate embedder on the CPU, as deployed, with its spec's load keywords, loaded now.
+
+    EmbeddingGenerator loads on its first use; `warmup` loads it here, so a directory that
+    cannot load fails before the grid runs rather than inside the first fit.
+    """
+    model = EmbeddingGenerator(path, device="cpu", **need_embedder_kwargs(NEED_EMBEDDERS[name]))
+    model.warmup()
+    return model
 
 
 def _under_models_root(path: str) -> bool:
@@ -1480,10 +1608,16 @@ def load_real_models(args: argparse.Namespace, *, models_lock: Path) -> Models:
 
     `shared`'s key names the fact embedder by its models.lock entry, found by its directory's
     name. Each `--need-embedder` loads on the CPU, as deployed, with its spec's load keywords.
+    Every model is loaded before this returns: the fact embedder and the cross-encoder load in
+    their constructors, and each gate embedder, which would otherwise load on its first use,
+    through `warmup`.
 
     Raises:
         GridInputError: A model directory does not exist, or the lock cannot be read or has no
             entry for the fact embedder.
+        GridLoadError: A model directory exists but its model fails to load with one of
+            `_LOAD_ERRORS`; the message names the directory and the error. Any other error, a
+            TypeError say, is not caught.
     """
     paths = [args.embedder, args.reranker, *(path for _n, path, _r in args.need_embedder or ())]
     for path in paths:
@@ -1497,13 +1631,19 @@ def load_real_models(args: argparse.Namespace, *, models_lock: Path) -> Models:
     entry = next((e for e in entries if e.name == wanted), None)
     if entry is None:
         raise GridInputError(f"{models_lock} has no entry named {wanted!r}, the fact embedder")
-    fact = SentenceTransformerEmbedder(args.embedder, device=args.embedder_device)
-    built = build_reranker(
-        "real", device=args.device, config=replace(BASE_CONFIG, rerank_model=args.reranker)
+    fact = _load(
+        args.embedder,
+        lambda: SentenceTransformerEmbedder(args.embedder, device=args.embedder_device),
+    )
+    built = _load(
+        args.reranker,
+        lambda: build_reranker(
+            "real", device=args.device, config=replace(BASE_CONFIG, rerank_model=args.reranker)
+        ),
     )
     gates = [GateEmbedder(SHARED, entry.name, entry.revision, fact)]
     for name, path, revision in args.need_embedder or ():
-        model = EmbeddingGenerator(path, device="cpu", **need_embedder_kwargs(NEED_EMBEDDERS[name]))
+        model = _load(path, partial(_gate_model, name, path))
         gates.append(GateEmbedder(name, name, revision, model))
     return Models(fact, built.reranker, tuple(gates))
 
@@ -1518,15 +1658,19 @@ def main(
     load_runner: LoadRunner | None = None,
     fixture_dir: Path = FIXTURE_DIR,
     models_lock: Path = DEFAULT_MODELS_LOCK,
+    fresh_probes: Sequence[Probe] | None = None,
 ) -> int:
     """Run the grid and write the report; return the exit code.
 
     These exit 2 through `parser.error`, before any model loads: a malformed argument, a model
     path outside /opt/models or not a directory, a gate embedder named twice, dev inputs that
-    cannot be read, and a models lock that cannot be read or lacks the fact embedder. A model
-    directory that exists but fails to load raises, as in memory_recall_run.py. The keywords
-    other than `argv` replace the real models, the grid, the fixed values and the runners, for
-    tests.
+    cannot be read (the fresh noise probes among them: a missing or empty file, or a row whose
+    kind is not `noise`, so the command never skips the fresh check), and a models lock that
+    cannot be read or lacks the fact embedder. A model directory that exists but fails to load
+    (`GridLoadError`) exits 4 with one line on stderr, `memory_selection_grid: exit 4,
+    <directory>: <type>: <message>`, and writes no report. A failed fresh check exits 5 and
+    writes the report but no need model. The keywords other than `argv` replace the real
+    models, the grid, the fixed values, the runners and the fresh noise file, for tests.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1539,6 +1683,11 @@ def main(
     try:
         fixture = Fixture.load(fixture_dir)
         followups = load_followups(fixture_dir / FOLLOWUP_FILE)
+        fresh = (
+            load_fresh_probes(fixture_dir / FRESH_NOISE_FILE)
+            if fresh_probes is None
+            else tuple(fresh_probes)
+        )
         bank = load_bank()
     except (OSError, ValueError, MemoryConfigError) as exc:
         parser.error(f"the dev inputs: {exc}")
@@ -1547,6 +1696,9 @@ def main(
         loaded = loader(args)
     except GridInputError as exc:
         parser.error(str(exc))
+    except GridLoadError as exc:
+        print(f"memory_selection_grid: exit {EXIT_LOAD}, {exc}", file=sys.stderr)
+        return EXIT_LOAD
     with tempfile.TemporaryDirectory(prefix="selection-grid-") as root:
         workdir = Path(root)
         outcome = run_grid(
@@ -1574,6 +1726,7 @@ def main(
                 workdir=workdir,
                 embedder_device=args.embedder_device,
             ),
+            fresh=fresh,
         )
     report = outcome.report
     fixed = report["fixed"]
@@ -1616,6 +1769,7 @@ __all__ = [
     "GateEmbedder",
     "GateFit",
     "GridInputError",
+    "GridLoadError",
     "GridOutcome",
     "GridPoint",
     "LoadJudgement",
@@ -1637,6 +1791,7 @@ __all__ = [
     "fixture_load_runner",
     "fixture_shadow_runner",
     "followup_counts",
+    "fresh_check",
     "gate_report",
     "gate_variants",
     "grid_config",
@@ -1644,6 +1799,7 @@ __all__ = [
     "judge_load",
     "load_check",
     "load_followups",
+    "load_fresh_probes",
     "load_real_models",
     "main",
     "need_model_record",
