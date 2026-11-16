@@ -7,9 +7,9 @@ object's type gloss so a question that names a type ("which organisations ...") 
 word with it, and F3 also drops the temporal qualifier. Notes have two views: the chunk's
 content (N0), or the note's title and the chunk's heading before it (N1), so a chunk whose body
 never names its subject still carries it. Whether any of these scores better than the served
-text is not assumed here: H18 (plan mist-read-path v7, A39) runs the fetcher over the dev probes
-across a grid of settings, the fact view among them, and picks the fact view by a rule fixed
-before it runs; the note view is N0, H13's note choice. The served text never changes with the view.
+text is not assumed here. H18 (16 Nov) was to choose the fact view from a grid of settings over
+the dev probes, but it ran no setting, so no run chose the view: F3 ships as built. The note
+view is N0, H13's note choice. The served text never changes with the view.
 
 The fact index (backend/memory/fact_index.py) embeds the view `MemoryConfig.fact_view` names and
 stores it beside the served text; a note candidate carries no view text, since N0 is its content.
@@ -91,8 +91,8 @@ FACT_VIEWS: Mapping[str, ViewSpec] = MappingProxyType(
 )
 
 # The fact view the index embeds unless told otherwise. It is a setting, not a finding:
-# `MemoryConfig.fact_view` (`MIST_MEMORY_FACT_VIEW`) defaults to the same id, which a test pins,
-# and H18 chooses the value the setting ships with.
+# `MemoryConfig.fact_view` (`MIST_MEMORY_FACT_VIEW`) defaults to the same id, which a test pins.
+# H18 chose no setting (16 Nov), so the value ships as built.
 DEFAULT_FACT_VIEW = "F3"
 
 NOTE_VIEWS: Mapping[str, NoteViewSpec] = MappingProxyType(

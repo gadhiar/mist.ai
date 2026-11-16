@@ -96,7 +96,7 @@ class TestDefaults:
         assert config.tz is UTC
         assert config.tz_name is None
         assert config.fact_view == "F3"
-        assert config.need_gate == "on"
+        assert config.need_gate == "shadow"
         assert config.need_embedder == "shared"
         assert config.need_context is True
 
@@ -125,6 +125,14 @@ class TestDefaults:
     def test_from_env_with_nothing_set_equals_the_defaults(self):
         assert MemoryConfig.from_env(tz_resolver=_never_called) == MemoryConfig()
 
+    @pytest.mark.parametrize("raw", [None, "", "  "])
+    def test_the_need_gate_is_shadow_when_unset_or_blank(self, monkeypatch, raw):
+        """The shipped model is shadow-only (plan v10 A55): by default the gate acts on nothing."""
+        if raw is not None:
+            monkeypatch.setenv("MIST_MEMORY_NEED_GATE", raw)
+
+        assert MemoryConfig.from_env(tz_resolver=_never_called).need_gate == "shadow"
+
 
 class TestFromEnv:
     def test_reads_every_scalar_variable(self, monkeypatch):
@@ -149,7 +157,7 @@ class TestFromEnv:
             "MIST_MEMORY_FACETS": "off",
             "MIST_MEMORY_RESCAN_INTERVAL_S": "45",
             "MIST_MEMORY_FACT_VIEW": "F2",
-            "MIST_MEMORY_NEED_GATE": "shadow",
+            "MIST_MEMORY_NEED_GATE": "on",
             "MIST_MEMORY_NEED_EMBEDDER": "bge-small-en-v1.5",
             "MIST_MEMORY_NEED_CONTEXT": "false",
         }
@@ -178,7 +186,7 @@ class TestFromEnv:
         assert config.facets is False
         assert config.rescan_interval_s == 45
         assert config.fact_view == "F2"
-        assert config.need_gate == "shadow"
+        assert config.need_gate == "on"
         assert config.need_embedder == "bge-small-en-v1.5"
         assert config.need_context is False
 
