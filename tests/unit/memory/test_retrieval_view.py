@@ -307,10 +307,10 @@ class TestFacetViews:
 
 
 class TestModuleDocstring:
-    def test_names_h18_as_what_picks_the_view(self):
+    def test_says_h18_ran_and_no_run_chose_the_view(self):
         doc = retrieval_view.__doc__ or ""
         assert "H18" in doc
-        assert "A39" in doc
+        assert "no run chose the view" in doc
         assert "H13 (plan mist-read-path v5) measures" not in doc
 
 

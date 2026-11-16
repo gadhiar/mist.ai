@@ -64,8 +64,9 @@ from scripts.eval_harness.memory_recall_run import (
 
 @pytest.fixture(autouse=True)
 def _gate_off_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A run without `--need-gate` takes the config's mode, `on` by default, and no gate model
-    # file ships yet; the tests of the other flags run with the gate off through the
+    # A run without `--need-gate` takes the config's mode, `shadow` by default, and the shipped
+    # gate model's record is keyed to the real fact embedder, so a token-embedder run finds no
+    # record for its key; the tests of the other flags run with the gate off through the
     # environment, which `MemoryConfig.from_env` reads. A `--need-gate` flag overrides it.
     monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "off")
 
@@ -1084,14 +1085,14 @@ def test_the_need_flags_and_the_fact_view_reach_the_config() -> None:
 def test_without_need_flags_the_config_keeps_the_environments_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "shadow")
+    monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "on")
     monkeypatch.setenv("MIST_MEMORY_NEED_CONTEXT", "false")
     args = harness._parser().parse_args(["--output", "run.jsonl"])
 
     config = harness.config_from_args(args)
 
     assert (config.need_gate, config.need_context, config.need_embedder) == (
-        "shadow",
+        "on",
         False,
         "shared",
     )

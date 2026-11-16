@@ -193,7 +193,8 @@ class MemoryConfig:
             turn has a temporal window or starts a conversation.
         select_k: Candidates the fetch selects by rank, 1 to 25 and at most `rerank_top_n`; a
             facet counts as one. The block packs them, and what expansion brings, in order
-            within its budget. A placeholder default until the selection run sets it.
+            within its budget. No run chose the default (H18, 16 Nov, ran no setting); it
+            ships as built.
         deadline_ms: Critical-path budget of `fetch`, counted from the call and covering any
             wait on stage 1.
         rerank_backend: `local` cross-encoder, `remote` HTTP endpoint, or `off`.
@@ -225,12 +226,16 @@ class MemoryConfig:
             change alters. The default equals `retrieval_view.DEFAULT_FACT_VIEW`.
         need_gate: Whether each fetch asks the need gate first. `on` acts on its band,
             `shadow` decides and traces, then serves the fetch as open, and `off` builds no
-            gate, so nothing reads the need bank or the gate model file. `off` is the rollback
-            lever when either of those is what broke.
+            gate, so nothing reads the need bank or the gate model file. `shadow` is the
+            default: the shipped model is shadow-only (its `source` starts with
+            `need_gate.SHADOW_ONLY`), fit when no gate met the eligibility rule, so nothing
+            acts on it. `off` is the rollback lever when the bank or the model file is what
+            broke.
         need_embedder: The gate embedder, a `need_gate.NEED_EMBEDDERS` name. `shared` reuses
             the fetch's own query vector; another name embeds the query a second time, with
-            that model's query prefix, on the `memory-gate` executor. A placeholder default
-            until the gate's selection run sets it.
+            that model's query prefix, on the `memory-gate` executor. No run chose the default
+            (H18, 16 Nov, ran no setting); it ships as built, and the shipped model is fit for
+            it.
         need_context: Whether a closed or band query that follows a fetch which served memory
             is also judged by the previous user turn joined to it, taking the higher
             probability.
@@ -263,7 +268,7 @@ class MemoryConfig:
     facets: bool = True
     rescan_interval_s: int = 300
     fact_view: FactViewId = "F3"
-    need_gate: NeedGateMode = "on"
+    need_gate: NeedGateMode = "shadow"
     need_embedder: NeedEmbedderName = "shared"
     need_context: bool = True
     corrections_enabled: bool = True
@@ -362,7 +367,7 @@ class MemoryConfig:
             facets=_env_bool("MIST_MEMORY_FACETS", True),
             rescan_interval_s=_env_int("MIST_MEMORY_RESCAN_INTERVAL_S", 300),
             fact_view=_env("MIST_MEMORY_FACT_VIEW") or "F3",  # type: ignore[arg-type]
-            need_gate=_env("MIST_MEMORY_NEED_GATE") or "on",  # type: ignore[arg-type]
+            need_gate=_env("MIST_MEMORY_NEED_GATE") or "shadow",  # type: ignore[arg-type]
             need_embedder=_env("MIST_MEMORY_NEED_EMBEDDER") or "shared",  # type: ignore[arg-type]
             need_context=_env_bool("MIST_MEMORY_NEED_CONTEXT", True),
             corrections_enabled=_env_bool("MIST_MEMORY_CORRECTIONS_ENABLED", True),

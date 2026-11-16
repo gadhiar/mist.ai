@@ -1,8 +1,10 @@
 """The phase-1 recall gate: judge one recall run against the read path's first-PR gates.
 
 H4 runs this over every gated run of `memory_recall_run.py`, idle and under load, of each probe
-set, and the first PR merges only when every run exits 0. The gates are plan mist-read-path's
-table, held here as `PR1_GATES`:
+set, and a run exits 1 when any line it gates fails. Which lines a PR waits on is the plan's
+reading rule at H4: for the library PR, plan mist-read-path v10 A56 reads `empty_on_noise` as
+reported, not gated, while no need gate acts. The gates are plan mist-read-path's table, held
+here as `PR1_GATES`:
 
 - Recall@block per class, on idle runs of the held-out set. Each class is a predicate on the
   probe's `kind`, `shape`, lexical tag (paraphrase is `lexical: false`) and whether `expected`

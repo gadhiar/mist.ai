@@ -55,6 +55,11 @@ DEFAULT_BANK_PATHS: tuple[Path, ...] = (
 )
 DEFAULT_MODEL_PATH: Path = _HERE / "need_model.json"
 
+# A record whose `source` starts with this was fit for shadow mode only: no eligibility rule
+# chose it, so it may decide and trace but not act. The turn PR's wiring (T33) refuses
+# `need_gate` `on` with such a record.
+SHADOW_ONLY: str = "shadow-only"
+
 NORMALISATION = "l2"
 LABELS = ("need", "no_need")
 
