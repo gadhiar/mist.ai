@@ -89,10 +89,12 @@ BLOCK_CAP_TOKENS = 300
 NEW_SHAPE_MINIMUM = 12
 
 # The dev set every setting is chosen on, and the held-out set the read path's first PR is
-# judged on. The per-probe rules hold for both; the file-level counts are each file's own.
+# judged on. The fresh noise set is checked once, after the selection grid's choice is final,
+# and is never used to choose. The per-probe rules hold for all three; the file-level counts are
+# each file's own (test_fresh_noise_probes.py holds the fresh set's).
 DEV_PROBES = "probes.jsonl"
 HELDOUT_PROBES = "heldout_probes.jsonl"
-PROBE_FILES = (DEV_PROBES, HELDOUT_PROBES)
+PROBE_FILES = (DEV_PROBES, HELDOUT_PROBES, "fresh_noise_probes.jsonl")
 
 
 # ---------------------------------------------------------------------------
