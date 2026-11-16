@@ -29,6 +29,7 @@ PROBE_PATHS = (FIXTURE_DIR / "probes.jsonl", FIXTURE_DIR / "heldout_probes.jsonl
 BANK_PATHS = (
     REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_a.jsonl",
     REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_b.jsonl",
+    REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_c.jsonl",
 )
 
 KEYS = ("id", "label", "previous", "query")
