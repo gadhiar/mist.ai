@@ -1,4 +1,4 @@
-"""Gate calibration on public speakers: pools, impostor trials and the threshold rule (A19).
+"""Gate calibration on public speakers: pools, trials and the threshold rule (A22).
 
 Runs as `/opt/venv-score/bin/python -I -m scripts.voice_data.rehearsal.calibrate --data /data
 --plan rehearsal/calibration/<C>/calibration-plan.json` in the `score` image, on the CPU, with
@@ -33,7 +33,12 @@ optional; the job refuses (exit 1) a plan that breaks any rule, naming ids and c
         "bootstrap": 1000,          # speaker-level resamples
         "anchor_sets": 10           # anchor sets drawn per speaker, draw 1 the pool's; >= 1
       },
-      "datasets": [                 # 1 or 2, names unique; never pooled
+      "matched": {                  # exactly the three gates; each a list of unique target
+        "anchors.sim_min": ["sets"],          # forms of that gate, whose miss the rule
+        "retrieval.anchor_floor": ["centroid/n10", "centroid/n20", "centroid/n30"],
+        "retrieval.margin": ["rival"]         # minimises
+      },
+      "datasets": [                # 1 or 2, names unique; never pooled
         {
           "name": "librittsr",
           "licence": "<text>", "subset": "<text>",
@@ -83,9 +88,32 @@ into pieces. A draw that cannot form a set is skipped and counted. Only the anch
 trials read the later draws: impostor trials, the floor and the margin read draw 1.
 
 Trials pair two speakers of one sex within one dataset, in both orders, and score them with
-extract's own `retrieve.centroids` and `retrieve.sims` (`score.cosine` underneath). The
-threshold rule reads impostor trials only. Target trials give the reported miss rates; each
-records its owner's speaker index, and a margin target trial its rivals' too.
+extract's own `retrieve.centroids` and `retrieve.sims` (`score.cosine` underneath). Each target
+trial records its owner's speaker index, and a margin target trial its rivals' too.
+
+The threshold rule (A22), per gate, with e1 WavLM-SV and e2 ECAPA in `EMBEDDERS` order:
+
+1. A pair (v1, v2) accepts a trial when each embedder's score is at or above its value less
+   `EPS`, extract's rule. A form's FAR is the share of its impostor trials accepted; its miss the
+   share of its target trials not accepted. A weight counts a trial that many times in both.
+2. v1 runs over the 0.0001 grid from the largest value accepting every trial of the gate on e1
+   (target and impostor, every form, both datasets) to the smallest accepting none. v2(v1) is the
+   least grid value, from the same lower end on e2, at which every impostor form of each dataset
+   holds FAR at or below alpha; the n-of-5 forms stay reported. At v1's lower end the rule is
+   ECAPA's alone, and where v2(v1) is e2's lower end it is WavLM-SV's alone.
+3. A larger v2 also holds alpha but misses at least as many target trials, so the candidates
+   are (v1, v2(v1)), and v2 is never raised above v2(v1).
+4. The pair is the candidate with the smallest largest miss over the plan's `matched` forms of
+   both datasets, then the smallest mean of those misses, then the smallest largest FAR over the
+   impostor forms, then the larger v1.
+5. v5's pair, alpha split equally between the embedders, holds alpha, so the candidate at its v1
+   has a v2 no higher than its own and the chosen pair never misses more in sample. It is
+   reported beside as `equal_beta`.
+
+v2(v1) comes from one sweep per form: as v1 falls, the trials it admits are a growing prefix in
+e1's order, and a heap gives each prefix's bound on v2. The bootstrap re-solves the rule on
+`bootstrap` speaker resamples: an impostor trial counts the copies of A times those of B, and a
+target trial its owner's copies.
 
 Output: `calibration.json` and `outputs.json` beside the plan. Printed lines and messages name
 ids and counts, never a file.
@@ -95,6 +123,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
 import io
 import itertools
 import json
@@ -151,6 +180,8 @@ DATASETS = (LIBRITTSR, RAVDESS)
 NEUTRAL = "neutral"
 CALM = "calm"
 SOLO = "solo"
+CENTROID = "centroid"
+RIVAL = "rival"
 MIXED = "mixed"
 ALL = "all"
 OTHERS = "others"
@@ -258,6 +289,7 @@ class Plan:
     seed: int
     embedders: dict[str, str]
     trials: TrialParams
+    matched: dict[str, tuple[str, ...]]
     datasets: tuple[DatasetPlan, ...]
 
 
@@ -347,6 +379,44 @@ def _trials(raw: object, problems: list[str]) -> TrialParams:
             "and at most 40, anchor k unique and 1-5"
         )
     return params
+
+
+def target_forms(params: TrialParams) -> dict[str, frozenset[str]]:
+    """Return each gate's target forms, the names `dataset_trials` gives them."""
+    sizes = (*params.cluster_n, *params.reported_n)
+    return {
+        SIM_MIN: frozenset({OTHERS, SETS}),
+        FLOOR: frozenset(f"{anchor}/n{n}" for anchor in (SOLO, CENTROID) for n in sizes),
+        MARGIN: frozenset({RIVAL}),
+    }
+
+
+def _matched(raw: object, params: TrialParams, problems: list[str]) -> dict[str, tuple[str, ...]]:
+    if not isinstance(raw, dict):
+        problems.append("matched is missing or not an object")
+        return {}
+    if set(raw) != set(GATES):
+        problems.append(f"matched does not name exactly the gates {', '.join(GATES)}")
+        return {}
+    known = target_forms(params)
+    found: dict[str, tuple[str, ...]] = {}
+    for gate in GATES:
+        forms = raw[gate]
+        if (
+            not isinstance(forms, list)
+            or not forms
+            or not all(isinstance(f, str) for f in forms)
+            or len(set(forms)) != len(forms)
+        ):
+            problems.append(f"matched {gate} is not a list of unique form names")
+            continue
+        unknown = [f for f in forms if f not in known[gate]]
+        if unknown:
+            problems.append(
+                f"matched {gate} names {', '.join(unknown)}, not a target form of the gate"
+            )
+        found[gate] = tuple(forms)
+    return found
 
 
 def _excluded(raw: object, name: str, problems: list[str]) -> tuple[tuple[str, str, str], ...]:
@@ -468,6 +538,7 @@ def parse_plan(raw: object) -> Plan:
     if not embedders:
         problems.append("the plan names no embedder")
     trials = _trials(raw.get("trials"), problems)
+    matched = _matched(raw.get("matched"), trials, problems)
     datasets: list[DatasetPlan] = []
     raw_datasets = raw.get("datasets")
     if not isinstance(raw_datasets, list) or not 1 <= len(raw_datasets) <= len(DATASETS):
@@ -491,6 +562,7 @@ def parse_plan(raw: object) -> Plan:
         seed=int(seed),  # type: ignore[arg-type]
         embedders=embedders,
         trials=trials,
+        matched=matched,
         datasets=tuple(datasets),
     )
 
@@ -1030,8 +1102,8 @@ def dataset_trials(
     dkey = _key(name)
     sizes = list(params.cluster_n) + list(params.reported_n)
     centres = {
-        "solo": [retrieve.centroids([s.anchors[0]]) for s in speakers],
-        "centroid": [retrieve.centroids(list(s.anchors)) for s in speakers],
+        SOLO: [retrieve.centroids([s.anchors[0]]) for s in speakers],
+        CENTROID: [retrieve.centroids(list(s.anchors)) for s in speakers],
     }
     model = [retrieve.centroids(list(s.pieces[: params.model_pieces])) for s in speakers]
     rival = [retrieve.centroids(list(s.pieces[: params.rival_pieces])) for s in speakers]
@@ -1088,7 +1160,7 @@ def dataset_trials(
             for held in b.pieces[params.model_pieces :]:
                 to_a = retrieve.sims(held, model[ia])
                 to_b = retrieve.sims(held, rival[ib])
-                add(MARGIN, "rival", ia, ib, [to_a[n] - to_b[n] for n in names])
+                add(MARGIN, RIVAL, ia, ib, [to_a[n] - to_b[n] for n in names])
             for k in params.anchor_k:
                 for centre in subset_centres[ia][k]:
                     for anchor in b.anchors:
@@ -1114,7 +1186,7 @@ def dataset_trials(
                 to_a = retrieve.sims(held, model[ia])
                 nearest = [retrieve.sims(held, rival[c]) for c in chosen]
                 gap = [to_a[n] - max(s[n] for s in nearest) for n in names]
-                add_target(MARGIN, "rival", gap, register, ia, chosen)
+                add_target(MARGIN, RIVAL, gap, register, ia, chosen)
         for drawn in a.anchor_sets():
             _, found = retrieve.anchor_check(list(drawn.anchors), unset)
             for sims, register in zip(found, drawn.registers):
@@ -1155,13 +1227,13 @@ def dataset_trials(
 
 
 # ---------------------------------------------------------------------------
-# The threshold rule
+# v5's equal split (A19), kept only as the comparator `equal_beta`
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class FormRule:
-    """Steps 1-3 on one form: beta*, each embedder's `t_e(beta*)` and the joint FAR there."""
+    """v5's steps 1-3 on one form: beta*, each embedder's `t_e(beta*)` and the joint FAR there."""
 
     beta: float
     values: tuple[float, ...]
@@ -1172,7 +1244,7 @@ class FormRule:
 
 @dataclass(frozen=True, slots=True)
 class GateValues:
-    """Step 4: each embedder's value, the maximum over forms and datasets, and what set it."""
+    """v5's step 4: each embedder's value, the maximum over forms and datasets, and what set it."""
 
     values: tuple[float, ...]
     set_by: tuple[tuple[str, str], ...]
@@ -1250,7 +1322,7 @@ def _ones(scores: np.ndarray) -> np.ndarray:
 
 
 def threshold(scores: np.ndarray, alpha: float, weights: np.ndarray | None = None) -> FormRule:
-    """Run threshold-rule steps 1-3 on one form's impostor trials.
+    """Run v5's equal-split steps 1-3 on one form's impostor trials.
 
     Args:
         scores: One row per trial, one column per embedder.
@@ -1304,7 +1376,7 @@ def _gate(
 
 
 def gate_values(forms: Mapping[tuple[str, str], np.ndarray], alpha: float) -> GateValues:
-    """Run threshold-rule step 4 on one gate: forms keyed by (dataset, form), never pooled.
+    """Run v5's equal-split step 4 on one gate: forms keyed by (dataset, form), never pooled.
 
     Raises:
         StageError: No form has a trial, or alpha is off the grid.
@@ -1316,20 +1388,335 @@ def gate_values(forms: Mapping[tuple[str, str], np.ndarray], alpha: float) -> Ga
     return found
 
 
+# ---------------------------------------------------------------------------
+# The threshold rule (A22): the least matched target miss within alpha
+# ---------------------------------------------------------------------------
+
+Key = tuple[str, str]
+"""A form of one dataset, (dataset, form); forms of two datasets are never pooled."""
+_UNSET = -(1 << 62)
+"""`_bounds`' value for a prefix that does not bound the second embedder's value."""
+TIE = 1e-12
+"""Rates closer than this tie in step 4, so a mean's float rounding cannot order two pairs."""
+
+
+def _accept_units(scores: object) -> np.ndarray:
+    """Return per score the largest grid unit u that accepts it: `score >= u / GRID - EPS`.
+
+    A value of u units accepts a trial exactly when u is at most the trial's unit, so the rule
+    compares integers and still applies extract's own test (`retrieve.EPS`).
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    units = np.floor((scores + EPS) * GRID).astype(np.int64)
+    while (high := units / GRID - EPS > scores).any():
+        units = units - high
+    while (low := (units + 1) / GRID - EPS <= scores).any():
+        units = units + low
+    return units
+
+
+class _Units:
+    """One form's trials as accept units per embedder, with the first embedder's order kept."""
+
+    __slots__ = ("units", "order")
+
+    def __init__(self, scores: np.ndarray) -> None:
+        scores = np.asarray(scores, dtype=np.float64)
+        if scores.ndim != 2 or scores.shape[1] != 2:
+            raise StageError("the threshold rule takes trials scored on exactly two embedders")
+        self.units = _accept_units(scores)
+        self.order = np.argsort(-self.units[:, 0], kind="stable")
+
+    def accepted(self, pair: Sequence[int], weights: np.ndarray) -> int:
+        """Return the weight the pair accepts, both embedders at or above their values."""
+        hit = (self.units[:, 0] >= pair[0]) & (self.units[:, 1] >= pair[1])
+        return int(weights[hit].sum())
+
+
+@dataclass(frozen=True, slots=True)
+class GateTrials:
+    """One gate's trials in grid units, prepared once for every solve of the gate.
+
+    `impostor` holds the constraint forms, `matched` the matched target forms. `low` and `high`
+    are step 2's range per embedder over every trial of the gate: the largest grid unit that
+    accepts every trial, and the smallest that accepts none.
+    """
+
+    impostor: dict[Key, _Units]
+    matched: dict[Key, _Units]
+    low: tuple[int, int]
+    high: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class Solution:
+    """The chosen pair and what it costs.
+
+    `miss` and `mean_miss` are step 4's keys 1 and 2 over the matched forms, `far` its key 3
+    over the impostor forms, and `binding` the impostor form with the largest FAR (the first in
+    order on a tie). `misses` and `fars` hold each form's weighted rate at the pair, for the
+    forms that carry weight.
+    """
+
+    values: tuple[float, float]
+    units: tuple[int, int]
+    miss: float
+    mean_miss: float
+    far: float
+    binding: Key
+    misses: dict[Key, float]
+    fars: dict[Key, float]
+
+
+def prepare_gate(
+    impostor: Mapping[Key, np.ndarray],
+    matched: Mapping[Key, np.ndarray],
+    others: Sequence[np.ndarray] = (),
+) -> GateTrials:
+    """Return a gate's trials for `solve`; `others` are its remaining trials, read for the range.
+
+    Raises:
+        StageError: The gate has no trial, or a form is not scored on two embedders.
+    """
+    every = [
+        np.asarray(s, dtype=np.float64).reshape(-1, 2)
+        for s in (*impostor.values(), *matched.values(), *others)
+    ]
+    every = [s for s in every if len(s)]
+    if not every:
+        raise StageError("a gate has no trial")
+    stacked = np.vstack(every)
+    low = _accept_units(stacked.min(axis=0))
+    high = _accept_units(stacked.max(axis=0)) + 1
+    return GateTrials(
+        impostor={key: _Units(scores) for key, scores in impostor.items()},
+        matched={key: _Units(scores) for key, scores in matched.items()},
+        low=(int(low[0]), int(low[1])),
+        high=(int(high[0]), int(high[1])),
+    )
+
+
+def _weights(
+    forms: Mapping[Key, _Units], given: Mapping[Key, np.ndarray] | None
+) -> dict[Key, np.ndarray]:
+    if given is None:
+        return {key: np.ones(len(form.units), dtype=np.int64) for key, form in forms.items()}
+    found = {key: np.asarray(given[key], dtype=np.int64) for key in forms}
+    if any(len(found[key]) != len(form.units) for key, form in forms.items()):
+        raise StageError("a form's weights do not match its trials")
+    return found
+
+
+def _bounds(form: _Units, weights: np.ndarray, allowed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return the form's first-embedder units, descending, and the least v2 of each prefix.
+
+    As v1 falls, the trials it admits are a growing prefix in that order. `bound[i]` is the least
+    second-embedder unit at which the first i trials accept at most `allowed` weight: one above
+    their (allowed + 1)-th largest second unit, counted by weight, or `_UNSET` while they weigh
+    `allowed` or less. A min-heap keeps the fewest largest units that weigh more than `allowed`,
+    so its least entry is that unit (the Design's prefix sweep).
+    """
+    order = form.order[weights[form.order] > 0]
+    bound = [_UNSET] * (len(order) + 1)
+    heap: list[tuple[int, int]] = []
+    kept = 0
+    seconds = form.units[order, 1].tolist()
+    for i, (unit, count) in enumerate(zip(seconds, weights[order].tolist())):
+        heapq.heappush(heap, (unit, count))
+        kept += count
+        while kept - heap[0][1] > allowed:
+            kept -= heapq.heappop(heap)[1]
+        if kept > allowed:
+            bound[i + 1] = heap[0][0] + 1
+    return form.units[order, 0], np.asarray(bound, dtype=np.int64)
+
+
+def _accepted_at(
+    form: _Units, weights: np.ndarray, firsts: np.ndarray, seconds: np.ndarray
+) -> np.ndarray:
+    """Return the weight the form accepts at each candidate (`firsts[i]`, `seconds[i]`).
+
+    `firsts` rises and `seconds` never does, so a trial is accepted over one run of candidates:
+    from the first whose v2 it reaches to the last whose v1 it reaches.
+    """
+    keep = weights > 0
+    units, counts = form.units[keep], weights[keep]
+    right = np.searchsorted(firsts, units[:, 0], side="right")
+    left = np.searchsorted(-seconds, -units[:, 1], side="left")
+    run = left < right
+    size = len(firsts) + 1
+    edges = np.bincount(left[run], weights=counts[run], minlength=size) - np.bincount(
+        right[run], weights=counts[run], minlength=size
+    )
+    return np.rint(np.cumsum(edges)[:-1]).astype(np.int64)
+
+
+def solve(
+    gate: GateTrials,
+    alpha_units: int,
+    impostor_weights: Mapping[Key, np.ndarray] | None = None,
+    target_weights: Mapping[Key, np.ndarray] | None = None,
+) -> Solution | None:
+    """Choose a gate's pair by the threshold rule, steps 2-6; `None` when no impostor weighs.
+
+    Weights count a trial that many times, in FAR and miss alike (a bootstrap resample, or a
+    left-out speaker at 0); every form of `gate` needs one, one each when `None`. The candidates
+    are v1 at each unit some weighted trial reaches, and at `high`: between two of them every
+    key is the same, so key 4 takes the upper one, and the search equals one over every v1 of
+    the grid. Each v1's v2 is the least unit at or above `low` holding alpha in every impostor
+    form, and is never raised further.
+
+    Raises:
+        StageError: A form's weights do not match its trials.
+    """
+    impostor_w = _weights(gate.impostor, impostor_weights)
+    target_w = _weights(gate.matched, target_weights)
+    totals = {key: int(w.sum()) for key, w in impostor_w.items()}
+    live = [key for key in gate.impostor if totals[key] > 0]
+    if not live:
+        return None
+    targets = {key: int(w.sum()) for key, w in target_w.items()}
+    aimed = [key for key in gate.matched if targets[key] > 0]
+    bounds = {
+        key: _bounds(gate.impostor[key], impostor_w[key], alpha_units * totals[key] // GRID)
+        for key in live
+    }
+    firsts = np.unique(
+        np.concatenate(
+            [
+                *(bounds[key][0] for key in live),
+                *(gate.matched[key].units[target_w[key] > 0, 0] for key in aimed),
+                np.array([gate.high[0]], dtype=np.int64),
+            ]
+        )
+    )
+    seconds = np.full(len(firsts), gate.low[1], dtype=np.int64)
+    for key in live:
+        units, bound = bounds[key]
+        seconds = np.maximum(seconds, bound[np.searchsorted(-units, -firsts, side="right")])
+    fars = {
+        key: _accepted_at(gate.impostor[key], impostor_w[key], firsts, seconds) / totals[key]
+        for key in live
+    }
+    misses = {
+        key: (targets[key] - _accepted_at(gate.matched[key], target_w[key], firsts, seconds))
+        / targets[key]
+        for key in aimed
+    }
+    far = np.vstack(list(fars.values())).max(axis=0)
+    if misses:
+        stacked = np.vstack(list(misses.values()))
+        worst, mean = stacked.max(axis=0), stacked.mean(axis=0)
+    else:
+        worst = mean = np.zeros(len(firsts))
+    keep = np.ones(len(firsts), dtype=bool)
+    for key in (worst, mean, far):
+        keep &= key <= key[keep].min() + TIE
+    i = int(np.flatnonzero(keep)[-1])
+    rates = {key: float(rate[i]) for key, rate in fars.items()}
+    pair = (int(firsts[i]), int(seconds[i]))
+    return Solution(
+        values=(round(pair[0] / GRID, 4), round(pair[1] / GRID, 4)),
+        units=pair,
+        miss=float(worst[i]),
+        mean_miss=float(mean[i]),
+        far=float(far[i]),
+        binding=max(live, key=lambda key: rates[key]),
+        misses={key: float(rate[i]) for key, rate in misses.items()},
+        fars=rates,
+    )
+
+
+def least_miss(
+    impostor: Mapping[Key, np.ndarray],
+    matched: Mapping[Key, np.ndarray],
+    alpha: float,
+    impostor_weights: Mapping[Key, np.ndarray] | None = None,
+    target_weights: Mapping[Key, np.ndarray] | None = None,
+    others: Sequence[np.ndarray] = (),
+) -> Solution:
+    """Run the threshold rule on one gate's trials, scores in rows, `EMBEDDERS` order in columns.
+
+    Raises:
+        StageError: No impostor trial weighs, alpha is off the grid, or a form is malformed.
+    """
+    found = solve(
+        prepare_gate(impostor, matched, others),
+        _alpha_units(alpha),
+        impostor_weights,
+        target_weights,
+    )
+    if found is None:
+        raise StageError("a gate has no impostor trial")
+    return found
+
+
+def gate_trials(datasets: Sequence[DatasetTrials], gate: str, matched: Sequence[str]) -> GateTrials:
+    """Return one gate's trials for `solve`: its impostor forms and its matched target forms."""
+    impostor = {(d.name, f): t.scores for d in datasets for f, t in d.impostor[gate].items()}
+    targets = {
+        (d.name, f): d.target[gate][f].scores
+        for d in datasets
+        for f in matched
+        if f in d.target[gate]
+    }
+    others = [
+        t.scores for d in datasets for group in (d.reported, d.target) for t in group[gate].values()
+    ]
+    return prepare_gate(impostor, targets, others)
+
+
+def gate_weights(
+    datasets: Sequence[DatasetTrials],
+    gate: str,
+    matched: Sequence[str],
+    copies: Mapping[str, np.ndarray],
+) -> tuple[dict[Key, np.ndarray], dict[Key, np.ndarray]]:
+    """Return each trial's weight when speaker i of a dataset counts `copies[dataset][i]` times.
+
+    An impostor trial (A, B) weighs the copies of A times the copies of B, so a speaker never
+    meets a copy of itself; a target trial weighs its owner's copies.
+    """
+    impostor = {
+        (d.name, f): copies[d.name][t.a] * copies[d.name][t.b]
+        for d in datasets
+        for f, t in d.impostor[gate].items()
+    }
+    target = {
+        (d.name, f): copies[d.name][d.target[gate][f].owners]
+        for d in datasets
+        for f in matched
+        if f in d.target[gate]
+    }
+    return impostor, target
+
+
+@dataclass(frozen=True, slots=True)
+class EqualSplit:
+    """v5's equal-split pair on the same trials, and its matched misses (`equal_beta`)."""
+
+    values: tuple[float, ...]
+    miss: float
+    mean_miss: float
+
+
 @dataclass(frozen=True, slots=True)
 class Summary:
-    """The values per gate, and the bootstrap's 5th-95th percentile intervals (step 5).
+    """The values per gate, and the bootstrap's 5th-95th percentile intervals.
 
     `intervals` holds each embedder's value interval per gate; `far_intervals` the joint FAR
-    interval at the chosen values per gate and (dataset, form), reported forms included.
-    `resamples` counts, per gate, the resamples that gave values (one whose speakers are all
-    copies of one per sex has no pair).
+    interval at the chosen values per gate and (dataset, form), reported forms included;
+    `miss_intervals` each target form's miss interval at the chosen values per register, `all`
+    included. `resamples` counts, per gate, the resamples that gave values (one whose speakers
+    are all copies of one per sex has no pair).
     """
 
     values: dict[str, tuple[float, ...]]
-    gates: dict[str, GateValues]
+    solutions: dict[str, Solution]
+    equal: dict[str, EqualSplit]
     intervals: dict[str, tuple[tuple[float, float] | None, ...]]
-    far_intervals: dict[str, dict[tuple[str, str], tuple[float, float] | None]]
+    far_intervals: dict[str, dict[Key, tuple[float, float] | None]]
+    miss_intervals: dict[str, dict[Key, dict[str, tuple[float, float] | None]]]
     resamples: dict[str, int]
 
 
@@ -1340,29 +1727,66 @@ def _interval(samples: Sequence[float], places: int) -> tuple[float, float] | No
     return round(float(low), places), round(float(high), places)
 
 
+def _equal_split(
+    datasets: Sequence[DatasetTrials], gate: str, prepared: GateTrials, alpha_units: int
+) -> EqualSplit:
+    """Return v5's equal-split pair on the gate's impostor forms, and its matched misses."""
+    forms = {
+        (d.name, f): _Prepared(t.scores) for d in datasets for f, t in d.impostor[gate].items()
+    }
+    found = _gate(forms, {k: _ones(p.scores) for k, p in forms.items()}, alpha_units)
+    if found is None:
+        raise StageError(f"{gate} has no trial")
+    pair = [int(round(v * GRID)) for v in found.values]
+    rates = []
+    for form in prepared.matched.values():
+        ones = np.ones(len(form.units), dtype=np.int64)
+        if len(ones):
+            rates.append((len(ones) - form.accepted(pair, ones)) / len(ones))
+    return EqualSplit(
+        values=found.values,
+        miss=max(rates, default=0.0),
+        mean_miss=float(np.mean(rates)) if rates else 0.0,
+    )
+
+
+def _registers(target: TargetTrials) -> tuple[list[str], np.ndarray]:
+    """Return a form's registers, `all` first, and each trial's register index."""
+    registers = [ALL, *sorted(set(target.registers))]
+    index = {register: i for i, register in enumerate(registers)}
+    return registers, np.array([index[r] for r in target.registers], dtype=np.int64)
+
+
 def summarise(
     datasets: Sequence[DatasetTrials],
     alpha: float,
     seed: int,
     bootstrap: int,
     names: Sequence[str],
+    matched: Mapping[str, Sequence[str]],
 ) -> Summary:
-    """Set each gate's values from the impostor trials and bootstrap their intervals.
+    """Set each gate's values by the threshold rule and bootstrap their intervals.
 
-    The bootstrap resamples speakers with replacement within each sex and dataset. A pair of
-    copies of A and B carries the original (A, B) trials, so a resample weighs each trial by the
-    copies of A times the copies of B, and a speaker never meets a copy of itself.
+    The bootstrap resamples speakers with replacement within each sex and dataset and solves the
+    rule again on each resample. A pair of copies of A and B carries the original (A, B) trials,
+    so an impostor trial weighs the copies of A times the copies of B, and a speaker never meets
+    a copy of itself; a target trial weighs its owner's copies.
 
     Raises:
-        StageError: A gate has no trial, or alpha is off the grid.
+        StageError: A gate has no trial, alpha is off the grid, or `names` is not two embedders.
     """
+    if len(names) != 2:
+        raise StageError("the threshold rule takes exactly two embedders")
     alpha_units = _alpha_units(alpha)
-    prepared = {
-        gate: {
-            (d.name, f): _Prepared(t.scores) for d in datasets for f, t in d.impostor[gate].items()
-        }
-        for gate in GATES
-    }
+    prepared = {gate: gate_trials(datasets, gate, matched[gate]) for gate in GATES}
+    solutions: dict[str, Solution] = {}
+    for gate in GATES:
+        found = solve(prepared[gate], alpha_units)
+        if found is None:
+            raise StageError(f"{gate} has no trial")
+        solutions[gate] = found
+    values = {gate: solutions[gate].values for gate in GATES}
+    equal = {gate: _equal_split(datasets, gate, prepared[gate], alpha_units) for gate in GATES}
     every = {
         gate: {
             (d.name, f): t
@@ -1371,18 +1795,21 @@ def summarise(
         }
         for gate in GATES
     }
-    gates: dict[str, GateValues] = {}
-    for gate in GATES:
-        found = _gate(
-            prepared[gate], {k: _ones(p.scores) for k, p in prepared[gate].items()}, alpha_units
-        )
-        if found is None:
-            raise StageError(f"{gate} has no trial")
-        gates[gate] = found
-    values = {gate: gates[gate].values for gate in GATES}
+    targets = {
+        gate: {
+            (d.name, f): (t, *_registers(t), ~_accepted(t.scores, values[gate]))
+            for d in datasets
+            for f, t in d.target[gate].items()
+        }
+        for gate in GATES
+    }
     value_samples: dict[str, list[tuple[float, ...]]] = {gate: [] for gate in GATES}
-    far_samples: dict[str, dict[tuple[str, str], list[float]]] = {
+    far_samples: dict[str, dict[Key, list[float]]] = {
         gate: {key: [] for key in every[gate]} for gate in GATES
+    }
+    miss_samples: dict[str, dict[Key, list[list[float]]]] = {
+        gate: {key: [[] for _ in found[1]] for key, found in targets[gate].items()}
+        for gate in GATES
     }
     groups = {
         d.name: [np.flatnonzero(np.asarray(d.sexes) == sex) for sex in sorted(set(d.sexes))]
@@ -1397,17 +1824,22 @@ def summarise(
                 np.add.at(copies, group[rng.integers(0, len(group), len(group))], 1)
             counts[d.name] = copies
         for gate in GATES:
-            weights = {
-                key: counts[key[0]][t.a] * counts[key[0]][t.b] for key, t in every[gate].items()
-            }
-            found = _gate(prepared[gate], {k: weights[k] for k in prepared[gate]}, alpha_units)
+            impostor_w, target_w = gate_weights(datasets, gate, matched[gate], counts)
+            found = solve(prepared[gate], alpha_units, impostor_w, target_w)
             if found is not None:
                 value_samples[gate].append(found.values)
             for key, trials in every[gate].items():
-                if int(weights[key].sum()):
-                    far_samples[gate][key].append(
-                        joint_far(trials.scores, values[gate], weights[key])
-                    )
+                weights = counts[key[0]][trials.a] * counts[key[0]][trials.b]
+                if int(weights.sum()):
+                    far_samples[gate][key].append(joint_far(trials.scores, values[gate], weights))
+            for key, (target, registers, codes, missed) in targets[gate].items():
+                weights = counts[key[0]][target.owners].astype(np.float64)
+                size = len(registers)
+                total = np.bincount(codes, weights=weights, minlength=size)
+                lost = np.bincount(codes, weights=weights * missed, minlength=size)
+                total[0], lost[0] = weights.sum(), (weights * missed).sum()
+                for i in np.flatnonzero(total > 0):
+                    miss_samples[gate][key][i].append(float(lost[i] / total[i]))
     intervals = {
         gate: tuple(_interval([v[e] for v in value_samples[gate]], 4) for e in range(len(names)))
         for gate in GATES
@@ -1416,11 +1848,23 @@ def summarise(
         gate: {key: _interval(samples, 6) for key, samples in far_samples[gate].items()}
         for gate in GATES
     }
+    miss_intervals = {
+        gate: {
+            key: {
+                register: _interval(miss_samples[gate][key][i], 6)
+                for i, register in enumerate(found[1])
+            }
+            for key, found in targets[gate].items()
+        }
+        for gate in GATES
+    }
     return Summary(
         values=values,
-        gates=gates,
+        solutions=solutions,
+        equal=equal,
         intervals=intervals,
         far_intervals=far_intervals,
+        miss_intervals=miss_intervals,
         resamples={gate: len(value_samples[gate]) for gate in GATES},
     )
 
@@ -1555,24 +1999,21 @@ def report(
     gates: dict[str, dict] = {}
     missed = {d.name: misses(d, summary.values, names) for d in trials}
     for gate in GATES:
-        found = summary.gates[gate]
+        solution = summary.solutions[gate]
         chosen = summary.values[gate]
         forms: dict[str, dict] = {}
         reported: dict[str, dict] = {}
         miss: dict[str, dict] = {}
         for d in trials:
-            forms[d.name] = {}
-            for form, t in d.impostor[gate].items():
-                rule = found.rules[(d.name, form)]
-                forms[d.name][form] = {
-                    "beta": rule.beta,
-                    "values": dict(zip(names, rule.values)),
-                    "joint_far_at_beta": round(rule.joint_far, 6),
+            forms[d.name] = {
+                form: {
                     "joint_far": round(joint_far(t.scores, chosen), 6),
                     "far_interval": summary.far_intervals[gate][(d.name, form)],
                     "trials": len(t.scores),
                     "pairs": t.pairs,
                 }
+                for form, t in d.impostor[gate].items()
+            }
             if d.reported[gate]:
                 reported[d.name] = {
                     form: {
@@ -1583,16 +2024,41 @@ def report(
                     }
                     for form, t in d.reported[gate].items()
                 }
-            miss[d.name] = missed[d.name][gate]
+            miss[d.name] = {
+                form: {
+                    register: {
+                        "trials": row["trials"],
+                        "missed": row["missed"],
+                        "rate": row["rate"],
+                        "rate_interval": summary.miss_intervals[gate][(d.name, form)][register],
+                        "by": row["by"],
+                    }
+                    for register, row in rows.items()
+                }
+                for form, rows in missed[d.name][gate].items()
+            }
+        binding = solution.binding
+        equal = summary.equal[gate]
         gates[gate] = {
             "values": dict(zip(names, chosen)),
-            "set_by": {
-                n: {"dataset": key[0], "form": key[1]} for n, key in zip(names, found.set_by)
-            },
             "intervals": dict(zip(names, summary.intervals[gate])),
+            "objective": {
+                "miss": round(solution.miss, 6),
+                "mean_miss": round(solution.mean_miss, 6),
+            },
+            "binding": {
+                "dataset": binding[0],
+                "form": binding[1],
+                "joint_far": round(solution.fars[binding], 6),
+            },
             "forms": forms,
             "reported": reported,
             "misses": miss,
+            "equal_beta": {
+                "values": dict(zip(names, equal.values)),
+                "miss": round(equal.miss, 6),
+                "mean_miss": round(equal.mean_miss, 6),
+            },
             "bootstrap": {"resamples": bootstrap, "used": summary.resamples[gate]},
         }
     params = asdict(plan.trials)
@@ -1622,6 +2088,7 @@ def report(
             for d in loaded
         },
         "embedders": {n: {"revision": r} for n, r in plan.embedders.items()},
+        "matched": {gate: list(plan.matched[gate]) for gate in GATES},
         "trials": {
             **{k: list(v) if isinstance(v, tuple) else v for k, v in params.items()},
             "min_pieces": MIN_PIECES,
@@ -1651,9 +2118,10 @@ def _span(interval: object) -> str:
 def summary_lines(result: Mapping[str, object]) -> list[str]:
     """Return the printed summary, naming no file.
 
-    Per gate: the values and intervals, each form's beta, FAR and counts, and every target miss
-    rate per dataset, form and register with the embedders that missed it, so a run can be
-    judged from its log alone.
+    Per gate: the values and intervals, the binding impostor form, the objective (the largest
+    matched miss and the form that sets it, and the mean), v5's equal-split pair beside it, each
+    form's FAR and counts, and every target miss rate per dataset, form and register with its
+    interval and the embedders that missed it, so a run can be judged from its log alone.
     """
     lines = []
     for dataset in result["datasets"]:  # type: ignore[attr-defined]
@@ -1668,17 +2136,41 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
         )
     for gate, entry in result["gates"].items():  # type: ignore[attr-defined]
         for name, value in entry["values"].items():
-            by = entry["set_by"][name]
             lines.append(
-                f"calibrate: {gate}.{name} = {value} (set by {by['dataset']} {by['form']}), "
-                f"interval {_span(entry['intervals'][name])}"
+                f"calibrate: {gate}.{name} = {value}, interval {_span(entry['intervals'][name])}"
             )
+        binding = entry["binding"]
+        lines.append(
+            f"calibrate: {gate} binding: {binding['dataset']} {binding['form']}, joint FAR "
+            f"{binding['joint_far']}"
+        )
+        rates = {
+            (dataset, form): forms[form][ALL]["rate"]
+            for dataset, forms in entry["misses"].items()
+            for form in result["matched"][gate]  # type: ignore[index]
+            if form in forms
+        }
+        where = ""
+        if rates:
+            dataset, form = max(rates, key=rates.__getitem__)
+            where = f" ({dataset} {form})"
+        objective = entry["objective"]
+        lines.append(
+            f"calibrate: {gate} objective: largest matched miss {objective['miss']}{where}, "
+            f"mean matched miss {objective['mean_miss']}"
+        )
+        equal = entry["equal_beta"]
+        pair = ", ".join(f"{name} {value}" for name, value in equal["values"].items())
+        lines.append(
+            f"calibrate: {gate} equal split: {pair}; largest matched miss {equal['miss']}, "
+            f"mean matched miss {equal['mean_miss']}"
+        )
         for dataset, forms in entry["forms"].items():
             for form, row in forms.items():
                 lines.append(
-                    f"calibrate: {gate} {dataset} {form}: beta {row['beta']}, joint FAR "
-                    f"{row['joint_far_at_beta']} at beta, {row['joint_far']} at the values "
-                    f"{_span(row['far_interval'])}; {row['trials']} trials, {row['pairs']} pairs"
+                    f"calibrate: {gate} {dataset} {form}: joint FAR {row['joint_far']} at the "
+                    f"values {_span(row['far_interval'])}; {row['trials']} trials, "
+                    f"{row['pairs']} pairs"
                 )
         for dataset, forms in entry["reported"].items():
             for form, row in forms.items():
@@ -1696,7 +2188,8 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
                     )
                     lines.append(
                         f"calibrate: {gate} {dataset} {form} {register}: missed {row['missed']} "
-                        f"of {row['trials']} trials, rate {row['rate']}; by {by}"
+                        f"of {row['trials']} trials, rate {row['rate']}, interval "
+                        f"{_span(row['rate_interval'])}; by {by}"
                     )
     return lines
 
@@ -1735,7 +2228,7 @@ def run(data: Path, plan_rel: str) -> list[str]:
         require_speakers(dataset.name, {s: c["eligible"] for s, c in _counts(found).items()})
         loaded.append(found)
         trials.append(dataset_trials(dataset.name, found.speakers, plan.trials, plan.seed, names))
-    summary = summarise(trials, plan.alpha, plan.seed, plan.trials.bootstrap, names)
+    summary = summarise(trials, plan.alpha, plan.seed, plan.trials.bootstrap, names, plan.matched)
     result = report(plan, loaded, trials, summary, names, plan.trials.bootstrap)
     folder = PurePosixPath(plan_rel).parent
     rel = (folder / CALIBRATION_NAME).as_posix()
