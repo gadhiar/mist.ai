@@ -146,7 +146,9 @@ def test_default_chunking_is_80_ms_with_the_default_gain(tmp_path: Path) -> None
     assert _read_wav(target)[1] == expected
 
 
-def test_refuses_an_input_inside_the_checkout(tmp_path: Path) -> None:
+def test_refuses_an_input_inside_the_checkout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     target = tmp_path / "out.wav"
 
     code = render_character.main(
@@ -155,6 +157,9 @@ def test_refuses_an_input_inside_the_checkout(tmp_path: Path) -> None:
 
     assert code == 2
     assert not target.exists()
+    # The path does not exist, so the missing-file refusal would also exit 2; only this reason
+    # shows that the checkout check refused it first.
+    assert "--in lies inside the checkout" in capsys.readouterr().err
 
 
 def test_refuses_an_output_inside_the_checkout(tmp_path: Path) -> None:
@@ -352,6 +357,9 @@ def test_refuses_an_earlier_render_inside_the_checkout(
 
     _assert_refused(code, target, printed, tmp_path)
     assert str(REPO_ROOT) not in printed
+    # The path does not exist, so the missing-file refusal would also exit 2; only this reason
+    # shows that the checkout check refused it first.
+    assert "--compare-to lies inside the checkout" in printed
 
 
 def test_refuses_a_missing_earlier_render(
