@@ -7,12 +7,16 @@ display + bridge text during retrieval/tool latency).
 """
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 
+from backend.chat import stream_events
 from backend.chat.stream_events import (
     Complete,
     Filler,
+    HandOff,
+    StateHint,
     StreamEvent,
     Thinking,
     Token,
@@ -135,3 +139,75 @@ class TestPatternMatching:
         assert thinking_count == 1
         assert filler_count == 1
         assert complete_response == "ab"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "field_name", "value"),
+    [(StateHint, "state", "calm"), (HandOff, "ack_text", "Let me look that up.")],
+    ids=["StateHint", "HandOff"],
+)
+class TestTierSeamEvents:
+    """T39: the hand-off and speaking-state seams. No emitter exists yet."""
+
+    def test_holds_its_field(self, event_type, field_name, value):
+        assert getattr(event_type(value), field_name) == value
+
+    def test_is_streamevent(self, event_type, field_name, value):
+        assert isinstance(event_type(value), StreamEvent)
+
+    def test_has_exactly_one_field(self, event_type, field_name, value):
+        assert [f.name for f in dataclasses.fields(event_type)] == [field_name]
+
+    def test_is_frozen(self, event_type, field_name, value):
+        event = event_type(value)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(event, field_name, "other")
+
+    def test_uses_slots(self, event_type, field_name, value):
+        event = event_type(value)
+        assert not hasattr(event, "__dict__"), "slots should suppress __dict__"
+        with pytest.raises((AttributeError, TypeError)):
+            event.unexpected = "value"  # type: ignore[attr-defined]
+
+    def test_is_not_a_token(self, event_type, field_name, value):
+        """A consumer that keeps only `Token`s drops these, which the
+        `HandOff` contract makes that consumer's job to handle.
+        """
+        assert not isinstance(event_type(value), Token)
+
+
+class TestTierSeamContracts:
+    def test_state_hint_docstring_names_the_vocabulary_and_turn_scope(self):
+        doc = StateHint.__doc__ or ""
+        assert "backend.realtime.speech.SPEAKING_STATES" in doc
+        assert '"neutral"' in doc
+        assert "never carries into the next turn" in doc
+
+    def test_hand_off_docstring_states_the_ordering_and_text_contract(self):
+        doc = " ".join((HandOff.__doc__ or "").split())
+        assert "at most once, before any `Token`" in doc
+        assert "`Complete.final_response` starts with it" in doc
+        assert "treat `ack_text` as the text of a `Token`" in doc
+
+    def test_module_does_not_import_the_realtime_package(self):
+        """The controller checks the state vocabulary; this module only names it."""
+        source = Path(stream_events.__file__).read_text(encoding="utf-8")
+        imports = [
+            line
+            for line in source.splitlines()
+            if line.startswith(("import ", "from ")) or line.lstrip().startswith("import ")
+        ]
+        assert imports, "precondition: the module has imports"
+        assert not [line for line in imports if "realtime" in line]
+
+    def test_match_dispatches_the_new_events(self):
+        seen: list[str] = []
+        for evt in [StateHint("calm"), HandOff("One moment."), Token(text="a")]:
+            match evt:
+                case StateHint(state=state):
+                    seen.append(f"state:{state}")
+                case HandOff(ack_text=ack):
+                    seen.append(f"ack:{ack}")
+                case Token(text=text):
+                    seen.append(f"token:{text}")
+        assert seen == ["state:calm", "ack:One moment.", "token:a"]

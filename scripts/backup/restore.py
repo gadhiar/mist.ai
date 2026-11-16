@@ -54,10 +54,10 @@ STAGE THEN SWAP: THE SIX PHASES
     different properties.
 
 WHAT "ATOMIC" MEANS HERE, EXACTLY
-    `os.replace` is atomic PER STORE AND PER RENAME. Three stores are three
-    atomic operations, not one: a crash between them leaves some stores new and
-    some old, which is why `restore.in-progress.json` records `stores_committed`
-    as it goes.
+    `os.replace` is atomic PER STORE AND PER RENAME. Each store is its own
+    atomic operation, and the set is not one: a crash between stores leaves
+    some stores new and some old, which is why `restore.in-progress.json`
+    records `stores_committed` as it goes.
 
     The vault swap is TWO renames, because Windows cannot rename a directory onto
     an existing one. There is therefore a window in which `vault/` does not
@@ -264,8 +264,8 @@ class RestoreProgressMarker:
         graph_relationships: Relationships loaded by phase 4.
         stores_committed: The store filenames already `os.replace`d onto their
             live names, in commit order. Per store rather than a single flag,
-            because `os.replace` is atomic PER STORE and three stores are three
-            atomic operations.
+            because `os.replace` is atomic PER STORE and each store is its own
+            atomic operation.
         vault_committed: Both vault renames completed.
         vault_previous: Where the target's previous vault tree was renamed
             aside, while it still exists. `None` before phase 5 and after phase
@@ -540,10 +540,10 @@ def commit_stores(
 ) -> list[str]:
     """PHASE 5 for the stores: `os.replace` each one, then clear ITS sidecars, then the next.
 
-    ATOMIC PER STORE. Each `os.replace` is atomic on its own; three stores are
-    three atomic operations, not one, so a failure at store 2 leaves store 1
-    committed and store 3 untouched. `on_commit` fires after each rename so the
-    progress marker records exactly which ones landed.
+    ATOMIC PER STORE. Each `os.replace` is atomic on its own; the stores are
+    separate atomic operations, not one, so a failure at the second store leaves
+    the first committed and the rest untouched. `on_commit` fires after each
+    rename so the progress marker records exactly which ones landed.
 
     THE SIDECAR CLEAR BELONGS HERE AND NOT IN PHASE 3, and the reason is
     correctness rather than ordering taste. Deleting the live `-wal` during
@@ -553,8 +553,8 @@ def commit_stores(
     `_clear_sqlite_sidecars`.
 
     Each store's sidecars are unlinked immediately after THAT store's rename
-    rather than renaming all three and then unlinking all three, which keeps the
-    window in which a restored `.db` sits beside a stale `-wal` to microseconds.
+    rather than renaming every store and then unlinking every sidecar, which
+    keeps the window in which a restored `.db` sits beside a stale `-wal` to microseconds.
     The staged files themselves carry no sidecars: the artifact's copies have
     none, because `capture_stores` checkpoints and strips them
     (`grep -n "_strip_sqlite_sidecars" scripts/backup/stores.py`).

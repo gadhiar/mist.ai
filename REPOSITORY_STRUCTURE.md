@@ -32,6 +32,10 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `start_dev.py` - Docker compose stack manager (start / stop / restart / logs)
 - `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
+- `render_character.py` - Renders one WAV through the character stage, as the realtime downlink would play it
+- `wake/` - Tools for MIST's wake model: the recording manifest check and the evaluation harness
+  - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
+  - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
@@ -55,8 +59,8 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `verify.py` - Compares a restored graph, stores and vault with the artifact they came from
 - `model_bench/` - Model bench host drivers; `scripts/model_bench/README.md` documents both
   - `bench_host.py` - Stops MIST, serves a pinned llama-server as `mist-bench-llm`, restores the stack
-  - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report
-  - `speech/` - The speech suites (`tts`, `cache`, `stt`, `turn`, `fit`, `lowtier`, `chain`, `game-session`, `listen-pack`, `report`), their committed inputs, and `report.py`, which writes `numbers.json` and `REPORT.md`
+  - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report; it also designs voices
+  - `speech/` - The speech suites (`tts`, `cache`, `stt`, `turn`, `fit`, `lowtier`, `chain`, `game-session`, `listen-pack`, `voice-design`, `report`), their committed inputs, and `report.py`, which writes `numbers.json` and `REPORT.md`
   - `speech/probes/` - The engine code the speech-bench containers run (synthesis, recognition, end of turn, the load generator)
 
 ### Container builds (`docker/`)
@@ -92,7 +96,50 @@ backend/
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 ├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
 ├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
-├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader
+├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader (memory, alarms, timers, the clock)
+│
+├── capabilities/                # Tools that act on the world (README.md: adding one)
+│   ├── host.py                  # CapabilityHost: admits, decides, runs and logs every call
+│   ├── contracts.py             # Capability base class, ToolSpec, outcomes, the turn port
+│   ├── config.py                # Capability environment variables, parsed once
+│   ├── router.py                # Per-turn routing under the token ceiling (at most 2 caps)
+│   ├── decoder.py               # Schema-constrained action decode for a small model
+│   ├── schema.py                # Grammar schemas and catalog lines for tools
+│   ├── intents.py               # Utterance normalisation for the fast-path grammars
+│   ├── policy.py                # Confirmation policy by tool and call source
+│   ├── proposals.py             # Cross-turn proposals and the yes-or-no matcher
+│   ├── replies.py               # Templated replies, notices and the actions block
+│   ├── power.py                 # Power level and model tiers (stopgaps until the router)
+│   ├── action_log.py            # One row per call; the per-day usage view
+│   ├── db.py                    # capabilities.db, shared by the capability stores
+│   ├── events.py                # WebSocket protocol 1.4.0 capability payloads
+│   ├── tool_events.py           # Capability fields of tool_call_started/completed
+│   ├── secrets.py               # Provider secrets and their redaction
+│   ├── clock.py                 # The injectable Clock protocol and SystemClock
+│   ├── alarms/                  # Native, offline alarms, timers and the clock
+│   │   ├── capability.py        # Alarms, timers and clock capabilities; alarm control
+│   │   ├── records.py           # Records, live occurrences and the event trail
+│   │   ├── scheduler.py         # The one writer of occurrence transitions
+│   │   ├── ringing.py           # Endpoint-neutral ringing and fallback
+│   │   ├── notifier.py          # alarm_fired and alarm_state payloads
+│   │   ├── intents.py           # Alarm, timer and clock fast-path rows
+│   │   └── timeparse.py         # Spoken times and repeat rules
+│   ├── lights/                  # Lights over Home Assistant's MCP server
+│   │   ├── capability.py        # LightsCapability over a LightsProvider
+│   │   ├── home_assistant.py    # The Home Assistant provider
+│   │   ├── catalog.py           # Light names and areas from GetLiveContext
+│   │   └── intents.py           # Lights fast-path rows
+│   ├── mcp/                     # MCP client: transport protocol, supervised connection
+│   │   ├── connection.py        # McpConnection: reconnects with backoff
+│   │   ├── transport.py         # The McpTransport protocol
+│   │   └── sdk_transport.py     # McpTransport over the mcp SDK
+│   └── music/                   # Music over the Spotify Web API
+│       ├── capability.py        # MusicCapability
+│       ├── spotify_api.py       # Web API client and token manager
+│       ├── token_store.py       # The Spotify token file
+│       ├── authorize.py         # One-time PKCE authorization CLI
+│       ├── pkce.py              # PKCE helpers
+│       └── intents.py           # Music fast-path rows
 │
 ├── chat/                        # Conversation handling
 │   ├── conversation_handler.py  # Pass-loop + persona + budget + post-filter
@@ -100,7 +147,8 @@ backend/
 │   ├── mist_context.py          # Identity / persona renderer
 │   ├── slop_detector.py         # AI-slop pattern filter
 │   ├── context_budget.py        # Cluster 6 ContextBudgetPlanner
-│   └── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
+│   ├── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
+│   └── turn_scope.py            # Per-turn state and the value objects of the stream-and-commit turn API
 │
 ├── event_store/                 # Append-only SQLite event store
 │   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
@@ -137,6 +185,27 @@ backend/
 │   ├── config.py                # MemoryConfig (MIST_MEMORY_*), nested as KnowledgeConfig.memory
 │   ├── models.py                # Request/result/item types, fact_key, ServingProfile, MemoryStage (trace memory key)
 │   └── fact_render.py           # One sentence per fact, with valid-time qualifiers
+│
+├── realtime/                    # Realtime voice path, one session per WebSocket connection;
+│   │                            #   the server does not use the package yet
+│   ├── addressee.py             # Addressee gate: whether an utterance holding MIST's name was said to her
+│   ├── bargein.py               # Barge-in policy: what user speech means while MIST speaks, holds a reply or thinks
+│   ├── budget.py                # Voice latency budget, voice configuration and their loader from the environment
+│   ├── character.py             # Character stage: the one place the sound of the spoken voice is shaped
+│   ├── engines/                 # Speech engine adapters implementing the protocols in `speech.py`
+│   │   ├── kws.py               # Server name spotter: a chain of three ONNX graphs behind `NameSpotter`
+│   │   ├── silero_vad.py        # Silero VAD (ONNX v5) behind `VoiceActivityDetector`, and the ONNX loading it shares
+│   │   └── smart_turn.py        # Smart Turn v3.2 (ONNX) behind `TurnEndDetector`
+│   ├── errors.py                # Exceptions raised by the realtime voice package
+│   ├── ingress.py               # Per-session audio ingress: uplink frames to speech segments, name hits and utterances
+│   ├── lanes.py                 # Inference lanes: one worker thread per engine, so model calls never block the event loop
+│   ├── playback.py              # Downlink playback: the session's `turn` lane, the pacer that feeds it and the ledger
+│   ├── protocol.py              # Realtime protocol 2.0.0: the binary frame codec and the control message schemas
+│   ├── scene.py                 # Scene seam: what the turn controller tells the screen, anchored to the audio clock
+│   ├── segmenter.py             # Cuts a reply's Token stream into the text segments TTS synthesizes one call at a time
+│   ├── speech.py                # Speech engine contracts: the protocols model adapters implement and the values they exchange
+│   ├── turn.py                  # Per-session turn controller: one mailbox task owns a voice session's turns
+│   └── voice_assets.py          # Voice identities, the private clips MIST's voice is cloned from, and the artefacts built on them
 │
 └── vault/                       # ADR-010 vault layer (Cluster 8)
     ├── conventions.py           # MIST.md auto-load primitive (ADR-014)

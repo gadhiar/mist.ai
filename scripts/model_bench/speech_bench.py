@@ -12,8 +12,11 @@ module does not exist yet is "not built": its subcommands are stubs that refuse,
 inputs and argv, and `selftest` skips its checks. Only a `ModuleNotFoundError` for the suite
 module itself counts as not built, so a missing dependency inside a built suite still fails loudly.
 
-`plan` and `selftest` write nothing and take neither `--results-root` nor `--run`; every
-subcommand that writes takes both. Stdlib only, like `bench_host.py`.
+`plan` writes only with `--host-1070-script`, and then it writes the host-1070 script, its game
+variant and the load body beside that path. `selftest` writes only scratch files, in temporary
+directories it removes. `prepare` writes into `--material-dir`, and `voice-design` into `--out`.
+Those four take neither `--results-root` nor `--run`, and every other subcommand takes both.
+Stdlib only, like `bench_host.py`.
 """
 
 from __future__ import annotations
@@ -65,6 +68,7 @@ SUITE_REGISTRY: tuple[SuiteSpec, ...] = (
     SuiteSpec("lowtier_suite", ("lowtier", "remote-memory")),
     SuiteSpec("chain", ("chain",)),
     SuiteSpec("game_suite", ("game-session",)),
+    SuiteSpec("voice_design", ("voice-design",)),
     SuiteSpec("report", ("report",)),
 )
 

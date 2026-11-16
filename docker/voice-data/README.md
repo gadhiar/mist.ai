@@ -29,7 +29,8 @@ rebuilds only the record, the code layer and the import check.
 - `/opt/venv-score`: speaker similarity (WavLM-SV, ECAPA), Whisper large-v3-turbo for CER, the
   arousal monitor and librosa (`requirements-score.txt`).
 - `/opt/venv-<family key>`: the family's own environment, with its own torch wheel and CUDA
-  libraries (`requirements-<name>.txt`).
+  libraries (`requirements-<name>.txt`). `/opt/venv-extract` also holds speechbrain at
+  venv-score's pin, because the `extract` and `clean` stages load ECAPA in it.
 - `/opt/mist-voice/code/scripts/{voice_data,model_bench}`: the code at the image's commit, the
   last layer copied. `mist-voice-code.pth` in each venv's `site-packages` puts
   `/opt/mist-voice/code` on the path, because jobs run `<venv>/bin/python -I`.

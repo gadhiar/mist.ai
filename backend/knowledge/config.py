@@ -5,7 +5,9 @@ Central configuration for Neo4j connection, embedding models, and extraction set
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -73,6 +75,21 @@ class EmbeddingConfig:
         return None if self.device == "auto" else self.device
 
 
+# A role is a caller of the LLM that may run on its own server and model. Each
+# role reads `MIST_LLM_<ROLE>_URL` and `MIST_LLM_<ROLE>_MODEL`, so adding one is
+# a new value here and its two variables, with no new code path.
+LLMRole = Literal["conversation"]
+LLM_ROLES: tuple[LLMRole, ...] = ("conversation",)
+
+
+@dataclass(frozen=True, slots=True)
+class LLMEndpoint:
+    """One llama-server (or Ollama) host and the model id requests name on it."""
+
+    base_url: str
+    model: str
+
+
 @dataclass
 class LLMConfig:
     """LLM model configuration.
@@ -85,6 +102,12 @@ class LLMConfig:
 
     Keeping the original `temperature` field as extraction-default avoids
     a rename that would churn through 10+ extraction call sites.
+
+    `model` and `base_url` are the base endpoint: extraction and curation
+    always use it. `roles` holds an endpoint only for a role whose URL
+    variable is set, so an unset role resolves to the base through
+    `endpoint` and nothing changes for it. `backend` and the sampling fields
+    apply to every endpoint.
     """
 
     model: str = "gemma-4-e4b"
@@ -106,25 +129,113 @@ class LLMConfig:
     # ever sent when the caller left `LLMRequest.thinking` unset; it never
     # overrides an explicit thinking config.
     tool_thinking_budget_tokens: int | None = 1024
+    # A spoken reply cannot start before its first words exist, so a voice
+    # turn sends this reasoning budget on both passes. 0 ends thinking at
+    # once. Being caller-set, it also keeps `AdaptiveThinkingProvider` from
+    # budgeting and retrying the turn.
+    voice_thinking_budget_tokens: int = 0
+    # The earliest character a `tts` turn's first emission may be cut at, so
+    # the first spoken segment is long enough to sound like a phrase.
+    voice_first_segment_min_chars: int = 40
+    # Only roles whose URL variable is set. A factory, not an env read: the
+    # class-level `os.getenv` defaults elsewhere in this module are baked in
+    # at import (KNOWN_ISSUES.md), so the role variables are read in
+    # `from_env` alone.
+    roles: dict[str, LLMEndpoint] = field(default_factory=dict)
+
+    def endpoint(self, role: LLMRole | None) -> LLMEndpoint:
+        """The endpoint `role` calls: its own when set, else the base.
+
+        Raises:
+            ValueError: `role` is not None and not in `LLM_ROLES`. A typo
+                would otherwise fall back to the base without a sign.
+        """
+        if role is not None and role not in LLM_ROLES:
+            raise ValueError(f"Unknown LLM role {role!r}; known roles: {', '.join(LLM_ROLES)}")
+        if role is not None and role in self.roles:
+            return self.roles[role]
+        return LLMEndpoint(base_url=self.base_url, model=self.model)
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables.
+
+        Raises:
+            ValueError: A role's model variable is set without its URL
+                variable, or a role's URL is not an `http` or `https` URL
+                with a host. Both fail at startup rather than at the first
+                turn's LLM call. Also when `MIST_VOICE_THINKING_BUDGET_TOKENS`
+                or `MIST_VOICE_FIRST_SEGMENT_MIN_CHARS` is not a whole number
+                of zero or more.
+        """
         backend = os.getenv("LLM_BACKEND", "llamacpp")
         default_url = "http://localhost:11434" if backend == "ollama" else "http://localhost:8080"
         raw_thinking_budget = os.getenv("MIST_TOOL_THINKING_BUDGET", "1024").strip()
         tool_thinking_budget_tokens = (
             None if raw_thinking_budget.lower() == "off" else int(raw_thinking_budget)
         )
+        model = os.getenv("MODEL", "gemma-4-e4b")
         return cls(
-            model=os.getenv("MODEL", "gemma-4-e4b"),
+            model=model,
             base_url=os.getenv("LLM_SERVER_URL", default_url),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
             conversation_temperature=float(os.getenv("LLM_CONVERSATION_TEMPERATURE", "0.7")),
             conversation_max_tokens=int(os.getenv("LLM_CONVERSATION_MAX_TOKENS", "1024")),
             backend=backend,
             tool_thinking_budget_tokens=tool_thinking_budget_tokens,
+            voice_thinking_budget_tokens=cls._non_negative_int_from_env(
+                "MIST_VOICE_THINKING_BUDGET_TOKENS", 0
+            ),
+            voice_first_segment_min_chars=cls._non_negative_int_from_env(
+                "MIST_VOICE_FIRST_SEGMENT_MIN_CHARS", 40
+            ),
+            roles=cls._roles_from_env(default_model=model),
         )
+
+    @staticmethod
+    def _non_negative_int_from_env(name: str, default: int) -> int:
+        """Read a count that must be zero or more, naming `name` when it is not.
+
+        `ThinkingConfig` refuses a negative budget, so a negative budget would
+        otherwise fail every voice turn, far from the setting; a negative
+        minimum length can only be a typo. Either fails at startup with the
+        variable named, as does a value `int()` cannot read.
+        """
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number, got {raw!r}") from None
+        if value < 0:
+            raise ValueError(f"{name} must be zero or more, got {value}")
+        return value
+
+    @staticmethod
+    def _roles_from_env(default_model: str) -> dict[str, LLMEndpoint]:
+        """Read each role's endpoint; a role with no URL is left out.
+
+        An empty or blank variable counts as unset, as a `.env` line `NAME=`
+        leaves it.
+        """
+        roles: dict[str, LLMEndpoint] = {}
+        for role in LLM_ROLES:
+            url_var = f"MIST_LLM_{role.upper()}_URL"
+            model_var = f"MIST_LLM_{role.upper()}_MODEL"
+            url = os.getenv(url_var, "").strip()
+            role_model = os.getenv(model_var, "").strip()
+            if not url:
+                if role_model:
+                    raise ValueError(
+                        f"{model_var} is set but {url_var} is not; set both or neither"
+                    )
+                continue
+            parts = urlsplit(url)
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                raise ValueError(f"{url_var} must be an http or https URL with a host, got {url!r}")
+            roles[role] = LLMEndpoint(base_url=url, model=role_model or default_model)
+        return roles
 
 
 @dataclass
@@ -342,8 +453,8 @@ class ContextBudgetConfig:
     The model's usable attention window is usually smaller than its configured
     context window. Gemma 4 E4B at 32K ctx_size still degrades quality past
     its trained context (~8K). This config caps the total prompt budget and
-    splits the remainder (after persona + tools + static) between retrieval
-    and history via weight-based allocation.
+    splits the remainder (after the stable prefix and tools) between the
+    per-turn delta and history.
 
     - `context_window` is the hard ceiling; output `max_tokens` is subtracted.
       MIS-171 T4: this may be the literal string `"auto"` after `from_env()`
@@ -358,10 +469,25 @@ class ContextBudgetConfig:
       reach the arithmetic in `plan()`.
     - `output_reserve_tokens` additionally reserves headroom for the completion.
     - `safety_margin_tokens` is extra headroom for tokenizer inaccuracy.
-    - `retrieval_budget_ratio` allocates share of the remaining budget to
-      retrieval-context; history gets the rest.
+    - `retrieval_budget_ratio` caps retrieval at this share of the budget
+      left after the prefix; retrieval is also held to the delta reserve.
     - `history_strategy` names a strategy registered in
-      `backend.chat.context_budget` (defaults to sliding-window).
+      `backend.chat.context_budget`: `stable_window` (the default) or
+      `sliding_window`.
+    - `turn_delta_max_tokens` is the token cap for the per-turn delta (the
+      context that varies every turn: retrieval or memory, advisory,
+      interruption note, clock). The planner reserves it whole on every
+      turn, so the history budget does not move when the delta does.
+    - `delta_placement` is where that delta goes: `user_prefix`, ahead of
+      the user's words in the final user message, or `system_tail`, a system
+      message directly before the final user message.
+    - `history_high_water_factor` is how far, as a multiple of the history
+      message cap, `stable_window` lets the window grow before its start
+      steps forward. Below 1.0 the window could never hold the cap.
+
+    Raises:
+        ValueError: `delta_placement` is not one of the two placements, or
+            `history_high_water_factor` is below 1.0.
     """
 
     context_window: int | str = (
@@ -370,8 +496,24 @@ class ContextBudgetConfig:
     output_reserve_tokens: int = 512  # Headroom for completion output
     safety_margin_tokens: int = 256  # Absorbs tokenizer estimation error
     retrieval_budget_ratio: float = 0.4  # 40% of flex budget to retrieval
-    history_strategy: str = "sliding_window"  # sliding_window | (future) summarized
+    history_strategy: str = "stable_window"  # stable_window | sliding_window
     enabled: bool = True  # Master switch; False keeps legacy behavior
+    turn_delta_max_tokens: int = 1000
+    delta_placement: str = "user_prefix"  # user_prefix | system_tail, checked below
+    history_high_water_factor: float = 2.0
+
+    def __post_init__(self) -> None:
+        """Reject a placement or high-water factor the prompt layout cannot use."""
+        if self.delta_placement not in ("user_prefix", "system_tail"):
+            raise ValueError(
+                f"delta_placement must be 'user_prefix' or 'system_tail' "
+                f"(MIST_CTX_BUDGET_DELTA_PLACEMENT), got {self.delta_placement!r}"
+            )
+        if self.history_high_water_factor < 1.0:
+            raise ValueError(
+                f"history_high_water_factor must be at least 1.0 "
+                f"(MIST_CTX_BUDGET_HISTORY_HIGH_WATER), got {self.history_high_water_factor!r}"
+            )
 
     @classmethod
     def from_env(cls) -> "ContextBudgetConfig":
@@ -389,8 +531,11 @@ class ContextBudgetConfig:
             output_reserve_tokens=int(os.getenv("MIST_CTX_BUDGET_OUTPUT_RESERVE", "512")),
             safety_margin_tokens=int(os.getenv("MIST_CTX_BUDGET_SAFETY", "256")),
             retrieval_budget_ratio=float(os.getenv("MIST_CTX_BUDGET_RETRIEVAL_RATIO", "0.4")),
-            history_strategy=os.getenv("MIST_CTX_BUDGET_HISTORY_STRATEGY", "sliding_window"),
+            history_strategy=os.getenv("MIST_CTX_BUDGET_HISTORY_STRATEGY", "stable_window"),
             enabled=os.getenv("MIST_CTX_BUDGET_ENABLED", "true").lower() == "true",
+            turn_delta_max_tokens=int(os.getenv("MIST_CTX_BUDGET_TURN_DELTA_MAX_TOKENS", "1000")),
+            delta_placement=os.getenv("MIST_CTX_BUDGET_DELTA_PLACEMENT", "user_prefix"),
+            history_high_water_factor=float(os.getenv("MIST_CTX_BUDGET_HISTORY_HIGH_WATER", "2.0")),
         )
 
 

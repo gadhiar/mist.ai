@@ -11,16 +11,59 @@ Usage:
 For tests, bypass factories and pass fakes directly to constructors.
 """
 
+import asyncio
+import functools
 import logging
 import os
+import random
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import httpx
 
+from backend.capabilities.action_log import ActionLog
+from backend.capabilities.alarms.capability import (
+    TZ_UNSET_REASON,
+    AlarmsCapability,
+    ClockCapability,
+    RingingTracker,
+    SchedulerAlarmControl,
+    TimersCapability,
+    UserZone,
+)
+from backend.capabilities.alarms.records import AlarmRecords
+from backend.capabilities.alarms.ringing import DesktopSink, RingRouter
+from backend.capabilities.alarms.scheduler import AlarmScheduler
+from backend.capabilities.clock import Clock
+from backend.capabilities.config import CapabilitiesConfig
+from backend.capabilities.contracts import Capability, CapabilityStatus
+from backend.capabilities.db import CapabilitiesDb
+from backend.capabilities.decoder import DECODE_INSTRUCTIONS, ActionDecoder
+from backend.capabilities.events import EventSink
+from backend.capabilities.host import CapabilityHost, HostSettings
+from backend.capabilities.lights.capability import (
+    LightAdjustment,
+    LightsCapability,
+    StatusReading,
+)
+from backend.capabilities.lights.catalog import EMPTY_CATALOG, LightCatalog, LightTarget
+from backend.capabilities.lights.home_assistant import HomeAssistantLightsProvider
+from backend.capabilities.mcp.connection import BackoffPolicy, McpConnection
+from backend.capabilities.mcp.transport import McpTransport
+from backend.capabilities.music.capability import MusicCapability
+from backend.capabilities.music.spotify_api import SpotifyAccounts, SpotifyApi, SpotifyTokenManager
+from backend.capabilities.music.token_store import SpotifyTokenStore
+from backend.capabilities.policy import PolicyTable
+from backend.capabilities.power import PowerState, TierProviders
+from backend.capabilities.replies import ReplyRegister
+from backend.capabilities.router import Embedder, RouterConfig, ToolRouter
+from backend.capabilities.secrets import Secret, SecretRegistry, SecretSource
+from backend.errors import CapabilityConfigError, CapabilityUnavailableError, SecretMissingError
 from backend.interfaces import (
     EmbeddingProvider,
     EventStoreProvider,
@@ -32,7 +75,7 @@ if TYPE_CHECKING:
     from backend.vault import VaultFilewatcher, VaultWriter
     from backend.vault.invalidation_bus import InvalidationBus
     from backend.vault.sidecar_index import VaultSidecarIndex
-from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig, LLMConfig
+from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig, LLMConfig, LLMRole
 from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.deduplication import EntityDeduplicator
 from backend.knowledge.curation.graph_writer import CurationGraphWriter, RebuildStamps
@@ -50,6 +93,11 @@ from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 from backend.llm import StreamingLLMProvider
+from backend.origins import ALLOW_ALL, ALLOWED_ORIGINS_ENV, allowed_origins
+from backend.user_timezone import USER_TIMEZONE_ENV, resolve_user_timezone
+
+if TYPE_CHECKING:
+    from backend.chat.context_budget import TokenCounter
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +242,8 @@ def build_graph_store(
 def build_llm_provider(
     config: KnowledgeConfig,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+    *,
+    role: LLMRole | None = None,
 ) -> StreamingLLMProvider:
     """Create the LLM provider based on config.
 
@@ -205,6 +255,11 @@ def build_llm_provider(
             emits a `phase: "llm_call"` JSONL record. When the gate is False
             (or the logger is None) the concrete provider is returned directly
             with no wrapper overhead.
+        role: The caller's LLM role. The provider targets
+            `config.llm.endpoint(role)`: the role's own endpoint when its URL
+            variable is set, else `base_url` and `model`. None, as extraction
+            and curation pass, is always the base. The wrappers below apply to
+            a role's provider exactly as to the base.
 
     Returns:
         StreamingLLMProvider instance (LlamaServerProvider or OllamaProvider),
@@ -224,19 +279,20 @@ def build_llm_provider(
         backend/extraction_service` has no hits).
     """
     llm_config = config.llm
+    endpoint = llm_config.endpoint(role)
     if llm_config.backend == "llamacpp":
         from backend.llm.llama_server_provider import LlamaServerProvider
 
         provider: StreamingLLMProvider = LlamaServerProvider(
-            base_url=llm_config.base_url,
-            model=llm_config.model,
+            base_url=endpoint.base_url,
+            model=endpoint.model,
         )
     elif llm_config.backend == "ollama":
         from backend.llm.ollama_provider import OllamaProvider
 
         provider = OllamaProvider(
-            base_url=llm_config.base_url,
-            model=llm_config.model,
+            base_url=endpoint.base_url,
+            model=endpoint.model,
         )
     else:
         raise ValueError(f"Unknown LLM backend: {llm_config.backend}")
@@ -726,6 +782,8 @@ def build_conversation_handler(
     graph_store: GraphStore | None = None,
     vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
     with_extraction_dispatcher: bool = False,
+    *,
+    conversation_llm_provider: StreamingLLMProvider | None = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -759,9 +817,20 @@ def build_conversation_handler(
       `_on_vault_rebuild` listener so vault-change events evict stale
       `_mist_context_cache` entries. When None, no subscription is registered.
 
+    T39 (LLM roles): the base provider and the conversation's are split.
+    The extraction pipeline always gets the base (`llm_provider`, or one
+    built from `base_url` and `model`). The handler gets the conversation
+    role's, so a smaller conversation model on its own server never moves
+    extraction. With the role unset the handler gets the base object itself,
+    so both hold one provider, as before roles existed. Curation takes the
+    base from `voice_processor._llm_provider`, not from the handler
+    (`backend/server.py::_resolve_curation_dependencies`).
+
     Args:
         config: Knowledge subsystem configuration.
-        llm_provider: Optional pre-built LLM provider.
+        llm_provider: Optional pre-built base LLM provider, for the
+            extraction pipeline and, with no conversation role set, the
+            handler. The live server injects one built by `VoiceProcessor`.
         vault_writer: Optional pre-built VaultWriter. When None, one is
             constructed from config. Pass an explicit None-equivalent by
             disabling config.vault.enabled.
@@ -790,6 +859,11 @@ def build_conversation_handler(
             does not use this flag: its handler is built inside the
             VoiceProcessor chain, so `backend/server.py` attaches one after the
             fact via `ConversationHandler.attach_extraction_dispatcher`.
+        conversation_llm_provider: Optional pre-built provider for the
+            handler alone. When None, the handler gets
+            `build_llm_provider(config, role="conversation")` if the
+            conversation role is set in `config.llm.roles`, else the base
+            provider. The extraction pipeline never receives it.
     """
     from pathlib import Path
 
@@ -821,6 +895,14 @@ def build_conversation_handler(
     if gs is None:
         gs = build_graph_store(config)
     provider = llm_provider or build_llm_provider(config, debug_logger=debug_logger)
+    if conversation_llm_provider is not None:
+        handler_provider = conversation_llm_provider
+    elif "conversation" in config.llm.roles:
+        handler_provider = build_llm_provider(
+            config, debug_logger=debug_logger, role="conversation"
+        )
+    else:
+        handler_provider = provider
     pipeline = build_extraction_pipeline(
         config,
         graph_store=gs,
@@ -878,7 +960,7 @@ def build_conversation_handler(
         graph_store=gs,
         extraction_pipeline=pipeline,
         retriever=retriever,
-        llm_provider=provider,
+        llm_provider=handler_provider,
         conventions_loader=conventions_loader,
         tool_usage_tracker=tracker,
         debug_logger=debug_logger,
@@ -1332,3 +1414,352 @@ def build_phase3_components(
     # orphaning and a full-note re-extraction -- retired under R1.3).
     writer.set_mist_write_marker(filewatcher.mark_mist_write)
     return Phase3Components(filewatcher=filewatcher, invalidation_bus=bus)
+
+
+# ---------------------------------------------------------------------------
+# Capabilities -- the capability host and what it owns
+# ---------------------------------------------------------------------------
+
+# Bounds each Spotify request in every phase (connect, read, write, pool), as the authorize CLI
+# does (`backend.capabilities.music.authorize.HTTP_TIMEOUT_S`).
+_SPOTIFY_HTTP_TIMEOUT_S = 15.0
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityBuild:
+    """What `build_capability_host` built: a host, or the reason there is none.
+
+    Disabled means no host at all, never an inert one: the server keeps `disabled_reason` only
+    so `GET /capabilities` can answer `enabled: false` with it.
+
+    The build owns what the host does not close: the capabilities database and the Spotify
+    HTTP client. `close` releases both, after `host.stop()`.
+
+    Attributes:
+        host: None whenever `disabled_reason` is set.
+        disabled_reason: Why no host was built, for example "capabilities disabled".
+        capabilities: The capabilities the host holds, in registration order, so
+            `GET /capabilities` can list each one's tools and provider tools; empty with no host.
+    """
+
+    host: CapabilityHost | None
+    disabled_reason: str | None
+    capabilities: tuple[Capability, ...] = field(default=(), compare=False)
+    _db: CapabilitiesDb | None = field(default=None, compare=False, repr=False)
+    _http: httpx.AsyncClient | None = field(default=None, compare=False, repr=False)
+
+    async def close(self) -> None:
+        """Close the Spotify HTTP client and the database; a disabled build closes nothing.
+
+        Call it after `host.stop()`, so no capability is still using either. A second call is
+        harmless: both closes are idempotent.
+        """
+        if self._http is not None:
+            await self._http.aclose()
+        if self._db is not None:
+            # `close` takes the database lock, which a worker-thread call may still hold.
+            await asyncio.to_thread(self._db.close)
+
+
+class _UnavailableLights:
+    """A `LightsProvider` that cannot serve, for lights configured without a usable connection.
+
+    Lights then stay listed as `unavailable` with the reason, rather than missing from the
+    status surface and `GET /capabilities`.
+    """
+
+    def __init__(self, reason: str, clock: Clock) -> None:
+        self._reason = reason
+        self._clock = clock
+
+    async def start(self) -> None:
+        """Start nothing: there is no connection."""
+
+    async def stop(self) -> None:
+        """Stop nothing: there is no connection."""
+
+    def status(self) -> CapabilityStatus:
+        """Return `unavailable` with the reason the lights cannot connect."""
+        return CapabilityStatus(
+            name="lights", state="unavailable", reason=self._reason, checked_at=self._clock.now()
+        )
+
+    def catalog(self) -> LightCatalog:
+        """Return the empty catalog."""
+        return EMPTY_CATALOG
+
+    def resolve(self, target: str) -> LightTarget | None:
+        """Know no target."""
+        return None
+
+    def provider_tools(self) -> tuple[str, ...]:
+        """Report no provider tools."""
+        return ()
+
+    async def power(self, target: LightTarget, on: bool) -> None:
+        """Refuse; the host's status gate stops a call before it gets here."""
+        raise CapabilityUnavailableError(self._reason)
+
+    async def adjust(self, target: LightTarget, adjustment: LightAdjustment) -> None:
+        """Refuse; the host's status gate stops a call before it gets here."""
+        raise CapabilityUnavailableError(self._reason)
+
+    async def read_status(self, target: LightTarget | None) -> StatusReading:
+        """Refuse; the host's status gate stops a call before it gets here."""
+        raise CapabilityUnavailableError(self._reason)
+
+
+def _capability_disabled_reason(config: CapabilitiesConfig) -> str | None:
+    """Return why no capability host may be built now, or None when one may.
+
+    An isolation flag that does not parse fails closed: an eval or hydration run must never
+    reach real lights, music or alarms because of a typo.
+    """
+    from backend.knowledge.eval_isolation import (
+        EvalIsolationError,
+        is_eval_isolation_active,
+        is_hydration_isolation_active,
+    )
+
+    if not config.enabled:
+        return "capabilities disabled"
+    if ALLOW_ALL in allowed_origins():
+        return f"{ALLOWED_ORIGINS_ENV} allows every origin"
+    try:
+        if is_eval_isolation_active():
+            return "eval isolation active (MIST_EVAL_ISOLATION)"
+        if is_hydration_isolation_active():
+            return "hydration isolation active (MIST_HYDRATION_ISOLATION)"
+    except EvalIsolationError as exc:
+        return f"isolation flag invalid: {exc}"
+    return None
+
+
+def _user_zone(name: str | None) -> UserZone:
+    """Resolve `MIST_TIMEZONE` for alarms, timers and the clock.
+
+    An unset zone is checked first, without the resolver: the resolver's UTC default serves
+    dates, but an alarm in a guessed zone rings at the wrong hour. A set name that does not
+    resolve to a `ZoneInfo` (an unknown name, or the resolver's UTC fallback when tzdata is
+    missing) gives no zone either, so an alarm never rings in a fallback zone.
+    """
+    if name is None:
+        return UserZone(name=None, tz=None, reason=TZ_UNSET_REASON)
+    try:
+        tz = resolve_user_timezone({USER_TIMEZONE_ENV: name})
+    except ValueError:
+        tz = None
+    if not isinstance(tz, ZoneInfo):
+        return UserZone(name=name, tz=None, reason=f"timezone {name} not found (tzdata missing?)")
+    return UserZone(name=name, tz=tz, reason=None)
+
+
+def _lights_transport(
+    secret_source: SecretSource,
+    secret_registry: SecretRegistry,
+    transport_factory: "Callable[[str, Secret], McpTransport] | None",
+) -> "tuple[Secret, Callable[[str, Secret], McpTransport]] | str":
+    """Return the Home Assistant token and transport factory, or why lights cannot connect."""
+    try:
+        token = secret_source.get("MIST_HA_TOKEN")
+    except SecretMissingError as exc:
+        return str(exc)
+    if token is None:
+        return "MIST_HA_TOKEN unset"
+    secret_registry.register(token)
+    if transport_factory is None:
+        try:
+            from backend.capabilities.mcp.sdk_transport import (  # type: ignore[import-not-found]
+                McpSdkTransport,
+            )
+        except ImportError:
+            return "mcp package not installed"
+        transport_factory = McpSdkTransport
+    return token, transport_factory
+
+
+def build_capability_host(
+    config: CapabilitiesConfig,
+    *,
+    event_sink: EventSink,
+    secret_source: SecretSource,
+    secret_registry: SecretRegistry,
+    clock: Clock,
+    embedder: Embedder | None,
+    token_counter: "TokenCounter",
+    transport_factory: "Callable[[str, Secret], McpTransport] | None",
+    power: PowerState,
+    tiers: TierProviders,
+    register: ReplyRegister,
+    desktop_present: Callable[[], bool],
+) -> CapabilityBuild:
+    """Assemble the capabilities named in `MIST_CAPABILITIES` behind one `CapabilityHost`.
+
+    No host is built while capabilities are disabled, while `MIST_ALLOWED_ORIGINS` allows every
+    origin (any web page could then drive devices), or while eval or hydration isolation is
+    active or unreadable. Lights are built only with `MIST_HA_MCP_URL`, music only with
+    `MIST_SPOTIFY_CLIENT_ID`. Nothing here opens a file or a socket: the database opens on
+    first use, so an unwritable path makes alarms and timers `unavailable` at start instead of
+    failing the build.
+
+    Alarms and timers share one store, one scheduler and one `RingingTracker`, which wraps the
+    `RingRouter` that rings the desktop endpoint, and the host's `SchedulerAlarmControl` runs
+    over the same three. Without a usable `MIST_TIMEZONE` none of them is built, and alarms,
+    timers and the clock report the zone's reason.
+
+    Args:
+        config: The parsed capability environment.
+        event_sink: Broadcasts host and alarm payloads to every connection.
+        secret_source: Where the Home Assistant token is read from.
+        secret_registry: Receives every secret value, for redaction.
+        clock: The host's and every capability's clock.
+        embedder: For the router's embedding stage; None turns that stage off.
+        token_counter: Counts catalog tokens for the router and the lights enum check.
+        transport_factory: Builds a Home Assistant MCP transport from the URL and token; None
+            uses the MCP SDK transport, imported here so a missing `mcp` package costs only
+            lights.
+        power: The level each record and broadcast carries.
+        tiers: Whose `interaction` provider gates the action decode.
+        register: The address form of each session's first templated reply.
+        desktop_present: Whether a client is connected, for the desktop ring endpoint.
+
+    Returns:
+        A build with a host and no reason, or no host and the reason.
+    """
+    reason = _capability_disabled_reason(config)
+    if reason is not None:
+        logger.info("No capability host built: %s", reason)
+        return CapabilityBuild(host=None, disabled_reason=reason)
+
+    threshold = config.router.embedding_threshold
+    if threshold is not None and embedder is None:
+        logger.warning(
+            "MIST_CAPABILITY_ROUTER_EMBEDDING_THRESHOLD is set but no embedder is available; "
+            "the router's embedding stage stays off"
+        )
+        threshold = None
+    try:
+        router_config = RouterConfig(
+            token_budget=config.tool_token_budget,
+            reserved_tokens=token_counter.count(DECODE_INSTRUCTIONS),
+            sticky_turns=config.router.sticky_turns,
+            embedding_threshold=threshold,
+        )
+    except CapabilityConfigError as exc:
+        logger.error("No capability host built: %s", exc)
+        return CapabilityBuild(host=None, disabled_reason=f"capability config invalid: {exc}")
+
+    names = set(config.capabilities)
+    db = CapabilitiesDb(config.db_path)
+    records = AlarmRecords(db)
+    zone = _user_zone(config.timezone) if names & {"alarms", "timers", "clock"} else None
+    scheduler: AlarmScheduler | None = None
+    tracker: RingingTracker | None = None
+    alarm_control: SchedulerAlarmControl | None = None
+    endpoints: Callable[[], tuple[str, ...]] = tuple
+    if zone is not None and zone.tz is not None and names & {"alarms", "timers"}:
+        sinks = [DesktopSink(event_sink, desktop_present)]
+        ring_router = RingRouter(sinks, records, clock, config.alarms, zone.tz)
+        tracker = RingingTracker(ring_router)
+        scheduler = AlarmScheduler(records, clock, tracker, config.alarms, zone.tz)
+        alarm_control = SchedulerAlarmControl(records, scheduler, clock, config.alarms, zone.tz)
+        endpoints = ring_router.endpoints
+
+    capabilities: list[Capability] = []
+    connection: McpConnection | None = None
+    http: httpx.AsyncClient | None = None
+    for name in config.capabilities:
+        if name in ("alarms", "timers") and zone is not None:
+            scheduled = AlarmsCapability if name == "alarms" else TimersCapability
+            capabilities.append(
+                scheduled(
+                    records,
+                    scheduler,
+                    clock=clock,
+                    zone=zone,
+                    ringing=tracker,
+                    endpoints=endpoints,
+                    snooze_minutes=config.alarms.snooze_minutes,
+                )
+            )
+        elif name == "clock" and zone is not None:
+            capabilities.append(ClockCapability(clock=clock, zone=zone))
+        elif name == "lights" and config.lights.ha_mcp_url is not None:
+            url = config.lights.ha_mcp_url
+            transport = _lights_transport(secret_source, secret_registry, transport_factory)
+            provider: HomeAssistantLightsProvider | _UnavailableLights
+            if isinstance(transport, str):
+                logger.warning("Lights unavailable: %s", transport)
+                provider = _UnavailableLights(transport, clock)
+            else:
+                token, make = transport
+                rng = random.SystemRandom()
+                connection = McpConnection(
+                    functools.partial(make, url, token),
+                    clock,
+                    # Equal jitter, so several clients do not reconnect in step.
+                    BackoffPolicy(jitter=lambda delay, rng=rng: rng.uniform(delay / 2, delay)),
+                )
+                provider = HomeAssistantLightsProvider(
+                    connection, clock, call_timeout_s=config.tool_timeout_s
+                )
+            capabilities.append(
+                LightsCapability(
+                    provider, default_target=config.lights.default_target, counter=token_counter
+                )
+            )
+        elif name == "music" and config.music.spotify_client_id is not None:
+            http = httpx.AsyncClient(timeout=_SPOTIFY_HTTP_TIMEOUT_S)
+            token_store = SpotifyTokenStore(Path(config.music.spotify_token_path))
+            accounts = SpotifyAccounts(
+                http,
+                client_id=config.music.spotify_client_id,
+                registry=secret_registry,
+                clock=clock,
+            )
+            tokens = SpotifyTokenManager(
+                store=token_store, accounts=accounts, registry=secret_registry, clock=clock
+            )
+            capabilities.append(
+                MusicCapability(
+                    SpotifyApi(http, tokens),
+                    device_name=config.music.spotify_device,
+                    clock=clock,
+                    token_store=token_store,
+                )
+            )
+
+    specs = [spec for capability in capabilities for spec in capability.tools()]
+    try:
+        policy = PolicyTable.from_specs(specs, config.policy_file)
+    except CapabilityConfigError as exc:
+        logger.warning("Capability policy file ignored, defaults in force: %s", exc)
+        policy = PolicyTable.from_specs(specs, None)
+    host = CapabilityHost(
+        capabilities,
+        router=ToolRouter(capabilities, router_config, token_counter, embedder),
+        counter=token_counter,
+        policy=policy,
+        decoder=ActionDecoder(),
+        secrets=secret_registry,
+        action_log=ActionLog(db),
+        event_sink=event_sink,
+        clock=clock,
+        settings=HostSettings.from_config(config),
+        alarm_control=alarm_control,
+        power=power,
+        tiers=tiers,
+        register=register,
+    )
+    if connection is not None:
+        connection.set_state_listener(host.status_changed)
+    logger.info(
+        "Capability host built: %s", ", ".join(c.name for c in capabilities) or "no capabilities"
+    )
+    return CapabilityBuild(
+        host=host,
+        disabled_reason=None,
+        capabilities=tuple(capabilities),
+        _db=db,
+        _http=http,
+    )

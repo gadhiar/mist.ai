@@ -21,5 +21,5 @@ RUN test -n "$GIT_SHA" \
 
 COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/
 COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/
-RUN /opt/venv-train-neutts/bin/python -I -c 'import torch, torchaudio, neutts, transformers, librosa, soundfile, numpy, perth, phonemizer, scripts.voice_data' \
+RUN /opt/venv-train-neutts/bin/python -I -c 'import torch, torchaudio, torchao, neutts, transformers, librosa, soundfile, numpy, perth, phonemizer, scripts.voice_data' \
  && /opt/venv-score/bin/python -I -c 'import scripts.voice_data'

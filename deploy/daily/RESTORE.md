@@ -164,3 +164,20 @@ Nothing is deleted. The previous state and vault stay in `<root>/retired/<UTC st
 previous graph volume stays under its old name. To go back, stop the instance, move the two
 directories back from `retired/`, and set `MIST_DAILY_NEO4J_VOLUME` back to the old volume name
 in `daily.env` before running `up`.
+
+---
+
+## Capability tokens
+
+A backup holds `capabilities.db`, so alarms, timers and the action log come back with the
+stores. It does not hold the tokens: `mist-backup` does not mount `<root>/secrets/`. Promotion
+leaves `<root>/secrets/` where it is, so the same root keeps its tokens. But after a restore onto
+a new instance root, re-issue the HA and Spotify tokens; `<root>/secrets/` is not backed up:
+
+- write a new Home Assistant long-lived access token into `<root>/secrets/ha_token`, and revoke
+  the old one in Home Assistant if the old root is gone;
+- run the Spotify authorization again, which writes `<root>/secrets/spotify_token.json`.
+
+`deploy/daily/README.md`, Capabilities, gives both steps in full. Until they are done, lights and
+music cannot act and `/capabilities` names the missing token as their reason; the other
+capabilities run.

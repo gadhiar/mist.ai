@@ -244,3 +244,37 @@ class SentenceBoundaryDetector:
         if dot_pos < len(self._buffer) - 2 and self._buffer[dot_pos : dot_pos + 3] == "...":
             return True
         return False
+
+
+def find_clause_boundary(text: str, min_chars: int) -> int | None:
+    """Find where text may be cut early so speech can start before the sentence ends.
+
+    The handler's first emission and the first TTS segment both cut here, through this one
+    function, so the first Token and the first segment end at the same character. A boundary is
+    a `,`, `;` or `:` (optionally followed by a closing quote or bracket), a dash with a space
+    on each side (`-`, `--`, an en dash or an em dash), or a sentence boundary as
+    `SentenceBoundaryDetector` finds it, so abbreviations, decimals, list markers and ellipses
+    are not boundaries. Each must be followed by whitespace: a comma at the end of the text may
+    be the start of `1,000`, so the cut waits for the next character.
+
+    Args:
+        text: The text to search, from the start of the segment being cut.
+        min_chars: The earliest index a cut may lie at, so the first segment is long enough to
+            sound like a phrase.
+
+    Returns:
+        The index just past the first boundary at or after `min_chars`, or None when there is
+        none yet.
+    """
+    clause = re.compile(r"""(?:[,;:]["')}\]]?|(?<=\s)(?:--|[-–—]))(?=\s)""")
+    cuts = [match.end() for match in clause.finditer(text)]
+    detector = SentenceBoundaryDetector()
+    detector._buffer = text
+    search_start = 0
+    while (boundary := detector._find_boundary(search_start)) is not None:
+        # `_find_boundary` returns the index past the whitespace; the cut lies just past the
+        # punctuation and its closing quote or bracket.
+        cuts.append(len(text[:boundary].rstrip()))
+        search_start = boundary
+    eligible = [cut for cut in cuts if cut >= min_chars]
+    return min(eligible) if eligible else None

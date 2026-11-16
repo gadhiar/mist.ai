@@ -50,6 +50,14 @@ services:
       - MIST_LOG_DIR=/app/logs
       - MIST_OPS_DIR=/app/ops
       - MIST_BACKUP_STATUS_PATH=/app/ops/backup-status.json
+      # Capabilities: the store sits with the others under state/, which mist-backup captures;
+      # the tokens sit in secrets/, which only this service mounts, so no backup holds them.
+      # MIST_HA_TOKEN is empty so a token put in daily.env is ignored and the file is its one
+      # source.
+      - MIST_CAPABILITIES_DB_PATH=/app/data/capabilities.db
+      - MIST_HA_TOKEN=
+      - MIST_HA_TOKEN_FILE=/app/secrets/ha_token
+      - MIST_SPOTIFY_TOKEN_PATH=/app/secrets/spotify_token.json
       # The Tauri app's origins only; the code's default also admits the Vite dev origin.
       - MIST_ALLOWED_ORIGINS=${MIST_ALLOWED_ORIGINS:-http://tauri.localhost,https://tauri.localhost,tauri://localhost}
     volumes:
@@ -58,6 +66,8 @@ services:
       - ${MIST_DAILY_ROOT}/mist-memory:/app/mist-memory
       # Read-only here: only mist-backup and the host CLI write the ops directory.
       - ${MIST_DAILY_ROOT}/ops:/app/ops:ro
+      # Read-write: the Spotify client rewrites its token file when it refreshes the token.
+      - ${MIST_DAILY_ROOT}/secrets:/app/secrets
       - mist-hf-cache:/home/appuser/.cache/huggingface
       - mist-torch-cache:/home/appuser/.cache/torch
     mem_limit: ${MIST_DAILY_BACKEND_MEM_LIMIT:-8g}

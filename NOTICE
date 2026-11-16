@@ -48,14 +48,16 @@ respective licenses:
    Model downloaded at runtime via transformers library.
 
 -------------------------------------------------------------------------------
-4. Silero VAD
-   Location: Downloaded via torch.hub
-   Source: https://github.com/snakers4/silero-vad
+4. Silero VAD (ONNX build)
+   Location: Staged under the models directory (speech/onnx-community/silero-vad/onnx/model.onnx)
+   Source: https://huggingface.co/onnx-community/silero-vad
+           (revision e71cae966052b992a7eca6b17738916ce0eca4ec),
+           an ONNX export of https://github.com/snakers4/silero-vad
    License: MIT License
    Copyright: Silero Team
 
-   Used for Voice Activity Detection.
-   Model downloaded at runtime.
+   Used for Voice Activity Detection (backend/realtime/engines/silero_vad.py).
+   The model file is not included in this repository and is not downloaded at runtime.
 
 -------------------------------------------------------------------------------
 5. Ollama / Qwen 2.5
@@ -67,7 +69,21 @@ respective licenses:
    Runs as separate service, not included in this repository.
 
 -------------------------------------------------------------------------------
-6. MS MARCO MiniLM-L-6-v2 Cross-Encoder
+6. Smart Turn v3
+   Location: Staged under the models directory
+             (speech/pipecat-ai/smart-turn-v3/smart-turn-v3.2-cpu.onnx)
+   Source: https://huggingface.co/pipecat-ai/smart-turn-v3
+           (revision f766f81d3cfdf7737ac64aad813d91bbfd56bf93),
+           https://github.com/pipecat-ai/smart-turn
+   License: BSD 2-Clause License
+   Copyright: Daily
+
+   Used for semantic end-of-turn detection (backend/realtime/engines/smart_turn.py),
+   whose input preparation follows the project's published inference.py.
+   The model file is not included in this repository and is not downloaded at runtime.
+
+-------------------------------------------------------------------------------
+7. MS MARCO MiniLM-L-6-v2 Cross-Encoder
    Location: Baked into the backend image at /opt/models/ms-marco-MiniLM-L-6-v2
    Source: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2
    Revision: 233902d25c440f23af6f7d6e94d2946bac0bee0a
@@ -79,7 +95,7 @@ respective licenses:
    repository.
 
 -------------------------------------------------------------------------------
-7. MS MARCO MiniLM-L-12-v2 Cross-Encoder
+8. MS MARCO MiniLM-L-12-v2 Cross-Encoder
    Location: Baked into the backend image at /opt/models/ms-marco-MiniLM-L-12-v2
    Source: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-12-v2
    Revision: 7b0235231ca2674cb8ca8f022859a6eba2b1c968
@@ -91,7 +107,7 @@ respective licenses:
    in this repository.
 
 -------------------------------------------------------------------------------
-8. all-MiniLM-L6-v2 Sentence Embedding Model
+9. all-MiniLM-L6-v2 Sentence Embedding Model
    Location: Baked into the backend image at /opt/models/all-MiniLM-L6-v2
    Source: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
    Revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
@@ -133,6 +149,15 @@ The following components are licensed under MIT License:
 
 MIT License is permissive and allows commercial use, modification,
 distribution, and private use with minimal restrictions.
+
+BSD 2-CLAUSE LICENSE COMPONENTS
+
+The following components are licensed under the BSD 2-Clause License:
+- Smart Turn v3
+
+The BSD 2-Clause License allows redistribution and use in source and binary
+forms, with or without modification, provided the copyright notice, the list
+of conditions and the disclaimer are retained.
 
 ===============================================================================
 

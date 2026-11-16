@@ -292,3 +292,48 @@ class TestEmptyEvents:
         assert result.operations_applied == 0
         assert result.duration_ms > 0
         llm.assert_not_called()
+
+
+class TestCapabilityTurns:
+    """T31: a turn a capability answered alone is not reflected on."""
+
+    @pytest.mark.asyncio
+    async def test_a_capability_turn_is_not_derived_or_counted(self):
+        capability = _make_turn(utterance="set a timer for ten minutes", event_id="evt-cap")
+        capability["answered_by"] = "capability"
+        model = _make_turn(utterance="I prefer concise answers", event_id="evt-model")
+        model["answered_by"] = "model"
+        old = _make_turn(utterance="I like clear explanations", event_id="evt-old")
+        old["answered_by"] = None
+        store = FakeEventStore(turns=[capability, model, old])
+        job, _llm, _ = _build_job(event_store=store)
+        detected: list[str] = []
+        derived: list[str] = []
+        real_detect = job._signal_detector.detect
+        real_derive = job._deriver.derive
+
+        def _detect(utterance, **kwargs):
+            detected.append(utterance)
+            return real_detect(utterance, **kwargs)
+
+        async def _derive(**kwargs):
+            derived.append(kwargs["event_id"])
+            return await real_derive(**kwargs)
+
+        job._signal_detector.detect = _detect
+        job._deriver.derive = _derive
+
+        result = await job.run(lookback_hours=24)
+
+        assert result.events_processed == 2
+        assert derived == ["evt-model", "evt-old"]
+        assert detected == ["I prefer concise answers", "I like clear explanations"]
+
+    @pytest.mark.asyncio
+    async def test_a_turn_without_the_key_is_derived_as_today(self):
+        store = FakeEventStore(turns=[_make_turn(utterance="hello", event_id="evt-1")])
+        job, _llm, _ = _build_job(event_store=store)
+
+        result = await job.run(lookback_hours=24)
+
+        assert result.events_processed == 1
