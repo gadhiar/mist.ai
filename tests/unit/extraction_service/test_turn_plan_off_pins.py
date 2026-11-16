@@ -71,13 +71,19 @@ PROSE_UTTERANCE = "I have been learning Rust for a few months"
 # T60: the scope body is sent with `max_tokens` 512 in place of 96; before T60 the two were
 # 49903b6ece2a885e20b813bd77acf90cd8a49110a4f44f8213da66dc8d815b5d and
 # 11b54c027d71919b5bcbf7b2c5dd3aa80b4f6d200d444928215c6d9d9b8cf281.
-STRUCTURED_BODIES_SHA256 = "91ee7c0912e38bb495d1528d83f37929a4c74cc138b619f523ca3c53b1452f2c"
-PROSE_BODIES_SHA256 = "2370541fe87ff38807fd6baaad3ad8d90233592d196797d3a41873a2dc8a2fd2"
+# T64: the bodies hold the system prompt and Stage 2 schema before T52 again, with T60's
+# scope `max_tokens`; before T64, under T52's prompt and schema, the two were
+# 91ee7c0912e38bb495d1528d83f37929a4c74cc138b619f523ca3c53b1452f2c and
+# 2370541fe87ff38807fd6baaad3ad8d90233592d196797d3a41873a2dc8a2fd2.
+STRUCTURED_BODIES_SHA256 = "a40685dba9adfc5a172d650b7c96ccd3629ac835042bf7003a2fdb1d01ebfb76"
+PROSE_BODIES_SHA256 = "6665623b4756371e02e7a4991932eec3538e2b61f2f53c83474f05308cb8ddde"
 # T48: `EARLIER_ITEMS_HEADING` joined the hash; at 058e52c this was
 # 6c7cfb5fb49e1c8382fb298d0b50607cd6d6c8c5f43c9277f1f59ef9a76c590e.
 # T52: Rule 28, Example 30 and the generated schema moved it; before T52 it was
 # dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b.
-PROMPT_SHA256 = "3db8b2a7e7346efa14835792c38ff82123043bec67b82a017d5f67d18f719212"
+# T64: undid T52's move, restoring the prompt and schema before T52; under T52 it was
+# 3db8b2a7e7346efa14835792c38ff82123043bec67b82a017d5f67d18f719212.
+PROMPT_SHA256 = "dfae2785c08ededffbbf4369ed468b9e803abde321566481d8f7bc4aae80298b"
 SERVING_IDENTITY_AT_058E52C = "si1-0a4fdfffca232a0e3d27716f7ab0e41ed75715ed7eb932b05939b692bc358cb1"
 # T49: `request.extract.thinking_budget_tokens` went from None to 8192.
 # T62: `request.<stage>.cache_prompt` joined it, false at every stage; at b56f28a it was

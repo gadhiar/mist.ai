@@ -47,9 +47,8 @@ _DATA_KEYWORDS = frozenset({"enum", "const", "required"})
 
 
 def _generate(pack: Pack) -> dict:
-    by_name = {node.type_name: node for node in pack.node_types}
     return generate_extraction_schema(
-        entity_types=tuple(by_name[name] for name in pack.extractable_node_types),
+        entity_types=pack.extractable_node_types,
         relationship_types=pack.extractable_edge_types,
     )
 

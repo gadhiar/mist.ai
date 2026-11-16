@@ -185,13 +185,18 @@ class PackRelease:
 # same change the Stage 2 schema came to be generated from the pack's declarations: it
 # limits each entity's and relationship's type to the extractable lists, and Metric
 # declares `quantity` beside `value` and `unit`, the three keys the schema requires of
-# a Metric's properties. The rails hash did not move.
+# a Metric's properties. Still under r9 and before any r9 release, T64 undid that
+# change after the AT52 cell measured the prompt and schema before it (v24's H34
+# reading): Rule 28 again calls a `[user]:` line an earlier unit, though the engine
+# still shows earlier units under `EARLIER_ITEMS_HEADING`, and the Stage 2 schema's
+# entities and relationships are again open objects. The rails hash did not move.
 PACK_RELEASE: PackRelease = PackRelease(
     extraction_version=EXTRACTION_VERSION,
     pack_version=ONTOLOGY_VERSION,
-    # Before T52's Rule 28, Example 30 and generated schema:
-    # 944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d.
-    pack_prompt_hash="ac0dcd956bcb596a86bee1ab6a90a42661dff5347366fe859033a43067a75eac",
+    # Again the value before T52's Rule 28, Example 30 and generated schema; under that
+    # change, which T64 undid, it was
+    # ac0dcd956bcb596a86bee1ab6a90a42661dff5347366fe859033a43067a75eac.
+    pack_prompt_hash="944c7fca0f474d70627a98836ba79d5fdf895dacda34550a3fcb732f0b1b078d",
     pack_rails_hash="bc72f2458c8bc3a62a6843a08b0c11262880778912d2e387cdcedffc0582bc3d",
 )
 
@@ -357,7 +362,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
         # Before T62's uncached requests and request date, which move
         # code_sha256:
         # ci1-b26a03224c323f3835ba8b00fa81462184a6e93e882190ce6e061385779483a7.
-        code_identity="ci1-2091315e85f9bb98b0d93e35ac0d4923d21a972d7e6d9dd155a78ca6cce6c688",
+        # Before T64's restore of the prompt and schema before T52, which moves
+        # prompt_sha256 and code_sha256:
+        # ci1-2091315e85f9bb98b0d93e35ac0d4923d21a972d7e6d9dd155a78ca6cce6c688.
+        code_identity="ci1-8655f1ae4c8fc2f9c406608356669698835270275a0071ccd3f997e5ea00b3f4",
         date="2026-11-12",
         reason=(
             "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
@@ -368,15 +376,12 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "lead-in or heading changes; each Stage 2 call leaves a batch record entry on "
             "the response; the pack's `unchecked-goals` item filter drops an unchecked item "
             "under no goal word, and a turn with no unit left makes its scope call and no "
-            "plan or Stage 2 call; T52 brings Rule 28 and Example 30 to that form, so the "
-            "prompt says earlier units stand under EARLIER_ITEMS_HEADING and no longer "
-            "calls a `[user]:` line one; T52 also generates the Stage 2 schema from the "
-            "pack's declarations, so an entity's type is one of the pack's extractable "
-            "types and a relationship's one of its extractable edges, each entity carries "
-            "id, name and type and each relationship source, target and type, and a "
-            "Metric that writes properties writes value, unit and quantity, unit and "
-            "quantity possibly null; T60 sends scope with a cap of 512 in place of 96, so a "
-            "scope reply is no longer cut mid-answer; T62 sends every request with "
+            "plan or Stage 2 call; T64 undid T52's Rule 28, Example 30 and generated "
+            "schema, so Rule 28 calls a `[user]:` line an earlier unit though the engine "
+            "shows earlier units under EARLIER_ITEMS_HEADING, the schema limits no type, "
+            "and it requires only the entities and relationships arrays; T60 sends scope "
+            "with a cap of 512 in place of 96, so a scope reply is no longer cut "
+            "mid-answer; T62 sends every request with "
             "`cache_prompt` false, so each prompt is processed from its first token, and "
             "with the turn's reference date as `chat_template_kwargs.current_date`, which "
             "the shipped gpt-oss template renders as the system message's date in place of "

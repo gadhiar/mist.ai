@@ -94,13 +94,7 @@ class TemporalClass(StrEnum):
 
 @dataclass(frozen=True)
 class PropertyDefinition:
-    """Schema definition for a single property on a node or edge type.
-
-    `nullable` and `extracted` are None unless a pack sets them, so a declaration that
-    sets neither hashes as it did before they existed. `nullable` lets the model write
-    null for the property; `extracted` marks it as one the model writes, which the
-    generated Stage 2 schema states.
-    """
+    """Schema definition for a single property on a node or edge type."""
 
     name: str
     type: str
@@ -108,8 +102,6 @@ class PropertyDefinition:
     description: str = ""
     allowed_values: tuple[str, ...] | None = None
     default: Any | None = None
-    nullable: bool | None = None
-    extracted: bool | None = None
 
 
 @dataclass(frozen=True)

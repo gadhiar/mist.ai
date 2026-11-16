@@ -787,29 +787,15 @@ METRIC = NodeTypeDefinition(
             type="float",
             required=True,
             description="Numeric value of the measurement.",
-            extracted=True,
         ),
         PropertyDefinition(
             name="unit",
             type="string",
             required=True,
             description=(
-                "Unit of measurement (e.g. 'seconds', 'tokens/sec', 'percent', 'count'), "
-                "or null when the value has none."
+                "Unit of measurement (e.g. 'seconds', 'tokens/sec', "
+                "'tool_selection', 'percent', 'count')."
             ),
-            nullable=True,
-            extracted=True,
-        ),
-        PropertyDefinition(
-            name="quantity",
-            type="string",
-            required=True,
-            description=(
-                "What is measured (e.g. 'tool_selection'), or null when the "
-                "utterance does not say."
-            ),
-            nullable=True,
-            extracted=True,
         ),
     ),
     optional_properties=(
