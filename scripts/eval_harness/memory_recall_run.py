@@ -1506,7 +1506,7 @@ class ProbeTracer:
         block_ids: dict[str, set[str]],
         indexed_notes: set[str],
     ) -> tuple[dict[str, object], list[dict[str, object]]]:
-        """A note target; one dropped before the order, as if suppressed, keeps that reason."""
+        """A note target; one dropped before the order, as when suppressed, keeps that reason."""
         path = str(base["id"])
         fused_positions = [fused_at[key] for key in keys if key in fused_at]
         ranks = sorted(ranked_at[key] for key in keys if key in ranked_at)

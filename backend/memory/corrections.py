@@ -7,9 +7,11 @@ queued mid-turn), and then calls each recorded listener with the record.
 
 Recording takes effect at read time, before any graph write: `LoggedSuppression` reads the log
 into a `Suppression`, which the fetcher reads in stage 1 and applies before the cross-encoder.
-It takes effect on the next fetch only once a recorded listener calls `fetcher.invalidate()`
-(registering one is T34's); until then a stage 1 the fetcher cached for a session, up to
-30 s old, still holds the suppression set read before the correction. What it suppresses
+A fetch that runs its own stage 1 reads the log, so the correction reaches it at once. What a
+prefetch left (its cached stage 1, its finished result, or a run still in flight for the same
+words) holds the set read before the correction and is reused for up to 30 s, until a recorded
+listener calls `fetcher.invalidate()` (registering one is T34's); the fetcher module's
+docstring says when each is reused. What it suppresses
 (Design point 12, with plan v2's and v5's changes):
 
 - every version of the corrected `fact_key` recorded at or before the correction, so the same

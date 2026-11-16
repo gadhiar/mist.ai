@@ -8,9 +8,6 @@ in two stages (Design point 8):
   fact and facet entity anchors of the last two user utterances, and the suppression set of the
   corrections (`corrections.Suppression`, read only when `corrections_enabled`). It is cached
   per session for 30 s, so a prefetch started at speech start takes it off the critical path.
-  A recorded correction drops the cache only through a recorded listener that calls
-  `invalidate()` (registering one is T34's); without one a cached stage 1 keeps the
-  suppression set read before the correction until it expires.
 - Stage 2 depends on the words: the FTS, vector and entity-anchored fact and facet pools, the
   vault note pool, RRF fusion into the pool order, the shortlist's drops (suppressed facts,
   notes whose whole text a correction suppresses, facets with fewer than two current members),
@@ -43,6 +40,14 @@ endpoint `fetch` reuses that result when the final words normalise to the same t
 (`prefetch_reuse="block"`), awaits a running prefetch of the same text within the deadline,
 reuses a cached stage 1 when the words are close enough (Jaccard 0.8 on the token sets,
 `stage1`), and otherwise runs fresh (`none`).
+
+A correction reaches a fetch that runs its own stage 1 at once, since that stage reads the log.
+Only a prefetch fills the caches, and three things it leaves can hold the suppression set read
+before a correction: its cached stage 1, reused for 30 s from its start while the anchors
+match and the words are close enough; its finished result, reused for 30 s from its end for
+the same normalised words and request shape; and a prefetch still running for them.
+`invalidate()` drops all three. Until a recorded listener calls it (registering one is T34's),
+each is reused as above after a correction.
 
 `fetch` never raises into the turn: an index failure returns an empty result marked
 `index_error`, a reranker failure keeps the pool order marked `reranker_unavailable`, and any
