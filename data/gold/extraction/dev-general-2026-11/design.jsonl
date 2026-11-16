@@ -1,0 +1,60 @@
+{"tag": "dvg-01-core-obsidian-reading-notes", "category": "core", "intent": "types: User, Technology, Concept; predicates: USES, USED_FOR; note: 2 relations, a tool the user uses and what for"}
+{"tag": "dvg-02-core-dislikes-open-plan-offices", "category": "core", "intent": "types: User, Concept; predicates: DISLIKES; note: 1 relation, a plain dislike"}
+{"tag": "dvg-03-core-works-at-ruddlesmoor", "category": "core", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, the user's employer with a job title"}
+{"tag": "dvg-04-core-prefers-paper-notebooks", "category": "core", "intent": "types: User, Preference; predicates: PREFERS; note: 1 relation, a preference with its context"}
+{"tag": "dvg-05-core-negated-kubernetes", "category": "core", "intent": "types: User, Technology; predicates: DISLIKES; note: 1 relation, a negated preference, an assertion"}
+{"tag": "dvg-06-core-negated-yaml-config", "category": "core", "intent": "types: User, Technology; predicates: DISLIKES; note: 1 relation, a negated preference in another wording, an assertion"}
+{"tag": "dvg-07-core-uses-syncthing", "category": "core", "intent": "types: User, Technology; predicates: USES; note: 1 relation, a tool the user runs"}
+{"tag": "dvg-08-core-prefers-fish-to-zsh", "category": "core", "intent": "types: User, Technology; predicates: PREFERS; note: 1 relation, a preference over a named alternative"}
+{"tag": "dvg-09-core-prefers-cycling-to-work", "category": "core", "intent": "types: User, Preference; predicates: PREFERS; note: 1 relation, an activity preferred over another"}
+{"tag": "dvg-10-core-works-at-wyndral-clinic", "category": "core", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, the employer named with a job and a city"}
+{"tag": "dvg-11-event-talk-at-lintwater-meetup", "category": "event", "intent": "types: User, Event, Date; predicates: EXPERIENCED, OCCURRED_ON; note: 2 relations, a talk the user gave on a stated day"}
+{"tag": "dvg-12-event-first-marathon", "category": "event", "intent": "types: Event, Date; predicates: OCCURRED_ON; note: 1 relation, a completed milestone on a stated day"}
+{"tag": "dvg-13-event-launched-pottery-site", "category": "event", "intent": "types: Event, Date; predicates: OCCURRED_ON; note: 1 relation, a launch milestone on a stated day"}
+{"tag": "dvg-14-event-kotlin-workshop", "category": "event", "intent": "types: User, Event, Date; predicates: EXPERIENCED, OCCURRED_ON; note: 2 relations, an event the user attended on a stated day"}
+{"tag": "dvg-15-event-graduated-nursing-degree", "category": "event", "intent": "types: Event, Date; predicates: OCCURRED_ON; note: 1 relation, a graduation milestone on a stated day"}
+{"tag": "dvg-16-metric-larchfield-indexer-throughput", "category": "metric", "intent": "types: Project, Metric; predicates: HAS_METRIC; note: 1 relation, a throughput of the user's project"}
+{"tag": "dvg-17-metric-gorsey-test-suite-time", "category": "metric", "intent": "types: Project, Metric; predicates: HAS_METRIC; note: 1 relation, a duration measured on a project"}
+{"tag": "dvg-18-metric-sqlite-query-time", "category": "metric", "intent": "types: Technology, Metric; predicates: HAS_METRIC; note: 1 relation, a latency of a technology"}
+{"tag": "dvg-19-skill-learning-japanese", "category": "skill", "intent": "types: User, Skill; predicates: LEARNING; note: 1 relation, a language the user is learning"}
+{"tag": "dvg-20-skill-expert-terraform", "category": "skill", "intent": "types: User, Technology; predicates: EXPERT_IN; note: 1 relation, a technology the user is expert in"}
+{"tag": "dvg-21-skill-struggles-css-grid", "category": "skill", "intent": "types: User, Technology; predicates: STRUGGLES_WITH; note: 1 relation, a technology the user struggles with"}
+{"tag": "dvg-22-skill-learning-welsh-from-september", "category": "skill", "intent": "types: User, Skill; predicates: LEARNING; note: 1 relation, learning that starts on a stated day, forward-dated (an enrolment)"}
+{"tag": "dvg-23-skill-knows-elixir-learning-gleam", "category": "skill", "intent": "types: User, Technology; predicates: KNOWS, LEARNING; note: 2 relations, one known language and one being learned"}
+{"tag": "dvg-24-thirdparty-henrike-starts-at-saltbridge", "category": "thirdparty", "intent": "types: User, Person, Organization; predicates: KNOWS_PERSON, WORKS_AT; note: 2 relations, a friend's job from a stated month, forward-dated (a new job)"}
+{"tag": "dvg-25-thirdparty-tobiah-beekeeping", "category": "thirdparty", "intent": "types: User, Person, Skill; predicates: KNOWS_PERSON, EXPERT_IN; note: 2 relations, a neighbour's expertise"}
+{"tag": "dvg-26-thirdparty-radka-uses-blender", "category": "thirdparty", "intent": "types: User, Person, Technology; predicates: KNOWS_PERSON, USES; note: 2 relations, a relative's tool"}
+{"tag": "dvg-27-thirdparty-leofric-recommends-kicad", "category": "thirdparty", "intent": "types: User, Person, Organization, Technology; predicates: KNOWS_PERSON, WORKS_AT, RECOMMENDS; note: 3 relations, a friend's employer and a tool he recommended"}
+{"tag": "dvg-28-thirdparty-eluned-recommends-book", "category": "thirdparty", "intent": "types: User, Person, Skill, Document; predicates: KNOWS_PERSON, EXPERT_IN, RECOMMENDS; note: 3 relations, an instructor's expertise and a book she recommended"}
+{"tag": "dvg-29-validtime-embergrove-since", "category": "validtime", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, employment with a stated start month"}
+{"tag": "dvg-30-validtime-vim-span", "category": "validtime", "intent": "types: User, Technology; predicates: USES; note: 1 relation, use over a span of two years"}
+{"tag": "dvg-31-validtime-fencing-society-since", "category": "validtime", "intent": "types: User, Organization; predicates: MEMBER_OF; note: 1 relation, membership with a stated start month"}
+{"tag": "dvg-32-validtime-orrin-until", "category": "validtime", "intent": "types: User, Project; predicates: WORKS_ON; note: 1 relation, work on a project with a stated end, forward-dated (a planned end)"}
+{"tag": "dvg-33-validtime-contract-until", "category": "validtime", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, a contract with a stated end day, forward-dated (a contract's end)"}
+{"tag": "dvg-34-nofact-pasta-timer", "category": "nofact", "intent": "types: none; predicates: none; note: a utility request to the assistant"}
+{"tag": "dvg-35-nofact-greeting", "category": "nofact", "intent": "types: none; predicates: none; note: small talk"}
+{"tag": "dvg-36-nofact-mutex-question", "category": "nofact", "intent": "types: none; predicates: none; note: a general question"}
+{"tag": "dvg-37-nofact-norway-hypothetical", "category": "nofact", "intent": "types: none; predicates: none; note: a hypothetical"}
+{"tag": "dvg-38-nofact-thank-you-note", "category": "nofact", "intent": "types: none; predicates: none; note: a drafting request that says my"}
+{"tag": "dvg-39-nofact-umbrella-question", "category": "nofact", "intent": "types: none; predicates: none; note: a question naming a place"}
+{"tag": "dvg-40-structural-kafka-streams-part-of-kafka", "category": "structural", "intent": "types: Technology; predicates: PART_OF; note: 1 relation, a library that is part of a platform"}
+{"tag": "dvg-41-structural-planner-module-part-of-brindlecote", "category": "structural", "intent": "types: Concept, Project; predicates: PART_OF; note: 1 relation, a module that is part of a service"}
+{"tag": "dvg-42-structural-sourdough-kind-of-bread", "category": "structural", "intent": "types: Concept; predicates: IS_A; note: 1 relation, a kind-of relation between two concepts"}
+{"tag": "dvg-43-cease-stopped-evernote", "category": "cease", "intent": "types: User, Technology; predicates: USES; note: 1 relation, cease with a stated stop month"}
+{"tag": "dvg-44-cease-left-marlow-kettleworks", "category": "cease", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, cease with a stated stop month"}
+{"tag": "dvg-45-cease-no-longer-learning-mandarin", "category": "cease", "intent": "types: User, Skill; predicates: LEARNING; note: 1 relation, cease with no date"}
+{"tag": "dvg-46-cease-gave-up-nix", "category": "cease", "intent": "types: User, Technology; predicates: USES; note: 1 relation, cease with no date"}
+{"tag": "dvg-47-cease-cancelled-copperline-club", "category": "cease", "intent": "types: User, Organization; predicates: MEMBER_OF; note: 1 relation, cease with a stated stop month"}
+{"tag": "dvg-48-retract-never-worked-at-greyfriar", "category": "retract", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, retract worded as scratch what I said"}
+{"tag": "dvg-49-retract-misspoke-pulumi", "category": "retract", "intent": "types: User, Technology; predicates: USES; note: 1 relation, retract worded as I misspoke"}
+{"tag": "dvg-50-retract-never-learning-icelandic", "category": "retract", "intent": "types: User, Skill; predicates: LEARNING; note: 1 relation, retract worded as a correction"}
+{"tag": "dvg-51-retract-wrong-about-go", "category": "retract", "intent": "types: User, Technology; predicates: EXPERT_IN; note: 1 relation, retract worded as I was wrong"}
+{"tag": "dvg-52-retract-forget-jazz-fusion", "category": "retract", "intent": "types: User, Concept; predicates: PREFERS; note: 1 relation, retract worded as forget what I told you"}
+{"tag": "dvg-53-pair-firefox-to-vivaldi", "category": "pair", "intent": "types: User, Technology; predicates: USES; note: 2 relations, cease on the old browser and an assertion on the new one, both at a stated month"}
+{"tag": "dvg-54-pair-tidewell-to-fenmarch", "category": "pair", "intent": "types: User, Organization; predicates: WORKS_AT; note: 2 relations, cease on the old employer and an assertion on the new one, both at a stated month"}
+{"tag": "dvg-55-habit-swim-at-lido", "category": "habit", "intent": "types: User, Concept; predicates: HAS_HABIT; note: 1 relation, a daily habit"}
+{"tag": "dvg-56-habit-volunteer-food-bank", "category": "habit", "intent": "types: User, Concept; predicates: HAS_HABIT; note: 1 relation, a habit twice a month"}
+{"tag": "dvg-57-habit-phone-parents", "category": "habit", "intent": "types: User, Concept; predicates: HAS_HABIT; note: 1 relation, a daily habit about a group, so no Person"}
+{"tag": "dvg-58-datekind-taskwarrior-since", "category": "datekind", "intent": "types: User, Technology; predicates: USES; note: 1 relation, a fact that holds from a stated day"}
+{"tag": "dvg-59-datekind-starts-at-ashcombe", "category": "datekind", "intent": "types: User, Organization; predicates: WORKS_AT; note: 1 relation, a fact that holds from a stated day, forward-dated (a new job)"}
+{"tag": "dvg-60-datekind-closing-on-house", "category": "datekind", "intent": "types: Event, Date; predicates: OCCURRED_ON; note: 1 relation, a milestone on a stated day, forward-dated (a booked closing)"}

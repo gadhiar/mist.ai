@@ -21,6 +21,13 @@ utterance copies one of the dev-list, held-out or 60-probe sets, names a person 
 of those sets, or names an entity of the production prompt's examples. Its label passes are
 held to the label checks from the commit that adds each file. A failing selection check reports
 selection tags and counts only, because no session that tunes extraction may see its text.
+
+The dev-general set (`dev-general-2026-11.jsonl`, the section after the selection set's) is 60
+prose probes in the 60-probe set's category mix, checked from the commit that adds them, before
+any label: its size, tag order and category counts, its design rows, that it is prose with no
+list markup, that its dates are absolute and miss the reference month, and that it copies and
+names nothing of the other sets. Its label passes join the label checks once each file has a
+row. A failing dev-general check reports dev-general tags and counts only.
 """
 
 from __future__ import annotations
@@ -407,22 +414,35 @@ _HELDOUT_GOLD = _GOLD_DIR / "heldout-2026-11.jsonl"
 # The published sets are labels too, so every label check below runs on them as well. So are
 # the selection set and its label passes, whose tags name selection utterances.
 _SELECTION_LABEL_FILES = (*_SELECTION_PASSES, _SELECTION)
+# The dev-general set (plan v26 T67): its utterance file, which its adjudicated gold later
+# fills, and the directory its two blind label passes are written to. Each file is checked
+# once it exists and holds a row, so the empty passes of a set not yet labelled are skipped.
+_DEV_GENERAL = _GOLD_DIR / "dev-general-2026-11.jsonl"
+_DEV_GENERAL_DIR = _GOLD_DIR / "dev-general-2026-11"
+_DEV_GENERAL_DESIGN = _DEV_GENERAL_DIR / "design.jsonl"
+_DEV_GENERAL_LABEL_FILES = tuple(
+    p
+    for p in (_DEV_GENERAL_DIR / "pass-a.jsonl", _DEV_GENERAL_DIR / "pass-b.jsonl", _DEV_GENERAL)
+    if p.is_file() and p.read_text(encoding="utf-8").strip()
+)
 _LABEL_PARAMS = [
     pytest.param(p, id=p.name)
     for p in (*_LABEL_FILES, _DEV_GOLD, _HELDOUT_GOLD, *_SELECTION_LABEL_FILES)
-]
+] + [pytest.param(p, id=f"dev-general/{p.name}") for p in _DEV_GENERAL_LABEL_FILES]
 
 
 def _labelled_utterances(path: Path) -> dict[str, str]:
     """The utterance each tag of a label file has to carry, from the file it was labelled from."""
     if path in _SELECTION_LABEL_FILES:
         return {r["tag"]: r["utterance"] for r in _gold_rows(_SELECTION)}
+    if path in _DEV_GENERAL_LABEL_FILES:
+        return {r["tag"]: r["utterance"] for r in _gold_rows(_DEV_GENERAL)}
     return {r["tag"]: r["utterance"] for r in _load_utterances()}
 
 
 def _faults_to_report(path: Path, faults: list[tuple]) -> list:
-    """A selection file's faults as their tags alone, so a failure prints no selection label."""
-    if path in _SELECTION_LABEL_FILES:
+    """A selection or dev-general file's faults as their tags alone, so a failure prints no label."""
+    if path in _SELECTION_LABEL_FILES or path in _DEV_GENERAL_LABEL_FILES:
         return sorted({fault[0] for fault in faults})
     return faults
 
@@ -1884,7 +1904,8 @@ def test_no_assert_on_the_selection_set_passes_an_argument_to_a_call():
 
     `assert len(rows) >= n` prints `rows`: selection text, or the text of the set a guard
     compares it with, held-out included. A check that reads the selection set computes into a
-    local first and asserts on the local.
+    local first and asserts on the local. The same holds for every function whose name holds
+    `dev_general`, since the dev-general guards read the selection, held-out and 60 rows too.
     """
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
 
@@ -1893,7 +1914,11 @@ def test_no_assert_on_the_selection_set_passes_an_argument_to_a_call():
             function.name
             for function in tree.body
             if isinstance(function, ast.FunctionDef)
-            and ("selection" in function.name or function.name in _LABEL_CHECKS_ON_SELECTION)
+            and (
+                "selection" in function.name
+                or "dev_general" in function.name
+                or function.name in _LABEL_CHECKS_ON_SELECTION
+            )
             for statement in ast.walk(function)
             if isinstance(statement, ast.Assert)
             for part in ast.walk(statement.test)
@@ -1902,3 +1927,455 @@ def test_no_assert_on_the_selection_set_passes_an_argument_to_a_call():
     )
 
     assert calling == []
+
+
+# --- The dev-general set (plan v26 T67) ------------------------------------------------------
+
+# Dev-general is a prose set in the 60's category mix, written so a re-draw's spread can be
+# measured on prose as dev-lists measures it on lists. Its rows are pinned before any label
+# exists: two blind passes label the utterance file as written, so its size, its category mix
+# and its date rules are held here first. Its dates are absolute and none falls in June 2026,
+# the month of the reference dates a run is scored against, so each stated date stands in the
+# same relation to both; the forward-dated probes the design notes name give a run's date text
+# dates on both sides of the reference. Like the selection checks, a failure names dev-general
+# tags and counts only, so no row of another set is printed.
+_DEV_GENERAL_TAG = re.compile(rf"^dvg-(?P<num>\d{{2}})-(?P<category>[a-z]+)-(?P<slug>{_SLUG})$")
+# The categories in the table's order, with the 60's counts.
+_DEV_GENERAL_CATEGORIES = {
+    "core": 10,
+    "event": 5,
+    "metric": 3,
+    "skill": 5,
+    "thirdparty": 5,
+    "validtime": 5,
+    "nofact": 6,
+    "structural": 3,
+    "cease": 5,
+    "retract": 5,
+    "pair": 2,
+    "habit": 3,
+    "datekind": 3,
+}
+_DEV_GENERAL_SIZE = 60
+_DEV_GENERAL_DESIGN_FIELDS = {"tag", "category", "intent"}
+_DEV_GENERAL_RECOMMENDING = 2
+_DEV_GENERAL_MAX_SENTENCES = 3
+_DEV_GENERAL_FORWARD_MIN = 5
+_DEV_GENERAL_YEARS_MIN = 4
+_DEV_GENERAL_FORWARD_NOTE = "forward-dated"
+_DEV_GENERAL_NOTE = re.compile(r"; note: (?P<note>.+)$")
+# The month of the reference dates, which no stated date may fall in.
+_REFERENCE_YEAR, _REFERENCE_MONTH = 2026, 6
+
+_MONTH_NAMES = (
+    "January February March April May June July August September October November December"
+).split()
+_MONTH_WORD = r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)"  # noqa: E501
+_WEEKDAY_WORD = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+_NUMBER_WORD = (
+    r"(?:\d+|a few|a couple of|several|an?|one|two|three|four|five|six|seven|eight|nine|ten"
+    r"|eleven|twelve|fifteen|twenty|thirty|forty|fifty|a hundred)"
+)
+_YEAR_WORD = re.compile(r"\b(?:19|20)\d{2}\b")
+# Acceptance 3's floor of relative time expressions.
+_RELATIVE_WORDS = re.compile(
+    r"\b(?:yesterday|today|tonight|tomorrow|ago|recently|lately|soon|nowadays|from now"
+    r"|the other day)\b",
+    re.IGNORECASE,
+)
+_RELATIVE_HEADED = re.compile(
+    rf"\b(?:this|next|last|past|coming|previous)\s+(?:{_WEEKDAY_WORD}|{_MONTH_WORD}|morning"
+    r"|afternoon|evening|night|week|weekend|month|quarter|season|spring|summer|autumn|fall"
+    r"|winter|year)s?\b",
+    re.IGNORECASE,
+)
+_RELATIVE_SPAN = re.compile(
+    rf"\b(?:in|for|within)\s+{_NUMBER_WORD}\s+(?:days?|weeks?|months?|years?)\b", re.IGNORECASE
+)
+_WEEKDAY = re.compile(rf"\b{_WEEKDAY_WORD}s?\b", re.IGNORECASE)
+_MONTH = re.compile(rf"\b{_MONTH_WORD}\b")
+_ORDINAL = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)\b")
+_ISO_DAY_OR_MONTH = re.compile(r"\b((?:19|20)\d{2})-(\d{2})(?:-\d{2})?\b")
+_MONTH_AND_YEAR = re.compile(rf"\b({_MONTH_WORD})(?:\s+\d{{1,2}}(?:st|nd|rd|th)?,?)?\s+(\d{{4}})\b")
+
+
+def _dev_general_sentences(utterance: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", utterance.strip()) if s]
+
+
+def _dev_general_time_faults(utterance: str) -> list[str]:
+    """The kinds of relative time expression an utterance holds, by Acceptance 3's rules."""
+    faults = []
+    for sentence in _dev_general_sentences(utterance):
+        if _RELATIVE_WORDS.search(sentence):
+            faults.append("relative word")
+        if _RELATIVE_HEADED.search(sentence):
+            faults.append("relative head")
+        if _WEEKDAY.search(sentence):
+            faults.append("weekday")
+        for kind, pattern in (
+            ("span with no year", _RELATIVE_SPAN),
+            ("month with no year", _MONTH),
+            ("day with no year", _ORDINAL),
+        ):
+            if any(not _YEAR_WORD.search(sentence[m.end() :]) for m in pattern.finditer(sentence)):
+                faults.append(kind)
+    return sorted(set(faults))
+
+
+def _dev_general_stated_dates(utterance: str) -> list[tuple[int, int | None]]:
+    """Each stated date as (year, month), with month None for a bare year."""
+    dates, spans = [], []
+    for match in _ISO_DAY_OR_MONTH.finditer(utterance):
+        dates.append((int(match[1]), int(match[2])))
+        spans.append(match.span())
+    for match in _MONTH_AND_YEAR.finditer(utterance):
+        month = [m[:3] for m in _MONTH_NAMES].index(match[1][:3]) + 1
+        dates.append((int(match[2]), month))
+        spans.append(match.span())
+    for match in _YEAR_WORD.finditer(utterance):
+        if not any(start <= match.start() < end for start, end in spans):
+            dates.append((int(match[0]), None))
+    return dates
+
+
+def _dev_general_date_faults(utterance: str) -> list[str]:
+    """A date in the reference month, or a bare reference year, which holds that month."""
+    faults = []
+    for year, month in _dev_general_stated_dates(utterance):
+        if year == _REFERENCE_YEAR and month in (_REFERENCE_MONTH, None):
+            faults.append("reference month" if month else "bare reference year")
+    return faults
+
+
+def _dev_general_is_forward_dated(utterance: str) -> bool:
+    return any(
+        year > _REFERENCE_YEAR or (year == _REFERENCE_YEAR and (month or 0) > _REFERENCE_MONTH)
+        for year, month in _dev_general_stated_dates(utterance)
+    )
+
+
+def _dev_general_rows() -> list[dict]:
+    return _gold_rows(_DEV_GENERAL)
+
+
+def _dev_general_design() -> list[dict]:
+    return _gold_rows(_DEV_GENERAL_DESIGN)
+
+
+def _dev_general_category(tag: str) -> str | None:
+    match = _DEV_GENERAL_TAG.match(tag)
+    return match.group("category") if match else None
+
+
+def _dev_general_intent_names(intent: object) -> tuple[set[str], set[str]] | None:
+    """An intent's types and predicates, or None when it is not in `_INTENT`'s form."""
+    match = _INTENT.match(intent) if isinstance(intent, str) else None
+    if match is None:
+        return None
+
+    def names(field: str) -> set[str]:
+        value = match.group(field).strip()
+        return set() if value == "none" else {n.strip() for n in value.split(",")}
+
+    return names("types"), names("predicates")
+
+
+def _dev_general_other_utterances(set_name: str) -> list[str]:
+    if set_name == "selection":
+        return [r["utterance"] for r in _selection_rows()]
+    return _other_set_utterances()[set_name]
+
+
+def _dev_general_other_people_and_organizations(set_name: str) -> set[str]:
+    if set_name == "selection":
+        return {
+            gold_id
+            for row in _selection_rows()
+            for entity in row["expected_entities"]
+            if entity["type"] in {"Person", "Organization"}
+            for gold_id in (entity["id"], *entity.get("alternatives", ()))
+        }
+    return _other_set_people_and_organizations()[set_name]
+
+
+_DEV_GENERAL_OTHER_SETS = (*_OTHER_SETS, "selection")
+_DEV_GENERAL_OTHER_SIZES = {
+    **_SET_SIZES,
+    "selection": _SELECTION_LIST_PROBES + _SELECTION_PROSE_PROBES,
+}
+
+
+@pytest.mark.parametrize(
+    ("utterance", "faults"),
+    [
+        ("I joined Varnel Labs on 3 March 2024.", []),
+        ("From 2019 to 2021 I used Vim. It was fine.", []),
+        ("I start there in August 2026, for a few weeks in 2027.", []),
+        ("I joined Varnel Labs yesterday.", ["relative word"]),
+        ("I moved there two years ago.", ["relative word"]),
+        ("I moved there next spring.", ["relative head"]),
+        ("We met last March.", ["month with no year", "relative head"]),
+        ("I swim on Tuesdays.", ["weekday"]),
+        ("I joined in March. That was 2024.", ["month with no year"]),
+        ("I will finish it in three weeks.", ["span with no year"]),
+        ("I have used it for a few years.", ["span with no year"]),
+        ("It is due on the 14th.", ["day with no year"]),
+        ("Twice a month I volunteer at the food bank.", []),
+    ],
+)
+def test_dev_general_time_check_on_synthetic_utterances(utterance, faults):
+    found = _dev_general_time_faults(utterance)
+
+    assert found == faults
+
+
+@pytest.mark.parametrize(
+    ("utterance", "dates", "faults", "forward"),
+    [
+        ("I joined on 3 March 2024.", [(2024, 3)], [], False),
+        ("From 2019 to 2021 I used Vim.", [(2019, None), (2021, None)], [], False),
+        ("My lease ends on 2026-09-30.", [(2026, 9)], [], True),
+        ("It runs until March 14, 2027.", [(2027, 3)], [], True),
+        ("I moved on 12 June 2026.", [(2026, 6)], ["reference month"], False),
+        ("I moved in 2026.", [(2026, None)], ["bare reference year"], False),
+        ("Since May 2026 I have used Zed.", [(2026, 5)], [], False),
+    ],
+)
+def test_dev_general_date_check_on_synthetic_utterances(utterance, dates, faults, forward):
+    stated = _dev_general_stated_dates(utterance)
+    found = _dev_general_date_faults(utterance)
+    ahead = _dev_general_is_forward_dated(utterance)
+
+    assert stated == dates
+    assert found == faults
+    assert ahead is forward
+
+
+def test_dev_general_rows_follow_the_gold_row_schema():
+    rows = _dev_general_rows()
+
+    malformed = sorted({fault[0] for fault in _schema_faults(rows)})
+    untyped = [
+        r["tag"]
+        for r in rows
+        if not isinstance(r.get("utterance"), str)
+        or not r["utterance"].strip()
+        or not isinstance(r.get("expected_entities"), list)
+        or not isinstance(r.get("expected_relationships"), list)
+    ]
+    size = len(rows)
+
+    assert size == _DEV_GENERAL_SIZE
+    assert malformed == []
+    assert untyped == []
+
+
+def test_dev_general_tags_follow_the_format_and_number_densely_in_order():
+    tags = [r["tag"] for r in _dev_general_rows()]
+
+    malformed = [t for t in tags if not _DEV_GENERAL_TAG.match(t) or "-list-" in t]
+    numbers = [int(m.group("num")) for t in tags if (m := _DEV_GENERAL_TAG.match(t))]
+    dense = list(range(1, _DEV_GENERAL_SIZE + 1))
+
+    assert malformed == []
+    assert numbers == dense
+
+
+def test_dev_general_categories_follow_the_table_in_count_and_order():
+    categories = [_dev_general_category(r["tag"]) for r in _dev_general_rows()]
+
+    expected = [name for name, count in _DEV_GENERAL_CATEGORIES.items() for _ in range(count)]
+    counted = dict(Counter(categories))
+
+    assert counted == _DEV_GENERAL_CATEGORIES
+    assert categories == expected
+
+
+def test_dev_general_design_has_one_row_per_probe_in_tag_order():
+    design = _dev_general_design()
+    tags = [r["tag"] for r in _dev_general_rows()]
+
+    design_tags = [d.get("tag") for d in design]
+    stray = [
+        d.get("tag")
+        for d in design
+        if set(d) != _DEV_GENERAL_DESIGN_FIELDS
+        or d["category"] != _dev_general_category(d["tag"])
+        or _dev_general_intent_names(d["intent"]) is None
+    ]
+
+    assert design_tags == tags
+    assert stray == []
+
+
+def test_dev_general_intents_name_only_extractable_types_and_predicates():
+    types, predicates = set(EXTRACTABLE_NODE_TYPES), set(EXTRACTABLE_RELATIONSHIP_TYPES)
+    unknown = []
+
+    for row in _dev_general_design():
+        names = _dev_general_intent_names(row.get("intent"))
+        if names is not None and (names[0] - types or names[1] - predicates):
+            unknown.append(row.get("tag"))
+
+    assert unknown == []
+
+
+def test_dev_general_nofact_intents_name_nothing_and_fact_intents_name_a_predicate():
+    wrong = []
+
+    for row in _dev_general_design():
+        names = _dev_general_intent_names(row.get("intent"))
+        if names is None:
+            continue
+        is_nofact = row.get("category") == "nofact"
+        if is_nofact == bool(names[0] or names[1]) or (not is_nofact and not names[1]):
+            wrong.append(row.get("tag"))
+
+    assert wrong == []
+
+
+def test_dev_general_thirdparty_intents_know_the_person_and_two_carry_a_recommendation():
+    intents = [
+        _dev_general_intent_names(d.get("intent")) or (set(), set())
+        for d in _dev_general_design()
+        if d.get("category") == "thirdparty"
+    ]
+
+    unknown = sum("KNOWS_PERSON" not in predicates for _, predicates in intents)
+    recommending = sum("RECOMMENDS" in predicates for _, predicates in intents)
+
+    assert unknown == 0
+    assert recommending == _DEV_GENERAL_RECOMMENDING
+
+
+def test_dev_general_utterances_are_prose_of_one_to_three_sentences():
+    marked, sized = [], []
+
+    for row in _dev_general_rows():
+        utterance = row["utterance"]
+        lines = utterance.splitlines()
+        if len(lines) != 1 or any(
+            p.match(line) for p in (_ITEM_LINE, _TABLE_LINE, _HEADING_LINE) for line in lines
+        ):
+            marked.append(row["tag"])
+        if not 1 <= len(_dev_general_sentences(utterance)) <= _DEV_GENERAL_MAX_SENTENCES:
+            sized.append(row["tag"])
+
+    assert marked == []
+    assert sized == []
+
+
+def test_dev_general_utterances_hold_no_relative_time_expression():
+    relative = [r["tag"] for r in _dev_general_rows() if _dev_general_time_faults(r["utterance"])]
+
+    assert relative == []
+
+
+def test_no_dev_general_date_falls_in_the_reference_month():
+    dated = [r["tag"] for r in _dev_general_rows() if _dev_general_date_faults(r["utterance"])]
+
+    assert dated == []
+
+
+def test_dev_general_forward_dated_probes_are_the_ones_the_design_notes_name():
+    rows, design = _dev_general_rows(), _dev_general_design()
+
+    forward = [r["tag"] for r in rows if _dev_general_is_forward_dated(r["utterance"])]
+    noted = [
+        d.get("tag")
+        for d in design
+        if (m := _DEV_GENERAL_NOTE.search(str(d.get("intent", ""))))
+        and _DEV_GENERAL_FORWARD_NOTE in m.group("note")
+    ]
+    count = len(forward)
+
+    assert count >= _DEV_GENERAL_FORWARD_MIN
+    assert forward == noted
+
+
+def test_dev_general_dates_spread_across_four_years():
+    years = {
+        year for r in _dev_general_rows() for year, _ in _dev_general_stated_dates(r["utterance"])
+    }
+
+    spread = len(years)
+
+    assert spread >= _DEV_GENERAL_YEARS_MIN
+
+
+def test_no_two_dev_general_utterances_are_the_same_or_near_copies():
+    rows = _dev_general_rows()
+
+    copies = [
+        row["tag"]
+        for i, row in enumerate(rows)
+        if _tags_copying([row], [o["utterance"] for j, o in enumerate(rows) if j != i])
+    ]
+
+    assert copies == []
+
+
+@pytest.mark.parametrize("set_name", _DEV_GENERAL_OTHER_SETS)
+def test_no_dev_general_utterance_copies_an_utterance_of_another_set(set_name):
+    others = _dev_general_other_utterances(set_name)
+
+    copies = _tags_copying(_dev_general_rows(), others)
+    # Counts in locals: an assert on `len(others)` would print the other set's utterances.
+    compared = len(others)
+    expected = _DEV_GENERAL_OTHER_SIZES.get(set_name, len(_sixty_rows()))
+    copied = len(copies)
+
+    assert compared >= expected, "the other set's utterances were not all compared"
+    assert copies == [], f"{copied} dev-general probes copy an utterance of another set"
+
+
+@pytest.mark.parametrize("set_name", _DEV_GENERAL_OTHER_SETS)
+def test_no_dev_general_utterance_names_a_person_or_organization_of_another_set(set_name):
+    terms = _dev_general_other_people_and_organizations(set_name)
+
+    named = _tags_naming(_dev_general_rows(), terms)
+    # Counts in locals: an assert on `len(terms)` would print the other set's names.
+    found, naming = len(terms), len(named)
+
+    assert found >= _OTHER_SET_TERMS_MIN, "the other set's people and organizations were not found"
+    assert named == [], f"{naming} dev-general probes name a person or organization of another set"
+
+
+def test_dev_general_utterances_avoid_entity_names_in_the_production_prompt():
+    terms = _prompt_entity_terms()
+
+    named = _tags_naming(_dev_general_rows(), terms)
+    found, naming = len(terms), len(named)
+
+    assert found > 20, "the prompt's example entities were not found"
+    assert named == [], f"{naming} dev-general probes name an entity of the prompt's examples"
+
+
+def test_no_dev_general_utterance_mentions_raj():
+    rows = _dev_general_rows()
+
+    naming = [r["tag"] for r in rows if re.search(r"\braj\b", r["utterance"], re.IGNORECASE)]
+
+    assert naming == []
+
+
+def test_every_check_that_reads_dev_general_is_under_the_print_guard():
+    """The assert check above finds its functions by name, so a dev-general check carries it."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    unguarded = sorted(
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and "dev_general" not in node.name
+        and "selection" not in node.name
+        and node.name not in _LABEL_CHECKS_ON_SELECTION
+        and any(isinstance(n, ast.Assert) for n in ast.walk(node))
+        and any(
+            isinstance(n, ast.Name) and n.id.lower().startswith("_dev_general")
+            for n in ast.walk(node)
+        )
+    )
+
+    assert unguarded == []
