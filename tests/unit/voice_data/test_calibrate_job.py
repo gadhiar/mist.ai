@@ -309,6 +309,47 @@ def test_permuting_target_scores_changes_no_value() -> None:
     assert before.intervals == after.intervals
 
 
+def test_misses_count_each_embedder_alone_and_both_per_register() -> None:
+    # At (0.5, 0.5): rows 0 and 4 pass (4 sits on the value), row 1 misses on the first embedder
+    # only, row 2 on the second only and row 3 on both.
+    target = calibrate.TargetTrials(
+        scores=np.array([[0.9, 0.9], [0.1, 0.9], [0.9, 0.1], [0.1, 0.1], [0.5, 0.5]]),
+        registers=("calm", "calm", "awake", "awake", "awake"),
+        owners=np.zeros(5, dtype=np.int64),
+        rivals=((),) * 5,
+    )
+    empty = {gate: {} for gate in calibrate.GATES}
+    trials = calibrate.DatasetTrials(
+        name="ravdess",
+        sexes=("female",),
+        impostor=empty,
+        reported=empty,
+        target={**empty, calibrate.SIM_MIN: {"others": target}},
+    )
+    values = {gate: (0.5, 0.5) for gate in calibrate.GATES}
+    found = calibrate.misses(trials, values, NAMES)[calibrate.SIM_MIN]["others"]
+    assert found == {
+        "all": {
+            "trials": 5,
+            "missed": 3,
+            "rate": 0.6,
+            "by": {"wavlm-sv": 1, "ecapa": 1, "both": 1},
+        },
+        "awake": {
+            "trials": 3,
+            "missed": 2,
+            "rate": 0.666667,
+            "by": {"wavlm-sv": 0, "ecapa": 1, "both": 1},
+        },
+        "calm": {
+            "trials": 2,
+            "missed": 1,
+            "rate": 0.5,
+            "by": {"wavlm-sv": 1, "ecapa": 0, "both": 0},
+        },
+    }
+
+
 def test_bootstrap_repeats_under_one_seed() -> None:
     trials = calibrate.dataset_trials(
         "librittsr", make_speakers({"female": 3, "male": 3}), SMALL, seed=1, names=NAMES
@@ -482,6 +523,127 @@ def _no_read(*args: object, **kwargs: object) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Anchor sets
+# ---------------------------------------------------------------------------
+
+
+def _clip(seconds: float, seed: int, register: str = "neutral") -> calibrate.Clip:
+    tone = _tone(90 + 13 * seed, seconds, RATE, seed=seed).astype(np.float64)
+    return calibrate.Clip(tone, register)
+
+
+def _skipping_clips() -> list[calibrate.Clip]:
+    # Four 3 s files and two 9 s ones. A draw forms a set only when its solo clip reaches 12 s on
+    # two files, one of them 9 s; a solo clip of three or four files leaves under four rows.
+    return [_clip(3.0, i) for i in range(4)] + [_clip(9.0, 4 + i) for i in range(2)]
+
+
+def test_later_draws_reshuffle_and_skip_a_draw_that_cannot_form_a_set() -> None:
+    clips = _skipping_clips()
+    sets, skipped = calibrate.anchor_draws(clips, "librittsr", "1111", seed=3, count=10, rate=RATE)
+    assert len(sets) + skipped == 9
+    assert sets and skipped
+    for found in sets:
+        assert 12 <= len(found.solo) / RATE <= 20
+        assert found.solo_registers == ("neutral", "neutral")
+        assert [r.register for r in found.rows] == ["neutral"] * 4
+        assert all(3 <= len(r.audio) / RATE <= 30 for r in found.rows)
+    again, skipped_again = calibrate.anchor_draws(
+        clips, "librittsr", "1111", seed=3, count=10, rate=RATE
+    )
+    assert skipped_again == skipped
+    assert [s.solo.tolist() for s in again] == [s.solo.tolist() for s in sets]
+    one = calibrate.anchor_draws(clips, "librittsr", "1111", seed=3, count=1, rate=RATE)
+    assert one == ([], 0)
+
+
+def test_ravdess_later_draws_join_neutral_then_calm_and_one_row_per_register() -> None:
+    clips: list[calibrate.Clip] = []
+    for register in ("neutral", "calm", "awake", "sleepy", "excited", "other"):
+        count = 4 if register == "neutral" else 8 if register != "other" else 24
+        for _ in range(count):
+            clips.append(_clip(1.5, len(clips), register))
+    sets, skipped = calibrate.anchor_draws(clips, "ravdess", "01", seed=5, count=10, rate=RATE)
+    assert (len(sets), skipped) == (9, 0)
+    for found in sets:
+        assert found.solo_registers == ("neutral",) * 4 + ("calm",) * 3
+        assert [r.register for r in found.rows] == ["calm", "awake", "sleepy", "excited"]
+    assert len({s.solo.tobytes() for s in sets}) > 1
+
+
+def test_a_speakers_sets_trials_number_anchor_sets_less_the_skipped_draws() -> None:
+    params = dataclasses.replace(SMALL, anchor_sets=10)
+    sets, skipped = calibrate.anchor_draws(
+        _skipping_clips(), "librittsr", "1001", seed=3, count=params.anchor_sets, rate=RATE
+    )
+    assert skipped
+    embedders = [ToneEmbedder(n) for n in NAMES]
+    draws = tuple(calibrate.embed_set(embedders, s, RATE) for s in sets)
+    speakers = make_speakers({"female": 3, "male": 3})
+    speakers[0] = dataclasses.replace(speakers[0], draws=draws, skipped=skipped)
+    trials = calibrate.dataset_trials("librittsr", speakers, params, seed=1, names=NAMES)
+    target = trials.target[calibrate.SIM_MIN]
+    owners = target["sets"].owners.tolist()
+    assert owners.count(0) == params.anchor_sets - skipped
+    assert [owners.count(i) for i in range(1, 6)] == [1] * 5
+    assert set(target["sets"].registers) == {"neutral"}
+    others = target["others"]
+    mine = [r for r, o in zip(others.registers, others.owners) if o == 0]
+    assert mine == ["solo", "neutral", "neutral", "neutral", "neutral"] * (10 - skipped)
+    assert len(others.scores) == 5 * (10 - skipped) + 5 * 5
+
+
+def test_a_set_is_accepted_at_a_pair_exactly_when_anchor_check_passes() -> None:
+    speakers = make_speakers({"female": 3, "male": 3}, dataset="ravdess", noise=0.5, seed=4)
+    trials = calibrate.dataset_trials("ravdess", speakers, SMALL, seed=1, names=NAMES)
+    sets = trials.target[calibrate.SIM_MIN]["sets"]
+    assert set(sets.registers) == {"mixed"}
+    rng = np.random.default_rng(2)
+    pairs = [tuple(float(v) for v in row) for row in sets.scores]
+    pairs += [tuple(round(float(v), 4) for v in row) for row in sets.scores]
+    pairs += [tuple(float(v) for v in rng.uniform(0.0, 1.0, 2)) for _ in range(40)]
+    seen = set()
+    for pair in pairs:
+        sim_min = dict(zip(NAMES, pair))
+        for row, owner in zip(sets.scores, sets.owners):
+            passed, _ = calibrate.retrieve.anchor_check(list(speakers[owner].anchors), sim_min)
+            assert (calibrate.joint_far(row[None, :], pair) == 1.0) == passed
+            seen.add(passed)
+    assert seen == {True, False}
+
+
+def test_every_target_trial_records_its_owner_and_each_margin_trial_its_rivals() -> None:
+    speakers = make_speakers({"female": 4, "male": 3})
+    trials = calibrate.dataset_trials("librittsr", speakers, SMALL, seed=1, names=NAMES)
+    model = [calibrate.retrieve.centroids(list(s.pieces[:30])) for s in speakers]
+    rival = [calibrate.retrieve.centroids(list(s.pieces[:20])) for s in speakers]
+    for gate, forms in trials.target.items():
+        for t in forms.values():
+            assert len(t.owners) == len(t.rivals) == len(t.registers) == len(t.scores)
+            assert sorted(set(t.owners.tolist())) == list(range(7))
+            if gate != calibrate.MARGIN:
+                assert set(t.rivals) == {()}
+                continue
+            seen: dict[int, set] = {}
+            for owner, rivals in zip(t.owners, t.rivals):
+                same = sum(s.sex == speakers[owner].sex for s in speakers) - 1
+                assert len(rivals) == len(set(rivals)) == min(3, same)
+                assert owner not in rivals
+                assert all(speakers[r].sex == speakers[owner].sex for r in rivals)
+                seen.setdefault(int(owner), set()).add(rivals)
+            assert all(len(v) == 1 for v in seen.values())
+    margin = trials.target[calibrate.MARGIN]["rival"]
+    first = speakers[0].pieces[30]
+    want = [
+        calibrate.retrieve.sims(first, model[0])[n]
+        - max(calibrate.retrieve.sims(first, rival[r])[n] for r in margin.rivals[0])
+        for n in NAMES
+    ]
+    assert margin.owners[0] == 0
+    assert np.allclose(margin.scores[0], want, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
 # The job end to end
 # ---------------------------------------------------------------------------
 
@@ -550,6 +712,7 @@ def write_plan(data: Path, ravdess: bool = True, **overrides: object) -> dict:
             "draws": 10,
             "anchor_k": [1, 2, 4],
             "bootstrap": 5,
+            "anchor_sets": 10,
         },
         "datasets": datasets,
     }
@@ -628,6 +791,39 @@ def test_main_writes_calibration_and_outputs_beside_the_plan(
         assert re.search(r"\.(wav|zip)\b|public/", text) is None
 
 
+def test_the_log_prints_every_miss_rate_per_dataset_form_and_register(
+    tmp_path: Path, fakes: list[ToneEmbedder], capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = tmp_path / "data"
+    write_plan(data)
+    assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 0
+    out = capsys.readouterr().out
+    result = json.loads((data / FOLDER_REL / "calibration.json").read_text(encoding="utf-8"))
+    lines = set(out.splitlines())
+    printed = 0
+    for gate, entry in result["gates"].items():
+        assert set(entry["misses"]) == {"librittsr", "ravdess"}
+        for dataset, forms in entry["misses"].items():
+            assert forms
+            for form, rows in forms.items():
+                assert "all" in rows
+                for register, row in rows.items():
+                    by = row["by"]
+                    line = (
+                        f"calibrate: {gate} {dataset} {form} {register}: missed "
+                        f"{row['missed']} of {row['trials']} trials, rate {row['rate']}; by "
+                        f"wavlm-sv only {by['wavlm-sv']}, ecapa only {by['ecapa']}, "
+                        f"both {by['both']}"
+                    )
+                    assert line in lines, line
+                    assert sum(by.values()) == row["missed"]
+                    printed += 1
+    anchors = result["gates"][calibrate.SIM_MIN]["misses"]["ravdess"]["others"]
+    assert set(anchors) == {"all", "solo", "calm", "awake", "sleepy", "excited"}
+    assert printed > 20
+    assert re.search(r"\.(wav|zip)\b|public/", out) is None
+
+
 def test_main_checks_every_sha256_before_reading_any_audio(
     tmp_path: Path,
     fakes: list[ToneEmbedder],
@@ -659,6 +855,48 @@ def test_main_checks_the_archive_sha256(
     assert "ravdess" in err and "sha256" in err and ".zip" not in err
 
 
+def _trials_without(name: str) -> dict:
+    return {k: v for k, v in dataclasses.asdict(calibrate.TrialParams()).items() if k != name}
+
+
+# The six values of `write_plan`'s synthetic plan before anchor sets were drawn (0aea7ef0): the
+# draws add target trials only, so the rule must give the same values.
+BASE_KEYS = {
+    "anchors.sim_min.wavlm-sv": 0.9999,
+    "anchors.sim_min.ecapa": 0.9993,
+    "retrieval.anchor_floor.wavlm-sv": 0.9998,
+    "retrieval.anchor_floor.ecapa": 0.9992,
+    "retrieval.margin.wavlm-sv": 0.0002,
+    "retrieval.margin.ecapa": -0.0006,
+}
+
+
+def test_the_job_draws_anchor_sets_and_keeps_the_base_values(
+    tmp_path: Path, fakes: list[ToneEmbedder], capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = tmp_path / "data"
+    write_plan(data)
+    assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 0
+    out = capsys.readouterr().out
+    result = json.loads((data / FOLDER_REL / "calibration.json").read_text(encoding="utf-8"))
+    assert result["keys"] == BASE_KEYS
+    assert result["trials"]["anchor_sets"] == 10
+    # Every synthetic file is 3 s (LibriTTS-R) or 1.5 s (RAVDESS), so every draw forms a set.
+    assert result["anchor_sets"] == {
+        "librittsr": {"drawn": 60, "skipped": 0},
+        "ravdess": {"drawn": 60, "skipped": 0},
+    }
+    missed = result["gates"][calibrate.SIM_MIN]["misses"]
+    assert set(missed["librittsr"]["sets"]) == {"all", "neutral"}
+    assert set(missed["ravdess"]["sets"]) == {"all", "mixed"}
+    for dataset in ("librittsr", "ravdess"):
+        assert missed[dataset]["sets"]["all"]["trials"] == 60
+        assert missed[dataset]["others"]["all"]["trials"] == 300
+        assert "sets" not in result["gates"][calibrate.SIM_MIN]["forms"][dataset]
+    assert "calibrate: librittsr anchor sets: 60 drawn, 0 skipped" in out.splitlines()
+    assert re.search(r"\.(wav|zip)\b|public/", out) is None
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     [
@@ -667,6 +905,8 @@ def test_main_checks_the_archive_sha256(
         ({"schema": 2}, "schema"),
         ({"embedders": {}}, "embedder"),
         ({"trials": {"piece_s": [3.0]}}, "trials"),
+        ({"trials": _trials_without("anchor_sets")}, "anchor_sets"),
+        ({"trials": {**_trials_without("anchor_sets"), "anchor_sets": 0}}, "wrong type or sign"),
     ],
 )
 def test_a_malformed_plan_refuses(

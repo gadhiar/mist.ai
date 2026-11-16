@@ -67,8 +67,9 @@ TRIALS: Mapping[str, object] = {
     "draws": 10,
     "anchor_k": [1, 2, 4],
     "bootstrap": 1000,
+    "anchor_sets": 10,
 }
-"""The Design's trial parameters, in the plan's `trials` schema."""
+"""The Design's trial parameters, in the plan's `trials` schema; `anchor_sets` is v6's (A23)."""
 
 LIBRITTSR = "librittsr"
 RAVDESS = "ravdess"

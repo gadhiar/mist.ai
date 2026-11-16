@@ -334,6 +334,7 @@ def test_run_plans_public_speakers_runs_the_job_and_applies_its_values(
         "draws": 10,
         "anchor_k": [1, 2, 4],
         "bootstrap": 1000,
+        "anchor_sets": 10,
     }
     libri, ravdess = plan["datasets"]
     assert (libri["name"], libri["licence"], libri["subset"]) == (
