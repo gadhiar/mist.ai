@@ -390,6 +390,20 @@ def test_impostor_is_the_nearest_eligible_speaker_of_the_target_sex() -> None:
         mix.choose_impostor({})
 
 
+def test_music_bed_has_the_render_sample_count_when_the_fraction_rounds_up() -> None:
+    # The rehearsal build's failure: 297311.75 samples truncated to a bed one sample short of the
+    # 297312 the render rounds to, and the last chunk's `bed[c0:c1] * duck` would not broadcast.
+    seconds = (297311 + 0.75) / mix.RATE
+    tone = np.sin(np.arange(mix.RATE) * 2 * np.pi * 220.0 / mix.RATE).astype(np.float32)
+    library = mix.Library(verifier=None, pools={}, styles={}, cache={"m": tone})  # type: ignore[arg-type]
+    bed = mix.music_bed(seconds, np.random.default_rng(0), library, ["m"])
+    widths: list[int] = []
+    envelope = mix.duck_envelope([], seconds)
+    peak = mix.render(seconds, [], bed, envelope, lambda block: widths.append(block.shape[1]))
+    assert len(bed) == sum(widths) == 297312
+    assert peak > 0.0
+
+
 def test_candidates_are_same_sex_and_eligible(built: Built) -> None:
     sources = pkg.load_sources(built.sources)
     names = {s.speaker for s in mix.impostor_candidates(sources, MINUTES)}
