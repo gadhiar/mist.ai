@@ -49,30 +49,60 @@ The 67 agreed relations and the agreed empty rows were read against the same gui
   850-documents-per-minute`. Its reading: a named thing with a kind noun beside its name.
 - Pass B: `larchfield-indexer` (`Project`) `HAS_METRIC 850-documents-per-minute`. Its reading:
   the whole name is the entity, a project of the user's.
-- Ruling: pass A's three entities and two edges.
-  - Id and kind: N14 Kind nouns (the pack's guide; Rule 25). Its own example, "a Pinecil
-    soldering iron" is `pinecil IS_A soldering-iron`, is this shape: a proper name before a
-    lowercase kind noun. The kind is not part of the name (it is not capitalised with it, as
-    `kestrelmoor-hiking-society` is), and the name does not modify some other thing, so N4 Name
-    modifiers (Rule 23, "the Ferrowind tuning guide") does not apply. Under N1 the name is the
-    utterance's own run for the entity.
-  - Type: N6 Type by its test. An indexer that processes documents is a tool, which the
-    Technology test names. The Project test names an undertaking, and the utterance says nothing
-    of the user working on it (contrast dvg-32, where "working on" makes the planner a `Project`).
-    As a Technology, the kind gets its `IS_A`; the type was not chosen to keep that edge.
+- Ruling (re-ruled after the T70 pull-request review): pass B's two entities and one edge,
+  `larchfield-indexer` (`Project`) `HAS_METRIC 850-documents-per-minute`. The first ruling cited
+  a "Project test" that names an undertaking; the guide has no such test, so the type is ruled
+  again on the tests as they are written.
+  - The rule: N6, "A type is chosen by its type test, never to keep an edge."
+    (`data/gold/extraction/LABELLING.md:131`). The two tests in play are the pack's type
+    descriptions: Technology, "A programming language, framework, library, tool, platform,
+    service, database, or protocol." (`backend/knowledge/ontologies/packs/v1_4_0/types.py:542`),
+    and Project, "A work, personal, open-source, or research project."
+    (`backend/knowledge/ontologies/packs/v1_4_0/types.py:594`).
+  - Type: `Project`, by the best reading of those two tests. The utterance names the thing with
+    the speaker's possessive and a proper name of its own, which marks a piece of software that
+    is the user's own: a personal project in the Project test's words. The Technology test lists
+    the kinds of technology anyone may use, and nothing in the utterance makes the indexer one
+    of those rather than the user's own work. The agreed row dvg-32 reads the same shape the same
+    way: both passes, blind, type the user's named route planner a `Project` with the id
+    `orrin-route-planner`, and its `WORKS_ON` edge is the pack's "Indicates active involvement in
+    a project." (`backend/knowledge/ontologies/packs/v1_4_0/types.py:1280`). The tests do not
+    settle the type outright, so the question is listed under Decisions needed.
+  - Kind: no `IS_A`. N14 gives a kind no edge when "`IS_A` joins only Abstraction, Concept,
+    Location, Organization, Skill and Technology, so a Document, Project or Person gets none"
+    (`backend/knowledge/ontologies/packs/v1_4_0/labelling.md:207-208`).
+  - Id: `larchfield-indexer`. Rule 2: "When a contiguous run of the utterance's words names the
+    entity, that run is the id, neither lengthened nor shortened"
+    (`backend/knowledge/ontologies/packs/v1_4_0/conventions.py:802`). With no kind split off, the
+    run that names the indexer is the name with its kind noun, as dvg-32's agreed
+    `orrin-route-planner` keeps its kind noun.
   - Metric: `850-documents-per-minute` is agreed and follows the Metric id rule (Rule 27): value
     first, the unit as written, no quantity word given.
   - No user edge: the possessive only names the thing (N8).
+  - Pass A's rationale, kept for the record: a proper name before a lowercase kind noun is
+    N14's Pinecil shape, the name the entity and the kind a `Concept` it `IS_A`, with the
+    indexer a tool under the Technology test.
 
 ### dvg-17-metric-gorsey-test-suite-time: adjudicated whole
 
 - Pass A: `gorsey` (`Technology`) `IS_A` `budgeting-app` (`Concept`), and `gorsey HAS_METRIC
   42-seconds`.
 - Pass B: `gorsey-budgeting-app` (`Project`) `HAS_METRIC 42-seconds-test-suite`.
-- Ruling: `gorsey` (`Technology`) `IS_A budgeting-app`, and `gorsey HAS_METRIC
-  42-seconds-test-suite`.
-  - Id, kind and type: as dvg-16, by N14 (the Pinecil shape), N4 not applying, and N6 (an app is
-    a tool; nothing says the user works on it).
+- Ruling (re-ruled after the T70 pull-request review): `gorsey-budgeting-app` (`Project`)
+  `HAS_METRIC 42-seconds-test-suite`.
+  - Type: `Project`, under the same rule and tests as dvg-16 (N6,
+    `data/gold/extraction/LABELLING.md:131`; Technology,
+    `backend/knowledge/ontologies/packs/v1_4_0/types.py:542`; Project, "A work, personal,
+    open-source, or research project.", `backend/knowledge/ontologies/packs/v1_4_0/types.py:594`).
+    The speaker's possessive and the app's own proper name mark the user's own software, and the
+    app's test suite says the user develops it: a personal project. This sits with the agreed
+    dvg-32 as dvg-16 does. The question is listed under Decisions needed.
+  - Kind and id: no `IS_A`, since N14 gives a Project none
+    (`backend/knowledge/ontologies/packs/v1_4_0/labelling.md:207-208`), and the id is the run
+    that names the app, `gorsey-budgeting-app` (Rule 2,
+    `backend/knowledge/ontologies/packs/v1_4_0/conventions.py:802`).
+  - Pass A's rationale, kept for the record: as for dvg-16, the Pinecil shape with the app a
+    tool under the Technology test.
   - Metric id: the Metric id rule (Rule 27), "<value>-<unit>-<quantity>" with only empty parts
     left out. The utterance names what is measured, the test suite's run, so the quantity is
     `test-suite` and is kept; pass A's `42-seconds` leaves out a part the utterance gives (Rule 28
@@ -95,9 +125,16 @@ The 67 agreed relations and the agreed empty rows were read against the same gui
   `brindlecote IS_A scheduling-service` (`Concept`).
 - Pass B: `brindlecote-scheduling-service` (`Technology`) `COMPRISES planner-module`.
 - Ruling: pass A's three entities and two edges.
-  - Id and kind: N14 (Rule 25), the Pinecil shape, as dvg-16. "scheduling service" says more
-    than the Technology type's own word "service", so it is not a kind that only restates the
-    type.
+  - Type: both passes type the service a `Technology`, and the Technology test names a
+    "service" (`backend/knowledge/ontologies/packs/v1_4_0/types.py:542`). Unlike dvg-16 and
+    dvg-17, the utterance gives it no possessive and nothing marks it as the user's own work, so
+    the Project test does not compete.
+  - Id and kind: N14 Kind nouns (Rule 25). Its own example, "a Pinecil soldering iron" is
+    `pinecil IS_A soldering-iron` (`backend/knowledge/ontologies/packs/v1_4_0/labelling.md:198-199`),
+    is this shape: a proper name before a lowercase kind noun, the name not modifying some other
+    thing, so N4 Name modifiers (Rule 23) does not apply. A Technology can take `IS_A`, and
+    "scheduling service" says more than the Technology test's own word "service", so it is not a
+    kind that only restates the type.
   - The part: both passes type the module a `Mechanism` (Rule 14, a concrete component that
     performs a function inside a larger system). `PART_OF` admits no `Mechanism` source, so the
     composition is `COMPRISES` from the whole, "X is made up of Y" (Rule 15(e)); both passes
@@ -115,12 +152,19 @@ The 67 agreed relations and the agreed empty rows were read against the same gui
 ## The gold
 
 60 rows; the utterances and tags are unchanged. The six `nofact` rows are empty, as both passes
-had them (Rules 8 to 10 of the engine core). The gold holds 128 entities and 74 relationships:
-the 67 agreed relations and seven ruled ones. Every gold id is a fixed point of the id rails.
+had them (Rules 8 to 10 of the engine core). The gold holds 126 entities and 72 relationships:
+the 67 agreed relations and five ruled ones. Every gold id is a fixed point of the id rails.
 
 ## Decisions needed
 
-None. One reading is recorded for review: in dvg-16, dvg-17 and dvg-41, the name before the
-kind noun is read as the entity's own name (N14's Pinecil shape), not as the owner of a thing
-named by the whole phrase (N4). Read the other way, each of the three would lose its `IS_A` edge
-and take the whole phrase as its id.
+1. Technology or Project for the user's own named software (dvg-16, dvg-17). The Project test,
+   "A work, personal, open-source, or research project." (`types.py:594`), and the Technology
+   test, which names a "tool" (`types.py:542`), both fit an indexer or an app the speaker calls
+   "my" and gives a proper name. The gold reads both as `Project`, as the agreed dvg-32 reads the
+   user's named route planner. Read as `Technology`, each would take N14's Pinecil shape instead:
+   the proper name as its id, and an `IS_A` edge to its kind noun (`indexer`, `budgeting-app`),
+   one more entity and one more relation each.
+2. The N14 or N4 reading of a proper name before a kind noun (dvg-41). The gold reads
+   "Brindlecote" as the service's own name (N14's Pinecil shape), not as the owner of a thing
+   named by the whole phrase (N4). Read the other way, dvg-41 would lose its `IS_A` edge and take
+   the whole phrase, `brindlecote-scheduling-service`, as its id.

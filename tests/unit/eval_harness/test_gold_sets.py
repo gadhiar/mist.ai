@@ -1972,9 +1972,13 @@ _MONTH_NAMES = (
 ).split()
 _MONTH_WORD = r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)"  # noqa: E501
 _WEEKDAY_WORD = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+# Every number word up to ninety-nine, a compound written with a hyphen or a space.
+_UNIT_WORD = r"(?:one|two|three|four|five|six|seven|eight|nine)"
+_TEEN_WORD = r"(?:ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)"
+_TENS_WORD = r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
 _NUMBER_WORD = (
-    r"(?:\d+|a few|a couple of|several|an?|one|two|three|four|five|six|seven|eight|nine|ten"
-    r"|eleven|twelve|fifteen|twenty|thirty|forty|fifty|a hundred)"
+    rf"(?:\d+|a few|a couple of|several|a hundred|{_TENS_WORD}(?:[- ]{_UNIT_WORD})?"
+    rf"|{_TEEN_WORD}|{_UNIT_WORD}|an?)"
 )
 _YEAR_WORD = re.compile(r"\b(?:19|20)\d{2}\b")
 # Acceptance 3's floor of relative time expressions.
@@ -1993,7 +1997,11 @@ _RELATIVE_SPAN = re.compile(
     rf"\b(?:in|for|within)\s+{_NUMBER_WORD}\s+(?:days?|weeks?|months?|years?)\b", re.IGNORECASE
 )
 _WEEKDAY = re.compile(rf"\b{_WEEKDAY_WORD}s?\b", re.IGNORECASE)
-_MONTH = re.compile(rf"\b{_MONTH_WORD}\b")
+# A month name in lowercase is a month too. "may" and "march" are left out because they are
+# also common verbs ("you may", "march on"), so matching them would flag sentences that name
+# no month; capitalised, they are still caught by `_MONTH_WORD`.
+_LOWERCASE_MONTH_WORD = "|".join(m.lower() for m in _MONTH_NAMES if m not in {"May", "March"})
+_MONTH = re.compile(rf"\b(?:{_MONTH_WORD}|{_LOWERCASE_MONTH_WORD})\b")
 _ORDINAL = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)\b")
 _ISO_DAY_OR_MONTH = re.compile(r"\b((?:19|20)\d{2})-(\d{2})(?:-\d{2})?\b")
 _MONTH_AND_YEAR = re.compile(rf"\b({_MONTH_WORD})(?:\s+\d{{1,2}}(?:st|nd|rd|th)?,?)?\s+(\d{{4}})\b")
@@ -2122,6 +2130,14 @@ _DEV_GENERAL_OTHER_SIZES = {
         ("I have used it for a few years.", ["span with no year"]),
         ("It is due on the 14th.", ["day with no year"]),
         ("Twice a month I volunteer at the food bank.", []),
+        ("I joined the club in june.", ["month with no year"]),
+        ("The lease ends in october.", ["month with no year"]),
+        ("I joined the club in june 2024.", []),
+        ("You may want to march on.", []),
+        ("I will be away for eighteen days.", ["span with no year"]),
+        ("It closes in twenty-five weeks.", ["span with no year"]),
+        ("I have lived here for forty two years.", ["span with no year"]),
+        ("I lived there for ninety-nine days in 2019.", []),
     ],
 )
 def test_dev_general_time_check_on_synthetic_utterances(utterance, faults):
@@ -2391,7 +2407,7 @@ def test_every_check_that_reads_dev_general_is_under_the_print_guard():
 _DEV_GENERAL_AGREEMENT = _DEV_GENERAL_DIR / "agreement.json"
 _DEV_GENERAL_PASS_A = _DEV_GENERAL_DIR / "pass-a.jsonl"
 _DEV_GENERAL_PASS_B = _DEV_GENERAL_DIR / "pass-b.jsonl"
-_DEV_GENERAL_GOLD_COUNTS = {"entities": 128, "relationships": 74}
+_DEV_GENERAL_GOLD_COUNTS = {"entities": 126, "relationships": 72}
 
 
 def test_dev_general_agreement_is_what_the_module_recomputes_from_the_passes(tmp_path):
@@ -2419,6 +2435,41 @@ def test_dev_general_agreement_is_what_the_module_recomputes_from_the_passes(tmp
 
     assert recorded, "the dev-general agreement.json is missing"
     assert same
+
+
+def _dev_general_tags_missing_from(path: Path, tags: list[str]) -> list[str]:
+    """The tags, in order, that a label file holds no row for."""
+    held = {row["tag"] for row in _gold_rows(path)}
+    return [tag for tag in tags if tag not in held]
+
+
+def test_dev_general_missing_tag_check_on_a_synthetic_pass(tmp_path):
+    path = tmp_path / "pass.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"tag": tag, "utterance": "", "expected_entities": []}) + "\n"
+            for tag in ("dvg-01-core-a", "dvg-03-core-c")
+        ),
+        encoding="utf-8",
+    )
+
+    missing = _dev_general_tags_missing_from(path, ["dvg-01-core-a", "dvg-02-core-b"])
+
+    assert missing == ["dvg-02-core-b"]
+
+
+def test_each_dev_general_pass_holds_every_dev_general_tag():
+    """The shared label check fails a tag a pass adds, not one it leaves out; this is the other."""
+    tags = [r["tag"] for r in _dev_general_rows()]
+    passes = [
+        p for p in (_DEV_GENERAL_PASS_A, _DEV_GENERAL_PASS_B) if p in _DEV_GENERAL_LABEL_FILES
+    ]
+
+    missing = [tag for path in passes for tag in _dev_general_tags_missing_from(path, tags)]
+    checked = len(passes)
+
+    assert checked == 2, "a dev-general label pass is missing or empty"
+    assert missing == []
 
 
 def test_dev_general_gold_is_60_rows_with_nofact_rows_empty_and_the_rest_relational():
