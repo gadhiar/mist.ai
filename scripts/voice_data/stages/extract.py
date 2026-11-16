@@ -9,9 +9,14 @@ The order is Design 4's:
 
 1. Every anchor is 3-30 s. The solo clips are read as they are.
 2. Per source, the centre channel (or the downmix when the layout has none) goes through every
-   separator candidate, `none` included. Each candidate is scored by the median SIM of its 50
-   best 3 s VAD speech windows to the solo clips, else to its own timestamp anchors, cut from its
-   own output; the best is kept and the downmix goes through it too.
+   separator candidate, `none` included. Each candidate's reference is the solo clips, else its
+   own timestamp anchors cut from its own output. The median SIM of its 50 best 3 s VAD speech
+   windows to that reference gives a provisional choice, whose output is diarized and embedded.
+   The provisional target cluster is the one nearest its reference, with no floor; its embedded
+   turns that touch no overlap are the spans. Each candidate is scored again by the median SIM
+   of its own cuts of every span, and the best is kept; with no span, or no reference for the
+   provisional candidate, the window scores decide. The chosen output is diarized again only
+   when it is not the provisional one, and the downmix goes through it too.
 3. The anchors must agree, timestamp anchors cut from their source's chosen output; else the run
    stops with the result `anchors-disagree` (the host exits 3). When `seed/sdh/` is mounted, the
    SDH spans `stages/sdh.py` holds as anchors are cut the same way and checked against the
@@ -77,6 +82,9 @@ FC = "FC"
 DOWNMIX = "downmix"
 CHOICE_WINDOW_S = 3.0
 CHOICE_BEST_N = 50
+# How a source's separator was chosen: on the provisional target turns, or on the best windows.
+BASIS_TURNS = "turns"
+BASIS_WINDOWS = "windows"
 # A turn shorter than this is too short to embed; it is recorded as a length drop.
 MIN_EMBED_S = 0.5
 AUDIO_SUBTYPE = "PCM_24"
@@ -222,7 +230,13 @@ class SourceWork:
 
     source: Source
     separator: str
+    # The scores that decided, and the 50-best-window scores (the same when `basis` is windows).
     scores: dict[str, float | None]
+    window_scores: dict[str, float | None]
+    provisional: str
+    basis: str
+    spans: int
+    rediarized: bool
     scratch: dict[str, Path]
     turns: list[Turn]
     turn_embs: list[retrieve.Embedding | None]
@@ -459,6 +473,142 @@ def candidate_scores(
     return scores
 
 
+def span_scores(
+    outputs: Mapping[str, np.ndarray],
+    rate: int,
+    models: Models,
+    references: Mapping[str, Mapping[str, np.ndarray] | None],
+    spans: Sequence[Span],
+) -> dict[str, float | None]:
+    """Score each candidate on its own cuts of `spans`: the median SIM over every span.
+
+    `best_n` is the span count, so no span is left out. A candidate with no reference, or no
+    span to cut, scores `None`.
+    """
+    scores: dict[str, float | None] = {}
+    for name, output in outputs.items():
+        reference = references.get(name)
+        if reference is None:
+            scores[name] = None
+            continue
+        embs = [embed(models.embedders, cut(output, rate, span), rate) for span in spans]
+        scores[name] = retrieve.candidate_score(embs, reference, len(spans))
+    return scores
+
+
+@dataclass(frozen=True, slots=True)
+class Diarized:
+    """One output's diarization: its turns by start, its overlaps, and each turn's embedding.
+
+    A turn shorter than `MIN_EMBED_S` has no embedding.
+    """
+
+    turns: list[Turn]
+    overlaps: list[Span]
+    turn_embs: list[retrieve.Embedding | None]
+
+    def labelled(self) -> list[tuple[str, retrieve.Embedding]]:
+        """Each embedded turn's diarizer label and embedding."""
+        return [
+            (t.speaker, e) for t, e in zip(self.turns, self.turn_embs, strict=True) if e is not None
+        ]
+
+
+def diarize(audio: np.ndarray, rate: int, models: Models) -> Diarized:
+    """Diarize one output and embed each turn long enough to embed."""
+    turns = sorted(models.diarizer.turns(audio, rate), key=lambda t: t.start_s)
+    overlaps = list(models.diarizer.overlaps(audio, rate))
+    turn_embs = [
+        (
+            embed(models.embedders, cut(audio, rate, Span(t.start_s, t.end_s)), rate)
+            if t.end_s - t.start_s >= MIN_EMBED_S
+            else None
+        )
+        for t in turns
+    ]
+    return Diarized(turns=turns, overlaps=overlaps, turn_embs=turn_embs)
+
+
+@dataclass(frozen=True, slots=True)
+class SeparatorChoice:
+    """The separator a source keeps, how it was chosen, and the chosen output's diarization.
+
+    `basis` is `turns` when the candidates were scored on the provisional target cluster's
+    spans and `windows` when the window scores decided; `scores` are the scores that decided.
+    """
+
+    separator: str
+    provisional: str
+    basis: str
+    scores: dict[str, float | None]
+    window_scores: dict[str, float | None]
+    spans: int
+    rediarized: bool
+    diarized: Diarized
+
+
+def separator_choice(
+    outputs: Mapping[str, np.ndarray],
+    rate: int,
+    models: Models,
+    references: Mapping[str, Mapping[str, np.ndarray] | None],
+) -> SeparatorChoice:
+    """Choose a source's separator on the provisional target cluster's turns.
+
+    The window scores give a provisional choice, whose output is diarized. Its target cluster,
+    ranked against its reference with no floor (`retrieve.best_cluster`), gives the spans: that
+    cluster's embedded turns that touch no overlap. The best 50 windows can be another speaker's
+    when the target speaks little, while these spans are the target's wherever the provisional
+    cluster is. Each candidate is scored on its own cuts of the spans; the provisional
+    candidate's cuts are its turn embeddings already. With no span, or no reference for the
+    provisional candidate, the window scores decide. The chosen output is diarized again only
+    when the choice differs from the provisional one.
+    """
+    window_scores = candidate_scores(outputs, rate, models, references)
+    provisional = retrieve.choose_separator(window_scores)
+    diarized = diarize(outputs[provisional], rate, models)
+    reference = references.get(provisional)
+    picked: list[tuple[Span, retrieve.Embedding]] = []
+    if reference is not None:
+        label = retrieve.best_cluster(diarized.labelled(), reference)
+        for turn, emb in zip(diarized.turns, diarized.turn_embs, strict=True):
+            span = Span(turn.start_s, turn.end_s)
+            if (
+                emb is not None
+                and turn.speaker == label
+                and not segments.intersects(span, diarized.overlaps)
+            ):
+                picked.append((span, emb))
+    if reference is None or not picked:
+        return SeparatorChoice(
+            separator=provisional,
+            provisional=provisional,
+            basis=BASIS_WINDOWS,
+            scores=window_scores,
+            window_scores=window_scores,
+            spans=0,
+            rediarized=False,
+            diarized=diarized,
+        )
+    spans = [span for span, _ in picked]
+    others = {name: output for name, output in outputs.items() if name != provisional}
+    found = span_scores(others, rate, models, references, spans)
+    own = retrieve.candidate_score([emb for _, emb in picked], reference, len(spans))
+    scores = {name: own if name == provisional else found[name] for name in outputs}
+    chosen = retrieve.choose_separator(scores)
+    rediarized = chosen != provisional
+    return SeparatorChoice(
+        separator=chosen,
+        provisional=provisional,
+        basis=BASIS_TURNS,
+        scores=scores,
+        window_scores=window_scores,
+        spans=len(spans),
+        rediarized=rediarized,
+        diarized=diarize(outputs[chosen], rate, models) if rediarized else diarized,
+    )
+
+
 # The stage.
 
 
@@ -536,8 +686,8 @@ class Extraction:
         rate = source.sample_rate
         primary = decode(self.data, source, source.primary_channel)
         outputs = separate(primary, rate, self.models.separators)
-        scores = candidate_scores(outputs, rate, self.models, references)
-        chosen = retrieve.choose_separator(scores)
+        choice = separator_choice(outputs, rate, self.models, references)
+        chosen = choice.separator
         channels = {source.primary_channel: outputs[chosen]}
         del outputs, primary
         if source.primary_channel == FC:
@@ -548,18 +698,10 @@ class Extraction:
         main = channels[source.primary_channel]
         anchors = self._anchor_cuts(source.source_id, main, rate)
         sdh_embs = self._sdh_cuts(source.source_id, main, rate)
-        turns = sorted(self.models.diarizer.turns(main, rate), key=lambda t: t.start_s)
-        overlaps = list(self.models.diarizer.overlaps(main, rate))
+        turns, overlaps = choice.diarized.turns, choice.diarized.overlaps
+        turn_embs = choice.diarized.turn_embs
         speech = {name: list(self.models.vad.speech(a, rate)) for name, a in channels.items()}
         quality = {name: self.models.quality.frames(a, rate) for name, a in channels.items()}
-        turn_embs = [
-            (
-                self._embed(cut(main, rate, Span(t.start_s, t.end_s)), rate)
-                if t.end_s - t.start_s >= MIN_EMBED_S
-                else None
-            )
-            for t in turns
-        ]
         offcentre: list[Span] = []
         if DOWNMIX in channels and source.primary_channel == FC:
             offcentre = [
@@ -572,14 +714,21 @@ class Extraction:
         for name, audio in channels.items():
             paths[name] = scratch / f"{source.source_id}-{name}.npy"
             np.save(paths[name], audio)
+        again = "diarized again" if choice.rediarized else "diarized once"
         print(
-            f"extract: {source.source_id} separator {chosen}, {len(turns)} turns, "
+            f"extract: {source.source_id} separator {chosen} (provisional {choice.provisional}, "
+            f"basis {choice.basis}, {choice.spans} turns scored, {again}), {len(turns)} turns, "
             f"{len(overlaps)} overlaps, {len(offcentre)} off-centre spans"
         )
         work = SourceWork(
             source=source,
             separator=chosen,
-            scores=scores,
+            scores=choice.scores,
+            window_scores=choice.window_scores,
+            provisional=choice.provisional,
+            basis=choice.basis,
+            spans=choice.spans,
+            rediarized=choice.rediarized,
             scratch=paths,
             turns=turns,
             turn_embs=turn_embs,
@@ -1077,9 +1226,12 @@ class Extraction:
                     "source_id": sid,
                     **work.source.facts,
                     "separator": work.separator,
-                    "separator_scores": {
-                        k: None if v is None else round(v, 4) for k, v in work.scores.items()
-                    },
+                    "separator_scores": _scores(work.scores),
+                    "separator_basis": work.basis,
+                    "separator_window_scores": _scores(work.window_scores),
+                    "separator_provisional": work.provisional,
+                    "separator_turns": work.spans,
+                    "separator_rediarized": work.rediarized,
                     "primary_s": seconds[primary[0]] if primary else 0.0,
                     "clusters": [
                         {
@@ -1166,6 +1318,10 @@ def cluster_seconds(turns: Sequence[Turn]) -> dict[str, float]:
 
 def _rounded(values: Mapping[str, float]) -> dict[str, float]:
     return {name: round(float(value), 4) for name, value in values.items()}
+
+
+def _scores(values: Mapping[str, float | None]) -> dict[str, float | None]:
+    return {name: None if v is None else round(v, 4) for name, v in values.items()}
 
 
 def turn_records(

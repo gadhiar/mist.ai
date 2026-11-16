@@ -379,6 +379,16 @@ def report_lines(report: Mapping[str, object]) -> list[str]:
             f"s; kept {_num(source.get('kept'))}, flagged {_num(source.get('flagged'))}, "
             f"dropped {_num(source.get('dropped'))}"
         )
+        # A report written before the turn-based choice has no basis; its scores are the windows'.
+        basis = source.get("separator_basis")
+        if isinstance(basis, str):
+            again = "diarized again" if source.get("separator_rediarized") else "diarized once"
+            lines.append(
+                f"    separator basis {basis}: provisional {source.get('separator_provisional')}, "
+                f"chosen {source.get('separator')}, {_num(source.get('separator_turns'))} turns "
+                f"scored, {again}"
+            )
+            lines.append(f"    window scores: {_table(source.get('separator_window_scores'))}")
         clusters = source.get("clusters")
         for cluster in clusters if isinstance(clusters, list) else []:
             lines.append(
