@@ -2437,6 +2437,41 @@ def test_dev_general_agreement_is_what_the_module_recomputes_from_the_passes(tmp
     assert same
 
 
+def _dev_general_tags_missing_from(path: Path, tags: list[str]) -> list[str]:
+    """The tags, in order, that a label file holds no row for."""
+    held = {row["tag"] for row in _gold_rows(path)}
+    return [tag for tag in tags if tag not in held]
+
+
+def test_dev_general_missing_tag_check_on_a_synthetic_pass(tmp_path):
+    path = tmp_path / "pass.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"tag": tag, "utterance": "", "expected_entities": []}) + "\n"
+            for tag in ("dvg-01-core-a", "dvg-03-core-c")
+        ),
+        encoding="utf-8",
+    )
+
+    missing = _dev_general_tags_missing_from(path, ["dvg-01-core-a", "dvg-02-core-b"])
+
+    assert missing == ["dvg-02-core-b"]
+
+
+def test_each_dev_general_pass_holds_every_dev_general_tag():
+    """The shared label check fails a tag a pass adds, not one it leaves out; this is the other."""
+    tags = [r["tag"] for r in _dev_general_rows()]
+    passes = [
+        p for p in (_DEV_GENERAL_PASS_A, _DEV_GENERAL_PASS_B) if p in _DEV_GENERAL_LABEL_FILES
+    ]
+
+    missing = [tag for path in passes for tag in _dev_general_tags_missing_from(path, tags)]
+    checked = len(passes)
+
+    assert checked == 2, "a dev-general label pass is missing or empty"
+    assert missing == []
+
+
 def test_dev_general_gold_is_60_rows_with_nofact_rows_empty_and_the_rest_relational():
     rows = _dev_general_rows()
 
