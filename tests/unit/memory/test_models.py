@@ -11,6 +11,7 @@ import backend.memory.models as memory_models
 from backend.memory.models import (
     DEFAULT_SERVING,
     Candidate,
+    CandidateDisposition,
     EpisodeSource,
     ExchangeSource,
     FacetSource,
@@ -70,6 +71,7 @@ _DROPPED = (
     "dropped_suppressed",
     "dropped_no_members",
     "dropped_late",
+    "dropped_band",
 )
 _NEED_KEYS = {
     "mode",
@@ -439,6 +441,9 @@ class TestMemoryCandidate:
             _candidate(disposition=disposition, item=2)
 
         assert _candidate(disposition=disposition, item=None).item is None
+
+    def test_the_disposition_type_names_every_accepted_disposition(self):
+        assert set(CandidateDisposition.__args__) == {"injected", *_DROPPED}
 
     @pytest.mark.parametrize(
         ("overrides", "fragment"),
