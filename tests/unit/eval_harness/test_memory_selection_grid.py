@@ -17,11 +17,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from safetensors import SafetensorError
 
 import backend.memory.need_gate as need_gate_module
 import scripts.eval_harness.memory_selection_grid as grid
+from backend.errors import MemoryRerankError, MistError
 from backend.memory.need_gate import (
     FORM_CANDIDATES,
     CvResult,
@@ -423,6 +426,159 @@ def test_a_model_directory_that_does_not_exist_exits_2(
         main(argv, models_lock=lock)
     assert exc.value.code == 2
     assert absent in capsys.readouterr().err
+
+
+# --- exit 4: a model that exists but fails to load -----------------------------------------------
+
+_FACT_LOCK = (
+    '[[model]]\nname = "fact"\nrepo = "x/fact"\nrevision = "1"\nlicense = "MIT"\n'
+    'target = "fact"\n'
+)
+# Each loader `load_real_models` calls, and the directory under /opt/models it loads.
+_LOADERS = {
+    "SentenceTransformerEmbedder": "fact",
+    "build_reranker": "reranker",
+    "EmbeddingGenerator": BGE,
+    "warmup": BGE,
+}
+
+
+def _present_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], Path]:
+    """Argv naming three model directories that exist, and a lock with the fact embedder."""
+    root = tmp_path / "models"
+    monkeypatch.setattr(grid, "MODELS_ROOT", root)
+    for name in ("fact", "reranker", BGE):
+        (root / name).mkdir(parents=True)
+    argv = _argv("--need-embedder", f"{BGE}={root / BGE}@5c38", output=str(tmp_path / "grid.json"))
+    argv[argv.index("--embedder") + 1] = str(root / "fact")
+    argv[argv.index("--reranker") + 1] = str(root / "reranker")
+    lock = tmp_path / "models.lock"
+    lock.write_text(_FACT_LOCK, encoding="utf-8")
+    return argv, lock
+
+
+def _stub_loaders(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failing: str | None = None,
+    error: BaseException | None = None,
+) -> list[str]:
+    """Replace the four loaders: the one named `failing` raises `error`, every other one loads.
+
+    Unstubbed, the first loader would already fail on an empty directory (and `build_reranker`
+    refuses any path outside the real /opt/models), so a test would never reach a later loader.
+    Returns the paths each gate embedder's `warmup` ran for.
+    """
+    warmed: list[str] = []
+
+    def check(name: str) -> None:
+        if name == failing:
+            assert error is not None
+            raise error
+
+    class Fact:
+        def __init__(self, path: str, *, device: str) -> None:
+            check("SentenceTransformerEmbedder")
+
+    def build_reranker(choice: str, *, device: str, config: object) -> SimpleNamespace:
+        check("build_reranker")
+        return SimpleNamespace(reranker=TokenReranker())
+
+    class Generator:
+        def __init__(self, path: str, *, device: str, **kwargs: object) -> None:
+            check("EmbeddingGenerator")
+            self.path = path
+
+        def warmup(self) -> None:
+            check("warmup")
+            warmed.append(self.path)
+
+    monkeypatch.setattr(grid, "SentenceTransformerEmbedder", Fact)
+    monkeypatch.setattr(grid, "build_reranker", build_reranker)
+    monkeypatch.setattr(grid, "EmbeddingGenerator", Generator)
+    return warmed
+
+
+def test_load_errors_are_reranks_model_errors_and_the_rerank_and_import_errors() -> None:
+    assert (
+        OSError,
+        ValueError,
+        RuntimeError,
+        ImportError,
+        SafetensorError,
+        MemoryRerankError,
+    ) == grid._LOAD_ERRORS
+    assert issubclass(grid.GridLoadError, MistError)
+
+
+def test_load_real_models_loads_every_model_and_warms_each_gate_embedder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    warmed = _stub_loaders(monkeypatch)
+    models = grid.load_real_models(build_parser().parse_args(argv), models_lock=lock)
+    assert [g.name for g in models.gate_embedders] == ["shared", BGE]
+    assert warmed == [str(tmp_path / "models" / BGE)]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError, ValueError, RuntimeError, ImportError, SafetensorError, MemoryRerankError],
+)
+@pytest.mark.parametrize("loader", list(_LOADERS))
+def test_a_model_that_fails_to_load_raises_grid_load_error_naming_it(
+    loader: str, error: type[Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    _stub_loaders(monkeypatch, failing=loader, error=error(f"{loader} stub failure"))
+    with pytest.raises(grid.GridLoadError) as exc:
+        grid.load_real_models(build_parser().parse_args(argv), models_lock=lock)
+    directory = tmp_path / "models" / _LOADERS[loader]
+    assert str(exc.value) == f"{directory}: {error.__name__}: {loader} stub failure"
+    assert type(exc.value.__cause__) is error
+
+
+def test_a_type_error_from_a_loader_is_not_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A programming error keeps its traceback and Python's exit 1.
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    _stub_loaders(monkeypatch, failing="SentenceTransformerEmbedder", error=TypeError("stub"))
+    with pytest.raises(TypeError, match="stub"):
+        grid.load_real_models(build_parser().parse_args(argv), models_lock=lock)
+
+
+def test_main_exits_4_with_one_line_and_no_report_when_a_model_fails_to_load(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "grid.json"
+
+    def models(_args: object) -> Models:
+        raise grid.GridLoadError("/opt/models/fact: OSError: stub")
+
+    code = main(_argv(output=str(output)), models=models)
+    assert code == grid.EXIT_LOAD == 4
+    assert not output.exists()
+    err = capsys.readouterr().err
+    assert err == "memory_selection_grid: exit 4, /opt/models/fact: OSError: stub\n"
+
+
+def test_a_gate_embedder_whose_warmup_fails_exits_4_before_any_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv, lock = _present_models(tmp_path, monkeypatch)
+    _stub_loaders(monkeypatch, failing="warmup", error=OSError("no weights"))
+
+    def no_fit(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a model failed to load, so nothing is fit")
+
+    monkeypatch.setattr(grid, "fit_gate", no_fit)
+    assert main(argv, models_lock=lock) == 4
+    assert not (tmp_path / "grid.json").exists()
+    directory = tmp_path / "models" / BGE
+    assert capsys.readouterr().err == (
+        f"memory_selection_grid: exit 4, {directory}: OSError: no weights\n"
+    )
 
 
 # --- step 1: the gate alone ----------------------------------------------------------------------

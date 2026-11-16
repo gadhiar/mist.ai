@@ -31,8 +31,9 @@ and the rule chooses again, up to three strikes.
 Exit 0: the choice has margin at least 0.05. Exit 3: the choice has margin under 0.05, to be
 flagged to the lead. Exit 1: no setting passes (as when every candidate of every gate embedder
 failed, which leaves no setting), or the load check struck three settings or every passing one.
-Exit 2: an input error, found before any model loads (`main` lists them). A model that exists
-but fails to load raises, so Python's exit 1 comes with a traceback.
+Exit 2: an input error, found before any model loads (`main` lists them). Exit 4: a model
+directory that exists fails to load; one stderr line names the directory and the error, and no
+report is written. Any other error still ends in a traceback with Python's exit 1.
 
 Usage, from the repository root (`/app` in the image):
     python scripts/eval_harness/memory_selection_grid.py --embedder PATH --reranker PATH
@@ -51,8 +52,9 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, tzinfo
+from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 # Run as a script path (H18's command), `sys.path` starts at this directory, not the repository
 # root the absolute imports below need.
@@ -60,7 +62,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.errors import MemoryConfigError  # noqa: E402
+from safetensors import SafetensorError  # noqa: E402
+
+from backend.errors import MemoryConfigError, MemoryRerankError, MistError  # noqa: E402
 from backend.interfaces import EmbeddingProvider  # noqa: E402
 from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator  # noqa: E402
 from backend.memory.config import MemoryConfig  # noqa: E402
@@ -137,6 +141,19 @@ EXIT_GO = 0
 EXIT_STOP = 1
 EXIT_INPUT = 2
 EXIT_FLAG = 3
+EXIT_LOAD = 4
+
+# What a model directory that exists can raise while it loads: rerank.py's `_MODEL_ERRORS`, an
+# ImportError from a missing optional package, and the MemoryRerankError `CrossEncoderReranker`
+# turns those into. A TypeError or any other programming error is not caught.
+_LOAD_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    ImportError,
+    SafetensorError,
+    MemoryRerankError,
+)
 
 # A difference of two shares can land a rounding step under a bound it meets exactly.
 _TOLERANCE = 1e-9
@@ -1427,6 +1444,36 @@ class GridInputError(ValueError):
     """An input the grid refuses before it runs: exit 2."""
 
 
+class GridLoadError(MistError):
+    """A model directory that exists failed to load: exit 4.
+
+    The message is `<directory>: <type>: <message>`, naming the directory and the error the
+    loader raised.
+    """
+
+
+_T = TypeVar("_T")
+
+
+def _load(directory: str, loader: Callable[[], _T]) -> _T:
+    """`loader()`, with any of `_LOAD_ERRORS` turned into GridLoadError naming `directory`."""
+    try:
+        return loader()
+    except _LOAD_ERRORS as exc:
+        raise GridLoadError(f"{directory}: {type(exc).__name__}: {exc}") from exc
+
+
+def _gate_model(name: str, path: str) -> EmbeddingGenerator:
+    """A gate embedder on the CPU, as deployed, with its spec's load keywords, loaded now.
+
+    EmbeddingGenerator loads on its first use; `warmup` loads it here, so a directory that
+    cannot load fails before the grid runs rather than inside the first fit.
+    """
+    model = EmbeddingGenerator(path, device="cpu", **need_embedder_kwargs(NEED_EMBEDDERS[name]))
+    model.warmup()
+    return model
+
+
 def _under_models_root(path: str) -> bool:
     resolved = Path(path)
     return MODELS_ROOT in (resolved, *resolved.parents)
@@ -1480,10 +1527,16 @@ def load_real_models(args: argparse.Namespace, *, models_lock: Path) -> Models:
 
     `shared`'s key names the fact embedder by its models.lock entry, found by its directory's
     name. Each `--need-embedder` loads on the CPU, as deployed, with its spec's load keywords.
+    Every model is loaded before this returns: the fact embedder and the cross-encoder load in
+    their constructors, and each gate embedder, which would otherwise load on its first use,
+    through `warmup`.
 
     Raises:
         GridInputError: A model directory does not exist, or the lock cannot be read or has no
             entry for the fact embedder.
+        GridLoadError: A model directory exists but its model fails to load with one of
+            `_LOAD_ERRORS`; the message names the directory and the error. Any other error, a
+            TypeError say, is not caught.
     """
     paths = [args.embedder, args.reranker, *(path for _n, path, _r in args.need_embedder or ())]
     for path in paths:
@@ -1497,13 +1550,19 @@ def load_real_models(args: argparse.Namespace, *, models_lock: Path) -> Models:
     entry = next((e for e in entries if e.name == wanted), None)
     if entry is None:
         raise GridInputError(f"{models_lock} has no entry named {wanted!r}, the fact embedder")
-    fact = SentenceTransformerEmbedder(args.embedder, device=args.embedder_device)
-    built = build_reranker(
-        "real", device=args.device, config=replace(BASE_CONFIG, rerank_model=args.reranker)
+    fact = _load(
+        args.embedder,
+        lambda: SentenceTransformerEmbedder(args.embedder, device=args.embedder_device),
+    )
+    built = _load(
+        args.reranker,
+        lambda: build_reranker(
+            "real", device=args.device, config=replace(BASE_CONFIG, rerank_model=args.reranker)
+        ),
     )
     gates = [GateEmbedder(SHARED, entry.name, entry.revision, fact)]
     for name, path, revision in args.need_embedder or ():
-        model = EmbeddingGenerator(path, device="cpu", **need_embedder_kwargs(NEED_EMBEDDERS[name]))
+        model = _load(path, partial(_gate_model, name, path))
         gates.append(GateEmbedder(name, name, revision, model))
     return Models(fact, built.reranker, tuple(gates))
 
@@ -1524,9 +1583,10 @@ def main(
     These exit 2 through `parser.error`, before any model loads: a malformed argument, a model
     path outside /opt/models or not a directory, a gate embedder named twice, dev inputs that
     cannot be read, and a models lock that cannot be read or lacks the fact embedder. A model
-    directory that exists but fails to load raises, as in memory_recall_run.py. The keywords
-    other than `argv` replace the real models, the grid, the fixed values and the runners, for
-    tests.
+    directory that exists but fails to load (`GridLoadError`) exits 4 with one line on stderr,
+    `memory_selection_grid: exit 4, <directory>: <type>: <message>`, and writes no report. The
+    keywords other than `argv` replace the real models, the grid, the fixed values and the
+    runners, for tests.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1547,6 +1607,9 @@ def main(
         loaded = loader(args)
     except GridInputError as exc:
         parser.error(str(exc))
+    except GridLoadError as exc:
+        print(f"memory_selection_grid: exit {EXIT_LOAD}, {exc}", file=sys.stderr)
+        return EXIT_LOAD
     with tempfile.TemporaryDirectory(prefix="selection-grid-") as root:
         workdir = Path(root)
         outcome = run_grid(
@@ -1616,6 +1679,7 @@ __all__ = [
     "GateEmbedder",
     "GateFit",
     "GridInputError",
+    "GridLoadError",
     "GridOutcome",
     "GridPoint",
     "LoadJudgement",
