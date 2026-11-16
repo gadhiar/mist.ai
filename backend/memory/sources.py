@@ -9,7 +9,8 @@ store (ADR-010 Invariant 4, last clause).
   on the turn's `now`, which T9 applies.
 - VaultCandidates queries the vault sidecar on its read-only connection in match-any mode and
   returns one note Candidate per path, minus the notes the block must never show twice or at
-  all.
+  all. It also reads a note's whole text, every chunk of its path, on the same connection, for
+  the fetcher's read-time suppression.
 """
 
 from __future__ import annotations
@@ -297,6 +298,24 @@ class VaultCandidates:
             if len(kept) >= self._k or len(rows) < fetch or fetch >= self._k * _MAX_FETCH_FACTOR:
                 return kept[: self._k]
             fetch *= 2
+
+    async def texts(self, paths: Collection[str]) -> dict[str, str]:
+        """The whole indexed text of each note path, in one read-only sidecar read.
+
+        Read-time suppression judges a note by all of its chunks, not only the one the pool
+        returned (mist-read-path T21), and the fetcher asks once per fetch for every note in
+        its shortlist.
+
+        Args:
+            paths: Note paths as the candidates carry them (`NoteSource.path`).
+
+        Returns:
+            Path to text for each path the sidecar holds.
+
+        Raises:
+            SidecarIndexError: The sidecar is not initialized or its database fails.
+        """
+        return await self._sidecar.path_texts_readonly(list(paths))
 
     def _candidate(self, row: Mapping[str, object], excluded: frozenset[str]) -> Candidate | None:
         """The Candidate of one sidecar row, or None when the row is dropped."""

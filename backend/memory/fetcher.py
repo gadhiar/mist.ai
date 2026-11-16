@@ -6,13 +6,18 @@ in two stages (Design point 8):
 
 - Stage 1 needs no transcript: the index state (`index_rebuilding` while a rebuild runs), the
   fact and facet entity anchors of the last two user utterances, and the suppression set of the
-  corrections. It is cached per session for 30 s, so a prefetch started at speech start takes
-  it off the critical path.
+  corrections (`corrections.Suppression`, read only when `corrections_enabled`). It is cached
+  per session for 30 s, so a prefetch started at speech start takes it off the critical path.
+  A recorded correction drops the cache only through a recorded listener that calls
+  `invalidate()` (registering one is T34's); without one a cached stage 1 keeps the
+  suppression set read before the correction until it expires.
 - Stage 2 depends on the words: the FTS, vector and entity-anchored fact and facet pools, the
   vault note pool, RRF fusion into the pool order, the shortlist's drops (suppressed facts,
-  facets with fewer than two current members), the cross-encoder on the pairs that fit the
-  time left, the order by rank, selection of the first `select_k`, expansion of sibling lists
-  (plan v2 V7) and facets into their facts, and packing in that order.
+  notes whose whole text a correction suppresses, facets with fewer than two current members),
+  the cross-encoder on the pairs that fit the time left, the order by rank, selection of the
+  first `select_k`, expansion of sibling lists (plan v2 V7) and facets into their facts, and
+  packing in that order. A suppressed candidate leaves before the cross-encoder, so it takes
+  no rerank pair and no `select_k` slot, and is traced `dropped_suppressed` with its ref.
 
 The need gate, when one is given, decides in stage 2, beside the pools and before the
 cross-encoder, how likely the turn needs memory. In `on` mode a closed decision ends the fetch
@@ -53,7 +58,7 @@ import math
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -65,6 +70,7 @@ from backend.knowledge.models import graph_ref, vault_ref
 
 from .block import BLOCK_VERSION, FactList, MemoryBlock, MemoryBlockBuilder, PlacedList
 from .config import MemoryConfig
+from .corrections import NO_SUPPRESSION, Suppression
 from .fact_index import FactGroup, IndexedFacet, IndexedFact
 from .fts import words
 from .models import (
@@ -241,12 +247,19 @@ class NoteSearch(Protocol):
         """Note candidates for the query, best first."""
         ...
 
+    async def texts(self, paths: Collection[str]) -> dict[str, str]:
+        """The whole indexed text of each note path the sidecar holds, in one read."""
+        ...
+
 
 class SuppressionSource(Protocol):
-    """The fact keys corrections suppress now (Phase C); read in stage 1, blocking."""
+    """What the corrections suppress now (Phase C); `corrections.LoggedSuppression` satisfies it.
 
-    def suppressed_fact_keys(self) -> frozenset[str]:
-        """Every `fact_key` a correction currently suppresses."""
+    Read in stage 1 on the index executor, so the read may block.
+    """
+
+    def suppression(self) -> Suppression:
+        """The suppression set of every correction logged now."""
         ...
 
 
@@ -328,8 +341,9 @@ class FetchOutcome:
         lists: The fact lists the block placed.
         fused: Every fused candidate in pool order, before the `rerank_top_n` cut, so its
             first `rerank_top_n` are the shortlist before its drops.
-        ranked: The shortlist after the drops (suppressed facts, facets without members or
-            whose lookup was late), in position order; the stage's candidate of rank `i` is
+        ranked: The shortlist after the drops (suppressed facts and notes, notes whose
+            whole-text read was late or failed, facets without members or whose lookup was
+            late), in position order; the stage's candidate of rank `i` is
             `ranked[i - 1]` for `i` up to its length.
         selected: What selection and expansion bring, in packing order: the first
             `select_k` of `ranked`, the selected facets included, and every fact expansion
@@ -427,7 +441,15 @@ class _Served:
                     self.versions.get(fused_candidate.candidate.item_id),
                 )
             )
-        suppressed_count = sum(1 for _, reason in self.dropped if reason == "dropped_suppressed")
+        # A suppressed note is counted apart from the facts: the narrative rule suppressed it.
+        suppressed_count = narrative_count = 0
+        for fused_candidate, reason in self.dropped:
+            if reason != "dropped_suppressed":
+                continue
+            if fused_candidate.candidate.kind == "note":
+                narrative_count += 1
+            else:
+                suppressed_count += 1
         ordered = sorted(stage_candidates, key=lambda c: (c.disposition != "injected", c.rank))
         request = self.request
         stage = MemoryStage(
@@ -442,7 +464,7 @@ class _Served:
             prefetch_reuse=self.reuse,
             reranked=self.reranked,
             suppressed=suppressed_count,
-            narrative_suppressed=0,
+            narrative_suppressed=narrative_count,
             timings=self.timings,
             candidates=tuple(ordered[:STAGE_CANDIDATE_CAP]),
             truncated=max(0, len(ordered) - STAGE_CANDIDATE_CAP),
@@ -458,17 +480,17 @@ class _Served:
             timings=self.timings,
             reranked=self.reranked,
             suppressed=suppressed_count,
-            narrative_suppressed=0,
+            narrative_suppressed=narrative_count,
             stage=stage,
         )
 
 
 @dataclass(frozen=True, slots=True)
 class _Stage1:
-    """What stage 1 found: the recent turns' fact and facet anchors and the suppressed keys."""
+    """What stage 1 found: the recent turns' fact and facet anchors and the suppression set."""
 
     anchors: tuple[FactGroup, ...]
-    suppressed: frozenset[str]
+    suppression: Suppression
     facet_anchors: tuple[IndexedFacet, ...] = ()
 
 
@@ -603,7 +625,8 @@ class MemoryFetcher:
         index_state: Returns the index's degraded reason, `index_db.degraded_reason` on a
             connection of its own (`runtime.IndexStateProbe`); checked on every fetch.
         notes: The vault note pool, or None when no sidecar is configured.
-        suppression: The corrections' suppression set (Phase C), or None for none.
+        suppression: The corrections' suppression set (Phase C), or None for none. Read only
+            when `config.corrections_enabled`.
         profile_path: The always-injected user profile note, kept out of the note pool.
         pool_size: Facts in each of the FTS, vector and entity pools.
         prefetch_deadline_ms: The budget of a prefetch's whole fetch.
@@ -822,7 +845,9 @@ class MemoryFetcher:
         """Run stage 1 on the index executor: the recent turns' anchors and the suppression set.
 
         The facet anchors, the facets whose subject the recent turns name, are read only when
-        `facets` is on.
+        `facets` is on; the suppression set only when `corrections_enabled` is. A log that
+        cannot be read raises `MemoryCorrectionError`, so the fetch serves no block rather than
+        a forgotten fact.
         """
 
         def work() -> _Stage1:
@@ -836,14 +861,12 @@ class MemoryFetcher:
                 if anchors and self._config.facets
                 else ()
             )
-            suppressed = (
-                self._suppression.suppressed_fact_keys()
-                if self._suppression is not None
-                else frozenset()
+            suppression = (
+                self._suppression.suppression()
+                if self._suppression is not None and self._config.corrections_enabled
+                else NO_SUPPRESSION
             )
-            return _Stage1(
-                anchors=groups, suppressed=frozenset(suppressed), facet_anchors=facet_anchors
-            )
+            return _Stage1(anchors=groups, suppression=suppression, facet_anchors=facet_anchors)
 
         return await self._call(self._executors.index, work, deadline=deadline, ledger=ledger)
 
@@ -905,13 +928,13 @@ class MemoryFetcher:
 
         fused = fuse(candidates)
         shortlisted, dropped, members = await self._drop_before_rerank(
-            fused[: self._config.rerank_top_n], stage1.suppressed, now, deadline, ledger
+            fused[: self._config.rerank_top_n], stage1.suppression, versions, now, deadline, ledger
         )
         scores = await self._rerank(request.query_text, shortlisted, deadline, ledger)
         ranked = order_candidates(shortlisted, scores, now=now, window=window)
 
         expansion = await self._expand(
-            ranked, members, versions, stage1.suppressed, now, deadline, ledger
+            ranked, members, versions, stage1.suppression, now, deadline, ledger
         )
         # An `on` band turn is served its first `band_k` entries; every other turn the block.
         band_k = (
@@ -956,7 +979,8 @@ class MemoryFetcher:
     async def _drop_before_rerank(
         self,
         head: Sequence[FusedCandidate],
-        suppressed: frozenset[str],
+        suppression: Suppression,
+        versions: dict[str, IndexedFact],
         now: datetime,
         deadline: float,
         ledger: _Ledger,
@@ -967,11 +991,16 @@ class MemoryFetcher:
     ]:
         """Take out of the shortlist what must not take a rerank pair or a slot.
 
-        A suppressed fact leaves as `dropped_suppressed`. The members of every shortlisted
-        facet are read in one batched lookup on the index executor; a facet left with fewer
-        than two current members no correction suppresses leaves as `dropped_no_members`. A
-        lookup that misses the deadline removes every facet as `dropped_late` and marks the
-        fetch `deadline`, so the facts are still served. The shortlist is not refilled.
+        A fact whose current version a correction suppresses leaves as `dropped_suppressed`.
+        When a correction names an object, the whole text of every shortlisted note is read in
+        one call, beside the facet member lookup, and a note whose whole text the corrections
+        suppress leaves as `dropped_suppressed`. A late or failed read removes every note as
+        `dropped_late`, since none of them can be cleared, and a late one marks the fetch
+        `deadline`. The members of every shortlisted facet are read in one batched lookup on
+        the index executor; a facet left with fewer than two current members no correction
+        suppresses leaves as `dropped_no_members`. A lookup that misses the deadline removes
+        every facet as `dropped_late` and marks the fetch `deadline`, so the facts are still
+        served. The shortlist is not refilled.
 
         Returns:
             The kept shortlist in pool order, the dropped candidates with their dispositions in
@@ -982,36 +1011,62 @@ class MemoryFetcher:
         """
         dropped: dict[tuple[str, str], CandidateDisposition] = {}
         facet_keys: list[str] = []
+        notes: list[tuple[Candidate, NoteSource]] = []
         for fused in head:
             candidate = fused.candidate
-            if candidate.kind == "fact" and candidate.item_id in suppressed:
-                dropped[_key(candidate)] = "dropped_suppressed"
+            if candidate.kind == "fact":
+                if _fact_suppressed(suppression, candidate.item_id, versions):
+                    dropped[_key(candidate)] = "dropped_suppressed"
             elif candidate.kind == "facet":
                 facet_keys.append(candidate.item_id)
+            elif (
+                candidate.kind == "note"
+                and suppression.narrates
+                and isinstance(candidate.source, NoteSource)
+            ):
+                notes.append((candidate, candidate.source))
+        texts_task: asyncio.Task[dict[str, str] | None] | None = None
+        if notes:
+            paths = list(dict.fromkeys(source.path for _, source in notes))
+            texts_task = asyncio.ensure_future(self._note_texts(paths, deadline, ledger))
         members: dict[str, tuple[IndexedFact, ...]] = {}
-        if facet_keys:
-            try:
-                found = await self._call(
-                    self._executors.index,
-                    lambda: self._index.facet_members_many(facet_keys, now=now),
-                    deadline=deadline,
-                    ledger=ledger,
-                )
-            except _LateError:
-                ledger.reasons.add("deadline")
-                dropped.update((("facet", key), "dropped_late") for key in facet_keys)
-            except MemoryIndexError as exc:
-                logger.warning("memory facet member lookup failed: %s", exc)
-                raise _IndexFailedError from exc
-            else:
-                for key in facet_keys:
-                    current = tuple(
-                        fact for fact in found.get(key, ()) if fact.fact_key not in suppressed
+        try:
+            if facet_keys:
+                try:
+                    found = await self._call(
+                        self._executors.index,
+                        lambda: self._index.facet_members_many(facet_keys, now=now),
+                        deadline=deadline,
+                        ledger=ledger,
                     )
-                    if len(current) < 2:
-                        dropped[("facet", key)] = "dropped_no_members"
-                    else:
-                        members[key] = current
+                except _LateError:
+                    ledger.reasons.add("deadline")
+                    dropped.update((("facet", key), "dropped_late") for key in facet_keys)
+                except MemoryIndexError as exc:
+                    logger.warning("memory facet member lookup failed: %s", exc)
+                    raise _IndexFailedError from exc
+                else:
+                    for key in facet_keys:
+                        current = tuple(
+                            fact
+                            for fact in found.get(key, ())
+                            if not suppression.suppresses_fact(fact)
+                        )
+                        if len(current) < 2:
+                            dropped[("facet", key)] = "dropped_no_members"
+                        else:
+                            members[key] = current
+            texts = await texts_task if texts_task is not None else None
+        finally:
+            if texts_task is not None and not texts_task.done():
+                texts_task.cancel()
+        for candidate, source in notes:
+            if texts is None:
+                dropped[_key(candidate)] = "dropped_late"
+            elif suppression.suppresses_note(
+                texts.get(source.path, candidate.text), candidate.when
+            ):
+                dropped[_key(candidate)] = "dropped_suppressed"
         kept = [fused for fused in head if _key(fused.candidate) not in dropped]
         gone = [
             (fused, dropped[_key(fused.candidate)])
@@ -1019,6 +1074,34 @@ class MemoryFetcher:
             if _key(fused.candidate) in dropped
         ]
         return kept, gone, members
+
+    async def _note_texts(
+        self, paths: list[str], deadline: float, ledger: _Ledger
+    ) -> dict[str, str] | None:
+        """The whole texts of the shortlisted notes, or None when the read was late or failed.
+
+        A late read marks the fetch `deadline`; a failed one is logged.
+        """
+        if self._notes is None:
+            return None
+        try:
+            texts = await asyncio.wait_for(
+                self._notes.texts(paths), timeout=self._remaining(deadline)
+            )
+        except TimeoutError:
+            ledger.reasons.add("deadline")
+            return None
+        except MistError as exc:
+            logger.warning(
+                "memory note texts could not be read, so no note is served: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if self._clock.monotonic() > deadline:
+            ledger.reasons.add("deadline")
+            return None
+        return texts
 
     async def _pools(
         self,
@@ -1279,7 +1362,7 @@ class MemoryFetcher:
         ranked: list[ScoredCandidate],
         members: dict[str, tuple[IndexedFact, ...]],
         versions: dict[str, IndexedFact],
-        suppressed: frozenset[str],
+        suppression: Suppression,
         now: datetime,
         deadline: float,
         ledger: _Ledger,
@@ -1354,7 +1437,9 @@ class MemoryFetcher:
                     continue
                 listable.add(sibling_key)
                 bringer = min(group, key=_position_order)
-                siblings = [fact for fact in found[sibling_key] if fact.fact_key not in suppressed]
+                siblings = [
+                    fact for fact in found[sibling_key] if not suppression.suppresses_fact(fact)
+                ]
                 # Siblings the fetch ranked join before those it never saw.
                 joining = sorted(
                     (fact for fact in siblings if ("fact", fact.fact_key) in by_key),
@@ -1986,6 +2071,20 @@ def _degraded_need(
 
 def _serving(context: _Context) -> ServingProfile:
     return ServingProfile(level=context.serving_level, tier=context.serving_tier)
+
+
+def _fact_suppressed(
+    suppression: Suppression, fact_key: str, versions: Mapping[str, IndexedFact]
+) -> bool:
+    """Whether the fact a candidate stands for is suppressed, judged on its current version.
+
+    A candidate whose version the pools did not bring is judged by its key alone, as a
+    version recorded before every correction of it would be.
+    """
+    version = versions.get(fact_key)
+    if version is None:
+        return fact_key in suppression.fact_keys
+    return suppression.suppresses_fact(version)
 
 
 def _key(candidate: Candidate) -> tuple[str, str]:
