@@ -1972,9 +1972,13 @@ _MONTH_NAMES = (
 ).split()
 _MONTH_WORD = r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)"  # noqa: E501
 _WEEKDAY_WORD = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+# Every number word up to ninety-nine, a compound written with a hyphen or a space.
+_UNIT_WORD = r"(?:one|two|three|four|five|six|seven|eight|nine)"
+_TEEN_WORD = r"(?:ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)"
+_TENS_WORD = r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
 _NUMBER_WORD = (
-    r"(?:\d+|a few|a couple of|several|an?|one|two|three|four|five|six|seven|eight|nine|ten"
-    r"|eleven|twelve|fifteen|twenty|thirty|forty|fifty|a hundred)"
+    rf"(?:\d+|a few|a couple of|several|a hundred|{_TENS_WORD}(?:[- ]{_UNIT_WORD})?"
+    rf"|{_TEEN_WORD}|{_UNIT_WORD}|an?)"
 )
 _YEAR_WORD = re.compile(r"\b(?:19|20)\d{2}\b")
 # Acceptance 3's floor of relative time expressions.
@@ -1993,7 +1997,11 @@ _RELATIVE_SPAN = re.compile(
     rf"\b(?:in|for|within)\s+{_NUMBER_WORD}\s+(?:days?|weeks?|months?|years?)\b", re.IGNORECASE
 )
 _WEEKDAY = re.compile(rf"\b{_WEEKDAY_WORD}s?\b", re.IGNORECASE)
-_MONTH = re.compile(rf"\b{_MONTH_WORD}\b")
+# A month name in lowercase is a month too. "may" and "march" are left out because they are
+# also common verbs ("you may", "march on"), so matching them would flag sentences that name
+# no month; capitalised, they are still caught by `_MONTH_WORD`.
+_LOWERCASE_MONTH_WORD = "|".join(m.lower() for m in _MONTH_NAMES if m not in {"May", "March"})
+_MONTH = re.compile(rf"\b(?:{_MONTH_WORD}|{_LOWERCASE_MONTH_WORD})\b")
 _ORDINAL = re.compile(r"\b\d{1,2}(?:st|nd|rd|th)\b")
 _ISO_DAY_OR_MONTH = re.compile(r"\b((?:19|20)\d{2})-(\d{2})(?:-\d{2})?\b")
 _MONTH_AND_YEAR = re.compile(rf"\b({_MONTH_WORD})(?:\s+\d{{1,2}}(?:st|nd|rd|th)?,?)?\s+(\d{{4}})\b")
@@ -2122,6 +2130,14 @@ _DEV_GENERAL_OTHER_SIZES = {
         ("I have used it for a few years.", ["span with no year"]),
         ("It is due on the 14th.", ["day with no year"]),
         ("Twice a month I volunteer at the food bank.", []),
+        ("I joined the club in june.", ["month with no year"]),
+        ("The lease ends in october.", ["month with no year"]),
+        ("I joined the club in june 2024.", []),
+        ("You may want to march on.", []),
+        ("I will be away for eighteen days.", ["span with no year"]),
+        ("It closes in twenty-five weeks.", ["span with no year"]),
+        ("I have lived here for forty two years.", ["span with no year"]),
+        ("I lived there for ninety-nine days in 2019.", []),
     ],
 )
 def test_dev_general_time_check_on_synthetic_utterances(utterance, faults):
