@@ -309,6 +309,45 @@ def test_permuting_target_scores_changes_no_value() -> None:
     assert before.intervals == after.intervals
 
 
+def test_misses_count_each_embedder_alone_and_both_per_register() -> None:
+    # At (0.5, 0.5): rows 0 and 4 pass (4 sits on the value), row 1 misses on the first embedder
+    # only, row 2 on the second only and row 3 on both.
+    target = calibrate.TargetTrials(
+        scores=np.array([[0.9, 0.9], [0.1, 0.9], [0.9, 0.1], [0.1, 0.1], [0.5, 0.5]]),
+        registers=("calm", "calm", "awake", "awake", "awake"),
+    )
+    empty = {gate: {} for gate in calibrate.GATES}
+    trials = calibrate.DatasetTrials(
+        name="ravdess",
+        sexes=("female",),
+        impostor=empty,
+        reported=empty,
+        target={**empty, calibrate.SIM_MIN: {"others": target}},
+    )
+    values = {gate: (0.5, 0.5) for gate in calibrate.GATES}
+    found = calibrate.misses(trials, values, NAMES)[calibrate.SIM_MIN]["others"]
+    assert found == {
+        "all": {
+            "trials": 5,
+            "missed": 3,
+            "rate": 0.6,
+            "by": {"wavlm-sv": 1, "ecapa": 1, "both": 1},
+        },
+        "awake": {
+            "trials": 3,
+            "missed": 2,
+            "rate": 0.666667,
+            "by": {"wavlm-sv": 0, "ecapa": 1, "both": 1},
+        },
+        "calm": {
+            "trials": 2,
+            "missed": 1,
+            "rate": 0.5,
+            "by": {"wavlm-sv": 1, "ecapa": 0, "both": 0},
+        },
+    }
+
+
 def test_bootstrap_repeats_under_one_seed() -> None:
     trials = calibrate.dataset_trials(
         "librittsr", make_speakers({"female": 3, "male": 3}), SMALL, seed=1, names=NAMES
@@ -626,6 +665,39 @@ def test_main_writes_calibration_and_outputs_beside_the_plan(
     assert "beta" in out and "FAR" in out
     for text in (out, err):
         assert re.search(r"\.(wav|zip)\b|public/", text) is None
+
+
+def test_the_log_prints_every_miss_rate_per_dataset_form_and_register(
+    tmp_path: Path, fakes: list[ToneEmbedder], capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = tmp_path / "data"
+    write_plan(data)
+    assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 0
+    out = capsys.readouterr().out
+    result = json.loads((data / FOLDER_REL / "calibration.json").read_text(encoding="utf-8"))
+    lines = set(out.splitlines())
+    printed = 0
+    for gate, entry in result["gates"].items():
+        assert set(entry["misses"]) == {"librittsr", "ravdess"}
+        for dataset, forms in entry["misses"].items():
+            assert forms
+            for form, rows in forms.items():
+                assert "all" in rows
+                for register, row in rows.items():
+                    by = row["by"]
+                    line = (
+                        f"calibrate: {gate} {dataset} {form} {register}: missed "
+                        f"{row['missed']} of {row['trials']} trials, rate {row['rate']}; by "
+                        f"wavlm-sv only {by['wavlm-sv']}, ecapa only {by['ecapa']}, "
+                        f"both {by['both']}"
+                    )
+                    assert line in lines, line
+                    assert sum(by.values()) == row["missed"]
+                    printed += 1
+    anchors = result["gates"][calibrate.SIM_MIN]["misses"]["ravdess"]["others"]
+    assert set(anchors) == {"all", "solo", "calm", "awake", "sleepy", "excited"}
+    assert printed > 20
+    assert re.search(r"\.(wav|zip)\b|public/", out) is None
 
 
 def test_main_checks_every_sha256_before_reading_any_audio(

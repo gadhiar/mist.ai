@@ -144,6 +144,7 @@ CALM = "calm"
 SOLO = "solo"
 MIXED = "mixed"
 ALL = "all"
+BOTH = "both"
 RAVDESS_REGISTERS = {
     "01": NEUTRAL,
     "02": CALM,
@@ -1267,24 +1268,34 @@ def summarise(
 
 
 def misses(
-    trials: DatasetTrials, values: Mapping[str, Sequence[float]]
-) -> dict[str, dict[str, dict[str, dict[str, float | int]]]]:
-    """Return the target miss rates per gate, form and register (`all` for every register)."""
-    found: dict[str, dict[str, dict[str, dict[str, float | int]]]] = {}
+    trials: DatasetTrials, values: Mapping[str, Sequence[float]], names: Sequence[str]
+) -> dict[str, dict[str, dict[str, dict[str, object]]]]:
+    """Return the target miss rates per gate, form and register (`all` for every register).
+
+    `by` splits each miss by the embedders that rejected it: each embedder alone, or `both`
+    when more than one did, so the log shows which embedder's value a register runs into.
+    """
+    found: dict[str, dict[str, dict[str, dict[str, object]]]] = {}
     for gate in GATES:
         found[gate] = {}
         for form, target in trials.target[gate].items():
-            accepted = _accepted(target.scores, values[gate])
+            scores = np.asarray(target.scores, dtype=np.float64).reshape(-1, len(names))
+            rejects = scores < np.asarray(values[gate], dtype=np.float64) - EPS
+            missed_on = rejects.sum(axis=1)
             registers = np.asarray(target.registers)
-            rows = {}
+            rows: dict[str, dict[str, object]] = {}
             for register in [ALL, *sorted(set(target.registers))]:
                 mask = np.ones(len(registers), bool) if register == ALL else registers == register
                 count = int(mask.sum())
-                missed = int((~accepted & mask).sum())
+                missed = int((mask & (missed_on > 0)).sum())
+                alone = mask & (missed_on == 1)
+                by = {n: int((alone & rejects[:, e]).sum()) for e, n in enumerate(names)}
+                by[BOTH] = int((mask & (missed_on > 1)).sum())
                 rows[register] = {
                     "trials": count,
                     "missed": missed,
                     "rate": round(missed / count, 6) if count else 0.0,
+                    "by": by,
                 }
             found[gate][form] = rows
     return found
@@ -1374,7 +1385,7 @@ def report(
 ) -> dict:
     """Return `calibration.json`'s content (Interfaces)."""
     gates: dict[str, dict] = {}
-    missed = {d.name: misses(d, summary.values) for d in trials}
+    missed = {d.name: misses(d, summary.values, names) for d in trials}
     for gate in GATES:
         found = summary.gates[gate]
         chosen = summary.values[gate]
@@ -1463,7 +1474,12 @@ def _span(interval: object) -> str:
 
 
 def summary_lines(result: Mapping[str, object]) -> list[str]:
-    """Return the printed summary: keys, values, betas, FARs, intervals and counts, no file."""
+    """Return the printed summary, naming no file.
+
+    Per gate: the values and intervals, each form's beta, FAR and counts, and every target miss
+    rate per dataset, form and register with the embedders that missed it, so a run can be
+    judged from its log alone.
+    """
     lines = []
     for dataset in result["datasets"]:  # type: ignore[attr-defined]
         for sex, row in dataset["speakers"].items():
@@ -1492,6 +1508,17 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
                     f"{row['joint_far']} at the values {_span(row['far_interval'])}; "
                     f"{row['trials']} trials, {row['pairs']} pairs"
                 )
+        for dataset, forms in entry["misses"].items():
+            for form, rows in forms.items():
+                for register, row in rows.items():
+                    by = ", ".join(
+                        f"{name} only {count}" if name != BOTH else f"{BOTH} {count}"
+                        for name, count in row["by"].items()
+                    )
+                    lines.append(
+                        f"calibrate: {gate} {dataset} {form} {register}: missed {row['missed']} "
+                        f"of {row['trials']} trials, rate {row['rate']}; by {by}"
+                    )
     return lines
 
 
