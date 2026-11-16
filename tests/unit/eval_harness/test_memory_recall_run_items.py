@@ -3,19 +3,23 @@
 The scorer's MRR reads that rank (plan v4, A26), so the block is built by hand here with the
 three shapes where rank and block position part: a list whose facts share one rank, a note
 served in two chunks, and a note ranked above the facts the block places before it.
+
+`outcome_record` adds the need gate's trace, the stage ids and, in shadow mode, the cut blocks
+to the record of the same hand-built block.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
+import json
+from dataclasses import fields, replace
 
 import pytest
 
 from backend.chat.context_budget import ApproximateTokenCounter
 from backend.memory.block import FactList, PlacedList
 from backend.memory.fact_index import IndexedFact
-from backend.memory.fetcher import FetchOutcome
+from backend.memory.fetcher import FetchCut, FetchOutcome
 from backend.memory.models import (
     Candidate,
     CandidateDisposition,
@@ -27,11 +31,17 @@ from backend.memory.models import (
     MemoryItem,
     MemoryResult,
     MemoryStage,
+    NeedTrace,
     NoteSource,
 )
 from backend.memory.ranking import FusedCandidate, ScoredCandidate
 from scripts.eval_harness.memory_recall import FIXTURE_DIR, load_probes, parse_run_record
-from scripts.eval_harness.memory_recall_run import dropped_dispositions, run_items, run_record
+from scripts.eval_harness.memory_recall_run import (
+    dropped_dispositions,
+    outcome_record,
+    run_items,
+    run_record,
+)
 
 
 def _fact(fact_key: str, object_name: str) -> IndexedFact:
@@ -311,3 +321,120 @@ def test_a_candidate_dropped_before_the_order_keeps_its_disposition_for_the_trac
         ("facet", "facet-habits"): "dropped_no_members",
         ("fact", _SWIM.fact_key): "dropped_suppressed",
     }
+
+
+# -- the record of a fetch outcome --------------------------------------------------------------
+
+_SHADOW = NeedTrace(
+    mode="shadow",
+    band="band",
+    p=0.5,
+    theta_low=0.3,
+    theta_high=0.7,
+    band_k=2,
+    need_ids=("a-need-001", "b-need-004", "a-need-010"),
+    no_need_ids=("b-no-need-002", "a-no-need-007", "a-no-need-003"),
+    context=False,
+    context_p=None,
+    degraded=None,
+)
+
+
+def _with_need(result: MemoryResult, need: NeedTrace | None) -> MemoryResult:
+    return replace(result, stage=replace(result.stage, need=need))
+
+
+def _gated_outcome(cuts: dict[int, FetchCut]) -> FetchOutcome:
+    """The hand-built block above, fetched under a shadow gate, with its stages' candidates."""
+    walk, read, tea = _scored(_WALK, 0.7), _scored(_READ, 0.6, position=2), _scored(_TEA, 0.65)
+    fused = tuple(
+        FusedCandidate(candidate=s.candidate, rrf=0.03 - n / 100, pool_rank=n)
+        for n, s in enumerate((walk, read, tea, _scored(_SWIM, 0.1)), start=1)
+    )
+    return FetchOutcome(
+        result=_with_need(_result(_ITEMS, _CANDIDATES), _SHADOW),
+        lists=(_LIST,),
+        fused=fused,
+        ranked=(walk, read, tea),
+        selected=(walk, read),
+        cuts=cuts,
+    )
+
+
+def _cut(k: int) -> FetchCut:
+    """The block cut to its first `k` entries: m1, then m2; the rest traced `dropped_band`."""
+    kept = {1: 1, 2: 2}[k]
+    candidates = tuple(
+        c if c.item is None or c.item <= kept else replace(c, disposition="dropped_band", item=None)
+        for c in _CANDIDATES
+    )
+    result = replace(_result(_ITEMS[:kept], candidates), tokens=30 * k)
+    return FetchCut(result=_with_need(result, _SHADOW), lists=(_LIST,))
+
+
+def _outcome_record(outcome: FetchOutcome) -> dict[str, object]:
+    return outcome_record(
+        load_probes(FIXTURE_DIR / "probes.jsonl")[0],
+        outcome,
+        counter=ApproximateTokenCounter(),
+        cpu_load_procs=0,
+        embedder_device="cpu",
+    )
+
+
+def test_a_record_carries_the_need_trace_and_the_stage_ids() -> None:
+    record = _outcome_record(_gated_outcome({}))
+
+    assert set(record["need"]) == {f.name for f in fields(NeedTrace)}
+    assert record["need"] == {
+        "mode": "shadow",
+        "band": "band",
+        "p": 0.5,
+        "theta_low": 0.3,
+        "theta_high": 0.7,
+        "band_k": 2,
+        "need_ids": ["a-need-001", "b-need-004", "a-need-010"],
+        "no_need_ids": ["b-no-need-002", "a-no-need-007", "a-no-need-003"],
+        "context": False,
+        "context_p": None,
+        "degraded": None,
+    }
+    assert record["stage_ids"] == {
+        "fused": ["fact:fact-walk", "fact:fact-read", "fact:fact-tea", "fact:fact-swim"],
+        "shortlisted": ["fact:fact-walk", "fact:fact-read", "fact:fact-tea"],
+        "selected": ["fact:fact-walk", "fact:fact-read"],
+    }
+    # Beside them, the record is the scorer's record of the same block.
+    plain = run_record(
+        load_probes(FIXTURE_DIR / "probes.jsonl")[0],
+        _gated_outcome({}).result,
+        [_LIST],
+        counter=ApproximateTokenCounter(),
+        cpu_load_procs=0,
+        embedder_device="cpu",
+        selected=_gated_outcome({}).selected,
+    )
+    assert {k: v for k, v in record.items() if k not in ("need", "stage_ids")} == plain
+
+
+def test_a_shadow_record_carries_each_cut_as_run_items_writes_it() -> None:
+    cuts = {1: _cut(1), 2: _cut(2)}
+    outcome = _gated_outcome(cuts)
+
+    record = _outcome_record(outcome)
+
+    assert record["cuts"] == {
+        str(k): {"items": run_items(cut.result, cut.lists, outcome.selected), "tokens": 30 * k}
+        for k, cut in cuts.items()
+    }
+    assert [item["ref"] for item in record["cuts"]["1"]["items"]] == ["m1", "m1", "m1"]
+    assert {item["ref"] for item in record["cuts"]["2"]["items"]} == {"m1", "m2"}
+    json.dumps(record)  # every value the run file holds is JSON
+
+
+def test_a_record_without_a_block_or_a_gate_has_no_cuts_and_no_need() -> None:
+    gated = _outcome_record(_gated_outcome({}))
+    ungated = _outcome_record(replace(_gated_outcome({}), result=_result(_ITEMS, _CANDIDATES)))
+
+    assert "cuts" not in gated
+    assert ungated["need"] is None and "cuts" not in ungated

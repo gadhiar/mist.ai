@@ -7,7 +7,8 @@ Lexical probes are held to the floors; paraphrase probes need a real embedder, s
 are printed only.
 
 The noise floor is a strict xfail because selection by rank injects up to `select_k` items for
-every probe, and the need gate that leaves a noise probe without a block arrives with T67.
+every probe, and the run here has no need gate to leave a noise probe without a block: the
+config pins the gate off.
 
 The type_scoped probes ask for a kind of thing ("Which devices and programs are part of my
 kit?"), and every one is tagged paraphrase. The fake reranker scores the rendered fact
@@ -49,6 +50,7 @@ _CONFIG = MemoryConfig(
     list_max_items=25,  # the fixture's lists have 16 siblings
     facets=True,
     deadline_ms=10_000,  # the floors measure ranking, not the time a shared runner takes
+    need_gate="off",  # the harness runs a gate only when given one
 )
 
 
@@ -99,7 +101,7 @@ def test_lexical_probes_reach_the_floors(reports: _Reports) -> None:
     assert overall.budget_ok == 1.0
 
 
-@pytest.mark.xfail(strict=True, reason="no need gate in the harness until T67")
+@pytest.mark.xfail(strict=True, reason="the floors run has no need gate")
 def test_lexical_noise_probes_stay_empty(reports: _Reports) -> None:
     overall = reports.lexical.overall
     assert overall.empty_on_noise is not None and overall.empty_on_noise >= 0.90
