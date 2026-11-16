@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.chat.conversation_handler import ConversationHandler
+from backend.chat.turn_scope import TurnScope
 from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
@@ -609,8 +610,12 @@ class TestPersonaInjection:
         """Persona block must be the FIRST message and role system."""
         session = conversation_handler.get_or_create_session("persona-s1")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=sample_mist_context,
+            pending_user_message="hello",
+        ).messages
         assert messages[0]["role"] == "system"
         assert "You are MIST" in messages[0]["content"]
         assert "she/her" in messages[0]["content"]
@@ -619,8 +624,12 @@ class TestPersonaInjection:
         """Absolute preferences render as HARD RULES in the persona block."""
         session = conversation_handler.get_or_create_session("persona-s2")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=sample_mist_context,
+            pending_user_message="hello",
+        ).messages
         combined_system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         assert "HARD RULE" in combined_system
         assert "No emoji or unicode decoration" in combined_system
@@ -628,8 +637,12 @@ class TestPersonaInjection:
     def test_persona_block_contains_traits(self, conversation_handler, sample_mist_context):
         session = conversation_handler.get_or_create_session("persona-s3")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=sample_mist_context,
+            pending_user_message="hello",
+        ).messages
         combined_system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         assert "Warm" in combined_system
 
@@ -637,8 +650,12 @@ class TestPersonaInjection:
         """When mist_context=None, the old hardcoded 'You are MIST' template is preserved."""
         session = conversation_handler.get_or_create_session("persona-s4")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=None
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=None,
+            pending_user_message="hello",
+        ).messages
         # The fallback system prompt still has the static header line.
         assert messages[0]["role"] == "system"
         assert "MIST" in messages[0]["content"]
@@ -646,10 +663,17 @@ class TestPersonaInjection:
     def test_persona_block_appears_before_retrieval_context(
         self, conversation_handler, sample_mist_context
     ):
-        """Ordering: persona -> static template -> retrieval context -> history."""
+        """Ordering: persona -> static template -> history -> retrieval in the final user message.
+
+        Retrieval varies every turn, so it sits after the history, in the
+        final user message ahead of the user's words, where it cannot break
+        the cached prefix of the next turn's prompt.
+        """
         from backend.knowledge.models import RetrievalResult
 
         session = conversation_handler.get_or_create_session("persona-s5")
+        session.add_message("user", "an earlier question")
+        session.add_message("assistant", "an earlier answer")
         # Construct a minimal RetrievalResult with one fact so it injects.
         # Use sentinels on formatted_context to locate it.
         retrieval = RetrievalResult(
@@ -666,12 +690,20 @@ class TestPersonaInjection:
             intent="relational",
         )
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=retrieval, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=retrieval,
+            mist_context=sample_mist_context,
+            pending_user_message="what did we decide",
+        ).messages
         combined = "\n".join(m["content"] for m in messages)
         persona_idx = combined.index("You are MIST")
+        history_idx = combined.index("an earlier answer")
         retrieval_idx = combined.index("RETRIEVED_CONTEXT_SENTINEL")
-        assert persona_idx < retrieval_idx
+        assert persona_idx < history_idx < retrieval_idx
+        assert messages[-1]["role"] == "user"
+        assert "RETRIEVED_CONTEXT_SENTINEL" in messages[-1]["content"]
+        assert messages[-1]["content"].endswith("what did we decide")
 
 
 class TestMistContextCaching:
@@ -1077,13 +1109,15 @@ class TestBudgetAwareBuildMessages:
         # Wave 2 tool catalog additions: tool_call observability, cards,
         # query_vault, switch_form), leaves ~930 for retrieval+history.
         # 50 history messages * ~36 tokens each (user + assistant pair * msg
-        # body) -> well above 930 -> forces pruning.
+        # body) -> well above 930 -> forces pruning. The turn-delta reserve is
+        # kept small so most of the ~930 goes to history.
         config.context_budget = ContextBudgetConfig(
             context_window=3000,
             output_reserve_tokens=50,
             safety_margin_tokens=10,
             retrieval_budget_ratio=0.3,
             enabled=True,
+            turn_delta_max_tokens=100,
         )
         return ConversationHandler(
             config=config,
@@ -1110,15 +1144,17 @@ class TestBudgetAwareBuildMessages:
             retrieval_result=None,
             mist_context=None,
             max_output_tokens=50,
-        )
+            pending_user_message="the newest question",
+        ).messages
 
         # System prompt(s) still present.
         assert any(m["role"] == "system" for m in messages)
         # History (non-system messages) must be < 100 after pruning.
         history_msgs = [m for m in messages if m["role"] != "system"]
         assert len(history_msgs) < 100
-        # Last history message must be the most recent.
-        assert history_msgs[-1]["content"].startswith("reply 49")
+        # The prompt ends with the user's message, after the most recent reply.
+        assert history_msgs[-1]["content"] == "the newest question"
+        assert history_msgs[-2]["content"].startswith("reply 49")
 
     def test_disabled_budget_preserves_legacy_behavior(self):
         """When context_budget.enabled=False the handler skips pruning entirely."""
@@ -1154,7 +1190,8 @@ class TestBudgetAwareBuildMessages:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="the newest question",
+        ).messages
         # All 5 history messages present (no pruning). Count by content so the
         # assertion is robust to always-present prefix blocks injected as
         # non-system messages (vault conventions / the curated user-profile
@@ -1169,7 +1206,7 @@ class TestToolCallObservability:
     """ADR-017 Wave 2: tool_call_started / tool_call_completed event emission.
 
     The dispatch wrap (_dispatch_tool_with_observability) buffers WS events
-    into self._turn_ws_events. handle_message_streaming drains the buffer
+    on the turn's TurnScope. handle_message_streaming drains the buffer
     into WSEvent yields. These tests exercise the wrap directly for tight
     isolation and ordering guarantees.
     """
@@ -1199,16 +1236,17 @@ class TestToolCallObservability:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         captured_at_dispatch: list[dict] = []
 
-        async def patched_dispatch(tc):
-            captured_at_dispatch.extend(handler._turn_ws_events)
+        async def patched_dispatch(dispatch_scope, tc):
+            captured_at_dispatch.extend(dispatch_scope.ws_events)
             return "test result"
 
         handler._dispatch_tool = patched_dispatch
         tc = LLMToolCall(id="oai-1", name="query_knowledge_graph", arguments={"query": "test"})
 
-        await handler._dispatch_tool_with_observability(tc)
+        await handler._dispatch_tool_with_observability(scope, tc)
 
         assert (
             len(captured_at_dispatch) == 1
@@ -1226,18 +1264,19 @@ class TestToolCallObservability:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
 
-        async def patched_dispatch(tc):
+        async def patched_dispatch(scope, tc):
             return "results retrieved"
 
         handler._dispatch_tool = patched_dispatch
         tc = LLMToolCall(id="oai-2", name="query_knowledge_graph", arguments={"query": "x"})
 
-        result = await handler._dispatch_tool_with_observability(tc)
+        result = await handler._dispatch_tool_with_observability(scope, tc)
 
         assert result == "results retrieved"
-        assert len(handler._turn_ws_events) == 2
-        completed = handler._turn_ws_events[1]
+        assert len(scope.ws_events) == 2
+        completed = scope.ws_events[1]
         assert completed["type"] == "tool_call_completed"
         assert completed["error"] is None
         assert isinstance(completed["duration_ms"], int)
@@ -1254,18 +1293,19 @@ class TestToolCallObservability:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
 
-        async def patched_dispatch(tc):
+        async def patched_dispatch(scope, tc):
             raise ValueError("simulated tool failure")
 
         handler._dispatch_tool = patched_dispatch
         tc = LLMToolCall(id="oai-3", name="query_knowledge_graph", arguments={"query": "x"})
 
-        result = await handler._dispatch_tool_with_observability(tc)
+        result = await handler._dispatch_tool_with_observability(scope, tc)
 
         assert result.startswith("Tool error:")
         assert "simulated tool failure" in result
-        completed = handler._turn_ws_events[1]
+        completed = scope.ws_events[1]
         assert completed["type"] == "tool_call_completed"
         assert completed["error"] is not None
         assert "simulated tool failure" in completed["error"]
@@ -1278,16 +1318,17 @@ class TestToolCallObservability:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
 
-        async def patched_dispatch(tc):
+        async def patched_dispatch(scope, tc):
             return "ok"
 
         handler._dispatch_tool = patched_dispatch
         tc = LLMToolCall(id="oai-4", name="query_knowledge_graph", arguments={"query": "x"})
 
-        await handler._dispatch_tool_with_observability(tc)
+        await handler._dispatch_tool_with_observability(scope, tc)
 
-        started, completed = handler._turn_ws_events
+        started, completed = scope.ws_events
         assert started["tool_call_id"] == completed["tool_call_id"]
         # Deep review febe-observability-8: the FE-visible id PROPAGATES the
         # provider-assigned tool_call id so FE events, message history, and
@@ -1322,13 +1363,14 @@ class TestToolCallObservability:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         tc = LLMToolCall(id="oai-nf", name="bogus.tool", arguments={})
 
-        result = await handler._dispatch_tool_with_observability(tc)
+        result = await handler._dispatch_tool_with_observability(scope, tc)
 
         assert result.startswith("Tool not found:")
         assert "bogus.tool" in result
-        events = handler._turn_ws_events
+        events = scope.ws_events
         assert len(events) == 2
         assert events[0]["type"] == "tool_call_started"
         completed = events[1]
@@ -1346,16 +1388,17 @@ class TestToolCallObservability:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
 
-        async def patched_dispatch(tc):
+        async def patched_dispatch(scope, tc):
             raise ValueError("simulated failure")
 
         handler._dispatch_tool = patched_dispatch
         tc = LLMToolCall(id="oai-san", name="query_knowledge_graph", arguments={"query": "x"})
 
-        await handler._dispatch_tool_with_observability(tc)
+        await handler._dispatch_tool_with_observability(scope, tc)
 
-        completed = handler._turn_ws_events[1]
+        completed = scope.ws_events[1]
         assert completed["error"] == "ValueError: simulated failure"
         assert "(" not in completed["error"]
         assert "'" not in completed["error"]
@@ -1365,7 +1408,7 @@ class TestToolCallObservability:
         """handle_message_streaming yields WSEvent for each tool dispatch
         as it happens (T3/v2: inline drain right after
         `_dispatch_tool_with_observability`, not batched at end of turn),
-        and clears the buffer once the turn completes.
+        and leaves the turn's scope buffer empty once the turn completes.
         """
         from backend.chat.stream_events import WSEvent
         from backend.llm.models import ToolCall as LLMToolCall
@@ -1398,7 +1441,10 @@ class TestToolCallObservability:
 
         # Stub the raw dispatch so this test isolates the WSEvent drain
         # timing from the real query_knowledge_graph tool's behavior.
-        async def stub_dispatch(tc):
+        dispatched_scopes: list[TurnScope] = []
+
+        async def stub_dispatch(scope, tc):
+            dispatched_scopes.append(scope)
             return "test result"
 
         handler._dispatch_tool = stub_dispatch
@@ -1417,8 +1463,10 @@ class TestToolCallObservability:
         # WS events must appear BEFORE the pass-2 Token stream (FE sees
         # observability before / alongside the response prose).
         assert "".join(emitted_tokens).strip() == "hello there."
-        # Buffer cleared after drain.
-        assert handler._turn_ws_events == []
+        # The turn's scope buffer is empty after the drain.
+        (scope,) = dispatched_scopes
+        assert scope.session_id == "s1"
+        assert scope.ws_events == []
 
 
 class TestFrontendSummonCards:
@@ -1458,7 +1506,9 @@ class TestFrontendSummonCards:
         'lines' for any input card missing the field).
         """
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         result = await handler._handle_summon_cards(
+            scope,
             header="Choices",
             cards=[
                 {"id": "c1", "label": "Alpha"},
@@ -1467,8 +1517,8 @@ class TestFrontendSummonCards:
         )
 
         assert "Displayed 2 cards" in result
-        assert len(handler._turn_ws_events) == 1
-        event = handler._turn_ws_events[0]
+        assert len(scope.ws_events) == 1
+        event = scope.ws_events[0]
         assert event["type"] == "cards_summon"
         assert event["panel"]["header"] == "Choices"
         assert len(event["panel"]["cards"]) == 2
@@ -1480,7 +1530,9 @@ class TestFrontendSummonCards:
     async def test_summon_cards_returns_summary_string(self):
         """Returns a short non-empty string to the LLM for the final pass."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         result = await handler._handle_summon_cards(
+            scope,
             header="Test",
             cards=[{"id": "x", "label": "X"}],
         )
@@ -1492,20 +1544,23 @@ class TestFrontendSummonCards:
     async def test_summon_cards_validates_pattern_enum(self):
         """Invalid pattern raises ValueError; no WS event emitted."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="invalid card.pattern"):
             await handler._handle_summon_cards(
+                scope,
                 header="Test",
                 cards=[{"id": "c1", "label": "X", "pattern": "rainbow"}],
             )
-        assert handler._turn_ws_events == []
+        assert scope.ws_events == []
 
     @pytest.mark.asyncio
     async def test_dismiss_cards_emits_event(self):
         """frontend.dismiss_cards appends cards_dismiss (empty payload)."""
         handler = self._build_handler()
-        result = await handler._handle_dismiss_cards()
+        scope = TurnScope(session_id="s1", turn_index=1)
+        result = await handler._handle_dismiss_cards(scope)
         assert result == "Dismissed cards panel"
-        assert handler._turn_ws_events == [{"type": "cards_dismiss"}]
+        assert scope.ws_events == [{"type": "cards_dismiss"}]
 
     @pytest.mark.asyncio
     async def test_summon_cards_dispatch_with_observability_full_event_chain(self):
@@ -1515,6 +1570,7 @@ class TestFrontendSummonCards:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         tc = LLMToolCall(
             id="oai-cards-1",
             name="frontend.summon_cards",
@@ -1524,14 +1580,14 @@ class TestFrontendSummonCards:
             },
         )
 
-        result = await handler._dispatch_tool_with_observability(tc)
+        result = await handler._dispatch_tool_with_observability(scope, tc)
 
         assert "Displayed 2 cards" in result
-        event_types = [e["type"] for e in handler._turn_ws_events]
+        event_types = [e["type"] for e in scope.ws_events]
         assert event_types == ["tool_call_started", "cards_summon", "tool_call_completed"]
         # tool_call_started/completed share a tool_call_id distinct from tc.id.
-        started = handler._turn_ws_events[0]
-        completed = handler._turn_ws_events[2]
+        started = scope.ws_events[0]
+        completed = scope.ws_events[2]
         assert started["tool_call_id"] == completed["tool_call_id"]
         assert started["name"] == "frontend.summon_cards"
 
@@ -1539,9 +1595,10 @@ class TestFrontendSummonCards:
     async def test_summon_cards_requires_non_empty_list(self):
         """Empty cards list rejected by the handler."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="non-empty"):
-            await handler._handle_summon_cards(header="X", cards=[])
-        assert handler._turn_ws_events == []
+            await handler._handle_summon_cards(scope, header="X", cards=[])
+        assert scope.ws_events == []
 
 
 class TestGraphSubgraphEmit:
@@ -1609,7 +1666,7 @@ class TestGraphSubgraphEmit:
         the event is a dict matching the ADR-017 shape.
         """
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = [
             self._make_fact(obj="Python", obj_type="Technology", similarity=0.95),
             self._make_fact(obj="Neo4j", obj_type="Technology", similarity=0.88),
@@ -1621,13 +1678,13 @@ class TestGraphSubgraphEmit:
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_knowledge_graph(query="what do I use")
+        result = await handler._handle_query_knowledge_graph(scope, query="what do I use")
 
         # Tool returned the formatted context, not the placeholder
         assert "No information found" not in result
 
         # Buffer should have exactly one graph_subgraph event
-        graph_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        graph_events = [e for e in scope.ws_events if e["type"] == "graph_subgraph"]
         assert len(graph_events) == 1
         event = graph_events[0]
         assert event["focal"]["label"] == "User"
@@ -1645,16 +1702,16 @@ class TestGraphSubgraphEmit:
     async def test_skips_emit_on_empty_hits(self):
         """Retriever returns 0 facts -> no graph_subgraph event."""
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
 
         async def stub_retrieve(**kwargs):
             return self._make_result([], query="x")
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_knowledge_graph(query="unknown thing")
+        result = await handler._handle_query_knowledge_graph(scope, query="unknown thing")
         assert "No information found" in result
-        graph_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        graph_events = [e for e in scope.ws_events if e["type"] == "graph_subgraph"]
         assert graph_events == []
 
     def test_neighbors_on_unit_circle(self):
@@ -1788,7 +1845,7 @@ class TestQueryKnowledgeGraphCompactLLMContext:
     async def test_default_compact_returns_focal_and_neighbors_only(self):
         """Default verbosity (omitted) returns the compact format."""
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = self._make_facts(count=3)
 
         async def stub_retrieve(**kwargs):
@@ -1796,7 +1853,7 @@ class TestQueryKnowledgeGraphCompactLLMContext:
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_knowledge_graph(query="what do I use")
+        result = await handler._handle_query_knowledge_graph(scope, query="what do I use")
 
         assert result.startswith("Focal: User (Person)")
         assert "Related (3): Python, Neo4j, FastAPI" in result
@@ -1810,7 +1867,7 @@ class TestQueryKnowledgeGraphCompactLLMContext:
         graph_subgraph for the FE.
         """
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = self._make_facts(count=7)
 
         async def stub_retrieve(**kwargs):
@@ -1818,7 +1875,7 @@ class TestQueryKnowledgeGraphCompactLLMContext:
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_knowledge_graph(query="x")
+        result = await handler._handle_query_knowledge_graph(scope, query="x")
         assert "Related (6)" in result
         # 7th name must not appear in the LLM result.
         assert "PyTorch" not in result
@@ -1827,7 +1884,7 @@ class TestQueryKnowledgeGraphCompactLLMContext:
     async def test_full_verbosity_returns_formatted_context(self):
         """verbosity='full' returns the legacy verbose formatted_context."""
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = self._make_facts(count=2)
 
         async def stub_retrieve(**kwargs):
@@ -1835,15 +1892,16 @@ class TestQueryKnowledgeGraphCompactLLMContext:
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_knowledge_graph(query="x", verbosity="full")
+        result = await handler._handle_query_knowledge_graph(scope, query="x", verbosity="full")
         assert "FULL LEGACY FORMATTED CONTEXT" in result
         assert "Focal:" not in result
 
     @pytest.mark.asyncio
     async def test_invalid_verbosity_raises(self):
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="invalid verbosity"):
-            await handler._handle_query_knowledge_graph(query="x", verbosity="overview")
+            await handler._handle_query_knowledge_graph(scope, query="x", verbosity="overview")
 
     @pytest.mark.asyncio
     async def test_graph_subgraph_emit_unchanged_by_verbosity(self):
@@ -1851,7 +1909,7 @@ class TestQueryKnowledgeGraphCompactLLMContext:
         event to the FE. Only the LLM-facing result differs.
         """
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = self._make_facts(count=3)
 
         async def stub_retrieve(**kwargs):
@@ -1859,13 +1917,13 @@ class TestQueryKnowledgeGraphCompactLLMContext:
 
         handler.retriever.retrieve = stub_retrieve
 
-        await handler._handle_query_knowledge_graph(query="x", verbosity="compact")
-        compact_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        await handler._handle_query_knowledge_graph(scope, query="x", verbosity="compact")
+        compact_events = [e for e in scope.ws_events if e["type"] == "graph_subgraph"]
         assert len(compact_events) == 1
 
-        handler._turn_ws_events = []
-        await handler._handle_query_knowledge_graph(query="x", verbosity="full")
-        full_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        scope.ws_events = []
+        await handler._handle_query_knowledge_graph(scope, query="x", verbosity="full")
+        full_events = [e for e in scope.ws_events if e["type"] == "graph_subgraph"]
         assert len(full_events) == 1
 
         # Same shape -- focal, neighbors, edges, distant identical.
@@ -1876,15 +1934,17 @@ class TestQueryKnowledgeGraphCompactLLMContext:
     async def test_zero_facts_short_circuit_unchanged(self):
         """Zero results -> 'No information found' regardless of verbosity."""
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
 
         async def stub_retrieve(**kwargs):
             return self._make_result([])
 
         handler.retriever.retrieve = stub_retrieve
 
-        result_compact = await handler._handle_query_knowledge_graph(query="x")
-        result_full = await handler._handle_query_knowledge_graph(query="x", verbosity="full")
+        result_compact = await handler._handle_query_knowledge_graph(scope, query="x")
+        result_full = await handler._handle_query_knowledge_graph(
+            scope, query="x", verbosity="full"
+        )
         assert "No information found" in result_compact
         assert "No information found" in result_full
 
@@ -1966,6 +2026,7 @@ class TestQueryVault:
     async def test_returns_formatted_context_on_hits(self):
         """Tool returns the retriever's formatted_context on N>0 vault facts."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = [self._make_vault_fact()]
 
         async def stub_retrieve(**kwargs):
@@ -1974,13 +2035,14 @@ class TestQueryVault:
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_vault(query="backend")
+        result = await handler._handle_query_vault(scope, query="backend")
         assert result == "prose context for the LLM"
 
     @pytest.mark.asyncio
     async def test_emits_vault_results_event(self):
         """On hits, vault_results event lands in the per-turn buffer."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = [
             # Vector hit: distance-derived score carried, emitted as the displayed score.
             self._make_vault_fact(
@@ -2007,9 +2069,9 @@ class TestQueryVault:
 
         handler.retriever.retrieve = stub_retrieve
 
-        await handler._handle_query_vault(query="backend", limit=5, display_hint="panel")
+        await handler._handle_query_vault(scope, query="backend", limit=5, display_hint="panel")
 
-        events = [e for e in handler._turn_ws_events if e["type"] == "vault_results"]
+        events = [e for e in scope.ws_events if e["type"] == "vault_results"]
         assert len(events) == 1
         event = events[0]
         assert event["query"] == "backend"
@@ -2040,42 +2102,46 @@ class TestQueryVault:
     async def test_skips_emit_on_zero_hits(self):
         """0 vault facts -> no vault_results emit + descriptive tool result."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
 
         async def stub_retrieve(**kwargs):
             return self._make_result([])
 
         handler.retriever.retrieve = stub_retrieve
 
-        result = await handler._handle_query_vault(query="unknown thing")
+        result = await handler._handle_query_vault(scope, query="unknown thing")
         assert "No vault content" in result
-        events = [e for e in handler._turn_ws_events if e["type"] == "vault_results"]
+        events = [e for e in scope.ws_events if e["type"] == "vault_results"]
         assert events == []
 
     @pytest.mark.asyncio
     async def test_validates_display_hint_enum(self):
         """Invalid display_hint raises ValueError; no event emitted."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="invalid display_hint"):
-            await handler._handle_query_vault(query="x", display_hint="carousel")
-        assert handler._turn_ws_events == []
+            await handler._handle_query_vault(scope, query="x", display_hint="carousel")
+        assert scope.ws_events == []
 
     @pytest.mark.asyncio
     async def test_validates_query_not_empty(self):
         """Empty / whitespace query rejected."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="non-empty"):
-            await handler._handle_query_vault(query="")
+            await handler._handle_query_vault(scope, query="")
         with pytest.raises(ValueError, match="non-empty"):
-            await handler._handle_query_vault(query="   ")
+            await handler._handle_query_vault(scope, query="   ")
 
     @pytest.mark.asyncio
     async def test_validates_limit_bounds(self):
         """Limit must be 1-10."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="between 1 and 10"):
-            await handler._handle_query_vault(query="x", limit=0)
+            await handler._handle_query_vault(scope, query="x", limit=0)
         with pytest.raises(ValueError, match="between 1 and 10"):
-            await handler._handle_query_vault(query="x", limit=11)
+            await handler._handle_query_vault(scope, query="x", limit=11)
 
     def test_tool_registered_in_schema(self):
         """query_vault appears in the handler's tool_schemas catalog."""
@@ -2130,11 +2196,12 @@ class TestFrontendSwitchForm:
     async def test_emits_form_switch_event(self):
         """Tool appends form_switch with the canonical ADR-017 shape."""
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         result = await handler._handle_switch_form(
-            form="graph", reason="rendering knowledge graph results"
+            scope, form="graph", reason="rendering knowledge graph results"
         )
         assert "Switched" in result
-        assert handler._turn_ws_events == [
+        assert scope.ws_events == [
             {
                 "type": "form_switch",
                 "form": "graph",
@@ -2145,17 +2212,19 @@ class TestFrontendSwitchForm:
     @pytest.mark.asyncio
     async def test_validates_form_enum(self):
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="invalid form"):
-            await handler._handle_switch_form(form="invalid", reason="any")
-        assert handler._turn_ws_events == []
+            await handler._handle_switch_form(scope, form="invalid", reason="any")
+        assert scope.ws_events == []
 
     @pytest.mark.asyncio
     async def test_validates_reason_required(self):
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         with pytest.raises(ValueError, match="non-empty"):
-            await handler._handle_switch_form(form="graph", reason="")
+            await handler._handle_switch_form(scope, form="graph", reason="")
         with pytest.raises(ValueError, match="non-empty"):
-            await handler._handle_switch_form(form="graph", reason="   ")
+            await handler._handle_switch_form(scope, form="graph", reason="   ")
 
     @pytest.mark.asyncio
     async def test_query_knowledge_graph_does_not_auto_switch_form(self):
@@ -2165,7 +2234,7 @@ class TestFrontendSwitchForm:
         from backend.knowledge.models import RetrievalResult, RetrievedFact
 
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
         facts = [
             RetrievedFact(
                 subject="User",
@@ -2195,9 +2264,9 @@ class TestFrontendSwitchForm:
             return result
 
         handler.retriever.retrieve = stub_retrieve
-        await handler._handle_query_knowledge_graph(query="what do I use")
+        await handler._handle_query_knowledge_graph(scope, query="what do I use")
 
-        form_switches = [e for e in handler._turn_ws_events if e["type"] == "form_switch"]
+        form_switches = [e for e in scope.ws_events if e["type"] == "form_switch"]
         assert form_switches == [], "query_knowledge_graph must not auto-emit form_switch"
 
     @pytest.mark.asyncio
@@ -2208,13 +2277,14 @@ class TestFrontendSwitchForm:
         from backend.llm.models import ToolCall as LLMToolCall
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         tc = LLMToolCall(
             id="oai-fs-1",
             name="frontend.switch_form",
             arguments={"form": "graph", "reason": "showing graph data"},
         )
-        await handler._dispatch_tool_with_observability(tc)
-        event_types = [e["type"] for e in handler._turn_ws_events]
+        await handler._dispatch_tool_with_observability(scope, tc)
+        event_types = [e["type"] for e in scope.ws_events]
         assert event_types == ["tool_call_started", "form_switch", "tool_call_completed"]
 
 
@@ -2469,9 +2539,9 @@ class TestQueryToolsUseStoredUserEntityId:
     @pytest.mark.asyncio
     async def test_query_knowledge_graph_queries_user_relationships_with_stored_id(self):
         handler = self._build_handler()
-        handler._current_session_id = "s1"
+        scope = TurnScope(session_id="s1", turn_index=1)
 
-        await handler._handle_query_knowledge_graph(query="what do I use")
+        await handler._handle_query_knowledge_graph(scope, query="what do I use")
 
         assert len(self.user_rel_calls) == 1
         assert self.user_rel_calls[0]["user_id"] == "user"
@@ -2482,6 +2552,7 @@ class TestQueryToolsUseStoredUserEntityId:
         from backend.knowledge.storage.partitions import USER_ENTITY_ID
 
         handler = self._build_handler()
+        scope = TurnScope(session_id="s1", turn_index=1)
         captured: dict = {}
 
         async def stub_retrieve(**kwargs):
@@ -2501,6 +2572,6 @@ class TestQueryToolsUseStoredUserEntityId:
 
         handler.retriever.retrieve = stub_retrieve
 
-        await handler._handle_query_vault(query="backend architecture")
+        await handler._handle_query_vault(scope, query="backend architecture")
 
         assert captured["user_id"] == USER_ENTITY_ID

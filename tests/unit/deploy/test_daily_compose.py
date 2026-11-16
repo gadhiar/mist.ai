@@ -41,6 +41,16 @@ STORE_PATH_LITERALS = {
     "MIST_VAULT_ROOT": "/app/mist-memory",
     "MIST_SIDECAR_DB_PATH": "/app/data/vault_sidecar.db",
 }
+# The backend's own capability paths. Not in STORE_PATH_LITERALS: mist-backup reads the store
+# through LIVE_STORE_FILENAMES under /app/data, and must never see the token files.
+# `MIST_HA_TOKEN` is pinned empty so a token pasted into daily.env is ignored: the file under
+# `<root>/secrets/` is the token's one source.
+CAPABILITY_LITERALS = {
+    "MIST_CAPABILITIES_DB_PATH": "/app/data/capabilities.db",
+    "MIST_HA_TOKEN": "",
+    "MIST_HA_TOKEN_FILE": "/app/secrets/ha_token",
+    "MIST_SPOTIFY_TOKEN_PATH": "/app/secrets/spotify_token.json",
+}
 BACKEND_LITERALS = {
     "NEO4J_URI": "bolt://mist-neo4j:7687",
     "LLM_SERVER_URL": "http://mist-llm:8080",
@@ -52,7 +62,9 @@ BACKEND_LITERALS = {
     "MIST_LOG_DIR": "/app/logs",
     "MIST_OPS_DIR": "/app/ops",
     "MIST_BACKUP_STATUS_PATH": "/app/ops/backup-status.json",
+    **CAPABILITY_LITERALS,
 }
+SECRETS_SOURCE = "${MIST_DAILY_ROOT}/secrets"
 BACKUP_ENVIRONMENT = {
     "NEO4J_URI": "bolt://mist-neo4j:7687",
     "MIST_BACKUP_ROOT": "/backup",
@@ -72,13 +84,25 @@ MEM_LIMITS = {
 }
 LOGGING = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}}
 
+# The capability rows of `daily.env.example`: commented out, so capabilities stay off until the
+# operator sets them. `MIST_TIMEZONE` also dates the use counts and the uptime ledger.
+CAPABILITY_EXAMPLE_VARIABLES = (
+    "MIST_CAPABILITIES_ENABLED",
+    "MIST_CAPABILITIES",
+    "MIST_TIMEZONE",
+    "MIST_HA_MCP_URL",
+    "MIST_LIGHTS_DEFAULT_TARGET",
+    "MIST_SPOTIFY_CLIENT_ID",
+    "MIST_SPOTIFY_DEVICE",
+    "MIST_RING_FALLBACK_AFTER_S",
+)
 # Read by the backend from `daily.env` or by `instance.py`, not interpolated by compose.
 EXAMPLE_EXTRA_VARIABLES = (
     "MIST_EXTRACTION_INFERENCE",
     "MIST_EXTRACTION_SERVICE_URL",
-    "MIST_TIMEZONE",
     "MIST_INSTANCE_NAME",
     "MODEL",
+    *CAPABILITY_EXAMPLE_VARIABLES,
 )
 REHEARSAL_PORT_VARIABLES = (
     "MIST_DAILY_WS_PORT",
@@ -245,9 +269,34 @@ class TestMounts:
             ("${MIST_DAILY_ROOT}/logs", "/app/logs", "rw"),
             ("${MIST_DAILY_ROOT}/mist-memory", "/app/mist-memory", "rw"),
             ("${MIST_DAILY_ROOT}/ops", "/app/ops", "ro"),
+            (SECRETS_SOURCE, "/app/secrets", "rw"),
             ("mist-hf-cache", "/home/appuser/.cache/huggingface", "rw"),
             ("mist-torch-cache", "/home/appuser/.cache/torch", "rw"),
         ]
+
+    def test_no_other_service_mounts_the_secrets(self, compose):
+        # The tokens stay out of every backup because mist-backup cannot see them. A mount of
+        # the whole root would expose `secrets/` too.
+        exposing = {SECRETS_SOURCE, "${MIST_DAILY_ROOT}", "${MIST_DAILY_ROOT}/"}
+        offenders = [
+            (name, source, target)
+            for name, service in compose["services"].items()
+            if name != BACKEND
+            for source, target, _mode in _mounts(service)
+            if source.startswith(SECRETS_SOURCE)
+            or source in exposing
+            or target.startswith("/app/secrets")
+        ]
+        assert not offenders
+
+    def test_the_capability_paths_lie_under_the_backend_mounts(self, compose):
+        environment = _environment(compose["services"][BACKEND])
+        assert environment["MIST_CAPABILITIES_DB_PATH"].startswith(
+            _mount_at(compose["services"][BACKEND], "/app/data")[1] + "/"
+        )
+        secrets_target = _mount_at(compose["services"][BACKEND], "/app/secrets")[1]
+        for key in ("MIST_HA_TOKEN_FILE", "MIST_SPOTIFY_TOKEN_PATH"):
+            assert environment[key].startswith(secrets_target + "/"), key
 
     def test_ops_is_read_only_in_the_backend(self, compose):
         assert _mount_at(compose["services"][BACKEND], "/app/ops")[2] == "ro"
@@ -453,6 +502,22 @@ class TestEnvExample:
         names = [name for _commented, name, _value in _example_assignments()]
         assert len(names) == len(set(names))
 
+    def test_extra_variables_name_each_variable_once(self):
+        assert len(EXAMPLE_EXTRA_VARIABLES) == len(set(EXAMPLE_EXTRA_VARIABLES))
+
+    def test_capability_variables_are_commented_out_placeholders(self):
+        by_name = {name: (commented, value) for commented, name, value in _example_assignments()}
+
+        for name in CAPABILITY_EXAMPLE_VARIABLES:
+            commented, value = by_name[name]
+            assert commented is True, f"{name} must be commented out"
+            assert PLACEHOLDER.match(value), f"{name}={value}"
+
+    def test_does_not_offer_the_capability_literals(self):
+        # Compose sets these four itself; a daily.env line for one would be ignored.
+        named = {name for _commented, name, _value in _example_assignments()}
+        assert named & set(CAPABILITY_LITERALS) == set()
+
     def test_every_value_is_a_placeholder_or_the_compose_default(self):
         defaults = dict(DEFAULT_INTERPOLATION.findall(_compose_text()))
 
@@ -509,3 +574,46 @@ class TestReadme:
     )
     def test_covers(self, phrase):
         assert phrase in README_PATH.read_text(encoding="utf-8")
+
+    def test_instance_root_layout_lists_the_secrets_directory(self):
+        layout = _readme_section("Instance root layout")
+        entries = [
+            line.split()[0]
+            for line in layout.splitlines()
+            if line.startswith("  ") and line.strip()
+        ]
+        assert "secrets/" in entries
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            pytest.param("`<root>/secrets/`", id="secrets-folder"),
+            pytest.param("`ha_token`", id="ha-token-file"),
+            pytest.param("`spotify_token.json`", id="spotify-token-file"),
+            pytest.param("python -m backend.capabilities.music.authorize", id="spotify-auth"),
+            pytest.param("not backed up", id="secrets-not-backed-up"),
+            pytest.param("`up`", id="activation-up"),
+            pytest.param("`switch", id="activation-switch"),
+            pytest.param("gaming mode", id="off-level"),
+            pytest.param("`MIST_CAPABILITIES_ENABLED=false`", id="behaviour-rollback"),
+            pytest.param("`capabilities.db`", id="store"),
+            pytest.param("`backup_suspect`", id="data-rollback-suspect"),
+            pytest.param("scripts/backup/scheduler.py", id="data-rollback-rule"),
+            pytest.param("`accept-backup-baseline --label <label>`", id="data-rollback-baseline"),
+        ],
+    )
+    def test_capabilities_section_covers(self, phrase):
+        text = " ".join(_readme_section("Capabilities").split())
+        assert phrase in text
+
+    def test_capabilities_section_names_every_capability_variable(self):
+        text = _readme_section("Capabilities")
+        missing = [name for name in CAPABILITY_EXAMPLE_VARIABLES if f"`{name}`" not in text]
+        assert not missing
+
+
+def _readme_section(title: str) -> str:
+    text = README_PATH.read_text(encoding="utf-8")
+    match = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    assert match is not None, f"README.md has no '## {title}' section"
+    return match.group(1)

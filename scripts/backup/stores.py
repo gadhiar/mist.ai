@@ -4,7 +4,9 @@ THE STORE SET IS ENUMERATED ON PURPOSE. `scripts/hydration/snapshot.py` globs
 instead (`grep -n 'dev_root.glob' scripts/hydration/snapshot.py` -> :519), and
 that is correct only because `dev-state/` is a directory the hydration tool
 creates and owns. The LIVE `./data` is not clean. Listed on the live deployment
-it holds five `.db` files: the three named below, plus
+when this list was written, it held five `.db` files: `event_store.db`,
+`extraction_cache.db` and `vault_sidecar.db` (the whole set until
+`capabilities.db` was added to it later), plus
 `event_store.pre-r1.4-backup-2026-07-31.db` (212992 bytes) and
 `event_store.pre-reset-backup-2026-06-09.db` (14331904 bytes). A glob sweeps
 both into every backup: the artifact doubles in size, and it gains a second,
@@ -41,12 +43,16 @@ from .errors import BackupError
 # is missing ("no such module: vec0") instead of quoting the whole error.
 _NO_SUCH_MODULE = re.compile(r"no such module: (\S+)")
 
-# The three stores that hold state which cannot be rebuilt from anything else.
-# Enumerated, never discovered -- see the module docstring.
+# The four stores that hold state which cannot be rebuilt from anything else.
+# Enumerated, never discovered -- see the module docstring. `capabilities.db`
+# holds alarms, timers, their events and the capability action log. The token
+# files the capabilities use live in `<root>/secrets/`, outside the state root,
+# and are never captured.
 LIVE_STORE_FILENAMES: tuple[str, ...] = (
     "event_store.db",
     "extraction_cache.db",
     "vault_sidecar.db",
+    "capabilities.db",
 )
 
 # Subdirectory of the artifact the stores are written into.

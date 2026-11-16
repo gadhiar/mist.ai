@@ -1,0 +1,15 @@
+# /opt/venv-teacher-omnivoice: OmniVoice from PyPI (H2 pins; gradio 6 since H3). huggingface-hub
+# is left to pip: transformers 5.19.0 needs >=1.31.0,<3.0 and gradio 6.32.0 >=1.16.0,<3.0.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+omnivoice==0.2.1
+transformers==5.19.0
+accelerate==1.8.1
+gradio==6.32.0
+librosa==0.11.0
+numpy==2.2.6
+pydub==0.25.1
+soundfile==0.13.1
+tensorboardx==2.6.5
+webdataset==1.0.2

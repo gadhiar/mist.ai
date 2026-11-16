@@ -13,8 +13,11 @@ utterances, paths, headings, subjects, objects or texts.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import aclosing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,12 +28,15 @@ from backend.chat.context_budget import ApproximateTokenCounter, BudgetPlan, Con
 from backend.chat.conversation_handler import ConversationHandler
 from backend.chat.mist_context import MistContext
 from backend.chat.retrieval_trace import TurnTraceBuilder, trace_failed
+from backend.chat.turn_scope import TurnDelivery, TurnRequest, TurnScope
 from backend.errors import LLMConnectionError
 from backend.knowledge.config import ContextBudgetConfig
 from backend.knowledge.models import RetrievalResult, RetrievedFact, fact_ref
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
+from backend.llm.models import LLMRequest, LLMResponse
 from backend.llm.models import ToolCall as LLMToolCall
+from backend.llm.provider import StreamingLLMProvider
 from backend.vault.conventions import ConventionsLoader
 from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
@@ -283,13 +289,14 @@ def _make_handler(
     budget_enabled: bool = True,
     auto_inject: bool = True,
     retriever_factory: Callable[[Any, GraphStore], KnowledgeRetriever] | None = None,
-) -> tuple[ConversationHandler, FakeStreamingLLMProvider, _FakeEventStore]:
+    llm_provider: StreamingLLMProvider | None = None,
+) -> tuple[ConversationHandler, Any, _FakeEventStore]:
     _seed_profile(vault_root)
     config = build_test_config(vault_root=str(vault_root), vault_enabled=True, vault_user_id="user")
     config.context_budget.enabled = budget_enabled
     config.auto_inject_docs = auto_inject
     gs = GraphStore(FakeNeo4jConnection(), FakeEmbeddingGenerator())
-    provider = FakeStreamingLLMProvider(passes)
+    provider = llm_provider if llm_provider is not None else FakeStreamingLLMProvider(passes)
     retriever = (
         retriever_factory(config, gs)
         if retriever_factory is not None
@@ -465,6 +472,27 @@ class TestTraceOnEveryTurn:
         }
         assert context["trace"]["tools"] == []
         assert context["trace"]["budget"]["history_raw"] == 1
+
+    @pytest.mark.asyncio
+    async def test_history_raw_counts_the_whole_history_on_a_long_session(
+        self, tmp_path: Path
+    ) -> None:
+        handler, _provider, store = _make_handler(
+            tmp_path, [ScriptedPass(chunks=["Sure."])], _full_script()
+        )
+        session = handler.get_or_create_session("s1")
+        for index in range(15):
+            session.add_message("user", f"seed question {index}")
+            session.add_message("assistant", f"seed answer {index}")
+
+        await _run_turn(handler, _UTTERANCE_2)
+
+        budget = store.events[0].retrieval_context["trace"]["budget"]
+        # The planner chooses the window from the 30 stored messages plus the
+        # pending one. At max_history 10 and the default high-water factor 2.0
+        # the stable window starts at message 20, the first step that leaves
+        # it within 20 messages, so it keeps the last 11.
+        assert (budget["history_raw"], budget["history_kept"]) == (31, 11)
 
     @pytest.mark.asyncio
     async def test_disabled_auto_inject_is_recorded(self, tmp_path: Path) -> None:
@@ -662,7 +690,7 @@ class TestBehaviourUnchanged:
         untraced, untraced_provider, untraced_store = _make_handler(
             tmp_path / "untraced", _tool_turn_passes(), _full_script()
         )
-        monkeypatch.setattr(untraced, "_feed_trace", lambda _feed: None)
+        monkeypatch.setattr(untraced, "_feed_trace", lambda _scope, _feed: None)
 
         await _run_turn(traced, _UTTERANCE_1)
         await _run_turn(untraced, _UTTERANCE_1)
@@ -1016,7 +1044,7 @@ class TestToolFeeds:
         untraced, untraced_provider, _untraced_store = _make_handler(
             tmp_path / "untraced", _tool_turn_passes(), _full_script()
         )
-        monkeypatch.setattr(untraced, "_feed_trace", lambda _feed: None)
+        monkeypatch.setattr(untraced, "_feed_trace", lambda _scope, _feed: None)
 
         await _run_turn(traced, _UTTERANCE_1)
         await _run_turn(untraced, _UTTERANCE_1)
@@ -1105,7 +1133,237 @@ class TestToolFeeds:
 
         monkeypatch.setattr(TurnTraceBuilder, "budget_planned", spy)
         handler._build_messages(
-            session=handler.sessions["s1"], max_history=10, retrieval_result=None
+            session=handler.sessions["s1"],
+            max_history=10,
+            retrieval_result=None,
+            pending_user_message=_UTTERANCE_1,
         )
 
         assert fed == []
+
+
+# --- Overlapping turns -------------------------------------------------------
+#
+# The realtime path opens a newer turn before the older one is committed (a
+# barge-in), and the server runs turns of different sessions concurrently on
+# one handler. Each turn's row must carry that turn's trace and no other's.
+
+_TURN_A = "Tell me about the alpha harbour"
+_TURN_B = "Tell me about the beta orchard"
+_TOOL_QUERY = {_TURN_A: "alpha notes", _TURN_B: "beta notes"}
+
+
+def _turn_facts(utterance: str) -> tuple[RetrievedFact, RetrievedFact]:
+    """The auto-inject fact and the vault-tool fact of one turn, distinct per turn."""
+    tag = _TOOL_QUERY[utterance].split()[0]
+    auto = _vault_fact(f"sessions/{tag}-auto.md", f"{tag} auto heading", f"{tag} auto text")
+    tool = _vault_fact(f"sessions/{tag}-tool.md", f"{tag} tool heading", f"{tag} tool text")
+    return auto, tool
+
+
+def _turn_refs(utterance: str) -> set[str]:
+    return {fact_ref(fact) for fact in _turn_facts(utterance)}
+
+
+def _trace_refs(trace: dict[str, Any]) -> set[str]:
+    refs = {c["ref"] for c in trace["auto_inject"]["candidates"]}
+    for entry in trace["tools"]:
+        refs |= {c["ref"] for c in entry["candidates"]}
+    return refs
+
+
+class _PerTurnRetriever(KnowledgeRetriever):
+    """Answers each turn's auto-inject and vault-tool queries with that turn's facts.
+
+    `tool_gate`, when given, is awaited by every tool retrieval before it
+    returns, so a test can hold tools in flight.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        graph_store: GraphStore,
+        tool_gate: Callable[[], Awaitable[Any]] | None = None,
+    ) -> None:
+        super().__init__(config=config, graph_store=graph_store)
+        self._tool_gate = tool_gate
+        self._by_query: dict[str, RetrievedFact] = {}
+        for utterance, tool_query in _TOOL_QUERY.items():
+            auto, tool = _turn_facts(utterance)
+            self._by_query[utterance] = auto
+            self._by_query[tool_query] = tool
+
+    async def retrieve(self, query, user_id="user", limit=None, **kwargs):  # noqa: ANN001
+        if kwargs.get("session_id") is None and self._tool_gate is not None:
+            await self._tool_gate()
+        return _result(query, "historical", [("vault", self._by_query[query], False, True)])
+
+    async def retrieve_mist_context(self):  # noqa: ANN201
+        return MistContext(display_name="MIST", pronouns="she/her", self_concept="")
+
+
+def _vault_tool_call(utterance: str) -> LLMToolCall:
+    return LLMToolCall(
+        id=f"tc-{_TOOL_QUERY[utterance]}",
+        name="query_vault",
+        arguments={"query": _TOOL_QUERY[utterance]},
+    )
+
+
+class _AlternatingProvider(StreamingLLMProvider):
+    """Serves two concurrent turns, handing control to the loop before every chunk.
+
+    The turn is the user text that ends the request's last user message.
+    Pass 1 (a request with tools) asks for that turn's one vault-tool call;
+    pass 2 answers in text.
+    `pass1_order` lists the turns in the order their pass 1 started.
+    """
+
+    model: str = "fake-alternating-model"
+
+    def __init__(self) -> None:
+        self.calls: list[LLMRequest] = []
+        self.pass1_order: list[str] = []
+
+    async def generate(
+        self, request: LLMRequest, *, stream: bool = False
+    ) -> AsyncGenerator[LLMResponse, None]:
+        self.calls.append(request)
+        last_user = next(m["content"] for m in reversed(request.messages) if m["role"] == "user")
+        # The final user message carries the turn's delta ahead of the user's words.
+        utterance = next(turn for turn in _TOOL_QUERY if last_user.endswith(turn))
+        if request.tools:
+            self.pass1_order.append(utterance)
+            await asyncio.sleep(0)
+            yield LLMResponse(content=None, tool_calls=[_vault_tool_call(utterance)], partial=False)
+            return
+        await asyncio.sleep(0)
+        yield LLMResponse(content="Answered.", partial=True)
+        await asyncio.sleep(0)
+        yield LLMResponse(content=None, partial=False)
+
+    def generate_sync(
+        self, request: LLMRequest, *, stream: bool = False
+    ) -> Generator[LLMResponse, None, None]:
+        raise NotImplementedError("async-only fake")
+
+
+def _voice_request(utterance: str, session_id: str = "s1") -> TurnRequest:
+    return TurnRequest(session_id=session_id, user_text=utterance, origin="voice", channel="tts")
+
+
+async def _stream(handler: ConversationHandler, scope: TurnScope) -> None:
+    async with aclosing(handler.stream_turn(scope)) as events:
+        async for _event in events:
+            pass
+
+
+def _delivery(outcome: str, text: str, *, tool_effect_unknown: bool = False) -> TurnDelivery:
+    return TurnDelivery(
+        outcome=outcome,  # type: ignore[arg-type]
+        delivered_text=text,
+        stt_model=None,
+        tts_model=None,
+        tool_effect_unknown=tool_effect_unknown,
+    )
+
+
+class TestOverlappingTurnsKeepTheirOwnTrace:
+    @pytest.mark.asyncio
+    async def test_barge_in_order_on_one_session(self, tmp_path: Path) -> None:
+        passes = [
+            ScriptedPass(tool_calls=[_vault_tool_call(_TURN_A)]),
+            ScriptedPass(chunks=["Alpha answer."]),
+            ScriptedPass(tool_calls=[_vault_tool_call(_TURN_B)]),
+            ScriptedPass(chunks=["Beta answer."]),
+        ]
+        handler, _provider, store = _make_handler(
+            tmp_path, passes, {}, retriever_factory=_PerTurnRetriever
+        )
+
+        scope_a = handler.open_turn(_voice_request(_TURN_A))
+        await _stream(handler, scope_a)
+        scope_b = handler.open_turn(_voice_request(_TURN_B))
+        await _stream(handler, scope_b)
+        handler.commit_turn(scope_a, _delivery("interrupted", "Alpha"))
+        handler.commit_turn(scope_b, _delivery("completed", scope_b.generated_text))
+
+        row_a, row_b = store.events
+        assert (row_a.user_utterance, row_b.user_utterance) == (_TURN_A, _TURN_B)
+        for row, utterance in ((row_a, _TURN_A), (row_b, _TURN_B)):
+            trace = row.retrieval_context["trace"]
+            assert _trace_refs(trace) == _turn_refs(utterance)
+            assert [entry["call"] for entry in trace["tools"]] == [1]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_turns_on_two_sessions(self, tmp_path: Path) -> None:
+        # Each tool retrieval waits until the other turn's is in flight too,
+        # so both turns are open before either commits.
+        both_in_tool = asyncio.Barrier(2)
+        provider = _AlternatingProvider()
+        handler, _provider, store = _make_handler(
+            tmp_path,
+            [],
+            {},
+            retriever_factory=lambda config, gs: _PerTurnRetriever(
+                config, gs, tool_gate=both_in_tool.wait
+            ),
+            llm_provider=provider,
+        )
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                _run_turn(handler, _TURN_A, session_id="sa"),
+                _run_turn(handler, _TURN_B, session_id="sb"),
+            ),
+            timeout=5,
+        )
+
+        assert set(provider.pass1_order) == {_TURN_A, _TURN_B}
+        rows = {event.session_id: event for event in store.events}
+        assert set(rows) == {"sa", "sb"}
+        for session_id, utterance in (("sa", _TURN_A), ("sb", _TURN_B)):
+            trace = rows[session_id].retrieval_context["trace"]
+            assert _trace_refs(trace) == _turn_refs(utterance)
+            assert [entry["call"] for entry in trace["tools"]] == [1]
+
+
+class TestFeedAfterCommit:
+    @pytest.mark.asyncio
+    async def test_a_tool_finishing_after_the_commit_leaves_the_row_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        release_tool = asyncio.Event()
+        passes = [
+            ScriptedPass(tool_calls=[_vault_tool_call(_TURN_A)]),
+            ScriptedPass(chunks=["Never streamed."]),
+        ]
+        handler, _provider, store = _make_handler(
+            tmp_path,
+            passes,
+            {},
+            retriever_factory=lambda config, gs: _PerTurnRetriever(
+                config, gs, tool_gate=release_tool.wait
+            ),
+        )
+        scope = handler.open_turn(_voice_request(_TURN_A))
+
+        stream_task = asyncio.create_task(_stream(handler, scope))
+        while not scope.tool_tasks:
+            await asyncio.sleep(0)
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
+        handler.commit_turn(scope, _delivery("interrupted", "", tool_effect_unknown=True))
+        (event,) = store.events
+        recorded = copy.deepcopy(event.retrieval_context)
+        assert scope.trace is None
+
+        release_tool.set()
+        assert await scope.wait_tools(timeout_s=5)
+
+        assert [result["name"] for result in scope.tool_results] == ["query_vault"]
+        assert not scope.tool_tasks[0].result().startswith("Error")
+        assert store.events == [event]
+        assert event.retrieval_context == recorded
+        assert recorded["trace"]["tools"] == []

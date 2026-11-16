@@ -10,9 +10,25 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
+
+TurnOutcome = Literal["completed", "interrupted", "superseded", "error"]
+TurnModality = Literal["voice", "text"]
+
+# Checked at construction because the event store is append-only: a misspelt outcome
+# written once stays in the log for good, and every later reader would have to handle it.
+TURN_OUTCOMES: frozenset[str] = frozenset({"completed", "interrupted", "superseded", "error"})
+TURN_MODALITIES: frozenset[str] = frozenset({"voice", "text"})
+
+# Who answered a turn. "capability": a capability's template was the whole
+# reply and no model pass ran, so the text is a command and a template, not
+# knowledge. "model": everything else, the error backstop included. The memory
+# writers read this through one predicate,
+# `backend.extraction_backlog.eligibility.policy_skip_reason`.
+AnsweredBy = Literal["model", "capability"]
+ANSWERED_BY_VALUES: frozenset[str] = frozenset({"model", "capability"})
 
 
 @dataclass
@@ -113,8 +129,46 @@ class ConversationTurnEvent:
     # Versioning -- derived, never restated (see backend.knowledge.version_stamps).
     ontology_version: str = ONTOLOGY_VERSION
 
+    # Turn outcome (MIS-127). `system_response` is what the conversation keeps as said; on
+    # an interrupted voice turn that is the part the user heard, while `generated_response`
+    # keeps the full text the LLM produced. None means not recorded, which is every turn
+    # logged before these fields existed.
+    turn_outcome: TurnOutcome | None = None
+    generated_response: str | None = None
+    turn_modality: TurnModality | None = None
+
+    # None: recorded before the field existed, which reads as "model".
+    answered_by: AnsweredBy | None = None
+
     # Assigned by EventStore.append_turn(), not by caller
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    def __post_init__(self) -> None:
+        """Refuse an unknown outcome, modality or `answered_by` before it can reach the log.
+
+        Checked at construction, so a misspelt value fails where it is written
+        rather than being stored and read later: an unknown `answered_by` would
+        otherwise read as a model turn.
+
+        Raises:
+            ValueError: If `turn_outcome`, `turn_modality` or `answered_by` is set to a
+                value outside `TURN_OUTCOMES`, `TURN_MODALITIES` or `ANSWERED_BY_VALUES`.
+        """
+        if self.turn_outcome is not None and self.turn_outcome not in TURN_OUTCOMES:
+            raise ValueError(
+                f"turn_outcome must be one of {sorted(TURN_OUTCOMES)} or None, "
+                f"got {self.turn_outcome!r}"
+            )
+        if self.turn_modality is not None and self.turn_modality not in TURN_MODALITIES:
+            raise ValueError(
+                f"turn_modality must be one of {sorted(TURN_MODALITIES)} or None, "
+                f"got {self.turn_modality!r}"
+            )
+        if self.answered_by is not None and self.answered_by not in ANSWERED_BY_VALUES:
+            raise ValueError(
+                f"unknown answered_by {self.answered_by!r}; "
+                f"expected one of {sorted(ANSWERED_BY_VALUES)} or None"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for SQLite insertion.
@@ -172,6 +226,10 @@ class ConversationTurnEvent:
                 json.dumps(self.llm_parameters) if self.llm_parameters is not None else None
             ),
             "ontology_version": self.ontology_version,
+            "turn_outcome": self.turn_outcome,
+            "generated_response": self.generated_response,
+            "turn_modality": self.turn_modality,
+            "answered_by": self.answered_by,
         }
 
     @classmethod
@@ -215,4 +273,8 @@ class ConversationTurnEvent:
             llm_model=row.get("llm_model"),
             llm_parameters=_parse_json(row.get("llm_parameters")),
             ontology_version=row.get("ontology_version", ONTOLOGY_VERSION),
+            turn_outcome=row.get("turn_outcome"),
+            generated_response=row.get("generated_response"),
+            turn_modality=row.get("turn_modality"),
+            answered_by=row.get("answered_by"),
         )

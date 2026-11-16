@@ -51,6 +51,25 @@ repos:
         language: system
         pass_filenames: true
         files: \.(py|md|txt|ya?ml|json|dart|sh)$
+      - id: no-audio-files
+        name: No audio or video (voice data lives in the private root)
+        entry: audio is not committed to this repository (it is public); video is not either; keep voice data under MIST_VOICE_PRIVATE_ROOT
+        language: fail
+        files: (?i)\.(wav|flac|mp3|ogg|opus|m4a|aac|ac3|eac3|dts|aif|aiff|wma|mka|mkv|mp4|m4v|mov|avi|webm|wmv|flv|m2ts|vob)$
+      - id: no-voice-assets
+        name: No voice identities, voice-data manifests, arrays or model weights
+        entry: voice identities and model weights are not committed to this repository (it is public); keep them under MIST_VOICE_PRIVATE_ROOT
+        language: fail
+        files: (?i)((^|/)(voice|student|target)\.json$|\.(npy|npz|pt|pth|bin|ckpt|onnx|safetensors|nemo|gguf|pkl|h5|hdf5|parquet|arrow)$)
+      - id: no-voice-data-records
+        name: No private voice-data records, subtitles, alignments or archives
+        entry: voice-data records are not committed to this public repository; keep them under MIST_VOICE_PRIVATE_ROOT
+        language: fail
+        files: (?i)(\.private\.|\.(srt|vtt|ass|rttm|textgrid|lab|tar|tgz|zip|7z)$)
+      - id: no-voice-private-terms
+        name: No private voice-data terms
+        entry: python scripts/check_voice_private_terms.py
+        language: system
 
   # General file quality checks
   - repo: https://github.com/pre-commit/pre-commit-hooks

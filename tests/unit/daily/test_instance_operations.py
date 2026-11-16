@@ -178,7 +178,17 @@ def make_root(
     extra: str = "",
 ) -> Root:
     path = (tmp_path / "instances" / name).resolve()
-    for sub in ("state", "mist-memory", "logs", "ops", "models", "release", "retired", "bin"):
+    for sub in (
+        "state",
+        "mist-memory",
+        "logs",
+        "ops",
+        "models",
+        "release",
+        "retired",
+        "bin",
+        "secrets",
+    ):
         (path / sub).mkdir(parents=True, exist_ok=True)
     marker = json.dumps({"v": 1, "instance": instance_name, "created_at": "2026-10-01T00:00:00Z"})
     for directory in (path, path / "state", path / "mist-memory"):

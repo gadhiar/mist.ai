@@ -13,6 +13,7 @@ WHAT IS CAPTURED
     stores/event_store.db       conversation sessions, turn events, epoch ledger
     stores/extraction_cache.db  cached extraction results
     stores/vault_sidecar.db     vault chunk index with embeddings
+    stores/capabilities.db      alarms, timers, their events, capability action log
     graph.json                  every node and relationship, all partitions,
                                 embeddings as exact `list[float]`, temporals and
                                 Points tagged rather than stringified

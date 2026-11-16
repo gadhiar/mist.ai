@@ -1,31 +1,37 @@
 """Cluster 6 — budget-aware context assembly for ConversationHandler.
 
-The conversation prompt is built from five ordered segments (persona block,
-static system template, retrieval context, optional live-data advisory,
-conversation history). Before Cluster 6 every segment was dumped in full and
+The conversation prompt is built from three ordered segments: the stable
+prefix (persona block, static system template, MIST.md, user profile; the
+tool schemas travel beside it), the conversation history, and the per-turn
+delta (interruption note, retrieval context, live-data advisory) in the
+final user message. Before Cluster 6 every segment was dumped in full and
 trusted to fit the model's context window. Bug E (43% empty V6 responses)
 traced back to this — persona + retrieval + 30 turns of history consumed
 the model's usable attention past Gemma 4 E4B's effective 8K context, and
 responses went empty.
 
-Cluster 6 enforces a hard prompt-token budget. Fixed segments (persona,
-tools, static system) consume from the top. The remainder is split between
-retrieval and history using a configurable ratio. Retrieval is pruned by
-priority score; history is pruned by a pluggable strategy (sliding-window
-default). All arithmetic happens BEFORE LLMRequest construction so the
-model never sees oversized prompts.
+Cluster 6 enforces a hard prompt-token budget. The stable prefix and tools
+consume from the top as fixed cost; a reserve of `turn_delta_max_tokens`
+goes to the delta; history gets the rest. Retrieval is pruned by priority
+score to the delta left after the other parts; history is pruned by a
+pluggable strategy (`stable_window` by default). All arithmetic happens
+BEFORE LLMRequest construction so the model never sees oversized prompts.
 
 Components:
 - `TokenCounter`: protocol for token accounting. `ApproximateTokenCounter`
   (char/3.6 heuristic, fast, zero-IO) is the default. `LlamaServerTokenCounter`
   calls llama-server's /tokenize endpoint for exact counts (slow — reserved
   for validation, not inner loop).
-- `HistoryStrategy`: protocol for history pruning. `SlidingWindowStrategy`
-  keeps the most recent turns that fit; future strategies (summarization)
-  plug into the same interface.
-- `ContextBudgetPlanner`: owns the arithmetic. Computes fixed cost, splits
-  remainder, invokes strategies, returns the pruned retrieval context string
+- `HistoryStrategy`: protocol for history pruning; every strategy returns a
+  `HistorySelection`. `SlidingWindowStrategy` keeps the most recent messages
+  that fit; `StableWindowStrategy` moves the window's start in steps so
+  consecutive prompts share their history and llama-server can reuse its
+  cached prefix.
+- `ContextBudgetPlanner`: owns the arithmetic. Computes fixed cost, reserves
+  the delta, invokes strategies, returns the pruned retrieval context string
   and pruned history list.
+- `TurnDeltaPart` and `PromptStats`: one block of the per-turn delta, and
+  the per-turn prompt statistics the handler puts on `TurnScope`.
 - `score_fact_for_retrieval_pruning`: priority = similarity x confidence x
   recency-decay.
 
@@ -38,7 +44,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from backend.knowledge.config import ContextBudgetConfig
 from backend.knowledge.models import RetrievalResult, RetrievedFact, fact_ref
@@ -116,6 +122,26 @@ class ApproximateTokenCounter:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class HistorySelection:
+    """The part of a history a strategy chose, and why its front was cut.
+
+    `messages` is always `history[start_index:]`: every strategy keeps a
+    contiguous tail, so a caller can tell which messages were left out by
+    index alone.
+
+    `compacted` says what removed messages from the front: `none` when
+    nothing beyond the strategy's own message cap was removed (for
+    `stable_window`, when the window starts at the first message), `step`
+    when `stable_window`'s stepped start removed them, and `budget` when the
+    token budget removed more than the cap or the step would have.
+    """
+
+    messages: list[dict[str, Any]]
+    start_index: int
+    compacted: Literal["none", "step", "budget"]
+
+
 class HistoryStrategy(Protocol):
     """Chooses which history messages fit the budget."""
 
@@ -124,24 +150,44 @@ class HistoryStrategy(Protocol):
         history: list[dict[str, Any]],
         budget_tokens: int,
         counter: TokenCounter,
-    ) -> list[dict[str, Any]]:
-        """Return a subset of `history` whose total token count ≤ `budget_tokens`.
+        *,
+        max_messages: int | None = None,
+        high_water_factor: float = 2.0,
+    ) -> HistorySelection:
+        """Choose a chronological tail of `history` costing at most `budget_tokens`.
 
-        Must return messages in original chronological order. May return an
-        empty list when the budget is too small for any message.
+        Args:
+            history: The session's full history, oldest first.
+            budget_tokens: Token budget for the selected messages.
+            counter: Token counter used to cost each message.
+            max_messages: The message cap the caller would have sliced to
+                (falsy: no cap, as `ConversationSession.get_history` treats it).
+            high_water_factor: For strategies that let the window grow past
+                `max_messages`, how far (as a multiple) before it is cut.
+
+        Returns:
+            A `HistorySelection`; its messages may be empty when the budget is
+            too small for any message.
         """
         ...
 
 
+def _suffix_costs(history: list[dict[str, Any]], counter: TokenCounter) -> list[int]:
+    """`costs[i]` is the token cost of `history[i:]`; `costs[len(history)]` is 0."""
+    costs = [0] * (len(history) + 1)
+    for index in range(len(history) - 1, -1, -1):
+        costs[index] = costs[index + 1] + counter.count_message(history[index])
+    return costs
+
+
 class SlidingWindowStrategy:
-    """Keeps the most recent N turns that fit the budget.
+    """Keeps the most recent messages that fit the budget.
 
-    Walks history in reverse (newest first) and accumulates until adding the
-    next message would exceed the budget. Preserves chronological order in
-    the returned list.
-
-    This is the simplest viable strategy for MVP. Summarization and
-    hierarchical strategies plug into the same interface post-Cluster-6.
+    Caps the history at the last `max_messages`, then walks it in reverse
+    (newest first) and accumulates until adding the next message would
+    exceed the budget. The window's start moves on every turn, so the
+    prompt's history changes at its front each time; `stable_window` exists
+    to avoid that.
     """
 
     def select(
@@ -149,26 +195,120 @@ class SlidingWindowStrategy:
         history: list[dict[str, Any]],
         budget_tokens: int,
         counter: TokenCounter,
-    ) -> list[dict[str, Any]]:
-        """Keep the most recent history messages that fit the token budget."""
-        if budget_tokens <= 0 or not history:
-            return []
+        *,
+        max_messages: int | None = None,
+        high_water_factor: float = 2.0,
+    ) -> HistorySelection:
+        """Keep the most recent history messages that fit the token budget.
 
-        selected_reverse: list[dict[str, Any]] = []
+        `high_water_factor` is accepted for the protocol and not used.
+        """
+        if not history:
+            return HistorySelection(messages=[], start_index=0, compacted="none")
+        total = len(history)
+        if budget_tokens <= 0:
+            return HistorySelection(messages=[], start_index=total, compacted="budget")
+
+        cap_start = max(0, total - max_messages) if max_messages else 0
+        start = total
         used = 0
-        for msg in reversed(history):
-            cost = counter.count_message(msg)
+        for index in range(total - 1, cap_start - 1, -1):
+            cost = counter.count_message(history[index])
             if used + cost > budget_tokens:
                 break
-            selected_reverse.append(msg)
+            start = index
             used += cost
 
-        selected_reverse.reverse()
-        return selected_reverse
+        return HistorySelection(
+            messages=history[start:],
+            start_index=start,
+            compacted="budget" if start > cap_start else "none",
+        )
+
+
+class StableWindowStrategy:
+    """Moves the history window's start in steps, so the prompt prefix survives turns.
+
+    llama-server reuses its KV cache only up to the first token that differs
+    from the previous prompt. A window whose start moves every turn changes
+    the history's first message every turn, so nothing after the stable
+    prefix is reused. This strategy grows the window append-only and moves
+    its start only in steps of `max_messages`, counted from the session's
+    first message, when the window would exceed `high_water_factor` x
+    `max_messages`. Between steps every prompt extends the previous one.
+
+    Rules, in order:
+
+    1. The start is the first multiple of `max_messages` that keeps the
+       window within the high-water mark, but never later than leaving the
+       last `max_messages` messages (which binds only for factors below 2).
+    2. The start moves back to the beginning of the exchange (the user
+       message) it falls in, so the window holds whole exchanges.
+    3. Over budget, the start jumps further steps while the window keeps at
+       least `max_messages` messages.
+    4. If it still does not fit, whole exchanges are dropped from the front
+       until it does.
+
+    The selection is a pure function of the history, the budget and the two
+    settings, so a replayed session gets the same windows. Without
+    `max_messages` there is no step: the whole history is kept and rule 4
+    alone applies.
+    """
+
+    def select(
+        self,
+        history: list[dict[str, Any]],
+        budget_tokens: int,
+        counter: TokenCounter,
+        *,
+        max_messages: int | None = None,
+        high_water_factor: float = 2.0,
+    ) -> HistorySelection:
+        """Select the stepped window, then fit it to the budget."""
+        total = len(history)
+        if total == 0:
+            return HistorySelection(messages=[], start_index=0, compacted="none")
+        if budget_tokens <= 0:
+            return HistorySelection(messages=[], start_index=total, compacted="budget")
+
+        exchange_starts = [
+            index
+            for index, message in enumerate(history)
+            if index == 0 or message.get("role") == "user"
+        ]
+
+        def exchange_start_at_or_before(index: int) -> int:
+            return max(start for start in exchange_starts if start <= index)
+
+        costs = _suffix_costs(history, counter)
+        compacted: Literal["none", "step", "budget"] = "none"
+        start = 0
+        if max_messages:
+            high_water = int(high_water_factor * max_messages)
+            step = max(0, math.ceil((total - high_water) / max_messages))
+            floor_start = max(0, total - max_messages)
+            start = exchange_start_at_or_before(min(step * max_messages, floor_start))
+            if start > 0:
+                compacted = "step"
+            while costs[start] > budget_tokens:
+                step += 1
+                candidate = exchange_start_at_or_before(step * max_messages)
+                if candidate <= start or total - candidate < max_messages:
+                    break
+                start = candidate
+                compacted = "budget"
+
+        while costs[start] > budget_tokens:
+            later = [index for index in exchange_starts if index > start]
+            start = later[0] if later else total
+            compacted = "budget"
+
+        return HistorySelection(messages=history[start:], start_index=start, compacted=compacted)
 
 
 _HISTORY_STRATEGIES: dict[str, HistoryStrategy] = {
     "sliding_window": SlidingWindowStrategy(),
+    "stable_window": StableWindowStrategy(),
 }
 
 
@@ -232,6 +372,52 @@ def score_fact_for_retrieval_pruning(
 
 
 # ---------------------------------------------------------------------------
+# Turn delta and prompt statistics
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TurnDeltaPart:
+    """One block of the per-turn delta, the context that varies every turn.
+
+    The delta goes after the history, in the final user message (or one
+    system message directly before it), so a change in it never invalidates
+    the cached prefix of the next prompt. `kind` orders and labels the block
+    when it is rendered. `prunable` marks a block the planner may shorten to
+    fit the delta budget (retrieval, memory); the others are charged whole.
+    No producer of `clock` or `memory` parts exists yet. `register` asks a
+    `tts` turn for a short spoken reply; it is in the delta rather than the
+    prefix so that typed and spoken turns share one cached prefix.
+    """
+
+    kind: Literal["clock", "interruption", "retrieval", "memory", "live_advisory", "register"]
+    text: str
+    prunable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PromptStats:
+    """Prompt-size and cache statistics for one turn, kept on `TurnScope.prompt_stats`.
+
+    The `*_est` counts are the planner's token estimates, taken when the
+    prompt is built. `prompt_tokens` and `cached_tokens` (prompt tokens the
+    server took from its KV cache) come from the provider's usage for
+    pass 1, None until that pass finishes or when the provider reports
+    nothing. `prefix_changed` is True when the stable prefix
+    or the tool schemas differ from the session's previous turn.
+    `history_compacted` is the history selection's `compacted`.
+    """
+
+    prefix_tokens_est: int
+    history_tokens_est: int
+    delta_tokens_est: int
+    prompt_tokens: int | None
+    cached_tokens: int | None
+    prefix_changed: bool
+    history_compacted: Literal["none", "step", "budget"]
+
+
+# ---------------------------------------------------------------------------
 # Budget plan and planner
 # ---------------------------------------------------------------------------
 
@@ -245,9 +431,12 @@ class BudgetPlan:
     full history list. `fits` is False when even the minimum (persona + static)
     exceeds context_window — a hard stop that should log + degrade gracefully.
 
-    `retrieval_budget` and `history_budget` are the allocated token budgets;
-    `retrieval_used` and `history_used` are what the pruned output actually
-    consumed.
+    `fixed_cost` is the stable prefix plus the tool schemas. `delta_budget`
+    is the reserve for the per-turn delta, `retrieval_budget` the part of it
+    left to retrieval, and `history_budget` the rest; `retrieval_used` and
+    `history_used` are what the pruned output actually consumed.
+    `history_compacted` is the history strategy's `HistorySelection.compacted`
+    (`budget` when nothing fits at all).
 
     `kept_fact_refs` and `dropped_fact_refs` name the facts behind
     `facts_kept` and `facts_dropped` (see `fact_ref`), so the turn trace can
@@ -271,6 +460,8 @@ class BudgetPlan:
     kept_fact_refs: tuple[str, ...] = ()
     dropped_fact_refs: tuple[str, ...] = ()
     retrieval_rerendered: bool = False
+    history_compacted: Literal["none", "step", "budget"] = "none"
+    delta_budget: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +520,11 @@ class ContextBudgetPlanner:
         self._history_strategy = history_strategy or get_history_strategy(config.history_strategy)
 
     @property
+    def config(self) -> ContextBudgetConfig:
+        """Return the config the planner budgets with."""
+        return self._config
+
+    @property
     def counter(self) -> TokenCounter:
         """Return the injected or default TokenCounter."""
         return self._counter
@@ -367,20 +563,32 @@ class ContextBudgetPlanner:
         persona_text: str | None,
         static_text: str,
         retrieval_result: RetrievalResult | None,
-        live_advisory_text: str | None,
         history: list[dict[str, Any]],
         tools: list[dict] | None,
         max_output_tokens: int,
         extra_fixed_texts: list[str] | None = None,
+        max_history: int | None = None,
+        delta_parts: list[TurnDeltaPart] | None = None,
+        live_advisory_text: str | None = None,
     ) -> BudgetPlan:
         """Plan the budget allocation for a single turn.
+
+        Only the stable prefix and the tool schemas are fixed cost. The
+        per-turn delta gets its own reserve of `turn_delta_max_tokens`
+        (capped at what the prefix leaves), whether or not this turn uses it,
+        so the history budget stays the same while the prefix and tools do; before
+        this, a live advisory was charged as fixed cost and moved the history
+        budget whenever it appeared. Inside the reserve, `delta_parts` are
+        charged first and retrieval is pruned by priority score to what is
+        left, capped also at `retrieval_budget_ratio` of the flex budget.
 
         Args:
             persona_text: Serialized persona block (MistContext.as_system_prompt_block).
             static_text: Static system-template body.
             retrieval_result: Auto-RAG result (or None if retrieval was skipped).
-            live_advisory_text: Optional live-data advisory body.
             history: Conversation history messages in chronological order.
+                The history strategy chooses the window from it, so pass the
+                whole history rather than a pre-sliced tail.
             tools: Tool schema array passed alongside messages.
             max_output_tokens: `LLMRequest.max_tokens` for the coming call.
             extra_fixed_texts: Additional always-injected blocks (vault
@@ -389,6 +597,13 @@ class ContextBudgetPlanner:
                 blocks eat the quality envelope past the 256-token safety
                 margin while the planner believes pruned retrieval/history
                 still fits.
+            max_history: Message cap handed to the history strategy as
+                `max_messages`, with `config.history_high_water_factor`.
+            delta_parts: The delta parts that are charged whole (interruption
+                note, live advisory, clock), as rendered text.
+            live_advisory_text: Advisory text charged exactly like a
+                `live_advisory` entry in `delta_parts`; the keyword callers
+                used before `delta_parts` existed.
 
         Returns:
             BudgetPlan describing what survives the budget, what got pruned,
@@ -402,8 +617,8 @@ class ContextBudgetPlanner:
             - self._config.safety_margin_tokens,
         )
 
-        # Fixed segments that never get pruned.
-        fixed_texts = [t for t in (persona_text, static_text, live_advisory_text) if t]
+        # Fixed segments: the stable prefix, never pruned.
+        fixed_texts = [t for t in (persona_text, static_text) if t]
         fixed_texts += [t for t in (extra_fixed_texts or []) if t]
         fixed_cost = self._fixed_segment_tokens(fixed_texts)
         fixed_cost += self._tools_schema_tokens(tools)
@@ -434,11 +649,25 @@ class ContextBudgetPlanner:
                 facts_kept=0,
                 facts_dropped=(len(retrieval_result.facts) if retrieval_result else 0),
                 dropped_fact_refs=(_refs(retrieval_result.facts) if retrieval_result else ()),
+                history_compacted="budget" if history else "none",
             )
 
-        # Allocate flex budget by ratio.
-        retrieval_budget = int(flex_budget * self._config.retrieval_budget_ratio)
-        history_budget = flex_budget - retrieval_budget
+        # The delta reserve is taken whole, used or not, so history_budget
+        # depends on the prefix alone. Retrieval gets what the parts charged
+        # whole leave of the reserve, capped by the ratio of the flex budget.
+        delta_budget = min(self._config.turn_delta_max_tokens, flex_budget)
+        history_budget = flex_budget - delta_budget
+        whole_texts = [part.text for part in delta_parts or []]
+        if live_advisory_text:
+            whole_texts.append(live_advisory_text)
+        whole_parts_cost = self._fixed_segment_tokens(whole_texts)
+        retrieval_budget = max(
+            0,
+            min(
+                delta_budget - whole_parts_cost,
+                int(flex_budget * self._config.retrieval_budget_ratio),
+            ),
+        )
 
         # Prune retrieval by priority score.
         pruned_retrieval_text: str | None = None
@@ -455,8 +684,14 @@ class ContextBudgetPlanner:
             retrieval_rerendered = prune.rerendered
 
         # Prune history by strategy.
-        pruned_history = self._history_strategy.select(history, history_budget, self._counter)
-        history_used = self._counter.count_messages(pruned_history)
+        selection = self._history_strategy.select(
+            history,
+            history_budget,
+            self._counter,
+            max_messages=max_history,
+            high_water_factor=self._config.history_high_water_factor,
+        )
+        history_used = self._counter.count_messages(selection.messages)
 
         return BudgetPlan(
             fits=True,
@@ -465,7 +700,7 @@ class ContextBudgetPlanner:
             retrieval_budget=retrieval_budget,
             history_budget=history_budget,
             pruned_retrieval_text=pruned_retrieval_text,
-            pruned_history=pruned_history,
+            pruned_history=selection.messages,
             retrieval_used=retrieval_used,
             history_used=history_used,
             facts_kept=len(kept_facts),
@@ -473,6 +708,8 @@ class ContextBudgetPlanner:
             kept_fact_refs=_refs(kept_facts),
             dropped_fact_refs=_refs(dropped_facts),
             retrieval_rerendered=retrieval_rerendered,
+            history_compacted=selection.compacted,
+            delta_budget=delta_budget,
         )
 
     def _prune_retrieval(

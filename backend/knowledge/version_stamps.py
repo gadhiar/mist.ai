@@ -352,6 +352,19 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
         ),
     ),
     CodeRevision(
+        extraction_version="2026-11-06-r6",
+        code_identity="ci1-83ac07ccf90f342a008a9d6472f03331e2e09a5c0c941d8b069f44c97c778105",
+        date="2026-11-12",
+        reason=(
+            "Two provider changes: LlamaServerProvider.generate closes the stream it "
+            "opened in `finally`; and cached prompt tokens (T17), where _parse_usage reads "
+            "usage.prompt_tokens_details.cached_tokens into cached_prompt_tokens, and "
+            "generate and generate_sync fill it from llama-server's timings.cache_n when "
+            "the usage gave none. Neither change touches _build_kwargs or a create call, "
+            "so every request is sent exactly as before. New turns only."
+        ),
+    ),
+    CodeRevision(
         extraction_version="2026-11-12-r9",
         # Before T52's Rule 28, Example 30 and generated schema, which move
         # prompt_sha256, and the schema's code, which moves code_sha256:
@@ -365,7 +378,10 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
         # Before T64's restore of the prompt and schema before T52, which moves
         # prompt_sha256 and code_sha256:
         # ci1-2091315e85f9bb98b0d93e35ac0d4923d21a972d7e6d9dd155a78ca6cce6c688.
-        code_identity="ci1-8655f1ae4c8fc2f9c406608356669698835270275a0071ccd3f997e5ea00b3f4",
+        # Before the merge of main at c9c4d36, whose provider reads cached prompt
+        # tokens, which moves code_sha256:
+        # ci1-8655f1ae4c8fc2f9c406608356669698835270275a0071ccd3f997e5ea00b3f4.
+        code_identity="ci1-84e461fc76a36420b278abc1e6f84a1ca11361e4e7844ec88cde694e0049ea7a",
         date="2026-11-12",
         reason=(
             "T48 (r9): a Stage 2 batch's utterance holds its own units only; a later batch "
@@ -385,7 +401,9 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "`cache_prompt` false, so each prompt is processed from its first token, and "
             "with the turn's reference date as `chat_template_kwargs.current_date`, which "
             "the shipped gpt-oss template renders as the system message's date in place of "
-            "the server's clock. Re-extracts history."
+            "the server's clock; the merge of main brings `cached_prompt_tokens` from "
+            "llama-server's `timings.cache_n`, read from the response, and changes no "
+            "request. Re-extracts history."
         ),
     ),
 )

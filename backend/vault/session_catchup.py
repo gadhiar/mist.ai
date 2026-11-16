@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.extraction_backlog.eligibility import policy_skip_reason
 from backend.vault.models import parse_frontmatter
 
 if TYPE_CHECKING:
@@ -192,11 +193,19 @@ class SessionNoteCatchup:
             return
         if not turns:
             return
+        # The live note leaves capability-only turns out, and so does this one.
+        # A session of only those has nothing to write, and returns here, before
+        # the attempt loop, whose exhaustion would write a `skipped` marker.
+        eligible = [t for t in turns if policy_skip_reason(t.get("answered_by")) is None]
+        if not eligible:
+            return
 
         # The note path is derived from the FIRST turn, matching how a live
         # session allocates it -- same slug algorithm, and (for catch-up
         # specifically) the date the session actually happened on rather
-        # than today's date, since this may run long after the session.
+        # than today's date, since this may run long after the session. The
+        # first LOGGED turn, capability turn or not: the live path allocates
+        # the path at the session's first turn, and the path is the dedup key.
         first = turns[0]
         date = str(first.get("timestamp", ""))[:10]
         try:
@@ -228,7 +237,7 @@ class SessionNoteCatchup:
 
         for attempt in range(1, _MAX_ATTEMPTS_PER_PASS + 1):
             try:
-                synthesis = await self._synthesizer.synthesize(turns)
+                synthesis = await self._synthesizer.synthesize(eligible)
             except Exception as exc:  # noqa: BLE001 -- best-effort
                 logger.warning(
                     "Catch-up synthesis raised for %s (attempt %d): %s",
