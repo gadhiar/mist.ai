@@ -16,10 +16,13 @@ in two stages (Design point 8):
 
 The need gate, when one is given, decides in stage 2, beside the pools and before the
 cross-encoder, how likely the turn needs memory. In `on` mode a closed decision ends the fetch
-with no block (`skip_reason="no_need"`) and cancels the pools; a band or open one proceeds. A
-gate vector that misses the deadline closes it as `deadline`, an embedder error or a refused
-vector as `need_unknown`. In `shadow` mode the gate waits and decides at the same point, is
-traced, and the fetch is served as open. A closed or band query that follows a fetch which
+with no block (`skip_reason="no_need"`) and cancels the pools; a band or open one proceeds,
+and a band turn is served at most the first `band_k` entries of the block by packing key
+(`MemoryBlockBuilder.build`'s `max_items`). A gate vector that misses the deadline closes it as
+`deadline`, an embedder error or a refused vector as `need_unknown`. In `shadow` mode the gate
+waits and decides at the same point, is traced, and the fetch is served as open; beside a
+block with text, the outcome carries the blocks a band turn would be served for each `band_k`
+of `SHADOW_CUTS` (`FetchOutcome.cuts`). A closed or band query that follows a fetch which
 served memory is also judged by the previous user turn joined to it, taking the higher
 probability. The decision is traced as `MemoryStage.need`.
 
@@ -50,7 +53,7 @@ import math
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -60,7 +63,7 @@ from backend.errors import MemoryIndexError, MemoryRerankError, MistError
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.models import graph_ref, vault_ref
 
-from .block import BLOCK_VERSION, FactList, MemoryBlockBuilder, PlacedList
+from .block import BLOCK_VERSION, FactList, MemoryBlock, MemoryBlockBuilder, PlacedList
 from .config import MemoryConfig
 from .fact_index import FactGroup, IndexedFacet, IndexedFact
 from .fts import words
@@ -120,6 +123,10 @@ _NEED_MODES: tuple[str, ...] = ("on", "shadow")
 
 # The bands after which a session's next fetch may be a follow-up of one that served memory.
 _SERVED_BANDS = frozenset({"band", "open"})
+
+# The `band_k` values a shadow fetch builds a band turn's block for (plan v8 design point 12),
+# so the selection grid reads the block a gated band turn would serve for either.
+SHADOW_CUTS: tuple[int, ...] = (1, 2)
 
 # How long a cached stage 1 and a completed prefetch stay valid.
 STAGE1_TTL_S = 30.0
@@ -288,6 +295,22 @@ class FetcherExecutors:
 
 
 @dataclass(frozen=True, slots=True)
+class FetchCut:
+    """The block a band turn with one `band_k` is served, built beside a shadow fetch's block.
+
+    Attributes:
+        result: The block `build(..., max_items=band_k)` returns for the fetch's input, as
+            the result an `on` band turn with this `band_k` is served: items, text, token
+            count and candidate dispositions. Its stage's `need` is the shadow decision and
+            its timings are the shadow fetch's.
+        lists: The fact lists the cut block placed, with their refs in it.
+    """
+
+    result: MemoryResult
+    lists: tuple[PlacedList, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class FetchOutcome:
     """A fetch's result and the fact lists its block placed.
 
@@ -313,6 +336,11 @@ class FetchOutcome:
             placed. Each fact sits at the earlier of its own position and that of the facet or
             fact that brought it; the block packs a list at its earliest member's position, so
             a list member here may sit later than its list does in the block.
+        cuts: In shadow mode, when the fetch built a block with text, the block a band turn
+            would be served for each `band_k` of `SHADOW_CUTS`, from the same input; a cut
+            that drops nothing is the block itself. Empty otherwise: with no gate, in `on`
+            mode, or with no block text. They are built after the fetch's timings are taken,
+            so the timings leave them out.
     """
 
     result: MemoryResult
@@ -320,6 +348,7 @@ class FetchOutcome:
     fused: tuple[FusedCandidate, ...] = ()
     ranked: tuple[ScoredCandidate, ...] = ()
     selected: tuple[ScoredCandidate, ...] = ()
+    cuts: Mapping[int, FetchCut] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +364,103 @@ class _Expansion:
     items: list[ScoredCandidate | FactList]
     selected: tuple[ScoredCandidate, ...]
     facets: dict[tuple[str, str], tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _Served:
+    """What a stage-2 fetch knows apart from its block, to turn any block it built into a result.
+
+    The served block and each shadow cut become results here, so a cut's result is the one an
+    `on` band turn with that `band_k` is served for the same input.
+
+    Attributes:
+        request: The turn's request.
+        ranked: The shortlist after its drops, in position order.
+        expansion: What selection and expansion handed the block.
+        dropped: The candidates that left the shortlist before the order, with the reason.
+        versions: The current version of each fact the pools found, by fact key.
+        reranked: How many candidates the cross-encoder scored.
+        timings: The fetch's timings.
+        reason: The fetch's degraded reason, or None.
+        reuse: How the fetch used a prefetch.
+        need: The need gate's decision, or None without a gate or a query.
+    """
+
+    request: MemoryRequest
+    ranked: Sequence[ScoredCandidate]
+    expansion: _Expansion
+    dropped: Sequence[tuple[FusedCandidate, CandidateDisposition]]
+    versions: dict[str, IndexedFact]
+    reranked: int
+    timings: FetchTimings
+    reason: DegradedReason | None
+    reuse: PrefetchReuse
+    need: NeedTrace | None
+
+    def result(self, block: MemoryBlock) -> MemoryResult:
+        """The result serving `block`, its stage tracing each candidate's disposition in it."""
+        placed: dict[tuple[str, str], tuple[CandidateDisposition, int | None]] = {}
+        for outcome in block.outcomes:
+            placed[_key(outcome.candidate.candidate)] = (outcome.disposition, outcome.item)
+        stage_candidates: list[MemoryCandidate] = []
+        for scored in self.ranked:
+            key = _key(scored.candidate)
+            if key in self.expansion.facets:
+                disposition, item = _facet_disposition(self.expansion.facets[key], placed)
+            elif key in placed:
+                disposition, item = placed[key]
+            else:
+                disposition, item = "dropped_rank", None
+            stage_candidates.append(
+                _stage_candidate(
+                    scored, scored.position, disposition, item, self.versions.get(key[1])
+                )
+            )
+        # Candidates that left the shortlist before the order are traced after it, by pool rank.
+        for rank, (fused_candidate, reason) in enumerate(self.dropped, start=len(self.ranked) + 1):
+            stage_candidates.append(
+                _stage_candidate(
+                    _unordered(fused_candidate),
+                    rank,
+                    reason,
+                    None,
+                    self.versions.get(fused_candidate.candidate.item_id),
+                )
+            )
+        suppressed_count = sum(1 for _, reason in self.dropped if reason == "dropped_suppressed")
+        ordered = sorted(stage_candidates, key=lambda c: (c.disposition != "injected", c.rank))
+        request = self.request
+        stage = MemoryStage(
+            ran=True,
+            skip_reason=None,
+            level=request.serving.level,
+            tier=request.serving.tier,
+            block_version=BLOCK_VERSION,
+            budget_tokens=block.budget_tokens,
+            tokens=block.tokens,
+            degraded_reason=self.reason,
+            prefetch_reuse=self.reuse,
+            reranked=self.reranked,
+            suppressed=suppressed_count,
+            narrative_suppressed=0,
+            timings=self.timings,
+            candidates=tuple(ordered[:STAGE_CANDIDATE_CAP]),
+            truncated=max(0, len(ordered) - STAGE_CANDIDATE_CAP),
+            need=self.need,
+        )
+        return MemoryResult(
+            items=block.items,
+            block_text=block.text,
+            tokens=block.tokens,
+            budget_tokens=block.budget_tokens,
+            degraded=self.reason is not None,
+            degraded_reason=self.reason,
+            timings=self.timings,
+            reranked=self.reranked,
+            suppressed=suppressed_count,
+            narrative_suppressed=0,
+            stage=stage,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,78 +913,44 @@ class MemoryFetcher:
         expansion = await self._expand(
             ranked, members, versions, stage1.suppressed, now, deadline, ledger
         )
-        block = self._builder.build(expansion.items, request=request, window=window)
-
-        placed: dict[tuple[str, str], tuple[CandidateDisposition, int | None]] = {}
-        for outcome in block.outcomes:
-            placed[_key(outcome.candidate.candidate)] = (outcome.disposition, outcome.item)
-        stage_candidates: list[MemoryCandidate] = []
-        for scored in ranked:
-            key = _key(scored.candidate)
-            if key in expansion.facets:
-                disposition, item = _facet_disposition(expansion.facets[key], placed)
-            elif key in placed:
-                disposition, item = placed[key]
-            else:
-                disposition, item = "dropped_rank", None
-            stage_candidates.append(
-                _stage_candidate(scored, scored.position, disposition, item, versions.get(key[1]))
-            )
-        # Candidates that left the shortlist before the order are traced after it, by pool rank.
-        for rank, (fused_candidate, reason) in enumerate(dropped, start=len(ranked) + 1):
-            stage_candidates.append(
-                _stage_candidate(
-                    _unordered(fused_candidate),
-                    rank,
-                    reason,
-                    None,
-                    versions.get(fused_candidate.candidate.item_id),
-                )
-            )
-        suppressed_count = sum(1 for _, reason in dropped if reason == "dropped_suppressed")
+        # An `on` band turn is served its first `band_k` entries; every other turn the block.
+        band_k = (
+            need.band_k if need is not None and need.mode == "on" and need.band == "band" else None
+        )
+        block = self._builder.build(
+            expansion.items, request=request, window=window, max_items=band_k
+        )
 
         if self._rerank_unavailable:
             ledger.reasons.add("reranker_unavailable")
         timings = self._timings(started, ledger, reuse)
-        reason = ledger.reason()
-        ordered = sorted(stage_candidates, key=lambda c: (c.disposition != "injected", c.rank))
-        stage = MemoryStage(
-            ran=True,
-            skip_reason=None,
-            level=request.serving.level,
-            tier=request.serving.tier,
-            block_version=BLOCK_VERSION,
-            budget_tokens=block.budget_tokens,
-            tokens=block.tokens,
-            degraded_reason=reason,
-            prefetch_reuse=reuse,
+        served = _Served(
+            request=request,
+            ranked=ranked,
+            expansion=expansion,
+            dropped=dropped,
+            versions=versions,
             reranked=len(scores),
-            suppressed=suppressed_count,
-            narrative_suppressed=0,
             timings=timings,
-            candidates=tuple(ordered[:STAGE_CANDIDATE_CAP]),
-            truncated=max(0, len(ordered) - STAGE_CANDIDATE_CAP),
+            reason=ledger.reason(),
+            reuse=reuse,
             need=need,
         )
-        result = MemoryResult(
-            items=block.items,
-            block_text=block.text,
-            tokens=block.tokens,
-            budget_tokens=block.budget_tokens,
-            degraded=reason is not None,
-            degraded_reason=reason,
-            timings=timings,
-            reranked=len(scores),
-            suppressed=suppressed_count,
-            narrative_suppressed=0,
-            stage=stage,
-        )
+        cuts: dict[int, FetchCut] = {}
+        if self._need_gate is not None and self._need_mode == "shadow" and block.text is not None:
+            # Built after the timings, so they measure the block the turn is served.
+            for k in SHADOW_CUTS:
+                cut = self._builder.build(
+                    expansion.items, request=request, window=window, max_items=k
+                )
+                cuts[k] = FetchCut(result=served.result(cut), lists=cut.lists)
         return FetchOutcome(
-            result=result,
+            result=served.result(block),
             lists=block.lists,
             fused=tuple(fused),
             ranked=tuple(ranked),
             selected=expansion.selected,
+            cuts=cuts,
         )
 
     async def _drop_before_rerank(
@@ -1953,16 +2045,20 @@ def _facet_disposition(
     member_keys: Sequence[str],
     placed: dict[tuple[str, str], tuple[CandidateDisposition, int | None]],
 ) -> tuple[CandidateDisposition, int | None]:
-    """A selected facet's disposition: injected at its first placed member's item, or not."""
+    """A selected facet's disposition: injected at its first placed member's item, or not.
+
+    A facet with no member injected is `dropped_band` when a band turn's cut dropped one of
+    its members, since the full block would have shown that one, and `dropped_budget`
+    otherwise.
+    """
+    dispositions = [placed.get(("fact", key), ("dropped_rank", None)) for key in member_keys]
     items = [
-        item
-        for disposition, item in (
-            placed.get(("fact", key), ("dropped_rank", None)) for key in member_keys
-        )
-        if disposition == "injected" and item is not None
+        item for disposition, item in dispositions if disposition == "injected" and item is not None
     ]
     if items:
         return "injected", min(items)
+    if any(disposition == "dropped_band" for disposition, _ in dispositions):
+        return "dropped_band", None
     return "dropped_budget", None
 
 
@@ -2085,8 +2181,10 @@ __all__ = [
     "GATE_EXECUTOR",
     "INDEX_EXECUTOR",
     "MODEL_EXECUTOR",
+    "SHADOW_CUTS",
     "FactSearch",
     "FetchClock",
+    "FetchCut",
     "FetchOutcome",
     "FetcherExecutors",
     "MemoryFetcher",

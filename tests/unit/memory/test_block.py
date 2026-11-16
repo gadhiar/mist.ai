@@ -13,14 +13,18 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from backend.memory.block import (
+    _PACKING_DISPOSITIONS,
     BLOCK_VERSION,
     CLOSE_MARKER,
     HEADER,
+    NO_SEARCH_LINE,
     OPEN_MARKER,
+    PARTIAL_LINE,
     BlockPlacement,
     FactList,
     MemoryBlock,
     MemoryBlockBuilder,
+    PackingDisposition,
     PackingOutcome,
     describe_when,
     speech_text,
@@ -311,8 +315,9 @@ def test_an_items_date_is_charged_to_the_budget() -> None:
     assert "[m1] 3 Oct: w0 w1 w2 w3 w4" in exact.text.splitlines()
 
 
+@pytest.mark.parametrize("max_items", [None, 1, 2], ids=["open", "cut-1", "cut-2"])
 @pytest.mark.parametrize("budget", range(0, 140, 3))
-def test_the_block_never_exceeds_the_budget(budget: int) -> None:
+def test_the_block_never_exceeds_the_budget(budget: int, max_items: int | None) -> None:
     scored = [
         _scored("fact", "f1", _words(12, "a"), 0.95),
         _scored("note", "n1", _words(30, "b"), 0.9),
@@ -327,7 +332,7 @@ def test_the_block_never_exceeds_the_budget(budget: int) -> None:
         (_request(budget_tokens=budget, conversation_start=True), None),
         (_request(budget_tokens=budget), YESTERDAY),
     ):
-        block = builder.build(scored, request=request, window=window)
+        block = builder.build(scored, request=request, window=window, max_items=max_items)
         if block.text is None:
             assert block.tokens == 0
             continue
@@ -1045,7 +1050,13 @@ def test_no_candidates_report_no_outcomes() -> None:
 
 @pytest.mark.parametrize(
     ("disposition", "item"),
-    [("injected", None), ("dropped_budget", 1), ("dropped_no_fit", 2), ("injected", 0)],
+    [
+        ("injected", None),
+        ("dropped_budget", 1),
+        ("dropped_no_fit", 2),
+        ("dropped_band", 3),
+        ("injected", 0),
+    ],
 )
 def test_an_outcome_keeps_a_block_position_to_injected_candidates(
     disposition: str, item: int | None
@@ -1217,6 +1228,165 @@ def test_a_fact_cannot_be_both_in_a_list_and_alone() -> None:
     alone = _member(facts[2], 0.5)
     with pytest.raises(ValueError, match="more than once"):
         _builder().build([fact_list, alone], request=_request(), window=None)
+
+
+# --- The band cut --------------------------------------------------------------------------
+
+
+def _ref_lines(block: MemoryBlock) -> list[str]:
+    assert block.text is not None
+    return [line for line in block.text.splitlines() if line.startswith("[m")]
+
+
+def test_a_band_cut_of_one_serves_a_three_fact_list_whole_as_its_one_entry() -> None:
+    fact_list, facts, _ = _languages()  # packs at position 201, its earliest member's
+    single = _scored("fact", "f-tea", "User likes tea.", 0.5)  # position 501
+    note = _scored("note", "n1", "the garden plan", 0.4)  # position 601
+    scored = [single, note, fact_list]
+
+    open_block = _builder().build(scored, request=_request(), window=None)
+    cut = _builder().build(scored, request=_request(), window=None, max_items=1)
+
+    assert len(open_block.items) == 3
+    # The list counts as one entry, so a cut of one serves all three facts in its sentence.
+    assert _ref_lines(cut) == [f"[m1] {SIBLINGS_DATE}: User uses Vim, Rust and Zig."]
+    (placed,) = cut.lists
+    assert (placed.ref, placed.facts) == ("m1", fact_list)
+    assert _outcomes(cut) == {
+        facts[1].fact_key: ("injected", 1),
+        facts[0].fact_key: ("injected", 1),
+        "f-tea": ("dropped_band", None),
+        "n1": ("dropped_band", None),
+    }
+
+
+def test_a_band_cut_keeps_the_first_entries_by_packing_key_not_the_reserves() -> None:
+    # A flagged turn packs the episode first, through the continuity reserve; the cut still
+    # keeps the entries earliest by packing key, so the facts ahead of it stay and it goes.
+    episode = _scored("episode", "ep", _words(3), 0.5, when=NOW - timedelta(days=1), position=3)
+    first = _scored("fact", "f1", _words(3), 0.5, position=1)
+    second = _scored("fact", "f2", _words(3), 0.5, position=2)
+    scored = [episode, second, first]
+    request = _request(conversation_start=True)
+
+    open_block = _builder().build(scored, request=request, window=None)
+    one = _builder().build(scored, request=request, window=None, max_items=1)
+    two = _builder().build(scored, request=request, window=None, max_items=2)
+
+    assert open_block.reserved_tokens > 0 and _ids(open_block) == ["f1", "f2", "ep"]
+    assert _ids(one) == ["f1"]
+    assert _ids(two) == ["f1", "f2"]
+    assert _outcomes(two)["ep"] == ("dropped_band", None)
+    assert _outcomes(one)["f2"] == ("dropped_band", None)
+
+
+def test_a_cut_that_drops_an_entry_ends_with_the_partial_line() -> None:
+    scored = _mixed()  # positions: n1 51, f2 101, e1 201, f1 401, x1 501
+    kept = [entry for entry in scored if entry.candidate.item_id in ("n1", "f2")]
+
+    cut = _builder().build(scored, request=_request(), window=None, max_items=2)
+    alone = _builder().build(kept, request=_request(), window=None)
+
+    assert cut.text is not None and alone.text is not None
+    # The kept entries laid out by section, then the line, then the close marker.
+    assert cut.text.splitlines() == [*alone.text.splitlines()[:-1], PARTIAL_LINE, CLOSE_MARKER]
+    assert _ids(cut) == ["f2", "n1"]
+    assert cut.items == alone.items
+    assert cut.tokens == COUNTER.count(cut.text) == alone.tokens + COUNTER.count(PARTIAL_LINE)
+    assert _outcomes(cut) == {
+        "f2": ("injected", 1),
+        "n1": ("injected", 2),
+        "e1": ("dropped_band", None),
+        "f1": ("dropped_band", None),
+        "x1": ("dropped_band", None),
+    }
+
+
+def test_a_cut_leaves_what_packing_dropped_as_packing_dropped_it() -> None:
+    scored = [
+        _scored("fact", "high", _words(9), 0.9),
+        _scored("fact", "huge", _words(200), 0.85),
+        _scored("fact", "mid", _words(9), 0.6),
+        _scored("fact", "low", _words(9), 0.4),
+    ]
+    budget = FRAME + FACTS_HEADING + 2 * (1 + 9) + 5
+
+    cut = _builder(block_tokens=budget).build(scored, request=_request(), window=None, max_items=1)
+
+    assert _outcomes(cut) == {
+        "high": ("injected", 1),
+        "mid": ("dropped_band", None),
+        "low": ("dropped_budget", None),
+        "huge": ("dropped_no_fit", None),
+    }
+
+
+@pytest.mark.parametrize("max_items", [3, 4])
+def test_a_block_of_max_items_entries_or_fewer_is_served_word_for_word(max_items: int) -> None:
+    fact_list, _, _ = _languages()
+    singles = [_scored("fact", f"f{index}", _words(9), 0.5 - index / 10) for index in range(3)]
+    list_line = 1 + 4 + 6  # the ref, the four-word date and "User uses Vim, Rust and Zig."
+    # Room for the list and two singles: the third is dropped by packing, not by the cut.
+    budget = FRAME + FACTS_HEADING + list_line + 2 * (1 + 9)
+    builder = _builder(block_tokens=budget)
+
+    open_block = builder.build([*singles, fact_list], request=_request(), window=None)
+    cut = builder.build([*singles, fact_list], request=_request(), window=None, max_items=max_items)
+
+    assert len(open_block.items) == 3
+    assert _outcomes(open_block)["f2"] == ("dropped_budget", None)
+    assert cut == open_block
+    assert cut.text is not None and PARTIAL_LINE not in cut.text
+
+
+@pytest.mark.parametrize(("room", "kept"), [(1, ["f0"]), (0, [])], ids=["one-fits", "none-fits"])
+def test_a_cut_that_would_pass_the_budget_keeps_fewer_entries(room: int, kept: list[str]) -> None:
+    """The line can cost more than the entries the cut drops; the block still fits its budget.
+
+    Each fact line is two tokens, so a cut of two (four tokens and the line) passes a budget
+    that holds one entry and the line, and a budget one line short of that holds none.
+    """
+    scored = [_scored("fact", f"f{index}", "w", 0.9 - index / 100) for index in range(3)]
+    budget = FRAME + FACTS_HEADING + room * 2 + COUNTER.count(PARTIAL_LINE)
+    builder = _builder(block_tokens=budget)
+
+    open_block = builder.build(scored, request=_request(), window=None)
+    cut = builder.build(scored, request=_request(), window=None, max_items=2)
+
+    assert len(open_block.items) == 3
+    assert _ids(cut) == kept
+    assert cut.tokens <= budget
+    banded = {
+        key for key, (disposition, _) in _outcomes(cut).items() if disposition == "dropped_band"
+    }
+    assert banded == {f"f{index}" for index in range(3)} - set(kept)
+    if kept:
+        assert cut.text is not None and cut.text.splitlines()[-2] == PARTIAL_LINE
+        assert cut.tokens == COUNTER.count(cut.text)
+    else:
+        assert (cut.text, cut.tokens, cut.lists) == (None, 0, ())
+
+
+@pytest.mark.parametrize("max_items", [0, -1])
+def test_a_cut_needs_at_least_one_entry(max_items: int) -> None:
+    with pytest.raises(ValueError, match="max_items"):
+        _builder().build(_mixed(), request=_request(), window=None, max_items=max_items)
+
+
+def test_dropped_band_is_a_packing_disposition() -> None:
+    assert "dropped_band" in PackingDisposition.__args__  # type: ignore[attr-defined]
+    assert "dropped_band" in _PACKING_DISPOSITIONS
+    outcome = PackingOutcome(
+        candidate=_scored("fact", "f1", "x", 0.5), disposition="dropped_band", item=None
+    )
+    assert outcome.disposition == "dropped_band"
+
+
+def test_the_per_turn_lines_are_one_sentence_each() -> None:
+    assert NO_SEARCH_LINE == "Memory was not searched for this message."
+    assert PARTIAL_LINE == "Only the closest memories are shown."
+    for line in (NO_SEARCH_LINE, PARTIAL_LINE):
+        assert re.fullmatch(r"[A-Z][^.!?\n]*\.", line)
 
 
 # --- Determinism ---------------------------------------------------------------------------

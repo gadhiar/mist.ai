@@ -41,6 +41,7 @@ CandidateDisposition = Literal[
     "dropped_suppressed",
     "dropped_no_members",
     "dropped_late",
+    "dropped_band",
 ]
 StageSkipReason = Literal["off", "zero_budget", "error", "no_need"]
 PrefetchReuse = Literal["block", "stage1", "none"]
@@ -67,6 +68,7 @@ _CANDIDATE_DISPOSITIONS: tuple[str, ...] = (
     "dropped_suppressed",
     "dropped_no_members",
     "dropped_late",
+    "dropped_band",
 )
 # A facet's trace ref: `facet:<facet_key>`, so no tool ref can collide with it.
 FACET_REF_PREFIX = "facet:"
@@ -292,7 +294,10 @@ class MemoryCandidate:
         score: Its order score, `1/(60 + pool_rank) + 1/(60 + ce_rank)`, the second term 0
             when not reranked.
         item: 1-based position in the block for an injected candidate, else None.
-        disposition: What became of it: `injected`, or the reason it was dropped.
+        disposition: What became of it: `injected`, or the reason it was dropped;
+            `dropped_band` for one packing placed and a band turn's cut then dropped, and for
+            a selected facet none of whose members is injected and one of which the cut
+            dropped.
         pool_rank: 1-based position in the fused order; None from a producer that has none.
         ce_rank: 1-based place among the reranked candidates by cross-encoder probability,
             ties by pool rank; None when the cross-encoder did not score it.

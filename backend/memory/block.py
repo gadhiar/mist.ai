@@ -19,8 +19,9 @@ builds every message. The builder takes the placement only because it changes on
 the block: the user's past speech is "I said" inside the user's message and "The user said" in
 a system message.
 
-Besides the text, the block reports what packing did with every candidate it was given
-(`PackingOutcome`), which the fetcher turns into the trace's candidate dispositions.
+Besides the text, the block reports what packing, and a band turn's cut, did with every
+candidate it was given (`PackingOutcome`), which the fetcher turns into the trace's candidate
+dispositions.
 """
 
 from __future__ import annotations
@@ -65,6 +66,14 @@ HEADER = (
     "the m-numbers aloud."
 )
 
+# The per-turn lines of plan v8 design point 10, one sentence each, which tell the model that
+# what the block shows is not all memory holds, so it knows to use its tools. A block that a
+# band turn's cut dropped an entry from ends with `PARTIAL_LINE`, just before the close marker.
+# `NO_SEARCH_LINE` is for a turn the need gate closed, which has no block; the builder never
+# writes it, and placing it where the block would go is the handler's (plan v8 T10).
+PARTIAL_LINE = "Only the closest memories are shown."
+NO_SEARCH_LINE = "Memory was not searched for this message."
+
 FACTS_HEADING = "Facts:"
 CONVERSATIONS_HEADING = "Earlier conversations:"
 NOTES_HEADING = "Notes:"
@@ -87,8 +96,14 @@ BlockPlacement = Literal["user_prefix", "system_tail"]
 # What packing did with a candidate. `dropped_no_fit`: the item does not fit the budget even as
 # the block's only item, so a larger budget, not fewer rivals, would have placed it.
 # `dropped_budget`: it fits alone, but items earlier in the fetch's order took the room.
-PackingDisposition = Literal["injected", "dropped_budget", "dropped_no_fit"]
-_PACKING_DISPOSITIONS: tuple[str, ...] = ("injected", "dropped_budget", "dropped_no_fit")
+# `dropped_band`: packing placed it, and a band turn's cut (`build`'s `max_items`) dropped it.
+PackingDisposition = Literal["injected", "dropped_budget", "dropped_no_fit", "dropped_band"]
+_PACKING_DISPOSITIONS: tuple[str, ...] = (
+    "injected",
+    "dropped_budget",
+    "dropped_no_fit",
+    "dropped_band",
+)
 
 # Who is speaking, in the voice of the block. The block addresses the model as "you" (the
 # header's "use your tools"), so the assistant's earlier words are "You said" at both
@@ -280,7 +295,7 @@ class PackingOutcome:
 
     Attributes:
         candidate: The candidate as ranking ordered it.
-        disposition: `injected`, `dropped_budget` or `dropped_no_fit` (see
+        disposition: `injected`, `dropped_budget`, `dropped_no_fit` or `dropped_band` (see
             `PackingDisposition`).
         item: The 1-based block position of the item that carries it (the n of `mn`) when
             injected, else None. Every scored member of a list shares the list's position.
@@ -318,7 +333,8 @@ class MemoryBlock:
     """One turn's packed block and what became of each candidate.
 
     Attributes:
-        items: The items placed, in block order, numbered m1..mN; empty when nothing fit. A
+        items: The items placed, in block order, numbered m1..mN; empty when nothing fit or
+            a band turn's cut left nothing. A
             list is one item: named by its earliest member (`item_id`, `source`, `when`,
             `score`), with the list's sentence as its `text`.
         text: The rendered block, or None when no item was placed.
@@ -381,6 +397,10 @@ class MemoryBlockBuilder:
     items did not use flows back. An item that does not fit is
     skipped and smaller ones after it still get their turn. A fact list is one item, packed
     whole or not at all.
+
+    A band turn's block (`build`'s `max_items`) is cut from that packing, not packed anew: of
+    the entries packed, it keeps the first `max_items` by packing key, whatever order packing
+    took them in, so the continuity reserve's items do not jump the queue.
     """
 
     def __init__(
@@ -413,6 +433,7 @@ class MemoryBlockBuilder:
         *,
         request: MemoryRequest,
         window: TimeWindow | None,
+        max_items: int | None = None,
     ) -> MemoryBlock:
         """Pack and render one turn's block.
 
@@ -426,13 +447,25 @@ class MemoryBlockBuilder:
             window: The turn's temporal window, or None when the user named none; any window,
                 including "last time", flags the continuity reserve. It has no default, so a
                 caller cannot drop the reserve by leaving it out.
+            max_items: A band turn's entry count (`band_k`), or None for the whole block.
+                Packing runs as without it; then, when it placed more entries than this, the
+                first `max_items` placed by packing key (a list counting as one) are laid out
+                by section and rendered with `PARTIAL_LINE` before the close marker, and each
+                entry dropped is `dropped_band`. Should the line take the block past its
+                budget, the last of the kept entries are dropped as well, until it fits or none
+                is left. When packing placed `max_items` entries or fewer, the block is the
+                one built without it.
 
         Returns:
-            The block; its `text` is None when no item fits or there are none.
+            The block; its `text` is None when no item fits or there are none, or when a cut
+            leaves no entry.
 
         Raises:
-            ValueError: One candidate or fact is given more than once, alone or in lists.
+            ValueError: One candidate or fact is given more than once, alone or in lists, or
+                `max_items` is below 1.
         """
+        if max_items is not None and max_items < 1:
+            raise ValueError(f"max_items must be at least 1, got {max_items}")
         budget = self._budget(request)
         flagged = window is not None or request.conversation_start
         reserve = math.floor(budget * self._config.continuity_share) if flagged else 0
@@ -457,11 +490,25 @@ class MemoryBlockBuilder:
             if self._count([*(entries[i] for i in chosen), entry]) <= budget:
                 chosen.append(index)
 
+        cut: set[int] = set()
+        if max_items is not None and len(chosen) > max_items:
+            # `entries` is in packing-key order, so the lowest indices are the first by it.
+            kept = sorted(chosen)[:max_items]
+            while kept and self._count([entries[i] for i in kept], partial=True) > budget:
+                kept.pop()
+            cut = set(chosen) - set(kept)
+            chosen = kept
+
         placed = _layout([entries[index] for index in chosen])
         positions = {id(entry): position for position, entry in enumerate(placed, start=1)}
         outcomes: list[PackingOutcome] = []
-        for entry in entries:
-            disposition, item = self._outcome(entry, positions, budget)
+        for index, entry in enumerate(entries):
+            disposition: PackingDisposition
+            item: int | None
+            if index in cut:
+                disposition, item = "dropped_band", None
+            else:
+                disposition, item = self._outcome(entry, positions, budget)
             outcomes.extend(
                 PackingOutcome(candidate=member, disposition=disposition, item=item)
                 for member in entry.members
@@ -476,7 +523,7 @@ class MemoryBlockBuilder:
                 outcomes=tuple(outcomes),
                 lists=(),
             )
-        text = _text(placed)
+        text = _text(placed, partial=bool(cut))
         return MemoryBlock(
             items=tuple(_item(entry, position) for position, entry in enumerate(placed, start=1)),
             text=text,
@@ -561,13 +608,13 @@ class MemoryBlockBuilder:
         )
         return f"{date}: {body}" if body else date
 
-    def _count(self, chosen: Sequence[_Entry]) -> int:
+    def _count(self, chosen: Sequence[_Entry], *, partial: bool = False) -> int:
         """The token count of the block `chosen` would render, frame and refs included.
 
-        Every trial during packing is counted this way, so the count that admits an item is
-        the count of the exact text that ships.
+        Every trial during packing and cutting is counted this way, so the count that admits
+        an item is the count of the exact text that ships. `partial` counts `PARTIAL_LINE` in.
         """
-        return self._counter.count(_text(_layout(chosen)))
+        return self._counter.count(_text(_layout(chosen), partial=partial))
 
     def _speech_segment(self, line: str) -> str:
         """One transcript line: `I said "..."` (or `The user said`), `You said "..."` or plain."""
@@ -602,8 +649,11 @@ def _layout(chosen: Iterable[_Entry]) -> list[_Entry]:
     return placed
 
 
-def _text(placed: Sequence[_Entry]) -> str:
-    """The block for entries already in block order, numbering refs m1..mN as it goes."""
+def _text(placed: Sequence[_Entry], *, partial: bool = False) -> str:
+    """The block for entries already in block order, numbering refs m1..mN as it goes.
+
+    `partial` puts `PARTIAL_LINE` on the line before the close marker.
+    """
     lines = [OPEN_MARKER, HEADER]
     current: str | None = None
     for position, entry in enumerate(placed, start=1):
@@ -612,6 +662,8 @@ def _text(placed: Sequence[_Entry]) -> str:
             lines.extend(("", heading))
             current = heading
         lines.append(f"[{_ref(position)}] {entry.body}")
+    if partial:
+        lines.append(PARTIAL_LINE)
     lines.append(CLOSE_MARKER)
     return "\n".join(lines)
 

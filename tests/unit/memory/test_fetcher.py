@@ -24,7 +24,7 @@ import pytest
 
 from backend.errors import EmbeddingError, MemoryIndexError, MemoryRerankError
 from backend.knowledge.models import graph_ref, vault_ref
-from backend.memory.block import HEADER, MemoryBlockBuilder
+from backend.memory.block import CLOSE_MARKER, HEADER, PARTIAL_LINE, MemoryBlockBuilder
 from backend.memory.config import MemoryConfig
 from backend.memory.facets import facet_key
 from backend.memory.fact_index import FactGroup, FactIndex, IndexedFacet, IndexedFact
@@ -1555,11 +1555,13 @@ class FakeGate:
         events: list[str] | None = None,
         refuse: bool = False,
         before_decide: Callable[[], None] | None = None,
+        band_k: int = 1,
     ) -> None:
         self.embedder = embedder if embedder is not None else FakeEmbedder()
         self.shares_query_vector = shares_query_vector
         self.query_prefix = ""
-        self.model = SimpleNamespace(theta_low=_THETA_LOW, theta_high=_THETA_HIGH, band_k=1)
+        self.band_k = band_k
+        self.model = SimpleNamespace(theta_low=_THETA_LOW, theta_high=_THETA_HIGH, band_k=band_k)
         twin = FakeEmbedder()
         self._scores = {
             tuple(twin.generate_embedding(text)): p for text, p in (scores or {}).items()
@@ -1590,7 +1592,7 @@ class FakeGate:
             p=p,
             theta_low=_THETA_LOW,
             theta_high=_THETA_HIGH,
-            band_k=1,
+            band_k=self.band_k,
             need_ids=_NEED_IDS,
             no_need_ids=_NO_NEED_IDS,
         )
@@ -1663,9 +1665,13 @@ def _is_context(text: str) -> bool:
     return "\n" in text
 
 
+def _need_free(result: MemoryResult) -> MemoryResult:
+    return replace(result, stage=replace(result.stage, need=None))
+
+
 def _without_need(outcome: FetchOutcome) -> FetchOutcome:
-    result = outcome.result
-    return replace(outcome, result=replace(result, stage=replace(result.stage, need=None)))
+    """The outcome as an ungated fetch gives it: no need trace and no shadow cuts."""
+    return replace(outcome, result=_need_free(outcome.result), cuts={})
 
 
 def _trace(band: str, p: float | None, **overrides: object) -> NeedTrace:
@@ -2014,6 +2020,181 @@ async def test_a_failed_shadow_vector_leaves_the_outcome_of_an_ungated_fetch(
     )
     assert shadow.result.degraded_reason is None and shadow.result.items
     assert _without_need(shadow) == ungated
+
+
+# -- the band cut -----------------------------------------------------------------------------
+
+_BAND_P = 0.45
+_BAND_QUERY = "do I use vim and rust at tidewater"
+_TIDEWATER = _fact("Tidewater Survey")
+
+
+def _band_input(fact_index: FactIndex, index: HookedIndex, *, entries: int) -> MemoryConfig:
+    """Script the pools so the open block holds `entries` entries, and return the config.
+
+    Two: a three-fact list (Vim and Rust selected, a third sibling brought by expansion, under
+    a cap of three) at position 1, then Tidewater Survey alone. One: Tidewater Survey alone.
+    """
+    tools = {row.object_name: row for row in _tools()}
+    fact_index.upsert([*tools.values(), _TIDEWATER])
+    if entries == 2:
+        index.script(tools["Vim"], tools["Rust"], _TIDEWATER)
+    else:
+        index.script(_TIDEWATER)
+    return _config(select_k=3, list_max_items=3)
+
+
+def _band_fetcher(
+    index: HookedIndex,
+    executors: FetcherExecutors,
+    config: MemoryConfig,
+    *,
+    mode: str = "on",
+    band_k: int = 1,
+    p: float | None = _BAND_P,
+) -> MemoryFetcher:
+    """A fetcher on the scripted pools; `p` None gives it no gate."""
+    gate = None if p is None else FakeGate(default=p, band_k=band_k)
+    return _fetcher(
+        index,
+        executors,
+        reranker=ScriptedReranker({"vim": 0.9, "rust": 0.9, "tidewater": 0.5}),
+        config=config,
+        need_gate=gate,
+        need_mode=mode,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_band_turn_serves_a_three_fact_list_whole_as_its_one_entry(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    config = _band_input(fact_index, index, entries=2)
+
+    outcome = await _band_fetcher(index, executors, config).fetch_outcome(_request(_BAND_QUERY))
+
+    result = outcome.result
+    assert result.stage.need == _trace("band", _BAND_P)
+    [item] = result.items
+    [placed] = outcome.lists
+    assert (item.ref, placed.ref, len(placed.facts.facts)) == ("m1", "m1", 3)
+    assert result.block_text is not None
+    assert result.block_text.splitlines()[-2:] == [PARTIAL_LINE, CLOSE_MARKER]
+    assert result.tokens == result.stage.tokens == FakeTokenCounter().count(result.block_text)
+    by_ref = _by_ref(result)
+    assert (by_ref[_ref(_TIDEWATER)].disposition, by_ref[_ref(_TIDEWATER)].item) == (
+        "dropped_band",
+        None,
+    )
+    tools = {row.object_name: row for row in _tools()}
+    assert {fact.object_name for fact in placed.facts.facts} >= {"Vim", "Rust"}
+    # Of the list's facts only the two selected were ranked, so only they are stage candidates.
+    assert {by_ref[_ref(tools[name])].item for name in ("Vim", "Rust")} == {1}
+    assert outcome.cuts == {}
+
+
+@pytest.mark.asyncio
+async def test_a_shadow_band_turn_is_not_cut(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    config = _band_input(fact_index, index, entries=2)
+
+    shadow = await _band_fetcher(index, executors, config, mode="shadow").fetch_outcome(
+        _request(_BAND_QUERY)
+    )
+    ungated = await _band_fetcher(index, executors, config, p=None).fetch_outcome(
+        _request(_BAND_QUERY)
+    )
+
+    assert shadow.result.stage.need == _trace("band", _BAND_P, mode="shadow")
+    assert len(shadow.result.items) == 2
+    assert shadow.result.block_text is not None and PARTIAL_LINE not in shadow.result.block_text
+    assert _without_need(shadow) == ungated
+
+
+@pytest.mark.parametrize("entries", [2, 1], ids=["two-entries", "one-entry"])
+@pytest.mark.asyncio
+async def test_each_shadow_cut_is_the_block_a_band_turn_with_that_band_k_serves(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, entries: int
+) -> None:
+    config = _band_input(fact_index, index, entries=entries)
+
+    shadow = await _band_fetcher(index, executors, config, mode="shadow").fetch_outcome(
+        _request(_BAND_QUERY)
+    )
+
+    assert len(shadow.result.items) == entries
+    assert set(shadow.cuts) == {1, 2}
+    for band_k, cut in shadow.cuts.items():
+        served = await _band_fetcher(index, executors, config, band_k=band_k).fetch_outcome(
+            _request(_BAND_QUERY)
+        )
+        assert served.result.stage.need == _trace("band", _BAND_P, band_k=band_k)
+        assert _need_free(cut.result) == _need_free(served.result)
+        assert cut.lists == served.lists
+        assert cut.result.block_text is not None
+        assert cut.result.tokens == FakeTokenCounter().count(cut.result.block_text)
+        if entries <= band_k:
+            # A cut that drops nothing is the open block.
+            assert cut.result.block_text == shadow.result.block_text
+            assert cut.result.items == shadow.result.items
+        else:
+            assert len(cut.result.items) == band_k
+            assert PARTIAL_LINE in cut.result.block_text
+
+
+@pytest.mark.parametrize("case", ["on-open", "on-band", "no-gate", "shadow-no-block"])
+@pytest.mark.asyncio
+async def test_cuts_are_empty_outside_shadow_mode_or_without_a_block(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, case: str
+) -> None:
+    config = _band_input(fact_index, index, entries=2)
+    if case == "shadow-no-block":
+        index.script()
+    p = {"on-open": 0.9, "on-band": _BAND_P, "no-gate": None}.get(case, _BAND_P)
+    mode = "on" if case.startswith("on-") else "shadow"
+
+    outcome = await _band_fetcher(index, executors, config, mode=mode, p=p).fetch_outcome(
+        _request(_BAND_QUERY)
+    )
+
+    assert (outcome.result.block_text is None) == (case == "shadow-no-block")
+    assert outcome.cuts == {}
+
+
+@pytest.mark.asyncio
+async def test_a_facet_whose_members_the_band_cut_dropped_is_dropped_band(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    """Order: Heron Works (1), the clubs facet (2), Filler (3), Kestrel (4).
+
+    Heron Works is no club, so with `band_k` 1 it is the one entry kept, and every member the
+    facet brought (Kestrel, Wren and Gull, at the facet's position) is cut.
+    """
+    clubs = {name: row for name, row in _clubs().items() if name != "heron"}
+    heron = _fact("Heron Works")
+    filler = _fact("Filler Works")
+    fact_index.upsert([*clubs.values(), heron, filler])
+    index.script(heron, clubs["kestrel"], filler)
+    index.script_facets(_CLUBS)
+    fetcher = _fetcher(
+        index,
+        executors,
+        reranker=_member_scores(),
+        config=_config(facets=True, select_k=2, list_max_items=3),
+        need_gate=FakeGate(default=_BAND_P),
+    )
+
+    outcome = await fetcher.fetch_outcome(_request("which clubs"))
+
+    assert [item.item_id for item in outcome.result.items] == [heron.fact_key]
+    by_ref = _by_ref(outcome.result)
+    assert by_ref[_ref(heron)].disposition == "injected"
+    # Of the members, only Kestrel was ranked, so only it is a stage candidate.
+    assert by_ref[_ref(clubs["kestrel"])].disposition == "dropped_band"
+    assert len(outcome.selected) == 5  # Heron Works, the facet and its three members
+    facet = by_ref[f"facet:{_CLUBS}"]
+    assert (facet.disposition, facet.item) == ("dropped_band", None)
 
 
 # -- follow-ups -------------------------------------------------------------------------------
