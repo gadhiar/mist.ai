@@ -30,6 +30,7 @@ from backend.realtime.budget import (
     DEFAULT_WAKE_PHRASES,
     STAGE_FIELDS,
     BargeInConfig,
+    CharacterConfig,
     EndpointingConfig,
     EngineOption,
     PlacementConfig,
@@ -252,6 +253,7 @@ CONFIG_DEFAULTS = [
             "fade_ms": 30,
             "progress_interval_ms": 100,
             "frame_ms": 40,
+            "character": None,
         },
         id="playback",
     ),
@@ -474,7 +476,7 @@ class TestLoadVoiceSettingsDefaults:
             budget=BUDGET_PRESETS["floor"],
             endpointing=EndpointingConfig(),
             barge_in=BargeInConfig(),
-            playback=PlaybackConfig(),
+            playback=PlaybackConfig(character=CharacterConfig()),
             segmenter=SegmenterConfig(),
             placement=PlacementConfig(),
             turn=TurnConfig(),
@@ -602,6 +604,8 @@ VARIABLES = [
     ("MIST_VOICE_WAKE_ATTEND_CUE", "false", "wake.attend_cue", False),
     ("MIST_VOICE_KWS_MODEL", "mist-wake-2", "placement.kws_model", "mist-wake-2"),
     ("MIST_VOICE_KWS_THREADS", "2", "placement.kws_threads", 2),
+    ("MIST_VOICE_CHARACTER", "false", "playback.character", None),
+    ("MIST_VOICE_CHARACTER_DOUBLE_GAIN", "0.2", "playback.character.double_gain", 0.2),
 ]
 
 # Read from a file the variable names, so the file tests cover them.
@@ -619,8 +623,7 @@ def _with_path(settings: VoiceSettings, path: str, value: object) -> VoiceSettin
     head, _, rest = path.partition(".")
     if not rest:
         return dataclasses.replace(settings, **{head: value})
-    child = getattr(settings, head)
-    return dataclasses.replace(settings, **{head: dataclasses.replace(child, **{rest: value})})
+    return dataclasses.replace(settings, **{head: _with_path(getattr(settings, head), rest, value)})
 
 
 class TestLoadVoiceSettingsVariables:
@@ -710,8 +713,26 @@ class TestLoadVoiceSettingsVariables:
             "MIST_VOICE_LOGPROB_THRESHOLD",
             "MIST_VOICE_TOOL_CANCEL_GRACE_MS",
             "MIST_VOICE_WAKE_ARBITRATION_MS",
+            "MIST_VOICE_CHARACTER",
+            "MIST_VOICE_CHARACTER_DOUBLE_GAIN",
             "VOICE_PROFILE",
         }
+
+    def test_the_character_stage_is_on_by_default_with_the_ear_tests_double_gain(self):
+        character = load_voice_settings({}).playback.character
+
+        assert character == CharacterConfig()
+        assert character.double_gain == 0.35
+
+    @pytest.mark.parametrize("raw", ["false", "0", "off", "NO"])
+    def test_the_character_switch_turns_the_whole_stage_off_limiter_included(self, raw):
+        assert load_voice_settings({"MIST_VOICE_CHARACTER": raw}).playback.character is None
+
+    def test_the_docstring_names_both_character_variables(self):
+        doc = load_voice_settings.__doc__
+
+        assert "`MIST_VOICE_CHARACTER`" in doc
+        assert "`MIST_VOICE_CHARACTER_DOUBLE_GAIN`" in doc
 
 
 def _phrases_file(tmp_path, content: object) -> dict[str, str]:
@@ -1133,3 +1154,14 @@ class TestLoadVoiceSettingsErrors:
     def test_an_empty_voice_profile_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="VOICE_PROFILE"):
             load_voice_settings({"VOICE_PROFILE": ""})
+
+    @pytest.mark.parametrize("enabled", ["true", "false"])
+    def test_a_double_gain_above_one_raises_naming_the_variable(self, enabled):
+        environ = {"MIST_VOICE_CHARACTER": enabled, "MIST_VOICE_CHARACTER_DOUBLE_GAIN": "1.5"}
+
+        with pytest.raises(ValueError, match="MIST_VOICE_CHARACTER_DOUBLE_GAIN"):
+            load_voice_settings(environ)
+
+    def test_an_unreadable_character_switch_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_CHARACTER"):
+            load_voice_settings({"MIST_VOICE_CHARACTER": "maybe"})

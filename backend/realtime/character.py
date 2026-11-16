@@ -33,8 +33,18 @@ Each part, in order, and why it is there:
   gain, tabulated at 1024 phases and linearly interpolated between them. Its magnitude error at
   9 kHz, the top EQ band, is under 0.002 dB at every fractional delay; a cubic interpolator would
   lose several dB there.
-- Mix and output gain: `out = G_out * (y + g * (c1 + c2))`, rounded and clipped to PCM16, with the
-  clipped samples counted. `G_out` keeps her loudness where the engine left it (`output_gain_db`).
+- Mix and output gain: `v = G_out * (y + g * (c1 + c2))`. `G_out` keeps her loudness where the
+  engine left it (`output_gain_db`).
+- Peak limiter (`PeakLimiter`, `CharacterConfig.limiter`), then rounding to PCM16: the
+  compressor is causal, so each loud onset passes at up to the full output gain until its
+  windows fill, and the mix can then pass full scale. The limiter has a soft knee at -1 dBFS,
+  instant attack, a 10 ms hold and a 10 ms release linear in dB, so no sample clips, a
+  sustained over is scaled rather than distorted, and every sample at or below the knee and out
+  of an over's 479-sample reach passes bit-for-bit. It has no look-ahead, so it adds no latency;
+  the rising crests of a loud onset land on the knee instead. It comes after the mix, where the
+  peaks are, and the copies read y, so it feeds nothing back. Its memory ends inside the
+  segment's tail, and `end_segment` clears it. With `limiter=None` the output is clipped to
+  PCM16 instead, and `clipped_samples` counts it.
 
 The dry path adds no latency: the first output sample is the first input sample, processed. The
 copies only ever read at least `delay_ms - sweep_ms / 2` behind, so they are causal too. At the
@@ -47,11 +57,14 @@ hold nothing of the segment and a later segment, after any wait, carries no scra
 import math
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy.signal import butter, sosfilt
 
-from .budget import CharacterConfig, DetunedCopy, PeakingBand
+from .budget import CharacterConfig, DetunedCopy, LimiterConfig, PeakingBand
 
 PCM16_FULL_SCALE = 32768.0
+# The largest PCM16 sample in full-scale units, and the limit of the limiter's knee curve.
+PCM16_CEILING = 32767.0 / 32768.0
 INTERPOLATOR_TAPS = 32
 INTERPOLATOR_BETA = 5.0
 _INTERPOLATOR_PHASES = 1024
@@ -323,6 +336,93 @@ class DetunedVoice:
         return float(np.clip(jump, min_jump, max_jump))
 
 
+def knee_curve(a: np.ndarray, *, knee_dbfs: float) -> np.ndarray:
+    """The limiter's target for magnitudes `a` in full-scale units.
+
+    The identity up to the knee K; above it `K + (c - K) * tanh((a - K) / (c - K))`, with c
+    `PCM16_CEILING`. Its first and second derivatives match the identity's at K, so a sample
+    just over the knee is barely bent. It rises and never passes c: in float64 the final
+    addition rounds it to c from about +9 dBFS.
+    """
+    knee = 10.0 ** (knee_dbfs / 20.0)
+    a = np.asarray(a, dtype=np.float64)
+    f = a.copy()
+    over = a > knee
+    room = PCM16_CEILING - knee
+    f[over] = knee + room * np.tanh((a[over] - knee) / room)
+    return f
+
+
+def _limiter_samples(ms: float, sample_rate: int) -> int:
+    return max(1, round(ms * sample_rate / 1000.0))
+
+
+def limiter_reach_samples(config: LimiterConfig, *, sample_rate: int) -> int:
+    """The samples an over can change, itself included: hold + release - 1."""
+    hold = _limiter_samples(config.hold_ms, sample_rate)
+    release = _limiter_samples(config.release_ms, sample_rate)
+    return hold + release - 1
+
+
+class PeakLimiter:
+    """A causal peak limiter with no look-ahead; float64 in and out, state carried across chunks.
+
+    At each sample n, with H hold and R release samples:
+
+    - r[n], in dB, is the gain that puts v[n] on `knee_curve`, or 0 at or below the knee;
+    - A[n] = min(r[n - H + 1 .. n]) holds the deepest r for H samples, and includes r[n], so the
+      attack is instant;
+    - M[n] = mean(A[n - R + 1 .. n]) takes the gain back to 0 dB linearly in dB after the hold;
+    - out[n] = v[n] * 10^(min(A[n], M[n]) / 20).
+
+    M is a sum over its own window, not a running sum, so a window of zeros gives exactly 0 dB:
+    an over at m changes only samples m to m + H + R - 2, and every other sample passes
+    bit-for-bit.
+    """
+
+    def __init__(self, config: LimiterConfig, *, sample_rate: int) -> None:
+        self._knee_dbfs = config.knee_dbfs
+        self._knee = 10.0 ** (config.knee_dbfs / 20.0)
+        self._hold = _limiter_samples(config.hold_ms, sample_rate)
+        self._release = _limiter_samples(config.release_ms, sample_rate)
+        self._limited = 0
+        self.reset()
+
+    @property
+    def limited_samples(self) -> int:
+        """Samples above the knee so far; `reset` keeps the count."""
+        return self._limited
+
+    def reset(self) -> None:
+        """Forget every over: the next sample starts at 0 dB."""
+        self._depths = np.zeros(self._hold - 1)
+        self._held = np.zeros(self._release - 1)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        """Limit `x`; the output has the same length, and `|rint(out * 32768)| <= 32767`."""
+        x = np.asarray(x, dtype=np.float64)
+        if len(x) == 0:
+            return np.zeros(0)
+        magnitude = np.abs(x)
+        over = magnitude > self._knee
+        count = int(np.count_nonzero(over))
+        self._limited += count
+        if count == 0 and not self._depths.any() and not self._held.any():
+            # No over within reach: every gain is exactly 0 dB, and the histories stay zeros.
+            return x.copy()
+        depth = np.zeros(len(x))
+        depth[over] = 20.0 * np.log10(
+            knee_curve(magnitude[over], knee_dbfs=self._knee_dbfs) / magnitude[over]
+        )
+        depths = np.concatenate((self._depths, depth))
+        held = sliding_window_view(depths, self._hold).min(axis=1)
+        self._depths = depths[len(depths) - (self._hold - 1) :]
+        helds = np.concatenate((self._held, held))
+        released = np.convolve(helds, np.ones(self._release), "valid") / self._release
+        self._held = helds[len(helds) - (self._release - 1) :]
+        return x * 10.0 ** (np.minimum(held, released) / 20.0)
+
+
 def character_tail_samples(config: CharacterConfig, *, sample_rate: int) -> int:
     """Samples of silence after which no copy reads any of the audio before them; 0 if no double."""
     if config.double_gain == 0.0 or not config.copies:
@@ -359,6 +459,11 @@ class CharacterStage:
             else ()
         )
         self._output_gain = 10.0 ** (config.output_gain_db / 20.0)
+        self._limiter = (
+            PeakLimiter(config.limiter, sample_rate=sample_rate)
+            if config.limiter is not None
+            else None
+        )
         self._tail = character_tail_samples(config, sample_rate=sample_rate)
         self._clipped = 0
         self._pending = False
@@ -370,8 +475,13 @@ class CharacterStage:
 
     @property
     def clipped_samples(self) -> int:
-        """Output samples clipped to the PCM16 range so far."""
+        """Output samples clipped to the PCM16 range so far; 0 unless `limiter` is None."""
         return self._clipped
+
+    @property
+    def limited_samples(self) -> int:
+        """Output samples the limiter found above its knee so far; 0 when `limiter` is None."""
+        return 0 if self._limiter is None else self._limiter.limited_samples
 
     def process(self, pcm16: bytes) -> bytes:
         """Process one chunk of mono little-endian PCM16; the output has the same length.
@@ -388,13 +498,18 @@ class CharacterStage:
         return self._run(x)
 
     def end_segment(self) -> bytes:
-        """The segment's tail: `tail_samples` of silence through the stage, or `b""`."""
-        if not self._pending:
-            return b""
+        """The segment's tail: `tail_samples` of silence through the stage, or `b""`.
+
+        The limiter is reset after the tail, and also when there is none, so no segment's
+        limiting reaches the next, whether its last over was in its own audio or in its tail.
+        """
+        tail = b""
+        if self._pending and self._tail:
+            tail = self._run(np.zeros(self._tail), tail=True)
         self._pending = False
-        if self._tail == 0:
-            return b""
-        return self._run(np.zeros(self._tail), tail=True)
+        if self._limiter is not None:
+            self._limiter.reset()
+        return tail
 
     def _run(self, x: np.ndarray, *, tail: bool = False) -> bytes:
         equalised, self._state = sosfilt(self._sos, x, zi=self._state)
@@ -408,6 +523,11 @@ class CharacterStage:
             for voice in self._voices[1:]:
                 copies = copies + voice.process(heard)
             y = y + self._double_gain * copies
-        scaled = np.rint(self._output_gain * y * PCM16_FULL_SCALE)
+        mixed = self._output_gain * y
+        if self._limiter is not None:
+            mixed = self._limiter.process(mixed)
+        scaled = np.rint(mixed * PCM16_FULL_SCALE)
+        # With the limiter nothing passes the PCM16 range; the count and the clip stay as a guard,
+        # and they are what `limiter=None` gives.
         self._clipped += int(np.count_nonzero((scaled > 32767.0) | (scaled < -32768.0)))
         return np.clip(scaled, -32768.0, 32767.0).astype("<i2").tobytes()

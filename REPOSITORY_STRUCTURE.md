@@ -32,6 +32,10 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `start_dev.py` - Docker compose stack manager (start / stop / restart / logs)
 - `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
+- `render_character.py` - Renders one WAV through the character stage, as the realtime downlink would play it
+- `wake/` - Tools for MIST's wake model: the recording manifest check and the evaluation harness
+  - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
+  - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
@@ -55,8 +59,8 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `verify.py` - Compares a restored graph, stores and vault with the artifact they came from
 - `model_bench/` - Model bench host drivers; `scripts/model_bench/README.md` documents both
   - `bench_host.py` - Stops MIST, serves a pinned llama-server as `mist-bench-llm`, restores the stack
-  - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report
-  - `speech/` - The speech suites (`tts`, `cache`, `stt`, `turn`, `fit`, `lowtier`, `chain`, `game-session`, `listen-pack`, `report`), their committed inputs, and `report.py`, which writes `numbers.json` and `REPORT.md`
+  - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report; it also designs voices
+  - `speech/` - The speech suites (`tts`, `cache`, `stt`, `turn`, `fit`, `lowtier`, `chain`, `game-session`, `listen-pack`, `voice-design`, `report`), their committed inputs, and `report.py`, which writes `numbers.json` and `REPORT.md`
   - `speech/probes/` - The engine code the speech-bench containers run (synthesis, recognition, end of turn, the load generator)
 
 ### Container builds (`docker/`)
@@ -143,7 +147,8 @@ backend/
 │   ├── mist_context.py          # Identity / persona renderer
 │   ├── slop_detector.py         # AI-slop pattern filter
 │   ├── context_budget.py        # Cluster 6 ContextBudgetPlanner
-│   └── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
+│   ├── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
+│   └── turn_scope.py            # Per-turn state and the value objects of the stream-and-commit turn API
 │
 ├── event_store/                 # Append-only SQLite event store
 │   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
@@ -175,6 +180,27 @@ backend/
 │   ├── eval_isolation.py        # F1 fail-closed eval Neo4j allowlist guard
 │   ├── canonical_serialize.py   # F3 wall-clock-free graph form
 │   └── extraction_cache.py      # F3 content-addressed extraction cache
+│
+├── realtime/                    # Realtime voice path, one session per WebSocket connection;
+│   │                            #   the server does not use the package yet
+│   ├── addressee.py             # Addressee gate: whether an utterance holding MIST's name was said to her
+│   ├── bargein.py               # Barge-in policy: what user speech means while MIST speaks, holds a reply or thinks
+│   ├── budget.py                # Voice latency budget, voice configuration and their loader from the environment
+│   ├── character.py             # Character stage: the one place the sound of the spoken voice is shaped
+│   ├── engines/                 # Speech engine adapters implementing the protocols in `speech.py`
+│   │   ├── kws.py               # Server name spotter: a chain of three ONNX graphs behind `NameSpotter`
+│   │   ├── silero_vad.py        # Silero VAD (ONNX v5) behind `VoiceActivityDetector`, and the ONNX loading it shares
+│   │   └── smart_turn.py        # Smart Turn v3.2 (ONNX) behind `TurnEndDetector`
+│   ├── errors.py                # Exceptions raised by the realtime voice package
+│   ├── ingress.py               # Per-session audio ingress: uplink frames to speech segments, name hits and utterances
+│   ├── lanes.py                 # Inference lanes: one worker thread per engine, so model calls never block the event loop
+│   ├── playback.py              # Downlink playback: the session's `turn` lane, the pacer that feeds it and the ledger
+│   ├── protocol.py              # Realtime protocol 2.0.0: the binary frame codec and the control message schemas
+│   ├── scene.py                 # Scene seam: what the turn controller tells the screen, anchored to the audio clock
+│   ├── segmenter.py             # Cuts a reply's Token stream into the text segments TTS synthesizes one call at a time
+│   ├── speech.py                # Speech engine contracts: the protocols model adapters implement and the values they exchange
+│   ├── turn.py                  # Per-session turn controller: one mailbox task owns a voice session's turns
+│   └── voice_assets.py          # Voice identities, the private clips MIST's voice is cloned from, and the artefacts built on them
 │
 └── vault/                       # ADR-010 vault layer (Cluster 8)
     ├── conventions.py           # MIST.md auto-load primitive (ADR-014)

@@ -15,15 +15,19 @@ import logging
 import random
 from collections.abc import Callable
 
+import numpy as np
 import pytest
 import pytest_asyncio
 
 from backend.chat.context_budget import PromptStats
 from backend.chat.stream_events import Complete, HandOff, StateHint, Token
 from backend.chat.turn_scope import CommitResult
-from backend.realtime.budget import BUDGET_PRESETS, TurnConfig, WakeConfig
+from backend.realtime import turn as turn_module
+from backend.realtime.budget import BUDGET_PRESETS, CharacterConfig, TurnConfig, WakeConfig
+from backend.realtime.character import CharacterStage
+from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import UtteranceEnded
-from backend.realtime.playback import LanePurge, PlaybackListener
+from backend.realtime.playback import LanePurge, PlaybackLedger, PlaybackListener
 from backend.realtime.protocol import Frame, MsgType
 from backend.realtime.scene import (
     AtSegment,
@@ -32,7 +36,7 @@ from backend.realtime.scene import (
     NullScenePort,
     ScenePort,
 )
-from backend.realtime.speech import TextSegment
+from backend.realtime.speech import CancelToken, TextSegment
 from backend.realtime.turn import (
     BargeInReport,
     Close,
@@ -56,12 +60,14 @@ from backend.realtime.turn import (
 from tests.fakes.speech import FakeSynthesizer
 
 from .turn_fakes import (
+    TEST_PLAYBACK,
     Call,
     FailingSynthesizer,
     FakeCallLater,
     FakeWakeArbiter,
     Harness,
     IdCounter,
+    InlineLane,
     Pause,
     RecordingIngress,
     WaitGate,
@@ -1077,7 +1083,317 @@ async def test_a_segments_last_frame_is_queued_while_the_next_waits_on_the_lane(
     assert audio_sizes(h) == [960] * 7 + [480] + [960] * 7 + [480]
 
 
+# -- The character stage (T50b) ---------------------------------------------------------------------
+
+CHARACTER_PLAYBACK = dataclasses.replace(TEST_PLAYBACK, character=CharacterConfig())
+DOWNLINK_RATE = 24000
+FRAME_BYTES = 960 * 2
+
+
+class ToneSynthesizer(FakeSynthesizer):
+    """`FakeSynthesizer` that records each segment's chunks as the controller pulls them.
+
+    `amplitude` rescales the fake's tone (0.3 of full scale) to another peak, so a test can
+    drive the stage past its limiter's knee or keep it well below.
+    """
+
+    def __init__(self, *, amplitude: float | None = None) -> None:
+        super().__init__()
+        self.amplitude = amplitude
+        self.emitted: list[list[bytes]] = []
+
+    def synthesize(self, segment, token):
+        chunks = super().synthesize(segment, token)
+        emitted: list[bytes] = []
+        self.emitted.append(emitted)
+
+        def recorded():
+            for chunk in chunks:
+                if self.amplitude is not None:
+                    tone = np.frombuffer(chunk.pcm16, dtype="<i2") * (self.amplitude / 0.3)
+                    pcm16 = np.clip(np.rint(tone), -32768, 32767).astype("<i2").tobytes()
+                    chunk = dataclasses.replace(chunk, pcm16=pcm16)
+                emitted.append(chunk.pcm16)
+                yield chunk
+
+        return recorded()
+
+
+def staged(
+    config: CharacterConfig, emitted: list[list[bytes]], *, tails: bool = True
+) -> tuple[CharacterStage, list[bytes]]:
+    """The stage run offline over the same chunks: each segment's audio, then its tail."""
+    stage = CharacterStage(config, sample_rate=DOWNLINK_RATE)
+    segments = []
+    for chunks in emitted:
+        audio = b"".join(stage.process(chunk) for chunk in chunks)
+        if tails:
+            audio += stage.end_segment()
+        segments.append(audio)
+    return stage, segments
+
+
+def tag_payload(h: Harness, tag: int) -> bytes:
+    return b"".join(f.payload for f in frames(h, MsgType.AUDIO_CHUNK) if f.turn_tag == tag)
+
+
+def segment_audio(h: Harness, tag: int) -> list[bytes]:
+    """The tag's `0x01` payloads cut where the pacer started each segment.
+
+    Every segment starts on a frame boundary, so no frame holds two segments' audio.
+    """
+    starts = [c[3] for c in h.scene.calls if c[0] == "segment_starting" and c[1] == tag]
+    offsets, at = set(), 0
+    for frame in frames(h, MsgType.AUDIO_CHUNK):
+        if frame.turn_tag == tag:
+            offsets.add(at)
+            at += len(frame.payload) // 2
+    assert set(starts) <= offsets
+    payload = tag_payload(h, tag)
+    bounds = [start * 2 for start in starts] + [len(payload)]
+    return [payload[a:b] for a, b in zip(bounds, bounds[1:])]
+
+
+def spy_stages(monkeypatch, *, on_process=None, fail_at: int | None = None) -> list:
+    """Build the controller's stages as spies: each counts `process` calls and keeps its tails.
+
+    `fail_at` makes that call of `process` (1-based) raise, and `on_process` runs after each
+    call with its number.
+    """
+    stages: list = []
+
+    class SpyStage(CharacterStage):
+        def __init__(self, config, *, sample_rate):
+            super().__init__(config, sample_rate=sample_rate)
+            self.processed = 0
+            self.tails: list[bytes] = []
+            stages.append(self)
+
+        def process(self, pcm16):
+            self.processed += 1
+            if self.processed == fail_at:
+                raise ValueError("stage failure")
+            out = super().process(pcm16)
+            if on_process is not None:
+                on_process(self.processed)
+            return out
+
+        def end_segment(self):
+            tail = super().end_segment()
+            self.tails.append(tail)
+            return tail
+
+    monkeypatch.setattr(turn_module, "CharacterStage", SpyStage)
+    return stages
+
+
+async def test_with_a_stage_each_segment_is_the_stage_run_offline_and_ends_in_its_tail(
+    monkeypatch,
+):
+    noted: dict[int, int] = {}
+    note_synthesized = PlaybackLedger.note_synthesized
+
+    def note(self, segment_index, segment, samples):
+        noted[segment_index] = samples
+        note_synthesized(self, segment_index, segment, samples)
+
+    monkeypatch.setattr(PlaybackLedger, "note_synthesized", note)
+    synth = ToneSynthesizer()
+    h = make_harness(
+        [Token("Hello. "), Token("World.")], synthesizer=synth, playback=CHARACTER_PLAYBACK
+    )
+    h.start_voice()
+    await h.speak("hello")
+    tag = queued_start(h).audio_tag
+
+    assert len(synth.emitted) == 2
+    _, expected = staged(CharacterConfig(), synth.emitted)
+    tail = CharacterStage(CharacterConfig(), sample_rate=DOWNLINK_RATE).tail_samples
+    assert tail > 0
+    # Each segment's tail is framed inside it: after its own audio, before the next segment's
+    # first frame, and before the `0x02`.
+    assert segment_audio(h, tag) == expected
+    assert tag_frames(h, tag)[-1] == "0x02"
+    for index, chunks in enumerate(synth.emitted):
+        engine_samples = sum(len(chunk) for chunk in chunks) // 2
+        assert len(expected[index]) // 2 == engine_samples + tail
+        # The ledger's synthesized count for the segment includes its tail.
+        assert noted[index] == engine_samples + tail
+
+
+async def test_without_a_stage_every_payload_is_the_engines_byte_for_byte():
+    synth = ToneSynthesizer()
+    h = make_harness([Token("Hello. "), Token("World.")], synthesizer=synth)
+    h.start_voice()
+    await h.speak("hello")
+    tag = queued_start(h).audio_tag
+
+    assert len(synth.emitted) == 2
+    assert segment_audio(h, tag) == [b"".join(chunks) for chunks in synth.emitted]
+
+
+async def test_a_cut_sends_no_tail(monkeypatch):
+    synth = ToneSynthesizer()
+    h = make_harness(
+        [Token("Hello there. "), Pause()], synthesizer=synth, playback=CHARACTER_PLAYBACK
+    )
+    # The lane holds the segment's second chunk, so the cut lands inside the segment.
+    stages = spy_stages(monkeypatch, on_process=lambda n: h.lane.hold() if n == 1 else None)
+    h.start_voice()
+    await h.speak("hello")
+    tag = queued_start(h).audio_tag
+    (stage,) = stages
+    assert stage.processed == 1
+
+    h.post(Interrupt())
+    await h.settle()
+    h.lane.open()
+    await h.settle()
+
+    assert stage.processed == 1
+    assert stage.tails == []
+    first = CharacterStage(CharacterConfig(), sample_rate=DOWNLINK_RATE).process(
+        synth.emitted[0][0]
+    )
+    assert tag_payload(h, tag) == first
+    assert tag_frames(h, tag)[-1] == "0x03"
+    assert h.outbound.violations == []
+
+
+async def test_a_stage_that_raises_ends_the_turn_through_the_synthesis_error_path(monkeypatch):
+    stages = spy_stages(monkeypatch, fail_at=2)
+    synth = ToneSynthesizer()
+    h = make_harness([Token("Hello there.")], synthesizer=synth, playback=CHARACTER_PLAYBACK)
+    h.start_voice()
+    await h.speak("hello")
+    turn_id = h.last_turn()
+    tag = queued_start(h).audio_tag
+
+    (degraded,) = degraded_tts_failed(h)
+    assert degraded.detail.error == "SpeechEngineError"
+    # The first chunk's frames went out before the failure, and no frame follows it.
+    first = CharacterStage(CharacterConfig(), sample_rate=DOWNLINK_RATE).process(
+        synth.emitted[0][0]
+    )
+    assert tag_payload(h, tag) == first
+    names = turn_lane_names(h, turn_id)
+    at = names.index("voice_decision:degraded")
+    assert "0x01" not in names[at:]
+    assert tag_frames(h, tag)[-1] == "0x02"
+    assert stages[0].tails == []
+
+    await finish_voice_turn(h, turn_id)
+    assert [c.outcome for c in h.responder.commits] == ["completed"]
+    assert h.outbound.violations == []
+
+
+async def test_a_segments_tail_is_queued_while_the_next_waits_and_never_reaches_it():
+    pause = Pause()
+    synth = ToneSynthesizer()
+    h = make_harness(
+        [Token("Hello. "), pause, Token("World."), Pause()],
+        synthesizer=synth,
+        playback=CHARACTER_PLAYBACK,
+    )
+    h.start_voice()
+    await h.speak("hello")
+    h.lane.hold()
+    pause.release()
+    await h.settle()
+    tag = queued_start(h).audio_tag
+
+    # Segment 0's tail is queued while segment 1 still waits on the lane.
+    assert len(synth.emitted) == 1
+    _, first = staged(CharacterConfig(), synth.emitted)
+    assert segment_audio(h, tag) == first
+
+    h.lane.open()
+    await h.settle()
+
+    assert len(synth.emitted) == 2
+    _, expected = staged(CharacterConfig(), synth.emitted)
+    _, untailed = staged(CharacterConfig(), synth.emitted, tails=False)
+    audio = segment_audio(h, tag)
+    assert audio == expected
+    # Segment 1's first frame is the stage's after segment 0's tail emptied the copies; run
+    # straight on from segment 0, the copies would still read segment 0 there.
+    assert audio[1][:FRAME_BYTES] == expected[1][:FRAME_BYTES]
+    assert audio[1][:FRAME_BYTES] != untailed[1][:FRAME_BYTES]
+
+
+def stage_logs(caplog, turn_id: str) -> list[tuple[int, tuple]]:
+    """The end-of-reply stage lines: each one's level and arguments; none holds reply text."""
+    lines = [
+        r for r in caplog.records if r.name == TURN_LOGGER and "character stage" in r.getMessage()
+    ]
+    for record in lines:
+        assert "Hello" not in record.getMessage()
+        assert turn_id in record.getMessage()
+    return [(record.levelno, record.args) for record in lines]
+
+
+async def stage_reply(config: CharacterConfig, amplitude: float) -> tuple[Harness, ToneSynthesizer]:
+    synth = ToneSynthesizer(amplitude=amplitude)
+    h = make_harness(
+        [Token("Hello there.")],
+        synthesizer=synth,
+        playback=dataclasses.replace(TEST_PLAYBACK, character=config),
+    )
+    h.start_voice()
+    await h.speak("hello")
+    assert tag_frames(h, queued_start(h).audio_tag)[-1] == "0x02"
+    return h, synth
+
+
+async def test_a_reply_clipped_without_the_limiter_ends_with_one_warning_of_its_count(caplog):
+    caplog.set_level(logging.INFO, logger=TURN_LOGGER)
+    config = CharacterConfig(limiter=None)
+    h, synth = await stage_reply(config, amplitude=0.9)
+
+    reference, _ = staged(config, synth.emitted)
+    assert reference.clipped_samples > 0
+    assert stage_logs(caplog, h.last_turn()) == [
+        (logging.WARNING, (h.last_turn(), reference.clipped_samples))
+    ]
+
+
+async def test_a_reply_the_limiter_held_ends_with_one_info_line_of_its_count(caplog):
+    caplog.set_level(logging.INFO, logger=TURN_LOGGER)
+    config = CharacterConfig()
+    h, synth = await stage_reply(config, amplitude=0.9)
+
+    reference, _ = staged(config, synth.emitted)
+    assert (reference.clipped_samples, reference.limited_samples > 0) == (0, True)
+    assert stage_logs(caplog, h.last_turn()) == [
+        (logging.INFO, (h.last_turn(), reference.limited_samples))
+    ]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(CharacterConfig(), id="limiter"),
+        pytest.param(CharacterConfig(limiter=None), id="no-limiter"),
+    ],
+)
+async def test_a_reply_below_the_knee_logs_no_stage_line(caplog, config):
+    caplog.set_level(logging.INFO, logger=TURN_LOGGER)
+    h, synth = await stage_reply(config, amplitude=0.01)
+
+    reference, _ = staged(config, synth.emitted)
+    assert (reference.clipped_samples, reference.limited_samples) == (0, 0)
+    assert stage_logs(caplog, h.last_turn()) == []
+
+
 # -- The shared fakes -------------------------------------------------------------------------------
+
+
+async def test_inline_lane_fails_a_job_raising_another_error_as_the_real_lane_does():
+    def broken() -> None:
+        raise ValueError("job failure")
+
+    with pytest.raises(SpeechEngineError, match="worker thread died"):
+        await InlineLane().run(broken, token=CancelToken())
 
 
 async def test_fake_arbiter_grants_a_solo_claim_before_claim_returns():

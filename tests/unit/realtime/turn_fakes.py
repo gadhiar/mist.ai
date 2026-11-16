@@ -139,6 +139,10 @@ class IdCounter:
 class InlineLane:
     """A lane that runs each job inline on the loop; a set token fails it as the real lane does.
 
+    A job that raises anything but `SpeechEngineError` or `LaneJobCancelled` fails with
+    `SpeechEngineError`, as the real lane's worker does when such an error ends its thread, so a
+    test sees the error the controller would.
+
     `hold()` makes every later job wait until `open()`, as a busy TTS lane would, so a test can
     queue a turn's tokens before any of their audio exists.
     """
@@ -164,7 +168,12 @@ class InlineLane:
             await self._gate.wait()
         if token.is_set():
             raise LaneJobCancelled("token set while the job waited")
-        return fn(*args)
+        try:
+            return fn(*args)
+        except (SpeechEngineError, LaneJobCancelled):
+            raise
+        except Exception as exc:  # the real lane's worker dies on any other error
+            raise SpeechEngineError("inline lane: worker thread died") from exc
 
 
 class FailingSynthesizer(FakeSynthesizer):
