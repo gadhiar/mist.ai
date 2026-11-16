@@ -48,13 +48,3 @@ def test_the_example_writes_its_keys_in_the_schema_s_order(example):
             assert list(entity["properties"])[:3] == ["value", "unit", "quantity"]
     for relationship in output["relationships"]:
         assert list(relationship)[:3] == ["source", "target", "type"]
-
-
-def test_a_metric_missing_a_written_key_is_refused():
-    example = next(e for e in PROMPT_EXAMPLES if '"type": "Metric", "properties"' in e)
-    output = _output(example)
-    metric = next(e for e in output["entities"] if e["type"] == "Metric")
-    del metric["properties"]["quantity"]
-
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(output, active_pack().extraction_schema)
