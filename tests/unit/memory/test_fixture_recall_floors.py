@@ -1,9 +1,13 @@
 """Recall floors of the fetcher on the fixture, with the weight-free fakes.
 
 The run goes through the harness (scripts/eval_harness/memory_recall_run.py) over the fact,
-note and noise probes, with a MemoryConfig whose `min_score`, `rerank_top_n` and block budget
-are set here, so a change to the defaults cannot move the floors. Lexical probes are held to
-the floors; paraphrase probes need a real embedder, so their metrics are printed only.
+note and noise probes, with a MemoryConfig whose fact view, `rerank_top_n`, `select_k`, list
+cap, facets and block budget are set here, so a change to the defaults cannot move the floors.
+Lexical probes are held to the floors; paraphrase probes need a real embedder, so their metrics
+are printed only.
+
+The noise floor is a strict xfail because selection by rank injects up to `select_k` items for
+every probe, and the need gate that leaves a noise probe without a block arrives with T67.
 
 The type_scoped probes ask for a kind of thing ("Which devices and programs are part of my
 kit?"), and every one is tagged paraphrase. The fake reranker scores the rendered fact
@@ -36,11 +40,14 @@ from scripts.eval_harness.memory_recall_run import (
 )
 
 _KINDS = ("fact", "note", "noise")
+# Every setting whose default H18 may still choose is pinned, so no default moves a figure.
 _CONFIG = MemoryConfig(
-    min_score=0.4,
+    fact_view="F3",
     rerank_top_n=20,
+    select_k=10,
     block_tokens=500,
-    list_max_items=16,  # the fixture's lists have 16 siblings
+    list_max_items=25,  # the fixture's lists have 16 siblings
+    facets=True,
     deadline_ms=10_000,  # the floors measure ranking, not the time a shared runner takes
 )
 
@@ -88,9 +95,14 @@ def test_lexical_probes_reach_the_floors(reports: _Reports) -> None:
     _print("lexical", overall)
     assert overall.recall_at_block is not None and overall.recall_at_block >= 0.90
     assert overall.mrr is not None and overall.mrr >= 0.70
-    assert overall.empty_on_noise is not None and overall.empty_on_noise >= 0.90
     assert overall.forgotten_leak in (None, 0.0)
     assert overall.budget_ok == 1.0
+
+
+@pytest.mark.xfail(strict=True, reason="no need gate in the harness until T67")
+def test_lexical_noise_probes_stay_empty(reports: _Reports) -> None:
+    overall = reports.lexical.overall
+    assert overall.empty_on_noise is not None and overall.empty_on_noise >= 0.90
 
 
 def test_lexical_list_item_probes_reach_recall(reports: _Reports) -> None:

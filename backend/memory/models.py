@@ -18,6 +18,9 @@ from typing import Literal
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 
 ItemKind = Literal["fact", "episode", "exchange", "note"]
+# What a candidate can be: a served kind, or a facet, which the fetcher expands into its member
+# facts before the block, so no served item is one.
+CandidateKind = Literal["fact", "episode", "exchange", "note", "facet"]
 SummaryState = Literal["raw", "summarized"]
 DegradedReason = Literal[
     "deadline",
@@ -29,9 +32,15 @@ DegradedReason = Literal[
 ]
 ServingLevel = Literal["full", "low", "off"]
 ServingTier = Literal["top", "interaction"]
-CandidateSource = Literal["graph", "vault", "episode", "exchange"]
+CandidateSource = Literal["graph", "vault", "episode", "exchange", "facet"]
 CandidateDisposition = Literal[
-    "injected", "dropped_min_score", "dropped_budget", "dropped_no_fit", "dropped_suppressed"
+    "injected",
+    "dropped_rank",
+    "dropped_budget",
+    "dropped_no_fit",
+    "dropped_suppressed",
+    "dropped_no_members",
+    "dropped_late",
 ]
 StageSkipReason = Literal["off", "zero_budget", "error", "no_need"]
 PrefetchReuse = Literal["block", "stage1", "none"]
@@ -49,14 +58,18 @@ _DEGRADED_REASONS: tuple[str, ...] = (
 )
 _SERVING_LEVELS: tuple[str, ...] = ("full", "low", "off")
 _SERVING_TIERS: tuple[str, ...] = ("top", "interaction")
-_CANDIDATE_SOURCES: tuple[str, ...] = ("graph", "vault", "episode", "exchange")
+_CANDIDATE_SOURCES: tuple[str, ...] = ("graph", "vault", "episode", "exchange", "facet")
 _CANDIDATE_DISPOSITIONS: tuple[str, ...] = (
     "injected",
-    "dropped_min_score",
+    "dropped_rank",
     "dropped_budget",
     "dropped_no_fit",
     "dropped_suppressed",
+    "dropped_no_members",
+    "dropped_late",
 )
+# A facet's trace ref: `facet:<facet_key>`, so no tool ref can collide with it.
+FACET_REF_PREFIX = "facet:"
 _STAGE_SKIP_REASONS: tuple[str, ...] = ("off", "zero_budget", "error", "no_need")
 _PREFETCH_REUSES: tuple[str, ...] = ("block", "stage1", "none")
 _NEED_MODES: tuple[str, ...] = ("on", "shadow")
@@ -136,18 +149,33 @@ class NoteSource:
     authored_by: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class FacetSource:
+    """Where a facet candidate came from: the group of facts it stands for.
+
+    A facet is a subject, a relation and an object type held by two or more facts; the fetcher
+    serves it as its current members, never as itself.
+    """
+
+    facet_key: str
+    subject_id: str
+    rel_type: str
+    object_type: str
+
+
 ItemSource = FactSource | EpisodeSource | ExchangeSource | NoteSource
 
-_SOURCE_BY_KIND: dict[str, type] = {
+_ITEM_SOURCE_BY_KIND: dict[str, type] = {
     "fact": FactSource,
     "episode": EpisodeSource,
     "exchange": ExchangeSource,
     "note": NoteSource,
 }
+_SOURCE_BY_KIND: dict[str, type] = {**_ITEM_SOURCE_BY_KIND, "facet": FacetSource}
 
 
-def _check_source(kind: str, source: object) -> None:
-    expected = _SOURCE_BY_KIND.get(kind)
+def _check_source(kind: str, source: object, kinds: Mapping[str, type] = _SOURCE_BY_KIND) -> None:
+    expected = kinds.get(kind)
     if expected is None:
         raise ValueError(f"unknown item kind {kind!r}")
     if not isinstance(source, expected):
@@ -203,7 +231,8 @@ class MemoryItem:
     """One item placed in the block, numbered by `ref` (m1..mN in block order).
 
     For a fact, `item_id` is the `fact_key`, so a correction names the fact rather than one of
-    its versions; `__post_init__` enforces that and that `source` matches `kind`.
+    its versions; `__post_init__` enforces that and that `source` matches `kind`. A facet is
+    never an item: the fetcher serves its member facts instead.
     """
 
     ref: str
@@ -216,7 +245,9 @@ class MemoryItem:
 
     def __post_init__(self) -> None:
         """Reject an item whose source does not match its kind or whose fact id is not its key."""
-        _check_source(self.kind, self.source)
+        if self.kind == "facet":
+            raise ValueError("a facet is served as its member facts, never as an item")
+        _check_source(self.kind, self.source, _ITEM_SOURCE_BY_KIND)
         if isinstance(self.source, FactSource) and self.item_id != self.source.fact_key:
             raise ValueError(
                 f"a fact item's item_id must be its fact_key, got {self.item_id!r} for "
@@ -247,17 +278,25 @@ class MemoryCandidate:
     """One candidate the fetch considered, as the trace records it: a ref, never text.
 
     Attributes:
-        source: Where the candidate came from: `graph`, `vault`, `episode` or `exchange`.
+        source: Where the candidate came from: `graph`, `vault`, `episode`, `exchange` or
+            `facet`.
         ref: The ref the tools would give the same memory (`graph_ref`, `vault_ref`, or an
-            `episode:` or `exchange:` hash), so a tool's ref joins the candidate.
+            `episode:` or `exchange:` hash), so a tool's ref joins the candidate; a facet,
+            which no tool returns, is `facet:<facet_key>`.
         alt_ref: For a graph candidate, the ref of the reversed orientation,
             `graph_ref(object_id, predicate, subject_id)`. The tools' Cypher returns edges in
             path order and puts the user first whatever the stored direction, so a tool ref
             matches either this or `ref`. None for every other source.
-        rank: 1-based rank after fusion and rerank.
-        score: Final score.
+        rank: 1-based place in the fetch's order: the candidate's position when it was
+            ordered, and after every ordered candidate for one dropped before the order.
+        score: Its order score, `1/(60 + pool_rank) + 1/(60 + ce_rank)`, the second term 0
+            when not reranked.
         item: 1-based position in the block for an injected candidate, else None.
         disposition: What became of it: `injected`, or the reason it was dropped.
+        pool_rank: 1-based position in the fused order; None from a producer that has none.
+        ce_rank: 1-based place among the reranked candidates by cross-encoder probability,
+            ties by pool rank; None when the cross-encoder did not score it.
+        p_ce: The cross-encoder's probability; None when it did not score it.
     """
 
     source: CandidateSource
@@ -267,6 +306,9 @@ class MemoryCandidate:
     score: float
     item: int | None
     disposition: CandidateDisposition
+    pool_rank: int | None = None
+    ce_rank: int | None = None
+    p_ce: float | None = None
 
     def __post_init__(self) -> None:
         """Keep `alt_ref` to graph candidates and a block position to injected ones."""
@@ -277,6 +319,10 @@ class MemoryCandidate:
                 f"alt_ref is set for graph candidates only, got source={self.source!r} "
                 f"alt_ref={self.alt_ref!r}"
             )
+        if self.source == "facet" and not self.ref.startswith(FACET_REF_PREFIX):
+            raise ValueError(
+                f"a facet candidate's ref starts {FACET_REF_PREFIX!r}, got {self.ref!r}"
+            )
         if (self.item is not None) != (self.disposition == "injected"):
             raise ValueError(
                 f"item is set for injected candidates only, got disposition="
@@ -286,6 +332,12 @@ class MemoryCandidate:
             raise ValueError(f"rank must be at least 1, got {self.rank}")
         if self.item is not None and self.item < 1:
             raise ValueError(f"item must be at least 1, got {self.item}")
+        if self.pool_rank is not None and self.pool_rank < 1:
+            raise ValueError(f"pool_rank must be at least 1, got {self.pool_rank}")
+        if self.ce_rank is not None and self.ce_rank < 1:
+            raise ValueError(f"ce_rank must be at least 1, got {self.ce_rank}")
+        if self.p_ce is not None:
+            _require_probability("p_ce", self.p_ce)
 
 
 def _band_of(p: float, theta_low: float, theta_high: float) -> str:
@@ -552,9 +604,12 @@ class Candidate:
     """An item offered by one or more candidate pools, before fusion and rerank.
 
     Attributes:
-        kind: Item kind; `source` must match it.
-        item_id: Stable id (the `fact_key` for a fact), used to merge pools and break ties.
-        text: Text the reranker scores and the block shows.
+        kind: Candidate kind; `source` must match it. A `facet` stands for a group of facts
+            and is expanded into them before the block.
+        item_id: Stable id (the `fact_key` for a fact, the `facet_key` for a facet), used to
+            merge pools and break ties.
+        text: Text the block shows; the reranker reads it when there is no `view_text`. A
+            facet's is its view.
         when: Instant recency is measured from (a fact's `recorded_at`, an episode's end).
         source: Provenance carried through to the MemoryItem.
         ranks: 1-based rank of the item in each pool that returned it, by pool name.
@@ -567,15 +622,15 @@ class Candidate:
             recency is measured as before. The block then dates the item by its day alone,
             because a part of the day read off midnight is a time nobody said.
         view_text: The item's retrieval view (backend/memory/retrieval_view.py), such as the
-            fact view the index embedded; None when the item has no view apart from `text`, as
-            for a note, whose view is N0, its content.
+            fact view the index embedded, which the reranker reads; None when the item has no
+            view apart from `text`, as for a note, whose view is N0, its content.
     """
 
-    kind: ItemKind
+    kind: CandidateKind
     item_id: str
     text: str
     when: datetime | None
-    source: ItemSource
+    source: ItemSource | FacetSource
     ranks: Mapping[str, int]
     confidence: float | None = None
     span_start: datetime | None = None

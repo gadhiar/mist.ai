@@ -1,11 +1,13 @@
-"""Score fusion for the memory read path: RRF across the pools, then the weighted final score.
+"""The order of the memory read path: RRF across the pools, then an order by rank.
 
 The fetcher composes these pure functions around the reranker call it times against the
-deadline. `shortlist` fuses the candidate pools and keeps the `rerank_top_n` best; the reranker
-scores as many of those, best first, as fit the remaining budget; `score_shortlist` mixes the
-scores with recency (or the window-match term) and confidence, drops what falls below
-`min_score` and orders the rest. Keeping the arithmetic here, free of I/O and clocks, lets each
-term be tested on its own and makes a replay rank the same way.
+deadline. `shortlist` fuses the candidate pools and keeps the first `rerank_top_n`; the
+reranker scores as many of those, in pool order, as fit the remaining budget; `order_candidates`
+sorts every candidate it is given by rank (plan v7 A37): inside the user's dated window first,
+then `order_score`, which fuses the pool rank with the cross-encoder's rank, then recency,
+confidence, id and kind. No candidate is dropped here: the fetcher selects the first
+`select_k`. Keeping the arithmetic here, free of I/O and clocks, lets each key be tested on its
+own and makes a replay order the same way.
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ from datetime import UTC, datetime
 
 from backend.vault.models import AuthoredBy
 
-from .config import MemoryConfig
 from .models import Candidate, EpisodeSource, FactSource, NoteSource, TimeWindow
 
 RRF_K = 60
@@ -61,38 +62,41 @@ class FusedCandidate:
     Attributes:
         candidate: The candidate, with the ranks of every pool that offered it merged.
         rrf: Its reciprocal rank fusion score, `sum(1 / (k + rank))` over those pools.
-        rrf_norm: `rrf` divided by the best `rrf` in the batch, in [0, 1]; the batch's best
-            item scores 1. It is the relevance of every item when the reranker scored none,
-            and when it scored only a prefix it sets the order of the unscored items, which
-            `score_shortlist` scales under the prefix's lowest rerank score.
+        pool_rank: Its 1-based position in the fused order. It stays the candidate's pool rank
+            when the fetcher drops others from the shortlist, so the order term it feeds does
+            not change with what else was dropped.
     """
 
     candidate: Candidate
     rrf: float
-    rrf_norm: float
+    pool_rank: int
 
 
 @dataclass(frozen=True, slots=True)
 class ScoredCandidate:
-    """A candidate with its final score and the terms that made it, for the trace and tests.
+    """A candidate with its place in the order and the keys that set it, for the trace and tests.
 
     Attributes:
-        candidate: The candidate scored.
-        score: `rerank_weight * relevance + recency_weight * time_term + confidence_weight *
-            confidence`.
-        relevance: The rerank score; for an item the reranker did not reach, `rrf_norm`
-            (nothing reranked) or `rrf_norm` scaled under the reranked prefix (see
-            `score_shortlist`).
-        reranked: Whether `relevance` came from the reranker.
+        candidate: The candidate ordered.
+        score: Its order score, `order_score(pool_rank, ce_rank)`.
+        position: Its 1-based place in the sorted order, the key the block packs by. The
+            fetcher gives a fact that expansion places the position of the candidate that
+            brought it, when that is earlier than its own.
+        pool_rank: Its 1-based position in the fused order.
+        ce_rank: Its 1-based place among the reranked candidates by cross-encoder
+            probability, ties by pool rank; None when the cross-encoder did not score it.
+        p_ce: The cross-encoder's probability; None when it did not score it.
         time_term: The window-match term when `window_applied`, otherwise recency.
-        window_applied: Whether a dated window replaced recency for this turn.
+        window_applied: Whether the turn named a dated window, whose items sort first.
         confidence: The confidence term.
     """
 
     candidate: Candidate
     score: float
-    relevance: float
-    reranked: bool
+    position: int
+    pool_rank: int
+    ce_rank: int | None
+    p_ce: float | None
     time_term: float
     window_applied: bool
     confidence: float
@@ -139,20 +143,16 @@ def fuse(candidates: Iterable[Candidate], *, k: int = RRF_K) -> list[FusedCandid
         merged[key] = replace(seen, ranks=ranks)
     scored = [(candidate, rrf_score(candidate.ranks, k=k)) for candidate in merged.values()]
     scored.sort(key=lambda pair: (-pair[1], pair[0].item_id, pair[0].kind))
-    best = scored[0][1] if scored else 0.0
     return [
-        FusedCandidate(candidate=candidate, rrf=rrf, rrf_norm=rrf / best if best > 0 else 0.0)
-        for candidate, rrf in scored
+        FusedCandidate(candidate=candidate, rrf=rrf, pool_rank=position)
+        for position, (candidate, rrf) in enumerate(scored, start=1)
     ]
 
 
 def shortlist(
     candidates: Iterable[Candidate], *, top_n: int, k: int = RRF_K
 ) -> list[FusedCandidate]:
-    """The `top_n` best candidates by RRF, the only ones that go on to the rerank and score.
-
-    `rrf_norm` is computed over the whole batch before the cut, so the best item scores 1.
-    """
+    """The first `top_n` candidates by RRF, the only ones that go on to the rerank and order."""
     return fuse(candidates, k=k)[:top_n]
 
 
@@ -232,50 +232,51 @@ def window_term(candidate: Candidate, window: TimeWindow) -> float:
     return 1.0 if window.contains(candidate.when) else 0.0
 
 
-def score_shortlist(
+def order_score(pool_rank: int, ce_rank: int | None, *, k: int = RRF_K) -> float:
+    """`1/(k + pool_rank) + 1/(k + ce_rank)`, the second term 0 when not reranked.
+
+    RRF over the two rankings the fetch has: the fused pools and the cross-encoder over the
+    shortlist's head. The diagnosis found that fusing a cosine ranking with a cross-encoder
+    ranking beats either alone; this applies that to the evidence the fetch has.
+    """
+    score = 1.0 / (k + pool_rank)
+    if ce_rank is not None:
+        score += 1.0 / (k + ce_rank)
+    return score
+
+
+def order_candidates(
     shortlisted: Sequence[FusedCandidate],
     rerank_scores: Sequence[float] | None,
     *,
     now: datetime,
     window: TimeWindow | None,
-    config: MemoryConfig,
 ) -> list[ScoredCandidate]:
-    """Final scores for the shortlist, thresholded at `min_score` and ordered best first.
+    """Every candidate given, sorted by rank and numbered by its place (plan v7 A37).
 
     `rerank_scores[i]` belongs to `shortlisted[i]`: the reranker scores the head of the
-    shortlist, best RRF first, until the deadline (Design point 6, step 2). Relevance then is:
-
-    - no scores (an empty sequence, which is what the fetcher passes when the NullReranker's
-      `pairs_within` cuts the batch to nothing or the deadline falls before the first pair, or
-      None, still accepted): every item keeps its `rrf_norm`, the fallback the design gives for
-      a reranker that cannot run;
-    - scores for the first m items, 1 <= m < len: an unscored item i gets
-      `min(rerank_scores) * rrf_norm_i / rrf_norm_m`, where item m is the last one scored.
-
-    The design says unscored pairs keep their RRF-normalised score (Design point 6, step 2).
-    Taken literally, an RRF score of 0.6 would outrank a reranked item the cross-encoder
-    scored 0.4, so a deadline cut would promote exactly the items nobody read.
-    The scaling (a lead ruling, 2026-10-23) keeps the RRF order among the unscored items and
-    puts every one of them at or under the lowest reranked score; when `rrf_norm_m` is 0 every
-    later item's is too, and they get 0. A prefix minimum of 0 sinks the whole tail, normally
-    under `min_score`, which is intended: the reranker found nothing relevant that far down.
-
-    The window-match term replaces recency only for a dated window. A "last time" window the
-    fetcher could not date carries no span to match, so recency stands in: the previous
-    conversation is, by definition, recent.
+    shortlist, in pool order, until the deadline. A reranked candidate's CE rank is its place
+    among them by probability, ties by pool rank. The sort key is `(outside, -order_score,
+    -recency, -confidence, item_id, kind)`: `outside` is 0 for a candidate inside a dated
+    window the user named and 1 otherwise, and 1 for all when the turn names no dated window
+    or names "last time", which has no bounds. A candidate the reranker did not reach, or
+    every candidate when it reached none, sorts by its pool rank alone, so a fetch the
+    reranker missed keeps the pool order without a special case. A facet has no time, so its
+    recency is 0.
 
     Args:
-        shortlisted: Output of `shortlist`, in its order.
-        rerank_scores: Reranker scores in [0, 1] for a prefix of `shortlisted`, or None.
+        shortlisted: The shortlist after the fetcher's drops, in pool order; each keeps its
+            pool rank.
+        rerank_scores: Cross-encoder probabilities in [0, 1] for a prefix of `shortlisted`,
+            or None for none.
         now: The turn's instant, for recency.
         window: The turn's temporal window, if the user named one.
-        config: Supplies the three weights and `min_score`.
 
     Returns:
-        The items scoring at least `min_score`, by score descending, then item id, then kind.
+        Every candidate of `shortlisted`, none dropped, in sorted order with `position` 1..n.
 
     Raises:
-        ValueError: There are more rerank scores than items, or one is outside [0, 1].
+        ValueError: There are more rerank scores than candidates, or one is outside [0, 1].
     """
     scores = tuple(rerank_scores) if rerank_scores is not None else ()
     if len(scores) > len(shortlisted):
@@ -284,50 +285,41 @@ def score_shortlist(
         if not 0.0 <= value <= 1.0 or math.isnan(value):
             raise ValueError(f"rerank scores must be in [0, 1], got {value}")
     dated = window if window is not None and window.start is not None else None
-    tail_scale = _unscored_scale(shortlisted, scores)
+    by_probability = sorted(
+        range(len(scores)), key=lambda index: (-scores[index], shortlisted[index].pool_rank)
+    )
+    ce_ranks = {index: rank for rank, index in enumerate(by_probability, start=1)}
 
-    results: list[ScoredCandidate] = []
+    keyed: list[tuple[tuple[int, float, float, float, str, str], ScoredCandidate]] = []
     for index, fused in enumerate(shortlisted):
         candidate = fused.candidate
-        reranked = index < len(scores)
-        relevance = scores[index] if reranked else fused.rrf_norm * tail_scale
-        time_term = recency_term(candidate, now) if dated is None else window_term(candidate, dated)
+        ce_rank = ce_ranks.get(index)
+        score = order_score(fused.pool_rank, ce_rank)
+        recency = recency_term(candidate, now)
+        time_term = recency if dated is None else window_term(candidate, dated)
         confidence = confidence_term(candidate)
-        score = (
-            config.rerank_weight * relevance
-            + config.recency_weight * time_term
-            + config.confidence_weight * confidence
-        )
-        if score < config.min_score:
-            continue
-        results.append(
-            ScoredCandidate(
-                candidate=candidate,
-                score=score,
-                relevance=relevance,
-                reranked=reranked,
-                time_term=time_term,
-                window_applied=dated is not None,
-                confidence=confidence,
+        outside = 0 if dated is not None and time_term >= 1.0 else 1
+        key = (outside, -score, -recency, -confidence, candidate.item_id, candidate.kind)
+        keyed.append(
+            (
+                key,
+                ScoredCandidate(
+                    candidate=candidate,
+                    score=score,
+                    position=0,
+                    pool_rank=fused.pool_rank,
+                    ce_rank=ce_rank,
+                    p_ce=scores[index] if ce_rank is not None else None,
+                    time_term=time_term,
+                    window_applied=dated is not None,
+                    confidence=confidence,
+                ),
             )
         )
-    results.sort(key=lambda item: (-item.score, item.candidate.item_id, item.candidate.kind))
-    return results
-
-
-def _unscored_scale(shortlisted: Sequence[FusedCandidate], scores: Sequence[float]) -> float:
-    """Factor applied to `rrf_norm` for items past the reranked prefix.
-
-    1 when nothing was reranked (pure RRF fallback); otherwise `min(scores) / rrf_norm_m` for
-    the last scored item m, or 0 when that `rrf_norm` is 0 (every later one is 0 as well, since
-    the shortlist is in RRF order).
-    """
-    if not scores:
-        return 1.0
-    last_scored_norm = shortlisted[len(scores) - 1].rrf_norm
-    if last_scored_norm <= 0:
-        return 0.0
-    return min(scores) / last_scored_norm
+    keyed.sort(key=lambda pair: pair[0])
+    return [
+        replace(scored, position=position) for position, (_, scored) in enumerate(keyed, start=1)
+    ]
 
 
 def _author_value(authored_by: str | None) -> str | None:

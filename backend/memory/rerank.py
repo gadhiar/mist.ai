@@ -1,11 +1,11 @@
 """Rerank step of the memory read path: the Reranker protocol and its local implementations.
 
-The fetcher fuses the candidate pools with RRF, then asks the reranker how many of the best
-pairs fit the deadline left (`pairs_within`) and scores only those (`score`); pairs left
-unscored keep their RRF-normalised score (Design point 6). This module holds the local
-placement, CrossEncoderReranker, and NullReranker, which stands in when the model is off or
-failed to load. The remote placement over HTTP (plan task T31) is to implement the same
-protocol.
+The fetcher fuses the candidate pools with RRF into the pool order, then asks the reranker how
+many pairs at the head of the shortlist fit the deadline left (`pairs_within`) and scores only
+those (`score`); a candidate left without a score is ordered by its pool rank alone. This
+module holds the local placement, CrossEncoderReranker, and NullReranker, which stands in when
+the model is off or failed to load. The remote placement over HTTP (plan task T31) is to
+implement the same protocol.
 
 The local model stays resident between turns and is released only on request (`release`), so
 the GPU can be handed to another program, and loaded again with `reload`.
@@ -83,10 +83,10 @@ _CALIBRATION_TEXTS: tuple[str, ...] = (
 class Reranker(Protocol):
     """Scores query-text pairs in [0, 1] and says how many pairs fit a time budget.
 
-    The fetcher calls `pairs_within` with the deadline left, cuts the best RRF candidates to
-    that many, and passes them to `score`. A placement that cannot score at all reports zero
-    pairs, so the cut empties the batch and every candidate keeps its RRF score; this is how
-    NullReranker stands in without changing the return type.
+    The fetcher calls `pairs_within` with the deadline left, cuts the shortlist's head, in pool
+    order, to that many, and passes them to `score`. A placement that cannot score at all
+    reports zero pairs, so the cut empties the batch and the fetch keeps the pool order; this
+    is how NullReranker stands in without changing the return type.
     """
 
     def score(
@@ -96,7 +96,7 @@ class Reranker(Protocol):
 
         Args:
             query: The user's utterance.
-            texts: Candidate texts, best RRF first.
+            texts: Candidate texts (each candidate's view, or its text), in pool order.
             budget_ms: Time left before the fetch deadline. The local model ignores it, since a
                 forward pass cannot be interrupted; the remote placement caps its timeout with
                 it.
@@ -105,7 +105,7 @@ class Reranker(Protocol):
             One score in [0, 1] per text, in input order.
 
         Raises:
-            MemoryRerankError: The pairs cannot be scored; the fetcher keeps the RRF scores.
+            MemoryRerankError: The pairs cannot be scored; the fetcher keeps the pool order.
         """
         ...
 
@@ -350,7 +350,7 @@ class CrossEncoderReranker:
             if loaded is None:
                 raise MemoryRerankError(
                     f"reranker at {self._model_path} on {self._device} is released; "
-                    f"keep the RRF scores for the {len(pairs)} pairs"
+                    f"keep the pool order for the {len(pairs)} pairs"
                 )
             logits = self._predict(loaded.model, pairs)
         return [_sigmoid(logit) for logit in logits]
@@ -564,10 +564,10 @@ class CrossEncoderReranker:
 class NullReranker:
     """Stands in when reranking is off or the model failed to load.
 
-    The plan has it return None so callers keep the RRF scores. The protocol's return type is
+    The plan has it return None so callers keep the pool order. The protocol's return type is
     `list[float]`, so the same outcome comes from `pairs_within`: it reports that no pair fits
     any budget, the fetcher's cut leaves nothing to score, and `score` on the empty batch
-    returns an empty list. Every candidate keeps its RRF-normalised score.
+    returns an empty list. Every candidate is ordered by its pool rank alone.
     """
 
     def score(
@@ -577,12 +577,12 @@ class NullReranker:
 
         Raises:
             MemoryRerankError: `texts` is not empty. A caller that skipped `pairs_within`
-                gets the error every reranker fault raises, which keeps the RRF scores,
+                gets the error every reranker fault raises, which keeps the pool order,
                 rather than invented scores.
         """
         if texts:
             raise MemoryRerankError(
-                f"NullReranker scores nothing; keep the RRF scores for the {len(texts)} pairs"
+                f"NullReranker scores nothing; keep the pool order for the {len(texts)} pairs"
             )
         return []
 
@@ -594,5 +594,5 @@ class NullReranker:
         """Nothing to free: no model is held."""
 
     def reload(self) -> bool:
-        """Nothing to load; reports ready, since `pairs_within` already keeps the RRF scores."""
+        """Nothing to load; reports ready, since `pairs_within` already keeps the pool order."""
         return True

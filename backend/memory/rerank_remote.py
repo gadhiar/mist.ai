@@ -7,7 +7,7 @@ reply shapes are as known to the planner and unverified: H4 probes the server be
 correction from the probe touches those three and nothing else.
 
 Every fault (a timeout, a transport error, an error status or a malformed reply) raises
-MemoryRerankError, which the fetcher turns into RRF scores, so a remote fault costs ranking
+MemoryRerankError, on which the fetcher keeps the pool order, so a remote fault costs ranking
 quality and never the turn. Messages name the endpoint and the cause, never the query or the
 documents, which are the user's memory text.
 """

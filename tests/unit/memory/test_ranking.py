@@ -1,7 +1,7 @@
-"""Tests for backend.memory.ranking: RRF fusion, the score terms, the threshold and the order.
+"""Tests for backend.memory.ranking: RRF fusion, the order terms and the order by rank.
 
-Each term is isolated by a config whose weights put all of the score on that one term, so a
-change to another term cannot hide a regression in the one under test.
+The order is a sort key, not a weighted score, so each test sets up candidates that tie on
+every key but the one under test.
 """
 
 from collections.abc import Mapping
@@ -14,6 +14,7 @@ from backend.memory.models import (
     Candidate,
     EpisodeSource,
     ExchangeSource,
+    FacetSource,
     FactSource,
     NoteSource,
     SummaryState,
@@ -26,9 +27,10 @@ from backend.memory.ranking import (
     FusedCandidate,
     confidence_term,
     fuse,
+    order_candidates,
+    order_score,
     recency_term,
     rrf_score,
-    score_shortlist,
     shortlist,
     window_term,
 )
@@ -36,16 +38,6 @@ from backend.vault.models import AuthoredBy
 from tests.fakes.memory_fakes import FakeClock
 
 NOW = FakeClock().now()  # 2026-10-22 18:00 UTC
-
-RELEVANCE_ONLY = MemoryConfig(
-    rerank_weight=1.0, recency_weight=0.0, confidence_weight=0.0, min_score=0.0
-)
-RECENCY_ONLY = MemoryConfig(
-    rerank_weight=0.0, recency_weight=1.0, confidence_weight=0.0, min_score=0.0
-)
-CONFIDENCE_ONLY = MemoryConfig(
-    rerank_weight=0.0, recency_weight=0.0, confidence_weight=1.0, min_score=0.0
-)
 
 YESTERDAY = TimeWindow(
     start=datetime(2026, 10, 21, tzinfo=UTC),
@@ -125,8 +117,31 @@ def _days_ago(days: float) -> datetime:
     return NOW - timedelta(days=days)
 
 
-def _fused(candidate: Candidate, rrf_norm: float = 1.0) -> FusedCandidate:
-    return FusedCandidate(candidate=candidate, rrf=rrf_norm, rrf_norm=rrf_norm)
+def _facet(item_id: str) -> Candidate:
+    return Candidate(
+        kind="facet",
+        item_id=item_id,
+        text=f"You use a tool {item_id}.",
+        view_text=f"You use a tool {item_id}.",
+        when=None,
+        source=FacetSource(
+            facet_key=item_id, subject_id="user", rel_type="USES", object_type="Tool"
+        ),
+        ranks={"fts": 1},
+    )
+
+
+def _fused(candidate: Candidate, pool_rank: int) -> FusedCandidate:
+    return FusedCandidate(candidate=candidate, rrf=1.0 / (RRF_K + pool_rank), pool_rank=pool_rank)
+
+
+def _pooled(*candidates: Candidate) -> list[FusedCandidate]:
+    """The candidates as a shortlist in their given order, pool ranks 1, 2, ..."""
+    return [_fused(candidate, rank) for rank, candidate in enumerate(candidates, start=1)]
+
+
+def _ids(ordered: list) -> list[str]:
+    return [scored.candidate.item_id for scored in ordered]
 
 
 class TestRrf:
@@ -143,7 +158,7 @@ class TestRrf:
         with pytest.raises(ValueError, match="rank"):
             rrf_score({"fts": 0})
 
-    def test_fuse_orders_by_rrf_and_normalises_to_the_best(self) -> None:
+    def test_fuse_orders_by_rrf_and_numbers_the_pool_ranks(self) -> None:
         both = _fact("b", {"fts": 2, "vec": 2})
         top_single = _fact("a", {"fts": 1})
         low_single = _fact("c", {"vec": 5})
@@ -152,9 +167,7 @@ class TestRrf:
 
         assert [f.candidate.item_id for f in fused] == ["b", "a", "c"]
         assert fused[0].rrf == pytest.approx(2 / 62)
-        assert fused[0].rrf_norm == 1.0
-        assert fused[1].rrf_norm == pytest.approx((1 / 61) / (2 / 62))
-        assert fused[2].rrf_norm == pytest.approx((1 / 65) / (2 / 62))
+        assert [f.pool_rank for f in fused] == [1, 2, 3]
 
     def test_fuse_merges_one_item_offered_twice_keeping_the_best_rank_per_pool(self) -> None:
         first = _fact("a", {"fts": 4, "vec": 2})
@@ -182,10 +195,11 @@ class TestRrf:
     def test_shortlist_keeps_the_top_n_best_first(self) -> None:
         candidates = [_fact(f"f{rank:02d}", {"fts": rank}) for rank in range(25, 0, -1)]
 
-        kept = shortlist(candidates, top_n=RELEVANCE_ONLY.rerank_top_n)
+        kept = shortlist(candidates, top_n=MemoryConfig().rerank_top_n)
 
-        assert RELEVANCE_ONLY.rerank_top_n == 20
+        assert MemoryConfig().rerank_top_n == 20
         assert [f.candidate.item_id for f in kept] == [f"f{rank:02d}" for rank in range(1, 21)]
+        assert [f.pool_rank for f in kept] == list(range(1, 21))
 
 
 class TestRecencyTerm:
@@ -241,6 +255,7 @@ class TestConfidenceTerm:
             pytest.param(_episode("e", summary_state="summarized"), 0.7, id="episode-summarized"),
             pytest.param(_episode("e", summary_state="raw"), 0.5, id="episode-raw"),
             pytest.param(_exchange("x"), 0.5, id="exchange"),
+            pytest.param(_facet("g"), 0.5, id="facet"),
         ],
     )
     def test_confidence_by_kind_and_source(self, candidate: Candidate, expected: float) -> None:
@@ -333,169 +348,131 @@ class TestWindowTerm:
             window_term(_fact("f"), last_time)
 
 
-class TestFinalScore:
-    def test_partial_rerank_scales_unscored_items_under_the_prefix_minimum(self) -> None:
-        # The prefix minimum (0.4, item a) is not the last scored item (b, rrf_norm 0.8), so
-        # the tail is scaled by min(prefix) / rrf_norm of b: c = 0.4 * 0.6 / 0.8, d = 0.4 *
-        # 0.3 / 0.8. Unscaled, c's 0.6 would outrank the reranked a.
-        listed = [
-            _fused(_fact("a"), 1.0),
-            _fused(_fact("b"), 0.8),
-            _fused(_fact("c"), 0.6),
-            _fused(_fact("d"), 0.3),
+class TestOrderCandidates:
+    def test_order_score_sums_the_pool_and_ce_reciprocal_ranks(self) -> None:
+        assert order_score(3, 1) == pytest.approx(1 / 63 + 1 / 61)
+        assert order_score(3, None) == pytest.approx(1 / 63)
+
+    def test_order_score_by_hand_with_ce_ties_broken_by_pool_rank(self) -> None:
+        # CE probabilities for the first three; b and c tie at 0.9, so b (pool 2) takes CE
+        # rank 1 and c (pool 3) CE rank 2; a is CE rank 3 and d was not reranked.
+        listed = _pooled(_fact("a"), _fact("b"), _fact("c"), _fact("d"))
+
+        ordered = order_candidates(listed, [0.2, 0.9, 0.9], now=NOW, window=None)
+
+        by_id = {scored.candidate.item_id: scored for scored in ordered}
+        assert [(by_id[i].pool_rank, by_id[i].ce_rank) for i in "abcd"] == [
+            (1, 3),
+            (2, 1),
+            (3, 2),
+            (4, None),
         ]
+        assert [by_id[i].p_ce for i in "abcd"] == [0.2, 0.9, 0.9, None]
+        assert by_id["a"].score == pytest.approx(1 / 61 + 1 / 63)
+        assert by_id["b"].score == pytest.approx(1 / 62 + 1 / 61)
+        assert by_id["c"].score == pytest.approx(1 / 63 + 1 / 62)
+        assert by_id["d"].score == pytest.approx(1 / 64)
+        assert _ids(ordered) == ["b", "a", "c", "d"]
+        assert [scored.position for scored in ordered] == [1, 2, 3, 4]
 
-        scored = score_shortlist(listed, [0.4, 0.9], now=NOW, window=None, config=RELEVANCE_ONLY)
+    def test_no_candidate_is_dropped(self) -> None:
+        listed = _pooled(*(_fact(f"f{n}") for n in range(6)))
 
-        assert [(s.candidate.item_id, s.score, s.reranked) for s in scored] == [
-            ("b", pytest.approx(0.9), True),
-            ("a", pytest.approx(0.4), True),
-            ("c", pytest.approx(0.3), False),
-            ("d", pytest.approx(0.15), False),
-        ]
+        ordered = order_candidates(listed, [0.0] * 6, now=NOW, window=None)
 
-    def test_a_prefix_minimum_of_zero_sinks_the_unscored_tail_under_min_score(self) -> None:
-        config = MemoryConfig(
-            rerank_weight=1.0, recency_weight=0.0, confidence_weight=0.0, min_score=0.2
+        assert sorted(_ids(ordered)) == [f"f{n}" for n in range(6)]
+
+    def test_without_ce_scores_the_order_is_the_pool_order(self) -> None:
+        # Recency and confidence differ, but the pool rank alone sets the order score.
+        listed = _pooled(
+            _fact("z", when=_days_ago(400), confidence=0.1),
+            _fact("y", when=NOW, confidence=1.0),
+            _note("x", "user"),
         )
-        listed = [_fused(_fact("a"), 1.0), _fused(_fact("b"), 0.9), _fused(_fact("c"), 0.8)]
 
-        scored = score_shortlist(listed, [0.7, 0.0], now=NOW, window=None, config=config)
+        for scores in ((), None):
+            ordered = order_candidates(listed, scores, now=NOW, window=None)
 
-        assert [s.candidate.item_id for s in scored] == ["a"]
+            assert _ids(ordered) == ["z", "y", "x"]
+            assert all(scored.ce_rank is None and scored.p_ce is None for scored in ordered)
 
-    def test_a_last_scored_item_with_zero_rrf_leaves_the_tail_at_zero(self) -> None:
-        listed = [_fused(_fact("a"), 0.0), _fused(_fact("b"), 0.0)]
+    def test_an_unreranked_candidate_follows_a_reranked_one_of_equal_pool_rank(self) -> None:
+        # Pool ranks are positions, so two equal ones only arise by construction; the CE term
+        # alone separates them, whatever the ids say.
+        listed = [_fused(_fact("b"), 3), _fused(_fact("a"), 3)]
 
-        scored = score_shortlist(listed, [0.5], now=NOW, window=None, config=RELEVANCE_ONLY)
+        ordered = order_candidates(listed, [0.0], now=NOW, window=None)
 
-        assert [(s.candidate.item_id, s.score) for s in scored] == [("a", 0.5), ("b", 0.0)]
+        assert _ids(ordered) == ["b", "a"]
+
+    def test_inside_a_dated_window_first_whatever_the_order_score(self) -> None:
+        inside = _fact("inside", when=datetime(2026, 10, 21, 9, tzinfo=UTC))
+        outside = _fact("outside", when=NOW)
+        listed = _pooled(outside, inside)
+
+        ordered = order_candidates(listed, [0.99, 0.01], now=NOW, window=YESTERDAY)
+
+        assert _ids(ordered) == ["inside", "outside"]
+        assert [scored.time_term for scored in ordered] == [1.0, 0.0]
+        assert all(scored.window_applied for scored in ordered)
 
     @pytest.mark.parametrize(
-        "rerank_scores",
-        [pytest.param(None, id="none"), pytest.param((), id="deadline-before-first-pair")],
+        "window",
+        [
+            pytest.param(None, id="no-window"),
+            pytest.param(
+                TimeWindow(start=None, end=None, phrase="last time", previous_conversation=True),
+                id="last-time",
+            ),
+        ],
     )
-    def test_no_rerank_scores_falls_back_to_rrf_for_every_item(
-        self, rerank_scores: tuple[float, ...] | None
-    ) -> None:
-        listed = [_fused(_fact("a"), 1.0), _fused(_fact("b"), 0.5)]
+    def test_no_window_precedence_without_a_dated_window(self, window: TimeWindow | None) -> None:
+        inside = _fact("inside", when=datetime(2026, 10, 21, 9, tzinfo=UTC))
+        outside = _fact("outside", when=NOW)
+        listed = _pooled(outside, inside)
 
-        scored = score_shortlist(listed, rerank_scores, now=NOW, window=None, config=RELEVANCE_ONLY)
+        ordered = order_candidates(listed, [0.99, 0.01], now=NOW, window=window)
 
-        assert [(s.candidate.item_id, s.score) for s in scored] == [("a", 1.0), ("b", 0.5)]
-        assert not any(s.reranked for s in scored)
+        assert _ids(ordered) == ["outside", "inside"]
+        assert not any(scored.window_applied for scored in ordered)
 
-    def test_a_pending_review_note_ranks_below_an_equal_mist_note(self) -> None:
-        listed = [_fused(_note("a", "mist-pending-review")), _fused(_note("b", "mist"))]
-
-        scored = score_shortlist(listed, [0.6, 0.6], now=NOW, window=None, config=MemoryConfig())
-
-        assert [s.candidate.item_id for s in scored] == ["b", "a"]
-        assert scored[0].score - scored[1].score == pytest.approx(0.1 * (0.7 - 0.5))
-
-    def test_recency_only(self) -> None:
-        listed = [_fused(_fact("old", when=_days_ago(90))), _fused(_episode("new", when=NOW))]
-
-        scored = score_shortlist(listed, None, now=NOW, window=None, config=RECENCY_ONLY)
-
-        assert [(s.candidate.item_id, s.score) for s in scored] == [
-            ("new", pytest.approx(1.0)),
-            ("old", pytest.approx(0.5)),
-        ]
-        assert not any(s.window_applied for s in scored)
-
-    def test_confidence_only(self) -> None:
-        listed = [_fused(_note("mine", "user")), _fused(_note("mist", "mist"))]
-
-        scored = score_shortlist(listed, None, now=NOW, window=None, config=CONFIDENCE_ONLY)
-
-        assert [(s.candidate.item_id, s.score) for s in scored] == [
-            ("mine", pytest.approx(0.9)),
-            ("mist", pytest.approx(0.7)),
+    def test_equal_order_scores_fall_to_recency_then_confidence_then_id_then_kind(self) -> None:
+        # Every candidate has pool rank 5 and no CE term, so the order score ties.
+        listed = [
+            _fused(_fact("old", when=_days_ago(90), confidence=0.9), 5),
+            _fused(_fact("new-low", when=NOW, confidence=0.2), 5),
+            _fused(_fact("new-high", when=NOW, confidence=0.9), 5),
+            _fused(_fact("tie-b", when=_days_ago(30), confidence=0.5), 5),
+            _fused(_fact("tie-a", when=_days_ago(30), confidence=0.5), 5),
+            # No time, confidence 0.5: these three tie on everything but id and kind.
+            _fused(_fact("same", when=None, confidence=0.5), 5),
+            _fused(_exchange("same", when=None), 5),
+            _fused(_facet("group"), 5),
         ]
 
-    def test_window_match_replaces_recency_when_a_window_is_present(self) -> None:
-        inside_but_older = _fact("inside", when=datetime(2026, 10, 21, 9, tzinfo=UTC))
-        outside_but_newer = _fact("outside", when=NOW)
-        listed = [_fused(outside_but_newer), _fused(inside_but_older)]
+        ordered = order_candidates(listed, (), now=NOW, window=None)
 
-        scored = score_shortlist(listed, None, now=NOW, window=YESTERDAY, config=RECENCY_ONLY)
-
-        assert [(s.candidate.item_id, s.score) for s in scored] == [
-            ("inside", 1.0),
-            ("outside", 0.0),
+        assert [(s.candidate.item_id, s.candidate.kind) for s in ordered] == [
+            ("new-high", "fact"),
+            ("new-low", "fact"),
+            ("tie-a", "fact"),
+            ("tie-b", "fact"),
+            ("old", "fact"),
+            ("group", "facet"),
+            ("same", "exchange"),
+            ("same", "fact"),
         ]
-        assert all(s.window_applied for s in scored)
 
-    def test_a_bound_last_time_window_is_matched_like_any_window(self) -> None:
-        conversation = TimeWindow(
-            start=datetime(2026, 10, 20, 9, tzinfo=UTC),
-            end=datetime(2026, 10, 20, 10, tzinfo=UTC),
-            phrase="last time",
-            previous_conversation=True,
-        )
-        listed = [_fused(_exchange("then", when=datetime(2026, 10, 20, 9, 30, tzinfo=UTC)))]
+    def test_a_facet_has_no_recency(self) -> None:
+        [scored] = order_candidates(_pooled(_facet("group")), (), now=NOW, window=YESTERDAY)
 
-        scored = score_shortlist(listed, None, now=NOW, window=conversation, config=RECENCY_ONLY)
-
-        assert scored[0].score == 1.0
-        assert scored[0].window_applied
-
-    def test_an_unbound_last_time_window_falls_back_to_recency(self) -> None:
-        last_time = TimeWindow(start=None, end=None, phrase="last time", previous_conversation=True)
-        listed = [_fused(_episode("e", when=_days_ago(14)))]
-
-        scored = score_shortlist(listed, None, now=NOW, window=last_time, config=RECENCY_ONLY)
-
-        assert scored[0].score == pytest.approx(0.5)
-        assert not scored[0].window_applied
-
-    def test_default_weights_combine_the_three_terms(self) -> None:
-        config = MemoryConfig(min_score=0.0)
-        listed = [_fused(_episode("e", when=_days_ago(14), summary_state="raw"), 0.2)]
-
-        scored = score_shortlist(listed, [0.75], now=NOW, window=None, config=config)
-
-        assert (config.rerank_weight, config.recency_weight, config.confidence_weight) == (
-            0.8,
-            0.1,
-            0.1,
-        )
-        assert scored[0].score == pytest.approx(0.8 * 0.75 + 0.1 * 0.5 + 0.1 * 0.5)
-        assert (scored[0].relevance, scored[0].time_term, scored[0].confidence) == (
-            0.75,
-            pytest.approx(0.5),
-            0.5,
-        )
-
-    def test_items_below_min_score_are_dropped_and_equal_ones_kept(self) -> None:
-        config = MemoryConfig(
-            rerank_weight=1.0, recency_weight=0.0, confidence_weight=0.0, min_score=0.5
-        )
-        listed = [_fused(_fact("below"), 0.49), _fused(_fact("equal"), 0.5), _fused(_fact("a"))]
-
-        scored = score_shortlist(listed, None, now=NOW, window=None, config=config)
-
-        assert [s.candidate.item_id for s in scored] == ["a", "equal"]
-
-    def test_equal_scores_are_ordered_by_item_id(self) -> None:
-        listed = [_fused(_fact(item_id)) for item_id in ("q", "b", "k")]
-
-        scored = score_shortlist(
-            listed, [0.5, 0.5, 0.5], now=NOW, window=None, config=MemoryConfig()
-        )
-
-        assert [s.candidate.item_id for s in scored] == ["b", "k", "q"]
+        assert scored.time_term == 0.0 and scored.confidence == 0.5
 
     def test_more_rerank_scores_than_items_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="rerank scores"):
-            score_shortlist(
-                [_fused(_fact("a"))], [0.5, 0.5], now=NOW, window=None, config=RELEVANCE_ONLY
-            )
+            order_candidates(_pooled(_fact("a")), [0.5, 0.5], now=NOW, window=None)
 
-    @pytest.mark.parametrize("bad", [-0.1, 1.1, float("nan")], ids=["negative", "above", "nan"])
+    @pytest.mark.parametrize("bad", [-0.1, 1.1, float("nan")])
     def test_rerank_score_outside_unit_interval_is_rejected(self, bad: float) -> None:
         with pytest.raises(ValueError, match=r"\[0, 1\]"):
-            score_shortlist(
-                [_fused(_fact("a"))], [bad], now=NOW, window=None, config=RELEVANCE_ONLY
-            )
+            order_candidates(_pooled(_fact("a")), [bad], now=NOW, window=None)

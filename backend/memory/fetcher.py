@@ -5,12 +5,14 @@ deadline (`MemoryConfig.deadline_ms`, 50 ms by default) counted from the call. T
 in two stages (Design point 8):
 
 - Stage 1 needs no transcript: the index state (`index_rebuilding` while a rebuild runs), the
-  entity anchors of the last two user utterances, and the suppression set of the corrections.
-  It is cached per session for 30 s, so a prefetch started at speech start takes it off the
-  critical path.
-- Stage 2 depends on the words: the FTS, vector and entity-anchored fact pools, the vault note
-  pool, RRF fusion, the cross-encoder on the pairs that fit the time left, the weighted score,
-  the `min_score` threshold, suppression, sibling expansion (plan v2 V7) and packing.
+  fact and facet entity anchors of the last two user utterances, and the suppression set of the
+  corrections. It is cached per session for 30 s, so a prefetch started at speech start takes
+  it off the critical path.
+- Stage 2 depends on the words: the FTS, vector and entity-anchored fact and facet pools, the
+  vault note pool, RRF fusion into the pool order, the shortlist's drops (suppressed facts,
+  facets with fewer than two current members), the cross-encoder on the pairs that fit the
+  time left, the order by rank, selection of the first `select_k`, expansion of sibling lists
+  (plan v2 V7) and facets into their facts, and packing in that order.
 
 The need gate, when one is given, decides in stage 2, beside the pools and before the
 cross-encoder, how likely the turn needs memory. In `on` mode a closed decision ends the fetch
@@ -35,7 +37,7 @@ reuses a cached stage 1 when the words are close enough (Jaccard 0.8 on the toke
 `stage1`), and otherwise runs fresh (`none`).
 
 `fetch` never raises into the turn: an index failure returns an empty result marked
-`index_error`, a reranker failure keeps the RRF scores marked `reranker_unavailable`, and any
+`index_error`, a reranker failure keeps the pool order marked `reranker_unavailable`, and any
 other contained failure returns an empty stage marked `skip_reason="error"`.
 """
 
@@ -48,7 +50,7 @@ import math
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -60,13 +62,15 @@ from backend.knowledge.models import graph_ref, vault_ref
 
 from .block import BLOCK_VERSION, FactList, MemoryBlockBuilder, PlacedList
 from .config import MemoryConfig
-from .fact_index import FactGroup, IndexedFact
+from .fact_index import FactGroup, IndexedFacet, IndexedFact
 from .fts import words
 from .models import (
+    FACET_REF_PREFIX,
     Candidate,
     CandidateDisposition,
     CandidateSource,
     DegradedReason,
+    FacetSource,
     FactSource,
     FetchTimings,
     MemoryCandidate,
@@ -82,7 +86,14 @@ from .models import (
     StageSkipReason,
 )
 from .need_gate import NeedDecision, NeedGate, context_text
-from .ranking import FusedCandidate, ScoredCandidate, fuse, score_shortlist
+from .ranking import (
+    FusedCandidate,
+    ScoredCandidate,
+    confidence_term,
+    fuse,
+    order_candidates,
+    order_score,
+)
 from .rerank import NullReranker, Reranker
 from .sources import (
     ANCHOR_TURNS,
@@ -97,6 +108,7 @@ from .temporal import parse_window
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+A = TypeVar("A")
 
 # Executor names the runtime builds and the factory passes in (Design point 8).
 INDEX_EXECUTOR = "memory-index"
@@ -149,7 +161,13 @@ _SOURCE_BY_KIND: dict[str, CandidateSource] = {
     "note": "vault",
     "episode": "episode",
     "exchange": "exchange",
+    "facet": "facet",
 }
+
+# Task names of the facet pools; their hits fuse under the fact pools' names.
+_FACET_FTS = "facet_fts"
+_FACET_VECTOR = "facet_vector"
+_FACET_ENTITY = "facet_entity"
 
 # One degraded reason per result; the more fundamental failure is reported.
 _DEGRADED_PRIORITY: tuple[DegradedReason, ...] = (
@@ -180,6 +198,26 @@ class FactSearch(Protocol):
         self, subject_id: str, rel_type: str, source_utterance_id: str, *, now: datetime
     ) -> tuple[IndexedFact, ...]:
         """The current facts one utterance stated with one subject and relation."""
+        ...
+
+    def search_facets_fts(self, query_text: str, *, limit: int = 20) -> list[IndexedFacet]:
+        """Facets whose view, subject name or type terms share a content word with the query."""
+        ...
+
+    def search_facets_vector(
+        self, embedding: Sequence[float], *, limit: int = 20
+    ) -> list[IndexedFacet]:
+        """Facets whose view is nearest to `embedding`, nearest first."""
+        ...
+
+    def search_facet_names(self, texts: Sequence[str], *, limit: int = 20) -> list[IndexedFacet]:
+        """Facets whose subject's name occurs whole in one of `texts`."""
+        ...
+
+    def facet_members_many(
+        self, facet_keys: Iterable[str], *, now: datetime
+    ) -> dict[str, tuple[IndexedFact, ...]]:
+        """The members of each facet current at `now`, newest recorded first, in one read."""
         ...
 
 
@@ -255,34 +293,57 @@ class FetchOutcome:
 
     The result is what the turn and the trace use. `lists` lets an offline reader, such as
     the recall harness, flatten a list item back into its facts: the result names a list by
-    its best-scored member only, and a sibling only the expansion brought in is not a
+    its earliest member only, and a sibling only the expansion brought in is not a
     candidate.
 
-    `fused` and `ranked` let the same reader attribute a miss to a stage: the result's stage
-    keeps refs, ranks and scores, not the pool ranks or the score terms, and at most
-    `STAGE_CANDIDATE_CAP` candidates. Both are empty when stage 2 did not run.
+    `fused`, `ranked` and `selected` let the same reader attribute a miss to a stage: the
+    result's stage keeps refs, ranks and scores, not the score terms, and at most
+    `STAGE_CANDIDATE_CAP` candidates. All three are empty when stage 2 did not run.
 
     Attributes:
         result: What `fetch` returns.
         lists: The fact lists the block placed.
-        fused: Every fused candidate in RRF order, before the `rerank_top_n` cut, so its first
-            `rerank_top_n` are the shortlist whose head the reranker scored.
-        ranked: The scored shortlist before `min_score`, best first; the stage's candidate of
-            rank `i` is `ranked[i - 1]`.
+        fused: Every fused candidate in pool order, before the `rerank_top_n` cut, so its
+            first `rerank_top_n` are the shortlist before its drops.
+        ranked: The shortlist after the drops (suppressed facts, facets without members or
+            whose lookup was late), in position order; the stage's candidate of rank `i` is
+            `ranked[i - 1]` for `i` up to its length.
+        selected: What selection and expansion bring, in packing order: the first
+            `select_k` of `ranked`, the selected facets included, and every fact expansion
+            placed. Each fact sits at the earlier of its own position and that of the facet or
+            fact that brought it; the block packs a list at its earliest member's position, so
+            a list member here may sit later than its list does in the block.
     """
 
     result: MemoryResult
     lists: tuple[PlacedList, ...] = ()
     fused: tuple[FusedCandidate, ...] = ()
     ranked: tuple[ScoredCandidate, ...] = ()
+    selected: tuple[ScoredCandidate, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _Expansion:
+    """What selection and expansion hand the block, and what the trace needs of them.
+
+    Attributes:
+        items: The block's input: candidates alone and fact lists.
+        selected: `FetchOutcome.selected`.
+        facets: Each selected facet's key, mapped to the fact keys of the members it brought.
+    """
+
+    items: list[ScoredCandidate | FactList]
+    selected: tuple[ScoredCandidate, ...]
+    facets: dict[tuple[str, str], tuple[str, ...]]
 
 
 @dataclass(frozen=True, slots=True)
 class _Stage1:
-    """What stage 1 found: the anchors of the recent turns and the suppressed fact keys."""
+    """What stage 1 found: the recent turns' fact and facet anchors and the suppressed keys."""
 
     anchors: tuple[FactGroup, ...]
     suppressed: frozenset[str]
+    facet_anchors: tuple[IndexedFacet, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,8 +462,8 @@ class MemoryFetcher:
         reranker: Scores query-text pairs (`CrossEncoderReranker`, `HttpReranker`, or
             `NullReranker` when the model is off or failed to load).
         block_builder: Packs and renders the block; built with the same `config`.
-        config: The memory settings: deadline, `min_score`, `rerank_top_n`,
-            `list_max_items`, the zone, and the budget per serving level.
+        config: The memory settings: deadline, `rerank_top_n`, `select_k`, `list_max_items`,
+            `facets`, the zone, and the budget per serving level.
         executors: The `memory-index`, `memory-model` and `memory-gate` executors.
         need_gate: The need gate, or None when `MIST_MEMORY_NEED_GATE` is off: every fetch is
             then open and traces no `need`. When the gate `shares_query_vector`, it decides on
@@ -632,7 +693,11 @@ class MemoryFetcher:
     async def _stage1(
         self, anchors: tuple[str, ...], *, deadline: float, ledger: _Ledger | None
     ) -> _Stage1:
-        """Run stage 1 on the index executor: the recent turns' anchors and the suppression set."""
+        """Run stage 1 on the index executor: the recent turns' anchors and the suppression set.
+
+        The facet anchors, the facets whose subject the recent turns name, are read only when
+        `facets` is on.
+        """
 
         def work() -> _Stage1:
             groups = (
@@ -640,12 +705,19 @@ class MemoryFetcher:
                 if anchors
                 else ()
             )
+            facet_anchors = (
+                tuple(self._index.search_facet_names(list(anchors), limit=self._pool_size))
+                if anchors and self._config.facets
+                else ()
+            )
             suppressed = (
                 self._suppression.suppressed_fact_keys()
                 if self._suppression is not None
                 else frozenset()
             )
-            return _Stage1(anchors=groups, suppressed=frozenset(suppressed))
+            return _Stage1(
+                anchors=groups, suppressed=frozenset(suppressed), facet_anchors=facet_anchors
+            )
 
         return await self._call(self._executors.index, work, deadline=deadline, ledger=ledger)
 
@@ -706,41 +778,44 @@ class MemoryFetcher:
         ledger.stage2_s = self._clock.monotonic() - stage2_started
 
         fused = fuse(candidates)
-        shortlisted = fused[: self._config.rerank_top_n]
+        shortlisted, dropped, members = await self._drop_before_rerank(
+            fused[: self._config.rerank_top_n], stage1.suppressed, now, deadline, ledger
+        )
         scores = await self._rerank(request.query_text, shortlisted, deadline, ledger)
-        unthresholded = replace(self._config, min_score=0.0)
-        ranked = score_shortlist(shortlisted, scores, now=now, window=window, config=unthresholded)
+        ranked = order_candidates(shortlisted, scores, now=now, window=window)
 
-        kept: list[ScoredCandidate] = []
-        below: dict[tuple[str, str], ScoredCandidate] = {}
-        suppressed: set[tuple[str, str]] = set()
-        for scored in ranked:
-            key = _key(scored.candidate)
-            if scored.score < self._config.min_score:
-                below[key] = scored
-            elif scored.candidate.kind == "fact" and scored.candidate.item_id in stage1.suppressed:
-                suppressed.add(key)
-            else:
-                kept.append(scored)
-
-        items = await self._expand(kept, below, versions, stage1.suppressed, now, deadline, ledger)
-        block = self._builder.build(items, request=request, window=window)
+        expansion = await self._expand(
+            ranked, members, versions, stage1.suppressed, now, deadline, ledger
+        )
+        block = self._builder.build(expansion.items, request=request, window=window)
 
         placed: dict[tuple[str, str], tuple[CandidateDisposition, int | None]] = {}
         for outcome in block.outcomes:
             placed[_key(outcome.candidate.candidate)] = (outcome.disposition, outcome.item)
         stage_candidates: list[MemoryCandidate] = []
-        for rank, scored in enumerate(ranked, start=1):
+        for scored in ranked:
             key = _key(scored.candidate)
-            if key in placed:
+            if key in expansion.facets:
+                disposition, item = _facet_disposition(expansion.facets[key], placed)
+            elif key in placed:
                 disposition, item = placed[key]
-            elif key in suppressed:
-                disposition, item = "dropped_suppressed", None
             else:
-                disposition, item = "dropped_min_score", None
+                disposition, item = "dropped_rank", None
             stage_candidates.append(
-                _stage_candidate(scored, rank, disposition, item, versions.get(key[1]))
+                _stage_candidate(scored, scored.position, disposition, item, versions.get(key[1]))
             )
+        # Candidates that left the shortlist before the order are traced after it, by pool rank.
+        for rank, (fused_candidate, reason) in enumerate(dropped, start=len(ranked) + 1):
+            stage_candidates.append(
+                _stage_candidate(
+                    _unordered(fused_candidate),
+                    rank,
+                    reason,
+                    None,
+                    versions.get(fused_candidate.candidate.item_id),
+                )
+            )
+        suppressed_count = sum(1 for _, reason in dropped if reason == "dropped_suppressed")
 
         if self._rerank_unavailable:
             ledger.reasons.add("reranker_unavailable")
@@ -758,7 +833,7 @@ class MemoryFetcher:
             degraded_reason=reason,
             prefetch_reuse=reuse,
             reranked=len(scores),
-            suppressed=len(suppressed),
+            suppressed=suppressed_count,
             narrative_suppressed=0,
             timings=timings,
             candidates=tuple(ordered[:STAGE_CANDIDATE_CAP]),
@@ -774,13 +849,84 @@ class MemoryFetcher:
             degraded_reason=reason,
             timings=timings,
             reranked=len(scores),
-            suppressed=len(suppressed),
+            suppressed=suppressed_count,
             narrative_suppressed=0,
             stage=stage,
         )
         return FetchOutcome(
-            result=result, lists=block.lists, fused=tuple(fused), ranked=tuple(ranked)
+            result=result,
+            lists=block.lists,
+            fused=tuple(fused),
+            ranked=tuple(ranked),
+            selected=expansion.selected,
         )
+
+    async def _drop_before_rerank(
+        self,
+        head: Sequence[FusedCandidate],
+        suppressed: frozenset[str],
+        now: datetime,
+        deadline: float,
+        ledger: _Ledger,
+    ) -> tuple[
+        list[FusedCandidate],
+        list[tuple[FusedCandidate, CandidateDisposition]],
+        dict[str, tuple[IndexedFact, ...]],
+    ]:
+        """Take out of the shortlist what must not take a rerank pair or a slot.
+
+        A suppressed fact leaves as `dropped_suppressed`. The members of every shortlisted
+        facet are read in one batched lookup on the index executor; a facet left with fewer
+        than two current members no correction suppresses leaves as `dropped_no_members`. A
+        lookup that misses the deadline removes every facet as `dropped_late` and marks the
+        fetch `deadline`, so the facts are still served. The shortlist is not refilled.
+
+        Returns:
+            The kept shortlist in pool order, the dropped candidates with their dispositions in
+            pool order, and each kept facet's members, newest recorded first.
+
+        Raises:
+            _IndexFailedError: The member lookup failed.
+        """
+        dropped: dict[tuple[str, str], CandidateDisposition] = {}
+        facet_keys: list[str] = []
+        for fused in head:
+            candidate = fused.candidate
+            if candidate.kind == "fact" and candidate.item_id in suppressed:
+                dropped[_key(candidate)] = "dropped_suppressed"
+            elif candidate.kind == "facet":
+                facet_keys.append(candidate.item_id)
+        members: dict[str, tuple[IndexedFact, ...]] = {}
+        if facet_keys:
+            try:
+                found = await self._call(
+                    self._executors.index,
+                    lambda: self._index.facet_members_many(facet_keys, now=now),
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+            except _LateError:
+                ledger.reasons.add("deadline")
+                dropped.update((("facet", key), "dropped_late") for key in facet_keys)
+            except MemoryIndexError as exc:
+                logger.warning("memory facet member lookup failed: %s", exc)
+                raise _IndexFailedError from exc
+            else:
+                for key in facet_keys:
+                    current = tuple(
+                        fact for fact in found.get(key, ()) if fact.fact_key not in suppressed
+                    )
+                    if len(current) < 2:
+                        dropped[("facet", key)] = "dropped_no_members"
+                    else:
+                        members[key] = current
+        kept = [fused for fused in head if _key(fused.candidate) not in dropped]
+        gone = [
+            (fused, dropped[_key(fused.candidate)])
+            for fused in head
+            if _key(fused.candidate) in dropped
+        ]
+        return kept, gone, members
 
     async def _pools(
         self,
@@ -790,12 +936,14 @@ class MemoryFetcher:
         ledger: _Ledger,
         embed_task: asyncio.Task[list[float]] | None,
     ) -> tuple[list[Candidate], dict[str, IndexedFact]]:
-        """Run the fact and note pools concurrently and turn their hits into candidates.
+        """Run the fact, facet and note pools concurrently and turn their hits into candidates.
 
-        Each pool has the deadline to itself; one that misses it is left out and the fetch is
-        marked `deadline`, so the candidates of the pools that finished still rank. An index
-        failure in any pool fails the fetch (`index_error`). An embedder failure costs the
-        vector and note pools only. `embed_task` is the query's embedding, which stage 2
+        The facet FTS, vector and entity pools run only when `facets` is on; the facet entity
+        pool is topped up with stage 1's facet anchors as the fact entity pool is with its
+        fact anchors. Each pool has the deadline to itself; one that misses it is left out and
+        the fetch is marked `deadline`, so the candidates of the pools that finished still
+        rank. An index failure in any pool fails the fetch (`index_error`). An embedder failure
+        costs the vector and note pools only. `embed_task` is the query's embedding, which stage 2
         starts and owns because the need gate may decide on the same vector; None for a blank
         query, which has no pools.
         """
@@ -865,12 +1013,47 @@ class MemoryFetcher:
                 logger.warning("memory note pool skipped: %s: %s", type(exc).__name__, exc)
                 return []
 
-        tasks = {
+        async def facet_fts() -> list[IndexedFacet]:
+            return await self._call(
+                index,
+                lambda: self._index.search_facets_fts(query, limit=limit),
+                deadline=deadline,
+                ledger=ledger,
+            )
+
+        async def facet_names() -> list[IndexedFacet]:
+            return await self._call(
+                index,
+                lambda: self._index.search_facet_names([query], limit=limit),
+                deadline=deadline,
+                ledger=ledger,
+            )
+
+        async def facet_vector() -> list[IndexedFacet]:
+            vec = await embedding()
+            if vec is None:
+                return []
+            try:
+                return await self._call(
+                    index,
+                    lambda: self._index.search_facets_vector(vec, limit=limit),
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+            except ValueError as exc:
+                logger.warning("memory facet vector pool skipped: %s", exc)
+                return []
+
+        tasks: dict[str, asyncio.Future[list]] = {
             FTS_POOL: asyncio.ensure_future(fts()),
             ENTITY_POOL: asyncio.ensure_future(names()),
             VECTOR_POOL: asyncio.ensure_future(vector()),
             "notes": asyncio.ensure_future(notes()),
         }
+        if self._config.facets:
+            tasks[_FACET_FTS] = asyncio.ensure_future(facet_fts())
+            tasks[_FACET_ENTITY] = asyncio.ensure_future(facet_names())
+            tasks[_FACET_VECTOR] = asyncio.ensure_future(facet_vector())
         try:
             await asyncio.wait(tasks.values())
         finally:
@@ -881,7 +1064,8 @@ class MemoryFetcher:
                     task.cancel()
                 elif not task.cancelled():
                     task.exception()
-        found: dict[str, object] = {}
+        # Each pool's hits by task name: fact groups, facets or note candidates.
+        found: dict[str, list] = {}
         for name, task in tasks.items():
             exc = task.exception()
             if exc is None:
@@ -894,17 +1078,12 @@ class MemoryFetcher:
             else:
                 raise exc
 
-        query_anchors: list[FactGroup] = list(found.get(ENTITY_POOL, []))  # type: ignore[arg-type]
-        seen = {group.fact_key for group in query_anchors}
-        for group in stage1.anchors:
-            if len(query_anchors) >= limit:
-                break
-            if group.fact_key not in seen:
-                query_anchors.append(group)
-                seen.add(group.fact_key)
+        query_anchors = _with_anchors(
+            found.get(ENTITY_POOL, []), stage1.anchors, limit, key=lambda group: group.fact_key
+        )
         pools: tuple[tuple[str, list[FactGroup]], ...] = (
-            (FTS_POOL, list(found.get(FTS_POOL, []))),  # type: ignore[arg-type]
-            (VECTOR_POOL, list(found.get(VECTOR_POOL, []))),  # type: ignore[arg-type]
+            (FTS_POOL, list(found.get(FTS_POOL, []))),
+            (VECTOR_POOL, list(found.get(VECTOR_POOL, []))),
             (ENTITY_POOL, query_anchors),
         )
         groups: dict[str, FactGroup] = {}
@@ -921,7 +1100,30 @@ class MemoryFetcher:
                 continue
             versions[key] = version
             candidates.append(_fact_candidate(version, ranks[key]))
-        candidates.extend(found.get("notes", []))  # type: ignore[arg-type]
+        if self._config.facets:
+            # A facet's pools carry the fact pools' names, so a facet found first by its pools
+            # fuses as a fact found first by the same pools would.
+            facet_anchors = _with_anchors(
+                found.get(_FACET_ENTITY, []),
+                stage1.facet_anchors,
+                limit,
+                key=lambda facet: facet.facet_key,
+            )
+            facet_pools: tuple[tuple[str, list[IndexedFacet]], ...] = (
+                (FTS_POOL, list(found.get(_FACET_FTS, []))),
+                (VECTOR_POOL, list(found.get(_FACET_VECTOR, []))),
+                (ENTITY_POOL, facet_anchors),
+            )
+            facets: dict[str, IndexedFacet] = {}
+            facet_ranks: dict[str, dict[str, int]] = {}
+            for pool, facet_hits in facet_pools:
+                for rank, facet in enumerate(facet_hits, start=1):
+                    facets.setdefault(facet.facet_key, facet)
+                    facet_ranks.setdefault(facet.facet_key, {})[pool] = rank
+            candidates.extend(
+                _facet_candidate(facet, facet_ranks[key]) for key, facet in facets.items()
+            )
+        candidates.extend(found.get("notes", []))
         return candidates, versions
 
     async def _rerank(
@@ -931,7 +1133,11 @@ class MemoryFetcher:
         deadline: float,
         ledger: _Ledger,
     ) -> tuple[float, ...]:
-        """Score the head of the shortlist that fits the time left; RRF scores stand otherwise."""
+        """Score the head of the shortlist that fits the time left, on each view or text.
+
+        A candidate the cross-encoder did not reach sorts by its pool rank alone; with no
+        scores at all the order is the pool order.
+        """
         if not shortlisted:
             return ()
         remaining_ms = self._remaining(deadline) * 1000.0
@@ -941,7 +1147,7 @@ class MemoryFetcher:
         count = min(len(shortlisted), max(0, self._reranker.pairs_within(remaining_ms)))
         if count == 0:
             return ()
-        texts = [fused.candidate.text for fused in shortlisted[:count]]
+        texts = [fused.candidate.view_text or fused.candidate.text for fused in shortlisted[:count]]
         rerank_started = self._clock.monotonic()
         try:
             scores = await self._call(
@@ -957,7 +1163,7 @@ class MemoryFetcher:
             ledger.reasons.add("deadline")
             return ()
         except MemoryRerankError as exc:
-            logger.warning("memory rerank failed, keeping the RRF scores: %s", exc)
+            logger.warning("memory rerank failed, keeping the pool order: %s", exc)
             ledger.reasons.add("reranker_unavailable")
             return ()
         finally:
@@ -968,7 +1174,7 @@ class MemoryFetcher:
         ):
             logger.warning(
                 "memory reranker returned %d scores for %d pairs or a score outside [0, 1]; "
-                "keeping the RRF scores",
+                "keeping the pool order",
                 len(values),
                 count,
             )
@@ -978,92 +1184,176 @@ class MemoryFetcher:
 
     async def _expand(
         self,
-        kept: list[ScoredCandidate],
-        below: dict[tuple[str, str], ScoredCandidate],
+        ranked: list[ScoredCandidate],
+        members: dict[str, tuple[IndexedFact, ...]],
         versions: dict[str, IndexedFact],
         suppressed: frozenset[str],
         now: datetime,
         deadline: float,
         ledger: _Ledger,
-    ) -> list[ScoredCandidate | FactList]:
-        """Group the kept facts of one list utterance into one item (plan v2 V7).
+    ) -> _Expansion:
+        """Select the first `select_k` candidates and expand them into the block's items.
 
-        Facts sharing `subject_id`, `rel_type` and `source_utterance_id` are siblings. When at
-        least two clear `min_score`, every current sibling that no correction suppresses joins
-        them, up to `list_max_items`: the scored members first, best score first, then the
-        other siblings in the index's sibling order. A sibling ranking dropped below
-        `min_score` that joins a list is placed as one of its scored members, so it gets the
-        list's disposition instead of a drop that the block contradicts. Scored members past
-        the cap stay single items.
+        A facet counts as one. Facts sharing `subject_id`, `rel_type` and
+        `source_utterance_id` are siblings: when two or more are selected alone, every current
+        sibling no correction suppresses joins them (plan v2 V7). A selected facet brings its
+        members, up to `list_max_items`: those also selected alone first, in sort order, then
+        the rest newest recorded first. A fact expansion brings takes the position and order
+        score of the candidate that brought it, or keeps its own when that is earlier, so the
+        block packs it where its bringer would be packed. Each fact is placed once: facts of
+        one subject, relation and utterance that a sibling lookup or a facet brought make one
+        `FactList`, capped at `list_max_items`; the members past the cap that are candidates
+        stay single items, and facet members of other utterances are single dated facts.
+
+        Raises:
+            _IndexFailedError: The sibling lookup failed.
         """
+        cap = self._config.list_max_items
+        chosen = ranked[: self._config.select_k]
+        by_key = {_key(scored.candidate): scored for scored in ranked}
+        # Each placed fact, with its candidate; None for a sibling only the lookup brought,
+        # which is listed but is not a candidate and gets no packing outcome.
+        placed: dict[str, ScoredCandidate | None] = {}
+        facts: dict[str, IndexedFact] = {}
+        others: list[ScoredCandidate] = []
+        for scored in chosen:
+            candidate = scored.candidate
+            if candidate.kind == "fact":
+                placed[candidate.item_id] = scored
+                version = versions.get(candidate.item_id)
+                if version is not None:
+                    facts[candidate.item_id] = version
+            elif candidate.kind != "facet":
+                others.append(scored)
+        alone = set(placed)
+
         groups: dict[tuple[str, str, str], list[ScoredCandidate]] = {}
-        for scored in kept:
+        for scored in chosen:
             version = (
-                versions.get(scored.candidate.item_id) if scored.candidate.kind == "fact" else None
+                facts.get(scored.candidate.item_id) if scored.candidate.kind == "fact" else None
             )
             if version is None or version.source_utterance_id is None:
                 continue
             sibling_key = (version.subject_id, version.rel_type, version.source_utterance_id)
             groups.setdefault(sibling_key, []).append(scored)
-        listed = {key: members for key, members in groups.items() if len(members) >= 2}
-        if not listed:
-            return list(kept)
+        listed = {key: group for key, group in groups.items() if len(group) >= 2}
+        listable: set[tuple[str, str, str]] = set()
+        if listed:
 
-        def lookup() -> dict[tuple[str, str, str], tuple[IndexedFact, ...]]:
-            return {key: self._index.siblings(key[0], key[1], key[2], now=now) for key in listed}
+            def lookup() -> dict[tuple[str, str, str], tuple[IndexedFact, ...]]:
+                return {
+                    key: self._index.siblings(key[0], key[1], key[2], now=now) for key in listed
+                }
 
-        try:
-            found = await self._call(
-                self._executors.index, lookup, deadline=deadline, ledger=ledger
-            )
-        except _LateError:
-            ledger.reasons.add("deadline")
-            return list(kept)
-        except MemoryIndexError as exc:
-            logger.warning("memory sibling lookup failed: %s", exc)
-            raise _IndexFailedError from exc
+            try:
+                found = await self._call(
+                    self._executors.index, lookup, deadline=deadline, ledger=ledger
+                )
+            except _LateError:
+                ledger.reasons.add("deadline")
+                found = {}
+            except MemoryIndexError as exc:
+                logger.warning("memory sibling lookup failed: %s", exc)
+                raise _IndexFailedError from exc
+            for sibling_key, group in sorted(
+                listed.items(), key=lambda pair: min(_position_order(s) for s in pair[1])
+            ):
+                if sibling_key not in found:
+                    continue
+                listable.add(sibling_key)
+                bringer = min(group, key=_position_order)
+                siblings = [fact for fact in found[sibling_key] if fact.fact_key not in suppressed]
+                # Siblings the fetch ranked join before those it never saw.
+                joining = sorted(
+                    (fact for fact in siblings if ("fact", fact.fact_key) in by_key),
+                    key=lambda fact: _position_order(by_key[("fact", fact.fact_key)]),
+                ) + [fact for fact in siblings if ("fact", fact.fact_key) not in by_key]
+                room = cap - len(group)
+                for fact in joining:
+                    if room <= 0:
+                        break
+                    if fact.fact_key in placed:
+                        continue
+                    entry = by_key.get(("fact", fact.fact_key))
+                    placed[fact.fact_key] = None if entry is None else _brought(entry, bringer)
+                    facts[fact.fact_key] = fact
+                    room -= 1
 
-        cap = self._config.list_max_items
-        in_lists: set[str] = set()
-        lists: list[FactList] = []
-        for sibling_key, members in listed.items():
-            siblings = [
-                fact for fact in found.get(sibling_key, ()) if fact.fact_key not in suppressed
-            ]
-            order = {fact.fact_key: position for position, fact in enumerate(siblings)}
-            scored_members = sorted(members, key=_score_order)
-            for fact in siblings:
-                extra = below.get(("fact", fact.fact_key))
-                if extra is not None and fact.fact_key not in in_lists:
-                    scored_members.append(extra)
-            chosen = scored_members[:cap]
-            chosen_keys = {member.candidate.item_id for member in chosen}
-            fill = [fact for fact in siblings if fact.fact_key not in chosen_keys]
-            facts_by_key = {fact.fact_key: fact for fact in siblings}
-            for member in chosen:
-                key = member.candidate.item_id
-                if key not in facts_by_key and key in versions:
-                    facts_by_key[key] = versions[key]
-            room = cap - len(chosen)
-            keys = [member.candidate.item_id for member in chosen] + [
-                fact.fact_key for fact in fill[: max(0, room)]
-            ]
-            if len(keys) < 2:
+        facet_members: dict[tuple[str, str], tuple[str, ...]] = {}
+        for scored in chosen:
+            if scored.candidate.kind != "facet":
                 continue
-            keys.sort(key=lambda key: order.get(key, len(order)))
-            lists.append(
-                FactList(facts=tuple(facts_by_key[key] for key in keys), scored=tuple(chosen))
+            current = members.get(scored.candidate.item_id, ())
+            first = sorted(
+                (fact for fact in current if fact.fact_key in alone),
+                key=lambda fact: _position_order(by_key[("fact", fact.fact_key)]),
             )
-            in_lists.update(keys)
-            for member in chosen:
-                below.pop(_key(member.candidate), None)
-        items: list[ScoredCandidate | FactList] = [
-            scored
-            for scored in kept
-            if not (scored.candidate.kind == "fact" and scored.candidate.item_id in in_lists)
+            taken = (first + [fact for fact in current if fact.fact_key not in alone])[:cap]
+            for fact in taken:
+                key = fact.fact_key
+                existing = placed.get(key)
+                if existing is None:
+                    entry = by_key.get(("fact", key))
+                    placed[key] = (
+                        _brought(entry, scored)
+                        if entry is not None
+                        else _member_candidate(fact, scored)
+                    )
+                    facts.setdefault(key, fact)
+                elif existing.position > scored.position:
+                    placed[key] = replace(existing, position=scored.position, score=scored.score)
+                version = facts[key]
+                if version.source_utterance_id is not None:
+                    listable.add(
+                        (version.subject_id, version.rel_type, version.source_utterance_id)
+                    )
+            facet_members[_key(scored.candidate)] = tuple(fact.fact_key for fact in taken)
+
+        items: list[ScoredCandidate | FactList] = list(others)
+        grouped: dict[tuple[str, str, str], list[str]] = {}
+        for key, entry in placed.items():
+            version = facts.get(key)
+            group_key = (
+                None
+                if version is None or version.source_utterance_id is None
+                else (version.subject_id, version.rel_type, version.source_utterance_id)
+            )
+            if group_key is not None and group_key in listable:
+                grouped.setdefault(group_key, []).append(key)
+            elif entry is not None:
+                items.append(entry)
+        for keys in grouped.values():
+            ranked_keys = sorted(
+                (key for key in keys if placed[key] is not None),
+                key=lambda key: _position_order(placed[key]),  # type: ignore[arg-type]
+            )
+            ordered = ranked_keys + [key for key in keys if placed[key] is None]
+            in_list = ordered[:cap]
+            listed_scored = tuple(
+                entry for entry in (placed[key] for key in in_list) if entry is not None
+            )
+            rest = ordered[cap:]
+            if len(in_list) >= 2 and listed_scored:
+                items.append(
+                    FactList(
+                        facts=tuple(sorted((facts[key] for key in in_list), key=_list_order)),
+                        scored=listed_scored,
+                    )
+                )
+            else:
+                rest = ordered
+            items.extend(entry for entry in (placed[key] for key in rest) if entry is not None)
+
+        selected: list[ScoredCandidate] = [
+            scored for scored in chosen if scored.candidate.kind == "facet"
         ]
-        items.extend(lists)
-        return items
+        for item in items:
+            selected.extend(item.scored if isinstance(item, FactList) else (item,))
+        return _Expansion(
+            items=items,
+            selected=tuple(sorted(selected, key=_position_order)),
+            facets=facet_members,
+        )
 
     # -- the need gate --------------------------------------------------------------------------
 
@@ -1610,8 +1900,85 @@ def _key(candidate: Candidate) -> tuple[str, str]:
     return (candidate.kind, candidate.item_id)
 
 
-def _score_order(scored: ScoredCandidate) -> tuple[float, str, str]:
-    return (-scored.score, scored.candidate.item_id, scored.candidate.kind)
+def _position_order(scored: ScoredCandidate) -> tuple[int, str, str]:
+    """The block's packing order: position, then item id and kind."""
+    return (scored.position, scored.candidate.item_id, scored.candidate.kind)
+
+
+def _list_order(fact: IndexedFact) -> tuple[str, str, str]:
+    """`FactIndex.siblings` order, so a list names its facts as the utterance's list does."""
+    return (fact.recorded_at or "", fact.object_name.casefold(), fact.row_key)
+
+
+def _brought(entry: ScoredCandidate, bringer: ScoredCandidate) -> ScoredCandidate:
+    """A ranked candidate expansion places: at its bringer's position, or its own if earlier."""
+    if entry.position <= bringer.position:
+        return entry
+    return replace(entry, position=bringer.position, score=bringer.score)
+
+
+def _member_candidate(fact: IndexedFact, facet: ScoredCandidate) -> ScoredCandidate:
+    """A facet member the pools never returned, placed at the facet's position and score."""
+    candidate = _fact_candidate(fact, {})
+    return ScoredCandidate(
+        candidate=candidate,
+        score=facet.score,
+        position=facet.position,
+        pool_rank=facet.pool_rank,
+        ce_rank=None,
+        p_ce=None,
+        time_term=facet.time_term,
+        window_applied=facet.window_applied,
+        confidence=confidence_term(candidate),
+    )
+
+
+def _unordered(fused: FusedCandidate) -> ScoredCandidate:
+    """A candidate dropped before the order, scored by its pool rank alone for the trace."""
+    candidate = fused.candidate
+    return ScoredCandidate(
+        candidate=candidate,
+        score=order_score(fused.pool_rank, None),
+        position=0,
+        pool_rank=fused.pool_rank,
+        ce_rank=None,
+        p_ce=None,
+        time_term=0.0,
+        window_applied=False,
+        confidence=confidence_term(candidate),
+    )
+
+
+def _facet_disposition(
+    member_keys: Sequence[str],
+    placed: dict[tuple[str, str], tuple[CandidateDisposition, int | None]],
+) -> tuple[CandidateDisposition, int | None]:
+    """A selected facet's disposition: injected at its first placed member's item, or not."""
+    items = [
+        item
+        for disposition, item in (
+            placed.get(("fact", key), ("dropped_rank", None)) for key in member_keys
+        )
+        if disposition == "injected" and item is not None
+    ]
+    if items:
+        return "injected", min(items)
+    return "dropped_budget", None
+
+
+def _with_anchors(
+    hits: Sequence[A], anchors: Sequence[A], limit: int, *, key: Callable[[A], str]
+) -> list[A]:
+    """The query's entity hits topped up to `limit` with the recent turns' anchors, once each."""
+    merged = list(hits)
+    seen = {key(hit) for hit in merged}
+    for anchor in anchors:
+        if len(merged) >= limit:
+            break
+        if key(anchor) not in seen:
+            merged.append(anchor)
+            seen.add(key(anchor))
+    return merged
 
 
 def _consume(future: asyncio.Future[object]) -> None:
@@ -1646,6 +2013,28 @@ def _fact_candidate(version: IndexedFact, ranks: dict[str, int]) -> Candidate:
         ),
         ranks=dict(ranks),
         confidence=version.confidence,
+        view_text=version.view_text,
+    )
+
+
+def _facet_candidate(facet: IndexedFacet, ranks: dict[str, int]) -> Candidate:
+    """The candidate a facet offers: its view as both the text and the reranker's view.
+
+    It has no time, so its recency is 0, and no confidence of its own.
+    """
+    return Candidate(
+        kind="facet",
+        item_id=facet.facet_key,
+        text=facet.view_text,
+        when=None,
+        source=FacetSource(
+            facet_key=facet.facet_key,
+            subject_id=facet.subject_id,
+            rel_type=facet.rel_type,
+            object_type=facet.object_type,
+        ),
+        ranks=dict(ranks),
+        view_text=facet.view_text,
     )
 
 
@@ -1656,11 +2045,18 @@ def _stage_candidate(
     item: int | None,
     version: IndexedFact | None,
 ) -> MemoryCandidate:
-    """The trace's record of one candidate: refs the tools would give it, never its text."""
+    """The trace's record of one candidate: refs the tools would give it, never its text.
+
+    `rank` is the candidate's position in the order, or for one dropped before the order, a
+    place after every ordered candidate. A facet's ref is `facet:<facet_key>`, with no
+    `alt_ref`.
+    """
     candidate = scored.candidate
     source = _SOURCE_BY_KIND[candidate.kind]
     alt_ref: str | None = None
-    if candidate.kind == "fact" and version is not None:
+    if candidate.kind == "facet":
+        ref = f"{FACET_REF_PREFIX}{candidate.item_id}"
+    elif candidate.kind == "fact" and version is not None:
         ref = graph_ref(version.subject_id, version.rel_type, version.object_id)
         alt_ref = graph_ref(version.object_id, version.rel_type, version.subject_id)
     elif isinstance(candidate.source, NoteSource):
@@ -1679,6 +2075,9 @@ def _stage_candidate(
         score=scored.score,
         item=item,
         disposition=disposition,
+        pool_rank=scored.pool_rank,
+        ce_rank=scored.ce_rank,
+        p_ce=scored.p_ce,
     )
 
 

@@ -77,8 +77,9 @@ Usage, from the repository root (`/app` in the image), so `backend` imports:
         [--embedder-device cpu|cuda] [--rerank-model PATH] [--threads N]
         [--placement user_prefix|system_tail] [--cpu-load-procs N] [--gpu-load-procs N]
         [--vram-log FILE [--vram-stt MODEL]] [--rescan-facts N --rescan-log FILE]
-        [--trace FILE] [--block-tokens N] [--min-score X] [--rerank-top-n N]
-        [--list-max-items N] [--deadline-ms N] [--fixture-dir DIR] [--probes FILE]
+        [--trace FILE] [--block-tokens N] [--rerank-top-n N] [--select-k N]
+        [--facets on|off] [--list-max-items N] [--deadline-ms N] [--fixture-dir DIR]
+        [--probes FILE]
 """
 
 from __future__ import annotations
@@ -124,7 +125,7 @@ from backend.memory.fetcher import (
 from backend.memory.fts import query_tokens
 from backend.memory.index_db import EMBEDDING_DIMENSION, open_index, open_reader
 from backend.memory.models import FactRow, MemoryRequest, MemoryResult, NoteSource
-from backend.memory.ranking import FusedCandidate
+from backend.memory.ranking import FusedCandidate, ScoredCandidate
 from backend.memory.rerank import CrossEncoderReranker, Reranker
 from backend.memory.runtime import IndexStateProbe, build_memory_executors
 from backend.memory.sources import (
@@ -608,7 +609,7 @@ def _item_ranks(result: MemoryResult) -> dict[int, int]:
     """Each block position's fetch rank: the lowest `MemoryCandidate.rank` injected there.
 
     A list's scored members are all injected at the list's position, so the list takes its
-    best member's rank.
+    earliest member's rank.
     """
     ranks: dict[int, int] = {}
     for candidate in result.stage.candidates:
@@ -617,7 +618,16 @@ def _item_ranks(result: MemoryResult) -> dict[int, int]:
     return ranks
 
 
-def run_items(result: MemoryResult, lists: Sequence[PlacedList]) -> list[dict[str, object]]:
+def _pair_text(fused: FusedCandidate) -> str:
+    """What the reranker reads of a candidate: its view, or its text when it has none."""
+    return fused.candidate.view_text or fused.candidate.text
+
+
+def run_items(
+    result: MemoryResult,
+    lists: Sequence[PlacedList],
+    selected: Sequence[ScoredCandidate] = (),
+) -> list[dict[str, object]]:
     """The block as the scorer reads it, each item with its fetch rank (plan v4, A26).
 
     A list's facts are each written under the list's ref, with the list's rank. A note is
@@ -626,12 +636,19 @@ def run_items(result: MemoryResult, lists: Sequence[PlacedList]) -> list[dict[st
     chunks. The rank is the fetcher's own, not the block position, because the block lays
     items out by section and the scorer's MRR reads the rank.
 
+    An item's rank is the lowest rank among the injected candidates it stands for. A fact a
+    selected facet placed also stands for the facet: `selected` (`FetchOutcome.selected`)
+    carries it at the earlier of its own position and the facet's, and a member the pools
+    never returned has no stage candidate of its own at all. A list's rank is the lowest over
+    all its facts, since the block packs a list at its earliest member.
+
     Raises:
-        ValueError: A block item has no injected candidate in the stage, so it has no rank
-            and the scorer would refuse the record.
+        ValueError: A block item has no injected candidate in the stage and no selected
+            position, so it has no rank and the scorer would refuse the record.
     """
     by_ref = {placed.ref: placed for placed in lists}
     ranks = _item_ranks(result)
+    placed_at = {(s.candidate.kind, s.candidate.item_id): s.position for s in selected}
     first: dict[tuple[str, str], tuple[str, float]] = {}
     best: dict[tuple[str, str], int] = {}
 
@@ -641,12 +658,19 @@ def run_items(result: MemoryResult, lists: Sequence[PlacedList]) -> list[dict[st
         best[key] = min(rank, best.get(key, rank))
 
     for position, item in enumerate(result.items, start=1):
-        rank = ranks.get(position)
-        if rank is None:
+        placed = by_ref.get(item.ref)
+        carried = (
+            [("fact", fact.fact_key) for fact in placed.facts.facts]
+            if placed is not None
+            else [(item.kind, item.item_id)]
+        )
+        candidates = [ranks[position]] if position in ranks else []
+        candidates += [placed_at[key] for key in carried if key in placed_at]
+        if not candidates:
             raise ValueError(
                 f"block item {item.ref} has no injected candidate in the stage, so no rank"
             )
-        placed = by_ref.get(item.ref)
+        rank = min(candidates)
         if placed is not None:
             for fact in placed.facts.facts:
                 add(item.ref, "fact", fact.fact_key, item.score, rank)
@@ -660,6 +684,26 @@ def run_items(result: MemoryResult, lists: Sequence[PlacedList]) -> list[dict[st
     ]
 
 
+def dropped_dispositions(outcome: FetchOutcome) -> dict[tuple[str, str], str]:
+    """The disposition of each candidate that left the shortlist before the order.
+
+    A suppressed fact, a facet without members and a facet whose member lookup was late are
+    not in `outcome.ranked`, so the trace gives them no rank; the stage still records each,
+    ranked after every ordered candidate and carrying its pool rank, which is its 1-based
+    place in `outcome.fused`. Keyed by `(kind, item_id)`.
+    """
+    ordered = len(outcome.ranked)
+    dropped: dict[tuple[str, str], str] = {}
+    for stage in outcome.result.stage.candidates:
+        if stage.rank <= ordered or stage.pool_rank is None:
+            continue
+        if not 1 <= stage.pool_rank <= len(outcome.fused):
+            continue
+        candidate = outcome.fused[stage.pool_rank - 1].candidate
+        dropped[(candidate.kind, candidate.item_id)] = stage.disposition
+    return dropped
+
+
 def run_record(
     probe: Probe,
     result: MemoryResult,
@@ -668,12 +712,13 @@ def run_record(
     counter: ApproximateTokenCounter,
     cpu_load_procs: int,
     embedder_device: Device,
+    selected: Sequence[ScoredCandidate] = (),
 ) -> dict[str, object]:
     """One run-file record: the scorer's keys and the per-probe measurements."""
     timings = result.timings
     return {
         "probe_id": probe.probe_id,
-        "items": run_items(result, lists),
+        "items": run_items(result, lists, selected),
         "tokens": result.tokens,
         "budget_tokens": result.budget_tokens,
         "critical_path_ms": round(timings.total_ms, 3),
@@ -974,7 +1019,6 @@ class ProbeTracer:
 
         result = outcome.result
         fused = outcome.fused
-        shortlist = fused[: self._top_n]
         by_rank = {candidate.rank: candidate for candidate in result.stage.candidates}
         fused_at = {(f.candidate.kind, f.candidate.item_id): n for n, f in enumerate(fused, 1)}
         ranked_at = {
@@ -984,6 +1028,8 @@ class ProbeTracer:
         def disposition(rank: int | None) -> str | None:
             stage = by_rank.get(rank) if rank is not None else None
             return stage.disposition if stage is not None else None
+
+        dropped = dropped_dispositions(outcome)
 
         fused_entries = [
             {
@@ -995,9 +1041,9 @@ class ProbeTracer:
                 ),
                 "pools": dict(f.candidate.ranks),
                 "rrf": f.rrf,
-                "rrf_norm": f.rrf_norm,
+                "pool_rank": f.pool_rank,
                 "text_chars": len(f.candidate.text),
-                "pair_tokens": tokens(f.candidate.text),
+                "pair_tokens": tokens(_pair_text(f)),
                 "shortlist": n if n <= self._top_n else None,
             }
             for n, f in enumerate(fused, 1)
@@ -1007,9 +1053,11 @@ class ProbeTracer:
                 "rank": n,
                 "kind": s.candidate.kind,
                 "item_id": s.candidate.item_id,
-                "reranked": s.reranked,
-                "relevance": s.relevance,
-                "logit": logit(s.relevance) if s.reranked else None,
+                "position": s.position,
+                "pool_rank": s.pool_rank,
+                "ce_rank": s.ce_rank,
+                "p_ce": s.p_ce,
+                "logit": logit(s.p_ce) if s.p_ce is not None else None,
                 "time_term": s.time_term,
                 "window_applied": s.window_applied,
                 "confidence": s.confidence,
@@ -1021,10 +1069,12 @@ class ProbeTracer:
         ]
         rerank_entries: list[dict[str, object]] = []
         matches = True
+        # The reranker scores the head of the shortlist the fetch kept, in pool order.
+        kept = sorted(outcome.ranked, key=lambda s: s.pool_rank)
         for call in reranks:
             texts = list(call.texts) if call.texts is not None else []
             if call.texts is not None:
-                head = [f.candidate.text for f in shortlist[: len(texts)]]
+                head = [s.candidate.view_text or s.candidate.text for s in kept[: len(texts)]]
                 matches = matches and texts == head
             scored = len(texts) if call.scores is not None else 0
             rerank_entries.append(
@@ -1041,7 +1091,7 @@ class ProbeTracer:
 
         searched = await self._search(probe)
         block_ids: dict[str, set[str]] = {}
-        for item in run_items(result, outcome.lists):
+        for item in run_items(result, outcome.lists, outcome.selected):
             block_ids.setdefault(str(item["kind"]), set()).add(str(item["id"]))
         targets = self._targets(
             probe,
@@ -1050,6 +1100,7 @@ class ProbeTracer:
             fused_at,
             ranked_at,
             disposition,
+            dropped,
             block_ids,
             indexed_notes,
         )
@@ -1139,6 +1190,7 @@ class ProbeTracer:
         fused_at: dict[tuple[str, str], int],
         ranked_at: dict[tuple[str, str], int],
         disposition: Callable[[int | None], str | None],
+        dropped: dict[tuple[str, str], str],
         block_ids: dict[str, set[str]],
         indexed_notes: set[str],
     ) -> list[tuple[dict[str, object], list[dict[str, object]]]]:
@@ -1156,7 +1208,14 @@ class ProbeTracer:
                 if ref.kind == "fact":
                     targets.append(
                         self._fact_target(
-                            base, probe, searched, fused_at, ranked_at, disposition, block_ids
+                            base,
+                            probe,
+                            searched,
+                            fused_at,
+                            ranked_at,
+                            disposition,
+                            dropped,
+                            block_ids,
                         )
                     )
                 elif ref.kind == "note":
@@ -1184,8 +1243,10 @@ class ProbeTracer:
         fused_at: dict[tuple[str, str], int],
         ranked_at: dict[tuple[str, str], int],
         disposition: Callable[[int | None], str | None],
+        dropped: dict[tuple[str, str], str],
         block_ids: dict[str, set[str]],
     ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """A fact target; one dropped before the order has no rank but keeps its disposition."""
         key = str(base["id"])
         versions = searched.versions.get(key, ())
         current = _current(versions, probe.now)
@@ -1203,7 +1264,7 @@ class ProbeTracer:
             "fused": fused,
             "shortlist": fused if fused is not None and fused <= self._top_n else None,
             "rank": rank,
-            "disposition": disposition(rank),
+            "disposition": disposition(rank) if rank is not None else dropped.get(("fact", key)),
             "in_block": key in block_ids.get("fact", set()),
             "oracle": oracle,
         }
@@ -1404,6 +1465,7 @@ async def run_fixture(
                     counter=counter,
                     cpu_load_procs=cpu_load_procs,
                     embedder_device=embedder_device,
+                    selected=outcome.selected,
                 )
                 if tracer is not None:
                     await tracer.trace(probe, outcome, indexed_notes=indexed_notes)
@@ -1838,10 +1900,12 @@ def config_from_args(args: argparse.Namespace) -> MemoryConfig:
     """
     config = MemoryConfig.from_env()
     overrides: dict[str, object] = {}
-    for name in ("block_tokens", "min_score", "rerank_top_n", "list_max_items", "deadline_ms"):
+    for name in ("block_tokens", "rerank_top_n", "select_k", "list_max_items", "deadline_ms"):
         value = getattr(args, name)
         if value is not None:
             overrides[name] = value
+    if args.facets is not None:
+        overrides["facets"] = args.facets == "on"
     if args.rerank_model is not None:
         overrides["rerank_model"] = _model_path(args.rerank_model)
     return replace(config, **overrides) if overrides else config
@@ -1896,8 +1960,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rescan-log", type=Path, help="rescan log to write (JSON)")
     parser.add_argument("--trace", type=Path, help="per-probe candidate trace to write (JSONL)")
     parser.add_argument("--block-tokens", type=int)
-    parser.add_argument("--min-score", type=float)
+    # No `--min-score`: selection is by rank, so argparse refuses the flag (exit 2).
     parser.add_argument("--rerank-top-n", type=int)
+    parser.add_argument("--select-k", type=int, help="candidates selected by rank, 1 to 25")
+    parser.add_argument("--facets", choices=("on", "off"), help="serve facets; overrides config")
     parser.add_argument("--list-max-items", type=int)
     parser.add_argument("--deadline-ms", type=int)
     parser.add_argument("--fixture-dir", type=Path, default=FIXTURE_DIR)
@@ -2058,6 +2124,7 @@ __all__ = [
     "content_stems",
     "cpu_load",
     "default_gpu_access",
+    "dropped_dispositions",
     "fact_row",
     "facts_known_at",
     "gpu_load",

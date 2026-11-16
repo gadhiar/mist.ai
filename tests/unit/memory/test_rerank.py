@@ -1030,5 +1030,5 @@ def test_null_reranker_release_and_reload_change_nothing() -> None:
 def test_null_reranker_refuses_to_invent_scores() -> None:
     texts: Sequence[str] = ["a", "b"]
 
-    with pytest.raises(MemoryRerankError, match="RRF"):
+    with pytest.raises(MemoryRerankError, match="pool order"):
         NullReranker().score("query", texts)

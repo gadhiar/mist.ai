@@ -13,7 +13,7 @@ import asyncio
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -26,7 +26,8 @@ from backend.errors import EmbeddingError, MemoryIndexError, MemoryRerankError
 from backend.knowledge.models import graph_ref, vault_ref
 from backend.memory.block import HEADER, MemoryBlockBuilder
 from backend.memory.config import MemoryConfig
-from backend.memory.fact_index import FactGroup, FactIndex, IndexedFact
+from backend.memory.facets import facet_key
+from backend.memory.fact_index import FactGroup, FactIndex, IndexedFacet, IndexedFact
 from backend.memory.fetcher import (
     _DEGRADED_PRIORITY,
     STAGE_CANDIDATE_CAP,
@@ -41,7 +42,9 @@ from backend.memory.index_db import open_index, open_reader
 from backend.memory.models import (
     Candidate,
     FactRow,
+    MemoryCandidate,
     MemoryRequest,
+    MemoryResult,
     NeedTrace,
     NoteSource,
     ServingProfile,
@@ -49,6 +52,7 @@ from backend.memory.models import (
 )
 from backend.memory.need_gate import NeedDecision, context_text
 from backend.memory.rerank import NullReranker
+from backend.memory.sources import ENTITY_POOL, FTS_POOL
 from tests.fakes.memory_fakes import FakeClock, FakeEmbedder, FakeReranker, FakeTokenCounter
 
 _MODEL = "all-MiniLM-L6-v2"
@@ -111,12 +115,28 @@ def _request(
 
 
 class HookedIndex:
-    """A FactIndex whose searches run `hooks[name]` first and are recorded by name."""
+    """A FactIndex whose searches run `hooks[name]` first and are recorded by name.
+
+    `script` pins the pool order a test needs: the FTS pool then holds exactly the scripted
+    facts in that order and the vector and entity pools hold none, so each fact's pool rank is
+    its place in the script. `script_facets` has the facet FTS and entity pools both hold the
+    scripted facets and the facet vector pool none, so a scripted facet fuses ahead of every
+    scripted fact.
+    """
 
     def __init__(self, inner: FactIndex) -> None:
         self.inner = inner
         self.hooks: dict[str, Callable[[], None]] = {}
         self.calls: list[str] = []
+        self.member_lookups: list[tuple[str, ...]] = []
+        self.scripted: tuple[FactRow, ...] | None = None
+        self.scripted_facets: tuple[str, ...] | None = None
+
+    def script(self, *rows: FactRow) -> None:
+        self.scripted = rows
+
+    def script_facets(self, *facet_keys: str) -> None:
+        self.scripted_facets = facet_keys
 
     def _enter(self, name: str) -> None:
         self.calls.append(name)
@@ -124,16 +144,29 @@ class HookedIndex:
         if hook is not None:
             hook()
 
+    def _scripted_groups(self) -> list[FactGroup]:
+        groups: list[FactGroup] = []
+        for row in self.scripted or ():
+            found = self.inner.search_names([row.object_name], limit=20)
+            groups.extend(group for group in found if group.fact_key == row.fact_key)
+        return groups
+
     def search_fts(self, query_text: str, *, limit: int = 20) -> list[FactGroup]:
         self._enter("search_fts")
+        if self.scripted is not None:
+            return self._scripted_groups()[:limit]
         return self.inner.search_fts(query_text, limit=limit)
 
     def search_vector(self, embedding: Sequence[float], *, limit: int = 20) -> list[FactGroup]:
         self._enter("search_vector")
+        if self.scripted is not None:
+            return []
         return self.inner.search_vector(embedding, limit=limit)
 
     def search_names(self, texts: Sequence[str], *, limit: int = 20) -> list[FactGroup]:
         self._enter("search_names")
+        if self.scripted is not None:
+            return []
         return self.inner.search_names(texts, limit=limit)
 
     def siblings(
@@ -141,6 +174,39 @@ class HookedIndex:
     ) -> tuple[IndexedFact, ...]:
         self._enter("siblings")
         return self.inner.siblings(subject_id, rel_type, source_utterance_id, now=now)
+
+    def _scripted_facet_list(self) -> list[IndexedFacet]:
+        # Every test fact's subject is the user, so this finds every facet of the index.
+        found = {facet.facet_key: facet for facet in self.inner.search_facet_names(["User"])}
+        return [found[key] for key in self.scripted_facets or () if key in found]
+
+    def search_facets_fts(self, query_text: str, *, limit: int = 20) -> list[IndexedFacet]:
+        self._enter("search_facets_fts")
+        if self.scripted_facets is not None:
+            return self._scripted_facet_list()[:limit]
+        return self.inner.search_facets_fts(query_text, limit=limit)
+
+    def search_facets_vector(
+        self, embedding: Sequence[float], *, limit: int = 20
+    ) -> list[IndexedFacet]:
+        self._enter("search_facets_vector")
+        if self.scripted_facets is not None:
+            return []
+        return self.inner.search_facets_vector(embedding, limit=limit)
+
+    def search_facet_names(self, texts: Sequence[str], *, limit: int = 20) -> list[IndexedFacet]:
+        self._enter("search_facet_names")
+        if self.scripted_facets is not None:
+            return self._scripted_facet_list()[:limit]
+        return self.inner.search_facet_names(texts, limit=limit)
+
+    def facet_members_many(
+        self, facet_keys: Iterable[str], *, now: datetime
+    ) -> dict[str, tuple[IndexedFact, ...]]:
+        keys = tuple(facet_keys)
+        self.member_lookups.append(keys)
+        self._enter("facet_members_many")
+        return self.inner.facet_members_many(keys, now=now)
 
 
 class ScriptedReranker:
@@ -245,12 +311,15 @@ def release() -> Iterator[threading.Event]:
 
 
 def _config(**overrides: object) -> MemoryConfig:
+    # Facets off unless a test is about them: the test facts share a subject, relation and
+    # object type, so most of them would form facets the test does not look for.
     values: dict[str, object] = {
-        "min_score": 0.2,
         "rerank_top_n": 20,
+        "select_k": 8,
         "block_tokens": 300,
         "deadline_ms": _ROOMY_MS,
         "list_max_items": 10,
+        "facets": False,
     }
     values.update(overrides)
     return MemoryConfig(**values)  # type: ignore[arg-type]
@@ -350,26 +419,34 @@ async def test_the_outcome_carries_the_fused_list_and_the_scored_shortlist(
     rows = [_fact(f"Survey Office {n}") for n in range(6)]
     fact_index.upsert(rows)
     reranker = FakeReranker()
-    fetcher = _fetcher(index, executors, reranker=reranker, config=_config(rerank_top_n=4))
+    fetcher = _fetcher(
+        index, executors, reranker=reranker, config=_config(rerank_top_n=4, select_k=4)
+    )
 
     outcome = await fetcher.fetch_outcome(_request("which survey office"))
 
-    # Every fused candidate, in RRF order, before the top_n cut; its head is what was scored.
+    # Every fused candidate, in pool order, before the top_n cut; its head is what was scored,
+    # each by its fact view.
     assert len(outcome.fused) == len(rows)
     rrf = [fused.rrf for fused in outcome.fused]
     assert rrf == sorted(rrf, reverse=True)
+    assert [fused.pool_rank for fused in outcome.fused] == list(range(1, len(rows) + 1))
     [(_, scored_texts, _)] = reranker.calls
-    assert [fused.candidate.text for fused in outcome.fused[:4]] == list(scored_texts)
+    views = [fused.candidate.view_text for fused in outcome.fused[:4]]
+    assert all(views) and views == list(scored_texts)
     assert outcome.result.reranked == 4
-    # The scored shortlist, unthresholded, in the order and with the scores of the stage.
+    # The ordered shortlist, in the order and with the scores and ranks of the stage.
     refs = {row.fact_key: graph_ref("user", "WORKS_AT", row.object_id) for row in rows}
     by_rank = sorted(outcome.result.stage.candidates, key=lambda candidate: candidate.rank)
-    assert [(refs[s.candidate.item_id], s.score) for s in outcome.ranked] == [
-        (candidate.ref, candidate.score) for candidate in by_rank
-    ]
+    assert [
+        (refs[s.candidate.item_id], s.score, s.position, s.pool_rank, s.ce_rank, s.p_ce)
+        for s in outcome.ranked
+    ] == [(c.ref, c.score, c.rank, c.pool_rank, c.ce_rank, c.p_ce) for c in by_rank]
     assert {s.candidate.item_id for s in outcome.ranked} == {
         fused.candidate.item_id for fused in outcome.fused[:4]
     }
+    # Selection: the first select_k of the order, in packing order.
+    assert outcome.selected == outcome.ranked
 
 
 @pytest.mark.asyncio
@@ -382,7 +459,7 @@ async def test_an_outcome_without_a_stage2_carries_no_candidates(
     outcome = await fetcher.fetch_outcome(_request("tidewater survey"))
 
     assert outcome.result.degraded_reason == "index_rebuilding"
-    assert (outcome.fused, outcome.ranked) == ((), ())
+    assert (outcome.fused, outcome.ranked, outcome.selected) == ((), (), ())
 
 
 @pytest.mark.asyncio
@@ -508,7 +585,7 @@ async def test_a_failing_pool_returns_index_error(
 
 
 @pytest.mark.asyncio
-async def test_a_failing_reranker_keeps_the_rrf_scores(
+async def test_a_failing_reranker_keeps_the_pool_order(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:
     fact_index.upsert([_fact("Tidewater Survey")])
@@ -674,6 +751,14 @@ def _words(prefix: str, count: int) -> str:
     return " ".join(f"{prefix}{n}" for n in range(count))
 
 
+def _ref(row: FactRow) -> str:
+    return graph_ref("user", row.rel_type, row.object_id)
+
+
+def _by_ref(result: MemoryResult) -> dict[str, MemoryCandidate]:
+    return {candidate.ref: candidate for candidate in result.stage.candidates}
+
+
 @pytest.mark.asyncio
 async def test_the_stage_records_every_disposition(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
@@ -684,10 +769,11 @@ async def test_the_stage_records_every_disposition(
         "bravo": _fact("Bravo " + _words("b", 28), rel_type="USES"),
         "charlie": _fact("Charlie", rel_type="USES"),
         "delta": _fact("Delta " + _words("d", 200), rel_type="USES"),
-        "echo": _fact("Echo", rel_type="USES"),
         "foxtrot": _fact("Foxtrot", rel_type="USES"),
+        "echo": _fact("Echo", rel_type="USES"),
     }
     fact_index.upsert(list(rows.values()))
+    index.script(*rows.values())
     reranker = ScriptedReranker(
         {"alpha": 0.99, "bravo": 0.98, "charlie": 0.97, "delta": 0.96, "foxtrot": 0.6}
     )
@@ -696,25 +782,78 @@ async def test_the_stage_records_every_disposition(
         executors,
         reranker=reranker,
         suppression=StaticSuppression(frozenset({rows["charlie"].fact_key})),
-        config=_config(min_score=0.3, block_tokens=header + 50),
+        config=_config(select_k=4, block_tokens=header + 50),
     )
 
     result = await fetcher.fetch(_request("which tools does the user use"))
 
-    by_key = {candidate.ref: candidate.disposition for candidate in result.stage.candidates}
+    by_ref = _by_ref(result)
     expected = {
-        "alpha": "injected",
-        "bravo": "dropped_budget",
-        "charlie": "dropped_suppressed",
-        "delta": "dropped_no_fit",
-        "echo": "dropped_min_score",
-        "foxtrot": "injected",
+        "alpha": ("injected", 1, 1),
+        "bravo": ("dropped_budget", 2, 2),
+        "delta": ("dropped_no_fit", 3, 4),
+        "foxtrot": ("injected", 4, 5),
+        "echo": ("dropped_rank", 5, 6),
+        # Suppressed before the cross-encoder: no pair, no slot, traced after the order.
+        "charlie": ("dropped_suppressed", 6, 3),
     }
-    for name, disposition in expected.items():
-        row = rows[name]
-        assert by_key[graph_ref("user", "USES", row.object_id)] == disposition, name
+    for name, (disposition, rank, pool_rank) in expected.items():
+        candidate = by_ref[_ref(rows[name])]
+        assert (candidate.disposition, candidate.rank, candidate.pool_rank) == (
+            disposition,
+            rank,
+            pool_rank,
+        ), name
+    assert by_ref[_ref(rows["alpha"])].ce_rank == 1
+    assert by_ref[_ref(rows["alpha"])].p_ce == pytest.approx(0.99)
+    charlie = by_ref[_ref(rows["charlie"])]
+    assert (charlie.ce_rank, charlie.p_ce) == (None, None)
+    assert charlie.score == pytest.approx(1 / (60 + 3))
+    [(_, texts)] = reranker.calls
+    assert len(texts) == 5 and not any("charlie" in text.lower() for text in texts)
     assert result.suppressed == result.stage.suppressed == 1
     assert all(rows["charlie"].object_name not in item.text for item in result.items)
+
+
+@pytest.mark.asyncio
+async def test_exactly_select_k_are_selected_and_the_rest_dropped_by_rank(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    rows = [_fact(name, rel_type="USES") for name in ("Ash", "Birch", "Cedar", "Damson", "Elm")]
+    fact_index.upsert(rows)
+    index.script(*rows)
+    reranker = ScriptedReranker({"ash": 0.9, "birch": 0.8, "cedar": 0.7, "damson": 0.6})
+    fetcher = _fetcher(index, executors, reranker=reranker, config=_config(select_k=3))
+
+    outcome = await fetcher.fetch_outcome(_request("which trees"))
+
+    assert [scored.position for scored in outcome.ranked] == [1, 2, 3, 4, 5]
+    assert outcome.selected == outcome.ranked[:3]
+    assert [item.item_id for item in outcome.result.items] == [row.fact_key for row in rows[:3]]
+    by_ref = _by_ref(outcome.result)
+    assert [by_ref[_ref(row)].disposition for row in rows] == [
+        "injected",
+        "injected",
+        "injected",
+        "dropped_rank",
+        "dropped_rank",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_without_the_cross_encoder_the_order_is_the_pool_order(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    rows = [_fact(name, rel_type="USES") for name in ("Elm", "Damson", "Cedar")]
+    fact_index.upsert(rows)
+    index.script(*rows)
+    fetcher = _fetcher(index, executors, reranker=FailingReranker())
+
+    outcome = await fetcher.fetch_outcome(_request("which trees"))
+
+    assert outcome.result.degraded_reason == "reranker_unavailable"
+    assert [scored.candidate.item_id for scored in outcome.ranked] == [r.fact_key for r in rows]
+    assert all(scored.ce_rank is None for scored in outcome.ranked)
 
 
 @pytest.mark.asyncio
@@ -722,18 +861,20 @@ async def test_the_stage_keeps_fifty_candidates_injected_first(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:
     header = FakeTokenCounter().count(HEADER)
-    rows = [_fact("Lead " + _words("l", 20), rel_type="USES")]
-    rows += [_fact(f"Long{n:02d} " + _words("x", 80), rel_type="USES") for n in range(57)]
-    rows += [_fact("Small", rel_type="USES"), _fact("Zero", rel_type="USES")]
-    fact_index.upsert(rows)
-    scores = {"lead": 0.99, "small": 0.4}
+    lead = _fact("Lead " + _words("l", 20), rel_type="USES")
+    longs = [_fact(f"Long{n:02d} " + _words("x", 80), rel_type="USES") for n in range(57)]
+    small, zero = _fact("Small", rel_type="USES"), _fact("Zero", rel_type="USES")
+    fact_index.upsert([lead, *longs, small, zero])
+    # Pool order and cross-encoder order agree, so the order is the script's: Small is 25th.
+    index.script(lead, *longs[:23], small, *longs[23:], zero)
+    scores = {"lead": 0.99, "small": 0.9575}
     scores.update({f"long{n:02d}": 0.98 - n * 0.001 for n in range(57)})
     fetcher = _fetcher(
         index,
         executors,
         reranker=ScriptedReranker(scores),
         pool_size=60,
-        config=_config(min_score=0.3, rerank_top_n=60, block_tokens=header + 40),
+        config=_config(select_k=25, rerank_top_n=60, block_tokens=header + 40),
     )
 
     result = await fetcher.fetch(_request("which tools does the user use"))
@@ -742,12 +883,11 @@ async def test_the_stage_keeps_fifty_candidates_injected_first(
     assert len(candidates) == STAGE_CANDIDATE_CAP and result.stage.truncated == 10
     assert [(c.rank, c.disposition) for c in candidates[:2]] == [
         (1, "injected"),
-        (59, "injected"),
+        (25, "injected"),
     ]
-    assert [c.rank for c in candidates[2:]] == list(range(2, 50))
+    assert [c.rank for c in candidates[2:]] == [*range(2, 25), *range(26, 51)]
     assert all(c.disposition != "injected" for c in candidates[2:])
-    small = graph_ref("user", "USES", "small")
-    assert candidates[1].ref == small
+    assert candidates[1].ref == _ref(small)
 
 
 # -- sibling lists ----------------------------------------------------------------------------
@@ -761,16 +901,23 @@ def _tools(utterance: str = "utt-9") -> list[FactRow]:
     return [*rows, _fact("Go", rel_type="USES", utterance="utt-2", object_type="Skill")]
 
 
+def _scripted_tools(index: HookedIndex, first: Sequence[str]) -> None:
+    """Script the tools' pool order: the named ones first, in order, then the rest."""
+    rows = {row.object_name: row for row in _tools()}
+    index.script(*(rows[name] for name in first), *(r for n, r in rows.items() if n not in first))
+
+
 @pytest.mark.asyncio
-async def test_two_siblings_over_min_score_bring_the_whole_list(
+async def test_two_selected_siblings_bring_the_whole_list(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:
     fact_index.upsert(_tools())
+    _scripted_tools(index, ["Vim", "Rust"])
     fetcher = _fetcher(
         index,
         executors,
         reranker=ScriptedReranker({"vim": 0.9, "rust": 0.9}),
-        config=_config(min_score=0.5),
+        config=_config(select_k=2),
     )
 
     outcome = await fetcher.fetch_outcome(_request("do I use vim and rust"))
@@ -780,12 +927,18 @@ async def test_two_siblings_over_min_score_bring_the_whole_list(
     assert [fact.object_name for fact in placed.facts.facts] == ["Emacs", "Rust", "Vim", "Zig"]
     [item] = outcome.result.items
     assert "Zig" in item.text and "Go" not in item.text
-    injected = [c for c in outcome.result.stage.candidates if c.disposition == "injected"]
-    assert {c.ref for c in injected} >= {
-        graph_ref("user", "USES", "vim"),
-        graph_ref("user", "USES", "rust"),
-    }
-    assert {c.item for c in injected} == {1}
+    by_ref = _by_ref(outcome.result)
+    # Zig and Emacs ranked after the selection; the list places them, so they are injected.
+    for name in ("Vim", "Rust", "Zig", "Emacs"):
+        assert (by_ref[graph_ref("user", "USES", name.lower())].disposition, name) == (
+            "injected",
+            name,
+        )
+    assert {c.item for c in by_ref.values() if c.disposition == "injected"} == {1}
+    assert by_ref[graph_ref("user", "USES", "go")].disposition == "dropped_rank"
+    # A placed sibling takes the position of the earliest selected member.
+    positions = {s.candidate.item_id: s.position for s in outcome.selected}
+    assert positions[_key("Zig", "USES")] == positions[_key("Vim", "USES")] == 1
 
 
 @pytest.mark.asyncio
@@ -793,11 +946,12 @@ async def test_a_list_is_capped_at_list_max_items(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:
     fact_index.upsert(_tools())
+    _scripted_tools(index, ["Vim", "Zig"])
     fetcher = _fetcher(
         index,
         executors,
         reranker=ScriptedReranker({"vim": 0.9, "zig": 0.9}),
-        config=_config(min_score=0.5, list_max_items=3),
+        config=_config(select_k=2, list_max_items=3),
     )
 
     outcome = await fetcher.fetch_outcome(_request("do I use vim and zig"))
@@ -808,12 +962,13 @@ async def test_a_list_is_capped_at_list_max_items(
 
 
 @pytest.mark.asyncio
-async def test_one_sibling_over_min_score_stays_a_single_item(
+async def test_one_selected_sibling_stays_a_single_item(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:
     fact_index.upsert(_tools())
+    _scripted_tools(index, ["Vim"])
     fetcher = _fetcher(
-        index, executors, reranker=ScriptedReranker({"vim": 0.9}), config=_config(min_score=0.5)
+        index, executors, reranker=ScriptedReranker({"vim": 0.9}), config=_config(select_k=1)
     )
 
     outcome = await fetcher.fetch_outcome(_request("do I use vim"))
@@ -828,18 +983,340 @@ async def test_a_suppressed_sibling_stays_out_of_the_list(
     fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
 ) -> None:
     fact_index.upsert(_tools())
+    _scripted_tools(index, ["Vim", "Rust"])
     fetcher = _fetcher(
         index,
         executors,
         reranker=ScriptedReranker({"vim": 0.9, "rust": 0.9}),
         suppression=StaticSuppression(frozenset({_key("Zig", "USES")})),
-        config=_config(min_score=0.5),
+        config=_config(select_k=2),
     )
 
     outcome = await fetcher.fetch_outcome(_request("do I use vim and rust"))
 
     [placed] = outcome.lists
     assert [fact.object_name for fact in placed.facts.facts] == ["Emacs", "Rust", "Vim"]
+
+
+# -- facets -----------------------------------------------------------------------------------
+
+
+_CLUBS = facet_key("user", "MEMBER_OF", "Organization")
+
+
+def _club(name: str, recorded: str, *, utterance: str | None = None, **kwargs: object) -> FactRow:
+    row = _fact(name, rel_type="MEMBER_OF", utterance=utterance, **kwargs)  # type: ignore[arg-type]
+    return replace(row, recorded_at=f"2026-{recorded}T00:00:00+00:00")
+
+
+def _clubs() -> dict[str, FactRow]:
+    """Four clubs of separate utterances, newest recorded first: Kestrel, Wren, Gull, Heron."""
+    return {
+        "heron": _club("Heron Society", "01-01"),
+        "gull": _club("Gull Club", "02-01"),
+        "wren": _club("Wren Circle", "03-01"),
+        "kestrel": _club("Kestrel Guild", "04-01"),
+    }
+
+
+def _member_scores() -> ScriptedReranker:
+    # The facet's view names no member, so it scores by its type word alone.
+    return ScriptedReranker({"heron": 0.9, "filler": 0.85, "kestrel": 0.1, "organization": 0.8})
+
+
+async def _member_fetch(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, *, select_k: int
+) -> tuple[FetchOutcome, dict[str, FactRow]]:
+    """Order: Heron (1), the facet (2), Filler (3), Kestrel (4); Gull and Wren unranked.
+
+    The facet is first in the pools (two facet pools find it), Heron first by the
+    cross-encoder; the order scores put the facet between Heron and Filler.
+    """
+    rows = _clubs()
+    filler = _fact("Filler Works")
+    fact_index.upsert([*rows.values(), filler])
+    index.script(rows["heron"], rows["kestrel"], filler)
+    index.script_facets(_CLUBS)
+    fetcher = _fetcher(
+        index,
+        executors,
+        reranker=_member_scores(),
+        config=_config(facets=True, select_k=select_k, list_max_items=3),
+    )
+    outcome = await fetcher.fetch_outcome(_request("which clubs"))
+    return outcome, {**rows, "filler": filler}
+
+
+@pytest.mark.asyncio
+async def test_a_selected_facet_places_its_members_selected_first_then_newest(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    outcome, rows = await _member_fetch(fact_index, index, executors, select_k=2)
+
+    order = [(s.candidate.kind, s.candidate.item_id) for s in outcome.ranked]
+    assert order == [
+        ("fact", rows["heron"].fact_key),
+        ("facet", _CLUBS),
+        ("fact", rows["filler"].fact_key),
+        ("fact", rows["kestrel"].fact_key),
+    ]
+    # Heron is selected alone, so it comes first; then the newest: Kestrel, then Wren. The
+    # cap of three leaves Gull out.
+    placed = {s.candidate.item_id: s.position for s in outcome.selected}
+    assert placed == {
+        rows["heron"].fact_key: 1,
+        _CLUBS: 2,
+        rows["kestrel"].fact_key: 2,
+        rows["wren"].fact_key: 2,
+    }
+    assert [s.position for s in outcome.selected] == sorted(s.position for s in outcome.selected)
+    texts = [item.text for item in outcome.result.items]
+    assert len(texts) == 3 and not any("Gull" in text for text in texts)
+    by_ref = _by_ref(outcome.result)
+    # Kestrel ranked past the selection; the facet placed it, so it is injected.
+    kestrel = by_ref[_ref(rows["kestrel"])]
+    assert (kestrel.rank, kestrel.disposition) == (4, "injected")
+    assert by_ref[_ref(rows["filler"])].disposition == "dropped_rank"
+    facet = by_ref[f"facet:{_CLUBS}"]
+    heron = by_ref[_ref(rows["heron"])]
+    assert (facet.source, facet.alt_ref, facet.rank) == ("facet", None, 2)
+    assert facet.disposition == "injected" and facet.item == heron.item == 1
+    assert index.member_lookups == [(_CLUBS,)]
+
+
+@pytest.mark.asyncio
+async def test_a_member_selected_alone_keeps_an_earlier_position_and_takes_the_facets_otherwise(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    outcome, rows = await _member_fetch(fact_index, index, executors, select_k=4)
+
+    ranked = {s.candidate.item_id: s for s in outcome.ranked}
+    selected = {s.candidate.item_id: s for s in outcome.selected}
+    facet = ranked[_CLUBS]
+    # Heron (1) is earlier than the facet (2) and keeps its place; Kestrel (4) moves up to it.
+    assert selected[rows["heron"].fact_key] == ranked[rows["heron"].fact_key]
+    kestrel = selected[rows["kestrel"].fact_key]
+    assert (kestrel.position, kestrel.score) == (facet.position, facet.score)
+    assert ranked[rows["kestrel"].fact_key].position == 4
+    assert selected[rows["filler"].fact_key].position == 3
+
+
+@pytest.mark.asyncio
+async def test_a_facet_and_a_sibling_list_of_one_utterance_make_one_list(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    rows = [
+        _club(name, "01-01", utterance="utt-clubs")
+        for name in ("Gull Club", "Heron Society", "Kestrel Guild")
+    ]
+    fact_index.upsert(rows)
+    gull, heron, kestrel = rows
+    index.script(gull, heron)
+    index.script_facets(_CLUBS)
+    fetcher = _fetcher(
+        index,
+        executors,
+        reranker=ScriptedReranker({"gull": 0.9, "heron": 0.85, "organization": 0.8}),
+        config=_config(facets=True, select_k=3),
+    )
+
+    outcome = await fetcher.fetch_outcome(_request("which clubs"))
+
+    # Fused in pool order, ordered by position, selected in packing order.
+    assert [fused.pool_rank for fused in outcome.fused] == [1, 2, 3]
+    assert [(f.candidate.kind, f.candidate.item_id) for f in outcome.fused] == [
+        ("facet", _CLUBS),
+        ("fact", gull.fact_key),
+        ("fact", heron.fact_key),
+    ]
+    assert [(s.candidate.kind, s.candidate.item_id, s.position) for s in outcome.ranked] == [
+        ("fact", gull.fact_key, 1),
+        ("facet", _CLUBS, 2),
+        ("fact", heron.fact_key, 3),
+    ]
+    selected = [(s.candidate.kind, s.candidate.item_id, s.position) for s in outcome.selected]
+    assert selected == sorted(
+        [
+            ("fact", gull.fact_key, 1),
+            ("facet", _CLUBS, 2),
+            ("fact", heron.fact_key, 2),
+            ("fact", kestrel.fact_key, 2),
+        ],
+        key=lambda entry: (entry[2], entry[1], entry[0]),
+    )
+    # One list, each fact once: the block's refusal of a repeated fact never fires.
+    [placed] = outcome.lists
+    assert sorted(fact.fact_key for fact in placed.facts.facts) == sorted(r.fact_key for r in rows)
+    [item] = outcome.result.items
+    assert outcome.result.stage.skip_reason is None and outcome.result.block_text is not None
+    by_ref = _by_ref(outcome.result)
+    assert {by_ref[_ref(row)].item for row in (gull, heron)} == {1}
+    assert by_ref[f"facet:{_CLUBS}"].item == 1
+
+
+@pytest.mark.parametrize("reason", ["suppressed", "not_current"])
+@pytest.mark.asyncio
+async def test_a_facet_without_two_current_members_leaves_before_the_cross_encoder(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors, reason: str
+) -> None:
+    if reason == "not_current":
+        gull = _club("Gull Club", "01-01", valid_from="2024-01-01", valid_to="2025-01-01")
+    else:
+        gull = _club("Gull Club", "01-01")
+    heron = _club("Heron Society", "02-01")
+    fact_index.upsert([gull, heron])
+    index.script(heron)
+    index.script_facets(_CLUBS)
+    reranker = FakeReranker()
+    suppressed = frozenset({gull.fact_key}) if reason == "suppressed" else frozenset()
+    fetcher = _fetcher(
+        index,
+        executors,
+        reranker=reranker,
+        suppression=StaticSuppression(suppressed),
+        config=_config(facets=True, select_k=1),
+    )
+
+    outcome = await fetcher.fetch_outcome(_request("which clubs"))
+
+    facet = _by_ref(outcome.result)[f"facet:{_CLUBS}"]
+    assert (facet.disposition, facet.rank, facet.ce_rank) == ("dropped_no_members", 2, None)
+    # It took no pair and no slot: the one slot went to Heron.
+    [(_, texts, _)] = reranker.calls
+    assert len(texts) == 1
+    assert [item.item_id for item in outcome.result.items] == [heron.fact_key]
+    assert index.member_lookups == [(_CLUBS,)]
+
+
+@pytest.mark.asyncio
+async def test_a_late_member_lookup_drops_every_facet_and_serves_the_facts(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    rows = _clubs()
+    fact_index.upsert(list(rows.values()))
+    index.script(rows["heron"])
+    index.script_facets(_CLUBS)
+    clock = FakeClock()
+    index.hooks["facet_members_many"] = lambda: clock.advance(ms=60)
+    fetcher = _fetcher(index, executors, clock=clock, config=_config(facets=True, deadline_ms=50))
+
+    result = await fetcher.fetch(_request("which clubs"))
+
+    assert result.degraded_reason == "deadline"
+    assert _by_ref(result)[f"facet:{_CLUBS}"].disposition == "dropped_late"
+    assert [item.item_id for item in result.items] == [rows["heron"].fact_key]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_member_lookup_gives_no_block_and_index_error(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert(list(_clubs().values()))
+    index.script_facets(_CLUBS)
+
+    def fail() -> None:
+        raise MemoryIndexError("disk I/O error")
+
+    index.hooks["facet_members_many"] = fail
+    result = await _fetcher(index, executors, config=_config(facets=True)).fetch(
+        _request("which clubs")
+    )
+
+    assert result.degraded_reason == "index_error" and result.items == ()
+    assert result.block_text is None
+
+
+@pytest.mark.asyncio
+async def test_a_selected_facet_none_of_whose_members_fit_is_dropped_budget(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    header = FakeTokenCounter().count(HEADER)
+    heron = _club("Heron " + _words("h", 200), "01-01")
+    gull = _club("Gull " + _words("g", 200), "02-01")
+    fact_index.upsert([heron, gull])
+    index.script(heron, gull)
+    index.script_facets(_CLUBS)
+    fetcher = _fetcher(
+        index,
+        executors,
+        reranker=ScriptedReranker({"organization": 0.9}),
+        config=_config(facets=True, select_k=1, block_tokens=header + 50),
+    )
+
+    outcome = await fetcher.fetch_outcome(_request("which clubs"))
+
+    assert [s.candidate.item_id for s in outcome.ranked][0] == _CLUBS
+    by_ref = _by_ref(outcome.result)
+    facet = by_ref[f"facet:{_CLUBS}"]
+    # Its members are too large for the whole budget, so the facet placed nothing.
+    assert (facet.disposition, facet.item) == ("dropped_budget", None)
+    assert {by_ref[_ref(row)].disposition for row in (heron, gull)} == {"dropped_no_fit"}
+    assert outcome.result.items == ()
+
+
+@pytest.mark.asyncio
+async def test_two_selected_facets_share_one_member_lookup(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    tools = facet_key("user", "USES", "Organization")
+    fact_index.upsert(
+        [*_clubs().values(), _fact("Vim", rel_type="USES"), _fact("Rust", rel_type="USES")]
+    )
+    index.script()
+    index.script_facets(_CLUBS, tools)
+    fetcher = _fetcher(index, executors, config=_config(facets=True, select_k=2))
+
+    outcome = await fetcher.fetch_outcome(_request("which clubs and tools"))
+
+    selected = {s.candidate.item_id for s in outcome.selected if s.candidate.kind == "facet"}
+    assert selected == {_CLUBS, tools}
+    [keys] = index.member_lookups
+    assert sorted(keys) == sorted([_CLUBS, tools])
+
+
+@pytest.mark.asyncio
+async def test_facets_come_from_their_own_pools_and_stage1_anchors(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert(list(_clubs().values()))
+    fetcher = _fetcher(index, executors, config=_config(facets=True))
+
+    outcome = await fetcher.fetch_outcome(
+        _request("which organisations am I a member of", turns=("the user joined a club",))
+    )
+
+    assert {"search_facets_fts", "search_facets_vector"} <= set(index.calls)
+    # Once for the recent turns in stage 1, once for the query's own entity pool.
+    assert index.calls.count("search_facet_names") == 2
+    [facet] = [f for f in outcome.fused if f.candidate.kind == "facet"]
+    assert facet.candidate.item_id == _CLUBS
+    # Only the recent turn names the user, so the entity rank came from stage 1's anchors.
+    assert ENTITY_POOL in facet.candidate.ranks and FTS_POOL in facet.candidate.ranks
+    assert facet.candidate.text == facet.candidate.view_text
+    assert facet.candidate.when is None
+    stage_facet = _by_ref(outcome.result)[f"facet:{_CLUBS}"]
+    assert (stage_facet.source, stage_facet.alt_ref) == ("facet", None)
+
+
+@pytest.mark.asyncio
+async def test_facets_off_runs_no_facet_pool_and_offers_no_facet(
+    fact_index: FactIndex, index: HookedIndex, executors: FetcherExecutors
+) -> None:
+    fact_index.upsert(list(_clubs().values()))
+    fetcher = _fetcher(index, executors, config=_config(facets=False))
+
+    outcome = await fetcher.fetch_outcome(
+        _request("which organisations am I a member of", turns=("the user joined a club",))
+    )
+
+    facet_calls = {
+        "search_facets_fts",
+        "search_facets_vector",
+        "search_facet_names",
+        "facet_members_many",
+    }
+    assert not facet_calls & set(index.calls)
+    assert all(fused.candidate.kind != "facet" for fused in outcome.fused)
 
 
 # -- prefetch ---------------------------------------------------------------------------------

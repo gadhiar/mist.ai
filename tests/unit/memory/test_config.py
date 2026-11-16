@@ -77,7 +77,8 @@ class TestDefaults:
         assert config.enabled is True
         assert config.block_tokens == 500
         assert config.continuity_share == 0.35
-        assert config.min_score == 0.35
+        assert config.select_k == 8
+        assert config.facets is True
         assert config.deadline_ms == 50
         assert config.rerank_backend == "local"
         assert config.rerank_model == "/opt/models/ms-marco-MiniLM-L-6-v2"
@@ -87,15 +88,10 @@ class TestDefaults:
         assert config.rerank_remote_model is None
         assert config.rerank_timeout_ms == 40
         assert config.rerank_remote_scores == "logit"
-        assert (config.rerank_weight, config.recency_weight, config.confidence_weight) == (
-            0.8,
-            0.1,
-            0.1,
-        )
         assert config.index_path is None
         assert config.refresh_debounce_s == 30
         assert config.block_tokens_low == 0
-        assert config.list_max_items == 10
+        assert config.list_max_items == 25
         assert config.rescan_interval_s == 300
         assert config.tz is UTC
         assert config.tz_name is None
@@ -103,6 +99,14 @@ class TestDefaults:
         assert config.need_gate == "on"
         assert config.need_embedder == "shared"
         assert config.need_context is True
+
+    def test_the_score_threshold_and_weights_are_gone(self):
+        """Selection is by rank (plan v7 A37), so no item score is thresholded or weighted."""
+        config = MemoryConfig()
+
+        for name in ("min_score", "rerank_weight", "recency_weight", "confidence_weight"):
+            assert not hasattr(config, name), name
+        assert {"MIST_MEMORY_MIN_SCORE", "MIST_MEMORY_WEIGHTS"}.isdisjoint(MEMORY_ENV_VARS)
 
     def test_there_is_no_neighbour_setting(self):
         """The gate model's form carries its own neighbour count; no setting can drift from it."""
@@ -128,7 +132,7 @@ class TestFromEnv:
             "MIST_MEMORY_ENABLED": "false",
             "MIST_MEMORY_BLOCK_TOKENS": "300",
             "MIST_MEMORY_CONTINUITY_SHARE": "0.5",
-            "MIST_MEMORY_MIN_SCORE": "0.4",
+            "MIST_MEMORY_SELECT_K": "5",
             "MIST_MEMORY_DEADLINE_MS": "80",
             "MIST_MEMORY_RERANK_BACKEND": "remote",
             "MIST_MEMORY_RERANK_MODEL": "/opt/models/ms-marco-MiniLM-L-12-v2",
@@ -138,11 +142,11 @@ class TestFromEnv:
             "MIST_MEMORY_RERANK_REMOTE_MODEL": "bge-reranker",
             "MIST_MEMORY_RERANK_TIMEOUT_MS": "25",
             "MIST_MEMORY_RERANK_REMOTE_SCORES": "probability",
-            "MIST_MEMORY_WEIGHTS": "0.6, 0.3, 0.1",
             "MIST_MEMORY_INDEX_PATH": ":memory:",
             "MIST_MEMORY_REFRESH_DEBOUNCE_S": "5",
             "MIST_MEMORY_BLOCK_TOKENS_LOW": "120",
             "MIST_MEMORY_LIST_MAX_ITEMS": "6",
+            "MIST_MEMORY_FACETS": "off",
             "MIST_MEMORY_RESCAN_INTERVAL_S": "45",
             "MIST_MEMORY_FACT_VIEW": "F2",
             "MIST_MEMORY_NEED_GATE": "shadow",
@@ -157,7 +161,7 @@ class TestFromEnv:
         assert config.enabled is False
         assert config.block_tokens == 300
         assert config.continuity_share == 0.5
-        assert config.min_score == 0.4
+        assert config.select_k == 5
         assert config.deadline_ms == 80
         assert config.rerank_backend == "remote"
         assert config.rerank_model == "/opt/models/ms-marco-MiniLM-L-12-v2"
@@ -167,15 +171,11 @@ class TestFromEnv:
         assert config.rerank_remote_model == "bge-reranker"
         assert config.rerank_timeout_ms == 25
         assert config.rerank_remote_scores == "probability"
-        assert (config.rerank_weight, config.recency_weight, config.confidence_weight) == (
-            0.6,
-            0.3,
-            0.1,
-        )
         assert config.index_path == ":memory:"
         assert config.refresh_debounce_s == 5
         assert config.block_tokens_low == 120
         assert config.list_max_items == 6
+        assert config.facets is False
         assert config.rescan_interval_s == 45
         assert config.fact_view == "F2"
         assert config.need_gate == "shadow"
@@ -220,8 +220,8 @@ class TestFromEnv:
             ("MIST_MEMORY_ENABLED", "maybe"),
             ("MIST_MEMORY_BLOCK_TOKENS", "five hundred"),
             ("MIST_MEMORY_CONTINUITY_SHARE", "a third"),
-            ("MIST_MEMORY_WEIGHTS", "0.8,0.2"),
-            ("MIST_MEMORY_WEIGHTS", "0.8,x,0.1"),
+            ("MIST_MEMORY_SELECT_K", "eight"),
+            ("MIST_MEMORY_FACETS", "some"),
             ("MIST_MEMORY_NEED_CONTEXT", "sometimes"),
         ],
     )
@@ -350,6 +350,8 @@ class TestRetiredVariables:
         [
             ("MIST_MEMORY_BLOCK_ROLE", "system_tail", "MIST_CTX_BUDGET_DELTA_PLACEMENT"),
             ("MIST_MEMORY_TZ", "Europe/London", "MIST_TIMEZONE"),
+            ("MIST_MEMORY_MIN_SCORE", "0.35", "MIST_MEMORY_SELECT_K"),
+            ("MIST_MEMORY_WEIGHTS", "0.8,0.1,0.1", "MIST_MEMORY_SELECT_K"),
         ],
     )
     def test_a_set_retired_variable_fails_naming_its_replacement(
@@ -362,7 +364,15 @@ class TestRetiredVariables:
 
         assert replacement in str(excinfo.value)
 
-    @pytest.mark.parametrize("name", ["MIST_MEMORY_BLOCK_ROLE", "MIST_MEMORY_TZ"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "MIST_MEMORY_BLOCK_ROLE",
+            "MIST_MEMORY_TZ",
+            "MIST_MEMORY_MIN_SCORE",
+            "MIST_MEMORY_WEIGHTS",
+        ],
+    )
     def test_a_blank_retired_variable_counts_as_unset(self, monkeypatch, name):
         """Compose forwards `${VAR:-}` as an empty string, which must not fail startup."""
         monkeypatch.setenv(name, "  ")
@@ -387,14 +397,16 @@ class TestValidation:
             ({"block_tokens": -1}, "block_tokens"),
             ({"continuity_share": -0.01}, "continuity_share"),
             ({"continuity_share": 1.01}, "continuity_share"),
-            ({"min_score": 1.5}, "min_score"),
+            ({"select_k": 0}, "select_k"),
+            ({"select_k": 26, "rerank_top_n": 30}, "select_k"),
+            ({"select_k": 21}, "select_k"),
+            ({"select_k": 10, "rerank_top_n": 9}, "select_k"),
+            ({"facets": "on"}, "facets"),
             ({"deadline_ms": 0}, "deadline_ms"),
             ({"rerank_top_n": 0}, "rerank_top_n"),
             ({"rerank_device": "mps"}, "rerank_device"),
             ({"rerank_backend": "gpu"}, "rerank_backend"),
             ({"rerank_remote_scores": "raw"}, "rerank_remote_scores"),
-            ({"rerank_weight": 0.8, "recency_weight": 0.2, "confidence_weight": 0.1}, "weights"),
-            ({"rerank_weight": 1.1, "recency_weight": -0.2, "confidence_weight": 0.1}, "weights"),
             ({"rerank_backend": "remote"}, "rerank_url"),
             (
                 {"rerank_backend": "remote", "rerank_url": "http://r:1", "rerank_timeout_ms": 0},
@@ -429,6 +441,9 @@ class TestValidation:
             ({"list_max_items": 2}, "list_max_items"),
             ({"list_max_items": 25}, "list_max_items"),
             ({"rescan_interval_s": 30}, "rescan_interval_s"),
+            ({"select_k": 1}, "select_k"),
+            ({"select_k": 25, "rerank_top_n": 25}, "select_k"),
+            ({"select_k": 9, "rerank_top_n": 9}, "select_k"),
         ],
     )
     def test_range_bounds_are_inclusive(self, overrides, field):
@@ -441,6 +456,8 @@ class TestValidation:
             ("MIST_MEMORY_LIST_MAX_ITEMS", "30"),
             ("MIST_MEMORY_RESCAN_INTERVAL_S", "10"),
             ("MIST_MEMORY_LIST_MAX_ITEMS", "ten"),
+            ("MIST_MEMORY_SELECT_K", "0"),
+            ("MIST_MEMORY_SELECT_K", "21"),
         ],
     )
     def test_from_env_rejects_out_of_range_variables(self, monkeypatch, name, raw):
@@ -453,13 +470,17 @@ class TestValidation:
         assert MemoryConfig(continuity_share=0.0).continuity_share == 0.0
         assert MemoryConfig(continuity_share=1.0).continuity_share == 1.0
 
-    def test_weights_sum_within_tolerance(self):
-        config = MemoryConfig(rerank_weight=0.7, recency_weight=0.2, confidence_weight=0.1000005)
-        assert config.confidence_weight == 0.1000005
+    @pytest.mark.parametrize("raw", ["on", "true", "off", "false"])
+    def test_facets_accept_on_and_off(self, monkeypatch, raw):
+        monkeypatch.setenv("MIST_MEMORY_FACETS", raw)
 
-    def test_weights_outside_tolerance_fail(self):
-        with pytest.raises(MemoryConfigError, match="weights"):
-            MemoryConfig(rerank_weight=0.7, recency_weight=0.2, confidence_weight=0.10001)
+        expected = raw in ("on", "true")
+        assert MemoryConfig.from_env(tz_resolver=_never_called).facets is expected
+
+    @pytest.mark.parametrize("name", ["min_score", "rerank_weight"])
+    def test_a_retired_field_is_refused_by_the_constructor(self, name):
+        with pytest.raises(TypeError, match=name):
+            MemoryConfig(**{name: 0.5})
 
     def test_remote_with_url_and_timeout_is_valid(self):
         config = MemoryConfig(rerank_backend="remote", rerank_url="http://rerank.lan:8080")
@@ -659,7 +680,7 @@ class TestEnvExampleDocumentsEveryVariable:
         assert documented["MIST_MEMORY_ENABLED"] == "true"
         assert int(documented["MIST_MEMORY_BLOCK_TOKENS"]) == defaults.block_tokens
         assert float(documented["MIST_MEMORY_CONTINUITY_SHARE"]) == defaults.continuity_share
-        assert float(documented["MIST_MEMORY_MIN_SCORE"]) == defaults.min_score
+        assert int(documented["MIST_MEMORY_SELECT_K"]) == defaults.select_k
         assert int(documented["MIST_MEMORY_DEADLINE_MS"]) == defaults.deadline_ms
         assert documented["MIST_MEMORY_RERANK_BACKEND"] == defaults.rerank_backend
         assert documented["MIST_MEMORY_RERANK_MODEL"] == defaults.rerank_model
@@ -667,10 +688,10 @@ class TestEnvExampleDocumentsEveryVariable:
         assert documented["MIST_MEMORY_RERANK_DEVICE"] == defaults.rerank_device
         assert int(documented["MIST_MEMORY_RERANK_TIMEOUT_MS"]) == defaults.rerank_timeout_ms
         assert documented["MIST_MEMORY_RERANK_REMOTE_SCORES"] == defaults.rerank_remote_scores
-        assert documented["MIST_MEMORY_WEIGHTS"] == "0.8,0.1,0.1"
         assert int(documented["MIST_MEMORY_REFRESH_DEBOUNCE_S"]) == defaults.refresh_debounce_s
         assert int(documented["MIST_MEMORY_BLOCK_TOKENS_LOW"]) == defaults.block_tokens_low
         assert int(documented["MIST_MEMORY_LIST_MAX_ITEMS"]) == defaults.list_max_items
+        assert documented["MIST_MEMORY_FACETS"] == "on"
         assert int(documented["MIST_MEMORY_RESCAN_INTERVAL_S"]) == defaults.rescan_interval_s
         assert documented["MIST_MEMORY_FACT_VIEW"] == defaults.fact_view
         assert documented["MIST_MEMORY_NEED_GATE"] == defaults.need_gate
@@ -687,6 +708,14 @@ class TestEnvExampleDocumentsEveryVariable:
         assert positions == sorted(positions)
         index = MEMORY_ENV_VARS.index("MIST_MEMORY_FACT_VIEW")
         assert MEMORY_ENV_VARS[index + 1 : index + 4] == _NEED_VARIABLES
+
+    def test_the_variables_are_listed_in_env_example_order(self):
+        text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        names = [name for name in MEMORY_ENV_VARS if name.startswith("MIST_MEMORY_")]
+
+        positions = [text.index(f"# {name}=") for name in names]
+
+        assert positions == sorted(positions)
 
     def test_the_need_embedder_comment_names_every_embedder(self):
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
