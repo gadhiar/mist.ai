@@ -7,7 +7,14 @@ argument, so no choice made here can be made on the held-out set the PR 1 gates 
 For each fact view and note view (backend/memory/retrieval_view.py), each dev probe of a gated
 class, and each noise probe, has its query scored against every fact version current at its
 `now` (the run harness's `facts_known_at` and its currency choice) and every note chunk the
-vault sidecar makes of the notes that exist then:
+vault sidecar makes of the notes that exist then, less what the read path suppresses before its
+reranker. The suppression set is production's, built as the harness builds it: the fixture's
+corrections due by `now` recorded into an event store of the probe's own
+(`record_due_corrections`), read back by `LoggedSuppression`. A fact leaves when its current
+version is suppressed (`Suppression.suppresses_fact`); a note path leaves when its whole indexed
+text, the sidecar's `path_texts_readonly` the fetcher reads, is suppressed at the time the note
+pool gives it (`Suppression.suppresses_note`). The pools' ranks still count what leaves, as the
+fetcher drops it after fusion without refilling:
 
 - CE: the cross-encoder's sigmoid over (query, view text);
 - BI: `b(sim) = clamp((sim - s0) / (s1 - s0), 0, 1)` over the bi-encoder cosine of the query
@@ -67,6 +74,7 @@ view text. Both are recorded in the output.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import posixpath
 import sys
@@ -81,10 +89,13 @@ import numpy as np
 from sentence_transformers import CrossEncoder
 
 from backend.errors import MemoryConfigError, MemoryRerankError
+from backend.event_store.store import EventStore
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.config import SidecarIndexConfig
 from backend.memory.config import MemoryConfig
+from backend.memory.corrections import CorrectionService, LoggedSuppression, Suppression
 from backend.memory.fact_index import FactIndex
+from backend.memory.fetcher import SystemClock
 from backend.memory.fts import query_tokens
 from backend.memory.index_db import EMBEDDING_DIMENSION, open_index, open_reader
 from backend.memory.models import FactRow
@@ -104,6 +115,7 @@ from backend.memory.sources import (
     NOTE_FTS_POOL,
     NOTE_VECTOR_POOL,
     VECTOR_POOL,
+    _note_when,
 )
 from backend.vault.sidecar_index import VaultSidecarIndex
 from scripts.eval_harness.memory_recall import Probe
@@ -120,6 +132,7 @@ from scripts.eval_harness.memory_recall_run import (
     fact_row,
     facts_known_at,
     notes_known_at,
+    record_due_corrections,
 )
 
 Device = Literal["cpu", "cuda"]
@@ -741,13 +754,17 @@ class _Measurer:
         self._titles: dict[str, str] = {}
         for note in fixture.notes:
             self._titles.setdefault(note.path, note.title)
+        # Each indexed path's time as the note pool reads it from the indexed frontmatter.
+        self._note_whens: dict[str, datetime | None] = {}
         self.query_norms: list[float] = []
         self.identity_errors: list[float] = []
 
     def run(self, probes: Sequence[Probe], workdir: Path, tz: tzinfo) -> dict[str, _ProbeParts]:
-        """Bring the indexes to each `now` in turn, as the run harness does, and measure there.
+        """Bring the indexes and the correction log to each `now`, as the harness does, and measure.
 
-        A note path is indexed once, when it first exists, as `run_fixture` indexes it.
+        A note path is indexed once, when it first exists, as `run_fixture` indexes it. The
+        corrections due by `now` are recorded into an event store in `workdir` before the
+        suppression set is read, as `run_fixture` records them before its fetches.
         """
         index_path = workdir / "memory_index.db"
         writer = open_index(index_path, embedding_model_id=_FTS_INDEX_MODEL_ID)
@@ -756,20 +773,31 @@ class _Measurer:
             SidecarIndexConfig(db_path=str(workdir / "vault_sidecar.db")), self.passages
         )
         sidecar.initialize()
+        event_store = EventStore(db_path=str(workdir / "event_store.db"))
+        event_store.initialize()
         parts: dict[str, _ProbeParts] = {}
         try:
+            corrections = CorrectionService(event_store, now_fn=SystemClock().now)
+            logged = LoggedSuppression(event_store)
+            recorded: set[str] = set()
             index = FactIndex(writer, TokenEmbedder(), tz=tz, reader=reader)
             indexed: set[str] = set()
             for now in sorted({probe.now for probe in probes}):
                 known = facts_known_at(self._fixture.facts, self._fixture.corrections, now)
                 index.diff_apply(known)
+                record_due_corrections(corrections, self._fixture.corrections, now, recorded)
                 for path, note in notes_known_at(self._fixture.notes, now).items():
                     if path not in indexed:
                         sidecar.upsert_file(path, note.content, note.mtime, note.frontmatter)
+                        self._note_whens[path] = _note_when(note.frontmatter, note.mtime, tz)[0]
                         indexed.add(path)
+                suppression = logged.suppression()
                 for probe in (p for p in probes if p.now == now):
-                    parts[probe.probe_id] = self._probe(probe, now, known, index, sidecar)
+                    parts[probe.probe_id] = self._probe(
+                        probe, now, known, index, sidecar, suppression
+                    )
         finally:
+            event_store.close()
             sidecar.close()
             reader.close()
             writer.close()
@@ -782,7 +810,14 @@ class _Measurer:
         known: Sequence[FactRow],
         index: FactIndex,
         sidecar: VaultSidecarIndex,
+        suppression: Suppression,
     ) -> _ProbeParts:
+        """One probe's measurements, scored only on what `suppression` leaves.
+
+        The vector order and the pool ranks still count a suppressed fact or note: the fetcher
+        fuses the pools first and drops what is suppressed from the shortlist after, before the
+        reranker, without refilling it.
+        """
         query = np.asarray(
             self._embedder.generate_embedding(self._query_prefix + probe.query), dtype=np.float64
         )
@@ -794,7 +829,7 @@ class _Measurer:
         current: dict[str, str] = {}
         for key in sorted(by_key):
             version = _current(index.versions(key), now)
-            if version is not None:
+            if version is not None and not suppression.suppresses_fact(version):
                 current[key] = version.row_key
         keys = list(current)
         searched = (
@@ -828,6 +863,8 @@ class _Measurer:
             fact_vector_ranks[view] = [rank_of[key] for key in keys]
 
         chunks = self._chunks(query, sidecar)
+        suppressed = self._suppressed_paths({chunk.path for chunk in chunks}, sidecar, suppression)
+        chunks = [chunk for chunk in chunks if chunk.path not in suppressed]
         paths = sorted({chunk.path for chunk in chunks})
         position = {path: n for n, path in enumerate(paths)}
         note_cos = np.full(len(paths), -1.0)
@@ -888,6 +925,30 @@ class _Measurer:
             chunks.append(chunk)
         return chunks
 
+    def _suppressed_paths(
+        self, paths: Iterable[str], sidecar: VaultSidecarIndex, suppression: Suppression
+    ) -> set[str]:
+        """The note paths whose whole indexed text `suppression` suppresses at the note's time.
+
+        The text is the one the fetcher judges (`VaultCandidates.texts`): the sidecar's
+        `path_texts_readonly`, each chunk cut at `chunk_max_chars`, so a corrected name past
+        every chunk's cut suppresses here no more than there. As in the fetcher, the texts are
+        read only when a correction names an object. The read is a coroutine on the sidecar's
+        own read thread, run to completion here on a loop of its own; the probe has none.
+
+        Raises:
+            SidecarIndexError: The sidecar read fails.
+        """
+        wanted = sorted(paths)
+        if not wanted or not suppression.narrates:
+            return set()
+        texts = asyncio.run(sidecar.path_texts_readonly(wanted))
+        return {
+            path
+            for path in wanted
+            if path in texts and suppression.suppresses_note(texts[path], self._note_whens[path])
+        }
+
     def _note_pools(
         self, query: np.ndarray, text: str, sidecar: VaultSidecarIndex
     ) -> dict[str, dict[str, int]]:
@@ -942,7 +1003,7 @@ def measure(
         reranker: The cross-encoder under test.
         fact_views: Fact view ids, in the tie-break order.
         note_views: Note view ids, in the tie-break order.
-        workdir: An empty directory for the fact index and the sidecar.
+        workdir: An empty directory for the fact index, the sidecar and the correction log.
         tz: Zone the fact views date a timestamp bound in, the index's.
         query_prefix: Prepended to each query before it is embedded.
         passage_prefix: Prepended to each fact view and chunk before it is embedded.

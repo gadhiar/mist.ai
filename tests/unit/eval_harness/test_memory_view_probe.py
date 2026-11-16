@@ -16,10 +16,19 @@ import pytest
 
 import scripts.eval_harness.memory_recall_run as harness
 import scripts.eval_harness.memory_view_probe as view_probe
+from backend.knowledge.config import SidecarIndexConfig
 from backend.memory.sources import NOTE_VECTOR_POOL
-from scripts.eval_harness.memory_recall import FIXTURE_DIR, ItemRef, Probe, load_probes
+from scripts.eval_harness.memory_recall import (
+    FIXTURE_DIR,
+    Correction,
+    Fact,
+    ItemRef,
+    Probe,
+    VaultNote,
+    load_probes,
+)
 from scripts.eval_harness.memory_recall_gate import PR1_GATES
-from scripts.eval_harness.memory_recall_run import TokenEmbedder, TokenReranker
+from scripts.eval_harness.memory_recall_run import Fixture, TokenEmbedder, TokenReranker
 from scripts.eval_harness.memory_view_probe import (
     BLEND,
     CE,
@@ -572,3 +581,199 @@ class TestDevRun:
         result = run["result"]
         assert band(result["winner"]["margin"]) == (result["band"], run["code"])
         assert result["exit_code"] == run["code"]
+
+
+# -- suppression: a small synthetic fixture with one correction ------------------------------
+
+_RECORDED = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
+_CORRECTED = datetime(2026, 3, 10, 12, 0, tzinfo=UTC)
+_SAID_AGAIN = datetime(2026, 3, 12, 9, 0, tzinfo=UTC)
+# Before the correction, after it, and after the corrected fact is said again.
+_BEFORE = datetime(2026, 3, 9, 8, 0, tzinfo=UTC)
+_AFTER = datetime(2026, 3, 11, 8, 0, tzinfo=UTC)
+_LATER = datetime(2026, 3, 14, 8, 0, tzinfo=UTC)
+_CORRECTION_ID = "corr-" + "0" * 31 + "1"
+_CORRECTED_KEY = "k-beans"
+_REPLACEMENT_KEY = "k-colombian"
+_OTHER_KEY = "k-dog"
+_NOTE_BEFORE = "notes/coffee-before.md"
+_NOTE_AFTER = "notes/coffee-after.md"
+_NOTE_PAST_CUT = "notes/coffee-past-cut.md"
+_NOTE_OTHER = "notes/garden.md"
+
+
+def _fact(
+    row_key: str,
+    fact_key: str,
+    object_name: str,
+    recorded_at: datetime,
+    *,
+    subject: str = "Wren",
+    relation: str = "PREFERS",
+) -> Fact:
+    return Fact(
+        row_key=row_key,
+        fact_key=fact_key,
+        subject_id=subject.casefold(),
+        subject_name=subject,
+        subject_type="User",
+        relation=relation,
+        object_id=object_name.casefold().replace(" ", "-"),
+        object_name=object_name,
+        object_type="Preference",
+        text=f"{subject} {relation} {object_name}",
+        valid_from=recorded_at,
+        valid_to=None,
+        recorded_at=recorded_at,
+        confidence=1.0,
+        source_utterance_id=None,
+        state="current",
+        superseded_by=None,
+        source_correction_id=None,
+    )
+
+
+def _note(path: str, body: str, updated_at: datetime) -> VaultNote:
+    return VaultNote(
+        path=path,
+        title=path.removeprefix("notes/").removesuffix(".md"),
+        heading="Coffee",
+        authored_by="mist",
+        created_at=updated_at,
+        updated_at=updated_at,
+        tags=(),
+        body=body,
+    )
+
+
+def _correction(recorded_at: datetime) -> Correction:
+    return Correction(
+        correction_id=_CORRECTION_ID,
+        recorded_at=recorded_at,
+        action="correct",
+        fact_key=_CORRECTED_KEY,
+        subject_id="wren",
+        subject_name="Wren",
+        relation="PREFERS",
+        object_id="ethiopian-beans",
+        object_name="Ethiopian beans",
+        replacement_object_name="Colombian beans",
+        surface="ws",
+        session_id=None,
+        conversation_id=None,
+        turn_index=None,
+        source_event_id=None,
+        origin="user",
+    )
+
+
+def _noise(probe_id: str, now: datetime) -> Probe:
+    return Probe(
+        probe_id=probe_id,
+        kind="noise",
+        lexical=False,
+        query="which coffee beans does Wren buy",
+        now=now,
+        conversation_start=False,
+        expected=(),
+        acceptable=(),
+        forbidden=(),
+        distractors=(),
+        correction_id=None,
+        rationale="synthetic",
+    )
+
+
+def _fixture(corrections: tuple[Correction, ...]) -> Fixture:
+    # The name only past the cut: every chunk of this note is cut before it.
+    past_cut = "lorem " * 1200 + "Wren once tried Ethiopian beans."
+    assert len(past_cut) > SidecarIndexConfig().chunk_max_chars + 100
+    return Fixture(
+        probes=(_noise("before", _BEFORE), _noise("after", _AFTER), _noise("later", _LATER)),
+        facts=(
+            _fact("fv-1", _CORRECTED_KEY, "Ethiopian beans", _RECORDED),
+            _fact("fv-2", _OTHER_KEY, "basset hound", _RECORDED, subject="Biscuit"),
+            # The correction's replacement, its own row recorded at the correction.
+            _fact("fv-3", _REPLACEMENT_KEY, "Colombian beans", _CORRECTED),
+            # The corrected fact said again after the correction.
+            _fact("fv-4", _CORRECTED_KEY, "Ethiopian beans", _SAID_AGAIN),
+        ),
+        notes=(
+            _note(_NOTE_BEFORE, "Wren buys Ethiopian beans for the house.", _RECORDED),
+            # Updated the day after the correction: its `last_updated` midnight is later.
+            _note(
+                _NOTE_AFTER,
+                "Wren went back to Ethiopian beans.",
+                datetime(2026, 3, 11, 7, 0, tzinfo=UTC),
+            ),
+            _note(_NOTE_PAST_CUT, past_cut, _RECORDED),
+            _note(_NOTE_OTHER, "Wren planted tomatoes by the fence.", _RECORDED),
+        ),
+        corrections=corrections,
+    )
+
+
+def _measure_items(fixture: Fixture, workdir: Path) -> dict[str, ProbeScores]:
+    measured = view_probe.measure(
+        fixture,
+        embedder=TokenEmbedder(),
+        reranker=TokenReranker(),
+        fact_views=("F0",),
+        note_views=("N0",),
+        workdir=workdir,
+        tz=UTC,
+    )
+    [pair] = measured.pairs
+    return {scores.probe.probe_id: scores for scores in pair.probes}
+
+
+class TestSuppression:
+    """The probe scores only what the read path would hand its reranker."""
+
+    @pytest.fixture(scope="class")
+    def scored(self, tmp_path_factory):
+        return _measure_items(_fixture((_correction(_CORRECTED),)), tmp_path_factory.mktemp("s"))
+
+    def test_a_fact_corrected_by_now_is_not_scored_and_its_replacement_is(self, scored):
+        items = scored["after"].item_ids
+        assert f"fact:{_CORRECTED_KEY}" not in items
+        assert f"fact:{_REPLACEMENT_KEY}" in items
+        assert f"fact:{_OTHER_KEY}" in items
+        # Left out before scoring: one score per candidate that stays.
+        assert len(scored["after"].ce) == len(items)
+
+    def test_a_correction_recorded_after_now_leaves_the_fact_in(self, scored):
+        items = scored["before"].item_ids
+        assert f"fact:{_CORRECTED_KEY}" in items
+        assert f"note:{_NOTE_BEFORE}" in items
+
+    def test_a_version_recorded_after_the_correction_is_scored(self, scored):
+        assert f"fact:{_CORRECTED_KEY}" in scored["later"].item_ids
+
+    def test_a_note_naming_the_corrected_object_is_not_scored_until_updated_after(self, scored):
+        items = scored["after"].item_ids
+        assert f"note:{_NOTE_BEFORE}" not in items
+        assert f"note:{_NOTE_AFTER}" in items
+        assert f"note:{_NOTE_OTHER}" in items
+        assert len(scored["after"].cos) == len(items)
+
+    def test_a_note_naming_it_only_past_the_chunk_cut_is_scored(self, scored):
+        assert f"note:{_NOTE_PAST_CUT}" in scored["after"].item_ids
+
+    def test_with_no_correction_due_the_scores_equal_the_base(self, tmp_path):
+        undue = _measure_items(
+            _fixture((_correction(datetime(2026, 4, 1, tzinfo=UTC)),)), tmp_path / "undue"
+        )
+        base = _measure_items(_fixture(()), tmp_path / "base")
+
+        assert undue.keys() == base.keys()
+        for probe_id, scores in base.items():
+            other = undue[probe_id]
+            assert other.item_ids == scores.item_ids
+            np.testing.assert_array_equal(other.ce, scores.ce)
+            np.testing.assert_array_equal(other.cos, scores.cos)
+            assert other.vector_ranks == scores.vector_ranks
+            assert other.pool_ranks == scores.pool_ranks
+        # Nothing is left out: every fact and note known at `now` is scored.
+        assert f"fact:{_CORRECTED_KEY}" in base["after"].item_ids
+        assert f"note:{_NOTE_BEFORE}" in base["after"].item_ids
