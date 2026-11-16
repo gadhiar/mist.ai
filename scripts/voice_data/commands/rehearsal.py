@@ -412,12 +412,12 @@ def run_score(args: argparse.Namespace) -> int:
         "impostor": score_mod.impostor_turns(eps, segments, labels),
         "downmix": score_mod.downmix_recovery(eps, segments, layouts),
         "impostor_clusters": clusters,
+        "retrieval": score_mod.retrieval_summary(clusters),
         "effects": {"comb": effects.get("comb"), "eq": effects.get("eq")},
         "identity_windows": effects.get("identity_windows"),
         "gates": score_mod.gate_values(
             eps,
             segments,
-            clusters,
             effects,
             h6,
             score_mod.fallback_fc(read_json(root.path / pkg.BUILD_REL), eps),

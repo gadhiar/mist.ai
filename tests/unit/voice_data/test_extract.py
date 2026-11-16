@@ -27,6 +27,7 @@ import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -954,6 +955,74 @@ def test_a_candidate_without_a_reference_scores_none() -> None:
 def test_a_separator_named_none_is_refused() -> None:
     with pytest.raises(extract_stage.StageError):
         extract_stage.separate(np.zeros(RATE, dtype=np.float32), RATE, (Distorter("none", 1.0),))
+
+
+# Per-embedder gate values: the plan's thresholds hold one value per embedder for the anchor
+# check, the anchor floor and the margin, since the two embedders' cosines sit on different
+# scales.
+
+EMBEDDER_NAMES = ("wavlm-sv", "ecapa")
+
+
+def test_limits_read_one_value_per_embedder() -> None:
+    values = gates_mod.load(None).effective()
+    values["retrieval.anchor_floor.ecapa"] = 0.3
+    values["retrieval.margin.wavlm-sv"] = -0.02
+    limits = extract_stage.Limits.from_thresholds(values, EMBEDDER_NAMES)
+    assert limits.anchor_floor == {"wavlm-sv": 0.6, "ecapa": 0.3}
+    assert limits.margin == {"wavlm-sv": -0.02, "ecapa": 0.1}
+    assert limits.anchor_sim_min == {"wavlm-sv": 0.6, "ecapa": 0.6}
+
+
+def test_thresholds_lacking_an_embedders_value_are_refused_by_name() -> None:
+    values = gates_mod.load(None).effective()
+    del values["retrieval.margin.ecapa"]
+    with pytest.raises(extract_stage.StageError, match=r"retrieval\.margin\.ecapa"):
+        extract_stage.Limits.from_thresholds(values, EMBEDDER_NAMES)
+    del values["anchors.sim_min.wavlm-sv"]
+    with pytest.raises(extract_stage.StageError) as caught:
+        extract_stage.Limits.from_thresholds(values, EMBEDDER_NAMES)
+    assert "anchors.sim_min.wavlm-sv" in str(caught.value)
+    assert "retrieval.margin.ecapa" in str(caught.value)
+
+
+def _at(wavlm: float, ecapa: float) -> retrieve.Embedding:
+    """A clip at exactly these cosines to the unit vector on axis 0, one per embedder."""
+
+    def unit(cos: float) -> np.ndarray:
+        v = np.zeros(8)
+        v[0], v[1] = cos, np.sqrt(1.0 - cos**2)
+        return v
+
+    return {"wavlm-sv": unit(wavlm), "ecapa": unit(ecapa)}
+
+
+def test_an_sdh_anchor_below_its_value_on_either_embedder_is_dropped() -> None:
+    # Raj's anchor sits on axis 0. The first SDH anchor passes ECAPA's lower value although a
+    # single value of 0.6 on both would drop it; the second is below ECAPA's, the third below
+    # WavLM-SV's.
+    span = sdh_stage.SdhSpan(start_s=0.0, end_s=4.0, offscreen=False, cues=1)
+    offscreen = sdh_stage.SdhSpan(start_s=5.0, end_s=9.0, offscreen=True, cues=1)
+    anchors = (span, offscreen, span)
+    spans = sdh_stage.SourceSpans(
+        found=3, found_offscreen=1, multi=0, merged=anchors, kept=anchors, held_out=(),
+        anchors=anchors,
+    )  # fmt: skip
+    work = SimpleNamespace(
+        source=SimpleNamespace(source_id="src-0001"),
+        sdh_embs=[_at(0.85, 0.40), _at(0.85, 0.30), _at(0.75, 0.90)],
+    )
+    stage = SimpleNamespace(
+        sdh={"src-0001": spans},
+        limits=SimpleNamespace(anchor_sim_min={"wavlm-sv": 0.8, "ecapa": 0.35}),
+    )
+    own = _at(1.0, 1.0)
+    centre, counts = extract_stage.Extraction._sdh_anchors(stage, [work], [own])  # type: ignore[arg-type]
+    assert counts is not None
+    assert (counts["joined"], counts["dropped"], counts["dropped_offscreen"]) == (1, 2, 1)
+    expected = retrieve.centroids([own, _at(0.85, 0.40)])
+    for name in EMBEDDER_NAMES:
+        np.testing.assert_allclose(centre[name], expected[name])
 
 
 # Anchors and refusals, on a small episode.
