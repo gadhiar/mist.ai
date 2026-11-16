@@ -57,8 +57,12 @@ FOLD_EXCEPTIONS: dict[str, str] = {
     "cheers": "cheers",
     "christmas": "christmas",
     "downstairs": "downstairs",
+    "leeds": "leeds",  # the city; the fold leaves leed
     "lens": "lens",
+    "madras": "madras",  # the curry; the fold leaves madra
+    "texas": "texas",  # the state; the fold leaves texa
     "upstairs": "upstairs",
+    "yes": "yes",  # the fold leaves ye
     # Kept whole: the fold is not a readable word. Series occurs in no bank row yet; it is
     # listed ahead of the rows authors will write.
     "gas": "gas",
@@ -71,8 +75,12 @@ FOLD_EXCEPTIONS: dict[str, str] = {
     "calories": "calorie",
     "causes": "cause",
     "goes": "go",
+    "houses": "house",  # the fold leaves hous
     "movies": "movie",
+    "organises": "organise",  # the fold leaves organis
     "phrases": "phrase",
+    "potatoes": "potato",  # the fold drops only the s
+    "roses": "rose",  # the fold leaves ros
     "volcanoes": "volcano",
 }
 

@@ -30,6 +30,7 @@ BANK_PATHS = (
     REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_a.jsonl",
     REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_b.jsonl",
     REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_c.jsonl",
+    REPO_ROOT / "backend" / "memory" / "need_bank" / "writer_d.jsonl",
 )
 
 KEYS = ("id", "label", "previous", "query")
