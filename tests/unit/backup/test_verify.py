@@ -232,6 +232,7 @@ class TestTheComparison:
             "event_store.db": {"artifact": 3, "restored": 3},
             "extraction_cache.db": {"artifact": 2, "restored": 2},
             "vault_sidecar.db": {"artifact": 5, "restored": 5},
+            "capabilities.db": {"artifact": 4, "restored": 4},
         }
         assert payload["vault_files"] == {"artifact": 3, "restored": 3}
 

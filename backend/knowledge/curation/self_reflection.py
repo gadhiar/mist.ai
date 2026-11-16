@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from backend.extraction_backlog.eligibility import policy_skip_reason
 from backend.interfaces import EventStoreProvider
 from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
 from backend.knowledge.extraction.signal_detector import SignalDetector
@@ -109,6 +110,10 @@ class SelfReflectionJob:
             event_id = turn.get("event_id", "")
 
             if not utterance:
+                continue
+            # A turn a capability answered alone is a command and a template;
+            # there is nothing in it about the user or MIST to reflect on.
+            if policy_skip_reason(turn.get("answered_by")) is not None:
                 continue
 
             signals = self._signal_detector.detect(

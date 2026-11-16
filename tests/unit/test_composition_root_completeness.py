@@ -146,6 +146,7 @@ EXPECTED_BUILDER_CALL_SITES: frozenset[str] = frozenset(
         "_build_health_registry",
         "_build_gpu_yield",
         "_build_uptime_recorder",
+        "build_capability_host",
     }
 )
 
