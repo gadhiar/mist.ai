@@ -233,6 +233,22 @@ def _segments(root: root_mod.Root, run: str) -> list[SegmentRecord]:
     return read_jsonl(path, SegmentRecord)
 
 
+def _turns(root: root_mod.Root, run: str) -> list[extract_cmd.TurnRecord]:
+    """Return run `run`'s turn record; `_segments` has checked the run id.
+
+    Raises:
+        InputError: The run has no `turns.jsonl`. A run made before extract wrote one cannot
+            name its impostor's cluster, so it is refused rather than scored without it.
+    """
+    path = root.path / extract_cmd.run_rel(run) / extract_cmd.TURNS_NAME
+    if not path.is_file():
+        raise InputError(
+            f"refused: run {run} has no {extract_cmd.TURNS_NAME}; it predates the turn record, "
+            "so its impostor cluster cannot be named"
+        )
+    return read_jsonl(path, extract_cmd.TurnRecord)
+
+
 # ---------------------------------------------------------------------------
 # answer
 # ---------------------------------------------------------------------------
@@ -374,6 +390,7 @@ def run_score(args: argparse.Namespace) -> int:
     """Score an extraction run, run the effects step, write and print the score."""
     root = open_rehearsal(args.root)
     segments = _segments(root, args.run)
+    turns = _turns(root, args.run)
     report = read_json(root.path / extract_cmd.run_rel(args.run) / extract_cmd.REPORT_NAME)
     if not isinstance(report, dict):
         raise InputError(f"refused: run {args.run}'s report is not a JSON object")
@@ -400,7 +417,7 @@ def run_score(args: argparse.Namespace) -> int:
         raise JobError(f"{folder}/{pkg.EFFECTS_NAME} is not a JSON object")
     gates = gates_mod.load(root.path)
     h6 = {key: gates.value(key) for key, d in gates.defaults.items() if d.h6}
-    clusters = score_mod.impostor_clusters(eps, segments, report)
+    clusters = score_mod.impostor_clusters(eps, turns, report)
     result = {
         "schema": pkg.SCHEMA,
         "run": args.run,
@@ -412,7 +429,7 @@ def run_score(args: argparse.Namespace) -> int:
         "impostor": score_mod.impostor_turns(eps, segments, labels),
         "downmix": score_mod.downmix_recovery(eps, segments, layouts),
         "impostor_clusters": clusters,
-        "retrieval": score_mod.retrieval_summary(clusters),
+        "retrieval": score_mod.retrieval_summary(clusters, eps, turns, report),
         "effects": {"comb": effects.get("comb"), "eq": effects.get("eq")},
         "identity_windows": effects.get("identity_windows"),
         "gates": score_mod.gate_values(

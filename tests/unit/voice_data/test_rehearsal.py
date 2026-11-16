@@ -19,7 +19,7 @@ import json
 import math
 import shutil
 import subprocess
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -31,6 +31,7 @@ from scipy.signal import lfilter
 from scripts.voice_data import cli, gates, packs
 from scripts.voice_data import rehearsal as pkg
 from scripts.voice_data import root as root_mod
+from scripts.voice_data.commands import extract as extract_cmd
 from scripts.voice_data.commands import rehearsal as rehearsal_cmd
 from scripts.voice_data.errors import InputError
 from scripts.voice_data.records import (
@@ -611,6 +612,10 @@ def _segment(n: int, sid: str, line: pkg.TruthLine, **kw: object) -> SegmentReco
     return SegmentRecord(**values)  # type: ignore[arg-type]
 
 
+TURN_LABELS = {"target": "spk-01", "impostor": "spk-02", "other": "spk-03"}
+TURN_ROLES = {"spk-01": "primary", "spk-02": "flagged", "spk-03": "other"}
+
+
 @dataclass
 class Extracted:
     built: Built
@@ -624,7 +629,7 @@ def extracted(built: Built) -> Extracted:
     root = built.root
     raw = root.path / "seed" / "raw" / "rehearsal"
     raw.mkdir(parents=True)
-    records, segments = [], []
+    records, segments, turns = [], [], []
     n = 0
     wrong_state = 0
     expected = {"primary": 0, "true_primary": 0, "impostor": 0, "off": 0, "fallback": 0}
@@ -647,6 +652,20 @@ def extracted(built: Built) -> Extracted:
         first = len(segments)
         lines = [ln for ln in built.truth if ln.episode == ep["episode"]]
         for line in lines:
+            if not line.overlap:
+                # The turn record: each speaker's lines diarized as its own cluster.
+                label = TURN_LABELS[line.speaker]
+                turns.append(
+                    extract_cmd.TurnRecord(
+                        source_id=sid, turn=sum(t.source_id == sid for t in turns),
+                        start_s=line.start_s, end_s=line.end_s, diar_cluster=label,
+                        role=TURN_ROLES[label], embedded=True, touches_overlap=False,
+                        sim_anchor={"wavlm-sv": 0.8, "ecapa": 0.7},
+                        sim_target={"wavlm-sv": 0.8, "ecapa": 0.7},
+                        gaps={"wavlm-sv": 0.3, "ecapa": 0.2}, passed=label == "spk-01",
+                        reasons=(),
+                    )
+                )  # fmt: skip
             if line.overlap or line.end_s - line.start_s < 1.0:
                 continue
             n += 1
@@ -691,6 +710,7 @@ def extracted(built: Built) -> Extracted:
     expected["wrong_state"] = wrong_state
     write_jsonl(root, "seed/inventory.jsonl", records)
     write_jsonl(root, "seed/runs/r1/segments.jsonl", segments)
+    write_jsonl(root, "seed/runs/r1/turns.jsonl", turns)
     for seg in segments:
         if seg.audio:
             _flac(root.path / seg.audio, int(seg.segment_id[4:]))
@@ -708,6 +728,7 @@ def extracted(built: Built) -> Extracted:
         {
             "run": "r1",
             "sources": [{"source_id": r.source_id, "clusters": clusters} for r in records],
+            "thresholds": gates.load(None).effective(),
         },
     )
     # The clean run: the kept target segments, cleaned audio being the processed clip at 24 kHz.
@@ -833,10 +854,15 @@ def test_score_reports_extraction_against_the_truth(extracted: Extracted, scored
     assert s["downmix"]["off-centre"]["by_reason"] == {"off-centre": exp["off"]}
     assert s["downmix"]["fallback"]["recovered"] == exp["fallback"] >= 3
     assert s["downmix"]["fallback"]["by_reason"] == {"fc-failed:snr": exp["fallback"]}
+    assert len(s["impostor_clusters"]) == EPISODES
     for row in s["impostor_clusters"]:
-        assert row["status"] == "flagged" and row["identified_by"] == "segments"
+        assert (row["diar_cluster"], row["status"], row["identified_by"]) == (
+            "spk-02", "flagged", "turns",
+        )  # fmt: skip
         assert row["median_sim"] == {"wavlm-sv": 0.66, "ecapa": 0.62}
-        assert row["stray_records"] == []
+        assert 0.0 < row["impostor_s"] <= row["impostor_total_s"]
+        assert f"({row['source_id']}) impostor cluster: spk-02 flagged, " in scored.out
+    assert "flag floor: wavlm-sv 0.659, ecapa 0.619" in scored.out
 
 
 def test_score_reports_whether_each_effect_survived(scored: Scored) -> None:
@@ -863,14 +889,21 @@ def test_score_reports_every_h6_gate(built: Built, scored: Scored) -> None:
     assert entries["segment.c50_min_db"]["value"] == 40.0
     assert entries["text.reject_max"]["value"] is None
     # The per-embedder retrieval and anchor values are H20's, not H6's, so no gate entry names
-    # them; the impostor statistics that informed the anchor floor sit under `retrieval`.
+    # them; where the impostor's cluster fell at the run's values sits under `retrieval`.
     assert not [k for k in entries if k.split(".")[0] in ("anchors", "retrieval")]
+    in_force = gates.load(None).effective()
+    six = {
+        key: in_force[key]
+        for gate in ("anchors.sim_min", "retrieval.anchor_floor", "retrieval.margin")
+        for name in ("wavlm-sv", "ecapa")
+        if (key := f"{gate}.{name}")
+    }
     assert scored.score["retrieval"] == {
-        "impostor_median_max": 0.64,
-        "non_admitted_median_upper_bound_max": None,
-        "impostor_primary_episodes": 0,
-        "impostor_merged_episodes": {},
-        "impostor_stray_records": 0,
+        "thresholds": six,
+        "impostor_episodes": {"primary": 0, "flagged": EPISODES, "other": 0, "none": 0},
+        "flag_floor": {"wavlm-sv": 0.659, "ecapa": 0.619},
+        "target_margin_share": {"wavlm-sv": 1.0, "ecapa": 1.0, "both": 1.0},
+        "impostor_margin_share": {"wavlm-sv": None, "ecapa": None, "both": None},
     }
     # The encodes are band-limited by their codecs (E-AC-3 near 20.5 kHz, AAC near 18 kHz).
     bandwidth = entries["ingest.bandwidth_cutoff_db"]["reason"]
@@ -878,6 +911,23 @@ def test_score_reports_every_h6_gate(built: Built, scored: Scored) -> None:
     for key in ("cleaning.spectrum_max_db", "state_floor.offset.neutral",
                 "state_floor.rehearsal_identity_window_floor"):  # fmt: skip
         assert isinstance(entries[key]["value"], float), key
+
+
+def test_score_refuses_a_run_without_a_turn_record(extracted: Extracted, scored: Scored) -> None:
+    # r1 and r2 of the rehearsal predate the turn record; their impostor cluster has no name.
+    root = extracted.built.root
+    for name in ("segments.jsonl", "report.json"):
+        source = root.path / "seed" / "runs" / "r1" / name
+        root.write_bytes(f"seed/runs/r0/{name}", source.read_bytes())
+    calls = len(extracted.built.docker.argvs)
+    with patched(extracted.built.docker, extracted.built.sources):
+        code, _, err = run_cli(["--root", str(root.path), "rehearsal", "score", "--run", "r0"])
+    assert code == 2 and "run r0 has no turns.jsonl" in err
+    assert len(extracted.built.docker.argvs) == calls
+    assert not (root.path / pkg.SCORES_REL / "r0").exists()
+
+
+# The impostor's cluster, named from turn records of one episode.
 
 
 def _probe_line(n: int, speaker: str, start: float) -> pkg.TruthLine:
@@ -897,24 +947,28 @@ PROBE_LINES = [
     _probe_line(5, "target", 17.0),
     _probe_line(6, "impostor", 21.0),
 ]
-
-
-# Five target and four impostor lines, alternating: the impostor merged into an admitted cluster.
+# Five target and four impostor lines, alternating.
 MERGE_LINES = [
     _probe_line(n, "target" if n % 2 else "impostor", 1.0 + 4.0 * (n - 1)) for n in range(1, 10)
 ]
+PROBE_ROLES = {"spk-01": "primary", "spk-02": "other", "spk-03": "other"}
+PROBE_MEDIANS = {"spk-01": {"ecapa": 0.8}, "spk-02": {"ecapa": 0.55}, "spk-03": {"ecapa": 0.2}}
 
 
 def _probe(
-    placed: Sequence[tuple[int, str, str, bool]],
-    spk02_role: str = "other",
+    placed: Sequence[tuple[int, str]],
     lines: Sequence[pkg.TruthLine] = PROBE_LINES,
     spans: Sequence[tuple[float, float] | None] = (),
+    roles: Mapping[str, str] = PROBE_ROLES,
+    medians: Mapping[str, Mapping[str, float]] = PROBE_MEDIANS,
+    gaps: Sequence[dict[str, float] | None] = (),
 ) -> tuple[list[dict], dict[str, object]]:
-    """Score one episode whose records are (truth line, diarizer label, cluster, kept).
+    """Score one episode whose diarized turns are (truth line, diarizer label).
 
-    A record spans its truth line less 0.1 s at each end, unless `spans` gives it a span.
-    Returns the impostor cluster rows and `retrieval_summary` of them.
+    A turn spans its truth line unless `spans` gives it a span, and has the gaps `gaps` gives
+    it (none by default); each label has its role in `roles` and its median in `medians`. The
+    run's thresholds are the defaults. Returns the impostor cluster rows and
+    `retrieval_summary` of them.
     """
     record = SourceRecord(
         "src-0001", "p", "matroska", 1, 0, (), 1, 0, None, "eac3", None, 1, "packets", 48000, 6,
@@ -922,163 +976,191 @@ def _probe(
     )  # fmt: skip
     score_mod = rehearsal_cmd.score_mod
     eps = score_mod.Episodes(lines, [record])
-    segments = []
-    for i, (n, label, cluster, kept) in enumerate(placed, start=1):
-        span = spans[i - 1] if i <= len(spans) else None
-        bounds = {} if span is None else {"start_s": span[0], "end_s": span[1]}
-        segments.append(
-            _segment(
-                i, "src-0001", lines[n - 1], diar_cluster=label, cluster=cluster, kept=kept,
-                **bounds,
-            )  # fmt: skip
-        )
-    report = {"sources": [{"source_id": "src-0001", "clusters": [
-        {"diar_cluster": "spk-01", "role": "primary", "median_sim": {"ecapa": 0.8}},
-        {"diar_cluster": "spk-02", "role": spk02_role, "median_sim": {"ecapa": 0.55}},
-        {"diar_cluster": "spk-03", "role": "other", "median_sim": {"ecapa": 0.2}},
-    ]}]}  # fmt: skip
-    rows = score_mod.impostor_clusters(eps, segments, report)
-    return rows, score_mod.retrieval_summary(rows)
+    turns = []
+    for i, (n, label) in enumerate(placed):
+        line = lines[n - 1]
+        span = spans[i] if i < len(spans) and spans[i] is not None else None
+        start, end = span or (line.start_s, line.end_s)
+        turns.append(
+            extract_cmd.TurnRecord(
+                source_id="src-0001", turn=i, start_s=start, end_s=end, diar_cluster=label,
+                role=roles[label], embedded=True, touches_overlap=False,
+                sim_anchor={"wavlm-sv": 0.5, "ecapa": 0.3},
+                sim_target={"wavlm-sv": 0.5, "ecapa": 0.3},
+                gaps=gaps[i] if i < len(gaps) else None, passed=None, reasons=(),
+            )
+        )  # fmt: skip
+    report = {
+        "sources": [{"source_id": "src-0001", "clusters": [
+            {"diar_cluster": label, "role": roles[label], "median_sim": dict(median)}
+            for label, median in medians.items()
+        ]}],
+        "thresholds": gates.load(None).effective(),
+    }  # fmt: skip
+    rows = score_mod.impostor_clusters(eps, turns, report)
+    return rows, score_mod.retrieval_summary(rows, eps, turns, report)
 
 
-def test_a_stray_impostor_record_in_the_primary_cluster_is_not_its_cluster() -> None:
-    # The round-1 probe: one dropped impostor record diarized into the target's primary cluster,
-    # covering a third of the impostor's speech; the rest is in spk-02, not admitted.
+def test_r2s_shape_names_the_impostors_cluster_not_the_targets() -> None:
+    # r2: nothing reached the ECAPA floor, so every cluster is `other`. The target's cluster has
+    # the highest medians; the turn record names the impostor's lower one, and the flag floor
+    # sits just under it.
+    lines = [*PROBE_LINES, _probe_line(7, "other", 25.0)]
+    roles = {"spk-00": "other", "spk-01": "other", "spk-02": "other"}
+    medians = {
+        "spk-00": {"wavlm-sv": 0.88, "ecapa": 0.5046},
+        "spk-01": {"wavlm-sv": 0.7961, "ecapa": 0.2496},
+        "spk-02": {"wavlm-sv": 0.31, "ecapa": 0.12},
+    }
     rows, summary = _probe(
-        [(1, "spk-01", "primary", True), (3, "spk-01", "primary", True),
-         (5, "spk-01", "primary", True), (2, "spk-01", "primary", False)]
+        [(1, "spk-00"), (2, "spk-01"), (3, "spk-00"), (4, "spk-01"), (5, "spk-00"),
+         (6, "spk-01"), (7, "spk-02")],
+        lines=lines, roles=roles, medians=medians,
     )  # fmt: skip
     assert rows == [
-        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-02",
-         "status": "not admitted", "median_sim": {"ecapa": 0.55},
-         "identified_by": "upper bound: highest non-admitted cluster",
-         "stray_records": [{"diar_cluster": "spk-01", "role": "primary", "records": 1}]}
+        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-01", "status": "other",
+         "median_sim": {"wavlm-sv": 0.7961, "ecapa": 0.2496}, "impostor_s": 10.5,
+         "cluster_s": 10.5, "impostor_share": 1.0, "impostor_total_s": 10.5,
+         "identified_by": "turns", "stray": []}
     ]  # fmt: skip
-    assert summary["impostor_primary_episodes"] == 0
-    assert summary["impostor_median_max"] is None
-    assert summary["non_admitted_median_upper_bound_max"] == 0.55
-    assert summary["impostor_stray_records"] == 1
-    assert summary["impostor_merged_episodes"] == {}
-    lines = rehearsal_cmd.score_mod.impostor_cluster_lines(rows)
-    assert lines == [
-        "  ep01 (src-0001) impostor cluster: not admitted, median ecapa 0.550 (upper bound: "
-        "highest non-admitted cluster); stray impostor records in admitted clusters: primary 1"
-    ]
+    assert summary["flag_floor"] == {"wavlm-sv": 0.795, "ecapa": 0.248}
+    assert summary["impostor_episodes"] == {"primary": 0, "flagged": 0, "other": 1, "none": 0}
+    assert set(summary["thresholds"]) == {
+        f"{gate}.{name}"
+        for gate in ("anchors.sim_min", "retrieval.anchor_floor", "retrieval.margin")
+        for name in ("wavlm-sv", "ecapa")
+    }
 
 
-MERGED_BY = (
-    "merged: admitted clusters cover over half of the impostor's speech and this one the most; "
-    "the impostor holds at most half its records"
-)
-
-
-def test_an_impostor_merged_into_the_primary_cluster_reads_primary() -> None:
-    # The PR review's probe: all five target and four impostor records in spk-01, primary. The
-    # impostor has no cluster of its own, so no non-admitted cluster bounds its median.
+def test_an_impostor_turn_in_the_primary_cluster_is_stray_when_its_own_holds_more() -> None:
+    # One impostor line diarized into the target's primary cluster, two into spk-02.
     rows, summary = _probe(
-        [(n, "spk-01", "primary", True) for n in range(1, 10)], lines=MERGE_LINES
-    )
+        [(1, "spk-01"), (3, "spk-01"), (5, "spk-01"), (2, "spk-01"), (4, "spk-02"),
+         (6, "spk-02")]
+    )  # fmt: skip
     assert rows == [
-        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-01",
-         "status": "primary", "median_sim": {"ecapa": 0.8}, "identified_by": MERGED_BY,
-         "stray_records": [{"diar_cluster": "spk-01", "role": "primary", "records": 4}]}
+        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-02", "status": "other",
+         "median_sim": {"ecapa": 0.55}, "impostor_s": 7.0, "cluster_s": 7.0,
+         "impostor_share": 1.0, "impostor_total_s": 10.5, "identified_by": "turns",
+         "stray": [{"diar_cluster": "spk-01", "role": "primary", "impostor_s": 3.5}]}
     ]  # fmt: skip
-    assert summary["impostor_merged_episodes"] == {"primary": 1}
-    assert summary["impostor_primary_episodes"] == 1
-    assert summary["impostor_median_max"] is None
-    assert summary["non_admitted_median_upper_bound_max"] is None
-    assert summary["impostor_stray_records"] == 4
-    lines = rehearsal_cmd.score_mod.impostor_cluster_lines(rows)
-    assert lines == [
-        f"  ep01 (src-0001) impostor cluster: primary ({MERGED_BY}), median ecapa 0.800; stray "
-        "impostor records in admitted clusters: primary 4"
+    assert summary["flag_floor"] == {"ecapa": 0.549}
+    assert rehearsal_cmd.score_mod.impostor_cluster_lines(rows) == [
+        "  ep01 (src-0001) impostor cluster: spk-02 other, 7.000 of 7.000 s impostor (share "
+        "1.000), median ecapa 0.550; impostor 10.500 s in all; stray: spk-01 primary 3.500 s"
     ]
 
 
-def test_turns_joining_target_and_impostor_lines_read_merged_into_primary() -> None:
-    # The review's probe E: all nine lines in spk-01, primary, each turn joining a target line
-    # and the impostor line after it. `Episodes.who` gives four records to no one and the last
-    # to the target, so the impostor holds no record, yet the cluster covers most of its speech.
-    turns = [(1.0 + 8.0 * k + 0.1, 1.0 + 8.0 * k + 7.4) for k in range(4)]
+def test_an_impostor_whose_seconds_sit_mostly_in_the_primary_cluster_reads_primary() -> None:
+    # Three of the four impostor lines are diarized with the target's five, the fourth alone.
     rows, summary = _probe(
-        [(n, "spk-01", "primary", True) for n in (1, 3, 5, 7, 9)],
+        [(n, "spk-01") for n in range(1, 8)] + [(8, "spk-02"), (9, "spk-01")],
         lines=MERGE_LINES,
-        spans=[*turns, None],
     )
-    assert rows == [
-        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-01",
-         "status": "primary", "median_sim": {"ecapa": 0.8}, "identified_by": MERGED_BY,
-         "stray_records": []}
-    ]  # fmt: skip
-    assert summary["impostor_primary_episodes"] == 1
-    assert summary["impostor_merged_episodes"] == {"primary": 1}
-    assert summary["impostor_median_max"] is None
-    assert summary["non_admitted_median_upper_bound_max"] is None
-    assert summary["impostor_stray_records"] == 0
+    (row,) = rows
+    assert (row["diar_cluster"], row["status"], row["identified_by"]) == (
+        "spk-01", "primary", "turns",
+    )  # fmt: skip
+    assert (row["impostor_s"], row["cluster_s"], row["impostor_share"]) == (10.5, 28.0, 0.375)
+    assert row["median_sim"] == {"ecapa": 0.8}
+    assert row["stray"] == [{"diar_cluster": "spk-02", "role": "other", "impostor_s": 3.5}]
+    assert summary["impostor_episodes"]["primary"] == 1
+    assert rehearsal_cmd.score_mod.impostor_cluster_lines(rows) == [
+        "  ep01 (src-0001) impostor cluster: spk-01 primary, 10.500 of 28.000 s impostor (share "
+        "0.375), median ecapa 0.800; impostor 14.000 s in all; stray: spk-02 other 3.500 s"
+    ]
 
 
-def test_target_records_overlapping_the_impostor_briefly_leave_it_not_admitted() -> None:
-    # Each impostor line starts 0.5 s before a target line ends; the target's records run 1 s
-    # past their line, so they cover 1.5 s of each 3.5 s impostor line, under half its speech.
+def test_turns_joining_target_and_impostor_lines_attribute_their_seconds_to_each() -> None:
+    # Four primary turns each join a target line and the impostor line after it: 3.4 s of each
+    # is the impostor's, so its seconds sit in the primary cluster.
+    turns = [(1.0 + 8.0 * k + 0.1, 1.0 + 8.0 * k + 7.4) for k in range(4)]
+    rows, summary = _probe([(n, "spk-01") for n in (1, 3, 5, 7, 9)], lines=MERGE_LINES, spans=turns)
+    (row,) = rows
+    assert (row["diar_cluster"], row["status"], row["stray"]) == ("spk-01", "primary", [])
+    assert (row["impostor_s"], row["cluster_s"], row["impostor_total_s"]) == (13.6, 32.7, 14.0)
+    assert row["impostor_share"] == round(13.6 / 32.7, 4)
+    assert summary["impostor_episodes"]["primary"] == 1
+
+
+def test_an_impostor_whose_seconds_sit_mostly_in_a_flagged_cluster_reads_flagged() -> None:
+    # spk-02 (flagged) holds two impostor lines among three target ones, spk-01 (primary) one
+    # among two.
+    rows, summary = _probe(
+        [(1, "spk-02"), (3, "spk-02"), (5, "spk-02"), (2, "spk-02"), (4, "spk-02"),
+         (7, "spk-01"), (9, "spk-01"), (6, "spk-01")],
+        lines=MERGE_LINES,
+        roles={**PROBE_ROLES, "spk-02": "flagged"},
+    )  # fmt: skip
+    (row,) = rows
+    assert (row["diar_cluster"], row["status"], row["impostor_s"]) == ("spk-02", "flagged", 7.0)
+    assert row["median_sim"] == {"ecapa": 0.55}
+    assert row["stray"] == [{"diar_cluster": "spk-01", "role": "primary", "impostor_s": 3.5}]
+    assert summary["impostor_episodes"] == {"primary": 0, "flagged": 1, "other": 0, "none": 0}
+    assert summary["flag_floor"] == {"ecapa": 0.549}
+
+
+def test_target_turns_running_into_impostor_lines_count_only_the_seconds_they_hold() -> None:
+    # Each impostor line starts 0.5 s before a target line ends; the target's turns run 1 s past
+    # their line, so they hold 1.5 s of each impostor line, and the impostor's own turns 2 s.
     lines = [
         _probe_line(1, "target", 1.0), _probe_line(2, "impostor", 4.0),
         _probe_line(3, "target", 9.0), _probe_line(4, "impostor", 12.0),
         _probe_line(5, "target", 17.0), _probe_line(6, "impostor", 20.0),
     ]  # fmt: skip
-    rows, summary = _probe(
-        [(n, "spk-01", "primary", True) for n in (1, 3, 5)],
+    rows, _ = _probe(
+        [(1, "spk-01"), (2, "spk-02"), (3, "spk-01"), (4, "spk-02"), (5, "spk-01"),
+         (6, "spk-02")],
         lines=lines,
-        spans=[(1.1, 5.5), (9.1, 13.5), (17.1, 21.5)],
-    )
+        spans=[(1.1, 5.5), (5.5, 7.5), (9.1, 13.5), (13.5, 15.5), (17.1, 21.5), (21.5, 23.5)],
+    )  # fmt: skip
+    (row,) = rows
+    assert (row["diar_cluster"], row["status"], row["impostor_s"]) == ("spk-02", "other", 6.0)
+    assert row["stray"] == [{"diar_cluster": "spk-01", "role": "primary", "impostor_s": 4.5}]
+
+
+def test_an_impostor_split_over_two_clusters_is_named_by_its_larger_share_in_seconds() -> None:
+    # spk-03 holds two short impostor turns (3.0 s), spk-02 one whole line (3.5 s): more turns
+    # in one, more seconds in the other.
+    rows, _ = _probe(
+        [(1, "spk-01"), (2, "spk-03"), (3, "spk-01"), (4, "spk-03"), (5, "spk-01"),
+         (6, "spk-02")],
+        spans=[None, (5.0, 6.5), None, (13.0, 14.5)],
+    )  # fmt: skip
+    (row,) = rows
+    assert (row["diar_cluster"], row["status"], row["impostor_s"]) == ("spk-02", "other", 3.5)
+    assert row["median_sim"] == {"ecapa": 0.55}
+    assert row["stray"] == [{"diar_cluster": "spk-03", "role": "other", "impostor_s": 3.0}]
+
+
+def test_an_impostor_with_no_turn_reads_none_and_leaves_no_flag_floor() -> None:
+    rows, summary = _probe([(1, "spk-01"), (3, "spk-01"), (5, "spk-01")])
     assert rows == [
-        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": "spk-02",
-         "status": "not admitted", "median_sim": {"ecapa": 0.55},
-         "identified_by": "upper bound: highest non-admitted cluster", "stray_records": []}
+        {"episode": "ep01", "source_id": "src-0001", "diar_cluster": None, "status": "none",
+         "median_sim": None, "impostor_s": 0.0, "cluster_s": None, "impostor_share": None,
+         "impostor_total_s": 10.5, "identified_by": "none", "stray": []}
     ]  # fmt: skip
-    assert summary["impostor_primary_episodes"] == 0
-    assert summary["impostor_merged_episodes"] == {}
-    assert summary["non_admitted_median_upper_bound_max"] == 0.55
+    assert summary["flag_floor"] is None
+    assert summary["impostor_episodes"] == {"primary": 0, "flagged": 0, "other": 0, "none": 1}
+    assert rehearsal_cmd.score_mod.impostor_cluster_lines(rows) == [
+        "  ep01 (src-0001) impostor cluster: none, no turn meets an impostor line; impostor "
+        "10.500 s in all"
+    ]
 
 
-def test_an_impostor_merged_into_a_flagged_cluster_names_the_one_covering_most_of_it() -> None:
-    # spk-02 (flagged) holds two of the four impostor lines among three target ones, spk-01
-    # (primary) one among two: the flagged cluster covers the most impostor speech.
-    rows, summary = _probe(
-        [(1, "spk-02", "flagged", True), (3, "spk-02", "flagged", True),
-         (5, "spk-02", "flagged", True), (2, "spk-02", "flagged", False),
-         (4, "spk-02", "flagged", True), (7, "spk-01", "primary", True),
-         (9, "spk-01", "primary", True), (6, "spk-01", "primary", False)],
-        spk02_role="flagged",
-        lines=MERGE_LINES,
+def test_margin_shares_count_primary_cluster_turns_by_whose_lines_they_are() -> None:
+    # Margins are 0.1 on both embedders. Of the target's three primary turns, one reaches on
+    # WavLM-SV, one on ECAPA, and one (no rival, so no margin applies) on both; the impostor's
+    # primary turn reaches on both, and its turns in spk-02, not primary, are not counted.
+    _, summary = _probe(
+        [(1, "spk-01"), (3, "spk-01"), (5, "spk-01"), (2, "spk-01"), (4, "spk-02"),
+         (6, "spk-02")],
+        gaps=[{"wavlm-sv": 0.2, "ecapa": 0.05}, {"wavlm-sv": 0.05, "ecapa": 0.3}, None,
+              {"wavlm-sv": 0.15, "ecapa": 0.12}, {"wavlm-sv": -0.5, "ecapa": -0.5},
+              {"wavlm-sv": -0.5, "ecapa": -0.5}],
     )  # fmt: skip
-    row = rows[0]
-    assert (row["status"], row["identified_by"], row["diar_cluster"]) == (
-        "flagged", MERGED_BY, "spk-02",
-    )  # fmt: skip
-    assert "merged_into" not in row
-    assert row["median_sim"] == {"ecapa": 0.55}
-    assert summary["impostor_merged_episodes"] == {"flagged": 1}
-    assert summary["impostor_primary_episodes"] == 0
-    assert summary["impostor_median_max"] is None
-    assert summary["non_admitted_median_upper_bound_max"] is None
-
-
-def test_the_impostor_cluster_is_the_admitted_one_its_records_hold_the_majority_of() -> None:
-    rows, summary = _probe(
-        [(1, "spk-01", "primary", True), (3, "spk-01", "primary", True),
-         (2, "spk-01", "primary", False), (4, "spk-02", "flagged", True),
-         (6, "spk-02", "flagged", True), (5, "spk-02", "flagged", True)],
-        spk02_role="flagged",
-    )  # fmt: skip
-    assert len(rows) == 1
-    row = rows[0]
-    assert (row["diar_cluster"], row["status"], row["identified_by"]) == (
-        "spk-02", "flagged", "segments",
-    )  # fmt: skip
-    assert row["median_sim"] == {"ecapa": 0.55}
-    assert row["stray_records"] == [{"diar_cluster": "spk-01", "role": "primary", "records": 1}]
-    assert summary["impostor_median_max"] == 0.55 and summary["impostor_primary_episodes"] == 0
-    assert summary["non_admitted_median_upper_bound_max"] is None
+    assert summary["target_margin_share"] == {"wavlm-sv": 0.6667, "ecapa": 0.6667, "both": 0.3333}
+    assert summary["impostor_margin_share"] == {"wavlm-sv": 1.0, "ecapa": 1.0, "both": 1.0}
 
 
 def test_recall_is_over_the_speech_extraction_can_keep_with_all_target_recall_beside() -> None:
@@ -1110,17 +1192,6 @@ def test_recall_is_over_the_speech_extraction_can_keep_with_all_target_recall_be
     assert (ex["target_s"], ex["target_covered_s"]) == (14.0, 7.6)
     assert ex["recall"] == 0.95 and ex["recall_all_target"] == round(7.6 / 14.0, 4)
     assert ex["min_s"] == 3.0
-
-
-def test_an_impostor_majority_primary_cluster_reports_primary() -> None:
-    rows, summary = _probe(
-        [(2, "spk-01", "primary", True), (4, "spk-01", "primary", True),
-         (1, "spk-01", "primary", True), (3, "spk-02", "flagged", True)],
-        spk02_role="flagged",
-    )  # fmt: skip
-    assert rows[0]["status"] == "primary" and rows[0]["median_sim"] == {"ecapa": 0.8}
-    assert rows[0]["stray_records"] == []
-    assert summary["impostor_primary_episodes"] == 1
 
 
 # ---------------------------------------------------------------------------
