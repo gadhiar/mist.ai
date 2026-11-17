@@ -124,6 +124,34 @@ class _StubInvalidationBus:
         pass
 
 
+class _InertObserver:
+    """Observer double that watches nothing, for the tests that inject events.
+
+    Those tests dispatch synthetic events straight to `_handler`. A real `polling`
+    observer beside them snapshots the vault at `start()` and polls it again every
+    second (watchdog's default timeout), so a test that writes files and is still
+    waiting when that first poll lands also gets the observer's own events for them,
+    and its exact-count assertions see extra upserts. Whether the poll lands inside a
+    test depended on how long the test ran after `start()`. The lifecycle tests still
+    start real observers.
+    """
+
+    def schedule(self, handler: object, path: str, recursive: bool = False) -> None:  # noqa: ARG002
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def join(self, timeout: float | None = None) -> None:  # noqa: ARG002
+        pass
+
+    def is_alive(self) -> bool:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -234,10 +262,13 @@ async def fake_sidecar() -> FakeSidecarIndex:
 
 
 @pytest_asyncio.fixture
-async def watcher(vault_root: Path, fake_sidecar: FakeSidecarIndex):
-    """Started VaultFilewatcher (polling observer, fast debounce). Stopped on teardown."""
+async def watcher(
+    vault_root: Path, fake_sidecar: FakeSidecarIndex, monkeypatch: pytest.MonkeyPatch
+):
+    """Started VaultFilewatcher (inert observer, fast debounce). Stopped on teardown."""
     config = _make_config()
     fw = _make_filewatcher(config, vault_root, fake_sidecar)
+    monkeypatch.setattr(fw, "_create_observer", _InertObserver)
     fw.start(loop=asyncio.get_running_loop())
     yield fw
     fw.stop()
