@@ -122,6 +122,8 @@ class TestGraphHopEntityFilter:
             "STRUGGLES_WITH",
             "DECIDED",
             "EXPERIENCED",
+            "RECOMMENDS",
+            "HAS_HABIT",
             # Structural / ontological
             "IS_A",
             "PART_OF",

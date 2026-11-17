@@ -36,7 +36,13 @@ from pathlib import Path
 import pytest
 
 from backend.knowledge import version_stamps
-from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.config import (
+    EmbeddingConfig,
+    ExtractionConfig,
+    KnowledgeConfig,
+    LLMConfig,
+    Neo4jConfig,
+)
 from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 
@@ -450,3 +456,23 @@ class TestNoBackendModuleRestatesAStamp:
             "Cypher stamps an ontology-version literal. Bind it as a query "
             f"parameter sourced from version_stamps instead: {offenders}"
         )
+
+
+class TestEmbedderIdentityInModelHash:
+    """The stamp names the embedder by its model name, not by where it was loaded from.
+
+    The production embedder loads the baked `/opt/models/all-MiniLM-L6-v2` when
+    the image has it and the name otherwise; both give the same vectors, so the
+    stamp must not change with the source. A change to the default embedder's
+    identity is a new epoch and has to fail here first.
+    """
+
+    def test_default_config_stamps_the_minilm_embedder(self):
+        config = KnowledgeConfig(
+            neo4j=Neo4jConfig(),
+            llm=LLMConfig(),
+            embedding=EmbeddingConfig(),
+            extraction=ExtractionConfig(),
+        )
+
+        assert version_stamps.compose_model_hash(config).endswith("|emb:all-MiniLM-L6-v2")

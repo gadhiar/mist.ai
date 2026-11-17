@@ -19,6 +19,11 @@ Hierarchy:
     +-- EmbeddingError
     +-- VectorStoreError
     +-- IngestionError
+    +-- MemoryIndexError
+    +-- MemoryRerankError
+    +-- MemoryCorrectionError
+    +-- MemoryConfigError
+    +-- ColdSummaryError
     +-- GpuYieldedError
     +-- VaultWriteError
     +-- SidecarIndexError
@@ -177,6 +182,48 @@ class SeedTargetNotSeedOnlyError(MistError):
 
     Raised by the seed applier before any write or wipe (MIS-177 D1): seeding
     over such a graph adopts its elements and the next wipe deletes them.
+    """
+
+
+# -- Memory read path (backend/memory) ----------------------------------------
+
+
+class MemoryIndexError(MistError):
+    """The derived memory index cannot be opened, read or written.
+
+    Covers a missing or corrupt `memory_index.db`, a sqlite_vec load failure
+    and an embedding-model mismatch. The fetcher turns it into an empty
+    result marked `index_error` and the factory rebuilds the index, so it
+    never reaches the turn.
+    """
+
+
+class MemoryRerankError(MistError):
+    """A reranker failed to load or to score.
+
+    The fetcher keeps the pool order and marks the result
+    `reranker_unavailable`, so a reranker fault costs ranking quality, not
+    the turn.
+    """
+
+
+class MemoryCorrectionError(MistError):
+    """A memory correction (forget or correct) cannot be recorded or applied."""
+
+
+class MemoryConfigError(MistError):
+    """A memory read-path setting is invalid.
+
+    Raised at config time, naming the variable or field, so a bad setting
+    fails startup instead of degrading recall silently.
+    """
+
+
+class ColdSummaryError(MistError):
+    """A rebuild needs episode summaries the summary cache does not hold.
+
+    Lists the missing keys; the operator reruns with `--allow-summarize`
+    rather than the rebuild calling a model unasked.
     """
 
 

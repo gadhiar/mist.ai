@@ -3,6 +3,7 @@
 import dataclasses
 import os
 from contextlib import contextmanager
+from datetime import UTC
 
 import pytest
 
@@ -16,6 +17,7 @@ from backend.knowledge.config import (
     SidecarIndexConfig,
     VaultConfig,
 )
+from backend.memory.config import MEMORY_ENV_VARS, MemoryConfig
 
 
 @contextmanager
@@ -512,6 +514,40 @@ class TestKnowledgeConfigVaultWiring:
         assert config.vault is custom
         assert config.vault.root == "/tmp/custom-vault"
         assert config.vault.enabled is False
+
+
+class TestKnowledgeConfigMemoryWiring:
+    """KnowledgeConfig nests MemoryConfig as `memory` (mist-read-path T2)."""
+
+    def test_post_init_defaults_memory(self):
+        from backend.knowledge.config import (
+            EmbeddingConfig,
+            ExtractionConfig,
+            Neo4jConfig,
+        )
+
+        config = KnowledgeConfig(
+            neo4j=Neo4jConfig(),
+            llm=LLMConfig(),
+            embedding=EmbeddingConfig(),
+            extraction=ExtractionConfig(),
+        )
+
+        assert config.memory == MemoryConfig()
+
+    def test_from_env_builds_memory_without_a_tz_database(self):
+        """An unset MIST_TIMEZONE gives `datetime.timezone.utc`, which needs no zone database."""
+        with _env(**_clear(*MEMORY_ENV_VARS)):
+            config = KnowledgeConfig.from_env()
+
+        assert config.memory == MemoryConfig()
+        assert config.memory.tz is UTC
+
+    def test_from_env_reads_memory_variables(self):
+        with _env(**{**_clear(*MEMORY_ENV_VARS), "MIST_MEMORY_BLOCK_TOKENS": "320"}):
+            config = KnowledgeConfig.from_env()
+
+        assert config.memory.block_tokens == 320
 
 
 class TestRebuildDeterminismStamps:

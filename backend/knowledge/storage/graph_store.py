@@ -62,6 +62,11 @@ _USER_FACING_REL_TYPES: list[str] = [
     "STRUGGLES_WITH",
     "DECIDED",
     "EXPERIENCED",
+    # v1.3.0 user-centric additions. Extractable since v1.3.0, so they are served too:
+    # test_user_facing_rel_types.py pins this list as a superset of
+    # EXTRACTABLE_RELATIONSHIP_TYPES.
+    "RECOMMENDS",
+    "HAS_HABIT",
     # Structural / ontological edges between entities
     "IS_A",
     "PART_OF",
@@ -92,6 +97,70 @@ _USER_FACING_REL_TYPES: list[str] = [
     "STRATEGY_FOR",
     "NAMING_CONVENTION_OF",
 ]
+
+# One page of every latest-belief version of the user-facing facts, for the memory index.
+# The `__Entity__`, allowlist, status and latest-belief predicates are the ones the C1 reads
+# below apply; the currency arms (`valid_from`/`valid_to` against `$now`) are left out on
+# purpose, because the index decides currency at read time and so must hold future-dated
+# versions, clamped history copies and tombstones too. The pattern is directed, so each edge
+# is one row. `elementId(r)` is the page key: it is unique per edge, which keyset paging
+# needs, though not stable across a rebuild, so nothing stores it. No index orders edges by
+# element id, so each page expands and filters every matching edge before it skips to
+# `$after_key`: a page costs one pass, and a rescan one pass per page.
+_CURRENT_FACTS_CYPHER = """
+MATCH (s:__Entity__)-[r]->(o:__Entity__)
+WHERE type(r) IN $allowed_rel_types
+  AND (r.status IS NULL OR r.status <> 'orphaned')
+  AND coalesce(r.is_latest_belief, true)
+  AND s.id IS NOT NULL AND o.id IS NOT NULL
+  AND ($after_key IS NULL OR elementId(r) > $after_key)
+WITH s, r, o, elementId(r) AS page_key
+ORDER BY page_key
+LIMIT $limit
+RETURN
+    page_key,
+    s.id AS subject_id,
+    coalesce(s.display_name, s.id) AS subject_name,
+    s.entity_type AS subject_type,
+    type(r) AS rel_type,
+    o.id AS object_id,
+    coalesce(o.display_name, o.id) AS object_name,
+    o.entity_type AS object_type,
+    r.version_key AS version_key,
+    r.valid_from AS valid_from,
+    r.valid_to AS valid_to,
+    coalesce(r.recorded_at, r.created_at) AS recorded_at,
+    r.confidence AS confidence,
+    r.source_utterance_id AS source_utterance_id
+"""
+
+
+def current_facts_query(after_key: str | None, limit: int) -> tuple[str, dict[str, Any]]:
+    """Cypher and parameters for one page of latest-belief user-facing fact versions.
+
+    It does no I/O: the memory index's async fact source runs the pair through
+    `GraphExecutor.execute_query`, so no GraphStore method is called from the event loop. Rows
+    come ordered by `page_key`; pass the last row's `page_key` as the next `after_key`, and a
+    page shorter than `limit` is the last.
+
+    Args:
+        after_key: `page_key` of the previous page's last row, or None for the first page.
+        limit: Most rows in the page.
+
+    Returns:
+        The query text and its parameters.
+
+    Raises:
+        ValueError: `limit` is not positive.
+    """
+    if limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+    params: dict[str, Any] = {
+        "allowed_rel_types": list(_USER_FACING_REL_TYPES),
+        "after_key": after_key,
+        "limit": limit,
+    }
+    return _CURRENT_FACTS_CYPHER, params
 
 
 class GraphStore:

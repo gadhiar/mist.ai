@@ -365,9 +365,7 @@ class TestPhase3Components:
 
         event = VaultChangeEvent(path=Path(tmp_path / "vault" / "test.md"))
 
-        asyncio.get_event_loop().run_until_complete(
-            result.filewatcher._invalidation_bus.publish(event)
-        )
+        asyncio.run(result.filewatcher._invalidation_bus.publish(event))
 
         assert len(received) == 1
         assert received[0] is event

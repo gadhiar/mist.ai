@@ -123,6 +123,29 @@ RUN python -c "import flash_attn; print('[FLASH-ATTN IMPORT OK]', flash_attn.__v
 # ran on whatever pytest/pytest-asyncio requirements.txt had already put in place.
 RUN pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"
 
+# 7. Model weights the memory read path loads from local paths with no network: the
+# cross-encoder rerankers and the offline eval's embedder, each at the commit sha
+# docker/backend/models.lock pins. The strict check runs first and fails the build on any
+# revision that is not a 40-hex sha. Only the lock and its checker are copied here, so an
+# application code change does not invalidate this layer. huggingface_hub comes from
+# sentence-transformers (step 3). Only the files loading needs are fetched (the checker's
+# ALLOW_PATTERNS and IGNORE_PATTERNS): no ONNX, OpenVINO or other weight formats.
+# This block alone runs as root, because only root can create /opt/models; the weights stay
+# root-owned and read-only to appuser, so the runtime cannot alter them. Nothing is
+# installed here, and PYTHONDONTWRITEBYTECODE keeps root from leaving .pyc files in
+# appuser's venv. No global HF offline flag is set: the production embedder loads this
+# baked all-MiniLM-L6-v2 copy with local_files_only=True, and the reranker loads its path
+# the same way.
+USER root
+COPY docker/backend/models.lock scripts/check_models_lock.py /opt/models/
+RUN export PYTHONDONTWRITEBYTECODE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+    && python /opt/models/check_models_lock.py --strict /opt/models/models.lock \
+    && python /opt/models/check_models_lock.py --strict --download ms-marco-MiniLM-L-6-v2 /opt/models/models.lock \
+    && python /opt/models/check_models_lock.py --strict --download ms-marco-MiniLM-L-12-v2 /opt/models/models.lock \
+    && python /opt/models/check_models_lock.py --strict --download all-MiniLM-L6-v2 /opt/models/models.lock \
+    && chmod -R a+rX /opt/models
+USER appuser
+
 # --- Application code ---
 WORKDIR /app
 
