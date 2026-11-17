@@ -24,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
 import pytest  # noqa: E402
 
 from scripts.model_bench import speech_bench  # noqa: E402
-from scripts.model_bench.speech import core, listening  # noqa: E402
+from scripts.model_bench.speech import chain, core, listening  # noqa: E402
 from scripts.model_bench.speech.probes import listen_pack, tts_probe  # noqa: E402
 
 ARMS = core.load_json(core.SPEECH_ARMS_PATH)
@@ -700,13 +700,15 @@ def test_the_container_argv_runs_the_probe_offline_in_the_base_image_with_no_gpu
 def test_plan_prints_the_listen_pack_argv_and_its_inputs_validate(capsys):
     assert listening.validate_inputs(_REPO_ROOT) == []
     blocks = listening.container_argv(core.build_plan_context(_REPO_ROOT))
-    assert [label for label, _ in blocks] == ["listen-pack"]
+    assert [label for label, _ in blocks] == ["listen-pack", "reply-ab", "reply-ab speech-service"]
 
     code = speech_bench.main(["plan"])
 
     out = capsys.readouterr().out
     assert code == 0
     assert "[argv] listen-pack: docker run" in out
+    assert "[argv] reply-ab: docker run" in out
+    assert f"{core.VOICE_CLIP_PLACEHOLDER}:/voice/identity.wav:ro" in out
     assert "plan ok" in out
 
 
@@ -1013,3 +1015,452 @@ def test_listen_pack_from_dir_cli_prints_no_source_file_name(tmp_path, monkeypat
     assert (tmp_path / "results" / "h15" / "speech" / "listening" / "index.html").is_file()
     assert "cand-" not in captured.out + captured.err
     assert f"{len(DIR_NAMES)} clips" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# `reply-ab`: a blind A/B page of two `chain --reply-pack` directories
+# ---------------------------------------------------------------------------
+
+UTTERANCE_TEXTS = {u["id"]: u["text"] for u in core.load_json(core.UTTERANCES_PATH)["utterances"]}
+A_REPLIES = {
+    "U19": "N, E, C, E, S, S, A, R, Y. Two s's in the middle.",
+    "U01": "Your ten minute timer is running now.",
+    "U07": "One moment.",
+}
+B_REPLIES = {
+    "U01": "Done, ten minutes from now.",
+    "U07": "One moment.",
+    "U19": "Necessary: N, E, C, E, S, S, A, R, Y.",
+}
+SMALL_ARMS = core.load_small_arms()
+
+
+def make_reply_pack(root: Path, name: str, model: str, replies: dict, **meta) -> Path:
+    """A directory in the layout `chain --reply-pack` writes; a list gives one reply per rep."""
+    pack = root / name
+    pack.mkdir(parents=True)
+    doc = {
+        "schema": 1,
+        "run": "h17",
+        "git_sha": "abc",
+        "alias": f"{model}@gpu-full",
+        "model": model,
+        "placement": "gpu-full",
+        "stt_engine": "nemotron-160",
+        "tts_engine": "pocket",
+        "reps": 1,
+        "utterances": list(replies),
+    }
+    doc.update(meta)
+    (pack / chain.REPLY_PACK_META).write_text(json.dumps(doc), encoding="utf-8")
+    rows = []
+    for uid, texts in replies.items():
+        for rep, text in enumerate(texts if isinstance(texts, list) else [texts], start=1):
+            error = None if text else "the model returned no text to speak"
+            row = {"run": "h17", "suite": "chain", "git_sha": "abc", "utt_id": uid, "rep": rep}
+            rows.append({**row, "kind": "command", "reply": text or None, "error": error})
+    _jsonl(pack / chain.REPLY_PACK_FILE, rows)
+    return pack
+
+
+def reply_packs(tmp_path: Path, a=None, b=None) -> tuple[Path, Path]:
+    pack_a = make_reply_pack(
+        tmp_path, "pack-a", "e4b-ref", A_REPLIES if a is None else a, tts_engine="pocket-clone"
+    )
+    pack_b = make_reply_pack(
+        tmp_path, "pack-b", "gemma4-e2b", B_REPLIES if b is None else b, tts_engine="qwen3"
+    )
+    return pack_a, pack_b
+
+
+def build_reply(tmp_path: Path, *, seed: int = 7, packs=None, runner=None, voice=None, **kwargs):
+    pack_a, pack_b = packs or reply_packs(tmp_path)
+    request = listening.ReplyRequest(
+        results_root=tmp_path / "results", run="h17", seed=seed, a=pack_a, b=pack_b
+    )
+    return listening.build_reply_ab(
+        request,
+        runner=runner or FakeRunner(code=99),
+        voice=voice,
+        git_sha="abc123",
+        emit=kwargs.pop("emit", lambda line: None),
+        **kwargs,
+    )
+
+
+def reply_speech(tmp_path: Path) -> Path:
+    return tmp_path / "results" / "h17" / "speech"
+
+
+def reply_key(tmp_path: Path) -> dict:
+    path = reply_speech(tmp_path) / listening.REPLY_KEY_SUITE / listening.KEY_FILE
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_reply_ab_builds_one_item_per_utterance_with_its_line_and_both_replies(tmp_path):
+    page = build_reply(tmp_path)
+
+    assert page == reply_speech(tmp_path) / "reply-ab" / "index.html"
+    data = listening.page_data(page.read_text(encoding="utf-8"))
+    # In `utterances.json` order, whatever order the packs hold them in.
+    assert [item["item_id"] for item in data["items"]] == ["U01", "U07", "U19"]
+    for item in data["items"]:
+        uid = item["item_id"]
+        assert item["text"] == UTTERANCE_TEXTS[uid]
+        assert sorted(r["text"] for r in item["replies"]) == sorted(
+            [A_REPLIES[uid], B_REPLIES[uid]]
+        )
+    labels = [r["label"] for item in data["items"] for r in item["replies"]]
+    assert len(labels) == len(set(labels)) == 6
+    assert data["voiced"] is False
+    assert data["columns"] == list(listening.REPLY_RATINGS_COLUMNS)
+    assert listening.REPLY_RATINGS_COLUMNS == ("label", "item_id", "quality", "preferred")
+    assert data["ratings_file"] == "ratings.csv"
+
+
+def test_reply_ab_labels_are_seeded_and_the_key_ties_each_label_to_its_side(tmp_path):
+    def mapping(seed, where):
+        packs = reply_packs(tmp_path / where)
+        build_reply(tmp_path / where, seed=seed, packs=packs)
+        key = reply_key(tmp_path / where)
+        return {r["label"]: (r["item_id"], r["side"]) for r in key["replies"]}
+
+    first, again, other = mapping(1, "one"), mapping(1, "two"), mapping(2, "three")
+
+    assert first == again
+    assert first != other
+    assert sorted(first.values()) == sorted((u, s) for u in A_REPLIES for s in ("a", "b"))
+
+
+def test_reply_ab_keeps_the_key_outside_the_page_folder(tmp_path):
+    pack_a, pack_b = reply_packs(tmp_path)
+
+    page = build_reply(tmp_path, packs=(pack_a, pack_b))
+
+    files = sorted(p.relative_to(page.parent).as_posix() for p in page.parent.rglob("*"))
+    assert files == ["index.html"]
+    key = reply_key(tmp_path)
+    assert key["seed"] == 7
+    assert (key["a"]["dir"], key["b"]["dir"]) == (str(pack_a.resolve()), str(pack_b.resolve()))
+    assert (key["a"]["meta"]["model"], key["b"]["meta"]["model"]) == ("e4b-ref", "gemma4-e2b")
+    assert key["voice"] is None
+    by_label = {r["label"]: r for r in key["replies"]}
+    data = listening.page_data(page.read_text(encoding="utf-8"))
+    for item in data["items"]:
+        for reply in item["replies"]:
+            side = by_label[reply["label"]]["side"]
+            expected = (A_REPLIES if side == "a" else B_REPLIES)[item["item_id"]]
+            assert reply["text"] == expected
+            assert by_label[reply["label"]]["rep"] == 1
+
+
+def _arm_terms() -> set[str]:
+    terms = set(SMALL_ARMS["models"]) | set(SMALL_ARMS["placements"])
+    for model in SMALL_ARMS["models"]:
+        terms |= {f"{model}@{placement}" for placement in SMALL_ARMS["placements"]}
+    for model in SMALL_ARMS["models"].values():
+        terms |= {part for part in model["repository"].split("/") if part}
+    terms |= set(ARMS["stt"]) | set(ARMS["tts"])
+    return terms | {"pack-a", "pack-b", "gemma", "minicpm", "qwen"}
+
+
+def test_the_reply_page_names_no_model_arm_or_placement(tmp_path):
+    page = build_reply(tmp_path)
+    html = page.read_text(encoding="utf-8")
+
+    hits = [
+        t
+        for t in _arm_terms()
+        if re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", html, re.I)
+    ]
+    assert hits == []
+    assert re.search(r"\barm\b", html, re.I) is None
+    assert listening.blind_hits(listening.REPLY_TEMPLATE, TTS) == []
+
+
+@pytest.mark.parametrize(
+    "leak",
+    ["gemma4-e2b", "gpu-full", "e4b-ref@gpu-full", "Gemma", "nemotron-160", "pocket-clone"],
+)
+def test_reply_ab_refuses_a_page_that_would_name_a_model_arm_or_placement(tmp_path, leak):
+    packs = reply_packs(tmp_path, b={**B_REPLIES, "U01": f"Done; this is {leak} talking."})
+
+    with pytest.raises(core.SpeechBenchError, match=re.escape(leak.lower())):
+        build_reply(tmp_path, packs=packs)
+
+    assert not (reply_speech(tmp_path) / "reply-ab").exists()
+    assert not (reply_speech(tmp_path) / "reply-ab-key").exists()
+
+
+def test_reply_ab_refuses_a_page_that_names_a_pack_s_own_model(tmp_path):
+    a = make_reply_pack(tmp_path, "pack-a", "custom-tune", {"U01": "Timer set."})
+    b = make_reply_pack(tmp_path, "pack-b", "gemma4-e2b", {"U01": "Custom-tune here, timer set."})
+
+    with pytest.raises(core.SpeechBenchError, match="custom-tune"):
+        build_reply(tmp_path, packs=(a, b))
+
+
+def test_reply_ab_takes_each_pack_s_first_reply_and_skips_a_line_one_pack_lacks(tmp_path):
+    said: list[str] = []
+    a = {**A_REPLIES, "U01": ["", "Ten minutes, starting now."]}
+    b = {k: v for k, v in B_REPLIES.items() if k != "U19"}
+    packs = reply_packs(tmp_path, a=a, b=b)
+
+    page = build_reply(tmp_path, packs=packs, emit=said.append)
+
+    data = listening.page_data(page.read_text(encoding="utf-8"))
+    assert [item["item_id"] for item in data["items"]] == ["U01", "U07"]
+    assert "Ten minutes, starting now." in [r["text"] for r in data["items"][0]["replies"]]
+    key = reply_key(tmp_path)
+    assert {(r["item_id"], r["side"], r["rep"]) for r in key["replies"]} >= {("U01", "a", 2)}
+    assert key["skipped"] == [{"item_id": "U19", "missing": ["b"]}]
+    assert any("U19" in line and "[skip]" in line for line in said)
+
+
+def test_reply_ab_refuses_a_pack_inside_the_checkout(tmp_path):
+    _, pack_b = reply_packs(tmp_path)
+
+    with pytest.raises(core.RepoPathError):
+        build_reply(tmp_path, packs=(_REPO_ROOT / "tests", pack_b))
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "not-a-pack"])
+def test_reply_ab_refuses_a_directory_that_is_not_a_reply_pack(tmp_path, kind):
+    pack_a, _ = reply_packs(tmp_path)
+    other = tmp_path / "other"
+    if kind == "not-a-pack":
+        other.mkdir()
+
+    with pytest.raises(core.InputError):
+        build_reply(tmp_path, packs=(pack_a, other))
+    assert not (tmp_path / "results").exists()
+
+
+def test_reply_ab_refuses_an_existing_pack_before_writing(tmp_path):
+    (reply_speech(tmp_path) / "reply-ab-key").mkdir(parents=True)
+
+    with pytest.raises(core.OutputExistsError):
+        build_reply(tmp_path)
+    assert not (reply_speech(tmp_path) / "reply-ab").exists()
+
+
+def test_reading_the_reply_key_is_refused_until_its_ratings_csv_exists(tmp_path):
+    build_reply(tmp_path)
+    speech = reply_speech(tmp_path)
+    where = {"suite": listening.REPLY_SUITE, "key_suite": listening.REPLY_KEY_SUITE}
+
+    with pytest.raises(listening.KeySealedError, match="ratings.csv"):
+        listening.read_key(speech, **where)
+    # The listening pack's ratings do not open the reply key.
+    (speech / "listening").mkdir()
+    (speech / "listening" / "ratings.csv").write_text("label\n", encoding="utf-8")
+    with pytest.raises(listening.KeySealedError):
+        listening.read_key(speech, **where)
+
+    (speech / "reply-ab" / "ratings.csv").write_text("label\n", encoding="utf-8")
+    assert listening.read_key(speech, **where)["a"]["meta"]["model"] == "e4b-ref"
+
+
+def test_reply_ab_show_key_is_refused_before_ratings_csv_exists(tmp_path, capsys):
+    build_reply(tmp_path)
+    argv = ["reply-ab", "--results-root", str(tmp_path / "results"), "--run", "h17"]
+
+    code = speech_bench.main([*argv, "--show-key"])
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "ratings.csv" in out and "e4b-ref" not in out
+    (reply_speech(tmp_path) / "reply-ab" / "ratings.csv").write_text("label\n", encoding="utf-8")
+    assert speech_bench.main([*argv, "--show-key"]) == 0
+    assert "e4b-ref" in capsys.readouterr().out
+
+
+def test_reply_ab_cli_builds_a_text_page_and_prints_no_model(tmp_path, monkeypatch, capsys):
+    pack_a, pack_b = reply_packs(tmp_path)
+    runner = FakeRunner(code=99)
+    monkeypatch.setattr(listening, "default_runner", lambda: runner)
+    argv = ["reply-ab", "--results-root", str(tmp_path / "results"), "--run", "h17"]
+
+    code = speech_bench.main([*argv, "--a", str(pack_a), "--b", str(pack_b)])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert (reply_speech(tmp_path) / "reply-ab" / "index.html").is_file()
+    assert runner.argvs == []
+    assert "reply-ab ok: 3 items" in out
+    assert "e4b-ref" not in out and "gemma4-e2b" not in out
+    assert isinstance(reply_key(tmp_path)["seed"], int)
+
+
+# --voice-clip: both replies voiced by `pocket-clone` with the one clip, loudness matched
+
+VOICE_TRANSCRIPT = "the quartz heron counted nine amber lanterns"
+CLIP_SHA = "0123456789ab"
+
+
+def write_identity_clip(root: Path) -> Path:
+    """A tone standing in for the identity clip, with a transcript beside it."""
+    folder = root / "private-identity"
+    _write_wav(folder / "identity.wav", tone(0.2, 0.1, 24000, 220.0), 24000)
+    (folder / "clip.txt").write_text(VOICE_TRANSCRIPT, encoding="utf-8")
+    return folder / "identity.wav"
+
+
+class PcmReply:
+    status = 200
+
+    def __init__(self, chunks):
+        self.headers = {"X-Sample-Rate": "24000"}
+        self._chunks = list(chunks)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def read1(self, *_):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+class FakeSpeechService:
+    """The speech service and its container: a short tone per text, and a log kept on stop."""
+
+    def __init__(self):
+        self.events: list[str] = []
+        self.spoken: list[str] = []
+
+    def start(self):
+        self.events.append("start")
+
+    def stop(self, log_dir):
+        self.events.append("stop")
+        (Path(log_dir) / "tts_service.log").write_text("loaded identity\n", encoding="utf-8")
+
+    def __call__(self, request, timeout=None):
+        self.spoken.append(json.loads(request.data.decode("utf-8"))["text"])
+        return PcmReply([b"\x10\x00" * 2400, b"\x20\x00" * 2400])
+
+
+def fake_voice(service: FakeSpeechService) -> listening.ReplyVoice:
+    client = chain.TtsClient(chain.TTS_URL, opener=service)
+    return listening.ReplyVoice(services=service, client=client, sha256_prefix=CLIP_SHA)
+
+
+def test_voiced_replies_are_spoken_by_one_service_and_loudness_matched(tmp_path):
+    service = FakeSpeechService()
+    runner = DirFakeRunner(tmp_path / "stage")
+
+    page = build_reply(tmp_path, runner=runner, voice=fake_voice(service))
+
+    assert service.events == ["start", "stop"]
+    assert sorted(service.spoken) == sorted([*A_REPLIES.values(), *B_REPLIES.values()])
+    speech = reply_speech(tmp_path).as_posix()
+    (argv,) = runner.argvs
+    assert argv[argv.index("--network") + 1] == "none" and "--gpus" not in argv
+    assert mounts(argv) == {
+        "/work": _REPO_ROOT.resolve().as_posix(),
+        f"/speech/tts/{listening.FROM_DIR_MOUNT}": f"{speech}/reply-ab-key/voiced",
+        "/jobs.json": f"{speech}/reply-ab-key/jobs.json",
+        "/out": f"{speech}/reply-ab/clips",
+    }
+    key = reply_key(tmp_path)
+    labels = sorted(r["label"] for r in key["replies"])
+    files = sorted(p.relative_to(page.parent).as_posix() for p in page.parent.rglob("*"))
+    assert files == ["clips", *[f"clips/{label}.wav" for label in labels], "index.html"]
+    key_dir = reply_speech(tmp_path) / "reply-ab-key"
+    loud = (key_dir / "loudness.jsonl").read_text(encoding="utf-8").splitlines()
+    assert sorted(json.loads(r)["label"] for r in loud) == labels
+    assert all(json.loads(r)["on_target"] for r in loud)
+    assert key["voice"] == {"engine": "pocket-clone", "voice_clip_sha256": CLIP_SHA}
+    assert (key_dir / "tts_service.log").is_file()
+    data = listening.page_data(page.read_text(encoding="utf-8"))
+    assert data["voiced"] is True
+
+
+def test_a_failed_voicing_leaves_no_page_and_stops_the_service(tmp_path):
+    service = FakeSpeechService()
+
+    def broken(request, timeout=None):
+        raise OSError("connection reset")
+
+    voice = listening.ReplyVoice(
+        services=service, client=chain.TtsClient(chain.TTS_URL, opener=broken), sha256_prefix="x"
+    )
+
+    with pytest.raises(core.SpeechBenchError, match="connection reset"):
+        build_reply(tmp_path, runner=DirFakeRunner(tmp_path / "stage"), voice=voice)
+
+    assert service.events == ["start", "stop"]
+    assert not (reply_speech(tmp_path) / "reply-ab" / "index.html").exists()
+
+
+def test_the_reply_voice_is_pocket_clone_with_the_clip_mounted_read_only(tmp_path):
+    clip = core.check_voice_clip(write_identity_clip(tmp_path))
+
+    voice = listening.reply_voice(clip, speech_models_dir=tmp_path / "models")
+
+    (spec,) = voice.services.specs
+    argv = list(spec.argv)
+    assert argv[argv.index("--engine") + 1] == core.VOICE_CLIP_ENGINE
+    mounted = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
+    assert f"{clip.path.as_posix()}:/voice/identity.wav:ro" in mounted
+    assert voice.client.url == f"{chain.TTS_URL}/speak"
+    assert voice.sha256_prefix == clip.sha256_prefix
+
+
+def test_reply_ab_cli_voices_with_the_clip_and_never_records_its_path(
+    tmp_path, monkeypatch, capsys, caplog
+):
+    pack_a, pack_b = reply_packs(tmp_path)
+    clip = write_identity_clip(tmp_path)
+    service = FakeSpeechService()
+    seen = {}
+
+    def voice(checked, *, speech_models_dir):
+        seen.update(clip=checked, models=speech_models_dir)
+        return fake_voice(service)
+
+    monkeypatch.setattr(listening, "reply_voice", voice)
+    monkeypatch.setattr(listening, "default_runner", lambda: DirFakeRunner(tmp_path / "stage"))
+    caplog.set_level("DEBUG")
+    argv = ["reply-ab", "--results-root", str(tmp_path / "results"), "--run", "h17"]
+    argv += ["--a", str(pack_a), "--b", str(pack_b), "--voice-clip", str(clip)]
+
+    code = speech_bench.main([*argv, "--speech-models-dir", str(tmp_path / "models")])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert seen["clip"].path == clip.resolve()
+    assert seen["models"] == tmp_path / "models"
+    texts = [p.read_text(encoding="utf-8") for p in (tmp_path / "results").rglob("*.json*")]
+    texts += [p.read_text(encoding="utf-8") for p in (tmp_path / "results").rglob("*.log")]
+    texts += [p.read_text(encoding="utf-8") for p in (tmp_path / "results").rglob("*.html")]
+    texts += [captured.out, captured.err, caplog.text]
+    for text in texts:
+        for secret in (str(clip), clip.as_posix(), clip.parent.name, VOICE_TRANSCRIPT):
+            assert secret not in text
+    assert sorted(p.name for p in clip.parent.iterdir()) == ["clip.txt", "identity.wav"]
+
+
+@pytest.mark.parametrize("case", ["missing-clip", "not-a-wav"])
+def test_reply_ab_voice_clip_misuse_exits_2_before_any_container_or_write(
+    tmp_path, monkeypatch, capsys, case
+):
+    pack_a, pack_b = reply_packs(tmp_path)
+    clip = write_identity_clip(tmp_path)
+    given = clip.parent / ("absent.wav" if case == "missing-clip" else "clip.txt")
+    monkeypatch.setattr(listening, "default_runner", lambda: FakeRunner(code=99))
+    monkeypatch.setattr(listening, "reply_voice", lambda *a, **k: pytest.fail("voice built"))
+    argv = ["reply-ab", "--results-root", str(tmp_path / "results"), "--run", "h17"]
+    argv += ["--a", str(pack_a), "--b", str(pack_b), "--voice-clip", str(given)]
+
+    code = speech_bench.main([*argv, "--speech-models-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "[REFUSED]" in captured.out
+    for secret in (str(given), clip.parent.name, VOICE_TRANSCRIPT):
+        assert secret not in captured.out + captured.err
+    assert not (tmp_path / "results").exists()
