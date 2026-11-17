@@ -244,8 +244,8 @@ class CannedDocker:
 
 
 REFUSAL = (
-    "error: anchors.sim_min is over its ceiling: left-out miss 0.0833 (ravdess sets) is above "
-    "0.05; calibration c1 is refused and sets no values"
+    "error: retrieval.anchor_floor is over its ceiling: left-out miss 0.0833 (ravdess "
+    "centroid/n10) is above 0.05; calibration c1 is refused and sets no values"
 )
 
 
@@ -253,18 +253,18 @@ def write_refused(root: root_mod.Root) -> None:
     """A `calibration.json` as the job writes it over a ceiling: every number, and no `keys`."""
     gate = {"values": {"wavlm-sv": 0.9, "ecapa": 0.5}, "objective": {"loso_miss": 0.0833}}
     refusal = {
-        "gate": "anchors.sim_min",
+        "gate": "retrieval.anchor_floor",
         "loso_miss": 0.0833,
         "ceiling": 0.05,
         "dataset": "ravdess",
-        "form": "sets",
+        "form": "centroid/n10",
     }
     result = {
         "schema": 1,
         "id": "c1",
         "status": "refused",
         "refusals": [refusal],
-        "gates": {"anchors.sim_min": gate},
+        "gates": {"retrieval.anchor_floor": gate},
     }
     write_json(root, RESULT_REL, result)
 
@@ -276,7 +276,7 @@ class RefusedDocker(CannedDocker):
         self.argvs.append(list(argv))
         write_refused(self.root)
         log.write_text(
-            "calibrate: anchors.sim_min objective: largest matched miss 0.05 in sample\n"
+            "calibrate: retrieval.anchor_floor objective: largest matched miss 0.05 in sample\n"
             "calibrate: status refused: 1 of 3 gates over their ceilings\n" + REFUSAL + "\n",
             encoding="utf-8",
         )
@@ -529,7 +529,9 @@ def test_the_job_runs_end_to_end_on_the_plan_run_wrote(
 def test_the_job_refuses_end_to_end_at_decision_17s_ceilings(
     tmp_path: Path, docker_for, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # On synthetic tones the anchor sets' left-out miss is far over 0.05, so the real job refuses.
+    # On synthetic tones the anchor floor's left-out miss is over 0.05, so the real job refuses;
+    # the anchor check is over its ceiling too, but it is reported only and never refuses (Raj,
+    # 16 Nov, Decision 19), so `refusals` does not name it.
     root = make_root(tmp_path, audio=True)
     digest = hashlib.sha256((root.path / ARCHIVE_REL).read_bytes()).hexdigest()
     monkeypatch.setattr(calibrate_cmd, "RAVDESS_ARCHIVE_SHA256", digest)
@@ -541,7 +543,7 @@ def test_the_job_refuses_end_to_end_at_decision_17s_ceilings(
     assert result["status"] == "refused" and "keys" not in result
     assert result["ceilings"] == calibrate_cmd.CEILINGS
     over = [row["gate"] for row in result["refusals"]]
-    assert "anchors.sim_min" in over
+    assert over and "anchors.sim_min" not in over
     errors = [line for line in out.splitlines() if line.startswith("error: ")]
     assert [line.split()[1] for line in errors] == over
     assert all("is over its ceiling" in line for line in errors)

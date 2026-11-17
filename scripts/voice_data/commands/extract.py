@@ -7,11 +7,13 @@ stay on this host, so there is no executor option (Design 3).
 Anchors are solo clips in `seed/reference/`, rows of `seed/anchors.csv` (`source,start_s,end_s`,
 the source relative to `seed/raw/`), or both. A row names a source by its file, so this command
 turns each row into a source id before the plan is written: no file name reaches the job, its
-argv or its output. No anchor at all exits 2; anchors that disagree exit 3.
+argv or its output. No anchor at all exits 2. Anchors that disagree are flagged and never
+refused (Raj, 16 Nov): the run goes on, and this command prints each anchor's SIMs and a flag
+line before the report, then exits 0.
 
 When `sdh scan` has run, `seed/sdh/` is mounted too and the job adds the target's SDH spans as
 extra anchors, each checked against these (`stages/sdh.py`, `stages/extract.py`). They never
-count toward either exit: SDH spans alone are no anchor.
+count toward exit 2 or the agreement flag: SDH spans alone are no anchor.
 
 The stage imports the file names and patterns below, so host and job share one definition.
 """
@@ -31,7 +33,7 @@ from pathlib import Path, PurePosixPath
 from .. import gates as gates_mod
 from .. import jobs
 from .. import root as root_mod
-from ..errors import GateError, InputError, JobError
+from ..errors import InputError, JobError
 from ..records import (
     JobInput,
     SourceRecord,
@@ -289,15 +291,18 @@ def _finish(root: root_mod.Root, run_id: str, thresholds: Mapping[str, float]) -
     if status == "anchor-length":
         bad = ", ".join(str(a) for a in result.get("anchors", []))  # type: ignore[union-attr]
         raise InputError(f"refused: anchors must be 3-30 s; out of range: {bad}")
-    if status == "anchors-disagree":
-        for line in anchor_lines(result.get("anchors", []), thresholds):  # type: ignore[union-attr]
-            print(line)
-        raise GateError(f"anchors disagree in run {run_id}; each SIM above is to the others")
     if status != "ok":
         raise JobError(f"run {run_id}: the job wrote no result")
     report = read_json(root.path / run_rel(run_id) / REPORT_NAME)
     if not isinstance(report, dict):
         raise JobError(f"run {run_id}: {REPORT_NAME} is not a JSON object")
+    if result.get("anchors_agree") is False:  # type: ignore[union-attr]
+        for line in anchor_lines(result.get("anchors", []), thresholds):  # type: ignore[union-attr]
+            print(line)
+        print(
+            f"anchors disagree in run {run_id}: flagged, not refused; each SIM above is to the "
+            "others"
+        )
     for line in report_lines(report):
         print(line)
     return 0

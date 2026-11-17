@@ -1415,18 +1415,32 @@ def test_no_anchor_exits_2_before_any_job(tmp_path: Path) -> None:
     assert docker.argvs == []
 
 
-def test_anchors_that_disagree_exit_3(tmp_path: Path) -> None:
+DISAGREE_FLAG = "anchors disagree in run r1: flagged, not refused; each SIM above is to the others"
+
+
+def test_anchors_that_disagree_are_flagged_and_the_run_goes_on(tmp_path: Path) -> None:
+    # Raj, 16 Nov (Decision 19): the anchor check reports and never refuses.
     csv = "source,start_s,end_s\nshow/episode one.mkv,9.3,13.3\n"  # the first other-voice line
     root, docker = _small_root(
         tmp_path, clips={"solo.wav": take("target", 8.0, 1)}, anchors_csv=csv
     )
     code, out, err = extract(root, docker)
-    assert code == 3, err
-    assert "anchors disagree" in err
+    assert code == 0, err
+    assert "anchors disagree" not in err
     assert "anchor clip-1" in out and "anchor time-1" in out
     # Two anchors: each one's SIM is to the other, so both fall below the default 0.6.
     assert "wavlm-sv 0.100 below, ecapa 0.100 below" in out
-    assert not (root.path / "seed" / "runs" / "r1" / "segments.jsonl").exists()
+    lines = out.splitlines()
+    flag = lines.index(DISAGREE_FLAG)
+    assert lines[flag - 1].startswith("  anchor time-1: ")
+    assert lines[flag + 1] == "extract run r1:"
+    run_dir = root.path / "seed" / "runs" / "r1"
+    result = json.loads((run_dir / "extract-result.json").read_text())
+    assert result["status"] == "ok" and result["anchors_agree"] is False
+    assert [row["anchor"] for row in result["anchors"]] == ["clip-1", "time-1"]
+    report = json.loads((run_dir / "report.json").read_text())
+    assert report["anchors"]["agree"] is False
+    assert (run_dir / "segments.jsonl").exists()
 
 
 def test_timestamp_anchors_alone_are_enough(tmp_path: Path) -> None:
@@ -1615,15 +1629,19 @@ def test_no_sdh_cue_text_or_label_leaves_the_extract_path(sdh_run: Ran) -> None:
         assert Canaries().transcript not in text.lower()
 
 
-def test_anchors_that_disagree_still_exit_3_with_sdh_spans(tmp_path: Path) -> None:
+def test_anchors_that_disagree_are_still_flagged_with_sdh_spans(tmp_path: Path) -> None:
     csv = "source,start_s,end_s\nshow/episode one.mkv,9.3,13.3\n"
     root, docker = _small_root(
         tmp_path, clips={"solo.wav": take("target", 8.0, 1)}, anchors_csv=csv
     )
     write_sdh(root)
     code, out, err = extract(root, docker)
-    assert code == 3, err
+    assert code == 0, err
     assert "anchor clip-1" in out and "anchor time-1" in out and "anchor time-2" not in out
+    assert DISAGREE_FLAG in out.splitlines()
+    run_dir = root.path / "seed" / "runs" / "r1"
+    assert json.loads((run_dir / "extract-result.json").read_text())["anchors_agree"] is False
+    assert json.loads((run_dir / "report.json").read_text())["anchors"]["agree"] is False
 
 
 def test_sdh_spans_without_seed_anchors_still_exit_2(tmp_path: Path) -> None:

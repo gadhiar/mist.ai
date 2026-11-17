@@ -13,9 +13,11 @@ v5's equal split of alpha between the embedders is written beside it only for co
 The job also measures each gate's miss out of sample, by leave one speaker out: for each
 speaker it solves the rule without every trial that speaker takes part in, and scores the
 speaker's own trials there. Each gate has a ceiling on that left-out miss (`CEILINGS`, Decision
-17); a gate strictly over its ceiling makes the job write a calibration with `status`
-`refused`, every number and no `keys`, print one `error:` line per such gate and exit 1, so
-`run` exits 4 and applies nothing. Beside the values the job reports an operating curve: the
+17). Only the anchor floor and the margin refuse: either strictly over its ceiling makes the job
+write a calibration with `status` `refused`, every number and no `keys`, print one `error:`
+line per such gate and exit 1, so `run` exits 4 and applies nothing. The anchor check's ceiling
+is reported and never refuses (Raj, 16 Nov, Decision 19), as extract flags anchors that
+disagree and runs on. Beside the values the job reports an operating curve: the
 pair, its misses in sample and left out, and its largest false-accept rate at each alpha of
 `CURVE_ALPHAS`, which holds `ALPHA`, so Raj can see what each budget costs on public speakers.
 
@@ -103,11 +105,12 @@ CEILINGS: Mapping[str, float] = {
     "retrieval.margin": 0.10,
 }
 """Each gate's ceiling on its largest matched left-out miss (Decision 17): 5% of anchor sets,
-5% of target clusters, 10% of target turns. Strictly over it, the calibration is refused."""
+5% of target clusters, 10% of target turns. Strictly over the anchor floor's or the margin's,
+the calibration is refused; over the anchor check's, it is reported only (Decision 19)."""
 CURVE_ALPHAS: list[float] = [0.005, 0.01, 0.02, 0.05]
 """The alphas of the operating curve; `ALPHA` is one of them, so its row is the chosen pair."""
 REFUSED = "refused"
-"""`calibration.json`'s `status` when a gate is over its ceiling."""
+"""`calibration.json`'s `status` when the anchor floor or the margin is over its ceiling."""
 
 LIBRITTSR = "librittsr"
 RAVDESS = "ravdess"

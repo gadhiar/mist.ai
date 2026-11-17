@@ -130,11 +130,14 @@ each form's `loso_missed` and `loso_rate` per register. A gate's `loso_miss` is 
 pooled rate over its matched forms of both datasets.
 
 Ceilings and the refusal (Decision 17). A gate is over its ceiling when its `loso_miss` is
-strictly greater than its entry in `ceilings`; equal is within. When any gate is over, the
-calibration is refused: `calibration.json` is still written, with `status` `refused`, each such
-gate in `refusals`, every number, and no `keys`; the job prints one `error:` line per gate over
-its ceiling, writes no `outputs.json`, and exits 1, so `calibrate run` applies nothing. Within
-every ceiling, `status` is `calibrated` and `keys` holds the six values.
+strictly greater than its entry in `ceilings`; equal is within. Only the anchor floor and the
+margin refuse: the anchor check's ceiling is reported and never refuses (`REPORT_ONLY`; Raj,
+16 Nov, Decision 19), so its objective reads `(over, reported only)` and the status line names
+it. When the anchor floor or the margin is over, the calibration is refused: `calibration.json`
+is still written, with `status` `refused`, each such gate in `refusals`, every number, and no
+`keys`; the job prints one `error:` line per refusing gate, writes no `outputs.json`, and exits
+1, so `calibrate run` applies nothing. With both within their ceilings, `status` is `calibrated`
+and `keys` holds the six values.
 
 The operating curve. For each alpha of `curve_alphas` the rule and the leave-one-out run again,
 and each gate's `curve` holds that alpha's pair, its largest matched miss in sample and left
@@ -203,6 +206,10 @@ SIM_MIN = "anchors.sim_min"
 FLOOR = "retrieval.anchor_floor"
 MARGIN = "retrieval.margin"
 GATES = (SIM_MIN, FLOOR, MARGIN)
+REPORT_ONLY: frozenset[str] = frozenset({SIM_MIN})
+"""The gates whose ceiling is reported and never refuses (Raj, 16 Nov, Decision 19): extract
+flags anchors that disagree and runs on, and the calibration treats the anchor check the same
+way."""
 CALIBRATED = "calibrated"
 REFUSED = "refused"
 PLAN_KIND = "calibration-plan"
@@ -2342,7 +2349,7 @@ def report(
             "form": judged.form,
         }
         for gate, judged in summary.objectives.items()
-        if not judged.within
+        if not judged.within and gate not in REPORT_ONLY
     ]
     params = asdict(plan.trials)
     found = {
@@ -2413,8 +2420,9 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
     matched miss in sample and left out, the forms that set them, the ceiling and the mean),
     v5's equal-split pair beside it, each form's FAR and counts, every target miss rate per
     dataset, form and register, in sample with its interval and left out, with the embedders
-    that missed it, and the operating curve. Last, the status. So a run can be judged from its
-    log alone.
+    that missed it, and the operating curve. Last, the status, which counts every gate over its
+    ceiling and names a `REPORT_ONLY` gate that is over, since `refusals` leaves it out. So a
+    run can be judged from its log alone.
     """
     lines = []
     for dataset in result["datasets"]:  # type: ignore[attr-defined]
@@ -2449,6 +2457,8 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
             where = f" ({dataset} {form})"
         objective = entry["objective"]
         verdict = "within" if objective["within"] else "over"
+        if not objective["within"] and gate in REPORT_ONLY:
+            verdict = "over, reported only"
         lines.append(
             f"calibrate: {gate} objective: largest matched miss {objective['miss']} in sample"
             f"{where}, {objective['loso_miss']} left out ({objective['dataset']} "
@@ -2496,10 +2506,22 @@ def summary_lines(result: Mapping[str, object]) -> list[str]:
                 f"matched miss {row['miss']} in sample, {row['loso_miss']} left out; largest "
                 f"FAR {row['largest_far']}"
             )
-    over = len(result["refusals"])  # type: ignore[arg-type]
-    if over:
+    over = [
+        gate
+        for gate, entry in result["gates"].items()  # type: ignore[attr-defined]
+        if not entry["objective"]["within"]
+    ]
+    reported = "".join(
+        f"; {gate} is over its ceiling and reported only" for gate in over if gate in REPORT_ONLY
+    )
+    if result["refusals"]:
         lines.append(
-            f"calibrate: status {REFUSED}: {over} of {len(GATES)} gates over their ceilings"
+            f"calibrate: status {REFUSED}: {len(over)} of {len(GATES)} gates over their "
+            f"ceilings{reported}"
+        )
+    elif reported:
+        lines.append(
+            f"calibrate: status {CALIBRATED}: every refusing gate is within its ceiling{reported}"
         )
     else:
         lines.append(f"calibrate: status {CALIBRATED}: every gate is within its ceiling")
@@ -2517,7 +2539,8 @@ def run(data: Path, plan_rel: str) -> tuple[list[str], dict]:
     """Run the calibration; return the root-relative files written and `calibration.json`.
 
     `calibration.json` is written whatever its `status`; a refused one holds every number and
-    no `keys`, and its `refusals` name each gate over its ceiling.
+    no `keys`, and its `refusals` name each refusing gate over its ceiling: the anchor floor,
+    the margin, or both. The anchor check over its ceiling is reported and never refused.
 
     Raises:
         StageError: The plan is refused, a file is missing or altered, the embedders differ from
@@ -2583,7 +2606,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the job; write `outputs.json` beside the plan for the executor to verify.
 
     A refused calibration still leaves `calibration.json`, but no `outputs.json`: the job prints
-    one `error:` line per gate over its ceiling and exits 1, so `calibrate run` applies nothing.
+    one `error:` line per refusing gate over its ceiling (the anchor floor or the margin, never
+    the anchor check) and exits 1, so `calibrate run` applies nothing.
     """
     parser = argparse.ArgumentParser(prog="scripts.voice_data.rehearsal.calibrate")
     parser.add_argument("--data", required=True, type=Path)

@@ -1424,53 +1424,99 @@ def test_the_job_draws_anchor_sets_and_sets_the_keys_from_the_rule(
     assert re.search(r"\.(wav|zip)\b|public/", out) is None
 
 
-def test_a_gate_over_its_ceiling_writes_a_refused_calibration_and_exits_1(
+def _sink(monkeypatch: pytest.MonkeyPatch, gates: Sequence[str]) -> None:
+    """Sink every matched target trial of `gates` below any impostor, so each one misses."""
+    built = calibrate.dataset_trials
+
+    def sunk(*args: object, **kwargs: object) -> calibrate.DatasetTrials:
+        trials = built(*args, **kwargs)
+        target = dict(trials.target)
+        for gate in gates:
+            forms = dict(target[gate])
+            for form in MATCHED[gate]:
+                forms[form] = dataclasses.replace(forms[form], scores=forms[form].scores - 3.0)
+            target[gate] = forms
+        return dataclasses.replace(trials, target=target)
+
+    monkeypatch.setattr(calibrate, "dataset_trials", sunk)
+
+
+REPORTED_ONLY = f"{calibrate.SIM_MIN} is over its ceiling and reported only"
+
+
+def test_the_anchor_check_over_its_ceiling_is_reported_and_never_refuses(
     tmp_path: Path,
     fakes: list[ToneEmbedder],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # Every anchor set sinks below any impostor, so each one misses wherever the pair sits: the
-    # anchor check's left-out miss is 1, over Decision 17's 0.05. The other gates' ceilings are 1.
-    built = calibrate.dataset_trials
-
-    def sunk(*args: object, **kwargs: object) -> calibrate.DatasetTrials:
-        trials = built(*args, **kwargs)
-        forms = dict(trials.target[calibrate.SIM_MIN])
-        forms["sets"] = dataclasses.replace(forms["sets"], scores=forms["sets"].scores - 3.0)
-        return dataclasses.replace(trials, target={**trials.target, calibrate.SIM_MIN: forms})
-
-    monkeypatch.setattr(calibrate, "dataset_trials", sunk)
+    # Raj, 16 Nov (Decision 19): the anchor check reports and never refuses. Every anchor set
+    # sinks below any impostor, so the anchor check's left-out miss is 1, over Decision 17's 0.05;
+    # the other gates' ceilings are 1, so nothing refuses.
+    _sink(monkeypatch, [calibrate.SIM_MIN])
     data = tmp_path / "data"
     write_plan(data, ceilings={**OPEN, calibrate.SIM_MIN: CEILINGS[calibrate.SIM_MIN]})
+    assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 0
+    out, err = capsys.readouterr()
+    result = json.loads((data / FOLDER_REL / "calibration.json").read_text(encoding="utf-8"))
+    assert result["status"] == "calibrated" and result["refusals"] == []
+    assert set(result["keys"]) == {f"{g}.{n}" for g in calibrate.GATES for n in NAMES}
+    objective = result["gates"][calibrate.SIM_MIN]["objective"]
+    assert (objective["loso_miss"], objective["ceiling"], objective["within"]) == (1.0, 0.05, False)
+    assert objective["form"] == "sets"
+    for gate in (calibrate.FLOOR, calibrate.MARGIN):
+        assert result["gates"][gate]["objective"]["within"] is True
+    lines = out.splitlines()
+    (line,) = (x for x in lines if x.startswith(f"calibrate: {calibrate.SIM_MIN} objective: "))
+    assert "ceiling 0.05 (over, reported only);" in line
+    assert [x for x in err.splitlines() if x.startswith("error: ")] == []
+    status = "calibrate: status calibrated: every refusing gate is within its ceiling; "
+    assert status + REPORTED_ONLY in lines
+    assert (data / FOLDER_REL / "outputs.json").exists()
+    assert re.search(r"\.(wav|zip)\b|public/", out + err) is None
+
+
+@pytest.mark.parametrize("gate", [calibrate.FLOOR, calibrate.MARGIN])
+def test_the_anchor_floor_and_the_margin_still_refuse(
+    gate: str,
+    tmp_path: Path,
+    fakes: list[ToneEmbedder],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The gate's matched target trials and every anchor set sink below any impostor, both at
+    # Decision 17's ceilings: the gate refuses alone, and the anchor check is only reported.
+    _sink(monkeypatch, [calibrate.SIM_MIN, gate])
+    data = tmp_path / "data"
+    ceilings = {**OPEN, calibrate.SIM_MIN: CEILINGS[calibrate.SIM_MIN], gate: CEILINGS[gate]}
+    write_plan(data, ceilings=ceilings)
     assert calibrate.main(["--data", str(data), "--plan", PLAN_REL]) == 1
     out, err = capsys.readouterr()
     result = json.loads((data / FOLDER_REL / "calibration.json").read_text(encoding="utf-8"))
     assert result["status"] == "refused" and "keys" not in result
-    objective = result["gates"][calibrate.SIM_MIN]["objective"]
-    assert (objective["loso_miss"], objective["ceiling"], objective["within"]) == (1.0, 0.05, False)
-    assert objective["form"] == "sets"
+    objective = result["gates"][gate]["objective"]
+    assert (objective["loso_miss"], objective["within"]) == (1.0, False)
+    assert result["gates"][calibrate.SIM_MIN]["objective"]["within"] is False
     assert result["refusals"] == [
         {
-            "gate": calibrate.SIM_MIN,
+            "gate": gate,
             "loso_miss": 1.0,
-            "ceiling": 0.05,
+            "ceiling": CEILINGS[gate],
             "dataset": objective["dataset"],
-            "form": "sets",
+            "form": objective["form"],
         }
     ]
-    for gate in (calibrate.FLOOR, calibrate.MARGIN):
-        assert result["gates"][gate]["objective"]["within"] is True
     # Every number is still written: the values, the misses and the curve.
     for entry in result["gates"].values():
         assert set(entry["values"]) == set(NAMES) and entry["misses"] and entry["curve"]
     errors = [line for line in err.splitlines() if line.startswith("error: ")]
     assert errors == [
-        f"error: {calibrate.SIM_MIN} is over its ceiling: left-out miss 1.0 "
-        f"({objective['dataset']} sets) is above 0.05; calibration c1 is refused and sets no "
+        f"error: {gate} is over its ceiling: left-out miss 1.0 ({objective['dataset']} "
+        f"{objective['form']}) is above {CEILINGS[gate]}; calibration c1 is refused and sets no "
         "values"
     ]
-    assert "calibrate: status refused: 1 of 3 gates over their ceilings" in out.splitlines()
+    status = "calibrate: status refused: 2 of 3 gates over their ceilings; "
+    assert status + REPORTED_ONLY in out.splitlines()
     assert "calibrate: key " not in out
     assert not (data / FOLDER_REL / "outputs.json").exists()
     assert re.search(r"\.(wav|zip)\b|public/", out + err) is None
