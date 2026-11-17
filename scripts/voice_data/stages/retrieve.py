@@ -1,9 +1,10 @@
 """Target-speaker retrieval on embeddings: the anchor check, both passes, the separator score.
 
-Design 4 in order. The anchors must agree. In each episode the diarized cluster nearest the
-anchor centroid is primary when it reaches the anchor floor on both embedders; every other
-cluster that reaches the floor is flagged, because a split by register and a similar-sounding
-cast member reach it alike. The target model is then built from primary turns only, so a flagged
+Design 4 in order. The anchor check reports whether the anchors agree, and the caller flags a set
+that does not; it never stops a run. In each episode the diarized cluster nearest the anchor
+centroid is primary when it reaches the anchor floor on both embedders; every other cluster that
+reaches the floor is flagged, because a split by register and a similar-sounding cast member
+reach it alike. The target model is then built from primary turns only, so a flagged
 cluster cannot pull the centroid, and a turn is kept when it beats every non-admitted cluster of
 its episode by the margin and reaches the floor of the target's leave-one-out distribution.
 

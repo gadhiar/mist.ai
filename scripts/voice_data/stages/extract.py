@@ -17,13 +17,15 @@ The order is Design 4's:
    of its own cuts of every span, and the best is kept; with no span, or no reference for the
    provisional candidate, the window scores decide. The chosen output is diarized again only
    when it is not the provisional one, and the downmix goes through it too.
-3. The anchors must agree, timestamp anchors cut from their source's chosen output; else the run
-   stops with the result `anchors-disagree` (the host exits 3). When `seed/sdh/` is mounted, the
-   SDH spans `stages/sdh.py` holds as anchors are cut the same way and checked against the
-   centroid of these anchors: one below that embedder's Anchors value on either embedder (each
-   embedder has its own, since their cosines sit on different scales) is dropped and
-   counted, and the rest join the anchor centroid that retrieval uses. They never enter the
-   agreement check, so they can neither cause nor mask `anchors-disagree`.
+3. The anchors are checked for agreement, timestamp anchors cut from their source's chosen
+   output. The check reports and never refuses (Raj, 16 Nov): its result is `anchors_agree` in
+   `extract-result.json` and `anchors.agree` in `report.json`, and the run goes on with the
+   anchors as they are, so the host flags a set that disagrees and still exits 0. When
+   `seed/sdh/` is mounted, the SDH spans `stages/sdh.py` holds as anchors are cut the same way
+   and checked against the centroid of these anchors: one below that embedder's Anchors value on
+   either embedder (each embedder has its own, since their cosines sit on different scales) is
+   dropped and counted, and the rest join the anchor centroid that retrieval uses. They never
+   enter the agreement check, so they can neither cause nor mask a disagreement.
 4. Diarization on the separated centre channel; the first retrieval pass names each episode's
    primary and flagged clusters; the target model and the 1.5 s window model are built from
    primary turns that touch no overlap.
@@ -858,9 +860,10 @@ class Extraction:
                 anchor_embs.update(cuts)
             anchors = clip_embs + [anchor_embs[i] for i in sorted(anchor_embs)]
             agree, anchor_sims = retrieve.anchor_check(anchors, self.limits.anchor_sim_min)
-            detail = {"anchors": self._anchor_rows(anchor_sims)}
-            if not agree:
-                return self._result("anchors-disagree", detail, written)
+            detail: dict[str, object] = {
+                "anchors": self._anchor_rows(anchor_sims),
+                "anchors_agree": agree,
+            }
             centroid, sdh_counts = self._sdh_anchors(works, anchors)
             if sdh_counts is not None:
                 detail["sdh"] = sdh_counts
@@ -1301,6 +1304,7 @@ class Extraction:
                 "clips": len(self.clips),
                 "timestamps": len(self.anchors),
                 "sim": detail.get("anchors", []),
+                "agree": bool(detail["anchors_agree"]),
             },
             "sdh": detail.get("sdh"),
             "rehearsal": None,
