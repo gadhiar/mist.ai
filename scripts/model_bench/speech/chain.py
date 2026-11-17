@@ -15,8 +15,12 @@ time to first audio, which also holds the rest of each stream the client reads b
 `--busy-arm c0` runs the same turns on `gpu-full` while T1's load generator streams from
 `mist-bench-llm` throughout, and records E4B's decode rate over each turn.
 
-The two services run in containers (`probes/stt_service.py`, `probes/tts_service.py`) on 4 CPU
-threads each, published on 127.0.0.1 only; this module only starts, polls and removes them.
+The two services run in containers (`probes/stt_service.py`, `probes/tts_service.py`), published
+on 127.0.0.1 only; this module only starts, polls and removes them. By default they run Parakeet
+and Pocket on 4 CPU threads each. `--stt-engine` and `--tts-engine` choose another engine from
+`STT_ENGINES` and `TTS_ENGINES`: a CUDA engine gets the GPU, a CPU engine 4 threads, and every row
+names both engines. `pocket-clone` speaks as the identity clip `--voice-clip` names, mounted
+read-only at a fixed container path; the results keep only the clip's sha256 prefix.
 """
 
 from __future__ import annotations
@@ -40,6 +44,10 @@ from .probes import load_gen, tts_engines, tts_probe
 SUITE = "chain"
 STT_ENGINE = "parakeet-cpu"
 TTS_ENGINE = "pocket"
+# The engines `--stt-engine` and `--tts-engine` choose from; the first of each is the default,
+# and with both defaults the services start exactly as before the choice existed.
+STT_ENGINES = (STT_ENGINE, "nemotron-160")
+TTS_ENGINES = (TTS_ENGINE, core.VOICE_CLIP_ENGINE, "qwen3", "qwen3-design")
 STT_PORT = 8091
 TTS_PORT = 8092
 STT_URL = f"http://{docker_cmds.LOCALHOST}:{STT_PORT}"
@@ -269,7 +277,7 @@ class SttReply:
 
 
 class SttClient:
-    """`POST /transcribe` on the Parakeet service: a WAV body, a JSON reply."""
+    """`POST /transcribe` on the speech-to-text service: a WAV body, a JSON reply."""
 
     def __init__(
         self,
@@ -322,7 +330,7 @@ class TtsReply:
 
 
 class TtsClient:
-    """`POST /speak` on the Pocket TTS service: text in, chunked 16-bit PCM out."""
+    """`POST /speak` on the speech service (Pocket by default): text in, chunked 16-bit PCM out."""
 
     def __init__(
         self,
@@ -529,30 +537,69 @@ def _service_head(name: str, port: int, cfg: Mapping[str, object], what: str) ->
     return argv + docker_cmds.env_args({"PYTHONDONTWRITEBYTECODE": "1"})
 
 
+def _check_engines(stt_engine: str, tts_engine: str) -> None:
+    if stt_engine not in STT_ENGINES:
+        raise core.SpeechBenchError(
+            f"the chain has no speech-to-text engine {stt_engine!r}; it offers {list(STT_ENGINES)}"
+        )
+    if tts_engine not in TTS_ENGINES:
+        raise core.SpeechBenchError(
+            f"the chain has no speech engine {tts_engine!r}; it offers {list(TTS_ENGINES)}"
+        )
+
+
 def stt_service_argv(
-    *, repo_dir: str, speech_models_dir: str, arms: Mapping[str, object] | None = None
+    *,
+    repo_dir: str,
+    speech_models_dir: str,
+    arms: Mapping[str, object] | None = None,
+    engine: str = STT_ENGINE,
 ) -> list[str]:
-    """`docker run -d` of the Parakeet service: the asr image, 4 CPU threads, no GPU."""
-    cfg = _arms(arms)["stt"][STT_ENGINE]
-    threads = stt_suite.cpu_threads(cfg, STT_ENGINE)
-    argv = _service_head(STT_CONTAINER, STT_PORT, cfg, STT_ENGINE)
+    """`docker run -d` of the speech-to-text service: the engine's image, GPU or 4 CPU threads.
+
+    The service hands `--threads` to `stt_engines.make_transcriber`, so a CUDA engine is passed
+    the arm's CPU thread count too (4 when the arm names none).
+    """
+    _check_engines(engine, TTS_ENGINE)
+    cfg = _arms(arms)["stt"][engine]
+    threads = stt_suite.cpu_threads(cfg, engine)
+    argv = _service_head(STT_CONTAINER, STT_PORT, cfg, engine)
     argv += docker_cmds.ro_mount(repo_dir, docker_cmds.REPO_MOUNT)
     argv += docker_cmds.ro_mount(speech_models_dir, stt_suite.CONTAINER_WEIGHTS)
     argv += ["-w", docker_cmds.REPO_MOUNT, str(cfg["image"]), "python", "-m", STT_SERVICE_MODULE]
-    argv += ["--engine", STT_ENGINE, "--weights", stt_suite.CONTAINER_WEIGHTS]
+    argv += ["--engine", engine, "--weights", stt_suite.CONTAINER_WEIGHTS]
     return argv + ["--threads", str(threads), "--host", CONTAINER_BIND, "--port", str(STT_PORT)]
 
 
 def tts_service_argv(
-    *, repo_dir: str, speech_models_dir: str, arms: Mapping[str, object] | None = None
+    *,
+    repo_dir: str,
+    speech_models_dir: str,
+    arms: Mapping[str, object] | None = None,
+    engine: str = TTS_ENGINE,
+    voice_clip: str | None = None,
 ) -> list[str]:
-    """`docker run -d` of the Pocket TTS service: its image, 4 CPU threads, the stock voice."""
-    cfg = _arms(arms)["tts"][TTS_ENGINE]
-    argv = _service_head(TTS_CONTAINER, TTS_PORT, cfg, TTS_ENGINE)
+    """`docker run -d` of the speech service: the engine's image, GPU or 4 CPU threads.
+
+    `--engine` is passed only for an engine other than Pocket, so the default argv is the one
+    run 7 recorded. `pocket-clone` gets `voice_clip` (a host path) mounted read-only at
+    `tts_engines.CONTAINER_VOICE_CLIP`; no other engine gets a clip.
+
+    Raises:
+        core.VoiceClipError: `pocket-clone` without a clip, or a clip with another engine.
+    """
+    _check_engines(STT_ENGINE, engine)
+    core.check_voice_clip_use([engine], voice_clip)
+    cfg = _arms(arms)["tts"][engine]
+    argv = _service_head(TTS_CONTAINER, TTS_PORT, cfg, engine)
     argv += docker_cmds.ro_mount(repo_dir, docker_cmds.REPO_MOUNT)
     argv += docker_cmds.ro_mount(speech_models_dir, tts_engines.CONTAINER_MODELS_DIR)
+    if voice_clip is not None:
+        argv += docker_cmds.ro_mount(voice_clip, tts_engines.CONTAINER_VOICE_CLIP)
     argv += ["-w", docker_cmds.REPO_MOUNT, str(cfg["image"]), "python", "-m", TTS_SERVICE_MODULE]
     argv += ["--models-dir", tts_engines.CONTAINER_MODELS_DIR]
+    if engine != TTS_ENGINE:
+        argv += ["--engine", engine]
     return argv + ["--host", CONTAINER_BIND, "--port", str(TTS_PORT)]
 
 
@@ -613,18 +660,22 @@ class ChainServices:
         clock: Clock = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         timeout_s: float = SERVICE_TIMEOUT_S,
+        stt_engine: str = STT_ENGINE,
+        tts_engine: str = TTS_ENGINE,
+        voice_clip: str | None = None,
     ) -> ChainServices:
-        """The Parakeet service, then the Pocket TTS service."""
+        """The speech-to-text service, then the speech service (Parakeet and Pocket by default)."""
+        paths = {"repo_dir": repo_dir, "speech_models_dir": speech_models_dir}
         specs = (
             ServiceSpec(
                 STT_CONTAINER,
-                tuple(stt_service_argv(repo_dir=repo_dir, speech_models_dir=speech_models_dir)),
+                tuple(stt_service_argv(**paths, engine=stt_engine)),
                 f"{STT_URL}/health",
                 "stt_service.log",
             ),
             ServiceSpec(
                 TTS_CONTAINER,
-                tuple(tts_service_argv(repo_dir=repo_dir, speech_models_dir=speech_models_dir)),
+                tuple(tts_service_argv(**paths, engine=tts_engine, voice_clip=voice_clip)),
                 f"{TTS_URL}/health",
                 "tts_service.log",
             ),
@@ -705,7 +756,10 @@ class Services(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ChainRequest:
-    """One chain run: a served alias, the material, and optionally E4B writing beside it."""
+    """One chain run: a served alias, the material, the two speech engines, and optionally E4B
+    writing beside it. `voice_clip` is the identity clip `pocket-clone` needs, kept out of
+    `repr` so no log line or traceback of the request shows its path.
+    """
 
     results_root: Path
     run: str
@@ -718,6 +772,9 @@ class ChainRequest:
     baseline_s: float = DEFAULT_BASELINE_S
     remote_url: str | None = None
     utt_ids: tuple[str, ...] = CHAIN_UTTERANCES
+    stt_engine: str = STT_ENGINE
+    tts_engine: str = TTS_ENGINE
+    voice_clip: Path | None = field(default=None, repr=False)
 
 
 class LoadGen(Protocol):
@@ -736,8 +793,26 @@ class LoadGen(Protocol):
         ...
 
 
-def _check_request(request: ChainRequest, container_state: Callable[[str], str]) -> str:
-    """Refuse a request that cannot run, before anything is written; return its alias."""
+def check_engines_and_clip(
+    stt_engine: str, tts_engine: str, voice_clip: Path | None
+) -> core.VoiceClip | None:
+    """The checked clip for `pocket-clone`, or None; refuses an engine or clip that cannot run.
+
+    Raises:
+        core.SpeechBenchError: an engine the chain does not offer.
+        core.VoiceClipError: `pocket-clone` without a clip, a clip with another engine, or a clip
+            that is missing, not a WAV, or inside the checkout.
+    """
+    _check_engines(stt_engine, tts_engine)
+    core.check_voice_clip_use([tts_engine], voice_clip)
+    return None if voice_clip is None else core.check_voice_clip(voice_clip)
+
+
+def _check_request(
+    request: ChainRequest, container_state: Callable[[str], str]
+) -> tuple[str, core.VoiceClip | None]:
+    """Refuse a request that cannot run, before anything is written; return its alias and clip."""
+    clip = check_engines_and_clip(request.stt_engine, request.tts_engine, request.voice_clip)
     core.speech_root(request.results_root, request.run)
     arms = core.load_small_arms()
     if request.model not in arms["models"]:
@@ -767,7 +842,7 @@ def _check_request(request: ChainRequest, container_state: Callable[[str], str])
             )
     if request.reps is not None and request.reps < 1:
         raise core.SpeechBenchError(f"--reps must be at least 1, not {request.reps}")
-    return alias
+    return alias, clip
 
 
 def _busy_fields(row: Mapping[str, object], completions: Sequence[load_gen.Completion]) -> dict:
@@ -794,7 +869,7 @@ def run_chain(
     git_sha: str | None = None,
 ) -> Path:
     """Run every recording `reps` times through the chain; return the claimed directory."""
-    alias = _check_request(request, container_state)
+    alias, clip = _check_request(request, container_state)
     busy = request.busy_arm is not None
     if busy and load_gen_factory is None:
         raise core.SpeechBenchError("--busy-arm needs a load generator")
@@ -813,7 +888,8 @@ def run_chain(
         f"{request.model}/{placement_dir}",
         git_sha=git_sha or core.current_git_sha(),
     )
-    voice = core.load_json(core.SPEECH_ARMS_PATH)["tts"][TTS_ENGINE]["timing_voice"]
+    voice = core.load_json(core.SPEECH_ARMS_PATH)["tts"][request.tts_engine]["timing_voice"]
+    engines = {"stt_engine": request.stt_engine, "tts_engine": request.tts_engine}
     meta = {
         "alias": alias,
         "model": request.model,
@@ -822,23 +898,25 @@ def run_chain(
         "reps": reps,
         "utterances": list(request.utt_ids),
         "llm_url": llm.base_url,
-        "stt_engine": STT_ENGINE,
-        "tts_engine": TTS_ENGINE,
+        **engines,
         "voice": voice,
         "done_result": DONE_RESULT,
         "hand_off_reply": HAND_OFF_ACK,
         "turn_ms": "stt_ms + first_clause_ms + tts_first_audio_ms",
     }
+    if clip is not None:
+        meta["voice_clip_sha256"] = clip.sha256_prefix
     core.write_json_exclusive(claim.path / "chain.json", meta)
 
     def each_turn() -> Iterator[dict[str, object]]:
         # Recording by recording, its repetitions together, as run 3 orders its material.
         for item in inputs.items.values():
             for rep in range(1, reps + 1):
-                yield run_turn(
+                row = run_turn(
                     item, rep=rep, alias=alias, inputs=inputs, llm=llm, stt=stt, tts=tts,
                     clock=clock,
                 )  # fmt: skip
+                yield {**row, **engines}
 
     turns = claim.jsonl("turns.jsonl")
     try:
@@ -917,10 +995,27 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--baseline-s", type=float, default=DEFAULT_BASELINE_S, help="E4B alone before a busy run"
     )
     parser.add_argument("--service-timeout", type=float, default=SERVICE_TIMEOUT_S)
+    parser.add_argument(
+        "--stt-engine", choices=STT_ENGINES, default=STT_ENGINE, help="speech-to-text engine"
+    )
+    parser.add_argument(
+        "--tts-engine", choices=TTS_ENGINES, default=TTS_ENGINE, help="speech engine"
+    )
+    parser.add_argument(
+        "--voice-clip",
+        type=Path,
+        help=f"the identity WAV {core.VOICE_CLIP_ENGINE} clones, outside the checkout "
+        f"(with --tts-engine {core.VOICE_CLIP_ENGINE} only)",
+    )
     parser.set_defaults(func=cmd_chain)
 
 
 def cmd_chain(args: argparse.Namespace) -> int:
+    try:
+        clip = check_engines_and_clip(args.stt_engine, args.tts_engine, args.voice_clip)
+    except core.VoiceClipError as exc:
+        print(f"[REFUSED] {exc}")
+        return 2
     if args.speech_models_dir is None:
         raise core.SpeechBenchError(
             f"--speech-models-dir (or {tts_suite.SPEECH_MODELS_DIR_ENV}) names the speech models"
@@ -942,11 +1037,17 @@ def cmd_chain(args: argparse.Namespace) -> int:
         baseline_s=args.baseline_s,
         remote_url=args.remote_url,
         utt_ids=tuple(u for u in CHAIN_UTTERANCES if u in args.utt) or CHAIN_UTTERANCES,
+        stt_engine=args.stt_engine,
+        tts_engine=args.tts_engine,
+        voice_clip=None if clip is None else clip.path,
     )
     services = ChainServices.default(
         repo_dir=core.REPO_ROOT.resolve().as_posix(),
         speech_models_dir=args.speech_models_dir.resolve().as_posix(),
         timeout_s=args.service_timeout,
+        stt_engine=args.stt_engine,
+        tts_engine=args.tts_engine,
+        voice_clip=None if clip is None else clip.path.as_posix(),
     )
     out = run_chain(
         request,
@@ -1004,6 +1105,10 @@ def validate_inputs(repo_root: Path) -> list[str]:
     parakeet = arms.get("stt", {}).get(STT_ENGINE, {})
     if parakeet.get("device") != "cpu" or int(parakeet.get("threads", 0)) != 4:
         problems.append("speech_arms.json: parakeet-cpu must run on 4 CPU threads")
+    for section, offered in (("stt", STT_ENGINES), ("tts", TTS_ENGINES)):
+        missing = [e for e in offered if e not in arms.get(section, {})]
+        if missing:
+            problems.append(f"speech_arms.json: the chain offers {section} engines {missing}")
     return problems
 
 
@@ -1018,6 +1123,14 @@ def selftest() -> None:
         _check(argv[argv.index("-p") + 1] == f"127.0.0.1:{port}:{port}", "service not on loopback")
         _check("--gpus" not in argv, "a chain service asks for the GPU")
         _check(argv[argv.index("--cpus") + 1] == "4", "a chain service is not on 4 CPUs")
+    clone = tts_service_argv(
+        repo_dir="/r", speech_models_dir="/m", engine=core.VOICE_CLIP_ENGINE, voice_clip="/c.wav"
+    )
+    _check(f"/c.wav:{tts_engines.CONTAINER_VOICE_CLIP}:ro" in clone, "clip not mounted read-only")
+    _check(clone[clone.index("--engine") + 1] == core.VOICE_CLIP_ENGINE, "clone engine not named")
+    design = tts_service_argv(repo_dir="/r", speech_models_dir="/m", engine="qwen3-design")
+    _check("--gpus" in design and "--cpus" not in design, "a CUDA speech engine lacks the GPU")
+    _check(not any("/voice/" in a for a in design), "a clip mounted for another engine")
     reply = "Your ten minute timer is set and running now, and it rings at ten past nine."
     spoken = tts_probe.first_segment(reply)
     _check(spoken == "Your ten minute timer is set and running now,", "first clause wrong")

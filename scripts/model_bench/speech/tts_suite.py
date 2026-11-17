@@ -609,21 +609,27 @@ def cmd_tts(args: argparse.Namespace) -> int:
     request = TtsRequest(
         results_root=args.results_root,
         run=args.run,
-        engines=tuple(args.engine or default_engines(tts, None)),
+        engines=tuple(args.engine or default_engines(tts, args.voice_clip)),
         speech_models_dir=models_dir,
         extra_voices=extra,
         seed=args.seed,
         repeats=args.repeats,
         lines=tuple(args.lines) if args.lines else None,
         baseline_s=args.baseline_s,
+        voice_clip=args.voice_clip,
     )
-    tts_dir = run_tts(
-        request,
-        runner=DockerRunner(),
-        container_state=lambda name: bench_host.probe_container_state(name).state,
-        load_gen_factory=lambda: load_gen.LoadGenerator(LOAD_GEN_BASE_URL),
-        sampler_factory=bench_host.GpuSampler,
-    )
+    try:
+        tts_dir = run_tts(
+            request,
+            runner=DockerRunner(),
+            container_state=lambda name: bench_host.probe_container_state(name).state,
+            load_gen_factory=lambda: load_gen.LoadGenerator(LOAD_GEN_BASE_URL),
+            sampler_factory=bench_host.GpuSampler,
+        )
+    except core.VoiceClipError as exc:
+        # `run_tts` checks the clip before it reads a container state or writes anything.
+        print(f"[REFUSED] {exc}")
+        return 2
     print(f"tts ok: {', '.join(request.engines)}; results in {tts_dir}")
     return 0
 
@@ -635,7 +641,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
 
 def register(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
-        "tts", help="run 1: speech synthesis, each engine in its own stock voice"
+        "tts", help="run 1: speech synthesis, each engine in its own voice"
     )
     core.add_results_args(parser)
     parser.add_argument(
@@ -662,6 +668,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=Path(env_models) if env_models else None,
         help=f"host speech models directory, <org>/<repo>/ layout (env {SPEECH_MODELS_DIR_ENV})",
+    )
+    parser.add_argument(
+        "--voice-clip",
+        type=Path,
+        help=f"the identity WAV {core.VOICE_CLIP_ENGINE} clones, outside the checkout; "
+        f"needed by {core.VOICE_CLIP_ENGINE} and refused without it",
     )
     parser.set_defaults(func=cmd_tts)
 
