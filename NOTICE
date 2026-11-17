@@ -120,6 +120,25 @@ respective licenses:
    runtime into the Hugging Face cache.
 
 -------------------------------------------------------------------------------
+10. Kyutai Pocket TTS
+   Location: Python package pocket-tts 4.0.1 (requirements-voice.txt); weights
+             staged under the models directory (speech/kyutai/pocket-tts/ and
+             speech/kyutai/pocket-tts-without-voice-cloning/)
+   Source: https://github.com/kyutai-labs/pocket-tts (code)
+           https://huggingface.co/kyutai/pocket-tts
+           (revision db04f0e653473e5c7333c69686ac92b7460b0c1d), the voice
+           cloning model, and its tokenizer from
+           https://huggingface.co/kyutai/pocket-tts-without-voice-cloning
+           (revision 00eac05ed3d16bdc3f6b5d598874019c34a89214)
+   License: MIT License (code); Creative Commons Attribution 4.0
+            International, CC-BY-4.0 (weights)
+   Copyright: Kyutai
+
+   Used for text-to-speech in MIST's own cloned voice
+   (backend/realtime/engines/pocket_tts.py). The weights are not included in
+   this repository and are not downloaded at runtime.
+
+-------------------------------------------------------------------------------
 
 APACHE LICENSE 2.0 COMPONENTS
 
@@ -146,9 +165,19 @@ The following components are licensed under MIT License:
 - OpenAI Whisper
 - Silero VAD
 - Ollama
+- Kyutai Pocket TTS (code)
 
 MIT License is permissive and allows commercial use, modification,
 distribution, and private use with minimal restrictions.
+
+CREATIVE COMMONS ATTRIBUTION 4.0 COMPONENTS
+
+The following components are licensed under CC-BY-4.0:
+- Kyutai Pocket TTS (weights)
+
+CC-BY-4.0 allows sharing and adaptation for any purpose, provided appropriate
+credit is given, a link to the license is provided, and changes are indicated.
+Full license text: https://creativecommons.org/licenses/by/4.0/legalcode
 
 BSD 2-CLAUSE LICENSE COMPONENTS
 
@@ -163,4 +192,4 @@ of conditions and the disclaimer are retained.
 
 For questions about licensing, contact: Raj Gadhia
 
-Last updated: 2026-11-07
+Last updated: 2026-11-17
