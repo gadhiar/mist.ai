@@ -12,6 +12,10 @@ drops overlapped speech and shorter segments by design). It is the share covered
 segments, primary or flagged, since flagged segments come back through the labels pack.
 All-target recall, over all the target's speech, is reported beside it. The effect measures come
 from the `effects` job step (`mix.py`); everything else here needs no audio.
+
+The impostor's cluster in each episode is named from the run's turn record (`turns.jsonl`,
+`commands/extract.py`'s `TurnRecord`), which holds every diarized turn whatever its cluster's
+role, by the impostor seconds each cluster's turns hold.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 
+from ..commands.extract import TurnRecord
 from ..records import SegmentRecord, SourceRecord
 from ..states import SPEAKING_STATES
 from . import TruthLine, majority, overlap_s
@@ -27,12 +32,24 @@ from . import TruthLine, majority, overlap_s
 Interval = tuple[float, float]
 PRIMARY = "primary"
 FLAGGED = "flagged"
+OTHER = "other"
+NONE = "none"
 DOWNMIX = "downmix"
-NOT_ADMITTED = "not admitted"
+# How an episode's impostor cluster was found: by the turn record, or not at all.
+BY_TURNS = "turns"
+STATUSES = (PRIMARY, FLAGGED, OTHER, NONE)
+# When two clusters hold the same impostor seconds, the one retrieval admitted further is named.
+_CONCERN = {PRIMARY: 2, FLAGGED: 1, OTHER: 0}
+# The six per-embedder retrieval values a run used, as `retrieval.thresholds` reports them.
+RETRIEVAL_PREFIXES = ("anchors.sim_min.", "retrieval.anchor_floor.", "retrieval.margin.")
+MARGIN_PREFIX = "retrieval.margin."
+# The flag floor sits this far under the impostor cluster's median before rounding down.
+FLAG_STEP = 0.001
+# A gap equal to a margin up to rounding meets it, as in `stages/retrieve.py`.
+EPS = 1e-9
 NOT_RATED = "a rating by Raj; the rehearsal holds no ratings to inform it"
 # Why each [E] gate the rehearsal cannot inform is "not measured".
 NOT_MEASURED = {
-    "retrieval.margin": "segments.jsonl records no per-turn margin to the rival clusters",
     "segment.window_percentile": (
         "a percentile of the target's own window distribution; the ground truth marks lines, "
         "not windows"
@@ -131,8 +148,8 @@ class Episodes:
         """Return the source's lines of one speaker kind."""
         return [ln for ln in self.lines.get(source_id, []) if ln.speaker == speaker]
 
-    def who(self, seg: SegmentRecord) -> str | None:
-        """Return `target`, `impostor` or `other` when that kind covers half the segment."""
+    def who(self, seg: SegmentRecord | TurnRecord) -> str | None:
+        """Return `target`, `impostor` or `other` when that kind covers half the segment or turn."""
         span = seg.end_s - seg.start_s
         if seg.source_id not in self.lines or span <= 0:
             return None
@@ -261,179 +278,187 @@ def downmix_recovery(
     return found
 
 
-BY_SEGMENTS = "segments"
-UPPER_BOUND = "upper bound: highest non-admitted cluster"
-MERGED_MEDIAN = (
-    "merged: admitted clusters cover over half of the impostor's speech and this one the most; "
-    "the impostor holds at most half its records"
-)
+def _medians(report: Mapping[str, object]) -> dict[tuple[str, str], object]:
+    """Return each cluster's median SIM to the anchor centroid, by source id and label."""
+    found: dict[tuple[str, str], object] = {}
+    sources = report.get("sources")
+    for source in sources if isinstance(sources, list) else []:
+        clusters = source.get("clusters") if isinstance(source, Mapping) else None
+        for cluster in clusters if isinstance(clusters, list) else []:
+            if isinstance(cluster, Mapping):
+                key = (str(source.get("source_id")), str(cluster.get("diar_cluster")))
+                found[key] = cluster.get("median_sim")
+    return found
 
 
 def impostor_clusters(
-    eps: Episodes, segments: Sequence[SegmentRecord], report: Mapping[str, object]
+    eps: Episodes, turns: Sequence[TurnRecord], report: Mapping[str, object]
 ) -> list[dict[str, object]]:
-    """Return each episode's impostor cluster: its status and median SIM to the anchor centroid.
+    """Return each episode's impostor cluster, named from the turn record by measured seconds.
 
-    Extract writes segment records for admitted clusters only (primary or flagged), kept or
-    dropped. An admitted cluster is the impostor's when more than half of its records in the
-    episode are the impostor's (`Episodes.who`). Impostor records in an admitted cluster that is
-    not the impostor's are counted per cluster in `stray_records`. When several admitted clusters
-    are the impostor's, the row names the worst: primary before flagged, then the higher median.
-
-    When no admitted cluster is the impostor's, the row measures how much of the impostor's
-    speech in the episode (the union of its ground-truth lines) the records of admitted clusters
-    cover: every record of those clusters, whichever speaker `Episodes.who` gives it to, or none.
-    A record of a diarizer turn that joins a target line and an impostor line can lie on neither
-    speaker's lines by half, so `Episodes.who` gives it to no one, yet the impostor speech in it
-    went into that turn's cluster. A record split between both speakers adds to the coverage the
-    part of it on the impostor's lines; it counts toward the impostor's majority and
-    `stray_records` only when `Episodes.who` gives it to the impostor. The denominator is all of
-    the impostor's speech, not only the speech extraction could keep, because extract drafts a
-    record for each turn of an admitted cluster (`stages/extract.py:782-797`) whether or not it is
-    kept: a turn too short to embed (:534-538, :848-849), a turn that fails retrieval (:864-880), a
-    cut of the wrong length (:912-915, from `segments.cut_line`) and a cut that touches overlap
-    (:917-920) are each drafted, and `_records` writes every draft (:967-1016). A passing turn's
-    records leave out what `cut_line` trims (`stages/segments.py:87-103`): the turn's edges outside
-    VAD speech, the pauses between segments when a long turn is cut, and the whole turn when VAD
-    finds no speech in it.
-
-    - When the admitted clusters together cover more than half of the impostor's speech, the
-      impostor is merged into the admitted cluster covering the most of it (primary before
-      flagged on a tie). `status` is that cluster's role, so the statuses stay primary, flagged
-      and not admitted, and `impostor_primary_episodes` counts a merge into primary.
-      `diar_cluster` names the cluster and `median_sim` is its median, of a cluster in which the
-      impostor holds at most half the records; `identified_by` is `MERGED_MEDIAN`. Impostor
-      records in it stay counted in `stray_records`.
-    - Otherwise the row reports the highest median among the episode's non-admitted clusters,
-      an upper bound on the impostor's own cluster's median, with the status `not admitted`;
-      which non-admitted cluster was the impostor's is unknown, as non-admitted clusters leave
-      no records (`stages/extract.py:783-787`).
+    Each turn's seconds on the impostor's ground-truth lines are attributed to the impostor and
+    summed per diarizer cluster. The episode's impostor cluster is the one holding the most
+    impostor seconds; on a tie, the one retrieval admitted further (primary, then flagged, then
+    other), then the first label. Its `status` is its role in the turn record and `median_sim`
+    its median SIM to the anchor centroid from `report.json`, so the row reads the impostor's
+    own cluster whatever its role, never another cluster's median standing in for it. Every
+    other cluster holding impostor seconds is listed in `stray`. `impostor_share` is the
+    impostor's share of the named cluster's seconds, which says how far its median is the
+    impostor's. An episode in which no turn meets an impostor line has `status` and
+    `identified_by` `none`.
     """
-    clusters_by_source: dict[str, list[Mapping[str, object]]] = {}
-    for source in report.get("sources") or []:  # type: ignore[union-attr]
-        if isinstance(source, Mapping) and isinstance(source.get("clusters"), list):
-            clusters_by_source[str(source.get("source_id"))] = source["clusters"]  # type: ignore[assignment]
+    medians = _medians(report)
     rows = []
     for sid in sorted(eps.lines):
-        clusters = {str(c.get("diar_cluster")): c for c in clusters_by_source.get(sid, [])}
-        records: Counter[str] = Counter()
-        impostor: Counter[str] = Counter()
-        spans: dict[str, list[Interval]] = {}
-        for seg in segments:
-            if seg.source_id == sid and seg.diar_cluster:
-                records[seg.diar_cluster] += 1
-                spans.setdefault(seg.diar_cluster, []).append((seg.start_s, seg.end_s))
-                if eps.who(seg) == "impostor":
-                    impostor[seg.diar_cluster] += 1
-        own, stray = [], []
-        for label in sorted(impostor):
-            role = clusters.get(label, {}).get("role")
-            if role not in (PRIMARY, FLAGGED) or not impostor[label]:
+        impostor_lines = eps.of(sid, "impostor")
+        seconds: dict[str, float] = {}
+        held: dict[str, float] = {}
+        roles: dict[str, str] = {}
+        for turn in turns:
+            if turn.source_id != sid:
                 continue
-            if 2 * impostor[label] > records[label]:
-                own.append(clusters[label])
-            else:
-                stray.append({"diar_cluster": label, "role": role, "records": impostor[label]})
+            label = turn.diar_cluster
+            seconds[label] = seconds.get(label, 0.0) + (turn.end_s - turn.start_s)
+            held[label] = held.get(label, 0.0) + overlap_s(turn.start_s, turn.end_s, impostor_lines)
+            roles[label] = turn.role
+        holding = [label for label in sorted(held) if held[label] > EPS]
+        total = round(length(union([(ln.start_s, ln.end_s) for ln in impostor_lines])), 3)
         row: dict[str, object] = {"episode": eps.episode[sid], "source_id": sid}
-        speech = union([(ln.start_s, ln.end_s) for ln in eps.of(sid, "impostor")])
-        admitted = [
-            (label, str(clusters[label].get("role")))
-            for label in sorted(records)
-            if clusters.get(label, {}).get("role") in (PRIMARY, FLAGGED)
-        ]
-        merged = _merged_into(speech, admitted, spans)
-        if own:
-            worst = max(own, key=lambda c: (c.get("role") == PRIMARY, _mean(c.get("median_sim"))))
+        if not holding:
             row.update(
-                diar_cluster=worst.get("diar_cluster"),
-                status=worst.get("role"),
-                median_sim=worst.get("median_sim"),
-                identified_by=BY_SEGMENTS,
-            )
-        elif merged is not None:
-            label, role = merged
-            row.update(
-                diar_cluster=label,
-                status=role,
-                median_sim=clusters[label].get("median_sim"),
-                identified_by=MERGED_MEDIAN,
-            )
-        else:
-            rest = [c for c in clusters.values() if c.get("role") not in (PRIMARY, FLAGGED)]
-            best = max(rest, key=lambda c: _mean(c.get("median_sim")), default=None)
-            row.update(
-                diar_cluster=None if best is None else best.get("diar_cluster"),
-                status=NOT_ADMITTED,
-                median_sim=None if best is None else best.get("median_sim"),
-                identified_by="none" if best is None else UPPER_BOUND,
-            )
-        row["stray_records"] = stray
+                diar_cluster=None, status=NONE, median_sim=None, impostor_s=0.0, cluster_s=None,
+                impostor_share=None, impostor_total_s=total, identified_by=NONE, stray=[],
+            )  # fmt: skip
+            rows.append(row)
+            continue
+        label = max(holding, key=lambda lb: (round(held[lb], 6), _CONCERN.get(roles[lb], 0)))
+        row.update(
+            diar_cluster=label,
+            status=roles[label],
+            median_sim=medians.get((sid, label)),
+            impostor_s=round(held[label], 3),
+            cluster_s=round(seconds[label], 3),
+            impostor_share=_ratio(held[label], seconds[label]),
+            impostor_total_s=total,
+            identified_by=BY_TURNS,
+            stray=[
+                {"diar_cluster": lb, "role": roles[lb], "impostor_s": round(held[lb], 3)}
+                for lb in holding
+                if lb != label
+            ],
+        )
         rows.append(row)
     return rows
 
 
-def _merged_into(
-    speech: Sequence[Interval],
-    admitted: Sequence[tuple[str, str]],
-    spans: Mapping[str, Sequence[Interval]],
-) -> tuple[str, str] | None:
-    """Return the label and role of the admitted cluster the impostor is merged into, or `None`.
-
-    `speech` is the impostor's speech in the episode, `admitted` the (label, role) of each
-    admitted cluster with records in it, and `spans` the spans of every record by label,
-    whichever speaker the record is given to. The impostor is merged when the clusters' records
-    together cover more than half of `speech`; the cluster named is the one covering the most,
-    primary before flagged on a tie.
-    """
-    every = [span for label, _ in admitted for span in spans[label]]
-    if not admitted or 2 * length(intersect(speech, union(every))) <= length(speech):
-        return None
-    covered = {label: length(intersect(speech, union(spans[label]))) for label, _ in admitted}
-    return max(admitted, key=lambda entry: (covered[entry[0]], entry[1] == PRIMARY))
-
-
 def impostor_cluster_lines(rows: Sequence[Mapping[str, object]]) -> list[str]:
-    """Return each episode's impostor cluster row as printed; a merged row shows `MERGED_MEDIAN`."""
+    """Return each episode's impostor cluster as printed: its seconds, share and median."""
     lines = []
     for row in rows:
-        by_role: Counter[str] = Counter()
-        for entry in row.get("stray_records") or []:  # type: ignore[union-attr]
-            by_role[str(entry["role"])] += int(entry["records"])
-        median = _table(row["median_sim"])
-        if row["identified_by"] == MERGED_MEDIAN:
-            found = f"{row['status']} ({MERGED_MEDIAN}), median {median}"
-        else:
-            found = f"{row['status']}, median {median} ({row['identified_by']})"
+        where = f"  {row['episode']} ({row['source_id']}) impostor cluster:"
+        total = f"impostor {_num(row['impostor_total_s'])} s in all"
+        if row["identified_by"] == NONE:
+            lines.append(f"{where} none, no turn meets an impostor line; {total}")
+            continue
+        stray = ", ".join(
+            f"{s['diar_cluster']} {s['role']} {_num(s['impostor_s'])} s"
+            for s in row.get("stray") or []  # type: ignore[union-attr]
+        )
         lines.append(
-            f"  {row['episode']} ({row['source_id']}) impostor cluster: {found}; stray impostor "
-            f"records in admitted clusters: {_table(dict(sorted(by_role.items())))}"
+            f"{where} {row['diar_cluster']} {row['status']}, {_num(row['impostor_s'])} of "
+            f"{_num(row['cluster_s'])} s impostor (share {_num(row['impostor_share'])}), median "
+            f"{_table(row['median_sim'])}; {total}; stray: {stray or 'none'}"
         )
     return lines
 
 
-def _mean(table: object) -> float:
-    if not isinstance(table, Mapping) or not table:
-        return -math.inf
-    values = [float(v) for v in table.values() if isinstance(v, int | float)]
-    return sum(values) / len(values) if values else -math.inf
+def flag_floor(rows: Sequence[Mapping[str, object]]) -> dict[str, float] | None:
+    """Return, per embedder, the anchor floor just under every named impostor cluster's median.
 
-
-def _median_max(rows: Sequence[Mapping[str, object]], identified_by: str) -> float | None:
-    """Return the highest mean median SIM of the rows identified one way, or `None`.
-
-    `impostor_median_max` takes the rows whose cluster the impostor's records identified; the
-    upper-bound rows go to their own entry, so a non-admitted episode's bound is never read as
-    the impostor's median. Merged rows (`MERGED_MEDIAN`) go to neither: they are counted by role
-    in `impostor_merged_episodes` instead.
+    For each episode whose impostor cluster the turn record named, its median less `FLAG_STEP`,
+    rounded down to 3 places; the floor is the minimum over those episodes. An anchor floor at
+    this value admits each of those clusters, so a run at it flags the impostor's cluster
+    rather than passing over it as another speaker. `None` when no episode's impostor cluster
+    was named.
     """
-    return max(
-        (
-            round(_mean(row.get("median_sim")), 3)
-            for row in rows
-            if row.get("identified_by") == identified_by and row.get("median_sim")
-        ),
-        default=None,
+    floors: dict[str, float] = {}
+    for row in rows:
+        median = row.get("median_sim")
+        if row.get("identified_by") != BY_TURNS or not isinstance(median, Mapping):
+            continue
+        for name, value in median.items():
+            # Rounding before the floor keeps float error (0.66 - 0.001 is 0.65899...) out of it.
+            floor = math.floor(round((float(value) - FLAG_STEP) * 1000.0, 6)) / 1000.0
+            floors[name] = min(floors.get(name, floor), floor)
+    return floors or None
+
+
+def _reaches(turn: TurnRecord, name: str, margin: float) -> bool:
+    # A judged turn with no rival had no margin applied, as in `retrieve.judge`.
+    if turn.gaps is None:
+        return True
+    gap = turn.gaps.get(name)
+    return gap is not None and gap >= margin - EPS
+
+
+def margin_share(
+    eps: Episodes, turns: Sequence[TurnRecord], speaker: str, margins: Mapping[str, float]
+) -> dict[str, float | None]:
+    """Return the share of one speaker's primary-cluster turns whose gap reaches the margin.
+
+    The turns counted are the embedded, judged turns of primary clusters that `speaker`'s lines
+    cover by half or more (`Episodes.who`). The share is given per embedder against that
+    embedder's margin, and as `both`, reaching every embedder's; `None` when no turn counts.
+    """
+    judged = [
+        t
+        for t in turns
+        if t.role == PRIMARY
+        and t.embedded
+        and t.sim_target is not None
+        and t.source_id in eps.lines
+        and eps.who(t) == speaker
+    ]
+    shares: dict[str, float | None] = {
+        name: _ratio(sum(_reaches(t, name, value) for t in judged), len(judged))
+        for name, value in margins.items()
+    }
+    shares["both"] = _ratio(
+        sum(all(_reaches(t, n, v) for n, v in margins.items()) for t in judged), len(judged)
     )
+    return shares
+
+
+def retrieval_summary(
+    clusters: Sequence[Mapping[str, object]],
+    eps: Episodes,
+    turns: Sequence[TurnRecord],
+    report: Mapping[str, object],
+) -> dict[str, object]:
+    """Return where the impostor's cluster fell at the retrieval values the run used.
+
+    The anchor floor, the anchor check and the margin are set per embedder by H20 on public
+    speakers, not by H6, so these are no gate entry. `thresholds` holds the run's six values
+    from its `report.json`, so a reader can check which values the rest was measured at;
+    `flag_floor` is what H6's floor-lowering step reads.
+    """
+    found = report.get("thresholds")
+    thresholds = {
+        str(k): float(v)
+        for k, v in sorted(found.items() if isinstance(found, Mapping) else [])
+        if str(k).startswith(RETRIEVAL_PREFIXES) and isinstance(v, int | float)
+    }
+    margins = {
+        k[len(MARGIN_PREFIX) :]: v for k, v in thresholds.items() if k.startswith(MARGIN_PREFIX)
+    }
+    statuses = Counter(str(c.get("status")) for c in clusters)
+    return {
+        "thresholds": thresholds,
+        "impostor_episodes": {status: statuses.get(status, 0) for status in STATUSES},
+        "flag_floor": flag_floor(clusters),
+        "target_margin_share": margin_share(eps, turns, "target", margins),
+        "impostor_margin_share": margin_share(eps, turns, "impostor", margins),
+    }
 
 
 def _sims(segs: Sequence[SegmentRecord]) -> dict[str, list[float]]:
@@ -477,7 +502,6 @@ def fallback_fc(build: object, eps: Episodes) -> dict[str, list[float]]:
 def gate_values(
     eps: Episodes,
     segments: Sequence[SegmentRecord],
-    clusters: Sequence[Mapping[str, object]],
     effects: Mapping[str, object] | None,
     h6_gates: Mapping[str, float],
     fallback: Mapping[str, Sequence[float]],
@@ -497,29 +521,6 @@ def gate_values(
         entry: dict[str, object] = {"default": default, "value": None}
         if key in NOT_MEASURED:
             entry["reason"] = NOT_MEASURED[key]
-        elif key == "anchors.sim_min":
-            if sims:
-                entry["value"] = round(min(percentile(v, 2) for v in sims.values()), 3)
-                entry["basis"] = (
-                    "p02 of the true target segments' SIM to the target centroid, lower embedder"
-                )
-            else:
-                entry["reason"] = "no kept segment is the target's"
-        elif key == "retrieval.anchor_floor":
-            entry["reason"] = (
-                "not calibrated: H6 keeps the anchor floor at its recorded value and lowers it "
-                "only to exercise the flagged path"
-            )
-            entry["impostor_median_max"] = _median_max(clusters, BY_SEGMENTS)
-            entry["non_admitted_median_upper_bound_max"] = _median_max(clusters, UPPER_BOUND)
-            entry["impostor_primary_episodes"] = sum(c.get("status") == PRIMARY for c in clusters)
-            merged = Counter(
-                str(c.get("status")) for c in clusters if c.get("identified_by") == MERGED_MEDIAN
-            )
-            entry["impostor_merged_episodes"] = dict(sorted(merged.items()))
-            entry["impostor_stray_records"] = sum(
-                int(s["records"]) for c in clusters for s in c.get("stray_records") or []  # type: ignore[union-attr]
-            )
         elif key in ("segment.snr_min_db", "segment.c50_min_db"):
             field = "snr_db" if key == "segment.snr_min_db" else "c50_db"
             values = [getattr(s, field) for s in true_fc if math.isfinite(getattr(s, field))]
@@ -625,6 +626,18 @@ def score_lines(score: Mapping[str, object]) -> list[str]:
             f"{_num(row['lines'])}; by reason: {_table(row['by_reason'])}"
         )
     lines += impostor_cluster_lines(score["impostor_clusters"])  # type: ignore[arg-type]
+    retrieval = score.get("retrieval")
+    if isinstance(retrieval, Mapping):
+        floor = retrieval.get("flag_floor")
+        lines.append(
+            f"  impostor clusters by status: {_table(retrieval.get('impostor_episodes'))}; flag "
+            f"floor: {_table(floor) if floor else 'none (no impostor cluster named)'}"
+        )
+        lines.append(
+            f"  primary-cluster turns reaching the margin: target "
+            f"{_table(retrieval.get('target_margin_share'))}; impostor "
+            f"{_table(retrieval.get('impostor_margin_share'))}"
+        )
     effects = score.get("effects") or {}
     comb = effects.get("comb") if isinstance(effects, Mapping) else None
     if isinstance(comb, Mapping):

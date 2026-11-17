@@ -27,7 +27,8 @@ FAMILIES_PATH = Path(__file__).with_name("families.json")
 REMOTE_MODULE = "scripts.voice_data.remote"
 # One `inspect` line per container: its name, then its device requests (`null` when it has none).
 INSPECT_FORMAT = "{{.Name}} {{json .HostConfig.DeviceRequests}}"
-NVIDIA_SMI = ("nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits")
+# The preflight's nvidia-smi arguments; nvidia-smi itself is the entrypoint (see `preflight`).
+NVIDIA_SMI_QUERY = ("--query-gpu=memory.free", "--format=csv,noheader,nounits")
 
 
 class PreflightError(VoiceDataError):
@@ -185,6 +186,8 @@ class LocalDocker:
 
         GPU users outside Docker are invisible here; the daily stack runs every GPU service in
         Docker. `allow` names containers that may keep their GPU (the bench's E4B server).
+        nvidia-smi runs as the entrypoint because a CUDA base image's own entrypoint prints its
+        banner to stdout first, and stdout must hold only one free-MiB line per GPU.
 
         Raises:
             PreflightError: A container outside `allow` holds a GPU, or free VRAM is below the
@@ -196,8 +199,9 @@ class LocalDocker:
             name = name.lstrip("/")
             if json.loads(requests or "null") and name not in allow:
                 raise PreflightError(f"refused: container {name} holds a GPU; stop it first")
-        smi = ["docker", "run", "--rm", "--network", "none", "--gpus", "all", job.image]
-        free_mib = max(int(v) for v in self._docker.capture([*smi, *NVIDIA_SMI]).split())
+        smi = ["docker", "run", "--rm", "--network", "none", "--gpus", "all"]
+        smi += ["--entrypoint", "nvidia-smi", job.image, *NVIDIA_SMI_QUERY]
+        free_mib = max(int(v) for v in self._docker.capture(smi).split())
         need_gb = float(self._family(job.family)["vram_gb"])  # type: ignore[arg-type]
         if free_mib / 1024 < need_gb:
             raise PreflightError(

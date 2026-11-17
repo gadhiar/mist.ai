@@ -1,20 +1,25 @@
 """Target-speaker retrieval on embeddings: the anchor check, both passes, the separator score.
 
-Design 4 in order. The anchors must agree. In each episode the diarized cluster nearest the
-anchor centroid is primary when it reaches the anchor floor on both embedders; every other
-cluster that reaches the floor is flagged, because a split by register and a similar-sounding
-cast member reach it alike. The target model is then built from primary turns only, so a flagged
+Design 4 in order. The anchor check reports whether the anchors agree, and the caller flags a set
+that does not; it never stops a run. In each episode the diarized cluster nearest the anchor
+centroid is primary when it reaches the anchor floor on both embedders; every other cluster that
+reaches the floor is flagged, because a split by register and a similar-sounding cast member
+reach it alike. The target model is then built from primary turns only, so a flagged
 cluster cannot pull the centroid, and a turn is kept when it beats every non-admitted cluster of
 its episode by the margin and reaches the floor of the target's leave-one-out distribution.
 
 An `Embedding` maps each embedder's name to one clip's vector, and every rule holds on all of
-them. SIMs equal up to rounding pass a floor: a voice whose clips embed identically must not be
-dropped by the last bit of a cosine.
+them. Each embedder has its own value for the anchor check, the anchor floor and the margin,
+because their cosines sit on different scales: one voice that scores near 0.88 on WavLM-SV can
+score near 0.50 on ECAPA, so one value for both would hold ECAPA to a bar set on WavLM-SV's
+scale. A value mapping that lacks an embedder the clips carry is refused rather than read as
+passing. SIMs equal up to rounding pass a floor: a voice whose clips embed identically must not
+be dropped by the last bit of a cosine.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -49,20 +54,34 @@ class TargetModel:
 
 @dataclass(frozen=True, slots=True)
 class Verdict:
-    """The second pass on one clip: whether it is kept, why not, its SIMs and its margin.
+    """The second pass on one clip: whether it is kept, why not, its SIMs, gaps and margin.
 
-    `margin` is the smallest, over embedders, of the clip's SIM to the target less its highest
-    SIM to a rival cluster; `None` when its episode has no rival.
+    `gaps` holds, per embedder, the clip's SIM to the target less its highest SIM to a rival
+    cluster, and `margin` is the smallest of them; both are `None` when its episode has no
+    rival. Each gap is kept because each embedder is held to its own margin value, so the
+    smallest alone cannot say which embedder failed or by how much.
     """
 
     passed: bool
     reasons: tuple[str, ...]
     sim: dict[str, float]
     margin: float | None
+    gaps: dict[str, float] | None
 
 
 def _names(embs: Sequence[Mapping[str, np.ndarray]]) -> list[str]:
     return list(embs[0]) if embs else []
+
+
+def _require(values: Mapping[str, float], names: Iterable[str], what: str) -> None:
+    """Refuse a value mapping that lacks one of the embedders compared.
+
+    Raises:
+        ValueError: `values` has no entry for one or more of `names`; the message names each.
+    """
+    missing = [name for name in names if name not in values]
+    if missing:
+        raise ValueError(f"{what} has no value for {', '.join(missing)}")
 
 
 def centroids(embs: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
@@ -82,21 +101,29 @@ def sims(emb: Mapping[str, np.ndarray], centre: Mapping[str, np.ndarray]) -> dic
 
 
 def anchor_check(
-    anchors: Sequence[Mapping[str, np.ndarray]], sim_min: float
+    anchors: Sequence[Mapping[str, np.ndarray]], sim_min: Mapping[str, float]
 ) -> tuple[bool, list[dict[str, float]]]:
     """Check that the anchors agree: each one's SIM to the centroid of the others.
 
+    Args:
+        anchors: Each anchor's embedding.
+        sim_min: Each embedder's value of the Anchors gate.
+
     Returns:
-        Whether every anchor reaches `sim_min` on every embedder, and each anchor's SIMs. A
-        single anchor has no others, so it passes with no SIM.
+        Whether every anchor reaches its embedder's `sim_min` on every embedder, and each
+        anchor's SIMs. A single anchor has no others, so it passes with no SIM.
+
+    Raises:
+        ValueError: `sim_min` lacks an embedder the anchors carry.
     """
+    _require(sim_min, _names(anchors), "the anchor check")
     if len(anchors) < 2:
         return True, [{} for _ in anchors]
     found = []
     for i, anchor in enumerate(anchors):
         others = [a for j, a in enumerate(anchors) if j != i]
         found.append(sims(anchor, centroids(others)))
-    ok = all(value >= sim_min - EPS for row in found for value in row.values())
+    ok = all(value >= sim_min[name] - EPS for row in found for name, value in row.items())
     return ok, found
 
 
@@ -107,37 +134,80 @@ def _by_label(turns: Sequence[tuple[str, Embedding]]) -> dict[str, list[Embeddin
     return dict(sorted(grouped.items()))
 
 
-def cluster_roles(
-    turns: Sequence[tuple[str, Embedding]], anchor_centroid: Mapping[str, np.ndarray], floor: float
-) -> dict[str, ClusterRole]:
-    """The first pass: each cluster of one episode is `primary`, `flagged` or `other`.
-
-    A cluster reaches the floor when its median SIM to the anchor centroid does on every
-    embedder. Of those, the one with the highest mean of its medians is primary (ties to the
-    cluster with more turns, then the first label); the rest are flagged.
-
-    Args:
-        turns: Each turn's diarizer label and embedding.
-        anchor_centroid: The anchors' centroid on each embedder.
-        floor: The anchor floor.
-    """
+def _medians(
+    turns: Sequence[tuple[str, Embedding]], centre: Mapping[str, np.ndarray]
+) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
+    """Return each cluster's median SIM to `centre` per embedder, and its turn count."""
     medians: dict[str, dict[str, float]] = {}
     counts: dict[str, int] = {}
     for label, embs in _by_label(turns).items():
         counts[label] = len(embs)
         medians[label] = {
-            name: float(np.median([cosine(e[name], centre) for e in embs]))
-            for name, centre in anchor_centroid.items()
+            name: float(np.median([cosine(e[name], vector) for e in embs]))
+            for name, vector in centre.items()
         }
+    return medians, counts
+
+
+def _first(
+    labels: Sequence[str], medians: Mapping[str, Mapping[str, float]], counts: Mapping[str, int]
+) -> str | None:
+    """Rank `labels` by the mean of their medians, ties to more turns and then the first label."""
+    if not labels:
+        return None
+    means = {lb: float(np.mean(list(medians[lb].values()))) for lb in labels}
+    best = max(means.values())
+    tied = [lb for lb in labels if means[lb] >= best - EPS]
+    return min(tied, key=lambda lb: (-counts[lb], lb))
+
+
+def best_cluster(
+    turns: Sequence[tuple[str, Embedding]], centre: Mapping[str, np.ndarray]
+) -> str | None:
+    """Return the cluster `cluster_roles` would make primary if no floor applied.
+
+    The separator choice takes it as the provisional target cluster, ranked against a
+    candidate's reference (the solo clips, or the candidate's own timestamp anchors). It has no
+    floor because the floors are calibrated against the centroid of a full anchor set, so
+    against a reference of fewer anchors a floored cluster would often be missing.
+
+    Returns:
+        The label, or `None` with no turn.
+    """
+    medians, counts = _medians(turns, centre)
+    return _first(list(medians), medians, counts)
+
+
+def cluster_roles(
+    turns: Sequence[tuple[str, Embedding]],
+    anchor_centroid: Mapping[str, np.ndarray],
+    floor: Mapping[str, float],
+) -> dict[str, ClusterRole]:
+    """The first pass: each cluster of one episode is `primary`, `flagged` or `other`.
+
+    A cluster reaches the floor when its median SIM to the anchor centroid reaches that
+    embedder's floor on every embedder. Of those, the one with the highest mean of its medians
+    is primary (ties to the cluster with more turns, then the first label); the rest are
+    flagged. The mean of the raw medians is kept rather than a headroom over each floor: the
+    floors are fixed for the run, so their mean is one constant, and ranking by the mean of the
+    medians gives the same order as ranking by the mean headroom over the floors.
+
+    Args:
+        turns: Each turn's diarizer label and embedding.
+        anchor_centroid: The anchors' centroid on each embedder.
+        floor: Each embedder's anchor floor.
+
+    Raises:
+        ValueError: `floor` lacks an embedder of the anchor centroid.
+    """
+    _require(floor, anchor_centroid, "the anchor floor")
+    medians, counts = _medians(turns, anchor_centroid)
     reaching = [
-        label for label, row in medians.items() if all(v >= floor - EPS for v in row.values())
+        label
+        for label, row in medians.items()
+        if all(v >= floor[name] - EPS for name, v in row.items())
     ]
-    primary = None
-    if reaching:
-        means = {lb: float(np.mean(list(medians[lb].values()))) for lb in reaching}
-        best = max(means.values())
-        tied = [lb for lb in reaching if means[lb] >= best - EPS]
-        primary = min(tied, key=lambda lb: (-counts[lb], lb))
+    primary = _first(reaching, medians, counts)
     roles = {}
     for label, row in medians.items():
         role = PRIMARY if label == primary else FLAGGED if label in reaching else OTHER
@@ -189,27 +259,32 @@ def judge(
     emb: Mapping[str, np.ndarray],
     model: TargetModel,
     rivals: Mapping[str, Mapping[str, np.ndarray]],
-    margin_min: float,
+    margin_min: Mapping[str, float],
 ) -> Verdict:
     """The second pass on one clip: the floor and the margin over every rival, per embedder.
 
     Reasons are `floor:<embedder>` for each embedder below the floor, then `margin:<embedder>`
-    for each where some rival comes within `margin_min`.
+    for each where some rival comes within that embedder's `margin_min`.
+
+    Raises:
+        ValueError: `margin_min` lacks an embedder of the target model.
     """
+    _require(margin_min, model.centroid, "the margin")
     sim = sims(emb, model.centroid)
     floors = [f"floor:{name}" for name in sim if not sim[name] >= model.floor[name] - EPS]
     margins: list[str] = []
     margin = None
+    gaps: dict[str, float] | None = None
     if rivals:
         gaps = {}
         for name in sim:
             nearest = max(cosine(emb[name], rival[name]) for rival in rivals.values())
             gaps[name] = sim[name] - nearest
-            if not gaps[name] >= margin_min - EPS:
+            if not gaps[name] >= margin_min[name] - EPS:
                 margins.append(f"margin:{name}")
         margin = min(gaps.values())
     reasons = tuple(floors + margins)
-    return Verdict(passed=not reasons, reasons=reasons, sim=sim, margin=margin)
+    return Verdict(passed=not reasons, reasons=reasons, sim=sim, margin=margin, gaps=gaps)
 
 
 def candidate_score(

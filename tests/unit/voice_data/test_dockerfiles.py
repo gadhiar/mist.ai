@@ -208,7 +208,7 @@ REQUIREMENTS = sorted(p.name for p in DOCKER_DIR.glob("requirements-*.txt"))
 
 
 def test_requirements_files_exist() -> None:
-    assert len(REQUIREMENTS) == 13
+    assert len(REQUIREMENTS) == 14
 
 
 @pytest.mark.parametrize("name", REQUIREMENTS)
@@ -353,20 +353,129 @@ def test_extract_import_check_loads_tiger_and_sidon_from_their_clones() -> None:
     # the clones on sys.path itself. TIGER's look2hear.layers imports torch_complex and
     # typeguard's check_argument_types, which typeguard 2.x provides; without the two pins the
     # import finds setuptools' vendored typeguard 4, which lacks it.
-    final = instructions(DOCKER_DIR / "extract.Dockerfile")[-1]
-    check = re.match(r"RUN /opt/venv-extract/bin/python -I -c '([^']*)'", final)
-    assert check, final
-    prefix = (
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    prefix = ast.parse(
         'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER",'
-        ' "/opt/mist-voice/upstream/Sidon/src"]; import '
+        ' "/opt/mist-voice/upstream/Sidon/src"]'
     )
-    code = check.group(1)
-    assert code.startswith(prefix), code
-    modules = {module.strip() for module in code.removeprefix(prefix).split(",")}
+    # The clones go on sys.path in the first two statements, before anything is imported.
+    assert [ast.unparse(node) for node in check.body[:2]] == [
+        ast.unparse(node) for node in prefix.body
+    ]
+    modules = imported_modules(ast.Module(body=check.body[2:], type_ignores=[]))
     assert {"look2hear.models", "sidon.cleansing", "scripts.voice_data"} <= modules
     pins = pinned_versions("requirements-extract.txt")
     assert "torch-complex" in pins
     assert SpecifierSet("<3").contains(pins.get("typeguard", "3")), pins.get("typeguard")
+
+
+CRISPER_CT2_REQUIREMENTS = "/opt/mist-voice/requirements/requirements-extract-ct2.txt"
+# crisperwhisper's engine.py `_REQUIRED_FORK_APIS`, checked with hasattr on ctranslate2's Whisper.
+CRISPER_FORK_APIS = (
+    "prefill",
+    "forward_step",
+    "set_alignment_heads",
+    "generate_greedy_with_attention",
+)
+
+
+def test_extract_ct2_file_pins_the_crisperwhisper_fork() -> None:
+    # crisperwhisper 2.1.0 declares the fork only in its `ct2` extra
+    # (pypi.org/pypi/crisperwhisper/2.1.0/json: ctranslate2-crisperwhisper<5,>=4.7.1.post4), so
+    # requirements-extract.txt alone installed upstream ctranslate2 4.9.0, which lacks its APIs.
+    pins = pinned_versions("requirements-extract-ct2.txt")
+    assert pins == {"ctranslate2-crisperwhisper": "4.7.1.post4"}
+    assert SpecifierSet("<5,>=4.7.1.post4").contains(pins["ctranslate2-crisperwhisper"])
+
+
+def test_extract_installs_the_crisperwhisper_fork_over_upstream_ctranslate2() -> None:
+    # The fork ships the same `ctranslate2` module as upstream. `--no-deps --force-reinstall`
+    # after the venv step overwrites that module and leaves upstream's record, which meets
+    # faster-whisper's and whisperx's ctranslate2 bounds, so the venv layer stays cached.
+    steps = instructions(DOCKER_DIR / "extract.Dockerfile")
+    [venv] = [
+        i
+        for i, s in enumerate(steps)
+        if "/opt/venv-extract/bin/pip install" in s
+        and "/opt/mist-voice/requirements/requirements-extract.txt" in s
+    ]
+    pth = steps.index(
+        "RUN printf '%s\\n' /opt/mist-voice/code > "
+        "/opt/venv-extract/lib/python3.11/site-packages/mist-voice-code.pth"
+    )
+    assert venv < pth
+    assert steps[pth + 1 : pth + 3] == [
+        f"COPY docker/voice-data/requirements-extract-ct2.txt {CRISPER_CT2_REQUIREMENTS}",
+        "RUN /opt/venv-extract/bin/pip install --no-cache-dir --no-deps --force-reinstall"
+        f" -r {CRISPER_CT2_REQUIREMENTS}",
+    ]
+    assert [s for s in steps if "requirements-extract-ct2.txt" in s] == steps[pth + 1 : pth + 3]
+
+
+def test_extract_import_check_asserts_the_crisperwhisper_fork_apis() -> None:
+    # CrisperWhisper raises ImportError at load when the installed ctranslate2 lacks these, so
+    # the image build asserts them and fails rather than the clean stage.
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    assert "ctranslate2" in imported_modules(check)
+    names = ", ".join(f'"{name}"' for name in CRISPER_FORK_APIS)
+    expected = f"all(hasattr(ctranslate2.models.Whisper, name) for name in ({names}))"
+    assert ast.unparse(ast.parse(expected, mode="eval").body) in asserted_expressions(check)
+
+
+NLTK_DATA_REPO = "https://github.com/nltk/nltk_data"
+# The last nltk_data commit that changed packages/tokenizers/punkt_tab.zip ("Add Malayalam to
+# punkt_tab", 2025-02-17).
+NLTK_DATA_COMMIT = "4f15a3d89eefe9748ec1c05be495d91289197155"
+PUNKT_TAB_ZIP = "packages/tokenizers/punkt_tab.zip"
+NLTK_TOKENIZERS_DIR = "/usr/local/share/nltk_data/tokenizers"
+
+
+def punkt_tab_step() -> tuple[int, list[str], str]:
+    """Return the extract Dockerfile's punkt_tab step: its index, its commands and its clone."""
+    steps = instructions(DOCKER_DIR / "extract.Dockerfile")
+    [index] = [i for i, s in enumerate(steps) if NLTK_DATA_REPO in s]
+    step = steps[index]
+    assert step.startswith("RUN "), step
+    commands = [c.strip() for c in step.removeprefix("RUN ").split(" && ")]
+    clone = re.fullmatch(
+        rf"git clone --filter=blob:none --no-checkout {re.escape(NLTK_DATA_REPO)} (/\S+)",
+        commands[0],
+    )
+    assert clone, commands[0]
+    return index, commands, clone.group(1)
+
+
+def test_extract_clones_nltk_data_at_the_pinned_commit_for_punkt_tab_only() -> None:
+    # WhisperX's alignment loads NLTK's punkt_tab, and its fallback `nltk.download` cannot reach
+    # the network in a `--network none` job, so the image carries it. The sparse, blobless clone
+    # fetches the commits and trees of the ~1 GB repository but only the one zip's blob, at a
+    # pinned commit.
+    _, commands, clone = punkt_tab_step()
+    assert commands[1:3] == [
+        f"git -C {clone} sparse-checkout set --no-cone {PUNKT_TAB_ZIP}",
+        f"git -C {clone} checkout --detach {NLTK_DATA_COMMIT}",
+    ]
+    assert commands[-1] == f"rm -rf {clone}"
+    # The step clones nothing else, so the other upstream clones stay in their own layer.
+    assert sum(c.startswith("git clone ") for c in commands) == 1
+
+
+def test_extract_unpacks_punkt_tab_into_the_default_nltk_path_before_the_sha() -> None:
+    # /usr/local/share/nltk_data is on NLTK's default search path, so no NLTK_DATA is needed.
+    # The step comes before `ARG GIT_SHA`, so a new commit keeps it cached.
+    index, commands, clone = punkt_tab_step()
+    [unpack] = [c for c in commands if "zipfile" in c]
+    assert commands.index(unpack) == len(commands) - 2
+    words = unpack.split()
+    assert words[:3] == ["python3.11", "-I", "-c"]
+    assert words[-2:] == [f"{clone}/{PUNKT_TAB_ZIP}", NLTK_TOKENIZERS_DIR]
+    code = re.fullmatch(r"python3\.11 -I -c '([^']*)' \S+ \S+", unpack)
+    assert code, unpack
+    tree = ast.parse(code.group(1))
+    calls = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    assert "zipfile.ZipFile(sys.argv[1]).extractall" in calls, calls
+    steps = instructions(DOCKER_DIR / "extract.Dockerfile")
+    assert index < steps.index("ARG GIT_SHA")
 
 
 def import_check(dockerfile: str, venv: str) -> ast.Module:
@@ -384,6 +493,16 @@ def imported_modules(check: ast.Module) -> set[str]:
         if isinstance(node, ast.Import)
         for alias in node.names
     }
+
+
+def test_extract_import_check_finds_punkt_tab() -> None:
+    # nltk.data.find raises LookupError when punkt_tab is missing, so the image build fails
+    # rather than the clean stage's alignment.
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    assert "nltk" in imported_modules(check)
+    calls = {ast.unparse(node) for node in ast.walk(check) if isinstance(node, ast.Call)}
+    expected = ast.parse('nltk.data.find("tokenizers/punkt_tab/english/")', mode="eval").body
+    assert ast.unparse(expected) in calls, calls
 
 
 def test_extract_venv_loads_ecapa_at_the_score_pin() -> None:

@@ -9,15 +9,23 @@ The order is Design 4's:
 
 1. Every anchor is 3-30 s. The solo clips are read as they are.
 2. Per source, the centre channel (or the downmix when the layout has none) goes through every
-   separator candidate, `none` included. Each candidate is scored by the median SIM of its 50
-   best 3 s VAD speech windows to the solo clips, else to its own timestamp anchors, cut from its
-   own output; the best is kept and the downmix goes through it too.
-3. The anchors must agree, timestamp anchors cut from their source's chosen output; else the run
-   stops with the result `anchors-disagree` (the host exits 3). When `seed/sdh/` is mounted, the
-   SDH spans `stages/sdh.py` holds as anchors are cut the same way and checked against the
-   centroid of these anchors: one below the Anchors gate on either embedder is dropped and
-   counted, and the rest join the anchor centroid that retrieval uses. They never enter the
-   agreement check, so they can neither cause nor mask `anchors-disagree`.
+   separator candidate, `none` included. Each candidate's reference is the solo clips, else its
+   own timestamp anchors cut from its own output. The median SIM of its 50 best 3 s VAD speech
+   windows to that reference gives a provisional choice, whose output is diarized and embedded.
+   The provisional target cluster is the one nearest its reference, with no floor; its embedded
+   turns that touch no overlap are the spans. Each candidate is scored again by the median SIM
+   of its own cuts of every span, and the best is kept; with no span, or no reference for the
+   provisional candidate, the window scores decide. The chosen output is diarized again only
+   when it is not the provisional one, and the downmix goes through it too.
+3. The anchors are checked for agreement, timestamp anchors cut from their source's chosen
+   output. The check reports and never refuses (Raj, 16 Nov): its result is `anchors_agree` in
+   `extract-result.json` and `anchors.agree` in `report.json`, and the run goes on with the
+   anchors as they are, so the host flags a set that disagrees and still exits 0. When
+   `seed/sdh/` is mounted, the SDH spans `stages/sdh.py` holds as anchors are cut the same way
+   and checked against the centroid of these anchors: one below that embedder's Anchors value on
+   either embedder (each embedder has its own, since their cosines sit on different scales) is
+   dropped and counted, and the rest join the anchor centroid that retrieval uses. They never
+   enter the agreement check, so they can neither cause nor mask a disagreement.
 4. Diarization on the separated centre channel; the first retrieval pass names each episode's
    primary and flagged clusters; the target model and the 1.5 s window model are built from
    primary turns that touch no overlap.
@@ -29,7 +37,9 @@ The order is Design 4's:
    check; a centre-channel cut failing SNR, C50 or the window check is retried from the downmix
    (`fc-failed:<gate>`). Every drop is a record with its reasons.
 7. States are proposed for kept segments, and `report.json` is written with the keys the seed
-   gate reads.
+   gate reads. `turns.jsonl` records every diarized turn, whatever its cluster's role, with the
+   SIMs and per-embedder gaps retrieval measured on it, so a scorer can tell which cluster held
+   which speaker.
 
 Models come from `load_models`, which T11's bindings serve; tests pass fakes through it.
 """
@@ -74,6 +84,9 @@ FC = "FC"
 DOWNMIX = "downmix"
 CHOICE_WINDOW_S = 3.0
 CHOICE_BEST_N = 50
+# How a source's separator was chosen: on the provisional target turns, or on the best windows.
+BASIS_TURNS = "turns"
+BASIS_WINDOWS = "windows"
 # A turn shorter than this is too short to embed; it is recorded as a length drop.
 MIN_EMBED_S = 0.5
 AUDIO_SUBTYPE = "PCM_24"
@@ -133,13 +146,17 @@ def load_models(device: str) -> Models:
 
 @dataclass(frozen=True, slots=True)
 class Limits:
-    """The gate values the run uses, from the plan's effective thresholds."""
+    """The gate values the run uses, from the plan's effective thresholds.
+
+    The anchor check, the anchor floor and the margin hold one value per embedder name, since
+    the embedders' cosines sit on different scales.
+    """
 
     anchor_min_s: float
     anchor_max_s: float
-    anchor_sim_min: float
-    anchor_floor: float
-    margin: float
+    anchor_sim_min: dict[str, float]
+    anchor_floor: dict[str, float]
+    margin: dict[str, float]
     loo_percentile: float
     min_s: float
     max_s: float
@@ -153,18 +170,25 @@ class Limits:
     purity_percentile: float
 
     @classmethod
-    def from_thresholds(cls, values: Mapping[str, float]) -> Limits:
-        """Read the gate keys the stage uses.
+    def from_thresholds(cls, values: Mapping[str, float], embedders: Sequence[str]) -> Limits:
+        """Read the gate keys the stage uses; per-embedder gates as `<key>.<embedder name>`.
+
+        Args:
+            values: The plan's effective thresholds.
+            embedders: The names of the run's embedders.
 
         Raises:
-            StageError: A key is missing.
+            StageError: A key is missing; the message names every missing key.
         """
+        # Each prefix takes an embedder name: `retrieval.margin.ecapa`.
+        per_embedder = {
+            "anchor_sim_min": "anchors.sim_min.",
+            "anchor_floor": "retrieval.anchor_floor.",
+            "margin": "retrieval.margin.",
+        }
         keys = {
             "anchor_min_s": "anchors.min_s",
             "anchor_max_s": "anchors.max_s",
-            "anchor_sim_min": "anchors.sim_min",
-            "anchor_floor": "retrieval.anchor_floor",
-            "margin": "retrieval.margin",
             "loo_percentile": "retrieval.loo_percentile",
             "min_s": "segment.min_s",
             "max_s": "segment.max_s",
@@ -177,10 +201,17 @@ class Limits:
             "window_percentile": "segment.window_percentile",
             "purity_percentile": "seed.purity_percentile",
         }
-        missing = [gate for gate in keys.values() if gate not in values]
+        wanted = list(keys.values())
+        wanted += [f"{prefix}{e}" for prefix in per_embedder.values() for e in embedders]
+        missing = [gate for gate in wanted if gate not in values]
         if missing:
             raise StageError(f"the plan's thresholds lack {', '.join(missing)}")
-        return cls(**{name: float(values[gate]) for name, gate in keys.items()})
+        scalars = {name: float(values[gate]) for name, gate in keys.items()}
+        per = {
+            name: {e: float(values[f"{prefix}{e}"]) for e in embedders}
+            for name, prefix in per_embedder.items()
+        }
+        return cls(**scalars, **per)
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +232,13 @@ class SourceWork:
 
     source: Source
     separator: str
+    # The scores that decided, and the 50-best-window scores (the same when `basis` is windows).
     scores: dict[str, float | None]
+    window_scores: dict[str, float | None]
+    provisional: str
+    basis: str
+    spans: int
+    rediarized: bool
     scratch: dict[str, Path]
     turns: list[Turn]
     turn_embs: list[retrieve.Embedding | None]
@@ -438,6 +475,142 @@ def candidate_scores(
     return scores
 
 
+def span_scores(
+    outputs: Mapping[str, np.ndarray],
+    rate: int,
+    models: Models,
+    references: Mapping[str, Mapping[str, np.ndarray] | None],
+    spans: Sequence[Span],
+) -> dict[str, float | None]:
+    """Score each candidate on its own cuts of `spans`: the median SIM over every span.
+
+    `best_n` is the span count, so no span is left out. A candidate with no reference, or no
+    span to cut, scores `None`.
+    """
+    scores: dict[str, float | None] = {}
+    for name, output in outputs.items():
+        reference = references.get(name)
+        if reference is None:
+            scores[name] = None
+            continue
+        embs = [embed(models.embedders, cut(output, rate, span), rate) for span in spans]
+        scores[name] = retrieve.candidate_score(embs, reference, len(spans))
+    return scores
+
+
+@dataclass(frozen=True, slots=True)
+class Diarized:
+    """One output's diarization: its turns by start, its overlaps, and each turn's embedding.
+
+    A turn shorter than `MIN_EMBED_S` has no embedding.
+    """
+
+    turns: list[Turn]
+    overlaps: list[Span]
+    turn_embs: list[retrieve.Embedding | None]
+
+    def labelled(self) -> list[tuple[str, retrieve.Embedding]]:
+        """Each embedded turn's diarizer label and embedding."""
+        return [
+            (t.speaker, e) for t, e in zip(self.turns, self.turn_embs, strict=True) if e is not None
+        ]
+
+
+def diarize(audio: np.ndarray, rate: int, models: Models) -> Diarized:
+    """Diarize one output and embed each turn long enough to embed."""
+    turns = sorted(models.diarizer.turns(audio, rate), key=lambda t: t.start_s)
+    overlaps = list(models.diarizer.overlaps(audio, rate))
+    turn_embs = [
+        (
+            embed(models.embedders, cut(audio, rate, Span(t.start_s, t.end_s)), rate)
+            if t.end_s - t.start_s >= MIN_EMBED_S
+            else None
+        )
+        for t in turns
+    ]
+    return Diarized(turns=turns, overlaps=overlaps, turn_embs=turn_embs)
+
+
+@dataclass(frozen=True, slots=True)
+class SeparatorChoice:
+    """The separator a source keeps, how it was chosen, and the chosen output's diarization.
+
+    `basis` is `turns` when the candidates were scored on the provisional target cluster's
+    spans and `windows` when the window scores decided; `scores` are the scores that decided.
+    """
+
+    separator: str
+    provisional: str
+    basis: str
+    scores: dict[str, float | None]
+    window_scores: dict[str, float | None]
+    spans: int
+    rediarized: bool
+    diarized: Diarized
+
+
+def separator_choice(
+    outputs: Mapping[str, np.ndarray],
+    rate: int,
+    models: Models,
+    references: Mapping[str, Mapping[str, np.ndarray] | None],
+) -> SeparatorChoice:
+    """Choose a source's separator on the provisional target cluster's turns.
+
+    The window scores give a provisional choice, whose output is diarized. Its target cluster,
+    ranked against its reference with no floor (`retrieve.best_cluster`), gives the spans: that
+    cluster's embedded turns that touch no overlap. The best 50 windows can be another speaker's
+    when the target speaks little, while these spans are the target's wherever the provisional
+    cluster is. Each candidate is scored on its own cuts of the spans; the provisional
+    candidate's cuts are its turn embeddings already. With no span, or no reference for the
+    provisional candidate, the window scores decide. The chosen output is diarized again only
+    when the choice differs from the provisional one.
+    """
+    window_scores = candidate_scores(outputs, rate, models, references)
+    provisional = retrieve.choose_separator(window_scores)
+    diarized = diarize(outputs[provisional], rate, models)
+    reference = references.get(provisional)
+    picked: list[tuple[Span, retrieve.Embedding]] = []
+    if reference is not None:
+        label = retrieve.best_cluster(diarized.labelled(), reference)
+        for turn, emb in zip(diarized.turns, diarized.turn_embs, strict=True):
+            span = Span(turn.start_s, turn.end_s)
+            if (
+                emb is not None
+                and turn.speaker == label
+                and not segments.intersects(span, diarized.overlaps)
+            ):
+                picked.append((span, emb))
+    if reference is None or not picked:
+        return SeparatorChoice(
+            separator=provisional,
+            provisional=provisional,
+            basis=BASIS_WINDOWS,
+            scores=window_scores,
+            window_scores=window_scores,
+            spans=0,
+            rediarized=False,
+            diarized=diarized,
+        )
+    spans = [span for span, _ in picked]
+    others = {name: output for name, output in outputs.items() if name != provisional}
+    found = span_scores(others, rate, models, references, spans)
+    own = retrieve.candidate_score([emb for _, emb in picked], reference, len(spans))
+    scores = {name: own if name == provisional else found[name] for name in outputs}
+    chosen = retrieve.choose_separator(scores)
+    rediarized = chosen != provisional
+    return SeparatorChoice(
+        separator=chosen,
+        provisional=provisional,
+        basis=BASIS_TURNS,
+        scores=scores,
+        window_scores=window_scores,
+        spans=len(spans),
+        rediarized=rediarized,
+        diarized=diarize(outputs[chosen], rate, models) if rediarized else diarized,
+    )
+
+
 # The stage.
 
 
@@ -453,7 +626,7 @@ class Extraction:
         self.models = models
         self.plan = _read_plan(data, run_id)
         self.thresholds = {str(k): float(v) for k, v in self.plan["thresholds"].items()}  # type: ignore[attr-defined]
-        self.limits = Limits.from_thresholds(self.thresholds)
+        self.limits = Limits.from_thresholds(self.thresholds, [e.name for e in models.embedders])
         self.sources = _sources(self.plan)
         self.by_id = {s.source_id: s for s in self.sources}
         self.anchors = _timestamp_anchors(self.plan, set(self.by_id))
@@ -515,8 +688,8 @@ class Extraction:
         rate = source.sample_rate
         primary = decode(self.data, source, source.primary_channel)
         outputs = separate(primary, rate, self.models.separators)
-        scores = candidate_scores(outputs, rate, self.models, references)
-        chosen = retrieve.choose_separator(scores)
+        choice = separator_choice(outputs, rate, self.models, references)
+        chosen = choice.separator
         channels = {source.primary_channel: outputs[chosen]}
         del outputs, primary
         if source.primary_channel == FC:
@@ -527,18 +700,10 @@ class Extraction:
         main = channels[source.primary_channel]
         anchors = self._anchor_cuts(source.source_id, main, rate)
         sdh_embs = self._sdh_cuts(source.source_id, main, rate)
-        turns = sorted(self.models.diarizer.turns(main, rate), key=lambda t: t.start_s)
-        overlaps = list(self.models.diarizer.overlaps(main, rate))
+        turns, overlaps = choice.diarized.turns, choice.diarized.overlaps
+        turn_embs = choice.diarized.turn_embs
         speech = {name: list(self.models.vad.speech(a, rate)) for name, a in channels.items()}
         quality = {name: self.models.quality.frames(a, rate) for name, a in channels.items()}
-        turn_embs = [
-            (
-                self._embed(cut(main, rate, Span(t.start_s, t.end_s)), rate)
-                if t.end_s - t.start_s >= MIN_EMBED_S
-                else None
-            )
-            for t in turns
-        ]
         offcentre: list[Span] = []
         if DOWNMIX in channels and source.primary_channel == FC:
             offcentre = [
@@ -551,14 +716,21 @@ class Extraction:
         for name, audio in channels.items():
             paths[name] = scratch / f"{source.source_id}-{name}.npy"
             np.save(paths[name], audio)
+        again = "diarized again" if choice.rediarized else "diarized once"
         print(
-            f"extract: {source.source_id} separator {chosen}, {len(turns)} turns, "
+            f"extract: {source.source_id} separator {chosen} (provisional {choice.provisional}, "
+            f"basis {choice.basis}, {choice.spans} turns scored, {again}), {len(turns)} turns, "
             f"{len(overlaps)} overlaps, {len(offcentre)} off-centre spans"
         )
         work = SourceWork(
             source=source,
             separator=chosen,
-            scores=scores,
+            scores=choice.scores,
+            window_scores=choice.window_scores,
+            provisional=choice.provisional,
+            basis=choice.basis,
+            spans=choice.spans,
+            rediarized=choice.rediarized,
             scratch=paths,
             turns=turns,
             turn_embs=turn_embs,
@@ -590,12 +762,17 @@ class Extraction:
         """Return the anchor centroid retrieval uses, and the SDH counts for the report.
 
         Each SDH anchor's SIM is taken to the centroid of Raj's anchors alone, his ground truth;
-        one below the Anchors gate on either embedder is dropped.
+        one below that embedder's Anchors value on either embedder is dropped.
         """
         own = retrieve.centroids(anchors)
         if not self.sdh:
             return own, None
-        floor = self.limits.anchor_sim_min - retrieve.EPS
+        sim_min = self.limits.anchor_sim_min
+
+        def reaches(emb: retrieve.Embedding) -> bool:
+            found = retrieve.sims(emb, own)
+            return all(v >= sim_min[name] - retrieve.EPS for name, v in found.items())
+
         joined: list[retrieve.Embedding] = []
         dropped = dropped_offscreen = 0
         for work in works:
@@ -603,7 +780,7 @@ class Extraction:
             if spans is None:
                 continue
             for span, emb in zip(spans.anchors, work.sdh_embs, strict=True):
-                if emb is not None and all(v >= floor for v in retrieve.sims(emb, own).values()):
+                if emb is not None and reaches(emb):
                     joined.append(emb)
                 else:
                     dropped += 1
@@ -683,9 +860,10 @@ class Extraction:
                 anchor_embs.update(cuts)
             anchors = clip_embs + [anchor_embs[i] for i in sorted(anchor_embs)]
             agree, anchor_sims = retrieve.anchor_check(anchors, self.limits.anchor_sim_min)
-            detail = {"anchors": self._anchor_rows(anchor_sims)}
-            if not agree:
-                return self._result("anchors-disagree", detail, written)
+            detail: dict[str, object] = {
+                "anchors": self._anchor_rows(anchor_sims),
+                "anchors_agree": agree,
+            }
             centroid, sdh_counts = self._sdh_anchors(works, anchors)
             if sdh_counts is not None:
                 detail["sdh"] = sdh_counts
@@ -730,16 +908,19 @@ class Extraction:
             drafts.extend(sorted(source_drafts, key=lambda d: (d.span.start_s, d.span.end_s)))
         records, proposals = self._records(drafts, audio_dir, written)
         report = self._report(works, records, drafts, model, windows, detail)
+        turns = turn_records(works, anchor_centroid, model, self.limits.margin)
         run_rel = contract.run_rel(self.run_id)
         seg_rel = f"{run_rel}/{contract.SEGMENTS_NAME}"
         _write_text(self.data / seg_rel, "".join(json.dumps(r.to_json()) + "\n" for r in records))
+        turns_rel = f"{run_rel}/{contract.TURNS_NAME}"
+        _write_text(self.data / turns_rel, "".join(json.dumps(t.to_json()) + "\n" for t in turns))
         prop_rel = f"{run_rel}/{contract.PROPOSALS_NAME}"
         _write_text(self.data / prop_rel, "".join(json.dumps(p) + "\n" for p in proposals))
         report_rel = f"{run_rel}/{contract.REPORT_NAME}"
         _write_json(self.data / report_rel, report)
         kept = sum(r.kept for r in records)
-        print(f"extract: {len(records)} segments, {kept} kept")
-        return self._result("ok", detail, [*written, seg_rel, prop_rel, report_rel])
+        print(f"extract: {len(records)} segments, {kept} kept, {len(turns)} turns recorded")
+        return self._result("ok", detail, [*written, seg_rel, turns_rel, prop_rel, report_rel])
 
     # The second pass and the segment gates.
 
@@ -781,7 +962,8 @@ class Extraction:
         primary = work.source.primary_channel
         for turn, emb in zip(work.turns, work.turn_embs, strict=True):
             # Turns of clusters not admitted are other speakers, not candidates, so they leave no
-            # record; a turn too short to embed is a candidate when its cluster is admitted.
+            # segment record (`turn_records` holds them); a turn too short to embed is a
+            # candidate when its cluster is admitted.
             role = work.roles.get(turn.speaker)
             if role is None or role.role == retrieve.OTHER:
                 continue
@@ -1040,19 +1222,26 @@ class Extraction:
         for work in works:
             sid = work.source.source_id
             own = [r for r in records if r.source_id == sid]
+            seconds = cluster_seconds(work.turns)
+            primary = [r.label for r in work.roles.values() if r.role == retrieve.PRIMARY]
             sources.append(
                 {
                     "source_id": sid,
                     **work.source.facts,
                     "separator": work.separator,
-                    "separator_scores": {
-                        k: None if v is None else round(v, 4) for k, v in work.scores.items()
-                    },
+                    "separator_scores": _scores(work.scores),
+                    "separator_basis": work.basis,
+                    "separator_window_scores": _scores(work.window_scores),
+                    "separator_provisional": work.provisional,
+                    "separator_turns": work.spans,
+                    "separator_rediarized": work.rediarized,
+                    "primary_s": seconds[primary[0]] if primary else 0.0,
                     "clusters": [
                         {
                             "diar_cluster": role.label,
                             "role": role.role,
                             "turns": role.turns,
+                            "seconds": seconds[role.label],
                             "median_sim": {k: round(v, 4) for k, v in role.median_sim.items()},
                         }
                         for role in work.roles.values()
@@ -1115,11 +1304,78 @@ class Extraction:
                 "clips": len(self.clips),
                 "timestamps": len(self.anchors),
                 "sim": detail.get("anchors", []),
+                "agree": bool(detail["anchors_agree"]),
             },
             "sdh": detail.get("sdh"),
             "rehearsal": None,
             "thresholds": dict(sorted(self.thresholds.items())),
         }
+
+
+def cluster_seconds(turns: Sequence[Turn]) -> dict[str, float]:
+    """Return each diarizer label's seconds over all its turns, those too short to embed too."""
+    seconds: dict[str, float] = {}
+    for turn in turns:
+        seconds[turn.speaker] = seconds.get(turn.speaker, 0.0) + (turn.end_s - turn.start_s)
+    return {label: round(value, 3) for label, value in seconds.items()}
+
+
+def _rounded(values: Mapping[str, float]) -> dict[str, float]:
+    return {name: round(float(value), 4) for name, value in values.items()}
+
+
+def _scores(values: Mapping[str, float | None]) -> dict[str, float | None]:
+    return {name: None if v is None else round(v, 4) for name, v in values.items()}
+
+
+def turn_records(
+    works: Sequence[SourceWork],
+    anchor_centroid: Mapping[str, np.ndarray],
+    model: retrieve.TargetModel | None,
+    margin: Mapping[str, float],
+) -> list[contract.TurnRecord]:
+    """Return one record per diarized turn of every source, sorted by source and start.
+
+    It writes down what retrieval already computed and embeds nothing: each turn's centre-channel
+    embedding from the first loop, the anchor centroid, the target model and the source's rival
+    centroids. `retrieve.judge` is run on every embedded turn, whatever its role, so a turn of a
+    non-admitted cluster carries the gaps a scorer needs to say how far another speaker sat from
+    the target. A label with no embedded turn has no role from `retrieve.cluster_roles`; its
+    turns are recorded as `other`, as the second pass treats them.
+    """
+    rows: list[contract.TurnRecord] = []
+    for work in works:
+        for index, (turn, emb) in enumerate(zip(work.turns, work.turn_embs, strict=True)):
+            role = work.roles.get(turn.speaker)
+            sim_anchor = sim_target = gaps = None
+            passed: bool | None = None
+            reasons: tuple[str, ...] = ()
+            if emb is not None:
+                sim_anchor = _rounded(retrieve.sims(emb, anchor_centroid))
+                if model is not None:
+                    verdict = retrieve.judge(emb, model, work.rivals, margin)
+                    sim_target = _rounded(verdict.sim)
+                    gaps = None if verdict.gaps is None else _rounded(verdict.gaps)
+                    passed, reasons = verdict.passed, verdict.reasons
+            span = Span(turn.start_s, turn.end_s)
+            rows.append(
+                contract.TurnRecord(
+                    source_id=work.source.source_id,
+                    turn=index,
+                    start_s=round(turn.start_s, 3),
+                    end_s=round(turn.end_s, 3),
+                    diar_cluster=turn.speaker,
+                    role=retrieve.OTHER if role is None else role.role,
+                    embedded=emb is not None,
+                    touches_overlap=segments.intersects(span, work.overlaps),
+                    sim_anchor=sim_anchor,
+                    sim_target=sim_target,
+                    gaps=gaps,
+                    passed=passed,
+                    reasons=reasons,
+                )
+            )
+    return sorted(rows, key=lambda r: (r.source_id, r.start_s, r.turn))
 
 
 def _distribution(model: retrieve.TargetModel | None) -> dict[str, object] | None:

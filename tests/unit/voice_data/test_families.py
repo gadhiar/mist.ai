@@ -82,8 +82,11 @@ def test_dockerfile_creates_the_venv_from_its_requirements(key: str) -> None:
     text = dockerfile.read_text(encoding="utf-8")
     assert f"python3.11 -m venv {family['venv']}" in text
     copied = REQUIREMENTS_COPY.findall(text)
-    assert len(copied) == 1, f"{dockerfile.name} copies {copied}"
-    assert (DOCKER_DIR / copied[0]).is_file()
+    # The extract image also copies the CrisperWhisper ctranslate2 fork, which it installs with
+    # --no-deps over the venv after the venv is built; it is an overlay, not the venv's base.
+    base = [name for name in copied if name != "requirements-extract-ct2.txt"]
+    assert len(base) == 1, f"{dockerfile.name} copies {copied}"
+    assert all((DOCKER_DIR / name).is_file() for name in copied)
     assert f"{family['venv']}/bin/pip install --no-cache-dir -r" in text
 
 
@@ -132,6 +135,8 @@ def test_whisperx_alignment_model_is_a_url_model() -> None:
     model = load()["families"]["extract"]["models"]["whisperx-align-en"]
     assert model["kind"] == "url"
     assert model["dest"].startswith("torch/hub/checkpoints/")
+    # Trusted on first use: the hash of the first HTTPS download; no upstream hash exists.
+    assert model["sha256"] == "488fd4f16de84438ffc945334278c1b9fb9b7159a806c1080b16111a958c945d"
 
 
 @pytest.mark.parametrize("key", sorted(FAMILY_KEYS))
