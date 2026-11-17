@@ -4,6 +4,8 @@ from pathlib import Path
 
 import yaml
 
+from backend.chat.persona_register import PersonaRegister
+
 VOICE_PROFILES_DIR = Path(__file__).parent.parent.parent / "voice_profiles"
 
 
@@ -68,10 +70,13 @@ class TestPersonalityConfig:
         assert "mannerisms" in config
         assert len(config["characteristic_openers"]) >= 3
 
-    def test_mist_has_no_address_form(self):
+    def test_mist_addresses_the_user_as_boss(self):
         config = _load_personality("mist")
-        assert "address_form" in config
-        assert config["address_form"] is None
+        assert config["address_form"] == "boss"
+
+    def test_mist_prompt_line_names_the_address_form_once(self):
+        line = PersonaRegister.load(VOICE_PROFILES_DIR, "mist").prompt_line()
+        assert line.count("boss") == 1
 
     def test_mist_openers_are_short(self):
         """Openers must be short enough for fast first TTS."""
@@ -87,7 +92,6 @@ class TestPersonalityConfig:
         prompt = _build_voice_system_prompt(config)
         assert "M.I.S.T" in prompt
         assert "opening phrase" in prompt
-        assert "Address the user as" not in prompt
 
     def test_mist_is_the_only_personality(self):
         profiles = sorted(p.name for p in VOICE_PROFILES_DIR.iterdir() if p.is_dir())
