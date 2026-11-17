@@ -34,6 +34,8 @@ The instance root is a host directory outside every git work tree. `MIST_DAILY_R
   release/<tag>/         deploy/ and scripts/daily/ extracted from the release tag
   retired/<UTC stamp>/   state/ and mist-memory/ replaced by a promotion, kept until deleted
   bin/instance.py        the active release's CLI, run by the sign-in task
+  secrets/               mounted read-write at /app/secrets in mist-backend only: the Home
+                         Assistant and Spotify tokens; in no backup (see Capabilities)
 ```
 
 The graph does not live in the root: it is the external Docker volume named by
@@ -54,10 +56,11 @@ not join.
 
 `daily.env` is passed to compose with `--env-file`, which resolves every `${VAR}` in
 `compose.yml`, and compose also gives it to `mist-backend` as its `env_file`. The
-`environment` literals in `compose.yml` win over any line in it: the store paths,
-`MIST_OPS_DIR=/app/ops`, `MIST_SESSION_ORIGIN=real`, `TTS_ENABLED=false` (the code defaults TTS
-on) and `EMBEDDING_DEVICE=cpu` (the embedding model must hold no GPU memory). A required variable
-that is unset makes compose refuse the whole file before anything starts.
+`environment` literals in `compose.yml` win over any line in it: the store paths, the capability
+store and token paths (see Capabilities), `MIST_OPS_DIR=/app/ops`, `MIST_SESSION_ORIGIN=real`,
+`TTS_ENABLED=false` (the code defaults TTS on) and `EMBEDDING_DEVICE=cpu` (the embedding model
+must hold no GPU memory). A required variable that is unset makes compose refuse the whole file
+before anything starts.
 
 `daily.env.example` lists every variable with a placeholder or its default.
 
@@ -80,7 +83,14 @@ that is unset makes compose refuse the whole file before anything starts.
 | `MIST_ALLOWED_ORIGINS` | compose: browser origins the backend admits | no | the three Tauri origins |
 | `MIST_EXTRACTION_INFERENCE` | the backend through `env_file` | no | `service` |
 | `MIST_EXTRACTION_SERVICE_URL` | the backend through `env_file` | no | code default |
-| `MIST_TIMEZONE` | the backend through `env_file` | no | UTC |
+| `MIST_TIMEZONE` | the backend through `env_file`; alarms, timers and the clock need it | no | UTC; alarms, timers and clock unavailable |
+| `MIST_CAPABILITIES_ENABLED` | the backend through `env_file` | no | `false` |
+| `MIST_CAPABILITIES` | the backend through `env_file` | no | all five |
+| `MIST_HA_MCP_URL` | the backend through `env_file`: lights | no | none, and lights is not built |
+| `MIST_LIGHTS_DEFAULT_TARGET` | the backend through `env_file`: lights | no | none |
+| `MIST_SPOTIFY_CLIENT_ID` | the backend through `env_file`: music | no | none, and music is not built |
+| `MIST_SPOTIFY_DEVICE` | the backend through `env_file`: music | no | none |
+| `MIST_RING_FALLBACK_AFTER_S` | the backend through `env_file`: alarms | no | `30` |
 | `MIST_BACKUP_HOST_PATH` | compose: host directory mounted at `/backup` | yes | |
 | `MIST_BACKUP_INTERVAL_HOURS` | compose: the backup scheduler | no | `24` |
 | `MIST_BACKUP_RETAIN` | compose: the backup scheduler | no | `7` |
@@ -342,6 +352,85 @@ It registers a second task, "MIST gaming watch", which runs
 trigger and settings as the first, including no time limit. `pythonw.exe` comes from the
 directory of `-Python`, and the script refuses before registering anything when it is not
 there. `unregister-signin-task.ps1` removes both tasks.
+
+---
+
+## Capabilities
+
+The backend can run five capabilities: clock, alarms, timers, lights (Home Assistant over MCP)
+and music (Spotify). They are off until `daily.env` turns them on, and
+`GET http://127.0.0.1:8001/capabilities` reports whether the host is enabled, the power level,
+and each capability's state and reason.
+
+Where their data lives. `compose.yml` sets four literals in `mist-backend`, so no `daily.env`
+line moves them:
+
+- `MIST_CAPABILITIES_DB_PATH=/app/data/capabilities.db`: the store `capabilities.db` sits in
+  `state/` beside the others, and every backup captures it with its row counts.
+- `MIST_HA_TOKEN_FILE=/app/secrets/ha_token` and
+  `MIST_SPOTIFY_TOKEN_PATH=/app/secrets/spotify_token.json`: the tokens sit in
+  `<root>/secrets/`, which `mist-backend` mounts read-write at `/app/secrets` (the Spotify
+  token is rewritten each time it is refreshed).
+- `MIST_HA_TOKEN=` is empty, so a token put in `daily.env` is ignored; the file is its one
+  source.
+
+The secrets folder. `init` creates `<root>/secrets/`; for a root made before this release, run
+`init --root <root>` again, which fills in what is missing and rewrites nothing. No other
+service mounts it, so `mist-backup` cannot read it and `<root>/secrets/` is not backed up. Put
+the tokens there:
+
+- `ha_token`: a Home Assistant long-lived access token, created in Home Assistant under the
+  user MIST signs in as (its profile, Security tab), written alone into the file.
+- `spotify_token.json`: written by the Spotify authorization, run once in the running backend
+  after `MIST_SPOTIFY_CLIENT_ID` is set:
+  `docker compose -p mist-daily exec mist-backend python -m backend.capabilities.music.authorize`.
+  It prints an address to open in a browser and asks for the address the browser lands on.
+  `--check` afterwards refreshes the token and prints how many devices Spotify reports.
+
+A missing or unreadable `ha_token` makes lights `unavailable` with the reason; the other
+capabilities run.
+
+The `daily.env` rows, all commented out in `daily.env.example`:
+
+- `MIST_CAPABILITIES_ENABLED`: `true` turns the host on; `false` or unset builds none.
+- `MIST_CAPABILITIES`: which of the five to run, comma-separated; all five when unset.
+- `MIST_TIMEZONE`: the IANA zone alarms, timers and the clock use. While it is unset or unknown
+  those three are `unavailable`, so an alarm never rings at an hour from a guessed zone.
+- `MIST_HA_MCP_URL` and `MIST_LIGHTS_DEFAULT_TARGET`: lights is built only with the URL; the
+  target is the light or area a command that names none acts on.
+- `MIST_SPOTIFY_CLIENT_ID` and `MIST_SPOTIFY_DEVICE`: music is built only with the client ID;
+  the device is where playback goes when no Spotify device is active.
+- `MIST_RING_FALLBACK_AFTER_S`: how long past an alarm's time an endpoint that cannot reach the
+  backend waits before it rings on its own; 30 when unset, 5 to 300.
+
+Activation. Set the rows, then run `up` to apply a changed `daily.env` on the same release, or
+`switch <tag>` for a new release (which runs `up` itself). Either recreates `mist-backend` with
+the new environment.
+
+At the off level, while gaming mode is on, the backend keeps running: alarms and timers already
+set ring and time out on schedule, because the scheduler needs no model. Spoken messages are
+refused, because Whisper is released. A typed message goes to the capability host's model-free
+step alone: one it handles (a ringing alarm or timer, a yes or no to a waiting proposal, or a
+fast-path command such as "set a timer for 10 minutes") is answered with no model call, and any
+other typed message gets the refusal: the yielded message, or the resume-failed message when
+the speech model could not be reloaded after gaming mode. With capabilities off
+(`MIST_CAPABILITIES_ENABLED=false`, so no host), every typed message gets that refusal.
+
+Rollback, behaviour: set `MIST_CAPABILITIES_ENABLED=false` in `daily.env` and run `up`. No host
+is built, and the WebSocket and `/capabilities` answer as disabled. Rollback, code:
+`switch <previous tag>`.
+
+Rollback, data: stop the instance with `down`, then delete `state/capabilities.db` and its
+`-wal` and `-shm` files. That drops every alarm, timer, event and action-log row; the pre-switch
+backup holds the last copy. While capabilities stay off, nothing recreates the file, so the next
+backup lacks a store the last success held and is `backup_suspect` (the success rule,
+`scripts/backup/scheduler.py`, `stores the last success held have no file`). Review its
+`manifest.json`, then run `accept-backup-baseline --label <label>` to make it the baseline.
+
+Rollback, tokens: delete `<root>/secrets/ha_token` and revoke the token in Home Assistant;
+delete `<root>/secrets/spotify_token.json` and remove the app's access in Spotify's account
+settings. Neither is in any backup, so after a restore onto a new instance root both are
+issued again (`deploy/daily/RESTORE.md`).
 
 ---
 

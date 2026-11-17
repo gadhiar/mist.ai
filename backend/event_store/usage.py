@@ -26,13 +26,13 @@ must not create, migrate or write the store it reports on.
 Local dates
 -----------
 Turns are bucketed by their date in the zone named by `MIST_TIMEZONE`
-(default UTC), resolved through `pytz`. `pytz` rather than `zoneinfo`: the
-backend image ships no IANA database for `zoneinfo` (no `tzdata` package and
-no system zone files), while `pytz` carries its own and is already installed
-as a dependency of `neo4j`. An unknown zone name falls back to UTC, logs a
-warning and is reported as `UTC`, so the caller always knows which zone the
-dates are in. A stored timestamp with no offset is read as UTC, the zone every
-writer uses (`ConversationTurnEvent.to_dict` normalises aware values to UTC).
+(default UTC), resolved through `backend.user_timezone.resolve_user_timezone`,
+the resolver memory config uses too, so both read the user's days the same
+way. An unknown zone name falls back to UTC, logs a warning and is reported
+as `UTC`, and so does a zone that cannot load because no zone database is
+installed, so the caller always knows which zone the dates are in. A stored
+timestamp with no offset is read as UTC, the zone every writer uses
+(`ConversationTurnEvent.to_dict` normalises aware values to UTC).
 """
 
 from __future__ import annotations
@@ -47,15 +47,14 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from urllib.parse import quote
 
-import pytz
-
 from backend.errors import MistError
+from backend.user_timezone import USER_TIMEZONE_ENV, resolve_user_timezone
 
 from .store import _DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-TIMEZONE_ENV = "MIST_TIMEZONE"
+TIMEZONE_ENV = USER_TIMEZONE_ENV
 DEFAULT_TIMEZONE = "UTC"
 ORIGIN = "real"
 
@@ -126,23 +125,27 @@ def resolve_store_path(configured: str | None) -> str:
 
 
 def resolve_timezone(name: str | None) -> tuple[tzinfo, str]:
-    """Resolve a zone name to a `pytz` zone and the name actually used.
+    """Resolve a zone name through the shared user-zone resolver, and name the zone used.
 
-    Unset or blank means the default, UTC, without a warning. An unknown name
-    also yields UTC, but with a warning naming the value, because a typo in
-    `MIST_TIMEZONE` shifts every late-evening turn onto the wrong date.
+    Unset or blank means the default, UTC; the shared resolver logs its one
+    unset warning per process, so memory config and usage together log it
+    once. An unknown or malformed name also yields UTC, but with a warning
+    here naming the value, because a typo in `MIST_TIMEZONE` shifts every
+    late-evening turn onto the wrong date. When no zone database is
+    installed the resolver gives UTC, and the zone is reported as `UTC`.
 
     Returns:
-        The zone, and its canonical name (`UTC` on fallback).
+        The zone, and the name the dates are in (`UTC` on any fallback).
     """
-    if name is None or not name.strip():
-        return pytz.utc, DEFAULT_TIMEZONE
+    environ = {} if name is None else {TIMEZONE_ENV: name}
     try:
-        zone = pytz.timezone(name.strip())
-    except pytz.exceptions.UnknownTimeZoneError:
+        zone = resolve_user_timezone(environ)
+    except ValueError:
         logger.warning("%s=%r is not a known time zone; counting in UTC", TIMEZONE_ENV, name)
-        return pytz.utc, DEFAULT_TIMEZONE
-    return zone, zone.zone
+        return UTC, DEFAULT_TIMEZONE
+    if zone is UTC or name is None:
+        return UTC, DEFAULT_TIMEZONE
+    return zone, name.strip()
 
 
 def local_date(raw: str, zone: tzinfo) -> date | None:

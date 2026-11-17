@@ -137,11 +137,11 @@ def test_rehearsal_precision_boundary(precision: float, passed: bool) -> None:
 
 def test_rehearsal_at_other_thresholds_fails() -> None:
     report = _report()
-    report["rehearsal"]["thresholds"]["retrieval.margin"] = 0.05  # type: ignore[index]
+    report["rehearsal"]["thresholds"]["retrieval.margin.wavlm-sv"] = 0.05  # type: ignore[index]
     result = seed_gate.evaluate(report, THRESHOLDS)
     criterion = _criterion(result, "rehearsal precision")
     assert criterion.passed is False
-    assert "retrieval.margin" in criterion.detail
+    assert "retrieval.margin.wavlm-sv" in criterion.detail
 
 
 def test_missing_rehearsal_fails() -> None:
@@ -291,3 +291,230 @@ def test_gate_refuses_a_root_in_a_git_work_tree(
         git.write_text("gitdir: elsewhere\n", encoding="utf-8")
     assert cli.main(["--root", str(root.path), "gate", "--run", "r1"]) == 2
     assert ".git" in capsys.readouterr().err
+
+
+# The rehearsal's precision record: `config/rehearsal.json`, and `gate --check-record`.
+
+RECORD_REL = "config/rehearsal.json"
+CHANGED = "retrieval.margin.wavlm-sv"
+
+
+def _record(precision: object = 0.97, run: str = "r4", **changes: object) -> dict[str, object]:
+    """The record `rehearsal score` writes, as the Interfaces section spells it out."""
+    record: dict[str, object] = {
+        "schema": 1,
+        "kind": "rehearsal-precision",
+        "run": run,
+        "precision": precision,
+        "thresholds": dict(THRESHOLDS),
+    }
+    record.update(changes)
+    return record
+
+
+def _write_record(root: root_mod.Root, record: object) -> None:
+    path = root.path / RECORD_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = record if isinstance(record, str) else json.dumps(record)
+    path.write_text(text, encoding="utf-8")
+
+
+def _null_rehearsal() -> dict[str, object]:
+    report = _report()
+    report["rehearsal"] = None
+    return report
+
+
+def _gate(root: root_mod.Root, *flags: str) -> int:
+    return cli.main(["--root", str(root.path), "gate", *flags])
+
+
+def test_the_record_names_its_file() -> None:
+    assert seed_gate.REHEARSAL_RECORD_REL == RECORD_REL
+    assert RECORD_REL in (seed_gate.__doc__ or "")
+
+
+def test_a_record_reads_back_as_written() -> None:
+    record = seed_gate.rehearsal_record("r4", 0.97, THRESHOLDS)
+    assert record == _record()
+    assert seed_gate.read_rehearsal_record(json.loads(json.dumps(record))) == record
+
+
+def test_record_differences_are_the_sorted_keys_that_differ() -> None:
+    thresholds = dict(THRESHOLDS)
+    assert seed_gate.record_differences(_record(), thresholds) == []
+    theirs = dict(thresholds, **{CHANGED: 0.5, "zz.only_in_record": 1.0})
+    del theirs["seed.clean_minutes_min"]
+    differ = seed_gate.record_differences(_record(thresholds=theirs), thresholds)
+    assert differ == sorted([CHANGED, "seed.clean_minutes_min", "zz.only_in_record"])
+
+
+def test_a_record_fills_a_null_rehearsal(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _null_rehearsal())
+    _write_record(private_root, _record())
+    code = _gate(private_root, "--run", "r1")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert f"  rehearsal record: {RECORD_REL} (rehearsal run r4)" in out.splitlines()
+    assert "rehearsal precision: 0.970 (min 0.95), at the run's thresholds" in out
+    assert "seed gate: pass" in out
+
+
+def test_a_record_at_other_thresholds_fails(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _null_rehearsal())
+    _write_record(private_root, _record(thresholds=dict(THRESHOLDS, **{CHANGED: 0.05})))
+    code = _gate(private_root, "--run", "r1")
+    out = capsys.readouterr().out
+    assert code == 3
+    assert f"thresholds differ: {CHANGED}" in out
+    assert "seed gate: fail" in out
+
+
+def test_a_records_low_precision_fails(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _null_rehearsal())
+    _write_record(private_root, _record(precision=0.9))
+    assert _gate(private_root, "--run", "r1") == 3
+    assert "FAIL  rehearsal precision: 0.900" in capsys.readouterr().out
+
+
+def test_the_reports_own_rehearsal_wins_over_the_record(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _report())
+    _write_record(private_root, _record(precision=0.1, thresholds={CHANGED: 0.05}))
+    code = _gate(private_root, "--run", "r1")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "rehearsal record:" not in out
+    assert "rehearsal precision: 0.970" in out
+
+
+def test_no_record_fails_as_missing(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _null_rehearsal())
+    assert _gate(private_root, "--run", "r1") == 3
+    out = capsys.readouterr().out
+    assert "FAIL  rehearsal precision: missing (min 0.95)" in out
+    assert "rehearsal record:" not in out
+
+
+MALFORMED: dict[str, object] = {
+    "not JSON": "{not json",
+    "not an object": [1, 2],
+    "the wrong kind": _record(kind="rehearsal-score"),
+    "no precision": {k: v for k, v in _record().items() if k != "precision"},
+    "a text precision": _record(precision="high"),
+    "a boolean precision": _record(precision=True),
+    "a null precision": _record(precision=None),
+    "no thresholds": {k: v for k, v in _record().items() if k != "thresholds"},
+    "list thresholds": _record(thresholds=[1.0]),
+    "a text threshold": _record(thresholds=dict(THRESHOLDS, **{CHANGED: "x"})),
+}
+
+
+@pytest.mark.parametrize("record", list(MALFORMED.values()), ids=list(MALFORMED))
+def test_gate_refuses_a_malformed_record(
+    private_root: root_mod.Root, record: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _null_rehearsal())
+    _write_record(private_root, record)
+    assert _gate(private_root, "--run", "r1") == 2
+    assert RECORD_REL in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("record", list(MALFORMED.values())[1:], ids=list(MALFORMED)[1:])
+def test_read_rehearsal_record_refuses_a_malformed_record(record: object) -> None:
+    with pytest.raises(InputError):
+        seed_gate.read_rehearsal_record(record)
+
+
+def test_check_record_matches_the_gates(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = seed_gate.rehearsal_record("r4", 0.97, gates.load(private_root.path).effective())
+    _write_record(private_root, record)
+    code = _gate(private_root, "--check-record")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out.splitlines() == ["rehearsal record matches the gates (rehearsal run r4)"]
+
+
+def _changed_value(thresholds: dict[str, object]) -> None:
+    thresholds[CHANGED] = 0.05
+
+
+def _only_in_record(thresholds: dict[str, object]) -> None:
+    thresholds["zz.only_in_record"] = 1.0
+
+
+def _only_in_gates(thresholds: dict[str, object]) -> None:
+    del thresholds["seed.clean_minutes_min"]
+
+
+@pytest.mark.parametrize(
+    ("change", "key"),
+    [
+        (_changed_value, CHANGED),
+        (_only_in_record, "zz.only_in_record"),
+        (_only_in_gates, "seed.clean_minutes_min"),
+    ],
+    ids=["changed value", "only in the record", "only in the gates"],
+)
+def test_check_record_names_a_key_that_differs(
+    private_root: root_mod.Root,
+    change: Callable[[dict[str, object]], None],
+    key: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    thresholds: dict[str, object] = dict(THRESHOLDS)
+    change(thresholds)
+    _write_record(private_root, _record(thresholds=thresholds))
+    assert _gate(private_root, "--check-record") == 3
+    assert f"rehearsal record differs: {key}" in capsys.readouterr().out.splitlines()
+
+
+def test_check_record_reads_the_roots_gate_overlay(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_record(private_root, _record())
+    overlay = {CHANGED: 0.2, "seed.clean_minutes_min": 12}
+    (private_root.path / gates.OVERLAY_REL).write_text(json.dumps(overlay), encoding="utf-8")
+    assert _gate(private_root, "--check-record") == 3
+    line = f"rehearsal record differs: {CHANGED}, seed.clean_minutes_min"
+    assert line in capsys.readouterr().out.splitlines()
+
+
+def test_check_record_without_a_record_exits_2(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _gate(private_root, "--check-record") == 2
+    assert RECORD_REL in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("record", list(MALFORMED.values()), ids=list(MALFORMED))
+def test_check_record_refuses_a_malformed_record(
+    private_root: root_mod.Root, record: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_record(private_root, record)
+    assert _gate(private_root, "--check-record") == 2
+    assert RECORD_REL in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags", [("--check-record", "--run", "r1"), ()], ids=["both flags", "neither flag"]
+)
+def test_gate_needs_exactly_one_of_run_and_check_record(
+    private_root: root_mod.Root, flags: tuple[str, ...]
+) -> None:
+    _write_report(private_root, _report())
+    _write_record(private_root, _record())
+    with pytest.raises(SystemExit) as caught:
+        _gate(private_root, *flags)
+    assert caught.value.code == 2

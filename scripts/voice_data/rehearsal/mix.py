@@ -690,11 +690,20 @@ def effects_events(
     return events
 
 
+def episode_samples(seconds: float) -> int:
+    """Return the episode's sample count: the one rule `music_bed` and `render` both size by.
+
+    `render` indexes the bed with its own chunk bounds, so a bed sized by a different rounding
+    rule is a sample short whenever the fraction rounds up, and the last chunk cannot broadcast.
+    """
+    return int(round(seconds * RATE))
+
+
 def music_bed(
     seconds: float, rng: np.random.Generator, library: Library, music: Sequence[str]
 ) -> np.ndarray:
     """Return a mono music bed for the episode at `MUSIC_DB` below dialogue, before ducking."""
-    length = int(seconds * RATE)
+    length = episode_samples(seconds)
     picks = [music[int(i)] for i in rng.permutation(len(music))[:4]]
     bed = np.concatenate([library.raw(rel) for rel in picks])
     return (normalise(_looped(bed, length), DIALOGUE_RMS) * 10.0 ** (MUSIC_DB / 20.0)).astype(
@@ -727,7 +736,7 @@ def render(
     master: float = 1.0,
 ) -> float:
     """Render the 5.1 mix chunk by chunk into `emit`, scaled by `master`; return its peak."""
-    total = int(round(seconds * RATE))
+    total = episode_samples(seconds)
     chunk = int(CHUNK_S * RATE)
     surround = 10.0 ** (SURROUND_DB / 20.0)
     lfe = lowpass(bed.astype(np.float64), RATE, LFE_HZ).astype(np.float32)

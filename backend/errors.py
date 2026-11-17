@@ -19,7 +19,32 @@ Hierarchy:
     +-- EmbeddingError
     +-- VectorStoreError
     +-- IngestionError
+    +-- MemoryIndexError
+    +-- MemoryRerankError
+    +-- MemoryCorrectionError
+    +-- MemoryConfigError
+    +-- ColdSummaryError
     +-- GpuYieldedError
+    +-- VaultWriteError
+    +-- SidecarIndexError
+    +-- FilewatcherError
+    +-- SeedSourceError
+    +-- SeedTargetNotSeedOnlyError
+    +-- CapabilityError
+        +-- CapabilityConfigError
+        +-- CapabilityRegistrationError
+        +-- CapabilityUnavailableError
+        +-- CapabilityInvocationError
+        +-- CapabilityStoreError
+        +-- TimeParseError
+        +-- ActionDecodeError
+        +-- SecretMissingError
+        +-- McpError
+        |   +-- McpTransportError
+        |   +-- McpProtocolError
+        +-- SpotifyError
+            +-- SpotifyAuthError
+            +-- SpotifyApiError
 
 Usage:
     from backend.errors import Neo4jConnectionError
@@ -158,3 +183,122 @@ class SeedTargetNotSeedOnlyError(MistError):
     Raised by the seed applier before any write or wipe (MIS-177 D1): seeding
     over such a graph adopts its elements and the next wipe deletes them.
     """
+
+
+# -- Memory read path (backend/memory) ----------------------------------------
+
+
+class MemoryIndexError(MistError):
+    """The derived memory index cannot be opened, read or written.
+
+    Covers a missing or corrupt `memory_index.db`, a sqlite_vec load failure
+    and an embedding-model mismatch. The fetcher turns it into an empty
+    result marked `index_error` and the factory rebuilds the index, so it
+    never reaches the turn.
+    """
+
+
+class MemoryRerankError(MistError):
+    """A reranker failed to load or to score.
+
+    The fetcher keeps the pool order and marks the result
+    `reranker_unavailable`, so a reranker fault costs ranking quality, not
+    the turn.
+    """
+
+
+class MemoryCorrectionError(MistError):
+    """A memory correction (forget or correct) cannot be recorded or applied."""
+
+
+class MemoryConfigError(MistError):
+    """A memory read-path setting is invalid.
+
+    Raised at config time, naming the variable or field, so a bad setting
+    fails startup instead of degrading recall silently.
+    """
+
+
+class ColdSummaryError(MistError):
+    """A rebuild needs episode summaries the summary cache does not hold.
+
+    Lists the missing keys; the operator reruns with `--allow-summarize`
+    rather than the rebuild calling a model unasked.
+    """
+
+
+# -- Capabilities (lights, music, alarms; ADR-025) ------------------------------
+
+
+class CapabilityError(MistError):
+    """Base for capability-layer failures.
+
+    A capability raises a subclass for a failure that should become a `ToolOutcome`
+    status (`error`, `unavailable` or `invalid_args`) reported to the user, rather than
+    an unexpected exception.
+    """
+
+
+class CapabilityConfigError(CapabilityError):
+    """A capability environment variable or the policy file is invalid."""
+
+
+class CapabilityRegistrationError(CapabilityError):
+    """A capability or tool cannot be registered: too many tools, too large, or a bad schema."""
+
+
+class CapabilityUnavailableError(CapabilityError):
+    """The capability's provider cannot be reached right now; the outcome is `unavailable`."""
+
+
+class CapabilityInvocationError(CapabilityError):
+    """A tool call failed after it reached its provider; the outcome is `error`."""
+
+
+class CapabilityStoreError(CapabilityError):
+    """The capabilities database cannot be opened, migrated or written."""
+
+
+class TimeParseError(CapabilityError):
+    """A spoken time or duration could not be parsed; the message names the input."""
+
+
+class ActionDecodeError(CapabilityError):
+    """The constrained action decode produced output that does not parse or validate."""
+
+
+class SecretMissingError(CapabilityError):
+    """A secret is configured but cannot be read, for example an unreadable secret file."""
+
+
+class McpError(CapabilityError):
+    """Base for Model Context Protocol client failures."""
+
+
+class McpTransportError(McpError):
+    """The MCP transport failed: connect, session or call I/O."""
+
+
+class McpProtocolError(McpError):
+    """The MCP server answered with something the client cannot use."""
+
+
+class SpotifyError(CapabilityError):
+    """Base for Spotify Web API failures."""
+
+
+class SpotifyAuthError(SpotifyError):
+    """No usable Spotify token: missing, revoked, or refused on refresh."""
+
+
+class SpotifyApiError(SpotifyError):
+    """A Spotify Web API call answered with an error status.
+
+    `reason` is a short machine word (`premium_required`, `no_active_device`,
+    `rate_limited`) that the music capability turns into an outcome reason.
+    """
+
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(f"Spotify API error {status}: {reason}")
+        self.status = status
+        self.reason = reason

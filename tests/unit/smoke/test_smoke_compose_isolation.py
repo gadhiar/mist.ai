@@ -72,6 +72,9 @@ SIBLING_COMPOSE_FILES = (
     "docker-compose.dev-hydration.yml",
 )
 
+#: `${VAR:-default}` in a compose value; group 1 is the default.
+_COMPOSE_DEFAULT = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}")
+
 
 def _load(path: Path) -> dict:
     """Parse a compose file into a plain dict."""
@@ -246,7 +249,11 @@ def _published_host_ports(compose: dict) -> set[int]:
     ports: set[int] = set()
     for service in (compose.get("services") or {}).values():
         for entry in service.get("ports", []) or []:
-            host_side = str(entry).split(":")[0]
+            # `${VAR:-default}` resolves to its default, so a bind address such as
+            # `${MIST_BACKEND_BIND_ADDR:-127.0.0.1}:8001:8001` still names its port.
+            resolved = _COMPOSE_DEFAULT.sub(r"\1", str(entry))
+            fields = resolved.split(":")
+            host_side = fields[-2] if len(fields) == 3 else fields[0]
             if host_side.isdigit():
                 ports.add(int(host_side))
     return ports
@@ -570,6 +577,27 @@ class TestPortsDoNotCollide:
                 f"first silently receives the traffic. That is how a smoke run "
                 f"reaches a database it was never meant to see."
             )
+
+    def test_main_compose_still_publishes_the_backend_port(self):
+        # The bind address became `${MIST_BACKEND_BIND_ADDR:-127.0.0.1}:8001:8001`;
+        # a parser that misread it would drop 8001 and hide a smoke collision.
+        main_ports = _published_host_ports(_load(REPO_ROOT / "docker-compose.yml"))
+        assert 8001 in main_ports, (
+            f"docker-compose.yml publishes {sorted(main_ports)}; 8001 is missing, so "
+            f"either the backend port moved or the port parser misreads a "
+            f"bind-address entry."
+        )
+
+    def test_port_parser_reads_bind_address_entries(self):
+        parsed = _published_host_ports(
+            {
+                "services": {
+                    "a": {"ports": ["${BIND:-127.0.0.1}:9001:8001", "127.0.0.1:9002:80"]},
+                    "b": {"ports": ["9003:80", "9004"]},
+                }
+            }
+        )
+        assert parsed == {9001, 9002, 9003, 9004}
 
 
 class TestHarnessShape:

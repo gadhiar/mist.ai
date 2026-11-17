@@ -1,0 +1,8 @@
+# /opt/venv-extract: the CrisperWhisper build of ctranslate2, installed after
+# requirements-extract.txt. crisperwhisper 2.1.0 declares it only in its `ct2` extra
+# (ctranslate2-crisperwhisper<5,>=4.7.1.post4); without it the venv holds upstream ctranslate2,
+# which lacks the APIs CrisperWhisper checks for. extract.Dockerfile installs it with
+# --no-deps --force-reinstall over upstream's `ctranslate2` module, so faster-whisper's
+# ctranslate2<5,>=4.0 and whisperx's ctranslate2>=4.5.0 stay met by the upstream record and
+# pip check stays clean.
+ctranslate2-crisperwhisper==4.7.1.post4

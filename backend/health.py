@@ -123,7 +123,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from backend.errors import MistError
 from backend.extraction_backlog.errors import (
@@ -132,6 +132,9 @@ from backend.extraction_backlog.errors import (
     InferenceUnreachableError,
 )
 from backend.extraction_contract.models import ExtractionStatus, HealthResponse
+
+if TYPE_CHECKING:
+    from backend.capabilities.host import CapabilityHost
 
 logger = logging.getLogger(__name__)
 
@@ -920,6 +923,49 @@ class BackupProbe:
             return path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
+
+
+class CapabilitiesProbe:
+    """Reports whether every enabled capability can serve, from the host's statuses.
+
+    `statuses()` is computed from memory with no network call, and it carries the health of
+    each supervised task a capability needs, so a dead alarm scheduler or MCP supervisor turns
+    the check down without a probe of its own. A capability whose state is `disabled` is not
+    counted; `available` and `degraded` are up. Any other state is down: `task_dead` when one
+    such capability has its `task_dead` set, `unreachable` otherwise. Which capability and why
+    is in `GET /capabilities` and the log, never here (module docstring).
+
+    The server registers it only when a host was built, and the accessor is read at each check,
+    so a host replaced later is the one checked. No host at check time, or a host whose every
+    capability is disabled, is not measured.
+
+    `severity="degrades"`: conversation goes on without devices, music or alarms.
+    `restart_repairs=False` although a restart revives a dead task: the flag belongs to the
+    probe, not to a reason, and the same probe reports Home Assistant and Spotify outages,
+    which a restart does not repair.
+    """
+
+    def __init__(self, get_host: "Callable[[], CapabilityHost | None]") -> None:
+        self.name = "capabilities"
+        self.severity: Severity = "degrades"
+        self.restart_repairs = False
+        self.timeout_seconds = 0.5
+        self._get_host = get_host
+
+    async def check(self) -> None:
+        """Translate the enabled capabilities' states into a probe signal."""
+        host = self._get_host()
+        if host is None:
+            raise ProbeUnavailable("disabled_by_config")
+        enabled = [status for status in host.statuses() if status.state != "disabled"]
+        if not enabled:
+            raise ProbeUnavailable("disabled_by_config")
+        down = [status for status in enabled if status.state not in ("available", "degraded")]
+        if not down:
+            return
+        if any(status.task_dead for status in down):
+            raise ProbeFailed("task_dead")
+        raise ProbeFailed("unreachable")
 
 
 def _parse_backup_status(text: str) -> _BackupRecord:

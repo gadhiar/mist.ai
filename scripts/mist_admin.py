@@ -53,6 +53,12 @@ Tier 3 subcommands (end-to-end):
                                              NO chat reply (deterministic F2
                                              measurement path).
 
+Memory index subcommands (mist-read-path):
+    memory-index-rebuild --facts            Drop the fact tables of
+        [--index-path PATH]                  memory_index.db and rebuild them
+                                             from the graph; prints the row
+                                             counts and the duration.
+
 Usage:
     python scripts/mist_admin.py <subcommand> [options]
 
@@ -65,17 +71,24 @@ import argparse
 import asyncio
 import json
 import logging
+import sqlite3
 import sys
 import time
 import uuid
-from dataclasses import replace
-from datetime import UTC, datetime
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from backend.interfaces import EmbeddingProvider
     from backend.knowledge.regeneration.log_regenerator import LogRegenerator
     from backend.knowledge.seed.models import SeedDocument
+    from backend.memory.fact_index import DiffReport
+    from backend.memory.fact_source import QueryExecutor
+    from backend.memory.retrieval_view import ViewSpec
 
 # Make `backend` importable when running from the host (mist-ai is not pip-installed).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2539,6 +2552,250 @@ def cmd_uptime(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Memory index (mist-read-path)
+# ---------------------------------------------------------------------------
+
+# Every table `index_db.FACTS_DDL` creates: the facts and the facets grouped from them. Each
+# virtual table takes its shadow tables with it when dropped, and `facts` takes its indexes.
+FACT_INDEX_TABLES: tuple[str, ...] = (
+    "facts_vec",
+    "facts_fts",
+    "facts",
+    "facets_vec",
+    "facets_fts",
+    "facets",
+)
+
+_MEMORY_INDEX_FILENAME = "memory_index.db"
+_IN_MEMORY = ":memory:"
+
+
+@dataclass(frozen=True, slots=True)
+class FactRebuildGraph:
+    """The graph a fact rebuild reads, the embedder it embeds with, and how to let go of both.
+
+    Attributes:
+        executor: Runs the fact scan's page queries off the event loop (`GraphExecutor`).
+        embedder: The GraphStore's `embedding_generator`, so the rebuild embeds on the same
+            model and device as live.
+        close: Disconnects the graph connection.
+    """
+
+    executor: QueryExecutor
+    embedder: EmbeddingProvider
+    close: Callable[[], None]
+
+
+@dataclass(frozen=True, slots=True)
+class FactRebuildResult:
+    """What one fact rebuild did: rows dropped, the refill's diff, rows held after, seconds."""
+
+    dropped_rows: int
+    report: DiffReport
+    rows: int
+    duration_s: float
+
+
+def _memory_index_path(config: Any, override: str | None) -> str:
+    """The index file: `--index-path`, else `MIST_MEMORY_INDEX_PATH`, else beside the event store.
+
+    The event store default is the one `factories.py` uses (`~/.mist/event_store.db`), and an
+    in-memory event store gives an in-memory index, as `.env.example` documents.
+    """
+    if override:
+        return override
+    if config.memory.index_path:
+        return config.memory.index_path
+    event_store = config.event_store.db_path or str(Path.home() / ".mist" / "event_store.db")
+    if event_store == _IN_MEMORY:
+        return _IN_MEMORY
+    return str(Path(event_store).parent / _MEMORY_INDEX_FILENAME)
+
+
+def _build_fact_rebuild_graph(config: Any) -> FactRebuildGraph:
+    """Connect to the graph once and take the embedder from the GraphStore built on it.
+
+    The embedder comes from `build_graph_store(config)` rather than a construction here, so
+    the rebuild embeds wherever live embeds (`EMBEDDING_DEVICE`); the executor shares the
+    store's connection, so the command opens one driver.
+    """
+    from backend.factories import build_graph_executor, build_graph_store, build_neo4j_connection
+
+    connection = build_neo4j_connection(config)
+    store = build_graph_store(config, connection=connection)
+    return FactRebuildGraph(
+        executor=build_graph_executor(config, connection),
+        embedder=store.embedding_generator,
+        close=connection.disconnect,
+    )
+
+
+def _drop_fact_tables(writer: Any, embedding_model_id: str) -> int:
+    """Drop and recreate the fact and facet tables empty, marking the index `rebuilding`.
+
+    One commit does both, so the refill rebuilds the facets from the refilled facts rather than
+    keeping facets grouped from the facts it dropped.
+
+    The mark is the in-place rebuild state `index_db` defines: until `IndexRebuild.complete`
+    clears it after the refill, every reader of the file, the running server's included,
+    reports `index_rebuilding` instead of serving a block from a partial index, and a crash
+    before then makes the next `open_index` rebuild again.
+
+    Returns:
+        How many fact rows the tables held.
+
+    Raises:
+        MemoryIndexError: The database fails; nothing is dropped.
+    """
+    from backend.errors import MemoryIndexError
+    from backend.memory.index_db import (
+        FACTS_DDL,
+        META_INDEX_STATE,
+        META_REBUILD_EMBEDDING_MODEL_ID,
+        META_REBUILD_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+        STATE_REBUILDING,
+        set_meta,
+        write_transaction,
+    )
+
+    try:
+        with write_transaction(writer):
+            (dropped,) = writer.execute("SELECT count(*) FROM facts").fetchone()
+            for table in FACT_INDEX_TABLES:
+                # A constant name from FACT_INDEX_TABLES; DDL takes no bound parameters.
+                writer.execute(f"DROP TABLE IF EXISTS {table}")  # nosec B608
+            for statement in FACTS_DDL:
+                writer.execute(statement)
+            set_meta(writer, META_INDEX_STATE, STATE_REBUILDING)
+            set_meta(writer, META_REBUILD_SCHEMA_VERSION, str(SCHEMA_VERSION))
+            set_meta(writer, META_REBUILD_EMBEDDING_MODEL_ID, embedding_model_id)
+    except sqlite3.Error as exc:
+        raise MemoryIndexError(f"cannot drop the memory index fact tables: {exc}") from exc
+    return dropped
+
+
+async def rebuild_fact_index(
+    *,
+    executor: QueryExecutor,
+    embedder: EmbeddingProvider,
+    index_path: str | Path,
+    embedding_model_id: str,
+    tz: tzinfo,
+    view: ViewSpec,
+    debounce_s: float,
+    rescan_interval_s: float,
+) -> FactRebuildResult:
+    """Drop the fact tables of `index_path` and refill them from the graph.
+
+    The refill is one `FactIndexRefresher.refresh()`, the full rescan and diff the live
+    refresher runs, into the emptied tables, so the rows equal the ones live refreshes build
+    under the same fact `view`; the refresher then completes the rebuild state
+    `_drop_fact_tables` set. `view` is required so the rebuild cannot embed a view other than
+    the configured one by default. Between the drop
+    and that completion the index serves no facts. A running server's refresher may write the
+    same rows meanwhile: both write the graph's current facts, and SQLite serialises the
+    writes.
+
+    Raises:
+        MistError: The index cannot be opened or written, or the scan or the embedder fails.
+            A failure after the drop leaves the index empty and marked `rebuilding`.
+    """
+    from backend.memory.fact_index import FactIndex
+    from backend.memory.fact_source import FactIndexRefresher, GraphFactSource
+    from backend.memory.index_db import IndexRebuild, open_index, open_reader
+
+    started = time.perf_counter()
+    writer = open_index(index_path, embedding_model_id=embedding_model_id)
+    try:
+        dropped = _drop_fact_tables(writer, embedding_model_id)
+        reader = open_reader(index_path, embedding_model_id=embedding_model_id)
+        try:
+            index = FactIndex(writer, embedder, tz=tz, reader=reader, view=view)
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-index") as pool:
+                refresher = FactIndexRefresher(
+                    GraphFactSource(executor),
+                    index,
+                    pool,
+                    clock=time,
+                    debounce_s=debounce_s,
+                    rescan_interval_s=rescan_interval_s,
+                    periodic=False,
+                    rebuild=IndexRebuild(index_path, embedding_model_id=embedding_model_id),
+                )
+                report = await refresher.refresh()
+            rows = index.count()
+        finally:
+            reader.close()
+    finally:
+        writer.close()
+    return FactRebuildResult(
+        dropped_rows=dropped,
+        report=report,
+        rows=rows,
+        duration_s=time.perf_counter() - started,
+    )
+
+
+def cmd_memory_index_rebuild(args: argparse.Namespace) -> int:
+    """Rebuild the memory index's fact tables from the graph; prints counts and duration.
+
+    Exit codes: 0 rebuilt; 1 a MistError (printed by `main`); 2 refused, for an in-memory
+    index, which belongs to one process and cannot be rebuilt from another. argparse exits 2
+    on a usage error before this runs.
+    """
+    from backend.errors import MistError
+    from backend.memory.retrieval_view import FACT_VIEWS
+
+    be = _load_backend()
+    config = be.get_config()
+    index_path = _memory_index_path(config, args.index_path)
+    if index_path == _IN_MEMORY:
+        print(
+            "[memory-index-rebuild] REFUSED: the memory index is in-memory, private to the "
+            "process that opened it; set MIST_MEMORY_INDEX_PATH or pass --index-path",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"[memory-index-rebuild] index: {index_path}")
+
+    graph = _build_fact_rebuild_graph(config)
+    try:
+        result = asyncio.run(
+            rebuild_fact_index(
+                executor=graph.executor,
+                embedder=graph.embedder,
+                index_path=index_path,
+                embedding_model_id=config.embedding.model_name,
+                tz=config.memory.tz,
+                view=FACT_VIEWS[config.memory.fact_view],
+                debounce_s=config.memory.refresh_debounce_s,
+                rescan_interval_s=config.memory.rescan_interval_s,
+            )
+        )
+    except MistError:
+        print(
+            "[memory-index-rebuild] the rebuild did not complete; if the fact tables were "
+            "dropped, the index stays marked rebuilding and serves no facts until a rebuild "
+            "completes. Rerun memory-index-rebuild --facts.",
+            file=sys.stderr,
+        )
+        raise
+    finally:
+        graph.close()
+
+    report = result.report
+    print(f"[memory-index-rebuild] dropped {result.dropped_rows} rows from the fact tables")
+    print(
+        f"[memory-index-rebuild] facts: rows={result.rows} inserted={report.inserted} "
+        f"updated={report.updated} deleted={report.deleted} unchanged={report.unchanged} "
+        f"embedded={report.embedded}"
+    )
+    print(f"[memory-index-rebuild] duration: {result.duration_s:.2f} s")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Arg parser
 # ---------------------------------------------------------------------------
 
@@ -2967,6 +3224,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_uptime.set_defaults(func=cmd_uptime)
+
+    # ---- mist-read-path: memory index rebuild -------------------------------
+    p_memrebuild = sub.add_parser(
+        "memory-index-rebuild",
+        help="Drop the memory index's fact tables and rebuild them from the graph.",
+    )
+    memrebuild_scope = p_memrebuild.add_mutually_exclusive_group(required=True)
+    memrebuild_scope.add_argument(
+        "--facts",
+        action="store_true",
+        help="Rebuild the fact tables (facts, facts_fts, facts_vec) from the graph.",
+    )
+    p_memrebuild.add_argument(
+        "--index-path",
+        default=None,
+        help=(
+            "Index file (default: MIST_MEMORY_INDEX_PATH, else memory_index.db beside the "
+            "event store)."
+        ),
+    )
+    p_memrebuild.set_defaults(func=cmd_memory_index_rebuild)
 
     return parser
 

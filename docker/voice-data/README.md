@@ -72,8 +72,9 @@ that nothing pulls in is added by H3 at the version it confirms.
 
 Also open after H2:
 
-- `sha256` is `"unverified"` for the three `url` models (`whisperx-align-en`,
-  `knnvc-wavlm-large`, `knnvc-hifigan-prematched`); fetch hashes them at the first download.
+- `sha256` is `"unverified"` for two `url` models (`knnvc-wavlm-large`,
+  `knnvc-hifigan-prematched`); fetch hashes them at the first download. `whisperx-align-en` is
+  pinned to the hash of its first download (trust on first use): no upstream hash was found.
 - `enhancer-discriminative` is left out of `families.json`: no checkpoint was found.
 - Licences marked `unverified` keep that value in `families.json`.
 - `crisperwhisper`, `keras`, `opencv-python`, `deepspeed`, the TensorRT wheels, `FreeSimpleGUI`,

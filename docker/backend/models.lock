@@ -1,0 +1,42 @@
+# models.lock -- the Hugging Face models the backend image bakes into /opt/models.
+#
+# Format: TOML (parsed with the standard library's tomllib). One [[model]] table per model,
+# with exactly these string fields:
+#
+#   name      directory name under /opt/models; the Dockerfile downloads by this name
+#   repo      Hugging Face model repo, `owner/name`
+#   revision  the repo commit sha the image is built from: 40 lowercase hex characters
+#   license   SPDX id; must be MIT-compatible (scripts/check_models_lock.py lists the set)
+#   target    where the image puts the files; always /opt/models/<name>
+#
+# The image build runs `scripts/check_models_lock.py --strict`, which refuses any revision
+# that is not a 40-hex sha, then downloads each entry at its revision. A branch name such as
+# `main` is refused because it moves: a rebuild would bake different weights under the same
+# name. The revisions and licenses below were read from the Hugging Face model API on
+# 2026-11-07; each repo reports `apache-2.0`. To move a model to a new revision, change its
+# sha here and in NOTICE together. Record every model here in NOTICE as well.
+
+# Reranker (memory read path default, MIST_MEMORY_RERANK_MODEL).
+[[model]]
+name = "ms-marco-MiniLM-L-6-v2"
+repo = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+revision = "233902d25c440f23af6f7d6e94d2946bac0bee0a"
+license = "Apache-2.0"
+target = "/opt/models/ms-marco-MiniLM-L-6-v2"
+
+# Larger reranker candidate, evaluated against L-6 before either becomes the default.
+[[model]]
+name = "ms-marco-MiniLM-L-12-v2"
+repo = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+revision = "7b0235231ca2674cb8ca8f022859a6eba2b1c968"
+license = "Apache-2.0"
+target = "/opt/models/ms-marco-MiniLM-L-12-v2"
+
+# Embedder for the offline recall eval and the production embedder, which loads this copy
+# and falls back to loading all-MiniLM-L6-v2 by name only where /opt/models lacks it.
+[[model]]
+name = "all-MiniLM-L6-v2"
+repo = "sentence-transformers/all-MiniLM-L6-v2"
+revision = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+license = "Apache-2.0"
+target = "/opt/models/all-MiniLM-L6-v2"

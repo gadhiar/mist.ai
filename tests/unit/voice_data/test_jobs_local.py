@@ -25,10 +25,32 @@ VENV = "/opt/venv-teacher-indextts2"
 IMAGE = "mist-voice-teacher-indextts2:0123456789ab"
 FAMILIES = {FAMILY: {"image": "mist-voice-teacher-indextts2", "venv": VENV, "vram_gb": 16}}
 SHA = "0" * 64
+# What an NVIDIA CUDA base image's entrypoint prints to stdout before it execs the command.
+CUDA_BANNER = """
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.4.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your
+convenience.
+
+"""
 
 
 class FakeDocker:
-    """Records every argv; answers `ps`, `inspect` and the `nvidia-smi` run from fixed data."""
+    """Records every argv; answers `ps`, `inspect` and the `nvidia-smi` run from fixed data.
+
+    A `docker run` without `--entrypoint` goes through the image's entrypoint, so its stdout
+    starts with the CUDA banner, as the real NVIDIA CUDA images do.
+    """
 
     def __init__(
         self,
@@ -53,7 +75,8 @@ class FakeDocker:
         if argv[1] == "inspect":
             name, requests = self.containers[argv[-1]]
             return f"/{name} {requests}\n"
-        return self.free_mib + "\n"
+        banner = "" if "--entrypoint" in argv else CUDA_BANNER
+        return banner + self.free_mib + "\n"
 
     def check(self, argv: Sequence[str]) -> None:
         self.calls.append(list(argv))
@@ -245,7 +268,20 @@ def test_preflight_passes_an_allowed_gpu_holder(private_root: Root) -> None:
     _local(private_root, docker).preflight(_job(gpu=True), allow=frozenset({"mist-llm"}))
     nvidia = docker.calls[-1]
     assert nvidia[:2] == ["docker", "run"] and "--gpus" in nvidia and IMAGE in nvidia
-    assert nvidia[nvidia.index(IMAGE) + 1] == "nvidia-smi"
+    assert nvidia[nvidia.index("--entrypoint") + 1] == "nvidia-smi"
+    assert nvidia[nvidia.index(IMAGE) + 1 :] == list(jobs.NVIDIA_SMI_QUERY)
+
+
+def test_preflight_bypasses_the_cuda_entrypoint_banner(private_root: Root) -> None:
+    """Regression: nvidia-smi run through the CUDA entrypoint put its banner in the parsed stdout.
+
+    The fake prints the banner before the numbers unless nvidia-smi is the entrypoint, and two
+    GPUs' lines show the preflight takes the largest free VRAM.
+    """
+    docker = FakeDocker(free_mib="512\n20000")
+    _local(private_root, docker).preflight(_job(gpu=True))
+    nvidia = docker.calls[-1]
+    assert nvidia.index("--entrypoint") < nvidia.index(IMAGE)
 
 
 def test_preflight_refuses_free_vram_below_the_family_need(private_root: Root) -> None:

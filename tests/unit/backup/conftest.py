@@ -45,6 +45,21 @@ STALE_BACKUP_FILENAMES = (
 )
 
 
+# The token files the daily instance keeps in `<root>/secrets/` (deploy/daily/compose.yml mounts
+# it at /app/secrets in mist-backend only), with values a test can search an artifact for.
+SECRET_FILES = {
+    "ha_token": "ha-long-lived-token-must-not-be-captured\n",
+    "spotify_token.json": '{"refresh_token": "spotify-refresh-token-must-not-be-captured"}\n',
+}
+
+
+def plant_secrets(directory: Path) -> None:
+    """Write the capability token files into `directory`, as `init` and the operator do."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename, content in SECRET_FILES.items():
+        (directory / filename).write_text(content, encoding="utf-8")
+
+
 def make_store(path: Path, *, table: str, rows: int) -> None:
     """Create a WAL-mode SQLite store with `rows` rows in `table`."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,11 +132,12 @@ def vec0_state_root(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def state_root(tmp_path: Path) -> Path:
-    """A stand-in for live `./data`: three real stores plus two stale ones."""
+    """A stand-in for live `./data`: four real stores plus two stale ones."""
     root = tmp_path / "live-data"
     make_store(root / "event_store.db", table="conversation_turn_events", rows=3)
     make_store(root / "extraction_cache.db", table="extraction_cache", rows=2)
     make_store(root / "vault_sidecar.db", table="vault_chunks", rows=5)
+    make_store(root / "capabilities.db", table="alarm_records", rows=4)
     for filename in STALE_BACKUP_FILENAMES:
         make_store(root / filename, table="conversation_turn_events", rows=99)
     (root / "vector_store").mkdir()
