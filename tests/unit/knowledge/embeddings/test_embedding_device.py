@@ -51,10 +51,21 @@ class _RecordingSentenceTransformer:
 
 
 @pytest.fixture
-def recorded_constructions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[tuple, dict]]:
+def recorded_constructions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> list[tuple[tuple, dict]]:
+    """Record constructions, with the baked model root pointed at an absent directory.
+
+    The backend image bakes `/opt/models/all-MiniLM-L6-v2`, and the generator
+    loads that path instead of the name wherever it exists, so these by-name
+    assertions would fail inside the image without the redirect.
+    """
     _RecordingSentenceTransformer.calls = []
     monkeypatch.setattr(
         embedding_generator_module, "SentenceTransformer", _RecordingSentenceTransformer
+    )
+    monkeypatch.setattr(
+        embedding_generator_module, "DEFAULT_MODELS_ROOT", str(tmp_path / "absent-models")
     )
     return _RecordingSentenceTransformer.calls
 

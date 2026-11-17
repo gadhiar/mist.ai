@@ -96,7 +96,7 @@ backend/
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 ├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
 ├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
-├── user_timezone.py             # MIST_TIMEZONE resolver for alarms, timers and the clock
+├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader
 │
 ├── capabilities/                # Tools that act on the world (README.md: adding one)
 │   ├── host.py                  # CapabilityHost: admits, decides, runs and logs every call
@@ -180,6 +180,11 @@ backend/
 │   ├── eval_isolation.py        # F1 fail-closed eval Neo4j allowlist guard
 │   ├── canonical_serialize.py   # F3 wall-clock-free graph form
 │   └── extraction_cache.py      # F3 content-addressed extraction cache
+│
+├── memory/                      # Memory read path: per-turn recall into a budgeted block
+│   ├── config.py                # MemoryConfig (MIST_MEMORY_*), nested as KnowledgeConfig.memory
+│   ├── models.py                # Request/result/item types, fact_key, ServingProfile, MemoryStage (trace memory key)
+│   └── fact_render.py           # One sentence per fact, with valid-time qualifiers
 │
 ├── realtime/                    # Realtime voice path, one session per WebSocket connection;
 │   │                            #   the server does not use the package yet
@@ -461,6 +466,7 @@ Frontend lives in a separate repo at `./mist-frontend/`. See that repo's contrib
 - **Integration tests:** `tests/integration/` (cluster-scoped reproducers; require live Neo4j + llama-server)
 - **Drift guards:** `tests/unit/test_eval_harness_scorers.py` locks scorer frozensets to ontology; `tests/unit/knowledge/extraction/test_validator.py::TestValidatorOntologyConsistency` locks validator to ontology
 - **Eval harness:** `scripts/eval_harness/` runs V1-V8 gauntlets; reports in `data/ingest/`
+- **Memory read path:** `tests/unit/memory/` (fakes in `tests/fakes/memory_fakes.py`); `tests/fixtures/memory_recall/` holds the synthetic recall fixture (facts, conversations, episodes, vault notes, corrections, probes) that `scripts/eval_harness/memory_recall.py` scores
 
 ---
 

@@ -48,9 +48,49 @@ _CUTOVER_BINDING_COLUMNS = (
 )
 
 
+# The `memory_corrections` columns in declaration order (mist-read-path T21, Design point 12).
+MEMORY_CORRECTION_COLUMNS: tuple[str, ...] = (
+    "correction_id",
+    "recorded_at",
+    "action",
+    "fact_key",
+    "subject_id",
+    "subject_name",
+    "relation",
+    "object_id",
+    "object_name",
+    "replacement_object_name",
+    "surface",
+    "session_id",
+    "conversation_id",
+    "turn_index",
+    "source_event_id",
+    "origin",
+)
+# What applying a correction under an epoch came to (`memory_corrections_applied.outcome`).
+MEMORY_CORRECTION_OUTCOMES: tuple[str, ...] = ("applied", "noop", "unresolved")
+
+
 def _dumps(value: Mapping[str, Any]) -> str:
     """A JSON column value with a stable key order."""
     return json.dumps(dict(value), sort_keys=True)
+
+
+def _origin_clause(origins: tuple[str, ...] | None) -> tuple[str, list[str]]:
+    """The `origin IN (...)` condition and its parameters, or no condition for None.
+
+    Raises:
+        ValueError: `origins` is an empty tuple, which would select nothing, refused as
+            `get_all_turns_for_reextraction` refuses it.
+    """
+    if origins is None:
+        return "", []
+    if not origins:
+        raise ValueError(
+            "origins must be a non-empty tuple of provenance values, or None to disable "
+            "origin filtering"
+        )
+    return f"origin IN ({', '.join(['?'] * len(origins))})", list(origins)
 
 
 class EpochCutoverStateError(MistError):
@@ -1943,6 +1983,116 @@ class EventStore:
             return json.loads(text)
         except json.JSONDecodeError:
             return text
+
+    # ------------------------------------------------------------------
+    # Memory corrections (mist-read-path T21). The log is append-only:
+    # there is no update or delete here, and schema.sql's triggers refuse
+    # one made with raw SQL.
+    # ------------------------------------------------------------------
+
+    def append_memory_correction(self, row: Mapping[str, Any]) -> None:
+        """Append one correction to the `memory_corrections` log.
+
+        Args:
+            row: Exactly the `MEMORY_CORRECTION_COLUMNS`, by name. `recorded_at` is
+                ISO-8601 UTC with microseconds (CorrectionService writes it so), which keeps
+                the log's text order equal to its time order.
+
+        Raises:
+            ValueError: `row` lacks a column or carries one the table does not have.
+            sqlite3.IntegrityError: The id is already logged, or a CHECK fails (an unknown
+                action or surface, or a replacement on a forget or none on a correct).
+        """
+        missing = [name for name in MEMORY_CORRECTION_COLUMNS if name not in row]
+        stray = sorted(set(row) - set(MEMORY_CORRECTION_COLUMNS))
+        if missing or stray:
+            raise ValueError(
+                f"a memory correction row needs exactly its columns: missing {missing}, "
+                f"stray {stray}"
+            )
+        conn = self._get_connection()
+        names = ", ".join(MEMORY_CORRECTION_COLUMNS)
+        marks = ", ".join(f":{name}" for name in MEMORY_CORRECTION_COLUMNS)
+        conn.execute(
+            f"INSERT INTO memory_corrections ({names}) VALUES ({marks})",  # nosec B608
+            dict(row),
+        )
+
+    def list_memory_corrections(
+        self, *, origins: tuple[str, ...] | None = None
+    ) -> list[dict[str, Any]]:
+        """Every logged correction in log order, (`recorded_at`, `correction_id`).
+
+        Args:
+            origins: Only corrections whose `origin` is one of these, as
+                `get_all_turns_for_reextraction` filters turns; None keeps every origin.
+
+        Raises:
+            ValueError: `origins` is an empty tuple, which would select nothing.
+        """
+        where, params = _origin_clause(origins)
+        names = ", ".join(MEMORY_CORRECTION_COLUMNS)
+        conn = self._get_connection()
+        rows = conn.execute(
+            f"SELECT {names} FROM memory_corrections "  # nosec B608 -- fixed names, bound values
+            f"{'WHERE ' + where if where else ''} ORDER BY recorded_at, correction_id",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_unapplied_memory_corrections(
+        self, epoch_id: int, *, origins: tuple[str, ...] | None = None
+    ) -> list[dict[str, Any]]:
+        """The corrections with no `memory_corrections_applied` row for `epoch_id`, in log order.
+
+        Args:
+            epoch_id: The epoch whose progress is read; a new epoch lists every correction.
+            origins: As `list_memory_corrections`.
+
+        Raises:
+            ValueError: `origins` is an empty tuple.
+        """
+        where, params = _origin_clause(origins)
+        names = ", ".join(MEMORY_CORRECTION_COLUMNS)
+        conn = self._get_connection()
+        rows = conn.execute(
+            f"SELECT {names} FROM memory_corrections AS c "  # nosec B608 -- fixed names
+            "WHERE NOT EXISTS (SELECT 1 FROM memory_corrections_applied AS a "
+            "WHERE a.correction_id = c.correction_id AND a.epoch_id = ?) "
+            f"{'AND ' + where if where else ''} ORDER BY recorded_at, correction_id",
+            (epoch_id, *params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_memory_correction_applied(
+        self, *, correction_id: str, epoch_id: int, outcome: str, applied_at: str
+    ) -> None:
+        """Record a correction's outcome under an epoch; a second mark replaces the first.
+
+        Raises:
+            ValueError: `outcome` is not one of `MEMORY_CORRECTION_OUTCOMES`.
+        """
+        if outcome not in MEMORY_CORRECTION_OUTCOMES:
+            raise ValueError(
+                f"unknown memory correction outcome {outcome!r}; "
+                f"expected one of {MEMORY_CORRECTION_OUTCOMES}"
+            )
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT INTO memory_corrections_applied (correction_id, epoch_id, outcome, "
+            "applied_at) VALUES (?, ?, ?, ?) ON CONFLICT(correction_id, epoch_id) DO UPDATE "
+            "SET outcome = excluded.outcome, applied_at = excluded.applied_at",
+            (correction_id, epoch_id, outcome, applied_at),
+        )
+
+    def get_memory_corrections_applied(self, epoch_id: int) -> dict[str, str]:
+        """Map `correction_id` to its outcome under `epoch_id`."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT correction_id, outcome FROM memory_corrections_applied WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
 
     def _promotion_fault_point(self, step: str) -> None:
         """No-op seam between promotion's ledger append and its activation write.
