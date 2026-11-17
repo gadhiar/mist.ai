@@ -208,7 +208,7 @@ REQUIREMENTS = sorted(p.name for p in DOCKER_DIR.glob("requirements-*.txt"))
 
 
 def test_requirements_files_exist() -> None:
-    assert len(REQUIREMENTS) == 13
+    assert len(REQUIREMENTS) == 14
 
 
 @pytest.mark.parametrize("name", REQUIREMENTS)
@@ -353,20 +353,73 @@ def test_extract_import_check_loads_tiger_and_sidon_from_their_clones() -> None:
     # the clones on sys.path itself. TIGER's look2hear.layers imports torch_complex and
     # typeguard's check_argument_types, which typeguard 2.x provides; without the two pins the
     # import finds setuptools' vendored typeguard 4, which lacks it.
-    final = instructions(DOCKER_DIR / "extract.Dockerfile")[-1]
-    check = re.match(r"RUN /opt/venv-extract/bin/python -I -c '([^']*)'", final)
-    assert check, final
-    prefix = (
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    prefix = ast.parse(
         'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER",'
-        ' "/opt/mist-voice/upstream/Sidon/src"]; import '
+        ' "/opt/mist-voice/upstream/Sidon/src"]'
     )
-    code = check.group(1)
-    assert code.startswith(prefix), code
-    modules = {module.strip() for module in code.removeprefix(prefix).split(",")}
+    # The clones go on sys.path in the first two statements, before anything is imported.
+    assert [ast.unparse(node) for node in check.body[:2]] == [
+        ast.unparse(node) for node in prefix.body
+    ]
+    modules = imported_modules(ast.Module(body=check.body[2:], type_ignores=[]))
     assert {"look2hear.models", "sidon.cleansing", "scripts.voice_data"} <= modules
     pins = pinned_versions("requirements-extract.txt")
     assert "torch-complex" in pins
     assert SpecifierSet("<3").contains(pins.get("typeguard", "3")), pins.get("typeguard")
+
+
+CRISPER_CT2_REQUIREMENTS = "/opt/mist-voice/requirements/requirements-extract-ct2.txt"
+# crisperwhisper's engine.py `_REQUIRED_FORK_APIS`, checked with hasattr on ctranslate2's Whisper.
+CRISPER_FORK_APIS = (
+    "prefill",
+    "forward_step",
+    "set_alignment_heads",
+    "generate_greedy_with_attention",
+)
+
+
+def test_extract_ct2_file_pins_the_crisperwhisper_fork() -> None:
+    # crisperwhisper 2.1.0 declares the fork only in its `ct2` extra
+    # (pypi.org/pypi/crisperwhisper/2.1.0/json: ctranslate2-crisperwhisper<5,>=4.7.1.post4), so
+    # requirements-extract.txt alone installed upstream ctranslate2 4.9.0, which lacks its APIs.
+    pins = pinned_versions("requirements-extract-ct2.txt")
+    assert pins == {"ctranslate2-crisperwhisper": "4.7.1.post4"}
+    assert SpecifierSet("<5,>=4.7.1.post4").contains(pins["ctranslate2-crisperwhisper"])
+
+
+def test_extract_installs_the_crisperwhisper_fork_over_upstream_ctranslate2() -> None:
+    # The fork ships the same `ctranslate2` module as upstream. `--no-deps --force-reinstall`
+    # after the venv step overwrites that module and leaves upstream's record, which meets
+    # faster-whisper's and whisperx's ctranslate2 bounds, so the venv layer stays cached.
+    steps = instructions(DOCKER_DIR / "extract.Dockerfile")
+    [venv] = [
+        i
+        for i, s in enumerate(steps)
+        if "/opt/venv-extract/bin/pip install" in s
+        and "/opt/mist-voice/requirements/requirements-extract.txt" in s
+    ]
+    pth = steps.index(
+        "RUN printf '%s\\n' /opt/mist-voice/code > "
+        "/opt/venv-extract/lib/python3.11/site-packages/mist-voice-code.pth"
+    )
+    assert venv < pth
+    assert steps[pth + 1 : pth + 3] == [
+        f"COPY docker/voice-data/requirements-extract-ct2.txt {CRISPER_CT2_REQUIREMENTS}",
+        "RUN /opt/venv-extract/bin/pip install --no-cache-dir --no-deps --force-reinstall"
+        f" -r {CRISPER_CT2_REQUIREMENTS}",
+    ]
+    assert [s for s in steps if "requirements-extract-ct2.txt" in s] == steps[pth + 1 : pth + 3]
+
+
+def test_extract_import_check_asserts_the_crisperwhisper_fork_apis() -> None:
+    # CrisperWhisper raises ImportError at load when the installed ctranslate2 lacks these, so
+    # the image build asserts them and fails rather than the clean stage.
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    assert "ctranslate2" in imported_modules(check)
+    names = ", ".join(f'"{name}"' for name in CRISPER_FORK_APIS)
+    expected = f"all(hasattr(ctranslate2.models.Whisper, name) for name in ({names}))"
+    assert ast.unparse(ast.parse(expected, mode="eval").body) in asserted_expressions(check)
 
 
 def import_check(dockerfile: str, venv: str) -> ast.Module:
