@@ -96,7 +96,7 @@ backend/
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 ├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
 ├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
-├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader (memory, alarms, timers, the clock)
+├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader
 │
 ├── capabilities/                # Tools that act on the world (README.md: adding one)
 │   ├── host.py                  # CapabilityHost: admits, decides, runs and logs every call
