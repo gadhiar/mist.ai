@@ -1,0 +1,35 @@
+# MIST.AI room devices: the opt-in overlay that lets a registered device reach the backend.
+#
+# Off unless daily.env sets MIST_DAILY_DEVICE_BIND: only then does `instance.py` add
+#   -f <root>/release/<tag>/deploy/daily/compose.devices.yml --profile devices
+# to every compose call. The workstation stack takes it by a second -f with the same variables
+# and MIST_DEVICE_FORWARD_IMAGE set to that stack's backend image.
+#
+# mist-backend publishes no new port: its device listener's 8443 stays on the project network,
+# and mist-device-forward publishes the one LAN port and relays bytes to it. TLS ends in the
+# backend, so the forwarder holds no key. A LAN address missing when the containers start stops
+# the forwarder alone, never the desktop path.
+#
+# Contract: deploy/daily/README.md, Room devices; pinned by
+# tests/unit/deploy/test_devices_compose.py.
+
+services:
+  mist-backend:
+    environment:
+      - MIST_DEVICE_LISTENER=on
+    volumes:
+      # The registry, the server certificate and key, and the CA certificate; never the CA key.
+      - ${MIST_DEVICE_DIR:?set MIST_DEVICE_DIR in daily.env}:/app/devices:ro
+
+  mist-device-forward:
+    profiles: ["devices"]
+    image: ${MIST_DEVICE_FORWARD_IMAGE:-mist-backend:${MIST_RELEASE_TAG}}
+    pull_policy: never
+    user: "1000:1000"
+    # 0.0.0.0 is inside this container; the host side below is the one LAN address.
+    command: ["python", "-m", "scripts.daily.device_forward", "--listen", "0.0.0.0:8443",
+              "--to", "mist-backend:8443"]
+    ports:
+      - "${MIST_DAILY_DEVICE_BIND:?set MIST_DAILY_DEVICE_BIND in daily.env}:${MIST_DAILY_DEVICE_PORT:-8443}:8443"
+    mem_limit: 128m
+    restart: unless-stopped
