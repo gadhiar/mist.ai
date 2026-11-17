@@ -97,6 +97,8 @@ def test_no_voice_assets_hook_always_fails() -> None:
         "a/b.nemo",
         "models/m.gguf",
         "models/m.onnx",
+        "firmware/room-endpoint/wake.tflite",
+        "a/WAKE.TFLITE",
     ],
 )
 def test_no_voice_assets_matches_identities_and_weights(path: str) -> None:

@@ -53,7 +53,7 @@ INTERFACES = {
         "language": "fail",
         "files": (
             r"(?i)((^|/)(voice|student|target)\.json$|\.(npy|npz|pt|pth|bin|ckpt|onnx"
-            r"|safetensors|nemo|gguf|pkl|h5|hdf5|parquet|arrow)$)"
+            r"|safetensors|nemo|gguf|pkl|h5|hdf5|parquet|arrow|tflite)$)"
         ),
     },
     "no-voice-data-records": {
@@ -80,7 +80,7 @@ SUFFIXES = {
         "webm wmv flv m2ts vob"
     ).split(),
     "no-voice-assets": (
-        "npy npz pt pth bin ckpt onnx safetensors nemo gguf pkl h5 hdf5 parquet arrow"
+        "npy npz pt pth bin ckpt onnx safetensors nemo gguf pkl h5 hdf5 parquet arrow tflite"
     ).split(),
     "no-voice-data-records": "srt vtt ass rttm textgrid lab tar tgz zip 7z".split(),
 }
@@ -207,6 +207,8 @@ def test_private_infix_matches(path: str) -> None:
         ("no-voice-assets", "voices/mist-v1/voice.json"),
         ("no-voice-assets", "x.SAFETENSORS"),
         ("no-voice-assets", "a/b.nemo"),
+        ("no-voice-assets", "firmware/room-endpoint/models/wake.tflite"),
+        ("no-voice-assets", "Wake.TFLite"),
     ],
 )
 def test_realtime_goal_must_match_cases(hook_id: str, path: str) -> None:
@@ -237,7 +239,50 @@ def test_every_pattern_is_in_gitignore() -> None:
     assert "# Voice data never enters this public repository" in lines
     wanted = {f"*.{suffix}" for hook_id in FAIL_HOOKS for suffix in SUFFIXES[hook_id]}
     wanted |= {*JSON_NAMES, "*.private.*", "models/*.gguf"}
+    wanted |= set(FIRMWARE_GITIGNORE)
     assert wanted - lines == set()
+
+
+# --- firmware: build output, device secrets and ESPHome YAML ---------------
+
+FIRMWARE_GITIGNORE = (
+    "firmware/**/.esphome/",
+    "firmware/**/secrets.yaml",
+    "firmware/**/*.pem",
+)
+
+# ESPHome YAML uses `!secret`, `!include` and `!lambda`, which a safe load refuses, so firmware
+# YAML gets its own syntax-only (`--unsafe`) check and the strict check skips `firmware/`.
+FIRMWARE_YAML = r"^firmware/.*\.ya?ml$"
+
+
+def _check_yaml_hooks() -> list[dict]:
+    return [hook for hook in _all_hooks() if hook["id"] == "check-yaml"]
+
+
+def test_check_yaml_has_a_strict_entry_and_a_firmware_entry() -> None:
+    strict, firmware = _check_yaml_hooks()
+    assert strict == {"id": "check-yaml", "exclude": "^firmware/"}
+    assert firmware == {"id": "check-yaml", "args": ["--unsafe"], "files": FIRMWARE_YAML}
+
+
+@pytest.mark.parametrize(
+    ("path", "strict", "unsafe"),
+    [
+        ("firmware/room-endpoint/room.yaml", False, True),
+        ("firmware/room-endpoint/packages/audio.yml", False, True),
+        ("firmware/room-endpoint/README.md", False, False),
+        ("docker-compose.yml", True, False),
+        ("config/firmware/x.yaml", True, False),
+        (".github/workflows/ci.yml", True, False),
+    ],
+)
+def test_check_yaml_entries_split_firmware_from_the_rest(
+    path: str, strict: bool, unsafe: bool
+) -> None:
+    strict_hook, firmware_hook = _check_yaml_hooks()
+    assert (re.search(strict_hook["exclude"], path) is None) is strict
+    assert (re.search(firmware_hook["files"], path) is not None) is unsafe
 
 
 # --- the terms script -----------------------------------------------------

@@ -78,6 +78,7 @@ target.json
 *.hdf5
 *.parquet
 *.arrow
+*.tflite
 *.private.*
 *.srt
 *.vtt
@@ -89,6 +90,11 @@ target.json
 *.tgz
 *.zip
 *.7z
+
+# Room-endpoint firmware: ESPHome build output and device secrets stay untracked.
+firmware/**/.esphome/
+firmware/**/secrets.yaml
+firmware/**/*.pem
 
 # Cluster 8 vault layer (ADR-010) -- runtime artifacts.
 data/vault_sidecar.db
