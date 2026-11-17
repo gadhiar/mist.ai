@@ -5,7 +5,9 @@ stock voices; it synthesizes nothing. From each engine's timed pass with the mod
 line and acknowledgement in the engine's timing voice (`qwen3`, `turbo`, `original` at its 0.5
 settings, `pocket`), and from each engine's `listening.jsonl` every untimed clip: the
 listening-only voices, any `--extra-voice` `tts` was given, and `original`'s `expressive` setting
-on the emotive lines.
+on the emotive lines. `pocket-clone` (in its `identity` voice) and `qwen3-design` join the pack
+when the results root holds their timed clips; without them the pack says it skips each and
+builds from the four run-1 engines, which stay required.
 
 Blinding. Each clip gets a label from a seeded permutation (`c001` to `cNNN`) and is copied,
 loudness matched by the container probe, to `listening/clips/<label>.wav`. The page,
@@ -76,6 +78,10 @@ FROM_DIR_FEELING = "none given for these clips"
 # Names that identify an engine family without being an engine id, voice or repository name.
 FAMILY_TERMS = ("qwen", "chatterbox", "kyutai", "resemble", "resembleai")
 
+# Arms a results root may lack: `pocket-clone` runs only with a clip and both came after run 1
+# (mist-realtime-voice plan v6, T41). Every other arm's timed clips are required.
+OPTIONAL_ARMS = frozenset({core.VOICE_CLIP_ENGINE, "qwen3-design"})
+
 _DATA_RE = re.compile(
     r'<script id="pack-data" type="application/json">(?P<data>.*?)</script>', re.DOTALL
 )
@@ -142,13 +148,19 @@ def _clip(speech, engine, cfg, row, *, kind, condition, items, where) -> Clip:
 
 
 def collect_clips(
-    speech: Path, tts: Mapping[str, Mapping[str, object]], lines_doc: Mapping[str, object]
+    speech: Path,
+    tts: Mapping[str, Mapping[str, object]],
+    lines_doc: Mapping[str, object],
+    *,
+    emit: Callable[[str], None] = lambda line: None,
 ) -> list[Clip]:
     """Every clip the pack plays, in `speech_arms.json` engine order, timed clips first.
 
-    Refuses an engine with no timed clips saved, an engine whose listening clips are due but not
-    saved, a clip that is missing or outside its engine's directory, a voice or setting the
-    engine does not list, and the same engine, setting, voice and line saved twice.
+    Refuses a run-1 engine with no timed clips saved, an engine whose listening clips are due but
+    not saved, a clip that is missing or outside its engine's directory, a voice or setting the
+    engine does not list, and the same engine, setting, voice and line saved twice. An arm in
+    `OPTIONAL_ARMS` with no timed clips is left out with one `emit` line, so a results root from
+    before those arms packs as it did.
     """
     acks = {str(a["id"]) for a in lines_doc["acknowledgements"]}
     items = [str(i["id"]) for i in [*lines_doc["lines"], *lines_doc["acknowledgements"]]]
@@ -167,6 +179,9 @@ def collect_clips(
     for engine, cfg in tts.items():
         base = speech / "tts" / engine
         timed = base / tts_probe.probe_file(SOURCE_CONDITION)
+        if not timed.is_file() and engine in OPTIONAL_ARMS:
+            emit(f"[skip] {engine}: tts saved no timed clips for it; the pack leaves it out")
+            continue
         if not timed.is_file():
             raise core.SpeechBenchError(
                 f"tts has saved no timed clips for {engine}: {timed} is missing; run tts first"
@@ -467,7 +482,7 @@ def build_pack(
     _refuse_existing(speech)
     if from_dir is None:
         lines = lines_doc if lines_doc is not None else core.load_json(core.LINES_PATH)
-        clips = collect_clips(speech, tts, lines)
+        clips = collect_clips(speech, tts, lines, emit=emit)
         if not clips:
             raise core.SpeechBenchError(f"tts saved no clips under {speech / 'tts'}")
         labelled = assign_labels(clips, seed=request.seed)

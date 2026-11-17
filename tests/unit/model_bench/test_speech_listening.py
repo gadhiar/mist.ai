@@ -35,6 +35,8 @@ ACK_IDS = [ack["id"] for ack in LINES_DOC["acknowledgements"]]
 EMOTIVE = [line["id"] for line in LINES_DOC["lines"] if line["emotive"]]
 TEXTS = {item["id"]: item["text"] for item in [*LINES_DOC["lines"], *LINES_DOC["acknowledgements"]]}
 TIMING = {engine: cfg["timing_voice"] for engine, cfg in TTS.items()}
+# The four arms every results root holds; the pack refuses a root missing any of them.
+BASE_ARMS = ("qwen3", "turbo", "original", "pocket")
 
 
 # ---------------------------------------------------------------------------
@@ -231,40 +233,45 @@ SMALL = {"lines": ["L01", "L03"], "acks": ["A01"]}
 # ---------------------------------------------------------------------------
 
 
-def test_the_pack_takes_repeat_1_of_each_line_from_five_settings_in_each_timing_voice(tmp_path):
+@pytest.mark.parametrize("held", [BASE_ARMS, tuple(TTS)], ids=["base-arms", "every-arm"])
+def test_the_pack_takes_repeat_1_of_each_line_from_each_held_arm_in_its_timing_voice(
+    tmp_path, held
+):
     speech = speech_dir(tmp_path)
-    build_tts_tree(speech)
+    build_tts_tree(speech, engines=held)
 
     clips = listening.collect_clips(speech, TTS, LINES_DOC)
 
     timed = [c for c in clips if c.condition is not None]
     assert {(c.engine, c.setting, c.voice) for c in timed} == {
-        ("qwen3", "default", "aiden"),
-        ("turbo", "default", "builtin"),
-        ("original", "default", "builtin"),
-        ("pocket", "default", "alba"),
+        (engine, "default", TIMING[engine]) for engine in held
     }
     assert {c.rep for c in clips} == {1}
     assert {c.condition for c in timed} == {"idle"}
-    for engine in TTS:
+    for engine in held:
         got = sorted(c.line_id for c in timed if c.engine == engine)
         assert got == sorted(LINE_IDS + ACK_IDS)
     expressive = [c for c in clips if c.setting == "expressive"]
     assert sorted(c.line_id for c in expressive) == sorted(EMOTIVE)
     assert {(c.engine, c.voice) for c in expressive} == {("original", "builtin")}
     settings = {(c.engine, c.setting) for c in clips}
-    assert settings == {
-        ("qwen3", "default"),
-        ("turbo", "default"),
-        ("original", "default"),
-        ("original", "expressive"),
-        ("pocket", "default"),
-    }
+    assert settings == {(engine, "default") for engine in held} | {("original", "expressive")}
 
 
-def test_the_pack_includes_every_listening_only_and_extra_voice_clip(tmp_path):
+def test_a_pocket_clone_clip_passes_the_voice_check_in_the_identity_voice(tmp_path):
     speech = speech_dir(tmp_path)
-    build_tts_tree(speech, extra_voices={"qwen3": ["eric"], "pocket": ["marius"]})
+    build_tts_tree(speech)
+
+    clips = listening.collect_clips(speech, TTS, LINES_DOC)
+
+    clone = {(c.voice, c.setting) for c in clips if c.engine == "pocket-clone"}
+    assert clone == {("identity", "default")}
+
+
+@pytest.mark.parametrize("held", [BASE_ARMS, tuple(TTS)], ids=["base-arms", "every-arm"])
+def test_the_pack_includes_every_listening_only_and_extra_voice_clip(tmp_path, held):
+    speech = speech_dir(tmp_path)
+    build_tts_tree(speech, extra_voices={"qwen3": ["eric"], "pocket": ["marius"]}, engines=held)
 
     clips = listening.collect_clips(speech, TTS, LINES_DOC)
 
@@ -272,12 +279,12 @@ def test_the_pack_includes_every_listening_only_and_extra_voice_clip(tmp_path):
     by_voice = {}
     for clip in untimed:
         by_voice.setdefault((clip.engine, clip.voice), []).append(clip.line_id)
-    expected = {(e, v) for e, cfg in TTS.items() for v in cfg["listening_voices"]}
+    expected = {(e, v) for e in held for v in TTS[e]["listening_voices"]}
     expected |= {("qwen3", "eric"), ("pocket", "marius")}
     assert set(by_voice) == expected
     assert all(sorted(ids) == sorted(LINE_IDS) for ids in by_voice.values())
-    timed = 4 * (len(LINE_IDS) + len(ACK_IDS))
-    listening_only = sum(len(cfg["listening_voices"]) for cfg in TTS.values()) + 2
+    timed = len(held) * (len(LINE_IDS) + len(ACK_IDS))
+    listening_only = sum(len(TTS[e]["listening_voices"]) for e in held) + 2
     assert len(clips) == timed + len(EMOTIVE) + listening_only * len(LINE_IDS)
 
 
@@ -291,12 +298,57 @@ def test_every_clip_the_pack_takes_is_a_file_tts_already_saved(tmp_path):
     assert {c.src for c in clips} <= saved
 
 
-def test_the_pack_refuses_an_engine_tts_has_not_saved(tmp_path):
+@pytest.mark.parametrize("missing", BASE_ARMS)
+def test_the_pack_refuses_a_base_arm_tts_has_not_saved(tmp_path, missing):
     speech = speech_dir(tmp_path)
-    build_tts_tree(speech, engines=["qwen3", "turbo", "original"])
+    build_tts_tree(speech, engines=[e for e in TTS if e != missing])
 
-    with pytest.raises(core.SpeechBenchError, match="pocket"):
+    with pytest.raises(core.SpeechBenchError, match=f"for {missing}:"):
         listening.collect_clips(speech, TTS, LINES_DOC)
+
+
+def test_the_pack_skips_each_new_arm_with_no_timed_clips_and_says_so_once(tmp_path):
+    speech = speech_dir(tmp_path)
+    build_tts_tree(speech, engines=BASE_ARMS)
+    said: list[str] = []
+
+    clips = listening.collect_clips(speech, TTS, LINES_DOC, emit=said.append)
+
+    assert {c.engine for c in clips} == set(BASE_ARMS)
+    assert said == [
+        "[skip] pocket-clone: tts saved no timed clips for it; the pack leaves it out",
+        "[skip] qwen3-design: tts saved no timed clips for it; the pack leaves it out",
+    ]
+
+
+def test_a_results_root_from_before_the_new_arms_packs_as_it_did(tmp_path):
+    speech = speech_dir(tmp_path)
+    build_tts_tree(speech, engines=BASE_ARMS, **SMALL)
+    said: list[str] = []
+    request = listening.PackRequest(results_root=tmp_path / "results", run="mh1", seed=7)
+
+    page = listening.build_pack(request, runner=FakeRunner(), git_sha="abc123", emit=said.append)
+
+    key = json.loads((speech / "listening-key" / "key.json").read_text(encoding="utf-8"))
+    assert {c["engine"] for c in key["clips"]} == set(BASE_ARMS)
+    timed = len(BASE_ARMS) * (len(SMALL["lines"]) + len(SMALL["acks"]))
+    untimed = sum(len(TTS[e]["listening_voices"]) for e in BASE_ARMS) * len(SMALL["lines"])
+    emotive = len([i for i in SMALL["lines"] if i in EMOTIVE])
+    assert len(key["clips"]) == timed + untimed + emotive
+    assert len(list((page.parent / "clips").glob("*.wav"))) == len(key["clips"])
+    assert [line for line in said if line.startswith("[skip]")] == [
+        "[skip] pocket-clone: tts saved no timed clips for it; the pack leaves it out",
+        "[skip] qwen3-design: tts saved no timed clips for it; the pack leaves it out",
+    ]
+
+
+def test_the_blind_check_covers_the_new_arms_ids_voices_and_repositories():
+    terms = listening.forbidden_terms(TTS)
+
+    assert {"pocket-clone", "qwen3-design", "identity", "designed"} <= terms
+    assert {"qwen3-tts-12hz-1.7b-voicedesign", "pocket-tts", "kyutai", "qwen"} <= terms
+    assert listening.blind_hits("this one sounds like the identity clip", TTS) == ["identity"]
+    assert listening.blind_hits("the designed one", TTS) == ["designed"]
 
 
 def test_the_pack_refuses_a_saved_row_whose_clip_is_missing(tmp_path):
