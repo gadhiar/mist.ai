@@ -9,3 +9,9 @@
 
 # Kyutai Pocket TTS, the `pocket-clone` engine (docker/speech-bench/requirements-pocket.txt).
 pocket-tts==4.0.1
+
+# The speech-to-text engines, at the versions docker/speech-bench/requirements-asr.txt pins.
+# NVIDIA NeMo runs `nemotron-160`, the streaming engine on the GPU. onnx-asr runs `parakeet-cpu`
+# on onnxruntime, which requirements.txt pins at the arm's 1.31.1.
+nemo_toolkit[asr]==2.7.3
+onnx-asr==0.12.0
