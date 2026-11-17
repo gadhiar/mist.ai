@@ -1,9 +1,12 @@
-"""Run 7's speech service: T2's Pocket TTS adapter behind `POST /speak`, streaming PCM.
+"""Run 7's speech service: one of T2's speech adapters behind `POST /speak`, streaming PCM.
 
 The chained turn (`chain.py`) posts the first clause of each reply here and times the first audio
-chunk. The body is a JSON object holding `text` and nothing else: the service speaks only with
-Pocket's stock timing voice from `speech_arms.json`, loaded by name at start-up, and takes no voice
-of any kind from a request. The reply is 16-bit little-endian mono PCM at the engine's rate (the
+chunk. `--engine` names the adapter (Pocket by default). The body is a JSON object holding `text`
+and nothing else: the service speaks only with the engine's timing voice from `speech_arms.json`,
+loaded by name at start-up, and takes no voice of any kind from a request. For `pocket-clone`
+that voice is `identity`, cloned from the clip mounted at `tts_engines.CONTAINER_VOICE_CLIP`, which
+the adapter reads at load; for `qwen3-design` it is the voice its fixed description designs. The
+reply is 16-bit little-endian mono PCM at the engine's rate (the
 `X-Sample-Rate` header), sent with chunked transfer encoding, one chunk per engine chunk, so the
 first chunk leaves as soon as the engine yields it.
 
@@ -130,20 +133,22 @@ def make_server(
 def load_engine(
     models_dir: Path,
     *,
+    engine_id: str = ENGINE_ID,
     make: Callable[..., object] = tts_engines.make_engine,
     arms: Mapping[str, object] | None = None,
     importer: Callable[[str], object] = importlib.import_module,
 ) -> object:
-    """Pocket TTS with its stock timing voice, the voice run 1 timed."""
+    """The engine with its timing voice, the voice run 1 timed (Pocket's stock voice by default)."""
     doc = arms if arms is not None else core.load_json(core.SPEECH_ARMS_PATH)
-    voice = str(doc["tts"][ENGINE_ID]["timing_voice"])
-    engine = make(ENGINE_ID, models_dir=models_dir, arms=doc, importer=importer)
+    voice = str(doc["tts"][engine_id]["timing_voice"])
+    engine = make(engine_id, models_dir=models_dir, arms=doc, importer=importer)
     engine.load(voice)
     return engine
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--engine", default=ENGINE_ID, help="a speech_arms.json tts engine id")
     parser.add_argument("--models-dir", type=Path, default=Path(tts_engines.CONTAINER_MODELS_DIR))
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -156,13 +161,13 @@ def _interrupt(signum: int, frame: object) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    engine = load_engine(args.models_dir)
+    engine = load_engine(args.models_dir, engine_id=args.engine)
     # One untimed sentence first, so the chain's first turn does not time the engine's warm-up.
     for _ in engine.stream(WARMUP_TEXT):
         pass
     server = make_server(engine, host=args.host, port=args.port)
     signal.signal(signal.SIGTERM, _interrupt)
-    print(f"tts_service: {ENGINE_ID} on {args.host}:{args.port}", flush=True)
+    print(f"tts_service: {args.engine} on {args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
