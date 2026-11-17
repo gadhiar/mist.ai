@@ -82,8 +82,11 @@ def test_dockerfile_creates_the_venv_from_its_requirements(key: str) -> None:
     text = dockerfile.read_text(encoding="utf-8")
     assert f"python3.11 -m venv {family['venv']}" in text
     copied = REQUIREMENTS_COPY.findall(text)
-    assert len(copied) == 1, f"{dockerfile.name} copies {copied}"
-    assert (DOCKER_DIR / copied[0]).is_file()
+    # The extract image also copies the CrisperWhisper ctranslate2 fork, which it installs with
+    # --no-deps over the venv after the venv is built; it is an overlay, not the venv's base.
+    base = [name for name in copied if name != "requirements-extract-ct2.txt"]
+    assert len(base) == 1, f"{dockerfile.name} copies {copied}"
+    assert all((DOCKER_DIR / name).is_file() for name in copied)
     assert f"{family['venv']}/bin/pip install --no-cache-dir -r" in text
 
 
