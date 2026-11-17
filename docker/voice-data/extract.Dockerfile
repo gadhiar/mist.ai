@@ -3,8 +3,15 @@
 # FROM the code-free `runtime` stage of base.Dockerfile: `images build` tags it
 # mist-voice-runtime:<first 12 hex> and passes it as BASE_IMAGE, so a new commit reuses the
 # venv layers below and rebuilds only the last four steps.
+# After the venv step, requirements-extract-ct2.txt installs the CrisperWhisper build of
+# ctranslate2 with --no-deps --force-reinstall over upstream's module, so the venv layer stays
+# cached; the final check asserts the fork's APIs on ctranslate2.models.Whisper.
 # Upstream code bases that are not pip-installable are cloned at their pinned commits under
-# /opt/mist-voice/upstream/.
+# /opt/mist-voice/upstream/. The final check imports TIGER's look2hear.models and Sidon's
+# sidon.cleansing from those clones; `-I` ignores PYTHONPATH, so the check sets sys.path itself.
+# WhisperX's alignment loads NLTK's punkt_tab, and jobs run `--network none`, so its fallback
+# download fails: punkt_tab.zip (nltk_data, Apache-2.0) is unpacked under the default search path
+# /usr/local/share/nltk_data, and the final check finds it.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -12,6 +19,8 @@ COPY docker/voice-data/requirements-extract.txt /opt/mist-voice/requirements/req
 RUN python3.11 -m venv /opt/venv-extract \
  && /opt/venv-extract/bin/pip install --no-cache-dir -r /opt/mist-voice/requirements/requirements-extract.txt
 RUN printf '%s\n' /opt/mist-voice/code > /opt/venv-extract/lib/python3.11/site-packages/mist-voice-code.pth
+COPY docker/voice-data/requirements-extract-ct2.txt /opt/mist-voice/requirements/requirements-extract-ct2.txt
+RUN /opt/venv-extract/bin/pip install --no-cache-dir --no-deps --force-reinstall -r /opt/mist-voice/requirements/requirements-extract-ct2.txt
 
 RUN git clone --filter=blob:none https://github.com/JusperLee/TIGER /opt/mist-voice/upstream/TIGER \
  && git -C /opt/mist-voice/upstream/TIGER checkout --detach 9f18d4a10a7137e1ce8052cfb62215179f1287b6 \
@@ -22,11 +31,17 @@ RUN git clone --filter=blob:none https://github.com/JusperLee/TIGER /opt/mist-vo
  && git clone --filter=blob:none https://github.com/sarulab-speech/Sidon /opt/mist-voice/upstream/Sidon \
  && git -C /opt/mist-voice/upstream/Sidon checkout --detach 45210939881b8a38a0752fb33451a79a9d3703ee
 
+RUN git clone --filter=blob:none --no-checkout https://github.com/nltk/nltk_data /tmp/nltk_data \
+ && git -C /tmp/nltk_data sparse-checkout set --no-cone packages/tokenizers/punkt_tab.zip \
+ && git -C /tmp/nltk_data checkout --detach 4f15a3d89eefe9748ec1c05be495d91289197155 \
+ && python3.11 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' /tmp/nltk_data/packages/tokenizers/punkt_tab.zip /usr/local/share/nltk_data/tokenizers \
+ && rm -rf /tmp/nltk_data
+
 ARG GIT_SHA
 RUN test -n "$GIT_SHA" \
  && python3.11 -I -c 'import hashlib, json, pathlib, sys; reqs = sorted(pathlib.Path("/opt/mist-voice/requirements").glob("*.txt")); record = {"family": sys.argv[1], "git_sha": sys.argv[2], "requirements": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in reqs}}; pathlib.Path("/etc/mist-voice-image.json").write_text(json.dumps(record, indent=1) + "\n")' extract "$GIT_SHA"
 
 COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/
 COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/
-RUN /opt/venv-extract/bin/python -I -c 'import torch, torchaudio, torchvision, torchcodec, whisperx, pyannote.audio, faster_whisper, ctranslate2, silero_vad, transformers, accelerate, huggingface_hub, numpy, pandas, nltk, omegaconf, scipy, librosa, soundfile, safetensors, einops, beartype, rotary_embedding_torch, ml_collections, yaml, scripts.voice_data' \
+RUN /opt/venv-extract/bin/python -I -c 'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/TIGER", "/opt/mist-voice/upstream/Sidon/src"]; import torch,torchaudio, torchvision, torchcodec, whisperx, pyannote.audio, faster_whisper, ctranslate2, silero_vad, transformers, accelerate, huggingface_hub, numpy, pandas, nltk, omegaconf, scipy, librosa, soundfile, safetensors, einops, beartype, rotary_embedding_torch, ml_collections, yaml, speechbrain.inference.speaker, look2hear.models, sidon.cleansing, scripts.voice_data; nltk.data.find("tokenizers/punkt_tab/english/"); assert all(hasattr(ctranslate2.models.Whisper, name) for name in ("prefill", "forward_step", "set_alignment_heads", "generate_greedy_with_attention"))' \
  && /opt/venv-score/bin/python -I -c 'import scripts.voice_data'

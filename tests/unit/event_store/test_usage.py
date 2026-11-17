@@ -13,11 +13,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+import zoneinfo
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import backend.user_timezone as user_timezone
 from backend.errors import MistError
 from backend.event_store import usage
 from backend.event_store.usage import (
@@ -30,6 +32,7 @@ from backend.event_store.usage import (
     resolve_store_path,
     resolve_timezone,
 )
+from backend.memory.config import MEMORY_ENV_VARS, MemoryConfig
 
 _SCHEMA_PATH = Path(usage.__file__).parent / "schema.sql"
 
@@ -203,25 +206,91 @@ def test_since_skips_rows_before_the_cutoff_date(store: Path) -> None:
 # --- time zone -----------------------------------------------------------------
 
 
+@pytest.fixture
+def fresh_zone_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh process for the shared resolver: no zone warning logged yet."""
+    monkeypatch.setattr(user_timezone, "_unset_warned", False)
+    monkeypatch.setattr(user_timezone, "_missing_database_warned", set())
+
+
+def test_the_zone_variable_is_mist_timezone() -> None:
+    assert usage.TIMEZONE_ENV == "MIST_TIMEZONE"
+    assert usage.TIMEZONE_ENV == user_timezone.USER_TIMEZONE_ENV
+
+
+def test_usage_resolves_through_the_shared_resolver_not_pytz() -> None:
+    assert not hasattr(usage, "pytz")
+    assert usage.resolve_user_timezone is user_timezone.resolve_user_timezone
+
+
 def test_resolve_timezone_defaults_to_utc_when_unset_or_blank() -> None:
     for name in (None, "", "   "):
-        _zone, used = resolve_timezone(name)
+        zone, used = resolve_timezone(name)
         assert used == "UTC"
+        assert zone is UTC
 
 
 def test_resolve_timezone_accepts_an_iana_name() -> None:
     zone, used = resolve_timezone("America/New_York")
 
     assert used == "America/New_York"
+    assert zone == zoneinfo.ZoneInfo("America/New_York")
     assert local_date("2026-07-01T03:00:00+00:00", zone) == date(2026, 6, 30)
+
+
+def test_resolve_timezone_reports_the_stripped_name() -> None:
+    _zone, used = resolve_timezone("  Asia/Tokyo ")
+
+    assert used == "Asia/Tokyo"
 
 
 def test_unknown_timezone_falls_back_to_utc_and_logs(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger=usage.__name__):
-        _zone, used = resolve_timezone("Mars/Olympus_Mons")
+        zone, used = resolve_timezone("Mars/Olympus_Mons")
 
     assert used == "UTC"
-    assert "Mars/Olympus_Mons" in caplog.text
+    assert zone is UTC
+    usage_warnings = [r for r in caplog.records if r.name == usage.__name__]
+    assert len(usage_warnings) == 1
+    assert "Mars/Olympus_Mons" in usage_warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("name", ["America", "/etc/localtime", "../etc/passwd"])
+def test_a_malformed_zone_name_falls_back_to_utc(name: str) -> None:
+    zone, used = resolve_timezone(name)
+
+    assert (zone, used) == (UTC, "UTC")
+
+
+def test_a_missing_zone_database_reports_utc(
+    monkeypatch: pytest.MonkeyPatch, fresh_zone_warnings: None
+) -> None:
+    def not_found(name: str):
+        raise zoneinfo.ZoneInfoNotFoundError(f"No time zone found with key {name}")
+
+    monkeypatch.setattr(user_timezone, "ZoneInfo", not_found)
+    monkeypatch.setattr(user_timezone, "available_timezones", set)
+
+    zone, used = resolve_timezone("Asia/Tokyo")
+
+    assert (zone, used) == (UTC, "UTC")
+
+
+def test_an_unset_zone_warns_once_across_memory_config_and_usage(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fresh_zone_warnings: None
+) -> None:
+    """Both read `MIST_TIMEZONE` through one resolver, so its unset warning goes out once."""
+    for name in MEMORY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        MemoryConfig.from_env()
+        resolve_timezone(None)
+        resolve_timezone("")
+
+    unset = [r for r in caplog.records if "MIST_TIMEZONE is unset" in r.getMessage()]
+    assert len(unset) == 1
+    assert unset[0].name == user_timezone.__name__
 
 
 def test_build_reports_the_fallback_zone(store: Path) -> None:

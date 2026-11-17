@@ -771,3 +771,193 @@ def test_listen_pack_cli_builds_the_pack_through_the_runner(tmp_path, monkeypatc
     assert "qwen3" not in out
     key = json.loads((speech / "listening-key" / "key.json").read_text(encoding="utf-8"))
     assert isinstance(key["seed"], int)
+
+
+# ---------------------------------------------------------------------------
+# `--from-dir`: a blind pack of a directory's WAVs
+# ---------------------------------------------------------------------------
+
+DIR_NAMES = [f"cand-warm-s{s}.wav" for s in (1, 2, 3)] + [
+    "cand-bright-s1.wav",
+    "cand-bright-s2.wav",
+]
+
+
+def make_wav_dir(root: Path, names=DIR_NAMES) -> Path:
+    for name in names:
+        _write_wav(root / name, TINY, 24000)
+    return root
+
+
+class DirFakeRunner(FakeRunner):
+    """Runs the probe with the speech root it would see: only the directory under `tts/`."""
+
+    def __init__(self, stage: Path, **kwargs):
+        super().__init__(**kwargs)
+        self.stage = stage
+
+    def run(self, argv, *, log_path, on_line):
+        self.argvs.append(list(argv))
+        Path(log_path).write_text("log\n", encoding="utf-8")
+        if self.code is not None:
+            return self.code
+        table = mounts(argv)
+        assert f"{listening.CONTAINER_SPEECH}/tts" not in table
+        mounted = Path(table[f"{listening.CONTAINER_SPEECH}/tts/{listening.FROM_DIR_MOUNT}"])
+        staged = self.stage / "tts" / listening.FROM_DIR_MOUNT
+        staged.mkdir(parents=True)
+        for wav in mounted.iterdir():
+            staged.joinpath(wav.name).write_bytes(wav.read_bytes())
+        tail = argv[argv.index(listening.PROBE_MODULE) + 1 :]
+        mapped = []
+        for i, arg in enumerate(tail):
+            if i > 0 and tail[i - 1] in ("--jobs", "--out"):
+                mapped.append(table[arg])
+            elif i > 0 and tail[i - 1] == "--speech":
+                mapped.append(str(self.stage))
+            else:
+                mapped.append(arg)
+        return listen_pack.main(mapped, run=self.ffmpeg, emit=on_line)
+
+
+def build_from_dir(tmp_path: Path, wav_dir: Path, *, seed: int = 7, runner=None, **kwargs) -> Path:
+    request = listening.PackRequest(
+        results_root=tmp_path / "results", run="h15", seed=seed, from_dir=wav_dir
+    )
+    return listening.build_pack(
+        request,
+        runner=runner or DirFakeRunner(tmp_path / f"stage-{seed}"),
+        git_sha="abc123",
+        emit=lambda line: None,
+        **kwargs,
+    )
+
+
+def test_from_dir_builds_a_blind_pack_of_every_wav_with_the_key_outside_the_page(tmp_path):
+    wav_dir = make_wav_dir(tmp_path / "candidates")
+    (wav_dir / "notes.txt").write_text("not a clip", encoding="utf-8")
+    speech = tmp_path / "results" / "h15" / "speech"
+
+    page = build_from_dir(tmp_path, wav_dir)
+
+    assert page == speech / "listening" / "index.html"
+    key = json.loads((speech / "listening-key" / "key.json").read_text(encoding="utf-8"))
+    labels = sorted(c["label"] for c in key["clips"])
+    assert sorted(c["name"] for c in key["clips"]) == sorted(DIR_NAMES)
+    files = sorted(p.relative_to(page.parent).as_posix() for p in page.parent.rglob("*"))
+    assert files == ["clips", *[f"clips/{label}.wav" for label in labels], "index.html"]
+    assert key["seed"] == 7
+    assert key["from_dir"] == str(wav_dir.resolve())
+    loud = (speech / "listening-key" / "loudness.jsonl").read_text(encoding="utf-8").splitlines()
+    assert sorted(json.loads(r)["label"] for r in loud) == labels
+    data = listening.page_data(page.read_text(encoding="utf-8"))
+    assert sorted(label for g in data["groups"] for label in g["clips"]) == labels
+
+
+def test_from_dir_labels_are_seeded_and_the_page_names_no_source_file(tmp_path):
+    wav_dir = make_wav_dir(tmp_path / "candidates")
+    built: list[int] = []
+
+    def mapping(seed):
+        built.append(seed)
+        request = listening.PackRequest(
+            results_root=tmp_path / f"results-{len(built)}",
+            run="h15",
+            seed=seed,
+            from_dir=wav_dir,
+        )
+        page = listening.build_pack(
+            request,
+            runner=DirFakeRunner(request.results_root / "stage"),
+            git_sha="x",
+            emit=lambda line: None,
+        )
+        key = json.loads((page.parents[1] / "listening-key" / "key.json").read_text("utf-8"))
+        return page, {c["label"]: c["name"] for c in key["clips"]}
+
+    page, first = mapping(1)
+    _, again = mapping(1)
+    _, other = mapping(2)
+
+    assert first == again
+    assert first != other
+    html = page.read_text(encoding="utf-8")
+    for name in DIR_NAMES:
+        assert Path(name).stem not in html
+    assert "cand-" not in html
+    assert listening.blind_hits(html, TTS) == []
+
+
+def test_from_dir_runs_the_loudness_probe_with_only_the_directory_mounted_read_only(tmp_path):
+    wav_dir = make_wav_dir(tmp_path / "candidates")
+    runner = DirFakeRunner(tmp_path / "stage")
+
+    build_from_dir(tmp_path, wav_dir, runner=runner)
+
+    (argv,) = runner.argvs
+    speech = (tmp_path / "results" / "h15" / "speech").as_posix()
+    assert argv[argv.index("--network") + 1] == "none"
+    assert "--gpus" not in argv
+    assert argv[argv.index(listening.PROBE_MODULE) - 3 :][:3] == [listening.IMAGE, "python", "-m"]
+    assert mounts(argv) == {
+        "/work": _REPO_ROOT.resolve().as_posix(),
+        f"/speech/tts/{listening.FROM_DIR_MOUNT}": wav_dir.resolve().as_posix(),
+        "/jobs.json": f"{speech}/listening-key/jobs.json",
+        "/out": f"{speech}/listening/clips",
+    }
+    specs = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
+    assert [s for s in specs if not s.endswith(":ro")] == [f"{speech}/listening/clips:/out"]
+    assert len(runner.ffmpeg.argvs) == 2 * len(DIR_NAMES)
+
+
+def test_from_dir_refuses_a_page_that_would_name_an_arm(tmp_path):
+    wav_dir = make_wav_dir(tmp_path / "candidates")
+    word = listening.FROM_DIR_TEXT.split()[-1].strip(".,").lower()
+    arms = {"tts": {word: {"voices": [], "settings": {}, "model": {}}}}
+    speech = tmp_path / "results" / "h15" / "speech"
+
+    with pytest.raises(core.SpeechBenchError, match=word):
+        build_from_dir(tmp_path, wav_dir, arms=arms)
+
+    assert not (speech / "listening").exists()
+    assert not (speech / "listening-key").exists()
+
+
+def test_from_dir_refuses_a_directory_inside_the_repository(tmp_path):
+    request = listening.PackRequest(
+        results_root=tmp_path / "results",
+        run="h15",
+        seed=1,
+        from_dir=_REPO_ROOT / "tests",
+    )
+
+    with pytest.raises(core.RepoPathError):
+        listening.build_pack(request, runner=FakeRunner(), git_sha="x", emit=lambda line: None)
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty"])
+def test_from_dir_refuses_a_directory_with_no_wav_before_writing(tmp_path, kind):
+    wav_dir = tmp_path / "candidates"
+    if kind == "empty":
+        wav_dir.mkdir()
+        (wav_dir / "notes.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(core.SpeechBenchError):
+        build_from_dir(tmp_path, wav_dir)
+    assert not (tmp_path / "results" / "h15" / "speech" / "listening-key").exists()
+
+
+def test_listen_pack_from_dir_cli_prints_no_source_file_name(tmp_path, monkeypatch, capsys):
+    wav_dir = make_wav_dir(tmp_path / "candidates")
+    runner = DirFakeRunner(tmp_path / "stage")
+    monkeypatch.setattr(listening, "default_runner", lambda: runner)
+    argv = ["listen-pack", "--results-root", str(tmp_path / "results"), "--run", "h15"]
+
+    code = speech_bench.main([*argv, "--from-dir", str(wav_dir)])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert (tmp_path / "results" / "h15" / "speech" / "listening" / "index.html").is_file()
+    assert "cand-" not in captured.out + captured.err
+    assert f"{len(DIR_NAMES)} clips" in captured.out

@@ -509,3 +509,5 @@ def test_the_structure_file_names_the_speech_directories():
     assert scripts.index("`model_bench/`") < scripts.index("`speech/`")
     assert "`speech/probes/`" in scripts
     assert "`speech-bench/`" in docker
+    firsts = [spec.subcommands[0] for spec in speech_bench.SUITE_REGISTRY]
+    assert [name for name in firsts if f"`{name}`" not in scripts] == []

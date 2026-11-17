@@ -20,14 +20,14 @@
       "vram_gb": 8,
       "models": {
         "separator-dme": {"kind": "hf", "repository": "JusperLee/TIGER-DnR", "revision": "b7a59560bbca10febbcd46fb01600f868e587f57", "licence": "apache-2.0", "gated": false},
-        "separator-melband-vocals": {"kind": "hf", "repository": "becruily/mel-band-roformer-vocals", "revision": "cce57b846ff188a0d1c7f3af42c0585b33f02eb1", "licence": "unverified", "gated": false},
-        "dereverb-melband": {"kind": "hf", "repository": "anvuew/dereverb_mel_band_roformer", "revision": "cef05ad2b5b3145ea5c149d3ad5d1f8439b34d06", "licence": "gpl-3.0", "gated": false},
-        "enhancer-sidon": {"kind": "hf", "repository": "sarulab-speech/sidon-v0.1", "revision": "b3b02d8bbd55fdbc410e6e46e76ef95ace4fbf52", "licence": "mit", "gated": false},
+        "separator-melband-vocals": {"kind": "hf", "repository": "becruily/mel-band-roformer-vocals", "revision": "cce57b846ff188a0d1c7f3af42c0585b33f02eb1", "licence": "unverified", "gated": false, "files": ["config_vocals_becruily.yaml", "mel_band_roformer_vocals_becruily.ckpt"]},
+        "dereverb-melband": {"kind": "hf", "repository": "anvuew/dereverb_mel_band_roformer", "revision": "cef05ad2b5b3145ea5c149d3ad5d1f8439b34d06", "licence": "gpl-3.0", "gated": false, "files": ["dereverb_mel_band_roformer_anvuew.yaml", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"]},
+        "enhancer-sidon": {"kind": "hf", "repository": "sarulab-speech/sidon-v0.1", "revision": "b3b02d8bbd55fdbc410e6e46e76ef95ace4fbf52", "licence": "mit", "gated": false, "files": ["feature_extractor_cuda.pt", "decoder_cuda.pt"]},
         "diarizer-community-1": {"kind": "hf", "repository": "pyannote/speaker-diarization-community-1", "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee", "licence": "cc-by-4.0", "gated": true},
         "quality-brouhaha": {"kind": "hf", "repository": "pyannote/brouhaha", "revision": "c93c9b537732dd50c28c0366c73f560c3a7aeb02", "licence": "openrail", "gated": true},
         "whisperx-asr-large-v3": {"kind": "hf", "repository": "Systran/faster-whisper-large-v3", "revision": "edaa852ec7e145841d8ffdb056a99866b5f0a478", "licence": "mit", "gated": false},
         "crisperwhisper": {"kind": "hf", "repository": "nyralabs/CrisperWhisper2.0_large", "revision": "f4334f6e8193f2691212d49b20fa12d370e13896", "licence": "nyra-health-non-commercial-research", "gated": false},
-        "whisperx-align-en": {"kind": "url", "url": "https://download.pytorch.org/torchaudio/models/wav2vec2_fairseq_base_ls960_asr_ls960.pth", "sha256": "unverified", "dest": "torch/hub/checkpoints/wav2vec2_fairseq_base_ls960_asr_ls960.pth", "licence": "unverified", "gated": false}
+        "whisperx-align-en": {"kind": "url", "url": "https://download.pytorch.org/torchaudio/models/wav2vec2_fairseq_base_ls960_asr_ls960.pth", "sha256": "488fd4f16de84438ffc945334278c1b9fb9b7159a806c1080b16111a958c945d", "dest": "torch/hub/checkpoints/wav2vec2_fairseq_base_ls960_asr_ls960.pth", "licence": "unverified", "gated": false}
       }
     },
     "teacher-indextts2": {

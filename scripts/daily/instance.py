@@ -82,7 +82,17 @@ EXIT_REFUSED = 2
 INSTANCE_NAMES = ("daily", "rehearsal")
 DEFAULT_INSTANCE = "daily"
 DAILY_INSTANCE = "daily"
-INSTANCE_DIRS = ("state", "mist-memory", "logs", "ops", "models", "release", "retired", "bin")
+INSTANCE_DIRS = (
+    "state",
+    "mist-memory",
+    "logs",
+    "ops",
+    "models",
+    "release",
+    "retired",
+    "bin",
+    "secrets",
+)
 # A container that mounts only `state/` or `mist-memory/` sees neither the root nor the host
 # registry, so each carries its own copy of the marker.
 MARKED_SUBDIRS = ("state", "mist-memory")

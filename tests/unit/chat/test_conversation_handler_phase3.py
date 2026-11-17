@@ -69,21 +69,21 @@ class TestConventionsLoaderWiring:
         containing the conventions content. Post 2026-05-25 KV-cache discipline
         fix (parity audit v2.1 G6), the conventions message sits immediately
         after the static system template and before any variable content
-        (retrieval, advisory, history) so the cache prefix maximizes reuse.
+        (history, then the per-turn delta) so the cache prefix stays reusable.
         """
         (tmp_path / "MIST.md").write_text("VAULT CONVENTIONS BODY", encoding="utf-8")
         loader = ConventionsLoader(tmp_path)
         handler = _make_handler(conventions_loader=loader)
 
         session = ConversationSession(session_id="p3-s1", user_id="raj")
-        session.add_message("user", "hello")
 
         messages = handler._build_messages(
             session=session,
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="hello",
+        ).messages
 
         # The conventions user message must exist.
         conventions_msgs = [
@@ -111,9 +111,10 @@ class TestConventionsLoaderWiring:
         """KV-cache discipline regression test (parity audit v2.1 G6).
 
         With both MIST.md vault conventions AND retrieval context present,
-        the conventions user message must precede the retrieval system
-        message so the stable prefix (persona + static template + MIST.md)
-        survives variable-content invalidation across turns.
+        the conventions user message must precede the retrieval block (now
+        in the final user message) so the stable prefix (persona + static
+        template + MIST.md) survives variable-content invalidation across
+        turns.
 
         Pre-2026-05-25 the order was retrieval BEFORE conventions which
         broke MIST.md KV-cache reuse on every turn.
@@ -125,7 +126,6 @@ class TestConventionsLoaderWiring:
         handler = _make_handler(conventions_loader=loader)
 
         session = ConversationSession(session_id="p3-kv-cache", user_id="raj")
-        session.add_message("user", "hello")
 
         retrieval = RetrievalResult(
             query="test",
@@ -146,7 +146,8 @@ class TestConventionsLoaderWiring:
             max_history=10,
             retrieval_result=retrieval,
             mist_context=None,
-        )
+            pending_user_message="hello",
+        ).messages
 
         # Locate the two messages by sentinel content.
         conv_index = next(
@@ -160,9 +161,12 @@ class TestConventionsLoaderWiring:
             "turns (G6). Got conv_index=%d, retr_index=%d." % (conv_index, retr_index)
         )
 
-        # Conventions still carry the user role; retrieval still carries system.
+        # Conventions still carry the user role. Retrieval varies per turn, so
+        # it rides in the final user message, ahead of the user's words.
         assert messages[conv_index]["role"] == "user"
-        assert messages[retr_index]["role"] == "system"
+        assert retr_index == len(messages) - 1
+        assert messages[retr_index]["role"] == "user"
+        assert messages[retr_index]["content"].endswith("hello")
 
     def test_build_messages_omits_conventions_user_message_when_no_mist_md(
         self, tmp_path: Path
@@ -175,14 +179,14 @@ class TestConventionsLoaderWiring:
         handler = _make_handler(conventions_loader=loader)
 
         session = ConversationSession(session_id="p3-s2", user_id="raj")
-        session.add_message("user", "hello")
 
         messages = handler._build_messages(
             session=session,
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="hello",
+        ).messages
 
         assert not any("VAULT CONVENTIONS" in m.get("content", "") for m in messages)
 

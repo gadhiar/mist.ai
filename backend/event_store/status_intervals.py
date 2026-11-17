@@ -26,8 +26,9 @@ reported, never created. Rows are read in `id` order and each row's start is
 clipped to the latest end already counted, so two rows that overlap after the
 clock stepped back count their overlap once. An interval ends at its
 `last_seen_at`: the time since the newest tick is unrecorded, never up. Days
-are local days in `MIST_TIMEZONE`, resolved through `pytz` as
-`usage.py` does, so a DST change gives a day of 82800 s or 90000 s.
+are local days in `MIST_TIMEZONE`, resolved by `usage.py`'s `resolve_timezone`
+through the shared user-zone resolver, so a DST change gives a day of 82800 s
+or 90000 s.
 """
 
 from __future__ import annotations

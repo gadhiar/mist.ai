@@ -269,6 +269,7 @@ class TestTheRoundTrip:
             "event_store.db",
             "extraction_cache.db",
             "vault_sidecar.db",
+            "capabilities.db",
         }
         for filename in report.stores_restored:
             captured = (artifact / STORES_DIRNAME / filename).read_bytes()
@@ -282,6 +283,8 @@ class TestTheRoundTrip:
         restore(artifact, restore_target, target_graph, backup_root)
         assert row_counts(restore_target / "event_store.db") == {"conversation_turn_events": 3}
         assert row_counts(restore_target / "vault_sidecar.db") == {"vault_chunks": 5}
+        # The target held no capabilities.db, as a fresh instance root does not.
+        assert row_counts(restore_target / "capabilities.db") == {"alarm_records": 4}
 
     def test_stale_wal_sidecars_beside_the_target_store_are_removed(
         self, artifact, restore_target, target_graph, backup_root
@@ -795,17 +798,19 @@ class TestAFailureInEachPhaseLeavesExactlyTheDocumentedState:
     def test_a_phase_5_failure_commits_the_stores_before_it_and_no_others(
         self, artifact, restore_target, target_graph, backup_root, monkeypatch
     ):
-        # `os.replace` is atomic PER STORE: three stores are three atomic
-        # operations, not one, so the documented state after a failure at store
-        # two is store one new and stores two and three old.
+        # `os.replace` is atomic PER STORE: four stores are four atomic
+        # operations, not one. Stores commit in manifest order, which is sorted by
+        # name, so a failure at `extraction_cache.db` (the third) leaves
+        # `capabilities.db` and `event_store.db` new and `vault_sidecar.db` old.
         fail_rename_onto(monkeypatch, "extraction_cache.db")
 
         with pytest.raises(BackupError) as failure:
             restore(artifact, restore_target, target_graph, backup_root)
 
+        assert row_counts(restore_target / "capabilities.db") == {"alarm_records": 4}
         assert row_counts(restore_target / "event_store.db") == {"conversation_turn_events": 3}
         assert row_counts(restore_target / "vault_sidecar.db") == {"vault_chunks": 1}
-        assert "['event_store.db']" in str(failure.value)
+        assert "['capabilities.db', 'event_store.db']" in str(failure.value)
 
     def test_a_phase_5_failure_leaves_the_vault_untouched_and_the_marker_accurate(
         self, artifact, restore_target, target_graph, backup_root, monkeypatch
@@ -818,7 +823,7 @@ class TestAFailureInEachPhaseLeavesExactlyTheDocumentedState:
         assert (restore_target / "vault" / "target-only.md").is_file()
         assert not (restore_target / f"vault{VAULT_PREVIOUS_SUFFIX}").exists()
         marker = read_marker(restore_target)
-        assert marker["phases"]["stores_committed"] == ["event_store.db"]
+        assert marker["phases"]["stores_committed"] == ["capabilities.db", "event_store.db"]
         assert marker["phases"]["graph"]["committed"] is True
         assert marker["phases"]["vault_committed"] is False
         assert marker["phases"]["vault_previous"] is None

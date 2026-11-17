@@ -1,16 +1,23 @@
 """Tests for backend.knowledge.config."""
 
+import dataclasses
 import os
 from contextlib import contextmanager
+from datetime import UTC
+
+import pytest
 
 from backend.knowledge.config import (
+    LLM_ROLES,
     ContextBudgetConfig,
     FilewatcherConfig,
     KnowledgeConfig,
     LLMConfig,
+    LLMEndpoint,
     SidecarIndexConfig,
     VaultConfig,
 )
+from backend.memory.config import MEMORY_ENV_VARS, MemoryConfig
 
 
 @contextmanager
@@ -87,6 +94,101 @@ class TestLLMConfigToolThinkingBudget:
         with _env(MIST_TOOL_THINKING_BUDGET="OFF"):
             config = LLMConfig.from_env()
         assert config.tool_thinking_budget_tokens is None
+
+
+class TestLLMConfigRoles:
+    """T39: a role reads its own endpoint, and an unset role is the base endpoint."""
+
+    _ROLE_VARS = {"MIST_LLM_CONVERSATION_URL": None, "MIST_LLM_CONVERSATION_MODEL": None}
+
+    def test_roles_vocabulary(self):
+        assert LLM_ROLES == ("conversation",)
+
+    def test_endpoint_is_frozen_and_slotted(self):
+        endpoint = LLMEndpoint(base_url="http://a:1", model="m")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            endpoint.model = "other"  # type: ignore[misc]
+        assert not hasattr(endpoint, "__dict__")
+
+    def test_default_has_no_roles_and_every_endpoint_is_the_base(self):
+        config = LLMConfig(base_url="http://base:8080", model="base-model")
+        base = LLMEndpoint(base_url="http://base:8080", model="base-model")
+        assert config.roles == {}
+        assert config.endpoint(None) == base
+        assert config.endpoint("conversation") == base
+
+    def test_role_endpoint_wins_when_set(self):
+        conversation = LLMEndpoint(base_url="http://conv:8081", model="small")
+        config = LLMConfig(
+            base_url="http://base:8080", model="base-model", roles={"conversation": conversation}
+        )
+        assert config.endpoint("conversation") == conversation
+        assert config.endpoint(None) == LLMEndpoint(base_url="http://base:8080", model="base-model")
+
+    def test_unknown_role_raises(self):
+        with pytest.raises(ValueError, match="recall"):
+            LLMConfig().endpoint("recall")  # type: ignore[arg-type]
+
+    def test_from_env_without_role_variables_has_no_roles(self):
+        with _env(**self._ROLE_VARS):
+            config = LLMConfig.from_env()
+        assert config.roles == {}
+
+    def test_from_env_url_alone_takes_the_base_model(self):
+        with _env(
+            MIST_LLM_CONVERSATION_URL="http://conv:8081",
+            MIST_LLM_CONVERSATION_MODEL=None,
+            MODEL="base-model",
+        ):
+            config = LLMConfig.from_env()
+        assert config.roles == {
+            "conversation": LLMEndpoint(base_url="http://conv:8081", model="base-model")
+        }
+
+    def test_from_env_url_and_model(self):
+        with _env(
+            MIST_LLM_CONVERSATION_URL="https://conv:8081",
+            MIST_LLM_CONVERSATION_MODEL="small",
+            MODEL="base-model",
+        ):
+            config = LLMConfig.from_env()
+        assert config.roles["conversation"] == LLMEndpoint(
+            base_url="https://conv:8081", model="small"
+        )
+
+    def test_from_env_empty_url_is_unset(self):
+        with _env(MIST_LLM_CONVERSATION_URL="  ", MIST_LLM_CONVERSATION_MODEL=None):
+            config = LLMConfig.from_env()
+        assert config.roles == {}
+
+    def test_model_without_url_raises_naming_the_model_variable(self):
+        with (
+            _env(MIST_LLM_CONVERSATION_URL=None, MIST_LLM_CONVERSATION_MODEL="small"),
+            pytest.raises(ValueError, match="MIST_LLM_CONVERSATION_MODEL"),
+        ):
+            LLMConfig.from_env()
+
+    @pytest.mark.parametrize("url", ["ftp://conv:8081", "conv:8081", "http://"])
+    def test_url_without_http_scheme_and_host_raises_naming_the_url_variable(self, url):
+        with (
+            _env(MIST_LLM_CONVERSATION_URL=url, MIST_LLM_CONVERSATION_MODEL=None),
+            pytest.raises(ValueError, match="MIST_LLM_CONVERSATION_URL"),
+        ):
+            LLMConfig.from_env()
+
+    def test_role_variables_are_read_by_from_env_not_at_class_level(self):
+        """KNOWN_ISSUES.md records class-level `os.getenv` defaults as a trap:
+        they are baked in at import. Setting the variables after import must
+        reach `from_env` and must not reach the bare constructor.
+        """
+        with _env(MIST_LLM_CONVERSATION_URL="http://conv:8081", MIST_LLM_CONVERSATION_MODEL=None):
+            assert LLMConfig().roles == {}
+            assert "conversation" in LLMConfig.from_env().roles
+
+    def test_instances_do_not_share_a_roles_dict(self):
+        first, second = LLMConfig(), LLMConfig()
+        first.roles["conversation"] = LLMEndpoint(base_url="http://a:1", model="m")
+        assert second.roles == {}
 
 
 class TestContextBudgetConfigWindowSentinel:
@@ -412,6 +514,40 @@ class TestKnowledgeConfigVaultWiring:
         assert config.vault is custom
         assert config.vault.root == "/tmp/custom-vault"
         assert config.vault.enabled is False
+
+
+class TestKnowledgeConfigMemoryWiring:
+    """KnowledgeConfig nests MemoryConfig as `memory` (mist-read-path T2)."""
+
+    def test_post_init_defaults_memory(self):
+        from backend.knowledge.config import (
+            EmbeddingConfig,
+            ExtractionConfig,
+            Neo4jConfig,
+        )
+
+        config = KnowledgeConfig(
+            neo4j=Neo4jConfig(),
+            llm=LLMConfig(),
+            embedding=EmbeddingConfig(),
+            extraction=ExtractionConfig(),
+        )
+
+        assert config.memory == MemoryConfig()
+
+    def test_from_env_builds_memory_without_a_tz_database(self):
+        """An unset MIST_TIMEZONE gives `datetime.timezone.utc`, which needs no zone database."""
+        with _env(**_clear(*MEMORY_ENV_VARS)):
+            config = KnowledgeConfig.from_env()
+
+        assert config.memory == MemoryConfig()
+        assert config.memory.tz is UTC
+
+    def test_from_env_reads_memory_variables(self):
+        with _env(**{**_clear(*MEMORY_ENV_VARS), "MIST_MEMORY_BLOCK_TOKENS": "320"}):
+            config = KnowledgeConfig.from_env()
+
+        assert config.memory.block_tokens == 320
 
 
 class TestRebuildDeterminismStamps:

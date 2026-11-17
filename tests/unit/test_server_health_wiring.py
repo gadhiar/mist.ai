@@ -831,10 +831,15 @@ def lifespan_harness(monkeypatch, tmp_path):
         "_extraction_dispatcher_start_failed",
         "_gpu_yield",
         "_models_ready",
+        "_capability_build",
+        "_capability_config",
+        "_capability_power",
     ):
         monkeypatch.setattr(server, name, getattr(server, name))
     monkeypatch.setattr(server, "message_queue", asyncio.Queue())
     monkeypatch.setattr(server, "configure_file_logging", lambda log_dir: None)
+    # The record factory is process-global; installing it here would outlive the test.
+    monkeypatch.setattr(server, "install_log_redaction", lambda registry: None)
     monkeypatch.setattr(server, "build_vault_writer", lambda *a, **k: None)
     monkeypatch.setattr(server, "build_sidecar_index", lambda *a, **k: None)
     monkeypatch.setattr(server, "build_phase3_components", lambda *a, **k: None)

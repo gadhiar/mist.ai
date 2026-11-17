@@ -1,6 +1,8 @@
-"""Tests for SentenceBoundaryDetector."""
+"""Tests for SentenceBoundaryDetector and `find_clause_boundary`."""
 
-from backend.sentence_detector import SentenceBoundaryDetector
+import pytest
+
+from backend.sentence_detector import SentenceBoundaryDetector, find_clause_boundary
 
 
 class TestSentenceBoundaryDetector:
@@ -89,3 +91,80 @@ class TestSentenceBoundaryDetector:
         self.detector.feed("Second without ending")
         sentences = self.detector.flush()
         assert sentences == ["Second without ending"]
+
+
+class TestFindClauseBoundary:
+    """`find_clause_boundary` decides where the first TTS segment, and the handler's first
+    emission, may be cut. A cut inside a number or an abbreviation makes the voice pause
+    mid-phrase, and one that waits for the end of the sentence delays the first audio.
+    """
+
+    def test_returns_the_index_just_past_a_comma_at_the_minimum(self):
+        text = "Here is the first sentence of the reply, which runs long."
+
+        cut = find_clause_boundary(text, 40)
+
+        assert cut == 40
+        assert text[:cut] == "Here is the first sentence of the reply,"
+
+    def test_skips_a_boundary_before_the_minimum(self):
+        text = "Here is the reply, which runs long enough to pass."
+
+        assert find_clause_boundary(text, 40) is None
+        assert find_clause_boundary(text, 0) == len("Here is the reply,")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("Here is a clause,", id="comma-at-end"),
+            pytest.param("It costs 1,000 dollars", id="thousands-separator"),
+            pytest.param("Meet at 10:30 today", id="clock-time"),
+            pytest.param("It is done.", id="period-at-end"),
+        ],
+    )
+    def test_needs_whitespace_after_the_boundary(self, text):
+        assert find_clause_boundary(text, 0) is None
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            pytest.param("First part; second part", "First part;", id="semicolon"),
+            pytest.param("Note this: it matters", "Note this:", id="colon"),
+            pytest.param("I thought so - but no", "I thought so -", id="hyphen-between-spaces"),
+            pytest.param("I thought so — but no", "I thought so —", id="em-dash"),
+            pytest.param("I thought so – but no", "I thought so –", id="en-dash"),
+            pytest.param("I thought so -- but no", "I thought so --", id="double-hyphen"),
+            pytest.param("It is done. Next one", "It is done.", id="sentence-period"),
+            pytest.param("Is it done? Next one", "Is it done?", id="sentence-question"),
+            pytest.param('He said "go." Then he left', 'He said "go."', id="closing-quote"),
+            pytest.param('She said "yes," and left', 'She said "yes,"', id="comma-then-quote"),
+        ],
+    )
+    def test_cuts_just_past_each_kind_of_boundary(self, text, expected):
+        assert find_clause_boundary(text, 0) == len(expected)
+
+    def test_a_dash_inside_a_word_is_not_a_boundary(self):
+        assert find_clause_boundary("A well-known fact stays whole", 0) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("Dr. Smith went home today", id="abbreviation"),
+            pytest.param("It measured 3.5 metres today", id="decimal"),
+            pytest.param("Steps are 1. mix and bake", id="list-marker"),
+            pytest.param("Well... maybe later on", id="ellipsis"),
+        ],
+    )
+    def test_periods_the_sentence_detector_skips_are_not_boundaries(self, text):
+        assert find_clause_boundary(text, 0) is None
+
+    def test_returns_the_first_boundary_at_or_after_the_minimum(self):
+        text = "One, two, three, four"
+
+        assert find_clause_boundary(text, 5) == len("One, two,")
+        assert find_clause_boundary(text, len("One, two,")) == len("One, two,")
+        assert find_clause_boundary(text, len("One, two,") + 1) == len("One, two, three,")
+
+    def test_returns_none_for_text_without_a_boundary(self):
+        assert find_clause_boundary("no boundary anywhere in here", 0) is None
+        assert find_clause_boundary("", 0) is None

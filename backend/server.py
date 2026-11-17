@@ -14,12 +14,13 @@ import sqlite3
 import sys
 import time
 import uuid
+from collections.abc import Coroutine
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -33,8 +34,10 @@ if sys.platform == "win32":
 import httpx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 
 # `python backend/server.py` makes CPython prepend the SCRIPT's directory --
 # backend/ -- to sys.path, but not the repository root. The root has to be added
@@ -52,14 +55,42 @@ sys.path.insert(0, str(project_root))
 # ambiguous with dependencies/csm/config.py -- which is what the old
 # "import config BEFORE voice_processor" ordering existed to work around. The
 # qualified name removes both hazards outright.
+from backend.capabilities.clock import SystemClock  # isort:skip
+from backend.capabilities.config import (  # isort:skip
+    CapabilitiesConfig,
+    load_capabilities_config,
+)
+from backend.capabilities.contracts import ToolOutcome  # isort:skip
+from backend.capabilities.events import (  # isort:skip
+    ActionDecisionMessage,
+    AlarmActionMessage,
+    AlarmReportMessage,
+    QueueEventSink,
+    alarm_action_result_payload,
+)
+from backend.capabilities.power import (  # isort:skip
+    GpuYieldPower,
+    PowerState,
+    SingleModelTiers,
+)
+from backend.capabilities.replies import NoAddress  # isort:skip
+from backend.capabilities.secrets import (  # isort:skip
+    EnvSecretSource,
+    SecretRegistry,
+    install_log_redaction,
+    redact,
+)
+from backend.chat.context_budget import ApproximateTokenCounter  # isort:skip
 from backend.config import DEFAULT_CONFIG  # isort:skip
-from backend.errors import MistError  # isort:skip
+from backend.errors import CapabilityConfigError, MistError  # isort:skip
 from backend.event_store.status_intervals import (  # isort:skip
     degraded_beneath,
     record_status_tick,
 )
 from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
+    CapabilityBuild,
+    build_capability_host,
     build_curation_scheduler,
     build_extraction_dispatcher,
     build_phase3_components,
@@ -78,6 +109,7 @@ from backend.health import (  # isort:skip
     BackupProbe,
     BroadcasterProbe,
     BroadcasterState,
+    CapabilitiesProbe,
     EventStoreProbe,
     ExtractionBacklogProbe,
     ExtractionServiceHealthSource,
@@ -100,6 +132,8 @@ from backend.origins import allowed_origins, origin_allowed  # isort:skip
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from backend.capabilities.host import CapabilityHost
+    from backend.chat.conversation_handler import ConversationHandler
     from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import EventStoreProvider
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
@@ -208,8 +242,10 @@ logger = logging.getLogger(__name__)
 # v1.1.0 (2026-05-25): documents vault_results + system_status (shipped 2026-05-11).
 # v1.2.0 (2026-09-22): uptime_* fields in the ADR; this constant was not bumped then.
 # v1.3.0 (2026-09-26, MIS-171): additive `extraction_status` outbound message.
+# v1.4.0 (goal mist-capabilities): additive capability messages, listed in the
+# `websocket_endpoint` docstring.
 # Pinned by tests/unit/test_server_protocol_version.py.
-PROTOCOL_VERSION = "1.3.0"
+PROTOCOL_VERSION = "1.4.0"
 
 # Global state
 active_connections: set[WebSocket] = set()
@@ -260,6 +296,27 @@ EXTRACTION_HEALTH_CLIENT_TIMEOUT_S = 2.0
 # Gaming mode (`backend/gpu_yield.py`). None when `MIST_OPS_DIR` is unset, or
 # set while TTS is on: the backend is then never yielded.
 _gpu_yield: GpuYield | None = None
+
+# Capabilities (`backend/capabilities/`). `lifespan` builds them before the
+# voice processor. `_capability_build` holds the host, or the reason there is
+# none, which `GET /capabilities` reports; None before `lifespan` runs.
+# `_capability_config` is None when the capability variables do not parse.
+# The secret registry exists from import, so the log redaction `lifespan`
+# installs first covers every secret the host registers later.
+_capability_build: CapabilityBuild | None = None
+_capability_config: CapabilitiesConfig | None = None
+_capability_power: PowerState | None = None
+_capability_secrets = SecretRegistry()
+# A `reason` in `GET /capabilities`, and the text of a capability failure or a
+# validation error answered on the WebSocket, is cut to this many characters.
+CAPABILITY_REASON_MAX_CHARS = 200
+# The inbound WebSocket messages that reach the capability host.
+CAPABILITY_MESSAGE_TYPES = frozenset({"action_decision", "alarm_action", "alarm_report"})
+# The endpoint of the daily WebSocket, recorded as the actor of each alarm
+# action and report that arrives on it. A payload never names its own endpoint.
+WS_ENDPOINT = "desktop"
+_T = TypeVar("_T")
+_M = TypeVar("_M", bound=BaseModel)
 
 # `probe_loop` value for "the registry was never constructed", distinct from
 # `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
@@ -702,7 +759,7 @@ class CurationDependencies:
 
 
 def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
-    """Pull the curation scheduler's live collaborators off the ConversationHandler.
+    """Pull the curation scheduler's live collaborators off the handler and voice processor.
 
     Until 2026-08-03 `lifespan` called `build_curation_scheduler(knowledge_config)`
     and nothing else, leaving `event_store`, `tracker` and `llm_provider` at
@@ -720,12 +777,18 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
         zero patterns, always, so no Skill / KNOWS / MistCapability /
         HAS_CAPABILITY was ever derived.
 
-    `llm_provider` is taken from the handler rather than left to the factory's
-    own `build_llm_provider(config)`: the factory's call passes no
-    `debug_logger`, so the deriver's LLM calls would be structurally invisible
-    to the `phase: "llm_call"` JSONL stream even with the gate on, and a
-    second `LlamaServerProvider` means a duplicate pair of OpenAI clients
-    (and connection pools) that nothing closes.
+    `llm_provider` is the base provider, `voice_processor._llm_provider`: the
+    object `VoiceProcessor` builds and injects into `build_conversation_handler`,
+    which the extraction pipeline holds and `/health` probes
+    (`_health_llm_provider`). It is not the handler's `_provider`, because with
+    the conversation role set (`MIST_LLM_CONVERSATION_URL`) the handler holds
+    the role's provider, and curation stays on `LLM_SERVER_URL` and `MODEL`.
+    With the role unset the two are one object. It is supplied rather than
+    left to the factory's own `build_llm_provider(config)`: the factory's call
+    passes no `debug_logger`, so the deriver's LLM calls would be structurally
+    invisible to the `phase: "llm_call"` JSONL stream even with the gate on,
+    and a second `LlamaServerProvider` means a duplicate pair of OpenAI
+    clients (and connection pools) that nothing closes.
 
     Extracted from `lifespan()` for the same testability reason as
     `_build_session_note_catchup`: WHICH object each dependency points at is
@@ -737,8 +800,9 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     broadcast and the shutdown drain already use.
 
     Returns:
-        A `CurationDependencies` holding the live handler's own objects, or
-        all-None with `handler_found=False` when no handler is reachable.
+        A `CurationDependencies` holding the live handler's own event store
+        and tracker and the voice processor's base provider, or all-None with
+        `handler_found=False` when no handler is reachable.
     """
     handler = (
         voice_processor.models.knowledge.conversation_handler
@@ -755,7 +819,7 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     return CurationDependencies(
         event_store=handler.event_store,
         tracker=handler._tool_usage_tracker,
-        llm_provider=handler._provider,
+        llm_provider=getattr(voice_processor, "_llm_provider", None),
         handler_found=True,
     )
 
@@ -956,6 +1020,74 @@ def _event_store_configured() -> bool:
     return KnowledgeConfig.from_env().event_store.enabled
 
 
+def _capability_host() -> "CapabilityHost | None":
+    """Reach the capability host, or None when `lifespan` built none.
+
+    Read at each call, as the other health accessors are, so the probe and
+    `GET /capabilities` follow whatever build is current.
+    """
+    build = _capability_build
+    return build.host if build is not None else None
+
+
+def _desktop_present() -> bool:
+    """Whether a client is connected, so the desktop ring endpoint can ring."""
+    return bool(active_connections)
+
+
+def _capability_tiers(power: PowerState) -> SingleModelTiers:
+    """The action decode's tiers over the voice processor's one provider.
+
+    The provider is read through `_health_llm_provider` at each call, because
+    it exists only once `VoiceProcessor.initialize()` has built it: before
+    that the decode is unavailable, after it available. The same object is
+    passed to the host and the conversation handler, so they cannot disagree.
+    """
+    return SingleModelTiers(_health_llm_provider, power)
+
+
+def _read_secret_file(path: str) -> str:
+    """Read a `*_FILE` secret, such as a Docker secret holding the Home Assistant token."""
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _attach_capability_host(tiers: SingleModelTiers) -> None:
+    """Attach the built host to the live conversation handler, if both exist.
+
+    Called once `initialize()` has returned, since the handler exists only
+    then. With no handler (knowledge integration off, or its build failed)
+    the host still serves alarm actions and the status surface, but no turn
+    reaches it, which is logged.
+    """
+    host = _capability_host()
+    if host is None:
+        return
+    handler = _health_conversation_handler()
+    if handler is None:
+        logger.warning("Capability host built but no conversation handler exists; turns skip it")
+        return
+    handler.attach_capability_host(host, tiers=tiers)
+    logger.info("Capability host attached to the conversation handler")
+
+
+async def _stop_capability_host() -> None:
+    """Stop the host, then close what the build owns (database, Spotify client).
+
+    A no-op when no host was built. A failure is logged and shutdown goes on.
+    """
+    build = _capability_build
+    if build is None or build.host is None:
+        return
+    try:
+        await build.host.stop()
+    except (MistError, sqlite3.Error, OSError) as e:
+        logger.warning("Capability host stop error (non-fatal): %s", e)
+    try:
+        await build.close()
+    except (MistError, sqlite3.Error, OSError, httpx.HTTPError) as e:
+        logger.warning("Capability build close error (non-fatal): %s", e)
+
+
 async def _initialize_voice_processor(processor: VoiceProcessor, *, yielded: bool = False) -> None:
     """Load the model stack and only then publish readiness.
 
@@ -1049,8 +1181,9 @@ def _build_health_registry(
     probe_settings: HealthProbeSettings,
     yield_state: "Callable[[], str] | None" = None,
     ops_dir: str | None = None,
+    capability_host: "Callable[[], CapabilityHost | None] | None" = None,
 ) -> HealthRegistry:
-    """Construct the eight dependency probes and the registry that runs them.
+    """Construct the dependency probes and the registry that runs them.
 
     Every accessor is a callable that reads module state WHEN THE PROBE RUNS,
     never a value captured here. `voice_processor`, `vault_sidecar` and the
@@ -1088,6 +1221,9 @@ def _build_health_registry(
             the extraction_service check reads, so it reports `paused` while
             night extraction is held off. None or blank on the dev stack,
             which builds no reader and leaves the check as it was.
+        capability_host: The capability host's accessor, read at each check.
+            None when no host was built: the `capabilities` check is then
+            absent rather than unmeasured, which would derive `degraded`.
 
     Returns:
         A registry whose `run_forever` the caller schedules.
@@ -1119,6 +1255,8 @@ def _build_health_registry(
         ExtractionBacklogProbe(dispatcher, checked_extraction_status, start_failed, probe_settings),
         BackupProbe(probe_settings, lambda: datetime.now(UTC)),
     ]
+    if capability_host is not None:
+        probes.append(CapabilitiesProbe(capability_host))
     return HealthRegistry(
         probes,
         monotonic=time.monotonic,
@@ -1273,12 +1411,17 @@ async def _stop_uptime_recorder(task: "asyncio.Task | None") -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
+    # First, before any handler is attached or any secret loaded: the record
+    # factory redacts every record created from here on, whichever handler
+    # (the DEBUG file log below, the WebSocket log handler later) emits it.
+    install_log_redaction(_capability_secrets)
     configure_file_logging(_resolve_log_dir())
 
     global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
     global _broadcaster_state, _health_registry, _health_probe_executor
     global _extraction_health_client, _gpu_yield
+    global _capability_build, _capability_config, _capability_power
 
     # Startup
     logger.info("=" * 60)
@@ -1348,6 +1491,52 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Vault layer initialization failed (continuing without vault): %s", e)
 
+    # Gaming mode, built before the model load so a backend that boots while
+    # the marker exists skips Whisper and the LLM warmup, and before the
+    # capability host, whose power level reads it. Its poll starts only after
+    # initialize() returns, so a marker that came or went during the load is
+    # acted on by the first poll.
+    _gpu_yield = _build_gpu_yield(
+        os.environ.get("MIST_OPS_DIR"),
+        tts_enabled=bool(config.tts_enabled),
+        poll_s=gpu_yield_poll_s(),
+    )
+
+    # Capabilities: built and started before the voice processor exists and
+    # before the model load, so an alarm due at boot rings without waiting
+    # for the models. The decode tiers read the provider lazily (see
+    # `_capability_tiers`), so the host is ready before the provider is.
+    _capability_power = GpuYieldPower(_gpu_yield)
+    capability_tiers = _capability_tiers(_capability_power)
+    try:
+        _capability_config = load_capabilities_config(os.environ)
+    except CapabilityConfigError as e:
+        logger.error("Capability configuration invalid; no capability host: %s", e)
+        _capability_config = None
+        _capability_build = CapabilityBuild(
+            host=None, disabled_reason=f"capability config invalid: {e}"
+        )
+    else:
+        _capability_build = build_capability_host(
+            _capability_config,
+            event_sink=QueueEventSink(loop, message_queue),
+            secret_source=EnvSecretSource(os.environ, _read_secret_file),
+            secret_registry=_capability_secrets,
+            clock=SystemClock(),
+            # No embedder exists before the model load; the router's
+            # embedding stage stays off until one is wired.
+            embedder=None,
+            token_counter=ApproximateTokenCounter(),
+            # None: the factory uses the MCP SDK transport for lights.
+            transport_factory=None,
+            power=_capability_power,
+            tiers=capability_tiers,
+            register=NoAddress(),
+            desktop_present=_desktop_present,
+        )
+    if _capability_build.host is not None:
+        await _capability_build.host.start()
+
     # Initialize voice processor with the server-owned vault_writer, sidecar,
     # and invalidation_bus so that the voice-path ConversationHandler shares a
     # single started writer, the retriever routes to the same initialized sidecar
@@ -1360,21 +1549,13 @@ async def lifespan(app: FastAPI):
         vault_sidecar=vault_sidecar,
         invalidation_bus=vault_invalidation_bus,
     )
-    # Gaming mode, built before the model load so a backend that boots while
-    # the marker exists skips Whisper and the LLM warmup. Its poll starts only
-    # after initialize() returns, so a marker that came or went during the
-    # load is acted on by the first poll.
-    _gpu_yield = _build_gpu_yield(
-        os.environ.get("MIST_OPS_DIR"),
-        tts_enabled=bool(config.tts_enabled),
-        poll_s=gpu_yield_poll_s(),
-    )
     yield_state = _gpu_yield.state if _gpu_yield is not None else None
     defer_llm_jobs = _gpu_yield.is_yielded if _gpu_yield is not None else None
     # Sets `_models_ready` only once initialize() has returned, so
     # `/health.models_loaded` reports a state the process has actually reached
     # rather than the mere existence of the object above.
     await _initialize_voice_processor(voice_processor, yielded=_gpu_is_yielded())
+    _attach_capability_host(capability_tiers)
     gpu_yield_task: asyncio.Task | None = None
     if _gpu_yield is not None:
         gpu_yield_task = asyncio.create_task(_gpu_yield.run_forever(), name="gpu-yield")
@@ -1412,6 +1593,7 @@ async def lifespan(app: FastAPI):
         # The paused marker's directory, passed whether or not gaming mode was
         # built: night extraction is scheduled even with TTS on.
         ops_dir=os.environ.get("MIST_OPS_DIR"),
+        capability_host=_capability_host if _capability_host() is not None else None,
     )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
@@ -1569,6 +1751,10 @@ async def lifespan(app: FastAPI):
             await ch.aclose()
     except Exception as e:  # noqa: BLE001
         logger.warning("ConversationHandler aclose error (non-fatal): %s", e)
+
+    # After the handler drain, so no turn is still calling the host; then the
+    # build closes the database and the Spotify client the host used.
+    await _stop_capability_host()
 
     # T2a: stop the extraction dispatcher AFTER the handler drain above (which
     # waits on the backlog). A job still waiting on the service is abandoned
@@ -1813,6 +1999,115 @@ async def get_extraction_status():
     return extraction_status(extraction_dispatcher).model_dump(mode="json")
 
 
+def _capability_reason(text: str | None) -> str | None:
+    """Redact a reason and cut it to `CAPABILITY_REASON_MAX_CHARS`."""
+    if text is None:
+        return None
+    return redact(text, _capability_secrets)[:CAPABILITY_REASON_MAX_CHARS]
+
+
+def _capability_secret_presence(config: CapabilitiesConfig | None) -> list[dict]:
+    """Whether each configured capability's secret is present; never a value.
+
+    The Home Assistant token counts as present when `MIST_HA_TOKEN` or
+    `MIST_HA_TOKEN_FILE` is set, and the Spotify token when its file exists,
+    which the authorize CLI writes at any time, so it is checked per request.
+    """
+    if config is None:
+        return []
+    secrets: list[dict] = []
+    if "lights" in config.capabilities and config.lights.ha_mcp_url is not None:
+        secrets.append({"name": "MIST_HA_TOKEN", "present": config.lights.ha_token_configured})
+    if "music" in config.capabilities and config.music.spotify_client_id is not None:
+        token_file = Path(config.music.spotify_token_path)
+        secrets.append({"name": "MIST_SPOTIFY_TOKEN_PATH", "present": token_file.is_file()})
+    return secrets
+
+
+def _capabilities_payload() -> dict:
+    """The `GET /capabilities` body: the build, each capability, secrets and stats.
+
+    Every reason passes through `redact` and is capped, and no secret value is
+    read here, so the body is safe for any allowed page to read.
+    """
+    build = _capability_build
+    host = build.host if build is not None else None
+    power = _capability_power
+    capabilities: list[dict] = []
+    if build is not None and host is not None:
+        statuses = {status.name: status for status in host.statuses()}
+        for capability in build.capabilities:
+            status = statuses[capability.name]
+            capabilities.append(
+                {
+                    "name": capability.name,
+                    "state": status.state,
+                    "reason": _capability_reason(status.reason),
+                    "tools": [spec.name for spec in capability.tools()],
+                    "provider_tools": list(capability.provider_tools()),
+                }
+            )
+    return {
+        "enabled": host is not None,
+        "reason": _capability_reason(
+            build.disabled_reason if build is not None else "capabilities not started"
+        ),
+        "power_level": power.level() if power is not None else None,
+        "decode_available": host.decode_available() if host is not None else False,
+        "capabilities": capabilities,
+        "secrets": _capability_secret_presence(_capability_config),
+        "stats": host.stats() if host is not None else {},
+    }
+
+
+@app.get("/capabilities", response_model=None)
+async def get_capabilities(request: Request) -> dict | JSONResponse:
+    """The capability host's state, for the status view and the live checks.
+
+    CORS allows the configured origins only, but a page a browser loads from
+    any site can still send this request, so the same Origin rule as `/ws`
+    applies: a request whose `Origin` the allowlist refuses gets 403, and one
+    with no `Origin` (a local program) or an allowed one gets the body.
+    """
+    if not origin_allowed(request.headers.get("origin"), allowed_origins()):
+        return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
+    return _capabilities_payload()
+
+
+@app.get("/capabilities/usage", response_model=None)
+async def get_capability_usage(
+    request: Request, days: int = Query(7, ge=1, le=90)
+) -> dict | JSONResponse:
+    """Capability use and alarm events per local day: the milestone metric's source.
+
+    The body is `CapabilityHost.usage`'s: `tz`, `since`, `alarms_since`, and `days` and
+    `alarms`, newest first with one entry per day. It holds names, dates and numbers, never an
+    argument, summary or secret. The Origin rule is `GET /capabilities`'s: a refused `Origin`
+    gets 403, none or an allowed one gets the body.
+
+    - `days` (1-90, default 7); out of range is a 422 from the query validation.
+    - With no host the body is `{"enabled": false, "reason"}`, as `GET /capabilities` reports.
+    - A capabilities database that cannot be read is a 503 with
+      `{"error": "store_unavailable"}`, as the `/usage` views answer.
+    """
+    if not origin_allowed(request.headers.get("origin"), allowed_origins()):
+        return JSONResponse(status_code=403, content={"detail": "origin not allowed"})
+    host = _capability_host()
+    if host is None:
+        build = _capability_build
+        return {
+            "enabled": False,
+            "reason": _capability_reason(
+                build.disabled_reason if build is not None else "capabilities not started"
+            ),
+        }
+    try:
+        return await host.usage(days)
+    except MistError as exc:
+        logger.warning("GET /capabilities/usage: %s", _capability_reason(str(exc)))
+        return JSONResponse(status_code=503, content={"error": "store_unavailable"})
+
+
 @app.get("/usage/turns-per-day")
 async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
     """Real-origin turns per local day, counts only: ADR-042's measure of real use.
@@ -1957,6 +2252,211 @@ def _reset_voice_state_if_last_connection() -> bool:
     return True
 
 
+async def _run_capability_call(
+    call: Coroutine[object, object, _T], what: str
+) -> tuple[_T | None, BaseException | None]:
+    """Run one capability call as its own task, and return its result or its failure.
+
+    The receive loop's catch-all ends the connection, so no capability exception
+    may reach it. `asyncio.wait` returns when the task ends instead of
+    re-raising, and the outcome is read from `task.cancelled()` and then
+    `task.exception()`, so any exception is contained without a broad `except`
+    clause (CLAUDE.md, Errors). The task only computes; the endpoint sends what
+    it returns, so a send to a client that has gone still takes the disconnect
+    path.
+
+    If the endpoint is cancelled while it waits, the `finally` cancels the task,
+    so no capability call outlives its connection.
+
+    Returns:
+        `(result, None)` when the call returned; `(None, exception)` when it
+        raised, logged here at ERROR with its traceback; `(None, None)` when it
+        was cancelled, which the caller answers with nothing.
+    """
+    task = asyncio.create_task(call, name=f"capability-{what}")
+    try:
+        await asyncio.wait({task})
+    finally:
+        if not task.done():
+            task.cancel()
+    if task.cancelled():
+        logger.info("Capability call %s was cancelled; nothing is sent", what)
+        return None, None
+    error = task.exception()
+    if error is not None:
+        logger.error("Capability call %s failed", what, exc_info=error)
+        return None, error
+    return task.result(), None
+
+
+def _capability_failure_text(host: "CapabilityHost", error: BaseException) -> str:
+    """The client's text for an unexpected capability failure: class and message, redacted."""
+    text = host.redact(f"{type(error).__name__}: {error}")
+    return text[:CAPABILITY_REASON_MAX_CHARS]
+
+
+def _ws_error(kind: str, message: str) -> dict[str, object]:
+    """The ADR-017 `error` event, never retriable, for a capability message."""
+    return {
+        "type": "error",
+        "kind": kind,
+        "message": message,
+        "retriable": False,
+        "context": None,
+    }
+
+
+def _validate_capability_message(model: type[_M], data: dict[str, object]) -> _M | str:
+    """Return the validated message, or the text of the `validation` error that answers it.
+
+    The text names each failing field with pydantic's message and never the
+    input value, so a client's payload is not echoed back.
+    """
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or 'message'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        return f"invalid {data.get('type')}: {problems}"[:CAPABILITY_REASON_MAX_CHARS]
+
+
+async def _send_capability_snapshot(websocket: WebSocket) -> None:
+    """Send the host's connect snapshot on this socket, or nothing when there is no host.
+
+    The payloads go to the connecting client only, as `session_started` does.
+    A failure building them is answered with a `server` error and the
+    connection goes on.
+    """
+    host = _capability_host()
+    if host is None:
+        return
+    events, error = await _run_capability_call(host.snapshot_events(), "connect snapshot")
+    if error is not None:
+        await websocket.send_json(_ws_error("server", _capability_failure_text(host, error)))
+        return
+    for payload in events or ():
+        await websocket.send_json(payload)
+
+
+async def _decided_payloads(
+    handler: "ConversationHandler", session_id: str, message: ActionDecisionMessage
+) -> list[str]:
+    """Decide a proposal and serialise what to broadcast, inside the contained task."""
+    payloads = await handler.decide_proposal(session_id, message.proposal_id, message.decision)
+    return [json.dumps(payload) for payload in payloads]
+
+
+async def _alarm_action_result(
+    host: "CapabilityHost", message: AlarmActionMessage
+) -> dict[str, object]:
+    """Run a client's alarm action and build its `alarm_action_result`."""
+    outcome = await host.alarm_action(
+        message.alarm_id, message.action, message.minutes, endpoint=WS_ENDPOINT
+    )
+    return alarm_action_result_payload(
+        message.alarm_id, message.action, message.request_id, outcome, datetime.now(UTC)
+    )
+
+
+async def _alarm_report_result(
+    host: "CapabilityHost", message: AlarmReportMessage
+) -> dict[str, object]:
+    """Apply an endpoint's alarm report and build its `alarm_action_result`."""
+    outcome = await host.alarm_report(message, endpoint=WS_ENDPOINT)
+    return alarm_action_result_payload(
+        message.alarm_id, "report", message.request_id, outcome, datetime.now(UTC)
+    )
+
+
+def _failed_alarm_result(
+    host: "CapabilityHost",
+    alarm_id: str,
+    action: Literal["stop", "snooze", "dismiss", "report"],
+    request_id: str | None,
+    error: BaseException,
+) -> dict[str, object]:
+    """The `alarm_action_result` for an unexpected exception: `failed`, in place of `error`."""
+    reason = _capability_failure_text(host, error)
+    outcome = ToolOutcome(status="error", summary=f"Alarm {action} failed.", reason=reason)
+    return alarm_action_result_payload(alarm_id, action, request_id, outcome, datetime.now(UTC))
+
+
+async def _handle_capability_message(
+    websocket: WebSocket, data: dict[str, object], session_id: str
+) -> None:
+    """Answer `action_decision`, `alarm_action` or `alarm_report` from this connection.
+
+    Each capability call runs through `_run_capability_call`, and every send
+    happens here, in the receive loop's `try`, so a client that has gone takes
+    the disconnect path. `action_decision`'s payloads are broadcast (every
+    capability payload is, until turns are routed per connection); an alarm
+    action or report gets exactly one `alarm_action_result`, on this socket.
+    """
+    host = _capability_host()
+    if host is None:
+        await websocket.send_json(_ws_error("validation", "capabilities disabled"))
+        return
+    msg_type = data.get("type")
+    if msg_type == "action_decision":
+        await _handle_action_decision(websocket, host, data, session_id)
+        return
+    if msg_type == "alarm_action":
+        action = _validate_capability_message(AlarmActionMessage, data)
+        if isinstance(action, str):
+            await websocket.send_json(_ws_error("validation", action))
+            return
+        result, error = await _run_capability_call(
+            _alarm_action_result(host, action), "alarm_action"
+        )
+        if error is not None:
+            result = _failed_alarm_result(
+                host, action.alarm_id, action.action, action.request_id, error
+            )
+    else:
+        report = _validate_capability_message(AlarmReportMessage, data)
+        if isinstance(report, str):
+            await websocket.send_json(_ws_error("validation", report))
+            return
+        result, error = await _run_capability_call(
+            _alarm_report_result(host, report), "alarm_report"
+        )
+        if error is not None:
+            result = _failed_alarm_result(host, report.alarm_id, "report", report.request_id, error)
+    if result is not None:
+        await websocket.send_json(result)
+
+
+async def _handle_action_decision(
+    websocket: WebSocket, host: "CapabilityHost", data: dict[str, object], session_id: str
+) -> None:
+    """Resolve a proposal for this connection's own session, and broadcast what it produced.
+
+    `decide_proposal` belongs to the conversation handler, which merges the
+    decision into the session's history. With no handler no turn reached the
+    host, so there is no proposal to decide, and the client is told so.
+    """
+    decision = _validate_capability_message(ActionDecisionMessage, data)
+    if isinstance(decision, str):
+        await websocket.send_json(_ws_error("validation", decision))
+        return
+    handler = _health_conversation_handler()
+    if handler is None:
+        await websocket.send_json(
+            _ws_error("server", "no conversation handler, so no proposal can be decided")
+        )
+        return
+    payloads, error = await _run_capability_call(
+        _decided_payloads(handler, session_id, decision), "action_decision"
+    )
+    if error is not None:
+        await websocket.send_json(_ws_error("server", _capability_failure_text(host, error)))
+        return
+    for payload in payloads or ():
+        await message_queue.put(payload)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for voice + text conversation.
@@ -1966,7 +2466,8 @@ async def websocket_endpoint(websocket: WebSocket):
     the surface; field-level schemas live in the ADR.
 
     Inbound (client -> server):
-        audio, text, interrupt, reset_vad, log_config, subscribe_logs
+        audio, text, interrupt, reset_vad, log_config, subscribe_logs,
+        action_decision, alarm_action, alarm_report (1.4.0)
 
     Outbound (server -> client):
         session_started, heartbeat, health_status, system_status,
@@ -1975,8 +2476,21 @@ async def websocket_endpoint(websocket: WebSocket):
         tool_call_started / tool_call_completed, cards_summon /
         cards_dismiss, graph_subgraph, vault_results, form_switch,
         discriminated error, status, log_config_ack, log,
+        capabilities_status, alarm_state, action_proposed, action_resolved,
+        alarm_fired, alarm_action_result (1.4.0),
         plus binary audio frames (MIST protocol: MSG_AUDIO_CHUNK /
         MSG_AUDIO_COMPLETE).
+
+    With a capability host, the connect snapshot (`capabilities_status`, then
+    `alarm_state` when the alarm state can be read) follows `session_started`
+    on this socket only, as does the one `alarm_action_result` answering each
+    valid `alarm_action` or `alarm_report`, and any `error` answering a
+    capability message. `action_proposed`, `action_resolved`, `alarm_fired`,
+    and later `capabilities_status` and `alarm_state` changes are broadcast.
+    With no host, the snapshot is not sent and the three inbound capability
+    messages get a `validation` error, "capabilities disabled".
+    Each capability call runs through `_run_capability_call`, so a capability's
+    exception is answered on this socket and never ends the connection.
 
     A browser origin outside `allowed_origins()` is closed with 1008 before
     `accept`, because browsers apply no CORS to WebSockets (`backend/origins.py`).
@@ -2029,6 +2543,9 @@ async def websocket_endpoint(websocket: WebSocket):
     )
 
     try:
+        # First inside the `try`, so a client that has gone before the snapshot
+        # reaches it takes the disconnect path and its cleanup below.
+        await _send_capability_snapshot(websocket)
         while True:
             # Receive message from client
             data = await websocket.receive_json()
@@ -2047,12 +2564,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             # Handle different message types
+            yielded_refusal = None
             if msg_type in ("audio", "text"):
                 # Gaming mode: refuse the turn before it is processed or
                 # recorded. Every other message type is handled as usual.
-                refusal = _yielded_turn_refusal()
-                if refusal is not None:
-                    await websocket.send_json(refusal)
+                # With a capability host, a `text` message is first offered to
+                # the capability-only turn below, and refused only when nothing
+                # answers it, so alarms and timers stay usable while yielded.
+                yielded_refusal = _yielded_turn_refusal()
+                if yielded_refusal is not None and (
+                    msg_type == "audio" or _capability_host() is None
+                ):
+                    await websocket.send_json(yielded_refusal)
                     continue
 
             if msg_type == "audio":
@@ -2095,6 +2618,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Text message (manual input)
                 user_text = data.get("text", "")
                 if not user_text:
+                    if yielded_refusal is not None:
+                        await websocket.send_json(yielded_refusal)
                     continue
                 logger.info(f"Text message from client: '{user_text}'")
 
@@ -2102,8 +2627,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 # the user message optimistically in sendTextMessage().
                 # Voice path sends its own transcription from _process_user_speech().
 
-                # Process (will spawn thread internally)
                 loop = asyncio.get_running_loop()
+                if yielded_refusal is not None:
+                    # Gaming mode with a host: only the capability host's
+                    # model-free step may answer; the provider is never called.
+                    answered = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            voice_processor._process_conversation_turn,
+                            user_text,
+                            session_id=session_id,
+                            capability_only=True,
+                        ),
+                    )
+                    if not answered:
+                        await websocket.send_json(yielded_refusal)
+                    continue
+
+                # Process (will spawn thread internally)
                 await loop.run_in_executor(
                     None,
                     functools.partial(
@@ -2206,6 +2747,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"Log streaming: {'enabled' if enabled else 'disabled'}",
                     }
                 )
+
+            elif msg_type in CAPABILITY_MESSAGE_TYPES:
+                await _handle_capability_message(websocket, data, session_id)
 
             else:
                 logger.warning(f"Unknown message type: {msg_type}")

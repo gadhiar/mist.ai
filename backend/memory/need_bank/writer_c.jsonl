@@ -1,0 +1,770 @@
+{"id": "c-need-001", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "How do I usually take my coffee in the afternoon?"}
+{"id": "c-need-002", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Set the thermostat to my normal evening temperature."}
+{"id": "c-need-003", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Put the lights on how I like them for reading."}
+{"id": "c-need-004", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "Around what hour do I normally turn in on a weeknight?"}
+{"id": "c-need-005", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "Which side of the bed do I normally sleep on?"}
+{"id": "c-need-006", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "What's my usual order at the bakery on Saturdays?"}
+{"id": "c-need-007", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Play my morning playlist, the one I always start the day with."}
+{"id": "c-need-008", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "How spicy do I like my curry, mild or hot?"}
+{"id": "c-need-009", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "What sweetener do I normally stir into my tea?"}
+{"id": "c-need-010", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Wake me at my usual time tomorrow."}
+{"id": "c-need-011", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "How many days a week do I normally go running?"}
+{"id": "c-need-012", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Set the shower to the temperature I like."}
+{"id": "c-need-013", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "What's my go-to takeaway on a Friday night?"}
+{"id": "c-need-014", "writer": "c", "label": "need", "category": "preferences_habits", "hard": false, "text": "What's my usual bedtime on work nights?"}
+{"id": "c-need-015", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Turn the volume to where I usually keep it."}
+{"id": "c-need-016", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Start a focus timer the length I usually work in."}
+{"id": "c-need-017", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Set an alarm for when I normally leave for work."}
+{"id": "c-need-018", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Order the regular I always get from the corner cafe."}
+{"id": "c-need-019", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Get the bedroom as warm as I usually like it at night."}
+{"id": "c-need-020", "writer": "c", "label": "need", "category": "preferences_habits", "hard": true, "text": "Set a timer for as long as I usually steep my tea."}
+{"id": "c-need-021", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "How's my garden project coming along, what was the next step?"}
+{"id": "c-need-022", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "When did I say the quarterly sales report has to be finished?"}
+{"id": "c-need-023", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Which shade did I settle on for the kitchen walls?"}
+{"id": "c-need-024", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Which week did I block out for the move?"}
+{"id": "c-need-025", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Where did I get to with the bathroom tiling?"}
+{"id": "c-need-026", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "What did I tell you I had lined up for Saturday afternoon?"}
+{"id": "c-need-027", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "How far along am I with the novel draft?"}
+{"id": "c-need-028", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "What's the next milestone on my app project?"}
+{"id": "c-need-029", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "What budget did I set for the renovation?"}
+{"id": "c-need-030", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Who's the contractor I hired for the roof?"}
+{"id": "c-need-031", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Which day did I say I'd present to the team?"}
+{"id": "c-need-032", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Which targets did I set myself back in January?"}
+{"id": "c-need-033", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "What did I name the folder for the tax paperwork?"}
+{"id": "c-need-034", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "How many hours have I logged on the thesis this week?"}
+{"id": "c-need-035", "writer": "c", "label": "need", "category": "work_projects_plans", "hard": false, "text": "Which client pitch was I working on before the holiday?"}
+{"id": "c-need-036", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "When's my brother's flight landing?"}
+{"id": "c-need-037", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "What does my nephew want for his birthday?"}
+{"id": "c-need-038", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Remind me of the name of the dog next door."}
+{"id": "c-need-039", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Did my boss sign off on my leave request?"}
+{"id": "c-need-040", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Is my sister still vegetarian?"}
+{"id": "c-need-041", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Which foods does my mum react badly to?"}
+{"id": "c-need-042", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Which year was my niece born again?"}
+{"id": "c-need-043", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Where does my best friend work these days?"}
+{"id": "c-need-044", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "What was my grandad's job before he retired?"}
+{"id": "c-need-045", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "Which school does my son go to?"}
+{"id": "c-need-046", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "What's my partner's shoe size?"}
+{"id": "c-need-047", "writer": "c", "label": "need", "category": "people", "hard": true, "text": "Call the plumber I used last time."}
+{"id": "c-need-048", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "How is my aunt recovering after her operation?"}
+{"id": "c-need-049", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "What's my coworker's new baby called?"}
+{"id": "c-need-050", "writer": "c", "label": "need", "category": "people", "hard": false, "text": "When does my cousin get back from abroad?"}
+{"id": "c-need-051", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Is my laptop the fourteen or sixteen inch one?"}
+{"id": "c-need-052", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Is the dishwasher I bought still under guarantee?"}
+{"id": "c-need-053", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "What size tyres does my car take?"}
+{"id": "c-need-054", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Which neighbour has a copy of our house key?"}
+{"id": "c-need-055", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "What lens did I buy for my camera?"}
+{"id": "c-need-056", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Is the boiler overdue for its yearly check?"}
+{"id": "c-need-057", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Which bike lock do I have, the code one or the key one?"}
+{"id": "c-need-058", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "What brand is my vacuum cleaner?"}
+{"id": "c-need-059", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "When does my car insurance renew?"}
+{"id": "c-need-060", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "When did we get the mattress in the spare room?"}
+{"id": "c-need-061", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Which guitar strings do I use?"}
+{"id": "c-need-062", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "What's the mileage on my motorbike?"}
+{"id": "c-need-063", "writer": "c", "label": "need", "category": "possessions", "hard": true, "text": "Put on the speaker I got for my birthday."}
+{"id": "c-need-064", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "What phone case did I order last month?"}
+{"id": "c-need-065", "writer": "c", "label": "need", "category": "possessions", "hard": false, "text": "Which herbs did I say were growing on the balcony?"}
+{"id": "c-need-066", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Where do I usually grab lunch on workdays?"}
+{"id": "c-need-067", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Which leisure centre do I swim at?"}
+{"id": "c-need-068", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "How long is my commute door to door?"}
+{"id": "c-need-069", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "What was the name of that hotel by the harbour we liked?"}
+{"id": "c-need-070", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Which beach did we go to last summer?"}
+{"id": "c-need-071", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Which vet's practice is our cat registered with?"}
+{"id": "c-need-072", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "What's my parents' village called?"}
+{"id": "c-need-073", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Which chemist do I pick my prescription up from?"}
+{"id": "c-need-074", "writer": "c", "label": "need", "category": "places", "hard": true, "text": "Navigate to my usual car park in town."}
+{"id": "c-need-075", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Where did I park the car this morning?"}
+{"id": "c-need-076", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Which restaurant did I book for Friday?"}
+{"id": "c-need-077", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Where did my grandparents live before they moved?"}
+{"id": "c-need-078", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Where was that hiking trail I loved?"}
+{"id": "c-need-079", "writer": "c", "label": "need", "category": "places", "hard": false, "text": "Which city am I flying to next week?"}
+{"id": "c-need-080", "writer": "c", "label": "need", "category": "places", "hard": true, "text": "What's the weather like where my parents live?"}
+{"id": "c-need-081", "writer": "c", "label": "need", "category": "places", "hard": true, "text": "How long will it take to drive to my sister's?"}
+{"id": "c-need-082", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Yesterday we went over my job worries, what did you suggest?"}
+{"id": "c-need-083", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Which novel did you put me onto a few weeks back?"}
+{"id": "c-need-084", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "That soup recipe from our chat last Tuesday, what was in it?"}
+{"id": "c-need-085", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "What did we say about the holiday budget?"}
+{"id": "c-need-086", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Which trainers did you point me to when we talked about running?"}
+{"id": "c-need-087", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "What was the film we were discussing on Sunday?"}
+{"id": "c-need-088", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Earlier this week I mentioned a podcast, what was it called?"}
+{"id": "c-need-089", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "What did I tell you last month about my knee?"}
+{"id": "c-need-090", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Didn't we work out a packing list before?"}
+{"id": "c-need-091", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "What was the gift idea we came up with for my dad?"}
+{"id": "c-need-092", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Go back to what we discussed about the car loan."}
+{"id": "c-need-093", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "What tips did we go over before my interview last week?"}
+{"id": "c-need-094", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "We chatted about wedding venues last week, which did I like?"}
+{"id": "c-need-095", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "What did I say my goal was when we spoke on Monday?"}
+{"id": "c-need-096", "writer": "c", "label": "need", "category": "past_conversations", "hard": false, "text": "Pick up where we left off on the thesis outline."}
+{"id": "c-need-097", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Read out everything left on my shopping list for Saturday's big shop."}
+{"id": "c-need-098", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Read me my notes from the physio."}
+{"id": "c-need-099", "writer": "c", "label": "need", "category": "notes", "hard": true, "text": "Pop washing-up liquid onto my grocery list."}
+{"id": "c-need-100", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "What did I jot down about the boiler?"}
+{"id": "c-need-101", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Check my notes for the plumber's quote."}
+{"id": "c-need-102", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Read me what I wrote in my journal at the weekend."}
+{"id": "c-need-103", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Go through my camping checklist with me."}
+{"id": "c-need-104", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "What gift ideas have I saved for my sister?"}
+{"id": "c-need-105", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "What did I write in my diary about the reunion?"}
+{"id": "c-need-106", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Find the note where I wrote the door code."}
+{"id": "c-need-107", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "What's on my book wishlist?"}
+{"id": "c-need-108", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "What sizes did I write down for the new blinds?"}
+{"id": "c-need-109", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Scroll through my workout log for last week."}
+{"id": "c-need-110", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "What's on my list for the hardware store?"}
+{"id": "c-need-111", "writer": "c", "label": "need", "category": "notes", "hard": false, "text": "Read me the questions I noted for the doctor."}
+{"id": "c-need-112", "writer": "c", "label": "need", "category": "notes", "hard": true, "text": "Convert my usual pizza dough recipe to four servings."}
+{"id": "c-need-113", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "Is our anniversary on a weekday or a weekend this year?"}
+{"id": "c-need-114", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "Is my check-up at the dentist this month or next?"}
+{"id": "c-need-115", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "When is my tenancy up for renewal?"}
+{"id": "c-need-116", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "Which weekend is my sister's fortieth?"}
+{"id": "c-need-117", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "When's the school play my daughter's in?"}
+{"id": "c-need-118", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "When do I fly out for the conference?"}
+{"id": "c-need-119", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "When is my passport due to expire?"}
+{"id": "c-need-120", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "What date is the team offsite?"}
+{"id": "c-need-121", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "Is my haircut this Thursday or next?"}
+{"id": "c-need-122", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "What time is my flight on Wednesday?"}
+{"id": "c-need-123", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "What date did I start at my current firm?"}
+{"id": "c-need-124", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "When's the potluck I signed up for?"}
+{"id": "c-need-125", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "When's my car's next roadworthiness check?"}
+{"id": "c-need-126", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "Which night is the gig I bought tickets for?"}
+{"id": "c-need-127", "writer": "c", "label": "need", "category": "dates_events", "hard": false, "text": "How many sleeps until we jet off on holiday?"}
+{"id": "c-need-128", "writer": "c", "label": "need", "category": "dates_events", "hard": true, "text": "Play that song from our wedding."}
+{"id": "c-need-129", "writer": "c", "label": "need", "category": "dates_events", "hard": true, "text": "Is it going to rain on the day of my brother's wedding?"}
+{"id": "c-need-130", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Recommend a film I'd enjoy tonight."}
+{"id": "c-need-131", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Suggest a salmon dinner I'd like."}
+{"id": "c-need-132", "writer": "c", "label": "need", "category": "taste_dependent", "hard": true, "text": "Play some music I'd actually enjoy while I cook."}
+{"id": "c-need-133", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Pick a wine I'd like for Friday's dinner."}
+{"id": "c-need-134", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "What podcast would suit my taste for the drive?"}
+{"id": "c-need-135", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Find me a novel in the style I love."}
+{"id": "c-need-136", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Which restaurant nearby would I enjoy?"}
+{"id": "c-need-137", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Suggest a holiday spot that fits what I like."}
+{"id": "c-need-138", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Pick a recipe for tonight that fits my diet."}
+{"id": "c-need-139", "writer": "c", "label": "need", "category": "taste_dependent", "hard": true, "text": "Put on a show I'd want to watch."}
+{"id": "c-need-140", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Which dessert should I make, given what I like?"}
+{"id": "c-need-141", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Recommend a board game the family would love."}
+{"id": "c-need-142", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Suggest a gift my partner would actually like."}
+{"id": "c-need-143", "writer": "c", "label": "need", "category": "taste_dependent", "hard": false, "text": "Which kind of short break away would suit me best?"}
+{"id": "c-need-144", "writer": "c", "label": "need", "category": "taste_dependent", "hard": true, "text": "Choose an album for me, you know my taste."}
+{"id": "c-need-145", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "And his? When's his appointment with the physio?"}
+{"id": "c-need-146", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "What about the other one, the flat we viewed?"}
+{"id": "c-need-147", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "And my brother, is he coming to that as well?"}
+{"id": "c-need-148", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "What about the second contractor's quote?"}
+{"id": "c-need-149", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "And the one she recommended, was that the Italian place?"}
+{"id": "c-need-150", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "Did he ever finish that course?"}
+{"id": "c-need-151", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "How about the one from my cousin's wedding?"}
+{"id": "c-need-152", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "And which shop did she say had it?"}
+{"id": "c-need-153", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "What did we settle on for his present?"}
+{"id": "c-need-154", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "Wait, is that the same day as her surgery?"}
+{"id": "c-need-155", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "And her puppy, is it house trained yet?"}
+{"id": "c-need-156", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "What about the other hotel, the one by the coast?"}
+{"id": "c-need-157", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "Did I ever book that for him?"}
+{"id": "c-need-158", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "Which one of those did my dad already have?"}
+{"id": "c-need-159", "writer": "c", "label": "need", "category": "followup_back", "hard": false, "text": "And when was that one due, the second report?"}
+{"id": "c-no-need-001", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the traditional gift for a tenth wedding anniversary?"}
+{"id": "c-no-need-002", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at noon to order flowers for our anniversary."}
+{"id": "c-no-need-003", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which anniversary is celebrated with silver?"}
+{"id": "c-no-need-004", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "It's our anniversary tonight and I'm nervous, wish me luck!"}
+{"id": "c-no-need-005", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which came first, the book or the film of Jurassic Park?"}
+{"id": "c-no-need-006", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a timer for twenty minutes so I stop reading my book and start dinner."}
+{"id": "c-no-need-007", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Turn on the reading lamp, I want to finish this book."}
+{"id": "c-no-need-008", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should a car have its tyres rotated?"}
+{"id": "c-no-need-009", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If a car does forty miles per gallon, how far will it go on twelve gallons?"}
+{"id": "c-no-need-010", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "Do I need to scrape the car windows this morning or is it above freezing?"}
+{"id": "c-no-need-011", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me in two hours to move the car before the parking warden comes."}
+{"id": "c-no-need-012", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much caffeine is in a cup of coffee compared to tea?"}
+{"id": "c-no-need-013", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Set a four-minute timer for the coffee to brew."}
+{"id": "c-no-need-014", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Switch on the coffee machine in the kitchen."}
+{"id": "c-no-need-015", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Ugh, I spilled coffee all over the desk."}
+{"id": "c-no-need-016", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Oh that's a lovely idea, I'll give it a go later."}
+{"id": "c-no-need-017", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Whose idea was daylight saving time in the first place?"}
+{"id": "c-no-need-018", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "No idea what that last word was, can you spell it?"}
+{"id": "c-no-need-019", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Any idea how many ounces make up two pounds of flour?"}
+{"id": "c-no-need-020", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Any idea when the sun sets tonight?"}
+{"id": "c-no-need-021", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many notes are in a musical octave?"}
+{"id": "c-no-need-022", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Hang on, let me find a pen to note that down. Okay, go ahead."}
+{"id": "c-no-need-023", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who is on the new twenty pound note?"}
+{"id": "c-no-need-024", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If I have three ten pound notes and spend twelve pounds, what's left?"}
+{"id": "c-no-need-025", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Turn it down a notch, that high note is piercing."}
+{"id": "c-no-need-026", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Round that to two decimal places."}
+{"id": "c-no-need-027", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which place hosted the first modern Olympic Games?"}
+{"id": "c-no-need-028", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What's the hottest place in the country right now?"}
+{"id": "c-no-need-029", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "What's this song? The place I'm in keeps playing it."}
+{"id": "c-no-need-030", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does an open floor plan mean in house design?"}
+{"id": "c-no-need-031", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a pension plan and a savings account?"}
+{"id": "c-no-need-032", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "No plans this weekend, honestly just want to relax."}
+{"id": "c-no-need-033", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "A phone plan costs eighteen a month, what's that over two years?"}
+{"id": "c-no-need-034", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Repeat the plan you just laid out, step by step."}
+{"id": "c-no-need-035", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you be allergic to cold weather?"}
+{"id": "c-no-need-036", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What happens in the body when someone is allergic to bees?"}
+{"id": "c-no-need-037", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it possible to become allergic to shellfish as an adult?"}
+{"id": "c-no-need-038", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": true, "text": "My guest says she's allergic to nuts, is almond milk safe?"}
+{"id": "c-no-need-039", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is hay fever a kind of allergy?"}
+{"id": "c-no-need-040", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at five to start dinner for the kids."}
+{"id": "c-no-need-041", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What time do people usually eat dinner in Spain?"}
+{"id": "c-no-need-042", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Put a forty-minute timer on for dinner."}
+{"id": "c-no-need-043", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me to text my friend back when the match on TV now finishes."}
+{"id": "c-no-need-044", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many friends can a person really keep track of?"}
+{"id": "c-no-need-045", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My friend just made me laugh so hard I snorted."}
+{"id": "c-no-need-046", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "My friend is staying over, turn the heating up in the spare room."}
+{"id": "c-no-need-047", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many calories does an hour at the gym burn?"}
+{"id": "c-no-need-048", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set an alarm for six so I make it to the gym before work."}
+{"id": "c-no-need-049", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "Just got back from the gym and I'm wiped out."}
+{"id": "c-no-need-050", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the most common job in the country?"}
+{"id": "c-no-need-051", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you write a cover letter for a job application?"}
+{"id": "c-no-need-052", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "Rough day at work, my job is wearing me out."}
+{"id": "c-no-need-053", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a job interview at a bank usually involve?"}
+{"id": "c-no-need-054", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a town planning officer actually do?"}
+{"id": "c-no-need-055", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Do you need planning permission to build a garden shed?"}
+{"id": "c-no-need-056", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "I'm terrible at planning, everything's last minute with me."}
+{"id": "c-no-need-057", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a good app for meal planning?"}
+{"id": "c-no-need-058", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Pause the podcast for a second."}
+{"id": "c-no-need-059", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Skip ahead thirty seconds in this podcast."}
+{"id": "c-no-need-060", "writer": "c", "label": "no_need", "category": "music_volume", "hard": true, "text": "Turn the podcast up, I can't hear it over the dishwasher."}
+{"id": "c-no-need-061", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When did podcasts first become popular?"}
+{"id": "c-no-need-062", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "A road trip of six hundred miles at sixty miles an hour takes how long?"}
+{"id": "c-no-need-063", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "We're off on a camping trip to the Lake District this weekend, what's the forecast?"}
+{"id": "c-no-need-064", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What causes motion sickness on a long boat trip?"}
+{"id": "c-no-need-065", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the average size of an apartment in Tokyo?"}
+{"id": "c-no-need-066", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "Lock all the doors in the apartment, I'm heading out."}
+{"id": "c-no-need-067", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "Is it too windy to ride my bike to work this morning?"}
+{"id": "c-no-need-068", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much air pressure should a road bike tyre have?"}
+{"id": "c-no-need-069", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If I bike twelve miles in forty minutes, what's my speed?"}
+{"id": "c-no-need-070", "writer": "c", "label": "no_need", "category": "music_volume", "hard": true, "text": "Play happy birthday on the speaker, the cake's coming out!"}
+{"id": "c-no-need-071", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at nine to wish my aunt happy birthday."}
+{"id": "c-no-need-072", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a reminder for ten tomorrow to ring the dentist."}
+{"id": "c-no-need-073", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should you visit the dentist for a checkup?"}
+{"id": "c-no-need-074", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "Off to the dentist, wish me luck."}
+{"id": "c-no-need-075", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When is a cough worth seeing a doctor about?"}
+{"id": "c-no-need-076", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many years does it take to become a doctor?"}
+{"id": "c-no-need-077", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set an alarm for eight thirty, I've got the doctor at nine."}
+{"id": "c-no-need-078", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does it take to drive across America?"}
+{"id": "c-no-need-079", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "How long would it take to drive two hundred kilometres at ninety?"}
+{"id": "c-no-need-080", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "Is the fog bad enough that I should avoid the drive this morning?"}
+{"id": "c-no-need-081", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What's the temperature going to be this evening?"}
+{"id": "c-no-need-082", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Lower the lounge lamps a little for the evening."}
+{"id": "c-no-need-083", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Set an alarm for seven this evening, labelled bins."}
+{"id": "c-no-need-084", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who directed the first colour film?"}
+{"id": "c-no-need-085", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Turn the volume down, the film is way too loud."}
+{"id": "c-no-need-086", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long is the longest film ever made?"}
+{"id": "c-no-need-087", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which grocery items have the longest shelf life?"}
+{"id": "c-no-need-088", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at six to pick up groceries on the way home."}
+{"id": "c-no-need-089", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If groceries cost ninety a week, how much is that per month?"}
+{"id": "c-no-need-090", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is next Monday a bank holiday?"}
+{"id": "c-no-need-091", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why is the summer holiday so long in schools?"}
+{"id": "c-no-need-092", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Hang on, let me jot that number down, say it again."}
+{"id": "c-no-need-093", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Read the steps again slowly so I can jot them down."}
+{"id": "c-no-need-094", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Hold on, I need to jot this recipe down before it disappears."}
+{"id": "c-no-need-095", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "List the planets in order from the sun."}
+{"id": "c-no-need-096", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Turn that answer into a numbered list."}
+{"id": "c-no-need-097", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "List the countries that border Germany."}
+{"id": "c-no-need-098", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a timer for twenty-five minutes, my meeting starts after that."}
+{"id": "c-no-need-099", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What time is nine in the morning London time in New York? It's for a meeting."}
+{"id": "c-no-need-100", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "Silence my phone for the length of this meeting."}
+{"id": "c-no-need-101", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What was the first movie with sound?"}
+{"id": "c-no-need-102", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Pause the movie, I need a drink."}
+{"id": "c-no-need-103", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many frames per second is a standard movie shot at?"}
+{"id": "c-no-need-104", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "Turn the heater on in the office."}
+{"id": "c-no-need-105", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does the Oval Office get its name from?"}
+{"id": "c-no-need-106", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "Will it rain on my walk home from the office tonight?"}
+{"id": "c-no-need-107", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How old do you have to be to drive in Japan?"}
+{"id": "c-no-need-108", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": true, "text": "Roughly how long does a whole chicken need in the oven? My parents arrive at seven."}
+{"id": "c-no-need-109", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the best age for parents to start teaching kids to swim?"}
+{"id": "c-no-need-110", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at noon on Sunday to video call my parents."}
+{"id": "c-no-need-111", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a project manager actually do?"}
+{"id": "c-no-need-112", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a two-hour focus timer, I need to crack on with this project."}
+{"id": "c-no-need-113", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What was the Manhattan Project, in a sentence or two?"}
+{"id": "c-no-need-114", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a reminder for Thursday to post my sister's card."}
+{"id": "c-no-need-115", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "In English, which in-law is a sister's husband?"}
+{"id": "c-no-need-116", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My sister just had a baby, I'm an aunt!"}
+{"id": "c-no-need-117", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "Pair my watch with the phone."}
+{"id": "c-no-need-118", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who invented the wrist watch?"}
+{"id": "c-no-need-119", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do I set the time on a digital watch?"}
+{"id": "c-no-need-120", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which hand does a wedding ring go on?"}
+{"id": "c-no-need-121", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "I've got a wedding outdoors on Saturday, will it rain?"}
+{"id": "c-no-need-122", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Write that out as a short paragraph."}
+{"id": "c-no-need-123", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between an application and a program on a computer?"}
+{"id": "c-no-need-124", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set an alarm an hour before my two o'clock appointment."}
+{"id": "c-no-need-125", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How early should you arrive for a hospital appointment?"}
+{"id": "c-no-need-126", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do supermarkets put milk at the back of the last aisle?"}
+{"id": "c-no-need-127", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why are aisle seats popular on long-haul flights?"}
+{"id": "c-no-need-128", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is it a good day for the beach, how sunny will it get?"}
+{"id": "c-no-need-129", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why is beach sand mostly made of quartz?"}
+{"id": "c-no-need-130", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many blocks are in a mile in New York?"}
+{"id": "c-no-need-131", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Block calls from unknown numbers on the phone."}
+{"id": "c-no-need-132", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many squares are on a chess board?"}
+{"id": "c-no-need-133", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What time do you have to board a plane before departure?"}
+{"id": "c-no-need-134", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": true, "text": "I bought three shirts at fifteen each with a twenty percent discount, what did I pay?"}
+{"id": "c-no-need-135", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What was the first thing ever bought on the internet?"}
+{"id": "c-no-need-136", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": true, "text": "If my budget is two thousand and rent is half, what's left?"}
+{"id": "c-no-need-137", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the fifty thirty twenty rule for a budget?"}
+{"id": "c-no-need-138", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What are some simple budgeting tips for students?"}
+{"id": "c-no-need-139", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Where can I buy stamps nearby?"}
+{"id": "c-no-need-140", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If I buy four coffees at three twenty each, how much is that?"}
+{"id": "c-no-need-141", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it better to buy or lease a new car?"}
+{"id": "c-no-need-142", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What should I check when buying a second-hand bike?"}
+{"id": "c-no-need-143", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Skip to the next chapter of the audiobook."}
+{"id": "c-no-need-144", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Jump back a chapter, I nodded off."}
+{"id": "c-no-need-145", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a client and a customer?"}
+{"id": "c-no-need-146", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a reminder for three to email the client."}
+{"id": "c-no-need-147", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Change the bedroom lights to a blue color."}
+{"id": "c-no-need-148", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What color do you get mixing yellow and blue?"}
+{"id": "c-no-need-149", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "What's the weather tonight? I'm going to an outdoor concert."}
+{"id": "c-no-need-150", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long do I cook rice for?"}
+{"id": "c-no-need-151", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "At what temperature should I cook chicken thighs?"}
+{"id": "c-no-need-152", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Which date will it be a week on Friday?"}
+{"id": "c-no-need-153", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do I find the date a photo was taken on the phone?"}
+{"id": "c-no-need-154", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When is the tax return deadline this year?"}
+{"id": "c-no-need-155", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a timer for an hour, I've got a deadline to hit."}
+{"id": "c-no-need-156", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Kick off the dishwasher's eco programme, it's full."}
+{"id": "c-no-need-157", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When is the next full moon due?"}
+{"id": "c-no-need-158", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If a bill of eighty is due in four weekly payments, what's each one?"}
+{"id": "c-no-need-159", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Send the robot hoover round the ground floor."}
+{"id": "c-no-need-160", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What time does tonight's England football game start?"}
+{"id": "c-no-need-161", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who scored the most goals in a single World Cup?"}
+{"id": "c-no-need-162", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What counts as a goal in netball?"}
+{"id": "c-no-need-163", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many strings does a bass guitar have?"}
+{"id": "c-no-need-164", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Play some acoustic guitar music, quietly."}
+{"id": "c-no-need-165", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the most popular hobby in the world?"}
+{"id": "c-no-need-166", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Honestly, chatting to you is becoming a hobby, ha."}
+{"id": "c-no-need-167", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which house plant is hardest to kill?"}
+{"id": "c-no-need-168", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does third-party car insurance cover?"}
+{"id": "c-no-need-169", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How does travel insurance work if a flight is cancelled?"}
+{"id": "c-no-need-170", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When was the first scientific journal published?"}
+{"id": "c-no-need-171", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is keeping a journal actually good for sleep?"}
+{"id": "c-no-need-172", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What key is the national anthem written in?"}
+{"id": "c-no-need-173", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can a locksmith copy a spare key without the original?"}
+{"id": "c-no-need-174", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the quickest way to ease a sore knee after running?"}
+{"id": "c-no-need-175", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many bones meet at the knee?"}
+{"id": "c-no-need-176", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long should a laptop battery last?"}
+{"id": "c-no-need-177", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a wide angle lens and a zoom lens?"}
+{"id": "c-no-need-178", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you clean a camera lens safely?"}
+{"id": "c-no-need-179", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a hotel duty manager do?"}
+{"id": "c-no-need-180", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which car model has sold the most units ever?"}
+{"id": "c-no-need-181", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How does a weather model predict rain?"}
+{"id": "c-no-need-182", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Set an alarm for seven on Monday and Tuesday."}
+{"id": "c-no-need-183", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What do you call your niece's daughter?"}
+{"id": "c-no-need-184", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me Saturday morning to post my niece's birthday card."}
+{"id": "c-no-need-185", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's considered the first novel ever written?"}
+{"id": "c-no-need-186", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many words long is a typical novel?"}
+{"id": "c-no-need-187", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Are oats gluten free?"}
+{"id": "c-no-need-188", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Convert half a cup of oats into grams for me."}
+{"id": "c-no-need-189", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you withdraw a job offer once it's accepted?"}
+{"id": "c-no-need-190", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Thanks for the offer, but I'm alright."}
+{"id": "c-no-need-191", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the smoke point of olive oil?"}
+{"id": "c-no-need-192", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why does engine oil turn black over time?"}
+{"id": "c-no-need-193", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What are good packing tips for a carry-on bag?"}
+{"id": "c-no-need-194", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Give me a thirty-minute timer for packing."}
+{"id": "c-no-need-195", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does wall paint take to dry?"}
+{"id": "c-no-need-196", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "My partner's asleep, turn the hallway light off."}
+{"id": "c-no-need-197", "writer": "c", "label": "no_need", "category": "music_volume", "hard": true, "text": "Turn the music down, my partner's on a call."}
+{"id": "c-no-need-198", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does a passport renewal take?"}
+{"id": "c-no-need-199", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much does a plumber usually charge per hour?"}
+{"id": "c-no-need-200", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set a reminder for two, the plumber's coming to look at the boiler."}
+{"id": "c-no-need-201", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you structure a business proposal?"}
+{"id": "c-no-need-202", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the tradition behind kneeling for a marriage proposal?"}
+{"id": "c-no-need-203", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Pull the blinds down in the living room."}
+{"id": "c-no-need-204", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the gravitational pull of the moon compared to Earth?"}
+{"id": "c-no-need-205", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is pulling an all-nighter bad for memory?"}
+{"id": "c-no-need-206", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Quote that last line back to me word for word."}
+{"id": "c-no-need-207", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which philosopher is the quote 'I think, therefore I am' from?"}
+{"id": "c-no-need-208", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does a typical kitchen renovation take?"}
+{"id": "c-no-need-209", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Do you need permission for a loft renovation?"}
+{"id": "c-no-need-210", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many calories does running a mile burn?"}
+{"id": "c-no-need-211", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Save that answer so I can read it later."}
+{"id": "c-no-need-212", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much does turning the heating down one degree save?"}
+{"id": "c-no-need-213", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What time do the shops shut on Sunday?"}
+{"id": "c-no-need-214", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do so many shops close on Sunday in Germany?"}
+{"id": "c-no-need-215", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Show the front door camera on the TV."}
+{"id": "c-no-need-216", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Show me the lyrics for this song."}
+{"id": "c-no-need-217", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "What's a UK size nine shoe in European sizes?"}
+{"id": "c-no-need-218", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "The baby's sleeping, lower the volume on everything."}
+{"id": "c-no-need-219", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is sleeping with the window open better?"}
+{"id": "c-no-need-220", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why does the sun get dark spots?"}
+{"id": "c-no-need-221", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the blind spot in a car's mirror?"}
+{"id": "c-no-need-222", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "When does spring officially start this year?"}
+{"id": "c-no-need-223", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When should you plant tulip bulbs, autumn or spring?"}
+{"id": "c-no-need-224", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long should you stand at a stand-up desk each day?"}
+{"id": "c-no-need-225", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many suits are in a deck of cards?"}
+{"id": "c-no-need-226", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What colour suit should you wear to a funeral?"}
+{"id": "c-no-need-227", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does knee surgery recovery usually take?"}
+{"id": "c-no-need-228", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When was the first heart surgery performed?"}
+{"id": "c-no-need-229", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Start the tea countdown, three minutes for green tea."}
+{"id": "c-no-need-230", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many years of training does a teacher need?"}
+{"id": "c-no-need-231", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at three to email my son's teacher."}
+{"id": "c-no-need-232", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which team sport has the biggest squad on the field?"}
+{"id": "c-no-need-233", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which team won the last World Cup?"}
+{"id": "c-no-need-234", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long is a typical PhD thesis?"}
+{"id": "c-no-need-235", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a thesis and a dissertation?"}
+{"id": "c-no-need-236", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much is a train ticket from London to Manchester?"}
+{"id": "c-no-need-237", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Four tickets at twenty-two fifty each, what's the total?"}
+{"id": "c-no-need-238", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a tomato a fruit or a vegetable?"}
+{"id": "c-no-need-239", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Count down eight minutes while the vegetables steam."}
+{"id": "c-no-need-240", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a warranty and a guarantee?"}
+{"id": "c-no-need-241", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long is the legal warranty on electronics in the EU?"}
+{"id": "c-no-need-242", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Start a twenty-minute workout timer."}
+{"id": "c-no-need-243", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Play something upbeat for a workout."}
+{"id": "c-no-need-244", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "How much rain fell yesterday?"}
+{"id": "c-no-need-245", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who won the Arsenal match yesterday?"}
+{"id": "c-no-need-246", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": true, "text": "Can I use my phone abroad without roaming charges in the EU?"}
+{"id": "c-no-need-247", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the best advice for getting over jet lag?"}
+{"id": "c-no-need-248", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Play the whole album from the start."}
+{"id": "c-no-need-249", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you tell a sprained ankle from a broken one?"}
+{"id": "c-no-need-250", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What happens in a tax audit?"}
+{"id": "c-no-need-251", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What time does a bakery usually start baking bread?"}
+{"id": "c-no-need-252", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "Is it warm enough to sit out on the balcony tonight?"}
+{"id": "c-no-need-253", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Play some calm bedtime music for the kids."}
+{"id": "c-no-need-254", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you put hot soup in a blender?"}
+{"id": "c-no-need-255", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How far in advance should you make a hotel booking for August?"}
+{"id": "c-no-need-256", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many books can you borrow from a public library at once?"}
+{"id": "c-no-need-257", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's inside a black box flight recorder?"}
+{"id": "c-no-need-258", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "I need a break, let's chat later."}
+{"id": "c-no-need-259", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which breed of dog sheds the least hair?"}
+{"id": "c-no-need-260", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many people are in an average family in Europe?"}
+{"id": "c-no-need-261", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Bring the screen brightness down to half."}
+{"id": "c-no-need-262", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much does a log cabin cost to build?"}
+{"id": "c-no-need-263", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a USB-C cable and a Lightning cable?"}
+{"id": "c-no-need-264", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Where did the first cafe open?"}
+{"id": "c-no-need-265", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it true cats always land on their feet?"}
+{"id": "c-no-need-266", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Please continue that explanation where you stopped."}
+{"id": "c-no-need-267", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is cilantro the same as coriander?"}
+{"id": "c-no-need-268", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you claim a tax refund?"}
+{"id": "c-no-need-269", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "I've set alarms for seven and ten past seven, will they clash?"}
+{"id": "c-no-need-270", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the hardest grade in rock climbing?"}
+{"id": "c-no-need-271", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which football club has won the most trophies?"}
+{"id": "c-no-need-272", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "How rough will the sea be along the coast today?"}
+{"id": "c-no-need-273", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": true, "text": "If my commute is forty minutes each way, how many hours is that over five days?"}
+{"id": "c-no-need-274", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you check a contractor is properly licensed?"}
+{"id": "c-no-need-275", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long is a first aid course?"}
+{"id": "c-no-need-276", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a second cousin, exactly?"}
+{"id": "c-no-need-277", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at four to thank my coworker for the cake."}
+{"id": "c-no-need-278", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it safe to cross the road on an amber light?"}
+{"id": "c-no-need-279", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a database and a spreadsheet?"}
+{"id": "c-no-need-280", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What day is the first of December?"}
+{"id": "c-no-need-281", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's an easy dessert with three ingredients?"}
+{"id": "c-no-need-282", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who wrote the most famous diary of the Second World War?"}
+{"id": "c-no-need-283", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does dietary fibre actually do?"}
+{"id": "c-no-need-284", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which direction does the sun rise from?"}
+{"id": "c-no-need-285", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "What distance is a half marathon in miles?"}
+{"id": "c-no-need-286", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is eating late at night bad for you?"}
+{"id": "c-no-need-287", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the entry fee for the Louvre?"}
+{"id": "c-no-need-288", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Give me feedback on the paragraph I just read out."}
+{"id": "c-no-need-289", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When should I change the air filter in the furnace?"}
+{"id": "c-no-need-290", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a law firm and a chambers?"}
+{"id": "c-no-need-291", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a flat and an apartment?"}
+{"id": "c-no-need-292", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who flew the first solo flight across the Atlantic?"}
+{"id": "c-no-need-293", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My grandad just turned ninety, how cool is that?"}
+{"id": "c-no-need-294", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you apply for a research grant?"}
+{"id": "c-no-need-295", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Ha, you're a funny guy for a speaker on a shelf."}
+{"id": "c-no-need-296", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should you get a haircut to grow it out?"}
+{"id": "c-no-need-297", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Connect my headphones to the laptop."}
+{"id": "c-no-need-298", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Where were the first Olympics held?"}
+{"id": "c-no-need-299", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a good beginner hiking trail near here?"}
+{"id": "c-no-need-300", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a dental hygienist do that a dentist doesn't?"}
+{"id": "c-no-need-301", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does an angel investor do?"}
+{"id": "c-no-need-302", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "I got invited to a party tonight, so excited."}
+{"id": "c-no-need-303", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Got a good joke about penguins?"}
+{"id": "c-no-need-304", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What's the date of the longest day in June?"}
+{"id": "c-no-need-305", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can a landlord enter without notice?"}
+{"id": "c-no-need-306", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Set a timer for forty-five minutes for the lasagna."}
+{"id": "c-no-need-307", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Do dogs need a leash on the beach?"}
+{"id": "c-no-need-308", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much is sea level rising per year?"}
+{"id": "c-no-need-309", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Put the radio news on, I want to listen while I cook."}
+{"id": "c-no-need-310", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long do house cats live?"}
+{"id": "c-no-need-311", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What is a lockup garage?"}
+{"id": "c-no-need-312", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a memory foam mattress better for back pain?"}
+{"id": "c-no-need-313", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Convert this measurement: two hundred millilitres into cups."}
+{"id": "c-no-need-314", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long should meat rest after roasting?"}
+{"id": "c-no-need-315", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Read the menu options again, I missed one."}
+{"id": "c-no-need-316", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do bird migration routes follow coastlines?"}
+{"id": "c-no-need-317", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": true, "text": "My car's mileage went from ten thousand to twelve thousand five hundred, how far was that?"}
+{"id": "c-no-need-318", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "In project management, what is a milestone?"}
+{"id": "c-no-need-319", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Do you need a licence to ride a motorbike?"}
+{"id": "c-no-need-320", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the polite way to complain to a noisy neighbor?"}
+{"id": "c-no-need-321", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What makes a neighbourhood walkable?"}
+{"id": "c-no-need-322", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "What time does it get dark at night this week?"}
+{"id": "c-no-need-323", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Noted, thanks. Carry on with the next step."}
+{"id": "c-no-need-324", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many years of study does a nurse need?"}
+{"id": "c-no-need-325", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a company offsite usually involve?"}
+{"id": "c-no-need-326", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does a hernia operation take?"}
+{"id": "c-no-need-327", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is it nice enough for the park this afternoon?"}
+{"id": "c-no-need-328", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a software patch?"}
+{"id": "c-no-need-329", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which pet is easiest for a small flat?"}
+{"id": "c-no-need-330", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a pharmacy open on bank holidays?"}
+{"id": "c-no-need-331", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "What did that phrase mean, the one you just used?"}
+{"id": "c-no-need-332", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a physio and a chiropractor?"}
+{"id": "c-no-need-333", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How big is a football pitch?"}
+{"id": "c-no-need-334", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's pitching in baseball?"}
+{"id": "c-no-need-335", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When should garlic be planted?"}
+{"id": "c-no-need-336", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a potluck dinner?"}
+{"id": "c-no-need-337", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "I've been practicing my French, bonjour!"}
+{"id": "c-no-need-338", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a good present for a host?"}
+{"id": "c-no-need-339", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How does surge pricing work?"}
+{"id": "c-no-need-340", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do British people love to queue?"}
+{"id": "c-no-need-341", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you wash a quilt?"}
+{"id": "c-no-need-342", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the best way to quit smoking?"}
+{"id": "c-no-need-343", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is it raining outside at the moment?"}
+{"id": "c-no-need-344", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Give me a quick recap of what you just explained."}
+{"id": "c-no-need-345", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is redoing a bathroom worth it before selling?"}
+{"id": "c-no-need-346", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much value does a kitchen remodel add?"}
+{"id": "c-no-need-347", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Find the TV remote, make it beep."}
+{"id": "c-no-need-348", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How early can you start renewing a passport?"}
+{"id": "c-no-need-349", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a screen replacement cheaper than a new phone?"}
+{"id": "c-no-need-350", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you write a book report?"}
+{"id": "c-no-need-351", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do I go about resetting a router?"}
+{"id": "c-no-need-352", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which restaurant guide awards stars to chefs?"}
+{"id": "c-no-need-353", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What happens at a class reunion?"}
+{"id": "c-no-need-354", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Review what you just said for mistakes."}
+{"id": "c-no-need-355", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Rewrite that in simpler words."}
+{"id": "c-no-need-356", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a roadworthiness test in Australia?"}
+{"id": "c-no-need-357", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you split bills fairly with a roommate?"}
+{"id": "c-no-need-358", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why is a morning routine supposed to help?"}
+{"id": "c-no-need-359", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a seated row exercise?"}
+{"id": "c-no-need-360", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "The salmon needs fifteen minutes, start a timer."}
+{"id": "c-no-need-361", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much is saved by switching to LED bulbs?"}
+{"id": "c-no-need-362", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "At what age do kids start secondary school?"}
+{"id": "c-no-need-363", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often does a boiler need a service?"}
+{"id": "c-no-need-364", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should a car be serviced?"}
+{"id": "c-no-need-365", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many sheets of paper does a standard printer tray hold?"}
+{"id": "c-no-need-366", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What was the biggest ship ever built?"}
+{"id": "c-no-need-367", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What showed that the Earth was round?"}
+{"id": "c-no-need-368", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does signing a lease commit you to?"}
+{"id": "c-no-need-369", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Go to the next slide on the screen."}
+{"id": "c-no-need-370", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long should a best man speech be?"}
+{"id": "c-no-need-371", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a sprint in agile software?"}
+{"id": "c-no-need-372", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a power stance?"}
+{"id": "c-no-need-373", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Is the tumble dryer finished yet? Check its status."}
+{"id": "c-no-need-374", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long can a tourist stay in Japan without a visa?"}
+{"id": "c-no-need-375", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who stayed on the moon the longest?"}
+{"id": "c-no-need-376", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the cheapest storage for old photos?"}
+{"id": "c-no-need-377", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Read a short bedtime story for a five year old."}
+{"id": "c-no-need-378", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a quick way to calm down when stressed?"}
+{"id": "c-no-need-379", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it better to stretch before or after running?"}
+{"id": "c-no-need-380", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "I'm stuck on a crossword clue, five letters, a fruit."}
+{"id": "c-no-need-381", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much sugar is in a can of cola?"}
+{"id": "c-no-need-382", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a junior suite in a hotel?"}
+{"id": "c-no-need-383", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Summarize what you just told me in one line."}
+{"id": "c-no-need-384", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which countries switched to driving on the right?"}
+{"id": "c-no-need-385", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a takeaway pizza healthier than frozen?"}
+{"id": "c-no-need-386", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How big is a standard fish tank for goldfish?"}
+{"id": "c-no-need-387", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you throw a curveball?"}
+{"id": "c-no-need-388", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should you check tire pressure?"}
+{"id": "c-no-need-389", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Which way is the wind blowing, toward the sea or inland?"}
+{"id": "c-no-need-390", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is traffic heavy on the ring road this hour?"}
+{"id": "c-no-need-391", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you treat a wasp bite with vinegar?"}
+{"id": "c-no-need-392", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which country gives workers the most paid vacation?"}
+{"id": "c-no-need-393", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Do vegetarian diets lack iron?"}
+{"id": "c-no-need-394", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the biggest concert venue in Europe?"}
+{"id": "c-no-need-395", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should a cat see the vet?"}
+{"id": "c-no-need-396", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What questions should you ask at a house viewing?"}
+{"id": "c-no-need-397", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the smallest village in the world?"}
+{"id": "c-no-need-398", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is Wednesday supposed to be wet?"}
+{"id": "c-no-need-399", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Set a weekday alarm for six forty."}
+{"id": "c-no-need-400", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a quick weeknight pasta dish?"}
+{"id": "c-no-need-401", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which wine goes with fish?"}
+{"id": "c-no-need-402", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do wishlists work on online stores?"}
+{"id": "c-no-need-403", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long is the average workday in Japan?"}
+{"id": "c-no-need-404", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Check whether the upstairs printer is working."}
+{"id": "c-no-need-405", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What happens at a pottery workshop for beginners?"}
+{"id": "c-no-need-406", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When did people first start writing things down?"}
+{"id": "c-no-need-407", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is yoga good for back pain?"}
+{"id": "c-no-need-408", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "And what about tomorrow afternoon?"}
+{"id": "c-no-need-409", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "Actually, change it to ten minutes, not eight."}
+{"id": "c-no-need-410", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "And on Sunday, does the rain clear up?"}
+{"id": "c-no-need-411", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "And the bathroom light too."}
+{"id": "c-no-need-412", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "Same again but for the garden lights."}
+{"id": "c-no-need-413", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "And how much is that per month?"}
+{"id": "c-no-need-414", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "Same for the kitchen speaker, bump that one up as well."}
+{"id": "c-no-need-415", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do I renew a passport from abroad, and how long before it expires should I apply?"}
+{"id": "c-no-need-416", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Play this album on shuffle and add it to the current playlist."}
+{"id": "c-no-need-417", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which free app tracks a workout like a run around the park?"}
+{"id": "c-no-need-418", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at ten to confirm my appointment with the physio."}
+{"id": "c-no-need-419", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Set an alarm for eight on Wednesday, the physio is at nine."}
+{"id": "c-no-need-420", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My aunt just sent me a funny video of her cat."}
+{"id": "c-no-need-421", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why does milk go off so badly in summer heat?"}
+{"id": "c-no-need-422", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it cheaper to buy lunch at a bakery or a cafe?"}
+{"id": "c-no-need-423", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "My balcony faces west, will it get any sun this evening?"}
+{"id": "c-no-need-424", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is it bad to sleep on your left side in bed?"}
+{"id": "c-no-need-425", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a good way to block out street noise to sleep?"}
+{"id": "c-no-need-426", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a school board actually decide?"}
+{"id": "c-no-need-427", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should a combi boiler pressure be topped up?"}
+{"id": "c-no-need-428", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My boss just said I can leave early, brilliant."}
+{"id": "c-no-need-429", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": true, "text": "I bought two pairs of shoes at forty each, what did I spend?"}
+{"id": "c-no-need-430", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "If I bought a TV for six hundred with a ten percent discount, what's the saving?"}
+{"id": "c-no-need-431", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which brand of washing machine is most reliable?"}
+{"id": "c-no-need-432", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the best case for a phone to survive a drop?"}
+{"id": "c-no-need-433", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": true, "text": "Remind me at two to ring my brother back."}
+{"id": "c-no-need-434", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": true, "text": "My budget is three hundred a month, what's that per week?"}
+{"id": "c-no-need-435", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you make a family holiday budget stretch further?"}
+{"id": "c-no-need-436", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "We've chatted for ages, what time is it?"}
+{"id": "c-no-need-437", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Turn those steps into a checklist I can tick off."}
+{"id": "c-no-need-438", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's on a pilot's pre-flight checklist?"}
+{"id": "c-no-need-439", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Should I choose a gas or electric hob?"}
+{"id": "c-no-need-440", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a vacuum cleaner's HEPA filter catch?"}
+{"id": "c-no-need-441", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How should a freelancer invoice a client?"}
+{"id": "c-no-need-442", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Any storms forecast for the coast this weekend?"}
+{"id": "c-no-need-443", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the area code for Manchester?"}
+{"id": "c-no-need-444", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does the dress code smart casual mean?"}
+{"id": "c-no-need-445", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which city has the longest average commute?"}
+{"id": "c-no-need-446", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What happens at a press conference?"}
+{"id": "c-no-need-447", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do corner shops charge more?"}
+{"id": "c-no-need-448", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long is a beginner's sailing course?"}
+{"id": "c-no-need-449", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a first cousin once removed?"}
+{"id": "c-no-need-450", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you marry your cousin in the UK?"}
+{"id": "c-no-need-451", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My coworker brought in cake, so the day's looking up."}
+{"id": "c-no-need-452", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a korma mild or spicy compared to a madras curry?"}
+{"id": "c-no-need-453", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My dad's just learned to video call, ha."}
+{"id": "c-no-need-454", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a quick dessert using frozen berries?"}
+{"id": "c-no-need-455", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Did people keep a diary in ancient Rome?"}
+{"id": "c-no-need-456", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": true, "text": "What were we discussing a minute ago? I lost track."}
+{"id": "c-no-need-457", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Is the dishwasher finished, or still drying?"}
+{"id": "c-no-need-458", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which symptoms of a migraine mean you should call a doctor?"}
+{"id": "c-no-need-459", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long should pizza dough rise?"}
+{"id": "c-no-need-460", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Read that draft back to me before I send it."}
+{"id": "c-no-need-461", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "What's the drive like into town with this snow?"}
+{"id": "c-no-need-462", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When is the next comet due to pass Earth?"}
+{"id": "c-no-need-463", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When are tax payments due in the UK?"}
+{"id": "c-no-need-464", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which film won best picture last year?"}
+{"id": "c-no-need-465", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a law firm the same as a solicitor's practice?"}
+{"id": "c-no-need-466", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is flying or driving greener for a short trip?"}
+{"id": "c-no-need-467", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Put on a fifty-minute focus session with a break at the end."}
+{"id": "c-no-need-468", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Create a new folder on the desktop called receipts."}
+{"id": "c-no-need-469", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which gift is traditional for a fortieth anniversary?"}
+{"id": "c-no-need-470", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a fourteen inch laptop too small for work?"}
+{"id": "c-no-need-471", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "What's sixteen times fourteen?"}
+{"id": "c-no-need-472", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is Friday going to be dry?"}
+{"id": "c-no-need-473", "writer": "c", "label": "no_need", "category": "timers_alarms", "hard": false, "text": "Set a Friday alarm for half five."}
+{"id": "c-no-need-474", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why is Friday the thirteenth unlucky?"}
+{"id": "c-no-need-475", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you politely turn down a friend's invitation?"}
+{"id": "c-no-need-476", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does a cricket test game last?"}
+{"id": "c-no-need-477", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a gift card a good wedding gift?"}
+{"id": "c-no-need-478", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a polite gift for a new neighbour?"}
+{"id": "c-no-need-479", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": true, "text": "Will it rain on the way to the gig tonight?"}
+{"id": "c-no-need-480", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a SMART goal stand for in business?"}
+{"id": "c-no-need-481", "writer": "c", "label": "no_need", "category": "music_volume", "hard": true, "text": "My grandad is ninety today, play a celebration song."}
+{"id": "c-no-need-482", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "On average, how old are first-time grandparents?"}
+{"id": "c-no-need-483", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Split a grocery bill of eighty-four between three people."}
+{"id": "c-no-need-484", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which herbs are easiest growing indoors?"}
+{"id": "c-no-need-485", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "Just had a haircut and it's way too short, oh well."}
+{"id": "c-no-need-486", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the biggest natural harbour in the world?"}
+{"id": "c-no-need-487", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Does a hardware store cut keys?"}
+{"id": "c-no-need-488", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the longest hiking trail in America?"}
+{"id": "c-no-need-489", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you be hired before your visa comes through?"}
+{"id": "c-no-need-490", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Does home insurance cover a burst pipe?"}
+{"id": "c-no-need-491", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What should you wear to a video interview?"}
+{"id": "c-no-need-492", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which Italian city is famous for pesto?"}
+{"id": "c-no-need-493", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do most people drop their January targets by February?"}
+{"id": "c-no-need-494", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Slow down a little so I can jot all that down."}
+{"id": "c-no-need-495", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "I've started keeping a journal, it's oddly calming."}
+{"id": "c-no-need-496", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Where's the key on a keyboard for the euro symbol?"}
+{"id": "c-no-need-497", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a leisure centre and a gym?"}
+{"id": "c-no-need-498", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Do contact lens wearers need eye tests more often?"}
+{"id": "c-no-need-499", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why are poplar trees lined along French roads?"}
+{"id": "c-no-need-500", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much liquid can you take in hand luggage?"}
+{"id": "c-no-need-501", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long do goldfish live?"}
+{"id": "c-no-need-502", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Play the live version of this song."}
+{"id": "c-no-need-503", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a loan and an overdraft?"}
+{"id": "c-no-need-504", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Have I been logged out of the TV app?"}
+{"id": "c-no-need-505", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which children's book is the most loved of all time?"}
+{"id": "c-no-need-506", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should you flip a mattress?"}
+{"id": "c-no-need-507", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's good fuel mileage for a motorbike?"}
+{"id": "c-no-need-508", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What are the big baby milestones in the first year?"}
+{"id": "c-no-need-509", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why has the North Pole moved over time?"}
+{"id": "c-no-need-510", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you move a piano safely?"}
+{"id": "c-no-need-511", "writer": "c", "label": "no_need", "category": "small_talk", "hard": true, "text": "My mum is visiting today, wish me luck."}
+{"id": "c-no-need-512", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Navigate to the nearest petrol station."}
+{"id": "c-no-need-513", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the word for a nephew or niece without gender?"}
+{"id": "c-no-need-514", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Noted. Can you give me the third step again?"}
+{"id": "c-no-need-515", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which novel sold the most copies ever?"}
+{"id": "c-no-need-516", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does it take to write a novel on average?"}
+{"id": "c-no-need-517", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Should company data backups be kept offsite?"}
+{"id": "c-no-need-518", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Move onto the next question, please."}
+{"id": "c-no-need-519", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Cast this video onto the bedroom TV."}
+{"id": "c-no-need-520", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "In what order should you paint a room?"}
+{"id": "c-no-need-521", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "Put these numbers in order: twelve, five, thirty."}
+{"id": "c-no-need-522", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the right order of operations in maths?"}
+{"id": "c-no-need-523", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Give me a short outline of what you just explained."}
+{"id": "c-no-need-524", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What happens if a library book is overdue?"}
+{"id": "c-no-need-525", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is rolling clothes better than folding when packing?"}
+{"id": "c-no-need-526", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What paperwork do you need to sell a car?"}
+{"id": "c-no-need-527", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the legal age parents can leave kids home alone?"}
+{"id": "c-no-need-528", "writer": "c", "label": "no_need", "category": "music_volume", "hard": true, "text": "Keep the music low, my partner's sleeping."}
+{"id": "c-no-need-529", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": true, "text": "Unlock the front door, my partner's outside."}
+{"id": "c-no-need-530", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Make the alarm tone a higher pitch, it's too low to hear."}
+{"id": "c-no-need-531", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Speed up the podcast to one and a half."}
+{"id": "c-no-need-532", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Pop the porch light on."}
+{"id": "c-no-need-533", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's an easy dish to take to a potluck?"}
+{"id": "c-no-need-534", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a good present for a ten year old?"}
+{"id": "c-no-need-535", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Can you present that comparison as a table instead?"}
+{"id": "c-no-need-536", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long did the Channel Tunnel project take?"}
+{"id": "c-no-need-537", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a fair quote for repainting a bedroom?"}
+{"id": "c-no-need-538", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Should you get three quotes before hiring a builder?"}
+{"id": "c-no-need-539", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do cats react to catnip?"}
+{"id": "c-no-need-540", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Turn on the reading light in the bedroom."}
+{"id": "c-no-need-541", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does recovering from flu usually take?"}
+{"id": "c-no-need-542", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What does a registered letter mean in the post?"}
+{"id": "c-no-need-543", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a TV licence renewal automatic?"}
+{"id": "c-no-need-544", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the most expensive part of a home renovation?"}
+{"id": "c-no-need-545", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who writes the annual world happiness report?"}
+{"id": "c-no-need-546", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do I report a pothole to the council?"}
+{"id": "c-no-need-547", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Can you repeat my last request back to me?"}
+{"id": "c-no-need-548", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much should you tip at a restaurant in America?"}
+{"id": "c-no-need-549", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do restaurants close on Mondays?"}
+{"id": "c-no-need-550", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which footballer retired with the most caps?"}
+{"id": "c-no-need-551", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Who organises a school reunion usually?"}
+{"id": "c-no-need-552", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often is a roadworthiness check needed for older cars?"}
+{"id": "c-no-need-553", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does a slate roof last?"}
+{"id": "c-no-need-554", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is the Saturday car boot sale likely to be rained off?"}
+{"id": "c-no-need-555", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is farmed salmon as healthy as wild?"}
+{"id": "c-no-need-556", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Has the photo saved to the gallery?"}
+{"id": "c-no-need-557", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a typical sleep schedule for a newborn?"}
+{"id": "c-no-need-558", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Scroll down the recipe on the screen."}
+{"id": "c-no-need-559", "writer": "c", "label": "no_need", "category": "arithmetic_conversions", "hard": false, "text": "How many grams is one serving of pasta?"}
+{"id": "c-no-need-560", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What shade of green suits a north facing room?"}
+{"id": "c-no-need-561", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": false, "text": "Let's settle this: which of the two options you listed is cheaper?"}
+{"id": "c-no-need-562", "writer": "c", "label": "no_need", "category": "music_volume", "hard": false, "text": "Show me the next episode of the cooking show."}
+{"id": "c-no-need-563", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What day of the week is best for food shopping?"}
+{"id": "c-no-need-564", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Set the thermostat to twenty and heat the water for a shower."}
+{"id": "c-no-need-565", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What star sign is someone born in March?"}
+{"id": "c-no-need-566", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "When was the peace treaty signed after the First World War?"}
+{"id": "c-no-need-567", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What size is a king bed in centimetres?"}
+{"id": "c-no-need-568", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Turn the heating off in the spare bedroom."}
+{"id": "c-no-need-569", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the best spot to see the northern lights?"}
+{"id": "c-no-need-570", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long do I let loose leaf tea steep before I stir in sweetener?"}
+{"id": "c-no-need-571", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do charity shops get so many donations in January?"}
+{"id": "c-no-need-572", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the name for a group of crows?"}
+{"id": "c-no-need-573", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How are guide dogs trained?"}
+{"id": "c-no-need-574", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between a suit and a blazer?"}
+{"id": "c-no-need-575", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the scientific name for the kneecap?"}
+{"id": "c-no-need-576", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Does green tea have more caffeine than black tea?"}
+{"id": "c-no-need-577", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should you change guitar strings?"}
+{"id": "c-no-need-578", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which architectural style is the Eiffel Tower?"}
+{"id": "c-no-need-579", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long should you wait to fly after surgery?"}
+{"id": "c-no-need-580", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does a takeaway curry keep in the fridge?"}
+{"id": "c-no-need-581", "writer": "c", "label": "no_need", "category": "conversation_in_front", "hard": true, "text": "What have we talked about so far in this chat?"}
+{"id": "c-no-need-582", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why does food taste bland when you have a cold?"}
+{"id": "c-no-need-583", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many taste buds does a tongue have?"}
+{"id": "c-no-need-584", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which team has won the most football league titles?"}
+{"id": "c-no-need-585", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How many people make a good team size?"}
+{"id": "c-no-need-586", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much notice ends a rolling tenancy?"}
+{"id": "c-no-need-587", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a thesis statement in an essay?"}
+{"id": "c-no-need-588", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How do you defend a thesis in a viva?"}
+{"id": "c-no-need-589", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Can you get a refund on a train ticket?"}
+{"id": "c-no-need-590", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does bathroom tiling grout take to dry?"}
+{"id": "c-no-need-591", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How often should you replace running trainers?"}
+{"id": "c-no-need-592", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is parmesan cheese vegetarian?"}
+{"id": "c-no-need-593", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Which venue hosts the tennis finals in London?"}
+{"id": "c-no-need-594", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How much does a vet charge for vaccines?"}
+{"id": "c-no-need-595", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the most viewed video online ever?"}
+{"id": "c-no-need-596", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the oldest village in England?"}
+{"id": "c-no-need-597", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How does a self-winding watch work?"}
+{"id": "c-no-need-598", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Why do brides wear white at a wedding?"}
+{"id": "c-no-need-599", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Is today a weekday or a holiday here?"}
+{"id": "c-no-need-600", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's a weeknight meal ready in fifteen minutes?"}
+{"id": "c-no-need-601", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long does an opened bottle of wine last?"}
+{"id": "c-no-need-602", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Clear the wishlist on the shopping app."}
+{"id": "c-no-need-603", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "How long was the average workday a century ago?"}
+{"id": "c-no-need-604", "writer": "c", "label": "no_need", "category": "device_home_control", "hard": false, "text": "Is the doorbell camera working?"}
+{"id": "c-no-need-605", "writer": "c", "label": "no_need", "category": "small_talk", "hard": false, "text": "No worries, take your time."}
+{"id": "c-no-need-606", "writer": "c", "label": "no_need", "category": "weather_date_time", "hard": false, "text": "Was yesterday the hottest day of the year?"}
+{"id": "c-no-need-607", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Is a plumber or a heating engineer needed for a radiator?"}
+{"id": "c-no-need-608", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the hourly rate for an emergency plumber?"}
+{"id": "c-no-need-609", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "Should you pay a contractor upfront?"}
+{"id": "c-no-need-610", "writer": "c", "label": "no_need", "category": "general_knowledge", "hard": false, "text": "What's the difference between an employee and a contractor?"}
+{"id": "c-no-need-611", "writer": "c", "label": "no_need", "category": "followup_utility", "hard": false, "text": "And the flight time back the other way?"}

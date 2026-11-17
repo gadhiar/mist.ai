@@ -21,9 +21,16 @@ Retrieval methods:
 - `query_vector`: embedding nearest-neighbour via vec0.
 - `query_fts`: BM25 lexical search via FTS5.
 - `query_hybrid`: Reciprocal Rank Fusion (RRF) merge of both.
+- `query_hybrid_readonly`: the same merge, async, on a second read-only
+  connection with its own `vault-sidecar-read` thread.
+- `path_texts_readonly`: each named path's whole text, async, on that same
+  connection and thread.
 
-This module is sync. Async callers (filewatcher, ConversationHandler)
-wrap calls via `asyncio.get_event_loop().run_in_executor`.
+The database runs in WAL, so the read-only connection reads the last
+committed snapshot while the writer holds a transaction: the memory read
+path's per-turn reads never wait behind a filewatcher reindex. Every other
+method is sync; async callers (filewatcher, ConversationHandler) route them
+through `run_async`, the writer's single worker thread.
 """
 
 import asyncio
@@ -33,8 +40,10 @@ import re
 import sqlite3
 import struct
 import time
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 import sqlite_vec
 
@@ -57,6 +66,10 @@ logger = logging.getLogger(__name__)
 # in double quotes it is a string literal, not an operator (so "not sure" matches
 # the literal words rather than invoking the NOT operator).
 _FTS5_TOKEN_SPLIT = re.compile(r'[\s"\'()*:.\-+^?]+')
+
+# SQLite's name for a private in-memory database, which has no file to open a
+# second connection on and no WAL.
+_MEMORY_PATH = ":memory:"
 
 # Heading regex: one or more '#' followed by a space and heading text.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -115,7 +128,43 @@ def _is_excluded_from_indexing(path: str | Path) -> bool:
     return False
 
 
-def _quote_fts5(text: str) -> str:
+MatchMode = Literal["all", "any"]
+_MATCH_MODES: frozenset[str] = frozenset({"all", "any"})
+
+
+def _check_match(match: str) -> None:
+    """Refuse a match mode other than `"all"` or `"any"`.
+
+    Any other string would silently fall back to one of the two joins, hiding a caller's typo.
+    """
+    if match not in _MATCH_MODES:
+        raise ValueError(f"match must be 'all' or 'any', got {match!r}")
+
+
+def _remove_orphan_wal_files(db_path: Path) -> None:
+    """Delete the `-wal` and `-shm` of a database file that no longer exists.
+
+    Call it only when `db_path` is missing. Such files belong to a deleted
+    database: `mist_admin vault-rebuild` unlinks only the `.db`, and a backend
+    still holding the old index open keeps its WAL and its shared-memory index
+    on disk. Opening a new database at the same path would read them as its
+    own, replaying the old file's frames into the new one, and the new
+    database fails with a disk I/O error or an integrity failure. A database
+    file that exists keeps its WAL, which may hold its latest commits.
+
+    A process still holding the deleted file keeps its open handles and goes
+    on serving the old index until it restarts.
+    """
+    for suffix in ("-wal", "-shm"):
+        sibling = db_path.with_name(db_path.name + suffix)
+        if sibling.exists():
+            logger.warning(
+                "sidecar: removing %s, left by a deleted database at %s", sibling, db_path
+            )
+            sibling.unlink(missing_ok=True)
+
+
+def _quote_fts5(text: str, *, match: MatchMode = "all") -> str:
     """Build a robust FTS5 MATCH expression from arbitrary user text.
 
     Natural-language input routinely contains FTS5 metacharacters (`? " ' ( )
@@ -138,17 +187,31 @@ def _quote_fts5(text: str) -> str:
     `query_fts` treats an empty MATCH expression as "no lexical hits" rather
     than issuing it.
 
+    `match="any"` joins the same quoted literals with `OR` instead. The memory
+    read path asks for it because a recall query is a sentence: under the AND,
+    one word that no note contains empties the lexical leg, while under the OR
+    a note sharing any word is a candidate and bm25 ranks the notes sharing the
+    most words first. The quoting is the same in both modes, so `OR` here is
+    the only operator that can reach FTS5.
+
     Args:
         text: Raw user-supplied query text.
+        match: `"all"` (implicit AND, the default) or `"any"` (OR).
 
     Returns:
-        A MATCH expression of space-joined quoted string literals, or the empty
-        string if `text` contains no FTS5-indexable tokens.
+        A MATCH expression of quoted string literals joined by spaces (`"all"`)
+        or by ` OR ` (`"any"`), or the empty string if `text` contains no
+        FTS5-indexable tokens.
+
+    Raises:
+        ValueError: `match` is neither `"all"` nor `"any"`.
     """
+    _check_match(match)
     tokens = [tok for tok in _FTS5_TOKEN_SPLIT.split(text) if tok]
     if not tokens:
         return ""
-    return " ".join(f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens)
+    separator = " OR " if match == "any" else " "
+    return separator.join(f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens)
 
 
 def _extract_heading_blocks(content: str) -> list[tuple[str, int, str]]:
@@ -233,10 +296,10 @@ class VaultSidecarIndex:
         idx.initialize()          # creates / opens DB, emits DDL
         idx.upsert_file(...)      # index a note
         results = idx.query_hybrid(embedding, text, k=5)
-        idx.close()               # release connection
+        idx.close()               # release both connections
 
-    All public methods are synchronous. Call from async code via
-    `loop.run_in_executor(None, idx.method, *args)`.
+    Public methods are synchronous except `run_async`, `query_hybrid_readonly`
+    and `path_texts_readonly`. Call the others from async code via `run_async`.
 
     Implements `SidecarIndexProtocol` from `backend.interfaces`.
     """
@@ -261,11 +324,27 @@ class VaultSidecarIndex:
         # voice frames for tens to hundreds of ms per turn. max_workers=1
         # keeps sqlite access serialized.
         self._worker: ThreadPoolExecutor | None = None
+        # Read-only second connection and its own single thread, for
+        # `query_hybrid_readonly` and `path_texts_readonly`. The writer's
+        # worker is shared with the filewatcher's `upsert_file`, which embeds
+        # every chunk inside its write transaction, so a turn's query queued
+        # there waits for the whole reindex. Under WAL this connection reads the last committed
+        # snapshot instead. Both are opened by `initialize` and released by
+        # `close`; the connection is used only on the read thread.
+        self._reader: sqlite3.Connection | None = None
+        self._read_worker: ThreadPoolExecutor | None = None
 
     def _ensure_worker(self) -> ThreadPoolExecutor:
         if self._worker is None:
             self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vault-sidecar")
         return self._worker
+
+    def _ensure_read_worker(self) -> ThreadPoolExecutor:
+        if self._read_worker is None:
+            self._read_worker = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vault-sidecar-read"
+            )
+        return self._read_worker
 
     async def run_async(self, fn, /, *args):
         """Run a sidecar operation on the dedicated single worker thread.
@@ -297,15 +376,26 @@ class VaultSidecarIndex:
         extension. If `config.rebuild_on_startup` is True, all four
         schema objects are dropped before re-creation.
 
+        A file database is switched to WAL and gets a second, read-only
+        connection for `query_hybrid_readonly`, so a reader never waits on
+        the writer. When the database file is missing, any `-wal` and `-shm`
+        left beside it are removed first (see `_remove_orphan_wal_files`). `:memory:` has neither: a private in-memory database has
+        no second connection, and its read-only queries run on the writer.
+
         Idempotent: safe to call multiple times.
 
         Raises:
-            SidecarIndexError: If the database cannot be opened or the
-                schema cannot be created.
+            SidecarIndexError: If the database cannot be opened, cannot use
+                WAL, or the schema or the read connection cannot be created.
         """
+        conn: sqlite3.Connection | None = None
         try:
+            in_memory = self.config.db_path == _MEMORY_PATH
             db_path = Path(self.config.db_path)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
+            if not in_memory:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                if not db_path.exists():
+                    _remove_orphan_wal_files(db_path)
 
             # check_same_thread=False: the connection is opened on the
             # caller's thread (loop thread at server startup, main thread in
@@ -319,18 +409,76 @@ class VaultSidecarIndex:
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
 
+            if not in_memory:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    raise SidecarIndexError(
+                        f"sidecar index at {db_path} cannot use WAL (journal mode {mode})"
+                    )
+                # Under WAL, NORMAL can lose the latest commits on power loss
+                # but does not corrupt the file; the index is derived from the
+                # vault and rebuildable.
+                conn.execute("PRAGMA synchronous=NORMAL")
+
             if self.config.rebuild_on_startup:
                 logger.info("rebuild_on_startup=True -- dropping sidecar schema before recreate")
                 self._drop_schema(conn)
 
             self._create_schema(conn)
-            self._conn = conn
-            logger.info("VaultSidecarIndex initialized at %s", db_path)
+            reader = None if in_memory else self._open_reader(db_path)
+        except SidecarIndexError:
+            if conn is not None:
+                conn.close()
+            raise
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as exc:
+            if conn is not None:
+                conn.close()
             raise SidecarIndexError(f"Failed to initialize sidecar index: {exc}") from exc
+        self._close_reader()
+        self._conn = conn
+        self._reader = reader
+        logger.info("VaultSidecarIndex initialized at %s", db_path)
+
+    def _open_reader(self, db_path: Path) -> sqlite3.Connection:
+        """Open the read-only connection the `*_readonly` reads run on.
+
+        `mode=ro` makes a stray write fail instead of taking the write lock,
+        and refuses to create a missing file. sqlite-vec is loaded because the
+        vector leg queries the vec0 table.
+        """
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        reader = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.enable_load_extension(True)
+            sqlite_vec.load(reader)
+            reader.enable_load_extension(False)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+            reader.close()
+            raise
+        return reader
+
+    def _close_reader(self) -> None:
+        """Stop the read thread, then close the read connection.
+
+        The thread is joined before the connection closes, so a query still
+        running on it never sees its connection closed underneath it. The
+        join waits at most for the one query in flight.
+        """
+        if self._read_worker is not None:
+            self._read_worker.shutdown(wait=True)
+            self._read_worker = None
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                self._reader = None
 
     def close(self) -> None:
-        """Close the database connection and worker thread. Idempotent."""
+        """Close both connections and both worker threads. Idempotent."""
+        self._close_reader()
         if self._worker is not None:
             self._worker.shutdown(wait=False)
             self._worker = None
@@ -496,13 +644,20 @@ class VaultSidecarIndex:
 
         Returns:
             List of result dicts, each containing:
-            ``{path, heading, content, frontmatter, note_type, score, distance, source}``.
-            ``score`` is ``1.0 / (1.0 + distance)``. Empty list on empty index.
+            ``{path, heading, content, frontmatter, note_type, score, distance, source,
+            mtime}``. ``score`` is ``1.0 / (1.0 + distance)``. ``mtime`` is the
+            file mtime (integer seconds) stored at indexing, which the memory
+            read path falls back to for a note's recency. Empty list on empty
+            index.
 
         Raises:
             SidecarIndexError: On database error.
         """
         self._require_connection()
+        return self._vector_rows(self._conn, embedding, k)  # type: ignore[arg-type]
+
+    def _vector_rows(self, conn: sqlite3.Connection, embedding: list[float], k: int) -> list[dict]:
+        """`query_vector` on `conn`, the writer or the read-only connection."""
         dim = self.config.embedding_dimension
         try:
             packed = struct.pack(f"<{dim}f", *embedding)
@@ -510,10 +665,10 @@ class VaultSidecarIndex:
             raise SidecarIndexError(f"Failed to pack embedding: {exc}") from exc
 
         try:
-            rows = self._conn.execute(  # type: ignore[union-attr]
+            rows = conn.execute(
                 """
                 SELECT vc.path, vc.heading, vc.content, vc.frontmatter_json,
-                       vc.note_type, distance
+                       vc.note_type, distance, vc.mtime
                 FROM vault_chunks_vec
                 JOIN vault_chunks vc ON vc.chunk_id = vault_chunks_vec.rowid
                 WHERE embedding MATCH ? AND k = ?
@@ -534,11 +689,12 @@ class VaultSidecarIndex:
                 "score": 1.0 / (1.0 + row[5]),
                 "distance": row[5],
                 "source": "vector",
+                "mtime": row[6],
             }
             for row in rows
         ]
 
-    def query_fts(self, text: str, k: int = 10) -> list[dict]:
+    def query_fts(self, text: str, k: int = 10, match: MatchMode = "all") -> list[dict]:
         """Return top-k chunks by BM25 lexical relevance.
 
         FTS5 returns smaller (more-negative) BM25 scores for better matches.
@@ -555,6 +711,9 @@ class VaultSidecarIndex:
         Args:
             text: User-supplied search query.
             k: Maximum results to return.
+            match: `"all"` requires every token (implicit AND); `"any"` ORs
+                them, so one token absent from every note does not empty the
+                result (see `_quote_fts5`).
 
         Returns:
             List of result dicts with the same shape as `query_vector`,
@@ -562,9 +721,16 @@ class VaultSidecarIndex:
 
         Raises:
             SidecarIndexError: On unexpected database errors.
+            ValueError: `match` is neither `"all"` nor `"any"`.
         """
         self._require_connection()
-        safe_text = _quote_fts5(text)
+        return self._fts_rows(self._conn, text, k, match)  # type: ignore[arg-type]
+
+    def _fts_rows(
+        self, conn: sqlite3.Connection, text: str, k: int, match: MatchMode
+    ) -> list[dict]:
+        """`query_fts` on `conn`, the writer or the read-only connection."""
+        safe_text = _quote_fts5(text, match=match)
         # No indexable tokens (e.g. an all-punctuation query like "???"): an
         # empty MATCH expression would itself be an FTS5 syntax error. Skip the
         # query entirely -- there are no lexical hits to find.
@@ -573,11 +739,12 @@ class VaultSidecarIndex:
         weight = self.config.heading_context_weight
 
         try:
-            rows = self._conn.execute(  # type: ignore[union-attr]
+            rows = conn.execute(
                 """
                 SELECT vc.path, vc.heading, vc.content, vc.frontmatter_json,
                        vc.note_type,
-                       -bm25(vault_chunks_fts, 1.0, ?) as score
+                       -bm25(vault_chunks_fts, 1.0, ?) as score,
+                       vc.mtime
                 FROM vault_chunks_fts
                 JOIN vault_chunks vc ON vc.chunk_id = vault_chunks_fts.rowid
                 WHERE vault_chunks_fts MATCH ?
@@ -604,6 +771,7 @@ class VaultSidecarIndex:
                 "score": row[5],
                 "distance": None,
                 "source": "fts",
+                "mtime": row[6],
             }
             for row in rows
         ]
@@ -614,6 +782,7 @@ class VaultSidecarIndex:
         text: str,
         k: int = 10,
         rrf_k: int = 60,
+        match: MatchMode = "all",
     ) -> list[dict]:
         """Return top-k chunks via Reciprocal Rank Fusion of vector + FTS.
 
@@ -628,6 +797,10 @@ class VaultSidecarIndex:
             text: Query text for the FTS retriever.
             k: Final top-k to return.
             rrf_k: RRF constant (larger = flatter ranking curve).
+            match: Token combination of the FTS leg, `"all"` (the default,
+                which every existing caller relies on) or `"any"`, which the
+                memory read path uses so a sentence-shaped query keeps the
+                lexical hits of the words that do occur.
 
         Returns:
             List of result dicts with ``score=rrf_combined`` (the RRF ordering
@@ -635,11 +808,159 @@ class VaultSidecarIndex:
             1/(1+distance) in (0, 1], for hits seen by the vector leg, None for
             FTS-only hits) for UI display,
             ``vector_rank``, ``fts_rank`` (None if absent from that list),
-            and ``sources`` list. Empty if both retrievers return nothing.
+            ``sources`` list, and ``mtime`` as in `query_vector`. Empty if both
+            retrievers return nothing.
+
+        Raises:
+            SidecarIndexError: On database error.
+            ValueError: `match` is neither `"all"` nor `"any"`.
         """
+        _check_match(match)
+        self._require_connection()
+        return self._hybrid(self._conn, embedding, text, k, rrf_k, match)  # type: ignore[arg-type]
+
+    async def query_hybrid_readonly(
+        self,
+        embedding: list[float],
+        text: str,
+        k: int = 10,
+        rrf_k: int = 60,
+        match: MatchMode = "all",
+    ) -> list[dict]:
+        """`query_hybrid` on the read-only connection and the `vault-sidecar-read` thread.
+
+        The writer's single worker also runs the filewatcher's `upsert_file`,
+        which embeds every chunk inside its write transaction, so a query
+        queued behind it waits for the whole reindex. Under WAL this
+        connection reads the last committed snapshot while a write is open,
+        so a turn's query returns without waiting; it does not see a write
+        that has not committed yet. A `:memory:` index has no second
+        connection, so its query runs on the writer's worker instead.
+
+        Arguments and result are those of `query_hybrid`.
+
+        Raises:
+            SidecarIndexError: The index is not initialized or the database
+                fails.
+            ValueError: `match` is neither `"all"` nor `"any"`.
+        """
+        _check_match(match)
+        self._require_connection()
+        if self._reader is None:
+            return await self.run_async(self.query_hybrid, embedding, text, k, rrf_k, match)
+        reader = self._reader
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._ensure_read_worker(),
+            self._hybrid_in_snapshot,
+            reader,
+            embedding,
+            text,
+            k,
+            rrf_k,
+            match,
+        )
+
+    async def path_texts_readonly(self, paths: Collection[str]) -> dict[str, str]:
+        """Each path's whole indexed text, on the read-only connection and its read thread.
+
+        The memory read path judges a note by every chunk of its path, not only the chunk a
+        query returned, so a corrected name in another section still suppresses the note
+        (mist-read-path T21). A path's text is its chunks' contents in chunk order (the
+        file-level chunk, then the heading blocks as first indexed), joined by a blank line;
+        each chunk is cut at `chunk_max_chars` as indexed. It runs where
+        `query_hybrid_readonly` runs and for the same reason: a `:memory:` index has no
+        second connection and reads on the writer's worker.
+
+        Args:
+            paths: The stored `path` values, as a query row carries them.
+
+        Returns:
+            Path to text, for each path the index holds; a path it does not hold is absent.
+
+        Raises:
+            SidecarIndexError: The index is not initialized or the database fails.
+        """
+        self._require_connection()
+        wanted = list(dict.fromkeys(paths))
+        if self._reader is None:
+            return await self.run_async(self._path_texts, self._conn, wanted)
+        reader = self._reader
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._ensure_read_worker(), self._path_texts, reader, wanted
+        )
+
+    def _path_texts(self, conn: sqlite3.Connection, paths: list[str]) -> dict[str, str]:
+        """`path_texts_readonly`'s read, one statement and so one snapshot, on `conn`."""
+        if not paths:
+            return {}
+        marks = ", ".join("?" * len(paths))
+        try:
+            rows = conn.execute(
+                f"SELECT path, content FROM vault_chunks WHERE path IN ({marks}) "  # nosec B608
+                "ORDER BY chunk_id",
+                paths,
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise SidecarIndexError(f"path_texts_readonly failed: {exc}") from exc
+        chunks: dict[str, list[str]] = {}
+        for row in rows:
+            chunks.setdefault(row[0], []).append(row[1])
+        return {path: "\n\n".join(parts) for path, parts in chunks.items()}
+
+    def _hybrid_in_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        embedding: list[float],
+        text: str,
+        k: int,
+        rrf_k: int,
+        match: MatchMode,
+    ) -> list[dict]:
+        """`_hybrid` inside one read transaction on the read-only connection.
+
+        The two legs are separate statements; without the transaction a
+        reindex committing between them could give one leg the old chunks and
+        the other the new ones. A failure to begin or end the transaction is
+        a SidecarIndexError like any other read failure, so the fetcher's
+        MistError handling covers it.
+        """
+        try:
+            conn.execute("BEGIN")
+        except sqlite3.Error as exc:
+            raise SidecarIndexError(f"query_hybrid_readonly failed: {exc}") from exc
+        ended = False
+        try:
+            rows = self._hybrid(conn, embedding, text, k, rrf_k, match)
+            try:
+                conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                raise SidecarIndexError(f"query_hybrid_readonly failed: {exc}") from exc
+            ended = True
+            return rows
+        finally:
+            # A read transaction left open would pin the WAL snapshot this
+            # connection reads, so the next query would not see new commits.
+            if not ended and conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error as exc:
+                    logger.warning("query_hybrid_readonly: rollback failed: %s", exc)
+
+    def _hybrid(
+        self,
+        conn: sqlite3.Connection,
+        embedding: list[float],
+        text: str,
+        k: int,
+        rrf_k: int,
+        match: MatchMode,
+    ) -> list[dict]:
+        """The RRF merge of `query_hybrid`, on `conn` (the writer or the reader)."""
         overshoot = k * 2
-        vector_results = self.query_vector(embedding, k=overshoot)
-        fts_results = self.query_fts(text, k=overshoot)
+        vector_results = self._vector_rows(conn, embedding, overshoot)
+        fts_results = self._fts_rows(conn, text, overshoot, match)
 
         # Keyed by (path, heading) -- heading may be None for file-level chunks.
         merged: dict[tuple[str, str | None], dict] = {}
@@ -654,6 +975,7 @@ class VaultSidecarIndex:
                     "content": result["content"],
                     "frontmatter": result["frontmatter"],
                     "note_type": result["note_type"],
+                    "mtime": result["mtime"],
                     "score": 0.0,
                     # display_similarity carries the distance-derived similarity
                     # (1/(1+distance), in (0, 1]) for UI display. Distinct from
@@ -679,6 +1001,7 @@ class VaultSidecarIndex:
                     "content": result["content"],
                     "frontmatter": result["frontmatter"],
                     "note_type": result["note_type"],
+                    "mtime": result["mtime"],
                     "score": 0.0,
                     # FTS-only hit: no vector score available. A chunk also seen
                     # by the vector leg keeps its score via the else-branch
