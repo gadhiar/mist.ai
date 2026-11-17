@@ -689,17 +689,19 @@ def test_release_build_pipes_the_archive_into_both_docker_builds(make_ctx, built
     }
 
 
-def test_release_build_extracts_deploy_scripts_daily_and_chat_templates_only(make_ctx, built_root):
+def test_release_build_extracts_deploy_and_scripts_daily_only(make_ctx, built_root):
     runner = FakeRunner(release_responses())
     assert release_build(make_ctx, runner, built_root, TAG, "--repo", REPO_ARG) == 0
-    assert all_files(built_root / "release" / TAG) == {
+    extracted = all_files(built_root / "release" / TAG)
+    assert extracted == {
         "deploy/README.md": b"deploy\n",
         "deploy/daily/compose.yml": b"services: {}\n",
         "deploy/daily/daily.env.example": b"MIST_RELEASE_TAG=<release-tag>\n",
-        "docker/extraction/chat_templates/gpt-oss.jinja": b"{{ messages }}\n",
         "scripts/daily/__init__.py": b"",
         "scripts/daily/instance.py": b"print('instance')\n",
     }
+    # The daily compose project mounts no chat template, so the archive's copy stays out.
+    assert "docker/extraction/chat_templates/gpt-oss.jinja" not in extracted
     assert [p.name for p in (built_root / "release").iterdir()] == [TAG]
 
 

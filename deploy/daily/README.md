@@ -81,8 +81,9 @@ before anything starts.
 | `MODEL` | the backend through `env_file` | no | code default |
 | `MIST_LLM_SHARE_NETWORK` | compose: external network `mist-llm` joins | no | `mist-llm-share` |
 | `MIST_ALLOWED_ORIGINS` | compose: browser origins the backend admits | no | the three Tauri origins |
-| `MIST_EXTRACTION_INFERENCE` | the backend through `env_file` | no | `service` |
-| `MIST_EXTRACTION_SERVICE_URL` | the backend through `env_file` | no | code default |
+| `MIST_EXTRACTION_INFERENCE` | none: compose sets it on `mist-backend`, so a `daily.env` line is ignored | no | `service` |
+| `MIST_EXTRACTION_SERVICE_URL` | none: compose sets it on `mist-backend`, so a `daily.env` line is ignored | no | `http://mist-extraction:8090` |
+| `MIST_HEALTH_BACKLOG_MAX_AGE_S` | compose: the backend's overdue age for the extraction backlog | no | `86400` |
 | `MIST_TIMEZONE` | the backend through `env_file`; alarms, timers and the clock need it | no | UTC; alarms, timers and clock unavailable |
 | `MIST_CAPABILITIES_ENABLED` | the backend through `env_file` | no | `false` |
 | `MIST_CAPABILITIES` | the backend through `env_file` | no | all five |
@@ -91,6 +92,13 @@ before anything starts.
 | `MIST_SPOTIFY_CLIENT_ID` | the backend through `env_file`: music | no | none, and music is not built |
 | `MIST_SPOTIFY_DEVICE` | the backend through `env_file`: music | no | none |
 | `MIST_RING_FALLBACK_AFTER_S` | the backend through `env_file`: alarms | no | `30` |
+| `MIST_EXTRACTION_WINDOW` | the instance CLI: the night window, `HH:MM-HH:MM` in host local time | no | `23:59-10:00` |
+| `MIST_DAILY_EXTRACTION_MODEL_FILE` | compose: the model the extraction llama-server loads | no | `ggml-org/gpt-oss-20b-MXFP4.gguf` |
+| `MIST_DAILY_EXTRACTION_CTX_SIZE` | compose: extraction llama-server context size | no | `65536` |
+| `MIST_DAILY_EXTRACTION_NCMOE` | compose: MoE layers whose experts stay on the CPU | no | `24` |
+| `MIST_DAILY_EXTRACTION_CACHE_RAM_MIB` | compose: extraction llama-server prompt-cache cap | no | `2048` |
+| `EXTRACTION_MODEL_HASH` | compose: the model identity `mist-extraction` stamps | for extraction | none, and extraction stays paused |
+| `EXTRACTION_LLM_DEVICE` | compose: the GPU name in `mist-extraction`'s serving identity | for extraction | none, and extraction stays paused |
 | `MIST_BACKUP_HOST_PATH` | compose: host directory mounted at `/backup` | yes | |
 | `MIST_BACKUP_INTERVAL_HOURS` | compose: the backup scheduler | no | `24` |
 | `MIST_BACKUP_RETAIN` | compose: the backup scheduler | no | `7` |
@@ -101,6 +109,8 @@ before anything starts.
 | `MIST_DAILY_NEO4J_MEM_LIMIT` | compose: `mem_limit` of `mist-neo4j` | no | `3g` |
 | `MIST_DAILY_LLM_MEM_LIMIT` | compose: `mem_limit` of `mist-llm` | no | `9g` |
 | `MIST_DAILY_BACKUP_MEM_LIMIT` | compose: `mem_limit` of `mist-backup` | no | `4g` |
+| `MIST_DAILY_EXTRACTION_LLM_MEM_LIMIT` | compose: `mem_limit` of `mist-extraction-llm` | no | `14g` |
+| `MIST_DAILY_EXTRACTION_MEM_LIMIT` | compose: `mem_limit` of `mist-extraction` | no | `1g` |
 | `MIST_DAILY_WS_PORT` | compose: host port of the WebSocket; rehearsal only | no | `8001` |
 | `MIST_DAILY_BOLT_PORT` | compose: host port of Neo4j Bolt; rehearsal only | no | `7687` |
 | `MIST_DAILY_NEO4J_HTTP_PORT` | compose: host port of the Neo4j browser; rehearsal only | no | `7474` |

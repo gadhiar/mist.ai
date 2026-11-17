@@ -6,6 +6,9 @@ tree, so each test guards one way an edit could make it reach the working tree, 
 beyond loopback, lose a literal that must not depend on the env file, or drift from the
 workstation stack's `docker-compose.yml` where the two must agree.
 
+The night extraction services run main's extraction overlay, `docker-compose.extraction.yml`,
+with a listed set of deltas, each asserted on its own.
+
 The parity tests fail on a deliberate change to either file until the other follows: that is
 their purpose, not a defect.
 """
@@ -17,18 +20,35 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.unit.test_compose_extraction import (
+    EXPECTED_SERVER_DECLARATIONS,
+    declaration_problems,
+    llama_server_settings,
+    model_path_problems,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DAILY_DIR = REPO_ROOT / "deploy" / "daily"
 COMPOSE_PATH = DAILY_DIR / "compose.yml"
 ENV_EXAMPLE_PATH = DAILY_DIR / "daily.env.example"
 README_PATH = DAILY_DIR / "README.md"
 ROOT_COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
+OVERLAY_PATH = REPO_ROOT / "docker-compose.extraction.yml"
 
 BACKEND = "mist-backend"
 NEO4J = "mist-neo4j"
 LLM = "mist-llm"
 BACKUP = "mist-backup"
-SERVICES = (BACKEND, NEO4J, LLM, BACKUP)
+EXTRACTION_LLM = "mist-extraction-llm"
+EXTRACTION = "mist-extraction"
+CHAT_SERVICES = (BACKEND, NEO4J, LLM, BACKUP)
+# The names `scripts/daily/instance.py` starts, stops and waits on (`EXTRACTION_PROFILE`,
+# `EXTRACTION_SERVICES`); renaming one here breaks `extraction apply`.
+EXTRACTION_SERVICES = (EXTRACTION_LLM, EXTRACTION)
+EXTRACTION_PROFILE = "extraction"
+SERVICES = (*CHAT_SERVICES, *EXTRACTION_SERVICES)
+OVERLAY_LLM = "mist-extraction-llm-local"
+OVERLAY_SERVICE = "mist-extraction-local"
 RELEASE_IMAGE_PREFIX = "mist-backend:${MIST_RELEASE_TAG:?"
 BIND_SOURCE_PREFIXES = ("${MIST_DAILY_ROOT", "${MODELS_DIR:?", "${MIST_BACKUP_HOST_PATH:?")
 TAURI_ORIGINS = "http://tauri.localhost,https://tauri.localhost,tauri://localhost"
@@ -51,6 +71,15 @@ CAPABILITY_LITERALS = {
     "MIST_HA_TOKEN_FILE": "/app/secrets/ha_token",
     "MIST_SPOTIFY_TOKEN_PATH": "/app/secrets/spotify_token.json",
 }
+# The backend calls the night extraction service in this project. The backlog's overdue age is a
+# day, since turns wait for the night window; the request timeout holds a slow night job of
+# three LLM calls at the service's per-call bound (plan v5, A15).
+EXTRACTION_BACKEND_ENTRIES = {
+    "MIST_EXTRACTION_INFERENCE": "service",
+    "MIST_EXTRACTION_SERVICE_URL": "http://mist-extraction:8090",
+    "MIST_HEALTH_BACKLOG_MAX_AGE_S": "${MIST_HEALTH_BACKLOG_MAX_AGE_S:-86400}",
+    "MIST_EXTRACTION_REQUEST_TIMEOUT_S": "1800",
+}
 BACKEND_LITERALS = {
     "NEO4J_URI": "bolt://mist-neo4j:7687",
     "LLM_SERVER_URL": "http://mist-llm:8080",
@@ -63,6 +92,7 @@ BACKEND_LITERALS = {
     "MIST_OPS_DIR": "/app/ops",
     "MIST_BACKUP_STATUS_PATH": "/app/ops/backup-status.json",
     **CAPABILITY_LITERALS,
+    **EXTRACTION_BACKEND_ENTRIES,
 }
 SECRETS_SOURCE = "${MIST_DAILY_ROOT}/secrets"
 BACKUP_ENVIRONMENT = {
@@ -81,6 +111,8 @@ MEM_LIMITS = {
     NEO4J: "${MIST_DAILY_NEO4J_MEM_LIMIT:-3g}",
     LLM: "${MIST_DAILY_LLM_MEM_LIMIT:-9g}",
     BACKUP: "${MIST_DAILY_BACKUP_MEM_LIMIT:-4g}",
+    EXTRACTION_LLM: "${MIST_DAILY_EXTRACTION_LLM_MEM_LIMIT:-14g}",
+    EXTRACTION: "${MIST_DAILY_EXTRACTION_MEM_LIMIT:-1g}",
 }
 LOGGING = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}}
 
@@ -98,12 +130,62 @@ CAPABILITY_EXAMPLE_VARIABLES = (
 )
 # Read by the backend from `daily.env` or by `instance.py`, not interpolated by compose.
 EXAMPLE_EXTRA_VARIABLES = (
-    "MIST_EXTRACTION_INFERENCE",
-    "MIST_EXTRACTION_SERVICE_URL",
+    "MIST_EXTRACTION_WINDOW",
     "MIST_INSTANCE_NAME",
     "MODEL",
     *CAPABILITY_EXAMPLE_VARIABLES,
 )
+# Compose sets these on mist-backend, so a daily.env line for one would be ignored.
+COMPOSE_SET_EXTRACTION_VARIABLES = (
+    "MIST_EXTRACTION_INFERENCE",
+    "MIST_EXTRACTION_SERVICE_URL",
+    "MIST_EXTRACTION_REQUEST_TIMEOUT_S",
+)
+
+# The night serving settings `daily.env` may change, by the llama-server setting each feeds.
+# Every other serving setting is a literal.
+DAILY_LLM_VARIABLES = {
+    "LLAMA_ARG_MODEL": "MIST_DAILY_EXTRACTION_MODEL_FILE",
+    "LLAMA_ARG_CTX_SIZE": "MIST_DAILY_EXTRACTION_CTX_SIZE",
+    "-ncmoe": "MIST_DAILY_EXTRACTION_NCMOE",
+    "--cache-ram": "MIST_DAILY_EXTRACTION_CACHE_RAM_MIB",
+}
+# The extraction identity; not required, so a missing value never stops chat:
+# `extraction apply` pauses extraction as unconfigured instead.
+IDENTITY_VARIABLES = ("EXTRACTION_MODEL_HASH", "EXTRACTION_LLM_DEVICE")
+# Every name the two extraction services read from daily.env, apart from the image tag and the
+# models directory, which they share with the chat services.
+EXTRACTION_DAILY_VARIABLES = {
+    *DAILY_LLM_VARIABLES.values(),
+    "MIST_DAILY_EXTRACTION_LLM_MEM_LIMIT",
+    "MIST_DAILY_EXTRACTION_MEM_LIMIT",
+    *IDENTITY_VARIABLES,
+}
+EXTRACTION_SHARED_VARIABLES = {"MIST_RELEASE_TAG", "MODELS_DIR"}
+# mist-llm's cache and attention settings, which the night server adds to the overlay's.
+CACHE_AND_ATTENTION_SETTINGS = (
+    "LLAMA_ARG_FLASH_ATTN",
+    "LLAMA_ARG_CACHE_TYPE_K",
+    "LLAMA_ARG_CACHE_TYPE_V",
+)
+ADDED_SERVER_DECLARATIONS = {"FLASH_ATTN", "CACHE_TYPE_K", "CACHE_TYPE_V"}
+# The service environment entries that differ from the overlay's defaults, each asserted by its
+# own test in `TestParityWithTheExtractionOverlay`.
+SERVICE_ENVIRONMENT_DELTAS = {
+    "EXTRACTION_LLM_BASE_URL",
+    "EXTRACTION_MODEL_HASH",
+    "EXTRACTION_SERVER_DEVICE",
+    "EXTRACTION_SERVER_CTX_SIZE",
+    "EXTRACTION_LLM_TIMEOUT_SECONDS",
+}
+# Night context and the overlay's: 65,536 is Raj's ruling of 15 Nov (plan v4 A11, v5 M34).
+NIGHT_CTX_SIZE = "65536"
+OVERLAY_CTX_SIZE = "16384"
+# The LLM's floor: about 11 GiB of expert tensors on the CPU at ncmoe 24, the prompt-cache cap,
+# and 1 GiB for the server (plan v4, Interfaces, Compose).
+EXPERT_TENSORS_ON_CPU_GIB = 11
+SERVER_OVERHEAD_GIB = 1
+CHAT_TEMPLATE = re.compile(r"chat[-_ ]?templates?", re.I)
 REHEARSAL_PORT_VARIABLES = (
     "MIST_DAILY_WS_PORT",
     "MIST_DAILY_BOLT_PORT",
@@ -136,6 +218,23 @@ def compose() -> dict:
 @pytest.fixture(scope="module")
 def root_compose() -> dict:
     return _load(ROOT_COMPOSE_PATH)
+
+
+@pytest.fixture(scope="module")
+def overlay() -> dict:
+    return _load(OVERLAY_PATH)
+
+
+def _resolved(value: str) -> str | None:
+    """What a compose value comes to with no variable set; None when a variable is required."""
+    if REQUIRED_INTERPOLATION.search(value):
+        return None
+    return DEFAULT_INTERPOLATION.sub(lambda match: match.group(2), value)
+
+
+def _interpolated(value: object) -> set[str]:
+    """Every variable name a compose value, or a whole parsed service, interpolates."""
+    return set(INTERPOLATION.findall(yaml.safe_dump(value, width=1 << 20)))
 
 
 def _environment(service: dict) -> dict[str, str]:
@@ -217,8 +316,14 @@ class TestServices:
     def test_project_is_named_mist_daily(self, compose):
         assert compose["name"] == "mist-daily"
 
-    def test_services_are_exactly_the_four(self, compose):
-        assert set(compose["services"]) == set(SERVICES)
+    def test_services_are_exactly_the_six(self, compose):
+        services = compose["services"]
+        in_extraction = {
+            name for name in services if EXTRACTION_PROFILE in services[name].get("profiles", [])
+        }
+
+        assert set(services) == set(SERVICES)
+        assert in_extraction == set(EXTRACTION_SERVICES)
 
     @pytest.mark.parametrize("key", ["container_name", "build"])
     def test_no_service_sets(self, compose, key):
@@ -249,9 +354,14 @@ class TestServices:
         assert path.startswith("${MIST_DAILY_ROOT:?") and path.endswith("}/daily.env")
         assert not isinstance(entry, dict) or entry.get("required", True) is True
 
-    @pytest.mark.parametrize("name", SERVICES)
+    @pytest.mark.parametrize("name", CHAT_SERVICES)
     def test_restarts_unless_stopped(self, compose, name):
         assert compose["services"][name]["restart"] == "unless-stopped"
+
+    @pytest.mark.parametrize("name", EXTRACTION_SERVICES)
+    def test_extraction_service_has_no_env_file(self, compose, name):
+        # Interpolation is the only way daily.env reaches either container.
+        assert "env_file" not in compose["services"][name]
 
 
 class TestMounts:
@@ -324,9 +434,23 @@ class TestMounts:
             ("${MIST_DAILY_ROOT}/logs/neo4j", "/logs", "rw"),
         ]
 
-    def test_llm_mounts_only_the_models_read_only(self, compose):
-        ((source, target, mode),) = _mounts(compose["services"][LLM])
+    @pytest.mark.parametrize("name", [LLM, EXTRACTION_LLM])
+    def test_llm_mounts_only_the_models_read_only(self, compose, name):
+        ((source, target, mode),) = _mounts(compose["services"][name])
         assert source.startswith("${MODELS_DIR:?") and (target, mode) == ("/models", "ro")
+
+    def test_extraction_llm_mounts_the_models_as_mist_llm_does(self, compose):
+        services = compose["services"]
+        assert services[EXTRACTION_LLM]["volumes"] == services[LLM]["volumes"]
+
+    def test_extraction_service_mounts_nothing(self, compose):
+        assert not compose["services"][EXTRACTION].get("volumes")
+
+    @pytest.mark.parametrize("name", EXTRACTION_SERVICES)
+    def test_names_no_chat_template(self, compose, name):
+        # llama-server serves the template embedded in the model file, as the overlay runs it.
+        text = yaml.safe_dump(compose["services"][name], width=1 << 20)
+        assert not CHAT_TEMPLATE.search(text)
 
 
 class TestPorts:
@@ -346,7 +470,7 @@ class TestPorts:
             "127.0.0.1:${MIST_DAILY_NEO4J_HTTP_PORT:-7474}:7474",
         ]
 
-    @pytest.mark.parametrize("name", [LLM, BACKUP])
+    @pytest.mark.parametrize("name", [LLM, BACKUP, *EXTRACTION_SERVICES])
     def test_publishes_no_port(self, compose, name):
         assert not compose["services"][name].get("ports")
 
@@ -365,6 +489,37 @@ class TestEnvironment:
     def test_backend_sets_nothing_beyond_the_contract(self, compose):
         environment = _environment(compose["services"][BACKEND])
         assert set(environment) == set(BACKEND_LITERALS) | {"MIST_ALLOWED_ORIGINS"}
+
+    def test_backend_calls_the_extraction_service_on_its_health_port(self, compose, overlay):
+        url = _environment(compose["services"][BACKEND])["MIST_EXTRACTION_SERVICE_URL"]
+        health = overlay["services"][OVERLAY_SERVICE]["healthcheck"]["test"][-1]
+
+        assert url == f"http://{EXTRACTION}:8090"
+        assert "http://localhost:8090/" in health
+
+    def test_extraction_reads_only_its_own_daily_variables(self, compose):
+        # image and volumes take the release tag and models directory the chat services use;
+        # everything else, the serving settings above all, reads only its own names.
+        read = set()
+        for name in EXTRACTION_SERVICES:
+            service = dict(compose["services"][name])
+            assert _interpolated(service.pop("image")) <= {"MIST_RELEASE_TAG"}
+            assert _interpolated(service.pop("volumes", [])) <= {"MODELS_DIR"}
+            read |= _interpolated(service)
+
+        assert read == EXTRACTION_DAILY_VARIABLES
+
+    def test_extraction_interpolates_no_overlay_variable(self, compose, overlay):
+        overlay_names = set()
+        for name in (OVERLAY_LLM, OVERLAY_SERVICE):
+            overlay_names |= _interpolated(overlay["services"][name])
+        daily_names = set()
+        for name in EXTRACTION_SERVICES:
+            daily_names |= _interpolated(compose["services"][name])
+
+        shared = {*IDENTITY_VARIABLES, "MODELS_DIR"}
+        assert overlay_names - shared, "the overlay interpolates nothing else to keep out"
+        assert daily_names & (overlay_names - shared) == set()
 
     def test_backup_environment(self, compose):
         environment = _environment(compose["services"][BACKUP])
@@ -409,6 +564,14 @@ class TestDependencies:
     def test_runs_without_a_profile(self, compose, name):
         assert "profiles" not in compose["services"][name]
 
+    def test_extraction_service_waits_for_its_llm(self, compose):
+        assert compose["services"][EXTRACTION]["depends_on"] == {
+            EXTRACTION_LLM: {"condition": "service_healthy"}
+        }
+
+    def test_extraction_llm_depends_on_nothing(self, compose):
+        assert "depends_on" not in compose["services"][EXTRACTION_LLM]
+
 
 class TestNetworksAndVolumes:
     def test_neo4j_data_volume_is_external_with_a_required_name(self, compose):
@@ -430,9 +593,13 @@ class TestNetworksAndVolumes:
     def test_llm_joins_the_default_and_share_networks(self, compose):
         assert set(compose["services"][LLM]["networks"]) == {"default", SHARE_NETWORK}
 
-    @pytest.mark.parametrize("name", [BACKEND, NEO4J, BACKUP])
+    @pytest.mark.parametrize("name", [BACKEND, NEO4J, BACKUP, *EXTRACTION_SERVICES])
     def test_does_not_join_the_share_network(self, compose, name):
         assert SHARE_NETWORK not in (compose["services"][name].get("networks") or [])
+
+    @pytest.mark.parametrize("name", EXTRACTION_SERVICES)
+    def test_extraction_joins_the_default_network_only(self, compose, name):
+        assert compose["services"][name].get("networks", ["default"]) == ["default"]
 
 
 class TestResources:
@@ -459,12 +626,22 @@ class TestResources:
 
         assert limit > cache_ram_mib * MIB
 
+    def test_extraction_llm_default_limit_holds_its_floor(self, compose):
+        service = compose["services"][EXTRACTION_LLM]
+        command = service["command"]
+        cache_ram_mib = int(_default_of(command[command.index("--cache-ram") + 1]))
+        floor = (EXPERT_TENSORS_ON_CPU_GIB + SERVER_OVERHEAD_GIB) * 1024 * MIB
+        floor += cache_ram_mib * MIB
+
+        assert _size_in_bytes(_default_of(service["mem_limit"])) >= floor
+
     @pytest.mark.parametrize("name", SERVICES)
     def test_logs_rotate(self, compose, name):
         assert compose["services"][name]["logging"] == LOGGING
 
-    def test_backup_reserves_no_gpu(self, compose):
-        assert "deploy" not in compose["services"][BACKUP]
+    @pytest.mark.parametrize("name", [BACKUP, EXTRACTION])
+    def test_reserves_no_gpu(self, compose, name):
+        assert "deploy" not in compose["services"][name]
 
 
 class TestParityWithTheWorkstationStack:
@@ -485,6 +662,197 @@ class TestParityWithTheWorkstationStack:
 
     def test_neo4j_image_matches_docker_compose(self, compose, root_compose):
         assert compose["services"][NEO4J]["image"] == root_compose["services"][NEO4J]["image"]
+
+
+class TestExtractionLlmFollowsMistLlm:
+    """The night server takes mist-llm's image, GPU reservation, healthcheck and KV cache form."""
+
+    @pytest.mark.parametrize("key", ["image", "deploy", "healthcheck"])
+    def test_matches_mist_llm(self, compose, key):
+        services = compose["services"]
+        assert services[EXTRACTION_LLM][key] == services[LLM][key]
+
+    @pytest.mark.parametrize("setting", CACHE_AND_ATTENTION_SETTINGS)
+    def test_cache_and_attention_match_mist_llm(self, compose, setting):
+        services = compose["services"]
+        assert _environment(services[EXTRACTION_LLM])[setting] == (
+            _environment(services[LLM])[setting]
+        )
+
+
+class TestParityWithTheExtractionOverlay:
+    """Main's `docker-compose.extraction.yml` local services, with each listed delta pinned."""
+
+    def test_llm_image_matches_the_overlay(self, compose, overlay):
+        assert compose["services"][EXTRACTION_LLM]["image"] == (
+            overlay["services"][OVERLAY_LLM]["image"]
+        )
+
+    def test_llm_settings_match_the_overlay_but_the_deltas(self, compose, overlay):
+        # Compared with no variable set: model path, ncmoe, batch, ubatch, mmap, reasoning,
+        # sampling and the cache-ram cap all resolve to the overlay's values.
+        daily = llama_server_settings(compose["services"][EXTRACTION_LLM])
+        local = llama_server_settings(overlay["services"][OVERLAY_LLM])
+
+        assert set(daily) == set(local) | set(CACHE_AND_ATTENTION_SETTINGS)
+        for setting in set(local) - {"LLAMA_ARG_CTX_SIZE"}:
+            assert _resolved(daily[setting]) == _resolved(local[setting]), setting
+
+    @pytest.mark.parametrize(
+        "setting, expected",
+        [
+            pytest.param("LLAMA_ARG_MODEL", "/models/ggml-org/gpt-oss-20b-MXFP4.gguf", id="model"),
+            pytest.param("-ncmoe", "24", id="ncmoe"),
+            pytest.param("-b", "2048", id="batch"),
+            pytest.param("-ub", "2048", id="ubatch"),
+            pytest.param("-lm", "none", id="no-mmap"),
+            pytest.param("LLAMA_ARG_REASONING", "on", id="reasoning"),
+            pytest.param("LLAMA_ARG_THINK", "deepseek", id="reasoning-format"),
+            pytest.param("--temp", "1.0", id="temp"),
+            pytest.param("--top-p", "1.0", id="top-p"),
+        ],
+    )
+    def test_llm_setting_equals_the_overlay(self, compose, overlay, setting, expected):
+        daily = llama_server_settings(compose["services"][EXTRACTION_LLM])
+        local = llama_server_settings(overlay["services"][OVERLAY_LLM])
+        assert _resolved(daily[setting]) == _resolved(local[setting]) == expected
+
+    def test_llm_reads_only_the_night_variables(self, compose):
+        # A line carried into daily.env from a checkout's .env cannot move the serving identity.
+        for setting, value in llama_server_settings(compose["services"][EXTRACTION_LLM]).items():
+            expected = {DAILY_LLM_VARIABLES[setting]} if setting in DAILY_LLM_VARIABLES else set()
+            assert set(INTERPOLATION.findall(value)) == expected, f"{setting}={value}"
+
+    def test_delta_ctx_size_default(self, compose, overlay):
+        daily = llama_server_settings(compose["services"][EXTRACTION_LLM])
+        local = llama_server_settings(overlay["services"][OVERLAY_LLM])
+
+        assert _resolved(daily["LLAMA_ARG_CTX_SIZE"]) == NIGHT_CTX_SIZE
+        assert _resolved(local["LLAMA_ARG_CTX_SIZE"]) == OVERLAY_CTX_SIZE
+
+    @pytest.mark.parametrize("setting", CACHE_AND_ATTENTION_SETTINGS)
+    def test_delta_cache_types_and_flash_attention(self, compose, overlay, setting):
+        daily = llama_server_settings(compose["services"][EXTRACTION_LLM])
+        local = llama_server_settings(overlay["services"][OVERLAY_LLM])
+
+        assert daily[setting] == ("on" if setting == "LLAMA_ARG_FLASH_ATTN" else "q8_0")
+        assert setting not in local
+
+    def test_delta_cache_ram_variable(self, compose, overlay):
+        daily = llama_server_settings(compose["services"][EXTRACTION_LLM])
+        local = llama_server_settings(overlay["services"][OVERLAY_LLM])
+
+        assert daily["--cache-ram"] == "${MIST_DAILY_EXTRACTION_CACHE_RAM_MIB:-2048}"
+        assert local["--cache-ram"] == "${LLM_CACHE_RAM_MIB:-2048}"
+
+    @pytest.mark.parametrize(
+        "name, local", [(EXTRACTION_LLM, OVERLAY_LLM), (EXTRACTION, OVERLAY_SERVICE)]
+    )
+    def test_delta_profile(self, compose, overlay, name, local):
+        assert compose["services"][name]["profiles"] == [EXTRACTION_PROFILE]
+        assert overlay["services"][local]["profiles"] == ["extraction-local"]
+
+    @pytest.mark.parametrize(
+        "name, local", [(EXTRACTION_LLM, OVERLAY_LLM), (EXTRACTION, OVERLAY_SERVICE)]
+    )
+    def test_delta_restart_no(self, compose, overlay, name, local):
+        # Only `extraction apply` starts them; a Docker restart must not run them by day.
+        assert compose["services"][name]["restart"] == "no"
+        assert overlay["services"][local]["restart"] == "unless-stopped"
+
+    @pytest.mark.parametrize(
+        "name, local", [(EXTRACTION_LLM, OVERLAY_LLM), (EXTRACTION, OVERLAY_SERVICE)]
+    )
+    def test_delta_mem_limit(self, compose, overlay, name, local):
+        assert compose["services"][name]["mem_limit"] == MEM_LIMITS[name]
+        assert "mem_limit" not in overlay["services"][local]
+
+    def test_delta_no_published_port(self, compose, overlay):
+        assert not compose["services"][EXTRACTION].get("ports")
+        assert overlay["services"][OVERLAY_SERVICE]["ports"]
+
+    def test_delta_image_in_place_of_build(self, compose, overlay):
+        service = compose["services"][EXTRACTION]
+        backend_image = compose["services"][BACKEND]["image"]
+
+        assert service["image"] == backend_image.replace(f"{BACKEND}:", f"{EXTRACTION}:", 1)
+        assert service["pull_policy"] == "never"
+        assert overlay["services"][OVERLAY_SERVICE]["build"]["dockerfile"] == (
+            "docker/extraction/Dockerfile"
+        )
+
+    def test_delta_llm_url(self, compose, overlay):
+        daily = _environment(compose["services"][EXTRACTION])
+        local = _environment(overlay["services"][OVERLAY_SERVICE])
+
+        assert daily["EXTRACTION_LLM_BASE_URL"] == f"http://{EXTRACTION_LLM}:8080"
+        assert local["EXTRACTION_LLM_BASE_URL"] == f"http://{OVERLAY_LLM}:8080"
+
+    @pytest.mark.parametrize(
+        "key, variable",
+        [
+            ("EXTRACTION_MODEL_HASH", "EXTRACTION_MODEL_HASH"),
+            ("EXTRACTION_SERVER_DEVICE", "EXTRACTION_LLM_DEVICE"),
+        ],
+    )
+    def test_delta_identity_variables_are_not_required(self, compose, overlay, key, variable):
+        # A missing value never stops chat; `extraction apply` refuses to start instead.
+        daily = _environment(compose["services"][EXTRACTION])
+        local = _environment(overlay["services"][OVERLAY_SERVICE])
+
+        assert daily[key] == f"${{{variable}:-}}"
+        assert local[key].startswith(f"${{{variable}:?")
+
+    def test_delta_per_call_timeout(self, compose, overlay):
+        # Plan v5 A15: a full 2,048-token call at a contended decode, bounded at 10 minutes.
+        daily = _environment(compose["services"][EXTRACTION])
+        local = _environment(overlay["services"][OVERLAY_SERVICE])
+
+        assert daily["EXTRACTION_LLM_TIMEOUT_SECONDS"] == "600"
+        assert _resolved(local["EXTRACTION_LLM_TIMEOUT_SECONDS"]) == "120"
+
+    def test_service_environment_matches_the_overlay_but_the_deltas(self, compose, overlay):
+        daily = _environment(compose["services"][EXTRACTION])
+        local = _environment(overlay["services"][OVERLAY_SERVICE])
+        added = {f"EXTRACTION_SERVER_{name}" for name in ADDED_SERVER_DECLARATIONS}
+
+        assert set(daily) == set(local) | added
+        for key in set(local) - SERVICE_ENVIRONMENT_DELTAS:
+            assert _resolved(daily[key]) == _resolved(local[key]), key
+
+    @pytest.mark.parametrize(
+        "key, expected",
+        [
+            ("EXTRACTION_REASONING_EFFORT", "low"),
+            ("EXTRACTION_ADAPTER", "gptoss"),
+            ("EXTRACTION_MAX_ATTEMPTS", "2"),
+            ("EXTRACTION_LOCATION_LABEL", "local-4070"),
+            ("EXTRACTION_CONSTRAINED_MODE", ""),
+        ],
+    )
+    def test_service_setting_is_the_overlay_default_as_a_literal(self, compose, key, expected):
+        assert _environment(compose["services"][EXTRACTION])[key] == expected
+
+    def test_every_llm_setting_is_declared_from_the_same_expression(self, compose):
+        services = compose["services"]
+        llm, service = services[EXTRACTION_LLM], services[EXTRACTION]
+
+        assert declaration_problems(llm, service) == []
+        assert model_path_problems(llm, service) == []
+
+    def test_declares_the_overlay_settings_and_the_kv_cache(self, compose):
+        environment = _environment(compose["services"][EXTRACTION])
+        declared = {
+            key.removeprefix("EXTRACTION_SERVER_")
+            for key in environment
+            if key.startswith("EXTRACTION_SERVER_")
+        }
+        assert declared == EXPECTED_SERVER_DECLARATIONS | ADDED_SERVER_DECLARATIONS
+
+    def test_service_healthcheck_matches_the_overlay(self, compose, overlay):
+        assert compose["services"][EXTRACTION]["healthcheck"] == (
+            overlay["services"][OVERLAY_SERVICE]["healthcheck"]
+        )
 
 
 class TestEnvExample:
@@ -517,6 +885,39 @@ class TestEnvExample:
         # Compose sets these four itself; a daily.env line for one would be ignored.
         named = {name for _commented, name, _value in _example_assignments()}
         assert named & set(CAPABILITY_LITERALS) == set()
+
+    def test_does_not_offer_the_extraction_entries_compose_sets(self):
+        named = {name for _commented, name, _value in _example_assignments()}
+        assert named & set(COMPOSE_SET_EXTRACTION_VARIABLES) == set()
+
+    def test_says_compose_sets_the_extraction_mode_and_url(self):
+        comments = " ".join(
+            line.lstrip("# ").strip()
+            for line in ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+            if line.startswith("#")
+        )
+        phrase = "compose sets MIST_EXTRACTION_INFERENCE and MIST_EXTRACTION_SERVICE_URL"
+        assert phrase.lower() in comments.lower()
+
+    def test_extraction_variables_are_commented_out(self):
+        by_name = {name: commented for commented, name, _value in _example_assignments()}
+        names = EXTRACTION_DAILY_VARIABLES | {"MIST_HEALTH_BACKLOG_MAX_AGE_S"}
+
+        for name in names:
+            assert by_name[name] is True, f"{name} must be commented out"
+
+    def test_extraction_window_is_a_commented_placeholder_with_its_format(self):
+        lines = ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+        index = lines.index("# MIST_EXTRACTION_WINDOW=<hh-mm-hh-mm>")
+        comment = []
+        for line in reversed(lines[:index]):
+            if not line.startswith("#") or EXAMPLE_ASSIGNMENT.match(line):
+                break
+            comment.insert(0, line.lstrip("# "))
+        text = " ".join(comment)
+
+        for phrase in ("HH:MM-HH:MM", "host local time", "23:59-10:00"):
+            assert phrase in text, phrase
 
     def test_every_value_is_a_placeholder_or_the_compose_default(self):
         defaults = dict(DEFAULT_INTERPOLATION.findall(_compose_text()))
@@ -562,6 +963,15 @@ class TestReadme:
         text = README_PATH.read_text(encoding="utf-8")
         missing = [name for _c, name, _v in _example_assignments() if f"`{name}`" not in text]
         assert not missing
+
+    @pytest.mark.parametrize("name", ["MIST_EXTRACTION_INFERENCE", "MIST_EXTRACTION_SERVICE_URL"])
+    def test_variable_row_says_compose_sets_it(self, name):
+        rows = [
+            line
+            for line in README_PATH.read_text(encoding="utf-8").splitlines()
+            if line.startswith(f"| `{name}` |")
+        ]
+        assert len(rows) == 1 and "compose sets it" in rows[0], rows
 
     @pytest.mark.parametrize(
         "phrase",

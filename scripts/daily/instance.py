@@ -108,9 +108,7 @@ DOCKERFILE = "docker/backend/Dockerfile"
 COMPOSE_FILE = "deploy/daily/compose.yml"
 EXTRACTION_IMAGE_REPOSITORY = "mist-extraction"
 EXTRACTION_DOCKERFILE = "docker/extraction/Dockerfile"
-# The chat templates are mounted into mist-extraction-llm from the extracted release, so the
-# template the LLM serves is the tag's own.
-RELEASE_EXTRACT_PREFIXES = ("deploy/", "scripts/daily/", "docker/extraction/chat_templates/")
+RELEASE_EXTRACT_PREFIXES = ("deploy/", "scripts/daily/")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
 REHEARSAL_TAG_PATTERN = re.compile(r"rehearsal-[0-9a-f]{7}", re.ASCII)
 STDERR_TAIL_LINES = 20
