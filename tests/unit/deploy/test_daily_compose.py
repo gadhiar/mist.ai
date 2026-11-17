@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scripts.daily import instance
 from tests.unit.test_compose_extraction import (
     EXPECTED_SERVER_DECLARATIONS,
     declaration_problems,
@@ -39,16 +40,43 @@ BACKEND = "mist-backend"
 NEO4J = "mist-neo4j"
 LLM = "mist-llm"
 BACKUP = "mist-backup"
-EXTRACTION_LLM = "mist-extraction-llm"
-EXTRACTION = "mist-extraction"
+# The names `scripts/daily/instance.py` starts, stops and waits on, taken from the CLI so a
+# rename on either side fails this suite rather than `extraction apply`.
+EXTRACTION_LLM = instance.EXTRACTION_LLM_SERVICE
+EXTRACTION = instance.EXTRACTION_SERVICE
 CHAT_SERVICES = (BACKEND, NEO4J, LLM, BACKUP)
-# The names `scripts/daily/instance.py` starts, stops and waits on (`EXTRACTION_PROFILE`,
-# `EXTRACTION_SERVICES`); renaming one here breaks `extraction apply`.
-EXTRACTION_SERVICES = (EXTRACTION_LLM, EXTRACTION)
-EXTRACTION_PROFILE = "extraction"
+EXTRACTION_SERVICES = instance.EXTRACTION_SERVICES
+EXTRACTION_PROFILE = instance.EXTRACTION_PROFILE
 SERVICES = (*CHAT_SERVICES, *EXTRACTION_SERVICES)
 OVERLAY_LLM = "mist-extraction-llm-local"
 OVERLAY_SERVICE = "mist-extraction-local"
+OVERLAY_COUNTERPART = {EXTRACTION_LLM: OVERLAY_LLM, EXTRACTION: OVERLAY_SERVICE}
+# Top-level keys each daily extraction service drops from, or adds to, its overlay service. A
+# key the overlay gains fails the key-set test until it is carried over or listed here.
+DROPPED_OVERLAY_KEYS: dict[str, dict[str, str]] = {
+    EXTRACTION_LLM: {
+        "container_name": "containers stay project-scoped, so a rehearsal can run beside daily",
+    },
+    EXTRACTION: {
+        "container_name": "containers stay project-scoped, so a rehearsal can run beside daily",
+        "hostname": "the service is itself named mist-extraction, so its DNS name needs no alias",
+        "ports": "nothing outside the project calls it; the backend reaches it by name",
+        "build": "the release image is built by `instance.py release-build`, never by compose",
+    },
+}
+ADDED_DAILY_KEYS: dict[str, dict[str, str]] = {
+    EXTRACTION_LLM: {
+        "networks": "the default network only, stated against mist-llm's share network",
+        "mem_limit": "every daily service has a memory limit from daily.env",
+        "logging": "every daily service rotates its logs",
+    },
+    EXTRACTION: {
+        "image": "the release's mist-extraction:<tag>, in place of build",
+        "pull_policy": "never: a pull of the tag could fetch an unrelated public image",
+        "mem_limit": "every daily service has a memory limit from daily.env",
+        "logging": "every daily service rotates its logs",
+    },
+}
 RELEASE_IMAGE_PREFIX = "mist-backend:${MIST_RELEASE_TAG:?"
 BIND_SOURCE_PREFIXES = ("${MIST_DAILY_ROOT", "${MODELS_DIR:?", "${MIST_BACKUP_HOST_PATH:?")
 TAURI_ORIGINS = "http://tauri.localhost,https://tauri.localhost,tauri://localhost"
@@ -152,7 +180,7 @@ DAILY_LLM_VARIABLES = {
 }
 # The extraction identity; not required, so a missing value never stops chat:
 # `extraction apply` pauses extraction as unconfigured instead.
-IDENTITY_VARIABLES = ("EXTRACTION_MODEL_HASH", "EXTRACTION_LLM_DEVICE")
+IDENTITY_VARIABLES = instance.EXTRACTION_IDENTITY_VARIABLES
 # Every name the two extraction services read from daily.env, apart from the image tag and the
 # models directory, which they share with the chat services.
 EXTRACTION_DAILY_VARIABLES = {
@@ -682,6 +710,21 @@ class TestExtractionLlmFollowsMistLlm:
 
 class TestParityWithTheExtractionOverlay:
     """Main's `docker-compose.extraction.yml` local services, with each listed delta pinned."""
+
+    @pytest.mark.parametrize("name", EXTRACTION_SERVICES)
+    def test_keys_match_the_overlay_but_the_listed_deltas(self, compose, overlay, name):
+        daily = set(compose["services"][name])
+        local = set(overlay["services"][OVERLAY_COUNTERPART[name]])
+        dropped = set(DROPPED_OVERLAY_KEYS.get(name, {}))
+        added = set(ADDED_DAILY_KEYS.get(name, {}))
+
+        assert dropped <= local and not added & local, "a listed delta is stale"
+        assert daily == (local - dropped) | added
+
+    @pytest.mark.parametrize("name", EXTRACTION_SERVICES)
+    @pytest.mark.parametrize("key", ["hostname", "container_name"])
+    def test_sets_no_fixed_container_name(self, compose, name, key):
+        assert key not in compose["services"][name]
 
     def test_llm_image_matches_the_overlay(self, compose, overlay):
         assert compose["services"][EXTRACTION_LLM]["image"] == (
