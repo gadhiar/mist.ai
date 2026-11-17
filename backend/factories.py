@@ -98,6 +98,10 @@ from backend.user_timezone import USER_TIMEZONE_ENV, resolve_user_timezone
 
 if TYPE_CHECKING:
     from backend.chat.context_budget import TokenCounter
+    from backend.realtime.budget import VoiceSettings
+    from backend.realtime.protocol import PowerLevel
+    from backend.realtime.runtime import EngineLoaders, GpuMeter, MistRuntime
+    from backend.realtime.session import InferenceLanes, SpeechEngines
 
 logger = logging.getLogger(__name__)
 
@@ -1762,4 +1766,197 @@ def build_capability_host(
         capabilities=tuple(capabilities),
         _db=db,
         _http=http,
+    )
+
+
+def build_speech_engines(
+    settings: "VoiceSettings",
+    *,
+    loaders: "EngineLoaders | None" = None,
+    power_level: "PowerLevel" = "full",
+    gpu_meter: "GpuMeter | None" = None,
+) -> "SpeechEngines":
+    """Load each speech slot from its placement chain, one engine at a time.
+
+    `loaders` defaults to the real adapters, each importing its library only when its option is
+    tried; `gpu_meter` defaults to torch's allocator figures, imported on the first CUDA load.
+
+    Args:
+        settings: The voice settings; the placement chains and the voice identity are read here.
+        loaders: How each engine loads; tests pass fakes.
+        power_level: The level at boot; at `off` the GPU is yielded and CUDA options are skipped.
+        gpu_meter: Measures each CUDA load's VRAM.
+    """
+    import importlib
+
+    from backend.realtime.runtime import TorchGpuMeter, load_speech_engines
+
+    return load_speech_engines(
+        settings,
+        loaders if loaders is not None else _real_engine_loaders(),
+        power_level=power_level,
+        gpu_meter=(
+            gpu_meter
+            if gpu_meter is not None
+            else TorchGpuMeter(lambda: importlib.import_module("torch"))
+        ),
+    )
+
+
+def _real_engine_loaders() -> "EngineLoaders":
+    """The T6, T7 and T8 adapters, each loaded through its classmethod `load`."""
+    from backend.realtime.engines.kws import OnnxNameSpotter
+    from backend.realtime.engines.nemotron_stt import NemotronStreamingTranscriber, import_nemo
+    from backend.realtime.engines.parakeet_stt import ParakeetTranscriber, import_onnx_asr
+    from backend.realtime.engines.pocket_tts import PocketCloneSynthesizer, import_pocket
+    from backend.realtime.engines.silero_vad import (
+        SileroVad,
+        onnxruntime_providers,
+        open_onnx_session,
+    )
+    from backend.realtime.engines.smart_turn import SmartTurnDetector, whisper_features
+    from backend.realtime.runtime import EngineLoaders
+
+    return EngineLoaders(
+        chains={
+            "pocket-clone": lambda s, device: PocketCloneSynthesizer.load(
+                s.placement, s.profile, library_loader=import_pocket, device=device
+            ),
+            "nemotron-160": lambda s, device: NemotronStreamingTranscriber.load(
+                s.placement, library_loader=import_nemo, device=device
+            ),
+            "parakeet-cpu": lambda s, device: ParakeetTranscriber.load(
+                s.placement, library_loader=import_onnx_asr, device=device
+            ),
+        },
+        vad=lambda placement: SileroVad.load(
+            placement, session_factory=open_onnx_session, available_providers=onnxruntime_providers
+        ),
+        eot=lambda placement, endpointing: SmartTurnDetector.load(
+            placement,
+            endpointing,
+            session_factory=open_onnx_session,
+            available_providers=onnxruntime_providers,
+            feature_extractor_factory=whisper_features,
+        ),
+        kws=lambda placement: OnnxNameSpotter.load(placement, session_factory=open_onnx_session),
+    )
+
+
+def build_mist_runtime(
+    config: KnowledgeConfig,
+    *,
+    voice_settings: "VoiceSettings",
+    llm_provider: StreamingLLMProvider | None = None,
+    handler_factory: Callable[..., object] | None = None,
+    engine_loaders: "EngineLoaders | None" = None,
+    gpu_meter: "GpuMeter | None" = None,
+    lanes: "InferenceLanes | None" = None,
+    power_level: "Callable[[], PowerLevel] | None" = None,
+    tts_enabled: bool = True,
+    vault_writer: "VaultWriter | None" = None,
+    vault_sidecar: SidecarIndexProtocol | None = None,
+    invalidation_bus: "InvalidationBus | None" = None,
+) -> "MistRuntime":
+    """Compose what every realtime session shares: responder, speech engines, lanes, settings.
+
+    The handler is built as `KnowledgeIntegration` builds it. Only a `MistError` from that build
+    (Neo4j unreachable raises `Neo4jConnectionError`) degrades to `DirectResponder`; any other
+    exception is a bug and fails startup with its traceback. The LLM is warmed unless the GPU is
+    yielded at boot, and the embedding model always, as `ModelManager.load_all_models` did.
+
+    Args:
+        config: The knowledge configuration; `llm.voice_first_segment_min_chars` sets the
+            segmenter's first cut, so the handler's first emission and the first TTS segment
+            cut at the same point.
+        voice_settings: From `load_voice_settings`.
+        llm_provider: The interactive provider; built from `config` when None.
+        handler_factory: Builds the handler; `build_conversation_handler` when None.
+        engine_loaders: How each speech engine loads; the real adapters when None.
+        gpu_meter: Measures each CUDA engine's VRAM; torch's figures when None.
+        lanes: The inference lanes; one `InferenceLane` per engine kind when None.
+        power_level: The process's power level; `full` until T22 wires its state.
+        tts_enabled: Whether voice turns may be spoken.
+        vault_writer: Passed to the handler build.
+        vault_sidecar: Passed to the handler build.
+        invalidation_bus: Passed to the handler build.
+    """
+    from backend.errors import MistError
+    from backend.llm.models import LLMRequest
+    from backend.realtime.degraded import DirectResponder
+    from backend.realtime.lanes import InferenceLane
+    from backend.realtime.runtime import MistRuntime, primary_placement
+    from backend.realtime.session import InferenceLanes, SessionServices
+
+    provider = llm_provider if llm_provider is not None else build_llm_provider(config)
+    level: Callable[[], PowerLevel] = power_level or (lambda: "full")
+    settings = replace(
+        voice_settings,
+        segmenter=replace(
+            voice_settings.segmenter,
+            first_segment_min_chars=config.llm.voice_first_segment_min_chars,
+        ),
+    )
+
+    handler: object | None = None
+    if not config.enable_knowledge_integration:
+        logger.warning(
+            "Knowledge integration is disabled: turns are answered without memory and are "
+            "not recorded"
+        )
+    else:
+        build_handler = handler_factory or build_conversation_handler
+        try:
+            handler = build_handler(
+                config=config,
+                llm_provider=provider,
+                vault_writer=vault_writer,
+                vault_sidecar=vault_sidecar,
+                invalidation_bus=invalidation_bus,
+            )
+        except MistError as error:
+            logger.warning("Knowledge integration unavailable, answering without memory: %s", error)
+    responder = handler if handler is not None else DirectResponder(provider)
+
+    engines = build_speech_engines(
+        settings, loaders=engine_loaders, power_level=level(), gpu_meter=gpu_meter
+    )
+    if lanes is None:
+        lanes = InferenceLanes(
+            vad=InferenceLane("vad"),
+            eot=InferenceLane("eot"),
+            stt=InferenceLane("stt"),
+            tts=InferenceLane("tts"),
+            kws=InferenceLane("kws"),
+        )
+
+    if level() == "off":
+        logger.info("GPU yielded at boot: skipping the LLM warmup")
+    else:
+        provider.invoke_sync(LLMRequest(messages=[{"role": "user", "content": "hi"}], max_tokens=1))
+    graph_store = getattr(handler, "graph_store", None)
+    embedder = getattr(graph_store, "embedding_generator", None)
+    warmup = getattr(embedder, "warmup", None)
+    if warmup is not None:
+        logger.info("Warming up embedding model...")
+        warmup()
+
+    services = SessionServices(
+        responder=responder,  # type: ignore[arg-type]
+        engines=engines,
+        lanes=lanes,
+        settings=settings,
+        placement=lambda: primary_placement(engines, settings),
+        power_level=level,
+        tts_enabled=tts_enabled,
+    )
+    return MistRuntime(
+        llm_provider=provider,
+        conversation_handler=handler,
+        responder=responder,  # type: ignore[arg-type]
+        engines=engines,
+        lanes=lanes,
+        settings=settings,
+        services=services,
+        agent_available=handler is not None,
     )
