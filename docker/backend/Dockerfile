@@ -78,6 +78,18 @@ RUN pip install -r /app/requirements.txt
 # Ensure openai and httpx are installed (safety net if requirements.txt cache is stale)
 RUN pip install "openai>=1.30" "httpx>=0.27"
 
+# 3b. Speech engine packages (requirements-voice.txt), kept out of requirements.txt so that CI,
+# which installs requirements.txt alone, never sees them. NeMo, one of these engines, installs a
+# top-level `scripts` package into site-packages; the repository's `scripts` has no `__init__.py`,
+# so it is a namespace package and NeMo's would win over it, breaking `scripts.backup` and the
+# bench. The step removes that package and fails the build if any `scripts` is still importable.
+# `-I` drops the working directory and PYTHONPATH from `sys.path`, so only the installed packages
+# are judged. It runs before step 4, so the re-pin still catches a torch these packages moved.
+COPY --chown=appuser:appgroup requirements-voice.txt /app/requirements-voice.txt
+RUN pip install -r /app/requirements-voice.txt \
+    && rm -rf /opt/venv/lib/python3.11/site-packages/scripts \
+    && python -I -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('scripts') is not None)"
+
 # 4. Re-pin PyTorch ONLY if chatterbox or requirements overwrote it
 RUN TORCH_VER=$(python -c "import torch; print(torch.__version__)") && \
     if [ "$TORCH_VER" != "2.6.0+cu124" ]; then \

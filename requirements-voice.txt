@@ -1,0 +1,11 @@
+# Speech engine packages for the realtime voice adapters in backend/realtime/engines/.
+#
+# Installed only by docker/backend/Dockerfile's step 3b, after requirements.txt and before the
+# torch re-pin, never by CI: NeMo (the speech-to-text engines) installs a top-level `scripts`
+# package that would shadow the repository's own, and step 3b removes it. Each line is an exact
+# `name==version` pin at the version the engine's arm in
+# scripts/model_bench/speech/speech_arms.json records, which
+# tests/unit/realtime/test_engine_bench_parity.py checks.
+
+# Kyutai Pocket TTS, the `pocket-clone` engine (docker/speech-bench/requirements-pocket.txt).
+pocket-tts==4.0.1
