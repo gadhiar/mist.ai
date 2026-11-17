@@ -54,10 +54,10 @@ def _vector(text: str) -> np.ndarray:
 
 @pytest.fixture(autouse=True)
 def _gate_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A run without `--need-gate` takes the config's mode, `shadow` by default, and the shipped
-    # gate model's record is keyed to the real fact embedder, so a token-embedder run finds no
-    # record for its key; these runs measure placement, so the gate is off through the
-    # environment.
+    # A run without `--need-gate` takes the config's mode: `off` by default, or whatever
+    # `MIST_MEMORY_NEED_GATE` says. The shipped gate model's record is keyed to the real fact
+    # embedder, so a token-embedder run with the gate on or shadow finds no record for its key;
+    # these runs measure placement, so the environment pins the gate off.
     monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "off")
 
 

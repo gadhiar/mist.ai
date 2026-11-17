@@ -64,10 +64,11 @@ from scripts.eval_harness.memory_recall_run import (
 
 @pytest.fixture(autouse=True)
 def _gate_off_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A run without `--need-gate` takes the config's mode, `shadow` by default, and the shipped
-    # gate model's record is keyed to the real fact embedder, so a token-embedder run finds no
-    # record for its key; the tests of the other flags run with the gate off through the
-    # environment, which `MemoryConfig.from_env` reads. A `--need-gate` flag overrides it.
+    # A run without `--need-gate` takes the config's mode: `off` by default, or whatever
+    # `MIST_MEMORY_NEED_GATE` says. The shipped gate model's record is keyed to the real fact
+    # embedder, so a token-embedder run with the gate on or shadow finds no record for its key;
+    # the tests of the other flags pin the gate off through the environment, which
+    # `MemoryConfig.from_env` reads. A `--need-gate` flag overrides it.
     monkeypatch.setenv("MIST_MEMORY_NEED_GATE", "off")
 
 

@@ -96,7 +96,7 @@ class TestDefaults:
         assert config.tz is UTC
         assert config.tz_name is None
         assert config.fact_view == "F3"
-        assert config.need_gate == "shadow"
+        assert config.need_gate == "off"
         assert config.need_embedder == "shared"
         assert config.need_context is True
 
@@ -126,12 +126,12 @@ class TestDefaults:
         assert MemoryConfig.from_env(tz_resolver=_never_called) == MemoryConfig()
 
     @pytest.mark.parametrize("raw", [None, "", "  "])
-    def test_the_need_gate_is_shadow_when_unset_or_blank(self, monkeypatch, raw):
-        """The shipped model is shadow-only (plan v10 A55): by default the gate acts on nothing."""
+    def test_the_need_gate_is_off_when_unset_or_blank(self, monkeypatch, raw):
+        """In shadow the gate put fetches past their deadline at H4: by default none is built."""
         if raw is not None:
             monkeypatch.setenv("MIST_MEMORY_NEED_GATE", raw)
 
-        assert MemoryConfig.from_env(tz_resolver=_never_called).need_gate == "shadow"
+        assert MemoryConfig.from_env(tz_resolver=_never_called).need_gate == "off"
 
 
 class TestFromEnv:

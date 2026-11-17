@@ -79,7 +79,7 @@ after each fetch returns, never inside the timed path.
 `--fact-view` sets the fact view the index embeds, overriding the config's.
 
 The need gate: `--need-gate on|shadow|off` overrides the config's mode, which without the flag
-is `MIST_MEMORY_NEED_GATE`'s, `shadow` by default. `--need-embedder shared` (the default) builds the
+is `MIST_MEMORY_NEED_GATE`'s, `off` by default. `--need-embedder shared` (the default) builds the
 gate on the fact embedder, sharing the fetch's query vector; its name and revision for the
 gate's key are the fact embedder's entry in `--models-lock` with `--embedder real`, and
 `FAKE_EMBEDDER_NAME` and `FAKE_EMBEDDER_REVISION` with `--embedder fake`. `--need-embedder PATH`

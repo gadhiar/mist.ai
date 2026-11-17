@@ -226,11 +226,12 @@ class MemoryConfig:
             change alters. The default equals `retrieval_view.DEFAULT_FACT_VIEW`.
         need_gate: Whether each fetch asks the need gate first. `on` acts on its band,
             `shadow` decides and traces, then serves the fetch as open, and `off` builds no
-            gate, so nothing reads the need bank or the gate model file. `shadow` is the
-            default: the shipped model is shadow-only (its `source` starts with
-            `need_gate.SHADOW_ONLY`), fit when no gate met the eligibility rule, so nothing
-            acts on it. `off` is the rollback lever when the bank or the model file is what
-            broke.
+            gate, so nothing reads the need bank or the gate model file. `off` is the
+            default: with the gate in shadow, 121 of 178 dev idle fetches at H4 (17 Nov)
+            missed their deadline, against none with it off, and the shipped model is shadow-only
+            (its `source` starts with `need_gate.SHADOW_ONLY`), fit when no gate met the
+            eligibility rule, so nothing may act on it. `off` is also the rollback lever when
+            the bank or the model file is what broke.
         need_embedder: The gate embedder, a `need_gate.NEED_EMBEDDERS` name. `shared` reuses
             the fetch's own query vector; another name embeds the query a second time, with
             that model's query prefix, on the `memory-gate` executor. No run chose the default
@@ -268,7 +269,7 @@ class MemoryConfig:
     facets: bool = True
     rescan_interval_s: int = 300
     fact_view: FactViewId = "F3"
-    need_gate: NeedGateMode = "shadow"
+    need_gate: NeedGateMode = "off"
     need_embedder: NeedEmbedderName = "shared"
     need_context: bool = True
     corrections_enabled: bool = True
@@ -367,7 +368,7 @@ class MemoryConfig:
             facets=_env_bool("MIST_MEMORY_FACETS", True),
             rescan_interval_s=_env_int("MIST_MEMORY_RESCAN_INTERVAL_S", 300),
             fact_view=_env("MIST_MEMORY_FACT_VIEW") or "F3",  # type: ignore[arg-type]
-            need_gate=_env("MIST_MEMORY_NEED_GATE") or "shadow",  # type: ignore[arg-type]
+            need_gate=_env("MIST_MEMORY_NEED_GATE") or "off",  # type: ignore[arg-type]
             need_embedder=_env("MIST_MEMORY_NEED_EMBEDDER") or "shared",  # type: ignore[arg-type]
             need_context=_env_bool("MIST_MEMORY_NEED_CONTEXT", True),
             corrections_enabled=_env_bool("MIST_MEMORY_CORRECTIONS_ENABLED", True),

@@ -4,8 +4,10 @@ H23 ran this script on 16 Nov, in image mist-read-path-h4:be7be966, to fit the r
 `backend/memory/need_model.json`; tests/unit/memory/test_need_model.py pins that record.
 
 H18 (16 Nov, image mist-read-path-h4:be7be966) found no eligible gate variant and wrote no need
-model. Raj's ruling of 16 Nov ships the gate in shadow mode: each fetch is decided and traced, then
-served as open. A shadow gate still needs a record for its key in need_model.json. This fits the
+model. Raj's ruling of 16 Nov was to ship the gate in shadow mode: each fetch decided and traced,
+then served as open. A shadow gate still needs a record for its key in need_model.json. At H4 (17
+Nov) the shadow gate put 121 of 178 dev idle fetches past their deadline, so the gate ships `off`
+(Raj, 17 Nov) and the record ships unread until a run sets `shadow` or `on`. This fits the
 one variant plan v10 names: the `shared` gate embedder (the fact embedder, whose query vector the
 fetch shares), the form H18's cross-validation chose for it, recall target 0.95 and band_k 1. No
 eligibility rule chose it, and its record's `source` starts with `SHADOW_ONLY`.
