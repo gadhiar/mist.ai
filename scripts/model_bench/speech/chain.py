@@ -21,6 +21,11 @@ and Pocket on 4 CPU threads each. `--stt-engine` and `--tts-engine` choose anoth
 `STT_ENGINES` and `TTS_ENGINES`: a CUDA engine gets the GPU, a CPU engine 4 threads, and every row
 names both engines. `pocket-clone` speaks as the identity clip `--voice-clip` names, mounted
 read-only at a fixed container path; the results keep only the clip's sha256 prefix.
+
+`--reply-pack <dir>` also saves each turn's whole reply, per recording and repetition, for
+`reply-ab`'s blind comparison (`listening.py`). The client already reads every reply stream to
+its end before it speaks the first clause, so the pack takes the text the turn holds: it adds no
+request and reads no clock, and every recorded time is the same with it or without it.
 """
 
 from __future__ import annotations
@@ -77,6 +82,9 @@ DEFAULT_BASELINE_S = 60.0
 SERVICE_TIMEOUT_S = 600.0
 HEALTH_POLL_S = 1.0
 LOAD_GEN_BASE_URL = tts_suite.LOAD_GEN_BASE_URL
+# `--reply-pack <dir>`: what made the pack, and one whole reply per recording and repetition.
+REPLY_PACK_META = "reply-pack.json"
+REPLY_PACK_FILE = "replies.jsonl"
 
 Clock = Callable[[], float]
 Opener = Callable[..., object]
@@ -347,6 +355,15 @@ class TtsClient:
 
     def speak(self, text: str) -> TtsReply:
         """Speak `text`, noting when the first audio chunk arrived and when the last did."""
+        return self._speak(text, None)
+
+    def render(self, text: str) -> tuple[bytes, int]:
+        """All of `text`'s audio as 16-bit mono PCM, and its sample rate, for a reply A/B clip."""
+        chunks: list[bytes] = []
+        reply = self._speak(text, chunks)
+        return b"".join(chunks), reply.sample_rate
+
+    def _speak(self, text: str, keep: list[bytes] | None) -> TtsReply:
         data = json.dumps({"text": text}).encode("utf-8")
         request = _post(self.url, data, "application/json")
         t_request = self._clock()
@@ -363,6 +380,8 @@ class TtsClient:
                     if t_first is None:
                         t_first = self._clock()
                     n_bytes += len(chunk)
+                    if keep is not None:
+                        keep.append(chunk)
             t_end = self._clock()
         except urllib.error.HTTPError as exc:
             raise core.StreamError(f"POST {self.url} returned HTTP {exc.code}") from exc
@@ -637,6 +656,11 @@ class ServiceSpec:
     log_name: str
 
 
+def _tts_spec(paths: Mapping[str, str], engine: str, voice_clip: str | None) -> ServiceSpec:
+    argv = tts_service_argv(**paths, engine=engine, voice_clip=voice_clip)
+    return ServiceSpec(TTS_CONTAINER, tuple(argv), f"{TTS_URL}/health", "tts_service.log")
+
+
 @dataclass
 class ChainServices:
     """Starts both service containers, waits for each to answer, and removes them after."""
@@ -673,15 +697,35 @@ class ChainServices:
                 f"{STT_URL}/health",
                 "stt_service.log",
             ),
-            ServiceSpec(
-                TTS_CONTAINER,
-                tuple(tts_service_argv(**paths, engine=tts_engine, voice_clip=voice_clip)),
-                f"{TTS_URL}/health",
-                "tts_service.log",
-            ),
+            _tts_spec(paths, tts_engine, voice_clip),
         )
         return cls(
             specs,
+            docker or core.HostDocker(),
+            opener or urllib.request.urlopen,
+            clock,
+            sleep,
+            timeout_s,
+        )
+
+    @classmethod
+    def speech_only(
+        cls,
+        *,
+        repo_dir: str,
+        speech_models_dir: str,
+        docker: ServiceDocker | None = None,
+        opener: Opener | None = None,
+        clock: Clock = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        timeout_s: float = SERVICE_TIMEOUT_S,
+        engine: str = TTS_ENGINE,
+        voice_clip: str | None = None,
+    ) -> ChainServices:
+        """The speech service alone, as `reply-ab` uses it to voice whole replies."""
+        paths = {"repo_dir": repo_dir, "speech_models_dir": speech_models_dir}
+        return cls(
+            (_tts_spec(paths, engine, voice_clip),),
             docker or core.HostDocker(),
             opener or urllib.request.urlopen,
             clock,
@@ -758,7 +802,8 @@ class Services(Protocol):
 class ChainRequest:
     """One chain run: a served alias, the material, the two speech engines, and optionally E4B
     writing beside it. `voice_clip` is the identity clip `pocket-clone` needs, kept out of
-    `repr` so no log line or traceback of the request shows its path.
+    `repr` so no log line or traceback of the request shows its path. `reply_pack` is a new
+    directory outside the checkout for each turn's whole reply (`--reply-pack`).
     """
 
     results_root: Path
@@ -775,6 +820,7 @@ class ChainRequest:
     stt_engine: str = STT_ENGINE
     tts_engine: str = TTS_ENGINE
     voice_clip: Path | None = field(default=None, repr=False)
+    reply_pack: Path | None = None
 
 
 class LoadGen(Protocol):
@@ -842,7 +888,33 @@ def _check_request(
             )
     if request.reps is not None and request.reps < 1:
         raise core.SpeechBenchError(f"--reps must be at least 1, not {request.reps}")
+    if request.reply_pack is not None:
+        pack = core.refuse_path_inside_repo(request.reply_pack, what="--reply-pack")
+        if pack.exists():
+            raise core.OutputExistsError(
+                f"--reply-pack {pack} already exists; a reply pack is written once, to a new "
+                f"directory"
+            )
     return alias, clip
+
+
+def reply_row(row: Mapping[str, object]) -> dict[str, object]:
+    """One turn's whole reply for the pack: the model's text, or the hand-off acknowledgement.
+
+    `run_turn` reads every stream to its end before it speaks, so the row already holds the
+    whole reply; a hand-off turn speaks `HAND_OFF_ACK` and has no model text, and a failed turn
+    keeps its error and no reply.
+    """
+    reply = row.get("reply")
+    if reply is None and row.get("error") is None:
+        reply = row.get("spoken_text")
+    return {
+        "utt_id": row["utt_id"],
+        "rep": row["rep"],
+        "kind": row["kind"],
+        "reply": reply,
+        "error": row.get("error"),
+    }
 
 
 def _busy_fields(row: Mapping[str, object], completions: Sequence[load_gen.Completion]) -> dict:
@@ -907,6 +979,9 @@ def run_chain(
     if clip is not None:
         meta["voice_clip_sha256"] = clip.sha256_prefix
     core.write_json_exclusive(claim.path / "chain.json", meta)
+    replies = None
+    if request.reply_pack is not None:
+        replies = _open_reply_pack(request.reply_pack, claim, meta)
 
     def each_turn() -> Iterator[dict[str, object]]:
         # Recording by recording, its repetitions together, as run 3 orders its material.
@@ -916,6 +991,8 @@ def run_chain(
                     item, rep=rep, alias=alias, inputs=inputs, llm=llm, stt=stt, tts=tts,
                     clock=clock,
                 )  # fmt: skip
+                if replies is not None:
+                    replies.write(reply_row(row))
                 yield {**row, **engines}
 
     turns = claim.jsonl("turns.jsonl")
@@ -929,7 +1006,24 @@ def run_chain(
         return claim.path
     finally:
         turns.close()
+        if replies is not None:
+            replies.close()
         services.stop(claim.path)
+
+
+def _open_reply_pack(
+    pack: Path, claim: core.OutputClaim, meta: Mapping[str, object]
+) -> core.JsonlWriter:
+    """Claim the pack directory, write what made it, and open its reply file.
+
+    The meta names the model, placement and engines, so `reply-ab` keeps it in its sealed key
+    and never on the page. It holds no clip path, only what `chain.json` already records.
+    """
+    path = core.claim_dir(core.refuse_path_inside_repo(pack, what="--reply-pack"))
+    doc = {"schema": 1, "run": claim.run, "git_sha": claim.git_sha, **meta}
+    doc["results"] = str(claim.path)
+    core.write_json_exclusive(path / REPLY_PACK_META, doc)
+    return core.JsonlWriter(path / REPLY_PACK_FILE, stamp=claim.stamp())
 
 
 def _run_busy(
@@ -1007,6 +1101,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help=f"the identity WAV {core.VOICE_CLIP_ENGINE} clones, outside the checkout "
         f"(with --tts-engine {core.VOICE_CLIP_ENGINE} only)",
     )
+    parser.add_argument(
+        "--reply-pack",
+        type=Path,
+        help="also save each turn's whole reply to this new directory, outside the checkout, "
+        "for reply-ab",
+    )
     parser.set_defaults(func=cmd_chain)
 
 
@@ -1040,6 +1140,7 @@ def cmd_chain(args: argparse.Namespace) -> int:
         stt_engine=args.stt_engine,
         tts_engine=args.tts_engine,
         voice_clip=None if clip is None else clip.path,
+        reply_pack=args.reply_pack,
     )
     services = ChainServices.default(
         repo_dir=core.REPO_ROOT.resolve().as_posix(),

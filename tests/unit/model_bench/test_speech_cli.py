@@ -80,7 +80,7 @@ def test_registry_lists_the_suite_modules_and_their_subcommands_in_order():
         ("turn_suite", ("turn",)),
         ("cache_suite", ("cache",)),
         ("fit_suite", ("fit",)),
-        ("listening", ("listen-pack",)),
+        ("listening", ("listen-pack", "reply-ab")),
         ("lowtier_suite", ("lowtier", "remote-memory")),
         ("chain", ("chain",)),
         ("game_suite", ("game-session",)),
@@ -331,9 +331,14 @@ FORBIDDEN_OPTION_PARTS = (
 
 # The owner's ruling of 12 Nov allows one cloned arm, `pocket-clone`, which clones a private
 # identity clip named at run time and kept outside the checkout. So exactly one option that takes
-# a voice sample exists: `--voice-clip`, on the two subcommands that can run that arm, `tts` and
-# `chain`. Any other option holding a listed part, or `--voice-clip` anywhere else, still fails.
-ALLOWED_VOICE_SAMPLE_OPTIONS = {"tts": {"voice-clip"}, "chain": {"voice-clip"}}
+# a voice sample exists: `--voice-clip`, on the three subcommands that can run that arm, `tts`,
+# `chain` and `reply-ab` (which voices both replies of an item with it). Any other option holding
+# a listed part, or `--voice-clip` anywhere else, still fails.
+ALLOWED_VOICE_SAMPLE_OPTIONS = {
+    "tts": {"voice-clip"},
+    "chain": {"voice-clip"},
+    "reply-ab": {"voice-clip"},
+}
 
 
 def _normalised(options):
@@ -348,7 +353,7 @@ def _hits(options, allowed=frozenset()):
     )
 
 
-def test_no_option_takes_a_voice_sample_but_voice_clip_on_tts_and_chain():
+def test_no_option_takes_a_voice_sample_but_voice_clip_on_tts_chain_and_reply_ab():
     parser = speech_bench.build_parser()
     top = {opt for action in parser._actions for opt in action.option_strings}
     hits = [f"(top) {o}" for o in _hits(top)]

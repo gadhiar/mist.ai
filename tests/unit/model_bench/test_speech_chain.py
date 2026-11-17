@@ -1031,6 +1031,177 @@ def test_run_chain_refuses_a_results_root_inside_the_repository(material):
 
 
 # ---------------------------------------------------------------------------
+# --reply-pack: each turn's whole reply, saved for the blind reply A/B page
+# ---------------------------------------------------------------------------
+
+TIMING_FIELDS = (
+    "stt_ms", "llm_first_token_ms", "tool_call_ms", "done_first_token_ms", "first_clause_ms",
+    "tts_first_audio_ms", "tts_total_ms", "turn_ms", "turn_wall_ms", "t_turn_start",
+    "t_turn_end",
+)  # fmt: skip
+WHOLE_DONE_REPLY = "Your ten minute timer is set and running now, and it rings at ten past nine."
+
+
+def pack_run(tmp_path, material, name, **overrides):
+    """A two-repetition run against the recorded fake stream, under its own results root."""
+    clock = Clock()
+    fake = fake_for_run(clock)
+    llm, stt, tts = make_clients(fake, clock)
+    services = FakeServiceLifecycle()
+    request = chain_request(tmp_path, material, results_root=tmp_path / name, **overrides)
+    out = chain.run_chain(
+        request, llm=llm, stt=stt, tts=tts, services=services,
+        container_state=lambda name: "running", clock=clock, git_sha="abc",
+    )  # fmt: skip
+    rows = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
+    return rows, fake, services
+
+
+def test_a_reply_pack_leaves_every_recorded_time_of_the_turn_unchanged(tmp_path, material):
+    plain, plain_fake, _ = pack_run(tmp_path, material, "plain")
+    packed, packed_fake, _ = pack_run(
+        tmp_path, material, "packed", reply_pack=tmp_path / "replies-a"
+    )
+
+    assert len(packed) == len(plain) == 28
+    for before, after in zip(plain, packed, strict=True):
+        assert {f: after[f] for f in TIMING_FIELDS} == {f: before[f] for f in TIMING_FIELDS}
+    assert [r["turn_ms"] for r in packed] == [r["turn_ms"] for r in plain]
+    # The pack takes the reply the turn already streamed to its end: no request is added.
+    assert [kind for kind, _ in packed_fake.requests] == [kind for kind, _ in plain_fake.requests]
+    assert packed_fake.spoken == plain_fake.spoken
+
+
+def test_a_reply_pack_saves_the_whole_reply_per_recording_and_repetition(tmp_path, material):
+    pack = tmp_path / "replies-a"
+
+    rows, fake, _ = pack_run(tmp_path, material, "results", reply_pack=pack)
+
+    saved = [json.loads(line) for line in (pack / chain.REPLY_PACK_FILE).read_text().splitlines()]
+    assert [(r["utt_id"], r["rep"]) for r in saved] == [(r["utt_id"], r["rep"]) for r in rows]
+    by_turn = {(r["utt_id"], r["rep"]): r for r in saved}
+    # The turn speaks only the first clause; the pack holds the whole reply.
+    assert by_turn[("U01", 1)]["reply"] == WHOLE_DONE_REPLY
+    assert "Your ten minute timer is set and running now," in fake.spoken
+    assert by_turn[("U20", 2)]["reply"] == SHORT_REPLY
+    assert by_turn[("U07", 1)]["reply"] == chain.HAND_OFF_ACK
+    assert {r["kind"] for r in saved} == {"command", "short", "hand_off"}
+    assert all(r["error"] is None for r in saved)
+    meta = json.loads((pack / chain.REPLY_PACK_META).read_text())
+    assert (meta["model"], meta["placement"], meta["alias"]) == (
+        "gemma4-e2b",
+        "gpu-full",
+        "gemma4-e2b@gpu-full",
+    )
+    assert (meta["stt_engine"], meta["tts_engine"], meta["reps"]) == ("parakeet-cpu", "pocket", 2)
+    assert meta["utterances"] == list(chain.CHAIN_UTTERANCES)
+
+
+def test_a_reply_pack_keeps_a_failed_turn_with_its_error_and_no_reply(tmp_path, material):
+    clock = Clock()
+    fake = fake_for_run(clock)
+    fake.transcripts = [UTTERANCES[u] for u in chain.CHAIN_UTTERANCES]
+    route = fake.chat_router
+
+    def failing(body):
+        if body["messages"][-1]["content"] == UTTERANCES["U19"]:
+            return [(0.05, sse({"error": {"message": "slot unavailable"}}))]
+        return route(body)
+
+    fake.chat_router = failing
+    llm, stt, tts = make_clients(fake, clock)
+    pack = tmp_path / "replies-a"
+
+    chain.run_chain(
+        chain_request(tmp_path, material, reps=1, reply_pack=pack), llm=llm, stt=stt, tts=tts,
+        services=FakeServiceLifecycle(), container_state=lambda name: "running", clock=clock,
+        git_sha="abc",
+    )  # fmt: skip
+
+    saved = {
+        r["utt_id"]: r
+        for r in (json.loads(x) for x in (pack / chain.REPLY_PACK_FILE).read_text().splitlines())
+    }
+    assert saved["U19"]["reply"] is None and "slot unavailable" in saved["U19"]["error"]
+    assert saved["U20"]["reply"] == SHORT_REPLY
+
+
+@pytest.mark.parametrize("where", ["inside-the-checkout", "existing"])
+def test_a_reply_pack_is_refused_inside_the_checkout_or_over_an_earlier_one(
+    tmp_path, material, where
+):
+    pack = _REPO_ROOT / "reply-pack-here" if where == "inside-the-checkout" else tmp_path / "old"
+    if where == "existing":
+        pack.mkdir()
+    clock = Clock()
+    llm, stt, tts = make_clients(fake_for_run(clock), clock)
+    services = FakeServiceLifecycle()
+
+    with pytest.raises(core.SpeechBenchError, match="--reply-pack"):
+        chain.run_chain(
+            chain_request(tmp_path, material, reply_pack=pack), llm=llm, stt=stt, tts=tts,
+            services=services, container_state=lambda name: "running", clock=clock,
+        )  # fmt: skip
+
+    assert services.events == []
+    assert not (tmp_path / "results").exists()
+    assert not (_REPO_ROOT / "reply-pack-here").exists()
+
+
+def test_cmd_chain_hands_the_reply_pack_to_the_request(tmp_path, monkeypatch):
+    seen = {}
+
+    def run_chain(request, **kwargs):
+        seen["request"] = request
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "turns.jsonl").write_text("", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(chain.ChainServices, "default", lambda **kwargs: FakeServiceLifecycle())
+    monkeypatch.setattr(chain, "run_chain", run_chain)
+    argv = [
+        "chain", "--results-root", str(tmp_path / "results"), "--run", "mh1",
+        "--model", "gemma4-e2b", "--placement", "gpu-full", "--material-dir", str(tmp_path),
+        "--speech-models-dir", str(tmp_path), "--reply-pack", str(tmp_path / "replies-a"),
+    ]  # fmt: skip
+
+    assert speech_bench.main(argv) == 0
+    assert seen["request"].reply_pack == tmp_path / "replies-a"
+    parser = speech_bench.subcommand_parsers(speech_bench.build_parser())["chain"]
+    assert {a.dest: a for a in parser._actions}["reply_pack"].default is None
+
+
+def test_the_speech_client_renders_all_of_a_text_s_audio(tmp_path):
+    clock = Clock()
+    fake = FakeServices(clock)
+    tts = chain.TtsClient(chain.TTS_URL, opener=fake, clock=clock)
+
+    pcm, rate = tts.render(WHOLE_DONE_REPLY)
+
+    assert fake.spoken == [WHOLE_DONE_REPLY]
+    assert pcm == b"\x01\x00" * 480 + b"\x02\x00" * 480
+    assert rate == 24000
+
+
+def test_the_speech_only_service_runs_one_engine_with_its_clip():
+    clock = Clock()
+    docker = FakeDocker()
+    services = chain.ChainServices.speech_only(
+        repo_dir="/repo", speech_models_dir="/models", engine="pocket-clone",
+        voice_clip=CLIP_HOST, docker=docker, opener=HealthOpener(clock), clock=clock,
+        sleep=clock.sleep,
+    )  # fmt: skip
+
+    (spec,) = services.specs
+    assert spec.container == chain.TTS_CONTAINER
+    assert _pairs(list(spec.argv), "--engine") == ["pocket-clone"]
+    assert CLIP_MOUNT in _pairs(list(spec.argv), "-v")
+    services.start()
+    assert [c for c in docker.calls if c[0] == "run"] == [("run", chain.TTS_CONTAINER)]
+
+
+# ---------------------------------------------------------------------------
 # --busy-arm c0: the chained turn while E4B writes
 # ---------------------------------------------------------------------------
 
