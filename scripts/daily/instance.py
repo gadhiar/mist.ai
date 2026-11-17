@@ -26,6 +26,7 @@ import contextlib
 import functools
 import importlib.util
 import io
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -135,6 +136,23 @@ REVISION_LABEL = "org.opencontainers.image.revision"
 BACKUP_ONCE = ("python", "-m", "scripts.backup.scheduler", "--once")
 
 ACCEPT_SUSPECT = ("python", "-m", "scripts.backup.scheduler", "--accept-suspect")
+
+# Room devices (item 11): the opt-in overlay, used only while `daily.env` sets the bind. The
+# forwarder publishes the one LAN port; nothing else of the instance leaves loopback.
+DEVICES_COMPOSE_FILE = "deploy/daily/compose.devices.yml"
+DEVICES_PROFILE = "devices"
+DEVICE_FORWARD_SERVICE = "mist-device-forward"
+DEVICE_BIND_KEY = "MIST_DAILY_DEVICE_BIND"
+DEVICE_PORT_KEY = "MIST_DAILY_DEVICE_PORT"
+DEVICE_DIR_KEY = "MIST_DEVICE_DIR"
+# A LAN address can arrive after sign-in (DHCP, Wi-Fi), so `up` keeps retrying the forwarder on
+# this period until `--wait-minutes` runs out.
+DEVICE_FORWARD_RETRY_S = 30.0
+# RFC 1918 only: the forwarder must face the home LAN, never every interface or the internet.
+PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+CONTAINER_STATE_FORMAT = "{{.State.Status}}"
 
 # The restore drill (item 8). The graph URI is the drill compose file's `NEO4J_URI`, which is in
 # the dev allowlist of `backend/knowledge/eval_isolation.py`; a unit test pins the equality. The
@@ -937,8 +955,12 @@ class Instance:
         return self.release_dir().joinpath(*COMPOSE_FILE.split("/"))
 
     def compose(self) -> list[str]:
-        """The `docker compose` prefix every project command starts with (item 5)."""
-        return [
+        """The `docker compose` prefix every project command starts with (item 5).
+
+        With the device bind set it adds the overlay and its profile, so `down` and `status` see
+        the forwarder `up` started, and no call recreates mist-backend without its device mount.
+        """
+        prefix = [
             "docker",
             "compose",
             "-p",
@@ -948,6 +970,19 @@ class Instance:
             "--env-file",
             str(self.env_path),
         ]
+        if _device_bind(self):
+            prefix += ["-f", str(_devices_compose_file(self)), "--profile", DEVICES_PROFILE]
+        return prefix
+
+
+def _device_bind(inst: Instance) -> str:
+    """`MIST_DAILY_DEVICE_BIND`, empty when unset; the one switch for every device change."""
+    return inst.env.get(DEVICE_BIND_KEY, "").strip()
+
+
+def _devices_compose_file(inst: Instance) -> Path:
+    """The tag's own device overlay, beside its compose file."""
+    return inst.release_dir().joinpath(*DEVICES_COMPOSE_FILE.split("/"))
 
 
 def _load_instance(raw_root: str | Path, ctx: Context, *, require_release: bool = True) -> Instance:
@@ -991,6 +1026,44 @@ def _check_ports(inst: Instance) -> None:
                 f"({', '.join(str(p) for p in sorted(ALLOWLISTED_PORTS))}); no instance may "
                 "answer on one"
             )
+    _check_device_settings(inst)
+
+
+def _check_device_settings(inst: Instance) -> None:
+    """Refuse a device port or bind that would publish the wrong thing, or the bind alone.
+
+    The bind is the forwarder's only host address, so anything but one RFC 1918 IPv4 address
+    (all interfaces, loopback, a public address) is refused rather than published. Compose would
+    refuse a bind without `MIST_DEVICE_DIR` only once Docker runs; this refuses it first.
+    """
+    port = inst.env.get(DEVICE_PORT_KEY)
+    if port is not None and port != "":
+        websocket = CANONICAL_PORTS["MIST_DAILY_WS_PORT"]
+        usable = port.isascii() and port.isdigit() and len(port) <= 5 and 1 <= int(port) <= 65535
+        if not usable:
+            raise RefusedError(f"{inst.env_path} sets {DEVICE_PORT_KEY}={port}, which is no port")
+        if port == websocket or int(port) in ALLOWLISTED_PORTS:
+            raise RefusedError(
+                f"{inst.env_path} sets {DEVICE_PORT_KEY}={port}, the WebSocket port {websocket} "
+                f"or an eval, dev or staging port; the forwarder needs a port of its own"
+            )
+    bind = _device_bind(inst)
+    if not bind:
+        return
+    try:
+        address = ipaddress.IPv4Address(bind)
+    except ValueError:
+        address = None
+    if address is None or not any(address in net for net in PRIVATE_IPV4_NETWORKS):
+        raise RefusedError(
+            f"{inst.env_path} sets {DEVICE_BIND_KEY}={bind}; it must be the PC's LAN address, "
+            "one private IPv4 address (10/8, 172.16/12 or 192.168/16)"
+        )
+    if not inst.env.get(DEVICE_DIR_KEY, "").strip():
+        raise RefusedError(
+            f"{inst.env_path} sets {DEVICE_BIND_KEY} but not {DEVICE_DIR_KEY}, the devices "
+            "directory mist-backend mounts"
+        )
 
 
 def _backup_host_path(inst: Instance) -> str:
@@ -1149,17 +1222,30 @@ def _normalized(path: str) -> str:
 
 
 def _foreign_containers(inst: Instance, containers: Sequence[ContainerInfo]) -> list[str]:
-    """`<name> uses <files>` for each container not made from the release's compose file alone.
+    """`<name> uses <files>` for each container not made from the release's own compose files.
 
     Compose records the files a container was created from in a label, so a
-    `docker compose -p mist-daily -f <another file> up` shows here.
+    `docker compose -p mist-daily -f <another file> up` shows here. The release's files are its
+    compose file alone, or that file then its device overlay. Compose recreates a container only
+    when its configuration changes, so the services the overlay leaves alone may carry either
+    label; mist-backend, which the overlay changes, must carry the overlay exactly when the bind
+    is set, and the forwarder, which only the overlay defines, whenever the bind is set.
     """
-    expected = _normalized(str(inst.compose_file()))
+    alone = [_normalized(str(inst.compose_file()))]
+    with_overlay = [*alone, _normalized(str(_devices_compose_file(inst)))]
+    bind = bool(_device_bind(inst))
     foreign = []
     for container in containers:
         label = str(container.labels.get(CONFIG_FILES_LABEL, ""))
-        files = [entry for entry in label.split(",") if entry]
-        if len(files) != 1 or _normalized(files[0]) != expected:
+        files = [_normalized(entry) for entry in label.split(",") if entry]
+        service = container.labels.get(SERVICE_LABEL)
+        if service == DEVICE_FORWARD_SERVICE and bind:
+            accepted = [with_overlay]
+        elif service == BACKEND_SERVICE:
+            accepted = [with_overlay] if bind else [alone]
+        else:
+            accepted = [alone, with_overlay]
+        if files not in accepted:
             foreign.append(f"{container.name} uses {label or '(no config-file label)'}")
     return foreign
 
@@ -1203,6 +1289,7 @@ def instance_up(inst: Instance, ctx: Context, wait_minutes: int) -> None:
     services that answer turns from starting.
     """
     _check_static_configuration(inst, ctx)
+    deadline = ctx.monotonic() + wait_minutes * 60
     _wait_for_docker(ctx, wait_minutes)
     _check_release_image(inst, ctx)
     _ensure_share_network(inst, ctx)
@@ -1231,14 +1318,69 @@ def instance_up(inst: Instance, ctx: Context, wait_minutes: int) -> None:
             )
         else:
             print(f"started {BACKUP_SERVICE}: backups are armed")
+    bind = _device_bind(inst)
+    if bind:
+        problem = _start_device_forward(inst, ctx, deadline)
+        if problem is not None:
+            problems.append(problem)
     try:
-        foreign = _foreign_containers(inst, _project_containers(ctx, inst.project))
+        containers = _project_containers(ctx, inst.project)
     except FailedError as exc:
         problems.append(f"the containers' compose files could not be checked: {exc}")
     else:
-        problems.extend(f"container {entry}, not {inst.compose_file()}" for entry in foreign)
+        if not bind:
+            containers = _remove_leftover_forwarders(ctx, containers, problems)
+        expected = str(inst.compose_file())
+        if bind:
+            expected = f"{expected} with {_devices_compose_file(inst)}"
+        foreign = _foreign_containers(inst, containers)
+        problems.extend(f"container {entry}, not {expected}" for entry in foreign)
     if problems:
         raise FailedError(f"release {inst.tag} is up, but: " + "; ".join(problems))
+
+
+def _start_device_forward(inst: Instance, ctx: Context, deadline: float) -> str | None:
+    """Start the forwarder, retrying until `deadline`; the problem to report, or None.
+
+    It starts in its own call, after the services, because its port binds the LAN address, which
+    can be missing at sign-in; a failure here never stops the services the desktop uses.
+    """
+    while True:
+        started = ctx.runner([*inst.compose(), "up", "-d", DEVICE_FORWARD_SERVICE])
+        if started.returncode == 0:
+            print(f"started {DEVICE_FORWARD_SERVICE} on {_device_bind(inst)}")
+            return None
+        if ctx.monotonic() >= deadline:
+            return (
+                f"{DEVICE_FORWARD_SERVICE} did not start by the --wait-minutes deadline "
+                f"({_stderr_tail(started)}); room devices cannot connect, and the other "
+                "services keep running"
+            )
+        ctx.sleep(DEVICE_FORWARD_RETRY_S)
+
+
+def _remove_leftover_forwarders(
+    ctx: Context, containers: Sequence[ContainerInfo], problems: list[str]
+) -> list[ContainerInfo]:
+    """Remove each forwarder left from when the bind was set; the containers that remain.
+
+    Without the bind no compose call names the overlay, so compose would never stop it, and it
+    would go on publishing the LAN port. `rm -f` without `-v` removes the container only.
+    """
+    remaining = []
+    for container in containers:
+        if container.labels.get(SERVICE_LABEL) != DEVICE_FORWARD_SERVICE:
+            remaining.append(container)
+            continue
+        removed = ctx.runner(["docker", "rm", "-f", container.name])
+        if removed.returncode == 0:
+            print(f"removed the leftover {DEVICE_FORWARD_SERVICE} {container.name}")
+        else:
+            problems.append(
+                f"the leftover {DEVICE_FORWARD_SERVICE} {container.name} could not be removed "
+                f"({_stderr_tail(removed)}); it may still publish the device port"
+            )
+    return remaining
 
 
 def cmd_up(args: argparse.Namespace, ctx: Context) -> None:
@@ -2677,8 +2819,36 @@ def _usage_lines(inst: Instance, ctx: Context, port: str) -> list[str]:
     return [f"turns-per-day: {counts}", f"days used: {used} of {len(entries)}"]
 
 
+def _device_forward_line(
+    inst: Instance, ctx: Context, containers: Sequence[ContainerInfo] | None
+) -> str | None:
+    """The forwarder's state, or None when the bind is unset and no forwarder exists.
+
+    `containers` is None when the listing failed. A forwarder left with the bind unset is named,
+    since it may still publish the device port until the next `up` removes it.
+    """
+    bind = bool(_device_bind(inst))
+    if containers is None:
+        return "device-forward: unknown (the containers could not be listed)" if bind else None
+    forwarders = [c for c in containers if c.labels.get(SERVICE_LABEL) == DEVICE_FORWARD_SERVICE]
+    if not forwarders:
+        return "device-forward: absent" if bind else None
+    name = forwarders[0].name
+    result = ctx.runner(["docker", "inspect", "--format", CONTAINER_STATE_FORMAT, name])
+    state = result.stdout.decode("utf-8", "replace").strip()
+    if result.returncode != 0 or not state:
+        shown = f"unknown ({_stderr_tail(result)})"
+    elif state in ("running", "exited"):
+        shown = state
+    else:
+        shown = f"exited ({state})"
+    suffix = "" if bind else f" ({DEVICE_BIND_KEY} is unset; up removes it)"
+    return f"device-forward: {shown}{suffix}"
+
+
 def cmd_status(args: argparse.Namespace, ctx: Context) -> int:
-    """Print what runs, whether it is the release, gaming mode, `/health` and the use counts.
+    """Print what runs, whether it is the release, the device forwarder, gaming mode, `/health`
+    and the use counts.
 
     Exits 1 when a container of the project was made from another compose file, or when the
     containers cannot be listed, since then that check did not run.
@@ -2686,15 +2856,20 @@ def cmd_status(args: argparse.Namespace, ctx: Context) -> int:
     inst = _load_instance(args.root, ctx)
     print(_backend_line(inst, ctx))
     code = EXIT_OK
+    containers: list[ContainerInfo] | None
     try:
-        foreign = _foreign_containers(inst, _project_containers(ctx, inst.project))
+        containers = _project_containers(ctx, inst.project)
     except FailedError as exc:
+        containers = None
         print(f"config-file check: failed ({exc})")
         code = EXIT_FAILED
     else:
-        for entry in foreign:
+        for entry in _foreign_containers(inst, containers):
             print(f"config-file mismatch: {entry}")
             code = EXIT_FAILED
+    device_line = _device_forward_line(inst, ctx, containers)
+    if device_line is not None:
+        print(device_line)
     print(gaming_mode_line(inst.root))
     port = inst.env.get("MIST_DAILY_WS_PORT") or CANONICAL_PORTS["MIST_DAILY_WS_PORT"]
     if port.isdigit():

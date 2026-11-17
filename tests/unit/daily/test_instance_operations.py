@@ -1483,3 +1483,453 @@ def test_unregister_script_removes_the_task():
     ]
     assert len(removals) == 2
     assert "powershell -ExecutionPolicy Bypass -File" in ps_header(UNREGISTER)
+
+
+# --- The device overlay (item 11) ------------------------------------------------------------
+#
+# With `MIST_DAILY_DEVICE_BIND` set, every compose call adds the overlay and its profile, `up`
+# starts the forwarder in its own call and retries it on the injected clock, and the config-file
+# check holds mist-backend and the forwarder to the overlay. With it unset, nothing changes but a
+# leftover forwarder's removal.
+
+DEVICE_BIND = "192.168.1.20"
+FORWARDER = "mist-device-forward"
+STATE_FORMAT = "{{.State.Status}}"
+
+
+def overlay_file(root: Root, tag: str = TAG) -> Path:
+    return root.path / "release" / tag / "deploy" / "daily" / "compose.devices.yml"
+
+
+def devices_base(root: Root, tag: str = TAG) -> list[str]:
+    return [*root.base(tag), "-f", str(overlay_file(root, tag)), "--profile", "devices"]
+
+
+def both_files(root: Root, tag: str = TAG) -> str:
+    return f"{root.compose_file(tag)},{overlay_file(root, tag)}"
+
+
+def enable_devices(root: Root, tmp_path: Path, *, device_dir: bool = True) -> None:
+    set_env_line(root, f"MIST_DAILY_DEVICE_BIND={DEVICE_BIND}")
+    if device_dir:
+        set_env_line(root, f"MIST_DEVICE_DIR={(tmp_path / 'device-dir').as_posix()}")
+
+
+def listing_responses(root: Root, labels_by_service: dict[str, str]) -> dict:
+    """The project listing and one inspection per service, each with its config-file label."""
+    responses: dict = {}
+    ids = []
+    for service, files in labels_by_service.items():
+        cid = f"id-{service}"
+        ids.append(cid)
+        labels = labels_for(root, service, files)
+        responses[container_inspect(cid)] = inspect_line(
+            f"{root.project}-{service}-1", IMAGE_ID, labels
+        )
+    responses[project_ps(root.project)] = ok("\n".join(ids) + "\n")
+    return responses
+
+
+def devices_up_responses(root: Root, forward=None) -> dict:
+    base = devices_base(root)
+    responses = {
+        DOCKER_INFO: ok("27.0.0\n"),
+        image_inspect(TAG): ok(IMAGE_ID + "\n"),
+        NETWORK_INSPECT: ok("[]"),
+        (*base, "up", "-d", "mist-neo4j", "mist-llm", "mist-backend"): ok(),
+        (*base, "--profile", "backup", "up", "-d", "mist-backup"): ok(),
+        (*base, "up", "-d", FORWARDER): forward if forward is not None else ok(),
+    }
+    responses.update(
+        listing_responses(
+            root,
+            {
+                "mist-neo4j": str(root.compose_file()),
+                "mist-llm": str(root.compose_file()),
+                "mist-backend": both_files(root),
+                FORWARDER: both_files(root),
+            },
+        )
+    )
+    return responses
+
+
+@pytest.fixture
+def devices_daily(tmp_path, daily) -> Root:
+    enable_devices(daily, tmp_path)
+    return daily
+
+
+# Instance.compose
+
+
+def test_compose_adds_the_overlay_and_profile_only_when_the_bind_is_set(make_ctx, daily, tmp_path):
+    ctx = make_ctx()
+    assert instance._load_instance(daily.path, ctx).compose() == daily.base()
+
+    enable_devices(daily, tmp_path)
+
+    assert instance._load_instance(daily.path, ctx).compose() == devices_base(daily)
+
+
+def test_an_empty_bind_counts_as_unset(make_ctx, daily):
+    set_env_line(daily, "MIST_DAILY_DEVICE_BIND=")
+    assert instance._load_instance(daily.path, make_ctx()).compose() == daily.base()
+
+
+def test_down_with_the_bind_set_stops_the_forwarder_too(make_ctx, devices_daily):
+    stop = (*devices_base(devices_daily), "--profile", "backup", "stop")
+    runner = FakeRunner({stop: ok()})
+
+    assert run(make_ctx(runner), "down", "--root", str(devices_daily.path)) == 0
+
+    assert runner.calls == [list(stop)]
+
+
+# _check_ports
+
+
+@pytest.mark.parametrize("command", CHECKED_COMMANDS)
+@pytest.mark.parametrize(
+    "bind",
+    [
+        pytest.param("0.0.0.0", id="all-addresses"),
+        pytest.param("8.8.8.8", id="public"),
+        pytest.param("127.0.0.1", id="loopback"),
+        pytest.param("169.254.1.1", id="link-local"),
+        pytest.param("192.168.1", id="not-an-address"),
+        pytest.param("fd00::1", id="ipv6"),
+    ],
+)
+def test_refuses_a_device_bind_that_is_not_a_private_ipv4_address(
+    make_ctx, tmp_path, daily, command, bind, capsys
+):
+    switch_ready(daily)
+    set_env_line(daily, f"MIST_DAILY_DEVICE_BIND={bind}")
+    set_env_line(daily, f"MIST_DEVICE_DIR={(tmp_path / 'device-dir').as_posix()}")
+    before = daily.env.read_bytes()
+    runner = FakeRunner()
+
+    assert run(make_ctx(runner), *command_args(command, daily)) == 2
+
+    assert runner.calls == []
+    assert daily.env.read_bytes() == before
+    assert "MIST_DAILY_DEVICE_BIND" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", CHECKED_COMMANDS)
+@pytest.mark.parametrize("port", ["8001", "8002", "7688", "7689", "7690", "0", "65536", "84x3"])
+def test_refuses_a_device_port_that_is_the_websocket_an_allowlisted_or_no_port(
+    make_ctx, devices_daily, command, port, capsys
+):
+    switch_ready(devices_daily)
+    set_env_line(devices_daily, f"MIST_DAILY_DEVICE_PORT={port}")
+    runner = FakeRunner()
+
+    assert run(make_ctx(runner), *command_args(command, devices_daily)) == 2
+
+    assert runner.calls == []
+    assert "MIST_DAILY_DEVICE_PORT" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", CHECKED_COMMANDS)
+@pytest.mark.parametrize("line", [None, "MIST_DEVICE_DIR="])
+def test_refuses_the_bind_without_a_device_dir(make_ctx, tmp_path, daily, command, line, capsys):
+    switch_ready(daily)
+    enable_devices(daily, tmp_path, device_dir=False)
+    if line is not None:
+        set_env_line(daily, line)
+    runner = FakeRunner()
+
+    assert run(make_ctx(runner), *command_args(command, daily)) == 2
+
+    assert runner.calls == []
+    assert "MIST_DEVICE_DIR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bind", ["10.1.2.3", "172.16.0.9", "172.31.255.1", "192.168.1.20"])
+def test_up_accepts_a_private_bind_with_a_device_dir(make_ctx, tmp_path, daily, bind):
+    set_env_line(daily, f"MIST_DAILY_DEVICE_BIND={bind}")
+    set_env_line(daily, f"MIST_DEVICE_DIR={(tmp_path / 'device-dir').as_posix()}")
+    set_env_line(daily, "MIST_DAILY_DEVICE_PORT=8443")
+    runner = FakeRunner(devices_up_responses(daily))
+
+    assert run(make_ctx(runner), "up", "--root", str(daily.path)) == 0
+
+
+# _foreign_containers
+
+
+def foreign(root: Root, ctx, labels_by_service: dict[str, str]) -> list[str]:
+    """`_foreign_containers` over one container per entry; an empty service has no label."""
+    inst = instance._load_instance(root.path, ctx)
+    containers = []
+    for service, files in labels_by_service.items():
+        labels = {"com.docker.compose.project.config_files": files}
+        if service:
+            labels["com.docker.compose.service"] = service
+        name = f"{root.project}-{service or 'unlabelled'}-1"
+        containers.append(instance.ContainerInfo(name, IMAGE_ID, labels))
+    return instance._foreign_containers(inst, containers)
+
+
+@pytest.mark.parametrize("service", ["mist-neo4j", "mist-llm", "mist-backup", ""])
+def test_with_the_bind_set_a_container_keeps_its_old_one_file_label(
+    make_ctx, devices_daily, service
+):
+    assert foreign(devices_daily, make_ctx(), {service: str(devices_daily.compose_file())}) == []
+
+
+@pytest.mark.parametrize(
+    "service", ["mist-neo4j", "mist-llm", "mist-backup", "", "mist-backend", FORWARDER]
+)
+def test_with_the_bind_set_the_two_file_label_passes(make_ctx, devices_daily, service):
+    assert foreign(devices_daily, make_ctx(), {service: both_files(devices_daily)}) == []
+
+
+@pytest.mark.parametrize("service", ["mist-backend", FORWARDER])
+def test_with_the_bind_set_the_backend_and_forwarder_need_the_overlay(
+    make_ctx, devices_daily, service
+):
+    found = foreign(devices_daily, make_ctx(), {service: str(devices_daily.compose_file())})
+
+    assert found == [f"mist-daily-{service}-1 uses {devices_daily.compose_file()}"]
+
+
+@pytest.mark.parametrize("service", ["mist-neo4j", "mist-llm", "mist-backup", "", FORWARDER])
+def test_with_the_bind_unset_a_container_keeps_its_two_file_label(make_ctx, daily, service):
+    assert foreign(daily, make_ctx(), {service: both_files(daily)}) == []
+
+
+def test_with_the_bind_unset_the_backend_must_not_carry_the_overlay(make_ctx, daily):
+    found = foreign(daily, make_ctx(), {"mist-backend": both_files(daily)})
+
+    assert found == [f"mist-daily-mist-backend-1 uses {both_files(daily)}"]
+
+
+@pytest.mark.parametrize("bind", [False, True])
+@pytest.mark.parametrize("service", ["mist-neo4j", "mist-backend", FORWARDER, ""])
+@pytest.mark.parametrize(
+    "files",
+    [
+        pytest.param(lambda root: "/elsewhere/docker-compose.yml", id="foreign-file"),
+        pytest.param(
+            lambda root: f"{root.compose_file()},/elsewhere/override.yml", id="foreign-second"
+        ),
+        pytest.param(lambda root: str(root.compose_file(OLD_TAG)), id="old-release"),
+        pytest.param(lambda root: both_files(root, OLD_TAG), id="old-release-overlay"),
+        pytest.param(lambda root: f"{overlay_file(root)},{root.compose_file()}", id="reversed"),
+        pytest.param(lambda root: "", id="no-label"),
+    ],
+)
+def test_a_foreign_file_or_another_releases_files_still_fail(
+    make_ctx, tmp_path, daily, bind, service, files
+):
+    if bind:
+        enable_devices(daily, tmp_path)
+    assert len(foreign(daily, make_ctx(), {service: files(daily)})) == 1
+
+
+# instance_up
+
+
+def test_up_starts_the_forwarder_in_its_own_call_after_the_services(
+    make_ctx, devices_daily, capsys
+):
+    (devices_daily.ops / "backups-armed").write_text("{}", encoding="utf-8")
+    runner = FakeRunner(devices_up_responses(devices_daily))
+
+    assert run(make_ctx(runner), "up", "--root", str(devices_daily.path)) == 0
+
+    base = devices_base(devices_daily)
+    assert compose_calls(runner) == [
+        [*base, "up", "-d", "mist-neo4j", "mist-llm", "mist-backend"],
+        [*base, "--profile", "backup", "up", "-d", "mist-backup"],
+        [*base, "up", "-d", FORWARDER],
+    ]
+    assert f"started {FORWARDER}" in capsys.readouterr().out
+
+
+def test_up_retries_the_forwarder_every_30_seconds_until_it_starts(make_ctx, devices_daily):
+    forward = [fail(1, b"cannot assign requested address"), fail(), ok()]
+    runner = FakeRunner(devices_up_responses(devices_daily, forward))
+    clock = FakeClock()
+
+    assert run(make_ctx(runner, clock), "up", "--root", str(devices_daily.path)) == 0
+
+    forward_call = [*devices_base(devices_daily), "up", "-d", FORWARDER]
+    assert compose_calls(runner).count(forward_call) == 3
+    assert clock.sleeps == [30.0, 30.0]
+
+
+def test_up_gives_up_on_the_forwarder_at_the_wait_minutes_deadline(make_ctx, devices_daily, capsys):
+    refused = fail(1, b"cannot assign requested address")
+    runner = FakeRunner(devices_up_responses(devices_daily, refused))
+    clock = FakeClock()
+    args = ("up", "--root", str(devices_daily.path), "--wait-minutes", "2")
+
+    assert run(make_ctx(runner, clock), *args) == 1
+
+    base = devices_base(devices_daily)
+    calls = compose_calls(runner)
+    # The services started once, before the first forwarder attempt, and stay up.
+    assert calls[0] == [*base, "up", "-d", "mist-neo4j", "mist-llm", "mist-backend"]
+    assert calls[1:] == [[*base, "up", "-d", FORWARDER]] * 5
+    assert clock.sleeps == [30.0] * 4
+    err = capsys.readouterr().err
+    assert f"release {TAG} is up, but: {FORWARDER} did not start" in err
+    assert "cannot assign requested address" in err
+
+
+def test_the_forwarder_deadline_counts_from_the_start_of_up(make_ctx, devices_daily):
+    responses = devices_up_responses(devices_daily, fail())
+    responses[DOCKER_INFO] = [fail()] * 7 + [ok("27.0.0\n")]
+    runner = FakeRunner(responses)
+    clock = FakeClock()
+    args = ("up", "--root", str(devices_daily.path), "--wait-minutes", "2")
+
+    assert run(make_ctx(runner, clock), *args) == 1
+
+    # Docker took 35 of the 120 seconds, which leaves the forwarder four attempts, not five.
+    forward_call = [*devices_base(devices_daily), "up", "-d", FORWARDER]
+    assert compose_calls(runner).count(forward_call) == 4
+    assert clock.sleeps == [5.0] * 7 + [30.0] * 3
+
+
+def test_up_without_the_bind_starts_no_forwarder_and_removes_nothing(make_ctx, daily):
+    runner = FakeRunner(up_responses(daily))
+
+    assert run(make_ctx(runner), "up", "--root", str(daily.path)) == 0
+
+    assert not any(FORWARDER in call for call in runner.calls)
+    assert not any("rm" in call for call in runner.calls)
+
+
+def test_up_without_the_bind_removes_a_leftover_forwarder(make_ctx, daily, capsys):
+    responses = up_responses(daily)
+    responses.update(
+        listing_responses(
+            daily,
+            {
+                "mist-neo4j": str(daily.compose_file()),
+                "mist-llm": str(daily.compose_file()),
+                "mist-backend": str(daily.compose_file()),
+                FORWARDER: both_files(daily),
+            },
+        )
+    )
+    remove = ("docker", "rm", "-f", f"mist-daily-{FORWARDER}-1")
+    responses[remove] = ok()
+    runner = FakeRunner(responses)
+
+    assert run(make_ctx(runner), "up", "--root", str(daily.path)) == 0
+
+    assert runner.calls[-1] == list(remove)
+    assert runner.calls.count(list(project_ps(daily.project))) == 1
+    assert f"removed the leftover {FORWARDER}" in capsys.readouterr().out
+
+
+def test_up_reports_a_leftover_forwarder_it_could_not_remove(make_ctx, daily, capsys):
+    responses = up_responses(daily)
+    responses.update(
+        listing_responses(
+            daily, {"mist-backend": str(daily.compose_file()), FORWARDER: both_files(daily)}
+        )
+    )
+    responses[("docker", "rm", "-f", f"mist-daily-{FORWARDER}-1")] = fail(1, b"in use")
+    runner = FakeRunner(responses)
+
+    assert run(make_ctx(runner), "up", "--root", str(daily.path)) == 1
+
+    err = capsys.readouterr().err
+    assert FORWARDER in err and "in use" in err
+
+
+def test_up_with_the_bind_set_flags_a_backend_without_the_overlay(make_ctx, devices_daily, capsys):
+    responses = devices_up_responses(devices_daily)
+    responses.update(
+        listing_responses(devices_daily, {"mist-backend": str(devices_daily.compose_file())})
+    )
+    runner = FakeRunner(responses)
+
+    assert run(make_ctx(runner), "up", "--root", str(devices_daily.path)) == 1
+
+    err = capsys.readouterr().err
+    assert "mist-daily-mist-backend-1" in err
+    assert str(overlay_file(devices_daily)) in err
+
+
+# cmd_status
+
+
+def forwarder_state(root: Root, state: str) -> dict:
+    argv = ("docker", "inspect", "--format", STATE_FORMAT, f"{root.project}-{FORWARDER}-1")
+    return {argv: ok(state + "\n")}
+
+
+def devices_status_responses(root: Root, state: str | None) -> dict:
+    responses = status_responses(root)
+    ps = responses.pop((*root.base(), "ps", "--format", "json"))
+    responses[(*devices_base(root), "ps", "--format", "json")] = ps
+    labels = {
+        "mist-neo4j": str(root.compose_file()),
+        "mist-llm": str(root.compose_file()),
+        "mist-backend": both_files(root),
+    }
+    if state is not None:
+        labels[FORWARDER] = both_files(root)
+        responses.update(forwarder_state(root, state))
+    responses.update(listing_responses(root, labels))
+    return responses
+
+
+@pytest.mark.parametrize(
+    ("state", "line"),
+    [
+        ("running", "device-forward: running"),
+        ("exited", "device-forward: exited"),
+        ("created", "device-forward: exited (created)"),
+        (None, "device-forward: absent"),
+    ],
+)
+def test_status_prints_the_forwarders_state(make_ctx, devices_daily, capsys, state, line):
+    runner = FakeRunner(devices_status_responses(devices_daily, state))
+
+    code = run(make_ctx(runner, fetch=status_fetch()), "status", "--root", str(devices_daily.path))
+
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("backend: tag ")
+    assert lines[1] == line
+    assert lines[2].startswith("gaming-mode: ")
+
+
+def test_status_says_the_forwarder_state_is_unknown_when_the_listing_fails(
+    make_ctx, devices_daily, capsys
+):
+    responses = devices_status_responses(devices_daily, "running")
+    responses[project_ps(devices_daily.project)] = fail(1, b"daemon busy")
+    runner = FakeRunner(responses)
+    ctx = make_ctx(runner, fetch=status_fetch())
+
+    assert run(ctx, "status", "--root", str(devices_daily.path)) == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith("config-file check: failed (")
+    assert lines[2] == "device-forward: unknown (the containers could not be listed)"
+
+
+def test_status_without_the_bind_names_a_leftover_forwarder(make_ctx, daily, capsys):
+    responses = status_responses(daily)
+    responses.update(
+        listing_responses(
+            daily, {"mist-backend": str(daily.compose_file()), FORWARDER: both_files(daily)}
+        )
+    )
+    responses.update(forwarder_state(daily, "running"))
+    runner = FakeRunner(responses)
+
+    run(make_ctx(runner, fetch=status_fetch()), "status", "--root", str(daily.path))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == "device-forward: running (MIST_DAILY_DEVICE_BIND is unset; up removes it)"
