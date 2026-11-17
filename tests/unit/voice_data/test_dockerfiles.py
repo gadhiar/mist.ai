@@ -422,6 +422,61 @@ def test_extract_import_check_asserts_the_crisperwhisper_fork_apis() -> None:
     assert ast.unparse(ast.parse(expected, mode="eval").body) in asserted_expressions(check)
 
 
+NLTK_DATA_REPO = "https://github.com/nltk/nltk_data"
+# The last nltk_data commit that changed packages/tokenizers/punkt_tab.zip ("Add Malayalam to
+# punkt_tab", 2025-02-17).
+NLTK_DATA_COMMIT = "4f15a3d89eefe9748ec1c05be495d91289197155"
+PUNKT_TAB_ZIP = "packages/tokenizers/punkt_tab.zip"
+NLTK_TOKENIZERS_DIR = "/usr/local/share/nltk_data/tokenizers"
+
+
+def punkt_tab_step() -> tuple[int, list[str], str]:
+    """Return the extract Dockerfile's punkt_tab step: its index, its commands and its clone."""
+    steps = instructions(DOCKER_DIR / "extract.Dockerfile")
+    [index] = [i for i, s in enumerate(steps) if NLTK_DATA_REPO in s]
+    step = steps[index]
+    assert step.startswith("RUN "), step
+    commands = [c.strip() for c in step.removeprefix("RUN ").split(" && ")]
+    clone = re.fullmatch(
+        rf"git clone --filter=blob:none --no-checkout {re.escape(NLTK_DATA_REPO)} (/\S+)",
+        commands[0],
+    )
+    assert clone, commands[0]
+    return index, commands, clone.group(1)
+
+
+def test_extract_clones_nltk_data_at_the_pinned_commit_for_punkt_tab_only() -> None:
+    # WhisperX's alignment loads NLTK's punkt_tab, and its fallback `nltk.download` cannot reach
+    # the network in a `--network none` job, so the image carries it. The sparse, blobless clone
+    # downloads only the one zip of the ~1 GB repository, at a pinned commit.
+    _, commands, clone = punkt_tab_step()
+    assert commands[1:3] == [
+        f"git -C {clone} sparse-checkout set --no-cone {PUNKT_TAB_ZIP}",
+        f"git -C {clone} checkout --detach {NLTK_DATA_COMMIT}",
+    ]
+    assert commands[-1] == f"rm -rf {clone}"
+    # The step clones nothing else, so the other upstream clones stay in their own layer.
+    assert sum(c.startswith("git clone ") for c in commands) == 1
+
+
+def test_extract_unpacks_punkt_tab_into_the_default_nltk_path_before_the_sha() -> None:
+    # /usr/local/share/nltk_data is on NLTK's default search path, so no NLTK_DATA is needed.
+    # The step comes before `ARG GIT_SHA`, so a new commit keeps it cached.
+    index, commands, clone = punkt_tab_step()
+    [unpack] = [c for c in commands if "zipfile" in c]
+    assert commands.index(unpack) == len(commands) - 2
+    words = unpack.split()
+    assert words[:3] == ["python3.11", "-I", "-c"]
+    assert words[-2:] == [f"{clone}/{PUNKT_TAB_ZIP}", NLTK_TOKENIZERS_DIR]
+    code = re.fullmatch(r"python3\.11 -I -c '([^']*)' \S+ \S+", unpack)
+    assert code, unpack
+    tree = ast.parse(code.group(1))
+    calls = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    assert "zipfile.ZipFile(sys.argv[1]).extractall" in calls, calls
+    steps = instructions(DOCKER_DIR / "extract.Dockerfile")
+    assert index < steps.index("ARG GIT_SHA")
+
+
 def import_check(dockerfile: str, venv: str) -> ast.Module:
     """Parse the Python that a family image's final step runs in the family's own venv."""
     final = instructions(DOCKER_DIR / dockerfile)[-1]
@@ -437,6 +492,16 @@ def imported_modules(check: ast.Module) -> set[str]:
         if isinstance(node, ast.Import)
         for alias in node.names
     }
+
+
+def test_extract_import_check_finds_punkt_tab() -> None:
+    # nltk.data.find raises LookupError when punkt_tab is missing, so the image build fails
+    # rather than the clean stage's alignment.
+    check = import_check("extract.Dockerfile", "/opt/venv-extract")
+    assert "nltk" in imported_modules(check)
+    calls = {ast.unparse(node) for node in ast.walk(check) if isinstance(node, ast.Call)}
+    expected = ast.parse('nltk.data.find("tokenizers/punkt_tab/english/")', mode="eval").body
+    assert ast.unparse(expected) in calls, calls
 
 
 def test_extract_venv_loads_ecapa_at_the_score_pin() -> None:
