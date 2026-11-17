@@ -448,7 +448,8 @@ def punkt_tab_step() -> tuple[int, list[str], str]:
 def test_extract_clones_nltk_data_at_the_pinned_commit_for_punkt_tab_only() -> None:
     # WhisperX's alignment loads NLTK's punkt_tab, and its fallback `nltk.download` cannot reach
     # the network in a `--network none` job, so the image carries it. The sparse, blobless clone
-    # downloads only the one zip of the ~1 GB repository, at a pinned commit.
+    # fetches the commits and trees of the ~1 GB repository but only the one zip's blob, at a
+    # pinned commit.
     _, commands, clone = punkt_tab_step()
     assert commands[1:3] == [
         f"git -C {clone} sparse-checkout set --no-cone {PUNKT_TAB_ZIP}",
