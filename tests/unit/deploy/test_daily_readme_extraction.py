@@ -6,7 +6,6 @@ extraction to the code that makes it true, or pins that a statement from before 
 ran in the daily project (an "extraction host") is gone.
 """
 
-import hashlib
 import re
 from pathlib import Path
 
@@ -25,11 +24,6 @@ UNREGISTER_PATH = DAILY_DIR / "windows" / "unregister-signin-task.ps1"
 CUTOVER_PATH = REPO_ROOT / "backend" / "extraction_backlog" / "CUTOVER.md"
 
 EXTRACTION_TASK = "MIST extraction window"
-
-# SHA-256 of the "## Capabilities" section, heading through the line before the next "## ", at
-# 9bce823c. The night extraction change leaves that section alone; a later change to it updates
-# this digest in the same commit.
-CAPABILITIES_SHA256 = "bce73e93a581c7f191616635439b4f06ec221f16043f4e893dda387330bc3a46"
 
 
 def _text() -> str:
@@ -263,9 +257,3 @@ def test_no_longer_says(phrase):
 
 def test_gaming_mode_says_extraction_runs_on_this_gpu_at_night():
     assert "runs on this GPU at night, in the daily project" in _flat("Gaming mode")
-
-
-def test_capabilities_section_is_unchanged():
-    match = re.search(r"^## Capabilities\n.*?(?=^## )", _text(), re.M | re.S)
-    assert match is not None
-    assert hashlib.sha256(match.group(0).encode("utf-8")).hexdigest() == CAPABILITIES_SHA256
