@@ -656,8 +656,11 @@ The `daily.env` rows:
 The variables the chains replaced, such as `MIST_VOICE_STT_DEVICE`, make the backend refuse to
 start while set at all; delete any such line.
 
-Staging the wake model. Its files go in `<MODELS_DIR>/speech/wake/<model id>/`, beside its
-`manifest.json`, and `MIST_VOICE_KWS_MODEL` names the id. The phrases file goes at
+Staging the wake model. The server's `manifest.json` goes in
+`<MODELS_DIR>/speech/wake/<model id>/`, the directory `MIST_VOICE_KWS_MODEL` names by its id,
+and the device's files, the microWakeWord model and its manifest, go in
+`<MODELS_DIR>/speech/wake/<model id>/device/`. The server reads the device's model file there,
+in place, so the server and the device run one file. The phrases file goes at
 `<MODELS_DIR>/speech/wake/phrases.json`, and
 `MIST_VOICE_WAKE_PHRASES_FILE=/models/speech/wake/phrases.json` points the backend at it, since
 only `/models` is mounted for it. The wake model is for personal use only: its trainers'
