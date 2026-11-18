@@ -8,6 +8,26 @@ step and after a drain at every leaf. It reuses `turn_fakes.py` and wraps its fa
 Spec: plan v2 :1866, as v3 :1703, v4 :330, v5 :1751, v6 :1658, v8 :273 and v9 :320 change it.
 v5 removed push-to-talk, the hold in `thinking` and its supersede, so the alphabet has no press
 and I1 is gone, and M67 holds only at a held turn's release. D8 (the alarm rule) is deferred.
+v13's A51 (T55c) brings a supersede back on v5's trigger: a name accepted while a model turn is
+in `thinking` with none of its audio queued supersedes the turn instead of barging in. The
+`supersede` invariant checks, at every send and every acceptance, that a `supersede` comes only
+in an accepting step, exactly when the turn in flight is not held or ending, is `thinking`, has
+no audio queued and no capability answer (`answered` is always None here, since D8 is
+deferred), and is followed in that step by its cut's `stream_cancelled superseded`, with no
+`barge_in`. The reach order `supersede` shows the search visits one.
+
+T55d keeps a superseded turn K that dispatched no tool, for the utterance U that superseded it,
+and joins K's request text to the next turn from U. K (its turn and U, as ranks) is part of the
+snapshot. The responder's open-turn set drops K when a turn opens carrying its words, which every
+turn that opens while K is kept must (`merge`). The `K kept` invariants, at every state: K is kept
+only while U is open in the record or a held turn from U is in flight; a K whose words a merge
+carried (resolved with no commit) is never committed, and every turn is committed at most once
+(M66); a supersede never finds K kept; and once the controller is closed, by its cancellation at
+every world's close, no K is left and every K has been committed or carried. `thinking`, a
+model turn with no tool and no audio, is a start state for the narrowed runs only (`merge`, `K
+alone` and `merge at release`, and the merge teeth): from it a supersede keeps K at depth 3, and
+the runs search what U then does (`MERGE_ALPHABET`). No full-alphabet run keeps a K within its
+default depth, so these runs are where the `K kept` invariants are exercised.
 
 The harness:
 
@@ -92,14 +112,18 @@ after v opens reaches one snapshot, and only one of the two holds the step. Two 
 `reconfigure behind a voice restart` and `text ahead of a step's muted drop`, are not v2
 orders: they show that the eager step meets C1.
 
-Three orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
-frameless `0x02` is fifth on the lane and each take moves one item. B1(d) needs 4 from
-`speaking`: a name, the lost verdict, w's end and v's VAD start. The posting-step witness needs
-6 from `idle`. Each one's reach run searches only the actions that the order and its
-alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`, `POSTING_ALPHABET`) to its own depth: every
-sequence of those actions, with the same reductions and invariants, and no other action. A
-search keys its visited states on the progress of its start's full-alphabet orders and of its
-own narrowed ones only. The default depths stay as ruled.
+Four orders need more than their start's default depth, and three need a start of their own.
+B8 needs 8 from `thinking_tool`: its frameless `0x02` is fifth on the lane and each take moves
+one item. B1(d) needs 4 from `speaking`: a name, the lost verdict, w's end and v's VAD start.
+The posting-step witness needs 6 from `idle`. The supersede needs 4 from `thinking_tool`: a
+name, its grant, the gate decode, and the tool's end, since the cut waits on the tool's grace.
+The T55d orders start from `thinking`, which no full-alphabet run searches: `merge` and `K
+alone` need 4, and `merge at release` needs 5. Each one's reach run searches only the actions that the order and its
+alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`, `POSTING_ALPHABET`, `SUPERSEDE_ALPHABET`,
+`MERGE_ALPHABET`, `RELEASE_ALPHABET`) to its own depth: every sequence of those actions, with
+the same reductions and invariants, and no other action. A search keys its visited states on the
+progress of its start's full-alphabet orders and of its own narrowed ones only. The default
+depths stay as ruled.
 """
 
 from __future__ import annotations
@@ -166,6 +190,7 @@ from .turn_fakes import (
     RecordingIngress,
     RecordingOutbound,
     RecordingScenePort,
+    Sent,
     default_gate,
     describe,
     floor_placement,
@@ -207,7 +232,9 @@ UNADDRESSED = "I missed the bus"
 STOP = "stop"
 REPLY = "Hi. "
 ACK = "One moment. "
-CLOSING = ("transcription", "voice_decision:dropped")
+CLOSING = ("transcription", "voice_decision:dropped", "voice_decision:wake_lost")
+WAKE_ENDS = ("voice_decision:wake_rejected", "voice_decision:wake_lost")
+"""The messages that end a name without accepting it; neither may cut or idle a turn."""
 
 EAGER_SAFE = frozenset({"deliver", "take", "synth_fail", "text"})
 """The actions under which the controller step is eager; only `text` then waits for it (C1)."""
@@ -400,6 +427,15 @@ class ModelResponder(FakeResponder):
 
     def open_turn(self, request):
         world = self.world
+        kept = world.controller._kept
+        if kept is not None:
+            # A turn may open while K is kept only from U, carrying K's words (T55d).
+            words = f"{kept.turn.scope.request.user_text} "
+            if not request.user_text.startswith(words):
+                world.fail(
+                    "merge", f"{request.user_text!r} opened with K kept, not after {words!r}"
+                )
+            self.open.discard(kept.turn.scope.turn_index)
         if self.open:
             world.fail("M66", f"a turn opened while turn {sorted(self.open)} is open")
         world.check_acceptance("a turn opened")
@@ -441,6 +477,8 @@ class ModelResponder(FakeResponder):
         index = scope.turn_index
         if index in world.commits:
             world.fail("M66", f"turn {index} committed twice")
+        if index in world.carried:
+            world.fail("K kept", f"turn {index} committed after a merge carried its words")
         world.commits.add(index)
         if delivery.outcome == "completed":
             if index not in self.finished:
@@ -532,16 +570,23 @@ class World:
     after_step: list[object] = field(default_factory=list)
     failures: list[Violation] = field(default_factory=list)
     commits: set[int] = field(default_factory=set)
+    kept_turns: set[int] = field(default_factory=set)
+    """Every turn the controller has kept for a merge (T55d)."""
+    carried: set[int] = field(default_factory=set)
+    """The kept turns resolved with no commit: a merge carried their words (T55d)."""
     done_handled: set[str] = field(default_factory=set)
     done_sent: set[str] = field(default_factory=set)
     reconfigures: list[Reconfigure] = field(default_factory=list)
     rejected_wakes: list[object] = field(default_factory=list)
+    lost_wakes: list[object] = field(default_factory=list)
     segments: dict[str, list[tuple[int, str, str]]] = field(default_factory=dict)
     hinted: dict[str, bool] = field(default_factory=dict)
     acks: collections.Counter[str] = field(default_factory=collections.Counter)
     handling: Step | None = None
     labels: list[str] = field(default_factory=list)
     accepted: set[str] = field(default_factory=set)
+    accepting: int = 0
+    """How many acceptances are running now; a `supersede` may be sent only inside one (A51)."""
     handled: list[Handled] = field(default_factory=list)
     stopped: ModelIngress | None = None
     checking: bool = True
@@ -604,6 +649,8 @@ class World:
             # The wakes are kept, not their ids, so no id is reused by a later name.
             if any(seen is wake for seen in self.rejected_wakes):
                 self.fail("wake_rejected once", f"a second wake_rejected for one name ({reason})")
+            if any(seen is wake for seen in self.lost_wakes):
+                self.fail("wake_lost once", f"a wake_rejected for a name that lost ({reason})")
             self.rejected_wakes.append(wake)
             before = len(self.outbound.of("voice_decision:wake_rejected"))
             send_rejected(wake, reason)
@@ -611,6 +658,19 @@ class World:
                 self.fail("wake_rejected once", f"one rejection sent other than one ({reason})")
 
         c._send_wake_rejected = wake_rejected  # type: ignore[method-assign]
+        send_lost = c._send_wake_lost
+
+        def wake_lost(wake, winner_score, utterance_id):
+            # One loss per name, and never a loss for a name already rejected, or the reverse.
+            if any(seen is wake for seen in (*self.lost_wakes, *self.rejected_wakes)):
+                self.fail("wake_lost once", "a second end (wake_lost) for one name")
+            self.lost_wakes.append(wake)
+            before = len(self.outbound.of("voice_decision:wake_lost"))
+            send_lost(wake, winner_score, utterance_id)
+            if len(self.outbound.of("voice_decision:wake_lost")) - before != 1:
+                self.fail("wake_lost once", "one loss sent other than one wake_lost")
+
+        c._send_wake_lost = wake_lost  # type: ignore[method-assign]
         settle = self.arbiter.settle
 
         def settle_once(claim_id, accepted):
@@ -659,7 +719,20 @@ class World:
         async def accepted(wake):
             # The gate's verdict is the acceptance; what the accepting step sends may name it.
             self.accepted.add(wake.utterance_id)
-            await accept_wake(wake)
+            turn = c._turn
+            live = turn is not None and not turn.ending and not turn.held
+            trigger = (
+                live and c._phase == "thinking" and not turn.frames_queued and turn.answered is None
+            )
+            if trigger and c._kept is not None:
+                self.fail("K kept", f"a supersede of {turn.turn_id} found K kept")
+            sent_from = len(self.outbound.sent)
+            self.accepting += 1
+            try:
+                await accept_wake(wake)
+            finally:
+                self.accepting -= 1
+            self.check_supersede(turn if trigger else None, self.outbound.sent[sent_from:])
 
         c._accept_wake = accepted  # type: ignore[method-assign]
         synthesize = self.synth.synthesize
@@ -696,12 +769,28 @@ class World:
             queued = list(self.mailbox.items)
             ingress = self.ingress
             levers = len(ingress.calls) if ingress is not None else 0
+            kept = self.controller._kept
             try:
                 await handler(message)
             finally:
                 self.handling = None
+            if kept is not None and self.controller._kept is not kept:
+                # K left the controller in this step: recorded alone, or carried by a merge.
+                index = kept.turn.scope.turn_index
+                if index in self.commits:
+                    facts.add("K alone")
+                else:
+                    facts.add("merged")
+                    self.carried.add(index)
+            if self.controller._kept is not None:
+                self.kept_turns.add(self.controller._kept.turn.scope.turn_index)
             if any(purge.terminal for _, purge in self.outbound.purges[step.purges_from :]):
                 facts.add("purged 0x02")
+            if any(
+                describe(item) == "voice_decision:supersede"
+                for item in self.outbound.client[step.client_from :]
+            ):
+                facts.add("superseded")
             if isinstance(message, WakeVerdict) and not message.proceed and ingress is not None:
                 # B1(d): the lost claim's drop names w, whose end and then v's start are queued.
                 lost = [
@@ -784,6 +873,13 @@ class World:
         )
 
     def on_send(self, item: object) -> None:
+        name = describe(item)
+        if self.accepting == 0 and (
+            name == "voice_decision:supersede"
+            or name == "stream_cancelled"
+            and getattr(item, "reason", None) == "superseded"
+        ):
+            self.fail("supersede", f"{name} sent outside an accepting step")
         uid = named_utterance(item)
         if uid is None:
             return
@@ -795,7 +891,45 @@ class World:
             return
         if utterance is None and (minted or uid in self.ever_published):
             return
+        # A lost claim's verdict is its `wake_lost`, which names the candidate it has just
+        # closed unpublished (A52); no other message may name it.
+        if (
+            describe(item) == "voice_decision:wake_lost"
+            and utterance is not None
+            and utterance.closed
+            and not utterance.published
+            and any(getattr(wake, "utterance_id", None) == uid for wake in self.lost_wakes)
+        ):
+            return
         self.fail("acceptance", f"{describe(item)} names {uid} before its acceptance")
+
+    def check_supersede(self, thinking: object, new: list[Sent]) -> None:
+        """A51: what one acceptance sent, given the turn it found superseded or None.
+
+        `thinking` is the turn in flight when it was not held or ending, in `thinking`, with no
+        audio queued and no capability answer; it alone gets one `supersede`, then its cut's
+        `stream_cancelled superseded`, and no `barge_in`. Any other acceptance supersedes nothing.
+        """
+        names = [describe(s.item) for s in new]
+        supersedes = [s for s in new if describe(s.item) == "voice_decision:supersede"]
+        if thinking is None:
+            if supersedes:
+                self.fail("supersede", f"a supersede with no thinking turn before audio: {names}")
+            return
+        turn_id = thinking.turn_id  # type: ignore[attr-defined]
+        if [s.turn_id for s in supersedes] != [turn_id]:
+            self.fail("supersede", f"the thinking turn {turn_id} not superseded once: {names}")
+            return
+        if "voice_decision:barge_in" in names:
+            self.fail("supersede", f"a barge_in beside the supersede: {names}")
+        after = new[names.index("voice_decision:supersede") + 1 :]
+        cuts = [
+            (s.turn_id, getattr(s.item, "reason", None))
+            for s in after
+            if describe(s.item) == "stream_cancelled"
+        ]
+        if cuts != [(turn_id, "superseded")]:
+            self.fail("supersede", f"the supersede's cut is {cuts}: {names}")
 
     def check_acceptance(self, what: str) -> None:
         step = self.handling
@@ -1077,7 +1211,12 @@ class World:
             while "deliver" in self.enabled(search=False):
                 await self.act("deliver")
 
-    async def close(self) -> None:
+    async def close(self) -> Violation | None:
+        """Cancel the mailbox task, as a server shutdown does, and end every stream.
+
+        Returns the `K kept` violation the cancellation's teardown leaves, if any: a K still kept,
+        or a superseded turn kept and neither committed nor carried (T55d).
+        """
         for tool in self.responder.tools:
             if not tool.done():
                 tool.set_result("ok")
@@ -1092,6 +1231,13 @@ class World:
         for feed in self.responder.feeds.values():
             feed.put_nowait(None)
         await quiesce()
+        kept = self.controller._kept
+        if kept is not None:
+            return Violation("K kept", f"{kept.turn.turn_id} still kept after the close")
+        lost = self.kept_turns - self.commits - self.carried
+        if lost:
+            return Violation("K kept", f"kept turns {sorted(lost)} neither committed nor carried")
+        return None
 
     # -- Invariants ---------------------------------------------------------------------------
 
@@ -1105,16 +1251,16 @@ class World:
         names = [describe(item) for item in new]
         scene = self.scene.calls[step.scene_from :]
         newly = self.published() - step.published
-        if "voice_decision:wake_rejected" in names:
+        for end in (n for n in WAKE_ENDS if n in names):
             if "voice_decision:barge_in" in names or "playback_stop" in names:
                 self.fail("rejection cuts nothing", f"{names}")
             if len(self.outbound.purges) > step.purges_from:
-                self.fail("rejection cuts nothing", "a purge in the step of a wake_rejected")
+                self.fail("rejection cuts nothing", f"a purge in the step of a {end}")
             if step.phase in ("thinking", "speaking"):
-                after = names[names.index("voice_decision:wake_rejected") + 1 :]
+                after = names[names.index(end) + 1 :]
                 cycles = [n for n in after if n.startswith("state_cycle")]
                 if cycles and cycles[0] == "state_cycle:idle":
-                    self.fail("rejection restores", f"{step.phase} rejection then {cycles[0]}")
+                    self.fail("rejection restores", f"{step.phase} {end} then {cycles[0]}")
         for call in scene:
             if call[0] == "phase" and call[1] in ("wake", "listening") and not newly:
                 self.fail("scene anchors", f"{call[1]} intent with no acceptance in its step")
@@ -1182,6 +1328,14 @@ class World:
                 and call[1] in cancelled
             ):
                 self.fail("scene cancel", f"{call[:3]} after its turn's cancel_turn")
+        # T55d: K is kept only while U is open in the record or a held turn from U is in flight.
+        kept = c._kept
+        if kept is not None:
+            uid = kept.utterance_id
+            record = c._utterances.get(uid)
+            held = turn is not None and turn.held and not turn.ending and turn.utterance_id == uid
+            if (record is None or record.closed) and not held:
+                self.fail("K kept", f"{kept.turn.turn_id} kept with {uid} closed and none held")
         # v8: no utterance is open while ingress is muted; an attend cue is never left standing.
         if self.muted and self.ingress is not None and self.ingress.open_uid is not None:
             self.fail("mute", f"ingress holds {self.ingress.open_uid} open while muted")
@@ -1384,6 +1538,7 @@ class World:
                 fingerprint(turn.ledger),
                 fingerprint(turn.segmenter),
                 turn.scope.tool_dispatched,
+                turn.scope.request.user_text,  # a merged request carries K's words (T55d)
             )
         record = tuple(
             sorted(
@@ -1485,9 +1640,22 @@ class World:
                 if isinstance(i, Frame) or describe(i) in ("stream_token", "stream_start")
             ),
         )
+        kept = c._kept
+        kept_state = None
+        if kept is not None:
+            # The merge reads K's request text, so it is part of the key with K and U.
+            kept_state = (
+                t(kept.turn.turn_id),
+                u(kept.utterance_id),
+                kept.turn.scope.turn_index,
+                kept.turn.scope.request.user_text,
+            )
         return (
             c._phase,
             turn_state,
+            kept_state,
+            tuple(sorted(self.carried)),
+            tuple(sorted(self.kept_turns)),
             c._pending is not None and c._pending.refusal,
             record,
             wake_state,
@@ -1602,10 +1770,16 @@ START_STATES: dict[str, tuple[str, ...]] = {
 }
 """Each start state's prefix, run eagerly. Every one but `off` has voice on, unmuted."""
 
+NARROW_STARTS: dict[str, tuple[str, ...]] = {
+    "thinking": ("voice_start", "name", "grant:0", "gate_yes", "end"),
+}
+"""Start states searched only by a narrowed reach run: `thinking` is a model turn with no tool
+and no audio, which a name supersedes and keeps (T55d)."""
+
 
 async def build(start: str, *, checking: bool = True) -> World:
     world = World(checking=checking)
-    await world.run_eager(START_STATES[start])
+    await world.run_eager({**START_STATES, **NARROW_STARTS}[start])
     world.checking = True
     world.env = 0
     world.starts = 0
@@ -1622,7 +1796,7 @@ def check_preconditions(depth: int) -> None:
         raise AssertionError(f"precondition: frames are {FRAME_MS} ms, not 20")
     if endpointing.pre_roll_ms // FRAME_MS != REQUIRED_PRE_ROLL_FRAMES:
         raise AssertionError("precondition: VAD pre-roll is not 15 frames")
-    largest = max(len(prefix) for prefix in START_STATES.values())
+    largest = max(len(prefix) for prefix in (*START_STATES.values(), *NARROW_STARTS.values()))
     if largest > MAX_START_FRAMES:
         raise AssertionError(f"precondition: a start state holds {largest} frames, above 6")
     if largest + depth >= REQUIRED_PRE_ROLL_FRAMES:
@@ -1702,6 +1876,26 @@ POSTING_ALPHABET = frozenset({"reconfigure_refused", "name", "mute", "voice_stop
 """The posting-step witness's actions: two refused reconfigures to spend the voice starts, a
 name, the mute and `voice_stop` that leave the controller a muted ingress, and the text."""
 
+SUPERSEDE_DEPTH = 4
+SUPERSEDE_ALPHABET = frozenset(
+    {"name", "grant", "deny", "gate_yes", "gate_no", "say", "tool_end", "advance"}
+)
+"""The supersede's actions and its alternatives': a name and its claim's verdict either way, the
+gate decode addressed or not, a token whose audio would make it a barge-in, and the tool's end or
+its grace running out, either of which lets the cut finish."""
+
+MERGE_DEPTH = 4
+MERGE_ALPHABET = frozenset(
+    {"name", "grant", "gate_yes", "candidate", "resumed", "end", "drop", "text", "mute", "done"}
+)
+"""The merge's actions and its alternatives': a name, its grant and its addressed gate decode,
+which supersede the turn and keep K; then what U does: a held turn, resumed speech, its end or
+its drop, a mute, a typed message, and the reply's end that commits the turn U started."""
+
+RELEASE_ALPHABET = MERGE_ALPHABET - {"text"}
+"""The merge at a held turn's release, one action deeper: the typed message, which the depth-4 run
+takes at every point U is open, is left out to keep the run's CPU within its share."""
+
 REACH: tuple[Reach, ...] = (
     # v2 :2027-2028, a servable `Reconfigure` while speaking and while a turn is held, which
     # waits for a quiescent point.
@@ -1752,9 +1946,9 @@ REACH: tuple[Reach, ...] = (
         ),
     ),
     # v2 :1660-1662, B1(d) in its v5 form: v5 has no `WakeLost`; a lost claim drops w with
-    # `wake_lost` (`turn.py` `_reject`). The verdict is handled with w's end and v's start
-    # queued behind it. Ingress is dormant in `idle` (v5 :1177), so this runs from `speaking`,
-    # and it needs depth 4: name, deny, end, vad.
+    # `wake_lost` and sends one `voice_decision wake_lost` (`turn.py` `_lose`). The verdict is
+    # handled with w's end and v's start queued behind it. Ingress is dormant in `idle`
+    # (v5 :1177), so this runs from `speaking`, and it needs depth 4: name, deny, end, vad.
     Reach(
         "B1(d)",
         "speaking",
@@ -1765,6 +1959,42 @@ REACH: tuple[Reach, ...] = (
             handled("SpeechStarted", before="speaking"),
         ),
         alphabet=B1D_ALPHABET,
+    ),
+    # v13 A51 (T55c): a name, its grant and its addressed gate decode while the tool turn thinks
+    # with no audio queued; the gate decode's step supersedes the turn, waits in the cut on the
+    # tool's grace, and idles once the tool ends. So it needs depth 4.
+    Reach(
+        "supersede",
+        "thinking_tool",
+        SUPERSEDE_DEPTH,
+        (handled("TranscriptPartial", before="thinking", after="idle", fact="superseded"),),
+        alphabet=SUPERSEDE_ALPHABET,
+    ),
+    # v13 T55d: a name, its grant and its gate decode supersede a model turn with no tool and
+    # keep it as K; U's end then opens a turn that carries K's words, with no commit of K.
+    Reach(
+        "merge",
+        "thinking",
+        MERGE_DEPTH,
+        (handled("UtteranceEnded", after="thinking", fact="merged"),),
+        alphabet=MERGE_ALPHABET,
+    ),
+    # v13 T55d: K is committed alone where U starts no turn: U dropped by ingress.
+    Reach(
+        "K alone",
+        "thinking",
+        MERGE_DEPTH,
+        (handled("UtteranceDropped", fact="K alone"),),
+        alphabet=MERGE_ALPHABET,
+    ),
+    # v13 T55d: a held turn from U carries K's words and resolves K only at its release, so
+    # it needs depth 5: the name, its grant, the gate decode, the candidate and U's end.
+    Reach(
+        "merge at release",
+        "thinking",
+        MERGE_DEPTH + 1,
+        (handled("UtteranceEnded", before="held", fact="merged"),),
+        alphabet=RELEASE_ALPHABET,
     ),
     # v2 :2029-2030, B9: from `thinking`, a VAD start, then the failure, which moves to `text`.
     Reach(
@@ -1898,6 +2128,7 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
             for label in reversed(waited.actions):
                 stack.append(((*path[:-1], label), None, None))
         kept = False
+        failed = False
         try:
             progress = tuple(order.progress(world) for order in orders)
             for order, done in zip(orders, progress):
@@ -1927,9 +2158,16 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
             step = Waited(len(world.mailbox.items), waiting) if waiting else None
             stack.append(((*path, actions[0]), world, step))
             kept = True
+        except BaseException:
+            failed = True
+            raise
         finally:
             if not kept:
-                await world.close()
+                # The close cancels the mailbox task, so every world not continued checks its
+                # teardown; a failure already raised is not masked by this one.
+                closing = await world.close()
+                if closing is not None and not failed:
+                    raise AssertionError(f"{start} after {list(path)}, closed: {closing}")
     stats.seconds = time.perf_counter() - began
     return stats
 
@@ -2215,12 +2453,25 @@ def _every_handoff_speaks(world: World) -> None:
     c._on_handoff = handoff  # type: ignore[method-assign]
 
 
+def _supersede_every_name(world: World) -> None:
+    """The trigger struck out: a name supersedes any live turn, `speaking` included."""
+    world.controller._supersedes = lambda turn: True  # type: ignore[method-assign]
+
+
+def _never_supersede(world: World) -> None:
+    """The v5 barge-in kept for a thinking turn before audio."""
+    world.controller._supersedes = lambda turn: False  # type: ignore[method-assign]
+
+
 TEETH: list[tuple[str, str, int, Callable[[World], None]]] = [
+    ("supersede", "speaking", 3, _supersede_every_name),
+    ("supersede", "thinking_tool", 3, _never_supersede),
     ("v6 ack", "held", 2, _every_handoff_speaks),
     ("swap", "idle", 3, _quiescent_without_idle_since),
     ("M47", "speaking", 3, _ignore_purge_result),
     ("settle once", "idle", 2, _settle_twice),
     ("wake_rejected once", "idle", 2, lambda w: _twice(w, "_send_wake_rejected")),
+    ("wake_lost once", "idle", 2, lambda w: _twice(w, "_send_wake_lost")),
     ("acceptance", "idle", 2, _name_the_candidate_at_its_end),
     ("mute", "held", 1, _ignore_muted_drops),
     ("I3", "held", 1, lambda w: _twice(w, "_send_end_of_utterance")),
@@ -2246,5 +2497,40 @@ async def test_a_planted_fault_breaks_its_invariant(invariant, start, depth, pla
     monkeypatch.setattr(f"{__name__}.PLANT", plant)
     with pytest.raises(AssertionError) as caught:
         await search(start, depth)
+    message = str(caught.value)
+    assert f": {invariant}: " in message, message
+
+
+def _never_resolve_k(world: World) -> None:
+    """A turn from U carries K's words and leaves K kept, to be committed later as well."""
+    world.controller._resolve_kept = lambda utterance_id: None  # type: ignore[method-assign]
+
+
+def _never_commit_k_alone(world: World) -> None:
+    """U starts no turn and K is never recorded."""
+    world.controller._commit_kept = lambda: None  # type: ignore[method-assign]
+
+
+def _never_merge(world: World) -> None:
+    """A turn from U opens on its own words while K is kept."""
+    world.controller._request_text = lambda utterance_id, text: text  # type: ignore[method-assign]
+
+
+MERGE_TEETH: list[tuple[str, str, Callable[[World], None]]] = [
+    ("K kept", "resolve", _never_resolve_k),
+    ("K kept", "commit alone", _never_commit_k_alone),
+    ("merge", "request text", _never_merge),
+]
+
+
+@pytest.mark.parametrize(
+    ("invariant", "fault", "plant"), MERGE_TEETH, ids=[f"{t[0]}: {t[1]}" for t in MERGE_TEETH]
+)
+async def test_a_planted_fault_in_the_merge_breaks_its_invariant(
+    invariant, fault, plant, monkeypatch
+):
+    monkeypatch.setattr(f"{__name__}.PLANT", plant)
+    with pytest.raises(AssertionError) as caught:
+        await search("thinking", MERGE_DEPTH, MERGE_ALPHABET)
     message = str(caught.value)
     assert f": {invariant}: " in message, message

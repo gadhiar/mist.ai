@@ -167,19 +167,22 @@ COPY --chown=appuser:appgroup backend/ /app/backend/
 COPY --chown=appuser:appgroup src/ /app/src/
 COPY --chown=appuser:appgroup dependencies/ /app/dependencies/
 COPY --chown=appuser:appgroup scripts/ /app/scripts/
+# Persona profiles: backend/server.py reads <profile>/personality.yaml from /app/voice_profiles.
+COPY --chown=appuser:appgroup voice_profiles/ /app/voice_profiles/
 
 # Runtime directories, created and handed to appuser by name, without -R, so this
-# layer holds nine directory entries instead of a copy of everything under /app.
+# layer holds ten directory entries instead of a copy of everything under /app.
 # Each is a mount point or a path the backend writes without a mount: /app/data
 # and its three subdirectories, /app/logs (the live-path smoke backend mounts
-# none and writes it in the container layer), /app/mist-memory, /app/ops, and
-# /app/dev-state (a named volume, which Docker initialises from this directory's
-# ownership). Runs as root, because only root can give a directory to appuser.
+# none and writes it in the container layer), /app/mist-memory, /app/ops,
+# /app/dev-state and /voice-cache (named volumes, which Docker initialises from
+# the directory's ownership, so UID 1000 can write a new one). Runs as root,
+# because only root can give a directory to appuser.
 USER root
 RUN mkdir -p /app /app/data /app/data/voice_profiles /app/data/vector_store /app/data/audio \
-        /app/logs /app/mist-memory /app/ops /app/dev-state \
+        /app/logs /app/mist-memory /app/ops /app/dev-state /voice-cache \
     && chown appuser:appgroup /app /app/data /app/data/voice_profiles /app/data/vector_store \
-        /app/data/audio /app/logs /app/mist-memory /app/ops /app/dev-state
+        /app/data/audio /app/logs /app/mist-memory /app/ops /app/dev-state /voice-cache
 
 USER appuser
 ENV HOME=/home/appuser

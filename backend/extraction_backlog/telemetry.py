@@ -1,24 +1,26 @@
-"""Process-wide count of turns the event log never recorded.
+r"""Process-wide count of turns the event log never recorded.
 
-`ModelManager.generate_llm_response` has two branches. With knowledge
-integration enabled it streams through `KnowledgeIntegration`, whose
-`ConversationHandler` owns the event store and records every turn. With it off
-or unavailable it calls the chat model directly, and that turn is answered and
-then lost: it is written to neither the event log nor the extraction backlog.
+`build_mist_runtime` (`backend/factories.py`) picks one responder for every
+turn. With knowledge integration enabled and built, it is the
+`ConversationHandler`, which owns the event store and records every turn. With
+it off, or when building the handler raised a `MistError`, it is
+`DirectResponder` (`backend/realtime/degraded.py`), which calls the chat model
+directly, and that turn is answered and then lost: it is written to neither the
+event log nor the extraction backlog.
 
 Recording it there is not possible, and not merely unimplemented:
 
 - The event store is constructed in exactly one place on the live path,
-  `ConversationHandler.__init__` (`grep -n "EventStore(" backend/` -> the
+  `ConversationHandler.__init__` (`grep -rn "= EventStore(" backend` -> the
   `conversation_handler.py` constructor and the admin CLI in this package).
-- That handler is built only by `KnowledgeIntegration.__init__`
-  (`grep -n "build_conversation_handler(" backend/chat/knowledge_integration.py`),
-  and when that construction raises, the same `__init__` leaves
-  `conversation_handler = None` and `enabled = False` (its `except Exception`
-  branch). The fallback branch runs exactly when `enabled` is False or no
-  `KnowledgeIntegration` exists, so there is no event store to write to.
-- The fallback branch's only I/O is `self._llm_provider.generate_sync`
-  (`grep -n "generate_sync" backend/voice_models/model_manager.py`).
+- That handler is built only by `build_mist_runtime`'s `build_handler(` call
+  (`grep -n "build_handler(" backend/factories.py`), and `DirectResponder` is
+  chosen exactly when that handler is None
+  (`grep -n "DirectResponder(" backend/factories.py`), so there is no event
+  store to write to.
+- `DirectResponder.stream_turn`'s only I/O is `self._llm_provider.generate`,
+  and its `commit_turn` records nothing
+  (`grep -n "generate(\|def commit_turn" backend/realtime/degraded.py`).
 
 So the loss is made visible instead: one structured WARNING per turn, and a
 counter surfaced as `ExtractionStatus.unrecorded_turns` on the WebSocket,
@@ -42,8 +44,10 @@ _unrecorded_turns = 0
 def record_unrecorded_turn(request_id: str | None) -> int:
     """Count one turn answered without being logged, and warn about it.
 
-    Thread-safe: the voice path runs `generate_llm_response` on a worker
-    thread (`backend.request_context.spawn_with_context`).
+    The one caller, `DirectResponder.stream_turn`
+    (`grep -rn "record_unrecorded_turn(" backend` -> `backend/realtime/degraded.py`),
+    runs on the event loop; the lock keeps the count exact for any caller on
+    another thread.
 
     Args:
         request_id: The turn's `current_request_id`, or None when unset.

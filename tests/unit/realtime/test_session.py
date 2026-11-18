@@ -17,11 +17,13 @@ from typing import Literal
 import pytest
 import pytest_asyncio
 
+from backend.capabilities.power import FixedPower
 from backend.chat.stream_events import Token
 from backend.realtime.addressee import AddresseeGate
 from backend.realtime.budget import BargeInConfig, VoiceSettings
 from backend.realtime.ingress import AudioIngress, IngressSeed
 from backend.realtime.playback import LanePurge
+from backend.realtime.power import PowerGate
 from backend.realtime.protocol import (
     Direction,
     Frame,
@@ -62,6 +64,7 @@ from .turn_fakes import (
     FakeWakeArbiter,
     IdCounter,
     InlineLane,
+    Pause,
     RecordingIngress,
     floor_placement,
     settle,
@@ -228,6 +231,7 @@ class Rig:
         real_ingress: bool = False,
         session_id: str = "s1",
         capability: Callable[[str, object], None] | None = None,
+        power_gate: PowerGate | None = None,
     ) -> None:
         self.clock = FakeClock()
         self.ids = IdCounter()
@@ -270,6 +274,7 @@ class Rig:
             ingress_factory=self._real_ingress if real_ingress else self._ingress,
             controller_factory=self._controller,
             on_capability_message=capability or (lambda _sid, _msg: None),
+            power_gate=power_gate,
         )
         self.session = RealtimeSession(
             session_id=session_id,
@@ -811,6 +816,231 @@ class TestReconfigure:
         await rig.stop()
 
         assert [a["req"] for a in rig.answers()] == [1]
+
+
+# -- The answer fence ------------------------------------------------------------------------------
+
+
+def at(rig: Rig, name: str, **match: object) -> int:
+    """The wire position of the one written item called `name` whose fields match `match`."""
+    found = [
+        index
+        for index, item in enumerate(rig.socket.sent)
+        if name_of(item) == name
+        and all(isinstance(item, dict) and item.get(k) == v for k, v in match.items())
+    ]
+    assert len(found) == 1, f"{name} {match}: {len(found)} in {rig.names()}"
+    return found[0]
+
+
+def stream_starts(rig: Rig) -> list[str]:
+    return [str(item["turn_id"]) for item in rig.socket.sent if name_of(item) == "stream_start"]
+
+
+async def answer_waiting(rig: Rig, req: int, aec: str) -> str:
+    """Hold the socket at a typed turn's `stream_start`, with a reconfigure received meanwhile.
+
+    The turn completes and `apply` answers the reconfigure while the sender is held, so the
+    answer waits behind the turn's `stream_token`s, `stream_complete`, `state_cycle idle` and
+    `turn_metrics` on the lane. Returns the turn's id.
+    """
+    rig.socket.hold(lambda item: name_of(item) == "stream_start")
+    await rig.send({"type": "text", "text": "hi"}, voice_start(req=req, aec=aec))
+    assert isinstance(rig.socket.holding, dict)
+    assert rig.ingress.kwargs["seed"] is not None  # `apply` built the seeded ingress
+    return str(rig.socket.holding["turn_id"])
+
+
+async def thinking_turn(rig: Rig) -> None:
+    """Publish one utterance; its turn waits in `thinking` on the responder's `Pause`."""
+    uid = rig.ids()
+    rig.ingress.emit(rig.ingress.started(uid))
+    rig.ingress.emit(rig.ingress.ended(uid, "hello"))
+    await settle()
+    assert rig.controller.phase == "thinking"
+
+
+class SwitchedTiers:
+    """The `interaction` tier's provider, which a test takes away."""
+
+    def __init__(self) -> None:
+        self.model: object | None = object()
+
+    def provider(self, tier: str) -> object | None:
+        return self.model
+
+
+class TestAnswerFence:
+    """A53: an answer `apply` readies waits for the `turn`-lane items queued before it."""
+
+    async def test_an_applied_answer_is_written_after_its_turns_idle_and_metrics(self):
+        rig = await Rig().start()
+        await rig.send(voice_start(req=1))
+        turn_id = await answer_waiting(rig, req=2, aec="native")
+
+        rig.socket.release()
+        await settle()
+
+        answer = at(rig, "voice_state", cause="answer", req=2)
+        assert at(rig, "stream_complete", turn_id=turn_id) < answer
+        assert at(rig, "state_cycle", state="idle", turn_id=turn_id) < answer
+        assert at(rig, "turn_metrics", turn_id=turn_id) < answer
+
+    async def test_another_control_item_overtakes_a_waiting_answer(self):
+        rig = await Rig().start()
+        await rig.send(voice_start(req=1))
+        turn_id = await answer_waiting(rig, req=2, aec="native")
+
+        rig.session.send_control({"type": "status", "message": "c"})
+        rig.socket.release()
+        await settle()
+
+        status = at(rig, "status")
+        assert status == at(rig, "stream_start", turn_id=turn_id) + 1
+        assert status < at(rig, "voice_state", cause="answer", req=2)
+
+    async def test_an_invalid_answer_and_a_broadcast_queue_behind_a_waiting_answer(self):
+        rig = await Rig().start()
+        await rig.send(voice_start(req=1))
+        turn_id = await answer_waiting(rig, req=2, aec="native")
+
+        await rig.send(voice_start(req=3, mode="ptt"))
+        rig.session.send_voice_state()
+        rig.socket.release()
+        await settle()
+
+        applied = at(rig, "voice_state", cause="answer", req=2)
+        invalid = at(rig, "voice_state", cause="answer", req=3)
+        broadcast = at(rig, "voice_state", cause="broadcast")
+        assert at(rig, "turn_metrics", turn_id=turn_id) < applied < invalid < broadcast
+        assert rig.socket.sent[invalid]["refused"] == "invalid"
+
+    async def test_a_voice_stop_while_an_answer_waits_sends_its_messages_after_it(self):
+        rig = await Rig([Token("Hi.")], [Pause(), Token("Later.")]).start()
+        await rig.send(voice_start(req=1))
+        first = await answer_waiting(rig, req=2, aec="native")
+        await thinking_turn(rig)
+        await rig.send(voice_start(req=3, aec="device"))  # pending: a turn is in flight
+
+        await rig.send({"type": "voice_stop"})
+        rig.socket.release()
+        await settle()
+
+        applied = at(rig, "voice_state", cause="answer", req=2)
+        refused = at(rig, "voice_state", cause="answer", req=3)
+        barge = at(rig, "voice_decision:barge_in")
+        assert at(rig, "turn_metrics", turn_id=first) < applied < refused < barge
+        assert rig.socket.sent[refused]["refused"] == "voice_stop"
+        assert rig.socket.sent[barge]["reason"] == "voice_stop"
+
+    async def test_a_power_off_suspension_while_an_answer_waits_sends_its_messages_after_it(
+        self,
+    ):
+        tiers = SwitchedTiers()
+        gate = PowerGate(
+            FixedPower("full"),
+            tiers,  # type: ignore[arg-type]
+            lambda: "no model",
+            spoken_commands_at_off=False,
+        )
+        rig = await Rig([Token("Hi.")], [Pause(), Token("Later.")], power_gate=gate).start()
+        await rig.send(voice_start(req=1))
+        first = await answer_waiting(rig, req=2, aec="native")
+        await thinking_turn(rig)
+        await rig.send(voice_start(req=3, aec="device"))
+
+        tiers.model = None
+        rig.session.send_voice_state()  # the registry's broadcast suspends voice
+        await settle()
+        rig.socket.release()
+        await settle()
+
+        assert any(isinstance(m, VoiceStop) for m in rig.controller.posted)
+        applied = at(rig, "voice_state", cause="answer", req=2)
+        refused = at(rig, "voice_state", cause="answer", req=3)
+        barge = at(rig, "voice_decision:barge_in")
+        assert at(rig, "turn_metrics", turn_id=first) < applied < refused < barge
+        assert at(rig, "voice_state", cause="broadcast") > applied
+        assert rig.socket.sent[refused]["refused"] == "voice_stop"
+        assert rig.socket.sent[barge]["reason"] == "voice_stop"
+
+    async def test_once_the_window_passes_a_control_item_is_unfenced_again(self):
+        rig = await Rig([Token("Hi.")], [Pause(), Token("Later.")], [Token("Again.")]).start()
+        await rig.send(voice_start(req=1))
+        await answer_waiting(rig, req=2, aec="native")
+        await thinking_turn(rig)
+        await rig.send({"type": "voice_stop"})
+        rig.socket.release()
+        await settle()
+
+        await rig.send(voice_start(req=3))  # from off: answered at once
+        third = await answer_waiting(rig, req=4, aec="native")
+        rig.session.send_control({"type": "status", "message": "c"})
+        rig.socket.release()
+        await settle()
+
+        status = at(rig, "status")
+        assert status == at(rig, "stream_start", turn_id=third) + 1
+        assert status < at(rig, "voice_state", cause="answer", req=4)
+
+    async def test_with_an_empty_lane_an_applied_answer_goes_at_its_control_position(self):
+        rig = await Rig().start()
+        await rig.send(voice_start(req=1))
+        rig.socket.hold(lambda item: name_of(item) == "status")
+        rig.session.send_control({"type": "status", "message": "held"})
+        await settle()
+
+        await rig.send(voice_start(req=2, aec="native"))  # quiescent: applied at once
+        rig.session.send_turn("t9", {"type": "stream_token", "turn_id": "t9", "token": "x"})
+        rig.session.send_control({"type": "status", "message": "after"})
+        rig.socket.release()
+        await settle()
+
+        assert rig.ingress.kwargs["seed"] is not None
+        assert rig.names()[-4:] == ["status", "voice_state", "status", "stream_token"]
+        assert rig.socket.sent[-3]["req"] == 2
+
+    async def test_two_waiting_answers_then_a_voice_stop_keep_req_order(self):
+        rig = await Rig([Token("One.")], [Token("Two.")], [Pause(), Token("Three.")]).start()
+        await rig.send(voice_start(req=1))
+        first = await answer_waiting(rig, req=2, aec="native")
+        await rig.send({"type": "text", "text": "two"}, voice_start(req=3, aec="device"))
+        assert len(rig.ingresses) == 3  # both reconfigures applied while the sender is held
+        await thinking_turn(rig)
+        await rig.send(voice_start(req=4, aec="headset"))
+
+        await rig.send({"type": "voice_stop"})
+        rig.socket.release()
+        await settle()
+
+        second = stream_starts(rig)[1]
+        answers = [at(rig, "voice_state", cause="answer", req=req) for req in (2, 3, 4)]
+        barge = at(rig, "voice_decision:barge_in")
+        assert at(rig, "turn_metrics", turn_id=first) < answers[0]
+        assert answers[0] < at(rig, "stream_start", turn_id=second)
+        assert at(rig, "state_cycle", state="idle", turn_id=second) < answers[1]
+        assert at(rig, "turn_metrics", turn_id=second) < answers[1]
+        assert answers == sorted(answers) and answers[-1] < barge
+        assert rig.socket.sent[answers[-1]]["refused"] == "voice_stop"
+
+    async def test_voice_stop_answers_a_pending_request_then_an_invalid_one_behind_it(self):
+        # v2's M63 case: voice is off from the `voice_stop`'s receipt.
+        rig = await Rig([Pause(), Token("Later.")]).start()
+        await rig.send(voice_start(req=1))
+        await thinking_turn(rig)
+        await rig.send(voice_start(req=2, aec="native"), voice_start(req=3, mode="ptt"))
+        assert [a["req"] for a in rig.answers()] == [1]
+
+        await rig.send({"type": "voice_stop"})
+
+        assert [(a["req"], a["active"], a["mode"], a["refused"]) for a in rig.answers()] == [
+            (1, True, "wake", None),
+            (2, False, None, "voice_stop"),
+            (3, False, None, "invalid"),
+        ]
+        last = at(rig, "voice_state", cause="answer", req=3)
+        assert last < at(rig, "voice_decision:barge_in")
+        assert last < at(rig, "stream_cancelled")
 
 
 # -- Mute ------------------------------------------------------------------------------------------

@@ -43,7 +43,6 @@ class VoiceConfig(BaseModel):
 
     # TTS settings
     tts_enabled: bool = True  # Set to False to disable TTS (text-only mode)
-    tts_engine: str = "chatterbox"  # "chatterbox" (default) or "csm" (legacy)
     voice_profile: str = DEFAULT_VOICE_PROFILE  # Selected via VOICE_PROFILE env var
     use_voice_context: bool = True
 
@@ -72,7 +71,6 @@ def load_config() -> VoiceConfig:
     """Load configuration from environment variables."""
     return VoiceConfig(
         tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true",
-        tts_engine=os.getenv("TTS_ENGINE", "chatterbox"),
         voice_profile=os.getenv("VOICE_PROFILE", DEFAULT_VOICE_PROFILE),
         system_status=SystemStatusConfig(
             enabled=_bool_env("MIST_SYSTEM_STATUS_ENABLED", True),

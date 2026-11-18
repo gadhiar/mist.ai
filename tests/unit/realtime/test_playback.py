@@ -353,6 +353,78 @@ class TestTurnLane:
         assert taken_after_purge is None
 
 
+class TestTurnLaneMark:
+    """`mark` and `passed`: the session's fence for a `voice_state` answer (A53)."""
+
+    def test_a_mark_is_the_number_the_next_put_takes(self):
+        lane = TurnLane(max_items=1)
+        first = lane.mark()
+
+        lane.put(TURN, "a")
+        with pytest.raises(LaneFull):
+            lane.put(TURN, "b")
+
+        assert lane.mark() == first + 1
+
+    def test_a_mark_passes_once_each_earlier_item_is_taken(self):
+        lane = TurnLane()
+        lane.put(TURN, "a")
+        lane.put(TURN, "b")
+        mark = lane.mark()
+
+        before = lane.passed(mark)
+        lane.take()
+        after_one = lane.passed(mark)
+        lane.take()
+
+        assert (before, after_one, lane.passed(mark)) == (False, False, True)
+
+    def test_a_purged_earlier_item_counts_as_gone(self):
+        lane = TurnLane()
+        lane.put("t1", "a")
+        lane.put("t2", "b")
+        mark = lane.mark()
+
+        lane.purge("t1")
+        assert lane.passed(mark) is False
+        lane.purge("t2")
+
+        assert lane.passed(mark) is True
+
+    def test_purging_a_later_turn_leaves_the_mark_unpassed_until_the_earlier_items_go(self):
+        # The plan reviewer's counter-example: a count of items gone would reach the mark here.
+        lane = TurnLane()
+        lane.put("t1", "a")
+        lane.put("t1", "b")
+        mark = lane.mark()
+        lane.put("t2", "x")
+        lane.put("t2", "y")
+
+        lane.purge("t2")
+        purged = lane.passed(mark)
+        lane.take()
+        after_one = lane.passed(mark)
+        lane.take()
+
+        assert (purged, after_one, lane.passed(mark)) == (False, False, True)
+
+    def test_items_put_after_the_mark_never_hold_it_back(self):
+        empty = TurnLane()
+        empty_mark = empty.mark()
+        empty.put(TURN, "later")
+        busy = TurnLane()
+        busy.put("t1", "a")
+        busy_mark = busy.mark()
+        busy.put("t2", "x")
+        busy.put("t2", "y")
+
+        busy.take()
+
+        assert empty.passed(empty_mark) is True
+        assert busy.passed(busy_mark) is True
+        assert _drain(busy) == ["x", "y"]
+
+
 class RecordingLock:
     def __init__(self, log: list[tuple[str, bool]]) -> None:
         self.log = log
@@ -406,6 +478,10 @@ class RecordingStore:
     def __iter__(self) -> Iterator[object]:
         self._touch("iter")
         return iter(list(self._items))
+
+    def __getitem__(self, index: int) -> object:
+        self._touch("getitem")
+        return self._items[index]
 
 
 class TestTurnLaneLocking:
@@ -462,6 +538,23 @@ class TestTurnLaneLocking:
         self._assert_one_locked_call(log)
         assert purge == LanePurge(terminal=True, stream_start=False, first_token=0)
         assert _drain(lane) == ["b"]
+
+    def test_passed_holds_the_lock_for_every_store_access(self):
+        lane, log = self._lane()
+        mark = lane.mark()
+        lane.put(TURN, "a")
+        log.clear()
+
+        assert lane.passed(mark) is True
+
+        self._assert_one_locked_call(log)
+
+    def test_mark_takes_the_lock(self):
+        lane, log = self._lane()
+
+        lane.mark()
+
+        assert log == [("acquire", False), ("release", False)]
 
     def test_put_on_a_full_lane_raises_and_still_releases_the_lock(self):
         lane, log = self._lane(max_items=1)

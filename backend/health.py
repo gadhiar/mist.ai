@@ -15,8 +15,9 @@ Single-flight, because a timeout does not stop the work
 `asyncio.wait_for` abandons what it was waiting on rather than stopping it: a
 `run_in_executor` call whose thread is wedged keeps that thread. A hung
 dependency probed every tick would leak one worker per tick into the default
-executor and eventually starve the voice pipeline's own `run_in_executor` calls
-(`backend/voice_processor.py:178`). So the sync graph probe runs in an injected
+executor and eventually starve its other users, such as `GraphExecutor`'s graph
+queries (`backend/knowledge/storage/graph_executor.py:53`, `run_in_executor(None,
+...)`). So the sync graph probe runs in an injected
 `ThreadPoolExecutor(max_workers=1)`, and the registry tracks in-flight probes:
 a probe whose previous invocation has not returned is SKIPPED this tick. Its
 cached result ages and goes stale, which is the honest report.
@@ -491,11 +492,11 @@ class Neo4jProbe:
     reason -- the contract names only outcomes that can actually occur.
 
     `severity="degrades"` and `restart_repairs=False`: the system's own boot path
-    treats Neo4j as non-fatal (`ModelManager.__init__` logs `Knowledge
-    integration disabled (Neo4j unavailable)` and continues --
-    `backend/voice_models/model_manager.py:97-98`), and restarting the backend
-    costs about 120s of model
-    reload during which MIST serves nothing, against a memory-only fault where
+    treats Neo4j as non-fatal (`build_mist_runtime` catches the handler build's
+    `MistError`, logs `Knowledge integration unavailable, answering without
+    memory`, and answers through `DirectResponder` --
+    `grep -n "answering without memory" backend/factories.py`), and restarting
+    the backend reloads its models, during which MIST serves nothing, against a memory-only fault where
     conversation still works. The backend also cannot distinguish "our driver is
     dead" (restart would fix it) from "Neo4j is down" (restart is destructive);
     the two present identically here.
@@ -519,11 +520,11 @@ class Neo4jProbe:
         """Run the graph health check in the injected single-worker executor."""
         connection = self._get_connection()
         if connection is None:
-            # The distinction is load-bearing. `ModelManager.__init__` sets
-            # `self.knowledge = None` when Neo4j is unavailable at boot
-            # (`backend/voice_models/model_manager.py:96-103`, both the
-            # `is_enabled()` False branch and the `except`), so
-            # rendering null there would satisfy the letter of the null rule
+            # The distinction is load-bearing. The runtime holds no
+            # conversation handler, so no connection, both when knowledge
+            # integration is off and when its build raised at boot, Neo4j
+            # unreachable included (`_health_conversation_handler` in
+            # `backend/server.py`), so rendering null there would satisfy the letter of the null rule
             # while hiding exactly the fault it exists to expose.
             if self._knowledge_configured():
                 raise ProbeFailed("unavailable_at_boot")
@@ -713,17 +714,22 @@ class BroadcasterState:
 
 
 class BroadcasterProbe:
-    """Reports whether the WebSocket broadcaster task is still alive.
+    r"""Reports whether the WebSocket broadcaster task is still alive.
 
     Reads memory only, so `timeout_seconds` never binds here; it exists because
     the protocol requires it.
 
     The accessor returns `alive`, `dead`, or None when nothing has published the
-    state yet. `restart_repairs=True`, uniquely in this system: every outbound
-    event -- transcription, LLM tokens, TTS audio frames, `state_cycle`,
-    `vad_status`, heartbeats, `system_status`, `health_status`, log streaming --
-    funnels through the broadcaster (18 `message_queue.put` sites across
-    `backend/server.py` and `backend/voice_processor.py`), and a dead
+    state yet. `restart_repairs=True`, uniquely in this system: every
+    process-wide event -- heartbeats, `system_status`, `health_status`,
+    `extraction_status`, decided proposals, log streaming -- funnels through
+    the broadcaster (`grep -rn "message_queue.put\|_queue.put" backend` ->
+    six sites in `backend/server.py` and two in `backend/log_handler.py`, whose
+    `_queue` is `message_queue`; its other hits are this docstring and the vault
+    writer's own job queue, `backend/vault/writer.py:263` and `:569`). Turn
+    frames do not: each session sends its own, and `backend/realtime` never
+    touches `message_queue` (`grep -rn message_queue backend/realtime` -> no
+    hits). A dead
     `asyncio.Task` is revived by nothing short of a new process.
     """
 

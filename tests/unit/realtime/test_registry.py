@@ -330,18 +330,20 @@ class TestWakeArbitration:
         a = await rig.connect("a")
         await rig.connect("b")  # connected, voice off: not a voice session
         await a.send(voice_start())
-        verdicts: list[bool] = []
+        verdicts: list[tuple[bool, float | None]] = []
 
-        rig.registry.arbiter.claim("a", WakeRank(0.0, None, None, 0.2), verdicts.append)
+        rig.registry.arbiter.claim(
+            "a", WakeRank(0.0, None, None, 0.2, 0.7), lambda ok, w: verdicts.append((ok, w))
+        )
 
-        assert verdicts == [True]
+        assert verdicts == [(True, None)]
         assert rig.later.timers == []
 
     @pytest.mark.parametrize(
         ("rank_a", "rank_b", "winner"),
         [
-            (WakeRank(0.0, 0.5, 0.6, 0.1), WakeRank(10.0, 2.0, 0.9, 0.3), "a"),
-            (WakeRank(0.0, 1.0, 0.4, 0.3), WakeRank(10.0, 1.0, 0.8, 0.1), "b"),
+            (WakeRank(0.0, 0.5, 0.6, 0.1, 0.71), WakeRank(10.0, 2.0, 0.9, 0.3, 0.93), "a"),
+            (WakeRank(0.0, 1.0, 0.4, 0.3, 0.71), WakeRank(10.0, 1.0, 0.8, 0.1, 0.93), "b"),
         ],
         ids=["fewer_false_accepts_wins", "tied_false_accepts_the_quantile_decides"],
     )
@@ -351,11 +353,41 @@ class TestWakeArbitration:
         b = await rig.connect("b")
         await a.send(voice_start())
         await b.send(voice_start())
-        verdicts: list[tuple[str, bool]] = []
+        verdicts: list[tuple[str, bool, float | None]] = []
 
-        rig.registry.arbiter.claim("a", rank_a, lambda ok: verdicts.append(("a", ok)))
-        rig.registry.arbiter.claim("b", rank_b, lambda ok: verdicts.append(("b", ok)))
+        claim_a = rig.registry.arbiter.claim(
+            "a", rank_a, lambda ok, w: verdicts.append(("a", ok, w))
+        )
+        claim_b = rig.registry.arbiter.claim(
+            "b", rank_b, lambda ok, w: verdicts.append(("b", ok, w))
+        )
 
         assert [delay for delay, _ in rig.later.timers] == [0.3]
         rig.later.fire()
-        assert verdicts == [(winner, True)]
+        assert verdicts == [(winner, True, None)]
+
+        # The winner's gate accepts it: the loser hears the winner's raw score.
+        won, lost, won_rank = (claim_a, "b", rank_a) if winner == "a" else (claim_b, "a", rank_b)
+        rig.registry.arbiter.settle(won, True)
+        assert verdicts == [(winner, True, None), (lost, False, won_rank.score)]
+
+    async def test_a_withdrawn_claim_gets_no_loss_when_the_winner_is_accepted(self):
+        rig = RegistryRig()
+        a = await rig.connect("a")
+        b = await rig.connect("b")
+        await a.send(voice_start())
+        await b.send(voice_start())
+        verdicts: list[tuple[str, bool, float | None]] = []
+        arbiter = rig.registry.arbiter
+
+        won = arbiter.claim(
+            "a", WakeRank(0.0, 0.5, 0.6, 0.1, 0.9), lambda ok, w: verdicts.append(("a", ok, w))
+        )
+        gone = arbiter.claim(
+            "b", WakeRank(10.0, 2.0, 0.9, 0.3, 0.8), lambda ok, w: verdicts.append(("b", ok, w))
+        )
+        rig.later.fire()
+        arbiter.settle(gone, False)  # b's candidate was dropped while a's gate decoded
+        arbiter.settle(won, True)
+
+        assert verdicts == [("a", True, None)]

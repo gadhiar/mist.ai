@@ -80,6 +80,7 @@ from .turn_fakes import (
     InlineLane,
     Pause,
     RecordingIngress,
+    Sent,
     WaitGate,
     close_live_controllers,
     describe,
@@ -1674,19 +1675,28 @@ async def test_inline_lane_fails_a_job_raising_another_error_as_the_real_lane_do
 
 
 async def test_fake_arbiter_grants_a_solo_claim_before_claim_returns():
-    verdicts: list[bool] = []
+    verdicts: list[tuple[bool, float | None]] = []
+
+    def record(proceed: bool, winner_score: float | None) -> None:
+        verdicts.append((proceed, winner_score))
+
     arbiter = FakeWakeArbiter(solo=True)
-    rank = WakeRank(arrival=0.0, false_accepts_per_hour=None, positive_quantile=None, margin=0.1)
-    claim = arbiter.claim("s", rank, verdicts.append)
-    assert verdicts == [True] and claim == 1
+    rank = WakeRank(
+        arrival=0.0, false_accepts_per_hour=None, positive_quantile=None, margin=0.1, score=0.6
+    )
+    claim = arbiter.claim("s", rank, record)
+    assert verdicts == [(True, None)] and claim == 1
 
     manual = FakeWakeArbiter()
-    first = manual.claim("s", rank, verdicts.append)
+    first = manual.claim("s", rank, record)
+    second = manual.claim("s", rank, record)
     manual.deny(first)
+    manual.deny(second, winner_score=0.75)
     manual.settle(first, False)
-    assert verdicts == [True, False]
+    assert verdicts == [(True, None), (False, 0.9), (False, 0.75)]
     assert manual.settles == [(1, False)]
-    assert WakeVerdict(claim_id=1, proceed=True).proceed is True
+    assert WakeVerdict(claim_id=1, proceed=True).winner_score is None
+    assert WakeVerdict(claim_id=1, proceed=False, winner_score=0.9).winner_score == 0.9
 
 
 async def test_ingress_and_controller_ids_come_from_one_counter():
@@ -2618,16 +2628,24 @@ async def test_a_handoff_turns_tts_failed_voiced_text_keeps_the_ack():
 
 
 def calibrated(
-    fa: float, quantile: float, *, arrival: float = 0.0, margin: float = 0.1
+    fa: float, quantile: float, *, arrival: float = 0.0, margin: float = 0.1, score: float = 0.5
 ) -> WakeRank:
     return WakeRank(
-        arrival=arrival, false_accepts_per_hour=fa, positive_quantile=quantile, margin=margin
+        arrival=arrival,
+        false_accepts_per_hour=fa,
+        positive_quantile=quantile,
+        margin=margin,
+        score=score,
     )
 
 
-def uncalibrated(margin: float, *, arrival: float = 0.0) -> WakeRank:
+def uncalibrated(margin: float, *, arrival: float = 0.0, score: float = 0.5) -> WakeRank:
     return WakeRank(
-        arrival=arrival, false_accepts_per_hour=None, positive_quantile=None, margin=margin
+        arrival=arrival,
+        false_accepts_per_hour=None,
+        positive_quantile=None,
+        margin=margin,
+        score=score,
     )
 
 
@@ -2670,22 +2688,24 @@ async def test_outranks_is_false_both_ways_for_equal_ranks():
 
 
 async def test_a_rank_missing_either_calibrated_scale_ranks_as_uncalibrated():
-    half = WakeRank(arrival=0.0, false_accepts_per_hour=0.1, positive_quantile=None, margin=0.9)
+    half = WakeRank(
+        arrival=0.0, false_accepts_per_hour=0.1, positive_quantile=None, margin=0.9, score=0.5
+    )
     assert outranks(calibrated(9.0, 0.0, arrival=50.0), half)
     assert outranks(half, uncalibrated(0.5))
 
 
 class Verdicts:
-    """Each claim's verdicts, in the order the `verdict` callbacks were called."""
+    """Each claim's verdicts, `(claim, proceed, winner_score)`, in the order they were called."""
 
     def __init__(self) -> None:
-        self.log: list[tuple[str, bool]] = []
+        self.log: list[tuple[str, bool, float | None]] = []
 
-    def to(self, name: str) -> Callable[[bool], None]:
-        return lambda proceed: self.log.append((name, proceed))
+    def to(self, name: str) -> Callable[[bool, float | None], None]:
+        return lambda proceed, winner_score: self.log.append((name, proceed, winner_score))
 
-    def of(self, name: str) -> list[bool]:
-        return [proceed for who, proceed in self.log if who == name]
+    def of(self, name: str) -> list[tuple[bool, float | None]]:
+        return [(proceed, score) for who, proceed, score in self.log if who == name]
 
 
 def arbiter_with(
@@ -2705,11 +2725,11 @@ async def test_one_session_with_no_claim_pending_proceeds_before_claim_returns_w
     claim = wake.claim("s1", uncalibrated(0.2), verdicts.to("a"))
     seen_at_return = list(verdicts.log)
 
-    assert seen_at_return == [("a", True)]
+    assert seen_at_return == [("a", True, None)]
     assert later.timers == []
     wake.settle(claim, True)
     second = wake.claim("s1", uncalibrated(0.2), verdicts.to("b"))
-    assert verdicts.of("b") == [True]
+    assert verdicts.of("b") == [(True, None)]
     assert later.timers == []
     assert second != claim
 
@@ -2725,25 +2745,25 @@ async def test_one_session_with_a_departed_sessions_claim_pending_waits():
     assert verdicts.log == []
     assert len(later.timers) == 1  # it joined the window `gone` opened
     later.fire()
-    assert verdicts.log == [("gone", True)]
+    assert verdicts.log == [("gone", True, None)]
     wake.settle(gone, False)  # the departed session's controller dropped it at disconnect
-    assert verdicts.log == [("gone", True), ("stay", True)]
+    assert verdicts.log == [("gone", True, None), ("stay", True, None)]
     wake.settle(stay, True)
 
 
 async def test_one_session_with_a_departed_sessions_winner_unsettled_waits():
     wake, later, count = arbiter_with(sessions=2)
     verdicts = Verdicts()
-    gone = wake.claim("s2", uncalibrated(0.2), verdicts.to("gone"))
+    gone = wake.claim("s2", uncalibrated(0.2, score=0.62), verdicts.to("gone"))
     later.fire()
     count[0] = 1
 
     stay = wake.claim("s1", uncalibrated(0.9), verdicts.to("stay"))
 
-    assert verdicts.log == [("gone", True)]
+    assert verdicts.log == [("gone", True, None)]
     assert len(later.timers) == 1
     wake.settle(gone, True)
-    assert verdicts.of("stay") == [False]
+    assert verdicts.of("stay") == [(False, 0.62)]
     wake.settle(stay, False)
 
 
@@ -2758,7 +2778,8 @@ async def test_a_window_opens_at_the_first_claim_and_its_best_claim_proceeds_at_
     assert len(later.timers) == 1  # the second claim joined the open window
     assert verdicts.log == []
     later.fire()
-    assert verdicts.log == [("strong", True)]  # the weak claim waits for the winner's verdict
+    # The weak claim waits for the winner's verdict.
+    assert verdicts.log == [("strong", True, None)]
 
 
 async def test_a_claim_after_the_window_closed_waits_while_the_winner_is_unsettled():
@@ -2769,23 +2790,28 @@ async def test_a_claim_after_the_window_closed_waits_while_the_winner_is_unsettl
 
     wake.claim("s2", uncalibrated(0.9), verdicts.to("late"))
 
-    assert verdicts.log == [("first", True)]
+    assert verdicts.log == [("first", True, None)]
     assert len(later.timers) == 1  # no new window while a winner is unsettled
     wake.settle(first, False)
-    assert verdicts.log == [("first", True), ("late", True)]
+    assert verdicts.log == [("first", True, None), ("late", True, None)]
 
 
 async def test_accepting_the_winner_sends_every_other_pending_claim_false_and_empties_it():
     wake, later, _ = arbiter_with()
     verdicts = Verdicts()
-    winner = wake.claim("s1", uncalibrated(0.5), verdicts.to("winner"))
-    wake.claim("s2", uncalibrated(0.2), verdicts.to("loser"))
+    winner = wake.claim("s1", uncalibrated(0.5, score=0.93), verdicts.to("winner"))
+    wake.claim("s2", uncalibrated(0.2, score=0.71), verdicts.to("loser"))
     later.fire()
-    wake.claim("s3", uncalibrated(0.1), verdicts.to("late"))
+    wake.claim("s3", uncalibrated(0.1, score=0.6), verdicts.to("late"))
 
     wake.settle(winner, True)
 
-    assert verdicts.log == [("winner", True), ("loser", False), ("late", False)]
+    # A grant carries no score; each loser gets the accepted winner's raw score, not its own.
+    assert verdicts.log == [
+        ("winner", True, None),
+        ("loser", False, 0.93),
+        ("late", False, 0.93),
+    ]
     # Empty: the next claim opens a new window.
     wake.claim("s1", uncalibrated(0.5), verdicts.to("next"))
     assert len(later.timers) == 2
@@ -2801,15 +2827,37 @@ async def test_rejecting_the_winner_gives_the_next_ranked_claim_its_verdict():
     later.fire()
 
     wake.settle(winner, False)
-    assert verdicts.log == [("winner", True), ("second", True)]
+    assert verdicts.log == [("winner", True, None), ("second", True, None)]
     wake.settle(second, False)
-    assert verdicts.log[-1] == ("third", True)
+    assert verdicts.log[-1] == ("third", True, None)
     wake.settle(third, False)
 
     # None remains, so it is empty: the next claim opens a new window.
     assert len(verdicts.log) == 3
     wake.claim("s1", uncalibrated(0.5), verdicts.to("next"))
     assert len(later.timers) == 2
+
+
+async def test_a_loser_after_a_rejected_winner_gets_the_runner_ups_score():
+    """The runner-up rule: a loser gets the accepted claim's score, not the first winner's."""
+    wake, later, _ = arbiter_with()
+    verdicts = Verdicts()
+    winner = wake.claim("s1", uncalibrated(0.5, score=0.95), verdicts.to("winner"))
+    runner_up = wake.claim("s2", uncalibrated(0.3, score=0.8), verdicts.to("runner_up"))
+    withdrawn = wake.claim("s3", uncalibrated(0.2, score=0.7), verdicts.to("withdrawn"))
+    wake.claim("s4", uncalibrated(0.1, score=0.65), verdicts.to("last"))
+    later.fire()
+
+    wake.settle(winner, False)
+    wake.settle(withdrawn, False)  # dropped at mute while the runner-up's gate decodes
+    wake.settle(runner_up, True)
+
+    assert verdicts.log == [
+        ("winner", True, None),
+        ("runner_up", True, None),
+        ("last", False, 0.8),
+    ]
+    assert verdicts.of("withdrawn") == []
 
 
 async def test_withdrawing_a_waiting_claim_sends_no_verdict_to_anyone():
@@ -2821,13 +2869,14 @@ async def test_withdrawing_a_waiting_claim_sends_no_verdict_to_anyone():
     wake.settle(best, False)  # withdrawn inside the window: dropped at mute, say
     assert verdicts.log == []
     later.fire()
-    assert verdicts.log == [("other", True)]
+    assert verdicts.log == [("other", True, None)]
 
     late = wake.claim("s1", uncalibrated(0.9), verdicts.to("late"))
     wake.settle(late, False)  # withdrawn while the winner is unsettled
-    assert verdicts.log == [("other", True)]
+    assert verdicts.log == [("other", True, None)]
     wake.settle(other, True)
-    assert verdicts.log == [("other", True)]
+    # The withdrawn claim gets no loss either when the winner is accepted.
+    assert verdicts.log == [("other", True, None)]
 
 
 async def test_withdrawing_every_claim_in_a_window_leaves_its_close_nothing_to_grant():
@@ -2854,7 +2903,7 @@ async def test_settle_true_on_a_claim_that_is_not_the_winner_raises():
         wake.settle(waiting, True)  # waiting on the winner
     with pytest.raises(ValueError):
         wake.settle(999, True)  # never claimed
-    assert verdicts.log == [("winner", True)]
+    assert verdicts.log == [("winner", True, None)]
     wake.settle(winner, True)
     with pytest.raises(ValueError):
         wake.settle(waiting, True)  # it lost
@@ -2866,21 +2915,21 @@ async def test_settle_false_on_a_claim_it_no_longer_holds_is_a_no_op():
     """Decision 3: a controller settles a lost claim too, after its `verdict(False)`."""
     wake, later, count = arbiter_with()
     verdicts = Verdicts()
-    winner = wake.claim("s1", uncalibrated(0.9), verdicts.to("winner"))
+    winner = wake.claim("s1", uncalibrated(0.9, score=0.88), verdicts.to("winner"))
     loser = wake.claim("s2", uncalibrated(0.1), verdicts.to("loser"))
     later.fire()
     wake.settle(winner, True)
-    assert verdicts.log == [("winner", True), ("loser", False)]
+    assert verdicts.log == [("winner", True, None), ("loser", False, 0.88)]
 
     wake.settle(loser, False)
     wake.settle(winner, False)
     wake.settle(999, False)
 
-    assert verdicts.log == [("winner", True), ("loser", False)]
+    assert verdicts.log == [("winner", True, None), ("loser", False, 0.88)]
     # It is still empty: a lone session's next claim proceeds at once, with no timer.
     count[0] = 1
     fresh = wake.claim("s1", uncalibrated(0.9), verdicts.to("fresh"))
-    assert verdicts.of("fresh") == [True]
+    assert verdicts.of("fresh") == [(True, None)]
     assert len(later.timers) == 1
     wake.settle(fresh, True)
 
@@ -2895,10 +2944,17 @@ async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(
     got: dict[int, list[bool]] = {}
     settled: set[int] = set()
     order: list[int] = []
+    scores: list[float] = []
+    accepting: list[float] = []  # the score of the winner being accepted, during its settle
 
-    def record(index: int) -> Callable[[bool], None]:
-        def verdict(proceed: bool) -> None:
+    def record(index: int) -> Callable[[bool, float | None], None]:
+        def verdict(proceed: bool, winner_score: float | None) -> None:
             assert index >= len(order) or order[index] not in settled, "a verdict after settle"
+            if proceed:
+                assert winner_score is None, "a grant with a winner score"
+            else:
+                assert accepting, "a loss outside a winner's acceptance"
+                assert winner_score == accepting[0], "a loss without the accepted winner's score"
             got.setdefault(index, []).append(proceed)
 
         return verdict
@@ -2909,8 +2965,11 @@ async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(
     for _ in range(60):
         action = rng.random()
         if action < 0.35:
-            rank = uncalibrated(round(rng.random(), 1), arrival=float(rng.randint(0, 3)))
             index = len(order)
+            scores.append(index / 100)
+            rank = uncalibrated(
+                round(rng.random(), 1), arrival=float(rng.randint(0, 3)), score=scores[index]
+            )
             order.append(wake.claim(f"s{rng.randint(1, 3)}", rank, record(index)))
         elif action < 0.55 and later.pending:
             later.fire()
@@ -2921,7 +2980,9 @@ async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(
             if order[index] in settled:
                 continue
             accepted = index in unsettled_winners() and rng.random() < 0.5
+            accepting[:] = [scores[index]] if accepted else []
             wake.settle(order[index], accepted)
+            accepting.clear()
             settled.add(order[index])
         assert len(unsettled_winners()) <= 1, "two unsettled winners"
         assert all(len(v) == 1 for v in got.values()), "a claim with two verdicts"
@@ -2934,8 +2995,10 @@ async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(
 # Each seed drives one controller through a random sequence of every message type: ingress events
 # (`NameHeard` from either spotter and the gate partial among them, and events of an old epoch),
 # controls, `wake`, verdicts from `FakeWakeArbiter` granted or denied at any point (after the
-# claim was settled included), playback reports, the responder's pauses and the clock. The step
-# invariants are checked after every step, and the end invariants after a drain and the close.
+# claim was settled included), playback reports, the responder's pauses and the clock. A cut-in,
+# her name granted and gated as addressed while a turn thinks, makes a share of the seeds
+# supersede a turn, with and without a tool dispatched (A51, T55c and T55d). The step invariants
+# are checked after every step, and the end invariants after a drain and the close.
 
 INTERLEAVING_STEPS = 40
 INTERLEAVING_SEEDS = 200
@@ -2947,7 +3010,9 @@ INTERLEAVING_TEXTS = (
     "what time is it",
     "mist, wait",
 )
-CLOSING_MESSAGES = ("transcription", "voice_decision:dropped")
+CLOSING_MESSAGES = ("transcription", "voice_decision:dropped", "voice_decision:wake_lost")
+CUT_REASONS = ("user_interrupt", "barge_in", "superseded", "new_input", "voice_stop")
+"""The `stream_cancelled` reasons a cut sends; a disconnect's cut sends nothing."""
 EVERY_KIND = frozenset(
     {
         "SpeechStarted",
@@ -2976,6 +3041,9 @@ EVERY_KIND = frozenset(
 )
 REACHED: dict[int, tuple[frozenset[str], int]] = {}
 """Each seed run so far: the message kinds it posted and its verdicts for settled claims."""
+SUPERSEDES: dict[int, tuple[int, int, int]] = {}
+"""Each seed run so far: its supersedes with no tool (kept), with a tool, and the kept turns a
+merge carried (T55d)."""
 
 
 def named_utterance(item: object) -> str | None:
@@ -2986,9 +3054,115 @@ def named_utterance(item: object) -> str | None:
     return uid if isinstance(uid, str) else None
 
 
+def superseded_turns(sent: list[Sent]) -> list[str]:
+    """The turns a `supersede` named, in send order."""
+    return [str(s.turn_id) for s in sent if describe(s.item) == "voice_decision:supersede"]
+
+
+def merged_turns(sent: list[Sent]) -> list[str]:
+    """The turns a `supersede` named with `merged` true: kept for the merge (T55d)."""
+    return [
+        str(s.turn_id)
+        for s in sent
+        if describe(s.item) == "voice_decision:supersede" and s.item.detail.merged  # type: ignore[attr-defined]
+    ]
+
+
+def check_cuts(sent: list[Sent]) -> None:
+    """Each cut's reason is a cut reason, and `superseded` is the reason exactly for the turns a
+    `supersede` named: once each, before the turn's cut, with no `barge_in`, and its
+    `turn_metrics` outcome `superseded` (A51). `merged` is the negation of `tool_dispatched`, and
+    a merged turn's metrics, sent before any commit, say it is not recorded (T55d).
+    """
+    superseded: list[str] = []
+    merged: set[str] = set()
+    cut: dict[str, str] = {}
+    for item in sent:
+        name, turn_id = describe(item.item), item.turn_id
+        if name == "voice_decision:supersede":
+            assert turn_id not in superseded, f"a second supersede for {turn_id}"
+            assert turn_id not in cut, f"a supersede for {turn_id} after its cut"
+            detail = item.item.detail  # type: ignore[attr-defined]
+            assert detail.merged is not detail.tool_dispatched, f"{turn_id}: {detail}"
+            superseded.append(str(turn_id))
+            if detail.merged:
+                merged.add(str(turn_id))
+        elif name == "voice_decision:barge_in":
+            assert turn_id not in superseded, f"a barge_in for superseded {turn_id}"
+        elif name == "stream_cancelled":
+            reason = item.item.reason  # type: ignore[attr-defined]
+            assert reason in CUT_REASONS, f"stream_cancelled reason {reason}"
+            assert (reason == "superseded") == (turn_id in superseded), f"{turn_id}: {reason}"
+            cut[str(turn_id)] = reason
+        elif name == "turn_metrics":
+            outcome = item.item.outcome  # type: ignore[attr-defined]
+            assert (outcome == "superseded") == (turn_id in superseded), f"{turn_id}: {outcome}"
+            if turn_id in merged:
+                assert item.item.recorded is False, f"kept {turn_id} reported recorded"  # type: ignore[attr-defined]
+    assert all(cut.get(t) == "superseded" for t in superseded), f"a supersede uncut: {cut}"
+
+
+async def test_the_cut_checks_accept_a_supersede_and_catch_each_mismatch():
+    """`check_cuts`, which the interleavings run at every step, is not vacuous."""
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "thinking"
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    h.post(h.ingress.heard(uid, hit_pos=110))
+    await h.settle()
+    h.post(h.ingress.partial(uid, "mist, and then", gate=True, through_pos=125))
+    await h.settle()
+
+    sent = list(h.outbound.sent)
+    assert len(superseded_turns(sent)) == 1
+    check_cuts(sent)
+
+    def cancelled_as(reason: str) -> list[Sent]:
+        return [
+            (
+                Sent(s.lane, s.item.model_copy(update={"reason": reason}), s.turn_id)  # type: ignore[attr-defined]
+                if describe(s.item) == "stream_cancelled"
+                else s
+            )
+            for s in sent
+        ]
+
+    def replaced(name: str, update: Callable[[object], object]) -> list[Sent]:
+        return [
+            Sent(s.lane, update(s.item), s.turn_id) if describe(s.item) == name else s for s in sent
+        ]
+
+    assert merged_turns(sent) == superseded_turns(sent)  # no tool: the turn is kept (T55d)
+    recorded = replaced("turn_metrics", lambda m: m.model_copy(update={"recorded": True}))  # type: ignore[attr-defined]
+    unmerged = replaced(
+        "voice_decision:supersede",
+        lambda d: d.model_copy(update={"detail": d.detail.model_copy(update={"merged": False})}),  # type: ignore[attr-defined]
+    )
+    unannounced = [s for s in sent if describe(s.item) != "voice_decision:supersede"]
+    uncut = [s for s in sent if describe(s.item) != "stream_cancelled"]
+    broken_cases = (
+        unannounced,
+        uncut,
+        cancelled_as("barge_in"),
+        cancelled_as("disconnect"),
+        recorded,
+        unmerged,
+    )
+    for broken in broken_cases:
+        with pytest.raises(AssertionError):
+            check_cuts(broken)
+
+
 def random_script(rng: random.Random, pauses: list[Pause]) -> list[object]:
+    """One turn's script. Kinds 2 and 4 pause in `thinking` before any audio, where an accepted
+    name supersedes the turn: kind 2 with no tool dispatched (kept for the merge), kind 4 with
+    one (committed at the cut).
+    """
     pause = Pause()
-    kind = rng.randrange(4)
+    kind = rng.randrange(5)
     if kind == 0:
         return [Token("One two three. "), Token("Four five.")]
     pauses.append(pause)
@@ -2996,6 +3170,15 @@ def random_script(rng: random.Random, pauses: list[Pause]) -> list[object]:
         return [Token("One. "), pause, Token("Two.")]
     if kind == 2:
         return [pause, Token("Late.")]
+    if kind == 4:
+        return [
+            WaitGate(),
+            Call(dispatch_tool),
+            tool_started(),
+            pause,
+            tool_completed(),
+            Token("OK."),
+        ]
     return [
         Token("Setting it. "),
         WaitGate(),
@@ -3011,6 +3194,7 @@ class Interleaving:
     """One seed's run: a controller, a model of the ingress feeding it, and the invariants."""
 
     def __init__(self, seed: int) -> None:
+        self.seed = seed
         self.rng = random.Random(seed)
         self.pauses: list[Pause] = []
         scripts = [random_script(self.rng, self.pauses) for _ in range(INTERLEAVING_STEPS)]
@@ -3028,6 +3212,9 @@ class Interleaving:
         self.gate_asks: list[tuple[str, int]] = []
         self.failures: list[str] = []
         self.committed: list[int] = []
+        self.outcomes: list[str] = []
+        self.turn_index: dict[str, int] = {}
+        self.cut_in: str | None = None
         self.stale_verdicts = 0
         self.trace: list[str] = []
         self._instrument()
@@ -3035,15 +3222,27 @@ class Interleaving:
     # -- Instrumentation ------------------------------------------------------------------------
 
     def _instrument(self) -> None:
-        """Count commits per turn, and watch each verdict for a settled claim as it is handled."""
+        """Count commits per turn, map turn ids to the responder's turns, and watch each verdict
+        for a settled claim as it is handled.
+        """
         responder = self.h.responder
         commit_turn = responder.commit_turn
+        open_turn = responder.open_turn
+        controller = self.h.controller
 
         def commit(scope, delivery):
             self.committed.append(scope.turn_index)
+            self.outcomes.append(delivery.outcome)
             return commit_turn(scope, delivery)
 
+        def opened(request):
+            # `_open_turn` has taken the turn's id, and asks the responder before it holds it.
+            scope = open_turn(request)
+            self.turn_index[f"session-1-turn-{controller._turn_seq}"] = scope.turn_index
+            return scope
+
         responder.commit_turn = commit  # type: ignore[method-assign]
+        responder.open_turn = opened  # type: ignore[method-assign]
         handlers = self.h.controller._handlers
         on_verdict = handlers[WakeVerdict]
 
@@ -3241,6 +3440,42 @@ class Interleaving:
     def _tick(self) -> str | None:
         return "advance"
 
+    def _cut_in(self) -> str | None:
+        """Her name while a turn thinks, which the next two steps grant and gate as addressed.
+
+        Random names rarely meet a turn still `thinking` and then win a grant and an addressed
+        gate decode in turn, so without this no seed superseded a turn (A51). The turn's script
+        decides whether it is superseded (no audio yet) and kept or committed (T55d).
+        """
+        if self.ingress is None or self.h.controller.phase != "thinking":
+            return None
+        self.cut_in = "grant"
+        self.h.post(
+            self.ingress.heard(
+                self.open_uid,
+                from_pos=self.rng.randint(40, 100),
+                hit_pos=self.rng.randint(100, 140),
+                arrival=float(self._now()),
+            )
+        )
+        return "NameHeard(server)"
+
+    def _cut_in_next(self) -> str | None:
+        """The cut-in's grant, then its addressed gate decode; None once neither applies."""
+        if self.cut_in == "grant":
+            waiting = [claim for claim in self.h.arbiter.claims if not claim.answered]
+            if waiting:
+                self.h.arbiter.grant(waiting[-1].claim_id)
+                self.cut_in = "gate"
+                return "WakeVerdict"
+        elif self.cut_in == "gate" and self.ingress is not None and self.gate_asks:
+            uid, through = self.gate_asks.pop(0)
+            self.h.post(self.ingress.partial(uid, "mist, and then", gate=True, through_pos=through))
+            self.cut_in = None
+            return "TranscriptPartial(gate)"
+        self.cut_in = None
+        return None
+
     # -- Running ----------------------------------------------------------------------------------
 
     async def step(self) -> None:
@@ -3256,13 +3491,15 @@ class Interleaving:
             self._playback,
             self._release,
             self._tick,
+            self._cut_in,
         ]
-        weights = [6, 2, 3, 1, 1, 1, 3, 3, 2, 3, 2]
-        for _ in range(20):
+        weights = [6, 2, 3, 1, 1, 1, 3, 3, 2, 3, 2, 4]
+        kind = self._cut_in_next() if self.cut_in is not None else None
+        attempts = 0
+        while kind is None and attempts < 20:
             kind = self.rng.choices(actions, weights)[0]()
-            if kind is not None:
-                break
-        else:
+            attempts += 1
+        if kind is None:
             kind = "advance"
         self.trace.append(kind)
         if kind == "advance":
@@ -3300,6 +3537,7 @@ class Interleaving:
                 assert call[2] not in cancelled, f"{call} after its turn's cancel_turn"
             elif call[0] == "tool_view":
                 assert call[1] not in cancelled, f"{call} after its turn's cancel_turn"
+        check_cuts(h.outbound.sent)
 
     async def finish(self) -> None:
         """Drain and stop voice, check, close, then check the end invariants."""
@@ -3339,10 +3577,29 @@ class Interleaving:
         h.outbound.take_all()
         assert h.outbound.control == []
         assert h.outbound.lane.take() is None
-        # Every shown turn was committed exactly once, and no other turn was.
+        # Every shown turn was committed exactly once, a superseded one included, and no other
+        # turn was, except a kept turn whose words a merge carried (T55d): shown, never
+        # committed, its request text leading a later request. Each superseded turn committed
+        # says `superseded`.
         commits = collections.Counter(self.committed)
         assert all(n == 1 for n in commits.values()), f"a turn committed twice: {commits}"
-        assert len(commits) == len(set(h.outbound.queued_turn_ids()))
+        shown = {self.turn_index[t] for t in set(h.outbound.queued_turn_ids())}
+        assert set(commits) <= shown, f"an unshown turn committed: {commits}, shown {shown}"
+        carried = shown - set(commits)
+        kept = {self.turn_index[t] for t in merged_turns(h.outbound.sent)}
+        assert carried <= kept, f"shown turns {carried - kept} never committed"
+        requests = h.responder.requests
+        for index in carried:
+            words = f"{requests[index].user_text} "
+            assert any(r.user_text.startswith(words) for r in requests[index + 1 :]), index
+        outcomes = collections.Counter(self.outcomes)
+        superseded = len(superseded_turns(h.outbound.sent))
+        assert outcomes["superseded"] == superseded - len(carried), f"{outcomes}"
+        SUPERSEDES[self.seed] = (
+            len(merged_turns(h.outbound.sent)),
+            superseded - len(merged_turns(h.outbound.sent)),
+            len(carried),
+        )
         # Every claim was settled exactly once.
         settles = collections.Counter(cid for cid, _ in h.arbiter.settles)
         assert settles == collections.Counter(c.claim_id for c in h.arbiter.claims)
@@ -3382,3 +3639,10 @@ async def test_the_interleavings_post_every_message_type_and_stale_verdicts():
     reached = frozenset().union(*(kinds for kinds, _ in REACHED.values()))
     assert sorted(EVERY_KIND - reached) == []
     assert sum(stale for _, stale in REACHED.values()) > 0
+    # A share of the seeds supersede a turn, kept or committed at the cut, and some merges carry
+    # a kept turn, so the end check's kept-turn branch runs.
+    kept = sum(1 for merged, _, _ in SUPERSEDES.values() if merged)
+    tool = sum(1 for _, with_tool, _ in SUPERSEDES.values() if with_tool)
+    carried = sum(1 for _, _, merges in SUPERSEDES.values() if merges)
+    print(f"\ninterleavings: seeds superseding kept={kept} with_tool={tool} carried={carried}")
+    assert kept > 0 and tool > 0 and carried > 0, (kept, tool, carried)

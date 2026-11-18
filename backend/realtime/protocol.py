@@ -764,7 +764,14 @@ class EndpointDetail(_WireModel):
 
 
 class SupersedeDetail(_WireModel):
-    """Detail of a `supersede` decision."""
+    """Detail of a `supersede` decision.
+
+    `merged` is the negation of `tool_dispatched`. With no tool dispatched, the superseded turn
+    is not recorded on its own when the utterance that superseded it starts a turn: its request
+    text leads that turn's. If that utterance starts none, the superseded turn is recorded alone.
+    The merged text is not on the wire: it joins, with one space, the `transcription`s of the
+    utterances whose words it carries.
+    """
 
     merged: bool
     tool_dispatched: bool
@@ -840,7 +847,13 @@ class OverloadDetail(_WireModel):
 
 
 class WakeLostDetail(_WireModel):
-    """Detail of a `wake_lost` decision; `utterance_id` names the utterance the lost wake opened."""
+    """Detail of a `wake_lost` decision.
+
+    `winner_score` is the accepted winner's raw spotter score and `score` the loser's; they may
+    come from different spotter models, so they are reported, not compared. `utterance_id`
+    names the utterance the lost wake opened, or a fresh id when an endpoint wake's backlog had
+    not arrived to open one.
+    """
 
     winner_score: float
     score: float
@@ -1008,7 +1021,10 @@ class VoiceDecisionOverload(_WireModel):
 class VoiceDecisionWakeLost(_WireModel):
     """Another room unit won wake arbitration; it closes the utterance it names.
 
-    That is the utterance the lost wake opened, and the message is sent only while it is open.
+    Sent once to each losing session, with reason `arbitration`, when the winner's name is
+    accepted. It names the utterance the lost wake opened, which closes with it. An endpoint
+    wake whose backlog had not arrived opened none, so it names a fresh id the client never saw
+    and can ignore. `turn_id` is the turn in flight when the name was heard, else null.
     """
 
     type: Literal["voice_decision"] = "voice_decision"
@@ -1023,14 +1039,15 @@ class VoiceDecisionWakeRejected(_WireModel):
 
     `turn_id` is the turn in flight when the name was heard, else null. `self_speech`: MIST said
     the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the
-    transcript does not address her. `lost_arbitration`: another candidate won. `no_backlog`:
-    an endpoint `wake` carried less pre-wake audio than the server's minimum.
+    transcript does not address her. `no_backlog`: an endpoint `wake` carried less pre-wake
+    audio than the server's minimum. A name that loses cross-session arbitration is not
+    rejected: it gets `wake_lost`.
     """
 
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["wake_rejected"] = "wake_rejected"
     turn_id: str | None
-    reason: Literal["self_speech", "self_media", "not_addressed", "lost_arbitration", "no_backlog"]
+    reason: Literal["self_speech", "self_media", "not_addressed", "no_backlog"]
     detail: WakeRejectedDetail
 
 

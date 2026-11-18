@@ -56,6 +56,7 @@ from backend.realtime.protocol import (
     VoiceStartMessage,
     VoiceStartPeek,
     VoiceStateMessage,
+    WakeLostDetail,
     WakeMessage,
     WakeRejectedDetail,
     decode_frame,
@@ -322,15 +323,36 @@ WAKE_REJECTED_REASONS = [
     "self_speech",
     "self_media",
     "not_addressed",
-    "lost_arbitration",
     "no_backlog",
 ]
 
 
-def test_wake_rejected_reasons_are_exactly_the_five():
+def test_wake_rejected_reasons_are_exactly_the_four():
     schema = VoiceDecisionWakeRejected.model_json_schema()
 
     assert schema["properties"]["reason"]["enum"] == WAKE_REJECTED_REASONS
+
+
+def test_wake_rejected_refuses_lost_arbitration_which_wake_lost_replaced():
+    """An arbitration loser gets `wake_lost` (A52 option A), so the rejection reason is gone."""
+    message = dict(
+        _vector_message(SERVER_VECTORS, "voice_decision_wake_rejected"), reason="lost_arbitration"
+    )
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "reason"
+
+
+def test_the_wake_rejected_reason_vector_names_the_four_reasons():
+    (vector,) = (
+        v
+        for v in CONTROL_INVALID_VECTORS
+        if v["name"].startswith("voice_decision wake_rejected: reason")
+    )
+
+    assert vector["rule"] == "wake_rejected reasons: " + ", ".join(WAKE_REJECTED_REASONS)
 
 
 @pytest.mark.parametrize("reason", WAKE_REJECTED_REASONS)
@@ -1294,6 +1316,19 @@ def test_encode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
         pytest.param(TranscriptionMessage, ("closes",), id="TranscriptionMessage"),
         pytest.param(VoiceDecisionDropped, ("closes",), id="VoiceDecisionDropped"),
         pytest.param(VoiceDecisionWakeLost, ("closes",), id="VoiceDecisionWakeLost"),
+        pytest.param(
+            VoiceDecisionWakeLost,
+            ("arbitration", "endpoint", "backlog", "fresh"),
+            id="VoiceDecisionWakeLost.fresh_id",
+        ),
+        pytest.param(
+            WakeLostDetail, ("winner_score", "fresh", "backlog"), id="WakeLostDetail.fresh_id"
+        ),
+        pytest.param(
+            VoiceDecisionWakeRejected,
+            ("self_speech", "self_media", "not_addressed", "no_backlog", "wake_lost"),
+            id="VoiceDecisionWakeRejected",
+        ),
         pytest.param(
             DegradedDetail,
             ("voiced_text", "text_from_token", "tts_failed", "rejects"),

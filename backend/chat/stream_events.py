@@ -91,9 +91,10 @@ class WSEvent(StreamEvent):
     Carries tool_call_started, tool_call_completed, cards_summon,
     cards_dismiss, graph_subgraph, and other ADR-017 discriminated events
     that originate inside the conversation pipeline. The pipeline does not
-    hold a WebSocket reference; the bridge in `knowledge_integration` and
-    `voice_processor` translates these yields into queue puts on the
-    canonical message_queue without coupling the handler to the WS layer.
+    hold a WebSocket reference; the turn controller
+    (`TurnController._on_ws_event`, `backend/realtime/turn.py`) sends each
+    payload on the turn's own session, without coupling the handler to the
+    WS layer.
 
     `payload` is the full event body including the ADR-017 `type` field;
     the bridge serializes it via json.dumps and forwards as-is.
@@ -126,10 +127,9 @@ class HandOff(StreamEvent):
     `Complete.final_response` starts with it. A consumer must treat `ack_text` as the
     text of a `Token` if it does not handle `HandOff` itself.
 
-    No emitter exists yet. Both drains in `backend/chat/knowledge_integration.py`
-    yield `Token` text and `WSEvent` payloads and nothing else from the stream,
-    so they would drop the acknowledgement; the change that adds an emitter
-    updates them.
+    No emitter exists yet (`grep -rn "HandOff(" backend` finds only this
+    class). Its consumer is `TurnController._on_handoff`
+    (`backend/realtime/turn.py`).
     """
 
     ack_text: str

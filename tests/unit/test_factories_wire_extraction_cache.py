@@ -201,9 +201,9 @@ def test_live_pipeline_degrades_gracefully_when_cache_initialization_fails(tmp_p
     """The cache's `initialize()` -- `mkdir` + `sqlite3.connect` -- is I/O that can
     fail on an unwritable or absent data root (I1, whole-branch review). Before
     this fix, that failure propagated straight out of `build_extraction_pipeline`,
-    through `build_conversation_handler`'s unguarded call site, into
-    `KnowledgeIntegration.__init__`'s outer `except Exception` -- which logs
-    "Knowledge integration disabled" and silently degrades MIST to a plain LLM:
+    through `build_conversation_handler`'s unguarded call site, into the
+    deleted threaded voice path's outer `except Exception` -- which logged
+    "Knowledge integration disabled" and silently degraded MIST to a plain LLM:
     no graph, no retrieval, no extraction, no vault. This test proves the
     pipeline itself now absorbs the failure and comes up in the SAME degraded
     mode `ExtractionPipeline` already supports on purpose: `extraction_cache`

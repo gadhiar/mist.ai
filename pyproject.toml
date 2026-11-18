@@ -200,6 +200,7 @@ markers = [
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
     "requires_vault: reads the private, gitignored mist-memory/ vault; skipped when absent",
+    "speech_models: real speech engines on the host (tests/speech_models); each test skips naming the missing weight, GPU, package or variable",
 ]
 
 [tool.coverage.run]
