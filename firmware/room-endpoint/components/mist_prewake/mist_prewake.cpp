@@ -15,23 +15,6 @@ namespace mist_prewake {
 
 static const char *const TAG = "mist_prewake";
 
-static const char *close_reason_name(mist_core::CloseReason reason) {
-  switch (reason) {
-    case mist_core::CloseReason::StateCycle:
-      return "state_cycle";
-    case mist_core::CloseReason::Decision:
-      return "voice_decision";
-    case mist_core::CloseReason::Cap:
-      return "cap";
-    case mist_core::CloseReason::Mute:
-      return "mute";
-    case mist_core::CloseReason::Disconnect:
-      return "disconnection";
-    default:
-      return "none";
-  }
-}
-
 static const char *wake_outcome_name(mist_core::WakeOutcome outcome) {
   switch (outcome) {
     case mist_core::WakeOutcome::Opened:
@@ -127,9 +110,11 @@ void MistPrewake::on_wake_word_detected(const std::string &wake_word) {
   }
   // The trigger carries no probability, so `score` is the model's cutoff (README, "wake.score").
   const float score = static_cast<float>(this->wake_model_->get_probability_cutoff()) / 255.0f;
+  const uint32_t first_seq = this->uplink_->next_seq();
   const mist_core::WakeOutcome outcome = this->uplink_->on_wake(score, millis());
   if (outcome == mist_core::WakeOutcome::Opened) {
-    ESP_LOGI(TAG, "Wake: uplink open, backlog %u ms", (unsigned) this->uplink_->last_backlog_ms());
+    ESP_LOGI(TAG, "Uplink open: wake '%s', backlog %u ms, first seq %u", wake_word.c_str(),
+             (unsigned) this->uplink_->last_backlog_ms(), (unsigned) first_seq);
   } else {
     ESP_LOGW(TAG, "Wake: uplink not opened (%s)", wake_outcome_name(outcome));
   }
@@ -137,7 +122,9 @@ void MistPrewake::on_wake_word_detected(const std::string &wake_word) {
 
 void MistPrewake::on_link_connected() {
   if (this->uplink_ != nullptr) {
+    const bool was_open = this->uplink_->is_open();
     this->uplink_->on_connected();
+    this->log_close_(was_open);
   }
 }
 
@@ -187,7 +174,7 @@ void MistPrewake::on_mute_(bool muted) {
 
 void MistPrewake::log_close_(bool was_open) {
   if (was_open && !this->uplink_->is_open()) {
-    ESP_LOGI(TAG, "Uplink closed (%s), next seq %u", close_reason_name(this->uplink_->last_close()),
+    ESP_LOGI(TAG, "Uplink closed: %s, next seq %u", this->uplink_->last_close_detail(),
              (unsigned) this->uplink_->next_seq());
   }
 }

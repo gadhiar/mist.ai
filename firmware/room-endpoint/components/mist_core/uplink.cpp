@@ -28,7 +28,7 @@ Uplink::Uplink(PcmRing& ring, UplinkSink& sink, const UplinkConfig& config)
 }
 
 void Uplink::on_connected() {
-  close(CloseReason::Disconnect);
+  close(CloseReason::Disconnect, "disconnection");
   connected_ = true;
   voice_active_ = false;
   server_muted_ = muted_;
@@ -39,7 +39,7 @@ void Uplink::on_connected() {
 }
 
 void Uplink::on_disconnected() {
-  if (open_) close(CloseReason::Disconnect);
+  if (open_) close(CloseReason::Disconnect, "disconnection");
   connected_ = false;
   voice_active_ = false;
   state_ = MistState::Idle;
@@ -51,7 +51,7 @@ void Uplink::on_voice_state(bool active) { voice_active_ = active; }
 bool Uplink::on_mute(bool muted) {
   if (muted == muted_) return true;
   muted_ = muted;
-  if (muted && open_) close(CloseReason::Mute);
+  if (muted && open_) close(CloseReason::Mute, "mute");
   ring_.clear();
   return sync_mute();
 }
@@ -73,14 +73,25 @@ void Uplink::on_state_cycle(MistState state, const char* turn_id) {
     speaking_turn_[0] = '\0';
   }
   if (open_ && (state == MistState::Speak || state == MistState::Idle)) {
-    close(CloseReason::StateCycle);
+    close(CloseReason::StateCycle,
+          state == MistState::Speak ? "state_cycle speak" : "state_cycle idle");
   }
 }
 
 void Uplink::on_voice_decision(DecisionKind kind) {
-  if (open_ && (kind == DecisionKind::WakeRejected || kind == DecisionKind::WakeLost ||
-                kind == DecisionKind::Dropped)) {
-    close(CloseReason::Decision);
+  if (!open_) return;
+  switch (kind) {
+    case DecisionKind::WakeRejected:
+      close(CloseReason::Decision, "wake_rejected");
+      break;
+    case DecisionKind::WakeLost:
+      close(CloseReason::Decision, "wake_lost");
+      break;
+    case DecisionKind::Dropped:
+      close(CloseReason::Decision, "dropped");
+      break;
+    default:
+      break;
   }
 }
 
@@ -120,7 +131,7 @@ uint32_t Uplink::pump(uint32_t now_ms, uint32_t max_frames) {
   if (!open_) return 0;
   // Unsigned subtraction keeps the cap right across the clock's wrap.
   if (now_ms - opened_at_ms_ >= config_.cap_ms) {
-    close(CloseReason::Cap);
+    close(CloseReason::Cap, "cap");
     return 0;
   }
   uint32_t sent = 0;
@@ -146,8 +157,11 @@ bool Uplink::send_pending() {
   return true;
 }
 
-void Uplink::close(CloseReason reason) {
-  if (open_) last_close_ = reason;
+void Uplink::close(CloseReason reason, const char* detail) {
+  if (open_) {
+    last_close_ = reason;
+    last_close_detail_ = detail;
+  }
   open_ = false;
   has_pending_ = false;
 }

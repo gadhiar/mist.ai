@@ -106,9 +106,13 @@ class Uplink {
   uint32_t next_seq() const { return seq_; }
   uint32_t last_backlog_ms() const { return last_backlog_ms_; }
   CloseReason last_close() const { return last_close_; }
+  // What closed the last uplink, for the device log: "state_cycle speak", "state_cycle idle",
+  // "wake_rejected", "wake_lost", "dropped", "cap", "mute" or "disconnection" ("none" before
+  // the first close). The operator commands' causes read as the spike listener's `closed_by`.
+  const char* last_close_detail() const { return last_close_detail_; }
 
  private:
-  void close(CloseReason reason);
+  void close(CloseReason reason, const char* detail);
   bool send_pending();
   // Sends `mute {active}` when the server's mute state differs from the switch's; true when they
   // agree afterwards.
@@ -129,6 +133,7 @@ class Uplink {
   uint32_t seq_ = 0;
   uint32_t last_backlog_ms_ = 0;
   CloseReason last_close_ = CloseReason::None;
+  const char* last_close_detail_ = "none";
 
   MistState state_ = MistState::Idle;
   char speaking_turn_[kIdCap] = {};
