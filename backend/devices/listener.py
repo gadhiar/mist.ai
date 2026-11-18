@@ -9,8 +9,11 @@ the forwarder's or Docker's proxy's address, so the limiter keys on the claimed 
 An accepted device gets `serve(socket, <device name>, "room")`: the backend's per-connection
 serve, which binds the session's endpoint to the device's name. A device holds one session: a
 second connection replaces the first, which is closed 4001. The registry file is re-read when it
-changes, at every attempt and every `REVOCATION_POLL_S` while a device is connected, and a
-device revoked or removed meanwhile is closed 4003.
+changes, at every attempt and every `REVOCATION_POLL_S` while a device is connected. Each live
+session keeps the `token_sha256` it was admitted with, and after every read, changed or not, a
+session whose device was removed, revoked or rotated to a new token is closed 4003. A connection
+is checked the same way as it enters the live set, so one that verified against records a read
+replaced while it was being accepted is closed then, and never replaces a current session.
 
 The listener closes a session by handing the session a disconnect through `DeviceSocket`, so the
 session ends as it does when the device leaves (its turn committed), and only then sends the
@@ -24,6 +27,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from starlette.applications import Starlette
@@ -31,7 +35,7 @@ from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from .limiter import AuthLimiter, Clock
-from .registry import DeviceRegistry, claimed_name, valid_name
+from .registry import DeviceRecord, DeviceRegistry, claimed_name, valid_name
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +44,7 @@ CLOSE_POLICY = 1008
 CLOSE_REPLACED = 4001
 CLOSE_REVOKED = 4003
 REVOCATION_POLL_S = 5.0
-"""Half the 10 s a revoked device's session may outlive its revocation."""
+"""Half the 10 s a session may outlive its device's revocation, removal or rotation."""
 REPLACE_WAIT_S = 5.0
 """How long a new connection waits for the session it replaces to end."""
 BEARER_PREFIX = "bearer "
@@ -147,6 +151,25 @@ class DeviceSocket:
             await self.close(self.ending)
 
 
+@dataclass(frozen=True, slots=True)
+class _Live:
+    """A live connection and the `token_sha256` of the record `verify` admitted it with."""
+
+    connection: DeviceSocket
+    token_sha256: str
+
+
+def _stale(record: DeviceRecord | None, admitted: str) -> str | None:
+    """Why a session admitted with the digest `admitted` may no longer run, or None if it may."""
+    if record is None:
+        return "removed"
+    if record.revoked:
+        return "revoked"
+    if record.token_sha256 != admitted:
+        return "rotated"
+    return None
+
+
 def _bearer(header: str | None) -> str | None:
     if header is None or not header.lower().startswith(BEARER_PREFIX):
         return None
@@ -181,7 +204,7 @@ class DeviceApp(Starlette):
         self._serve = serve
         self._limiter = limiter
         self._clock = clock
-        self._live: dict[str, DeviceSocket] = {}
+        self._live: dict[str, _Live] = {}
         self._watch: asyncio.Task[None] | None = None
 
     def connected(self) -> list[str]:
@@ -207,7 +230,7 @@ class DeviceApp(Starlette):
             await self._refuse(websocket, device_id, peer, self._reason(bearer, device_id))
             return
         await websocket.accept()
-        await self._serve_device(websocket, record.name)
+        await self._serve_device(websocket, record)
 
     def _reason(self, bearer: str | None, device_id: str | None) -> str:
         if bearer is None:
@@ -228,15 +251,23 @@ class DeviceApp(Starlette):
         )
         await websocket.close(code=CLOSE_POLICY)
 
-    async def _serve_device(self, websocket: WebSocket, name: str) -> None:
+    async def _serve_device(self, websocket: WebSocket, admitted: DeviceRecord) -> None:
+        name = admitted.name
         connection = DeviceSocket(websocket)
+        # `accept` awaited since `verify`, so a read may have replaced the records meanwhile.
+        reason = _stale(self._current().get(name), admitted.token_sha256)
+        if reason is not None:
+            self._close_stale(name, connection, reason)
+            await connection.finish()
+            return
+        live = _Live(connection, admitted.token_sha256)
         previous = self._live.get(name)
-        self._live[name] = connection
+        self._live[name] = live
         if previous is not None:
             logger.info("device_replaced device=%s", name)
-            previous.end(CLOSE_REPLACED)
+            previous.connection.end(CLOSE_REPLACED)
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(previous.done.wait(), timeout=REPLACE_WAIT_S)
+                await asyncio.wait_for(previous.connection.done.wait(), timeout=REPLACE_WAIT_S)
         logger.info("device_connected device=%s", name)
         self._ensure_watch()
         connection.start()
@@ -244,7 +275,7 @@ class DeviceApp(Starlette):
             await self._serve(connection, name, "room")
         finally:
             await connection.finish()
-            if self._live.get(name) is connection:
+            if self._live.get(name) is live:
                 del self._live[name]
             connection.done.set()
             logger.info("device_disconnected device=%s code=%s", name, connection.close_code)
@@ -252,18 +283,30 @@ class DeviceApp(Starlette):
                 self._watch.cancel()
                 self._watch = None
 
-    # -- Revocation ------------------------------------------------------------------------
+    # -- Revocation, removal and rotation --------------------------------------------------
+
+    def _current(self) -> dict[str, DeviceRecord]:
+        return {record.name: record for record in self._registry.devices()}
 
     def _reload(self) -> None:
-        if self._registry.reload_if_changed():
-            self._close_revoked()
+        # Checked whether or not this read found a change, so closing a session never depends
+        # on which read saw the change first.
+        self._registry.reload_if_changed()
+        self._check_live()
 
-    def _close_revoked(self) -> None:
-        admitted = {record.name for record in self._registry.devices() if not record.revoked}
-        for name, connection in list(self._live.items()):
-            if name not in admitted and connection.ending is None:
-                logger.warning("device_revoked_closed device=%s", name)
-                connection.end(CLOSE_REVOKED)
+    def _check_live(self) -> None:
+        current = self._current()
+        for name, live in list(self._live.items()):
+            if live.connection.ending is not None:
+                continue
+            reason = _stale(current.get(name), live.token_sha256)
+            if reason is not None:
+                self._close_stale(name, live.connection, reason)
+
+    @staticmethod
+    def _close_stale(name: str, connection: DeviceSocket, reason: str) -> None:
+        logger.warning("device_revoked_closed device=%s reason=%s", name, reason)
+        connection.end(CLOSE_REVOKED)
 
     def _ensure_watch(self) -> None:
         if self._watch is None or self._watch.done():

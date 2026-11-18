@@ -854,9 +854,12 @@ python scripts/daily/devices.py cert --ip <new-pc-lan-ip>
 - `devices.py add` registers a device and writes its token, the server address and port, and
   `mist_ca.pem` into the private directory's `secrets.yaml`, for the device's firmware build.
   The token is never printed; the registry keeps only its sha256.
-- `devices.py revoke` refuses the device from the next registry reload on; the backend re-reads
-  the file when it changes.
-- `devices.py rotate` gives a device a new token; reflash it from the private directory.
+- `devices.py revoke` refuses the device from the next registry reload on, and closes its live
+  session within 10 s; the backend re-reads the file when it changes.
+- `devices.py rotate` gives a device a new token, and closes a live session still on the old one
+  within 10 s; reflash it from the private directory. Until then the device is refused at each
+  retry, and five refusals in 60 s block its name for 300 s, so a device reflashed at once can
+  wait up to 5 minutes to connect.
 - `devices.py cert` reissues the server certificate when the PC's address changes; devices keep
   their `mist_ca.pem`.
 

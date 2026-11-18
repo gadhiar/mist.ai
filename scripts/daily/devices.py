@@ -619,8 +619,9 @@ def cmd_revoke(args: argparse.Namespace, ctx: Context) -> None:
 def cmd_rotate(args: argparse.Namespace, ctx: Context) -> None:
     """Give a device a new token; the backend refuses the old one from its next registry read.
 
-    That holds for new connections only: rotating closes no session, so one already open on the
-    old token stays open. A connection on the new token replaces it.
+    A session still open on the old token is closed (4003) within 10 s, by the listener's next
+    registry read, or sooner by a connection on the new token. The device is then refused until
+    it is reflashed with the new token.
     """
     device_dir = _device_dir(args, ctx)
     ca_dir = _ca_dir(args, ctx) if args.ca_dir or ctx.environ.get("MIST_DAILY_ROOT") else None
@@ -645,7 +646,10 @@ def cmd_rotate(args: argparse.Namespace, ctx: Context) -> None:
             f"wrote the new token to {out / SECRETS_FILE}, but the registry write stopped at "
             f"{exc}: the registry still holds the old one; run rotate again"
         ) from exc
-    print(f"rotated {args.name}'s token; reflash the device from {out / SECRETS_FILE}")
+    print(
+        f"rotated {args.name}'s token; a session still on the old one is closed within 10 s; "
+        f"reflash the device from {out / SECRETS_FILE}"
+    )
 
 
 def cmd_cert(args: argparse.Namespace, ctx: Context) -> None:
