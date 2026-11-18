@@ -17,7 +17,7 @@ import logging
 import os
 import random
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,7 +37,7 @@ from backend.capabilities.alarms.capability import (
     UserZone,
 )
 from backend.capabilities.alarms.records import AlarmRecords
-from backend.capabilities.alarms.ringing import DesktopSink, RingRouter
+from backend.capabilities.alarms.ringing import DesktopSink, RingRouter, RingSink
 from backend.capabilities.alarms.scheduler import AlarmScheduler
 from backend.capabilities.clock import Clock
 from backend.capabilities.config import CapabilitiesConfig
@@ -1602,6 +1602,7 @@ def build_capability_host(
     tiers: TierProviders,
     register: ReplyRegister,
     desktop_present: Callable[[], bool],
+    ring_sinks: Sequence[RingSink] = (),
 ) -> CapabilityBuild:
     """Assemble the capabilities named in `MIST_CAPABILITIES` behind one `CapabilityHost`.
 
@@ -1613,9 +1614,9 @@ def build_capability_host(
     failing the build.
 
     Alarms and timers share one store, one scheduler and one `RingingTracker`, which wraps the
-    `RingRouter` that rings the desktop endpoint, and the host's `SchedulerAlarmControl` runs
-    over the same three. Without a usable `MIST_TIMEZONE` none of them is built, and alarms,
-    timers and the clock report the zone's reason.
+    `RingRouter` that rings the desktop endpoint and then each of `ring_sinks`, and the host's
+    `SchedulerAlarmControl` runs over the same three. Without a usable `MIST_TIMEZONE` none of
+    them is built, and alarms, timers and the clock report the zone's reason.
 
     Args:
         config: The parsed capability environment.
@@ -1632,6 +1633,8 @@ def build_capability_host(
         tiers: Whose `interaction` provider gates the action decode.
         register: The address form of each session's first templated reply.
         desktop_present: Whether a client is connected, for the desktop ring endpoint.
+        ring_sinks: The other ring endpoints, one per room device, rung after the desktop and
+            listed by name for `ring_on`; none rings the desktop only.
 
     Returns:
         A build with a host and no reason, or no host and the reason.
@@ -1668,7 +1671,7 @@ def build_capability_host(
     alarm_control: SchedulerAlarmControl | None = None
     endpoints: Callable[[], tuple[str, ...]] = tuple
     if zone is not None and zone.tz is not None and names & {"alarms", "timers"}:
-        sinks = [DesktopSink(event_sink, desktop_present)]
+        sinks: list[RingSink] = [DesktopSink(event_sink, desktop_present), *ring_sinks]
         ring_router = RingRouter(sinks, records, clock, config.alarms, zone.tz)
         tracker = RingingTracker(ring_router)
         scheduler = AlarmScheduler(records, clock, tracker, config.alarms, zone.tz)
