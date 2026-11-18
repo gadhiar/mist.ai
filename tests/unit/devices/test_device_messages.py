@@ -1,4 +1,4 @@
-"""A device token's session takes the device's message types only, end to end.
+"""A device token's session takes and is sent the device's message types only, end to end.
 
 The device authenticates on the real `DeviceApp`, whose serve is the server's own
 `_serve_session`, so its connection is a `RealtimeSession` bound to the device's name with kind
@@ -8,12 +8,15 @@ over a scripted alarm control, which records the endpoint each alarm action name
 
 What these pin: a type the device never sends is refused with a protocol error and changes
 nothing, not the turns, the log stream's gate or a proposal, and the session goes on to take the
-device's own types.
+device's own types. Going out, the device is sent only the types it acts on: another session's
+proposal, the capabilities status and the heartbeat are withheld, its alarms are not.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 from pathlib import Path
 
@@ -31,6 +34,7 @@ from tests.unit.realtime.turn_fakes import settle
 from tests.unit.test_server_capability_messages import DecidingHandler
 from tests.unit.test_server_capability_messages import Rig as CapabilityRig
 from tests.unit.test_session_id_propagation import (  # noqa: F401 -- autouse fixtures
+    connect,
     drain_capability_calls,
     install_runtime,
     no_runtime,
@@ -114,7 +118,12 @@ async def deliver(device: DeviceClient, message: dict[str, object]) -> None:
 
 
 def stop_alarm(request_id: str) -> dict[str, object]:
-    return {"type": "alarm_action", "alarm_id": "a-ringing", "action": "stop", "request_id": request_id}
+    return {
+        "type": "alarm_action",
+        "alarm_id": "a-ringing",
+        "action": "stop",
+        "request_id": request_id,
+    }
 
 
 @pytest.mark.parametrize("message_type", sorted(REFUSED))
@@ -147,6 +156,35 @@ async def test_a_device_token_cannot_send_a_type_the_device_does_not(
     await deliver(device, stop_alarm("after-refusal"))
     (result,) = device.of_type("alarm_action_result")
     assert (result["request_id"], result["outcome"]) == ("after-refusal", "ok")
+
+
+async def test_a_device_is_sent_no_proposal_status_or_heartbeat_and_still_its_alarms(device):
+    from backend import server
+
+    desktop = await connect()
+    proposal = {
+        "type": "action_proposed",
+        "proposal_id": "p1",
+        "session_id": desktop.ws.handshake_session_id,
+        "summary": "turn the lights off",
+        "calls": [],
+        "expires_at": "2026-01-05T07:05:00Z",
+    }
+    # As the broadcaster drains `message_queue`: the desktop's proposal and a heartbeat.
+    await server.message_queue.put(json.dumps(proposal))
+    await server.message_queue.put(json.dumps({"type": "heartbeat", "timestamp": 1}))
+    broadcaster = asyncio.get_running_loop().create_task(server.broadcast_messages())
+    await server.message_queue.join()
+    await settle()
+    broadcaster.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await broadcaster
+    await desktop.leave()
+
+    desktop_types = [frame["type"] for frame in desktop.ws.frames]
+    assert {"capabilities_status", "action_proposed", "heartbeat"} <= set(desktop_types)
+    device_types = [message["type"] for message in device.messages()]
+    assert device_types == ["session_started", "alarm_state"]
 
 
 async def test_a_device_alarm_action_reaches_the_host_with_the_devices_name(host, device):

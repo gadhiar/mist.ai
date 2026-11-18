@@ -22,6 +22,15 @@ before dispatch, with a throttled protocol error naming `type`, a `room_message_
 once per type, and a count in `refused_messages`; it reaches no turn, no log subscription, no log
 gate and no proposal. Every `0x11` frame is dropped and counted in `dropped_references`.
 
+Going out, a `room` session's socket carries binary frames and only the text types its device
+acts on (`ROOM_SERVER_MESSAGE_TYPES`). The sender checks each text item's `type` as it writes
+it, after the lanes, so broadcasts, targeted sends and the session's own items are all held to
+the set, while lane order, bounds and fences stay as they are: a withheld `turn` item still moves
+its lane on. Every other item, one with no readable `type` included, is withheld, counted in
+`withheld`, and logged `room_message_withheld` at DEBUG once per type. Another session's
+proposals, the capabilities and system status, the heartbeat, and a turn's tokens, transcripts
+and metrics never reach the device.
+
 A `control` item may carry a fence, a `TurnLane` mark, and waits until the lane has passed it.
 The newest waiting fence is the largest fence on `control` the lane has not passed yet. Three
 rules set a fence (A53):
@@ -77,6 +86,7 @@ from .playback import LaneFull, LanePurge, MonotonicPlaybackClock, PlaybackClock
 from .power import PowerGate, PowerGatedResponder, SynthesizerSlot, TranscriberSlot
 from .protocol import (
     ROOM_CLIENT_MESSAGE_TYPES,
+    ROOM_SERVER_MESSAGE_TYPES,
     ActionDecisionMessage,
     AlarmActionMessage,
     AlarmReportMessage,
@@ -333,7 +343,8 @@ class RealtimeSession:
         endpoint_kind: What kind of endpoint it is, which picks the spotter calibration and is
             what a `voice_start`'s advisory `endpoint` is compared with: one naming another kind
             is logged and the bound one kept. A `room` session also accepts only the device's
-            message types (`ROOM_CLIENT_MESSAGE_TYPES`) and no `0x11` frame. None: `desktop`
+            message types (`ROOM_CLIENT_MESSAGE_TYPES`) and no `0x11` frame, and is sent only
+            the types it acts on (`ROOM_SERVER_MESSAGE_TYPES`) and binary frames. None: `desktop`
             for the `desktop` endpoint and `room` for any other, so a session bound to a device
             is never given the desktop's types by omission.
         services: What every session shares.
@@ -390,6 +401,8 @@ class RealtimeSession:
         self._gpu_yield_logged = False
         self.refused_messages = 0
         self._refused_types: set[str] = set()
+        self.withheld = 0
+        self._withheld_types: set[str | None] = set()
 
         self._activity = False
         self._activity_check: asyncio.Handle | None = None
@@ -665,14 +678,53 @@ class RealtimeSession:
             await self._write(item)
 
     async def _write(self, item: object) -> None:
+        """Send one item the lanes gave up; a `room` session is sent only what its device reads.
+
+        The check runs here, after the lanes, so a withheld item has already moved its lane on
+        and a fence behind it passes as if it had been sent.
+        """
         if isinstance(item, Frame):
             await self._socket.send_bytes(encode_frame(item))
-        elif isinstance(item, BaseModel):
+            return
+        if self.endpoint_kind != "desktop":
+            message_type = self._type_of(item)
+            if message_type not in ROOM_SERVER_MESSAGE_TYPES:
+                self._withhold(message_type)
+                return
+        if isinstance(item, BaseModel):
             await self._socket.send_text(item.model_dump_json())
         elif isinstance(item, str):
             await self._socket.send_text(item)
         else:
             await self._socket.send_text(json.dumps(item))
+
+    @staticmethod
+    def _type_of(item: object) -> str | None:
+        """A text item's `type`: a model's field, a mapping's key, or a JSON string's key.
+
+        None when it has none that is a string, an unparsable string included, so the caller
+        withholds it: an item whose type cannot be read is not one the device reads.
+        """
+        if isinstance(item, BaseModel):
+            message_type = getattr(item, "type", None)
+        elif isinstance(item, Mapping):
+            message_type = item.get("type")
+        elif isinstance(item, str):
+            try:
+                data = json.loads(item)
+            except (ValueError, RecursionError):
+                return None
+            message_type = data.get("type") if isinstance(data, dict) else None
+        else:
+            return None
+        return message_type if isinstance(message_type, str) else None
+
+    def _withhold(self, message_type: str | None) -> None:
+        """Count an item a `room` session is not sent, and log its type once per session."""
+        self.withheld += 1
+        if message_type not in self._withheld_types:
+            self._withheld_types.add(message_type)
+            logger.debug("room_message_withheld session=%s type=%s", self.session_id, message_type)
 
     # -- Voice activity ------------------------------------------------------------------------
 
