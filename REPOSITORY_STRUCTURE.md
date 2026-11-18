@@ -33,10 +33,11 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
 - `render_character.py` - Renders one WAV through the character stage, as the realtime downlink would play it
-- `wake/` - Tools for MIST's wake model: the guided recorder, the recording manifest check and the evaluation harness
+- `wake/` - Tools for MIST's wake model: the guided recorder, the recording manifest check and the evaluation harnesses
   - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
   - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
   - `record.py` - The guided host-side recorder for one headset sitting: 16 kHz clips and their draft manifest entries
+  - `spotter_eval.py` - The server spotter's pass bar: tune positives and false wakes per hour over an ambient set, written as the converter's evaluation
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
