@@ -17,7 +17,9 @@ does not start with `test_`, so pytest does not collect it. Each test file impor
 - `RecordingIngress`: the controller's levers on ingress, recorded, and builders for the events
   ingress emits, numbered by epoch and `event_seq`.
 - `FakeResponder`: scripted turn streams; records requests, prefetches, commits and closes. A
-  `WaitGate` step waits on the scope's dispatch gate, as the handler does before a tool.
+  `WaitGate` step waits on the scope's dispatch gate, as the handler does before a tool. Its
+  capability-only path records each call and returns the next scripted result, None without one.
+- `FakeAlarm`: the controller's `alarm_ringing`, which a test rings and stops by hand.
 - `FakeHost`: a `ReconfigureHost` that records its answers.
 - `FakeWakeArbiter`: a `WakeArbitration` whose verdicts a test grants or denies by hand.
 - `FakeCallLater`: the loop's `call_later` for a real `WakeArbiter`: it records each timer, and
@@ -34,10 +36,11 @@ import itertools
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
+from backend.chat.conversation_handler import CapabilityOnlyTurn
 from backend.chat.stream_events import StreamEvent, Token, WSEvent
 from backend.chat.turn_scope import CommitResult, TurnDelivery, TurnRequest, TurnScope
 from backend.realtime.addressee import AddresseeGate
-from backend.realtime.bargein import KeywordBargeIn
+from backend.realtime.bargein import AecMode, KeywordBargeIn
 from backend.realtime.budget import (
     BUDGET_PRESETS,
     BargeInConfig,
@@ -634,6 +637,9 @@ class FakeResponder:
         self.commit_times: list[int] = []
         self.log: list[str] = []
         self.closed: list[int] = []
+        self.capability_results: list[CapabilityOnlyTurn | None] = []
+        self.capability_calls: list[tuple[str, str]] = []
+        self.on_capability: Callable[[str], None] | None = None
 
     def add(self, *steps: ScriptStep) -> None:
         self.scripts.append(list(steps))
@@ -684,6 +690,27 @@ class FakeResponder:
 
     def prefetch(self, session_id: str, partial_text: str | None) -> None:
         self.prefetches.append((session_id, partial_text))
+
+    async def handle_capability_only(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
+        """Record the call, run `on_capability` (a capability's effect), return the next result."""
+        self.capability_calls.append((text, session_id))
+        self.log.append(f"capability:{text}")
+        if self.on_capability is not None:
+            self.on_capability(text)
+        return self.capability_results.pop(0) if self.capability_results else None
+
+
+class FakeAlarm:
+    """The controller's `alarm_ringing`: rings until a test, or a fake capability, stops it."""
+
+    def __init__(self, *, ringing: bool = True) -> None:
+        self.ringing = ringing
+
+    def __call__(self) -> bool:
+        return self.ringing
+
+    def stop(self) -> None:
+        self.ringing = False
 
 
 # -- Host and arbiter ------------------------------------------------------------------------
@@ -779,13 +806,13 @@ def floor_placement() -> TurnPlacement:
     return TurnPlacement(mode="primary", stt="cuda:0", tts="cuda:0", budget=BUDGET_PRESETS["floor"])
 
 
-def voice_settings(*, playback: bool = True) -> VoiceStartMessage:
+def voice_settings(*, playback: bool = True, aec: AecMode = "headset") -> VoiceStartMessage:
     return VoiceStartMessage(
         req=1,
         mode="wake",
         sample_rate=16000,
         frame_ms=20,
-        aec="headset",
+        aec=aec,
         playback=playback,
         endpoint="desktop",
         spotter="server",
@@ -811,6 +838,7 @@ class Harness:
     ids: IdCounter
     policy: KeywordBargeIn
     kwargs: dict[str, object]
+    aec: AecMode = "headset"
 
     @property
     def lane(self) -> InlineLane:
@@ -830,7 +858,7 @@ class Harness:
             VoiceStart(
                 ingress=self.ingress,  # type: ignore[arg-type]
                 policy=self.policy,
-                settings=voice_settings(playback=playback),
+                settings=voice_settings(playback=playback, aec=self.aec),
                 epoch=self.ingress.epoch,
             )
         )
@@ -886,6 +914,8 @@ def make_harness(
     arbiter: WakeArbitration | None = None,
     session_id: str = "session-1",
     id_prefix: str = "u",
+    aec: AecMode = "headset",
+    alarm_ringing: Callable[[], bool] | None = None,
 ) -> Harness:
     """A controller wired to every fake; `synthesizer=False` builds one with no TTS.
 
@@ -911,7 +941,14 @@ def make_harness(
     host = FakeHost()
     wake_config = wake or WakeConfig()
     barge = barge_in or BargeInConfig(arm_delay_ms=0)
-    policy = KeywordBargeIn(barge, aec="headset", recent_tts_text=lambda _ms: "", clock=clock)
+    built: list[TurnController] = []
+    # The session's wiring: the policy's echo guard reads the controller's played text.
+    policy = KeywordBargeIn(
+        barge,
+        aec=aec,
+        recent_tts_text=lambda ms: built[0].recent_tts_text(ms),
+        clock=clock,
+    )
     kwargs: dict[str, object] = {
         "session_id": session_id,
         "responder": responder,
@@ -935,7 +972,10 @@ def make_harness(
         "turn_config": turn_config or TurnConfig(),
         "barge_in_config": barge,
     }
+    if alarm_ringing is not None:
+        kwargs["alarm_ringing"] = alarm_ringing
     controller = TurnController(**kwargs)  # type: ignore[arg-type]
+    built.append(controller)
     if start:
         controller.start()
     LIVE_CONTROLLERS.append(controller)
@@ -952,4 +992,5 @@ def make_harness(
         ids=ids,
         policy=policy,
         kwargs=kwargs,
+        aec=aec,
     )
