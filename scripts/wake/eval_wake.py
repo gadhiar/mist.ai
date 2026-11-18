@@ -3,7 +3,7 @@
 A wake model is judged end to end, by what reaches a verdict, not by its raw scores: a name hit
 the gate rejects costs nothing but a cue, and a hit it accepts on a film is a false wake. So
 each recording runs through an offline driver of the live path: the VAD opens speech segments
-and feeds the spotter from each onset as ingress does (`backend/realtime/ingress.py`); every hit
+and the spotter is fed every frame as ingress feeds it (`backend/realtime/ingress.py`); every hit
 passes the gate's pre-decode checks, with the PC's own output scored when the entry has a
 reference; the gate decode runs through the `StreamingTranscriber` contract; and `decide` reads
 its text.
@@ -69,8 +69,8 @@ from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
     VAD_WINDOW_SAMPLES,
     SpeechSegmentTracker,
-    onset_feed_start,
     onset_lead_frames,
+    spotter_feed,
 )
 from backend.realtime.speech import (
     CancelToken,
@@ -153,10 +153,14 @@ def positive_quantile_table(
 
 @dataclass(frozen=True, slots=True)
 class _Feed:
-    """Frames the spotter scores in one go, after a context reset when `reset` is set."""
+    """Frames one `spotter_feed` call releases: `warm` scored silently, then `push` reported.
 
-    reset: bool
-    positions: tuple[int, ...]
+    The harness never resets the stream: it has no mute and no backlog, the only causes of a
+    reset in ingress, and each recording gets a stream of its own.
+    """
+
+    warm: tuple[int, ...]
+    push: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,10 +179,11 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
     """Segment one recording and decide which frames reach the spotter, as ingress does.
 
     Each VAD window at or above `vad_threshold` is speech, and ingress's own
-    `SpeechSegmentTracker` turns the windows into segments. When one opens, the spotter gets a
-    fresh context and the frames from `onset_feed_start`, then every frame after it while the
-    segment is open. Ingress feeds the spotter only during speech, so audio it never scores live
-    is not scored here either.
+    `SpeechSegmentTracker` turns the windows into segments. After each frame, as ingress does
+    once it routes a frame, `spotter_feed` releases the frames the spotter scores next: every
+    frame of the recording once and in order, a segment and its pre-roll pushed and the rest
+    warmed. Frames still waiting when the recording ends, which an onset could yet have made
+    pre-roll, are not scored, as ingress would not have scored them yet.
     """
     usable = len(pcm) // FRAME_BYTES * FRAME_BYTES
     frames = tuple(pcm[start : start + FRAME_BYTES] for start in range(0, usable, FRAME_BYTES))
@@ -186,17 +191,10 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
     stream = vad.open_stream()
     tracker = SpeechSegmentTracker(cfg)
     lead = onset_lead_frames(cfg)
-    feeds: list[tuple[bool, list[int]]] = []
+    feeds: list[_Feed] = []
     segments: list[tuple[int, int]] = []
     window = 0
-    fed: int | None = None
-    reset_pending = False
-
-    def feed(positions: range, reset: bool) -> None:
-        if not reset and feeds and feeds[-1][1][-1] == positions[0] - 1:
-            feeds[-1][1].extend(positions)
-        else:
-            feeds.append((reset, list(positions)))
+    next_pos = 0
 
     for pos in range(len(frames)):
         while (window + 1) * VAD_WINDOW_SAMPLES <= (pos + 1) * FRAME_SAMPLES:
@@ -208,25 +206,23 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
             step = tracker.window(speech, first, last)
             if step.closed is not None:
                 segments.append(step.closed)
-            if step.started is not None:
-                reset_pending = True
-                # Ingress feeds what its ring holds; here that is the recording's own frames.
-                begin = max(onset_feed_start(step.started[0], lead, fed), 0)
-                if begin <= pos:
-                    feed(range(begin, pos + 1), True)
-                    reset_pending = False
-                    fed = pos
-        if tracker.open_segment is not None and (fed is None or pos > fed):
-            feed(range(pos, pos + 1), reset_pending)
-            reset_pending = False
-            fed = pos
+        # The first frame the VAD has not scored: the one holding the next window's first
+        # sample, which is what ingress's `_vad_from` names.
+        next_unscored = window * VAD_WINDOW_SAMPLES // FRAME_SAMPLES
+        segment = tracker.open_segment
+        released = spotter_feed(
+            next_pos,
+            pos,
+            segment[0] if segment is not None else None,
+            tracker.earliest_onset(next_unscored),
+            lead,
+        )
+        if released.end > next_pos:
+            feeds.append(_Feed(warm=tuple(released.warm), push=tuple(released.push)))
+            next_pos = released.end
     if tracker.open_segment is not None:
         segments.append(tracker.open_segment)
-    return _Heard(
-        frames=frames,
-        feeds=tuple(_Feed(reset, tuple(positions)) for reset, positions in feeds),
-        segments=tuple(segments),
-    )
+    return _Heard(frames=frames, feeds=tuple(feeds), segments=tuple(segments))
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,9 +309,9 @@ class _Driver:
         stream = self._engines.spotter.open_stream(threshold)
         results: list[_HitResult] = []
         for batch in heard.feeds:
-            if batch.reset:
-                stream.reset()
-            for position in batch.positions:
+            for position in batch.warm:
+                stream.warm(heard.frames[position], offset + position)
+            for position in batch.push:
                 arrival = self._clock()
                 for found in stream.push(heard.frames[position], offset + position):
                     results.append(

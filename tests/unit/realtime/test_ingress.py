@@ -23,6 +23,7 @@ from backend.realtime import ingress as ingress_module
 from backend.realtime.budget import EndpointingConfig, TurnConfig, WakeConfig
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
+    KWS_BACKLOG_FRAMES,
     AudioIngress,
     ControllerDropReason,
     DropReason,
@@ -31,18 +32,20 @@ from backend.realtime.ingress import (
     IngressLanes,
     IngressOverload,
     IngressSeed,
+    IngressStats,
     NameHeard,
     OpenedUtterance,
     SegmentStep,
     SpeechResumed,
     SpeechSegmentTracker,
     SpeechStarted,
+    SpotterFeed,
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
-    onset_feed_start,
     onset_lead_frames,
     ring_retention_ms,
+    spotter_feed,
 )
 from backend.realtime.lanes import InferenceLane, LaneJobCancelled
 from backend.realtime.protocol import Frame, MsgType
@@ -51,6 +54,7 @@ from tests.fakes.scripted_audio import scripted_audio, silence, speech_burst, to
 from tests.fakes.speech import (
     EnergyVad,
     ScriptedNameSpotter,
+    ScriptedNameSpotterStream,
     ScriptedTranscriber,
     ScriptedTranscriptStream,
     ScriptedTurnEnd,
@@ -1305,17 +1309,226 @@ class TestNameHeard:
         assert rig.of(NameHeard) == []
         assert spotter.streams == [] or spotter.streams[0].pushed == []
 
+
+class LoggedStream(ScriptedNameSpotterStream):
+    """A scripted stream that also logs its calls in order, so warm, push and reset interleave."""
+
+    def __init__(self, hits: Sequence[NameHit], threshold: float, log: list) -> None:
+        super().__init__(hits, threshold)
+        self.log = log
+
+    def push(self, pcm: bytes, pos: int) -> list[NameHit]:
+        self.log.append(("push", pos))
+        return super().push(pcm, pos)
+
+    def warm(self, pcm: bytes, pos: int) -> None:
+        self.log.append(("warm", pos))
+        super().warm(pcm, pos)
+
+    def reset(self, *, warm_up: bool = True) -> None:
+        self.log.append(("reset", warm_up))
+        super().reset(warm_up=warm_up)
+
+
+class LoggedSpotter(ScriptedNameSpotter):
+    """A scripted spotter whose streams share one ordered log of their calls."""
+
+    def __init__(self, hits: Sequence[NameHit] = ()) -> None:
+        super().__init__(hits)
+        self.log: list[tuple[str, object]] = []
+
+    def open_stream(self, threshold: float) -> LoggedStream:
+        stream = LoggedStream(self.hits, threshold, self.log)
+        self.streams.append(stream)
+        return stream
+
+
+def fed_positions(log: Sequence[tuple[str, object]]) -> list[int]:
+    """Every position warmed or pushed, in the order the spotter was fed them."""
+    return [typing.cast(int, pos) for kind, pos in log if kind != "reset"]
+
+
+class TestTheSpotterFeed:
+    """Ingress feeds the spotter every frame once and in order, reporting only from speech."""
+
     @pytest.mark.asyncio
-    async def test_a_spotter_job_that_misses_its_hop_is_skipped_and_reported_on_kws(self):
-        rig = Rig(engaged=False, spotter=ScriptedNameSpotter())
-        rig.lanes.kws.holding = True
+    async def test_frames_between_two_segments_are_warmed_with_no_reset(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+
         await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(1600)
+        await rig.speak(640)
+        await rig.quiet(400)
+
+        (stream,) = spotter.streams
+        assert stream.resets == 0
+        fed = fed_positions(spotter.log)
+        assert fed == list(range(len(fed)))
+        assert len(fed) > 176
+        second = 144
+        assert set(range(32 - PRE_ROLL, 64)) <= set(stream.pushed)
+        assert set(range(80, second - PRE_ROLL)) <= set(stream.warmed)
+        assert set(range(second - PRE_ROLL, second + 32)) <= set(stream.pushed)
+
+    @pytest.mark.asyncio
+    async def test_the_pre_roll_is_pushed_never_warmed_though_the_vad_scored_it_first(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        # Frames 32 to 35 are scored as two speech windows: a run, not yet a segment.
+        await rig.speak(80)
+        (stream,) = spotter.streams
+        assert stream.warmed == list(range(32 - PRE_ROLL))
+        assert stream.pushed == []
+
+        # Frame 36 completes the third window, and the segment opens at frame 32.
+        await rig.speak(20)
+
+        assert stream.warmed == list(range(32 - PRE_ROLL))
+        assert stream.pushed == list(range(32 - PRE_ROLL, 37))
+
+    @pytest.mark.asyncio
+    async def test_a_scripted_hit_on_a_warmed_frame_is_not_reported(self):
+        spotter = LoggedSpotter([hit_at(5)])
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(640)
+
+        assert 5 in spotter.streams[0].warmed
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_a_mute_resets_the_stream_and_no_frame_from_before_it_is_fed_after_it(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+
+        rig.ingress.set_muted(True)
+        await rig.quiet(200)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+        await rig.quiet(640)
+
+        log = spotter.log
+        assert [entry for entry in log if entry[0] == "reset"] == [("reset", True)]
+        reset_at = log.index(("reset", True))
+        before = fed_positions(log[:reset_at])
+        after = fed_positions(log[reset_at + 1 :])
+        assert before == list(range(32 - PRE_ROLL))
+        assert after and after == list(range(unmuted_at, unmuted_at + len(after)))
+        assert len(spotter.streams) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hit_from_a_job_that_ran_across_a_mute_and_a_short_unmute_is_dropped(self):
+        spotter = LoggedSpotter([hit_at(48)])
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        await rig.speak(320)
+        rig.lanes.kws.holding = True
+        await rig.speak(20)
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        rig.lanes.kws.release()
+        await settle()
+
+        assert 48 in spotter.streams[0].pushed
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_frames_the_vad_queue_dropped_are_fed(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        for _ in range(150):
+            await rig.quiet(20, settle_after=False)
+        await settle(500)
+
+        await rig.quiet(640)
+
+        assert rig.ingress.stats().queue_dropped_frames == 50
+        fed = fed_positions(spotter.log)
+        assert fed[:60] == list(range(60))
+
+    @pytest.mark.asyncio
+    async def test_frames_that_arrive_during_a_slow_job_are_fed_by_the_next_job(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        await rig.speak(320)
+        jobs = len(rig.lanes.kws.submitted)
+        rig.lanes.kws.holding = True
+
+        await rig.speak(100)
+        rig.lanes.kws.release()
+        await settle()
+
+        assert spotter.streams[0].pushed[-5:] == [48, 49, 50, 51, 52]
+        assert len(rig.lanes.kws.submitted) - jobs == 2
+        assert rig.ingress.stats().skipped_kws_hops == 0
+        assert rig.of(IngressOverload) == []
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_past_the_bound_drops_the_oldest_resets_cold_and_reports_once(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        await rig.speak(320)
+        rig.lanes.kws.holding = True
+        await rig.speak(20)
+
+        await rig.speak((KWS_BACKLOG_FRAMES + 10) * FRAME_MS)
+        rig.lanes.kws.release()
+        await settle()
+
+        assert rig.ingress.stats().skipped_kws_hops == 10
+        (overload,) = rig.of(IngressOverload)
+        assert (overload.lane, overload.dropped_ms) == ("kws", FRAME_MS)
+        log = spotter.log
+        reset_at = log.index(("reset", False))
+        assert log[reset_at - 1] == ("push", 48)
+        assert log[reset_at + 1 :] == [("push", pos) for pos in range(59, 109)]
+        fed = fed_positions(log)
+        assert fed == sorted(set(fed))
+        assert not set(range(49, 59)) & set(fed)
+
+    @pytest.mark.parametrize(("floor", "first"), [(0, 83 - PRE_ROLL), (75, 75)])
+    @pytest.mark.asyncio
+    async def test_a_seeded_ingress_feeds_from_the_pre_roll_before_vad_from_above_the_floor(
+        self, floor, first
+    ):
+        audio = scripted_audio([silence(1600), speech_burst(400)], seed=7)
+        spotter = LoggedSpotter()
+        rig = Rig(
+            seed=seed_from(audio, first_pos=0, floor=floor, vad_from=83),
+            spotter=spotter,
+            engaged=False,
+        )
 
         await rig.speak(320)
 
-        assert rig.ingress.stats().skipped_kws_hops >= 5
-        (overload,) = rig.of(IngressOverload)
-        assert overload.lane == "kws"
+        fed = fed_positions(spotter.log)
+        assert fed and fed == list(range(first, first + len(fed)))
+        assert spotter.streams[0].resets == 0
+
+    @pytest.mark.asyncio
+    async def test_a_seed_with_no_vad_from_feeds_from_the_first_frame_pushed(self):
+        seed = seed_from(
+            np.zeros(40 * FRAME_SAMPLES, dtype=np.float32), first_pos=0, floor=0, vad_from=None
+        )
+        spotter = LoggedSpotter()
+        rig = Rig(seed=seed, spotter=spotter, engaged=False)
+
+        await rig.quiet(640)
+
+        fed = fed_positions(spotter.log)
+        assert fed and fed == list(range(40, 40 + len(fed)))
+
+    def test_the_docstrings_say_what_kws_overload_and_skipped_kws_hops_count(self):
+        assert "KWS_BACKLOG_FRAMES" in (IngressOverload.__doc__ or "")
+        assert "skipped_kws_hops" in (IngressStats.__doc__ or "")
+        assert "every frame" in (spotter_feed.__doc__ or "")
 
 
 def ref_frame(marker: bool) -> bytes:
@@ -1885,14 +2098,51 @@ class TestSpeechSegmentTracker:
         (step,) = windows(tracker, 9, 1, speech=True)
         assert step.started == (7 * 512 // FRAME_SAMPLES, (9 * 512 + 511) // FRAME_SAMPLES)
 
+    def test_with_no_run_the_earliest_onset_is_the_first_unscored_frame(self):
+        tracker = SpeechSegmentTracker(EndpointingConfig())
+        windows(tracker, 0, 2, speech=False)
 
-class TestOnsetFeed:
-    def test_the_feed_starts_a_pre_roll_before_the_onset(self):
-        assert onset_feed_start(40, PRE_ROLL, None) == 40 - PRE_ROLL
-        assert onset_feed_start(40, PRE_ROLL, 10) == 40 - PRE_ROLL
+        assert tracker.earliest_onset(4) == 4
 
-    def test_the_feed_never_repeats_a_frame_already_fed(self):
-        assert onset_feed_start(40, PRE_ROLL, 30) == 31
+    def test_while_a_run_is_under_way_the_earliest_onset_is_its_first_frame(self):
+        tracker = SpeechSegmentTracker(EndpointingConfig())
+        windows(tracker, 0, 2, speech=False)
+        windows(tracker, 2, 2, speech=True)
+
+        assert tracker.earliest_onset(7) == 3
+
+        windows(tracker, 4, 1, speech=False)
+        assert tracker.earliest_onset(8) == 8
+
+
+class TestSpotterFeed:
+    def test_with_a_segment_open_frames_before_its_pre_roll_are_warmed_and_the_rest_pushed(self):
+        assert spotter_feed(10, 60, 40, 40, PRE_ROLL) == SpotterFeed(
+            warm=range(10, 40 - PRE_ROLL), push=range(40 - PRE_ROLL, 61)
+        )
+
+    def test_with_a_segment_open_a_pre_roll_partly_fed_is_pushed_from_the_next_frame(self):
+        feed = spotter_feed(30, 60, 40, 40, PRE_ROLL)
+
+        assert (list(feed.warm), feed.push) == ([], range(30, 61))
+
+    def test_with_none_open_frames_an_onset_could_make_pre_roll_wait(self):
+        feed = spotter_feed(10, 60, None, 50, PRE_ROLL)
+
+        assert (feed.warm, list(feed.push)) == (range(10, 50 - PRE_ROLL), [])
+
+    def test_with_none_open_and_no_onset_possible_by_the_newest_frame_all_are_warmed(self):
+        feed = spotter_feed(10, 60, None, 100, PRE_ROLL)
+
+        assert (feed.warm, list(feed.push)) == (range(10, 61), [])
+
+    @pytest.mark.parametrize(
+        ("next_pos", "onset", "earliest"), [(61, 40, 40), (40, None, 50), (35, None, 50)]
+    )
+    def test_nothing_is_released_twice_or_early(self, next_pos, onset, earliest):
+        feed = spotter_feed(next_pos, 60, onset, earliest, PRE_ROLL)
+
+        assert (list(feed.warm), list(feed.push)) == ([], [])
 
     def test_the_pre_roll_in_frames_comes_from_the_endpointing_config(self):
         assert onset_lead_frames(EndpointingConfig()) == PRE_ROLL
