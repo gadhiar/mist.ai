@@ -92,6 +92,7 @@ from backend.devices.listener import (  # isort:skip
     build_device_app,
 )
 from backend.devices.registry import DeviceRegistry, DeviceRegistryError  # isort:skip
+from backend.devices.ring_sink import DeviceRingSink, device_ring_sinks  # isort:skip
 from backend.devices.server import DeviceListener, ListenerState  # isort:skip
 from backend.errors import CapabilityConfigError, MistError  # isort:skip
 from backend.event_store.status_intervals import (  # isort:skip
@@ -1568,6 +1569,46 @@ async def lifespan(app: FastAPI):
     voice_settings = load_voice_settings(os.environ)
     persona = PersonaRegister.load(VOICE_PROFILES_ROOT, voice_settings.profile)
     _capability_sink = CapabilitySink()
+
+    # Room devices' configuration and registry, read before the capability
+    # host so each registered, unrevoked device rings through its own sink.
+    # Either one unreadable logs ERROR and shows `failed` in `/health`: no
+    # device rings and no listener starts, and the desktop path runs on. A
+    # device registered later rings after a restart.
+    _device_listener = None
+    _device_app = None
+    _device_listener_state = "off"
+    device_registry: DeviceRegistry | None = None
+    try:
+        device_config: DeviceListenerConfig | None = DeviceListenerConfig.from_env(os.environ)
+    except DeviceListenerConfigError as e:
+        logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
+        device_config = None
+        _device_listener_state = "failed"
+    if device_config is not None and device_config.enabled:
+        try:
+            device_registry = DeviceRegistry.load(device_config.registry)
+        except DeviceRegistryError as e:
+            logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
+            _device_listener_state = "failed"
+
+    # The sinks reach the session registry when they are called, as
+    # `_desktop_present` does, since the registry is built after the host.
+    def _endpoint_present(endpoint: str) -> bool:
+        registry = session_registry
+        return registry is not None and registry.endpoint_present(endpoint)
+
+    def _send_to_endpoint(endpoint: str, payload: dict[str, object]) -> None:
+        registry = session_registry
+        if registry is not None:
+            registry.broadcast(json.dumps(payload), endpoint=endpoint)
+
+    ring_sinks: tuple[DeviceRingSink, ...] = (
+        device_ring_sinks(device_registry.devices(), _send_to_endpoint, _endpoint_present)
+        if device_registry is not None
+        else ()
+    )
+
     try:
         _capability_config = load_capabilities_config(os.environ)
     except CapabilityConfigError as e:
@@ -1593,6 +1634,7 @@ async def lifespan(app: FastAPI):
             tiers=capability_tiers,
             register=persona,
             desktop_present=_desktop_present,
+            ring_sinks=ring_sinks,
         )
     if _capability_build.host is not None:
         await _capability_build.host.start()
@@ -1778,32 +1820,19 @@ async def lifespan(app: FastAPI):
         logger.warning("Session-note catch-up scheduling failed (non-fatal): %s", e)
 
     # Room devices: a second, TLS listener for `/v2/device`, off unless
-    # `MIST_DEVICE_LISTENER=on`. Started once the session registry exists, since
-    # each device is served as a session. A listener that cannot start (its
-    # configuration or registry unreadable, the port taken, a bad certificate)
-    # logs ERROR and shows `failed` in `/health`; the desktop path runs on.
-    _device_listener = None
-    _device_app = None
-    _device_listener_state = "off"
-    try:
-        device_config: DeviceListenerConfig | None = DeviceListenerConfig.from_env(os.environ)
-    except DeviceListenerConfigError as e:
-        logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
-        device_config = None
-        _device_listener_state = "failed"
-    if device_config is not None and device_config.enabled:
-        try:
-            device_registry = DeviceRegistry.load(device_config.registry)
-        except DeviceRegistryError as e:
-            logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
-            _device_listener_state = "failed"
-        else:
-            device_clock = DeviceClock()
-            _device_app = build_device_app(
-                device_registry, _serve_session, AuthLimiter(device_clock), device_clock
-            )
-            _device_listener = DeviceListener(device_config, _device_app)
-            await _device_listener.start()
+    # `MIST_DEVICE_LISTENER=on`. Its configuration and registry were read
+    # before the capability host, which rings each device; the listener
+    # starts once the session registry exists, since each device is served as
+    # a session. A listener that cannot start (the port taken, a bad
+    # certificate) logs ERROR and shows `failed` in `/health`; the desktop
+    # path runs on.
+    if device_config is not None and device_registry is not None:
+        device_clock = DeviceClock()
+        _device_app = build_device_app(
+            device_registry, _serve_session, AuthLimiter(device_clock), device_clock
+        )
+        _device_listener = DeviceListener(device_config, _device_app)
+        await _device_listener.start()
 
     logger.info(f"Server ready on ws://{config.host}:{config.port}/ws")
     logger.info("=" * 60)

@@ -16,7 +16,7 @@ import asyncio
 import io
 import struct
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
 from pathlib import Path
@@ -28,7 +28,7 @@ import pytest_asyncio
 
 from backend import factories
 from backend.capabilities.alarms.capability import RingingTracker
-from backend.capabilities.alarms.ringing import DesktopSink, RingRouter
+from backend.capabilities.alarms.ringing import DesktopSink, RingRouter, RingSink
 from backend.capabilities.config import CapabilitiesConfig, load_capabilities_config
 from backend.capabilities.db import CapabilitiesDb
 from backend.capabilities.decoder import DECODE_INSTRUCTIONS
@@ -36,6 +36,7 @@ from backend.capabilities.host import CapabilityHost, HostSettings
 from backend.capabilities.replies import NoAddress
 from backend.capabilities.secrets import EnvSecretSource, SecretRegistry
 from backend.chat.context_budget import ApproximateTokenCounter
+from backend.devices.ring_sink import DeviceRingSink
 from backend.factories import CapabilityBuild, build_capability_host
 from tests.unit.capabilities.fakes import FakeClock, FakePower, FakeTiers, RecordingEventSink
 from tests.unit.capabilities.mcp.fake_home_assistant import FakeHomeAssistant
@@ -100,6 +101,7 @@ async def build(tmp_path):
         secrets: Mapping[str, str] | None = None,
         transport_factory: Callable[..., object] | None = None,
         desktop_present: Callable[[], bool] = lambda: False,
+        ring_sinks: Sequence[RingSink] | None = None,
     ) -> tuple[CapabilityBuild, Rig]:
         rig = Rig(
             sink=RecordingEventSink(),
@@ -110,6 +112,8 @@ async def build(tmp_path):
             server=FakeHomeAssistant(),
         )
         config = _config(tmp_path, env)
+        # Left out unless a test names it, so the other builds check the default.
+        extra = {} if ring_sinks is None else {"ring_sinks": ring_sinks}
         result = build_capability_host(
             config,
             event_sink=rig.sink,
@@ -123,6 +127,7 @@ async def build(tmp_path):
             tiers=rig.tiers,
             register=NoAddress(),
             desktop_present=desktop_present,
+            **extra,
         )
         builds.append(result)
         return result, rig
@@ -378,6 +383,29 @@ class TestAlarmsWiring:
         control_args = controls[0][0]
         assert control_args[0] is records
         assert control_args[1] is scheduler
+
+    def test_ring_sinks_ring_after_the_desktop_and_are_endpoints_ring_on_can_name(
+        self, enabled, build, zone, monkeypatch
+    ):
+        routers = _recording(monkeypatch, "RingRouter")
+        alarms = _recording(monkeypatch, "AlarmsCapability")
+        timers = _recording(monkeypatch, "TimersCapability")
+        kitchen = DeviceRingSink("kitchen", lambda name, payload: None, lambda name: False)
+        bedroom = DeviceRingSink("bedroom", lambda name, payload: None, lambda name: True)
+
+        build(
+            {"MIST_CAPABILITIES": "alarms,timers,clock", "MIST_TIMEZONE": ZONE_NAME},
+            ring_sinks=[kitchen, bedroom],
+        )
+
+        (router_args, _, router) = routers[0]
+        desktop, *devices = router_args[0]
+        assert isinstance(desktop, DesktopSink)
+        assert devices == [kitchen, bedroom]
+        assert router.endpoints() == ("desktop", "kitchen", "bedroom")
+        for calls in (alarms, timers):
+            _, kwargs, _ = calls[0]
+            assert kwargs["endpoints"]() == ("desktop", "kitchen", "bedroom")
 
     @pytest.mark.asyncio
     async def test_the_alarm_control_reads_the_store_the_capabilities_write(
