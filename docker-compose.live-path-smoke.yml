@@ -244,15 +244,15 @@ services:
       # so the two move together or not at all.
       #
       # --- turns must be recorded ------------------------------------------
-      # Load-bearing, not hygiene: at
-      # `backend/voice_models/model_manager.py:494`,
-      # `generate_llm_response` takes the knowledge-augmented path only when
-      # `self.knowledge and self.knowledge.is_enabled()`; the else branch
-      # (`model_manager.py:501-530`) calls the LLM provider directly. Turn
-      # recording lives only on the knowledge path -- `_record_turn_event` is
-      # defined and called in `backend/chat/conversation_handler.py` (2279,
-      # 1631, 1702) and nowhere in `model_manager.py`. With knowledge
-      # integration off, the conversation would produce no turn row at all.
+      # Load-bearing, not hygiene: `build_mist_runtime` (`backend/factories.py`)
+      # builds the `ConversationHandler` only when knowledge integration is
+      # enabled; otherwise every turn is answered by `DirectResponder`
+      # (`backend/realtime/degraded.py`), which calls the LLM provider
+      # directly and records nothing. Turn recording lives only in the
+      # handler -- `_record_turn_event` is defined and called in
+      # `backend/chat/conversation_handler.py` (3888; 3161, 3178, 3214). With
+      # knowledge integration off, the conversation would produce no turn row
+      # at all.
       - ENABLE_KNOWLEDGE_INTEGRATION=true
       # Sessions are recorded origin='real' for the reason dev-hydration gives
       # at `docker-compose.dev-hydration.yml:152-163`: `origin` discriminates

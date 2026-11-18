@@ -1,335 +1,80 @@
-# Backend - Voice Conversation Server
+# Backend
 
-WebSocket-based voice conversation backend for M.I.S.T AI.
+The FastAPI and Uvicorn server MIST's frontend talks to over one WebSocket, `ws://<host>:8001/ws`,
+plus a few HTTP routes (`/health`, `/extraction/status`, `/capabilities`, `/usage/...`). It runs in
+the `mist-backend` container; see the repository's CLAUDE.md for the stack.
 
 ## Architecture
 
 ```
-WebSocket Client
-    ->
-FastAPI Server (server.py)
-    ->
-Voice Processor (voice_processor.py)
-    ->
-┌─────────────────────────────────────┐
-│ VAD -> STT -> LLM -> TTS -> Audio Out  │
-└─────────────────────────────────────┘
-    ->
-Model Manager (voice_models/model_manager.py)
+WebSocket /ws (backend/server.py, websocket_endpoint)
+  -> SessionRegistry (realtime/registry.py): one RealtimeSession per connection
+     -> RealtimeSession (realtime/session.py): binary frames to the audio ingress,
+        text to control handling; drains its `control`, `turn` and `bulk` lanes
+        -> AudioIngress (realtime/ingress.py): VAD, speech-to-text, end of turn, name hits
+        -> TurnController (realtime/turn.py): one mailbox task owns the session's turns
+           -> responder: ConversationHandler (chat/conversation_handler.py), or
+              DirectResponder (realtime/degraded.py) when knowledge integration is off
+           -> segmenter (realtime/segmenter.py) -> TTS engine -> playback (realtime/playback.py)
 ```
 
-## Components
+A turn's frames go to its own session's socket only. Process-wide events (heartbeats,
+`system_status`, `health_status`, `extraction_status`, log streaming) go through `message_queue` and
+the broadcaster in `server.py`; `backend/realtime` never touches that queue.
 
-### server.py
-FastAPI WebSocket server managing client connections and message routing.
+`lifespan` in `server.py` builds everything once at startup through `build_mist_runtime`
+(`factories.py`): the LLM provider, the conversation handler, and the speech engines, each slot
+loaded from its chain by `load_speech_engines` (`realtime/runtime.py`). Model calls run on
+inference lanes (`realtime/lanes.py`), one worker thread per engine, so they never block the event
+loop.
 
-**Endpoints:**
-- `ws://localhost:8001/ws` - Main WebSocket endpoint
+## Package map
 
-**Message Protocol:** See [Message Types](#message-types) below
+- `server.py` - the app, `lifespan`, the WebSocket endpoint and the HTTP routes.
+- `factories.py` - the composition root: every real dependency is built here and injected.
+- `realtime/` - the voice path: sessions, the turn controller, ingress, playback, barge-in, wake by
+  name, power levels and the speech engine adapters in `realtime/engines/`. Each module's docstring
+  says what it owns; `REPOSITORY_STRUCTURE.md` lists them.
+- `chat/` - the conversation handler: the pass loop, persona, tools and the stream events a turn
+  yields (`chat/stream_events.py`).
+- `knowledge/` - extraction, retrieval, curation and the Neo4j graph store.
+- `vault/` - the markdown vault writer, sidecar index and filewatcher.
+- `llm/` - the LLM providers.
+- `extraction_backlog/` - the extraction dispatcher and its admin CLI.
+- `capabilities/` - tools that act on the world, with proposals that wait for the user's yes.
 
-### voice_processor.py
-Orchestrates the voice conversation pipeline using Silero VAD callbacks.
+## Protocol
 
-**Flow:**
-1. Audio chunks arrive via WebSocket
-2. VAD detects speech/silence
-3. On speech end: STT transcribes -> LLM generates -> TTS synthesizes
-4. Audio streams back via WebSocket
-
-**Features:**
-- Real-time VAD with <100ms latency
-- Streaming TTS audio (chunk-by-chunk delivery)
-- Conversation state management
-
-### voice_models/model_manager.py
-Manages model lifecycle and TTS worker thread.
-
-**Key Features:**
-- Lazy model loading (STT on first use, TTS on first use)
-- Dedicated TTS worker thread to prevent blocking
-- Context management for voice consistency
-- Sentence-boundary chunking for long responses (>150 tokens)
-- Token-aware generation limits
-
-**TTS Chunking Strategy:**
-- Short responses (<150 tokens): Single generation
-- Long responses (>150 tokens): Sentence-boundary chunking at ~120 tokens/chunk
-- Context preserved: 3 reference clips + 2 recent utterances
-- Automatic cleanup after chunked generation
-
-## Message Types
-
-### Client -> Server
-
-#### 1. Audio Chunk
-```json
-{
-  "type": "audio_chunk",
-  "data": "<base64_encoded_audio>",
-  "sample_rate": 16000
-}
-```
-Raw audio from microphone (16kHz mono, float32)
-
-#### 2. Stop Generation
-```json
-{
-  "type": "stop"
-}
-```
-Interrupt current TTS generation
-
-### Server -> Client
-
-#### 1. Transcription
-```json
-{
-  "type": "transcription",
-  "text": "User's spoken text..."
-}
-```
-STT result after speech detection
-
-#### 2. Response Text
-```json
-{
-  "type": "response",
-  "text": "AI response text..."
-}
-```
-LLM-generated response (before audio)
-
-#### 3. Audio Chunk
-```json
-{
-  "type": "audio_chunk",
-  "data": "<base64_encoded_audio>"
-}
-```
-TTS audio chunk (24kHz mono, float32)
-
-Sent continuously as audio is generated (streaming).
-
-#### 4. Audio End
-```json
-{
-  "type": "audio_end"
-}
-```
-Signals completion of TTS generation
-
-#### 5. Status Update
-```json
-{
-  "type": "status",
-  "message": "Thinking...",
-  "stage": "llm" | "tts" | "ready"
-}
-```
-Progress updates during processing
-
-#### 6. Error
-```json
-{
-  "type": "error",
-  "message": "Error description"
-}
-```
-Error during processing
+The WebSocket contract is the realtime protocol, version 2.0.0, defined in
+`realtime/protocol.py`: the binary audio frame codec and every control message schema. The first
+frame on a connection is `session_started`, carrying the server-minted `session_id`,
+`protocol_version` and `capabilities.voice`. A turn opens with `stream_start{turn_id, channel,
+origin}` (`audio_tag` only for a spoken turn), streams `stream_token`, ends its stream with
+`stream_complete` or `stream_cancelled`, and closes with `turn_metrics` after the turn is
+committed. Frontend coordination is recorded in ADR-016 and ADR-017.
 
 ## Configuration
 
-Configuration is managed via `config.py` using Pydantic:
+Every setting comes from the environment and is documented in `.env.example`. The voice settings
+(`MIST_VOICE_*`) are read once at startup by `load_voice_settings` (`realtime/budget.py`); an
+invalid value stops the backend with a message naming the variable. `MIST_VOICE_STT_CHAIN` and
+`MIST_VOICE_TTS_CHAIN` choose the speech engines, and `off` turns a slot off. `TTS_ENABLED=false`
+keeps replies unspoken. `ENABLE_KNOWLEDGE_INTEGRATION=false` answers every turn through
+`DirectResponder`, which records nothing.
 
-```python
-class VoiceConfig(BaseModel):
-    # STT
-    whisper_model: str = "base"
+## Running
 
-    # VAD
-    vad_threshold: float = 0.5
-    min_speech_duration_ms: int = 250
-    min_silence_duration_ms: int = 500
-
-    # LLM
-    llm_model: str = "qwen2.5:latest"
-
-    # TTS
-    tts_device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    voice_profile: str = "mist"  # Selected via VOICE_PROFILE env var
-    use_voice_context: bool = True
-```
-
-## Model Details
-
-### STT: OpenAI Whisper
-- **Model:** `base` (74M params)
-- **Language:** Auto-detect
-- **Latency:** ~200-500ms per utterance
-
-### LLM: llama-server (llama.cpp)
-- **Default Model:** Gemma 4 E4B Q5_K_M (carteakey-full recipe, ADR-008 revised)
-- **System Prompt:** Conversational AI assistant (M.I.S.T) with persona +
-  memory-architecture blocks
-- **Token Limit:** 1024 conversation max_tokens (Cluster 6); 0.0 extraction /
-  0.7 conversation temperature split
-- **Fallback:** OllamaProvider remains wired for `LLM_BACKEND=ollama`
-
-### TTS: Chatterbox
-- **Model:** Chatterbox's built-in voice; a profile may name a reference WAV to clone
-  instead (MIT license)
-- **Sample Rate:** 24kHz
-- **Latency:** ~0.74x RTF in-container
-- **Legacy:** Sesame CSM-1B retained under `dependencies/csm/` for rollback only
-
-## Running the Server
-
-### Standard Mode
 ```bash
-python backend/server.py
+docker compose up -d mist-backend
 ```
 
-Server starts on `ws://localhost:8001/ws`
+## Testing
 
-### With Custom Config
-```python
-from backend.config import VoiceConfig
-from backend.voice_processor import VoiceProcessor
+Tests run in the backend container (see `TESTING.md`). The voice path's unit tests are in
+`tests/unit/realtime/`; they drive the session and turn controller with fake engines
+(`tests/unit/realtime/turn_fakes.py`, `test_speech_fakes.py`), so they need no GPU and no model
+weights.
 
-config = VoiceConfig(
-    whisper_model="small",
-    vad_threshold=0.6,
-    llm_model="mistral:latest"
-)
-
-processor = VoiceProcessor(config, message_queue)
-```
-
-## Threading Model
-
-```
-Main Thread (FastAPI)
-    ->
-Voice Processor Thread
-    ->
-┌──────────────────────────┐
-│ TTS Worker Thread        │
-│ - Dedicated thread       │
-│ - Queue-based requests   │
-│ - Prevents UI blocking   │
-└──────────────────────────┘
-```
-
-**Why Threading:**
-- TTS generation can take 10-60 seconds for long responses
-- Worker thread prevents blocking VAD/STT pipeline
-- Queue ensures orderly generation
-- Clean shutdown on disconnect
-
-## Performance Characteristics
-
-### Latency Breakdown
-```
-User stops speaking
-  -> 100ms (VAD detection)
-STT transcription
-  -> 300ms (Whisper)
-LLM generation
-  -> 1-3s (Qwen streaming)
-TTS generation
-  -> 2-5s (CSM first chunk)
-Audio playback starts
-  -> Streaming continues...
-Complete audio
-```
-
-**Total Time to First Audio:** ~3-6 seconds
-
-### Memory Usage
-- **Whisper base:** ~400MB VRAM
-- **CSM-1B:** ~3GB VRAM
-- **Total:** ~4GB VRAM minimum
-
-### Long Response Handling
-- Responses >150 tokens automatically chunked
-- Each chunk: ~120 tokens = ~900 audio frames
-- Chunking prevents quality degradation
-- Context preserved between chunks
-
-## Troubleshooting
-
-### TTS Quality Degradation
-**Symptom:** Audio gets quieter or stutters during long generations
-
-**Cause:** Position overflow in CSM generator
-
-**Fix:** Applied sliding window fix in `dependencies/csm/generator.py` line 233-237
-
-### CUDA Out of Memory
-**Symptom:** RuntimeError: CUDA out of memory
-
-**Solutions:**
-1. Reduce context: Set `use_voice_context=False` in config
-2. Use smaller Whisper: `whisper_model="tiny"`
-3. Close other GPU applications
-
-### Connection Issues
-**Symptom:** WebSocket disconnects frequently
-
-**Solutions:**
-1. Check firewall settings
-2. Increase timeout in client
-3. Monitor server logs for errors
-
-## Development
-
-### Adding New Models
-
-**STT:**
-```python
-# In voice_models/model_manager.py
-self.stt = YourSTTWrapper()
-```
-
-**LLM:**
-```python
-# Modify generate_llm_response() in model_manager.py
-# Ensure streaming support
-```
-
-**TTS:**
-```python
-# In voice_models/model_manager.py
-self.tts = YourTTSWrapper()
-# Must implement generate_stream() or similar
-```
-
-### Testing
-
-**Unit Test:**
 ```bash
-pytest tests/test_voice_processor.py
+MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/realtime -q
 ```
-
-**Integration Test:**
-```bash
-python cli_client/voice_client.py
-# Speak into microphone, verify response
-```
-
-## Future Enhancements
-
-- [ ] Multi-speaker support
-- [ ] Voice activity visualization
-- [ ] Conversation history persistence
-- [ ] RAG integration for knowledge retrieval
-- [ ] Emotion detection and voice adaptation
-- [ ] Real-time translation
-
-## Related Documentation
-
-- [Model Manager Details](voice_models/README.md)
-- [Frontend Integration](../frontend/README.md)
-- [CLI Client Usage](../cli_client/README.md)
-- [Architecture Decisions](../docs/decisions/)

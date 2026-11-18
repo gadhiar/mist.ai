@@ -1,6 +1,6 @@
 """The responder that answers turns when knowledge integration is off or failed to start.
 
-Moved from `ModelManager.generate_llm_response`'s fallback branch with its prompt, token limit
+Moved from the deleted threaded voice path's no-knowledge fallback with its prompt, token limit
 and sampling unchanged, behind the `TurnResponder` API the turn controller drives. Such a turn
 is answered but never recorded: the event store belongs to the knowledge subsystem that is off,
 so each turn is counted and warned about once (`backend/extraction_backlog/telemetry.py`), and

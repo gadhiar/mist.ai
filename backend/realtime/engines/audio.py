@@ -160,7 +160,7 @@ def resample(samples: np.ndarray, rate: int, target: int = OUTPUT_RATE) -> np.nd
 
 
 def to_pcm16(samples: np.ndarray) -> bytes:
-    """Little-endian PCM16, clipped to [-1, 1] first, as `audio_protocol.float32_to_pcm16` does."""
+    """Little-endian PCM16, clipped to [-1, 1] first, the sample format of a binary audio frame."""
     return (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 

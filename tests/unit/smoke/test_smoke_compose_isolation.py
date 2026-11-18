@@ -496,18 +496,18 @@ class TestMountDiscipline:
         assert_isolated_root(REPO_ROOT / "smoke-state", purpose="live-path smoke")
 
 
-class TestKnowledgeIntegrationOn:
+class TestKnowledgeOn:
     """Without knowledge integration the conversation records no turn at all."""
 
     def test_knowledge_integration_enabled(self, backend_env):
         value = backend_env.get("ENABLE_KNOWLEDGE_INTEGRATION")
         assert value == "true", (
-            f"ENABLE_KNOWLEDGE_INTEGRATION={value!r}. At "
-            f"backend/voice_models/model_manager.py:494 `generate_llm_response` "
-            f"takes the knowledge-augmented path only when knowledge is enabled; "
-            f"the else branch (model_manager.py:501-530) calls the LLM provider "
-            f"directly. Turn recording lives only on the knowledge path "
-            f"(`_record_turn_event`, backend/chat/conversation_handler.py:2279). "
+            f"ENABLE_KNOWLEDGE_INTEGRATION={value!r}. `build_mist_runtime` "
+            f"(backend/factories.py) builds the conversation handler only when "
+            f"knowledge is enabled; otherwise `DirectResponder` "
+            f"(backend/realtime/degraded.py) calls the LLM provider directly and "
+            f"records nothing. Turn recording lives only in the handler "
+            f"(`_record_turn_event`, backend/chat/conversation_handler.py:3888). "
             f"With this off the smoke run produces a reply, no turn row, and four "
             f"absent artifacts that look like a broken pipeline."
         )

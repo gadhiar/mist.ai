@@ -18,8 +18,8 @@ Modules:
     admin       -- `python -m backend.extraction_backlog.admin`
 
 The package-level names below are resolved lazily (PEP 562). `telemetry` is
-imported from `ModelManager.generate_llm_response`'s no-knowledge fallback,
-which runs precisely when the knowledge subsystem failed to come up; an eager
+imported by `DirectResponder` (`backend/realtime/degraded.py`), the responder
+that answers turns precisely when the knowledge subsystem failed to come up; an eager
 `from .dispatcher import ...` here would pull the extraction pipeline into that
 branch and could fail the turn for the same reason knowledge did.
 """

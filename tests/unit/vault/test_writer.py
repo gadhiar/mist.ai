@@ -832,7 +832,8 @@ def test_enqueue_on_unstarted_writer_fails_fast(writer: VaultWriter, tmp_vault: 
 # TestSessionIdUniqueness  (Phase 3 Task 18)
 # ---------------------------------------------------------------------------
 # The 2026-05-10 audit found 5 of 7 session notes had session_id: default
-# because KnowledgeIntegration.current_session_id initializes to "default"
+# because the threaded voice path's knowledge bridge (since deleted) held a
+# current_session_id attribute initialised to "default"
 # and that raw string was written directly into frontmatter.
 #
 # Fix contract: _append_turn_sync derives the frontmatter session_id from
