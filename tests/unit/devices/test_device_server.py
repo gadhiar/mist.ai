@@ -122,7 +122,8 @@ LISTENERS: list[DeviceListener] = []
 async def _stop_listeners():
     yield
     while LISTENERS:
-        await LISTENERS.pop().stop()
+        # Bounded, so a broken stop cap fails its test instead of hanging the suite.
+        await asyncio.wait_for(LISTENERS.pop().stop(), timeout=10)
 
 
 def listener_for(config: DeviceListenerConfig, app: object, **kwargs: object) -> DeviceListener:
@@ -471,20 +472,43 @@ async def stuck_client(port: int, context: ssl.SSLContext) -> asyncio.StreamWrit
     return writer
 
 
+class StubbornApp:
+    """A session that ignores the disconnect and never returns, so the server cannot drain it.
+
+    uvicorn drops an idle client by itself at shutdown; only a session that outlives its
+    connection makes `stop` depend on the graceful bound and the stop cap.
+    """
+
+    def __init__(self) -> None:
+        self.connected = asyncio.Event()
+        self.app = Starlette(routes=[WebSocketRoute("/v2/device", self._endpoint)])
+
+    async def _endpoint(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.connected.set()
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+        await asyncio.Event().wait()
+
+
 @pytest.mark.asyncio
-async def test_a_client_that_never_closes_does_not_hold_stop_past_6_s(tls_pair, client_ssl):
-    echo = EchoApp()
-    listener = listener_for(config_for(tls_pair), echo.app)
+async def test_a_session_that_never_returns_does_not_hold_stop_past_6_s(tls_pair, client_ssl):
+    stubborn = StubbornApp()
+    listener = listener_for(config_for(tls_pair), stubborn.app)
     await listener.start()
     writer = await stuck_client(listener.port(), client_ssl)
-    await asyncio.wait_for(echo.connected.wait(), timeout=5)
+    await asyncio.wait_for(stubborn.connected.wait(), timeout=5)
 
     started = time.monotonic()
-    await listener.stop()
+    # The outer bound only turns a hang into a failure; `stop`'s own cap is what is measured.
+    await asyncio.wait_for(listener.stop(), timeout=STOP_TIMEOUT_S + 4)
     elapsed = time.monotonic() - started
     writer.transport.abort()
 
-    assert elapsed < STOP_TIMEOUT_S + 0.5
+    # The graceful shutdown waits its 5 s for the session, then cancels it, inside the 6 s cap.
+    assert GRACEFUL_SHUTDOWN_S <= elapsed <= STOP_TIMEOUT_S + 0.5, elapsed
     assert listener.state() == "off"
 
 
@@ -502,7 +526,8 @@ async def test_a_serve_task_that_outlives_its_bound_is_cancelled(tls_pair, caplo
 
     started = time.monotonic()
     with caplog.at_level(logging.WARNING, logger=SERVER_LOGGER):
-        await listener.stop(timeout_s=0.3)
+        # Bounded, so a broken cap fails here instead of hanging the suite.
+        await asyncio.wait_for(listener.stop(timeout_s=0.3), timeout=5)
     elapsed = time.monotonic() - started
 
     assert elapsed < 2.0

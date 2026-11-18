@@ -36,7 +36,8 @@ from .config import DeviceListenerConfig
 logger = logging.getLogger(__name__)
 
 WS_MAX_SIZE = 65536
-"""The largest WebSocket message a device may send: a 20 ms frame is 652 bytes."""
+"""The largest WebSocket message a device may send: a 20 ms frame is 656 bytes (a 16-byte
+header and 640 bytes of 16 kHz PCM16)."""
 GRACEFUL_SHUTDOWN_S = 5
 STOP_TIMEOUT_S = 6.0
 CANCEL_WAIT_S = 1.0
