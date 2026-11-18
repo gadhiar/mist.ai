@@ -53,7 +53,13 @@ from backend.realtime.budget import (
     VoiceSettings,
     load_voice_settings,
 )
-from backend.realtime.engines.kws import OnnxNameSpotter, WakeManifest, read_manifest
+from backend.realtime.engines.kws import (
+    MicroNameSpotter,
+    WakeManifest,
+    import_micro_runtime,
+    read_manifest,
+)
+from backend.realtime.engines.parakeet_stt import ParakeetTranscriber, import_onnx_asr
 from backend.realtime.engines.silero_vad import (
     SileroVad,
     onnxruntime_providers,
@@ -119,9 +125,10 @@ def false_accept_table(points: Sequence[tuple[float, float]]) -> list[tuple[floa
     """Score to false accepts per hour, made monotone by a running minimum from low scores up.
 
     Each rate comes from its own run, and a higher threshold can measure more false accepts
-    than a lower one: a score that dips below it and returns is two rising edges there and one
-    below, and each hit's decode covers a different span. A table the arbitration reads must
-    not rank a higher score as more likely false, so each rate is capped by every rate below.
+    than a lower one: the gate decides on a decode of the span around each hit, a higher
+    threshold can place a hit at a later step, and that span's decode can be accepted where the
+    lower threshold's was not. A table the arbitration reads must not rank a higher score as
+    more likely false, so each rate is capped by every rate below.
     """
     table: list[tuple[float, float]] = []
     lowest = math.inf
@@ -659,7 +666,7 @@ def _real_engines(spec: str) -> EngineLoader:
             factory = getattr(importlib.import_module(module_name), attribute)
         except (ImportError, AttributeError) as exc:
             raise RefusedError(f"--stt-factory {spec!r} could not be loaded: {exc}") from exc
-        spotter = OnnxNameSpotter.load(placement, session_factory=open_onnx_session)
+        spotter = MicroNameSpotter.load(placement, library_loader=import_micro_runtime)
         vad = SileroVad.load(
             placement,
             session_factory=open_onnx_session,
@@ -668,6 +675,19 @@ def _real_engines(spec: str) -> EngineLoader:
         return Engines(spotter=spotter, vad=vad, transcriber=factory(placement))
 
     return load
+
+
+def parakeet_cpu(placement: PlacementConfig) -> StreamingTranscriber:
+    """The `parakeet-cpu` engine as the gate's STT: `scripts.wake.eval_wake:parakeet_cpu`.
+
+    `--stt-factory` is required and takes a `<module>:<callable>`; this one loads the adapter
+    as `backend/factories.py` loads the `parakeet-cpu` chain, so a host run with no GPU needs
+    no module of its own.
+
+    Raises:
+        SpeechEngineError: As `ParakeetTranscriber.load`.
+    """
+    return ParakeetTranscriber.load(placement, library_loader=import_onnx_asr)
 
 
 def _parser() -> argparse.ArgumentParser:
