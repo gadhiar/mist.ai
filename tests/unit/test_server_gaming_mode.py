@@ -1,319 +1,192 @@
-"""The WebSocket and `health_status` behaviour of gaming mode.
+"""Gaming mode as the server wires it: the power gate on `/ws`, `health_status`, and the boot.
 
-Driven through FastAPI's test client with the voice processor stubbed and a
-real `GpuYield` over a temporary marker. `TestClient` is constructed without
-the `with` block, so the real lifespan, and with it the model stack, never
-runs (as in `tests/unit/test_origin_allowlist.py`).
+`lifespan` builds the gate from gaming mode's `GpuYield` (`_build_power`, `_capability_tiers`,
+`_build_power_gate`) and every session applies it (T22's `PowerGatedResponder`). These tests
+drive the real `websocket_endpoint` with that gate over a real `GpuYield` on a temporary
+marker, with the fakes of `tests/unit/test_session_id_propagation.py`.
 
-With a capability host attached, a `text` message while yielded is offered to
-the capability-only turn, and refused as before only when nothing answers it;
-`audio` is refused either way.
+Protocol 1.4.0's server-side gate and the threaded voice path are gone; each invariant their
+tests pinned is pinned here or by T22's realtime tests:
 
-The `VoiceProcessor` tests cover the other side of the gate: a voice turn
-admitted just before Whisper was released, whose model manager raises
-`GpuYieldedError`, and the capability-only turn, which streams through the
-text turn's output path and never reaches the model path.
+- a typed turn while yielded is refused with the yield's message: here, and
+  `realtime/test_session_power.py::TestTypedTurns::test_the_refusal_names_the_yield_while_gpu_yield_is_yielded`;
+- `resume_failed` refused with its own message: the realtime reload never leaves `GpuYield` in
+  `resume_failed` (`realtime/test_power.py::TestReload::test_a_real_gpu_yield_is_normal_after_a_failing_reload`),
+  so `gpu_yield_refusal` names the missing model then
+  (`test_session_power.py::TestPowerGate::test_the_yield_refusal_names_the_missing_model_otherwise`);
+- a handled capability command while yielded gets no refusal and streams as a typed turn: here,
+  and `test_session_power.py::TestTypedTurns::test_a_typed_message_goes_to_the_capability_only_path`;
+- an unhandled message gets what its pre-LLM step drained, then the refusal, and calls no model:
+  here, and `TestTypedTurns::test_an_unhandled_message_gets_its_drained_events_then_the_refusal`
+  (its `FailingResponder` fails any model call);
+- audio while yielded is refused: `audio` is no protocol 2 message (T1); voice at `off` is
+  `test_session_power.py::TestVoiceAtOff`;
+- turns reach the model when not yielded: here, and
+  `TestTypedTurns::test_at_off_with_a_provider_a_typed_question_still_reaches_it`;
+- `interrupt` while yielded: `realtime/test_session.py::TestDispatch`; `reset_vad` is removed (T1);
+- a voice turn past the gate when the engines were released (`GpuYieldedError`):
+  `realtime/test_power.py::TestSessionCut::test_a_tts_turn_in_synthesis_is_cut_whole_and_recorded_interrupted`
+  and `TestSlots::test_an_empty_slot_refuses_work_with_a_speech_engine_error`;
+- the bridge's `generation_lock`, `latest_user_input` respawn and put-completion ordering: removed
+  with the bridge; a session's turns are its controller's, one at a time.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import threading
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend import server
 from backend.chat.conversation_handler import CapabilityOnlyTurn
-from backend.chat.stream_events import Complete, Token, WSEvent
-from backend.config import VoiceConfig
-from backend.errors import GpuYieldedError
-from backend.gpu_yield import RESUME_FAILED_MESSAGE, YIELDED_MESSAGE, GpuYield
-from backend.request_context import current_turn_complete
-from backend.voice_models.model_manager import ModelManager
+from backend.chat.stream_events import Complete, Token
+from backend.factories import build_mist_runtime
+from backend.gpu_yield import YIELDED_MESSAGE, GpuYield
+from backend.realtime.power import NO_MODEL_MESSAGE
+from backend.realtime.runtime import TorchGpuMeter
+from tests.unit.realtime.test_runtime import (
+    FakeProvider,
+    HandlerFactory,
+    Loaders,
+    inline_lanes,
+    knowledge_config,
+    settings,
+)
+from tests.unit.test_session_id_propagation import (  # noqa: F401 -- autouse fixtures
+    RecordingConversationHandler,
+    connect,
+    install_runtime,
+    no_runtime,
+    reset_session_context,
+)
 
-_TIMER_TEXT = "set a timer for 10 minutes"
-
-
-class StubVoiceProcessor:
-    """Records the turn methods the WebSocket dispatches to. No models, no VAD."""
-
-    def __init__(self) -> None:
-        self.turns: list[tuple[str, object]] = []
-        self.vad_resets = 0
-        self.interrupt_flag = threading.Event()
-        self.models = SimpleNamespace(knowledge=None)
-
-    def process_complete_audio(self, audio_data, sample_rate, session_id=None) -> None:
-        self.turns.append(("audio", len(audio_data)))
-
-    def _process_conversation_turn(self, user_text, session_id=None, request_id=None) -> None:
-        self.turns.append(("text", user_text))
-
-    def reset_vad(self) -> None:
-        self.vad_resets += 1
-
-    def reset_connection_state(self) -> None:
-        return None
+PROVIDER = object()
 
 
 def _noop() -> None:
     return None
 
 
-def _failing_resume() -> None:
-    raise RuntimeError("no memory for Whisper")
-
-
-def _gpu(marker: Path, *, on_resume=_noop) -> GpuYield:
-    return GpuYield(marker, _noop, on_resume, poll_s=2.0)
+def _marker(tmp_path: Path) -> Path:
+    return tmp_path / "gpu-yielded"
 
 
 def yielded_gpu(tmp_path: Path) -> GpuYield:
-    marker = tmp_path / "gpu-yielded"
-    marker.write_text('{"v": 1}', encoding="utf-8")
-    return _gpu(marker)
-
-
-def resume_failed_gpu(tmp_path: Path) -> GpuYield:
-    marker = tmp_path / "gpu-yielded"
-    marker.write_text('{"v": 1}', encoding="utf-8")
-    gpu = _gpu(marker, on_resume=_failing_resume)
-    marker.unlink()
-    asyncio.run(gpu.poll_once())
-    assert gpu.state() == "resume_failed"
-    return gpu
+    _marker(tmp_path).write_text('{"v": 1}', encoding="utf-8")
+    return GpuYield(_marker(tmp_path), _noop, _noop, poll_s=2.0)
 
 
 def normal_gpu(tmp_path: Path) -> GpuYield:
-    return _gpu(tmp_path / "gpu-yielded")
+    return GpuYield(_marker(tmp_path), _noop, _noop, poll_s=2.0)
 
 
-def _envelope(message: str) -> dict:
-    return {
-        "type": "error",
-        "kind": "server",
-        "message": message,
-        "retriable": True,
-        "context": None,
-    }
+def _gate(monkeypatch, gpu: GpuYield | None):
+    """The gate exactly as `lifespan` builds it, over `gpu`."""
+    monkeypatch.setattr(server, "_gpu_yield", gpu)
+    power = server._build_power(gpu)
+    return server._build_power_gate(power, server._capability_tiers(power), gpu)
 
 
-@pytest.fixture
-def stub(monkeypatch) -> StubVoiceProcessor:
-    processor = StubVoiceProcessor()
-    monkeypatch.setattr(server, "voice_processor", processor)
-    monkeypatch.setattr(server, "_gpu_yield", None)
-    monkeypatch.delenv("MIST_ALLOWED_ORIGINS", raising=False)
-    return processor
+def _errors(frames: list[dict]) -> list[dict]:
+    return [frame for frame in frames if frame["type"] == "error"]
 
 
-def _session(client: TestClient):
-    return client.websocket_connect("/ws")
+def _names(frames: list[dict]) -> list[str]:
+    return [str(frame["type"]) for frame in frames]
 
 
-def _send_turns_and_collect(ws) -> list[dict]:
-    """Send one audio and one text message, then an interrupt as a barrier.
-
-    The endpoint handles messages in order, so the interrupt's acknowledgement
-    arrives only after both turns were dispatched or refused.
-    """
-    ws.send_json({"type": "audio", "audio": [0.0, 0.1, 0.2], "sample_rate": 16000})
-    ws.send_json({"type": "text", "text": "hello"})
-    ws.send_json({"type": "interrupt"})
-    replies = []
-    while True:
-        reply = ws.receive_json()
-        replies.append(reply)
-        if reply.get("type") == "status":
-            return replies
+# -- Typed turns through the gate ------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("build", "message"),
-    [
-        pytest.param(yielded_gpu, YIELDED_MESSAGE, id="yielded"),
-        pytest.param(resume_failed_gpu, RESUME_FAILED_MESSAGE, id="resume-failed"),
-    ],
-)
-def test_turns_are_refused_with_the_state_message(stub, monkeypatch, tmp_path, build, message):
-    monkeypatch.setattr(server, "_gpu_yield", build(tmp_path))
+@pytest.mark.asyncio
+async def test_a_typed_turn_while_yielded_is_refused_with_the_yield_message(monkeypatch, tmp_path):
+    handler = RecordingConversationHandler()
+    install_runtime(
+        monkeypatch,
+        handler,
+        power_gate=_gate(monkeypatch, yielded_gpu(tmp_path)),
+        llm_provider=PROVIDER,
+    )
+    connection = await connect()
 
-    with _session(TestClient(server.app)) as ws:
-        assert ws.receive_json()["type"] == "session_started"
-        replies = _send_turns_and_collect(ws)
+    await connection.send({"type": "text", "text": "tell me a story"})
+    session_id = connection.ws.handshake_session_id
+    await connection.leave()
 
-    assert replies[:2] == [_envelope(message), _envelope(message)]
-    assert stub.turns == []
-
-
-def test_interrupt_and_reset_vad_behave_as_today_while_yielded(stub, monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "_gpu_yield", yielded_gpu(tmp_path))
-
-    with _session(TestClient(server.app)) as ws:
-        ws.receive_json()
-        ws.send_json({"type": "interrupt"})
-        interrupt_reply = ws.receive_json()
-        ws.send_json({"type": "reset_vad"})
-        reset_reply = ws.receive_json()
-
-    assert interrupt_reply == {"type": "status", "message": "Interrupt acknowledged"}
-    assert stub.interrupt_flag.is_set()
-    assert reset_reply == {"type": "status", "message": "VAD reset"}
-    assert stub.vad_resets == 1
+    errors = _errors(connection.ws.frames)
+    assert [(e["kind"], e["message"], e["retriable"]) for e in errors] == [
+        ("server", YIELDED_MESSAGE, True)
+    ]
+    assert handler.capability_calls == [("tell me a story", session_id)]
+    assert handler.requests == [], "the model path was reached while yielded"
 
 
-@pytest.mark.parametrize(
-    "build",
-    [
-        pytest.param(normal_gpu, id="gaming-mode-configured-but-normal"),
-        pytest.param(None, id="no-gaming-mode"),
-    ],
-)
-def test_turns_reach_the_voice_processor_when_not_yielded(stub, monkeypatch, tmp_path, build):
-    if build is not None:
-        monkeypatch.setattr(server, "_gpu_yield", build(tmp_path))
-
-    with _session(TestClient(server.app)) as ws:
-        ws.receive_json()
-        replies = _send_turns_and_collect(ws)
-
-    assert stub.turns == [("audio", 3), ("text", "hello")]
-    assert [r["type"] for r in replies] == ["status"]
-
-
-# --- Capability commands at the off level ----------------------------------------
-
-
-class CapabilityStubVoiceProcessor(StubVoiceProcessor):
-    """Also takes the capability-only turn, answering it as `handled` says."""
-
-    def __init__(self, handled: bool) -> None:
-        super().__init__()
-        self.handled = handled
-        self.capability_turns: list[tuple[str, object]] = []
-
-    def _process_conversation_turn(
-        self, user_text, session_id=None, request_id=None, *, capability_only=False
-    ) -> bool:
-        if capability_only:
-            self.capability_turns.append((user_text, session_id))
-            return self.handled
-        self.turns.append(("text", user_text))
-        return True
-
-
-class SnapshotlessHost:
-    """Stands in for an attached capability host; its connect snapshot is empty."""
-
-    async def snapshot_events(self) -> list[dict]:
-        return []
-
-
-def _attach_host(monkeypatch) -> None:
-    monkeypatch.setattr(server, "_capability_build", SimpleNamespace(host=SnapshotlessHost()))
-
-
-def _capability_stub(monkeypatch, *, handled: bool) -> CapabilityStubVoiceProcessor:
-    processor = CapabilityStubVoiceProcessor(handled)
-    monkeypatch.setattr(server, "voice_processor", processor)
-    return processor
-
-
-def _send_and_collect(ws, *messages: dict) -> list[dict]:
-    """Send `messages`, then an interrupt as a barrier, and return the replies before it."""
-    for message in messages:
-        ws.send_json(message)
-    ws.send_json({"type": "interrupt"})
-    replies = []
-    while True:
-        reply = ws.receive_json()
-        if reply.get("type") == "status":
-            return replies
-        replies.append(reply)
-
-
-def test_a_handled_text_command_while_yielded_gets_no_refusal(stub, monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "_gpu_yield", yielded_gpu(tmp_path))
-    _attach_host(monkeypatch)
-    processor = _capability_stub(monkeypatch, handled=True)
-
-    with _session(TestClient(server.app)) as ws:
-        session_id = ws.receive_json()["session_id"]
-        replies = _send_and_collect(ws, {"type": "text", "text": "set a timer for 10 minutes"})
-
-    assert replies == []
-    assert processor.capability_turns == [("set a timer for 10 minutes", session_id)]
-    assert processor.turns == []
-
-
-@pytest.mark.parametrize(
-    ("build", "message"),
-    [
-        pytest.param(yielded_gpu, YIELDED_MESSAGE, id="yielded"),
-        pytest.param(resume_failed_gpu, RESUME_FAILED_MESSAGE, id="resume-failed"),
-    ],
-)
-def test_an_unhandled_text_message_gets_the_state_refusal(
-    stub, monkeypatch, tmp_path, build, message
-):
-    monkeypatch.setattr(server, "_gpu_yield", build(tmp_path))
-    _attach_host(monkeypatch)
-    processor = _capability_stub(monkeypatch, handled=False)
-
-    with _session(TestClient(server.app)) as ws:
-        ws.receive_json()
-        replies = _send_and_collect(ws, {"type": "text", "text": "tell me a story"})
-
-    assert replies == [_envelope(message)]
-    assert [text for text, _session_id in processor.capability_turns] == ["tell me a story"]
-    assert processor.turns == []
-
-
-def test_audio_while_yielded_is_refused_with_a_host_attached(stub, monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "_gpu_yield", yielded_gpu(tmp_path))
-    _attach_host(monkeypatch)
-    processor = _capability_stub(monkeypatch, handled=True)
-
-    with _session(TestClient(server.app)) as ws:
-        ws.receive_json()
-        replies = _send_and_collect(
-            ws, {"type": "audio", "audio": [0.0, 0.1, 0.2], "sample_rate": 16000}
+@pytest.mark.asyncio
+async def test_a_handled_command_while_yielded_streams_with_no_refusal(monkeypatch, tmp_path):
+    handler = RecordingConversationHandler()
+    handler.capability_results.append(
+        CapabilityOnlyTurn(
+            handled=True,
+            events=(Token("Timer set."), Complete(final_response="Timer set.")),
         )
+    )
+    install_runtime(
+        monkeypatch,
+        handler,
+        power_gate=_gate(monkeypatch, yielded_gpu(tmp_path)),
+        llm_provider=PROVIDER,
+    )
+    connection = await connect()
 
-    assert replies == [_envelope(YIELDED_MESSAGE)]
-    assert processor.turns == []
-    assert processor.capability_turns == []
+    await connection.send({"type": "text", "text": "set a timer for 10 minutes"})
+    session_id = connection.ws.handshake_session_id
+    await connection.leave()
+
+    frames = connection.ws.frames
+    assert _errors(frames) == []
+    assert handler.capability_calls == [("set a timer for 10 minutes", session_id)]
+    assert handler.requests == []
+    names = _names(frames)
+    assert names.index("stream_start") < names.index("stream_complete")
 
 
-def test_empty_text_while_yielded_is_refused_with_a_host_attached(stub, monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "_gpu_yield", yielded_gpu(tmp_path))
-    _attach_host(monkeypatch)
-    processor = _capability_stub(monkeypatch, handled=True)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [True, False], ids=["gaming-mode-normal", "no-gaming-mode"])
+async def test_a_typed_turn_reaches_the_model_when_not_yielded(monkeypatch, tmp_path, configured):
+    handler = RecordingConversationHandler()
+    gpu = normal_gpu(tmp_path) if configured else None
+    install_runtime(monkeypatch, handler, power_gate=_gate(monkeypatch, gpu), llm_provider=PROVIDER)
+    connection = await connect()
 
-    with _session(TestClient(server.app)) as ws:
-        ws.receive_json()
-        replies = _send_and_collect(ws, {"type": "text", "text": ""})
+    await connection.send({"type": "text", "text": "hello"})
+    await connection.leave()
 
-    assert replies == [_envelope(YIELDED_MESSAGE)]
-    assert processor.capability_turns == []
+    assert [r.user_text for r in handler.requests] == ["hello"]
+    assert handler.capability_calls == []
+    assert _errors(connection.ws.frames) == []
+    assert "stream_complete" in _names(connection.ws.frames)
 
 
-def test_text_with_a_host_when_not_yielded_takes_the_normal_turn(stub, monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "_gpu_yield", normal_gpu(tmp_path))
-    _attach_host(monkeypatch)
-    processor = _capability_stub(monkeypatch, handled=True)
+@pytest.mark.asyncio
+async def test_before_the_runtime_has_a_provider_the_refusal_names_the_missing_model(
+    monkeypatch, tmp_path
+):
+    handler = RecordingConversationHandler()
+    install_runtime(monkeypatch, handler, power_gate=_gate(monkeypatch, normal_gpu(tmp_path)))
+    connection = await connect()
 
-    with _session(TestClient(server.app)) as ws:
-        ws.receive_json()
-        replies = _send_and_collect(ws, {"type": "text", "text": "hello"})
+    await connection.send({"type": "text", "text": "hello"})
+    await connection.leave()
 
-    assert replies == []
-    assert processor.turns == [("text", "hello")]
-    assert processor.capability_turns == []
+    assert [e["message"] for e in _errors(connection.ws.frames)] == [NO_MODEL_MESSAGE]
+    assert handler.requests == []
+
+
+# -- health_status ---------------------------------------------------------------------------
 
 
 async def _first_health_status(monkeypatch) -> dict:
@@ -327,355 +200,85 @@ async def _first_health_status(monkeypatch) -> dict:
     return json.loads(payload)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("build", "expected_llm"),
     [
         pytest.param(yielded_gpu, False, id="yielded"),
-        pytest.param(resume_failed_gpu, False, id="resume-failed"),
         pytest.param(normal_gpu, True, id="normal"),
         pytest.param(None, True, id="no-gaming-mode"),
     ],
 )
-def test_health_status_llm_is_false_while_yielded(stub, monkeypatch, tmp_path, build, expected_llm):
-    if build is not None:
-        monkeypatch.setattr(server, "_gpu_yield", build(tmp_path))
+async def test_health_status_llm_is_false_while_yielded(monkeypatch, tmp_path, build, expected_llm):
+    monkeypatch.setattr(server, "_gpu_yield", build(tmp_path) if build is not None else None)
+    monkeypatch.setattr(server, "runtime", SimpleNamespace(agent_available=True))
 
-    payload = asyncio.run(_first_health_status(monkeypatch))
+    payload = await _first_health_status(monkeypatch)
 
-    assert payload == {"type": "health_status", "llm": expected_llm, "agent": False, "local": True}
-
-
-class ReleasedModels:
-    """A model manager whose Whisper was released after the turn passed the gate."""
-
-    def transcribe_audio(self, audio_data, sample_rate):
-        raise GpuYieldedError("Whisper is not loaded")
+    assert payload == {"type": "health_status", "llm": expected_llm, "agent": True, "local": True}
 
 
 @pytest.mark.asyncio
-async def test_speech_turn_past_the_gate_gets_the_yielded_envelope_and_records_no_turn():
-    from backend import voice_processor as vp_module
+async def test_health_status_reads_no_llm_and_no_agent_before_the_runtime_is_built(monkeypatch):
+    monkeypatch.setattr(server, "_gpu_yield", None)
+    monkeypatch.setattr(server, "runtime", None)
 
-    queue: asyncio.Queue = asyncio.Queue()
-    processor = vp_module.VoiceProcessor(VoiceConfig(tts_enabled=False), message_queue=queue)
-    processor.models = ReleasedModels()
-    processor.loop = asyncio.get_running_loop()
-    turns: list[str] = []
-    processor._process_conversation_turn = lambda text, **kwargs: turns.append(text)
+    payload = await _first_health_status(monkeypatch)
 
-    await asyncio.to_thread(processor._process_user_speech, [0.0, 0.1], 16000)
-    message = json.loads(await asyncio.wait_for(queue.get(), timeout=5.0))
-
-    assert message == _envelope(YIELDED_MESSAGE)
-    assert queue.empty()
-    assert turns == []
-
-
-# --- The capability-only turn in the voice processor ------------------------------
-
-_STARTED = {"type": "tool_call_started", "tool_call_id": "call-1", "name": "timers.start"}
-_COMPLETED = {"type": "tool_call_completed", "tool_call_id": "call-1", "name": "timers.start"}
-_REPLY = "Timer set for 10 minutes."
-
-
-class ScriptedCapabilityHandler:
-    """A conversation handler whose capability-only answer is scripted."""
-
-    def __init__(self, answer) -> None:
-        self.answer = answer
-        self.calls: list[tuple[str, str]] = []
-
-    async def handle_capability_only(self, text: str, session_id: str):
-        self.calls.append((text, session_id))
-        if isinstance(self.answer, BaseException):
-            raise self.answer
-        return self.answer
-
-
-_SUPERSEDED = {
-    "type": "action_resolved",
-    "proposal_id": "p1",
-    "session_id": "s1",
-    "decision": "superseded",
-    "outcomes": [],
-}
-_UNHANDLED = CapabilityOnlyTurn(handled=False, events=())
-
-
-def _answered_events() -> list:
-    return [
-        WSEvent(payload=dict(_STARTED)),
-        WSEvent(payload=dict(_COMPLETED)),
-        Token(text=_REPLY),
-        Complete(final_response=_REPLY, tool_calls_used=1, duration_ms=3.0),
-    ]
-
-
-def _answered_turn() -> CapabilityOnlyTurn:
-    return CapabilityOnlyTurn(handled=True, events=tuple(_answered_events()))
-
-
-class GatedQueue(asyncio.Queue):
-    """A queue whose every put waits for `gate`, so a test can see whether a writer waited."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.gate = asyncio.Event()
-
-    async def put(self, item) -> None:
-        await self.gate.wait()
-        await super().put(item)
-
-
-def _drain_now(queue: asyncio.Queue) -> list:
-    items = []
-    while not queue.empty():
-        items.append(queue.get_nowait())
-    return items
-
-
-def _trim(text: str) -> str:
-    return ModelManager.trim_to_last_sentence(None, text)  # type: ignore[arg-type]
-
-
-def _processor(queue: asyncio.Queue, handler, model_items=None):
-    """A real `VoiceProcessor`, text only, over a handler and a scripted model path.
-
-    The model path records each call; with `model_items` None it yields nothing, so a test
-    can assert that it never ran.
-    """
-    from backend import voice_processor as vp_module
-
-    model_calls: list[str] = []
-
-    def generate_llm_response(user_text):
-        model_calls.append(user_text)
-        for item in model_items or ():
-            if isinstance(item, Complete):
-                current_turn_complete.set(item)
-            else:
-                yield item
-
-    processor = vp_module.VoiceProcessor(VoiceConfig(tts_enabled=False), message_queue=queue)
-    processor.loop = asyncio.get_running_loop()
-    processor.models = SimpleNamespace(
-        knowledge=SimpleNamespace(conversation_handler=handler, is_enabled=lambda: True),
-        generate_llm_response=generate_llm_response,
-        trim_to_last_sentence=_trim,
-    )
-    return processor, model_calls
-
-
-async def _messages_until_idle(queue: asyncio.Queue) -> list[dict]:
-    messages = []
-    while True:
-        message = json.loads(await asyncio.wait_for(queue.get(), timeout=5.0))
-        messages.append(message)
-        if message == {"type": "state_cycle", "state": "idle"}:
-            return messages
-
-
-async def _settle() -> None:
-    """Let any put the worker thread scheduled on the loop run."""
-    for _ in range(5):
-        await asyncio.sleep(0)
-
-
-def _comparable(messages: list[dict]) -> list[dict]:
-    """The messages with the per-turn id and the timing left out."""
-    out = []
-    for message in messages:
-        message = {k: v for k, v in message.items() if k not in ("turn_id", "duration_ms")}
-        out.append(message)
-    return out
+    assert payload == {"type": "health_status", "llm": False, "agent": False, "local": True}
 
 
 @pytest.mark.asyncio
-async def test_a_handled_capability_turn_streams_like_a_text_turn():
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_answered_turn())
-    processor, model_calls = _processor(queue, handler)
+async def test_health_status_agent_is_false_when_turns_are_answered_without_memory(monkeypatch):
+    monkeypatch.setattr(server, "_gpu_yield", None)
+    monkeypatch.setattr(server, "runtime", SimpleNamespace(agent_available=False))
 
-    answered = await asyncio.to_thread(
-        processor._process_conversation_turn, _TIMER_TEXT, session_id="s1", capability_only=True
+    payload = await _first_health_status(monkeypatch)
+
+    assert (payload["llm"], payload["agent"]) == (True, False)
+
+
+# -- The boot --------------------------------------------------------------------------------
+
+
+def _build_at_boot(
+    monkeypatch, gpu: GpuYield | None
+) -> tuple[Loaders, FakeProvider, HandlerFactory]:
+    """`build_mist_runtime` with the gate `lifespan` builds, over fake loaders and provider."""
+    no_device = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setitem(sys.modules, "torch", no_device)
+    loaders = Loaders()
+    provider = FakeProvider()
+    factory = HandlerFactory()
+    build_mist_runtime(
+        knowledge_config(),  # type: ignore[arg-type]
+        voice_settings=settings(),
+        llm_provider=provider,  # type: ignore[arg-type]
+        handler_factory=factory,
+        engine_loaders=loaders.build(),
+        gpu_meter=TorchGpuMeter(lambda: no_device),
+        lanes=inline_lanes(),
+        power_gate=_gate(monkeypatch, gpu),
+        torch_loader=lambda: no_device,
     )
-    off_messages = await _messages_until_idle(queue)
-
-    normal_queue: asyncio.Queue = asyncio.Queue()
-    normal, _calls = _processor(
-        normal_queue,
-        ScriptedCapabilityHandler(None),
-        model_items=[dict(_STARTED), dict(_COMPLETED), _REPLY, _answered_events()[-1]],
-    )
-    await asyncio.to_thread(normal._process_conversation_turn, _TIMER_TEXT, session_id="s1")
-    normal_messages = await _messages_until_idle(normal_queue)
-
-    assert answered is True
-    assert handler.calls == [(_TIMER_TEXT, "s1")]
-    assert model_calls == []
-    assert _comparable(off_messages) == _comparable(normal_messages)
-    assert [m["type"] for m in off_messages] == [
-        "state_cycle",
-        "stream_start",
-        "tool_call_started",
-        "tool_call_completed",
-        "state_cycle",
-        "stream_token",
-        "stream_complete",
-        "state_cycle",
-    ]
-    complete = off_messages[-2]
-    assert (complete["full_text"], complete["tool_calls_used"]) == (_REPLY, 1)
-    assert not processor.generation_lock.locked()
+    return loaders, provider, factory
 
 
-@pytest.mark.asyncio
-async def test_an_unhandled_capability_turn_sends_nothing_and_calls_no_model():
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_UNHANDLED)
-    processor, model_calls = _processor(queue, handler)
+def test_a_boot_with_the_marker_present_builds_no_cuda_engine_and_skips_the_warmup(
+    monkeypatch, tmp_path
+):
+    """Main's `load_all_models(yielded=True)`: no GPU model, no LLM warm-up, embeddings warmed."""
+    loaders, provider, factory = _build_at_boot(monkeypatch, yielded_gpu(tmp_path))
 
-    answered = await asyncio.to_thread(
-        processor._process_conversation_turn,
-        "tell me a story",
-        session_id="s1",
-        capability_only=True,
-    )
-    await _settle()
-
-    assert answered is False
-    assert handler.calls == [("tell me a story", "s1")]
-    assert model_calls == []
-    assert queue.empty()
-    assert not processor.generation_lock.locked()
+    assert loaders.calls, "the CPU engines still load"
+    assert not [call for call in loaders.calls if call.endswith("@cuda")]
+    assert provider.warmups == []
+    assert factory.embedder.warmed == 1
 
 
-@pytest.mark.asyncio
-async def test_an_unhandled_capability_turn_sends_what_its_pre_llm_step_drained():
-    # A message that superseded a live proposal is still refused, but every client must
-    # learn that the proposal is gone; the payload is on the queue before the call returns,
-    # so it is queued before the caller sends the refusal.
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(
-        CapabilityOnlyTurn(handled=False, events=(WSEvent(payload=dict(_SUPERSEDED)),))
-    )
-    processor, model_calls = _processor(queue, handler)
+def test_a_boot_without_the_marker_tries_cuda_first_and_warms_the_llm(monkeypatch, tmp_path):
+    loaders, provider, factory = _build_at_boot(monkeypatch, normal_gpu(tmp_path))
 
-    answered = await asyncio.to_thread(
-        processor._process_conversation_turn,
-        "tell me a story",
-        session_id="s1",
-        capability_only=True,
-    )
-    sent = _drain_now(queue)
-
-    assert answered is False
-    assert sent == [json.dumps(_SUPERSEDED)]
-    assert model_calls == []
-    assert not processor.generation_lock.locked()
-
-
-@pytest.mark.asyncio
-async def test_an_unhandled_capability_turn_returns_only_after_its_puts_finish():
-    queue = GatedQueue()
-    handler = ScriptedCapabilityHandler(
-        CapabilityOnlyTurn(handled=False, events=(WSEvent(payload=dict(_SUPERSEDED)),))
-    )
-    processor, _model_calls = _processor(queue, handler)
-
-    turn = asyncio.ensure_future(
-        asyncio.to_thread(
-            processor._process_conversation_turn,
-            "tell me a story",
-            session_id="s1",
-            capability_only=True,
-        )
-    )
-    await asyncio.sleep(0.2)
-    returned_before_the_put = turn.done()
-    queue.gate.set()
-    answered = await asyncio.wait_for(turn, timeout=5.0)
-
-    assert returned_before_the_put is False
-    assert answered is False
-    assert _drain_now(queue) == [json.dumps(_SUPERSEDED)]
-
-
-@pytest.mark.asyncio
-async def test_a_capability_turn_with_no_conversation_handler_is_unhandled():
-    queue: asyncio.Queue = asyncio.Queue()
-    processor, model_calls = _processor(queue, None)
-    processor.models.knowledge = None
-
-    answered = await asyncio.to_thread(
-        processor._process_conversation_turn, _TIMER_TEXT, session_id="s1", capability_only=True
-    )
-    await _settle()
-
-    assert answered is False
-    assert model_calls == []
-    assert queue.empty()
-    assert not processor.generation_lock.locked()
-
-
-@pytest.mark.asyncio
-async def test_a_capability_turn_while_a_turn_is_in_flight_is_unhandled_and_not_queued():
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_answered_turn())
-    processor, model_calls = _processor(queue, handler)
-    processor.generation_lock.acquire()
-    try:
-        answered = await asyncio.to_thread(
-            processor._process_conversation_turn,
-            _TIMER_TEXT,
-            session_id="s1",
-            capability_only=True,
-        )
-    finally:
-        processor.generation_lock.release()
-    await _settle()
-
-    assert answered is False
-    assert handler.calls == []
-    assert processor.latest_user_input is None
-    assert model_calls == []
-    assert queue.empty()
-
-
-@pytest.mark.asyncio
-async def test_a_capability_turn_does_not_respawn_a_queued_model_turn():
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(_answered_turn())
-    processor, model_calls = _processor(queue, handler)
-    processor.latest_user_input = ("what is the weather", "s1")
-
-    await asyncio.to_thread(
-        processor._process_conversation_turn, _TIMER_TEXT, session_id="s1", capability_only=True
-    )
-    await _messages_until_idle(queue)
-    await asyncio.sleep(0.05)
-
-    assert model_calls == []
-    assert processor.latest_user_input == ("what is the weather", "s1")
-
-
-@pytest.mark.asyncio
-async def test_a_failing_capability_turn_gets_an_error_without_the_exception_text():
-    queue: asyncio.Queue = asyncio.Queue()
-    handler = ScriptedCapabilityHandler(RuntimeError("token tok-quince-7741 rejected"))
-    processor, model_calls = _processor(queue, handler)
-
-    answered = await asyncio.to_thread(
-        processor._process_conversation_turn, _TIMER_TEXT, session_id="s1", capability_only=True
-    )
-    messages = await _messages_until_idle(queue)
-
-    assert answered is True
-    assert model_calls == []
-    errors = [m for m in messages if m["type"] == "error"]
-    assert len(errors) == 1
-    assert errors[0]["kind"] == "model"
-    assert errors[0]["retriable"] is True
-    assert "tok-quince-7741" not in json.dumps(messages)
-    assert "stream_start" not in [m["type"] for m in messages]
-    assert not processor.generation_lock.locked()
+    assert [call for call in loaders.calls if call.endswith("@cuda")]
+    assert len(provider.warmups) == 1
+    assert factory.embedder.warmed == 1

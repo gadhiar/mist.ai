@@ -99,9 +99,10 @@ from backend.user_timezone import USER_TIMEZONE_ENV, resolve_user_timezone
 if TYPE_CHECKING:
     from backend.chat.context_budget import TokenCounter
     from backend.realtime.budget import VoiceSettings
+    from backend.realtime.power import PowerGate
     from backend.realtime.protocol import PowerLevel
     from backend.realtime.runtime import EngineLoaders, GpuMeter, MistRuntime
-    from backend.realtime.session import InferenceLanes, SpeechEngines
+    from backend.realtime.session import CapabilityMessage, InferenceLanes, SpeechEngines
 
 logger = logging.getLogger(__name__)
 
@@ -788,6 +789,7 @@ def build_conversation_handler(
     with_extraction_dispatcher: bool = False,
     *,
     conversation_llm_provider: StreamingLLMProvider | None = None,
+    register_prompt: str | None = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -868,6 +870,8 @@ def build_conversation_handler(
             `build_llm_provider(config, role="conversation")` if the
             conversation role is set in `config.llm.roles`, else the base
             provider. The extraction pipeline never receives it.
+        register_prompt: The persona's register sentence for the prompt's stable prefix
+            (`PersonaRegister.prompt_line()`); None leaves the prompt without one.
     """
     from pathlib import Path
 
@@ -979,6 +983,7 @@ def build_conversation_handler(
         # harness / CLI probes set it to "test" so their sessions are
         # excludable from an R1.6 rebuild.
         session_origin=config.event_store.session_origin,
+        register_prompt=register_prompt,
     )
     if with_extraction_dispatcher and handler.event_store is not None:
         handler.attach_extraction_dispatcher(
@@ -1857,6 +1862,11 @@ def build_mist_runtime(
     vault_writer: "VaultWriter | None" = None,
     vault_sidecar: SidecarIndexProtocol | None = None,
     invalidation_bus: "InvalidationBus | None" = None,
+    power_gate: "PowerGate | None" = None,
+    alarm_ringing: Callable[[], bool] | None = None,
+    on_capability_message: "Callable[[str, CapabilityMessage], None] | None" = None,
+    register_prompt: str | None = None,
+    torch_loader: Callable[[], object] | None = None,
 ) -> "MistRuntime":
     """Compose what every realtime session shares: responder, speech engines, lanes, settings.
 
@@ -1864,6 +1874,12 @@ def build_mist_runtime(
     (Neo4j unreachable raises `Neo4jConnectionError`) degrades to `DirectResponder`; any other
     exception is a bug and fails startup with its traceback. The LLM is warmed unless the GPU is
     yielded at boot, and the embedding model always, as `ModelManager.load_all_models` did.
+
+    `llm_provider` is the base provider: the handler build gives it to the extraction pipeline
+    and, by T39's rule, the conversation role's provider to the handler. `MistRuntime.llm_provider`
+    is that base, which curation and `/health` read. The runtime's `gpu` is the GPU control
+    gaming mode's `GpuYield` reaches through `release_gpu_engines` and `reload_gpu_engines`; the
+    caller attaches it to the loop and the registry.
 
     Args:
         config: The knowledge configuration; `llm.voice_first_segment_min_chars` sets the
@@ -1880,16 +1896,27 @@ def build_mist_runtime(
         vault_writer: Passed to the handler build.
         vault_sidecar: Passed to the handler build.
         invalidation_bus: Passed to the handler build.
+        power_gate: The gate every session applies to turns and voice (T22); its level is the
+            process's when `power_level` is None.
+        alarm_ringing: Whether an alarm rings now (D8), for every controller.
+        on_capability_message: Where each session hands `action_decision`, `alarm_action` and
+            `alarm_report`.
+        register_prompt: The persona's register sentence, passed to the handler build.
+        torch_loader: Imports torch for the GPU control's cache release; torch itself when None.
     """
+    import importlib
+
     from backend.errors import MistError
     from backend.llm.models import LLMRequest
     from backend.realtime.degraded import DirectResponder
     from backend.realtime.lanes import InferenceLane
-    from backend.realtime.runtime import MistRuntime, primary_placement
+    from backend.realtime.runtime import GpuEngines, MistRuntime, TorchGpuMeter, primary_placement
     from backend.realtime.session import InferenceLanes, SessionServices
 
     provider = llm_provider if llm_provider is not None else build_llm_provider(config)
-    level: Callable[[], PowerLevel] = power_level or (lambda: "full")
+    level: Callable[[], PowerLevel] = power_level or (
+        power_gate.level if power_gate is not None else (lambda: "full")
+    )
     settings = replace(
         voice_settings,
         segmenter=replace(
@@ -1913,14 +1940,17 @@ def build_mist_runtime(
                 vault_writer=vault_writer,
                 vault_sidecar=vault_sidecar,
                 invalidation_bus=invalidation_bus,
+                register_prompt=register_prompt,
             )
         except MistError as error:
             logger.warning("Knowledge integration unavailable, answering without memory: %s", error)
     responder = handler if handler is not None else DirectResponder(provider)
 
-    engines = build_speech_engines(
-        settings, loaders=engine_loaders, power_level=level(), gpu_meter=gpu_meter
-    )
+    load_torch = torch_loader or (lambda: importlib.import_module("torch"))
+    meter = gpu_meter if gpu_meter is not None else TorchGpuMeter(load_torch)
+    loaders = engine_loaders if engine_loaders is not None else _real_engine_loaders()
+    engines = build_speech_engines(settings, loaders=loaders, power_level=level(), gpu_meter=meter)
+    gpu = GpuEngines(engines, settings, loaders, torch_loader=load_torch, gpu_meter=meter)
     if lanes is None:
         lanes = InferenceLanes(
             vad=InferenceLane("vad"),
@@ -1941,6 +1971,11 @@ def build_mist_runtime(
         logger.info("Warming up embedding model...")
         warmup()
 
+    extra: dict[str, object] = {}
+    if alarm_ringing is not None:
+        extra["alarm_ringing"] = alarm_ringing
+    if on_capability_message is not None:
+        extra["on_capability_message"] = on_capability_message
     services = SessionServices(
         responder=responder,  # type: ignore[arg-type]
         engines=engines,
@@ -1949,8 +1984,11 @@ def build_mist_runtime(
         placement=lambda: primary_placement(engines, settings),
         power_level=level,
         tts_enabled=tts_enabled,
+        power_gate=power_gate,
+        **extra,  # type: ignore[arg-type]
     )
     return MistRuntime(
+        gpu=gpu,
         llm_provider=provider,
         conversation_handler=handler,
         responder=responder,  # type: ignore[arg-type]

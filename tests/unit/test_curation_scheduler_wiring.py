@@ -79,22 +79,19 @@ def _make_handler(*, event_store_enabled: bool = True) -> ConversationHandler:
 _HANDLERS_PROVIDER = object()
 
 
-def _voice_processor_for(
+def _runtime_for(
     handler: ConversationHandler | None, provider: object = _HANDLERS_PROVIDER
 ) -> SimpleNamespace:
-    """Wrap a handler in the voice_processor -> models -> knowledge chain.
+    """The runtime's two fields curation reads: the handler, and the base provider.
 
-    `_llm_provider` is the base provider the live voice processor builds and
-    injects into `build_conversation_handler` (`voice_processor.py`), the one
-    `/health` probes. It defaults to the handler's own `_provider`, which is
-    that same object when no conversation role is set.
+    `llm_provider` is the base provider `lifespan` builds and `build_mist_runtime`
+    injects into `build_conversation_handler`, the one `/health` probes. It
+    defaults to the handler's own `_provider`, which is that same object when no
+    conversation role is set.
     """
     if provider is _HANDLERS_PROVIDER:
         provider = handler._provider if handler is not None else None
-    return SimpleNamespace(
-        _llm_provider=provider,
-        models=SimpleNamespace(knowledge=SimpleNamespace(conversation_handler=handler)),
-    )
+    return SimpleNamespace(llm_provider=provider, conversation_handler=handler)
 
 
 def _job(scheduler, name: str):
@@ -145,43 +142,31 @@ class TestResolveCurationDependencies:
         equivalents of them.
         """
         handler = _make_handler()
-        voice_processor = _voice_processor_for(handler)
+        runtime = _runtime_for(handler)
 
-        deps = server._resolve_curation_dependencies(voice_processor)
+        deps = server._resolve_curation_dependencies(runtime)
 
         assert deps.handler_found is True
         assert deps.tracker is handler._tool_usage_tracker
         assert deps.event_store is handler.event_store
-        assert deps.llm_provider is voice_processor._llm_provider
+        assert deps.llm_provider is runtime.llm_provider
 
     @pytest.mark.parametrize(
-        "voice_processor",
+        "runtime",
         [
-            pytest.param(None, id="no-voice-processor"),
-            pytest.param(SimpleNamespace(models=None), id="no-models"),
-            pytest.param(
-                SimpleNamespace(models=SimpleNamespace(knowledge=None)),
-                id="no-knowledge-integration",
-            ),
-            pytest.param(
-                SimpleNamespace(models=SimpleNamespace(knowledge=SimpleNamespace())),
-                id="no-conversation-handler-attribute",
-            ),
+            pytest.param(None, id="no-runtime"),
+            pytest.param(_runtime_for(None, object()), id="no-conversation-handler"),
+            pytest.param(SimpleNamespace(llm_provider=object()), id="no-handler-attribute"),
         ],
     )
-    def test_reports_handler_not_found_on_every_broken_link(self, voice_processor):
-        """Each link in the chain is optional in production. A break at any
-        of them must surface as `handler_found=False` -- the signal lifespan
-        logs a warning on -- rather than as an AttributeError that the
-        surrounding `except Exception` would swallow into "scheduler failed
-        to start".
+    def test_reports_handler_not_found_on_every_broken_link(self, runtime):
+        """The handler is optional in production (knowledge integration off,
+        or its build failed and turns go to `DirectResponder`). Its absence
+        must surface as `handler_found=False` -- the signal lifespan logs a
+        warning on -- rather than as an AttributeError that the surrounding
+        `except Exception` would swallow into "scheduler failed to start".
         """
-        if isinstance(voice_processor, SimpleNamespace) and hasattr(voice_processor, "models"):
-            knowledge = getattr(voice_processor.models, "knowledge", None)
-            if knowledge is not None and not hasattr(knowledge, "conversation_handler"):
-                knowledge.conversation_handler = None
-
-        deps = server._resolve_curation_dependencies(voice_processor)
+        deps = server._resolve_curation_dependencies(runtime)
 
         assert deps.handler_found is False
         assert deps.event_store is None
@@ -196,14 +181,14 @@ class TestResolveCurationDependencies:
         """
         handler = _make_handler(event_store_enabled=False)
         assert handler.event_store is None, "precondition: config disabled the store"
-        voice_processor = _voice_processor_for(handler)
+        runtime = _runtime_for(handler)
 
-        deps = server._resolve_curation_dependencies(voice_processor)
+        deps = server._resolve_curation_dependencies(runtime)
 
         assert deps.handler_found is True
         assert deps.event_store is None
         assert deps.tracker is handler._tool_usage_tracker
-        assert deps.llm_provider is voice_processor._llm_provider
+        assert deps.llm_provider is runtime.llm_provider
 
 
 class TestSchedulerObjectGraph:
@@ -213,7 +198,7 @@ class TestSchedulerObjectGraph:
         indistinguishable by value.
         """
         handler = _make_handler()
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler))
+        deps = server._resolve_curation_dependencies(_runtime_for(handler))
 
         scheduler, _ = _build_scheduler(
             handler.config,
@@ -231,7 +216,7 @@ class TestSchedulerObjectGraph:
         """
         handler = _make_handler(event_store_enabled=True)
         assert handler.event_store is not None, "precondition: config enabled the store"
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler))
+        deps = server._resolve_curation_dependencies(_runtime_for(handler))
 
         scheduler, _ = _build_scheduler(
             handler.config,
@@ -244,15 +229,15 @@ class TestSchedulerObjectGraph:
         assert reflection_job._event_store is not None
         assert reflection_job._event_store is handler.event_store
 
-    def test_internal_deriver_uses_the_voice_processors_base_provider(self):
+    def test_internal_deriver_uses_the_runtimes_base_provider(self):
         """Supplying the provider is what keeps the deriver's LLM calls on
         the same (possibly instrumented) base provider the extraction
         pipeline uses and `/health` probes, instead of a second one the
         factory builds with no debug logger.
         """
         handler = _make_handler()
-        voice_processor = _voice_processor_for(handler)
-        deps = server._resolve_curation_dependencies(voice_processor)
+        runtime = _runtime_for(handler)
+        deps = server._resolve_curation_dependencies(runtime)
 
         scheduler, _ = _build_scheduler(
             handler.config,
@@ -261,12 +246,12 @@ class TestSchedulerObjectGraph:
             llm_provider=deps.llm_provider,
         )
 
-        assert _job(scheduler, "self_reflection")._deriver._llm is voice_processor._llm_provider
+        assert _job(scheduler, "self_reflection")._deriver._llm is runtime.llm_provider
 
     def test_curation_keeps_the_base_provider_when_the_conversation_role_is_set(self, monkeypatch):
         """Design review finding 1: with the conversation role set the handler
         holds the role's provider, and curation must not follow it. It takes
-        the base the voice processor injected, which the pipeline also holds.
+        the base the runtime build injected, which the pipeline also holds.
         """
         from backend.knowledge.config import ContextBudgetConfig, LLMConfig
         from tests.unit.knowledge.conftest import FakeVectorStore
@@ -289,7 +274,7 @@ class TestSchedulerObjectGraph:
         assert handler._provider is not base, "precondition: the handler holds the role's"
         pipeline_provider = handler._extraction_pipeline._extractor._llm
 
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler, base))
+        deps = server._resolve_curation_dependencies(_runtime_for(handler, base))
         scheduler, _ = _build_scheduler(
             config,
             event_store=deps.event_store,
@@ -339,7 +324,7 @@ class TestSkillDerivationIsReachable:
         them. This is the property "the parameter was passed" cannot express.
         """
         handler = _make_handler()
-        deps = server._resolve_curation_dependencies(_voice_processor_for(handler))
+        deps = server._resolve_curation_dependencies(_runtime_for(handler))
         scheduler, connection = _build_scheduler(
             handler.config,
             event_store=deps.event_store,
