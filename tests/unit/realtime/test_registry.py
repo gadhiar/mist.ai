@@ -246,9 +246,13 @@ class TestRouting:
         # As the broadcaster routes `message_queue`: JSON text to every session.
         rig.registry.broadcast(json.dumps({"type": "heartbeat", "timestamp": 1}))
         rig.registry.broadcast(json.dumps({"type": "system_status", "timestamp": 1}))
+        # As the turn controller sends a turn's proposal: on that session's own `turn` lane.
+        for client in (desk, room):
+            session_id = client.session.session_id
+            proposal = {"type": "action_proposed", "proposal_id": "p1", "session_id": session_id}
+            client.session.send_turn("turn-1", proposal)
         # As capabilities emit through their sink, which sends `alarm_fired` to the desktop.
         sink.emit({"type": "capabilities_status", "rev": 1})
-        sink.emit({"type": "action_proposed", "proposal_id": "p1", "session_id": "a"})
         sink.emit({"type": "alarm_state", "rev": 1, "ringing": []})
         sink.emit({"type": "alarm_fired", "alarm_id": "a1"})
         # As a device's ring sink rings it, and as an alarm action is answered.
