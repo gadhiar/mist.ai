@@ -11,6 +11,7 @@ frame within it into the position a hit is scripted at. Transcripts are scripted
 the gate decodes run: entries in manifest order, one decode per distinct span.
 """
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -24,16 +25,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from backend.realtime.budget import EndpointingConfig, PlacementConfig
+from backend.realtime.budget import EndpointingConfig, PlacementConfig, load_voice_settings
 from backend.realtime.engines.kws import read_manifest
 from backend.realtime.engines.parakeet_stt import OnnxAsrLibrary, ParakeetTranscriber
 from backend.realtime.ingress import (
+    AudioIngress,
+    IngressEngines,
+    IngressLanes,
     SegmentStep,
     SpeechSegmentTracker,
-    onset_feed_start,
     onset_lead_frames,
 )
-from backend.realtime.speech import NameHit
+from backend.realtime.protocol import Frame, MsgType
+from backend.realtime.speech import CancelToken, NameHit
 from scripts.wake import eval_wake
 from scripts.wake import manifest as wake_manifest
 from tests.fakes.speech import EnergyVad, ScriptedNameSpotter, ScriptedTranscriber
@@ -722,9 +726,88 @@ def test_the_harness_segments_through_ingress_s_tracker(
     closed = [step.closed for step in steps if step.closed is not None]
     assert heard.segments == tuple(closed) and len(closed) == 1
     (onset,) = (step.started[0] for step in steps if step.started is not None)
-    first_feed = heard.feeds[0]
-    assert first_feed.reset
-    assert first_feed.positions[0] == max(onset_feed_start(onset, onset_lead_frames(cfg), None), 0)
+    fed = [pos for feed in heard.feeds for pos in (*feed.warm, *feed.push)]
+    assert fed == list(range(len(fed)))
+    pushed = [pos for feed in heard.feeds for pos in feed.push]
+    assert pushed[0] == max(onset - onset_lead_frames(cfg), 0)
+
+
+class ImmediateLane:
+    """Runs each job at once on the event loop, as the harness makes every engine call."""
+
+    async def run(self, fn: object, *args: object, token: CancelToken) -> object:
+        return fn(*args)  # type: ignore[operator]
+
+
+def tone_and_silence(parts_ms: Sequence[tuple[bool, int]]) -> np.ndarray:
+    """Alternating tone and silence, each part a whole number of 20 ms frames."""
+    pieces = []
+    for loud, ms in parts_ms:
+        count = RATE * ms // 1000
+        t = np.arange(count) / RATE
+        level = 0.3 * 32767 if loud else 0.0
+        pieces.append((level * np.sin(2 * np.pi * 440.0 * t)).astype("<i2"))
+    return np.concatenate(pieces)
+
+
+@pytest.mark.asyncio
+async def test_the_harness_feeds_the_spotter_what_ingress_feeds_it(tmp_path: Path) -> None:
+    samples = tone_and_silence(
+        [(False, 640), (True, 640), (False, 800), (True, 400), (False, 1200)]
+    )
+    recording = tmp_path / "recordings" / "p" / "a.wav"
+    recording.parent.mkdir(parents=True)
+    with wave.open(str(recording), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(samples.tobytes())
+    duration_ms = len(samples) * 1000 // RATE
+    path = write_manifest(tmp_path, [entry("p/a.wav", duration_ms=duration_ms)])
+    (item,) = wake_manifest.load_manifest(path).entries
+    settings = load_voice_settings({})
+
+    live = ScriptedNameSpotter()
+    lane = ImmediateLane()
+    ingress = AudioIngress(
+        engines=IngressEngines(
+            vad=EnergyVad(), transcriber=ScriptedTranscriber([]), turn_end=None, spotter=live
+        ),
+        lanes=IngressLanes(vad=lane, stt=lane, eot=lane, kws=lane),
+        endpointing=settings.endpointing,
+        wake=settings.wake,
+        emit=lambda event: None,
+        retention_ms=7000,
+        epoch=1,
+        new_utterance_id=lambda: "u1",
+        clock=lambda: 0,
+    )
+    pcm = samples.tobytes()
+    frame_bytes = RATE * FRAME_MS // 1000 * 2
+    for pos in range(len(pcm) // frame_bytes):
+        payload = pcm[pos * frame_bytes : (pos + 1) * frame_bytes]
+        ingress.push_frame(Frame(MsgType.MIC_AUDIO, 0, pos, RATE, payload), pos)
+        for _ in range(20):
+            await asyncio.sleep(0)
+    ingress.close()
+
+    offline = ScriptedNameSpotter()
+    driver = eval_wake._Driver(
+        eval_wake.Engines(spotter=offline, vad=EnergyVad(), transcriber=ScriptedTranscriber([])),
+        settings,
+        [settings.wake.kws_threshold],
+        FakeClock(),
+    )
+    driver.run(item, 0)
+
+    (heard,) = live.streams
+    (scored,) = offline.streams
+    assert heard.pushed and heard.warmed
+    assert (scored.resets, scored.warmed, scored.pushed) == (
+        heard.resets,
+        heard.warmed,
+        heard.pushed,
+    )
 
 
 # -- The harness: refusals --------------------------------------------------------------------
