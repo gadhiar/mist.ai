@@ -61,6 +61,8 @@ def write_registry(path: Path, entries: list[dict[str, object]]) -> None:
 
 ROOM = token_of("example-room", secret_for(1))
 OTHER = token_of("other-room", secret_for(2))
+ROTATED_ROOM = token_of("example-room", secret_for(4))
+"""`example-room`'s token after `devices.py rotate`."""
 
 
 class FakeClock:
@@ -144,6 +146,23 @@ class AsgiDevice:
         await asyncio.wait_for(self.task, timeout=5)
 
 
+class GatedDevice(AsgiDevice):
+    """A connection whose accept is held until the test opens `gate`.
+
+    The app has verified the token by the time it sends the accept, so holding the accept opens
+    the window between verification and the live set that a registry read can land in.
+    """
+
+    def __init__(self, app, authorization: str | None) -> None:
+        self.gate = asyncio.Event()
+        super().__init__(app, authorization)
+
+    async def _send(self, message: dict[str, object]) -> None:
+        if message["type"] == "websocket.accept":
+            await self.gate.wait()
+        await super()._send(message)
+
+
 class RecordingServe:
     """The per-connection serve: records who it served, greets, and echoes until disconnect."""
 
@@ -176,6 +195,12 @@ class Rig:
 
     async def connect(self, authorization: str | None) -> AsgiDevice:
         device = AsgiDevice(self.app, authorization)
+        self.devices.append(device)
+        await settle()
+        return device
+
+    async def connect_gated(self, authorization: str | None) -> GatedDevice:
+        device = GatedDevice(self.app, authorization)
         self.devices.append(device)
         await settle()
         return device
@@ -463,6 +488,182 @@ class TestRevocation:
 
         watches = [t for t in asyncio.all_tasks() if t.get_name() == "device-registry-watch"]
         assert watches == []
+
+
+def closures(caplog) -> list[tuple[str, str]]:
+    return [
+        (r.levelname, r.getMessage())
+        for r in caplog.records
+        if r.getMessage().startswith("device_revoked_closed")
+    ]
+
+
+def rotated_registry() -> list[dict[str, object]]:
+    return [entry("example-room", secret_for(4)), entry("other-room", secret_for(2))]
+
+
+CHANGES = [
+    pytest.param(rotated_registry(), "rotated", id="rotated"),
+    pytest.param(
+        [entry("example-room", secret_for(1), revoked=True), entry("other-room", secret_for(2))],
+        "revoked",
+        id="revoked",
+    ),
+    pytest.param([entry("other-room", secret_for(2))], "removed", id="removed"),
+]
+
+
+class TestClosingReasons:
+    @pytest.mark.parametrize(("entries", "reason"), CHANGES)
+    async def test_each_closing_is_logged_once_at_warning_with_its_reason(
+        self, rig, caplog, entries, reason
+    ):
+        device = await rig.connect(f"Bearer {ROOM}")
+
+        write_registry(rig.path, entries)
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await device.ended()
+
+        assert device.closed_with == CLOSE_REVOKED
+        assert closures(caplog) == [
+            ("WARNING", f"device_revoked_closed device=example-room reason={reason}")
+        ]
+
+    async def test_an_unreadable_registry_closes_every_session_as_removed(self, rig, caplog):
+        device = await rig.connect(f"Bearer {ROOM}")
+        other = await rig.connect(f"Bearer {OTHER}")
+
+        rig.path.write_text("not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await device.ended()
+            await other.ended()
+
+        assert (device.closed_with, other.closed_with) == (CLOSE_REVOKED, CLOSE_REVOKED)
+        assert sorted(message for _, message in closures(caplog)) == [
+            "device_revoked_closed device=example-room reason=removed",
+            "device_revoked_closed device=other-room reason=removed",
+        ]
+
+    async def test_the_check_runs_after_a_read_that_finds_the_file_unchanged(self, rig, caplog):
+        device = await rig.connect(f"Bearer {ROOM}")
+        write_registry(rig.path, rotated_registry())
+        # Another reader takes the change first, so the listener's own read finds nothing new.
+        assert rig.registry.reload_if_changed()
+
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await device.ended()
+
+        assert device.closed_with == CLOSE_REVOKED
+        assert closures(caplog) == [
+            ("WARNING", "device_revoked_closed device=example-room reason=rotated")
+        ]
+
+
+class TestRotation:
+    async def test_a_session_on_the_old_secret_is_closed_4003_within_10_s(self, rig, caplog):
+        device = await rig.connect(f"Bearer {ROOM}")
+
+        write_registry(rig.path, rotated_registry())
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await device.ended()
+
+        assert REVOCATION_POLL_S * 2 <= 10
+        assert device.closed_with == CLOSE_REVOKED
+        assert rig.serve.ended == ["example-room"]
+        assert rig.app.connected() == []
+        assert closures(caplog) == [
+            ("WARNING", "device_revoked_closed device=example-room reason=rotated")
+        ]
+
+    async def test_a_new_token_arriving_before_the_poll_ends_the_old_session_and_is_served(
+        self, rig, caplog
+    ):
+        old = await rig.connect(f"Bearer {ROOM}")
+        write_registry(rig.path, rotated_registry())
+
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            new = await rig.connect(f"Bearer {ROTATED_ROOM}")
+            await old.ended()
+            for _ in range(3):
+                await rig.clock.advance(REVOCATION_POLL_S)
+
+        assert old.closed_with == CLOSE_REVOKED
+        assert new.accepted and new.closed_with is None
+        assert new.texts() == ["hello example-room"]
+        assert rig.serve.calls == [("example-room", "room"), ("example-room", "room")]
+        assert rig.app.connected() == ["example-room"]
+        assert closures(caplog) == [
+            ("WARNING", "device_revoked_closed device=example-room reason=rotated")
+        ]
+
+    async def test_a_session_on_the_current_secret_survives_another_devices_change(
+        self, rig, caplog
+    ):
+        device = await rig.connect(f"Bearer {ROOM}")
+        other = await rig.connect(f"Bearer {OTHER}")
+
+        write_registry(
+            rig.path, [entry("example-room", secret_for(1)), entry("other-room", secret_for(5))]
+        )
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            await rig.clock.advance(REVOCATION_POLL_S)
+            await other.ended()
+            await rig.clock.advance(REVOCATION_POLL_S)
+
+        assert other.closed_with == CLOSE_REVOKED
+        assert device.closed_with is None
+        assert rig.app.connected() == ["example-room"]
+        assert closures(caplog) == [
+            ("WARNING", "device_revoked_closed device=other-room reason=rotated")
+        ]
+
+
+class TestAcceptRace:
+    @pytest.mark.parametrize(("entries", "reason"), CHANGES)
+    async def test_a_connection_verified_before_a_change_is_closed_as_it_enters(
+        self, rig, caplog, entries, reason
+    ):
+        other = await rig.connect(f"Bearer {OTHER}")
+        late = await rig.connect_gated(f"Bearer {ROOM}")
+        assert not late.accepted
+
+        write_registry(rig.path, entries)
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            await rig.clock.advance(REVOCATION_POLL_S)
+            late.gate.set()
+            await late.ended()
+
+        assert late.closed_with == CLOSE_REVOKED
+        assert other.closed_with is None
+        assert rig.app.connected() == ["other-room"]
+        assert closures(caplog) == [
+            ("WARNING", f"device_revoked_closed device=example-room reason={reason}")
+        ]
+
+    async def test_a_late_connection_on_the_old_secret_does_not_replace_the_new_one(
+        self, rig, caplog
+    ):
+        late = await rig.connect_gated(f"Bearer {ROOM}")
+        write_registry(rig.path, rotated_registry())
+        new = await rig.connect(f"Bearer {ROTATED_ROOM}")
+
+        with caplog.at_level(logging.WARNING, logger=LISTENER_LOGGER):
+            late.gate.set()
+            await late.ended()
+            await rig.clock.advance(REVOCATION_POLL_S)
+
+        assert late.closed_with == CLOSE_REVOKED
+        assert new.closed_with is None
+        assert rig.app.connected() == ["example-room"]
+        assert closures(caplog) == [
+            ("WARNING", "device_revoked_closed device=example-room reason=rotated")
+        ]
 
 
 # -- The app's surface ---------------------------------------------------------------------

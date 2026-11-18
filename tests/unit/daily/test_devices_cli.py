@@ -593,6 +593,20 @@ def test_rotate_replaces_the_token_and_keeps_the_rest_of_the_secrets_file(
     assert secret not in captured.out and secret not in captured.err
 
 
+def test_rotate_says_a_session_on_the_old_token_is_closed_and_where_to_reflash_from(
+    device_dir, initialised, out, capsys
+):
+    assert add(make_ctx(), device_dir, out) == 0
+    capsys.readouterr()
+
+    assert run(make_ctx(), "rotate", NAME, "--out", str(out), "--dir", str(device_dir)) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"rotated {NAME}'s token; a session still on the old one is closed within 10 s; "
+        f"reflash the device from {out / 'secrets.yaml'}"
+    ]
+
+
 def test_rotate_refuses_a_revoked_device(device_dir, initialised, out):
     assert add(make_ctx(), device_dir, out) == 0
     assert run(make_ctx(), "revoke", NAME, "--dir", str(device_dir)) == 0
