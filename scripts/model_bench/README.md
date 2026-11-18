@@ -653,21 +653,22 @@ capture and pins its sha256, so a later accidental edit to the fixture is caught
 
 Runs `probes/voice_vram.py` inside `mist-backend` via `docker exec -i mist-backend python -` (the
 probe source piped in on stdin -- that pipe carries only this one file, so the probe is a
-self-contained script, not a package import). It constructs its own `WhisperSTT` and `ChatterboxTTS`
-instances the way `backend/voice_models/model_manager.py` does (same `VoiceProfileRegistry` path,
-same `VOICE_PROFILE` env var), runs one STT transcription and one TTS generation, and prints a
-single JSON line with peak CUDA memory and per-half success flags. `bench_host.py` samples
+self-contained script, not a package import). It loads the realtime speech engines the live path
+runs: `load_voice_settings(os.environ)` reads the container's settings, and `build_speech_engines`
+(`backend/factories.py`) walks `MIST_VOICE_STT_CHAIN` and `MIST_VOICE_TTS_CHAIN` with the adapters
+`build_mist_runtime` loads. It then runs one final STT decode of 2 s of silence and synthesizes one
+segment, and prints a single JSON line with peak CUDA memory and per-half success flags; a slot
+whose chain loaded nothing reports its half as failed, with the slot's status in `error`. The peak
+covers the whole run, because the probe passes a meter that does not reset torch's peak
+statistics before each CUDA load as the default `TorchGpuMeter` does. `bench_host.py` samples
 nvidia-smi at 5 Hz for the probe's duration, records the sampled peak as `vram_steps.json`'s
 `voice_peak` step, and stores the probe's own JSON as `vram_steps.json`'s `voice_probe`.
 
-**Double-counting note.** Production already loads both models eagerly at `mist-backend` startup:
-`backend/server.py:500-507` constructs `VoiceProcessor` and awaits `voice_processor.initialize()`,
-which `backend/voice_processor.py:178` runs `ModelManager.load_all_models()` in an executor;
-`ModelManager.load_all_models()` (`backend/voice_models/model_manager.py:113-152`) loads
-`WhisperSTT` at line 120 and starts the Chatterbox TTS worker thread (which loads the model) at
-line 190, inside `_tts_worker_chatterbox`. Because this probe constructs its own separate
-`WhisperSTT`/`ChatterboxTTS` instances rather than reusing the already-running backend's, its peak
-VRAM reading double-counts whatever the backend already holds resident. The `voice_peak` /
+**Double-counting note.** Production already loads its speech engines eagerly at `mist-backend`
+startup: `lifespan` runs `_build_runtime` (`backend/server.py:1090`), which calls
+`build_mist_runtime`, and that loads both chains through `build_speech_engines`. Because this probe
+loads its own engines in its own process rather than reusing the already-running backend's, its
+peak VRAM reading double-counts whatever the backend already holds resident. The `voice_peak` /
 `voice_probe` numbers this feeds into `vram_steps.json` are therefore conservative (they overstate
 VRAM pressure, i.e. understate headroom), not exact -- the lead should read them as an upper bound
 on the true STT+TTS footprint, not the footprint itself.

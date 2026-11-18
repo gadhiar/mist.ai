@@ -66,9 +66,10 @@ def _session_id_from_path(path: Path) -> str:
     This eliminates the legacy fallback that wrote the raw external session_id
     argument directly into frontmatter. Five of seven session notes in the
     2026-05-10 audit had ``session_id: default`` because
-    KnowledgeIntegration held a `current_session_id` instance attribute
-    initialised to ``"default"`` and that raw string propagated into the
-    frontmatter without transformation. That attribute has since been removed
+    the threaded voice path's knowledge bridge held a `current_session_id`
+    instance attribute initialised to ``"default"`` and that raw string
+    propagated into the frontmatter without transformation. That bridge has
+    since been deleted
     in favour of the `current_session_id` context var, so the raw id is now
     the connection's UUID -- this slug derivation stays regardless, because
     frontmatter wants the human-readable note slug, not a UUID.

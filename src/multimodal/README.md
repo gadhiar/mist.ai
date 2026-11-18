@@ -257,8 +257,14 @@ vi.start_conversation()
 
 ### WebSocket Integration
 
+The backend does not use the STT or TTS classes below (of this directory it
+imports only `voice_profile`): its voice path is the realtime package
+(`backend/realtime/`), which loads its own speech engines
+(`backend/realtime/engines/`) through `build_speech_engines`
+(`backend/factories.py`). The sketch below shows how the legacy classes in this
+directory fit a WebSocket handler on their own.
+
 ```python
-# Backend integration (see backend/voice_processor.py)
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.tts import SesameTTS
 

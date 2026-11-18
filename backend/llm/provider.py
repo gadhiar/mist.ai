@@ -37,7 +37,8 @@ class StreamingLLMProvider(ABC):
         `reasoning_content` (joined from any reasoning deltas),
         `finish_reason`, and `usage`. Its `content` is always None on
         purpose -- callers that append every chunk's `content` to build the
-        reply (e.g. `backend/voice_models/model_manager.py`) would
+        reply (e.g. `DirectResponder.stream_turn` in
+        `backend/realtime/degraded.py`) would
         otherwise duplicate the final text if the aggregated content were
         repeated there.
 

@@ -12,8 +12,10 @@ re-runs during continuous-usage hardening.
 | `.local/v7_websocket_driver.py` | 25 tool-selection probes | `data/ingest/v7-tool-heavy-inputs.jsonl` | `scripts/eval_harness/score_v7_probe_run.py` |
 | `.local/v8_websocket_driver.py` | 20 extraction-edge probes | `data/ingest/v8-edge-production-inputs.jsonl` | `scripts/eval_harness/score_v8_probe_run.py` |
 
-All three drivers connect to `ws://localhost:8001/ws` and use the
-hardcoded server-side `session_id="default"`. Driver source lives at
+All three drivers connect to `ws://localhost:8001/ws`. The server mints a
+fresh `session_id` (`str(uuid.uuid4())` in `websocket_endpoint`,
+`backend/server.py`) for every connection and sends it in the
+`session_started` frame; a driver cannot choose it. Driver source lives at
 `.local/` (gitignored, host-side); commit production-relevant changes
 to drivers via this runbook + design docs (`v7_probe_set_design.md`,
 `v8_probe_set_design.md`), not via the driver files themselves.
@@ -23,11 +25,12 @@ conflate them:**
 
 | Path | session_id used | Where set | Score command |
 |---|---|---|---|
-| WebSocket drivers | `default` (server hardcoded in `voice_processor.py`) | server-side; cannot be overridden by the driver | `--session-id default` |
+| WebSocket drivers | a uuid4 per connection, from the `session_started` frame | server-side (`websocket_endpoint`, `backend/server.py`); cannot be overridden by the driver | `--session-id <that uuid>` |
 | `mist_admin replay` (chat-path) | caller-supplied via `--session-id <tag>` | the replay process; arbitrary string | `--session-id <same tag>` |
 
 Reading the WebSocket gauntlet section below: every score command
-takes `--session-id default`. Reading the chat-path replay section:
+takes the uuid the driver's connection received in `session_started`.
+Reading the chat-path replay section:
 every score command takes the same `--session-id <tag>` you passed
 to `mist_admin replay`. They are not interchangeable.
 
@@ -132,10 +135,12 @@ python -u .local/v7_websocket_driver.py
 python -u .local/v8_websocket_driver.py
 ```
 
-Drivers run sequentially against the same `session_id="default"`. The
-chronological order matters: V6 populates conversational history; V7
-runs against that history (testing tool-decision robustness to prior
-context); V8 runs after V6+V7 with extraction-focused probes.
+Drivers run sequentially. This runbook was written when every
+connection shared `session_id="default"`, so V7 ran against the
+conversational history V6 populated, and V8 after both. Every
+connection now gets its own session id, so a driver that opens its own
+connection no longer sees an earlier driver's history in its session;
+whether the drivers in `.local/` still rely on that is unverified.
 
 For session-isolated runs (e.g., apples-to-apples comparison against
 a chat-path baseline), recreate the backend between drivers using the
@@ -149,14 +154,14 @@ MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend \
   python scripts/eval_harness/score_v7_probe_run.py \
   --input data/ingest/v7-tool-heavy-inputs.jsonl \
   --debug-jsonl /app/data/runtime/v678-<run-tag>.jsonl \
-  --session-id default
+  --session-id <V7 driver's session_started uuid>
 
 # V8
 MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend \
   python scripts/eval_harness/score_v8_probe_run.py \
   --input data/ingest/v8-edge-production-inputs.jsonl \
   --debug-jsonl /app/data/runtime/v678-<run-tag>.jsonl \
-  --session-id default
+  --session-id <V8 driver's session_started uuid>
 ```
 
 V6 is qualitative — review the driver's output JSONL for empty
@@ -323,7 +328,7 @@ MSYS_NO_PATHCONV=1 docker compose exec -T \
 ```
 
 Score with `--session-id v7-chat-replay-<tag>` to match the replay's
-session_id (not "default" — that's the WebSocket-path session).
+session_id (not a WebSocket connection's uuid).
 
 ## Troubleshooting
 
@@ -332,8 +337,8 @@ session_id (not "default" — that's the WebSocket-path session).
 | Backend log shows `Debug JSONL logging enabled at C:/Program Files/Git/app/...` | MSYS path-rewriting hit `MIST_DEBUG_JSONL` value | Add `MSYS_NO_PATHCONV=1` to the `docker compose up` line (not just `exec`) |
 | Driver dies mid-run with `ConnectionClosedError: keepalive ping timeout` | Default `ping_interval=20s` killed the connection during a slow turn | Verify `ping_interval=None, ping_timeout=None` in the driver's `websockets.connect` |
 | Single turn crosses 180s and the backend hangs | TTS rendering crossed the `handle_message_streaming` bridge timeout | Recreate backend with `TTS_ENABLED=false` for validation runs |
-| Scorer reports `0/N matched against debug JSONL` | Backend env didn't apply `MIST_DEBUG_JSONL` (running container started before env was set) OR voice_processor didn't wrap the LLM provider with `InstrumentedStreamingLLMProvider` | Recreate backend with `MIST_DEBUG_JSONL=...` set; verify backend logs show "LLM provider wrapped with observability instrumentation" |
-| V7 fails with FP that doesn't appear on chat-path replay | V6/V7/V8 share `session_id="default"`; prior turns' history is in scope | Recreate backend between V6 and V7 to wipe sessions; OR accept and document as session-contamination edge case |
+| Scorer reports `0/N matched against debug JSONL` | Backend env didn't apply `MIST_DEBUG_JSONL` (running container started before env was set) OR `build_llm_provider` (`backend/factories.py`) didn't wrap the LLM provider with `InstrumentedStreamingLLMProvider` (it wraps only when the debug logger's LLM-call logging is on) | Recreate backend with `MIST_DEBUG_JSONL=...` set; verify backend logs show "LLM provider wrapped with observability instrumentation" |
+| V7 fails with FP that doesn't appear on chat-path replay | Under the old shared `session_id="default"`, V6/V7/V8 shared one session and prior turns' history was in scope. With a session per connection this applies only if the drivers share one connection | Run each driver on its own connection; OR accept and document as session-contamination edge case |
 
 ## References
 
