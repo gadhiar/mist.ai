@@ -277,11 +277,17 @@ services:
       - MODEL=${MODEL:-gemma-4-e4b}
       #
       # --- voice off --------------------------------------------------------
-      # This is a text-path conversation. TTS off skips the Chatterbox load,
-      # which is gated on `self.config.tts_enabled` at
-      # `backend/voice_models/model_manager.py:123`. Whisper STT still loads
-      # unconditionally at `model_manager.py:119-120`, which is why the GPU
-      # reservation below is kept.
+      # This is a text-path conversation. `off` alone is the empty chain
+      # (`backend/realtime/budget.py:724`), so `load_speech_engines`
+      # (`backend/realtime/runtime.py:263`) loads no STT or TTS engine, and with
+      # the STT chain empty no VAD, end-of-turn model or name spotter either
+      # (`runtime.py:290`). TTS_ENABLED=false, read at `backend/config.py:74`,
+      # also keeps replies unspoken. The GPU reservation below dates from the
+      # deleted threaded voice path, which loaded its speech-to-text model at
+      # startup; whether anything in this stack still needs the GPU is
+      # unverified, so it stays.
+      - MIST_VOICE_STT_CHAIN=off
+      - MIST_VOICE_TTS_CHAIN=off
       - TTS_ENABLED=false
       - WATCHFILES_FORCE_POLLING=1
       #
@@ -327,14 +333,14 @@ services:
     volumes:
       # THE ONLY WRITABLE MOUNT. Read LAYER 1 in the header before adding
       # another. There is deliberately no /app/logs bind mount (dev-hydration
-      # has one at `docker-compose.dev-hydration.yml:190`): `backend/server.py:75-76`
+      # has one at `docker-compose.dev-hydration.yml:195`): `backend/server.py:75-76`
       # does `Path("/app/logs").mkdir(parents=True, exist_ok=True)` and
       # `docker/backend/Dockerfile`'s runtime-directory step creates it owned by
       # appuser, so the directory lives in the container's own layer and its logs
       # die with the container -- which is the correct lifetime for a throwaway
       # stack.
       - ./smoke-state:/app/smoke-state
-      # Code, read-only, mirroring `docker-compose.dev-hydration.yml:226-231`
+      # Code, read-only, mirroring `docker-compose.dev-hydration.yml:231-236`
       # and `docker-compose.override.yml:7-12`. Read-only is not merely
       # hygiene: it is what keeps a smoke-stack process from editing the tree
       # the live stack is running from.
@@ -347,7 +353,7 @@ services:
       # Model caches are content-addressed and read-mostly; sharing them avoids
       # a second 3-4GB download. Same two named volumes the live backend uses
       # (`docker-compose.yml:74-75`) and dev-hydration shares
-      # (`docker-compose.dev-hydration.yml:234-235`).
+      # (`docker-compose.dev-hydration.yml:239-240`).
       - mist-hf-cache:/home/appuser/.cache/huggingface
       - mist-torch-cache:/home/appuser/.cache/torch
     depends_on:
