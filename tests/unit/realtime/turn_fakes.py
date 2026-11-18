@@ -21,7 +21,8 @@ does not start with `test_`, so pytest does not collect it. Each test file impor
   capability-only path records each call and returns the next scripted result, None without one.
 - `FakeAlarm`: the controller's `alarm_ringing`, which a test rings and stops by hand.
 - `FakeHost`: a `ReconfigureHost` that records its answers.
-- `FakeWakeArbiter`: a `WakeArbitration` whose verdicts a test grants or denies by hand.
+- `FakeWakeArbiter`: a `WakeArbitration` whose verdicts a test grants or denies by hand; a
+  denial carries a winner's score.
 - `FakeCallLater`: the loop's `call_later` for a real `WakeArbiter`: it records each timer, and
   a test fires it by hand.
 - `Harness` and `make_harness`: a controller wired to all of the above.
@@ -736,15 +737,19 @@ class Claim:
     claim_id: int
     session_id: str
     rank: WakeRank
-    verdict: Callable[[bool], None]
+    verdict: Callable[[bool, float | None], None]
     answered: bool = False
+
+
+DENYING_WINNER_SCORE = 0.9
+"""The winner's raw score `FakeWakeArbiter.deny` reports when a test names none."""
 
 
 class FakeWakeArbiter:
     """A `WakeArbitration` that records claims and settles; a test grants or denies by hand.
 
     With `solo=True` every claim is granted before `claim` returns, as the real arbiter does for
-    a lone session.
+    a lone session. A denial carries a winner's score, as the real arbiter's always does.
     """
 
     def __init__(self, *, solo: bool = False) -> None:
@@ -753,7 +758,9 @@ class FakeWakeArbiter:
         self.settles: list[tuple[int, bool]] = []
         self._ids = itertools.count(1)
 
-    def claim(self, session_id: str, rank: WakeRank, verdict: Callable[[bool], None]) -> int:
+    def claim(
+        self, session_id: str, rank: WakeRank, verdict: Callable[[bool, float | None], None]
+    ) -> int:
         entry = Claim(next(self._ids), session_id, rank, verdict)
         self.claims.append(entry)
         if self.solo:
@@ -763,18 +770,18 @@ class FakeWakeArbiter:
     def settle(self, claim_id: int, accepted: bool) -> None:
         self.settles.append((claim_id, accepted))
 
-    def _answer(self, claim_id: int, proceed: bool) -> None:
+    def _answer(self, claim_id: int, proceed: bool, winner_score: float | None) -> None:
         entry = next(c for c in self.claims if c.claim_id == claim_id)
         if entry.answered:
             raise AssertionError(f"claim {claim_id} already has a verdict")
         entry.answered = True
-        entry.verdict(proceed)
+        entry.verdict(proceed, winner_score)
 
     def grant(self, claim_id: int) -> None:
-        self._answer(claim_id, True)
+        self._answer(claim_id, True, None)
 
-    def deny(self, claim_id: int) -> None:
-        self._answer(claim_id, False)
+    def deny(self, claim_id: int, winner_score: float = DENYING_WINNER_SCORE) -> None:
+        self._answer(claim_id, False, winner_score)
 
 
 class FakeCallLater:

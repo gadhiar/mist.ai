@@ -30,13 +30,16 @@ committed.
 
 MIST wakes by name. A `NameHeard` from the server's spotter, or an endpoint's `wake` and the
 `NameHeard` its backlog yields, opens an unpublished wake candidate: nothing names it on the
-wire, in a log line or to the responder until the addressee gate accepts it. The controller
-checks her own recent speech first, sends `attend`, opens the candidate, claims it from the
-cross-session arbiter, checks the reference score once the claim may proceed, and only then asks
-ingress for the one gate decode. Acceptance publishes the candidate in one step and replays any
-end of turn held meanwhile; rejection drops it and sends one `wake_rejected`. While a turn is in
-flight an accepted name interrupts it with `barge_in` reason `wake`. After a name-opened turn a
-follow-up window, when configured, keeps ingress engaged so the next utterance needs no name.
+wire, in a log line or to the responder until the addressee gate accepts it or it loses
+arbitration. The controller checks her own recent speech first, sends `attend`, opens the
+candidate, claims it from the cross-session arbiter, checks the reference score once the claim
+may proceed, and only then asks ingress for the one gate decode. Acceptance publishes the
+candidate in one step and replays any end of turn held meanwhile; rejection drops it and sends
+one `wake_rejected`. A claim that loses because another session's name was accepted drops it
+and sends one `wake_lost`, naming its utterance, or a fresh id when an endpoint wake's backlog
+has not opened one yet. While a turn is in flight an accepted name interrupts it with `barge_in`
+reason `wake`. After a name-opened turn a follow-up window, when configured, keeps ingress
+engaged so the next utterance needs no name.
 
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
 interruption note, cancellation, prefetch, `turn_metrics`, the scene anchors not tied to a
@@ -128,8 +131,10 @@ from .protocol import (
     VoiceDecisionEndpoint,
     VoiceDecisionOverload,
     VoiceDecisionRelease,
+    VoiceDecisionWakeLost,
     VoiceDecisionWakeRejected,
     VoiceStartMessage,
+    WakeLostDetail,
     WakeRejectedDetail,
     next_turn_tag,
 )
@@ -186,9 +191,8 @@ STAGE_TIMESTAMPS: tuple[tuple[str, str], ...] = (
 DUCK_DB = 12.0
 """How far a name hit lowers her playback until its verdict (v1's 12 dB duck)."""
 
-WakeRejectReason = Literal[
-    "self_speech", "self_media", "not_addressed", "lost_arbitration", "no_backlog"
-]
+WakeRejectReason = Literal["self_speech", "self_media", "not_addressed", "no_backlog"]
+"""Why a name is rejected; losing arbitration is not a rejection, it is `wake_lost` (A52)."""
 
 
 # -- Ports ----------------------------------------------------------------------------------
@@ -300,27 +304,42 @@ class TurnPlacement:
 
 @dataclass(frozen=True, slots=True)
 class WakeRank:
-    """How strongly one candidate heard the name, for cross-session arbitration."""
+    """How strongly one candidate heard the name, for cross-session arbitration.
+
+    `score` is the spotter's raw score. `outranks` never reads it, since two spotters' raw
+    scores are not comparable; it travels to each loser as the winner's score in `wake_lost`.
+    """
 
     arrival: float
     false_accepts_per_hour: float | None
     positive_quantile: float | None
     margin: float
+    score: float
 
 
 @dataclass(frozen=True, slots=True)
 class WakeVerdict:
-    """The mailbox event a wake arbitration verdict posts: may the claim proceed."""
+    """The mailbox event a wake arbitration verdict posts: may the claim proceed.
+
+    `winner_score` is None on a grant; on a loss it is the accepted winner's raw score.
+    """
 
     claim_id: int
     proceed: bool
+    winner_score: float | None = None
 
 
 class WakeArbitration(Protocol):
     """Cross-session wake arbitration; one instance is shared by every voice session."""
 
-    def claim(self, session_id: str, rank: WakeRank, verdict: Callable[[bool], None]) -> int:
-        """Register a candidate; `verdict` posts its answer into the owner's mailbox."""
+    def claim(
+        self, session_id: str, rank: WakeRank, verdict: Callable[[bool, float | None], None]
+    ) -> int:
+        """Register a candidate; `verdict` posts its answer into the owner's mailbox.
+
+        `verdict(True, None)` grants the claim; `verdict(False, score)` says another claim won,
+        `score` being that winner's `rank.score`.
+        """
         ...
 
     def settle(self, claim_id: int, accepted: bool) -> None:
@@ -360,7 +379,7 @@ class _Claim:
     claim_id: int
     session_id: str
     rank: WakeRank
-    verdict: Callable[[bool], None]
+    verdict: Callable[[bool, float | None], None]
 
 
 class WakeArbiter:
@@ -397,18 +416,20 @@ class WakeArbiter:
         self._winner: _Claim | None = None
         self._window_open = False
 
-    def claim(self, session_id: str, rank: WakeRank, verdict: Callable[[bool], None]) -> int:
+    def claim(
+        self, session_id: str, rank: WakeRank, verdict: Callable[[bool, float | None], None]
+    ) -> int:
         """Register a candidate and return its claim id.
 
-        With one session and no claim pending, `verdict(True)` runs before this returns and no
-        timer is set. Otherwise the claim joins the open window, or waits on an unsettled
+        With one session and no claim pending, `verdict(True, None)` runs before this returns
+        and no timer is set. Otherwise the claim joins the open window, or waits on an unsettled
         winner, or opens a window.
         """
         self._next_id += 1
         entry = _Claim(self._next_id, session_id, rank, verdict)
         if self._sessions() <= 1 and not self._waiting and self._winner is None:
             self._winner = entry
-            verdict(True)
+            verdict(True, None)
             return entry.claim_id
         self._waiting[entry.claim_id] = entry
         if not self._window_open and self._winner is None:
@@ -419,10 +440,11 @@ class WakeArbiter:
     def settle(self, claim_id: int, accepted: bool) -> None:
         """Take the gate's verdict for the winner, or withdraw a claim.
 
-        Accepting the winner sends every other pending claim `verdict(False)`; rejecting it gives
-        the next-ranked claim `verdict(True)`. `accepted=False` on a waiting claim withdraws it
-        with no verdict to anyone, and on a claim the arbiter no longer holds (one that lost, or
-        is already settled) does nothing.
+        Accepting the winner sends every other pending claim `verdict(False, score)`, with the
+        winner's raw score: the only way a claim loses. Rejecting it gives the next-ranked claim
+        `verdict(True, None)`. `accepted=False` on a waiting claim withdraws it with no verdict
+        to anyone, and on a claim the arbiter no longer holds (one that lost, or is already
+        settled) does nothing.
 
         Raises:
             ValueError: `accepted` is True for a claim that is not the unsettled winner.
@@ -434,7 +456,7 @@ class WakeArbiter:
                 losers = list(self._waiting.values())
                 self._waiting.clear()
                 for loser in losers:
-                    loser.verdict(False)
+                    loser.verdict(False, winner.rank.score)
             else:
                 self._grant_next()
             return
@@ -447,7 +469,7 @@ class WakeArbiter:
         self._grant_next()
 
     def _grant_next(self) -> None:
-        """Give the best-ranked waiting claim `verdict(True)`, unless a window or winner stands."""
+        """Grant the best-ranked waiting claim `(True, None)`, unless a window or winner stands."""
         if self._window_open or self._winner is not None or not self._waiting:
             return
         best: _Claim | None = None
@@ -457,7 +479,7 @@ class WakeArbiter:
         assert best is not None  # noqa: S101 - `_waiting` is not empty
         del self._waiting[best.claim_id]
         self._winner = best
-        best.verdict(True)
+        best.verdict(True, None)
 
 
 # -- Messages -------------------------------------------------------------------------------
@@ -685,9 +707,9 @@ class _Wake:
 
     `arrival_ms` is the hit's arrival, or the `wake` message's; `name_end_ms` is when the name
     ended by estimate, from which `wake_screen_ms` runs. `turn_id` is the turn in flight at the
-    hit, which a `wake_rejected` names. `utterance_id` is None while an endpoint wake waits for
-    the `NameHeard` its backlog yields (`waiting_name`). `proceed` records a winning verdict;
-    `claim_id` stays in the controller's claims until the claim is settled.
+    hit, which a `wake_rejected` or `wake_lost` names. `utterance_id` is None while an endpoint
+    wake waits for the `NameHeard` its backlog yields (`waiting_name`). `proceed` records a
+    winning verdict; `claim_id` stays in the controller's claims until the claim is settled.
     """
 
     source: Spotter
@@ -1867,22 +1889,23 @@ class TurnController:
             false_accepts_per_hour=fa,
             positive_quantile=quantile,
             margin=wake.score - threshold,
+            score=wake.score,
         )
         known: list[int] = []
-        early: list[bool] = []
+        early: list[tuple[bool, float | None]] = []
 
-        def verdict(proceed: bool) -> None:
+        def verdict(proceed: bool, winner_score: float | None) -> None:
             if known:
-                self._mailbox.put_nowait(WakeVerdict(known[0], proceed))
+                self._mailbox.put_nowait(WakeVerdict(known[0], proceed, winner_score))
             else:
-                early.append(proceed)
+                early.append((proceed, winner_score))
 
         claim_id = self._arbiter.claim(self._session_id, rank, verdict)
         known.append(claim_id)
         wake.claim_id = claim_id
         self._claims[claim_id] = wake
-        for proceed in early:
-            self._mailbox.put_nowait(WakeVerdict(claim_id, proceed))
+        for proceed, winner_score in early:
+            self._mailbox.put_nowait(WakeVerdict(claim_id, proceed, winner_score))
 
     def _settle(self, wake: _Wake, accepted: bool) -> None:
         """Settle the candidate's claim, once: later verdicts for it are stale."""
@@ -2006,9 +2029,24 @@ class TurnController:
 
     def _reject(self, wake: _Wake, reason: WakeRejectReason) -> None:
         """Drop the candidate, send one `wake_rejected`, and put the client back (v5 :417-422)."""
-        drop = "wake_lost" if reason == "lost_arbitration" else "not_addressed"
-        self._abandon(wake, drop_reason=drop, restore=False)
+        self._abandon(wake, drop_reason="not_addressed", restore=False)
         self._send_wake_rejected(wake, reason)
+        self._restore(wake)
+
+    def _lose(self, wake: _Wake, winner_score: float | None) -> None:
+        """Another session's name won arbitration: drop, one `wake_lost`, restore (A52, v2 :2256).
+
+        The message names the open candidate's utterance. An endpoint wake whose backlog has not
+        arrived has none, so it names a fresh id, as the muted endpoint wake's `dropped` does;
+        the client never saw a candidate's id before its verdict anyway (v5 :407-410). The
+        backlog's `NameHeard`, when it comes, finds no wake waiting and is counted stale.
+        """
+        assert winner_score is not None  # noqa: S101 - the arbiter sends a loss with its score
+        self._abandon(wake, drop_reason="wake_lost", restore=False)
+        utterance_id = wake.utterance_id
+        if utterance_id is None:
+            utterance_id = self._new_utterance_id()
+        self._send_wake_lost(wake, winner_score, utterance_id)
         self._restore(wake)
 
     def _abandon(
@@ -2062,6 +2100,17 @@ class TurnController:
                 reason=reason,
                 detail=WakeRejectedDetail(
                     source=wake.source, score=wake.score, reference_score=wake.reference_score
+                ),
+            )
+        )
+
+    def _send_wake_lost(self, wake: _Wake, winner_score: float, utterance_id: str) -> None:
+        self._send_control(
+            VoiceDecisionWakeLost(
+                turn_id=wake.turn_id,
+                reason="arbitration",
+                detail=WakeLostDetail(
+                    winner_score=winner_score, score=wake.score, utterance_id=utterance_id
                 ),
             )
         )
@@ -2415,16 +2464,16 @@ class TurnController:
         """An arbitration verdict for one of this controller's claims (v9 :153-163).
 
         One for a claim already settled is ignored and counted: a drop was handled before a
-        verdict already in the mailbox. A losing claim closes its candidate
-        `lost_arbitration`; a winning one goes on to checks b and c, at once or when an endpoint
-        wake's `NameHeard` opens its candidate.
+        verdict already in the mailbox. A losing claim closes its candidate with one `wake_lost`
+        (`_lose`); a winning one goes on to checks b and c, at once or when an endpoint wake's
+        `NameHeard` opens its candidate.
         """
         wake = self._claims.get(message.claim_id)
         if wake is None:
             self._count_stale()
             return
         if not message.proceed:
-            self._reject(wake, "lost_arbitration")
+            self._lose(wake, message.winner_score)
             return
         wake.proceed = True
         await self._screen(wake)
