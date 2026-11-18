@@ -102,8 +102,11 @@ another model carries the same word, except the spike build, whose stand-in wake
 model's own file; it recognises the spike build by `mist_link: device_stats`, which only
 `packages/spike.yaml` sets. So in the room build only `${wake_model}` opens the uplink and "stop"
 never does. This is checked at build time (`esphome config` refuses such a build), not by a host
-test. A room compile without `--config` gets the stop model as `wake_model` from `build.py`'s
-stand-ins, so it is refused too.
+test. A room compile without `--config` cannot take the stop manifest as `wake_model`, so
+`build.py` writes a stand-in name model into its throwaway build directory: the image's stop
+manifest with its word changed to "compile check" and its `model` naming the image's stop model
+file. That image still opens on "stop", so `build.py` refuses `--out` for it; a room image leaves
+the container only when built from the private YAML with `--config`.
 
 The uplink closes on the first of these, checked against the realtime controller on `main`:
 
@@ -160,9 +163,11 @@ ESPHome's data directory and `HOME` inside it, serves the image's assets on `127
 the compile (`voice_kit` takes the XMOS image only by URL), runs `esphome compile`, and copies the
 images out with `--out`. With `--config`, the private YAML's directory is copied beside this one,
 so its `!include ../room-endpoint/...` resolves and its own `secrets.yaml` and `mist_ca.pem` are
-read. Without `--config` it builds the repository's config with throwaway secrets, which is the
-compile check a change here runs:
+read. Without `--config` it builds the repository's config with throwaway secrets and, for
+`room`, the stand-in name model above (no `--out`), which is the compile check a change here
+runs:
 
 ```bash
 python -m scripts.room_endpoint.build compile spike
+python -m scripts.room_endpoint.build compile room
 ```
