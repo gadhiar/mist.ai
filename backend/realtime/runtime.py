@@ -133,7 +133,9 @@ class _Walk:
     At startup a failed load logs WARNING with its error, as T12 shipped. Under a release or
     reload, `failure_level` is set: a failure logs the error's class only at that level, and a
     `RuntimeError` or `OSError` from a loader (CUDA's out-of-memory is a `RuntimeError`) moves
-    the walk on as a `MistError` does.
+    the walk on as a `MistError` does. `gpu_failed` runs once after each failed CUDA load,
+    before the next option: the GPU control empties the CUDA cache there, so a partial
+    allocation goes back to the game rather than sitting in torch's pool.
     """
 
     def __init__(
@@ -144,12 +146,14 @@ class _Walk:
         gpu_allowed: bool,
         *,
         failure_level: int | None = None,
+        gpu_failed: Callable[[], object] | None = None,
     ) -> None:
         self.settings = settings
         self.loaders = loaders
         self.gpu_meter = gpu_meter
         self.gpu_allowed = gpu_allowed
         self.failure_level = failure_level
+        self.gpu_failed = gpu_failed
         self.tolerated: tuple[type[BaseException], ...] = (
             (MistError,) if failure_level is None else (MistError, RuntimeError, OSError)
         )
@@ -208,6 +212,7 @@ class _Walk:
                 )
             except VoiceAssetError as error:
                 logger.error("%s chain: %s@%s: %s", slot, option.engine, option.device, error)
+                self._after_failure(option.device)
                 continue
             except self.tolerated as error:
                 if self.failure_level is None:
@@ -227,11 +232,17 @@ class _Walk:
                         option.device,
                         type(error).__name__,
                     )
+                self._after_failure(option.device)
                 continue
             model_id = engine.model_id  # type: ignore[attr-defined]
             logger.info("%s: %s loaded on %s (%s)", slot, option.engine, option.device, model_id)
             return engine, _status(option.device, model_id, vram), index
         return None, OFF, None
+
+    def _after_failure(self, device: str) -> None:
+        """Return what a failed CUDA load allocated before the walk tries the next option."""
+        if _on_gpu(device) and self.gpu_failed is not None:
+            self.gpu_failed()
 
     def single(
         self, name: str, device: str, load: Callable[[], _T]
@@ -670,6 +681,7 @@ class GpuEngines:
             self._gpu_meter,
             gpu_allowed,
             failure_level=failure_level,
+            gpu_failed=self._empty_cache,
         )
 
     def _swap(

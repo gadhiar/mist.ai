@@ -602,6 +602,28 @@ class TestReload:
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(errors) == 1
 
+    async def test_a_failed_reload_empties_the_cuda_cache(self):
+        built = build()
+        await release(built)
+        assert built.cuda.empty_calls == 1
+        built.loaders.fail(
+            "nemotron-160@cuda", RuntimeError("CUDA out of memory"), RuntimeError("again")
+        )
+        built.sleep.hold()
+
+        await reload(built)
+        assert built.cuda.empty_calls == 2  # the reload's failed CUDA load
+        assert built.sleep.gate is not None
+        built.sleep.gate.set()
+        for _ in range(20):
+            await settle()
+            if where(built)[0] == "cuda":
+                break
+            await asyncio.sleep(0.01)
+
+        assert where(built) == ("cuda", "cpu")
+        assert built.cuda.empty_calls == 3  # and the retry's; the load that worked empties none
+
     async def test_the_retry_delay_doubles_up_to_sixty_seconds(self):
         built = build()
         await release(built)
