@@ -14,7 +14,9 @@ arbitration. T11e part 2 runs the arbitration bullets (v5 :1709-1722) through tw
 that share one real `WakeArbiter`.
 
 T55c (A51) amends v5's `thinking` cell: a name accepted while a model turn is `thinking` with none
-of its audio queued supersedes the turn instead of barging in.
+of its audio queued supersedes the turn instead of barging in. T55d keeps a superseded turn that
+dispatched no tool and joins its request text to the next turn's, or records it alone where the
+superseding utterance starts no turn.
 
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
@@ -22,6 +24,8 @@ Every test drives the controller only through `post` and `close`, with the fakes
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 
@@ -2253,7 +2257,13 @@ async def test_endpoint_wake_while_speaking_interrupts_only_after_acceptance():
 # -- A name while she thinks supersedes the turn (A51, T55c) ------------------------------------------
 # A name accepted while a model turn is in `thinking` with none of its audio queued supersedes it:
 # `supersede`, the cut with `stream_cancelled superseded`, `idle` and `turn_metrics`, then the
-# name's publish, all in the accepting step. K, the superseded turn, is committed at the cut.
+# name's publish, all in the accepting step. K, the superseded turn, is committed at the cut only
+# when it dispatched a tool; otherwise it is kept and joins the next turn (T55d, below).
+
+
+def transcribed(h: Harness, uid: str) -> list[str]:
+    """The texts of the `transcription`s naming `uid`."""
+    return [t.text for t in h.outbound.of("transcription") if t.utterance_id == uid]
 
 
 async def accept_a_name(h: Harness, how: str, text: str) -> str:
@@ -2289,7 +2299,7 @@ async def test_a_name_accepted_in_thinking_before_any_audio_supersedes_the_turn(
 
     (supersede,) = h.outbound.of("voice_decision:supersede")
     assert (supersede.turn_id, supersede.reason) == (turn_id, "continued_speech")
-    assert supersede.detail.model_dump() == {"merged": False, "tool_dispatched": False}
+    assert supersede.detail.model_dump() == {"merged": True, "tool_dispatched": False}
     assert h.outbound.of("voice_decision:barge_in") == []
     names = h.outbound.names()[mark:]
     # The pacer's stop ends the announced audio tag (`0x03`, `playback_stop`) within the cut.
@@ -2307,20 +2317,35 @@ async def test_a_name_accepted_in_thinking_before_any_audio_supersedes_the_turn(
     (cancelled,) = h.outbound.of("stream_cancelled")
     assert (cancelled.turn_id, cancelled.reason) == (turn_id, "superseded")
     assert (cancelled.partial_text, cancelled.spoken_text) == ("", "")
+    # No tool was dispatched, so K is kept for the merge: its metrics say it is not recorded.
     (metrics,) = h.outbound.of("turn_metrics")
-    assert (metrics.turn_id, metrics.outcome) == (turn_id, "superseded")
-    assert [(c.outcome, c.delivered_text) for c in h.responder.commits] == [("superseded", "")]
+    assert (metrics.turn_id, metrics.outcome, metrics.recorded) == (turn_id, "superseded", False)
+    assert h.responder.commits == []
     assert h.controller.phase == "idle"
+    # The name's prefetch already carries K's words ahead of its own.
+    assert h.responder.prefetches[-1] == (
+        "session-1",
+        "mist, what's the weather mist, and in Paris",
+    )
 
-    # The turn from the name takes its own text; K stays committed once, before its reply.
+    # U's end starts a non-held turn whose request carries both texts; the client sees U's own.
     h.post(h.ingress.ended(uid, "mist, and in Paris"))
     await h.settle()
     first, second = h.responder.requests
-    assert (first.user_text, second.user_text) == ("mist, what's the weather", "mist, and in Paris")
-    assert second.interruption_note == "before_reply"
-    assert [c.outcome for c in h.responder.commits] == ["superseded"]
+    assert first.user_text == "mist, what's the weather"
+    assert second.user_text == "mist, what's the weather mist, and in Paris"
+    assert not second.held
+    assert second.interruption_note is None  # K is not recorded, so the note is left as it was
+    assert transcribed(h, uid) == ["mist, and in Paris"]
+    assert h.responder.commits == []
     assert h.outbound.of("voice_decision:supersede") == [supersede]
     pause.release()
+
+    # One commit in all, U's turn's: K's words are recorded once, inside it.
+    await h.controller.close()
+    assert [entry for entry in h.responder.log if entry.startswith("commit:")] == [
+        "commit:interrupted"
+    ]
 
 
 async def test_a_supersede_after_a_dispatched_tool_says_so():
@@ -2333,7 +2358,7 @@ async def test_a_supersede_after_a_dispatched_tool_says_so():
     turn_id = h.last_turn()
     assert h.controller.phase == "thinking"
 
-    await accept_a_name(h, "server", "mist, make it ten minutes")
+    uid = await accept_a_name(h, "server", "mist, make it ten minutes")
 
     (supersede,) = h.outbound.of("voice_decision:supersede")
     assert supersede.turn_id == turn_id
@@ -2341,9 +2366,19 @@ async def test_a_supersede_after_a_dispatched_tool_says_so():
     assert h.outbound.of("voice_decision:barge_in") == []
     (cancelled,) = h.outbound.of("stream_cancelled")
     assert cancelled.reason == "superseded"
+    # K is committed at the cut, before its metrics, so they say it is recorded.
     (metrics,) = h.outbound.of("turn_metrics")
-    assert (metrics.outcome, metrics.kind) == ("superseded", "tool")
+    assert (metrics.outcome, metrics.kind, metrics.recorded) == ("superseded", "tool", True)
     assert [(c.outcome, c.delivered_text) for c in h.responder.commits] == [("superseded", "")]
+    assert h.responder.prefetches[-1] == ("session-1", "mist, make it ten minutes")
+
+    # The turn from the name takes its own text, after K's record.
+    h.post(h.ingress.ended(uid, "mist, make it ten minutes"))
+    await h.settle()
+    first, second = h.responder.requests
+    assert (first.user_text, second.user_text) == ("mist, set a timer", "mist, make it ten minutes")
+    assert second.interruption_note == "before_reply"
+    assert [c.outcome for c in h.responder.commits] == ["superseded"]
     pause.release()
 
 
@@ -2388,6 +2423,269 @@ async def test_a_name_accepted_while_a_turn_is_held_cancels_it_without_trace():
     assert h.outbound.of("stream_cancelled") == []
     assert h.outbound.queued_turn_ids() == []
     assert h.responder.commits == []
+
+
+# -- A superseded question joins the next one (A51, T55d) ------------------------------------------
+# With no tool dispatched, K is kept, not committed, at the cut: every turn from U sends the
+# responder K's request text, one space, then its own, and K is resolved when a non-held turn from
+# U opens or a held one is released. Where U starts no turn, or another turn would be recorded
+# first, K is committed alone, `superseded` with "".
+
+K_TEXT = "mist, what's the weather"
+U_TEXT = "mist, and in Paris"
+MERGED = f"{K_TEXT} {U_TEXT}"
+
+
+async def kept_turn(h: Harness, u_text: str = U_TEXT) -> str:
+    """Start voice, supersede a thinking turn that dispatched no tool; U's utterance id."""
+    h.start_voice()
+    await h.speak(K_TEXT)
+    assert h.controller.phase == "thinking"
+    uid = await accept_a_name(h, "server", u_text)
+    (supersede,) = h.outbound.of("voice_decision:supersede")
+    assert supersede.detail.model_dump() == {"merged": True, "tool_dispatched": False}
+    assert h.responder.commits == []
+    return uid
+
+
+def recorded(h: Harness) -> list[str]:
+    """The responder's opens, commits and capability calls, in order."""
+    return [e for e in h.responder.log if e == "open" or e.startswith(("commit:", "capability:"))]
+
+
+def commits_of(h: Harness) -> list[tuple[str, str]]:
+    return [(c.outcome, c.delivered_text) for c in h.responder.commits]
+
+
+async def test_with_speculative_start_the_held_turn_from_u_carries_k_through_its_release():
+    h = make_harness([Pause(), Token("Late.")], [Token("In Paris it rains. "), Pause()])
+    uid = await kept_turn(h)
+
+    h.post(h.ingress.candidate(uid, U_TEXT))
+    await h.settle()
+
+    assert h.controller.phase == "held"
+    _, held_request = h.responder.requests
+    assert (held_request.held, held_request.user_text) == (True, MERGED)
+    assert h.responder.prefetches[-1] == ("session-1", MERGED)
+
+    h.post(h.ingress.ended(uid, U_TEXT))
+    await h.settle()
+
+    # The release keeps the held request: no second request, and the client sees U's own text.
+    (release,) = h.outbound.of("voice_decision:release")
+    assert release.detail.utterance_id == uid
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, MERGED]
+    assert transcribed(h, uid) == [U_TEXT]
+    assert h.responder.commits == []
+
+    await h.controller.close()
+    assert recorded(h) == ["open", "open", "commit:interrupted"]
+
+
+async def test_a_held_turn_from_u_cancelled_by_resumed_speech_leaves_k_for_the_next_one():
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Token("In Paris it rains. "), Pause()])
+    uid = await kept_turn(h)
+    h.post(h.ingress.candidate(uid, U_TEXT))
+    await h.settle()
+
+    h.post(h.ingress.resumed(uid))
+    await h.settle()
+
+    assert h.controller.phase == "idle"
+    assert h.responder.commits == []
+    longer = f"{U_TEXT} tomorrow"
+    h.post(h.ingress.candidate(uid, longer))
+    await h.settle()
+    h.post(h.ingress.ended(uid, longer))
+    await h.settle()
+
+    # Each held turn from U carries K once; the second is released.
+    _, cancelled, released = h.responder.requests
+    assert (cancelled.held, cancelled.user_text) == (True, MERGED)
+    assert (released.held, released.user_text) == (True, f"{K_TEXT} {longer}")
+    assert len(h.outbound.of("voice_decision:release")) == 1
+    assert transcribed(h, uid) == [longer]
+    assert h.responder.commits == []
+
+    await h.controller.close()
+    assert recorded(h) == ["open", "open", "open", "commit:interrupted"]
+
+
+@pytest.mark.parametrize("final", ["stop", "mist, stop"])
+async def test_mist_stop_with_speculative_start_off_starts_a_turn_from_u_that_merges_k(final):
+    """U ends in `idle`, where no keyword verdict cuts anything, so it starts a turn from U.
+
+    "mist, stop" is accepted on the gate's decode; its final transcript may or may not keep the
+    name, and either way the end in `idle` starts a turn.
+    """
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    uid = await kept_turn(h, "mist, stop")
+
+    h.post(h.ingress.ended(uid, final))
+    await h.settle()
+
+    _, second = h.responder.requests
+    assert (second.held, second.user_text) == (False, f"{K_TEXT} {final}")
+    assert transcribed(h, uid) == [final]
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert h.responder.commits == []
+
+    await h.controller.close()
+    assert recorded(h) == ["open", "open", "commit:interrupted"]
+
+
+async def test_mist_stop_on_a_held_turn_from_u_whose_final_keeps_the_name_releases_and_merges():
+    """In `held` only a keyword-only end cancels (`KeywordBargeIn._judge_whole`); a final that
+    keeps the name is a new request, so the held turn from U is released and carries K.
+    """
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    uid = await kept_turn(h, "mist, stop")
+    h.post(h.ingress.candidate(uid, "mist, stop"))
+    await h.settle()
+
+    h.post(h.ingress.ended(uid, "mist, stop"))
+    await h.settle()
+
+    assert len(h.outbound.of("voice_decision:release")) == 1
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, f"{K_TEXT} mist, stop"]
+    assert h.responder.commits == []
+
+
+async def _stop_on_the_held_turn(h: Harness, uid: str) -> None:
+    """The name and `stop` with speculative start on, the final transcript the keyword alone."""
+    h.post(h.ingress.candidate(uid, "stop"))
+    await h.settle()
+    assert h.controller.phase == "held"
+    assert h.responder.requests[-1].user_text == f"{K_TEXT} stop"
+    h.post(h.ingress.ended(uid, "stop"))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("keyword", uid)
+
+
+async def _mute(h: Harness, uid: str) -> None:
+    h.post(h.ingress.dropped(uid, "muted"), Mute(active=True))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("muted", uid)
+
+
+async def _voice_stop(h: Harness, uid: str) -> None:
+    h.post(VoiceStop())
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("voice_stop", uid)
+
+
+async def _voice_start_over_an_adopted_ingress(h: Harness, uid: str) -> None:
+    h.post(new_start(h))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("voice_stop", uid)
+
+
+async def _typed_while_held(h: Harness, uid: str) -> None:
+    h.post(h.ingress.candidate(uid, U_TEXT))
+    await h.settle()
+    assert h.controller.phase == "held"
+    h.post(Text("what's on today"))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("text_input", uid)
+    # K is recorded before the typed turn opens.
+    assert recorded(h) == ["open", "open", "commit:superseded", "open"]
+    assert h.responder.requests[-1].user_text == "what's on today"
+
+
+async def _close(h: Harness, uid: str) -> None:
+    await h.controller.close()
+
+
+async def _cancel(h: Harness, uid: str) -> None:
+    task = h.controller.task
+    assert task is not None
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    "end_u",
+    [
+        _stop_on_the_held_turn,
+        _mute,
+        _voice_stop,
+        _voice_start_over_an_adopted_ingress,
+        _typed_while_held,
+        _close,
+        _cancel,
+    ],
+    ids=[
+        "mist-stop-speculative",
+        "mute",
+        "voice_stop",
+        "voice_start",
+        "typed-while-held",
+        "close",
+        "cancel",
+    ],
+)
+async def test_k_is_committed_alone_once_where_u_starts_no_turn(end_u):
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Pause()])
+    uid = await kept_turn(h, "mist, stop")
+
+    await end_u(h, uid)
+
+    assert commits_of(h) == [("superseded", "")]
+    assert h.responder.commits[0].tool_effect_unknown is False
+    task = h.controller.task
+    if task is not None and not task.done():
+        await h.controller.close()
+    # Exactly once: nothing later records K again.
+    assert [entry for entry in recorded(h) if entry == "commit:superseded"] == ["commit:superseded"]
+
+
+async def test_an_alarm_stop_word_records_k_before_the_capability_path_is_asked():
+    alarm = FakeAlarm()
+    h = make_harness([Pause(), Token("Late.")], [Pause()], alarm_ringing=alarm)
+    uid = await kept_turn(h, "mist, stop")
+    h.post(h.ingress.candidate(uid, "mist, stop"))
+    await h.settle()
+    assert h.controller.phase == "held"
+
+    h.post(h.ingress.ended(uid, "mist, stop"))
+    await h.settle()
+
+    assert h.responder.capability_calls == [("mist, stop", "session-1")]
+    assert recorded(h) == ["open", "open", "commit:superseded", "capability:mist, stop"]
+    assert commits_of(h) == [("superseded", "")]
+    await h.controller.close()
+    assert commits_of(h) == [("superseded", "")]
+
+
+async def test_a_typed_message_while_u_is_open_records_k_first_and_u_then_takes_its_own_text():
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Token("In Paris it rains. "), Pause()])
+    uid = await kept_turn(h)
+
+    h.post(Text("what's on today"))
+    await h.settle()
+
+    # K is recorded before the typed turn opens, so its record precedes the typed turn's.
+    assert recorded(h) == ["open", "commit:superseded", "open"]
+    assert h.controller.phase == "text"
+
+    h.post(h.ingress.ended(uid, U_TEXT))
+    await h.settle()
+
+    # U's end cuts the typed turn and starts a turn from U with its own text alone.
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, "what's on today", U_TEXT]
+    assert h.outbound.of("stream_cancelled")[-1].reason == "new_input"
+    assert commits_of(h) == [("superseded", ""), ("interrupted", "")]
+    assert transcribed(h, uid) == [U_TEXT]
+    await h.controller.close()
+    assert [c.outcome for c in h.responder.commits] == ["superseded", "interrupted", "interrupted"]
 
 
 async def test_a_wake_while_muted_is_dropped_muted_with_a_fresh_id():
