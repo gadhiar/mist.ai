@@ -43,7 +43,10 @@ CODE_SOURCES = (
     "src/",
     "dependencies/",
     "scripts/",
+    "voice_profiles/",
 )
+# Where `backend/server.py`'s `VOICE_PROFILES_ROOT` reads `<profile>/personality.yaml`.
+VOICE_PROFILES_TARGET = "/app/voice_profiles/"
 # The numbered dependency steps, each commented once in this order; `3b` slots in without
 # renumbering the rest.
 STEP_NUMBERS = ("1", "2", "3", "3b", "4", "5", "6", "7")
@@ -57,7 +60,8 @@ SCRIPTS_CHECK = (
 PIN_LINE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?==[^\s=;#]+")
 REQUIREMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # Every mount point and unmounted path the backend writes, so each stays writable by appuser:
-# /app/dev-state is a named volume Docker initialises from the image directory's ownership.
+# /app/dev-state and /voice-cache are named volumes Docker initialises from the image
+# directory's ownership.
 RUNTIME_DIRECTORIES = (
     "/app",
     "/app/data",
@@ -68,6 +72,7 @@ RUNTIME_DIRECTORIES = (
     "/app/mist-memory",
     "/app/ops",
     "/app/dev-state",
+    "/voice-cache",
 )
 RELEASE_LINES = [
     ("ARG", "MIST_RELEASE_TAG=unreleased"),
@@ -332,6 +337,19 @@ class TestCodeOwnership:
 
         assert copies, f"{source} is never copied"
         assert all(f"--chown={OWNER}" in arguments.split() for arguments in copies), copies
+
+    def test_voice_profiles_land_where_the_server_reads_them(self):
+        instructions = _instructions()
+        (copy,) = (
+            i
+            for i, (keyword, arguments) in enumerate(instructions)
+            if keyword == "COPY" and _copy_source(arguments) == "voice_profiles/"
+        )
+        code_copies = _code_copy_indexes()
+
+        assert instructions[copy][1].split()[-1] == VOICE_PROFILES_TARGET
+        # Beside the other code copies, so the runtime directory step still follows them all.
+        assert copy == code_copies[-1] and copy - 1 in code_copies
 
     def test_no_recursive_chown_follows_the_first_code_copy(self):
         first_copy = _code_copy_indexes()[0]
