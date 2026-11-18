@@ -353,7 +353,6 @@ class RealtimeSession:
         self.dropped_references = 0
         self._last_protocol_error: int | None = None
         self._gpu_yield_logged = False
-        self._ledger: object | None = None
 
         self._activity = False
         self._activity_check: asyncio.Handle | None = None
@@ -435,14 +434,10 @@ class RealtimeSession:
     def recent_tts_text(self, window_ms: int) -> str:
         """The text this session played within `window_ms`, from its latest spoken turn.
 
-        The ledger is the controller's, read through its private turn record: the controller
-        offers no public view of it, and the ledger outlives the turn, so the text a turn ended
-        on stays readable for the echo guard after it ends.
+        The controller keeps that turn's ledger after the turn ends, so the text a turn ended on
+        stays readable for the echo guard.
         """
-        ledger = self._ledger
-        if ledger is None:
-            return ""
-        return ledger.recent_tts_text(window_ms)  # type: ignore[attr-defined]
+        return self._controller.recent_tts_text(window_ms)
 
     # -- Lifecycle ---------------------------------------------------------------------------
 
@@ -535,7 +530,6 @@ class RealtimeSession:
                 logger.error("session %s: turn lane full; closing with 1013", self.session_id)
             self.close(CLOSE_TRY_AGAIN_LATER)
             return False
-        self._note_ledger()
         self._ready.set()
         self._schedule_activity_check()
         return True
@@ -579,12 +573,6 @@ class RealtimeSession:
                     ),
                 ),
             )
-
-    def _note_ledger(self) -> None:
-        turn = getattr(self._controller, "_turn", None)
-        ledger = getattr(turn, "ledger", None)
-        if ledger is not None:
-            self._ledger = ledger
 
     def _next_item(self) -> object | None:
         if self._control:
