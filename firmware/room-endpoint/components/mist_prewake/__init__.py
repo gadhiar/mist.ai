@@ -17,7 +17,7 @@ from pathlib import Path
 import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
-from esphome.components import binary_sensor, microphone
+from esphome.components import binary_sensor, microphone, network
 from esphome.components.micro_wake_word import WakeWordModel
 from esphome.components.mist_link import MistLink
 from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_PATH, CONF_TYPE, TYPE_LOCAL
@@ -53,6 +53,22 @@ def _ring_holds_the_backlog(config: dict) -> dict:
     return config
 
 
+def _request_high_performance_networking(config: dict) -> dict:
+    """Size lwIP and Wi-Fi for the backlog burst, as ESPHome's streaming components do.
+
+    A wake sends 5 s of backlog, about 175 KB on the wire, that must arrive within 1 s. Without
+    this request lwIP keeps ESP-IDF's 5760-byte send buffer (`lwip/Kconfig:652-654`), so about 30
+    round trips carry one backlog. With PSRAM the request gives a 65534-byte send buffer with
+    window scaling (`network/__init__.py:438-469`) and more Wi-Fi buffers with A-MPDU, allocated
+    in PSRAM (`wifi/__init__.py:785-814`). The published Voice PE config gets the same through
+    Sendspin (`sendspin/__init__.py:252-258`). Only this request reaches the Wi-Fi settings:
+    `network: enable_high_performance` sets lwIP's alone (`has_high_performance_networking`,
+    `network/__init__.py:201-215`). It runs at validation, before any `to_code` reads the flag.
+    """
+    network.require_high_performance_networking()
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -74,6 +90,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     _ring_holds_the_backlog,
+    _request_high_performance_networking,
 )
 
 

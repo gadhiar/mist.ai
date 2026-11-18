@@ -453,6 +453,47 @@ MIST_TEST(speak_and_idle_close_the_uplink) {
   }
 }
 
+// The device logs this detail on each close, in the spike listener's own words for the operator
+// commands (`closed_by`), so a device log and a listener result can be read side by side.
+MIST_TEST(each_close_names_its_cause_for_the_log) {
+  CHECK_STREQ(Rig().uplink.last_close_detail(), "none");
+
+  struct Case {
+    void (*close)(Uplink&);
+    const char* detail;
+  };
+  const Case cases[] = {
+      {[](Uplink& u) { u.on_state_cycle(MistState::Speak, "turn-1"); }, "state_cycle speak"},
+      {[](Uplink& u) { u.on_state_cycle(MistState::Idle, ""); }, "state_cycle idle"},
+      {[](Uplink& u) { u.on_voice_decision(DecisionKind::WakeRejected); }, "wake_rejected"},
+      {[](Uplink& u) { u.on_voice_decision(DecisionKind::WakeLost); }, "wake_lost"},
+      {[](Uplink& u) { u.on_voice_decision(DecisionKind::Dropped); }, "dropped"},
+      {[](Uplink& u) { u.pump(30000); }, "cap"},
+      {[](Uplink& u) { u.on_mute(true); }, "mute"},
+      {[](Uplink& u) { u.on_disconnected(); }, "disconnection"},
+      {[](Uplink& u) { u.on_connected(); }, "disconnection"},
+  };
+  for (const Case& c : cases) {
+    Rig rig;
+    rig.ready();
+    CHECK(rig.uplink.on_wake(0.9f, 0) == WakeOutcome::Opened);
+    c.close(rig.uplink);
+    CHECK(!rig.uplink.is_open());
+    CHECK_STREQ(rig.uplink.last_close_detail(), c.detail);
+  }
+}
+
+MIST_TEST(a_close_while_closed_keeps_the_last_cause) {
+  Rig rig;
+  rig.ready();
+  CHECK(rig.uplink.on_wake(0.9f, 0) == WakeOutcome::Opened);
+  rig.uplink.on_state_cycle(MistState::Idle, "");
+  rig.uplink.on_mute(true);
+  rig.uplink.on_disconnected();
+
+  CHECK_STREQ(rig.uplink.last_close_detail(), "state_cycle idle");
+}
+
 MIST_TEST(attend_listen_and_think_keep_the_uplink_open) {
   Rig rig;
   rig.ready();
