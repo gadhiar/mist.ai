@@ -38,8 +38,8 @@ the result, `<PC LAN IP>` the PC's reserved address, and `<worker image>` the mi
 
 3. Flash the factory image. Connect the Voice PE to the PC by USB, open https://web.esphome.io in
    Chrome or Edge, choose Connect, pick the device's serial port, choose Install, and select
-   `<private dir>/<device>/images/spike/firmware.factory.bin`. Later builds can go over the air
-   with the OTA password in `secrets.yaml`.
+   `<private dir>/<device>/images/spike/firmware.factory.bin`. Later builds go over the air
+   instead ("Over the air: later builds", below).
 
 4. Start the spike listener on the device port. `-i` keeps stdin open for the operator commands:
 
@@ -63,14 +63,61 @@ the result, `<PC LAN IP>` the PC's reserved address, and `<worker image>` the mi
    - Wakes: say "stop" 20 times at 1 to 3 m, with nothing playing. After each, wait a few seconds
      and type `state idle` to close the uplink.
    - Playback: say "stop" with nothing playing (it opens the uplink), then type `tone` at once.
-     Do not say "stop" during the tone: during playback "stop" is a `barge_in`, not a wake. Let the
-     60 s play out, then type `state idle`.
+     The listener replies `tone started (audio_tag <n>, 60 s)` and the speaker plays a steady
+     400 Hz tone. Do not say "stop" during the tone: during playback "stop" is a `barge_in`, not a
+     wake. Until the tone ends, type no `state` or `reject` and leave the mute switch alone: each
+     closes the uplink, and G1 counts 60 s of uplink beside the tone. The listener prints nothing
+     when the tone ends, so type `status`: it shows `tone=playing` until the tone's last frame
+     has gone out, then `tone=idle`. Once it shows `tone=idle`, type `state idle`.
    - Soak: leave it running for 30 minutes in all.
    - Reconnection: `quit`, then start the listener again with the same command and the same
      `--out`, and `quit` once the device has reconnected.
 
    The result is `<result dir>/spike_result.json`: counts and timings only, never audio. G1's
    checks and a pass or fail for each are in it.
+
+6. The device's log, if a check fails. It comes over USB only (the firmware has no native API):
+   connect the Voice PE by USB, open https://web.esphome.io, choose Connect, pick the serial port
+   and choose Logs. Each uplink logs one line when it opens and one when it closes:
+
+   - `Uplink open: wake '<word>', backlog <ms> ms, first seq <n>`;
+   - `Uplink closed: <cause>, next seq <n>`, where `<cause>` is `state_cycle speak`,
+     `state_cycle idle`, `wake_rejected`, `wake_lost`, `dropped`, `cap`, `mute` or
+     `disconnection`. For an operator command it reads as the result's `closed_by`, so a close
+     the listener did not cause (`mute`, `cap`, `disconnection`) shows here and not there.
+
+## Over the air: later builds
+
+After the first USB flash, a new image goes to the device over Wi-Fi with ESPHome's own OTA,
+authenticated by `mist_ota_password` from the device's `secrets.yaml`, which the private YAML
+reads through `packages/device.yaml` (`ota: password: !secret mist_ota_password`).
+
+1. Build the new image with step 2's command (or the room build's). The OTA image is
+   `<private dir>/<device>/images/spike/firmware.ota.bin` (`images/room/` for the room build).
+
+2. Find the device's IP address on Windows, in any of these ways:
+
+   - In PowerShell, `ping -4 <device>.local`: the firmware answers multicast DNS under its
+     `device_name`, and the reply line shows the address, if Windows resolves `.local` names on
+     your network.
+   - Your router's list of DHCP clients: the device appears under `<device>`. Reserving that
+     address there keeps it the same after a reboot.
+   - The device's log over USB (step 6): the Wi-Fi component logs `IP Address:` once it connects.
+
+3. Upload. This runs in the worker image with the network on, so the container reaches the
+   device; it mounts the repository's config and the private directory read-only where `build.py`
+   puts them, passes the one substitution `build.py` passes for a `--config` build
+   (`mist_components_path`), and serves the image's assets on `127.0.0.1:8765` as `build.py`
+   does, because ESPHome validates the whole config, `voice_kit`'s XMOS image by URL included,
+   before it uploads:
+
+   ```bash
+   docker run --rm -v <repo>/firmware/room-endpoint:/build/room-endpoint:ro -v <private dir>/<device>:/build/config:ro -e HOME=/tmp -e ESPHOME_DATA_DIR=/tmp/esphome -w /tmp <worker image> sh -c "/opt/python312/bin/python3.12 -I -m http.server 8765 --bind 127.0.0.1 --directory /opt/mist-firmware-deps >/dev/null 2>&1 & sleep 2; esphome -s mist_components_path /build/room-endpoint/components upload /build/config/spike.yaml --device <device IP> --file /build/config/images/spike/firmware.ota.bin"
+   ```
+
+   For the room build, add `-v <models dir>:/models:ro` and use `room.yaml` and
+   `images/room/firmware.ota.bin`. ESPHome prints `Successfully uploaded program.` and the device
+   restarts into the new image, then connects to the listener again.
 
 ## The room build
 
@@ -94,6 +141,13 @@ unmuted and with `voice_state.active` true, sends `wake {keyword: "mist", score,
 then the newest `backlog_ms` (at most 5000) of the ring oldest first, then live frames, all
 through `mist_link`. `mist_core::Uplink` (`components/mist_core/uplink.cpp`) is the state machine,
 tested on the host in `tests/unit/firmware/cpp/test_uplink.cpp`.
+
+A wake queues the whole backlog at once (250 frames, about 175 KB on the wire once WebSocket and
+TLS framing are added), and G1 wants its last frame at the server within 1 s. Two settings carry
+it. `mist_prewake` requests ESPHome's high-performance networking, as the published config's
+Sendspin does: without it lwIP's send buffer is ESP-IDF's 5760 bytes, so about 30 round trips
+carry one backlog. And `packages/device.yaml` turns Wi-Fi power save off: in ESPHome's default
+modem sleep the server's ACKs can wait for the next beacon, which stalls the send window.
 
 Which detection opens it. `micro_wake_word`'s `on_wake_word_detected` passes only the detected
 model's word, so `mist_prewake` opens the uplink only when that word is the name model's
@@ -141,7 +195,9 @@ the automation's one argument is `wake_word`, `micro_wake_word/__init__.py:600-6
 detection queue is protected (`micro_wake_word.h:138`). So `mist_prewake` sends the cutoff the model runs with,
 `WakeWordModel::get_probability_cutoff() / 255`: the manifest's `micro.probability_cutoff`, or the
 model's `probability_cutoff` in the YAML (`micro_wake_word/__init__.py:555-558`), quantized to
-1/255. The server's calibration then ranks the device at its cutoff's false-accept rate.
+1/255. The server's calibration then ranks the device at its cutoff's false-accept rate. H4's
+spike build shows it: the stop manifest's cutoff is 0.5, quantized to `int(0.5 * 255)` = 127, and
+every wake carried `score` 127/255 = 0.49803922.
 
 ## Layout and how a build works
 
