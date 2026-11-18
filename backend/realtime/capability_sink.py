@@ -1,9 +1,12 @@
 """Capabilities' `EventSink` over the session registry: house-wide state to every session (D7).
 
 The capability host emits its broadcast payloads here, from the loop or from a worker thread.
-`alarm_fired` is the desktop's ring, so it goes to the sessions bound `desktop` only; every
-other payload (`capabilities_status`, `alarm_state`, `action_proposed`, `action_resolved` and
-the rest) is queued on every session. A `room` session writes only the types its device acts on
+`alarm_fired` is the desktop's ring (`DesktopSink.ring`), so it goes to the sessions bound
+`desktop` only. The other three are queued on every session: `capabilities_status` (the host's
+status broadcast), `action_resolved` for an expired proposal (the host's expiry callback), and
+`alarm_state` (`DesktopSink.state_changed`). A turn's own `action_proposed` and
+`action_resolved` never come here: the host buffers them per session, and the turn's stream
+takes them through `drain_events`. A `room` session writes only the types its device acts on
 (`ROOM_SERVER_MESSAGE_TYPES`, checked in `RealtimeSession._write`), so of these a device is sent
 `alarm_state` alone; its own `alarm_fired` comes from its ring sink (`backend/devices/`).
 
