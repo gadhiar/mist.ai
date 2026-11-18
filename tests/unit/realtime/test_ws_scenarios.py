@@ -459,12 +459,13 @@ def test_speculative_starts_are_cancelled_by_resumed_speech_and_released_at_the_
 
 
 def test_a_name_while_she_thinks_supersedes_the_turn(voice_server):
-    """v1 scenario 5, its third part, on v13's A51 (T55c).
+    """v1 scenario 5, its third part, on v13's A51 (T55c, T55d).
 
     The responder pauses before the first turn's first token, so none of its audio is queued
     when the second name is accepted: the name supersedes the turn instead of barging in. The
-    `supersede` goes out at the cut (Decision 2, option A), and the first turn is committed
-    `superseded` there; the second turn's request is its own utterance's text (T55d merges).
+    `supersede` goes out at the cut (Decision 2, option A). No tool was dispatched, so the first
+    turn is not recorded on its own: the second turn's request carries both utterances joined by
+    one space, its `transcription` its own text, and its commit is the only one.
     """
     stack = VoiceStack(transcripts=["mist, what's the weather", "mist, and in Paris"])
     pause = Pause()
@@ -481,18 +482,23 @@ def test_a_name_while_she_thinks_supersedes_the_turn(voice_server):
         supersede = one(client, "supersede", turn_id=first)
         assert (supersede["reason"], supersede["detail"]) == (
             "continued_speech",
-            {"merged": False, "tool_dispatched": False},
+            {"merged": True, "tool_dispatched": False},
         )
         cancelled = one(client, "stream_cancelled", turn_id=first)
         assert cancelled["reason"] == "superseded"
         assert client.voice.index(supersede) < client.voice.index(cancelled)
         assert client.of("barge_in") == []
-        assert one(client, "turn_metrics", turn_id=first)["outcome"] == "superseded"
+        first_metrics = one(client, "turn_metrics", turn_id=first)
+        assert (first_metrics["outcome"], first_metrics["recorded"]) == ("superseded", False)
         assert [request.user_text for request in srv.responder.requests] == [
+            "mist, what's the weather",
+            "mist, what's the weather mist, and in Paris",
+        ]
+        assert [item["text"] for item in client.of("transcription")] == [
             "mist, what's the weather",
             "mist, and in Paris",
         ]
-        assert [commit.outcome for commit in srv.responder.commits] == ["superseded", "completed"]
+        assert [commit.outcome for commit in srv.responder.commits] == ["completed"]
         assert metrics["turn_id"] != first and metrics["outcome"] == "completed"
         assert_protocol_rules(client)
 

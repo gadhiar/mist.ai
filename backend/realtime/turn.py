@@ -39,7 +39,10 @@ one `wake_rejected`. A claim that loses because another session's name was accep
 and sends one `wake_lost`, naming its utterance, or a fresh id when an endpoint wake's backlog
 has not opened one yet. While a turn is in flight an accepted name interrupts it with `barge_in`
 reason `wake`, except a model turn still `thinking` with none of its audio queued, which the name
-supersedes (A51): `supersede`, then the cut with reason `superseded`. After a name-opened turn a follow-up window, when configured, keeps ingress
+supersedes (A51): `supersede`, then the cut with reason `superseded`. A superseded turn that
+dispatched no tool is kept, not committed, and its request text leads every turn the name's
+utterance starts; where that utterance starts none, or another turn would be recorded first, it
+is committed alone. After a name-opened turn a follow-up window, when configured, keeps ingress
 engaged so the next utterance needs no name.
 
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
@@ -817,6 +820,18 @@ class _Turn:
         self.marks.setdefault(key, at_ms)
 
 
+@dataclass(frozen=True, slots=True)
+class _KeptTurn:
+    """A superseded turn kept for the merge (A51): K, and the utterance that superseded it.
+
+    K dispatched no tool, so it is not recorded on its own when that utterance starts a turn:
+    the turn's request carries K's request text ahead of its own, and K is never committed.
+    """
+
+    turn: _Turn
+    utterance_id: str
+
+
 # -- Metrics ----------------------------------------------------------------------------
 
 
@@ -1144,6 +1159,7 @@ class TurnController:
         self._task: asyncio.Task[None] | None = None
         self._phase: Phase = "idle"
         self._turn: _Turn | None = None
+        self._kept: _KeptTurn | None = None
         self._note: Literal["mid_reply", "before_reply"] | None = None
         self._tag = MAX_TURN_TAG
         self._turn_seq = 0
@@ -1277,6 +1293,7 @@ class TurnController:
             turn = self._turn
             if turn is not None and not turn.ending:
                 await self._cut(turn, reason="disconnect", notify=False)
+            self._commit_kept()
             raise
 
     async def _handle(self, message: object) -> None:
@@ -1502,7 +1519,7 @@ class TurnController:
                     stable_chars=event.stable_chars,
                 )
             )
-            self._responder.prefetch(self._session_id, event.text)
+            self._prefetch(event.utterance_id, event.text)
         if self._policy is None:
             return
         if self._phase in ("thinking", "speaking") and utterance.keyword is None:
@@ -1564,7 +1581,7 @@ class TurnController:
         utterance.partial_text = event.text
         if not utterance.published:
             return
-        self._responder.prefetch(self._session_id, event.text)
+        self._prefetch(event.utterance_id, event.text)
         if self._phase == "idle" and self._turn is None:
             self._open_turn(
                 self._next_turn_id(),
@@ -1603,6 +1620,7 @@ class TurnController:
             if keyword is not None:
                 await self._alarm_cut(utterance, keyword, event.text, event.heard_at_ms)
         if utterance.alarm_stop:
+            self._commit_kept_for(event.utterance_id)  # its record precedes the capability path's
             self._hand_to_capability(event)
             return
         text = event.text
@@ -1626,6 +1644,7 @@ class TurnController:
             self._send_control(
                 VoiceDecisionDropped(turn_id=None, reason="keyword", detail=_ended_detail(event))
             )
+            self._commit_kept_for(event.utterance_id)
             return
         if self._turn is not None:
             await self._cut(self._turn, reason="new_input")
@@ -1644,6 +1663,7 @@ class TurnController:
         """
         if self._policy is not None and self._alarm_stop(event.text) is not None:
             await self._cancel_held(turn)
+            self._commit_kept_for(event.utterance_id)  # its record precedes the capability path's
             self._hand_to_capability(event)
             return
         if self._policy is not None:
@@ -1655,6 +1675,7 @@ class TurnController:
                         turn_id=None, reason="keyword", detail=_ended_detail(event)
                     )
                 )
+                self._commit_kept_for(event.utterance_id)
                 return
         if event.text != turn.text:
             await self._cancel_held(turn)
@@ -1683,6 +1704,8 @@ class TurnController:
         turn.marks["eot_decided"] = event.heard_at_ms
         turn.base_ms = event.heard_at_ms - event.silence_ms
         turn.held = False
+        if turn.utterance_id is not None:
+            self._resolve_kept(turn.utterance_id)  # its request carried K's words
         if turn.ledger is not None:
             self._spoken_ledger = turn.ledger
         self._phase = "thinking" if turn.audio_tag is not None else "text"
@@ -1738,6 +1761,7 @@ class TurnController:
         held = self._held_turn(event.utterance_id)
         if held is not None:
             await self._cancel_held(held)
+        self._commit_kept_for(event.utterance_id)
 
     async def _on_overload(self, event: IngressOverload) -> None:
         """`overload` names the turn in flight, but never a held one, which sent nothing (v1)."""
@@ -1974,7 +1998,7 @@ class TurnController:
             if turn.held:
                 await self._cancel_held(turn)  # it never reached the client
             elif self._supersedes(turn):
-                await self._supersede(turn)
+                await self._supersede(turn, utterance.utterance_id)
             else:
                 self._send_control(
                     VoiceDecisionBargeIn(
@@ -2000,21 +2024,66 @@ class TurnController:
         """
         return self._phase == "thinking" and not turn.frames_queued and turn.answered is None
 
-    async def _supersede(self, turn: _Turn) -> None:
+    async def _supersede(self, turn: _Turn, utterance_id: str) -> None:
         """Send `supersede`, then cut the turn with reason `superseded` (A51).
 
-        The decision goes out at the cut (Decision 2, option A). The cut commits the turn
-        `superseded` with what the client received, "" before any audio, so the next turn's
-        note is `before_reply`; a turn the name opens takes the name's utterance's own text.
+        The decision goes out at the cut (Decision 2, option A). A turn that dispatched a tool is
+        committed there, `superseded` with "" (nothing of it was queued), so the next turn's note
+        is `before_reply` and a turn the name's utterance `utterance_id` starts takes its own
+        text. Any other is kept (`merged`): not committed, its `outcome` set here since no
+        commit sets it, and its request text leads every turn from that utterance until one is
+        released or opens unheld; where none will be, `_commit_kept` records it alone.
+
+        A supersede never finds a turn kept: a typed turn is in `text`, and a turn from the
+        kept turn's utterance that reaches `thinking` resolved it when it opened or was released.
         """
+        assert self._kept is None  # noqa: S101 - at most one turn is kept (A51)
+        merged = not turn.scope.tool_dispatched
         self._send_control(
             VoiceDecisionSupersede(
                 turn_id=turn.turn_id,
                 reason="continued_speech",
-                detail=SupersedeDetail(merged=False, tool_dispatched=turn.scope.tool_dispatched),
+                detail=SupersedeDetail(merged=merged, tool_dispatched=not merged),
             )
         )
-        await self._cut(turn, reason="superseded")
+        await self._cut(turn, reason="superseded", keep=merged)
+        if merged:
+            self._kept = _KeptTurn(turn, utterance_id)
+
+    def _request_text(self, utterance_id: str | None, text: str) -> str:
+        """The request text of a turn from `utterance_id`: K's words first while K is kept."""
+        kept = self._kept
+        if kept is None or utterance_id is None or kept.utterance_id != utterance_id:
+            return text
+        return f"{kept.turn.scope.request.user_text} {text}"
+
+    def _prefetch(self, utterance_id: str, text: str) -> None:
+        """Prefetch for the turn an utterance's text may start, with K's words when merged."""
+        self._responder.prefetch(self._session_id, self._request_text(utterance_id, text))
+
+    def _resolve_kept(self, utterance_id: str) -> None:
+        """A turn from the kept turn's utterance carries its words: K is never committed."""
+        kept = self._kept
+        if kept is not None and kept.utterance_id == utterance_id:
+            self._kept = None
+
+    def _commit_kept_for(self, utterance_id: str) -> None:
+        """Record K alone when the utterance it waits on will start no turn from it."""
+        kept = self._kept
+        if kept is not None and kept.utterance_id == utterance_id:
+            self._commit_kept()
+
+    def _commit_kept(self) -> None:
+        """Record the kept turn alone, `superseded` with "", once; nothing is kept after it.
+
+        Its stream ended at the cut, so a failed record is logged rather than sent.
+        """
+        kept, self._kept = self._kept, None
+        if kept is None:
+            return
+        result = self._commit(kept.turn, "superseded", "", tool_effect_unknown=False)
+        if result.error is not None:
+            logger.error("turn %s: record_failed", kept.turn.turn_id)
 
     def _publish_candidate(self, utterance: _Utterance, *, wake: bool) -> None:
         """Publish an accepted candidate in one step (v5 :411-416, the D3 anchors at :1196-1197).
@@ -2038,7 +2107,10 @@ class TurnController:
                     stable_chars=latest.stable_chars,
                 )
             )
-        self._responder.prefetch(self._session_id, latest.text if latest is not None else None)
+        if latest is not None:
+            self._prefetch(utterance.utterance_id, latest.text)
+        else:
+            self._responder.prefetch(self._session_id, None)
         self._set_engaged(True)
 
     async def _replay(self, utterance: _Utterance) -> None:
@@ -2256,7 +2328,9 @@ class TurnController:
         The held utterance was never shown as a turn, so it closes visibly (`dropped
         text_input`) rather than ending later and cutting the typed turn it preceded (v1). An
         unpublished candidate is dropped silently (v5 :1189-1190); the typed turn's `think`
-        follows the `attend` its name sent.
+        follows the `attend` its name sent. A kept turn (A51) is recorded alone before the typed
+        turn opens, so its record comes first; an utterance it waited on that stays open later
+        starts a turn with its own text.
         """
         self._drop_candidates("text_input")
         turn = self._turn
@@ -2265,6 +2339,7 @@ class TurnController:
             self._drop_for_text(turn.utterance_id)
         elif turn is not None:
             await self._cut(turn, reason="new_input")
+        self._commit_kept()
         now = self._clock.now_ms()
         self._open_turn(self._next_turn_id(), message.text, "text", base_ms=now, marks={})
 
@@ -2280,6 +2355,7 @@ class TurnController:
                 turn_id=None, reason="text_input", detail=_closing_detail(utterance, drop)
             )
         )
+        self._commit_kept_for(utterance_id)
 
     async def _on_interrupt(self, message: Interrupt) -> None:
         turn = self._turn
@@ -2380,6 +2456,7 @@ class TurnController:
                     turn_id=None, reason="voice_stop", detail=_closing_detail(utterance, drop)
                 )
             )
+            self._commit_kept_for(utterance.utterance_id)
 
     async def _on_reconfigure(self, message: Reconfigure) -> None:
         """Hold a servable request until a quiescent point; answer the others at once (M46).
@@ -2586,6 +2663,7 @@ class TurnController:
         turn = self._turn
         if turn is not None and not turn.ending:
             await self._cut(turn, reason="disconnect", notify=False)
+        self._commit_kept()
 
     # -- Opening a turn ---------------------------------------------------------------------
 
@@ -2648,7 +2726,15 @@ class TurnController:
         # Timings count from the end of speech: the utterance's last frame less its silence.
         marks = {"eot_decided": event.heard_at_ms, "stt_final": self._clock.now_ms()}
         base = event.heard_at_ms - event.silence_ms
-        self._open_turn(turn_id, turn_text, "voice", base_ms=base, marks=marks, answered=answered)
+        self._open_turn(
+            turn_id,
+            turn_text,
+            "voice",
+            base_ms=base,
+            marks=marks,
+            from_utterance=event.utterance_id,
+            answered=answered,
+        )
         self._take_wake_timings(event.utterance_id)
 
     def _open_turn(
@@ -2660,9 +2746,16 @@ class TurnController:
         base_ms: int,
         marks: dict[str, int],
         held_utterance: str | None = None,
+        from_utterance: str | None = None,
         answered: tuple[StreamEvent, ...] | None = None,
     ) -> None:
         """Open a turn; with `held_utterance` it starts held, answering that utterance.
+
+        `from_utterance` names the utterance an unheld voice turn answers. A turn from the
+        utterance a kept turn waits on sends the responder the kept turn's request text, one
+        space, then `text` (A51); `text` stays the turn's own, which the held end compares and
+        the `transcription` carries. Opened unheld it resolves the kept turn; held, its release
+        does. Any other turn would be recorded first, so the kept turn is recorded alone before.
 
         With `answered` the responder opens nothing: the capability-only path opened, answered
         and committed the turn already, so its scope is the controller's own.
@@ -2670,9 +2763,13 @@ class TurnController:
         placement = self._placement()
         channel = self._channel_for(origin)
         held = held_utterance is not None
+        source = held_utterance if held else from_utterance
+        kept = self._kept
+        if kept is not None and kept.utterance_id != source:
+            self._commit_kept()
         request = TurnRequest(
             session_id=self._session_id,
-            user_text=text,
+            user_text=self._request_text(source, text),
             origin=origin,
             channel=channel,
             interruption_note=self._note,
@@ -2683,6 +2780,8 @@ class TurnController:
         else:
             scope = TurnScope(session_id=self._session_id, turn_index=-1, request=request)
             scope.dispatch_gate.set()
+        if not held and source is not None:
+            self._resolve_kept(source)
         now = self._clock.now_ms()
         turn = _Turn(
             turn_id=turn_id,
@@ -3312,10 +3411,15 @@ class TurnController:
             await self._cut(self._turn, reason="new_input")
         self._start_voice_turn(event, answered=result.events)
 
-    async def _cut(self, turn: _Turn, *, reason: CancelReason, notify: bool = True) -> None:
+    async def _cut(
+        self, turn: _Turn, *, reason: CancelReason, notify: bool = True, keep: bool = False
+    ) -> None:
         """Cancel the turn and commit what the client received (v2 M62, M69).
 
         The outcome is `superseded` for reason `superseded` (A51) and `interrupted` otherwise.
+        With `keep` (a superseded turn kept for the merge, A51) nothing is committed: the outcome
+        is set on the turn for its `turn_metrics`, which then say it is not recorded, and the
+        interruption note is left as it was.
 
         The task group is cancelled and awaited first, so no token or frame of the turn is
         queued after the purge; the purge and the pacer's stop then run with no await between
@@ -3369,9 +3473,13 @@ class TurnController:
         if notify:
             self._close_orphan_tools(turn)
         outcome: Outcome = "superseded" if reason == "superseded" else "interrupted"
-        result = self._commit(turn, outcome, delivered, tool_effect_unknown=not finished)
+        result: CommitResult | None = None
+        if keep:
+            turn.outcome = outcome
+        else:
+            result = self._commit(turn, outcome, delivered, tool_effect_unknown=not finished)
         if notify:
-            if result.error is not None:
+            if result is not None and result.error is not None:
                 if purge.stream_start:
                     logger.error("turn %s: record_failed", turn.turn_id)
                 else:

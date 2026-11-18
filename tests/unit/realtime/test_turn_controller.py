@@ -2995,8 +2995,10 @@ async def test_each_claim_gets_at_most_one_verdict_and_none_after_it_is_settled(
 # Each seed drives one controller through a random sequence of every message type: ingress events
 # (`NameHeard` from either spotter and the gate partial among them, and events of an old epoch),
 # controls, `wake`, verdicts from `FakeWakeArbiter` granted or denied at any point (after the
-# claim was settled included), playback reports, the responder's pauses and the clock. The step
-# invariants are checked after every step, and the end invariants after a drain and the close.
+# claim was settled included), playback reports, the responder's pauses and the clock. A cut-in,
+# her name granted and gated as addressed while a turn thinks, makes a share of the seeds
+# supersede a turn, with and without a tool dispatched (A51, T55c and T55d). The step invariants
+# are checked after every step, and the end invariants after a drain and the close.
 
 INTERLEAVING_STEPS = 40
 INTERLEAVING_SEEDS = 200
@@ -3039,6 +3041,9 @@ EVERY_KIND = frozenset(
 )
 REACHED: dict[int, tuple[frozenset[str], int]] = {}
 """Each seed run so far: the message kinds it posted and its verdicts for settled claims."""
+SUPERSEDES: dict[int, tuple[int, int, int]] = {}
+"""Each seed run so far: its supersedes with no tool (kept), with a tool, and the kept turns a
+merge carried (T55d)."""
 
 
 def named_utterance(item: object) -> str | None:
@@ -3054,19 +3059,34 @@ def superseded_turns(sent: list[Sent]) -> list[str]:
     return [str(s.turn_id) for s in sent if describe(s.item) == "voice_decision:supersede"]
 
 
+def merged_turns(sent: list[Sent]) -> list[str]:
+    """The turns a `supersede` named with `merged` true: kept for the merge (T55d)."""
+    return [
+        str(s.turn_id)
+        for s in sent
+        if describe(s.item) == "voice_decision:supersede" and s.item.detail.merged  # type: ignore[attr-defined]
+    ]
+
+
 def check_cuts(sent: list[Sent]) -> None:
     """Each cut's reason is a cut reason, and `superseded` is the reason exactly for the turns a
     `supersede` named: once each, before the turn's cut, with no `barge_in`, and its
-    `turn_metrics` outcome `superseded` (A51).
+    `turn_metrics` outcome `superseded` (A51). `merged` is the negation of `tool_dispatched`, and
+    a merged turn's metrics, sent before any commit, say it is not recorded (T55d).
     """
     superseded: list[str] = []
+    merged: set[str] = set()
     cut: dict[str, str] = {}
     for item in sent:
         name, turn_id = describe(item.item), item.turn_id
         if name == "voice_decision:supersede":
             assert turn_id not in superseded, f"a second supersede for {turn_id}"
             assert turn_id not in cut, f"a supersede for {turn_id} after its cut"
+            detail = item.item.detail  # type: ignore[attr-defined]
+            assert detail.merged is not detail.tool_dispatched, f"{turn_id}: {detail}"
             superseded.append(str(turn_id))
+            if detail.merged:
+                merged.add(str(turn_id))
         elif name == "voice_decision:barge_in":
             assert turn_id not in superseded, f"a barge_in for superseded {turn_id}"
         elif name == "stream_cancelled":
@@ -3077,6 +3097,8 @@ def check_cuts(sent: list[Sent]) -> None:
         elif name == "turn_metrics":
             outcome = item.item.outcome  # type: ignore[attr-defined]
             assert (outcome == "superseded") == (turn_id in superseded), f"{turn_id}: {outcome}"
+            if turn_id in merged:
+                assert item.item.recorded is False, f"kept {turn_id} reported recorded"  # type: ignore[attr-defined]
     assert all(cut.get(t) == "superseded" for t in superseded), f"a supersede uncut: {cut}"
 
 
@@ -3108,16 +3130,39 @@ async def test_the_cut_checks_accept_a_supersede_and_catch_each_mismatch():
             for s in sent
         ]
 
+    def replaced(name: str, update: Callable[[object], object]) -> list[Sent]:
+        return [
+            Sent(s.lane, update(s.item), s.turn_id) if describe(s.item) == name else s for s in sent
+        ]
+
+    assert merged_turns(sent) == superseded_turns(sent)  # no tool: the turn is kept (T55d)
+    recorded = replaced("turn_metrics", lambda m: m.model_copy(update={"recorded": True}))  # type: ignore[attr-defined]
+    unmerged = replaced(
+        "voice_decision:supersede",
+        lambda d: d.model_copy(update={"detail": d.detail.model_copy(update={"merged": False})}),  # type: ignore[attr-defined]
+    )
     unannounced = [s for s in sent if describe(s.item) != "voice_decision:supersede"]
     uncut = [s for s in sent if describe(s.item) != "stream_cancelled"]
-    for broken in (unannounced, uncut, cancelled_as("barge_in"), cancelled_as("disconnect")):
+    broken_cases = (
+        unannounced,
+        uncut,
+        cancelled_as("barge_in"),
+        cancelled_as("disconnect"),
+        recorded,
+        unmerged,
+    )
+    for broken in broken_cases:
         with pytest.raises(AssertionError):
             check_cuts(broken)
 
 
 def random_script(rng: random.Random, pauses: list[Pause]) -> list[object]:
+    """One turn's script. Kinds 2 and 4 pause in `thinking` before any audio, where an accepted
+    name supersedes the turn: kind 2 with no tool dispatched (kept for the merge), kind 4 with
+    one (committed at the cut).
+    """
     pause = Pause()
-    kind = rng.randrange(4)
+    kind = rng.randrange(5)
     if kind == 0:
         return [Token("One two three. "), Token("Four five.")]
     pauses.append(pause)
@@ -3125,6 +3170,15 @@ def random_script(rng: random.Random, pauses: list[Pause]) -> list[object]:
         return [Token("One. "), pause, Token("Two.")]
     if kind == 2:
         return [pause, Token("Late.")]
+    if kind == 4:
+        return [
+            WaitGate(),
+            Call(dispatch_tool),
+            tool_started(),
+            pause,
+            tool_completed(),
+            Token("OK."),
+        ]
     return [
         Token("Setting it. "),
         WaitGate(),
@@ -3140,6 +3194,7 @@ class Interleaving:
     """One seed's run: a controller, a model of the ingress feeding it, and the invariants."""
 
     def __init__(self, seed: int) -> None:
+        self.seed = seed
         self.rng = random.Random(seed)
         self.pauses: list[Pause] = []
         scripts = [random_script(self.rng, self.pauses) for _ in range(INTERLEAVING_STEPS)]
@@ -3158,6 +3213,8 @@ class Interleaving:
         self.failures: list[str] = []
         self.committed: list[int] = []
         self.outcomes: list[str] = []
+        self.turn_index: dict[str, int] = {}
+        self.cut_in: str | None = None
         self.stale_verdicts = 0
         self.trace: list[str] = []
         self._instrument()
@@ -3165,16 +3222,27 @@ class Interleaving:
     # -- Instrumentation ------------------------------------------------------------------------
 
     def _instrument(self) -> None:
-        """Count commits per turn, and watch each verdict for a settled claim as it is handled."""
+        """Count commits per turn, map turn ids to the responder's turns, and watch each verdict
+        for a settled claim as it is handled.
+        """
         responder = self.h.responder
         commit_turn = responder.commit_turn
+        open_turn = responder.open_turn
+        controller = self.h.controller
 
         def commit(scope, delivery):
             self.committed.append(scope.turn_index)
             self.outcomes.append(delivery.outcome)
             return commit_turn(scope, delivery)
 
+        def opened(request):
+            # `_open_turn` has taken the turn's id, and asks the responder before it holds it.
+            scope = open_turn(request)
+            self.turn_index[f"session-1-turn-{controller._turn_seq}"] = scope.turn_index
+            return scope
+
         responder.commit_turn = commit  # type: ignore[method-assign]
+        responder.open_turn = opened  # type: ignore[method-assign]
         handlers = self.h.controller._handlers
         on_verdict = handlers[WakeVerdict]
 
@@ -3372,6 +3440,42 @@ class Interleaving:
     def _tick(self) -> str | None:
         return "advance"
 
+    def _cut_in(self) -> str | None:
+        """Her name while a turn thinks, which the next two steps grant and gate as addressed.
+
+        Random names rarely meet a turn still `thinking` and then win a grant and an addressed
+        gate decode in turn, so without this no seed superseded a turn (A51). The turn's script
+        decides whether it is superseded (no audio yet) and kept or committed (T55d).
+        """
+        if self.ingress is None or self.h.controller.phase != "thinking":
+            return None
+        self.cut_in = "grant"
+        self.h.post(
+            self.ingress.heard(
+                self.open_uid,
+                from_pos=self.rng.randint(40, 100),
+                hit_pos=self.rng.randint(100, 140),
+                arrival=float(self._now()),
+            )
+        )
+        return "NameHeard(server)"
+
+    def _cut_in_next(self) -> str | None:
+        """The cut-in's grant, then its addressed gate decode; None once neither applies."""
+        if self.cut_in == "grant":
+            waiting = [claim for claim in self.h.arbiter.claims if not claim.answered]
+            if waiting:
+                self.h.arbiter.grant(waiting[-1].claim_id)
+                self.cut_in = "gate"
+                return "WakeVerdict"
+        elif self.cut_in == "gate" and self.ingress is not None and self.gate_asks:
+            uid, through = self.gate_asks.pop(0)
+            self.h.post(self.ingress.partial(uid, "mist, and then", gate=True, through_pos=through))
+            self.cut_in = None
+            return "TranscriptPartial(gate)"
+        self.cut_in = None
+        return None
+
     # -- Running ----------------------------------------------------------------------------------
 
     async def step(self) -> None:
@@ -3387,13 +3491,15 @@ class Interleaving:
             self._playback,
             self._release,
             self._tick,
+            self._cut_in,
         ]
-        weights = [6, 2, 3, 1, 1, 1, 3, 3, 2, 3, 2]
-        for _ in range(20):
+        weights = [6, 2, 3, 1, 1, 1, 3, 3, 2, 3, 2, 4]
+        kind = self._cut_in_next() if self.cut_in is not None else None
+        attempts = 0
+        while kind is None and attempts < 20:
             kind = self.rng.choices(actions, weights)[0]()
-            if kind is not None:
-                break
-        else:
+            attempts += 1
+        if kind is None:
             kind = "advance"
         self.trace.append(kind)
         if kind == "advance":
@@ -3472,12 +3578,28 @@ class Interleaving:
         assert h.outbound.control == []
         assert h.outbound.lane.take() is None
         # Every shown turn was committed exactly once, a superseded one included, and no other
-        # turn was; each superseded turn's commit says `superseded`.
+        # turn was, except a kept turn whose words a merge carried (T55d): shown, never
+        # committed, its request text leading a later request. Each superseded turn committed
+        # says `superseded`.
         commits = collections.Counter(self.committed)
         assert all(n == 1 for n in commits.values()), f"a turn committed twice: {commits}"
-        assert len(commits) == len(set(h.outbound.queued_turn_ids()))
+        shown = {self.turn_index[t] for t in set(h.outbound.queued_turn_ids())}
+        assert set(commits) <= shown, f"an unshown turn committed: {commits}, shown {shown}"
+        carried = shown - set(commits)
+        kept = {self.turn_index[t] for t in merged_turns(h.outbound.sent)}
+        assert carried <= kept, f"shown turns {carried - kept} never committed"
+        requests = h.responder.requests
+        for index in carried:
+            words = f"{requests[index].user_text} "
+            assert any(r.user_text.startswith(words) for r in requests[index + 1 :]), index
         outcomes = collections.Counter(self.outcomes)
-        assert outcomes["superseded"] == len(superseded_turns(h.outbound.sent)), f"{outcomes}"
+        superseded = len(superseded_turns(h.outbound.sent))
+        assert outcomes["superseded"] == superseded - len(carried), f"{outcomes}"
+        SUPERSEDES[self.seed] = (
+            len(merged_turns(h.outbound.sent)),
+            superseded - len(merged_turns(h.outbound.sent)),
+            len(carried),
+        )
         # Every claim was settled exactly once.
         settles = collections.Counter(cid for cid, _ in h.arbiter.settles)
         assert settles == collections.Counter(c.claim_id for c in h.arbiter.claims)
@@ -3517,3 +3639,10 @@ async def test_the_interleavings_post_every_message_type_and_stale_verdicts():
     reached = frozenset().union(*(kinds for kinds, _ in REACHED.values()))
     assert sorted(EVERY_KIND - reached) == []
     assert sum(stale for _, stale in REACHED.values()) > 0
+    # A share of the seeds supersede a turn, kept or committed at the cut, and some merges carry
+    # a kept turn, so the end check's kept-turn branch runs.
+    kept = sum(1 for merged, _, _ in SUPERSEDES.values() if merged)
+    tool = sum(1 for _, with_tool, _ in SUPERSEDES.values() if with_tool)
+    carried = sum(1 for _, _, merges in SUPERSEDES.values() if merges)
+    print(f"\ninterleavings: seeds superseding kept={kept} with_tool={tool} carried={carried}")
+    assert kept > 0 and tool > 0 and carried > 0, (kept, tool, carried)

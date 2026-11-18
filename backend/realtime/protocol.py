@@ -764,7 +764,14 @@ class EndpointDetail(_WireModel):
 
 
 class SupersedeDetail(_WireModel):
-    """Detail of a `supersede` decision."""
+    """Detail of a `supersede` decision.
+
+    `merged` is the negation of `tool_dispatched`. With no tool dispatched, the superseded turn
+    is not recorded on its own when the utterance that superseded it starts a turn: its request
+    text leads that turn's. If that utterance starts none, the superseded turn is recorded alone.
+    The merged text is not on the wire: it joins, with one space, the `transcription`s of the
+    utterances whose words it carries.
+    """
 
     merged: bool
     tool_dispatched: bool

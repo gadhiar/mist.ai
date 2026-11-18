@@ -16,6 +16,19 @@ no audio queued and no capability answer (`answered` is always None here, since 
 deferred), and is followed in that step by its cut's `stream_cancelled superseded`, with no
 `barge_in`. The reach order `supersede` shows the search visits one.
 
+T55d keeps a superseded turn K that dispatched no tool, for the utterance U that superseded it,
+and joins K's request text to the next turn from U. K (its turn and U, as ranks) is part of the
+snapshot. The responder's open-turn set drops K when a turn opens carrying its words, which every
+turn that opens while K is kept must (`merge`). The `K kept` invariants, at every state: K is kept
+only while U is open in the record or a held turn from U is in flight; a K whose words a merge
+carried (resolved with no commit) is never committed, and every turn is committed at most once
+(M66); a supersede never finds K kept; and once the controller is closed, by its cancellation at
+every world's close, no K is left and every K has been committed or carried. `thinking`, a
+model turn with no tool and no audio, is a start state for the narrowed runs only (`merge`, `K
+alone` and `merge at release`, and the merge teeth): from it a supersede keeps K at depth 3, and
+the runs search what U then does (`MERGE_ALPHABET`). No full-alphabet run keeps a K within its
+default depth, so these runs are where the `K kept` invariants are exercised.
+
 The harness:
 
 - `GatedMailbox` replaces the controller's mailbox. Every post, the turn's own tasks' included,
@@ -99,16 +112,18 @@ after v opens reaches one snapshot, and only one of the two holds the step. Two 
 `reconfigure behind a voice restart` and `text ahead of a step's muted drop`, are not v2
 orders: they show that the eager step meets C1.
 
-Four orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
-frameless `0x02` is fifth on the lane and each take moves one item. B1(d) needs 4 from
-`speaking`: a name, the lost verdict, w's end and v's VAD start. The posting-step witness needs
-6 from `idle`. The supersede needs 4 from `thinking_tool`: a name, its grant, the gate decode,
-and the tool's end, since the cut waits on the tool's grace. Each one's reach run searches only
-the actions that the order and its alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`,
-`POSTING_ALPHABET`, `SUPERSEDE_ALPHABET`) to its own depth: every
-sequence of those actions, with the same reductions and invariants, and no other action. A
-search keys its visited states on the progress of its start's full-alphabet orders and of its
-own narrowed ones only. The default depths stay as ruled.
+Four orders need more than their start's default depth, and three need a start of their own.
+B8 needs 8 from `thinking_tool`: its frameless `0x02` is fifth on the lane and each take moves
+one item. B1(d) needs 4 from `speaking`: a name, the lost verdict, w's end and v's VAD start.
+The posting-step witness needs 6 from `idle`. The supersede needs 4 from `thinking_tool`: a
+name, its grant, the gate decode, and the tool's end, since the cut waits on the tool's grace.
+The T55d orders start from `thinking`, which no full-alphabet run searches: `merge` and `K
+alone` need 4, and `merge at release` needs 5. Each one's reach run searches only the actions that the order and its
+alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`, `POSTING_ALPHABET`, `SUPERSEDE_ALPHABET`,
+`MERGE_ALPHABET`, `RELEASE_ALPHABET`) to its own depth: every sequence of those actions, with
+the same reductions and invariants, and no other action. A search keys its visited states on the
+progress of its start's full-alphabet orders and of its own narrowed ones only. The default
+depths stay as ruled.
 """
 
 from __future__ import annotations
@@ -412,6 +427,15 @@ class ModelResponder(FakeResponder):
 
     def open_turn(self, request):
         world = self.world
+        kept = world.controller._kept
+        if kept is not None:
+            # A turn may open while K is kept only from U, carrying K's words (T55d).
+            words = f"{kept.turn.scope.request.user_text} "
+            if not request.user_text.startswith(words):
+                world.fail(
+                    "merge", f"{request.user_text!r} opened with K kept, not after {words!r}"
+                )
+            self.open.discard(kept.turn.scope.turn_index)
         if self.open:
             world.fail("M66", f"a turn opened while turn {sorted(self.open)} is open")
         world.check_acceptance("a turn opened")
@@ -453,6 +477,8 @@ class ModelResponder(FakeResponder):
         index = scope.turn_index
         if index in world.commits:
             world.fail("M66", f"turn {index} committed twice")
+        if index in world.carried:
+            world.fail("K kept", f"turn {index} committed after a merge carried its words")
         world.commits.add(index)
         if delivery.outcome == "completed":
             if index not in self.finished:
@@ -544,6 +570,10 @@ class World:
     after_step: list[object] = field(default_factory=list)
     failures: list[Violation] = field(default_factory=list)
     commits: set[int] = field(default_factory=set)
+    kept_turns: set[int] = field(default_factory=set)
+    """Every turn the controller has kept for a merge (T55d)."""
+    carried: set[int] = field(default_factory=set)
+    """The kept turns resolved with no commit: a merge carried their words (T55d)."""
     done_handled: set[str] = field(default_factory=set)
     done_sent: set[str] = field(default_factory=set)
     reconfigures: list[Reconfigure] = field(default_factory=list)
@@ -694,6 +724,8 @@ class World:
             trigger = (
                 live and c._phase == "thinking" and not turn.frames_queued and turn.answered is None
             )
+            if trigger and c._kept is not None:
+                self.fail("K kept", f"a supersede of {turn.turn_id} found K kept")
             sent_from = len(self.outbound.sent)
             self.accepting += 1
             try:
@@ -737,10 +769,21 @@ class World:
             queued = list(self.mailbox.items)
             ingress = self.ingress
             levers = len(ingress.calls) if ingress is not None else 0
+            kept = self.controller._kept
             try:
                 await handler(message)
             finally:
                 self.handling = None
+            if kept is not None and self.controller._kept is not kept:
+                # K left the controller in this step: recorded alone, or carried by a merge.
+                index = kept.turn.scope.turn_index
+                if index in self.commits:
+                    facts.add("K alone")
+                else:
+                    facts.add("merged")
+                    self.carried.add(index)
+            if self.controller._kept is not None:
+                self.kept_turns.add(self.controller._kept.turn.scope.turn_index)
             if any(purge.terminal for _, purge in self.outbound.purges[step.purges_from :]):
                 facts.add("purged 0x02")
             if any(
@@ -1168,7 +1211,12 @@ class World:
             while "deliver" in self.enabled(search=False):
                 await self.act("deliver")
 
-    async def close(self) -> None:
+    async def close(self) -> Violation | None:
+        """Cancel the mailbox task, as a server shutdown does, and end every stream.
+
+        Returns the `K kept` violation the cancellation's teardown leaves, if any: a K still kept,
+        or a superseded turn kept and neither committed nor carried (T55d).
+        """
         for tool in self.responder.tools:
             if not tool.done():
                 tool.set_result("ok")
@@ -1183,6 +1231,13 @@ class World:
         for feed in self.responder.feeds.values():
             feed.put_nowait(None)
         await quiesce()
+        kept = self.controller._kept
+        if kept is not None:
+            return Violation("K kept", f"{kept.turn.turn_id} still kept after the close")
+        lost = self.kept_turns - self.commits - self.carried
+        if lost:
+            return Violation("K kept", f"kept turns {sorted(lost)} neither committed nor carried")
+        return None
 
     # -- Invariants ---------------------------------------------------------------------------
 
@@ -1273,6 +1328,14 @@ class World:
                 and call[1] in cancelled
             ):
                 self.fail("scene cancel", f"{call[:3]} after its turn's cancel_turn")
+        # T55d: K is kept only while U is open in the record or a held turn from U is in flight.
+        kept = c._kept
+        if kept is not None:
+            uid = kept.utterance_id
+            record = c._utterances.get(uid)
+            held = turn is not None and turn.held and not turn.ending and turn.utterance_id == uid
+            if (record is None or record.closed) and not held:
+                self.fail("K kept", f"{kept.turn.turn_id} kept with {uid} closed and none held")
         # v8: no utterance is open while ingress is muted; an attend cue is never left standing.
         if self.muted and self.ingress is not None and self.ingress.open_uid is not None:
             self.fail("mute", f"ingress holds {self.ingress.open_uid} open while muted")
@@ -1475,6 +1538,7 @@ class World:
                 fingerprint(turn.ledger),
                 fingerprint(turn.segmenter),
                 turn.scope.tool_dispatched,
+                turn.scope.request.user_text,  # a merged request carries K's words (T55d)
             )
         record = tuple(
             sorted(
@@ -1576,9 +1640,22 @@ class World:
                 if isinstance(i, Frame) or describe(i) in ("stream_token", "stream_start")
             ),
         )
+        kept = c._kept
+        kept_state = None
+        if kept is not None:
+            # The merge reads K's request text, so it is part of the key with K and U.
+            kept_state = (
+                t(kept.turn.turn_id),
+                u(kept.utterance_id),
+                kept.turn.scope.turn_index,
+                kept.turn.scope.request.user_text,
+            )
         return (
             c._phase,
             turn_state,
+            kept_state,
+            tuple(sorted(self.carried)),
+            tuple(sorted(self.kept_turns)),
             c._pending is not None and c._pending.refusal,
             record,
             wake_state,
@@ -1693,10 +1770,16 @@ START_STATES: dict[str, tuple[str, ...]] = {
 }
 """Each start state's prefix, run eagerly. Every one but `off` has voice on, unmuted."""
 
+NARROW_STARTS: dict[str, tuple[str, ...]] = {
+    "thinking": ("voice_start", "name", "grant:0", "gate_yes", "end"),
+}
+"""Start states searched only by a narrowed reach run: `thinking` is a model turn with no tool
+and no audio, which a name supersedes and keeps (T55d)."""
+
 
 async def build(start: str, *, checking: bool = True) -> World:
     world = World(checking=checking)
-    await world.run_eager(START_STATES[start])
+    await world.run_eager({**START_STATES, **NARROW_STARTS}[start])
     world.checking = True
     world.env = 0
     world.starts = 0
@@ -1713,7 +1796,7 @@ def check_preconditions(depth: int) -> None:
         raise AssertionError(f"precondition: frames are {FRAME_MS} ms, not 20")
     if endpointing.pre_roll_ms // FRAME_MS != REQUIRED_PRE_ROLL_FRAMES:
         raise AssertionError("precondition: VAD pre-roll is not 15 frames")
-    largest = max(len(prefix) for prefix in START_STATES.values())
+    largest = max(len(prefix) for prefix in (*START_STATES.values(), *NARROW_STARTS.values()))
     if largest > MAX_START_FRAMES:
         raise AssertionError(f"precondition: a start state holds {largest} frames, above 6")
     if largest + depth >= REQUIRED_PRE_ROLL_FRAMES:
@@ -1801,6 +1884,18 @@ SUPERSEDE_ALPHABET = frozenset(
 gate decode addressed or not, a token whose audio would make it a barge-in, and the tool's end or
 its grace running out, either of which lets the cut finish."""
 
+MERGE_DEPTH = 4
+MERGE_ALPHABET = frozenset(
+    {"name", "grant", "gate_yes", "candidate", "resumed", "end", "drop", "text", "mute", "done"}
+)
+"""The merge's actions and its alternatives': a name, its grant and its addressed gate decode,
+which supersede the turn and keep K; then what U does: a held turn, resumed speech, its end or
+its drop, a mute, a typed message, and the reply's end that commits the turn U started."""
+
+RELEASE_ALPHABET = MERGE_ALPHABET - {"text"}
+"""The merge at a held turn's release, one action deeper: the typed message, which the depth-4 run
+takes at every point U is open, is left out to keep the run's CPU within its share."""
+
 REACH: tuple[Reach, ...] = (
     # v2 :2027-2028, a servable `Reconfigure` while speaking and while a turn is held, which
     # waits for a quiescent point.
@@ -1874,6 +1969,32 @@ REACH: tuple[Reach, ...] = (
         SUPERSEDE_DEPTH,
         (handled("TranscriptPartial", before="thinking", after="idle", fact="superseded"),),
         alphabet=SUPERSEDE_ALPHABET,
+    ),
+    # v13 T55d: a name, its grant and its gate decode supersede a model turn with no tool and
+    # keep it as K; U's end then opens a turn that carries K's words, with no commit of K.
+    Reach(
+        "merge",
+        "thinking",
+        MERGE_DEPTH,
+        (handled("UtteranceEnded", after="thinking", fact="merged"),),
+        alphabet=MERGE_ALPHABET,
+    ),
+    # v13 T55d: K is committed alone where U starts no turn: U dropped by ingress.
+    Reach(
+        "K alone",
+        "thinking",
+        MERGE_DEPTH,
+        (handled("UtteranceDropped", fact="K alone"),),
+        alphabet=MERGE_ALPHABET,
+    ),
+    # v13 T55d: a held turn from U carries K's words and resolves K only at its release, so
+    # it needs depth 5: the name, its grant, the gate decode, the candidate and U's end.
+    Reach(
+        "merge at release",
+        "thinking",
+        MERGE_DEPTH + 1,
+        (handled("UtteranceEnded", before="held", fact="merged"),),
+        alphabet=RELEASE_ALPHABET,
     ),
     # v2 :2029-2030, B9: from `thinking`, a VAD start, then the failure, which moves to `text`.
     Reach(
@@ -2007,6 +2128,7 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
             for label in reversed(waited.actions):
                 stack.append(((*path[:-1], label), None, None))
         kept = False
+        failed = False
         try:
             progress = tuple(order.progress(world) for order in orders)
             for order, done in zip(orders, progress):
@@ -2036,9 +2158,16 @@ async def search(start: str, depth: int, alphabet: frozenset[str] | None = None)
             step = Waited(len(world.mailbox.items), waiting) if waiting else None
             stack.append(((*path, actions[0]), world, step))
             kept = True
+        except BaseException:
+            failed = True
+            raise
         finally:
             if not kept:
-                await world.close()
+                # The close cancels the mailbox task, so every world not continued checks its
+                # teardown; a failure already raised is not masked by this one.
+                closing = await world.close()
+                if closing is not None and not failed:
+                    raise AssertionError(f"{start} after {list(path)}, closed: {closing}")
     stats.seconds = time.perf_counter() - began
     return stats
 
@@ -2368,5 +2497,40 @@ async def test_a_planted_fault_breaks_its_invariant(invariant, start, depth, pla
     monkeypatch.setattr(f"{__name__}.PLANT", plant)
     with pytest.raises(AssertionError) as caught:
         await search(start, depth)
+    message = str(caught.value)
+    assert f": {invariant}: " in message, message
+
+
+def _never_resolve_k(world: World) -> None:
+    """A turn from U carries K's words and leaves K kept, to be committed later as well."""
+    world.controller._resolve_kept = lambda utterance_id: None  # type: ignore[method-assign]
+
+
+def _never_commit_k_alone(world: World) -> None:
+    """U starts no turn and K is never recorded."""
+    world.controller._commit_kept = lambda: None  # type: ignore[method-assign]
+
+
+def _never_merge(world: World) -> None:
+    """A turn from U opens on its own words while K is kept."""
+    world.controller._request_text = lambda utterance_id, text: text  # type: ignore[method-assign]
+
+
+MERGE_TEETH: list[tuple[str, str, Callable[[World], None]]] = [
+    ("K kept", "resolve", _never_resolve_k),
+    ("K kept", "commit alone", _never_commit_k_alone),
+    ("merge", "request text", _never_merge),
+]
+
+
+@pytest.mark.parametrize(
+    ("invariant", "fault", "plant"), MERGE_TEETH, ids=[f"{t[0]}: {t[1]}" for t in MERGE_TEETH]
+)
+async def test_a_planted_fault_in_the_merge_breaks_its_invariant(
+    invariant, fault, plant, monkeypatch
+):
+    monkeypatch.setattr(f"{__name__}.PLANT", plant)
+    with pytest.raises(AssertionError) as caught:
+        await search("thinking", MERGE_DEPTH, MERGE_ALPHABET)
     message = str(caught.value)
     assert f": {invariant}: " in message, message
