@@ -263,25 +263,38 @@ class DeviceApp(Starlette):
         live = _Live(connection, admitted.token_sha256)
         previous = self._live.get(name)
         self._live[name] = live
-        if previous is not None:
-            logger.info("device_replaced device=%s", name)
-            previous.connection.end(CLOSE_REPLACED)
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(previous.connection.done.wait(), timeout=REPLACE_WAIT_S)
-        logger.info("device_connected device=%s", name)
-        self._ensure_watch()
-        connection.start()
+        served = False
+        # The wait is inside the cleanup too: a cancellation there (shutdown) must not leave
+        # an entry for a connection whose serve never ran.
         try:
+            if previous is not None:
+                logger.info("device_replaced device=%s", name)
+                previous.connection.end(CLOSE_REPLACED)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(previous.connection.done.wait(), timeout=REPLACE_WAIT_S)
+            if connection.ending is not None:
+                # A registry read ended it during the wait; serving it now would greet a
+                # device whose session is already closed.
+                return
+            served = True
+            logger.info("device_connected device=%s", name)
+            self._ensure_watch()
+            connection.start()
             await self._serve(connection, name, "room")
         finally:
             await connection.finish()
-            if self._live.get(name) is live:
-                del self._live[name]
-            connection.done.set()
-            logger.info("device_disconnected device=%s code=%s", name, connection.close_code)
-            if not self._live and self._watch is not None:
-                self._watch.cancel()
-                self._watch = None
+            if served:
+                logger.info("device_disconnected device=%s code=%s", name, connection.close_code)
+            self._drop(name, live)
+
+    def _drop(self, name: str, live: _Live) -> None:
+        """Take `live` out of the live set, and stop the watch when no device is left."""
+        if self._live.get(name) is live:
+            del self._live[name]
+        live.connection.done.set()
+        if not self._live and self._watch is not None:
+            self._watch.cancel()
+            self._watch = None
 
     # -- Revocation, removal and rotation --------------------------------------------------
 
