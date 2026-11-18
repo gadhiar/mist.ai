@@ -1,4 +1,4 @@
-"""Capabilities' `EventSink` over the session registry: house-wide state to every session (D7).
+"""Capabilities' `EventSink` on the registry: house-wide state queued on every session (D7).
 
 The capability host emits its broadcast payloads here, from the loop or from a worker thread.
 `alarm_fired` is the desktop's ring (`DesktopSink.ring`), so it goes to the sessions bound
