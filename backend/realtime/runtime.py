@@ -258,8 +258,10 @@ def load_speech_engines(
 ) -> SpeechEngines:
     """Load every speech slot, one engine at a time.
 
-    STT first: with it off, no utterance can be transcribed, so the VAD, end-of-turn model and
-    name spotter are not loaded. Each chain keeps its first option that loads; at power `off`
+    STT first: with it configured off (an empty chain), no utterance can be transcribed, so the
+    VAD, end-of-turn model and name spotter are not loaded. A configured chain loads them even
+    when no option loaded, so a boot while yielded with a CUDA-only chain has them ready when
+    the reload brings STT up. Each chain keeps its first option that loads; at power `off`
     the GPU belongs to something else, so every CUDA option is skipped and the walk goes on down
     the chain. A sum of measured VRAM over `vram_budget_mib` logs a WARNING and sets
     `vram_over_budget`; nothing is unloaded.
@@ -274,7 +276,7 @@ def load_speech_engines(
     transcriber, stt, stt_index = walk.chain("stt")
     vad = turn_end = spotter = None
     vad_status = eot_status = kws_status = OFF
-    if transcriber is not None:
+    if placement.stt_chain:
         vad, vad_status = walk.single("vad", placement.vad_device, lambda: loaders.vad(placement))
         turn_end, eot_status = walk.single(
             "eot", placement.eot_device, lambda: loaders.eot(placement, settings.endpointing)

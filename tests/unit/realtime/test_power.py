@@ -517,6 +517,20 @@ class TestReload:
         assert where(built) == ("cuda", "cpu")
         assert built.host.placements() == []
 
+    async def test_a_yielded_boot_with_a_cuda_only_stt_chain_loads_vad_and_eot(self):
+        built = build(stt_chain=(EngineOption("nemotron-160", "cuda"),), power_level="off")
+        engines = built.engines
+        assert engines.transcriber is None  # type: ignore[attr-defined]
+        assert engines.vad is not None  # type: ignore[attr-defined]
+        assert engines.turn_end is not None  # type: ignore[attr-defined]
+        statuses = engines.statuses  # type: ignore[attr-defined]
+        assert (statuses.vad.location, statuses.eot.location) == ("cpu", "cpu")
+
+        await reload(built)
+
+        assert where(built) == ("cuda", "cpu")
+        assert engines.transcriber.model_id == "nemotron-model"  # type: ignore[attr-defined]
+
     async def test_a_failing_cuda_load_leaves_each_slot_on_its_next_option(self, cuda_tts):
         built = build(tts_chain=(EngineOption("cuda-tts", "cuda"),))
         built.sleep.hold()
