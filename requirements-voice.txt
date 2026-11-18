@@ -3,9 +3,11 @@
 # Installed only by docker/backend/Dockerfile's step 3b, after requirements.txt and before the
 # torch re-pin, never by CI: NeMo (the speech-to-text engines) installs a top-level `scripts`
 # package that would shadow the repository's own, and step 3b removes it. Each line is an exact
-# `name==version` pin at the version the engine's arm in
+# `name==version` pin. A speech engine's packages are pinned at the version the engine's arm in
 # scripts/model_bench/speech/speech_arms.json records, which
-# tests/unit/realtime/test_engine_bench_parity.py checks.
+# tests/unit/realtime/test_engine_bench_parity.py checks. The server name spotter's two packages
+# have no bench arm: they are pinned at the versions the host parity run against microWakeWord's
+# own inference (H11) uses.
 
 # Kyutai Pocket TTS, the `pocket-clone` engine (docker/speech-bench/requirements-pocket.txt).
 pocket-tts==4.0.1
@@ -15,3 +17,9 @@ pocket-tts==4.0.1
 # on onnxruntime, which requirements.txt pins at the arm's 1.31.1.
 nemo_toolkit[asr]==2.7.3
 onnx-asr==0.12.0
+
+# The server name spotter's microWakeWord runtime, for the model file the device runs: LiteRT
+# (ai-edge-litert) runs the streaming TFLite model, and pymicro-features computes the
+# microfrontend features the model reads.
+ai-edge-litert==2.3.0
+pymicro-features==2.0.2
