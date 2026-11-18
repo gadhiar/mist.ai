@@ -377,17 +377,19 @@ def test_a_reconfigure_waits_for_the_turn_and_voice_stop_cuts_and_closes(voice_s
         turn_id = speaking_turn(srv, client, Token("It is sunny."))
         client.send(voice_start(2, aec="native"))
         assert client.of("voice_state", cause="answer", req=2) == []
-        finish(client)
+        turn_metrics = finish(client)
 
-        # The answer waits for the turn to end: it follows the turn's audio and its completion.
-        # v2 orders it after the turn's `state_cycle idle`; the controller queues it after that
-        # idle, but the answer rides the control lane, which the sender drains first, so on the
-        # wire it can precede the idle (reported as a spec gap, not asserted here).
+        # The answer waits for the turn to end: it follows the turn's audio, its completion, its
+        # `state_cycle idle` (v2 M46) and its `turn_metrics`. The controller queues the idle and
+        # the metrics on the turn lane, and the sender fences the answer `apply` readies behind
+        # every turn-lane item queued before it (A53).
         names = client.names()
         answer = client.voice.index(one(client, "voice_state", cause="answer", req=2))
         complete = client.voice.index(one(client, "stream_complete", turn_id=turn_id))
+        idle = client.voice.index(one(client, "state_cycle", state="idle", turn_id=turn_id))
+        metrics = client.voice.index(turn_metrics)
         assert names.index("0x02") < answer and complete < answer
-        assert one(client, "state_cycle", state="idle", turn_id=turn_id)
+        assert idle < answer and metrics < answer
         assert client.of("stream_cancelled") == []
 
         # A turn in flight: `voice_stop` cuts it with reason `voice_stop`.

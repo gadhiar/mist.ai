@@ -5,13 +5,34 @@ the only caller of ingress levers. The session dispatches each client message to
 routes uplink frames to the current `AudioIngress`, answers every `voice_start` in the order
 received, and drains three outbound lanes through one sender:
 
-- `control`: unbounded; voice decisions, `voice_state`, errors. Always sent first.
+- `control`: unbounded; voice decisions, `voice_state`, errors. Sent first, except an item
+  fenced behind the `turn` lane (below).
 - `turn`: a `TurnLane` bounded at 2048 items; a turn's stream and frames, purged by turn id. A
   full lane means the client stopped reading, so the session closes with 1013.
 - `bulk`: logs and broadcasts, bounded at 512 items, dropping the oldest and counting the drops.
 
 The sender takes one item at a time, so a purge between two takes removes everything the client
 has not been sent yet.
+
+A `control` item may carry a fence, a `TurnLane` mark, and waits until the lane has passed it.
+The newest waiting fence is the largest fence on `control` the lane has not passed yet. Three
+rules set a fence (A53):
+
+1. A `voice_state` answer that `apply` readies is fenced at the larger of the lane's mark and
+   the newest waiting fence. An answer applied at a turn's end therefore follows that turn's
+   `state_cycle idle` and `turn_metrics`, which the controller queued on the lane before its
+   mailbox step reached the reconfigure. Every other answer is sent at a message's receipt,
+   never at a turn's end, and sets no fence of its own.
+2. A `voice_state`, answer or broadcast, queued while a fenced item waits takes the newest
+   waiting fence, so answers keep `req` order and no broadcast overtakes an older answer.
+3. The `voice_stop` window: when a `voice_stop` is received, or the power suspends voice, while
+   a fenced item waits, every `control` item queued until the newest waiting fence passes
+   takes that fence. The stop's refusals, `barge_in`, `state_cycle idle` and `dropped` then
+   follow the waiting answer, in M63's order.
+
+The sender sends the first `control` item whose fence is None or passed, else the `turn` lane's
+next item, else `bulk`'s. Outside the `voice_stop` window no item but a `voice_state` waits
+for an answer.
 """
 
 from __future__ import annotations
@@ -324,7 +345,8 @@ class RealtimeSession:
         self._clock = services.clock_factory()
         self._new_utterance_id = services.utterance_ids()
 
-        self._control: deque[object] = deque()
+        self._control: deque[tuple[object, int | None]] = deque()  # (item, fence)
+        self._stop_window = False
         self._turn = TurnLane(max_turn_items)
         self._bulk: deque[object] = deque()
         self._max_bulk = max_bulk_items
@@ -497,10 +519,44 @@ class RealtimeSession:
     # -- Outbound lanes ------------------------------------------------------------------------
 
     def send_control(self, item: object) -> None:
-        """Queue an item on the `control` lane, which the sender always drains first."""
-        self._control.append(item)
+        """Queue an item on the `control` lane, which the sender drains first unless it is fenced.
+
+        Only the module's rules 2 and 3 can fence an item queued here: a `voice_state` queued
+        while a fenced item waits, and any item queued in the `voice_stop` window, takes the
+        newest waiting fence. Rule 1, a new fence at the `turn` lane's mark, is `apply`'s alone.
+        """
+        self._queue_control(item, None)
+
+    def _queue_control(self, item: object, fence: int | None) -> None:
+        """Queue `item` with its own fence (rule 1) or None, then apply rules 2 and 3."""
+        waiting = self._waiting_fence()
+        if waiting is None:
+            self._stop_window = False  # the window closes once its fence has passed
+        elif fence is not None:
+            fence = max(fence, waiting)
+        elif self._stop_window or isinstance(item, VoiceStateMessage):
+            fence = waiting
+        self._control.append((item, fence))
         self._ready.set()
         self._schedule_activity_check()
+
+    def _waiting_fence(self) -> int | None:
+        """The newest fence on `control` the `turn` lane has not passed, None when none waits.
+
+        Fences never decrease along `control`: a rule 1 fence is at least the lane's mark at
+        its queueing, which no earlier fence exceeds, and rules 2 and 3 copy the newest waiting
+        fence. So the last fenced item has the largest, and once the lane has passed it, it has
+        passed every other.
+        """
+        for _item, fence in reversed(self._control):
+            if fence is not None:
+                return None if self._turn.passed(fence) else fence
+        return None
+
+    def _open_stop_window(self) -> None:
+        """Rule 3: hold every later `control` item behind a waiting answer (M63)."""
+        if self._waiting_fence() is not None:
+            self._stop_window = True
 
     def send_turn(
         self,
@@ -565,8 +621,10 @@ class RealtimeSession:
             )
 
     def _next_item(self) -> object | None:
-        if self._control:
-            return self._control.popleft()
+        for index, (control, fence) in enumerate(self._control):
+            if fence is None or self._turn.passed(fence):
+                del self._control[index]
+                return control
         item = self._turn.take()
         if item is not None:
             return item
@@ -676,10 +734,12 @@ class RealtimeSession:
 
         The drop is posted before `VoiceStop`, so the controller closes the utterance with the
         power's reason, and the stop then finds nothing open. The settings are kept, so the
-        rise restarts voice with no new `voice_start` from the client.
+        rise restarts voice with no new `voice_start` from the client. An applied answer still
+        waiting opens the `voice_stop` window, as a `voice_stop` does.
         """
         voice, self._voice = self._voice, None
         assert voice is not None  # noqa: S101 - the caller checked it
+        self._open_stop_window()
         self._kept = voice.settings
         drop = voice.ingress.close()
         if drop is not None:
@@ -882,6 +942,12 @@ class RealtimeSession:
         return VoiceStart(ingress=ingress, policy=policy, settings=settings, epoch=self._epoch)
 
     def _on_voice_stop(self) -> None:
+        """Voice is off from receipt (M63): pending answers are refused, then `VoiceStop` posted.
+
+        An applied answer still waiting opens the `voice_stop` window first, so the refusals
+        and the controller's stop messages follow it.
+        """
+        self._open_stop_window()
         self._kept = None
         if self._voice is None:
             return
@@ -910,13 +976,18 @@ class RealtimeSession:
         return next((slot for slot in self._answers if slot.request is request), None)
 
     def apply(self, request: Reconfigure, seed: IngressSeed) -> VoiceStart | None:
-        """Build the seeded ingress, switch routing to it, and answer the request accepted."""
+        """Build the seeded ingress, switch routing to it, and answer the request accepted.
+
+        The answer is fenced at the `turn` lane's mark (rule 1): the controller applies at a
+        quiescent point, after the ended turn queued its `state_cycle idle` and `turn_metrics`
+        on the lane, and the answer must not overtake them.
+        """
         slot = self._slot_of(request)
         if slot is None or slot.ready or self._voice is None:
             return None
         start = self._start_voice(request.settings, seed=seed)
         slot.ready = True
-        self._flush_answers()
+        self._flush_answers(applied=slot)
         return start
 
     def refuse(self, request: Reconfigure, reason: str) -> None:
@@ -934,10 +1005,13 @@ class RealtimeSession:
         self._answers.append(slot)
         self._flush_answers()
 
-    def _flush_answers(self) -> None:
+    def _flush_answers(self, applied: _Answer | None = None) -> None:
+        """Send every ready answer at the head, in `req` order; only `applied` sets a fence."""
         while self._answers and self._answers[0].ready:
             slot = self._answers.popleft()
-            self.send_control(self.voice_state("answer", req=slot.req, refused=slot.refused))
+            fence = self._turn.mark() if slot is applied else None
+            answer = self.voice_state("answer", req=slot.req, refused=slot.refused)
+            self._queue_control(answer, fence)
 
     def voice_state(
         self,

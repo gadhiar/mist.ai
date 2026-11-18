@@ -77,14 +77,22 @@ class _LaneEntry:
     terminal: bool
     kind: LaneItemKind | None
     token_index: int | None
+    number: int
+    """The entry's put number: one more than the entry put before it."""
 
 
 class TurnLane:
     """The bounded queue of a session's `turn` lane.
 
-    Put, take and purge each hold the lane's lock for the whole call and never await, so a take
-    and a purge are each one atomic step: a queued `0x02` is either taken by the sender or
-    reported by the purge, never both and never neither.
+    Put, take, purge, `mark` and `passed` each hold the lane's lock for the whole call and never
+    await, so a take and a purge are each one atomic step: a queued `0x02` is either taken by
+    the sender or reported by the purge, never both and never neither.
+
+    Each entry is numbered at put. A mark is the number the next put takes, and it has passed
+    once every entry put before it is gone, taken or purged. The lane is first in, first out
+    and its numbers rise from head to tail, so that is when the lane is empty or its head's
+    number is at least the mark. A count of entries gone would not do: a purge removes entries
+    out of put order, so purging a later turn would count toward an earlier mark.
     """
 
     def __init__(
@@ -93,6 +101,7 @@ class TurnLane:
         self._max_items = max_items
         self._lock: AbstractContextManager[object] = lock if lock is not None else threading.Lock()
         self._items: deque[_LaneEntry] = deque()
+        self._next_number = 0
 
     def put(
         self,
@@ -123,12 +132,26 @@ class TurnLane:
         """
         if (kind == "token") != (token_index is not None):
             raise ValueError("token_index is set exactly when kind is 'token'")
-        entry = _LaneEntry(turn_id, item, terminal, kind, token_index)
         with self._lock:
             if len(self._items) >= self._max_items:
                 raise LaneFull(f"turn lane is full at {self._max_items} items")
-            self._items.append(entry)
+            number = self._next_number
+            self._next_number += 1
+            self._items.append(_LaneEntry(turn_id, item, terminal, kind, token_index, number))
         return True
+
+    def mark(self) -> int:
+        """The number the next put takes: `passed(mark)` waits for everything queued now."""
+        with self._lock:
+            return self._next_number
+
+    def passed(self, mark: int) -> bool:
+        """Whether every entry put before `mark` is gone, taken or purged.
+
+        Entries put after the mark never hold it back.
+        """
+        with self._lock:
+            return not self._items or self._items[0].number >= mark
 
     def take(self) -> object | None:
         """Remove and return the oldest item, None when the lane is empty.
