@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import shlex
 import shutil
@@ -415,13 +416,14 @@ class FakeToolchain:
     served: list[list[str]] = field(default_factory=list)
     serving_during_compile: list[bool] = field(default_factory=list)
     seen_files: dict[str, str] = field(default_factory=dict)
+    stop_manifest: Path = Path(build.STAND_INS["stop_model"])
     _serving: bool = False
 
     def compile(self, argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
         self.compiles.append((list(argv), dict(env), cwd))
         self.serving_during_compile.append(self._serving)
         for path in cwd.rglob("*"):
-            if path.is_file() and path.suffix in (".yaml", ".pem"):
+            if path.is_file() and path.suffix in (".yaml", ".pem", ".json"):
                 self.seen_files[path.relative_to(cwd).as_posix()] = path.read_text("utf-8")
         if self.write_images:
             images = Path(env["ESPHOME_DATA_DIR"]) / "build" / "mist-test" / "build"
@@ -444,8 +446,36 @@ class FakeToolchain:
 
     def toolchain(self, tmp_root: Path) -> build.Toolchain:
         return build.Toolchain(
-            compile=self.compile, serve=self.serve, make_ca=self.make_ca, tmp_root=tmp_root
+            compile=self.compile,
+            serve=self.serve,
+            make_ca=self.make_ca,
+            tmp_root=tmp_root,
+            stop_manifest=self.stop_manifest,
         )
+
+
+@pytest.fixture
+def stop_manifest(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The image's stop manifest layout, outside the build root the test checks is emptied."""
+    stop = tmp_path_factory.mktemp("deps") / "models" / "stop"
+    stop.mkdir(parents=True)
+    (stop / "stop.tflite").write_bytes(b"stand-in model")
+    manifest = {
+        "type": "micro",
+        "wake_word": "Stop",
+        "model": "stop.tflite",
+        "trained_languages": ["en"],
+        "version": 2,
+        "micro": {"probability_cutoff": 0.5, "sliding_window_size": 5},
+    }
+    (stop / "stop.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return stop / "stop.json"
+
+
+def _substitutions(argv: Sequence[str]) -> dict[str, str]:
+    subs = dict(zip(argv[2:-2:3], argv[3:-2:3]))
+    assert argv[1:-2:3] == ["-s"] * len(subs)
+    return subs
 
 
 def _run(fake: FakeToolchain, tmp_root: Path, *args: str) -> tuple[int, str]:
@@ -503,8 +533,7 @@ def test_worker_compile_copies_the_tree_and_passes_the_stand_ins(tmp_path: Path)
     assert cwd.parent == tmp_path
     tree = cwd / "room-endpoint"
     assert argv[-2:] == ["compile", str(tree / "spike.yaml")]
-    subs = dict(zip(argv[2:-2:3], argv[3:-2:3]))
-    assert argv[1:-2:3] == ["-s"] * len(subs)
+    subs = _substitutions(argv)
     assert subs == {**build.STAND_INS, "mist_components_path": str(tree / "components")}
     assert env["ESPHOME_DATA_DIR"] == str(cwd / "data")
     assert env["HOME"] == str(cwd / "home")
@@ -516,8 +545,10 @@ def test_worker_compile_copies_the_tree_and_passes_the_stand_ins(tmp_path: Path)
     assert list(tmp_path.iterdir()) == []  # the build directory is removed
 
 
-def test_worker_compile_writes_throwaway_secrets_in_the_build_directory(tmp_path: Path) -> None:
-    fake = FakeToolchain()
+def test_worker_compile_writes_throwaway_secrets_in_the_build_directory(
+    tmp_path: Path, stop_manifest: Path
+) -> None:
+    fake = FakeToolchain(stop_manifest=stop_manifest)
     rc, _ = _run(fake, tmp_path, "compile", "room")
     assert rc == 0
     secrets_text = fake.seen_files["room-endpoint/secrets.yaml"]
@@ -598,12 +629,90 @@ def test_config_builds_the_private_yaml_beside_a_copy_of_the_tree(tmp_path: Path
     assert (private / "images" / "spike" / "firmware.factory.bin").read_bytes() == b"factory"
 
 
+def test_room_compile_check_wakes_on_a_stand_in_word_in_the_build_directory(
+    tmp_path: Path, stop_manifest: Path
+) -> None:
+    fake = FakeToolchain(stop_manifest=stop_manifest)
+    rc, output = _run(fake, tmp_path, "compile", "room")
+    assert rc == 0, output
+    ((argv, _, cwd),) = fake.compiles
+    subs = _substitutions(argv)
+    wake = Path(subs["wake_model"])
+    rel = wake.relative_to(cwd).as_posix()  # under the throwaway build directory
+    assert wake.suffix == ".json"
+    assert subs == {
+        **build.STAND_INS,
+        "wake_model": str(wake),
+        "mist_components_path": str(cwd / "room-endpoint" / "components"),
+    }
+    written = json.loads(fake.seen_files[rel])
+    stop = json.loads(stop_manifest.read_text(encoding="utf-8"))
+    assert written["wake_word"] == "compile check"
+    assert written["wake_word"].strip().lower() != stop["wake_word"].strip().lower()
+    unchanged = {k: v for k, v in stop.items() if k not in ("wake_word", "model")}
+    assert {k: v for k, v in written.items() if k not in ("wake_word", "model")} == unchanged
+    # ESPHome loads `manifest.parent / manifest["model"]`; an absolute `model` replaces the parent.
+    assert Path(written["model"]).is_absolute()
+    assert wake.parent / written["model"] == stop_manifest.resolve().parent / stop["model"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_room_stand_in_wake_copies_the_image_stop_manifest() -> None:
+    assert build.default_toolchain().stop_manifest == Path(build.STAND_INS["stop_model"])
+    assert build.STAND_INS["stop_model"] == "/opt/mist-firmware-deps/models/stop/stop.json"
+
+
+def test_spike_compile_keeps_the_stop_model_as_its_wake(tmp_path: Path) -> None:
+    fake = FakeToolchain(stop_manifest=tmp_path / "missing" / "stop.json")
+    rc, output = _run(fake, tmp_path, "compile", "spike")
+    assert rc == 0, output
+    ((argv, _, _),) = fake.compiles
+    assert _substitutions(argv)["wake_model"] == build.STAND_INS["stop_model"]
+    assert not any(name.endswith(".json") for name in fake.seen_files)
+
+
+def test_room_compile_check_refuses_out_before_any_compile(tmp_path: Path) -> None:
+    fake = FakeToolchain()
+    out = tmp_path / "out"
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    rc, output = _run(fake, tmp_root, "compile", "room", "--out", str(out))
+    assert rc == 2
+    assert output.startswith("refused: ")
+    assert "--out" in output and "--config" in output
+    assert fake.compiles == []
+    assert fake.served == []
+    assert not out.exists()
+    assert list(tmp_root.iterdir()) == []
+
+
+def test_room_with_config_keeps_out(tmp_path: Path) -> None:
+    private = tmp_path / "private" / "device"
+    private.mkdir(parents=True)
+    (private / "room.yaml").write_text("packages:\n  mist: !include ../room-endpoint/room.yaml\n")
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    out = private / "images" / "room"
+    fake = FakeToolchain()
+    rc, output = _run(
+        fake, tmp_root, "compile", "room", "--config", str(private / "room.yaml"), "--out", str(out)
+    )
+    assert rc == 0, output
+    ((argv, _, cwd),) = fake.compiles
+    assert argv == build.compile_argv(
+        cwd / "config" / "room.yaml",
+        {"mist_components_path": str(cwd / "room-endpoint" / "components")},
+    )
+    assert (out / "firmware.factory.bin").read_bytes() == b"factory"
+    assert (out / "firmware.ota.bin").read_bytes() == b"ota"
+
+
 def test_a_failed_compile_exits_1_and_removes_the_build_directory(tmp_path: Path) -> None:
     fake = FakeToolchain(compile_rc=2, write_images=False)
     out = tmp_path / "out"
     tmp_root = tmp_path / "tmp"
     tmp_root.mkdir()
-    rc, output = _run(fake, tmp_root, "compile", "room", "--out", str(out))
+    rc, output = _run(fake, tmp_root, "compile", "spike", "--out", str(out))
     assert rc == 1
     assert "compile failed" in output
     assert not out.exists()

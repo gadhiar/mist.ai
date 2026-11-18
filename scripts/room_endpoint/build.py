@@ -14,7 +14,12 @@ removed when the run ends.
 Without `--config` it builds the repository's `spike.yaml` or `room.yaml` with the image's paths
 as substitutions and a `secrets.yaml` and `mist_ca.pem` it generates in the build directory with
 throwaway values (a stand-in Wi-Fi network, token and CA), so a worker's compile check never needs
-a secret. The room build's wake model stand-in is the stock `stop` model.
+a secret. The spike build's stand-in wake is the stock `stop` model itself. The room build cannot
+take that: `mist_prewake` refuses a room build in which another model shares the name model's
+word. So the room compile check wakes on a manifest written into the build directory, the stop
+manifest with its word changed to "compile check" and its `model` naming the image's stop model
+file. That image still opens on "stop", so `--out` is refused for it: a room image leaves the
+container only when built from a private YAML with `--config`.
 
 With `--config <path>` it builds a private YAML made from `personal.example.yaml`: the file's
 directory (without its `images/`) is copied in as `config/`, beside `room-endpoint/`, so the
@@ -28,13 +33,15 @@ discarded with it.
 `voice_kit` takes the XMOS front end's firmware only by URL, so for the compile's length the
 image's dependency directory is served on `127.0.0.1:8765`, which only this container reaches.
 
-Exit codes: 0 built; 1 the compile failed or produced no image; 2 refused (no such config).
+Exit codes: 0 built; 1 the compile failed or produced no image; 2 refused (no such config, or
+`--out` for the room compile check).
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import secrets
 import shutil
@@ -81,6 +88,13 @@ COPY_IGNORE = shutil.ignore_patterns(".esphome", "__pycache__", "images")
 STAND_IN_DEVICE = "stand-in"
 STAND_IN_SECRET_BYTES = 32
 
+# The room compile check's name model: the stop model under a word no other model carries.
+ROOM_TARGET = "room"
+STAND_IN_WAKE_FILE = "stand-in-wake.json"
+STAND_IN_WAKE_WORD = "compile check"
+KEY_WAKE_WORD = "wake_word"
+KEY_MODEL = "model"
+
 
 class BuildError(Exception):
     """A step of the build failed; the message says which."""
@@ -99,6 +113,7 @@ class Toolchain:
     serve: Serve
     make_ca: MakeCa
     tmp_root: Path = Path("/tmp")  # nosec B108 - the container's own throwaway directory
+    stop_manifest: Path = Path(STAND_INS["stop_model"])
 
 
 def server_python() -> str:
@@ -181,6 +196,36 @@ def write_stand_in_secrets(directory: Path, make_ca: MakeCa, work_dir: Path) -> 
     make_ca(directory / CA_FILE, work_dir)
 
 
+def write_stand_in_wake(directory: Path, stop_manifest: Path) -> Path:
+    """Write the room compile check's name model manifest into `directory` and return its path.
+
+    It is `stop_manifest` with only its word changed, so `mist_prewake`'s check that no other
+    model shares the name model's word passes, and its `model` is the stop model file's absolute
+    path: ESPHome 2026.10.2 loads `manifest_path.parent / manifest["model"]`
+    (`micro_wake_word/__init__.py:452`), and an absolute right operand replaces the parent.
+    """
+    stop = stop_manifest.resolve()
+    manifest = json.loads(stop.read_text(encoding="utf-8"))
+    manifest[KEY_WAKE_WORD] = STAND_IN_WAKE_WORD
+    manifest[KEY_MODEL] = str(stop.parent / manifest[KEY_MODEL])
+    path = directory / STAND_IN_WAKE_FILE
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def refuse_stand_in_out(target: str, config: Path | None, out: Path | None) -> None:
+    """Keep the room compile check's image in the build directory.
+
+    Its stand-in name model is the stop model, so that image would open the uplink on "stop".
+    """
+    if target == ROOM_TARGET and config is None and out is not None:
+        raise BuildError(
+            "--out is refused for a room build without --config: its stand-in wake is the stop "
+            'model, so the image would open the uplink on "stop"; build the room image from '
+            "the private YAML with --config"
+        )
+
+
 def _run_compile(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
     return subprocess.run(list(argv), env=dict(env), cwd=cwd, check=False).returncode  # nosec
 
@@ -234,7 +279,11 @@ def _prepare(build_dir: Path, target: str, config: Path | None, toolchain: Toolc
     components = {COMPONENTS_SUBSTITUTION: str(tree / "components")}
     if config is None:
         write_stand_in_secrets(tree, toolchain.make_ca, build_dir)
-        return compile_argv(tree / f"{target}.yaml", {**STAND_INS, **components})
+        substitutions = {**STAND_INS, **components}
+        if target == ROOM_TARGET:
+            wake = write_stand_in_wake(build_dir, toolchain.stop_manifest)
+            substitutions["wake_model"] = str(wake)
+        return compile_argv(tree / f"{target}.yaml", substitutions)
     private = build_dir / PRIVATE_NAME
     shutil.copytree(config.parent, private, ignore=COPY_IGNORE)
     return compile_argv(private / config.name, components)
@@ -250,6 +299,11 @@ def run(
     """Build one image set; see the module docstring for the steps and exit codes."""
     if config is not None and not config.is_file():
         print(f"refused: {config} is not a file", file=stdout)
+        return 2
+    try:
+        refuse_stand_in_out(target, config, out)
+    except BuildError as exc:
+        print(f"refused: {exc}", file=stdout)
         return 2
     build_dir = Path(tempfile.mkdtemp(prefix="mist-room-endpoint-", dir=toolchain.tmp_root))
     try:
