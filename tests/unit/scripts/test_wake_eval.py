@@ -356,8 +356,8 @@ def test_a_duration_that_does_not_match_the_audio_is_refused(tmp_path: Path) -> 
 # -- The manifest: split hygiene --------------------------------------------------------------
 
 
-def test_a_positive_session_in_tune_and_test_is_refused_naming_both(tmp_path: Path) -> None:
-    message = refused(
+def test_a_positive_session_in_tune_and_test_loads(tmp_path: Path) -> None:
+    path = write_manifest(
         tmp_path,
         [
             entry("p/train.wav", split="train", session="day-1"),
@@ -365,8 +365,13 @@ def test_a_positive_session_in_tune_and_test_is_refused_naming_both(tmp_path: Pa
             entry("p/test.wav", split="test", session="day-2"),
         ],
     )
-    assert "entry 1 (p/tune.wav" in message and "entry 2 (p/test.wav" in message
-    assert "day-2" in message
+
+    loaded = wake_manifest.load_manifest(path)
+
+    assert [(item.file, item.split) for item in loaded.entries if item.session == "day-2"] == [
+        ("p/tune.wav", "tune"),
+        ("p/test.wav", "test"),
+    ]
 
 
 def test_a_media_session_in_train_and_test_is_refused_naming_both(tmp_path: Path) -> None:
@@ -381,15 +386,37 @@ def test_a_media_session_in_train_and_test_is_refused_naming_both(tmp_path: Path
     assert "film-night" in message
 
 
-def test_a_session_shared_across_labels_and_splits_is_refused(tmp_path: Path) -> None:
-    message = refused(
+@pytest.mark.parametrize("media_first", [True, False])
+def test_a_session_with_a_media_entry_in_train_and_a_positive_in_tune_is_refused(
+    tmp_path: Path, media_first: bool
+) -> None:
+    media = entry("m/a.wav", "media", "train", phrase="", session="living-room")
+    positive = entry("p/b.wav", "positive", "tune", session="living-room")
+    rows = [media, positive] if media_first else [positive, media]
+    media_index = 0 if media_first else 1
+
+    message = refused(tmp_path, rows)
+
+    assert f"entry {media_index} (m/a.wav" in message
+    assert f"entry {1 - media_index} (p/b.wav" in message
+    assert "living-room" in message and "media" in message
+
+
+def test_a_session_shared_across_labels_and_splits_loads(tmp_path: Path) -> None:
+    path = write_manifest(
         tmp_path,
         [
             entry("p/a.wav", "positive", "train", session="evening"),
             entry("h/b.wav", "homophone", "tune", phrase="I missed it", session="evening"),
         ],
     )
-    assert "entry 0 (p/a.wav" in message and "entry 1 (h/b.wav" in message
+
+    loaded = wake_manifest.load_manifest(path)
+
+    assert [(item.file, item.split) for item in loaded.entries] == [
+        ("p/a.wav", "train"),
+        ("h/b.wav", "tune"),
+    ]
 
 
 def test_one_file_in_two_splits_is_refused_naming_both(tmp_path: Path) -> None:
