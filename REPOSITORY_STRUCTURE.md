@@ -384,7 +384,6 @@ MODEL=gemma-4-e4b
 
 # Voice / TTS
 TTS_ENABLED=true
-TTS_ENGINE=chatterbox
 VOICE_PROFILE=mist
 
 # Feature flags
