@@ -1,37 +1,47 @@
-"""The server name spotter: an openWakeWord-style chain of three ONNX graphs behind `NameSpotter`.
+"""The server name spotter: microWakeWord's streaming model behind `NameSpotter`, on LiteRT.
 
-Wake by name needs MIST's name scored on the uplink as it arrives. The model is three graphs, a
-melspectrogram, a shared speech embedding and a classifier trained for her names, and research
-R2a found that each reads a different window: the melspectrogram 1280 new samples behind 480 of
-left context, scaled by `x/10 + 2`; the embedding the last 76 mel frames, moving by 8 per hop;
-the classifier the last N embeddings, with N read from its own input shape. An ordered list of
-files cannot carry that, so the model directory's `manifest.json` states each graph's input
-spec, and this module refuses any spec but the one the code implements. A manifest that loads
-is one whose scores the code can reproduce.
+One model serves the room device and the server, so one training serves both and their two
+calibrations describe the same weights. The server runs the device's own streaming `.tflite`
+file in place: the manifest's `model.file` is a path inside the model directory
+(`device/mist.tflite` for `mist-mww-1`), so both spotters run one file with one sha256.
+
+The input is quantized as the device quantizes it. pymicro-features' microfrontend gives each
+of its 40 features per 10 ms as the integer value v times 0.0390625; the adapter recovers v
+exactly and applies ESPHome's fixed integer formula, `(v * 256 + 333) // 666 - 128` clamped to
+int8 (`micro_wake_word.cpp`), not the model's input scale, so the server scores what the device
+scores. The uint8 output becomes a probability as microWakeWord's `dequantize_output_data`
+computes it, `(q - zero_point) / 255`.
+
+A hit is the server's own rule, not the device's: a step whose score, the mean of the last
+`sliding_window` probabilities, is at least the threshold, when no hit came in the last
+`cooldown_steps` steps, which span `window_ms` of audio. The rule is greedy, so a higher threshold
+never gives more hits on the same scores (its hits are spaced picks from a subset of the steps a
+lower one picks from, and greedy picks the most), and the converter that writes
+`calibration.server` refuses counts that rise with the threshold. One `_Cooldown` holds the rule
+for the stream and for `hit_steps`, the offline evaluation's count, so what is measured is what
+ships.
+
+The streaming model keeps its state in the interpreter, so each stream, each reset and each
+offline score builds its own interpreter, from the bytes `load` read and checked once.
 
 Weights are never downloaded, never committed, and stay under `<models_dir>/speech/wake/<id>/`,
-because the trained weights are for personal use only. Each graph's sha256 is checked at load,
-so a file swapped under a manifest is refused rather than scored.
-
-The first `warmup_predictions` predictions after a reset are zeroed (R2a). How openWakeWord
-fills its windows before they are full is not in R2a, so two choices here are unverified: a
-window not yet full is zero-padded, and its score is never reported; and the melspectrogram is
-fed int16-scale samples as float32. T36's parity check on the real model settles them.
-
-onnxruntime is never imported here: the sessions come from the injected `session_factory`, and
-the real factory is `silero_vad.open_onnx_session`.
+because the trained weights are for personal use only. ai-edge-litert and pymicro-features are
+imported only by `import_micro_runtime`, which `load` is handed, so importing this module loads
+neither and tests pass a fake library.
 """
 
 import hashlib
+import importlib
 import json
 import logging
 import math
 import re
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 import numpy as np
 
@@ -39,24 +49,24 @@ from ..budget import PlacementConfig
 from ..errors import SpeechEngineError
 from ..protocol import Spotter
 from ..speech import NameHit, SpotterCalibration
-from .silero_vad import CPU_PROVIDER, SessionSpec
 
 logger = logging.getLogger(__name__)
 
-FAMILY = "openwakeword"
+FAMILY = "microwakeword"
 SAMPLE_RATE = 16000
-HOP_MS = 80
-HOP_SAMPLES = SAMPLE_RATE * HOP_MS // 1000
-LEFT_CONTEXT_SAMPLES = 480
-FRAMES_PER_HOP = 8
-MEL_BINS = 32
-MEL_SCALE = 0.1
-MEL_OFFSET = 2.0
-EMBEDDING_FRAMES = 76
-EMBEDDING_STRIDE = 8
-EMBEDDING_DIMS = 96
-ROLES = ("melspectrogram", "embedding", "classifier")
+FEATURE_STEP_MS = 10
+FEATURES = 40
+FRONTEND_SAMPLES = SAMPLE_RATE * FEATURE_STEP_MS // 1000
+"""Samples per frontend call, 10 ms, as microWakeWord's `generate_features_for_clip` feeds it."""
+FEATURE_SCALE = 0.0390625
+"""pymicro-features' `FLOAT32_SCALE`: a feature is the microfrontend's integer value times it."""
+INPUT_VALUE_SCALE = 256
+INPUT_VALUE_DIV = 666
+"""ESPHome's `value_scale` and `value_div`, the device's int8 input formula on the value."""
+OUTPUT_SCALE = 255.0
+"""microWakeWord's `dequantize_output_data` divides by 255 whatever the output's own scale."""
 
+_FRONTEND_BYTES = 2 * FRONTEND_SAMPLES
 _ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MANIFEST_KEYS = frozenset(
@@ -65,93 +75,175 @@ _MANIFEST_KEYS = frozenset(
         "names",
         "family",
         "sample_rate",
-        "hop_ms",
+        "feature_step_ms",
         "window_ms",
-        "threshold",
-        "warmup_predictions",
-        "graphs",
+        "sliding_window",
+        "warmup_ms",
+        "model",
         "hit_lag_ms",
         "calibration",
         "training",
     }
 )
-_GRAPH_COMMON = {"role", "file", "sha256", "input"}
-_EXPECTED_GRAPHS: dict[str, dict[str, object]] = {
-    "melspectrogram": {
-        "input": {"new_samples": HOP_SAMPLES, "left_context_samples": LEFT_CONTEXT_SAMPLES},
-        "frames_per_hop": FRAMES_PER_HOP,
-        "bins": MEL_BINS,
-        "output_transform": {"scale": MEL_SCALE, "offset": MEL_OFFSET},
-    },
-    "embedding": {
-        "input": {"window_frames": EMBEDDING_FRAMES, "stride_frames": EMBEDDING_STRIDE},
-        "dims": EMBEDDING_DIMS,
-    },
-    "classifier": {"input": {"window_embeddings": "from_model"}},
-}
-"""The one input spec per role the pipeline implements; a manifest must state exactly this."""
+_MODEL_KEYS = frozenset({"file", "sha256"})
 _SPOTTERS: tuple[Spotter, ...] = ("server", "endpoint")
 _CALIBRATION_KEYS = frozenset({"false_accepts", "positive_quantile"})
+_RUNTIME = (
+    ("ai_edge_litert.interpreter", "ai-edge-litert"),
+    ("pymicro_features", "pymicro-features"),
+)
+"""Each runtime module `import_micro_runtime` imports, with the package that provides it."""
+_INTERPRETER_ERRORS = (ValueError, RuntimeError)
+"""What LiteRT's `Interpreter` raises on a file it cannot open or allocate."""
 
 
-class ShapedInput(Protocol):
-    """A model input with its shape, which the classifier's window is read from.
+class TensorDetails(TypedDict):
+    """The keys of LiteRT's tensor details the spotter reads; the real dicts hold more."""
 
-    A symbolic dimension is a string or `None`, which is why the window check refuses both.
-    """
+    index: int
+    shape: np.ndarray
+    dtype: type
+    quantization: tuple[float, int]
 
-    @property
-    def name(self) -> str:
-        """The input's name, which every feed is keyed by."""
+
+class MicroInterpreter(Protocol):
+    """The part of LiteRT's `Interpreter` the spotter calls, so tests can fake it."""
+
+    def allocate_tensors(self) -> None:
+        """Allocate the tensors; needed once before the first `set_tensor`."""
         ...
 
-    @property
-    def shape(self) -> Sequence[object]:
-        """The input's declared shape."""
+    def get_input_details(self) -> Sequence[TensorDetails]:
+        """The model's inputs."""
+        ...
+
+    def get_output_details(self) -> Sequence[TensorDetails]:
+        """The model's outputs."""
+        ...
+
+    def set_tensor(self, tensor_index: int, value: np.ndarray) -> None:
+        """Copy `value` into the input tensor at `tensor_index`."""
+        ...
+
+    def invoke(self) -> None:
+        """Run the model once, advancing its streaming state."""
+        ...
+
+    def get_tensor(self, tensor_index: int) -> np.ndarray:
+        """A copy of the tensor at `tensor_index`."""
         ...
 
 
-class KwsSession(Protocol):
-    """The part of `onnxruntime.InferenceSession` the spotter uses, so tests can fake it."""
+class FeatureFrontend(Protocol):
+    """The microfrontend, fed one 10 ms call at a time as microWakeWord feeds it."""
 
-    def get_inputs(self) -> Sequence[ShapedInput]:
-        """The model's inputs; the spotter feeds the first."""
+    def features(self, pcm: bytes) -> Sequence[float]:
+        """Take 160 samples of PCM16 and return the 40 features they complete.
+
+        Returns no features while the frontend's analysis window is still filling.
+        """
         ...
-
-    def run(
-        self, output_names: Sequence[str] | None, input_feed: Mapping[str, np.ndarray]
-    ) -> Sequence[np.ndarray]:
-        """Run the model; `None` for `output_names` returns every output in model order."""
-        ...
-
-
-KwsSessionFactory = Callable[[SessionSpec], KwsSession]
 
 
 @dataclass(frozen=True, slots=True)
-class WakeGraph:
-    """One checked graph file of the chain, in its role's place."""
+class MicroLibrary:
+    """What the spotter needs from the runtime, bound once by `import_micro_runtime`.
 
-    role: str
-    path: str
-    sha256: str
+    `interpreter(model, threads)` builds a LiteRT interpreter over the model's bytes;
+    `frontend()` a fresh microfrontend, whose filterbank and noise state are per stream.
+    """
+
+    interpreter: Callable[[bytes, int], MicroInterpreter]
+    frontend: Callable[[], FeatureFrontend]
+
+
+class _FrontendResult(Protocol):
+    features: Sequence[float]
+    samples_read: int
+
+
+class _PyMicroFrontend:
+    """pymicro-features' `MicroFrontend` behind `FeatureFrontend`.
+
+    pymicro-features 1.x named the call `ProcessSamples` and the pinned 2.x line names it
+    `process_samples` (unverified here, since the runner has neither); the adapter takes either,
+    so the pin can move without a code change. A call that reads less than the 160 samples it is
+    given would drop audio, so it is refused.
+    """
+
+    __slots__ = ("_process",)
+
+    def __init__(self, frontend: object) -> None:
+        process = getattr(frontend, "process_samples", None) or getattr(
+            frontend, "ProcessSamples", None
+        )
+        if not callable(process):
+            raise SpeechEngineError(
+                "pymicro-features' MicroFrontend has no process_samples call; "
+                "requirements-voice.txt pins the version the spotter is written for"
+            )
+        self._process: Callable[[bytes], _FrontendResult] = process
+
+    def features(self, pcm: bytes) -> Sequence[float]:
+        """Run one 10 ms call; see `FeatureFrontend.features`."""
+        result = self._process(pcm)
+        if result.samples_read != len(pcm) // 2:
+            raise SpeechEngineError(
+                f"the microfrontend read {result.samples_read} of the {FRONTEND_SAMPLES} samples "
+                "it was given"
+            )
+        return result.features
+
+
+def import_micro_runtime() -> MicroLibrary:
+    """Import ai-edge-litert and pymicro-features and bind what the spotter calls.
+
+    The interpreter is LiteRT's `ai_edge_litert.interpreter.Interpreter`, as microWakeWord's own
+    `inference.py` imports it, and the frontend pymicro-features' `MicroFrontend`, as its
+    `generate_features_for_clip` builds it.
+
+    Raises:
+        SpeechEngineError: A package is not installed; the message names it.
+    """
+    modules = []
+    for module, package in _RUNTIME:
+        try:
+            modules.append(importlib.import_module(module))
+        except ImportError as exc:
+            raise SpeechEngineError(
+                f"{package} is not installed ({exc.name or module}); requirements-voice.txt "
+                "pins ai-edge-litert and pymicro-features for the server name spotter"
+            ) from exc
+    litert, micro = modules
+    interpreter_class = litert.Interpreter
+    frontend_class = micro.MicroFrontend
+
+    def interpreter(model: bytes, threads: int) -> MicroInterpreter:
+        return interpreter_class(model_content=model, num_threads=threads)
+
+    def frontend() -> FeatureFrontend:
+        return _PyMicroFrontend(frontend_class())
+
+    return MicroLibrary(interpreter=interpreter, frontend=frontend)
 
 
 @dataclass(frozen=True, slots=True)
 class WakeManifest:
     """A model directory's `manifest.json` after validation.
 
-    `training` is the sha256 of the training-split manifest the model was trained from, kept so
-    that H11 can check which split a measured model came from.
+    `model_file` is the model's full path and `model_sha256` its checked digest. `training` is
+    the sha256 of the training-split manifest the model was trained from, kept so that the
+    evaluation can check which split a measured model came from.
     """
 
     path: str
     model_id: str
     names: tuple[str, ...]
     window_ms: int
-    threshold: float
-    warmup_predictions: int
-    graphs: tuple[WakeGraph, ...]
+    sliding_window: int
+    warmup_ms: int
+    model_file: str
+    model_sha256: str
     hit_lag_ms: int
     calibration: Mapping[Spotter, SpotterCalibration]
     training: str
@@ -206,6 +298,10 @@ class _Reader:
             raise self.fail(f"{where} must be an integer of at least {minimum}, got {value!r}")
         return value
 
+    def exactly(self, value: object, where: str, expected: int) -> None:
+        if not _is_int(value) or value != expected:
+            raise self.fail(f"{where} must be {expected} for {FAMILY}, got {value!r}")
+
     def pairs(self, value: object, where: str) -> tuple[tuple[float, float], ...]:
         if not isinstance(value, list) or not value:
             raise self.fail(f"{where} must be a non-empty list of [score, value] pairs")
@@ -235,67 +331,44 @@ def _calibration_entry(reader: _Reader, value: object, where: str) -> SpotterCal
     return SpotterCalibration(false_accepts=false_accepts, positive_quantile=quantile)
 
 
-def _graph(reader: _Reader, value: object, index: int, directory: Path) -> WakeGraph:
-    where = f"graphs[{index}]"
-    role = ROLES[index]
-    if not isinstance(value, dict) or value.get("role") != role:
-        found = value.get("role") if isinstance(value, dict) else value
-        raise reader.fail(f"{where} must be the {role} graph (order {list(ROLES)}), got {found!r}")
-    expected = _EXPECTED_GRAPHS[role]
-    entry = reader.keys(value, where, _GRAPH_COMMON | set(expected))
-    for key, spec in expected.items():
-        if entry[key] != spec or not _same_types(entry[key], spec):
-            raise reader.fail(f"{where} ({role}) {key} must be {spec!r}, got {entry[key]!r}")
+def _model_file(reader: _Reader, value: object, directory: Path) -> tuple[Path, str, bytes]:
+    """The model file's path, its checked sha256 and its bytes, read once.
+
+    The path is split on `/` by hand: `PurePosixPath` folds an empty or `.` part away, and a
+    backslash or a drive would leave the directory on Windows.
+    """
+    entry = reader.keys(value, "model", _MODEL_KEYS)
     file = entry["file"]
     if not isinstance(file, str) or not file:
-        raise reader.fail(f"{where}.file must be a relative path")
-    relative = PurePosixPath(file)
-    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
-        raise reader.fail(f"{where}.file {file!r} must stay inside {directory}")
+        raise reader.fail("model.file must be a relative path inside the model directory")
+    parts = file.split("/")
+    if (
+        "\\" in file
+        or PureWindowsPath(file).drive
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        raise reader.fail(
+            f"model.file {file!r} must be a relative path inside {directory}, with no empty, "
+            "'.' or '..' part"
+        )
     digest = entry["sha256"]
     if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-        raise reader.fail(f"{where}.sha256 must be 64 lower-case hex digits")
-    path = directory.joinpath(*relative.parts)
-    if not path.is_file():
-        raise reader.fail(f"{role} graph {path} not found")
-    actual = _sha256(path)
+        raise reader.fail("model.sha256 must be 64 lower-case hex digits")
+    path = directory.joinpath(*parts)
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise reader.fail(f"wake model {path} not found") from exc
+    except OSError as exc:
+        raise reader.fail(f"wake model {path} could not be read: {exc}") from exc
+    actual = hashlib.sha256(content).hexdigest()
     if actual != digest:
-        raise reader.fail(f"{role} graph {path} has sha256 {actual}, the manifest gives {digest}")
-    return WakeGraph(role=role, path=str(path), sha256=digest)
+        raise reader.fail(f"wake model {path} has sha256 {actual}, the manifest gives {digest}")
+    return path, digest, content
 
 
-def _same_types(value: object, spec: object) -> bool:
-    """Equal values of the wrong JSON type (`true` for 1, `1` for "1") are still refused."""
-    if isinstance(spec, dict):
-        return isinstance(value, dict) and all(
-            _same_types(value[key], item) for key, item in spec.items()
-        )
-    if isinstance(spec, float):
-        return _is_number(value)
-    if isinstance(spec, int):
-        return _is_int(value)
-    return type(value) is type(spec)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def read_manifest(path: Path, model_id: str) -> WakeManifest:
-    """Read and check `<models_dir>/speech/wake/<model_id>/manifest.json`.
-
-    Every key is required and an unknown key is refused, so a field the code does not read
-    cannot be mistaken for one it honours.
-
-    Raises:
-        SpeechEngineError: The manifest or a graph file is missing, a sha256 differs, or a
-            value is outside what the openWakeWord pipeline here implements. The message starts
-            with the manifest's path, and names the graph file where one is at fault.
-    """
+def _read(path: Path, model_id: str) -> tuple[WakeManifest, bytes]:
+    """The checked manifest and the model's bytes, which `load` runs without reading again."""
     reader = _Reader(path)
     try:
         text = path.read_text(encoding="utf-8")
@@ -315,19 +388,13 @@ def read_manifest(path: Path, model_id: str) -> WakeManifest:
         raise reader.fail("names must be a non-empty list of non-empty strings")
     if manifest["family"] != FAMILY:
         raise reader.fail(f"family must be {FAMILY!r}, got {manifest['family']!r}")
-    if not _is_int(manifest["sample_rate"]) or manifest["sample_rate"] != SAMPLE_RATE:
-        raise reader.fail(f"sample_rate must be {SAMPLE_RATE}, got {manifest['sample_rate']!r}")
-    if not _is_int(manifest["hop_ms"]) or manifest["hop_ms"] != HOP_MS:
-        raise reader.fail(f"hop_ms must be {HOP_MS} for {FAMILY}, got {manifest['hop_ms']!r}")
+    reader.exactly(manifest["sample_rate"], "sample_rate", SAMPLE_RATE)
+    reader.exactly(manifest["feature_step_ms"], "feature_step_ms", FEATURE_STEP_MS)
     window_ms = reader.integer(manifest["window_ms"], "window_ms", 1)
-    if not _is_number(manifest["threshold"]):
-        raise reader.fail(f"threshold must be a number, got {manifest['threshold']!r}")
-    warmup = reader.integer(manifest["warmup_predictions"], "warmup_predictions", 0)
+    sliding_window = reader.integer(manifest["sliding_window"], "sliding_window", 1)
+    warmup_ms = reader.integer(manifest["warmup_ms"], "warmup_ms", 0)
     hit_lag_ms = reader.integer(manifest["hit_lag_ms"], "hit_lag_ms", 0)
-    graphs = manifest["graphs"]
-    if not isinstance(graphs, list) or len(graphs) != len(ROLES):
-        raise reader.fail(f"graphs must list the {len(ROLES)} graphs {list(ROLES)} in order")
-    checked = tuple(_graph(reader, graph, index, path.parent) for index, graph in enumerate(graphs))
+    model_path, digest, content = _model_file(reader, manifest["model"], path.parent)
     # Each spotter's entry is optional: a spotter with none ranks as uncalibrated.
     calibration = reader.keys(manifest["calibration"], "calibration", set(_SPOTTERS), optional=True)
     table = {
@@ -338,245 +405,296 @@ def read_manifest(path: Path, model_id: str) -> WakeManifest:
     training = manifest["training"]
     if not isinstance(training, str) or not _SHA256.fullmatch(training):
         raise reader.fail("training must be the training-split manifest's sha256")
-    return WakeManifest(
+    checked = WakeManifest(
         path=str(path),
         model_id=model_id,
         names=tuple(names),
         window_ms=window_ms,
-        threshold=float(manifest["threshold"]),
-        warmup_predictions=warmup,
-        graphs=checked,
+        sliding_window=sliding_window,
+        warmup_ms=warmup_ms,
+        model_file=str(model_path),
+        model_sha256=digest,
         hit_lag_ms=hit_lag_ms,
         calibration=MappingProxyType(table),
         training=training,
     )
+    return checked, content
 
 
-# -- The pipeline -----------------------------------------------------------------------------
+def read_manifest(path: Path, model_id: str) -> WakeManifest:
+    """Read and check `<models_dir>/speech/wake/<model_id>/manifest.json` and its model file.
+
+    Every key is required and an unknown key is refused, so a field the code does not read
+    cannot be mistaken for one it honours.
+
+    Raises:
+        SpeechEngineError: The manifest or the model file is missing, the model's sha256
+            differs, or a value is outside what this spotter implements. The message starts
+            with the manifest's path, and names the model file where it is at fault.
+    """
+    return _read(path, model_id)[0]
+
+
+# -- The streaming context --------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
-class _Chain:
-    """The three loaded sessions and the names of the inputs each is fed through."""
+class _Model:
+    """What every context of one loaded model shares: the checked bytes and the step's shape."""
 
-    mel: KwsSession
-    mel_input: str
-    embedding: KwsSession
-    embedding_input: str
-    classifier: KwsSession
-    classifier_input: str
-    window: int
-    warmup: int
-    model_id: str
+    content: bytes
+    library: MicroLibrary
+    threads: int
+    stride: int
+    input_index: int
+    output_index: int
+    output_zero_point: int
+    sliding_window: int
+    warmup_samples: int
+    cooldown_steps: int
+    keyword: str
 
 
-class _HopScorer:
-    """One context's buffers: audio left context, mel frames and embeddings.
+@dataclass(frozen=True, slots=True)
+class _Step:
+    """One invoke: its probability, the window's score after it, and whether it may hit."""
 
-    The buffers start as zeros, so a window not yet full reads as zero-padded; `step` reports
-    0.0 for such a hop, and for each warm-up prediction, so neither can reach a threshold.
+    probability: float
+    score: float
+    eligible: bool
+
+
+class _Cooldown:
+    """The hit rule: at or above the threshold, and no hit in the last `steps` steps.
+
+    A hit at step s blocks steps s+1 to s+steps-1, so two hits are at least `steps` steps, and
+    so at least `window_ms` of audio, apart. Greedy, so the count never rises with the
+    threshold.
+    """
+
+    __slots__ = ("_since", "_steps")
+
+    def __init__(self, steps: int) -> None:
+        if steps < 0:
+            raise ValueError(f"a cooldown is a count of steps, got {steps}")
+        self._steps = steps
+        self._since: int | None = None
+
+    def step(self, reaches: bool) -> bool:
+        """Advance one step; True when the step is a hit, which restarts the cooldown."""
+        if self._since is not None:
+            self._since += 1
+        if reaches and (self._since is None or self._since >= self._steps):
+            self._since = 0
+            return True
+        return False
+
+
+def hit_steps(series: Sequence[float], threshold: float, cooldown_steps: int) -> list[int]:
+    """The steps of a score series that hit at `threshold`, by the stream's own rule.
+
+    A stream fed the same audio from a fresh warmed context, in any split between `warm` and
+    `push`, finds these hits and reports those in pushed audio.
+
+    Raises:
+        ValueError: `cooldown_steps` is negative.
+    """
+    cooldown = _Cooldown(cooldown_steps)
+    return [index for index, score in enumerate(series) if cooldown.step(score >= threshold)]
+
+
+def _quantize(values: Sequence[float]) -> np.ndarray:
+    """One step's features as the device quantizes them: v recovered, then ESPHome's formula."""
+    features = np.asarray(values, dtype=np.float64)
+    if features.shape != (FEATURES,):
+        raise SpeechEngineError(
+            f"the microfrontend gave {features.size} features, expected {FEATURES}"
+        )
+    value = np.rint(features / FEATURE_SCALE).astype(np.int64)
+    quantized = (value * INPUT_VALUE_SCALE + INPUT_VALUE_DIV // 2) // INPUT_VALUE_DIV - 128
+    return np.clip(quantized, -128, 127).astype(np.int8)
+
+
+def _open_interpreter(library: MicroLibrary, content: bytes, threads: int) -> MicroInterpreter:
+    interpreter = library.interpreter(content, threads)
+    interpreter.allocate_tensors()
+    return interpreter
+
+
+class _Context:
+    """One fresh streaming state: interpreter, frontend, pending samples and features, window.
+
+    The window starts as zeros, as the device's sliding window does. With `warm_up` the context
+    is first fed `warmup_ms` of digital silence, whose steps are dropped, so a short buffer
+    starts from a settled state; without it, no step is eligible to hit until `warmup_ms` of
+    audio has been fed, as the device ignores its first slices after a reset.
     """
 
     __slots__ = (
-        "_chain",
-        "_context",
-        "_embeddings",
-        "_full_embeddings",
-        "_mel",
-        "_mel_frames",
-        "_predictions",
-    )
-
-    def __init__(self, chain: _Chain) -> None:
-        self._chain = chain
-        self._context = np.zeros(LEFT_CONTEXT_SAMPLES, dtype=np.float32)
-        self._mel = np.zeros((EMBEDDING_FRAMES, MEL_BINS), dtype=np.float32)
-        self._embeddings = np.zeros((chain.window, EMBEDDING_DIMS), dtype=np.float32)
-        self._mel_frames = 0
-        self._full_embeddings = 0
-        self._predictions = 0
-
-    def step(self, hop: np.ndarray) -> float:
-        """Run the chain once over one 1280-sample hop and return its reportable score.
-
-        The melspectrogram is fed int16-scale float32 samples (unverified; see the module).
-        """
-        chain = self._chain
-        framed = np.concatenate([self._context, hop.astype(np.float32)])[np.newaxis, :]
-        self._context = framed[0, -LEFT_CONTEXT_SAMPLES:]
-        frames = self._output(chain.mel.run(None, {chain.mel_input: framed}), "melspectrogram")
-        if frames.size != FRAMES_PER_HOP * MEL_BINS:
-            raise SpeechEngineError(
-                f"wake model {chain.model_id}: the melspectrogram gave {frames.size} values per "
-                f"hop, expected {FRAMES_PER_HOP} frames of {MEL_BINS} bins"
-            )
-        frames = frames.reshape(FRAMES_PER_HOP, MEL_BINS) * MEL_SCALE + MEL_OFFSET
-        self._mel = np.concatenate([self._mel[FRAMES_PER_HOP:], frames])
-        self._mel_frames += FRAMES_PER_HOP
-
-        window = self._mel[np.newaxis, :, :, np.newaxis]
-        vector = self._output(
-            chain.embedding.run(None, {chain.embedding_input: window}), "embedding"
-        )
-        if vector.size != EMBEDDING_DIMS:
-            raise SpeechEngineError(
-                f"wake model {chain.model_id}: the embedding gave {vector.size} values, "
-                f"expected {EMBEDDING_DIMS}"
-            )
-        self._embeddings = np.concatenate([self._embeddings[1:], vector[np.newaxis, :]])
-        if self._mel_frames >= EMBEDDING_FRAMES:
-            self._full_embeddings += 1
-
-        features = self._embeddings[np.newaxis, :, :]
-        scores = self._output(
-            chain.classifier.run(None, {chain.classifier_input: features}), "classifier"
-        )
-        if scores.size != 1:
-            raise SpeechEngineError(
-                f"wake model {chain.model_id}: the classifier gave {scores.size} scores, expected 1"
-            )
-        self._predictions += 1
-        if self._predictions <= chain.warmup or self._full_embeddings < chain.window:
-            return 0.0
-        return float(scores[0])
-
-    def _output(self, outputs: Sequence[np.ndarray], role: str) -> np.ndarray:
-        if not outputs:
-            raise SpeechEngineError(f"wake model {self._chain.model_id}: the {role} gave no output")
-        return np.asarray(outputs[0], dtype=np.float32).reshape(-1)
-
-
-def _samples(pcm: bytes) -> np.ndarray:
-    if len(pcm) % 2:
-        raise SpeechEngineError(f"name spotter takes PCM16, got {len(pcm)} bytes")
-    return np.frombuffer(pcm, dtype="<i2")
-
-
-class OnnxNameSpotterStream:
-    """One audio source's spotting state: the pending samples, the windows, and the edge.
-
-    A hit is a rising edge, the score reaching the threshold from below, so a name held across
-    several hops reports once. After a hit, no other hit is reported for `window_ms` of audio,
-    because the classifier window still holds the same name until then.
-    """
-
-    __slots__ = (
-        "_chain",
-        "_hops_since_hit",
-        "_keyword",
+        "_fed",
+        "_features",
+        "_frontend",
+        "_interpreter",
+        "_model",
         "_pending",
-        "_previous",
-        "_refractory_hops",
-        "_scorer",
-        "_threshold",
+        "_quiet",
+        "_window",
     )
 
-    def __init__(self, chain: _Chain, threshold: float, keyword: str, window_ms: int) -> None:
-        self._chain = chain
+    def __init__(self, model: _Model, *, warm_up: bool) -> None:
+        self._model = model
+        self._interpreter = _open_interpreter(model.library, model.content, model.threads)
+        self._frontend = model.library.frontend()
+        self._pending = b""
+        self._features: list[np.ndarray] = []
+        self._window: deque[float] = deque(
+            [0.0] * model.sliding_window, maxlen=model.sliding_window
+        )
+        self._fed = 0
+        self._quiet = 0 if warm_up else model.warmup_samples
+        if warm_up and model.warmup_samples:
+            self.feed(bytes(2 * model.warmup_samples))
+
+    def feed(self, pcm: bytes) -> list[_Step]:
+        """Run every step `pcm` completes; samples past the last whole 10 ms wait.
+
+        Raises:
+            SpeechEngineError: The PCM is not whole 16-bit samples, or the frontend gives
+                other than 40 features.
+        """
+        if len(pcm) % 2:
+            raise SpeechEngineError(f"name spotter takes PCM16, got {len(pcm)} bytes")
+        pending = self._pending + pcm
+        steps: list[_Step] = []
+        start = 0
+        while len(pending) - start >= _FRONTEND_BYTES:
+            chunk = pending[start : start + _FRONTEND_BYTES]
+            start += _FRONTEND_BYTES
+            self._fed += FRONTEND_SAMPLES
+            values = self._frontend.features(chunk)
+            if not len(values):
+                continue
+            self._features.append(_quantize(values))
+            if len(self._features) == self._model.stride:
+                steps.append(self._invoke())
+        self._pending = pending[start:]
+        return steps
+
+    def _invoke(self) -> _Step:
+        model = self._model
+        block = np.stack(self._features)[np.newaxis, :, :]
+        self._features = []
+        self._interpreter.set_tensor(model.input_index, block)
+        self._interpreter.invoke()
+        output = int(np.asarray(self._interpreter.get_tensor(model.output_index)).reshape(-1)[0])
+        probability = (output - model.output_zero_point) / OUTPUT_SCALE
+        self._window.append(probability)
+        score = sum(self._window) / model.sliding_window
+        return _Step(probability=probability, score=score, eligible=self._fed >= self._quiet)
+
+
+# -- The spotter ------------------------------------------------------------------------------
+
+
+class MicroNameSpotterStream:
+    """One audio source's spotting state: the model's own state, the window and the cooldown.
+
+    `warm` and `push` run the same steps and the same cooldown, so a hit in warmed audio blocks
+    the pushed hits after it as one in pushed audio would; only `push` reports.
+    """
+
+    __slots__ = ("_context", "_cooldown", "_model", "_threshold")
+
+    def __init__(self, model: _Model, threshold: float) -> None:
+        self._model = model
         self._threshold = threshold
-        self._keyword = keyword
-        self._refractory_hops = -(-window_ms // HOP_MS)
         self.reset()
 
     def push(self, pcm: bytes, pos: int) -> list[NameHit]:
-        """Buffer PCM16 mono 16 kHz audio and score each hop it completes.
+        """Score PCM16 mono 16 kHz audio and report each step that hits.
 
-        A 20 ms frame is 320 samples, so a hop completes on every fourth; the samples past the
-        last whole hop wait for the next push. When one push completes several hops the
-        classifier runs once per hop and the push scores the highest, so a hit is judged once
-        per push however the frames arrive. A hit's `end_pos` is `pos`, the frame the hop ended on.
+        A hit's `end_pos` is `pos`, the frame whose push completed the step, and `keyword` the
+        manifest's first name: the model gives one probability, not one per name.
 
         Raises:
-            SpeechEngineError: The PCM is not whole 16-bit samples, or a graph's output has an
-                unexpected size.
+            SpeechEngineError: The PCM is not whole 16-bit samples, or the frontend gives
+                other than 40 features.
         """
-        pending = np.concatenate([self._pending, _samples(pcm)])
-        scores: list[float] = []
-        while len(pending) >= HOP_SAMPLES:
-            scores.append(self._scorer.step(pending[:HOP_SAMPLES]))
-            pending = pending[HOP_SAMPLES:]
-            if self._hops_since_hit is not None:
-                self._hops_since_hit += 1
-        self._pending = pending
-        if not scores:
-            return []
-        score = max(scores)
-        rising = score >= self._threshold > self._previous
-        self._previous = score
-        refractory = (
-            self._hops_since_hit is not None and self._hops_since_hit < self._refractory_hops
-        )
-        if not rising or refractory:
-            return []
-        self._hops_since_hit = 0
-        return [NameHit(end_pos=pos, keyword=self._keyword, score=score)]
+        return [
+            NameHit(end_pos=pos, keyword=self._model.keyword, score=score)
+            for score in self._hits(pcm)
+        ]
 
-    def reset(self) -> None:
-        """Drop the pending samples, the windows, the warm-up count and the edge state."""
-        self._scorer = _HopScorer(self._chain)
-        self._pending = np.zeros(0, dtype="<i2")
-        self._previous = 0.0
-        self._hops_since_hit: int | None = None
+    def warm(self, pcm: bytes, pos: int) -> None:
+        """Score audio as `push` does and report nothing; a hit it finds starts the cooldown.
+
+        Raises:
+            SpeechEngineError: As `push`.
+        """
+        self._hits(pcm)
+
+    def reset(self, *, warm_up: bool = True) -> None:
+        """Start a new context: a new interpreter and frontend, an empty window and cooldown.
+
+        With `warm_up` the context first hears `warmup_ms` of silence; without it, no hit is
+        reported until `warmup_ms` of audio has been fed, so a reset while behind adds no work.
+        """
+        self._context = _Context(self._model, warm_up=warm_up)
+        self._cooldown = _Cooldown(self._model.cooldown_steps)
+
+    def _hits(self, pcm: bytes) -> list[float]:
+        return [
+            step.score
+            for step in self._context.feed(pcm)
+            if self._cooldown.step(step.eligible and step.score >= self._threshold)
+        ]
 
 
-class OnnxNameSpotter:
-    """The openWakeWord-style spotter over three onnxruntime sessions that every stream shares.
+class MicroNameSpotter:
+    """The microWakeWord spotter over one checked model file that every stream shares.
 
-    `keyword` on each hit is the manifest's first name: the classifier gives one score for the
-    model, not one per name. `threshold` is the manifest's default, which the wake settings may
-    override per stream.
+    `stride` is the feature steps one invoke reads, from the model's input shape, and
+    `cooldown_steps` the invokes `window_ms` spans, rounded up.
     """
 
     __slots__ = (
-        "_chain",
+        "_model",
         "calibration",
-        "classifier_window",
+        "cooldown_steps",
         "hit_lag_ms",
         "model_id",
         "names",
-        "threshold",
+        "stride",
         "training",
-        "warmup_predictions",
         "window_ms",
     )
 
-    def __init__(self, manifest: WakeManifest, sessions: Sequence[KwsSession]) -> None:
-        mel, embedding, classifier = sessions
-        classifier_path = manifest.graphs[2].path
-        window = _classifier_window(classifier, manifest.path, classifier_path)
-        self._chain = _Chain(
-            mel=mel,
-            mel_input=_first_input(mel, manifest.path, manifest.graphs[0].path).name,
-            embedding=embedding,
-            embedding_input=_first_input(embedding, manifest.path, manifest.graphs[1].path).name,
-            classifier=classifier,
-            classifier_input=_first_input(classifier, manifest.path, classifier_path).name,
-            window=window,
-            warmup=manifest.warmup_predictions,
-            model_id=manifest.model_id,
-        )
+    def __init__(self, manifest: WakeManifest, model: _Model) -> None:
+        self._model = model
         self.model_id = manifest.model_id
         self.names = manifest.names
         self.window_ms = manifest.window_ms
         self.hit_lag_ms = manifest.hit_lag_ms
         self.calibration = manifest.calibration
-        self.threshold = manifest.threshold
-        self.warmup_predictions = manifest.warmup_predictions
         self.training = manifest.training
-        self.classifier_window = window
+        self.stride = model.stride
+        self.cooldown_steps = model.cooldown_steps
 
     @classmethod
     def load(
-        cls, placement: PlacementConfig, *, session_factory: KwsSessionFactory
-    ) -> "OnnxNameSpotter":
+        cls, placement: PlacementConfig, *, library_loader: Callable[[], MicroLibrary]
+    ) -> "MicroNameSpotter":
         """Open `placement.kws_model` from `<models_dir>/speech/wake/<id>/` on the CPU.
 
-        Each session runs `placement.kws_threads` intra-op threads and one inter-op thread:
-        the chain is three single-path graphs run in turn.
+        The model's bytes are read once and their sha256 checked; one interpreter built from
+        them checks the model's shape, and every stream later builds its own from the same
+        bytes with `placement.kws_threads` threads.
 
         Raises:
             SpeechEngineError: No model is set, the id is malformed, the manifest is refused
-                (`read_manifest`), or the classifier's window is not a positive integer.
+                (`read_manifest`), a runtime package is missing, the interpreter cannot open
+                the file, or its input is not int8 `[1, stride, 40]` or its output not uint8
+                `[1, 1]`; a refusal of the file names it and the shape found.
         """
         model_id = placement.kws_model
         if model_id is None:
@@ -586,65 +704,108 @@ class OnnxNameSpotter:
                 f"MIST_VOICE_KWS_MODEL={model_id!r}: expected a model id [a-z0-9][a-z0-9-]*"
             )
         path = Path(placement.models_dir, "speech", "wake", model_id, "manifest.json")
-        manifest = read_manifest(path, model_id)
-        sessions = [
-            session_factory(
-                SessionSpec(
-                    path=graph.path,
-                    providers=(CPU_PROVIDER,),
-                    device_id=0,
-                    intra_op_num_threads=placement.kws_threads,
-                    inter_op_num_threads=1,
-                )
-            )
-            for graph in manifest.graphs
-        ]
-        spotter = cls(manifest, sessions)
+        manifest, content = _read(path, model_id)
+        library = library_loader()
+        where = f"{manifest.path}: wake model {manifest.model_file}"
+        try:
+            interpreter = _open_interpreter(library, content, placement.kws_threads)
+        except _INTERPRETER_ERRORS as exc:
+            raise SpeechEngineError(
+                f"{where} could not be opened ({type(exc).__name__}: {exc})"
+            ) from exc
+        stride, input_index = _check_input(interpreter.get_input_details(), where)
+        output_index, zero_point = _check_output(interpreter.get_output_details(), where)
+        model = _Model(
+            content=content,
+            library=library,
+            threads=placement.kws_threads,
+            stride=stride,
+            input_index=input_index,
+            output_index=output_index,
+            output_zero_point=zero_point,
+            sliding_window=manifest.sliding_window,
+            warmup_samples=manifest.warmup_ms * SAMPLE_RATE // 1000,
+            cooldown_steps=math.ceil(manifest.window_ms / (stride * FEATURE_STEP_MS)),
+            keyword=manifest.names[0],
+        )
+        spotter = cls(manifest, model)
         logger.info(
-            "Name spotter %s loaded from %s with %d threads, classifier window %d",
+            "Name spotter %s loaded from %s with %d threads, stride %d, cooldown %d steps",
             model_id,
-            path.parent,
+            manifest.model_file,
             placement.kws_threads,
-            spotter.classifier_window,
+            stride,
+            model.cooldown_steps,
         )
         return spotter
 
-    def open_stream(self, threshold: float) -> OnnxNameSpotterStream:
-        """Open a stream with fresh context that reports scores at or above `threshold`."""
-        return OnnxNameSpotterStream(self._chain, threshold, self.names[0], self.window_ms)
+    def open_stream(self, threshold: float) -> MicroNameSpotterStream:
+        """Open a stream on a fresh warmed context that reports scores at or above `threshold`."""
+        return MicroNameSpotterStream(self._model, threshold)
 
     def score_window(self, pcm: bytes) -> float:
-        """The highest reportable score over a finished buffer, from a fresh context.
+        """The highest score over a finished buffer from a fresh warmed context, else 0.0.
 
-        This is the stream's pipeline, warm-up and fill rules included, so a buffer shorter
-        than the windows scores 0.0; samples past the last whole hop are not scored.
+        For a threshold above 0, the result reaches it exactly when a fresh stream pushed the
+        same audio reports a hit. A buffer that completes no step scores 0.0.
 
         Raises:
-            SpeechEngineError: The PCM is not whole 16-bit samples, or a graph's output has an
-                unexpected size.
+            SpeechEngineError: As `MicroNameSpotterStream.push`.
         """
-        samples = _samples(pcm)
-        scorer = _HopScorer(self._chain)
-        best = 0.0
-        for start in range(0, len(samples) - HOP_SAMPLES + 1, HOP_SAMPLES):
-            best = max(best, scorer.step(samples[start : start + HOP_SAMPLES]))
-        return best
+        return max(self.score_series(pcm), default=0.0)
+
+    def score_series(self, pcm: bytes) -> list[float]:
+        """Every step's score over a buffer from a fresh warmed context, for `hit_steps`.
+
+        Raises:
+            SpeechEngineError: As `MicroNameSpotterStream.push`.
+        """
+        return [step.score for step in _Context(self._model, warm_up=True).feed(pcm)]
+
+    def probabilities(self, pcm: bytes) -> list[float]:
+        """Every step's raw probability from a fresh context with no warm-up, for parity.
+
+        This is what microWakeWord's own inference gives on the same audio, before the
+        sliding window.
+
+        Raises:
+            SpeechEngineError: As `MicroNameSpotterStream.push`.
+        """
+        return [step.probability for step in _Context(self._model, warm_up=False).feed(pcm)]
 
 
-def _first_input(session: KwsSession, manifest: str, graph: str) -> ShapedInput:
-    inputs = session.get_inputs()
-    if not inputs:
-        raise SpeechEngineError(f"{manifest}: graph {graph} has no inputs")
-    return inputs[0]
+def _describe(details: Sequence[TensorDetails]) -> str:
+    found = [
+        f"{np.dtype(item['dtype']).name} {[int(size) for size in item['shape']]}"
+        for item in details
+    ]
+    return ", ".join(found) or "none"
 
 
-def _classifier_window(session: KwsSession, manifest: str, graph: str) -> int:
-    """N, the embeddings one classifier call reads, from its first input's second dimension."""
-    shape = list(_first_input(session, manifest, graph).shape)
-    window = shape[1] if len(shape) > 1 else None
-    if not _is_int(window) or window < 1:
+def _check_input(details: Sequence[TensorDetails], where: str) -> tuple[int, int]:
+    """The stride and the input's index, from one int8 input of shape `[1, stride, 40]`."""
+    shape = [int(size) for size in details[0]["shape"]] if len(details) == 1 else []
+    if (
+        len(details) != 1
+        or np.dtype(details[0]["dtype"]) != np.int8
+        or len(shape) != 3
+        or shape[0] != 1
+        or shape[1] < 1
+        or shape[2] != FEATURES
+    ):
         raise SpeechEngineError(
-            f"{manifest}: classifier graph {graph} input shape {shape} has no positive integer "
-            "window in its second dimension"
+            f"{where}: the input must be one int8 tensor of shape [1, stride, {FEATURES}] with a "
+            f"positive stride, got {_describe(details)}"
         )
-    return window
+    return shape[1], int(details[0]["index"])
+
+
+def _check_output(details: Sequence[TensorDetails], where: str) -> tuple[int, int]:
+    """The output's index and zero point, from one uint8 output of shape `[1, 1]`."""
+    shape = [int(size) for size in details[0]["shape"]] if len(details) == 1 else []
+    if len(details) != 1 or np.dtype(details[0]["dtype"]) != np.uint8 or shape != [1, 1]:
+        raise SpeechEngineError(
+            f"{where}: the output must be one uint8 tensor of shape [1, 1], "
+            f"got {_describe(details)}"
+        )
+    return int(details[0]["index"]), int(details[0]["quantization"][1])

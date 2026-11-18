@@ -195,7 +195,7 @@ backend/
 │   ├── degraded.py              # `DirectResponder`: answers turns when knowledge integration is off or failed to start
 │   ├── engines/                 # Speech engine adapters implementing the protocols in `speech.py`
 │   │   ├── audio.py             # Text and audio rules every TTS adapter shares
-│   │   ├── kws.py               # Server name spotter: a chain of three ONNX graphs behind `NameSpotter`
+│   │   ├── kws.py               # Server name spotter: the device's streaming microWakeWord model on LiteRT behind `NameSpotter`
 │   │   ├── nemotron_stt.py      # Nemotron streaming English STT behind `StreamingTranscriber`, on the GPU
 │   │   ├── parakeet_stt.py      # Parakeet TDT 0.6B v2 (ONNX) STT behind `StreamingTranscriber`, on the CPU
 │   │   ├── pocket_tts.py        # Pocket TTS with voice cloning behind `SpeechSynthesizer`

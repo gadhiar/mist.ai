@@ -2,8 +2,8 @@
 
 Every WAV here is written by `wave` into pytest's temporary directory, and the engines are the
 scripted fakes (`ScriptedNameSpotter`, `ScriptedTranscriber`, `EnergyVad`), so no recording and
-no model is read. The model manifest is T34's format over three placeholder graph files, which
-`read_manifest` hashes like real ones.
+no model is read. The model manifest is the microWakeWord format over a placeholder model file,
+which `read_manifest` hashes like a real one.
 
 Scripted hits are addressed by uplink position. The harness numbers the frames of a split's
 entries in manifest order, one position per 20 ms frame, so `offsets` below turns an entry and a
@@ -12,6 +12,7 @@ the gate decodes run: entries in manifest order, one decode per distinct span.
 """
 
 import hashlib
+import importlib
 import json
 import logging
 import wave
@@ -23,8 +24,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from backend.realtime.budget import EndpointingConfig
+from backend.realtime.budget import EndpointingConfig, PlacementConfig
 from backend.realtime.engines.kws import read_manifest
+from backend.realtime.engines.parakeet_stt import OnnxAsrLibrary, ParakeetTranscriber
 from backend.realtime.ingress import (
     SegmentStep,
     SpeechSegmentTracker,
@@ -137,44 +139,21 @@ def write_model(
     hit_lag_ms: int = 0,
     calibration: Mapping[str, object] | None = None,
 ) -> Path:
-    """T34's manifest over three placeholder graphs, which `read_manifest` hashes."""
+    """A microWakeWord manifest over a placeholder model file, which `read_manifest` hashes."""
     directory = models_dir / "speech" / "wake" / MODEL_ID
-    directory.mkdir(parents=True, exist_ok=True)
-    specs: list[tuple[str, dict[str, object]]] = [
-        (
-            "melspectrogram",
-            {
-                "input": {"new_samples": 1280, "left_context_samples": 480},
-                "frames_per_hop": 8,
-                "bins": 32,
-                "output_transform": {"scale": 0.1, "offset": 2.0},
-            },
-        ),
-        ("embedding", {"input": {"window_frames": 76, "stride_frames": 8}, "dims": 96}),
-        ("classifier", {"input": {"window_embeddings": "from_model"}}),
-    ]
-    graphs = []
-    for role, spec in specs:
-        payload = f"placeholder {role}".encode()
-        (directory / f"{role}.onnx").write_bytes(payload)
-        graphs.append(
-            {
-                "role": role,
-                "file": f"{role}.onnx",
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                **spec,
-            }
-        )
+    (directory / "device").mkdir(parents=True, exist_ok=True)
+    payload = b"placeholder streaming model"
+    (directory / "device" / "mist.tflite").write_bytes(payload)
     manifest = {
         "model_id": MODEL_ID,
         "names": ["mist"],
-        "family": "openwakeword",
+        "family": "microwakeword",
         "sample_rate": 16000,
-        "hop_ms": 80,
+        "feature_step_ms": 10,
         "window_ms": 1280,
-        "threshold": 0.5,
-        "warmup_predictions": 5,
-        "graphs": graphs,
+        "sliding_window": 5,
+        "warmup_ms": 1000,
+        "model": {"file": "device/mist.tflite", "sha256": hashlib.sha256(payload).hexdigest()},
         "hit_lag_ms": hit_lag_ms,
         "calibration": dict(calibration or {}),
         "training": training,
@@ -849,6 +828,71 @@ def test_the_real_engines_need_an_stt_factory(
     assert code == 2
     assert "--stt-factory" in capsys.readouterr().err
     assert not out.exists()
+
+
+def test_the_real_engines_load_the_microwakeword_spotter_and_the_named_stt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class Spotter:
+        @staticmethod
+        def load(placement: PlacementConfig, *, library_loader: object) -> str:
+            seen["spotter"] = (placement, library_loader)
+            return "spotter"
+
+    class Vad:
+        @staticmethod
+        def load(placement: PlacementConfig, **kwargs: object) -> str:
+            seen["vad"] = placement
+            return "vad"
+
+    def stt(placement: PlacementConfig) -> str:
+        seen["stt"] = placement
+        return "stt"
+
+    monkeypatch.setattr(eval_wake, "MicroNameSpotter", Spotter)
+    monkeypatch.setattr(eval_wake, "SileroVad", Vad)
+    monkeypatch.setattr(eval_wake, "parakeet_cpu", stt)
+    placement = PlacementConfig(models_dir="/models", kws_model=MODEL_ID)
+
+    engines = eval_wake._real_engines("scripts.wake.eval_wake:parakeet_cpu")(placement)
+
+    assert engines == eval_wake.Engines(spotter="spotter", vad="vad", transcriber="stt")  # type: ignore[arg-type]
+    assert seen == {
+        "spotter": (placement, eval_wake.import_micro_runtime),
+        "vad": placement,
+        "stt": placement,
+    }
+
+
+def test_parakeet_cpu_loads_parakeet_from_the_placement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights = tmp_path / "models" / "speech" / "istupakov" / "parakeet-tdt-0.6b-v2-onnx"
+    weights.mkdir(parents=True)
+    (weights / "vocab.txt").write_text("placeholder", encoding="utf-8")
+    loads: list[tuple[tuple, dict]] = []
+
+    class Options:
+        intra_op_num_threads = 0
+        inter_op_num_threads = 0
+
+    def load_model(*args: object, **kwargs: object) -> object:
+        loads.append((args, kwargs))
+        return object()
+
+    def fake_import() -> OnnxAsrLibrary:
+        return OnnxAsrLibrary(load_model=load_model, session_options=Options, errors=())
+
+    monkeypatch.setattr(eval_wake, "import_onnx_asr", fake_import)
+    factory = importlib.import_module("scripts.wake.eval_wake").parakeet_cpu
+
+    transcriber = factory(PlacementConfig(models_dir=str(tmp_path / "models")))
+
+    assert isinstance(transcriber, ParakeetTranscriber)
+    ((_, kwargs),) = loads
+    assert kwargs["path"] == str(weights)
 
 
 # -- The harness: the tuning pass -------------------------------------------------------------
