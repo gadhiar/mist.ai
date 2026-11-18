@@ -421,6 +421,22 @@ class TestReplacement:
         assert rig.app.connected() == ["example-room"]
         assert "device_disconnected device=example-room code=4001" in caplog.text
 
+    async def test_a_connection_cancelled_in_the_replace_wait_leaves_no_live_entry(
+        self, lingering_rig
+    ):
+        rig = lingering_rig
+        await rig.connect(f"Bearer {ROOM}")
+        second = await rig.connect(f"Bearer {ROOM}")
+        assert not second.task.done()
+
+        # Shutdown cancels the connection's task while it waits for the session it replaces.
+        second.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second.task
+
+        assert rig.serve.calls == [("example-room", "room")]
+        assert rig.app.connected() == []
+
     async def test_the_first_session_ends_before_the_second_is_served(self, rig):
         await rig.connect(f"Bearer {ROOM}")
 
