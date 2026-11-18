@@ -73,6 +73,13 @@ logger:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # A wake sends 5 s of backlog (about 175 KB on the wire) that must arrive within 1 s. ESPHome's
+  # ESP32 default is `light` (wifi/__init__.py:517-525), modem sleep, in which "the delay in
+  # receiving Wi-Fi data may be the same as the DTIM cycle" (ESP-IDF docs, api-guides/wifi.rst
+  # line 2149): the server's ACKs wait for a beacon and the send window waits behind them. A
+  # mains-powered room endpoint keeps the radio awake. The send buffer behind the backlog is
+  # `mist_prewake`'s request for high-performance networking (its `__init__.py`).
+  power_save_mode: none
 
 ota:
   - platform: esphome
