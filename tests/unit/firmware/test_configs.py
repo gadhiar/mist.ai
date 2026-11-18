@@ -255,8 +255,40 @@ def test_secret_keys_are_the_ones_devices_py_writes() -> None:
     assert load(PACKAGES / "link.yaml")["mist_link"]["ca_file"] == devices.DEVICE_CA_FILE
 
 
-def test_spike_package_turns_on_device_stats_only() -> None:
-    assert load(PACKAGES / "spike.yaml") == {"mist_link": {"device_stats": True}}
+def test_spike_package_turns_on_device_stats_and_the_spike_player_only() -> None:
+    assert load(PACKAGES / "spike.yaml") == {
+        "mist_link": {"device_stats": True, "spike_speaker": "reply_resampling_speaker"}
+    }
+
+
+def test_spike_player_feeds_the_reply_resampler_of_the_speaker_chain() -> None:
+    speakers = {spk["id"]: spk for spk in load(PACKAGES / "device.yaml")["speaker"]}
+    resampler = speakers["reply_resampling_speaker"]
+    assert resampler["platform"] == "resampler"
+    assert resampler["sample_rate"] == 48000
+    mixer_inputs = [source["id"] for source in speakers["mixing_speaker"]["source_speakers"]]
+    assert resampler["output_speaker"] in mixer_inputs
+    assert speakers["mixing_speaker"]["output_speaker"] == "i2s_audio_speaker"
+
+
+def test_room_build_carries_no_spike_player() -> None:
+    for path in (ENDPOINT / "room.yaml", PACKAGES / "device.yaml", PACKAGES / "link.yaml"):
+        assert "spike_speaker" not in path.read_text(encoding="utf-8"), path
+
+
+def test_spike_player_code_is_compiled_only_into_the_spike_build() -> None:
+    define = "USE_MIST_LINK_SPIKE_PLAYER"
+    for name in ("mist_link.h", "mist_link.cpp"):
+        text = (LINK_DIR / name).read_text(encoding="utf-8")
+        guarded = re.findall(rf"#ifdef {define}\n(.*?)#endif", text, flags=re.S)
+        assert any("SpikePlayer" in block for block in guarded), name
+        outside = re.sub(rf"#ifdef {define}\n.*?#endif", "", text, flags=re.S)
+        assert "SpikePlayer" not in outside, name
+    cpp = (LINK_DIR / "mist_link.cpp").read_text(encoding="utf-8")
+    assert "add_playback_underruns" in cpp
+    codegen = (LINK_DIR / "__init__.py").read_text(encoding="utf-8")
+    assert f'cg.add_define("{define}")' in codegen
+    assert "cv.use_id(speaker.Speaker)" in codegen
 
 
 def test_spike_config_includes_the_spike_package() -> None:

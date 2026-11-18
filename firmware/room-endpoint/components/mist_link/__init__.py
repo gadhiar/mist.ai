@@ -9,14 +9,17 @@ registry name, so an offline compile has nothing to fetch; `esp-tls` and `tcp_tr
 ESPHome leaves out of the build by default, are put back for it.
 
 `device_stats: true` (the spike build's `packages/spike.yaml`) compiles in the 10 s stats report;
-without it the report's code is not in the image.
+without it the report's code is not in the image. `spike_speaker` (also the spike build's only)
+compiles in a minimal player that sends `0x01` audio straight to that speaker, so the spike can
+measure uplink during playback before the room build's player exists; it has no tag rules, fades
+or ducking.
 """
 
 from pathlib import Path
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import psram
+from esphome.components import psram, speaker
 from esphome.components.esp32 import (
     add_idf_component,
     add_idf_sdkconfig_option,
@@ -34,6 +37,7 @@ CONF_TOKEN = "token"  # nosec B105 - a config key's name, not a secret
 CONF_CA_FILE = "ca_file"
 CONF_WEBSOCKET_CLIENT_PATH = "websocket_client_path"
 CONF_DEVICE_STATS = "device_stats"
+CONF_SPIKE_SPEAKER = "spike_speaker"
 
 DEFAULT_WEBSOCKET_CLIENT_PATH = "/opt/mist-firmware-deps/esp_websocket_client"
 DEVICE_PATH = "/v2/device"
@@ -71,6 +75,7 @@ CONFIG_SCHEMA = cv.Schema(
             CONF_WEBSOCKET_CLIENT_PATH, default=DEFAULT_WEBSOCKET_CLIENT_PATH
         ): cv.directory,
         cv.Optional(CONF_DEVICE_STATS, default=False): cv.boolean,
+        cv.Optional(CONF_SPIKE_SPEAKER): cv.use_id(speaker.Speaker),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -95,3 +100,7 @@ async def to_code(config: dict[str, object]) -> None:
 
     if config[CONF_DEVICE_STATS]:
         cg.add_define("USE_MIST_LINK_DEVICE_STATS")
+    if CONF_SPIKE_SPEAKER in config:
+        cg.add_define("USE_MIST_LINK_SPIKE_PLAYER")
+        output = await cg.get_variable(config[CONF_SPIKE_SPEAKER])
+        cg.add(var.set_spike_speaker(output))

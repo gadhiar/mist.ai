@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
 #
-# Spike build only (host step H4): the link sends `device_stats` every 10 s, which only the spike
-# listener reads. `room.yaml` never includes this package, so the room build carries no stats
-# code at all.
+# Spike build only (host step H4). `room.yaml` never includes this package, so the room build
+# carries none of this code:
+#
+# - the link sends `device_stats` every 10 s, which only the spike listener reads;
+# - a minimal player sends the listener's `0x01` audio (24 kHz PCM16) straight to the reply
+#   resampler, mixer and DAC, and counts underruns into `device_stats`, so G1 can measure the
+#   uplink during playback. It has no tag rules, fades or ducking; T6's player replaces it in the
+#   room build.
 
 mist_link:
   device_stats: true
+  spike_speaker: reply_resampling_speaker

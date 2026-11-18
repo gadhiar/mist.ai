@@ -73,6 +73,16 @@ void MistLink::setup() {
     return;
   }
   esp_websocket_register_events(this->client_, WEBSOCKET_EVENT_ANY, MistLink::on_event, this);
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+  this->spike_player_ = new SpikePlayer(this, this->spike_speaker_);  // NOLINT: lives as long as the link
+  if (this->spike_speaker_ == nullptr || !this->spike_player_->setup()) {
+    ESP_LOGE(TAG, "Could not set up the spike player");
+    this->mark_failed();
+    return;
+  }
+  this->add_listener(this->spike_player_);
+#endif
 }
 
 void MistLink::loop() {
@@ -102,6 +112,10 @@ void MistLink::loop() {
     }
     heap_caps_free(event.data);
   }
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+  this->spike_player_->loop();
+#endif
 
 #ifdef USE_MIST_LINK_DEVICE_STATS
   const uint32_t now = millis();
@@ -338,6 +352,96 @@ void MistLink::send_stats() {
   const size_t len = mist_core::build_device_stats(buf, sizeof(buf), stats);
   if (len == 0 || !this->send_text(buf, len)) {
     ESP_LOGW(TAG, "Could not queue device_stats");
+  }
+}
+#endif
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+// -- The spike player --------------------------------------------------------------------------
+
+bool SpikePlayer::setup() {
+  this->fifo_ = static_cast<uint8_t *>(heap_caps_malloc(kFifoBytes, MALLOC_CAP_SPIRAM));
+  return this->fifo_ != nullptr;
+}
+
+void SpikePlayer::on_link_frame(const mist_core::Frame &frame) {
+  switch (frame.type) {
+    case mist_core::MsgType::AudioChunk: {
+      if (!this->streaming_) {
+        this->output_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, kSampleRate));
+        this->output_->start();
+        this->streaming_ = true;
+        this->finishing_ = false;
+        this->primed_ = false;
+        this->dry_ = false;
+      }
+      size_t len = frame.payload_len;
+      if (len > kFifoBytes - this->used_) {
+        this->dropped_bytes_ += len - (kFifoBytes - this->used_);
+        len = kFifoBytes - this->used_;
+      }
+      size_t tail = (this->head_ + this->used_) % kFifoBytes;
+      size_t copied = 0;
+      while (copied < len) {
+        const size_t chunk = std::min(len - copied, kFifoBytes - tail);
+        std::memcpy(this->fifo_ + tail, frame.payload + copied, chunk);
+        copied += chunk;
+        tail = (tail + chunk) % kFifoBytes;
+      }
+      this->used_ += len;
+      break;
+    }
+    case mist_core::MsgType::AudioComplete:
+      this->streaming_ = false;
+      this->finishing_ = true;
+      break;
+    case mist_core::MsgType::InterruptFade:
+      this->stop_stream();
+      break;
+    default:
+      break;
+  }
+}
+
+void SpikePlayer::on_link_disconnected() { this->stop_stream(); }
+
+void SpikePlayer::stop_stream() {
+  if (this->streaming_ || this->finishing_) {
+    this->output_->stop();
+  }
+  this->streaming_ = false;
+  this->finishing_ = false;
+  this->head_ = 0;
+  this->used_ = 0;
+}
+
+void SpikePlayer::loop() {
+  while (this->used_ > 0) {
+    const size_t chunk = std::min(this->used_, kFifoBytes - this->head_);
+    const size_t written = this->output_->play(this->fifo_ + this->head_, chunk, 0);
+    this->head_ = (this->head_ + written) % kFifoBytes;
+    this->used_ -= written;
+    if (written < chunk) {
+      break;
+    }
+  }
+  if (this->finishing_ && this->used_ == 0) {
+    this->output_->finish();
+    this->finishing_ = false;
+  }
+  if (this->dropped_bytes_ > 0) {
+    ESP_LOGW(TAG, "Spike player: FIFO full, dropped %u bytes", (unsigned) this->dropped_bytes_);
+    this->dropped_bytes_ = 0;
+  }
+  if (!this->streaming_) {
+    return;
+  }
+  if (this->output_->has_buffered_data()) {
+    this->primed_ = true;
+    this->dry_ = false;
+  } else if (this->primed_ && this->used_ == 0 && !this->dry_) {
+    this->dry_ = true;
+    this->link_->add_playback_underruns(1);
   }
 }
 #endif

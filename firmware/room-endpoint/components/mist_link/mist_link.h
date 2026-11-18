@@ -38,8 +38,16 @@
 #include "esphome/core/defines.h"
 #include "esphome/core/static_task.h"
 
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+#include "esphome/components/speaker/speaker.h"
+#endif
+
 namespace esphome {
 namespace mist_link {
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+class SpikePlayer;
+#endif
 
 // The owner of some inbound messages. Every callback runs on the main loop.
 class LinkListener {
@@ -96,6 +104,11 @@ class MistLink : public Component, public mist_core::UplinkSink {
   void add_mic_overruns(uint32_t count) { this->mic_overruns_.fetch_add(count); }
   void add_ring_overruns(uint32_t count) { this->ring_overruns_.fetch_add(count); }
   void add_playback_underruns(uint32_t count) { this->playback_underruns_.fetch_add(count); }
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+  // Spike build only: the speaker the SpikePlayer feeds.
+  void set_spike_speaker(speaker::Speaker *output) { this->spike_speaker_ = output; }
+#endif
 
  protected:
   enum class Kind : uint8_t { Connected, Disconnected, Text, Binary };
@@ -166,7 +179,50 @@ class MistLink : public Component, public mist_core::UplinkSink {
   std::atomic<uint32_t> inbound_dropped_{0};
   std::atomic<uint32_t> outbound_dropped_{0};
   uint32_t last_stats_ms_{0};
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+  speaker::Speaker *spike_speaker_{nullptr};
+  SpikePlayer *spike_player_{nullptr};
+#endif
 };
+
+#ifdef USE_MIST_LINK_SPIKE_PLAYER
+// Spike build only (host step H4): plays the spike listener's tone so G1 can measure the uplink
+// during playback before the room build's player exists. Every `0x01` frame's 24 kHz PCM16 goes,
+// in arrival order, through a 1 s PSRAM FIFO into the reply resampler, mixer and DAC; `0x02`
+// lets the speaker drain and `0x03` stops it. There are no tag rules, fades or ducking; T6's
+// `mist_player` is the room build's player.
+//
+// An underrun is counted, once per dry spell, when a stream is playing, the speaker has held
+// audio since the stream started, and both the FIFO and the speaker are empty.
+class SpikePlayer : public LinkListener {
+ public:
+  static constexpr uint32_t kSampleRate = 24000;
+  static constexpr size_t kFifoBytes = kSampleRate * 2;  // 1 s of PCM16 mono
+
+  SpikePlayer(MistLink *link, speaker::Speaker *output) : link_(link), output_(output) {}
+
+  bool setup();
+  // Runs on the main loop: moves FIFO audio into the speaker and checks for an underrun.
+  void loop();
+  void on_link_frame(const mist_core::Frame &frame) override;
+  void on_link_disconnected() override;
+
+ protected:
+  void stop_stream();
+
+  MistLink *link_;
+  speaker::Speaker *output_;
+  uint8_t *fifo_{nullptr};
+  size_t head_{0};  // next byte to play
+  size_t used_{0};
+  bool streaming_{false};
+  bool finishing_{false};  // `0x02` came; finish the speaker once the FIFO is empty
+  bool primed_{false};
+  bool dry_{false};
+  uint32_t dropped_bytes_{0};
+};
+#endif
 
 }  // namespace mist_link
 }  // namespace esphome

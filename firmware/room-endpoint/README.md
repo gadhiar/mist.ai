@@ -12,8 +12,9 @@ directory, `<private dir>/<device>/`, outside every work tree; the built images 
 
 The spike build measures the device gate G1 against the spike listener, a stand-in for MIST's
 backend on your PC. Its wake is the stock "stop" model (approved for H4 only): a "stop" said with
-nothing playing opens the uplink. It reports `device_stats` every 10 s and keeps an uplink open up
-to 75 s, so 60 s of playback fits in one wake. It needs H3 done: the devices dir, the firewall
+nothing playing opens the uplink. It reports `device_stats` every 10 s, plays the listener's tone
+through a minimal spike-only player (no fades or ducking; the room build's player replaces it),
+and keeps an uplink open up to 75 s, so 60 s of playback fits in one wake. It needs H3 done: the devices dir, the firewall
 rule, and `devices.py add <device>` with your Wi-Fi lines added to its `secrets.yaml`.
 
 Placeholders: `<repo>` is a mist.ai checkout, `<private dir>/<device>` the device's private
