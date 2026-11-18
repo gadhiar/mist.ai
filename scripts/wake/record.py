@@ -13,18 +13,25 @@ PortAudio in its wheel), `numpy` and `scipy`, and run it from the repository roo
     <venv>/Scripts/pip install sounddevice numpy scipy
     <venv>/Scripts/python -m scripts.wake.record devices
 
-`devices` lists the input devices with their index and default rate; pass the headset's index as
-`--device N`, or leave it out to use the system default input.
+Run it in PowerShell or Windows Terminal. Git Bash's terminal does not pass single key presses
+through, so a clip would not stop on Enter.
+
+`devices` lists the input devices with their index, host API and default rate. One headset
+appears once per host API (MME, DirectSound, WASAPI); pass one entry's index as `--device N`, or
+leave it out to use the system default input.
 
 The sitting. `--root` is a directory outside the repository; there is no default, so recordings
 never land in this public repository. Run five blocks, with a short break between them:
 
     python -m scripts.wake.record session --root <dir> --device N
 
-A block is 12 wake prompts and 6 sound-alike sentences, interleaved. Each prompt names the
-phrase and the style (normal, quiet, fast, tired, or a few words of other talk first). Enter
-starts a clip and Enter stops it, at 8 s at most; then Enter keeps it, `r` records it again, `p`
-plays it back and `q` stops the block, keeping the clips already kept. A block stopped before its
+A block is 18 wake prompts and 6 sound-alike sentences, interleaved. Six of the wake prompts are
+the name alone ("mist", "hey mist"): the evaluation measures hit lag on those, since there the
+name is the last speech. Each prompt names the phrase and the style (normal, quiet, fast, tired,
+or, before a sentence, a few words of other talk first). Enter starts a clip and Enter stops it,
+at 8 s at most; a clip whose peak is below -40 dBFS is too quiet (check the headset's mute) and is
+taken again. Then Enter keeps it, `r` records it again, `p` plays it back and `q` stops the
+block, keeping the clips already kept. A block stopped before its
 first keep is offered again; a block stopped later counts as done, and its remaining prompts are
 skipped. After each block a line suggests a change of position for the next.
 
@@ -33,18 +40,25 @@ Optionally, record an hour of ordinary headset use (calls, videos, talk not mean
 
     python -m scripts.wake.record passive --root <dir> --minutes 60 --device N
 
-It writes one file per 10 minutes, each its own session; Ctrl+C closes and keeps the open file.
-`status --root <dir>` shows the blocks done, the clips per label and the passive minutes. Last:
+It writes one file per 10 minutes, each its own session; Ctrl+C closes and keeps the open file. A
+file whose peak is below -40 dBFS is not written: the microphone heard nothing. `passive` may run
+in a second terminal during the blocks. `status --root <dir>` shows the blocks done, the clips per
+label and the passive minutes. Last:
 
     python -m scripts.wake.record finish --root <dir> --seed N
 
-which runs `manifest assign` on the draft into `<dir>/manifest.json` and then `manifest check`,
-printing the seed, each split's shares and each split's counts per label. A draft
-`manifest.py` refuses exits 1, with its message naming the entries at fault.
+which runs `manifest assign` on the draft and `manifest check` on the result, printing the seed,
+each split's shares and each split's counts per label. It writes `<dir>/manifest.json` only when
+the check passes, every split holds positives and `tune` holds the name alone; otherwise it
+writes nothing and exits 1, and another `--seed` may place the blocks differently. When
+`manifest.py` refuses the draft, `finish` exits 1 and the message names the entries at fault.
 
 Files under `--root`: `recordings/<session>/<label>-<nnn>.wav` and `manifest.draft.json`, the
 entries without `split`, rewritten after every kept clip, so a closed terminal loses at most the
-clip in hand (in `passive`, the open file). Block sessions are `<YYYYMMDD>-<HHMM>-b<n>`, passive
+clip in hand (in `passive`, the open file). Each write reads the draft again and adds to it, so a
+`session` and a `passive` in two terminals keep each other's entries. A lock file,
+`manifest.draft.lock`, keeps two writes from interleaving; it is held for milliseconds, so one
+left by a killed process is cleared after 2 s. Block sessions are `<YYYYMMDD>-<HHMM>-b<n>`, passive
 ones `<YYYYMMDD>-<HHMM>-p<n>`.
 
 The recordings are personal audio. No agent listens to, opens, lists or copies them; agents read
@@ -55,14 +69,17 @@ Exit codes: 0 done; 1 an audio or file error, with the message; 2 a refused invo
 """
 
 import argparse
+import array
 import json
 import math
 import os
 import re
 import sys
+import tempfile
 import time
 import wave
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -76,29 +93,35 @@ BLOCKS = 5
 MAX_CLIP_SECONDS = 8
 MIN_CLIP_FRAMES = SAMPLE_RATE // 10
 """A clip shorter than 0.1 s is a missed key press, not a recording; it is taken again."""
+SILENCE_DBFS = -40.0
+"""A peak below this is a muted or unplugged microphone, not a quiet voice."""
+LOCK_STALE_SECONDS = 2.0
+"""The draft lock is held for milliseconds; one older than this was left by a killed process."""
 CHUNK_MINUTES = 10
 PASSIVE_GOAL_MINUTES = 60
 CONDITION = "headset"
 MEDIA_PHRASE = ""
 """`media` holds no prompted sentence; `manifest.py` accepts an empty phrase."""
 DRAFT_NAME = "manifest.draft.json"
+LOCK_NAME = "manifest.draft.lock"
 MANIFEST_NAME = "manifest.json"
 RECORDINGS = "recordings"
+
+NAME_ALONE: tuple[str, ...] = ("mist", "hey mist")
+"""The names said alone, each 3 times a block: `eval_wake.py` measures hit lag on these."""
 
 WAKE_PHRASES: tuple[tuple[str, str], ...] = (
     ("mist, what's up", "mist, how's it going"),
     ("hey mist, what's the time", "hey mist, turn the lights off"),
     ("so, mist, what do you think", "are you there mist"),
 )
-"""Three placements of the name (first, after "hey", mid-sentence); each is said 4 times a block."""
+"""Three placements of the name in a sentence (first, after "hey", mid-sentence); each is said 4
+times a block."""
 
-STYLES: tuple[str, ...] = (
-    "normal",
-    "quiet",
-    "fast",
-    "tired",
-    "other talk first (a few words, up to 4 s, then the phrase)",
-)
+PLAIN_STYLES: tuple[str, ...] = ("normal", "quiet", "fast", "tired")
+LEAD_IN_STYLE = "other talk first (a few words, up to 4 s, then the phrase)"
+STYLES: tuple[str, ...] = (*PLAIN_STYLES, LEAD_IN_STYLE)
+"""The lead-in is for sentences only: before the name alone it would not be the name alone."""
 
 MISSED: tuple[str, ...] = (
     "I missed the bus this morning",
@@ -168,19 +191,21 @@ class Prompt:
 
 
 def block_prompts(block: int) -> tuple[Prompt, ...]:
-    """Block `block`'s 18 prompts: a sound-alike sentence after every two wake prompts.
+    """Block `block`'s 24 prompts: a sound-alike sentence after every three wake prompts.
 
-    The wake prompts cycle the three placements of the name, each placement's two phrases
-    alternating, and the styles rotate by block so a phrase is not always said the same way.
-    Block n takes the n-th three "missed" and three fog sentences, so none repeats.
+    Each run of three wake prompts is the name alone ("mist" and "hey mist" alternating) and two
+    sentences. The sentences cycle the three placements of the name, each placement's two
+    phrases alternating. Styles rotate by block so a phrase is not always said the same way, and
+    the name alone takes only the plain styles. Block n takes the n-th three "missed" and three
+    fog sentences, so none repeats.
     """
     if not 1 <= block <= BLOCKS:
         raise ValueError(f"block must be 1 to {BLOCKS}, got {block}")
     first = 3 * (block - 1)
-    sentences = [
+    homophones = [
         text for pair in zip(MISSED[first : first + 3], FOG[first : first + 3]) for text in pair
     ]
-    wake = [
+    sentences = [
         Prompt(
             "positive",
             WAKE_PHRASES[index % 3][(index // 3) % 2],
@@ -189,11 +214,11 @@ def block_prompts(block: int) -> tuple[Prompt, ...]:
         for index in range(12)
     ]
     prompts: list[Prompt] = []
-    for position in range(18):
-        if position % 3 == 2:
-            prompts.append(Prompt("homophone", sentences[position // 3], "normal"))
-        else:
-            prompts.append(wake[position - position // 3])
+    for run, homophone in enumerate(homophones):
+        style = PLAIN_STYLES[(run + block - 1) % len(PLAIN_STYLES)]
+        prompts.append(Prompt("positive", NAME_ALONE[run % 2], style))
+        prompts.extend(sentences[2 * run : 2 * run + 2])
+        prompts.append(Prompt("homophone", homophone, "normal"))
     return tuple(prompts)
 
 
@@ -206,6 +231,7 @@ class InputDevice:
 
     index: int
     name: str
+    host_api: str
     default_rate: int
 
 
@@ -288,13 +314,19 @@ class SoundDeviceAudio:
         self._sd = sounddevice
 
     def input_devices(self) -> list[InputDevice]:
-        """Every device with an input channel, by PortAudio index."""
+        """Every device with an input channel, by PortAudio index, with its host API's name."""
         try:
             found = self._sd.query_devices()
+            apis = self._sd.query_hostapis()
         except self._sd.PortAudioError as exc:
             raise RecorderError(f"could not list the audio devices: {exc}") from exc
         return [
-            InputDevice(index, str(info["name"]), int(info["default_samplerate"]))
+            InputDevice(
+                index,
+                str(info["name"]),
+                str(apis[info["hostapi"]]["name"]),
+                int(info["default_samplerate"]),
+            )
             for index, info in enumerate(found)
             if info["max_input_channels"] > 0
         ]
@@ -451,6 +483,19 @@ def duration_ms(pcm: bytes) -> int:
     return round(len(pcm) // SAMPLE_WIDTH * 1000 / SAMPLE_RATE)
 
 
+def peak_dbfs(pcm: bytes) -> float:
+    """The loudest sample of mono PCM16 in dB relative to full scale; `-inf` for all zeros.
+
+    Uses the standard library's `array`, so the silence check needs no host package.
+    """
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % SAMPLE_WIDTH])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    peak = max(max(samples), -min(samples)) if samples else 0
+    return 20 * math.log10(peak / 32768) if peak else -math.inf
+
+
 def write_wav(path: Path, pcm: bytes) -> None:
     """Write 16 kHz mono PCM16, never over an existing file, since that would lose a recording."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,15 +534,62 @@ def load_draft(root: Path) -> list[DraftEntry]:
 
 
 def write_draft(root: Path, entries: Sequence[DraftEntry]) -> None:
-    """Replace the draft in one step, so a crash leaves the old draft or the new one."""
+    """Replace the draft in one step, so a crash leaves the old draft or the new one.
+
+    Windows refuses to replace a file another process has open, as `status` briefly does, so
+    a refused replace is tried again for up to a second.
+    """
     payload = {"root": str(root), "entries": [asdict(item) for item in entries]}
     path = root / DRAFT_NAME
     staged = path.with_name(DRAFT_NAME + ".tmp")
     try:
         staged.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(staged, path)
+        for attempt in range(50):
+            try:
+                os.replace(staged, path)
+                return
+            except PermissionError:
+                if attempt == 49:
+                    raise
+                time.sleep(0.02)
     except OSError as exc:
         raise RecorderError(f"could not write {DRAFT_NAME}: {exc}") from exc
+
+
+@contextmanager
+def _draft_lock(root: Path) -> Iterator[None]:
+    """Hold `LOCK_NAME` so two processes' read-and-append writes never interleave.
+
+    The lock is held for one read and one write. A lock still there after
+    `LOCK_STALE_SECONDS` of waiting was left by a killed process, and is cleared.
+    """
+    lock = root / LOCK_NAME
+    deadline = time.monotonic() + LOCK_STALE_SECONDS
+    while True:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except (FileExistsError, PermissionError):
+            # Windows reports a lock being deleted as PermissionError: both mean wait.
+            if time.monotonic() < deadline:
+                time.sleep(0.01)
+                continue
+            lock.unlink(missing_ok=True)
+            deadline = time.monotonic() + LOCK_STALE_SECONDS
+        except OSError as exc:
+            raise RecorderError(f"could not lock {DRAFT_NAME}: {exc}") from exc
+    try:
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def append_to_draft(root: Path, entry: DraftEntry) -> None:
+    """Add one entry to the draft as it is on disk, keeping what another process added."""
+    with _draft_lock(root):
+        entries = load_draft(root)
+        entries.append(entry)
+        write_draft(root, entries)
 
 
 def _numbers(entries: Sequence[DraftEntry], kind: str) -> set[int]:
@@ -510,23 +602,22 @@ def _numbers(entries: Sequence[DraftEntry], kind: str) -> set[int]:
     return found
 
 
-def _keep(root: Path, entries: list[DraftEntry], entry: DraftEntry, pcm: bytes) -> None:
+def _keep(root: Path, entry: DraftEntry, pcm: bytes) -> None:
     """Write the clip, then the draft that lists it, so the draft never names a missing file."""
     write_wav(root / entry.file, pcm)
-    entries.append(entry)
-    write_draft(root, entries)
+    append_to_draft(root, entry)
 
 
 # -- Commands -------------------------------------------------------------------------------------
 
 
 def run_devices(host: Host) -> int:
-    """List the input devices with their index and default rate."""
+    """List the input devices with their index, host API and default rate."""
     devices = host.audio.input_devices()
     if not devices:
         raise RefusedError("no input device")
     for device in devices:
-        print(f"{device.index}: {device.name} ({device.default_rate} Hz)")
+        print(f"{device.index}: {device.name} [{device.host_api}] ({device.default_rate} Hz)")
     return 0
 
 
@@ -543,6 +634,12 @@ def _take(host: Host, prompt: Prompt, header: str, device: int | None, rate: int
         pcm = resample(raw, rate, SAMPLE_RATE)
         if len(pcm) // SAMPLE_WIDTH < MIN_CLIP_FRAMES:
             print("Nothing was recorded; take it again.")
+            continue
+        level = peak_dbfs(pcm)
+        if level < SILENCE_DBFS:
+            print(
+                f"Too quiet (peak {level:.0f} dBFS): check the headset's mute, then take it again."
+            )
             continue
         while True:
             choice = host.keyboard.choose("Enter keeps it, r redo, p play back, q stop the block: ")
@@ -564,8 +661,7 @@ def _take(host: Host, prompt: Prompt, header: str, device: int | None, rate: int
 
 def run_session(host: Host, root: Path, device: int | None, condition: str) -> int:
     """Record the next block; the clips kept stay kept whether or not it is finished."""
-    entries = load_draft(root)
-    block = max(_numbers(entries, "b"), default=0) + 1
+    block = max(_numbers(load_draft(root), "b"), default=0) + 1
     if block > BLOCKS:
         raise RefusedError(f"all {BLOCKS} blocks are recorded; run `passive` or `finish`")
     rate = host.audio.capture_rate(device)
@@ -589,7 +685,7 @@ def run_session(host: Host, root: Path, device: int | None, condition: str) -> i
             session=session,
         )
         root.mkdir(parents=True, exist_ok=True)
-        _keep(root, entries, entry, pcm)
+        _keep(root, entry, pcm)
         kept += 1
     print(f"Block {block}: kept {kept} of {len(prompts)} clips.")
     if kept and block < BLOCKS:
@@ -603,15 +699,22 @@ def run_passive(host: Host, root: Path, minutes: int, device: int | None) -> int
     """Record the microphone in `CHUNK_MINUTES` files, each its own `media` session."""
     if minutes < 1:
         raise RefusedError("--minutes must be at least 1")
-    entries = load_draft(root)
-    number = max(_numbers(entries, "p"), default=0)
+    number = max(_numbers(load_draft(root), "p"), default=0)
     rate = host.audio.capture_rate(device)
     remaining = minutes * 60 * rate
     chunk_frames = CHUNK_MINUTES * 60 * rate
     root.mkdir(parents=True, exist_ok=True)
 
-    def keep_chunk(session: str, blocks: list[bytes]) -> None:
+    def keep_chunk(session: str, blocks: list[bytes]) -> bool:
+        """Write one chunk unless it is silent; whether it was written."""
         pcm = resample(b"".join(blocks), rate, SAMPLE_RATE)
+        level = peak_dbfs(pcm)
+        if level < SILENCE_DBFS:
+            print(
+                f"The microphone heard nothing (peak {level:.0f} dBFS); {session} is not written."
+                " Check the headset's mute."
+            )
+            return False
         entry = DraftEntry(
             file=f"{RECORDINGS}/{session}/media-001.wav",
             label="media",
@@ -620,8 +723,9 @@ def run_passive(host: Host, root: Path, minutes: int, device: int | None) -> int
             duration_ms=duration_ms(pcm),
             session=session,
         )
-        _keep(root, entries, entry, pcm)
+        _keep(root, entry, pcm)
         print(f"Kept {session}: {entry.duration_ms / 60000:.1f} minutes.")
+        return True
 
     stream = host.audio.open_stream(device, rate)
     print(f"Recording {minutes} minutes in {CHUNK_MINUTES}-minute files. Ctrl+C stops early.")
@@ -629,8 +733,8 @@ def run_passive(host: Host, root: Path, minutes: int, device: int | None) -> int
     pending: list[bytes] = []
     try:
         while remaining > 0:
-            number += 1
-            session = f"{host.now():%Y%m%d-%H%M}-p{number}"
+            # A silent chunk is not written, so its number is used by the next one.
+            session = f"{host.now():%Y%m%d-%H%M}-p{number + 1}"
             target = min(chunk_frames, remaining)
             frames = 0
             while frames < target:
@@ -639,7 +743,8 @@ def run_passive(host: Host, root: Path, minutes: int, device: int | None) -> int
                 frames += len(data) // SAMPLE_WIDTH
             blocks, pending = pending, []
             remaining -= frames
-            keep_chunk(session, blocks)
+            if keep_chunk(session, blocks):
+                number += 1
     except KeyboardInterrupt:
         if pending:
             keep_chunk(session, pending)
@@ -665,18 +770,62 @@ def run_status(root: Path) -> int:
     return 0
 
 
+def _unusable(manifest: wake_manifest.RecordingManifest) -> str | None:
+    """Why the assigned manifest cannot train and tune a model, or None when it can.
+
+    Every split needs positives, and `tune` needs the name said alone, because the tune pass
+    takes the model's hit lag from those clips and a model manifest without it is refused.
+    """
+    for split in wake_manifest.SPLITS:
+        if not any(item.label == "positive" for item in manifest.split(split)):
+            return f"the {split} split holds no positives"
+    names = {wake_manifest.phrase_key(name) for name in NAME_ALONE}
+    if not any(
+        item.label == "positive" and wake_manifest.phrase_key(item.phrase) in names
+        for item in manifest.split("tune")
+    ):
+        return "the tune split holds no clip of the name said alone"
+    return None
+
+
 def run_finish(root: Path, seed: int) -> int:
-    """Assign the draft's splits into `manifest.json`, then check it, through `manifest.py`."""
+    """Assign and check the draft's splits, and write `manifest.json` only when it is usable.
+
+    The candidate is written in a scratch directory under `root`, so a refused seed leaves
+    nothing behind.
+    """
     draft = root / DRAFT_NAME
     out = root / MANIFEST_NAME
     if not draft.is_file():
         raise RefusedError(f"no {DRAFT_NAME} under --root; record a block first")
     if out.exists():
         raise RefusedError(f"{MANIFEST_NAME} already exists under --root; finish never replaces it")
-    assign = ["assign", "--manifest", str(draft), "--seed", str(seed), "--out", str(out)]
-    if wake_manifest.main(assign) != 0:
-        return 1
-    return 0 if wake_manifest.main(["check", "--manifest", str(out)]) == 0 else 1
+    with tempfile.TemporaryDirectory(prefix=".finish-", dir=root) as scratch:
+        candidate = Path(scratch) / MANIFEST_NAME
+        assign = ["assign", "--manifest", str(draft), "--seed", str(seed), "--out", str(candidate)]
+        if wake_manifest.main(assign) != 0:
+            return 1
+        if wake_manifest.main(["check", "--manifest", str(candidate)]) != 0:
+            return 1
+        try:
+            problem = _unusable(wake_manifest.load_manifest(candidate))
+        except wake_manifest.ManifestError as exc:
+            raise RecorderError(str(exc)) from exc
+        if problem:
+            print(
+                f"record: {problem} with seed {seed}; {MANIFEST_NAME} is not written."
+                " Run finish again with another seed.",
+                file=sys.stderr,
+            )
+            return 1
+        data = candidate.read_bytes()
+    try:
+        with out.open("xb") as handle:
+            handle.write(data)
+    except FileExistsError as exc:
+        raise RefusedError(f"{MANIFEST_NAME} already exists under --root") from exc
+    print(f"Wrote {MANIFEST_NAME}.")
+    return 0
 
 
 # -- Command line ---------------------------------------------------------------------------------

@@ -50,7 +50,9 @@ class FakeStream:
             raise KeyboardInterrupt
         audio.streamed += frames
         audio.stream_reads += 1
-        return (audio.stream_reads % 30000).to_bytes(2, "little") * frames
+        # Each read holds one distinct constant, loud enough to pass the silence check.
+        level = 0 if audio.silent_stream else 1000 + audio.stream_reads % 20000
+        return level.to_bytes(2, "little") * frames
 
     def close(self) -> None:
         self.closed = True
@@ -67,12 +69,16 @@ class FakeAudio:
         clip_ms: int = 1000,
         interrupt_after_s: int | None = None,
         has_input: bool = True,
+        silent_captures: int = 0,
+        silent_stream: bool = False,
     ) -> None:
         self.rate = rate
         self.opens_16k = opens_16k
         self.clip_ms = clip_ms
         self.interrupt_after_s = interrupt_after_s
         self.has_input = has_input
+        self.silent_captures = silent_captures
+        self.silent_stream = silent_stream
         self.captures: list[bytes] = []
         self.capture_rates: list[int] = []
         self.played: list[tuple[bytes, int]] = []
@@ -84,7 +90,14 @@ class FakeAudio:
     def input_devices(self) -> list[record.InputDevice]:
         if not self.has_input:
             return []
-        return [record.InputDevice(index=3, name="Headset Microphone", default_rate=self.rate)]
+        return [
+            record.InputDevice(
+                index=3,
+                name="Headset Microphone",
+                host_api="Windows WASAPI",
+                default_rate=self.rate,
+            )
+        ]
 
     def capture_rate(self, device: int | None) -> int:
         if not self.has_input:
@@ -96,7 +109,11 @@ class FakeAudio:
             hook()
         frames = rate * self.clip_ms // 1000
         step = len(self.captures) + 1
-        pcm = ((np.arange(frames) * step) % 20000).astype("<i2").tobytes()
+        if step <= self.silent_captures:
+            # A muted headset: low noise, peak 100 (about -50 dBFS).
+            pcm = ((np.arange(frames) * step) % 101).astype("<i2").tobytes()
+        else:
+            pcm = ((np.arange(frames) * step) % 20000).astype("<i2").tobytes()
         self.captures.append(pcm)
         self.capture_rates.append(rate)
         return FakeCapture(pcm)
@@ -176,25 +193,36 @@ def record_blocks(root: Path, count: int, audio: FakeAudio | None = None) -> Fak
     """Record `count` full blocks through one fake microphone, so no two captures match."""
     audio = audio or FakeAudio()
     for _ in range(count):
-        assert run(["session", "--root", str(root)], host(audio, keep(18))) == 0
+        assert run(["session", "--root", str(root)], host(audio, keep(BLOCK))) == 0
     return audio
+
+
+BLOCK = 24
+"""A block's prompts: 18 wake prompts and 6 sound-alike sentences."""
+NAMES = {"mist", "hey mist"}
+"""The phrase keys `eval_wake.py` measures hit lag on: a model name said alone."""
 
 
 # -- session -----------------------------------------------------------------------------------
 
 
-def test_session_writes_eighteen_16k_clips_and_entries_the_manifest_accepts(tmp_path, capsys):
+def test_session_writes_24_16k_clips_and_entries_the_manifest_accepts(tmp_path, capsys):
     root = tmp_path / "wake"
 
-    assert run(["session", "--root", str(root)], host(keys=keep(18))) == 0
+    assert run(["session", "--root", str(root)], host(keys=keep(BLOCK))) == 0
 
     data = draft(root)
     assert data["root"] == str(root.resolve())
     entries = data["entries"]
-    assert len(entries) == 18
-    assert [item["label"] for item in entries].count("positive") == 12
+    assert len(entries) == BLOCK
+    assert [item["label"] for item in entries].count("positive") == 18
     assert [item["label"] for item in entries].count("homophone") == 6
-    assert [item["label"] for item in entries[:6]] == ["positive", "positive", "homophone"] * 2
+    assert [item["label"] for item in entries[:8]] == ["positive"] * 3 + ["homophone"] + [
+        "positive"
+    ] * 3 + ["homophone"]
+    alone = [item for item in entries if wake_manifest.phrase_key(item["phrase"]) in NAMES]
+    assert len(alone) == 6
+    assert all(item["label"] == "positive" for item in alone)
     assert {item["session"] for item in entries} == {"20261117-2105-b1"}
     for position, item in enumerate(entries, 1):
         assert set(item) == {"file", "label", "phrase", "condition", "duration_ms", "session"}
@@ -209,23 +237,89 @@ def test_session_writes_eighteen_16k_clips_and_entries_the_manifest_accepts(tmp_
         json.dumps({"root": data["root"], "entries": [{**e, "split": "train"} for e in entries]}),
         encoding="utf-8",
     )
-    assert len(wake_manifest.load_manifest(checked).split("train")) == 18
+    assert len(wake_manifest.load_manifest(checked).split("train")) == BLOCK
 
     out = capsys.readouterr().out
     first = record.block_prompts(1)[0]
-    assert f'Block 1 of 5, clip 1 of 18. Say: "{first.phrase}". Style: {first.style}' in out
+    assert f'Block 1 of 5, clip 1 of 24. Say: "{first.phrase}". Style: {first.style}' in out
 
 
-def test_block_prompts_rotate_phrasings_and_styles():
+def test_block_prompts_add_the_name_alone_and_rotate_phrasings_and_styles():
+    lead_in = [style for style in record.STYLES if "4 s" in style]
+    assert len(lead_in) == 1
     for block in range(1, 6):
         prompts = record.block_prompts(block)
         wake = [item for item in prompts if item.label == "positive"]
-        assert len(prompts) == 18
-        assert len(wake) == 12
+        assert len(prompts) == BLOCK
+        assert len(wake) == 18
+        alone = [item for item in wake if item.phrase in record.NAME_ALONE]
+        assert sorted(item.phrase for item in alone) == ["hey mist"] * 3 + ["mist"] * 3
+        assert {wake_manifest.phrase_key(phrase) for phrase in record.NAME_ALONE} == NAMES
+        # Other talk before the name would put speech after it: never on a name said alone.
+        assert not any(item.style in lead_in for item in alone)
+        sentences = [item for item in wake if item not in alone]
         for family in record.WAKE_PHRASES:
-            assert sum(item.phrase in family for item in wake) == 4
-        assert {item.style for item in wake} == set(record.STYLES)
-    assert any("4 s" in style for style in record.STYLES)
+            assert sum(item.phrase in family for item in sentences) == 4
+        assert {item.style for item in sentences} == set(record.STYLES)
+        assert len({item.style for item in alone}) > 1
+
+
+def test_a_quiet_clip_is_not_offered_and_is_recorded_again(tmp_path, capsys):
+    root = tmp_path / "wake"
+    audio = FakeAudio(silent_captures=1)
+    # The quiet capture asks no keep question: Enter, Enter, then the retake.
+    keys = ["enter", "enter", *keep(1), "enter", "enter", "q"]
+
+    assert run(["session", "--root", str(root)], host(audio, keys)) == 0
+
+    assert "too quiet" in capsys.readouterr().out.lower()
+    entries = draft(root)["entries"]
+    assert len(entries) == 1
+    with wave.open(str(root / entries[0]["file"]), "rb") as handle:
+        assert handle.readframes(handle.getnframes()) == audio.captures[1]
+
+
+def test_an_entry_another_process_wrote_survives_the_next_keep(tmp_path):
+    root = tmp_path / "wake"
+    audio = FakeAudio()
+    foreign = {
+        "file": "recordings/20261117-2104-p1/media-001.wav",
+        "label": "media",
+        "phrase": "",
+        "condition": "headset",
+        "duration_ms": 60000,
+        "session": "20261117-2104-p1",
+    }
+
+    def passive_in_another_terminal() -> None:
+        if len(audio.captures) == 1:
+            data = draft(root)
+            data["entries"].append(foreign)
+            (root / "manifest.draft.json").write_text(json.dumps(data), encoding="utf-8")
+
+    audio.on_capture.append(passive_in_another_terminal)
+
+    assert (
+        run(["session", "--root", str(root)], host(audio, [*keep(2), "enter", "enter", "q"])) == 0
+    )
+
+    entries = draft(root)["entries"]
+    assert len(entries) == 3
+    assert foreign in entries
+    assert [item["label"] for item in entries if item != foreign] == ["positive", "positive"]
+    assert not (root / record.LOCK_NAME).exists()
+
+
+def test_a_lock_left_by_a_killed_process_is_cleared(tmp_path, monkeypatch):
+    root = tmp_path / "wake"
+    root.mkdir()
+    (root / record.LOCK_NAME).write_text("", encoding="utf-8")
+    monkeypatch.setattr(record, "LOCK_STALE_SECONDS", 0.05)
+
+    assert run(["session", "--root", str(root)], host(keys=[*keep(1), "enter", "enter", "q"])) == 0
+
+    assert len(draft(root)["entries"]) == 1
+    assert not (root / record.LOCK_NAME).exists()
 
 
 def test_redo_replaces_the_clip_in_hand_and_the_draft_is_rewritten_after_each_keep(tmp_path):
@@ -311,7 +405,7 @@ def test_sound_alike_sentences_never_repeat_and_a_sixth_block_is_refused(tmp_pat
     assert run(["session", "--root", str(root)], host(keys=keep(1))) == 2
 
     assert "all 5 blocks are recorded" in capsys.readouterr().err
-    assert len(draft(root)["entries"]) == 90
+    assert len(draft(root)["entries"]) == 5 * BLOCK
 
 
 def test_a_block_stopped_before_its_first_keep_is_offered_again(tmp_path):
@@ -367,6 +461,19 @@ def test_passive_keeps_the_open_chunk_on_interrupt_and_numbers_on(tmp_path):
     assert draft(root)["entries"][-1]["session"].endswith("-p3")
 
 
+def test_a_silent_passive_chunk_is_not_written(tmp_path, capsys):
+    root = tmp_path / "wake"
+
+    assert (
+        run(["passive", "--root", str(root), "--minutes", "1"], host(FakeAudio(silent_stream=True)))
+        == 0
+    )
+
+    assert "heard nothing" in capsys.readouterr().out
+    assert not (root / "manifest.draft.json").exists()
+    assert not list(root.rglob("*.wav"))
+
+
 # -- status and finish -------------------------------------------------------------------------
 
 
@@ -380,7 +487,7 @@ def test_status_counts_blocks_labels_and_passive_minutes(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "blocks: 2 of 5" in out
-    assert "clips: positive 24, homophone 12, media 1" in out
+    assert "clips: positive 36, homophone 12, media 1" in out
     assert "passive: 2.0 of 60 minutes (optional)" in out
     assert "next: block 3" in out
 
@@ -403,12 +510,30 @@ def test_finish_writes_a_manifest_with_positives_in_every_split(tmp_path, capsys
     assert run(["finish", "--root", str(root), "--seed", "7"], host()) == 0
 
     loaded = wake_manifest.load_manifest(root / "manifest.json")
-    assert len(loaded.entries) == 92
+    assert len(loaded.entries) == 5 * BLOCK + 2
     for split in wake_manifest.SPLITS:
         assert any(item.label == "positive" for item in loaded.split(split))
+    assert any(
+        item.label == "positive" and wake_manifest.phrase_key(item.phrase) in NAMES
+        for item in loaded.split("tune")
+    )
     out = capsys.readouterr().out
     assert "seed 7" in out
     assert "train: positive" in out
+
+
+def test_finish_writes_nothing_when_a_split_has_no_positives(tmp_path, capsys):
+    root = tmp_path / "wake"
+    record_blocks(root, 1)
+    before = sorted(path.relative_to(root) for path in root.rglob("*"))
+    capsys.readouterr()
+
+    assert run(["finish", "--root", str(root), "--seed", "1"], host()) == 1
+
+    assert not (root / "manifest.json").exists()
+    assert sorted(path.relative_to(root) for path in root.rglob("*")) == before
+    output = capsys.readouterr()
+    assert "another seed" in output.out + output.err
 
 
 def test_finish_refuses_an_existing_manifest(tmp_path, capsys):
@@ -436,10 +561,10 @@ def test_a_missing_root_exits_2(command):
 # -- devices and refusals ----------------------------------------------------------------------
 
 
-def test_devices_lists_index_and_default_rate(capsys):
+def test_devices_lists_index_host_api_and_default_rate(capsys):
     assert run(["devices"], host(FakeAudio(rate=48000))) == 0
 
-    assert "3: Headset Microphone (48000 Hz)" in capsys.readouterr().out
+    assert "3: Headset Microphone [Windows WASAPI] (48000 Hz)" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -450,6 +575,11 @@ def test_no_input_device_exits_2(tmp_path, argv):
     argv = [str(tmp_path) if item == "ROOT" else item for item in argv]
 
     assert run(argv, host(FakeAudio(has_input=False))) == 2
+
+
+def test_the_guide_names_a_terminal_that_passes_key_presses():
+    assert "PowerShell" in record.__doc__
+    assert "Git Bash" in record.__doc__
 
 
 def test_importing_the_recorder_imports_no_audio_package():
