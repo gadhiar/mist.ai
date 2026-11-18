@@ -308,7 +308,7 @@ async def settle() -> None:
 async def test_models_loaded_is_false_during_the_runtime_build(monkeypatch):
     """The shipped defect: `models_loaded` was true throughout the model load.
 
-    The old field was `voice_processor is not None`, bound before the load, so it
+    The old field was "the voice processor global is set", bound before the load, so it
     reported loaded for that entire window -- true of the assignment, false of
     the system. The flag must not flip until the runtime build has returned, and
     the build runs off the loop, so `/health` answers while it loads.

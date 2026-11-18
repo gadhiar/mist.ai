@@ -24,7 +24,7 @@ tests pinned is pinned here or by T22's realtime tests:
 - turns reach the model when not yielded: here, and
   `TestTypedTurns::test_at_off_with_a_provider_a_typed_question_still_reaches_it`;
 - `interrupt` while yielded: `realtime/test_session.py::TestDispatch`; `reset_vad` is removed (T1);
-- a voice turn past the gate when the engines were released (`GpuYieldedError`):
+- a voice turn past the gate when the engines were released (main's yielded-GPU error):
   `realtime/test_power.py::TestSessionCut::test_a_tts_turn_in_synthesis_is_cut_whole_and_recorded_interrupted`
   and `TestSlots::test_an_empty_slot_refuses_work_with_a_speech_engine_error`;
 - the bridge's `generation_lock`, `latest_user_input` respawn and put-completion ordering: removed

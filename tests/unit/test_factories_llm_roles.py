@@ -170,7 +170,7 @@ class TestBuildConversationHandlerProviderSplit:
         assert handler._provider is not _pipeline_provider(handler)
 
     def test_role_set_injected_base_stays_the_pipelines(self, llm_env):
-        """The live server's path: `voice_processor` injects the base provider."""
+        """The live server's path: `build_mist_runtime` injects the base provider."""
         _set_role(llm_env, model=CONVERSATION_MODEL)
         injected = FakeLLM()
 

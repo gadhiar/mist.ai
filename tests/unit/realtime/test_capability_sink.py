@@ -107,7 +107,7 @@ async def test_a_payload_before_the_registry_is_attached_reaches_nobody_but_sets
 
 
 async def test_emit_from_another_thread_is_routed_on_the_loop_as_one_json_string():
-    """The invariant `QueueEventSink`'s threaded test pinned, on the registry instead."""
+    """An `emit` from any thread is serialised once and routed on the loop's thread."""
     sink, registry = attached()
     loop_thread = threading.get_ident()
 

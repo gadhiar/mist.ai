@@ -180,15 +180,14 @@ Until the tier router lands, two stopgaps serve: `GpuYieldPower` reads `full` wh
 is `normal` and `off` while it is `yielded` or `resume_failed`, so nothing sets `low` yet; and
 `SingleModelTiers` serves both tiers from today's one model, and none at `off`.
 
-While gaming mode is `yielded` or `resume_failed`, the WebSocket refuses spoken messages, because
-Whisper is released. With a host, a typed message goes to
+While the level is `off`, every realtime session applies the server's `PowerGate`
+(`backend/realtime/power.py`). A `voice_start` is refused with `power_off` unless spoken commands
+at `off` are allowed and both speech engines are on the CPU. A typed message goes to
 `ConversationHandler.handle_capability_only`, which runs only `pre_llm` and calls no model: a
-message it handles is answered as a normal text turn, and any other gets the gate's refusal,
-the yielded message while `yielded` and the resume-failed message while `resume_failed`. Any
-payload `pre_llm` drained for an unhandled message, such as the `action_resolved` of a proposal
-the message superseded, is put on the broadcast queue for every client before that refusal is
-sent (`VoiceProcessor._process_conversation_turn`). With no host (capabilities disabled), every
-typed message gets the same refusal (`backend/server.py`, the `audio` and `text` gate).
+message it handles is answered as a normal text turn, and any other gets the events `pre_llm`
+drained for it, such as the `action_resolved` of a proposal the message superseded, and then the
+gate's refusal. The refusal is the yielded message while gaming mode is `yielded`, and names the
+missing model otherwise (`tests/unit/realtime/test_session_power.py`).
 
 ## The usage view
 

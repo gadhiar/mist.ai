@@ -21,15 +21,11 @@ tests drive the endpoint with.
 from __future__ import annotations
 
 import asyncio
-import threading
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
 
-from backend.chat.knowledge_integration import KnowledgeIntegration
-from backend.chat.stream_events import Complete, Token
 from backend.realtime.budget import BargeInConfig, VoiceSettings
 from backend.realtime.power import PowerGate
 from backend.realtime.registry import LogGate, SessionRegistry
@@ -346,101 +342,3 @@ class TestSessionIdReachesHandler:
             first.handshake_session_id,
             second.handshake_session_id,
         ], "connections collapsed into a shared session"
-
-
-# -- The threaded bridge's context var (deleted with the bridge) ------------------------------
-
-
-class StreamingHandler:
-    """The handler end of `KnowledgeIntegration`'s threaded bridge: records each session id."""
-
-    def __init__(self) -> None:
-        self.session_ids: list[str] = []
-        self._lock = threading.Lock()
-
-    async def handle_message_streaming(
-        self, user_message: str, session_id: str
-    ) -> AsyncIterator[Token | Complete]:
-        with self._lock:
-            self.session_ids.append(session_id)
-        yield Token(text="ok")
-        yield Complete(final_response="ok")
-
-
-def build_knowledge_integration(handler: StreamingHandler) -> KnowledgeIntegration:
-    """A `KnowledgeIntegration` whose real methods run against a fake handler.
-
-    `__init__` builds a live ConversationHandler, so it is bypassed.
-    """
-    ki = object.__new__(KnowledgeIntegration)
-    ki.enabled = True
-    ki.conversation_handler = handler
-    return ki
-
-
-class TestConcurrentSessionsDoNotClobber:
-    def test_two_concurrent_turns_each_keep_their_own_session(self):
-        """Both turns set their session id before either reads it; each reads its own."""
-        handler = StreamingHandler()
-        ki = build_knowledge_integration(handler)
-
-        loop = asyncio.new_event_loop()
-        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
-        loop_thread.start()
-
-        barrier = threading.Barrier(2, timeout=10.0)
-        observed: dict[str, str] = {}
-        errors: list[BaseException] = []
-
-        def turn(session_id: str) -> None:
-            try:
-                current_session_id.set(session_id)
-                barrier.wait()
-                list(ki.generate_response_streaming("hi", event_loop=loop))
-                observed[session_id] = current_session_id.get()
-            except BaseException as exc:  # noqa: BLE001 -- re-raised in assert
-                errors.append(exc)
-
-        threads = [
-            threading.Thread(target=turn, args=("session-alpha",)),
-            threading.Thread(target=turn, args=("session-beta",)),
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=20.0)
-
-        loop.call_soon_threadsafe(loop.stop)
-        loop_thread.join(timeout=5.0)
-
-        assert not errors, f"worker thread raised: {errors}"
-        assert observed == {"session-alpha": "session-alpha", "session-beta": "session-beta"}
-        assert sorted(handler.session_ids) == ["session-alpha", "session-beta"]
-
-
-class TestMissingSessionIdIsFatal:
-    def test_raises_when_no_session_id_is_available(self):
-        ki = build_knowledge_integration(StreamingHandler())
-        current_session_id.set(None)
-
-        with pytest.raises(ValueError, match="No session id for this turn"):
-            list(ki.generate_response_streaming("hi", event_loop=None))
-
-    def test_does_not_reach_handler_when_session_id_is_missing(self):
-        handler = StreamingHandler()
-        ki = build_knowledge_integration(handler)
-        current_session_id.set(None)
-
-        with pytest.raises(ValueError):
-            list(ki.generate_response_streaming("hi", event_loop=None))
-
-        assert handler.session_ids == []
-
-    def test_explicit_argument_overrides_the_context_var(self):
-        handler = StreamingHandler()
-        ki = build_knowledge_integration(handler)
-        current_session_id.set("ambient-session")
-
-        list(ki.generate_response_streaming("hi", session_id="explicit-session", event_loop=None))
-
-        assert handler.session_ids == ["explicit-session"]

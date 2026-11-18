@@ -829,14 +829,15 @@ def build_conversation_handler(
     role's, so a smaller conversation model on its own server never moves
     extraction. With the role unset the handler gets the base object itself,
     so both hold one provider, as before roles existed. Curation takes the
-    base from `voice_processor._llm_provider`, not from the handler
+    base from `MistRuntime.llm_provider`, not from the handler
     (`backend/server.py::_resolve_curation_dependencies`).
 
     Args:
         config: Knowledge subsystem configuration.
         llm_provider: Optional pre-built base LLM provider, for the
             extraction pipeline and, with no conversation role set, the
-            handler. The live server injects one built by `VoiceProcessor`.
+            handler. The live server injects the one `lifespan` builds, through
+            `build_mist_runtime`.
         vault_writer: Optional pre-built VaultWriter. When None, one is
             constructed from config. Pass an explicit None-equivalent by
             disabling config.vault.enabled.
@@ -862,8 +863,8 @@ def build_conversation_handler(
             spawning in-process extraction. The dispatcher is NOT started; the
             caller owns `start()`/`stop()`. Default False keeps every existing
             caller (admin scripts, benches) on the in-process path. The server
-            does not use this flag: its handler is built inside the
-            VoiceProcessor chain, so `backend/server.py` attaches one after the
+            does not use this flag: its handler is built inside
+            `build_mist_runtime`, so `backend/server.py` attaches one after the
             fact via `ConversationHandler.attach_extraction_dispatcher`.
         conversation_llm_provider: Optional pre-built provider for the
             handler alone. When None, the handler gets
@@ -961,7 +962,7 @@ def build_conversation_handler(
     # Cluster 8 Phase 5: vault_writer is caller-provided (or None). Auto-build
     # removed to avoid two writers racing on the same vault root -- the
     # server lifespan owns the single VaultWriter and plumbs it through
-    # VoiceProcessor -> ModelManager -> KnowledgeIntegration -> here. Unit
+    # `build_mist_runtime` -> here. Unit
     # tests that want wiring coverage pass an explicit writer or None.
     handler = ConversationHandler(
         config=config,
@@ -1870,10 +1871,10 @@ def build_mist_runtime(
 ) -> "MistRuntime":
     """Compose what every realtime session shares: responder, speech engines, lanes, settings.
 
-    The handler is built as `KnowledgeIntegration` builds it. Only a `MistError` from that build
-    (Neo4j unreachable raises `Neo4jConnectionError`) degrades to `DirectResponder`; any other
-    exception is a bug and fails startup with its traceback. The LLM is warmed unless the GPU is
-    yielded at boot, and the embedding model always, as `ModelManager.load_all_models` did.
+    The handler is built by `handler_factory` (`build_conversation_handler`). Only a `MistError`
+    from that build (Neo4j unreachable raises `Neo4jConnectionError`) degrades to
+    `DirectResponder`; any other exception is a bug and fails startup with its traceback. The LLM
+    is warmed unless the GPU is yielded at boot, and the embedding model always.
 
     `llm_provider` is the base provider: the handler build gives it to the extraction pipeline
     and, by T39's rule, the conversation role's provider to the handler. `MistRuntime.llm_provider`
