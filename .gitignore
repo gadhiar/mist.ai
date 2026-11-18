@@ -90,6 +90,11 @@ target.json
 *.zip
 *.7z
 
+# Host-tier speech fixtures (scripts/voice_fixtures/generate_fixtures.py): audio
+# spoken in a private voice identity, and the manifest that describes it. The
+# audio rules above cover the WAVs, not the manifest.
+tests/fixtures/voice/generated/
+
 # Cluster 8 vault layer (ADR-010) -- runtime artifacts.
 data/vault_sidecar.db
 data/vault_sidecar.db-shm
