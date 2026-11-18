@@ -58,10 +58,6 @@ NO_MODEL_MESSAGE = (
     "MIST's language model is not available right now, so she can only take commands."
 )
 
-CapabilityOnly = Callable[[str, str], Awaitable["CapabilityOnlyTurn | None"]]
-"""`ConversationHandler.handle_capability_only(text, session_id)`, injected until T52 adds it to
-the responder."""
-
 
 def gpu_yield_refusal(gpu_state: Callable[[], str]) -> Callable[[], str]:
     """The refusal text by gaming mode's state: the yield's message while it is `yielded`.
@@ -143,21 +139,18 @@ class PowerGatedResponder:
     runs, because that path acts on the world. Such a turn records nothing at commit: the
     handler committed a handled one, and an unhandled one is not recorded (its contract).
 
+    The capability-only path is the inner responder's port (T52): it never reaches the model,
+    so it is passed through at every level, and a stop word while an alarm rings reaches it
+    with or without a provider.
+
     Args:
-        inner: The model path.
+        inner: The model path, and the capability-only path behind its port.
         gate: The power gate.
-        capability_only: The capability-only path; None refuses every message without a model.
     """
 
-    def __init__(
-        self,
-        inner: TurnResponder,
-        gate: PowerGate,
-        capability_only: CapabilityOnly | None = None,
-    ) -> None:
+    def __init__(self, inner: TurnResponder, gate: PowerGate) -> None:
         self._inner = inner
         self._gate = gate
-        self._capability_only = capability_only
 
     def open_turn(self, request: TurnRequest) -> TurnScope:
         """Open on the model path while the tier has a provider, else on the capability path."""
@@ -178,9 +171,7 @@ class PowerGatedResponder:
         request = scope.request
         assert request is not None  # noqa: S101 - `open_turn` sets it
         await scope.dispatch_gate.wait()
-        result = None
-        if self._capability_only is not None:
-            result = await self._capability_only(request.user_text, request.session_id)
+        result = await self._inner.handle_capability_only(request.user_text, request.session_id)
         if result is not None and result.handled:
             for event in result.events:
                 if isinstance(event, Token):
@@ -209,6 +200,10 @@ class PowerGatedResponder:
         """Forward the hint only while a model can use it."""
         if self._gate.model_available():
             self._inner.prefetch(session_id, partial_text)
+
+    async def handle_capability_only(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
+        """The inner responder's capability-only path, at any level; it never reaches the model."""
+        return await self._inner.handle_capability_only(text, session_id)
 
 
 # -- Engine slots --------------------------------------------------------------------------------

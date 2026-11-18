@@ -10,6 +10,7 @@ responder that would reach the model fails if anything calls it.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
@@ -49,6 +50,7 @@ from .turn_fakes import (
     FakeResponder,
     IdCounter,
     InlineLane,
+    Pause,
     floor_placement,
     settle,
 )
@@ -58,6 +60,8 @@ def voice_start() -> dict[str, object]:
     """A `voice_start` the rig's engines serve: no server spotter is loaded."""
     return _voice_start(spotter="endpoint")
 
+
+TURN_LOGGER = "backend.realtime.turn"
 
 PROVIDER = object()
 """The interaction tier's provider; the gate only asks whether one exists."""
@@ -86,7 +90,19 @@ class Level:
 
 
 class FailingResponder:
-    """The model path: any call means a turn reached a provider that is not there."""
+    """The model path fails if called; its capability-only port answers from `capability`.
+
+    Any model call means a turn reached a provider that is not there. With no `capability`, the
+    port answers None, as a responder with no capability host attached does.
+    """
+
+    def __init__(self, capability: FakeCapabilityOnly | None = None) -> None:
+        self.capability = capability
+
+    async def handle_capability_only(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
+        if self.capability is None:
+            return None
+        return await self.capability(text, session_id)
 
     def open_turn(self, request: TurnRequest) -> TurnScope:
         raise AssertionError("open_turn reached the model path")
@@ -135,7 +151,6 @@ class PowerRig:
         power: object,
         tiers: object,
         refusal: object = lambda: NO_MODEL_MESSAGE,
-        capability_only: FakeCapabilityOnly | None = None,
         spoken_commands_at_off: bool = True,
         statuses: EngineStatuses = ON_CPU,
         responder: object | None = None,
@@ -185,7 +200,6 @@ class PowerRig:
             ingress_factory=self._ingress,
             controller_factory=self._controller,
             power_gate=self.gate,
-            capability_only=capability_only,
             **extra,  # type: ignore[arg-type]
         )
         self.session = RealtimeSession(
@@ -330,17 +344,14 @@ class TestPowerGate:
 @pytest.mark.asyncio
 class TestTypedTurns:
     async def test_at_off_with_a_provider_a_typed_question_still_reaches_it(self):
-        capability = FakeCapabilityOnly(HANDLED)
         rig = await PowerRig(
-            power=FixedPower("off"),
-            tiers=FixedTiers({"interaction": PROVIDER}),
-            capability_only=capability,
+            power=FixedPower("off"), tiers=FixedTiers({"interaction": PROVIDER})
         ).start()
 
         await rig.send({"type": "text", "text": "what is a quasar"})
 
         assert [r.user_text for r in rig.responder.requests] == ["what is a quasar"]
-        assert capability.calls == []
+        assert rig.responder.capability_calls == []
         assert "stream_complete" in rig.names()
 
     async def test_at_full_with_no_provider_a_typed_question_gets_the_refusal(self):
@@ -358,9 +369,7 @@ class TestTypedTurns:
 
     async def test_a_typed_message_goes_to_the_capability_only_path(self):
         capability = FakeCapabilityOnly(HANDLED)
-        rig = await PowerRig(
-            **no_model(), capability_only=capability, responder=FailingResponder()
-        ).start()
+        rig = await PowerRig(**no_model(), responder=FailingResponder(capability)).start()
 
         await rig.send({"type": "text", "text": "lights on"})
 
@@ -374,9 +383,7 @@ class TestTypedTurns:
 
     async def test_an_unhandled_message_gets_its_drained_events_then_the_refusal(self):
         capability = FakeCapabilityOnly(UNHANDLED)
-        rig = await PowerRig(
-            **no_model(), capability_only=capability, responder=FailingResponder()
-        ).start()
+        rig = await PowerRig(**no_model(), responder=FailingResponder(capability)).start()
 
         await rig.send({"type": "text", "text": "write me a poem"})
 
@@ -455,9 +462,7 @@ class TestVoiceAtOff:
 
     async def test_a_final_transcript_goes_to_capability_only_and_is_spoken(self):
         capability = FakeCapabilityOnly(HANDLED)
-        rig = await PowerRig(
-            **no_model(), capability_only=capability, responder=FailingResponder()
-        ).start()
+        rig = await PowerRig(**no_model(), responder=FailingResponder(capability)).start()
         await rig.send(voice_start())
 
         await rig.utterance("lights on")
@@ -470,9 +475,7 @@ class TestVoiceAtOff:
 
     async def test_an_unhandled_utterance_gets_the_envelope_and_its_text_is_spoken(self):
         capability = FakeCapabilityOnly(UNHANDLED)
-        rig = await PowerRig(
-            **no_model(), capability_only=capability, responder=FailingResponder()
-        ).start()
+        rig = await PowerRig(**no_model(), responder=FailingResponder(capability)).start()
         await rig.send(voice_start())
 
         await rig.utterance("write me a poem")
@@ -620,5 +623,68 @@ class TestServices:
         )
 
         assert services.power_gate is None
-        assert services.capability_only is None
         assert services.alarm_ringing() is False
+        assert not hasattr(services, "capability_only")  # the responder's port carries it
+
+
+class HeldCapability(FakeCapabilityOnly):
+    """The capability-only path whose first call waits, so its reply is still being formed."""
+
+    def __init__(self) -> None:
+        super().__init__(None)
+        self.first = asyncio.Event()
+
+    async def __call__(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
+        self.calls.append((text, session_id))
+        if len(self.calls) == 1:
+            await self.first.wait()
+        return None
+
+
+async def say(rig: PowerRig, text: str) -> None:
+    uid = rig.ids()
+    rig.ingress.emit(rig.ingress.started(uid))
+    rig.ingress.emit(rig.ingress.ended(uid, text))
+    await settle()
+
+
+@pytest.mark.asyncio
+class TestAlarmStop:
+    async def test_stop_while_ringing_reaches_the_inner_port_with_the_tier_available(self, caplog):
+        responder = FakeResponder([Token("Hello there. "), Pause()])
+        rig = await PowerRig(
+            power=FixedPower("full"),
+            tiers=FixedTiers({"interaction": PROVIDER}),
+            responder=responder,
+            alarm_ringing=lambda: True,
+        ).start()
+        await rig.send(voice_start())
+        await say(rig, "tell me a story")
+        assert rig.controller.phase in ("thinking", "speaking")
+
+        with caplog.at_level(logging.ERROR, logger=TURN_LOGGER):
+            await say(rig, "stop")
+
+        assert responder.capability_calls == [("stop", "s1")]
+        assert [b["reason"] for b in rig.of("voice_decision:barge_in")] == ["keyword"]
+        assert "capability-only path failed" not in caplog.text
+        assert rig.task is not None and not rig.task.done()
+
+    async def test_stop_while_ringing_reaches_the_inner_port_with_the_tier_unavailable(
+        self, caplog
+    ):
+        capability = HeldCapability()
+        rig = await PowerRig(
+            **no_model(), responder=FailingResponder(capability), alarm_ringing=lambda: True
+        ).start()
+        await rig.send(voice_start())
+        await say(rig, "lights on")
+        assert rig.controller.phase in ("thinking", "speaking")
+
+        with caplog.at_level(logging.ERROR, logger=TURN_LOGGER):
+            await say(rig, "stop")
+
+        assert capability.calls == [("lights on", "s1"), ("stop", "s1")]
+        assert [b["reason"] for b in rig.of("voice_decision:barge_in")] == ["keyword"]
+        assert "capability-only path failed" not in caplog.text
+        assert rig.task is not None and not rig.task.done()
