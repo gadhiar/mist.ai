@@ -78,7 +78,9 @@ class SessionRegistry:
     ) -> RealtimeSession:
         """Build a session for an accepted socket and register it; the caller awaits `run`.
 
-        `endpoint` is `desktop` or a room device's name; `endpoint_kind` defaults to it.
+        `endpoint` is `desktop` or a room device's name. `endpoint_kind` defaults to `desktop`
+        for the `desktop` endpoint and to `room` for any other, whose session accepts only the
+        device's message types (`ROOM_CLIENT_MESSAGE_TYPES`).
         """
         session = RealtimeSession(
             session_id=session_id,

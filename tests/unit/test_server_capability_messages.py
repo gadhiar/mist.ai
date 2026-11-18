@@ -8,7 +8,8 @@ the fakes of `tests/unit/test_session_id_propagation.py`. The capability host is
 The containment rule these pin: no capability exception may reach the session. A failing
 capability call is answered on its connection and the session goes on to the next message; a
 `log_config` later in the same script, answered with its `log_config_ack`, is the witness that
-the session survived.
+the session survived. A device session refuses `log_config`, so its witness is a type it
+refuses, answered with the refusal's protocol error.
 
 The session validates each message against the wire contract (`backend/realtime/protocol.py`)
 before it reaches the server, so a malformed capability message is a `protocol` error from the
@@ -752,6 +753,15 @@ class TestNoHost:
 # -- Which endpoint an alarm message came from ------------------------------------------------
 
 DEVICE = "example-room"
+# A room session answers a type the device does not send with a protocol error, and goes on.
+ROOM_WITNESS = {"type": "voice_stop"}
+ROOM_WITNESS_ANSWER = {
+    "type": "error",
+    "kind": "protocol",
+    "message": "voice_stop is not accepted from a room endpoint",
+    "retriable": False,
+    "context": {"field": "type"},
+}
 
 
 async def _device_connection() -> Connection:
@@ -770,25 +780,29 @@ class TestEndpointAttribution:
         install_runtime(monkeypatch, DecidingHandler())
         device = await _device_connection()
 
-        await device.send(_alarm_action(request_id="req-1"), WITNESS)
+        await device.send(_alarm_action(request_id="req-1"), ROOM_WITNESS)
         await device.leave()
 
         assert rig.control.acts == [("a-ringing", "stop", None, DEVICE)]
         frames = _without_snapshot(_after_handshake(device.ws))
-        assert [f["type"] for f in frames] == ["alarm_action_result", "log_config_ack"]
+        assert [f["type"] for f in frames] == ["alarm_action_result", "error"]
         assert frames[0]["outcome"] == "ok"
+        assert frames[1] == ROOM_WITNESS_ANSWER
 
     @pytest.mark.asyncio
     async def test_an_alarm_report_from_a_device_session_names_the_device(self, monkeypatch, rig):
         install_runtime(monkeypatch, DecidingHandler())
         device = await _device_connection()
 
-        await device.send(_alarm_report(request_id="rep-1"), WITNESS)
+        await device.send(_alarm_report(request_id="rep-1"), ROOM_WITNESS)
         await device.leave()
 
         assert rig.control.reports == [
             {"alarm_id": "a-ringing", "endpoint": DEVICE, "outcome": "rang"}
         ]
+        frames = _without_snapshot(_after_handshake(device.ws))
+        assert [f["type"] for f in frames] == ["alarm_action_result", "error"]
+        assert frames[1] == ROOM_WITNESS_ANSWER
 
     @pytest.mark.asyncio
     async def test_a_ws_session_beside_a_device_still_names_desktop(self, monkeypatch, rig):

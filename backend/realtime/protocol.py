@@ -1249,6 +1249,24 @@ def _type_tags(union: object, field: str) -> frozenset[str]:
 
 
 CLIENT_MESSAGE_TYPES = _type_tags(ClientMessage, "type")
+# What a `room` session accepts: the text types the room device sends, and no other. A device
+# token may wake MIST, speak a turn and answer an alarm, but not type a turn, read or gate the
+# log stream, or decide a proposal. `tests/unit/firmware/test_core.py` ties the set to the
+# types the firmware's contract driver sends, so a new device message fails there until it is
+# allowed here.
+ROOM_CLIENT_MESSAGE_TYPES = frozenset(
+    {
+        "voice_start",
+        "wake",
+        "barge_in",
+        "mute",
+        "interrupt",
+        "playback_progress",
+        "playback_done",
+        "alarm_action",
+        "alarm_report",
+    }
+)
 SERVER_MESSAGE_TYPES = _type_tags(ServerMessage, "type")
 VOICE_DECISION_KINDS = _type_tags(VoiceDecisionMessage, "kind")
 
