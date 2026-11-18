@@ -1160,7 +1160,7 @@
       "field": "backlog_ms"
     },
     {
-      "name": "voice_decision wake_rejected: reason outside the five",
+      "name": "voice_decision wake_rejected: reason outside the four",
       "direction": "server_to_client",
       "json": {
         "type": "voice_decision",
@@ -1169,7 +1169,7 @@
         "reason": "too_quiet",
         "detail": {"source": "server", "score": 0.6, "reference_score": null}
       },
-      "rule": "wake_rejected reasons: self_speech, self_media, not_addressed, lost_arbitration, no_backlog",
+      "rule": "wake_rejected reasons: self_speech, self_media, not_addressed, no_backlog",
       "field": "reason"
     },
     {

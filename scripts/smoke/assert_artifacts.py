@@ -47,7 +47,7 @@ Two streams, with different levels, and the smoke stack keeps neither:
   `Session note written for %s at %s` (`conversation_handler.py:1970`) and
   `Session %s below synthesis threshold` (`:1962`).
 
-`docker-compose.live-path-smoke.yml:324-330` deliberately bind-mounts no
+`docker-compose.live-path-smoke.yml:333-342` deliberately bind-mounts no
 `/app/logs`, so the file log lives in the container's writable layer and dies
 with the container. The Phase 2 `--force-recreate` replaces that container --
 so the Phase 1 log, which is where A1, A2 and A3's evidence is, must be
@@ -244,7 +244,7 @@ def parse_transcript(text: str) -> TranscriptFacts:
             # `closed` means CLEANLY closed. drive_turns.py records the note
             # even when the close itself raised, carrying `close_error`; A3
             # reads this field as evidence that the server's disconnect
-            # `finally` (backend/server.py:1008-1017) was reached in good
+            # `finally` (`websocket_endpoint`, backend/server.py) was reached in good
             # order, which a failed close does not establish.
             closed = not record.get("close_error")
         elif kind == "summary":
@@ -361,7 +361,7 @@ def adjudicate_a1(
     (`backend/chat/conversation_handler.py:2874`), which has zero production
     callers -- documented at `backend/server.py:262-265`. The WebSocket
     disconnect path calls `end_session` on the HANDLER
-    (`backend/server.py:1015`), which writes the vault note and never touches
+    (`_end_handler_session`, `backend/server.py`), which writes the vault note and never touches
     `ended_at`. So `ended_at` stays NULL after a perfectly normal disconnect,
     and asserting on it would fail for a reason unrelated to the pipeline.
 
@@ -446,8 +446,9 @@ def adjudicate_a1(
                     "at :2306-2307. Start there -- check whether the smoke backend built "
                     "an event store at all, and whether ENABLE_KNOWLEDGE_INTEGRATION "
                     "was true (docker-compose.live-path-smoke.yml:256; with knowledge "
-                    "off, backend/voice_models/model_manager.py:501-530 takes a path "
-                    "that never calls _record_turn_event).",
+                    "off, build_mist_runtime answers every turn with DirectResponder, "
+                    "backend/realtime/degraded.py, which never calls "
+                    "_record_turn_event).",
                 ]
             ),
         )
@@ -605,7 +606,7 @@ def adjudicate_a2(
                 + [
                     "Capture the Phase 1 log and re-run this assertion. If the smoke "
                     "backend was already recreated for Phase 2, that log is gone with "
-                    "its container (docker-compose.live-path-smoke.yml:324-330 mounts "
+                    "its container (docker-compose.live-path-smoke.yml:333-342 mounts"
                     "no /app/logs) and this stays INCONCLUSIVE for this run."
                 ]
             ),
@@ -790,8 +791,8 @@ def adjudicate_a3(
             tuple(
                 evidence
                 + [
-                    "The note is written from the WebSocket `finally` at "
-                    "backend/server.py:1008-1017. Without a recorded close there is no "
+                    "The note is written from websocket_endpoint's `finally` "
+                    "(backend/server.py). Without a recorded close there is no "
                     "evidence that block was reached."
                 ]
             ),
@@ -816,12 +817,12 @@ def adjudicate_a3(
         tuple(
             evidence
             + [
-                "Path that should have produced it: backend/server.py:1015 calls "
-                "ConversationHandler.end_session "
-                "(backend/chat/conversation_handler.py:1885), which drains extraction "
-                "tasks (:1920), synthesizes (:1960) and writes via "
-                "VaultWriter.write_session_note (:1965). A write failure there is "
-                "swallowed per Invariant 6 but logged as a WARNING at :1972 -- grep for "
+                "Path that should have produced it: _end_handler_session "
+                "(backend/server.py) calls ConversationHandler.end_session "
+                "(backend/chat/conversation_handler.py:3394), which drains extraction "
+                "tasks (_drain_extraction_tasks) and renders the note via "
+                "VaultWriter.write_session_note. A write failure there is "
+                "swallowed per Invariant 6 but logged as a WARNING -- grep for "
                 "'Session note write failed'.",
                 "expected location: smoke-state/vault/sessions/YYYY-MM-DD-<slug>.md "
                 "(backend/vault/writer.py:538), slug derived from the FIRST utterance "
@@ -926,7 +927,7 @@ def adjudicate_a4(
                         "MIST_CURATION_SCHEDULER_ENABLED off (scheduler.py:271-273). "
                         "The compose file sets MIST_CURATION_SCHEDULER_ENABLED from "
                         "${MIST_SMOKE_SCHEDULER:-0} "
-                        "(docker-compose.live-path-smoke.yml:321), so Phase 2 must be "
+                        "(docker-compose.live-path-smoke.yml:331), so Phase 2 must be "
                         "run with MIST_SMOKE_SCHEDULER=1.",
                     ]
                 ),

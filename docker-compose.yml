@@ -51,8 +51,9 @@ services:
       # directory from this var, defaulting to repo-relative logs/ when
       # unset. The container needs the bind-mounted /app/logs explicitly.
       - MIST_LOG_DIR=/app/logs
+      # Spoken replies; the speech engines themselves come from the MIST_VOICE_* settings in
+      # .env (backend/realtime/budget.py).
       - TTS_ENABLED=${TTS_ENABLED:-true}
-      - TTS_ENGINE=${TTS_ENGINE:-chatterbox}
       - VOICE_PROFILE=${VOICE_PROFILE:-mist}
       - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
       # Capabilities: the alarm, timer and action-log database and the Spotify
@@ -81,6 +82,13 @@ services:
       # AFTER confirming the new ones populate successfully.
       - mist-hf-cache:/home/appuser/.cache/huggingface
       - mist-torch-cache:/home/appuser/.cache/torch
+      # The speech weights, beside the llama-server weights: mist-llm's mount.
+      - ${MODELS_DIR:-./models}:/models:ro
+      # Her voice identities, from a directory outside the checkout so that no reference clip
+      # can be committed; VOICE_IDENTITY_DIR moves it.
+      - ${VOICE_IDENTITY_DIR:-../mist-voice/voices}:/voices:ro
+      # Engine files built from those identities, rebuilt where missing.
+      - mist-voice-cache:/voice-cache
     depends_on:
       mist-neo4j:
         condition: service_healthy
@@ -217,3 +225,5 @@ volumes:
   mist-neo4j-logs:
   mist-hf-cache:
   mist-torch-cache:
+  mist-voice-cache:
+    name: mist-voice-cache

@@ -120,7 +120,7 @@ class SentenceBoundaryDetector:
         return []
 
     def feed_segments(self, token: str) -> list[str]:
-        """Feed a token, return complete raw segments (0 or more).
+        r"""Feed a token, return complete raw segments (0 or more).
 
         Same boundaries as `feed`, but nothing is stripped or re-joined: each
         segment is the exact slice of the input it covers, including the
@@ -131,9 +131,11 @@ class SentenceBoundaryDetector:
         the fed input exactly, so a caller that must preserve formatting
         (paragraph breaks, list lines) can recover it.
 
-        `feed` is left untouched because the voice TTS path
-        (`backend/voice_processor.py`) consumes its stripped sentences. Do
-        not mix `feed` and `feed_segments` on one detector instance: `feed`
+        `feed` keeps its stripped-sentence contract for its tests; no
+        production code calls it (`grep -rn "\.feed(" backend` finds only
+        the speech segmenter's and the Nemotron engine's own `feed`), and both the speech
+        segmenter (`backend/realtime/segmenter.py`) and the conversation
+        handler use `feed_segments`. Do not mix `feed` and `feed_segments` on one detector instance: `feed`
         discards leading whitespace from the buffer.
 
         Args:

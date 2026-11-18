@@ -13,20 +13,29 @@ handling of wake verdicts (v9 :153-163, :296-300), with `FakeWakeArbiter` standi
 arbitration. T11e part 2 runs the arbitration bullets (v5 :1709-1722) through two controllers
 that share one real `WakeArbiter`.
 
+T55c (A51) amends v5's `thinking` cell: a name accepted while a model turn is `thinking` with none
+of its audio queued supersedes the turn instead of barging in. T55d keeps a superseded turn that
+dispatched no tool and joins its request text to the next turn's, or records it alone where the
+superseding utterance starts no turn.
+
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 
 import pytest
 import pytest_asyncio
 
-from backend.chat.stream_events import HandOff, Token
+from backend.chat.conversation_handler import CapabilityOnlyTurn
+from backend.chat.stream_events import Complete, HandOff, Token
 from backend.realtime.budget import BargeInConfig, WakeConfig
+from backend.realtime.protocol import VoiceDecisionWakeLost, WakeLostDetail
 from backend.realtime.scene import Immediate
 from backend.realtime.speech import SpotterCalibration
 from backend.realtime.turn import (
@@ -48,6 +57,7 @@ from backend.realtime.turn import (
 from .turn_fakes import (
     Call,
     FailingSynthesizer,
+    FakeAlarm,
     FakeCallLater,
     Harness,
     Pause,
@@ -2015,6 +2025,7 @@ async def test_while_speaking_mist_wait_ducks_at_the_hit_accepts_and_interrupts_
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id) == ("wake", turn_id)
     assert (barge.detail.phase, barge.detail.utterance_id) == ("speaking", uid)
+    assert h.outbound.of("voice_decision:supersede") == []
     names = h.outbound.names()[mark:]
     assert subsequence(
         names,
@@ -2131,6 +2142,8 @@ async def test_stop_or_the_name_during_the_handoff_wait_cancels_as_in_thinking(h
     (barge,) = h.outbound.of("voice_decision:barge_in")
     reason = "keyword" if how == "stop" else "wake"
     assert (barge.reason, barge.turn_id, barge.detail.phase) == (reason, turn_id, "thinking")
+    # The ack's audio is queued, so the name barges in (A51 supersedes only before any audio).
+    assert h.outbound.of("voice_decision:supersede") == []
     assert h.responder.closed == [0]
     assert [c.outcome for c in h.responder.commits] == ["interrupted"]
 
@@ -2186,6 +2199,7 @@ async def test_endpoint_wake_ranks_with_its_calibration_and_a_slow_backlog_still
         false_accepts_per_hour=pytest.approx(1.05),
         positive_quantile=pytest.approx(0.5),
         margin=pytest.approx(0.2),
+        score=0.7,
     )
     # The backlog completes well after `wake_arbitration_ms`; the claim made at `wake` waits.
     await h.clock.advance(400)
@@ -2235,8 +2249,443 @@ async def test_endpoint_wake_while_speaking_interrupts_only_after_acceptance():
 
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id, barge.detail.utterance_id) == ("wake", turn_id, uid)
+    assert h.outbound.of("voice_decision:supersede") == []
     assert [c.outcome for c in h.responder.commits] == ["interrupted"]
     pause.release()
+
+
+# -- A name while she thinks supersedes the turn (A51, T55c) ------------------------------------------
+# A name accepted while a model turn is in `thinking` with none of its audio queued supersedes it:
+# `supersede`, the cut with `stream_cancelled superseded`, `idle` and `turn_metrics`, then the
+# name's publish, all in the accepting step. K, the superseded turn, is committed at the cut only
+# when it dispatched a tool; otherwise it is kept and joins the next turn (T55d, below).
+
+
+def transcribed(h: Harness, uid: str) -> list[str]:
+    """The texts of the `transcription`s naming `uid`."""
+    return [t.text for t in h.outbound.of("transcription") if t.utterance_id == uid]
+
+
+async def accept_a_name(h: Harness, how: str, text: str) -> str:
+    """Accept a name through the server spotter or an endpoint `wake`; the candidate's id."""
+    if how == "server":
+        uid = h.ids()
+        h.post(h.ingress.started(uid))
+        await h.settle()
+        await name_hit(h, uid)
+        await gate(h, uid, text)
+        return uid
+    h.post(endpoint_wake(1500))
+    await h.settle()
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
+    await h.settle()
+    ((*_, uid),) = calls(h.ingress, "open_utterance")
+    h.post(h.ingress.partial(uid, text, gate=True))
+    await h.settle()
+    return str(uid)
+
+
+@pytest.mark.parametrize("how", ["server", "endpoint"])
+async def test_a_name_accepted_in_thinking_before_any_audio_supersedes_the_turn(how):
+    pause = Pause()
+    h = make_harness([pause, Token("Late.")], [Token("In Paris it rains."), Pause()])
+    h.start_voice()
+    await h.speak("mist, what's the weather")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "thinking"
+    mark = len(h.outbound.client)
+
+    uid = await accept_a_name(h, how, "mist, and in Paris")
+
+    (supersede,) = h.outbound.of("voice_decision:supersede")
+    assert (supersede.turn_id, supersede.reason) == (turn_id, "continued_speech")
+    assert supersede.detail.model_dump() == {"merged": True, "tool_dispatched": False}
+    assert h.outbound.of("voice_decision:barge_in") == []
+    names = h.outbound.names()[mark:]
+    # The pacer's stop ends the announced audio tag (`0x03`, `playback_stop`) within the cut.
+    assert names[names.index("voice_decision:supersede") :] == [
+        "voice_decision:supersede",
+        "0x03",
+        "playback_stop",
+        "stream_cancelled",
+        "state_cycle:idle",
+        "turn_metrics",
+        "vad_status:speech_started",
+        "state_cycle:listen",
+        "transcript_partial",
+    ]
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert (cancelled.turn_id, cancelled.reason) == (turn_id, "superseded")
+    assert (cancelled.partial_text, cancelled.spoken_text) == ("", "")
+    # No tool was dispatched, so K is kept for the merge: its metrics say it is not recorded.
+    (metrics,) = h.outbound.of("turn_metrics")
+    assert (metrics.turn_id, metrics.outcome, metrics.recorded) == (turn_id, "superseded", False)
+    assert h.responder.commits == []
+    assert h.controller.phase == "idle"
+    # The name's prefetch already carries K's words ahead of its own.
+    assert h.responder.prefetches[-1] == (
+        "session-1",
+        "mist, what's the weather mist, and in Paris",
+    )
+
+    # U's end starts a non-held turn whose request carries both texts; the client sees U's own.
+    h.post(h.ingress.ended(uid, "mist, and in Paris"))
+    await h.settle()
+    first, second = h.responder.requests
+    assert first.user_text == "mist, what's the weather"
+    assert second.user_text == "mist, what's the weather mist, and in Paris"
+    assert not second.held
+    assert second.interruption_note is None  # K is not recorded, so the note is left as it was
+    assert transcribed(h, uid) == ["mist, and in Paris"]
+    assert h.responder.commits == []
+    assert h.outbound.of("voice_decision:supersede") == [supersede]
+    pause.release()
+
+    # One commit in all, U's turn's: K's words are recorded once, inside it.
+    await h.controller.close()
+    assert [entry for entry in h.responder.log if entry.startswith("commit:")] == [
+        "commit:interrupted"
+    ]
+
+
+async def test_a_supersede_after_a_dispatched_tool_says_so():
+    pause = Pause()
+    h = make_harness(
+        [WaitGate(), Call(dispatch_tool), tool_started(), pause, Token("Done.")], [Pause()]
+    )
+    h.start_voice()
+    await h.speak("mist, set a timer")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "thinking"
+
+    uid = await accept_a_name(h, "server", "mist, make it ten minutes")
+
+    (supersede,) = h.outbound.of("voice_decision:supersede")
+    assert supersede.turn_id == turn_id
+    assert supersede.detail.model_dump() == {"merged": False, "tool_dispatched": True}
+    assert h.outbound.of("voice_decision:barge_in") == []
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert cancelled.reason == "superseded"
+    # K is committed at the cut, before its metrics, so they say it is recorded.
+    (metrics,) = h.outbound.of("turn_metrics")
+    assert (metrics.outcome, metrics.kind, metrics.recorded) == ("superseded", "tool", True)
+    assert [(c.outcome, c.delivered_text) for c in h.responder.commits] == [("superseded", "")]
+    assert h.responder.prefetches[-1] == ("session-1", "mist, make it ten minutes")
+
+    # The turn from the name takes its own text, after K's record.
+    h.post(h.ingress.ended(uid, "mist, make it ten minutes"))
+    await h.settle()
+    first, second = h.responder.requests
+    assert (first.user_text, second.user_text) == ("mist, set a timer", "mist, make it ten minutes")
+    assert second.interruption_note == "before_reply"
+    assert [c.outcome for c in h.responder.commits] == ["superseded"]
+    pause.release()
+
+
+async def test_a_name_on_a_capability_answered_turn_in_thinking_still_barges_in():
+    """Its text is already recorded (D8), so it is interrupted, never superseded."""
+    alarm = FakeAlarm()
+    h = make_harness(alarm_ringing=alarm)
+    reply = "The alarm is off."
+    h.responder.capability_results.append(
+        CapabilityOnlyTurn(handled=True, events=(Token(reply), Complete(final_response=reply)))
+    )
+    h.lane.hold()  # no audio: the answer stays in `thinking`
+    h.start_voice()
+    stop = h.ids()
+    h.post(h.ingress.started(stop), h.ingress.candidate(stop, "stop"))
+    await h.settle()
+    h.post(h.ingress.ended(stop, "stop"))
+    await h.settle()
+    answer = h.last_turn()
+    assert h.controller.phase == "thinking"
+
+    await accept_a_name(h, "server", "mist, what's the time")
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.reason, barge.turn_id, barge.detail.phase) == ("wake", answer, "thinking")
+    assert h.outbound.of("voice_decision:supersede") == []
+    assert h.outbound.of("stream_cancelled")[0].reason == "barge_in"
+    assert h.outbound.of("turn_metrics")[-1].outcome == "interrupted"
+    assert h.responder.commits == []  # the capability-only path recorded it
+    h.lane.open()
+
+
+async def test_a_name_accepted_while_a_turn_is_held_cancels_it_without_trace():
+    h = make_harness([Token("One two. "), Pause()], [Pause()])
+    h.start_voice()
+    await held(h)
+
+    await accept_a_name(h, "endpoint", "mist, what's up")
+
+    assert h.outbound.of("voice_decision:supersede") == []
+    assert h.outbound.of("voice_decision:barge_in") == []
+    assert h.outbound.of("stream_cancelled") == []
+    assert h.outbound.queued_turn_ids() == []
+    assert h.responder.commits == []
+
+
+# -- A superseded question joins the next one (A51, T55d) ------------------------------------------
+# With no tool dispatched, K is kept, not committed, at the cut: every turn from U sends the
+# responder K's request text, one space, then its own, and K is resolved when a non-held turn from
+# U opens or a held one is released. Where U starts no turn, or another turn would be recorded
+# first, K is committed alone, `superseded` with "".
+
+K_TEXT = "mist, what's the weather"
+U_TEXT = "mist, and in Paris"
+MERGED = f"{K_TEXT} {U_TEXT}"
+
+
+async def kept_turn(h: Harness, u_text: str = U_TEXT) -> str:
+    """Start voice, supersede a thinking turn that dispatched no tool; U's utterance id."""
+    h.start_voice()
+    await h.speak(K_TEXT)
+    assert h.controller.phase == "thinking"
+    uid = await accept_a_name(h, "server", u_text)
+    (supersede,) = h.outbound.of("voice_decision:supersede")
+    assert supersede.detail.model_dump() == {"merged": True, "tool_dispatched": False}
+    assert h.responder.commits == []
+    return uid
+
+
+def recorded(h: Harness) -> list[str]:
+    """The responder's opens, commits and capability calls, in order."""
+    return [e for e in h.responder.log if e == "open" or e.startswith(("commit:", "capability:"))]
+
+
+def commits_of(h: Harness) -> list[tuple[str, str]]:
+    return [(c.outcome, c.delivered_text) for c in h.responder.commits]
+
+
+async def test_with_speculative_start_the_held_turn_from_u_carries_k_through_its_release():
+    h = make_harness([Pause(), Token("Late.")], [Token("In Paris it rains. "), Pause()])
+    uid = await kept_turn(h)
+
+    h.post(h.ingress.candidate(uid, U_TEXT))
+    await h.settle()
+
+    assert h.controller.phase == "held"
+    _, held_request = h.responder.requests
+    assert (held_request.held, held_request.user_text) == (True, MERGED)
+    assert h.responder.prefetches[-1] == ("session-1", MERGED)
+
+    h.post(h.ingress.ended(uid, U_TEXT))
+    await h.settle()
+
+    # The release keeps the held request: no second request, and the client sees U's own text.
+    (release,) = h.outbound.of("voice_decision:release")
+    assert release.detail.utterance_id == uid
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, MERGED]
+    assert transcribed(h, uid) == [U_TEXT]
+    assert h.responder.commits == []
+
+    await h.controller.close()
+    assert recorded(h) == ["open", "open", "commit:interrupted"]
+
+
+async def test_a_held_turn_from_u_cancelled_by_resumed_speech_leaves_k_for_the_next_one():
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Token("In Paris it rains. "), Pause()])
+    uid = await kept_turn(h)
+    h.post(h.ingress.candidate(uid, U_TEXT))
+    await h.settle()
+
+    h.post(h.ingress.resumed(uid))
+    await h.settle()
+
+    assert h.controller.phase == "idle"
+    assert h.responder.commits == []
+    longer = f"{U_TEXT} tomorrow"
+    h.post(h.ingress.candidate(uid, longer))
+    await h.settle()
+    h.post(h.ingress.ended(uid, longer))
+    await h.settle()
+
+    # Each held turn from U carries K once; the second is released.
+    _, cancelled, released = h.responder.requests
+    assert (cancelled.held, cancelled.user_text) == (True, MERGED)
+    assert (released.held, released.user_text) == (True, f"{K_TEXT} {longer}")
+    assert len(h.outbound.of("voice_decision:release")) == 1
+    assert transcribed(h, uid) == [longer]
+    assert h.responder.commits == []
+
+    await h.controller.close()
+    assert recorded(h) == ["open", "open", "open", "commit:interrupted"]
+
+
+@pytest.mark.parametrize("final", ["stop", "mist, stop"])
+async def test_mist_stop_with_speculative_start_off_starts_a_turn_from_u_that_merges_k(final):
+    """U ends in `idle`, where no keyword verdict cuts anything, so it starts a turn from U.
+
+    "mist, stop" is accepted on the gate's decode; its final transcript may or may not keep the
+    name, and either way the end in `idle` starts a turn.
+    """
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    uid = await kept_turn(h, "mist, stop")
+
+    h.post(h.ingress.ended(uid, final))
+    await h.settle()
+
+    _, second = h.responder.requests
+    assert (second.held, second.user_text) == (False, f"{K_TEXT} {final}")
+    assert transcribed(h, uid) == [final]
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert h.responder.commits == []
+
+    await h.controller.close()
+    assert recorded(h) == ["open", "open", "commit:interrupted"]
+
+
+async def test_mist_stop_on_a_held_turn_from_u_whose_final_keeps_the_name_releases_and_merges():
+    """In `held` only a keyword-only end cancels (`KeywordBargeIn._judge_whole`); a final that
+    keeps the name is a new request, so the held turn from U is released and carries K.
+    """
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    uid = await kept_turn(h, "mist, stop")
+    h.post(h.ingress.candidate(uid, "mist, stop"))
+    await h.settle()
+
+    h.post(h.ingress.ended(uid, "mist, stop"))
+    await h.settle()
+
+    assert len(h.outbound.of("voice_decision:release")) == 1
+    assert h.outbound.of("voice_decision:dropped") == []
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, f"{K_TEXT} mist, stop"]
+    assert h.responder.commits == []
+
+
+async def _stop_on_the_held_turn(h: Harness, uid: str) -> None:
+    """The name and `stop` with speculative start on, the final transcript the keyword alone."""
+    h.post(h.ingress.candidate(uid, "stop"))
+    await h.settle()
+    assert h.controller.phase == "held"
+    assert h.responder.requests[-1].user_text == f"{K_TEXT} stop"
+    h.post(h.ingress.ended(uid, "stop"))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("keyword", uid)
+
+
+async def _mute(h: Harness, uid: str) -> None:
+    h.post(h.ingress.dropped(uid, "muted"), Mute(active=True))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("muted", uid)
+
+
+async def _voice_stop(h: Harness, uid: str) -> None:
+    h.post(VoiceStop())
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("voice_stop", uid)
+
+
+async def _voice_start_over_an_adopted_ingress(h: Harness, uid: str) -> None:
+    h.post(new_start(h))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("voice_stop", uid)
+
+
+async def _typed_while_held(h: Harness, uid: str) -> None:
+    h.post(h.ingress.candidate(uid, U_TEXT))
+    await h.settle()
+    assert h.controller.phase == "held"
+    h.post(Text("what's on today"))
+    await h.settle()
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("text_input", uid)
+    # K is recorded before the typed turn opens.
+    assert recorded(h) == ["open", "open", "commit:superseded", "open"]
+    assert h.responder.requests[-1].user_text == "what's on today"
+
+
+async def _close(h: Harness, uid: str) -> None:
+    await h.controller.close()
+
+
+async def _cancel(h: Harness, uid: str) -> None:
+    task = h.controller.task
+    assert task is not None
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    "end_u",
+    [
+        _stop_on_the_held_turn,
+        _mute,
+        _voice_stop,
+        _voice_start_over_an_adopted_ingress,
+        _typed_while_held,
+        _close,
+        _cancel,
+    ],
+    ids=[
+        "mist-stop-speculative",
+        "mute",
+        "voice_stop",
+        "voice_start",
+        "typed-while-held",
+        "close",
+        "cancel",
+    ],
+)
+async def test_k_is_committed_alone_once_where_u_starts_no_turn(end_u):
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Pause()])
+    uid = await kept_turn(h, "mist, stop")
+
+    await end_u(h, uid)
+
+    assert commits_of(h) == [("superseded", "")]
+    assert h.responder.commits[0].tool_effect_unknown is False
+    task = h.controller.task
+    if task is not None and not task.done():
+        await h.controller.close()
+    # Exactly once: nothing later records K again.
+    assert [entry for entry in recorded(h) if entry == "commit:superseded"] == ["commit:superseded"]
+
+
+async def test_an_alarm_stop_word_records_k_before_the_capability_path_is_asked():
+    alarm = FakeAlarm()
+    h = make_harness([Pause(), Token("Late.")], [Pause()], alarm_ringing=alarm)
+    uid = await kept_turn(h, "mist, stop")
+    h.post(h.ingress.candidate(uid, "mist, stop"))
+    await h.settle()
+    assert h.controller.phase == "held"
+
+    h.post(h.ingress.ended(uid, "mist, stop"))
+    await h.settle()
+
+    assert h.responder.capability_calls == [("mist, stop", "session-1")]
+    assert recorded(h) == ["open", "open", "commit:superseded", "capability:mist, stop"]
+    assert commits_of(h) == [("superseded", "")]
+    await h.controller.close()
+    assert commits_of(h) == [("superseded", "")]
+
+
+async def test_a_typed_message_while_u_is_open_records_k_first_and_u_then_takes_its_own_text():
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Token("In Paris it rains. "), Pause()])
+    uid = await kept_turn(h)
+
+    h.post(Text("what's on today"))
+    await h.settle()
+
+    # K is recorded before the typed turn opens, so its record precedes the typed turn's.
+    assert recorded(h) == ["open", "commit:superseded", "open"]
+    assert h.controller.phase == "text"
+
+    h.post(h.ingress.ended(uid, U_TEXT))
+    await h.settle()
+
+    # U's end cuts the typed turn and starts a turn from U with its own text alone.
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, "what's on today", U_TEXT]
+    assert h.outbound.of("stream_cancelled")[-1].reason == "new_input"
+    assert commits_of(h) == [("superseded", ""), ("interrupted", "")]
+    assert transcribed(h, uid) == [U_TEXT]
+    await h.controller.close()
+    assert [c.outcome for c in h.responder.commits] == ["superseded", "interrupted", "interrupted"]
 
 
 async def test_a_wake_while_muted_is_dropped_muted_with_a_fresh_id():
@@ -2517,23 +2966,104 @@ async def test_a_dropped_candidate_settles_its_claim_once_with_accepted_false(dr
         assert calls(h.ingress, "drop") == []
 
 
-async def test_a_lost_claim_closes_its_candidate_lost_arbitration_and_settles_once():
+def losses(h: Harness) -> list[VoiceDecisionWakeLost]:
+    return h.outbound.of("voice_decision:wake_lost")  # type: ignore[return-value]
+
+
+async def test_a_lost_claim_closes_its_candidate_with_one_wake_lost_and_settles_once():
     h = make_harness([Pause()], solo=False)
     h.start_voice()
-    uid = await name_hit(h)
+    uid = await name_hit(h, score=0.6)
 
-    h.arbiter.deny(1)
+    h.arbiter.deny(1, winner_score=0.93)
     await h.settle()
 
     assert h.outbound.names() == [
         "state_cycle:attend",
-        "voice_decision:wake_rejected",
+        "voice_decision:wake_lost",
         "state_cycle:idle",
     ]
-    assert h.outbound.of("voice_decision:wake_rejected")[0].reason == "lost_arbitration"
+    (message,) = losses(h)
+    assert message.turn_id is None
+    assert message.reason == "arbitration"
+    assert message.detail == WakeLostDetail(winner_score=0.93, score=0.6, utterance_id=uid)
     assert calls(h.ingress, "drop") == [("drop", uid, "wake_lost")]
     assert calls(h.ingress, "request_gate_partial") == []
     assert h.arbiter.settles == [(1, False)]
+
+
+@pytest.mark.parametrize("phase", ["thinking", "speaking"])
+async def test_a_lost_claim_in_a_turn_cuts_nothing_and_restores_the_phase_state(phase):
+    h, pause = await in_phase(phase)
+    h.arbiter.solo = False
+    turn_id = h.last_turn()
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    mark = len(h.outbound.client)
+
+    await name_hit(h, uid, score=0.6)
+    h.arbiter.deny(h.arbiter.claims[-1].claim_id, winner_score=0.9)
+    await h.settle()
+
+    restored = "think" if phase == "thinking" else "speak"
+    duck = ["playback_duck"] if phase == "speaking" else []
+    assert h.outbound.names()[mark:] == [
+        "state_cycle:attend",
+        *duck,
+        "voice_decision:wake_lost",
+        *duck,
+        f"state_cycle:{restored}",
+    ]
+    assert ducks(h) == ([12.0, 0.0] if phase == "speaking" else [])
+    (message,) = losses(h)
+    assert message.turn_id == turn_id
+    assert message.detail == WakeLostDetail(winner_score=0.9, score=0.6, utterance_id=uid)
+    assert h.outbound.of("voice_decision:wake_rejected") == []
+    assert h.outbound.of("state_cycle:idle") == []
+    assert h.outbound.purges == []
+    assert h.responder.commits == []
+    assert h.controller.phase == phase
+    assert calls(h.ingress, "drop") == [("drop", uid, "wake_lost")]
+    pause.release()
+
+
+async def test_an_endpoint_wake_that_loses_before_its_backlog_gets_a_fresh_id():
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    h.post(endpoint_wake(1500, score=0.6))
+    await h.settle()
+    (claim,) = h.arbiter.claims
+
+    h.arbiter.deny(claim.claim_id, winner_score=0.9)
+    await h.settle()
+
+    assert h.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_lost",
+        "state_cycle:idle",
+    ]
+    (message,) = losses(h)
+    assert message.reason == "arbitration"
+    assert message.turn_id is None
+    assert message.detail.winner_score == 0.9
+    assert message.detail.score == 0.6
+    uid = message.detail.utterance_id
+    # No ingress lever ever named it: the id is fresh, and nothing opened to drop.
+    named = [call for call in h.ingress.calls if uid in call]
+    assert named == []
+    assert calls(h.ingress, "open_utterance") == []
+    assert calls(h.ingress, "drop") == []
+    assert h.arbiter.settles == [(claim.claim_id, False)]
+
+    # The backlog's `NameHeard` comes after the loss: no wake waits for it, so it is stale.
+    stale, mark = h.controller.stale_events, len(h.outbound.sent)
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.6))
+    await h.settle()
+
+    assert h.controller.stale_events == stale + 1
+    assert h.outbound.sent[mark:] == []
+    assert calls(h.ingress, "open_utterance") == []
 
 
 async def test_a_verdict_for_a_settled_claim_is_ignored_counted_and_sends_nothing():
@@ -2628,6 +3158,13 @@ def rejected_reasons(h: Harness) -> list[str]:
     return [item.reason for item in h.outbound.of("voice_decision:wake_rejected")]
 
 
+def lost_details(h: Harness) -> list[tuple[str, float, float, str]]:
+    """Each `wake_lost`'s reason, winner score, own score and utterance id."""
+    return [
+        (m.reason, m.detail.winner_score, m.detail.score, m.detail.utterance_id) for m in losses(h)
+    ]
+
+
 async def test_two_calibrated_hits_the_lower_false_accept_rate_proceeds_over_a_larger_margin():
     # The two tables disagree with the margins: a's 0.6 (margin 0.1) reads 0.2 false accepts an
     # hour, b's 0.9 (margin 0.4) reads 1.0.
@@ -2649,16 +3186,16 @@ async def test_two_calibrated_hits_the_lower_false_accept_rate_proceeds_over_a_l
         ("request_gate_partial", ua, GATE_THROUGH)
     ]
     assert calls(s.b.ingress, "request_gate_partial") == []
-    # The loser waits for the winner's verdict: nothing is rejected yet.
-    assert rejected_reasons(s.b) == []
+    # The loser waits for the winner's verdict: nothing is sent to it yet.
+    assert s.b.outbound.names() == ["state_cycle:attend"]
 
     await gate(s.a, ua, "mist what's up")
 
     assert "vad_status:speech_started" in s.a.outbound.names()
-    assert rejected_reasons(s.b) == ["lost_arbitration"]
+    assert lost_details(s.b) == [("arbitration", 0.6, 0.9, ub)]
     assert s.b.outbound.names() == [
         "state_cycle:attend",
-        "voice_decision:wake_rejected",
+        "voice_decision:wake_lost",
         "state_cycle:idle",
     ]
     assert calls(s.b.ingress, "drop") == [("drop", ub, "wake_lost")]
@@ -2683,9 +3220,11 @@ async def test_two_hits_at_the_false_accept_floor_the_higher_quantile_proceeds_t
 
     await gate(s.b, ub, "mist what's the time")
 
-    assert rejected_reasons(s.a) == ["lost_arbitration"]
+    assert lost_details(s.a) == [("arbitration", 0.95, 0.85, ua)]
+    assert rejected_reasons(s.a) == []
     assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
     assert rejected_reasons(s.b) == []
+    assert losses(s.b) == []
 
 
 async def test_two_hits_equal_on_both_scales_the_earlier_arrival_proceeds():
@@ -2700,7 +3239,8 @@ async def test_two_hits_equal_on_both_scales_the_earlier_arrival_proceeds():
         ("request_gate_partial", ub, GATE_THROUGH)
     ]
     await gate(s.b, ub, "mist, are you there")
-    assert rejected_reasons(s.a) == ["lost_arbitration"]
+    assert lost_details(s.a) == [("arbitration", 0.8, 0.8, ua)]
+    assert rejected_reasons(s.a) == []
     assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
 
 
@@ -2725,14 +3265,17 @@ async def test_calibrated_outranks_uncalibrated_and_uncalibrated_ranks_by_margin
     await s.close_window()
 
     won, lost = (s.a, s.b) if winner == "a" else (s.b, s.a)
-    won_uid = ua if winner == "a" else ub
+    won_uid, lost_uid = (ua, ub) if winner == "a" else (ub, ua)
+    won_score, lost_score = (score_a, score_b) if winner == "a" else (score_b, score_a)
     assert calls(won.ingress, "request_gate_partial") == [
         ("request_gate_partial", won_uid, GATE_THROUGH)
     ]
     assert calls(lost.ingress, "request_gate_partial") == []
     await gate(won, won_uid, "mist what's up")
     assert rejected_reasons(won) == []
-    assert rejected_reasons(lost) == ["lost_arbitration"]
+    assert losses(won) == []
+    assert rejected_reasons(lost) == []
+    assert lost_details(lost) == [("arbitration", won_score, lost_score, lost_uid)]
 
 
 async def test_when_the_winner_is_rejected_the_runner_up_requests_its_gate_partial():
@@ -2752,6 +3295,8 @@ async def test_when_the_winner_is_rejected_the_runner_up_requests_its_gate_parti
     await gate(s.b, ub, "mist what's up")
     assert rejected_reasons(s.b) == []
     assert "vad_status:speech_started" in s.b.outbound.names()
+    # The rejected winner's claim is settled, so the runner-up's acceptance sends it no loss.
+    assert losses(s.a) == []
 
 
 async def test_only_the_winners_gate_partial_is_requested_while_both_wait():

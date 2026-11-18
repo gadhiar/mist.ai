@@ -29,6 +29,7 @@ import pytest
 import yaml
 
 from backend.knowledge.eval_isolation import LIVE_NEO4J_ENDPOINTS, _allowed_endpoints
+from backend.realtime.budget import load_voice_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_PATH = REPO_ROOT / "docker-compose.live-path-smoke.yml"
@@ -495,20 +496,63 @@ class TestMountDiscipline:
         assert_isolated_root(REPO_ROOT / "smoke-state", purpose="live-path smoke")
 
 
-class TestKnowledgeIntegrationOn:
+class TestKnowledgeOn:
     """Without knowledge integration the conversation records no turn at all."""
 
     def test_knowledge_integration_enabled(self, backend_env):
         value = backend_env.get("ENABLE_KNOWLEDGE_INTEGRATION")
         assert value == "true", (
-            f"ENABLE_KNOWLEDGE_INTEGRATION={value!r}. At "
-            f"backend/voice_models/model_manager.py:494 `generate_llm_response` "
-            f"takes the knowledge-augmented path only when knowledge is enabled; "
-            f"the else branch (model_manager.py:501-530) calls the LLM provider "
-            f"directly. Turn recording lives only on the knowledge path "
-            f"(`_record_turn_event`, backend/chat/conversation_handler.py:2279). "
+            f"ENABLE_KNOWLEDGE_INTEGRATION={value!r}. `build_mist_runtime` "
+            f"(backend/factories.py) builds the conversation handler only when "
+            f"knowledge is enabled; otherwise `DirectResponder` "
+            f"(backend/realtime/degraded.py) calls the LLM provider directly and "
+            f"records nothing. Turn recording lives only in the handler "
+            f"(`_record_turn_event`, backend/chat/conversation_handler.py:3888). "
             f"With this off the smoke run produces a reply, no turn row, and four "
             f"absent artifacts that look like a broken pipeline."
+        )
+
+
+#: The backend of each text-path stack that must load no speech engine.
+VOICE_OFF_BACKENDS = (
+    pytest.param(COMPOSE_PATH, BACKEND_SERVICE, id="live-path-smoke"),
+    pytest.param(
+        REPO_ROOT / "docker-compose.dev-hydration.yml", "mist-backend-dev", id="dev-hydration"
+    ),
+)
+
+
+class TestVoiceOff:
+    """Both stacks drive text turns and share the host's one GPU with the live backend."""
+
+    @pytest.mark.parametrize("var", ("MIST_VOICE_STT_CHAIN", "MIST_VOICE_TTS_CHAIN"))
+    @pytest.mark.parametrize(("path", "service"), VOICE_OFF_BACKENDS)
+    def test_speech_chain_is_off(self, path, service, var):
+        env = _environment_of(_load(path), service)
+
+        value = env.get(var)
+
+        assert value == "off", (
+            f"{var}={value!r} on {service} ({path.name}). Unset, the chain is "
+            f"`PlacementConfig`'s default (backend/realtime/budget.py), whose first "
+            f"STT option is Nemotron on CUDA, so this text-path stack would load a "
+            f"speech engine into the VRAM the live backend holds. `off` alone is "
+            f"the empty chain; TTS_ENABLED=false only stops replies being spoken "
+            f"and loads nothing less."
+        )
+
+    @pytest.mark.parametrize(("path", "service"), VOICE_OFF_BACKENDS)
+    def test_voice_settings_load_with_both_chains_empty(self, path, service):
+        env = _environment_of(_load(path), service)
+
+        placement = load_voice_settings(env).placement
+
+        assert (placement.stt_chain, placement.tts_chain) == ((), ()), (
+            f"{service} ({path.name}) loads voice settings with STT chain "
+            f"{placement.stt_chain} and TTS chain {placement.tts_chain}. The file's "
+            f"environment runs through the parser the backend uses, which raises "
+            f"for a removed per-slot variable, so a stale one fails here before it "
+            f"stops the backend at boot."
         )
 
 

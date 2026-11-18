@@ -1,9 +1,11 @@
 """Cross-turn confirmation: the proposal store and the yes-or-no matcher.
 
-A turn cannot wait for the user's "yes": a turn holds `generation_lock` while it generates, and
-an utterance that arrives meanwhile is queued rather than processed (`voice_processor.py`). So
-a call that needs confirmation is stored as a proposal, the turn ends, and a later utterance or
-an `action_decision` message resolves it. A spoken "yes" and a button press can race on the main
+A turn cannot wait for the user's "yes": a session's `TurnController` runs one turn at a time,
+and a typed utterance, or a spoken one addressed to her, that arrives meanwhile cuts that turn
+as `new_input` rather than reaching it (`backend/realtime/turn.py`: `_on_text`, and
+`_ended_step`, where unnamed speech closes silently and cuts nothing). So a call that needs
+confirmation is stored as a proposal, the turn ends, and a later utterance or an
+`action_decision` message resolves it. A spoken "yes" and a button press can race on the main
 loop, so `ProposalStore.pop` is synchronous: whichever runs first takes the proposal, and the
 other finds nothing to run.
 """

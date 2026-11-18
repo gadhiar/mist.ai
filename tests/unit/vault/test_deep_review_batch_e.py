@@ -145,7 +145,8 @@ class TestCurationEmbeddingSharing:
             build_test_config(), executor, embedding_provider=sentinel
         )
 
-        # A private second EmbeddingGenerator is never warmed by ModelManager,
+        # A private second EmbeddingGenerator is never warmed by
+        # `build_mist_runtime`, which warms only the graph store's,
         # so the first tier-3 dedup or new-entity write cold-loads a
         # SentenceTransformer on the event loop UNDER the curation lock.
         assert pipeline._deduplicator._embedding_provider is sentinel

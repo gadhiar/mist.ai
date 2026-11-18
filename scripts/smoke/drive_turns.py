@@ -19,50 +19,64 @@ rather than at exit.
 
 PROTOCOL, verified against source
 ---------------------------------
-- The endpoint is `@app.websocket("/ws")` at `backend/server.py:739`. There is
-  no pydantic model on input: `backend/server.py:804` does a raw
-  `receive_json()` and `:806` dispatches on `data.get("type")`.
+The wire contract is the realtime protocol, 2.0.0
+(`backend/realtime/protocol.py`).
+
+- The endpoint is `@app.websocket("/ws")`, `websocket_endpoint` in
+  `backend/server.py`. It hands the socket to one `RealtimeSession`
+  (`backend/realtime/session.py`), whose `_on_text` parses each text message
+  with `parse_client_message` and posts a `TextMessage` to the session's
+  `TurnController` (`backend/realtime/turn.py`).
 - A text turn is exactly `{"type": "text", "text": "<utterance>"}`
-  (`backend/server.py:856-858`). Any other field is ignored. An empty `text` is
-  skipped by `continue` at `backend/server.py:859`, which is why
-  `build_text_frame` refuses an empty utterance here rather than sending one
-  and waiting forever for a terminal that cannot come.
-- The SERVER mints the session id: `session_id = str(uuid.uuid4())` at
-  `backend/server.py:787`, once per connection. A client cannot supply one. The
-  first frame sent is `session_started` (`backend/server.py:788-799`) and its
-  `session_id` is the join key for every later assertion, so this script reads
-  it from that frame and refuses to proceed without it.
-- Exactly three terminal frame types exist per turn, mutually exclusive, at
-  `backend/voice_processor.py:620-674`: `error` (`:631`), `stream_cancelled`
-  (`:646`), `stream_complete` (`:665`). Non-terminal frames also seen on this
-  path: `stream_start` (`:547`), `stream_token` (`:601`), and -- with
-  TTS_ENABLED=false, which `docker-compose.live-path-smoke.yml:285` sets -- a
-  `state_cycle` idle at `backend/voice_processor.py:696-698`.
-- The text branch calls `_process_conversation_turn` directly
-  (`backend/server.py:872`), the same function the voice path converges on at
-  `backend/voice_processor.py:483`. TTS is gated at `:564`, `:609` and `:677`,
-  so turning TTS off does not change turn recording.
+  (`TextMessage` in `backend/realtime/protocol.py`). An empty `text` is not skipped: it
+  opens a turn with an empty utterance, which is why `build_text_frame`
+  refuses one here.
+- The SERVER mints the session id: `session_id = str(uuid.uuid4())` in
+  `websocket_endpoint`, once per connection. A client cannot supply one. The
+  first frame sent is `session_started` and its `session_id` is the join key
+  for every later assertion, so this script reads it from that frame and
+  refuses to proceed without it.
+- Routing is per session: a turn's frames go to its own session's socket only
+  (`grep -rn message_queue backend/realtime` -> no hits); only process-wide
+  events such as heartbeats reach every client through the broadcaster.
+- A typed turn opens with `stream_start{turn_id, channel, origin}`, channel
+  and origin both `text` and no `audio_tag` (`_open_turn` and `_channel_for`
+  in `turn.py`), then streams `stream_token` frames, then ends its stream with
+  exactly one of `stream_complete` or `stream_cancelled`. A failed generation
+  sends a `voice_decision` `degraded` `turn_error` and still ends with
+  `stream_complete`. The turn is committed AFTER its stream terminal, and
+  `state_cycle` idle and then `turn_metrics{turn_id, outcome, recorded}`
+  follow the commit (`TurnController._complete` and `_cut`). A text sent
+  before that commit cuts the turn as `new_input` (`TurnController._on_text`),
+  so the driver waits for `turn_metrics` before sending the next turn.
+- An `error` frame never names a turn: a protocol error carries
+  `context: {"field": ...}` (`RealtimeSession._protocol_error`), the server's
+  own errors carry `context: None`. One that arrives before `stream_start`
+  means the text was refused and no turn will open.
+- A typed turn is never spoken (`_channel_for` speaks only a `voice` turn),
+  so TTS_ENABLED does not change what this script sees.
 
 ISOLATION
 ---------
-`assert_ws_target_not_live` (`backend/knowledge/eval_isolation.py:308`) runs
+`assert_ws_target_not_live` (`backend/knowledge/eval_isolation.py`) runs
 BEFORE any socket is opened. Its hardcoded denylist `LIVE_WS_ENDPOINTS`
-(`eval_isolation.py:120-126`) refuses `mist-backend:8001`, `localhost:8001` and
-`127.0.0.1:8001`, and no environment variable can widen it
-(`eval_isolation.py:345-355`). Its allowlist arm defaults to the DEV endpoints
-(`DEFAULT_DEV_WS_ENDPOINTS`, `eval_isolation.py:79`), so the smoke port must be
+refuses `mist-backend:8001`, `localhost:8001` and `127.0.0.1:8001`, and no
+environment variable can widen it. Its allowlist arm defaults to the DEV
+endpoints (`DEFAULT_DEV_WS_ENDPOINTS`), so the smoke port must be
 named explicitly via MIST_DEV_WS_HOSTS; see `_guard_message` for the exact
 value and RUNBOOK.md for where it is set.
 
 CLEAN CLOSE
 -----------
-The session note is written from the WebSocket `finally` block at
-`backend/server.py:1008-1017`, which calls `ConversationHandler.end_session`
-(`backend/chat/conversation_handler.py:1885`). That call also DRAINS the
-per-turn background extraction tasks (`conversation_handler.py:1920`) before
-synthesising, which is what makes "assert after a clean disconnect" free of the
-"a background task had not finished yet" ambiguity. A killed client still
-triggers the server's `finally` via `WebSocketDisconnect` -- but a killed
+The session note is written from `websocket_endpoint`'s `finally` block
+(`backend/server.py`): once the session has committed its turn and `run` has
+returned, `_end_handler_session` calls `ConversationHandler.end_session`
+(`backend/chat/conversation_handler.py:3394`). That call also DRAINS the
+per-turn background extraction tasks (`_drain_extraction_tasks`,
+`conversation_handler.py:3429`) before synthesising, which is what makes
+"assert after a clean disconnect" free of the "a background task had not
+finished yet" ambiguity. A killed client still reaches the server's `finally`
+when the session's receive loop sees the disconnect -- but a killed
 DRIVER skips its own transcript flush and summary, so this script closes the
 socket, awaits closure, and returns rather than being interrupted.
 
@@ -107,11 +121,28 @@ DEFAULT_TURNS_PATH = Path(__file__).resolve().parent / "turns.json"
 #: same time. Recorded as a known gap rather than described as a guard it is
 #: not: an earlier revision of this comment claimed the refusal already
 #: existed, which would have let exactly that silent misread through.
+#:
+#: The protocol 2 port kept version 1: it only ADDED fields to `turn_outcome`
+#: and `summary` records, and every field a v1 reader takes (`terminal_type`,
+#: `terminal_counts`, `session_id`, `disconnected_at`) keeps its name and meaning.
 TRANSCRIPT_SCHEMA_VERSION = 1
 
-#: The three mutually exclusive per-turn terminals, `backend/voice_processor.py`
-#: :631 (error), :646 (stream_cancelled), :665 (stream_complete).
+#: How a turn can end, as `TurnOutcome.terminal_type` and the summary's
+#: `terminal_counts` name it. `stream_complete` and `stream_cancelled` are the
+#: turn's stream terminal frames. `error` is a turn whose `turn_metrics` outcome
+#: is `error` (its stream still ends with `stream_complete`, after a `degraded
+#: turn_error` decision), or a text the server refused before any turn opened.
 TERMINAL_FRAME_TYPES = frozenset({"error", "stream_cancelled", "stream_complete"})
+
+#: The stream terminal frames. Neither ends the turn: the turn commits after
+#: it, and `turn_metrics` follows the commit.
+STREAM_TERMINAL_TYPES = frozenset({"stream_cancelled", "stream_complete"})
+
+#: What a typed turn's `stream_start` carries: `_on_text` opens the turn with
+#: origin `text` (`TurnController._on_text`, `backend/realtime/turn.py`), and
+#: `_channel_for` speaks only a `voice` turn, so the channel is `text`
+#: and `audio_tag` is absent whatever TTS_ENABLED says.
+EXPECTED_STREAM_START = (("origin", "text"), ("channel", "text"))
 
 EXIT_OK = 0
 EXIT_GUARD_REFUSED = 2
@@ -149,17 +180,28 @@ class TurnOutcome:
     """How one turn ended, as observed on the wire.
 
     Attributes:
-        terminal_type: One of `error`, `stream_cancelled`, `stream_complete`.
-        turn_id: The id the terminal frame carried, or None when it carried
-            none (an `error` whose `context` is None -- see `terminal_turn_id`).
-        turn_id_matched: Whether that id equals the one `stream_start` opened
-            the turn with. False means the terminal did not belong to this
-            turn's stream, which is the shape a protocol-level `error` takes.
-        text: `full_text` for `stream_complete`
-            (`backend/voice_processor.py:667`), `partial_text` for
-            `stream_cancelled` (`:648`), `message` for `error` (`:633`). Three
-            different fields, one attribute, because what the caller wants is
+        terminal_type: One of `TERMINAL_FRAME_TYPES`.
+        turn_id: The id `turn_metrics` carried, or None when the turn never
+            opened (a refused text, ended by an `error`).
+        turn_id_matched: Whether the stream terminal's id equals the one
+            `stream_start` opened the turn with.
+        text: `full_text` for `stream_complete`, `partial_text` for
+            `stream_cancelled`, `message` for an `error` that ended the wait.
+            Three fields, one attribute, because what the caller wants is
             "what did the server end up saying".
+        error_kind: The first `degraded` decision's reason for this turn
+            (`turn_error` for a failed generation), or the refusing `error`
+            frame's `kind`.
+        origin, channel, audio_tag: As `stream_start` carried them.
+        stream_start_problems: Where `stream_start` differed from a typed
+            turn's (`EXPECTED_STREAM_START`, no `audio_tag`).
+        cancel_reason: `stream_cancelled.reason`, else None.
+        outcome, recorded: As `turn_metrics` carried them; None when the turn
+            never opened.
+        session_error_kinds: Session-level `error` frames that arrived while
+            the turn ran; they do not end it.
+        foreign_frames: Frames naming another turn id. Turn frames go to their
+            own session's socket only, so anything but 0 is a defect.
     """
 
     turn_index: int
@@ -173,6 +215,15 @@ class TurnOutcome:
     error_kind: str | None
     token_count: int
     elapsed_s: float
+    origin: str | None
+    channel: str | None
+    audio_tag: int | None
+    stream_start_problems: tuple[str, ...]
+    cancel_reason: str | None
+    outcome: str | None
+    recorded: bool | None
+    session_error_kinds: tuple[str, ...]
+    foreign_frames: int
 
 
 # ---------------------------------------------------------------------------
@@ -184,11 +235,12 @@ class TurnOutcome:
 def load_turn_plan(path: Path) -> TurnPlan:
     """Parse and validate the corpus file.
 
-    Validation is not ceremony here. A turn under the 3-word floor at
-    `backend/knowledge/extraction/pipeline.py:640` would be silently skipped for
-    extraction, and an EMPTY turn is worse: `backend/server.py:859` does
-    `continue` on a falsy `text`, so the server would never emit a terminal
-    frame and the driver would sit on its per-turn timeout for nothing.
+    Validation is not ceremony here. A turn under the 3-word floor
+    (`ExtractionPipeline._is_too_short`, `backend/knowledge/extraction/pipeline.py`)
+    would be silently skipped for extraction, and an EMPTY turn is worse: the
+    server does not skip it (`TextMessage.text` is any string,
+    `backend/realtime/protocol.py`), so it would open a real turn with
+    an empty utterance that the corpus never meant to say.
 
     Args:
         path: Location of `turns.json`.
@@ -219,9 +271,9 @@ def load_turn_plan(path: Path) -> TurnPlan:
         if not isinstance(text, str) or not text.strip():
             raise CorpusError(
                 f"turn {position} in {path} has empty or non-string 'text'. "
-                "backend/server.py:859 skips a falsy text with `continue`, so such "
-                "a turn would produce no terminal frame and the driver would hang "
-                "until its per-turn timeout."
+                "The server does not skip an empty text (TextMessage, "
+                "backend/realtime/protocol.py): it would open a turn with "
+                "an empty utterance."
             )
         turns.append(
             TurnSpec(
@@ -242,11 +294,12 @@ def load_turn_plan(path: Path) -> TurnPlan:
 def build_text_frame(text: str) -> dict[str, str]:
     """Build the one inbound frame shape this script sends.
 
-    Exactly two keys. `backend/server.py:856-858` reads `data.get("type")` and
-    `data.get("text", "")` and nothing else from a text message, so any extra
-    field would be silently discarded -- and a field that looks like it is doing
-    something while being discarded is how a session_id comes to be believed in.
-    The server mints its own session id at `backend/server.py:787`; there is no
+    Exactly two keys. `TextMessage` (`backend/realtime/protocol.py`)
+    has `type` and `text` and nothing else, and its model ignores extra fields
+    (`extra="ignore"` on `_WireModel`), so any extra field would be silently
+    discarded -- and a field that looks like it is doing something while being
+    discarded is how a session_id comes to be believed in. The server mints its
+    own session id in `websocket_endpoint` (`backend/server.py`); there is no
     client-supplied id to send.
 
     Args:
@@ -260,8 +313,8 @@ def build_text_frame(text: str) -> dict[str, str]:
     """
     if not text.strip():
         raise CorpusError(
-            "refusing to send an empty text frame: backend/server.py:859 skips it "
-            "with `continue`, so no terminal frame would ever arrive"
+            "refusing to send an empty text frame: the server would open a turn "
+            "with an empty utterance (TextMessage, backend/realtime/protocol.py)"
         )
     return {"type": "text", "text": text}
 
@@ -270,9 +323,10 @@ def parse_frame(payload: str | bytes) -> dict[str, Any] | None:
     """Decode one received frame, returning None for anything undecodable.
 
     Binary frames are not decoded. On this path they should not occur at all:
-    the binary MIST audio frames are emitted by `_tts_consumer`, which only runs
-    when TTS is enabled (`backend/voice_processor.py:564`), and
-    `docker-compose.live-path-smoke.yml:285` sets TTS_ENABLED=false. They are
+    downlink audio frames carry a `tts`-channel turn's `audio_tag`, and a typed
+    turn has the `text` channel (`_channel_for`, `backend/realtime/turn.py`);
+    the smoke stack also sets MIST_VOICE_TTS_CHAIN=off, so no TTS engine is
+    loaded (`docker-compose.live-path-smoke.yml`). They are
     counted rather than treated as an error, so an unexpected one shows up in
     the transcript instead of aborting the run.
 
@@ -299,7 +353,8 @@ def session_id_from_frame(frame: dict[str, Any]) -> str | None:
 
     Returns:
         The session id when this is a `session_started` frame carrying a
-        non-empty one (`backend/server.py:788-791`), else None.
+        non-empty one (`SessionStartedMessage`, `backend/realtime/protocol.py`),
+        else None.
     """
     if frame.get("type") != "session_started":
         return None
@@ -309,29 +364,37 @@ def session_id_from_frame(frame: dict[str, Any]) -> str | None:
     return None
 
 
-def is_terminal_frame(frame: dict[str, Any]) -> bool:
-    """Whether this frame ends a turn.
+def stream_start_problems(frame: dict[str, Any]) -> tuple[str, ...]:
+    """Where a `stream_start` differs from a typed turn's.
 
     Args:
-        frame: A decoded inbound frame.
+        frame: A decoded `stream_start` frame.
 
     Returns:
-        True for `error`, `stream_cancelled` and `stream_complete`.
+        One line per unexpected field; empty for a typed turn's opener.
     """
-    return frame.get("type") in TERMINAL_FRAME_TYPES
+    problems = [
+        f"{key} {frame.get(key)!r}, expected {expected!r}"
+        for key, expected in EXPECTED_STREAM_START
+        if frame.get(key) != expected
+    ]
+    if frame.get("audio_tag") is not None:
+        problems.append(
+            f"audio_tag {frame.get('audio_tag')!r}, expected none: a text-channel turn "
+            "sends no audio"
+        )
+    return tuple(problems)
 
 
 def terminal_turn_id(frame: dict[str, Any]) -> str | None:
-    """Read the turn id off a terminal frame, whichever shape it uses.
+    """Read the turn id off a terminal frame.
 
-    `stream_complete` and `stream_cancelled` carry `turn_id` at the top level
-    (`backend/voice_processor.py:647`, `:666`). `error` carries it nested, as
-    `context.turn_id` (`backend/voice_processor.py:635`).
-
-    An `error` whose `context` is None is NOT a turn terminal: that shape is the
-    connection-level validation error built at `backend/server.py:809-816` and
-    `:824-832`, and the not-ready error at `backend/server.py:769-775`. It
-    returns None here, and the caller records it with `turn_id_matched=False`.
+    `stream_complete` and `stream_cancelled` carry `turn_id` at the top level.
+    An `error` never names a turn in protocol 2: its `context` is
+    `{"field": ...}` for a message that failed to parse
+    (`RealtimeSession._protocol_error`, `backend/realtime/session.py`)
+    and None for the server's own errors (`_ws_error`,
+    `backend/server.py:2345`, and the not-ready error in `websocket_endpoint`).
 
     Args:
         frame: A decoded terminal frame.
@@ -340,10 +403,6 @@ def terminal_turn_id(frame: dict[str, Any]) -> str | None:
         The turn id, or None when the frame carries none.
     """
     if frame.get("type") == "error":
-        context = frame.get("context")
-        if isinstance(context, dict):
-            turn_id = context.get("turn_id")
-            return turn_id if isinstance(turn_id, str) else None
         return None
     turn_id = frame.get("turn_id")
     return turn_id if isinstance(turn_id, str) else None
@@ -356,9 +415,9 @@ def terminal_text(frame: dict[str, Any]) -> str:
         frame: A decoded terminal frame.
 
     Returns:
-        `full_text` for `stream_complete` (`backend/voice_processor.py:667`),
-        `partial_text` for `stream_cancelled` (`:648`), `message` for `error`
-        (`:633`). Empty string when the field is absent or not a string.
+        `full_text` for `stream_complete`, `partial_text` for
+        `stream_cancelled`, `message` for `error`. Empty string when the field
+        is absent or not a string.
     """
     field = {
         "stream_complete": "full_text",
@@ -373,18 +432,26 @@ class TurnRecorder:
     """The per-turn frame state machine.
 
     One instance per turn. Frames are fed in arrival order; `consume` returns
-    None until a terminal frame arrives, then returns the `TurnOutcome` for that
-    turn. Feeding it further frames after that is a programming error and
-    raises, because a second terminal for one turn would mean the three-way
-    exclusivity at `backend/voice_processor.py:620-674` had broken and silently
-    overwriting the first outcome would hide it.
+    None until the turn has ended, then returns its `TurnOutcome`. A turn ends
+    at the `turn_metrics` naming it, not at its stream terminal: `_complete`
+    and `_cut` commit the turn between the two (`TurnController._complete` and
+    `TurnController._cut` in `backend/realtime/turn.py`), and a text sent before
+    the commit cuts the turn as `new_input` (`TurnController._on_text`). The one
+    exception is an `error` before any `stream_start`: the server refused the
+    text and no turn will open. Feeding the recorder after that raises, because
+    silently overwriting the first outcome would hide a second end.
     """
 
     def __init__(self, spec: TurnSpec, *, started_at: float | None = None) -> None:
         self._spec = spec
         self._started_at = time.monotonic() if started_at is None else started_at
+        self._start: dict[str, Any] | None = None
         self._stream_turn_id: str | None = None
         self._tokens: list[str] = []
+        self._terminal: dict[str, Any] | None = None
+        self._degraded: list[str] = []
+        self._session_errors: list[str] = []
+        self._foreign = 0
         self._done = False
 
     @property
@@ -397,9 +464,8 @@ class TurnRecorder:
         """Concatenation of every `stream_token` seen so far.
 
         Kept alongside the terminal's `full_text` because they can differ:
-        `backend/voice_processor.py:617` trims the response to its last complete
-        sentence before building `stream_complete`, after the tokens have
-        already gone out at `:601`.
+        `_send_complete` (`backend/realtime/turn.py`) sends the
+        generation's `final_response` when it has one.
         """
         return "".join(self._tokens)
 
@@ -411,49 +477,97 @@ class TurnRecorder:
             now: Monotonic clock override, for tests.
 
         Returns:
-            The outcome when `frame` is a terminal, else None.
+            The outcome when `frame` ends the turn, else None.
 
         Raises:
-            RuntimeError: If fed a frame after the turn has already terminated.
+            RuntimeError: If fed a frame after the turn has already ended.
         """
         if self._done:
             raise RuntimeError(
-                f"turn {self._spec.index} already terminated; a second frame "
+                f"turn {self._spec.index} already terminated; a further frame "
                 f"({frame.get('type')!r}) would overwrite its outcome"
             )
 
         frame_type = frame.get("type")
 
-        if frame_type == "stream_start":
+        if frame_type == "error":
+            kind = frame.get("kind") if isinstance(frame.get("kind"), str) else "unknown"
+            if self._stream_turn_id is None:
+                return self._end(frame, outcome=None, recorded=None, error_kind=kind, now=now)
+            self._session_errors.append(kind)
+            return None
+
+        if frame_type == "stream_start" and self._stream_turn_id is None:
             turn_id = frame.get("turn_id")
             if isinstance(turn_id, str):
                 self._stream_turn_id = turn_id
+                self._start = frame
+            return None
+
+        turn_id = frame.get("turn_id")
+        if self._stream_turn_id is None or not isinstance(turn_id, str):
+            return None
+        if turn_id != self._stream_turn_id:
+            self._foreign += 1
             return None
 
         if frame_type == "stream_token":
             token = frame.get("token")
             if isinstance(token, str):
                 self._tokens.append(token)
-            return None
+        elif frame_type == "voice_decision" and frame.get("kind") == "degraded":
+            self._degraded.append(str(frame.get("reason")))
+        elif frame_type in STREAM_TERMINAL_TYPES and self._terminal is None:
+            self._terminal = frame
+        elif frame_type == "turn_metrics":
+            outcome = frame.get("outcome") if isinstance(frame.get("outcome"), str) else None
+            recorded = frame.get("recorded") if isinstance(frame.get("recorded"), bool) else None
+            error_kind = self._degraded[0] if self._degraded else None
+            return self._end(
+                self._terminal, outcome=outcome, recorded=recorded, error_kind=error_kind, now=now
+            )
+        return None
 
-        if not is_terminal_frame(frame):
-            return None
-
+    def _end(
+        self,
+        terminal: dict[str, Any] | None,
+        *,
+        outcome: str | None,
+        recorded: bool | None,
+        error_kind: str | None,
+        now: float | None,
+    ) -> TurnOutcome:
         self._done = True
-        turn_id = terminal_turn_id(frame)
+        terminal = terminal or {}
+        if outcome == "error" or terminal.get("type") == "error":
+            terminal_type = "error"
+        else:
+            terminal_type = str(terminal.get("type", "none"))
+        start = self._start or {}
+        terminal_id = terminal_turn_id(terminal)
+        cancel_reason = terminal.get("reason")
         elapsed = (time.monotonic() if now is None else now) - self._started_at
         return TurnOutcome(
             turn_index=self._spec.index,
             utterance=self._spec.text,
-            terminal_type=str(frame_type),
-            turn_id=turn_id,
-            turn_id_matched=turn_id is not None and turn_id == self._stream_turn_id,
-            text=terminal_text(frame),
-            duration_ms=_as_int(frame.get("duration_ms")),
-            tool_calls_used=_as_int(frame.get("tool_calls_used")),
-            error_kind=frame.get("kind") if isinstance(frame.get("kind"), str) else None,
+            terminal_type=terminal_type,
+            turn_id=self._stream_turn_id,
+            turn_id_matched=terminal_id is not None and terminal_id == self._stream_turn_id,
+            text=terminal_text(terminal),
+            duration_ms=_as_int(terminal.get("duration_ms")),
+            tool_calls_used=_as_int(terminal.get("tool_calls_used")),
+            error_kind=error_kind,
             token_count=len(self._tokens),
             elapsed_s=elapsed,
+            origin=start.get("origin") if isinstance(start.get("origin"), str) else None,
+            channel=start.get("channel") if isinstance(start.get("channel"), str) else None,
+            audio_tag=_as_int(start.get("audio_tag")),
+            stream_start_problems=stream_start_problems(start) if start else (),
+            cancel_reason=cancel_reason if isinstance(cancel_reason, str) else None,
+            outcome=outcome,
+            recorded=recorded,
+            session_error_kinds=tuple(self._session_errors),
+            foreign_frames=self._foreign,
         )
 
 
@@ -468,7 +582,9 @@ def summarise_outcomes(outcomes: list[TurnOutcome]) -> dict[str, int]:
     This is the count A1 turns on: `assert_artifacts.py` calls fewer than five
     `stream_complete` terminals INCONCLUSIVE rather than FAIL, because a turn
     that never completed never exercised `_record_turn_event`
-    (`backend/chat/conversation_handler.py:2279`) at all.
+    (`backend/chat/conversation_handler.py:3888`) as a completed turn. A
+    failed turn counts as `error`, not `stream_complete`, though protocol 2
+    ends its stream with `stream_complete` (see `TERMINAL_FRAME_TYPES`).
 
     Args:
         outcomes: Every turn outcome, in order.
@@ -489,14 +605,14 @@ def _guard_message(ws_url: str, reason: str) -> str:
     """Build the refusal message, naming the variable the operator must set."""
     return (
         f"REFUSED: {ws_url} did not pass assert_ws_target_not_live "
-        f"(backend/knowledge/eval_isolation.py:308).\n"
+        f"(backend/knowledge/eval_isolation.py).\n"
         f"  Guard said: {reason}\n"
         "  If the target IS the smoke stack (host port 8003, published by "
         "docker-compose.live-path-smoke.yml:160), the allowlist arm is what "
         "refused it: it defaults to the DEV endpoints "
-        "(DEFAULT_DEV_WS_ENDPOINTS, eval_isolation.py:79). Export exactly:\n"
+        "(DEFAULT_DEV_WS_ENDPOINTS in eval_isolation.py). Export exactly:\n"
         "      MIST_DEV_WS_HOSTS=localhost:8003,127.0.0.1:8003\n"
-        "  The denylist arm (eval_isolation.py:120-126) refuses localhost:8001, "
+        "  The denylist arm (LIVE_WS_ENDPOINTS) refuses localhost:8001, "
         "127.0.0.1:8001 and mist-backend:8001 -- the LIVE backend -- and no "
         "environment variable widens it. If that is what refused you, the URL is "
         "wrong; do not try to work around it."
@@ -507,7 +623,8 @@ def guard_ws_target(ws_url: str) -> None:
     """Refuse a target that is, or might be, the live backend.
 
     Called before the socket is opened. The guard is a pure function and makes
-    no network call of its own (`backend/knowledge/eval_isolation.py:318-320`),
+    no network call of its own (`assert_ws_target_not_live`'s docstring,
+    `backend/knowledge/eval_isolation.py`),
     so a driver aimed at live is refused without ever contacting live.
 
     Args:
@@ -611,8 +728,8 @@ class Transcript:
 async def _await_session_started(ws: Any, transcript: Transcript, timeout: float) -> str:
     """Read frames until `session_started` arrives, and return its session id.
 
-    The handshake is the FIRST frame the server sends
-    (`backend/server.py:788-799`), but this loops rather than reading exactly
+    The handshake is the FIRST frame the server sends (`websocket_endpoint`,
+    `backend/server.py`), but this loops rather than reading exactly
     one frame so an unexpected leading frame is recorded instead of crashing the
     run.
 
@@ -649,19 +766,23 @@ async def _run_turn(
     transcript: Transcript,
     timeout: float,
 ) -> TurnOutcome:
-    """Send one utterance and read frames until its turn terminates.
+    """Send one utterance and read frames until its turn ends.
+
+    The turn ends at its `turn_metrics`, after the commit, not at its stream
+    terminal; returning earlier would let the next turn's text cut this one as
+    `new_input` (see `TurnRecorder`).
 
     Args:
         ws: The open connection.
         spec: The turn to send.
         transcript: Where to record what arrives.
-        timeout: Seconds to wait for a terminal frame.
+        timeout: Seconds to wait for the turn to end.
 
     Returns:
         The turn's outcome.
 
     Raises:
-        TimeoutError: If no terminal frame arrives within `timeout`.
+        TimeoutError: If the turn does not end within `timeout`.
     """
     frame_out = build_text_frame(spec.text)
     await ws.send(json.dumps(frame_out))
@@ -673,7 +794,7 @@ async def _run_turn(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(
-                f"turn {spec.index} produced no terminal frame within {timeout:.0f}s "
+                f"turn {spec.index} produced no turn_metrics within {timeout:.0f}s "
                 f"(saw {len(recorder.streamed_text)} streamed characters)"
             )
         payload = await asyncio.wait_for(ws.recv(), timeout=remaining)
@@ -699,7 +820,23 @@ async def _run_turn(
                 error_kind=outcome.error_kind,
                 token_count=outcome.token_count,
                 elapsed_s=round(outcome.elapsed_s, 3),
+                origin=outcome.origin,
+                channel=outcome.channel,
+                audio_tag=outcome.audio_tag,
+                stream_start_problems=list(outcome.stream_start_problems),
+                cancel_reason=outcome.cancel_reason,
+                outcome=outcome.outcome,
+                recorded=outcome.recorded,
+                session_error_kinds=list(outcome.session_error_kinds),
+                foreign_frames=outcome.foreign_frames,
             )
+            for problem in outcome.stream_start_problems:
+                print(f"[smoke] turn {spec.index}: unexpected stream_start: {problem}")
+            if outcome.foreign_frames:
+                print(
+                    f"[smoke] turn {spec.index}: {outcome.foreign_frames} frames named "
+                    "another turn; turn frames should reach their own session only"
+                )
             return outcome
 
 
@@ -722,7 +859,7 @@ async def run_conversation(
         websockets: The resolved `websockets` module.
         ws_version: Its version string, recorded in the transcript header.
         connect_timeout: Seconds allowed for the TCP+WS handshake.
-        turn_timeout: Seconds allowed per turn for a terminal frame.
+        turn_timeout: Seconds allowed per turn for its `turn_metrics`.
 
     Returns:
         A process exit code.
@@ -749,9 +886,9 @@ async def run_conversation(
             "  Check the smoke backend is up and healthy:\n"
             '      docker ps --filter name=mist-backend-smoke --format "{{.Status}}"\n'
             "  Its healthcheck has a 120s start_period "
-            "(docker-compose.live-path-smoke.yml:370); Whisper still loads with "
-            "TTS off (backend/voice_models/model_manager.py:119-120), so a cold "
-            "start is not instant.",
+            "(docker-compose.live-path-smoke.yml:381): the backend builds its "
+            "runtime and warms its models before it accepts a connection, so a "
+            "cold start is not instant.",
             file=sys.stderr,
         )
         return EXIT_CONNECT_FAILED
@@ -770,7 +907,7 @@ async def run_conversation(
         session_id = await _await_session_started(connection, transcript, connect_timeout)
         transcript.write("session", session_id=session_id)
         print(f"[smoke] SMOKE_SESSION_ID={session_id}")
-        print("[smoke] The server minted that id (backend/server.py:787). Every")
+        print("[smoke] The server minted that id (websocket_endpoint). Every")
         print("[smoke] assertion joins on it. Copy it now.")
 
         for spec in plan.turns:
@@ -791,8 +928,8 @@ async def run_conversation(
         if failure is not None:
             transcript.write("note", event="conversation_aborted", error=failure)
             print(f"[smoke] conversation aborted: {failure}", file=sys.stderr)
-        # Clean close, always. The server's `finally`
-        # (backend/server.py:1008-1017) writes the session note on disconnect;
+        # Clean close, always. `websocket_endpoint`'s `finally`
+        # (backend/server.py) writes the session note on disconnect;
         # closing rather than dropping the process is what lets THIS side record
         # when that happened.
         #
@@ -825,6 +962,7 @@ async def run_conversation(
         session_id=session_id,
         disconnected_at=disconnected_at,
         terminal_counts=counts,
+        turns_recorded=sum(1 for o in outcomes if o.recorded),
         turns_planned=len(plan.turns),
         retrieval_probe_answer=probe,
         aborted=failure,
@@ -872,7 +1010,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     `--url` has no default on purpose, matching the reasoning in
     `assert_ws_target_not_live`'s docstring
-    (`backend/knowledge/eval_isolation.py:323-324`): a default is a value nobody
+    (`backend/knowledge/eval_isolation.py`): a default is a value nobody
     checked, and live and smoke differ by two digits on the host.
     """
     parser = argparse.ArgumentParser(
@@ -907,7 +1045,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--turn-timeout",
         type=float,
         default=300.0,
-        help="Seconds to wait per turn for a terminal frame (default: 300).",
+        help="Seconds to wait per turn for its turn_metrics (default: 300).",
     )
     return parser
 

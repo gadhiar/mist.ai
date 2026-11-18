@@ -1,6 +1,6 @@
 """T2b part B: turns answered without knowledge integration are counted and warned about.
 
-The fallback moved from `ModelManager.generate_llm_response` to `DirectResponder` (T12); these
+The fallback moved from the deleted threaded voice path to `DirectResponder` (T12); these
 are the same assertions against it. Each turn's stream counts once; opening and committing it
 count nothing.
 """

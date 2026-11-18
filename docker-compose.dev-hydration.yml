@@ -177,9 +177,14 @@ services:
       - MODEL=${MODEL:-gemma-4-e4b}
       #
       # --- voice off --------------------------------------------------------
-      # Hydration is a text-path replay. TTS off skips the Chatterbox load
-      # (model_manager.py:123), which is ~3.9GB of VRAM the live backend is
-      # already holding.
+      # Hydration is a text-path replay. `off` alone is the empty chain
+      # (`backend/realtime/budget.py:724`), so `load_speech_engines`
+      # (`backend/realtime/runtime.py:263`) loads no speech engine into the GPU
+      # the live backend shares; the default STT chain starts with Nemotron on
+      # CUDA. TTS_ENABLED=false, read by `load_config` in `backend/config.py`,
+      # also keeps replies unspoken.
+      - MIST_VOICE_STT_CHAIN=off
+      - MIST_VOICE_TTS_CHAIN=off
       - TTS_ENABLED=false
       - ENABLE_KNOWLEDGE_INTEGRATION=true
       - WATCHFILES_FORCE_POLLING=1

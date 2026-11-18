@@ -402,10 +402,10 @@ def writer_stamps_from_config(config: KnowledgeConfig) -> RebuildStamps:
     dispatcher's writer-stamp guard. Both derive the triple through this one
     function, so for one config the two values cannot differ in how they are
     derived. They are equal only when the two callers get equal configs: in
-    the server each reads its own `KnowledgeConfig.from_env()`
-    (`backend/server.py`, `_start_extraction_dispatcher`'s caller;
-    `backend/voice_models/model_manager.py` for the curation pipeline), and
-    the two agree because both read the same environment. The model hash is
+    the server both get the one `KnowledgeConfig.from_env()` that `lifespan`
+    reads (`grep -n "knowledge_config" backend/server.py`), passed to
+    `_build_runtime` for the curation pipeline and to
+    `_start_extraction_dispatcher` for the dispatcher. The model hash is
     `compose_model_hash(config)`, never the bare `config.model_hash`.
     """
     from backend.knowledge.version_stamps import compose_model_hash
@@ -430,7 +430,8 @@ def build_curation_pipeline(
     """Create a fully wired CurationPipeline (bitemporal engine, C2).
 
     Pass `embedding_provider` to share an already-warmed model: a private
-    EmbeddingGenerator here is never warmed by ModelManager, so the first
+    EmbeddingGenerator here is never warmed by `build_mist_runtime` (which
+    warms only the graph store's `embedding_generator`), so the first
     turn reaching tier-3 dedup or a new-entity write lazy-loads a
     SentenceTransformer ON the event loop UNDER the curation lock.
     """
@@ -534,11 +535,15 @@ def resolve_internal_derivation(explicit: bool | None) -> bool:
         # Same rationale as `curation_scheduler_enabled`, which this call site
         # originally missed. `is_hydration_isolation_active` RAISES on an
         # unrecognized value, which is right for a CLI that can print a refusal
-        # -- but this runs during `build_extraction_pipeline`, inside
-        # `KnowledgeIntegration.__init__`'s broad `except Exception`. So
-        # a mistyped MIST_HYDRATION_ISOLATION did not disable Stage 9,
-        # it silently disabled the ENTIRE knowledge subsystem (no graph, no
-        # retrieval, no extraction, no vault) with one warning line.
+        # -- but this runs during `build_extraction_pipeline`, at startup.
+        # Under the deleted threaded voice path a raise here was caught by a
+        # broad `except Exception`, so a mistyped MIST_HYDRATION_ISOLATION did
+        # not disable Stage 9, it silently disabled the ENTIRE knowledge
+        # subsystem (no graph, no retrieval, no extraction, no vault) with one
+        # warning line. Today `build_mist_runtime` catches only `MistError`,
+        # and `EvalIsolationError` is a `RuntimeError`
+        # (`grep -n "class EvalIsolationError" backend/knowledge/eval_isolation.py`),
+        # so an uncaught raise here would fail startup instead.
         #
         # Degrade toward isolated=True: Stage 9 OFF is the safe direction, and
         # an unparsable isolation flag is not evidence that we are NOT
@@ -576,8 +581,8 @@ def build_extraction_pipeline(
             config,
             executor,
             debug_logger=debug_logger,
-            # Share the graph store's embedding model: ModelManager warms
-            # exactly that instance at startup (off-loop), so curation never
+            # Share the graph store's embedding model: `build_mist_runtime`
+            # warms exactly that instance at startup, so curation never
             # cold-loads a second SentenceTransformer under the write lock.
             embedding_provider=gs.embedding_generator,
         )
@@ -616,11 +621,13 @@ def build_extraction_pipeline(
     # the parent directory and opens a sqlite3 connection, and both raise on
     # an unwritable or absent data root. This call sits at the composition
     # root every production path runs through (`build_conversation_handler`
-    # -> `build_extraction_pipeline`), and an uncaught exception here
-    # propagates up into `KnowledgeIntegration.__init__`'s outer
-    # `except Exception`, which silently degrades MIST to a plain LLM -- no
+    # -> `build_extraction_pipeline`). When this was written, an uncaught
+    # exception here propagated into the deleted threaded voice path's broad
+    # `except Exception`, which silently degraded MIST to a plain LLM -- no
     # graph, no retrieval, no extraction, no vault -- reported as one
-    # WARNING line. `sqlite3.Error` and `OSError` are the same pair
+    # WARNING line. Today `build_mist_runtime` catches only `MistError` and
+    # degrades to `DirectResponder`, so a bare `sqlite3.Error` or `OSError`
+    # would fail startup instead. `sqlite3.Error` and `OSError` are the same pair
     # `_record_skip` / `_record_extraction` already narrow to (`grep -n
     # "except (sqlite3.Error, OSError)" backend/knowledge/extraction/pipeline.py`),
     # and this call is failure-isolated the same way the vector store below

@@ -86,8 +86,6 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 ```
 backend/
 ├── server.py                    # FastAPI WebSocket server (port 8001)
-├── voice_processor.py           # Voice pipeline orchestration
-├── audio_protocol.py            # MIST binary audio frame builder
 ├── log_handler.py               # WebSocketLogHandler with rate limiter
 ├── request_context.py           # ContextVar propagation
 ├── sentence_detector.py         # Streaming TTS sentence boundary detection
@@ -145,7 +143,6 @@ backend/
 │
 ├── chat/                        # Conversation handling
 │   ├── conversation_handler.py  # Pass-loop + persona + budget + post-filter
-│   ├── knowledge_integration.py # Bridge to voice system
 │   ├── mist_context.py          # Identity / persona renderer
 │   ├── slop_detector.py         # AI-slop pattern filter
 │   ├── context_budget.py        # Cluster 6 ContextBudgetPlanner
@@ -189,22 +186,32 @@ backend/
 │   └── fact_render.py           # One sentence per fact, with valid-time qualifiers
 │
 ├── realtime/                    # Realtime voice path, one session per WebSocket connection;
-│   │                            #   the server does not use the package yet
+│   │                            #   `server.py` serves every connection through it
 │   ├── addressee.py             # Addressee gate: whether an utterance holding MIST's name was said to her
 │   ├── bargein.py               # Barge-in policy: what user speech means while MIST speaks, holds a reply or thinks
 │   ├── budget.py                # Voice latency budget, voice configuration and their loader from the environment
+│   ├── capability_sink.py       # Capabilities' event sink over the session registry: house-wide state to every session
 │   ├── character.py             # Character stage: the one place the sound of the spoken voice is shaped
+│   ├── degraded.py              # `DirectResponder`: answers turns when knowledge integration is off or failed to start
 │   ├── engines/                 # Speech engine adapters implementing the protocols in `speech.py`
+│   │   ├── audio.py             # Text and audio rules every TTS adapter shares
 │   │   ├── kws.py               # Server name spotter: a chain of three ONNX graphs behind `NameSpotter`
+│   │   ├── nemotron_stt.py      # Nemotron streaming English STT behind `StreamingTranscriber`, on the GPU
+│   │   ├── parakeet_stt.py      # Parakeet TDT 0.6B v2 (ONNX) STT behind `StreamingTranscriber`, on the CPU
+│   │   ├── pocket_tts.py        # Pocket TTS with voice cloning behind `SpeechSynthesizer`
 │   │   ├── silero_vad.py        # Silero VAD (ONNX v5) behind `VoiceActivityDetector`, and the ONNX loading it shares
 │   │   └── smart_turn.py        # Smart Turn v3.2 (ONNX) behind `TurnEndDetector`
 │   ├── errors.py                # Exceptions raised by the realtime voice package
 │   ├── ingress.py               # Per-session audio ingress: uplink frames to speech segments, name hits and utterances
 │   ├── lanes.py                 # Inference lanes: one worker thread per engine, so model calls never block the event loop
 │   ├── playback.py              # Downlink playback: the session's `turn` lane, the pacer that feeds it and the ledger
+│   ├── power.py                 # Power level on the realtime path: the gate that turns and voice read
 │   ├── protocol.py              # Realtime protocol 2.0.0: the binary frame codec and the control message schemas
+│   ├── registry.py              # The process's sessions: routing, log streaming, voice activity and wake arbitration
+│   ├── runtime.py               # The composed realtime runtime, and the walk that loads each speech slot from its chain
 │   ├── scene.py                 # Scene seam: what the turn controller tells the screen, anchored to the audio clock
 │   ├── segmenter.py             # Cuts a reply's Token stream into the text segments TTS synthesizes one call at a time
+│   ├── session.py               # One session per WebSocket: uplink routing, voice settings and the outbound lanes
 │   ├── speech.py                # Speech engine contracts: the protocols model adapters implement and the values they exchange
 │   ├── turn.py                  # Per-session turn controller: one mailbox task owns a voice session's turns
 │   └── voice_assets.py          # Voice identities, the private clips MIST's voice is cloned from, and the artefacts built on them
@@ -346,12 +353,16 @@ Almost every ADR is in the vault, not in-repo. This section previously listed `a
 Tauri Frontend (./mist-frontend/)
   -> WebSocket (ws://localhost:8001/ws)
 Backend Server (server.py)
-  -> binary audio frames OR text messages
-Voice / chat pipelines:
-  STT -> LLM -> TTS pipelines on voice path
-  ConversationHandler pass-loop on text path
-  -> discriminated events (state_cycle, stream_token, stream_complete,
-     tool_call_*, vad_status, health_status, etc.) per ADR-017
+  -> one RealtimeSession per connection (backend/realtime/session.py)
+  -> binary audio frames OR text messages (protocol 2.0.0)
+Per-session TurnController (backend/realtime/turn.py):
+  voice turns: VAD -> STT -> end of turn -> LLM -> TTS
+  typed turns: text -> LLM
+  both answered by the ConversationHandler pass-loop
+  -> discriminated events (stream_start, stream_token, stream_complete,
+     turn_metrics, voice_decision, tool_call_*, etc.) on the session's
+     own socket; process-wide events (heartbeat, health_status, ...)
+     through the broadcaster
 Tauri Frontend renders spatial composition
 ```
 
@@ -384,7 +395,6 @@ MODEL=gemma-4-e4b
 
 # Voice / TTS
 TTS_ENABLED=true
-TTS_ENGINE=chatterbox
 VOICE_PROFILE=mist
 
 # Feature flags
@@ -447,10 +457,10 @@ npm run dev   # Vite dev server on localhost:1420 + Tauri shell window
 5. Add unit tests under `tests/unit/knowledge/`
 
 ### Adding new voice features
-1. Modify `backend/voice_processor.py` for pipeline changes
-2. Update `backend/voice_models/model_manager.py` for model integration
-3. Add WebSocket message types to ADR-017 if FE coordination required
-4. Emit the new events from `server.py` / `voice_processor.py`
+1. Change turn behaviour in `backend/realtime/turn.py` (the per-session `TurnController`) and audio ingest in `backend/realtime/ingress.py`
+2. Add a speech engine as an adapter in `backend/realtime/engines/` implementing a protocol in `backend/realtime/speech.py`, named in a `MIST_VOICE_*_CHAIN` and loaded by `load_speech_engines` (`backend/realtime/runtime.py`)
+3. Add WebSocket message types to `backend/realtime/protocol.py`, and to ADR-017 if FE coordination is required
+4. Send the new events from the session (`backend/realtime/session.py`), on the lane they belong to (`backend/realtime/lanes.py`)
 
 ### Adding new vault primitives
 1. Extend `backend/vault/` (writer / sidecar / filewatcher) per ADR-010 invariants
