@@ -20,7 +20,12 @@ manifest's own `train` subset is refused, because its scores on `tune` or `test`
 scores on unseen recordings.
 
 The report holds file ids, labels, counts, rates and milliseconds. Transcripts stay in memory
-for the one `decide` call that reads them, and are never written or logged.
+while their recording is judged at each threshold (an ambient file's for as long as its
+`AmbientGate` lives), for the `decide` calls that read them, and are never written or logged.
+
+`spotter_eval` measures the server bar through the same driver: `accepted_wakes` counts the
+recordings the gate wakes on at each threshold, and `AmbientGate` the hits it accepts in ambient
+audio that is not in the manifest. The engines come from `real_engines`, as here.
 
 Timings follow the live path rather than the offline wall clock. Audio arrives at real time on
 the uplink, so a hit's verdict cannot come before `gate_tail_ms` of audio after it, or before
@@ -40,7 +45,7 @@ import re
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -153,14 +158,33 @@ def positive_quantile_table(
 
 @dataclass(frozen=True, slots=True)
 class _Feed:
-    """Frames one `spotter_feed` call releases: `warm` scored silently, then `push` reported.
+    """Frames the spotter scores in turn: `warm` scored silently, then `push` reported.
 
     The harness never resets the stream: it has no mute and no backlog, the only causes of a
     reset in ingress, and each recording gets a stream of its own.
     """
 
-    warm: tuple[int, ...]
-    push: tuple[int, ...]
+    warm: range
+    push: range
+
+
+def _released(feeds: list[_Feed], warm: range, push: range) -> None:
+    """Add one `spotter_feed` release to `feeds`, joined to the last feed where it can be.
+
+    Releases are contiguous, so a release after a feed that pushed nothing, or one that warms
+    nothing after a feed that pushed, extends that feed and the stream hears the same frames in
+    the same order. A recording's feeds then grow with its segments, not its frames, which keeps
+    hours of ambient audio's feeds small enough to hold.
+    """
+    if feeds:
+        last = feeds[-1]
+        if not last.push:
+            feeds[-1] = _Feed(warm=range(last.warm.start, warm.stop), push=push)
+            return
+        if not warm:
+            feeds[-1] = _Feed(warm=last.warm, push=range(last.push.start, push.stop))
+            return
+    feeds.append(_Feed(warm=warm, push=push))
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,8 +209,8 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
     warmed. Frames still waiting when the recording ends, which an onset could yet have made
     pre-roll, are not scored, as ingress would not have scored them yet.
     """
-    usable = len(pcm) // FRAME_BYTES * FRAME_BYTES
-    frames = tuple(pcm[start : start + FRAME_BYTES] for start in range(0, usable, FRAME_BYTES))
+    frames = _frames(pcm)
+    usable = len(frames) * FRAME_BYTES
     samples = np.frombuffer(pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0
     stream = vad.open_stream()
     tracker = SpeechSegmentTracker(cfg)
@@ -218,11 +242,17 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
             lead,
         )
         if released.end > next_pos:
-            feeds.append(_Feed(warm=tuple(released.warm), push=tuple(released.push)))
+            _released(feeds, released.warm, released.push)
             next_pos = released.end
     if tracker.open_segment is not None:
         segments.append(tracker.open_segment)
     return _Heard(frames=frames, feeds=tuple(feeds), segments=tuple(segments))
+
+
+def _frames(pcm: bytes) -> tuple[bytes, ...]:
+    """A recording's whole 20 ms frames; a partial last frame is never routed."""
+    usable = len(pcm) // FRAME_BYTES * FRAME_BYTES
+    return tuple(pcm[start : start + FRAME_BYTES] for start in range(0, usable, FRAME_BYTES))
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,7 +285,11 @@ class _Outcome:
 
 
 class _Driver:
-    """Runs recordings through stage 1 and the gate at every threshold of the run."""
+    """Runs recordings through stage 1 and the gate at every threshold of the run.
+
+    A recording is named in log lines by a source label: a manifest entry by its file id, an
+    ambient file by its number (`AmbientGate`).
+    """
 
     def __init__(
         self,
@@ -265,20 +299,28 @@ class _Driver:
         clock: Callable[[], float],
     ) -> None:
         self._engines = engines
+        self._settings = settings
         self._endpointing = settings.endpointing
         self._wake = settings.wake
         self._clock = clock
         self._lead = onset_lead_frames(settings.endpointing)
-        # The live gate reads the stream's threshold for the self-media check, and the threshold
-        # under test is the one the daily instance would run with.
-        self._gates = {
-            threshold: AddresseeGate(
-                dataclasses.replace(settings.wake, kws_threshold=threshold),
-                echo_guard_ms=settings.barge_in.echo_guard_ms,
-            )
-            for threshold in thresholds
-        }
+        self._thresholds = tuple(thresholds)
+        self._gates: dict[float, AddresseeGate] = {}
+        self.decodes = 0
         self.decode_errors = 0
+
+    def gate(self, threshold: float) -> AddresseeGate:
+        """The gate at `threshold`, built once.
+
+        The live gate reads the stream's threshold for the self-media check, and the threshold
+        under test is the one the daily instance would run with.
+        """
+        if threshold not in self._gates:
+            self._gates[threshold] = AddresseeGate(
+                dataclasses.replace(self._wake, kws_threshold=threshold),
+                echo_guard_ms=self._settings.barge_in.echo_guard_ms,
+            )
+        return self._gates[threshold]
 
     def run(self, item: Entry, offset: int) -> dict[float, _Outcome]:
         """Every threshold's outcome for one recording, its frames numbered from `offset`.
@@ -291,14 +333,18 @@ class _Driver:
         decodes: dict[tuple[int, int], tuple[str, float] | None] = {}
         return {
             threshold: _Outcome(
-                item, heard, self._spot(item, heard, offset, gate, reference, decodes, threshold)
+                item,
+                heard,
+                self._spot(
+                    item.file, heard, offset, self.gate(threshold), reference, decodes, threshold
+                ),
             )
-            for threshold, gate in self._gates.items()
+            for threshold in self._thresholds
         }
 
     def _spot(
         self,
-        item: Entry,
+        source: str,
         heard: _Heard,
         offset: int,
         gate: AddresseeGate,
@@ -315,13 +361,13 @@ class _Driver:
                 arrival = self._clock()
                 for found in stream.push(heard.frames[position], offset + position):
                     results.append(
-                        self._judge(item, heard, found, offset, arrival, gate, reference, decodes)
+                        self._judge(source, heard, found, offset, arrival, gate, reference, decodes)
                     )
         return tuple(results)
 
     def _judge(
         self,
-        item: Entry,
+        source: str,
         heard: _Heard,
         found: NameHit,
         offset: int,
@@ -337,7 +383,7 @@ class _Driver:
         screen_ms = (self._clock() - arrival) * 1000
         reference_score = None
         if verdict is None and reference is not None:
-            reference_score = self._reference_score(item, reference, position)
+            reference_score = self._reference_score(source, reference, position)
             verdict = gate.pre_decode(
                 score=found.score, reference_score=reference_score, recent_tts_text=""
             )
@@ -347,7 +393,7 @@ class _Driver:
 
         span = self._span(heard, position)
         if span not in decodes:
-            decodes[span] = self._decode(item, heard, span)
+            decodes[span] = self._decode(source, heard, span)
         decoded = decodes[span]
         if decoded is None:
             # A failed gate decode rejects the candidate live, and so it does here.
@@ -387,11 +433,12 @@ class _Driver:
         return start, end
 
     def _decode(
-        self, item: Entry, heard: _Heard, span: tuple[int, int]
+        self, source: str, heard: _Heard, span: tuple[int, int]
     ) -> tuple[str, float] | None:
         start, end = span
         pcm = b"".join(heard.frames[start : end + 1])
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        self.decodes += 1
         stream = self._engines.transcriber.open_stream()
         try:
             stream.push(audio)
@@ -400,13 +447,13 @@ class _Driver:
             decode_ms = (self._clock() - before) * 1000
         except SpeechEngineError:
             self.decode_errors += 1
-            logger.warning("Gate decode failed for %s; counted as not addressed", item.file)
+            logger.warning("Gate decode failed for %s; counted as not addressed", source)
             return None
         finally:
             stream.close()
         return update.text, decode_ms
 
-    def _reference_score(self, item: Entry, reference: bytes, position: int) -> float | None:
+    def _reference_score(self, source: str, reference: bytes, position: int) -> float | None:
         """The spotter's score over the PC's output in the window ending at the hit.
 
         The window is ingress's: the spotter's own window plus `reference_tolerance_ms` before
@@ -422,8 +469,127 @@ class _Driver:
                 reference[first * FRAME_BYTES : (position + 1) * FRAME_BYTES]
             )
         except SpeechEngineError:
-            logger.warning("Reference scoring failed for %s; scored as absent", item.file)
+            logger.warning("Reference scoring failed for %s; scored as absent", source)
             return None
+
+
+def _outcomes(driver: _Driver, entries: Sequence[Entry]) -> Iterator[dict[float, _Outcome]]:
+    """Each entry's outcomes at every threshold, in manifest order.
+
+    Frames are numbered on one uplink running from the first recording to the last, so a hit's
+    position names its recording.
+    """
+    offset = 0
+    for number, item in enumerate(entries, start=1):
+        outcomes = driver.run(item, offset)
+        heard = next(iter(outcomes.values())).heard
+        offset += len(heard.frames)
+        logger.debug(
+            "Entry %d of %d (%s): %d frames, %d segments",
+            number,
+            len(entries),
+            item.file,
+            len(heard.frames),
+            len(heard.segments),
+        )
+        yield outcomes
+
+
+@dataclass(slots=True)
+class DecodeCounts:
+    """Gate decodes run and failed, which `accepted_wakes` adds to for a caller's report."""
+
+    decodes: int = 0
+    decode_errors: int = 0
+
+
+def accepted_wakes(
+    entries: Sequence[Entry],
+    engines: Engines,
+    settings: VoiceSettings,
+    thresholds: Sequence[float],
+    clock: Callable[[], float],
+    *,
+    counts: DecodeCounts | None = None,
+) -> dict[float, int]:
+    """At each threshold, the entries with at least one hit the gate accepts.
+
+    Over positives this is the count the tune and test passes report as woken, their total less
+    their missed: the same driver over the same entries, numbered the same way. `counts`, when
+    given, gains the run's gate decodes and failed decodes.
+    """
+    driver = _Driver(engines, settings, thresholds, clock)
+    woken = dict.fromkeys(thresholds, 0)
+    for outcomes in _outcomes(driver, entries):
+        for threshold, outcome in outcomes.items():
+            woken[threshold] += bool(outcome.accepted)
+    if counts is not None:
+        counts.decodes += driver.decodes
+        counts.decode_errors += driver.decode_errors
+    return woken
+
+
+class AmbientGate:
+    """Counts the hits the gate accepts in ambient audio, one file and one threshold at a time.
+
+    Each file goes through the driver as a recording does: the VAD's segments, every frame fed
+    through `spotter_feed` to a fresh stream at the threshold, warmed or pushed as ingress feeds
+    it, and each pushed hit judged as the live gate judges it with no reference and nothing she
+    said, which is the room where she is idle and the PC plays nothing. A warmed hit is never
+    reported, so never gated.
+
+    A file is heard by the VAD once: its segments and feeds are kept, and its audio is read
+    again at each threshold, so one file's audio is held at a time. Each span is decoded at most
+    once per file, whatever the threshold, and a failed decode rejects its hit as it does live.
+    `decodes` and `decode_errors` count both across files, and `listen_s` is the clock's time
+    spent in the VAD. A log line names a file only as "ambient file <i>", its place in the order
+    the files were first given.
+    """
+
+    def __init__(
+        self, engines: Engines, settings: VoiceSettings, clock: Callable[[], float]
+    ) -> None:
+        self._driver = _Driver(engines, settings, (), clock)
+        self._vad = engines.vad
+        self._endpointing = settings.endpointing
+        self._clock = clock
+        self._heard: dict[Path, tuple[str, _Heard]] = {}
+        self._decoded: dict[Path, dict[tuple[int, int], tuple[str, float] | None]] = {}
+        self.listen_s = 0.0
+
+    @property
+    def decodes(self) -> int:
+        """Gate decodes run, failed ones included."""
+        return self._driver.decodes
+
+    @property
+    def decode_errors(self) -> int:
+        """Gate decodes that failed, each rejecting its hit."""
+        return self._driver.decode_errors
+
+    def accepted_hits(self, path: Path, threshold: float) -> int:
+        """The hits in one ambient file at `threshold` that the gate accepts."""
+        pcm = read_pcm16(path)
+        if path in self._heard:
+            source, kept = self._heard[path]
+            heard = dataclasses.replace(kept, frames=_frames(pcm))
+        else:
+            source = f"ambient file {len(self._heard) + 1}"
+            start = self._clock()
+            heard = _listen(pcm, self._vad, self._endpointing)
+            self.listen_s += self._clock() - start
+            self._heard[path] = (source, dataclasses.replace(heard, frames=()))
+            self._decoded[path] = {}
+        hits = self._driver._spot(
+            source,
+            heard,
+            0,
+            self._driver.gate(threshold),
+            None,
+            self._decoded[path],
+            threshold,
+        )
+        return sum(item.verdict.accepted for item in hits)
 
 
 # -- The report -------------------------------------------------------------------------------
@@ -551,21 +717,9 @@ def evaluate(
     """
     driver = _Driver(engines, settings, thresholds, clock)
     by_threshold: dict[float, list[_Outcome]] = {threshold: [] for threshold in thresholds}
-    offset = 0
-    for number, item in enumerate(entries, start=1):
-        outcomes = driver.run(item, offset)
-        heard = next(iter(outcomes.values())).heard
-        offset += len(heard.frames)
+    for outcomes in _outcomes(driver, entries):
         for threshold, outcome in outcomes.items():
             by_threshold[threshold].append(outcome)
-        logger.debug(
-            "Entry %d of %d (%s): %d frames, %d segments",
-            number,
-            len(entries),
-            item.file,
-            len(heard.frames),
-            len(heard.segments),
-        )
 
     names = frozenset(name.lower() for name in model.names)
     media_hours = sum(item.duration_ms for item in entries if item.label == "media") / 3_600_000
@@ -647,7 +801,7 @@ def _thresholds(value: str) -> list[float]:
     return sorted(parsed)
 
 
-def _real_engines(spec: str) -> EngineLoader:
+def real_engines(spec: str) -> EngineLoader:
     """The spotter and VAD from the placement, and the STT from a named factory.
 
     The factory is `<module>:<callable>`, called with the placement and returning a
@@ -726,7 +880,7 @@ def _run(
     if load_engines is None:
         if not args.stt_factory:
             raise RefusedError("--stt-factory is required to load the real engines")
-        load_engines = _real_engines(args.stt_factory)
+        load_engines = real_engines(args.stt_factory)
     if not _MODEL_ID.fullmatch(args.model):
         raise RefusedError(f"--model {args.model!r}: expected a model id [a-z0-9][a-z0-9-]*")
     try:
