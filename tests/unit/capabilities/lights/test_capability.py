@@ -113,13 +113,16 @@ class StubProvider:
 def _capability(
     provider: StubProvider | HomeAssistantLightsProvider | None = None,
     default_target: str | None = None,
+    area_of: Callable[[str], str | None] | None = None,
 ) -> LightsCapability:
+    # Left out unless a test names it, so the other tests check the default.
+    extra = {} if area_of is None else {"area_of": area_of}
     return LightsCapability(
-        provider or StubProvider(), default_target=default_target, counter=COUNTER
+        provider or StubProvider(), default_target=default_target, counter=COUNTER, **extra
     )
 
 
-def _ctx() -> InvocationContext:
+def _ctx(endpoint: str | None = None) -> InvocationContext:
     return InvocationContext(
         session_id="s1",
         turn_id="t1",
@@ -127,6 +130,7 @@ def _ctx() -> InvocationContext:
         tool_call_id="c1",
         source="fastpath",
         now=DEFAULT_START,
+        endpoint=endpoint,
     )
 
 
@@ -134,9 +138,11 @@ def _spec(capability: LightsCapability, name: str):
     return next(spec for spec in capability.tools() if spec.name == name)
 
 
-async def _invoke(capability: LightsCapability, tool: str, **args: object) -> ToolOutcome:
+async def _invoke(
+    capability: LightsCapability, tool: str, *, endpoint: str | None = None, **args: object
+) -> ToolOutcome:
     validated = _spec(capability, tool).args_model.model_validate(args)
-    return await capability.invoke(tool, validated, _ctx())
+    return await capability.invoke(tool, validated, _ctx(endpoint))
 
 
 def _lines(capability: LightsCapability, refine: bool) -> list[str]:
@@ -397,6 +403,74 @@ class TestPower:
         provider = StubProvider()
         await _invoke(_capability(provider), POWER, target="LIVING ROOM", on=False)
         assert provider.calls == [("power", LightTarget(kind="area", value="Living Room"), False)]
+
+
+class TestDeviceArea:
+    """An untargeted power or adjust call from a room device acts on the device's area."""
+
+    AREAS = {"bedside": "Bedroom", "hallway": None}
+
+    def _capability(self, provider: StubProvider) -> LightsCapability:
+        return _capability(provider, default_target="Living Room", area_of=self.AREAS.get)
+
+    @pytest.mark.parametrize(
+        ("tool", "args", "call"),
+        [
+            (POWER, {"on": True}, ("power", True)),
+            (ADJUST, {"brightness_pct": 30}, ("adjust", LightAdjustment(brightness_pct=30))),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_untargeted_call_from_a_device_acts_on_its_area(self, tool, args, call):
+        provider = StubProvider()
+
+        outcome = await _invoke(self._capability(provider), tool, endpoint="bedside", **args)
+
+        assert outcome.status == "ok"
+        assert outcome.data["target"] == "Bedroom"
+        assert provider.calls == [(call[0], LightTarget(kind="area", value="Bedroom"), call[1])]
+
+    @pytest.mark.parametrize("endpoint", ["desktop", "hallway", None])
+    @pytest.mark.asyncio
+    async def test_the_desktop_or_a_device_with_no_area_takes_the_default_target(self, endpoint):
+        provider = StubProvider()
+
+        outcome = await _invoke(self._capability(provider), POWER, endpoint=endpoint, on=False)
+
+        assert outcome.summary == "Living Room lights off."
+        assert provider.calls == [("power", LightTarget(kind="area", value="Living Room"), False)]
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_target_wins_over_the_devices_area(self):
+        provider = StubProvider()
+
+        await _invoke(
+            self._capability(provider), ADJUST, endpoint="bedside", target="kitchen", color="red"
+        )
+
+        assert provider.calls == [
+            ("adjust", LightTarget(kind="area", value="Kitchen"), LightAdjustment(color="red"))
+        ]
+
+    @pytest.mark.asyncio
+    async def test_status_without_a_target_still_reads_every_light(self):
+        provider = StubProvider()
+
+        await _invoke(self._capability(provider), STATUS, endpoint="bedside")
+
+        assert provider.calls == [("status", None, None)]
+
+    def test_an_untargeted_proposal_names_no_room_once_areas_are_routed(self):
+        # The summary is built without the call's context, so it cannot know whether the
+        # device's area or the default target will be acted on.
+        spec = _spec(self._capability(StubProvider()), POWER)
+
+        assert spec.summarize(spec.args_model.model_validate({"on": True})) == (
+            "turn on the lights"
+        )
+        assert spec.summarize(
+            spec.args_model.model_validate({"target": "kitchen", "on": True})
+        ) == ("turn on the kitchen lights")
 
 
 class TestAdjust:

@@ -405,6 +405,7 @@ class CapabilityHost(CapabilityTurnPort):
         tiers: TierProviders | None = None,
         register: ReplyRegister = NoAddress(),
         turn_endpoint: str = "desktop",
+        endpoint_of: Callable[[str], str | None] | None = None,
     ) -> None:
         """Register the capabilities; nothing is started and no file is touched.
 
@@ -432,9 +433,12 @@ class CapabilityHost(CapabilityTurnPort):
             register: Supplies the address form that ends each session's first templated
                 reply (`with_address`). `NoAddress()` by default, which leaves every reply
                 as `replies.py` renders it.
-            turn_endpoint: The endpoint every call's `InvocationContext.endpoint` names when
-                its context names none: `desktop`, the endpoint of typed turns, until turns
-                are routed per connection.
+            turn_endpoint: The endpoint a call's `InvocationContext.endpoint` names when its
+                context names none and `endpoint_of` gives none for its session: `desktop`,
+                the endpoint of typed turns, by default.
+            endpoint_of: The endpoint a live session is bound to, or None for one that is not
+                connected (`SessionRegistry.endpoint_of`), so a call from a room device's
+                session names that device. None leaves every such call on `turn_endpoint`.
 
         Raises:
             CapabilityRegistrationError: Two capabilities share a name, or two offer the same
@@ -481,6 +485,7 @@ class CapabilityHost(CapabilityTurnPort):
         self._tiers = tiers
         self._register = register
         self._turn_endpoint = turn_endpoint
+        self._endpoint_of = endpoint_of
         # Sessions that have had a templated reply, so only each one's first is addressed.
         self._addressed: set[str] = set()
         # Per session, the `received_at` of the turn `plan_turn` built a decode for, which its
@@ -953,12 +958,11 @@ class CapabilityHost(CapabilityTurnPort):
             return await self._repair(decode, capability, spec, arguments, error, utterance)
 
         now = self._clock.now()
+        endpoint = self._endpoint(session_id)
         items = [
             (
                 call,
-                InvocationContext(
-                    session_id, turn_id, utterance, call.id, "model", now, self._turn_endpoint
-                ),
+                InvocationContext(session_id, turn_id, utterance, call.id, "model", now, endpoint),
             )
             for call in calls
         ]
@@ -1038,12 +1042,12 @@ class CapabilityHost(CapabilityTurnPort):
         Returns:
             The record. A call that needs confirmation becomes a proposal of its own,
             superseding the session's live one, and its outcome is `pending_confirmation`.
-            Its `turn_ms` counts from this call. A context that names no endpoint is given the
-            host's turn endpoint.
+            Its `turn_ms` counts from this call. A context that names no endpoint is given its
+            session's, or the host's turn endpoint when the session has none.
         """
         received = time.monotonic()
         if ctx.endpoint is None:
-            ctx = dataclasses.replace(ctx, endpoint=self._turn_endpoint)
+            ctx = dataclasses.replace(ctx, endpoint=self._endpoint(ctx.session_id))
         async with self._lock(ctx.session_id):
             (record,) = await self._run_calls(
                 ctx.session_id, [(tool_call, ctx)], offered, None, received
@@ -1370,7 +1374,7 @@ class CapabilityHost(CapabilityTurnPort):
                 tool_call_id=str(uuid.uuid4()),
                 source="proposal",
                 now=self._clock.now(),
-                endpoint=self._turn_endpoint,
+                endpoint=self._endpoint(proposal.session_id),
             )
             processed = await self._decide_and_run(
                 _Ready(capability, spec, call.args, call.summary), ctx, received
@@ -1429,7 +1433,7 @@ class CapabilityHost(CapabilityTurnPort):
                 tool_call_id=str(uuid.uuid4()),
                 source="fastpath",
                 now=self._clock.now(),
-                endpoint=self._turn_endpoint,
+                endpoint=self._endpoint(session_id),
             )
             record = await self._record(
                 ctx,
@@ -1466,13 +1470,26 @@ class CapabilityHost(CapabilityTurnPort):
             tool_call_id=call.id,
             source="fastpath",
             now=self._clock.now(),
-            endpoint=self._turn_endpoint,
+            endpoint=self._endpoint(session_id),
         )
         async with self._lock(session_id):
             records = await self._run_calls(session_id, [(call, ctx)], None, None, received)
         return PreTurnResolution(True, reply_for(records), None, records, ())
 
     # -- Helpers ---------------------------------------------------------------------------
+
+    def _endpoint(self, session_id: str) -> str:
+        """Return the endpoint of a call whose context names none.
+
+        The session's own endpoint comes first, so a call from a room device's session names
+        that device; a session `endpoint_of` does not know, or no `endpoint_of`, gives the
+        turn endpoint.
+        """
+        if self._endpoint_of is not None:
+            endpoint = self._endpoint_of(session_id)
+            if endpoint is not None:
+                return endpoint
+        return self._turn_endpoint
 
     def _addressed_reply(self, session_id: str, reply: str) -> str:
         """Give a templated reply the address form when it is the session's first.
