@@ -430,8 +430,7 @@ def test_speculative_starts_are_cancelled_by_resumed_speech_and_released_at_the_
 
     The end-of-turn model never says done (0.2), so each pause opens a held speculative turn.
     The first is cancelled when speech resumes, and leaves nothing on the wire; the second is
-    released at the silence cap. The third part, a supersede with merged text, is a spec gap:
-    the controller never sends `voice_decision supersede`.
+    released at the silence cap. The third part, the supersede, is the next test.
     """
     text = "mist, what's the weather like"
     stack = VoiceStack(transcripts=[text], eot=(0.2,))
@@ -456,6 +455,45 @@ def test_speculative_starts_are_cancelled_by_resumed_speech_and_released_at_the_
         assert one(client, "endpoint")["turn_id"] == turn_id
         assert metrics["outcome"] == "completed"
         assert [commit.outcome for commit in srv.responder.commits] == ["completed"]
+        assert_protocol_rules(client)
+
+
+def test_a_name_while_she_thinks_supersedes_the_turn(voice_server):
+    """v1 scenario 5, its third part, on v13's A51 (T55c).
+
+    The responder pauses before the first turn's first token, so none of its audio is queued
+    when the second name is accepted: the name supersedes the turn instead of barging in. The
+    `supersede` goes out at the cut (Decision 2, option A), and the first turn is committed
+    `superseded` there; the second turn's request is its own utterance's text (T55d merges).
+    """
+    stack = VoiceStack(transcripts=["mist, what's the weather", "mist, and in Paris"])
+    pause = Pause()
+    with voice_server(stack) as srv, srv.connect() as client:
+        srv.responder.add(pause, Token("It is sunny."))
+        srv.responder.add(Token("In Paris it rains."))
+        client.send(voice_start(1))
+        client.say(NAMED, name_at_ms=NAME_AT_MS)
+        (first,) = (item["turn_id"] for item in client.of("state_cycle", state="think"))
+        client.say(NAMED, name_at_ms=NAME_AT_MS)
+        srv.run(pause.release)
+        metrics = finish(client)
+
+        supersede = one(client, "supersede", turn_id=first)
+        assert (supersede["reason"], supersede["detail"]) == (
+            "continued_speech",
+            {"merged": False, "tool_dispatched": False},
+        )
+        cancelled = one(client, "stream_cancelled", turn_id=first)
+        assert cancelled["reason"] == "superseded"
+        assert client.voice.index(supersede) < client.voice.index(cancelled)
+        assert client.of("barge_in") == []
+        assert one(client, "turn_metrics", turn_id=first)["outcome"] == "superseded"
+        assert [request.user_text for request in srv.responder.requests] == [
+            "mist, what's the weather",
+            "mist, and in Paris",
+        ]
+        assert [commit.outcome for commit in srv.responder.commits] == ["superseded", "completed"]
+        assert metrics["turn_id"] != first and metrics["outcome"] == "completed"
         assert_protocol_rules(client)
 
 

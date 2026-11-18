@@ -80,6 +80,7 @@ from .turn_fakes import (
     InlineLane,
     Pause,
     RecordingIngress,
+    Sent,
     WaitGate,
     close_live_controllers,
     describe,
@@ -3008,6 +3009,8 @@ INTERLEAVING_TEXTS = (
     "mist, wait",
 )
 CLOSING_MESSAGES = ("transcription", "voice_decision:dropped", "voice_decision:wake_lost")
+CUT_REASONS = ("user_interrupt", "barge_in", "superseded", "new_input", "voice_stop")
+"""The `stream_cancelled` reasons a cut sends; a disconnect's cut sends nothing."""
 EVERY_KIND = frozenset(
     {
         "SpeechStarted",
@@ -3044,6 +3047,72 @@ def named_utterance(item: object) -> str | None:
     if uid is None:
         uid = getattr(getattr(item, "detail", None), "utterance_id", None)
     return uid if isinstance(uid, str) else None
+
+
+def superseded_turns(sent: list[Sent]) -> list[str]:
+    """The turns a `supersede` named, in send order."""
+    return [str(s.turn_id) for s in sent if describe(s.item) == "voice_decision:supersede"]
+
+
+def check_cuts(sent: list[Sent]) -> None:
+    """Each cut's reason is a cut reason, and `superseded` is the reason exactly for the turns a
+    `supersede` named: once each, before the turn's cut, with no `barge_in`, and its
+    `turn_metrics` outcome `superseded` (A51).
+    """
+    superseded: list[str] = []
+    cut: dict[str, str] = {}
+    for item in sent:
+        name, turn_id = describe(item.item), item.turn_id
+        if name == "voice_decision:supersede":
+            assert turn_id not in superseded, f"a second supersede for {turn_id}"
+            assert turn_id not in cut, f"a supersede for {turn_id} after its cut"
+            superseded.append(str(turn_id))
+        elif name == "voice_decision:barge_in":
+            assert turn_id not in superseded, f"a barge_in for superseded {turn_id}"
+        elif name == "stream_cancelled":
+            reason = item.item.reason  # type: ignore[attr-defined]
+            assert reason in CUT_REASONS, f"stream_cancelled reason {reason}"
+            assert (reason == "superseded") == (turn_id in superseded), f"{turn_id}: {reason}"
+            cut[str(turn_id)] = reason
+        elif name == "turn_metrics":
+            outcome = item.item.outcome  # type: ignore[attr-defined]
+            assert (outcome == "superseded") == (turn_id in superseded), f"{turn_id}: {outcome}"
+    assert all(cut.get(t) == "superseded" for t in superseded), f"a supersede uncut: {cut}"
+
+
+async def test_the_cut_checks_accept_a_supersede_and_catch_each_mismatch():
+    """`check_cuts`, which the interleavings run at every step, is not vacuous."""
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "thinking"
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    h.post(h.ingress.heard(uid, hit_pos=110))
+    await h.settle()
+    h.post(h.ingress.partial(uid, "mist, and then", gate=True, through_pos=125))
+    await h.settle()
+
+    sent = list(h.outbound.sent)
+    assert len(superseded_turns(sent)) == 1
+    check_cuts(sent)
+
+    def cancelled_as(reason: str) -> list[Sent]:
+        return [
+            (
+                Sent(s.lane, s.item.model_copy(update={"reason": reason}), s.turn_id)  # type: ignore[attr-defined]
+                if describe(s.item) == "stream_cancelled"
+                else s
+            )
+            for s in sent
+        ]
+
+    unannounced = [s for s in sent if describe(s.item) != "voice_decision:supersede"]
+    uncut = [s for s in sent if describe(s.item) != "stream_cancelled"]
+    for broken in (unannounced, uncut, cancelled_as("barge_in"), cancelled_as("disconnect")):
+        with pytest.raises(AssertionError):
+            check_cuts(broken)
 
 
 def random_script(rng: random.Random, pauses: list[Pause]) -> list[object]:
@@ -3088,6 +3157,7 @@ class Interleaving:
         self.gate_asks: list[tuple[str, int]] = []
         self.failures: list[str] = []
         self.committed: list[int] = []
+        self.outcomes: list[str] = []
         self.stale_verdicts = 0
         self.trace: list[str] = []
         self._instrument()
@@ -3101,6 +3171,7 @@ class Interleaving:
 
         def commit(scope, delivery):
             self.committed.append(scope.turn_index)
+            self.outcomes.append(delivery.outcome)
             return commit_turn(scope, delivery)
 
         responder.commit_turn = commit  # type: ignore[method-assign]
@@ -3360,6 +3431,7 @@ class Interleaving:
                 assert call[2] not in cancelled, f"{call} after its turn's cancel_turn"
             elif call[0] == "tool_view":
                 assert call[1] not in cancelled, f"{call} after its turn's cancel_turn"
+        check_cuts(h.outbound.sent)
 
     async def finish(self) -> None:
         """Drain and stop voice, check, close, then check the end invariants."""
@@ -3399,10 +3471,13 @@ class Interleaving:
         h.outbound.take_all()
         assert h.outbound.control == []
         assert h.outbound.lane.take() is None
-        # Every shown turn was committed exactly once, and no other turn was.
+        # Every shown turn was committed exactly once, a superseded one included, and no other
+        # turn was; each superseded turn's commit says `superseded`.
         commits = collections.Counter(self.committed)
         assert all(n == 1 for n in commits.values()), f"a turn committed twice: {commits}"
         assert len(commits) == len(set(h.outbound.queued_turn_ids()))
+        outcomes = collections.Counter(self.outcomes)
+        assert outcomes["superseded"] == len(superseded_turns(h.outbound.sent)), f"{outcomes}"
         # Every claim was settled exactly once.
         settles = collections.Counter(cid for cid, _ in h.arbiter.settles)
         assert settles == collections.Counter(c.claim_id for c in h.arbiter.claims)

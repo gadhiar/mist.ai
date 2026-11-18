@@ -8,6 +8,13 @@ step and after a drain at every leaf. It reuses `turn_fakes.py` and wraps its fa
 Spec: plan v2 :1866, as v3 :1703, v4 :330, v5 :1751, v6 :1658, v8 :273 and v9 :320 change it.
 v5 removed push-to-talk, the hold in `thinking` and its supersede, so the alphabet has no press
 and I1 is gone, and M67 holds only at a held turn's release. D8 (the alarm rule) is deferred.
+v13's A51 (T55c) brings a supersede back on v5's trigger: a name accepted while a model turn is
+in `thinking` with none of its audio queued supersedes the turn instead of barging in. The
+`supersede` invariant checks, at every send and every acceptance, that a `supersede` comes only
+in an accepting step, exactly when the turn in flight is not held or ending, is `thinking`, has
+no audio queued and no capability answer (`answered` is always None here, since D8 is
+deferred), and is followed in that step by its cut's `stream_cancelled superseded`, with no
+`barge_in`. The reach order `supersede` shows the search visits one.
 
 The harness:
 
@@ -92,11 +99,13 @@ after v opens reaches one snapshot, and only one of the two holds the step. Two 
 `reconfigure behind a voice restart` and `text ahead of a step's muted drop`, are not v2
 orders: they show that the eager step meets C1.
 
-Three orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
+Four orders need more than their start's default depth. B8 needs 8 from `thinking_tool`: its
 frameless `0x02` is fifth on the lane and each take moves one item. B1(d) needs 4 from
 `speaking`: a name, the lost verdict, w's end and v's VAD start. The posting-step witness needs
-6 from `idle`. Each one's reach run searches only the actions that the order and its
-alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`, `POSTING_ALPHABET`) to its own depth: every
+6 from `idle`. The supersede needs 4 from `thinking_tool`: a name, its grant, the gate decode,
+and the tool's end, since the cut waits on the tool's grace. Each one's reach run searches only
+the actions that the order and its alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`,
+`POSTING_ALPHABET`, `SUPERSEDE_ALPHABET`) to its own depth: every
 sequence of those actions, with the same reductions and invariants, and no other action. A
 search keys its visited states on the progress of its start's full-alphabet orders and of its
 own narrowed ones only. The default depths stay as ruled.
@@ -166,6 +175,7 @@ from .turn_fakes import (
     RecordingIngress,
     RecordingOutbound,
     RecordingScenePort,
+    Sent,
     default_gate,
     describe,
     floor_placement,
@@ -545,6 +555,8 @@ class World:
     handling: Step | None = None
     labels: list[str] = field(default_factory=list)
     accepted: set[str] = field(default_factory=set)
+    accepting: int = 0
+    """How many acceptances are running now; a `supersede` may be sent only inside one (A51)."""
     handled: list[Handled] = field(default_factory=list)
     stopped: ModelIngress | None = None
     checking: bool = True
@@ -677,7 +689,18 @@ class World:
         async def accepted(wake):
             # The gate's verdict is the acceptance; what the accepting step sends may name it.
             self.accepted.add(wake.utterance_id)
-            await accept_wake(wake)
+            turn = c._turn
+            live = turn is not None and not turn.ending and not turn.held
+            trigger = (
+                live and c._phase == "thinking" and not turn.frames_queued and turn.answered is None
+            )
+            sent_from = len(self.outbound.sent)
+            self.accepting += 1
+            try:
+                await accept_wake(wake)
+            finally:
+                self.accepting -= 1
+            self.check_supersede(turn if trigger else None, self.outbound.sent[sent_from:])
 
         c._accept_wake = accepted  # type: ignore[method-assign]
         synthesize = self.synth.synthesize
@@ -720,6 +743,11 @@ class World:
                 self.handling = None
             if any(purge.terminal for _, purge in self.outbound.purges[step.purges_from :]):
                 facts.add("purged 0x02")
+            if any(
+                describe(item) == "voice_decision:supersede"
+                for item in self.outbound.client[step.client_from :]
+            ):
+                facts.add("superseded")
             if isinstance(message, WakeVerdict) and not message.proceed and ingress is not None:
                 # B1(d): the lost claim's drop names w, whose end and then v's start are queued.
                 lost = [
@@ -802,6 +830,13 @@ class World:
         )
 
     def on_send(self, item: object) -> None:
+        name = describe(item)
+        if self.accepting == 0 and (
+            name == "voice_decision:supersede"
+            or name == "stream_cancelled"
+            and getattr(item, "reason", None) == "superseded"
+        ):
+            self.fail("supersede", f"{name} sent outside an accepting step")
         uid = named_utterance(item)
         if uid is None:
             return
@@ -824,6 +859,34 @@ class World:
         ):
             return
         self.fail("acceptance", f"{describe(item)} names {uid} before its acceptance")
+
+    def check_supersede(self, thinking: object, new: list[Sent]) -> None:
+        """A51: what one acceptance sent, given the turn it found superseded or None.
+
+        `thinking` is the turn in flight when it was not held or ending, in `thinking`, with no
+        audio queued and no capability answer; it alone gets one `supersede`, then its cut's
+        `stream_cancelled superseded`, and no `barge_in`. Any other acceptance supersedes nothing.
+        """
+        names = [describe(s.item) for s in new]
+        supersedes = [s for s in new if describe(s.item) == "voice_decision:supersede"]
+        if thinking is None:
+            if supersedes:
+                self.fail("supersede", f"a supersede with no thinking turn before audio: {names}")
+            return
+        turn_id = thinking.turn_id  # type: ignore[attr-defined]
+        if [s.turn_id for s in supersedes] != [turn_id]:
+            self.fail("supersede", f"the thinking turn {turn_id} not superseded once: {names}")
+            return
+        if "voice_decision:barge_in" in names:
+            self.fail("supersede", f"a barge_in beside the supersede: {names}")
+        after = new[names.index("voice_decision:supersede") + 1 :]
+        cuts = [
+            (s.turn_id, getattr(s.item, "reason", None))
+            for s in after
+            if describe(s.item) == "stream_cancelled"
+        ]
+        if cuts != [(turn_id, "superseded")]:
+            self.fail("supersede", f"the supersede's cut is {cuts}: {names}")
 
     def check_acceptance(self, what: str) -> None:
         step = self.handling
@@ -1730,6 +1793,14 @@ POSTING_ALPHABET = frozenset({"reconfigure_refused", "name", "mute", "voice_stop
 """The posting-step witness's actions: two refused reconfigures to spend the voice starts, a
 name, the mute and `voice_stop` that leave the controller a muted ingress, and the text."""
 
+SUPERSEDE_DEPTH = 4
+SUPERSEDE_ALPHABET = frozenset(
+    {"name", "grant", "deny", "gate_yes", "gate_no", "say", "tool_end", "advance"}
+)
+"""The supersede's actions and its alternatives': a name and its claim's verdict either way, the
+gate decode addressed or not, a token whose audio would make it a barge-in, and the tool's end or
+its grace running out, either of which lets the cut finish."""
+
 REACH: tuple[Reach, ...] = (
     # v2 :2027-2028, a servable `Reconfigure` while speaking and while a turn is held, which
     # waits for a quiescent point.
@@ -1793,6 +1864,16 @@ REACH: tuple[Reach, ...] = (
             handled("SpeechStarted", before="speaking"),
         ),
         alphabet=B1D_ALPHABET,
+    ),
+    # v13 A51 (T55c): a name, its grant and its addressed gate decode while the tool turn thinks
+    # with no audio queued; the gate decode's step supersedes the turn, waits in the cut on the
+    # tool's grace, and idles once the tool ends. So it needs depth 4.
+    Reach(
+        "supersede",
+        "thinking_tool",
+        SUPERSEDE_DEPTH,
+        (handled("TranscriptPartial", before="thinking", after="idle", fact="superseded"),),
+        alphabet=SUPERSEDE_ALPHABET,
     ),
     # v2 :2029-2030, B9: from `thinking`, a VAD start, then the failure, which moves to `text`.
     Reach(
@@ -2243,7 +2324,19 @@ def _every_handoff_speaks(world: World) -> None:
     c._on_handoff = handoff  # type: ignore[method-assign]
 
 
+def _supersede_every_name(world: World) -> None:
+    """The trigger struck out: a name supersedes any live turn, `speaking` included."""
+    world.controller._supersedes = lambda turn: True  # type: ignore[method-assign]
+
+
+def _never_supersede(world: World) -> None:
+    """The v5 barge-in kept for a thinking turn before audio."""
+    world.controller._supersedes = lambda turn: False  # type: ignore[method-assign]
+
+
 TEETH: list[tuple[str, str, int, Callable[[World], None]]] = [
+    ("supersede", "speaking", 3, _supersede_every_name),
+    ("supersede", "thinking_tool", 3, _never_supersede),
     ("v6 ack", "held", 2, _every_handoff_speaks),
     ("swap", "idle", 3, _quiescent_without_idle_since),
     ("M47", "speaking", 3, _ignore_purge_result),

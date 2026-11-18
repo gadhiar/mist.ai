@@ -38,7 +38,8 @@ candidate in one step and replays any end of turn held meanwhile; rejection drop
 one `wake_rejected`. A claim that loses because another session's name was accepted drops it
 and sends one `wake_lost`, naming its utterance, or a fresh id when an endpoint wake's backlog
 has not opened one yet. While a turn is in flight an accepted name interrupts it with `barge_in`
-reason `wake`. After a name-opened turn a follow-up window, when configured, keeps ingress
+reason `wake`, except a model turn still `thinking` with none of its audio queued, which the name
+supersedes (A51): `supersede`, then the cut with reason `superseded`. After a name-opened turn a follow-up window, when configured, keeps ingress
 engaged so the next utterance needs no name.
 
 T11a builds the core: the mailbox, the channel rule, completed turns, the commit rule, the
@@ -116,6 +117,7 @@ from .protocol import (
     StreamCancelledMessage,
     StreamChannel,
     StreamStartMessage,
+    SupersedeDetail,
     TranscriptionMessage,
     TranscriptPartialMessage,
     TurnLaneStats,
@@ -131,6 +133,7 @@ from .protocol import (
     VoiceDecisionEndpoint,
     VoiceDecisionOverload,
     VoiceDecisionRelease,
+    VoiceDecisionSupersede,
     VoiceDecisionWakeLost,
     VoiceDecisionWakeRejected,
     VoiceStartMessage,
@@ -1949,7 +1952,12 @@ class TurnController:
             self._reject(wake, "not_addressed")
 
     async def _accept_wake(self, wake: _Wake) -> None:
-        """Accept: interrupt a turn in flight, publish in one step, replay a held end (v5)."""
+        """Accept: end a turn in flight, publish in one step, replay a held end (v5).
+
+        A held turn never reached the client and is cancelled without trace. A turn the name
+        supersedes (`_supersedes`) gets `supersede` and its cut; any other gets `barge_in` reason
+        `wake` and its cut. Either way the cut's messages precede the publish.
+        """
         self._candidate = None
         self._settle(wake, True)
         assert wake.utterance_id is not None  # noqa: S101 - only an open candidate is decided
@@ -1965,6 +1973,8 @@ class TurnController:
         if turn is not None and not turn.ending:
             if turn.held:
                 await self._cancel_held(turn)  # it never reached the client
+            elif self._supersedes(turn):
+                await self._supersede(turn)
             else:
                 self._send_control(
                     VoiceDecisionBargeIn(
@@ -1978,6 +1988,33 @@ class TurnController:
                 await self._cut(turn, reason="barge_in")
         self._publish_candidate(utterance, wake=True)
         await self._replay(utterance)
+
+    def _supersedes(self, turn: _Turn) -> bool:
+        """Whether an accepted name supersedes `turn` rather than barging in (A51).
+
+        Only a model turn still `thinking` before any of its audio is queued: v1 supersedes a
+        turn "before MIST has said anything". Once audio is queued (a `HandOff` ack included),
+        in `speaking` or `text`, the name barges in. So does it on a turn the capability-only
+        path answered, whose text that path has already recorded. The caller has excluded a held
+        or ending turn.
+        """
+        return self._phase == "thinking" and not turn.frames_queued and turn.answered is None
+
+    async def _supersede(self, turn: _Turn) -> None:
+        """Send `supersede`, then cut the turn with reason `superseded` (A51).
+
+        The decision goes out at the cut (Decision 2, option A). The cut commits the turn
+        `superseded` with what the client received, "" before any audio, so the next turn's
+        note is `before_reply`; a turn the name opens takes the name's utterance's own text.
+        """
+        self._send_control(
+            VoiceDecisionSupersede(
+                turn_id=turn.turn_id,
+                reason="continued_speech",
+                detail=SupersedeDetail(merged=False, tool_dispatched=turn.scope.tool_dispatched),
+            )
+        )
+        await self._cut(turn, reason="superseded")
 
     def _publish_candidate(self, utterance: _Utterance, *, wake: bool) -> None:
         """Publish an accepted candidate in one step (v5 :411-416, the D3 anchors at :1196-1197).
@@ -3278,6 +3315,8 @@ class TurnController:
     async def _cut(self, turn: _Turn, *, reason: CancelReason, notify: bool = True) -> None:
         """Cancel the turn and commit what the client received (v2 M62, M69).
 
+        The outcome is `superseded` for reason `superseded` (A51) and `interrupted` otherwise.
+
         The task group is cancelled and awaited first, so no token or frame of the turn is
         queued after the purge; the purge and the pacer's stop then run with no await between
         them. A disconnect (`notify` false) sends nothing from the purge on, the pacer's
@@ -3329,7 +3368,8 @@ class TurnController:
         finished = await self._uncancellable(self._wait_tools(turn.scope))
         if notify:
             self._close_orphan_tools(turn)
-        result = self._commit(turn, "interrupted", delivered, tool_effect_unknown=not finished)
+        outcome: Outcome = "superseded" if reason == "superseded" else "interrupted"
+        result = self._commit(turn, outcome, delivered, tool_effect_unknown=not finished)
         if notify:
             if result.error is not None:
                 if purge.stream_start:
