@@ -619,8 +619,8 @@ def cmd_revoke(args: argparse.Namespace, ctx: Context) -> None:
 def cmd_rotate(args: argparse.Namespace, ctx: Context) -> None:
     """Give a device a new token; the backend refuses the old one from its next registry read.
 
-    That holds for new connections only. The backend closes a live session only when its device
-    is revoked or removed, so a session already open on the old token stays open until it ends.
+    That holds for new connections only: rotating closes no session, so one already open on the
+    old token stays open. A connection on the new token replaces it.
     """
     device_dir = _device_dir(args, ctx)
     ca_dir = _ca_dir(args, ctx) if args.ca_dir or ctx.environ.get("MIST_DAILY_ROOT") else None
