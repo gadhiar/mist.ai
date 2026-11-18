@@ -175,11 +175,13 @@ respective licenses:
    Location: Python packages ai-edge-litert 2.3.0 and pymicro-features 2.0.2
              (requirements-voice.txt)
    Source: https://github.com/google-ai-edge/LiteRT (LiteRT)
+           https://github.com/rhasspy/pymicro-features (pymicro-features)
            https://pypi.org/project/ai-edge-litert/
            https://pypi.org/project/pymicro-features/
    License: Apache License 2.0
-   Copyright: Google LLC (LiteRT); original authors of pymicro-features
-              (see the package's license)
+   Copyright: The Google AI Edge Authors (LiteRT); Michael Hansen
+              (pymicro-features), whose package includes TensorFlow Lite's
+              microfrontend sources, Copyright 2018 The TensorFlow Authors
 
    Used by the server name spotter to run the microWakeWord model: LiteRT
    runs the streaming TFLite model, and pymicro-features computes the
