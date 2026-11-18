@@ -3,11 +3,11 @@
 Hermetic: parses the committed compose file only. `TTS_EXAGGERATION`, `TTS_TEMPERATURE` and
 `TTS_CFG_WEIGHT` were passed to the container although no Python code reads them
 (`grep -rnE 'TTS_(EXAGGERATION|TEMPERATURE|CFG_WEIGHT)' --include='*.py' .` matches only this
-file), so they looked like working knobs and were not. `TTS_ENGINE` is the same kind of knob:
-`backend/config.py` reads it into `VoiceConfig.tts_engine`, and nothing reads that field
-(`git grep -nw tts_engine -- backend` matches only its declaration and that read), because the
-realtime chains choose the engines. `TTS_ENABLED` is still the switch for spoken replies
-(`backend/config.py`), so it stays, defaulting on.
+file), so they looked like working knobs and were not. `TTS_ENGINE` has no reader left either:
+1ba6a366 deleted `VoiceConfig.tts_engine` and its read from `backend/config.py`, and
+`git grep -nw tts_engine -- backend` prints nothing, because the realtime chains choose the
+engines. `TTS_ENABLED` is still the switch for spoken replies (`load_config` in
+`backend/config.py`), so it stays, defaulting on.
 
 The production service mounts no voice profile directory from the checkout. Her voice
 identities come from a directory outside it, `VOICE_IDENTITY_DIR`, so no reference clip can be

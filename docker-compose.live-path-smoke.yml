@@ -37,9 +37,9 @@
 # a ${VAR:-default} interpolation, for the reason stated at
 # `docker-compose.dev-hydration.yml:115-121`: the base compose reads those same
 # variable names from the HOST shell -- EVENT_STORE_DB_PATH, MIST_VAULT_ROOT
-# and MIST_SIDECAR_DB_PATH are `${VAR:-default}` at `docker-compose.yml:39,45,46`
-# (EVENT_STORE_AUDIO_DIR and VECTOR_STORE_DATA_DIR are already literals there,
-# at `:40-41`) -- so an operator exporting one to steer THIS stack would
+# and MIST_SIDECAR_DB_PATH are `${VAR:-default}` in `mist-backend`'s environment
+# in `docker-compose.yml` (EVENT_STORE_AUDIO_DIR and VECTOR_STORE_DATA_DIR are
+# literals there) -- so an operator exporting one to steer THIS stack would
 # silently retarget the LIVE backend on its next recreate. All five are
 # hardcoded here rather than only the three, because which of them the base
 # file interpolates is not a property this stack should depend on. Compose
@@ -130,7 +130,7 @@ services:
       - NEO4J_PLUGINS=["apoc"]
     volumes:
       # Named volumes, distinct from the live `mist-neo4j-data` /
-      # `mist-neo4j-logs` declared at `docker-compose.yml:180-181`. Named
+      # `mist-neo4j-logs` in `docker-compose.yml`'s top-level volumes. Named
       # rather than tmpfs so a crashed assertion pass can be re-run against the
       # same graph; the RESET block above is the deliberate way to discard it.
       - mist-neo4j-smoke-data:/data
@@ -177,7 +177,7 @@ services:
       # live graph, which is what the literals rule exists to prevent.
       - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
-      # Literal, unlike `docker-compose.yml:26`'s ${NEO4J_DATABASE:-neo4j}.
+      # Literal, unlike `docker-compose.yml`'s NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}.
       - NEO4J_DATABASE=neo4j
       - EVENT_STORE_DB_PATH=/app/smoke-state/event_store.db
       - EVENT_STORE_AUDIO_DIR=/app/smoke-state/audio
@@ -261,16 +261,16 @@ services:
       - MIST_SESSION_ORIGIN=real
       #
       # --- determinism ------------------------------------------------------
-      # Literal 0.0, unlike `docker-compose.yml:32`'s ${LLM_TEMPERATURE:-0.0}.
+      # Literal 0.0, unlike `docker-compose.yml`'s LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.0}.
       - LLM_TEMPERATURE=0.0
       #
       # --- shared, stateless ------------------------------------------------
       # llama-server holds no per-stack state, so this backend borrows the live
-      # `mist-llm` (`docker-compose.yml:116-177`) rather than loading a second
+      # `mist-llm` service (`docker-compose.yml`) rather than loading a second
       # copy of the model into 12GB of VRAM.
       - LLM_SERVER_URL=http://mist-llm:8080
       - LLM_BACKEND=llamacpp
-      # Interpolated, matching `docker-compose.yml:29` and
+      # Interpolated, matching MODEL in `docker-compose.yml`'s `mist-backend` and
       # `docker-compose.dev-hydration.yml:177`: MODEL must name the model the
       # borrowed mist-llm actually loaded, so pinning it here could only
       # disagree with it.
@@ -281,11 +281,11 @@ services:
       # (`backend/realtime/budget.py:724`), so `load_speech_engines`
       # (`backend/realtime/runtime.py:263`) loads no STT or TTS engine, and with
       # the STT chain empty no VAD, end-of-turn model or name spotter either
-      # (`runtime.py:290`). TTS_ENABLED=false, read at `backend/config.py:74`,
-      # also keeps replies unspoken. The GPU reservation below dates from the
-      # deleted threaded voice path, which loaded its speech-to-text model at
-      # startup; whether anything in this stack still needs the GPU is
-      # unverified, so it stays.
+      # (`runtime.py:290`). TTS_ENABLED=false, read by `load_config` in
+      # `backend/config.py`, also keeps replies unspoken. The GPU reservation
+      # below dates from the deleted threaded voice path, which loaded its
+      # speech-to-text model at startup; whether anything in this stack still
+      # needs the GPU is unverified, so it stays.
       - MIST_VOICE_STT_CHAIN=off
       - MIST_VOICE_TTS_CHAIN=off
       - TTS_ENABLED=false
@@ -333,12 +333,12 @@ services:
     volumes:
       # THE ONLY WRITABLE MOUNT. Read LAYER 1 in the header before adding
       # another. There is deliberately no /app/logs bind mount (dev-hydration
-      # has one at `docker-compose.dev-hydration.yml:195`): `backend/server.py:75-76`
-      # does `Path("/app/logs").mkdir(parents=True, exist_ok=True)` and
-      # `docker/backend/Dockerfile`'s runtime-directory step creates it owned by
-      # appuser, so the directory lives in the container's own layer and its logs
-      # die with the container -- which is the correct lifetime for a throwaway
-      # stack.
+      # has one at `docker-compose.dev-hydration.yml:195`): this service sets
+      # no MIST_LOG_DIR, so `_resolve_log_dir` (`backend/server.py`) names /app/logs, which
+      # `configure_file_logging` creates if absent and `docker/backend/Dockerfile`'s
+      # runtime-directory step creates owned by appuser. The directory lives in
+      # the container's own layer and its logs die with the container -- which
+      # is the correct lifetime for a throwaway stack.
       - ./smoke-state:/app/smoke-state
       # Code, read-only, mirroring `docker-compose.dev-hydration.yml:231-236`
       # and `docker-compose.override.yml:7-12`. Read-only is not merely
@@ -352,7 +352,7 @@ services:
       - ./voice_profiles:/app/voice_profiles:ro
       # Model caches are content-addressed and read-mostly; sharing them avoids
       # a second 3-4GB download. Same two named volumes the live backend uses
-      # (`docker-compose.yml:74-75`) and dev-hydration shares
+      # (`mist-backend`'s volumes in `docker-compose.yml`) and dev-hydration shares
       # (`docker-compose.dev-hydration.yml:239-240`).
       - mist-hf-cache:/home/appuser/.cache/huggingface
       - mist-torch-cache:/home/appuser/.cache/torch

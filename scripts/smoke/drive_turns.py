@@ -28,7 +28,7 @@ The wire contract is the realtime protocol, 2.0.0
   with `parse_client_message` and posts a `TextMessage` to the session's
   `TurnController` (`backend/realtime/turn.py`).
 - A text turn is exactly `{"type": "text", "text": "<utterance>"}`
-  (`TextMessage`, `protocol.py:398-402`). An empty `text` is not skipped: it
+  (`TextMessage` in `backend/realtime/protocol.py`). An empty `text` is not skipped: it
   opens a turn with an empty utterance, which is why `build_text_frame`
   refuses one here.
 - The SERVER mints the session id: `session_id = str(uuid.uuid4())` in
@@ -139,8 +139,8 @@ TERMINAL_FRAME_TYPES = frozenset({"error", "stream_cancelled", "stream_complete"
 STREAM_TERMINAL_TYPES = frozenset({"stream_cancelled", "stream_complete"})
 
 #: What a typed turn's `stream_start` carries: `_on_text` opens the turn with
-#: origin `text` (`backend/realtime/turn.py:2182`), and `_channel_for`
-#: (`turn.py:2510-2520`) speaks only a `voice` turn, so the channel is `text`
+#: origin `text` (`TurnController._on_text`, `backend/realtime/turn.py`), and
+#: `_channel_for` speaks only a `voice` turn, so the channel is `text`
 #: and `audio_tag` is absent whatever TTS_ENABLED says.
 EXPECTED_STREAM_START = (("origin", "text"), ("channel", "text"))
 
@@ -239,7 +239,7 @@ def load_turn_plan(path: Path) -> TurnPlan:
     (`ExtractionPipeline._is_too_short`, `backend/knowledge/extraction/pipeline.py`)
     would be silently skipped for extraction, and an EMPTY turn is worse: the
     server does not skip it (`TextMessage.text` is any string,
-    `backend/realtime/protocol.py:398-402`), so it would open a real turn with
+    `backend/realtime/protocol.py`), so it would open a real turn with
     an empty utterance that the corpus never meant to say.
 
     Args:
@@ -272,7 +272,7 @@ def load_turn_plan(path: Path) -> TurnPlan:
             raise CorpusError(
                 f"turn {position} in {path} has empty or non-string 'text'. "
                 "The server does not skip an empty text (TextMessage, "
-                "backend/realtime/protocol.py:398-402): it would open a turn with "
+                "backend/realtime/protocol.py): it would open a turn with "
                 "an empty utterance."
             )
         turns.append(
@@ -294,7 +294,7 @@ def load_turn_plan(path: Path) -> TurnPlan:
 def build_text_frame(text: str) -> dict[str, str]:
     """Build the one inbound frame shape this script sends.
 
-    Exactly two keys. `TextMessage` (`backend/realtime/protocol.py:398-402`)
+    Exactly two keys. `TextMessage` (`backend/realtime/protocol.py`)
     has `type` and `text` and nothing else, and its model ignores extra fields
     (`extra="ignore"` on `_WireModel`), so any extra field would be silently
     discarded -- and a field that looks like it is doing something while being
@@ -314,7 +314,7 @@ def build_text_frame(text: str) -> dict[str, str]:
     if not text.strip():
         raise CorpusError(
             "refusing to send an empty text frame: the server would open a turn "
-            "with an empty utterance (TextMessage, backend/realtime/protocol.py:398-402)"
+            "with an empty utterance (TextMessage, backend/realtime/protocol.py)"
         )
     return {"type": "text", "text": text}
 
@@ -392,7 +392,7 @@ def terminal_turn_id(frame: dict[str, Any]) -> str | None:
     `stream_complete` and `stream_cancelled` carry `turn_id` at the top level.
     An `error` never names a turn in protocol 2: its `context` is
     `{"field": ...}` for a message that failed to parse
-    (`RealtimeSession._protocol_error`, `backend/realtime/session.py:707-720`)
+    (`RealtimeSession._protocol_error`, `backend/realtime/session.py`)
     and None for the server's own errors (`_ws_error`,
     `backend/server.py:2345`, and the not-ready error in `websocket_endpoint`).
 
@@ -434,9 +434,9 @@ class TurnRecorder:
     One instance per turn. Frames are fed in arrival order; `consume` returns
     None until the turn has ended, then returns its `TurnOutcome`. A turn ends
     at the `turn_metrics` naming it, not at its stream terminal: `_complete`
-    and `_cut` commit the turn between the two (`backend/realtime/turn.py:3088-3093`,
-    `:3280-3293`), and a text sent before the commit cuts the turn as
-    `new_input` (`TurnController._on_text`, `turn.py:2167-2182`). The one
+    and `_cut` commit the turn between the two (`TurnController._complete` and
+    `TurnController._cut` in `backend/realtime/turn.py`), and a text sent before
+    the commit cuts the turn as `new_input` (`TurnController._on_text`). The one
     exception is an `error` before any `stream_start`: the server refused the
     text and no turn will open. Feeding the recorder after that raises, because
     silently overwriting the first outcome would hide a second end.
@@ -464,7 +464,7 @@ class TurnRecorder:
         """Concatenation of every `stream_token` seen so far.
 
         Kept alongside the terminal's `full_text` because they can differ:
-        `_send_complete` (`backend/realtime/turn.py:2916-2930`) sends the
+        `_send_complete` (`backend/realtime/turn.py`) sends the
         generation's `final_response` when it has one.
         """
         return "".join(self._tokens)
@@ -1010,7 +1010,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     `--url` has no default on purpose, matching the reasoning in
     `assert_ws_target_not_live`'s docstring
-    (`backend/knowledge/eval_isolation.py:323-324`): a default is a value nobody
+    (`backend/knowledge/eval_isolation.py`): a default is a value nobody
     checked, and live and smoke differ by two digits on the host.
     """
     parser = argparse.ArgumentParser(
