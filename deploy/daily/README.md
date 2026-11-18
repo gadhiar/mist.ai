@@ -99,7 +99,7 @@ before anything starts.
 | `MIST_EXTRACTION_WINDOW` | the instance CLI: the night window, `HH:MM-HH:MM` in host local time | no | `23:59-10:00` |
 | `MIST_DAILY_EXTRACTION_MODEL_FILE` | compose: the model the extraction llama-server loads | no | `ggml-org/gpt-oss-20b-MXFP4.gguf` |
 | `MIST_DAILY_EXTRACTION_CTX_SIZE` | compose: extraction llama-server context size | no | `65536` |
-| `MIST_DAILY_EXTRACTION_NCMOE` | compose: MoE layers whose experts stay on the CPU | no | `24` |
+| `MIST_DAILY_EXTRACTION_NCMOE` | compose: MoE layers whose experts stay on the CPU | no | `21` |
 | `MIST_DAILY_EXTRACTION_CACHE_RAM_MIB` | compose: extraction llama-server prompt-cache cap | no | `2048` |
 | `EXTRACTION_MODEL_HASH` | compose: the model identity `mist-extraction` stamps | for extraction | none, and extraction stays paused |
 | `EXTRACTION_LLM_DEVICE` | compose: the GPU name in `mist-extraction`'s serving identity | for extraction | none, and extraction stays paused |
