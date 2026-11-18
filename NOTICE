@@ -171,6 +171,25 @@ respective licenses:
    runtime.
 
 -------------------------------------------------------------------------------
+13. LiteRT (ai-edge-litert) and pymicro-features
+   Location: Python packages ai-edge-litert 2.3.0 and pymicro-features 2.0.2
+             (requirements-voice.txt)
+   Source: https://github.com/google-ai-edge/LiteRT (LiteRT)
+           https://github.com/rhasspy/pymicro-features (pymicro-features)
+           https://pypi.org/project/ai-edge-litert/
+           https://pypi.org/project/pymicro-features/
+   License: Apache License 2.0
+   Copyright: The Google AI Edge Authors (LiteRT); Michael Hansen
+              (pymicro-features), whose package includes TensorFlow Lite's
+              microfrontend sources, Copyright 2018 The TensorFlow Authors
+
+   Used by the server name spotter to run the microWakeWord model: LiteRT
+   runs the streaming TFLite model, and pymicro-features computes the
+   microfrontend features it reads. The model is staged under the models
+   directory (speech/wake/<model id>/device/), is not included in this
+   repository and is not downloaded at runtime.
+
+-------------------------------------------------------------------------------
 
 APACHE LICENSE 2.0 COMPONENTS
 
@@ -181,6 +200,7 @@ The following components are licensed under Apache License 2.0:
 - MS MARCO MiniLM-L-6-v2 and MiniLM-L-12-v2 Cross-Encoders
 - all-MiniLM-L6-v2 Sentence Embedding Model
 - NVIDIA NeMo toolkit
+- LiteRT (ai-edge-litert) and pymicro-features
 
 Apache License 2.0 Summary:
 You may use, reproduce, and distribute this work, with or without
@@ -235,4 +255,4 @@ of conditions and the disclaimer are retained.
 
 For questions about licensing, contact: Raj Gadhia
 
-Last updated: 2026-11-17
+Last updated: 2026-11-18
