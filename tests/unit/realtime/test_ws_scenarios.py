@@ -560,6 +560,16 @@ def since(client: VoiceClient, mark: int, kind: str, **match: object) -> list[di
     return [item for item in client.of(kind, **match) if any(item is f for f in fresh)]
 
 
+def assert_spoken(client: VoiceClient) -> int:
+    """The newest turn went out on the `tts` channel and its audio tag ended with a `0x02`."""
+    start = client.of("stream_start")[-1]
+    assert start["channel"] == "tts", start
+    tag = int(start["audio_tag"])
+    tagged = frames_of(client, tag)
+    assert [frame.msg_type for frame in tagged].count(AUDIO_COMPLETE) == 1, tagged
+    return tag
+
+
 @pytest.mark.parametrize(
     "devices",
     [pytest.param(("cuda",), id="stt-on-cuda"), pytest.param(("cpu",), id="stt-on-cpu")],
@@ -615,10 +625,12 @@ def test_gaming_mode_takes_the_level_off_and_back(voice_server, tmp_path, device
             active.say(NAMED, name_at_ms=NAME_AT_MS)
             assert finish(active)["outcome"] == "completed"
             assert active.of("stream_token")[-1]["token"] == TIMER_REPLY
+            timer_tag = assert_spoken(active)
             active.say(NAMED, name_at_ms=NAME_AT_MS)
             assert finish(active)["outcome"] == "completed"
             assert active.of("error")[-1] == turn_refusal(YIELDED_MESSAGE)
             assert active.of("stream_token")[-1]["token"] == YIELDED_MESSAGE
+            assert assert_spoken(active) != timer_tag
             assert responder.requests == []
         assert [call[0] for call in responder.capability_calls] == [
             "set a timer for 10 minutes",
