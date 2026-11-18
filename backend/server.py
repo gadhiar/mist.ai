@@ -1842,18 +1842,20 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Server shutting down...")
 
-    # The device listener first, before anything its sessions use stops: its
-    # graceful shutdown is capped, and its task cancelled after 6 s.
-    if _device_listener is not None:
-        await _device_listener.stop()
-
-    # Cancel the catch-up background task FIRST, before anything else below
-    # touches vault_writer or the ConversationHandler it holds a reference
-    # to. curation_scheduler.stop() and ch.aclose() both await, which yields
+    # Cancel the catch-up background task FIRST, as shutdown's first awaiting
+    # step, before anything else below touches vault_writer or the
+    # ConversationHandler it holds a reference to. Every later awaiting step
+    # (the device listener's stop, curation_scheduler.stop(), ch.aclose()) yields
     # the event loop -- a still-running catch-up pass could resume in that
     # window and reach a write against an already-stopped vault_writer if
     # cancellation happened later (or not at all).
     await _shutdown_session_note_catchup(catchup_task)
+
+    # The device listener next, right after the catch-up and before anything
+    # its sessions use stops: its graceful shutdown is capped, and its task
+    # cancelled after 6 s.
+    if _device_listener is not None:
+        await _device_listener.stop()
 
     if curation_scheduler is not None:
         await curation_scheduler.stop()
