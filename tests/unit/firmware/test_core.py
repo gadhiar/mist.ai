@@ -21,6 +21,7 @@ import pytest
 from backend.capabilities.events import AlarmActionMessage, AlarmReportMessage
 from backend.realtime.protocol import (
     CLIENT_MESSAGE_TYPES,
+    ROOM_CLIENT_MESSAGE_TYPES,
     Direction,
     MsgType,
     decode_frame,
@@ -156,6 +157,11 @@ def test_contract_covers_every_message_the_device_sends(
 
     assert sent == DEVICE_MESSAGE_TYPES
     assert any(kind == "BINARY" for _, kind, _ in contract_lines)
+
+
+def test_a_room_session_accepts_every_type_the_device_sends_and_no_other():
+    """A new device message fails here until the room session's allowlist takes it."""
+    assert DEVICE_MESSAGE_TYPES - {"device_stats"} == ROOM_CLIENT_MESSAGE_TYPES
 
 
 def test_every_protocol_message_parses_strictly_with_the_backend_codec(

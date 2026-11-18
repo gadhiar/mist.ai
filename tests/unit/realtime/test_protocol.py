@@ -27,6 +27,7 @@ from backend.realtime.protocol import (
     MAGIC,
     MAX_WAKE_BACKLOG_MS,
     PROTOCOL_VERSION,
+    ROOM_CLIENT_MESSAGE_TYPES,
     SERVER_MESSAGE_TYPES,
     UPLINK_SAMPLE_RATE,
     VOICE_DECISION_KINDS,
@@ -422,6 +423,22 @@ def test_client_message_set_matches_design_doc():
         "alarm_action",
         "alarm_report",
     } == CLIENT_MESSAGE_TYPES
+
+
+def test_room_client_message_set_is_the_device_types_within_the_client_set():
+    """A room session accepts these nine; the firmware test pins them to what the device sends."""
+    assert {
+        "voice_start",
+        "wake",
+        "barge_in",
+        "mute",
+        "interrupt",
+        "playback_progress",
+        "playback_done",
+        "alarm_action",
+        "alarm_report",
+    } == ROOM_CLIENT_MESSAGE_TYPES
+    assert ROOM_CLIENT_MESSAGE_TYPES < CLIENT_MESSAGE_TYPES
 
 
 def test_server_message_set_matches_design_doc():
