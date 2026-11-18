@@ -120,7 +120,10 @@ services:
       MODEL: gemma-4-e4b
       # Dev turns are not real use: they stay out of the real-turn counts (ADR-042).
       MIST_SESSION_ORIGIN: ${MIST_DEV_SESSION_ORIGIN:-test}
-      TTS_ENABLED: "false"
+      # Voice off: an empty chain loads no engine in its slot, so a dev stack holds no GPU
+      # memory for speech.
+      MIST_VOICE_STT_CHAIN: "off"
+      MIST_VOICE_TTS_CHAIN: "off"
       ENABLE_KNOWLEDGE_INTEGRATION: "true"
     volumes:
       - dev-state:/app/dev-state

@@ -34,7 +34,10 @@ The instance root is a host directory outside every git work tree. `MIST_DAILY_R
   ops/                   mounted at /app/ops: read-only in mist-backend, read-write in
                          mist-backup; release records, backup status, gaming-mode marker,
                          extraction mode and paused marker
-  models/                the llama-server weights, mounted read-only at /models
+  models/                the llama-server weights and the speech weights, mounted read-only
+                         at /models
+  voices/                her voice identities, mounted read-only at /voices in mist-backend
+                         only (see Voice)
   release/<tag>/         deploy/ and scripts/daily/ extracted from the release tag
   retired/<UTC stamp>/   state/ and mist-memory/ replaced by a promotion, kept until deleted
   bin/instance.py        the active release's CLI, run by the sign-in task
@@ -45,7 +48,7 @@ The instance root is a host directory outside every git work tree. `MIST_DAILY_R
 The graph does not live in the root: it is the external Docker volume named by
 `MIST_DAILY_NEO4J_VOLUME`, so `docker compose down -v` cannot delete it, and promoting a restored
 volume changes one line of `daily.env`. The model and embedding caches are the project-scoped
-volumes `mist-hf-cache` and `mist-torch-cache`.
+volumes `mist-hf-cache` and `mist-torch-cache`, and the voice cache is `voice-cache` (see Voice).
 
 Every bind mount starts at `MIST_DAILY_ROOT`, `MODELS_DIR` or `MIST_BACKUP_HOST_PATH`, so none is
 relative to a repository. Every published port binds 127.0.0.1 only: the WebSocket has no
@@ -61,9 +64,10 @@ not join.
 `daily.env` is passed to compose with `--env-file`, which resolves every `${VAR}` in
 `compose.yml`, and compose also gives it to `mist-backend` as its `env_file`. The
 `environment` literals in `compose.yml` win over any line in it: the store paths, the capability
-store and token paths (see Capabilities), `MIST_OPS_DIR=/app/ops`, `MIST_SESSION_ORIGIN=real`,
-`TTS_ENABLED=false` (the code defaults TTS on) and `EMBEDDING_DEVICE=cpu` (the embedding model
-must hold no GPU memory). A required variable that is unset makes compose refuse the whole file
+store and token paths (see Capabilities), `MIST_OPS_DIR=/app/ops`, `MIST_SESSION_ORIGIN=real`
+and `EMBEDDING_DEVICE=cpu` (the embedding model must hold no GPU memory). No literal touches
+voice: it runs on the code's defaults, spoken replies included, and the `MIST_VOICE_*` lines
+change them (see Voice). A required variable that is unset makes compose refuse the whole file
 before anything starts.
 
 `daily.env.example` lists every variable with a placeholder or its default.
@@ -78,7 +82,7 @@ before anything starts.
 | `MIST_DAILY_NEO4J_VOLUME` | compose: name of the external graph volume | yes | |
 | `MIST_DAILY_NEO4J_HEAP` | compose: Neo4j initial and maximum heap | no | `1g` |
 | `MIST_DAILY_NEO4J_PAGECACHE` | compose: Neo4j page cache | no | `512m` |
-| `MODELS_DIR` | compose: host directory mounted at `/models` | yes | |
+| `MODELS_DIR` | compose: host directory mounted read-only at `/models` in `mist-llm`, `mist-extraction-llm` and `mist-backend` | yes | |
 | `LLM_MODEL_FILE` | compose: the model llama-server loads | no | as `docker-compose.yml` |
 | `LLM_CTX_SIZE` | compose: llama-server context size | no | `32768` |
 | `LLM_CACHE_RAM_MIB` | compose: llama-server prompt-cache cap | no | `2048` |
@@ -89,6 +93,12 @@ before anything starts.
 | `MIST_EXTRACTION_SERVICE_URL` | none: compose sets it on `mist-backend`, so a `daily.env` line is ignored | no | `http://mist-extraction:8090` |
 | `MIST_HEALTH_BACKLOG_MAX_AGE_S` | compose: the backend's overdue age for the extraction backlog | no | `86400` |
 | `MIST_TIMEZONE` | the backend through `env_file`; alarms, timers and the clock need it | no | UTC; alarms, timers and clock unavailable |
+| `MIST_VOICE_STT_CHAIN` | the backend through `env_file`: speech-to-text engines in order | no | code default; `off` turns the slot off |
+| `MIST_VOICE_TTS_CHAIN` | the backend through `env_file`: spoken-reply engines in order | no | code default; `off` turns the slot off |
+| `MIST_VOICE_TTS_VOICE` | the backend through `env_file`: voice identity under `voices/` | no | none |
+| `MIST_VOICE_KWS_MODEL` | the backend through `env_file`: wake model under `MODELS_DIR` | no | none, and the server spotter is off |
+| `MIST_VOICE_KWS_THRESHOLD` | the backend through `env_file`: wake score a heard name needs | no | `0.5` |
+| `MIST_VOICE_WAKE_PHRASES_FILE` | the backend through `env_file`: wake phrases file under `/models` | no | the built-in sets |
 | `MIST_CAPABILITIES_ENABLED` | the backend through `env_file` | no | `false` |
 | `MIST_CAPABILITIES` | the backend through `env_file` | no | all five |
 | `MIST_HA_MCP_URL` | the backend through `env_file`: lights | no | none, and lights is not built |
@@ -231,11 +241,13 @@ What yields: `gaming-mode on` writes `ops/gpu-yielded`
 (`{"v": 1, "since": "<UTC time>", "by": "manual"|"watcher"}`) through a temporary file and a
 rename, waits two backend polls (twice `MIST_GPU_YIELD_POLL_S` from `daily.env`, 2 s by
 default, so 4 s), then stops `mist-llm`. The backend sees the marker within one poll and
-releases Whisper, its one GPU model in this instance: the embedding model runs on the CPU by
-literal, and TTS is off. Waiting before the stop means `/health` never sees a stopped LLM while
-the backend still reads normal. On a release with night extraction it then stops
-`mist-extraction` and `mist-extraction-llm` too, by the stop path in Night extraction, with
-the paused marker's reason `gaming`.
+releases every speech engine on the GPU, speech-to-text and spoken replies alike, freeing their
+GPU memory: each slot moves to the next CPU option of its chain (`MIST_VOICE_STT_CHAIN`,
+`MIST_VOICE_TTS_CHAIN`), or to `off` when the chain has none. On a release before realtime voice
+this was Whisper alone. The embedding model runs on the CPU by literal. Waiting before the stop
+means `/health` never sees a stopped LLM while the backend still reads normal. On a release
+with night extraction it then stops `mist-extraction` and `mist-extraction-llm` too, by the
+stop path in Night extraction, with the paused marker's reason `gaming`.
 
 - If the stop fails twice, `on` removes the marker it wrote and exits 1, so nothing reports
   `yielded` while the LLM still holds the GPU. A marker that was already there is left.
@@ -257,16 +269,21 @@ and `restart_recommended` stays false.
 
 `off` waits for the LLM. `gaming-mode off` starts `mist-llm` and polls `docker compose ... ps`
 until compose reports it `healthy`, for up to `--wait-minutes` (default 5), and only then
-removes the marker. While the LLM loads, turns still get the yielded reply. On a release with
+removes the marker. When the marker goes, the backend reloads the speech engines one at a
+time, each slot going back to the chain option it held before the release, so they take their
+GPU memory again. While the LLM loads, turns still get the yielded reply. On a release with
 night extraction it then runs `extraction apply`, which starts extraction again if the mode
 and window want it; an apply that does not converge makes `off` exit 1 after the marker is
 gone.
 
 - If it never becomes healthy, `off` exits 1 and leaves the marker, so `/health` keeps saying
   `yielded`, which is still true.
-- If Whisper does not reload after the marker goes, for example because a game still holds the
-  memory, the `llm` check reads `down` with `resume_failed`, and the backend retries with a
-  backoff up to 60 s.
+- If a speech engine does not reload on its device after the marker goes, for example because a
+  game still holds the memory, its slot stays on the option it fell to at the release, and the
+  backend retries it. `/health` shows where each slot settled under `voice.engines`, and every
+  connected client gets a `voice_decision` placement with reason `reload_failed`. Gaming mode
+  itself has ended, so the failed reload leaves the `llm` check alone, and typed turns keep
+  working.
 - `up` leaves `mist-llm` stopped while the marker exists, so a restart during a game does not
   load the model.
 
@@ -607,6 +624,47 @@ issued again (`deploy/daily/RESTORE.md`).
 
 ---
 
+## Voice
+
+The backend runs realtime voice on the code's defaults (`backend/realtime/budget.py`): no
+compose literal sets a voice variable, and spoken replies are on. The `MIST_VOICE_*` rows of
+`daily.env.example` are commented out; set one, then run `up` to apply it.
+
+Where it reads from. `mist-backend` mounts three paths for voice, each at the in-container
+default the code reads, so compose sets no path variable:
+
+- `/models`, read-only: the backend reads the speech weights from `MODELS_DIR`, with the same
+  mount spec as `mist-llm`.
+- `/voices`, read-only: her voice identities, from `<MIST_DAILY_ROOT>/voices/`, outside every
+  repository. Each identity is a directory named by its id, and `MIST_VOICE_TTS_VOICE` picks
+  one. Compose creates the directory empty when it is missing.
+- `/voice-cache`: the engine files built from an identity, in the volume
+  `mist-<instance>_voice-cache` (no `name:`, so compose prefixes the project). Missing files are
+  built again, so the volume may be deleted while the backend is stopped.
+
+The `daily.env` rows:
+
+- `MIST_VOICE_STT_CHAIN` and `MIST_VOICE_TTS_CHAIN`: the speech-to-text and spoken-reply engines,
+  comma-separated `<engine>@<device>` options in the order they are tried, with `cpu` or `cuda`
+  as the device. `off` alone turns that slot off, which is the behaviour rollback.
+- `MIST_VOICE_TTS_VOICE`: the voice identity id.
+- `MIST_VOICE_KWS_MODEL` and `MIST_VOICE_KWS_THRESHOLD`: the server name spotter's model id, off
+  while unset, and the score a heard name needs, 0.5 by default.
+- `MIST_VOICE_WAKE_PHRASES_FILE`: the wake phrases and addressee word sets, a JSON file; the
+  built-in sets apply while it is unset.
+
+The variables the chains replaced, such as `MIST_VOICE_STT_DEVICE`, make the backend refuse to
+start while set at all; delete any such line.
+
+Staging the wake model. Its files go in `<MODELS_DIR>/speech/wake/<model id>/`, beside its
+`manifest.json`, and `MIST_VOICE_KWS_MODEL` names the id. The phrases file goes at
+`<MODELS_DIR>/speech/wake/phrases.json`, and
+`MIST_VOICE_WAKE_PHRASES_FILE=/models/speech/wake/phrases.json` points the backend at it, since
+only `/models` is mounted for it. The wake model is for personal use only: its trainers'
+negative data is non-commercial, so its weights are never committed, published or shared.
+
+---
+
 ## Reading /health
 
 `GET http://127.0.0.1:8001/health` always answers HTTP 200. Its `status` is `healthy`,
@@ -634,7 +692,7 @@ changes, with what each means and what to do.
 | `backup` | `backup_failed` | down | The last attempt failed and no success is recent. | Read `docker compose -p mist-daily logs mist-backup`, fix the destination, run `backup-now`. |
 | `backup` | `backup_overdue` | down | The last success is older than `MIST_BACKUP_MAX_AGE_HOURS` (default 26). | Check that `mist-backup` runs (`status`); `arm-backups` if it was disarmed. |
 | `llm` | `gpu_yielded` | yielded | Gaming mode is on. | `gaming-mode off`. |
-| `llm` | `resume_failed` | down | Gaming mode ended but Whisper did not reload; the backend retries. | Close what holds the GPU's memory; the backend retries on its own. If it persists, restart `mist-backend`. |
+| `llm` | `resume_failed` | down | Gaming mode ended but the backend's resume step raised; the backend retries. The speech engines' reload never raises (`backend/realtime/power.py`, `gpu_yield_refusal`), so a speech engine that fails to reload shows under `voice.engines` instead (see Gaming mode). | Close what holds the GPU's memory; the backend retries on its own. If it persists, restart `mist-backend`. |
 
 Any check reads `ok` with status `up` when nothing above applies.
 

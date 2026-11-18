@@ -35,14 +35,14 @@ services:
     env_file:
       - path: ${MIST_DAILY_ROOT:?set MIST_DAILY_ROOT in daily.env}/daily.env
         required: true
-    # Literals win over env_file, so no line carried into daily.env can move a store, turn TTS on
-    # or put the embedding model on the GPU.
+    # Literals win over env_file, so no line carried into daily.env can move a store or put the
+    # embedding model on the GPU. There is no voice literal: voice runs on the code's defaults,
+    # which the MIST_VOICE_* lines of daily.env change.
     environment:
       - NEO4J_URI=bolt://mist-neo4j:7687
       - LLM_SERVER_URL=http://mist-llm:8080
       - LLM_BACKEND=llamacpp
       - MIST_SESSION_ORIGIN=real
-      - TTS_ENABLED=false
       - EMBEDDING_DEVICE=cpu
       - EVENT_STORE_DB_PATH=/app/data/event_store.db
       - EVENT_STORE_AUDIO_DIR=/app/data/audio
@@ -79,6 +79,13 @@ services:
       - ${MIST_DAILY_ROOT}/secrets:/app/secrets
       - mist-hf-cache:/home/appuser/.cache/huggingface
       - mist-torch-cache:/home/appuser/.cache/torch
+      # The speech weights, beside the llama-server weights: mist-llm's mount.
+      - ${MODELS_DIR:?set MODELS_DIR in daily.env}:/models:ro
+      # Her voice identities, outside every repository. The short form creates the directory
+      # empty when it is missing, and it reads no new variable, so it cannot refuse the file.
+      - ${MIST_DAILY_ROOT}/voices:/voices:ro
+      # Engine files built from those identities; rebuilt when the volume is deleted.
+      - voice-cache:/voice-cache
     mem_limit: ${MIST_DAILY_BACKEND_MEM_LIMIT:-8g}
     logging: *logging
     # Not mist-llm: gaming mode stops it while the backend keeps serving.
@@ -375,3 +382,5 @@ volumes:
     name: ${MIST_DAILY_NEO4J_VOLUME:?set MIST_DAILY_NEO4J_VOLUME in daily.env}
   mist-hf-cache:
   mist-torch-cache:
+  # No `name:`, so compose prefixes it with the project, `mist-<instance>_voice-cache`.
+  voice-cache:

@@ -266,8 +266,12 @@ class TestEnvironment:
         env = _environment(services[BACKEND])
         assert env["MIST_SESSION_ORIGIN"] == "${MIST_DEV_SESSION_ORIGIN:-test}"
 
-    def test_tts_is_off_by_literal(self, services):
-        assert _environment(services[BACKEND])["TTS_ENABLED"] == "false"
+    def test_voice_is_off_by_literal(self, services):
+        # An empty chain loads no engine, so a dev stack never takes GPU memory for speech.
+        env = _environment(services[BACKEND])
+
+        assert env["MIST_VOICE_STT_CHAIN"] == "off"
+        assert env["MIST_VOICE_TTS_CHAIN"] == "off"
 
     def test_origins_are_left_to_the_code_default(self, services):
         assert "MIST_ALLOWED_ORIGINS" not in _environment(services[BACKEND])

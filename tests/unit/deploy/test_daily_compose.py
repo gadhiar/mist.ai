@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from backend.realtime.budget import _REMOVED_PER_SLOT
 from scripts.daily import instance
 from tests.unit.test_compose_extraction import (
     EXPECTED_SERVER_DECLARATIONS,
@@ -113,7 +114,6 @@ BACKEND_LITERALS = {
     "LLM_SERVER_URL": "http://mist-llm:8080",
     "LLM_BACKEND": "llamacpp",
     "MIST_SESSION_ORIGIN": "real",
-    "TTS_ENABLED": "false",
     "EMBEDDING_DEVICE": "cpu",
     **STORE_PATH_LITERALS,
     "MIST_LOG_DIR": "/app/logs",
@@ -123,6 +123,11 @@ BACKEND_LITERALS = {
     **EXTRACTION_BACKEND_ENTRIES,
 }
 SECRETS_SOURCE = "${MIST_DAILY_ROOT}/secrets"
+# Her voice identities, under the instance root and outside every repository, and the engine
+# assets built from them. Both targets are the in-container defaults of
+# `backend/realtime/budget.py`'s `PlacementConfig`, so compose sets no variable for either.
+VOICES_SOURCE = "${MIST_DAILY_ROOT}/voices"
+VOICE_CACHE_VOLUME = "voice-cache"
 BACKUP_ENVIRONMENT = {
     "NEO4J_URI": "bolt://mist-neo4j:7687",
     "MIST_BACKUP_ROOT": "/backup",
@@ -156,12 +161,27 @@ CAPABILITY_EXAMPLE_VARIABLES = (
     "MIST_SPOTIFY_DEVICE",
     "MIST_RING_FALLBACK_AFTER_S",
 )
+# The voice rows of `daily.env.example`: commented out, so voice runs on the code's defaults
+# until the operator changes one. Each is read by `load_voice_settings`.
+VOICE_EXAMPLE_VARIABLES = (
+    "MIST_VOICE_STT_CHAIN",
+    "MIST_VOICE_TTS_CHAIN",
+    "MIST_VOICE_TTS_VOICE",
+    "MIST_VOICE_KWS_MODEL",
+    "MIST_VOICE_KWS_THRESHOLD",
+    "MIST_VOICE_WAKE_PHRASES_FILE",
+)
+# The one example value that is a path rather than a `<placeholder>`: only `/models` is mounted
+# for the phrases file, so the example shows where under it the file goes.
+EXAMPLE_PATH_VALUES = {"MIST_VOICE_WAKE_PHRASES_FILE": "/models/speech/wake/phrases.json"}
+VOICE_SETTINGS_PATH = REPO_ROOT / "backend" / "realtime" / "budget.py"
 # Read by the backend from `daily.env` or by `instance.py`, not interpolated by compose.
 EXAMPLE_EXTRA_VARIABLES = (
     "MIST_EXTRACTION_WINDOW",
     "MIST_INSTANCE_NAME",
     "MODEL",
     *CAPABILITY_EXAMPLE_VARIABLES,
+    *VOICE_EXAMPLE_VARIABLES,
 )
 # Compose sets these on mist-backend, so a daily.env line for one would be ignored.
 COMPOSE_SET_EXTRACTION_VARIABLES = (
@@ -336,6 +356,22 @@ def _compose_text() -> str:
     return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
 
 
+def _comment_above(name: str) -> str:
+    """The comment lines directly above `name`'s line in the example, joined on one line."""
+    lines = ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+    (index,) = (
+        i
+        for i, line in enumerate(lines)
+        if (match := EXAMPLE_ASSIGNMENT.match(line.strip())) and match.group(2) == name
+    )
+    comment: list[str] = []
+    for line in reversed(lines[:index]):
+        if not line.startswith("#") or EXAMPLE_ASSIGNMENT.match(line.strip()):
+            break
+        comment.insert(0, line.lstrip("# "))
+    return " ".join(" ".join(comment).split())
+
+
 def _example_assignments() -> list[tuple[bool, str, str]]:
     """(commented, name, value) for every `NAME=value` line, live or commented out."""
     assignments = []
@@ -416,7 +452,47 @@ class TestMounts:
             (SECRETS_SOURCE, "/app/secrets", "rw"),
             ("mist-hf-cache", "/home/appuser/.cache/huggingface", "rw"),
             ("mist-torch-cache", "/home/appuser/.cache/torch", "rw"),
+            ("${MODELS_DIR:?set MODELS_DIR in daily.env}", "/models", "ro"),
+            (VOICES_SOURCE, "/voices", "ro"),
+            (VOICE_CACHE_VOLUME, "/voice-cache", "rw"),
         ]
+
+    def test_backend_mounts_the_models_as_mist_llm_does(self, compose):
+        # The speech weights sit beside the llama-server weights; the same spec keeps one
+        # variable, one required message and read-only for both.
+        services = compose["services"]
+        (llm_models,) = services[LLM]["volumes"]
+        backend_models = [
+            spec for spec in services[BACKEND]["volumes"] if spec.endswith(":/models:ro")
+        ]
+
+        assert backend_models == [llm_models]
+
+    def test_backend_voices_are_read_only_under_the_instance_root(self, compose):
+        source, _target, mode = _mount_at(compose["services"][BACKEND], "/voices")
+
+        assert mode == "ro"
+        assert _interpolated(source) == {"MIST_DAILY_ROOT"}
+        assert source.startswith("${MIST_DAILY_ROOT}/")
+
+    def test_voice_cache_is_writable_and_project_scoped(self, compose):
+        source, _target, mode = _mount_at(compose["services"][BACKEND], "/voice-cache")
+        declaration = compose["volumes"][VOICE_CACHE_VOLUME] or {}
+
+        assert (source, mode) == (VOICE_CACHE_VOLUME, "rw")
+        # No `name:`, so compose prefixes it with the project: each instance gets its own.
+        assert "name" not in declaration
+        assert not declaration.get("external")
+
+    def test_no_other_service_mounts_the_voices(self, compose):
+        offenders = [
+            (name, target)
+            for name, service in compose["services"].items()
+            if name != BACKEND
+            for _source, target, _mode in _mounts(service)
+            if target in ("/voices", "/voice-cache")
+        ]
+        assert not offenders
 
     def test_no_other_service_mounts_the_secrets(self, compose):
         # The tokens stay out of every backup because mist-backup cannot see them. A mount of
@@ -524,6 +600,16 @@ class TestEnvironment:
         environment = _environment(compose["services"][BACKEND])
         assert set(environment) == set(BACKEND_LITERALS) | {"MIST_ALLOWED_ORIGINS"}
 
+    def test_backend_leaves_spoken_replies_to_the_code_default(self, compose):
+        # `TTS_ENABLED` defaults on in `backend/config.py`; a literal here would pin it off.
+        assert "TTS_ENABLED" not in _environment(compose["services"][BACKEND])
+
+    def test_literals_comment_says_voice_runs_on_the_code_defaults(self):
+        text = " ".join(COMPOSE_PATH.read_text(encoding="utf-8").split())
+
+        assert "turn TTS on" not in text
+        assert "voice runs on the code's defaults" in text
+
     def test_backend_calls_the_extraction_service_on_its_health_port(self, compose, overlay):
         url = _environment(compose["services"][BACKEND])["MIST_EXTRACTION_SERVICE_URL"]
         health = overlay["services"][OVERLAY_SERVICE]["healthcheck"]["test"][-1]
@@ -615,7 +701,7 @@ class TestNetworksAndVolumes:
         assert volume["name"].startswith("${MIST_DAILY_NEO4J_VOLUME:?")
 
     def test_cache_volumes_are_project_scoped(self, compose):
-        for name in ("mist-hf-cache", "mist-torch-cache"):
+        for name in ("mist-hf-cache", "mist-torch-cache", VOICE_CACHE_VOLUME):
             assert not (compose["volumes"][name] or {}).get("external")
 
     def test_share_network_is_external(self, compose):
@@ -982,7 +1068,44 @@ class TestEnvExample:
         defaults = dict(DEFAULT_INTERPOLATION.findall(_compose_text()))
 
         for _commented, name, value in _example_assignments():
-            assert PLACEHOLDER.match(value) or value == defaults.get(name), f"{name}={value}"
+            assert (
+                PLACEHOLDER.match(value)
+                or value == defaults.get(name)
+                or value == EXAMPLE_PATH_VALUES.get(name)
+            ), f"{name}={value}"
+
+    def test_voice_variables_are_commented_out_placeholders(self):
+        by_name = {name: (commented, value) for commented, name, value in _example_assignments()}
+
+        for name in VOICE_EXAMPLE_VARIABLES:
+            commented, value = by_name[name]
+            assert commented is True, f"{name} must be commented out"
+            assert PLACEHOLDER.match(value) or value == EXAMPLE_PATH_VALUES.get(name), name
+
+    def test_voice_variables_are_ones_the_backend_reads(self):
+        source = VOICE_SETTINGS_PATH.read_text(encoding="utf-8")
+        unread = [name for name in VOICE_EXAMPLE_VARIABLES if f'"{name}"' not in source]
+        assert not unread
+
+    def test_does_not_offer_the_removed_per_slot_voice_variables(self):
+        # Set at all, each one makes the backend refuse to start.
+        named = {name for _commented, name, _value in _example_assignments()}
+        assert named & set(_REMOVED_PER_SLOT) == set()
+
+    def test_voice_comment_says_off_and_where_the_identities_live(self):
+        comment = _comment_above("MIST_VOICE_STT_CHAIN")
+
+        for phrase in ("`off`", "<MIST_DAILY_ROOT>/voices/", "outside every repository"):
+            assert phrase in comment, phrase
+
+    def test_phrases_file_comment_says_it_lives_under_the_models_directory(self):
+        comment = _comment_above("MIST_VOICE_WAKE_PHRASES_FILE")
+
+        for phrase in ("MODELS_DIR", "only `/models` is mounted"):
+            assert phrase in comment, phrase
+
+    def test_header_no_longer_says_tts_stays_off(self):
+        assert "turn TTS on" not in " ".join(ENV_EXAMPLE_PATH.read_text(encoding="utf-8").split())
 
     def test_every_assignment_has_a_comment_above_it(self):
         previous = None
@@ -1079,6 +1202,58 @@ class TestReadme:
         text = _readme_section("Capabilities")
         missing = [name for name in CAPABILITY_EXAMPLE_VARIABLES if f"`{name}`" not in text]
         assert not missing
+
+
+class TestReadmeVoice:
+    """What the README tells the operator about voice on this instance."""
+
+    def test_no_tts_literal_in_the_contract(self):
+        assert "TTS_ENABLED=false" not in README_PATH.read_text(encoding="utf-8")
+
+    def test_instance_root_layout_lists_the_voices_directory(self):
+        layout = _readme_section("Instance root layout")
+        entries = [
+            line.split()[0]
+            for line in layout.splitlines()
+            if line.startswith("  ") and line.strip()
+        ]
+        assert "voices/" in entries
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            pytest.param("speech weights from `MODELS_DIR`", id="speech-weights"),
+            pytest.param("`<MIST_DAILY_ROOT>/voices/`", id="voice-identities"),
+            pytest.param("`mist-<instance>_voice-cache`", id="cache-volume"),
+            pytest.param("deleted while the backend is stopped", id="cache-deletable"),
+            pytest.param("`<MODELS_DIR>/speech/wake/<model id>/`", id="wake-model-staging"),
+            pytest.param("`<MODELS_DIR>/speech/wake/phrases.json`", id="phrases-staging"),
+            pytest.param("personal use only", id="wake-model-licence"),
+        ],
+    )
+    def test_voice_section_covers(self, phrase):
+        assert phrase in " ".join(_readme_section("Voice").split())
+
+    def test_voice_section_names_every_voice_variable(self):
+        text = _readme_section("Voice")
+        missing = [name for name in VOICE_EXAMPLE_VARIABLES if f"`{name}`" not in text]
+        assert not missing
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            pytest.param("releases every speech engine on the GPU", id="release"),
+            pytest.param("reloads the speech engines", id="reload"),
+            pytest.param("`reload_failed`", id="reload-failed"),
+            pytest.param("`/health`", id="health"),
+            pytest.param("typed turns keep working", id="typed-turns"),
+        ],
+    )
+    def test_gaming_mode_covers_the_speech_engines(self, phrase):
+        assert phrase in " ".join(_readme_section("Gaming mode").split())
+
+    def test_gaming_mode_no_longer_says_tts_is_off(self):
+        assert "TTS is off" not in " ".join(_readme_section("Gaming mode").split())
 
 
 def _readme_section(title: str) -> str:
