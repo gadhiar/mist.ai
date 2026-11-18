@@ -1573,8 +1573,9 @@ async def lifespan(app: FastAPI):
     # Room devices' configuration and registry, read before the capability
     # host so each registered, unrevoked device rings through its own sink.
     # Either one unreadable logs ERROR and shows `failed` in `/health`: no
-    # device rings and no listener starts, and the desktop path runs on. A
-    # device registered later rings after a restart.
+    # device rings and no listener starts, and the desktop path runs on. The
+    # listener re-reads the registry, so a device registered or revoked later
+    # becomes, or stops being, a ring endpoint at that read, with no restart.
     _device_listener = None
     _device_app = None
     _device_listener_state = "off"
@@ -1592,12 +1593,14 @@ async def lifespan(app: FastAPI):
             logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
             _device_listener_state = "failed"
 
-    # The sinks read the session registry when they are called, as
-    # `_desktop_present` does, since the registry is built after the host.
-    ring_sinks: tuple[DeviceRingSink, ...] = (
-        registry_ring_sinks(device_registry.devices(), lambda: session_registry)
+    # The ring router asks for the device sinks at each call, so they follow
+    # the registry's latest read. The sinks read the session registry when
+    # they are called, as `_desktop_present` does, since the registry is built
+    # after the host.
+    ring_sinks: "Callable[[], tuple[DeviceRingSink, ...]] | None" = (
+        registry_ring_sinks(device_registry.devices, lambda: session_registry)
         if device_registry is not None
-        else ()
+        else None
     )
 
     # Read when a call runs, as the sinks read it, so a call names its

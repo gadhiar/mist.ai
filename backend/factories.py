@@ -1609,7 +1609,7 @@ def build_capability_host(
     tiers: TierProviders,
     register: ReplyRegister,
     desktop_present: Callable[[], bool],
-    ring_sinks: Sequence[RingSink] = (),
+    ring_sinks: Callable[[], Sequence[RingSink]] | None = None,
     endpoint_of: Callable[[str], str | None] | None = None,
     area_of: Callable[[str], str | None] | None = None,
 ) -> CapabilityBuild:
@@ -1623,9 +1623,10 @@ def build_capability_host(
     failing the build.
 
     Alarms and timers share one store, one scheduler and one `RingingTracker`, which wraps the
-    `RingRouter` that rings the desktop endpoint and then each of `ring_sinks`, and the host's
-    `SchedulerAlarmControl` runs over the same three. Without a usable `MIST_TIMEZONE` none of
-    them is built, and alarms, timers and the clock report the zone's reason.
+    `RingRouter` that rings the desktop endpoint and then each sink `ring_sinks` gives at that
+    call, and the host's `SchedulerAlarmControl` runs over the same three. Without a usable
+    `MIST_TIMEZONE` none of them is built, and alarms, timers and the clock report the zone's
+    reason.
 
     Args:
         config: The parsed capability environment.
@@ -1642,8 +1643,10 @@ def build_capability_host(
         tiers: Whose `interaction` provider gates the action decode.
         register: The address form of each session's first templated reply.
         desktop_present: Whether a client is connected, for the desktop ring endpoint.
-        ring_sinks: The other ring endpoints, one per room device, rung after the desktop and
-            listed by name for `ring_on`; none rings the desktop only.
+        ring_sinks: Gives the other ring endpoints, one per room device, rung after the desktop
+            and listed by name for `ring_on`. The router reads it at each call, so a device
+            registered or revoked while the backend runs becomes, or stops being, an endpoint
+            with no restart. None rings the desktop only.
         endpoint_of: The endpoint a live session is bound to, for the host's calls and for a
             stop or snooze spoken to alarms or timers. None leaves every spoken stop or snooze,
             and every call whose context names no endpoint, on the default turn endpoint,
@@ -1686,8 +1689,14 @@ def build_capability_host(
     alarm_control: SchedulerAlarmControl | None = None
     endpoints: Callable[[], tuple[str, ...]] = tuple
     if zone is not None and zone.tz is not None and names & {"alarms", "timers"}:
-        sinks: list[RingSink] = [DesktopSink(event_sink, desktop_present), *ring_sinks]
-        ring_router = RingRouter(sinks, records, clock, config.alarms, zone.tz)
+        ring_router = RingRouter(
+            [DesktopSink(event_sink, desktop_present)],
+            records,
+            clock,
+            config.alarms,
+            zone.tz,
+            sink_source=ring_sinks,
+        )
         tracker = RingingTracker(ring_router)
         scheduler = AlarmScheduler(records, clock, tracker, config.alarms, zone.tz)
         alarm_control = SchedulerAlarmControl(records, scheduler, clock, config.alarms, zone.tz)

@@ -10,8 +10,10 @@ registry exists (`registry_ring_sinks`).
 Only `alarm_fired` is the sink's own. `alarm_state` already reaches every session, a device's
 included, through the capability host's event sink, so `stopped` and `state_changed` send
 nothing: a stop from the device (`alarm_action`) or a spoken one ends the occurrence in the
-scheduler, and the `alarm_state` that follows tells every endpoint. The sinks are fixed when the
-host is built, so a device registered later rings once the backend restarts.
+scheduler, and the `alarm_state` that follows tells every endpoint. `RingRouter` asks
+`registry_ring_sinks`' callable for the sinks at each call, over the device registry the
+listener re-reads, so a device registered or revoked while the backend runs becomes, or stops
+being, an endpoint at the registry's next read, with no restart.
 """
 
 from __future__ import annotations
@@ -83,13 +85,14 @@ def device_ring_sinks(
 
 
 def registry_ring_sinks(
-    devices: Iterable[DeviceRecord], registry: Callable[[], EndpointRoutes | None]
-) -> tuple[DeviceRingSink, ...]:
-    """Return one sink per device that is not revoked, over the session registry.
+    devices: Callable[[], Iterable[DeviceRecord]], registry: Callable[[], EndpointRoutes | None]
+) -> Callable[[], tuple[DeviceRingSink, ...]]:
+    """Return a sink source: at each call, one sink per device not revoked, in registry order.
 
-    `registry` is called at each `present` and `ring`, so sinks built before the session
-    registry exists reach it once it does; until then no device is present and nothing is sent.
-    A payload goes out as JSON text, as the capability host's event sink sends its own.
+    `devices` is read at each call of the source, so the sinks follow the device registry's
+    latest read. `registry` is called at each `present` and `ring`, so sinks built before the
+    session registry exists reach it once it does; until then no device is present and nothing
+    is sent. A payload goes out as JSON text, as the capability host's event sink sends its own.
     """
 
     def present(endpoint: str) -> bool:
@@ -101,4 +104,7 @@ def registry_ring_sinks(
         if routes is not None:
             routes.broadcast(json.dumps(payload), endpoint=endpoint)
 
-    return device_ring_sinks(devices, send, present)
+    def sinks() -> tuple[DeviceRingSink, ...]:
+        return device_ring_sinks(devices(), send, present)
+
+    return sinks

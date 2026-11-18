@@ -3,14 +3,18 @@
 The sink is checked alone, under `RingRouter` beside the desktop sink over a fake session
 registry, and end to end: a real capability host built by `build_capability_host` with the
 device's sink rings a timer on a fake device served by the real device app, and the device's
-`alarm_action` stop ends it, recorded from the device's endpoint.
+`alarm_action` stop ends it, recorded from the device's endpoint. A real `DeviceRegistry` on a
+temporary file shows the sinks following the registry after the host is built, and the
+`lifespan` tests show the composition root handing the host that live source.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import UTC, time, timedelta
 from pathlib import Path
@@ -23,6 +27,7 @@ from backend.capabilities.alarms.notifier import alarm_fired_payload
 from backend.capabilities.alarms.records import AlarmRecords, ArmRequest, Occurrence, RingTarget
 from backend.capabilities.alarms.ringing import DesktopSink, RingRouter, RingSink
 from backend.capabilities.config import AlarmSettings, load_capabilities_config
+from backend.capabilities.contracts import InvocationContext
 from backend.capabilities.db import CapabilitiesDb
 from backend.capabilities.replies import NoAddress
 from backend.capabilities.secrets import EnvSecretSource, SecretRegistry
@@ -31,7 +36,8 @@ from backend.devices.limiter import AuthLimiter
 from backend.devices.listener import build_device_app
 from backend.devices.registry import DeviceRegistry
 from backend.devices.ring_sink import DeviceRingSink, device_ring_sinks, registry_ring_sinks
-from backend.factories import build_capability_host
+from backend.factories import CapabilityBuild, build_capability_host
+from backend.llm.models import ToolCall
 from tests.unit.capabilities.fakes import (
     DEFAULT_START,
     FakeClock,
@@ -89,6 +95,18 @@ class FakeRoutes:
 
     def broadcast(self, message: object, *, endpoint: str | None = None) -> None:
         self.broadcasts.append((message, endpoint))
+
+
+def _rewrite(path: Path, entries: list[dict[str, object]]) -> None:
+    """Write the registry and move its modification time past any earlier write's.
+
+    `reload_if_changed` compares the file's stamp, and a test writes faster than a coarse file
+    system clock ticks, so two writes of one size could otherwise share a stamp.
+    """
+    previous = path.stat().st_mtime_ns if path.exists() else 0
+    write_registry(path, entries)
+    mtime = max(path.stat().st_mtime_ns, previous + 1_000_000_000)
+    os.utime(path, ns=(mtime, mtime))
 
 
 @pytest.fixture()
@@ -201,8 +219,8 @@ class TestDeviceRingSink:
         write_registry(path, [entry(DEVICE, secret_for(1))])
         installed: list[FakeRoutes] = []
         (sink,) = registry_ring_sinks(
-            DeviceRegistry.load(path).devices(), lambda: installed[0] if installed else None
-        )
+            DeviceRegistry.load(path).devices, lambda: installed[0] if installed else None
+        )()
         occurrence = await _ringing(records)
 
         # Built before the registry exists: absent, and a ring sends nothing.
@@ -219,6 +237,36 @@ class TestDeviceRingSink:
         assert json.loads(message) == alarm_fired_payload(
             occurrence, RING_TIMEOUT_S, fallback=False
         )
+
+    def test_registry_sinks_follow_the_registry_at_each_call(self, tmp_path):
+        path = tmp_path / "registry.json"
+        _rewrite(
+            path, [entry(DEVICE, secret_for(1)), entry("old-room", secret_for(2), revoked=True)]
+        )
+        registry = DeviceRegistry.load(path)
+        sinks = registry_ring_sinks(registry.devices, lambda: FakeRoutes(OTHER))
+
+        first = sinks()
+        _rewrite(
+            path,
+            [
+                entry(OTHER, secret_for(3)),
+                entry(DEVICE, secret_for(1), revoked=True),
+                entry("old-room", secret_for(2), revoked=True),
+                entry("third-room", secret_for(4)),
+            ],
+        )
+        unread = sinks()
+        assert registry.reload_if_changed()
+        reread = sinks()
+
+        assert [sink.name for sink in first] == [DEVICE]
+        assert [sink.name for sink in unread] == [DEVICE]
+        # Unrevoked only, in registry order, each a sink of its own over the routes.
+        assert [sink.name for sink in reread] == [OTHER, "third-room"]
+        assert all(isinstance(sink, DeviceRingSink) for sink in reread)
+        assert [sink.present() for sink in reread] == [True, False]
+        assert sinks() is not reread
 
 
 # -- Under the router, beside the desktop ------------------------------------------------------
@@ -288,8 +336,20 @@ async def device_host(monkeypatch, tmp_path):
     path = tmp_path / "registry.json"
     write_registry(path, [entry(DEVICE, secret_for(1))])
     ring_sinks = registry_ring_sinks(
-        DeviceRegistry.load(path).devices(), lambda: server.session_registry
+        DeviceRegistry.load(path).devices, lambda: server.session_registry
     )
+    build, clock, db_path = await _started_host(monkeypatch, tmp_path, ring_sinks)
+    monkeypatch.setattr(server, "_capability_build", build)
+    monkeypatch.setattr(server, "message_queue", asyncio.Queue())
+    yield build.host, clock, db_path
+    await build.host.stop()
+    await build.close()
+
+
+async def _started_host(
+    monkeypatch, tmp_path: Path, ring_sinks: Callable[[], Sequence[RingSink]]
+) -> tuple[CapabilityBuild, FakeClock, Path]:
+    """Build and start a real host with alarms, timers and clock over `ring_sinks`."""
     monkeypatch.setenv("MIST_EVAL_ISOLATION", "0")
     monkeypatch.delenv("MIST_HYDRATION_ISOLATION", raising=False)
     monkeypatch.delenv("MIST_ALLOWED_ORIGINS", raising=False)
@@ -320,13 +380,9 @@ async def device_host(monkeypatch, tmp_path):
         ring_sinks=ring_sinks,
     )
     assert build.host is not None
-    monkeypatch.setattr(server, "_capability_build", build)
-    monkeypatch.setattr(server, "message_queue", asyncio.Queue())
     await build.host.start()
     await build.host.wait_started()
-    yield build.host, clock, db_path
-    await build.host.stop()
-    await build.close()
+    return build, clock, db_path
 
 
 @pytest_asyncio.fixture
@@ -410,6 +466,82 @@ async def test_the_spoken_stop_ends_a_ring_on_the_device_as_the_device_stop_does
     assert result["outcome"] == "invalid_args"
 
 
+# -- A host built before the device: the sinks follow the registry ------------------------------
+
+
+def _recording_routers(monkeypatch) -> list[RingRouter]:
+    """Record each `RingRouter` the factory builds, so a test can read its endpoints."""
+    real = factories.RingRouter
+    built: list[RingRouter] = []
+
+    def construct(*args, **kwargs) -> RingRouter:
+        router = real(*args, **kwargs)
+        built.append(router)
+        return router
+
+    monkeypatch.setattr(factories, "RingRouter", construct)
+    return built
+
+
+def _set_alarm(ring_on: list[str]) -> tuple[ToolCall, InvocationContext]:
+    call = ToolCall(id="call-1", name="alarms.set", arguments={"time": "8am", "ring_on": ring_on})
+    ctx = InvocationContext(
+        session_id="s1",
+        turn_id="t1",
+        utterance="set an alarm for 8am",
+        tool_call_id="call-1",
+        source="model",
+        now=DEFAULT_START,
+    )
+    return call, ctx
+
+
+@pytest.mark.asyncio
+async def test_a_device_registered_after_the_build_rings_and_a_revoked_one_stops_being_one(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "registry.json"
+    _rewrite(path, [entry(DEVICE, secret_for(1))])
+    registry = DeviceRegistry.load(path)
+    routes = FakeRoutes()
+    routers = _recording_routers(monkeypatch)
+    build, clock, _ = await _started_host(
+        monkeypatch, tmp_path, registry_ring_sinks(registry.devices, lambda: routes)
+    )
+    assert build.host is not None
+    try:
+        (router,) = routers
+        assert router.endpoints() == ("desktop", DEVICE)
+
+        # Registered while the backend runs: an endpoint from the registry's next read.
+        _rewrite(path, [entry(DEVICE, secret_for(1)), entry(OTHER, secret_for(2))])
+        assert router.endpoints() == ("desktop", DEVICE)
+        assert registry.reload_if_changed()
+        assert router.endpoints() == ("desktop", DEVICE, OTHER)
+
+        # `ring_on` can name it, and the alarm rings on it alone while it is present.
+        routes.connected.add(OTHER)
+        record = await build.host.invoke(*_set_alarm([OTHER]), None)
+        assert record.outcome.status == "ok", record.outcome
+        await clock.advance(3601.0)
+        await _until(lambda: bool(routes.broadcasts))
+        ((message, endpoint),) = routes.broadcasts
+        assert endpoint == OTHER
+        fired = json.loads(str(message))
+        assert (fired["type"], fired["fallback"]) == ("alarm_fired", False)
+
+        # Revoked while the backend runs: no longer an endpoint from the next read.
+        _rewrite(path, [entry(DEVICE, secret_for(1), revoked=True), entry(OTHER, secret_for(2))])
+        assert registry.reload_if_changed()
+        assert router.endpoints() == ("desktop", OTHER)
+        refused = await build.host.invoke(*_set_alarm([DEVICE]), None)
+        assert refused.outcome.status == "invalid_args"
+        assert refused.outcome.data == {"known_endpoints": ["desktop", OTHER]}
+    finally:
+        await build.host.stop()
+        await build.close()
+
+
 # -- The composition root: `lifespan` hands the registry's devices to the host ------------------
 
 
@@ -420,9 +552,7 @@ async def test_lifespan_gives_the_host_one_ring_sink_per_live_device(
     from backend import server
 
     path = tmp_path / "registry.json"
-    write_registry(
-        path, [entry(DEVICE, secret_for(1)), entry("old-room", secret_for(2), revoked=True)]
-    )
+    _rewrite(path, [entry(DEVICE, secret_for(1)), entry("old-room", secret_for(2), revoked=True)])
     # The listener itself fails on the missing certificate; the sinks come from the registry.
     monkeypatch.setenv("MIST_DEVICE_LISTENER", "on")
     monkeypatch.setenv("MIST_DEVICE_PORT", str(_free_port()))
@@ -433,15 +563,39 @@ async def test_lifespan_gives_the_host_one_ring_sink_per_live_device(
     await lifespan_harness.start()
 
     async with server.lifespan(server.app):
-        sinks = tuple(lifespan_harness.host_kwargs["ring_sinks"])
+        ring_sinks = lifespan_harness.host_kwargs["ring_sinks"]
+        sinks = tuple(ring_sinks())
         registry = server.session_registry
         before = [sink.present() for sink in sinks]
         # A session bound to the device: the sink sees it through the registry `lifespan`
         # built after the host, so a sink reading no registry would stay absent.
         monkeypatch.setattr(registry, "endpoint_present", lambda endpoint: endpoint == DEVICE)
         after = [sink.present() for sink in sinks]
+        # The device registry `lifespan` loaded, which the listener re-reads: `area_of` is its.
+        device_registry = lifespan_harness.host_kwargs["area_of"].__self__
+        _rewrite(path, [entry(DEVICE, secret_for(1), revoked=True), entry(OTHER, secret_for(3))])
+        assert device_registry.reload_if_changed()
+        reread = tuple(ring_sinks())
 
     assert [sink.name for sink in sinks] == [DEVICE]
     assert isinstance(sinks[0], DeviceRingSink)
     assert registry is not None
     assert (before, after) == ([False], [True])
+    assert isinstance(device_registry, DeviceRegistry)
+    assert [sink.name for sink in reread] == [OTHER]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_without_a_device_registry_gives_the_host_no_ring_sinks(
+    lifespan_harness,  # noqa: F811 -- the imported fixture
+):
+    from backend import server
+
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+
+    async with server.lifespan(server.app):
+        pass
+
+    assert "ring_sinks" in lifespan_harness.host_kwargs
+    assert lifespan_harness.host_kwargs["ring_sinks"] is None
