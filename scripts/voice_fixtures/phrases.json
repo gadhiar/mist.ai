@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "complete": [
+    "What does the weather look like for tomorrow morning?",
+    "Can you add oat milk and bread to the shopping list?",
+    "How long should I boil an egg for a soft yolk?",
+    "Please turn the hallway lights down to half.",
+    "What is a good recipe for a quick vegetable soup?",
+    "How many days are left until the end of the month?"
+  ],
+  "pause": [
+    {"before": "Could you remind me to", "after": "water the plants this evening?"},
+    {"before": "I need to find out when the", "after": "pharmacy on the corner closes."},
+    {"before": "What would happen if we moved the", "after": "meeting to Thursday afternoon?"}
+  ],
+  "hesitation": [
+    "So I was thinking that maybe we could...",
+    "Can you look up the name of that...",
+    "I wanted to ask whether the..."
+  ],
+  "keyword_echo": [
+    {
+      "keyword": "stop",
+      "echo": "The museum opens at ten in the morning and the last entry is at half past four."
+    },
+    {
+      "keyword": "wait",
+      "echo": "There are three bus routes into town, and the fastest one leaves every twelve minutes."
+    },
+    {
+      "keyword": "cancel",
+      "echo": "I found a few recipes that use lentils, carrots and a little smoked paprika."
+    }
+  ],
+  "wake": [
+    {"name": "Hey Mist,", "request": "what does the weather look like this afternoon?", "kind": "plain"},
+    {"name": "Hey Mist,", "request": "how do I say thank you in Portuguese?", "kind": "plain"},
+    {"name": "Hey Mist,", "request": "give me one idea for a quick dinner tonight.", "kind": "plain"},
+    {"name": "Hey Mist,", "request": "what time is it right now?", "kind": "tool"},
+    {"name": "Hey Mist,", "request": "do I have any timers running?", "kind": "tool"}
+  ],
+  "noise": [
+    {"burst_ms": 300, "level_dbfs": -20.0, "seed": 1},
+    {"burst_ms": 150, "level_dbfs": -12.0, "seed": 2},
+    {"burst_ms": 600, "level_dbfs": -30.0, "seed": 3}
+  ]
+}
