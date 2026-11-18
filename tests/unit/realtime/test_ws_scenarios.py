@@ -486,8 +486,8 @@ def test_endpoint_wakes_arbitrate_barge_in_and_bound_the_chain(voice_server, cap
     """v5 scenario 13 over `/ws`, which binds every connection `desktop`.
 
     Two sessions use the endpoint spotter. A `voice_start` naming `room` is logged and ignored
-    (v3). The worse-ranked wake loses arbitration; the code closes that candidate with
-    `wake_rejected lost_arbitration`, not v2's `wake_lost` (a spec gap).
+    (v3). The worse-ranked wake loses arbitration and gets one `wake_lost` with the winner's
+    score (v2 :2256).
     """
     question = "mist, what's the time"
     stack = VoiceStack(transcripts=[question] * 4)
@@ -512,8 +512,12 @@ def test_endpoint_wakes_arbitrate_barge_in_and_bound_the_chain(voice_server, cap
         first.say(live)
         second.say(live, seed=1)
 
-        lost = one(second, "wake_rejected")
-        assert lost["reason"] == "lost_arbitration"
+        lost = one(second, "wake_lost")
+        assert lost["reason"] == "arbitration"
+        assert lost["detail"]["score"] == 0.6
+        assert lost["detail"]["winner_score"] == 0.9
+        assert lost["detail"]["utterance_id"] is not None
+        assert second.of("wake_rejected") == []
         assert second.of("stream_start") == []
         turn_id = str(one(first, "stream_start")["turn_id"])
         assert one(first, "transcription")["text"] == question

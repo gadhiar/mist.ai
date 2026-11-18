@@ -207,7 +207,9 @@ UNADDRESSED = "I missed the bus"
 STOP = "stop"
 REPLY = "Hi. "
 ACK = "One moment. "
-CLOSING = ("transcription", "voice_decision:dropped")
+CLOSING = ("transcription", "voice_decision:dropped", "voice_decision:wake_lost")
+WAKE_ENDS = ("voice_decision:wake_rejected", "voice_decision:wake_lost")
+"""The messages that end a name without accepting it; neither may cut or idle a turn."""
 
 EAGER_SAFE = frozenset({"deliver", "take", "synth_fail", "text"})
 """The actions under which the controller step is eager; only `text` then waits for it (C1)."""
@@ -536,6 +538,7 @@ class World:
     done_sent: set[str] = field(default_factory=set)
     reconfigures: list[Reconfigure] = field(default_factory=list)
     rejected_wakes: list[object] = field(default_factory=list)
+    lost_wakes: list[object] = field(default_factory=list)
     segments: dict[str, list[tuple[int, str, str]]] = field(default_factory=dict)
     hinted: dict[str, bool] = field(default_factory=dict)
     acks: collections.Counter[str] = field(default_factory=collections.Counter)
@@ -604,6 +607,8 @@ class World:
             # The wakes are kept, not their ids, so no id is reused by a later name.
             if any(seen is wake for seen in self.rejected_wakes):
                 self.fail("wake_rejected once", f"a second wake_rejected for one name ({reason})")
+            if any(seen is wake for seen in self.lost_wakes):
+                self.fail("wake_lost once", f"a wake_rejected for a name that lost ({reason})")
             self.rejected_wakes.append(wake)
             before = len(self.outbound.of("voice_decision:wake_rejected"))
             send_rejected(wake, reason)
@@ -611,6 +616,19 @@ class World:
                 self.fail("wake_rejected once", f"one rejection sent other than one ({reason})")
 
         c._send_wake_rejected = wake_rejected  # type: ignore[method-assign]
+        send_lost = c._send_wake_lost
+
+        def wake_lost(wake, winner_score, utterance_id):
+            # One loss per name, and never a loss for a name already rejected, or the reverse.
+            if any(seen is wake for seen in (*self.lost_wakes, *self.rejected_wakes)):
+                self.fail("wake_lost once", "a second end (wake_lost) for one name")
+            self.lost_wakes.append(wake)
+            before = len(self.outbound.of("voice_decision:wake_lost"))
+            send_lost(wake, winner_score, utterance_id)
+            if len(self.outbound.of("voice_decision:wake_lost")) - before != 1:
+                self.fail("wake_lost once", "one loss sent other than one wake_lost")
+
+        c._send_wake_lost = wake_lost  # type: ignore[method-assign]
         settle = self.arbiter.settle
 
         def settle_once(claim_id, accepted):
@@ -794,6 +812,16 @@ class World:
         if utterance is not None and (utterance.published or uid in self.accepted):
             return
         if utterance is None and (minted or uid in self.ever_published):
+            return
+        # A lost claim's verdict is its `wake_lost`, which names the candidate it has just
+        # closed unpublished (A52); no other message may name it.
+        if (
+            describe(item) == "voice_decision:wake_lost"
+            and utterance is not None
+            and utterance.closed
+            and not utterance.published
+            and any(getattr(wake, "utterance_id", None) == uid for wake in self.lost_wakes)
+        ):
             return
         self.fail("acceptance", f"{describe(item)} names {uid} before its acceptance")
 
@@ -1105,16 +1133,16 @@ class World:
         names = [describe(item) for item in new]
         scene = self.scene.calls[step.scene_from :]
         newly = self.published() - step.published
-        if "voice_decision:wake_rejected" in names:
+        for end in (n for n in WAKE_ENDS if n in names):
             if "voice_decision:barge_in" in names or "playback_stop" in names:
                 self.fail("rejection cuts nothing", f"{names}")
             if len(self.outbound.purges) > step.purges_from:
-                self.fail("rejection cuts nothing", "a purge in the step of a wake_rejected")
+                self.fail("rejection cuts nothing", f"a purge in the step of a {end}")
             if step.phase in ("thinking", "speaking"):
-                after = names[names.index("voice_decision:wake_rejected") + 1 :]
+                after = names[names.index(end) + 1 :]
                 cycles = [n for n in after if n.startswith("state_cycle")]
                 if cycles and cycles[0] == "state_cycle:idle":
-                    self.fail("rejection restores", f"{step.phase} rejection then {cycles[0]}")
+                    self.fail("rejection restores", f"{step.phase} {end} then {cycles[0]}")
         for call in scene:
             if call[0] == "phase" and call[1] in ("wake", "listening") and not newly:
                 self.fail("scene anchors", f"{call[1]} intent with no acceptance in its step")
@@ -1752,9 +1780,9 @@ REACH: tuple[Reach, ...] = (
         ),
     ),
     # v2 :1660-1662, B1(d) in its v5 form: v5 has no `WakeLost`; a lost claim drops w with
-    # `wake_lost` (`turn.py` `_reject`). The verdict is handled with w's end and v's start
-    # queued behind it. Ingress is dormant in `idle` (v5 :1177), so this runs from `speaking`,
-    # and it needs depth 4: name, deny, end, vad.
+    # `wake_lost` and sends one `voice_decision wake_lost` (`turn.py` `_lose`). The verdict is
+    # handled with w's end and v's start queued behind it. Ingress is dormant in `idle`
+    # (v5 :1177), so this runs from `speaking`, and it needs depth 4: name, deny, end, vad.
     Reach(
         "B1(d)",
         "speaking",
@@ -2221,6 +2249,7 @@ TEETH: list[tuple[str, str, int, Callable[[World], None]]] = [
     ("M47", "speaking", 3, _ignore_purge_result),
     ("settle once", "idle", 2, _settle_twice),
     ("wake_rejected once", "idle", 2, lambda w: _twice(w, "_send_wake_rejected")),
+    ("wake_lost once", "idle", 2, lambda w: _twice(w, "_send_wake_lost")),
     ("acceptance", "idle", 2, _name_the_candidate_at_its_end),
     ("mute", "held", 1, _ignore_muted_drops),
     ("I3", "held", 1, lambda w: _twice(w, "_send_end_of_utterance")),

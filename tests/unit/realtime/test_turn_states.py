@@ -27,6 +27,7 @@ import pytest_asyncio
 
 from backend.chat.stream_events import HandOff, Token
 from backend.realtime.budget import BargeInConfig, WakeConfig
+from backend.realtime.protocol import VoiceDecisionWakeLost, WakeLostDetail
 from backend.realtime.scene import Immediate
 from backend.realtime.speech import SpotterCalibration
 from backend.realtime.turn import (
@@ -2186,6 +2187,7 @@ async def test_endpoint_wake_ranks_with_its_calibration_and_a_slow_backlog_still
         false_accepts_per_hour=pytest.approx(1.05),
         positive_quantile=pytest.approx(0.5),
         margin=pytest.approx(0.2),
+        score=0.7,
     )
     # The backlog completes well after `wake_arbitration_ms`; the claim made at `wake` waits.
     await h.clock.advance(400)
@@ -2517,23 +2519,104 @@ async def test_a_dropped_candidate_settles_its_claim_once_with_accepted_false(dr
         assert calls(h.ingress, "drop") == []
 
 
-async def test_a_lost_claim_closes_its_candidate_lost_arbitration_and_settles_once():
+def losses(h: Harness) -> list[VoiceDecisionWakeLost]:
+    return h.outbound.of("voice_decision:wake_lost")  # type: ignore[return-value]
+
+
+async def test_a_lost_claim_closes_its_candidate_with_one_wake_lost_and_settles_once():
     h = make_harness([Pause()], solo=False)
     h.start_voice()
-    uid = await name_hit(h)
+    uid = await name_hit(h, score=0.6)
 
-    h.arbiter.deny(1)
+    h.arbiter.deny(1, winner_score=0.93)
     await h.settle()
 
     assert h.outbound.names() == [
         "state_cycle:attend",
-        "voice_decision:wake_rejected",
+        "voice_decision:wake_lost",
         "state_cycle:idle",
     ]
-    assert h.outbound.of("voice_decision:wake_rejected")[0].reason == "lost_arbitration"
+    (message,) = losses(h)
+    assert message.turn_id is None
+    assert message.reason == "arbitration"
+    assert message.detail == WakeLostDetail(winner_score=0.93, score=0.6, utterance_id=uid)
     assert calls(h.ingress, "drop") == [("drop", uid, "wake_lost")]
     assert calls(h.ingress, "request_gate_partial") == []
     assert h.arbiter.settles == [(1, False)]
+
+
+@pytest.mark.parametrize("phase", ["thinking", "speaking"])
+async def test_a_lost_claim_in_a_turn_cuts_nothing_and_restores_the_phase_state(phase):
+    h, pause = await in_phase(phase)
+    h.arbiter.solo = False
+    turn_id = h.last_turn()
+    uid = h.ids()
+    h.post(h.ingress.started(uid))
+    await h.settle()
+    mark = len(h.outbound.client)
+
+    await name_hit(h, uid, score=0.6)
+    h.arbiter.deny(h.arbiter.claims[-1].claim_id, winner_score=0.9)
+    await h.settle()
+
+    restored = "think" if phase == "thinking" else "speak"
+    duck = ["playback_duck"] if phase == "speaking" else []
+    assert h.outbound.names()[mark:] == [
+        "state_cycle:attend",
+        *duck,
+        "voice_decision:wake_lost",
+        *duck,
+        f"state_cycle:{restored}",
+    ]
+    assert ducks(h) == ([12.0, 0.0] if phase == "speaking" else [])
+    (message,) = losses(h)
+    assert message.turn_id == turn_id
+    assert message.detail == WakeLostDetail(winner_score=0.9, score=0.6, utterance_id=uid)
+    assert h.outbound.of("voice_decision:wake_rejected") == []
+    assert h.outbound.of("state_cycle:idle") == []
+    assert h.outbound.purges == []
+    assert h.responder.commits == []
+    assert h.controller.phase == phase
+    assert calls(h.ingress, "drop") == [("drop", uid, "wake_lost")]
+    pause.release()
+
+
+async def test_an_endpoint_wake_that_loses_before_its_backlog_gets_a_fresh_id():
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    h.post(endpoint_wake(1500, score=0.6))
+    await h.settle()
+    (claim,) = h.arbiter.claims
+
+    h.arbiter.deny(claim.claim_id, winner_score=0.9)
+    await h.settle()
+
+    assert h.outbound.names() == [
+        "state_cycle:attend",
+        "voice_decision:wake_lost",
+        "state_cycle:idle",
+    ]
+    (message,) = losses(h)
+    assert message.reason == "arbitration"
+    assert message.turn_id is None
+    assert message.detail.winner_score == 0.9
+    assert message.detail.score == 0.6
+    uid = message.detail.utterance_id
+    # No ingress lever ever named it: the id is fresh, and nothing opened to drop.
+    named = [call for call in h.ingress.calls if uid in call]
+    assert named == []
+    assert calls(h.ingress, "open_utterance") == []
+    assert calls(h.ingress, "drop") == []
+    assert h.arbiter.settles == [(claim.claim_id, False)]
+
+    # The backlog's `NameHeard` comes after the loss: no wake waits for it, so it is stale.
+    stale, mark = h.controller.stale_events, len(h.outbound.sent)
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.6))
+    await h.settle()
+
+    assert h.controller.stale_events == stale + 1
+    assert h.outbound.sent[mark:] == []
+    assert calls(h.ingress, "open_utterance") == []
 
 
 async def test_a_verdict_for_a_settled_claim_is_ignored_counted_and_sends_nothing():
@@ -2628,6 +2711,13 @@ def rejected_reasons(h: Harness) -> list[str]:
     return [item.reason for item in h.outbound.of("voice_decision:wake_rejected")]
 
 
+def lost_details(h: Harness) -> list[tuple[str, float, float, str]]:
+    """Each `wake_lost`'s reason, winner score, own score and utterance id."""
+    return [
+        (m.reason, m.detail.winner_score, m.detail.score, m.detail.utterance_id) for m in losses(h)
+    ]
+
+
 async def test_two_calibrated_hits_the_lower_false_accept_rate_proceeds_over_a_larger_margin():
     # The two tables disagree with the margins: a's 0.6 (margin 0.1) reads 0.2 false accepts an
     # hour, b's 0.9 (margin 0.4) reads 1.0.
@@ -2649,16 +2739,16 @@ async def test_two_calibrated_hits_the_lower_false_accept_rate_proceeds_over_a_l
         ("request_gate_partial", ua, GATE_THROUGH)
     ]
     assert calls(s.b.ingress, "request_gate_partial") == []
-    # The loser waits for the winner's verdict: nothing is rejected yet.
-    assert rejected_reasons(s.b) == []
+    # The loser waits for the winner's verdict: nothing is sent to it yet.
+    assert s.b.outbound.names() == ["state_cycle:attend"]
 
     await gate(s.a, ua, "mist what's up")
 
     assert "vad_status:speech_started" in s.a.outbound.names()
-    assert rejected_reasons(s.b) == ["lost_arbitration"]
+    assert lost_details(s.b) == [("arbitration", 0.6, 0.9, ub)]
     assert s.b.outbound.names() == [
         "state_cycle:attend",
-        "voice_decision:wake_rejected",
+        "voice_decision:wake_lost",
         "state_cycle:idle",
     ]
     assert calls(s.b.ingress, "drop") == [("drop", ub, "wake_lost")]
@@ -2683,9 +2773,11 @@ async def test_two_hits_at_the_false_accept_floor_the_higher_quantile_proceeds_t
 
     await gate(s.b, ub, "mist what's the time")
 
-    assert rejected_reasons(s.a) == ["lost_arbitration"]
+    assert lost_details(s.a) == [("arbitration", 0.95, 0.85, ua)]
+    assert rejected_reasons(s.a) == []
     assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
     assert rejected_reasons(s.b) == []
+    assert losses(s.b) == []
 
 
 async def test_two_hits_equal_on_both_scales_the_earlier_arrival_proceeds():
@@ -2700,7 +2792,8 @@ async def test_two_hits_equal_on_both_scales_the_earlier_arrival_proceeds():
         ("request_gate_partial", ub, GATE_THROUGH)
     ]
     await gate(s.b, ub, "mist, are you there")
-    assert rejected_reasons(s.a) == ["lost_arbitration"]
+    assert lost_details(s.a) == [("arbitration", 0.8, 0.8, ua)]
+    assert rejected_reasons(s.a) == []
     assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
 
 
@@ -2725,14 +2818,17 @@ async def test_calibrated_outranks_uncalibrated_and_uncalibrated_ranks_by_margin
     await s.close_window()
 
     won, lost = (s.a, s.b) if winner == "a" else (s.b, s.a)
-    won_uid = ua if winner == "a" else ub
+    won_uid, lost_uid = (ua, ub) if winner == "a" else (ub, ua)
+    won_score, lost_score = (score_a, score_b) if winner == "a" else (score_b, score_a)
     assert calls(won.ingress, "request_gate_partial") == [
         ("request_gate_partial", won_uid, GATE_THROUGH)
     ]
     assert calls(lost.ingress, "request_gate_partial") == []
     await gate(won, won_uid, "mist what's up")
     assert rejected_reasons(won) == []
-    assert rejected_reasons(lost) == ["lost_arbitration"]
+    assert losses(won) == []
+    assert rejected_reasons(lost) == []
+    assert lost_details(lost) == [("arbitration", won_score, lost_score, lost_uid)]
 
 
 async def test_when_the_winner_is_rejected_the_runner_up_requests_its_gate_partial():
@@ -2752,6 +2848,8 @@ async def test_when_the_winner_is_rejected_the_runner_up_requests_its_gate_parti
     await gate(s.b, ub, "mist what's up")
     assert rejected_reasons(s.b) == []
     assert "vad_status:speech_started" in s.b.outbound.names()
+    # The rejected winner's claim is settled, so the runner-up's acceptance sends it no loss.
+    assert losses(s.a) == []
 
 
 async def test_only_the_winners_gate_partial_is_requested_while_both_wait():
