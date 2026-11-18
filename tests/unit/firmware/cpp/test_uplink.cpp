@@ -312,6 +312,93 @@ MIST_TEST(mute_while_disconnected_sends_nothing_and_is_kept) {
   CHECK(rig.uplink.on_wake(0.9f, 0) == WakeOutcome::Muted);
 }
 
+MIST_TEST(a_refused_mute_is_sent_by_the_next_pump) {
+  Rig rig;
+  rig.ready();
+  rig.sink.refuse_text = true;
+
+  CHECK(!rig.uplink.on_mute(true));
+  CHECK(rig.uplink.muted());
+  CHECK_EQ(rig.uplink.pump(20), 0);
+  rig.sink.refuse_text = false;
+  rig.write(5);
+  CHECK_EQ(rig.uplink.pump(40), 0);
+
+  CHECK_EQ(rig.sink.texts.size(), 1);
+  CHECK(field_equals(rig.sink.texts[0], "type", "mute"));
+  bool active = false;
+  CHECK(bool_field(rig.sink.texts[0], "active", &active));
+  CHECK(active);
+  CHECK(rig.sink.frames.empty());
+  rig.uplink.pump(60);
+  CHECK_EQ(rig.sink.texts.size(), 1);
+}
+
+MIST_TEST(a_mute_undone_before_its_retry_sends_nothing) {
+  Rig rig;
+  rig.ready();
+  rig.sink.refuse_text = true;
+  CHECK(!rig.uplink.on_mute(true));
+
+  rig.sink.refuse_text = false;
+  CHECK(rig.uplink.on_mute(false));
+  rig.uplink.pump(20);
+
+  CHECK(rig.sink.texts.empty());
+  CHECK(!rig.uplink.muted());
+}
+
+MIST_TEST(a_new_connection_drops_an_unsent_mute_because_voice_start_carries_it) {
+  Rig rig;
+  rig.ready();
+  rig.sink.refuse_text = true;
+  CHECK(!rig.uplink.on_mute(true));
+  rig.uplink.on_disconnected();
+  rig.sink.refuse_text = false;
+
+  rig.ready();
+  rig.uplink.pump(20);
+
+  CHECK(rig.sink.texts.empty());
+  CHECK(rig.uplink.muted());
+  CHECK(rig.uplink.on_wake(0.9f, 40) == WakeOutcome::Muted);
+}
+
+MIST_TEST(an_unsent_unmute_goes_before_the_next_wake) {
+  Rig rig;
+  rig.ready();
+  CHECK(rig.uplink.on_mute(true));
+  rig.sink.refuse_text = true;
+  CHECK(!rig.uplink.on_mute(false));
+  rig.sink.refuse_text = false;
+  rig.write(3);
+
+  CHECK(rig.uplink.on_wake(0.9f, 0) == WakeOutcome::Opened);
+
+  CHECK_EQ(rig.sink.texts.size(), 3);
+  CHECK(field_equals(rig.sink.texts[1], "type", "mute"));
+  bool active = true;
+  CHECK(bool_field(rig.sink.texts[1], "active", &active));
+  CHECK(!active);
+  CHECK(field_equals(rig.sink.texts[2], "type", "wake"));
+  CHECK_EQ(rig.sink.frames.size(), 3);
+}
+
+MIST_TEST(a_wake_waits_while_an_unmute_cannot_be_sent) {
+  Rig rig;
+  rig.ready();
+  CHECK(rig.uplink.on_mute(true));
+  rig.sink.refuse_text = true;
+  CHECK(!rig.uplink.on_mute(false));
+  rig.write(3);
+
+  CHECK(rig.uplink.on_wake(0.9f, 0) == WakeOutcome::SendFailed);
+
+  CHECK(!rig.uplink.is_open());
+  CHECK_EQ(rig.sink.texts.size(), 1);
+  CHECK(rig.sink.frames.empty());
+}
+
 MIST_TEST(each_rejecting_decision_closes_the_uplink_and_nothing_follows) {
   const DecisionKind closing[] = {DecisionKind::WakeRejected, DecisionKind::WakeLost,
                                   DecisionKind::Dropped};

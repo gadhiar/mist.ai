@@ -75,13 +75,17 @@ class Uplink {
   Uplink(PcmRing& ring, UplinkSink& sink, const UplinkConfig& config = UplinkConfig());
 
   // A new connection: `seq` restarts at 0 and voice is inactive until a `voice_state` says so.
+  // Its `voice_start` already carried the current mute state, so no `mute` is owed.
   void on_connected();
   void on_disconnected();
   // `voice_state.active` from either cause.
   void on_voice_state(bool active);
   // The hardware mute switch. Mute closes the uplink and clears the ring; unmute clears it
-  // again, so nothing captured before or during the mute reaches a later backlog. Each change
-  // sends `mute {active}` while connected. Returns false only when that send was refused.
+  // again, so nothing captured before or during the mute reaches a later backlog. While
+  // connected, a change the server does not know yet is sent as `mute {active}`; returns false
+  // only when that send was refused. A refused one is sent again by the next `pump` or `on_wake`
+  // (a wake never reaches the server ahead of the unmute before it), unless the switch went back
+  // first or a new connection's `voice_start` carries the state instead.
   bool on_mute(bool muted);
   void on_state_cycle(MistState state, const char* turn_id);
   void on_voice_decision(DecisionKind kind);
@@ -91,8 +95,9 @@ class Uplink {
   // A "stop" detection.
   StopOutcome on_stop_keyword();
 
-  // Sends the frames the ring holds past the cursor, at most `max_frames`, and closes the uplink
-  // at its cap. Returns the frames handed to the sink.
+  // Sends a mute change the sink refused before; then sends the frames the ring holds past the
+  // cursor, at most `max_frames`, and closes the uplink at its cap. Returns the frames handed to
+  // the sink.
   uint32_t pump(uint32_t now_ms, uint32_t max_frames = 0xFFFFFFFFu);
 
   bool is_open() const { return open_; }
@@ -105,6 +110,9 @@ class Uplink {
  private:
   void close(CloseReason reason);
   bool send_pending();
+  // Sends `mute {active}` when the server's mute state differs from the switch's; true when they
+  // agree afterwards.
+  bool sync_mute();
 
   PcmRing& ring_;
   UplinkSink& sink_;
@@ -113,6 +121,9 @@ class Uplink {
   bool connected_ = false;
   bool voice_active_ = false;
   bool muted_ = false;
+  // The mute state the server holds: set from `voice_start` on each connection, then by each
+  // `mute` the sink took.
+  bool server_muted_ = false;
   bool open_ = false;
   uint32_t opened_at_ms_ = 0;
   uint32_t seq_ = 0;

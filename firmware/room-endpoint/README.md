@@ -82,18 +82,78 @@ differs in the hardware. Copy `personal.example.yaml` to `<private dir>/<device>
 docker run --rm --network none -v <repo>:/repo:ro -v <private dir>/<device>:/private/<device> -v <models dir>:/models:ro -w /repo <worker image> python -m scripts.room_endpoint.build compile room --config /private/<device>/room.yaml --out /private/<device>/images/room
 ```
 
+## The pre-wake ring and wake uplink
+
+`mist_prewake` (configured in `packages/link.yaml`) holds the last `ring_ms` (6 s) of microphone
+channel 0, the XMOS chain through AGC at gain 1 (as the published config's voice pipeline takes
+it, `home-assistant-voice.yaml` lines 1814-1820; the wake models read channel 1 at gain 4, lines
+1721-1726), in a PSRAM ring (`heap_caps_malloc` with
+`MALLOC_CAP_SPIRAM`, 16 kHz mono PCM16 in 20 ms frames, through `mist_core::PcmRing`). Nothing
+leaves the device before a name detection. A detection by the name model, while connected,
+unmuted and with `voice_state.active` true, sends `wake {keyword: "mist", score, backlog_ms}`,
+then the newest `backlog_ms` (at most 5000) of the ring oldest first, then live frames, all
+through `mist_link`. `mist_core::Uplink` (`components/mist_core/uplink.cpp`) is the state machine,
+tested on the host in `tests/unit/firmware/cpp/test_uplink.cpp`.
+
+Which detection opens it. `micro_wake_word`'s `on_wake_word_detected` passes only the detected
+model's word, so `mist_prewake` opens the uplink only when that word is the name model's
+(`wake_model: mist_wake`, the model `${wake_model}` loads). Its codegen refuses any build in which
+another model carries the same word, except the spike build, whose stand-in wake is the stop
+model's own file; it recognises the spike build by `mist_link: device_stats`, which only
+`packages/spike.yaml` sets. So in the room build only `${wake_model}` opens the uplink and "stop"
+never does. This is checked at build time (`esphome config` refuses such a build), not by a host
+test. A room compile without `--config` gets the stop model as `wake_model` from `build.py`'s
+stand-ins, so it is refused too.
+
+The uplink closes on the first of these, checked against the realtime controller on `main`:
+
+- `state_cycle` `speak` or `idle` after the wake: the controller sends `state_cycle speak` before
+  a reply stretch's first `0x01` (`backend/realtime/turn.py:1278-1285`) and `state_cycle idle`
+  at a turn's end (`turn.py:2972`) or after an utterance that opened no turn (`turn.py:3067`);
+- `voice_decision` `dropped` (`backend/realtime/protocol.py:849-874`, which closes the utterance
+  it names, reason `muted` included), `wake_lost` (`protocol.py:922-932`, the same) or
+  `wake_rejected` (`protocol.py:935-948`);
+- `uplink_cap_ms` (30 s; 75 s in the spike build) after the wake;
+- the mute switch;
+- disconnection.
+
+It stays open through `voice_decision` `endpoint`, which opens a turn while `hold` and
+`supersede` still listen (`protocol.py:789-826`), and through `state_cycle` `think`, so the
+server's hold and supersede logic still hears a sentence that goes on.
+
+The mute switch is GPIO3, from the published Voice PE config this firmware adapts
+(`home-assistant-voice.yaml` at 2644f4c, line 523, the `gpio` binary sensor
+`hardware_mute_switch`; on means muted). Turning it on clears the ring, closes any uplink and
+sends `mute {active: true}`; turning it off clears the ring again and sends `mute {active:
+false}`, so no audio from before or during a mute reaches a later backlog. A `mute` the link's
+queue refuses is sent again on the next pass, and always before the next `wake`; each
+`voice_start` carries the current state.
+
+`wake.score` is the name model's probability cutoff, not the detection's probability. ESPHome
+2026.10.2 computes a detection's probabilities (`DetectionEvent.max_probability` and
+`average_probability`, `esphome/components/micro_wake_word/streaming_model.h:20-28`) but only
+logs them; its trigger passes the word alone
+(`this->wake_word_detected_trigger_.trigger(*detection_event.wake_word)`, `micro_wake_word.cpp:496`;
+the automation's one argument is `wake_word`, `micro_wake_word/__init__.py:600-605`), and the
+detection queue is protected (`micro_wake_word.h:138`). So `mist_prewake` sends the cutoff the model runs with,
+`WakeWordModel::get_probability_cutoff() / 255`: the manifest's `micro.probability_cutoff`, or the
+model's `probability_cutoff` in the YAML (`micro_wake_word/__init__.py:555-558`), quantized to
+1/255. The server's calibration then ranks the device at its cutoff's false-accept rate.
+
 ## Layout and how a build works
 
 - `room.yaml` and `spike.yaml`: the two top-level configs, with every substitution's default set
   to the worker image's path (`room.yaml` alone has no default name model).
 - `packages/device.yaml`: the hardware, adapted from the published Voice PE config (MIT): board,
   PSRAM, XMOS front end (`voice_kit`, referenced at its pinned commit, never copied), I2S buses,
-  microphone, speaker chain, Wi-Fi, OTA, SNTP and the wake models.
-- `packages/link.yaml`: `mist_link`, the link to MIST; `packages/spike.yaml` adds the spike's
-  `device_stats`, and `room.yaml` never includes it.
+  microphone, speaker chain, mute switch, Wi-Fi, OTA, SNTP and the wake models.
+- `packages/link.yaml`: `mist_link`, the link to MIST, and `mist_prewake`, the pre-wake ring and
+  wake uplink; `packages/spike.yaml` adds the spike's `device_stats`, and `room.yaml` never
+  includes it.
 - `components/mist_core/`: the portable core, tested on the host (`tests/unit/firmware`);
   `components/mist_link/`: the link, through `esp_websocket_client` added from the image's local
-  copy.
+  copy; `components/mist_prewake/`: the microphone tap, wake hook and mute switch around
+  `mist_core`'s ring and uplink.
 
 `scripts/room_endpoint/build.py` copies this directory to a new directory under `/tmp`, sets
 ESPHome's data directory and `HOME` inside it, serves the image's assets on `127.0.0.1:8765` for
