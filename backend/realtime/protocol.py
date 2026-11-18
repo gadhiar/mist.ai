@@ -1268,6 +1268,26 @@ ROOM_CLIENT_MESSAGE_TYPES = frozenset(
     }
 )
 SERVER_MESSAGE_TYPES = _type_tags(ServerMessage, "type")
+# What a `room` session is sent: the text types the room device's codec decodes, and no other.
+# Each is a protocol message or a capability event (`backend/capabilities/events.py`); another
+# session's proposals, the capabilities and system status and the heartbeat are withheld, as the
+# device would ignore them. `tests/unit/firmware/test_core.py` ties the set to `read_inbound`'s
+# source, so a type the firmware starts to decode fails there until it is allowed here.
+ROOM_SERVER_MESSAGE_TYPES = frozenset(
+    {
+        "session_started",
+        "voice_state",
+        "state_cycle",
+        "voice_decision",
+        "stream_start",
+        "playback_stop",
+        "playback_duck",
+        "error",
+        "alarm_state",
+        "alarm_fired",
+        "alarm_action_result",
+    }
+)
 VOICE_DECISION_KINDS = _type_tags(VoiceDecisionMessage, "kind")
 
 

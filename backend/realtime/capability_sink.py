@@ -3,7 +3,9 @@
 The capability host emits its broadcast payloads here, from the loop or from a worker thread.
 `alarm_fired` is the desktop's ring, so it goes to the sessions bound `desktop` only; every
 other payload (`capabilities_status`, `alarm_state`, `action_proposed`, `action_resolved` and
-the rest) goes to every session.
+the rest) is queued on every session. A `room` session writes only the types its device acts on
+(`ROOM_SERVER_MESSAGE_TYPES`, checked in `RealtimeSession._write`), so of these a device is sent
+`alarm_state` alone; its own `alarm_fired` comes from its ring sink (`backend/devices/`).
 
 The sink also answers D8's `alarm_ringing`. Capabilities has no synchronous ringing query, so
 the sink keeps the `ringing` list of the last `alarm_state` it relayed: an alarm rings while that

@@ -22,6 +22,7 @@ from backend.capabilities.events import AlarmActionMessage, AlarmReportMessage
 from backend.realtime.protocol import (
     CLIENT_MESSAGE_TYPES,
     ROOM_CLIENT_MESSAGE_TYPES,
+    ROOM_SERVER_MESSAGE_TYPES,
     Direction,
     MsgType,
     decode_frame,
@@ -90,6 +91,7 @@ STANDARD_HEADERS = frozenset(
 PLATFORM_HEADER = re.compile(r"esphome|esp_|freertos|sdkconfig|driver/|nvs|arduino|hal/", re.I)
 INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
 CASE = re.compile(r"^MIST_TEST\((\w+)\)", re.M)
+INBOUND_TYPE = re.compile(r'\btype\.equals\("(\w+)"\)')
 MIT_LINE = "SPDX-License-Identifier: MIT"
 
 
@@ -162,6 +164,27 @@ def test_contract_covers_every_message_the_device_sends(
 def test_a_room_session_accepts_every_type_the_device_sends_and_no_other():
     """A new device message fails here until the room session's allowlist takes it."""
     assert DEVICE_MESSAGE_TYPES - {"device_stats"} == ROOM_CLIENT_MESSAGE_TYPES
+
+
+def _decoded_types() -> frozenset[str]:
+    """The `type.equals("...")` strings in `read_inbound`'s body, read from `codec.cpp`'s source.
+
+    The body runs from the brace after the signature to its matching brace; the function holds
+    no brace inside a string or a comment, so counting braces finds it with no compiler.
+    """
+    source = (CORE_DIR / "codec.cpp").read_text(encoding="utf-8")
+    opening = source.index("{", source.index("ReadError read_inbound("))
+    depth = 0
+    for end in range(opening, len(source)):
+        depth += {"{": 1, "}": -1}.get(source[end], 0)
+        if depth == 0:
+            break
+    return frozenset(INBOUND_TYPE.findall(source[opening:end]))
+
+
+def test_a_room_session_is_sent_every_type_the_device_decodes_and_no_other():
+    """A type the firmware starts to decode fails here until the room session's set takes it."""
+    assert _decoded_types() == ROOM_SERVER_MESSAGE_TYPES
 
 
 def test_every_protocol_message_parses_strictly_with_the_backend_codec(

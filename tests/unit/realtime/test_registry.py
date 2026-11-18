@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Literal
 
 import pytest
@@ -10,6 +11,7 @@ import pytest_asyncio
 
 from backend.chat.stream_events import Token
 from backend.realtime.budget import BargeInConfig, VoiceSettings
+from backend.realtime.capability_sink import CapabilitySink
 from backend.realtime.registry import SessionRegistry
 from backend.realtime.session import InferenceLanes, RealtimeSession, SessionServices, SpeechEngines
 from backend.realtime.turn import WakeArbiter, WakeRank
@@ -161,12 +163,24 @@ class TestRouting:
         desk = await rig.connect("a", "desktop")
         room = await rig.connect("b", "room")
 
-        rig.registry.broadcast({"type": "status", "message": "all"})
-        rig.registry.broadcast({"type": "status", "message": "rooms"}, endpoint="room")
+        rig.registry.broadcast({"type": "alarm_state", "message": "all"})
+        rig.registry.broadcast({"type": "alarm_state", "message": "rooms"}, endpoint="room")
         await settle()
 
         assert [m["message"] for m in desk.socket.sent] == ["all"]
         assert [m["message"] for m in room.socket.sent] == ["all", "rooms"]
+
+    async def test_a_status_broadcast_reaches_the_desktop_and_not_a_room(self):
+        rig = RegistryRig()
+        desk = await rig.connect("a", "desktop")
+        room = await rig.connect("b", "example-room", "room")
+
+        rig.registry.broadcast({"type": "status", "message": "all"})
+        await settle()
+
+        assert desk.names() == ["status"]
+        assert room.socket.sent == []
+        assert (desk.session.withheld, room.session.withheld) == (0, 1)
 
     async def test_send_to_reaches_one_session(self):
         rig = RegistryRig()
@@ -216,11 +230,48 @@ class TestRouting:
         other = await rig.connect("a", "other-room", "room")
         device = await rig.connect("b", "example-room", "room")
 
-        rig.registry.broadcast({"type": "status", "message": "ring"}, endpoint="example-room")
+        rig.registry.broadcast({"type": "alarm_fired", "message": "ring"}, endpoint="example-room")
         await settle()
 
         assert [m["message"] for m in device.socket.sent] == ["ring"]
         assert other.socket.sent == []
+
+    async def test_a_room_gets_the_alarm_broadcasts_and_results_but_not_status_or_proposals(self):
+        rig = RegistryRig()
+        desk = await rig.connect("a", "desktop")
+        room = await rig.connect("b", "example-room", "room")
+        sink = CapabilitySink()
+        sink.attach(rig.registry, asyncio.get_running_loop())
+
+        # As the broadcaster routes `message_queue`: JSON text to every session.
+        rig.registry.broadcast(json.dumps({"type": "heartbeat", "timestamp": 1}))
+        rig.registry.broadcast(json.dumps({"type": "system_status", "timestamp": 1}))
+        # As capabilities emit through their sink, which sends `alarm_fired` to the desktop.
+        sink.emit({"type": "capabilities_status", "rev": 1})
+        sink.emit({"type": "action_proposed", "proposal_id": "p1", "session_id": "a"})
+        sink.emit({"type": "alarm_state", "rev": 1, "ringing": []})
+        sink.emit({"type": "alarm_fired", "alarm_id": "a1"})
+        # As a device's ring sink rings it, and as an alarm action is answered.
+        rig.registry.broadcast(
+            json.dumps({"type": "alarm_fired", "alarm_id": "a1"}), endpoint="example-room"
+        )
+        for session_id in ("a", "b"):
+            rig.registry.send_to(session_id, {"type": "alarm_action_result", "alarm_id": "a1"})
+        await settle()
+
+        assert sorted(desk.names()) == sorted(
+            [
+                "alarm_action_result",
+                "heartbeat",
+                "system_status",
+                "capabilities_status",
+                "action_proposed",
+                "alarm_state",
+                "alarm_fired",
+            ]
+        )
+        assert sorted(room.names()) == ["alarm_action_result", "alarm_fired", "alarm_state"]
+        assert (desk.session.withheld, room.session.withheld) == (0, 4)
 
     async def test_each_session_gets_its_own_voice_state_on_a_change(self):
         rig = RegistryRig()

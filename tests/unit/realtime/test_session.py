@@ -27,7 +27,9 @@ from backend.realtime.power import PowerGate
 from backend.realtime.protocol import (
     CLIENT_MESSAGE_TYPES,
     ROOM_CLIENT_MESSAGE_TYPES,
+    ROOM_SERVER_MESSAGE_TYPES,
     Direction,
+    ErrorMessage,
     Frame,
     MsgType,
     StreamStartMessage,
@@ -643,6 +645,144 @@ class TestRoomMessages:
 
         assert not any(call[0] == "reference" for call in rig.ingress.calls)
         assert rig.session.dropped_references == 2
+
+
+# -- Room sessions: only the types the device acts on ---------------------------------------------
+
+AUDIO = Frame(MsgType.AUDIO_CHUNK, 1, 1, 24000, b"\x00\x00" * 480)
+
+# One item of each shape the session writes, the type it carries, and whether a room gets it.
+OUTBOUND: list[tuple[object, bool]] = [
+    (ErrorMessage(kind="server", message="x", retriable=True, context=None), True),
+    ({"type": "alarm_state", "rev": 1}, True),
+    (json.dumps({"type": "alarm_fired", "alarm_id": "a1"}), True),
+    (AUDIO, True),
+    ({"type": "status", "message": "s"}, False),
+    (json.dumps({"type": "heartbeat", "timestamp": 1}), False),
+    ("a raw log line", False),
+    (json.dumps(["alarm_state"]), False),
+    ({"message": "no type"}, False),
+    ({"type": ["alarm_state"]}, False),
+]
+
+
+def as_written(item: object) -> object:
+    """An item as the fake socket records it, with a frame named by its type."""
+    if isinstance(item, Frame):
+        return f"0x{item.msg_type:02x}"
+    if isinstance(item, ErrorMessage):
+        return json.loads(item.model_dump_json())
+    if isinstance(item, str):
+        try:
+            return json.loads(item)
+        except ValueError:
+            return item
+    return item
+
+
+def written(rig: Rig) -> list[object]:
+    return [as_written(item) for item in rig.socket.sent]
+
+
+def withheld_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith("room_message_withheld")]
+
+
+def a_room_gets(name: str) -> bool:
+    """Whether a room is sent what `name_of` named: a frame, or a type its device acts on."""
+    return name.startswith("0x") or name.split(":", 1)[0] in ROOM_SERVER_MESSAGE_TYPES
+
+
+async def voice_turn(rig: Rig, start: dict[str, object]) -> None:
+    """Start voice and publish one utterance; the turn it opens answers it."""
+    await rig.send(start)
+    uid = rig.ids()
+    rig.ingress.emit(rig.ingress.started(uid))
+    rig.ingress.emit(rig.ingress.ended(uid, "hello"))
+    await settle()
+
+
+async def played_voice_turn(rig: Rig, start: dict[str, object]) -> None:
+    """One spoken turn, played to its end, so it sends its `turn_metrics` too."""
+    await voice_turn(rig, start)
+    (turn_id,) = stream_starts(rig)
+    await rig.send({"type": "playback_done", "turn_id": turn_id, "played_ms": 5000})
+
+
+class TestRoomOutbound:
+    async def test_a_room_session_writes_only_the_types_the_device_acts_on(self):
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        for item, _sent in OUTBOUND:
+            rig.session.send_control(item)
+        await settle()
+
+        assert written(rig) == [as_written(item) for item, sent in OUTBOUND if sent]
+        assert rig.session.withheld == sum(1 for _item, sent in OUTBOUND if not sent)
+
+    async def test_a_desktop_session_writes_every_item(self):
+        rig = await Rig().start()
+
+        for item, _sent in OUTBOUND:
+            rig.session.send_control(item)
+        await settle()
+
+        assert written(rig) == [as_written(item) for item, _sent in OUTBOUND]
+        assert rig.session.withheld == 0
+
+    async def test_each_withheld_type_is_logged_once_at_debug_and_every_item_counted(self, caplog):
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        with caplog.at_level(logging.DEBUG, logger="backend.realtime.session"):
+            for item in ({"type": "status"}, json.dumps({"type": "heartbeat"}), {"type": "status"}):
+                rig.session.send_bulk(item)
+            await settle()
+
+        records = withheld_records(caplog)
+        assert [r.getMessage() for r in records] == [
+            "room_message_withheld session=s1 type=status",
+            "room_message_withheld session=s1 type=heartbeat",
+        ]
+        assert {r.levelno for r in records} == {logging.DEBUG}
+        assert rig.session.withheld == 3
+        assert rig.socket.sent == []
+
+    async def test_a_rooms_own_turn_sends_what_the_device_acts_on_and_withholds_the_rest(self):
+        desk = await Rig().start()
+        room = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        await played_voice_turn(desk, voice_start())
+        await played_voice_turn(room, CLIENT_MESSAGES["voice_start"])
+
+        # The desktop is sent every item of the turn, the room the types its device acts on.
+        sent = set(desk.names())
+        assert {"stream_start", "voice_state", "0x01", "transcription", "turn_metrics"} <= sent
+        assert desk.session.withheld == 0
+        kept = {name for name in sent if a_room_gets(name)}
+        assert set(room.names()) == kept
+        assert {"stream_start", "voice_state", "0x01"} <= kept
+        assert room.session.withheld == sum(1 for name in desk.names() if name not in kept)
+
+    async def test_a_withheld_turn_item_still_releases_a_control_item_fenced_behind_it(self):
+        # No synthesizer: the reply goes on the text channel, so the turn ends with no playback.
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room", synthesizer=False).start()
+        rig.socket.hold(lambda item: name_of(item) == "stream_start")
+        await voice_turn(rig, CLIENT_MESSAGES["voice_start"])
+        assert isinstance(rig.socket.holding, dict)
+        turn_id = rig.socket.holding["turn_id"]
+        # A reconfigure while the turn runs: `apply` answers it at the turn's end, fenced behind
+        # the turn's last lane item, `turn_metrics`, which a room is not sent.
+        await rig.send({**CLIENT_MESSAGES["voice_start"], "req": 2, "aec": "native"})
+        assert [answer["req"] for answer in rig.answers()] == [1]
+
+        rig.socket.release()
+        await settle()
+
+        assert "turn_metrics" not in rig.names()
+        answer = at(rig, "voice_state", cause="answer", req=2)
+        assert at(rig, "stream_start", turn_id=turn_id) < answer
+        assert at(rig, "state_cycle", state="idle", turn_id=turn_id) < answer
+        assert rig.session.withheld > 0
 
 
 # -- Lanes ---------------------------------------------------------------------------------------
