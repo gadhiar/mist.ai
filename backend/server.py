@@ -1600,6 +1600,18 @@ async def lifespan(app: FastAPI):
         else ()
     )
 
+    # Read when a call runs, as the sinks read it, so a call names its
+    # session's endpoint once the registry exists; before then, and for a
+    # session that is not connected, it gives None and the turn endpoint
+    # applies.
+    def _session_endpoint(session_id: str) -> str | None:
+        registry = session_registry
+        return registry.endpoint_of(session_id) if registry is not None else None
+
+    # Without a loaded device registry no endpoint has an area, so an
+    # untargeted lights call keeps `MIST_LIGHTS_DEFAULT_TARGET`.
+    _device_area = device_registry.area_of if device_registry is not None else None
+
     try:
         _capability_config = load_capabilities_config(os.environ)
     except CapabilityConfigError as e:
@@ -1626,6 +1638,8 @@ async def lifespan(app: FastAPI):
             register=persona,
             desktop_present=_desktop_present,
             ring_sinks=ring_sinks,
+            endpoint_of=_session_endpoint,
+            area_of=_device_area,
         )
     if _capability_build.host is not None:
         await _capability_build.host.start()

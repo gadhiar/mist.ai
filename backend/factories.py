@@ -1603,6 +1603,8 @@ def build_capability_host(
     register: ReplyRegister,
     desktop_present: Callable[[], bool],
     ring_sinks: Sequence[RingSink] = (),
+    endpoint_of: Callable[[str], str | None] | None = None,
+    area_of: Callable[[str], str | None] | None = None,
 ) -> CapabilityBuild:
     """Assemble the capabilities named in `MIST_CAPABILITIES` behind one `CapabilityHost`.
 
@@ -1635,6 +1637,12 @@ def build_capability_host(
         desktop_present: Whether a client is connected, for the desktop ring endpoint.
         ring_sinks: The other ring endpoints, one per room device, rung after the desktop and
             listed by name for `ring_on`; none rings the desktop only.
+        endpoint_of: The endpoint a live session is bound to, for the host's calls and for a
+            stop or snooze spoken to alarms or timers. None leaves every spoken stop or snooze,
+            and every call whose context names no endpoint, on the default turn endpoint,
+            `desktop`.
+        area_of: A room device's area, for an untargeted lights power or adjust call from that
+            device; None leaves such a call on `MIST_LIGHTS_DEFAULT_TARGET`.
 
     Returns:
         A build with a host and no reason, or no host and the reason.
@@ -1693,6 +1701,7 @@ def build_capability_host(
                     ringing=tracker,
                     endpoints=endpoints,
                     snooze_minutes=config.alarms.snooze_minutes,
+                    endpoint_of=endpoint_of,
                 )
             )
         elif name == "clock" and zone is not None:
@@ -1718,7 +1727,10 @@ def build_capability_host(
                 )
             capabilities.append(
                 LightsCapability(
-                    provider, default_target=config.lights.default_target, counter=token_counter
+                    provider,
+                    default_target=config.lights.default_target,
+                    counter=token_counter,
+                    area_of=area_of,
                 )
             )
         elif name == "music" and config.music.spotify_client_id is not None:
@@ -1763,6 +1775,7 @@ def build_capability_host(
         power=power,
         tiers=tiers,
         register=register,
+        endpoint_of=endpoint_of,
     )
     if connection is not None:
         connection.set_state_listener(host.status_changed)
