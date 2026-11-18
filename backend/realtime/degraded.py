@@ -12,6 +12,7 @@ from __future__ import annotations
 import itertools
 import os
 from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
 from backend.chat.stream_events import Complete, StreamEvent, Token
 from backend.chat.turn_scope import CommitResult, TurnDelivery, TurnRequest, TurnScope
@@ -19,6 +20,9 @@ from backend.extraction_backlog.telemetry import record_unrecorded_turn
 from backend.llm.models import LLMRequest
 from backend.llm.provider import StreamingLLMProvider
 from backend.request_context import current_request_id
+
+if TYPE_CHECKING:
+    from backend.chat.conversation_handler import CapabilityOnlyTurn
 
 FALLBACK_SYSTEM_PROMPT = """You are M.I.S.T, a helpful voice assistant and friend to your creator, Raj Gadhia.
 
@@ -81,3 +85,11 @@ class DirectResponder:
 
     def prefetch(self, session_id: str, partial_text: str | None) -> None:
         """Nothing to prefetch without retrieval."""
+
+    async def handle_capability_only(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
+        """None, always: this fallback has no capability host.
+
+        It answers only when the conversation handler cannot be built, so a "stop" heard while
+        an alarm rings cuts the reply and nothing more (D8).
+        """
+        return None

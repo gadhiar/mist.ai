@@ -46,7 +46,9 @@ wake, `StateHint` and `HandOff`. T11c adds the record a cut keeps, the move to t
 transcript's keyword interrupt publishes its utterance, whose end then starts a turn from the
 text after the keyword or closes with `dropped keyword`. T11e adds the addressee rows, the
 handling of arbitration verdicts and the follow-up window, then `outranks` and `WakeArbiter`, the
-one cross-session arbiter every voice session's controller shares.
+one cross-session arbiter every voice session's controller shares. T52 adds D8: while an alarm
+rings, an alarm stop word early in an utterance cuts her with no arm delay, and the utterance's
+whole final transcript goes to the responder's capability-only path instead of to a next turn.
 """
 
 from __future__ import annotations
@@ -58,7 +60,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 
 from backend.chat.stream_events import Complete, HandOff, StateHint, StreamEvent, Token, WSEvent
 from backend.chat.turn_scope import CommitResult, TurnDelivery, TurnRequest, TurnScope
@@ -156,6 +158,11 @@ from .speech import (
     positive_quantile,
 )
 
+if TYPE_CHECKING:
+    # Only the type: importing the conversation handler at runtime would load the whole chat
+    # pipeline into every module that imports the controller.
+    from backend.chat.conversation_handler import CapabilityOnlyTurn
+
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
@@ -204,6 +211,14 @@ class TurnResponder(Protocol):
 
     def prefetch(self, session_id: str, partial_text: str | None) -> None:
         """Hint that a turn is forming; returns at once."""
+        ...
+
+    async def handle_capability_only(self, text: str, session_id: str) -> CapabilityOnlyTurn | None:
+        """Answer `text` from the capability host alone, never the model (D8).
+
+        A handled result is already committed; its events are the reply to stream. None means
+        no capability host is attached.
+        """
         ...
 
 
@@ -618,6 +633,17 @@ class _WindowLapsed:
     seq: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CapabilityAnswered:
+    """The capability-only path's result for an alarm-stop utterance's end (D8).
+
+    `result` is None when no capability host is attached, or when the call failed.
+    """
+
+    event: UtteranceEnded
+    result: CapabilityOnlyTurn | None
+
+
 # -- State --------------------------------------------------------------------------------
 
 
@@ -627,7 +653,9 @@ class _Utterance:
 
     `keyword` is the keyword a transcript verdict interrupted a turn with: the barge-in
     published the utterance, and its turn text is then what follows that keyword (v2, v5).
-    `idle_ignored` notes the one `barge_in_ignored idle` it got.
+    `alarm_stop` marks a keyword that stopped her while an alarm rang: its whole final transcript
+    then goes to the capability-only path, not to a turn (D8). `idle_ignored` notes the one
+    `barge_in_ignored idle` it got.
 
     A `candidate` is unpublished and waits for a verdict: a name's (`_Wake`) or, in a
     follow-up window (`followup`), its first transcript's. Until then its latest partial is kept
@@ -642,6 +670,7 @@ class _Utterance:
     partial_text: str = ""
     partial_ms: int = 0
     keyword: str | None = None
+    alarm_stop: bool = False
     idle_ignored: bool = False
     candidate: bool = False
     followup: bool = False
@@ -695,7 +724,9 @@ class _Turn:
 
     A held turn (`held`) answers `utterance_id`, whose end is not yet confirmed; until its
     release every output it makes waits in `kept`, in the order it was made. `character` is the
-    reply's character stage, built with its pacer; None when the stage is off.
+    reply's character stage, built with its pacer; None when the stage is off. `answered` holds
+    the events of a reply the capability-only path already made and committed (D8): the turn
+    streams them in place of the responder's stream, and its commit records nothing.
     """
 
     turn_id: str
@@ -717,6 +748,7 @@ class _Turn:
     ledger: PlaybackLedger | None = None
     pacer: PlaybackPacer | None = None
     character: CharacterStage | None = None
+    answered: tuple[StreamEvent, ...] | None = None
     token: CancelToken = field(default_factory=CancelToken)
     segments: asyncio.Queue[tuple[int, TextSegment] | None] = field(default_factory=asyncio.Queue)
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
@@ -839,6 +871,21 @@ def _final_update(event: UtteranceEnded) -> TranscriptUpdate:
 # The policy's word rule (`bargein.py`): a run of letters or digits, joined across an apostrophe.
 _WORD = re.compile(r"[^\W_]+(?:['’][^\W_]+)*")
 _LEADING_SEPARATORS = re.compile(r"^[\s,.;:!?\-–—…]+")
+
+
+def _words(text: str) -> tuple[str, ...]:
+    """The policy's normalized words of `text`: lower case, punctuation dropped."""
+    return tuple(match.group().lower() for match in _WORD.finditer(text))
+
+
+async def _answered_stream(
+    scope: TurnScope, events: tuple[StreamEvent, ...]
+) -> AsyncIterator[StreamEvent]:
+    """Stream a reply the capability-only path already made, as a responder's stream would."""
+    for event in events:
+        if isinstance(event, Token):
+            scope.stream.emitted += event.text
+        yield event
 
 
 def _after_keyword(text: str, keyword: str) -> str:
@@ -1007,7 +1054,8 @@ class TurnController:
         playback_config: Downlink pacing.
         turn_config: The teardown's tool grace.
         barge_in_config: Keywords and the alarm stop words (T11d).
-        alarm_ringing: Whether an alarm rings now (T11d).
+        alarm_ringing: Whether an alarm rings now: while it does, an alarm stop word cuts her at
+            once and hands the whole utterance to the capability-only path (D8, T52).
         power_level: The power level a turn's metrics report, read when it opens.
 
     Raises:
@@ -1092,6 +1140,8 @@ class TurnController:
         self._window_seq = 0
         self._window_task: asyncio.Task[None] | None = None
         self._silent_closes = 0
+        self._spoken_ledger: PlaybackLedger | None = None
+        self._answering: dict[str, asyncio.Task[None]] = {}
         self._handlers: dict[type, Callable[[object], Awaitable[None]]] = {
             SpeechStarted: self._on_speech_started,
             SpeechResumed: self._on_speech_resumed,
@@ -1120,6 +1170,7 @@ class TurnController:
             _SynthFailed: self._on_synth_failed,
             _AckPlayed: self._on_ack_played,
             _WindowLapsed: self._on_window_lapsed,
+            _CapabilityAnswered: self._on_capability_answered,
         }  # type: ignore[dict-item]
 
     # -- Public surface -------------------------------------------------------------------
@@ -1148,6 +1199,19 @@ class TurnController:
     def silent_closes(self) -> int:
         """Unnamed utterances that ended unpublished, closed with no message (v5 :421-426)."""
         return self._silent_closes
+
+    def recent_tts_text(self, window_ms: int) -> str:
+        """The text the latest spoken turn played within `window_ms`, for the echo guard.
+
+        It is read from that turn's `PlaybackLedger`, which the controller keeps after the turn
+        ends, so the words a reply ended on stay guarded for the window. A held turn becomes
+        the latest only at its release: until then it has played nothing, and the turn before
+        it is still the one whose sound may reach the microphone.
+        """
+        ledger = self._spoken_ledger
+        if ledger is None:
+            return ""
+        return ledger.recent_tts_text(window_ms)
 
     def start(self) -> None:
         """Start the mailbox task on the running loop; a second call does nothing."""
@@ -1416,6 +1480,11 @@ class TurnController:
             self._responder.prefetch(self._session_id, event.text)
         if self._policy is None:
             return
+        if self._phase in ("thinking", "speaking") and utterance.keyword is None:
+            keyword = self._alarm_stop(event.text)
+            if keyword is not None:
+                await self._alarm_cut(utterance, keyword, event.text, event.heard_at_ms)
+                return
         update = TranscriptUpdate(event.text, event.stable_chars, False, 0)
         if self._phase == "speaking":
             verdict = self._policy.evaluate(update, self._clock.now_ms(), self._phase)
@@ -1499,6 +1568,18 @@ class TurnController:
         if held is not None:
             await self._end_held(held, event)
             return
+        if (
+            not utterance.alarm_stop
+            and utterance.keyword is None
+            and self._phase in ("thinking", "speaking")
+            and self._policy is not None
+        ):
+            keyword = self._alarm_stop(event.text)
+            if keyword is not None:
+                await self._alarm_cut(utterance, keyword, event.text, event.heard_at_ms)
+        if utterance.alarm_stop:
+            self._hand_to_capability(event)
+            return
         text = event.text
         if utterance.keyword is not None:
             text = _after_keyword(event.text, utterance.keyword)
@@ -1532,7 +1613,14 @@ class TurnController:
         since it never reached the client (no `barge_in`, no teardown), and the utterance closes
         with `dropped keyword`. An end whose text is not the text the turn answers is not
         released: the turn is cancelled without trace and a turn starts from the end.
+
+        While an alarm rings, an end that opens with an alarm stop word goes to the
+        capability-only path whole, after the cancel, so "stop" stops the alarm (D8).
         """
+        if self._policy is not None and self._alarm_stop(event.text) is not None:
+            await self._cancel_held(turn)
+            self._hand_to_capability(event)
+            return
         if self._policy is not None:
             verdict = self._policy.on_utterance_end(_final_update(event), "held")
             if verdict is not None and verdict.action == "interrupt":
@@ -1570,6 +1658,8 @@ class TurnController:
         turn.marks["eot_decided"] = event.heard_at_ms
         turn.base_ms = event.heard_at_ms - event.silence_ms
         turn.held = False
+        if turn.ledger is not None:
+            self._spoken_ledger = turn.ledger
         self._phase = "thinking" if turn.audio_tag is not None else "text"
         kept, turn.kept = turn.kept, []
         for item in kept:
@@ -2030,8 +2120,11 @@ class TurnController:
         self._ingress.set_engaged(engaged)
 
     def _busy(self) -> bool:
-        """A turn, a waiting name, or an addressed or waiting utterance still open."""
-        if self._turn is not None or self._candidate is not None:
+        """A turn, a waiting name, an open utterance, or a capability-only answer still to come.
+
+        The utterance counts when it is addressed or waiting; the answer is an alarm stop's (D8).
+        """
+        if self._turn is not None or self._candidate is not None or self._answering:
             return True
         return any(not u.closed and (u.published or u.candidate) for u in self._utterances.values())
 
@@ -2229,6 +2322,8 @@ class TurnController:
             return False
         if self._candidate is not None:
             return False  # an endpoint wake may still be waiting for its backlog
+        if self._answering:
+            return False  # a capability-only answer may still open a turn
         if any(not u.closed for u in self._utterances.values()):
             return False
         return self._ingress.idle_since() == self._handled_seq
@@ -2450,15 +2545,24 @@ class TurnController:
             )
         )
 
-    def _start_voice_turn(self, event: UtteranceEnded, text: str | None = None) -> None:
-        """Start the turn the end opens; `text`, when given, is its turn text (the remainder)."""
+    def _start_voice_turn(
+        self,
+        event: UtteranceEnded,
+        text: str | None = None,
+        *,
+        answered: tuple[StreamEvent, ...] | None = None,
+    ) -> None:
+        """Start the turn the end opens; `text`, when given, is its turn text (the remainder).
+
+        With `answered` the turn plays a reply the capability-only path already made (D8).
+        """
         turn_id = self._next_turn_id()
         turn_text = event.text if text is None else text
         self._send_end_of_utterance(turn_id, event, turn_text)
         # Timings count from the end of speech: the utterance's last frame less its silence.
         marks = {"eot_decided": event.heard_at_ms, "stt_final": self._clock.now_ms()}
         base = event.heard_at_ms - event.silence_ms
-        self._open_turn(turn_id, turn_text, "voice", base_ms=base, marks=marks)
+        self._open_turn(turn_id, turn_text, "voice", base_ms=base, marks=marks, answered=answered)
         self._take_wake_timings(event.utterance_id)
 
     def _open_turn(
@@ -2470,8 +2574,13 @@ class TurnController:
         base_ms: int,
         marks: dict[str, int],
         held_utterance: str | None = None,
+        answered: tuple[StreamEvent, ...] | None = None,
     ) -> None:
-        """Open a turn; with `held_utterance` it starts held, answering that utterance."""
+        """Open a turn; with `held_utterance` it starts held, answering that utterance.
+
+        With `answered` the responder opens nothing: the capability-only path opened, answered
+        and committed the turn already, so its scope is the controller's own.
+        """
         placement = self._placement()
         channel = self._channel_for(origin)
         held = held_utterance is not None
@@ -2483,7 +2592,11 @@ class TurnController:
             interruption_note=self._note,
             held=held,
         )
-        scope = self._responder.open_turn(request)
+        if answered is None:
+            scope = self._responder.open_turn(request)
+        else:
+            scope = TurnScope(session_id=self._session_id, turn_index=-1, request=request)
+            scope.dispatch_gate.set()
         now = self._clock.now_ms()
         turn = _Turn(
             turn_id=turn_id,
@@ -2498,6 +2611,7 @@ class TurnController:
             text=text,
             held=held,
             utterance_id=held_utterance,
+            answered=answered,
         )
         turn.scene = _TurnScene(self._scene, turn)
         self._turn = turn
@@ -2534,6 +2648,8 @@ class TurnController:
             self._clock,
             prebuffer_ms=self._playback_config.client_prebuffer_ms,
         )
+        if not turn.held:
+            self._spoken_ledger = turn.ledger
         turn.pacer = PlaybackPacer(
             turn_id=turn.turn_id,
             audio_tag=tag,
@@ -2566,7 +2682,11 @@ class TurnController:
 
     async def _produce(self, turn: _Turn) -> None:
         loop = asyncio.get_running_loop()
-        stream = self._responder.stream_turn(turn.scope)
+        stream: AsyncIterator[StreamEvent]
+        if turn.answered is not None:
+            stream = _answered_stream(turn.scope, turn.answered)
+        else:
+            stream = self._responder.stream_turn(turn.scope)
         async with contextlib.aclosing(stream):  # type: ignore[type-var]
             async for event in stream:
                 ack: asyncio.Future[None] = loop.create_future()
@@ -3002,6 +3122,110 @@ class TurnController:
             turn.marks["keyword_heard"] = heard_at_ms
         await self._cut(turn, reason="barge_in")
 
+    # -- "Stop" while an alarm rings (D8) ------------------------------------------------------
+
+    def _alarm_stop(self, text: str) -> str | None:
+        """The alarm stop word in `text`'s first words while an alarm rings, else None (D8).
+
+        Any of `alarm_stop_keywords` within the first `keyword_window_words` words counts, with
+        no arm delay. The echo guard applies as the policy applies it: a word MIST herself played
+        within `echo_guard_ms` is taken for her own, unless the client declared a headset.
+        `alarm_ringing` is asked only for a hit, since the keyword check needs nothing from it.
+        """
+        config = self._barge_in_config
+        words = _words(text)[: config.keyword_window_words]
+        hit: str | None = None
+        for keyword in config.alarm_stop_keywords:
+            parts = _words(keyword)
+            if parts and any(
+                words[start : start + len(parts)] == parts
+                for start in range(len(words) - len(parts) + 1)
+            ):
+                hit = " ".join(parts)
+                break
+        if hit is None:
+            return None
+        if self._settings is None or self._settings.aec != "headset":
+            played = " ".join(_words(self.recent_tts_text(config.echo_guard_ms)))
+            if f" {hit} " in f" {played} ":
+                return None
+        return hit if self._alarm_ringing() else None
+
+    async def _alarm_cut(
+        self, utterance: _Utterance, keyword: str, text: str, heard_at_ms: int
+    ) -> None:
+        """Cut her for an alarm stop word, as a keyword `barge_in`, and mark the utterance.
+
+        Its end then goes whole to the capability-only path instead of starting a turn from
+        what follows the keyword. It is published even when no turn is left to cut, so that
+        end is still handed on.
+        """
+        utterance.alarm_stop = True
+        utterance.published = True
+        utterance.keyword = keyword
+        verdict = BargeInVerdict(
+            action="interrupt",
+            reason="keyword",
+            keyword=keyword,
+            text=text.strip(),
+            remainder="",
+            phase=self._phase,
+        )
+        await self._barge_in(verdict, utterance.utterance_id, heard_at_ms)
+
+    def _hand_to_capability(self, event: UtteranceEnded) -> None:
+        """Ask the capability-only path about the whole utterance, off the mailbox task.
+
+        The call acts on the world and may wait on the capability host, so the mailbox goes on
+        handling playback reports and speech meanwhile, and the result comes back as
+        `_CapabilityAnswered`. A failed call is logged and answered as None. A close does not
+        cancel the call: the user asked for the alarm to stop, so it is let finish.
+        """
+        task = asyncio.ensure_future(self._ask_capability(event))
+        task.set_name(f"{self._session_id}-capability-{event.utterance_id}")
+        self._answering[event.utterance_id] = task
+        task.add_done_callback(lambda done: self._capability_done(event, done))
+
+    async def _ask_capability(self, event: UtteranceEnded) -> None:
+        result = await self._responder.handle_capability_only(event.text, self._session_id)
+        self._mailbox.put_nowait(_CapabilityAnswered(event, result))
+
+    def _capability_done(self, event: UtteranceEnded, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "session %s: the capability-only path failed with %s",
+                self._session_id,
+                type(error).__name__,
+            )
+            self._mailbox.put_nowait(_CapabilityAnswered(event, None))
+
+    async def _on_capability_answered(self, message: _CapabilityAnswered) -> None:
+        """Play a handled answer as a voice turn; close anything else as `dropped keyword`.
+
+        A handled result was committed by the capability-only path, so its turn of origin `voice`
+        (on `tts` by the channel rule) streams the result's events and records nothing. It
+        supersedes any turn opened meanwhile, as a new utterance's end would. Otherwise no turn
+        opens and nothing goes on as a next turn; the payloads an unhandled call drained, such as a superseded
+        proposal's `action_resolved`, still reach the client, because they are the host's.
+        """
+        event = message.event
+        self._answering.pop(event.utterance_id, None)
+        result = message.result
+        if result is None or not result.handled:
+            self._send_control(
+                VoiceDecisionDropped(turn_id=None, reason="keyword", detail=_ended_detail(event))
+            )
+            for item in result.events if result is not None else ():
+                if isinstance(item, WSEvent):
+                    self._send_control(item.payload)
+            return
+        if self._turn is not None:
+            await self._cut(self._turn, reason="new_input")
+        self._start_voice_turn(event, answered=result.events)
+
     async def _cut(self, turn: _Turn, *, reason: CancelReason, notify: bool = True) -> None:
         """Cancel the turn and commit what the client received (v2 M62, M69).
 
@@ -3130,7 +3354,11 @@ class TurnController:
             ),
             tool_effect_unknown=tool_effect_unknown,
         )
-        result = self._responder.commit_turn(turn.scope, delivery)
+        if turn.answered is not None:
+            # The capability-only path recorded the turn when it answered (its contract).
+            result = CommitResult(recorded=False, event_id=None, error=None)
+        else:
+            result = self._responder.commit_turn(turn.scope, delivery)
         turn.commit_result = result
         # Recording semantics: the next turn's request says how this one ended, never its text.
         if outcome in ("interrupted", "superseded"):
