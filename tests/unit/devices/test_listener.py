@@ -713,8 +713,10 @@ class TestAcceptRace:
         self, lingering_rig, caplog
     ):
         rig = lingering_rig
-        first = await rig.connect(f"Bearer {ROOM}")
+        # INFO from the start, so the first connection's lines are counted whatever level
+        # earlier tests left the logger at.
         with caplog.at_level(logging.INFO, logger=LISTENER_LOGGER):
+            first = await rig.connect(f"Bearer {ROOM}")
             second = await rig.connect(f"Bearer {ROOM}")
             # The first session still commits its turn, so the second waits to replace it.
             assert first.closed_with is None and not second.task.done()
@@ -730,7 +732,11 @@ class TestAcceptRace:
         assert rig.serve.calls == [("example-room", "room")]
         assert second.texts() == []
         assert rig.app.connected() == []
-        assert caplog.text.count("device_connected device=example-room") == 0
+        # Only the first connection was served, so only it is logged connected and disconnected.
+        assert caplog.text.count("device_connected device=example-room") == 1
+        assert [
+            r.getMessage() for r in caplog.records if r.getMessage().startswith("device_disc")
+        ] == ["device_disconnected device=example-room code=4001"]
         assert closures(caplog) == [
             ("WARNING", "device_revoked_closed device=example-room reason=rotated")
         ]
