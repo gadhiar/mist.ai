@@ -1217,6 +1217,7 @@ def _build_health_registry(
     extraction_inference: ExtractionServiceHealthSource,
     probe_settings: HealthProbeSettings,
     yield_state: "Callable[[], str] | None" = None,
+    ops_dir: str | None = None,
     capability_host: "Callable[[], CapabilityHost | None] | None" = None,
 ) -> HealthRegistry:
     """Construct the dependency probes and the registry that runs them.
@@ -1251,7 +1252,12 @@ def _build_health_registry(
         probe_settings: Thresholds and the backup status path.
         yield_state: `GpuYield.state`, so the llm check reads `yielded` while
             gaming mode holds the GPU and `down` (`resume_failed`) while the
-            reload fails. None without gaming mode.
+            reload fails, and the extraction_service check reads `yielded`
+            too, since gaming mode stops extraction. None without gaming mode.
+        ops_dir: `MIST_OPS_DIR`, where the host CLI writes the paused marker
+            the extraction_service check reads, so it reports `paused` while
+            night extraction is held off. None or blank on the dev stack,
+            which builds no reader and leaves the check as it was.
         capability_host: The capability host's accessor, read at each check.
             None when no host was built: the `capabilities` check is then
             absent rather than unmeasured, which would derive `degraded`.
@@ -1260,6 +1266,9 @@ def _build_health_registry(
         A registry whose `run_forever` the caller schedules.
     """
     from backend.extraction_backlog.status import checked_extraction_status
+    from backend.extraction_hold import build_extraction_hold_reader
+
+    hold_reader = build_extraction_hold_reader(ops_dir)
 
     def dispatcher():
         return extraction_dispatcher
@@ -1273,7 +1282,13 @@ def _build_health_registry(
         EventStoreProbe(_health_event_store, _event_store_configured),
         VaultSidecarProbe(lambda: vault_sidecar),
         BroadcasterProbe(broadcaster_state.state),
-        ExtractionServiceProbe(extraction_inference, dispatcher, start_failed),
+        ExtractionServiceProbe(
+            extraction_inference,
+            dispatcher,
+            start_failed,
+            yield_state=yield_state,
+            hold_state=hold_reader.current if hold_reader is not None else None,
+        ),
         ExtractionBacklogProbe(dispatcher, checked_extraction_status, start_failed, probe_settings),
         BackupProbe(probe_settings, lambda: datetime.now(UTC)),
     ]
@@ -1625,6 +1640,9 @@ async def lifespan(app: FastAPI):
         RemoteExtractionInference(_extraction_health_client, _extraction_service_url()),
         HealthProbeSettings.from_env(),
         yield_state=yield_state,
+        # The paused marker's directory, passed whether or not gaming mode was
+        # built: night extraction is scheduled even with TTS on.
+        ops_dir=os.environ.get("MIST_OPS_DIR"),
         capability_host=_capability_host if _capability_host() is not None else None,
     )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
@@ -1808,6 +1826,10 @@ async def lifespan(app: FastAPI):
     health_status_task.cancel()
     heartbeat_task.cancel()
     health_probe_task.cancel()
+    # Awaited, as the gpu-yield task is below: a probe can be suspended in
+    # `asyncio.to_thread` (the paused-marker read), and a loop closed before the
+    # cancel lands destroys the task while it is still pending.
+    await asyncio.gather(health_probe_task, return_exceptions=True)
     await _stop_uptime_recorder(uptime_task)
     broadcaster_task.cancel()
     power_watcher_task.cancel()
@@ -1896,12 +1918,14 @@ async def health() -> dict:
       conversation, by choice rather than by fault. It outranks `degraded`
       and yields to `unhealthy` (another fatal check down), and a yielded
       check that goes stale reads unknown, so a dead probe loop reads
-      `degraded`, never `yielded`.
+      `degraded`, never `yielded`. A check that reports `status: "paused"`
+      counts as up, so extraction waiting for its night window leaves the
+      status `healthy`; a stale paused check reads unknown like any other.
     - `restart_recommended`: whether restarting the PROCESS would plausibly
       help, which is a different question from `status`. Advisory only -- Docker
       restart policies react to container exit, not to healthcheck state, and
       there is no autoheal sidecar, so nothing acts on this today. A yielded
-      check never sets it.
+      or paused check never sets it.
     - `probe_loop`: `alive`, `dead` (no cycle completed within
       `dead_after_seconds`, so the cache is unrefreshed), or
       `PROBE_LOOP_NOT_STARTED` when no registry exists -- reachable only
@@ -1909,18 +1933,25 @@ async def health() -> dict:
       `checks` mapping, because nothing verified is not healthy.
     - `checks`: one entry per dependency. `status: null` means NOT MEASURED and
       carries a `reason` from a closed vocabulary; it never means `up`.
-      `status: "yielded"` (reason `gpu_yielded`) is set by the `llm` check
-      when given a yield state that reads `yielded`, and records
-      `consecutive_failures` 0; a yield state of `resume_failed` reads `down`.
+      `status: "yielded"` (reason `gpu_yielded`) is set by the `llm` and
+      `extraction_service` checks when given a yield state that reads
+      `yielded`, and records `consecutive_failures` 0; a yield state of
+      `resume_failed` reads `down` on the `llm` check. `status: "paused"`
+      (reason `extraction_paused`) is set only by `extraction_service`, and
+      also records `consecutive_failures` 0.
       The checks are `neo4j`, `llm`, `event_store`, `vault_sidecar`,
       `broadcaster` and three that say whether MIST is still learning and
       backed up, each `severity: degrades` and `restart_repairs: false`:
-      - `extraction_service`: its own `GET /v1/health` call to the extraction
-        service every cycle, so a switched-off host reads `down` /
-        `unreachable` even while the dispatcher is idle. Also `down` for
-        `query_failed`, `service_degraded`, `epoch_mismatch`, or
-        `unavailable_at_boot` when the dispatcher failed to start; null
-        `disabled_by_config` with no dispatcher or in `off` mode.
+      - `extraction_service`: `yielded` while gaming mode holds the GPU, else
+        `paused` while the host CLI's current paused marker
+        (`<MIST_OPS_DIR>/extraction-paused`) says the service was stopped on
+        purpose, without calling it in either case. Otherwise its own
+        `GET /v1/health` call to the extraction service every cycle, so a
+        switched-off host reads `down` / `unreachable` even while the
+        dispatcher is idle. Also `down` for `query_failed`,
+        `service_degraded`, `epoch_mismatch`, or `unavailable_at_boot` when
+        the dispatcher failed to start; null `disabled_by_config` with no
+        dispatcher or in `off` mode.
       - `extraction_backlog`: the producer behind the `extraction` block,
         `down` for `stalled`, `backlog_overdue` (oldest pending turn past
         `MIST_HEALTH_BACKLOG_MAX_AGE_S`) and `dead_lettered`, in that order, or

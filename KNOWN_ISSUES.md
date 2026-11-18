@@ -2,7 +2,9 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-11-06 (daily instance: Daily Instance section added, 7 open items; the
+**Last Updated:** 2026-11-17 (daily instance night extraction: 5 open items added to
+the Daily Instance section. Prior -- 2026-11-06: daily instance: Daily Instance section added,
+7 open items; the
 `mist-memory/` unit tests (MIS-147), the CORS wildcard and the Dockerfile pytest pin resolved.
 Prior -- 2026-09-16: MIS-146 hermetic unit tier: Test Isolation section added, 5 open items, tracked as MIS-147 and MIS-148 where filed. Prior -- 2026-06-14: MIS-124 / ontology v1.4.0 close-out: F2 typing gate CLEARED 0.909; rel-precision documented near-miss 0.833 -- residual bounded to model extraction quality (event-naming, metric structured-field emission, predicate choice) + small-model prompt sensitivity / flash-attn near-tie, deferred to a constrained-decoding / larger-model decision, NOT more canonicalization. Prior -- 2026-06-13 C3 close-out: 2 production-reproducibility findings added.)
 
@@ -182,6 +184,39 @@ the adjacent findings it deliberately left out of scope.
   answers keep working; it needs goal mist-model-host's tier router. With TTS on there is no
   gaming mode at all (entry above), so the goal that turns speech on needs the low level, or a
   safe release, first.
+
+- [ ] **A chat turn at night shares the GPU with an extraction decode.** In the extraction
+  window `mist-extraction-llm` runs beside `mist-llm` on the one card, and nothing pre-empts an
+  extraction decode for a chat turn. The night rehearsal measured the contended chat time to
+  first token at `MIST_DAILY_EXTRACTION_NCMOE` 21 at 0.459 s at most (trials of 0.459, 0.410
+  and 0.422 s). Pre-emption waits for the dreaming work, which no goal plans yet.
+
+- [ ] **The night setting is fixed after the first real turn.** `mist-extraction` declares each
+  `mist-extraction-llm` setting as `EXTRACTION_SERVER_*`, `MIST_DAILY_EXTRACTION_NCMOE` among
+  them, and the declared settings are part of the serving identity
+  (`backend/knowledge/extraction/serving_identity.py:23`), so changing one is a new extraction
+  epoch, as is a later extraction version. With turns in the log, a new epoch needs
+  `backend/extraction_backlog/CUTOVER.md` sections 3 to 6, and section 5.3 is unresolved
+  (`CUTOVER.md:238`). Until 5.3 or an identity rule lands, the instance keeps the setting and
+  the version of its first cutover.
+
+- [ ] **Night extraction needs the PC on and signed in.** The "MIST extraction window" task
+  runs only while the user is signed in (`LogonType Interactive`,
+  `deploy/daily/windows/register-signin-task.ps1:107`); locked is fine. A tick missed while the
+  PC sleeps runs when it wakes, so a PC that sleeps through the window skips that night's
+  extraction.
+
+- [ ] **The window moves at 5-minute ticks, on the host clock.** The task runs `extraction
+  apply` every 5 minutes, so extraction starts and stops up to 5 minutes after the window's
+  edges, plus the time a start takes (the night rehearsal loaded `mist-extraction-llm` in 80 to
+  93 s). `MIST_EXTRACTION_WINDOW` is read in the host's local time, the time zone Windows runs
+  in, not `MIST_TIMEZONE`.
+
+- [ ] **A rollback to a release without night extraction has an order.** Run `extraction
+  off`, then `unregister-signin-task.ps1`, then `switch <previous tag>`, then that release's
+  `register-signin-task.ps1` without `-NightExtraction` (`deploy/daily/README.md`, Release
+  lifecycle). Out of order, the "MIST extraction window" task's ticks fail every 5 minutes
+  against the older release.
 
 ## Extraction Epoch Identity (2026-11-09, goal mist-extraction-epoch-identity)
 

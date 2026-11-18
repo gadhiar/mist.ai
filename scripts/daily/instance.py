@@ -13,8 +13,9 @@ poll through `Context.sleep` and `Context.monotonic`, and every HTTP read throug
 real waiting. Before any command runs, `subprocess_runner` passes it to `volume_safety.py`,
 loaded from beside this file, which refuses every form that could delete a volume.
 
-Exit codes: 0 done; 2 refused, nothing changed; 1 failed part-way, with the state named, or a
-command the volume guard refused.
+Exit codes: 0 done; 2 refused, nothing changed, except that `extraction apply` refuses a missing
+identity variable after it has stopped extraction and written the `unconfigured` marker; 1
+failed part-way, with the state named, or a command the volume guard refused.
 `backup-now` returns the one-shot backup's own exit code, `accept-backup-baseline` the
 scheduler's, and `drill-restore` and `drill-verify` those of restore and verify.
 """
@@ -42,7 +43,8 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import time as wall_time
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
@@ -104,6 +106,8 @@ MAIN_REF = "origin/main"
 IMAGE_REPOSITORY = "mist-backend"
 DOCKERFILE = "docker/backend/Dockerfile"
 COMPOSE_FILE = "deploy/daily/compose.yml"
+EXTRACTION_IMAGE_REPOSITORY = "mist-extraction"
+EXTRACTION_DOCKERFILE = "docker/extraction/Dockerfile"
 RELEASE_EXTRACT_PREFIXES = ("deploy/", "scripts/daily/")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
 REHEARSAL_TAG_PATTERN = re.compile(r"rehearsal-[0-9a-f]{7}", re.ASCII)
@@ -128,6 +132,14 @@ DEFAULT_SHARE_NETWORK = "mist-llm-share"
 CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
 PROJECT_LABEL = "com.docker.compose.project"
 SERVICE_LABEL = "com.docker.compose.service"
+CONFIG_HASH_LABEL = "com.docker.compose.config-hash"
+# The night extraction services (plan v4). They sit under their own profile, so an `up` that
+# names the three chat services never starts them; only `extraction apply` does.
+EXTRACTION_PROFILE = "extraction"
+EXTRACTION_SERVICE = "mist-extraction"
+EXTRACTION_LLM_SERVICE = "mist-extraction-llm"
+# Start order: the LLM first, since the service waits on its health.
+EXTRACTION_SERVICES = (EXTRACTION_LLM_SERVICE, EXTRACTION_SERVICE)
 NEO4J_SERVICE = "mist-neo4j"
 # Where both compose files mount the graph volume inside the Neo4j container.
 NEO4J_DATA_MOUNT = "/data"
@@ -175,6 +187,37 @@ DEFAULT_GAME_RESUME_DELAY_S = 120.0
 GAMING_WATCH_LOG = "gaming-watch.log"
 GAMING_WATCH_LOG_BYTES = 1024 * 1024
 GAMING_WATCH_LOG_BACKUPS = 3
+
+# Night extraction (plan v4, Interfaces and contracts). The paused marker's name is the
+# backend's `EXTRACTION_PAUSED_MARKER` in `backend/extraction_hold.py`, spelled here because
+# this file runs where `backend` is not importable; a test on each side pins it.
+EXTRACTION_PAUSED_MARKER = "extraction-paused"
+PAUSED_REASONS = ("window", "mode", "gaming", "starting", "unconfigured")
+EXTRACTION_MODE_FILE = "extraction-mode"
+EXTRACTION_MODES = ("on", "off", "auto")
+DEFAULT_EXTRACTION_MODE = "auto"
+INIT_EXTRACTION_MODE = "off"
+EXTRACTION_WINDOW_VARIABLE = "MIST_EXTRACTION_WINDOW"
+DEFAULT_EXTRACTION_WINDOW = "23:59-10:00"
+EXTRACTION_WINDOW_PATTERN = re.compile(
+    r"([01][0-9]|2[0-3]):([0-5][0-9])-([01][0-9]|2[0-3]):([0-5][0-9])", re.ASCII
+)
+# A window pause stays valid this long past the next start, so a task tick that runs late does
+# not leave the backend reading a stopped service as down.
+EXTRACTION_WINDOW_GRACE = timedelta(minutes=15)
+# The only two names the extraction services read from `daily.env`; neither is required by
+# compose, so a missing one never stops chat. Apply pauses extraction as unconfigured instead.
+EXTRACTION_IDENTITY_VARIABLES = ("EXTRACTION_MODEL_HASH", "EXTRACTION_LLM_DEVICE")
+# Inside the night task's 15-minute execution limit, with room for the two-poll waits.
+EXTRACTION_START_DEADLINE_S = 600
+EXTRACTION_POLL_S = 5.0
+EXTRACTION_STOP_TIMEOUT_S = 10
+EXTRACTION_LOG_LINES = 200
+EXTRACTION_WINDOW_LOG = "extraction-window.log"
+EXTRACTION_INSPECT_FORMAT = (
+    "{{.Name}} {{.Image}} {{.State.Status}} "
+    "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{json .Config.Labels}}"
+)
 
 # Windows' `CREATE_NO_WINDOW` process creation flag. `subprocess` defines it only on Windows,
 # so the value is spelled here for the code path that reads it, and the tests that patch
@@ -300,11 +343,14 @@ class Context:
     every wait and poll, and `fetch` every HTTP read, so a test never waits or connects.
     `processes` lists the running processes for `gaming-watch` as `gamewatch.ProcessRecord`s;
     None means `gamewatch.list_processes`, which exists only once that command has loaded the
-    file, so the annotation cannot name the record type.
+    file, so the annotation cannot name the record type. `local_zone` is the zone the extraction
+    window is read in; None means the host's own, daylight saving included, and a test passes a
+    `zoneinfo.ZoneInfo` to drive midnight and a clock change from `clock` alone.
     """
 
     runner: Runner = subprocess_runner
     clock: Callable[[], datetime] = _utc_now
+    local_zone: tzinfo | None = None
     environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
     home: Path = field(default_factory=Path.home)
     script_path: Path = field(default_factory=_default_script_path)
@@ -565,6 +611,12 @@ def cmd_init(args: argparse.Namespace, ctx: Context) -> None:
             if not (directory / LIVE_INSTANCE_MARKER).exists():
                 _write_atomic(directory / LIVE_INSTANCE_MARKER, marker_bytes)
         done.append("wrote the markers")
+        # A new instance starts with extraction off until its epoch cutover; a second init
+        # keeps whatever mode the operator set since.
+        mode_path = root / "ops" / EXTRACTION_MODE_FILE
+        if not mode_path.exists():
+            _write_atomic(mode_path, f"{INIT_EXTRACTION_MODE}\n".encode())
+            done.append(f"wrote {mode_path}")
         if seed is not None:
             for entry in sorted((seed / "vault").iterdir()):
                 if entry.is_dir():
@@ -687,7 +739,7 @@ def _resolve_release(ctx: Context, repo: Path, tag: str) -> str:
 
 
 def _release_members(archive: bytes) -> tuple[set[str], list[tuple[str, bytes | None]]]:
-    """Every path in the archive, and the `deploy/` and `scripts/daily/` entries to extract.
+    """Every path in the archive, and the entries under `RELEASE_EXTRACT_PREFIXES` to extract.
 
     Entries are read into memory and written by hand, because the container's Python predates
     `tarfile`'s extraction filters. Only plain files and directories are accepted, under names
@@ -768,13 +820,20 @@ def _extract_release(release_dir: Path, tag: str, selected: list[tuple[str, byte
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def cmd_release_build(args: argparse.Namespace, ctx: Context) -> None:
-    """Build `mist-backend:<tag>` from a tag's archive and unpack its deploy files.
+def _built_image_id(ctx: Context, image: str) -> str | None:
+    inspected = ctx.runner(["docker", "image", "inspect", "--format", "{{.Id}}", image])
+    image_id = inspected.stdout.decode("ascii", "replace").strip()
+    return image_id if inspected.returncode == 0 and image_id else None
 
-    The image is built from `git archive` of the commit, never from a working tree, so what
-    runs is exactly what the tag names. The image ID is recorded because a later
-    `docker build -t mist-backend:<tag>` anywhere could re-point the tag; `up` and `switch`
-    compare against the record.
+
+def cmd_release_build(args: argparse.Namespace, ctx: Context) -> None:
+    """Build `mist-backend:<tag>` and `mist-extraction:<tag>` from a tag's archive, unpack it.
+
+    Both images are built from the same `git archive` of the commit, never from a working tree,
+    so what runs is exactly what the tag names. Both image IDs are recorded because a later
+    `docker build -t <image>:<tag>` anywhere could re-point the tag; `up`, `switch` and
+    `extraction apply` compare against the record. The extraction image carries the commit as
+    its revision label, since its Dockerfile takes no build argument for it.
     """
     if (args.tag is None) == (args.rehearsal is None):
         raise RefusedError("give exactly one of TAG and --rehearsal REF")
@@ -799,7 +858,9 @@ def cmd_release_build(args: argparse.Namespace, ctx: Context) -> None:
             f"git archive of {commit} failed, nothing changed: {_stderr_tail(archived)}"
         )
     names, selected = _release_members(archived.stdout)
-    missing = [path for path in (DOCKERFILE, COMPOSE_FILE) if path not in names]
+    missing = [
+        path for path in (DOCKERFILE, EXTRACTION_DOCKERFILE, COMPOSE_FILE) if path not in names
+    ]
     if missing:
         raise RefusedError(f"{commit} has no {', '.join(missing)}; it cannot be a daily release")
 
@@ -825,26 +886,53 @@ def cmd_release_build(args: argparse.Namespace, ctx: Context) -> None:
             f"docker build of {image} failed; release/ and ops/ unchanged: {_stderr_tail(build)}"
         )
 
-    inspected = ctx.runner(["docker", "image", "inspect", "--format", "{{.Id}}", image])
-    image_id = inspected.stdout.decode("ascii", "replace").strip()
-    if inspected.returncode != 0 or not image_id:
+    image_id = _built_image_id(ctx, image)
+    if image_id is None:
         raise FailedError(
-            f"built {image} but could not read its image ID ({_stderr_tail(inspected)}); "
+            f"built {image} but could not read its image ID; "
             f"release/{tag}/ and ops/release-{tag}.json not written"
+        )
+
+    extraction_image = f"{EXTRACTION_IMAGE_REPOSITORY}:{tag}"
+    extraction_build = ctx.runner(
+        [
+            "docker",
+            "build",
+            "-f",
+            EXTRACTION_DOCKERFILE,
+            "-t",
+            extraction_image,
+            "--label",
+            f"{REVISION_LABEL}={commit}",
+            "-",
+        ],
+        stdin=archived.stdout,
+    )
+    if extraction_build.returncode != 0:
+        raise FailedError(
+            f"built {image} ({image_id}), but docker build of {extraction_image} failed; "
+            f"release/ and ops/ unchanged: {_stderr_tail(extraction_build)}"
+        )
+    extraction_image_id = _built_image_id(ctx, extraction_image)
+    if extraction_image_id is None:
+        raise FailedError(
+            f"built {image} ({image_id}) and {extraction_image} but could not read the latter's "
+            f"image ID; release/{tag}/ and ops/release-{tag}.json not written"
         )
 
     try:
         _extract_release(root / "release", tag, selected)
     except OSError as exc:
         raise FailedError(
-            f"built {image} ({image_id}) but could not extract release/{tag}/: {exc}; "
-            f"ops/release-{tag}.json not written"
+            f"built {image} ({image_id}) and {extraction_image} ({extraction_image_id}) but could "
+            f"not extract release/{tag}/: {exc}; ops/release-{tag}.json not written"
         ) from exc
 
     record = {
         "tag": tag,
         "commit": commit,
         "image_id": image_id,
+        "extraction_image_id": extraction_image_id,
         "built_at": _format_utc(ctx.clock()),
     }
     record_path = root / "ops" / f"release-{tag}.json"
@@ -853,11 +941,12 @@ def cmd_release_build(args: argparse.Namespace, ctx: Context) -> None:
         _write_atomic(record_path, (json.dumps(record, indent=2) + "\n").encode("utf-8"))
     except OSError as exc:
         raise FailedError(
-            f"built {image} ({image_id}) and extracted release/{tag}/, but could not write "
-            f"{record_path}: {exc}"
+            f"built {image} ({image_id}) and {extraction_image} ({extraction_image_id}) and "
+            f"extracted release/{tag}/, but could not write {record_path}: {exc}"
         ) from exc
 
     print(f"built {image} ({image_id}) from {commit}")
+    print(f"built {extraction_image} ({extraction_image_id}) from {commit}")
     print(f"extracted release/{tag}/ and recorded {record_path}")
 
 
@@ -1200,7 +1289,10 @@ def instance_up(inst: Instance, ctx: Context, wait_minutes: int) -> None:
     """Start the instance from its release, then check what runs is that release.
 
     mist-backup starts in a second call, so a broken backup destination never keeps the
-    services that answer turns from starting.
+    services that answer turns from starting. Extraction is applied after both, and a failed
+    apply is reported, not fatal: turns queue while it is down. A release whose record has no
+    extraction image predates night extraction, so it gets a note instead of an apply, and a
+    rollback to it exits 0.
     """
     _check_static_configuration(inst, ctx)
     _wait_for_docker(ctx, wait_minutes)
@@ -1231,6 +1323,15 @@ def instance_up(inst: Instance, ctx: Context, wait_minutes: int) -> None:
             )
         else:
             print(f"started {BACKUP_SERVICE}: backups are armed")
+    if _extraction_image_id(inst) is None:
+        print(f"release {inst.tag} records no extraction image; extraction apply skipped")
+    else:
+        try:
+            _apply_extraction(inst, ctx)
+        except InstanceError as exc:
+            problems.append(
+                f"extraction apply did not converge ({exc.label}: {exc}); turns queue until it does"
+            )
     try:
         foreign = _foreign_containers(inst, _project_containers(ctx, inst.project))
     except FailedError as exc:
@@ -1250,11 +1351,19 @@ def cmd_down(args: argparse.Namespace, ctx: Context) -> None:
     """Stop every container of the project and remove nothing.
 
     `stop`, never `down`: the containers, networks and volumes stay, so nothing a later
-    `up` needs is deleted. Profile `backup` is enabled so mist-backup stops too.
+    `up` needs is deleted. Profiles `backup` and `extraction` are enabled so mist-backup and
+    both extraction services stop too.
     """
     inst = _load_instance(args.root, ctx, require_release=False)
     if _tag_is_valid(inst.tag) and inst.compose_file().is_file():
-        argv = [*inst.compose(), "--profile", BACKUP_PROFILE, "stop"]
+        argv = [
+            *inst.compose(),
+            "--profile",
+            BACKUP_PROFILE,
+            "--profile",
+            EXTRACTION_PROFILE,
+            "stop",
+        ]
     else:
         argv = ["docker", "compose", "-p", inst.project, "stop"]
     result = ctx.runner(argv)
@@ -1269,20 +1378,35 @@ def cmd_down(args: argparse.Namespace, ctx: Context) -> None:
 # --- switch ----------------------------------------------------------------------------------
 
 
-def _backend_running(inst: Instance, ctx: Context) -> bool:
+def _read_backend_running(inst: Instance, ctx: Context) -> bool:
+    """Whether the instance's own mist-backend runs, asked of compose by project.
+
+    Scoped by `-p <project>` and the service label compose reports, never by container name,
+    so a development stack's container also called mist-backend is never read.
+
+    Raises:
+        ValueError: When the listing fails or cannot be parsed; the message says which.
+    """
     result = ctx.runner(
         ["docker", "compose", "-p", inst.project, "ps", "--status", "running", "--format", "json"]
     )
-    fix = "nothing changed; pass --skip-backup to switch without the pre-switch backup"
     if result.returncode != 0:
-        raise RefusedError(
-            f"cannot tell whether {inst.project} runs ({_stderr_tail(result)}); {fix}"
-        )
+        raise ValueError(f"cannot tell whether {inst.project} runs ({_stderr_tail(result)})")
     try:
         rows = _parse_ps_json(result.stdout)
     except ValueError as exc:
-        raise RefusedError(f"cannot read {inst.project}'s containers ({exc}); {fix}") from exc
+        raise ValueError(f"cannot read {inst.project}'s containers ({exc})") from exc
     return any(row.get("Service") == BACKEND_SERVICE for row in rows)
+
+
+def _backend_running(inst: Instance, ctx: Context) -> bool:
+    """`_read_backend_running` for switch, whose fix is its own `--skip-backup`."""
+    try:
+        return _read_backend_running(inst, ctx)
+    except ValueError as exc:
+        raise RefusedError(
+            f"{exc}; nothing changed; pass --skip-backup to switch without the pre-switch backup"
+        ) from exc
 
 
 def cmd_switch(args: argparse.Namespace, ctx: Context) -> int | None:
@@ -1291,6 +1415,11 @@ def cmd_switch(args: argparse.Namespace, ctx: Context) -> int | None:
     `switch <previous tag>` is the rollback. It restores the code but not a data migration the
     newer release made, which is why a running instance is backed up first, on the release
     that wrote its data.
+
+    Before `daily.env` moves, the extraction containers are removed, found by their project
+    and service labels rather than through a compose file, so the target release need not
+    define the services. One left stopped by an older release's compose file would otherwise
+    read as foreign to `up` and `status`; the services hold no state.
     """
     _check_tag_name(args.tag, "TAG")
     current = _load_instance(args.root, ctx, require_release=False)
@@ -1326,6 +1455,14 @@ def cmd_switch(args: argparse.Namespace, ctx: Context) -> int | None:
                 file=sys.stderr,
             )
             return code
+
+    try:
+        _remove_extraction_by_label(current, ctx)
+    except InstanceError as exc:
+        raise FailedError(
+            f"could not remove the extraction containers before the switch ({exc}); "
+            f"{target.env_path} and bin/ unchanged"
+        ) from exc
 
     new_bytes = TAG_LINE.sub(f"MIST_RELEASE_TAG={args.tag}".encode(), env_bytes, count=1)
     try:
@@ -2198,12 +2335,13 @@ def _write_gaming_marker(path: Path, since: str, by: str) -> None:
 
 
 def gaming_mode_on(root: str | Path, ctx: Context, *, by: str = "manual") -> None:
-    """Yield the GPU: mark the yield, let the backend see it, then stop mist-llm.
+    """Yield the GPU: mark the yield, let the backend see it, then stop mist-llm and extraction.
 
     The backend polls the marker every `MIST_GPU_YIELD_POLL_S`; waiting two polls before the
     stop means `/health` never sees a stopped LLM while the backend still reads normal. A
     manual `on` takes over a watcher's yield, so the watcher cannot end a hold Raj asked for;
-    a watcher `on` never changes a manual one.
+    a watcher `on` never changes a manual one. Extraction stops on its own stop path, service
+    first, for a release that has it.
 
     Raises:
         InstanceError: When the root cannot be read, or the stop fails twice; then the marker
@@ -2235,6 +2373,16 @@ def gaming_mode_on(root: str | Path, ctx: Context, *, by: str = "manual") -> Non
         else:
             state = f"left {marker}, which was there before"
         raise FailedError(f"stop {LLM_SERVICE} failed twice ({_stderr_tail(result)}); {state}")
+    if _extraction_image_id(inst) is not None:
+        # The backend has read `gpu-yielded` for two polls (or it was there before), and it
+        # reports extraction as yielded ahead of paused, so this stop needs no wait of its own.
+        try:
+            _stop_extraction(inst, ctx, "gaming", None, backend_informed=True)
+        except InstanceError as exc:
+            raise FailedError(
+                f"{LLM_SERVICE} is stopped and {marker} stays, but extraction did not stop: "
+                f"{exc}; the next extraction apply stops it"
+            ) from exc
     print(f"gaming mode on: {LLM_SERVICE} stopped and the backend has released the GPU")
 
 
@@ -2256,15 +2404,17 @@ def gaming_mode_off(
     wait_minutes: int = DEFAULT_OFF_WAIT_MINUTES,
     should_abort: Callable[[], bool] | None = None,
 ) -> Literal["done", "aborted"]:
-    """End the yield: start mist-llm, wait until compose calls it healthy, then drop the marker.
+    """End the yield: start mist-llm, wait until compose calls it healthy, drop the marker, apply.
 
     While the LLM loads, turns still get the yielded reply rather than a failure, and a timeout
     leaves the marker, so `/health` keeps reading yielded, which is still true. `should_abort`,
-    called on each poll, lets the watcher stop mist-llm again when a game starts meanwhile.
+    called on each poll, lets the watcher stop mist-llm again when a game starts meanwhile; the
+    extraction apply that follows calls it too, and stops extraction for gaming when it fires.
 
     Raises:
         InstanceError: When mist-llm cannot be started, does not become healthy within
-            `wait_minutes`, or an abort's stop fails; the marker stays in each case.
+            `wait_minutes`, or an abort's stop fails; the marker stays in each case. Also when
+            the extraction apply after the marker's removal does not converge.
     """
     inst = _load_instance(root, ctx)
     marker = inst.ops / GPU_YIELDED_MARKER
@@ -2300,6 +2450,16 @@ def gaming_mode_off(
     except OSError as exc:
         raise FailedError(f"{LLM_SERVICE} is healthy, but {marker} stays: {exc}") from exc
     print(f"gaming mode off: {LLM_SERVICE} is healthy and the marker is removed")
+    if _extraction_image_id(inst) is not None:
+        try:
+            _apply_extraction(inst, ctx, should_abort=should_abort)
+        except _ListingFailedError:
+            raise
+        except InstanceError as exc:
+            raise FailedError(
+                f"{LLM_SERVICE} is healthy and {marker} is removed, but extraction apply did not "
+                f"converge: {exc}"
+            ) from exc
     return "done"
 
 
@@ -2323,6 +2483,779 @@ def cmd_gaming_mode(args: argparse.Namespace, ctx: Context) -> None:
         root = _absolute_path(args.root, ctx.home)
         _instance_name(root)
         print(gaming_mode_line(root))
+
+
+# --- Night extraction ------------------------------------------------------------------------
+#
+# `extraction apply` is a level-triggered supervisor: each call reads what the instance's files
+# ask for now (the mode, the window, `gpu-yielded`, the two identity variables) and takes the
+# two extraction services there, whatever state an earlier call or a crash left. The night
+# task calls it every 5 minutes, so any order of calls converges without a lock. The paused
+# marker that explains a stopped service is written before the stop and stays until the
+# service is healthy again; the backend reads it to report `paused` rather than `down`.
+
+
+def _local_now(ctx: Context) -> datetime:
+    """Now on the local wall clock: `Context.local_zone`'s, or the host's when that is None."""
+    return ctx.clock().astimezone(ctx.local_zone)
+
+
+def _wall_to_utc(wall: datetime, ctx: Context) -> datetime:
+    """A naive local wall-clock time as UTC, under the zone's own daylight-saving rules.
+
+    With no zone injected, `astimezone` on a naive datetime reads it as the host's local time,
+    so the conversion uses the host's rules for that date rather than today's offset.
+    """
+    if ctx.local_zone is None:
+        return wall.astimezone(UTC)
+    return wall.replace(tzinfo=ctx.local_zone).astimezone(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionWindow:
+    """`MIST_EXTRACTION_WINDOW`: the local wall-clock span, from `start` up to `end`."""
+
+    start: wall_time
+    end: wall_time
+
+    def text(self) -> str:
+        """The window as `daily.env` spells it."""
+        return f"{self.start:%H:%M}-{self.end:%H:%M}"
+
+    def contains(self, local: datetime) -> bool:
+        """Whether the wall-clock time of `local` lies in the window; one that ends before it
+        starts runs across midnight.
+        """
+        wall = local.time()
+        if self.start < self.end:
+            return self.start <= wall < self.end
+        return wall >= self.start or wall < self.end
+
+    def next_start(self, local: datetime, ctx: Context) -> datetime:
+        """The window's next start after `local`, in UTC."""
+        wall = local.replace(tzinfo=None)
+        start = datetime.combine(wall.date(), self.start)
+        if start <= wall:
+            start += timedelta(days=1)
+        return _wall_to_utc(start, ctx)
+
+
+def _extraction_window(env: Mapping[str, str], env_path: Path) -> ExtractionWindow:
+    """`daily.env`'s window, or the default when it is unset or empty.
+
+    Raises:
+        RefusedError: When it is not `HH:MM-HH:MM`, or both ends are equal, which could mean
+            either always or never.
+    """
+    raw = env.get(EXTRACTION_WINDOW_VARIABLE, "") or DEFAULT_EXTRACTION_WINDOW
+    match = EXTRACTION_WINDOW_PATTERN.fullmatch(raw)
+    if match is None:
+        raise RefusedError(
+            f"{env_path} sets {EXTRACTION_WINDOW_VARIABLE}={raw}, not HH:MM-HH:MM in local time"
+        )
+    hours_a, minutes_a, hours_b, minutes_b = (int(part) for part in match.groups())
+    window = ExtractionWindow(wall_time(hours_a, minutes_a), wall_time(hours_b, minutes_b))
+    if window.start == window.end:
+        raise RefusedError(
+            f"{env_path} sets {EXTRACTION_WINDOW_VARIABLE}={raw}, whose ends are equal; use "
+            "`extraction on` or `extraction off` for always or never"
+        )
+    return window
+
+
+def _extraction_mode(ops: Path) -> str:
+    """`ops/extraction-mode`, or `auto` when there is none (a root older than the file).
+
+    Raises:
+        RefusedError: When the file cannot be read or holds anything but on, off or auto.
+    """
+    path = ops / EXTRACTION_MODE_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return DEFAULT_EXTRACTION_MODE
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RefusedError(f"cannot read {path}: {exc}") from exc
+    mode = text.strip()
+    if mode not in EXTRACTION_MODES:
+        raise RefusedError(
+            f"{path} holds {mode!r}, not on, off or auto; set it with extraction on|off|auto"
+        )
+    return mode
+
+
+def _missing_extraction_identity(env: Mapping[str, str]) -> tuple[str, ...]:
+    """The identity variables that hold no value; an example's `<placeholder>` is none."""
+    missing = []
+    for name in EXTRACTION_IDENTITY_VARIABLES:
+        value = env.get(name, "").strip()
+        if not value or (value.startswith("<") and value.endswith(">")):
+            missing.append(name)
+    return tuple(missing)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionWant:
+    """What the instance's files ask of extraction now.
+
+    `reason` is why it runs (`mode` or `window`) when `wanted`, and otherwise the paused
+    marker's reason; `until` is the marker's expiry for a window pause, else None. `missing`
+    names the identity variables `daily.env` leaves unset, never their values.
+    """
+
+    wanted: bool
+    reason: str
+    mode: str
+    window: ExtractionWindow
+    inside: bool
+    missing: tuple[str, ...]
+    until: datetime | None = None
+
+    @property
+    def configured(self) -> bool:
+        """Whether every identity variable holds a value."""
+        return not self.missing
+
+
+def _extraction_want(inst: Instance, ctx: Context) -> ExtractionWant:
+    """Read the whole desired state from disk again: `daily.env`, the mode and the markers.
+
+    A game outranks the mode, the mode outranks the window, and the window outranks missing
+    identity, so the reason recorded is the one an operator would act on first.
+    """
+    env = _read_env(inst.env_path)
+    window = _extraction_window(env, inst.env_path)
+    mode = _extraction_mode(inst.ops)
+    local = _local_now(ctx)
+    inside = window.contains(local)
+    missing = _missing_extraction_identity(env)
+    until = None
+    if (inst.ops / GPU_YIELDED_MARKER).exists():
+        wanted, reason = False, "gaming"
+    elif mode == "off":
+        wanted, reason = False, "mode"
+    elif mode == "auto" and not inside:
+        wanted, reason = False, "window"
+        until = window.next_start(local, ctx) + EXTRACTION_WINDOW_GRACE
+    elif missing:
+        wanted, reason = False, "unconfigured"
+    else:
+        wanted, reason = True, "mode" if mode == "on" else "window"
+    return ExtractionWant(wanted, reason, mode, window, inside, missing, until)
+
+
+def _extraction_image_id(inst: Instance) -> str | None:
+    """The extraction image ID the release recorded, or None for a release that predates it."""
+    record_path = inst.ops / f"release-{inst.tag}.json"
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = record.get("extraction_image_id") if isinstance(record, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _require_extraction_release(inst: Instance) -> str:
+    image_id = _extraction_image_id(inst)
+    if image_id is None:
+        raise RefusedError(
+            f"release {inst.tag} has no night extraction: ops/release-{inst.tag}.json records "
+            "no extraction_image_id; switch to a release built with it"
+        )
+    return image_id
+
+
+def _local_extraction_image(inst: Instance, ctx: Context) -> str | None:
+    return _built_image_id(ctx, f"{EXTRACTION_IMAGE_REPOSITORY}:{inst.tag}")
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionContainer:
+    """What `docker inspect` says about one extraction container."""
+
+    cid: str
+    service: str
+    image_id: str
+    status: str
+    health: str
+    labels: Mapping[str, str]
+
+    @property
+    def running(self) -> bool:
+        """Whether Docker reports the container running."""
+        return self.status == "running"
+
+    @property
+    def healthy(self) -> bool:
+        """Whether it runs and its healthcheck passes."""
+        return self.running and self.health == "healthy"
+
+
+def _extraction_container_ids(inst: Instance, ctx: Context, service: str) -> list[str]:
+    """Every container of `service` in the project, found by label, whatever file made it."""
+    listed = ctx.runner(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"label={PROJECT_LABEL}={inst.project}",
+            "--filter",
+            f"label={SERVICE_LABEL}={service}",
+        ]
+    )
+    if listed.returncode != 0:
+        raise FailedError(
+            f"cannot list project {inst.project}'s {service} containers: {_stderr_tail(listed)}"
+        )
+    return listed.stdout.decode("utf-8", "replace").split()
+
+
+def _extraction_containers(inst: Instance, ctx: Context) -> list[ExtractionContainer]:
+    found = []
+    for service in EXTRACTION_SERVICES:
+        for cid in _extraction_container_ids(inst, ctx, service):
+            result = ctx.runner(["docker", "inspect", "--format", EXTRACTION_INSPECT_FORMAT, cid])
+            if result.returncode != 0:
+                raise FailedError(f"cannot inspect container {cid}: {_stderr_tail(result)}")
+            parts = result.stdout.decode("utf-8", "replace").strip().split(" ", 4)
+            try:
+                labels = json.loads(parts[4]) if len(parts) == 5 else None
+            except json.JSONDecodeError:
+                labels = None
+            if len(parts) != 5 or not (labels is None or isinstance(labels, dict)):
+                raise FailedError(f"cannot read docker inspect's output for container {cid}")
+            found.append(
+                ExtractionContainer(cid, service, parts[1], parts[2], parts[3], labels or {})
+            )
+    return found
+
+
+def _extraction_compose(inst: Instance) -> list[str]:
+    """The compose prefix with the extraction profile, without which compose cannot resolve
+    either service.
+    """
+    return [*inst.compose(), "--profile", EXTRACTION_PROFILE]
+
+
+def _config_hash(inst: Instance, ctx: Context, service: str) -> str:
+    """The config hash the release's compose file gives `service` with today's `daily.env`."""
+    result = ctx.runner([*_extraction_compose(inst), "config", "--hash", service])
+    if result.returncode == 0:
+        for line in result.stdout.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == service:
+                return parts[1]
+    raise FailedError(
+        f"cannot read {service}'s config hash from {inst.compose_file()}: {_stderr_tail(result)}"
+    )
+
+
+def _is_current(
+    inst: Instance, container: ExtractionContainer, config_hash: str, image_id: str
+) -> bool:
+    """Whether the container is what the release's compose file would make now.
+
+    A `daily.env` change to a serving setting changes the config hash, and a container from
+    another release's file or image is another release's service, so any of those is stale.
+    """
+    label = str(container.labels.get(CONFIG_FILES_LABEL, ""))
+    files = [entry for entry in label.split(",") if entry]
+    if len(files) != 1 or _normalized(files[0]) != _normalized(str(inst.compose_file())):
+        return False
+    if container.labels.get(CONFIG_HASH_LABEL) != config_hash:
+        return False
+    return container.service != EXTRACTION_SERVICE or container.image_id == image_id
+
+
+def _read_paused_marker(path: Path) -> tuple[bool, dict | None]:
+    """Whether the marker exists, and its payload when it parses as the contract's marker."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False, None
+    except (OSError, UnicodeDecodeError):
+        return True, None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return True, None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or _parse_utc(payload.get("since")) is None
+        or payload.get("reason") not in PAUSED_REASONS
+        or not (payload.get("until") is None or _parse_utc(payload.get("until")) is not None)
+    ):
+        return True, None
+    return True, payload
+
+
+def _paused_marker_active(payload: dict | None, now: datetime) -> bool:
+    """Whether the backend reads this marker as paused: it parses and has not expired."""
+    if payload is None:
+        return False
+    until = _parse_utc(payload.get("until"))
+    return until is None or until > now
+
+
+def _set_paused(inst: Instance, ctx: Context, reason: str, until: datetime | None) -> bool:
+    """Write the paused marker for `reason`; return whether the backend already read paused.
+
+    `since` carries over from a marker that parses, since extraction has been stopped on
+    purpose since then; an unchanged marker is not rewritten.
+    """
+    path = inst.ops / EXTRACTION_PAUSED_MARKER
+    _present, payload = _read_paused_marker(path)
+    now = ctx.clock()
+    active = _paused_marker_active(payload, now)
+    record = {
+        "v": 1,
+        "since": payload["since"] if payload is not None else _format_utc(now),
+        "reason": reason,
+        "until": None if until is None else _format_utc(until),
+    }
+    if record != payload:
+        try:
+            _write_atomic(path, (json.dumps(record) + "\n").encode("utf-8"))
+        except OSError as exc:
+            raise FailedError(f"cannot write {path}: {exc}; extraction left as it was") from exc
+    return active
+
+
+def _clear_paused(inst: Instance) -> None:
+    path = inst.ops / EXTRACTION_PAUSED_MARKER
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise FailedError(f"extraction is healthy, but {path} stays: {exc}") from exc
+
+
+def _log_transition(inst: Instance, ctx: Context, action: str, reason: str) -> None:
+    """Append `<UTC> start|stop <reason>` to the window log; a failed write only warns."""
+    path = inst.root / "logs" / EXTRACTION_WINDOW_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{_format_utc(ctx.clock())} {action} {reason}\n")
+    except OSError as exc:
+        print(f"instance.py: cannot append to {path}: {exc}", file=sys.stderr)
+
+
+def _save_extraction_log(inst: Instance, ctx: Context, service: str) -> None:
+    """Replace `logs/extraction-last-<service>.log` with the container's last lines.
+
+    Removal deletes the container's own log, so this copy is what a failed start leaves for
+    `/health`'s remedy to read.
+    """
+    result = ctx.runner(
+        [
+            *_extraction_compose(inst),
+            "logs",
+            "--no-color",
+            "--tail",
+            str(EXTRACTION_LOG_LINES),
+            service,
+        ]
+    )
+    if result.returncode == 0:
+        data = result.stdout
+    else:
+        data = f"docker compose logs {service} failed: {_stderr_tail(result)}\n".encode()
+    _write_extraction_log(inst, service, data)
+
+
+def _write_extraction_log(inst: Instance, service: str, data: bytes) -> None:
+    path = inst.root / "logs" / f"extraction-last-{service}.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomic(path, data)
+    except OSError as exc:
+        print(f"instance.py: cannot write {path}: {exc}", file=sys.stderr)
+
+
+def _remove_extraction(inst: Instance, ctx: Context, present: set[str]) -> None:
+    """Stop the service before its LLM, keep each one's last log lines, then remove both.
+
+    The service stops first so the backend's in-flight call ends as a transport error, which
+    costs no attempt; with the LLM gone first the service would answer an error envelope,
+    which does. Removal names both services, since a bare `rm` would also remove a stopped
+    mist-llm or mist-backend.
+
+    Raises:
+        FailedError: When a stop or the removal fails; the caller's marker stays.
+    """
+    dc = _extraction_compose(inst)
+    stops = (
+        (EXTRACTION_SERVICE, ["--timeout", str(EXTRACTION_STOP_TIMEOUT_S)]),
+        (EXTRACTION_LLM_SERVICE, []),
+    )
+    for service, options in stops:
+        if service not in present:
+            continue
+        stopped = ctx.runner([*dc, "stop", *options, service])
+        if stopped.returncode != 0:
+            raise FailedError(f"stop {service} failed ({_stderr_tail(stopped)})")
+    for service, _options in stops:
+        if service in present:
+            _save_extraction_log(inst, ctx, service)
+    removed = ctx.runner([*dc, "rm", "-f", EXTRACTION_SERVICE, EXTRACTION_LLM_SERVICE])
+    if removed.returncode != 0:
+        raise FailedError(
+            f"removing {EXTRACTION_SERVICE} and {EXTRACTION_LLM_SERVICE} failed "
+            f"({_stderr_tail(removed)})"
+        )
+
+
+def _stop_extraction(
+    inst: Instance,
+    ctx: Context,
+    reason: str,
+    until: datetime | None,
+    containers: Sequence[ExtractionContainer] | None = None,
+    *,
+    backend_informed: bool = False,
+) -> None:
+    """The stop path: the marker first, two backend polls, then stop and remove both.
+
+    The wait is skipped when nothing runs, when the backend already read paused, or when the
+    caller's own wait covered it (`backend_informed`, for gaming mode's `gpu-yielded`).
+    """
+    if containers is None:
+        containers = _extraction_containers(inst, ctx)
+    active = _set_paused(inst, ctx, reason, until)
+    if not containers:
+        print(f"extraction: not running, paused for {reason}")
+        return
+    running = any(container.running for container in containers)
+    if running and not active and not backend_informed:
+        ctx.sleep(2 * _gpu_yield_poll_s(inst))
+    try:
+        _remove_extraction(inst, ctx, {container.service for container in containers})
+    except FailedError as exc:
+        raise FailedError(f"{exc}; {EXTRACTION_PAUSED_MARKER} stays, paused for {reason}") from exc
+    if running:
+        _log_transition(inst, ctx, "stop", reason)
+    print(f"extraction: stopped and removed, paused for {reason}")
+
+
+def _stop_unwanted(
+    inst: Instance,
+    ctx: Context,
+    want: ExtractionWant,
+    containers: Sequence[ExtractionContainer] | None = None,
+) -> None:
+    """The stop path for `want`; missing identity is then refused, naming only the variables.
+
+    The marker reads `unconfigured` like any other pause; the refusal (plan v4: apply refuses
+    on missing identity) is what tells the operator that this pause, unlike the window's,
+    ends only when `daily.env` changes.
+
+    Raises:
+        RefusedError: When the pause is for missing identity.
+        FailedError: From the stop path.
+    """
+    _stop_extraction(inst, ctx, want.reason, want.until, containers)
+    if want.reason == "unconfigured":
+        raise RefusedError(
+            f"{inst.env_path} leaves {', '.join(want.missing)} unset, so extraction stays "
+            "paused as unconfigured; set it, then run extraction apply"
+        )
+
+
+def _extraction_health(inst: Instance, ctx: Context) -> tuple[bool, str | None]:
+    """Whether both services report healthy, and why the start failed if one has exited."""
+    result = ctx.runner(
+        [
+            *_extraction_compose(inst),
+            "ps",
+            "--all",
+            "--format",
+            "json",
+            EXTRACTION_LLM_SERVICE,
+            EXTRACTION_SERVICE,
+        ]
+    )
+    if result.returncode != 0:
+        return False, None
+    try:
+        rows = _parse_ps_json(result.stdout)
+    except ValueError:
+        return False, None
+    by_service = {row.get("Service"): row for row in rows}
+    for service in EXTRACTION_SERVICES:
+        state = by_service.get(service, {}).get("State")
+        if state in ("exited", "dead"):
+            return False, f"{service} is {state}"
+    return (
+        all(
+            by_service.get(service, {}).get("Health") == "healthy"
+            for service in EXTRACTION_SERVICES
+        ),
+        None,
+    )
+
+
+def _fail_start(inst: Instance, ctx: Context, why: str) -> None:
+    """Remove both containers and the marker, so `/health` reads extraction as down.
+
+    Raises:
+        FailedError: Always, naming why the start failed and what was left.
+    """
+    try:
+        present = {container.service for container in _extraction_containers(inst, ctx)}
+        _remove_extraction(inst, ctx, present)
+    except InstanceError as exc:
+        raise FailedError(
+            f"extraction did not start: {why}; removing its containers then failed ({exc}), so "
+            f"{EXTRACTION_PAUSED_MARKER} stays until its start deadline"
+        ) from exc
+    _clear_paused(inst)
+    _log_transition(inst, ctx, "stop", "failed")
+    raise FailedError(
+        f"extraction did not start: {why}; both containers and {EXTRACTION_PAUSED_MARKER} are "
+        "removed, so /health reads it as down"
+    )
+
+
+def _start_extraction(
+    inst: Instance,
+    ctx: Context,
+    want: ExtractionWant,
+    containers: Sequence[ExtractionContainer],
+    stale: bool,
+    should_abort: Callable[[], bool] | None,
+) -> None:
+    """The start path: marker `starting`, the LLM, the service, then both healthy.
+
+    After each step the whole desired state is read again; when extraction is no longer wanted
+    the stop path runs instead. The marker goes only once both are healthy and still wanted.
+    """
+    deadline = ctx.monotonic() + EXTRACTION_START_DEADLINE_S
+    until = ctx.clock() + timedelta(seconds=EXTRACTION_START_DEADLINE_S)
+    active = _set_paused(inst, ctx, "starting", until)
+
+    def no_longer_wanted() -> bool:
+        now = _extraction_want(inst, ctx)
+        if now.wanted and should_abort is not None and should_abort():
+            now = replace(now, wanted=False, reason="gaming", until=None)
+        if now.wanted:
+            return False
+        _stop_unwanted(inst, ctx, now)
+        return True
+
+    if stale:
+        if any(container.running for container in containers) and not active:
+            ctx.sleep(2 * _gpu_yield_poll_s(inst))
+        try:
+            _remove_extraction(inst, ctx, {container.service for container in containers})
+        except FailedError as exc:
+            raise FailedError(
+                f"could not remove the stale extraction containers ({exc}); "
+                f"{EXTRACTION_PAUSED_MARKER} stays until its start deadline"
+            ) from exc
+        if no_longer_wanted():
+            return
+    _log_transition(inst, ctx, "start", want.reason)
+    for service in EXTRACTION_SERVICES:
+        started = ctx.runner([*_extraction_compose(inst), "up", "-d", service])
+        if started.returncode != 0:
+            _fail_start(inst, ctx, f"up -d {service} failed ({_stderr_tail(started)})")
+        if no_longer_wanted():
+            return
+    while True:
+        healthy, problem = _extraction_health(inst, ctx)
+        if healthy:
+            break
+        if problem is not None:
+            _fail_start(inst, ctx, problem)
+        if ctx.monotonic() >= deadline:
+            _fail_start(
+                inst,
+                ctx,
+                f"{EXTRACTION_LLM_SERVICE} and {EXTRACTION_SERVICE} did not both report healthy "
+                f"within {EXTRACTION_START_DEADLINE_S} s",
+            )
+        ctx.sleep(EXTRACTION_POLL_S)
+        if no_longer_wanted():
+            return
+    if no_longer_wanted():
+        return
+    _clear_paused(inst)
+    print(f"extraction: running and healthy, started for {want.reason}")
+
+
+def _apply_extraction(
+    inst: Instance, ctx: Context, *, should_abort: Callable[[], bool] | None = None
+) -> None:
+    """Converge the two extraction services on what the instance's files ask for now.
+
+    `should_abort`, from the gaming watcher, counts as `gpu-yielded` when it returns true.
+    A start waits for the project's own mist-backend: while it is not running, apply starts
+    nothing and writes no marker, but the stop path still runs whenever extraction is unwanted.
+
+    Raises:
+        RefusedError: Nothing changed: the release predates night extraction, a setting is
+            malformed, or extraction is wanted but `mist-extraction:<tag>` is not the image
+            the release recorded. The one exception is a missing identity variable, which the
+            message names: that refusal comes after the stop path has run and written the
+            `unconfigured` marker, so something did change.
+        FailedError: A stop or start did not converge, or the backend's state could not be
+            read; the message names what was left.
+    """
+    expected_image = _require_extraction_release(inst)
+    want = _extraction_want(inst, ctx)
+    if want.wanted and should_abort is not None and should_abort():
+        want = replace(want, wanted=False, reason="gaming", until=None)
+    containers = _extraction_containers(inst, ctx)
+    if not want.wanted:
+        _stop_unwanted(inst, ctx, want, containers)
+        return
+    image = f"{EXTRACTION_IMAGE_REPOSITORY}:{inst.tag}"
+    local = _local_extraction_image(inst, ctx)
+    fix = f"run release-build {inst.tag} --root {inst.root}"
+    if local is None:
+        raise RefusedError(f"there is no image {image}; {fix}")
+    if local != expected_image:
+        raise RefusedError(
+            f"{image} is {local}, but ops/release-{inst.tag}.json records {expected_image}: the "
+            f"tag was re-pointed by another build; {fix}"
+        )
+    services = [container.service for container in containers]
+    hashes = {s: _config_hash(inst, ctx, s) for s in EXTRACTION_SERVICES if s in services}
+    stale = len(set(services)) != len(services) or not all(
+        _is_current(inst, container, hashes[container.service], expected_image)
+        for container in containers
+    )
+    if not stale and len(containers) == 2 and all(c.healthy for c in containers):
+        _clear_paused(inst)
+        print("extraction: running and healthy from the current release; nothing to do")
+        return
+    try:
+        backend = _read_backend_running(inst, ctx)
+    except ValueError as exc:
+        raise FailedError(f"{exc}; started nothing") from exc
+    if not backend:
+        # The backend sends extraction its work; started without it, the pair would hold the
+        # GPU after `down` with nothing to do. `up` applies again once the backend runs.
+        print(
+            f"extraction: {BACKEND_SERVICE} of project {inst.project} is not running; "
+            "started nothing"
+        )
+        return
+    _start_extraction(inst, ctx, want, containers, stale, should_abort)
+
+
+def extraction_apply(
+    root: str | Path, ctx: Context, *, should_abort: Callable[[], bool] | None = None
+) -> None:
+    """`extraction apply` in process: load the root, then converge."""
+    _apply_extraction(_load_instance(root, ctx), ctx, should_abort=should_abort)
+
+
+def _remove_extraction_by_label(inst: Instance, ctx: Context) -> list[str]:
+    """Stop, then remove, every extraction container of the project, found by label.
+
+    Plain `docker` on container IDs, since the target release's compose file may not define
+    the services. The order is the stop path's: the service before its LLM, so an in-flight
+    call ends as a transport error rather than an error envelope that costs the turn an
+    attempt; then each one's last log lines; then `docker rm -f`.
+
+    Raises:
+        FailedError: When listing, a stop or the removal fails; nothing is removed after a
+            failed stop.
+    """
+    containers = _extraction_containers(inst, ctx)
+    if not containers:
+        return []
+    ordered = sorted(containers, key=lambda c: c.service != EXTRACTION_SERVICE)
+    for container in ordered:
+        if not container.running:
+            continue
+        short = container.service == EXTRACTION_SERVICE
+        timeout = ["-t", str(EXTRACTION_STOP_TIMEOUT_S)] if short else []
+        stopped = ctx.runner(["docker", "stop", *timeout, container.cid])
+        if stopped.returncode != 0:
+            raise FailedError(
+                f"docker stop of {container.service} ({container.cid}) failed: "
+                f"{_stderr_tail(stopped)}"
+            )
+    for container in ordered:
+        logs = ctx.runner(["docker", "logs", "--tail", str(EXTRACTION_LOG_LINES), container.cid])
+        if logs.returncode == 0:
+            # `docker logs` keeps the container's two streams apart; both are kept, in turn.
+            data = logs.stdout + logs.stderr
+        else:
+            data = f"docker logs {container.cid} failed: {_stderr_tail(logs)}\n".encode()
+        _write_extraction_log(inst, container.service, data)
+    ids = [container.cid for container in containers]
+    removed = ctx.runner(["docker", "rm", "-f", *ids])
+    if removed.returncode != 0:
+        raise FailedError(
+            f"docker rm -f of the extraction containers failed: {_stderr_tail(removed)}"
+        )
+    print(f"removed {len(ids)} extraction container(s) before the switch")
+    return ids
+
+
+def extraction_line(inst: Instance, ctx: Context) -> str:
+    """The one line `extraction status` and `status` print; it shows no `daily.env` identity."""
+    expected = _extraction_image_id(inst)
+    if expected is None:
+        return f"extraction: none in release {inst.tag}"
+    try:
+        want = _extraction_want(inst, ctx)
+    except RefusedError as exc:
+        return f"extraction: settings refused ({exc})"
+    try:
+        containers = _extraction_containers(inst, ctx)
+    except FailedError:
+        running = "unknown"
+    else:
+        up = {container.service for container in containers if container.running}
+        running = "yes" if len(up) == 2 else "no" if not up else "partial"
+    present, payload = _read_paused_marker(inst.ops / EXTRACTION_PAUSED_MARKER)
+    if payload is None:
+        paused = "unreadable" if present else "no"
+    elif _paused_marker_active(payload, ctx.clock()):
+        paused = payload["reason"]
+    else:
+        paused = f"expired {payload['reason']}"
+    local = _local_extraction_image(inst, ctx)
+    image = "missing" if local is None else "match" if local == expected else "MISMATCH"
+    return (
+        f"extraction: mode {want.mode}, window {want.window.text()} "
+        f"{'inside' if want.inside else 'outside'}, running {running}, paused {paused}, "
+        f"image {image}, configured {'yes' if want.configured else 'no'}"
+    )
+
+
+def cmd_extraction(args: argparse.Namespace, ctx: Context) -> None:
+    """`extraction on|off|auto|apply|status`: set the mode and converge, converge, or show it."""
+    inst = _load_instance(args.root, ctx)
+    _require_extraction_release(inst)
+    if args.action == "status":
+        print(extraction_line(inst, ctx))
+        return
+    if args.action in EXTRACTION_MODES:
+        path = inst.ops / EXTRACTION_MODE_FILE
+        try:
+            _write_atomic(path, f"{args.action}\n".encode())
+        except OSError as exc:
+            raise FailedError(f"cannot write {path}: {exc}; nothing changed") from exc
+        print(f"extraction mode: {args.action}")
+        try:
+            _apply_extraction(inst, ctx)
+        except RefusedError as exc:
+            raise FailedError(
+                f"wrote mode {args.action} to {path}, but apply was refused: {exc}"
+            ) from exc
+        return
+    _apply_extraction(inst, ctx)
 
 
 # --- gaming-watch ----------------------------------------------------------------------------
@@ -2678,7 +3611,7 @@ def _usage_lines(inst: Instance, ctx: Context, port: str) -> list[str]:
 
 
 def cmd_status(args: argparse.Namespace, ctx: Context) -> int:
-    """Print what runs, whether it is the release, gaming mode, `/health` and the use counts.
+    """Print what runs, whether it is the release, gaming mode, extraction, `/health` and use.
 
     Exits 1 when a container of the project was made from another compose file, or when the
     containers cannot be listed, since then that check did not run.
@@ -2696,6 +3629,7 @@ def cmd_status(args: argparse.Namespace, ctx: Context) -> int:
             print(f"config-file mismatch: {entry}")
             code = EXIT_FAILED
     print(gaming_mode_line(inst.root))
+    print(extraction_line(inst, ctx))
     port = inst.env.get("MIST_DAILY_WS_PORT") or CANONICAL_PORTS["MIST_DAILY_WS_PORT"]
     if port.isdigit():
         lines = _health_lines(inst, ctx, port) + _usage_lines(inst, ctx, port)
@@ -2730,7 +3664,9 @@ def build_parser() -> argparse.ArgumentParser:
     retire.set_defaults(handler=cmd_retire)
 
     release = commands.add_parser(
-        "release-build", help="build mist-backend:<tag> and extract the tag's deploy files"
+        "release-build",
+        help="build mist-backend:<tag> and mist-extraction:<tag>, and extract the tag's deploy "
+        "files",
     )
     release.add_argument("tag", nargs="?", help="annotated tag daily-YYYY.MM.DD[.N] on main")
     release.add_argument(
@@ -2766,7 +3702,9 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument("--root", required=True)
     down.set_defaults(handler=cmd_down)
 
-    status = commands.add_parser("status", help="show the release, gaming mode, health and use")
+    status = commands.add_parser(
+        "status", help="show the release, gaming mode, extraction, health and use"
+    )
     status.add_argument("--root", required=True)
     status.set_defaults(handler=cmd_status)
 
@@ -2781,6 +3719,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long `off` waits for mist-llm to become healthy",
     )
     gaming.set_defaults(handler=cmd_gaming_mode)
+
+    extraction = commands.add_parser(
+        "extraction",
+        help="set night extraction's mode and converge on it, converge, or show its state",
+    )
+    extraction.add_argument("action", choices=(*EXTRACTION_MODES, "apply", "status"))
+    extraction.add_argument("--root", required=True)
+    extraction.set_defaults(handler=cmd_extraction)
 
     watch = commands.add_parser(
         "gaming-watch",

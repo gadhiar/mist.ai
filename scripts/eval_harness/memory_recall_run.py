@@ -170,16 +170,14 @@ from backend.memory.models import (
     NeedTrace,
     NoteSource,
 )
+from backend.memory.need_embedders import NEED_EMBEDDERS, NeedEmbedderSpec, need_embedder_kwargs
 from backend.memory.need_gate import (
-    NEED_EMBEDDERS,
     NeedBank,
-    NeedEmbedderSpec,
     NeedGate,
     NeedKey,
     NeedModel,
     load_bank,
     load_models,
-    need_embedder_kwargs,
     select_model,
 )
 from backend.memory.ranking import FusedCandidate, ScoredCandidate
