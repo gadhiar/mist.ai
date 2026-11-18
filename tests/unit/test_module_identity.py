@@ -58,7 +58,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # dormant torch model stack. It remains COVERED anyway -- the duplicate scan is
 # scoped by path, not by walked root, so if anything ever loads a
 # dependencies/csm module under two names the check still fires. See the
-# `model_manager.py:13` note on _ROOT_MODULE_FLOORS below.
+# `src/multimodal/tts.py:23-27` note on _ROOT_MODULE_FLOORS below.
 WALKED_ROOTS = ("backend", "src", "scripts")
 
 # Probe program. Populates sys.modules the way production does, then dumps
@@ -254,23 +254,22 @@ def _describe(duplicates: dict[str, list[str]]) -> str:
 # History, kept because it is the whole reason this guard exists. When the guard
 # was built on 2026-08-03 it recorded three live duplicates here --
 # backend/factories.py, backend/knowledge/__init__.py and
-# backend/knowledge/config.py -- because server.py imported `config`,
-# `voice_processor`, `factories`, `knowledge.config` and `log_handler` by bare
-# name while 341 import sites inside backend/ spelled the same modules
-# `backend.*`. factories.py is the dependency-injection wiring module, so the
-# DI graph was built twice in production. Those imports were unified onto the
-# `backend.` spelling later the same day (server.py:50-59,
-# voice_processor.py:31/40), which emptied this baseline and the one below.
+# backend/knowledge/config.py -- because server.py imported `config`, the
+# threaded voice processor (since replaced by `backend/realtime/`), `factories`,
+# `knowledge.config` and `log_handler` by bare name while 341 import sites
+# inside backend/ spelled the same modules `backend.*`. factories.py is the
+# dependency-injection wiring module, so the DI graph was built twice in
+# production. Those imports were unified onto the `backend.` spelling later the
+# same day, which emptied this baseline and the one below.
 ENTRY_POINT_BASELINE: dict[str, list[str]] = {}
 
 # The all-roots walk reaches modules the entry point does not, so it sees a
-# superset. It once carried six extra pairs -- audio_protocol, config,
-# log_handler, voice_models, voice_models.model_manager and voice_processor --
+# superset. It once carried six extra pairs -- `config`, `log_handler`, and four
+# modules of the threaded voice path since replaced by `backend/realtime/` --
 # which were collision-capable rather than live: they would have duplicated the
 # moment any reachable module imported them the other way. Two of them were in
-# fact already live through voice_processor.py's bare `audio_protocol` and
-# `voice_models.model_manager` imports. All six were resolved by the same
-# unification, so this baseline is empty too.
+# fact already live through bare imports inside that path. All six were
+# resolved by the same unification, so this baseline is empty too.
 #
 # Walking src/ and scripts/ on 2026-08-03 added 44 modules and found NO
 # duplicate of its own -- those two trees were clean then and are clean now.
@@ -301,14 +300,14 @@ IMPORT_FAILURE_BASELINE: dict[str, str] = {}
 # src 14, scripts 30) so ordinary growth never trips them.
 #
 # Related live hazard these floors do NOT cover, recorded here because it is
-# the reason src/ was worth walking: backend/voice_models/model_manager.py:12-13
-# inserts the repo root and then the RELATIVE path "dependencies/csm" onto
+# the reason src/ was worth walking: src/multimodal/tts.py:23-27
+# (`_ensure_csm_path`) inserts the RELATIVE path "dependencies/csm" onto
 # sys.path, so it resolves only when CWD is the repo root. Combined with the
-# bare `from generator import Segment` at model_manager.py:240/736 and
-# src/multimodal/tts.py:38/103/199, dependencies/csm/generator.py is
-# double-identity-capable. It stays latent only because CSM is dormant behind
-# Chatterbox and those imports sit inside functions, where a static walk cannot
-# reach them. If CSM is ever reactivated the duplicate scan will catch it.
+# bare `from generator import ...` at src/multimodal/tts.py:38/104/200,
+# dependencies/csm/generator.py is double-identity-capable. It stays latent
+# only because CSM is dormant behind Chatterbox and those imports sit inside
+# functions, where a static walk cannot reach them. If CSM is ever reactivated
+# the duplicate scan will catch it.
 _ROOT_MODULE_FLOORS = {"backend": 90, "src": 10, "scripts": 20}
 
 # Floors on first-party modules actually resident in sys.modules. A probe that

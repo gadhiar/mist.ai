@@ -6,8 +6,8 @@ from memory, and add turns that count as real use (ADR-042).
 
 `TestClient` is constructed without the `with` block, as in
 `tests/unit/test_server_health_wiring.py`: entering it would run the ASGI
-lifespan and load the model stack. Without the lifespan `voice_processor` is
-None, so an accepted connection is answered with the "Server not ready" error
+lifespan and load the model stack. Without the lifespan the runtime and the
+session registry are None, so an accepted connection is answered with the "Server not ready" error
 and closed with 1013; receiving that error is the proof of acceptance. A
 refused connection is closed before `accept`, which `TestClient` reports by
 raising `WebSocketDisconnect` on entering the `websocket_connect` session.
@@ -50,8 +50,24 @@ def default_origins(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def no_voice_processor(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(server, "voice_processor", None)
+def no_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No runtime and no session registry, as before `lifespan` built them."""
+    monkeypatch.setattr(server, "runtime", None)
+    monkeypatch.setattr(server, "session_registry", None)
+
+
+class CountingRegistry:
+    """A session registry that counts the sessions the endpoint asks it for."""
+
+    def __init__(self) -> None:
+        self.created = 0
+
+    def create_session(self, **kwargs: object) -> object:
+        self.created += 1
+        raise AssertionError("a refused origin reached the session registry")
+
+    def count(self) -> int:
+        return self.created
 
 
 def _ws_headers(origin: str | None) -> dict[str, str]:
@@ -138,7 +154,7 @@ class TestWebSocketOrigin:
         ],
     )
     def test_allowed_origin_is_accepted(
-        self, origin: str | None, default_origins, no_voice_processor
+        self, origin: str | None, default_origins, no_runtime
     ) -> None:
         client = TestClient(server.app)
 
@@ -156,7 +172,7 @@ class TestWebSocketOrigin:
         ],
     )
     def test_refused_origin_is_closed_with_1008_before_accept(
-        self, origin: str, default_origins, no_voice_processor, caplog
+        self, origin: str, default_origins, no_runtime, caplog
     ) -> None:
         client = TestClient(server.app)
 
@@ -175,18 +191,21 @@ class TestWebSocketOrigin:
         ]
         assert len(refusals) == 1
 
-    def test_refused_origin_never_joins_active_connections(
-        self, default_origins, no_voice_processor
+    def test_refused_origin_never_joins_the_session_registry(
+        self, monkeypatch, default_origins
     ) -> None:
+        registry = CountingRegistry()
+        monkeypatch.setattr(server, "session_registry", registry)
+        monkeypatch.setattr(server, "runtime", object())
         client = TestClient(server.app)
-        before = len(server.active_connections)
 
         with pytest.raises(WebSocketDisconnect):
             _open_and_close(client, "http://evil.example")
 
-        assert len(server.active_connections) == before
+        assert registry.created == 0
+        assert server._session_count() == 0
 
-    def test_star_accepts_any_origin(self, monkeypatch, no_voice_processor) -> None:
+    def test_star_accepts_any_origin(self, monkeypatch, no_runtime) -> None:
         monkeypatch.setenv(_ENV, "*")
         client = TestClient(server.app)
 

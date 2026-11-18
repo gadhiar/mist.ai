@@ -2,8 +2,8 @@
 
 `sounddevice` opens PortAudio when it is imported, and PortAudio raises when the host
 has no sound server. On the ubuntu-26.04 runner image it raises `PortAudioError`, which
-broke collection of every unit test that reached `src/multimodal/stt.py` through
-`backend/voice_models/model_manager.py`. The server never records or plays audio
+broke collection of every unit test that reached `src/multimodal/stt.py` through the
+threaded voice path's model manager, since deleted. The server never records or plays audio
 locally -- it transcribes audio received over the WebSocket -- so only the methods
 that record or play may import `sounddevice`.
 

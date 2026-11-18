@@ -35,18 +35,11 @@ class SystemStatusConfig(BaseModel):
 class VoiceConfig(BaseModel):
     """Configuration for voice AI system."""
 
-    # Model paths
-    whisper_model: str = "base"
     # 2026-05-11: default aligned with docker-compose.yml MODEL env var
     # (gemma-4-e4b). Qwen 2.5 7B was the pre-2026-04-22 default; replaced by
-    # Gemma 4 E4B Q5_K_M per ADR-008 model-backend-selection.
+    # Gemma 4 E4B Q5_K_M per ADR-008 model-backend-selection. Speech engine
+    # models and devices are `VoiceSettings.placement`'s.
     llm_model: str = "gemma-4-e4b"
-    tts_device: str = "cuda"
-
-    # VAD settings
-    vad_enabled: bool = True
-    vad_threshold: float = 0.5
-    vad_sample_rate: int = 16000
 
     # TTS settings
     tts_enabled: bool = True  # Set to False to disable TTS (text-only mode)

@@ -107,9 +107,9 @@ class GpuYield:
     ) -> None:
         """Read the marker once and start `yielded` or `normal`, calling neither callback.
 
-        A backend that boots while yielded skips the GPU models
-        (`ModelManager.load_all_models(yielded=True)`), so there is nothing to
-        release at construction.
+        A backend that boots while yielded builds no CUDA speech engine and
+        skips the LLM warm-up (`build_mist_runtime` at power level `off`), so
+        there is nothing to release at construction.
 
         Args:
             marker_path: `<MIST_OPS_DIR>/gpu-yielded`.
