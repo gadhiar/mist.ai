@@ -9,12 +9,15 @@ bytes or JSON back.
 import json
 import re
 import struct
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import get_args
 
 import pytest
 
+from backend.capabilities import events as capability_events
 from backend.errors import MistError
+from backend.realtime import protocol
 from backend.realtime.errors import ProtocolError, RealtimeError, SpeechEngineError
 from backend.realtime.protocol import (
     CLIENT_MESSAGE_TYPES,
@@ -27,6 +30,9 @@ from backend.realtime.protocol import (
     SERVER_MESSAGE_TYPES,
     UPLINK_SAMPLE_RATE,
     VOICE_DECISION_KINDS,
+    ActionDecisionMessage,
+    AlarmActionMessage,
+    AlarmReportMessage,
     BackendMistState,
     DegradedDetail,
     Direction,
@@ -390,6 +396,9 @@ def test_client_message_set_matches_design_doc():
         "interrupt",
         "log_config",
         "subscribe_logs",
+        "action_decision",
+        "alarm_action",
+        "alarm_report",
     } == CLIENT_MESSAGE_TYPES
 
 
@@ -1589,3 +1598,175 @@ def test_vectors_keep_the_gpu_yield_vector():
     names = {vector["name"] for vector in CLIENT_VECTORS}
 
     assert {"gpu_yield", "mute", "voice_start", "voice_start_muted"} <= names
+
+
+# -- main's 1.x control messages ---------------------------------------------
+
+# Main's own example payloads, from `tests/unit/capabilities/test_events.py`: the inbound
+# parametrization for `action_decision` and `alarm_action`, and the rang report that
+# `test_a_rang_report_validates_and_round_trips` builds for `alarm_report`.
+MAIN_CONTROL_EXAMPLES = {
+    "action_decision": {"type": "action_decision", "proposal_id": "p1", "decision": "approve"},
+    "alarm_action": {"type": "alarm_action", "alarm_id": "a1", "action": "snooze", "minutes": 5},
+    "alarm_report": {
+        "type": "alarm_report",
+        "alarm_id": "a1",
+        "outcome": "rang",
+        "at": "2026-01-05T06:59:00Z",
+        "rang_at": "2026-01-05T06:59:00Z",
+        "request_id": "q1",
+    },
+}
+# The instant main's capabilities tests validate the example report against.
+MAIN_REPORT_NOW = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
+
+MAIN_CONTROL_MODELS = {
+    "action_decision": capability_events.ActionDecisionMessage,
+    "alarm_action": capability_events.AlarmActionMessage,
+    "alarm_report": capability_events.AlarmReportMessage,
+}
+
+ADDED_CONTROL_MODELS = [
+    pytest.param(ActionDecisionMessage, MAIN_CONTROL_MODELS["action_decision"], id="decision"),
+    pytest.param(AlarmActionMessage, MAIN_CONTROL_MODELS["alarm_action"], id="alarm_action"),
+    pytest.param(AlarmReportMessage, MAIN_CONTROL_MODELS["alarm_report"], id="alarm_report"),
+]
+
+
+def _field_contract(model: type) -> dict[str, tuple]:
+    """Each field's type, constraints and default; `type` by its tag only.
+
+    The protocol's `type` defaults to its tag, which `CLIENT_MESSAGE_TYPES` reads, where
+    capabilities' is required, so only its annotation is compared.
+    """
+    contract: dict[str, tuple] = {}
+    for name, info in model.model_fields.items():
+        if name == "type":
+            contract[name] = (info.annotation,)
+        else:
+            contract[name] = (info.annotation, info.metadata, info.is_required(), info.default)
+    return contract
+
+
+@pytest.mark.parametrize(("ours", "mains"), ADDED_CONTROL_MODELS)
+def test_added_control_message_fields_are_mains(ours, mains):
+    """Fires when a field drifts between the protocol model and capabilities' model."""
+    assert list(ours.model_fields) == list(mains.model_fields)
+    assert _field_contract(ours) == _field_contract(mains)
+    assert ours.model_config.get("extra") == mains.model_config.get("extra")
+
+
+@pytest.mark.parametrize("name", sorted(MAIN_CONTROL_EXAMPLES))
+def test_added_control_message_parses_from_mains_example_and_round_trips(name):
+    example = MAIN_CONTROL_EXAMPLES[name]
+
+    parsed = parse_client_message(json.dumps(example))
+
+    assert parsed.type == name
+    assert json.loads(encode_message(parsed)) == example
+    assert _vector_message(CLIENT_VECTORS, name) == example
+    main = MAIN_CONTROL_MODELS[name].model_validate(example, context={"now": MAIN_REPORT_NOW})
+    assert main.to_payload() == example
+
+
+def test_alarm_report_refuses_an_endpoint_key():
+    """The server attaches the connection's endpoint, so no report may name its own."""
+    message = dict(MAIN_CONTROL_EXAMPLES["alarm_report"], endpoint="room")
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps(message))
+
+    assert excinfo.value.field == "endpoint"
+    assert "endpoint" not in AlarmReportMessage.model_fields
+
+
+@pytest.mark.parametrize("name", ["action_decision", "alarm_action"])
+def test_other_added_control_messages_ignore_an_unknown_key(name):
+    message = dict(MAIN_CONTROL_EXAMPLES[name], endpoint="room")
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert json.loads(encode_message(parsed)) == MAIN_CONTROL_EXAMPLES[name]
+
+
+def test_alarm_action_omits_request_id_only_when_absent():
+    """The same payload capabilities' `to_payload` gives: `minutes` stays, null or not."""
+    stop = {"type": "alarm_action", "alarm_id": "a1", "action": "stop"}
+
+    parsed = parse_client_message(json.dumps(stop))
+    assert json.loads(encode_message(parsed)) == dict(stop, minutes=None)
+
+    with_request = dict(stop, request_id="q1")
+    parsed = parse_client_message(json.dumps(with_request))
+    assert json.loads(encode_message(parsed)) == dict(with_request, minutes=None)
+
+
+@pytest.mark.parametrize(
+    ("changes", "field"),
+    [
+        pytest.param({"minutes": 61}, "minutes", id="minutes-over-60"),
+        pytest.param({"minutes": "5"}, "minutes", id="minutes-not-coerced"),
+        pytest.param({"request_id": ""}, "request_id", id="request-id-empty"),
+        pytest.param({"action": "pause"}, "action", id="unknown-action"),
+    ],
+)
+def test_alarm_action_keeps_mains_constraints(changes, field):
+    message = dict(MAIN_CONTROL_EXAMPLES["alarm_action"], **changes)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps(message))
+
+    assert excinfo.value.field == field
+
+
+@pytest.mark.parametrize(
+    ("changes", "field"),
+    [
+        pytest.param({"outcome": "snoozed"}, "snoozed_until", id="snoozed-without-until"),
+        pytest.param(
+            {"outcome": "stopped", "snoozed_until": "2026-01-05T07:08:00Z"},
+            "snoozed_until",
+            id="until-with-stopped",
+        ),
+        pytest.param({"at": "2026-01-05T06:59:00"}, "at", id="naive-at"),
+        pytest.param({"alarm_id": ""}, "alarm_id", id="empty-alarm-id"),
+        pytest.param({"request_id": "q" * 65}, "request_id", id="request-id-65"),
+    ],
+)
+def test_alarm_report_keeps_mains_constraints(changes, field):
+    message = dict(MAIN_CONTROL_EXAMPLES["alarm_report"], **changes)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps(message))
+
+    assert excinfo.value.field == field
+
+
+def test_alarm_report_snoozed_round_trips_and_omits_what_it_did_not_carry():
+    message = {
+        "type": "alarm_report",
+        "alarm_id": "a1",
+        "outcome": "snoozed",
+        "at": "2026-01-05T06:59:00Z",
+        "rang_at": "2026-01-05T06:30:00Z",
+        "snoozed_until": "2026-01-05T07:08:00Z",
+    }
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_an_unknown_type_beside_mains_control_messages_still_names_type():
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps({"type": "alarm_snooze", "alarm_id": "a1"}))
+
+    assert excinfo.value.field == "type"
+
+
+def test_module_docstring_states_what_2_0_0_carries():
+    doc = protocol.__doc__ or ""
+    terms = ("2.0.0", "1.x control messages", "protocol 2's own", "server messages", "not modelled")
+
+    assert [term for term in terms if term not in doc] == []
+    assert PROTOCOL_VERSION == "2.0.0"

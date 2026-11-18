@@ -1,10 +1,13 @@
-"""The four speech synthesis adapters of run 1, each meeting `engines.SpeechEngine`.
+"""The speech synthesis adapters of run 1, each meeting `engines.SpeechEngine`.
 
-Every engine speaks with a stock voice of its own and nothing is cloned: `voices()` returns only
-the stock names `speech_arms.json` lists, `load` refuses any other name before importing
-anything, and no adapter hands its engine an audio file or an audio argument. Engine packages and
-torch are imported lazily through `importer`, inside the bench container only, so importing this
-module loads no engine and the unit tests pass fake modules instead.
+`voices()` returns only the names `speech_arms.json` lists, and `load` refuses any other name
+before importing anything. The four run-1 engines speak with a stock voice of their own, and none
+of them hands its engine an audio file or an audio argument. Two arms do not (mist-realtime-voice
+plan v6, T41): `pocket-clone` clones the one identity clip `--voice-clip` mounts read-only at
+`CONTAINER_VOICE_CLIP`, its only voice being `identity`, and `qwen3-design` designs its voice from
+the fixed description and seed of its arm. Engine packages and torch are imported lazily through
+`importer`, inside the bench container only, so importing this module loads no engine and the
+unit tests pass fake modules instead.
 
 Weights are read from the read-only mount at `CONTAINER_MODELS_DIR` (layout `<org>/<repo>/`)
 with `HF_HUB_OFFLINE=1`, so nothing is downloaded.
@@ -20,6 +23,13 @@ names its files as `hf://` URIs, which resolve only through a Hugging Face cache
 loads a copy of that config in which the model and tokenizer are the mounted files of the
 ungated repository. Each stock Pocket voice is passed as the path of its precomputed voice state,
 a safetensors file from the same repository and revision as the weights, which holds no audio.
+
+`pocket-clone` loads the same installed config with all three of its `hf://` URIs mapped to the
+mounted snapshots (host step H13 printed them from the pocket image): the cloning model from
+`kyutai/pocket-tts`, the tokenizer and the fallback model from the ungated repository each URI
+names. Its voice is `get_state_for_audio_prompt(<the mounted clip>)`. `qwen3-design` loads and
+calls the VoiceDesign model through `design_probe.Designer`, the loading path T40's voice-design
+tool uses, with the entry point H13 read from the qwen3 image.
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from .. import core
+from . import design_probe
 
 if TYPE_CHECKING:
     import numpy
@@ -73,6 +84,17 @@ POCKET_LOCAL_FILES = {
 
 # The stock voices' precomputed states, under the engine's weights directory.
 POCKET_VOICE_STATES = "languages/english/embeddings"
+
+# The installed config's `weights_path`: the cloning model of the gated repository, at the
+# revision the `pocket-clone` arm records. `pocket-clone` maps exactly these three URIs.
+POCKET_CLONE_MODEL_URI = (
+    "hf://kyutai/pocket-tts/languages/english/model.safetensors"
+    "@db04f0e653473e5c7333c69686ac92b7460b0c1d"
+)
+POCKET_CLONE_URIS = (POCKET_CLONE_MODEL_URI, POCKET_MODEL_URI, POCKET_TOKENIZER_URI)
+
+# Fixed container path of the identity clip `--voice-clip` mounts read-only for `pocket-clone`.
+CONTAINER_VOICE_CLIP = "/voice/identity.wav"
 
 # Values `pocket_tts.utils.utils.download_if_necessary` fetches rather than opens.
 _REMOTE_PREFIXES = ("hf://", "http://", "https://")
@@ -254,6 +276,13 @@ class PocketEngine(StockVoiceEngine):
     """
 
     def _load_model(self) -> object:
+        model = self._load_local_model()
+        # The state upstream leaves after loading this same file through its fallback.
+        model.has_voice_cloning = False
+        return model
+
+    def _load_local_model(self) -> object:
+        """`TTSModel.load_model` on `_local_config`'s copy of the installed config."""
         torch = self._import("torch")
         torch.set_num_threads(int(self._cfg["threads"]))
         package = self._import("pocket_tts")
@@ -267,8 +296,6 @@ class PocketEngine(StockVoiceEngine):
             # `load_config` reads the file during this call. The model keeps its path as
             # `origin`, read only for a voice passed by name, which this adapter never does.
             model = package.TTSModel.load_model(config=path)
-        # The state upstream leaves after loading this same file through its fallback.
-        model.has_voice_cloning = False
         self.sample_rate = int(model.sample_rate)
         self.streaming = callable(getattr(model, POCKET_STREAM_METHOD, None))
         return model
@@ -339,11 +366,126 @@ class PocketEngine(StockVoiceEngine):
         yield to_mono(self._model.generate_audio(self._voice_state, text), self._import)
 
 
+def _hf_local_path(uri: str, models_dir: Path) -> Path:
+    """`hf://<org>/<repo>/<path>@<revision>` as `<models dir>/<org>/<repo>/<path>`."""
+    org, repo, *path = uri.removeprefix("hf://").rsplit("@", 1)[0].split("/")
+    return models_dir.joinpath(org, repo, *path)
+
+
+class PocketCloneEngine(PocketEngine):
+    """Pocket TTS on the CPU with voice cloning on, speaking as the mounted identity clip.
+
+    The gated repository's cloning model is the one 4.0.1 loads from `weights_path`, so the copy
+    maps that URI and the other two to their mounted snapshots and keeps cloning on. A model that
+    loads without cloning anyway is refused: it cannot speak as the clip.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        cfg: Mapping[str, object],
+        *,
+        models_dir: Path = Path(CONTAINER_MODELS_DIR),
+        importer: Importer = importlib.import_module,
+        voice_clip: Path = Path(CONTAINER_VOICE_CLIP),
+    ):
+        super().__init__(name, cfg, models_dir=models_dir, importer=importer)
+        self.voice_clip = voice_clip
+
+    def _load_model(self) -> object:
+        model = self._load_local_model()
+        if getattr(model, "has_voice_cloning", None) is not True:
+            raise core.SpeechBenchError(f"{self.name}: the model loaded without voice cloning")
+        return model
+
+    def _local_config(self, installed: object) -> dict:
+        """A copy of the installed config whose three `hf://` URIs are the mounted snapshots.
+
+        Raises:
+            SpeechBenchError: the installed config does not name 4.0.1's three URIs where 4.0.1
+                does, a mapped file is missing, or the copy still names a remote file.
+        """
+        name = f"{self.name}: the installed {POCKET_CONFIG}"
+        if not isinstance(installed, dict):
+            raise core.SpeechBenchError(f"{name} is not a mapping")
+        flow_lm, mimi = installed.get("flow_lm"), installed.get("mimi")
+        if not isinstance(flow_lm, dict) or not isinstance(mimi, dict):
+            raise core.SpeechBenchError(f"{name} has no `flow_lm` or `mimi` section")
+        lookup_table = flow_lm.get("lookup_table")
+        if not isinstance(lookup_table, dict):
+            raise core.SpeechBenchError(f"{name} has no `flow_lm.lookup_table` section")
+        for key, found, expected in (
+            ("weights_path", installed.get("weights_path"), POCKET_CLONE_MODEL_URI),
+            (
+                "weights_path_without_voice_cloning",
+                installed.get("weights_path_without_voice_cloning"),
+                POCKET_MODEL_URI,
+            ),
+            (
+                "flow_lm.lookup_table.tokenizer_path",
+                lookup_table.get("tokenizer_path"),
+                POCKET_TOKENIZER_URI,
+            ),
+        ):
+            if found != expected:
+                raise core.SpeechBenchError(
+                    f"{name} has {key} {found!r}; this adapter loads only {expected!r}, "
+                    "the value of Pocket TTS 4.0.1"
+                )
+        for section, values in (("flow_lm", flow_lm), ("mimi", mimi)):
+            if values.get("weights_path") is not None:
+                raise core.SpeechBenchError(
+                    f"{name} sets {section}.weights_path; Pocket TTS 4.0.1 leaves it unset"
+                )
+        local = {uri: _hf_local_path(uri, self._models_dir) for uri in POCKET_CLONE_URIS}
+        for path in local.values():
+            if not path.is_file():
+                raise core.SpeechBenchError(f"{self.name}: {path} is not in the mounted weights")
+        config = copy.deepcopy(installed)
+        config["weights_path"] = str(local[POCKET_CLONE_MODEL_URI])
+        config["weights_path_without_voice_cloning"] = str(local[POCKET_MODEL_URI])
+        config["flow_lm"]["lookup_table"]["tokenizer_path"] = str(local[POCKET_TOKENIZER_URI])
+        remote = sorted({s for s in _strings(config) if s.startswith(_REMOTE_PREFIXES)})
+        if remote:
+            raise core.SpeechBenchError(f"{name} still names remote files: {remote}")
+        return config
+
+    def _select_voice(self, voice: str) -> None:
+        # A `Path` not ending in `.safetensors` is read as audio to clone.
+        if not self.voice_clip.is_file():
+            raise VoiceError(
+                f"{self.name}: no identity clip is mounted at {self.voice_clip}; "
+                "run with --voice-clip"
+            )
+        self._voice_state = self._model.get_state_for_audio_prompt(self.voice_clip)
+
+
+class Qwen3DesignEngine(StockVoiceEngine):
+    """Qwen3-TTS 1.7B VoiceDesign through `qwen_tts`, voicing every text from one description.
+
+    Each call designs its voice afresh, so torch is seeded with the arm's seed before every call,
+    as the voice-design tool seeds each candidate. Whole-segment: it yields once per text.
+    """
+
+    def _load_model(self) -> object:
+        return design_probe.Designer(self.weights_dir(), self._import)
+
+    def _stream(self, text: str) -> Iterator[numpy.ndarray]:
+        params = self.params()
+        audio, rate = self._model.design(
+            description=str(params["instruct"]), text=text, seed=int(params["seed"])
+        )
+        self.sample_rate = int(rate)
+        yield to_mono(audio, self._import)
+
+
 ADAPTERS: dict[str, type[StockVoiceEngine]] = {
     "qwen3": Qwen3Engine,
     "turbo": TurboEngine,
     "original": OriginalEngine,
     "pocket": PocketEngine,
+    "pocket-clone": PocketCloneEngine,
+    "qwen3-design": Qwen3DesignEngine,
 }
 
 

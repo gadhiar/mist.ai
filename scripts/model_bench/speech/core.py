@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -108,6 +108,13 @@ class StreamError(SpeechBenchError):
 
 class PrefixError(SpeechBenchError):
     """The prefix builder could not land within tolerance of its token target."""
+
+
+class VoiceClipError(SpeechBenchError):
+    """A `--voice-clip` request refused before any container starts (exit 2).
+
+    Its message never holds the clip's path, which may name the private identity root.
+    """
 
 
 class ServeFailedError(SpeechBenchError):
@@ -369,6 +376,62 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# The identity clip `pocket-clone` clones (`--voice-clip` on `tts` and `chain`)
+# ---------------------------------------------------------------------------
+
+# The one arm that takes a clip, the voice name its results record, and what a printed plan shows
+# in place of the clip's host path.
+VOICE_CLIP_ENGINE = "pocket-clone"
+IDENTITY_VOICE = "identity"
+VOICE_CLIP_PLACEHOLDER = "<voice-clip>"
+VOICE_CLIP_SUFFIX = ".wav"
+CLIP_SHA_CHARS = 12
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceClip:
+    """A checked identity clip: its resolved path, kept out of `repr`, and its sha256 prefix."""
+
+    path: Path = field(repr=False)
+    sha256_prefix: str
+
+
+def check_voice_clip(path: Path, *, repo_root: Path = REPO_ROOT) -> VoiceClip:
+    """The clip `--voice-clip` names, refusing one that is missing, not a WAV, or committed.
+
+    Only its bytes are read, to fingerprint it; nothing beside it (such as a transcript) is
+    opened, and nothing is written near it. Refusals never name the path.
+
+    Raises:
+        VoiceClipError: the path is not a file, not a `.wav`, or lies inside the checkout.
+    """
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise VoiceClipError("--voice-clip names no file; give the identity clip's WAV")
+    if resolved.suffix.lower() != VOICE_CLIP_SUFFIX:
+        raise VoiceClipError(f"--voice-clip must be a {VOICE_CLIP_SUFFIX} file")
+    if resolved.is_relative_to(repo_root.resolve()):
+        raise VoiceClipError(
+            "--voice-clip lies inside the git checkout; an identity clip stays outside it"
+        )
+    return VoiceClip(resolved, sha256_file(resolved)[:CLIP_SHA_CHARS])
+
+
+def check_voice_clip_use(engines: Sequence[str], clip: object | None) -> None:
+    """A clip goes with `pocket-clone` and only with it.
+
+    Raises:
+        VoiceClipError: `pocket-clone` runs without a clip, or a clip is given to a run without it.
+    """
+    if VOICE_CLIP_ENGINE in engines and clip is None:
+        raise VoiceClipError(f"{VOICE_CLIP_ENGINE} clones a voice and needs --voice-clip")
+    if clip is not None and VOICE_CLIP_ENGINE not in engines:
+        raise VoiceClipError(
+            f"--voice-clip is for {VOICE_CLIP_ENGINE} only, and this run does not include it"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1133,6 +1196,7 @@ class PlanContext:
     small_models_dir: str = "<small-models-dir>"
     speech_models_dir: str = "<speech-models-dir>"
     pins_path: str = "<results-root>/<run>/speech/host/pins.json"
+    voice_clip: str = VOICE_CLIP_PLACEHOLDER
 
 
 def build_plan_context(repo_root: Path = REPO_ROOT) -> PlanContext:

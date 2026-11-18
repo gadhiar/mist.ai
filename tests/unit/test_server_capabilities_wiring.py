@@ -29,6 +29,7 @@ from backend.capabilities.secrets import Secret, SecretRegistry
 from backend.factories import CapabilityBuild
 from backend.health import BroadcasterState, HealthProbeSettings
 from tests.unit.capabilities.fakes import make_tool_spec
+from tests.unit.test_server_health_wiring import fake_mist_runtime
 
 AT = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
 TOKEN = "ha-secret-token-0123456789"  # noqa: S105 - a fake token for the redaction check
@@ -264,28 +265,33 @@ class TestEndpointOrigin:
 
 class TestPorts:
     def test_the_decode_is_unavailable_until_the_provider_exists(self, monkeypatch):
-        monkeypatch.setattr(server, "voice_processor", SimpleNamespace())
+        monkeypatch.setattr(server, "runtime", None)
         tiers = server._capability_tiers(FixedPower("full"))
 
         before = tiers.provider("interaction")
         provider = object()
-        server.voice_processor._llm_provider = provider
+        monkeypatch.setattr(server, "runtime", SimpleNamespace(llm_provider=provider))
 
         assert before is None
         assert tiers.provider("interaction") is provider
         assert tiers.provider("smart") is provider
 
     def test_no_tier_serves_at_off(self, monkeypatch):
-        monkeypatch.setattr(server, "voice_processor", SimpleNamespace(_llm_provider=object()))
+        monkeypatch.setattr(server, "runtime", SimpleNamespace(llm_provider=object()))
 
         assert server._capability_tiers(FixedPower("off")).provider("interaction") is None
 
-    def test_the_desktop_is_present_while_a_connection_is_open(self, monkeypatch):
-        connections: set[object] = set()
-        monkeypatch.setattr(server, "active_connections", connections)
+    def test_the_desktop_is_present_while_a_desktop_session_is_open(self, monkeypatch):
+        endpoints: list[str] = []
+        registry = SimpleNamespace(endpoint_present=lambda endpoint: endpoint in endpoints)
+        monkeypatch.setattr(server, "session_registry", None)
 
         assert server._desktop_present() is False
-        connections.add(object())
+        monkeypatch.setattr(server, "session_registry", registry)
+        assert server._desktop_present() is False
+        endpoints.append("room")
+        assert server._desktop_present() is False
+        endpoints.append("desktop")
         assert server._desktop_present() is True
 
 
@@ -311,7 +317,7 @@ class TestHealthCheck:
 
     @pytest.mark.asyncio
     async def test_the_check_reads_the_host_at_each_run(self, executor, monkeypatch):
-        monkeypatch.setattr(server, "voice_processor", None)
+        monkeypatch.setattr(server, "runtime", None)
         monkeypatch.setattr(server, "extraction_dispatcher", None)
         monkeypatch.setattr(server, "_capability_build", None)
         registry = self._registry(executor, server._capability_host)
@@ -348,14 +354,6 @@ class FakeHandler:
         self.attached = (host, tiers)
 
 
-class FakeModels:
-    def __init__(self, handler: FakeHandler) -> None:
-        self.knowledge = SimpleNamespace(conversation_handler=handler)
-
-    def shutdown(self) -> None:
-        return None
-
-
 class FakeScheduler:
     async def start(self) -> bool:
         return False
@@ -368,7 +366,9 @@ class FakeScheduler:
 def lifespan_rig(monkeypatch, tmp_path):
     """Run the real `lifespan` with capabilities enabled and nothing else behind it."""
     for name in (
-        "voice_processor",
+        "runtime",
+        "session_registry",
+        "_capability_sink",
         "curation_scheduler",
         "log_handler",
         "extraction_dispatcher",
@@ -389,22 +389,27 @@ def lifespan_rig(monkeypatch, tmp_path):
     ):
         monkeypatch.setattr(server, name, getattr(server, name))
     events: list[str] = []
-    rig = SimpleNamespace(events=events, processors=[], handler=FakeHandler(events), builds=[])
+    provider = object()
+    rig = SimpleNamespace(
+        events=events, runtimes=[], handler=FakeHandler(events), builds=[], provider=provider
+    )
 
-    class FakeVoiceProcessor:
-        def __init__(self, config, message_queue, **kwargs) -> None:
-            host = server._capability_host()
-            events.append("voice_processor")
-            self.host_watcher_at_construction = host.stats()["status_watcher"] if host else None
-            self.models = None
-            self.decode_during_initialize: bool | None = None
-            rig.processors.append(self)
-
-        async def initialize(self, *, yielded: bool = False) -> None:
-            host = server._capability_host()
-            self.decode_during_initialize = host.decode_available() if host else None
-            self._llm_provider = object()
-            self.models = FakeModels(rig.handler)
+    def fake_build_mist_runtime(config, **kwargs):
+        """`build_mist_runtime` in place, recording what the host looked like during the load."""
+        host = server._capability_host()
+        events.append("runtime")
+        built = fake_mist_runtime(
+            handler=rig.handler,
+            provider=kwargs["llm_provider"],
+            power_gate=kwargs["power_gate"],
+        )
+        built_view = SimpleNamespace(
+            runtime=built,
+            host_watcher_during_build=host.stats()["status_watcher"] if host else None,
+            decode_during_build=host.decode_available() if host else None,
+        )
+        rig.runtimes.append(built_view)
+        return built
 
     real_build = server.build_capability_host
 
@@ -423,7 +428,8 @@ def lifespan_rig(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "install_log_redaction", lambda registry: events.append("redact"))
     monkeypatch.setattr(server, "build_capability_host", recording_build)
     monkeypatch.setattr(server, "_stop_capability_host", recording_stop)
-    monkeypatch.setattr(server, "VoiceProcessor", FakeVoiceProcessor)
+    monkeypatch.setattr(server, "build_mist_runtime", fake_build_mist_runtime)
+    monkeypatch.setattr(server, "build_llm_provider", lambda config, **kwargs: provider)
     monkeypatch.setattr(server, "message_queue", asyncio.Queue())
     monkeypatch.setattr(server, "configure_file_logging", lambda log_dir: None)
     monkeypatch.setattr(server, "build_vault_writer", lambda *a, **k: None)
@@ -452,8 +458,8 @@ class TestLifespan:
     ):
         async with server.lifespan(server.app):
             host = server._capability_host()
-            processor = lifespan_rig.processors[0]
-            decode_after_initialize = host.decode_available()
+            built = lifespan_rig.runtimes[0]
+            decode_after_build = host.decode_available()
             checks = server._health_registry.snapshot()["checks"]
             body = server._capabilities_payload()
             lifespan_rig.events.append("serving")
@@ -463,17 +469,18 @@ class TestLifespan:
         assert lifespan_rig.events == [
             "redact",
             "build",
-            "voice_processor",
+            "runtime",
             "attach",
             "serving",
             "stop",
         ]
-        assert processor.host_watcher_at_construction == "running"
-        assert processor.decode_during_initialize is False
-        assert decode_after_initialize is True
+        assert built.host_watcher_during_build == "running"
+        assert built.decode_during_build is False
+        assert decode_after_build is True
         attached_host, attached_tiers = lifespan_rig.handler.attached
         assert attached_host is host
-        assert attached_tiers.provider("interaction") is processor._llm_provider
+        assert attached_tiers.provider("interaction") is built.runtime.llm_provider
+        assert built.runtime.llm_provider is lifespan_rig.provider
         assert checks["capabilities"]["restart_repairs"] is False
         assert body["enabled"] is True
         assert [c["name"] for c in body["capabilities"]] == ["clock", "timers"]

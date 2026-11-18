@@ -1,14 +1,18 @@
-"""WebSocket protocol 1.4.0 capability messages on the real `websocket_endpoint` (build T14).
+"""The capability messages on the real `websocket_endpoint` (build T14, served by sessions in T13).
 
-Every test drives `server.websocket_endpoint` over the scripted fake websocket of
-`tests/unit/test_session_id_propagation.py`. The capability host is a real `CapabilityHost`
-over fake capabilities and a scripted alarm control, reached through `_capability_build` as
-`lifespan` leaves it, so the server's own wiring is what runs.
+Every test drives `server.websocket_endpoint` with one `RealtimeSession` per connection, over
+the fakes of `tests/unit/test_session_id_propagation.py`. The capability host is a real
+`CapabilityHost` over fake capabilities and a scripted alarm control, reached through
+`_capability_build` as `lifespan` leaves it, so the server's own wiring is what runs.
 
-The containment rule these pin: the receive loop's catch-all `except Exception` ends the
-connection, so no capability exception may reach it. A failing capability call is answered on
-its socket and the loop goes on to the next message; a `reset_vad` later in the same script is
-the witness that the loop survived.
+The containment rule these pin: no capability exception may reach the session. A failing
+capability call is answered on its connection and the session goes on to the next message; a
+`log_config` later in the same script, answered with its `log_config_ack`, is the witness that
+the session survived.
+
+The session validates each message against the wire contract (`backend/realtime/protocol.py`)
+before it reaches the server, so a malformed capability message is a `protocol` error from the
+session; protocol 1.4.0's server answered it with a `validation` error.
 """
 
 from __future__ import annotations
@@ -36,18 +40,20 @@ from backend.chat.context_budget import ApproximateTokenCounter
 from backend.errors import CapabilityStoreError, CapabilityUnavailableError
 from backend.factories import CapabilityBuild
 from tests.unit.capabilities.fakes import FakeCapability, FakeClock, RecordingEventSink
-from tests.unit.test_session_id_propagation import (
+from tests.unit.test_session_id_propagation import (  # noqa: F401 -- autouse fixtures
     FakeWebSocket,
     RecordingConversationHandler,
-    build_voice_processor,
-    reset_session_context,  # noqa: F401 -- autouse fixture, applied by import
+    connect,
+    install_runtime,
+    no_runtime,
+    reset_session_context,
     run_endpoint,
 )
 
 TOKEN = "tok-3c7d9e1f"
 SERVER_LOGGER = "backend.server"
-RESET_VAD = {"type": "reset_vad"}
-VAD_RESET_ANSWER = {"type": "status", "message": "VAD reset"}
+WITNESS = {"type": "log_config", "action": "set_level", "level": "INFO", "logger": "x.y"}
+WITNESS_ANSWER = {"type": "log_config_ack", "logger": "x.y", "level": "INFO"}
 
 AlarmAction = Literal["stop", "snooze", "dismiss"]
 
@@ -234,8 +240,8 @@ def no_host(monkeypatch):
 
 def _after_handshake(ws: FakeWebSocket) -> list[dict]:
     """The frames sent after `session_started`, which must be the first frame."""
-    assert ws.sent[0]["type"] == "session_started", ws.sent
-    return ws.sent[1:]
+    assert ws.frames[0]["type"] == "session_started", ws.frames
+    return ws.frames[1:]
 
 
 def _of_type(frames: list[dict], event_type: str) -> list[dict]:
@@ -278,9 +284,14 @@ def _alarm_report(**fields: object) -> dict[str, object]:
 async def _run(
     monkeypatch, inbound: list[dict], handler: RecordingConversationHandler | None = None
 ):
-    handler = handler or DecidingHandler()
-    vp = build_voice_processor(handler, asyncio.get_running_loop())
-    return await run_endpoint(monkeypatch, vp, inbound)
+    return await run_endpoint(monkeypatch, handler or DecidingHandler(), inbound)
+
+
+def _protocol_error(frames: list[dict]) -> dict:
+    """The one frame, which must be the session's `protocol` error for a malformed message."""
+    (error,) = frames
+    assert (error["type"], error["kind"], error["retriable"]) == ("error", "protocol", False)
+    return error
 
 
 # -- Connect snapshot ------------------------------------------------------------------------
@@ -304,7 +315,7 @@ class TestConnectSnapshot:
     async def test_status_carries_the_power_level_and_decode_availability(self, monkeypatch, rig):
         ws = await _run(monkeypatch, [])
 
-        (status,) = _of_type(ws.sent, "capabilities_status")
+        (status,) = _of_type(ws.frames, "capabilities_status")
         assert status["power_level"] == "full"
         assert status["decode_available"] is True
         assert [c["name"] for c in status["capabilities"]] == ["alarms"]
@@ -323,7 +334,7 @@ class TestConnectSnapshot:
     ):
         rig.control.snapshot_error = RuntimeError(f"store exploded {TOKEN}")
 
-        ws = await _run(monkeypatch, [RESET_VAD])
+        ws = await _run(monkeypatch, [WITNESS])
 
         frames = _after_handshake(ws)
         assert frames[0] == {
@@ -333,33 +344,30 @@ class TestConnectSnapshot:
             "retriable": False,
             "context": None,
         }
-        assert TOKEN not in json.dumps(ws.sent)
-        assert frames[1:] == [VAD_RESET_ANSWER]
+        assert TOKEN not in json.dumps(ws.frames)
+        assert frames[1:] == [WITNESS_ANSWER]
 
     @pytest.mark.asyncio
     async def test_a_send_to_a_gone_client_takes_the_disconnect_path(
         self, monkeypatch, rig, caplog
     ):
-        from backend import server
-
         class GoneOnSnapshot(FakeWebSocket):
-            async def send_json(self, payload: dict) -> None:
-                if payload.get("type") == "capabilities_status":
+            async def _write(self, item: object) -> None:
+                if isinstance(item, dict) and item.get("type") == "capabilities_status":
                     raise WebSocketDisconnect(code=1001)
-                await super().send_json(payload)
+                await super()._write(item)
 
         handler = DecidingHandler()
-        vp = build_voice_processor(handler, asyncio.get_running_loop())
-        monkeypatch.setattr(server, "voice_processor", vp)
-        monkeypatch.setattr(server, "log_handler", None)
-        ws = GoneOnSnapshot([RESET_VAD])
+        endpoint = install_runtime(monkeypatch, handler)
+        ws = GoneOnSnapshot()
 
         with caplog.at_level(logging.INFO, logger=SERVER_LOGGER):
-            await server.websocket_endpoint(ws)
+            connection = await connect(ws)
+            await asyncio.wait_for(connection.task, timeout=5)
 
         assert handler.ended_sessions == [ws.handshake_session_id]
-        assert ws not in server.active_connections
-        assert [f["type"] for f in ws.sent] == ["session_started"]
+        assert endpoint.registry.count() == 0
+        assert [f["type"] for f in ws.frames] == ["session_started"]
         assert not [r for r in caplog.records if r.getMessage().startswith("WebSocket error")]
 
 
@@ -373,7 +381,7 @@ class TestContainment:
         handler.decide_error = RuntimeError(f"decide blew up {TOKEN}")
         decision = {"type": "action_decision", "proposal_id": "p1", "decision": "approve"}
 
-        ws = await _run(monkeypatch, [decision, RESET_VAD], handler)
+        ws = await _run(monkeypatch, [decision, WITNESS], handler)
 
         frames = _without_snapshot(_after_handshake(ws))
         assert frames == [
@@ -384,7 +392,7 @@ class TestContainment:
                 "retriable": False,
                 "context": None,
             },
-            VAD_RESET_ANSWER,
+            WITNESS_ANSWER,
         ]
         assert handler.ended_sessions == [ws.handshake_session_id]
 
@@ -411,9 +419,9 @@ class TestContainment:
         handler.decide_error = asyncio.CancelledError()
         decision = {"type": "action_decision", "proposal_id": "p1", "decision": "approve"}
 
-        ws = await _run(monkeypatch, [decision, RESET_VAD], handler)
+        ws = await _run(monkeypatch, [decision, WITNESS], handler)
 
-        assert _without_snapshot(_after_handshake(ws)) == [VAD_RESET_ANSWER]
+        assert _without_snapshot(_after_handshake(ws)) == [WITNESS_ANSWER]
         assert _broadcast() == []
 
     @pytest.mark.asyncio
@@ -422,53 +430,56 @@ class TestContainment:
 
         handler = DecidingHandler()
         handler.decide_gate = asyncio.Event()
-        vp = build_voice_processor(handler, asyncio.get_running_loop())
-        monkeypatch.setattr(server, "voice_processor", vp)
-        monkeypatch.setattr(server, "log_handler", None)
-        ws = FakeWebSocket([{"type": "action_decision", "proposal_id": "p1", "decision": "reject"}])
+        install_runtime(monkeypatch, handler)
+        connection = await connect()
+        ws = connection.ws
+        ws.text({"type": "action_decision", "proposal_id": "p1", "decision": "reject"})
 
-        endpoint = asyncio.create_task(server.websocket_endpoint(ws))
         await asyncio.wait_for(handler.decide_started.wait(), timeout=5.0)
-        endpoint.cancel()
+        connection.task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await endpoint
+            await connection.task
         for _ in range(10):
             await asyncio.sleep(0)
 
         assert handler.decide_cancelled, "the capability call outlived its connection"
         assert _without_snapshot(_after_handshake(ws)) == []
+        assert server._capability_tasks == {}
+        assert handler.ended_sessions == [ws.handshake_session_id]
 
     @pytest.mark.asyncio
     async def test_the_connection_stays_registered_until_the_script_ends(self, monkeypatch, rig):
         from backend import server
 
         class Tracking(FakeWebSocket):
-            def __init__(self, inbound: list[dict]) -> None:
-                super().__init__(inbound)
+            def __init__(self) -> None:
+                super().__init__()
                 self.registered: list[bool] = []
 
-            async def receive_json(self) -> dict:
-                self.registered.append(self in server.active_connections)
-                return await super().receive_json()
+            async def receive(self) -> dict[str, object]:
+                registry = server.session_registry
+                self.registered.append(registry is not None and registry.count() == 1)
+                return await super().receive()
 
         rig.control.act_error = RuntimeError("act blew up")
         handler = DecidingHandler()
         handler.decide_error = RuntimeError("decide blew up")
-        vp = build_voice_processor(handler, asyncio.get_running_loop())
-        monkeypatch.setattr(server, "voice_processor", vp)
-        monkeypatch.setattr(server, "log_handler", None)
-        ws = Tracking(
+        endpoint = install_runtime(monkeypatch, handler)
+        ws = Tracking()
+
+        await run_endpoint(
+            monkeypatch,
+            None,
             [
                 {"type": "action_decision", "proposal_id": "p1", "decision": "approve"},
                 _alarm_action(request_id="r1"),
-                RESET_VAD,
-            ]
+                WITNESS,
+            ],
+            ws=ws,
         )
 
-        await server.websocket_endpoint(ws)
-
         assert ws.registered == [True, True, True, True]
-        assert ws not in server.active_connections
+        assert endpoint.registry.count() == 0
         assert handler.ended_sessions == [ws.handshake_session_id]
 
 
@@ -498,16 +509,13 @@ class TestActionDecision:
         assert _without_snapshot(_after_handshake(ws)) == []
 
     @pytest.mark.asyncio
-    async def test_an_invalid_decision_is_a_validation_error(self, monkeypatch, rig):
+    async def test_an_invalid_decision_is_a_protocol_error(self, monkeypatch, rig):
         handler = DecidingHandler()
         decision = {"type": "action_decision", "proposal_id": "p1", "decision": "maybe"}
 
         ws = await _run(monkeypatch, [decision], handler)
 
-        (error,) = _without_snapshot(_after_handshake(ws))
-        assert error["type"] == "error"
-        assert error["kind"] == "validation"
-        assert error["retriable"] is False
+        error = _protocol_error(_without_snapshot(_after_handshake(ws)))
         assert "decision" in error["message"]
         assert handler.decisions == []
 
@@ -517,9 +525,9 @@ class TestActionDecision:
 
 class TestAlarmAction:
     async def _result(self, monkeypatch, message: dict[str, object]) -> dict:
-        ws = await _run(monkeypatch, [message, RESET_VAD])
+        ws = await _run(monkeypatch, [message, WITNESS])
         frames = _without_snapshot(_after_handshake(ws))
-        assert frames[-1] == VAD_RESET_ANSWER
+        assert frames[-1] == WITNESS_ANSWER
         (result,) = frames[:-1]
         assert result["type"] == "alarm_action_result"
         assert _broadcast() == [], "the result goes to the requesting socket only"
@@ -586,7 +594,7 @@ class TestAlarmAction:
     ):
         rig.control.act_error = RuntimeError(f"act blew up {TOKEN}")
 
-        ws = await _run(monkeypatch, [_alarm_action(request_id="req-9"), RESET_VAD])
+        ws = await _run(monkeypatch, [_alarm_action(request_id="req-9"), WITNESS])
 
         frames = _without_snapshot(_after_handshake(ws))
         assert _of_type(frames, "error") == []
@@ -594,8 +602,8 @@ class TestAlarmAction:
         assert result["request_id"] == "req-9"
         assert result["outcome"] == "failed"
         assert result["reason"] == "RuntimeError: act blew up ***"
-        assert TOKEN not in json.dumps(ws.sent)
-        assert frames[-1] == VAD_RESET_ANSWER
+        assert TOKEN not in json.dumps(ws.frames)
+        assert frames[-1] == WITNESS_ANSWER
 
     @pytest.mark.asyncio
     async def test_no_request_id_key_when_the_client_sent_none(self, monkeypatch, rig):
@@ -615,14 +623,12 @@ class TestAlarmAction:
             {"alarm_id": None},
         ],
     )
-    async def test_an_invalid_action_is_a_validation_error_and_no_result(
+    async def test_an_invalid_action_is_a_protocol_error_and_no_result(
         self, monkeypatch, rig, change
     ):
         ws = await _run(monkeypatch, [_alarm_action(**change)])
 
-        (error,) = _without_snapshot(_after_handshake(ws))
-        assert error["type"] == "error"
-        assert error["kind"] == "validation"
+        _protocol_error(_without_snapshot(_after_handshake(ws)))
         assert rig.control.acts == []
 
 
@@ -631,9 +637,9 @@ class TestAlarmAction:
 
 class TestAlarmReport:
     async def _result(self, monkeypatch, message: dict[str, object]) -> dict:
-        ws = await _run(monkeypatch, [message, RESET_VAD])
+        ws = await _run(monkeypatch, [message, WITNESS])
         frames = _without_snapshot(_after_handshake(ws))
-        assert frames[-1] == VAD_RESET_ANSWER
+        assert frames[-1] == WITNESS_ANSWER
         (result,) = frames[:-1]
         assert result["type"] == "alarm_action_result"
         return result
@@ -676,8 +682,7 @@ class TestAlarmReport:
     async def test_a_payload_endpoint_is_refused_as_an_unknown_field(self, monkeypatch, rig):
         ws = await _run(monkeypatch, [_alarm_report(endpoint="room")])
 
-        (error,) = _without_snapshot(_after_handshake(ws))
-        assert (error["type"], error["kind"]) == ("error", "validation")
+        error = _protocol_error(_without_snapshot(_after_handshake(ws)))
         assert "endpoint" in error["message"]
         assert rig.control.reports == []
 
@@ -702,9 +707,9 @@ class TestAlarmReport:
 class TestNoHost:
     @pytest.mark.asyncio
     async def test_nothing_extra_is_sent_on_connect(self, monkeypatch, no_host):
-        ws = await _run(monkeypatch, [RESET_VAD])
+        ws = await _run(monkeypatch, [WITNESS])
 
-        assert _after_handshake(ws) == [VAD_RESET_ANSWER]
+        assert _after_handshake(ws) == [WITNESS_ANSWER]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -712,7 +717,14 @@ class TestNoHost:
         [
             {"type": "action_decision", "proposal_id": "p1", "decision": "approve"},
             {"type": "alarm_action", "alarm_id": "a1", "action": "stop"},
-            {"type": "alarm_report", "alarm_id": "a1", "outcome": "rang"},
+            # Its `at` and `rang_at` are required on the wire, so the session hands it over.
+            {
+                "type": "alarm_report",
+                "alarm_id": "a1",
+                "outcome": "rang",
+                "at": "2026-01-05T07:00:00Z",
+                "rang_at": "2026-01-05T07:00:00Z",
+            },
         ],
     )
     async def test_capability_messages_answer_capabilities_disabled(
@@ -720,7 +732,7 @@ class TestNoHost:
     ):
         handler = DecidingHandler()
 
-        ws = await _run(monkeypatch, [message, RESET_VAD], handler)
+        ws = await _run(monkeypatch, [message, WITNESS], handler)
 
         assert _after_handshake(ws) == [
             {
@@ -730,7 +742,7 @@ class TestNoHost:
                 "retriable": False,
                 "context": None,
             },
-            VAD_RESET_ANSWER,
+            WITNESS_ANSWER,
         ]
         assert handler.decisions == []
 

@@ -7,8 +7,10 @@ passing when they land.
 
 from __future__ import annotations
 
+import math
 import sys
 import types
+import wave
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -78,7 +80,7 @@ def test_registry_lists_the_suite_modules_and_their_subcommands_in_order():
         ("turn_suite", ("turn",)),
         ("cache_suite", ("cache",)),
         ("fit_suite", ("fit",)),
-        ("listening", ("listen-pack",)),
+        ("listening", ("listen-pack", "reply-ab")),
         ("lowtier_suite", ("lowtier", "remote-memory")),
         ("chain", ("chain",)),
         ("game_suite", ("game-session",)),
@@ -327,10 +329,157 @@ FORBIDDEN_OPTION_PARTS = (
 )
 
 
-def test_no_registered_subcommand_has_an_option_that_takes_a_voice_sample():
-    options = speech_bench.all_option_strings(speech_bench.build_parser())
+# The owner's ruling of 12 Nov allows one cloned arm, `pocket-clone`, which clones a private
+# identity clip named at run time and kept outside the checkout. So exactly one option that takes
+# a voice sample exists: `--voice-clip`, on the three subcommands that can run that arm, `tts`,
+# `chain` and `reply-ab` (which voices both replies of an item with it). Any other option holding
+# a listed part, or `--voice-clip` anywhere else, still fails.
+ALLOWED_VOICE_SAMPLE_OPTIONS = {
+    "tts": {"voice-clip"},
+    "chain": {"voice-clip"},
+    "reply-ab": {"voice-clip"},
+}
 
-    normalised = {opt.lstrip("-").replace("_", "-").lower() for opt in options}
-    hits = sorted(o for o in normalised for part in FORBIDDEN_OPTION_PARTS if part in o)
+
+def _normalised(options):
+    return {opt.lstrip("-").replace("_", "-").lower() for opt in options}
+
+
+def _hits(options, allowed=frozenset()):
+    return sorted(
+        o
+        for o in _normalised(options) - set(allowed)
+        if any(part in o for part in FORBIDDEN_OPTION_PARTS)
+    )
+
+
+def test_no_option_takes_a_voice_sample_but_voice_clip_on_tts_chain_and_reply_ab():
+    parser = speech_bench.build_parser()
+    top = {opt for action in parser._actions for opt in action.option_strings}
+    hits = [f"(top) {o}" for o in _hits(top)]
+    subcommands = speech_bench.subcommand_parsers(parser)
+    for name, sub in subcommands.items():
+        allowed = ALLOWED_VOICE_SAMPLE_OPTIONS.get(name, set())
+        hits += [f"{name} {o}" for o in _hits(speech_bench.all_option_strings(sub), allowed)]
+
     assert hits == []
-    assert "host-1070-script" in normalised
+    for name in ALLOWED_VOICE_SAMPLE_OPTIONS:
+        assert "voice-clip" in _normalised(speech_bench.all_option_strings(subcommands[name]))
+    assert "host-1070-script" in _normalised(speech_bench.all_option_strings(parser))
+
+
+def test_the_narrowed_check_still_fails_on_any_other_voice_sample_option():
+    assert _hits({"--voice-clip"}) == ["voice-clip"]
+    assert _hits({"--voice-clip", "--clone-from"}, {"voice-clip"}) == ["clone-from"]
+    assert _hits({"--speaker-wav", "--voice-clip"}, {"voice-clip"}) == ["speaker-wav"]
+
+
+# ---------------------------------------------------------------------------
+# --voice-clip misuse exits 2 before any container starts
+# ---------------------------------------------------------------------------
+
+TRANSCRIPT = "the quartz heron counted nine amber lanterns"
+
+
+def write_identity_clip(root: Path) -> Path:
+    """A sine tone standing in for the identity clip, with a transcript beside it."""
+    folder = root / "private-identity"
+    folder.mkdir(parents=True)
+    clip = folder / "identity.wav"
+    samples = (round(8000 * math.sin(2 * math.pi * 220 * i / 24000)) for i in range(2400))
+    with wave.open(str(clip), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(24000)
+        out.writeframes(b"".join(s.to_bytes(2, "little", signed=True) for s in samples))
+    (folder / "clip.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    return clip
+
+
+def _explode(*args, **kwargs):
+    raise AssertionError("a container would have started")
+
+
+class ExplodingRunner:
+    """A container runner that may be built but fails the test if it runs anything."""
+
+    run = staticmethod(_explode)
+
+
+MISUSES = {
+    "clone-without-clip": ("pocket-clone", None),
+    "missing-clip": ("pocket-clone", "absent.wav"),
+    "clip-with-another-engine": ("pocket", "identity.wav"),
+}
+
+
+def _misuse_argv(tmp_path, subcommand, case):
+    clip = write_identity_clip(tmp_path)
+    engine, clip_name = MISUSES[case]
+    common = ["--results-root", str(tmp_path / "results"), "--run", "mh1"]
+    common += ["--speech-models-dir", str(tmp_path)]
+    if subcommand == "tts":
+        argv = ["tts", *common, "--engine", engine]
+    else:
+        argv = ["chain", *common, "--model", "gemma4-e2b", "--placement", "gpu-full"]
+        argv += ["--material-dir", str(tmp_path), "--tts-engine", engine]
+    if clip_name is not None:
+        argv += ["--voice-clip", str(clip.parent / clip_name)]
+    return argv, clip
+
+
+@pytest.mark.parametrize("case", sorted(MISUSES))
+@pytest.mark.parametrize("subcommand", ["tts", "chain"])
+def test_voice_clip_misuse_exits_2_before_any_container_or_write(
+    tmp_path, monkeypatch, capsys, subcommand, case
+):
+    from scripts.model_bench.speech import chain, tts_suite
+
+    monkeypatch.setattr(tts_suite, "DockerRunner", ExplodingRunner)
+    monkeypatch.setattr(tts_suite.bench_host, "probe_container_state", _explode)
+    monkeypatch.setattr(chain.ChainServices, "default", _explode)
+    monkeypatch.setattr(chain.core, "HostDocker", _explode)
+    argv, clip = _misuse_argv(tmp_path, subcommand, case)
+
+    code = speech_bench.main(argv)
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "[REFUSED]" in captured.out
+    for text in (captured.out, captured.err):
+        for secret in (str(clip), clip.as_posix(), clip.parent.name, TRANSCRIPT):
+            assert secret not in text
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("with_clip", [False, True])
+def test_tts_without_an_engine_runs_pocket_clone_only_with_a_clip(
+    tmp_path, monkeypatch, capsys, with_clip
+):
+    from scripts.model_bench.speech import core, tts_suite
+
+    seen = {}
+
+    def run_tts(request, **kwargs):
+        seen["request"] = request
+        return tmp_path / "tts"
+
+    monkeypatch.setattr(tts_suite, "run_tts", run_tts)
+    clip = write_identity_clip(tmp_path)
+    argv = ["tts", "--results-root", str(tmp_path / "results"), "--run", "mh1"]
+    argv += ["--speech-models-dir", str(tmp_path)]
+    if with_clip:
+        argv += ["--voice-clip", str(clip)]
+
+    code = speech_bench.main(argv)
+
+    assert code == 0
+    request = seen["request"]
+    arms = list(core.load_json(core.SPEECH_ARMS_PATH)["tts"])
+    if with_clip:
+        assert request.engines == tuple(arms)
+        assert request.voice_clip == clip
+    else:
+        assert request.engines == tuple(a for a in arms if a != "pocket-clone")
+        assert request.voice_clip is None
+    assert str(clip.parent) not in capsys.readouterr().out

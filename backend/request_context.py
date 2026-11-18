@@ -1,61 +1,27 @@
 """Request context propagation via contextvars.
 
-Provides a per-request ID, a per-connection session ID, and per-turn result
-side-channels that flow through async and threaded call chains, enabling log
-records to be grouped by conversation turn and each turn to be attributed to
-the WebSocket connection that originated it.
+Provides a per-request ID and a per-connection session ID that flow through
+async and threaded call chains, enabling log records to be grouped by
+conversation turn and each turn to be attributed to the WebSocket connection
+that originated it.
 """
 
 import itertools
 import threading
 from collections.abc import Callable
 from contextvars import ContextVar, copy_context
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from backend.chat.stream_events import Complete
+from typing import Any
 
 current_request_id: ContextVar[str | None] = ContextVar("current_request_id", default=None)
 
-# Per-connection session ID, minted at the WebSocket handshake and read by the
-# conversation pipeline. This is a ContextVar rather than instance state
-# because `voice_processor` is a module-level singleton shared by every
-# connection in `active_connections`: storing the session on the instance lets
-# one connection overwrite another's. Each turn's call chain carries its own
-# value here instead.
+# Per-connection session ID. A ContextVar rather than instance state, so that
+# no object shared by every connection holds one connection's session.
 #
 # Default is None, not a placeholder string. A silently-defaulted session ID
 # is what previously routed every connection into a single session named
 # "default"; consumers must treat None as a wiring error rather than
 # substitute a fallback.
 current_session_id: ContextVar[str | None] = ContextVar("current_session_id", default=None)
-
-# Per-TURN result side-channel. `generate_response_streaming` yields only
-# strings and dicts, but ADR-017's `stream_complete` needs `duration_ms` /
-# `tool_calls_used`, and a bridge timeout needs a discriminated error rather
-# than error text yielded as a fake token. Producer and consumer run on the
-# same thread -- the consumer drives the producer's generator, and a generator
-# body executes in its caller's context -- so a ContextVar carries the value
-# back without the singleton instance attribute these replace.
-#
-# The producer resets both at the top of `generate_response_streaming`, before
-# it yields anything, so a consumer never reads a prior turn's value. No
-# consumer-side reset exists or is needed: `KnowledgeIntegration.enabled` is
-# set once in __init__ and never flips, so the producer either runs on every
-# turn of the process or on none of them -- there is no turn that skips it
-# after another turn set a value. Executor threads ARE pooled and reused with
-# no fresh context, so if `enabled` ever becomes runtime-mutable, that
-# assumption breaks and the consumer must reset again. The pending-input
-# respawn path (`voice_processor.py:745`, inside `spawn_with_context`) also
-# inherits these vars via `copy_context` rather than starting fresh, so it is
-# this producer-side reset-before-first-yield -- not anything on the respawn
-# path -- that keeps a respawned turn from reading the finishing turn's values.
-current_turn_complete: ContextVar["Complete | None"] = ContextVar(
-    "current_turn_complete", default=None
-)
-current_turn_error: ContextVar[tuple[str, str] | None] = ContextVar(
-    "current_turn_error", default=None
-)
 
 _counter = itertools.count(1)
 _counter_lock = threading.Lock()

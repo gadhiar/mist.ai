@@ -755,14 +755,17 @@ read-only; the code those containers run lives in `scripts/model_bench/speech/pr
 container mounts its model files read-only from the speech or small models directory with
 `HF_HUB_OFFLINE=1`, so no container downloads anything. Every engine the suites time speaks in a
 stock voice its package ships, and `voice-design` designs its candidate voices from text
-descriptions: nothing is cloned, and no subcommand takes a voice sample.
+descriptions. The one exception is `pocket-clone`, which clones the identity clip that
+`--voice-clip` names at run time; only `tts`, `chain` and `reply-ab` take that option, the clip
+stays outside the repository, and results record its sha256 prefix, never its path.
 
 Results go to `<results-root>/<run>/speech/`, one directory per suite (`tts/`, `cache/`, `stt/`,
-`turn/`, `fit/`, `lowtier/`, `host1070/`, `chain/`, `game/`, `listening/`), with `host/` holding
-the H1 and H2 records. `voice-design` is the exception: its candidates go to its `--out`
+`turn/`, `fit/`, `lowtier/`, `host1070/`, `chain/`, `game/`, `listening/`, `reply-ab/`), with
+`host/` holding the H1 and H2 records. `voice-design` is the exception: its candidates go to its
+`--out` directory, and `chain --reply-pack` also writes each turn's whole reply to its own new
 directory. A results root inside the repository is refused, as `bench_host` refuses one, as are
-`voice-design`'s inputs and `--out` and a `listen-pack --from-dir` directory inside it, and no
-suite overwrites an earlier run's files.
+`voice-design`'s inputs and `--out`, a `listen-pack --from-dir` directory, a `--reply-pack`
+directory and a `reply-ab` pack inside it, and no suite overwrites an earlier run's files.
 
 ### Subcommands
 
@@ -779,10 +782,11 @@ suite overwrites an earlier run's files.
 | `fit` | Run 5: what fits on the card together, one `bench_host vram-step` per combination. |
 | `lowtier` | Run 7: a small model on a placement; `--remote-url` reads the host-1070 rows, `--e4b-reload` times E4B's return. |
 | `remote-memory` | Writes the H6 script's memory figures, layer counts and skips per model and placement. |
-| `chain` | Run 7's chained turns, speech in to first audio out; `--busy-arm c0` runs them while E4B writes. |
+| `chain` | Run 7's chained turns, speech in to first audio out; `--busy-arm c0` runs them while E4B writes; `--reply-pack <dir>` also saves each turn's whole reply per recording and repetition, for `reply-ab`, without changing any recorded time. |
 | `game-session` | Runs 8 and 9, guided, in an administrator terminal; `--with-1070` adds the shared 1070 conditions, `--server-process <name>` adds run 9's server counters. |
 | `voice-design` | Renders candidate voices from text descriptions with the Qwen3-TTS VoiceDesign model on the GPU: `--descriptions` and `--lines` (JSON lists of `{"id", "text"}`), `--seeds N`, `--out <dir>`, the weights from `<models-dir>/speech/` (env `MODELS_DIR`). Writes `cand-<description id>-s<seed>.wav` per description and seed and `design-log.jsonl`; prints ids and counts only. |
 | `listen-pack` | Builds the blind listening page from run 1's saved clips, or, with `--from-dir <dir>`, from every WAV in that directory. |
+| `reply-ab` | Builds a blind A/B page of two `chain --reply-pack` directories, `--a <dir>` and `--b <dir>`: one item per utterance, its words from `utterances.json` and the two replies under seeded labels, the key in `reply-ab-key/` until `reply-ab/ratings.csv` exists (`--show-key`). With `--voice-clip`, `pocket-clone` voices both replies of every item with that clip, loudness matched. |
 | `report` | Writes `numbers.json` and `REPORT.md` under `speech/`. |
 
 ### Bench run ids
