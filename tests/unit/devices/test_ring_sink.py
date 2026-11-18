@@ -435,10 +435,13 @@ async def test_lifespan_gives_the_host_one_ring_sink_per_live_device(
     async with server.lifespan(server.app):
         sinks = tuple(lifespan_harness.host_kwargs["ring_sinks"])
         registry = server.session_registry
-        present = [sink.present() for sink in sinks]
+        before = [sink.present() for sink in sinks]
+        # A session bound to the device: the sink sees it through the registry `lifespan`
+        # built after the host, so a sink reading no registry would stay absent.
+        monkeypatch.setattr(registry, "endpoint_present", lambda endpoint: endpoint == DEVICE)
+        after = [sink.present() for sink in sinks]
 
     assert [sink.name for sink in sinks] == [DEVICE]
     assert isinstance(sinks[0], DeviceRingSink)
-    # The sink reads the registry `lifespan` built after the host: no device session is open.
     assert registry is not None
-    assert present == [False]
+    assert (before, after) == ([False], [True])
