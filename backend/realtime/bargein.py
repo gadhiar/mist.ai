@@ -112,8 +112,12 @@ class KeywordBargeIn:
     `arm_delay_ms` (the canceller converges by then), and not when MIST herself said that keyword
     within `echo_guard_ms`. A user wearing a headset hears no leak, so `aec` `headset` turns the
     echo guard off. In `held` and `thinking` nothing has played, so neither the arm delay nor the
-    echo guard applies, and only an utterance that is a keyword and nothing else interrupts: any
-    other speech is a new request, which the controller merges in by superseding.
+    echo guard applies, and only a keyword-only utterance, or one name then a keyword-only
+    utterance, interrupts: any other speech is a new request, which the controller merges in by
+    superseding. The name is allowed so that "mist, stop" means what "stop" means: a final
+    transcript may keep the name said before the keyword. Only one leading name with a
+    word after it is skipped; a trailing name ("stop, mist") or a greeting before the name
+    ("hey mist, stop") still makes a request.
 
     The policy is per voice session: the session builds one at each `voice_start`, with that
     message's `aec`. It keeps one piece of state, the turn whose audio started last; partial
@@ -122,6 +126,9 @@ class KeywordBargeIn:
     Args:
         config: The keywords, the arm delay, the keyword window and the echo guard window.
         aec: The client's declared echo cancellation.
+        names: Her configured names (`WakeConfig.names`). Each is held as its own words, since
+            a name may hold a hyphen, which separates the words of a transcript ("mist-ai" is
+            "mist ai").
         recent_tts_text: The text MIST played in the last `window_ms`, shaped like
             `PlaybackLedger.recent_tts_text` for the current turn's ledger.
         clock: The session's monotonic millisecond clock, read for the arm delay at an
@@ -133,6 +140,7 @@ class KeywordBargeIn:
         config: BargeInConfig,
         *,
         aec: AecMode,
+        names: tuple[str, ...],
         recent_tts_text: Callable[[int], str],
         clock: Callable[[], int],
     ) -> None:
@@ -145,6 +153,7 @@ class KeywordBargeIn:
         self._keywords = tuple(
             (" ".join(words), words) for words in (_words(k) for k in config.keywords) if words
         )
+        self._names = tuple(words for words in (_words(n) for n in names) if words)
         self._turn_id: str | None = None
         self._audio_at_ms = 0
 
@@ -191,8 +200,9 @@ class KeywordBargeIn:
         """Judge the final transcript when the utterance ends.
 
         In `speaking` speech without a keyword is ignored with reason `no_keyword`, so the user
-        sees why MIST talked on. In `held` and `thinking` a keyword-only utterance interrupts and
-        anything else gets no verdict, which the controller treats as a new request.
+        sees why MIST talked on. In `held` and `thinking` a keyword-only utterance, or one name
+        then a keyword-only utterance, interrupts and anything else gets no verdict, which the
+        controller treats as a new request.
         """
         if phase in ("speaking", "idle"):
             verdict = self._judge_window(update.text, self._clock(), phase)
@@ -225,9 +235,19 @@ class KeywordBargeIn:
         )
 
     def _judge_whole(self, text: str, phase: Phase) -> BargeInVerdict | None:
-        said = " ".join(_words(text))
-        for keyword, _ in self._keywords:
-            if said == keyword:
+        """Interrupt for an utterance that is a keyword alone, or one leading name then one.
+
+        The verdict's `text` is the whole utterance, name included, as the user said it.
+        """
+        said = _words(text)
+        candidates = [said]
+        candidates.extend(
+            said[len(name) :]
+            for name in self._names
+            if len(said) > len(name) and said[: len(name)] == name
+        )
+        for keyword, parts in self._keywords:
+            if parts in candidates:
                 return BargeInVerdict(
                     action="interrupt",
                     reason="keyword",

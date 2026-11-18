@@ -63,12 +63,14 @@ def make_policy(
     clock: FakeClock | None = None,
     config: BargeInConfig | None = None,
     audio_started: bool = True,
+    names: tuple[str, ...] = ("mist",),
 ) -> tuple[KeywordBargeIn, FakeEcho, FakeClock]:
     echo = echo if echo is not None else FakeEcho()
     clock = clock if clock is not None else FakeClock(ARMED_AT)
     policy = KeywordBargeIn(
         config if config is not None else BargeInConfig(),
         aec=aec,
+        names=names,
         recent_tts_text=echo,
         clock=clock,
     )
@@ -371,6 +373,81 @@ class TestHeldAndThinking:
     def test_other_text_gives_no_verdict(self, phase: Phase, text: str) -> None:
         policy, _, _ = make_policy(audio_started=False)
         assert policy.on_utterance_end(final(text), phase) is None
+
+    @pytest.mark.parametrize(
+        ("text", "keyword"),
+        [("mist, stop", "stop"), ("Mist stop.", "stop"), ("mist, hold on", "hold on")],
+    )
+    def test_her_name_then_a_stop_keyword_interrupts(
+        self, phase: Phase, text: str, keyword: str
+    ) -> None:
+        """The name she was woken by often stays in the final; it leaves a keyword-only end."""
+        policy, _, _ = make_policy(audio_started=False)
+        assert policy.on_utterance_end(final(text), phase) == interrupt(keyword, text, "", phase)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "mist",
+            "Mist.",
+            "mist stop the music",
+            "hey mist, stop",
+            "stop, mist",
+            "mist mist stop",
+            "nova, stop",
+        ],
+    )
+    def test_the_name_skipped_is_one_leading_configured_name(self, phase: Phase, text: str) -> None:
+        """Only one configured name, first and followed by a word, is skipped: trailing names,
+        greetings and other names leave a request, which the controller merges in.
+        """
+        policy, _, _ = make_policy(audio_started=False, names=("mist",))
+        assert policy.on_utterance_end(final(text), phase) is None
+
+    @pytest.mark.parametrize("text", ["mist-ai, stop", "mist ai stop", "Mist AI. Stop."])
+    def test_a_hyphenated_name_is_skipped_as_its_words(self, phase: Phase, text: str) -> None:
+        policy, _, _ = make_policy(audio_started=False, names=("mist-ai",))
+        assert policy.on_utterance_end(final(text), phase) == interrupt("stop", text, "", phase)
+
+    def test_part_of_a_hyphenated_name_is_not_the_name(self, phase: Phase) -> None:
+        policy, _, _ = make_policy(audio_started=False, names=("mist-ai",))
+        assert policy.on_utterance_end(final("mist, stop"), phase) is None
+
+    def test_any_configured_name_is_skipped(self, phase: Phase) -> None:
+        policy, _, _ = make_policy(audio_started=False, names=("mist", "mist-ai"))
+        assert policy.on_utterance_end(final("mist ai, stop"), phase) == interrupt(
+            "stop", "mist ai, stop", "", phase
+        )
+        assert policy.on_utterance_end(final("mist, stop"), phase) == interrupt(
+            "stop", "mist, stop", "", phase
+        )
+
+    def test_partials_with_the_name_never_interrupt(self, phase: Phase) -> None:
+        policy, _, _ = make_policy(audio_started=False)
+        assert policy.evaluate(partial("mist, stop"), ARMED_AT, phase) is None
+        assert policy.evaluate(final("mist, stop"), ARMED_AT, phase) is None
+
+
+class TestNamesInSpeaking:
+    """The names change only the held and thinking judge; `speaking` keeps its keyword window."""
+
+    @pytest.mark.parametrize(
+        "text", ["mist, stop", "Mist stop.", "mist", "mist stop the music", "hey mist, stop"]
+    )
+    def test_names_do_not_change_a_speaking_verdict(self, text: str) -> None:
+        named, _, _ = make_policy(names=("mist",))
+        other, _, _ = make_policy(names=("nova",))
+        assert named.evaluate(partial(text), ARMED_AT, "speaking") == other.evaluate(
+            partial(text), ARMED_AT, "speaking"
+        )
+        assert named.on_utterance_end(final(text), "speaking") == other.on_utterance_end(
+            final(text), "speaking"
+        )
+
+    def test_name_then_keyword_while_speaking_is_the_window_match(self) -> None:
+        policy, _, _ = make_policy()
+        verdict = policy.on_utterance_end(final("mist, stop the music"), "speaking")
+        assert verdict == interrupt("stop", "mist, stop the music", "the music", "speaking")
 
 
 class TestIdleAndText:

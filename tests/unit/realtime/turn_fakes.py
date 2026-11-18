@@ -953,6 +953,7 @@ def make_harness(
     policy = KeywordBargeIn(
         barge,
         aec=aec,
+        names=wake_config.names,
         recent_tts_text=lambda ms: built[0].recent_tts_text(ms),
         clock=clock,
     )
