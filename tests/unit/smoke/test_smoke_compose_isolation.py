@@ -53,7 +53,7 @@ STORE_PATH_VARS = (
 
 #: Host directories that must never be bind-mounted into the smoke backend.
 #: ./data and ./mist-memory are live state. ./dev-state is not live, but it
-#: holds the hydration fixture that `docker-compose.dev-hydration.yml:21-23`
+#: holds the hydration fixture that the header of `docker-compose.dev-hydration.yml`
 #: records as costing 87 LLM turns to reproduce.
 FORBIDDEN_HOST_MOUNTS = {
     "./data": "the LIVE event store, vector store and audio directory",
@@ -61,7 +61,8 @@ FORBIDDEN_HOST_MOUNTS = {
     "./dev-state": "the hydration fixture (87 LLM turns to reproduce)",
 }
 
-#: Named volumes belonging to the live Neo4j (`docker-compose.yml:180-181`).
+#: Named volumes belonging to the live Neo4j: the `mist-neo4j` service's `/data`
+#: and `/logs` volumes in `docker-compose.yml`.
 FORBIDDEN_VOLUME_NAMES = {"mist-neo4j-data", "mist-neo4j-logs"}
 
 #: Compose files whose published host ports the smoke stack must not reuse.
@@ -192,8 +193,9 @@ def _split_volume_spec(spec: str) -> tuple[str, str, str]:
 #:
 #:   - MEMBERSHIP OF THE TOP-LEVEL `volumes:` KEY: correct for a whole compose
 #:     PROJECT, wrong for one overlay file. `mist-hf-cache` and
-#:     `mist-torch-cache` are declared at `docker-compose.yml:182-183` and used
-#:     by this stack's backend, so a test parsing only this overlay reports
+#:     `mist-torch-cache` are declared under the top-level `volumes:` key of
+#:     `docker-compose.yml` and used by this stack's backend
+#:     (`mist-backend-smoke`), so a test parsing only this overlay reports
 #:     both as binds. Measured, not predicted: it turned
 #:     `test_bind_mount_set_is_exactly_the_allowlist`,
 #:     `test_scratch_is_the_only_writable_bind_mount` and
@@ -285,7 +287,8 @@ class TestStorePathsAreScratchOnly:
         assert "${" not in value, (
             f"{var}={value!r} interpolates a host-shell variable. The base compose "
             f"reads EVENT_STORE_DB_PATH, MIST_VAULT_ROOT and MIST_SIDECAR_DB_PATH "
-            f"from the host shell (docker-compose.yml:39,45,46), so an operator "
+            f"from the host shell (the ${{VAR:-default}} values in mist-backend's "
+            f"environment in docker-compose.yml), so an operator "
             f"exporting one to steer the smoke stack would silently RETARGET THE "
             f"LIVE BACKEND on its next recreate. The rule covers all five paths "
             f"rather than only those three, because which ones are interpolated in "
@@ -301,7 +304,8 @@ class TestNeo4jIsolation:
         uri = backend_env.get("NEO4J_URI")
         assert uri == f"bolt://{NEO4J_SERVICE}:7687", (
             f"NEO4J_URI={uri!r} does not name the disposable smoke instance "
-            f"({NEO4J_SERVICE}). docker-compose.yml:23 points the live backend at "
+            f"({NEO4J_SERVICE}). mist-backend's NEO4J_URI in docker-compose.yml "
+            f"points the live backend at "
             f"bolt://mist-neo4j:7687, and the smoke stack shares the project "
             f"network, so an unset or inherited URI lands on the canonical graph."
         )
@@ -444,7 +448,8 @@ class TestMountDiscipline:
         overlap = referenced & FORBIDDEN_VOLUME_NAMES
         assert not overlap, (
             f"This compose file references {sorted(overlap)}, the LIVE Neo4j's "
-            f"named volumes (docker-compose.yml:180-181). Attaching one would put "
+            f"named volumes (the mist-neo4j service's /data and /logs volumes in "
+            f"docker-compose.yml). Attaching one would put "
             f"the smoke Neo4j's writes into the canonical graph's data directory "
             f"-- two Neo4j instances over one store, which is corruption rather "
             f"than sharing."
@@ -484,7 +489,8 @@ class TestMountDiscipline:
         offenders = sorted(h for h in expected_ro if modes[h] != "ro")
         assert not offenders, (
             f"{BACKEND_SERVICE} mounts {offenders} writable. The live stack runs "
-            f"from this same tree (docker-compose.override.yml:7-12), so a "
+            f"from this same tree (mist-backend's code volumes in "
+            f"docker-compose.override.yml), so a "
             f"writable code mount lets a throwaway container edit the source the "
             f"live backend is executing. Append ':ro'."
         )
@@ -774,7 +780,8 @@ class TestHarnessShape:
         reason -- which is exactly what a declaration-based attempt did.
 
         `mist-hf-cache` is the load-bearing case: it is declared in the BASE
-        file (`docker-compose.yml:182`), not in this overlay, so any classifier
+        file (the top-level `volumes:` key of `docker-compose.yml`), not in this
+        overlay, so any classifier
         that consults only this file's top-level `volumes:` key misreports it.
         """
         names = _volume_names(compose, BACKEND_SERVICE)
