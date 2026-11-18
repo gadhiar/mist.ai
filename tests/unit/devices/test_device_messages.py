@@ -8,8 +8,10 @@ over a scripted alarm control, which records the endpoint each alarm action name
 
 What these pin: a type the device never sends is refused with a protocol error and changes
 nothing, not the turns, the log stream's gate or a proposal, and the session goes on to take the
-device's own types. Going out, the device is sent only the types it acts on: another session's
-proposal, the capabilities status and the heartbeat are withheld, its alarms are not.
+device's own types. Going out, the device is sent only the types it acts on: the proposal its
+own turn makes, the capabilities status and the heartbeat are withheld, its alarms are not. A
+desktop turn's proposal goes on the desktop session's own `turn` lane, so it never reaches the
+device either.
 """
 
 from __future__ import annotations
@@ -23,11 +25,12 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from backend.chat.stream_events import Token, WSEvent
 from backend.devices.limiter import AuthLimiter
 from backend.devices.listener import build_device_app
 from backend.devices.registry import DeviceRegistry
 from backend.factories import CapabilityBuild
-from tests.unit.devices.test_device_turn import DeviceClient
+from tests.unit.devices.test_device_turn import BACKLOG_MS, FRAME_MS, DeviceClient, calls
 from tests.unit.devices.test_listener import ROOM, FakeClock, entry, secret_for, write_registry
 from tests.unit.realtime.test_registry import RecordingLogGate
 from tests.unit.realtime.turn_fakes import settle
@@ -45,6 +48,18 @@ pytestmark = pytest.mark.asyncio
 
 DEVICE = "example-room"
 SESSION_LOGGER = "backend.realtime.session"
+
+VOICE_START = {
+    "type": "voice_start",
+    "req": 1,
+    "mode": "wake",
+    "sample_rate": 16000,
+    "frame_ms": FRAME_MS,
+    "aec": "native",
+    "playback": True,
+    "endpoint": "room",
+    "spotter": "endpoint",
+}
 
 REFUSED = {
     "text": {"type": "text", "text": "read me the logs"},
@@ -158,20 +173,51 @@ async def test_a_device_token_cannot_send_a_type_the_device_does_not(
     assert (result["request_id"], result["outcome"]) == ("after-refusal", "ok")
 
 
-async def test_a_device_is_sent_no_proposal_status_or_heartbeat_and_still_its_alarms(device):
+def proposal(proposal_id: str) -> WSEvent:
+    """A turn's `action_proposed`, as the handler yields it into the turn's stream."""
+    return WSEvent(
+        {
+            "type": "action_proposed",
+            "proposal_id": proposal_id,
+            "session_id": "unused",
+            "summary": "turn the lights off",
+            "calls": [],
+            "expires_at": "2026-01-05T07:05:00Z",
+        }
+    )
+
+
+async def device_turn(rig, device: DeviceClient) -> None:
+    """The device wakes with its backlog and speaks one utterance, as `test_device_turn.py`."""
+    device.send(VOICE_START)
+    await settle()
+    device.send({"type": "wake", "keyword": "mist", "score": 0.9, "backlog_ms": BACKLOG_MS})
+    backlog = BACKLOG_MS // FRAME_MS
+    for seq in range(backlog + 10):
+        device.mic(seq)
+    await settle(200)
+    (ingress,) = rig.ingresses
+    ingress.emit(
+        ingress.heard(None, from_pos=60, hit_pos=backlog - 1, spotter="endpoint", score=0.9)
+    )
+    await settle()
+    ((_, _mode, _from, uid),) = calls(ingress, "open_utterance")
+    ingress.emit(ingress.partial(uid, "mist turn the lights off", gate=True))
+    ingress.emit(ingress.ended(uid, "Mist, turn the lights off."))
+    await settle(200)
+
+
+async def test_a_device_is_sent_no_proposal_status_or_heartbeat_and_still_its_alarms(rig, device):
     from backend import server
 
+    # Each turn's proposal goes on its own session's `turn` lane: the desktop's typed turn first,
+    # then the device's spoken one.
+    rig.handler.add(proposal("p-desktop"), Token("Shall I?"))
+    rig.handler.add(proposal("p-device"), Token("Shall I?"))
     desktop = await connect()
-    proposal = {
-        "type": "action_proposed",
-        "proposal_id": "p1",
-        "session_id": desktop.ws.handshake_session_id,
-        "summary": "turn the lights off",
-        "calls": [],
-        "expires_at": "2026-01-05T07:05:00Z",
-    }
-    # As the broadcaster drains `message_queue`: the desktop's proposal and a heartbeat.
-    await server.message_queue.put(json.dumps(proposal))
+    await desktop.send({"type": "text", "text": "turn the lights off"})
+    await device_turn(rig, device)
+    # As the heartbeat loop queues it on `message_queue`, and the broadcaster drains it.
     await server.message_queue.put(json.dumps({"type": "heartbeat", "timestamp": 1}))
     broadcaster = asyncio.get_running_loop().create_task(server.broadcast_messages())
     await server.message_queue.join()
@@ -181,10 +227,17 @@ async def test_a_device_is_sent_no_proposal_status_or_heartbeat_and_still_its_al
         await broadcaster
     await desktop.leave()
 
+    (started,) = device.of_type("session_started")
+    sessions = [request.session_id for request in rig.handler.requests]
+    assert sessions == [desktop.ws.handshake_session_id, started["session_id"]]
     desktop_types = [frame["type"] for frame in desktop.ws.frames]
-    assert {"capabilities_status", "action_proposed", "heartbeat"} <= set(desktop_types)
+    assert {"capabilities_status", "heartbeat"} <= set(desktop_types)
+    proposed = [f["proposal_id"] for f in desktop.ws.frames if f["type"] == "action_proposed"]
+    assert proposed == ["p-desktop"]
     device_types = [message["type"] for message in device.messages()]
-    assert device_types == ["session_started", "alarm_state"]
+    assert device_types[:2] == ["session_started", "alarm_state"]
+    assert "stream_start" in device_types
+    assert not {"action_proposed", "capabilities_status", "heartbeat"} & set(device_types)
 
 
 async def test_a_device_alarm_action_reaches_the_host_with_the_devices_name(host, device):
