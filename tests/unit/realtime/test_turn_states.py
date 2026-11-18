@@ -13,6 +13,9 @@ handling of wake verdicts (v9 :153-163, :296-300), with `FakeWakeArbiter` standi
 arbitration. T11e part 2 runs the arbitration bullets (v5 :1709-1722) through two controllers
 that share one real `WakeArbiter`.
 
+T55c (A51) amends v5's `thinking` cell: a name accepted while a model turn is `thinking` with none
+of its audio queued supersedes the turn instead of barging in.
+
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
 """
@@ -25,7 +28,8 @@ from dataclasses import dataclass
 import pytest
 import pytest_asyncio
 
-from backend.chat.stream_events import HandOff, Token
+from backend.chat.conversation_handler import CapabilityOnlyTurn
+from backend.chat.stream_events import Complete, HandOff, Token
 from backend.realtime.budget import BargeInConfig, WakeConfig
 from backend.realtime.protocol import VoiceDecisionWakeLost, WakeLostDetail
 from backend.realtime.scene import Immediate
@@ -49,6 +53,7 @@ from backend.realtime.turn import (
 from .turn_fakes import (
     Call,
     FailingSynthesizer,
+    FakeAlarm,
     FakeCallLater,
     Harness,
     Pause,
@@ -2016,6 +2021,7 @@ async def test_while_speaking_mist_wait_ducks_at_the_hit_accepts_and_interrupts_
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id) == ("wake", turn_id)
     assert (barge.detail.phase, barge.detail.utterance_id) == ("speaking", uid)
+    assert h.outbound.of("voice_decision:supersede") == []
     names = h.outbound.names()[mark:]
     assert subsequence(
         names,
@@ -2132,6 +2138,8 @@ async def test_stop_or_the_name_during_the_handoff_wait_cancels_as_in_thinking(h
     (barge,) = h.outbound.of("voice_decision:barge_in")
     reason = "keyword" if how == "stop" else "wake"
     assert (barge.reason, barge.turn_id, barge.detail.phase) == (reason, turn_id, "thinking")
+    # The ack's audio is queued, so the name barges in (A51 supersedes only before any audio).
+    assert h.outbound.of("voice_decision:supersede") == []
     assert h.responder.closed == [0]
     assert [c.outcome for c in h.responder.commits] == ["interrupted"]
 
@@ -2237,8 +2245,149 @@ async def test_endpoint_wake_while_speaking_interrupts_only_after_acceptance():
 
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id, barge.detail.utterance_id) == ("wake", turn_id, uid)
+    assert h.outbound.of("voice_decision:supersede") == []
     assert [c.outcome for c in h.responder.commits] == ["interrupted"]
     pause.release()
+
+
+# -- A name while she thinks supersedes the turn (A51, T55c) ------------------------------------------
+# A name accepted while a model turn is in `thinking` with none of its audio queued supersedes it:
+# `supersede`, the cut with `stream_cancelled superseded`, `idle` and `turn_metrics`, then the
+# name's publish, all in the accepting step. K, the superseded turn, is committed at the cut.
+
+
+async def accept_a_name(h: Harness, how: str, text: str) -> str:
+    """Accept a name through the server spotter or an endpoint `wake`; the candidate's id."""
+    if how == "server":
+        uid = h.ids()
+        h.post(h.ingress.started(uid))
+        await h.settle()
+        await name_hit(h, uid)
+        await gate(h, uid, text)
+        return uid
+    h.post(endpoint_wake(1500))
+    await h.settle()
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
+    await h.settle()
+    ((*_, uid),) = calls(h.ingress, "open_utterance")
+    h.post(h.ingress.partial(uid, text, gate=True))
+    await h.settle()
+    return str(uid)
+
+
+@pytest.mark.parametrize("how", ["server", "endpoint"])
+async def test_a_name_accepted_in_thinking_before_any_audio_supersedes_the_turn(how):
+    pause = Pause()
+    h = make_harness([pause, Token("Late.")], [Token("In Paris it rains."), Pause()])
+    h.start_voice()
+    await h.speak("mist, what's the weather")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "thinking"
+    mark = len(h.outbound.client)
+
+    uid = await accept_a_name(h, how, "mist, and in Paris")
+
+    (supersede,) = h.outbound.of("voice_decision:supersede")
+    assert (supersede.turn_id, supersede.reason) == (turn_id, "continued_speech")
+    assert supersede.detail.model_dump() == {"merged": False, "tool_dispatched": False}
+    assert h.outbound.of("voice_decision:barge_in") == []
+    names = h.outbound.names()[mark:]
+    # The pacer's stop ends the announced audio tag (`0x03`, `playback_stop`) within the cut.
+    assert names[names.index("voice_decision:supersede") :] == [
+        "voice_decision:supersede",
+        "0x03",
+        "playback_stop",
+        "stream_cancelled",
+        "state_cycle:idle",
+        "turn_metrics",
+        "vad_status:speech_started",
+        "state_cycle:listen",
+        "transcript_partial",
+    ]
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert (cancelled.turn_id, cancelled.reason) == (turn_id, "superseded")
+    assert (cancelled.partial_text, cancelled.spoken_text) == ("", "")
+    (metrics,) = h.outbound.of("turn_metrics")
+    assert (metrics.turn_id, metrics.outcome) == (turn_id, "superseded")
+    assert [(c.outcome, c.delivered_text) for c in h.responder.commits] == [("superseded", "")]
+    assert h.controller.phase == "idle"
+
+    # The turn from the name takes its own text; K stays committed once, before its reply.
+    h.post(h.ingress.ended(uid, "mist, and in Paris"))
+    await h.settle()
+    first, second = h.responder.requests
+    assert (first.user_text, second.user_text) == ("mist, what's the weather", "mist, and in Paris")
+    assert second.interruption_note == "before_reply"
+    assert [c.outcome for c in h.responder.commits] == ["superseded"]
+    assert h.outbound.of("voice_decision:supersede") == [supersede]
+    pause.release()
+
+
+async def test_a_supersede_after_a_dispatched_tool_says_so():
+    pause = Pause()
+    h = make_harness(
+        [WaitGate(), Call(dispatch_tool), tool_started(), pause, Token("Done.")], [Pause()]
+    )
+    h.start_voice()
+    await h.speak("mist, set a timer")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "thinking"
+
+    await accept_a_name(h, "server", "mist, make it ten minutes")
+
+    (supersede,) = h.outbound.of("voice_decision:supersede")
+    assert supersede.turn_id == turn_id
+    assert supersede.detail.model_dump() == {"merged": False, "tool_dispatched": True}
+    assert h.outbound.of("voice_decision:barge_in") == []
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert cancelled.reason == "superseded"
+    (metrics,) = h.outbound.of("turn_metrics")
+    assert (metrics.outcome, metrics.kind) == ("superseded", "tool")
+    assert [(c.outcome, c.delivered_text) for c in h.responder.commits] == [("superseded", "")]
+    pause.release()
+
+
+async def test_a_name_on_a_capability_answered_turn_in_thinking_still_barges_in():
+    """Its text is already recorded (D8), so it is interrupted, never superseded."""
+    alarm = FakeAlarm()
+    h = make_harness(alarm_ringing=alarm)
+    reply = "The alarm is off."
+    h.responder.capability_results.append(
+        CapabilityOnlyTurn(handled=True, events=(Token(reply), Complete(final_response=reply)))
+    )
+    h.lane.hold()  # no audio: the answer stays in `thinking`
+    h.start_voice()
+    stop = h.ids()
+    h.post(h.ingress.started(stop), h.ingress.candidate(stop, "stop"))
+    await h.settle()
+    h.post(h.ingress.ended(stop, "stop"))
+    await h.settle()
+    answer = h.last_turn()
+    assert h.controller.phase == "thinking"
+
+    await accept_a_name(h, "server", "mist, what's the time")
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.reason, barge.turn_id, barge.detail.phase) == ("wake", answer, "thinking")
+    assert h.outbound.of("voice_decision:supersede") == []
+    assert h.outbound.of("stream_cancelled")[0].reason == "barge_in"
+    assert h.outbound.of("turn_metrics")[-1].outcome == "interrupted"
+    assert h.responder.commits == []  # the capability-only path recorded it
+    h.lane.open()
+
+
+async def test_a_name_accepted_while_a_turn_is_held_cancels_it_without_trace():
+    h = make_harness([Token("One two. "), Pause()], [Pause()])
+    h.start_voice()
+    await held(h)
+
+    await accept_a_name(h, "endpoint", "mist, what's up")
+
+    assert h.outbound.of("voice_decision:supersede") == []
+    assert h.outbound.of("voice_decision:barge_in") == []
+    assert h.outbound.of("stream_cancelled") == []
+    assert h.outbound.queued_turn_ids() == []
+    assert h.responder.commits == []
 
 
 async def test_a_wake_while_muted_is_dropped_muted_with_a_fresh_id():
