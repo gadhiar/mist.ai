@@ -181,8 +181,8 @@ services:
       # (`backend/realtime/budget.py:724`), so `load_speech_engines`
       # (`backend/realtime/runtime.py:263`) loads no speech engine into the GPU
       # the live backend shares; the default STT chain starts with Nemotron on
-      # CUDA. TTS_ENABLED=false, read at `backend/config.py:74`, also keeps
-      # replies unspoken.
+      # CUDA. TTS_ENABLED=false, read by `load_config` in `backend/config.py`,
+      # also keeps replies unspoken.
       - MIST_VOICE_STT_CHAIN=off
       - MIST_VOICE_TTS_CHAIN=off
       - TTS_ENABLED=false

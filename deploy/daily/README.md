@@ -692,7 +692,7 @@ changes, with what each means and what to do.
 | `backup` | `backup_failed` | down | The last attempt failed and no success is recent. | Read `docker compose -p mist-daily logs mist-backup`, fix the destination, run `backup-now`. |
 | `backup` | `backup_overdue` | down | The last success is older than `MIST_BACKUP_MAX_AGE_HOURS` (default 26). | Check that `mist-backup` runs (`status`); `arm-backups` if it was disarmed. |
 | `llm` | `gpu_yielded` | yielded | Gaming mode is on. | `gaming-mode off`. |
-| `llm` | `resume_failed` | down | Gaming mode ended but the backend's resume step raised; the backend retries. The speech engines' reload never raises (`backend/realtime/power.py`, `gpu_yield_refusal`), so a speech engine that fails to reload shows under `voice.engines` instead (see Gaming mode). | Close what holds the GPU's memory; the backend retries on its own. If it persists, restart `mist-backend`. |
+| `llm` | `resume_failed` | down | Gaming mode ended but the backend's resume step raised; the backend retries. The speech engines' reload never raises: `GpuEngines` (`backend/realtime/runtime.py`) logs a failed load at ERROR and retries it, because a raised error would read as a failed resume, so a speech engine that fails to reload shows under `voice.engines` instead (see Gaming mode). | Close what holds the GPU's memory; the backend retries on its own. If it persists, restart `mist-backend`. |
 
 Any check reads `ok` with status `up` when nothing above applies.
 

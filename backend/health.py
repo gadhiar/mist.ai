@@ -724,7 +724,9 @@ class BroadcasterProbe:
     process-wide event -- heartbeats, `system_status`, `health_status`,
     `extraction_status`, decided proposals, log streaming -- funnels through
     the broadcaster (`grep -rn "message_queue.put\|_queue.put" backend` ->
-    six sites in `backend/server.py`, two in `backend/log_handler.py`). Turn
+    six sites in `backend/server.py` and two in `backend/log_handler.py`, whose
+    `_queue` is `message_queue`; its other hits are this docstring and the vault
+    writer's own job queue, `backend/vault/writer.py:263` and `:569`). Turn
     frames do not: each session sends its own, and `backend/realtime` never
     touches `message_queue` (`grep -rn message_queue backend/realtime` -> no
     hits). A dead
