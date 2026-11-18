@@ -45,13 +45,7 @@ from .ingress import (
 )
 from .ingress import Lane as InferenceLane
 from .playback import LaneFull, LanePurge, MonotonicPlaybackClock, PlaybackClock, TurnLane
-from .power import (
-    CapabilityOnly,
-    PowerGate,
-    PowerGatedResponder,
-    SynthesizerSlot,
-    TranscriberSlot,
-)
+from .power import PowerGate, PowerGatedResponder, SynthesizerSlot, TranscriberSlot
 from .protocol import (
     ActionDecisionMessage,
     AlarmActionMessage,
@@ -194,8 +188,7 @@ class SessionServices:
 
     `power_gate` gates turns on the model tier and voice on spoken commands at off (T22); with
     None every turn reaches `responder` and the level is `power_level()`, which is otherwise
-    unread. `capability_only` is the capability-only path a turn without a model takes, None
-    until T13 wires it. `alarm_ringing` is passed to each controller, and T13 sets it.
+    unread. `alarm_ringing` is passed to each controller, and T13 sets it.
     """
 
     responder: TurnResponder
@@ -211,7 +204,6 @@ class SessionServices:
     controller_factory: Callable[..., TurnController] = TurnController
     on_capability_message: Callable[[str, CapabilityMessage], None] = _ignore_capability
     power_gate: PowerGate | None = None
-    capability_only: CapabilityOnly | None = None
     alarm_ringing: Callable[[], bool] = _no_alarm
 
 
@@ -372,9 +364,7 @@ class RealtimeSession:
         synthesizer = engines.tts_slot if engines.tts_slot is not None else engines.synthesizer
         responder = services.responder
         if services.power_gate is not None:
-            responder = PowerGatedResponder(
-                responder, services.power_gate, services.capability_only
-            )
+            responder = PowerGatedResponder(responder, services.power_gate)
         return services.controller_factory(
             session_id=self.session_id,
             responder=responder,
