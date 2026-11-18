@@ -209,9 +209,7 @@ def load_speech_engines(
     vad = turn_end = spotter = None
     vad_status = eot_status = kws_status = OFF
     if transcriber is not None:
-        vad, vad_status = walk.single(
-            "vad", placement.vad_device, lambda: loaders.vad(placement)
-        )
+        vad, vad_status = walk.single("vad", placement.vad_device, lambda: loaders.vad(placement))
         turn_end, eot_status = walk.single(
             "eot", placement.eot_device, lambda: loaders.eot(placement, settings.endpointing)
         )
