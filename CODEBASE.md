@@ -1,6 +1,19 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-11-09 (**Extraction epochs are keyed on every setting that changes
+**Last Updated:** 2026-11-17 (**The daily instance runs extraction at night** (goal
+mist-daily-instance). `deploy/daily/compose.yml` adds `mist-extraction-llm`, a llama-server
+with gpt-oss-20b beside `mist-llm` on the one card, and `mist-extraction`, the extraction
+service built from `docker/extraction/Dockerfile`, both under profile `extraction`.
+`scripts/daily/instance.py extraction on|off|auto|apply|status` runs them in a window on the
+host clock, 23:59-10:00 by default, at the "MIST extraction window" task's 5-minute ticks, and
+gaming mode stops them. `backend/extraction_hold.py` reads the CLI's `extraction-paused` marker,
+so `/health` reports a planned stop as `paused`, not `down`.
+`scripts/model_bench/probes/night_fit.py` measured the pair at `MIST_DAILY_EXTRACTION_NCMOE` 21:
+a peak of 10,105 MiB on the card, a contended chat time to first token of at most 0.459 s, and
+a chat-idle extraction decode median of 24.74 tokens per second. Not live yet: the deploy plan
+runs it, with `backend/extraction_backlog/CUTOVER.md` 6A before the first real turn.)
+
+**PRIOR ENTRY --** 2026-11-09 (**Extraction epochs are keyed on every setting that changes
 output** (PR 40): see the ExtractionPipeline bullet under Current Status. Deploy step pending: set
 `EXTRACTION_LLM_DEVICE` in `.env`, rebuild the extraction service, restart the backend, then
 confirm the active epoch is bound in `admin status`.)
