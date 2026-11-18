@@ -30,7 +30,7 @@ from backend.realtime.runtime import EngineLoaders, TorchGpuMeter
 from backend.realtime.session import InferenceLanes, tts_voice_of
 from backend.realtime.turn import TurnPlacement
 from backend.realtime.voice_assets import VoiceAssetError
-from tests.fakes.speech import EnergyVad, FakeSynthesizer, ScriptedNameSpotter, ScriptedTranscriber
+from tests.fakes.speech import FakeSynthesizer, ScriptedNameSpotter, ScriptedTranscriber
 
 from .turn_fakes import InlineLane
 
@@ -233,16 +233,12 @@ class TestVram:
         meter = TorchGpuMeter(lambda: SimpleNamespace(cuda=cuda))
 
         with caplog.at_level(logging.WARNING, logger=RUNTIME_LOGGER):
-            engines = build_speech_engines(
-                settings(), loaders=Loaders().build(), gpu_meter=meter
-            )
+            engines = build_speech_engines(settings(), loaders=Loaders().build(), gpu_meter=meter)
 
         assert engines.statuses.stt.vram_mib == 5000
         assert engines.vram_over_budget is True
         assert any("over the 4500 MiB budget" in r.getMessage() for r in caplog.records)
-        assert cuda.calls.index("reset_peak_memory_stats") < cuda.calls.index(
-            "max_memory_reserved"
-        )
+        assert cuda.calls.index("reset_peak_memory_stats") < cuda.calls.index("max_memory_reserved")
 
     def test_a_cpu_only_placement_measures_nothing(self):
         cuda = FakeCuda(reserved_mib=[])
@@ -404,9 +400,7 @@ class TestBuildMistRuntime:
         ("environ", "character"),
         [({}, CharacterConfig()), ({"MIST_VOICE_CHARACTER": "false"}, None)],
     )
-    def test_the_controllers_playback_config_carries_the_character_stage(
-        self, environ, character
-    ):
+    def test_the_controllers_playback_config_carries_the_character_stage(self, environ, character):
         voice = load_voice_settings(environ)
         voice = dataclasses.replace(voice, placement=settings().placement)
 
