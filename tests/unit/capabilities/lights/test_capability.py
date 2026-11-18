@@ -452,6 +452,22 @@ class TestDeviceArea:
             ("adjust", LightTarget(kind="area", value="Kitchen"), LightAdjustment(color="red"))
         ]
 
+    @pytest.mark.parametrize(
+        ("tool", "args"), [(POWER, {"on": True}), (ADJUST, {"brightness_pct": 30})]
+    )
+    @pytest.mark.asyncio
+    async def test_an_area_the_catalog_does_not_know_is_answered_not_replaced(self, tool, args):
+        # Acting on the default target's room would switch lights the speaker is not in, so
+        # an unknown area answers `invalid_args` naming it instead.
+        provider = StubProvider()
+        capability = _capability(provider, default_target="Living Room", area_of=lambda n: "Loft")
+
+        outcome = await _invoke(capability, tool, endpoint="bedside", **args)
+
+        assert (outcome.status, outcome.reason) == ("invalid_args", "unknown target")
+        assert "called Loft" in outcome.summary
+        assert provider.calls == []
+
     @pytest.mark.asyncio
     async def test_status_without_a_target_still_reads_every_light(self):
         provider = StubProvider()
