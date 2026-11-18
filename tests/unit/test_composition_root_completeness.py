@@ -151,6 +151,7 @@ EXPECTED_BUILDER_CALL_SITES: frozenset[str] = frozenset(
         "_build_runtime",
         "_build_uptime_recorder",
         "build_capability_host",
+        "build_device_app",
     }
 )
 
