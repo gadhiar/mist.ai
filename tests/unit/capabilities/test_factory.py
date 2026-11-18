@@ -101,7 +101,7 @@ async def build(tmp_path):
         secrets: Mapping[str, str] | None = None,
         transport_factory: Callable[..., object] | None = None,
         desktop_present: Callable[[], bool] = lambda: False,
-        ring_sinks: Sequence[RingSink] | None = None,
+        ring_sinks: Callable[[], Sequence[RingSink]] | None = None,
         endpoint_of: Callable[[str], str | None] | None = None,
         area_of: Callable[[str], str | None] | None = None,
     ) -> tuple[CapabilityBuild, Rig]:
@@ -395,20 +395,42 @@ class TestAlarmsWiring:
         timers = _recording(monkeypatch, "TimersCapability")
         kitchen = DeviceRingSink("kitchen", lambda name, payload: None, lambda name: False)
         bedroom = DeviceRingSink("bedroom", lambda name, payload: None, lambda name: True)
+        registered: list[RingSink] = [kitchen, bedroom]
+
+        def ring_sinks() -> tuple[RingSink, ...]:
+            return tuple(registered)
 
         build(
             {"MIST_CAPABILITIES": "alarms,timers,clock", "MIST_TIMEZONE": ZONE_NAME},
-            ring_sinks=[kitchen, bedroom],
+            ring_sinks=ring_sinks,
         )
 
-        (router_args, _, router) = routers[0]
-        desktop, *devices = router_args[0]
+        (router_args, router_kwargs, router) = routers[0]
+        (desktop,) = router_args[0]
         assert isinstance(desktop, DesktopSink)
-        assert devices == [kitchen, bedroom]
+        assert router_kwargs["sink_source"] is ring_sinks
         assert router.endpoints() == ("desktop", "kitchen", "bedroom")
         for calls in (alarms, timers):
             _, kwargs, _ = calls[0]
             assert kwargs["endpoints"]() == ("desktop", "kitchen", "bedroom")
+        # Read at each call: a sink the source gives after the build is an endpoint at once.
+        garage = DeviceRingSink("garage", lambda name, payload: None, lambda name: False)
+        registered[:] = [garage, bedroom]
+        assert router.endpoints() == ("desktop", "garage", "bedroom")
+        for calls in (alarms, timers):
+            _, kwargs, _ = calls[0]
+            assert kwargs["endpoints"]() == ("desktop", "garage", "bedroom")
+
+    def test_no_ring_sinks_gives_the_router_no_source(self, enabled, build, zone, monkeypatch):
+        routers = _recording(monkeypatch, "RingRouter")
+
+        build({"MIST_CAPABILITIES": "alarms", "MIST_TIMEZONE": ZONE_NAME})
+
+        (router_args, router_kwargs, router) = routers[0]
+        (desktop,) = router_args[0]
+        assert isinstance(desktop, DesktopSink)
+        assert router_kwargs["sink_source"] is None
+        assert router.endpoints() == ("desktop",)
 
     def test_endpoint_of_reaches_the_host_and_both_scheduled_capabilities(
         self, enabled, build, zone, monkeypatch
