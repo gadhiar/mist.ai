@@ -92,7 +92,7 @@ from backend.devices.listener import (  # isort:skip
     build_device_app,
 )
 from backend.devices.registry import DeviceRegistry, DeviceRegistryError  # isort:skip
-from backend.devices.ring_sink import DeviceRingSink, device_ring_sinks  # isort:skip
+from backend.devices.ring_sink import DeviceRingSink, registry_ring_sinks  # isort:skip
 from backend.devices.server import DeviceListener, ListenerState  # isort:skip
 from backend.errors import CapabilityConfigError, MistError  # isort:skip
 from backend.event_store.status_intervals import (  # isort:skip
@@ -1592,19 +1592,10 @@ async def lifespan(app: FastAPI):
             logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
             _device_listener_state = "failed"
 
-    # The sinks reach the session registry when they are called, as
+    # The sinks read the session registry when they are called, as
     # `_desktop_present` does, since the registry is built after the host.
-    def _endpoint_present(endpoint: str) -> bool:
-        registry = session_registry
-        return registry is not None and registry.endpoint_present(endpoint)
-
-    def _send_to_endpoint(endpoint: str, payload: dict[str, object]) -> None:
-        registry = session_registry
-        if registry is not None:
-            registry.broadcast(json.dumps(payload), endpoint=endpoint)
-
     ring_sinks: tuple[DeviceRingSink, ...] = (
-        device_ring_sinks(device_registry.devices(), _send_to_endpoint, _endpoint_present)
+        registry_ring_sinks(device_registry.devices(), lambda: session_registry)
         if device_registry is not None
         else ()
     )
@@ -1845,8 +1836,8 @@ async def lifespan(app: FastAPI):
     # Cancel the catch-up background task FIRST, as shutdown's first awaiting
     # step, before anything else below touches vault_writer or the
     # ConversationHandler it holds a reference to. Every later awaiting step
-    # (the device listener's stop, curation_scheduler.stop(), ch.aclose()) yields
-    # the event loop -- a still-running catch-up pass could resume in that
+    # (the device listener's stop, curation_scheduler.stop(), ch.aclose()) can
+    # yield the event loop -- a still-running catch-up pass could resume in that
     # window and reach a write against an already-stopped vault_writer if
     # cancellation happened later (or not at all).
     await _shutdown_session_note_catchup(catchup_task)

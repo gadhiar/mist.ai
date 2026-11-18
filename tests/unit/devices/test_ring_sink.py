@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Mapping
 from contextlib import closing
 from datetime import UTC, time, timedelta
 from pathlib import Path
@@ -31,7 +30,7 @@ from backend.chat.context_budget import ApproximateTokenCounter
 from backend.devices.limiter import AuthLimiter
 from backend.devices.listener import build_device_app
 from backend.devices.registry import DeviceRegistry
-from backend.devices.ring_sink import DeviceRingSink, device_ring_sinks
+from backend.devices.ring_sink import DeviceRingSink, device_ring_sinks, registry_ring_sinks
 from backend.factories import build_capability_host
 from tests.unit.capabilities.fakes import (
     DEFAULT_START,
@@ -45,6 +44,10 @@ from tests.unit.devices.test_device_turn import DeviceClient
 from tests.unit.devices.test_listener import ROOM, entry, secret_for, write_registry
 from tests.unit.devices.test_listener import FakeClock as ListenerClock
 from tests.unit.realtime.turn_fakes import settle
+from tests.unit.test_server_health_wiring import (  # noqa: F401 -- the fixture
+    _free_port,
+    lifespan_harness,
+)
 from tests.unit.test_session_id_propagation import (  # noqa: F401 -- autouse fixtures
     RecordingConversationHandler,
     install_runtime,
@@ -72,6 +75,20 @@ class FakeSessions:
 
     def send(self, endpoint: str, payload: dict[str, object]) -> None:
         self.sent.append((endpoint, payload))
+
+
+class FakeRoutes:
+    """`SessionRegistry`'s `endpoint_present` and `broadcast`, recording each broadcast."""
+
+    def __init__(self, *connected: str) -> None:
+        self.connected = set(connected)
+        self.broadcasts: list[tuple[object, str | None]] = []
+
+    def endpoint_present(self, endpoint: str) -> bool:
+        return endpoint in self.connected
+
+    def broadcast(self, message: object, *, endpoint: str | None = None) -> None:
+        self.broadcasts.append((message, endpoint))
 
 
 @pytest.fixture()
@@ -178,6 +195,31 @@ class TestDeviceRingSink:
         assert [sink.name for sink in sinks] == [DEVICE, OTHER]
         assert [sink.present() for sink in sinks] == [True, False]
 
+    @pytest.mark.asyncio
+    async def test_registry_sinks_read_the_session_registry_when_called(self, records, tmp_path):
+        path = tmp_path / "registry.json"
+        write_registry(path, [entry(DEVICE, secret_for(1))])
+        installed: list[FakeRoutes] = []
+        (sink,) = registry_ring_sinks(
+            DeviceRegistry.load(path).devices(), lambda: installed[0] if installed else None
+        )
+        occurrence = await _ringing(records)
+
+        # Built before the registry exists: absent, and a ring sends nothing.
+        assert sink.present() is False
+        assert await sink.ring(occurrence, RING_TIMEOUT_S, fallback=False) is False
+        routes = FakeRoutes(DEVICE)
+        installed.append(routes)
+
+        assert sink.present() is True
+        assert await sink.ring(occurrence, RING_TIMEOUT_S, fallback=False) is True
+        ((message, endpoint),) = routes.broadcasts
+        assert endpoint == DEVICE
+        assert isinstance(message, str)
+        assert json.loads(message) == alarm_fired_payload(
+            occurrence, RING_TIMEOUT_S, fallback=False
+        )
+
 
 # -- Under the router, beside the desktop ------------------------------------------------------
 
@@ -234,27 +276,20 @@ def _events(db_path: Path, occurrence_id: str) -> list[tuple[str, str | None, st
     return list(rows)
 
 
-def _send_to_endpoint(endpoint: str, payload: Mapping[str, object]) -> None:
-    """What `lifespan` gives each sink: the registry read when called, the payload as text."""
-    from backend import server
-
-    registry = server.session_registry
-    if registry is not None:
-        registry.broadcast(json.dumps(payload), endpoint=endpoint)
-
-
-def _endpoint_present(endpoint: str) -> bool:
-    from backend import server
-
-    registry = server.session_registry
-    return registry is not None and registry.endpoint_present(endpoint)
-
-
 @pytest_asyncio.fixture
 async def device_host(monkeypatch, tmp_path):
-    """A real host with the device's ring sink, installed as `lifespan` leaves it."""
+    """A real host with the device's ring sink, installed as `lifespan` leaves it.
+
+    The sink is `registry_ring_sinks`' over the server's `session_registry`, read when called,
+    as `lifespan` builds it; the registry is installed only later, by the `device` fixture.
+    """
     from backend import server
 
+    path = tmp_path / "registry.json"
+    write_registry(path, [entry(DEVICE, secret_for(1))])
+    ring_sinks = registry_ring_sinks(
+        DeviceRegistry.load(path).devices(), lambda: server.session_registry
+    )
     monkeypatch.setenv("MIST_EVAL_ISOLATION", "0")
     monkeypatch.delenv("MIST_HYDRATION_ISOLATION", raising=False)
     monkeypatch.delenv("MIST_ALLOWED_ORIGINS", raising=False)
@@ -282,7 +317,7 @@ async def device_host(monkeypatch, tmp_path):
         tiers=FakeTiers(),
         register=NoAddress(),
         desktop_present=lambda: False,
-        ring_sinks=(DeviceRingSink(DEVICE, _send_to_endpoint, _endpoint_present),),
+        ring_sinks=ring_sinks,
     )
     assert build.host is not None
     monkeypatch.setattr(server, "_capability_build", build)
@@ -300,11 +335,9 @@ async def device(monkeypatch, tmp_path, device_host):
     from backend import server
 
     install_runtime(monkeypatch, RecordingConversationHandler())
-    path = tmp_path / "registry.json"
-    write_registry(path, [entry(DEVICE, secret_for(1))])
     listener_clock = ListenerClock()
     app = build_device_app(
-        DeviceRegistry.load(path),
+        DeviceRegistry.load(tmp_path / "registry.json"),
         server._serve_session,
         AuthLimiter(listener_clock),
         listener_clock,
@@ -375,3 +408,37 @@ async def test_the_spoken_stop_ends_a_ring_on_the_device_as_the_device_stop_does
     await _until(lambda: bool(device.of_type("alarm_action_result")))
     (result,) = device.of_type("alarm_action_result")
     assert result["outcome"] == "invalid_args"
+
+
+# -- The composition root: `lifespan` hands the registry's devices to the host ------------------
+
+
+@pytest.mark.asyncio
+async def test_lifespan_gives_the_host_one_ring_sink_per_live_device(
+    lifespan_harness, monkeypatch, tmp_path  # noqa: F811 -- the imported fixture
+):
+    from backend import server
+
+    path = tmp_path / "registry.json"
+    write_registry(
+        path, [entry(DEVICE, secret_for(1)), entry("old-room", secret_for(2), revoked=True)]
+    )
+    # The listener itself fails on the missing certificate; the sinks come from the registry.
+    monkeypatch.setenv("MIST_DEVICE_LISTENER", "on")
+    monkeypatch.setenv("MIST_DEVICE_PORT", str(_free_port()))
+    monkeypatch.setenv("MIST_DEVICE_TLS_CERT", str(tmp_path / "missing.pem"))
+    monkeypatch.setenv("MIST_DEVICE_TLS_KEY", str(tmp_path / "missing.key"))
+    monkeypatch.setenv("MIST_DEVICE_REGISTRY", str(path))
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+
+    async with server.lifespan(server.app):
+        sinks = tuple(lifespan_harness.host_kwargs["ring_sinks"])
+        registry = server.session_registry
+        present = [sink.present() for sink in sinks]
+
+    assert [sink.name for sink in sinks] == [DEVICE]
+    assert isinstance(sinks[0], DeviceRingSink)
+    # The sink reads the registry `lifespan` built after the host: no device session is open.
+    assert registry is not None
+    assert present == [False]

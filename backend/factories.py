@@ -1615,8 +1615,8 @@ def build_capability_host(
 
     Alarms and timers share one store, one scheduler and one `RingingTracker`, which wraps the
     `RingRouter` that rings the desktop endpoint and then each of `ring_sinks`, and the host's
-    `SchedulerAlarmControl` runs over the same three. Without a usable `MIST_TIMEZONE` none of them is built, and alarms,
-    timers and the clock report the zone's reason.
+    `SchedulerAlarmControl` runs over the same three. Without a usable `MIST_TIMEZONE` none of
+    them is built, and alarms, timers and the clock report the zone's reason.
 
     Args:
         config: The parsed capability environment.
