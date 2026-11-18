@@ -20,7 +20,7 @@ from backend.memory.config import (
     NeedEmbedderName,
 )
 from backend.memory.models import ServingProfile
-from backend.memory.need_gate import NEED_EMBEDDERS
+from backend.memory.need_embedders import NEED_EMBEDDERS
 from backend.memory.retrieval_view import DEFAULT_FACT_VIEW, FACT_VIEWS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

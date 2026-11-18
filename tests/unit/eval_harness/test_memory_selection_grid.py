@@ -26,6 +26,7 @@ from safetensors import SafetensorError
 import backend.memory.need_gate as need_gate_module
 import scripts.eval_harness.memory_selection_grid as grid
 from backend.errors import MemoryRerankError, MistError
+from backend.memory.need_embedders import NEED_EMBEDDERS
 from backend.memory.need_gate import (
     FORM_CANDIDATES,
     CvResult,
@@ -155,7 +156,7 @@ def _labels(bank: NeedBank, fixture: Fixture, followups: Sequence[Followup]) -> 
 def _oracle(
     name: str, bank: NeedBank, fixture: Fixture, followups: Sequence[Followup]
 ) -> GateEmbedder:
-    prefix = need_gate_module.NEED_EMBEDDERS[name].query_prefix
+    prefix = NEED_EMBEDDERS[name].query_prefix
     return GateEmbedder(
         name=name,
         key_name=name,
@@ -1305,7 +1306,7 @@ def test_the_need_model_record_is_one_load_models_accepts(
     path.write_text(json.dumps({"records": [record]}), encoding="utf-8")
     [model] = load_models(path)
     assert model.embedder_name == BGE and model.embedder_revision == "oracle-v1"
-    assert model.query_prefix == need_gate_module.NEED_EMBEDDERS[BGE].query_prefix
+    assert model.query_prefix == NEED_EMBEDDERS[BGE].query_prefix
     assert model.bank_sha256 == bank.sha256
     assert (model.theta_low, model.theta_high) == (variant.theta_low, variant.theta_high)
     assert (model.band_k, model.recall_target) == (variant.band_k, variant.recall_target)
