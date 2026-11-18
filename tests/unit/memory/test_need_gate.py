@@ -23,12 +23,10 @@ from backend.memory.need_gate import (
     DEFAULT_BANK_PATHS,
     DEFAULT_MODEL_PATH,
     FORM_CANDIDATES,
-    NEED_EMBEDDERS,
     NEWTON_TOLERANCE,
     CvResult,
     FormSpec,
     NeedBank,
-    NeedEmbedderSpec,
     NeedExemplar,
     NeedFitError,
     NeedGate,
@@ -43,7 +41,6 @@ from backend.memory.need_gate import (
     grouped_cv,
     load_bank,
     load_models,
-    need_embedder_kwargs,
     need_model_key,
     probabilities,
     select_model,
@@ -299,7 +296,6 @@ class TestDefaults:
             NeedBank,
             NeedKey,
             NeedModel,
-            NeedEmbedderSpec,
             FormSpec,
             CvResult,
             need_gate.NeedDecision,
@@ -314,25 +310,6 @@ class TestDefaults:
             FormSpec("knn", 1.0, None)
         with pytest.raises(ValueError):
             FormSpec("knn", None, 0)
-
-
-class TestEmbedders:
-    def test_need_embedders_hold_the_prefixes_and_attention_settings(self):
-        assert dict(NEED_EMBEDDERS) == {
-            "shared": NeedEmbedderSpec("", None),
-            "bge-small-en-v1.5": NeedEmbedderSpec(
-                "Represent this sentence for searching relevant passages: ", None
-            ),
-            "granite-embedding-small-english-r2": NeedEmbedderSpec("", "sdpa"),
-        }
-
-    def test_kwargs_empty_without_an_attention_setting(self):
-        assert need_embedder_kwargs(NEED_EMBEDDERS["shared"]) == {}
-        assert need_embedder_kwargs(NEED_EMBEDDERS["bge-small-en-v1.5"]) == {}
-
-    def test_kwargs_carry_the_one_keyword_with_an_attention_setting(self):
-        spec = NEED_EMBEDDERS["granite-embedding-small-english-r2"]
-        assert need_embedder_kwargs(spec) == {"attn_implementation": "sdpa"}
 
 
 class TestContextText:

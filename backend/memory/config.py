@@ -22,7 +22,7 @@ from backend.errors import MemoryConfigError
 from backend.user_timezone import USER_TIMEZONE_ENV, ZoneLoader, resolve_user_timezone
 
 from .models import ServingProfile
-from .need_gate import NEED_EMBEDDERS
+from .need_embedders import NEED_EMBEDDERS
 from .retrieval_view import FACT_VIEWS
 
 FactViewId = Literal["F0", "F1", "F2", "F3"]
@@ -232,7 +232,7 @@ class MemoryConfig:
             (its `source` starts with `need_gate.SHADOW_ONLY`), fit when no gate met the
             eligibility rule, so nothing may act on it. `off` is also the rollback lever when
             the bank or the model file is what broke.
-        need_embedder: The gate embedder, a `need_gate.NEED_EMBEDDERS` name. `shared` reuses
+        need_embedder: The gate embedder, a `need_embedders.NEED_EMBEDDERS` name. `shared` reuses
             the fetch's own query vector; another name embeds the query a second time, with
             that model's query prefix, on the `memory-gate` executor. No run chose the default
             (H18, 16 Nov, ran no setting); it ships as built, and the shipped model is fit for
