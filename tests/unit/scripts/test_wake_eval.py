@@ -28,6 +28,7 @@ import pytest
 from backend.realtime.budget import EndpointingConfig, PlacementConfig, load_voice_settings
 from backend.realtime.engines.kws import read_manifest
 from backend.realtime.engines.parakeet_stt import OnnxAsrLibrary, ParakeetTranscriber
+from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
     AudioIngress,
     IngressEngines,
@@ -939,7 +940,7 @@ def test_the_real_engines_load_the_microwakeword_spotter_and_the_named_stt(
     monkeypatch.setattr(eval_wake, "parakeet_cpu", stt)
     placement = PlacementConfig(models_dir="/models", kws_model=MODEL_ID)
 
-    engines = eval_wake._real_engines("scripts.wake.eval_wake:parakeet_cpu")(placement)
+    engines = eval_wake.real_engines("scripts.wake.eval_wake:parakeet_cpu")(placement)
 
     assert engines == eval_wake.Engines(spotter="spotter", vad="vad", transcriber="stt")  # type: ignore[arg-type]
     assert seen == {
@@ -1165,6 +1166,114 @@ def test_no_transcript_text_reaches_the_output_or_the_logs(
         assert word not in captured.out
         assert word not in captured.err
     assert caplog.records, "the run should log its progress"
+
+
+# -- The driver's entry points for spotter_eval ------------------------------------------------
+
+
+def test_accepted_wakes_equal_the_tuning_pass_count(tmp_path: Path) -> None:
+    argv, engines, out, _ = tune_setup(tmp_path / "pass")
+    assert engines.run(argv) == 0
+    rows = by_threshold(json.loads(out.read_text(encoding="utf-8")))
+    # A fresh rig over the same audio, scripts and positions: the positives lead the tune split,
+    # so they sit at the same uplink positions with or without the entries after them.
+    _, fresh, _, _ = tune_setup(tmp_path / "direct")
+    tune = wake_manifest.load_manifest(tmp_path / "direct" / "manifest.json").split("tune")
+    positives = [item for item in tune if item.label == "positive"]
+    assert positives == list(tune[: len(positives)])
+
+    woken = eval_wake.accepted_wakes(
+        positives,
+        eval_wake.Engines(spotter=fresh.spotter, vad=fresh.vad, transcriber=fresh.transcriber),
+        load_voice_settings({}),
+        [0.3, 0.4, 0.5, 0.6, 0.7],
+        fresh.clock,
+    )
+
+    reported = {
+        threshold: row["false_reject"]["overall"]["total"]
+        - row["false_reject"]["overall"]["rejected"]
+        for threshold, row in rows.items()
+    }
+    assert woken == reported == {0.3: 3, 0.4: 3, 0.5: 2, 0.6: 1, 0.7: 0}
+
+
+def write_ambient(path: Path) -> None:
+    """640 ms of silence, 640 ms of tone (frames 32 to 63), then 1200 ms of silence."""
+    samples = tone_and_silence([(False, 640), (True, 640), (False, 1200)])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(samples.tobytes())
+
+
+# Every ambient file's stream reports a hit at frame 50, in its speech, and one at frame 90, in
+# silence after the segment has closed, which is warmed and never reported.
+AMBIENT_HITS = (
+    NameHit(end_pos=50, keyword="mist", score=0.6),
+    NameHit(end_pos=90, keyword="mist", score=0.7),
+)
+
+
+def test_the_ambient_gate_hears_each_file_once_and_decodes_each_span_once(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "ambient" / "a.wav", tmp_path / "ambient" / "b.wav"
+    write_ambient(first)
+    write_ambient(second)
+    engines = rig(AMBIENT_HITS, [ADDRESSED, UNADDRESSED])
+    gate = eval_wake.AmbientGate(
+        eval_wake.Engines(
+            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
+        ),
+        load_voice_settings({}),
+        engines.clock,
+    )
+
+    assert gate.accepted_hits(first, 0.5) == 1
+    assert gate.accepted_hits(first, 0.65) == 0
+    assert gate.accepted_hits(first, 0.3) == 1
+    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (1, 1, 1)
+
+    assert gate.accepted_hits(second, 0.5) == 0
+    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (2, 2, 2)
+    assert gate.decode_errors == 0
+
+    assert [stream.threshold for stream in engines.spotter.streams] == [0.5, 0.65, 0.3, 0.5]
+    for stream in engines.spotter.streams:
+        fed = sorted([*stream.warmed, *stream.pushed])
+        assert fed == list(range(len(fed)))
+        assert 50 in stream.pushed and 90 in stream.warmed
+
+
+def test_a_failed_ambient_decode_is_rejected_counted_and_logged_by_number(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "ambient" / "meeting-secret.wav"
+    write_ambient(path)
+    clock = FakeClock()
+
+    def failing() -> None:
+        raise SpeechEngineError("scripted decode failure")
+
+    spotter = ScriptedNameSpotter(AMBIENT_HITS)
+    transcriber = ScriptedTranscriber([ADDRESSED], ms_per_word=1, on_decode=failing)
+    gate = eval_wake.AmbientGate(
+        eval_wake.Engines(spotter=spotter, vad=EnergyVad(), transcriber=transcriber),
+        load_voice_settings({}),
+        clock,
+    )
+    caplog.set_level(logging.DEBUG)
+
+    assert gate.accepted_hits(path, 0.5) == 0
+    assert gate.accepted_hits(path, 0.3) == 0
+
+    assert (gate.decodes, gate.decode_errors, len(transcriber.streams)) == (1, 1, 1)
+    assert "ambient file 1" in caplog.text
+    assert "meeting-secret" not in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 # -- The harness: the test pass ---------------------------------------------------------------

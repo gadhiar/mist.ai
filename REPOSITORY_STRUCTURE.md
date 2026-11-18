@@ -37,7 +37,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
   - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
   - `record.py` - The guided host-side recorder for one headset sitting: 16 kHz clips and their draft manifest entries
-  - `spotter_eval.py` - The server spotter's pass bar: tune positives and false wakes per hour over an ambient set, written as the converter's evaluation
+  - `spotter_eval.py` - The server spotter's pass bar, measured after the addressee gate: gated tune wakes and gated false wakes per hour over an ambient set, beside the spotter-only figures written as the converter's evaluation
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
