@@ -205,12 +205,18 @@ SERVICE_ENVIRONMENT_DELTAS = {
     "EXTRACTION_SERVER_DEVICE",
     "EXTRACTION_SERVER_CTX_SIZE",
     "EXTRACTION_LLM_TIMEOUT_SECONDS",
+    "EXTRACTION_SERVER_N_CPU_MOE",
 }
 # Night context and the overlay's: 65,536 is Raj's ruling of 15 Nov (plan v4 A11, v5 M34).
 NIGHT_CTX_SIZE = "65536"
 OVERLAY_CTX_SIZE = "16384"
-# The LLM's floor: about 11 GiB of expert tensors on the CPU at ncmoe 24, the prompt-cache cap,
-# and 1 GiB for the server (plan v4, Interfaces, Compose).
+# Night ncmoe and the overlay's: at 24 the night rehearsal decoded 21.76 tokens per second,
+# below its bar of 23, and at 21 it passed every bar (plan v6, T8).
+NIGHT_NCMOE = "21"
+OVERLAY_NCMOE = "24"
+# The LLM's floor: about 11 GiB of expert tensors with all 24 layers' experts on the CPU, an
+# upper bound at ncmoe 21, the prompt-cache cap, and 1 GiB for the server (plan v4, Interfaces,
+# Compose). The night rehearsal measured a peak of 9.716 GiB at ncmoe 21.
 EXPERT_TENSORS_ON_CPU_GIB = 11
 SERVER_OVERHEAD_GIB = 1
 CHAT_TEMPLATE = re.compile(r"chat[-_ ]?templates?", re.I)
@@ -732,20 +738,19 @@ class TestParityWithTheExtractionOverlay:
         )
 
     def test_llm_settings_match_the_overlay_but_the_deltas(self, compose, overlay):
-        # Compared with no variable set: model path, ncmoe, batch, ubatch, mmap, reasoning,
-        # sampling and the cache-ram cap all resolve to the overlay's values.
+        # Compared with no variable set: model path, batch, ubatch, mmap, reasoning, sampling
+        # and the cache-ram cap all resolve to the overlay's values.
         daily = llama_server_settings(compose["services"][EXTRACTION_LLM])
         local = llama_server_settings(overlay["services"][OVERLAY_LLM])
 
         assert set(daily) == set(local) | set(CACHE_AND_ATTENTION_SETTINGS)
-        for setting in set(local) - {"LLAMA_ARG_CTX_SIZE"}:
+        for setting in set(local) - {"LLAMA_ARG_CTX_SIZE", "-ncmoe"}:
             assert _resolved(daily[setting]) == _resolved(local[setting]), setting
 
     @pytest.mark.parametrize(
         "setting, expected",
         [
             pytest.param("LLAMA_ARG_MODEL", "/models/ggml-org/gpt-oss-20b-MXFP4.gguf", id="model"),
-            pytest.param("-ncmoe", "24", id="ncmoe"),
             pytest.param("-b", "2048", id="batch"),
             pytest.param("-ub", "2048", id="ubatch"),
             pytest.param("-lm", "none", id="no-mmap"),
@@ -772,6 +777,17 @@ class TestParityWithTheExtractionOverlay:
 
         assert _resolved(daily["LLAMA_ARG_CTX_SIZE"]) == NIGHT_CTX_SIZE
         assert _resolved(local["LLAMA_ARG_CTX_SIZE"]) == OVERLAY_CTX_SIZE
+
+    def test_delta_ncmoe_default(self, compose, overlay):
+        daily_llm = llama_server_settings(compose["services"][EXTRACTION_LLM])
+        local_llm = llama_server_settings(overlay["services"][OVERLAY_LLM])
+        daily_service = _environment(compose["services"][EXTRACTION])
+        local_service = _environment(overlay["services"][OVERLAY_SERVICE])
+
+        assert _resolved(daily_llm["-ncmoe"]) == NIGHT_NCMOE
+        assert _resolved(daily_service["EXTRACTION_SERVER_N_CPU_MOE"]) == NIGHT_NCMOE
+        assert _resolved(local_llm["-ncmoe"]) == OVERLAY_NCMOE
+        assert _resolved(local_service["EXTRACTION_SERVER_N_CPU_MOE"]) == OVERLAY_NCMOE
 
     @pytest.mark.parametrize("setting", CACHE_AND_ATTENTION_SETTINGS)
     def test_delta_cache_types_and_flash_attention(self, compose, overlay, setting):

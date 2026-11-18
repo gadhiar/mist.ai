@@ -270,7 +270,7 @@ services:
     command:
       - "--no-webui"
       - "-ncmoe"
-      - "${MIST_DAILY_EXTRACTION_NCMOE:-24}"
+      - "${MIST_DAILY_EXTRACTION_NCMOE:-21}"
       - "-b"
       - "2048"
       - "-ub"
@@ -286,8 +286,9 @@ services:
     # No ports and no share network: only mist-extraction calls it.
     networks:
       - default
-    # The expert tensors on the CPU (about 11 GiB at ncmoe 24), the 2048 MiB prompt-cache cap
-    # and 1 GiB for the server.
+    # The night rehearsal measured a peak of 9.716 GiB at ncmoe 21. The limit holds at most
+    # about 11 GiB of expert tensors (all 24 layers' experts on the CPU), the 2048 MiB
+    # prompt-cache cap and 1 GiB for the server.
     mem_limit: ${MIST_DAILY_EXTRACTION_LLM_MEM_LIMIT:-14g}
     logging: *logging
     deploy:
@@ -332,7 +333,7 @@ services:
       - EXTRACTION_SERVER_FLASH_ATTN=on
       - EXTRACTION_SERVER_CACHE_TYPE_K=q8_0
       - EXTRACTION_SERVER_CACHE_TYPE_V=q8_0
-      - EXTRACTION_SERVER_N_CPU_MOE=${MIST_DAILY_EXTRACTION_NCMOE:-24}
+      - EXTRACTION_SERVER_N_CPU_MOE=${MIST_DAILY_EXTRACTION_NCMOE:-21}
       - EXTRACTION_SERVER_BATCH=2048
       - EXTRACTION_SERVER_UBATCH=2048
       - EXTRACTION_SERVER_CACHE_RAM_MIB=${MIST_DAILY_EXTRACTION_CACHE_RAM_MIB:-2048}

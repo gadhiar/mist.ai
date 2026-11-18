@@ -99,7 +99,7 @@ before anything starts.
 | `MIST_EXTRACTION_WINDOW` | the instance CLI: the night window, `HH:MM-HH:MM` in host local time | no | `23:59-10:00` |
 | `MIST_DAILY_EXTRACTION_MODEL_FILE` | compose: the model the extraction llama-server loads | no | `ggml-org/gpt-oss-20b-MXFP4.gguf` |
 | `MIST_DAILY_EXTRACTION_CTX_SIZE` | compose: extraction llama-server context size | no | `65536` |
-| `MIST_DAILY_EXTRACTION_NCMOE` | compose: MoE layers whose experts stay on the CPU | no | `24` |
+| `MIST_DAILY_EXTRACTION_NCMOE` | compose: MoE layers whose experts stay on the CPU | no | `21` |
 | `MIST_DAILY_EXTRACTION_CACHE_RAM_MIB` | compose: extraction llama-server prompt-cache cap | no | `2048` |
 | `EXTRACTION_MODEL_HASH` | compose: the model identity `mist-extraction` stamps | for extraction | none, and extraction stays paused |
 | `EXTRACTION_LLM_DEVICE` | compose: the GPU name in `mist-extraction`'s serving identity | for extraction | none, and extraction stays paused |
@@ -707,8 +707,11 @@ start it while the daily instance runs:
 - its `mist-backend` and `mist-neo4j` cannot bind ports 8001, 7687 and 7474, which the daily
   instance holds;
 - its `mist-llm`, which publishes 8080 (`docker-compose.yml:137-138`), would load a second model
-  onto the GPU, where it would compete with the instance's llama-server for the 12 GB card's
-  memory; two llama-servers have not been measured together on this card;
+  onto the GPU, where it would compete with the instance's llama-servers for the 12 GB card's
+  memory. The night rehearsal ran the instance's own two llama-servers together, `mist-llm`
+  beside `mist-extraction-llm` at `MIST_DAILY_EXTRACTION_NCMOE` 21: a peak `memory.used` of
+  10,105 MiB, a contended chat time to first token of at most 0.459 s, and a chat-idle
+  extraction decode median of 24.74 tokens per second over three trials;
 - once the original data has moved into the instance root, it starts an empty MIST, because its
   mounts are relative to the repository (`./data`, `./logs`, `./mist-memory`).
 
@@ -729,11 +732,12 @@ are 8g backend, 3g Neo4j, 9g LLM, 4g backup, 14g `mist-extraction-llm` and 1g `m
     the end of the rerun, `memory.stat` counted 5374 MiB of file pages, mostly the memory-mapped
     model, which the kernel can reclaim, and 312 MiB of anonymous memory.
 - The backend's and backup's are estimates. The backend's has been measured on text turns only.
-- The extraction services' limits are estimates from the comments in `compose.yml` and
-  `daily.env.example`, with no measured peak yet; the night rehearsal records them.
-  `mist-extraction-llm`'s 14g holds the expert tensors kept on the CPU (about 11 GiB at
-  `MIST_DAILY_EXTRACTION_NCMOE` 24), the 2048 MiB prompt-cache cap and 1 GiB for the server.
-  `mist-extraction`'s 1g has no breakdown.
+- `mist-extraction-llm`'s 14g has a measured peak of 9.716 GiB from the night rehearsal, at
+  `MIST_DAILY_EXTRACTION_NCMOE` 21, which leaves 30.6% of 14g free, more than 1 GiB. The limit
+  holds at most about 11 GiB of expert tensors (all 24 layers' experts on the CPU), the 2048 MiB
+  prompt-cache cap and 1 GiB for the server.
+- `mist-extraction`'s 1g is an estimate with no breakdown and no measured peak, because the
+  first night run never started it.
 
 The six limits add up to more than the Docker VM's memory, on purpose: each one bounds a single
 service, and what must fit the VM is the sum of what the services use.
