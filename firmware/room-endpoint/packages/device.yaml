@@ -13,9 +13,23 @@ esphome:
   name: ${device_name}
   min_version: 2026.10.2
   on_boot:
-    priority: -100
-    then:
-      - micro_wake_word.start:
+    # The speaker's amplifier is enabled by GPIO47, which the published config holds off at reset
+    # (`internal_speaker_amp`, `restore_mode: ALWAYS_OFF`, home-assistant-voice.yaml at 2644f4c,
+    # lines 280-286) and turns on 1 s into boot (lines 42-48). As there.
+    - priority: 375
+      then:
+        - delay: 1s
+        - switch.turn_on: internal_speaker_amp
+    - priority: -100
+      then:
+        # The DAC's level. `i2s_audio_speaker` starts at volume 1.0, which the AIC3204 maps to
+        # +24 dB of digital gain (aic3204.cpp:152-157), so a reply above -24 dBFS clips. The
+        # published config's media player starts at `volume_initial` 0.5 (speaker_source
+        # media_player.py:130) within `volume_min` 0.4 and `volume_max` 0.85
+        # (home-assistant-voice.yaml lines 1668-1670), which it hands the speaker as 0.625
+        # (speaker_source_media_player.cpp:820-829): -8.5 dB here as there.
+        - lambda: id(i2s_audio_speaker).set_volume(0.625f);
+        - micro_wake_word.start:
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -117,6 +131,13 @@ microphone:
     i2s_mode: secondary
     i2s_audio_id: i2s_input
     channel: stereo
+
+switch:
+  - platform: gpio
+    pin: GPIO47
+    id: internal_speaker_amp
+    restore_mode: ALWAYS_OFF
+    internal: true
 
 audio_dac:
   - platform: aic3204
