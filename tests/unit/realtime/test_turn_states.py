@@ -2535,22 +2535,32 @@ async def test_mist_stop_with_speculative_start_off_starts_a_turn_from_u_that_me
     assert recorded(h) == ["open", "open", "commit:interrupted"]
 
 
-async def test_mist_stop_on_a_held_turn_from_u_whose_final_keeps_the_name_releases_and_merges():
-    """In `held` only a keyword-only end cancels (`KeywordBargeIn._judge_whole`); a final that
-    keeps the name is a new request, so the held turn from U is released and carries K.
+async def test_mist_stop_on_a_held_turn_from_u_whose_final_keeps_the_name_cancels_it():
+    """In `held` one leading name then a keyword alone cancels (`KeywordBargeIn._judge_whole`),
+    as the keyword alone does: U closes `dropped` `keyword` and K is recorded on its own, once.
     """
-    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    h = make_harness([Pause(), Token("Late.")], [Pause()], [Pause()])
     uid = await kept_turn(h, "mist, stop")
+
+    await _stop_with_the_name_on_the_held_turn(h, uid)
+
+    assert h.outbound.of("voice_decision:release") == []
+    assert [r.user_text for r in h.responder.requests] == [K_TEXT, f"{K_TEXT} mist, stop"]
+    assert commits_of(h) == [("superseded", "")]
+    await h.controller.close()
+    assert commits_of(h) == [("superseded", "")]
+
+
+async def _stop_with_the_name_on_the_held_turn(h: Harness, uid: str) -> None:
+    """The name and `stop` with speculative start on, the final transcript keeping the name."""
     h.post(h.ingress.candidate(uid, "mist, stop"))
     await h.settle()
-
+    assert h.controller.phase == "held"
+    assert h.responder.requests[-1].user_text == f"{K_TEXT} mist, stop"
     h.post(h.ingress.ended(uid, "mist, stop"))
     await h.settle()
-
-    assert len(h.outbound.of("voice_decision:release")) == 1
-    assert h.outbound.of("voice_decision:dropped") == []
-    assert [r.user_text for r in h.responder.requests] == [K_TEXT, f"{K_TEXT} mist, stop"]
-    assert h.responder.commits == []
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.utterance_id) == ("keyword", uid)
 
 
 async def _stop_on_the_held_turn(h: Harness, uid: str) -> None:
@@ -2615,6 +2625,7 @@ async def _cancel(h: Harness, uid: str) -> None:
     "end_u",
     [
         _stop_on_the_held_turn,
+        _stop_with_the_name_on_the_held_turn,
         _mute,
         _voice_stop,
         _voice_start_over_an_adopted_ingress,
@@ -2624,6 +2635,7 @@ async def _cancel(h: Harness, uid: str) -> None:
     ],
     ids=[
         "mist-stop-speculative",
+        "mist-stop-with-the-name",
         "mute",
         "voice_stop",
         "voice_start",

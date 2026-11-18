@@ -599,12 +599,16 @@ class World:
         self.synth = FailingSynthesizer(fail_call=-1, ms_per_char=10)
         self.arbiter = FakeWakeArbiter(solo=False)
         self.host = ModelHost(self)
+        wake = WakeConfig()
         self.policy = KeywordBargeIn(
-            BargeInConfig(), aec="headset", recent_tts_text=lambda _ms: "", clock=self.clock
+            BargeInConfig(),
+            aec="headset",
+            names=wake.names,
+            recent_tts_text=lambda _ms: "",
+            clock=self.clock,
         )
         self.ingress: ModelIngress | None = None
         self.ingresses: list[ModelIngress] = []
-        wake = WakeConfig()
         self.controller = TurnController(
             session_id="s",
             responder=self.responder,

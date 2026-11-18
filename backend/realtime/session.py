@@ -935,6 +935,7 @@ class RealtimeSession:
         policy = KeywordBargeIn(
             config.barge_in,
             aec=settings.aec,
+            names=config.wake.names,
             recent_tts_text=self.recent_tts_text,
             clock=self._clock.now_ms,
         )

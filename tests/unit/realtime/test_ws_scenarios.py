@@ -297,9 +297,13 @@ def test_other_speech_while_she_speaks_sends_nothing(voice_server):
         assert_protocol_rules(client)
 
 
-def test_stop_while_thinking_ends_the_turn_with_an_empty_response(voice_server):
-    """v1 scenario 6 with v2's change: `stop` closes with `dropped keyword`, no new turn."""
-    stack = VoiceStack(transcripts=["mist, what's the weather", "stop"])
+@pytest.mark.parametrize("second", ["stop", "mist, stop"])
+def test_stop_while_thinking_ends_the_turn_with_an_empty_response(voice_server, second):
+    """v1 scenario 6 with v2's change: `stop` closes with `dropped keyword`, no new turn.
+
+    Her name before the keyword, unmarked by the spotter so nothing supersedes, ends the same way.
+    """
+    stack = VoiceStack(transcripts=["mist, what's the weather", second])
     pause = Pause()
     with voice_server(stack) as srv, srv.connect() as client:
         srv.responder.add(pause, Token("Sure."))
@@ -500,6 +504,41 @@ def test_a_name_while_she_thinks_supersedes_the_turn(voice_server):
         ]
         assert [commit.outcome for commit in srv.responder.commits] == ["completed"]
         assert metrics["turn_id"] != first and metrics["outcome"] == "completed"
+        assert_protocol_rules(client)
+
+
+def test_mist_stop_while_she_thinks_supersedes_the_turn_and_starts_none(voice_server):
+    """The name heard on "mist, stop" supersedes the thinking turn, and the end, her name then a
+    keyword alone, cancels the held turn from it: the first turn is recorded on its own, empty,
+    and no second turn reaches the model or the client.
+    """
+    stack = VoiceStack(transcripts=["mist, what's the weather", "mist, stop"])
+    pause = Pause()
+    with voice_server(stack) as srv, srv.connect() as client:
+        srv.responder.add(pause, Token("It is sunny."))
+        srv.responder.add(Pause())
+        client.send(voice_start(1))
+        client.say(NAMED, name_at_ms=NAME_AT_MS)
+        (first,) = (item["turn_id"] for item in client.of("state_cycle", state="think"))
+        client.say(NAMED, name_at_ms=NAME_AT_MS)
+        srv.run(pause.release)
+
+        supersede = one(client, "supersede", turn_id=first)
+        assert supersede["detail"] == {"merged": True, "tool_dispatched": False}
+        dropped = one(client, "dropped")
+        assert dropped["reason"] == "keyword"
+        (said_first,) = (item["utterance_id"] for item in client.of("transcription"))
+        (said_second,) = {item["utterance_id"] for item in client.of("transcript_partial")} - {
+            said_first
+        }
+        assert dropped["detail"]["utterance_id"] == said_second
+        # Only the first utterance's held turn is released; the second's is cancelled unseen.
+        assert [item["detail"]["utterance_id"] for item in client.of("release")] == [said_first]
+        assert [(c.outcome, c.delivered_text) for c in srv.responder.commits] == [
+            ("superseded", "")
+        ]
+        assert_no_second_turn(srv, client)
+        assert client.of("stream_token") == []
         assert_protocol_rules(client)
 
 
