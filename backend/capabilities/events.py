@@ -1,4 +1,4 @@
-"""WebSocket protocol 1.4.0 payloads for capabilities, and the sink that queues them.
+"""WebSocket protocol 1.4.0 payloads for capabilities, and the sink port that emits them.
 
 They are Pydantic models because they are WebSocket schemas (CLAUDE.md, Data types). Building a
 server-to-client payload through its model makes a payload that drifts from the protocol fail
@@ -9,8 +9,6 @@ needs.
 
 from __future__ import annotations
 
-import asyncio
-import json
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 
@@ -386,19 +384,3 @@ class EventSink(Protocol):
     def emit(self, payload: dict[str, object]) -> None:
         """Send one payload; safe to call from any thread."""
         ...
-
-
-class QueueEventSink:
-    """Puts each payload, as one JSON string, on the server's broadcast queue.
-
-    `emit` hands the put to the queue's loop with `call_soon_threadsafe`, because an
-    `asyncio.Queue` may only be touched from its own loop's thread.
-    """
-
-    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[str | bytes]) -> None:
-        self._loop = loop
-        self._queue = queue
-
-    def emit(self, payload: dict[str, object]) -> None:
-        """Serialise `payload` now and queue it on the loop's thread."""
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, json.dumps(payload))

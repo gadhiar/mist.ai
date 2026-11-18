@@ -308,9 +308,7 @@ class TestWebSocketPush:
             _extraction_pipeline=world.build_pipeline(),
             attach_extraction_dispatcher=lambda d: None,
         )
-        voice_processor = SimpleNamespace(
-            models=SimpleNamespace(knowledge=SimpleNamespace(conversation_handler=handler))
-        )
+        runtime = SimpleNamespace(conversation_handler=handler)
         from tests.mocks.config import build_test_config
 
         config = build_test_config(embedding_model="test-emb")
@@ -319,7 +317,7 @@ class TestWebSocketPush:
         config.model_hash = world.service.model_hash
         config.extraction_version = world.service.extraction_version
         config.ontology_version = ONTOLOGY_VERSION
-        dispatcher = await server._start_extraction_dispatcher(voice_processor, config)
+        dispatcher = await server._start_extraction_dispatcher(runtime, config)
         world.dispatchers.append(dispatcher)
         await wait_until(lambda: not captured.empty())
 

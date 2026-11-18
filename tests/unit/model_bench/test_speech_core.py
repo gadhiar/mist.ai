@@ -653,8 +653,17 @@ def test_speech_arms_lists_the_stock_voices_and_timing_voices():
     ]
     assert tts["turbo"]["voices"] == ["builtin"]
     assert tts["original"]["voices"] == ["builtin"]
+    assert tts["pocket-clone"]["voices"] == ["identity"]
+    assert tts["qwen3-design"]["voices"] == ["designed"]
     timing = {engine: cfg["timing_voice"] for engine, cfg in tts.items()}
-    assert timing == {"qwen3": "aiden", "turbo": "builtin", "original": "builtin", "pocket": "alba"}
+    assert timing == {
+        "qwen3": "aiden",
+        "turbo": "builtin",
+        "original": "builtin",
+        "pocket": "alba",
+        "pocket-clone": "identity",
+        "qwen3-design": "designed",
+    }
     assert set(tts["qwen3"]["listening_voices"]) == {
         "ryan",
         "vivian",
@@ -706,6 +715,97 @@ def test_small_arms_holds_four_models_and_no_file_pins():
 
 def test_core_validate_inputs_finds_no_problem_in_the_committed_material():
     assert core.validate_inputs(_REPO_ROOT) == []
+
+
+@pytest.mark.parametrize("arm", ["pocket-clone", "qwen3-design"])
+def test_the_arms_loader_accepts_each_new_arm(arm):
+    doc = core.load_json(core.SPEECH_ARMS_PATH)
+    only = {**doc, "tts": {arm: doc["tts"][arm]}}
+
+    assert core._validate_speech_arms(only) == []
+
+
+# ---------------------------------------------------------------------------
+# The identity clip `--voice-clip` names: checked, fingerprinted, never named
+# ---------------------------------------------------------------------------
+
+CLIP_TRANSCRIPT = "zebra quartz lantern seventeen test line one"
+
+
+def _sine_clip(root: Path, name: str = "clip.wav") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / name
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(
+            b"".join(struct.pack("<h", int(8000 * ((i % 40) / 20 - 1))) for i in range(16000))
+        )
+    (root / "clip.txt").write_text(CLIP_TRANSCRIPT, encoding="utf-8")
+    return path
+
+
+def test_check_voice_clip_returns_the_resolved_clip_and_a_12_hex_sha256_prefix(tmp_path):
+    clip = _sine_clip(tmp_path / "identity")
+
+    checked = core.check_voice_clip(clip)
+
+    assert checked.path == clip.resolve()
+    assert checked.sha256_prefix == core.sha256_file(clip)[:12]
+    assert re.fullmatch(r"[0-9a-f]{12}", checked.sha256_prefix)
+    assert str(clip) not in repr(checked) and CLIP_TRANSCRIPT not in repr(checked)
+
+
+@pytest.mark.parametrize("case", ["missing", "a-directory", "not-a-wav", "inside-the-checkout"])
+def test_check_voice_clip_refuses_without_naming_the_path(tmp_path, case):
+    identity = tmp_path / "identity"
+    clip = _sine_clip(identity)
+    target = {
+        "missing": identity / "absent.wav",
+        "a-directory": identity,
+        "not-a-wav": identity / "clip.txt",
+        "inside-the-checkout": _REPO_ROOT / "scripts" / "model_bench" / "speech" / "lines.json",
+    }[case]
+
+    with pytest.raises(core.VoiceClipError) as info:
+        core.check_voice_clip(target, repo_root=_REPO_ROOT)
+
+    message = str(info.value)
+    for secret in (str(target), target.as_posix(), str(clip), CLIP_TRANSCRIPT, "absent"):
+        assert secret not in message
+
+
+def test_check_voice_clip_refuses_a_wav_inside_the_checkout(tmp_path):
+    clip = _sine_clip(tmp_path / "repo" / "voices")
+
+    with pytest.raises(core.VoiceClipError, match="checkout"):
+        core.check_voice_clip(clip, repo_root=tmp_path / "repo")
+
+
+@pytest.mark.parametrize(
+    ("engines", "clip", "refused"),
+    [
+        pytest.param(("pocket-clone",), None, True, id="clone-without-a-clip"),
+        pytest.param(("pocket", "qwen3"), "clip", True, id="clip-without-clone"),
+        pytest.param(("pocket", "pocket-clone"), "clip", False, id="clip-with-clone"),
+        pytest.param(("pocket",), None, False, id="neither"),
+    ],
+)
+def test_a_clip_goes_with_pocket_clone_and_only_with_it(engines, clip, refused):
+    if refused:
+        with pytest.raises(core.VoiceClipError):
+            core.check_voice_clip_use(engines, clip)
+    else:
+        core.check_voice_clip_use(engines, clip)
+
+
+def test_the_plan_context_names_the_clip_by_a_placeholder():
+    ctx = core.build_plan_context(_REPO_ROOT)
+
+    assert ctx.voice_clip == core.VOICE_CLIP_PLACEHOLDER == "<voice-clip>"
+    assert core.VOICE_CLIP_ENGINE == "pocket-clone"
+    assert core.IDENTITY_VOICE == "identity"
 
 
 # ---------------------------------------------------------------------------

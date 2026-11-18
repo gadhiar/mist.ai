@@ -1,8 +1,8 @@
 """T2b part B: turns answered without knowledge integration are counted and warned about.
 
-`ModelManager.generate_llm_response` is exercised for real; `__init__` is
-bypassed (it loads Whisper/TTS and builds a live KnowledgeIntegration), the same
-approach `tests/unit/test_session_id_propagation.py` takes.
+The fallback moved from `ModelManager.generate_llm_response` to `DirectResponder` (T12); these
+are the same assertions against it. Each turn's stream counts once; opening and committing it
+count nothing.
 """
 
 from __future__ import annotations
@@ -12,43 +12,26 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.chat.stream_events import Complete, Token
+from backend.chat.turn_scope import CommitResult, TurnDelivery, TurnRequest
 from backend.extraction_backlog import telemetry
+from backend.realtime.degraded import FALLBACK_SYSTEM_PROMPT, DirectResponder
 from backend.request_context import current_request_id
-from backend.voice_models.model_manager import ModelManager
 
 TELEMETRY_LOGGER = "backend.extraction_backlog.telemetry"
+
+pytestmark = pytest.mark.asyncio
 
 
 class _FakeProvider:
     def __init__(self) -> None:
         self.requests = []
 
-    def generate_sync(self, request, stream=True):
+    async def generate(self, request, *, stream=False):
         self.requests.append(request)
-        yield SimpleNamespace(content="Hello")
-        yield SimpleNamespace(content=" there.")
-
-
-class _FakeKnowledge:
-    def __init__(self, enabled: bool) -> None:
-        self._enabled = enabled
-        self.calls = []
-
-    def is_enabled(self) -> bool:
-        return self._enabled
-
-    def generate_response_streaming(self, user_text, event_loop=None):
-        self.calls.append(user_text)
-        yield "From the graph."
-
-
-def _manager(knowledge) -> tuple[ModelManager, _FakeProvider]:
-    mm = object.__new__(ModelManager)
-    provider = _FakeProvider()
-    mm.knowledge = knowledge
-    mm._llm_provider = provider
-    mm.event_loop = None
-    return mm, provider
+        yield SimpleNamespace(content="Hello", partial=True)
+        yield SimpleNamespace(content=" there.", partial=True)
+        yield SimpleNamespace(content=None, partial=False)
 
 
 @pytest.fixture(autouse=True)
@@ -64,25 +47,35 @@ def _warnings(caplog) -> list[logging.LogRecord]:
     ]
 
 
-class TestFallbackBranch:
-    @pytest.mark.parametrize(
-        "knowledge", [None, _FakeKnowledge(enabled=False)], ids=["no_knowledge", "knowledge_off"]
-    )
-    def test_each_fallback_turn_counts_once_and_warns_once(self, knowledge, caplog):
+def _request(text: str) -> TurnRequest:
+    return TurnRequest(session_id="s1", user_text=text, origin="text", channel="text")
+
+
+async def _turn(responder: DirectResponder, text: str) -> tuple[str, list[object]]:
+    scope = responder.open_turn(_request(text))
+    events = [event async for event in responder.stream_turn(scope)]
+    tokens = "".join(e.text for e in events if isinstance(e, Token))
+    return tokens, events
+
+
+class TestFallbackTurns:
+    async def test_each_fallback_turn_counts_once_and_warns_once(self, caplog):
         # Arrange
-        mm, provider = _manager(knowledge)
+        provider = _FakeProvider()
+        responder = DirectResponder(provider)
         token = current_request_id.set("turn-41")
 
         # Act
         try:
             with caplog.at_level(logging.WARNING, logger=TELEMETRY_LOGGER):
-                first = "".join(mm.generate_llm_response("hi"))
-                second = "".join(mm.generate_llm_response("and again"))
+                first, events = await _turn(responder, "hi")
+                second, _ = await _turn(responder, "and again")
         finally:
             current_request_id.reset(token)
 
         # Assert
         assert first == second == "Hello there."
+        assert events[-1] == Complete(final_response="Hello there.")
         assert len(provider.requests) == 2
         assert telemetry.unrecorded_turns() == 2
         records = _warnings(caplog)
@@ -90,28 +83,48 @@ class TestFallbackBranch:
         assert all("request_id=turn-41" in r.getMessage() for r in records)
         assert "unrecorded_total=2" in records[-1].getMessage()
 
-    def test_a_missing_request_id_is_logged_as_a_dash(self, caplog):
-        mm, _provider = _manager(None)
+    async def test_a_missing_request_id_is_logged_as_a_dash(self, caplog):
+        responder = DirectResponder(_FakeProvider())
         token = current_request_id.set(None)
         try:
             with caplog.at_level(logging.WARNING, logger=TELEMETRY_LOGGER):
-                list(mm.generate_llm_response("hi"))
+                await _turn(responder, "hi")
         finally:
             current_request_id.reset(token)
 
         assert "request_id=- " in _warnings(caplog)[0].getMessage()
 
+    async def test_the_request_keeps_the_fallback_prompt_and_its_token_limit(self):
+        provider = _FakeProvider()
 
-class TestKnowledgeBranch:
-    def test_the_knowledge_path_neither_counts_nor_warns(self, caplog):
-        knowledge = _FakeKnowledge(enabled=True)
-        mm, provider = _manager(knowledge)
+        await _turn(DirectResponder(provider), "what is up")
+
+        request = provider.requests[0]
+        assert request.messages == [
+            {"role": "system", "content": FALLBACK_SYSTEM_PROMPT},
+            {"role": "user", "content": "what is up"},
+        ]
+        assert request.max_tokens == 400
+        assert request.top_p == 0.9
+        assert FALLBACK_SYSTEM_PROMPT.startswith("You are M.I.S.T, a helpful voice assistant")
+        assert FALLBACK_SYSTEM_PROMPT.endswith("thorough when needed.")
+
+
+class TestOpenAndCommit:
+    async def test_opening_and_committing_neither_count_nor_warn(self, caplog):
+        responder = DirectResponder(_FakeProvider())
 
         with caplog.at_level(logging.WARNING, logger=TELEMETRY_LOGGER):
-            text = "".join(mm.generate_llm_response("what do I use?"))
+            scope = responder.open_turn(_request("hi"))
+            result = responder.commit_turn(
+                scope,
+                TurnDelivery(
+                    outcome="completed", delivered_text="", stt_model=None, tts_model=None
+                ),
+            )
+            responder.prefetch("s1", "partial")
 
-        assert text == "From the graph."
-        assert knowledge.calls == ["what do I use?"]
-        assert provider.requests == []
+        assert result == CommitResult(recorded=False, event_id=None, error=None)
+        assert scope.dispatch_gate.is_set()
         assert telemetry.unrecorded_turns() == 0
         assert _warnings(caplog) == []

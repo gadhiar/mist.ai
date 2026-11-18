@@ -327,6 +327,26 @@ class TestDegradedBeneath:
 
         assert degraded_beneath(snap) is False
 
+    def test_a_paused_check_counts_as_up(self) -> None:
+        """Extraction stopped by schedule is not a fault hidden beneath the yield."""
+        snap = _snapshot(
+            "yielded",
+            llm=_check("yielded", "fatal"),
+            neo4j=_check("up", "fatal"),
+            extraction_service=_check("paused"),
+        )
+
+        assert degraded_beneath(snap) is False
+
+    def test_a_stale_paused_check_counts_as_not_up(self) -> None:
+        snap = _snapshot(
+            "yielded",
+            llm=_check("yielded", "fatal"),
+            extraction_service=_check("paused", stale=True),
+        )
+
+        assert degraded_beneath(snap) is True
+
     @pytest.mark.parametrize("status", ["healthy", "degraded", "unhealthy"])
     def test_false_for_every_non_yielded_snapshot(self, status: str) -> None:
         snap = _snapshot(status, llm=_check("down", "fatal"), backup=_check("down"))

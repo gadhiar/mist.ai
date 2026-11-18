@@ -10,9 +10,10 @@ dead socket.
 Most tests here do not boot the ASGI lifespan. The pieces `lifespan` calls are
 module level for exactly that reason, so the sequence and the wiring are
 assertable without faking the model stack. The gaming-mode tests at the end
-are the exception: what they pin is which object `lifespan` hands to the voice
-processor, the probes and the curation scheduler, so they run `lifespan` with
-every builder that would reach the model stack, Neo4j or the vault replaced.
+are the exception: what they pin is which object `lifespan` hands to the runtime
+build, the session registry, the probes and the curation scheduler, so they run
+`lifespan` with every builder that would reach the model stack, Neo4j or the
+vault replaced (`build_mist_runtime` by a `RuntimeFactory`).
 
 `test_health_is_always_200` uses `fastapi.testclient.TestClient`, and that is
 the first use of it in `tests/` -- `grep -rln TestClient tests/` found nothing
@@ -24,7 +25,9 @@ and load the model stack.
 """
 
 import asyncio
+import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -36,7 +39,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import server
+from backend.capabilities.power import FixedPower, GpuYieldPower
 from backend.extraction_contract.models import HealthResponse
+from backend.extraction_hold import EXTRACTION_PAUSED_MARKER
 from backend.gpu_yield import GpuYield
 from backend.health import (
     BroadcasterProbe,
@@ -51,7 +56,9 @@ _GLOBALS = (
     "_models_ready",
     "_broadcaster_state",
     "_health_registry",
-    "voice_processor",
+    "runtime",
+    "session_registry",
+    "_capability_sink",
     "vault_sidecar",
     "extraction_dispatcher",
     "_extraction_dispatcher_start_failed",
@@ -125,11 +132,138 @@ class FakeLLMProvider:
         return self.healthy
 
 
-class FakeVoiceProcessorHoldingLLM:
-    """Only what `_health_llm_provider` reads. No models, no VAD, no torch."""
+class FakeRuntimeHoldingLLM:
+    """Only what `_health_llm_provider` reads: the runtime's base provider. No models."""
 
     def __init__(self, provider) -> None:
-        self._llm_provider = provider
+        self.llm_provider = provider
+
+
+class FakeGpu:
+    """The runtime's GPU control (`GpuEngines`), recording what the server asks of it."""
+
+    def __init__(self) -> None:
+        self.attached: tuple[object, object] | None = None
+        self.levels: list[str] = []
+        self.calls: list[str] = []
+        self.reload_error: BaseException | None = None
+
+    def attach(self, loop, host) -> None:
+        self.attached = (loop, host)
+
+    def level_changed(self, level) -> None:
+        self.levels.append(level)
+
+    def release(self) -> int:
+        self.calls.append("release")
+        return 0
+
+    def reload(self) -> None:
+        self.calls.append("reload")
+        if self.reload_error is not None:
+            raise self.reload_error
+
+    def stop(self) -> None:
+        self.calls.append("stop")
+
+
+def fake_mist_runtime(
+    *,
+    handler=None,
+    provider=None,
+    gpu: FakeGpu | None = None,
+    power_gate=None,
+    alarm_ringing=None,
+    on_capability_message=None,
+    closed: list[str] | None = None,
+):
+    """A real `MistRuntime` over fakes: no engine loaded, inline lanes, a recording GPU."""
+    from backend.realtime.budget import VoiceSettings
+    from backend.realtime.runtime import MistRuntime
+    from backend.realtime.session import InferenceLanes, SessionServices, SpeechEngines
+    from tests.unit.realtime.turn_fakes import FakeResponder, InlineLane, floor_placement
+
+    class ClosingLane(InlineLane):
+        def shutdown(self) -> None:
+            if closed is not None:
+                closed.append("lane")
+
+    engines = SpeechEngines()
+    lanes = InferenceLanes(
+        vad=ClosingLane(),
+        eot=ClosingLane(),
+        stt=ClosingLane(),
+        tts=ClosingLane(),
+        kws=ClosingLane(),
+    )
+    settings = VoiceSettings()
+    responder = handler if handler is not None else FakeResponder()
+    extra: dict[str, object] = {}
+    if alarm_ringing is not None:
+        extra["alarm_ringing"] = alarm_ringing
+    if on_capability_message is not None:
+        extra["on_capability_message"] = on_capability_message
+    services = SessionServices(
+        responder=responder,  # type: ignore[arg-type]
+        engines=engines,
+        lanes=lanes,
+        settings=settings,
+        placement=floor_placement,
+        power_gate=power_gate,
+        **extra,  # type: ignore[arg-type]
+    )
+    return MistRuntime(
+        llm_provider=provider if provider is not None else FakeLLMProvider(),
+        conversation_handler=handler,
+        responder=responder,  # type: ignore[arg-type]
+        engines=engines,
+        lanes=lanes,
+        settings=settings,
+        services=services,
+        agent_available=handler is not None,
+        gpu=gpu if gpu is not None else FakeGpu(),  # type: ignore[arg-type]
+    )
+
+
+class RuntimeFactory:
+    """`build_mist_runtime` in place: records its arguments and what boot looked like then.
+
+    The build runs on a worker thread (`asyncio.to_thread`), so what it reads from the loop it
+    reads through `run_coroutine_threadsafe`.
+    """
+
+    def __init__(self, handler=None, provider=None) -> None:
+        self.handler = handler
+        self.provider = provider
+        self.calls: list[dict[str, object]] = []
+        self.level_at_build: str | None = None
+        self.gpu_yield_tasks_during_build: list[str] | None = None
+        self.models_ready_during_build: bool | None = None
+        self.runtime = None
+        self.closed: list[str] = []
+        self.loop = None
+
+    def __call__(self, config, **kwargs):
+        self.calls.append(kwargs)
+        gate = kwargs["power_gate"]
+        self.level_at_build = gate.level()
+        self.models_ready_during_build = server._models_ready
+        if self.loop is not None:
+
+            async def yield_tasks() -> list[str]:
+                return [t.get_name() for t in _gpu_yield_tasks()]
+
+            future = asyncio.run_coroutine_threadsafe(yield_tasks(), self.loop)
+            self.gpu_yield_tasks_during_build = future.result(timeout=5)
+        self.runtime = fake_mist_runtime(
+            handler=self.handler,
+            provider=kwargs["llm_provider"],
+            power_gate=gate,
+            alarm_ringing=kwargs["alarm_ringing"],
+            on_capability_message=kwargs["on_capability_message"],
+            closed=self.closed,
+        )
+        return self.runtime
 
 
 class FakeExtractionInference:
@@ -155,14 +289,21 @@ class FakeIdleDispatcher:
         return extraction_status(None).model_copy(update={"state": "idle"})
 
 
-def build_server_registry(executor, settings: HealthProbeSettings | None = None, yield_state=None):
+def build_server_registry(
+    executor,
+    settings: HealthProbeSettings | None = None,
+    yield_state=None,
+    ops_dir=None,
+    inference=None,
+):
     """`_build_health_registry` with fakes for the extraction service and settings."""
     return server._build_health_registry(
         executor,
         BroadcasterState(),
-        FakeExtractionInference(),
+        inference if inference is not None else FakeExtractionInference(),
         settings if settings is not None else HealthProbeSettings(),
         yield_state=yield_state,
+        ops_dir=ops_dir,
     )
 
 
@@ -173,40 +314,79 @@ async def settle() -> None:
 
 # 1
 @pytest.mark.asyncio
-async def test_models_loaded_is_false_during_initialize():
+async def test_models_loaded_is_false_during_the_runtime_build(monkeypatch):
     """The shipped defect: `models_loaded` was true throughout the model load.
 
-    `lifespan` binds `voice_processor` and THEN awaits `initialize()`, which
-    takes roughly 120s of model loading. The old field was
-    `voice_processor is not None`, so it reported loaded for that entire window
-    -- true of the assignment, false of the system. The flag must not flip until
-    `initialize()` has returned.
+    The old field was "the voice processor global is set", bound before the load, so it
+    reported loaded for that entire window -- true of the assignment, false of
+    the system. The flag must not flip until the runtime build has returned, and
+    the build runs off the loop, so `/health` answers while it loads.
     """
-    initializing = asyncio.Event()
-    release = asyncio.Event()
+    building = threading.Event()
+    release = threading.Event()
+    provider = FakeLLMProvider()
+    built = fake_mist_runtime()
 
-    class FakeVoiceProcessor:
-        async def initialize(self, *, yielded: bool = False) -> None:
-            initializing.set()
-            await release.wait()
+    def blocking_factory(config, **kwargs):
+        building.set()
+        release.wait(timeout=10)
+        return built
 
-    processor = FakeVoiceProcessor()
-    # Bound exactly as `lifespan` binds it: before initialize is awaited.
-    server.voice_processor = processor
-    task = asyncio.create_task(server._initialize_voice_processor(processor))
+    monkeypatch.setattr(server, "build_llm_provider", lambda config, **kwargs: provider)
+    task = asyncio.create_task(
+        server._build_runtime(
+            object(),  # type: ignore[arg-type]
+            voice_settings=object(),  # type: ignore[arg-type]
+            power_gate=object(),  # type: ignore[arg-type]
+            alarm_ringing=lambda: False,
+            register_prompt=None,
+            factory=blocking_factory,
+        )
+    )
 
-    await initializing.wait()
+    assert await asyncio.to_thread(building.wait, 10)
     mid = await server.health()
     assert mid["models_loaded"] is False
-    assert server.voice_processor is not None
+    assert server.runtime is None
 
     release.set()
-    await task
+    assert await task is built
     after = await server.health()
     assert after["models_loaded"] is True
+    assert server.runtime is built
     # A plain bool, not a string or an enum: `scripts/hydration/target.py` and
     # the hydration tests read this field.
     assert isinstance(after["models_loaded"], bool)
+
+
+@pytest.mark.asyncio
+async def test_the_runtime_is_built_with_the_base_provider_and_the_lifespan_wiring(monkeypatch):
+    """`build_mist_runtime` gets the base provider (T39), the gate, D8's query and the persona."""
+    provider = FakeLLMProvider()
+    factory = RuntimeFactory()
+    monkeypatch.setattr(server, "build_llm_provider", lambda config, **kwargs: provider)
+    gate = server._build_power_gate(
+        FixedPower("full"), server._capability_tiers(FixedPower("full")), None
+    )
+    ringing = lambda: False  # noqa: E731
+
+    await server._build_runtime(
+        object(),  # type: ignore[arg-type]
+        voice_settings=object(),  # type: ignore[arg-type]
+        power_gate=gate,
+        alarm_ringing=ringing,
+        register_prompt="Speak plainly.",
+        factory=factory,
+    )
+
+    (kwargs,) = factory.calls
+    assert kwargs["llm_provider"] is provider
+    assert kwargs["power_gate"] is gate
+    assert kwargs["alarm_ringing"] is ringing
+    assert kwargs["register_prompt"] == "Speak plainly."
+    assert kwargs["on_capability_message"] is server._on_capability_message
+    assert factory.models_ready_during_build is False
+    assert server._health_llm_provider() is provider
 
 
 # 2
@@ -419,20 +599,21 @@ def test_health_is_always_200(build, expected_status):
 async def test_accessors_are_lazy(executor):
     """Probes must read module state when they run, not when they were built.
 
-    `lifespan` rebinds `voice_processor` and `vault_sidecar`, and the objects
+    `lifespan` rebinds `runtime` and `vault_sidecar`, and the objects
     behind them are built at different points in startup. An accessor that
     captured a value at construction would freeze whatever was there -- and a
     captured None freezes the probe at "absent" for the life of the process,
-    reporting an outage that has ended.
+    reporting an outage that has ended. The LLM probe reads the runtime's base
+    provider, the one curation reads (T39).
     """
-    server.voice_processor = None
+    server.runtime = None
     server.vault_sidecar = None
 
     registry = build_server_registry(executor)
 
     provider = FakeLLMProvider()
     sidecar = FakeSidecar()
-    server.voice_processor = FakeVoiceProcessorHoldingLLM(provider)
+    server.runtime = FakeRuntimeHoldingLLM(provider)
     server.vault_sidecar = sidecar
 
     await registry.run_once()
@@ -473,9 +654,46 @@ async def test_existing_fields_preserved(monkeypatch):
     for field in ("models_loaded", "active_connections", "hydration_isolation"):
         assert field in with_registry, field
     assert with_registry["models_loaded"] is False
-    assert with_registry["active_connections"] == len(server.active_connections)
+    assert with_registry["active_connections"] == server._session_count() == 0
     assert with_registry["hydration_isolation"] is False
     assert with_registry["status"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_active_connections_counts_the_registrys_sessions():
+    server.session_registry = SimpleNamespace(count=lambda: 3)
+
+    payload = await server.health()
+
+    assert payload["active_connections"] == 3
+    assert server._session_count() == 3
+
+
+@pytest.mark.asyncio
+async def test_the_voice_block_reports_the_runtimes_engines_and_power_level():
+    server.runtime = None
+    before = await server.health()
+
+    power = FixedPower("off")
+    gate = server._build_power_gate(power, server._capability_tiers(power), None)
+    server.runtime = fake_mist_runtime(power_gate=gate)
+    after = await server.health()
+
+    assert before["voice"] is None
+    voice = after["voice"]
+    assert set(voice) == {
+        "engines",
+        "tts_voice",
+        "vram_budget_mib",
+        "vram_over_budget",
+        "power_level",
+    }
+    assert set(voice["engines"]) == {"vad", "eot", "stt", "tts", "kws"}
+    assert voice["engines"]["stt"]["location"] == "off"
+    assert voice["tts_voice"]["engine"] == "off"
+    assert voice["vram_budget_mib"] == server.runtime.settings.placement.vram_budget_mib
+    assert voice["vram_over_budget"] is False
+    assert voice["power_level"] == "off"
 
 
 # 8
@@ -546,7 +764,7 @@ async def test_backup_reads_the_injected_settings(executor, tmp_path):
 # 11
 @pytest.mark.asyncio
 async def test_health_top_level_keys_and_extraction_block_are_unchanged(executor):
-    """The new checks live under `checks`; no other `/health` field changes."""
+    """The new checks live under `checks`; `voice` (T13) is the one top-level field added."""
     registry = build_server_registry(executor)
     await registry.run_once()
     server._health_registry = registry
@@ -564,6 +782,7 @@ async def test_health_top_level_keys_and_extraction_block_are_unchanged(executor
         "active_connections",
         "hydration_isolation",
         "extraction",
+        "voice",
     }
     extraction = payload["extraction"]
     assert set(extraction) == {
@@ -703,23 +922,87 @@ async def test_llm_check_reads_down_when_the_reload_failed(executor, tmp_path):
     assert (llm["status"], llm["reason"]) == ("down", "resume_failed")
 
 
-class FakeLifespanVoiceProcessor:
-    """What `lifespan` constructs in place of `VoiceProcessor`: no models."""
+# -- Night extraction paused ---------------------------------------------------
 
-    instances: list["FakeLifespanVoiceProcessor"] = []
 
-    def __init__(self, config, message_queue, **kwargs) -> None:
-        self.models = None
-        self.initialized_with: dict | None = None
-        self.gpu_yield_tasks_during_initialize: list[asyncio.Task] | None = None
-        FakeLifespanVoiceProcessor.instances.append(self)
+def _paused_marker(ops_dir: Path, until: str | None = None) -> Path:
+    marker = ops_dir / EXTRACTION_PAUSED_MARKER
+    marker.write_text(
+        json.dumps({"v": 1, "since": "2026-11-15T10:00:00Z", "reason": "window", "until": until}),
+        encoding="utf-8",
+    )
+    return marker
 
-    async def initialize(self, *, yielded: bool = False) -> None:
-        self.initialized_with = {"yielded": yielded}
-        # The poll must start only after the model manager exists: a poll
-        # running during the load could release or reload a Whisper that is
-        # still being built.
-        self.gpu_yield_tasks_during_initialize = _gpu_yield_tasks()
+
+@pytest.mark.asyncio
+async def test_extraction_service_reads_yielded_from_the_yield_state(executor, tmp_path):
+    """The same yield state reaches both GPU-side checks."""
+    gpu = GpuYield(_marked(tmp_path), _noop, _noop, poll_s=2.0)
+    inference = FakeExtractionInference()
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    registry = build_server_registry(executor, yield_state=gpu.state, inference=inference)
+
+    await registry.run_once()
+
+    check = registry.snapshot()["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("yielded", "gpu_yielded")
+    assert inference.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_reads_paused_from_the_ops_dir_marker(executor, tmp_path):
+    marker = _paused_marker(tmp_path)
+    inference = FakeExtractionInference()
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    registry = build_server_registry(executor, ops_dir=str(tmp_path), inference=inference)
+    server._health_registry = registry
+
+    await registry.run_once()
+    payload = await server.health()
+    # Read on every cycle, not captured at build time.
+    marker.unlink()
+    await registry.run_once()
+    resumed = registry.snapshot()["checks"]["extraction_service"]
+
+    check = payload["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+    assert check["consecutive_failures"] == 0
+    assert (resumed["status"], resumed["reason"]) == ("up", "ok")
+    assert inference.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ops_dir", [None, ""])
+async def test_no_ops_dir_reads_no_marker(executor, tmp_path, monkeypatch, ops_dir):
+    """The dev stack: a marker in the working directory is never looked for."""
+    _paused_marker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    inference = FakeExtractionInference()
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    registry = build_server_registry(executor, ops_dir=ops_dir, inference=inference)
+
+    await registry.run_once()
+
+    check = registry.snapshot()["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("up", "ok")
+    assert inference.calls == 1
+
+
+class FakeHandler:
+    """The handler attributes `lifespan` reads, and a recording `attach_capability_host`."""
+
+    def __init__(self) -> None:
+        self.event_store = None
+        self._tool_usage_tracker = None
+        self._provider = None
+        self.attached: tuple[object, object] | None = None
+        self.closed = False
+
+    def attach_capability_host(self, host, *, tiers=None) -> None:
+        self.attached = (host, tiers)
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class FakeScheduler:
@@ -730,18 +1013,41 @@ class FakeScheduler:
         return None
 
 
+class RecordingPersona:
+    """`PersonaRegister` in place: records where it was loaded from."""
+
+    loads: list[tuple[Path, str]] = []
+
+    def __init__(self, root: Path, profile: str) -> None:
+        self.root = root
+        self.profile = profile
+
+    @classmethod
+    def load(cls, root: Path, profile: str) -> "RecordingPersona":
+        cls.loads.append((root, profile))
+        return cls(root, profile)
+
+    def prompt_line(self) -> str:
+        return f"register of {self.profile}"
+
+    def address_form(self) -> str:
+        return "you"
+
+
 @pytest.fixture
 def lifespan_harness(monkeypatch, tmp_path):
     """Run the real `lifespan` with nothing behind it.
 
     The builders that would open the vault, Neo4j or the model stack return
-    None or fakes, the file log and the system-status task are switched off,
-    and every global `lifespan` rebinds is restored afterwards. What is left
-    is the wiring under test: the yield state, the voice processor's
-    `initialize` call, the probe registry and the curation scheduler call.
+    None or fakes (`build_mist_runtime` is a `RuntimeFactory`), the file log and
+    the system-status task are switched off, and every global `lifespan` rebinds
+    is restored afterwards. What is left is the wiring under test: the yield
+    state, the power gate, the runtime build, the session registry, the probe
+    registry and the curation scheduler call.
     """
     for name in (
-        "voice_processor",
+        "runtime",
+        "session_registry",
         "curation_scheduler",
         "log_handler",
         "extraction_dispatcher",
@@ -759,6 +1065,7 @@ def lifespan_harness(monkeypatch, tmp_path):
         "_capability_build",
         "_capability_config",
         "_capability_power",
+        "_capability_sink",
     ):
         monkeypatch.setattr(server, name, getattr(server, name))
     monkeypatch.setattr(server, "message_queue", asyncio.Queue())
@@ -768,8 +1075,21 @@ def lifespan_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "build_vault_writer", lambda *a, **k: None)
     monkeypatch.setattr(server, "build_sidecar_index", lambda *a, **k: None)
     monkeypatch.setattr(server, "build_phase3_components", lambda *a, **k: None)
-    FakeLifespanVoiceProcessor.instances = []
-    monkeypatch.setattr(server, "VoiceProcessor", FakeLifespanVoiceProcessor)
+    provider = FakeLLMProvider()
+    monkeypatch.setattr(server, "build_llm_provider", lambda config, **kwargs: provider)
+    handler = FakeHandler()
+    factory = RuntimeFactory(handler=handler)
+    monkeypatch.setattr(server, "build_mist_runtime", factory)
+    RecordingPersona.loads = []
+    monkeypatch.setattr(server, "PersonaRegister", RecordingPersona)
+    host_kwargs: dict = {}
+    real_build_host = server.build_capability_host
+
+    def recording_build_host(config, **kwargs):
+        host_kwargs.update(kwargs)
+        return real_build_host(config, **kwargs)
+
+    monkeypatch.setattr(server, "build_capability_host", recording_build_host)
     scheduler_kwargs: dict = {}
 
     def fake_build_curation_scheduler(config, **kwargs):
@@ -777,9 +1097,14 @@ def lifespan_harness(monkeypatch, tmp_path):
         return FakeScheduler()
 
     monkeypatch.setattr(server, "build_curation_scheduler", fake_build_curation_scheduler)
-    monkeypatch.delenv("MIST_OPS_DIR", raising=False)
-    monkeypatch.delenv("MIST_BACKUP_STATUS_PATH", raising=False)
-    monkeypatch.delenv("MIST_GPU_YIELD_POLL_S", raising=False)
+    for name in (
+        "MIST_OPS_DIR",
+        "MIST_BACKUP_STATUS_PATH",
+        "MIST_GPU_YIELD_POLL_S",
+        "MIST_VOICE_PROFILE",
+        "MIST_CAPABILITIES_ENABLED",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     def configure(*, tts_enabled: bool) -> None:
         system_status = server.config.system_status.model_copy(update={"enabled": False})
@@ -791,29 +1116,83 @@ def lifespan_harness(monkeypatch, tmp_path):
             ),
         )
 
-    return SimpleNamespace(configure=configure, scheduler_kwargs=scheduler_kwargs)
+    async def start() -> None:
+        factory.loop = asyncio.get_running_loop()
+
+    return SimpleNamespace(
+        configure=configure,
+        start=start,
+        scheduler_kwargs=scheduler_kwargs,
+        host_kwargs=host_kwargs,
+        factory=factory,
+        handler=handler,
+        provider=provider,
+    )
 
 
 def _gpu_yield_tasks() -> list[asyncio.Task]:
     return [t for t in asyncio.all_tasks() if t.get_name() == "gpu-yield"]
 
 
+def _named_tasks(name: str) -> list[asyncio.Task]:
+    return [t for t in asyncio.all_tasks() if t.get_name() == name]
+
+
 @pytest.mark.asyncio
 async def test_lifespan_without_ops_dir_builds_no_gpu_yield(lifespan_harness):
     lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
 
     async with server.lifespan(server.app):
         await server._health_registry.run_once()
         llm = server._health_registry.snapshot()["checks"]["llm"]
-        voice_processor = FakeLifespanVoiceProcessor.instances[0]
         tasks = _gpu_yield_tasks()
+        power = server._capability_power
 
     assert server._gpu_yield is None
     assert tasks == []
-    assert voice_processor.initialized_with == {"yielded": False}
+    assert isinstance(power, FixedPower)
+    assert power.level() == "full"
+    assert lifespan_harness.factory.level_at_build == "full"
     assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] is None
-    # No yield state reaches the probe, so the llm check asks the provider.
-    assert (llm["status"], llm["reason"]) == ("down", "unavailable_at_boot")
+    # No yield state reaches the probe, so the llm check asks the runtime's base provider.
+    assert (llm["status"], llm["reason"]) == ("up", "ok")
+    assert lifespan_harness.provider.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_lifespan_without_ops_dir_reads_no_paused_marker(
+    lifespan_harness, monkeypatch, tmp_path
+):
+    """The dev stack: a marker in the working directory is never looked for."""
+    lifespan_harness.configure(tts_enabled=False)
+    _paused_marker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    async with server.lifespan(server.app):
+        await server._health_registry.run_once()
+        check = server._health_registry.snapshot()["checks"]["extraction_service"]
+
+    assert check["status"] != "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tts_enabled", [False, True], ids=["gaming-mode", "tts-on"])
+async def test_lifespan_with_ops_dir_wires_the_paused_marker(
+    lifespan_harness, monkeypatch, tmp_path, tts_enabled
+):
+    """Read from `MIST_OPS_DIR` whether or not gaming mode could be built."""
+    lifespan_harness.configure(tts_enabled=tts_enabled)
+    _paused_marker(tmp_path)
+    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
+
+    async with server.lifespan(server.app):
+        await server._health_registry.run_once()
+        payload = await server.health()
+
+    check = payload["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+    assert payload["checks"]["llm"]["status"] != "yielded"
 
 
 @pytest.mark.asyncio
@@ -821,40 +1200,56 @@ async def test_lifespan_with_a_marker_boots_yielded_and_wires_every_reader(
     lifespan_harness, monkeypatch, tmp_path
 ):
     lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
     _marked(tmp_path)
     monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
 
     async with server.lifespan(server.app):
         gpu = server._gpu_yield
+        power = server._capability_power
         await server._health_registry.run_once()
         payload = await server.health()
-        voice_processor = FakeLifespanVoiceProcessor.instances[0]
+        status = server._health_status_payload()
         tasks = _gpu_yield_tasks()
 
     assert isinstance(gpu, GpuYield)
     assert gpu.state() == "yielded"
-    assert voice_processor.initialized_with == {"yielded": True}
+    assert isinstance(power, GpuYieldPower)
+    # The build read the level at boot: `off`, so no CUDA engine and no warm-up.
+    assert lifespan_harness.factory.level_at_build == "off"
     assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] == gpu.is_yielded
     assert (payload["checks"]["llm"]["status"], payload["checks"]["llm"]["reason"]) == (
         "yielded",
         "gpu_yielded",
     )
     assert payload["status"] == "yielded"
+    assert payload["voice"]["power_level"] == "off"
+    assert status["llm"] is False
     assert len(tasks) == 1
     assert tasks[0].done()
-    assert voice_processor.gpu_yield_tasks_during_initialize == []
+    # The poll starts only after the runtime exists: a poll running during the
+    # build could release or reload engines that are still loading.
+    assert lifespan_harness.factory.gpu_yield_tasks_during_build == []
 
 
-class ResumeBug:
-    """A model manager whose reload raises an error `GpuYield` does not catch."""
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tts_enabled", [True, False])
+async def test_lifespan_builds_the_gpu_yield_whenever_the_ops_dir_is_set_voice_on_or_off(
+    lifespan_harness, monkeypatch, tmp_path, tts_enabled
+):
+    """The `tts_enabled` rule is gone: the runtime releases every CUDA engine, TTS included."""
+    lifespan_harness.configure(tts_enabled=tts_enabled)
+    await lifespan_harness.start()
+    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
 
-    knowledge = None
+    async with server.lifespan(server.app):
+        gpu = server._gpu_yield
+        tasks = _gpu_yield_tasks()
 
-    def reacquire_gpu_models(self) -> None:
-        raise ValueError("unexpected reload failure")
-
-    def shutdown(self) -> None:
-        return None
+    assert isinstance(gpu, GpuYield)
+    assert gpu.state() == "normal"
+    assert len(tasks) == 1
+    assert lifespan_harness.factory.level_at_build == "full"
 
 
 @pytest.mark.asyncio
@@ -862,13 +1257,15 @@ async def test_a_dead_gpu_yield_poll_logs_one_error_naming_the_exception_class(
     lifespan_harness, monkeypatch, tmp_path, caplog
 ):
     lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
     marker = _marked(tmp_path)
     monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
     monkeypatch.setenv("MIST_GPU_YIELD_POLL_S", "0.01")
 
     with caplog.at_level(logging.ERROR, logger="backend.server"):
         async with server.lifespan(server.app):
-            server.voice_processor.models = ResumeBug()
+            # A reload error `GpuYield` does not catch.
+            server.runtime.gpu.reload_error = ValueError("unexpected reload failure")
             (task,) = _gpu_yield_tasks()
             marker.unlink()
             await asyncio.wait([task], timeout=5.0)
@@ -883,24 +1280,90 @@ async def test_a_dead_gpu_yield_poll_logs_one_error_naming_the_exception_class(
 
 
 @pytest.mark.asyncio
-async def test_lifespan_with_tts_on_logs_the_conflict_and_builds_no_gpu_yield(
-    lifespan_harness, monkeypatch, tmp_path, caplog
-):
-    lifespan_harness.configure(tts_enabled=True)
+async def test_lifespan_wires_the_registry_the_sink_the_gate_and_the_gpu(lifespan_harness):
+    """Each object `lifespan` builds reaches the one that reads it, and shutdown stops each."""
+    from backend.realtime.capability_sink import CapabilitySink
+    from backend.realtime.power import PowerGate
+    from backend.realtime.registry import SessionRegistry
+
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+    host_kwargs = lifespan_harness.host_kwargs
+
+    async with server.lifespan(server.app):
+        loop = asyncio.get_running_loop()
+        built = server.runtime
+        registry = server.session_registry
+        sink = server._capability_sink
+        watchers = _named_tasks("power-watcher")
+        log_handler = server.log_handler
+
+    (kwargs,) = lifespan_harness.factory.calls
+    assert built is lifespan_harness.factory.runtime
+    assert isinstance(registry, SessionRegistry)
+    # The registry is built on the runtime's services, gated by the log handler.
+    assert registry._services is built.services
+    assert registry._log_gate is log_handler
+    # `SessionServices.power_gate` and D8's `alarm_ringing`.
+    assert isinstance(kwargs["power_gate"], PowerGate)
+    assert built.services.power_gate is kwargs["power_gate"]
+    assert isinstance(sink, CapabilitySink)
+    assert kwargs["alarm_ringing"] == sink.ringing
+    # The capability host's sink is the registry's, and the desktop is the registry's.
+    assert host_kwargs["event_sink"] is sink
+    assert sink._registry is registry
+    assert host_kwargs["desktop_present"] is server._desktop_present
+    # The persona: the host's register, and its prompt line the handler's register_prompt.
+    ((root, profile),) = RecordingPersona.loads
+    assert root == server.project_root / "voice_profiles"
+    assert host_kwargs["register"].profile == profile
+    assert kwargs["register_prompt"] == f"register of {profile}"
+    # The runtime's GPU control is attached to the loop and the registry, then stopped.
+    assert built.gpu.attached == (loop, registry)
+    assert "stop" in built.gpu.calls
+    # The power watcher runs while serving and is stopped at shutdown.
+    assert len(watchers) == 1
+    assert watchers[0].done()
+    # The handler is drained, then every lane closed last.
+    assert lifespan_harness.handler.closed
+    assert lifespan_harness.factory.closed == ["lane"] * 5
+
+
+@pytest.mark.asyncio
+async def test_the_gpu_yield_reaches_the_runtime_late_and_the_watcher_reaches_its_gpu(tmp_path):
+    """`on_yield` and `on_resume` read the module's runtime when called, not when built."""
+    marker = _marked(tmp_path)
+    gpu_yield = server._build_gpu_yield(str(tmp_path), poll_s=2.0)
+    assert gpu_yield is not None
+    gpu = FakeGpu()
+    server.runtime = fake_mist_runtime(gpu=gpu)
+
+    marker.unlink()
+    await gpu_yield.poll_once()  # resumed
     _marked(tmp_path)
-    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
+    await gpu_yield.poll_once()  # yielded
+    server._level_changed("off")
 
-    with caplog.at_level(logging.ERROR, logger="backend.server"):
-        async with server.lifespan(server.app):
-            voice_processor = FakeLifespanVoiceProcessor.instances[0]
+    assert gpu.calls == ["reload", "release"]
+    assert gpu.levels == ["off"]
 
-    conflict = [
-        r.getMessage()
-        for r in caplog.records
-        if r.levelno == logging.ERROR and "MIST_OPS_DIR" in r.getMessage()
-    ]
-    assert len(conflict) == 1
-    assert "TTS" in conflict[0]
-    assert server._gpu_yield is None
-    assert voice_processor.initialized_with == {"yielded": False}
-    assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] is None
+
+def test_the_power_gate_refuses_with_the_yield_message_only_while_yielded(tmp_path):
+    from backend.gpu_yield import YIELDED_MESSAGE
+    from backend.realtime.power import NO_MODEL_MESSAGE
+
+    _marked(tmp_path)
+    yielded = server._build_gpu_yield(str(tmp_path), poll_s=2.0)
+    power = server._build_power(yielded)
+    gate = server._build_power_gate(power, server._capability_tiers(power), yielded)
+    no_yield = server._build_power_gate(
+        FixedPower("full"), server._capability_tiers(FixedPower("full")), None
+    )
+    server.runtime = None
+
+    assert gate.level() == "off"
+    assert gate.refusal_message() == YIELDED_MESSAGE
+    assert no_yield.level() == "full"
+    assert no_yield.model_available() is False  # no runtime, so no provider yet
+    assert no_yield.refusal_message() == NO_MODEL_MESSAGE
+    assert server._build_power(None).level() == "full"

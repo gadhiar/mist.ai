@@ -75,9 +75,9 @@ from backend.errors import MemoryConfigError, MemoryRerankError, MistError  # no
 from backend.interfaces import EmbeddingProvider  # noqa: E402
 from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator  # noqa: E402
 from backend.memory.config import MemoryConfig  # noqa: E402
+from backend.memory.need_embedders import NEED_EMBEDDERS, need_embedder_kwargs  # noqa: E402
 from backend.memory.need_gate import (  # noqa: E402
     FORM_CANDIDATES,
-    NEED_EMBEDDERS,
     NORMALISATION,
     CvResult,
     FormSpec,
@@ -93,7 +93,6 @@ from backend.memory.need_gate import (  # noqa: E402
     fit_form,
     grouped_cv,
     load_bank,
-    need_embedder_kwargs,
     need_model_key,
     theta,
 )

@@ -394,74 +394,33 @@ class _FakeConversationHandler:
         pass
 
 
-class _FakeKnowledgeIntegration:
-    """Minimal stand-in for KnowledgeIntegration forwarding tests."""
-
-    def __init__(self, *, invalidation_bus=None, **_kwargs):
-        self._invalidation_bus = invalidation_bus
-        self.conversation_handler = _FakeConversationHandler(invalidation_bus=invalidation_bus)
-
-
-class _FakeModelManager:
-    """Minimal stand-in for ModelManager forwarding tests."""
-
-    def __init__(self, *, invalidation_bus=None, **_kwargs):
-        self._invalidation_bus = invalidation_bus
-        self.knowledge = _FakeKnowledgeIntegration(invalidation_bus=invalidation_bus)
-
-
-class _FakeVoiceProcessor:
-    """Minimal stand-in for VoiceProcessor forwarding tests."""
-
-    def __init__(self, *, invalidation_bus=None, **_kwargs):
-        self._invalidation_bus = invalidation_bus
-        self.models = _FakeModelManager(invalidation_bus=invalidation_bus)
-
-
 class TestPhase55BusWiring:
     """Regression suite: shared InvalidationBus reaches ConversationHandler.
 
-    Most tests in this class use minimal hand-rolled fakes that mirror real
-    constructor signatures and require neither sentence_transformers nor
-    Neo4j. The exception is
+    The server hands the bus to `build_mist_runtime`, which hands it to the
+    handler build. The forwarding tests drive the real `build_mist_runtime`
+    over the fake loaders and provider of `tests/unit/realtime/test_runtime.py`,
+    and need neither sentence_transformers nor Neo4j. The exception is
     test_build_conversation_handler_subscribes_on_vault_rebuild_when_bus_provided,
-    which imports backend.factories, is marked @requires_sentence_transformers,
-    and calls the real build_conversation_handler -- it injects a GraphStore
-    wrapping FakeNeo4jConnection, a FakeVectorStore, and a FakeLLM so it does
-    not open a real Neo4j connection or build a real vector store. The real
+    which is marked @requires_sentence_transformers and calls the real
+    build_conversation_handler -- it injects a GraphStore wrapping
+    FakeNeo4jConnection, a FakeVectorStore, and a FakeLLM so it does not open
+    a real Neo4j connection or build a real vector store. The real
     integration is covered by
     test_build_phase3_components_invalidation_bus_is_same_instance above.
     """
 
-    def test_bus_identity_preserved_through_voice_processor(self):
-        """Bus passed into VoiceProcessor reaches its ModelManager unchanged."""
+    def test_build_mist_runtime_forwards_the_bus_to_the_handler_build(self):
+        """The bus the server passes the runtime build reaches the handler build unchanged."""
         from backend.vault.invalidation_bus import InvalidationBus
+        from tests.unit.realtime.test_runtime import HandlerFactory, runtime
 
         bus = InvalidationBus()
-        vp = _FakeVoiceProcessor(invalidation_bus=bus)
+        factory = HandlerFactory()
 
-        assert vp._invalidation_bus is bus
-        assert vp.models._invalidation_bus is bus
+        runtime(factory, invalidation_bus=bus)
 
-    def test_bus_identity_preserved_through_model_manager_to_knowledge(self):
-        """Bus passed into ModelManager reaches its KnowledgeIntegration unchanged."""
-        from backend.vault.invalidation_bus import InvalidationBus
-
-        bus = InvalidationBus()
-        mm = _FakeModelManager(invalidation_bus=bus)
-
-        assert mm._invalidation_bus is bus
-        assert mm.knowledge._invalidation_bus is bus
-
-    def test_bus_identity_preserved_through_knowledge_integration_to_handler(self):
-        """Bus passed into KnowledgeIntegration reaches its ConversationHandler unchanged."""
-        from backend.vault.invalidation_bus import InvalidationBus
-
-        bus = InvalidationBus()
-        ki = _FakeKnowledgeIntegration(invalidation_bus=bus)
-
-        assert ki._invalidation_bus is bus
-        assert ki.conversation_handler._invalidation_bus is bus
+        assert factory.calls[0]["invalidation_bus"] is bus
 
     def test_conversation_handler_subscribes_on_vault_rebuild_when_bus_provided(self):
         """ConversationHandler._on_vault_rebuild is registered on the bus when one is provided."""
@@ -483,20 +442,23 @@ class TestPhase55BusWiring:
 
         assert handler._invalidation_bus is None
 
-    def test_full_chain_fake_wiring_shares_bus_and_registers_listener(self):
-        """Full chain fake: filewatcher bus -> VoiceProcessor -> handler._on_vault_rebuild subscribed.
+    def test_full_chain_shares_bus_and_registers_listener(self):
+        """Full chain: filewatcher bus -> build_mist_runtime -> handler._on_vault_rebuild subscribed.
 
         Regression for Phase 5 P0: proves that a single bus instance can
         propagate from the filewatcher side down to the handler and that
         the listener is registered, so publish() would reach the handler.
         """
         from backend.vault.invalidation_bus import InvalidationBus
+        from tests.unit.realtime.test_runtime import runtime
 
         bus = InvalidationBus()
 
         # Wire full chain with the shared bus
-        vp = _FakeVoiceProcessor(invalidation_bus=bus)
-        handler = vp.models.knowledge.conversation_handler
+        built, _ = runtime(
+            lambda **kwargs: _FakeConversationHandler(**kwargs), invalidation_bus=bus
+        )
+        handler = built.conversation_handler
 
         assert handler._invalidation_bus is bus
         # At least one listener registered on the bus (the handler's callback)
@@ -558,72 +520,3 @@ class TestPhase55BusWiring:
         # retriever the factory built, rather than being ignored in favour
         # of a real vector store the factory constructs itself.
         assert handler.retriever._vector_store is fake_vector_store
-
-
-class TestRealKnowledgeIntegrationBusParam:
-    """Tests that the real KnowledgeIntegration accepts and forwards invalidation_bus.
-
-    Platform-neutral: imports only backend.chat.knowledge_integration which
-    has no torch/sentence_transformers dependency.
-    """
-
-    def test_knowledge_integration_accepts_invalidation_bus_kwarg(self):
-        """KnowledgeIntegration.__init__ must have an invalidation_bus parameter.
-
-        This test catches the missing-param regression. It FAILS before the fix
-        and PASSES once invalidation_bus is added to KnowledgeIntegration.__init__.
-        """
-        import inspect
-
-        from backend.chat.knowledge_integration import KnowledgeIntegration
-
-        sig = inspect.signature(KnowledgeIntegration.__init__)
-        assert "invalidation_bus" in sig.parameters, (
-            "KnowledgeIntegration.__init__ is missing the 'invalidation_bus' parameter; "
-            "build_conversation_handler is called without it so ConversationHandler "
-            "_on_vault_rebuild is never subscribed (Phase 5 P0 regression)."
-        )
-
-    def test_knowledge_integration_stores_and_forwards_invalidation_bus(self):
-        """KnowledgeIntegration must store invalidation_bus and pass it to build_conversation_handler.
-
-        Uses unittest.mock to intercept the build_conversation_handler call and verify
-        the bus arrives as the invalidation_bus keyword argument.
-        """
-        import inspect
-        from unittest.mock import MagicMock, patch
-
-        from backend.chat.knowledge_integration import KnowledgeIntegration
-        from backend.vault.invalidation_bus import InvalidationBus
-
-        sig = inspect.signature(KnowledgeIntegration.__init__)
-        if "invalidation_bus" not in sig.parameters:
-            pytest.skip("invalidation_bus param not yet added -- caught by sibling test")
-
-        bus = InvalidationBus()
-        fake_handler = MagicMock()
-        fake_handler._invalidation_bus = bus
-
-        with patch(
-            "backend.chat.knowledge_integration.build_conversation_handler",
-            return_value=fake_handler,
-        ) as mock_build:
-            config = MagicMock()
-            config.enable_knowledge_integration = True
-            # Construction may fail for other reasons (Neo4j, etc.) --
-            # we only care that build_conversation_handler was called with the bus.
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                KnowledgeIntegration(
-                    config=config,
-                    llm_provider=MagicMock(),
-                    invalidation_bus=bus,
-                )
-
-            if mock_build.called:
-                _, kwargs = mock_build.call_args
-                assert kwargs.get("invalidation_bus") is bus, (
-                    "build_conversation_handler was called without invalidation_bus; "
-                    "ConversationHandler will not subscribe _on_vault_rebuild."
-                )

@@ -15,7 +15,7 @@ unit suite at 2376 passed:
     I3 both silently revert together.
 
 `lifespan()` itself cannot be driven directly in a test without faking the
-entire model stack (VoiceProcessor.initialize, Neo4j, llama-server), so the
+entire model stack (the runtime build, Neo4j, llama-server), so the
 scheduling and shutdown logic were extracted into
 `_schedule_session_note_catchup` / `_shutdown_session_note_catchup` --
 small, pure functions testable in isolation. The one property extraction
@@ -213,10 +213,18 @@ class _FakeSynthesizer:
         return True
 
 
-def _fake_voice_processor(handler) -> SimpleNamespace:
-    return SimpleNamespace(
-        models=SimpleNamespace(knowledge=SimpleNamespace(conversation_handler=handler))
-    )
+def _fake_runtime(handler) -> SimpleNamespace:
+    return SimpleNamespace(conversation_handler=handler)
+
+
+class _CountingRegistry:
+    """The one `SessionRegistry` method the gate reads: how many sessions are connected."""
+
+    def __init__(self, sessions: int) -> None:
+        self.sessions = sessions
+
+    def count(self) -> int:
+        return self.sessions
 
 
 def _fake_handler() -> SimpleNamespace:
@@ -244,41 +252,41 @@ class TestBuildSessionNoteCatchup:
 
     def test_returns_none_when_vault_writer_is_none(self):
         handler = _fake_handler()
-        voice_processor = _fake_voice_processor(handler)
+        runtime = _fake_runtime(handler)
 
-        assert server._build_session_note_catchup(voice_processor, None) is None
+        assert server._build_session_note_catchup(runtime, None) is None
 
     def test_returns_none_when_no_conversation_handler_is_available(self):
-        voice_processor = SimpleNamespace(models=None)
+        runtime = SimpleNamespace(conversation_handler=None)
 
-        assert server._build_session_note_catchup(voice_processor, vault_writer=object()) is None
+        assert server._build_session_note_catchup(runtime, vault_writer=object()) is None
 
     def test_returns_none_when_event_store_is_unavailable(self):
         handler = _fake_handler()
         handler.event_store = None
-        voice_processor = _fake_voice_processor(handler)
+        runtime = _fake_runtime(handler)
 
-        assert server._build_session_note_catchup(voice_processor, vault_writer=object()) is None
+        assert server._build_session_note_catchup(runtime, vault_writer=object()) is None
 
     @pytest.mark.asyncio
-    async def test_is_conversation_active_reflects_websocket_connections_not_handler_sessions(
+    async def test_is_conversation_active_reflects_connected_sessions_not_handler_sessions(
         self, monkeypatch
     ):
         """The core C1 regression guard. `handler.sessions` is non-empty
         (simulating the leftover-entry bug this wiring must NOT depend on)
-        while there is no live WebSocket connection -- catch-up must still
+        while the session registry holds no session -- catch-up must still
         proceed past the conversation-active gate.
         """
         handler = _fake_handler()
-        voice_processor = _fake_voice_processor(handler)
-        monkeypatch.setattr(server, "active_connections", set())
+        runtime = _fake_runtime(handler)
+        monkeypatch.setattr(server, "session_registry", _CountingRegistry(0))
 
-        catchup = server._build_session_note_catchup(voice_processor, vault_writer=object())
+        catchup = server._build_session_note_catchup(runtime, vault_writer=object())
         assert catchup is not None
         await catchup.run()
 
         assert handler.event_store.list_sessions_with_turns_called, (
-            "is_conversation_active must reflect active_connections, not "
+            "is_conversation_active must reflect the session registry, not "
             "ConversationHandler.sessions (which only ever grows in production)"
         )
 
@@ -287,10 +295,10 @@ class TestBuildSessionNoteCatchup:
         """Positive counterpart: a genuinely live connection must still defer."""
         handler = _fake_handler()
         handler.sessions = {}  # empty -- proves this is NOT what gates it either
-        voice_processor = _fake_voice_processor(handler)
-        monkeypatch.setattr(server, "active_connections", {object()})
+        runtime = _fake_runtime(handler)
+        monkeypatch.setattr(server, "session_registry", _CountingRegistry(1))
 
-        catchup = server._build_session_note_catchup(voice_processor, vault_writer=object())
+        catchup = server._build_session_note_catchup(runtime, vault_writer=object())
         assert catchup is not None
         await catchup.run()
 
@@ -345,11 +353,11 @@ class TestBuildSessionNoteCatchup:
         handler.derive_session_note_path = (
             lambda session_id, first_utterance, date: f"/vault/sessions/{date}-{session_id}.md"
         )
-        voice_processor = _fake_voice_processor(handler)
+        runtime = _fake_runtime(handler)
         vault_writer = _RecordingVaultWriter()
-        monkeypatch.setattr(server, "active_connections", set())
+        monkeypatch.setattr(server, "session_registry", _CountingRegistry(0))
 
-        catchup = server._build_session_note_catchup(voice_processor, vault_writer)
+        catchup = server._build_session_note_catchup(runtime, vault_writer)
         assert catchup is not None
         await catchup.run()
 

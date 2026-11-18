@@ -261,6 +261,25 @@
       {
         "name": "subscribe_logs",
         "message": {"type": "subscribe_logs", "enabled": true, "levels": ["INFO", "WARNING"]}
+      },
+      {
+        "name": "action_decision",
+        "message": {"type": "action_decision", "proposal_id": "p1", "decision": "approve"}
+      },
+      {
+        "name": "alarm_action",
+        "message": {"type": "alarm_action", "alarm_id": "a1", "action": "snooze", "minutes": 5}
+      },
+      {
+        "name": "alarm_report",
+        "message": {
+          "type": "alarm_report",
+          "alarm_id": "a1",
+          "outcome": "rang",
+          "at": "2026-01-05T06:59:00Z",
+          "rang_at": "2026-01-05T06:59:00Z",
+          "request_id": "q1"
+        }
       }
     ],
     "server_to_client": [
@@ -1165,6 +1184,20 @@
       },
       "rule": "detail.source is the spotter that heard the name, server or endpoint",
       "field": "detail.source"
+    },
+    {
+      "name": "alarm_report: a report that names its own endpoint",
+      "direction": "client_to_server",
+      "json": {
+        "type": "alarm_report",
+        "alarm_id": "a1",
+        "outcome": "rang",
+        "at": "2026-01-05T06:59:00Z",
+        "rang_at": "2026-01-05T06:59:00Z",
+        "endpoint": "room"
+      },
+      "rule": "the server attaches the endpoint of the connection a report arrived on",
+      "field": "endpoint"
     }
   ]
 }

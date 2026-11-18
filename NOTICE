@@ -120,6 +120,57 @@ respective licenses:
    runtime into the Hugging Face cache.
 
 -------------------------------------------------------------------------------
+10. Kyutai Pocket TTS
+   Location: Python package pocket-tts 4.0.1 (requirements-voice.txt); weights
+             staged under the models directory (speech/kyutai/pocket-tts/ and
+             speech/kyutai/pocket-tts-without-voice-cloning/)
+   Source: https://github.com/kyutai-labs/pocket-tts (code)
+           https://huggingface.co/kyutai/pocket-tts
+           (revision db04f0e653473e5c7333c69686ac92b7460b0c1d), the voice
+           cloning model, and its tokenizer from
+           https://huggingface.co/kyutai/pocket-tts-without-voice-cloning
+           (revision 00eac05ed3d16bdc3f6b5d598874019c34a89214)
+   License: MIT License (code); Creative Commons Attribution 4.0
+            International, CC-BY-4.0 (weights)
+   Copyright: Kyutai
+
+   Used for text-to-speech in MIST's own cloned voice
+   (backend/realtime/engines/pocket_tts.py). The weights are not included in
+   this repository and are not downloaded at runtime.
+
+-------------------------------------------------------------------------------
+11. NVIDIA Nemotron Speech Streaming English 0.6B
+   Location: Python package nemo_toolkit[asr] 2.7.3 (requirements-voice.txt);
+             weights staged under the models directory
+             (speech/nvidia/nemotron-speech-streaming-en-0.6b/
+             nemotron-speech-streaming-en-0.6b.nemo, pinned by its sha256)
+   Source: https://github.com/NVIDIA/NeMo (code)
+           https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b
+   License: Apache License 2.0 (NeMo toolkit); NVIDIA Open Model License
+            (model weights; see the model card)
+   Copyright: NVIDIA Corporation
+
+   Used for streaming speech-to-text on the GPU
+   (backend/realtime/engines/nemotron_stt.py). The weights are not included
+   in this repository and are not downloaded at runtime.
+
+-------------------------------------------------------------------------------
+12. NVIDIA Parakeet TDT 0.6B v2 (ONNX conversion) and onnx-asr
+   Location: Python package onnx-asr 0.12.0 (requirements-voice.txt), run on
+             onnxruntime (requirements.txt); weights staged under the models
+             directory (speech/istupakov/parakeet-tdt-0.6b-v2-onnx/)
+   Source: https://github.com/istupakov/onnx-asr (code)
+           https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx, the
+           ONNX conversion of https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
+   License: MIT License (onnx-asr code); Creative Commons Attribution 4.0
+            International, CC-BY-4.0 (weights)
+   Copyright: Ilya Stupakov (onnx-asr); NVIDIA Corporation (weights)
+
+   Used for speech-to-text on the CPU (backend/realtime/engines/parakeet_stt.py).
+   The weights are not included in this repository and are not downloaded at
+   runtime.
+
+-------------------------------------------------------------------------------
 
 APACHE LICENSE 2.0 COMPONENTS
 
@@ -129,6 +180,7 @@ The following components are licensed under Apache License 2.0:
 - Qwen 2.5 Model
 - MS MARCO MiniLM-L-6-v2 and MiniLM-L-12-v2 Cross-Encoders
 - all-MiniLM-L6-v2 Sentence Embedding Model
+- NVIDIA NeMo toolkit
 
 Apache License 2.0 Summary:
 You may use, reproduce, and distribute this work, with or without
@@ -146,9 +198,29 @@ The following components are licensed under MIT License:
 - OpenAI Whisper
 - Silero VAD
 - Ollama
+- Kyutai Pocket TTS (code)
+- onnx-asr
 
 MIT License is permissive and allows commercial use, modification,
 distribution, and private use with minimal restrictions.
+
+CREATIVE COMMONS ATTRIBUTION 4.0 COMPONENTS
+
+The following components are licensed under CC-BY-4.0:
+- Kyutai Pocket TTS (weights)
+- NVIDIA Parakeet TDT 0.6B v2 (weights, and their ONNX conversion)
+
+CC-BY-4.0 allows sharing and adaptation for any purpose, provided appropriate
+credit is given, a link to the license is provided, and changes are indicated.
+Full license text: https://creativecommons.org/licenses/by/4.0/legalcode
+
+NVIDIA OPEN MODEL LICENSE COMPONENTS
+
+The following components are licensed under the NVIDIA Open Model License:
+- NVIDIA Nemotron Speech Streaming English 0.6B (weights)
+
+The license's terms are linked from the model card
+(https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b).
 
 BSD 2-CLAUSE LICENSE COMPONENTS
 
@@ -163,4 +235,4 @@ of conditions and the disclaimer are retained.
 
 For questions about licensing, contact: Raj Gadhia
 
-Last updated: 2026-11-07
+Last updated: 2026-11-17

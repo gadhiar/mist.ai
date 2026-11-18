@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import sys
 import threading
 import urllib.error
@@ -537,6 +538,285 @@ def test_chain_plan_argv_lists_both_services():
 
 
 # ---------------------------------------------------------------------------
+# Choosing the engines, and the cloned voice
+# ---------------------------------------------------------------------------
+
+# The argv the base recorded for both services; a run without `--stt-engine` or `--tts-engine`
+# must start exactly these.
+BASE_STT_ARGV = [
+    "docker", "run", "-d", "--name", "mist-bench-chain-stt", "-p", "127.0.0.1:8091:8091",
+    "--cpus", "4", "-e", "HF_HUB_OFFLINE=1", "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4",
+    "-e", "OPENBLAS_NUM_THREADS=4", "-e", "PYTHONDONTWRITEBYTECODE=1", "-v", "/repo:/work:ro",
+    "-v", "/models:/weights:ro", "-w", "/work", "mist-speech-bench-asr", "python", "-m",
+    "scripts.model_bench.speech.probes.stt_service", "--engine", "parakeet-cpu", "--weights",
+    "/weights", "--threads", "4", "--host", "0.0.0.0", "--port", "8091",
+]  # fmt: skip
+BASE_TTS_ARGV = [
+    "docker", "run", "-d", "--name", "mist-bench-chain-tts", "-p", "127.0.0.1:8092:8092",
+    "--cpus", "4", "-e", "HF_HUB_OFFLINE=1", "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4",
+    "-e", "OPENBLAS_NUM_THREADS=4", "-e", "PYTHONDONTWRITEBYTECODE=1", "-v", "/repo:/work:ro",
+    "-v", "/models:/models/speech:ro", "-w", "/work", "mist-speech-bench-pocket", "python", "-m",
+    "scripts.model_bench.speech.probes.tts_service", "--models-dir", "/models/speech", "--host",
+    "0.0.0.0", "--port", "8092",
+]  # fmt: skip
+CLIP_HOST = "/private/identity/clip.wav"
+CLIP_MOUNT = f"{CLIP_HOST}:/voice/identity.wav:ro"
+TRANSCRIPT = "the quartz heron counted nine amber lanterns"
+ARMS = core.load_json(core.SPEECH_ARMS_PATH)
+
+
+def test_the_chain_offers_two_stt_engines_and_four_tts_engines():
+    assert chain.STT_ENGINES == ("parakeet-cpu", "nemotron-160")
+    assert chain.TTS_ENGINES == ("pocket", "pocket-clone", "qwen3", "qwen3-design")
+    assert (chain.STT_ENGINE, chain.TTS_ENGINE) == ("parakeet-cpu", "pocket")
+
+
+def test_with_neither_engine_chosen_the_service_argv_are_the_base_s():
+    paths = {"repo_dir": "/repo", "speech_models_dir": "/models"}
+
+    assert chain.stt_service_argv(**paths) == BASE_STT_ARGV
+    assert chain.tts_service_argv(**paths) == BASE_TTS_ARGV
+    assert chain.stt_service_argv(**paths, engine="parakeet-cpu") == BASE_STT_ARGV
+    assert chain.tts_service_argv(**paths, engine="pocket") == BASE_TTS_ARGV
+
+
+def _check_device(argv, cfg):
+    if cfg["device"] == "cuda":
+        assert _pairs(argv, "--gpus") == ["all"]
+        assert "--cpus" not in argv
+    else:
+        assert "--gpus" not in argv
+        assert _pairs(argv, "--cpus") == ["4"]
+        assert "OMP_NUM_THREADS=4" in _pairs(argv, "-e")
+
+
+@pytest.mark.parametrize("engine", ["parakeet-cpu", "nemotron-160"])
+def test_the_stt_service_runs_the_chosen_engine_in_its_image_on_its_device(engine):
+    cfg = ARMS["stt"][engine]
+    argv = chain.stt_service_argv(repo_dir="/repo", speech_models_dir="/models", engine=engine)
+
+    assert _pairs(argv, "--engine") == [engine]
+    assert cfg["image"] in argv
+    assert _pairs(argv, "-p") == ["127.0.0.1:8091:8091"]
+    assert all(m.endswith(":ro") for m in _pairs(argv, "-v"))
+    _check_device(argv, cfg)
+
+
+@pytest.mark.parametrize("engine", ["pocket", "pocket-clone", "qwen3", "qwen3-design"])
+def test_the_tts_service_runs_the_chosen_engine_in_its_image_on_its_device(engine):
+    cfg = ARMS["tts"][engine]
+    clip = CLIP_HOST if engine == "pocket-clone" else None
+    argv = chain.tts_service_argv(
+        repo_dir="/repo", speech_models_dir="/models", engine=engine, voice_clip=clip
+    )
+
+    assert _pairs(argv, "--engine") == ([] if engine == "pocket" else [engine])
+    assert cfg["image"] in argv
+    assert _pairs(argv, "-p") == ["127.0.0.1:8092:8092"]
+    assert all(m.endswith(":ro") for m in _pairs(argv, "-v"))
+    _check_device(argv, cfg)
+    clip_mounts = [m for m in _pairs(argv, "-v") if "/voice/" in m]
+    assert clip_mounts == ([CLIP_MOUNT] if engine == "pocket-clone" else [])
+
+
+@pytest.mark.parametrize(("engine", "clip"), [("pocket-clone", None), ("pocket", CLIP_HOST)])
+def test_the_tts_service_refuses_a_clone_without_a_clip_and_a_clip_without_the_clone(engine, clip):
+    with pytest.raises(core.VoiceClipError):
+        chain.tts_service_argv(
+            repo_dir="/repo", speech_models_dir="/models", engine=engine, voice_clip=clip
+        )
+
+
+def test_the_services_start_the_chosen_engines_with_the_clip_mounted():
+    clock = Clock()
+    services = chain.ChainServices.default(
+        repo_dir="/repo", speech_models_dir="/models", docker=FakeDocker(),
+        opener=HealthOpener(clock), clock=clock, sleep=clock.sleep,
+        stt_engine="nemotron-160", tts_engine="pocket-clone", voice_clip=CLIP_HOST,
+    )  # fmt: skip
+
+    stt, tts = (list(spec.argv) for spec in services.specs)
+    assert _pairs(stt, "--engine") == ["nemotron-160"]
+    assert _pairs(tts, "--engine") == ["pocket-clone"]
+    assert CLIP_MOUNT in _pairs(tts, "-v")
+
+
+def write_identity_clip(root: Path) -> Path:
+    """A sine tone standing in for the identity clip, with a transcript beside it."""
+    folder = root / "private-identity"
+    folder.mkdir(parents=True)
+    clip = folder / "identity.wav"
+    samples = (round(8000 * math.sin(2 * math.pi * 220 * i / 24000)) for i in range(2400))
+    with wave.open(str(clip), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(24000)
+        out.writeframes(b"".join(s.to_bytes(2, "little", signed=True) for s in samples))
+    (folder / "clip.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    return clip
+
+
+def one_rep_run(tmp_path, material, **overrides):
+    clock = Clock()
+    fake = fake_for_run(clock)
+    fake.transcripts = [UTTERANCES[u] for u in chain.CHAIN_UTTERANCES]
+    llm, stt, tts = make_clients(fake, clock)
+    services = FakeServiceLifecycle()
+    out = chain.run_chain(
+        chain_request(tmp_path, material, reps=1, **overrides), llm=llm, stt=stt, tts=tts,
+        services=services, container_state=lambda name: "running", clock=clock, git_sha="abc",
+    )  # fmt: skip
+    rows = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
+    return out, rows, json.loads((out / "chain.json").read_text())
+
+
+def test_without_a_choice_each_row_names_parakeet_and_pocket(tmp_path, material):
+    _, rows, meta = one_rep_run(tmp_path, material)
+
+    assert {(r["stt_engine"], r["tts_engine"]) for r in rows} == {("parakeet-cpu", "pocket")}
+    assert (meta["stt_engine"], meta["tts_engine"], meta["voice"]) == (
+        "parakeet-cpu",
+        "pocket",
+        "alba",
+    )
+    assert "voice_clip_sha256" not in meta
+
+
+@pytest.mark.parametrize(
+    ("stt_engine", "tts_engine"), [("nemotron-160", "qwen3"), ("parakeet-cpu", "qwen3-design")]
+)
+def test_each_row_and_the_meta_name_both_chosen_engines(tmp_path, material, stt_engine, tts_engine):
+    _, rows, meta = one_rep_run(tmp_path, material, stt_engine=stt_engine, tts_engine=tts_engine)
+
+    assert len(rows) == 14
+    assert {(r["stt_engine"], r["tts_engine"]) for r in rows} == {(stt_engine, tts_engine)}
+    assert (meta["stt_engine"], meta["tts_engine"]) == (stt_engine, tts_engine)
+    assert meta["voice"] == ARMS["tts"][tts_engine]["timing_voice"]
+
+
+def test_a_cloned_chain_records_identity_and_the_clip_s_sha_and_never_its_path_or_words(
+    tmp_path, material, capsys, caplog
+):
+    clip = write_identity_clip(tmp_path)
+    caplog.set_level("DEBUG")
+
+    out, rows, meta = one_rep_run(tmp_path, material, tts_engine="pocket-clone", voice_clip=clip)
+
+    assert {r["tts_engine"] for r in rows} == {"pocket-clone"}
+    assert meta["voice"] == "identity"
+    assert meta["voice_clip_sha256"] == hashlib.sha256(clip.read_bytes()).hexdigest()[:12]
+    captured = capsys.readouterr()
+    texts = [p.read_text(encoding="utf-8") for p in out.rglob("*") if p.is_file()]
+    texts += [captured.out, captured.err, caplog.text]
+    for text in texts:
+        for secret in (str(clip), clip.as_posix(), clip.parent.name, TRANSCRIPT):
+            assert secret not in text
+    assert sorted(p.name for p in clip.parent.iterdir()) == ["clip.txt", "identity.wav"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"tts_engine": "pocket-clone"},
+        {"tts_engine": "pocket", "voice_clip": "CLIP"},
+        {"tts_engine": "pocket-clone", "voice_clip": "MISSING"},
+    ],
+    ids=["clone-without-clip", "clip-without-clone", "missing-clip"],
+)
+def test_run_chain_refuses_a_clip_misuse_before_anything(tmp_path, material, overrides):
+    clip = write_identity_clip(tmp_path)
+    values = dict(overrides)
+    if values.get("voice_clip") == "CLIP":
+        values["voice_clip"] = clip
+    elif values.get("voice_clip") == "MISSING":
+        values["voice_clip"] = clip.parent / "absent.wav"
+    clock = Clock()
+    llm, stt, tts = make_clients(fake_for_run(clock), clock)
+    services = FakeServiceLifecycle()
+
+    with pytest.raises(core.VoiceClipError) as caught:
+        chain.run_chain(
+            chain_request(tmp_path, material, **values), llm=llm, stt=stt, tts=tts,
+            services=services, container_state=lambda name: "running", clock=clock,
+        )  # fmt: skip
+
+    assert str(clip.parent) not in str(caught.value)
+    assert services.events == []
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"stt_engine": "whisper-small"}, {"tts_engine": "chatterbox"}]
+)
+def test_run_chain_refuses_an_engine_the_chain_does_not_offer(tmp_path, material, overrides):
+    clock = Clock()
+    llm, stt, tts = make_clients(fake_for_run(clock), clock)
+    services = FakeServiceLifecycle()
+
+    with pytest.raises(core.SpeechBenchError, match="engine"):
+        chain.run_chain(
+            chain_request(tmp_path, material, **overrides), llm=llm, stt=stt, tts=tts,
+            services=services, container_state=lambda name: "running", clock=clock,
+        )  # fmt: skip
+
+    assert services.events == []
+    assert not (tmp_path / "results").exists()
+
+
+def test_the_chain_cli_offers_the_engines_and_the_voice_clip():
+    parser = speech_bench.subcommand_parsers(speech_bench.build_parser())["chain"]
+    actions = {a.dest: a for a in parser._actions}
+
+    assert tuple(actions["stt_engine"].choices) == chain.STT_ENGINES
+    assert tuple(actions["tts_engine"].choices) == chain.TTS_ENGINES
+    assert (actions["stt_engine"].default, actions["tts_engine"].default) == (
+        "parakeet-cpu",
+        "pocket",
+    )
+    assert actions["voice_clip"].default is None
+
+
+def test_cmd_chain_hands_the_checked_clip_to_the_services_and_the_request(
+    tmp_path, monkeypatch, capsys
+):
+    clip = write_identity_clip(tmp_path)
+    seen = {}
+
+    def services(**kwargs):
+        seen["services"] = kwargs
+        return FakeServiceLifecycle()
+
+    def run_chain(request, **kwargs):
+        seen["request"] = request
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "turns.jsonl").write_text("", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(chain.ChainServices, "default", services)
+    monkeypatch.setattr(chain, "run_chain", run_chain)
+    argv = [
+        "chain", "--results-root", str(tmp_path / "results"), "--run", "mh1",
+        "--model", "gemma4-e2b", "--placement", "gpu-full", "--material-dir", str(tmp_path),
+        "--speech-models-dir", str(tmp_path), "--stt-engine", "nemotron-160",
+        "--tts-engine", "pocket-clone", "--voice-clip", str(clip),
+    ]  # fmt: skip
+
+    code = speech_bench.main(argv)
+
+    assert code == 0
+    request = seen["request"]
+    assert (request.stt_engine, request.tts_engine) == ("nemotron-160", "pocket-clone")
+    assert request.voice_clip == clip.resolve()
+    assert seen["services"]["voice_clip"] == clip.resolve().as_posix()
+    assert (seen["services"]["stt_engine"], seen["services"]["tts_engine"]) == (
+        "nemotron-160",
+        "pocket-clone",
+    )
+    assert str(clip.parent) not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # The services' container lifecycle
 # ---------------------------------------------------------------------------
 
@@ -748,6 +1028,177 @@ def test_run_chain_refuses_a_results_root_inside_the_repository(material):
             request, llm=llm, stt=stt, tts=tts, services=FakeServiceLifecycle(),
             container_state=lambda name: "running", clock=clock,
         )  # fmt: skip
+
+
+# ---------------------------------------------------------------------------
+# --reply-pack: each turn's whole reply, saved for the blind reply A/B page
+# ---------------------------------------------------------------------------
+
+TIMING_FIELDS = (
+    "stt_ms", "llm_first_token_ms", "tool_call_ms", "done_first_token_ms", "first_clause_ms",
+    "tts_first_audio_ms", "tts_total_ms", "turn_ms", "turn_wall_ms", "t_turn_start",
+    "t_turn_end",
+)  # fmt: skip
+WHOLE_DONE_REPLY = "Your ten minute timer is set and running now, and it rings at ten past nine."
+
+
+def pack_run(tmp_path, material, name, **overrides):
+    """A two-repetition run against the recorded fake stream, under its own results root."""
+    clock = Clock()
+    fake = fake_for_run(clock)
+    llm, stt, tts = make_clients(fake, clock)
+    services = FakeServiceLifecycle()
+    request = chain_request(tmp_path, material, results_root=tmp_path / name, **overrides)
+    out = chain.run_chain(
+        request, llm=llm, stt=stt, tts=tts, services=services,
+        container_state=lambda name: "running", clock=clock, git_sha="abc",
+    )  # fmt: skip
+    rows = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
+    return rows, fake, services
+
+
+def test_a_reply_pack_leaves_every_recorded_time_of_the_turn_unchanged(tmp_path, material):
+    plain, plain_fake, _ = pack_run(tmp_path, material, "plain")
+    packed, packed_fake, _ = pack_run(
+        tmp_path, material, "packed", reply_pack=tmp_path / "replies-a"
+    )
+
+    assert len(packed) == len(plain) == 28
+    for before, after in zip(plain, packed, strict=True):
+        assert {f: after[f] for f in TIMING_FIELDS} == {f: before[f] for f in TIMING_FIELDS}
+    assert [r["turn_ms"] for r in packed] == [r["turn_ms"] for r in plain]
+    # The pack takes the reply the turn already streamed to its end: no request is added.
+    assert [kind for kind, _ in packed_fake.requests] == [kind for kind, _ in plain_fake.requests]
+    assert packed_fake.spoken == plain_fake.spoken
+
+
+def test_a_reply_pack_saves_the_whole_reply_per_recording_and_repetition(tmp_path, material):
+    pack = tmp_path / "replies-a"
+
+    rows, fake, _ = pack_run(tmp_path, material, "results", reply_pack=pack)
+
+    saved = [json.loads(line) for line in (pack / chain.REPLY_PACK_FILE).read_text().splitlines()]
+    assert [(r["utt_id"], r["rep"]) for r in saved] == [(r["utt_id"], r["rep"]) for r in rows]
+    by_turn = {(r["utt_id"], r["rep"]): r for r in saved}
+    # The turn speaks only the first clause; the pack holds the whole reply.
+    assert by_turn[("U01", 1)]["reply"] == WHOLE_DONE_REPLY
+    assert "Your ten minute timer is set and running now," in fake.spoken
+    assert by_turn[("U20", 2)]["reply"] == SHORT_REPLY
+    assert by_turn[("U07", 1)]["reply"] == chain.HAND_OFF_ACK
+    assert {r["kind"] for r in saved} == {"command", "short", "hand_off"}
+    assert all(r["error"] is None for r in saved)
+    meta = json.loads((pack / chain.REPLY_PACK_META).read_text())
+    assert (meta["model"], meta["placement"], meta["alias"]) == (
+        "gemma4-e2b",
+        "gpu-full",
+        "gemma4-e2b@gpu-full",
+    )
+    assert (meta["stt_engine"], meta["tts_engine"], meta["reps"]) == ("parakeet-cpu", "pocket", 2)
+    assert meta["utterances"] == list(chain.CHAIN_UTTERANCES)
+
+
+def test_a_reply_pack_keeps_a_failed_turn_with_its_error_and_no_reply(tmp_path, material):
+    clock = Clock()
+    fake = fake_for_run(clock)
+    fake.transcripts = [UTTERANCES[u] for u in chain.CHAIN_UTTERANCES]
+    route = fake.chat_router
+
+    def failing(body):
+        if body["messages"][-1]["content"] == UTTERANCES["U19"]:
+            return [(0.05, sse({"error": {"message": "slot unavailable"}}))]
+        return route(body)
+
+    fake.chat_router = failing
+    llm, stt, tts = make_clients(fake, clock)
+    pack = tmp_path / "replies-a"
+
+    chain.run_chain(
+        chain_request(tmp_path, material, reps=1, reply_pack=pack), llm=llm, stt=stt, tts=tts,
+        services=FakeServiceLifecycle(), container_state=lambda name: "running", clock=clock,
+        git_sha="abc",
+    )  # fmt: skip
+
+    saved = {
+        r["utt_id"]: r
+        for r in (json.loads(x) for x in (pack / chain.REPLY_PACK_FILE).read_text().splitlines())
+    }
+    assert saved["U19"]["reply"] is None and "slot unavailable" in saved["U19"]["error"]
+    assert saved["U20"]["reply"] == SHORT_REPLY
+
+
+@pytest.mark.parametrize("where", ["inside-the-checkout", "existing"])
+def test_a_reply_pack_is_refused_inside_the_checkout_or_over_an_earlier_one(
+    tmp_path, material, where
+):
+    pack = _REPO_ROOT / "reply-pack-here" if where == "inside-the-checkout" else tmp_path / "old"
+    if where == "existing":
+        pack.mkdir()
+    clock = Clock()
+    llm, stt, tts = make_clients(fake_for_run(clock), clock)
+    services = FakeServiceLifecycle()
+
+    with pytest.raises(core.SpeechBenchError, match="--reply-pack"):
+        chain.run_chain(
+            chain_request(tmp_path, material, reply_pack=pack), llm=llm, stt=stt, tts=tts,
+            services=services, container_state=lambda name: "running", clock=clock,
+        )  # fmt: skip
+
+    assert services.events == []
+    assert not (tmp_path / "results").exists()
+    assert not (_REPO_ROOT / "reply-pack-here").exists()
+
+
+def test_cmd_chain_hands_the_reply_pack_to_the_request(tmp_path, monkeypatch):
+    seen = {}
+
+    def run_chain(request, **kwargs):
+        seen["request"] = request
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "turns.jsonl").write_text("", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(chain.ChainServices, "default", lambda **kwargs: FakeServiceLifecycle())
+    monkeypatch.setattr(chain, "run_chain", run_chain)
+    argv = [
+        "chain", "--results-root", str(tmp_path / "results"), "--run", "mh1",
+        "--model", "gemma4-e2b", "--placement", "gpu-full", "--material-dir", str(tmp_path),
+        "--speech-models-dir", str(tmp_path), "--reply-pack", str(tmp_path / "replies-a"),
+    ]  # fmt: skip
+
+    assert speech_bench.main(argv) == 0
+    assert seen["request"].reply_pack == tmp_path / "replies-a"
+    parser = speech_bench.subcommand_parsers(speech_bench.build_parser())["chain"]
+    assert {a.dest: a for a in parser._actions}["reply_pack"].default is None
+
+
+def test_the_speech_client_renders_all_of_a_text_s_audio(tmp_path):
+    clock = Clock()
+    fake = FakeServices(clock)
+    tts = chain.TtsClient(chain.TTS_URL, opener=fake, clock=clock)
+
+    pcm, rate = tts.render(WHOLE_DONE_REPLY)
+
+    assert fake.spoken == [WHOLE_DONE_REPLY]
+    assert pcm == b"\x01\x00" * 480 + b"\x02\x00" * 480
+    assert rate == 24000
+
+
+def test_the_speech_only_service_runs_one_engine_with_its_clip():
+    clock = Clock()
+    docker = FakeDocker()
+    services = chain.ChainServices.speech_only(
+        repo_dir="/repo", speech_models_dir="/models", engine="pocket-clone",
+        voice_clip=CLIP_HOST, docker=docker, opener=HealthOpener(clock), clock=clock,
+        sleep=clock.sleep,
+    )  # fmt: skip
+
+    (spec,) = services.specs
+    assert spec.container == chain.TTS_CONTAINER
+    assert _pairs(list(spec.argv), "--engine") == ["pocket-clone"]
+    assert CLIP_MOUNT in _pairs(list(spec.argv), "-v")
+    services.start()
+    assert [c for c in docker.calls if c[0] == "run"] == [("run", chain.TTS_CONTAINER)]
 
 
 # ---------------------------------------------------------------------------
@@ -1061,3 +1512,33 @@ def test_the_tts_service_answers_a_refused_body_with_400():
 
     assert caught.value.code == 400
     assert engine.texts == []
+
+
+def test_the_tts_service_takes_an_engine_and_defaults_to_pocket():
+    assert tts_service.build_parser().parse_args([]).engine == "pocket"
+    args = tts_service.build_parser().parse_args(["--engine", "qwen3-design"])
+    assert args.engine == "qwen3-design"
+
+
+class AnyVoiceEngine(FakeEngine):
+    def voices(self):
+        return [self.loaded_voice_hint]
+
+
+@pytest.mark.parametrize("engine_id", ["pocket-clone", "qwen3", "qwen3-design"])
+def test_the_tts_service_loads_the_chosen_engine_with_its_timing_voice(engine_id):
+    voice = ARMS["tts"][engine_id]["timing_voice"]
+    engine = AnyVoiceEngine()
+    engine.loaded_voice_hint = voice
+    seen = {}
+
+    def make(name, **kwargs):
+        seen["engine"] = name
+        seen.update(kwargs)
+        return engine
+
+    loaded = tts_service.load_engine(Path("/models/speech"), engine_id=engine_id, make=make)
+
+    assert loaded is engine and engine.loaded == voice
+    assert seen["engine"] == engine_id and seen["models_dir"] == Path("/models/speech")
+    assert voice == {"pocket-clone": "identity", "qwen3-design": "designed"}.get(engine_id, voice)

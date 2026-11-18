@@ -11,6 +11,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 # Package-qualified: `request_context` and `backend.request_context` are two
@@ -19,6 +20,19 @@ from typing import Any
 from backend.request_context import current_request_id
 
 _thread_local = threading.local()
+
+
+@dataclass(frozen=True, slots=True)
+class LogLine:
+    """One streamed log record on the broadcast queue: its JSON text and its level.
+
+    The level travels beside the text so the broadcaster can hand the line to the sessions
+    subscribed at that level (`SessionRegistry.publish_log`) without parsing it again.
+    """
+
+    text: str
+    level: str
+
 
 # Default gating levels for noisy third-party loggers.
 _SUPPRESSED_LOGGERS: dict[str, int] = {
@@ -205,11 +219,11 @@ class WebSocketLogHandler(logging.Handler):
         return True
 
     def _enqueue(self, record: logging.LogRecord) -> None:
-        """Serialize a log record to JSON and push onto the async message queue.
+        """Serialize a log record to JSON and push it onto the queue as a `LogLine`.
 
-        The broadcaster (server.py:73-93) only handles bytes/str on the wire;
-        emitting a dict here previously caused silent drops (MIS-106 dead code
-        on the wire). Timestamp is unix milliseconds per ADR-017.
+        A dict on the queue was once dropped silently by the broadcaster (MIS-106), so the
+        record is serialized here; its level goes beside it for per-session routing.
+        Timestamp is unix milliseconds per ADR-017.
         """
         request_id = current_request_id.get()
         record_dict: dict[str, Any] = {
@@ -221,8 +235,9 @@ class WebSocketLogHandler(logging.Handler):
             "request_id": request_id,
             "message": self.format(record),
         }
+        line = LogLine(text=json.dumps(record_dict), level=record.levelname)
         with contextlib.suppress(RuntimeError):
-            asyncio.run_coroutine_threadsafe(self._queue.put(json.dumps(record_dict)), self._loop)
+            asyncio.run_coroutine_threadsafe(self._queue.put(line), self._loop)
 
     def _enqueue_summary(self, count: int, duration: float) -> None:
         """Enqueue a rate-limit recovery summary as JSON (exempt from limiter)."""
@@ -237,5 +252,6 @@ class WebSocketLogHandler(logging.Handler):
                 f"Dropped {count} log messages in the last " f"{duration:.1f}s (rate limit)"
             ),
         }
+        line = LogLine(text=json.dumps(record_dict), level="WARNING")
         with contextlib.suppress(RuntimeError):
-            asyncio.run_coroutine_threadsafe(self._queue.put(json.dumps(record_dict)), self._loop)
+            asyncio.run_coroutine_threadsafe(self._queue.put(line), self._loop)

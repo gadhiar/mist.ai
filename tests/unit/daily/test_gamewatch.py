@@ -1127,8 +1127,8 @@ def test_register_script_header_documents_the_switch():
 def test_unregister_script_removes_both_tasks_each_only_if_present():
     code = ps_code(UNREGISTER)
     removals = ps_statements(code, "Unregister-ScheduledTask")
-    assert len(removals) == 2
-    for name in (INSTANCE_TASK, WATCH_TASK):
+    assert len(removals) == 3
+    for name in (INSTANCE_TASK, WATCH_TASK, "MIST extraction window"):
         removal = f"Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false"
         assert sum(removal in line for line in removals) == 1, name
         lookup = f"Get-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue"
