@@ -109,7 +109,10 @@ from .turn import (
 
 logger = logging.getLogger(__name__)
 
-Endpoint = Literal["desktop", "room"]
+# A session's endpoint: `desktop`, or a room device's registered name (`backend/devices/`), so
+# a ring or a broadcast can name one device. What kind of endpoint it is lives in `EndpointKind`.
+Endpoint = str
+EndpointKind = Literal["desktop", "room"]
 CapabilityMessage = ActionDecisionMessage | AlarmActionMessage | AlarmReportMessage
 
 TURN_LANE_MAX_ITEMS = 2048
@@ -296,8 +299,10 @@ class RealtimeSession:
     Args:
         session_id: The session's id, as `session_started` announced it.
         websocket: The accepted socket.
-        endpoint: The endpoint the connection is bound to; a `voice_start` naming another one
-            is logged and the bound one kept.
+        endpoint: The endpoint the connection is bound to: `desktop`, or a room device's name.
+        endpoint_kind: What kind of endpoint it is, which picks the spotter calibration and is
+            what a `voice_start`'s advisory `endpoint` is compared with: one naming another kind
+            is logged and the bound one kept. None: the endpoint itself.
         services: What every session shares.
         host: The registry.
         max_turn_items: The `turn` lane's bound.
@@ -312,11 +317,13 @@ class RealtimeSession:
         endpoint: Endpoint,
         services: SessionServices,
         host: SessionHost,
+        endpoint_kind: EndpointKind | None = None,
         max_turn_items: int = TURN_LANE_MAX_ITEMS,
         max_bulk_items: int = BULK_LANE_MAX_ITEMS,
     ) -> None:
         self.session_id = session_id
         self.endpoint: Endpoint = endpoint
+        self.endpoint_kind: str = endpoint if endpoint_kind is None else endpoint_kind
         self._socket = websocket
         self._services = services
         self._host = host
@@ -360,7 +367,7 @@ class RealtimeSession:
         settings = self._settings
         engines = services.engines
         spotter = engines.spotter
-        own = "server" if self.endpoint == "desktop" else "endpoint"
+        own = "server" if self.endpoint_kind == "desktop" else "endpoint"
         synthesizer = engines.tts_slot if engines.tts_slot is not None else engines.synthesizer
         responder = services.responder
         if services.power_gate is not None:
@@ -816,12 +823,13 @@ class RealtimeSession:
             self._answer_now(_Answer(req=settings.req), "invalid")
             return
         self._max_req = settings.req
-        if settings.endpoint != self.endpoint:
+        if settings.endpoint != self.endpoint_kind:
             logger.warning(
-                "session %s: voice_start names endpoint %s; the connection is bound to %s",
+                "session %s: voice_start names endpoint %s; the connection is bound to %s (%s)",
                 self.session_id,
                 settings.endpoint,
                 self.endpoint,
+                self.endpoint_kind,
             )
         refusal = self._refusal(settings)
         voice = self._voice

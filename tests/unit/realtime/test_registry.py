@@ -116,11 +116,14 @@ class RegistryRig:
         return self.ingresses[id(client.session)]
 
     async def connect(
-        self, session_id: str, endpoint: Literal["desktop", "room"] = "desktop"
+        self,
+        session_id: str,
+        endpoint: str = "desktop",
+        endpoint_kind: Literal["desktop", "room"] | None = None,
     ) -> Connected:
         socket = FakeSocket()
         session = self.registry.create_session(
-            session_id=session_id, websocket=socket, endpoint=endpoint
+            session_id=session_id, websocket=socket, endpoint=endpoint, endpoint_kind=endpoint_kind
         )
         task = asyncio.get_running_loop().create_task(session.run())
         client = Connected(session, socket, task)
@@ -185,6 +188,39 @@ class TestRouting:
         assert rig.registry.endpoint_present("desktop") is False
         await room.leave()
         assert rig.registry.endpoint_present("room") is False
+
+    async def test_endpoint_of_names_each_sessions_endpoint_until_it_leaves(self):
+        rig = RegistryRig()
+        desk = await rig.connect("a", "desktop")
+        device = await rig.connect("b", "example-room", "room")
+
+        bound = (rig.registry.endpoint_of("a"), rig.registry.endpoint_of("b"))
+        await device.leave()
+
+        assert bound == ("desktop", "example-room")
+        assert rig.registry.endpoint_of("b") is None
+        assert rig.registry.endpoint_of("never") is None
+        assert desk.session.endpoint_kind == "desktop"
+
+    async def test_create_session_passes_the_kind_through(self):
+        rig = RegistryRig()
+
+        device = await rig.connect("a", "example-room", "room")
+
+        assert (device.session.endpoint, device.session.endpoint_kind) == ("example-room", "room")
+        assert rig.registry.endpoint_present("example-room") is True
+        assert rig.registry.endpoint_present("room") is False
+
+    async def test_a_broadcast_to_a_device_name_reaches_that_device_only(self):
+        rig = RegistryRig()
+        other = await rig.connect("a", "other-room", "room")
+        device = await rig.connect("b", "example-room", "room")
+
+        rig.registry.broadcast({"type": "status", "message": "ring"}, endpoint="example-room")
+        await settle()
+
+        assert [m["message"] for m in device.socket.sent] == ["ring"]
+        assert other.socket.sent == []
 
     async def test_each_session_gets_its_own_voice_state_on_a_change(self):
         rig = RegistryRig()

@@ -223,7 +223,8 @@ class Rig:
         spotter: ScriptedNameSpotter | None | bool = True,
         synthesizer: bool = True,
         vad: bool = True,
-        endpoint: Literal["desktop", "room"] = "desktop",
+        endpoint: str = "desktop",
+        endpoint_kind: Literal["desktop", "room"] | None = None,
         max_turn_items: int = 2048,
         real_ingress: bool = False,
         session_id: str = "s1",
@@ -275,6 +276,7 @@ class Rig:
             session_id=session_id,
             websocket=self.socket,
             endpoint=endpoint,
+            endpoint_kind=endpoint_kind,
             services=services,
             host=self.host,  # type: ignore[arg-type]
             max_turn_items=max_turn_items,
@@ -639,6 +641,33 @@ class TestVoiceStart:
         assert any("endpoint" in r.getMessage() for r in caplog.records)
         # A room session asks the spotter for its endpoint calibration (v5).
         assert rig.controller.kwargs["calibration"] is CALIBRATION["endpoint"]
+
+    async def test_a_device_bound_room_session_takes_room_without_a_warning(self, caplog):
+        rig = await Rig(endpoint="example-room", endpoint_kind="room").start()
+
+        with caplog.at_level(logging.WARNING, logger="backend.realtime.session"):
+            await rig.send(voice_start(endpoint="room", spotter="endpoint"))
+
+        assert answer_of(rig.answers()[0]) == (1, True, None, False)
+        assert [r for r in caplog.records if "endpoint" in r.getMessage()] == []
+        assert (rig.session.endpoint, rig.session.endpoint_kind) == ("example-room", "room")
+        # The calibration key follows the kind, not the device's name.
+        assert rig.controller.kwargs["calibration"] is CALIBRATION["endpoint"]
+
+    async def test_a_device_bound_session_naming_desktop_is_logged(self, caplog):
+        rig = await Rig(endpoint="example-room", endpoint_kind="room").start()
+
+        with caplog.at_level(logging.WARNING, logger="backend.realtime.session"):
+            await rig.send(voice_start(endpoint="desktop"))
+
+        (record,) = (r for r in caplog.records if "endpoint" in r.getMessage())
+        assert "desktop" in record.getMessage() and "room" in record.getMessage()
+
+    async def test_the_kind_defaults_to_the_endpoint(self):
+        rig = await Rig(endpoint="desktop").start()
+
+        assert rig.session.endpoint_kind == "desktop"
+        assert rig.controller.kwargs["calibration"] is CALIBRATION["server"]
 
     async def test_the_controller_is_wired_from_the_settings_and_the_spotter(self):
         rig = await Rig().start()

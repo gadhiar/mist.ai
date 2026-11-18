@@ -40,7 +40,9 @@ from backend.chat.context_budget import ApproximateTokenCounter
 from backend.errors import CapabilityStoreError, CapabilityUnavailableError
 from backend.factories import CapabilityBuild
 from tests.unit.capabilities.fakes import FakeCapability, FakeClock, RecordingEventSink
+from tests.unit.realtime.turn_fakes import settle
 from tests.unit.test_session_id_propagation import (  # noqa: F401 -- autouse fixtures
+    Connection,
     FakeWebSocket,
     RecordingConversationHandler,
     connect,
@@ -745,6 +747,84 @@ class TestNoHost:
             WITNESS_ANSWER,
         ]
         assert handler.decisions == []
+
+
+# -- Which endpoint an alarm message came from ------------------------------------------------
+
+DEVICE = "example-room"
+
+
+async def _device_connection() -> Connection:
+    """One session served as the device route serves it: bound to a device's name, kind room."""
+    from backend import server
+
+    ws = FakeWebSocket()
+    task = asyncio.get_running_loop().create_task(server._serve_session(ws, DEVICE, "room"))
+    await settle()
+    return Connection(ws, task)
+
+
+class TestEndpointAttribution:
+    @pytest.mark.asyncio
+    async def test_an_alarm_action_from_a_device_session_names_the_device(self, monkeypatch, rig):
+        install_runtime(monkeypatch, DecidingHandler())
+        device = await _device_connection()
+
+        await device.send(_alarm_action(request_id="req-1"), WITNESS)
+        await device.leave()
+
+        assert rig.control.acts == [("a-ringing", "stop", None, DEVICE)]
+        frames = _without_snapshot(_after_handshake(device.ws))
+        assert [f["type"] for f in frames] == ["alarm_action_result", "log_config_ack"]
+        assert frames[0]["outcome"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_an_alarm_report_from_a_device_session_names_the_device(self, monkeypatch, rig):
+        install_runtime(monkeypatch, DecidingHandler())
+        device = await _device_connection()
+
+        await device.send(_alarm_report(request_id="rep-1"), WITNESS)
+        await device.leave()
+
+        assert rig.control.reports == [
+            {"alarm_id": "a-ringing", "endpoint": DEVICE, "outcome": "rang"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_ws_session_beside_a_device_still_names_desktop(self, monkeypatch, rig):
+        install_runtime(monkeypatch, DecidingHandler())
+        desktop = await connect()
+        device = await _device_connection()
+
+        await desktop.send(_alarm_report())
+        await device.send(_alarm_report())
+        await desktop.leave()
+        await device.leave()
+
+        assert [r["endpoint"] for r in rig.control.reports] == ["desktop", DEVICE]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        [pytest.param(_alarm_action(), id="action"), pytest.param(_alarm_report(), id="report")],
+    )
+    async def test_a_session_the_registry_no_longer_knows_gets_an_error_and_one_warning(
+        self, monkeypatch, rig, caplog, message
+    ):
+        from backend import server
+
+        install_runtime(monkeypatch, DecidingHandler())
+        sent: list[dict[str, object]] = []
+
+        with caplog.at_level(logging.WARNING, logger=SERVER_LOGGER):
+            await server._handle_capability_message(message, "gone-session", sent.append)
+
+        (error,) = sent
+        assert (error["type"], error["kind"], error["retriable"]) == ("error", "server", False)
+        assert rig.control.acts == [] and rig.control.reports == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "gone-session" in warnings[0].getMessage()
 
 
 # -- The endpoint's docstring ----------------------------------------------------------------
