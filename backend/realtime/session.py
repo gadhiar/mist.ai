@@ -45,7 +45,13 @@ from .ingress import (
 )
 from .ingress import Lane as InferenceLane
 from .playback import LaneFull, LanePurge, MonotonicPlaybackClock, PlaybackClock, TurnLane
-from .power import CapabilityOnly, PowerGate, PowerGatedResponder
+from .power import (
+    CapabilityOnly,
+    PowerGate,
+    PowerGatedResponder,
+    SynthesizerSlot,
+    TranscriberSlot,
+)
 from .protocol import (
     ActionDecisionMessage,
     AlarmActionMessage,
@@ -129,7 +135,10 @@ class SpeechEngines:
     """The loaded speech engines, shared by every session; a slot is None when it is off.
 
     Mutable on purpose: T22's GPU release and reload swap engines and statuses in place, and
-    every session reads them at the next `voice_start` and `voice_state`.
+    every session reads them at the next `voice_start` and `voice_state`. `stt_slot` and
+    `tts_slot` are the slots the runtime swaps; a session opens its streams and synthesizes on
+    them when they are set, so work started before a swap keeps its engine, and `transcriber`
+    and `synthesizer` name the engine loaded now.
     """
 
     vad: VoiceActivityDetector | None = None
@@ -139,6 +148,8 @@ class SpeechEngines:
     spotter: NameSpotter | None = None
     statuses: EngineStatuses = ALL_OFF
     vram_over_budget: bool = False
+    stt_slot: TranscriberSlot | None = None
+    tts_slot: SynthesizerSlot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +342,8 @@ class RealtimeSession:
         self._voice: _Voice | None = None
         self._kept: VoiceStartMessage | None = None
         self._power_check: asyncio.Handle | None = None
+        self._spoken_turn: str | None = None
+        self._unsubscribe_tts: Callable[[], None] | None = None
         self._epoch = 0
         self._muted = False
         self._pos = 0
@@ -357,7 +370,7 @@ class RealtimeSession:
         engines = services.engines
         spotter = engines.spotter
         own = "server" if self.endpoint == "desktop" else "endpoint"
-        synthesizer = engines.synthesizer
+        synthesizer = engines.tts_slot if engines.tts_slot is not None else engines.synthesizer
         responder = services.responder
         if services.power_gate is not None:
             responder = PowerGatedResponder(
@@ -436,6 +449,9 @@ class RealtimeSession:
     async def run(self) -> None:
         """Serve the connection until it closes, then commit the turn and unregister."""
         loop = asyncio.get_running_loop()
+        tts_slot = self._services.engines.tts_slot
+        if tts_slot is not None:
+            self._unsubscribe_tts = tts_slot.subscribe(self._on_tts_release)
         self._controller.start()
         self._sender = loop.create_task(self._send_loop(), name=f"session-send-{self.session_id}")
         self._sender.add_done_callback(self._sender_done)
@@ -455,7 +471,19 @@ class RealtimeSession:
             self._close_code = code
         self._closing.set()
 
+    def _on_tts_release(self) -> None:
+        """A GPU release cancelled TTS: cut a spoken reply whole, as the UI's stop does.
+
+        The cancel already ended the synthesis; the interrupt makes the controller end the turn,
+        so it is recorded as interrupted. A typed turn streams no audio and goes on.
+        """
+        if self._spoken_turn is not None and self._controller.phase in ("thinking", "speaking"):
+            self._controller.post(Interrupt())
+
     async def _teardown(self) -> None:
+        if self._unsubscribe_tts is not None:
+            self._unsubscribe_tts()
+            self._unsubscribe_tts = None
         await self._controller.close()
         voice, self._voice = self._voice, None
         if voice is not None:
@@ -528,8 +556,10 @@ class RealtimeSession:
         """A voice turn on the text channel because no synthesizer loaded is `tts_unavailable`.
 
         The controller picks the text channel without saying why; the session knows the slot
-        is off, so it queues the decision right after the turn's `stream_start`.
+        is off, so it queues the decision right after the turn's `stream_start`. A `tts` turn
+        is noted, so a GPU release knows a spoken reply is the one to cut.
         """
+        self._spoken_turn = start.turn_id if start.channel == "tts" else None
         voice = self._voice
         if (
             start.origin == "voice"
@@ -846,7 +876,9 @@ class RealtimeSession:
         ingress = services.ingress_factory(
             engines=IngressEngines(
                 vad=engines.vad,
-                transcriber=engines.transcriber,
+                transcriber=(
+                    engines.stt_slot if engines.stt_slot is not None else engines.transcriber
+                ),
                 turn_end=engines.turn_end,
                 spotter=engines.spotter,
             ),
