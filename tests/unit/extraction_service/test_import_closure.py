@@ -136,8 +136,11 @@ assert isinstance(app, FastAPI), type(app)
 
 try:
     import numpy
-except ModuleNotFoundError:
-    pass
+except ModuleNotFoundError as error:
+    # Only the finder's own refusal counts: an environment without numpy would raise this
+    # error even with a finder that blocks nothing.
+    if "outside the extraction image's import allowlist" not in str(error):
+        raise
 else:
     raise AssertionError("numpy imported, so the allowlist blocks nothing")
 
