@@ -32,9 +32,8 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8")
 
 import httpx
-import numpy as np
 import uvicorn
-from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
@@ -52,9 +51,8 @@ sys.path.insert(0, str(project_root))
 # Module-level state belongs to the module object, so the factories wiring,
 # ContextVars and caches would each exist twice, and a write through one name
 # would be invisible through the other. The bare spelling was additionally
-# ambiguous with dependencies/csm/config.py -- which is what the old
-# "import config BEFORE voice_processor" ordering existed to work around. The
-# qualified name removes both hazards outright.
+# ambiguous with dependencies/csm/config.py, which an import-order workaround
+# once papered over. The qualified name removes both hazards outright.
 from backend.capabilities.clock import SystemClock  # isort:skip
 from backend.capabilities.config import (  # isort:skip
     CapabilitiesConfig,
@@ -65,15 +63,14 @@ from backend.capabilities.events import (  # isort:skip
     ActionDecisionMessage,
     AlarmActionMessage,
     AlarmReportMessage,
-    QueueEventSink,
     alarm_action_result_payload,
 )
 from backend.capabilities.power import (  # isort:skip
+    FixedPower,
     GpuYieldPower,
     PowerState,
     SingleModelTiers,
 )
-from backend.capabilities.replies import NoAddress  # isort:skip
 from backend.capabilities.secrets import (  # isort:skip
     EnvSecretSource,
     SecretRegistry,
@@ -81,29 +78,28 @@ from backend.capabilities.secrets import (  # isort:skip
     redact,
 )
 from backend.chat.context_budget import ApproximateTokenCounter  # isort:skip
+from backend.chat.persona_register import PersonaRegister  # isort:skip
 from backend.config import DEFAULT_CONFIG  # isort:skip
 from backend.errors import CapabilityConfigError, MistError  # isort:skip
 from backend.event_store.status_intervals import (  # isort:skip
     degraded_beneath,
     record_status_tick,
 )
-from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
     CapabilityBuild,
     build_capability_host,
     build_curation_scheduler,
     build_extraction_dispatcher,
+    build_llm_provider,
+    build_mist_runtime,
     build_phase3_components,
     build_sidecar_index,
     build_vault_writer,
 )
 from backend.gpu_yield import (  # isort:skip
     MARKER_NAME,
-    RESUME_FAILED_MESSAGE,
-    YIELDED_MESSAGE,
     GpuYield,
     gpu_yield_poll_s,
-    turn_refusal,
 )
 from backend.health import (  # isort:skip
     BackupProbe,
@@ -126,8 +122,22 @@ from backend.knowledge.eval_isolation import (  # isort:skip
     EvalIsolationError,
     is_hydration_isolation_active,
 )
-from backend.log_handler import WebSocketLogHandler  # isort:skip
+from backend.log_handler import LogLine, WebSocketLogHandler  # isort:skip
 from backend.origins import allowed_origins, origin_allowed  # isort:skip
+from backend.realtime.budget import load_voice_settings  # isort:skip
+from backend.realtime.capability_sink import CapabilitySink  # isort:skip
+from backend.realtime.power import (  # isort:skip
+    PowerGate,
+    PowerWatcher,
+    gpu_yield_refusal,
+)
+from backend.realtime.protocol import (  # isort:skip
+    PROTOCOL_VERSION,
+    SessionCapabilities,
+    SessionStartedMessage,
+)
+from backend.realtime.registry import SessionRegistry  # isort:skip
+from backend.realtime.session import CapabilityMessage  # isort:skip
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -138,6 +148,9 @@ if TYPE_CHECKING:
     from backend.interfaces import EventStoreProvider
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
     from backend.llm import StreamingLLMProvider
+    from backend.realtime.budget import VoiceSettings
+    from backend.realtime.protocol import PowerLevel
+    from backend.realtime.runtime import MistRuntime
 
 # Setup logging -- console + persistent file
 _log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -237,24 +250,19 @@ def configure_file_logging(log_dir: Path) -> logging.Handler:
 
 logger = logging.getLogger(__name__)
 
-# WebSocket protocol version sent on session_started per ADR-017. Bump
-# minor on additive event/field additions, major on breaking changes.
-# v1.1.0 (2026-05-25): documents vault_results + system_status (shipped 2026-05-11).
-# v1.2.0 (2026-09-22): uptime_* fields in the ADR; this constant was not bumped then.
-# v1.3.0 (2026-09-26, MIS-171): additive `extraction_status` outbound message.
-# v1.4.0 (goal mist-capabilities): additive capability messages, listed in the
-# `websocket_endpoint` docstring.
-# Pinned by tests/unit/test_server_protocol_version.py.
-PROTOCOL_VERSION = "1.4.0"
+# The WebSocket protocol version `session_started` announces, imported from the
+# realtime protocol: 2.0.0 is main's 1.4.0 control messages plus protocol 2's
+# own. Pinned by tests/unit/test_server_protocol_version.py.
 
 # Global state
-active_connections: set[WebSocket] = set()
-active_connections_lock = asyncio.Lock()
-# Connections that opted into log streaming (ADR-017: per-connection
-# ephemeral). The global handler gate derives from "any subscriber present".
-log_subscribers: set[WebSocket] = set()
-message_queue: asyncio.Queue[str | bytes] = asyncio.Queue()
-voice_processor: VoiceProcessor | None = None
+# Process-wide producers (heartbeat, system and health status, extraction
+# status, log lines, decided proposals) put here; `broadcast_messages` drains
+# it into the session registry.
+message_queue: asyncio.Queue[str | LogLine] = asyncio.Queue()
+# The realtime runtime and the registry that holds one `RealtimeSession` per
+# `/ws` connection; both built in `lifespan`, None before it.
+runtime: "MistRuntime | None" = None
+session_registry: SessionRegistry | None = None
 curation_scheduler = None
 # T2a extraction backlog dispatcher (started/stopped in lifespan).
 extraction_dispatcher = None
@@ -268,10 +276,9 @@ vault_filewatcher = None
 # Phase 5.5: shared InvalidationBus wired from filewatcher to ConversationHandler
 vault_invalidation_bus = None
 
-# `/health` state. `voice_processor` is bound BEFORE `initialize()` is awaited,
-# so `voice_processor is not None` was true throughout the ~120s model load and
-# `models_loaded` claimed a state the process had not reached. This flag is set
-# only once `initialize()` has returned. Kept a plain bool because
+# `/health` state. This flag is set only once the runtime's build has returned,
+# so `models_loaded` never claims a state the process has not reached. Kept a
+# plain bool because
 # `tests/unit/hydration/test_health_isolation_flag.py` asserts the field is
 # still present and unchanged in kind. `scripts/hydration/target.py` consumes
 # this response but reads only `hydration_isolation` from it
@@ -293,12 +300,12 @@ _extraction_dispatcher_start_failed: bool = False
 # phase (httpx applies it to connect, read, write and pool separately) regardless.
 _extraction_health_client: httpx.AsyncClient | None = None
 EXTRACTION_HEALTH_CLIENT_TIMEOUT_S = 2.0
-# Gaming mode (`backend/gpu_yield.py`). None when `MIST_OPS_DIR` is unset, or
-# set while TTS is on: the backend is then never yielded.
+# Gaming mode (`backend/gpu_yield.py`). None when `MIST_OPS_DIR` is unset: the
+# backend is then never yielded.
 _gpu_yield: GpuYield | None = None
 
 # Capabilities (`backend/capabilities/`). `lifespan` builds them before the
-# voice processor. `_capability_build` holds the host, or the reason there is
+# runtime. `_capability_build` holds the host, or the reason there is
 # none, which `GET /capabilities` reports; None before `lifespan` runs.
 # `_capability_config` is None when the capability variables do not parse.
 # The secret registry exists from import, so the log redaction `lifespan`
@@ -307,14 +314,21 @@ _capability_build: CapabilityBuild | None = None
 _capability_config: CapabilitiesConfig | None = None
 _capability_power: PowerState | None = None
 _capability_secrets = SecretRegistry()
+# Relays the host's broadcasts to the sessions and answers D8's `alarm_ringing`.
+_capability_sink: CapabilitySink | None = None
+# Each session's capability calls in flight, cancelled when it disconnects so no
+# call outlives its connection.
+_capability_tasks: dict[str, set[asyncio.Task]] = {}
 # A `reason` in `GET /capabilities`, and the text of a capability failure or a
 # validation error answered on the WebSocket, is cut to this many characters.
 CAPABILITY_REASON_MAX_CHARS = 200
-# The inbound WebSocket messages that reach the capability host.
-CAPABILITY_MESSAGE_TYPES = frozenset({"action_decision", "alarm_action", "alarm_report"})
-# The endpoint of the daily WebSocket, recorded as the actor of each alarm
-# action and report that arrives on it. A payload never names its own endpoint.
+# The endpoint every `/ws` connection is bound to (D7), recorded as the actor
+# of each alarm action and report that arrives on it. A payload never names its
+# own endpoint.
 WS_ENDPOINT = "desktop"
+# Where `PersonaRegister` reads `<profile>/personality.yaml`; `/app/voice_profiles`
+# in the image.
+VOICE_PROFILES_ROOT = project_root / "voice_profiles"
 _T = TypeVar("_T")
 _M = TypeVar("_M", bound=BaseModel)
 
@@ -339,26 +353,27 @@ UPTIME_FIRST_TICK_WAIT_S = 60.0
 UPTIME_FIRST_TICK_POLL_S = 1.0
 
 
+def _route_broadcast(message: "str | LogLine") -> None:
+    """Hand one queued message to the registry: a log line to its subscribers, else to all.
+
+    Each session queues it on its own `bulk` lane and its own sender writes it, so a slow
+    client delays only itself. With no registry (before `lifespan` built one) there is no
+    session to send to, and the message is dropped.
+    """
+    registry = session_registry
+    if registry is None:
+        return
+    if isinstance(message, LogLine):
+        registry.publish_log(message.text, message.level)
+    else:
+        registry.broadcast(message)
+
+
 async def broadcast_messages():
-    """Background task to broadcast messages to all connected clients."""
+    """Drain `message_queue` into the session registry, one message at a time."""
     while True:
         message = await message_queue.get()
-
-        # Send to all connected clients
-        async with active_connections_lock:
-            stale = []
-            for websocket in active_connections:
-                try:
-                    if isinstance(message, bytes):
-                        await websocket.send_bytes(message)
-                    elif isinstance(message, str):
-                        await websocket.send_text(message)
-                except Exception as e:
-                    logger.error(f"Error sending to client: {e}")
-                    stale.append(websocket)
-            for ws in stale:
-                active_connections.discard(ws)
-
+        _route_broadcast(message)
         message_queue.task_done()
 
 
@@ -458,42 +473,34 @@ async def system_status_loop(interval_seconds: float = 5.0) -> None:
 async def health_status_loop(interval_seconds: float = 30.0) -> None:
     """Emit ADR-017 ``health_status`` events every ``interval_seconds``.
 
-    Three booleans for the FE's persistent bottom-left health indicator
-    (per prototype ``edges-v10`` ``Offline persistent indicator``):
-
-    - ``llm``: True iff ``voice_processor.models`` is initialized (LLM
-      backend loaded) and gaming mode does not hold the GPU. While yielded,
-      or while the reload after gaming mode is failing, no model is loaded
-      for a turn, so it is False.
-    - ``agent``: True iff ``voice_processor.models.knowledge.enabled``
-      (knowledge subsystem operational; False means degraded MIST)
-    - ``local``: True always (if this loop is running, the BE is up)
-
-    Transition-event emission (v1.1+) would supplement this periodic
-    push; v1.0 is periodic only.
+    The payload is `_health_status_payload`'s. Transition-event emission
+    (v1.1+) would supplement this periodic push; v1.0 is periodic only.
     """
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            llm = bool(voice_processor and voice_processor.models) and not _gpu_is_yielded()
-            agent = bool(
-                voice_processor
-                and voice_processor.models
-                and voice_processor.models.knowledge
-                and voice_processor.models.knowledge.enabled
-            )
-            local = True
-            payload = json.dumps(
-                {
-                    "type": "health_status",
-                    "llm": llm,
-                    "agent": agent,
-                    "local": local,
-                }
-            )
-            await message_queue.put(payload)
+            await message_queue.put(json.dumps(_health_status_payload()))
         except Exception as e:  # noqa: BLE001
             logger.error("Health status emit failed: %s", e)
+
+
+def _health_status_payload() -> dict[str, object]:
+    """Three booleans for the FE's persistent health indicator, read from the runtime now.
+
+    - `llm`: the runtime is built and gaming mode does not hold the GPU. While
+      yielded, or while the reload after gaming mode is failing, no model serves
+      a turn, so it is False.
+    - `agent`: the runtime answers turns through the conversation handler;
+      False means degraded MIST, answering without memory (`DirectResponder`).
+    - `local`: True always (if this loop is running, the BE is up).
+    """
+    built = runtime
+    return {
+        "type": "health_status",
+        "llm": built is not None and not _gpu_is_yielded(),
+        "agent": built is not None and built.agent_available,
+        "local": True,
+    }
 
 
 def _gpu_is_yielded() -> bool:
@@ -501,66 +508,80 @@ def _gpu_is_yielded() -> bool:
     return _gpu_yield is not None and _gpu_yield.is_yielded()
 
 
-def _yielded_turn_refusal() -> dict | None:
-    """The error envelope an `audio` or `text` message gets while yielded, else None.
+def _release_gpu_engines() -> None:
+    """`GpuYield.on_yield`: drop the runtime's CUDA speech engines.
 
-    The existing ADR-017 error shape, retriable, with a fixed message per
-    state, so the client fails the turn fast and plainly. The message schemas
-    are unchanged.
+    Reads `runtime` when called, because the runtime is built after the
+    `GpuYield`: its boot reads whether the marker is present.
     """
-    if _gpu_yield is None:
-        return None
-    state = _gpu_yield.state()
-    if state == "normal":
-        return None
-    return turn_refusal(YIELDED_MESSAGE if state == "yielded" else RESUME_FAILED_MESSAGE)
+    if runtime is not None:
+        runtime.release_gpu_engines()
 
 
-def _release_gpu_models() -> None:
-    """`GpuYield.on_yield`: release the live model manager's GPU models.
-
-    Reads `voice_processor` when called, because the model manager exists
-    only once `initialize()` has built it, after the `GpuYield` is built.
-    """
-    models = getattr(voice_processor, "models", None)
-    if models is not None:
-        models.release_gpu_models()
+def _reload_gpu_engines() -> None:
+    """`GpuYield.on_resume`: bring the runtime's speech engines back; never raises."""
+    if runtime is not None:
+        runtime.reload_gpu_engines()
 
 
-def _reacquire_gpu_models() -> None:
-    """`GpuYield.on_resume`: reload the live model manager's GPU models."""
-    models = getattr(voice_processor, "models", None)
-    if models is not None:
-        models.reacquire_gpu_models()
-
-
-def _build_gpu_yield(ops_dir: str | None, *, tts_enabled: bool, poll_s: float) -> GpuYield | None:
+def _build_gpu_yield(ops_dir: str | None, *, poll_s: float) -> GpuYield | None:
     """Build the gaming-mode watcher on `<ops_dir>/gpu-yielded`, or None.
 
     None when `ops_dir` (`MIST_OPS_DIR`) is unset or blank: no gaming mode,
-    never yielded. None, with one error, when TTS is on as well: gaming mode
-    releases Whisper only, and Chatterbox cannot yet be released safely, so a
-    backend with TTS on does not yield.
+    never yielded. Built otherwise, voice on or off: the runtime releases and
+    reloads every CUDA speech engine, TTS included (D2).
 
     Args:
         ops_dir: The `MIST_OPS_DIR` value.
-        tts_enabled: `config.tts_enabled`.
         poll_s: Marker poll interval (`MIST_GPU_YIELD_POLL_S`).
     """
     if ops_dir is None or not ops_dir.strip():
         return None
-    if tts_enabled:
-        logger.error(
-            "MIST_OPS_DIR is set but TTS_ENABLED is true: gaming mode needs TTS off, so no "
-            "GPU yield is built and a stopped LLM will read down"
-        )
-        return None
     return GpuYield(
         Path(ops_dir.strip()) / MARKER_NAME,
-        _release_gpu_models,
-        _reacquire_gpu_models,
+        _release_gpu_engines,
+        _reload_gpu_engines,
         poll_s=poll_s,
     )
+
+
+def _build_power(gpu_yield: GpuYield | None) -> PowerState:
+    """The process's power level: gaming mode's state, or always `full` without it."""
+    return FixedPower("full") if gpu_yield is None else GpuYieldPower(gpu_yield)
+
+
+def _build_power_gate(
+    power: PowerState, tiers: SingleModelTiers, gpu_yield: GpuYield | None
+) -> PowerGate:
+    """The gate every session applies (D2).
+
+    The refusal names the yield while `GpuYield` is `yielded`, and the missing
+    model otherwise or with no `GpuYield`.
+    """
+    state = gpu_yield.state if gpu_yield is not None else (lambda: "normal")
+    return PowerGate(power, tiers, gpu_yield_refusal(state))
+
+
+def _level_changed(level: "PowerLevel") -> None:
+    """The power watcher's report, to the runtime's GPU control: `voice_state`s and the rise."""
+    built = runtime
+    if built is not None and built.gpu is not None:
+        built.gpu.level_changed(level)
+
+
+def _on_power_watcher_done(task: "asyncio.Task") -> None:
+    """Done-callback for the power watcher; logs a death, ignores a cancel."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Power watcher died (%s); level changes no longer reach the sessions",
+            type(exc).__name__,
+            exc_info=exc,
+        )
+    else:
+        logger.error("Power watcher returned; level changes no longer reach the sessions")
 
 
 def _on_gpu_yield_loop_done(task: "asyncio.Task") -> None:
@@ -647,7 +668,13 @@ def _log_catchup_task_exception(task: "asyncio.Task") -> None:
         logger.error("Session-note catch-up task failed: %s", exc, exc_info=exc)
 
 
-def _build_session_note_catchup(voice_processor, vault_writer):
+def _session_count() -> int:
+    """How many `/ws` sessions are connected; 0 before the registry exists."""
+    registry = session_registry
+    return 0 if registry is None else registry.count()
+
+
+def _build_session_note_catchup(runtime, vault_writer):
     """Construct the catch-up instance from live server state, or None if ineligible.
 
     Extracted from `lifespan()` (final-review fix, C1) so the WIRING --
@@ -656,30 +683,24 @@ def _build_session_note_catchup(voice_processor, vault_writer):
     reason `_schedule_session_note_catchup` and
     `_shutdown_session_note_catchup` were extracted in fix round 2.
 
-    `is_conversation_active` is wired to the module-level `active_connections`
-    set, NOT `ConversationHandler.sessions`. `sessions` is populated on
-    every turn and, in production, is removed from in exactly one place --
-    `clear_session` -- whose only caller (`KnowledgeIntegration.clear_session`)
-    has zero production callers itself. The WebSocket disconnect path calls
-    `end_session`, which pops `_vault_paths` but never touches `self.sessions`.
-    Wiring the gate to `sessions` therefore means "this process has ever had
-    a conversation," not "a conversation is active right now" -- true
-    forever after the first turn, which silently disables `run_forever`'s
-    retry (R1.3.1 fix round 1, I5) for the rest of the process's life.
-    `active_connections` IS discarded on disconnect (see the `finally`
-    block in `websocket_endpoint`), so it reflects live connections
-    correctly.
+    `is_conversation_active` is wired to the session registry's count
+    (`_session_count`), NOT `ConversationHandler.sessions`. `sessions` is
+    populated on every turn and, in production, is removed from in exactly one
+    place -- `clear_session` -- which no server path calls. The WebSocket
+    disconnect path calls `end_session`, which pops `_vault_paths` but never
+    touches `self.sessions`. Wiring the gate to `sessions` therefore means
+    "this process has ever had a conversation," not "a conversation is active
+    right now" -- true forever after the first turn, which silently disables
+    `run_forever`'s retry (R1.3.1 fix round 1, I5) for the rest of the
+    process's life. The registry forgets a session once it has committed its
+    turn on disconnect, so its count reflects live connections.
 
     Returns:
         A `SessionNoteCatchup` ready to schedule, or None when the vault
         layer is disabled, no `ConversationHandler` is reachable yet, or
         the event store is unavailable.
     """
-    catchup_handler = (
-        voice_processor.models.knowledge.conversation_handler
-        if voice_processor and voice_processor.models and voice_processor.models.knowledge
-        else None
-    )
+    catchup_handler = getattr(runtime, "conversation_handler", None)
     catchup_event_store = catchup_handler.event_store if catchup_handler is not None else None
     if vault_writer is None or catchup_handler is None or catchup_event_store is None:
         return None
@@ -698,7 +719,7 @@ def _build_session_note_catchup(voice_processor, vault_writer):
         vault_writer=vault_writer,
         sessions_with_graph_state=catchup_handler.graph_store.sessions_with_graph_state,
         session_path_for=catchup_handler.derive_session_note_path,
-        is_conversation_active=lambda: bool(active_connections),
+        is_conversation_active=lambda: _session_count() > 0,
         is_llm_ready=catchup_handler.session_synthesizer.is_ready,
     )
 
@@ -710,7 +731,7 @@ def _schedule_session_note_catchup(catchup) -> "asyncio.Task":
     coroutine that gets scheduled -- `run_forever`, not a one-shot `run` --
     and the done-callback attachment are both independently testable
     without booting the full ASGI lifespan, which would otherwise require
-    faking `VoiceProcessor.initialize` and the entire model stack. See
+    faking the runtime's build and the entire model stack. See
     `tests/unit/test_server_catchup_lifecycle.py`.
     """
     task = asyncio.create_task(catchup.run_forever(), name="session-note-catchup")
@@ -758,8 +779,8 @@ class CurationDependencies:
     handler_found: bool
 
 
-def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
-    """Pull the curation scheduler's live collaborators off the handler and voice processor.
+def _resolve_curation_dependencies(runtime) -> CurationDependencies:
+    """Pull the curation scheduler's live collaborators off the runtime and its handler.
 
     Until 2026-08-03 `lifespan` called `build_curation_scheduler(knowledge_config)`
     and nothing else, leaving `event_store`, `tracker` and `llm_provider` at
@@ -777,10 +798,10 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
         zero patterns, always, so no Skill / KNOWS / MistCapability /
         HAS_CAPABILITY was ever derived.
 
-    `llm_provider` is the base provider, `voice_processor._llm_provider`: the
-    object `VoiceProcessor` builds and injects into `build_conversation_handler`,
-    which the extraction pipeline holds and `/health` probes
-    (`_health_llm_provider`). It is not the handler's `_provider`, because with
+    `llm_provider` is the base provider, `runtime.llm_provider`: the object
+    `lifespan` builds and `build_mist_runtime` injects into
+    `build_conversation_handler`, which the extraction pipeline holds and
+    `/health` probes (`_health_llm_provider`). It is not the handler's `_provider`, because with
     the conversation role set (`MIST_LLM_CONVERSATION_URL`) the handler holds
     the role's provider, and curation stays on `LLM_SERVER_URL` and `MODEL`.
     With the role unset the two are one object. It is supplied rather than
@@ -796,19 +817,12 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     booting the full model stack unless the resolution is its own function.
     See `tests/unit/test_curation_scheduler_wiring.py`.
 
-    Reaches the handler through the same defensive chain the end-session
-    broadcast and the shutdown drain already use.
-
     Returns:
         A `CurationDependencies` holding the live handler's own event store
-        and tracker and the voice processor's base provider, or all-None with
+        and tracker and the runtime's base provider, or all-None with
         `handler_found=False` when no handler is reachable.
     """
-    handler = (
-        voice_processor.models.knowledge.conversation_handler
-        if voice_processor and voice_processor.models and voice_processor.models.knowledge
-        else None
-    )
+    handler = getattr(runtime, "conversation_handler", None)
     if handler is None:
         return CurationDependencies(
             event_store=None,
@@ -819,17 +833,16 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     return CurationDependencies(
         event_store=handler.event_store,
         tracker=handler._tool_usage_tracker,
-        llm_provider=getattr(voice_processor, "_llm_provider", None),
+        llm_provider=getattr(runtime, "llm_provider", None),
         handler_found=True,
     )
 
 
-async def _start_extraction_dispatcher(voice_processor, knowledge_config: KnowledgeConfig):
+async def _start_extraction_dispatcher(runtime, knowledge_config: KnowledgeConfig):
     """Build, attach and start the T2a extraction-backlog dispatcher.
 
-    Reaches the live ConversationHandler through the same
-    voice_processor -> models -> knowledge -> conversation_handler chain the
-    curation wiring uses, builds the dispatcher over that handler's OWN
+    Reaches the live ConversationHandler on the runtime, as the curation
+    wiring does, builds the dispatcher over that handler's OWN
     pipeline and event store (so the backlog reads the log live traffic writes),
     starts it, and attaches it, so from here on a recorded turn wakes the
     backlog instead of spawning in-process extraction on the chat model.
@@ -850,11 +863,7 @@ async def _start_extraction_dispatcher(voice_processor, knowledge_config: Knowle
     """
     from backend.extraction_backlog.settings import DispatcherSettings
 
-    handler = (
-        voice_processor.models.knowledge.conversation_handler
-        if voice_processor and voice_processor.models and voice_processor.models.knowledge
-        else None
-    )
+    handler = getattr(runtime, "conversation_handler", None)
     if handler is None or handler.event_store is None:
         logger.warning(
             "Extraction dispatcher not started: no ConversationHandler or event store "
@@ -966,18 +975,13 @@ def _on_health_probe_loop_done(task: "asyncio.Task") -> None:
 
 
 def _health_conversation_handler():
-    """Reach the live `ConversationHandler`, or None at any broken hop.
+    """Reach the live `ConversationHandler`, or None.
 
-    Every hop is guarded because each one is legitimately None in a running
-    process: `models` until `VoiceProcessor.initialize()` has built it
-    (`voice_processor.py:168`), `knowledge` when knowledge integration is off or
-    Neo4j was unavailable at boot (`voice_models/model_manager.py:85-98`), and
-    `conversation_handler` when `build_conversation_handler` raised
-    (`chat/knowledge_integration.py:74-87`).
+    None before `lifespan` has built the runtime, and when the runtime answers
+    without memory: knowledge integration off, or its build raised a
+    `MistError` such as Neo4j unreachable (`build_mist_runtime`).
     """
-    models = getattr(voice_processor, "models", None)
-    knowledge = getattr(models, "knowledge", None)
-    return getattr(knowledge, "conversation_handler", None)
+    return getattr(runtime, "conversation_handler", None)
 
 
 def _health_graph_connection():
@@ -996,18 +1000,12 @@ def _health_event_store():
 
 
 def _health_llm_provider():
-    """Reach the LLM provider.
+    """Reach the base LLM provider, `runtime.llm_provider`, or None before the runtime.
 
-    Read off `VoiceProcessor`, not `ModelManager`: both hold the same object,
-    since `voice_processor.py:171` passes `self._llm_provider` straight into the
-    `ModelManager` constructor, which stores it unchanged
-    (`voice_models/model_manager.py:71`). The `VoiceProcessor` attribute is the
-    shorter chain and is assigned first (`voice_processor.py:162`, before
-    `models` exists at :168), so it is never the later of the two to appear.
-    `getattr` rather than attribute access because it is assigned in
-    `initialize()`, not in `__init__`.
+    The base, not the handler's: it is the object the extraction pipeline and
+    curation hold, so the probe checks the server those use (T39's split).
     """
-    return getattr(voice_processor, "_llm_provider", None)
+    return getattr(runtime, "llm_provider", None)
 
 
 def _knowledge_configured() -> bool:
@@ -1031,17 +1029,18 @@ def _capability_host() -> "CapabilityHost | None":
 
 
 def _desktop_present() -> bool:
-    """Whether a client is connected, so the desktop ring endpoint can ring."""
-    return bool(active_connections)
+    """Whether a session bound `desktop` is connected, so the desktop endpoint can ring."""
+    registry = session_registry
+    return registry is not None and registry.endpoint_present(WS_ENDPOINT)
 
 
 def _capability_tiers(power: PowerState) -> SingleModelTiers:
-    """The action decode's tiers over the voice processor's one provider.
+    """The action decode's and the sessions' tiers over the runtime's one provider.
 
     The provider is read through `_health_llm_provider` at each call, because
-    it exists only once `VoiceProcessor.initialize()` has built it: before
-    that the decode is unavailable, after it available. The same object is
-    passed to the host and the conversation handler, so they cannot disagree.
+    it exists only once the runtime is built: before that the decode is
+    unavailable, after it available. The same object is passed to the host,
+    the conversation handler and the power gate, so they cannot disagree.
     """
     return SingleModelTiers(_health_llm_provider, power)
 
@@ -1054,7 +1053,7 @@ def _read_secret_file(path: str) -> str:
 def _attach_capability_host(tiers: SingleModelTiers) -> None:
     """Attach the built host to the live conversation handler, if both exist.
 
-    Called once `initialize()` has returned, since the handler exists only
+    Called once the runtime is built, since the handler exists only
     then. With no handler (knowledge integration off, or its build failed)
     the host still serves alarm actions and the status surface, but no turn
     reaches it, which is logged.
@@ -1088,24 +1087,62 @@ async def _stop_capability_host() -> None:
         logger.warning("Capability build close error (non-fatal): %s", e)
 
 
-async def _initialize_voice_processor(processor: VoiceProcessor, *, yielded: bool = False) -> None:
-    """Load the model stack and only then publish readiness.
+async def _build_runtime(
+    knowledge_config: KnowledgeConfig,
+    *,
+    voice_settings: "VoiceSettings",
+    power_gate: PowerGate,
+    alarm_ringing: "Callable[[], bool]",
+    register_prompt: str | None,
+    factory: "Callable[..., MistRuntime] | None" = None,
+) -> "MistRuntime":
+    """Build the realtime runtime off the loop, publish it, and only then publish readiness.
 
-    The ordering is the whole point, so it is a function rather than two lines
-    in `lifespan`: `_models_ready` must flip AFTER `initialize()` returns, and
-    that is not assertable without faking the entire model stack unless the
-    sequence is independently callable. See
-    `tests/unit/test_server_health_wiring.py::test_models_loaded_is_false_during_initialize`.
+    The ordering is the whole point, so it is a function rather than lines in
+    `lifespan`: `_models_ready` must flip AFTER the build returns, and that is
+    not assertable without faking the model stack unless the sequence is
+    independently callable. See
+    `tests/unit/test_server_health_wiring.py::test_models_loaded_is_false_during_the_runtime_build`.
+
+    The build loads the speech engines and warms the LLM, so it runs on a worker
+    thread: the capability host is already running on the loop, and an alarm due
+    at boot rings without waiting for the models. The gate's level is read at
+    boot, so with gaming mode's marker present no CUDA engine is built and the
+    LLM warm-up is skipped.
 
     Args:
-        processor: The already-constructed `VoiceProcessor` to initialize.
-        yielded: Gaming mode holds the GPU at boot; the GPU models and the LLM
-            warmup are skipped.
+        knowledge_config: The knowledge configuration.
+        voice_settings: From `load_voice_settings`.
+        power_gate: Every session's gate; its level is the process's.
+        alarm_ringing: D8's ringing query, `CapabilitySink.ringing`.
+        register_prompt: The persona's register sentence for the handler's prompt.
+        factory: Builds the runtime; `lifespan` passes the module's `build_mist_runtime`,
+            looked up at its call. The module's `build_mist_runtime` too when None.
     """
-    global _models_ready
+    global runtime, _models_ready
 
-    await processor.initialize(yielded=yielded)
+    from backend.debug_jsonl_logger import DebugJSONLLogger
+
+    provider = build_llm_provider(knowledge_config, debug_logger=DebugJSONLLogger.from_env())
+    built = await asyncio.to_thread(
+        functools.partial(
+            factory or build_mist_runtime,
+            knowledge_config,
+            voice_settings=voice_settings,
+            llm_provider=provider,
+            tts_enabled=bool(config.tts_enabled),
+            vault_writer=vault_writer,
+            vault_sidecar=vault_sidecar,
+            invalidation_bus=vault_invalidation_bus,
+            power_gate=power_gate,
+            alarm_ringing=alarm_ringing,
+            on_capability_message=_on_capability_message,
+            register_prompt=register_prompt,
+        )
+    )
+    runtime = built
     _models_ready = True
+    return built
 
 
 async def _start_extraction_dispatcher_recording_failure(
@@ -1186,7 +1223,7 @@ def _build_health_registry(
     """Construct the dependency probes and the registry that runs them.
 
     Every accessor is a callable that reads module state WHEN THE PROBE RUNS,
-    never a value captured here. `voice_processor`, `vault_sidecar` and the
+    never a value captured here. `runtime`, `vault_sidecar` and the
     objects reachable through them are rebound during `lifespan`, and this
     registry is built after that -- but a captured value would still be wrong
     the moment any of them is replaced, and a captured None would freeze the
@@ -1417,11 +1454,11 @@ async def lifespan(app: FastAPI):
     install_log_redaction(_capability_secrets)
     configure_file_logging(_resolve_log_dir())
 
-    global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
+    global curation_scheduler, log_handler, extraction_dispatcher, session_registry
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
     global _broadcaster_state, _health_registry, _health_probe_executor
     global _extraction_health_client, _gpu_yield
-    global _capability_build, _capability_config, _capability_power
+    global _capability_build, _capability_config, _capability_power, _capability_sink
 
     # Startup
     logger.info("=" * 60)
@@ -1435,8 +1472,8 @@ async def lifespan(app: FastAPI):
     knowledge_config = KnowledgeConfig.from_env()
 
     # Cluster 8 Phase 5: vault layer subsystems are built FIRST so the
-    # single server-owned VaultWriter can be plumbed into VoiceProcessor
-    # -> ModelManager -> KnowledgeIntegration -> ConversationHandler. Each
+    # single server-owned VaultWriter can be plumbed into the runtime's
+    # ConversationHandler (`build_mist_runtime`). Each
     # subsystem is optional via config and degrades cleanly when disabled.
     vault_writer = None
     vault_sidecar = None
@@ -1471,8 +1508,8 @@ async def lifespan(app: FastAPI):
 
         # Phase 5.5: migrate from build_filewatcher (throwaway bus) to
         # build_phase3_components so the shared InvalidationBus instance can
-        # be forwarded to VoiceProcessor -> ModelManager -> KnowledgeIntegration
-        # -> build_conversation_handler, wiring ConversationHandler._on_vault_rebuild
+        # be forwarded through `build_mist_runtime` to
+        # build_conversation_handler, wiring ConversationHandler._on_vault_rebuild
         # for ADR-010 read-path cache invalidation on vault edits.
         phase3 = build_phase3_components(
             config=knowledge_config,
@@ -1491,23 +1528,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Vault layer initialization failed (continuing without vault): %s", e)
 
-    # Gaming mode, built before the model load so a backend that boots while
-    # the marker exists skips Whisper and the LLM warmup, and before the
-    # capability host, whose power level reads it. Its poll starts only after
-    # initialize() returns, so a marker that came or went during the load is
-    # acted on by the first poll.
-    _gpu_yield = _build_gpu_yield(
-        os.environ.get("MIST_OPS_DIR"),
-        tts_enabled=bool(config.tts_enabled),
-        poll_s=gpu_yield_poll_s(),
-    )
+    # Gaming mode, built before the runtime so a backend that boots while the
+    # marker exists builds no CUDA speech engine and skips the LLM warmup, and
+    # before the capability host, whose power level reads it. Its callbacks
+    # reach the runtime late, through the module global. Its poll starts only
+    # after the runtime is built, so a marker that came or went during the
+    # load is acted on by the first poll.
+    _gpu_yield = _build_gpu_yield(os.environ.get("MIST_OPS_DIR"), poll_s=gpu_yield_poll_s())
 
-    # Capabilities: built and started before the voice processor exists and
-    # before the model load, so an alarm due at boot rings without waiting
-    # for the models. The decode tiers read the provider lazily (see
-    # `_capability_tiers`), so the host is ready before the provider is.
-    _capability_power = GpuYieldPower(_gpu_yield)
+    # Capabilities: built and started before the runtime and before the model
+    # load, so an alarm due at boot rings without waiting for the models. The
+    # tiers read the provider lazily (see `_capability_tiers`), so the host is
+    # ready before the provider is. The sink reaches the sessions once the
+    # registry is attached below.
+    _capability_power = _build_power(_gpu_yield)
     capability_tiers = _capability_tiers(_capability_power)
+    power_gate = _build_power_gate(_capability_power, capability_tiers, _gpu_yield)
+    voice_settings = load_voice_settings(os.environ)
+    persona = PersonaRegister.load(VOICE_PROFILES_ROOT, voice_settings.profile)
+    _capability_sink = CapabilitySink()
     try:
         _capability_config = load_capabilities_config(os.environ)
     except CapabilityConfigError as e:
@@ -1519,7 +1558,7 @@ async def lifespan(app: FastAPI):
     else:
         _capability_build = build_capability_host(
             _capability_config,
-            event_sink=QueueEventSink(loop, message_queue),
+            event_sink=_capability_sink,
             secret_source=EnvSecretSource(os.environ, _read_secret_file),
             secret_registry=_capability_secrets,
             clock=SystemClock(),
@@ -1531,31 +1570,42 @@ async def lifespan(app: FastAPI):
             transport_factory=None,
             power=_capability_power,
             tiers=capability_tiers,
-            register=NoAddress(),
+            register=persona,
             desktop_present=_desktop_present,
         )
     if _capability_build.host is not None:
         await _capability_build.host.start()
 
-    # Initialize voice processor with the server-owned vault_writer, sidecar,
-    # and invalidation_bus so that the voice-path ConversationHandler shares a
-    # single started writer, the retriever routes to the same initialized sidecar
-    # (Phase 9), and _on_vault_rebuild is subscribed to the shared bus for
-    # ADR-010 read-path cache invalidation (Phase 5.5).
-    voice_processor = VoiceProcessor(
-        config,
-        message_queue,
-        vault_writer=vault_writer,
-        vault_sidecar=vault_sidecar,
-        invalidation_bus=vault_invalidation_bus,
-    )
+    # The realtime runtime, with the server-owned vault_writer, sidecar and
+    # invalidation_bus, so the handler shares a single started writer, the
+    # retriever routes to the same initialized sidecar (Phase 9), and
+    # _on_vault_rebuild is subscribed to the shared bus for ADR-010 read-path
+    # cache invalidation (Phase 5.5). Sets `_models_ready` only once the build
+    # has returned, so `/health.models_loaded` reports a state the process has
+    # actually reached.
     yield_state = _gpu_yield.state if _gpu_yield is not None else None
     defer_llm_jobs = _gpu_yield.is_yielded if _gpu_yield is not None else None
-    # Sets `_models_ready` only once initialize() has returned, so
-    # `/health.models_loaded` reports a state the process has actually reached
-    # rather than the mere existence of the object above.
-    await _initialize_voice_processor(voice_processor, yielded=_gpu_is_yielded())
+    built = await _build_runtime(
+        knowledge_config,
+        voice_settings=voice_settings,
+        power_gate=power_gate,
+        alarm_ringing=_capability_sink.ringing,
+        register_prompt=persona.prompt_line(),
+        factory=build_mist_runtime,
+    )
+    # The log handler streams through the registry: `subscribe_logs` gates it
+    # on every session's subscription (`SessionRegistry.set_log_subscription`).
+    log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
+    logging.getLogger().addHandler(log_handler)
+    logger.info("WebSocket log handler attached")
+    session_registry = SessionRegistry(built.services, log_gate=log_handler)
+    _capability_sink.attach(session_registry, loop)
+    if built.gpu is not None:
+        built.gpu.attach(loop, session_registry)
     _attach_capability_host(capability_tiers)
+    power_watcher = PowerWatcher(power_gate, yield_state or (lambda: "normal"), _level_changed)
+    power_watcher_task = asyncio.create_task(power_watcher.run(), name="power-watcher")
+    power_watcher_task.add_done_callback(_on_power_watcher_done)
     gpu_yield_task: asyncio.Task | None = None
     if _gpu_yield is not None:
         gpu_yield_task = asyncio.create_task(_gpu_yield.run_forever(), name="gpu-yield")
@@ -1599,8 +1649,8 @@ async def lifespan(app: FastAPI):
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
 
     # The uptime ledger samples the registry above into the event store, so it
-    # starts after both exist; `voice_processor.initialize()` has returned, so
-    # the handler that owns the event store is the live one.
+    # starts after both exist; the runtime is built, so the handler that owns
+    # the event store is the live one.
     uptime_task: asyncio.Task | None = None
     uptime_recorder = _build_uptime_recorder(
         _health_event_store(), _health_snapshot, uptime_record_s()
@@ -1627,19 +1677,14 @@ async def lifespan(app: FastAPI):
             config.system_status.gpu_enabled,
         )
 
-    # Attach WebSocket log handler to root logger
-    log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
-    logging.getLogger().addHandler(log_handler)
-    logger.info("WebSocket log handler attached")
-
     # Start curation scheduler for periodic graph maintenance.
     #
     # Every falsy-default parameter is supplied explicitly -- see
     # `_resolve_curation_dependencies` for what leaving them defaulted cost
     # (two of the nine jobs structurally incapable of producing output).
-    # `voice_processor.initialize()` has already completed above, so the
-    # ConversationHandler these come off is the live one.
-    curation_deps = _resolve_curation_dependencies(voice_processor)
+    # The runtime is built above, so the ConversationHandler these come off
+    # is the live one.
+    curation_deps = _resolve_curation_dependencies(built)
     if not curation_deps.handler_found:
         logger.warning(
             "Curation scheduler: no ConversationHandler reachable -- self_reflection and "
@@ -1671,11 +1716,11 @@ async def lifespan(app: FastAPI):
         logger.warning("Curation scheduler failed to start: %s", e)
         curation_scheduler = None
 
-    # T2a: extraction backlog. After voice_processor.initialize() so the
-    # handler it attaches to is the live one.
+    # T2a: extraction backlog. After the runtime's build so the handler it
+    # attaches to is the live one.
     extraction_dispatcher = None
     extraction_dispatcher = await _start_extraction_dispatcher_recording_failure(
-        lambda: _start_extraction_dispatcher(voice_processor, knowledge_config)
+        lambda: _start_extraction_dispatcher(built, knowledge_config)
     )
 
     # ADR-017 additive `extraction_status`: periodic push, with or without a
@@ -1697,15 +1742,14 @@ async def lifespan(app: FastAPI):
     # ConversationHandler.end_session. Background and deferential -- boot is
     # when the user is most likely to start talking, and a synthesis call
     # would hold the GPU and delay their first token. Reached through the
-    # same voice_processor -> models -> knowledge -> conversation_handler
-    # chain the shutdown path below already uses to reach the handler.
+    # runtime's handler, as the shutdown path below reaches it.
     # Runs as `run_forever` (periodic, not one-shot): a single pass can come
     # back empty because the LLM backend is still cold at boot or a
     # conversation is live throughout, and a one-shot task would strand the
     # backlog for the rest of the process's life in either case.
     catchup_task: asyncio.Task | None = None
     try:
-        catchup = _build_session_note_catchup(voice_processor, vault_writer)
+        catchup = _build_session_note_catchup(built, vault_writer)
         if catchup is not None:
             catchup_task = _schedule_session_note_catchup(catchup)
             logger.info("Session-note catch-up scheduled as a periodic background task")
@@ -1742,11 +1786,7 @@ async def lifespan(app: FastAPI):
     # loop teardown would otherwise cancel them mid commit-protocol (belief
     # retired, successor never written) and drop their vault appends.
     try:
-        ch = (
-            voice_processor.models.knowledge.conversation_handler
-            if voice_processor and voice_processor.models and voice_processor.models.knowledge
-            else None
-        )
+        ch = _health_conversation_handler()
         if ch is not None and hasattr(ch, "aclose"):
             await ch.aclose()
     except Exception as e:  # noqa: BLE001
@@ -1792,11 +1832,15 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(health_probe_task, return_exceptions=True)
     await _stop_uptime_recorder(uptime_task)
     broadcaster_task.cancel()
+    power_watcher_task.cancel()
+    await asyncio.gather(power_watcher_task, return_exceptions=True)
     if gpu_yield_task is not None:
         gpu_yield_task.cancel()
         # Waits for the cancel to land; `return_exceptions` keeps a loop that
         # already died (logged by its done-callback) from raising here.
         await asyncio.gather(gpu_yield_task, return_exceptions=True)
+    if built.gpu is not None:
+        built.gpu.stop()
     # `wait=False` deliberately: a probe thread wedged on the timeout-less Neo4j
     # driver would otherwise hold shutdown for the driver's own 60s acquisition
     # timeout. The pool has one worker and the process is ending.
@@ -1804,8 +1848,8 @@ async def lifespan(app: FastAPI):
         _health_probe_executor.shutdown(wait=False)
     # After the probe loop is cancelled, so no new health call starts on it.
     await _close_extraction_health_client()
-    if voice_processor and voice_processor.models:
-        voice_processor.models.shutdown()
+    # Last: each lane's worker thread stops once nothing can submit to it.
+    built.close()
 
 
 # FastAPI app with lifespan
@@ -1923,18 +1967,20 @@ async def health() -> dict:
 
     Fields that predate the registry, preserved for existing consumers
     -----------------------------------------------------------------
-    - `models_loaded`: `_models_ready`, set after `VoiceProcessor.initialize()`
-      returns. A plain bool. Two consumers outside this module, not one:
+    - `models_loaded`: `_models_ready`, set after the runtime's build returns.
+      A plain bool. Two consumers outside this module, not one:
       `tests/unit/hydration/test_health_isolation_flag.py`, which asserts it is
       present, and a documented operator wait-loop at
       `scripts/eval_harness/websocket_gauntlets_runbook.md:96-97`
       (`until curl ... | grep -q "models_loaded.:true"; do sleep 3; done`).
       That loop is the point of the fix rather than an incidental reader: the
-      field used to be `voice_processor is not None`, and `lifespan` binds
-      `voice_processor` before awaiting `initialize()`, so the loop exited
-      almost at once and handed the operator a ready signal roughly 120s of
-      model loading early. It now blocks until the models are actually up.
-    - `active_connections`: live WebSocket count.
+      field once read an object bound before its models loaded, so the loop
+      exited almost at once and handed the operator a ready signal roughly
+      120s of model loading early. It now blocks until the models are up.
+    - `active_connections`: live WebSocket count, `SessionRegistry.count()`.
+    - `voice`: the runtime's engine report (`engines`, `tts_voice`,
+      `vram_budget_mib`, `vram_over_budget`) and `power_level`; null before
+      the runtime is built.
     - `hydration_isolation` (F4): the positive handshake the hydrator requires
       before sending its first turn. The live backend never sets
       `MIST_HYDRATION_ISOLATION`, so this field is how a hydrator pointed at the
@@ -1946,17 +1992,42 @@ async def health() -> dict:
       producer, so the two cannot disagree.
 
     Returns:
-        The snapshot mapping with those four fields added. Returned as a dict
+        The snapshot mapping with those five fields added. Returned as a dict
         so FastAPI serializes it with a 200.
     """
     from backend.extraction_backlog.status import extraction_status, health_block
 
     payload = _health_snapshot()
     payload["models_loaded"] = _models_ready
-    payload["active_connections"] = len(active_connections)
+    payload["active_connections"] = _session_count()
     payload["hydration_isolation"] = _hydration_isolation_for_health()
     payload["extraction"] = health_block(extraction_status(extraction_dispatcher))
+    payload["voice"] = _voice_health()
     return payload
+
+
+def _voice_health() -> dict[str, object] | None:
+    """The runtime's engine report for `/health`, or None before the runtime is built.
+
+    `engines` is each slot's status as `voice_state` reports it, `tts_voice` the
+    synthesizer's identity (engine `off` with TTS off), and `power_level` the
+    level every session shows, read now.
+    """
+    from backend.realtime.session import tts_voice_of
+
+    built = runtime
+    if built is None:
+        return None
+    engines = built.engines
+    services = built.services
+    gate = services.power_gate
+    return {
+        "engines": engines.statuses.model_dump(mode="json"),
+        "tts_voice": tts_voice_of(engines, built.settings).model_dump(mode="json"),
+        "vram_budget_mib": built.settings.placement.vram_budget_mib,
+        "vram_over_budget": engines.vram_over_budget,
+        "power_level": gate.level() if gate is not None else services.power_level(),
+    }
 
 
 def _health_snapshot() -> dict:
@@ -2229,44 +2300,20 @@ def _hydration_isolation_for_health() -> bool:
         return False
 
 
-def _reset_voice_state_if_last_connection() -> bool:
-    """Clear singleton connection state once no client remains.
-
-    `voice_processor` is shared by every entry in `active_connections`, so its
-    connection-scoped state (a parked utterance) outlives the connection that
-    produced it and becomes the next session's starting state.
-
-    Guarded on the set being EMPTY rather than firing on every disconnect: with
-    a concurrent connection still open, the parked utterance may be that
-    connection's, and clearing it would drop a live client's queued message.
-
-    Returns:
-        True if the reset ran, False if a connection remains or the voice
-        processor has not been constructed yet.
-    """
-    if active_connections:
-        return False
-    if voice_processor is None:
-        return False
-    voice_processor.reset_connection_state()
-    return True
-
-
 async def _run_capability_call(
     call: Coroutine[object, object, _T], what: str
 ) -> tuple[_T | None, BaseException | None]:
     """Run one capability call as its own task, and return its result or its failure.
 
-    The receive loop's catch-all ends the connection, so no capability exception
-    may reach it. `asyncio.wait` returns when the task ends instead of
-    re-raising, and the outcome is read from `task.cancelled()` and then
-    `task.exception()`, so any exception is contained without a broad `except`
-    clause (CLAUDE.md, Errors). The task only computes; the endpoint sends what
-    it returns, so a send to a client that has gone still takes the disconnect
-    path.
+    No capability exception may reach the session or the loop's exception
+    handler. `asyncio.wait` returns when the task ends instead of re-raising,
+    and the outcome is read from `task.cancelled()` and then `task.exception()`,
+    so any exception is contained without a broad `except` clause (CLAUDE.md,
+    Errors). The task only computes; the caller queues what it returns on the
+    session's lanes.
 
-    If the endpoint is cancelled while it waits, the `finally` cancels the task,
-    so no capability call outlives its connection.
+    If the caller is cancelled while it waits (its session disconnected), the
+    `finally` cancels the task, so no capability call outlives its connection.
 
     Returns:
         `(result, None)` when the call returned; `(None, exception)` when it
@@ -2322,22 +2369,20 @@ def _validate_capability_message(model: type[_M], data: dict[str, object]) -> _M
         return f"invalid {data.get('type')}: {problems}"[:CAPABILITY_REASON_MAX_CHARS]
 
 
-async def _send_capability_snapshot(websocket: WebSocket) -> None:
-    """Send the host's connect snapshot on this socket, or nothing when there is no host.
+async def _capability_snapshot() -> list[dict[str, object]]:
+    """The host's connect snapshot for one connecting client, or nothing with no host.
 
-    The payloads go to the connecting client only, as `session_started` does.
-    A failure building them is answered with a `server` error and the
-    connection goes on.
+    The payloads go to the connecting client only, after `session_started`. A
+    failure building them is answered with a `server` error and the connection
+    goes on.
     """
     host = _capability_host()
     if host is None:
-        return
+        return []
     events, error = await _run_capability_call(host.snapshot_events(), "connect snapshot")
     if error is not None:
-        await websocket.send_json(_ws_error("server", _capability_failure_text(host, error)))
-        return
-    for payload in events or ():
-        await websocket.send_json(payload)
+        return [_ws_error("server", _capability_failure_text(host, error))]
+    return list(events or ())
 
 
 async def _decided_payloads(
@@ -2383,29 +2428,61 @@ def _failed_alarm_result(
     return alarm_action_result_payload(alarm_id, action, request_id, outcome, datetime.now(UTC))
 
 
-async def _handle_capability_message(
-    websocket: WebSocket, data: dict[str, object], session_id: str
-) -> None:
-    """Answer `action_decision`, `alarm_action` or `alarm_report` from this connection.
+def _on_capability_message(session_id: str, message: CapabilityMessage) -> None:
+    """`SessionServices.on_capability_message`: answer it on its own task, off the receive loop.
 
-    Each capability call runs through `_run_capability_call`, and every send
-    happens here, in the receive loop's `try`, so a client that has gone takes
-    the disconnect path. `action_decision`'s payloads are broadcast (every
+    The session hands the message over synchronously, so the capability call runs as a task the
+    server tracks per session; the session's disconnect cancels what is still running.
+    """
+    registry = session_registry
+    if registry is None:
+        return
+
+    def send(payload: dict[str, object]) -> None:
+        registry.send_to(session_id, payload)
+
+    task = asyncio.get_running_loop().create_task(
+        _handle_capability_message(message.model_dump(mode="json"), session_id, send),
+        name=f"capability-message-{message.type}",
+    )
+    tasks = _capability_tasks.setdefault(session_id, set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _cancel_capability_tasks(session_id: str) -> None:
+    """Cancel the session's capability calls still in flight, and wait for the cancels."""
+    tasks = _capability_tasks.pop(session_id, set())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _handle_capability_message(
+    data: dict[str, object], session_id: str, send: "Callable[[dict[str, object]], None]"
+) -> None:
+    """Answer `action_decision`, `alarm_action` or `alarm_report` from one session.
+
+    The session already validated the message against the wire contract; it is
+    validated again with capabilities' own model, as main's server did, because
+    that model is what the host takes. Each capability call runs through
+    `_run_capability_call`. `action_decision`'s payloads are broadcast (every
     capability payload is, until turns are routed per connection); an alarm
-    action or report gets exactly one `alarm_action_result`, on this socket.
+    action or report gets exactly one `alarm_action_result`, on the session's
+    `control` lane through `send`.
     """
     host = _capability_host()
     if host is None:
-        await websocket.send_json(_ws_error("validation", "capabilities disabled"))
+        send(_ws_error("validation", "capabilities disabled"))
         return
     msg_type = data.get("type")
     if msg_type == "action_decision":
-        await _handle_action_decision(websocket, host, data, session_id)
+        await _handle_action_decision(host, data, session_id, send)
         return
     if msg_type == "alarm_action":
         action = _validate_capability_message(AlarmActionMessage, data)
         if isinstance(action, str):
-            await websocket.send_json(_ws_error("validation", action))
+            send(_ws_error("validation", action))
             return
         result, error = await _run_capability_call(
             _alarm_action_result(host, action), "alarm_action"
@@ -2417,7 +2494,7 @@ async def _handle_capability_message(
     else:
         report = _validate_capability_message(AlarmReportMessage, data)
         if isinstance(report, str):
-            await websocket.send_json(_ws_error("validation", report))
+            send(_ws_error("validation", report))
             return
         result, error = await _run_capability_call(
             _alarm_report_result(host, report), "alarm_report"
@@ -2425,11 +2502,14 @@ async def _handle_capability_message(
         if error is not None:
             result = _failed_alarm_result(host, report.alarm_id, "report", report.request_id, error)
     if result is not None:
-        await websocket.send_json(result)
+        send(result)
 
 
 async def _handle_action_decision(
-    websocket: WebSocket, host: "CapabilityHost", data: dict[str, object], session_id: str
+    host: "CapabilityHost",
+    data: dict[str, object],
+    session_id: str,
+    send: "Callable[[dict[str, object]], None]",
 ) -> None:
     """Resolve a proposal for this connection's own session, and broadcast what it produced.
 
@@ -2439,19 +2519,17 @@ async def _handle_action_decision(
     """
     decision = _validate_capability_message(ActionDecisionMessage, data)
     if isinstance(decision, str):
-        await websocket.send_json(_ws_error("validation", decision))
+        send(_ws_error("validation", decision))
         return
     handler = _health_conversation_handler()
     if handler is None:
-        await websocket.send_json(
-            _ws_error("server", "no conversation handler, so no proposal can be decided")
-        )
+        send(_ws_error("server", "no conversation handler, so no proposal can be decided"))
         return
     payloads, error = await _run_capability_call(
         _decided_payloads(handler, session_id, decision), "action_decision"
     )
     if error is not None:
-        await websocket.send_json(_ws_error("server", _capability_failure_text(host, error)))
+        send(_ws_error("server", _capability_failure_text(host, error)))
         return
     for payload in payloads or ():
         await message_queue.put(payload)
@@ -2459,41 +2537,32 @@ async def _handle_action_decision(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for voice + text conversation.
+    """Serve one `RealtimeSession` per connection, through the session registry.
 
-    The authoritative message contract is ADR-017 (WebSocket Message
-    Contract, knowledge-vault/Decisions/) -- this docstring only enumerates
-    the surface; field-level schemas live in the ADR.
+    The authoritative message contract is the realtime protocol, 2.0.0
+    (`backend/realtime/protocol.py`): main's 1.4.0 control messages plus
+    protocol 2's own. `session_started` carries `protocol_version` and
+    `capabilities.voice`; the session then owns the socket. Its receive loop
+    sends binary frames to uplink handling and text to control handling and
+    never awaits a turn, and its sender drains the `control`, `turn` and `bulk`
+    lanes, so an `interrupt` is handled while a turn is still generating.
 
-    Inbound (client -> server):
-        audio, text, interrupt, reset_vad, log_config, subscribe_logs,
-        action_decision, alarm_action, alarm_report (1.4.0)
+    Every connection is bound `desktop` (D7). With a capability host, the
+    connect snapshot (`capabilities_status`, then `alarm_state` when the alarm
+    state can be read) follows `session_started` to this client only.
+    `action_decision`, `alarm_action` and `alarm_report` reach the host through
+    `_on_capability_message`; with no host they get a `validation` error,
+    "capabilities disabled". An alarm action or report is answered with one
+    `alarm_action_result` to this session only. Process-wide messages arrive
+    through the registry: `broadcast_messages` (`action_proposed`,
+    `action_resolved`) and `CapabilitySink` (`alarm_fired` to `desktop`
+    sessions only).
 
-    Outbound (server -> client):
-        session_started, heartbeat, health_status, system_status,
-        vad_status, transcription, state_cycle,
-        stream_start / stream_token / stream_complete / stream_cancelled,
-        tool_call_started / tool_call_completed, cards_summon /
-        cards_dismiss, graph_subgraph, vault_results, form_switch,
-        discriminated error, status, log_config_ack, log,
-        capabilities_status, alarm_state, action_proposed, action_resolved,
-        alarm_fired, alarm_action_result (1.4.0),
-        plus binary audio frames (MIST protocol: MSG_AUDIO_CHUNK /
-        MSG_AUDIO_COMPLETE).
-
-    With a capability host, the connect snapshot (`capabilities_status`, then
-    `alarm_state` when the alarm state can be read) follows `session_started`
-    on this socket only, as does the one `alarm_action_result` answering each
-    valid `alarm_action` or `alarm_report`, and any `error` answering a
-    capability message. `action_proposed`, `action_resolved`, `alarm_fired`,
-    and later `capabilities_status` and `alarm_state` changes are broadcast.
-    With no host, the snapshot is not sent and the three inbound capability
-    messages get a `validation` error, "capabilities disabled".
-    Each capability call runs through `_run_capability_call`, so a capability's
-    exception is answered on this socket and never ends the connection.
-
-    A browser origin outside `allowed_origins()` is closed with 1008 before
-    `accept`, because browsers apply no CORS to WebSockets (`backend/origins.py`).
+    On disconnect the session commits its turn before `run` returns; only then
+    is the handler told the session ended, so the session note sees the last
+    turn. A browser origin outside `allowed_origins()` is closed with 1008
+    before `accept`, because browsers apply no CORS to WebSockets
+    (`backend/origins.py`).
     """
     origin = websocket.headers.get("origin")
     if not origin_allowed(origin, allowed_origins()):
@@ -2502,13 +2571,9 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     await websocket.accept(headers=None)
-    async with active_connections_lock:
-        active_connections.add(websocket)
-
-    logger.info(f"Client connected (total: {len(active_connections)})")
-
-    # Ensure voice processor is initialized
-    if voice_processor is None:
+    registry = session_registry
+    built = runtime
+    if registry is None or built is None:
         await websocket.send_json(
             {
                 "type": "error",
@@ -2519,284 +2584,58 @@ async def websocket_endpoint(websocket: WebSocket):
             }
         )
         await websocket.close(code=1013)
-        async with active_connections_lock:
-            active_connections.discard(websocket)
         return
 
-    # Send session_started handshake per ADR-017. The session_id is a fresh
-    # UUID per WebSocket connection and is threaded into every turn this
-    # connection dispatches (see the audio / text branches below), so the
-    # EventStore session, the mist-context cache key, and vault session-note
-    # frontmatter all key off this value rather than a shared placeholder.
+    # A fresh id per connection, threaded into every turn the session opens, so
+    # the event store session, the context cache key and the session note all
+    # key off it rather than a shared placeholder.
     session_id = str(uuid.uuid4())
-    await websocket.send_json(
-        {
-            "type": "session_started",
-            "session_id": session_id,
-            "protocol_version": PROTOCOL_VERSION,
-            "mist_state": "idle",
-            "capabilities": {
-                "tts_enabled": bool(config.tts_enabled),
-                "vad_enabled": True,
-            },
-        }
+    session = registry.create_session(
+        session_id=session_id,
+        websocket=websocket,  # type: ignore[arg-type]
+        endpoint=WS_ENDPOINT,
     )
-
+    logger.info("Client connected (total: %d)", registry.count())
     try:
-        # First inside the `try`, so a client that has gone before the snapshot
-        # reaches it takes the disconnect path and its cleanup below.
-        await _send_capability_snapshot(websocket)
-        while True:
-            # Receive message from client
-            data = await websocket.receive_json()
-
-            msg_type = data.get("type")
-            if msg_type is None:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "kind": "validation",
-                        "message": "Missing 'type' field",
-                        "retriable": False,
-                        "context": None,
-                    }
-                )
-                continue
-
-            # Handle different message types
-            yielded_refusal = None
-            if msg_type in ("audio", "text"):
-                # Gaming mode: refuse the turn before it is processed or
-                # recorded. Every other message type is handled as usual.
-                # With a capability host, a `text` message is first offered to
-                # the capability-only turn below, and refused only when nothing
-                # answers it, so alarms and timers stay usable while yielded.
-                yielded_refusal = _yielded_turn_refusal()
-                if yielded_refusal is not None and (
-                    msg_type == "audio" or _capability_host() is None
-                ):
-                    await websocket.send_json(yielded_refusal)
-                    continue
-
-            if msg_type == "audio":
-                # Complete audio from client (no VAD, just transcribe and process)
-                audio_payload = data.get("audio")
-                if audio_payload is None:
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "kind": "validation",
-                            "message": "Missing 'audio' field",
-                            "retriable": False,
-                            "context": None,
-                        }
-                    )
-                    continue
-                audio_data = np.asarray(audio_payload, dtype=np.float32)
-                sample_rate = data.get("sample_rate", 16000)
-
-                logger.info(f"Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
-
-                # Process complete audio directly (transcribe -> LLM -> TTS).
-                # functools.partial because run_in_executor forwards positional
-                # args only, and the session id must arrive by keyword to stay
-                # readable at the boundary. The executor thread does not inherit
-                # this coroutine's context, so the callee publishes the session
-                # id into `current_session_id` itself.
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        voice_processor.process_complete_audio,
-                        audio_data,
-                        sample_rate,
-                        session_id=session_id,
-                    ),
-                )
-
-            elif msg_type == "text":
-                # Text message (manual input)
-                user_text = data.get("text", "")
-                if not user_text:
-                    if yielded_refusal is not None:
-                        await websocket.send_json(yielded_refusal)
-                    continue
-                logger.info(f"Text message from client: '{user_text}'")
-
-                # No transcription broadcast here -- frontend already added
-                # the user message optimistically in sendTextMessage().
-                # Voice path sends its own transcription from _process_user_speech().
-
-                loop = asyncio.get_running_loop()
-                if yielded_refusal is not None:
-                    # Gaming mode with a host: only the capability host's
-                    # model-free step may answer; the provider is never called.
-                    answered = await loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            voice_processor._process_conversation_turn,
-                            user_text,
-                            session_id=session_id,
-                            capability_only=True,
-                        ),
-                    )
-                    if not answered:
-                        await websocket.send_json(yielded_refusal)
-                    continue
-
-                # Process (will spawn thread internally)
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        voice_processor._process_conversation_turn,
-                        user_text,
-                        session_id=session_id,
-                    ),
-                )
-
-            elif msg_type == "interrupt":
-                # Manual interrupt request
-                logger.info("Manual interrupt requested")
-                voice_processor.interrupt_flag.set()
-
-                await websocket.send_json({"type": "status", "message": "Interrupt acknowledged"})
-
-            elif msg_type == "reset_vad":
-                # Reset VAD state
-                voice_processor.reset_vad()
-                await websocket.send_json({"type": "status", "message": "VAD reset"})
-
-            elif msg_type == "log_config":
-                # Runtime log level control
-                action = data.get("action")
-                if action != "set_level":
-                    await websocket.send_json(
-                        {
-                            "type": "log_config_error",
-                            "message": (f"Invalid action: '{action}'. " "Must be 'set_level'."),
-                        }
-                    )
-                    continue
-
-                level = data.get("level", "")
-                if level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
-                    await websocket.send_json(
-                        {
-                            "type": "log_config_error",
-                            "message": (
-                                f"Invalid level: '{level}'. "
-                                "Must be one of DEBUG, INFO, WARNING, ERROR."
-                            ),
-                        }
-                    )
-                    continue
-
-                target_logger = data.get("logger")
-                if not target_logger:
-                    await websocket.send_json(
-                        {
-                            "type": "log_config_error",
-                            "message": "Missing 'logger' field.",
-                        }
-                    )
-                    continue
-
-                if log_handler is not None:
-                    log_handler.set_logger_level(target_logger, level)
-
-                await websocket.send_json(
-                    {
-                        "type": "log_config_ack",
-                        "logger": target_logger,
-                        "level": level,
-                    }
-                )
-
-            elif msg_type == "subscribe_logs":
-                # ADR-017 subscribe_logs: opt-in WebSocket log streaming.
-                # Streaming is off by default; FE toggles per session.
-                enabled = bool(data.get("enabled", False))
-                levels = data.get("levels")
-                if levels is not None and not isinstance(levels, list):
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "kind": "validation",
-                            "message": "subscribe_logs 'levels' must be a list of strings or null",
-                            "retriable": False,
-                            "context": None,
-                        }
-                    )
-                    continue
-                # ADR-017: subscription state is per-connection ephemeral.
-                # Track subscribers so a disconnect cannot leave the global
-                # handler gate stuck on (every later client would receive the
-                # full log stream without opting in).
-                if enabled:
-                    log_subscribers.add(websocket)
-                else:
-                    log_subscribers.discard(websocket)
-                if log_handler is not None:
-                    if log_subscribers:
-                        log_handler.set_streaming(True, levels)
-                    else:
-                        log_handler.set_streaming(False, None)
-                await websocket.send_json(
-                    {
-                        "type": "status",
-                        "message": f"Log streaming: {'enabled' if enabled else 'disabled'}",
-                    }
-                )
-
-            elif msg_type in CAPABILITY_MESSAGE_TYPES:
-                await _handle_capability_message(websocket, data, session_id)
-
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
-
-    except WebSocketDisconnect:
-        logger.info(f"Client disconnected (remaining: {len(active_connections) - 1})")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-    finally:
-        async with active_connections_lock:
-            active_connections.discard(websocket)
-        # Ordering matters: this must run AFTER the discard (so the emptiness
-        # check sees this connection gone) and BEFORE `end_session` below (so a
-        # parked utterance cannot be drained into a turn while the session it
-        # belongs to is being closed).
-        _reset_voice_state_if_last_connection()
-        # ADR-017: log subscription is per-connection ephemeral -- drop this
-        # connection's subscription and close the global gate when no
-        # subscriber remains.
-        log_subscribers.discard(websocket)
-        if not log_subscribers and log_handler is not None:
-            log_handler.set_streaming(False, None)
-        # Gap #1a / ADR-011 bucket 2: flip status of any active sessions
-        # this connection touched. Fire-and-forget; failures swallowed
-        # internally per Invariant 6.
-        #
-        # Scoped to THIS connection's session. `end_session(session_id=None)`
-        # ends every session the handler tracks, which was harmless while all
-        # connections shared the single "default" session -- but the P6 fix gave
-        # each connection its own id, which turned that no-op into a live bug: a
-        # disconnect on one connection would end the sessions of every other
-        # connection still open, writing their vault notes early and evicting
-        # their paths.
-        #
-        # The parameter was already implemented and documented ("Specific
-        # session to end. When None, ends every tracked session_id"); only the
-        # call site omitted it. Passing the minted id is the whole fix.
-        try:
-            handler = (
-                voice_processor.models.knowledge.conversation_handler
-                if voice_processor and voice_processor.models and voice_processor.models.knowledge
-                else None
+        session.send_control(
+            SessionStartedMessage(
+                session_id=session_id,
+                protocol_version=PROTOCOL_VERSION,
+                mist_state="idle",
+                capabilities=SessionCapabilities(
+                    tts_enabled=bool(config.tts_enabled),
+                    vad_enabled=True,
+                    voice=built.voice_capabilities(),
+                ),
             )
-            if handler is not None and hasattr(handler, "end_session"):
-                await handler.end_session(session_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Session-end signal handler failed (non-fatal): %s", exc, exc_info=False)
+        )
+        for payload in await _capability_snapshot():
+            session.send_control(payload)
+        await session.run()
+    finally:
+        # A no-op once `run` has torn the session down; it covers a cancel
+        # before `run` started.
+        registry.unregister(session)
+        await _cancel_capability_tasks(session_id)
+        logger.info("Client disconnected (remaining: %d)", registry.count())
+        await _end_handler_session(session_id)
+
+
+async def _end_handler_session(session_id: str) -> None:
+    """Tell the handler this connection's session ended (Gap #1a, ADR-011 bucket 2).
+
+    Scoped to THIS connection's session: `end_session(session_id=None)` ends
+    every session the handler tracks, which would write the vault notes of
+    every other open connection early and evict their paths. Failures are
+    logged and swallowed, per Invariant 6.
+    """
+    handler = _health_conversation_handler()
+    if handler is None or not hasattr(handler, "end_session"):
+        return
+    try:
+        await handler.end_session(session_id)
+    except (MistError, sqlite3.Error, OSError) as exc:
+        logger.warning("Session-end signal handler failed (non-fatal): %s", exc, exc_info=False)
 
 
 if __name__ == "__main__":
@@ -2806,8 +2645,8 @@ if __name__ == "__main__":
     # `__main__`. Uvicorn resolves a string target with
     # `importlib.import_module("server")`, which finds this same file again on
     # sys.path and executes the ENTIRE module body a second time as a second
-    # module object. `app`, `active_connections`, `active_connections_lock`,
-    # `message_queue`, `voice_processor` and `log_handler` all existed twice,
+    # module object. `app`, `message_queue`, the runtime, the session registry
+    # and `log_handler` all existed twice,
     # the root logger collected two FileHandlers on the same log file (every
     # line was written twice), and the copy uvicorn actually served was the
     # `server` one -- so state written by the `__main__` copy was invisible to

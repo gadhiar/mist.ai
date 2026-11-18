@@ -98,6 +98,11 @@ from backend.user_timezone import USER_TIMEZONE_ENV, resolve_user_timezone
 
 if TYPE_CHECKING:
     from backend.chat.context_budget import TokenCounter
+    from backend.realtime.budget import VoiceSettings
+    from backend.realtime.power import PowerGate
+    from backend.realtime.protocol import PowerLevel
+    from backend.realtime.runtime import EngineLoaders, GpuMeter, MistRuntime
+    from backend.realtime.session import CapabilityMessage, InferenceLanes, SpeechEngines
 
 logger = logging.getLogger(__name__)
 
@@ -784,6 +789,7 @@ def build_conversation_handler(
     with_extraction_dispatcher: bool = False,
     *,
     conversation_llm_provider: StreamingLLMProvider | None = None,
+    register_prompt: str | None = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -823,14 +829,15 @@ def build_conversation_handler(
     role's, so a smaller conversation model on its own server never moves
     extraction. With the role unset the handler gets the base object itself,
     so both hold one provider, as before roles existed. Curation takes the
-    base from `voice_processor._llm_provider`, not from the handler
+    base from `MistRuntime.llm_provider`, not from the handler
     (`backend/server.py::_resolve_curation_dependencies`).
 
     Args:
         config: Knowledge subsystem configuration.
         llm_provider: Optional pre-built base LLM provider, for the
             extraction pipeline and, with no conversation role set, the
-            handler. The live server injects one built by `VoiceProcessor`.
+            handler. The live server injects the one `lifespan` builds, through
+            `build_mist_runtime`.
         vault_writer: Optional pre-built VaultWriter. When None, one is
             constructed from config. Pass an explicit None-equivalent by
             disabling config.vault.enabled.
@@ -856,14 +863,16 @@ def build_conversation_handler(
             spawning in-process extraction. The dispatcher is NOT started; the
             caller owns `start()`/`stop()`. Default False keeps every existing
             caller (admin scripts, benches) on the in-process path. The server
-            does not use this flag: its handler is built inside the
-            VoiceProcessor chain, so `backend/server.py` attaches one after the
+            does not use this flag: its handler is built inside
+            `build_mist_runtime`, so `backend/server.py` attaches one after the
             fact via `ConversationHandler.attach_extraction_dispatcher`.
         conversation_llm_provider: Optional pre-built provider for the
             handler alone. When None, the handler gets
             `build_llm_provider(config, role="conversation")` if the
             conversation role is set in `config.llm.roles`, else the base
             provider. The extraction pipeline never receives it.
+        register_prompt: The persona's register sentence for the prompt's stable prefix
+            (`PersonaRegister.prompt_line()`); None leaves the prompt without one.
     """
     from pathlib import Path
 
@@ -953,7 +962,7 @@ def build_conversation_handler(
     # Cluster 8 Phase 5: vault_writer is caller-provided (or None). Auto-build
     # removed to avoid two writers racing on the same vault root -- the
     # server lifespan owns the single VaultWriter and plumbs it through
-    # VoiceProcessor -> ModelManager -> KnowledgeIntegration -> here. Unit
+    # `build_mist_runtime` -> here. Unit
     # tests that want wiring coverage pass an explicit writer or None.
     handler = ConversationHandler(
         config=config,
@@ -975,6 +984,7 @@ def build_conversation_handler(
         # harness / CLI probes set it to "test" so their sessions are
         # excludable from an R1.6 rebuild.
         session_origin=config.event_store.session_origin,
+        register_prompt=register_prompt,
     )
     if with_extraction_dispatcher and handler.event_store is not None:
         handler.attach_extraction_dispatcher(
@@ -1762,4 +1772,230 @@ def build_capability_host(
         capabilities=tuple(capabilities),
         _db=db,
         _http=http,
+    )
+
+
+def build_speech_engines(
+    settings: "VoiceSettings",
+    *,
+    loaders: "EngineLoaders | None" = None,
+    power_level: "PowerLevel" = "full",
+    gpu_meter: "GpuMeter | None" = None,
+) -> "SpeechEngines":
+    """Load each speech slot from its placement chain, one engine at a time.
+
+    `loaders` defaults to the real adapters, each importing its library only when its option is
+    tried; `gpu_meter` defaults to torch's allocator figures, imported on the first CUDA load.
+
+    Args:
+        settings: The voice settings; the placement chains and the voice identity are read here.
+        loaders: How each engine loads; tests pass fakes.
+        power_level: The level at boot; at `off` the GPU is yielded and CUDA options are skipped.
+        gpu_meter: Measures each CUDA load's VRAM.
+    """
+    import importlib
+
+    from backend.realtime.runtime import TorchGpuMeter, load_speech_engines
+
+    return load_speech_engines(
+        settings,
+        loaders if loaders is not None else _real_engine_loaders(),
+        power_level=power_level,
+        gpu_meter=(
+            gpu_meter
+            if gpu_meter is not None
+            else TorchGpuMeter(lambda: importlib.import_module("torch"))
+        ),
+    )
+
+
+def _real_engine_loaders() -> "EngineLoaders":
+    """The T6, T7 and T8 adapters, each loaded through its classmethod `load`."""
+    from backend.realtime.engines.kws import OnnxNameSpotter
+    from backend.realtime.engines.nemotron_stt import NemotronStreamingTranscriber, import_nemo
+    from backend.realtime.engines.parakeet_stt import ParakeetTranscriber, import_onnx_asr
+    from backend.realtime.engines.pocket_tts import PocketCloneSynthesizer, import_pocket
+    from backend.realtime.engines.silero_vad import (
+        SileroVad,
+        onnxruntime_providers,
+        open_onnx_session,
+    )
+    from backend.realtime.engines.smart_turn import SmartTurnDetector, whisper_features
+    from backend.realtime.runtime import EngineLoaders
+
+    return EngineLoaders(
+        chains={
+            "pocket-clone": lambda s, device: PocketCloneSynthesizer.load(
+                s.placement, s.profile, library_loader=import_pocket, device=device
+            ),
+            "nemotron-160": lambda s, device: NemotronStreamingTranscriber.load(
+                s.placement, library_loader=import_nemo, device=device
+            ),
+            "parakeet-cpu": lambda s, device: ParakeetTranscriber.load(
+                s.placement, library_loader=import_onnx_asr, device=device
+            ),
+        },
+        vad=lambda placement: SileroVad.load(
+            placement, session_factory=open_onnx_session, available_providers=onnxruntime_providers
+        ),
+        eot=lambda placement, endpointing: SmartTurnDetector.load(
+            placement,
+            endpointing,
+            session_factory=open_onnx_session,
+            available_providers=onnxruntime_providers,
+            feature_extractor_factory=whisper_features,
+        ),
+        kws=lambda placement: OnnxNameSpotter.load(placement, session_factory=open_onnx_session),
+    )
+
+
+def build_mist_runtime(
+    config: KnowledgeConfig,
+    *,
+    voice_settings: "VoiceSettings",
+    llm_provider: StreamingLLMProvider | None = None,
+    handler_factory: Callable[..., object] | None = None,
+    engine_loaders: "EngineLoaders | None" = None,
+    gpu_meter: "GpuMeter | None" = None,
+    lanes: "InferenceLanes | None" = None,
+    power_level: "Callable[[], PowerLevel] | None" = None,
+    tts_enabled: bool = True,
+    vault_writer: "VaultWriter | None" = None,
+    vault_sidecar: SidecarIndexProtocol | None = None,
+    invalidation_bus: "InvalidationBus | None" = None,
+    power_gate: "PowerGate | None" = None,
+    alarm_ringing: Callable[[], bool] | None = None,
+    on_capability_message: "Callable[[str, CapabilityMessage], None] | None" = None,
+    register_prompt: str | None = None,
+    torch_loader: Callable[[], object] | None = None,
+) -> "MistRuntime":
+    """Compose what every realtime session shares: responder, speech engines, lanes, settings.
+
+    The handler is built by `handler_factory` (`build_conversation_handler`). Only a `MistError`
+    from that build (Neo4j unreachable raises `Neo4jConnectionError`) degrades to
+    `DirectResponder`; any other exception is a bug and fails startup with its traceback. The LLM
+    is warmed unless the GPU is yielded at boot, and the embedding model always.
+
+    `llm_provider` is the base provider: the handler build gives it to the extraction pipeline
+    and, by T39's rule, the conversation role's provider to the handler. `MistRuntime.llm_provider`
+    is that base, which curation and `/health` read. The runtime's `gpu` is the GPU control
+    gaming mode's `GpuYield` reaches through `release_gpu_engines` and `reload_gpu_engines`; the
+    caller attaches it to the loop and the registry.
+
+    Args:
+        config: The knowledge configuration; `llm.voice_first_segment_min_chars` sets the
+            segmenter's first cut, so the handler's first emission and the first TTS segment
+            cut at the same point.
+        voice_settings: From `load_voice_settings`.
+        llm_provider: The interactive provider; built from `config` when None.
+        handler_factory: Builds the handler; `build_conversation_handler` when None.
+        engine_loaders: How each speech engine loads; the real adapters when None.
+        gpu_meter: Measures each CUDA engine's VRAM; torch's figures when None.
+        lanes: The inference lanes; one `InferenceLane` per engine kind when None.
+        power_level: The process's power level; `full` until T22 wires its state.
+        tts_enabled: Whether voice turns may be spoken.
+        vault_writer: Passed to the handler build.
+        vault_sidecar: Passed to the handler build.
+        invalidation_bus: Passed to the handler build.
+        power_gate: The gate every session applies to turns and voice (T22); its level is the
+            process's when `power_level` is None.
+        alarm_ringing: Whether an alarm rings now (D8), for every controller.
+        on_capability_message: Where each session hands `action_decision`, `alarm_action` and
+            `alarm_report`.
+        register_prompt: The persona's register sentence, passed to the handler build.
+        torch_loader: Imports torch for the GPU control's cache release; torch itself when None.
+    """
+    import importlib
+
+    from backend.errors import MistError
+    from backend.llm.models import LLMRequest
+    from backend.realtime.degraded import DirectResponder
+    from backend.realtime.lanes import InferenceLane
+    from backend.realtime.runtime import GpuEngines, MistRuntime, TorchGpuMeter, primary_placement
+    from backend.realtime.session import InferenceLanes, SessionServices
+
+    provider = llm_provider if llm_provider is not None else build_llm_provider(config)
+    level: Callable[[], PowerLevel] = power_level or (
+        power_gate.level if power_gate is not None else (lambda: "full")
+    )
+    settings = replace(
+        voice_settings,
+        segmenter=replace(
+            voice_settings.segmenter,
+            first_segment_min_chars=config.llm.voice_first_segment_min_chars,
+        ),
+    )
+
+    handler: object | None = None
+    if not config.enable_knowledge_integration:
+        logger.warning(
+            "Knowledge integration is disabled: turns are answered without memory and are "
+            "not recorded"
+        )
+    else:
+        build_handler = handler_factory or build_conversation_handler
+        try:
+            handler = build_handler(
+                config=config,
+                llm_provider=provider,
+                vault_writer=vault_writer,
+                vault_sidecar=vault_sidecar,
+                invalidation_bus=invalidation_bus,
+                register_prompt=register_prompt,
+            )
+        except MistError as error:
+            logger.warning("Knowledge integration unavailable, answering without memory: %s", error)
+    responder = handler if handler is not None else DirectResponder(provider)
+
+    load_torch = torch_loader or (lambda: importlib.import_module("torch"))
+    meter = gpu_meter if gpu_meter is not None else TorchGpuMeter(load_torch)
+    loaders = engine_loaders if engine_loaders is not None else _real_engine_loaders()
+    engines = build_speech_engines(settings, loaders=loaders, power_level=level(), gpu_meter=meter)
+    gpu = GpuEngines(engines, settings, loaders, torch_loader=load_torch, gpu_meter=meter)
+    if lanes is None:
+        lanes = InferenceLanes(
+            vad=InferenceLane("vad"),
+            eot=InferenceLane("eot"),
+            stt=InferenceLane("stt"),
+            tts=InferenceLane("tts"),
+            kws=InferenceLane("kws"),
+        )
+
+    if level() == "off":
+        logger.info("GPU yielded at boot: skipping the LLM warmup")
+    else:
+        provider.invoke_sync(LLMRequest(messages=[{"role": "user", "content": "hi"}], max_tokens=1))
+    graph_store = getattr(handler, "graph_store", None)
+    embedder = getattr(graph_store, "embedding_generator", None)
+    warmup = getattr(embedder, "warmup", None)
+    if warmup is not None:
+        logger.info("Warming up embedding model...")
+        warmup()
+
+    extra: dict[str, object] = {}
+    if alarm_ringing is not None:
+        extra["alarm_ringing"] = alarm_ringing
+    if on_capability_message is not None:
+        extra["on_capability_message"] = on_capability_message
+    services = SessionServices(
+        responder=responder,  # type: ignore[arg-type]
+        engines=engines,
+        lanes=lanes,
+        settings=settings,
+        placement=lambda: primary_placement(engines, settings),
+        power_level=level,
+        tts_enabled=tts_enabled,
+        power_gate=power_gate,
+        **extra,  # type: ignore[arg-type]
+    )
+    return MistRuntime(
+        gpu=gpu,
+        llm_provider=provider,
+        conversation_handler=handler,
+        responder=responder,  # type: ignore[arg-type]
+        engines=engines,
+        lanes=lanes,
+        settings=settings,
+        services=services,
+        agent_available=handler is not None,
     )

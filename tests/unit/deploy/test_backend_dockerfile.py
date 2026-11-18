@@ -12,6 +12,11 @@ Ubuntu's apt python3.11, which is the release candidate 3.11.0rc1. The archive i
 it is unpacked, the build checks the interpreter it unpacked, and `/opt/python/bin` goes first on
 PATH before the venv is created, so that the venv's `home` is the pinned interpreter.
 
+The speech engine packages live in `requirements-voice.txt`, apart from `requirements.txt`,
+because NeMo installs a top-level `scripts` package that would shadow the repository's own: only
+the image's step `# 3b.` installs them, removes that package and checks with `python -I` that no
+`scripts` is importable, and CI, which installs `requirements.txt` alone, never sees them.
+
 Each test fails on the edit its name describes, for example a `chown -R` reintroduced after the
 code copies or a runtime directory dropped from the final `RUN`.
 """
@@ -24,11 +29,33 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DOCKERFILE_PATH = REPO_ROOT / "docker" / "backend" / "Dockerfile"
+REQUIREMENTS = REPO_ROOT / "requirements.txt"
+VOICE_REQUIREMENTS = REPO_ROOT / "requirements-voice.txt"
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
 APP_USER = "appuser"
 OWNER = "appuser:appgroup"
 VENV = "/opt/venv"
-CODE_SOURCES = ("requirements.txt", "backend/", "src/", "dependencies/", "scripts/")
+CODE_SOURCES = (
+    "requirements.txt",
+    "requirements-voice.txt",
+    "backend/",
+    "src/",
+    "dependencies/",
+    "scripts/",
+)
+# The numbered dependency steps, each commented once in this order; `3b` slots in without
+# renumbering the rest.
+STEP_NUMBERS = ("1", "2", "3", "3b", "4", "5", "6", "7")
+STEP_COMMENT = re.compile(r"#\s*(\d+[a-z]?)\.\s")
+VOICE_INSTALL = "pip install -r /app/requirements-voice.txt"
+REQUIREMENTS_INSTALL = "pip install -r /app/requirements.txt"
+SITE_SCRIPTS = "/opt/venv/lib/python3.11/site-packages/scripts"
+SCRIPTS_CHECK = (
+    "import importlib.util, sys; sys.exit(importlib.util.find_spec('scripts') is not None)"
+)
+PIN_LINE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?==[^\s=;#]+")
+REQUIREMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # Every mount point and unmounted path the backend writes, so each stays writable by appuser:
 # /app/dev-state is a named volume Docker initialises from the image directory's ownership.
 RUNTIME_DIRECTORIES = (
@@ -357,3 +384,94 @@ class TestFinalImage:
         (cmd_index,) = (i for i, (keyword, _a) in enumerate(instructions) if keyword == "CMD")
 
         assert instructions[cmd_index + 1 :] == RELEASE_LINES
+
+
+def _requirement_names(path: Path) -> list[str]:
+    """The normalised package name of each requirement line, comments and blanks skipped."""
+    names = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        match = REQUIREMENT_NAME.match(line)
+        assert match, line
+        names.append(re.sub(r"[-_.]+", "-", match.group(0)).lower())
+    return names
+
+
+def _step_comments() -> list[str]:
+    """The number of each numbered step comment, in file order."""
+    lines = DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines()
+    return [match.group(1) for line in lines if (match := STEP_COMMENT.match(line.strip()))]
+
+
+def _run_index(predicate) -> int:
+    (index,) = (
+        i
+        for i, (keyword, arguments) in enumerate(_instructions())
+        if keyword == "RUN" and predicate(arguments)
+    )
+    return index
+
+
+def _voice_run_index() -> int:
+    return _run_index(lambda arguments: VOICE_INSTALL in arguments)
+
+
+class TestVoiceRequirements:
+    def test_steps_keep_their_numbers_with_3b_between_3_and_4(self):
+        assert _step_comments() == list(STEP_NUMBERS)
+
+    def test_voice_install_follows_step_3_and_precedes_the_torch_repin(self):
+        requirements = _run_index(lambda arguments: arguments == REQUIREMENTS_INSTALL)
+        repin = _run_index(lambda arguments: "torch.__version__" in arguments)
+
+        assert requirements < _voice_run_index() < repin
+
+    def test_voice_install_removes_site_scripts_then_checks_isolated(self):
+        commands = _commands(_instructions()[_voice_run_index()][1])
+
+        install = _first_index(commands, lambda tokens: " ".join(tokens) == VOICE_INSTALL)
+        remove = _first_index(commands, lambda tokens: tokens == ["rm", "-rf", SITE_SCRIPTS])
+        check = _first_index(
+            commands, lambda tokens: tokens == ["python", "-I", "-c", SCRIPTS_CHECK]
+        )
+
+        assert install < remove < check, commands
+
+    def test_voice_requirements_are_copied_before_their_install(self):
+        instructions = _instructions()
+        (copy,) = (
+            i
+            for i, (keyword, arguments) in enumerate(instructions)
+            if keyword == "COPY" and _copy_source(arguments) == "requirements-voice.txt"
+        )
+
+        assert instructions[copy][1].split()[-1] == "/app/requirements-voice.txt"
+        assert copy < _voice_run_index()
+
+    def test_every_voice_requirement_is_an_exact_pin(self):
+        lines = [
+            raw.strip()
+            for raw in VOICE_REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+            if raw.strip() and not raw.strip().startswith("#")
+        ]
+
+        assert lines, "requirements-voice.txt pins nothing"
+        assert [line for line in lines if not PIN_LINE.fullmatch(line)] == []
+
+    def test_requirements_txt_names_no_voice_package(self):
+        voice = set(_requirement_names(VOICE_REQUIREMENTS))
+
+        assert voice
+        assert sorted(voice & set(_requirement_names(REQUIREMENTS))) == []
+
+    def test_no_workflow_names_the_voice_requirements(self):
+        workflows = sorted(WORKFLOWS.glob("*.y*ml"))
+
+        assert workflows
+        assert [
+            path.name
+            for path in workflows
+            if "requirements-voice.txt" in path.read_text(encoding="utf-8")
+        ] == []

@@ -36,9 +36,10 @@ in `EXEMPTIONS` with a written justification.
 WHAT THIS GUARD DOES NOT COVER (read this before trusting it)
 -------------------------------------------------------------
 - Builder calls ANYWHERE ELSE. Not elsewhere in `server.py`, and not in any
-  other module. Notably `build_conversation_handler` is invoked from the
-  VoiceProcessor -> ModelManager -> KnowledgeIntegration chain, not from
-  `lifespan`, and is therefore invisible here.
+  other module. Notably `build_mist_runtime` is invoked from `_build_runtime`
+  on a worker thread, and `build_conversation_handler` from
+  `build_mist_runtime`, not from `lifespan`; both are therefore invisible here.
+  `_build_runtime`'s own call in `lifespan` is watched.
 - Attribute-form calls (`factories.build_x(...)`) and any call reached
   through indirection: a builder bound to a local variable, `getattr`, a
   dispatch dict. Only bare-name calls are matched.
@@ -120,8 +121,8 @@ EXEMPTIONS: tuple[Exemption, ...] = (
         parameter="embedding_provider",
         reason=(
             "Deliberate. At this point in lifespan() the server owns no embedding "
-            "provider to share -- the graph store (and with it the ModelManager-warmed "
-            "EmbeddingGenerator) is built later, inside VoiceProcessor.initialize(). "
+            "provider to share -- the graph store (and with it the warmed "
+            "EmbeddingGenerator) is built later, inside the runtime build (build_mist_runtime). "
             "The factory's fallback builds EmbeddingGenerator(config.embedding.model_name), "
             "which is lazy: no model is loaded at construction, and lifespan warms it "
             "explicitly via vault_sidecar.warmup() on the next lines. Passing None here "
@@ -145,6 +146,9 @@ EXPECTED_BUILDER_CALL_SITES: frozenset[str] = frozenset(
         "_build_session_note_catchup",
         "_build_health_registry",
         "_build_gpu_yield",
+        "_build_power",
+        "_build_power_gate",
+        "_build_runtime",
         "_build_uptime_recorder",
         "build_capability_host",
     }

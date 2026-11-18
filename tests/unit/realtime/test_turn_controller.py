@@ -1,5 +1,6 @@
 """The per-session turn controller: its core (T11a), cuts, purges, records and completion
-(T11c), and the cross-session `WakeArbiter` with `outranks` (T11e part 2).
+(T11c), the cross-session `WakeArbiter` with `outranks` (T11e part 2), and "stop" while an alarm
+rings with the played text the echo guard reads (T52, D8).
 
 Every test drives the controller only through `post` and `close`, with the recording transport,
 `RecordingScenePort`, the fake responder, `FakeSynthesizer` on an inline lane, and the fake clock
@@ -20,11 +21,19 @@ import pytest
 import pytest_asyncio
 
 from backend.chat.context_budget import PromptStats
-from backend.chat.stream_events import Complete, HandOff, StateHint, Token
+from backend.chat.conversation_handler import CapabilityOnlyTurn
+from backend.chat.stream_events import Complete, HandOff, StateHint, Token, WSEvent
 from backend.chat.turn_scope import CommitResult
 from backend.realtime import turn as turn_module
-from backend.realtime.budget import BUDGET_PRESETS, CharacterConfig, TurnConfig, WakeConfig
+from backend.realtime.budget import (
+    BUDGET_PRESETS,
+    BargeInConfig,
+    CharacterConfig,
+    TurnConfig,
+    WakeConfig,
+)
 from backend.realtime.character import CharacterStage
+from backend.realtime.degraded import DirectResponder
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import UtteranceEnded
 from backend.realtime.playback import LanePurge, PlaybackLedger, PlaybackListener
@@ -63,6 +72,7 @@ from .turn_fakes import (
     TEST_PLAYBACK,
     Call,
     FailingSynthesizer,
+    FakeAlarm,
     FakeCallLater,
     FakeWakeArbiter,
     Harness,
@@ -1383,6 +1393,273 @@ async def test_a_reply_below_the_knee_logs_no_stage_line(caplog, config):
     reference, _ = staged(config, synth.emitted)
     assert (reference.clipped_samples, reference.limited_samples) == (0, 0)
     assert stage_logs(caplog, h.last_turn()) == []
+
+
+# -- "Stop" while an alarm rings (D8, T52) -----------------------------------------------------------
+
+
+def handled(reply: str) -> CapabilityOnlyTurn:
+    """A capability-only result the host answered, shaped as `handle_capability_only` makes it."""
+    return CapabilityOnlyTurn(handled=True, events=(Token(reply), Complete(final_response=reply)))
+
+
+async def ringing_reply(
+    alarm: FakeAlarm,
+    *,
+    reply: str = "One two three. Four five. ",
+    aec: str = "headset",
+    into_ms: int = 300,
+) -> tuple[Harness, str]:
+    """MIST speaks `reply` with v1's arm delay of 1000 ms, and has played `into_ms` of it."""
+    h = make_harness(
+        [Token(reply), Pause()], barge_in=BargeInConfig(), alarm_ringing=alarm, aec=aec
+    )
+    h.start_voice()
+    await h.speak("hello")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "speaking"
+    await h.clock.advance(into_ms)
+    h.post(PlaybackProgress(turn_id=turn_id, played_ms=into_ms))
+    await h.settle()
+    return h, turn_id
+
+
+async def test_stop_while_ringing_300_ms_into_her_speech_cuts_her_and_stops_the_alarm():
+    alarm = FakeAlarm()
+    h, turn_id = await ringing_reply(alarm)
+    h.responder.capability_results.append(handled("The alarm is off."))
+    h.responder.on_capability = lambda _text: alarm.stop()
+    other = h.ids()
+
+    h.post(h.ingress.started(other), h.ingress.partial(other, "Stop", heard_at_ms=300))
+    await h.settle()
+
+    # Cut at once, 700 ms before v1's arm delay would let a keyword through.
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.turn_id, barge.reason, barge.detail.keyword, barge.detail.utterance_id) == (
+        turn_id,
+        "keyword",
+        "stop",
+        other,
+    )
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    assert h.responder.capability_calls == []  # the whole utterance goes, at its end
+
+    h.post(h.ingress.ended(other, "Stop."))
+    await h.settle()
+
+    assert h.responder.capability_calls == [("Stop.", "session-1")]
+    assert alarm.ringing is False
+    assert len(h.responder.requests) == 1  # the model opened no turn for it
+    answer = h.outbound.of("stream_start")[-1]
+    assert answer.turn_id != turn_id
+    assert (answer.channel, answer.origin) == ("tts", "voice")
+    assert h.outbound.tokens(answer.turn_id) == ["The alarm is off."]
+    (transcription,) = h.outbound.of("transcription")[-1:]
+    assert (transcription.text, transcription.utterance_id) == ("Stop.", other)
+
+    await finish_voice_turn(h, answer.turn_id)
+    # The capability path committed its own turn: the controller commits nothing more.
+    assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    last = metrics(h)[-1]
+    assert (last.turn_id, last.origin, last.channel, last.outcome) == (
+        answer.turn_id,
+        "voice",
+        "tts",
+        "completed",
+    )
+    assert h.outbound.violations == []
+
+
+async def test_stop_the_alarm_while_ringing_reaches_capability_only_whole_and_opens_no_turn():
+    alarm = FakeAlarm()
+    h, turn_id = await ringing_reply(alarm)
+    other = h.ids()
+
+    h.post(h.ingress.started(other), h.ingress.partial(other, "stop the", heard_at_ms=300))
+    h.post(h.ingress.ended(other, "Stop the alarm."))
+    await h.settle()
+
+    assert h.outbound.of("voice_decision:barge_in")[0].turn_id == turn_id
+    assert h.responder.capability_calls == [("Stop the alarm.", "session-1")]
+    # Nothing went on as a next turn, and a None result does nothing more.
+    assert len(h.responder.requests) == 1
+    assert h.outbound.turn_ids() == [turn_id]
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert (dropped.reason, dropped.detail.text) == ("keyword", "Stop the alarm.")
+    assert h.controller.phase == "idle"
+
+
+async def test_an_unhandled_stop_sends_the_drained_payloads_and_opens_no_turn():
+    alarm = FakeAlarm()
+    h, turn_id = await ringing_reply(alarm)
+    resolved = {"type": "action_resolved", "action_id": "a-1", "status": "superseded"}
+    h.responder.capability_results.append(
+        CapabilityOnlyTurn(handled=False, events=(WSEvent(resolved),))
+    )
+    other = h.ids()
+
+    h.post(h.ingress.started(other), h.ingress.partial(other, "stop", heard_at_ms=300))
+    h.post(h.ingress.ended(other, "stop"))
+    await h.settle()
+
+    assert h.outbound.turn_ids() == [turn_id]
+    assert h.outbound.of("action_resolved") == [resolved]
+    assert h.outbound.of("voice_decision:dropped")[0].reason == "keyword"
+
+
+async def test_a_failed_capability_call_is_logged_and_closes_as_dropped_keyword(caplog):
+    alarm = FakeAlarm()
+    h, turn_id = await ringing_reply(alarm)
+
+    def fail(_text: str) -> None:
+        raise RuntimeError("host down")
+
+    h.responder.on_capability = fail
+    other = h.ids()
+
+    with caplog.at_level(logging.ERROR, logger=TURN_LOGGER):
+        h.post(h.ingress.started(other), h.ingress.partial(other, "stop", heard_at_ms=300))
+        h.post(h.ingress.ended(other, "stop"))
+        await h.settle()
+
+    assert "capability-only path failed with RuntimeError" in caplog.text
+    assert h.outbound.turn_ids() == [turn_id]
+    assert h.outbound.of("voice_decision:dropped")[0].reason == "keyword"
+
+
+async def test_stop_with_no_alarm_ringing_keeps_v1_and_never_reaches_capability_only():
+    alarm = FakeAlarm(ringing=False)
+    h, turn_id = await ringing_reply(alarm)
+    early = h.ids()
+
+    h.post(h.ingress.started(early), h.ingress.partial(early, "stop", heard_at_ms=300))
+    h.post(h.ingress.ended(early, "stop"))
+    await h.settle()
+    assert h.outbound.of("voice_decision:barge_in") == []  # v1's arm delay holds it back
+    assert h.controller.phase == "speaking"
+
+    await h.clock.advance(1000)
+    late = h.ids()
+    h.post(h.ingress.started(late), h.ingress.partial(late, "stop"), h.ingress.ended(late, "stop"))
+    await h.settle()
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.turn_id, barge.detail.keyword) == (turn_id, "stop")
+    (dropped,) = h.outbound.of("voice_decision:dropped")
+    assert dropped.reason == "keyword"
+    assert h.responder.capability_calls == []
+    assert len(h.responder.requests) == 1
+
+
+@pytest.mark.parametrize("ringing", [True, False])
+@pytest.mark.parametrize("word", ["cancel", "never mind"])
+async def test_cancel_and_never_mind_never_reach_capability_only(word, ringing):
+    alarm = FakeAlarm(ringing=ringing)
+    h = make_harness([Token("One two three. "), Pause()], alarm_ringing=alarm)
+    h.start_voice()
+    await h.speak("hello")
+    turn_id = h.last_turn()
+    other = h.ids()
+
+    h.post(h.ingress.started(other), h.ingress.partial(other, word), h.ingress.ended(other, word))
+    await h.settle()
+
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.turn_id, barge.detail.keyword) == (turn_id, word)
+    assert h.outbound.of("voice_decision:dropped")[0].reason == "keyword"
+    assert h.responder.capability_calls == []
+    assert alarm.ringing is ringing
+
+
+async def test_stop_heard_in_her_own_speech_within_the_echo_guard_cuts_nothing():
+    alarm = FakeAlarm()
+    h, turn_id = await ringing_reply(alarm, reply="Stop the oven when it beeps. ", aec="browser")
+    assert "Stop" in h.controller.recent_tts_text(BargeInConfig().echo_guard_ms)
+    other = h.ids()
+
+    h.post(h.ingress.started(other), h.ingress.partial(other, "stop", heard_at_ms=300))
+    h.post(h.ingress.ended(other, "stop"))
+    await h.settle()
+
+    assert h.outbound.of("voice_decision:barge_in") == []
+    assert h.responder.commits == []
+    assert h.responder.capability_calls == []
+    assert h.controller.phase == "speaking"
+    assert alarm.ringing is True
+
+
+async def test_stop_while_ringing_and_thinking_cuts_at_once():
+    alarm = FakeAlarm()
+    h = make_harness([Pause(), Token("Late.")], barge_in=BargeInConfig(), alarm_ringing=alarm)
+    h.start_voice()
+    await h.speak("hello")
+    turn_id = h.last_turn()
+    assert h.controller.phase == "thinking"
+    other = h.ids()
+
+    h.post(h.ingress.started(other), h.ingress.partial(other, "stop"))
+    await h.settle()
+    assert h.outbound.of("voice_decision:barge_in")[0].turn_id == turn_id
+    assert h.controller.phase == "idle"
+
+    h.post(h.ingress.ended(other, "stop the alarm"))
+    await h.settle()
+    assert h.responder.capability_calls == [("stop the alarm", "session-1")]
+    assert len(h.responder.requests) == 1
+
+
+async def test_stop_ending_a_held_turn_while_ringing_goes_to_capability_only():
+    alarm = FakeAlarm()
+    h = make_harness(alarm_ringing=alarm)
+    h.responder.capability_results.append(handled("The alarm is off."))
+    h.start_voice()
+    uid = h.ids()
+    h.post(h.ingress.started(uid), h.ingress.candidate(uid, "stop"))
+    await h.settle()
+    assert h.controller.phase == "held"
+
+    h.post(h.ingress.ended(uid, "stop"))
+    await h.settle()
+
+    assert h.responder.capability_calls == [("stop", "session-1")]
+    # The held turn was cancelled without trace; only the capability's answer reached the client.
+    assert len(h.responder.requests) == 1 and h.responder.commits == []
+    (start,) = h.outbound.of("stream_start")
+    assert h.outbound.tokens(start.turn_id) == ["The alarm is off."]
+    assert h.outbound.of("voice_decision:dropped") == []
+
+
+async def test_the_direct_responder_has_no_capability_host():
+    responder = DirectResponder(llm_provider=None)  # type: ignore[arg-type]
+
+    assert await responder.handle_capability_only("stop", "session-1") is None
+
+
+# -- The played text the echo guard reads (lead ruling, 17 Nov) ----------------------------------------
+
+
+async def test_recent_tts_text_is_the_latest_spoken_turns_and_outlives_the_turn():
+    h = make_harness([Token("First reply here. ")], [Token("Second.")])
+    assert h.controller.recent_tts_text(5000) == ""
+    h.start_voice()
+    await h.speak("hello")
+    turn_id = h.last_turn()
+    await h.clock.advance(400)
+    h.post(PlaybackProgress(turn_id=turn_id, played_ms=400))
+    await h.settle()
+    assert "First" in h.controller.recent_tts_text(5000)
+
+    await finish_voice_turn(h, turn_id)
+    assert h.controller.phase == "idle"
+    assert "First" in h.controller.recent_tts_text(5000)
+
+    # A held turn has played nothing: the turn before it stays the one the guard reads.
+    uid = h.ids()
+    h.post(h.ingress.started(uid), h.ingress.candidate(uid, "and then"))
+    await h.settle()
+    assert h.controller.phase == "held"
+    assert "First" in h.controller.recent_tts_text(5000)
 
 
 # -- The shared fakes -------------------------------------------------------------------------------

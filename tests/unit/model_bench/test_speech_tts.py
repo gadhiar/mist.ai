@@ -24,7 +24,7 @@ import pytest  # noqa: E402
 import yaml  # noqa: E402
 
 from scripts.model_bench import speech_bench  # noqa: E402
-from scripts.model_bench.speech import core, tts_suite  # noqa: E402
+from scripts.model_bench.speech import core, tts_suite, voice_design  # noqa: E402
 from scripts.model_bench.speech.probes import load_gen, tts_engines, tts_probe  # noqa: E402
 
 ARMS = core.load_json(core.SPEECH_ARMS_PATH)
@@ -34,7 +34,11 @@ LINES = {line["id"]: line for line in LINES_DOC["lines"]}
 ACKS = {ack["id"]: ack for ack in LINES_DOC["acknowledgements"]}
 EMOTIVE = [line["id"] for line in LINES_DOC["lines"] if line["emotive"]]
 L_IDS = list(LINES)
-GPU_ENGINES = ["qwen3", "turbo", "original"]
+GPU_ENGINES = ["qwen3", "turbo", "original", "qwen3-design"]
+CLONE = "pocket-clone"
+DESIGN = "qwen3-design"
+# A distinctive string standing for the identity clip's transcript; it must never reach a result.
+TRANSCRIPT = "zebra quartz lantern seventeen test line one"
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +626,7 @@ def fake_torch(rec: Recorder):
     return types.SimpleNamespace(
         bfloat16="bf16",
         set_num_threads=lambda n: rec.record("set_num_threads", n),
+        manual_seed=lambda seed: rec.record("manual_seed", seed),
     )
 
 
@@ -1070,15 +1075,16 @@ def test_the_pocket_adapter_refuses_a_voice_whose_state_file_is_missing(tmp_path
     assert adapter.voice is None
 
 
-def test_no_adapter_passes_an_audio_argument_to_its_engine(tmp_path):
+def test_no_adapter_but_pocket_clone_passes_an_audio_argument_to_its_engine(tmp_path):
     rec = Recorder()
     configs_dir, models_dir = pocket_setup(tmp_path)
     modules = (
         chatterbox_modules(rec)
         | qwen3_modules(rec)
+        | qwen3_design_modules(rec)
         | pocket_modules(rec, streaming=False, configs_dir=configs_dir)
     )
-    for engine in TTS:
+    for engine in [e for e in TTS if e != CLONE]:
         adapter = tts_engines.make_engine(
             engine, models_dir=models_dir, importer=fake_importer(modules, [])
         )
@@ -1088,6 +1094,363 @@ def test_no_adapter_passes_an_audio_argument_to_its_engine(tmp_path):
     passed = [key for _, _, kwargs in rec.calls for key in kwargs]
     assert not [k for k in passed if "audio" in k or "prompt" in k or "wav" in k]
     assert [list(kw) for name, _, kw in rec.calls if name == "load_model"] == [["config"]]
+    states = [args[0] for name, args, _ in rec.calls if name == "state"]
+    assert all(Path(s).suffix == ".safetensors" for s in states)
+
+
+# ---------------------------------------------------------------------------
+# The two arms T41 adds: `pocket-clone` and `qwen3-design`
+# ---------------------------------------------------------------------------
+
+# The `pocket` and `qwen3` arms as they were before T41, which must not change.
+BASE_POCKET_ARM = {
+    "verified": False,
+    "image": "mist-speech-bench-pocket",
+    "device": "cpu",
+    "threads": 4,
+    "streaming": True,
+    "packages": {"pocket-tts": "4.0.1", "torch": "2.6.0+cu124"},
+    "model": {
+        "repository": "kyutai/pocket-tts-without-voice-cloning",
+        "gated_fallback": "kyutai/pocket-tts",
+    },
+    "licence": "code MIT, weights CC-BY-4.0",
+    "settings": {"default": {}},
+    "voices": ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"],
+    "female_voices": ["alba", "fantine", "cosette", "eponine", "azelma"],
+    "timing_voice": "alba",
+    "listening_voices": ["fantine", "cosette", "eponine", "azelma"],
+}
+BASE_QWEN3_ARM = {
+    "verified": False,
+    "image": "mist-speech-bench-qwen3",
+    "device": "cuda",
+    "streaming": True,
+    "packages": {
+        "faster-qwen3-tts": "0.5.4",
+        "transformers": "5.16.1",
+        "qwen-tts-hf": "0.1.1.post1",
+        "torch": "2.6.0+cu124",
+    },
+    "model": {
+        "repository": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "revision": "85e237c1",
+        "bytes": 2493919668,
+    },
+    "licence": "Apache-2.0",
+    "settings": {
+        "default": {"chunk_size": 8, "dtype": "bfloat16", "language": "English", "instruct": None}
+    },
+    "voices": [
+        "vivian",
+        "serena",
+        "uncle_fu",
+        "dylan",
+        "eric",
+        "ryan",
+        "aiden",
+        "ono_anna",
+        "sohee",
+    ],
+    "female_voices": ["vivian", "serena", "ono_anna", "sohee"],
+    "timing_voice": "aiden",
+    "listening_voices": ["ryan", "vivian", "serena", "ono_anna", "sohee"],
+}
+CLONE_REVISION = "db04f0e653473e5c7333c69686ac92b7460b0c1d"
+
+
+def test_the_arms_file_gains_pocket_clone_and_qwen3_design_after_the_four_base_arms():
+    assert list(TTS) == ["qwen3", "turbo", "original", "pocket", CLONE, DESIGN]
+    assert TTS["pocket"] == BASE_POCKET_ARM
+    assert TTS["qwen3"] == BASE_QWEN3_ARM
+
+
+def test_pocket_clone_is_the_cloning_pocket_model_on_4_cpu_threads_in_the_pocket_image():
+    arm = TTS[CLONE]
+
+    assert arm["model"] == {"repository": "kyutai/pocket-tts", "revision": CLONE_REVISION}
+    assert (arm["device"], arm["threads"], arm["image"]) == ("cpu", 4, "mist-speech-bench-pocket")
+    assert arm["verified"] is False
+    assert arm["packages"] == TTS["pocket"]["packages"]
+    assert arm["voices"] == [core.IDENTITY_VOICE] and arm["timing_voice"] == core.IDENTITY_VOICE
+    assert arm["female_voices"] == [] and arm["listening_voices"] == []
+    assert arm["settings"] == {"default": {}}
+    # The arm's revision is the one the installed config's cloning-model URI names.
+    assert tts_engines.POCKET_CLONE_MODEL_URI.endswith(f"@{CLONE_REVISION}")
+
+
+def test_qwen3_design_is_the_voice_design_model_t40_pins_on_the_gpu_in_the_qwen3_image():
+    arm = TTS[DESIGN]
+    model = arm["model"]
+
+    assert f"{model['repository']}@{model['revision']}" == voice_design.MODEL_PIN
+    assert (arm["device"], arm["image"]) == ("cuda", "mist-speech-bench-qwen3")
+    assert arm["verified"] is False
+    assert arm["streaming"] is False
+    assert arm["packages"] == {
+        "qwen-tts-hf": "0.1.1.post1",
+        "transformers": "5.16.1",
+        "torch": "2.6.0+cu124",
+    }
+    assert arm["voices"] == ["designed"] and arm["timing_voice"] == "designed"
+    default = arm["settings"]["default"]
+    assert set(default) == {"instruct", "seed"}
+    assert isinstance(default["instruct"], str) and default["instruct"].strip()
+    assert isinstance(default["seed"], int)
+
+
+def test_the_arms_comment_says_which_arm_clones_and_which_designs():
+    comment = ARMS["_comment"]
+
+    assert "nothing is cloned" not in comment
+    assert "`pocket-clone` clones a private identity clip passed at run time" in comment
+    assert "`qwen3-design` designs a voice from text" in comment
+    assert "every other engine speaks a stock voice" in comment
+
+
+def test_every_tts_arm_has_an_adapter_and_every_adapter_an_arm():
+    assert list(tts_engines.ADAPTERS) == list(TTS)
+
+
+CLONE_REPO = "kyutai/pocket-tts"
+
+
+def clone_setup(tmp_path: Path, *, installed: str = INSTALLED_POCKET_YAML, missing=()):
+    """Pocket's setup plus the cloning model's snapshot and a synthetic identity clip."""
+    configs_dir, models_dir = pocket_setup(tmp_path, installed=installed, missing=missing)
+    english = models_dir.joinpath(*CLONE_REPO.split("/"), "languages", "english")
+    english.mkdir(parents=True)
+    if "clone/model.safetensors" not in missing:
+        (english / "model.safetensors").write_bytes(b"fake cloning model")
+    clip = write_identity_clip(tmp_path / "identity")
+    return configs_dir, models_dir, clip
+
+
+def write_identity_clip(root: Path) -> Path:
+    """A one-second sine tone and, beside it, a transcript file that nothing may read."""
+    root.mkdir(parents=True, exist_ok=True)
+    clip = root / "clip.wav"
+    rate = 24000
+    frames = (np.sin(2 * np.pi * 220.0 * np.arange(rate) / rate) * 8000).astype("<i2")
+    with wave.open(str(clip), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(frames.tobytes())
+    (root / "clip.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    return clip
+
+
+def clone_adapter(tmp_path: Path, rec: Recorder, *, has_voice_cloning=True, **setup):
+    configs_dir, models_dir, clip = clone_setup(tmp_path, **setup)
+    modules = pocket_modules(rec, streaming=False, configs_dir=configs_dir)
+    modules["pocket_tts"].TTSModel.configs = []
+    loader = modules["pocket_tts"].TTSModel.load_model
+
+    def load_model(**kwargs):
+        model = loader(**kwargs)
+        model.has_voice_cloning = has_voice_cloning
+        return model
+
+    modules["pocket_tts"].TTSModel.load_model = staticmethod(load_model)
+    adapter = tts_engines.PocketCloneEngine(
+        CLONE,
+        TTS[CLONE],
+        models_dir=models_dir,
+        importer=fake_importer(modules, []),
+        voice_clip=clip,
+    )
+    return adapter, modules, models_dir, clip
+
+
+def test_make_engine_builds_the_clone_adapter_reading_the_fixed_container_clip():
+    adapter = tts_engines.make_engine(CLONE, importer=fake_importer({}, []))
+
+    assert isinstance(adapter, tts_engines.PocketCloneEngine)
+    assert adapter.voice_clip == Path(tts_engines.CONTAINER_VOICE_CLIP)
+    assert adapter.voices() == [core.IDENTITY_VOICE]
+
+
+def test_the_clone_adapter_maps_the_three_installed_uris_to_their_local_snapshots(tmp_path):
+    rec = Recorder()
+    adapter, modules, models_dir, _ = clone_adapter(tmp_path, rec)
+    installed = yaml.safe_load(INSTALLED_POCKET_YAML)
+    ungated = models_dir.joinpath(*POCKET_REPO.split("/"), "languages", "english")
+    cloning = models_dir.joinpath(*CLONE_REPO.split("/"), "languages", "english")
+
+    adapter.load(core.IDENTITY_VOICE)
+
+    [written] = modules["pocket_tts"].TTSModel.configs
+    expected = installed
+    expected["weights_path"] = str(cloning / "model.safetensors")
+    expected["weights_path_without_voice_cloning"] = str(ungated / "model.safetensors")
+    expected["flow_lm"]["lookup_table"]["tokenizer_path"] = str(ungated / "tokenizer.json")
+    assert written == expected
+    assert remote_strings(written) == []
+    assert ("set_num_threads", (4,), {}) in rec.calls
+
+
+def test_the_clone_adapter_leaves_voice_cloning_on(tmp_path):
+    rec = Recorder()
+    adapter, _, _, _ = clone_adapter(tmp_path, rec)
+
+    adapter.load(core.IDENTITY_VOICE)
+
+    assert adapter._model.has_voice_cloning is True
+
+
+def test_the_clone_adapter_refuses_a_model_that_loaded_without_voice_cloning(tmp_path):
+    rec = Recorder()
+    adapter, _, _, _ = clone_adapter(tmp_path, rec, has_voice_cloning=False)
+
+    with pytest.raises(core.SpeechBenchError, match="cloning"):
+        adapter.load(core.IDENTITY_VOICE)
+
+    assert "state" not in [call[0] for call in rec.calls]
+
+
+@pytest.mark.parametrize(
+    ("edit", "missing"),
+    [
+        pytest.param(
+            _replace(POCKET_GATED_URI, POCKET_GATED_URI[:-8] + "00000000"),
+            (),
+            id="cloning-uri-at-another-revision",
+        ),
+        pytest.param(
+            _replace(POCKET_GATED_URI, POCKET_GATED_URI.replace("english", "french")),
+            (),
+            id="cloning-uri-at-another-path",
+        ),
+        pytest.param(
+            _replace(POCKET_MODEL_URI, POCKET_MODEL_URI[:-8] + "00000000"),
+            (),
+            id="ungated-uri-at-another-revision",
+        ),
+        pytest.param(
+            _replace(POCKET_TOKENIZER_URI, POCKET_TOKENIZER_URI.replace(POCKET_REPO, CLONE_REPO)),
+            (),
+            id="tokenizer-uri-in-another-repository",
+        ),
+        pytest.param(
+            _replace("  #weights_path: codec.safetensors", "  weights_path: codec.safetensors"),
+            (),
+            id="mimi-weights-path-set",
+        ),
+        pytest.param(
+            lambda text: text + "voice: hf://kyutai/pocket-tts/embeddings/alba.safetensors@x\n",
+            (),
+            id="another-hf-uri",
+        ),
+        pytest.param(
+            lambda text: text + "voice: https://example.org/voices/alba.safetensors\n",
+            (),
+            id="another-remote-file",
+        ),
+        pytest.param(lambda text: text, ("clone/model.safetensors",), id="cloning-model-missing"),
+        pytest.param(lambda text: text, ("model.safetensors",), id="ungated-model-missing"),
+        pytest.param(lambda text: text, ("tokenizer.json",), id="tokenizer-missing"),
+    ],
+)
+def test_the_clone_adapter_refuses_any_other_uri_or_a_missing_snapshot_before_loading(
+    tmp_path, edit, missing
+):
+    rec = Recorder()
+    adapter, _, _, _ = clone_adapter(
+        tmp_path, rec, installed=edit(INSTALLED_POCKET_YAML), missing=missing
+    )
+
+    with pytest.raises(core.SpeechBenchError):
+        adapter.load(core.IDENTITY_VOICE)
+
+    assert "load_model" not in [call[0] for call in rec.calls]
+
+
+def test_the_clone_adapter_takes_its_voice_from_the_mounted_clip(tmp_path):
+    rec = Recorder()
+    adapter, _, _, clip = clone_adapter(tmp_path, rec)
+
+    adapter.load(core.IDENTITY_VOICE)
+    chunks = list(adapter.stream("Hello."))
+
+    [state] = [args for name, args, _ in rec.calls if name == "state"]
+    assert state == (clip,)
+    assert ("generate_audio", ("state:clip", "Hello."), {}) in rec.calls
+    assert len(chunks) == 1
+
+
+def test_the_clone_adapter_refuses_when_no_clip_is_mounted(tmp_path):
+    rec = Recorder()
+    adapter, _, _, clip = clone_adapter(tmp_path, rec)
+    clip.unlink()
+
+    with pytest.raises(tts_engines.VoiceError):
+        adapter.load(core.IDENTITY_VOICE)
+
+    assert "state" not in [call[0] for call in rec.calls]
+    assert adapter.voice is None
+
+
+def qwen3_design_modules(rec: Recorder):
+    class Model:
+        def generate_voice_design(self, text, instruct, language=None, **kwargs):
+            rec.record("generate_voice_design", text=text, instruct=instruct, language=language)
+            return [np.full(7, 0.1, dtype=np.float32)], 12000
+
+    class Qwen3TTSModel:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            rec.record("design.from_pretrained", path, **kwargs)
+            return Model()
+
+    return {
+        "qwen_tts": types.SimpleNamespace(Qwen3TTSModel=Qwen3TTSModel),
+        "torch": fake_torch(rec),
+    }
+
+
+def test_the_design_adapter_loads_the_voice_design_model_as_the_design_probe_does():
+    rec = Recorder()
+    adapter = tts_engines.make_engine(
+        DESIGN,
+        models_dir=Path("/models/speech"),
+        importer=fake_importer(qwen3_design_modules(rec), []),
+    )
+
+    adapter.load("designed")
+
+    name, args, kwargs = rec.calls[0]
+    assert name == "design.from_pretrained"
+    assert Path(args[0]) == Path("/models/speech/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+    assert kwargs == {"device_map": "cuda:0", "dtype": "bf16"}
+
+
+def test_the_design_adapter_voices_each_text_with_the_arm_s_fixed_description_and_seed():
+    rec = Recorder()
+    default = TTS[DESIGN]["settings"]["default"]
+    adapter = tts_engines.make_engine(DESIGN, importer=fake_importer(qwen3_design_modules(rec), []))
+
+    adapter.load("designed")
+    first = list(adapter.stream("Hello there."))
+    list(adapter.stream("Goodbye."))
+
+    calls = [c for c in rec.calls if c[0] in ("manual_seed", "generate_voice_design")]
+    assert calls == [
+        ("manual_seed", (default["seed"],), {}),
+        (
+            "generate_voice_design",
+            (),
+            {"text": "Hello there.", "instruct": default["instruct"], "language": "English"},
+        ),
+        ("manual_seed", (default["seed"],), {}),
+        (
+            "generate_voice_design",
+            (),
+            {"text": "Goodbye.", "instruct": default["instruct"], "language": "English"},
+        ),
+    ]
+    assert len(first) == 1 and len(first[0]) == 7
+    assert adapter.sample_rate == 12000 and adapter.streaming is False
 
 
 # ---------------------------------------------------------------------------
@@ -1097,9 +1460,21 @@ def test_no_adapter_passes_an_audio_argument_to_its_engine(tmp_path):
 OUT = "/results/mh1/speech/tts/x"
 
 
+CLIP_HOST = "/private/identity/clip.wav"
+
+
+def clip_for(engine: str) -> str | None:
+    return CLIP_HOST if engine == CLONE else None
+
+
 def timed(engine: str, condition: str = "idle") -> list[str]:
     return tts_suite.timed_argv(
-        engine, condition, out_dir=OUT, repo_dir="/repo", speech_models_dir="/models"
+        engine,
+        condition,
+        out_dir=OUT,
+        repo_dir="/repo",
+        speech_models_dir="/models",
+        voice_clip=clip_for(engine),
     )
 
 
@@ -1125,13 +1500,42 @@ def test_a_gpu_engine_gets_all_gpus_and_the_bench_server_s_network(engine):
     assert "--cpus" not in argv
 
 
-def test_pocket_gets_no_gpu_no_network_and_at_most_4_threads():
-    argv = timed("pocket")
+@pytest.mark.parametrize("engine", ["pocket", CLONE])
+def test_pocket_gets_no_gpu_no_network_and_at_most_4_threads(engine):
+    argv = timed(engine)
 
     assert "--gpus" not in argv
     assert value(argv, "--network") == "none"
     assert float(value(argv, "--cpus")) <= 4
     assert {"OMP_NUM_THREADS=4", "MKL_NUM_THREADS=4"} <= set(envs(argv))
+
+
+def test_pocket_clone_mounts_the_clip_read_only_at_the_fixed_container_path():
+    argv = timed(CLONE)
+
+    assert f"{CLIP_HOST}:{tts_engines.CONTAINER_VOICE_CLIP}:ro" in mounts(argv)
+    tail = argv[argv.index("scripts.model_bench.speech.probes.tts_probe") + 1 :]
+    assert CLIP_HOST not in " ".join(tail)
+
+
+def test_pocket_clone_s_argv_refuses_to_be_built_without_a_clip():
+    with pytest.raises(core.VoiceClipError):
+        tts_suite.timed_argv(
+            CLONE, "idle", out_dir=OUT, repo_dir="/repo", speech_models_dir="/models"
+        )
+
+
+@pytest.mark.parametrize("engine", [e for e in TTS if e != CLONE])
+def test_no_other_engine_s_argv_takes_a_clip(engine):
+    with pytest.raises(core.VoiceClipError):
+        tts_suite.timed_argv(
+            engine,
+            "idle",
+            out_dir=OUT,
+            repo_dir="/repo",
+            speech_models_dir="/models",
+            voice_clip=CLIP_HOST,
+        )
 
 
 @pytest.mark.parametrize("engine", list(TTS))
@@ -1142,6 +1546,8 @@ def test_every_engine_container_is_offline_read_only_and_mounts_the_repository(e
     assert "/repo:/work:ro" in mounts(argv)
     assert "/models:/models/speech:ro" in mounts(argv)
     assert [m for m in mounts(argv) if not m.endswith(":ro")] == [f"{OUT}:/out"]
+    clip_mounts = [m for m in mounts(argv) if tts_engines.CONTAINER_VOICE_CLIP in m]
+    assert len(clip_mounts) == (1 if engine == CLONE else 0)
     assert value(argv, "-w") == "/work"
     assert "-p" not in argv and "--publish" not in argv
     assert argv[argv.index(TTS[engine]["image"]) + 1 :][:3] == [
@@ -1205,7 +1611,12 @@ def test_the_render_argv_names_each_voice_and_the_expressive_setting():
 @pytest.mark.parametrize("engine", list(TTS))
 def test_the_loop_argv_runs_the_probe_s_loop_mode_with_no_output_mount(engine):
     argv = tts_suite.loop_container_argv(
-        engine, line_id="L05", seconds=90, repo_dir="/repo", speech_models_dir="/models"
+        engine,
+        line_id="L05",
+        seconds=90,
+        repo_dir="/repo",
+        speech_models_dir="/models",
+        voice_clip=clip_for(engine),
     )
 
     tail = argv[argv.index("scripts.model_bench.speech.probes.tts_probe") + 1 :]
@@ -1557,6 +1968,127 @@ def test_the_mounted_results_path_is_the_claimed_directory_outside_the_repositor
 
 
 # ---------------------------------------------------------------------------
+# The cloned voice: which runs take a clip, and what they record of it
+# ---------------------------------------------------------------------------
+
+
+def test_a_default_run_leaves_out_pocket_clone_unless_a_clip_is_given(tmp_path):
+    without = tts_suite.default_engines(TTS, None)
+    with_clip = tts_suite.default_engines(TTS, tmp_path / "clip.wav")
+
+    assert without == tuple(e for e in TTS if e != CLONE)
+    assert with_clip == tuple(TTS)
+
+
+def _refused_before_anything(tmp_path, req) -> str:
+    log: list[str] = []
+    with pytest.raises(core.VoiceClipError) as info:
+        tts_suite.run_tts(
+            req,
+            runner=FakeRunner(log, Now()),
+            container_state=lambda name: log.append("state") or "running",
+            load_gen_factory=lambda: FakeLoadGen(log),
+            sampler_factory=lambda path: FakeSampler(log, path),
+            git_sha="x",
+            repo_root=_REPO_ROOT,
+        )
+    assert log == []
+    assert not (tmp_path / "results").exists()
+    return str(info.value)
+
+
+def test_run_tts_refuses_pocket_clone_without_a_clip_before_anything(tmp_path):
+    _refused_before_anything(tmp_path, request(tmp_path, engines=(CLONE,)))
+
+
+def test_run_tts_refuses_a_clip_for_a_run_without_pocket_clone(tmp_path):
+    clip = write_identity_clip(tmp_path / "identity")
+
+    message = _refused_before_anything(
+        tmp_path, request(tmp_path, engines=("pocket",), voice_clip=clip)
+    )
+
+    assert str(clip) not in message and clip.as_posix() not in message
+
+
+def test_run_tts_refuses_a_clip_that_does_not_exist(tmp_path):
+    clip = tmp_path / "identity" / "absent.wav"
+
+    message = _refused_before_anything(
+        tmp_path, request(tmp_path, engines=(CLONE,), voice_clip=clip)
+    )
+
+    assert "absent" not in message
+
+
+def _all_text_under(root: Path) -> str:
+    return "\n".join(
+        p.read_bytes().decode("utf-8", errors="replace") for p in root.rglob("*") if p.is_file()
+    )
+
+
+def test_a_cloned_run_records_the_identity_and_the_clip_s_sha256_prefix_only(tmp_path, caplog):
+    caplog.set_level("DEBUG")
+    identity_root = tmp_path / "identity"
+    clip = write_identity_clip(identity_root)
+    before = sorted((p.name, p.stat().st_mtime_ns) for p in identity_root.iterdir())
+    sha = core.sha256_file(clip)[:12]
+
+    _, runner = run_suite(tmp_path, request(tmp_path, engines=(CLONE,), voice_clip=clip))
+
+    tts_dir = tmp_path / "results" / "mh1" / "speech" / "tts"
+    samples = read_jsonl(tts_dir / "samples.jsonl")
+    [load] = read_jsonl(tts_dir / "load.jsonl")
+    assert samples and all(r["voice"] == core.IDENTITY_VOICE for r in samples)
+    assert {r["voice_clip_sha256"] for r in samples} == {sha}
+    assert (load["voice"], load["voice_clip_sha256"]) == (core.IDENTITY_VOICE, sha)
+    clip_mount = f"{clip.resolve().as_posix()}:{tts_engines.CONTAINER_VOICE_CLIP}:ro"
+    assert all(clip_mount in mounts(argv) for argv in runner.argvs)
+    written = _all_text_under(tmp_path / "results")
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in (str(clip), clip.as_posix(), clip.resolve().as_posix(), TRANSCRIPT, "clip.wav"):
+        assert secret not in written
+        assert secret not in logged
+    assert sorted((p.name, p.stat().st_mtime_ns) for p in identity_root.iterdir()) == before
+
+
+def test_a_run_without_a_clip_records_no_clip_field(tmp_path):
+    run_suite(tmp_path, request(tmp_path, engines=("pocket",)))
+
+    rows = read_jsonl(tmp_path / "results" / "mh1" / "speech" / "tts" / "samples.jsonl")
+    assert all("voice_clip_sha256" not in r for r in rows)
+
+
+def test_the_docker_runner_logs_the_clip_mount_as_a_placeholder(tmp_path, monkeypatch):
+    clip = write_identity_clip(tmp_path / "identity")
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.stdout = iter(["ready\n"])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(tts_suite.subprocess, "Popen", FakePopen)
+    argv = tts_suite.timed_argv(
+        CLONE,
+        "idle",
+        out_dir=OUT,
+        repo_dir="/repo",
+        speech_models_dir="/models",
+        voice_clip=clip.as_posix(),
+    )
+    log_path = tmp_path / "idle.log"
+
+    code = tts_suite.DockerRunner().run(argv, log_path=log_path, on_line=lambda line: None)
+
+    text = log_path.read_text(encoding="utf-8")
+    assert code == 0
+    assert clip.as_posix() not in text and str(clip) not in text
+    assert f"{core.VOICE_CLIP_PLACEHOLDER}:{tts_engines.CONTAINER_VOICE_CLIP}:ro" in text
+
+
+# ---------------------------------------------------------------------------
 # Registry: plan, selftest and inputs
 # ---------------------------------------------------------------------------
 
@@ -1573,6 +2105,12 @@ def test_plan_lists_tts_suite_as_built_and_prints_its_argv(capsys):
         assert f"[argv] tts {engine} loop:" in out
     assert "[argv] tts qwen3 render:" in out
     assert "[argv] tts original render:" in out
+    clone_lines = [line for line in out.splitlines() if line.startswith("[argv] tts pocket-clone")]
+    assert len(clone_lines) == 3
+    placeholder = f"{core.VOICE_CLIP_PLACEHOLDER}:{tts_engines.CONTAINER_VOICE_CLIP}:ro"
+    assert all(placeholder in line for line in clone_lines)
+    others = [line for line in out.splitlines() if "pocket-clone" not in line]
+    assert not [line for line in others if tts_engines.CONTAINER_VOICE_CLIP in line]
 
 
 def test_selftest_runs_the_tts_suite_selftest(capsys):

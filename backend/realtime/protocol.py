@@ -16,7 +16,16 @@ Control messages are JSON text frames discriminated by `type`. `parse_client_mes
 `parse_server_message` validate in strict mode, so a client sending `"active": "yes"` gets a
 `ProtocolError` instead of a silent coercion; a JavaScript client must round integer fields
 before sending. Fields a newer client adds are ignored rather than rejected, which keeps a minor
-protocol bump compatible with this server.
+protocol bump compatible with this server; `alarm_report` is the one exception, and refuses an
+unknown key.
+
+Protocol 2.0.0 is main's 1.x control messages plus protocol 2's own. Every client message
+main's `/ws` handles is modelled, with main's fields, except `audio` and `reset_vad`, which
+protocol 2 removed: `text`, `interrupt`, `log_config` and `subscribe_logs` from protocol 1, and
+capabilities' `action_decision`, `alarm_action` and `alarm_report` from 1.4.0. Main's server
+messages are not modelled: the server messages here are the ones protocol 2 adds or changes, so
+a server event protocol 2 leaves unchanged, such as `stream_token` or a capability event, is an
+unknown type to `parse_server_message`.
 """
 
 import json
@@ -26,6 +35,7 @@ from enum import IntEnum, StrEnum
 from typing import Literal
 
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -415,6 +425,79 @@ class SubscribeLogsMessage(_WireModel):
     levels: list[str] | None
 
 
+# The three capability messages restate the fields of capabilities' inbound models on main
+# (`backend/capabilities/events.py`, protocol 1.4.0) rather than import them, so this module still
+# imports no backend package but its own. `test_protocol.py` compares each field's type,
+# constraints and default with capabilities' model, so the two cannot drift apart.
+
+
+class ActionDecisionMessage(_WireModel):
+    """Approve or reject a capability's proposal (unchanged from protocol 1.4.0)."""
+
+    type: Literal["action_decision"] = "action_decision"
+    proposal_id: str
+    decision: Literal["approve", "reject"]
+
+
+class AlarmActionMessage(_WireModel):
+    """Stop, snooze or dismiss an alarm (unchanged from protocol 1.4.0).
+
+    `minutes` applies to a snooze only. `request_id` is an opaque client string the server's
+    answer echoes; it is left out of the serialized message when none was sent, as capabilities'
+    `to_payload` leaves it out, while a missing `minutes` serializes as null.
+    """
+
+    type: Literal["alarm_action"] = "alarm_action"
+    alarm_id: str
+    action: Literal["stop", "snooze", "dismiss"]
+    minutes: int | None = Field(default=None, ge=1, le=60)
+    request_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        return _drop_none(handler(self), "request_id")
+
+
+class AlarmReportMessage(_WireModel):
+    """An endpoint's report of a ring it started playing, or of its local ring's outcome.
+
+    Unchanged from protocol 1.4.0. It has no `endpoint` field, and unlike every other client
+    message an unknown key is refused rather than ignored: the server attaches the endpoint of
+    the connection the report arrived on, so a report that names its own endpoint fails
+    validation naming `endpoint`. `snoozed_until` comes with outcome `snoozed` and with nothing
+    else.
+
+    Capabilities' model also refuses `at` or `rang_at` outside a window around the owner's
+    clock. That check reads the clock, so it is not a wire rule and is not repeated here: on
+    main the server validates the report with capabilities' model, and the capability host
+    checks the window again against its own clock (`CapabilityHost.alarm_report`).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    type: Literal["alarm_report"] = "alarm_report"
+    alarm_id: str = Field(min_length=1)
+    outcome: Literal["rang", "stopped", "snoozed"]
+    at: AwareDatetime
+    rang_at: AwareDatetime
+    snoozed_until: AwareDatetime | None = None
+    request_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _snoozed_until_comes_with_snoozed(self) -> "AlarmReportMessage":
+        if (self.snoozed_until is None) == (self.outcome == "snoozed"):
+            raise PydanticCustomError(
+                "snoozed_until_pairing",
+                "{wire_field} is required with snoozed and refused otherwise",
+                {"wire_field": "snoozed_until"},
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        return _drop_none(handler(self), "snoozed_until", "request_id")
+
+
 ClientMessage = (
     VoiceStartMessage
     | VoiceStopMessage
@@ -428,6 +511,9 @@ ClientMessage = (
     | InterruptMessage
     | LogConfigMessage
     | SubscribeLogsMessage
+    | ActionDecisionMessage
+    | AlarmActionMessage
+    | AlarmReportMessage
 )
 
 
@@ -1184,8 +1270,9 @@ def parse_client_message(raw: str | bytes) -> ClientMessage:
     The removed protocol 1 messages `audio` and `reset_vad` are unknown types here.
 
     Raises:
-        ProtocolError: Invalid JSON, an unknown or missing `type`, a missing required field or a
-            field of the wrong type or value; `field` names it (dotted for nested fields).
+        ProtocolError: Invalid JSON, an unknown or missing `type`, a missing required field, a
+            field of the wrong type or value, or an unknown key on `alarm_report`; `field`
+            names it (dotted for nested fields).
     """
     return _validate(_ClientEnvelope, raw)
 
