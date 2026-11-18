@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# A template for one device's private YAML. Copy it to `<private dir>/<device>/room.yaml`, beside
+# the `secrets.yaml` and `mist_ca.pem` that `scripts/daily/devices.py add` wrote there, and add the
+# Wi-Fi lines (`wifi_ssid`, `wifi_password`) to that `secrets.yaml`. Never copy it into a work tree.
+#
+# Build it only with `python -m scripts.room_endpoint.build compile room --config
+# /private/<device>/room.yaml --out /private/<device>/images/room` (README.md): the build places
+# a copy of the repository's `firmware/room-endpoint/` beside a copy of this directory, which is
+# where the `!include` below points.
+#
+# For the spike build (H4), copy it to `<private dir>/<device>/spike.yaml` instead, include
+# `../room-endpoint/spike.yaml`, and drop `wake_model`: the spike's stand-in wake is built in.
+
+substitutions:
+  device_name: <device>
+  # The name model, from the models directory mounted at /models.
+  wake_model: /models/<model id>/device/<model file>.json
+
+packages:
+  mist: !include ../room-endpoint/room.yaml

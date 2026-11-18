@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The one persistent link to MIST's device listener: `wss://<server_host>:<server_port>/v2/device`
+# with the device's bearer token and the private CA pinned. The host, port and token come from the
+# `secrets.yaml` that `scripts/daily/devices.py add` writes; `mist_ca.pem` is the CA certificate it
+# copies beside it, read relative to the top-level YAML's directory.
+
+external_components:
+  - source:
+      type: local
+      path: ${mist_components_path}
+    components: [mist_core, mist_link]
+
+mist_link:
+  # Not `link`: that would shadow POSIX `link()` in the generated C++.
+  id: mist_connection
+  server_host: !secret mist_server_host
+  server_port: !secret mist_server_port
+  token: !secret mist_device_token
+  ca_file: mist_ca.pem
+  websocket_client_path: ${websocket_client_path}

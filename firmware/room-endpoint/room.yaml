@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The room build: MIST's firmware for a Voice PE. It wakes on `${wake_model}` alone, the name model
+# kept outside the repository, which the private YAML made from `personal.example.yaml` sets.
+# Build it with `python -m scripts.room_endpoint.build compile room` (see README.md).
+#
+# Every other default is the worker image's path for that asset.
+
+substitutions:
+  device_name: mist-room
+  # No default model: a build that forgets to set it fails on this missing file.
+  wake_model: /models/set-wake_model-in-the-private-yaml.json
+  stop_model: /opt/mist-firmware-deps/models/stop/stop.json
+  vad_model: /opt/mist-firmware-deps/models/vad/vad.json
+  voice_kit_path: /opt/mist-firmware-deps/home-assistant-voice-pe/esphome/components
+  xmos_firmware: http://127.0.0.1:8765/xmos/ffva_v1.3.1_upgrade.bin
+  websocket_client_path: /opt/mist-firmware-deps/esp_websocket_client
+  mist_components_path: components
+  # How long an uplink stays open after a wake (plan Design item 4).
+  uplink_cap_ms: "30000"
+  # The pre-wake ring's length and the most of it a wake sends.
+  ring_ms: "6000"
+  backlog_ms: "5000"
+  # The quietest an alarm rings, as a fraction of full volume.
+  ring_volume_floor: "0.6"
+
+packages:
+  device: !include packages/device.yaml
+  link: !include packages/link.yaml

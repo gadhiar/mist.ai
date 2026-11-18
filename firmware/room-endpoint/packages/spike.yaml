@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# Spike build only (host step H4): the link sends `device_stats` every 10 s, which only the spike
+# listener reads. `room.yaml` never includes this package, so the room build carries no stats
+# code at all.
+
+mist_link:
+  device_stats: true
