@@ -31,6 +31,7 @@ void Uplink::on_connected() {
   close(CloseReason::Disconnect);
   connected_ = true;
   voice_active_ = false;
+  server_muted_ = muted_;
   seq_ = 0;
   state_ = MistState::Idle;
   speaking_turn_[0] = '\0';
@@ -52,10 +53,16 @@ bool Uplink::on_mute(bool muted) {
   muted_ = muted;
   if (muted && open_) close(CloseReason::Mute);
   ring_.clear();
-  if (!connected_) return true;
+  return sync_mute();
+}
+
+bool Uplink::sync_mute() {
+  if (!connected_ || server_muted_ == muted_) return true;
   char buf[64];
-  const size_t len = build_mute(buf, sizeof(buf), muted);
-  return len > 0 && sink_.send_text(buf, len);
+  const size_t len = build_mute(buf, sizeof(buf), muted_);
+  if (len == 0 || !sink_.send_text(buf, len)) return false;
+  server_muted_ = muted_;
+  return true;
 }
 
 void Uplink::on_state_cycle(MistState state, const char* turn_id) {
@@ -82,6 +89,7 @@ WakeOutcome Uplink::on_wake(float score, uint32_t now_ms) {
   if (muted_) return WakeOutcome::Muted;
   if (!voice_active_) return WakeOutcome::VoiceInactive;
   if (open_) return WakeOutcome::AlreadyOpen;
+  if (!sync_mute()) return WakeOutcome::SendFailed;
   const uint32_t frames = ring_.read_last(config_.backlog_ms);
   const uint32_t backlog_ms = frames * PcmRing::kFrameMs;
   char buf[160];
@@ -108,6 +116,7 @@ StopOutcome Uplink::on_stop_keyword() {
 }
 
 uint32_t Uplink::pump(uint32_t now_ms, uint32_t max_frames) {
+  sync_mute();
   if (!open_) return 0;
   // Unsigned subtraction keeps the cap right across the clock's wrap.
   if (now_ms - opened_at_ms_ >= config_.cap_ms) {

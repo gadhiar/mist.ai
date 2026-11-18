@@ -2,7 +2,7 @@
 # Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
 #
 # The Voice PE hardware: board, PSRAM, the XMOS front end, the I2S buses, microphone and speaker
-# chain, Wi-Fi, OTA, SNTP and the wake models. Adapted from the published Voice PE config
+# chain, mute switch, Wi-Fi, OTA, SNTP and the wake models. Adapted from the published Voice PE config
 # (esphome/home-assistant-voice-pe, home-assistant-voice.yaml at 2644f4c, MIT), with its stock
 # wake models, wake word select, assistant pipeline and native API removed.
 #
@@ -47,6 +47,11 @@ external_components:
       type: local
       path: ${voice_kit_path}
     components: [voice_kit]
+  # The pre-wake ring and wake uplink; configured in `packages/link.yaml`.
+  - source:
+      type: local
+      path: ${mist_components_path}
+    components: [mist_prewake]
 
 logger:
   level: DEBUG
@@ -91,6 +96,14 @@ i2s_audio:
       number: GPIO14
     i2s_bclk_pin:
       number: GPIO13
+
+# The hardware mute switch on the side of the device, on the pin the published config gives it
+# (home-assistant-voice.yaml at 2644f4c, `hardware_mute_switch`, line 523). On means muted.
+binary_sensor:
+  - platform: gpio
+    id: hardware_mute_switch
+    internal: true
+    pin: GPIO3
 
 # Channel 0 is the XMOS chain through AGC, channel 1 through noise suppression.
 microphone:
@@ -161,3 +174,7 @@ micro_wake_word:
       id: stop
   vad:
     model: ${vad_model}
+  # A detection passes only its model's word; `mist_prewake` opens the uplink only for the name
+  # model's (packages/link.yaml).
+  on_wake_word_detected:
+    - lambda: id(mist_prewake_uplink).on_wake_word_detected(wake_word);
