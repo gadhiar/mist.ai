@@ -270,28 +270,47 @@ async def test_a_message_over_64_kib_closes_the_connection_1009(tls_pair, client
 # -- Signals -------------------------------------------------------------------------------
 
 
-def handlers() -> tuple[object, object]:
-    return signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
+def a_uvicorn_handler(handler: object) -> bool:
+    """Whether `handler` is a method of a uvicorn server, such as `Server.handle_exit`."""
+    return isinstance(getattr(handler, "__self__", None), uvicorn.Server)
 
 
 @pytest.mark.asyncio
-async def test_the_signal_handlers_are_the_same_before_while_serving_and_after(
-    tls_pair, client_ssl
+async def test_the_listener_installs_no_signal_handler_from_start_to_stop(
+    tls_pair, client_ssl, monkeypatch
 ):
+    # What is pinned is the listener's own calls, not the process-wide handlers: anything else in
+    # the process may set a handler during the awaits below, and that is not the listener's doing.
+    # uvicorn 0.46 installs through `signal.signal`; `add_signal_handler` is recorded too, so a
+    # uvicorn that moved to the loop's route would still be caught.
+    installed: list[tuple[int, object]] = []
+    real_signal = signal.signal
+
+    def record_signal(signum, handler):
+        installed.append((signum, handler))
+        return real_signal(signum, handler)
+
+    loop = asyncio.get_running_loop()
+    real_add_signal_handler = loop.add_signal_handler
+
+    def record_add_signal_handler(signum, callback, *args):
+        installed.append((signum, callback))
+        return real_add_signal_handler(signum, callback, *args)
+
+    monkeypatch.setattr(signal, "signal", record_signal)
+    monkeypatch.setattr(loop, "add_signal_handler", record_add_signal_handler)
     echo = EchoApp()
     listener = listener_for(config_for(tls_pair), echo.app)
-    before = handlers()
 
     await listener.start()
     async with connect(uri(listener), ssl=client_ssl) as client:
         await client.send("ping")
-        await client.recv()
-        serving = handlers()
+        answer = await client.recv()
     await listener.stop()
-    after = handlers()
 
-    assert serving == before
-    assert after == before
+    assert answer == "ping"
+    assert echo.received == ["ping"]
+    assert [(signum, h) for signum, h in installed if a_uvicorn_handler(h)] == []
 
 
 async def hello(scope, receive, send) -> None:
