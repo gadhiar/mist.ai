@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import uuid
@@ -32,9 +33,19 @@ from .addressee import AddresseeGate
 from .bargein import KeywordBargeIn
 from .budget import BUDGET_FIELDS, VoiceSettings
 from .errors import ProtocolError
-from .ingress import AudioIngress, IngressEngines, IngressLanes, IngressSeed, ring_retention_ms
+from .ingress import (
+    AudioIngress,
+    EndpointCandidate,
+    IngressEngines,
+    IngressLanes,
+    IngressSeed,
+    UtteranceDropped,
+    UtteranceEnded,
+    ring_retention_ms,
+)
 from .ingress import Lane as InferenceLane
 from .playback import LaneFull, LanePurge, MonotonicPlaybackClock, PlaybackClock, TurnLane
+from .power import CapabilityOnly, PowerGate, PowerGatedResponder
 from .protocol import (
     ActionDecisionMessage,
     AlarmActionMessage,
@@ -154,13 +165,26 @@ def _ignore_capability(session_id: str, message: CapabilityMessage) -> None:
     logger.debug("session %s: capability message %s has no handler", session_id, message.type)
 
 
+def _no_alarm() -> bool:
+    return False
+
+
+def _on_cpu(status: EngineStatus) -> bool:
+    return status.loaded and status.location == "cpu"
+
+
 @dataclass(frozen=True, slots=True)
 class SessionServices:
     """What every session shares, built once by `MistRuntime`; tests pass fakes.
 
     `ingress_factory` and `controller_factory` default to the real classes; a test passes its
     own to record what the session builds. `on_capability_message` receives `action_decision`,
-    `alarm_action` and `alarm_report`, which belong to the capability host (T22).
+    `alarm_action` and `alarm_report`, which belong to the capability host (T13).
+
+    `power_gate` gates turns on the model tier and voice on spoken commands at off (T22); with
+    None every turn reaches `responder` and the level is `power_level()`, which is otherwise
+    unread. `capability_only` is the capability-only path a turn without a model takes, None
+    until T13 wires it. `alarm_ringing` is passed to each controller, and T13 sets it.
     """
 
     responder: TurnResponder
@@ -175,6 +199,9 @@ class SessionServices:
     ingress_factory: Callable[..., AudioIngress] = AudioIngress
     controller_factory: Callable[..., TurnController] = TurnController
     on_capability_message: Callable[[str, CapabilityMessage], None] = _ignore_capability
+    power_gate: PowerGate | None = None
+    capability_only: CapabilityOnly | None = None
+    alarm_ringing: Callable[[], bool] = _no_alarm
 
 
 class SessionSocket(Protocol):
@@ -302,6 +329,8 @@ class RealtimeSession:
         self.bulk_dropped = 0
 
         self._voice: _Voice | None = None
+        self._kept: VoiceStartMessage | None = None
+        self._power_check: asyncio.Handle | None = None
         self._epoch = 0
         self._muted = False
         self._pos = 0
@@ -329,9 +358,14 @@ class RealtimeSession:
         spotter = engines.spotter
         own = "server" if self.endpoint == "desktop" else "endpoint"
         synthesizer = engines.synthesizer
+        responder = services.responder
+        if services.power_gate is not None:
+            responder = PowerGatedResponder(
+                responder, services.power_gate, services.capability_only
+            )
         return services.controller_factory(
             session_id=self.session_id,
-            responder=services.responder,
+            responder=responder,
             outbound=self,
             host=self,
             placement=services.placement,
@@ -350,8 +384,22 @@ class RealtimeSession:
             playback_config=settings.playback,
             turn_config=settings.turn,
             barge_in_config=settings.barge_in,
-            power_level=services.power_level,
+            alarm_ringing=services.alarm_ringing,
+            power_level=self.power_level,
         )
+
+    def power_level(self) -> PowerLevel:
+        """The level shown in `voice_state` and `turn_metrics`: the gate's, else the services'."""
+        gate = self._services.power_gate
+        return gate.level() if gate is not None else self._services.power_level()
+
+    def _voice_blocked(self) -> bool:
+        """The tier has no provider and voice may not take spoken commands (D2 item 4)."""
+        gate = self._services.power_gate
+        if gate is None or gate.model_available():
+            return False
+        statuses = self._services.engines.statuses
+        return not gate.spoken_commands_allowed(_on_cpu(statuses.stt), _on_cpu(statuses.tts))
 
     @property
     def controller(self) -> TurnController:
@@ -419,6 +467,8 @@ class RealtimeSession:
                 await sender
         if self._activity_check is not None:
             self._activity_check.cancel()
+        if self._power_check is not None:
+            self._power_check.cancel()
         self._host.session_closed(self)
         if self._close_code is not None:
             await self._socket.close(self._close_code)
@@ -550,7 +600,85 @@ class RealtimeSession:
             self._host.voice_activity_changed(self)
 
     def _emit(self, event: object) -> None:
+        if not self._power_admits(event):
+            return
         self._controller.post(event)  # type: ignore[arg-type]
+        self._schedule_activity_check()
+
+    def _power_admits(self, event: object) -> bool:
+        """Whether an ingress event may reach the controller at the current power.
+
+        Without a model no turn starts speculatively, so an `EndpointCandidate` is dropped: a
+        held turn would run the capability path, which acts on the world, before its utterance
+        is known to have ended. While voice is blocked an ended utterance closes with `dropped
+        power_off` instead of opening a turn, and the session stops voice on the next step,
+        outside the ingress callback that emitted the event.
+        """
+        gate = self._services.power_gate
+        if gate is None or gate.model_available():
+            return True
+        if isinstance(event, EndpointCandidate):
+            return False
+        if not self._voice_blocked():
+            return True
+        self._schedule_power_check()
+        if isinstance(event, UtteranceEnded):
+            self._controller.post(
+                UtteranceDropped(
+                    epoch=event.epoch,
+                    event_seq=event.event_seq,
+                    utterance_id=event.utterance_id,
+                    first_pos=event.first_pos,
+                    reason="power_off",  # type: ignore[arg-type]
+                    text=event.text,
+                    duration_ms=event.duration_ms,
+                    no_speech_prob=event.no_speech_prob,
+                    avg_logprob=event.avg_logprob,
+                )
+            )
+            return False
+        return True
+
+    # -- Power ---------------------------------------------------------------------------------
+
+    def _schedule_power_check(self) -> None:
+        if self._power_check is None:
+            loop = asyncio.get_running_loop()
+            self._power_check = loop.call_soon(self._apply_power)
+
+    def _apply_power(self) -> None:
+        """Stop voice the power blocks, keeping its `voice_start`; restart it once it does not."""
+        self._power_check = None
+        if self._services.power_gate is None or self._closing.is_set():
+            return
+        blocked = self._voice_blocked()
+        if blocked and self._voice is not None:
+            self._suspend_voice()
+        elif (
+            not blocked
+            and self._voice is None
+            and self._kept is not None
+            and self._refusal(self._kept) is None
+        ):
+            settings, self._kept = self._kept, None
+            self._controller.post(self._start_voice(settings, seed=None))
+
+    def _suspend_voice(self) -> None:
+        """Close ingress, its open utterance with `dropped power_off`, then stop the controller.
+
+        The drop is posted before `VoiceStop`, so the controller closes the utterance with the
+        power's reason, and the stop then finds nothing open. The settings are kept, so the
+        rise restarts voice with no new `voice_start` from the client.
+        """
+        voice, self._voice = self._voice, None
+        assert voice is not None  # noqa: S101 - the caller checked it
+        self._kept = voice.settings
+        drop = voice.ingress.close()
+        if drop is not None:
+            # `power_off` is a wire reason that ingress's `DropReason` does not list yet.
+            power_drop = dataclasses.replace(drop, reason="power_off")  # type: ignore[arg-type]
+            self._controller.post(power_drop)
+        self._controller.post(VoiceStop())
         self._schedule_activity_check()
 
     # -- Receive -------------------------------------------------------------------------------
@@ -666,6 +794,8 @@ class RealtimeSession:
     # -- Voice start, stop and mute ----------------------------------------------------------
 
     def _refusal(self, settings: VoiceStartMessage) -> str | None:
+        if self._voice_blocked():
+            return "power_off"
         engines = self._services.engines
         if engines.vad is None or engines.transcriber is None:
             return "vad unavailable"
@@ -693,6 +823,7 @@ class RealtimeSession:
                 return
             changed = settings.muted != self._muted
             self._muted = settings.muted
+            self._kept = None
             start = self._start_voice(settings, seed=None)
             self._answer_now(_Answer(req=settings.req), None)
             self._controller.post(start)
@@ -741,6 +872,7 @@ class RealtimeSession:
         return VoiceStart(ingress=ingress, policy=policy, settings=settings, epoch=self._epoch)
 
     def _on_voice_stop(self) -> None:
+        self._kept = None
         if self._voice is None:
             return
         self._voice = None
@@ -804,11 +936,21 @@ class RealtimeSession:
         req: int | None = None,
         refused: str | None = None,
     ) -> VoiceStateMessage:
-        """This session's `voice_state`, composed now."""
+        """This session's `voice_state`, composed now.
+
+        A broadcast to a session whose voice the power stopped says `refused: power_off`.
+        """
         settings = self._settings
         engines = self._services.engines
         voice = self._voice
         playback = settings.playback
+        if (
+            cause == "broadcast"
+            and voice is None
+            and self._kept is not None
+            and self._voice_blocked()
+        ):
+            refused = "power_off"
         return VoiceStateMessage(
             cause=cause,
             req=req,
@@ -830,11 +972,16 @@ class RealtimeSession:
             engines=engines.statuses,
             tts_voice=tts_voice_of(engines, settings),
             vram_budget_mib=settings.placement.vram_budget_mib,
-            power_level=self._services.power_level(),
+            power_level=self.power_level(),
             muted=self._muted,
             refused=refused,
         )
 
     def send_voice_state(self) -> None:
-        """Send this session a broadcast `voice_state`, on the `control` lane."""
+        """Apply the power to voice, then send this session a broadcast `voice_state`.
+
+        The registry sends one after every power level or engine change, so this is where a
+        session stops voice the power blocks and restarts it from its kept `voice_start`.
+        """
+        self._apply_power()
         self.send_control(self.voice_state("broadcast"))
