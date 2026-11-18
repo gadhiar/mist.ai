@@ -12,9 +12,12 @@
 // does) and counted the same way, so a torn frame is never returned.
 //
 // Samples are stored two to a `std::atomic<uint32_t>` word with relaxed loads and stores, so the
-// concurrent copy is free of data races in the C++ memory model; on the ESP32-S3 and on x86 these
-// compile to plain 32-bit loads and stores. Frame counters run modulo a multiple of the capacity
-// below 2^31, so they wrap without a 64-bit atomic (which the ESP32-S3 lacks).
+// concurrent copy is free of data races in the C++ memory model. The ring needs atomic 32-bit
+// words, not lock-free ones. On the host they are lock-free. On the ESP32-S3 with PSRAM, ESP-IDF
+// 5.5.6 enables CONFIG_STDATOMIC_S32C1I_SPIRAM_WORKAROUND, and newlib/project_include.cmake then
+// adds -mdisable-hardware-atomics, so these atomics become libatomic calls and
+// `is_always_lock_free` is false. Frame counters run modulo a multiple of the capacity below 2^31, so they wrap without
+// a 64-bit atomic (which the ESP32-S3 lacks).
 
 #pragma once
 
@@ -40,8 +43,9 @@ class PcmRing {
 
   // `storage` must be 4-byte aligned and hold at least two frame slots; it must outlive the ring.
   PcmRing(void* storage, size_t bytes) {
-    static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "packed sample words");
-    static_assert(std::atomic<uint32_t>::is_always_lock_free, "lock-free sample words");
+    // Atomic, not necessarily lock-free: on PSRAM targets the words go through libatomic.
+    static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t),
+                  "the ring stores samples two to an atomic 32-bit word");
     const bool aligned = reinterpret_cast<uintptr_t>(storage) % alignof(std::atomic<uint32_t>) == 0;
     const size_t slots = bytes / kFrameBytes;
     if (storage == nullptr || !aligned || slots < 2 || slots > 0x7FFFFFFFu) return;
