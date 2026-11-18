@@ -121,7 +121,7 @@ It will report 0 files. That is expected for a fresh `smoke-state`.
 
 `MIST_SMOKE_SCHEDULER` is unset, which resolves
 `MIST_CURATION_SCHEDULER_ENABLED` to the literal `0`
-(`docker-compose.live-path-smoke.yml:321`). The scheduler is off on purpose for
+(`docker-compose.live-path-smoke.yml:331`). The scheduler is off on purpose for
 the conversation; Step 5 turns it on. Why that ordering is load-bearing is
 explained there.
 
@@ -130,9 +130,10 @@ Every command in this runbook names its services explicitly. A bare
 **including the live services**.
 
 Wait for the backend to become healthy. Its healthcheck has a 120-second start
-period (`docker-compose.live-path-smoke.yml:370`), and Whisper still loads even
-with TTS off (`backend/voice_models/model_manager.py:119-120`), so allow a
-couple of minutes:
+period (`docker-compose.live-path-smoke.yml:381`), and the backend builds its
+runtime and warms its models before it serves a connection, so allow a couple
+of minutes. Both speech chains are off in this stack (`MIST_VOICE_STT_CHAIN=off`,
+`MIST_VOICE_TTS_CHAIN=off`), so no speech engine loads:
 
     docker ps --filter name=mist-backend-smoke --format "{{.Names}} {{.Status}}"
 
@@ -305,7 +306,7 @@ Two files because there are two streams at two levels:
   (`backend/chat/conversation_handler.py:1962` and `:1970`), which never reach
   the console.
 
-`docker-compose.live-path-smoke.yml:324-330` deliberately bind-mounts no
+`docker-compose.live-path-smoke.yml:333-342` deliberately bind-mounts no
 `/app/logs`, so the file log lives in the container's writable layer. Step 6
 replaces that container with `--force-recreate`, and both logs go with it. If
 you skip this step, A2 and A3 degrade from decidable to INCONCLUSIVE for this
@@ -471,19 +472,20 @@ State this plainly in any report of the result. The run exercises the TEXT path
 only, and the following are untested by it:
 
 - **The Tauri frontend's own message construction.** The driver sends
-  `{"type": "text", "text": ...}` because that is what
-  `backend/server.py:856-858` reads. Whether the shipped frontend sends exactly
+  `{"type": "text", "text": ...}` because that is the protocol's
+  `TextMessage` (`backend/realtime/protocol.py:398-402`). Whether the shipped frontend sends exactly
   that, and nothing else that matters, is not established here.
 - **The Tauri shell**: its WebSocket lifecycle, reconnection, and anything it
   does around the connection.
 - **Anything the real frontend sends that this script does not** -- `interrupt`,
-  `reset_vad`, `log_config`, `subscribe_logs`, and the binary audio frames are
-  all in the endpoint's contract (`backend/server.py:747-758`) and none is
-  exercised.
-- **Whisper and VAD**, and everything above `voice_processor.py:483`
-  `_process_conversation_turn`. The text and voice paths converge at that
-  function; this run enters below the convergence point, so the whole
-  audio-ingest half is untested.
+  `voice_start`, `voice_stop`, `wake`, `barge_in`, the playback reports,
+  `log_config`, `subscribe_logs`, and the binary audio frames are all in the
+  protocol (`RealtimeSession._dispatch`, `backend/realtime/session.py`) and
+  none is exercised.
+- **The voice path**: VAD, speech-to-text, end-of-turn, the name spotter and
+  speech synthesis. Both speech chains are off in this stack, and a typed turn
+  enters the `TurnController` through `_on_text` and is never spoken, so the
+  whole audio half is untested.
 
 On voice specifically: the brief that commissioned this instrument states that
 the shipped frontend cannot capture audio at all, there being no `getUserMedia`

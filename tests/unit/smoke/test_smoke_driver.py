@@ -64,7 +64,7 @@ def test_every_shipped_turn_clears_the_three_word_extraction_floor():
 
 
 def test_load_turn_plan_rejects_an_empty_utterance(tmp_path):
-    """An empty text would be skipped by `continue` at `backend/server.py:859`."""
+    """An empty text would open a turn with an empty utterance (`TextMessage`, protocol 2)."""
     corpus = tmp_path / "turns.json"
     corpus.write_text(json.dumps({"turns": [{"index": 1, "text": "   "}]}), encoding="utf-8")
 
@@ -91,7 +91,7 @@ def test_load_turn_plan_reports_a_missing_file_by_name(tmp_path):
 
 
 def test_text_frame_has_exactly_the_two_keys_the_server_reads():
-    """`backend/server.py:856-858` reads `type` and `text` and nothing else."""
+    """`TextMessage` (`backend/realtime/protocol.py:398-402`) has `type` and `text` only."""
     frame = dt.build_text_frame("My name is Dana Whitfield.")
 
     assert frame == {"type": "text", "text": "My name is Dana Whitfield."}
@@ -142,7 +142,17 @@ def _spec(index: int = 1, text: str = "Hello there friend.") -> dt.TurnSpec:
     return dt.TurnSpec(index=index, text=text, purpose="extraction-target")
 
 
-#: Recorded from `backend/voice_processor.py:661-673`.
+#: A typed turn's opener: `TurnController._open_turn` (`backend/realtime/turn.py:2622-2628`)
+#: builds `StreamStartMessage`, and `_channel_for` (`turn.py:2510-2520`) gives a turn whose
+#: origin is not `voice` the `text` channel, so `audio_tag` is absent.
+STREAM_START = {
+    "type": "stream_start",
+    "turn_id": "aaaa-1111",
+    "channel": "text",
+    "origin": "text",
+}
+
+#: Built by `_send_complete` (`backend/realtime/turn.py:2916-2930`).
 STREAM_COMPLETE = {
     "type": "stream_complete",
     "turn_id": "aaaa-1111",
@@ -151,42 +161,69 @@ STREAM_COMPLETE = {
     "tool_calls_used": 0,
 }
 
-#: Recorded from `backend/voice_processor.py:642-653`.
+#: Built by `_cut` (`backend/realtime/turn.py:3271-3279`); `spoken_text` is null for a
+#: `text`-channel turn (`StreamCancelledMessage`, `backend/realtime/protocol.py:1139`).
 STREAM_CANCELLED = {
     "type": "stream_cancelled",
     "turn_id": "aaaa-1111",
     "partial_text": "Noted, Da",
+    "reason": "new_input",
+    "spoken_text": None,
 }
 
-#: Recorded from `backend/voice_processor.py:627-640`.
-TURN_ERROR = {
-    "type": "error",
-    "kind": "bridge_timeout",
-    "message": "knowledge bridge timed out",
-    "retriable": True,
-    "context": {"turn_id": "aaaa-1111"},
+#: A failed generation: `_send_degraded(turn, "turn_error")` (`backend/realtime/turn.py:2943`),
+#: then `stream_complete`, then `turn_metrics` with outcome `error`.
+TURN_ERROR_DECISION = {
+    "type": "voice_decision",
+    "kind": "degraded",
+    "turn_id": "aaaa-1111",
+    "reason": "turn_error",
+    "detail": {"engine": None, "error": None, "voiced_text": None, "text_from_token": None},
 }
 
-#: Recorded from `backend/server.py:808-816`. Connection-level, NOT a turn
-#: terminal: its `context` is None.
+#: Built by `RealtimeSession._protocol_error` (`backend/realtime/session.py:707-720`) when a
+#: client message fails to parse. Session-level: it names a field, never a turn.
 PROTOCOL_ERROR = {
     "type": "error",
-    "kind": "validation",
-    "message": "Missing 'type' field",
+    "kind": "protocol",
+    "message": "text: field required",
     "retriable": False,
-    "context": None,
+    "context": {"field": "text"},
 }
 
 
-def test_happy_path_turn_yields_stream_complete_with_its_fields():
+def _metrics(
+    outcome: str = "completed", recorded: bool = True, turn_id: str = "aaaa-1111"
+) -> dict[str, object]:
+    """The fields of `TurnMetricsMessage` (`backend/realtime/protocol.py:1090`) the driver reads."""
+    return {
+        "type": "turn_metrics",
+        "turn_id": turn_id,
+        "origin": "text",
+        "channel": "text",
+        "kind": "plain",
+        "outcome": outcome,
+        "recorded": recorded,
+    }
+
+
+def _run(recorder: dt.TurnRecorder, *frames: dict[str, object]) -> list[object]:
+    return [recorder.consume(frame, now=float(n + 1)) for n, frame in enumerate(frames)]
+
+
+def test_happy_path_turn_ends_at_turn_metrics_with_its_fields():
     recorder = dt.TurnRecorder(_spec(), started_at=100.0)
 
-    assert recorder.consume({"type": "stream_start", "turn_id": "aaaa-1111"}) is None
+    assert recorder.consume(STREAM_START) is None
     assert recorder.consume({"type": "stream_token", "turn_id": "aaaa-1111", "token": "No"}) is None
     assert (
         recorder.consume({"type": "stream_token", "turn_id": "aaaa-1111", "token": "ted"}) is None
     )
-    outcome = recorder.consume(STREAM_COMPLETE, now=104.5)
+    assert recorder.consume(STREAM_COMPLETE) is None
+    assert (
+        recorder.consume({"type": "state_cycle", "state": "idle", "turn_id": "aaaa-1111"}) is None
+    )
+    outcome = recorder.consume(_metrics(), now=104.5)
 
     assert outcome is not None
     assert outcome.terminal_type == "stream_complete"
@@ -197,87 +234,172 @@ def test_happy_path_turn_yields_stream_complete_with_its_fields():
     assert outcome.tool_calls_used == 0
     assert outcome.token_count == 2
     assert outcome.elapsed_s == pytest.approx(4.5)
+    assert outcome.origin == "text"
+    assert outcome.channel == "text"
+    assert outcome.audio_tag is None
+    assert outcome.stream_start_problems == ()
+    assert outcome.outcome == "completed"
+    assert outcome.recorded is True
+    assert outcome.error_kind is None
+    assert outcome.foreign_frames == 0
     assert recorder.streamed_text == "Noted"
 
 
-def test_cancelled_turn_reports_partial_text_as_its_text():
-    recorder = dt.TurnRecorder(_spec(), started_at=0.0)
-    recorder.consume({"type": "stream_start", "turn_id": "aaaa-1111"})
+def test_stream_complete_alone_does_not_end_the_turn():
+    """The turn commits after `stream_complete`; a text sent before `turn_metrics` cuts it.
 
-    outcome = recorder.consume(STREAM_CANCELLED, now=1.0)
+    `TurnController._on_text` (`backend/realtime/turn.py:2167-2182`) cuts a turn still held in
+    `self._turn` with reason `new_input`, and `_finish` (`turn.py:3370`) clears it only after
+    `_complete` has committed and sent `turn_metrics` (`turn.py:3088-3093`).
+    """
+    recorder = dt.TurnRecorder(_spec(), started_at=0.0)
+
+    assert _run(recorder, STREAM_START, STREAM_COMPLETE) == [None, None]
+
+
+def test_cancelled_turn_reports_partial_text_and_reason():
+    recorder = dt.TurnRecorder(_spec(), started_at=0.0)
+
+    *_, outcome = _run(
+        recorder, STREAM_START, STREAM_CANCELLED, _metrics("interrupted", recorded=True)
+    )
 
     assert outcome is not None
     assert outcome.terminal_type == "stream_cancelled"
     assert outcome.text == "Noted, Da"
+    assert outcome.cancel_reason == "new_input"
     assert outcome.turn_id_matched is True
     assert outcome.duration_ms is None
+    assert outcome.outcome == "interrupted"
 
 
-def test_turn_error_reports_message_and_kind_and_matches_its_turn_id():
+def test_failed_turn_is_an_error_terminal_carrying_its_degraded_reason():
     recorder = dt.TurnRecorder(_spec(), started_at=0.0)
-    recorder.consume({"type": "stream_start", "turn_id": "aaaa-1111"})
 
-    outcome = recorder.consume(TURN_ERROR, now=2.0)
+    *_, outcome = _run(
+        recorder,
+        STREAM_START,
+        TURN_ERROR_DECISION,
+        STREAM_COMPLETE,
+        _metrics("error", recorded=False),
+    )
 
     assert outcome is not None
     assert outcome.terminal_type == "error"
-    assert outcome.error_kind == "bridge_timeout"
-    assert outcome.text == "knowledge bridge timed out"
+    assert outcome.error_kind == "turn_error"
+    assert outcome.text == "Noted, Dana. You work at Corvid Analytics."
     assert outcome.turn_id == "aaaa-1111"
     assert outcome.turn_id_matched is True
+    assert outcome.outcome == "error"
+    assert outcome.recorded is False
 
 
-def test_protocol_error_terminates_the_turn_but_does_not_match_its_id():
-    """`backend/server.py:808-816` builds this with `context: None`.
-
-    It is not this turn's terminal, but it must still end the wait -- otherwise
-    the driver sits on its per-turn timeout for a turn the server has already
-    given up on.
-    """
+def test_an_error_before_stream_start_ends_the_wait_unmatched():
+    """A rejected text opens no turn, so the session-level error is all that will arrive."""
     recorder = dt.TurnRecorder(_spec(), started_at=0.0)
-    recorder.consume({"type": "stream_start", "turn_id": "aaaa-1111"})
 
     outcome = recorder.consume(PROTOCOL_ERROR, now=0.5)
 
     assert outcome is not None
     assert outcome.terminal_type == "error"
+    assert outcome.error_kind == "protocol"
+    assert outcome.text == "text: field required"
     assert outcome.turn_id is None
     assert outcome.turn_id_matched is False
+    assert outcome.outcome is None
+    assert outcome.recorded is None
+
+
+def test_an_error_after_stream_start_is_recorded_without_ending_the_turn():
+    recorder = dt.TurnRecorder(_spec(), started_at=0.0)
+
+    *head, outcome = _run(recorder, STREAM_START, PROTOCOL_ERROR, STREAM_COMPLETE, _metrics())
+
+    assert head == [None, None, None]
+    assert outcome is not None
+    assert outcome.terminal_type == "stream_complete"
+    assert outcome.session_error_kinds == ("protocol",)
+
+
+def test_turn_metrics_for_another_turn_does_not_end_this_one():
+    recorder = dt.TurnRecorder(_spec(), started_at=0.0)
+
+    results = _run(recorder, STREAM_START, _metrics(turn_id="bbbb-2222"), STREAM_COMPLETE)
+
+    assert results == [None, None, None]
+    assert recorder.consume(_metrics(), now=9.0) is not None
+
+
+def test_frames_naming_another_turn_are_counted_as_foreign():
+    """Turn frames are routed to their own session's socket, so another turn id is a defect."""
+    recorder = dt.TurnRecorder(_spec(), started_at=0.0)
+
+    *_, outcome = _run(
+        recorder,
+        STREAM_START,
+        {"type": "stream_token", "turn_id": "bbbb-2222", "token": "x"},
+        STREAM_COMPLETE,
+        _metrics(),
+    )
+
+    assert outcome is not None
+    assert outcome.foreign_frames == 1
+    assert outcome.token_count == 0
+
+
+@pytest.mark.parametrize(
+    ("override", "fragment"),
+    [
+        ({"origin": "voice"}, "origin 'voice'"),
+        ({"channel": "tts"}, "channel 'tts'"),
+        ({"audio_tag": 3}, "audio_tag 3"),
+    ],
+)
+def test_stream_start_problems_name_each_unexpected_field(override, fragment):
+    problems = dt.stream_start_problems({**STREAM_START, **override})
+
+    assert len(problems) == 1
+    assert fragment in problems[0]
+
+
+def test_a_typed_turns_stream_start_has_no_problems():
+    assert dt.stream_start_problems(STREAM_START) == ()
 
 
 def test_non_terminal_frames_do_not_end_the_turn():
-    """`state_cycle` idle is emitted with TTS off at `backend/voice_processor.py:696-698`."""
     recorder = dt.TurnRecorder(_spec(), started_at=0.0)
 
     for frame in (
-        {"type": "state_cycle", "state": "think"},
+        {"type": "state_cycle", "state": "think", "turn_id": "aaaa-1111"},
         {"type": "heartbeat"},
-        {"type": "transcription", "text": "x"},
         {"type": "tool_call_started", "name": "vault_search"},
         {"type": "state_cycle", "state": "idle"},
+        STREAM_COMPLETE,
+        STREAM_CANCELLED,
     ):
         assert recorder.consume(frame) is None
 
 
-def test_feeding_a_recorder_after_its_terminal_raises():
+def test_feeding_a_recorder_after_its_turn_ended_raises():
     recorder = dt.TurnRecorder(_spec(), started_at=0.0)
-    recorder.consume(STREAM_COMPLETE, now=1.0)
+    _run(recorder, STREAM_START, STREAM_COMPLETE, _metrics())
 
     with pytest.raises(RuntimeError, match="already terminated"):
-        recorder.consume(STREAM_CANCELLED, now=2.0)
+        recorder.consume(STREAM_CANCELLED, now=9.0)
 
 
-def test_terminal_turn_id_reads_the_nested_field_only_for_errors():
+def test_terminal_turn_id_reads_the_top_level_field_and_never_an_errors():
     assert dt.terminal_turn_id(STREAM_COMPLETE) == "aaaa-1111"
     assert dt.terminal_turn_id(STREAM_CANCELLED) == "aaaa-1111"
-    assert dt.terminal_turn_id(TURN_ERROR) == "aaaa-1111"
     assert dt.terminal_turn_id(PROTOCOL_ERROR) is None
 
 
 def test_summarise_outcomes_reports_zero_for_absent_terminal_types():
+    complete = dt.TurnRecorder(_spec(1), started_at=0.0)
+    failed = dt.TurnRecorder(_spec(2), started_at=0.0)
     outcomes = [
-        dt.TurnRecorder(_spec(1), started_at=0.0).consume(STREAM_COMPLETE, now=1.0),
-        dt.TurnRecorder(_spec(2), started_at=0.0).consume(TURN_ERROR, now=1.0),
+        _run(complete, STREAM_START, STREAM_COMPLETE, _metrics())[-1],
+        _run(failed, STREAM_START, TURN_ERROR_DECISION, STREAM_COMPLETE, _metrics("error"))[-1],
     ]
 
     counts = dt.summarise_outcomes([o for o in outcomes if o is not None])
@@ -324,11 +446,12 @@ def test_guard_message_names_the_variable_the_operator_must_set():
     message = dt._guard_message("ws://localhost:8003/ws", "not a recognized endpoint")
 
     assert "MIST_DEV_WS_HOSTS=localhost:8003,127.0.0.1:8003" in message
-    assert "eval_isolation.py:308" in message
+    assert "assert_ws_target_not_live" in message
+    assert "eval_isolation.py" in message
 
 
 def test_guard_refuses_the_live_backend_and_admits_the_smoke_port(monkeypatch):
-    """The denylist arm is at `backend/knowledge/eval_isolation.py:120-126`."""
+    """The denylist arm is `LIVE_WS_ENDPOINTS` in `backend/knowledge/eval_isolation.py`."""
     monkeypatch.setenv("MIST_DEV_WS_HOSTS", "localhost:8003,127.0.0.1:8003")
 
     with pytest.raises(SystemExit) as refusal:
@@ -339,7 +462,7 @@ def test_guard_refuses_the_live_backend_and_admits_the_smoke_port(monkeypatch):
 
 
 def test_guard_refuses_the_smoke_port_when_the_allowlist_is_not_widened(monkeypatch):
-    """`DEFAULT_DEV_WS_ENDPOINTS` (`eval_isolation.py:79`) names port 8002, not 8003."""
+    """`DEFAULT_DEV_WS_ENDPOINTS` (`eval_isolation.py`) names port 8002, not 8003."""
     monkeypatch.delenv("MIST_DEV_WS_HOSTS", raising=False)
 
     with pytest.raises(SystemExit) as refusal:
@@ -1135,7 +1258,7 @@ def test_a3_fails_on_a_clean_close_with_no_note_and_no_declining_line():
 
     assert verdict.status == aa.FAIL
     joined = " ".join(verdict.evidence)
-    assert "backend/server.py:1015" in joined
+    assert "_end_handler_session" in joined
     assert "Session note write failed" in joined
 
 
