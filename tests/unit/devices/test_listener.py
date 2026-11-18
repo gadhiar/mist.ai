@@ -183,12 +183,27 @@ class RecordingServe:
         self.ended.append(name)
 
 
+class LingeringServe(RecordingServe):
+    """A serve that outlives its disconnect until `release` is set, as committing a turn does.
+
+    It holds a replacing connection in the listener's wait for the session it replaces.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def __call__(self, socket: DeviceSocket, name: str, kind: str) -> None:
+        await super().__call__(socket, name, kind)
+        await self.release.wait()
+
+
 class Rig:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, serve: RecordingServe | None = None) -> None:
         self.path = path
         self.clock = FakeClock()
         self.limiter = AuthLimiter(self.clock)
-        self.serve = RecordingServe()
+        self.serve = serve if serve is not None else RecordingServe()
         self.registry = DeviceRegistry.load(path)
         self.app = build_device_app(self.registry, self.serve, self.limiter, self.clock)
         self.devices: list[AsgiDevice] = []
@@ -220,10 +235,7 @@ def registry_path(tmp_path) -> Path:
     return path
 
 
-@pytest_asyncio.fixture
-async def rig(registry_path):
-    built = Rig(registry_path)
-    yield built
+async def disconnect_all(built: Rig) -> None:
     for device in built.devices:
         if not device.task.done():
             device.leave()
@@ -231,6 +243,22 @@ async def rig(registry_path):
     for device in built.devices:
         if not device.task.done():
             device.task.cancel()
+
+
+@pytest_asyncio.fixture
+async def rig(registry_path):
+    built = Rig(registry_path)
+    yield built
+    await disconnect_all(built)
+
+
+@pytest_asyncio.fixture
+async def lingering_rig(registry_path):
+    serve = LingeringServe()
+    built = Rig(registry_path, serve)
+    yield built
+    serve.release.set()
+    await disconnect_all(built)
 
 
 def failures(caplog) -> list[str]:
@@ -661,6 +689,32 @@ class TestAcceptRace:
         assert late.closed_with == CLOSE_REVOKED
         assert new.closed_with is None
         assert rig.app.connected() == ["example-room"]
+        assert closures(caplog) == [
+            ("WARNING", "device_revoked_closed device=example-room reason=rotated")
+        ]
+
+    async def test_a_connection_ended_during_the_replace_wait_is_never_served(
+        self, lingering_rig, caplog
+    ):
+        rig = lingering_rig
+        first = await rig.connect(f"Bearer {ROOM}")
+        with caplog.at_level(logging.INFO, logger=LISTENER_LOGGER):
+            second = await rig.connect(f"Bearer {ROOM}")
+            # The first session still commits its turn, so the second waits to replace it.
+            assert first.closed_with is None and not second.task.done()
+
+            write_registry(rig.path, rotated_registry())
+            await rig.clock.advance(REVOCATION_POLL_S)
+            rig.serve.release.set()
+            await first.ended()
+            await second.ended()
+
+        assert first.closed_with == CLOSE_REPLACED
+        assert second.closed_with == CLOSE_REVOKED
+        assert rig.serve.calls == [("example-room", "room")]
+        assert second.texts() == []
+        assert rig.app.connected() == []
+        assert caplog.text.count("device_connected device=example-room") == 0
         assert closures(caplog) == [
             ("WARNING", "device_revoked_closed device=example-room reason=rotated")
         ]
