@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The Voice PE hardware: board, PSRAM, the XMOS front end, the I2S buses, microphone and speaker
+# chain, Wi-Fi, OTA, SNTP and the wake models. Adapted from the published Voice PE config
+# (esphome/home-assistant-voice-pe, home-assistant-voice.yaml at 2644f4c, MIT), with its stock
+# wake models, wake word select, assistant pipeline and native API removed.
+#
+# Substitutions come from the top-level config (`room.yaml` or `spike.yaml`); secrets come from
+# the `secrets.yaml` that `scripts/daily/devices.py add` writes beside the private YAML.
+
+esphome:
+  name: ${device_name}
+  min_version: 2026.10.2
+  on_boot:
+    priority: -100
+    then:
+      - micro_wake_word.start:
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  cpu_frequency: 240MHz
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      # Instructions and read-only data run from PSRAM, so a flash write does not stall the
+      # wake models.
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      # TLS buffers in PSRAM, and TLS 1.3, for the link to MIST.
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false
+
+external_components:
+  - source:
+      type: local
+      path: ${voice_kit_path}
+    components: [voice_kit]
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+ota:
+  - platform: esphome
+    password: !secret mist_ota_password
+
+time:
+  - platform: sntp
+    id: sntp_time
+    # Alarms carry aware times; the device keeps UTC.
+    timezone: UTC
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+
+voice_kit:
+  id: voice_kit_component
+  i2c_id: internal_i2c
+  reset_pin: GPIO4
+  firmware:
+    url: ${xmos_firmware}
+    version: "1.3.1"
+    md5: 964635c5bf125529dab14a2472a15401
+
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+    i2s_bclk_pin:
+      number: GPIO8
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO14
+    i2s_bclk_pin:
+      number: GPIO13
+
+# Channel 0 is the XMOS chain through AGC, channel 1 through noise suppression.
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_din_pin: GPIO15
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+
+audio_dac:
+  - platform: aic3204
+    id: aic3204_dac
+    i2c_id: internal_i2c
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO10
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+    audio_dac: aic3204_dac
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: reply_mixing_input
+        timeout: never
+      - id: alarm_mixing_input
+        timeout: never
+  # MIST's replies arrive as 24 kHz PCM16; the mixer runs at 48 kHz.
+  - platform: resampler
+    id: reply_resampling_speaker
+    output_speaker: reply_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: alarm_resampling_speaker
+    output_speaker: alarm_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+# The wake models read channel 1 at gain 4, as the stock config's do. `mist_wake` is the name
+# model (the spike build's stand-in is `stop`); `stop` cuts her off while she speaks.
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: i2s_mics
+    channels: 1
+    gain_factor: 4
+  stop_after_detection: false
+  models:
+    - model: ${wake_model}
+      id: mist_wake
+    - model: ${stop_model}
+      id: stop
+  vad:
+    model: ${vad_model}
