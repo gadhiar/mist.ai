@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Removes the Windows sign-in tasks "MIST daily instance" and "MIST gaming watch", for a
-    rollback.
+    Removes the Windows tasks "MIST daily instance", "MIST gaming watch" and
+    "MIST extraction window", for a rollback.
 
 .DESCRIPTION
     Run it as:
@@ -10,7 +10,8 @@
 
     It removes the tasks that register-signin-task.ps1 registered, each only if it is
     registered, and nothing else. It does not stop the instance: `instance.py down --root
-    <root>` does that. A watcher already running keeps running until sign-out.
+    <root>` does that, and `instance.py extraction off --root <root>` stops the extraction
+    services. A watcher already running keeps running until sign-out.
 #>
 [CmdletBinding()]
 param()
@@ -34,4 +35,13 @@ if ($null -eq $WatchTask) {
 else {
     Unregister-ScheduledTask -TaskName 'MIST gaming watch' -Confirm:$false
     Write-Output "Removed the task 'MIST gaming watch'."
+}
+
+$NightTask = Get-ScheduledTask -TaskName 'MIST extraction window' -ErrorAction SilentlyContinue
+if ($null -eq $NightTask) {
+    Write-Output "No task named 'MIST extraction window' is registered."
+}
+else {
+    Unregister-ScheduledTask -TaskName 'MIST extraction window' -Confirm:$false
+    Write-Output "Removed the task 'MIST extraction window'."
 }

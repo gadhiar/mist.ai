@@ -50,7 +50,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
     - `score_runs.py` - Scores raw runs with a pinned checkout's scorer and classifier: exact and aligned figures, paired lines, the worksheet and pending pairs
     - `adjudicated.py` - Checks an adjudicated worksheet, prints the corrected figures, and checks the aligner's credits against the adjudicated classes
 - `daily/` - The daily instance's host tools
-  - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, backups, restore drill, promote)
+  - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, night extraction, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
   - `gamewatch.py` - The gaming watcher's process lister, game rules and decision
 - `backup/` - Backups of the graph, stores and vault, and their restore
@@ -96,6 +96,7 @@ backend/
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 ├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
 ├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
+├── extraction_hold.py           # Reads the host's extraction-paused marker for /health
 ├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader
 │
 ├── capabilities/                # Tools that act on the world (README.md: adding one)
@@ -262,14 +263,14 @@ root outside every git work tree.
 
 ```
 deploy/daily/
-├── compose.yml                  # The mist-daily compose project (backend, Neo4j, llama-server, backup)
+├── compose.yml                  # The mist-daily compose project (backend, Neo4j, llama-server, backup, night extraction LLM and service)
 ├── daily.env.example            # Template for <root>/daily.env
 ├── README.md                    # Contract, operation and the /health reasons table
 ├── RESTORE.md                   # Restore drill and promotion
 ├── restore-drill.yml            # Drill project: restores a backup into a fresh volume
 └── windows/
-    ├── register-signin-task.ps1    # Sign-in task that starts the instance (-GamingWatch adds the watcher's)
-    └── unregister-signin-task.ps1  # Removes both sign-in tasks, for a rollback
+    ├── register-signin-task.ps1    # Sign-in task that starts the instance (-GamingWatch adds the watcher's, -NightExtraction the extraction window task)
+    └── unregister-signin-task.ps1  # Removes all three sign-in tasks, for a rollback
 ```
 
 ## Dev Instance Fixture (`tests/fixtures/dev-instance/`)

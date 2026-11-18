@@ -24,6 +24,7 @@ and load the model stack.
 """
 
 import asyncio
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,7 @@ from fastapi.testclient import TestClient
 
 from backend import server
 from backend.extraction_contract.models import HealthResponse
+from backend.extraction_hold import EXTRACTION_PAUSED_MARKER
 from backend.gpu_yield import GpuYield
 from backend.health import (
     BroadcasterProbe,
@@ -155,14 +157,21 @@ class FakeIdleDispatcher:
         return extraction_status(None).model_copy(update={"state": "idle"})
 
 
-def build_server_registry(executor, settings: HealthProbeSettings | None = None, yield_state=None):
+def build_server_registry(
+    executor,
+    settings: HealthProbeSettings | None = None,
+    yield_state=None,
+    ops_dir=None,
+    inference=None,
+):
     """`_build_health_registry` with fakes for the extraction service and settings."""
     return server._build_health_registry(
         executor,
         BroadcasterState(),
-        FakeExtractionInference(),
+        inference if inference is not None else FakeExtractionInference(),
         settings if settings is not None else HealthProbeSettings(),
         yield_state=yield_state,
+        ops_dir=ops_dir,
     )
 
 
@@ -703,6 +712,72 @@ async def test_llm_check_reads_down_when_the_reload_failed(executor, tmp_path):
     assert (llm["status"], llm["reason"]) == ("down", "resume_failed")
 
 
+# -- Night extraction paused ---------------------------------------------------
+
+
+def _paused_marker(ops_dir: Path, until: str | None = None) -> Path:
+    marker = ops_dir / EXTRACTION_PAUSED_MARKER
+    marker.write_text(
+        json.dumps({"v": 1, "since": "2026-11-15T10:00:00Z", "reason": "window", "until": until}),
+        encoding="utf-8",
+    )
+    return marker
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_reads_yielded_from_the_yield_state(executor, tmp_path):
+    """The same yield state reaches both GPU-side checks."""
+    gpu = GpuYield(_marked(tmp_path), _noop, _noop, poll_s=2.0)
+    inference = FakeExtractionInference()
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    registry = build_server_registry(executor, yield_state=gpu.state, inference=inference)
+
+    await registry.run_once()
+
+    check = registry.snapshot()["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("yielded", "gpu_yielded")
+    assert inference.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_reads_paused_from_the_ops_dir_marker(executor, tmp_path):
+    marker = _paused_marker(tmp_path)
+    inference = FakeExtractionInference()
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    registry = build_server_registry(executor, ops_dir=str(tmp_path), inference=inference)
+    server._health_registry = registry
+
+    await registry.run_once()
+    payload = await server.health()
+    # Read on every cycle, not captured at build time.
+    marker.unlink()
+    await registry.run_once()
+    resumed = registry.snapshot()["checks"]["extraction_service"]
+
+    check = payload["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+    assert check["consecutive_failures"] == 0
+    assert (resumed["status"], resumed["reason"]) == ("up", "ok")
+    assert inference.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ops_dir", [None, ""])
+async def test_no_ops_dir_reads_no_marker(executor, tmp_path, monkeypatch, ops_dir):
+    """The dev stack: a marker in the working directory is never looked for."""
+    _paused_marker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    inference = FakeExtractionInference()
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    registry = build_server_registry(executor, ops_dir=ops_dir, inference=inference)
+
+    await registry.run_once()
+
+    check = registry.snapshot()["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("up", "ok")
+    assert inference.calls == 1
+
+
 class FakeLifespanVoiceProcessor:
     """What `lifespan` constructs in place of `VoiceProcessor`: no models."""
 
@@ -814,6 +889,41 @@ async def test_lifespan_without_ops_dir_builds_no_gpu_yield(lifespan_harness):
     assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] is None
     # No yield state reaches the probe, so the llm check asks the provider.
     assert (llm["status"], llm["reason"]) == ("down", "unavailable_at_boot")
+
+
+@pytest.mark.asyncio
+async def test_lifespan_without_ops_dir_reads_no_paused_marker(
+    lifespan_harness, monkeypatch, tmp_path
+):
+    """The dev stack: a marker in the working directory is never looked for."""
+    lifespan_harness.configure(tts_enabled=False)
+    _paused_marker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    async with server.lifespan(server.app):
+        await server._health_registry.run_once()
+        check = server._health_registry.snapshot()["checks"]["extraction_service"]
+
+    assert check["status"] != "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tts_enabled", [False, True], ids=["gaming-mode", "tts-on"])
+async def test_lifespan_with_ops_dir_wires_the_paused_marker(
+    lifespan_harness, monkeypatch, tmp_path, tts_enabled
+):
+    """Read from `MIST_OPS_DIR` whether or not gaming mode could be built."""
+    lifespan_harness.configure(tts_enabled=tts_enabled)
+    _paused_marker(tmp_path)
+    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
+
+    async with server.lifespan(server.app):
+        await server._health_registry.run_once()
+        payload = await server.health()
+
+    check = payload["checks"]["extraction_service"]
+    assert (check["status"], check["reason"]) == ("paused", "extraction_paused")
+    assert payload["checks"]["llm"]["status"] != "yielded"
 
 
 @pytest.mark.asyncio

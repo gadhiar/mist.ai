@@ -226,10 +226,10 @@ def degraded_beneath(snapshot: Mapping) -> bool:
 
     A yield outranks `degraded` in `health.derive_status`, so a fault that
     starts while the GPU is yielded would otherwise be invisible in the
-    ledger. "Up" means what it means to `derive_status`: `status` is `up` and
-    the result is not stale, so a null (not measured) or stale check counts
-    as not up, exactly as it would make the system `degraded` without the
-    yield.
+    ledger. "Up" means what it means to `derive_status`: `status` is `up` or
+    `paused` (extraction stopped by its schedule) and the result is not
+    stale, so a null (not measured) or stale check counts as not up, exactly
+    as it would make the system `degraded` without the yield.
 
     Returns:
         False for every snapshot whose status is not `yielded`.
@@ -239,7 +239,7 @@ def degraded_beneath(snapshot: Mapping) -> bool:
     for check in (snapshot.get("checks") or {}).values():
         if check.get("status") == "yielded":
             continue
-        if check.get("status") != "up" or check.get("stale"):
+        if check.get("status") not in ("up", "paused") or check.get("stale"):
             return True
     return False
 

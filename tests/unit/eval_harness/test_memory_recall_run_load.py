@@ -36,13 +36,12 @@ import backend.memory.need_gate as need_gate_module
 import scripts.eval_harness.memory_recall_run as harness
 from backend.memory.config import MemoryConfig
 from backend.memory.models import MemoryRequest
+from backend.memory.need_embedders import NEED_EMBEDDERS, need_embedder_kwargs
 from backend.memory.need_gate import (
-    NEED_EMBEDDERS,
     NeedGate,
     NeedKey,
     load_bank,
     load_models,
-    need_embedder_kwargs,
     need_model_key,
 )
 from backend.memory.retrieval_view import FACT_VIEWS
