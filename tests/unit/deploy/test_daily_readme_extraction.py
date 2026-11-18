@@ -234,7 +234,7 @@ def test_release_lifecycle_rollback_order_for_a_release_without_night_extraction
 # --- Memory limits ----------------------------------------------------------------------------
 
 
-def test_memory_limits_include_the_extraction_services_as_estimates():
+def test_memory_limits_include_the_extraction_services():
     services = yaml.safe_load(_source(COMPOSE_PATH))["services"]
     section = _flat("Memory limits")
     for service in ("mist-extraction-llm", "mist-extraction"):
@@ -243,14 +243,45 @@ def test_memory_limits_include_the_extraction_services_as_estimates():
         assert f"{default.group(1)} `{service}`" in section, service
     assert "The six limits" in section
     assert "The four limits" not in section
-    assert "The extraction services' limits are estimates" in section
-    assert "no measured peak" in section
+
+
+def test_memory_limits_give_the_extraction_llm_its_measured_peak():
+    section = _flat("Memory limits")
+    assert "`mist-extraction-llm`'s 14g has a measured peak of 9.716 GiB" in section
+    assert "`MIST_DAILY_EXTRACTION_NCMOE` 21, which leaves 30.6% of 14g free" in section
+    assert "at most about 11 GiB of expert tensors (all 24 layers' experts on the CPU)" in section
+    assert "The extraction services' limits are estimates" not in section
+    assert "no measured peak yet" not in section
+
+
+def test_memory_limits_keep_the_extraction_service_an_estimate():
+    section = _flat("Memory limits")
+    assert "`mist-extraction`'s 1g is an estimate" in section
+    assert "with no breakdown and no measured peak" in section
+    assert "the first night run never started it" in section
+
+
+def test_workstation_stack_gives_the_two_llama_servers_measured_together():
+    section = _flat("The root docker-compose.yml is the workstation stack")
+    assert "`mist-llm` beside `mist-extraction-llm`" in section
+    assert "at `MIST_DAILY_EXTRACTION_NCMOE` 21: a peak" in section
+    assert "`memory.used` of 10,105 MiB" in section
+    assert "time to first token of at most 0.459 s" in section
+    assert "extraction decode median of 24.74 tokens per second over three trials" in section
 
 
 # --- What is gone ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("phrase", ["extraction host", "default 6 h", "removes both tasks"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "extraction host",
+        "default 6 h",
+        "removes both tasks",
+        "have not been measured together",
+    ],
+)
 def test_no_longer_says(phrase):
     assert phrase not in _text().lower()
 
