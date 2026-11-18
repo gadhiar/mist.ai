@@ -681,10 +681,12 @@ class AudioIngress:
         # The spotter's feed: `_kws_next` is the first frame not yet released to it (None until
         # the stream's start is known), `_kws_waiting` the released frames no job has taken,
         # each with whether it is pushed, and `_kws_reset` a pending reset's `warm_up`.
+        # `_kws_off` is set when the stream could not be opened: nothing more is fed.
         self._kws_stream: NameSpotterStream | None = None
         self._kws_next: int | None = None
         self._kws_waiting: deque[tuple[_Frame, bool]] = deque()
         self._kws_busy = False
+        self._kws_off = False
         self._kws_reset: bool | None = None
         self._kws_generation = 0
         self._kws_overload_reported = False
@@ -1132,7 +1134,7 @@ class AudioIngress:
         frames before `vad_from`, are in the ring though never routed, and are released all
         the same. A position the ring no longer holds is skipped.
         """
-        if self._engines.spotter is None or self._kws_next is None:
+        if self._engines.spotter is None or self._kws_off or self._kws_next is None:
             return
         newest = self._processed_pos
         next_unscored = self._vad_from()
@@ -1178,43 +1180,96 @@ class AudioIngress:
             self._send_overload("kws", dropped * FRAME_MS)
 
     def _start_spotter_job(self) -> None:
-        """Start one job with every waiting frame; at most one runs per session."""
+        """Start one job with every waiting frame; at most one runs per session.
+
+        With no stream yet, the job opens one first on the `kws` lane (`_run_spotter`).
+        """
         spotter = self._engines.spotter
         if spotter is None or self._kws_busy or self._closed or not self._kws_waiting:
             return
-        if self._kws_stream is None:
-            # A new stream is a fresh context, so a reset asked for before it adds nothing.
-            self._kws_stream = spotter.open_stream(self._wake.kws_threshold)
-            self._kws_reset = None
         frames = tuple((item.payload, item.pos, push) for item, push in self._kws_waiting)
         self._kws_waiting.clear()
         reset, self._kws_reset = self._kws_reset, None
+        stream = self._kws_stream
+        if stream is None:
+            # A new stream is a fresh context, so a reset asked for before it adds nothing.
+            reset = None
         self._kws_busy = True
-        self._spawn(self._run_spotter(self._kws_stream, frames, reset, self._kws_generation))
+        self._spawn(self._run_spotter(stream, frames, reset, self._kws_generation))
 
     async def _run_spotter(
         self,
-        stream: NameSpotterStream,
+        stream: NameSpotterStream | None,
         frames: tuple[tuple[bytes, int, bool], ...],
         reset: bool | None,
         generation: int,
     ) -> None:
+        """Feed one job's frames on the `kws` lane, opening the stream first when `stream` is None.
+
+        The open is a lane job of its own, so a failed open, which turns the spotter off, is
+        told apart from a failed push, which fails only its frames job. However the job ends,
+        `_kws_busy` is cleared and the next job starts unless the ingress is closed, so no
+        exception, from an engine or from reporting a hit, leaves the spotter waiting for good.
+        """
         try:
-            hits = await self._lanes.kws.run(_spotter_job, stream, frames, reset, token=self._token)
+            if stream is None:
+                stream = await self._open_spotter()
+                if stream is None:
+                    return
+                if generation != self._kws_generation:
+                    # A mute landed while no stream existed, so it asked for no reset. Every
+                    # frame here is from before it, and the fresh stream has fed nothing, so
+                    # there is no gap for a backlog reset to restart from either.
+                    self._kws_reset = None
+                    return
+            try:
+                hits = await self._lanes.kws.run(
+                    _spotter_job, stream, frames, reset, token=self._token
+                )
+            except SpeechEngineError:
+                logger.warning("Ingress name spotter job failed", exc_info=True)
+                self._engine_errors += 1
+                hits = []
+            for hit in hits:
+                await self._on_hit(hit, generation)
         except LaneJobCancelled:
             return
+        finally:
+            self._kws_busy = False
+            if not self._closed:
+                if self._kws_waiting:
+                    self._start_spotter_job()
+                else:
+                    # The spotter has caught up, so the next drop is a new overload episode.
+                    self._kws_overload_reported = False
+
+    async def _open_spotter(self) -> NameSpotterStream | None:
+        """Open the spotter's stream as its own `kws` job and store it as soon as it returns.
+
+        Opening builds an interpreter and feeds it `warmup_ms` of silence, engine work that
+        belongs on the lane. A `SpeechEngineError` turns the spotter off for this ingress: it is
+        logged once and counted, the waiting frames are cleared and no later frame is queued.
+        `load` has already built an interpreter from the same bytes, so a failed open is not
+        expected to be transient, and retrying at every job would log and rebuild up to 50
+        times a second. A new ingress (a reconfigure) opens again. Returns None when off.
+        """
+        spotter = self._engines.spotter
+        assert spotter is not None
+        try:
+            stream = await self._lanes.kws.run(
+                spotter.open_stream, self._wake.kws_threshold, token=self._token
+            )
         except SpeechEngineError:
-            logger.warning("Ingress name spotter job failed", exc_info=True)
+            logger.warning(
+                "Ingress name spotter could not open its stream; it is off for this ingress",
+                exc_info=True,
+            )
             self._engine_errors += 1
-            hits = []
-        for hit in hits:
-            await self._on_hit(hit, generation)
-        self._kws_busy = False
-        if self._kws_waiting:
-            self._start_spotter_job()
-        else:
-            # The spotter has caught up, so the next drop is a new overload episode.
-            self._kws_overload_reported = False
+            self._kws_off = True
+            self._kws_waiting.clear()
+            return None
+        self._kws_stream = stream
+        return stream
 
     def _mute_spotter(self) -> None:
         """Skip the spotter to the floor; its next fed frame starts a fresh, warmed context."""

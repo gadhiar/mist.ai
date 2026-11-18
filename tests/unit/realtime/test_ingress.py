@@ -1531,6 +1531,163 @@ class TestTheSpotterFeed:
         assert "every frame" in (spotter_feed.__doc__ or "")
 
 
+class UnopenableSpotter(LoggedSpotter):
+    """A spotter whose stream cannot be built, as when its interpreter fails to load."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.opens = 0
+
+    def open_stream(self, threshold: float) -> LoggedStream:
+        self.opens += 1
+        raise SpeechEngineError("the interpreter could not be built")
+
+
+class FirstPushFailsStream(LoggedStream):
+    """A logged stream whose first push fails as a broken engine would; later pushes work."""
+
+    def __init__(self, hits: Sequence[NameHit], threshold: float, log: list) -> None:
+        super().__init__(hits, threshold, log)
+        self.failed = False
+
+    def push(self, pcm: bytes, pos: int) -> list[NameHit]:
+        if not self.failed:
+            self.failed = True
+            raise SpeechEngineError("the first push failed")
+        return super().push(pcm, pos)
+
+
+class FirstPushFailsSpotter(LoggedSpotter):
+    def open_stream(self, threshold: float) -> FirstPushFailsStream:
+        stream = FirstPushFailsStream(self.hits, threshold, self.log)
+        self.streams.append(stream)
+        return stream
+
+
+class TestTheSpotterLane:
+    """The stream opens as its own `kws` job, and no failure leaves the spotter stuck busy."""
+
+    @pytest.mark.asyncio
+    async def test_the_stream_is_opened_by_its_own_kws_job_before_the_first_frames_job(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(640)
+
+        submitted = rig.lanes.kws.submitted
+        assert submitted[:2] == ["open_stream", "_spotter_job"]
+        assert submitted.count("open_stream") == 1
+        (stream,) = spotter.streams
+        assert stream.threshold == WakeConfig().kws_threshold
+        assert stream.warmed
+
+    @pytest.mark.asyncio
+    async def test_an_open_that_fails_turns_the_spotter_off_and_the_utterance_still_ends(
+        self, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="backend.realtime.ingress")
+        spotter = UnopenableSpotter()
+        rig = Rig(spotter=spotter)
+
+        await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(960)
+
+        assert [ended.text for ended in rig.of(UtteranceEnded)] == ["hello there"]
+        assert spotter.opens == 1
+        assert rig.lanes.kws.submitted == ["open_stream"]
+        assert rig.ingress.stats().engine_errors == 1
+        failures = [r for r in caplog.records if "spotter" in r.getMessage()]
+        assert len(failures) == 1
+        assert failures[0].exc_info is not None
+        # No frame is queued for a spotter that is off, so none waits for a job that never runs.
+        assert not rig.ingress._kws_waiting
+
+    @pytest.mark.asyncio
+    async def test_a_first_push_that_raises_keeps_the_stream_and_later_frames_are_fed(self):
+        spotter = FirstPushFailsSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.speak(640)
+
+        assert rig.lanes.kws.submitted[:2] == ["open_stream", "_spotter_job"]
+        assert rig.lanes.kws.submitted.count("open_stream") == 1
+        (stream,) = spotter.streams
+        assert stream.failed
+        assert len(stream.pushed) > 20
+        assert stream.pushed == list(range(stream.pushed[0], stream.pushed[0] + len(stream.pushed)))
+        assert rig.ingress.stats().engine_errors == 1
+
+    @pytest.mark.asyncio
+    async def test_a_mute_during_the_open_skips_its_frames_and_feeds_the_fresh_stream_unreset(
+        self,
+    ):
+        spotter = LoggedSpotter([hit_at(2)])
+        rig = Rig(engaged=False, spotter=spotter)
+        rig.lanes.kws.holding = True
+        await rig.speak(320)
+        assert rig.lanes.kws.submitted == ["open_stream"]
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+        rig.lanes.kws.release()
+        await settle()
+        await rig.speak(320)
+
+        (stream,) = spotter.streams
+        assert stream.resets == 0
+        fed = fed_positions(spotter.log)
+        assert fed and fed == list(range(unmuted_at, unmuted_at + len(fed)))
+        assert 2 not in stream.pushed
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_reset_asked_for_during_an_open_a_mute_skipped_is_cleared(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        rig.lanes.kws.holding = True
+        await rig.speak(320)
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+
+        await rig.quiet((KWS_BACKLOG_FRAMES + 30) * FRAME_MS)
+        assert rig.ingress.stats().skipped_kws_hops > 0
+        rig.lanes.kws.release()
+        await settle()
+
+        (stream,) = spotter.streams
+        assert stream.resets == 0
+        fed = fed_positions(spotter.log)
+        assert fed and min(fed) >= unmuted_at
+        assert fed == sorted(set(fed))
+
+    @pytest.mark.asyncio
+    async def test_an_on_hit_that_raises_once_leaves_the_frames_after_it_fed(self, monkeypatch):
+        spotter = LoggedSpotter([hit_at(40), hit_at(60)])
+        rig = Rig(engaged=False, spotter=spotter)
+        report = rig.ingress._on_hit
+        calls: list[int] = []
+
+        async def on_hit_failing_once(hit: NameHit, generation: int) -> None:
+            calls.append(hit.end_pos)
+            if len(calls) == 1:
+                raise RuntimeError("a bug in reporting a hit")
+            await report(hit, generation)
+
+        monkeypatch.setattr(rig.ingress, "_on_hit", on_hit_failing_once)
+        await rig.quiet(640)
+
+        await rig.speak(960)
+
+        assert calls == [40, 60]
+        (stream,) = spotter.streams
+        assert stream.pushed[-1] == rig.pos - 1
+        assert [heard.hit for heard in rig.of(NameHeard)] == [hit_at(60)]
+        assert rig.ingress.stats().skipped_kws_hops == 0
+
+
 def ref_frame(marker: bool) -> bytes:
     body = bytearray(640)
     if marker:
