@@ -166,9 +166,11 @@ class _PyMicroFrontend:
     """pymicro-features' `MicroFrontend` behind `FeatureFrontend`.
 
     pymicro-features 1.x named the call `ProcessSamples` and the pinned 2.x line names it
-    `process_samples` (unverified here, since the runner has neither); the adapter takes either,
-    so the pin can move without a code change. A call that reads less than the 160 samples it is
-    given would drop audio, so it is refused.
+    `process_samples`: rhasspy/pymicro-features' `main` names it so in `src/micro_features.cpp`
+    (read 18 Nov), and H11 step 1 ran the frontend through this adapter in the backend image.
+    The adapter still takes either name, so the pin can move without a code change; dropping the
+    1.x name would need a new run of the real frontend. A call that reads less than the 160
+    samples it is given would drop audio, so it is refused.
     """
 
     __slots__ = ("_process",)
