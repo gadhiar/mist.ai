@@ -41,9 +41,10 @@ Optionally, record an hour of ordinary headset use (calls, videos, talk not mean
     python -m scripts.wake.record passive --root <dir> --minutes 60 --device N
 
 It writes one file per 10 minutes, each its own session; Ctrl+C closes and keeps the open file. A
-file whose peak is below -40 dBFS is not written: the microphone heard nothing. `passive` may run
-in a second terminal during the blocks. `status --root <dir>` shows the blocks done, the clips per
-label and the passive minutes. Last:
+file whose peak is below -40 dBFS is not written: the microphone heard nothing. Run `passive` only
+during ordinary headset use, never while a block is recording: both record the same microphone, so
+the block's wake phrases would also be stored as `media`. `status --root <dir>` shows the blocks
+done, the clips per label and the passive minutes. Last:
 
     python -m scripts.wake.record finish --root <dir> --seed N
 
@@ -55,8 +56,8 @@ writes nothing and exits 1, and another `--seed` may place the blocks differentl
 
 Files under `--root`: `recordings/<session>/<label>-<nnn>.wav` and `manifest.draft.json`, the
 entries without `split`, rewritten after every kept clip, so a closed terminal loses at most the
-clip in hand (in `passive`, the open file). Each write reads the draft again and adds to it, so a
-`session` and a `passive` in two terminals keep each other's entries. A lock file,
+clip in hand (in `passive`, the open file). Each write reads the draft again and adds to it, so two
+processes writing the same draft keep each other's entries. A lock file,
 `manifest.draft.lock`, keeps two writes from interleaving; it is held for milliseconds, so one
 left by a killed process is cleared after 2 s. Block sessions are `<YYYYMMDD>-<HHMM>-b<n>`, passive
 ones `<YYYYMMDD>-<HHMM>-p<n>`.
