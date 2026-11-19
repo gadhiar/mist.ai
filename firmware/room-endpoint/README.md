@@ -331,20 +331,22 @@ manifest with its word changed to "compile check" and its `model` naming the ima
 file. That image still opens on "stop", so `build.py` refuses `--out` for it; a room image leaves
 the container only when built from the private YAML with `--config`.
 
-The uplink closes on the first of these, checked against the realtime controller on `main`:
+The uplink closes on the first of these, checked against the realtime controller in this tree:
 
 - `state_cycle` `speak` or `idle` after the wake: the controller sends `state_cycle speak` before
-  a reply stretch's first `0x01` (`backend/realtime/turn.py:1278-1285`) and `state_cycle idle`
-  at a turn's end (`turn.py:2972`) or after an utterance that opened no turn (`turn.py:3067`);
-- `voice_decision` `dropped` (`backend/realtime/protocol.py:849-874`, which closes the utterance
-  it names, reason `muted` included), `wake_lost` (`protocol.py:922-932`, the same) or
-  `wake_rejected` (`protocol.py:935-948`);
+  a reply stretch's first `0x01` (`backend/realtime/turn.py:1384-1392`), and `state_cycle idle`
+  when a turn completes (`_complete`, `turn.py:3277`), when an interrupted or superseded turn
+  ends (`_cut`, `turn.py:3488`), or after an `attend` whose wake opened no turn, with nothing
+  else in flight (`_restore`, `turn.py:2186-2197`);
+- `voice_decision` `dropped` (`backend/realtime/protocol.py:948-973`, which closes the utterance
+  it names, reason `muted` included), `wake_lost` (`protocol.py:1021-1034`, the same) or
+  `wake_rejected` (`protocol.py:1037-1051`);
 - `uplink_cap_ms` (30 s; 75 s in the spike build) after the wake;
 - the mute switch;
 - disconnection.
 
 It stays open through `voice_decision` `endpoint`, which opens a turn while `hold` and
-`supersede` still listen (`protocol.py:789-826`), and through `state_cycle` `think`, so the
+`supersede` still listen (`protocol.py:888-925`), and through `state_cycle` `think`, so the
 server's hold and supersede logic still hears a sentence that goes on.
 
 The mute switch is GPIO3, from the published Voice PE config this firmware adapts
