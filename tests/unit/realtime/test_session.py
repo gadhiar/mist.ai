@@ -25,7 +25,11 @@ from backend.realtime.ingress import AudioIngress, IngressSeed
 from backend.realtime.playback import LanePurge
 from backend.realtime.power import PowerGate
 from backend.realtime.protocol import (
+    CLIENT_MESSAGE_TYPES,
+    ROOM_CLIENT_MESSAGE_TYPES,
+    ROOM_SERVER_MESSAGE_TYPES,
     Direction,
+    ErrorMessage,
     Frame,
     MsgType,
     StreamStartMessage,
@@ -40,8 +44,11 @@ from backend.realtime.session import (
 )
 from backend.realtime.speech import SpotterCalibration
 from backend.realtime.turn import (
+    BargeInReport,
     Interrupt,
     Mute,
+    PlaybackDone,
+    PlaybackProgress,
     Reconfigure,
     Text,
     TurnController,
@@ -226,7 +233,8 @@ class Rig:
         spotter: ScriptedNameSpotter | None | bool = True,
         synthesizer: bool = True,
         vad: bool = True,
-        endpoint: Literal["desktop", "room"] = "desktop",
+        endpoint: str = "desktop",
+        endpoint_kind: Literal["desktop", "room"] | None = None,
         max_turn_items: int = 2048,
         real_ingress: bool = False,
         session_id: str = "s1",
@@ -280,6 +288,7 @@ class Rig:
             session_id=session_id,
             websocket=self.socket,
             endpoint=endpoint,
+            endpoint_kind=endpoint_kind,
             services=services,
             host=self.host,  # type: ignore[arg-type]
             max_turn_items=max_turn_items,
@@ -470,6 +479,312 @@ class TestDispatch:
         assert yields[0].levelno == logging.INFO
 
 
+# -- Room sessions: the device's message types only -----------------------------------------------
+
+DEVICE = "example-room"
+
+# One valid message of each client type, keyed by type.
+CLIENT_MESSAGES: dict[str, dict[str, object]] = {
+    "voice_start": voice_start(endpoint="room", spotter="endpoint"),
+    "wake": {"type": "wake", "keyword": "mist", "score": 0.9, "backlog_ms": 0},
+    "barge_in": {"type": "barge_in", "turn_id": "turn-1", "keyword": "stop"},
+    "mute": {"type": "mute", "active": True},
+    "interrupt": {"type": "interrupt"},
+    "playback_progress": {"type": "playback_progress", "turn_id": "turn-1", "played_ms": 480},
+    "playback_done": {"type": "playback_done", "turn_id": "turn-1", "played_ms": 960},
+    "alarm_action": {"type": "alarm_action", "alarm_id": "a1", "action": "stop"},
+    "alarm_report": {
+        "type": "alarm_report",
+        "alarm_id": "a1",
+        "outcome": "rang",
+        "at": "2026-01-05T06:59:00Z",
+        "rang_at": "2026-01-05T06:59:00Z",
+    },
+    "voice_stop": {"type": "voice_stop"},
+    "gpu_yield": {"type": "gpu_yield", "active": True, "source": "manual"},
+    "text": {"type": "text", "text": "what time is it"},
+    "log_config": {"type": "log_config", "action": "set_level", "level": "DEBUG", "logger": "x.y"},
+    "subscribe_logs": {"type": "subscribe_logs", "enabled": True, "levels": None},
+    "action_decision": {"type": "action_decision", "proposal_id": "p1", "decision": "approve"},
+}
+REFUSED_TYPES = (
+    "voice_stop",
+    "gpu_yield",
+    "text",
+    "log_config",
+    "subscribe_logs",
+    "action_decision",
+)
+
+
+def refusal(message_type: str) -> dict[str, object]:
+    return {
+        "type": "error",
+        "kind": "protocol",
+        "message": f"{message_type} is not accepted from a room endpoint",
+        "retriable": False,
+        "context": {"field": "type"},
+    }
+
+
+def in_order(types: frozenset[str]) -> list[str]:
+    """`voice_start` first and `voice_stop` last, so every message between finds voice on."""
+    middle = sorted(types - {"voice_start", "voice_stop"})
+    return ["voice_start", *middle, *(["voice_stop"] if "voice_stop" in types else [])]
+
+
+def refusal_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith("room_message_refused")]
+
+
+class TestRoomMessages:
+    async def test_the_message_table_holds_one_message_of_every_client_type(self):
+        assert set(CLIENT_MESSAGES) == CLIENT_MESSAGE_TYPES
+        assert set(REFUSED_TYPES) == CLIENT_MESSAGE_TYPES - ROOM_CLIENT_MESSAGE_TYPES
+
+    @pytest.mark.parametrize("message_type", REFUSED_TYPES)
+    async def test_a_room_session_refuses_a_type_the_device_does_not_send(
+        self, caplog, message_type
+    ):
+        seen: list[str] = []
+        rig = await Rig(
+            endpoint=DEVICE,
+            endpoint_kind="room",
+            capability=lambda _sid, msg: seen.append(msg.type),
+        ).start()
+        await rig.send(CLIENT_MESSAGES["voice_start"])
+        assert rig.session.voice_on
+        posted = list(rig.controller.posted)
+        sent = len(rig.socket.sent)
+
+        with caplog.at_level(logging.INFO, logger="backend.realtime.session"):
+            await rig.send(CLIENT_MESSAGES[message_type], CLIENT_MESSAGES[message_type])
+
+        # No effect: nothing posted, no log subscription or gate change, no capability call.
+        assert rig.controller.posted == posted
+        assert rig.host.subscriptions == []
+        assert rig.host.levels == []
+        assert seen == []
+        assert rig.session.voice_on
+        assert not any("not used in protocol 2" in r.getMessage() for r in caplog.records)
+        # One answer: the second is inside the protocol error's one-second throttle.
+        assert rig.socket.sent[sent:] == [refusal(message_type)]
+        (record,) = refusal_records(caplog)
+        assert record.levelno == logging.WARNING
+        assert record.getMessage() == (
+            f"room_message_refused session=s1 endpoint={DEVICE} type={message_type}"
+        )
+        assert rig.session.refused_messages == 2
+
+    async def test_each_refused_type_is_logged_once_and_every_refusal_counted(self, caplog):
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        with caplog.at_level(logging.WARNING, logger="backend.realtime.session"):
+            await rig.send(CLIENT_MESSAGES["text"], CLIENT_MESSAGES["text"])
+            rig.clock.now = 1000
+            await rig.send(CLIENT_MESSAGES["subscribe_logs"], CLIENT_MESSAGES["text"])
+
+        assert [r.getMessage().rsplit("=", 1)[1] for r in refusal_records(caplog)] == [
+            "text",
+            "subscribe_logs",
+        ]
+        assert rig.session.refused_messages == 4
+        assert [item for item in rig.socket.sent if name_of(item) == "error"] == [
+            refusal("text"),
+            refusal("subscribe_logs"),
+        ]
+        assert rig.posted(Text) == []
+
+    async def test_a_room_session_dispatches_each_type_the_device_sends(self, caplog):
+        seen: list[str] = []
+        rig = await Rig(
+            endpoint=DEVICE,
+            endpoint_kind="room",
+            capability=lambda _sid, msg: seen.append(msg.type),
+        ).start()
+
+        with caplog.at_level(logging.WARNING, logger="backend.realtime.session"):
+            await rig.send(*(CLIENT_MESSAGES[name] for name in in_order(ROOM_CLIENT_MESSAGE_TYPES)))
+
+        assert answer_of(rig.answers()[0]) == (1, True, None, False)
+        posted = {type(message) for message in rig.controller.posted}
+        assert {Wake, BargeInReport, Mute, Interrupt, PlaybackProgress, PlaybackDone} <= posted
+        assert sorted(seen) == ["alarm_action", "alarm_report"]
+        assert rig.session.refused_messages == 0
+        assert refusal_records(caplog) == []
+        assert "error" not in rig.names()
+
+    async def test_a_desktop_session_dispatches_every_client_type(self, caplog):
+        seen: list[str] = []
+        rig = await Rig(capability=lambda _sid, msg: seen.append(msg.type)).start()
+        everything = [
+            voice_start() if name == "voice_start" else CLIENT_MESSAGES[name]
+            for name in in_order(CLIENT_MESSAGE_TYPES)
+        ]
+
+        with caplog.at_level(logging.INFO, logger="backend.realtime.session"):
+            await rig.send(*everything)
+
+        posted = {type(message) for message in rig.controller.posted}
+        assert {Wake, BargeInReport, Mute, Interrupt, PlaybackProgress, PlaybackDone} <= posted
+        assert {Text, VoiceStop} <= posted
+        assert sorted(seen) == ["action_decision", "alarm_action", "alarm_report"]
+        assert rig.host.subscriptions == [(True, None)]
+        assert rig.host.levels == [("x.y", "DEBUG")]
+        assert any("not used in protocol 2" in r.getMessage() for r in caplog.records)
+        assert rig.session.refused_messages == 0
+        assert refusal_records(caplog) == []
+
+    async def test_a_room_session_drops_every_reference_frame(self):
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+        await rig.send(voice_start(endpoint="room", spotter="server", reference=True))
+        assert answer_of(rig.answers()[0]) == (1, True, None, False)
+
+        await rig.reference(seq=1)
+        await rig.reference(seq=2)
+
+        assert not any(call[0] == "reference" for call in rig.ingress.calls)
+        assert rig.session.dropped_references == 2
+
+
+# -- Room sessions: only the types the device acts on ---------------------------------------------
+
+AUDIO = Frame(MsgType.AUDIO_CHUNK, 1, 1, 24000, b"\x00\x00" * 480)
+
+# One item of each shape the session writes, the type it carries, and whether a room gets it.
+OUTBOUND: list[tuple[object, bool]] = [
+    (ErrorMessage(kind="server", message="x", retriable=True, context=None), True),
+    ({"type": "alarm_state", "rev": 1}, True),
+    (json.dumps({"type": "alarm_fired", "alarm_id": "a1"}), True),
+    (AUDIO, True),
+    ({"type": "status", "message": "s"}, False),
+    (json.dumps({"type": "heartbeat", "timestamp": 1}), False),
+    ("a raw log line", False),
+    (json.dumps(["alarm_state"]), False),
+    ({"message": "no type"}, False),
+    ({"type": ["alarm_state"]}, False),
+]
+
+
+def as_written(item: object) -> object:
+    """An item as the fake socket records it, with a frame named by its type."""
+    if isinstance(item, Frame):
+        return f"0x{item.msg_type:02x}"
+    if isinstance(item, ErrorMessage):
+        return json.loads(item.model_dump_json())
+    if isinstance(item, str):
+        try:
+            return json.loads(item)
+        except ValueError:
+            return item
+    return item
+
+
+def written(rig: Rig) -> list[object]:
+    return [as_written(item) for item in rig.socket.sent]
+
+
+def withheld_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith("room_message_withheld")]
+
+
+def a_room_gets(name: str) -> bool:
+    """Whether a room is sent what `name_of` named: a frame, or a type its device acts on."""
+    return name.startswith("0x") or name.split(":", 1)[0] in ROOM_SERVER_MESSAGE_TYPES
+
+
+async def voice_turn(rig: Rig, start: dict[str, object]) -> None:
+    """Start voice and publish one utterance; the turn it opens answers it."""
+    await rig.send(start)
+    uid = rig.ids()
+    rig.ingress.emit(rig.ingress.started(uid))
+    rig.ingress.emit(rig.ingress.ended(uid, "hello"))
+    await settle()
+
+
+async def played_voice_turn(rig: Rig, start: dict[str, object]) -> None:
+    """One spoken turn, played to its end, so it sends its `turn_metrics` too."""
+    await voice_turn(rig, start)
+    (turn_id,) = stream_starts(rig)
+    await rig.send({"type": "playback_done", "turn_id": turn_id, "played_ms": 5000})
+
+
+class TestRoomOutbound:
+    async def test_a_room_session_writes_only_the_types_the_device_acts_on(self):
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        for item, _sent in OUTBOUND:
+            rig.session.send_control(item)
+        await settle()
+
+        assert written(rig) == [as_written(item) for item, sent in OUTBOUND if sent]
+        assert rig.session.withheld == sum(1 for _item, sent in OUTBOUND if not sent)
+
+    async def test_a_desktop_session_writes_every_item(self):
+        rig = await Rig().start()
+
+        for item, _sent in OUTBOUND:
+            rig.session.send_control(item)
+        await settle()
+
+        assert written(rig) == [as_written(item) for item, _sent in OUTBOUND]
+        assert rig.session.withheld == 0
+
+    async def test_each_withheld_type_is_logged_once_at_debug_and_every_item_counted(self, caplog):
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        with caplog.at_level(logging.DEBUG, logger="backend.realtime.session"):
+            for item in ({"type": "status"}, json.dumps({"type": "heartbeat"}), {"type": "status"}):
+                rig.session.send_bulk(item)
+            await settle()
+
+        records = withheld_records(caplog)
+        assert [r.getMessage() for r in records] == [
+            "room_message_withheld session=s1 type=status",
+            "room_message_withheld session=s1 type=heartbeat",
+        ]
+        assert {r.levelno for r in records} == {logging.DEBUG}
+        assert rig.session.withheld == 3
+        assert rig.socket.sent == []
+
+    async def test_a_rooms_own_turn_sends_what_the_device_acts_on_and_withholds_the_rest(self):
+        desk = await Rig().start()
+        room = await Rig(endpoint=DEVICE, endpoint_kind="room").start()
+
+        await played_voice_turn(desk, voice_start())
+        await played_voice_turn(room, CLIENT_MESSAGES["voice_start"])
+
+        # The desktop is sent every item of the turn, the room the types its device acts on.
+        sent = set(desk.names())
+        assert {"stream_start", "voice_state", "0x01", "transcription", "turn_metrics"} <= sent
+        assert desk.session.withheld == 0
+        kept = {name for name in sent if a_room_gets(name)}
+        assert set(room.names()) == kept
+        assert {"stream_start", "voice_state", "0x01"} <= kept
+        assert room.session.withheld == sum(1 for name in desk.names() if name not in kept)
+
+    async def test_a_withheld_turn_item_still_releases_a_control_item_fenced_behind_it(self):
+        # No synthesizer: the reply goes on the text channel, so the turn ends with no playback.
+        rig = await Rig(endpoint=DEVICE, endpoint_kind="room", synthesizer=False).start()
+        rig.socket.hold(lambda item: name_of(item) == "stream_start")
+        await voice_turn(rig, CLIENT_MESSAGES["voice_start"])
+        assert isinstance(rig.socket.holding, dict)
+        turn_id = rig.socket.holding["turn_id"]
+        # A reconfigure while the turn runs: `apply` answers it at the turn's end, fenced behind
+        # the turn's last lane item, `turn_metrics`, which a room is not sent.
+        await rig.send({**CLIENT_MESSAGES["voice_start"], "req": 2, "aec": "native"})
+        assert [answer["req"] for answer in rig.answers()] == [1]
+
+        rig.socket.release()
+        await settle()
+
+        assert "turn_metrics" not in rig.names()
+        answer = at(rig, "voice_state", cause="answer", req=2)
+        assert at(rig, "stream_start", turn_id=turn_id) < answer
+        assert at(rig, "state_cycle", state="idle", turn_id=turn_id) < answer
+        assert rig.session.withheld > 0
+
+
 # -- Lanes ---------------------------------------------------------------------------------------
 
 
@@ -644,6 +959,44 @@ class TestVoiceStart:
         assert any("endpoint" in r.getMessage() for r in caplog.records)
         # A room session asks the spotter for its endpoint calibration (v5).
         assert rig.controller.kwargs["calibration"] is CALIBRATION["endpoint"]
+
+    async def test_a_device_bound_room_session_takes_room_without_a_warning(self, caplog):
+        rig = await Rig(endpoint="example-room", endpoint_kind="room").start()
+
+        with caplog.at_level(logging.WARNING, logger="backend.realtime.session"):
+            await rig.send(voice_start(endpoint="room", spotter="endpoint"))
+
+        assert answer_of(rig.answers()[0]) == (1, True, None, False)
+        assert [r for r in caplog.records if "endpoint" in r.getMessage()] == []
+        assert (rig.session.endpoint, rig.session.endpoint_kind) == ("example-room", "room")
+        # The calibration key follows the kind, not the device's name.
+        assert rig.controller.kwargs["calibration"] is CALIBRATION["endpoint"]
+
+    async def test_a_device_bound_session_naming_desktop_is_logged(self, caplog):
+        rig = await Rig(endpoint="example-room", endpoint_kind="room").start()
+
+        with caplog.at_level(logging.WARNING, logger="backend.realtime.session"):
+            await rig.send(voice_start(endpoint="desktop"))
+
+        (record,) = (r for r in caplog.records if "endpoint" in r.getMessage())
+        assert "desktop" in record.getMessage() and "room" in record.getMessage()
+
+    async def test_the_kind_defaults_to_the_endpoint(self):
+        rig = await Rig(endpoint="desktop").start()
+
+        assert rig.session.endpoint_kind == "desktop"
+        assert rig.controller.kwargs["calibration"] is CALIBRATION["server"]
+
+    async def test_with_no_kind_any_endpoint_but_desktop_is_a_room(self):
+        """The kind fails closed: a session bound to a device's name is held to its types."""
+        rig = await Rig(endpoint=DEVICE).start()
+
+        await rig.send(CLIENT_MESSAGES["text"])
+
+        assert rig.session.endpoint_kind == "room"
+        assert rig.controller.kwargs["calibration"] is CALIBRATION["endpoint"]
+        assert rig.posted(Text) == []
+        assert rig.session.refused_messages == 1
 
     async def test_the_controller_is_wired_from_the_settings_and_the_spotter(self):
         rig = await Rig().start()

@@ -27,6 +27,8 @@ from backend.realtime.protocol import (
     MAGIC,
     MAX_WAKE_BACKLOG_MS,
     PROTOCOL_VERSION,
+    ROOM_CLIENT_MESSAGE_TYPES,
+    ROOM_SERVER_MESSAGE_TYPES,
     SERVER_MESSAGE_TYPES,
     UPLINK_SAMPLE_RATE,
     VOICE_DECISION_KINDS,
@@ -422,6 +424,51 @@ def test_client_message_set_matches_design_doc():
         "alarm_action",
         "alarm_report",
     } == CLIENT_MESSAGE_TYPES
+
+
+def test_room_client_message_set_is_the_device_types_within_the_client_set():
+    """A room session accepts these nine; the firmware test pins them to what the device sends."""
+    assert {
+        "voice_start",
+        "wake",
+        "barge_in",
+        "mute",
+        "interrupt",
+        "playback_progress",
+        "playback_done",
+        "alarm_action",
+        "alarm_report",
+    } == ROOM_CLIENT_MESSAGE_TYPES
+    assert ROOM_CLIENT_MESSAGE_TYPES < CLIENT_MESSAGE_TYPES
+
+
+def _capability_event_types() -> frozenset[str]:
+    """The `type` tags of capabilities' outbound events, the `...Event` models of `events.py`."""
+    types: set[str] = set()
+    for name, value in vars(capability_events).items():
+        if name.endswith("Event") and isinstance(value, type) and "type" in value.model_fields:
+            types.update(get_args(value.model_fields["type"].annotation))
+    return frozenset(types)
+
+
+def test_room_server_message_set_is_the_types_the_device_acts_on():
+    """A room session is sent these eleven; the firmware test pins them to what the codec reads."""
+    assert {
+        "session_started",
+        "voice_state",
+        "state_cycle",
+        "voice_decision",
+        "stream_start",
+        "playback_stop",
+        "playback_duck",
+        "error",
+        "alarm_state",
+        "alarm_fired",
+        "alarm_action_result",
+    } == ROOM_SERVER_MESSAGE_TYPES
+    events = _capability_event_types()
+    assert {"alarm_state", "alarm_fired", "alarm_action_result", "action_proposed"} <= events
+    assert SERVER_MESSAGE_TYPES | events >= ROOM_SERVER_MESSAGE_TYPES
 
 
 def test_server_message_set_matches_design_doc():

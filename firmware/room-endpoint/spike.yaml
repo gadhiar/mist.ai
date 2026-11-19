@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The spike build for host step H4, which measures the device gate G1 against the spike listener.
+# It differs from `room.yaml` in three ways, and is never flashed as the room build:
+#
+# - its wake is the stock `stop` model, a stand-in approved for H4 only, so the name model need
+#   not exist yet: a "stop" said with nothing playing opens the uplink;
+# - the uplink stays open up to 75 s after a wake, so G1's 60 s of live uplink during playback
+#   fits in one wake (the room build closes at 30 s);
+# - `packages/spike.yaml` adds the `device_stats` report.
+
+substitutions:
+  device_name: mist-spike
+  wake_model: /opt/mist-firmware-deps/models/stop/stop.json
+  stop_model: /opt/mist-firmware-deps/models/stop/stop.json
+  vad_model: /opt/mist-firmware-deps/models/vad/vad.json
+  voice_kit_path: /opt/mist-firmware-deps/home-assistant-voice-pe/esphome/components
+  xmos_firmware: http://127.0.0.1:8765/xmos/ffva_v1.3.1_upgrade.bin
+  websocket_client_path: /opt/mist-firmware-deps/esp_websocket_client
+  mist_components_path: components
+  uplink_cap_ms: "75000"
+  ring_ms: "6000"
+  backlog_ms: "5000"
+  ring_volume_floor: "0.6"
+
+packages:
+  device: !include packages/device.yaml
+  link: !include packages/link.yaml
+  spike: !include packages/spike.yaml

@@ -34,6 +34,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
 - `render_character.py` - Renders one WAV through the character stage, as the realtime downlink would play it
 - `wake/` - Tools for MIST's wake model: the guided recorder, the recording manifest check and the evaluation harness
+  - `device_calibration.py` - Writes the room device model's tables into the server wake manifest's `calibration.endpoint`, from its streaming evaluation
   - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
   - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
   - `record.py` - The guided host-side recorder for one headset sitting: 16 kHz clips and their draft manifest entries
@@ -54,6 +55,11 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, night extraction, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
   - `gamewatch.py` - The gaming watcher's process lister, game rules and decision
+  - `devices.py` - Provisions room devices: the device CA and server certificate, the registry, and each device's private `secrets.yaml`
+  - `device_forward.py` - The LAN relay in front of the device listener, run only in `mist-device-forward`; copies bytes both ways and leaves TLS to the backend
+- `room_endpoint/` - The room device's firmware tools, run in the worker image (see `firmware/room-endpoint/README.md`)
+  - `build.py` - Compiles the spike or room firmware offline in a throwaway build directory; `--out` copies the factory and OTA images out
+  - `spike_listener.py` - The H4 spike listener: a stand-in for MIST's device listener that measures the device gate G1
 - `backup/` - Backups of the graph, stores and vault, and their restore
   - `scheduler.py` - Runs backups on a schedule inside the compose project; a bad dump never prunes good ones
   - `status.py` - The backup status file: last attempt, its outcome and the last success
@@ -148,6 +154,14 @@ backend/
 │   ├── context_budget.py        # Cluster 6 ContextBudgetPlanner
 │   ├── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
 │   └── turn_scope.py            # Per-turn state and the value objects of the stream-and-commit turn API
+│
+├── devices/                     # Room devices: the device listener, off unless MIST_DEVICE_LISTENER=on
+│   ├── registry.py              # The registered devices and their token hashes, from registry.json
+│   ├── listener.py              # `/v2/device`: authenticates a device before accept, then one realtime session
+│   ├── server.py                # Runs the listener as a second uvicorn server, with TLS, in the backend's process
+│   ├── limiter.py               # Limits failed authentications by the device id a token claims
+│   ├── config.py                # The listener's MIST_DEVICE_* settings
+│   └── ring_sink.py             # A ring endpoint for each registered, unrevoked device: `alarm_fired` to its sessions
 │
 ├── event_store/                 # Append-only SQLite event store
 │   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
@@ -272,6 +286,7 @@ root outside every git work tree.
 ```
 deploy/daily/
 ├── compose.yml                  # The mist-daily compose project (backend, Neo4j, llama-server, backup, night extraction LLM and service)
+├── compose.devices.yml          # Opt-in room devices overlay: the backend's device listener and mist-device-forward on the LAN port
 ├── daily.env.example            # Template for <root>/daily.env
 ├── README.md                    # Contract, operation and the /health reasons table
 ├── RESTORE.md                   # Restore drill and promotion
@@ -279,6 +294,35 @@ deploy/daily/
 └── windows/
     ├── register-signin-task.ps1    # Sign-in task that starts the instance (-GamingWatch adds the watcher's, -NightExtraction the extraction window task)
     └── unregister-signin-task.ps1  # Removes all three sign-in tasks, for a rollback
+```
+
+## Room Device Firmware (`firmware/`)
+
+MIST's own ESPHome firmware for a Voice PE room device, built offline by
+`scripts/room_endpoint/build.py` in the worker image. Nothing personal is here: each device's
+YAML, secrets, name model and images live in its private directory. `README.md` is the build,
+flash and use guide; `NOTICE` records the licences.
+
+```
+firmware/
+└── room-endpoint/
+    ├── README.md                # Provisioning, build, flash, OTA, LEDs and controls, alarms, pins
+    ├── room.yaml                # The room build: wakes on the private name model
+    ├── spike.yaml               # The H4 spike build: the stop model as a stand-in wake, device_stats
+    ├── personal.example.yaml    # Template for a device's private YAML
+    ├── packages/
+    │   ├── device.yaml          # Hardware, adapted from the published Voice PE config (MIT)
+    │   ├── link.yaml            # mist_link and mist_prewake
+    │   ├── player.yaml          # mist_player: replies, volume, models and LEDs
+    │   ├── controls.yaml        # Button, dial, stop detections and the LED ring
+    │   ├── alarm.yaml           # mist_alarm: alarms on the device
+    │   └── spike.yaml           # The spike's device_stats and spike-only player
+    └── components/
+        ├── mist_core/           # Portable C++ core, tested on the host (tests/unit/firmware)
+        ├── mist_link/           # The wss:// link, through esp_websocket_client
+        ├── mist_prewake/        # Pre-wake ring, wake uplink and mute switch
+        ├── mist_player/         # Reply player, level, models and LEDs
+        └── mist_alarm/          # Alarm ring, schedule copy and reports
 ```
 
 ## Dev Instance Fixture (`tests/fixtures/dev-instance/`)
@@ -478,6 +522,7 @@ Frontend lives in a separate repo at `./mist-frontend/`. See that repo's contrib
 - **Integration tests:** `tests/integration/` (cluster-scoped reproducers; require live Neo4j + llama-server)
 - **Drift guards:** `tests/unit/test_eval_harness_scorers.py` locks scorer frozensets to ontology; `tests/unit/knowledge/extraction/test_validator.py::TestValidatorOntologyConsistency` locks validator to ontology
 - **Eval harness:** `scripts/eval_harness/` runs V1-V8 gauntlets; reports in `data/ingest/`
+- **Room device firmware:** `tests/unit/firmware/` (the configs, `build.py` and the README in `test_configs.py`; `mist_core` compiled and run on the host from `cpp/` by `test_core.py`)
 - **Memory read path:** `tests/unit/memory/` (fakes in `tests/fakes/memory_fakes.py`); `tests/fixtures/memory_recall/` holds the synthetic recall fixture (facts, conversations, episodes, vault notes, corrections, probes) that `scripts/eval_harness/memory_recall.py` scores
 
 ---

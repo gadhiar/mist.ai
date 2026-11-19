@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The one persistent link to MIST's device listener: `wss://<server_host>:<server_port>/v2/device`
+# with the device's bearer token and the private CA pinned. The host, port and token come from the
+# `secrets.yaml` that `scripts/daily/devices.py add` writes; `mist_ca.pem` is the CA certificate it
+# copies beside it, read relative to the top-level YAML's directory.
+
+external_components:
+  - source:
+      type: local
+      path: ${mist_components_path}
+    components: [mist_core, mist_link]
+
+mist_link:
+  # Not `link`: that would shadow POSIX `link()` in the generated C++.
+  id: mist_connection
+  server_host: !secret mist_server_host
+  server_port: !secret mist_server_port
+  token: !secret mist_device_token
+  ca_file: mist_ca.pem
+  websocket_client_path: ${websocket_client_path}
+
+# The pre-wake ring and wake uplink (plan Design item 4). Channel 0 at gain 1, as the published
+# config's voice pipeline takes it, fills a `ring_ms` ring in PSRAM; a detection by the name model
+# (`mist_wake`) sends `wake`, the newest `backlog_ms` oldest first, then live audio until the
+# uplink closes. Nothing leaves the device before a detection. The source is declared in
+# `packages/device.yaml`, beside the microphone and models it reads.
+mist_prewake:
+  id: mist_prewake_uplink
+  link_id: mist_connection
+  microphone:
+    microphone: i2s_mics
+    channels: 0
+    gain_factor: 1
+  wake_model: mist_wake
+  mute_switch: hardware_mute_switch
+  ring_ms: ${ring_ms}
+  backlog_ms: ${backlog_ms}
+  uplink_cap_ms: ${uplink_cap_ms}

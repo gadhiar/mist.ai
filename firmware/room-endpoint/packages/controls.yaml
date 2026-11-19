@@ -1,0 +1,183 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# Controls and lights (plan Design item 7), the one place the room build's inputs are wired:
+#
+# - a detection by the stop model goes to the uplink (`barge_in` while she speaks) and to the
+#   player, whose answer during a ring (`StopRing`) goes to the alarm component, which stops it
+#   everywhere; `packages/device.yaml`'s own handler still hands every detection to the pre-wake
+#   uplink, which opens only for the name model;
+# - the center button's single, double and long presses go to the player, which sends `interrupt`
+#   while she speaks; during a ring its answer (`StopRing` for a single press, `SnoozeRing` for a
+#   double) goes to the alarm component; no press reaches the uplink, so there is no push-to-talk;
+# - each dial detent moves the volume by one step;
+# - the LED ring, whose effects the player picks from MIST's state.
+#
+# The mute switch is wired in `packages/link.yaml` and the player reads it too. The button, dial
+# and LED ring hardware is the published Voice PE config's (esphome/home-assistant-voice-pe,
+# home-assistant-voice.yaml at 2644f4c, MIT: `center_button`, `dial`, `leds_internal`,
+# `led_power`, and the ring's remap); the effects are written for MIST, after that config's
+# spinning, blinking and pulsing ones.
+
+micro_wake_word:
+  on_wake_word_detected:
+    - if:
+        condition:
+          lambda: return wake_word == id(stop).get_wake_word();
+        then:
+          - lambda: |-
+              id(mist_prewake_uplink).on_stop_detected();
+              id(mist_alarms).on_ring_action(id(mist_reply_player).on_stop_detected());
+
+binary_sensor:
+  - platform: gpio
+    id: center_button
+    internal: true
+    pin:
+      number: GPIO0
+      inverted: true
+    on_multi_click:
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 0.25s
+        then:
+          - lambda: id(mist_alarms).on_ring_action(id(mist_reply_player).on_button(mist_core::ButtonEvent::SinglePress));
+      - timing:
+          - ON for at most 1s
+          - OFF for at most 0.25s
+          - ON for at most 1s
+          - OFF for at least 0.25s
+        then:
+          - lambda: id(mist_alarms).on_ring_action(id(mist_reply_player).on_button(mist_core::ButtonEvent::DoublePress));
+      - timing:
+          - ON for at least 1s
+        then:
+          - lambda: id(mist_alarms).on_ring_action(id(mist_reply_player).on_button(mist_core::ButtonEvent::LongPress));
+
+sensor:
+  - platform: rotary_encoder
+    id: dial
+    internal: true
+    pin_a: GPIO16
+    pin_b: GPIO18
+    resolution: 2
+    on_clockwise:
+      - lambda: id(mist_reply_player).on_dial(1);
+    on_anticlockwise:
+      - lambda: id(mist_reply_player).on_dial(-1);
+
+power_supply:
+  - id: led_power
+    pin: GPIO45
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: leds_internal
+    internal: true
+    pin: GPIO21
+    bit0_high: 300ns
+    bit0_low: 975ns
+    bit1_high: 650ns
+    bit1_low: 650ns
+    reset_low: 300us
+    reset_high: 0us
+    max_refresh_rate: 15ms
+    num_leds: 12
+    # The published config's `rgb_order: GRB`, under this ESPHome's name for it.
+    channel_colors: GRB
+    rmt_symbols: 192
+    default_transition_length: 0ms
+    power_supply: led_power
+
+  # The ring in order around the device, as the published config remaps it. Each effect draws in
+  # the colour the player sets; the player turns the ring off when she is idle.
+  - platform: partition
+    id: mist_leds
+    internal: true
+    default_transition_length: 0ms
+    segments:
+      - id: leds_internal
+        from: 7
+        to: 11
+      - id: leds_internal
+        from: 0
+        to: 6
+    effects:
+      # The link to MIST is down.
+      - addressable_twinkle:
+          name: Disconnected
+          twinkle_probability: 50%
+      # The mute switch is on: the two lights beside the microphones.
+      - addressable_lambda:
+          name: Muted
+          update_interval: 100ms
+          lambda: |-
+            for (uint8_t i = 0; i < 12; i++) {
+              it[i] = (i == 3 || i == 9) ? current_color : Color::BLACK;
+            }
+      # After her name: a slow clockwise turn of two arms.
+      - addressable_lambda:
+          name: Attend
+          update_interval: 100ms
+          lambda: |-
+            static uint8_t head = 0;
+            for (uint8_t i = 0; i < 12; i++) {
+              const uint8_t behind = (head + 12 - i) % 6;
+              it[i] = behind == 0 ? current_color
+                    : behind == 1 ? current_color * 192
+                    : behind == 2 ? current_color * 128
+                    : Color::BLACK;
+            }
+            head = (head + 1) % 12;
+      # She is listening: the same turn, faster.
+      - addressable_lambda:
+          name: Listen
+          update_interval: 50ms
+          lambda: |-
+            static uint8_t head = 0;
+            for (uint8_t i = 0; i < 12; i++) {
+              const uint8_t behind = (head + 12 - i) % 6;
+              it[i] = behind == 0 ? current_color
+                    : behind == 1 ? current_color * 192
+                    : behind == 2 ? current_color * 128
+                    : Color::BLACK;
+            }
+            head = (head + 1) % 12;
+      # She is thinking: two opposite lights pulse.
+      - addressable_lambda:
+          name: Think
+          update_interval: 20ms
+          lambda: |-
+            static uint8_t step = 0;
+            const uint8_t phase = step % 20;
+            const uint8_t level = phase < 10 ? 255 - phase * 22 : 57 + (phase - 10) * 22;
+            for (uint8_t i = 0; i < 12; i++) {
+              it[i] = (i == 0 || i == 6) ? current_color * level : Color::BLACK;
+            }
+            step = (step + 1) % 20;
+      # She is speaking: two arms turn anticlockwise.
+      - addressable_lambda:
+          name: Speak
+          update_interval: 50ms
+          lambda: |-
+            static uint8_t head = 0;
+            for (uint8_t i = 0; i < 12; i++) {
+              const uint8_t ahead = (i + 12 - head) % 6;
+              it[i] = ahead == 0 ? current_color
+                    : ahead == 1 ? current_color * 192
+                    : ahead == 2 ? current_color * 128
+                    : Color::BLACK;
+            }
+            head = (head + 11) % 12;
+      # An alarm rings: the whole ring pulses.
+      - addressable_lambda:
+          name: Ringing
+          update_interval: 20ms
+          lambda: |-
+            static uint8_t step = 0;
+            const uint8_t phase = step % 20;
+            const uint8_t level = phase < 10 ? 255 - phase * 22 : 57 + (phase - 10) * 22;
+            for (uint8_t i = 0; i < 12; i++) {
+              it[i] = current_color * level;
+            }
+            step = (step + 1) % 20;

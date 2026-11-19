@@ -14,7 +14,7 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
-from .session import Endpoint, RealtimeSession, SessionServices, SessionSocket
+from .session import Endpoint, EndpointKind, RealtimeSession, SessionServices, SessionSocket
 from .turn import WakeArbiter
 
 logger = logging.getLogger(__name__)
@@ -69,13 +69,24 @@ class SessionRegistry:
     # -- Sessions ------------------------------------------------------------------------------
 
     def create_session(
-        self, *, session_id: str, websocket: SessionSocket, endpoint: Endpoint
+        self,
+        *,
+        session_id: str,
+        websocket: SessionSocket,
+        endpoint: Endpoint,
+        endpoint_kind: EndpointKind | None = None,
     ) -> RealtimeSession:
-        """Build a session for an accepted socket and register it; the caller awaits `run`."""
+        """Build a session for an accepted socket and register it; the caller awaits `run`.
+
+        `endpoint` is `desktop` or a room device's name. `endpoint_kind` defaults to `desktop`
+        for the `desktop` endpoint and to `room` for any other, whose session accepts only the
+        device's message types (`ROOM_CLIENT_MESSAGE_TYPES`).
+        """
         session = RealtimeSession(
             session_id=session_id,
             websocket=websocket,
             endpoint=endpoint,
+            endpoint_kind=endpoint_kind,
             services=self._services,
             host=self,
         )
@@ -112,6 +123,11 @@ class SessionRegistry:
     def endpoint_present(self, endpoint: Endpoint) -> bool:
         """Whether a session bound to `endpoint` is connected."""
         return any(session.endpoint == endpoint for session in self._sessions.values())
+
+    def endpoint_of(self, session_id: str) -> Endpoint | None:
+        """The endpoint a live session is bound to, or None for one that is not connected."""
+        session = self._sessions.get(session_id)
+        return None if session is None else session.endpoint
 
     # -- Outbound ------------------------------------------------------------------------------
 

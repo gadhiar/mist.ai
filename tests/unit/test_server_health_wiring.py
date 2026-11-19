@@ -27,6 +27,8 @@ and load the model stack.
 import asyncio
 import json
 import logging
+import socket
+import subprocess  # nosec B404 - runs a fixed openssl argument list, never a shell
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -64,6 +66,9 @@ _GLOBALS = (
     "_extraction_dispatcher_start_failed",
     "_extraction_health_client",
     "_gpu_yield",
+    "_device_listener",
+    "_device_app",
+    "_device_listener_state",
 )
 
 
@@ -783,7 +788,9 @@ async def test_health_top_level_keys_and_extraction_block_are_unchanged(executor
         "hydration_isolation",
         "extraction",
         "voice",
+        "devices",
     }
+    assert payload["devices"] == {"listener": "off", "connected": []}
     extraction = payload["extraction"]
     assert set(extraction) == {
         "state",
@@ -1066,6 +1073,9 @@ def lifespan_harness(monkeypatch, tmp_path):
         "_capability_config",
         "_capability_power",
         "_capability_sink",
+        "_device_listener",
+        "_device_app",
+        "_device_listener_state",
     ):
         monkeypatch.setattr(server, name, getattr(server, name))
     monkeypatch.setattr(server, "message_queue", asyncio.Queue())
@@ -1103,6 +1113,11 @@ def lifespan_harness(monkeypatch, tmp_path):
         "MIST_GPU_YIELD_POLL_S",
         "MIST_VOICE_PROFILE",
         "MIST_CAPABILITIES_ENABLED",
+        "MIST_DEVICE_LISTENER",
+        "MIST_DEVICE_PORT",
+        "MIST_DEVICE_TLS_CERT",
+        "MIST_DEVICE_TLS_KEY",
+        "MIST_DEVICE_REGISTRY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -1367,3 +1382,162 @@ def test_the_power_gate_refuses_with_the_yield_message_only_while_yielded(tmp_pa
     assert no_yield.model_available() is False  # no runtime, so no provider yet
     assert no_yield.refusal_message() == NO_MODEL_MESSAGE
     assert server._build_power(None).level() == "full"
+
+
+# -- The room device listener (voice PE T10) ----------------------------------------------
+
+
+def _device_registry(tmp_path: Path) -> Path:
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps({"version": 1, "devices": []}), encoding="utf-8")
+    return path
+
+
+def _free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _tls_pair(directory: Path) -> tuple[Path, Path]:
+    """A throwaway certificate and key, made by `openssl` (no key is committed)."""
+    key, cert = directory / "server.key", directory / "server.pem"
+    subprocess.run(  # nosec B603 B607 - fixed argument list, no shell
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=device-listener-test",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+class _RecordingListener:
+    """Stands in for `DeviceListener` to show that none is built."""
+
+    built: list[object] = []
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        _RecordingListener.built.append(args)
+
+
+@pytest.mark.asyncio
+async def test_with_no_device_variable_no_listener_is_built(lifespan_harness, monkeypatch):
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+    _RecordingListener.built = []
+    monkeypatch.setattr(server, "DeviceListener", _RecordingListener)
+
+    async with server.lifespan(server.app):
+        payload = await server.health()
+
+    assert _RecordingListener.built == []
+    assert server._device_listener is None
+    assert payload["devices"] == {"listener": "off", "connected": []}
+
+
+@pytest.mark.asyncio
+async def test_a_listener_on_a_taken_port_fails_and_the_backend_serves_on(
+    lifespan_harness, monkeypatch, tmp_path, caplog
+):
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("0.0.0.0", 0))  # nosec B104 - a test holding the port the listener wants
+    holder.listen()
+    monkeypatch.setenv("MIST_DEVICE_LISTENER", "on")
+    monkeypatch.setenv("MIST_DEVICE_PORT", str(holder.getsockname()[1]))
+    monkeypatch.setenv("MIST_DEVICE_REGISTRY", str(_device_registry(tmp_path)))
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+
+    try:
+        with caplog.at_level(logging.ERROR):
+            async with server.lifespan(server.app):
+                payload = await server.health()
+                registry_built = server.session_registry is not None
+    finally:
+        holder.close()
+
+    assert payload["devices"] == {"listener": "failed", "connected": []}
+    assert registry_built
+    assert any("device_listener_failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_listener_with_a_missing_certificate_fails_and_the_backend_serves_on(
+    lifespan_harness, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MIST_DEVICE_LISTENER", "on")
+    monkeypatch.setenv("MIST_DEVICE_PORT", str(_free_port()))
+    monkeypatch.setenv("MIST_DEVICE_TLS_CERT", str(tmp_path / "missing.pem"))
+    monkeypatch.setenv("MIST_DEVICE_TLS_KEY", str(tmp_path / "missing.key"))
+    monkeypatch.setenv("MIST_DEVICE_REGISTRY", str(_device_registry(tmp_path)))
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+
+    async with server.lifespan(server.app):
+        payload = await server.health()
+
+    assert payload["devices"]["listener"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({"MIST_DEVICE_LISTENER": "maybe"}, id="bad-switch"),
+        pytest.param({"MIST_DEVICE_LISTENER": "on"}, id="missing-registry"),
+    ],
+)
+async def test_an_unreadable_configuration_or_registry_reads_failed(
+    lifespan_harness, monkeypatch, tmp_path, env
+):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MIST_DEVICE_REGISTRY", str(tmp_path / "absent.json"))
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+
+    async with server.lifespan(server.app):
+        payload = await server.health()
+
+    assert payload["devices"] == {"listener": "failed", "connected": []}
+    assert server._device_listener is None
+
+
+@pytest.mark.asyncio
+async def test_an_enabled_listener_serves_and_is_stopped_at_shutdown(
+    lifespan_harness, monkeypatch, tmp_path
+):
+    cert, key = _tls_pair(tmp_path)
+    monkeypatch.setenv("MIST_DEVICE_LISTENER", "on")
+    monkeypatch.setenv("MIST_DEVICE_PORT", str(_free_port()))
+    monkeypatch.setenv("MIST_DEVICE_TLS_CERT", str(cert))
+    monkeypatch.setenv("MIST_DEVICE_TLS_KEY", str(key))
+    monkeypatch.setenv("MIST_DEVICE_REGISTRY", str(_device_registry(tmp_path)))
+    lifespan_harness.configure(tts_enabled=False)
+    await lifespan_harness.start()
+
+    async with server.lifespan(server.app):
+        payload = await server.health()
+        listener = server._device_listener
+
+    assert payload["devices"] == {"listener": "on", "connected": []}
+    assert listener is not None and listener.state() == "off"
+    assert (await server.health())["devices"]["listener"] == "off"

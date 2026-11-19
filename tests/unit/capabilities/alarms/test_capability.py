@@ -193,7 +193,12 @@ def _close_databases():
         _DBS.pop().close()
 
 
-def _rig(path: Path, *, start: datetime = T0) -> Rig:
+def _rig(
+    path: Path,
+    *,
+    start: datetime = T0,
+    endpoint_of: Callable[[str], str | None] | None = None,
+) -> Rig:
     db = CapabilitiesDb(str(path))
     _DBS.append(db)
     records = CountingRecords(db)
@@ -206,13 +211,16 @@ def _rig(path: Path, *, start: datetime = T0) -> Rig:
     def known() -> tuple[str, ...]:
         return tuple(endpoints)
 
-    common = {
+    common: dict[str, object] = {
         "clock": clock,
         "zone": ZONE,
         "ringing": tracker,
         "endpoints": known,
         "snooze_minutes": SETTINGS.snooze_minutes,
     }
+    # Left out unless a test names it, so the other tests check the default.
+    if endpoint_of is not None:
+        common["endpoint_of"] = endpoint_of
     return Rig(
         db=db,
         records=records,
@@ -1136,6 +1144,62 @@ class TestRinging:
         finally:
             await timers.stop()
         assert scheduler.health().state == "stopped"
+
+
+class TestSpokenActionEndpoint:
+    """A spoken stop or snooze is recorded from its session's endpoint, else the turn's."""
+
+    SESSIONS = {"s-bedside": "bedside"}
+
+    @pytest_asyncio.fixture
+    async def routed(self, tmp_path) -> Rig:
+        built = _rig(tmp_path / "capabilities.db", endpoint_of=self.SESSIONS.get)
+        await built.alarms.start()
+        await built.timers.start()
+        return built
+
+    @pytest.mark.parametrize(("phrase", "event"), [("stop", "stopped"), ("snooze", "snoozed")])
+    @pytest.mark.asyncio
+    async def test_a_spoken_action_records_the_sessions_endpoint(self, routed, phrase, event):
+        await _ringing_alarm(routed)
+
+        outcome = await routed.alarms.on_active_utterance(phrase, "s-bedside")
+
+        assert outcome is not None and outcome.status == "ok"
+        assert (await routed.events())[-1] == (event, "fastpath", "bedside")
+
+    @pytest.mark.asyncio
+    async def test_a_spoken_timer_stop_records_the_sessions_endpoint(self, routed):
+        await _ringing_timer(routed)
+
+        stopped = await routed.timers.on_active_utterance("stop", "s-bedside")
+
+        assert stopped is not None and stopped.summary == "Timer stopped."
+        assert (await routed.events())[-1] == ("stopped", "fastpath", "bedside")
+
+    @pytest.mark.asyncio
+    async def test_a_session_with_no_endpoint_records_the_turn_endpoint(self, routed):
+        await _ringing_alarm(routed)
+
+        await routed.alarms.on_active_utterance("stop", "s-gone")
+
+        assert (await routed.events())[-1] == ("stopped", "fastpath", "desktop")
+
+    @pytest.mark.asyncio
+    async def test_the_hosts_fast_path_stop_records_the_sessions_endpoint(self, routed):
+        host = _host([routed.alarms, routed.timers], routed.clock)
+        await host.start()
+        await host.wait_started()
+        try:
+            await _ringing_alarm(routed)
+
+            resolution = await host.pre_llm("s-bedside", "t1", "Stop")
+
+            assert resolution is not None and resolution.reply == "Alarm stopped."
+            assert await routed.live() == []
+            assert (await routed.events())[-1] == ("stopped", "fastpath", "bedside")
+        finally:
+            await host.stop()
 
 
 async def _eventually(predicate: Callable[[], bool], timeout_s: float = 2.0) -> None:
