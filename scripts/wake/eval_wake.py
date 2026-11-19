@@ -6,7 +6,9 @@ each recording runs through an offline driver of the live path: the VAD opens sp
 and the spotter is pushed every frame as ingress pushes it (`backend/realtime/ingress.py`);
 every hit passes the gate's pre-decode checks, with the PC's own output scored when the entry
 has a reference; the gate decode runs through the `StreamingTranscriber` contract; and `decide`
-reads its text.
+reads its text with the name where the spotter heard it, as a server wake's gate partial gives
+it live: the decode's words in the recording's frames and the VAD's last speech frame once the
+span's last frame has arrived.
 
     python -m scripts.wake.eval_wake --manifest <path> --model <id> --split tune|test \
         --thresholds 0.3,0.4,0.5 --out <json> --stt-factory <module>:<callable>
@@ -19,13 +21,16 @@ split. `train` is never evaluated. A model whose `training` hash is not the sha2
 manifest's own `train` subset is refused, because its scores on `tune` or `test` would not be
 scores on unseen recordings.
 
-The report holds file ids, labels, counts, rates and milliseconds. Transcripts stay in memory
+The report holds file ids, labels, counts, rates and milliseconds; `false_reject.at_hit` counts
+what the decode wrote at each missed positive's first hit (`GateVerdict.at_hit`, `no_timings`
+where the gate read no timed words). Transcripts stay in memory
 while their recording is judged at each threshold (an ambient file's for as long as its
 `AmbientGate` lives), for the `decide` calls that read them, and are never written or logged.
 
 `spotter_eval` measures the server bar through the same driver: `accepted_wakes` counts the
-recordings the gate wakes on at each threshold, and `AmbientGate` the hits it accepts in ambient
-audio that is not in the manifest. The engines come from `real_engines`, as here.
+recordings the gate wakes on at each threshold, `gate_checks` what the gate made of each first
+hit at one, and `AmbientGate` the hits it accepts in ambient audio that is not in the manifest.
+The engines come from `real_engines`, as here.
 
 Timings follow the live path rather than the offline wall clock. Audio arrives at real time on
 the uplink, so a hit's verdict cannot come before `gate_tail_ms` of audio after it, or before
@@ -48,10 +53,11 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
-from backend.realtime.addressee import AddresseeGate, GateVerdict
+from backend.realtime.addressee import AddresseeGate, AtHit, GateVerdict, NameAlignment
 from backend.realtime.budget import (
     EndpointingConfig,
     PlacementConfig,
@@ -79,10 +85,12 @@ from backend.realtime.ingress import (
 )
 from backend.realtime.speech import (
     CancelToken,
+    HeardWord,
     NameHit,
     NameSpotter,
     StreamingTranscriber,
     VoiceActivityDetector,
+    WordTiming,
 )
 
 from .manifest import (
@@ -94,6 +102,7 @@ from .manifest import (
     read_pcm16,
     subset_sha256,
 )
+from .record import NAME_ALONE
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +111,11 @@ FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 FRAME_BYTES = FRAME_SAMPLES * 2
 EVALUATED_SPLITS = ("tune", "test")
+SPLIT_POST_ROLL_MS = 500
+"""How far past a segment's last speech frame `AmbientGate.hit_places` counts a hit as near it.
+
+It is the longest post-roll weighed for a spotter that reports only hits near speech, and the
+only one the split measures."""
 
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 
@@ -161,11 +175,14 @@ class _Heard:
     """One recording as ingress would hear it: its frames and the VAD's segments.
 
     A segment is `(onset frame, last speech frame)`, inclusive. The spotter is pushed every
-    frame, so the frames are all it needs.
+    frame, so the frames are all it needs. `last_speech` holds, for each frame, the last frame
+    of the latest VAD window judged speech among those scored once that frame has arrived, or
+    -1 before any: ingress's `_last_speech_pos`, which a gate partial carries as its speech end.
     """
 
     frames: tuple[bytes, ...]
     segments: tuple[tuple[int, int], ...]
+    last_speech: tuple[int, ...]
 
 
 def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _Heard:
@@ -183,6 +200,8 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
     stream = vad.open_stream()
     tracker = SpeechSegmentTracker(cfg)
     segments: list[tuple[int, int]] = []
+    last_speech: list[int] = []
+    latest = -1
     window = 0
 
     for pos in range(len(frames)):
@@ -192,18 +211,37 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
             last = (start + VAD_WINDOW_SAMPLES - 1) // FRAME_SAMPLES
             window += 1
             speech = stream.score(samples[start : start + VAD_WINDOW_SAMPLES]) >= cfg.vad_threshold
+            if speech:
+                latest = last
             step = tracker.window(speech, first, last)
             if step.closed is not None:
                 segments.append(step.closed)
+        last_speech.append(latest)
     if tracker.open_segment is not None:
         segments.append(tracker.open_segment)
-    return _Heard(frames=frames, segments=tuple(segments))
+    return _Heard(frames=frames, segments=tuple(segments), last_speech=tuple(last_speech))
 
 
 def _frames(pcm: bytes) -> tuple[bytes, ...]:
     """A recording's whole 20 ms frames; a partial last frame is never routed."""
     usable = len(pcm) // FRAME_BYTES * FRAME_BYTES
     return tuple(pcm[start : start + FRAME_BYTES] for start in range(0, usable, FRAME_BYTES))
+
+
+def _rebased(
+    words: tuple[WordTiming, ...] | None, start: int, end: int
+) -> tuple[HeardWord, ...] | None:
+    """A span decode's words in the frames of the recording, bounded by the span's last."""
+    if words is None:
+        return None
+    return tuple(
+        HeardWord(
+            word.text,
+            min(start + word.start_ms // FRAME_MS, end),
+            min(start + max(word.end_ms - 1, word.start_ms) // FRAME_MS, end),
+        )
+        for word in words
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +253,11 @@ class _HitResult:
     verdict: GateVerdict
     accept_ms: float
     screen_server_ms: float
+
+    @property
+    def at_hit(self) -> AtHit | None:
+        """What the gate decode wrote at the hit, or None when it had no timed words to read."""
+        return self.verdict.at_hit
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +276,10 @@ class _Outcome:
     def reason(self) -> str:
         """Why the recording opened no turn: no hit, or the first hit's gate check."""
         return self.hits[0].verdict.check if self.hits else "no_hit"
+
+
+_Decoded = tuple[str, tuple[HeardWord, ...] | None, float]
+"""A span's gate decode: its text, its words in the recording's frames, and its decode time."""
 
 
 class _Driver:
@@ -281,7 +328,7 @@ class _Driver:
         """
         heard = _listen(read_pcm16(item.path), self._engines.vad, self._endpointing)
         reference = read_pcm16(item.reference_path) if item.reference_path is not None else None
-        decodes: dict[tuple[int, int], tuple[str, float] | None] = {}
+        decodes: dict[tuple[int, int], _Decoded | None] = {}
         return {
             threshold: _Outcome(
                 item,
@@ -300,7 +347,7 @@ class _Driver:
         offset: int,
         gate: AddresseeGate,
         reference: bytes | None,
-        decodes: dict[tuple[int, int], tuple[str, float] | None],
+        decodes: dict[tuple[int, int], _Decoded | None],
         threshold: float,
     ) -> tuple[_HitResult, ...]:
         # Every frame once and in order, as ingress pushes them, so every hit is judged. The
@@ -325,7 +372,7 @@ class _Driver:
         arrival: float,
         gate: AddresseeGate,
         reference: bytes | None,
-        decodes: dict[tuple[int, int], tuple[str, float] | None],
+        decodes: dict[tuple[int, int], _Decoded | None],
     ) -> _HitResult:
         position = min(max(found.end_pos - offset, 0), len(heard.frames) - 1)
         # Check a: her own recent speech, a memory read; `attend` goes out after it. Offline she
@@ -355,9 +402,15 @@ class _Driver:
                 reference_score=reference_score,
             )
             return _HitResult(position, found.score, verdict, tail_ms, screen_ms)
-        text, decode_ms = decoded
+        text, words, decode_ms = decoded
+        # The speech end ingress gives a gate partial: the last speech heard once the frames
+        # through the span's end have arrived, when its decode starts.
+        last = heard.last_speech[span[1]]
+        alignment = NameAlignment(position, FRAME_MS, last if last >= 0 else None, words)
         before = self._clock()
-        verdict = gate.decide(text=text, score=found.score, reference_score=reference_score)
+        verdict = gate.decide(
+            text=text, score=found.score, reference_score=reference_score, alignment=alignment
+        )
         decide_ms = (self._clock() - before) * 1000
         return _HitResult(
             position, found.score, verdict, tail_ms + decode_ms + decide_ms, screen_ms
@@ -384,9 +437,13 @@ class _Driver:
         end = min(position + self._wake.gate_tail_ms // FRAME_MS, len(heard.frames) - 1)
         return start, end
 
-    def _decode(
-        self, source: str, heard: _Heard, span: tuple[int, int]
-    ) -> tuple[str, float] | None:
+    def _decode(self, source: str, heard: _Heard, span: tuple[int, int]) -> _Decoded | None:
+        """The span's gate decode, its words rebased to the recording's frames, or None.
+
+        A word's first frame holds its start and its last frame its final millisecond, as
+        ingress rebases a gate partial's words through the positions it pushed; the span's
+        frames are contiguous, so its positions run from its start.
+        """
         start, end = span
         pcm = b"".join(heard.frames[start : end + 1])
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
@@ -403,7 +460,7 @@ class _Driver:
             return None
         finally:
             stream.close()
-        return update.text, decode_ms
+        return update.text, _rebased(update.words, start, end), decode_ms
 
     def _reference_score(self, source: str, reference: bytes, position: int) -> float | None:
         """The spotter's score over the PC's output in the window ending at the hit.
@@ -481,6 +538,75 @@ def accepted_wakes(
     return woken
 
 
+Place = Literal["inside", "after", "no_segment"]
+
+
+@dataclass(frozen=True, slots=True)
+class GateChecks:
+    """What the gate made of each entry's first hit at one threshold, as counts.
+
+    `first_hit` counts the first hit's gate check, or `no_hit`, and `first_hit_by_group` the
+    same for the entries that say the name alone (`name_alone`, a phrase of `record.NAME_ALONE`)
+    and the rest (`sentence`). Over the entries with a hit, `at_hit` counts what the decode
+    wrote at the first hit (`GateVerdict.at_hit`), `no_timings` where the gate read no timed
+    words, and `places` gives each first hit's place in entry order: in a segment (`inside`),
+    after the last speech frame of the latest segment to open before it (`after`, with the lag
+    in milliseconds), or before any segment (`no_segment`).
+    """
+
+    first_hit: Mapping[str, int]
+    first_hit_by_group: Mapping[str, Mapping[str, int]]
+    at_hit: Mapping[str, int]
+    places: tuple[tuple[Place, int | None], ...]
+
+
+def gate_checks(
+    entries: Sequence[Entry],
+    engines: Engines,
+    settings: VoiceSettings,
+    threshold: float,
+    clock: Callable[[], float],
+) -> GateChecks:
+    """The gate checks at `threshold` of each entry's first hit, through the same driver.
+
+    These say why a positive did not wake her and where the spotter placed the name: a first
+    hit after the speech has ended is decoded with nothing more to come, and one inside speech
+    with words after it.
+    """
+    alone = frozenset(phrase_key(phrase) for phrase in NAME_ALONE)
+    driver = _Driver(engines, settings, [threshold], clock)
+    first_hit: Counter[str] = Counter()
+    groups: dict[str, Counter[str]] = {"name_alone": Counter(), "sentence": Counter()}
+    at_hit: Counter[str] = Counter()
+    places: list[tuple[Place, int | None]] = []
+    for outcomes in _outcomes(driver, entries):
+        outcome = outcomes[threshold]
+        first_hit[outcome.reason] += 1
+        group = "name_alone" if phrase_key(outcome.entry.phrase) in alone else "sentence"
+        groups[group][outcome.reason] += 1
+        if outcome.hits:
+            first = outcome.hits[0]
+            at_hit[first.at_hit or "no_timings"] += 1
+            places.append(_place(outcome.heard.segments, first.position))
+    return GateChecks(
+        first_hit=dict(sorted(first_hit.items())),
+        first_hit_by_group={name: dict(sorted(counts.items())) for name, counts in groups.items()},
+        at_hit=dict(sorted(at_hit.items())),
+        places=tuple(places),
+    )
+
+
+def _place(segments: Sequence[tuple[int, int]], position: int) -> tuple[Place, int | None]:
+    """Where a hit landed against the VAD's segments, with its lag past the speech if after."""
+    before = [segment for segment in segments if segment[0] <= position]
+    if not before:
+        return "no_segment", None
+    last = before[-1][1]
+    if position <= last:
+        return "inside", None
+    return "after", (position - last) * FRAME_MS
+
+
 class AmbientGate:
     """Counts the hits the gate accepts in ambient audio, one file and one threshold at a time.
 
@@ -494,7 +620,8 @@ class AmbientGate:
     once per file, whatever the threshold, and a failed decode rejects its hit as it does live.
     `decodes` and `decode_errors` count both across files, and `listen_s` is the clock's time
     spent in the VAD. A log line names a file only as "ambient file <i>", its place in the order
-    the files were first given.
+    the files were first given. The positions of each file's reported hits at each threshold
+    are kept too, for `hit_places`.
     """
 
     def __init__(
@@ -505,7 +632,8 @@ class AmbientGate:
         self._endpointing = settings.endpointing
         self._clock = clock
         self._heard: dict[Path, tuple[str, _Heard]] = {}
-        self._decoded: dict[Path, dict[tuple[int, int], tuple[str, float] | None]] = {}
+        self._decoded: dict[Path, dict[tuple[int, int], _Decoded | None]] = {}
+        self._reported: dict[tuple[Path, float], tuple[int, ...]] = {}
         self.listen_s = 0.0
 
     @property
@@ -540,7 +668,28 @@ class AmbientGate:
             self._decoded[path],
             threshold,
         )
+        self._reported[(path, threshold)] = tuple(item.position for item in hits)
         return sum(item.verdict.accepted for item in hits)
+
+    def hit_places(self, path: Path, threshold: float) -> tuple[int, int]:
+        """The file's reported hits at `threshold`, near speech and not, accepted or not.
+
+        Near speech is from a segment's first frame less the pre-roll through
+        `SPLIT_POST_ROLL_MS` past its last speech frame: the hits a spotter that reported only
+        there would still report. The positions are those `accepted_hits` recorded at
+        `threshold`, which runs first if it has not.
+        """
+        if (path, threshold) not in self._reported:
+            self.accepted_hits(path, threshold)
+        _, kept = self._heard[path]
+        lead = self._driver._lead
+        post = SPLIT_POST_ROLL_MS // FRAME_MS
+        positions = self._reported[(path, threshold)]
+        near = sum(
+            any(first - lead <= position <= last + post for first, last in kept.segments)
+            for position in positions
+        )
+        return near, len(positions) - near
 
 
 # -- The report -------------------------------------------------------------------------------
@@ -613,6 +762,13 @@ def _row(
             "by_phrase": _grouped(positives, lambda entry: entry.phrase),
             "files": [item.entry.file for item in missed],
             "reasons": dict(sorted(Counter(item.reason for item in missed).items())),
+            "at_hit": dict(
+                sorted(
+                    Counter(
+                        item.hits[0].at_hit or "no_timings" for item in missed if item.hits
+                    ).items()
+                )
+            ),
         },
         "media_false_accepts": {
             "count": media_accepts,

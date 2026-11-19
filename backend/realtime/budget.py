@@ -480,8 +480,18 @@ A greeting that opens an utterance is read first, so "morning mist" alone still 
 DEFAULT_GREETINGS: tuple[str, ...] = ("hey", "hi", "hello", "morning", "evening", "yo")
 """Greetings that make a following name a vocative at the start of an utterance."""
 
-# The phrases file's keys, each a list of strings replacing that field's default.
-_PHRASE_KEYS = ("phrases", "address_starts", "stop_before", "greetings")
+DEFAULT_NAME_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("mist", ("missed", "miss", "myst", "midst", "mists", "mist's", "must", "mest")),
+)
+"""Each name with the near spellings a recogniser writes for it, which the gate reads as the
+name only where the spotter heard it (`WakeConfig`)."""
+
+# The phrases file's keys: `aliases` is an object from name to a list of words, and each other
+# key a list of strings replacing that field's default.
+_PHRASE_KEYS = ("phrases", "address_starts", "stop_before", "greetings", "aliases")
+# One gate token, the form of `addressee._WORD`, which budget cannot import: addressee imports
+# budget.
+_ALIAS = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)*")
 
 # `lookback_ms` plus this must stay within the wire's `MAX_WAKE_BACKLOG_MS`.
 _LOOKBACK_HEADROOM_MS = 1000
@@ -503,6 +513,24 @@ class WakeConfig:
     less than `endpoint_min_backlog_ms` of audio before it is rejected. `followup_window_ms`
     above 0 keeps listening without the name after a turn; `attend_cue` sends `attend` at a
     hit, before the verdict.
+
+    `aliases` maps a name to its near spellings ("missed" for "mist"), which the phrases file's
+    `aliases` key replaces and `"aliases": {}` turns off; an entry for a name not in `names` has
+    no effect. For a server hit the gate knows where the spotter heard the name, and reads it
+    there (`addressee.vocative_match`):
+    - An alias counts as the name only in a word overlapping the alias window, the
+      `alias_window_ms` before the hit through the hit, because it sounds like the name and
+      elsewhere is an ordinary word ("I missed the bus").
+    - Even there, an alias needs a vocative's punctuation: as the first word, "," after it, or
+      "." or "?" and then a word in `address_starts`; as the last word, "," before it, unless it
+      is the only word ("Missed."). A configured name keeps its rules.
+    - The trailing-speech guard: a rule anchored at the utterance's end (the last-word rule, or
+      a phrase template matched at the end) counts only when the VAD heard no speech more than
+      `trailing_speech_ms` past the hit, so a decode the gate tail cut short ("a cold mist" of
+      "a cold mist hung over the lake") does not pass as said to her.
+    - The full-stop form: a name or alias first, then "." or "?" and a word in `address_starts`
+      ("Mist. What's the time?"), counts as the first-word rule's comma does.
+    An endpoint wake has no hit position on the server, so none of this applies to it.
     """
 
     names: tuple[str, ...] = ("mist",)
@@ -519,6 +547,9 @@ class WakeConfig:
     endpoint_min_backlog_ms: int = 1500
     followup_window_ms: int = 0
     attend_cue: bool = True
+    aliases: tuple[tuple[str, tuple[str, ...]], ...] = DEFAULT_NAME_ALIASES
+    alias_window_ms: int = 400
+    trailing_speech_ms: int = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,7 +670,7 @@ class _Env:
 
         return self._read(name, default, parse)
 
-    def phrases_file(self, name: str) -> Mapping[str, tuple[str, ...]]:
+    def phrases_file(self, name: str) -> Mapping[str, tuple[object, ...]]:
         return self._read(name, {}, _parse_phrases_file)
 
 
@@ -768,7 +799,12 @@ def _parse_names(name: str, raw: str) -> tuple[str, ...]:
     return names
 
 
-def _parse_phrases_file(name: str, raw: str) -> Mapping[str, tuple[str, ...]]:
+def _parse_phrases_file(name: str, raw: str) -> Mapping[str, tuple[object, ...]]:
+    """The file's word sets by `WakeConfig` field, `aliases` as `DEFAULT_NAME_ALIASES` holds them.
+
+    Each alias must be one gate token; whether its name is configured, and that it is no name
+    itself, `_wake_config` checks, since the names come from another variable.
+    """
     path = _parse_absolute_path(name, raw)
     try:
         with open(path, encoding="utf-8") as handle:
@@ -785,8 +821,26 @@ def _parse_phrases_file(name: str, raw: str) -> Mapping[str, tuple[str, ...]]:
             f"{name}: {path} has unknown keys {', '.join(unknown)}; "
             f"expected any of {', '.join(_PHRASE_KEYS)}"
         )
-    sets: dict[str, tuple[str, ...]] = {}
+    sets: dict[str, tuple[object, ...]] = {}
     for key, items in content.items():
+        if key == "aliases":
+            if not isinstance(items, dict):
+                raise ValueError(f"{name}: {path} key 'aliases' must be an object")
+            aliases: list[tuple[str, tuple[str, ...]]] = []
+            for owner, words in items.items():
+                if not isinstance(words, list) or not all(isinstance(w, str) for w in words):
+                    raise ValueError(
+                        f"{name}: {path} aliases of {owner!r} must be a list of strings"
+                    )
+                for word in words:
+                    if not _ALIAS.fullmatch(word):
+                        raise ValueError(
+                            f"{name}: {path} alias {word!r} of {owner!r} is not one lower-case "
+                            "word of letters and digits, with apostrophes only inside"
+                        )
+                aliases.append((owner, tuple(words)))
+            sets[key] = tuple(aliases)
+            continue
         if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
             raise ValueError(f"{name}: {path} key {key!r} must be a list of strings")
         stripped = tuple(item.strip() for item in items)
@@ -826,6 +880,12 @@ def _wake_config(env: _Env, barge_in: BargeInConfig) -> WakeConfig:
             "MIST_VOICE_FOLLOWUP_WINDOW_MS", defaults.followup_window_ms
         ),
         attend_cue=env.boolean("MIST_VOICE_WAKE_ATTEND_CUE", defaults.attend_cue),
+        alias_window_ms=env.positive_integer(
+            "MIST_VOICE_WAKE_ALIAS_WINDOW_MS", defaults.alias_window_ms
+        ),
+        trailing_speech_ms=env.positive_integer(
+            "MIST_VOICE_WAKE_TRAILING_SPEECH_MS", defaults.trailing_speech_ms
+        ),
     )
     # Arbitration runs during the gate tail, so it must end by the time the tail does.
     if barge_in.wake_arbitration_ms > wake.gate_tail_ms:
@@ -834,7 +894,22 @@ def _wake_config(env: _Env, barge_in: BargeInConfig) -> WakeConfig:
             f"MIST_VOICE_WAKE_GATE_TAIL_MS, {wake.gate_tail_ms} ms; arbitration must end within "
             "the gate tail"
         )
-    return dataclasses.replace(wake, **env.phrases_file("MIST_VOICE_WAKE_PHRASES_FILE"))
+    sets = env.phrases_file("MIST_VOICE_WAKE_PHRASES_FILE")
+    # An alias of a name the spotter is not listening for could never be read, and a name
+    # listed as an alias would lose its own rules at the hit; either is a mistake in the file.
+    for owner, words in sets.get("aliases", ()):  # type: ignore[misc]
+        if owner not in wake.names:
+            raise ValueError(
+                f"MIST_VOICE_WAKE_PHRASES_FILE: aliases name {owner!r}, which is not one of "
+                f"the names, {', '.join(wake.names)}"
+            )
+        for word in words:
+            if word in wake.names:
+                raise ValueError(
+                    f"MIST_VOICE_WAKE_PHRASES_FILE: alias {word!r} of {owner!r} is a configured "
+                    "name"
+                )
+    return dataclasses.replace(wake, **sets)
 
 
 def _alarm_stop_keywords(env: _Env, name: str, barge_in: BargeInConfig) -> tuple[str, ...]:

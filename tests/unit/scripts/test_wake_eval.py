@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from backend.realtime.addressee import NameAlignment
 from backend.realtime.budget import EndpointingConfig, PlacementConfig, load_voice_settings
 from backend.realtime.engines.kws import read_manifest
 from backend.realtime.engines.parakeet_stt import OnnxAsrLibrary, ParakeetTranscriber
@@ -38,7 +39,7 @@ from backend.realtime.ingress import (
     onset_lead_frames,
 )
 from backend.realtime.protocol import Frame, MsgType
-from backend.realtime.speech import CancelToken, NameHit
+from backend.realtime.speech import CancelToken, HeardWord, NameHit
 from scripts.wake import eval_wake
 from scripts.wake import manifest as wake_manifest
 from tests.fakes.speech import EnergyVad, ScriptedNameSpotter, ScriptedTranscriber
@@ -854,6 +855,111 @@ def test_the_harness_reports_a_hit_in_silence_and_spans_it(tmp_path: Path) -> No
         assert driver._span(outcome.heard, position) == (bounded, end)
 
 
+def test_the_harness_keeps_the_last_speech_frame_heard_by_each_frame() -> None:
+    # Silence (frames 0 to 31), tone (32 to 63), then silence again (64 to 123).
+    samples = tone_and_silence([(False, 640), (True, 640), (False, 1200)])
+    cfg = EndpointingConfig()
+
+    heard = eval_wake._listen(samples.tobytes(), EnergyVad(), cfg)
+
+    # Ingress's rule, from the windows themselves: a window is scored once the frame holding
+    # its last sample arrives, and a speech window's last frame is the latest speech.
+    scorer = EnergyVad().open_stream()
+    floats = samples.astype(np.float32) / 32768.0
+    expected = []
+    latest = -1
+    window = 0
+    for pos in range(len(heard.frames)):
+        while (window + 1) * 512 <= (pos + 1) * 320:
+            start = window * 512
+            if scorer.score(floats[start : start + 512]) >= cfg.vad_threshold:
+                latest = (start + 511) // 320
+            window += 1
+        expected.append(latest)
+    assert heard.last_speech == tuple(expected)
+    assert heard.last_speech[31] == -1
+    assert heard.last_speech[-1] == heard.segments[-1][1]
+    assert all(value <= pos for pos, value in enumerate(heard.last_speech))
+
+
+def write_recording(tmp_path: Path, samples: np.ndarray) -> Path:
+    """One tune positive of these samples, and its manifest."""
+    recording = tmp_path / "recordings" / "p" / "a.wav"
+    recording.parent.mkdir(parents=True)
+    with wave.open(str(recording), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(samples.tobytes())
+    duration_ms = len(samples) * 1000 // RATE
+    return write_manifest(tmp_path, [entry("p/a.wav", duration_ms=duration_ms)])
+
+
+def spy_alignments(monkeypatch: pytest.MonkeyPatch) -> list[NameAlignment | None]:
+    """Every alignment the gate's `decide` is given, in order."""
+    seen: list[NameAlignment | None] = []
+    original = eval_wake.AddresseeGate.decide
+
+    def deciding(self: object, **kwargs: object) -> object:
+        seen.append(kwargs.get("alignment"))  # type: ignore[arg-type]
+        return original(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(eval_wake.AddresseeGate, "decide", deciding)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("parts", "hit_at", "speech"),
+    [
+        # A hit in the silence after the tone: the speech ended before it.
+        ([(False, 640), (True, 640), (False, 2400)], 70, "ended"),
+        # A hit in the tone: speech goes on past it, through the gate tail.
+        ([(False, 640), (True, 2000), (False, 1200)], 60, "going on"),
+        # No speech at all: no speech end is known.
+        ([(False, 3000)], 80, "none"),
+    ],
+)
+def test_the_gate_reads_the_decode_s_words_where_the_spotter_heard_the_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parts: list[tuple[bool, int]],
+    hit_at: int,
+    speech: str,
+) -> None:
+    seen = spy_alignments(monkeypatch)
+    (item,) = wake_manifest.load_manifest(
+        write_recording(tmp_path, tone_and_silence(parts))
+    ).entries
+    settings = load_voice_settings({})
+    spotter = ScriptedNameSpotter([NameHit(end_pos=hit_at, keyword="mist", score=0.9)])
+    # Every word is the name, 200 ms each from the decode's first sample.
+    transcriber = ScriptedTranscriber([" ".join(["mist"] * 60)], ms_per_word=200)
+    driver = eval_wake._Driver(
+        eval_wake.Engines(spotter=spotter, vad=EnergyVad(), transcriber=transcriber),
+        settings,
+        [0.5],
+        FakeClock(),
+    )
+
+    outcome = driver.run(item, 0)[0.5]
+
+    (found,) = outcome.hits
+    start, end = driver._span(outcome.heard, hit_at)
+    count = (end - start + 1) * FRAME_MS // 200
+    words = tuple(HeardWord("mist", start + 10 * i, start + 10 * i + 9) for i in range(count))
+    last = outcome.heard.last_speech[end]
+    speech_end = last if last >= 0 else None
+    assert seen == [NameAlignment(hit_at, FRAME_MS, speech_end, words)]
+    if speech == "ended":
+        assert speech_end is not None and speech_end < hit_at
+    elif speech == "going on":
+        assert speech_end is not None and speech_end > hit_at + 5
+    else:
+        assert speech_end is None
+    # The words through the gate tail cover the hit, and every one is the name.
+    assert found.at_hit == found.verdict.at_hit == "name"
+
+
 # -- The harness: refusals --------------------------------------------------------------------
 
 
@@ -1144,6 +1250,41 @@ def test_the_tuning_pass_writes_the_rates_per_threshold(tmp_path: Path) -> None:
     assert rows[0.7]["homophone_false_accepts"]["share"] == 0.0
 
 
+def test_the_report_counts_the_word_at_each_missed_positive_s_first_hit(tmp_path: Path) -> None:
+    argv, engines, out, _ = tune_setup(tmp_path)
+
+    assert engines.run(argv) == 0
+
+    rows = by_threshold(json.loads(out.read_text(encoding="utf-8")))
+    # At 0.3 p4 is missed on its decode, whose words the scripted STT times at the span's
+    # start, inside the alias window before its hit at frame 20, and none is a name.
+    assert rows[0.3]["false_reject"]["at_hit"] == {"other": 1}
+    # From 0.4 up the missed positives have no hit, so no word at one.
+    for threshold in (0.4, 0.5, 0.6, 0.7):
+        assert rows[threshold]["false_reject"]["at_hit"] == {}
+
+
+def test_a_hit_rejected_before_its_decode_has_no_timings(tmp_path: Path) -> None:
+    # The reference holds the name at 0.9, so the gate rejects p1's hit as self media.
+    recordings = tmp_path / "recordings"
+    write_wav(recordings / "p" / "ref.wav", tone_ms=1000, constant=REFERENCE_SAMPLE)
+    entries = [
+        entry("p/train.wav", split="train", session="s-train"),
+        entry("p/p1.wav", session="s-tune", reference_file="p/ref.wav"),
+    ]
+    path = write_manifest(tmp_path, entries)
+    training = wake_manifest.subset_sha256(wake_manifest.load_manifest(path), "train")
+    write_model(tmp_path / "models", training=training)
+    engines = rig([hit(offsets(entries, "tune"), "p/p1.wav", 25, 0.7)], [ADDRESSED])
+    out = tmp_path / "eval.json"
+
+    assert engines.run(harness_args(path, tmp_path / "models", out, "tune", "0.5")) == 0
+
+    (row,) = json.loads(out.read_text(encoding="utf-8"))["thresholds"]
+    assert row["false_reject"]["reasons"] == {"self_media": 1}
+    assert row["false_reject"]["at_hit"] == {"no_timings": 1}
+
+
 def test_the_tuning_pass_writes_latency_and_the_measured_hit_lag(tmp_path: Path) -> None:
     argv, engines, out, _ = tune_setup(tmp_path)
 
@@ -1251,6 +1392,90 @@ def test_accepted_wakes_equal_the_tuning_pass_count(tmp_path: Path) -> None:
     assert woken == reported == {0.3: 3, 0.4: 3, 0.5: 2, 0.6: 1, 0.7: 0}
 
 
+def tune_positives(tmp_path: Path) -> tuple[list[wake_manifest.Entry], Rig]:
+    """`tune_setup`'s four positives, which lead its tune split, and a fresh rig."""
+    _, engines, _, _ = tune_setup(tmp_path)
+    tune = wake_manifest.load_manifest(tmp_path / "manifest.json").split("tune")
+    return [item for item in tune if item.label == "positive"], engines
+
+
+def test_gate_checks_count_each_positive_s_first_hit(tmp_path: Path) -> None:
+    positives, engines = tune_positives(tmp_path)
+
+    checks = eval_wake.gate_checks(
+        positives,
+        eval_wake.Engines(
+            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
+        ),
+        load_voice_settings({}),
+        0.3,
+        engines.clock,
+    )
+
+    # p1 and p2 open with "hey mist", p3 says "mist" alone and p4's decode is unaddressed.
+    assert checks.first_hit == {"phrase": 2, "vocative": 1, "not_addressed": 1}
+    # p1 to p3 say the name alone ("hey mist", "mist"); p4 says it in a sentence.
+    assert checks.first_hit_by_group == {
+        "name_alone": {"phrase": 2, "vocative": 1},
+        "sentence": {"not_addressed": 1},
+    }
+    # The scripted STT times every word at its span's start: frame 0, in the alias window of a
+    # hit at frame 20 (p1, p2, p4) and before the window of p3's hit at frame 36.
+    assert checks.at_hit == {"name": 2, "other": 1, "none": 1}
+    # p3's hit lands 100 ms after its speech; the others' hits are in their tone.
+    assert checks.places == (
+        ("inside", None),
+        ("inside", None),
+        ("after", 100),
+        ("inside", None),
+    )
+
+
+def test_gate_checks_count_a_positive_with_no_hit(tmp_path: Path) -> None:
+    positives, engines = tune_positives(tmp_path)
+
+    checks = eval_wake.gate_checks(
+        positives,
+        eval_wake.Engines(
+            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
+        ),
+        load_voice_settings({}),
+        0.5,
+        engines.clock,
+    )
+
+    # At 0.5 p2 (0.45) and p4 (0.35) have no hit, and so no word or place at one. The script
+    # is read in decode order, so p3's decode is the second, "hey mist quokka".
+    assert checks.first_hit == {"no_hit": 2, "phrase": 2}
+    assert checks.first_hit_by_group == {
+        "name_alone": {"no_hit": 1, "phrase": 2},
+        "sentence": {"no_hit": 1},
+    }
+    assert sum(checks.at_hit.values()) == len(checks.places) == 2
+
+
+def test_gate_checks_count_a_first_hit_with_no_segment_before_it(tmp_path: Path) -> None:
+    # 2400 ms of silence and then 640 ms of tone: the hit at frame 50 has no segment before it.
+    samples = tone_and_silence([(False, 2400), (True, 640)])
+    (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
+    engines = rig([NameHit(end_pos=50, keyword="mist", score=0.9)], [])
+
+    checks = eval_wake.gate_checks(
+        [item],
+        eval_wake.Engines(
+            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
+        ),
+        load_voice_settings({}),
+        0.5,
+        engines.clock,
+    )
+
+    assert checks.places == (("no_segment", None),)
+    # The scripted decode past its script is empty: no word at the hit.
+    assert checks.at_hit == {"none": 1}
+    assert checks.first_hit == {"not_addressed": 1}
+
+
 def write_ambient(path: Path) -> None:
     """640 ms of silence, 640 ms of tone (frames 32 to 63), then 1200 ms of silence."""
     samples = tone_and_silence([(False, 640), (True, 640), (False, 1200)])
@@ -1329,6 +1554,45 @@ def test_a_failed_ambient_decode_is_rejected_counted_and_logged_by_number(
     assert "ambient file 1" in caplog.text
     assert "meeting-secret" not in caplog.text
     assert str(tmp_path) not in caplog.text
+
+
+def test_the_ambient_split_counts_hits_near_a_segment_and_the_rest(tmp_path: Path) -> None:
+    path = tmp_path / "ambient" / "a.wav"
+    write_ambient(path)
+    settings = load_voice_settings({})
+    heard = eval_wake._listen(wake_manifest.read_pcm16(path), EnergyVad(), settings.endpointing)
+    ((onset, last),) = heard.segments
+    lead = onset_lead_frames(settings.endpointing)
+    assert eval_wake.SPLIT_POST_ROLL_MS == 500
+    positions = {
+        "no segment": 2,
+        "pre-roll": onset - lead,
+        "speech": (onset + last) // 2,
+        "400 ms past": last + 400 // FRAME_MS,
+        "600 ms past": last + 600 // FRAME_MS,
+    }
+    assert positions["no segment"] < onset - lead
+    assert positions["600 ms past"] < len(heard.frames)
+    hits = [NameHit(end_pos=pos, keyword="mist", score=0.7) for pos in positions.values()]
+    # Every decode is past the script, so empty: the split counts hits reported, not accepted.
+    engines = rig(hits, [])
+    gate = eval_wake.AmbientGate(
+        eval_wake.Engines(
+            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
+        ),
+        settings,
+        engines.clock,
+    )
+
+    assert gate.hit_places(path, 0.5) == (3, 2)
+
+    # The split reads the hits `accepted_hits` recorded: no second pass over the file.
+    assert gate.accepted_hits(path, 0.5) == 0
+    decodes, streams = gate.decodes, len(engines.spotter.streams)
+    assert gate.hit_places(path, 0.5) == (3, 2)
+    assert (gate.decodes, len(engines.spotter.streams)) == (decodes, streams)
+    # Above every hit's score nothing is reported.
+    assert gate.hit_places(path, 0.8) == (0, 0)
 
 
 # -- The harness: the test pass ---------------------------------------------------------------

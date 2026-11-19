@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 from backend.chat.stream_events import Complete, HandOff, StateHint, StreamEvent, Token, WSEvent
 from backend.chat.turn_scope import CommitResult, TurnDelivery, TurnRequest, TurnScope
 
-from .addressee import AddresseeGate
+from .addressee import AddresseeGate, NameAlignment
 from .bargein import BargeInPolicy, BargeInVerdict
 from .budget import (
     BUDGET_FIELDS,
@@ -159,6 +159,7 @@ from .speech import (
     NEUTRAL_STATE,
     SPEAKING_STATES,
     CancelToken,
+    HeardWord,
     Phase,
     SpeechSynthesizer,
     SpotterCalibration,
@@ -1507,7 +1508,7 @@ class TurnController:
             wake = self._candidate_of(utterance.utterance_id)
             if wake is not None:
                 if event.gate and wake.gate_requested:
-                    await self._decide(wake, event.text)
+                    await self._decide(wake, event.text, event.words, event.speech_end_pos)
             elif utterance.followup:
                 await self._judge_followup(utterance)
             return
@@ -1946,7 +1947,8 @@ class TurnController:
 
         Check b needs no decode. Check c reads the one gate decode through the hit plus
         `gate_tail_ms`; when ingress has already ended the candidate, no decode can come, and its
-        final transcript, held meanwhile, is read instead.
+        final transcript, held meanwhile, is read instead, with its words and no speech end: it
+        holds the whole utterance, so nothing was cut off after the name.
         """
         if not wake.proceed or wake.utterance_id is None or wake.gate_requested:
             return
@@ -1959,16 +1961,35 @@ class TurnController:
         utterance = self._utterances[wake.utterance_id]
         ended = [e for e in utterance.held_ends if isinstance(e, UtteranceEnded)]
         if ended:
-            await self._decide(wake, ended[-1].text)
+            await self._decide(wake, ended[-1].text, ended[-1].words, None)
             return
         wake.gate_requested = True
         assert self._ingress is not None  # noqa: S101 - a candidate is open on it
         through = wake.hit_pos + self._wake.gate_tail_ms // self._frame_ms
         self._ingress.request_gate_partial(wake.utterance_id, through)
 
-    async def _decide(self, wake: _Wake, text: str) -> None:
+    async def _decide(
+        self,
+        wake: _Wake,
+        text: str,
+        words: tuple[HeardWord, ...] | None,
+        speech_end_pos: int | None,
+    ) -> None:
+        """Check c: the gate reads the decode, at the hit for a server wake.
+
+        Only the server spotter's hit is an uplink position the words can be compared with; an
+        endpoint wake's hit is placed from its backlog, so it is decided on its text alone.
+        """
+        alignment = (
+            NameAlignment(wake.hit_pos, self._frame_ms, speech_end_pos, words)
+            if wake.source == "server"
+            else None
+        )
         verdict = self._gate.decide(
-            text=text, score=wake.score, reference_score=wake.reference_score
+            text=text,
+            score=wake.score,
+            reference_score=wake.reference_score,
+            alignment=alignment,
         )
         if verdict.accepted:
             await self._accept_wake(wake)

@@ -36,6 +36,7 @@ from .lanes import LaneJobCancelled
 from .protocol import Frame, Spotter
 from .speech import (
     CancelToken,
+    HeardWord,
     NameHit,
     NameSpotter,
     NameSpotterStream,
@@ -45,6 +46,7 @@ from .speech import (
     TurnEndDetector,
     VadStream,
     VoiceActivityDetector,
+    WordTiming,
 )
 
 logger = logging.getLogger(__name__)
@@ -265,6 +267,11 @@ class TranscriptPartial:
     `uncovered_since_ms` is the arrival of the oldest frame the previous partial did not cover,
     from which the session measures caption lag. `gate` marks the out-of-cadence decode the
     controller asked for through `through_pos`.
+
+    `words` are the decode's words with the uplink positions they were heard in, None when the
+    engine gave no timings. A gate partial's `speech_end_pos` is the last frame of the latest
+    VAD window judged speech when its decode started, or None before any speech, so the
+    addressee gate can tell whether speech went on past the name.
     """
 
     epoch: int
@@ -278,6 +285,8 @@ class TranscriptPartial:
     uncovered_since_ms: int
     gate: bool = False
     through_pos: int | None = None
+    words: tuple[HeardWord, ...] | None = None
+    speech_end_pos: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +303,10 @@ class EndpointCandidate:
 
 @dataclass(frozen=True, slots=True)
 class UtteranceEnded:
-    """A confirmed end, with why it ended and the final transcript's scores; text is never empty."""
+    """A confirmed end, with why it ended and the final transcript's scores; text is never empty.
+
+    `words` are the final transcript's words with their uplink positions, as a partial's are.
+    """
 
     epoch: int
     event_seq: int
@@ -308,6 +320,7 @@ class UtteranceEnded:
     no_speech_prob: float | None
     avg_logprob: float | None
     heard_at_ms: int
+    words: tuple[HeardWord, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,6 +574,27 @@ class _Utterance:
     def duration_ms(self, last_pos: int) -> int:
         return max(0, last_pos - self.first_pos + 1) * FRAME_MS
 
+    def heard(self, words: tuple[WordTiming, ...] | None) -> tuple[HeardWord, ...] | None:
+        """An update's words at the uplink positions of the frames pushed into the stream.
+
+        A word's milliseconds count from the stream's first sample, and the stream holds the
+        pushed frames in order, 20 ms each, so the k-th 20 ms is `positions[k]`: frames the
+        uplink lost or the queue dropped take no time in the stream, and a word heard across
+        such a gap spans it. An end is exclusive, so a word's last frame holds its last
+        millisecond.
+        """
+        if words is None or not self.positions:
+            return None
+        last = len(self.positions) - 1
+        return tuple(
+            HeardWord(
+                word.text,
+                self.positions[min(word.start_ms // FRAME_MS, last)],
+                self.positions[min(max(word.end_ms - 1, word.start_ms) // FRAME_MS, last)],
+            )
+            for word in words
+        )
+
 
 def _spotter_job(
     stream: NameSpotterStream,
@@ -659,6 +693,9 @@ class AudioIngress:
         self._vad_generation = 0
         self._tracker = SpeechSegmentTracker(endpointing)
         self._segments: deque[tuple[int, int]] = deque()
+        # The last frame of the latest VAD window judged speech, segment open or not: a gate
+        # partial carries it, so the gate can tell speech that went on past the name.
+        self._last_speech_pos: int | None = None
         self._processed_pos: int | None = None
 
         self._utt: _Utterance | None = None
@@ -1071,6 +1108,8 @@ class AudioIngress:
     # -- Speech segments --------------------------------------------------------------------------
 
     def _on_window(self, speech: bool, first: int, last: int) -> None:
+        if speech:
+            self._last_speech_pos = last
         step = self._tracker.window(speech, first, last)
         if step.closed is not None:
             self._segments.append(step.closed)
@@ -1446,11 +1485,16 @@ class AudioIngress:
 
     def _start_decode(self, utt: _Utterance, *, gate: bool) -> None:
         utt.decoding = True
-        task = self._spawn(self._decode_partial(utt, utt.last_pushed, gate))
+        # Read as the decode starts: frames through `through_pos` have arrived, and later
+        # speech is not in the decode.
+        speech_end = self._last_speech_pos if gate else None
+        task = self._spawn(self._decode_partial(utt, utt.last_pushed, gate, speech_end))
         utt.tasks.add(task)
         task.add_done_callback(utt.tasks.discard)
 
-    async def _decode_partial(self, utt: _Utterance, end_pos: int, gate: bool) -> None:
+    async def _decode_partial(
+        self, utt: _Utterance, end_pos: int, gate: bool, speech_end: int | None
+    ) -> None:
         token = utt.decode_token
         try:
             update = await self._lanes.stt.run(utt.stream.decode_partial, token, token=token)
@@ -1486,6 +1530,8 @@ class AudioIngress:
                 uncovered,
                 gate,
                 through,
+                utt.heard(update.words),
+                speech_end,
             )
         )
         if gate:
@@ -1644,6 +1690,7 @@ class AudioIngress:
                 final.no_speech_prob,
                 final.avg_logprob,
                 utt.arrival(utt.final_end),
+                utt.heard(final.words),
             )
         )
         self._finish(utt, utt.final_end)

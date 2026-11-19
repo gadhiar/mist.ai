@@ -26,6 +26,7 @@ from backend.realtime.budget import (
     BUDGET_PRESETS,
     DEFAULT_ADDRESS_STARTS,
     DEFAULT_GREETINGS,
+    DEFAULT_NAME_ALIASES,
     DEFAULT_STOP_BEFORE,
     DEFAULT_WAKE_PHRASES,
     STAGE_FIELDS,
@@ -356,6 +357,15 @@ CONFIG_DEFAULTS = [
             "endpoint_min_backlog_ms": 1500,
             "followup_window_ms": 0,
             "attend_cue": True,
+            # Raj's approval of v16, 18 Nov: the diagnostics' near spellings of the name.
+            "aliases": (
+                (
+                    "mist",
+                    ("missed", "miss", "myst", "midst", "mists", "mist's", "must", "mest"),
+                ),
+            ),
+            "alias_window_ms": 400,
+            "trailing_speech_ms": 100,
         },
         id="wake",
     ),
@@ -602,6 +612,8 @@ VARIABLES = [
     ("MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS", "2000", "wake.endpoint_min_backlog_ms", 2000),
     ("MIST_VOICE_FOLLOWUP_WINDOW_MS", "4000", "wake.followup_window_ms", 4000),
     ("MIST_VOICE_WAKE_ATTEND_CUE", "false", "wake.attend_cue", False),
+    ("MIST_VOICE_WAKE_ALIAS_WINDOW_MS", "500", "wake.alias_window_ms", 500),
+    ("MIST_VOICE_WAKE_TRAILING_SPEECH_MS", "160", "wake.trailing_speech_ms", 160),
     ("MIST_VOICE_KWS_MODEL", "mist-wake-2", "placement.kws_model", "mist-wake-2"),
     ("MIST_VOICE_KWS_THREADS", "2", "placement.kws_threads", 2),
     ("MIST_VOICE_CHARACTER", "false", "playback.character", None),
@@ -682,6 +694,8 @@ class TestLoadVoiceSettingsVariables:
             "MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS",
             "MIST_VOICE_FOLLOWUP_WINDOW_MS",
             "MIST_VOICE_WAKE_ATTEND_CUE",
+            "MIST_VOICE_WAKE_ALIAS_WINDOW_MS",
+            "MIST_VOICE_WAKE_TRAILING_SPEECH_MS",
             "MIST_VOICE_KWS_MODEL",
             "MIST_VOICE_KWS_THREADS",
             "MIST_VOICE_BUDGET",
@@ -777,6 +791,63 @@ class TestWakePhrasesFile:
 
         assert wake.address_starts == ("what", "find")
         assert wake.stop_before == ("the",)
+
+    def test_the_default_aliases_are_the_diagnostics_near_spellings_of_mist(self):
+        assert WakeConfig().aliases == DEFAULT_NAME_ALIASES
+        assert DEFAULT_NAME_ALIASES == (
+            ("mist", ("missed", "miss", "myst", "midst", "mists", "mist's", "must", "mest")),
+        )
+
+    def test_a_file_replaces_the_aliases_and_keeps_the_other_sets(self, tmp_path):
+        environ = {
+            **_phrases_file(tmp_path, {"aliases": {"mist": ["myst", "missed"], "nova": []}}),
+            "MIST_VOICE_WAKE_NAMES": "mist,nova",
+        }
+
+        wake = load_voice_settings(environ).wake
+
+        assert wake.aliases == (("mist", ("myst", "missed")), ("nova", ()))
+        assert wake.phrases == DEFAULT_WAKE_PHRASES
+
+    def test_an_empty_aliases_object_turns_the_aliases_off(self, tmp_path):
+        wake = load_voice_settings(_phrases_file(tmp_path, {"aliases": {}})).wake
+
+        assert wake.aliases == ()
+
+    def test_a_file_without_aliases_keeps_the_default_ones(self, tmp_path):
+        wake = load_voice_settings(_phrases_file(tmp_path, {"greetings": ["hey"]})).wake
+
+        assert wake.aliases == DEFAULT_NAME_ALIASES
+
+    @pytest.mark.parametrize(
+        "aliases",
+        [
+            pytest.param({"nova": ["nover"]}, id="unknown-name"),
+            pytest.param({"mist": ["Missed"]}, id="upper-case"),
+            pytest.param({"mist": ["two words"]}, id="two-words"),
+            pytest.param({"mist": ["mist-y"]}, id="hyphen"),
+            pytest.param({"mist": ["'mist"]}, id="leading-apostrophe"),
+            pytest.param({"mist": [""]}, id="empty"),
+            pytest.param({"mist": [3]}, id="not-a-string"),
+            pytest.param({"mist": "missed"}, id="not-a-list"),
+            pytest.param(["missed"], id="not-an-object"),
+            pytest.param({"mist": ["mist"]}, id="the-name-itself"),
+        ],
+    )
+    def test_a_bad_alias_entry_raises_naming_the_file_variable(self, tmp_path, aliases):
+        environ = _phrases_file(tmp_path, {"aliases": aliases})
+
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_PHRASES_FILE"):
+            load_voice_settings(environ)
+
+    def test_another_configured_name_given_as_an_alias_raises(self, tmp_path):
+        environ = {
+            **_phrases_file(tmp_path, {"aliases": {"nova": ["mist"]}}),
+            "MIST_VOICE_WAKE_NAMES": "mist,nova",
+        }
+
+        with pytest.raises(ValueError, match="MIST_VOICE_WAKE_PHRASES_FILE.*configured name"):
+            load_voice_settings(environ)
 
 
 CHAIN_VARIABLES = [
@@ -944,6 +1015,8 @@ class TestLoadVoiceSettingsErrors:
             "MIST_VOICE_WAKE_JOIN_GAP_MS",
             "MIST_VOICE_WAKE_GATE_TAIL_MS",
             "MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS",
+            "MIST_VOICE_WAKE_ALIAS_WINDOW_MS",
+            "MIST_VOICE_WAKE_TRAILING_SPEECH_MS",
         ],
     )
     def test_a_zero_wake_interval_raises_naming_the_variable(self, name):

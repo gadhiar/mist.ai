@@ -568,6 +568,14 @@ def test_the_printed_lines_are_counts_rates_hours_and_timing(
         "gate, tune positives: 4 cutoffs, 3 decodes, 0 failed, 1.5 s wall",
         "ambient VAD: 2 files, 0.0 s wall",
         "gate at 0.96: 0 false wakes, 1 decodes, 0 failed, 0.5 s wall",
+        "gate checks at 0.96: first hit of 3 tune positives: vocative 3",
+        "gate checks at 0.96: name alone 3: vocative 3; in a sentence 0: none",
+        "gate checks at 0.96: word at the first hit: "
+        "name 0, alias 0, other 0, none 0, no timings 3",
+        "gate checks at 0.96: first hit inside a segment 3, after a segment 0, "
+        "with no segment before it 0",
+        "ambient split at 0.96: 1 hits from a segment's pre-roll to 500 ms past its speech "
+        "(100.000 per hour), 0 others (0.000 per hour)",
         "tune positives: 3",
         "cutoff 0.2: wakes 3/3, false wakes 4 (400.000 per hour), "
         "gated wakes 3/3, gated false wakes not run",
@@ -580,9 +588,86 @@ def test_the_printed_lines_are_counts_rates_hours_and_timing(
         "bar: pass at 0.96",
     ]
     names = ["meeting-101", "meeting-102", "tune-a", "tune-b", "tune-c", "eval.json", "manifest"]
-    for name in names + ["what's", "rolled"]:
+    # No transcript, and no phrase of the manifest ("hey mist", "hey missed").
+    for name in names + ["what's", "rolled", "hey", "missed"]:
         assert name not in captured.out
         assert name not in captured.err
+
+
+def test_the_gate_checks_print_at_the_highest_cutoff_with_spotter_only_wakes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Positive 4 says the name in a sentence, and its decode is unaddressed: no cutoff has
+    # enough gated wakes, so the ambient set is not gated, and every cutoff has the
+    # spotter-only wakes; the checks print at the highest, 0.96.
+    entries = tuple(
+        (
+            entry("p/tune-c.wav", 4, "positive", "tune", phrase="so what's the time mist")
+            if item["file"] == "p/tune-c.wav"
+            else (item, value)
+        )
+        for item, value in DEFAULT_ENTRIES
+    )
+    run = prepare(tmp_path, entries=entries, texts={4: UNADDRESSED})
+
+    assert run.run() == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    checks = [line for line in lines if line.startswith(("gate checks", "ambient split"))]
+    assert checks == [
+        "gate checks at 0.96: first hit of 3 tune positives: not_addressed 1, vocative 2",
+        "gate checks at 0.96: name alone 2: vocative 2; in a sentence 1: not_addressed 1",
+        "gate checks at 0.96: word at the first hit: "
+        "name 0, alias 0, other 0, none 0, no timings 3",
+        "gate checks at 0.96: first hit inside a segment 3, after a segment 0, "
+        "with no segment before it 0",
+    ]
+    # They follow the gate lines, before the summary.
+    assert lines.index(checks[0]) == lines.index("tune positives: 3") - len(checks)
+    assert "what's" not in "\n".join(lines)
+
+
+def test_the_gate_check_lines_give_the_spread_of_hits_after_the_speech() -> None:
+    checks = eval_wake.GateChecks(
+        first_hit={"no_hit": 1, "not_addressed": 2, "vocative": 3},
+        first_hit_by_group={
+            "name_alone": {"not_addressed": 1, "vocative": 3},
+            "sentence": {"no_hit": 1, "not_addressed": 1},
+        },
+        at_hit={"alias": 2, "name": 1, "no_timings": 1, "other": 1},
+        places=(
+            ("after", 180),
+            ("inside", None),
+            ("after", 100),
+            ("no_segment", None),
+            ("inside", None),
+        ),
+    )
+
+    assert spotter_eval.check_lines(0.5, checks) == [
+        "gate checks at 0.5: first hit of 6 tune positives: "
+        "no_hit 1, not_addressed 2, vocative 3",
+        "gate checks at 0.5: name alone 4: not_addressed 1, vocative 3; "
+        "in a sentence 2: no_hit 1, not_addressed 1",
+        "gate checks at 0.5: word at the first hit: "
+        "name 1, alias 2, other 1, none 0, no timings 1",
+        "gate checks at 0.5: first hit inside a segment 2, after a segment 2 "
+        "(min 100, median 140, max 180 ms), with no segment before it 1",
+    ]
+
+
+def test_no_gate_checks_print_when_no_cutoff_has_the_spotter_only_wakes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # At 0.98 only positive 3 wakes the spotter, one of the three needed.
+    run = prepare(tmp_path)
+
+    assert run.run(cutoffs="0.98") == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert [line for line in lines if line.startswith(("gate checks", "ambient split"))] == [
+        "gate checks: not run, no cutoff has enough spotter-only wakes"
+    ]
 
 
 def test_the_progress_lines_are_flushed_as_each_gated_pass_finishes(

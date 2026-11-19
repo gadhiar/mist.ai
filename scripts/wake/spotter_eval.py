@@ -59,7 +59,12 @@ What it prints is counts, rates, hours and timings, never a file name or a trans
 ambient hours, the scoring's wall time and its real-time factor (the cost, per session, of
 ingress feeding the spotter every frame), a gate line for the tune positives, the ambient VAD
 pass's wall time and a gate line for the gated cutoff, each gate line with its decodes, failed
-decodes and wall time, then each cutoff's wakes and false wakes, spotter-only and gated, and
+decodes and wall time; then the gate checks (`check_lines`) at the bar's cutoff when it passes,
+else at the highest cutoff with enough spotter-only wakes: each tune positive's first hit by
+its gate check, overall and for the name said alone or in a sentence, the word the decode wrote
+at it, and where it landed against the VAD's segments; and, when the ambient set was gated, its
+reported hits split into those from a segment's pre-roll to 500 ms past its speech and the
+rest. Then each cutoff's wakes and false wakes, spotter-only and gated, and
 `bar: pass at <c>` or `bar: no cutoff passes`. Each progress line is flushed as its pass ends. A
 log line names an ambient file only as "ambient file <i>", its place in name order. Exit 0 when
 the evaluation is written and the bar passes, 1 when it is written and no cutoff passes, 2 when
@@ -73,6 +78,7 @@ import json
 import math
 import os
 import re
+import statistics
 import sys
 import time
 import wave
@@ -86,12 +92,15 @@ from backend.realtime.engines.kws import hit_steps, read_manifest
 from backend.realtime.errors import SpeechEngineError
 
 from .eval_wake import (
+    SPLIT_POST_ROLL_MS,
     AmbientGate,
     DecodeCounts,
     EngineLoader,
     Engines,
+    GateChecks,
     RefusedError,
     accepted_wakes,
+    gate_checks,
     real_engines,
 )
 from .manifest import Entry, ManifestError, load_manifest, read_pcm16, subset_sha256
@@ -219,6 +228,58 @@ def passing_cutoff(
         return None
     rate = dict(zip(cutoffs, gated_rates, strict=True))[cutoff]
     return cutoff if rate is not None and rate <= MAX_FALSE_WAKES_PER_HOUR else None
+
+
+def checks_cutoff(
+    cutoffs: Sequence[float],
+    gated_wakes: Sequence[int],
+    gated_rates: Sequence[float | None],
+    scores: Sequence[float],
+) -> float | None:
+    """The cutoff the gate checks are printed at, else None.
+
+    The bar's cutoff when it passes; else the highest cutoff whose spotter-only wakes reach
+    ceil(14n/18), the cutoff a spotter good enough for the bar would run at, so the checks say
+    what the gate does there.
+    """
+    passed = passing_cutoff(cutoffs, gated_wakes, gated_rates, len(scores))
+    if passed is not None:
+        return passed
+    needed = required_wakes(len(scores))
+    return max((cutoff for cutoff in cutoffs if wakes_at(cutoff, scores) >= needed), default=None)
+
+
+_AT_HIT_ORDER = ("name", "alias", "other", "none", "no_timings")
+
+
+def _counts(counts: Mapping[str, int]) -> str:
+    return ", ".join(f"{key} {value}" for key, value in sorted(counts.items())) or "none"
+
+
+def check_lines(cutoff: float, checks: GateChecks) -> list[str]:
+    """The gate-check lines at `cutoff`: counts and milliseconds, never a phrase or a file."""
+    prefix = f"gate checks at {cutoff}:"
+    alone = checks.first_hit_by_group["name_alone"]
+    sentence = checks.first_hit_by_group["sentence"]
+    words = ", ".join(
+        f"{key.replace('_', ' ')} {checks.at_hit.get(key, 0)}" for key in _AT_HIT_ORDER
+    )
+    lags = sorted(lag for place, lag in checks.places if place == "after" and lag is not None)
+    after = f"after a segment {len(lags)}"
+    if lags:
+        median = round(float(statistics.median(lags)))
+        after += f" (min {lags[0]}, median {median}, max {lags[-1]} ms)"
+    inside = sum(place == "inside" for place, _ in checks.places)
+    unsegmented = sum(place == "no_segment" for place, _ in checks.places)
+    return [
+        f"{prefix} first hit of {sum(checks.first_hit.values())} tune positives: "
+        f"{_counts(checks.first_hit)}",
+        f"{prefix} name alone {sum(alone.values())}: {_counts(alone)}; "
+        f"in a sentence {sum(sentence.values())}: {_counts(sentence)}",
+        f"{prefix} word at the first hit: {words}",
+        f"{prefix} first hit inside a segment {inside}, {after}, "
+        f"with no segment before it {unsegmented}",
+    ]
 
 
 # -- Inputs -----------------------------------------------------------------------------------
@@ -351,8 +412,9 @@ def evaluate(
 
     `engines.spotter` scores as `AmbientSpotter` too, as `MicroNameSpotter` does. The gated
     wakes come from `accepted_wakes` at every cutoff; the ambient set is gated at the highest
-    cutoff with enough of them, if any, through `AmbientGate`. `progress` takes each progress
-    line as its pass ends.
+    cutoff with enough of them, if any, through `AmbientGate`. The gate checks then run over the
+    positives once more, at `checks_cutoff`; their decodes are not in the evaluation's counts.
+    `progress` takes each progress line as its pass ends.
 
     Raises:
         RefusedError: The spotter-only false-accept rates rise with the cutoff.
@@ -377,6 +439,7 @@ def evaluate(
     false_wakes: dict[float, int | None] = dict.fromkeys(cutoffs)
 
     cutoff = gated_cutoff(cutoffs, gated_wakes, len(positives))
+    split: tuple[int, int] | None = None
     if cutoff is not None:
         gate = AmbientGate(engines, settings, clock)
         start = clock()
@@ -389,6 +452,23 @@ def evaluate(
         progress(
             f"gate at {cutoff}: {false_wakes[cutoff]} false wakes, {gate.decodes} decodes, "
             f"{gate.decode_errors} failed, {ambient_s - gate.listen_s:.1f} s wall"
+        )
+        places = [gate.hit_places(item.path, cutoff) for item in ambient]
+        split = (sum(near for near, _ in places), sum(rest for _, rest in places))
+
+    gated_rates = [None if count is None else count / hours for count in false_wakes.values()]
+    at = checks_cutoff(cutoffs, gated_wakes, gated_rates, scored.scores)
+    if at is None:
+        progress("gate checks: not run, no cutoff has enough spotter-only wakes")
+    else:
+        for line in check_lines(at, gate_checks(positives, engines, settings, at, clock)):
+            progress(line)
+    if split is not None:
+        near, rest = split
+        progress(
+            f"ambient split at {cutoff}: {near} hits from a segment's pre-roll to "
+            f"{SPLIT_POST_ROLL_MS} ms past its speech ({near / hours:.3f} per hour), "
+            f"{rest} others ({rest / hours:.3f} per hour)"
         )
 
     return Evaluation(
