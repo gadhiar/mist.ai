@@ -115,8 +115,11 @@ void MistPlayer::loop() {
   }
   const uint32_t now = millis();
 
+  // Only an output started for the current turn counts. After `halt_output_()` the mixer source
+  // keeps reporting the halted turn's mixed tail until it has played, and a new turn whose
+  // prebuffer is already queued (so `playing()`) would otherwise take it as its own.
   const uint32_t played = this->played_frames_.exchange(0);
-  if (played > 0) {
+  if (played > 0 && this->speaker_active_) {
     this->in_speaker_ = played < this->in_speaker_ ? this->in_speaker_ - played : 0;
     this->queue_.on_played(played, now);
   }
