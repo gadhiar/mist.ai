@@ -14,6 +14,18 @@ times, from which the caption lag follows; each GPU engine's VRAM as `build_spee
 measured it; what STT made of the noise bursts and whether ingress's drop rule drops it; the
 keyword-over-echo transcripts; and Pocket's first-chunk time, real-time factor and peak per
 segment length.
+
+Word timings, per STT engine. On the generated `wake` fixtures, the final's first word must
+overlap the fixture's name span within 160 ms. `MIST_VOICE_WORDS_DIR`, when set, names a directory
+of 16 kHz mono PCM16 WAVs, each a name said alone, synthetic or public only; the test that reads
+it skips naming the variable when it is unset. Each clip's name span runs from its first to its
+last 10 ms frame within 30 dB of its loudest. Each clip is decoded alone, with 500 ms of silence
+before it and 1000 ms after, and followed 150 ms later by the next clip (the last by the first),
+padded the same. The word overlapping the name span most must overlap the 400 ms alias window
+before a hit 100 ms and a hit 180 ms after the name's end. Its records hold counts and the name
+word's start and end errors in ms, never a transcript. Parakeet's last word ends where the
+decoded audio ends, so a lone clip's end error is about its 1000 ms of padding; the pairs' first
+names measure its word ends.
 """
 
 from __future__ import annotations
@@ -34,9 +46,16 @@ import pytest
 
 from backend.realtime.budget import EndpointingConfig, EngineOption, VoiceSettings
 from backend.realtime.errors import SpeechEngineError
-from backend.realtime.speech import CancelToken, StreamingTranscriber, TextSegment
+from backend.realtime.speech import CancelToken, StreamingTranscriber, TextSegment, WordTiming
 from scripts.model_bench.speech.wer import word_error_rate
-from scripts.voice_fixtures.generate_fixtures import FixtureEntry, Manifest, samples
+from scripts.voice_fixtures.generate_fixtures import (
+    FixtureEntry,
+    FixtureError,
+    Manifest,
+    Span,
+    read_wav,
+    samples,
+)
 
 pytestmark = pytest.mark.speech_models
 
@@ -52,6 +71,21 @@ RATE = 16000
 FRAME_SAMPLES = RATE // 50
 VAD_WINDOW = 512
 WER_SCENARIOS = ("complete", "pause", "hesitation", "wake")
+
+# Word timings. A wake fixture's first word must overlap its name span widened by this much.
+WAKE_NAME_TOLERANCE_MS = 160
+# The synthetic name clips (H33): the variable, the name-span rule, and how each is decoded.
+WORDS_DIR_VARIABLE = "MIST_VOICE_WORDS_DIR"
+NAME_SPAN_FRAME_MS = 10
+NAME_SPAN_DB = 30.0
+NAME_LEAD_MS = 500
+NAME_TAIL_MS = 1000
+NAME_PAIR_GAP_MS = 150
+# The measured median and maximum lag of a spotter hit after the name's speech ended.
+HIT_LAGS_MS = (100, 180)
+# Design 4's alias window, the stretch before a hit where the gate reads a near spelling of the
+# name. T69 adds it as the wake setting `alias_window_ms`, default 400; this literal stands in.
+ALIAS_WINDOW_MS = 400
 
 # An invented passage, cut at word boundaries into segments of about each length.
 TTS_PASSAGE = (
@@ -294,6 +328,7 @@ class Transcription:
     avg_logprob: float | None
     partial_ms: list[float]
     final_ms: float
+    words: tuple[WordTiming, ...] | None = None
 
 
 def _transcribe(
@@ -315,7 +350,9 @@ def _transcribe(
         final_ms = (time.perf_counter() - start) * 1000
     finally:
         stream.close()
-    return Transcription(final.text, final.no_speech_prob, final.avg_logprob, partial_ms, final_ms)
+    return Transcription(
+        final.text, final.no_speech_prob, final.avg_logprob, partial_ms, final_ms, final.words
+    )
 
 
 def _timing_summary(values: list[float]) -> dict[str, float | int]:
@@ -410,6 +447,215 @@ def test_stt_keyword_over_echo_transcripts_are_recorded(
             text=result.text,
             keyword_heard=keyword.lower() in result.text.lower(),
         )
+
+
+# -- STT word timings -------------------------------------------------------------------------
+
+
+def _overlap_ms(word: WordTiming, span: Span) -> int:
+    return min(word.end_ms, span.end_ms) - max(word.start_ms, span.start_ms)
+
+
+def _near(word: WordTiming, span: Span, tolerance_ms: int) -> bool:
+    """Whether the word overlaps the span widened by `tolerance_ms` on each side."""
+    return word.start_ms < span.end_ms + tolerance_ms and word.end_ms > span.start_ms - tolerance_ms
+
+
+def _timing_outcome(result: Transcription) -> str | None:
+    """`no_timings` for text without words, `no_text` for an empty final, else None."""
+    if not result.text.strip():
+        return "no_text"
+    if result.words is None:
+        return "no_timings"
+    return None
+
+
+def test_stt_word_timings_on_the_wake_fixtures(
+    stt, voice_settings, manifest, fixture_audio, speech_record
+):
+    engine, transcriber = stt.engine, stt.transcriber
+    interval = voice_settings.endpointing.stt_partial_interval_ms
+    outcomes: dict[str, str] = {}
+    for entry in _entries(manifest, "wake"):
+        result = _transcribe(transcriber, fixture_audio(entry), interval)
+        name = entry.speech[0]
+        outcome = _timing_outcome(result)
+        first = result.words[0] if result.words else None
+        fields: dict[str, object] = {}
+        if outcome is None and first is None:
+            outcome = "no_word"
+        elif outcome is None and first is not None:
+            outcome = "near" if _near(first, name, WAKE_NAME_TOLERANCE_MS) else "far"
+            fields = {
+                "start_error_ms": first.start_ms - name.start_ms,
+                "end_error_ms": first.end_ms - name.end_ms,
+            }
+        outcomes[entry.id] = outcome
+        speech_record(
+            "stt_wake_name_word", engine=engine, fixture=entry.id, outcome=outcome, **fields
+        )
+
+    counts = {kind: list(outcomes.values()).count(kind) for kind in sorted(set(outcomes.values()))}
+    speech_record("stt_wake_name_words", engine=engine, **counts)
+    assert outcomes, "the manifest has no wake fixtures"
+    misses = {key: kind for key, kind in outcomes.items() if kind != "near"}
+    assert (
+        not misses
+    ), f"{engine}: the first word is not within {WAKE_NAME_TOLERANCE_MS} ms of the name: {misses}"
+
+
+def name_span(audio: np.ndarray) -> Span | None:
+    """From the first to the last 10 ms frame within `NAME_SPAN_DB` of the loudest frame's RMS.
+
+    None for a clip with no frame above digital silence.
+    """
+    frame = samples(NAME_SPAN_FRAME_MS)
+    count = len(audio) // frame
+    if count == 0:
+        return None
+    frames = audio[: count * frame].astype(np.float64).reshape(count, frame)
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    loudest = float(rms.max())
+    if loudest <= 0.0:
+        return None
+    loud = np.flatnonzero(rms >= loudest * 10 ** (-NAME_SPAN_DB / 20))
+    return Span(int(loud[0]) * NAME_SPAN_FRAME_MS, (int(loud[-1]) + 1) * NAME_SPAN_FRAME_MS)
+
+
+def name_word(words: tuple[WordTiming, ...], span: Span) -> WordTiming | None:
+    """The word overlapping the name span most, or None when no word overlaps it."""
+    best = max(words, key=lambda word: _overlap_ms(word, span), default=None)
+    if best is None or _overlap_ms(best, span) <= 0:
+        return None
+    return best
+
+
+def in_alias_window(word: WordTiming, hit_ms: int) -> bool:
+    """Whether the word overlaps Design 4's alias window, `ALIAS_WINDOW_MS` up to the hit."""
+    return word.start_ms <= hit_ms and word.end_ms > hit_ms - ALIAS_WINDOW_MS
+
+
+def _silence(ms: int) -> np.ndarray:
+    return np.zeros(samples(ms), dtype=np.float32)
+
+
+def _name_clips(root: Path) -> list[tuple[np.ndarray, Span]]:
+    """Each WAV under `root` with its name span; a file that does not read fails the test."""
+    paths = sorted(root.glob("*.wav"))
+    if not paths:
+        pytest.fail(f"{WORDS_DIR_VARIABLE} names {root}, which holds no .wav file")
+    clips = []
+    for path in paths:
+        try:
+            audio = read_wav(path)
+        except (FixtureError, OSError, EOFError) as exc:
+            pytest.fail(f"{path.name} does not read as 16 kHz mono PCM16: {exc}")
+        span = name_span(audio)
+        if span is None:
+            pytest.fail(f"{path.name} is silent: it has no name span")
+        clips.append((audio, span))
+    return clips
+
+
+def _shifted(span: Span, ms: int) -> Span:
+    return Span(span.start_ms + ms, span.end_ms + ms)
+
+
+def test_stt_word_timings_on_synthetic_names(stt, voice_settings, speech_record):
+    root = os.environ.get(WORDS_DIR_VARIABLE)
+    if not root:
+        pytest.skip(f"variable {WORDS_DIR_VARIABLE} is not set: it names the synthetic name clips")
+    engine, transcriber = stt.engine, stt.transcriber
+    interval = voice_settings.endpointing.stt_partial_interval_ms
+    clips = _name_clips(Path(root))
+    lead, tail = _silence(NAME_LEAD_MS), _silence(NAME_TAIL_MS)
+    decodes = []
+    for index, (clip, _) in enumerate(clips):
+        following = clips[(index + 1) % len(clips)][0]
+        decodes.append(("alone", index, np.concatenate([lead, clip, tail])))
+        decodes.append(
+            (
+                "pair",
+                index,
+                np.concatenate([lead, clip, _silence(NAME_PAIR_GAP_MS), following, tail]),
+            )
+        )
+
+    outcomes: list[tuple[str, str]] = []
+    errors: dict[str, list[int]] = {"start": [], "end": []}
+    for case, index, audio in decodes:
+        span = _shifted(clips[index][1], NAME_LEAD_MS)
+        result = _transcribe(transcriber, audio, interval)
+        outcome = _timing_outcome(result)
+        fields: dict[str, object] = {}
+        word = None if outcome is not None else name_word(result.words or (), span)
+        if outcome is None and word is None:
+            outcome = "no_word"
+        elif word is not None:
+            hits = [span.end_ms + lag for lag in HIT_LAGS_MS]
+            outcome = "in_window" if all(in_alias_window(word, hit) for hit in hits) else "outside"
+            fields = {
+                "start_error_ms": word.start_ms - span.start_ms,
+                "end_error_ms": word.end_ms - span.end_ms,
+            }
+            errors["start"].append(word.start_ms - span.start_ms)
+            errors["end"].append(word.end_ms - span.end_ms)
+        outcomes.append((case, outcome))
+        speech_record(
+            "stt_name_word", engine=engine, case=case, clip=index, outcome=outcome, **fields
+        )
+
+    summary: dict[str, object] = {"clips": len(clips), "decodes": len(decodes)}
+    for case, outcome in sorted(set(outcomes)):
+        summary[f"{case}_{outcome}"] = outcomes.count((case, outcome))
+    for edge, values in errors.items():
+        if values:
+            summary[f"{edge}_error_ms_median"] = round(statistics.median(values), 1)
+            summary[f"{edge}_error_ms_max_abs"] = max(abs(value) for value in values)
+    speech_record("stt_name_words", engine=engine, **summary)
+    assert not [
+        kind for _, kind in outcomes if kind == "no_timings"
+    ], f"{engine} gave a final with text and no word timings: {summary}"
+    assert all(kind == "in_window" for _, kind in outcomes), (
+        f"{engine}: a name word misses the alias window of a hit {HIT_LAGS_MS} ms after the "
+        f"name: {summary}"
+    )
+
+
+def test_the_name_span_runs_from_the_first_to_the_last_frame_within_30_db_of_the_loudest():
+    loud = np.full(samples(200), 0.5, dtype=np.float32)
+    within = np.full(samples(100), 0.5 * 10 ** (-29 / 20), dtype=np.float32)
+    below = np.full(samples(100), 0.5 * 10 ** (-31 / 20), dtype=np.float32)
+    audio = np.concatenate([below, within, _silence(50), loud, below])
+
+    assert name_span(audio) == Span(100, 450)
+    assert name_span(_silence(300)) is None
+    assert name_span(np.zeros(0, dtype=np.float32)) is None
+
+
+def test_the_name_word_is_the_word_overlapping_the_name_span_most():
+    words = (WordTiming("hey", 0, 300), WordTiming("mist", 300, 800), WordTiming("go", 800, 900))
+
+    assert name_word(words, Span(250, 820)) == words[1]
+    assert name_word(words, Span(950, 1000)) is None
+    assert name_word((), Span(0, 100)) is None
+
+
+@pytest.mark.parametrize(
+    ("word", "inside"),
+    [
+        # A name ending at 1000 ms: hits at 1100 and 1180 ms open windows from 700 and 780 ms.
+        (WordTiming("mist", 600, 1000), True),
+        (WordTiming("mist", 600, 781), True),
+        (WordTiming("mist", 600, 780), False),
+        (WordTiming("mist", 1100, 1500), True),
+        (WordTiming("mist", 1101, 1500), False),
+    ],
+)
+def test_the_alias_window_bound_holds_for_both_hits(word, inside):
+    hits = [1000 + lag for lag in HIT_LAGS_MS]
+
+    assert all(in_alias_window(word, hit) for hit in hits) is inside
 
 
 # -- TTS --------------------------------------------------------------------------------------

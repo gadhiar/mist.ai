@@ -957,14 +957,23 @@ def test_parakeet_cpu_loads_parakeet_from_the_placement(
     weights.mkdir(parents=True)
     (weights / "vocab.txt").write_text("placeholder", encoding="utf-8")
     loads: list[tuple[tuple, dict]] = []
+    timestamped: list[object] = []
 
     class Options:
         intra_op_num_threads = 0
         inter_op_num_threads = 0
 
-    def load_model(*args: object, **kwargs: object) -> object:
+    class Model:
+        """onnx-asr's text adapter: the transcriber asks it for the timestamped one."""
+
+        def with_timestamps(self) -> object:
+            model = object()
+            timestamped.append(model)
+            return model
+
+    def load_model(*args: object, **kwargs: object) -> Model:
         loads.append((args, kwargs))
-        return object()
+        return Model()
 
     def fake_import() -> OnnxAsrLibrary:
         return OnnxAsrLibrary(load_model=load_model, session_options=Options, errors=())
@@ -977,6 +986,7 @@ def test_parakeet_cpu_loads_parakeet_from_the_placement(
     assert isinstance(transcriber, ParakeetTranscriber)
     ((_, kwargs),) = loads
     assert kwargs["path"] == str(weights)
+    assert len(timestamped) == 1
 
 
 # -- The harness: the tuning pass -------------------------------------------------------------
