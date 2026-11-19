@@ -34,6 +34,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
 - `render_character.py` - Renders one WAV through the character stage, as the realtime downlink would play it
 - `wake/` - Tools for MIST's wake model: the guided recorder, the recording manifest check and the evaluation harness
+  - `device_calibration.py` - Writes the room device model's tables into the server wake manifest's `calibration.endpoint`, from its streaming evaluation
   - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
   - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
   - `record.py` - The guided host-side recorder for one headset sitting: 16 kHz clips and their draft manifest entries
@@ -55,6 +56,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
   - `gamewatch.py` - The gaming watcher's process lister, game rules and decision
   - `devices.py` - Provisions room devices: the device CA and server certificate, the registry, and each device's private `secrets.yaml`
+  - `device_forward.py` - The LAN relay in front of the device listener, run only in `mist-device-forward`; copies bytes both ways and leaves TLS to the backend
 - `room_endpoint/` - The room device's firmware tools, run in the worker image (see `firmware/room-endpoint/README.md`)
   - `build.py` - Compiles the spike or room firmware offline in a throwaway build directory; `--out` copies the factory and OTA images out
   - `spike_listener.py` - The H4 spike listener: a stand-in for MIST's device listener that measures the device gate G1
@@ -152,6 +154,14 @@ backend/
 │   ├── context_budget.py        # Cluster 6 ContextBudgetPlanner
 │   ├── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
 │   └── turn_scope.py            # Per-turn state and the value objects of the stream-and-commit turn API
+│
+├── devices/                     # Room devices: the device listener, off unless MIST_DEVICE_LISTENER=on
+│   ├── registry.py              # The registered devices and their token hashes, from registry.json
+│   ├── listener.py              # `/v2/device`: authenticates a device before accept, then one realtime session
+│   ├── server.py                # Runs the listener as a second uvicorn server, with TLS, in the backend's process
+│   ├── limiter.py               # Limits failed authentications by the device id a token claims
+│   ├── config.py                # The listener's MIST_DEVICE_* settings
+│   └── ring_sink.py             # A ring endpoint for each registered, unrevoked device: `alarm_fired` to its sessions
 │
 ├── event_store/                 # Append-only SQLite event store
 │   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
@@ -276,6 +286,7 @@ root outside every git work tree.
 ```
 deploy/daily/
 ├── compose.yml                  # The mist-daily compose project (backend, Neo4j, llama-server, backup, night extraction LLM and service)
+├── compose.devices.yml          # Opt-in room devices overlay: the backend's device listener and mist-device-forward on the LAN port
 ├── daily.env.example            # Template for <root>/daily.env
 ├── README.md                    # Contract, operation and the /health reasons table
 ├── RESTORE.md                   # Restore drill and promotion
