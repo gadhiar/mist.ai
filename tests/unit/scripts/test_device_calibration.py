@@ -8,7 +8,8 @@ still loads end to end. No real model and no recording is read.
 The manifests are written by hand rather than by `json.dumps`, with spacing and number spellings
 (`0.50`, `1e0`) a re-serialisation would change, so a converter that rewrote the whole file
 instead of splicing in one entry would fail the byte-for-byte checks. Each splice and refusal
-test runs once for each spotter, with the other spotter's entry as the bytes that must survive.
+test runs once for each spotter; where its manifest holds the other spotter's entry, that entry's
+bytes must survive.
 """
 
 import hashlib
@@ -433,6 +434,7 @@ def test_a_missing_manifest_is_refused(
 
 
 def test_an_unknown_spotter_is_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Refused by the choice check: the message names the spotter and the two choices."""
     manifest = write_manifest(tmp_path, "{}")
     before = manifest.read_bytes()
 
@@ -440,7 +442,9 @@ def test_an_unknown_spotter_is_refused(tmp_path: Path, capsys: pytest.CaptureFix
         run(write_eval(tmp_path), manifest, "desktop")
 
     assert exc.value.code == 2
-    assert "--spotter" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--spotter: invalid choice: 'desktop'" in err
+    assert "'server'" in err and "'endpoint'" in err
     assert manifest.read_bytes() == before
 
 
