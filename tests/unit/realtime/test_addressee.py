@@ -9,20 +9,62 @@ defaults, since those are what a fresh install hears with. The module is importe
 it must run without a controller, ingress or engine loaded.
 """
 
+import ast
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
+from backend.realtime import addressee as addressee_module
 from backend.realtime.addressee import (
     AddresseeGate,
     GateVerdict,
+    NameAlignment,
     WakeConfig,
     normalize,
     vocative_match,
 )
+from backend.realtime.budget import DEFAULT_NAME_ALIASES
+from backend.realtime.speech import HeardWord
+from scripts.wake import record
 
 DEFAULTS = WakeConfig()
+ALIASES = dict(DEFAULT_NAME_ALIASES)["mist"]
+FRAME_MS = 20
+WORD_FRAMES = 15  # 300 ms a word
+FIRST_POS = 100
+SPEECH_ON = 30  # frames: speech went on 600 ms past the hit
+
+
+def timed(text: str) -> tuple[HeardWord, ...]:
+    """`text`'s words, each heard for 300 ms one after another from frame 100."""
+    return tuple(
+        HeardWord(word, FIRST_POS + index * WORD_FRAMES, FIRST_POS + (index + 1) * WORD_FRAMES - 1)
+        for index, word in enumerate(text.split())
+    )
+
+
+def hit_on(
+    text: str, index: int, *, speech_past: int = 0, offset: int = 0, words: bool = True
+) -> NameAlignment:
+    """A hit at the end of word `index`, moved `offset` frames, with speech `speech_past` after.
+
+    The spotter hits once a name has been heard, so a hit at a word is at its last frame.
+    """
+    heard = timed(text)
+    hit = heard[index].last_pos + offset
+    return NameAlignment(hit, FRAME_MS, hit + speech_past, heard if words else None)
+
+
+def word_index(text: str, wanted: frozenset[str]) -> int:
+    """The first word of `text` whose tokens hold one of `wanted`."""
+    return next(
+        index
+        for index, word in enumerate(text.split())
+        if any(token in wanted for token in normalize(word))
+    )
 
 
 class TestNormalize:
@@ -108,6 +150,234 @@ class TestVocativeMatchConfigured:
         assert vocative_match("hey mist", two_names) == "phrase"
 
 
+def _truncated_sentences() -> list[object]:
+    """Each homophone and fog sentence cut after its name or alias word, and after the next.
+
+    A gate decode runs only `gate_tail_ms` past the hit, so it can end there; the recogniser may
+    close it with a full stop, which is what makes "A cold mist." look final.
+    """
+    wanted = frozenset({"mist", *ALIASES})
+    cases: dict[str, int] = {}
+    for sentence in (*record.MISSED, *record.FOG):
+        words = sentence.split()
+        at = word_index(sentence, wanted)
+        for end in (at + 1, at + 2):
+            if end <= len(words):
+                for ending in ("", "."):
+                    cases.setdefault(" ".join(words[:end]) + ending, at)
+    return [pytest.param(text, at, id=text) for text, at in cases.items()]
+
+
+def _aliased_prompts() -> list[object]:
+    """The recorded wake prompts as written, commas kept, with "mist" spelled as each alias."""
+    prompts = [*record.NAME_ALONE, *(prompt for pair in record.WAKE_PHRASES for prompt in pair)]
+    return [
+        pytest.param(re.sub(r"\bmist\b", alias, prompt), alias, id=f"{prompt} as {alias}")
+        for prompt in prompts
+        for alias in ALIASES
+    ]
+
+
+class TestTheNameAtTheHit:
+    @pytest.mark.parametrize(("text", "at"), _truncated_sentences())
+    def test_a_sentence_cut_off_at_the_name_or_an_alias_while_speech_goes_on_is_rejected(
+        self, text, at
+    ):
+        alignment = hit_on(text, at, speech_past=SPEECH_ON)
+
+        assert vocative_match(text, DEFAULTS, alignment) is None
+
+    def test_the_guard_closes_the_hole_a_cut_off_name_leaves_without_it(self):
+        text = "A cold mist."
+
+        assert vocative_match(text, DEFAULTS) == "vocative"
+        assert vocative_match(text, DEFAULTS, hit_on(text, 2, speech_past=SPEECH_ON)) is None
+        assert vocative_match(text, DEFAULTS, hit_on(text, 2)) == "vocative"
+
+    @pytest.mark.parametrize(("text", "alias"), _aliased_prompts())
+    def test_a_recorded_prompt_with_an_alias_at_the_hit_and_speech_ended_is_accepted(
+        self, text, alias
+    ):
+        alignment = hit_on(text, word_index(text, frozenset({alias})))
+
+        assert vocative_match(text, DEFAULTS, alignment) is not None
+
+    @pytest.mark.parametrize("offset", [30, -30], ids=["600-ms-after", "600-ms-before"])
+    @pytest.mark.parametrize(("text", "alias"), _aliased_prompts())
+    def test_the_same_prompt_with_the_hit_600_ms_from_the_alias_is_rejected(
+        self, text, alias, offset
+    ):
+        alignment = hit_on(text, word_index(text, frozenset({alias})), offset=offset)
+
+        assert vocative_match(text, DEFAULTS, alignment) is None
+
+    @pytest.mark.parametrize(
+        ("text", "alias", "check"),
+        [
+            # An alias before a bare address start, or last after an ordinary word, is the word.
+            ("missed call from mum", "missed", None),
+            ("I just missed.", "missed", None),
+            ("Missed what's the time", "missed", None),
+            # Its punctuation marks the vocative.
+            ("Missed. What's the time?", "missed", "vocative"),
+            ("what's the time, missed?", "missed", "vocative"),
+            ("Missed, set a timer", "missed", "vocative"),
+            ("Missed.", "missed", "vocative"),
+            # The risks A62 names: these are said to a person, and wake her on a hit.
+            ("Hi miss", "miss", "vocative"),
+            ("thank you, miss", "miss", "vocative"),
+        ],
+    )
+    def test_an_aligned_alias_needs_the_punctuation_of_a_vocative(self, text, alias, check):
+        alignment = hit_on(text, word_index(text, frozenset({alias})))
+
+        assert vocative_match(text, DEFAULTS, alignment) == check
+
+    @pytest.mark.parametrize(
+        ("text", "check"),
+        [
+            ("missed, what's up", None),
+            ("hey missed", None),
+            ("Missed.", None),
+            ("Mist. What's the time?", None),
+            ("A cold mist.", "vocative"),
+            ("hey mist, what's the time", "phrase"),
+        ],
+    )
+    def test_without_an_alignment_the_verdicts_are_today_s(self, text, check):
+        assert vocative_match(text, DEFAULTS) == check
+        assert AddresseeGate(DEFAULTS, echo_guard_ms=2000).decide(
+            text=text, score=0.9, reference_score=None
+        ) == GateVerdict(
+            accepted=check is not None,
+            check=check or "not_addressed",
+            score=0.9,
+            reference_score=None,
+            at_hit=None,
+        )
+
+    @pytest.mark.parametrize(
+        ("text", "at", "speech_past", "check"),
+        [
+            # No timings: no alias counts, wherever the hit was.
+            ("hey missed", 1, 0, None),
+            ("missed, what's up", 0, 0, None),
+            # The names keep their rules, and the guard still reads the speech end.
+            ("hey mist", 1, SPEECH_ON, "phrase"),
+            ("A cold mist.", 2, SPEECH_ON, None),
+            ("A cold mist.", 2, 0, "vocative"),
+        ],
+    )
+    def test_without_words_only_names_count_under_the_guard(self, text, at, speech_past, check):
+        alignment = hit_on(text, at, speech_past=speech_past, words=False)
+
+        assert vocative_match(text, DEFAULTS, alignment) == check
+
+    def test_words_of_another_text_count_no_alias(self):
+        text = "hey missed"
+        alignment = NameAlignment(114 + 15, FRAME_MS, 129, timed("hey there"))
+
+        assert vocative_match(text, DEFAULTS, alignment) is None
+
+    @pytest.mark.parametrize(
+        ("text", "check"),
+        [
+            ("Mist. What's the time?", "vocative"),
+            ("Mist? Turn the lights off.", "vocative"),
+            ("Missed. Can you dim the lights?", "vocative"),
+            ("Mist. The fog lifted.", None),
+            ("Missed. The bus left.", None),
+        ],
+    )
+    def test_the_full_stop_form_needs_an_address_start_after_it(self, text, check):
+        alignment = hit_on(text, 0, speech_past=SPEECH_ON)
+
+        assert vocative_match(text, DEFAULTS, alignment) == check
+
+    @pytest.mark.parametrize("text", ["so are you there mist", "so are you there missed"])
+    def test_a_template_matched_at_the_end_counts_only_when_speech_ended_at_the_hit(self, text):
+        last = len(text.split()) - 1
+        # 100 ms past the hit still counts: the VAD's last speech window can end after it.
+        ended = hit_on(text, last, speech_past=5)
+        went_on = hit_on(text, last, speech_past=6)
+
+        assert vocative_match(text, DEFAULTS, ended) == "phrase"
+        assert vocative_match(text, DEFAULTS, went_on) is None
+
+    @pytest.mark.parametrize(
+        ("text", "at", "check"),
+        [
+            ("mist, what's up", 0, "phrase"),
+            ("hey mist, turn the lights off", 1, "phrase"),
+            ("mist can you dim the lights", 0, "vocative"),
+            ("so, mist, what do you think", 1, "vocative"),
+            ("missed, what's up", 0, "phrase"),
+            ("hey missed, turn the lights off", 1, "phrase"),
+        ],
+    )
+    def test_a_name_first_or_greeting_prompt_with_speech_going_on_is_accepted(
+        self, text, at, check
+    ):
+        # The guard reads only the rules anchored at the end; these are said from the start.
+        alignment = hit_on(text, at, speech_past=100)
+
+        assert vocative_match(text, DEFAULTS, alignment) == check
+
+    @pytest.mark.parametrize(
+        ("text", "at", "offset", "at_hit"),
+        [
+            ("hey mist", 1, 0, "name"),
+            ("hey missed", 1, 0, "alias"),
+            ("missed mist", 1, 0, "name"),
+            ("hello there", 1, 0, "other"),
+            ("hello there", 1, 60, "none"),
+        ],
+    )
+    def test_the_verdict_records_what_was_written_at_the_hit(self, text, at, offset, at_hit):
+        alignment = hit_on(text, at, offset=offset)
+
+        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).decide(
+            text=text, score=0.7, reference_score=None, alignment=alignment
+        )
+
+        assert verdict.at_hit == at_hit
+
+    def test_an_alignment_without_words_records_nothing_at_the_hit(self):
+        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).decide(
+            text="hey mist",
+            score=0.7,
+            reference_score=0.1,
+            alignment=hit_on("hey mist", 1, words=False),
+        )
+
+        assert verdict == GateVerdict(
+            accepted=True, check="phrase", score=0.7, reference_score=0.1, at_hit=None
+        )
+
+    def test_an_aligned_alias_is_accepted_with_its_check_scores_and_kind(self):
+        text = "what's the time, missed?"
+
+        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).decide(
+            text=text, score=0.62, reference_score=None, alignment=hit_on(text, 3)
+        )
+
+        assert verdict == GateVerdict(
+            accepted=True, check="vocative", score=0.62, reference_score=None, at_hit="alias"
+        )
+
+    def test_aliases_turned_off_count_nothing_at_the_hit(self):
+        text = "hey missed"
+        config = WakeConfig(aliases=())
+
+        assert vocative_match(text, config, hit_on(text, 1)) is None
+
+    def test_an_alias_of_a_name_not_configured_counts_nothing(self):
+        text = "hey missed"
+        config = WakeConfig(names=("nova",))
+
+        assert vocative_match(text, config, hit_on(text, 1)) is None
+
+
 class TestPreDecode:
     def _gate(self) -> AddresseeGate:
         return AddresseeGate(DEFAULTS, echo_guard_ms=2000)
@@ -165,6 +435,15 @@ class TestPreDecode:
 
         assert verdict is None
 
+    def test_an_alias_in_her_recent_speech_is_not_her_name(self):
+        # "must" and "miss" are common in her replies; counting them would reject genuine wakes
+        # for the whole echo guard. Her own playback is the reference score's to catch.
+        verdict = self._gate().pre_decode(
+            score=0.9, reference_score=None, recent_tts_text="You must have missed it, miss."
+        )
+
+        assert verdict is None
+
     def test_the_gate_keeps_its_echo_guard_for_the_controller(self):
         assert AddresseeGate(DEFAULTS, echo_guard_ms=1500).echo_guard_ms == 1500
 
@@ -211,3 +490,24 @@ class TestPurity:
         assert "backend.realtime.turn" not in loaded
         assert "backend.realtime.ingress" not in loaded
         assert not [name for name in loaded if name.startswith("backend.realtime.engines")]
+
+    def test_the_gate_imports_only_the_wake_settings_and_the_speech_contract(self):
+        tree = ast.parse(Path(addressee_module.__file__).read_text(encoding="utf-8"))
+        relative = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level
+        }
+        absolute = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and not node.level
+        }
+
+        assert relative == {"budget", "speech"}
+        assert absolute == {"re", "dataclasses", "typing"}

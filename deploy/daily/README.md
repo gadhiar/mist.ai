@@ -651,7 +651,9 @@ The `daily.env` rows:
 - `MIST_VOICE_KWS_MODEL` and `MIST_VOICE_KWS_THRESHOLD`: the server name spotter's model id, off
   while unset, and the score a heard name needs, 0.5 by default.
 - `MIST_VOICE_WAKE_PHRASES_FILE`: the wake phrases and addressee word sets, a JSON file; the
-  built-in sets apply while it is unset.
+  built-in sets apply while it is unset. Its `aliases` key maps each name to the near spellings
+  the gate reads as the name at a server hit ("missed" for "mist"), and `"aliases": {}` turns
+  them off without a release.
 
 The variables the chains replaced, such as `MIST_VOICE_STT_DEVICE`, make the backend refuse to
 start while set at all; delete any such line.

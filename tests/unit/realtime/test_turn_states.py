@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 from dataclasses import dataclass
 
@@ -34,10 +35,11 @@ import pytest_asyncio
 
 from backend.chat.conversation_handler import CapabilityOnlyTurn
 from backend.chat.stream_events import Complete, HandOff, Token
+from backend.realtime.addressee import NameAlignment
 from backend.realtime.budget import BargeInConfig, WakeConfig
 from backend.realtime.protocol import VoiceDecisionWakeLost, WakeLostDetail
 from backend.realtime.scene import Immediate
-from backend.realtime.speech import SpotterCalibration
+from backend.realtime.speech import HeardWord, SpotterCalibration
 from backend.realtime.turn import (
     BargeInReport,
     Close,
@@ -1812,6 +1814,112 @@ async def test_i_missed_the_bus_is_rejected_with_no_trace_of_its_words_or_its_id
     for item in h.outbound.client:
         dumped = item.model_dump_json() if hasattr(item, "model_dump_json") else repr(item)
         assert uid not in dumped
+
+
+# -- The name at the hit (v16 T69): a server wake's gate reads the words heard at its hit -----------
+
+ALIAS_LAST = "what's the time, missed?"
+
+
+def heard_at_hit(hit_pos: int) -> tuple[HeardWord, ...]:
+    """`ALIAS_LAST` timed so that "missed?" ends on the hit, as the spotter hears a name."""
+    return (
+        HeardWord("what's", hit_pos - 30, hit_pos - 21),
+        HeardWord("the", hit_pos - 20, hit_pos - 16),
+        HeardWord("time,", hit_pos - 15, hit_pos - 6),
+        HeardWord("missed?", hit_pos - 5, hit_pos),
+    )
+
+
+def spy_alignments(h: Harness, monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record the alignment the controller passes the gate's `decide`, verdicts unchanged."""
+    gate = h.kwargs["gate"]
+    decide = gate.decide  # type: ignore[attr-defined]
+    seen: list[object] = []
+
+    def recording(**kwargs: object) -> object:
+        seen.append(kwargs.get("alignment"))
+        return decide(**kwargs)
+
+    monkeypatch.setattr(gate, "decide", recording)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("speech_end_pos", "accepted"),
+    [(HIT, True), (HIT + 5, True), (HIT + 30, False)],
+    ids=["speech-ended-at-the-hit", "100-ms-past", "speech-went-on-600-ms"],
+)
+async def test_a_server_gate_partial_reads_an_alias_at_the_hit_under_the_guard(
+    monkeypatch, speech_end_pos, accepted
+):
+    h = make_harness([Pause()])
+    h.start_voice()
+    seen = spy_alignments(h, monkeypatch)
+    uid = await name_hit(h)
+    words = heard_at_hit(HIT)
+
+    h.post(
+        dataclasses.replace(
+            h.ingress.partial(uid, ALIAS_LAST, gate=True, through_pos=GATE_THROUGH),
+            words=words,
+            speech_end_pos=speech_end_pos,
+        )
+    )
+    await h.settle()
+
+    assert seen == [NameAlignment(HIT, 20, speech_end_pos, words)]
+    assert h.arbiter.settles == [(1, accepted)]
+    if accepted:
+        assert h.outbound.of("voice_decision:wake_rejected") == []
+        assert h.outbound.of("transcript_partial")[0].text == ALIAS_LAST
+    else:
+        (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+        assert rejected.reason == "not_addressed"
+        assert calls(h.ingress, "drop") == [("drop", uid, "not_addressed")]
+
+
+async def test_an_endpoint_wake_is_decided_on_its_text_alone(monkeypatch):
+    h = make_harness([Pause()])
+    h.start_voice()
+    seen = spy_alignments(h, monkeypatch)
+    h.post(Wake(keyword="mist", score=0.8, backlog_ms=1500, arrival=0.0))
+    await h.settle()
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.8))
+    await h.settle()
+    ((*_, uid),) = calls(h.ingress, "open_utterance")
+
+    # The same words at its hit would wake a server candidate; an endpoint's are not read.
+    h.post(
+        dataclasses.replace(
+            h.ingress.partial(uid, ALIAS_LAST, gate=True),
+            words=heard_at_hit(99),
+            speech_end_pos=99,
+        )
+    )
+    await h.settle()
+
+    assert seen == [None]
+    (rejected,) = h.outbound.of("voice_decision:wake_rejected")
+    assert rejected.reason == "not_addressed"
+
+
+async def test_a_held_end_is_read_with_its_words_and_no_speech_end(monkeypatch):
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    seen = spy_alignments(h, monkeypatch)
+    uid = await name_hit(h)
+    words = heard_at_hit(HIT)
+    h.post(dataclasses.replace(h.ingress.ended(uid, ALIAS_LAST), words=words))
+    await h.settle()
+
+    h.arbiter.grant(1)
+    await h.settle()
+
+    assert calls(h.ingress, "request_gate_partial") == []
+    assert seen == [NameAlignment(HIT, 20, None, words)]
+    assert [r.user_text for r in h.responder.requests] == [ALIAS_LAST]
+    assert h.arbiter.settles == [(1, True)]
 
 
 async def test_self_speech_in_her_recent_speech_from_any_session_rejects_before_attend():
