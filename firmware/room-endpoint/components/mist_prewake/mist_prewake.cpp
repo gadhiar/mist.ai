@@ -120,6 +120,32 @@ void MistPrewake::on_wake_word_detected(const std::string &wake_word) {
   }
 }
 
+static const char *stop_outcome_name(mist_core::StopOutcome outcome) {
+  switch (outcome) {
+    case mist_core::StopOutcome::BargeInSent:
+      return "barge_in sent";
+    case mist_core::StopOutcome::AlreadySent:
+      return "already sent for this turn";
+    case mist_core::StopOutcome::NotSpeaking:
+      return "not speaking";
+    case mist_core::StopOutcome::NotConnected:
+      return "not connected";
+    case mist_core::StopOutcome::Muted:
+      return "muted";
+    case mist_core::StopOutcome::SendFailed:
+      return "link queue full";
+  }
+  return "unknown";
+}
+
+void MistPrewake::on_stop_detected() {
+  if (this->uplink_ == nullptr) {
+    return;
+  }
+  // A stop during a ring is the player's, so "not speaking" is no fault here.
+  ESP_LOGI(TAG, "Stop: %s", stop_outcome_name(this->uplink_->on_stop_keyword()));
+}
+
 void MistPrewake::on_link_connected() {
   if (this->uplink_ != nullptr) {
     const bool was_open = this->uplink_->is_open();

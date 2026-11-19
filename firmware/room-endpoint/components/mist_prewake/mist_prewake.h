@@ -53,6 +53,9 @@ class MistPrewake : public Component, public mist_link::LinkListener {
 
   // `micro_wake_word`'s `on_wake_word_detected`, which passes only the detected model's word.
   void on_wake_word_detected(const std::string &wake_word);
+  // A detection by the stop model (`packages/controls.yaml`). While she speaks the uplink sends
+  // `barge_in {turn_id, keyword: "stop"}` at most once per turn; it never opens the uplink.
+  void on_stop_detected();
 
   void on_link_connected() override;
   void on_link_disconnected() override;
