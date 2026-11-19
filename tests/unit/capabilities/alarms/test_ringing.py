@@ -234,6 +234,141 @@ class TestRouting:
             _router(records, *(FakeSink(name) for name in names))
 
 
+class CountingSource:
+    """A sink source the test changes, counting how often the router reads it."""
+
+    def __init__(self, *sinks: FakeSink) -> None:
+        self.sinks: list[FakeSink] = list(sinks)
+        self.reads = 0
+
+    def __call__(self) -> tuple[FakeSink, ...]:
+        self.reads += 1
+        return tuple(self.sinks)
+
+
+def _sourced(records: AlarmRecords, source: CountingSource, *fixed: FakeSink) -> RingRouter:
+    return RingRouter(list(fixed), records, FakeClock(), SETTINGS, UTC, sink_source=source)
+
+
+class TestSinkSource:
+    def test_sourced_sinks_follow_the_fixed_ones_and_track_the_source(self, records):
+        desktop, room = FakeSink("desktop"), FakeSink("room")
+        source = CountingSource(room)
+        router = _sourced(records, source, desktop)
+
+        assert router.endpoints() == ("desktop", "room")
+        bedroom = FakeSink("bedroom")
+        source.sinks.append(bedroom)
+        assert router.endpoints() == ("desktop", "room", "bedroom")
+        assert router.resolve("all") == ((desktop, room, bedroom), False)
+        source.sinks.remove(room)
+        assert router.endpoints() == ("desktop", "bedroom")
+        assert router.resolve(("room",)) == ((desktop, bedroom), True)
+
+    @pytest.mark.asyncio
+    async def test_a_sink_the_source_adds_later_rings_when_ring_on_names_it(self, db, records):
+        desktop = FakeSink("desktop")
+        source = CountingSource()
+        router = _sourced(records, source, desktop)
+        occurrence = await _ringing(records, ("room",))
+        room = FakeSink("room")
+        source.sinks.append(room)
+
+        delivery = await router.ring(occurrence, 600.0)
+
+        assert delivery == RingDelivery(sent_to=("room",), fallback=False)
+        assert room.rings == [(occurrence.occurrence_id, 600.0, False)]
+        assert desktop.rings == []
+        assert (await _live(records, occurrence.occurrence_id)).sent_to == frozenset({"room"})
+
+    @pytest.mark.asyncio
+    async def test_stopped_and_state_changed_reach_the_sourced_sinks(self, records):
+        desktop, room = FakeSink("desktop"), FakeSink("room", present=False)
+        router = _sourced(records, CountingSource(room), desktop)
+        occurrence = await _ringing(records)
+
+        await router.stopped("o1")
+        await router.state_changed([occurrence], 4, T0)
+
+        assert desktop.stops == room.stops == ["o1"]
+        expected = alarm_state_payload([occurrence], 4, T0, settings=SETTINGS, tz=UTC)
+        assert desktop.states == room.states == [expected]
+
+    @pytest.mark.parametrize("room_present", [True, False], ids=["rung", "rung-nowhere"])
+    @pytest.mark.asyncio
+    async def test_each_call_reads_the_source_once(self, records, room_present):
+        desktop = FakeSink("desktop", present=False)
+        source = CountingSource(FakeSink("room", present=room_present))
+        router = _sourced(records, source, desktop)
+        occurrence = await _ringing(records)
+        assert source.reads == 0
+
+        router.endpoints()
+        assert source.reads == 1
+        router.resolve("all")
+        assert source.reads == 2
+        for coroutine in (
+            lambda: router.ring(occurrence, 600.0),
+            lambda: router.stopped(occurrence.occurrence_id),
+            lambda: router.state_changed([occurrence], 5, T0),
+        ):
+            before = source.reads
+            await coroutine()
+            assert source.reads == before + 1
+
+    @pytest.mark.asyncio
+    async def test_an_unusable_sourced_sink_is_skipped_and_logged_once_per_name(
+        self, records, caplog
+    ):
+        desktop, room = FakeSink("desktop"), FakeSink("room")
+        bad = [FakeSink(""), FakeSink("a,b"), FakeSink("all"), FakeSink("desktop")]
+        twin = FakeSink("room")
+        router = _sourced(records, CountingSource(*bad, room, twin), desktop)
+        occurrence = await _ringing(records)
+
+        with caplog.at_level(logging.ERROR, logger=RINGING_LOGGER):
+            assert router.endpoints() == ("desktop", "room")
+            delivery = await router.ring(occurrence, 600.0)
+            await router.stopped(occurrence.occurrence_id)
+            await router.state_changed([occurrence], 6, T0)
+            assert router.resolve("all") == ((desktop, room), False)
+
+        assert delivery == RingDelivery(sent_to=("desktop", "room"), fallback=False)
+        for skipped in (*bad, twin):
+            assert skipped.rings == skipped.stops == skipped.states == []
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 5
+        for name in ("''", "'a,b'", "'all'", "'desktop'", "'room'"):
+            assert sum(name in message for message in errors) == 1, (name, errors)
+
+    def test_a_skipped_name_that_comes_back_is_not_logged_again(self, records, caplog):
+        """Once per name: the source gives the same unusable sink at every call."""
+        source = CountingSource(FakeSink("all"))
+        router = _sourced(records, source, FakeSink("desktop"))
+
+        with caplog.at_level(logging.ERROR, logger=RINGING_LOGGER):
+            router.endpoints()
+            source.sinks = []
+            router.endpoints()
+            source.sinks = [FakeSink("all")]
+            router.endpoints()
+
+        assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+
+    @pytest.mark.parametrize("names", [("desktop", "desktop"), ("",), ("a,b",), ("all",)])
+    def test_the_fixed_sinks_keep_their_check_beside_a_source(self, records, names):
+        with pytest.raises(ValueError, match="sink"):
+            _sourced(records, CountingSource(), *(FakeSink(name) for name in names))
+
+    def test_no_source_rings_the_fixed_sinks_only(self, records):
+        desktop = FakeSink("desktop")
+
+        router = RingRouter([desktop], records, FakeClock(), SETTINGS, UTC, sink_source=None)
+
+        assert router.endpoints() == ("desktop",)
+        assert router.resolve("all") == ((desktop,), False)
+
+
 class TestContainment:
     @pytest.mark.parametrize(
         "error", [OSError("socket gone"), CapabilityStoreError("room unit store down")]

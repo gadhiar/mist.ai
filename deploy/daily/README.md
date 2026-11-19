@@ -808,3 +808,81 @@ service, and what must fit the VM is the sum of what the services use.
 Check the limits against `docker stats` on the running instance. Headroom is (limit - peak) /
 limit: raise any limit with less than 25% headroom over its observed peak. Every service also
 logs through the `json-file` driver with `max-size` 20m and `max-file` 5.
+
+---
+
+## Room devices
+
+A room device (a voice satellite on the home LAN) reaches the backend through
+`deploy/daily/compose.devices.yml`, an overlay that is off unless `daily.env` sets
+`MIST_DAILY_DEVICE_BIND`. `compose.yml` itself stays loopback-only and knows nothing of devices.
+
+With the bind set, every compose call `instance.py` makes adds
+`-f <root>/release/<tag>/deploy/daily/compose.devices.yml --profile devices`, which:
+
+- gives `mist-backend` `MIST_DEVICE_LISTENER=on` and mounts `MIST_DEVICE_DIR` read-only at
+  `/app/devices`; the backend publishes no new port;
+- adds `mist-device-forward`, which publishes `<MIST_DAILY_DEVICE_BIND>:<MIST_DAILY_DEVICE_PORT>`
+  and relays bytes to the backend's port 8443 on the project network. TLS ends in the backend,
+  so the forwarder holds no key.
+
+The variables:
+
+- `MIST_DAILY_DEVICE_BIND`: the PC's LAN address. `instance.py` refuses anything but one private
+  IPv4 address (10/8, 172.16/12, 192.168/16), and refuses the bind without `MIST_DEVICE_DIR`.
+- `MIST_DAILY_DEVICE_PORT`: the host port on that address, 8443 when unset. It is refused when
+  it is 8001, an eval, dev or staging port, or no port at all.
+- `MIST_DEVICE_DIR`: the absolute host path of the devices directory, outside every git work
+  tree and never under `<root>/secrets/`.
+- `MIST_DEVICE_FORWARD_IMAGE`: workstation only, never in `daily.env`. The daily instance runs
+  the forwarder from `mist-backend:<tag>`; the workstation stack takes the overlay by a second
+  `-f` and sets this to its own backend image.
+
+### Provisioning
+
+`scripts/daily/devices.py` runs on host Python with the standard library and `openssl`. It keeps
+two directories apart: the devices directory (`registry.json`, `tls/` with the server
+certificate and key and the CA certificate), which `mist-backend` mounts, and the CA directory
+(`<MIST_DAILY_ROOT>/devices-ca`, holding `ca.key`), which nothing mounts. Each command refuses a
+directory inside a git work tree.
+
+```
+python scripts/daily/devices.py init --ip <pc-lan-ip>
+python scripts/daily/devices.py add example-room --area example-room --out <private-dir>
+python scripts/daily/devices.py list
+python scripts/daily/devices.py revoke example-room
+python scripts/daily/devices.py rotate example-room --out <private-dir>
+python scripts/daily/devices.py cert --ip <new-pc-lan-ip>
+```
+
+- `devices.py init` makes the CA and a server certificate naming the PC's address.
+- `devices.py add` registers a device and writes its token, the server address and port, and
+  `mist_ca.pem` into the private directory's `secrets.yaml`, for the device's firmware build.
+  The token is never printed; the registry keeps only its sha256.
+- `devices.py revoke` refuses the device from the next registry reload on, and closes its live
+  session within 10 s; the backend re-reads the file when it changes.
+- `devices.py rotate` gives a device a new token, and closes a live session still on the old one
+  within 10 s; reflash it from the private directory. Until then the device is refused at each
+  retry, and five refusals in 60 s block its name for 300 s, so a device reflashed at once can
+  wait up to 5 minutes to connect.
+- `devices.py cert` reissues the server certificate when the PC's address changes; devices keep
+  their `mist_ca.pem`.
+
+### up, status and rollback
+
+`up` starts `mist-device-forward` in its own call, after the other services, and retries it every
+30 seconds until `--wait-minutes` runs out, counted from the start of `up`, because the LAN
+address can arrive after sign-in. A forwarder that does not start fails `up` with exit 1 and
+leaves every other service running. With the bind unset, `up` removes a leftover forwarder with
+`docker rm -f` (no `-v`), so it stops publishing the device port.
+
+The config-file check holds `mist-backend` and the forwarder to `compose.yml` with
+`compose.devices.yml` while the bind is set, and `mist-backend` to `compose.yml` alone while it
+is unset; the other services may carry either.
+
+`status` prints `device-forward: running`, `exited`, `absent` or `unknown` after the config-file
+lines while the bind is set, and names a leftover forwarder while it is unset.
+
+To roll back, comment out `MIST_DAILY_DEVICE_BIND` and run `up`: the forwarder is removed, and
+`mist-backend` is recreated without the listener or the mount. Unset the bind before switching to
+a release that has no `compose.devices.yml`.

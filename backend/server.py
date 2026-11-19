@@ -80,6 +80,20 @@ from backend.capabilities.secrets import (  # isort:skip
 from backend.chat.context_budget import ApproximateTokenCounter  # isort:skip
 from backend.chat.persona_register import PersonaRegister  # isort:skip
 from backend.config import DEFAULT_CONFIG  # isort:skip
+from backend.devices.config import (  # isort:skip
+    DeviceListenerConfig,
+    DeviceListenerConfigError,
+)
+from backend.devices.limiter import AuthLimiter  # isort:skip
+from backend.devices.listener import (  # isort:skip
+    DeviceApp,
+    DeviceSocket,
+    SystemClock as DeviceClock,
+    build_device_app,
+)
+from backend.devices.registry import DeviceRegistry, DeviceRegistryError  # isort:skip
+from backend.devices.ring_sink import DeviceRingSink, registry_ring_sinks  # isort:skip
+from backend.devices.server import DeviceListener, ListenerState  # isort:skip
 from backend.errors import CapabilityConfigError, MistError  # isort:skip
 from backend.event_store.status_intervals import (  # isort:skip
     degraded_beneath,
@@ -263,6 +277,13 @@ message_queue: asyncio.Queue[str | LogLine] = asyncio.Queue()
 # `/ws` connection; both built in `lifespan`, None before it.
 runtime: "MistRuntime | None" = None
 session_registry: SessionRegistry | None = None
+# The room devices' listener (`backend/devices/`), built in `lifespan` only when
+# `MIST_DEVICE_LISTENER=on`; `_device_listener_state` is what `/health` shows
+# when there is no listener: `off`, or `failed` when its configuration or
+# registry could not be read.
+_device_listener: DeviceListener | None = None
+_device_app: DeviceApp | None = None
+_device_listener_state: ListenerState = "off"
 curation_scheduler = None
 # T2a extraction backlog dispatcher (started/stopped in lifespan).
 extraction_dispatcher = None
@@ -1459,6 +1480,7 @@ async def lifespan(app: FastAPI):
     global _broadcaster_state, _health_registry, _health_probe_executor
     global _extraction_health_client, _gpu_yield
     global _capability_build, _capability_config, _capability_power, _capability_sink
+    global _device_listener, _device_app, _device_listener_state
 
     # Startup
     logger.info("=" * 60)
@@ -1547,6 +1569,52 @@ async def lifespan(app: FastAPI):
     voice_settings = load_voice_settings(os.environ)
     persona = PersonaRegister.load(VOICE_PROFILES_ROOT, voice_settings.profile)
     _capability_sink = CapabilitySink()
+
+    # Room devices' configuration and registry, read before the capability
+    # host so each registered, unrevoked device rings through its own sink.
+    # Either one unreadable logs ERROR and shows `failed` in `/health`: no
+    # device rings and no listener starts, and the desktop path runs on. The
+    # listener re-reads the registry, so a device registered or revoked later
+    # becomes, or stops being, a ring endpoint at that read, with no restart.
+    _device_listener = None
+    _device_app = None
+    _device_listener_state = "off"
+    device_registry: DeviceRegistry | None = None
+    try:
+        device_config: DeviceListenerConfig | None = DeviceListenerConfig.from_env(os.environ)
+    except DeviceListenerConfigError as e:
+        logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
+        device_config = None
+        _device_listener_state = "failed"
+    if device_config is not None and device_config.enabled:
+        try:
+            device_registry = DeviceRegistry.load(device_config.registry)
+        except DeviceRegistryError as e:
+            logger.error("device_listener_failed error=%s; the desktop path is unaffected", e)
+            _device_listener_state = "failed"
+
+    # The ring router asks for the device sinks at each call, so they follow
+    # the registry's latest read. The sinks read the session registry when
+    # they are called, as `_desktop_present` does, since the registry is built
+    # after the host.
+    ring_sinks: "Callable[[], tuple[DeviceRingSink, ...]] | None" = (
+        registry_ring_sinks(device_registry.devices, lambda: session_registry)
+        if device_registry is not None
+        else None
+    )
+
+    # Read when a call runs, as the sinks read it, so a call names its
+    # session's endpoint once the registry exists; before then, and for a
+    # session that is not connected, it gives None and the turn endpoint
+    # applies.
+    def _session_endpoint(session_id: str) -> str | None:
+        registry = session_registry
+        return registry.endpoint_of(session_id) if registry is not None else None
+
+    # Without a loaded device registry no endpoint has an area, so an
+    # untargeted lights call keeps `MIST_LIGHTS_DEFAULT_TARGET`.
+    _device_area = device_registry.area_of if device_registry is not None else None
+
     try:
         _capability_config = load_capabilities_config(os.environ)
     except CapabilityConfigError as e:
@@ -1572,6 +1640,9 @@ async def lifespan(app: FastAPI):
             tiers=capability_tiers,
             register=persona,
             desktop_present=_desktop_present,
+            ring_sinks=ring_sinks,
+            endpoint_of=_session_endpoint,
+            area_of=_device_area,
         )
     if _capability_build.host is not None:
         await _capability_build.host.start()
@@ -1756,6 +1827,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001 -- catch-up must never block startup
         logger.warning("Session-note catch-up scheduling failed (non-fatal): %s", e)
 
+    # Room devices: a second, TLS listener for `/v2/device`, off unless
+    # `MIST_DEVICE_LISTENER=on`. Its configuration and registry were read
+    # before the capability host, which rings each device; the listener
+    # starts once the session registry exists, since each device is served as
+    # a session. A listener that cannot start (the port taken, a bad
+    # certificate) logs ERROR and shows `failed` in `/health`; the desktop
+    # path runs on.
+    if device_config is not None and device_registry is not None:
+        device_clock = DeviceClock()
+        _device_app = build_device_app(
+            device_registry, _serve_session, AuthLimiter(device_clock), device_clock
+        )
+        _device_listener = DeviceListener(device_config, _device_app)
+        await _device_listener.start()
+
     logger.info(f"Server ready on ws://{config.host}:{config.port}/ws")
     logger.info("=" * 60)
 
@@ -1764,13 +1850,20 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Server shutting down...")
 
-    # Cancel the catch-up background task FIRST, before anything else below
-    # touches vault_writer or the ConversationHandler it holds a reference
-    # to. curation_scheduler.stop() and ch.aclose() both await, which yields
-    # the event loop -- a still-running catch-up pass could resume in that
+    # Cancel the catch-up background task FIRST, as shutdown's first awaiting
+    # step, before anything else below touches vault_writer or the
+    # ConversationHandler it holds a reference to. Every later awaiting step
+    # (the device listener's stop, curation_scheduler.stop(), ch.aclose()) can
+    # yield the event loop -- a still-running catch-up pass could resume in that
     # window and reach a write against an already-stopped vault_writer if
     # cancellation happened later (or not at all).
     await _shutdown_session_note_catchup(catchup_task)
+
+    # The device listener next, right after the catch-up and before anything
+    # its sessions use stops: its graceful shutdown is capped, and its task
+    # cancelled after 6 s.
+    if _device_listener is not None:
+        await _device_listener.stop()
 
     if curation_scheduler is not None:
         await curation_scheduler.stop()
@@ -1991,8 +2084,15 @@ async def health() -> dict:
       dead letters, unrecorded turns, service reachability), from the same
       producer, so the two cannot disagree.
 
+    Added after the registry
+    ------------------------
+    - `devices`: the room device listener (`backend/devices/`): `listener` is
+      `off` (not enabled, or stopped), `on` (serving) or `failed` (it could not
+      start; the desktop path is unaffected), and `connected` the sorted names
+      of the devices with a live session.
+
     Returns:
-        The snapshot mapping with those five fields added. Returned as a dict
+        The snapshot mapping with those fields added. Returned as a dict
         so FastAPI serializes it with a 200.
     """
     from backend.extraction_backlog.status import extraction_status, health_block
@@ -2003,6 +2103,12 @@ async def health() -> dict:
     payload["hydration_isolation"] = _hydration_isolation_for_health()
     payload["extraction"] = health_block(extraction_status(extraction_dispatcher))
     payload["voice"] = _voice_health()
+    listener = _device_listener
+    device_app = _device_app
+    payload["devices"] = {
+        "listener": listener.state() if listener is not None else _device_listener_state,
+        "connected": device_app.connected() if device_app is not None else [],
+    }
     return payload
 
 
@@ -2394,11 +2500,11 @@ async def _decided_payloads(
 
 
 async def _alarm_action_result(
-    host: "CapabilityHost", message: AlarmActionMessage
+    host: "CapabilityHost", message: AlarmActionMessage, endpoint: str
 ) -> dict[str, object]:
-    """Run a client's alarm action and build its `alarm_action_result`."""
+    """Run a client's alarm action from `endpoint` and build its `alarm_action_result`."""
     outcome = await host.alarm_action(
-        message.alarm_id, message.action, message.minutes, endpoint=WS_ENDPOINT
+        message.alarm_id, message.action, message.minutes, endpoint=endpoint
     )
     return alarm_action_result_payload(
         message.alarm_id, message.action, message.request_id, outcome, datetime.now(UTC)
@@ -2406,10 +2512,10 @@ async def _alarm_action_result(
 
 
 async def _alarm_report_result(
-    host: "CapabilityHost", message: AlarmReportMessage
+    host: "CapabilityHost", message: AlarmReportMessage, endpoint: str
 ) -> dict[str, object]:
-    """Apply an endpoint's alarm report and build its `alarm_action_result`."""
-    outcome = await host.alarm_report(message, endpoint=WS_ENDPOINT)
+    """Apply `endpoint`'s alarm report and build its `alarm_action_result`."""
+    outcome = await host.alarm_report(message, endpoint=endpoint)
     return alarm_action_result_payload(
         message.alarm_id, "report", message.request_id, outcome, datetime.now(UTC)
     )
@@ -2470,6 +2576,12 @@ async def _handle_capability_message(
     capability payload is, until turns are routed per connection); an alarm
     action or report gets exactly one `alarm_action_result`, on the session's
     `control` lane through `send`.
+
+    An alarm action or report is attributed to the endpoint its session is
+    bound to (`SessionRegistry.endpoint_of`): `desktop` for `/ws`, the device's
+    name for a room device. A session the registry no longer knows is answered
+    with a `server` error and one WARNING, and never reaches the host under
+    another endpoint's name.
     """
     host = _capability_host()
     if host is None:
@@ -2479,13 +2591,23 @@ async def _handle_capability_message(
     if msg_type == "action_decision":
         await _handle_action_decision(host, data, session_id, send)
         return
+    registry = session_registry
+    endpoint = registry.endpoint_of(session_id) if registry is not None else None
+    if endpoint is None:
+        logger.warning(
+            "Capability message %s from session %s, which is no longer connected; not applied",
+            msg_type,
+            session_id,
+        )
+        send(_ws_error("server", f"session {session_id} is not connected"))
+        return
     if msg_type == "alarm_action":
         action = _validate_capability_message(AlarmActionMessage, data)
         if isinstance(action, str):
             send(_ws_error("validation", action))
             return
         result, error = await _run_capability_call(
-            _alarm_action_result(host, action), "alarm_action"
+            _alarm_action_result(host, action, endpoint), "alarm_action"
         )
         if error is not None:
             result = _failed_alarm_result(
@@ -2497,7 +2619,7 @@ async def _handle_capability_message(
             send(_ws_error("validation", report))
             return
         result, error = await _run_capability_call(
-            _alarm_report_result(host, report), "alarm_report"
+            _alarm_report_result(host, report, endpoint), "alarm_report"
         )
         if error is not None:
             result = _failed_alarm_result(host, report.alarm_id, "report", report.request_id, error)
@@ -2571,6 +2693,21 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     await websocket.accept(headers=None)
+    await _serve_session(websocket, WS_ENDPOINT, WS_ENDPOINT)
+
+
+async def _serve_session(
+    websocket: "WebSocket | DeviceSocket",
+    endpoint: str,
+    endpoint_kind: Literal["desktop", "room"],
+) -> None:
+    """Serve one accepted connection as a `RealtimeSession` bound to `endpoint`.
+
+    Both routes call it: `/ws` with `desktop`, and the device listener
+    (`backend/devices/listener.py`) with the device's registered name and kind
+    `room`, after it has authenticated the device. Before the runtime and the
+    registry exist the client gets a retriable `server` error and a close 1013.
+    """
     registry = session_registry
     built = runtime
     if registry is None or built is None:
@@ -2593,9 +2730,10 @@ async def websocket_endpoint(websocket: WebSocket):
     session = registry.create_session(
         session_id=session_id,
         websocket=websocket,  # type: ignore[arg-type]
-        endpoint=WS_ENDPOINT,
+        endpoint=endpoint,
+        endpoint_kind=endpoint_kind,
     )
-    logger.info("Client connected (total: %d)", registry.count())
+    logger.info("Client connected: %s (total: %d)", endpoint, registry.count())
     try:
         session.send_control(
             SessionStartedMessage(

@@ -14,6 +14,23 @@ received, and drains three outbound lanes through one sender:
 The sender takes one item at a time, so a purge between two takes removes everything the client
 has not been sent yet.
 
+A session is bound to an endpoint of a kind: `desktop`, the loopback `/ws`, or `room`, a device
+the listener authenticated. A kind not given is `desktop` for the `desktop` endpoint and `room`
+for any other, so it fails closed. A `room` session accepts only the text types the device sends
+(`ROOM_CLIENT_MESSAGE_TYPES`) and `0x10` frames: any other type is refused after parsing and
+before dispatch, with a throttled protocol error naming `type`, a `room_message_refused` WARNING
+once per type, and a count in `refused_messages`; it reaches no turn, no log subscription, no log
+gate and no proposal. Every `0x11` frame is dropped and counted in `dropped_references`.
+
+Going out, a `room` session's socket carries binary frames and only the text types its device
+acts on (`ROOM_SERVER_MESSAGE_TYPES`). The sender checks each text item's `type` as it writes
+it, after the lanes, so broadcasts, targeted sends and the session's own items are all held to
+the set, while lane order, bounds and fences stay as they are: a withheld `turn` item still moves
+its lane on. Every other item, one with no readable `type` included, is withheld, counted in
+`withheld`, and logged `room_message_withheld` at DEBUG once per type. Another session's
+proposals, the capabilities and system status, the heartbeat, and a turn's tokens, transcripts
+and metrics never reach the device.
+
 A `control` item may carry a fence, a `TurnLane` mark, and waits until the lane has passed it.
 The newest waiting fence is the largest fence on `control` the lane has not passed yet. Three
 rules set a fence (A53):
@@ -68,6 +85,8 @@ from .ingress import Lane as InferenceLane
 from .playback import LaneFull, LanePurge, MonotonicPlaybackClock, PlaybackClock, TurnLane
 from .power import PowerGate, PowerGatedResponder, SynthesizerSlot, TranscriberSlot
 from .protocol import (
+    ROOM_CLIENT_MESSAGE_TYPES,
+    ROOM_SERVER_MESSAGE_TYPES,
     ActionDecisionMessage,
     AlarmActionMessage,
     AlarmReportMessage,
@@ -130,7 +149,10 @@ from .turn import (
 
 logger = logging.getLogger(__name__)
 
-Endpoint = Literal["desktop", "room"]
+# A session's endpoint: `desktop`, or a room device's registered name (`backend/devices/`), so
+# a ring or a broadcast can name one device. What kind of endpoint it is lives in `EndpointKind`.
+Endpoint = str
+EndpointKind = Literal["desktop", "room"]
 CapabilityMessage = ActionDecisionMessage | AlarmActionMessage | AlarmReportMessage
 
 TURN_LANE_MAX_ITEMS = 2048
@@ -317,8 +339,14 @@ class RealtimeSession:
     Args:
         session_id: The session's id, as `session_started` announced it.
         websocket: The accepted socket.
-        endpoint: The endpoint the connection is bound to; a `voice_start` naming another one
-            is logged and the bound one kept.
+        endpoint: The endpoint the connection is bound to: `desktop`, or a room device's name.
+        endpoint_kind: What kind of endpoint it is, which picks the spotter calibration and is
+            what a `voice_start`'s advisory `endpoint` is compared with: one naming another kind
+            is logged and the bound one kept. A `room` session also accepts only the device's
+            message types (`ROOM_CLIENT_MESSAGE_TYPES`) and no `0x11` frame, and is sent only
+            the types it acts on (`ROOM_SERVER_MESSAGE_TYPES`) and binary frames. None: `desktop`
+            for the `desktop` endpoint and `room` for any other, so a session bound to a device
+            is never given the desktop's types by omission.
         services: What every session shares.
         host: The registry.
         max_turn_items: The `turn` lane's bound.
@@ -333,11 +361,15 @@ class RealtimeSession:
         endpoint: Endpoint,
         services: SessionServices,
         host: SessionHost,
+        endpoint_kind: EndpointKind | None = None,
         max_turn_items: int = TURN_LANE_MAX_ITEMS,
         max_bulk_items: int = BULK_LANE_MAX_ITEMS,
     ) -> None:
         self.session_id = session_id
         self.endpoint: Endpoint = endpoint
+        if endpoint_kind is None:
+            endpoint_kind = "desktop" if endpoint == "desktop" else "room"
+        self.endpoint_kind: EndpointKind = endpoint_kind
         self._socket = websocket
         self._services = services
         self._host = host
@@ -367,6 +399,10 @@ class RealtimeSession:
         self.dropped_references = 0
         self._last_protocol_error: int | None = None
         self._gpu_yield_logged = False
+        self.refused_messages = 0
+        self._refused_types: set[str] = set()
+        self.withheld = 0
+        self._withheld_types: set[str | None] = set()
 
         self._activity = False
         self._activity_check: asyncio.Handle | None = None
@@ -382,7 +418,7 @@ class RealtimeSession:
         settings = self._settings
         engines = services.engines
         spotter = engines.spotter
-        own = "server" if self.endpoint == "desktop" else "endpoint"
+        own = "server" if self.endpoint_kind == "desktop" else "endpoint"
         synthesizer = engines.tts_slot if engines.tts_slot is not None else engines.synthesizer
         responder = services.responder
         if services.power_gate is not None:
@@ -642,14 +678,53 @@ class RealtimeSession:
             await self._write(item)
 
     async def _write(self, item: object) -> None:
+        """Send one item the lanes gave up; a `room` session is sent only what its device reads.
+
+        The check runs here, after the lanes, so a withheld item has already moved its lane on
+        and a fence behind it passes as if it had been sent.
+        """
         if isinstance(item, Frame):
             await self._socket.send_bytes(encode_frame(item))
-        elif isinstance(item, BaseModel):
+            return
+        if self.endpoint_kind != "desktop":
+            message_type = self._type_of(item)
+            if message_type not in ROOM_SERVER_MESSAGE_TYPES:
+                self._withhold(message_type)
+                return
+        if isinstance(item, BaseModel):
             await self._socket.send_text(item.model_dump_json())
         elif isinstance(item, str):
             await self._socket.send_text(item)
         else:
             await self._socket.send_text(json.dumps(item))
+
+    @staticmethod
+    def _type_of(item: object) -> str | None:
+        """A text item's `type`: a model's field, a mapping's key, or a JSON string's key.
+
+        None when it has none that is a string, an unparsable string included, so the caller
+        withholds it: an item whose type cannot be read is not one the device reads.
+        """
+        if isinstance(item, BaseModel):
+            message_type = getattr(item, "type", None)
+        elif isinstance(item, Mapping):
+            message_type = item.get("type")
+        elif isinstance(item, str):
+            try:
+                data = json.loads(item)
+            except (ValueError, RecursionError):
+                return None
+            message_type = data.get("type") if isinstance(data, dict) else None
+        else:
+            return None
+        return message_type if isinstance(message_type, str) else None
+
+    def _withhold(self, message_type: str | None) -> None:
+        """Count an item a `room` session is not sent, and log its type once per session."""
+        self.withheld += 1
+        if message_type not in self._withheld_types:
+            self._withheld_types.add(message_type)
+            logger.debug("room_message_withheld session=%s type=%s", self.session_id, message_type)
 
     # -- Voice activity ------------------------------------------------------------------------
 
@@ -764,7 +839,8 @@ class RealtimeSession:
             if isinstance(text, str):
                 self._on_text(text)
 
-    def _protocol_error(self, error: ProtocolError) -> None:
+    def _protocol_error(self, error: ProtocolError, *, message: str | None = None) -> None:
+        """Answer a protocol violation, at most once a second; `message` replaces the text."""
         now = self._clock.now_ms()
         last = self._last_protocol_error
         if last is not None and now - last < PROTOCOL_ERROR_INTERVAL_MS:
@@ -773,11 +849,29 @@ class RealtimeSession:
         self.send_control(
             ErrorMessage(
                 kind="protocol",
-                message=str(error),
+                message=str(error) if message is None else message,
                 retriable=False,
                 context={"field": error.field},
             )
         )
+
+    def _refuse(self, message_type: str) -> None:
+        """Refuse a type a `room` session does not accept: answered, counted, never dispatched.
+
+        The session stays open, so a firmware build that sends a new type is told so and keeps
+        its turns, rather than reconnecting in a loop.
+        """
+        self.refused_messages += 1
+        if message_type not in self._refused_types:
+            self._refused_types.add(message_type)
+            logger.warning(
+                "room_message_refused session=%s endpoint=%s type=%s",
+                self.session_id,
+                self.endpoint,
+                message_type,
+            )
+        reason = f"{message_type} is not accepted from a room endpoint"
+        self._protocol_error(ProtocolError("type", reason), message=reason)
 
     def _on_binary(self, data: bytes) -> None:
         try:
@@ -794,7 +888,8 @@ class RealtimeSession:
                 return
             voice.ingress.push_frame(frame, pos)
         elif frame.msg_type == MsgType.REF_AUDIO:
-            if voice is None or not voice.settings.reference:
+            # A room device sends no reference frames, so a `room` session takes none.
+            if self.endpoint_kind != "desktop" or voice is None or not voice.settings.reference:
                 self.dropped_references += 1
                 return
             voice.ingress.push_reference(frame.seq, frame.payload)
@@ -808,6 +903,11 @@ class RealtimeSession:
                 self._answer_now(_Answer(req=peek.req), "invalid")
             else:
                 self._protocol_error(error)
+            return
+        # Checked on the parsed type, the one `_dispatch` matches on; anything but the desktop
+        # is held to the device's types.
+        if self.endpoint_kind != "desktop" and message.type not in ROOM_CLIENT_MESSAGE_TYPES:
+            self._refuse(message.type)
             return
         self._dispatch(message)
 
@@ -876,12 +976,13 @@ class RealtimeSession:
             self._answer_now(_Answer(req=settings.req), "invalid")
             return
         self._max_req = settings.req
-        if settings.endpoint != self.endpoint:
+        if settings.endpoint != self.endpoint_kind:
             logger.warning(
-                "session %s: voice_start names endpoint %s; the connection is bound to %s",
+                "session %s: voice_start names endpoint %s; the connection is bound to %s (%s)",
                 self.session_id,
                 settings.endpoint,
                 self.endpoint,
+                self.endpoint_kind,
             )
         refusal = self._refusal(settings)
         voice = self._voice

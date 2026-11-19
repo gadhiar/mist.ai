@@ -171,7 +171,79 @@ respective licenses:
    runtime.
 
 -------------------------------------------------------------------------------
-13. LiteRT (ai-edge-litert) and pymicro-features
+13. Home Assistant Voice PE configuration (Adapted)
+   Location: firmware/room-endpoint/packages/*.yaml (adapted)
+   Source: https://github.com/esphome/home-assistant-voice-pe,
+           home-assistant-voice.yaml at commit
+           2644f4c794271d735d182ca7ebf899ed46164f4e
+   License: MIT License (the YAML; the repository's LICENSE is the ESPHome
+            License, MIT for YAML and Python, GPLv3 for C++)
+   Copyright: (c) 2019 ESPHome
+
+   Modifications made for MIST.AI:
+   - packages/device.yaml: the board, PSRAM, XMOS front end, I2S buses,
+     microphone, speaker chain, mute switch, Wi-Fi, OTA and SNTP, with the
+     stock wake models, wake word select, assistant pipeline and native API
+     removed
+   - packages/controls.yaml: the center button, dial and LED ring hardware and
+     the ring's remap; the LED effects are written for MIST
+   - the other packages wire MIST's own components (MIT) to that hardware
+
+   See firmware/room-endpoint/README.md (Pins) for the pinned commit.
+
+-------------------------------------------------------------------------------
+14. voice_kit ESPHome component
+   Location: Not included in this repository. Referenced at its pinned commit
+             through the voice_kit_path substitution
+             (firmware/room-endpoint/room.yaml); the worker image holds the
+             checkout at /opt/mist-firmware-deps/home-assistant-voice-pe/
+   Source: https://github.com/esphome/home-assistant-voice-pe,
+           esphome/components/voice_kit at commit
+           2644f4c794271d735d182ca7ebf899ed46164f4e
+   License: GNU General Public License v3.0 (C++); MIT License (Python)
+   Copyright: (c) 2019 ESPHome
+
+   Flashes and drives the Voice PE's XMOS audio front end. Compiled into a
+   firmware image; never copied into this repository.
+
+-------------------------------------------------------------------------------
+15. esp_websocket_client
+   Location: Not included in this repository. Added to a firmware build as an
+             ESP-IDF component from the worker image's copy
+             (/opt/mist-firmware-deps/esp_websocket_client)
+   Source: https://github.com/espressif/esp-protocols,
+           components/esp_websocket_client, version 1.8.0 (commit
+           70bf122fc8bc74622dcf7e15233b5b2af9088df5)
+   License: Apache License 2.0
+   Copyright: Espressif Systems
+
+   The WebSocket client of the room device's link to MIST
+   (firmware/room-endpoint/components/mist_link/).
+
+-------------------------------------------------------------------------------
+16. microWakeWord stop and VAD models
+   Location: Not included in this repository. The worker image holds them at
+             /opt/mist-firmware-deps/models/stop/ and
+             /opt/mist-firmware-deps/models/vad/
+   Source: https://github.com/kahrendt/microWakeWord, release "stop" (the stop
+           model); https://github.com/esphome/micro-wake-word-models at commit
+           9a72109cc935f77e34cf8ffe7b868155c37ec201 (the VAD model)
+   License: Apache License 2.0
+   Copyright: Kevin Ahrendt (the author each model's manifest names)
+
+   The room device's "stop" keyword and voice activity detection
+   (firmware/room-endpoint/packages/device.yaml). Compiled into a firmware
+   image; the sha256 of each file is in firmware/room-endpoint/README.md
+   (Pins).
+
+   A built firmware image links voice_kit and ESPHome's own C++ runtime, both
+   GPLv3, with MIST.AI's MIT components, so the image is a GPLv3 combined
+   work. That binds only on distribution: each image is built for one personal
+   device from its private configuration and is not distributed. MIST.AI's own
+   files stay MIT.
+
+-------------------------------------------------------------------------------
+17. LiteRT (ai-edge-litert) and pymicro-features
    Location: Python packages ai-edge-litert 2.3.0 and pymicro-features 2.0.2
              (requirements-voice.txt)
    Source: https://github.com/google-ai-edge/LiteRT (LiteRT)
@@ -200,6 +272,8 @@ The following components are licensed under Apache License 2.0:
 - MS MARCO MiniLM-L-6-v2 and MiniLM-L-12-v2 Cross-Encoders
 - all-MiniLM-L6-v2 Sentence Embedding Model
 - NVIDIA NeMo toolkit
+- esp_websocket_client
+- microWakeWord stop and VAD models
 - LiteRT (ai-edge-litert) and pymicro-features
 
 Apache License 2.0 Summary:
@@ -220,9 +294,20 @@ The following components are licensed under MIT License:
 - Ollama
 - Kyutai Pocket TTS (code)
 - onnx-asr
+- Home Assistant Voice PE configuration (YAML, adapted)
 
 MIT License is permissive and allows commercial use, modification,
 distribution, and private use with minimal restrictions.
+
+GNU GENERAL PUBLIC LICENSE V3 COMPONENTS
+
+The following components are licensed under GPLv3:
+- voice_kit ESPHome component (C++; referenced at its pinned commit, not
+  included in this repository)
+
+A firmware image built from firmware/room-endpoint/ is a GPLv3 combined work
+(see 16 above). Its obligations apply only when the image is distributed.
+Full license text: https://www.gnu.org/licenses/gpl-3.0.txt
 
 CREATIVE COMMONS ATTRIBUTION 4.0 COMPONENTS
 

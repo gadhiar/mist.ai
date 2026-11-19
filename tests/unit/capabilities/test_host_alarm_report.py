@@ -5,6 +5,7 @@ given, and the turn endpoint every `InvocationContext` carries (T23).
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Literal
@@ -14,7 +15,12 @@ import pytest_asyncio
 
 from backend.capabilities.action_log import ActionLog
 from backend.capabilities.alarms.records import ReportOutcome, ReportResult
-from backend.capabilities.contracts import FastIntent, InvocationContext, ToolOutcome
+from backend.capabilities.contracts import (
+    DecodeReply,
+    FastIntent,
+    InvocationContext,
+    ToolOutcome,
+)
 from backend.capabilities.db import CapabilitiesDb
 from backend.capabilities.decoder import ActionDecoder
 from backend.capabilities.events import (
@@ -34,6 +40,7 @@ from tests.unit.capabilities.fakes import (
     FakeCapability,
     FakeClock,
     RecordingEventSink,
+    ScriptedDecode,
     make_tool_spec,
 )
 
@@ -109,7 +116,7 @@ async def _stop_hosts():
 def _rig(
     *capabilities: FakeCapability,
     alarm_control: AlarmControl | None = None,
-    **host_options: str,
+    **host_options: object,
 ) -> Rig:
     counter = ApproximateTokenCounter()
     router = ToolRouter(
@@ -408,3 +415,93 @@ class TestTurnEndpoint:
         ctx = InvocationContext("s1", "t1", "x", "c1", "model", T0)
 
         assert ctx.endpoint is None
+
+
+class TestSessionEndpoint:
+    """A call's endpoint is its context's, else its session's (`endpoint_of`), else the turn's."""
+
+    SESSIONS = {"s-bedside": "bedside"}
+
+    @staticmethod
+    def _lights() -> FakeCapability:
+        return FakeCapability(
+            "lights",
+            tools=[
+                make_tool_spec("lights.do"),
+                make_tool_spec("lights.all_off", default_policy="confirm"),
+            ],
+            intents={"lights on": FastIntent(tool="lights.do", args={})},
+        )
+
+    @staticmethod
+    def _decode(tool: str) -> ScriptedDecode:
+        content = json.dumps({"calls": [{"tool": tool, "args": {}}], "also_reply": False})
+        return ScriptedDecode(DecodeReply(content=content, finish_reason="stop"))
+
+    async def _every_path(self, rig: Rig, lights: FakeCapability, session: str) -> list[object]:
+        """Run one call on the fast path, the model path and the proposal path."""
+        await rig.host.pre_llm(session, "t1", "lights on")
+        plan = rig.host.plan_turn(session, "lights", [])
+        await rig.host.run_actions(session, "t2", "lights", plan, self._decode("lights.do"))
+        plan = rig.host.plan_turn(session, "lights", [])
+        held = await rig.host.run_actions(
+            session, "t3", "lights", plan, self._decode("lights.all_off")
+        )
+        (proposal_id,) = {r.outcome.proposal_id for r in held.records}
+        assert proposal_id is not None
+        await rig.host.decide(session, proposal_id, "approve")
+        return [(ctx.source, ctx.endpoint) for _, _, ctx in lights.invocations]
+
+    @pytest.mark.asyncio
+    async def test_every_path_takes_the_sessions_endpoint(self):
+        lights = self._lights()
+        asked: list[str] = []
+
+        def endpoint_of(session_id: str) -> str | None:
+            asked.append(session_id)
+            return self.SESSIONS.get(session_id)
+
+        rig = _rig(lights, endpoint_of=endpoint_of, turn_endpoint="room")
+
+        sources = await self._every_path(rig, lights, "s-bedside")
+
+        assert sources == [
+            ("fastpath", "bedside"),
+            ("model", "bedside"),
+            ("proposal", "bedside"),
+        ]
+        assert set(asked) == {"s-bedside"}
+
+    @pytest.mark.parametrize(
+        ("options", "expected"), [({}, "desktop"), ({"turn_endpoint": "room"}, "room")]
+    )
+    @pytest.mark.asyncio
+    async def test_a_session_with_no_endpoint_takes_the_turn_endpoint(self, options, expected):
+        lights = self._lights()
+        rig = _rig(lights, endpoint_of=self.SESSIONS.get, **options)
+
+        sources = await self._every_path(rig, lights, "s-gone")
+
+        assert sources == [("fastpath", expected), ("model", expected), ("proposal", expected)]
+
+    @pytest.mark.asyncio
+    async def test_invoke_gives_a_context_with_no_endpoint_the_sessions(self):
+        lights = self._lights()
+        rig = _rig(lights, endpoint_of=self.SESSIONS.get)
+        ctx = InvocationContext("s-bedside", "t1", "lights on", "c1", "model", T0)
+
+        await rig.host.invoke(ToolCall(id="c1", name="lights.do", arguments={}), ctx, None)
+
+        [(_, _, seen)] = lights.invocations
+        assert seen.endpoint == "bedside"
+
+    @pytest.mark.asyncio
+    async def test_a_context_that_names_an_endpoint_keeps_it_over_the_sessions(self):
+        lights = self._lights()
+        rig = _rig(lights, endpoint_of=self.SESSIONS.get)
+        ctx = InvocationContext("s-bedside", "t1", "lights on", "c1", "model", T0, "kitchen")
+
+        await rig.host.invoke(ToolCall(id="c1", name="lights.do", arguments={}), ctx, None)
+
+        [(_, _, seen)] = lights.invocations
+        assert seen.endpoint == "kitchen"

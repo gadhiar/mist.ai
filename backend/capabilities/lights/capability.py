@@ -8,7 +8,7 @@ can read one.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
@@ -198,20 +198,31 @@ class LightsCapability(Capability):
     refine_allowance_tokens = REFINE_ALLOWANCE_TOKENS
 
     def __init__(
-        self, provider: LightsProvider, *, default_target: str | None, counter: TokenCounter
+        self,
+        provider: LightsProvider,
+        *,
+        default_target: str | None,
+        counter: TokenCounter,
+        area_of: Callable[[str], str | None] | None = None,
     ) -> None:
         """Build the capability; nothing connects until `start`.
 
         Args:
             provider: The lights backend, such as `HomeAssistantLightsProvider`.
             default_target: `MIST_LIGHTS_DEFAULT_TARGET`, the light or area a power or adjust
-                call acts on when it names none; None makes such a call `invalid_args`.
+                call acts on when it names none and its endpoint has no area; None makes such
+                a call `invalid_args`.
             counter: The router's token counter, so the enum check here measures as the host's
                 refinement check does.
+            area_of: The area a room device was registered for, by device name, or None for
+                any other endpoint (`DeviceRegistry.area_of`), so an untargeted power or adjust
+                call from a device acts on that device's area. None leaves every such call on
+                `default_target`.
         """
         self._provider = provider
         self._default_target = _clean(default_target)
         self._counter = counter
+        self._area_of = area_of
         # The catalog targets last measured and whether their enum fitted the allowance.
         self._enum_fit: tuple[tuple[str, ...], bool] = ((), False)
         self._tools = (
@@ -301,9 +312,9 @@ class LightsCapability(Capability):
         """
         try:
             if isinstance(args, PowerArgs) and tool == POWER:
-                return await self._power(args)
+                return await self._power(args, ctx)
             if isinstance(args, AdjustArgs) and tool == ADJUST:
-                return await self._adjust(args)
+                return await self._adjust(args, ctx)
             if isinstance(args, StatusArgs) and tool == STATUS:
                 return await self._status(args)
         except (CapabilityUnavailableError, McpTransportError) as exc:
@@ -322,8 +333,8 @@ class LightsCapability(Capability):
 
     # -- Tools -----------------------------------------------------------------------------
 
-    async def _power(self, args: PowerArgs) -> ToolOutcome:
-        target = self._resolve(args.target or self._default_target)
+    async def _power(self, args: PowerArgs, ctx: InvocationContext) -> ToolOutcome:
+        target = self._resolve(args.target or self._untargeted(ctx))
         if isinstance(target, ToolOutcome):
             return target
         await self._provider.power(target, args.on)
@@ -336,8 +347,8 @@ class LightsCapability(Capability):
             status="ok", summary=summary, data={"target": target.value, "on": args.on}
         )
 
-    async def _adjust(self, args: AdjustArgs) -> ToolOutcome:
-        target = self._resolve(args.target or self._default_target)
+    async def _adjust(self, args: AdjustArgs, ctx: InvocationContext) -> ToolOutcome:
+        target = self._resolve(args.target or self._untargeted(ctx))
         if isinstance(target, ToolOutcome):
             return target
         adjustment = LightAdjustment(
@@ -374,6 +385,19 @@ class LightsCapability(Capability):
         items = [f"{light.names[0]} is {light.state or 'unknown'}" for light in reading.lights]
         return ToolOutcome(status="ok", summary=render_read(STATUS, items), data=data)
 
+    def _untargeted(self, ctx: InvocationContext) -> str | None:
+        """Return what a power or adjust call that names no target acts on.
+
+        The area of the device the call came from comes first, so "lights off" said to a
+        bedroom device switches the bedroom. An endpoint `area_of` gives no area for, such as
+        the desktop, falls back to `default_target`.
+        """
+        if self._area_of is not None and ctx.endpoint is not None:
+            area = _clean(self._area_of(ctx.endpoint))
+            if area is not None:
+                return area
+        return self._default_target
+
     def _resolve(self, text: str | None) -> LightTarget | ToolOutcome:
         """Resolve a target, or return the `invalid_args` outcome that answers instead."""
         if text is None:
@@ -395,7 +419,10 @@ class LightsCapability(Capability):
     # -- Summaries for proposals -----------------------------------------------------------
 
     def _target_phrase(self, target: str | None) -> str:
-        chosen = target or self._default_target
+        # A summary is built from the arguments alone, without the call's endpoint, so while
+        # areas are routed an untargeted call may act on a device's area rather than the
+        # default target, and the summary names neither.
+        chosen = target or (self._default_target if self._area_of is None else None)
         return f"the {_lights_phrase(chosen)}" if chosen else "the lights"
 
     def _summarize_power(self, args: BaseModel) -> str:

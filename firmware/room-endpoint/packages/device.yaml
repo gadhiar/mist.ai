@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The Voice PE hardware: board, PSRAM, the XMOS front end, the I2S buses, microphone and speaker
+# chain, mute switch, Wi-Fi, OTA, SNTP and the wake models. Adapted from the published Voice PE config
+# (esphome/home-assistant-voice-pe, home-assistant-voice.yaml at 2644f4c, MIT), with its stock
+# wake models, wake word select, assistant pipeline and native API removed.
+#
+# Substitutions come from the top-level config (`room.yaml` or `spike.yaml`); secrets come from
+# the `secrets.yaml` that `scripts/daily/devices.py add` writes beside the private YAML.
+
+esphome:
+  name: ${device_name}
+  min_version: 2026.10.2
+  on_boot:
+    # The speaker's amplifier is enabled by GPIO47, which the published config holds off at reset
+    # (`internal_speaker_amp`, `restore_mode: ALWAYS_OFF`, home-assistant-voice.yaml at 2644f4c,
+    # lines 280-286) and turns on 1 s into boot (lines 42-48). As there.
+    - priority: 375
+      then:
+        - delay: 1s
+        - switch.turn_on: internal_speaker_amp
+    - priority: -100
+      then:
+        # The DAC's level. `i2s_audio_speaker` starts at volume 1.0, which the AIC3204 maps to
+        # +24 dB of digital gain (aic3204.cpp:152-157), so a reply above -24 dBFS clips. The
+        # published config's media player starts at `volume_initial` 0.5 (speaker_source
+        # media_player.py:130) within `volume_min` 0.4 and `volume_max` 0.85
+        # (home-assistant-voice.yaml lines 1668-1670), which it hands the speaker as 0.625
+        # (speaker_source_media_player.cpp:820-829): -8.5 dB here as there.
+        - lambda: id(i2s_audio_speaker).set_volume(0.625f);
+        - micro_wake_word.start:
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  cpu_frequency: 240MHz
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      # Instructions and read-only data run from PSRAM, so a flash write does not stall the
+      # wake models.
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      # TLS buffers in PSRAM, and TLS 1.3, for the link to MIST.
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false
+
+external_components:
+  - source:
+      type: local
+      path: ${voice_kit_path}
+    components: [voice_kit]
+  # The pre-wake ring and wake uplink; configured in `packages/link.yaml`.
+  - source:
+      type: local
+      path: ${mist_components_path}
+    components: [mist_prewake]
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # A wake sends 5 s of backlog (about 175 KB on the wire) that must arrive within 1 s. ESPHome's
+  # ESP32 default is `light` (wifi/__init__.py:517-525), modem sleep, in which "the delay in
+  # receiving Wi-Fi data may be the same as the DTIM cycle" (ESP-IDF docs, api-guides/wifi.rst
+  # line 2149): the server's ACKs wait for a beacon and the send window waits behind them. A
+  # mains-powered room endpoint keeps the radio awake. The send buffer behind the backlog is
+  # `mist_prewake`'s request for high-performance networking (its `__init__.py`).
+  power_save_mode: none
+
+ota:
+  - platform: esphome
+    password: !secret mist_ota_password
+
+time:
+  - platform: sntp
+    id: sntp_time
+    # Alarms carry aware times; the device keeps UTC.
+    timezone: UTC
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+
+voice_kit:
+  id: voice_kit_component
+  i2c_id: internal_i2c
+  reset_pin: GPIO4
+  firmware:
+    url: ${xmos_firmware}
+    version: "1.3.1"
+    md5: 964635c5bf125529dab14a2472a15401
+
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+    i2s_bclk_pin:
+      number: GPIO8
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO14
+    i2s_bclk_pin:
+      number: GPIO13
+
+# The hardware mute switch on the side of the device, on the pin the published config gives it
+# (home-assistant-voice.yaml at 2644f4c, `hardware_mute_switch`, line 523). On means muted.
+binary_sensor:
+  - platform: gpio
+    id: hardware_mute_switch
+    internal: true
+    pin: GPIO3
+
+# Channel 0 is the XMOS chain through AGC, channel 1 through noise suppression.
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_din_pin: GPIO15
+    adc_type: external
+    pdm: false
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+
+switch:
+  - platform: gpio
+    pin: GPIO47
+    id: internal_speaker_amp
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+audio_dac:
+  - platform: aic3204
+    id: aic3204_dac
+    i2c_id: internal_i2c
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO10
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+    audio_dac: aic3204_dac
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: reply_mixing_input
+        timeout: never
+      - id: alarm_mixing_input
+        timeout: never
+  # MIST's replies arrive as 24 kHz PCM16; the mixer runs at 48 kHz.
+  - platform: resampler
+    id: reply_resampling_speaker
+    output_speaker: reply_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: alarm_resampling_speaker
+    output_speaker: alarm_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+# The wake models read channel 1 at gain 4, as the stock config's do. `mist_wake` is the name
+# model (the spike build's stand-in is `stop`); `stop` cuts her off while she speaks.
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: i2s_mics
+    channels: 1
+    gain_factor: 4
+  stop_after_detection: false
+  models:
+    - model: ${wake_model}
+      id: mist_wake
+      internal: true
+    - model: ${stop_model}
+      id: stop
+      internal: true
+  vad:
+    model: ${vad_model}
+  # A detection passes only its model's word; `mist_prewake` opens the uplink only for the name
+  # model's (packages/link.yaml).
+  on_wake_word_detected:
+    - lambda: id(mist_prewake_uplink).on_wake_word_detected(wake_word);

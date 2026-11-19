@@ -412,6 +412,7 @@ class _ScheduledCapability(Capability):
         endpoints: Callable[[], Sequence[str]],
         snooze_minutes: int,
         turn_endpoint: str = DESKTOP,
+        endpoint_of: Callable[[str], str | None] | None = None,
     ) -> None:
         """Keep the collaborators; nothing is read until `start`.
 
@@ -425,9 +426,13 @@ class _ScheduledCapability(Capability):
             endpoints: The ring endpoints by name (`RingRouter.endpoints`), read at each call
                 so one added later is known.
             snooze_minutes: The configured snooze, for a snooze phrase that names none.
-            turn_endpoint: The endpoint a spoken stop or snooze is recorded from. The
-                `on_active_utterance` hook carries no context, so the host's turn endpoint is
-                passed here.
+            turn_endpoint: The endpoint a spoken stop or snooze is recorded from when
+                `endpoint_of` gives none for its session. The `on_active_utterance` hook
+                carries no context, so the host's turn endpoint is passed here.
+            endpoint_of: The endpoint a live session is bound to, or None for one that is not
+                connected; the host's own `endpoint_of`, so a stop spoken to a room device is
+                recorded from that device. None records every spoken action from
+                `turn_endpoint`.
 
         Raises:
             ValueError: A scheduler is passed without a zone, a zone without a scheduler, or a
@@ -448,6 +453,7 @@ class _ScheduledCapability(Capability):
         self._endpoints = endpoints
         self._snooze_minutes = snooze_minutes
         self._turn_endpoint = turn_endpoint
+        self._endpoint_of = endpoint_of
 
     def routing_hints(self) -> RoutingHints:
         """Return no keywords beyond the router's floor for this capability."""
@@ -507,7 +513,8 @@ class _ScheduledCapability(Capability):
         """Stop or snooze what rings on a stop or snooze phrase; None for anything else.
 
         A phrase that names the other kind ("stop the timer" to alarms) is left to that
-        capability while one of its items rings, so each stops its own.
+        capability while one of its items rings, so each stops its own. The action is recorded
+        from the session's endpoint, else from the turn endpoint.
 
         Raises:
             CapabilityStoreError: The store cannot be read or written.
@@ -523,8 +530,12 @@ class _ScheduledCapability(Capability):
             and self._ringing.ringing(phrase.kind)
         ):
             return None
+        endpoint = self._endpoint_of(session_id) if self._endpoint_of is not None else None
         return await self._ring_action(
-            phrase.action, phrase.minutes, source="fastpath", endpoint=self._turn_endpoint
+            phrase.action,
+            phrase.minutes,
+            source="fastpath",
+            endpoint=endpoint if endpoint is not None else self._turn_endpoint,
         )
 
     async def invoke(self, tool: str, args: BaseModel, ctx: InvocationContext) -> ToolOutcome:
@@ -641,6 +652,7 @@ class AlarmsCapability(_ScheduledCapability):
         endpoints: Callable[[], Sequence[str]],
         snooze_minutes: int,
         turn_endpoint: str = DESKTOP,
+        endpoint_of: Callable[[str], str | None] | None = None,
     ) -> None:
         """Build the capability (`_ScheduledCapability.__init__` documents the arguments)."""
         super().__init__(
@@ -652,6 +664,7 @@ class AlarmsCapability(_ScheduledCapability):
             endpoints=endpoints,
             snooze_minutes=snooze_minutes,
             turn_endpoint=turn_endpoint,
+            endpoint_of=endpoint_of,
         )
         self._tools = (
             ToolSpec(
@@ -889,6 +902,7 @@ class TimersCapability(_ScheduledCapability):
         endpoints: Callable[[], Sequence[str]],
         snooze_minutes: int,
         turn_endpoint: str = DESKTOP,
+        endpoint_of: Callable[[str], str | None] | None = None,
     ) -> None:
         """Build the capability (`_ScheduledCapability.__init__` documents the arguments)."""
         super().__init__(
@@ -900,6 +914,7 @@ class TimersCapability(_ScheduledCapability):
             endpoints=endpoints,
             snooze_minutes=snooze_minutes,
             turn_endpoint=turn_endpoint,
+            endpoint_of=endpoint_of,
         )
         self._tools = (
             ToolSpec(

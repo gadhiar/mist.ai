@@ -74,6 +74,11 @@ from pathlib import Path
 import pytest
 
 from backend import server
+from tests.unit.devices.test_listener import entry, secret_for, write_registry
+from tests.unit.test_server_health_wiring import (  # noqa: F401 -- the fixture
+    _free_port,
+    lifespan_harness,
+)
 
 # Minimum length of an exemption justification. Long enough that "n/a",
 # "ok", or a bare ticket id cannot satisfy it.
@@ -151,6 +156,7 @@ EXPECTED_BUILDER_CALL_SITES: frozenset[str] = frozenset(
         "_build_runtime",
         "_build_uptime_recorder",
         "build_capability_host",
+        "build_device_app",
     }
 )
 
@@ -375,3 +381,51 @@ class TestExemptionsCannotRot:
                 )
 
         assert not stale, "\n".join(["Stale EXEMPTIONS entries:", "", *(f"  {s}" for s in stale)])
+
+
+# -- Runtime values: what `lifespan` hands the capability host ------------------------------
+
+
+class TestCapabilityHostRouting:
+    """The guard above proves `lifespan` names `endpoint_of` and `area_of`; these prove what
+    arrives. `lifespan` passing None for either would satisfy the guard and still leave every
+    device call on the desktop endpoint and the default lights target.
+    """
+
+    DEVICE = "example-room"
+    AREA = "Bedroom"
+
+    @pytest.mark.asyncio
+    async def test_lifespan_hands_the_host_the_session_endpoint_and_the_device_area(
+        self, lifespan_harness, monkeypatch, tmp_path  # noqa: F811 -- the imported fixture
+    ):
+        path = tmp_path / "registry.json"
+        write_registry(path, [{**entry(self.DEVICE, secret_for(1)), "area": self.AREA}])
+        # The listener itself fails on the missing certificate; the registry still loads.
+        monkeypatch.setenv("MIST_DEVICE_LISTENER", "on")
+        monkeypatch.setenv("MIST_DEVICE_PORT", str(_free_port()))
+        monkeypatch.setenv("MIST_DEVICE_TLS_CERT", str(tmp_path / "missing.pem"))
+        monkeypatch.setenv("MIST_DEVICE_TLS_KEY", str(tmp_path / "missing.key"))
+        monkeypatch.setenv("MIST_DEVICE_REGISTRY", str(path))
+        lifespan_harness.configure(tts_enabled=False)
+        await lifespan_harness.start()
+
+        async with server.lifespan(server.app):
+            endpoint_of = lifespan_harness.host_kwargs["endpoint_of"]
+            area_of = lifespan_harness.host_kwargs["area_of"]
+            registry = server.session_registry
+            unbound = endpoint_of("s-device")
+            # A session bound to the device: `endpoint_of` sees it through the registry
+            # `lifespan` built after the host, so one reading no registry would give None.
+            monkeypatch.setattr(
+                registry,
+                "endpoint_of",
+                lambda session_id: self.DEVICE if session_id == "s-device" else None,
+            )
+            bound = endpoint_of("s-device")
+            other = endpoint_of("s-desktop")
+
+        assert registry is not None
+        assert (unbound, bound, other) == (None, self.DEVICE, None)
+        assert area_of(self.DEVICE) == self.AREA
+        assert area_of("desktop") is None
