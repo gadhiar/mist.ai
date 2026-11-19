@@ -329,15 +329,14 @@ class ScriptedNameSpotterStream:
 
     The partial context is the positions pushed since the last `reset`. A hit is reported once
     per context, as a spotter's cooldown reports a name once, so a frame pushed again in the
-    same context gives no second hit, and after a `reset` it does. `warm` records its position
-    in `warmed` and reports nothing; `reset` records its `warm_up` in `warm_ups`.
+    same context gives no second hit, and after a `reset` it does. `reset` records its
+    `warm_up` in `warm_ups`.
     """
 
     def __init__(self, hits: Sequence[NameHit], threshold: float) -> None:
         self.hits = hits
         self.threshold = threshold
         self.pushed: list[int] = []
-        self.warmed: list[int] = []
         self.context: list[int] = []
         self.resets = 0
         self.warm_ups: list[bool] = []
@@ -352,9 +351,6 @@ class ScriptedNameSpotterStream:
                 self._reported.add(index)
                 found.append(hit)
         return found
-
-    def warm(self, pcm: bytes, pos: int) -> None:
-        self.warmed.append(pos)
 
     def reset(self, *, warm_up: bool = True) -> None:
         self.context = []

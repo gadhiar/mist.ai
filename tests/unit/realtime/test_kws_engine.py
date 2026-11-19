@@ -656,8 +656,6 @@ def test_odd_byte_pcm_is_refused(tmp_path: Path) -> None:
     stream, _ = build(tmp_path).stream()
     with pytest.raises(SpeechEngineError):
         stream.push(b"\x00\x01\x02", 0)
-    with pytest.raises(SpeechEngineError):
-        stream.warm(b"\x00", 0)
 
 
 # -- Probabilities, scores and hits -----------------------------------------------------------
@@ -720,16 +718,7 @@ def test_hit_steps_takes_the_greedy_spaced_steps_at_or_above_the_threshold() -> 
         hit_steps([0.5], 0.5, -1)
 
 
-# -- Warm, reset and the warm-up --------------------------------------------------------------
-
-
-def test_warm_reports_nothing_but_its_hit_starts_the_cooldown(tmp_path: Path) -> None:
-    rig = build(tmp_path, window_ms=60, respond=constant(255))
-    stream, _ = rig.stream()
-    stream.warm(silence(1), 0)
-    assert stream.warm(silence(1), 1) is None
-    assert push_frames(stream, silence(1), 2) == []
-    assert [hit.end_pos for hit in push_frames(stream, silence(2), 3)] == [3]
+# -- Reset and the warm-up --------------------------------------------------------------------
 
 
 def test_a_stream_opens_on_the_warm_up_silence_and_reports_none_of_it(tmp_path: Path) -> None:
@@ -803,7 +792,7 @@ def _random_case(rng: random.Random) -> tuple[dict[str, int], bytes]:
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_hit_steps_is_monotone_and_equals_a_stream_split_between_warm_and_push(
+def test_hit_steps_is_monotone_and_equals_a_stream_pushed_every_frame(
     tmp_path: Path, seed: int
 ) -> None:
     rng = random.Random(seed)
@@ -817,34 +806,27 @@ def test_hit_steps_is_monotone_and_equals_a_stream_split_between_warm_and_push(
     counts = [len(hit_steps(series, threshold, cooldown)) for threshold in thresholds]
     assert counts == sorted(counts, reverse=True)
 
-    # The same audio, split at random between `warm` and `push`.
+    # The same audio, every piece of it pushed, in pieces of random size.
     threshold = rng.choice(thresholds) if thresholds else 0.5
     stream, _ = rig.stream(threshold)
-    pieces: list[tuple[int, bool]] = []
+    pieces: list[int] = []
     reported: list[tuple[int, float]] = []
     total = len(pcm) // 2
     start = 0
     while start < total:
         end = min(total, start + rng.randint(1, 700))
         piece = pcm[2 * start : 2 * end]
-        pos, pushed = len(pieces), rng.random() < 0.5
-        if pushed:
-            reported.extend((hit.end_pos, hit.score) for hit in stream.push(piece, pos))
-        else:
-            stream.warm(piece, pos)
+        reported.extend((hit.end_pos, hit.score) for hit in stream.push(piece, len(pieces)))
         start = end
-        pieces.append((end, pushed))
+        pieces.append(end)
 
     # Steps completed by the end of each piece: one feature per 160 samples, silence included.
     silence_samples = settings["warmup_ms"] * 16
     before = silence_samples // CHUNK // settings["stride"]
-    done = [(silence_samples + end) // CHUNK // settings["stride"] - before for end, _ in pieces]
+    done = [(silence_samples + end) // CHUNK // settings["stride"] - before for end in pieces]
     assert len(series) == (done[-1] if done else 0)
     expected = [
-        (piece, series[step])
-        for step in hit_steps(series, threshold, cooldown)
-        for piece in [bisect_right(done, step)]
-        if pieces[piece][1]
+        (bisect_right(done, step), series[step]) for step in hit_steps(series, threshold, cooldown)
     ]
     assert reported == expected
 

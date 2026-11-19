@@ -5,8 +5,8 @@ cutoff c, the gate accepts a hit on at least ceil(14n/18) of the n `tune` positi
 recording manifest (the gated wakes), and accepts at most 0.5 hits an hour on the ambient set
 (the gated false wakes). A hit counts by what she does with it, not by what the spotter hears:
 each runs through `eval_wake`'s offline driver of the live path, the VAD's segments, the spotter
-fed as ingress feeds it, the gate's pre-decode checks, the gate decode with the `--stt-factory`
-STT, and `decide` on its text.
+pushed every frame as ingress pushes it, the gate's pre-decode checks, the gate decode with the
+`--stt-factory` STT, and `decide` on its text.
 
     python -m scripts.wake.spotter_eval --manifest <recordings> --model <id> --ambient <dir> \
         --out <eval.json> --stt-factory <module>:<callable> [--cutoffs <list>] \
@@ -24,10 +24,10 @@ enough gated wakes. A cutoff not gated prints "not run".
 The gate runs as the live session runs it with nothing playing and nothing said by her: with no
 reference score and no recent text of hers, the self-media and self-speech checks pass every hit,
 as they do live in a room where she is idle and the PC plays nothing, and `decide` reads the gate
-decode of ingress's span. Every frame of an ambient file goes through `spotter_feed` and one
-stream at c, as ingress feeds it, and only a hit in a pushed frame, a speech segment or its
-pre-roll, is gated. The gated count counts accepted hits, the count `eval_wake` reports. It is
-neither a strict upper nor a strict lower bound on the turns she would open: live, a hit is
+decode of ingress's span. Every frame of an ambient file is pushed once and in order to one
+stream at c, as ingress pushes it, and every hit the stream reports, in speech or in silence, is
+gated. The gated count counts accepted hits, the count `eval_wake` reports. It is neither a
+strict upper nor a strict lower bound on the turns she would open: live, a hit is
 dropped while she is held, while another candidate waits or within a published utterance, which
 makes the count high; and live she reads a finished utterance's final transcript where this
 decodes ingress's span, and that text can be accepted where the span's was not.
@@ -37,17 +37,16 @@ when its `score_window`, the highest score over the recording from a fresh warme
 least c: for a c above 0, exactly when a fresh stream pushed the same audio at threshold c reports
 a hit. Every frame of each ambient file is scored as one stream: one `score_series` per file, from
 a fresh warmed context at the file's start, then `hit_steps` at each cutoff with the model's own
-`cooldown_steps`, the rule the stream applies. Ingress's stream is fed every frame of a session
-as one stream too, warming the frames outside speech and reporting only the hits in a speech
-segment or its pre-roll (`backend/realtime/ingress.py`), and a warmed hit starts the cooldown as
-a pushed one does. So on the same audio from the same start, with no reset or backlog drop in
-between, the hits ingress reports are a subset of the hits counted here, and the spotter-only
-rate bounds the shipped one. Every server hit that passes the self-speech check sends `attend`,
-ducks her while she speaks and costs a gate decode, so the spotter-only rate at c bounds the
-`attend` cues an hour from ambient speech; the gated bar does not limit them.
+`cooldown_steps`, the rule the stream applies. Ingress pushes its stream every frame of a session
+as one stream too, and reports every hit it finds (`backend/realtime/ingress.py`). So on the
+same audio from the same start, with no reset or backlog drop in between, the hits ingress
+reports equal the hits counted here, and the spotter-only rate is the shipped one. Every server
+hit that passes the self-speech check sends `attend`, ducks her while she speaks and costs a
+gate decode, so the spotter-only rate at c bounds the `attend` cues an hour from ambient sound;
+the gated bar does not limit them.
 
 The output is the converter's evaluation, spotter-only and from the one scoring pass, so it keeps
-that subset property: exactly `cutoffs`, `false_accepts_per_hour` and `positive_scores`, which
+that equality: exactly `cutoffs`, `false_accepts_per_hour` and `positive_scores`, which
 `device_calibration` turns into `calibration.server`. The converter refuses false-accept rates
 that rise with the cutoff, and so does this, writing nothing.
 

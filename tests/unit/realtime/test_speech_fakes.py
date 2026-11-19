@@ -244,7 +244,6 @@ class TestProtocols:
         assert _params(speech.NameSpotter.open_stream) == ["self", "threshold"]
         assert _params(speech.NameSpotter.score_window) == ["self", "pcm"]
         assert _params(speech.NameSpotterStream.push) == ["self", "pcm", "pos"]
-        assert _params(speech.NameSpotterStream.warm) == ["self", "pcm", "pos"]
         assert _params(speech.NameSpotterStream.reset) == ["self", "warm_up"]
         warm_up = inspect.signature(speech.NameSpotterStream.reset).parameters["warm_up"]
         assert (warm_up.kind, warm_up.default) == (inspect.Parameter.KEYWORD_ONLY, True)
@@ -260,30 +259,10 @@ class TestProtocols:
         assert _params(ScriptedNameSpotter.open_stream) == ["self", "threshold"]
         assert _params(ScriptedNameSpotter.score_window) == ["self", "pcm"]
         assert _params(type(stream).push) == ["self", "pcm", "pos"]
-        assert _params(type(stream).warm) == ["self", "pcm", "pos"]
         assert _params(type(stream).reset) == ["self", "warm_up"]
         warm_up = inspect.signature(type(stream).reset).parameters["warm_up"]
         assert (warm_up.kind, warm_up.default) == (inspect.Parameter.KEYWORD_ONLY, True)
         assert hits and all(isinstance(hit, NameHit) for hit in hits)
-
-    def test_the_scripted_stream_records_warm_and_reset_and_warms_without_reporting(self):
-        spotter = ScriptedNameSpotter(
-            [
-                NameHit(end_pos=3, keyword="mist", score=0.9),
-                NameHit(end_pos=5, keyword="mist", score=0.9),
-            ]
-        )
-        stream = spotter.open_stream(0.5)
-
-        assert stream.warm(bytes(640), 3) is None
-        stream.reset(warm_up=False)
-        stream.reset()
-
-        assert stream.warmed == [3]
-        assert stream.pushed == []
-        assert stream.warm_ups == [False, True]
-        assert stream.resets == 2
-        assert stream.push(bytes(640), 5) == [NameHit(end_pos=5, keyword="mist", score=0.9)]
 
 
 # Two points of a table, so a score between them interpolates and one outside clamps.

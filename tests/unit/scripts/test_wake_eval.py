@@ -727,10 +727,8 @@ def test_the_harness_segments_through_ingress_s_tracker(
     closed = [step.closed for step in steps if step.closed is not None]
     assert heard.segments == tuple(closed) and len(closed) == 1
     (onset,) = (step.started[0] for step in steps if step.started is not None)
-    fed = [pos for feed in heard.feeds for pos in (*feed.warm, *feed.push)]
-    assert fed == list(range(len(fed)))
-    pushed = [pos for feed in heard.feeds for pos in feed.push]
-    assert pushed[0] == max(onset - onset_lead_frames(cfg), 0)
+    assert heard.segments[0][0] == onset
+    assert len(heard.frames) == 1280 // FRAME_MS
 
 
 class ImmediateLane:
@@ -803,12 +801,57 @@ async def test_the_harness_feeds_the_spotter_what_ingress_feeds_it(tmp_path: Pat
 
     (heard,) = live.streams
     (scored,) = offline.streams
-    assert heard.pushed and heard.warmed
-    assert (scored.resets, scored.warmed, scored.pushed) == (
-        heard.resets,
-        heard.warmed,
-        heard.pushed,
+    assert heard.pushed == list(range(len(pcm) // frame_bytes))
+    assert (scored.resets, scored.pushed) == (heard.resets, heard.pushed)
+
+
+def test_the_harness_reports_a_hit_in_silence_and_spans_it(tmp_path: Path) -> None:
+    # Silence (frames 0 to 31), tone (32 to 63), then 2400 ms of silence (64 to 183).
+    samples = tone_and_silence([(False, 640), (True, 640), (False, 2400)])
+    recording = tmp_path / "recordings" / "p" / "a.wav"
+    recording.parent.mkdir(parents=True)
+    with wave.open(str(recording), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(samples.tobytes())
+    duration_ms = len(samples) * 1000 // RATE
+    path = write_manifest(tmp_path, [entry("p/a.wav", duration_ms=duration_ms)])
+    (item,) = wake_manifest.load_manifest(path).entries
+    settings = load_voice_settings({})
+    # Frame 150 is in silence more than 1000 ms after the segment's last speech.
+    engines = rig([NameHit(end_pos=150, keyword="mist", score=0.9)], [ADDRESSED])
+    driver = eval_wake._Driver(
+        eval_wake.Engines(
+            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
+        ),
+        settings,
+        [0.5],
+        engines.clock,
     )
+
+    outcome = driver.run(item, 0)[0.5]
+
+    assert [found.position for found in outcome.hits] == [150]
+    assert outcome.accepted
+    window = 1280 // FRAME_MS
+    tail = settings.wake.gate_tail_ms // FRAME_MS
+    # The window and the pre-roll before the hit, and nothing of the unchained segment.
+    assert driver._span(outcome.heard, 150) == (150 - window - 15, 150 + tail)
+    (decode,) = engines.transcriber.streams
+    assert decode.pushed == [(window + 15 + tail + 1) * RATE * FRAME_MS // 1000]
+    # Every hit's span starts where ingress's would: the shared chain start, bounded.
+    for position in (40, 70, 100, 150, len(outcome.heard.frames) - 1):
+        start = eval_wake.name_chain_start(
+            outcome.heard.segments,
+            position,
+            join_gap_ms=settings.wake.join_gap_ms,
+            pre_roll_frames=onset_lead_frames(settings.endpointing),
+            window_frames=window,
+        )
+        bounded = max(start, position - settings.wake.lookback_ms // FRAME_MS, 0)
+        end = min(position + tail, len(outcome.heard.frames) - 1)
+        assert driver._span(outcome.heard, position) == (bounded, end)
 
 
 # -- The harness: refusals --------------------------------------------------------------------
@@ -1210,7 +1253,7 @@ def write_ambient(path: Path) -> None:
 
 
 # Every ambient file's stream reports a hit at frame 50, in its speech, and one at frame 90, in
-# silence after the segment has closed, which is warmed and never reported.
+# silence after the segment has closed, which is reported and gated too. Their spans differ.
 AMBIENT_HITS = (
     NameHit(end_pos=50, keyword="mist", score=0.6),
     NameHit(end_pos=90, keyword="mist", score=0.7),
@@ -1223,7 +1266,9 @@ def test_the_ambient_gate_hears_each_file_once_and_decodes_each_span_once(
     first, second = tmp_path / "ambient" / "a.wav", tmp_path / "ambient" / "b.wav"
     write_ambient(first)
     write_ambient(second)
-    engines = rig(AMBIENT_HITS, [ADDRESSED, UNADDRESSED])
+    # The first file's speech hit decodes unaddressed and its silence hit addressed; the second
+    # file's decodes are past the script, so empty.
+    engines = rig(AMBIENT_HITS, [UNADDRESSED, ADDRESSED])
     gate = eval_wake.AmbientGate(
         eval_wake.Engines(
             spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
@@ -1233,19 +1278,18 @@ def test_the_ambient_gate_hears_each_file_once_and_decodes_each_span_once(
     )
 
     assert gate.accepted_hits(first, 0.5) == 1
-    assert gate.accepted_hits(first, 0.65) == 0
+    assert gate.accepted_hits(first, 0.65) == 1
     assert gate.accepted_hits(first, 0.3) == 1
-    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (1, 1, 1)
+    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (1, 2, 2)
 
     assert gate.accepted_hits(second, 0.5) == 0
-    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (2, 2, 2)
+    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (2, 4, 4)
     assert gate.decode_errors == 0
 
     assert [stream.threshold for stream in engines.spotter.streams] == [0.5, 0.65, 0.3, 0.5]
     for stream in engines.spotter.streams:
-        fed = sorted([*stream.warmed, *stream.pushed])
-        assert fed == list(range(len(fed)))
-        assert 50 in stream.pushed and 90 in stream.warmed
+        assert stream.pushed == list(range(len(stream.pushed)))
+        assert {50, 90} <= set(stream.pushed)
 
 
 def test_a_failed_ambient_decode_is_rejected_counted_and_logged_by_number(
@@ -1270,7 +1314,8 @@ def test_a_failed_ambient_decode_is_rejected_counted_and_logged_by_number(
     assert gate.accepted_hits(path, 0.5) == 0
     assert gate.accepted_hits(path, 0.3) == 0
 
-    assert (gate.decodes, gate.decode_errors, len(transcriber.streams)) == (1, 1, 1)
+    # Both hits' spans fail once each, and neither is decoded again at the second threshold.
+    assert (gate.decodes, gate.decode_errors, len(transcriber.streams)) == (2, 2, 2)
     assert "ambient file 1" in caplog.text
     assert "meeting-secret" not in caplog.text
     assert str(tmp_path) not in caplog.text

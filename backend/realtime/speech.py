@@ -273,14 +273,6 @@ class NameSpotterStream(Protocol):
         """
         ...
 
-    def warm(self, pcm: bytes, pos: int) -> None:
-        """Score audio as `push` does and report nothing.
-
-        A hit found here starts the cooldown as a pushed one does, so a stream's hits do not
-        depend on which of its frames were warmed and which pushed.
-        """
-        ...
-
     def reset(self, *, warm_up: bool = True) -> None:
         """Forget the context, so the next frame starts a new one.
 
