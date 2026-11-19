@@ -207,6 +207,59 @@ void alarm_scenarios() {
   rules.on_stop(g_now);
 }
 
+// A local ring snoozed offline, then a reboot before the link returns: the outcome kept in the
+// device's memory is reported on the first connection after it.
+void reboot_scenario() {
+  scenario("local_ring_across_a_reboot");
+  static mist_core::AlarmMemory memory;
+  PrintingAlarmSink sink;
+  const int64_t fire_at = kT + 4 * 3600 * kSecond;
+  {
+    mist_core::AlarmRules before(sink);
+    before.on_alarm_state(schedule("occ-reboot-1", fire_at));
+    g_now = fire_at + 30 * kSecond;
+    before.tick(g_now);
+    g_now += 3 * kSecond;
+    before.on_snooze(g_now);
+    before.save(&memory);
+  }
+  mist_core::AlarmRules after(sink);
+  if (!after.restore(memory)) {
+    ++g_failures;
+    return;
+  }
+  g_now += 5 * 60 * kSecond;
+  after.on_connected(g_now);
+}
+
+// No SNTP: the device's clock runs from `alarm_state.at`, which reached it `kLatencyMs` after the
+// owner wrote it, on a crystal `kFastPpm` fast. Each report is printed at the owner's own time,
+// which `test_core.py` validates it against.
+void owner_clock_scenario() {
+  scenario("owner_clock");
+  constexpr int64_t kLatencyMs = 250;
+  constexpr int64_t kFastPpm = 100;
+  const int64_t at = kT + 6 * 3600 * kSecond;
+  const int64_t boot_mono = 10 * kSecond;
+  // The device's monotonic time when the owner's clock reads `owner_ms`.
+  auto mono_at = [&](int64_t owner_ms) {
+    const int64_t elapsed = owner_ms - (at + kLatencyMs);
+    return boot_mono + elapsed + elapsed * kFastPpm / 1000000;
+  };
+
+  mist_core::AlarmClock clock;
+  clock.on_owner_time(at, boot_mono);
+  PrintingAlarmSink sink;
+  mist_core::AlarmRules rules(sink);
+  rules.on_alarm_state(schedule("occ-clock-1", at + 60 * kSecond));
+  rules.on_disconnected(clock.now(0, mono_at(at + 2 * kSecond)));
+
+  for (g_now = at + 2 * kSecond; g_now <= at + 20 * 60 * kSecond; g_now += kSecond) {
+    rules.tick(clock.now(0, mono_at(g_now)));
+  }
+  rules.on_connected(clock.now(0, mono_at(g_now)));
+}
+
 void stats_scenario() {
   scenario("device_stats");
   mist_core::DeviceStats stats{};
@@ -232,6 +285,8 @@ int main() {
   player_scenario();
   button_scenario();
   alarm_scenarios();
+  reboot_scenario();
+  owner_clock_scenario();
   stats_scenario();
   return g_failures == 0 ? 0 : 1;
 }

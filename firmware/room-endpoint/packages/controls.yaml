@@ -4,10 +4,12 @@
 # Controls and lights (plan Design item 7), the one place the room build's inputs are wired:
 #
 # - a detection by the stop model goes to the uplink (`barge_in` while she speaks) and to the
-#   player (a ring); `packages/device.yaml`'s own handler still hands every detection to the
-#   pre-wake uplink, which opens only for the name model;
+#   player, whose answer during a ring (`StopRing`) goes to the alarm component, which stops it
+#   everywhere; `packages/device.yaml`'s own handler still hands every detection to the pre-wake
+#   uplink, which opens only for the name model;
 # - the center button's single, double and long presses go to the player, which sends `interrupt`
-#   while she speaks; no press reaches the uplink, so there is no push-to-talk;
+#   while she speaks; during a ring its answer (`StopRing` for a single press, `SnoozeRing` for a
+#   double) goes to the alarm component; no press reaches the uplink, so there is no push-to-talk;
 # - each dial detent moves the volume by one step;
 # - the LED ring, whose effects the player picks from MIST's state.
 #
@@ -25,7 +27,7 @@ micro_wake_word:
         then:
           - lambda: |-
               id(mist_prewake_uplink).on_stop_detected();
-              id(mist_reply_player).on_stop_detected();
+              id(mist_alarms).on_ring_action(id(mist_reply_player).on_stop_detected());
 
 binary_sensor:
   - platform: gpio
@@ -39,18 +41,18 @@ binary_sensor:
           - ON for at most 1s
           - OFF for at least 0.25s
         then:
-          - lambda: id(mist_reply_player).on_button(mist_core::ButtonEvent::SinglePress);
+          - lambda: id(mist_alarms).on_ring_action(id(mist_reply_player).on_button(mist_core::ButtonEvent::SinglePress));
       - timing:
           - ON for at most 1s
           - OFF for at most 0.25s
           - ON for at most 1s
           - OFF for at least 0.25s
         then:
-          - lambda: id(mist_reply_player).on_button(mist_core::ButtonEvent::DoublePress);
+          - lambda: id(mist_alarms).on_ring_action(id(mist_reply_player).on_button(mist_core::ButtonEvent::DoublePress));
       - timing:
           - ON for at least 1s
         then:
-          - lambda: id(mist_reply_player).on_button(mist_core::ButtonEvent::LongPress);
+          - lambda: id(mist_alarms).on_ring_action(id(mist_reply_player).on_button(mist_core::ButtonEvent::LongPress));
 
 sensor:
   - platform: rotary_encoder

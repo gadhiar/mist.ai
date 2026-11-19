@@ -78,9 +78,20 @@ PLAYER_FILES = (
 )
 PREWAKE_DIR = ENDPOINT / "components" / "mist_prewake"
 
+# Alarms on the device (plan T7); each carries the MIT header too.
+ALARM_DIR = ENDPOINT / "components" / "mist_alarm"
+ALARM_FILES = (
+    ALARM_DIR / "__init__.py",
+    ALARM_DIR / "mist_alarm.h",
+    ALARM_DIR / "mist_alarm.cpp",
+    PACKAGES / "alarm.yaml",
+)
+
 # The ids the room build's packages share.
 PLAYER_ID = "mist_reply_player"
 PREWAKE_ID = "mist_prewake_uplink"
+# Not `alarm`: that would shadow POSIX `alarm()` in the generated C++.
+ALARM_ID = "mist_alarms"
 
 # Interfaces: the substitutions `room.yaml` carries, with the defaults the plan fixes.
 ROOM_SUBSTITUTIONS = (
@@ -290,7 +301,7 @@ def test_spike_player_feeds_the_reply_resampler_of_the_speaker_chain() -> None:
 def test_room_build_carries_no_spike_player() -> None:
     for path in (ENDPOINT / "room.yaml", PACKAGES / "device.yaml", PACKAGES / "link.yaml"):
         assert "spike_speaker" not in path.read_text(encoding="utf-8"), path
-    for path in PLAYER_FILES:
+    for path in (*PLAYER_FILES, *ALARM_FILES):
         assert "spike_speaker" not in path.read_text(encoding="utf-8"), path
 
 
@@ -325,6 +336,7 @@ def test_room_config_does_not_include_the_spike_package() -> None:
         "link": include("packages/link.yaml"),
         "player": include("packages/player.yaml"),
         "controls": include("packages/controls.yaml"),
+        "alarm": include("packages/alarm.yaml"),
     }
     assert "packages/spike.yaml" not in (ENDPOINT / "room.yaml").read_text(encoding="utf-8")
 
@@ -365,14 +377,14 @@ def test_personal_example_includes_the_room_config_with_placeholders() -> None:
 
 
 def test_owned_files_carry_the_mit_header() -> None:
-    for path in (*OWNED_FILES, *PLAYER_FILES):
+    for path in (*OWNED_FILES, *PLAYER_FILES, *ALARM_FILES):
         head = path.read_text(encoding="utf-8")[:600]
         assert "SPDX-License-Identifier: MIT" in head, path
         assert "LICENSE" in head, path
 
 
 def test_owned_files_name_no_address_but_loopback() -> None:
-    for path in (*OWNED_FILES, *PLAYER_FILES):
+    for path in (*OWNED_FILES, *PLAYER_FILES, *ALARM_FILES):
         addresses = set(re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", path.read_text("utf-8")))
         assert addresses <= {"127.0.0.1", "0.0.0.0"}, path  # nosec B104
 
@@ -419,8 +431,10 @@ def test_controls_route_a_stop_detection_to_the_uplink_and_the_player() -> None:
     (handler,) = mww["on_wake_word_detected"]
     condition = handler["if"]["condition"]["lambda"].strip()
     assert condition == "return wake_word == id(stop).get_wake_word();"
+    # The player answers `StopRing` while a ring plays, and the alarm component acts on it.
     assert _strings(handler["if"]["then"]) == [
-        f"id({PREWAKE_ID}).on_stop_detected();\nid({PLAYER_ID}).on_stop_detected();"
+        f"id({PREWAKE_ID}).on_stop_detected();\n"
+        f"id({ALARM_ID}).on_ring_action(id({PLAYER_ID}).on_stop_detected());"
     ]
 
 
@@ -440,8 +454,11 @@ def test_controls_hand_each_button_press_to_the_player_only() -> None:
     assert button["id"] == "center_button"
     assert button["pin"] == {"number": "GPIO0", "inverted": True}
     calls = [_strings(click["then"]) for click in button["on_multi_click"]]
+    # The player sends `interrupt` itself and answers `StopRing` or `SnoozeRing` while a ring
+    # plays; the alarm component acts on those and on nothing else.
+    press = f"id({PLAYER_ID}).on_button(mist_core::ButtonEvent::{{}})"
     assert calls == [
-        [f"id({PLAYER_ID}).on_button(mist_core::ButtonEvent::{event});"]
+        [f"id({ALARM_ID}).on_ring_action({press.format(event)});"]
         for event in ("SinglePress", "DoublePress", "LongPress")
     ]
     # No push-to-talk: nothing the button does reaches the uplink or the wake models.
@@ -517,6 +534,124 @@ def test_the_player_sets_the_level_only_through_the_speakers_set_volume() -> Non
     cpp = (PLAYER_DIR / "mist_player.cpp").read_text(encoding="utf-8")
     assert re.findall(r"set_volume\(", cpp) == ["set_volume("]
     assert "this->volume_speaker_->set_volume(this->ui_.speaker_level());" in cpp
+
+
+# -- Alarms on the device (plan T7) -----------------------------------------------------------
+
+
+def _alarm_source() -> str:
+    names = ("mist_alarm.h", "mist_alarm.cpp")
+    return "".join((ALARM_DIR / name).read_text(encoding="utf-8") for name in names)
+
+
+def _function_body(source: str, signature: str) -> str:
+    """The body of the C++ function whose definition starts with `signature`, by brace count."""
+    opening = source.index("{", source.index(signature))
+    depth = 0
+    for end in range(opening, len(source)):
+        depth += {"{": 1, "}": -1}.get(source[end], 0)
+        if depth == 0:
+            return source[opening : end + 1]
+    raise AssertionError(f"unbalanced body after {signature}")
+
+
+def test_alarm_package_rings_through_the_alarm_resampler_with_the_players_level() -> None:
+    alarm = load(PACKAGES / "alarm.yaml")
+    assert alarm["external_components"] == [
+        {
+            "source": {"type": "local", "path": "${mist_components_path}"},
+            "components": ["mist_alarm"],
+        }
+    ]
+    config = alarm["mist_alarm"]
+    assert config == {
+        "id": ALARM_ID,
+        "link_id": "mist_connection",
+        "player_id": PLAYER_ID,
+        "speaker": "alarm_resampling_speaker",
+        "time_id": "sntp_time",
+        "endpoint_name": secret("mist_device_id"),
+        "ring_volume_floor": "${ring_volume_floor}",
+    }
+    speakers = {spk["id"]: spk for spk in load(PACKAGES / "device.yaml")["speaker"]}
+    assert speakers["alarm_resampling_speaker"]["platform"] == "resampler"
+    assert speakers["alarm_resampling_speaker"]["output_speaker"] == "alarm_mixing_input"
+    mixer_inputs = [source["id"] for source in speakers["mixing_speaker"]["source_speakers"]]
+    assert "alarm_mixing_input" in mixer_inputs
+    clocks = [clock["id"] for clock in load(PACKAGES / "device.yaml")["time"]]
+    assert clocks == ["sntp_time"]
+
+
+def test_alarm_package_names_this_device_as_the_registry_does() -> None:
+    from scripts.daily import devices
+
+    # `ring_on` lists endpoint names, and a device's is its registry name, the token's prefix.
+    text = (PACKAGES / "alarm.yaml").read_text(encoding="utf-8")
+    assert set(re.findall(r"!secret\s+([a-z_]+)", text)) == {"mist_device_id"}
+    assert "mist_device_id" in devices.SECRET_KEYS
+    assert "mist_device_id" in (REPO_ROOT / "scripts" / "room_endpoint" / "build.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_alarm_component_sets_the_ring_floor_and_ringing_but_never_a_volume() -> None:
+    source = _alarm_source()
+    assert "set_volume" not in source
+    assert "set_mute" not in source
+    start = _function_body(source, "void MistAlarm::start_ring(")
+    assert start.index("this->player_->set_ring_floor(this->ring_floor_);") < start.index(
+        "this->player_->set_ringing(true);"
+    )
+    stop = _function_body(source, "void MistAlarm::stop_ring(")
+    assert "this->player_->set_ringing(false);" in stop
+    codegen = (ALARM_DIR / "__init__.py").read_text(encoding="utf-8")
+    assert "cg.add(var.set_ring_floor(config[CONF_RING_VOLUME_FLOOR]))" in codegen
+
+
+def test_alarm_component_hands_only_stop_and_snooze_to_the_rules() -> None:
+    body = _function_body(_alarm_source(), "bool MistAlarm::on_ring_action(")
+    assert "mist_core::ButtonAction::StopRing" in body
+    assert "mist_core::ButtonAction::SnoozeRing" in body
+    assert "this->rules_.on_stop(" in body
+    assert "this->rules_.on_snooze(" in body
+    assert "Interrupt" not in body
+
+
+def test_alarm_component_listens_on_the_link_and_decodes_no_new_type() -> None:
+    source = _alarm_source()
+    assert "public mist_link::LinkListener" in source
+    assert "this->link_->add_listener(this);" in source
+    assert "read_inbound" not in source
+    handled = set(re.findall(r"mist_core::InboundType::(\w+)", source))
+    assert handled == {"AlarmState", "AlarmFired", "AlarmActionResult"}
+    assert "mist_core::parse_alarm_state(" in source
+    assert "mist_core::parse_alarm_fired(" in source
+
+
+def test_alarm_component_keeps_its_memory_in_preferences_and_syncs_it() -> None:
+    source = _alarm_source()
+    assert re.search(r'kMemoryKey\s*=\s*"mist_alarm_schedule"', source)
+    assert "global_preferences->make_preference(sizeof(mist_core::AlarmMemory)" in source
+    assert "fnv1_hash(kMemoryKey)" in source
+    assert "this->rules_.restore(" in source
+    save = _function_body(source, "void MistAlarm::persist_(")
+    assert save.index("this->rules_.save(") < save.index("this->memory_pref_.save(")
+    assert "global_preferences->sync()" in save
+
+
+def test_alarm_component_takes_its_time_from_sntp_else_the_owner() -> None:
+    source = _alarm_source()
+    assert "add_on_time_sync_callback" in source
+    assert "this->clock_.on_sntp_synced();" in source
+    assert "this->clock_.on_owner_time(" in source
+
+
+def test_alarm_tone_is_synthesised_and_no_audio_file_ships() -> None:
+    source = _alarm_source()
+    assert "mist_core::AlarmTone" in source
+    audio = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".pcm", ".raw"}
+    assert not [path for path in ENDPOINT.rglob("*") if path.suffix.lower() in audio]
+    assert "file" not in load(PACKAGES / "alarm.yaml")["mist_alarm"]
 
 
 # -- The link component ------------------------------------------------------------------------
