@@ -32,3 +32,6 @@ packages:
   # stop word and ring hardware (packages/controls.yaml).
   player: !include packages/player.yaml
   controls: !include packages/controls.yaml
+  # MIST's alarms: the synthesised ring, the schedule copy kept in preferences, and the local
+  # ring while the link is down (packages/alarm.yaml).
+  alarm: !include packages/alarm.yaml

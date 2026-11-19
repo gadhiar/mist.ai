@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# MIST's alarms on the room device (plan Design item 6). `alarm_fired` rings at once; with the
+# link down, the schedule copy from the last `alarm_state`, kept in preferences, rings an
+# occurrence by A14's rules and reports its outcome on the next connection. The tone is
+# synthesised on the device and plays through the alarm resampler and its own mixer input
+# (`packages/device.yaml`); the player owns the level, and a ring plays at no less than
+# `${ring_volume_floor}` of it. Stop and snooze come from the button and the stop word, wired in
+# `packages/controls.yaml`.
+#
+# `endpoint_name` is the device's registry name, the name `ring_on` lists, from the
+# `secrets.yaml` that `scripts/daily/devices.py add` writes.
+
+external_components:
+  - source:
+      type: local
+      path: ${mist_components_path}
+    components: [mist_alarm]
+
+mist_alarm:
+  # Not `alarm`: that would shadow POSIX `alarm()` in the generated C++.
+  id: mist_alarms
+  link_id: mist_connection
+  player_id: mist_reply_player
+  speaker: alarm_resampling_speaker
+  time_id: sntp_time
+  endpoint_name: !secret mist_device_id
+  ring_volume_floor: ${ring_volume_floor}

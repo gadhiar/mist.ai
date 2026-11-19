@@ -12,8 +12,21 @@
 // ring's outcome (`rang`, `stopped`, or `snoozed` with `snoozed_until`) is reported on
 // reconnection, sent again on each later connection until `alarm_action_result` answers it.
 //
+// What must outlive a reboot (the schedule copy, the occurrences rung, the outcomes not yet
+// answered, a local ring cut short, and the request counter) goes into an `AlarmMemory`, which the
+// device keeps in preferences (NVS) and restores at boot. A local ring cut short by a reboot is
+// not rung again; it is reported `rang` from the time it started.
+//
 // Times are milliseconds since the epoch; 0 or less means the clock is not set yet, and nothing
-// rings locally until it is. Threading: one task calls every method.
+// rings locally until it is. `AlarmClock` gives that time: SNTP's once it has synced, else the
+// owner's own from the last `alarm_state.at` or `alarm_fired.fired_at`, run on from the device's
+// monotonic clock. A message reaches the device after it was written, so a clock set from it
+// runs behind the owner's, inside the 60 s ahead the owner allows a report
+// (`REPORT_MAX_AHEAD`, `backend/capabilities/events.py`).
+//
+// `AlarmTone` is the ring's sound, synthesised, since the guards forbid audio files.
+//
+// Threading: one task calls every method.
 
 #pragma once
 
@@ -58,6 +71,7 @@ bool parse_alarm_state(json::Value root, const char* device_name, ScheduleCopy* 
 struct FiredAlarm {
   char alarm_id[kIdCap];
   int64_t scheduled_for_ms;
+  int64_t fired_at_ms;  // the owner's clock as it fired
   int64_t ring_timeout_ms;
 };
 
@@ -75,6 +89,8 @@ class AlarmSink {
 };
 
 enum class RingSource : uint8_t { None, Server, Local };
+
+struct AlarmMemory;
 
 class AlarmRules {
  public:
@@ -107,6 +123,15 @@ class AlarmRules {
   const char* ringing_id() const { return ring_id_; }
   size_t pending_reports() const { return pending_count_; }
   const ScheduleCopy& schedule() const { return schedule_; }
+
+  // What survives a reboot. `save` writes every byte of `out`, padding included, so the same
+  // state always gives the same bytes and preferences write only a changed memory.
+  void save(AlarmMemory* out) const;
+  // Takes a memory saved by `save`, at boot, before anything else; false, with nothing changed,
+  // for a memory of another layout or one whose counts are out of range.
+  bool restore(const AlarmMemory& memory);
+  // Advances on every change `save` would write; the device saves when it moves.
+  uint32_t revision() const { return revision_; }
 
  private:
   struct Pending {
@@ -148,6 +173,74 @@ class AlarmRules {
   Pending pending_[kMaxPending] = {};
   size_t pending_count_ = 0;
   uint32_t request_counter_ = 0;
+  uint32_t revision_ = 0;
+};
+
+// The rules' state across a reboot: plain data, written whole to preferences.
+struct AlarmMemory {
+  // Raised whenever the layout changes, so an older memory is refused rather than misread.
+  static constexpr uint32_t kVersion = 1;
+
+  uint32_t version;
+  uint32_t request_counter;
+  ScheduleCopy schedule;
+  uint32_t ledger_count;
+  uint32_t ledger_next;
+  char ledger[AlarmRules::kLedgerSize][kIdCap];
+  uint32_t pending_count;
+  AlarmReport pending[AlarmRules::kMaxPending];
+  // A local ring still playing, not yet reported: empty when none.
+  char local_ring_id[kIdCap];
+  int64_t local_ring_started_ms;
+};
+
+// The time the rules run by, in milliseconds since the epoch.
+class AlarmClock {
+ public:
+  // 2024-01-01T00:00:00Z: an earlier time is a clock that was never set.
+  static constexpr int64_t kEarliestMs = 1704067200000LL;
+
+  // SNTP has set the system clock; from now on it is the time.
+  void on_sntp_synced() { sntp_synced_ = true; }
+  // The owner's clock read `owner_ms` (an `alarm_state.at` or `alarm_fired.fired_at`) when the
+  // device's monotonic clock read `mono_ms`. Each later one sets the clock again.
+  void on_owner_time(int64_t owner_ms, int64_t mono_ms);
+  // The time: the system clock once SNTP has synced, else the owner's run on from `mono_ms`,
+  // else 0 (not set).
+  int64_t now(int64_t system_ms, int64_t mono_ms) const;
+  bool from_sntp() const { return sntp_synced_; }
+
+ private:
+  bool sntp_synced_ = false;
+  bool owner_set_ = false;
+  int64_t owner_offset_ms_ = 0;  // owner time minus monotonic time
+};
+
+// The ring's sound: four 100 ms beeps of a 880 Hz sine, 100 ms apart, every 1.4 s, as 16 kHz
+// PCM16 mono. Its peak is -1 dBFS (29204), so the player's level, the ring floor and its 0 dB cap
+// set how loud it plays, not the tone. Each beep starts at phase 0 and ramps in and out over
+// 5 ms (a raised cosine), so its edges do not click.
+class AlarmTone {
+ public:
+  static constexpr uint32_t kSampleRate = 16000;
+  static constexpr uint32_t kFrequencyHz = 880;
+  static constexpr int16_t kPeak = 29204;  // 32767 * 10^(-1/20)
+  static constexpr uint32_t kBeeps = 4;
+  static constexpr uint32_t kBeepMs = 100;
+  static constexpr uint32_t kGapMs = 100;
+  static constexpr uint32_t kCycleMs = 1400;
+  static constexpr uint32_t kRampMs = 5;
+  static constexpr size_t kCycleSamples = kSampleRate * kCycleMs / 1000;
+
+  // The next `count` samples of the endless pattern.
+  void fill(int16_t* out, size_t count);
+  // Back to the start of the first beep, for the next ring.
+  void reset() { position_ = 0; }
+
+ private:
+  int16_t sample_at(uint32_t position) const;
+
+  uint32_t position_ = 0;  // within the cycle
 };
 
 }  // namespace mist_core
