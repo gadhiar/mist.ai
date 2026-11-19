@@ -15,7 +15,7 @@
 
 substitutions:
   device_name: <device>
-  # The name model, from the models directory mounted at /models.
+  # The name model's manifest, from `<models dir>` mounted at /models, its `.tflite` beside it.
   wake_model: /models/<model id>/device/<model file>.json
 
 packages:
