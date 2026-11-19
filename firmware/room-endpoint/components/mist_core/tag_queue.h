@@ -11,15 +11,23 @@
 // and flushes it, reports the position reached, and never reports it done. `playback_duck` lowers
 // the current turn by its `db`, and a new turn restores the level.
 //
-// The queue counts samples; the player holds the PCM. Threading: one task calls every method.
+// The queue counts samples; the player holds the PCM, renders the fade with `apply_fade_out`, and
+// hands the duck to the mixer as `duck_reduction_db`. Threading: one task calls every method.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "codec.h"
 
 namespace mist_core {
+
+// Scales `count` samples in place by a linear fade to silence: the samples sit at `offset` within
+// a fade of `total` samples, and a sample at position `p` keeps `(total - p) / total` of its
+// level, so the fade starts at full level and its last sample is the quietest step above
+// silence. Samples at or past `total` become silence. A fade may be applied in pieces.
+void apply_fade_out(int16_t* pcm, size_t count, size_t offset, size_t total);
 
 enum class TagVerdict : uint8_t { Play, Drop };
 
@@ -43,6 +51,10 @@ class TagQueue {
 
   // The session's `voice_state.playback`; applies from the next decision on.
   void set_params(const PlaybackParams& params) { params_ = params; }
+  const PlaybackParams& params() const { return params_; }
+
+  // Forgets the current turn without any report: the connection that carried it is gone.
+  void reset();
 
   // A new turn. Returns true when an earlier turn had audio not yet played out, which the player
   // flushes: the new turn takes over.
@@ -50,6 +62,9 @@ class TagQueue {
 
   // A `0x01` frame of `samples` samples.
   TagVerdict on_audio_chunk(uint16_t tag, uint32_t samples);
+  // The player had no room for the last `samples` samples of a chunk it was told to play; they
+  // are not queued, so the turn can still play out. Never unqueues what was already played.
+  void on_overflow(uint32_t samples);
   // A `0x02`: the turn's last frame is queued. Returns whether it named the current turn.
   bool on_audio_complete(uint16_t tag);
   // A `0x03`, which fades by the session's `fade_ms`.
@@ -66,11 +81,17 @@ class TagQueue {
   // The player rendered `samples` more samples of the current turn at `now_ms`, a free-running
   // millisecond clock that may wrap.
   void on_played(uint32_t samples, uint32_t now_ms);
+  // The output has played everything it was given after the `0x02`: every queued sample of the
+  // completed turn counts as played, even where the output's own count fell short (a resampler
+  // may round frames away). Does nothing before the `0x02`.
+  void on_output_drained(uint32_t now_ms);
 
   // The report due at `now_ms`, if any.
   PlaybackReport poll(uint32_t now_ms);
 
   float duck_db() const { return duck_db_; }
+  // The duck as the mixer's `apply_ducking` takes it: whole decibels of reduction, 0 to 255.
+  uint8_t duck_reduction_db() const;
   uint64_t queued_samples() const { return queued_; }
   uint64_t played_samples() const { return played_; }
 

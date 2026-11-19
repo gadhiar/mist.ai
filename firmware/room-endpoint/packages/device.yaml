@@ -198,8 +198,10 @@ micro_wake_word:
   models:
     - model: ${wake_model}
       id: mist_wake
+      internal: true
     - model: ${stop_model}
       id: stop
+      internal: true
   vad:
     model: ${vad_model}
   # A detection passes only its model's word; `mist_prewake` opens the uplink only for the name

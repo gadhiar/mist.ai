@@ -67,6 +67,21 @@ OWNED_FILES = (
     REPO_ROOT / "scripts" / "room_endpoint" / "build.py",
 )
 
+# The player, controls and lights (plan T6); each carries the MIT header too.
+PLAYER_DIR = ENDPOINT / "components" / "mist_player"
+PLAYER_FILES = (
+    PLAYER_DIR / "__init__.py",
+    PLAYER_DIR / "mist_player.h",
+    PLAYER_DIR / "mist_player.cpp",
+    PACKAGES / "player.yaml",
+    PACKAGES / "controls.yaml",
+)
+PREWAKE_DIR = ENDPOINT / "components" / "mist_prewake"
+
+# The ids the room build's packages share.
+PLAYER_ID = "mist_reply_player"
+PREWAKE_ID = "mist_prewake_uplink"
+
 # Interfaces: the substitutions `room.yaml` carries, with the defaults the plan fixes.
 ROOM_SUBSTITUTIONS = (
     "device_name",
@@ -275,6 +290,8 @@ def test_spike_player_feeds_the_reply_resampler_of_the_speaker_chain() -> None:
 def test_room_build_carries_no_spike_player() -> None:
     for path in (ENDPOINT / "room.yaml", PACKAGES / "device.yaml", PACKAGES / "link.yaml"):
         assert "spike_speaker" not in path.read_text(encoding="utf-8"), path
+    for path in PLAYER_FILES:
+        assert "spike_speaker" not in path.read_text(encoding="utf-8"), path
 
 
 def test_spike_player_code_is_compiled_only_into_the_spike_build() -> None:
@@ -306,6 +323,8 @@ def test_room_config_does_not_include_the_spike_package() -> None:
     assert room["packages"] == {
         "device": include("packages/device.yaml"),
         "link": include("packages/link.yaml"),
+        "player": include("packages/player.yaml"),
+        "controls": include("packages/controls.yaml"),
     }
     assert "packages/spike.yaml" not in (ENDPOINT / "room.yaml").read_text(encoding="utf-8")
 
@@ -346,16 +365,158 @@ def test_personal_example_includes_the_room_config_with_placeholders() -> None:
 
 
 def test_owned_files_carry_the_mit_header() -> None:
-    for path in OWNED_FILES:
+    for path in (*OWNED_FILES, *PLAYER_FILES):
         head = path.read_text(encoding="utf-8")[:600]
         assert "SPDX-License-Identifier: MIT" in head, path
         assert "LICENSE" in head, path
 
 
 def test_owned_files_name_no_address_but_loopback() -> None:
-    for path in OWNED_FILES:
+    for path in (*OWNED_FILES, *PLAYER_FILES):
         addresses = set(re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", path.read_text("utf-8")))
         assert addresses <= {"127.0.0.1", "0.0.0.0"}, path  # nosec B104
+
+
+# -- The player, controls and lights (plan T6) ------------------------------------------------
+
+
+def _strings(node: object) -> list[str]:
+    """Every string value under `node`, in document order: the lambdas of an action list."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, Tagged):
+        return _strings(node.value)
+    if isinstance(node, dict):
+        return [text for value in node.values() for text in _strings(value)]
+    if isinstance(node, list):
+        return [text for value in node for text in _strings(value)]
+    return []
+
+
+def _boot_entries(path: Path) -> list[dict]:
+    return load(path)["esphome"]["on_boot"]
+
+
+def test_both_wake_models_are_internal_so_toggles_never_write_flash() -> None:
+    models = load(PACKAGES / "device.yaml")["micro_wake_word"]["models"]
+    assert [(model["id"], model.get("internal")) for model in models] == [
+        ("mist_wake", True),
+        ("stop", True),
+    ]
+
+
+def test_device_keeps_its_one_detection_handler_for_the_name_model() -> None:
+    mww = load(PACKAGES / "device.yaml")["micro_wake_word"]
+    assert mww["on_wake_word_detected"] == [
+        {"lambda": f"id({PREWAKE_ID}).on_wake_word_detected(wake_word);"}
+    ]
+
+
+def test_controls_route_a_stop_detection_to_the_uplink_and_the_player() -> None:
+    mww = load(PACKAGES / "controls.yaml")["micro_wake_word"]
+    # The models stay in `device.yaml`; this package adds a handler only.
+    assert set(mww) == {"on_wake_word_detected"}
+    (handler,) = mww["on_wake_word_detected"]
+    condition = handler["if"]["condition"]["lambda"].strip()
+    assert condition == "return wake_word == id(stop).get_wake_word();"
+    assert _strings(handler["if"]["then"]) == [
+        f"id({PREWAKE_ID}).on_stop_detected();\nid({PLAYER_ID}).on_stop_detected();"
+    ]
+
+
+def test_prewake_hands_a_stop_detection_to_the_uplink() -> None:
+    header = (PREWAKE_DIR / "mist_prewake.h").read_text(encoding="utf-8")
+    assert "void on_stop_detected();" in header
+    cpp = (PREWAKE_DIR / "mist_prewake.cpp").read_text(encoding="utf-8")
+    body = re.search(r"void MistPrewake::on_stop_detected\(\) \{\n(.*?)\n\}", cpp, re.S)
+    assert body is not None
+    assert "this->uplink_->on_stop_keyword()" in body.group(1)
+
+
+def test_controls_hand_each_button_press_to_the_player_only() -> None:
+    sensors = load(PACKAGES / "controls.yaml")["binary_sensor"]
+    (button,) = sensors
+    assert button["platform"] == "gpio"
+    assert button["id"] == "center_button"
+    assert button["pin"] == {"number": "GPIO0", "inverted": True}
+    calls = [_strings(click["then"]) for click in button["on_multi_click"]]
+    assert calls == [
+        [f"id({PLAYER_ID}).on_button(mist_core::ButtonEvent::{event});"]
+        for event in ("SinglePress", "DoublePress", "LongPress")
+    ]
+    # No push-to-talk: nothing the button does reaches the uplink or the wake models.
+    for text in _strings(button):
+        assert PREWAKE_ID not in text and "wake" not in text, text
+
+
+def test_controls_turn_the_dial_into_volume_steps() -> None:
+    (dial,) = load(PACKAGES / "controls.yaml")["sensor"]
+    assert dial["platform"] == "rotary_encoder"
+    assert (dial["pin_a"], dial["pin_b"], dial["resolution"]) == ("GPIO16", "GPIO18", 2)
+    assert _strings(dial["on_clockwise"]) == [f"id({PLAYER_ID}).on_dial(1);"]
+    assert _strings(dial["on_anticlockwise"]) == [f"id({PLAYER_ID}).on_dial(-1);"]
+
+
+def test_controls_give_the_led_ring_an_effect_for_each_pattern_but_idle() -> None:
+    lights = {light["id"]: light for light in load(PACKAGES / "controls.yaml")["light"]}
+    strip = lights["leds_internal"]
+    assert strip["platform"] == "esp32_rmt_led_strip"
+    assert (strip["pin"], strip["num_leds"]) == ("GPIO21", 12)
+    ring = lights["mist_leds"]
+    assert ring["platform"] == "partition"
+    assert ring["internal"] is True
+    names = {next(iter(effect.values()))["name"] for effect in ring["effects"]}
+    ui_state = (ENDPOINT / "components" / "mist_core" / "ui_state.h").read_text("utf-8")
+    enum = re.search(r"enum class LedPattern : uint8_t \{([^}]*)\}", ui_state)
+    assert enum is not None
+    patterns = {name.strip() for name in enum.group(1).split(",") if name.strip()}
+    # Idle turns the ring off; every other pattern is an effect the player names.
+    assert names == patterns - {"Idle"}
+    cpp = (PLAYER_DIR / "mist_player.cpp").read_text(encoding="utf-8")
+    for name in names:
+        assert f'"{name}"' in cpp, name
+
+
+def test_player_feeds_the_reply_resampler_and_ducks_its_mixer_input() -> None:
+    player = load(PACKAGES / "player.yaml")
+    assert player["external_components"] == [
+        {
+            "source": {"type": "local", "path": "${mist_components_path}"},
+            "components": ["mist_player"],
+        }
+    ]
+    config = player["mist_player"]
+    assert config["id"] == PLAYER_ID
+    assert config["link_id"] == "mist_connection"
+    assert config["speaker"] == "reply_resampling_speaker"
+    assert config["ducking_speaker"] == "reply_mixing_input"
+    assert config["volume_speaker"] == "i2s_audio_speaker"
+    assert (config["wake_model"], config["stop_model"]) == ("mist_wake", "stop")
+    assert config["mute_switch"] == "hardware_mute_switch"
+    assert config["leds"] == "mist_leds"
+    assert config["ring_volume_floor"] == "${ring_volume_floor}"
+    speakers = {spk["id"]: spk for spk in load(PACKAGES / "device.yaml")["speaker"]}
+    assert speakers["reply_resampling_speaker"]["output_speaker"] == "reply_mixing_input"
+    assert speakers["i2s_audio_speaker"]["audio_dac"] == "aic3204_dac"
+
+
+def test_player_sets_the_level_from_an_on_boot_after_the_device_level() -> None:
+    (device_level,) = (
+        entry
+        for entry in _boot_entries(PACKAGES / "device.yaml")
+        if any("set_volume" in text for text in _strings(entry["then"]))
+    )
+    assert device_level["priority"] == -100
+    (boot,) = _boot_entries(PACKAGES / "player.yaml")
+    # A lower priority runs later (base_automation.h, StartupTrigger).
+    assert boot["priority"] < device_level["priority"]
+    assert _strings(boot["then"]) == [f"id({PLAYER_ID}).apply_boot_state();"]
+
+
+def test_the_player_sets_the_level_only_through_the_speakers_set_volume() -> None:
+    cpp = (PLAYER_DIR / "mist_player.cpp").read_text(encoding="utf-8")
+    assert re.findall(r"set_volume\(", cpp) == ["set_volume("]
+    assert "this->volume_speaker_->set_volume(this->ui_.speaker_level());" in cpp
 
 
 # -- The link component ------------------------------------------------------------------------

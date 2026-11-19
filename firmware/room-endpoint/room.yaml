@@ -28,3 +28,7 @@ substitutions:
 packages:
   device: !include packages/device.yaml
   link: !include packages/link.yaml
+  # MIST's replies, the volume and the LED ring (packages/player.yaml), and the button, dial,
+  # stop word and ring hardware (packages/controls.yaml).
+  player: !include packages/player.yaml
+  controls: !include packages/controls.yaml

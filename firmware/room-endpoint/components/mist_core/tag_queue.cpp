@@ -7,6 +7,30 @@
 
 namespace mist_core {
 
+void apply_fade_out(int16_t* pcm, size_t count, size_t offset, size_t total) {
+  for (size_t i = 0; i < count; ++i) {
+    const size_t position = offset + i;
+    if (position >= total) {
+      pcm[i] = 0;
+      continue;
+    }
+    const int64_t scaled = static_cast<int64_t>(pcm[i]) * static_cast<int64_t>(total - position) /
+                           static_cast<int64_t>(total);
+    pcm[i] = static_cast<int16_t>(scaled);
+  }
+}
+
+void TagQueue::reset() {
+  phase_ = Phase::None;
+  turn_id_[0] = '\0';
+  tag_ = 0;
+  queued_ = 0;
+  played_ = 0;
+  started_ = false;
+  final_report_ = false;
+  duck_db_ = 0.0f;
+}
+
 bool TagQueue::on_stream_start(const char* turn_id, bool has_audio_tag, uint16_t audio_tag) {
   const bool flush =
       phase_ == Phase::Buffering || phase_ == Phase::Playing || phase_ == Phase::Draining;
@@ -36,6 +60,10 @@ TagVerdict TagQueue::on_audio_chunk(uint16_t tag, uint32_t samples) {
     phase_ = Phase::Playing;
   }
   return TagVerdict::Play;
+}
+
+void TagQueue::on_overflow(uint32_t samples) {
+  queued_ = queued_ - played_ > samples ? queued_ - samples : played_;
 }
 
 bool TagQueue::on_audio_complete(uint16_t tag) {
@@ -73,6 +101,22 @@ void TagQueue::on_played(uint32_t samples, uint32_t now_ms) {
   }
   played_ += samples;
   if (played_ > queued_) played_ = queued_;
+}
+
+void TagQueue::on_output_drained(uint32_t now_ms) {
+  if (phase_ != Phase::Draining) return;
+  if (!started_) {
+    started_ = true;
+    last_report_ms_ = now_ms;
+  }
+  played_ = queued_;
+}
+
+uint8_t TagQueue::duck_reduction_db() const {
+  const float reduction = -duck_db_;
+  if (!(reduction > 0.0f)) return 0;
+  if (reduction >= 255.0f) return 255;
+  return static_cast<uint8_t>(reduction + 0.5f);
 }
 
 PlaybackReport TagQueue::poll(uint32_t now_ms) {

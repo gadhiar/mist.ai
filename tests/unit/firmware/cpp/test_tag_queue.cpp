@@ -3,8 +3,10 @@
 //
 // Host tests for the playback tag rules (plan Design item 5): `stream_start.audio_tag` names the
 // turn whose `0x01` frames play and every other tag is dropped; the prebuffer; progress at its
-// interval; `playback_done` once; fade and flush on `playback_stop` and `0x03`; ducking.
+// interval; `playback_done` once; fade and flush on `playback_stop` and `0x03`; ducking; the
+// player's overflow, drain and reset; the fade's ramp.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -231,4 +233,140 @@ MIST_TEST(duck_never_raises_the_volume) {
   queue.on_playback_duck("turn-1", 6.0f);
 
   CHECK(queue.duck_db() == 0.0f);
+}
+
+MIST_TEST(the_duck_reduction_is_the_mixers_whole_decibels) {
+  TagQueue queue;
+  queue.on_stream_start("turn-1", true, 9);
+  CHECK_EQ(queue.duck_reduction_db(), 0);
+
+  queue.on_playback_duck("turn-1", -12.4f);
+  CHECK_EQ(queue.duck_reduction_db(), 12);
+  queue.on_playback_duck("turn-1", -12.6f);
+  CHECK_EQ(queue.duck_reduction_db(), 13);
+  queue.on_playback_duck("turn-1", -0.4f);
+  CHECK_EQ(queue.duck_reduction_db(), 0);
+  queue.on_playback_duck("turn-1", -1000.0f);
+  CHECK_EQ(queue.duck_reduction_db(), 255);
+  queue.on_playback_duck("turn-1", std::nanf(""));
+
+  CHECK_EQ(queue.duck_reduction_db(), 0);
+}
+
+MIST_TEST(the_session_settings_are_kept_for_the_player) {
+  TagQueue queue;
+  CHECK_EQ(queue.params().fade_ms, 30);
+  PlaybackParams params;
+  params.fade_ms = 55;
+
+  queue.set_params(params);
+
+  CHECK_EQ(queue.params().fade_ms, 55);
+}
+
+MIST_TEST(audio_the_player_had_no_room_for_is_not_queued) {
+  TagQueue queue;
+  queue.on_stream_start("turn-1", true, 9);
+  queue.on_audio_chunk(9, ms(300));
+  queue.on_audio_chunk(9, ms(40));
+
+  queue.on_overflow(ms(40));
+
+  CHECK_EQ(queue.queued_samples(), ms(300));
+  queue.on_audio_complete(9);
+  queue.on_played(ms(300), 0);
+  const PlaybackReport report = queue.poll(0);
+  CHECK(report.kind == ReportKind::Done);
+  CHECK_EQ(report.played_ms, 300);
+}
+
+MIST_TEST(an_overflow_never_unqueues_audio_already_played) {
+  TagQueue queue;
+  queue.on_stream_start("turn-1", true, 9);
+  queue.on_audio_chunk(9, ms(100));
+  queue.on_played(ms(80), 0);
+
+  queue.on_overflow(ms(500));
+
+  CHECK_EQ(queue.queued_samples(), ms(80));
+  CHECK_EQ(queue.played_samples(), ms(80));
+}
+
+MIST_TEST(a_drained_output_completes_a_turn_its_count_fell_short_of) {
+  TagQueue queue;
+  queue.on_stream_start("turn-1", true, 9);
+  queue.on_audio_chunk(9, ms(300));
+  queue.on_audio_complete(9);
+  queue.on_played(ms(300) - 7, 0);
+  CHECK(queue.poll(50).kind == ReportKind::None);
+
+  queue.on_output_drained(60);
+  const PlaybackReport report = queue.poll(60);
+
+  CHECK(report.kind == ReportKind::Done);
+  CHECK_EQ(report.played_ms, 300);
+}
+
+MIST_TEST(a_drained_output_before_the_audio_complete_marker_completes_nothing) {
+  TagQueue queue;
+  queue.on_stream_start("turn-1", true, 9);
+  queue.on_audio_chunk(9, ms(300));
+  queue.on_played(ms(100), 0);
+
+  queue.on_output_drained(10);
+
+  CHECK_EQ(queue.played_samples(), ms(100));
+  CHECK(queue.poll(20).kind == ReportKind::None);
+}
+
+MIST_TEST(reset_forgets_the_turn_without_a_report) {
+  TagQueue queue;
+  queue.on_stream_start("turn-1", true, 9);
+  queue.on_audio_chunk(9, ms(300));
+  queue.on_played(ms(100), 0);
+
+  queue.reset();
+
+  CHECK(!queue.playing());
+  CHECK(queue.poll(1000).kind == ReportKind::None);
+  CHECK(queue.on_audio_chunk(9, ms(20)) == TagVerdict::Drop);
+  CHECK(!queue.on_playback_stop(9, 30).fade);
+  CHECK(!queue.on_stream_start("turn-2", true, 10));
+}
+
+// -- The fade ----------------------------------------------------------------------------------
+
+MIST_TEST(a_fade_ramps_from_full_level_to_silence) {
+  int16_t pcm[100];
+  for (int16_t& sample : pcm) sample = 10000;
+
+  mist_core::apply_fade_out(pcm, 100, 0, 100);
+
+  CHECK_EQ(pcm[0], 10000);
+  CHECK_EQ(pcm[50], 5000);
+  CHECK_EQ(pcm[99], 100);
+  for (int i = 1; i < 100; ++i) CHECK(pcm[i] < pcm[i - 1]);
+}
+
+MIST_TEST(a_fade_in_two_pieces_matches_one_piece) {
+  int16_t whole[64];
+  int16_t pieces[64];
+  for (int i = 0; i < 64; ++i) whole[i] = pieces[i] = static_cast<int16_t>(i % 2 ? -32768 : 32767);
+
+  mist_core::apply_fade_out(whole, 64, 0, 64);
+  mist_core::apply_fade_out(pieces, 40, 0, 64);
+  mist_core::apply_fade_out(pieces + 40, 24, 40, 64);
+
+  for (int i = 0; i < 64; ++i) CHECK_EQ(pieces[i], whole[i]);
+  CHECK_EQ(whole[1], -32256);
+}
+
+MIST_TEST(samples_past_a_fades_end_are_silent) {
+  int16_t pcm[8] = {1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000};
+
+  mist_core::apply_fade_out(pcm, 8, 4, 6);
+
+  CHECK_EQ(pcm[0], 333);
+  CHECK_EQ(pcm[1], 166);
+  for (int i = 2; i < 8; ++i) CHECK_EQ(pcm[i], 0);
 }

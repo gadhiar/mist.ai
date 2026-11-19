@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+# Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
+#
+# The room build's player (plan Design item 5; v4 A13). MIST's replies arrive on the link as
+# 24 kHz PCM16 and play through the reply resampler, the mixer and the I2S DAC of
+# `packages/device.yaml`, with the tag rules, prebuffer, progress, done, fade and duck of the
+# session's `voice_state.playback`. The player owns the speaker level: the dial's volume, kept in
+# preferences, and a ring's floor, applied through the I2S speaker's `set_volume` only. The name
+# and stop models and the LED ring follow MIST's state. Its inputs are wired in
+# `packages/controls.yaml`.
+
+esphome:
+  on_boot:
+    # After `packages/device.yaml`'s level at priority -100: a lower priority runs later, so the
+    # saved volume replaces the device's fixed boot level, and the models start as `UiState` has
+    # them whatever state they loaded.
+    - priority: -200
+      then:
+        - lambda: id(mist_reply_player).apply_boot_state();
+
+external_components:
+  - source:
+      type: local
+      path: ${mist_components_path}
+    components: [mist_player]
+
+mist_player:
+  id: mist_reply_player
+  link_id: mist_connection
+  speaker: reply_resampling_speaker
+  ducking_speaker: reply_mixing_input
+  volume_speaker: i2s_audio_speaker
+  wake_model: mist_wake
+  stop_model: stop
+  mute_switch: hardware_mute_switch
+  leds: mist_leds
+  ring_volume_floor: ${ring_volume_floor}
