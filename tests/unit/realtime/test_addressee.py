@@ -262,14 +262,32 @@ class TestTheNameAtTheHit:
             # No timings: no alias counts, wherever the hit was.
             ("hey missed", 1, 0, None),
             ("missed, what's up", 0, 0, None),
-            # The names keep their rules, and the guard still reads the speech end.
-            ("hey mist", 1, SPEECH_ON, "phrase"),
+            # The names keep their rules, and the guard still reads the speech end. "hey mist"
+            # is the whole decode and ends at the name, so its template is guarded; the
+            # greeting rule, which is not, accepts it.
+            ("hey mist", 1, SPEECH_ON, "vocative"),
             ("A cold mist.", 2, SPEECH_ON, None),
             ("A cold mist.", 2, 0, "vocative"),
         ],
     )
     def test_without_words_only_names_count_under_the_guard(self, text, at, speech_past, check):
         alignment = hit_on(text, at, speech_past=speech_past, words=False)
+
+        assert vocative_match(text, DEFAULTS, alignment) == check
+
+    @pytest.mark.parametrize(
+        ("text", "speech_past", "check"),
+        [
+            # A template that covers the whole decode and ends at the name is anchored at the
+            # end too: with speech going on past the hit, the decode was cut at the name.
+            ("are you there missed", SPEECH_ON, None),
+            ("are you there mist", SPEECH_ON, None),
+            ("are you there missed", 0, "phrase"),
+            ("are you there mist", 0, "phrase"),
+        ],
+    )
+    def test_a_whole_decode_template_ending_at_the_name_is_guarded(self, text, speech_past, check):
+        alignment = hit_on(text, 3, speech_past=speech_past)
 
         assert vocative_match(text, DEFAULTS, alignment) == check
 

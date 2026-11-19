@@ -168,7 +168,10 @@ def _phrase(words: list[str], marks: list[_Mark | None], config: WakeConfig, *, 
         slots = _template_words(template)
         if len(words) < len(slots):
             continue
-        if _slots_match(words[: len(slots)], marks[: len(slots)], slots):
+        # A template covering the whole decode and ending at the name is anchored at the end
+        # too, so the guard applies to its start match as well.
+        at_end = len(words) == len(slots) and slots[-1] == _NAME_SLOT
+        if (ends or not at_end) and _slots_match(words[: len(slots)], marks[: len(slots)], slots):
             return True
         tail = len(words) - len(slots)
         if ends and _slots_match(words[tail:], marks[tail:], slots):
@@ -258,11 +261,12 @@ def vocative_match(
       as the last word, only when "," comes before it or it is the only word ("I just missed."
       is not said to her, "Missed." and "what's the time, missed?" are). Rules 1 and 2 and the
       two commas need words of their own, and treat an aligned alias as a name.
-    - The trailing-speech guard: the last-word rule and a template matched at the end count
-      only when `speech_end_pos` is None or at most `trailing_speech_ms` past the hit, because
-      the gate decodes only `gate_tail_ms` past the hit and a cut-off decode ("A cold mist."
-      of "a cold mist hung over the lake") can end at the name. A template matched at the
-      start, the greeting and the two commas do not depend on where the decode ends.
+    - The trailing-speech guard: the last-word rule and a template matched at the end, or
+      covering the whole decode and ending at the name ("are you there mist"), count only when
+      `speech_end_pos` is None or at most `trailing_speech_ms` past the hit, because the gate
+      decodes only `gate_tail_ms` past the hit and a cut-off decode ("A cold mist." of "a cold
+      mist hung over the lake") can end at the name. Any other template matched at the start,
+      the greeting and the two commas do not depend on where the decode ends.
     - The full-stop form: a name or alias first, then "." or "?" and a word in
       `address_starts`, counts in rule 4 ("Mist. What's the time?"); "Mist. The fog lifted."
       does not.
