@@ -525,7 +525,8 @@ class WakeConfig:
       "." or "?" and then a word in `address_starts`; as the last word, "," before it, unless it
       is the only word ("Missed."). A configured name keeps its rules.
     - The trailing-speech guard: a rule anchored at the utterance's end (the last-word rule, or
-      a phrase template matched at the end) counts only when the VAD heard no speech more than
+      a phrase template matched at the end, or covering the whole decode and ending at the
+      name, as "are you there {name}" can) counts only when the VAD heard no speech more than
       `trailing_speech_ms` past the hit, so a decode the gate tail cut short ("a cold mist" of
       "a cold mist hung over the lake") does not pass as said to her.
     - The full-stop form: a name or alias first, then "." or "?" and a word in `address_starts`
