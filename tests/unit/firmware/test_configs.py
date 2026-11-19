@@ -10,6 +10,7 @@ lists, environment and file copies `build.py` makes, with a fake compile.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -242,6 +243,67 @@ def test_device_package_takes_wifi_and_ota_from_secrets_and_time_from_sntp() -> 
     (ota,) = device["ota"]
     assert ota == {"platform": "esphome", "password": secret("mist_ota_password")}
     assert [clock["platform"] for clock in device["time"]] == ["sntp"]
+
+
+def _amp_turned_on_at_boot(device: dict) -> bool:
+    """GPIO47 enables the speaker amplifier; held off at reset, it is switched on 1 s into boot."""
+    switches = [entry for entry in device.get("switch", []) if entry.get("pin") == "GPIO47"]
+    if switches != [
+        {
+            "platform": "gpio",
+            "pin": "GPIO47",
+            "id": "internal_speaker_amp",
+            "restore_mode": "ALWAYS_OFF",
+            "internal": True,
+        }
+    ]:
+        return False
+    steps = [step["then"] for step in device["esphome"]["on_boot"] if step["priority"] == 375]
+    return steps == [[{"delay": "1s"}, {"switch.turn_on": "internal_speaker_amp"}]]
+
+
+def test_device_package_turns_the_speaker_amplifier_on_at_boot() -> None:
+    device = load(PACKAGES / "device.yaml")
+    assert _amp_turned_on_at_boot(device)
+    without = copy.deepcopy(device)
+    boot = without["esphome"]["on_boot"]
+    boot[:] = [step for step in boot if step["priority"] != 375]
+    assert not _amp_turned_on_at_boot(without)
+
+
+def _wifi_power_save_off(device: dict) -> bool:
+    """In modem sleep the server's ACKs can wait for a beacon, which stalls a wake's backlog."""
+    return device["wifi"].get("power_save_mode") == "none"
+
+
+def test_device_package_turns_wifi_power_save_off() -> None:
+    device = load(PACKAGES / "device.yaml")
+    assert _wifi_power_save_off(device)
+    without = copy.deepcopy(device)
+    del without["wifi"]["power_save_mode"]  # ESPHome's ESP32 default is `light`
+    assert not _wifi_power_save_off(without)
+
+
+def _requests_high_performance_networking(source: str) -> bool:
+    """The prewake schema runs a validator that calls ESPHome's high-performance request."""
+    schema = re.search(r"^CONFIG_SCHEMA = cv\.All\((.*?)^\)", source, re.S | re.M)
+    if schema is None:
+        return False
+    validators = re.findall(r"^    (_\w+),$", schema.group(1), re.M)
+    for name in validators:
+        pattern = rf"^def {name}\(config: dict\) -> dict:\n(.*?)\n    return config"
+        body = re.search(pattern, source, re.S | re.M)
+        if body is not None and "network.require_high_performance_networking()" in body.group(1):
+            return True
+    return False
+
+
+def test_prewake_requests_high_performance_networking() -> None:
+    source = (PREWAKE_DIR / "__init__.py").read_text(encoding="utf-8")
+    assert _requests_high_performance_networking(source)
+    assert not _requests_high_performance_networking(
+        source.replace("    _request_high_performance_networking,\n", "")
+    )
 
 
 def test_device_package_runs_the_wake_and_stop_models_and_vad_by_substitution() -> None:
