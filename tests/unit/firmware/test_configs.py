@@ -1055,23 +1055,73 @@ def _readme_commands(prefix: str) -> list[list[str]]:
     return commands
 
 
+def _readme_section(heading: str) -> str:
+    """The README's `## ` section whose heading starts with `heading`, without the heading."""
+    sections = README.read_text(encoding="utf-8").split("\n## ")[1:]
+    found = [section for section in sections if section.startswith(heading)]
+    assert len(found) == 1, f"the README has {len(found)} sections headed {heading!r}"
+    return found[0].split("\n", 1)[1].replace("\\\n", " ")
+
+
 def test_readme_build_command_parses_with_build_py() -> None:
     commands = _readme_commands("python -m scripts.room_endpoint.build ")
     assert commands, "the README gives no build command"
     parser = build.build_parser()
     parsed = [parser.parse_args(args) for args in commands]
-    assert any(
-        args.command == "compile"
-        and args.target == "spike"
-        and args.config == Path("/private/<device>/spike.yaml")
-        and args.out == Path("/private/<device>/images/spike")
-        for args in parsed
-    ), "the README gives no H4 spike build command"
+    for target in ("spike", "room"):
+        assert any(
+            args.command == "compile"
+            and args.target == target
+            and args.config == Path(f"/private/<device>/{target}.yaml")
+            and args.out == Path(f"/private/<device>/images/{target}")
+            for args in parsed
+        ), f"the README gives no {target} build command from the private YAML"
 
 
-def test_readme_first_section_gives_the_h4_steps() -> None:
-    text = README.read_text(encoding="utf-8")
-    first = text.split("\n## ", 2)[1]
+def test_readme_room_build_command_mounts_the_models_and_no_network() -> None:
+    room = _readme_section("The room build")
+    (line,) = (line for line in room.splitlines() if "build compile room --config" in line)
+    assert "--network none" in line
+    assert "-v <models dir>:/models:ro" in line
+    assert "-v <repo>:/repo:ro" in line
+
+
+def test_readme_lists_the_led_patterns_in_ui_state_priority_order() -> None:
+    cpp = (ENDPOINT / "components" / "mist_core" / "ui_state.cpp").read_text(encoding="utf-8")
+    body = re.search(r"LedPattern UiState::led\(\) const \{\n(.*?)\n\}", cpp, re.S)
+    assert body is not None
+    order = list(dict.fromkeys(re.findall(r"return LedPattern::(\w+);", body.group(1))))
+    rows = re.findall(r"^\| (\d+) \| `(\w+)` \|", _readme_section("Using the device"), re.M)
+    assert [name for _, name in rows] == order
+    assert [int(rank) for rank, _ in rows] == list(range(1, len(order) + 1))
+
+
+def test_readme_gives_the_dial_numbers_from_ui_state() -> None:
+    header = (ENDPOINT / "components" / "mist_core" / "ui_state.h").read_text(encoding="utf-8")
+
+    def constant(name: str) -> str:
+        found = re.search(rf"static constexpr float {name} = ([0-9.]+)f;", header)
+        assert found is not None, name
+        return found.group(1)
+
+    using = " ".join(_readme_section("Using the device").split())
+    floor = load(ENDPOINT / "room.yaml")["substitutions"]["ring_volume_floor"]
+    assert f"by {constant('kDialStep')} per detent" in using
+    assert f"starts at {constant('kDefaultVolume')}" in using
+    assert f"at least {floor} of full volume" in using
+
+
+def test_readme_pins_match_the_configs_and_build_py() -> None:
+    pins = _readme_section("Pins")
+    device = load(PACKAGES / "device.yaml")
+    assert f"ESPHome {device['esphome']['min_version']}" in pins
+    assert Path(build.STAND_INS["xmos_firmware"]).name in pins
+    assert "2644f4c" in pins and "2644f4c" in (PACKAGES / "device.yaml").read_text("utf-8")
+    assert "`esp_websocket_client` 1.8.0" in pins
+
+
+def test_readme_h4_section_gives_the_h4_steps() -> None:
+    first = _readme_section("H4:")
     for needle in (
         "python -m scripts.room_endpoint.build compile spike",
         "web.esphome.io",

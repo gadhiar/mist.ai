@@ -54,6 +54,10 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
   - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, night extraction, backups, restore drill, promote)
   - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
   - `gamewatch.py` - The gaming watcher's process lister, game rules and decision
+  - `devices.py` - Provisions room devices: the device CA and server certificate, the registry, and each device's private `secrets.yaml`
+- `room_endpoint/` - The room device's firmware tools, run in the worker image (see `firmware/room-endpoint/README.md`)
+  - `build.py` - Compiles the spike or room firmware offline in a throwaway build directory; `--out` copies the factory and OTA images out
+  - `spike_listener.py` - The H4 spike listener: a stand-in for MIST's device listener that measures the device gate G1
 - `backup/` - Backups of the graph, stores and vault, and their restore
   - `scheduler.py` - Runs backups on a schedule inside the compose project; a bad dump never prunes good ones
   - `status.py` - The backup status file: last attempt, its outcome and the last success
@@ -281,6 +285,35 @@ deploy/daily/
     └── unregister-signin-task.ps1  # Removes all three sign-in tasks, for a rollback
 ```
 
+## Room Device Firmware (`firmware/`)
+
+MIST's own ESPHome firmware for a Voice PE room device, built offline by
+`scripts/room_endpoint/build.py` in the worker image. Nothing personal is here: each device's
+YAML, secrets, name model and images live in its private directory. `README.md` is the build,
+flash and use guide; `NOTICE` records the licences.
+
+```
+firmware/
+└── room-endpoint/
+    ├── README.md                # Provisioning, build, flash, OTA, LEDs and controls, alarms, pins
+    ├── room.yaml                # The room build: wakes on the private name model
+    ├── spike.yaml               # The H4 spike build: the stop model as a stand-in wake, device_stats
+    ├── personal.example.yaml    # Template for a device's private YAML
+    ├── packages/
+    │   ├── device.yaml          # Hardware, adapted from the published Voice PE config (MIT)
+    │   ├── link.yaml            # mist_link and mist_prewake
+    │   ├── player.yaml          # mist_player: replies, volume, models and LEDs
+    │   ├── controls.yaml        # Button, dial, stop detections and the LED ring
+    │   ├── alarm.yaml           # mist_alarm: alarms on the device
+    │   └── spike.yaml           # The spike's device_stats and spike-only player
+    └── components/
+        ├── mist_core/           # Portable C++ core, tested on the host (tests/unit/firmware)
+        ├── mist_link/           # The wss:// link, through esp_websocket_client
+        ├── mist_prewake/        # Pre-wake ring, wake uplink and mute switch
+        ├── mist_player/         # Reply player, level, models and LEDs
+        └── mist_alarm/          # Alarm ring, schedule copy and reports
+```
+
 ## Dev Instance Fixture (`tests/fixtures/dev-instance/`)
 
 The synthetic seed `docker-compose.dev.yml` starts from, and that `instance.py init --seed` reads
@@ -478,6 +511,7 @@ Frontend lives in a separate repo at `./mist-frontend/`. See that repo's contrib
 - **Integration tests:** `tests/integration/` (cluster-scoped reproducers; require live Neo4j + llama-server)
 - **Drift guards:** `tests/unit/test_eval_harness_scorers.py` locks scorer frozensets to ontology; `tests/unit/knowledge/extraction/test_validator.py::TestValidatorOntologyConsistency` locks validator to ontology
 - **Eval harness:** `scripts/eval_harness/` runs V1-V8 gauntlets; reports in `data/ingest/`
+- **Room device firmware:** `tests/unit/firmware/` (the configs, `build.py` and the README in `test_configs.py`; `mist_core` compiled and run on the host from `cpp/` by `test_core.py`)
 - **Memory read path:** `tests/unit/memory/` (fakes in `tests/fakes/memory_fakes.py`); `tests/fixtures/memory_recall/` holds the synthetic recall fixture (facts, conversations, episodes, vault notes, corrections, probes) that `scripts/eval_harness/memory_recall.py` scores
 
 ---
