@@ -56,13 +56,14 @@ AMBIENT_SERIES = {
 }
 AMBIENT_SECONDS = 18
 # Stream hits by key, as (frame within the file, score). Each positive's hit is in its speech.
-# Ambient file 101 has one in its speech (frames 200 to 299) at 0.955 and one at 0.99 at frame
-# 600, in silence, which is warmed and never reported; file 102 has one in its speech at 0.97.
+# Ambient file 101 has one in its speech (frames 200 to 299) at 0.955 and one at 0.957 at frame
+# 600, in silence, which is reported and gated at 0.95 and under, and is below 0.96; file 102
+# has one in its speech at 0.97.
 STREAM_HITS: dict[int, tuple[tuple[int, float], ...]] = {
     2: ((30, 0.97),),
     3: ((30, 0.99),),
     4: ((30, 0.96),),
-    101: ((250, 0.955), (600, 0.99)),
+    101: ((250, 0.955), (600, 0.957)),
     102: ((450, 0.97),),
 }
 # The gate decode's text by key: every positive and file 101 addressed, file 102 not.
@@ -205,8 +206,8 @@ def key_of(pcm: bytes) -> int:
 class KeyedStream:
     """A spotter stream that reports `STREAM_HITS` of the file it is fed, by frame in the file.
 
-    Every frame of a recording is fed once and in order from its first, so the first position
-    a stream sees is the file's frame 0, and its first frame's key names the file.
+    Every frame of a recording is pushed once and in order from its first, so the first
+    position a stream sees is the file's frame 0, and its first frame's key names the file.
     """
 
     hits: Mapping[int, Sequence[tuple[int, float]]]
@@ -215,16 +216,12 @@ class KeyedStream:
     key: int | None = None
     base: int = 0
     pushed: list[int] = field(default_factory=list)
-    warmed: list[int] = field(default_factory=list)
 
     def _frame(self, pcm: bytes, pos: int) -> int:
         if self.key is None:
             self.key = key_of(pcm)
             self.base = pos
         return pos - self.base
-
-    def warm(self, pcm: bytes, pos: int) -> None:
-        self.warmed.append(self._frame(pcm, pos))
 
     def push(self, pcm: bytes, pos: int) -> list[NameHit]:
         frame = self._frame(pcm, pos)
@@ -650,7 +647,7 @@ def test_gated_wakes_count_a_positive_only_when_one_of_its_hits_is_accepted(
     assert out.splitlines()[-1] == "bar: no cutoff passes"
 
 
-def test_a_gated_false_wake_is_a_pushed_hit_whose_decode_the_gate_accepts(
+def test_a_gated_false_wake_is_a_reported_hit_whose_decode_the_gate_accepts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     run = prepare(tmp_path)
@@ -658,19 +655,23 @@ def test_a_gated_false_wake_is_a_pushed_hit_whose_decode_the_gate_accepts(
     assert run.run(cutoffs="0.95") == 1
 
     out = capsys.readouterr().out
-    # At 0.95 file 101's speech hit is addressed and counts; file 102's is decoded "the mist
-    # rolled in" and does not; file 101's 0.99 hit at frame 600 is warmed and never gated.
-    assert cutoff_lines(out)[0.95].endswith("gated false wakes 1 (100.000 per hour)")
-    assert "gate at 0.95: 1 false wakes, 2 decodes, 0 failed, 1.0 s wall" in out.splitlines()
+    # At 0.95 file 101's speech hit is addressed and counts, and so does its 0.957 hit at frame
+    # 600, in silence, from a span of its own; file 102's is decoded "the mist rolled in" and
+    # does not.
+    assert cutoff_lines(out)[0.95].endswith("gated false wakes 2 (200.000 per hour)")
+    assert "gate at 0.95: 2 false wakes, 3 decodes, 0 failed, 1.5 s wall" in out.splitlines()
     (stream_101,) = (stream for stream in run.spotter.opened if stream.key == 101)
-    assert 600 in stream_101.warmed and 600 not in stream_101.pushed
-    assert 250 in stream_101.pushed
-    assert ("hit", 101, 0.95, 0.99) not in run.events
-    assert sorted(key for key in run.transcriber.decoded if key in AMBIENT_PARTS) == [101, 102]
+    assert {250, 600} <= set(stream_101.pushed)
+    assert ("hit", 101, 0.95, 0.957) in run.events
+    assert sorted(key for key in run.transcriber.decoded if key in AMBIENT_PARTS) == [
+        101,
+        101,
+        102,
+    ]
     assert out.splitlines()[-1] == "bar: no cutoff passes"
 
 
-def test_every_ambient_frame_is_fed_once_and_in_order_at_the_gated_cutoff(
+def test_every_ambient_frame_is_pushed_once_and_in_order_at_the_gated_cutoff(
     tmp_path: Path,
 ) -> None:
     run = prepare(tmp_path)
@@ -679,11 +680,7 @@ def test_every_ambient_frame_is_fed_once_and_in_order_at_the_gated_cutoff(
 
     for key in AMBIENT_PARTS:
         (stream,) = (stream for stream in run.spotter.opened if stream.key == key)
-        fed = sorted([*stream.warmed, *stream.pushed])
-        assert fed == list(range(len(fed)))
-        assert stream.pushed and stream.warmed
-        # Only the frames a recording's end leaves waiting are unfed.
-        assert AMBIENT_SECONDS * RATE // FRAME_SAMPLES - len(fed) < 50
+        assert stream.pushed == list(range(AMBIENT_SECONDS * RATE // FRAME_SAMPLES))
 
 
 def test_only_the_highest_candidate_is_gated(

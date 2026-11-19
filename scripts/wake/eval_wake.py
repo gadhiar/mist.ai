@@ -3,10 +3,10 @@
 A wake model is judged end to end, by what reaches a verdict, not by its raw scores: a name hit
 the gate rejects costs nothing but a cue, and a hit it accepts on a film is a false wake. So
 each recording runs through an offline driver of the live path: the VAD opens speech segments
-and the spotter is fed every frame as ingress feeds it (`backend/realtime/ingress.py`); every hit
-passes the gate's pre-decode checks, with the PC's own output scored when the entry has a
-reference; the gate decode runs through the `StreamingTranscriber` contract; and `decide` reads
-its text.
+and the spotter is pushed every frame as ingress pushes it (`backend/realtime/ingress.py`);
+every hit passes the gate's pre-decode checks, with the PC's own output scored when the entry
+has a reference; the gate decode runs through the `StreamingTranscriber` contract; and `decide`
+reads its text.
 
     python -m scripts.wake.eval_wake --manifest <path> --model <id> --split tune|test \
         --thresholds 0.3,0.4,0.5 --out <json> --stt-factory <module>:<callable>
@@ -74,8 +74,8 @@ from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
     VAD_WINDOW_SAMPLES,
     SpeechSegmentTracker,
+    name_chain_start,
     onset_lead_frames,
-    spotter_feed,
 )
 from backend.realtime.speech import (
     CancelToken,
@@ -157,68 +157,33 @@ def positive_quantile_table(
 
 
 @dataclass(frozen=True, slots=True)
-class _Feed:
-    """Frames the spotter scores in turn: `warm` scored silently, then `push` reported.
-
-    The harness never resets the stream: it has no mute and no backlog, the only causes of a
-    reset in ingress, and each recording gets a stream of its own.
-    """
-
-    warm: range
-    push: range
-
-
-def _released(feeds: list[_Feed], warm: range, push: range) -> None:
-    """Add one `spotter_feed` release to `feeds`, joined to the last feed where it can be.
-
-    Releases are contiguous, so a release after a feed that pushed nothing, or one that warms
-    nothing after a feed that pushed, extends that feed and the stream hears the same frames in
-    the same order. A recording's feeds then grow with its segments, not its frames, which keeps
-    hours of ambient audio's feeds small enough to hold.
-    """
-    if feeds:
-        last = feeds[-1]
-        if not last.push:
-            feeds[-1] = _Feed(warm=range(last.warm.start, warm.stop), push=push)
-            return
-        if not warm:
-            feeds[-1] = _Feed(warm=last.warm, push=range(last.push.start, push.stop))
-            return
-    feeds.append(_Feed(warm=warm, push=push))
-
-
-@dataclass(frozen=True, slots=True)
 class _Heard:
-    """One recording as ingress would hear it: its frames, the spotter feeds and the segments.
+    """One recording as ingress would hear it: its frames and the VAD's segments.
 
-    A segment is `(onset frame, last speech frame)`, inclusive.
+    A segment is `(onset frame, last speech frame)`, inclusive. The spotter is pushed every
+    frame, so the frames are all it needs.
     """
 
     frames: tuple[bytes, ...]
-    feeds: tuple[_Feed, ...]
     segments: tuple[tuple[int, int], ...]
 
 
 def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _Heard:
-    """Segment one recording and decide which frames reach the spotter, as ingress does.
+    """Segment one recording as ingress does, for the gate spans of its hits.
 
     Each VAD window at or above `vad_threshold` is speech, and ingress's own
-    `SpeechSegmentTracker` turns the windows into segments. After each frame, as ingress does
-    once it routes a frame, `spotter_feed` releases the frames the spotter scores next: every
-    frame of the recording once and in order, a segment and its pre-roll pushed and the rest
-    warmed. Frames still waiting when the recording ends, which an onset could yet have made
-    pre-roll, are not scored, as ingress would not have scored them yet.
+    `SpeechSegmentTracker` turns the windows into segments. The segments decide no frame the
+    spotter hears: ingress pushes it every frame once and in order as each is routed, and so
+    does `_Driver._spot`, from the first frame of the recording to its last. They place each
+    hit's gate span (`_Driver._span`).
     """
     frames = _frames(pcm)
     usable = len(frames) * FRAME_BYTES
     samples = np.frombuffer(pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0
     stream = vad.open_stream()
     tracker = SpeechSegmentTracker(cfg)
-    lead = onset_lead_frames(cfg)
-    feeds: list[_Feed] = []
     segments: list[tuple[int, int]] = []
     window = 0
-    next_pos = 0
 
     for pos in range(len(frames)):
         while (window + 1) * VAD_WINDOW_SAMPLES <= (pos + 1) * FRAME_SAMPLES:
@@ -230,23 +195,9 @@ def _listen(pcm: bytes, vad: VoiceActivityDetector, cfg: EndpointingConfig) -> _
             step = tracker.window(speech, first, last)
             if step.closed is not None:
                 segments.append(step.closed)
-        # The first frame the VAD has not scored: the one holding the next window's first
-        # sample, which is what ingress's `_vad_from` names.
-        next_unscored = window * VAD_WINDOW_SAMPLES // FRAME_SAMPLES
-        segment = tracker.open_segment
-        released = spotter_feed(
-            next_pos,
-            pos,
-            segment[0] if segment is not None else None,
-            tracker.earliest_onset(next_unscored),
-            lead,
-        )
-        if released.end > next_pos:
-            _released(feeds, released.warm, released.push)
-            next_pos = released.end
     if tracker.open_segment is not None:
         segments.append(tracker.open_segment)
-    return _Heard(frames=frames, feeds=tuple(feeds), segments=tuple(segments))
+    return _Heard(frames=frames, segments=tuple(segments))
 
 
 def _frames(pcm: bytes) -> tuple[bytes, ...]:
@@ -352,17 +303,17 @@ class _Driver:
         decodes: dict[tuple[int, int], tuple[str, float] | None],
         threshold: float,
     ) -> tuple[_HitResult, ...]:
+        # Every frame once and in order, as ingress pushes them, so every hit is judged. The
+        # harness never resets the stream: it has no mute and no backlog, the only causes of a
+        # reset in ingress, and each recording gets a stream of its own.
         stream = self._engines.spotter.open_stream(threshold)
         results: list[_HitResult] = []
-        for batch in heard.feeds:
-            for position in batch.warm:
-                stream.warm(heard.frames[position], offset + position)
-            for position in batch.push:
-                arrival = self._clock()
-                for found in stream.push(heard.frames[position], offset + position):
-                    results.append(
-                        self._judge(source, heard, found, offset, arrival, gate, reference, decodes)
-                    )
+        for position, frame in enumerate(heard.frames):
+            arrival = self._clock()
+            for found in stream.push(frame, offset + position):
+                results.append(
+                    self._judge(source, heard, found, offset, arrival, gate, reference, decodes)
+                )
         return tuple(results)
 
     def _judge(
@@ -415,19 +366,20 @@ class _Driver:
     def _span(self, heard: _Heard, position: int) -> tuple[int, int]:
         """The frames the gate decodes for a hit: ingress's `from_pos` through the gate tail.
 
-        The start is the earliest segment in the chain reaching the hit, each gap at most
-        `join_gap_ms`, less the pre-roll, and no further back than `lookback_ms`.
+        The start is ingress's own, `name_chain_start`: the earlier of the hit's chain of
+        segments and the spotter's window before the hit, less the pre-roll, raised past an
+        unchained segment's speech, and no further back than `lookback_ms` or the recording's
+        first frame. With no utterance open at the hit, as in the dormant state the bar
+        measures, that is the span ingress opens.
         """
-        segments = [segment for segment in heard.segments if segment[0] <= position]
-        start = position
-        if segments:
-            index = len(segments) - 1
-            while index > 0:
-                gap = segments[index][0] - segments[index - 1][1] - 1
-                if gap * FRAME_MS > self._wake.join_gap_ms:
-                    break
-                index -= 1
-            start = segments[index][0] - self._lead
+        window = -(-self._engines.spotter.window_ms // FRAME_MS)
+        start = name_chain_start(
+            heard.segments,
+            position,
+            join_gap_ms=self._wake.join_gap_ms,
+            pre_roll_frames=self._lead,
+            window_frames=window,
+        )
         start = max(start, position - self._wake.lookback_ms // FRAME_MS, 0)
         end = min(position + self._wake.gate_tail_ms // FRAME_MS, len(heard.frames) - 1)
         return start, end
@@ -532,14 +484,13 @@ def accepted_wakes(
 class AmbientGate:
     """Counts the hits the gate accepts in ambient audio, one file and one threshold at a time.
 
-    Each file goes through the driver as a recording does: the VAD's segments, every frame fed
-    through `spotter_feed` to a fresh stream at the threshold, warmed or pushed as ingress feeds
-    it, and each pushed hit judged as the live gate judges it with no reference and nothing she
-    said, which is the room where she is idle and the PC plays nothing. A warmed hit is never
-    reported, so never gated.
+    Each file goes through the driver as a recording does: the VAD's segments, every frame
+    pushed once and in order to a fresh stream at the threshold as ingress pushes it, and every
+    hit, in speech or in silence, judged as the live gate judges it with no reference and
+    nothing she said, which is the room where she is idle and the PC plays nothing.
 
-    A file is heard by the VAD once: its segments and feeds are kept, and its audio is read
-    again at each threshold, so one file's audio is held at a time. Each span is decoded at most
+    A file is heard by the VAD once: its segments are kept, and its audio is read again at each
+    threshold, so one file's audio is held at a time. Each span is decoded at most
     once per file, whatever the threshold, and a failed decode rejects its hit as it does live.
     `decodes` and `decode_errors` count both across files, and `listen_s` is the clock's time
     spent in the VAD. A log line names a file only as "ambient file <i>", its place in the order

@@ -495,8 +495,8 @@ class _Cooldown:
 def hit_steps(series: Sequence[float], threshold: float, cooldown_steps: int) -> list[int]:
     """The steps of a score series that hit at `threshold`, by the stream's own rule.
 
-    A stream fed the same audio from a fresh warmed context, in any split between `warm` and
-    `push`, finds these hits and reports those in pushed audio.
+    A stream pushed the same audio from a fresh warmed context, in pieces of any size, reports
+    these hits.
 
     Raises:
         ValueError: `cooldown_steps` is negative.
@@ -599,11 +599,7 @@ class _Context:
 
 
 class MicroNameSpotterStream:
-    """One audio source's spotting state: the model's own state, the window and the cooldown.
-
-    `warm` and `push` run the same steps and the same cooldown, so a hit in warmed audio blocks
-    the pushed hits after it as one in pushed audio would; only `push` reports.
-    """
+    """One audio source's spotting state: the model's own state, the window and the cooldown."""
 
     __slots__ = ("_context", "_cooldown", "_model", "_threshold")
 
@@ -626,14 +622,6 @@ class MicroNameSpotterStream:
             NameHit(end_pos=pos, keyword=self._model.keyword, score=score)
             for score in self._hits(pcm)
         ]
-
-    def warm(self, pcm: bytes, pos: int) -> None:
-        """Score audio as `push` does and report nothing; a hit it finds starts the cooldown.
-
-        Raises:
-            SpeechEngineError: As `push`.
-        """
-        self._hits(pcm)
 
     def reset(self, *, warm_up: bool = True) -> None:
         """Start a new context: a new interpreter and frontend, an empty window and cooldown.

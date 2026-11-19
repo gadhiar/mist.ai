@@ -39,13 +39,12 @@ from backend.realtime.ingress import (
     SpeechResumed,
     SpeechSegmentTracker,
     SpeechStarted,
-    SpotterFeed,
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
+    name_chain_start,
     onset_lead_frames,
     ring_retention_ms,
-    spotter_feed,
 )
 from backend.realtime.lanes import InferenceLane, LaneJobCancelled
 from backend.realtime.protocol import Frame, MsgType
@@ -391,7 +390,7 @@ class TestDormantListening:
         assert rig.ingress.idle_since() == 0
 
     @pytest.mark.asyncio
-    async def test_the_spotter_hears_the_speech_and_its_pre_roll_and_no_other_silence(self):
+    async def test_the_spotter_hears_every_frame_speech_and_silence_alike(self):
         spotter = ScriptedNameSpotter()
         rig = Rig(engaged=False, spotter=spotter)
 
@@ -399,10 +398,8 @@ class TestDormantListening:
         await rig.speak(640)
         await rig.quiet(1600)
 
-        pushed = spotter.streams[0].pushed
-        assert pushed == list(range(32 - PRE_ROLL, pushed[-1] + 1))
-        # The segment closes once 200 ms of silence follow the last speech window (frame 63).
-        assert pushed[-1] < 64 + 12
+        # Silence before the pre-roll and after the segment closed is pushed as speech is.
+        assert spotter.streams[0].pushed == list(range(rig.pos))
 
     @pytest.mark.asyncio
     async def test_set_engaged_makes_the_next_speech_open_an_utterance(self):
@@ -1235,14 +1232,16 @@ class TestSeed:
 
 class TestNameHeard:
     @pytest.mark.asyncio
-    async def test_a_name_last_in_one_segment_opens_at_the_segment_less_the_pre_roll(self):
+    async def test_a_name_last_in_one_segment_opens_at_the_window_less_the_pre_roll(self):
         rig = Rig(engaged=False, spotter=ScriptedNameSpotter([hit_at(78)]))
         await rig.quiet(640)
 
         await rig.speak(960)
 
         (heard,) = rig.of(NameHeard)
-        assert heard.from_pos == 32 - PRE_ROLL
+        # The spotter's 1280 ms window (64 frames) and the pre-roll reach back past the
+        # segment's pre-roll, to 78 - 64 - 15, and the first frame bounds that.
+        assert heard.from_pos == 0
         assert heard.hit == hit_at(78)
         assert (heard.utterance_id, heard.reference_score, heard.spotter) == (None, None, "server")
         assert heard.arrival == rig.arrivals[78]
@@ -1267,7 +1266,8 @@ class TestNameHeard:
 
         await rig.speak(640)
 
-        assert [h.from_pos for h in rig.of(NameHeard)] == [112 - PRE_ROLL]
+        # The first segment is not chained and ended before the window less the pre-roll.
+        assert [h.from_pos for h in rig.of(NameHeard)] == [140 - 64 - PRE_ROLL]
 
     @pytest.mark.asyncio
     async def test_a_preamble_longer_than_the_lookback_opens_6000_ms_before_the_hit(self):
@@ -1307,11 +1307,12 @@ class TestNameHeard:
         await rig.speak(640)
 
         assert rig.of(NameHeard) == []
-        assert spotter.streams == [] or spotter.streams[0].pushed == []
+        # Only the frames from before the mute reach the spotter.
+        assert spotter.streams[0].pushed == list(range(32))
 
 
 class LoggedStream(ScriptedNameSpotterStream):
-    """A scripted stream that also logs its calls in order, so warm, push and reset interleave."""
+    """A scripted stream that also logs its calls in order, so pushes and resets interleave."""
 
     def __init__(self, hits: Sequence[NameHit], threshold: float, log: list) -> None:
         super().__init__(hits, threshold)
@@ -1320,10 +1321,6 @@ class LoggedStream(ScriptedNameSpotterStream):
     def push(self, pcm: bytes, pos: int) -> list[NameHit]:
         self.log.append(("push", pos))
         return super().push(pcm, pos)
-
-    def warm(self, pcm: bytes, pos: int) -> None:
-        self.log.append(("warm", pos))
-        super().warm(pcm, pos)
 
     def reset(self, *, warm_up: bool = True) -> None:
         self.log.append(("reset", warm_up))
@@ -1344,15 +1341,15 @@ class LoggedSpotter(ScriptedNameSpotter):
 
 
 def fed_positions(log: Sequence[tuple[str, object]]) -> list[int]:
-    """Every position warmed or pushed, in the order the spotter was fed them."""
+    """Every position pushed, in the order the spotter was fed them."""
     return [typing.cast(int, pos) for kind, pos in log if kind != "reset"]
 
 
-class TestTheSpotterFeed:
-    """Ingress feeds the spotter every frame once and in order, reporting only from speech."""
+class TestTheSpotterHearsEveryFrame:
+    """Ingress pushes the spotter every frame once and in order, and reports every hit."""
 
     @pytest.mark.asyncio
-    async def test_frames_between_two_segments_are_warmed_with_no_reset(self):
+    async def test_every_frame_in_and_between_segments_is_pushed_with_no_reset(self):
         spotter = LoggedSpotter()
         rig = Rig(engaged=False, spotter=spotter)
 
@@ -1364,40 +1361,76 @@ class TestTheSpotterFeed:
 
         (stream,) = spotter.streams
         assert stream.resets == 0
-        fed = fed_positions(spotter.log)
-        assert fed == list(range(len(fed)))
-        assert len(fed) > 176
-        second = 144
-        assert set(range(32 - PRE_ROLL, 64)) <= set(stream.pushed)
-        assert set(range(80, second - PRE_ROLL)) <= set(stream.warmed)
-        assert set(range(second - PRE_ROLL, second + 32)) <= set(stream.pushed)
+        assert {kind for kind, _ in spotter.log} == {"push"}
+        assert fed_positions(spotter.log) == stream.pushed == list(range(rig.pos))
 
     @pytest.mark.asyncio
-    async def test_the_pre_roll_is_pushed_never_warmed_though_the_vad_scored_it_first(self):
+    async def test_each_frame_is_pushed_as_soon_as_it_is_routed(self):
         spotter = LoggedSpotter()
         rig = Rig(engaged=False, spotter=spotter)
         await rig.quiet(640)
         # Frames 32 to 35 are scored as two speech windows: a run, not yet a segment.
         await rig.speak(80)
         (stream,) = spotter.streams
-        assert stream.warmed == list(range(32 - PRE_ROLL))
-        assert stream.pushed == []
+        assert stream.pushed == list(range(36))
 
         # Frame 36 completes the third window, and the segment opens at frame 32.
         await rig.speak(20)
 
-        assert stream.warmed == list(range(32 - PRE_ROLL))
-        assert stream.pushed == list(range(32 - PRE_ROLL, 37))
+        assert stream.pushed == list(range(37))
 
     @pytest.mark.asyncio
-    async def test_a_scripted_hit_on_a_warmed_frame_is_not_reported(self):
-        spotter = LoggedSpotter([hit_at(5)])
+    async def test_every_frame_the_ring_holds_is_pushed_once_the_vad_queue_s_drops_too(self):
+        spotter = LoggedSpotter()
         rig = Rig(engaged=False, spotter=spotter)
+        for _ in range(150):
+            await rig.quiet(20, settle_after=False)
+        await settle(500)
 
         await rig.quiet(640)
 
-        assert 5 in spotter.streams[0].warmed
-        assert rig.of(NameHeard) == []
+        assert rig.ingress.stats().queue_dropped_frames == 50
+        assert {kind for kind, _ in spotter.log} == {"push"}
+        assert fed_positions(spotter.log) == list(range(rig.pos))
+
+    @pytest.mark.asyncio
+    async def test_a_hit_in_silence_with_no_segment_is_reported_with_its_window(self):
+        spotter = LoggedSpotter([hit_at(90)])
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(2000)
+
+        (heard,) = rig.of(NameHeard)
+        assert heard.hit == hit_at(90)
+        assert heard.from_pos == 90 - 64 - PRE_ROLL
+
+    @pytest.mark.asyncio
+    async def test_a_hit_in_silence_after_a_segment_closed_is_reported_and_chained(self):
+        spotter = LoggedSpotter([hit_at(100)])
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(1600)
+
+        # The segment (32 to about 63) closed before frame 100, less than 1000 ms before it.
+        (heard,) = rig.of(NameHeard)
+        assert heard.hit == hit_at(100)
+        assert heard.from_pos == 32 - PRE_ROLL
+
+    @pytest.mark.asyncio
+    async def test_a_hit_in_a_pre_roll_is_reported_as_it_is_heard(self):
+        spotter = LoggedSpotter([hit_at(95)])
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(2000)
+
+        (heard,) = rig.of(NameHeard)
+        await rig.speak(640)
+
+        # Reported before the onset at frame 100 that makes frame 95 pre-roll, so with no
+        # segment yet it spans the window less the pre-roll.
+        assert rig.of(NameHeard) == [heard]
+        assert heard.from_pos == 95 - 64 - PRE_ROLL
 
     @pytest.mark.asyncio
     async def test_a_mute_resets_the_stream_and_no_frame_from_before_it_is_fed_after_it(self):
@@ -1416,7 +1449,7 @@ class TestTheSpotterFeed:
         reset_at = log.index(("reset", True))
         before = fed_positions(log[:reset_at])
         after = fed_positions(log[reset_at + 1 :])
-        assert before == list(range(32 - PRE_ROLL))
+        assert before == list(range(32))
         assert after and after == list(range(unmuted_at, unmuted_at + len(after)))
         assert len(spotter.streams) == 1
 
@@ -1528,7 +1561,8 @@ class TestTheSpotterFeed:
     def test_the_docstrings_say_what_kws_overload_and_skipped_kws_hops_count(self):
         assert "KWS_BACKLOG_FRAMES" in (IngressOverload.__doc__ or "")
         assert "skipped_kws_hops" in (IngressStats.__doc__ or "")
-        assert "every frame" in (spotter_feed.__doc__ or "")
+        assert "every frame" in (ingress_module.__doc__ or "")
+        assert "every hit" in (ingress_module.__doc__ or "")
 
 
 class UnopenableSpotter(LoggedSpotter):
@@ -1579,7 +1613,7 @@ class TestTheSpotterLane:
         assert submitted.count("open_stream") == 1
         (stream,) = spotter.streams
         assert stream.threshold == WakeConfig().kws_threshold
-        assert stream.warmed
+        assert stream.pushed
 
     @pytest.mark.asyncio
     async def test_an_open_that_fails_turns_the_spotter_off_and_the_utterance_still_ends(
@@ -2255,51 +2289,50 @@ class TestSpeechSegmentTracker:
         (step,) = windows(tracker, 9, 1, speech=True)
         assert step.started == (7 * 512 // FRAME_SAMPLES, (9 * 512 + 511) // FRAME_SAMPLES)
 
-    def test_with_no_run_the_earliest_onset_is_the_first_unscored_frame(self):
-        tracker = SpeechSegmentTracker(EndpointingConfig())
-        windows(tracker, 0, 2, speech=False)
 
-        assert tracker.earliest_onset(4) == 4
-
-    def test_while_a_run_is_under_way_the_earliest_onset_is_its_first_frame(self):
-        tracker = SpeechSegmentTracker(EndpointingConfig())
-        windows(tracker, 0, 2, speech=False)
-        windows(tracker, 2, 2, speech=True)
-
-        assert tracker.earliest_onset(7) == 3
-
-        windows(tracker, 4, 1, speech=False)
-        assert tracker.earliest_onset(8) == 8
+WINDOW = 64  # the scripted spotter's 1280 ms window in 20 ms frames
+LEAD = WINDOW + PRE_ROLL
 
 
-class TestSpotterFeed:
-    def test_with_a_segment_open_frames_before_its_pre_roll_are_warmed_and_the_rest_pushed(self):
-        assert spotter_feed(10, 60, 40, 40, PRE_ROLL) == SpotterFeed(
-            warm=range(10, 40 - PRE_ROLL), push=range(40 - PRE_ROLL, 61)
-        )
+class TestNameChainStart:
+    """A server hit's gate span starts at its chain of segments or its window, less the pre-roll.
 
-    def test_with_a_segment_open_a_pre_roll_partly_fed_is_pushed_from_the_next_frame(self):
-        feed = spotter_feed(30, 60, 40, 40, PRE_ROLL)
-
-        assert (list(feed.warm), feed.push) == ([], range(30, 61))
-
-    def test_with_none_open_frames_an_onset_could_make_pre_roll_wait(self):
-        feed = spotter_feed(10, 60, None, 50, PRE_ROLL)
-
-        assert (feed.warm, list(feed.push)) == (range(10, 50 - PRE_ROLL), [])
-
-    def test_with_none_open_and_no_onset_possible_by_the_newest_frame_all_are_warmed(self):
-        feed = spotter_feed(10, 60, None, 100, PRE_ROLL)
-
-        assert (feed.warm, list(feed.push)) == (range(10, 61), [])
+    Each case is `(segments, hit, start)` at the defaults: a 1000 ms join gap (50 frames), a
+    300 ms pre-roll (15 frames) and the scripted spotter's 1280 ms window (64 frames).
+    """
 
     @pytest.mark.parametrize(
-        ("next_pos", "onset", "earliest"), [(61, 40, 40), (40, None, 50), (35, None, 50)]
+        ("segments", "hit", "start"),
+        [
+            pytest.param([(100, 400)], 380, 100 - PRE_ROLL, id="inside a long segment"),
+            pytest.param([(200, 230)], 237, 237 - LEAD, id="150 ms after a short segment"),
+            pytest.param([], 300, 300 - LEAD, id="no segment"),
+            pytest.param([(400, 500)], 300, 300 - LEAD, id="only a segment after the hit"),
+            pytest.param(
+                [(100, 150), (196, 260)], 250, 100 - PRE_ROLL, id="a 900 ms gap joins the chain"
+            ),
+            pytest.param(
+                [(100, 180), (232, 250)], 252, 181, id="an unchained segment inside the window"
+            ),
+            pytest.param(
+                [(100, 180)], 236, 181, id="an old segment 1.1 s before an unsegmented name"
+            ),
+            pytest.param(
+                [(100, 180)], 281, 281 - LEAD, id="a segment 2 s before ends outside the window"
+            ),
+        ],
     )
-    def test_nothing_is_released_twice_or_early(self, next_pos, onset, earliest):
-        feed = spotter_feed(next_pos, 60, onset, earliest, PRE_ROLL)
-
-        assert (list(feed.warm), list(feed.push)) == ([], [])
+    def test_the_table(self, segments, hit, start):
+        assert (
+            name_chain_start(
+                segments,
+                hit,
+                join_gap_ms=1000,
+                pre_roll_frames=PRE_ROLL,
+                window_frames=WINDOW,
+            )
+            == start
+        )
 
     def test_the_pre_roll_in_frames_comes_from_the_endpointing_config(self):
         assert onset_lead_frames(EndpointingConfig()) == PRE_ROLL

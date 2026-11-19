@@ -3,14 +3,15 @@
 Every engine call runs on an inference lane (`lanes.py`), so ingress itself only keeps state and
 schedules work. One worker task consumes the frames in arrival order: it cuts them into
 512-sample VAD windows, marks speech segments, routes frames into the open utterance's
-transcriber stream, and feeds the name spotter on the `kws` lane every frame the ring holds,
-once and in order, reporting names only from a segment and its pre-roll (`spotter_feed`).
-Partial decodes, the final decode and the end-of-turn score run as their own tasks, so silence
-keeps being measured while they are in flight, and a resume can cancel them.
+transcriber stream, and pushes the name spotter on the `kws` lane every frame the ring holds,
+once and in order as each is routed, reporting every hit it finds, in speech or in silence;
+the addressee gate, not the VAD, decides what a hit means. Partial decodes, the final decode
+and the end-of-turn score run as their own tasks, so silence keeps being measured while they are
+in flight, and a resume can cancel them.
 
 Ingress listens in one of two ways (Design, wake by name, item 1). Dormant, VAD marks segments
-and the spotter hears them, but nothing is transcribed. Engaged, VAD speech also opens an
-utterance. A wake utterance is opened by the controller through `open_utterance`, from the
+and the spotter hears every frame, but nothing is transcribed. Engaged, VAD speech also opens
+an utterance. A wake utterance is opened by the controller through `open_utterance`, from the
 `from_pos` of a `NameHeard`, with backfill from the ring of recent frames.
 
 Audio is kept, stamped and cut by the session's frame position, never by the uplink `seq`, which
@@ -23,7 +24,7 @@ import asyncio
 import bisect
 import logging
 from collections import OrderedDict, deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
 
@@ -174,70 +175,61 @@ class SpeechSegmentTracker:
         self._run = 0
         return segment
 
-    def earliest_onset(self, next_unscored: int) -> int:
-        """The earliest frame a segment not yet open can start at.
 
-        A segment opens at the first frame of its run, so while a run is under way that is the
-        run's first frame; with none, a run can only begin in a window not yet scored, which
-        starts at or after `next_unscored`, the first frame the VAD has not scored.
-        """
-        return self._run_start if self._run else next_unscored
+def name_chain_start(
+    segments: Sequence[tuple[int, int]],
+    hit_pos: int,
+    *,
+    join_gap_ms: int,
+    pre_roll_frames: int,
+    window_frames: int,
+) -> int:
+    """Where a server name hit's gate span starts, before the caller's bounds.
 
+    The spotter hears every frame, so a hit can come with no segment before it, or after its
+    segment closed, and the name it heard lies in the spotter's window before the hit whatever
+    the VAD made of it. The window is therefore in the decode: with no segment, a decode from
+    the hit would hold only the audio after the name.
 
-@dataclass(frozen=True, slots=True)
-class SpotterFeed:
-    """The frames one `spotter_feed` call releases: `warm` first, then `push`, both in order."""
+    The chain walks back from the hit. A segment `(onset, last speech frame)` that starts at or
+    before the hit joins when the gap from its last speech frame to the next element, the hit
+    or the next chained segment, is at most `join_gap_ms`. The start is the earlier of the first
+    chained segment's onset less `pre_roll_frames`, and `hit_pos` less `window_frames` (the
+    spotter's `window_ms` in whole frames, rounded up) less `pre_roll_frames`; with no chained
+    segment, the second alone.
 
-    warm: range
-    push: range
-
-    @property
-    def end(self) -> int:
-        """The first frame after those released, from which the next call starts."""
-        return self.push.stop if self.push else self.warm.stop
-
-
-def _span(start: int, stop: int) -> range:
-    return range(start, max(start, stop))
-
-
-def spotter_feed(
-    next_pos: int, newest: int, onset: int | None, earliest_onset: int, pre_roll_frames: int
-) -> SpotterFeed:
-    """Which frames the name spotter scores next: some warmed, some pushed, none twice.
-
-    The spotter hears every frame, once and in order, as one stream. A streaming model carries
-    its state from step to step and runs without a break on the device, so starting it cold at
-    each speech onset would score every name from a state it never has there. And fed one
-    stretch of audio from one start, the stream finds the hits the server's measured bar counts
-    over that audio; it reports the ones in pushed frames, so the hits it reports are a subset
-    of the measured ones. Only a speech segment and its pre-roll are pushed, since ingress
-    never reports a name heard outside speech; every other frame is warmed, scored and never
-    reported.
-
-    `next_pos` is the first frame not yet fed, `newest` the newest routed frame, `onset` the
-    open segment's first frame or None, and `earliest_onset` the earliest frame a segment not
-    yet open can start at (`SpeechSegmentTracker.earliest_onset`). With a segment open, frames
-    before its pre-roll are warmed and the rest pushed through `newest`. With none open,
-    frames are warmed only up to `pre_roll_frames` before `earliest_onset`; later ones wait,
-    because an onset may still make them pre-roll, and a warmed frame can never be reported.
-    While a segment is open nothing waits, so the wait delays no reported hit.
+    Then, if an unchained segment that started before the hit has its last speech frame at or
+    after that start, the start moves to the frame after it, so no unrelated speech enters the
+    decode. Such a segment ended more than `join_gap_ms` before the hit or the chain, so the
+    raise never cuts into the chain, and it cuts the window only where the window and the
+    pre-roll reach back further than `join_gap_ms`. What it cuts ended more than `join_gap_ms`
+    before the hit, where the name is not. `segments` are in order and need not all start
+    before the hit; the rest are ignored. Ingress and the wake harness both call this, each
+    bounding the result as it bounds a span.
     """
-    if onset is not None:
-        start = onset - pre_roll_frames
-        return SpotterFeed(
-            warm=_span(next_pos, min(newest + 1, start)),
-            push=_span(max(start, next_pos), newest + 1),
-        )
-    warm = _span(next_pos, min(newest, earliest_onset - pre_roll_frames - 1) + 1)
-    return SpotterFeed(warm=warm, push=range(warm.stop, warm.stop))
+    before = [segment for segment in segments if segment[0] <= hit_pos]
+    chain_from = len(before)
+    following = hit_pos
+    while chain_from > 0:
+        onset, last = before[chain_from - 1]
+        if (following - last - 1) * FRAME_MS > join_gap_ms:
+            break
+        chain_from -= 1
+        following = onset
+    start = hit_pos - window_frames - pre_roll_frames
+    if chain_from < len(before):
+        start = min(start, before[chain_from][0] - pre_roll_frames)
+    for _, last in before[:chain_from]:
+        if last >= start:
+            start = last + 1
+    return start
 
 
 def onset_lead_frames(cfg: EndpointingConfig) -> int:
     """The pre-roll, `pre_roll_ms`, in whole frames.
 
-    Ingress opens an utterance, pushes to the spotter and starts a wake chain this many frames
-    before a speech onset, and the wake harness reads the same number from here.
+    Ingress opens an utterance and starts a wake chain this many frames before a speech onset,
+    and the wake harness reads the same number from here.
     """
     return cfg.pre_roll_ms // FRAME_MS
 
@@ -572,22 +564,19 @@ class _Utterance:
 
 def _spotter_job(
     stream: NameSpotterStream,
-    frames: tuple[tuple[bytes, int, bool], ...],
+    frames: tuple[tuple[bytes, int], ...],
     reset_warm_up: bool | None,
 ) -> list[NameHit]:
-    """One `kws` lane job: a fresh context first when asked, then each frame warmed or pushed.
+    """One `kws` lane job: a fresh context first when asked, then each frame pushed in order.
 
     `reset_warm_up` is None for no reset, else the reset's `warm_up`. Each frame is
-    `(pcm, pos, push)`; only pushed frames can give hits.
+    `(pcm, pos)`.
     """
     if reset_warm_up is not None:
         stream.reset(warm_up=reset_warm_up)
     hits: list[NameHit] = []
-    for pcm, pos, push in frames:
-        if push:
-            hits.extend(stream.push(pcm, pos))
-        else:
-            stream.warm(pcm, pos)
+    for pcm, pos in frames:
+        hits.extend(stream.push(pcm, pos))
     return hits
 
 
@@ -680,11 +669,11 @@ class AudioIngress:
 
         # The spotter's feed: `_kws_next` is the first frame not yet released to it (None until
         # the stream's start is known), `_kws_waiting` the released frames no job has taken,
-        # each with whether it is pushed, and `_kws_reset` a pending reset's `warm_up`.
-        # `_kws_off` is set when the stream could not be opened: nothing more is fed.
+        # and `_kws_reset` a pending reset's `warm_up`. `_kws_off` is set when the stream could
+        # not be opened: nothing more is fed.
         self._kws_stream: NameSpotterStream | None = None
         self._kws_next: int | None = None
-        self._kws_waiting: deque[tuple[_Frame, bool]] = deque()
+        self._kws_waiting: deque[_Frame] = deque()
         self._kws_busy = False
         self._kws_off = False
         self._kws_reset: bool | None = None
@@ -695,6 +684,8 @@ class AudioIngress:
         spotter = engines.spotter
         lead_ms = (spotter.window_ms if spotter else 0) + wake.reference_tolerance_ms
         self._reference_cap = -(-lead_ms // FRAME_MS)
+        # The spotter's window in whole frames, rounded up: the audio a hit's name lies in.
+        self._kws_window = -(-spotter.window_ms // FRAME_MS) if spotter else 0
         self._endpoint_wake: _EndpointWake | None = None
 
         self._frames_received = 0
@@ -1099,11 +1090,12 @@ class AudioIngress:
             self._send(SpeechStarted(self._epoch, self._stamp(), utt.id, utt.first_pos))
 
     def _chain_from(self, hit_pos: int, lower: int | None) -> int:
-        """Where a wake utterance for a hit at `hit_pos` opens (Design, item 2).
+        """Where a wake utterance for an endpoint's hit at `hit_pos` opens (Design, item 2).
 
         The start of the earliest segment in the chain reaching the hit, each gap at most
         `join_gap_ms`, less the pre-roll; bounded below by the lookback, the floor, the ring's
-        oldest frame and, for an endpoint, the backlog's first frame.
+        oldest frame and, for an endpoint, the backlog's first frame. A server hit's start is
+        `_name_from`'s.
         """
         segments = [segment for segment in self._segments if segment[0] <= hit_pos]
         current = self._tracker.open_segment
@@ -1125,37 +1117,51 @@ class AudioIngress:
             bounds.append(lower)
         return max(bounds)
 
+    def _name_from(self, hit_pos: int) -> int:
+        """Where a wake utterance for a server hit at `hit_pos` opens.
+
+        `name_chain_start` over the segments the VAD has marked, the open one with its last
+        speech frame so far, bounded below by the lookback, the floor and the ring's oldest
+        frame, as `_chain_from` bounds an endpoint's.
+        """
+        segments = list(self._segments)
+        current = self._tracker.open_segment
+        if current is not None:
+            segments.append(current)
+        start = name_chain_start(
+            segments,
+            hit_pos,
+            join_gap_ms=self._wake.join_gap_ms,
+            pre_roll_frames=self._pre_roll,
+            window_frames=self._kws_window,
+        )
+        bounds = [start, hit_pos - self._wake.lookback_ms // FRAME_MS, self._floor]
+        if self._ring:
+            bounds.append(self._ring[0].pos)
+        return max(bounds)
+
     # -- Name spotting ----------------------------------------------------------------------------
 
     def _feed_spotter(self) -> None:
-        """Release the frames `spotter_feed` allows, from the ring by position, to the spotter.
+        """Release every frame through the newest routed one, from the ring by position.
 
-        Called after each routed frame. Frames the VAD queue dropped, and a seeded ingress's
-        frames before `vad_from`, are in the ring though never routed, and are released all
-        the same. A position the ring no longer holds is skipped.
+        Called after each routed frame, so each frame is pushed once and in order as soon as it
+        is routed, speech or not, and every hit the stream finds is reported. A streaming model
+        carries its state from step to step and runs without a break on the device, so the
+        stream is never started cold at a speech onset. Frames the VAD queue dropped, and a
+        seeded ingress's frames before `vad_from`, are in the ring though never routed, and are
+        released all the same. A position the ring no longer holds is skipped.
         """
         if self._engines.spotter is None or self._kws_off or self._kws_next is None:
             return
         newest = self._processed_pos
-        next_unscored = self._vad_from()
-        if newest is None or next_unscored is None:
+        if newest is None or self._closed or self._muted or newest < self._kws_next:
             return
-        segment = self._tracker.open_segment
-        feed = spotter_feed(
-            self._kws_next,
-            newest,
-            segment[0] if segment is not None else None,
-            self._tracker.earliest_onset(next_unscored),
-            self._pre_roll,
-        )
-        if feed.end <= self._kws_next:
-            return
-        for positions, push in ((feed.warm, False), (feed.push, True)):
-            for pos in positions:
-                frame = self._by_pos.get(pos)
-                if frame is not None:
-                    self._kws_waiting.append((frame, push))
-        self._kws_next = feed.end
+        for pos in range(self._kws_next, newest + 1):
+            frame = self._by_pos.get(pos)
+            if frame is not None:
+                self._kws_waiting.append(frame)
+        self._kws_next = newest + 1
         if self._kws_busy:
             self._bound_spotter_backlog()
         else:
@@ -1187,7 +1193,7 @@ class AudioIngress:
         spotter = self._engines.spotter
         if spotter is None or self._kws_busy or self._closed or not self._kws_waiting:
             return
-        frames = tuple((item.payload, item.pos, push) for item, push in self._kws_waiting)
+        frames = tuple((item.payload, item.pos) for item in self._kws_waiting)
         self._kws_waiting.clear()
         reset, self._kws_reset = self._kws_reset, None
         stream = self._kws_stream
@@ -1200,7 +1206,7 @@ class AudioIngress:
     async def _run_spotter(
         self,
         stream: NameSpotterStream | None,
-        frames: tuple[tuple[bytes, int, bool], ...],
+        frames: tuple[tuple[bytes, int], ...],
         reset: bool | None,
         generation: int,
     ) -> None:
@@ -1305,7 +1311,7 @@ class AudioIngress:
                 event_seq=self._stamp(),
                 hit=hit,
                 arrival=arrival,
-                from_pos=self._chain_from(hit.end_pos, None),
+                from_pos=self._name_from(hit.end_pos),
                 utterance_id=utt.id if in_utterance and utt is not None else None,
                 reference_score=reference,
             )
