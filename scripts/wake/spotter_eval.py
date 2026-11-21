@@ -1,36 +1,44 @@
-"""The server spotter's pass bar, measured after the addressee gate over ambient audio.
+"""The server spotter's pass bar, measured through the wake verifier over ambient audio.
 
 The bar, set by the lead on 18 Nov 2026 and measured after the gate on Raj's go of 18 Nov: at one
 cutoff c, the gate accepts a hit on at least ceil(14n/18) of the n `tune` positives of the
 recording manifest (the gated wakes), and accepts at most 0.5 hits an hour on the ambient set
 (the gated false wakes). A hit counts by what she does with it, not by what the spotter hears:
 each runs through `eval_wake`'s offline driver of the live path, the VAD's segments, the spotter
-pushed every frame as ingress pushes it, the gate's pre-decode checks, the gate decode with the
-`--stt-factory` STT, and `decide` on its text.
+pushed every frame as ingress pushes it, the gate's pre-decode checks, and the `--verifier`
+wake verifier's score of the window `verify_window` takes around the hit, against its
+threshold for the cutoff.
 
-    python -m scripts.wake.spotter_eval --manifest <recordings> --model <id> --ambient <dir> \
-        --out <eval.json> --stt-factory <module>:<callable> [--cutoffs <list>] \
+    python -m scripts.wake.spotter_eval --manifest <recordings> --model <id> --verifier <id> \
+        --ambient <dir> --out <eval.json> [--cutoffs <list>] [--endpoint-cutoff <x>] \
         [--min-hours 8] [--models-dir <dir>]
 
 Which cutoff, as Raj ruled on 18 Nov (A60, option A): the gated wakes are measured at every
 cutoff, and c is the highest cutoff with enough of them. Every cutoff is checked, because gated
-wakes need not fall as the cutoff rises: an early hit can be decoded before the words that
-address her. The ambient set is gated at c alone, and the bar passes when c's gated rate is at
-most 0.5 an hour. Its failure mode: when no cutoff has enough gated wakes, or c's gated rate is
-above 0.5, no cutoff passes, and a lower cutoff with enough wakes that would pass is never run.
-`--cutoffs` narrows the grid for both measurements, so `--cutoffs <x>` gates x alone when x has
-enough gated wakes. A cutoff not gated prints "not run".
+wakes need not fall as the cutoff rises: the verifier's threshold table does not increase with
+the cutoff, so a higher cutoff can read a lower threshold. The ambient set is gated at c alone,
+and the bar passes when c's gated rate is at most 0.5 an hour. Its failure mode: when no cutoff
+has enough gated wakes, or c's gated rate is above 0.5, no cutoff passes, and a lower cutoff
+with enough wakes that would pass is never run. `--cutoffs` narrows the grid for both
+measurements, so `--cutoffs <x>` gates x alone when x has enough gated wakes. A cutoff not gated
+prints "not run".
 
 The gate runs as the live session runs it with nothing playing and nothing said by her: with no
 reference score and no recent text of hers, the self-media and self-speech checks pass every hit,
-as they do live in a room where she is idle and the PC plays nothing, and `decide` reads the gate
-decode of ingress's span. Every frame of an ambient file is pushed once and in order to one
-stream at c, as ingress pushes it, and every hit the stream reports, in speech or in silence, is
-gated. The gated count counts accepted hits, the count `eval_wake` reports. It is neither a
-strict upper nor a strict lower bound on the turns she would open: live, a hit is
-dropped while she is held, while another candidate waits or within a published utterance, which
-makes the count high; and live she reads a finished utterance's final transcript where this
-decodes ingress's span, and that text can be accepted where the span's was not.
+as they do live in a room where she is idle and the PC plays nothing, and the verifier scores
+each hit's window. Every frame of an ambient file is pushed once and in order to one stream at
+c, as ingress pushes it, and every hit the stream reports, in speech or in silence, is gated.
+The gated count counts accepted hits, the count `eval_wake` reports. It is not the count of
+turns she would open: live, a hit is dropped while she is held, while another candidate waits or
+within a published utterance, which makes the count high; and live a lost frame or a mute can
+shorten a hit's window, which this never sees.
+
+`--endpoint-cutoff x` (H11 passes the device's 0.847) adds one line beside the bar: the server
+spotter's figures at x, spotter-only and gated, over the tune positives and the ambient set. It
+is a proxy for the endpoint path, whose device spotter fires at x and whose hits the verifier
+judges: here the server spotter's hits at x are judged, on the audio the server hears. The
+ambient set is gated at x through the same `AmbientGate` as at c, so a window scored at c is
+not scored again. It changes neither the evaluation nor the bar.
 
 The spotter-only figures are T63's, printed beside the gated ones. A positive wakes at cutoff c
 when its `score_window`, the highest score over the recording from a fresh warmed context, is at
@@ -41,9 +49,9 @@ a fresh warmed context at the file's start, then `hit_steps` at each cutoff with
 as one stream too, and reports every hit it finds (`backend/realtime/ingress.py`). So on the
 same audio from the same start, with no reset or backlog drop in between, the hits ingress
 reports equal the hits counted here, and the spotter-only rate is the shipped one. Every server
-hit that passes the self-speech check sends `attend`, ducks her while she speaks and costs a
-gate decode, so the spotter-only rate at c bounds the `attend` cues an hour from ambient sound;
-the gated bar does not limit them.
+hit that passes the self-speech check ducks her playback while she speaks and costs a verify
+call, so the spotter-only rate at c bounds those ducks and verify calls an hour from ambient
+sound; the gated bar does not limit them.
 
 The output is the converter's evaluation, spotter-only and from the one scoring pass, so it keeps
 that equality: exactly `cutoffs`, `false_accepts_per_hour` and `positive_scores`, which
@@ -53,27 +61,33 @@ that rise with the cutoff, and so does this, writing nothing.
 Only `tune` positives are scored. `load_manifest` checks every entry's file, reading it for its
 format and its sha256, so `train` and `test` audio is read there, but no `train` or `test` entry
 is scored. A model whose `training` is not the sha256 of this manifest's `train` subset is
-refused, as `eval_wake` refuses it.
+refused, as `eval_wake` refuses it, and so is a verifier `eval_wake.checked_verifier` refuses.
+Before anything is scored, every `tune` and `test` entry's sha256, and every ambient file's,
+read whole for it, is checked against the files the verifier's provenance lists: a recording
+that trained the verifier is refused, by count, never by name.
 
-What it prints is counts, rates, hours and timings, never a file name or a transcript: the
-ambient hours, the scoring's wall time and its real-time factor (the cost, per session, of
-ingress feeding the spotter every frame), a gate line for the tune positives, the ambient VAD
-pass's wall time and a gate line for the gated cutoff, each gate line with its decodes, failed
-decodes and wall time; then the gate checks (`check_lines`) at the bar's cutoff when it passes,
-else at the highest cutoff with enough spotter-only wakes: each tune positive's first hit by
-its gate check, overall and for the name said alone or in a sentence, the word the decode wrote
-at it, and where it landed against the VAD's segments; and, when the ambient set was gated, its
+What it prints is counts, rates, hours and timings, never a file name or a transcript: what the
+provenance lists and what was checked against it, the ambient hours, the scoring's wall time
+and its real-time factor (the cost, per session, of ingress feeding the spotter every frame), a
+gate line for the tune positives, the ambient VAD pass's wall time and a gate line for the gated
+cutoff, each gate line with its verifies, failed verifies, short windows and wall time; the
+endpoint proxy line when asked for; the verifier's windows with their p50 and p90 times, and the
+accept estimate, `after_ms` plus those times; then the gate checks (`check_lines`) at the bar's
+cutoff when it passes, else at the highest cutoff with enough spotter-only wakes: each tune
+positive's first hit by its gate check, overall and for the name said alone or in a sentence,
+and where it landed against the VAD's segments; and, when the ambient set was gated, its
 reported hits split into those from a segment's pre-roll to 500 ms past its speech and the
 rest. Then each cutoff's wakes and false wakes, spotter-only and gated, and
 `bar: pass at <c>` or `bar: no cutoff passes`. Each progress line is flushed as its pass ends. A
 log line names an ambient file only as "ambient file <i>", its place in name order. Exit 0 when
 the evaluation is written and the bar passes, 1 when it is written and no cutoff passes, 2 when
-the run is refused and nothing is written (an existing `--out`, or a missing or bad
-`--stt-factory`, included). A refusal of an ambient WAV names the file.
+the run is refused and nothing is written (an existing `--out`, or a missing, bad or absent
+`--verifier`, included). A refusal of an ambient WAV's format names the file.
 """
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -92,16 +106,20 @@ from backend.realtime.engines.kws import hit_steps, read_manifest
 from backend.realtime.errors import SpeechEngineError
 
 from .eval_wake import (
+    EVALUATED_SPLITS,
     SPLIT_POST_ROLL_MS,
     AmbientGate,
-    DecodeCounts,
     EngineLoader,
     Engines,
     GateChecks,
+    Provenance,
     RefusedError,
+    VerifyCounts,
     accepted_wakes,
+    checked_verifier,
     gate_checks,
     real_engines,
+    verifier_id,
 )
 from .manifest import Entry, ManifestError, load_manifest, read_pcm16, subset_sha256
 
@@ -147,8 +165,10 @@ class Evaluation:
     """One run's measurement: the converter's three lists and what the printed lines report.
 
     `gated_wakes` holds every cutoff's gated wakes, and `gated_false_wakes` the gated false
-    wakes of the cutoffs gated on the ambient set, None for the rest. `gate_wall_s`, `decodes`
-    and `decode_errors` cover both gated passes.
+    wakes of the cutoffs gated on the ambient set, None for the rest. `gate_wall_s` covers every
+    gated pass. `decodes` and `decode_errors` count the verifier's windows scored and its failed
+    scores over the bar's gated passes and the endpoint proxy's; they keep the names the
+    converter's test builds an evaluation with.
     """
 
     cutoffs: tuple[float, ...]
@@ -249,9 +269,6 @@ def checks_cutoff(
     return max((cutoff for cutoff in cutoffs if wakes_at(cutoff, scores) >= needed), default=None)
 
 
-_AT_HIT_ORDER = ("name", "alias", "other", "none", "no_timings")
-
-
 def _counts(counts: Mapping[str, int]) -> str:
     return ", ".join(f"{key} {value}" for key, value in sorted(counts.items())) or "none"
 
@@ -261,9 +278,6 @@ def check_lines(cutoff: float, checks: GateChecks) -> list[str]:
     prefix = f"gate checks at {cutoff}:"
     alone = checks.first_hit_by_group["name_alone"]
     sentence = checks.first_hit_by_group["sentence"]
-    words = ", ".join(
-        f"{key.replace('_', ' ')} {checks.at_hit.get(key, 0)}" for key in _AT_HIT_ORDER
-    )
     lags = sorted(lag for place, lag in checks.places if place == "after" and lag is not None)
     after = f"after a segment {len(lags)}"
     if lags:
@@ -276,10 +290,42 @@ def check_lines(cutoff: float, checks: GateChecks) -> list[str]:
         f"{_counts(checks.first_hit)}",
         f"{prefix} name alone {sum(alone.values())}: {_counts(alone)}; "
         f"in a sentence {sum(sentence.values())}: {_counts(sentence)}",
-        f"{prefix} word at the first hit: {words}",
         f"{prefix} first hit inside a segment {inside}, {after}, "
         f"with no segment before it {unsegmented}",
     ]
+
+
+def _gate_line(counts: VerifyCounts) -> str:
+    """A gate line's verifier counts."""
+    return (
+        f"{counts.verifies} verifies, {counts.failures} failed, "
+        f"{counts.short_windows} short windows"
+    )
+
+
+def _ms(value: object) -> str:
+    return "none" if value is None else f"{value} ms"
+
+
+def verify_lines(counts: VerifyCounts, after_ms: int) -> list[str]:
+    """The verifier's windows and times over the gated passes, and the accept estimate."""
+    accept = counts.accept_ms(after_ms)
+    return [
+        f"verify: {counts.verifies} windows, {counts.failures} failed, "
+        f"{counts.short_windows} short windows, {counts.wall_s:.1f} s wall, "
+        f"p50 {_ms(counts.p50_ms)}, p90 {_ms(counts.p90_ms)}",
+        f"accept: p50 {_ms(accept['p50'])}, p90 {_ms(accept['p90'])}, "
+        f"after_ms {after_ms} plus the measured verify time",
+    ]
+
+
+def provenance_line(provenance: Provenance, entries: int, ambient: int) -> str:
+    """What the verifier's provenance lists and what was checked against it, by count."""
+    return (
+        f"provenance: {len(provenance.files)} files listed from {len(provenance.sources)} "
+        f"sources, {provenance.hours:.3f} hours; {entries} tune and test entries and {ambient} "
+        "ambient files checked, none listed"
+    )
 
 
 # -- Inputs -----------------------------------------------------------------------------------
@@ -298,6 +344,21 @@ def _cutoffs(value: str | None) -> tuple[float, ...]:
     if len(set(parsed)) != len(parsed):
         raise RefusedError(f"--cutoffs lists a cutoff twice: {value!r}")
     return tuple(sorted(parsed))
+
+
+def _endpoint_cutoff(value: str | None) -> float | None:
+    """The `--endpoint-cutoff`, above 0 and at most 1, or None when not given."""
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise RefusedError(f"--endpoint-cutoff must be a number, got {value!r}") from exc
+    if not math.isfinite(parsed) or not 0.0 < parsed <= 1.0:
+        raise RefusedError(
+            f"--endpoint-cutoff must be above 0 and at most 1, the scores' scale; got {value!r}"
+        )
+    return parsed
 
 
 def _ambient_file(path: Path) -> AmbientFile:
@@ -339,6 +400,15 @@ def _ambient(directory: Path, min_hours: float) -> tuple[AmbientFile, ...]:
     return files
 
 
+def _ambient_sha256(item: AmbientFile, number: int) -> str:
+    """The sha256 of one ambient file's bytes, as the provenance lists a file."""
+    try:
+        with item.path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError as exc:
+        raise RefusedError(f"ambient file {number} could not be read: {exc.strerror}") from exc
+
+
 def _hours(files: Sequence[AmbientFile]) -> float:
     return sum(item.samples for item in files) / SAMPLE_RATE / 3600
 
@@ -348,12 +418,13 @@ def _hours(files: Sequence[AmbientFile]) -> float:
 
 @dataclass(frozen=True, slots=True)
 class _Scored:
-    """The spotter-only figures from the one scoring pass."""
+    """The spotter-only figures from the one scoring pass, and the endpoint cutoff's hits."""
 
     false_wakes: tuple[int, ...]
     rates: tuple[float, ...]
     scores: tuple[float, ...]
     wall_s: float
+    endpoint_false_wakes: int | None
 
 
 def _score(
@@ -362,25 +433,30 @@ def _score(
     ambient: Sequence[AmbientFile],
     cutoffs: Sequence[float],
     clock: Callable[[], float],
+    endpoint: float | None = None,
 ) -> _Scored:
     """Score the positives and the ambient set once, and count every cutoff's false wakes.
 
     The wall time covers the ambient `score_series` calls only, the work ingress's stream does
-    for every frame of a session, so the real-time factor is that feed's cost.
+    for every frame of a session, so the real-time factor is that feed's cost. The endpoint
+    cutoff's hits are counted from the same series and kept out of the rates.
 
     Raises:
         RefusedError: The false-accept rates rise with the cutoff.
         SpeechEngineError: As the spotter's scoring.
     """
     scores = tuple(spotter.score_window(read_pcm16(path)) for path in positives)
-    hits = dict.fromkeys(cutoffs, 0)
+    counted = list(cutoffs)
+    if endpoint is not None and endpoint not in counted:
+        counted.append(endpoint)
+    hits = dict.fromkeys(counted, 0)
     wall_s = 0.0
     for item in ambient:
         pcm = read_pcm16(item.path)
         start = clock()
         series = spotter.score_series(pcm)
         wall_s += clock() - start
-        for cutoff in cutoffs:
+        for cutoff in counted:
             hits[cutoff] += len(hit_steps(series, cutoff, spotter.cooldown_steps))
     hours = _hours(ambient)
     rates = tuple(hits[cutoff] / hours for cutoff in cutoffs)
@@ -396,7 +472,18 @@ def _score(
         rates=rates,
         scores=scores,
         wall_s=wall_s,
+        endpoint_false_wakes=None if endpoint is None else hits[endpoint],
     )
+
+
+def _gate_ambient(
+    gate: AmbientGate, ambient: Sequence[AmbientFile], cutoff: float, clock: Callable[[], float]
+) -> tuple[int, float, float]:
+    """The ambient set's accepted hits at `cutoff`, the pass's wall time and its VAD part."""
+    listened = gate.listen_s
+    start = clock()
+    accepted = sum(gate.accepted_hits(item.path, cutoff) for item in ambient)
+    return accepted, clock() - start, gate.listen_s - listened
 
 
 def evaluate(
@@ -407,54 +494,78 @@ def evaluate(
     cutoffs: Sequence[float],
     clock: Callable[[], float],
     progress: Callable[[str], None],
+    *,
+    endpoint: float | None = None,
+    header: Sequence[str] = (),
 ) -> Evaluation:
-    """Score once for the spotter-only figures, then measure the bar after the gate.
+    """Score once for the spotter-only figures, then measure the bar through the verifier.
 
     `engines.spotter` scores as `AmbientSpotter` too, as `MicroNameSpotter` does. The gated
-    wakes come from `accepted_wakes` at every cutoff; the ambient set is gated at the highest
-    cutoff with enough of them, if any, through `AmbientGate`. The gate checks then run over the
-    positives once more, at `checks_cutoff`; their decodes are not in the evaluation's counts.
-    `progress` takes each progress line as its pass ends.
+    wakes come from `accepted_wakes` at every cutoff, and at `endpoint` when given; the ambient
+    set is gated at the highest cutoff with enough of them, if any, and at `endpoint`, through
+    one `AmbientGate`. The gate checks then run over the positives once more, at
+    `checks_cutoff`; their verifies are not in the evaluation's counts. `header` is printed once
+    the scoring has passed the converter's check, and `progress` takes each progress line as its
+    pass ends.
 
     Raises:
         RefusedError: The spotter-only false-accept rates rise with the cutoff.
         SpeechEngineError: As the engines.
     """
     paths = [item.path for item in positives]
-    scored = _score(engines.spotter, paths, ambient, cutoffs, clock)
+    scored = _score(engines.spotter, paths, ambient, cutoffs, clock, endpoint)
+    for line in header:
+        progress(line)
     hours = _hours(ambient)
     progress(f"ambient: {len(ambient)} files, {hours:.3f} hours")
     factor = scored.wall_s / (hours * 3600)
     progress(f"scoring: {scored.wall_s:.1f} s wall, real-time factor {factor:.4f}")
 
-    counts = DecodeCounts()
+    gated = sorted({*cutoffs, *(() if endpoint is None else (endpoint,))})
+    counts = VerifyCounts()
     start = clock()
-    woken = accepted_wakes(positives, engines, settings, cutoffs, clock, counts=counts)
+    woken = accepted_wakes(positives, engines, settings, gated, clock, counts=counts)
     gate_wall_s = clock() - start
     progress(
-        f"gate, tune positives: {len(cutoffs)} cutoffs, {counts.decodes} decodes, "
-        f"{counts.decode_errors} failed, {gate_wall_s:.1f} s wall"
+        f"gate, tune positives: {len(gated)} cutoffs, {_gate_line(counts)}, "
+        f"{gate_wall_s:.1f} s wall"
     )
     gated_wakes = tuple(woken[cutoff] for cutoff in cutoffs)
     false_wakes: dict[float, int | None] = dict.fromkeys(cutoffs)
 
     cutoff = gated_cutoff(cutoffs, gated_wakes, len(positives))
+    gate = AmbientGate(engines, settings, clock)
     split: tuple[int, int] | None = None
     if cutoff is not None:
-        gate = AmbientGate(engines, settings, clock)
-        start = clock()
-        false_wakes[cutoff] = sum(gate.accepted_hits(item.path, cutoff) for item in ambient)
-        ambient_s = clock() - start
-        gate_wall_s += ambient_s
-        counts.decodes += gate.decodes
-        counts.decode_errors += gate.decode_errors
-        progress(f"ambient VAD: {len(ambient)} files, {gate.listen_s:.1f} s wall")
+        accepted, wall_s, listen_s = _gate_ambient(gate, ambient, cutoff, clock)
+        false_wakes[cutoff] = accepted
+        gate_wall_s += wall_s
+        progress(f"ambient VAD: {len(ambient)} files, {listen_s:.1f} s wall")
         progress(
-            f"gate at {cutoff}: {false_wakes[cutoff]} false wakes, {gate.decodes} decodes, "
-            f"{gate.decode_errors} failed, {ambient_s - gate.listen_s:.1f} s wall"
+            f"gate at {cutoff}: {accepted} false wakes, {_gate_line(gate.counts)}, "
+            f"{wall_s - listen_s:.1f} s wall"
         )
         places = [gate.hit_places(item.path, cutoff) for item in ambient]
         split = (sum(near for near, _ in places), sum(rest for _, rest in places))
+    if endpoint is not None and scored.endpoint_false_wakes is not None:
+        accepted, wall_s, listen_s = _gate_ambient(gate, ambient, endpoint, clock)
+        gate_wall_s += wall_s
+        if cutoff is None:
+            progress(f"ambient VAD: {len(ambient)} files, {listen_s:.1f} s wall")
+        threshold = engines.verifier.threshold_at(endpoint)
+        spotted = scored.endpoint_false_wakes
+        count = len(positives)
+        progress(
+            f"endpoint proxy at {endpoint}, on the server spotter's audio: verifier threshold "
+            f"{'none' if threshold is None else threshold}, "
+            f"wakes {wakes_at(endpoint, scored.scores)}/{count}, "
+            f"false wakes {spotted} ({spotted / hours:.3f} per hour), "
+            f"gated wakes {woken[endpoint]}/{count}, "
+            f"gated false wakes {accepted} ({accepted / hours:.3f} per hour)"
+        )
+    counts.add(gate.counts)
+    for line in verify_lines(counts, engines.verifier.after_ms):
+        progress(line)
 
     gated_rates = [None if count is None else count / hours for count in false_wakes.values()]
     at = checks_cutoff(cutoffs, gated_wakes, gated_rates, scored.scores)
@@ -482,8 +593,8 @@ def evaluate(
         gated_wakes=gated_wakes,
         gated_false_wakes=tuple(false_wakes[item] for item in cutoffs),
         gate_wall_s=gate_wall_s,
-        decodes=counts.decodes,
-        decode_errors=counts.decode_errors,
+        decodes=counts.verifies,
+        decode_errors=counts.failures,
     )
 
 
@@ -531,10 +642,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", required=True, type=Path, help="the evaluation JSON to write")
     parser.add_argument(
-        "--stt-factory", help="<module>:<callable> building the gate's STT from the placement"
+        "--verifier", help="the wake verifier model id the hits are judged by (required)"
     )
     parser.add_argument(
         "--cutoffs", help="comma-separated, from 0 to 1 (default: 0.01 to 0.99 by 0.01)"
+    )
+    parser.add_argument(
+        "--endpoint-cutoff",
+        help="a cutoff above 0 and at most 1 to print the endpoint proxy line at "
+        "(the device's is 0.847)",
     )
     parser.add_argument(
         "--min-hours",
@@ -544,7 +660,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--models-dir",
-        help="the models directory for the spotter, the VAD and the STT "
+        help="the models directory for the spotter, the VAD and the verifier "
         "(default: the voice settings' models_dir)",
     )
     return parser
@@ -562,8 +678,10 @@ def _run(
     cutoffs = _cutoffs(args.cutoffs)
     if not math.isfinite(args.min_hours) or args.min_hours < 0:
         raise RefusedError(f"--min-hours must be a finite number of at least 0: {args.min_hours}")
+    verifier = verifier_id(args.verifier)
     if not _MODEL_ID.fullmatch(args.model):
         raise RefusedError(f"--model {args.model!r}: expected a model id [a-z0-9][a-z0-9-]*")
+    endpoint = _endpoint_cutoff(args.endpoint_cutoff)
     try:
         settings = load_voice_settings(environ)
     except ValueError as exc:
@@ -583,24 +701,42 @@ def _run(
             f"model {model.model_id} records training {model.training}, but this manifest's "
             f"train split has sha256 {training}; it was not trained from this split"
         )
+    _, provenance = checked_verifier(str(models_dir), verifier, model, training)
     positives = [item for item in recordings.split("tune") if item.label == "positive"]
     if not positives:
         raise RefusedError("the manifest has no tune positive to measure wakes on")
     ambient = _ambient(args.ambient, args.min_hours)
-
-    if load_engines is None:
-        if not args.stt_factory:
-            raise RefusedError("--stt-factory is required to load the real engines")
-        load_engines = real_engines(args.stt_factory)
-    placement = dataclasses.replace(
-        settings.placement, models_dir=str(models_dir), kws_model=args.model
+    # Neither a measured entry nor the ambient set may have trained the verifier.
+    entries = provenance.refuse_listed(
+        (item.sha256 for name in EVALUATED_SPLITS for item in recordings.split(name)),
+        "tune and test entries",
     )
+    files = provenance.refuse_listed(
+        (_ambient_sha256(item, number) for number, item in enumerate(ambient, start=1)),
+        "ambient files",
+    )
+
+    placement = dataclasses.replace(
+        settings.placement, models_dir=str(models_dir), kws_model=args.model, verify_model=verifier
+    )
+    if load_engines is None:
+        load_engines = real_engines(verifier)
     try:
         engines = load_engines(placement)
     except SpeechEngineError as exc:
         raise RefusedError(f"the engines could not be loaded: {exc}") from exc
     try:
-        evaluation = evaluate(engines, settings, positives, ambient, cutoffs, clock, progress)
+        evaluation = evaluate(
+            engines,
+            settings,
+            positives,
+            ambient,
+            cutoffs,
+            clock,
+            progress,
+            endpoint=endpoint,
+            header=(provenance_line(provenance, entries, files),),
+        )
     except SpeechEngineError as exc:
         raise RefusedError(f"the engines could not run: {exc}") from exc
 

@@ -5,9 +5,10 @@ one constant sample value. A value is a file's key, plus `LOUD` on its speech pa
 `EnergyVad` hears speech exactly there and a scripted engine can tell from any buffer which file
 it came from. The spotter is scripted by key: `score_window` returns a positive's score,
 `score_series` an ambient file's series, and a stream reports a hit at a frame of a file. The
-gate's STT is scripted by key too, so no recording and no model is read. The model manifest is
-the microWakeWord format over a placeholder model file, which `read_manifest` hashes like a real
-one.
+wake verifier is scripted by key too, from the first sample of the window it scores, so no
+recording and no model is read. The model manifest is the microWakeWord format over a
+placeholder model file, which `read_manifest` hashes like a real one, and the verifier's
+directory holds its manifest, a placeholder model and `provenance.json`.
 """
 
 import hashlib
@@ -23,23 +24,27 @@ import numpy as np
 import pytest
 
 from backend.realtime.budget import PlacementConfig
-from backend.realtime.speech import CancelToken, NameHit, TranscriptUpdate
+from backend.realtime.engines.verifier import GRID
+from backend.realtime.speech import NameHit
 from scripts.wake import eval_wake, spotter_eval
 from scripts.wake import manifest as wake_manifest
-from tests.fakes.speech import EnergyVad
+from tests.fakes.speech import EnergyVad, ScriptedWakeVerifier
 
 RATE = 16000
 FRAME_SAMPLES = 320
 MODEL_ID = "mist-wake-test"
+VERIFIER_ID = "mist-verify-test"
+SPOTTER_PAYLOAD = b"placeholder streaming model"
 COOLDOWN_STEPS = 2
 RTF = 0.25
 """The scripted spotter's cost: seconds of the test clock per second of audio it scores."""
-DECODE_S = 0.5
-"""The scripted STT's cost: seconds of the test clock per gate decode."""
+VERIFY_S = 0.5
+"""The scripted verifier's cost: seconds of the test clock per window it scores."""
 LOUD = 5000
 """Added to a key on speech parts: `EnergyVad` scores 5000 and up as speech, 300 and under not."""
-ADDRESSED = "mist, what's the time"
-UNADDRESSED = "the mist rolled in"
+ADDRESSED = 0.9
+"""A verifier score above the scripted threshold, 0.5: the hit is accepted."""
+UNADDRESSED = 0.1
 
 # Tune positives, by key, and their scripted `score_window`.
 POSITIVE_SCORES = {2: 0.97, 3: 0.99, 4: 0.96}
@@ -66,8 +71,8 @@ STREAM_HITS: dict[int, tuple[tuple[int, float], ...]] = {
     101: ((250, 0.955), (600, 0.957)),
     102: ((450, 0.97),),
 }
-# The gate decode's text by key: every positive and file 101 addressed, file 102 not.
-TEXTS = {2: ADDRESSED, 3: ADDRESSED, 4: ADDRESSED, 101: ADDRESSED, 102: UNADDRESSED}
+# The verifier's score by key: every positive's window and file 101's pass, file 102's not.
+VERDICTS = {2: ADDRESSED, 3: ADDRESSED, 4: ADDRESSED, 101: ADDRESSED, 102: UNADDRESSED}
 CUTOFFS = "0.95,0.2,0.5,0.96"
 # With a cooldown of 2 steps, hits per cutoff: 0.2 gives steps 1, 3, 5 of the first file and
 # step 0 of the second; 0.5 gives steps 1, 3, 5 of the first; 0.95 and 0.96 none. Over 0.01 h:
@@ -158,7 +163,7 @@ def write_model(models_dir: Path, *, training: str) -> None:
     """A microWakeWord manifest over a placeholder model file, which `read_manifest` hashes."""
     directory = models_dir / "speech" / "wake" / MODEL_ID
     (directory / "device").mkdir(parents=True, exist_ok=True)
-    payload = b"placeholder streaming model"
+    payload = SPOTTER_PAYLOAD
     (directory / "device" / "mist.tflite").write_bytes(payload)
     manifest = {
         "model_id": MODEL_ID,
@@ -173,6 +178,61 @@ def write_model(models_dir: Path, *, training: str) -> None:
         "hit_lag_ms": 0,
         "calibration": {},
         "training": training,
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def write_verifier(
+    models_dir: Path,
+    *,
+    training: str,
+    listed: Sequence[str] = (),
+    provenance_training: str | None = None,
+) -> None:
+    """The verifier's directory: its manifest, a placeholder model and `provenance.json`.
+
+    `listed` are sha256 values the provenance says windows were read from, beside one of a
+    training file of its own; the provenance records `provenance_training`, else `training`.
+    """
+    directory = models_dir / "speech" / "wake" / VERIFIER_ID
+    directory.mkdir(parents=True, exist_ok=True)
+    model = b"placeholder verifier model"
+    (directory / "model.onnx").write_bytes(model)
+    provenance = {
+        "version": 1,
+        "training": provenance_training or training,
+        "file_sha256": sorted([hashlib.sha256(b"a training clip").hexdigest(), *listed]),
+        "sources": {
+            "train-split": {"licence": "personal", "version": "1", "files": 1, "hours": 0.5},
+            "synthetic": {"licence": "MIT", "version": "1", "files": 3, "hours": 1.25},
+        },
+        "excluded": {"ami_dev_sha256sums": "d" * 64, "ami_eval_sha256sums": "e" * 64},
+    }
+    data = json.dumps(provenance, indent=2).encode("utf-8")
+    (directory / "provenance.json").write_bytes(data)
+    manifest = {
+        "version": 1,
+        "kind": "wake_verifier",
+        "model_id": VERIFIER_ID,
+        "file": "model.onnx",
+        "sha256": hashlib.sha256(model).hexdigest(),
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "before_ms": 2000,
+        "after_ms": 300,
+        "min_window_ms": 800,
+        "spotter": {
+            "model_id": MODEL_ID,
+            "model_sha256": hashlib.sha256(SPOTTER_PAYLOAD).hexdigest(),
+        },
+        "thresholds": {
+            "cutoffs": list(GRID),
+            "scores": [0.5] * len(GRID),
+            "per_hour": 0.2,
+            "hours": 30.0,
+        },
+        "training": training,
+        "provenance_sha256": hashlib.sha256(data).hexdigest(),
     }
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -278,44 +338,37 @@ class ScriptedSpotter:
         return [stream.threshold for stream in self.opened if stream.key in keys]
 
 
-@dataclass
-class KeyedDecode:
-    """One gate decode: the text scripted for the key its audio starts with."""
+class KeyedVerifier(ScriptedWakeVerifier):
+    """`ScriptedWakeVerifier` scoring each window by the key its first sample holds.
 
-    owner: "KeyedTranscriber"
-    audio: list[np.ndarray] = field(default_factory=list)
+    Every window here starts in the file its hit is in, so its first sample names the file.
+    Each score costs `VERIFY_S` on the test clock and is recorded in `scored` and `events`; a
+    window of a `failing` key raises.
+    """
 
-    def push(self, pcm: np.ndarray) -> None:
-        self.audio.append(pcm)
+    def __init__(
+        self,
+        clock: FakeClock,
+        events: list[tuple[object, ...]],
+        verdicts: Mapping[int, float],
+        failing: frozenset[int],
+    ) -> None:
+        super().__init__(model_id=VERIFIER_ID, spotter_model_id=MODEL_ID)
+        self.clock = clock
+        self.events = events
+        self.verdicts = dict(verdicts)
+        self.failing = failing
+        self.scored: list[int] = []
 
-    def decode_partial(self, token: CancelToken) -> TranscriptUpdate:
-        samples = np.concatenate(self.audio)
-        key = int(round(float(samples[0]) * 32768)) % LOUD
-        self.owner.decoded.append(key)
-        self.owner.events.append(("decode", key))
-        self.owner.clock.now += DECODE_S
-        if key in self.owner.failing:
-            raise spotter_eval.SpeechEngineError("scripted decode failure")
-        text = self.owner.texts[key]
-        return TranscriptUpdate(text, len(text), False, len(samples) * 1000 // RATE)
-
-    def close(self) -> None:
-        pass
-
-
-@dataclass
-class KeyedTranscriber:
-    """The gate's STT, scripted by key, recording each decode's key."""
-
-    clock: FakeClock
-    events: list[tuple[object, ...]]
-    texts: Mapping[int, str] = field(default_factory=lambda: dict(TEXTS))
-    failing: frozenset[int] = frozenset()
-    model_id: str = "keyed-stt"
-    decoded: list[int] = field(default_factory=list)
-
-    def open_stream(self) -> KeyedDecode:
-        return KeyedDecode(self)
+    def score(self, pcm: bytes) -> float:
+        self.windows.append(len(pcm))
+        key = key_of(pcm)
+        self.scored.append(key)
+        self.events.append(("verify", key))
+        self.clock.now += VERIFY_S
+        if key in self.failing:
+            raise spotter_eval.SpeechEngineError("scripted verify failure")
+        return self.verdicts[key]
 
 
 @dataclass
@@ -326,11 +379,13 @@ class Setup:
     out: Path
     clock: FakeClock
     spotter: ScriptedSpotter
-    transcriber: KeyedTranscriber
+    verifier: KeyedVerifier
     events: list[tuple[object, ...]]
     vad: EnergyVad = field(default_factory=EnergyVad)
 
-    def args(self, *extra: str, cutoffs: str | None = CUTOFFS) -> list[str]:
+    def args(
+        self, *extra: str, cutoffs: str | None = CUTOFFS, verifier: str | None = VERIFIER_ID
+    ) -> list[str]:
         argv = [
             "--manifest",
             str(self.manifest),
@@ -345,6 +400,8 @@ class Setup:
             "--min-hours",
             "0.005",
         ]
+        if verifier is not None:
+            argv += ["--verifier", verifier]
         if cutoffs is not None:
             argv += ["--cutoffs", cutoffs]
         return argv + list(extra)
@@ -354,7 +411,7 @@ class Setup:
         return eval_wake.Engines(
             spotter=self.spotter,  # type: ignore[arg-type]
             vad=self.vad,
-            transcriber=self.transcriber,  # type: ignore[arg-type]
+            verifier=self.verifier,
         )
 
     def run(self, *extra: str, cutoffs: str | None = CUTOFFS) -> int:
@@ -372,14 +429,22 @@ def prepare(
     entries: Sequence[tuple[Mapping[str, object], int]] = DEFAULT_ENTRIES,
     training: str | None = None,
     positives: Mapping[int, float] | None = None,
-    texts: Mapping[int, str] | None = None,
+    verdicts: Mapping[int, float] | None = None,
     failing: frozenset[int] = frozenset(),
+    verifier: Mapping[str, object] | None = None,
 ) -> Setup:
+    """The recordings, the ambient set, the model and its verifier, and the scripted engines.
+
+    `verifier` holds `write_verifier`'s keyword arguments, its `training` defaulting to the
+    manifest's train sha256.
+    """
     manifest = write_recordings(tmp_path, entries)
-    if training is None:
-        training = wake_manifest.subset_sha256(wake_manifest.load_manifest(manifest), "train")
+    train = wake_manifest.subset_sha256(wake_manifest.load_manifest(manifest), "train")
     models_dir = tmp_path / "models"
-    write_model(models_dir, training=training)
+    write_model(models_dir, training=training or train)
+    options: dict[str, object] = dict(verifier or {})
+    trained = str(options.pop("training", train))
+    write_verifier(models_dir, training=trained, **options)  # type: ignore[arg-type]
     ambient = tmp_path / "ambient"
     write_ambient(ambient)
     clock = FakeClock()
@@ -389,9 +454,7 @@ def prepare(
         # A positive's stream hit scores what its window does.
         spotter.positives = dict(positives)
         spotter.hits = {**STREAM_HITS, **{key: ((30, score),) for key, score in positives.items()}}
-    transcriber = KeyedTranscriber(clock=clock, events=events, failing=failing)
-    if texts is not None:
-        transcriber.texts = {**TEXTS, **texts}
+    keyed = KeyedVerifier(clock, events, {**VERDICTS, **(verdicts or {})}, failing)
     return Setup(
         manifest,
         models_dir,
@@ -399,7 +462,7 @@ def prepare(
         tmp_path / "out" / "eval.json",
         clock,
         spotter,
-        transcriber,
+        keyed,
         events,
     )
 
@@ -476,8 +539,8 @@ def test_the_evaluation_passes_the_converter_s_checks(tmp_path: Path) -> None:
 
 
 def test_the_evaluation_stays_spotter_only_whatever_the_gate_accepts(tmp_path: Path) -> None:
-    # The gate accepts file 102's hit here, and rejects every positive's: neither moves `--out`.
-    run = prepare(tmp_path, texts={2: UNADDRESSED, 3: UNADDRESSED, 102: ADDRESSED})
+    # The verifier passes file 102's hit here and rejects every positive's: neither moves `--out`.
+    run = prepare(tmp_path, verdicts={2: UNADDRESSED, 3: UNADDRESSED, 102: ADDRESSED})
 
     assert run.run(cutoffs="0.95") == 1
 
@@ -505,7 +568,7 @@ def test_each_ambient_file_is_one_series_and_only_tune_positives_are_windowed(
 
         monkeypatch.setattr(module, "read_pcm16", reading)
 
-    # Audio reaches the spotter here, and the VAD and the gate through eval_wake.
+    # Audio reaches the spotter here, and the VAD and the verifier through eval_wake.
     spy(spotter_eval)
     spy(eval_wake)
 
@@ -563,15 +626,17 @@ def test_the_printed_lines_are_counts_rates_hours_and_timing(
 
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
+        "provenance: 1 files listed from 2 sources, 1.750 hours; 6 tune and test entries and "
+        "2 ambient files checked, none listed",
         "ambient: 2 files, 0.010 hours",
         "scoring: 9.0 s wall, real-time factor 0.2500",
-        "gate, tune positives: 4 cutoffs, 3 decodes, 0 failed, 1.5 s wall",
+        "gate, tune positives: 4 cutoffs, 3 verifies, 0 failed, 0 short windows, 1.5 s wall",
         "ambient VAD: 2 files, 0.0 s wall",
-        "gate at 0.96: 0 false wakes, 1 decodes, 0 failed, 0.5 s wall",
-        "gate checks at 0.96: first hit of 3 tune positives: vocative 3",
-        "gate checks at 0.96: name alone 3: vocative 3; in a sentence 0: none",
-        "gate checks at 0.96: word at the first hit: "
-        "name 0, alias 0, other 0, none 0, no timings 3",
+        "gate at 0.96: 0 false wakes, 1 verifies, 0 failed, 0 short windows, 0.5 s wall",
+        "verify: 4 windows, 0 failed, 0 short windows, 2.0 s wall, p50 500.0 ms, p90 500.0 ms",
+        "accept: p50 800.0 ms, p90 800.0 ms, after_ms 300 plus the measured verify time",
+        "gate checks at 0.96: first hit of 3 tune positives: verified 3",
+        "gate checks at 0.96: name alone 3: verified 3; in a sentence 0: none",
         "gate checks at 0.96: first hit inside a segment 3, after a segment 0, "
         "with no segment before it 0",
         "ambient split at 0.96: 1 hits from a segment's pre-roll to 500 ms past its speech "
@@ -597,7 +662,7 @@ def test_the_printed_lines_are_counts_rates_hours_and_timing(
 def test_the_gate_checks_print_at_the_highest_cutoff_with_spotter_only_wakes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Positive 4 says the name in a sentence, and its decode is unaddressed: no cutoff has
+    # Positive 4 says the name in a sentence, and the verifier rejects it: no cutoff has
     # enough gated wakes, so the ambient set is not gated, and every cutoff has the
     # spotter-only wakes; the checks print at the highest, 0.96.
     entries = tuple(
@@ -608,17 +673,15 @@ def test_the_gate_checks_print_at_the_highest_cutoff_with_spotter_only_wakes(
         )
         for item, value in DEFAULT_ENTRIES
     )
-    run = prepare(tmp_path, entries=entries, texts={4: UNADDRESSED})
+    run = prepare(tmp_path, entries=entries, verdicts={4: UNADDRESSED})
 
     assert run.run() == 1
 
     lines = capsys.readouterr().out.splitlines()
     checks = [line for line in lines if line.startswith(("gate checks", "ambient split"))]
     assert checks == [
-        "gate checks at 0.96: first hit of 3 tune positives: not_addressed 1, vocative 2",
-        "gate checks at 0.96: name alone 2: vocative 2; in a sentence 1: not_addressed 1",
-        "gate checks at 0.96: word at the first hit: "
-        "name 0, alias 0, other 0, none 0, no timings 3",
+        "gate checks at 0.96: first hit of 3 tune positives: not_addressed 1, verified 2",
+        "gate checks at 0.96: name alone 2: verified 2; in a sentence 1: not_addressed 1",
         "gate checks at 0.96: first hit inside a segment 3, after a segment 0, "
         "with no segment before it 0",
     ]
@@ -629,12 +692,11 @@ def test_the_gate_checks_print_at_the_highest_cutoff_with_spotter_only_wakes(
 
 def test_the_gate_check_lines_give_the_spread_of_hits_after_the_speech() -> None:
     checks = eval_wake.GateChecks(
-        first_hit={"no_hit": 1, "not_addressed": 2, "vocative": 3},
+        first_hit={"no_hit": 1, "not_addressed": 2, "verified": 3},
         first_hit_by_group={
-            "name_alone": {"not_addressed": 1, "vocative": 3},
+            "name_alone": {"not_addressed": 1, "verified": 3},
             "sentence": {"no_hit": 1, "not_addressed": 1},
         },
-        at_hit={"alias": 2, "name": 1, "no_timings": 1, "other": 1},
         places=(
             ("after", 180),
             ("inside", None),
@@ -646,11 +708,9 @@ def test_the_gate_check_lines_give_the_spread_of_hits_after_the_speech() -> None
 
     assert spotter_eval.check_lines(0.5, checks) == [
         "gate checks at 0.5: first hit of 6 tune positives: "
-        "no_hit 1, not_addressed 2, vocative 3",
-        "gate checks at 0.5: name alone 4: not_addressed 1, vocative 3; "
+        "no_hit 1, not_addressed 2, verified 3",
+        "gate checks at 0.5: name alone 4: not_addressed 1, verified 3; "
         "in a sentence 2: no_hit 1, not_addressed 1",
-        "gate checks at 0.5: word at the first hit: "
-        "name 1, alias 2, other 1, none 0, no timings 1",
         "gate checks at 0.5: first hit inside a segment 2, after a segment 2 "
         "(min 100, median 140, max 180 ms), with no segment before it 1",
     ]
@@ -697,27 +757,28 @@ def test_the_progress_lines_are_flushed_as_each_gated_pass_finishes(
         flush = later.index(("flush",))
         assert all(event[0] in ("write", "flush") for event in later[:flush])
 
+    flushed_before_next_work("provenance:")
     flushed_before_next_work("gate, tune positives:")
     flushed_before_next_work("gate at 0.96:")
-    # The tune gate line is out before the ambient gate decodes anything.
+    # The tune gate line is out before the ambient gate scores anything.
     tune_line = next(
         number
         for number, event in enumerate(run.events)
         if event[0] == "write" and str(event[1]).startswith("gate, tune")
     )
-    ambient_decodes = [
+    ambient_verifies = [
         number
         for number, event in enumerate(run.events)
-        if event[0] == "decode" and event[1] in AMBIENT_PARTS
+        if event[0] == "verify" and event[1] in AMBIENT_PARTS
     ]
-    assert ambient_decodes and min(ambient_decodes) > tune_line
+    assert ambient_verifies and min(ambient_verifies) > tune_line
 
 
 def test_gated_wakes_count_a_positive_only_when_one_of_its_hits_is_accepted(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Positive 4's hit is decoded as unaddressed: it wakes the spotter, not her.
-    run = prepare(tmp_path, texts={4: UNADDRESSED})
+    # The verifier rejects positive 4's hit: it wakes the spotter, not her.
+    run = prepare(tmp_path, verdicts={4: UNADDRESSED})
 
     assert run.run() == 1
 
@@ -732,7 +793,7 @@ def test_gated_wakes_count_a_positive_only_when_one_of_its_hits_is_accepted(
     assert out.splitlines()[-1] == "bar: no cutoff passes"
 
 
-def test_a_gated_false_wake_is_a_reported_hit_whose_decode_the_gate_accepts(
+def test_a_gated_false_wake_is_a_reported_hit_whose_window_the_verifier_passes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     run = prepare(tmp_path)
@@ -740,19 +801,22 @@ def test_a_gated_false_wake_is_a_reported_hit_whose_decode_the_gate_accepts(
     assert run.run(cutoffs="0.95") == 1
 
     out = capsys.readouterr().out
-    # At 0.95 file 101's speech hit is addressed and counts, and so does its 0.957 hit at frame
-    # 600, in silence, from a span of its own; file 102's is decoded "the mist rolled in" and
-    # does not.
+    # At 0.95 file 101's speech hit passes and counts, and so does its 0.957 hit at frame 600,
+    # in silence, from a window of its own; the verifier rejects file 102's.
     assert cutoff_lines(out)[0.95].endswith("gated false wakes 2 (200.000 per hour)")
-    assert "gate at 0.95: 2 false wakes, 3 decodes, 0 failed, 1.5 s wall" in out.splitlines()
+    assert (
+        "gate at 0.95: 2 false wakes, 3 verifies, 0 failed, 0 short windows, 1.5 s wall"
+        in out.splitlines()
+    )
     (stream_101,) = (stream for stream in run.spotter.opened if stream.key == 101)
     assert {250, 600} <= set(stream_101.pushed)
     assert ("hit", 101, 0.95, 0.957) in run.events
-    assert sorted(key for key in run.transcriber.decoded if key in AMBIENT_PARTS) == [
-        101,
-        101,
-        102,
-    ]
+    assert sorted(key for key in run.verifier.scored if key in AMBIENT_PARTS) == [101, 101, 102]
+    # Each window is 2000 ms before its hit and 300 ms after it, inside the file.
+    assert set(run.verifier.windows) == {
+        (100 + 15 + 1) * FRAME_SAMPLES * 2,
+        (30 + 15 + 1) * FRAME_SAMPLES * 2,
+    }
     assert out.splitlines()[-1] == "bar: no cutoff passes"
 
 
@@ -787,8 +851,8 @@ def test_only_the_highest_candidate_is_gated(
 def test_one_listed_cutoff_that_is_a_candidate_is_gated_alone(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # File 101's speech hit is unaddressed here, so 0.5's gated rate is 0.
-    run = prepare(tmp_path, texts={101: UNADDRESSED})
+    # The verifier rejects file 101's hits here, so 0.5's gated rate is 0.
+    run = prepare(tmp_path, verdicts={101: UNADDRESSED})
 
     assert run.run(cutoffs="0.5") == 0
 
@@ -799,8 +863,8 @@ def test_one_listed_cutoff_that_is_a_candidate_is_gated_alone(
 def test_the_bar_fails_when_the_highest_candidate_s_gated_rate_is_over_half_an_hour(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # File 102's hit at 0.97 is addressed now, one gated false wake in 0.01 h at 0.96.
-    run = prepare(tmp_path, texts={102: ADDRESSED})
+    # File 102's hit at 0.97 passes now, one gated false wake in 0.01 h at 0.96.
+    run = prepare(tmp_path, verdicts={102: ADDRESSED})
 
     assert run.run() == 1
 
@@ -811,16 +875,86 @@ def test_the_bar_fails_when_the_highest_candidate_s_gated_rate_is_over_half_an_h
     converter_accepts(json.loads(run.out.read_text(encoding="utf-8")))
 
 
-def test_a_failed_gate_decode_rejects_the_hit_and_is_counted(
+def test_a_failed_verify_rejects_the_hit_and_is_counted(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run = prepare(tmp_path, texts={102: ADDRESSED}, failing=frozenset({102}))
+    run = prepare(tmp_path, verdicts={102: ADDRESSED}, failing=frozenset({102}))
 
     assert run.run() == 0
 
-    out = capsys.readouterr().out.splitlines()
-    assert "gate at 0.96: 0 false wakes, 1 decodes, 1 failed, 0.5 s wall" in out
+    captured = capsys.readouterr()
+    out = captured.out.splitlines()
+    gate = "gate at 0.96: 0 false wakes, 1 verifies, 1 failed, 0 short windows, 0.5 s wall"
+    assert gate in out
+    assert "verify: 4 windows, 1 failed" in captured.out
     assert out[-1] == "bar: pass at 0.96"
+    assert "meeting-102" not in captured.err
+
+
+def test_a_window_under_the_minimum_is_counted_and_never_scored(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A one-second positive holds 46 frames around its hit at frame 30: under 1000 ms.
+    run = prepare(tmp_path)
+    run.verifier.min_window_ms = 1000
+
+    assert run.run(cutoffs="0.96") == 1
+
+    out = capsys.readouterr().out.splitlines()
+    assert (
+        "gate, tune positives: 1 cutoffs, 0 verifies, 0 failed, 3 short windows, 0.0 s wall" in out
+    )
+    assert "verify: 0 windows, 0 failed, 3 short windows, 0.0 s wall, p50 none, p90 none" in out
+    assert "accept: p50 none, p90 none, after_ms 300 plus the measured verify time" in out
+    assert cutoff_lines("\n".join(out))[0.96].startswith(
+        "cutoff 0.96: wakes 3/3, false wakes 0 (0.000 per hour), gated wakes 0/3, "
+    )
+    assert run.verifier.scored == []
+
+
+def test_the_endpoint_cutoff_prints_the_server_proxy_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = prepare(tmp_path)
+
+    assert run.run("--endpoint-cutoff", "0.847") == 0
+
+    out = capsys.readouterr().out.splitlines()
+    # At 0.847 the series of file 101 has one hit (0.9), and the stream reports both of file
+    # 101's hits, which pass, and file 102's, which does not.
+    assert (
+        "endpoint proxy at 0.847, on the server spotter's audio: verifier threshold 0.5, "
+        "wakes 3/3, false wakes 1 (100.000 per hour), gated wakes 3/3, "
+        "gated false wakes 2 (200.000 per hour)"
+    ) in out
+    # The positives' windows are scored once; file 102's is reused from the gate at 0.96.
+    verify = "verify: 6 windows, 0 failed, 0 short windows, 3.0 s wall, p50 500.0 ms, p90 500.0 ms"
+    assert verify in out
+    proxy = next(number for number, line in enumerate(out) if line.startswith("endpoint proxy"))
+    assert proxy < out.index(verify)
+    # The proxy changes neither the evaluation nor the bar.
+    assert json.loads(run.out.read_text(encoding="utf-8"))["cutoffs"] == EXPECTED_CUTOFFS
+    assert out[-1] == "bar: pass at 0.96"
+
+
+def test_no_endpoint_cutoff_prints_no_proxy_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = prepare(tmp_path)
+
+    assert run.run() == 0
+
+    assert "endpoint proxy" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "1.5", "nan", "high"])
+def test_an_endpoint_cutoff_outside_0_to_1_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    run = prepare(tmp_path)
+
+    assert "--endpoint-cutoff" in refused(run, capsys, "--endpoint-cutoff", value)
+    assert run.spotter.placements == []
 
 
 def test_no_cutoff_passes_writes_the_evaluation_and_exits_1(
@@ -884,6 +1018,86 @@ def test_a_model_trained_on_another_training_split_is_refused(
     run = prepare(tmp_path, training="0" * 64)
 
     assert "training" in refused(run, capsys)
+    assert run.spotter.placements == []
+
+
+def provenance_refused(run: Setup, capsys: pytest.CaptureFixture[str]) -> str:
+    """Assert a refusal before anything is scored, naming no recording; return stderr."""
+    err = refused(run, capsys)
+    assert run.spotter.placements == []
+    assert run.spotter.windows == run.spotter.streams == []
+    assert run.verifier.scored == []
+    for name in ("meeting-101", "meeting-102", "tune-a", "tune-b", "tune-c", "test.wav"):
+        assert name not in err
+    return err
+
+
+def recording_sha256(tmp_path: Path, file: str) -> str:
+    return hashlib.sha256((tmp_path / "recordings" / file).read_bytes()).hexdigest()
+
+
+def test_a_verifier_trained_on_another_training_split_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = prepare(tmp_path, verifier={"training": "0" * 64})
+
+    err = provenance_refused(run, capsys)
+
+    assert VERIFIER_ID in err and "train" in err
+
+
+def test_a_provenance_recording_another_training_split_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = prepare(tmp_path, verifier={"provenance_training": "1" * 64})
+
+    err = provenance_refused(run, capsys)
+
+    assert "provenance" in err and "training" in err
+
+
+@pytest.mark.parametrize("file", ["p/tune-b.wav", "h/tune.wav", "p/test.wav", "m/test.wav"])
+def test_a_tune_or_test_entry_in_the_provenance_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], file: str
+) -> None:
+    write_recordings(tmp_path)
+    run = prepare(tmp_path, verifier={"listed": [recording_sha256(tmp_path, file)]})
+
+    assert "1 of the 6 tune and test entries" in provenance_refused(run, capsys)
+
+
+def test_an_ambient_file_in_the_provenance_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_ambient(tmp_path / "ambient")
+    listed = hashlib.sha256((tmp_path / "ambient" / "meeting-102.wav").read_bytes()).hexdigest()
+    run = prepare(tmp_path, verifier={"listed": [listed]})
+
+    assert "1 of the 2 ambient files" in provenance_refused(run, capsys)
+
+
+def test_a_train_entry_in_the_provenance_is_what_it_should_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_recordings(tmp_path)
+    run = prepare(tmp_path, verifier={"listed": [recording_sha256(tmp_path, "p/train.wav")]})
+
+    assert run.run() == 0
+
+    assert capsys.readouterr().out.startswith(
+        "provenance: 2 files listed from 2 sources, 1.750 hours; 6 tune and test entries and "
+        "2 ambient files checked, none listed\n"
+    )
+
+
+def test_a_provenance_file_other_than_the_one_the_manifest_pins_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = prepare(tmp_path)
+    provenance = run.models_dir / "speech" / "wake" / VERIFIER_ID / "provenance.json"
+    provenance.write_text(provenance.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    assert "provenance" in refused(run, capsys)
     assert run.spotter.placements == []
 
 
@@ -1055,21 +1269,15 @@ def test_engines_that_cannot_load_are_refused(
 
 
 @pytest.mark.parametrize(
-    ("factory", "reason"),
-    [
-        (None, "--stt-factory is required"),
-        ("scripts.wake.eval_wake", "<module>:<callable>"),
-        ("scripts.wake.no_such_module:factory", "could not be loaded"),
-        ("scripts.wake.eval_wake:no_such_factory", "could not be loaded"),
-    ],
+    ("verifier", "reason"),
+    [(None, "--verifier is required"), ("Not_An_Id", "Not_An_Id"), ("absent", "absent")],
 )
-def test_a_missing_or_bad_stt_factory_is_refused_and_nothing_is_written(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], factory: str | None, reason: str
+def test_a_missing_bad_or_absent_verifier_is_refused_and_nothing_is_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], verifier: str | None, reason: str
 ) -> None:
     run = prepare(tmp_path)
-    extra = [] if factory is None else ["--stt-factory", factory]
 
-    code = spotter_eval.main(run.args(*extra), environ={}, clock=run.clock)
+    code = spotter_eval.main(run.args(verifier=verifier), environ={}, clock=run.clock)
 
     captured = capsys.readouterr()
     assert code == 2
@@ -1080,7 +1288,7 @@ def test_a_missing_or_bad_stt_factory_is_refused_and_nothing_is_written(
     assert spotter_eval.RefusedError is eval_wake.RefusedError
 
 
-def test_the_real_engines_are_eval_wake_s_on_the_model_under_test(
+def test_the_real_engines_are_eval_wake_s_on_the_model_and_verifier_under_test(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run = prepare(tmp_path)
@@ -1099,22 +1307,25 @@ def test_the_real_engines_are_eval_wake_s_on_the_model_under_test(
             seen.append(("vad", placement))
             return run.vad
 
-    def stt(placement: PlacementConfig) -> KeyedTranscriber:
-        seen.append(("stt", placement))
-        return run.transcriber
+    class Verifier:
+        @staticmethod
+        def load(placement: PlacementConfig, **kwargs: object) -> KeyedVerifier:
+            assert kwargs == {
+                "session_factory": eval_wake.open_onnx_session,
+                "available_providers": eval_wake.onnxruntime_providers,
+            }
+            seen.append(("verifier", placement))
+            return run.verifier
 
     monkeypatch.setattr(eval_wake, "MicroNameSpotter", Spotter)
     monkeypatch.setattr(eval_wake, "SileroVad", Vad)
-    monkeypatch.setattr(eval_wake, "parakeet_cpu", stt)
+    monkeypatch.setattr(eval_wake, "OnnxWakeVerifier", Verifier)
 
-    code = spotter_eval.main(
-        run.args("--stt-factory", "scripts.wake.eval_wake:parakeet_cpu"),
-        environ={},
-        clock=run.clock,
-    )
+    code = spotter_eval.main(run.args(), environ={}, clock=run.clock)
 
     assert code == 0
-    assert sorted(name for name, _ in seen) == ["spotter", "stt", "vad"]
+    assert sorted(name for name, _ in seen) == ["spotter", "vad", "verifier"]
     for _, placement in seen:
         assert placement.kws_model == MODEL_ID
+        assert placement.verify_model == VERIFIER_ID
         assert placement.models_dir == str(run.models_dir)
