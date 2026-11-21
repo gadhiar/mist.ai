@@ -129,6 +129,7 @@ from .speech import (
     StreamingTranscriber,
     TurnEndDetector,
     VoiceActivityDetector,
+    WakeVerifier,
 )
 from .turn import (
     BargeInReport,
@@ -176,6 +177,10 @@ class SpeechEngines:
     `tts_slot` are the slots the runtime swaps; a session opens its streams and synthesizes on
     them when they are set, so work started before a swap keeps its engine, and `transcriber`
     and `synthesizer` name the engine loaded now.
+
+    `verifier` is the acoustic wake verifier. With none, no wake can be accepted, so the runtime
+    loads no `spotter` and an endpoint `voice_start` is refused; it has no status of its own in
+    `statuses`.
     """
 
     vad: VoiceActivityDetector | None = None
@@ -187,17 +192,23 @@ class SpeechEngines:
     vram_over_budget: bool = False
     stt_slot: TranscriberSlot | None = None
     tts_slot: SynthesizerSlot | None = None
+    verifier: WakeVerifier | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class InferenceLanes:
-    """The process-wide lanes each engine's calls run on, one per engine kind."""
+    """The process-wide lanes each engine's calls run on, one per engine kind.
+
+    `verify` is the wake verifier's own lane, so a verify job never queues behind the spotter's
+    hops or an end-of-turn check.
+    """
 
     vad: InferenceLane
     eot: InferenceLane
     stt: InferenceLane
     tts: InferenceLane
     kws: InferenceLane
+    verify: InferenceLane
 
 
 def _full() -> PowerLevel:
@@ -969,6 +980,9 @@ class RealtimeSession:
             return "vad unavailable"
         if settings.spotter == "server" and engines.spotter is None:
             return "kws unavailable"
+        # No verifier, no wake accepted: refused before the device opens its uplink for one.
+        if settings.spotter == "endpoint" and engines.verifier is None:
+            return "verify unavailable"
         return None
 
     def _on_voice_start(self, settings: VoiceStartMessage) -> None:

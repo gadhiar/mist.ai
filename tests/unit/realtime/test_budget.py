@@ -618,6 +618,8 @@ VARIABLES = [
     ("MIST_VOICE_WAKE_TRAILING_SPEECH_MS", "160", "wake.trailing_speech_ms", 160),
     ("MIST_VOICE_KWS_MODEL", "mist-wake-2", "placement.kws_model", "mist-wake-2"),
     ("MIST_VOICE_KWS_THREADS", "2", "placement.kws_threads", 2),
+    ("MIST_VOICE_VERIFY_MODEL", " mist-verify-1 ", "placement.verify_model", "mist-verify-1"),
+    ("MIST_VOICE_VERIFY_THREADS", "4", "placement.verify_threads", 4),
     ("MIST_VOICE_CHARACTER", "false", "playback.character", None),
     ("MIST_VOICE_CHARACTER_DOUBLE_GAIN", "0.2", "playback.character.double_gain", 0.2),
 ]
@@ -700,6 +702,8 @@ class TestLoadVoiceSettingsVariables:
             "MIST_VOICE_WAKE_TRAILING_SPEECH_MS",
             "MIST_VOICE_KWS_MODEL",
             "MIST_VOICE_KWS_THREADS",
+            "MIST_VOICE_VERIFY_MODEL",
+            "MIST_VOICE_VERIFY_THREADS",
             "MIST_VOICE_BUDGET",
             "MIST_VOICE_CLIENT_PREBUFFER_MS",
             "MIST_VOICE_VAD_THRESHOLD",
@@ -1068,6 +1072,35 @@ class TestLoadVoiceSettingsErrors:
     def test_kws_threads_must_be_a_positive_integer(self, raw):
         with pytest.raises(ValueError, match="MIST_VOICE_KWS_THREADS"):
             load_voice_settings({"MIST_VOICE_KWS_THREADS": raw})
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("wake/verify-1", id="slash"),
+            pytest.param("Mist-Verify", id="upper-case"),
+            pytest.param("-verify", id="leading-dash"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    def test_a_verify_model_outside_the_id_form_raises_naming_the_variable(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_VERIFY_MODEL"):
+            load_voice_settings({"MIST_VOICE_VERIFY_MODEL": raw})
+
+    @pytest.mark.parametrize("raw", ["0", "9", "-1", "two"])
+    def test_verify_threads_outside_one_to_eight_raise_naming_the_variable(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_VERIFY_THREADS"):
+            load_voice_settings({"MIST_VOICE_VERIFY_THREADS": raw})
+
+    @pytest.mark.parametrize("raw", ["1", "8"])
+    def test_verify_threads_accept_one_to_eight(self, raw):
+        settings = load_voice_settings({"MIST_VOICE_VERIFY_THREADS": raw})
+
+        assert settings.placement.verify_threads == int(raw)
+
+    def test_the_verifier_is_unset_with_two_threads_by_default(self):
+        placement = load_voice_settings({}).placement
+
+        assert (placement.verify_model, placement.verify_threads) == (None, 2)
 
     @pytest.mark.parametrize("raw", ["400", "10001"])
     def test_an_endpoint_min_backlog_outside_its_bounds_raises_naming_it(self, raw):

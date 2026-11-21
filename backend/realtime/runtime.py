@@ -34,7 +34,7 @@ from .protocol import (
     VoiceDecisionPlacement,
 )
 from .session import OFF, InferenceLanes, SessionServices, SpeechEngines
-from .speech import NameSpotter, TurnEndDetector, VoiceActivityDetector
+from .speech import NameSpotter, TurnEndDetector, VoiceActivityDetector, WakeVerifier
 from .turn import TurnPlacement, TurnResponder
 from .voice_assets import VoiceAssetError
 
@@ -67,14 +67,16 @@ was never benchmarked there, so the walk skips it rather than guess."""
 class EngineLoaders:
     """How each engine loads. Each callable imports its library only when called.
 
-    `chains` maps an engine id to `(settings, device) -> engine`; `vad`, `eot` and `kws` load
-    the single-device engines from the placement.
+    `chains` maps an engine id to `(settings, device) -> engine`; `vad`, `eot`, `kws` and
+    `verify` load the single-device engines from the placement. With `verify` None no verifier
+    can load, so the spotter is not loaded either.
     """
 
     chains: Mapping[str, Callable[[VoiceSettings, str], object]]
     vad: Callable[[PlacementConfig], VoiceActivityDetector]
     eot: Callable[[PlacementConfig, EndpointingConfig], TurnEndDetector]
     kws: Callable[[PlacementConfig], NameSpotter]
+    verify: Callable[[PlacementConfig], WakeVerifier] | None = None
 
 
 class GpuMeter(Protocol):
@@ -270,11 +272,16 @@ def load_speech_engines(
     """Load every speech slot, one engine at a time.
 
     STT first: with it configured off (an empty chain), no utterance can be transcribed, so the
-    VAD, end-of-turn model and name spotter are not loaded. A configured chain loads them even
-    when no option loaded, so a boot while yielded with a CUDA-only chain has them ready when
-    the reload brings STT up. Each chain keeps its first option that loads; at power `off`
-    the GPU belongs to something else, so every CUDA option is skipped and the walk goes on down
-    the chain. A sum of measured VRAM over `vram_budget_mib` logs a WARNING and sets
+    VAD, end-of-turn model, wake verifier and name spotter are not loaded. A configured chain
+    loads them even when no option loaded, so a boot while yielded with a CUDA-only chain has
+    them ready when the reload brings STT up.
+
+    The verifier loads before the spotter, and the spotter loads only beside a verifier trained
+    against it (`spotter_model_id` equal to `kws_model`): without one no wake can be accepted,
+    so the spotter stays off and one WARNING says why (fail closed).
+
+    Each chain keeps its first option that loads; at power `off` the GPU belongs to something
+    else, so every CUDA option is skipped and the walk goes on down the chain. A sum of measured VRAM over `vram_budget_mib` logs a WARNING and sets
     `vram_over_budget`; nothing is unloaded.
 
     STT and TTS each get a slot the GPU release and reload swap. Its `home` is the option a
@@ -286,14 +293,40 @@ def load_speech_engines(
     walk = _Walk(settings, loaders, gpu_meter, gpu_allowed=power_level != "off")
     transcriber, stt, stt_index = walk.chain("stt")
     vad = turn_end = spotter = None
+    verifier: WakeVerifier | None = None
     vad_status = eot_status = kws_status = OFF
     if placement.stt_chain:
         vad, vad_status = walk.single("vad", placement.vad_device, lambda: loaders.vad(placement))
         turn_end, eot_status = walk.single(
             "eot", placement.eot_device, lambda: loaders.eot(placement, settings.endpointing)
         )
-        if placement.kws_model is not None:
-            spotter, kws_status = walk.single("kws", "cpu", lambda: loaders.kws(placement))
+        load_verifier = loaders.verify
+        if placement.verify_model is not None and load_verifier is not None:
+            verifier, _ = walk.single("verify", "cpu", lambda: load_verifier(placement))
+        kws_model = placement.kws_model
+        if kws_model is not None:
+            if placement.verify_model is None:
+                logger.warning(
+                    "kws: %s not loaded: no wake verifier is set (MIST_VOICE_VERIFY_MODEL), so "
+                    "no wake could be accepted",
+                    kws_model,
+                )
+            elif verifier is None:
+                logger.warning(
+                    "kws: %s not loaded: the wake verifier %s did not load, so no wake could be "
+                    "accepted",
+                    kws_model,
+                    placement.verify_model,
+                )
+            elif verifier.spotter_model_id != kws_model:
+                logger.warning(
+                    "kws: %s not loaded: the wake verifier %s was trained against spotter %s",
+                    kws_model,
+                    verifier.model_id,
+                    verifier.spotter_model_id,
+                )
+            else:
+                spotter, kws_status = walk.single("kws", "cpu", lambda: loaders.kws(placement))
     synthesizer, tts, tts_index = walk.chain("tts")
     stt_home = walk.skipped_gpu.get("stt", stt_index)
     tts_home = walk.skipped_gpu.get("tts", tts_index)
@@ -322,20 +355,26 @@ def load_speech_engines(
             if tts_home is None
             else SynthesizerSlot(synthesizer, option=tts_index, home=tts_home)  # type: ignore[arg-type]
         ),
+        verifier=verifier,
     )
 
 
 def voice_capabilities(engines: SpeechEngines) -> VoiceCapabilities:
-    """What `session_started` announces: the modes and spotters the loaded engines serve."""
+    """What `session_started` announces: the modes and spotters the loaded engines serve.
+
+    Every wake needs the verifier, so `endpoint` is offered only with one, `server` only with
+    the spotter as well, and `wake` only while some spotter is offered: a client is never
+    offered a mode nothing can accept.
+    """
     listens = engines.vad is not None and engines.transcriber is not None
     spotters: list[Literal["server", "endpoint"]] = []
-    if listens:
+    if listens and engines.verifier is not None:
         spotters.append("endpoint")
         if engines.spotter is not None:
             spotters.append("server")
     return VoiceCapabilities(
         protocol=2,
-        modes=["wake"] if listens else [],
+        modes=["wake"] if spotters else [],
         spotters=spotters,
         reference=listens and engines.spotter is not None,
         uplink_sample_rate=16000,
@@ -798,9 +837,16 @@ class MistRuntime:
         return voice_capabilities(self.engines)
 
     def close(self) -> None:
-        """Stop each lane's worker thread."""
+        """Stop each lane's worker thread, then close the wake verifier.
+
+        The lanes go first: a shutdown fails the waiting jobs and waits for the running one, so
+        no new verify job starts once the verifier is closed.
+        """
         lanes = self.lanes
-        for lane in (lanes.vad, lanes.eot, lanes.stt, lanes.tts, lanes.kws):
+        for lane in (lanes.vad, lanes.eot, lanes.stt, lanes.tts, lanes.kws, lanes.verify):
             shutdown = getattr(lane, "shutdown", None)
             if shutdown is not None:
                 shutdown()
+        verifier = self.engines.verifier
+        if verifier is not None:
+            verifier.close()

@@ -169,6 +169,7 @@ VOICE_EXAMPLE_VARIABLES = (
     "MIST_VOICE_TTS_VOICE",
     "MIST_VOICE_KWS_MODEL",
     "MIST_VOICE_KWS_THRESHOLD",
+    "MIST_VOICE_VERIFY_MODEL",
     "MIST_VOICE_WAKE_PHRASES_FILE",
 )
 # The one example value that is a path rather than a `<placeholder>`: only `/models` is mounted
@@ -1104,6 +1105,12 @@ class TestEnvExample:
         for phrase in ("MODELS_DIR", "only `/models` is mounted"):
             assert phrase in comment, phrase
 
+    def test_verify_model_comment_says_where_it_lives_and_that_wake_needs_it(self):
+        comment = _comment_above("MIST_VOICE_VERIFY_MODEL")
+
+        for phrase in ("speech/wake/<id>/", "MODELS_DIR", "no wake is accepted"):
+            assert phrase in comment, phrase
+
     def test_header_no_longer_says_tts_stays_off(self):
         assert "turn TTS on" not in " ".join(ENV_EXAMPLE_PATH.read_text(encoding="utf-8").split())
 
@@ -1229,6 +1236,10 @@ class TestReadmeVoice:
             pytest.param("`<MODELS_DIR>/speech/wake/<model id>/`", id="wake-model-staging"),
             pytest.param("`<MODELS_DIR>/speech/wake/phrases.json`", id="phrases-staging"),
             pytest.param("personal use only", id="wake-model-licence"),
+            pytest.param("`<MODELS_DIR>/speech/wake/<verifier id>/`", id="verifier-staging"),
+            pytest.param("`MIST_VOICE_VERIFY_THREADS`", id="verifier-threads"),
+            pytest.param("never committed", id="verifier-never-committed"),
+            pytest.param("no wake is accepted", id="verifier-fail-closed"),
         ],
     )
     def test_voice_section_covers(self, phrase):
