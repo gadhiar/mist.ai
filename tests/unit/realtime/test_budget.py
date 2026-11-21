@@ -290,6 +290,8 @@ CONFIG_DEFAULTS = [
             "models_dir": "/models",
             "kws_model": None,
             "kws_threads": 1,
+            "verify_model": None,
+            "verify_threads": 2,
         },
         id="placement",
     ),

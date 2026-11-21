@@ -378,6 +378,43 @@ class NameSpotter(Protocol):
         ...
 
 
+class WakeVerifier(Protocol):
+    """A second-stage acoustic model that judges whether a name hit was said to MIST.
+
+    The spotter only hears the name; the verifier scores the audio around the hit, from
+    `before_ms` before it to `after_ms` after it, and a window shorter than `min_window_ms` is
+    not scored. It was trained against one spotter, `spotter_model_id`, whose hits its threshold
+    table was calibrated on, so a score means nothing for another spotter's hits. CPU-only.
+    """
+
+    model_id: str
+    spotter_model_id: str
+    before_ms: int
+    after_ms: int
+    min_window_ms: int
+
+    def threshold_at(self, cutoff: float) -> float | None:
+        """The score a hit at spotter cutoff `cutoff` must reach, or None below the table."""
+        ...
+
+    def score(self, pcm: bytes) -> float:
+        """Score one window of PCM16 mono 16 kHz audio, as `NameSpotter.score_window` takes it.
+
+        Raises:
+            SpeechEngineError: The window cannot be scored, or the model's output is not one
+                finite score.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release the verifier's session, when its owner is done with it.
+
+        The protocol does not require `score` to raise after `close`; an adapter that frees a
+        model session raises `SpeechEngineError` from a later `score`.
+        """
+        ...
+
+
 def _interpolate(score: float, table: tuple[tuple[float, float], ...]) -> float | None:
     if not table:
         return None

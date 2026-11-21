@@ -381,7 +381,10 @@ class PlacementConfig:
     bounds how long a GPU release waits for running jobs to stop. `kws_model` is the name
     spotter's model id, the same id form, read from `<models_dir>/speech/wake/<id>/`; `None`
     turns the server spotter off. The spotter runs on the CPU only, with `kws_threads` threads,
-    so it has no device setting.
+    so it has no device setting. `verify_model` is the acoustic wake verifier's model id, the
+    same id form, read from the same `<models_dir>/speech/wake/<id>/`; `None` leaves the
+    verifier unloaded. It runs on the CPU only, with `verify_threads` onnxruntime intra-op
+    threads, so it has no device setting either.
     """
 
     vad_device: str = "cpu"
@@ -407,6 +410,8 @@ class PlacementConfig:
     models_dir: str = "/models"
     kws_model: str | None = None
     kws_threads: int = 1
+    verify_model: str | None = None
+    verify_threads: int = 2
 
 
 @dataclass(frozen=True, slots=True)
