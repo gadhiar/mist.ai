@@ -1,34 +1,33 @@
 """Tests for the wake model evaluation harness: the recording manifest and `eval_wake`.
 
 Every WAV here is written by `wave` into pytest's temporary directory, and the engines are the
-scripted fakes (`ScriptedNameSpotter`, `ScriptedTranscriber`, `EnergyVad`), so no recording and
+scripted fakes (`ScriptedNameSpotter`, `ScriptedWakeVerifier`, `EnergyVad`), so no recording and
 no model is read. The model manifest is the microWakeWord format over a placeholder model file,
-which `read_manifest` hashes like a real one.
+which `read_manifest` hashes like a real one, and the verifier's directory holds its manifest, a
+placeholder model and `provenance.json`, which `read_verifier_manifest` hashes the same way.
 
 Scripted hits are addressed by uplink position. The harness numbers the frames of a split's
 entries in manifest order, one position per 20 ms frame, so `offsets` below turns an entry and a
-frame within it into the position a hit is scripted at. Transcripts are scripted in the order
-the gate decodes run: entries in manifest order, one decode per distinct span.
+frame within it into the position a hit is scripted at. Verifier scores are scripted in the order
+the windows are scored: entries in manifest order, one score per distinct hit position.
 """
 
 import asyncio
 import hashlib
-import importlib
 import json
 import logging
 import wave
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from backend.realtime.addressee import NameAlignment
 from backend.realtime.budget import EndpointingConfig, PlacementConfig, load_voice_settings
 from backend.realtime.engines.kws import read_manifest
-from backend.realtime.engines.parakeet_stt import OnnxAsrLibrary, ParakeetTranscriber
+from backend.realtime.engines.verifier import GRID, verify_window
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
     AudioIngress,
@@ -39,17 +38,24 @@ from backend.realtime.ingress import (
     onset_lead_frames,
 )
 from backend.realtime.protocol import Frame, MsgType
-from backend.realtime.speech import CancelToken, HeardWord, NameHit
+from backend.realtime.speech import CancelToken, NameHit
 from scripts.wake import eval_wake
 from scripts.wake import manifest as wake_manifest
-from tests.fakes.speech import EnergyVad, ScriptedNameSpotter, ScriptedTranscriber
+from tests.fakes.speech import (
+    EnergyVad,
+    ScriptedNameSpotter,
+    ScriptedTranscriber,
+    ScriptedWakeVerifier,
+)
 
 RATE = 16000
 FRAME_MS = 20
 MODEL_ID = "mist-wake-test"
-SECRET_WORDS = ("quokka", "zanzibar")
-ADDRESSED = "hey mist quokka"
-UNADDRESSED = "zanzibar quokka"
+VERIFIER_ID = "mist-verify-test"
+SPOTTER_PAYLOAD = b"placeholder streaming model"
+ADDRESSED = 0.9
+"""A verifier score above the scripted threshold, 0.5: the hit is accepted."""
+UNADDRESSED = 0.1
 REFERENCE_SAMPLE = 0x1234
 REFERENCE_MARKER = REFERENCE_SAMPLE.to_bytes(2, "little") * 2
 SWEEP = "0.3,0.4,0.5,0.6,0.7"
@@ -148,7 +154,7 @@ def write_model(
     """A microWakeWord manifest over a placeholder model file, which `read_manifest` hashes."""
     directory = models_dir / "speech" / "wake" / MODEL_ID
     (directory / "device").mkdir(parents=True, exist_ok=True)
-    payload = b"placeholder streaming model"
+    payload = SPOTTER_PAYLOAD
     (directory / "device" / "mist.tflite").write_bytes(payload)
     manifest = {
         "model_id": MODEL_ID,
@@ -177,6 +183,64 @@ TUNED_CALIBRATION = {
 }
 
 
+def write_verifier(
+    models_dir: Path,
+    *,
+    training: str,
+    listed: Sequence[str] = (),
+    provenance_training: str | None = None,
+    spotter_sha256: str | None = None,
+) -> Path:
+    """The verifier's directory: its manifest, a placeholder model and `provenance.json`.
+
+    `listed` are the sha256 values the provenance says windows were read from, beside one of a
+    training file of its own; the provenance records `provenance_training`, else `training`.
+    """
+    directory = models_dir / "speech" / "wake" / VERIFIER_ID
+    directory.mkdir(parents=True, exist_ok=True)
+    model = b"placeholder verifier model"
+    (directory / "model.onnx").write_bytes(model)
+    provenance = {
+        "version": 1,
+        "training": provenance_training or training,
+        "file_sha256": sorted([hashlib.sha256(b"a training clip").hexdigest(), *listed]),
+        "sources": {
+            "train-split": {"licence": "personal", "version": "1", "files": 1, "hours": 0.5},
+            "synthetic": {"licence": "MIT", "version": "1", "files": 3, "hours": 1.25},
+        },
+        "excluded": {"ami_dev_sha256sums": "d" * 64, "ami_eval_sha256sums": "e" * 64},
+    }
+    data = json.dumps(provenance, indent=2).encode("utf-8")
+    (directory / "provenance.json").write_bytes(data)
+    manifest = {
+        "version": 1,
+        "kind": "wake_verifier",
+        "model_id": VERIFIER_ID,
+        "file": "model.onnx",
+        "sha256": hashlib.sha256(model).hexdigest(),
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "before_ms": 2000,
+        "after_ms": 300,
+        "min_window_ms": 800,
+        "spotter": {
+            "model_id": MODEL_ID,
+            "model_sha256": spotter_sha256 or hashlib.sha256(SPOTTER_PAYLOAD).hexdigest(),
+        },
+        "thresholds": {
+            "cutoffs": list(GRID),
+            "scores": [0.5] * len(GRID),
+            "per_hour": 0.2,
+            "hours": 30.0,
+        },
+        "training": training,
+        "provenance_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    path = directory / "manifest.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return path
+
+
 # -- Engines ----------------------------------------------------------------------------------
 
 
@@ -193,42 +257,70 @@ class FakeClock:
         self.now += ms / 1000
 
 
+class TimedVerifier(ScriptedWakeVerifier):
+    """`ScriptedWakeVerifier` whose every score costs time on the test clock, and logs it."""
+
+    def __init__(self, on_score: Callable[[], None], *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.on_score = on_score
+
+    def score(self, pcm: bytes) -> float:
+        self.on_score()
+        return super().score(pcm)
+
+
 @dataclass
 class Rig:
     """The fakes one harness run is given, kept so a test can read what reached them."""
 
     spotter: ScriptedNameSpotter
-    transcriber: ScriptedTranscriber
+    verifier: ScriptedWakeVerifier
     clock: FakeClock = field(default_factory=FakeClock)
     vad: EnergyVad = field(default_factory=EnergyVad)
+    placements: list[PlacementConfig] = field(default_factory=list)
+
+    @property
+    def engines(self) -> eval_wake.Engines:
+        return eval_wake.Engines(spotter=self.spotter, vad=self.vad, verifier=self.verifier)
+
+    def load(self, placement: PlacementConfig) -> eval_wake.Engines:
+        self.placements.append(placement)
+        return self.engines
 
     def run(self, argv: Sequence[str]) -> int:
-        return eval_wake.main(
-            list(argv),
-            load_engines=lambda placement: eval_wake.Engines(
-                spotter=self.spotter, vad=self.vad, transcriber=self.transcriber
-            ),
-            environ={},
-            clock=self.clock,
-        )
+        return eval_wake.main(list(argv), load_engines=self.load, environ={}, clock=self.clock)
 
 
 def rig(
     hits: Sequence[NameHit],
-    script: Sequence[str],
+    scores: Sequence[float | SpeechEngineError] = (),
     *,
-    decode_ms: Sequence[float] = (),
+    verify_ms: Sequence[float] = (),
+    min_window_ms: int = 400,
+    thresholds: float | Callable[[float], float | None] = 0.5,
 ) -> Rig:
-    """Scripted engines; each gate decode takes the next of `decode_ms` (else 50 ms)."""
-    clock = FakeClock()
-    pending = list(decode_ms)
+    """Scripted engines; each window scored takes the next of `verify_ms` (else 50 ms).
 
-    def decoding() -> None:
+    The verifier's windows are 2000 ms before a hit and 300 ms after it, as the manifest's, but
+    it scores a window of `min_window_ms` and up, 400 ms by default, so a hit 400 ms into a
+    one-second clip is scored; past `scores` every window scores 1.0, against 0.5.
+    """
+    clock = FakeClock()
+    pending = list(verify_ms)
+
+    def verifying() -> None:
         clock.advance(pending.pop(0) if pending else 50.0)
 
     spotter = ScriptedNameSpotter(hits, markers={REFERENCE_MARKER: 0.9})
-    transcriber = ScriptedTranscriber(script, ms_per_word=1, on_decode=decoding)
-    return Rig(spotter=spotter, transcriber=transcriber, clock=clock)
+    verifier = TimedVerifier(
+        verifying,
+        scores,
+        thresholds=thresholds,
+        spotter_model_id=MODEL_ID,
+        model_id=VERIFIER_ID,
+        min_window_ms=min_window_ms,
+    )
+    return Rig(spotter=spotter, verifier=verifier, clock=clock)
 
 
 def offsets(entries: Sequence[Mapping[str, object]], split: str) -> dict[str, int]:
@@ -793,7 +885,7 @@ async def test_the_harness_feeds_the_spotter_what_ingress_feeds_it(tmp_path: Pat
 
     offline = ScriptedNameSpotter()
     driver = eval_wake._Driver(
-        eval_wake.Engines(spotter=offline, vad=EnergyVad(), transcriber=ScriptedTranscriber([])),
+        eval_wake.Engines(spotter=offline, vad=EnergyVad(), verifier=ScriptedWakeVerifier()),
         settings,
         [settings.wake.kws_threshold],
         FakeClock(),
@@ -822,64 +914,17 @@ def test_the_harness_reports_a_hit_in_silence_and_spans_it(tmp_path: Path) -> No
     settings = load_voice_settings({})
     # Frame 150 is in silence more than 1000 ms after the segment's last speech.
     engines = rig([NameHit(end_pos=150, keyword="mist", score=0.9)], [ADDRESSED])
-    driver = eval_wake._Driver(
-        eval_wake.Engines(
-            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
-        ),
-        settings,
-        [0.5],
-        engines.clock,
-    )
+    driver = eval_wake._Driver(engines.engines, settings, [0.5], engines.clock)
 
     outcome = driver.run(item, 0)[0.5]
 
     assert [found.position for found in outcome.hits] == [150]
     assert outcome.accepted
-    window = 1280 // FRAME_MS
-    tail = settings.wake.gate_tail_ms // FRAME_MS
-    # The window and the pre-roll before the hit, and nothing of the unchained segment.
-    assert driver._span(outcome.heard, 150) == (150 - window - 15, 150 + tail)
-    (decode,) = engines.transcriber.streams
-    assert decode.pushed == [(window + 15 + tail + 1) * RATE * FRAME_MS // 1000]
-    # Every hit's span starts where ingress's would: the shared chain start, bounded.
-    for position in (40, 70, 100, 150, len(outcome.heard.frames) - 1):
-        start = eval_wake.name_chain_start(
-            outcome.heard.segments,
-            position,
-            join_gap_ms=settings.wake.join_gap_ms,
-            pre_roll_frames=onset_lead_frames(settings.endpointing),
-            window_frames=window,
-        )
-        bounded = max(start, position - settings.wake.lookback_ms // FRAME_MS, 0)
-        end = min(position + tail, len(outcome.heard.frames) - 1)
-        assert driver._span(outcome.heard, position) == (bounded, end)
-
-
-def test_the_harness_keeps_the_last_speech_frame_heard_by_each_frame() -> None:
-    # Silence (frames 0 to 31), tone (32 to 63), then silence again (64 to 123).
-    samples = tone_and_silence([(False, 640), (True, 640), (False, 1200)])
-    cfg = EndpointingConfig()
-
-    heard = eval_wake._listen(samples.tobytes(), EnergyVad(), cfg)
-
-    # Ingress's rule, from the windows themselves: a window is scored once the frame holding
-    # its last sample arrives, and a speech window's last frame is the latest speech.
-    scorer = EnergyVad().open_stream()
-    floats = samples.astype(np.float32) / 32768.0
-    expected = []
-    latest = -1
-    window = 0
-    for pos in range(len(heard.frames)):
-        while (window + 1) * 512 <= (pos + 1) * 320:
-            start = window * 512
-            if scorer.score(floats[start : start + 512]) >= cfg.vad_threshold:
-                latest = (start + 511) // 320
-            window += 1
-        expected.append(latest)
-    assert heard.last_speech == tuple(expected)
-    assert heard.last_speech[31] == -1
-    assert heard.last_speech[-1] == heard.segments[-1][1]
-    assert all(value <= pos for pos, value in enumerate(heard.last_speech))
+    assert outcome.hits[0].verdict.check == "verified"
+    # 2000 ms before the hit and 300 ms after it, inside the clip's 184 frames.
+    frame_bytes = RATE * FRAME_MS // 1000 * 2
+    assert engines.verifier.windows == [(15 + 100 + 1) * frame_bytes]
+    assert engines.verifier.cutoffs == [0.5]
 
 
 def write_recording(tmp_path: Path, samples: np.ndarray) -> Path:
@@ -895,75 +940,150 @@ def write_recording(tmp_path: Path, samples: np.ndarray) -> Path:
     return write_manifest(tmp_path, [entry("p/a.wav", duration_ms=duration_ms)])
 
 
-def spy_alignments(monkeypatch: pytest.MonkeyPatch) -> list[NameAlignment | None]:
-    """Every alignment the gate's `decide` is given, in order."""
-    seen: list[NameAlignment | None] = []
-    original = eval_wake.AddresseeGate.decide
-
-    def deciding(self: object, **kwargs: object) -> object:
-        seen.append(kwargs.get("alignment"))  # type: ignore[arg-type]
-        return original(self, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(eval_wake.AddresseeGate, "decide", deciding)
-    return seen
-
-
 @pytest.mark.parametrize(
-    ("parts", "hit_at", "speech"),
+    ("hit_at", "window"),
     [
-        # A hit in the silence after the tone: the speech ended before it.
-        ([(False, 640), (True, 640), (False, 2400)], 70, "ended"),
-        # A hit in the tone: speech goes on past it, through the gate tail.
-        ([(False, 640), (True, 2000), (False, 1200)], 60, "going on"),
-        # No speech at all: no speech end is known.
-        ([(False, 3000)], 80, "none"),
+        # Inside the clip on both sides: the whole window.
+        (120, (20, 135)),
+        # Near the start: the clip's first frame bounds it, unpadded.
+        (30, (0, 45)),
+        # Near the end: the clip's last frame (149) bounds it.
+        (145, (45, 149)),
     ],
 )
-def test_the_gate_reads_the_decode_s_words_where_the_spotter_heard_the_name(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    parts: list[tuple[bool, int]],
-    hit_at: int,
-    speech: str,
+def test_the_window_is_verify_window_over_the_clip_s_frames(
+    tmp_path: Path, hit_at: int, window: tuple[int, int]
 ) -> None:
-    seen = spy_alignments(monkeypatch)
-    (item,) = wake_manifest.load_manifest(
-        write_recording(tmp_path, tone_and_silence(parts))
-    ).entries
-    settings = load_voice_settings({})
-    spotter = ScriptedNameSpotter([NameHit(end_pos=hit_at, keyword="mist", score=0.9)])
-    # Every word is the name, 200 ms each from the decode's first sample.
-    transcriber = ScriptedTranscriber([" ".join(["mist"] * 60)], ms_per_word=200)
-    driver = eval_wake._Driver(
-        eval_wake.Engines(spotter=spotter, vad=EnergyVad(), transcriber=transcriber),
-        settings,
-        [0.5],
-        FakeClock(),
+    # 3000 ms of tone: 150 frames.
+    samples = tone_and_silence([(True, 3000)])
+    (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
+    engines = rig([NameHit(end_pos=hit_at, keyword="mist", score=0.9)], min_window_ms=800)
+    pushed: list[bytes] = []
+    original = engines.verifier.score
+
+    def scoring(pcm: bytes) -> float:
+        pushed.append(pcm)
+        return original(pcm)
+
+    engines.verifier.score = scoring  # type: ignore[method-assign]
+    driver = eval_wake._Driver(engines.engines, load_voice_settings({}), [0.5], engines.clock)
+
+    driver.run(item, 0)
+
+    first, last = window
+    frames = eval_wake._frames(wake_manifest.read_pcm16(item.path))
+    assert pushed == [b"".join(frames[first : last + 1])]
+    # The window is the one training and ingress take, `verify_window`'s.
+    shared = verify_window(
+        lambda pos: 0 <= pos < len(frames),
+        hit_at,
+        before_frames=100,
+        after_frames=15,
+        min_frames=40,
+    )
+    assert shared == range(first, last + 1)
+
+
+def test_a_window_under_the_minimum_is_rejected_unscored_and_counted(tmp_path: Path) -> None:
+    # A hit 400 ms into a one-second clip: 20 frames before it and 15 after, 720 ms in all.
+    samples = tone_and_silence([(True, 1000)])
+    (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
+    engines = rig([NameHit(end_pos=20, keyword="mist", score=0.9)], min_window_ms=800)
+    driver = eval_wake._Driver(engines.engines, load_voice_settings({}), [0.3, 0.5], engines.clock)
+
+    outcomes = driver.run(item, 0)
+
+    for outcome in outcomes.values():
+        (found,) = outcome.hits
+        assert not found.verdict.accepted
+        assert found.verdict.check == "not_addressed"
+        assert found.verify_score is None
+    assert engines.verifier.windows == []
+    assert (driver.counts.verifies, driver.counts.failures, driver.counts.short_windows) == (
+        0,
+        0,
+        1,
     )
 
-    outcome = driver.run(item, 0)[0.5]
 
-    (found,) = outcome.hits
-    start, end = driver._span(outcome.heard, hit_at)
-    count = (end - start + 1) * FRAME_MS // 200
-    words = tuple(HeardWord("mist", start + 10 * i, start + 10 * i + 9) for i in range(count))
-    last = outcome.heard.last_speech[end]
-    speech_end = last if last >= 0 else None
-    assert seen == [NameAlignment(hit_at, FRAME_MS, speech_end, words)]
-    if speech == "ended":
-        assert speech_end is not None and speech_end < hit_at
-    elif speech == "going on":
-        assert speech_end is not None and speech_end > hit_at + 5
-    else:
-        assert speech_end is None
-    # The words through the gate tail cover the hit, and every one is the name.
-    assert found.at_hit == found.verdict.at_hit == "name"
+def test_a_failed_score_rejects_the_hit_and_is_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    samples = tone_and_silence([(True, 1000)])
+    (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
+    engines = rig(
+        [NameHit(end_pos=30, keyword="mist", score=0.9)],
+        [SpeechEngineError("scripted verify failure")],
+        verify_ms=[40.0],
+    )
+    driver = eval_wake._Driver(engines.engines, load_voice_settings({}), [0.3, 0.5], engines.clock)
+    caplog.set_level(logging.DEBUG)
+
+    outcomes = driver.run(item, 0)
+
+    assert [outcome.reason for outcome in outcomes.values()] == ["not_addressed"] * 2
+    # Scored once, at the first threshold, and the failure reused at the second.
+    assert len(engines.verifier.windows) == 1
+    assert (driver.counts.verifies, driver.counts.failures, driver.counts.times_ms) == (
+        1,
+        1,
+        [40.0],
+    )
+    assert "p/a.wav" not in caplog.text and "a.wav" not in caplog.text
+
+
+def test_the_verifier_is_asked_for_the_threshold_of_each_cutoff(tmp_path: Path) -> None:
+    # The table is stricter from 0.5 up: the one window's score, 0.7, passes at 0.3 alone.
+    samples = tone_and_silence([(True, 1000)])
+    (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
+    engines = rig(
+        [NameHit(end_pos=30, keyword="mist", score=0.9)],
+        [0.7],
+        thresholds=lambda cutoff: 0.8 if cutoff >= 0.5 else 0.6,
+    )
+    driver = eval_wake._Driver(
+        engines.engines, load_voice_settings({}), [0.3, 0.5, 0.6], engines.clock
+    )
+
+    outcomes = driver.run(item, 0)
+
+    assert {cutoff: bool(outcome.accepted) for cutoff, outcome in outcomes.items()} == {
+        0.3: True,
+        0.5: False,
+        0.6: False,
+    }
+    assert engines.verifier.cutoffs == [0.3, 0.5, 0.6]
+    assert len(engines.verifier.windows) == 1
+
+
+def test_a_cutoff_below_the_table_rejects_every_hit(tmp_path: Path) -> None:
+    samples = tone_and_silence([(True, 1000)])
+    (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
+    engines = rig(
+        [NameHit(end_pos=30, keyword="mist", score=0.9)],
+        thresholds=lambda cutoff: None if cutoff < 0.01 else 0.5,
+    )
+    driver = eval_wake._Driver(
+        engines.engines, load_voice_settings({}), [0.005, 0.5], engines.clock
+    )
+
+    outcomes = driver.run(item, 0)
+
+    assert outcomes[0.005].reason == "not_addressed"
+    assert outcomes[0.5].accepted
 
 
 # -- The harness: refusals --------------------------------------------------------------------
 
 
-def small_setup(tmp_path: Path, **model: object) -> tuple[Path, Path, list[dict[str, object]]]:
+def small_setup(
+    tmp_path: Path, *, verifier: Mapping[str, object] | None = None, **model: object
+) -> tuple[Path, Path, list[dict[str, object]]]:
+    """A manifest of one entry in each split and a test media clip, the model and its verifier.
+
+    `verifier` holds `write_verifier`'s keyword arguments, its `training` defaulting to the
+    manifest's train sha256.
+    """
     entries = [
         entry("p/train.wav", split="train", session="s-train"),
         entry("p/tune.wav", split="tune", session="s-tune"),
@@ -974,11 +1094,22 @@ def small_setup(tmp_path: Path, **model: object) -> tuple[Path, Path, list[dict[
     training = wake_manifest.subset_sha256(wake_manifest.load_manifest(path), "train")
     models_dir = tmp_path / "models"
     write_model(models_dir, training=str(model.pop("training", training)), **model)
+    options: dict[str, object] = dict(verifier or {})
+    trained = str(options.pop("training", training))
+    write_verifier(models_dir, training=trained, **options)  # type: ignore[arg-type]
     return path, models_dir, entries
 
 
-def harness_args(path: Path, models_dir: Path, out: Path, split: str, thresholds: str) -> list[str]:
-    return [
+def harness_args(
+    path: Path,
+    models_dir: Path,
+    out: Path,
+    split: str,
+    thresholds: str,
+    *,
+    verifier: str | None = VERIFIER_ID,
+) -> list[str]:
+    argv = [
         "--manifest",
         str(path),
         "--model",
@@ -992,6 +1123,7 @@ def harness_args(path: Path, models_dir: Path, out: Path, split: str, thresholds
         "--out",
         str(out),
     ]
+    return argv + (["--verifier", verifier] if verifier is not None else [])
 
 
 def test_the_train_split_is_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1050,20 +1182,141 @@ def test_a_test_run_before_the_tuning_pass_is_written_is_refused(
     assert not out.exists()
 
 
-def test_the_real_engines_need_an_stt_factory(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("verifier", "reason"), [(None, "--verifier is required"), ("Bad_Id", "Bad_Id")]
+)
+def test_a_missing_or_malformed_verifier_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], verifier: str | None, reason: str
 ) -> None:
     path, models_dir, _ = small_setup(tmp_path)
     out = tmp_path / "eval.json"
+    engines = rig([])
 
-    code = eval_wake.main(harness_args(path, models_dir, out, "tune", "0.5"), environ={})
+    code = engines.run(harness_args(path, models_dir, out, "tune", "0.5", verifier=verifier))
 
     assert code == 2
-    assert "--stt-factory" in capsys.readouterr().err
+    assert reason in capsys.readouterr().err
     assert not out.exists()
+    assert engines.placements == []
 
 
-def test_the_real_engines_load_the_microwakeword_spotter_and_the_named_stt(
+def provenance_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], split: str = "tune", **verifier: object
+) -> str:
+    """Run with this verifier; assert the refusal (exit 2, nothing written or scored)."""
+    path, models_dir, entries = small_setup(
+        tmp_path, verifier=verifier, calibration=TUNED_CALIBRATION
+    )
+    out = tmp_path / "eval.json"
+    engines = rig([NameHit(end_pos=20, keyword="mist", score=0.9)])
+
+    code = engines.run(harness_args(path, models_dir, out, split, "0.5"))
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert err.startswith("eval_wake: ")
+    assert not out.exists()
+    assert engines.placements == []
+    assert engines.vad.streams == engines.spotter.streams == []
+    assert engines.verifier.windows == []
+    # A refusal names no recording.
+    for item in entries:
+        assert Path(str(item["file"])).name not in err
+    return err
+
+
+def entry_sha256(tmp_path: Path, file: str) -> str:
+    return hashlib.sha256((tmp_path / "recordings" / file).read_bytes()).hexdigest()
+
+
+def test_a_verifier_trained_on_another_training_split_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = provenance_refused(tmp_path, capsys, training="0" * 64)
+
+    assert VERIFIER_ID in err and "train" in err
+
+
+def test_a_provenance_recording_another_training_split_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = provenance_refused(tmp_path, capsys, provenance_training="1" * 64)
+
+    assert "provenance" in err and "training" in err
+
+
+@pytest.mark.parametrize(
+    ("file", "split"), [("p/tune.wav", "tune"), ("p/test.wav", "tune"), ("m/test.wav", "test")]
+)
+def test_a_tune_or_test_entry_in_the_provenance_is_refused_whatever_the_split_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], file: str, split: str
+) -> None:
+    # The recordings are written before the verifier, so their digests are known here.
+    write_manifest(
+        tmp_path,
+        [
+            entry("p/train.wav", split="train", session="s-train"),
+            entry("p/tune.wav", split="tune", session="s-tune"),
+            entry("p/test.wav", split="test", session="s-test"),
+            entry("m/test.wav", "media", "test", phrase="", session="s-test-media"),
+        ],
+    )
+    listed = [entry_sha256(tmp_path, file)]
+
+    err = provenance_refused(tmp_path, capsys, split, listed=listed)
+
+    assert "1 of the 3 tune and test entries" in err
+    assert listed[0] not in err
+
+
+def test_a_train_entry_in_the_provenance_is_what_it_should_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_manifest(tmp_path, [entry("p/train.wav", split="train", session="s-train")])
+    listed = [entry_sha256(tmp_path, "p/train.wav")]
+    path, models_dir, _ = small_setup(tmp_path, verifier={"listed": listed})
+    out = tmp_path / "eval.json"
+
+    assert rig([]).run(harness_args(path, models_dir, out, "tune", "0.5")) == 0
+
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["provenance"] == {
+        "files": 2,
+        "sources": {
+            "synthetic": {"files": 3, "hours": 1.25},
+            "train-split": {"files": 1, "hours": 0.5},
+        },
+        "checked": {"tune": 1, "test": 2},
+    }
+
+
+def test_a_provenance_file_other_than_the_one_the_manifest_pins_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, models_dir, _ = small_setup(tmp_path)
+    provenance = models_dir / "speech" / "wake" / VERIFIER_ID / "provenance.json"
+    provenance.write_text(provenance.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    out = tmp_path / "eval.json"
+    engines = rig([])
+
+    code = engines.run(harness_args(path, models_dir, out, "tune", "0.5"))
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "provenance" in err
+    assert not out.exists()
+    assert engines.placements == []
+
+
+def test_a_verifier_for_another_spotter_model_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = provenance_refused(tmp_path, capsys, spotter_sha256="f" * 64)
+
+    assert MODEL_ID in err
+
+
+def test_the_real_engines_load_the_spotter_the_vad_and_the_verifier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, object] = {}
@@ -1076,66 +1329,51 @@ def test_the_real_engines_load_the_microwakeword_spotter_and_the_named_stt(
 
     class Vad:
         @staticmethod
-        def load(placement: PlacementConfig, **kwargs: object) -> str:
-            seen["vad"] = placement
+        def load(
+            placement: PlacementConfig, *, session_factory: object, available_providers: object
+        ) -> str:
+            seen["vad"] = (placement, session_factory, available_providers)
             return "vad"
 
-    def stt(placement: PlacementConfig) -> str:
-        seen["stt"] = placement
-        return "stt"
+    class Verifier:
+        @staticmethod
+        def load(
+            placement: PlacementConfig, *, session_factory: object, available_providers: object
+        ) -> str:
+            seen["verifier"] = (placement, session_factory, available_providers)
+            return "verifier"
 
     monkeypatch.setattr(eval_wake, "MicroNameSpotter", Spotter)
     monkeypatch.setattr(eval_wake, "SileroVad", Vad)
-    monkeypatch.setattr(eval_wake, "parakeet_cpu", stt)
+    monkeypatch.setattr(eval_wake, "OnnxWakeVerifier", Verifier)
     placement = PlacementConfig(models_dir="/models", kws_model=MODEL_ID)
 
-    engines = eval_wake.real_engines("scripts.wake.eval_wake:parakeet_cpu")(placement)
+    engines = eval_wake.real_engines(VERIFIER_ID)(placement)
 
-    assert engines == eval_wake.Engines(spotter="spotter", vad="vad", transcriber="stt")  # type: ignore[arg-type]
+    assert engines == eval_wake.Engines(spotter="spotter", vad="vad", verifier="verifier")  # type: ignore[arg-type]
+    onnx = (eval_wake.open_onnx_session, eval_wake.onnxruntime_providers)
     assert seen == {
         "spotter": (placement, eval_wake.import_micro_runtime),
-        "vad": placement,
-        "stt": placement,
+        "vad": (placement, *onnx),
+        "verifier": (
+            PlacementConfig(models_dir="/models", kws_model=MODEL_ID, verify_model=VERIFIER_ID),
+            *onnx,
+        ),
     }
 
 
-def test_parakeet_cpu_loads_parakeet_from_the_placement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_the_engines_are_loaded_with_the_model_and_the_verifier_under_test(
+    tmp_path: Path,
 ) -> None:
-    weights = tmp_path / "models" / "speech" / "istupakov" / "parakeet-tdt-0.6b-v2-onnx"
-    weights.mkdir(parents=True)
-    (weights / "vocab.txt").write_text("placeholder", encoding="utf-8")
-    loads: list[tuple[tuple, dict]] = []
-    timestamped: list[object] = []
+    path, models_dir, _ = small_setup(tmp_path)
+    engines = rig([])
+    argv = harness_args(path, models_dir, tmp_path / "eval.json", "tune", "0.5")
 
-    class Options:
-        intra_op_num_threads = 0
-        inter_op_num_threads = 0
+    assert engines.run(argv) == 0
 
-    class Model:
-        """onnx-asr's text adapter: the transcriber asks it for the timestamped one."""
-
-        def with_timestamps(self) -> object:
-            model = object()
-            timestamped.append(model)
-            return model
-
-    def load_model(*args: object, **kwargs: object) -> Model:
-        loads.append((args, kwargs))
-        return Model()
-
-    def fake_import() -> OnnxAsrLibrary:
-        return OnnxAsrLibrary(load_model=load_model, session_options=Options, errors=())
-
-    monkeypatch.setattr(eval_wake, "import_onnx_asr", fake_import)
-    factory = importlib.import_module("scripts.wake.eval_wake").parakeet_cpu
-
-    transcriber = factory(PlacementConfig(models_dir=str(tmp_path / "models")))
-
-    assert isinstance(transcriber, ParakeetTranscriber)
-    ((_, kwargs),) = loads
-    assert kwargs["path"] == str(weights)
-    assert len(timestamped) == 1
+    (placement,) = engines.placements
+    assert (placement.kws_model, placement.verify_model) == (MODEL_ID, VERIFIER_ID)
+    assert placement.models_dir == str(models_dir)
 
 
 # -- The harness: the tuning pass -------------------------------------------------------------
@@ -1146,9 +1384,10 @@ def tune_setup(tmp_path: Path) -> tuple[list[str], Rig, Path, list[dict[str, obj
 
     Positives: p1 "hey mist" (headset, 0.65), p2 "hey mist" (desk, 0.45), p3 "mist" alone
     (headset, 0.55, 640 ms of speech then 640 ms of silence, the hit 100 ms after the speech
-    end) and p4 "are you there mist" (desk, 0.35, a decode the gate rejects). Homophones h1 and
-    h2 both score 0.6; only h1's decode is addressed. Media m1 scores 0.5 and is addressed; m2
-    scores 0.7 but its reference holds the name at 0.9, so the gate rejects it as self media.
+    end) and p4 "are you there mist" (desk, 0.35, a window the verifier rejects). Homophones h1
+    and h2 both score 0.6; only h1's window passes the verifier. Media m1 scores 0.5 and passes;
+    m2 scores 0.7 but its reference holds the name at 0.9, so the gate rejects it as self media
+    before its window is scored. The first three windows take 100, 200 and 300 ms.
     """
     recordings = tmp_path / "recordings"
     write_wav(recordings / "p" / "p3.wav", tone_ms=640, silence_ms=640)
@@ -1170,6 +1409,7 @@ def tune_setup(tmp_path: Path) -> tuple[list[str], Rig, Path, list[dict[str, obj
     training = wake_manifest.subset_sha256(wake_manifest.load_manifest(path), "train")
     models_dir = tmp_path / "models"
     write_model(models_dir, training=training)
+    write_verifier(models_dir, training=training)
     at = offsets(entries, "tune")
     hits = [
         hit(at, "p/p1.wav", 20, 0.65),
@@ -1181,8 +1421,8 @@ def tune_setup(tmp_path: Path) -> tuple[list[str], Rig, Path, list[dict[str, obj
         hit(at, "m/m1.wav", 20, 0.5),
         hit(at, "m/m2.wav", 25, 0.7),
     ]
-    script = [ADDRESSED, ADDRESSED, "mist", UNADDRESSED, ADDRESSED, UNADDRESSED, ADDRESSED]
-    engines = rig(hits, script, decode_ms=[100.0, 200.0, 300.0])
+    scores = [ADDRESSED, ADDRESSED, ADDRESSED, UNADDRESSED, ADDRESSED, UNADDRESSED, ADDRESSED]
+    engines = rig(hits, scores, verify_ms=[100.0, 200.0, 300.0])
     out = tmp_path / "eval" / "wake_eval.json"
     return harness_args(path, models_dir, out, "tune", SWEEP), engines, out, entries
 
@@ -1227,6 +1467,8 @@ def test_the_tuning_pass_writes_the_rates_per_threshold(tmp_path: Path) -> None:
     assert low["by_phrase"]["are you there mist"] == {"rate": 1.0, "rejected": 1, "total": 1}
     assert low["files"] == ["p/p4.wav"]
     assert low["reasons"] == {"not_addressed": 1}
+    # Nothing of what a transcript wrote: the rates, the files and the gate's reasons.
+    assert set(low) == {"overall", "by_condition", "by_phrase", "files", "reasons"}
     assert rows[0.4]["false_reject"]["reasons"] == {"no_hit": 1}
 
     middle = rows[0.5]["false_reject"]
@@ -1250,21 +1492,29 @@ def test_the_tuning_pass_writes_the_rates_per_threshold(tmp_path: Path) -> None:
     assert rows[0.7]["homophone_false_accepts"]["share"] == 0.0
 
 
-def test_the_report_counts_the_word_at_each_missed_positive_s_first_hit(tmp_path: Path) -> None:
+def test_each_hit_position_is_scored_once_whatever_the_threshold(tmp_path: Path) -> None:
     argv, engines, out, _ = tune_setup(tmp_path)
 
     assert engines.run(argv) == 0
 
-    rows = by_threshold(json.loads(out.read_text(encoding="utf-8")))
-    # At 0.3 p4 is missed on its decode, whose words the scripted STT times at the span's
-    # start, inside the alias window before its hit at frame 20, and none is a name.
-    assert rows[0.3]["false_reject"]["at_hit"] == {"other": 1}
-    # From 0.4 up the missed positives have no hit, so no word at one.
-    for threshold in (0.4, 0.5, 0.6, 0.7):
-        assert rows[threshold]["false_reject"]["at_hit"] == {}
+    # Seven hits reach the verifier, each at up to five thresholds, and each window is scored
+    # once: m2 is rejected as self media first, and the sweep reuses the rest.
+    assert len(engines.verifier.windows) == 7
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["verifier_id"] == VERIFIER_ID
+    assert report["verify"] == {
+        "count": 7,
+        "failures": 0,
+        "short_windows": 0,
+        "wall_s": 0.8,
+        "p50_ms": 50.0,
+        "p90_ms": 240.0,
+    }
+    # The verifier's after_ms, 300, plus the measured verify times.
+    assert report["accept_ms"] == {"p50": 350.0, "p90": 540.0, "after_ms": 300}
 
 
-def test_a_hit_rejected_before_its_decode_has_no_timings(tmp_path: Path) -> None:
+def test_a_hit_rejected_before_verification_is_never_scored(tmp_path: Path) -> None:
     # The reference holds the name at 0.9, so the gate rejects p1's hit as self media.
     recordings = tmp_path / "recordings"
     write_wav(recordings / "p" / "ref.wav", tone_ms=1000, constant=REFERENCE_SAMPLE)
@@ -1275,14 +1525,18 @@ def test_a_hit_rejected_before_its_decode_has_no_timings(tmp_path: Path) -> None
     path = write_manifest(tmp_path, entries)
     training = wake_manifest.subset_sha256(wake_manifest.load_manifest(path), "train")
     write_model(tmp_path / "models", training=training)
+    write_verifier(tmp_path / "models", training=training)
     engines = rig([hit(offsets(entries, "tune"), "p/p1.wav", 25, 0.7)], [ADDRESSED])
     out = tmp_path / "eval.json"
 
     assert engines.run(harness_args(path, tmp_path / "models", out, "tune", "0.5")) == 0
 
-    (row,) = json.loads(out.read_text(encoding="utf-8"))["thresholds"]
+    report = json.loads(out.read_text(encoding="utf-8"))
+    (row,) = report["thresholds"]
     assert row["false_reject"]["reasons"] == {"self_media": 1}
-    assert row["false_reject"]["at_hit"] == {"no_timings": 1}
+    assert engines.verifier.windows == []
+    assert report["verify"]["count"] == 0
+    assert report["accept_ms"] == {"p50": None, "p90": None, "after_ms": 300}
 
 
 def test_the_tuning_pass_writes_latency_and_the_measured_hit_lag(tmp_path: Path) -> None:
@@ -1291,8 +1545,8 @@ def test_the_tuning_pass_writes_latency_and_the_measured_hit_lag(tmp_path: Path)
     assert engines.run(argv) == 0
 
     rows = by_threshold(json.loads(out.read_text(encoding="utf-8")))
-    # Accepted positives at 0.3: p1, p2 and p3, decoded in 100, 200 and 300 ms after the
-    # 300 ms gate tail.
+    # Accepted positives at 0.3: p1, p2 and p3, verified in 100, 200 and 300 ms after the
+    # verifier's 300 ms after the hit; at 0.5, p1 and p3.
     assert rows[0.3]["wake_accept_ms"] == {"p50": 500.0, "p90": 580.0, "count": 3}
     assert rows[0.5]["wake_accept_ms"] == {"p50": 500.0, "p90": 580.0, "count": 2}
     assert rows[0.7]["wake_accept_ms"] == {"p50": None, "p90": None, "count": 0}
@@ -1300,11 +1554,15 @@ def test_the_tuning_pass_writes_latency_and_the_measured_hit_lag(tmp_path: Path)
     for threshold in (0.3, 0.4, 0.5):
         assert rows[threshold]["hit_lag_ms"] == {"median": 100, "p90": 100.0, "count": 1}
         screen = rows[threshold]["wake_screen_ms"]
-        assert screen["p50"] == 100.0 and screen["p90"] == 100.0
         assert screen["hit_lag_ms"] == 100
+    # The screen moves at acceptance: each woken positive's hit lag plus its accept time.
+    # At 0.3 and 0.4, 100 plus 400, 500 and 600 ms; at 0.5, plus 400 and 600 ms.
+    for threshold in (0.3, 0.4):
+        screen = rows[threshold]["wake_screen_ms"]
+        assert (screen["p50"], screen["p90"], screen["count"]) == (600.0, 680.0, 3)
+    screen = rows[0.5]["wake_screen_ms"]
+    assert (screen["p50"], screen["p90"], screen["count"]) == (600.0, 680.0, 2)
     assert rows[0.6]["hit_lag_ms"] == {"median": None, "p90": None, "count": 0}
-    # One decode per distinct span: m2 never reaches the STT, and the sweep reuses the rest.
-    assert len(engines.transcriber.streams) == 7
 
 
 def test_the_tuning_pass_writes_both_calibration_tables(tmp_path: Path) -> None:
@@ -1342,24 +1600,27 @@ def test_positive_quantiles_from_known_scores() -> None:
     assert table == [(0.1, 0.0), (0.5, 0.8), (0.8, 0.8), (1.0, 1.0)]
 
 
-def test_no_transcript_text_reaches_the_output_or_the_logs(
+def test_no_recording_is_named_in_the_logs_or_the_printed_lines(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    argv, engines, out, _ = tune_setup(tmp_path)
+    argv, engines, out, entries = tune_setup(tmp_path)
+    # p4's window fails, which is logged.
+    engines.verifier.scores[3] = SpeechEngineError("scripted verify failure")
     caplog.set_level(logging.DEBUG)
 
     assert engines.run(argv) == 0
 
     captured = capsys.readouterr()
-    written = out.read_text(encoding="utf-8")
-    for word in SECRET_WORDS:
-        assert word not in written
-        assert word not in caplog.text
-        assert word not in captured.out
-        assert word not in captured.err
+    for item in entries:
+        name = Path(str(item["file"])).stem
+        assert name not in caplog.text
+        assert name not in captured.out
+        assert name not in captured.err
+    assert "Verify failed" in caplog.text
     assert caplog.records, "the run should log its progress"
+    assert json.loads(out.read_text(encoding="utf-8"))["verify"]["failures"] == 1
 
 
 # -- The driver's entry points for spotter_eval ------------------------------------------------
@@ -1376,12 +1637,14 @@ def test_accepted_wakes_equal_the_tuning_pass_count(tmp_path: Path) -> None:
     positives = [item for item in tune if item.label == "positive"]
     assert positives == list(tune[: len(positives)])
 
+    counts = eval_wake.VerifyCounts()
     woken = eval_wake.accepted_wakes(
         positives,
-        eval_wake.Engines(spotter=fresh.spotter, vad=fresh.vad, transcriber=fresh.transcriber),
+        fresh.engines,
         load_voice_settings({}),
         [0.3, 0.4, 0.5, 0.6, 0.7],
         fresh.clock,
+        counts=counts,
     )
 
     reported = {
@@ -1390,6 +1653,9 @@ def test_accepted_wakes_equal_the_tuning_pass_count(tmp_path: Path) -> None:
         for threshold, row in rows.items()
     }
     assert woken == reported == {0.3: 3, 0.4: 3, 0.5: 2, 0.6: 1, 0.7: 0}
+    # The four positives' windows, each scored once, in 100, 200, 300 and 50 ms.
+    assert (counts.verifies, counts.failures, counts.short_windows) == (4, 0, 0)
+    assert counts.times_ms == pytest.approx([100.0, 200.0, 300.0, 50.0])
 
 
 def tune_positives(tmp_path: Path) -> tuple[list[wake_manifest.Entry], Rig]:
@@ -1403,25 +1669,16 @@ def test_gate_checks_count_each_positive_s_first_hit(tmp_path: Path) -> None:
     positives, engines = tune_positives(tmp_path)
 
     checks = eval_wake.gate_checks(
-        positives,
-        eval_wake.Engines(
-            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
-        ),
-        load_voice_settings({}),
-        0.3,
-        engines.clock,
+        positives, engines.engines, load_voice_settings({}), 0.3, engines.clock
     )
 
-    # p1 and p2 open with "hey mist", p3 says "mist" alone and p4's decode is unaddressed.
-    assert checks.first_hit == {"phrase": 2, "vocative": 1, "not_addressed": 1}
+    # The verifier passes p1 to p3 and rejects p4.
+    assert checks.first_hit == {"verified": 3, "not_addressed": 1}
     # p1 to p3 say the name alone ("hey mist", "mist"); p4 says it in a sentence.
     assert checks.first_hit_by_group == {
-        "name_alone": {"phrase": 2, "vocative": 1},
+        "name_alone": {"verified": 3},
         "sentence": {"not_addressed": 1},
     }
-    # The scripted STT times every word at its span's start: frame 0, in the alias window of a
-    # hit at frame 20 (p1, p2, p4) and before the window of p3's hit at frame 36.
-    assert checks.at_hit == {"name": 2, "other": 1, "none": 1}
     # p3's hit lands 100 ms after its speech; the others' hits are in their tone.
     assert checks.places == (
         ("inside", None),
@@ -1435,44 +1692,30 @@ def test_gate_checks_count_a_positive_with_no_hit(tmp_path: Path) -> None:
     positives, engines = tune_positives(tmp_path)
 
     checks = eval_wake.gate_checks(
-        positives,
-        eval_wake.Engines(
-            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
-        ),
-        load_voice_settings({}),
-        0.5,
-        engines.clock,
+        positives, engines.engines, load_voice_settings({}), 0.5, engines.clock
     )
 
-    # At 0.5 p2 (0.45) and p4 (0.35) have no hit, and so no word or place at one. The script
-    # is read in decode order, so p3's decode is the second, "hey mist quokka".
-    assert checks.first_hit == {"no_hit": 2, "phrase": 2}
+    # At 0.5 p2 (0.45) and p4 (0.35) have no hit, and so no place. The scores are read in the
+    # order the windows are scored, so p3's is the second, which passes.
+    assert checks.first_hit == {"no_hit": 2, "verified": 2}
     assert checks.first_hit_by_group == {
-        "name_alone": {"no_hit": 1, "phrase": 2},
+        "name_alone": {"no_hit": 1, "verified": 2},
         "sentence": {"no_hit": 1},
     }
-    assert sum(checks.at_hit.values()) == len(checks.places) == 2
+    assert len(checks.places) == 2
 
 
 def test_gate_checks_count_a_first_hit_with_no_segment_before_it(tmp_path: Path) -> None:
     # 2400 ms of silence and then 640 ms of tone: the hit at frame 50 has no segment before it.
     samples = tone_and_silence([(False, 2400), (True, 640)])
     (item,) = wake_manifest.load_manifest(write_recording(tmp_path, samples)).entries
-    engines = rig([NameHit(end_pos=50, keyword="mist", score=0.9)], [])
+    engines = rig([NameHit(end_pos=50, keyword="mist", score=0.9)], [UNADDRESSED])
 
     checks = eval_wake.gate_checks(
-        [item],
-        eval_wake.Engines(
-            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
-        ),
-        load_voice_settings({}),
-        0.5,
-        engines.clock,
+        [item], engines.engines, load_voice_settings({}), 0.5, engines.clock
     )
 
     assert checks.places == (("no_segment", None),)
-    # The scripted decode past its script is empty: no word at the hit.
-    assert checks.at_hit == {"none": 1}
     assert checks.first_hit == {"not_addressed": 1}
 
 
@@ -1488,38 +1731,33 @@ def write_ambient(path: Path) -> None:
 
 
 # Every ambient file's stream reports a hit at frame 50, in its speech, and one at frame 90, in
-# silence after the segment has closed, which is reported and gated too. Their spans differ.
+# silence after the segment has closed, which is reported and gated too. Their windows differ.
 AMBIENT_HITS = (
     NameHit(end_pos=50, keyword="mist", score=0.6),
     NameHit(end_pos=90, keyword="mist", score=0.7),
 )
 
 
-def test_the_ambient_gate_hears_each_file_once_and_decodes_each_span_once(
+def test_the_ambient_gate_hears_each_file_once_and_scores_each_hit_position_once(
     tmp_path: Path,
 ) -> None:
     first, second = tmp_path / "ambient" / "a.wav", tmp_path / "ambient" / "b.wav"
     write_ambient(first)
     write_ambient(second)
-    # The first file's speech hit decodes unaddressed and its silence hit addressed; the second
-    # file's decodes are past the script, so empty.
-    engines = rig(AMBIENT_HITS, [UNADDRESSED, ADDRESSED])
-    gate = eval_wake.AmbientGate(
-        eval_wake.Engines(
-            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
-        ),
-        load_voice_settings({}),
-        engines.clock,
-    )
+    # The first file's speech hit is rejected and its silence hit passes; neither of the
+    # second file's passes.
+    engines = rig(AMBIENT_HITS, [UNADDRESSED, ADDRESSED, UNADDRESSED, UNADDRESSED])
+    gate = eval_wake.AmbientGate(engines.engines, load_voice_settings({}), engines.clock)
 
     assert gate.accepted_hits(first, 0.5) == 1
     assert gate.accepted_hits(first, 0.65) == 1
     assert gate.accepted_hits(first, 0.3) == 1
-    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (1, 2, 2)
+    assert (len(engines.vad.streams), len(engines.verifier.windows)) == (1, 2)
+    assert gate.counts.verifies == 2
 
     assert gate.accepted_hits(second, 0.5) == 0
-    assert (len(engines.vad.streams), len(engines.transcriber.streams), gate.decodes) == (2, 4, 4)
-    assert gate.decode_errors == 0
+    assert (len(engines.vad.streams), len(engines.verifier.windows)) == (2, 4)
+    assert (gate.counts.verifies, gate.counts.failures) == (4, 0)
 
     assert [stream.threshold for stream in engines.spotter.streams] == [0.5, 0.65, 0.3, 0.5]
     for stream in engines.spotter.streams:
@@ -1527,30 +1765,21 @@ def test_the_ambient_gate_hears_each_file_once_and_decodes_each_span_once(
         assert {50, 90} <= set(stream.pushed)
 
 
-def test_a_failed_ambient_decode_is_rejected_counted_and_logged_by_number(
+def test_a_failed_ambient_score_is_rejected_counted_and_logged_by_number(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "ambient" / "meeting-secret.wav"
     write_ambient(path)
-    clock = FakeClock()
-
-    def failing() -> None:
-        raise SpeechEngineError("scripted decode failure")
-
-    spotter = ScriptedNameSpotter(AMBIENT_HITS)
-    transcriber = ScriptedTranscriber([ADDRESSED], ms_per_word=1, on_decode=failing)
-    gate = eval_wake.AmbientGate(
-        eval_wake.Engines(spotter=spotter, vad=EnergyVad(), transcriber=transcriber),
-        load_voice_settings({}),
-        clock,
-    )
+    failure = SpeechEngineError("scripted verify failure")
+    engines = rig(AMBIENT_HITS, [failure, failure])
+    gate = eval_wake.AmbientGate(engines.engines, load_voice_settings({}), engines.clock)
     caplog.set_level(logging.DEBUG)
 
     assert gate.accepted_hits(path, 0.5) == 0
     assert gate.accepted_hits(path, 0.3) == 0
 
-    # Both hits' spans fail once each, and neither is decoded again at the second threshold.
-    assert (gate.decodes, gate.decode_errors, len(transcriber.streams)) == (2, 2, 2)
+    # Both hits' windows fail once each, and neither is scored again at the second threshold.
+    assert (gate.counts.verifies, gate.counts.failures, len(engines.verifier.windows)) == (2, 2, 2)
     assert "ambient file 1" in caplog.text
     assert "meeting-secret" not in caplog.text
     assert str(tmp_path) not in caplog.text
@@ -1574,23 +1803,17 @@ def test_the_ambient_split_counts_hits_near_a_segment_and_the_rest(tmp_path: Pat
     assert positions["no segment"] < onset - lead
     assert positions["600 ms past"] < len(heard.frames)
     hits = [NameHit(end_pos=pos, keyword="mist", score=0.7) for pos in positions.values()]
-    # Every decode is past the script, so empty: the split counts hits reported, not accepted.
-    engines = rig(hits, [])
-    gate = eval_wake.AmbientGate(
-        eval_wake.Engines(
-            spotter=engines.spotter, vad=engines.vad, transcriber=engines.transcriber
-        ),
-        settings,
-        engines.clock,
-    )
+    # Every window is rejected: the split counts hits reported, not accepted.
+    engines = rig(hits, [UNADDRESSED] * len(hits))
+    gate = eval_wake.AmbientGate(engines.engines, settings, engines.clock)
 
     assert gate.hit_places(path, 0.5) == (3, 2)
 
     # The split reads the hits `accepted_hits` recorded: no second pass over the file.
     assert gate.accepted_hits(path, 0.5) == 0
-    decodes, streams = gate.decodes, len(engines.spotter.streams)
+    verifies, streams = gate.counts.verifies, len(engines.spotter.streams)
     assert gate.hit_places(path, 0.5) == (3, 2)
-    assert (gate.decodes, len(engines.spotter.streams)) == (decodes, streams)
+    assert (gate.counts.verifies, len(engines.spotter.streams)) == (verifies, streams)
     # Above every hit's score nothing is reported.
     assert gate.hit_places(path, 0.8) == (0, 0)
 
@@ -1606,7 +1829,7 @@ def test_the_test_pass_reads_the_lag_and_tables_from_the_model_and_writes_none(
     engines = rig(
         [hit(at, "p/test.wav", 20, 0.65), hit(at, "m/test.wav", 20, 0.4)],
         [ADDRESSED],
-        decode_ms=[150.0],
+        verify_ms=[150.0],
     )
     out = tmp_path / "eval.json"
 
@@ -1620,7 +1843,8 @@ def test_the_test_pass_reads_the_lag_and_tables_from_the_model_and_writes_none(
     assert row["threshold"] == 0.5
     assert "hit_lag_ms" not in row
     assert row["false_reject"]["overall"] == {"rate": 0.0, "rejected": 0, "total": 1}
+    # 300 ms after the hit and a 150 ms verify; the screen moves then, 120 ms of lag later.
     assert row["wake_accept_ms"] == {"p50": 450.0, "p90": 450.0, "count": 1}
-    assert row["wake_screen_ms"] == {"p50": 120.0, "p90": 120.0, "count": 1, "hit_lag_ms": 120}
+    assert row["wake_screen_ms"] == {"p50": 570.0, "p90": 570.0, "count": 1, "hit_lag_ms": 120}
     assert row["media_false_accepts"]["count"] == 0
     assert len(engines.vad.streams) == 2
