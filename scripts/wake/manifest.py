@@ -53,7 +53,7 @@ import sys
 import wave
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 LABELS = ("positive", "homophone", "media")
 SPLITS = ("train", "tune", "test")
@@ -286,22 +286,35 @@ def _check_splits(entries: Sequence[Entry]) -> None:
                 )
 
 
-def load_manifest(path: Path) -> RecordingManifest:
+def load_manifest(path: Path, *, root_map: Mapping[str, str] | None = None) -> RecordingManifest:
     """Read and check a recording manifest.
+
+    `root_map` translates the root as written to where the recordings are mounted, for a
+    manifest written on one machine and read in a container: `{"D:/wake": "/wake"}` reads
+    `D:/wake/recordings/a.wav` from `/wake/recordings/a.wav`. The manifest's `root` stays as
+    written, so `subset_bytes` and `subset_sha256` are the same whichever way it is read.
 
     Raises:
         ManifestError: The manifest is malformed, an entry fails a check (named by its index
             and file), a file or its contents is listed twice, or two splits share a homophone
             sentence or a session holding media (both entries named). A session without media
-            may span the splits.
+            may span the splits. With `root_map`, the root matches none of its keys.
     """
-    root, entries = _read(path, assigning=False)
+    root, entries = _read(path, assigning=False, root_map=root_map)
     _check_splits(entries)
     return RecordingManifest(path=Path(path), root=root, entries=entries)
 
 
-def _read(path: Path, *, assigning: bool) -> tuple[str, tuple[Entry, ...]]:
-    """The manifest's root as written and its entries, each checked on its own."""
+def _read(
+    path: Path, *, assigning: bool, root_map: Mapping[str, str] | None = None
+) -> tuple[str, tuple[Entry, ...]]:
+    """The manifest's root as written and its entries, each checked on its own.
+
+    With `root_map`, the root is matched against each key with a backslash read as `/`, a
+    trailing `/` ignored, without case when the key has a Windows drive, and the longest
+    matching key wins; the entries resolve under the root it maps to. A root written for another system
+    (`D:/wake` read on Linux) is accepted when it is absolute there.
+    """
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except OSError as exc:
@@ -311,11 +324,35 @@ def _read(path: Path, *, assigning: bool) -> tuple[str, tuple[Entry, ...]]:
     if not isinstance(raw, dict) or set(raw) != _MANIFEST_KEYS:
         raise ManifestError(f"{path}: manifest must be an object with exactly {{root, entries}}")
     root = raw["root"]
-    if not isinstance(root, str) or not Path(root).is_absolute():
-        raise ManifestError(f"{path}: root must be an absolute directory, got {root!r}")
-    root_path = Path(root).resolve()
+    if root_map is None:
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            raise ManifestError(f"{path}: root must be an absolute directory, got {root!r}")
+        located = root
+    else:
+        if not isinstance(root, str) or not (
+            PurePosixPath(root).is_absolute() or PureWindowsPath(root).is_absolute()
+        ):
+            raise ManifestError(f"{path}: root must be an absolute directory, got {root!r}")
+
+        def norm(value: str) -> str:
+            text = value.replace("\\", "/").rstrip("/")
+            return text.casefold() if PureWindowsPath(value).drive else text
+
+        written = root.replace("\\", "/").rstrip("/")
+        matches = [
+            (source, target)
+            for source, target in root_map.items()
+            if norm(written) == norm(source) or (norm(written) + "/").startswith(norm(source) + "/")
+        ]
+        if not matches:
+            raise ManifestError(f"{path}: root {root} matches no --root-map entry")
+        source, target = max(matches, key=lambda pair: len(norm(pair[0])))
+        located = target.rstrip("/\\") + written[len(source.replace("\\", "/").rstrip("/")) :]
+        if not Path(located).is_absolute():
+            raise ManifestError(f"{path}: root {root} maps to {located}, which is not absolute")
+    root_path = Path(located).resolve()
     if not root_path.is_dir():
-        raise ManifestError(f"{path}: root {root} is not a directory")
+        raise ManifestError(f"{path}: root {located} is not a directory")
     if not isinstance(raw["entries"], list):
         raise ManifestError(f"{path}: entries must be a list")
     entries = tuple(

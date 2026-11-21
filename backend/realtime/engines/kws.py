@@ -505,6 +505,45 @@ def hit_steps(series: Sequence[float], threshold: float, cooldown_steps: int) ->
     return [index for index, score in enumerate(series) if cooldown.step(score >= threshold)]
 
 
+def hit_positions(
+    series: Sequence[float],
+    cutoff: float,
+    *,
+    stride: int,
+    cooldown_steps: int,
+    first_pos: int,
+    warmup_samples: int = 0,
+    lead_calls: int = 0,
+    frame_samples: int = 2 * FRONTEND_SAMPLES,
+) -> list[int]:
+    """Each hit's frame in a `score_series` series, as a stream pushed the same audio reports it.
+
+    A stream pushed the audio from a fresh warmed context in frames of `frame_samples`, the
+    first at `first_pos`, reports a hit's `end_pos` as the frame whose push completed its step
+    (`MicroNameSpotterStream.push`). So one series per source places the hits at every cutoff,
+    with no stream per cutoff. A step is `stride` frontend calls of 160 samples, each giving
+    one feature, except the context's first `lead_calls`, which give none while the frontend's
+    analysis window fills; the warm-up's `warmup_samples` of silence come first, and the steps
+    it completes are not in the series. The mapping assumes that frontend shape, which the
+    stream does not report: the caller supplies `lead_calls` for the frontend it runs.
+
+    Raises:
+        ValueError: `stride` or `frame_samples` is below 1, or a count is negative.
+    """
+    if stride < 1 or frame_samples < 1 or min(warmup_samples, lead_calls) < 0:
+        raise ValueError(
+            "hit_positions: stride and frame_samples must be at least 1, and the warm-up and "
+            "lead calls not negative"
+        )
+    warm_steps = max(0, warmup_samples // FRONTEND_SAMPLES - lead_calls) // stride
+    positions = []
+    for step in hit_steps(series, cutoff, cooldown_steps):
+        calls = (warm_steps + step + 1) * stride + lead_calls
+        samples = calls * FRONTEND_SAMPLES - warmup_samples
+        positions.append(first_pos + (samples - 1) // frame_samples)
+    return positions
+
+
 def _quantize(values: Sequence[float]) -> np.ndarray:
     """One step's features as the device quantizes them: v recovered, then ESPHome's formula."""
     features = np.asarray(values, dtype=np.float64)
