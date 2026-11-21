@@ -16,7 +16,7 @@ controller, ingress or engine, so it runs, and is tested, without a model loaded
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 from .budget import WakeConfig
 from .speech import HeardWord
@@ -33,7 +33,14 @@ __all__ = [
 ]
 
 GateCheck = Literal[
-    "phrase", "vocative", "followup", "endpoint", "self_speech", "self_media", "not_addressed"
+    "verified",
+    "phrase",
+    "vocative",
+    "followup",
+    "endpoint",
+    "self_speech",
+    "self_media",
+    "not_addressed",
 ]
 AtHit = Literal["name", "alias", "other", "none"]
 """What the recogniser wrote in the alias window before a hit, for counts only."""
@@ -307,12 +314,59 @@ class AddresseeGate:
 
     `echo_guard_ms` is how far back the controller asks the registry for her spoken text before
     calling `pre_decode`; the gate holds it so that the self-speech policy lives in one object.
+
+    `thresholds` maps a spotter cutoff to the score the acoustic verifier must reach for a hit
+    at that cutoff, None for a cutoff below its table; the caller passes the loaded verifier's
+    `threshold_at`. It is a callable rather than the verifier so that this module stays free of
+    engines. Without it `verified` accepts nothing, so a gate built with no verifier fails closed.
     """
 
-    def __init__(self, config: WakeConfig, *, echo_guard_ms: int) -> None:
+    class Thresholds(Protocol):
+        """A cutoff-to-threshold lookup, such as `WakeVerifier.threshold_at`.
+
+        A protocol rather than `collections.abc.Callable`, because the module's imports are
+        pinned to `re`, `dataclasses` and `typing` besides `.budget` and `.speech`.
+        """
+
+        def __call__(self, cutoff: float, /) -> float | None:
+            """The score a hit at `cutoff` must reach, or None below the table."""
+            ...
+
+    def __init__(
+        self,
+        config: WakeConfig,
+        *,
+        echo_guard_ms: int,
+        thresholds: Thresholds | None = None,
+    ) -> None:
         self._config = config
         self._names = frozenset(config.names)
+        self._thresholds = thresholds
         self.echo_guard_ms = echo_guard_ms
+
+    def verified(
+        self,
+        *,
+        score: float,
+        reference_score: float | None,
+        verify_score: float | None,
+        cutoff: float,
+    ) -> GateVerdict:
+        """Accept a hit when the verifier's score reaches the threshold for the spotter's cutoff.
+
+        `score` and `reference_score` are the spotter's, carried into the verdict for the wake
+        event. `verify_score` is None when the verifier failed, the window was too short or no
+        verifier is loaded, and the threshold is None for a cutoff below the table; each of
+        those rejects the hit `not_addressed`, as a score below the threshold does.
+        """
+        threshold = self._thresholds(cutoff) if self._thresholds is not None else None
+        accepted = verify_score is not None and threshold is not None and verify_score >= threshold
+        return GateVerdict(
+            accepted=accepted,
+            check="verified" if accepted else "not_addressed",
+            score=score,
+            reference_score=reference_score,
+        )
 
     def pre_decode(
         self, *, score: float, reference_score: float | None, recent_tts_text: str

@@ -491,6 +491,78 @@ class TestDecide:
         )
 
 
+class TestVerified:
+    """The verifier's verdict: its score against the threshold for the spotter's cutoff."""
+
+    @staticmethod
+    def _gate(threshold: float | None = 0.6, asked: list[float] | None = None) -> AddresseeGate:
+        def thresholds(cutoff: float) -> float | None:
+            if asked is not None:
+                asked.append(cutoff)
+            return threshold
+
+        return AddresseeGate(DEFAULTS, echo_guard_ms=2000, thresholds=thresholds)
+
+    @pytest.mark.parametrize("verify_score", [0.6, 0.61, 0.99], ids=["at", "above", "well-above"])
+    def test_a_score_at_or_above_the_threshold_is_verified(self, verify_score):
+        verdict = self._gate().verified(
+            score=0.83, reference_score=0.12, verify_score=verify_score, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=True, check="verified", score=0.83, reference_score=0.12
+        )
+
+    def test_a_score_below_the_threshold_is_not_addressed(self):
+        verdict = self._gate().verified(
+            score=0.83, reference_score=None, verify_score=0.59, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.83, reference_score=None
+        )
+
+    def test_no_verifier_score_is_not_addressed(self):
+        # A failed verify, a short window or no verifier at all reaches the gate as None.
+        verdict = self._gate().verified(
+            score=0.9, reference_score=None, verify_score=None, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.9, reference_score=None
+        )
+
+    def test_a_cutoff_with_no_threshold_is_not_addressed(self):
+        verdict = self._gate(threshold=None).verified(
+            score=0.9, reference_score=None, verify_score=1.0, cutoff=0.005
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.9, reference_score=None
+        )
+
+    def test_a_gate_without_thresholds_verifies_nothing(self):
+        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).verified(
+            score=0.9, reference_score=None, verify_score=1.0, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.9, reference_score=None
+        )
+
+    def test_the_threshold_is_read_for_the_given_cutoff(self):
+        asked: list[float] = []
+
+        self._gate(asked=asked).verified(
+            score=0.9, reference_score=None, verify_score=0.7, cutoff=216 / 255
+        )
+
+        assert asked == [216 / 255]
+
+    def test_verified_is_a_gate_check(self):
+        assert "verified" in addressee_module.GateCheck.__args__
+
+
 class TestPurity:
     def test_importing_the_gate_loads_no_controller_ingress_or_engine(self):
         probe = (
