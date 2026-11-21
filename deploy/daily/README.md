@@ -98,6 +98,7 @@ before anything starts.
 | `MIST_VOICE_TTS_VOICE` | the backend through `env_file`: voice identity under `voices/` | no | none |
 | `MIST_VOICE_KWS_MODEL` | the backend through `env_file`: wake model under `MODELS_DIR` | no | none, and the server spotter is off |
 | `MIST_VOICE_KWS_THRESHOLD` | the backend through `env_file`: wake score a heard name needs | no | `0.5` |
+| `MIST_VOICE_VERIFY_MODEL` | the backend through `env_file`: wake verifier under `MODELS_DIR` | no | none, and no wake is accepted |
 | `MIST_VOICE_WAKE_PHRASES_FILE` | the backend through `env_file`: wake phrases file under `/models` | no | the built-in sets |
 | `MIST_CAPABILITIES_ENABLED` | the backend through `env_file` | no | `false` |
 | `MIST_CAPABILITIES` | the backend through `env_file` | no | all five |
@@ -650,6 +651,14 @@ The `daily.env` rows:
 - `MIST_VOICE_TTS_VOICE`: the voice identity id.
 - `MIST_VOICE_KWS_MODEL` and `MIST_VOICE_KWS_THRESHOLD`: the server name spotter's model id, off
   while unset, and the score a heard name needs, 0.5 by default.
+- `MIST_VOICE_VERIFY_MODEL`: the acoustic wake verifier's model id. The verifier judges every
+  wake, a server name hit and a room device's wake alike, so while it is unset or fails to load
+  no wake is accepted: the server spotter is not loaded, no wake mode is offered, and a
+  `voice_start` for the `endpoint` spotter, as a room device sends, is refused
+  `verify unavailable`. The server spotter also stays off when the verifier was trained
+  against another spotter than `MIST_VOICE_KWS_MODEL`; the log's WARNING names which.
+  `MIST_VOICE_VERIFY_THREADS` sets its CPU threads, 1 to 8, 2 by default; it has no row in
+  `daily.env.example`, and a `daily.env` line sets it as any other.
 - `MIST_VOICE_WAKE_PHRASES_FILE`: the wake phrases and addressee word sets, a JSON file; the
   built-in sets apply while it is unset. Its `aliases` key maps each name to the near spellings
   the gate reads as the name at a server hit ("missed" for "mist"), and `"aliases": {}` turns
@@ -667,6 +676,13 @@ in place, so the server and the device run one file. The phrases file goes at
 `MIST_VOICE_WAKE_PHRASES_FILE=/models/speech/wake/phrases.json` points the backend at it, since
 only `/models` is mounted for it. The wake model is for personal use only: its trainers'
 negative data is non-commercial, so its weights are never committed, published or shared.
+
+Staging the wake verifier. Its `model.onnx`, `manifest.json` and `provenance.json` go in
+`<MODELS_DIR>/speech/wake/<verifier id>/`, the directory `MIST_VOICE_VERIFY_MODEL` names by its
+id, beside the wake model it was trained against. The backend checks both files' sha256 and that
+the installed wake model is the one the verifier's manifest names; any failed check leaves the
+verifier off, and then no wake is accepted. The verifier is for personal use only, as the wake
+model is: it is never committed, published or shared.
 
 ---
 

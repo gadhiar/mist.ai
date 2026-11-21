@@ -15,7 +15,13 @@ from backend.realtime.capability_sink import CapabilitySink
 from backend.realtime.registry import SessionRegistry
 from backend.realtime.session import InferenceLanes, RealtimeSession, SessionServices, SpeechEngines
 from backend.realtime.turn import WakeArbiter, WakeRank
-from tests.fakes.speech import EnergyVad, FakeSynthesizer, ScriptedNameSpotter, ScriptedTranscriber
+from tests.fakes.speech import (
+    EnergyVad,
+    FakeSynthesizer,
+    ScriptedNameSpotter,
+    ScriptedTranscriber,
+    ScriptedWakeVerifier,
+)
 
 from .test_session import FakeIngress, FakeSocket, RecordingController, name_of, voice_start
 from .turn_fakes import (
@@ -85,6 +91,7 @@ class RegistryRig:
                 transcriber=ScriptedTranscriber(["hello"]),
                 synthesizer=FakeSynthesizer(),
                 spotter=ScriptedNameSpotter(),
+                verifier=ScriptedWakeVerifier(),
             ),
             lanes=InferenceLanes(
                 vad=InlineLane(),
@@ -92,6 +99,7 @@ class RegistryRig:
                 stt=InlineLane(),
                 tts=InlineLane(),
                 kws=InlineLane(),
+                verify=InlineLane(),
             ),
             settings=self.settings,
             placement=floor_placement,

@@ -61,6 +61,7 @@ from tests.fakes.speech import (
     FakeSynthesizer,
     ScriptedNameSpotter,
     ScriptedTranscriber,
+    ScriptedWakeVerifier,
 )
 
 from .turn_fakes import (
@@ -231,6 +232,7 @@ class Rig:
         self,
         *scripts: object,
         spotter: ScriptedNameSpotter | None | bool = True,
+        verifier: bool = True,
         synthesizer: bool = True,
         vad: bool = True,
         endpoint: str = "desktop",
@@ -258,6 +260,7 @@ class Rig:
             transcriber=ScriptedTranscriber(["hello there"], ms_per_word=20),
             synthesizer=FakeSynthesizer() if synthesizer else None,
             spotter=self.spotter,
+            verifier=ScriptedWakeVerifier() if verifier else None,
         )
         self.tts_lane = InlineLane()
         self.settings = VoiceSettings(
@@ -274,6 +277,7 @@ class Rig:
                 stt=InlineLane(),
                 tts=self.tts_lane,
                 kws=InlineLane(),
+                verify=InlineLane(),
             ),
             settings=self.settings,
             placement=floor_placement,
@@ -938,6 +942,23 @@ class TestVoiceStart:
         rig = await Rig(**rig_args).start()
 
         await rig.send(voice_start())
+
+        assert answer_of(rig.answers()[0]) == (1, False, reason, False)
+        assert rig.ingresses == []
+
+    @pytest.mark.parametrize(
+        ("rig_args", "reason"),
+        [
+            ({"verifier": False}, "verify unavailable"),
+            ({"verifier": False, "spotter": None}, "verify unavailable"),
+            # The existing checks come first.
+            ({"verifier": False, "vad": False}, "vad unavailable"),
+        ],
+    )
+    async def test_an_endpoint_spotter_needs_the_verifier(self, rig_args, reason):
+        rig = await Rig(**rig_args).start()
+
+        await rig.send(voice_start(spotter="endpoint"))
 
         assert answer_of(rig.answers()[0]) == (1, False, reason, False)
         assert rig.ingresses == []
