@@ -28,7 +28,6 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeVar
 
 import anyio
 import httpx
@@ -80,8 +79,6 @@ from .turn_fakes import (
 
 FRAME_MS = 20
 FRAME_SAMPLES = 320
-
-_E = TypeVar("_E")
 
 PROCESS_WIDE = frozenset(
     {
@@ -174,12 +171,6 @@ class FakeCuda:
 class FakeTorch:
     def __init__(self) -> None:
         self.cuda = FakeCuda()
-
-
-def _named(engine: _E, model_id: str) -> _E:
-    """The chain walk records each engine's `model_id`; the VAD and EOT fakes carry none."""
-    engine.model_id = model_id  # type: ignore[attr-defined]
-    return engine
 
 
 async def _never(seconds: float) -> None:
@@ -294,8 +285,8 @@ class VoiceStack:
                 "parakeet-cpu": self._load_stt,
                 "pocket-clone": lambda settings, device: self.synthesizer,
             },
-            vad=lambda placement: _named(EnergyVad(), "energy-vad"),
-            eot=lambda placement, endpointing: _named(ScriptedTurnEnd(self.eot), "scripted-eot"),
+            vad=lambda placement: EnergyVad(),
+            eot=lambda placement, endpointing: ScriptedTurnEnd(self.eot),
             kws=lambda placement: self.spotter,  # type: ignore[arg-type, return-value]
         )
         engines = load_speech_engines(self.settings, loaders, power_level=level)
