@@ -10,6 +10,7 @@ speech onset falls on a window boundary and its position is exact.
 """
 
 import asyncio
+import dataclasses
 import itertools
 import logging
 import typing
@@ -42,6 +43,7 @@ from backend.realtime.ingress import (
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
+    WakeVerified,
     name_chain_start,
     onset_lead_frames,
     ring_retention_ms,
@@ -58,6 +60,7 @@ from tests.fakes.speech import (
     ScriptedTranscriptStream,
     ScriptedTurnEnd,
     ScriptedUtterance,
+    ScriptedWakeVerifier,
 )
 
 FRAME_MS = 20
@@ -206,14 +209,17 @@ class Rig:
         seed: IngressSeed | None = None,
         engaged: bool = True,
         lanes: IngressLanes | None = None,
+        verifier: ScriptedWakeVerifier | None = None,
     ) -> None:
         self.clock = FakeClock()
         self.vad = EnergyVad()
         self.transcriber = transcriber or ScriptedTranscriber(["hello there"], ms_per_word=20)
         self.turn_end = ScriptedTurnEnd([0.9]) if turn_end == "default" else turn_end
         self.spotter = spotter
+        self.verifier = verifier
+        self.verify_lane = StepLane()
         self.lanes = lanes or IngressLanes(
-            vad=StepLane(), stt=StepLane(), eot=StepLane(), kws=StepLane()
+            vad=StepLane(), stt=StepLane(), eot=StepLane(), kws=StepLane(), verify=self.verify_lane
         )
         self.events: list[object] = []
         self.emitted_at: list[int] = []
@@ -223,6 +229,7 @@ class Rig:
                 transcriber=self.transcriber,
                 turn_end=self.turn_end,  # type: ignore[arg-type]
                 spotter=self.spotter,
+                verifier=self.verifier,
             ),
             lanes=self.lanes,
             endpointing=endpointing or EndpointingConfig(),
@@ -240,6 +247,11 @@ class Rig:
         self.pos = seed.frames[-1][0] + 1 if seed is not None and seed.frames else 0
         self.seq = 0
         self.arrivals: dict[int, int] = {}
+        self.payloads: dict[int, bytes] = {}
+
+    def wire(self, positions: range) -> bytes:
+        """The uplink bytes pushed at `positions`, joined in order."""
+        return b"".join(self.payloads[pos] for pos in positions)
 
     def _emit(self, event: object) -> None:
         self.events.append(event)
@@ -257,6 +269,7 @@ class Rig:
             self.ingress.push_reference(self.seq, reference)
         self.ingress.push_frame(Frame(MsgType.MIC_AUDIO, 0, self.seq, 16000, pcm), pos)
         self.arrivals[pos] = self.clock.now
+        self.payloads[pos] = pcm
         self.pos += 1
         self.seq += 1
         if settle_after:
@@ -2267,6 +2280,308 @@ class TestMuteClosesTheUtterance:
         for documented in (AudioIngress.set_muted, AudioIngress.open_utterance, UtteranceDropped):
             assert "muted" in (documented.__doc__ or "")
         assert "mute" in (IngressSeed.__doc__ or "")
+
+
+# -- The wake verifier ----------------------------------------------------------------------------
+
+AFTER = 15  # the verifier's default 300 ms after the hit, in frames
+BEFORE = 100  # its default 2000 ms before the hit
+
+
+class RecordingVerifier(ScriptedWakeVerifier):
+    """A scripted verifier that keeps the bytes of every window it scores, in order."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.pcms: list[bytes] = []
+
+    def score(self, pcm: bytes) -> float:
+        self.pcms.append(pcm)
+        return super().score(pcm)
+
+
+def first_samples(pcm: bytes) -> list[int]:
+    """The first sample of each 20 ms frame in `pcm`."""
+    samples = np.frombuffer(pcm, dtype="<i2")
+    return [int(samples[start]) for start in range(0, len(samples), FRAME_SAMPLES)]
+
+
+class TestVerify:
+    """`request_verify` scores one continuous stretch of audio around a name hit (Design 5)."""
+
+    @pytest.mark.asyncio
+    async def test_it_waits_for_the_hit_plus_after_then_scores_the_windows_wire_bytes(self):
+        verifier = RecordingVerifier([0.42])
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 120
+        await rig.marked(hit + 1)
+
+        rig.ingress.request_verify("u9", hit)
+        await rig.marked(AFTER - 1)
+
+        assert verifier.pcms == [] and rig.of(WakeVerified) == []
+
+        await rig.marked(1)
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + AFTER + 1))]
+        assert rig.of(WakeVerified) == [WakeVerified(3, 1, "u9", hit, 0.42)]
+        assert rig.verify_lane.started == ["score"]
+
+    @pytest.mark.asyncio
+    async def test_frames_already_received_are_scored_at_once(self):
+        verifier = RecordingVerifier([0.3])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(20, 136))]
+        assert [event.score for event in rig.of(WakeVerified)] == [0.3]
+
+    @pytest.mark.asyncio
+    async def test_no_verifier_gives_none_at_once(self):
+        rig = Rig(engaged=False)
+
+        rig.ingress.request_verify("u1", 5)
+
+        assert rig.of(WakeVerified) == [WakeVerified(3, 1, "u1", 5, None)]
+
+    @pytest.mark.asyncio
+    async def test_no_verify_lane_gives_none_at_once(self):
+        verifier = RecordingVerifier()
+        lanes = IngressLanes(vad=StepLane(), stt=StepLane(), eot=StepLane(), kws=StepLane())
+        rig = Rig(verifier=verifier, engaged=False, lanes=lanes)
+
+        rig.ingress.request_verify("u1", 5)
+
+        assert rig.of(WakeVerified) == [WakeVerified(3, 1, "u1", 5, None)]
+        assert verifier.windows == []
+
+    @pytest.mark.asyncio
+    async def test_a_window_under_min_window_ms_gives_none_unscored(self, caplog):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        caplog.set_level(logging.INFO, logger="backend.realtime.ingress")
+        await rig.marked(10 + AFTER + 1)
+
+        rig.ingress.request_verify("u1", 10)
+        await settle()
+
+        # Frames 0 to 25 are 26 frames, under the 40 that 800 ms needs.
+        assert [event.score for event in rig.of(WakeVerified)] == [None]
+        assert verifier.windows == []
+        assert any(
+            record.levelno == logging.INFO and "verify" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_engine_error_gives_none_and_is_counted(self, caplog):
+        verifier = RecordingVerifier([SpeechEngineError("verifier broke")])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+
+        assert [event.score for event in rig.of(WakeVerified)] == [None]
+        assert rig.ingress.stats().engine_errors == 1
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == "backend.realtime.ingress"
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_mute_while_the_job_runs_gives_no_event(self):
+        verifier = RecordingVerifier([0.9])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+        rig.verify_lane.holding = True
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+        assert rig.verify_lane.submitted == ["score"]
+
+        rig.ingress.set_muted(True)
+        rig.verify_lane.release()
+        await settle()
+
+        assert rig.of(WakeVerified) == []
+
+    @pytest.mark.asyncio
+    async def test_a_mute_while_waiting_for_frames_gives_no_event(self):
+        verifier = RecordingVerifier([0.9])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(121)
+        rig.ingress.request_verify("u1", 120)
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        await rig.marked(AFTER + 5)
+
+        assert rig.of(WakeVerified) == []
+        assert verifier.windows == []
+
+    @pytest.mark.asyncio
+    async def test_a_close_while_the_job_runs_gives_no_event(self):
+        verifier = RecordingVerifier([0.9])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+        rig.verify_lane.holding = True
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+
+        rig.ingress.close()
+        rig.verify_lane.release()
+        await settle()
+
+        assert rig.of(WakeVerified) == []
+
+    @pytest.mark.asyncio
+    async def test_a_request_after_close_gives_no_event(self):
+        rig = Rig(verifier=RecordingVerifier(), engaged=False)
+        rig.ingress.close()
+
+        rig.ingress.request_verify("u1", 5)
+
+        assert rig.of(WakeVerified) == []
+
+    # Splicing (design review 1): the window is one continuous stretch of time with the hit.
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_backlog_window_never_reaches_the_earlier_uplinks_frames(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        # An earlier uplink's tail: `seq` runs on into the backlog, since it resets only on
+        # connect, and positions have no gap, so only the backlog's first frame bounds it.
+        await rig.marked(50)
+        rig.ingress.expect_endpoint_wake(
+            keyword="hey mist", score=0.7, backlog_ms=1500, arrival=1.0
+        )
+        await rig.marked(75)
+        (heard,) = rig.of(NameHeard)
+        hit = heard.hit.end_pos
+        assert hit == 124
+
+        rig.ingress.request_verify("u1", hit)
+        await rig.marked(AFTER)
+
+        assert verifier.pcms == [rig.wire(range(50, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_a_seq_jump_before_the_hit_starts_the_window_after_it(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 120
+        await rig.marked(hit - 30)
+        rig.seq += 10  # ten frames lost on the link, with no position gap
+        await rig.marked(30 + AFTER + 1)
+
+        rig.ingress.request_verify("u1", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - 30, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_a_seq_jump_after_the_hit_ends_the_window_before_it(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 120
+        await rig.marked(hit + 6)
+        rig.seq += 3
+        await rig.marked(AFTER)
+
+        rig.ingress.request_verify("u1", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + 6))]
+
+    @pytest.mark.asyncio
+    async def test_a_mute_before_the_hit_starts_the_window_at_the_mute_boundary(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 100
+        await rig.marked(hit - 50)
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        await rig.marked(50 + AFTER + 1)
+
+        rig.ingress.request_verify("u1", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - 50, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_the_mute_boundary_crosses_a_reconfigure(self):
+        old = Rig(engaged=False)
+        await old.marked(50)
+        old.ingress.set_muted(True)
+        old.ingress.set_muted(False)
+        await old.marked(30)
+        seed = old.ingress.handoff()
+        old.ingress.close()
+        assert seed.mute_floor == 50
+
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False, seed=seed)
+        assert rig.pos == 80
+        rig.ingress.request_verify("u1", 100)
+        await rig.marked(36)
+
+        (pcm,) = verifier.pcms
+        assert len(pcm) == (116 - 50) * FRAME_SAMPLES * 2
+        live = (116 - 80) * FRAME_SAMPLES * 2
+        assert pcm[-live:] == rig.wire(range(80, 116))
+        # A seeded frame's bytes come back from float32, within one step of the wire's.
+        expected = [pos + 1 for pos in range(50, 80)]
+        assert all(abs(got - want) <= 1 for got, want in zip(first_samples(pcm[:-live]), expected))
+
+    @pytest.mark.asyncio
+    async def test_an_utterance_ended_20_frames_before_the_hit_leaves_the_full_window(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier)
+        await rig.quiet(2000)
+        await rig.speak(640)
+        await rig.quiet(800)
+        (ended,) = rig.of(UtteranceEnded)
+        hit = last_frame(ended) + 20
+        floor = rig.ingress.handoff().floor
+        assert hit - BEFORE < floor <= hit
+        await rig.quiet((hit + AFTER + 1 - rig.pos) * FRAME_MS)
+
+        rig.ingress.request_verify("u9", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_ending_before_its_window_is_built_keeps_its_hit_frame(self):
+        verifier = RecordingVerifier([0.8])
+        rig = Rig(verifier=verifier)
+        await rig.quiet(2000)
+        await rig.speak(640)
+        (started,) = rig.of(SpeechStarted)
+        hit = rig.pos - 1
+        rig.ingress.request_verify(started.utterance_id, hit)
+
+        await rig.quiet(AFTER * FRAME_MS - FRAME_MS)
+
+        assert len(rig.of(UtteranceEnded)) == 1
+        assert rig.ingress.handoff().floor > hit
+        assert verifier.pcms == []
+
+        await rig.quiet(FRAME_MS)
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + AFTER + 1))]
+        assert [(e.utterance_id, e.score) for e in rig.of(WakeVerified)] == [
+            (started.utterance_id, 0.8)
+        ]
+
+    def test_the_seed_carries_the_mute_boundary_as_its_last_defaulted_field(self):
+        last = dataclasses.fields(IngressSeed)[-1]
+        assert (last.name, last.default) == ("mute_floor", 0)
 
 
 # -- Real lanes -----------------------------------------------------------------------------------

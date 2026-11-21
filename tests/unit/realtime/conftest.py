@@ -63,6 +63,7 @@ from tests.fakes.speech import (
     ScriptedNameSpotter,
     ScriptedTranscriber,
     ScriptedTurnEnd,
+    ScriptedWakeVerifier,
 )
 
 from .turn_fakes import (
@@ -190,12 +191,15 @@ class VoiceStack:
     """`build_mist_runtime` in place: a real `MistRuntime` over the fakes a scenario scripts.
 
     `transcripts` are taken one per opened utterance, across every session, in order; `kws`
-    False builds no name spotter, as an unset `MIST_VOICE_KWS_MODEL` does.
+    False builds no name spotter, as an unset `MIST_VOICE_KWS_MODEL` does. `verifier` accepts
+    every hit; `verify` False builds none, as an unset `MIST_VOICE_VERIFY_MODEL` does, and then
+    the placed path loads no spotter either.
     """
 
     transcripts: Sequence[str] = ()
     eot: Sequence[float] = (0.95,)
     kws: bool = True
+    verify: bool = True
     stt_devices: tuple[str, ...] | None = None
     stt_load_errors: list[BaseException] = field(default_factory=list)
     markers: dict[bytes, float] = field(default_factory=dict)
@@ -213,6 +217,7 @@ class VoiceStack:
     responder: FakeResponder = field(init=False)
     transcriber: ScriptedTranscriber = field(init=False)
     spotter: ScriptedNameSpotter | None = field(init=False)
+    verifier: ScriptedWakeVerifier | None = field(init=False)
     synthesizer: FakeSynthesizer = field(init=False)
     runtime: MistRuntime | None = None
     torch: FakeTorch = field(default_factory=lambda: FakeTorch())
@@ -222,6 +227,7 @@ class VoiceStack:
         self.responder = FakeResponder(clock=self.clock)
         self.transcriber = ScriptedTranscriber(list(self.transcripts), ms_per_word=20)
         self.spotter = ScriptedNameSpotter(markers=self.markers) if self.kws else None
+        self.verifier = ScriptedWakeVerifier() if self.verify else None
         self.synthesizer = FakeSynthesizer()
 
     def __call__(self, config: object, **kwargs: object) -> MistRuntime:
@@ -234,11 +240,17 @@ class VoiceStack:
                 transcriber=self.transcriber,
                 synthesizer=self.synthesizer,
                 spotter=self.spotter,
+                verifier=self.verifier,
             )
         else:
             engines, gpu = self._placed_engines(gate.level())  # type: ignore[attr-defined]
         lanes = InferenceLanes(
-            vad=InlineLane(), eot=InlineLane(), stt=InlineLane(), tts=InlineLane(), kws=InlineLane()
+            vad=InlineLane(),
+            eot=InlineLane(),
+            stt=InlineLane(),
+            tts=InlineLane(),
+            kws=InlineLane(),
+            verify=InlineLane(),
         )
         services = SessionServices(
             responder=self.responder,  # type: ignore[arg-type]
@@ -277,6 +289,7 @@ class VoiceStack:
             stt_chain=tuple(EngineOption(stt_engine[d], d) for d in self.stt_devices),
             tts_chain=(EngineOption("pocket-clone", "cpu"),),
             kws_model="scripted-kws" if self.kws else None,
+            verify_model="scripted-verify" if self.verify else None,
         )
         self.settings = dataclasses.replace(self.settings, placement=placement)
         loaders = EngineLoaders(
@@ -288,6 +301,7 @@ class VoiceStack:
             vad=lambda placement: EnergyVad(),
             eot=lambda placement, endpointing: ScriptedTurnEnd(self.eot),
             kws=lambda placement: self.spotter,  # type: ignore[arg-type, return-value]
+            verify=lambda placement: self.verifier,  # type: ignore[arg-type, return-value]
         )
         engines = load_speech_engines(self.settings, loaders, power_level=level)
         gpu = GpuEngines(

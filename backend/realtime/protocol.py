@@ -624,7 +624,9 @@ class VoiceCapabilities(_WireModel):
     """What the server's voice path supports; its presence marks a protocol 2 server.
 
     Attributes:
-        spotters: `endpoint` once VAD and STT are loaded, and `server` as well once `kws` is.
+        modes: `wake` while at least one spotter is offered, else empty.
+        spotters: `endpoint` once VAD, STT and the wake verifier are loaded, since the
+            verifier accepts every wake, and `server` as well once `kws` is.
         reference: Whether the server scores `0x11` frames, which needs `kws` loaded.
     """
 
@@ -684,7 +686,9 @@ class VoiceStateMessage(_WireModel):
         muted: This session's mute as the server applies it, so the client's indicator shows
             what the server does.
         refused: In an answer, null when the request was applied, and otherwise why it was
-            not: a reason the requested mode is unavailable, `power_off` (the level is off and
+            not: a reason the requested mode is unavailable (`vad unavailable`;
+            `kws unavailable` for the `server` spotter; `verify unavailable` for the
+            `endpoint` spotter with no wake verifier loaded), `power_off` (the level is off and
             voice cannot take capability commands, so `active` is false), `superseded` (a newer
             valid `voice_start` arrived first), `voice_stop` (a `voice_stop` arrived first) or
             `invalid` (the `voice_start` failed validation). In a broadcast it is `power_off`,

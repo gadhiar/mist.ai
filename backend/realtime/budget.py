@@ -945,6 +945,11 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     the operator no longer expects it. `MIST_VOICE_TTS_VOICE` is a voice identity id, read
     under `MIST_VOICE_IDENTITY_ROOT`; `MIST_VOICE_CACHE_DIR` is where assets built from it go.
 
+    `MIST_VOICE_VERIFY_MODEL` is the acoustic wake verifier's model id, in the form
+    `MIST_VOICE_KWS_MODEL` takes; unset, no verifier loads, so no wake is accepted and the server
+    spotter is not loaded either. `MIST_VOICE_VERIFY_THREADS` is its onnxruntime intra-op
+    thread count, 1 to 8.
+
     `MIST_VOICE_WAKE_PHRASES_FILE` is the one variable that names a file: a JSON object with
     any of `phrases`, `address_starts`, `stop_before` and `greetings`, each a list of strings
     that replaces that set; a key it omits keeps its default.
@@ -1037,6 +1042,13 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
             f"a model id matching {_ID_FORM}",
         ),
         kws_threads=env.positive_integer("MIST_VOICE_KWS_THREADS", place.kws_threads),
+        verify_model=env.pattern(
+            "MIST_VOICE_VERIFY_MODEL",
+            place.verify_model,
+            _ID,
+            f"a model id matching {_ID_FORM}",
+        ),
+        verify_threads=env.bounded_integer("MIST_VOICE_VERIFY_THREADS", place.verify_threads, 1, 8),
     )
     turn = TurnConfig(
         tool_cancel_grace_ms=env.integer(

@@ -1842,7 +1842,7 @@ def build_speech_engines(
 
 
 def _real_engine_loaders() -> "EngineLoaders":
-    """The T6, T7 and T8 adapters, each loaded through its classmethod `load`."""
+    """The speech adapters and the wake verifier, each loaded through its classmethod `load`."""
     from backend.realtime.engines.kws import MicroNameSpotter, import_micro_runtime
     from backend.realtime.engines.nemotron_stt import NemotronStreamingTranscriber, import_nemo
     from backend.realtime.engines.parakeet_stt import ParakeetTranscriber, import_onnx_asr
@@ -1853,6 +1853,7 @@ def _real_engine_loaders() -> "EngineLoaders":
         open_onnx_session,
     )
     from backend.realtime.engines.smart_turn import SmartTurnDetector, whisper_features
+    from backend.realtime.engines.verifier import OnnxWakeVerifier
     from backend.realtime.runtime import EngineLoaders
 
     return EngineLoaders(
@@ -1878,6 +1879,9 @@ def _real_engine_loaders() -> "EngineLoaders":
             feature_extractor_factory=whisper_features,
         ),
         kws=lambda placement: MicroNameSpotter.load(placement, library_loader=import_micro_runtime),
+        verify=lambda placement: OnnxWakeVerifier.load(
+            placement, session_factory=open_onnx_session, available_providers=onnxruntime_providers
+        ),
     )
 
 
@@ -1991,6 +1995,7 @@ def build_mist_runtime(
             stt=InferenceLane("stt"),
             tts=InferenceLane("tts"),
             kws=InferenceLane("kws"),
+            verify=InferenceLane("verify"),
         )
 
     if level() == "off":
