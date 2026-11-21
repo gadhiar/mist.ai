@@ -31,6 +31,7 @@ from typing import Literal, Protocol, TypeVar
 import numpy as np
 
 from .budget import EndpointingConfig, TurnConfig, WakeConfig
+from .engines.verifier import verify_window
 from .errors import RealtimeError, SpeechEngineError
 from .lanes import LaneJobCancelled
 from .protocol import Frame, Spotter
@@ -46,6 +47,7 @@ from .speech import (
     TurnEndDetector,
     VadStream,
     VoiceActivityDetector,
+    WakeVerifier,
     WordTiming,
 )
 
@@ -383,6 +385,21 @@ class NameHeard:
     spotter: Spotter = "server"
 
 
+@dataclass(frozen=True, slots=True)
+class WakeVerified:
+    """The wake verifier's score over a name hit's audio window, for `request_verify`.
+
+    `score` is None when there is no verifier or no `verify` lane, when the audio held around
+    the hit is shorter than the verifier's `min_window_ms`, or when the verifier failed.
+    """
+
+    epoch: int
+    event_seq: int
+    utterance_id: str
+    hit_pos: int
+    score: float | None
+
+
 IngressEvent = (
     SpeechStarted
     | SpeechResumed
@@ -392,6 +409,7 @@ IngressEvent = (
     | UtteranceDropped
     | IngressOverload
     | NameHeard
+    | WakeVerified
 )
 
 
@@ -410,12 +428,15 @@ class IngressSeed:
     `frames` are the retained `(position, float32 audio)` pairs, oldest first; `floor` is one past
     the last frame of the last utterance, or one past the newest frame received before the last
     mute, whichever is later; `vad_from` the first frame the VAD has not scored, or None when the
-    VAD is not running.
+    VAD is not running. `mute_floor` is one past the newest frame received before the last mute,
+    the boundary no verify window reaches back across; unlike `floor`, an utterance's end does
+    not move it.
     """
 
     frames: tuple[tuple[int, np.ndarray], ...]
     floor: int
     vad_from: int | None
+    mute_floor: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,22 +470,27 @@ class Lane(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class IngressLanes:
-    """The lanes ingress submits to: VAD, STT, end of turn and the name spotter's `kws`."""
+    """The lanes ingress submits to: VAD, STT, end of turn and the name spotter's `kws`.
+
+    `verify` is the wake verifier's own lane, so a verify job never waits behind a spotter job.
+    """
 
     vad: Lane
     stt: Lane
     eot: Lane
     kws: Lane
+    verify: Lane | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class IngressEngines:
-    """The engines ingress drives; no end-of-turn model or no spotter turns that part off."""
+    """The engines ingress drives; no end-of-turn model, spotter or verifier turns that part off."""
 
     vad: VoiceActivityDetector
     transcriber: StreamingTranscriber
     turn_end: TurnEndDetector | None
     spotter: NameSpotter | None
+    verifier: WakeVerifier | None = None
 
 
 # -- Internal state -------------------------------------------------------------------------------
@@ -724,6 +750,15 @@ class AudioIngress:
         # The spotter's window in whole frames, rounded up: the audio a hit's name lies in.
         self._kws_window = -(-spotter.window_ms // FRAME_MS) if spotter else 0
         self._endpoint_wake: _EndpointWake | None = None
+        # The first frame of each endpoint backlog heard, by its hit's position: the frame
+        # before it is the previous uplink's last, so no verify window reaches back past it.
+        self._backlog_starts: dict[int, int] = {}
+
+        # The mute boundary: one past the newest frame received before the last mute. Only a
+        # mute moves it, where `_floor` also moves past every utterance that ends.
+        self._mute_floor = 0
+        # Verify requests waiting for their last frame: `(utterance_id, hit_pos, ready_pos)`.
+        self._verify_waiting: list[tuple[str, int, int]] = []
 
         self._frames_received = 0
         self._gap_frames = 0
@@ -758,6 +793,8 @@ class AudioIngress:
         pcm = np.frombuffer(frame.payload, dtype="<i2").astype(np.float32) / _PCM16_SCALE
         item = _Frame(pos, frame.seq, pcm, frame.payload, self._clock())
         self._remember(item)
+        if self._verify_waiting:
+            self._verify_arrived(pos)
         if self._kws_next is None:
             # The spotter's stream starts at the first frame this ingress receives, so frames
             # the VAD queue drops before any is routed are fed all the same.
@@ -813,6 +850,10 @@ class AudioIngress:
         The name spotter skips to the floor too: frames waiting for it are discarded, its next
         fed frame starts a fresh, warmed context, and a spotter job still running reports none
         of its hits, even when the mute is over by the time it ends.
+
+        The mute boundary moves to the same frame, so no verify window spans the mute, and a
+        verify request still waiting for its frames is discarded with no event; a verify job
+        that ends while muted emits none either.
         """
         if muted == self._muted or self._closed:
             return
@@ -822,9 +863,11 @@ class AudioIngress:
             if utt is not None:
                 self._drop_emitted(utt, "muted", utt.last_partial_text, None, utt.last_pushed)
             self._endpoint_wake = None
+            self._verify_waiting.clear()
             if self._ring:
                 # A frame enters the ring before its queue, so this covers the queued ones too.
                 self._floor = max(self._floor, self._ring[-1].pos + 1)
+                self._mute_floor = max(self._mute_floor, self._ring[-1].pos + 1)
             self._muted_frames += len(self._queue)
             self._queue.clear()
             self._reset_vad()
@@ -906,6 +949,28 @@ class AudioIngress:
         utt.gate_result = None
         self._maybe_start_gate(utt)
 
+    def request_verify(self, utterance_id: str, hit_pos: int) -> None:
+        """Score the audio around the name hit at `hit_pos` with the wake verifier.
+
+        Once a frame at or past `hit_pos` plus the verifier's `after_ms` has been received,
+        the window is built from one continuous stretch of audio with the hit (`_verify_has`),
+        its frames' uplink bytes are scored on the `verify` lane, and a `WakeVerified` for
+        `utterance_id` is emitted. With no verifier or no lane, the `WakeVerified` carries
+        None at once. While muted or closed nothing is scored or emitted: the controller
+        abandons its candidate on either.
+        """
+        if self._closed or self._muted:
+            return
+        verifier = self._engines.verifier
+        if verifier is None or self._lanes.verify is None:
+            self._send(WakeVerified(self._epoch, self._stamp(), utterance_id, hit_pos, None))
+            return
+        ready_pos = hit_pos + verifier.after_ms // FRAME_MS
+        if self._ring and self._ring[-1].pos >= ready_pos:
+            self._start_verify(utterance_id, hit_pos)
+        else:
+            self._verify_waiting.append((utterance_id, hit_pos, ready_pos))
+
     def drop(self, utterance_id: str, reason: ControllerDropReason) -> UtteranceDropped | None:
         """Close the named open utterance without a final decode and return its drop.
 
@@ -950,7 +1015,12 @@ class AudioIngress:
     def handoff(self) -> IngressSeed:
         """The seed for the next ingress across a reconfigure; reads only."""
         frames = tuple((item.pos, item.pcm) for item in self._ring)
-        return IngressSeed(frames=frames, floor=self._floor, vad_from=self._vad_from())
+        return IngressSeed(
+            frames=frames,
+            floor=self._floor,
+            vad_from=self._vad_from(),
+            mute_floor=self._mute_floor,
+        )
 
     def stats(self) -> IngressStats:
         """The counters so far: uplink gaps, discarded frames, skipped jobs, missing reference."""
@@ -975,6 +1045,7 @@ class AudioIngress:
             audio = np.asarray(pcm, dtype=np.float32)
             self._remember(_Frame(pos, None, audio, _to_pcm16(audio), arrival))
         self._floor = seed.floor
+        self._mute_floor = seed.mute_floor
         if seed.vad_from is None:
             # The spotter starts at the first frame received, as a new ingress's does.
             self._processed_pos = seed.frames[-1][0] if seed.frames else None
@@ -1391,6 +1462,8 @@ class AudioIngress:
     def _endpoint_heard(self, wake: _EndpointWake) -> None:
         assert wake.last_pos is not None
         self._endpoint_wake = None
+        if wake.first_pos is not None:
+            self._remember_backlog(wake.last_pos, wake.first_pos)
         utt = self._utt
         self._send(
             NameHeard(
@@ -1404,6 +1477,107 @@ class AudioIngress:
                 spotter="endpoint",
             )
         )
+
+    def _remember_backlog(self, hit_pos: int, first_pos: int) -> None:
+        """Keep an endpoint backlog's first frame by its hit, forgetting hits the ring has lost."""
+        oldest = self._ring[0].pos if self._ring else hit_pos
+        for stale in [pos for pos in self._backlog_starts if pos < oldest]:
+            del self._backlog_starts[stale]
+        self._backlog_starts[hit_pos] = first_pos
+
+    # -- The wake verifier ------------------------------------------------------------------------
+
+    def _verify_arrived(self, pos: int) -> None:
+        """Start every waiting verify request whose last frame has now been received."""
+        ready = [request for request in self._verify_waiting if pos >= request[2]]
+        if not ready:
+            return
+        self._verify_waiting = [request for request in self._verify_waiting if pos < request[2]]
+        for utterance_id, hit_pos, _ in ready:
+            self._start_verify(utterance_id, hit_pos)
+
+    def _start_verify(self, utterance_id: str, hit_pos: int) -> None:
+        """Build the hit's window now, while the ring holds it, and score it as a lane job.
+
+        The bytes are the frames' own uplink payload: `_to_pcm16` scales by 32767 and
+        truncates, and the verifier is trained on int16 over 32768.
+        """
+        verifier = self._engines.verifier
+        lane = self._lanes.verify
+        assert verifier is not None and lane is not None
+        window = verify_window(
+            self._verify_has(hit_pos, verifier.after_ms // FRAME_MS),
+            hit_pos,
+            before_frames=verifier.before_ms // FRAME_MS,
+            after_frames=verifier.after_ms // FRAME_MS,
+            min_frames=-(-verifier.min_window_ms // FRAME_MS),
+        )
+        if window is None:
+            logger.info(
+                "Ingress verify window for the hit at %d is under %d ms; not scored",
+                hit_pos,
+                verifier.min_window_ms,
+            )
+            self._send(WakeVerified(self._epoch, self._stamp(), utterance_id, hit_pos, None))
+            return
+        pcm = b"".join(self._by_pos[pos].payload for pos in window)
+        self._spawn(self._verify(verifier, lane, pcm, utterance_id, hit_pos))
+
+    def _verify_has(self, hit_pos: int, after_frames: int) -> Callable[[int], bool]:
+        """Whether a position's frame is audio of one continuous stretch of time with the hit.
+
+        Positions are the session's arrival counter, not time: the position before an endpoint
+        backlog's first frame is the previous uplink's last, and a frame lost on any link
+        leaves no position gap. So a frame counts when the ring holds it, it is at or past the
+        mute boundary and, for an endpoint hit, the backlog's first frame, and its `seq - pos`
+        is the hit frame's, since a `seq` jump is lost audio. `_floor` is no bound: it also
+        moves past every utterance that ends, which would cut a window short.
+
+        A frame a reconfigure seeded carries no `seq` and counts as continuous, since the
+        handoff keeps positions and the mute boundary; the `seq` check applies between frames
+        that both carry one. When the hit frame is a seeded one, the check is against the
+        first frame after it that carries a `seq`.
+        """
+        lower = max(self._mute_floor, self._backlog_starts.get(hit_pos, self._mute_floor))
+        by_pos = self._by_pos
+        offset: int | None = None
+        for pos in range(hit_pos, hit_pos + after_frames + 1):
+            frame = by_pos.get(pos)
+            if frame is not None and frame.seq is not None:
+                offset = frame.seq - pos
+                break
+
+        def has(pos: int) -> bool:
+            if pos < lower:
+                return False
+            frame = by_pos.get(pos)
+            if frame is None:
+                return False
+            return frame.seq is None or offset is None or frame.seq - pos == offset
+
+        return has
+
+    async def _verify(
+        self, verifier: WakeVerifier, lane: Lane, pcm: bytes, utterance_id: str, hit_pos: int
+    ) -> None:
+        """Score one window on the `verify` lane and emit its `WakeVerified`.
+
+        A close cancels the job and emits nothing; a result that lands while muted emits
+        nothing either. The spotter's generation is not checked: a spotter reset does not
+        abandon the hit, and the controller drops a result for a candidate it no longer holds.
+        """
+        score: float | None
+        try:
+            score = await lane.run(verifier.score, pcm, token=self._token)
+        except LaneJobCancelled:
+            return
+        except SpeechEngineError:
+            logger.warning("Ingress wake verifier failed for the hit at %d", hit_pos, exc_info=True)
+            self._engine_errors += 1
+            score = None
+        if self._closed or self._muted:
+            return
+        self._send(WakeVerified(self._epoch, self._stamp(), utterance_id, hit_pos, score))
 
     # -- Utterances -------------------------------------------------------------------------------
 

@@ -1034,8 +1034,11 @@ class RealtimeSession:
                 ),
                 turn_end=engines.turn_end,
                 spotter=engines.spotter,
+                verifier=engines.verifier,
             ),
-            lanes=IngressLanes(vad=lanes.vad, stt=lanes.stt, eot=lanes.eot, kws=lanes.kws),
+            lanes=IngressLanes(
+                vad=lanes.vad, stt=lanes.stt, eot=lanes.eot, kws=lanes.kws, verify=lanes.verify
+            ),
             endpointing=config.endpointing,
             wake=config.wake,
             emit=self._emit,

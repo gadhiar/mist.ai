@@ -62,6 +62,7 @@ from backend.realtime.ingress import (
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
+    WakeVerified,
 )
 from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.playback import LanePurge, TurnLane
@@ -424,6 +425,9 @@ class RecordingIngress:
     def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
         self.calls.append(("request_gate_partial", utterance_id, through_pos))
 
+    def request_verify(self, utterance_id: str, hit_pos: int) -> None:
+        self.calls.append(("request_verify", utterance_id, hit_pos))
+
     def set_engaged(self, engaged: bool) -> None:
         self.calls.append(("set_engaged", engaged))
 
@@ -550,6 +554,10 @@ class RecordingIngress:
 
     def overload(self, lane: str = "vad", dropped_ms: int = 120) -> IngressOverload:
         return IngressOverload(self.epoch, self._next_seq(), lane, dropped_ms, None, None)
+
+    def verified(self, uid: str, *, hit_pos: int = 110, score: float | None = 0.9) -> WakeVerified:
+        """The verifier's score for the hit at `hit_pos`; None as ingress sends on any failure."""
+        return WakeVerified(self.epoch, self._next_seq(), uid, hit_pos, score)
 
 
 def default_gate(config: WakeConfig | None = None) -> AddresseeGate:
