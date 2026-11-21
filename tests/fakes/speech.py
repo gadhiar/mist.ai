@@ -64,8 +64,9 @@ class EnergyVadStream:
 class EnergyVad:
     """A VAD that calls loud windows speech; `scripted_audio` bursts score near 0.9."""
 
-    def __init__(self, reference_rms: float = 0.01) -> None:
+    def __init__(self, reference_rms: float = 0.01, *, model_id: str = "energy-vad") -> None:
         self.reference_rms = reference_rms
+        self.model_id = model_id
         self.streams: list[EnergyVadStream] = []
 
     def open_stream(self) -> EnergyVadStream:
@@ -233,10 +234,11 @@ class ScriptedTranscriber:
 class ScriptedTurnEnd:
     """Returns scripted end-of-turn probabilities in order, repeating the last one after."""
 
-    def __init__(self, probabilities: Sequence[float]) -> None:
+    def __init__(self, probabilities: Sequence[float], *, model_id: str = "scripted-eot") -> None:
         if not probabilities:
             raise ValueError("ScriptedTurnEnd needs at least one probability")
         self.probabilities = list(probabilities)
+        self.model_id = model_id
         self.calls: list[int] = []
 
     def probability_complete(self, audio: np.ndarray) -> float:

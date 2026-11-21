@@ -159,6 +159,18 @@ class TestEngineWalk:
         assert (engines.vad, engines.turn_end, engines.spotter) == (None, None, None)
         assert engines.statuses.vad.location == "off"
 
+    def test_the_vad_and_eot_statuses_carry_their_engines_model_ids(self):
+        engines = build_speech_engines(settings(), loaders=Loaders().build())
+
+        assert (engines.statuses.vad.location, engines.statuses.vad.model_id) == (
+            "cpu",
+            "vad-model",
+        )
+        assert (engines.statuses.eot.location, engines.statuses.eot.model_id) == (
+            "cpu",
+            "eot-model",
+        )
+
     def test_an_unknown_id_or_unrecorded_device_is_skipped_with_one_error(self, caplog):
         chain = (
             EngineOption("whisper-big", "cuda"),

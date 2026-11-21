@@ -98,19 +98,26 @@ def last_eight_seconds(audio: np.ndarray) -> np.ndarray:
 
 
 class SmartTurnDetector:
-    """Smart Turn v3.2 over one onnxruntime session and a Whisper feature extractor."""
+    """Smart Turn v3.2 over one onnxruntime session and a Whisper feature extractor.
 
-    __slots__ = ("_endpointing", "_features", "_session")
+    `model_id` is the `eot_model` setting it was loaded from, which the engine walk reports in
+    the end-of-turn status.
+    """
+
+    __slots__ = ("_endpointing", "_features", "_session", "model_id")
 
     def __init__(
         self,
         session: OnnxSession,
         feature_extractor: FeatureExtractor,
         endpointing: EndpointingConfig,
+        *,
+        model_id: str,
     ) -> None:
         self._session = session
         self._features = feature_extractor
         self._endpointing = endpointing
+        self.model_id = model_id
 
     @classmethod
     def load(
@@ -149,7 +156,7 @@ class SmartTurnDetector:
             providers[0],
             placement.eot_threads,
         )
-        return cls(session, feature_extractor_factory(), endpointing)
+        return cls(session, feature_extractor_factory(), endpointing, model_id=placement.eot_model)
 
     def probability_complete(self, audio: np.ndarray) -> float:
         """The probability that the turn has ended, from up to the last 8 s of audio.

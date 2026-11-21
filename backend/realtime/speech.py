@@ -170,7 +170,12 @@ class VadStream(Protocol):
 
 
 class VoiceActivityDetector(Protocol):
-    """A VAD engine, shared by sessions, that opens one stream per audio source."""
+    """A VAD engine, shared by sessions, that opens one stream per audio source.
+
+    `model_id` names the model it loaded, which the engine walk reports in the VAD's status.
+    """
+
+    model_id: str
 
     def open_stream(self) -> VadStream:
         """Open a stream with fresh state."""
@@ -178,7 +183,13 @@ class VoiceActivityDetector(Protocol):
 
 
 class TurnEndDetector(Protocol):
-    """A semantic end-of-turn model that judges whether the speaker has finished."""
+    """A semantic end-of-turn model that judges whether the speaker has finished.
+
+    `model_id` names the model it loaded, which the engine walk reports in the end-of-turn
+    status.
+    """
+
+    model_id: str
 
     def probability_complete(self, audio: np.ndarray) -> float:
         """Score up to the last 8 s of 16 kHz float32 audio as the probability the turn ended."""

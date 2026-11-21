@@ -17,12 +17,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from backend.realtime.budget import EndpointingConfig, PlacementConfig
+from backend.realtime.budget import EndpointingConfig, EngineOption, PlacementConfig, VoiceSettings
 from backend.realtime.engines import silero_vad, smart_turn
 from backend.realtime.engines.silero_vad import SessionSpec, SileroVad
 from backend.realtime.engines.smart_turn import SmartTurnDetector
 from backend.realtime.errors import SpeechEngineError
-from backend.realtime.speech import TurnEndDetector, VoiceActivityDetector
+from backend.realtime.runtime import EngineLoaders, load_speech_engines
+from backend.realtime.speech import NameSpotter, TurnEndDetector, VoiceActivityDetector
+from tests.fakes.speech import ScriptedTranscriber
 
 SILERO_INPUTS = ("input", "state", "sr")
 SMART_TURN_INPUTS = ("input_features",)
@@ -484,6 +486,55 @@ class TestModelPath:
         kind = "vad" if field_name == "vad_model" else "eot"
         with pytest.raises(SpeechEngineError, match=f"MIST_VOICE_{field_name.upper()}"):
             load_either(kind, placement(models_dir, **{field_name: setting}))
+
+
+class TestModelId:
+    """The engine walk reports each loaded engine's `model_id`, so both adapters carry one."""
+
+    def test_the_engine_walk_reports_the_placement_models(self, models_dir: Path) -> None:
+        place = placement(
+            models_dir, stt_chain=(EngineOption("parakeet-cpu", "cpu"),), tts_chain=()
+        )
+
+        def no_spotter(placement: PlacementConfig) -> NameSpotter:
+            raise AssertionError("no kws_model is set, so no spotter loads")
+
+        loaders = EngineLoaders(
+            chains={"parakeet-cpu": lambda settings, device: ScriptedTranscriber([])},
+            vad=lambda placement: load_vad(placement)[0],
+            eot=lambda placement, endpointing: load_eot(
+                placement, endpointing=endpointing, feature_extractor=RecordingExtractor()
+            )[0],
+            kws=no_spotter,
+        )
+
+        engines = load_speech_engines(VoiceSettings(placement=place), loaders)
+
+        assert (engines.statuses.vad.location, engines.statuses.vad.model_id) == (
+            "cpu",
+            place.vad_model,
+        )
+        assert (engines.statuses.eot.location, engines.statuses.eot.model_id) == (
+            "cpu",
+            place.eot_model,
+        )
+
+    @pytest.mark.parametrize(
+        ("kind", "field_name", "inputs"),
+        [("vad", "vad_model", SILERO_INPUTS), ("eot", "eot_model", SMART_TURN_INPUTS)],
+    )
+    def test_the_model_id_is_the_setting_the_engine_loaded_from(
+        self, models_dir: Path, kind: str, field_name: str, inputs: tuple[str, ...]
+    ) -> None:
+        stage(models_dir, Path("speech/example-org/other-model/weights/v9.onnx"))
+        setting = "example-org/other-model@0123456789abcdef:weights/v9.onnx"
+        place = placement(models_dir, **{field_name: setting})
+        session = FakeSession(inputs, silero_respond)
+        if kind == "vad":
+            engine: VoiceActivityDetector | TurnEndDetector = load_vad(place, session=session)[0]
+        else:
+            engine = load_eot(place, session=session, feature_extractor=RecordingExtractor())[0]
+        assert engine.model_id == setting
 
 
 class TestNoDownload:
