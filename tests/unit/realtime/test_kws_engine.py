@@ -927,3 +927,83 @@ def test_the_module_imports_neither_runtime_package() -> None:
     assert "import pymicro_features" not in source
     assert "from ai_edge_litert" not in source
     assert "from pymicro_features" not in source
+
+
+# -- Hit positions from one series ------------------------------------------------------------
+
+
+class TestHitPositions:
+    """`hit_positions` over one `score_series` equals the stream's `end_pos` at each cutoff.
+
+    The stream is pushed 20 ms frames from `first_pos`, the remainder as one more frame, as
+    ingress pushes it; the frontend gives no features for its first `lead` calls, as a
+    microfrontend filling its analysis window does, and the warm-up need not be whole calls.
+    """
+
+    @staticmethod
+    def _filling(lead: int) -> Features:
+        def features(call: int, pcm: bytes) -> list[float]:
+            return [] if call <= lead else by_level(call, pcm)
+
+        return features
+
+    @pytest.mark.parametrize("seed", range(30))
+    def test_hit_positions_equal_the_streams_end_pos(self, tmp_path: Path, seed: int) -> None:
+        rng = random.Random(1000 + seed)
+        lead = rng.choice((0, 1, 2, 5))
+        settings = {
+            "stride": rng.randint(1, 3),
+            "sliding_window": rng.randint(1, 4),
+            "window_ms": rng.randint(10, 150),
+            "warmup_ms": rng.choice((0, 30, 45, 200)),
+        }
+        rig = build(tmp_path, features=self._filling(lead), respond=by_content, **settings)
+        spotter = rig.spotter
+        pcm = levels(*(rng.randint(0, 700) for _ in range(rng.randint(1, 90))))
+        pcm = pcm[: len(pcm) - 2 * rng.randint(0, 150)]
+        series = spotter.score_series(pcm)
+        first_pos = rng.randint(0, 50)
+        cutoffs = sorted({round(rng.random(), 3) for _ in range(4)} | set(series[:3]))
+        hits = 0
+        for cutoff in cutoffs:
+            stream, _ = rig.stream(cutoff)
+            reported = [hit.end_pos for hit in push_frames(stream, pcm, first_pos)]
+            hits += len(reported)
+            assert reported == kws.hit_positions(
+                series,
+                cutoff,
+                stride=spotter.stride,
+                cooldown_steps=spotter.cooldown_steps,
+                first_pos=first_pos,
+                warmup_samples=settings["warmup_ms"] * 16,
+                lead_calls=lead,
+            )
+        assert hits or not series
+
+    def test_a_step_is_placed_at_the_frame_holding_its_last_sample(self) -> None:
+        # Stride 3 is 480 samples a step: steps end at samples 480, 960 and 1440, in frames 1,
+        # 2 and 4 of 320 samples; a warm-up of 200 samples moves each end 200 samples earlier.
+        series = [1.0, 1.0, 1.0]
+        positions = kws.hit_positions(series, 0.5, stride=3, cooldown_steps=1, first_pos=10)
+        assert positions == [11, 12, 14]
+        warmed = kws.hit_positions(
+            series, 0.5, stride=3, cooldown_steps=1, first_pos=0, warmup_samples=200
+        )
+        assert warmed == [0, 2, 3]
+        assert kws.hit_positions(series, 0.5, stride=3, cooldown_steps=3, first_pos=0) == [1]
+        assert kws.hit_positions([], 0.5, stride=3, cooldown_steps=1, first_pos=0) == []
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"stride": 0},
+            {"cooldown_steps": -1},
+            {"warmup_samples": -1},
+            {"lead_calls": -1},
+            {"frame_samples": 0},
+        ],
+    )
+    def test_a_negative_or_empty_shape_is_refused(self, bad: dict[str, int]) -> None:
+        arguments = {"stride": 1, "cooldown_steps": 1, "first_pos": 0, **bad}
+        with pytest.raises(ValueError):
+            kws.hit_positions([0.5], 0.5, **arguments)
