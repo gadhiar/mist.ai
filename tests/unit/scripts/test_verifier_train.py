@@ -199,7 +199,7 @@ def world(tmp_path: Path) -> World:
 
 
 def tiny_builder(built: list[model.VerifierModel]) -> train.ModelBuilder:
-    def build(config: train.TrainConfig, weights: Path) -> model.VerifierModel:
+    def build(config: train.TrainConfig, weights: Path | None) -> model.VerifierModel:
         del config, weights
         made = tiny_model()
         built.append(made)
@@ -807,6 +807,271 @@ class TestStoreAndLoader:
             f"epoch {row['epoch']}: loss {row['loss']:.4f} over 12 examples, 0.0 examples/s, "
             f"run ETA {'unknown' if row['epoch'] == 1 else '0:00:00'}"
             for row in history
+        ]
+
+
+# -- The command line and the benchmark --------------------------------------------------------
+
+
+H37_FOLD = [
+    "--dataset",
+    "d",
+    "--manifest",
+    "m.json",
+    "--root-map",
+    "/from=/to",
+    "--weights",
+    "w.pth",
+    "--out",
+    "o",
+    "--fold",
+    "3",
+    "--batch",
+    "32",
+    "--accumulate",
+    "2",
+    "--seed",
+    "17",
+    "--cache",
+    "c",
+    "--store-workers",
+    "8",
+    "--loader-workers",
+    "4",
+    "--progress-seconds",
+    "60",
+]
+TINY_BENCHMARK = (
+    "--benchmark",
+    "--benchmark-seconds",
+    "0.05",
+    "--benchmark-workers",
+    "0,1",
+    "--benchmark-windows",
+    "48",
+    "--benchmark-decode",
+    "2000",
+    "--loader-workers",
+    "1",
+    "--store-workers",
+    "1",
+)
+
+
+class TestCommandLine:
+    def test_h37s_commands_parse_as_before(self) -> None:
+        args = train.parse_args(H37_FOLD)
+        assert args.benchmark is False
+        assert (args.dataset, args.manifest, args.weights, args.out) == (
+            Path("d"),
+            Path("m.json"),
+            Path("w.pth"),
+            Path("o"),
+        )
+        assert (args.fold, args.final, args.root_map, args.cache) == (
+            3,
+            False,
+            ["/from=/to"],
+            Path("c"),
+        )
+        assert (args.batch, args.accumulate, args.seed) == (32, 2, 17)
+        assert (args.store_workers, args.loader_workers, args.progress_seconds) == (8, 4, 60.0)
+        final = [*H37_FOLD[: H37_FOLD.index("--fold")], "--final"]
+        args = train.parse_args(final)
+        assert (args.fold, args.final) == (None, True)
+        args = train.parse_args(H37_FOLD[:10] + ["--final"])
+        assert (args.batch, args.cache, args.store_workers) == (32, None, train.STORE_WORKERS)
+        assert args.loader_workers == 4 and args.progress_seconds == train.PROGRESS_SECONDS
+
+    @pytest.mark.parametrize(
+        ("drop", "message"),
+        [
+            ("--manifest", "the following arguments are required: --manifest"),
+            ("--weights", "the following arguments are required: --weights"),
+            ("--fold", "one of the arguments --fold --final is required"),
+        ],
+    )
+    def test_a_missing_argument_still_exits_2_with_argparses_message(
+        self, drop: str, message: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        argv = list(H37_FOLD)
+        at = argv.index(drop)
+        del argv[at : at + 2]
+        with pytest.raises(SystemExit) as exited:
+            train.main(argv, build=tiny_builder([]))
+        assert exited.value.code == 2
+        assert message in capsys.readouterr().err
+
+    def test_the_benchmark_and_its_flags_are_optional(self) -> None:
+        args = train.parse_args(["--benchmark"])
+        assert args.benchmark is True
+        assert args.dataset is None and args.out is None
+        assert (args.benchmark_seconds, args.benchmark_workers) == (30.0, (0, 1, 2, 4, 8))
+        assert (args.benchmark_windows, args.benchmark_decode, args.batch) == (16384, 2000, 32)
+        args = train.parse_args(
+            ["--benchmark", "--dataset", "d", "--out", "o", "--benchmark-workers", "2,4"]
+        )
+        assert (args.dataset, args.out, args.benchmark_workers) == (Path("d"), Path("o"), (2, 4))
+
+    @pytest.mark.parametrize(
+        "option",
+        [
+            ("--manifest", "m.json"),
+            ("--weights", "w.pth"),
+            ("--fold", "0"),
+            ("--final",),
+            ("--cache", "c"),
+        ],
+    )
+    def test_the_benchmark_refuses_a_training_input(
+        self, option: tuple[str, ...], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            train.parse_args(["--benchmark", *option])
+        assert exited.value.code == 2
+        assert f"{option[0]} is refused" in capsys.readouterr().err
+
+    def test_a_benchmark_flag_without_the_benchmark_is_refused(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            train.parse_args([*H37_FOLD, "--benchmark-seconds", "5"])
+        assert exited.value.code == 2
+        assert "--benchmark-seconds is read only with --benchmark" in capsys.readouterr().err
+
+
+def _refuse_private_reads(world: World, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make the manifest loaders and any read of a recording fail; returns the files read."""
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the benchmark read a manifest")
+
+    monkeypatch.setattr(train, "load_manifest", refuse)
+    monkeypatch.setattr(train, "train_manifest", refuse)
+    read = train.read_wav_segment
+    opened: list[str] = []
+
+    def segment(path: Path, start: int, count: int) -> np.ndarray:
+        assert world.ami in Path(path).parents, "the benchmark read a recording"
+        opened.append(Path(path).name)
+        return read(path, start, count)
+
+    monkeypatch.setattr(train, "read_wav_segment", segment)
+    return opened
+
+
+class TestBenchmark:
+    def test_it_prints_each_measurement_and_the_projection(
+        self, world: World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        opened = _refuse_private_reads(world, monkeypatch)
+        out = world.root / "bench"
+        argv = [*TINY_BENCHMARK, "--dataset", str(world.dataset), "--out", str(out)]
+        assert train.main(argv, build=tiny_builder([])) == 0
+        assert opened and set(opened) == {"ES2002a.Mix-Headset.wav"}
+        assert not (out / train.BENCHMARK_CACHE).exists()
+        lines = capsys.readouterr().out.splitlines()
+        starts = [
+            "device: cpu",
+            "synthetic store: 48 windows",
+            "store cold read: ",
+            "store cold read as examples: ",
+            "loader: 0 workers, ",
+            "loader: 1 workers, ",
+            "step: cpu, ",
+            "end-to-end: 0 loader workers, ",
+            "scoring: ",
+            "index: 8 windows, 2 public",
+            "store build: 2 public windows",
+            "projection: training rate min(",
+            "projection: final training 6 x 44 / ",
+            "projection: store build 2 / ",
+            "projection: total ",
+            "ratio: loader / step = ",
+        ]
+        for start in starts:
+            assert any(line.startswith(start) for line in lines), start
+        folds = train.assign_folds(world.windows)
+        for fold in range(train.FOLDS):
+            held = sum(1 for window in world.windows if folds[window.group] == fold)
+            trained = sum(
+                train.REAL_REPEAT if window.kind == "real_positive" else 1
+                for window in world.windows
+                if folds[window.group] != fold
+            )
+            assert any(
+                line.startswith(f"projection: fold {fold} training 6 x {trained} / ")
+                for line in lines
+            ), fold
+            assert any(
+                line.startswith(f"projection: fold {fold} scoring {held} / ") for line in lines
+            ), fold
+        assert re.search(r"^projection: total \d+ s = \d+\.\d\d h$", lines[-2])
+        assert re.search(r"^ratio: loader / step = \S+ / \S+ = \d+\.\d\d$", lines[-1])
+        for line in lines:
+            assert str(world.root) not in line and str(out) not in line
+            assert train.BENCHMARK_CACHE not in line
+            for name in FIXTURE_NAMES:
+                assert name not in line, line
+
+    def test_without_an_index_it_prints_seconds_per_million_examples(
+        self,
+        world: World,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _refuse_private_reads(world, monkeypatch)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        monkeypatch.setattr(train.tempfile, "tempdir", str(scratch))
+        assert train.main(list(TINY_BENCHMARK), build=tiny_builder([])) == 0
+        assert not [path for path in scratch.iterdir() if "verifier-benchmark" in path.name]
+        lines = capsys.readouterr().out.splitlines()
+        assert not any(line.startswith(("index:", "store build:")) for line in lines)
+        assert re.search(
+            r"^projection: 1000000 / \S+ = \d+ s a million training examples$", lines[-2]
+        )
+        assert lines[-1].startswith("ratio: loader / step = ")
+
+    def test_it_removes_its_cache_when_it_fails(
+        self, world: World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _refuse_private_reads(world, monkeypatch)
+        out = world.root / "bench"
+        seen: list[bool] = []
+
+        def failing(*args: object, **kwargs: object) -> list[float]:
+            seen.append((out / train.BENCHMARK_CACHE).is_dir())
+            raise store.StoreError("scoring failed")
+
+        monkeypatch.setattr(train, "score_windows", failing)
+        argv = [*TINY_BENCHMARK, "--dataset", str(world.dataset), "--out", str(out)]
+        assert train.main(argv, build=tiny_builder([])) == 2
+        assert seen == [True]
+        assert not (out / train.BENCHMARK_CACHE).exists()
+        assert "train: scoring failed" in capsys.readouterr().err
+
+    def test_the_projection_is_printed_as_arithmetic(self) -> None:
+        workload = train.Workload(folds=((100, 10), (200, 20)), final=300, public=50)
+        rates = train.Rates(step=10.0, loader=20.0, cold_read=40.0, scoring=5.0, build=25.0)
+        lines = train.projection(workload, rates, epochs=6)
+        assert lines == [
+            "projection: training rate min(step 10.0, loader 20.0, cold read 40.0) "
+            "= 10.0 examples/s",
+            "projection: fold 0 training 6 x 100 / 10.0 = 60 s",
+            "projection: fold 0 scoring 10 / 5.0 = 2 s",
+            "projection: fold 1 training 6 x 200 / 10.0 = 120 s",
+            "projection: fold 1 scoring 20 / 5.0 = 4 s",
+            "projection: final training 6 x 300 / 10.0 = 180 s",
+            "projection: store build 50 / 25.0 = 2 s",
+            "projection: total 368 s = 0.10 h",
+        ]
+        quick_loader = train.Rates(step=10.0, loader=4.0, cold_read=40.0, scoring=5.0, build=1.0)
+        assert train.projection(None, quick_loader, epochs=6) == [
+            "projection: training rate min(step 10.0, loader 4.0, cold read 40.0) "
+            "= 4.0 examples/s",
+            "projection: 1000000 / 4.0 = 250000 s a million training examples",
         ]
 
 
