@@ -952,7 +952,8 @@ class _FakeClock:
 
 def _step_through(timed: "train._Timed", clock: _FakeClock, ahead: int, step: float) -> None:
     """Consume as `fit` over a `DeviceEpoch` reading `ahead` batches ahead: batch n + `ahead`
-    is asked for before batch n's step, and each step takes `step` seconds of `clock`."""
+    is asked for before batch n's step, and each step takes `step` seconds of `clock`.
+    """
     iterator = iter(timed)
     held = collections.deque(itertools.islice(iterator, ahead))
     for batch in iterator:
