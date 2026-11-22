@@ -8,7 +8,9 @@ threshold table on AMI calibration audio; a window from any of them in training 
 every one of those figures a measure of memory. So every file a window was read or mixed from
 is checked here, and the build is refused (exit 2, nothing written) when any of them is:
 
-- a manifest entry outside the train split, or whose sha256 is not its entry's;
+- a manifest recording whose sha256 no entry of the full manifest has, or a tune or test entry
+  has. A recording is resolved by sha256, because mine numbers it by its place in the
+  train-only manifest (as train reads it), not by its place in the full one;
 - an AMI dev or eval meeting (`stage.AMI_DEV`, `stage.AMI_EVAL`), a train meeting that failed
   the speaker filter, or a meeting outside the mining share of `ami/train/split.json`, or an
   AMI file whose sha256 is not the one `ami/train/SHA256SUMS` lists;
@@ -66,7 +68,8 @@ class GuardError(Exception):
 class Guard:
     """What the guard checks each file against."""
 
-    manifest: RecordingManifest
+    recordings: Mapping[str, frozenset[str]]
+    """Each full-manifest recording's sha256 and the splits of the entries holding it."""
     held_out: Mapping[str, str]
     train_sums: Mapping[str, str]
     mining: frozenset[str]
@@ -89,17 +92,24 @@ class Guard:
             raise GuardError(f"{where}: its sha256 is {self.held_out[ref.sha256]}")
 
     def _recording(self, ref: FileRef, where: str) -> None:
-        entries = self.manifest.entries
-        if ref.entry is None or ref.entry >= len(entries):
-            raise GuardError(f"{where}: manifest entry {ref.entry} does not exist")
-        entry = entries[ref.entry]
-        if entry.split != "train":
+        """Resolve a mined recording in the full manifest by its sha256, never by `ref.entry`.
+
+        `ref.entry` is the recording's place in the train-only manifest mine and train read,
+        which is not its place in the full manifest once tune or test entries sit between the
+        train ones; the sha256 names the same recording in both.
+        """
+        splits = self.recordings.get(ref.sha256)
+        if not splits:
             raise GuardError(
-                f"{where}: manifest entry {ref.entry} is {entry.split}, not in the manifest's "
-                "train split"
+                f"{where}: the recording mined as train entry {ref.entry} has a sha256 no "
+                "manifest entry has"
             )
-        if entry.sha256 != ref.sha256:
-            raise GuardError(f"{where}: its sha256 is not manifest entry {ref.entry}'s")
+        outside = sorted(splits - {"train"})
+        if outside:
+            raise GuardError(
+                f"{where}: the recording mined as train entry {ref.entry} has the sha256 of a "
+                f"{outside[0]} entry, not in the manifest's train split"
+            )
 
     def _ami(self, ref: FileRef, where: str) -> None:
         name = PurePosixPath(ref.path or "").name
@@ -149,8 +159,11 @@ def _guard(manifest: RecordingManifest, ami_root: Path, mined: Path) -> tuple[Gu
         excluded = frozenset(split["excluded"])
     except (KeyError, TypeError) as exc:
         raise GuardError(f"ami/train/{SPLIT} has no shares or excluded: {exc}") from exc
+    recordings: dict[str, set[str]] = {}
+    for item in manifest.entries:
+        recordings.setdefault(item.sha256, set()).add(item.split)
     guard = Guard(
-        manifest=manifest,
+        recordings={digest: frozenset(splits) for digest, splits in recordings.items()},
         held_out=held_out,
         train_sums=read_sums(ami_root / "train" / SUMS),
         mining=mining,
