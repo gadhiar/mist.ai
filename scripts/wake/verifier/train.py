@@ -1229,9 +1229,10 @@ def _cold_read(
     warm = min(WARM_BATCHES, len(data) - 1)
     refused = _drop_cache(store.directory)
     cold = _loader_pass(data, workers, pin, warm, seconds, clock)
+    cold_rate = cold.rate(clock())
     again = EpochBatches(data.plan[: cold.handed], data.labels, data.store, data.settings)
     warmed = _loader_pass(again, workers, pin, warm, float("inf"), clock)
-    cold_rate, warm_rate = cold.rate(clock()), warmed.rate(clock())
+    warm_rate = warmed.rate(clock())
     if refused is not None:
         note = f"page cache not dropped: {refused}"
     elif cold_rate >= HONOURED * warm_rate:
