@@ -34,7 +34,6 @@ from backend.realtime.speech import (
     TextSegment,
     TranscriptUpdate,
     VoiceInfo,
-    WordTiming,
     arbitration_key,
     false_accepts_per_hour,
     positive_quantile,
@@ -91,7 +90,6 @@ class TestValueTypes:
             ("audio_ms", int),
             ("no_speech_prob", float | None),
             ("avg_logprob", float | None),
-            ("words", tuple[WordTiming, ...] | None),
         ]
 
     def test_transcript_update_whisper_scores_default_to_none(self):
@@ -99,51 +97,6 @@ class TestValueTypes:
 
         assert update.no_speech_prob is None
         assert update.avg_logprob is None
-        assert update.words is None
-
-    def test_word_timing_fields_match_the_interfaces(self):
-        assert _fields(WordTiming) == [("text", str), ("start_ms", int), ("end_ms", int)]
-
-    @pytest.mark.parametrize(
-        ("text", "words"),
-        [
-            ("Mist, what's the time?", ("Mist,", "what's", "the", "time?")),
-            ("  turn   on ", ("turn", "on")),
-            ("", ()),
-        ],
-    )
-    def test_words_that_join_to_the_text_are_kept(self, text, words):
-        timed = tuple(WordTiming(word, 80 * i, 80 * (i + 1)) for i, word in enumerate(words))
-
-        update = TranscriptUpdate(text, 0, False, 400, words=timed)
-
-        assert update.words == timed
-
-    @pytest.mark.parametrize(
-        ("text", "words"),
-        [
-            ("turn on", ("turn",)),
-            ("turn on", ("turn", "on", "now")),
-            ("turn on", ("turnon",)),
-            ("turn on", ("turn on",)),
-            ("turn on", ("turn", "", "on")),
-            ("turn on", ("turn", "\ton")),
-            ("Mist, hi", ("Mist", ",", "hi")),
-            ("", ("mist",)),
-        ],
-    )
-    def test_words_that_do_not_join_to_the_text_are_refused(self, text, words):
-        timed = tuple(WordTiming(word, 0, 80) for word in words)
-
-        with pytest.raises(ValueError, match="words"):
-            TranscriptUpdate(text, 0, False, 400, words=timed)
-
-    def test_the_invariant_message_holds_no_text(self):
-        with pytest.raises(ValueError) as caught:
-            TranscriptUpdate("zebra quartz", 0, False, 400, words=(WordTiming("zebra", 0, 80),))
-
-        assert "zebra" not in str(caught.value)
-        assert "quartz" not in str(caught.value)
 
     def test_text_segment_and_synth_chunk_fields_match_the_interfaces(self):
         assert _fields(TextSegment) == [
@@ -195,15 +148,7 @@ class TestValueTypes:
 
     @pytest.mark.parametrize(
         "cls",
-        [
-            TranscriptUpdate,
-            WordTiming,
-            TextSegment,
-            SynthChunk,
-            VoiceInfo,
-            NameHit,
-            SpotterCalibration,
-        ],
+        [TranscriptUpdate, TextSegment, SynthChunk, VoiceInfo, NameHit, SpotterCalibration],
         ids=lambda cls: cls.__name__,
     )
     def test_value_types_are_frozen_and_slotted(self, cls):
@@ -531,15 +476,8 @@ class TestScriptedTranscriber:
         stream.push(np.zeros(3200, dtype=np.float32))
         second = stream.decode_partial(CancelToken())
 
-        turn, on, the = (
-            WordTiming("turn", 0, 200),
-            WordTiming("on", 200, 400),
-            WordTiming("the", 400, 600),
-        )
-        assert first == TranscriptUpdate("turn on", 0, False, 400, words=(turn, on))
-        assert second == TranscriptUpdate(
-            "turn on the", len("turn on"), False, 600, words=(turn, on, the)
-        )
+        assert first == TranscriptUpdate("turn on", 0, False, 400)
+        assert second == TranscriptUpdate("turn on the", len("turn on"), False, 600)
 
     def test_the_final_carries_the_utterances_scripted_whisper_scores(self):
         utterance = ScriptedUtterance("thanks for watching", no_speech_prob=0.9, avg_logprob=-1.4)
@@ -548,34 +486,7 @@ class TestScriptedTranscriber:
 
         final = stream.decode_final(CancelToken())
 
-        words = (
-            WordTiming("thanks", 0, 100),
-            WordTiming("for", 100, 100),
-            WordTiming("watching", 100, 100),
-        )
-        assert final == TranscriptUpdate("thanks for watching", 19, True, 100, 0.9, -1.4, words)
-
-    def test_the_final_spans_each_word_by_its_cadence_clamped_to_the_audio_pushed(self):
-        stream = ScriptedTranscriber(["turn  on the lights"], ms_per_word=200).open_stream()
-        stream.push(np.zeros(8000, dtype=np.float32))
-
-        final = stream.decode_final(CancelToken())
-
-        assert final.text == "turn  on the lights"
-        assert final.words == (
-            WordTiming("turn", 0, 200),
-            WordTiming("on", 200, 400),
-            WordTiming("the", 400, 500),
-            WordTiming("lights", 500, 500),
-        )
-
-    def test_a_decode_of_no_text_has_no_words(self):
-        stream = ScriptedTranscriber(["turn on"], ms_per_word=200).open_stream()
-        stream.push(np.zeros(1600, dtype=np.float32))
-
-        partial = stream.decode_partial(CancelToken())
-
-        assert (partial.text, partial.words) == ("", ())
+        assert final == TranscriptUpdate("thanks for watching", 19, True, 100, 0.9, -1.4)
 
     def test_each_stream_takes_the_next_utterance_and_then_empty_text(self):
         transcriber = ScriptedTranscriber(["one", "two"])

@@ -282,7 +282,9 @@ async def test_a_device_wakes_with_a_backlog_hears_its_reply_and_reports_its_ala
     await settle()
     ((_, mode, _from, uid),) = calls(ingress, "open_utterance")
     assert mode == "wake"
-    ingress.emit(ingress.partial(uid, "mist what time is it", gate=True))
+    assert ("request_verify", uid, backlog - 1) in ingress.calls
+    ingress.emit(ingress.partial(uid, "mist what time is it"))
+    ingress.emit(ingress.verified(uid, hit_pos=backlog - 1, score=0.9))
     ingress.emit(ingress.ended(uid, "Mist, what time is it?"))
     await settle(200)
 

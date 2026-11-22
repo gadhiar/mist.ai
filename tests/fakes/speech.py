@@ -32,7 +32,6 @@ from backend.realtime.speech import (
     TextSegment,
     TranscriptUpdate,
     VoiceInfo,
-    WordTiming,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,9 +98,7 @@ class ScriptedTranscriptStream:
     """Reveals the utterance's words as audio arrives: one word per `ms_per_word` pushed.
 
     `stable_chars` follows the Whisper adapter's rule, the longest common word prefix of the
-    last two partials; the final is the whole text, all of it stable. Every update carries word
-    timings by the same cadence: word i spans `[i * ms_per_word, (i + 1) * ms_per_word)`,
-    clamped to the audio pushed, which only a final's later words reach. `on_decode` runs inside
+    last two partials; the final is the whole text, all of it stable. `on_decode` runs inside
     each decode, before its result is recorded, so a test can hold a decode in flight or close
     the stream under it.
     """
@@ -147,19 +144,11 @@ class ScriptedTranscriptStream:
         if self.on_decode is not None:
             self.on_decode()
 
-    def _timed(self, words: Sequence[str]) -> tuple[WordTiming, ...]:
-        audio_ms = self.audio_ms
-        step = self.ms_per_word
-        return tuple(
-            WordTiming(word, min(index * step, audio_ms), min((index + 1) * step, audio_ms))
-            for index, word in enumerate(words)
-        )
-
     def decode_partial(self, token: CancelToken) -> TranscriptUpdate:
         self._decoding()
         self._check_decode_open("return a partial")
-        words = self.utterance.text.split()[: self.audio_ms // self.ms_per_word]
-        text = " ".join(words)
+        words = self.utterance.text.split()
+        text = " ".join(words[: self.audio_ms // self.ms_per_word])
         previous = self.partials[-1].text if self.partials else ""
         update = TranscriptUpdate(
             text,
@@ -168,7 +157,6 @@ class ScriptedTranscriptStream:
             self.audio_ms,
             self.utterance.no_speech_prob,
             self.utterance.avg_logprob,
-            self._timed(words),
         )
         self.partials.append(update)
         return update
@@ -184,7 +172,6 @@ class ScriptedTranscriptStream:
             self.audio_ms,
             self.utterance.no_speech_prob,
             self.utterance.avg_logprob,
-            self._timed(text.split()),
         )
         self.finals.append(update)
         return update

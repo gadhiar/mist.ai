@@ -106,19 +106,6 @@ class SynthChunk:
 
 
 @dataclass(frozen=True, slots=True)
-class WordTiming:
-    """One word of a transcript and where the engine heard it.
-
-    `start_ms` and `end_ms` are milliseconds from the stream's first pushed sample. `text` is the
-    word as the transcript writes it, punctuation included ("Mist,").
-    """
-
-    text: str
-    start_ms: int
-    end_ms: int
-
-
-@dataclass(frozen=True, slots=True)
 class TranscriptUpdate:
     """A partial or final transcript of the utterance so far.
 
@@ -126,12 +113,6 @@ class TranscriptUpdate:
     `no_speech_prob` and `avg_logprob` are Whisper's own non-speech signals, returned rather than
     acted on so that ingress applies the drop rule once, with configurable thresholds, and
     publishes what it dropped; engines without them leave both `None`.
-
-    `words` are the transcript's words with their timings, so a reader can tell which word was
-    heard at a given moment. When given, they join with single spaces to the text with its whitespace
-    collapsed, and no word is empty or holds whitespace; construction refuses anything else, so a
-    timing always belongs to the word the text shows. An engine that cannot meet that for a
-    decode, or has no timings, leaves `words` `None` for it.
     """
 
     text: str
@@ -140,21 +121,6 @@ class TranscriptUpdate:
     audio_ms: int
     no_speech_prob: float | None = None
     avg_logprob: float | None = None
-    words: tuple[WordTiming, ...] | None = None
-
-    def __post_init__(self) -> None:
-        if self.words is not None and not TranscriptUpdate.words_match(self.text, self.words):
-            # The message names no word: a transcript never reaches a log or an error.
-            raise ValueError(
-                f"transcript words do not join to its text ({len(self.words)} words given)"
-            )
-
-    @staticmethod
-    def words_match(text: str, words: tuple[WordTiming, ...]) -> bool:
-        """Whether `words` meet the invariant above for `text`."""
-        if any(word.text.split() != [word.text] for word in words):
-            return False
-        return " ".join(word.text for word in words) == " ".join(text.split())
 
 
 class VadStream(Protocol):
@@ -303,21 +269,6 @@ class NameHit:
     end_pos: int
     keyword: str
     score: float
-
-
-@dataclass(frozen=True, slots=True)
-class HeardWord:
-    """One word of a transcript and the uplink frames it was heard in.
-
-    `first_pos` and `last_pos` are uplink positions, inclusive, as a `NameHit`'s `end_pos` is,
-    so the addressee gate can tell which word sat at a hit. Ingress rebases an engine's
-    `WordTiming` to them through the frames it pushed into the stream. `text` is the word as the
-    transcript writes it, punctuation included.
-    """
-
-    text: str
-    first_pos: int
-    last_pos: int
 
 
 class NameSpotterStream(Protocol):

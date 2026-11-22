@@ -239,7 +239,7 @@ Spotter = Literal["server", "endpoint"]
 # The same values as capabilities' power level. Only gaming mode sets it; nothing in the voice
 # path detects games, full-screen windows or VRAM pressure.
 PowerLevel = Literal["full", "low", "off"]
-# `attend` is the provisional state sent at a name hit, before the addressee verdict.
+# `attend` stays for clients and endpoints that parse it; the controller no longer sends it.
 BackendMistState = Literal["idle", "attend", "listen", "think", "speak"]
 StreamChannel = Literal["tts", "text"]
 TurnOrigin = Literal["voice", "text", "system"]
@@ -1042,8 +1042,9 @@ class VoiceDecisionWakeRejected(_WireModel):
     """A name was heard but the addressee gate rejected it; the one trace such speech leaves.
 
     `turn_id` is the turn in flight when the name was heard, else null. `self_speech`: MIST said
-    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the
-    transcript does not address her. `no_backlog`: an endpoint `wake` carried less pre-wake
+    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the acoustic
+    wake verifier rejected the hit: its score fell below the threshold at the spotter's cutoff,
+    or there was no score or no verifier. `no_backlog`: an endpoint `wake` carried less pre-wake
     audio than the server's minimum. A name that loses cross-session arbitration is not
     rejected: it gets `wake_lost`.
     """
@@ -1177,9 +1178,9 @@ class StreamCancelledMessage(_WireModel):
 class StateCycleMessage(_WireModel):
     """MIST's visible state; `turn_id` is absent for `listen` when no turn is speaking.
 
-    `attend` is provisional: with the `attend_cue` setting on, it is sent at a name hit before
-    the addressee verdict, and is followed by `listen` on acceptance or by the state of the
-    controller's current phase on rejection.
+    The controller sends no `attend` at a name hit. An accepted wake sends `listen` in its
+    publishing step, after the cut of any turn in flight; a rejected or lost wake sends no
+    state, since the Droplet closes its uplink on the decision itself.
     """
 
     type: Literal["state_cycle"] = "state_cycle"
