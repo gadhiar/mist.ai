@@ -74,7 +74,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 from backend.chat.stream_events import Complete, HandOff, StateHint, StreamEvent, Token, WSEvent
 from backend.chat.turn_scope import CommitResult, TurnDelivery, TurnRequest, TurnScope
 
-from .addressee import AddresseeGate, NameAlignment
+from .addressee import AddresseeGate
 from .bargein import BargeInPolicy, BargeInVerdict
 from .budget import (
     BUDGET_FIELDS,
@@ -162,7 +162,6 @@ from .speech import (
     NEUTRAL_STATE,
     SPEAKING_STATES,
     CancelToken,
-    HeardWord,
     Phase,
     SpeechSynthesizer,
     SpotterCalibration,
@@ -269,10 +268,6 @@ class ControllerIngress(Protocol):
 
     def open_utterance(self, mode: Literal["wake"], from_pos: int) -> OpenedUtterance:
         """Open or continue a wake utterance from `from_pos`."""
-        ...
-
-    def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
-        """Decode the utterance through `through_pos` out of cadence."""
         ...
 
     def request_verify(self, utterance_id: str, hit_pos: int) -> None:
@@ -743,7 +738,6 @@ class _Wake:
     waiting_name: bool = False
     utterance_id: str | None = None
     hit_pos: int = 0
-    gate_requested: bool = False
     verified: bool = False
     verify_score: float | None = None
 
@@ -1522,13 +1516,10 @@ class TurnController:
         utterance.partial_text = event.text
         utterance.partial_ms = max(event.audio_end_pos - event.first_pos + 1, 0) * self._frame_ms
         if utterance.candidate:
-            # Unpublished: the gate reads it, not the keyword policy, and nothing is sent.
+            # Unpublished: kept for the publishing step, not read by the keyword policy or by
+            # the wake verdict, and nothing is sent.
             utterance.latest = event
-            wake = self._candidate_of(utterance.utterance_id)
-            if wake is not None:
-                if event.gate and wake.gate_requested:
-                    await self._decide(wake, event.text, event.words, event.speech_end_pos)
-            elif utterance.followup:
+            if self._candidate_of(utterance.utterance_id) is None and utterance.followup:
                 await self._judge_followup(utterance)
             return
         if utterance.published:
@@ -2055,37 +2046,6 @@ class TurnController:
         wake.verified = True
         wake.verify_score = event.score
         await self._screen(wake)
-
-    async def _decide(
-        self,
-        wake: _Wake,
-        text: str,
-        words: tuple[HeardWord, ...] | None,
-        speech_end_pos: int | None,
-    ) -> None:
-        """Check c: the gate reads the decode, at the hit for a server wake.
-
-        Not reached since T74: no gate decode is asked for, as the verifier decides every wake.
-        T75 removes it with the rest of the text gate.
-
-        Only the server spotter's hit is an uplink position the words can be compared with; an
-        endpoint wake's hit is placed from its backlog, so it is decided on its text alone.
-        """
-        alignment = (
-            NameAlignment(wake.hit_pos, self._frame_ms, speech_end_pos, words)
-            if wake.source == "server"
-            else None
-        )
-        verdict = self._gate.decide(
-            text=text,
-            score=wake.score,
-            reference_score=wake.reference_score,
-            alignment=alignment,
-        )
-        if verdict.accepted:
-            await self._accept_wake(wake)
-        else:
-            self._reject(wake, "not_addressed")
 
     async def _accept_wake(self, wake: _Wake) -> None:
         """Accept: end a turn in flight, publish in one step, replay a held end (v5).

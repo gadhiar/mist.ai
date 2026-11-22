@@ -1756,7 +1756,6 @@ async def test_name_first_sends_nothing_at_the_hit_then_publishes_in_one_step_an
         ("session-1", pytest.approx(0.4))
     ]
     assert calls(h.ingress, "request_verify") == [("request_verify", uid, HIT)]
-    assert calls(h.ingress, "request_gate_partial") == []
     assert h.responder.prefetches == []
     mark = len(h.outbound.client)
     at_wake: list[list[str]] = []
@@ -1842,8 +1841,8 @@ async def test_a_server_hit_is_decided_by_its_verifier_score_at_the_kws_threshol
     h.start_voice()
     uid = await name_hit(h)
 
-    # A gate partial, should one come, decides nothing: the text path is no longer reached.
-    h.post(h.ingress.partial(uid, "mist, what's the time", gate=True))
+    # A partial's text, however addressed it reads, decides nothing: only the score does.
+    h.post(h.ingress.partial(uid, "mist, what's the time"))
     await h.settle()
     assert h.arbiter.settles == []
     h.post(h.ingress.verified(uid, hit_pos=HIT, score=score))
@@ -3178,7 +3177,6 @@ async def test_a_lost_claim_closes_its_candidate_with_one_wake_lost_and_settles_
     assert message.reason == "arbitration"
     assert message.detail == WakeLostDetail(winner_score=0.93, score=0.6, utterance_id=uid)
     assert calls(h.ingress, "drop") == [("drop", uid, "wake_lost")]
-    assert calls(h.ingress, "request_gate_partial") == []
     assert h.arbiter.settles == [(1, False)]
 
 
@@ -3258,7 +3256,6 @@ async def test_a_verdict_for_a_settled_claim_is_ignored_counted_and_sends_nothin
 
     assert h.outbound.sent[mark:] == []
     assert h.controller.stale_events == stale + 1
-    assert calls(h.ingress, "request_gate_partial") == []
     assert h.arbiter.settles == [(1, False)]
 
 
@@ -3275,7 +3272,6 @@ async def test_a_winning_endpoint_wake_requests_its_score_when_its_name_heard_co
 
     ((*_, uid),) = calls(h.ingress, "open_utterance")
     assert calls(h.ingress, "request_verify") == [("request_verify", uid, 99)]
-    assert calls(h.ingress, "request_gate_partial") == []
 
 
 async def test_an_accepted_and_a_rejected_claim_are_each_settled_exactly_once():
