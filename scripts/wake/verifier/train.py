@@ -2,7 +2,8 @@
 
     python -m scripts.wake.verifier.train --dataset <dir> --manifest <train-only manifest> \
         --root-map <from>=<to> --weights <wavlm_base_plus.pth> --out <dir> \
-        (--fold <k> | --final) [--batch 32] [--accumulate 1] [--seed 17]
+        (--fold <k> | --final) [--batch 32] [--accumulate 1] [--seed 17] [--cache <dir>] \
+        [--store-workers 8] [--loader-workers 4] [--progress-seconds 60]
 
 The model is `model.build_verifier` over the staged `wavlm_base_plus.pth`, loaded strictly; the
 run refuses to start if the installed torchaudio's `WAVLM_BASE_PLUS._normalize_waveform` reads
@@ -14,6 +15,15 @@ recording is read through the train-only manifest (`--root-map` translating its 
 refused unless its sha256 is the index's `training` and it lists train entries alone, so no tune
 or test file is opened. Real positives are repeated `REAL_REPEAT` times an epoch.
 
+The store. `WindowReader` opens, parses and decodes a window's source file on every read, and an
+epoch reads every window, so the run reads them from `store.open_store` instead: each window
+decoded once into one flat file under `--cache` (default `<out>/window-cache`), kept under the
+sha256 of `index.jsonl` and reused by every later run of the same index with the same cache, the
+other folds and the final run included. A window that reads or mixes a recording is never
+written there; each run reads those through the manifest into memory. The store is opened before
+the model is built: its decoding processes, `--store-workers` of them, are started by spawn, and
+CUDA must not have started before them.
+
 Folds. Five folds grouped by each window's `group` as `mine.py` set it (recording session, AMI
 speaker group, LibriSpeech speaker, which a Chatterbox clone shares, piper speaker, MUSAN file),
 balanced within each kind of group, so no group is on
@@ -22,25 +32,35 @@ both sides of a fold. `--fold k` trains on the other four and scores fold k's wi
 its last epoch: nothing is chosen on out-of-fold data, which would bias the pre-flight's `r(c)`.
 
 Augmentation, for both classes alike from a per-item seed: the truncation of Design 3 (either
-side cut to a random length down to `MIN_WINDOW_FRAMES`, the hit kept), gain, white noise, a room
-response from the index's own `rirs` files, a low-pass band limit, and an AGC-like compressor.
-No step reads the label, so a window's length or level carries none.
+side cut to a random length down to `MIN_WINDOW_FRAMES`, the hit kept), then gain, a room
+response from the index's own `rirs` files, a low-pass band limit, white noise and an AGC-like
+compressor (`augment.augment_batch`). No step reads the label, so a window's length or level
+carries none. The steps run on the device, a batch at a time, outside autocast: done per item in
+numpy, the room response's convolution alone held the loader workers long enough that the GPU
+waited. A loader worker, `--loader-workers` of them on CUDA, only reads a batch's kept frames
+from the store and draws each item's choices from its seed.
+
+Progress. Every `--progress-seconds` (default 60) and at each epoch's end the run prints the
+examples done, examples a second and the time left of the epoch and of the run; the out-of-fold
+scoring prints the same for windows. A line names no file or path, so a run's log says nothing
+of the recordings it read.
 
 Defaults (recorded in the run's `config.json`): AdamW at 2e-5 for layers 9 to 12 and 1e-3 for
 the head, batch 32 (split into `--accumulate` micro-batches when VRAM is short), 6 epochs, fp16
 autocast on CUDA, seed 17. A batch holds windows of one length, because the encoder's group
 norm would see padding. The run writes `<out>/fold-<k>/` or `<out>/final/`: `model.pt`, the
 verifier's state dict; `config.json`; `history.json`, each epoch's mean loss; and for a fold
-`oof.jsonl`. Exit 0 trained, 2 refused (an existing run directory included).
+`oof.jsonl`. Exit 0 trained, 2 refused (an existing run directory and a store that cannot be
+built included).
 """
 
 import argparse
 import json
-import math
 import random
 import sys
+import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -48,6 +68,7 @@ import numpy as np
 import torch
 
 from ..manifest import ManifestError, RecordingManifest, load_manifest
+from .augment import Augment, BatchDraws, augment_batch, batch_draws, draw
 from .dataset import (
     AFTER_FRAMES,
     BEFORE_FRAMES,
@@ -76,6 +97,7 @@ from .model import (
     normalizes_waveform,
     sha256_path,
 )
+from .store import StoreError, WindowStore, index_key, open_store
 
 FOLDS = 5
 REAL_REPEAT = 10
@@ -85,6 +107,18 @@ RUN_MODEL = "model.pt"
 RUN_HISTORY = "history.json"
 RUN_OOF = "oof.jsonl"
 FINAL_RUN = "final"
+CACHE_DIR = "window-cache"
+"""The store's root under `--out` when `--cache` is not given."""
+STORE_WORKERS = 8
+"""Decoding processes the store is built with: one per physical core of the training host (8
+cores, 16 hardware threads, all of them visible to the training container). Each process decodes
+on one thread; whether a core's second hardware thread speeds decoding has not been measured."""
+PREFETCH_BATCHES = 4
+"""Batches each loader worker keeps ready, so one slow read does not leave the device waiting; at
+batch 32 a batch holds about 7 MB of pinned memory at most."""
+SCORE_BATCH = 64
+"""Held-out windows scored at once; a 116-frame batch of them is 9.5 MB of fp32 input."""
+PROGRESS_SECONDS = 60.0
 
 
 class TrainError(Exception):
@@ -94,22 +128,6 @@ class TrainError(Exception):
 def fold_run(fold: int) -> str:
     """A fold's run directory name under `--out`."""
     return f"fold-{fold}"
-
-
-@dataclass(frozen=True, slots=True)
-class Augment:
-    """The augmentation's probabilities and ranges, the same for both classes."""
-
-    truncate_p: float = 0.5
-    gain_db: tuple[float, float] = (-6.0, 6.0)
-    noise_p: float = 0.5
-    noise_snr_db: tuple[float, float] = (10.0, 40.0)
-    rir_p: float = 0.25
-    lowpass_p: float = 0.3
-    lowpass_hz: tuple[float, float] = (3000.0, 7500.0)
-    agc_p: float = 0.3
-    agc_target_rms: float = 0.1
-    agc_max_gain_db: float = 20.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +310,7 @@ def assign_folds(windows: Sequence[Window], folds: int = FOLDS) -> dict[str, int
     return assigned
 
 
-# -- Augmentation -----------------------------------------------------------------------------
+# -- Epochs -----------------------------------------------------------------------------------
 
 
 def hit_offset(window: Window) -> int:
@@ -322,41 +340,6 @@ def truncate(frames: int, hit: int, rng: random.Random, p: float) -> tuple[int, 
     highest = min(hit, frames - length)
     first = rng.randint(lowest, highest) if lowest <= highest else max(0, frames - length)
     return first, first + length - 1
-
-
-def _agc(samples: np.ndarray, target: float, max_gain_db: float) -> np.ndarray:
-    frames = max(1, len(samples) // FRAME_SAMPLES)
-    level = np.sqrt(
-        np.mean(samples[: frames * FRAME_SAMPLES].reshape(frames, -1) ** 2, axis=1) + 1e-10
-    )
-    envelope = np.maximum.accumulate(level) * 0.5 + level * 0.5
-    gain = np.minimum(target / np.maximum(envelope, 1e-6), 10 ** (max_gain_db / 20))
-    per_sample = np.repeat(gain, FRAME_SAMPLES)[: len(samples)]
-    per_sample = np.pad(per_sample, (0, len(samples) - len(per_sample)), mode="edge")
-    return samples * per_sample
-
-
-def augment(
-    samples: np.ndarray, rng: np.random.Generator, settings: Augment, rirs: Sequence[np.ndarray]
-) -> np.ndarray:
-    """Gain, noise, a room response, a band limit and AGC, each drawn from `rng`; no label read."""
-    out = samples.astype(np.float64)
-    out = out * 10 ** (rng.uniform(*settings.gain_db) / 20)
-    if rirs and rng.random() < settings.rir_p:
-        response = rirs[int(rng.integers(len(rirs)))]
-        out = np.convolve(out, response)[: len(out)]
-    if rng.random() < settings.lowpass_p:
-        from scipy.signal import butter, sosfilt  # noqa: PLC0415 - training only
-
-        cutoff = rng.uniform(*settings.lowpass_hz)
-        out = sosfilt(butter(6, cutoff, fs=SAMPLE_RATE, output="sos"), out)
-    if rng.random() < settings.noise_p:
-        power = float(np.mean(out**2)) + 1e-10
-        snr = rng.uniform(*settings.noise_snr_db)
-        out = out + rng.normal(0.0, math.sqrt(power / 10 ** (snr / 10)), len(out))
-    if rng.random() < settings.agc_p:
-        out = _agc(out, settings.agc_target_rms, settings.agc_max_gain_db)
-    return np.clip(out, -1.0, 32767 / 32768).astype(np.float32)
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,49 +390,258 @@ def plan_epoch(
     return batches
 
 
-class EpochData(torch.utils.data.Dataset):
-    """An epoch's items read and augmented; a batch sampler hands it one length at a time."""
+@dataclass(frozen=True, slots=True)
+class Batch:
+    """One planned batch as a loader worker hands it over, before the device augments it.
+
+    It defines `pin_memory` because DataLoader pins only tensors, sequences, mappings and objects
+    that define it.
+
+    Attributes:
+        audio: [B, L] int16, each item's kept frames.
+        labels: [B] float32, 1 for a positive.
+        draws: The items' augmentation choices.
+        responses: [B, R] float32, row i item i's room response cut to `L`, zero for an item
+            without one; `R` is the longest selected, 0 when no item has a room.
+    """
+
+    audio: torch.Tensor
+    labels: torch.Tensor
+    draws: BatchDraws
+    responses: torch.Tensor
+
+    def pin_memory(self) -> "Batch":
+        """The same batch in pinned memory, so the copy to the device can be asynchronous."""
+        return Batch(
+            self.audio.pin_memory(),
+            self.labels.pin_memory(),
+            self.draws.pin_memory(),
+            self.responses.pin_memory(),
+        )
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
+        """The same batch on `device`; `draws` keeps its noise seeds on the host."""
+        return Batch(
+            self.audio.to(device, non_blocking=non_blocking),
+            self.labels.to(device, non_blocking=non_blocking),
+            self.draws.to(device, non_blocking=non_blocking),
+            self.responses.to(device, non_blocking=non_blocking),
+        )
+
+
+class EpochBatches(torch.utils.data.Dataset):
+    """An epoch's plan read from the store, one `Batch` an item.
+
+    A worker reads each item's kept frames, draws its choices from its seed and reads the room
+    responses chosen; every step that touches the samples is left to the device.
+    """
 
     def __init__(
         self,
-        windows: Sequence[Window],
-        items: Sequence[Item],
-        reader: WindowReader,
+        plan: Sequence[Sequence[Item]],
+        labels: Sequence[float],
+        store: WindowStore,
         settings: Augment,
-        rirs: Sequence[FileRef],
     ) -> None:
-        self.windows = windows
-        self.items = items
-        self.reader = reader
+        self.plan = plan
+        self.labels = labels
+        self.store = store
         self.settings = settings
-        self.rir_refs = tuple(rirs)
-        self._rirs: list[np.ndarray] | None = None
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.plan)
 
-    def __getitem__(self, position: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._rirs is None:
-            self._rirs = [self.reader.rir(ref) for ref in self.rir_refs]
-        item = self.items[position]
-        window = self.windows[item.window]
-        samples = self.reader.samples(window)
-        kept = samples[item.first * FRAME_SAMPLES : (item.last + 1) * FRAME_SAMPLES]
-        audio = kept.astype(np.float32) / np.float32(32768.0)
-        audio = augment(audio, np.random.default_rng(item.seed), self.settings, self._rirs)
-        label = 1.0 if window.label == "positive" else 0.0
-        return torch.from_numpy(audio), torch.tensor(label)
+    def __getitem__(self, index: int) -> Batch:
+        items = self.plan[index]
+        audio = np.stack(
+            [
+                self.store.read(
+                    item.window, item.first * FRAME_SAMPLES, item.frames * FRAME_SAMPLES
+                )
+                for item in items
+            ]
+        )
+        draws = [draw(item.seed, self.settings, self.store.responses) for item in items]
+        length = audio.shape[1]
+        rooms = {
+            choice.rir: self.store.response(choice.rir)[:length]
+            for choice in draws
+            if choice.rir is not None
+        }
+        width = max((len(taps) for taps in rooms.values()), default=0)
+        responses = np.zeros((len(items), width), dtype=np.float32)
+        for row, choice in enumerate(draws):
+            if choice.rir is not None:
+                taps = rooms[choice.rir]
+                responses[row, : len(taps)] = taps
+        return Batch(
+            torch.from_numpy(audio),
+            torch.tensor([self.labels[item.window] for item in items], dtype=torch.float32),
+            batch_draws(draws),
+            torch.from_numpy(responses),
+        )
 
 
-def _collate(batch: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, ...]:
-    return torch.stack([audio for audio, _ in batch]), torch.stack([label for _, label in batch])
+_worker_limits: list[object] = []
+
+
+def _one_thread(worker: int) -> None:
+    """A loader worker's setup: one intra-op thread, for torch and for BLAS alike.
+
+    Each worker reads and draws for whole batches, so parallel work comes from the workers; a
+    thread pool in each one would only contend with the others and with the main process.
+    """
+    del worker
+    from threadpoolctl import threadpool_limits  # noqa: PLC0415 - loader workers only
+
+    torch.set_num_threads(1)
+    _worker_limits.append(threadpool_limits(1))
+
+
+def epoch_loader(data: EpochBatches, workers: int, pin: bool) -> torch.utils.data.DataLoader:
+    """The DataLoader over an epoch's batches, in plan order, `workers` processes reading ahead."""
+    return torch.utils.data.DataLoader(
+        data,
+        batch_size=None,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=pin,
+        worker_init_fn=_one_thread,
+        prefetch_factor=PREFETCH_BATCHES if workers > 0 else None,
+    )
+
+
+class DeviceEpoch:
+    """An epoch's batches moved to the device and augmented there, as `fit` takes them."""
+
+    def __init__(
+        self,
+        loader: Iterable[Batch],
+        examples: int,
+        device: torch.device,
+        settings: Augment,
+    ) -> None:
+        self.loader = loader
+        self.examples = examples
+        self.device = device
+        self.settings = settings
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        for batch in self.loader:
+            moved = batch.to(self.device, non_blocking=True)
+            with torch.no_grad():
+                waveforms = augment_batch(moved.audio, moved.draws, moved.responses, self.settings)
+            yield waveforms, moved.labels
+
+
+# -- Progress ---------------------------------------------------------------------------------
+
+
+Clock = Callable[[], float]
+Progress = Callable[[str], None]
+
+
+def _duration(seconds: float) -> str:
+    whole = int(round(seconds))
+    return f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}"
+
+
+def _eta(left: int, rate: float) -> str:
+    if left <= 0:
+        return "0:00:00"
+    return _duration(left / rate) if rate > 0 else "unknown"
+
+
+class _EpochMeter:
+    """An epoch's progress lines: counts, rate and the time left, never a file name or a path.
+
+    The run's time left takes every later epoch to be as long as this one, as `plan_epoch`'s are.
+    """
+
+    def __init__(
+        self, epoch: int, epochs: int, total: int, progress: Progress, interval: float, clock: Clock
+    ) -> None:
+        self.epoch = epoch
+        self.epochs = epochs
+        self.total = total
+        self.progress = progress
+        self.interval = interval
+        self.clock = clock
+        self.started = clock()
+        self.last = self.started
+
+    def _rate(self, done: int, now: float) -> float:
+        elapsed = now - self.started
+        return done / elapsed if elapsed > 0 else 0.0
+
+    def _run_left(self, done: int) -> int:
+        return self.total - done + (self.epochs - self.epoch) * self.total
+
+    def step(self, done: int) -> None:
+        now = self.clock()
+        if now - self.last < self.interval:
+            return
+        self.last = now
+        rate = self._rate(done, now)
+        self.progress(
+            f"epoch {self.epoch}: {done}/{self.total} examples, {rate:.1f} examples/s, "
+            f"epoch ETA {_eta(self.total - done, rate)}, run ETA {_eta(self._run_left(done), rate)}"
+        )
+
+    def finish(self, seen: int, loss: float) -> None:
+        rate = self._rate(seen, self.clock())
+        self.progress(
+            f"epoch {self.epoch}: loss {loss:.4f} over {seen} examples, {rate:.1f} examples/s, "
+            f"run ETA {_eta(self._run_left(seen), rate)}"
+        )
+
+
+class _ScoreMeter:
+    """The out-of-fold scoring's progress lines, never a file name or a path."""
+
+    def __init__(self, total: int, progress: Progress, interval: float, clock: Clock) -> None:
+        self.total = total
+        self.progress = progress
+        self.interval = interval
+        self.clock = clock
+        self.done = 0
+        self.started = clock()
+        self.last = self.started
+
+    def add(self, count: int) -> None:
+        self.done += count
+        now = self.clock()
+        if now - self.last >= self.interval:
+            self.last = now
+            self._emit(now)
+
+    def finish(self) -> None:
+        self._emit(self.clock())
+
+    def _emit(self, now: float) -> None:
+        elapsed = now - self.started
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        self.progress(
+            f"oof: {self.done}/{self.total} windows, {rate:.1f} windows/s, "
+            f"ETA {_eta(self.total - self.done, rate)}"
+        )
 
 
 # -- Training ---------------------------------------------------------------------------------
 
 
-Batches = Callable[[int], Sequence[tuple[torch.Tensor, torch.Tensor]]]
-"""An epoch's batches by epoch number, each `(waveforms, labels)`."""
+Batches = Callable[[int], Iterable[tuple[torch.Tensor, torch.Tensor]]]
+"""An epoch's batches by epoch number, each `(waveforms, labels)`: a sequence of them, or an
+iterable such as `DeviceEpoch` that carries its `examples`."""
+
+
+def _examples(epoch: Iterable[tuple[torch.Tensor, torch.Tensor]]) -> int:
+    examples = getattr(epoch, "examples", None)
+    if examples is not None:
+        return int(examples)
+    if isinstance(epoch, Sequence):
+        return sum(len(labels) for _, labels in epoch)
+    raise TypeError("an epoch's batches are a sequence or carry their `examples`")
 
 
 def fit(
@@ -457,8 +649,24 @@ def fit(
     batches: Batches,
     config: TrainConfig,
     device: torch.device,
+    *,
+    progress: Progress = print,
+    interval: float = PROGRESS_SECONDS,
+    clock: Clock = time.monotonic,
 ) -> list[dict[str, float]]:
     """Train the fixed schedule; the model is left at its last epoch, which the run keeps.
+
+    The loss is summed on the device and read only for the epoch's line, so the loop waits for
+    the device no more often than GradScaler's own step does.
+
+    Args:
+        model: The verifier.
+        batches: Each epoch's batches.
+        config: The schedule, optimiser and precision.
+        device: Where the model trains.
+        progress: Takes a line every `interval` seconds of `clock` and one at each epoch's end.
+        interval: Seconds between progress lines.
+        clock: The clock `interval` and the rates are measured on.
 
     Returns:
         Each epoch's mean loss and example count, in order; no epoch is selected from them.
@@ -474,8 +682,13 @@ def fit(
     history = []
     for epoch in range(1, config.epochs + 1):
         model.train()
-        total, seen = 0.0, 0
-        for waveforms, labels in batches(epoch):
+        epoch_batches = batches(epoch)
+        meter = _EpochMeter(
+            epoch, config.epochs, _examples(epoch_batches), progress, interval, clock
+        )
+        total = torch.zeros((), device=device)
+        seen = 0
+        for waveforms, labels in epoch_batches:
             optimizer.zero_grad(set_to_none=True)
             size = len(labels)
             for part in range(config.accumulate):
@@ -490,12 +703,14 @@ def fit(
                     logits = model(audio)
                 loss = loss_fn(logits.float(), target) / size
                 scaler.scale(loss).backward()
-                total += float(loss) * size
+                total += loss.detach() * size
             scaler.step(optimizer)
             scaler.update()
             seen += size
-        history.append({"epoch": epoch, "loss": total / max(seen, 1), "examples": seen})
-        print(f"epoch {epoch}: loss {total / max(seen, 1):.4f} over {seen} examples")
+            meter.step(seen)
+        mean = float(total) / max(seen, 1)
+        history.append({"epoch": epoch, "loss": mean, "examples": seen})
+        meter.finish(seen, mean)
     model.eval()
     return history
 
@@ -503,18 +718,53 @@ def fit(
 @torch.no_grad()
 def score_windows(
     model: VerifierModel,
-    windows: Sequence[Window],
-    reader: WindowReader,
+    store: WindowStore,
+    held: Sequence[int],
     device: torch.device,
+    *,
+    batch: int = SCORE_BATCH,
+    progress: Progress = print,
+    interval: float = PROGRESS_SECONDS,
+    clock: Clock = time.monotonic,
 ) -> list[float]:
-    """Each whole window's score, unaugmented, as the exported graph would give it."""
+    """Each held window's score, whole and unaugmented, as the exported graph would give it.
+
+    Windows of one length are scored `batch` at a time, in eval mode and fp32 without autocast,
+    so a window's score depends on its batch only by float rounding; one length a batch means no
+    window is padded.
+
+    Args:
+        model: The trained verifier.
+        store: The run's window store.
+        held: The held-out windows' positions in the index.
+        device: Where the model runs.
+        batch: Windows scored at once.
+        progress: Takes a line every `interval` seconds of `clock` and one at the end.
+        interval: Seconds between progress lines.
+        clock: The clock `interval` and the rate are measured on.
+
+    Returns:
+        The scores in `held`'s order.
+    """
     model.eval()
     model.to(device)
-    scores = []
-    for window in windows:
-        audio = reader.samples(window).astype(np.float32) / np.float32(32768.0)
-        logit = model(torch.from_numpy(audio).reshape(1, -1).to(device))
-        scores.append(float(torch.sigmoid(logit.float())[0]))
+    by_length: dict[int, list[int]] = defaultdict(list)
+    for position, window in enumerate(held):
+        by_length[store.length(window)].append(position)
+    scores = [0.0] * len(held)
+    meter = _ScoreMeter(len(held), progress, interval, clock)
+    for length, positions in sorted(by_length.items()):
+        for start in range(0, len(positions), batch):
+            chunk = positions[start : start + batch]
+            audio = np.stack([store.read(held[position], 0, length) for position in chunk])
+            waveform = torch.from_numpy(audio.astype(np.float32) / np.float32(32768.0))
+            with torch.autocast(device.type, enabled=False):
+                logits = model(waveform.to(device))
+            values = torch.sigmoid(logits.float()).cpu().tolist()
+            for position, value in zip(chunk, values, strict=True):
+                scores[position] = float(value)
+            meter.add(len(chunk))
+    meter.finish()
     return scores
 
 
@@ -528,7 +778,7 @@ def build_wavlm_verifier(config: TrainConfig, weights: Path) -> VerifierModel:
     )
 
 
-def run(args: argparse.Namespace, build: ModelBuilder) -> int:
+def run(args: argparse.Namespace, build: ModelBuilder, clock: Clock = time.monotonic) -> int:
     """Check the inputs, train one fold or the final model, and write the run."""
     if normalizes_waveform():
         raise TrainError(
@@ -544,7 +794,17 @@ def run(args: argparse.Namespace, build: ModelBuilder) -> int:
         raise TrainError(f"the run {name} already exists; a run is written new")
     if args.batch < 1 or args.accumulate < 1 or args.accumulate > args.batch:
         raise TrainError("--batch and --accumulate must be at least 1, accumulate <= batch")
-    config = TrainConfig(batch=args.batch, accumulate=args.accumulate, seed=args.seed)
+    if args.loader_workers < 0 or args.store_workers < 1 or not args.progress_seconds > 0:
+        raise TrainError(
+            "--loader-workers must be at least 0, --store-workers at least 1, and "
+            "--progress-seconds above 0"
+        )
+    config = TrainConfig(
+        batch=args.batch,
+        accumulate=args.accumulate,
+        seed=args.seed,
+        loader_workers=args.loader_workers,
+    )
     indexed = load_index(args.dataset)
     manifest = train_manifest(args.manifest, parse_root_map(args.root_map), indexed.training)
     reader = WindowReader(manifest, indexed.roots)
@@ -559,30 +819,40 @@ def run(args: argparse.Namespace, build: ModelBuilder) -> int:
         {ref.sha256: ref for w in windows for ref in w.inputs if ref.source == "rirs"}.values(),
         key=lambda ref: ref.sha256,
     )
+    # Before the model and the device: the store's decoding processes start by spawn, and
+    # nothing may have started CUDA before them.
+    store = open_store(
+        args.cache if args.cache is not None else args.out / CACHE_DIR,
+        index_key(args.dataset),
+        windows,
+        rirs,
+        reader,
+        provenance_sha256=indexed.provenance_sha256,
+        workers=args.store_workers,
+        interval=args.progress_seconds,
+        clock=clock,
+    )
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     model = build(config, args.weights)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    on_cuda = device.type == "cuda"
+    labels = [1.0 if window.label == "positive" else 0.0 for window in windows]
 
-    def batches(epoch: int) -> torch.utils.data.DataLoader:
+    def batches(epoch: int) -> DeviceEpoch:
         plan = plan_epoch(windows, chosen, config, epoch)
-        flat = [item for batch in plan for item in batch]
-        starts = np.cumsum([0] + [len(batch) for batch in plan])
-        sampler = [list(range(starts[i], starts[i + 1])) for i in range(len(plan))]
-        data = EpochData(windows, flat, reader, config.augment, rirs)
-        return torch.utils.data.DataLoader(
-            data,
-            batch_sampler=sampler,
-            num_workers=config.loader_workers if device.type == "cuda" else 0,
-            collate_fn=_collate,
-        )
+        data = EpochBatches(plan, labels, store, config.augment)
+        loader = epoch_loader(data, config.loader_workers if on_cuda else 0, pin=on_cuda)
+        return DeviceEpoch(loader, sum(len(batch) for batch in plan), device, config.augment)
 
-    history = fit(model, batches, config, device)
+    history = fit(model, batches, config, device, interval=args.progress_seconds, clock=clock)
     out.mkdir(parents=True)
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, out / RUN_MODEL)
     if not args.final:
-        scores = score_windows(model, [windows[i] for i in held], reader, device)
+        scores = score_windows(
+            model, store, held, device, interval=args.progress_seconds, clock=clock
+        )
         with (out / RUN_OOF).open("w", encoding="utf-8", newline="\n") as handle:
             for index, score in zip(held, scores, strict=True):
                 window = windows[index]
@@ -633,15 +903,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch", type=int, default=_DEFAULTS.batch)
     parser.add_argument("--accumulate", type=int, default=_DEFAULTS.accumulate)
     parser.add_argument("--seed", type=int, default=_DEFAULTS.seed)
+    parser.add_argument("--cache", type=Path, help=f"the store's root; <out>/{CACHE_DIR} if unset")
+    parser.add_argument("--store-workers", type=int, default=STORE_WORKERS)
+    parser.add_argument("--loader-workers", type=int, default=_DEFAULTS.loader_workers)
+    parser.add_argument("--progress-seconds", type=float, default=PROGRESS_SECONDS)
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, build: ModelBuilder | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    build: ModelBuilder | None = None,
+    clock: Clock = time.monotonic,
+) -> int:
     """Run the trainer; 0 trained, 2 refused."""
     args = _parser().parse_args(argv)
     try:
-        return run(args, build or build_wavlm_verifier)
-    except (TrainError, ManifestError, DatasetError, ModelError) as exc:
+        return run(args, build or build_wavlm_verifier, clock)
+    except (TrainError, ManifestError, DatasetError, ModelError, StoreError) as exc:
         print(f"train: {exc}", file=sys.stderr)
         return 2
 
