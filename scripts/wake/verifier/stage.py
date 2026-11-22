@@ -18,16 +18,27 @@ holds 40% of the kept hours, then to check until it holds 15%, and the rest to m
 when calibration is under 20 h or check under 6 h: the hours are printed and go to Raj, and
 `split.json` is not written.
 
+Dev and eval are staged as downloaded (v14 H28), and the bar reads them as mono: `spotter_eval`
+refuses ambient audio that is not 16 kHz mono PCM16. A train download that is 16 kHz PCM16 with
+more channels is averaged to mono by the rule `dataset.py` reads any multichannel file by (the
+mean of the channels per sample, rounded to the nearest integer, clipped to int16), so the staged
+mono file is what mining, calibration and training read. Its sha256 as downloaded and its
+channel count go to `<out>/SOURCES.json` and from there to `split.json`. Any other format, another
+rate or sample width, is refused.
+
 Each download is over https with its status checked, written beside its final name and renamed
-only after it is checked as 16 kHz mono PCM16, its sha256 in neither held-out `SHA256SUMS`, and
-listed in `<out>/SHA256SUMS`. A rerun downloads only what is missing and refuses, exit 2, a
-file whose sha256 differs from `SHA256SUMS`, a file `SHA256SUMS` does not list, or a file of a
-meeting that is not kept. Exit 0 staged, 1 a share under its minimum, 2 refused.
+only after it is checked as 16 kHz PCM16 and averaged to mono, its sha256 as downloaded and as
+staged in neither held-out `SHA256SUMS`, and listed in `<out>/SHA256SUMS`. `SOURCES.json` and
+`SHA256SUMS` are rewritten atomically after each file, so a rerun downloads only what is missing
+and keeps both records; it refuses, exit 2, a file whose sha256 differs from `SHA256SUMS`, a file
+`SHA256SUMS` does not list, or a file of a meeting that is not kept. Exit 0 staged, 1 a share
+under its minimum, 2 refused.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 import zipfile
@@ -39,6 +50,9 @@ from xml.etree import ElementTree  # nosec B405 - the AMI public annotations, sh
 from .dataset import (
     SAMPLE_RATE,
     DatasetError,
+    WavInfo,
+    downmix_pcm16,
+    is_pcm16_16k,
     is_pcm16_16k_mono,
     read_sums,
     sha256_bytes,
@@ -105,11 +119,15 @@ MIRROR = (
 WAV_SUFFIX = ".Mix-Headset.wav"
 SUMS = "SHA256SUMS"
 SPLIT = "split.json"
+SOURCES = "SOURCES.json"
+"""`{"version": 1, "files": {<staged name>: {"sha256", "channels"}}}`: each file averaged to
+mono, with its sha256 as downloaded and its channel count."""
 SHARES = ("calibration", "check", "mining")
 CALIBRATION_SHARE = 0.40
 CHECK_SHARE = 0.15
 FETCH_TIMEOUT_S = 60
 _BLOCK = 1 << 20
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 Fetcher = Callable[[str, Path], None]
 
@@ -133,6 +151,14 @@ class Minimums:
 
     calibration_hours: float = 20.0
     check_hours: float = 6.0
+
+
+@dataclass(frozen=True, slots=True)
+class Download:
+    """A staged file's download, recorded when it had more channels than the mono file staged."""
+
+    sha256: str
+    channels: int
 
 
 AMI_PARTITION = Partition(AMI_TRAIN, AMI_DEV, AMI_EVAL)
@@ -267,32 +293,130 @@ def _write_atomic(path: Path, data: bytes) -> None:
     os.replace(partial, path)
 
 
-def _check_wav(path: Path, name: str) -> int:
-    """The WAV's sample count, once it is checked as 16 kHz mono PCM16."""
+def _wav_format(
+    path: Path, name: str, accepted: Callable[[WavInfo], bool], expected: str
+) -> WavInfo:
     try:
         info = wav_info(path)
     except DatasetError as exc:
         raise StageError(f"{name}: {exc}") from exc
-    if not is_pcm16_16k_mono(info):
+    if not accepted(info):
         raise StageError(
             f"{name} is {info.rate} Hz, {info.channels} channels, {8 * info.width}-bit; "
-            "expected 16 kHz mono PCM16"
+            f"expected {expected}"
         )
-    return info.frames
+    return info
+
+
+def _read_sources(path: Path) -> dict[str, Download]:
+    """`SOURCES.json` as staged name to download, empty before the first file is averaged."""
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StageError(f"{path} could not be read: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise StageError(f"{path} is not version 1")
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise StageError(f"{path} has no files")
+    sources = {}
+    for name, entry in files.items():
+        if not (
+            isinstance(entry, dict)
+            and set(entry) == {"sha256", "channels"}
+            and isinstance(entry["sha256"], str)
+            and _SHA256.fullmatch(entry["sha256"])
+            and isinstance(entry["channels"], int)
+            and not isinstance(entry["channels"], bool)
+            and entry["channels"] >= 2
+        ):
+            raise StageError(
+                f"{path}: {name} is not {{'sha256': <sha256>, 'channels': <2 or more>}}"
+            )
+        sources[name] = Download(entry["sha256"], entry["channels"])
+    return sources
+
+
+def _sources_json(sources: Mapping[str, Download]) -> dict[str, dict[str, object]]:
+    return {
+        name: {"channels": sources[name].channels, "sha256": sources[name].sha256}
+        for name in sorted(sources)
+    }
+
+
+def _sources_bytes(sources: Mapping[str, Download]) -> bytes:
+    payload = {"version": 1, "files": _sources_json(sources)}
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _check_held_out(
+    name: str, digest: str, download: Download | None, held_out: Mapping[str, str]
+) -> None:
+    """Refuse a file whose sha256 as staged, or as downloaded, a held-out `SHA256SUMS` lists."""
+    if digest in held_out:
+        raise StageError(f"{name} has the sha256 of {held_out[digest]}")
+    if download is not None and download.sha256 in held_out:
+        raise StageError(f"{name} as downloaded has the sha256 of {held_out[download.sha256]}")
+
+
+def _download(
+    meeting: str,
+    name: str,
+    out: Path,
+    fetch: Fetcher,
+    listed: str | None,
+    held_out: Mapping[str, str],
+) -> tuple[Path, int, str, Download | None]:
+    """Fetch a meeting beside its final name, averaged to mono when it has more channels.
+
+    Returns the checked file, still to be renamed, its sample count and sha256, and its
+    download when it was averaged. Nothing is left behind when it is refused.
+    """
+    partial = out / f"{name}.part"
+    mono = out / f"{name}.mono.part"
+    partial.unlink(missing_ok=True)
+    mono.unlink(missing_ok=True)
+    try:
+        fetch(MIRROR.format(meeting=meeting), partial)
+        info = _wav_format(partial, name, is_pcm16_16k, "16 kHz PCM16")
+        download = None
+        frames = info.frames
+        if info.channels > 1:
+            download = Download(sha256_file(partial), info.channels)
+            frames = downmix_pcm16(partial, mono)
+            os.replace(mono, partial)
+        digest = sha256_file(partial)
+        if listed is not None and digest != listed:
+            raise StageError(f"{name} staged with sha256 {digest}, but {SUMS} lists {listed}")
+        _check_held_out(name, digest, download, held_out)
+    except (StageError, DatasetError, OSError):
+        partial.unlink(missing_ok=True)
+        mono.unlink(missing_ok=True)
+        raise
+    return partial, frames, digest, download
 
 
 def _stage_files(
     kept: Sequence[str], out: Path, fetch: Fetcher, held_out: Mapping[str, str]
-) -> dict[str, int]:
-    """Download what is missing, check every file, and return each meeting's sample count."""
+) -> tuple[dict[str, int], dict[str, Download]]:
+    """Download what is missing and check every file.
+
+    Returns each meeting's sample count, and the download of each staged file that was averaged
+    to mono.
+    """
     out.mkdir(parents=True, exist_ok=True)
     sums_path = out / SUMS
     sums = read_sums(sums_path) if sums_path.exists() else {}
+    sources_path = out / SOURCES
+    sources = _read_sources(sources_path)
     expected = {f"{meeting}{WAV_SUFFIX}": meeting for meeting in kept}
     strays = sorted(
         path.name for path in out.iterdir() if path.suffix == ".wav" and path.name not in expected
     )
     strays += sorted(name for name in sums if name not in expected)
+    strays += sorted(name for name in sources if name not in expected)
     if strays:
         raise StageError(f"{out} holds files of meetings that are not kept: {strays}")
     samples: dict[str, int] = {}
@@ -304,27 +428,22 @@ def _stage_files(
             digest = sha256_file(path)
             if digest != sums[name]:
                 raise StageError(f"{name} has sha256 {digest}, but {SUMS} lists {sums[name]}")
-            samples[meeting] = _check_wav(path, name)
-        else:
-            partial = out / f"{name}.part"
-            partial.unlink(missing_ok=True)
-            try:
-                fetch(MIRROR.format(meeting=meeting), partial)
-                samples[meeting] = _check_wav(partial, name)
-                digest = sha256_file(partial)
-                if name in sums and digest != sums[name]:
-                    raise StageError(
-                        f"{name} downloaded with sha256 {digest}, but {SUMS} lists {sums[name]}"
-                    )
-            except StageError:
-                partial.unlink(missing_ok=True)
-                raise
-            sums[name] = digest
-            _write_atomic(sums_path, sums_bytes(sums))
-            os.replace(partial, path)
-        if sums[name] in held_out:
-            raise StageError(f"{name} has the sha256 of {held_out[sums[name]]}")
-    return samples
+            info = _wav_format(path, name, is_pcm16_16k_mono, "16 kHz mono PCM16")
+            samples[meeting] = info.frames
+            _check_held_out(name, digest, sources.get(name), held_out)
+            continue
+        partial, samples[meeting], digest, download = _download(
+            meeting, name, out, fetch, sums.get(name), held_out
+        )
+        if download is not None:
+            sources[name] = download
+            _write_atomic(sources_path, _sources_bytes(sources))
+        elif sources.pop(name, None) is not None:
+            _write_atomic(sources_path, _sources_bytes(sources))
+        sums[name] = digest
+        _write_atomic(sums_path, sums_bytes(sums))
+        os.replace(partial, path)
+    return samples, sources
 
 
 def stage(
@@ -345,7 +464,7 @@ def stage(
         held_out |= {digest: f"ami/eval/{name}" for name, digest in eval_sums.items()}
         meetings = read_meetings(annotations)
         kept, excluded = speaker_filter(meetings, partition)
-        samples = _stage_files(kept, out, fetch, held_out)
+        samples, sources = _stage_files(kept, out, fetch, held_out)
     except (StageError, DatasetError, OSError) as exc:
         print(f"stage: {exc}", file=sys.stderr)
         return 2
@@ -377,6 +496,7 @@ def stage(
         "groups": [list(group) for group in groups],
         "shares": {share: list(members) for share, members in shares.items()},
         "hours": held,
+        "sources": _sources_json(sources),
     }
     data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     _write_atomic(out / SPLIT, data)
