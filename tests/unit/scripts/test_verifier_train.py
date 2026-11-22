@@ -16,7 +16,7 @@ import re
 import shutil
 import sys
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -810,6 +810,123 @@ class TestStoreAndLoader:
         ]
 
 
+# -- DeviceEpoch -------------------------------------------------------------------------------
+
+
+DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=pytest.mark.skipif(
+            not torch.cuda.is_available(), reason="the side stream needs an accelerator"
+        ),
+    ),
+]
+EPOCH_AUGMENT = augment.Augment(rir_p=0.5, noise_p=0.5, lowpass_p=0.5, agc_p=0.5)
+TAPS = 64
+
+
+def fixture_batches(count: int = 5) -> list[train.Batch]:
+    """`count` synthetic batches of differing lengths and sizes, each item's choices from a seed."""
+    rng = np.random.default_rng(11)
+    decay = np.exp(-np.arange(TAPS) / 8.0)
+    batches = []
+    for number in range(count):
+        size, length = 3 + number % 2, (40 + 7 * number) * FRAME
+        draws = [augment.draw(100 * number + row, EPOCH_AUGMENT, 2) for row in range(size)]
+        responses = np.zeros((size, TAPS), dtype=np.float32)
+        for row, choice in enumerate(draws):
+            if choice.rir is not None:
+                responses[row] = (rng.standard_normal(TAPS) * decay).astype(np.float32)
+        batches.append(
+            train.Batch(
+                torch.from_numpy(rng.integers(-2000, 2001, (size, length)).astype(np.int16)),
+                torch.tensor([float((number + row) % 2) for row in range(size)]),
+                augment.batch_draws(draws),
+                torch.from_numpy(responses),
+            )
+        )
+    return batches
+
+
+def _hosted(batches: list[train.Batch], device: torch.device) -> list[train.Batch]:
+    """The batches as the trainer's loader hands them over: pinned on CUDA."""
+    return [batch.pin_memory() for batch in batches] if device.type == "cuda" else batches
+
+
+def _examples(batches: list[train.Batch]) -> int:
+    return sum(len(batch.labels) for batch in batches)
+
+
+class _Tracked:
+    """A loader iterator the test keeps a reference to, so only an explicit close closes it."""
+
+    def __init__(self, batches: list[train.Batch]) -> None:
+        self.batches = iter(batches)
+        self.closed = False
+
+    def __iter__(self) -> "_Tracked":
+        return self
+
+    def __next__(self) -> train.Batch:
+        return next(self.batches)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_device_epoch_hands_over_a_plain_loops_batches_in_order(device: str) -> None:
+    target = torch.device(device)
+    batches = fixture_batches()
+    expected = []
+    for batch in batches:
+        moved = batch.to(target)
+        with torch.no_grad():
+            waveforms = augment.augment_batch(
+                moved.audio, moved.draws, moved.responses, EPOCH_AUGMENT
+            )
+        expected.append((waveforms.cpu(), moved.labels.cpu()))
+    epoch = train.DeviceEpoch(_hosted(batches, target), _examples(batches), target, EPOCH_AUGMENT)
+    handed = []
+    for waveforms, labels in epoch:
+        assert waveforms.device.type == labels.device.type == target.type
+        handed.append((waveforms.cpu(), labels.cpu()))
+    assert len(handed) == len(expected)
+    for (waveforms, labels), (want, want_labels) in zip(handed, expected, strict=True):
+        assert waveforms.dtype == torch.float32
+        assert torch.equal(waveforms, want)
+        assert torch.equal(labels, want_labels)
+
+
+def test_a_loader_error_mid_epoch_propagates_out_of_the_device_epoch() -> None:
+    batches = fixture_batches(3)
+
+    def failing() -> Iterator[train.Batch]:
+        yield batches[0]
+        yield batches[1]
+        raise OSError("the store went away")
+
+    epoch = train.DeviceEpoch(failing(), _examples(batches), torch.device("cpu"), EPOCH_AUGMENT)
+    handed = []
+    with pytest.raises(OSError, match="the store went away"):
+        for waveforms, _ in epoch:
+            handed.append(waveforms)
+    assert len(handed) == 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_consumer_that_stops_early_closes_the_loaders_iterator(device: str) -> None:
+    target = torch.device(device)
+    batches = fixture_batches(4)
+    loader = _Tracked(_hosted(batches, target))
+    epoch = iter(train.DeviceEpoch(loader, _examples(batches), target, EPOCH_AUGMENT))
+    next(epoch)
+    assert not loader.closed
+    epoch.close()
+    assert loader.closed
+
+
 # -- The command line and the benchmark --------------------------------------------------------
 
 
@@ -991,6 +1108,7 @@ class TestBenchmark:
         ]
         for start in starts:
             assert any(line.startswith(start) for line in lines), start
+        assert not any(line.startswith("step: from pinned host batches") for line in lines)
         folds = train.assign_folds(world.windows)
         for fold in range(train.FOLDS):
             held = sum(1 for window in world.windows if folds[window.group] == fold)

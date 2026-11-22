@@ -68,7 +68,8 @@ the directory is removed at the end, failed or not. The model is the Base+ verif
 initialisation. It prints one line a measurement, each over `--benchmark-seconds` after a
 warm-up: the loader's rate for each worker count, the store's cold read rate, the step rate of
 `fit`'s own loop over batches already on the device (cudnn benchmark off, the trainer's
-setting, and on), the end-to-end rate over the real loader, and the scoring rate. With
+setting, and on), on CUDA the same loop over pinned host batches that `DeviceEpoch` copies to
+the device with no loader, the end-to-end rate over the real loader, and the scoring rate. With
 `--dataset` it reads the index's three files alone, times a store build over a sample of its
 public windows, and projects the five folds and the final run; without it, the seconds a
 million training examples take. Exit 0 measured, 2 refused.
@@ -86,7 +87,7 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -544,8 +545,45 @@ def epoch_loader(data: EpochBatches, workers: int, pin: bool) -> torch.utils.dat
     )
 
 
+def _close(iterator: Iterator[Batch]) -> None:
+    """Close a loader's iterator that can be closed, such as a generator."""
+    close = getattr(iterator, "close", None)
+    if close is not None:
+        close()
+
+
+def _on_device(batch: Batch) -> list[torch.Tensor]:
+    """The batch's tensors on an accelerator; `draws.noise_seeds` stays on the host."""
+    tensors = [
+        batch.audio,
+        batch.labels,
+        batch.responses,
+        *(getattr(batch.draws, item.name) for item in fields(batch.draws)),
+    ]
+    return [tensor for tensor in tensors if tensor.is_cuda]
+
+
 class DeviceEpoch:
-    """An epoch's batches moved to the device and augmented there, as `fit` takes them."""
+    """An epoch's batches moved to the device and augmented there, as `fit` takes them.
+
+    On CUDA the copy of batch i+1 runs on a side stream while batch i's step runs. With fp16,
+    GradScaler's `step` reads its inf check back, so `fit` waits for the device once a step; a
+    copy issued on the compute stream after that wait sits on the critical path, the device
+    copying before it can augment and step. Issued on a side stream after batch i's augmentation
+    is launched and before batch i is handed over, the copy overlaps batch i's step, and the
+    compute stream waits for the copy's event only before it augments batch i+1.
+
+    The caching allocator ties each block to the stream it was allocated on and hands a freed
+    block to that stream's next allocation at once, trusting the stream's own order to keep the
+    two apart. A tensor copied on the side stream is read on the compute stream, outside that
+    order: once freed, its block could take a later batch's copy while the compute stream still
+    reads it. `record_stream` on the compute stream makes the allocator hold the block until the
+    compute stream's work queued before the free has finished.
+
+    The batches, their order and their values are the same on every device. On any other device
+    a batch is moved and augmented as it is asked for, nothing read ahead. A loader error raised
+    while batch i+1 is read ahead on CUDA leaves the iteration before batch i is handed over.
+    """
 
     def __init__(
         self,
@@ -560,11 +598,50 @@ class DeviceEpoch:
         self.settings = settings
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        for batch in self.loader:
+        if self.device.type == "cuda":
+            return self._read_ahead()
+        return self._in_turn()
+
+    def _augment(self, moved: Batch) -> torch.Tensor:
+        with torch.no_grad():
+            return augment_batch(moved.audio, moved.draws, moved.responses, self.settings)
+
+    def _in_turn(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        iterator = iter(self.loader)
+        try:
+            for batch in iterator:
+                moved = batch.to(self.device, non_blocking=True)
+                yield self._augment(moved), moved.labels
+        finally:
+            _close(iterator)
+
+    def _read_ahead(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        compute = torch.cuda.current_stream(self.device)
+        side = torch.cuda.Stream(self.device)
+        iterator = iter(self.loader)
+        try:
+            upcoming = self._copy(next(iterator, None), compute, side)
+            while upcoming is not None:
+                moved, copied = upcoming
+                compute.wait_event(copied)
+                waveforms = self._augment(moved)
+                upcoming = self._copy(next(iterator, None), compute, side)
+                yield waveforms, moved.labels
+        finally:
+            _close(iterator)
+
+    def _copy(
+        self, batch: Batch | None, compute: torch.cuda.Stream, side: torch.cuda.Stream
+    ) -> tuple[Batch, torch.cuda.Event] | None:
+        """`batch` copied on `side`, each copy kept for `compute`, and the copy's event."""
+        if batch is None:
+            return None
+        with torch.cuda.stream(side):
             moved = batch.to(self.device, non_blocking=True)
-            with torch.no_grad():
-                waveforms = augment_batch(moved.audio, moved.draws, moved.responses, self.settings)
-            yield waveforms, moved.labels
+            copied = side.record_event()
+        for tensor in _on_device(moved):
+            tensor.record_stream(compute)
+        return moved, copied
 
 
 # -- Progress ---------------------------------------------------------------------------------
@@ -1185,9 +1262,13 @@ def _step_rates(
     """The step rate with cudnn's benchmark off (the trainer's setting) and on; the first.
 
     On CUDA the warm-up covers every kept length once, so each shape's kernels are chosen
-    before the clock starts. The CPU chooses none, so there it is one batch.
+    before the clock starts. The CPU chooses none, so there it is one batch. On CUDA a third
+    measurement, cudnn's benchmark back at the trainer's setting, runs the same loop over the
+    pool's batches pinned on the host: `DeviceEpoch` copies each to the device as the trainer
+    does, with no loader, so the copy's cost is told apart from the loader's.
     """
-    pool = [data[index].to(device) for index in range(min(STEP_POOL, len(data)))]
+    host = [data[index] for index in range(min(STEP_POOL, len(data)))]
+    pool = [batch.to(device) for batch in host]
     if device.type != "cuda":
         rate = _step_rate(model, [data[0]], pool, config, device, seconds, clock)
         _say(f"step: cpu, {rate:.1f} examples/s; one warm-up batch, no cudnn")
@@ -1210,6 +1291,9 @@ def _step_rates(
             )
     finally:
         torch.backends.cudnn.benchmark = previous
+    pinned = [batch.pin_memory() for batch in host]
+    copied = _step_rate(model, warm, pinned, config, device, seconds, clock)
+    _say(f"step: from pinned host batches, {copied:.1f} examples/s")
     return rates[False]
 
 
