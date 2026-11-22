@@ -937,6 +937,72 @@ def test_a_consumer_that_stops_early_closes_the_loaders_iterator(device: str) ->
     assert loader.closed
 
 
+# -- The benchmark's timing -------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A clock that moves only when the consumer below takes a step."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _step_through(timed: "train._Timed", clock: _FakeClock, ahead: int, step: float) -> None:
+    """Consume as `fit` over a `DeviceEpoch` reading `ahead` batches ahead: batch n + `ahead`
+    is asked for before batch n's step, and each step takes `step` seconds of `clock`."""
+    iterator = iter(timed)
+    held = collections.deque(itertools.islice(iterator, ahead))
+    for batch in iterator:
+        held.append(batch)
+        held.popleft()
+        clock.now += step
+    while held:
+        held.popleft()
+        clock.now += step
+
+
+@pytest.mark.parametrize("ahead", [0, 1])
+def test_the_timed_window_covers_the_counted_steps_under_read_ahead(ahead: int) -> None:
+    batches = [types.SimpleNamespace(labels=[0.0] * 4) for _ in range(100)]
+    clock = _FakeClock()
+    timed = train._Timed(batches, 2, 10.0, clock, ahead=ahead)
+    _step_through(timed, clock, ahead, step=1.0)
+    assert timed.examples > 0
+    assert timed.rate(clock()) == pytest.approx(4.0)
+    assert timed.examples / 4 == clock() - timed.started
+
+
+def test_the_read_ahead_timed_is_the_device_epochs() -> None:
+    assert train.DeviceEpoch.ahead(torch.device("cuda")) == 1
+    assert train.DeviceEpoch.ahead(torch.device("cpu")) == 0
+
+
+class _Plan:
+    """An `EpochBatches` stand-in: its plan, and its batch at an index is the index."""
+
+    def __init__(self, plan: list[list[train.Item]]) -> None:
+        self.plan = plan
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+
+def test_the_step_warm_up_covers_every_length_and_every_pool_shape() -> None:
+    def batch(size: int, frames: int) -> list[train.Item]:
+        return [train.Item(0, 0, frames - 1, 0)] * size
+
+    shapes = [(32, 50), (5, 50), (32, 60), (5, 50), (7, 70), (3, 80)]
+    plan = [batch(size, frames) for size, frames in shapes]
+    warm = train._warm_up(_Plan(plan), 4)  # type: ignore[arg-type]
+    assert warm == [0, 1, 2, 4, 5]
+    warmed = {shapes[index] for index in warm}
+    assert set(shapes[:4]) <= warmed
+    assert {frames for _, frames in shapes} == {frames for _, frames in warmed}
+
+
 # -- The command line and the benchmark --------------------------------------------------------
 
 
@@ -1098,15 +1164,23 @@ class TestBenchmark:
         assert opened and set(opened) == {"ES2002a.Mix-Headset.wav"}
         assert not (out / train.BENCHMARK_CACHE).exists()
         lines = capsys.readouterr().out.splitlines()
+        on_cuda = torch.cuda.is_available()
+        if on_cuda:
+            device_lines = [
+                "device: cuda",
+                "step: cudnn benchmark off, ",
+                "step: cudnn benchmark on, ",
+                "step: from pinned host batches",
+                "end-to-end: 1 loader workers, ",
+            ]
+        else:
+            device_lines = ["device: cpu", "step: cpu, ", "end-to-end: 0 loader workers, "]
         starts = [
-            "device: cpu",
+            *device_lines,
             "synthetic store: 48 windows",
             "store cold read: ",
-            "store cold read as examples: ",
             "loader: 0 workers, ",
             "loader: 1 workers, ",
-            "step: cpu, ",
-            "end-to-end: 0 loader workers, ",
             "scoring: ",
             "index: 8 windows, 2 public",
             "store build: 2 public windows",
@@ -1118,7 +1192,16 @@ class TestBenchmark:
         ]
         for start in starts:
             assert any(line.startswith(start) for line in lines), start
-        assert not any(line.startswith("step: from pinned host batches") for line in lines)
+        if not on_cuda:
+            assert not any(line.startswith("step: from pinned host batches") for line in lines)
+        cold = [line for line in lines if line.startswith("store cold read")]
+        assert len(cold) == 1, cold
+        assert re.search(
+            r"^store cold read: \d+ examples through 1 loader workers, \d+\.\d examples/s; "
+            r"warm \d+\.\d examples/s; page cache ",
+            cold[0],
+        ), cold[0]
+        assert "windows" not in cold[0] and " x " not in cold[0]
         folds = train.assign_folds(world.windows)
         for fold in range(train.FOLDS):
             held = sum(1 for window in world.windows if folds[window.group] == fold)

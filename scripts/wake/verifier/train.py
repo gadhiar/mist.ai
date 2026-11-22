@@ -67,13 +67,20 @@ responses decaying noise, decoded by `open_store` into `<out>/benchmark-cache` (
 directory without `--out`), a root no training store shares since `open_store` sweeps its root;
 the directory is removed at the end, failed or not. The model is the Base+ verifier from random
 initialisation. It prints one line a measurement, each over `--benchmark-seconds` after a
-warm-up: the loader's rate for each worker count, the store's cold read rate, the step rate of
-`fit`'s own loop over batches already on the device (cudnn benchmark off, the trainer's
-setting, and on), on CUDA the same loop over pinned host batches that `DeviceEpoch` copies to
-the device with no loader, the end-to-end rate over the real loader, and the scoring rate. With
-`--dataset` it reads the index's three files alone, times a store build over a sample of its
-public windows, and projects the five folds and the final run; without it, the seconds a
-million training examples take. Exit 0 measured, 2 refused.
+warm-up: the cold read, the loader's rate for each worker count, the step rate of `fit`'s own
+loop over batches already on the device (cudnn benchmark off, the trainer's setting, and on),
+on CUDA the same loop over pinned host batches that `DeviceEpoch` copies to the device with no
+loader, the end-to-end rate over the real loader, and the scoring rate. With `--dataset` it
+reads the index's three files alone, times a store build over a sample of its public windows,
+and projects the five folds and the final run; without it, the seconds a million training
+examples take. Exit 0 measured, 2 refused.
+
+The cold read is the loader's rate, in examples a second with `--loader-workers` workers, over
+one pass of the plan after the store's pages are dropped, each window read once; a warm pass
+over the same batches follows. It measures the file system holding `--out`, so on the training
+host `--out` belongs on the file system that holds the training store. The drop is
+`posix_fadvise`, which inside Docker Desktop's VM cannot drop the Windows host's cache of a
+bind-mounted drive; the line notes a cold pass that was not slower than the warm one.
 """
 
 import argparse
@@ -598,8 +605,16 @@ class DeviceEpoch:
         self.device = device
         self.settings = settings
 
+    @staticmethod
+    def ahead(device: torch.device) -> int:
+        """Batches asked of the loader beyond the one handed over: one on CUDA, else none.
+
+        On CUDA batch i+1 is asked for before batch i is handed over, so before batch i's step.
+        """
+        return 1 if device.type == "cuda" else 0
+
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        if self.device.type == "cuda":
+        if self.ahead(self.device):
             return self._read_ahead()
         return self._in_turn()
 
@@ -1110,31 +1125,46 @@ class _Cycle(Sequence[Sequence[Item]]):
 class _Timed:
     """Hands over `batches` until `seconds` have passed after the first `warm` of them.
 
-    The clock starts as batch `warm` is asked for and is checked before each later one is, so
-    the examples counted are those handed over inside the time measured. A consumer that
-    finishes its work on a batch before asking for the next, as `fit`'s loop does, has done the
-    counted work by the time `rate` is read.
+    The examples counted are those of batch `warm` and every later one handed over. The
+    consumer asks for batch n + `ahead` when it has finished its work on batch n - 1 and not
+    yet started batch n: `ahead` is 0 for a loop that finishes a batch before asking for the
+    next, and `DeviceEpoch.ahead` for `fit` over a `DeviceEpoch`, which reads one ahead on
+    CUDA. So the clock starts as batch `warm + ahead` is asked for, when the consumer is done
+    with batch `warm - 1`, and is checked before each later batch is asked for; once it runs
+    out, the consumer finishes the batches it holds, the last one counted. By the time `rate`
+    is read after the consumer returns, the time measured covers the work on the counted
+    batches, and on no other.
     """
 
-    def __init__(self, batches: Iterable[Batch], warm: int, seconds: float, clock: Clock) -> None:
+    def __init__(
+        self,
+        batches: Iterable[Batch],
+        warm: int,
+        seconds: float,
+        clock: Clock,
+        ahead: int = 0,
+    ) -> None:
         self.batches = batches
         self.warm = warm
         self.seconds = seconds
         self.clock = clock
+        self.ahead = ahead
         self.examples = 0
+        self.handed = 0
         self.started: float | None = None
 
     def __iter__(self) -> Iterator[Batch]:
         iterator = iter(self.batches)
         try:
             for number in itertools.count():
-                if number == self.warm:
+                if number == self.warm + self.ahead:
                     self.started = self.clock()
                 elif self.started is not None and self.clock() - self.started >= self.seconds:
                     return
                 batch = next(iterator, None)
                 if batch is None:
                     return
+                self.handed += 1
                 if number >= self.warm:
                     self.examples += len(batch.labels)
                 yield batch
@@ -1170,51 +1200,61 @@ def _drop_cache(directory: Path) -> str | None:
     return None
 
 
-def _read_pass(
-    store: WindowStore, order: Sequence[int], seconds: float, clock: Clock
-) -> tuple[int, float]:
-    started = clock()
-    read = 0
-    for window in order:
-        store.read(window, 0, store.length(window))
-        read += 1
-        if clock() - started >= seconds:
-            break
-    return read, max(clock() - started, 1e-9)
+def _loader_pass(
+    data: EpochBatches, workers: int, pin: bool, warm: int, seconds: float, clock: Clock
+) -> _Timed:
+    """`data` through `epoch_loader` once, timed after `warm` batches, nothing consumed."""
+    timed = _Timed(epoch_loader(data, workers, pin), warm, seconds, clock)
+    for _ in timed:
+        pass
+    return timed
 
 
 def _cold_read(
-    store: WindowStore, mean_frames: float, seed: int, seconds: float, clock: Clock
+    data: EpochBatches, store: WindowStore, workers: int, pin: bool, seconds: float, clock: Clock
 ) -> float:
-    """One pass of whole-window reads in random order after the store's pages are dropped.
+    """The loader's rate over one pass of the plan after the store's pages are dropped.
 
-    A warm pass over the same windows follows, so a drop the file system did not honour shows
-    as a cold rate close to the warm one. Returns the cold rate as training examples a second:
-    an example reads its kept frames alone.
+    The pass reads through `epoch_loader` with the trainer's `workers`, and the plan holds
+    each window once, so every read is cold; it stops after `seconds`, as each measurement
+    does. A warm pass over the batches the cold one handed over follows, so a drop the file
+    system did not honour shows as a cold rate close to the warm one. Both rates are training
+    examples a second as the loader hands them over, with no scaling.
+
+    The drop is `posix_fadvise` on the store's files, which live on the file system holding
+    `--out`. Inside Docker Desktop's VM it drops only the VM's own cache, not the Windows
+    host's cache of a bind-mounted drive, so there the cold pass can read from memory; the
+    line's note says so when the cold pass was not slower than the warm one.
     """
-    order = list(range(len(store)))
-    random.Random(seed).shuffle(order)  # nosec B311 - a reproducible order only
+    warm = min(WARM_BATCHES, len(data) - 1)
     refused = _drop_cache(store.directory)
-    read, elapsed = _read_pass(store, order, seconds, clock)
-    _, again = _read_pass(store, order[:read], float("inf"), clock)
-    cold, warm = read / elapsed, read / again
+    cold = _loader_pass(data, workers, pin, warm, seconds, clock)
+    again = EpochBatches(data.plan[: cold.handed], data.labels, data.store, data.settings)
+    warmed = _loader_pass(again, workers, pin, warm, float("inf"), clock)
+    cold_rate, warm_rate = cold.rate(clock()), warmed.rate(clock())
     if refused is not None:
         note = f"page cache not dropped: {refused}"
-    elif cold >= HONOURED * warm:
+    elif cold_rate >= HONOURED * warm_rate:
         note = "page cache dropped, but the cold pass was not slower than the warm one"
     else:
         note = "page cache dropped"
-    megabytes = cold * BENCHMARK_FRAMES * FRAME_SAMPLES * 2 / 1e6
     _say(
-        f"store cold read: {read} windows in random order in {elapsed:.1f} s, "
-        f"{cold:.1f} windows/s, {megabytes:.1f} MB/s; warm {warm:.1f} windows/s; {note}"
+        f"store cold read: {cold.examples} examples through {workers} loader workers, "
+        f"{cold_rate:.1f} examples/s; warm {warm_rate:.1f} examples/s; {note}"
     )
-    examples = cold * BENCHMARK_FRAMES / mean_frames
-    _say(
-        f"store cold read as examples: {cold:.1f} windows/s x {BENCHMARK_FRAMES} / "
-        f"{mean_frames:.1f} mean kept frames = {examples:.1f} examples/s"
-    )
-    return examples
+    return cold_rate
+
+
+def _warm_up(data: EpochBatches, pooled: int) -> list[Batch]:
+    """The plan's first batch of each kept length, and of each (batch size, length) shape among
+    its first `pooled` batches, the pool the step rate cycles; in plan order, each once.
+    """
+    chosen: dict[tuple[int, ...], int] = {}
+    for index, items in enumerate(data.plan):
+        chosen.setdefault((items[0].frames,), index)
+        if index < pooled:
+            chosen.setdefault((len(items), items[0].frames), index)
+    return [data[index] for index in sorted(set(chosen.values()))]
 
 
 def _step_rate(
@@ -1228,8 +1268,10 @@ def _step_rate(
 ) -> float:
     """`fit`'s own loop over batches already on the device: augmentation in, loader out.
 
-    The warm-up epoch runs `warm` once; the measured one cycles `pool` and skips its first
-    batch, which pays for the new optimiser's state.
+    The warm-up epoch runs `warm` once; the measured one cycles `pool` and leaves its first
+    batch out of the count and its step out of the time, since that step pays for the new
+    optimiser's state. `_Timed` is told how far `DeviceEpoch` reads ahead, so on CUDA, as on
+    the CPU, the steps timed are the steps counted.
     """
     one = replace(config, epochs=1)
     fit(
@@ -1239,7 +1281,7 @@ def _step_rate(
         device,
         progress=_quiet,
     )
-    timed = _Timed(itertools.cycle(pool), 1, seconds, clock)
+    timed = _Timed(itertools.cycle(pool), 1, seconds, clock, DeviceEpoch.ahead(device))
     fit(
         model,
         lambda epoch: DeviceEpoch(timed, _examples_in(pool), device, config.augment),
@@ -1260,8 +1302,9 @@ def _step_rates(
 ) -> float:
     """The step rate with cudnn's benchmark off (the trainer's setting) and on; the first.
 
-    On CUDA the warm-up covers every kept length once, so each shape's kernels are chosen
-    before the clock starts. The CPU chooses none, so there it is one batch. On CUDA a third
+    On CUDA the warm-up covers every kept length once and every (batch size, length) shape
+    of the pool, so with cudnn's benchmark on each shape the clock sees has been autotuned
+    before it starts. The CPU chooses no kernels, so there it is one batch. On CUDA a third
     measurement, cudnn's benchmark back at the trainer's setting, runs the same loop over the
     pool's batches pinned on the host: `DeviceEpoch` copies each to the device as the trainer
     does, with no loader, so the copy's cost is told apart from the loader's.
@@ -1272,10 +1315,7 @@ def _step_rates(
         rate = _step_rate(model, [data[0]], pool, config, device, seconds, clock)
         _say(f"step: cpu, {rate:.1f} examples/s; one warm-up batch, no cudnn")
         return rate
-    firsts: dict[int, int] = {}
-    for index, items in enumerate(data.plan):
-        firsts.setdefault(items[0].frames, index)
-    warm = [data[index] for index in sorted(firsts.values())]
+    warm = _warm_up(data, len(host))
     previous = torch.backends.cudnn.benchmark
     rates: dict[bool, float] = {}
     try:
@@ -1286,7 +1326,7 @@ def _step_rates(
             peak = torch.cuda.max_memory_allocated(device) / 2**30
             _say(
                 f"step: cudnn benchmark {'on' if flag else 'off'}, {rates[flag]:.1f} "
-                f"examples/s over {len(warm)} warmed lengths, peak {peak:.2f} GiB allocated"
+                f"examples/s over {len(warm)} warmed shapes, peak {peak:.2f} GiB allocated"
             )
     finally:
         torch.backends.cudnn.benchmark = previous
@@ -1513,10 +1553,10 @@ def _measure(
         build_rate = _sample_build(indexed, root / "sample", args, clock)
     labels = [1.0 if window.label == "positive" else 0.0 for window in windows]
     plan = plan_epoch(windows, range(len(windows)), config, 1)
-    mean_frames = float(np.mean([item.frames for items in plan for item in items]))
-    cold_read = _cold_read(store, mean_frames, config.seed, seconds, clock)
-
+    data = EpochBatches(plan, labels, store, config.augment)
     on_cuda = torch.cuda.is_available()
+    cold_read = _cold_read(data, store, config.loader_workers, on_cuda, seconds, clock)
+
     device = torch.device("cuda" if on_cuda else "cpu")
     if on_cuda:
         _say(f"device: cuda, {torch.cuda.get_device_name(device)}")
@@ -1525,9 +1565,7 @@ def _measure(
     cycled = EpochBatches(_Cycle(plan, PLAN_REPEATS), labels, store, config.augment)
     loader_rates: dict[int, float] = {}
     for workers in dict.fromkeys([*args.benchmark_workers, config.loader_workers]):
-        timed = _Timed(epoch_loader(cycled, workers, pin=on_cuda), WARM_BATCHES, seconds, clock)
-        for _ in timed:
-            pass
+        timed = _loader_pass(cycled, workers, on_cuda, WARM_BATCHES, seconds, clock)
         loader_rates[workers] = timed.rate(clock())
         pinned = ", pinned" if on_cuda else ""
         _say(f"loader: {workers} workers, {loader_rates[workers]:.1f} examples/s{pinned}")
@@ -1536,14 +1574,17 @@ def _measure(
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     model = build(config, None)
-    data = EpochBatches(plan, labels, store, config.augment)
     step = _step_rates(model, data, config, device, seconds, clock)
     if on_cuda:
         torch.cuda.empty_cache()
 
     workers = config.loader_workers if on_cuda else 0
     timed = _Timed(
-        epoch_loader(cycled, workers, pin=on_cuda), WARM_BATCHES if on_cuda else 1, seconds, clock
+        epoch_loader(cycled, workers, pin=on_cuda),
+        WARM_BATCHES if on_cuda else 1,
+        seconds,
+        clock,
+        DeviceEpoch.ahead(device),
     )
     examples = sum(len(items) for items in plan)
     fit(
@@ -1601,7 +1642,17 @@ def _parser(benchmark: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--manifest", required=training, type=Path)
     parser.add_argument("--root-map", action="append", default=[])
     parser.add_argument("--weights", required=training, type=Path)
-    parser.add_argument("--out", required=training, type=Path)
+    parser.add_argument(
+        "--out",
+        required=training,
+        type=Path,
+        help=(
+            "the run's directory; with --benchmark, where its synthetic store is built, so put "
+            "it on the training store's file system: the cold read measures the file system "
+            "holding it, and posix_fadvise inside Docker Desktop's VM cannot drop the Windows "
+            "host's cache"
+        ),
+    )
     which = parser.add_mutually_exclusive_group(required=training)
     which.add_argument("--fold", type=int)
     which.add_argument("--final", action="store_true")
