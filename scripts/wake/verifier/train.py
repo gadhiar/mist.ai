@@ -20,9 +20,10 @@ epoch reads every window, so the run reads them from `store.open_store` instead:
 decoded once into one flat file under `--cache` (default `<out>/window-cache`), kept under the
 sha256 of `index.jsonl` and reused by every later run of the same index with the same cache, the
 other folds and the final run included. A window that reads or mixes a recording is never
-written there; each run reads those through the manifest into memory. The store is opened before
-the model is built: its decoding processes, `--store-workers` of them, are started by spawn, and
-CUDA must not have started before them.
+written there; each run reads those through the manifest into memory. Its decoding processes,
+`--store-workers` of them, are started by spawn, not fork: the trainer's process already runs
+torch's thread pools, and a child forked from a threaded process can inherit a lock another
+thread held (`store.py`).
 
 Folds. Five folds grouped by each window's `group` as `mine.py` set it (recording session, AMI
 speaker group, LibriSpeech speaker, which a Chatterbox clone shares, piper speaker, MUSAN file),
@@ -929,8 +930,6 @@ def run(args: argparse.Namespace, build: ModelBuilder, clock: Clock = time.monot
         {ref.sha256: ref for w in windows for ref in w.inputs if ref.source == "rirs"}.values(),
         key=lambda ref: ref.sha256,
     )
-    # Before the model and the device: the store's decoding processes start by spawn, and
-    # nothing may have started CUDA before them.
     store = open_store(
         args.cache if args.cache is not None else args.out / CACHE_DIR,
         index_key(args.dataset),
@@ -1485,7 +1484,6 @@ def _measure(
     seconds = args.benchmark_seconds
     windows = synthetic_windows(args.benchmark_windows)
     rooms = synthetic_rooms()
-    # Both stores before the device: their decoding processes start by spawn, as in `run`.
     started = clock()
     store = open_store(
         root / "synthetic",
