@@ -11,17 +11,20 @@ clip), each step's probability and range, and its float32 output; no step reads 
 differs:
 
 - The room response and the low-pass are one multiplication in the frequency domain instead of
-  `np.convolve` and `sosfilt`. With the FFT at least twice the window long, the room's
-  convolution has no wrap-around in the samples kept. The low-pass is the sixth-order
-  Butterworth's frequency response evaluated from the same sections, so it differs from
-  `sosfilt` only by its impulse response's tail beyond the window, which at 3 to 7.5 kHz is
-  below float32 resolution.
+  `np.convolve` and `sosfilt`. The low-pass is the sixth-order Butterworth's frequency response
+  evaluated from the same sections, so the product is a circular convolution with the room's
+  taps and the low-pass's whole impulse response. The room-convolved signal is 2L - 1 samples
+  long, and the FFT is longer than that by `lowpass_tail` samples, the point past which the
+  impulse response's absolute sum is under `TAIL_BOUND`, at the cutoff in the settings' range
+  that rings longest. What wraps into a kept sample is therefore under `TAIL_BOUND` times the
+  room-convolved signal's peak.
 - The work is float32 on the device, where the old path was float64.
 - `draw` makes every draw whether or not its step applies, in a fixed order, and the noise
   comes from a torch generator seeded per item. A seed therefore gives other values than
   `train.augment` gave it; each step's distribution is the old one.
 """
 
+import functools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
@@ -29,7 +32,7 @@ from dataclasses import dataclass, fields
 import numpy as np
 import torch
 from scipy.fft import next_fast_len
-from scipy.signal import butter
+from scipy.signal import butter, sosfilt
 
 from .dataset import FRAME_SAMPLES, SAMPLE_RATE
 
@@ -38,6 +41,11 @@ LOWPASS_SECTIONS = LOWPASS_ORDER // 2
 CLIP_LOW = -1.0
 CLIP_HIGH = 32767 / 32768
 _IDENTITY_SECTION = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+TAIL_BOUND = 2.0**-24
+"""The low-pass's impulse response's absolute sum left past `lowpass_tail`: float32's unit
+roundoff, so what wraps into a kept sample is below float32 resolution of the signal's peak."""
+TAIL_CUTOFFS = 65
+"""Cutoffs `lowpass_tail` evaluates across the settings' range, both ends included."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,16 +211,47 @@ def augment_batch(
         raise ValueError(f"responses must be [{batch}, R], not {tuple(responses.shape)}")
     out = audio.to(torch.float32) / 32768.0
     out = out * draws.gain[:, None]
-    out = _filter(out, draws, responses)
+    out = _filter(out, draws, responses, lowpass_tail(*settings.lowpass_hz))
     out = _add_noise(out, draws)
     out = _agc(out, draws.agc, settings)
     return out.clamp(CLIP_LOW, CLIP_HIGH)
 
 
-def _filter(out: torch.Tensor, draws: BatchDraws, responses: torch.Tensor) -> torch.Tensor:
-    """The room response and the low-pass as one product of spectra."""
+@functools.lru_cache(maxsize=8)
+def lowpass_tail(low_hz: float, high_hz: float) -> int:
+    """Samples after which the low-pass's impulse response sums under `TAIL_BOUND` in absolute
+    value, at whichever of `TAIL_CUTOFFS` cutoffs across `[low_hz, high_hz]` rings longest.
+
+    The ringing is not longest at the lowest cutoff: at 16 kHz the largest pole radius is
+    0.78 at 3 kHz and 0.95 at 7.5 kHz, and the tail 72 samples at 3 kHz and 345 at 7.5 kHz.
+    The impulse response is computed long enough that the tail ends in its first half.
+    """
+    longest = 0
+    for cutoff in np.linspace(low_hz, high_hz, TAIL_CUTOFFS):
+        sos = butter(LOWPASS_ORDER, cutoff, fs=SAMPLE_RATE, output="sos")
+        count = 1024
+        while True:
+            impulse = np.zeros(count)
+            impulse[0] = 1.0
+            remaining = np.cumsum(np.abs(sosfilt(sos, impulse))[::-1])[::-1]
+            below = np.flatnonzero(remaining < TAIL_BOUND)
+            if len(below) and below[0] < count // 2:
+                longest = max(longest, int(below[0]))
+                break
+            count *= 2
+    return longest
+
+
+def _filter(
+    out: torch.Tensor, draws: BatchDraws, responses: torch.Tensor, tail: int
+) -> torch.Tensor:
+    """The room response and the low-pass as one product of spectra.
+
+    The transform holds the room-convolved signal, 2L - 1 samples, and `tail` more, so the
+    low-pass's ringing past them is all that wraps into the samples kept.
+    """
     length = out.shape[1]
-    size = next_fast_len(2 * length, real=True)
+    size = next_fast_len(2 * length + tail, real=True)
     taps = responses[:, :length].to(torch.float32)
     taps = torch.nn.functional.pad(taps, (0, size - taps.shape[1]))
     room = torch.fft.rfft(taps)
