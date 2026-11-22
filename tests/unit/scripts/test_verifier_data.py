@@ -14,6 +14,7 @@ import math
 import subprocess
 import sys
 import types
+import wave
 import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -170,37 +171,88 @@ def held_out_dir(directory: Path, meetings: Sequence[str]) -> Path:
     return directory
 
 
+def multichannel(meeting: str, channels: int) -> np.ndarray:
+    """A meeting's samples by channel, led by the frames whose mean rounds, ties or clips."""
+    seconds = SECONDS[meeting]
+    base = spoken(seconds / 2, 0.4, seconds / 2 - 0.4, seed=7).astype(np.int32)
+    columns = [base, base * 3 // 4 + 1, -base // 2, base // 3 - 5][:channels]
+    frames = np.stack(columns, axis=1)
+    counting = np.arange(1, channels + 1)
+    edges = [
+        np.full(channels, 32767),
+        np.full(channels, -32768),
+        np.resize([32767, -32768], channels),
+        counting,
+        counting + 1,
+        -counting,
+    ]
+    frames[: len(edges)] = np.stack(edges)
+    return frames.astype("<i2")
+
+
+def write_channels(path: Path, frames: np.ndarray, rate: int = RATE, width: int = 2) -> Path:
+    """A WAV of `frames` (samples by channels) at `width` bytes a sample, as a mirror serves one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    samples = np.asarray(frames, dtype="<i2")
+    if width == 1:
+        data = ((samples.astype(np.int32) >> 8) + 128).astype(np.uint8).tobytes()
+    elif width == 3:
+        data = (samples.astype("<i4") << 8).view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+    else:
+        data = samples.tobytes()
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(samples.shape[1])
+        handle.setsampwidth(width)
+        handle.setframerate(rate)
+        handle.writeframes(data)
+    return path
+
+
 @dataclass
 class FakeFetch:
-    """Writes each meeting's WAV: `SECONDS[meeting]` of quiet with a burst in the middle."""
+    """Writes each meeting's WAV: `SECONDS[meeting]` of quiet with a burst in the middle.
+
+    A meeting in `served` is written by `write_channels` in `channels`, `width` and `rate`, the
+    same bytes on every call; any other is mono PCM16 at `rate`.
+    """
 
     rate: int = RATE
+    served: tuple[str, ...] = ()
+    channels: int = 2
+    width: int = 2
     urls: list[str] = field(default_factory=list)
 
     def __call__(self, url: str, dest: Path) -> None:
         self.urls.append(url)
         meeting = url.rsplit("/", 1)[1].split(".")[0]
+        if meeting in self.served:
+            write_channels(dest, multichannel(meeting, self.channels), self.rate, self.width)
+            return
         seconds = SECONDS[meeting]
         samples = spoken(seconds / 2, 0.4, seconds / 2 - 0.4, seed=len(self.urls))
         write(dest, samples, self.rate)
 
 
-def staged_ami(root: Path, fetch: FakeFetch | None = None) -> Path:
-    """`<root>/ami/{annotations,dev,eval,train}` staged by `stage.stage`."""
-    ami = root / "ami"
-    zip_path = annotations_zip(ami / "annotations" / "ami.zip", SPEAKERS)
-    held_out_dir(ami / "dev", PARTITION.dev)
-    held_out_dir(ami / "eval", PARTITION.eval)
-    code = stage.stage(
-        zip_path,
+def run_stage(ami: Path, fetch: FakeFetch) -> int:
+    """`stage.stage` over `<ami>/{annotations/ami.zip,dev,eval}` into `<ami>/train`."""
+    return stage.stage(
+        ami / "annotations" / "ami.zip",
         ami / "dev",
         ami / "eval",
         ami / "train",
-        fetch=fetch or FakeFetch(),
+        fetch=fetch,
         partition=PARTITION,
         minimums=TINY,
     )
-    assert code == 0
+
+
+def staged_ami(root: Path, fetch: FakeFetch | None = None) -> Path:
+    """`<root>/ami/{annotations,dev,eval,train}` staged by `stage.stage`."""
+    ami = root / "ami"
+    annotations_zip(ami / "annotations" / "ami.zip", SPEAKERS)
+    held_out_dir(ami / "dev", PARTITION.dev)
+    held_out_dir(ami / "eval", PARTITION.eval)
+    assert run_stage(ami, fetch or FakeFetch()) == 0
     return ami
 
 
@@ -718,22 +770,133 @@ class TestStage:
         )
         assert refused == 2
 
-    def test_a_download_in_another_format_is_refused(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("rate", "channels", "width"),
+        [(44100, 1, 2), (44100, 2, 2), (RATE, 1, 1), (RATE, 2, 1), (RATE, 2, 3)],
+    )
+    def test_a_download_in_another_format_is_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        rate: int,
+        channels: int,
+        width: int,
+    ) -> None:
         ami = tmp_path / "ami"
-        zip_path = annotations_zip(ami / "ann.zip", SPEAKERS)
+        annotations_zip(ami / "annotations" / "ami.zip", SPEAKERS)
         held_out_dir(ami / "dev", PARTITION.dev)
         held_out_dir(ami / "eval", PARTITION.eval)
-        code = stage.stage(
-            zip_path,
-            ami / "dev",
-            ami / "eval",
-            ami / "train",
-            fetch=FakeFetch(rate=44100),
-            partition=PARTITION,
-            minimums=TINY,
+        fetch = FakeFetch(rate=rate, served=tuple(SECONDS), channels=channels, width=width)
+        assert run_stage(ami, fetch) == 2
+        assert f"is {rate} Hz, {channels} channels, {8 * width}-bit" in capsys.readouterr().err
+        assert len(fetch.urls) == 1
+        assert not list((ami / "train").iterdir())
+
+    @pytest.mark.parametrize("channels", [2, 3])
+    def test_a_multichannel_download_is_staged_as_the_mean_of_its_channels(
+        self, tmp_path: Path, channels: int
+    ) -> None:
+        ami = staged_ami(tmp_path, FakeFetch(served=("ES2005a",), channels=channels))
+        train = ami / "train"
+        name = "ES2005a.Mix-Headset.wav"
+        frames = multichannel("ES2005a", channels)
+        original = write_channels(tmp_path / "original.wav", frames)
+        staged = train / name
+        info = dataset.wav_info(staged)
+        assert dataset.is_pcm16_16k_mono(info) and info.frames == len(frames)
+        mono = dataset.read_wav_segment(staged, 0, info.frames)
+        rounded = np.round(frames.astype(np.float64).mean(axis=1))
+        np.testing.assert_array_equal(mono, np.clip(rounded, -32768, 32767).astype("<i2"))
+        # The rule the dataset reads any other multichannel file by.
+        np.testing.assert_array_equal(mono, dataset.to_pcm16(dataset.read_audio(original)[0]))
+        assert dataset.read_sums(train / "SHA256SUMS")[name] == dataset.sha256_file(staged)
+        source = {name: {"channels": channels, "sha256": dataset.sha256_file(original)}}
+        recorded = json.loads((train / "SOURCES.json").read_text(encoding="utf-8"))
+        assert recorded == {"version": 1, "files": source}
+        split = json.loads((train / "split.json").read_text(encoding="utf-8"))
+        assert split["sources"] == source
+        assert sorted(path.name for path in train.iterdir()) == sorted(
+            [*(f"{m}.Mix-Headset.wav" for m in SECONDS), "SHA256SUMS", "SOURCES.json", "split.json"]
         )
-        assert code == 2
-        assert not list((ami / "train").glob("*.wav"))
+
+    def test_a_rerun_downloads_only_what_is_missing_and_clears_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        ami = staged_ami(tmp_path)
+        train = ami / "train"
+        name = "TS3005a.Mix-Headset.wav"
+        # What a run leaves when a multichannel download is refused: the files before it staged
+        # and listed, the refused one and split.json absent.
+        (train / name).unlink()
+        (train / "split.json").unlink()
+        listed = dataset.read_sums(train / "SHA256SUMS")
+        del listed[name]
+        (train / "SHA256SUMS").write_bytes(dataset.sums_bytes(listed))
+        kept = {path.name: path.read_bytes() for path in train.glob("*.wav")}
+        fetch = FakeFetch(served=("TS3005a",))
+        assert run_stage(ami, fetch) == 0
+        assert fetch.urls == [stage.MIRROR.format(meeting="TS3005a")]
+        assert {n: (train / n).read_bytes() for n in kept} == kept
+        sums = dataset.read_sums(train / "SHA256SUMS")
+        assert sums == listed | {name: dataset.sha256_file(train / name)}
+        original = write_channels(tmp_path / "original.wav", multichannel("TS3005a", 2))
+        source = {name: {"channels": 2, "sha256": dataset.sha256_file(original)}}
+        # A run after that downloads nothing and keeps the record.
+        again = FakeFetch()
+        assert run_stage(ami, again) == 0 and again.urls == []
+        assert dataset.read_sums(train / "SHA256SUMS") == sums
+        recorded = json.loads((train / "SOURCES.json").read_text(encoding="utf-8"))
+        assert recorded["files"] == source
+        split = json.loads((train / "split.json").read_text(encoding="utf-8"))
+        assert split["sources"] == source
+
+    @pytest.mark.parametrize("moment", ["download", "rerun"])
+    @pytest.mark.parametrize("kind", ["downloaded", "staged"])
+    def test_a_held_out_sha256_as_downloaded_or_as_staged_is_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str, moment: str
+    ) -> None:
+        name = "ES2005a.Mix-Headset.wav"
+        clean = staged_ami(tmp_path / "clean", FakeFetch(served=("ES2005a",)))
+        if kind == "downloaded":
+            files = json.loads((clean / "train" / "SOURCES.json").read_text(encoding="utf-8"))
+            digest = files["files"][name]["sha256"]
+        else:
+            digest = dataset.read_sums(clean / "train" / "SHA256SUMS")[name]
+        ami = clean
+        if moment == "download":
+            ami = tmp_path / "fresh" / "ami"
+            annotations_zip(ami / "annotations" / "ami.zip", SPEAKERS)
+            held_out_dir(ami / "dev", PARTITION.dev)
+            held_out_dir(ami / "eval", PARTITION.eval)
+        sums_path = ami / "eval" / "SHA256SUMS"
+        held_out = dataset.read_sums(sums_path) | {"EN2002b.Mix-Headset.wav": digest}
+        sums_path.write_bytes(dataset.sums_bytes(held_out))
+        capsys.readouterr()
+        assert run_stage(ami, FakeFetch(served=("ES2005a",))) == 2
+        err = capsys.readouterr().err
+        assert name in err and "ami/eval/EN2002b.Mix-Headset.wav" in err
+        if moment == "download":
+            assert not (ami / "train" / name).exists()
+            assert name not in dataset.read_sums(ami / "train" / "SHA256SUMS")
+            assert not list((ami / "train").glob("*.part"))
+
+    @pytest.mark.parametrize(
+        "files",
+        [
+            {"IB4005.Mix-Headset.wav": {"channels": 2, "sha256": "a" * 64}},
+            {"ES2005a.Mix-Headset.wav": {"channels": 1, "sha256": "a" * 64}},
+            {"ES2005a.Mix-Headset.wav": {"channels": 2, "sha256": "a"}},
+            {"ES2005a.Mix-Headset.wav": {"channels": 2}},
+            [],
+        ],
+    )
+    def test_a_sources_json_that_is_malformed_or_names_another_meeting_is_refused(
+        self, tmp_path: Path, files: object
+    ) -> None:
+        ami = staged_ami(tmp_path)
+        sources = ami / "train" / "SOURCES.json"
+        sources.write_text(json.dumps({"version": 1, "files": files}), encoding="utf-8")
+        assert run_stage(ami, FakeFetch()) == 2
 
     def test_held_out_dirs_without_sha256sums_are_refused(self, tmp_path: Path) -> None:
         ami = tmp_path / "ami"

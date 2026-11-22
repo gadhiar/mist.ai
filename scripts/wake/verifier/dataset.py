@@ -386,6 +386,40 @@ def write_wav(path: Path, samples: np.ndarray, rate: int = SAMPLE_RATE) -> None:
         handle.writeframes(np.asarray(samples, dtype="<i2").tobytes())
 
 
+def is_pcm16_16k(info: WavInfo) -> bool:
+    """True for 16 kHz PCM16 in any channel count, the formats `downmix_pcm16` reads."""
+    return (info.rate, info.width) == (SAMPLE_RATE, SAMPLE_WIDTH)
+
+
+def downmix_pcm16(source: Path, dest: Path, block_frames: int = 1 << 18) -> int:
+    """Write a 16 kHz PCM16 WAV as mono, each sample the mean of its channels, and count them.
+
+    The mean is rounded to the nearest integer and clipped to int16: `read_audio` averages the
+    channels and `to_pcm16` rounds and clips, so the mono file holds what this module reads from
+    the multichannel one. The file is read in blocks, an AMI meeting at a time.
+
+    Raises:
+        DatasetError: `source` is not 16 kHz PCM16.
+    """
+    info = wav_info(source)
+    if not is_pcm16_16k(info):
+        raise DatasetError(f"{source.name} is not 16 kHz PCM16")
+    frame_bytes = SAMPLE_WIDTH * info.channels
+    written = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(source), "rb") as reader, wave.open(str(dest), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(SAMPLE_WIDTH)
+        writer.setframerate(SAMPLE_RATE)
+        while data := reader.readframes(block_frames):
+            whole = len(data) - len(data) % frame_bytes
+            frames = np.frombuffer(data[:whole], dtype="<i2").reshape(-1, info.channels)
+            mean = np.round(frames.astype(np.float64).mean(axis=1))
+            writer.writeframes(np.clip(mean, -32768, 32767).astype("<i2").tobytes())
+            written += len(frames)
+    return written
+
+
 def read_sums(path: Path) -> dict[str, str]:
     """A `sha256sum` listing as name to sha256: `<sha256>  <name>` or `<sha256> *<name>`.
 
