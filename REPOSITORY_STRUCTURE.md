@@ -33,12 +33,25 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
 - `render_character.py` - Renders one WAV through the character stage, as the realtime downlink would play it
-- `wake/` - Tools for MIST's wake model: the guided recorder, the recording manifest check and the evaluation harnesses
+- `wake/` - Tools for MIST's wake cascade (the name spotter, then the acoustic wake verifier): the guided recorder, the recording manifest check, the verifier's training pipeline and the evaluation harnesses
   - `device_calibration.py` - Writes a spotter's calibration tables into the wake model's manifest, from that spotter's evaluation
-  - `eval_wake.py` - The wake model evaluation harness: stage 1 and the addressee gate, offline, over one split
+  - `eval_wake.py` - The cascade's evaluation harness: the spotter, then the wake verifier, offline, over one split, through a driver of the live path (VAD segments, the spotter pushed every frame, the gate's pre-decode checks and the verifier's score of each hit's window)
   - `manifest.py` - The wake recording manifest: its check, and the training subset the model records
   - `record.py` - The guided host-side recorder for one headset sitting: 16 kHz clips and their draft manifest entries
-  - `spotter_eval.py` - The server spotter's pass bar, measured after the addressee gate: gated tune wakes and gated false wakes per hour over an ambient set, beside the spotter-only figures written as the converter's evaluation
+  - `spotter_eval.py` - The server spotter's pass bar, measured through the wake verifier: gated tune wakes and gated false wakes per hour over an ambient set, beside the spotter-only figures written as the converter's evaluation
+  - `verifier/` - The acoustic wake verifier's training data, model and calibration; nothing in `backend/` imports it
+    - `stage.py` - Stages the AMI train meetings the verifier mines and calibrates on, kept apart from dev and eval by speaker
+    - `dataset.py` - The training index: window specs over source files, never copies of audio
+    - `synth.py` - The synthetic speech's texts, and the checks and mixing every synthetic clip goes through
+    - `piper_driver.py` - Speaks every text with piper-sample-generator, the same number of times each (runs as a file in WSL)
+    - `chatterbox_driver.py` - Speaks the texts with Chatterbox, cloning LibriSpeech train-clean-100 speakers
+    - `mine.py` - Mines the spotter's hits into training windows: real, synthetic and ambient
+    - `build.py` - Builds the dataset index from the mined windows, behind the leakage guard
+    - `model.py` - The verifier's network: WavLM Base+ with its last four layers and a head fine-tuned
+    - `train.py` - Trains the verifier on the dataset index, one cross-validation fold or the final model
+    - `export.py` - Exports a trained run to ONNX, checks it against torch, and times it in ONNX Runtime
+    - `calibrate.py` - Calibrates the threshold table on the AMI calibration share and writes the verifier's manifest
+    - `preflight.py` - The pre-flight gate: whether the gated cascade still wakes on the tune positives and stays quiet
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
   - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
   - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
@@ -202,7 +215,7 @@ backend/
 │
 ├── realtime/                    # Realtime voice path, one session per WebSocket connection;
 │   │                            #   `server.py` serves every connection through it
-│   ├── addressee.py             # Addressee gate: whether an utterance holding MIST's name was said to her
+│   ├── addressee.py             # Addressee gate: whether a name hit was said to MIST: `pre_decode` (her own TTS text and the reference score) and the verifier's verdict
 │   ├── bargein.py               # Barge-in policy: what user speech means while MIST speaks, holds a reply or thinks
 │   ├── budget.py                # Voice latency budget, voice configuration and their loader from the environment
 │   ├── capability_sink.py       # Capabilities' event sink over the session registry: house-wide state to every session
@@ -215,9 +228,10 @@ backend/
 │   │   ├── parakeet_stt.py      # Parakeet TDT 0.6B v2 (ONNX) STT behind `StreamingTranscriber`, on the CPU
 │   │   ├── pocket_tts.py        # Pocket TTS with voice cloning behind `SpeechSynthesizer`
 │   │   ├── silero_vad.py        # Silero VAD (ONNX v5) behind `VoiceActivityDetector`, and the ONNX loading it shares
-│   │   └── smart_turn.py        # Smart Turn v3.2 (ONNX) behind `TurnEndDetector`
+│   │   ├── smart_turn.py        # Smart Turn v3.2 (ONNX) behind `TurnEndDetector`
+│   │   └── verifier.py          # Acoustic wake verifier (ONNX) behind `WakeVerifier`: scores the audio around a name hit against its threshold for the spotter's cutoff
 │   ├── errors.py                # Exceptions raised by the realtime voice package
-│   ├── ingress.py               # Per-session audio ingress: uplink frames to speech segments, name hits and utterances
+│   ├── ingress.py               # Per-session audio ingress: uplink frames to speech segments, name hits, their verifier scores and utterances
 │   ├── lanes.py                 # Inference lanes: one worker thread per engine, so model calls never block the event loop
 │   ├── playback.py              # Downlink playback: the session's `turn` lane, the pacer that feeds it and the ledger
 │   ├── power.py                 # Power level on the realtime path: the gate that turns and voice read

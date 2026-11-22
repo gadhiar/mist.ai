@@ -21,13 +21,6 @@ chunk completes, so a partial costs only the new audio's steps and returns the h
 frames with `keep_all_outputs`), because ingress may resume an utterance after a final, and the
 live stream must then go on from where its whole chunks left off.
 
-Word timings. Each step covers known feature frames, so the stream stamps the words a step's text
-adds or changes with that step's span: a word starts with the first step that emitted it and ends
-with the last step that changed it. The span comes from the frames at the preprocessor config's
-`window_stride`, and no NeMo hypothesis timestamp is read. A config without a positive stride is
-logged once at load, and its transcripts carry no words. The bookkeeping lives in the stream's
-state, so the final's flush stamps its copy and the live stream keeps its own.
-
 This module also holds what both speech-to-text adapters share (the stream's buffering, closing
 and partial history, release, and the library error rule); `parakeet_stt.py` imports it.
 
@@ -43,7 +36,7 @@ import re
 import stat
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Protocol, TypeVar
@@ -53,7 +46,7 @@ import numpy as np
 from ..budget import PlacementConfig
 from ..errors import RealtimeError, SpeechEngineError
 from ..lanes import LaneJobCancelled
-from ..speech import CancelToken, TranscriptUpdate, WordTiming
+from ..speech import CancelToken, TranscriptUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -97,17 +90,6 @@ def stable_prefix_chars(previous: str, current: str) -> int:
 def audio_ms(samples: int) -> int:
     """Milliseconds of 16 kHz audio."""
     return samples * 1000 // SAMPLE_RATE
-
-
-def checked_words(text: str, words: tuple[WordTiming, ...] | None) -> tuple[WordTiming, ...] | None:
-    """`words` when they meet `TranscriptUpdate`'s words invariant for `text`, else None.
-
-    A decode whose timings cannot be tied to its text still returns its text; only its words
-    are dropped.
-    """
-    if words is None or not TranscriptUpdate.words_match(text, words):
-        return None
-    return words
 
 
 def library_error(engine_id: str, action: str, exc: BaseException) -> SpeechEngineError:
@@ -212,20 +194,14 @@ class BufferedTranscriptStream:
         with self._lock:
             self._check_open(action)
 
-    def _partial(
-        self, text: str, samples: int, words: tuple[WordTiming, ...] | None
-    ) -> TranscriptUpdate:
+    def _partial(self, text: str, samples: int) -> TranscriptUpdate:
         stable = stable_prefix_chars(self._last_partial, text)
         self._last_partial = text
-        return TranscriptUpdate(
-            text, stable, False, audio_ms(samples), words=checked_words(text, words)
-        )
+        return TranscriptUpdate(text, stable, False, audio_ms(samples))
 
     @staticmethod
-    def _final(text: str, samples: int, words: tuple[WordTiming, ...] | None) -> TranscriptUpdate:
-        return TranscriptUpdate(
-            text, len(text), True, audio_ms(samples), words=checked_words(text, words)
-        )
+    def _final(text: str, samples: int) -> TranscriptUpdate:
+        return TranscriptUpdate(text, len(text), True, audio_ms(samples))
 
 
 S = TypeVar("S", bound=BufferedTranscriptStream)
@@ -315,8 +291,7 @@ class NemoModel(Protocol):
 
     Also `encoder.set_default_att_context_size`, `encoder.setup_streaming_params`,
     `encoder.get_initial_cache_state`, `encoder.streaming_cfg`, `_cfg.preprocessor`,
-    `from_config_dict` and `parameters`, as the probe calls them, and the preprocessor config's
-    `window_stride` for word timings.
+    `from_config_dict` and `parameters`, as the probe calls them.
     """
 
     def eval(self) -> object:
@@ -429,11 +404,7 @@ def _hypothesis_text(reply: object) -> str:
 
 @dataclass(slots=True)
 class _StreamState:
-    """One utterance's streaming state: the audio fed, the step position and what it carries.
-
-    `words` is the per-step word bookkeeping: each word of `text` with the span of the steps
-    that made it. `stamp` keeps it after every step that returns text.
-    """
+    """One utterance's streaming state: the audio fed, the step position and what it carries."""
 
     audio: np.ndarray
     cache_channel: object
@@ -444,54 +415,18 @@ class _StreamState:
     text: str = ""
     hypotheses: object = None
     pred_out: object = None
-    words: list[WordTiming] = field(default_factory=list)
-
-    def stamp(self, start_ms: int, end_ms: int) -> None:
-        """Stamp the words this step's text added or changed with the step's audio span.
-
-        Words are matched by position, since a greedy streaming hypothesis only grows at its
-        end. A word the step left as it was keeps its span. A changed word keeps the start of
-        the first step that emitted it and ends with this step; a new word spans this step.
-        Words the text no longer holds are dropped.
-        """
-        stamped = []
-        for index, word in enumerate(self.text.split()):
-            if index >= len(self.words):
-                stamped.append(WordTiming(word, start_ms, end_ms))
-            elif self.words[index].text == word:
-                stamped.append(self.words[index])
-            else:
-                stamped.append(WordTiming(word, self.words[index].start_ms, end_ms))
-        self.words = stamped
 
 
 class _Streamer:
-    """The restored model and its streaming preprocessor, stepped as the probe steps them.
+    """The restored model and its streaming preprocessor, stepped as the probe steps them."""
 
-    `frame_ms` is the preprocessor's feature frame stride in milliseconds, which places each
-    step's frames in the audio; None when the config gives none, and then no step is stamped.
-    """
+    __slots__ = ("_device", "_model", "_preprocessor", "_torch")
 
-    __slots__ = ("_device", "_model", "_preprocessor", "_torch", "frame_ms")
-
-    def __init__(
-        self,
-        model: NemoModel,
-        preprocessor: object,
-        torch: ModuleType,
-        frame_ms: float | None = None,
-    ) -> None:
+    def __init__(self, model: NemoModel, preprocessor: object, torch: ModuleType) -> None:
         self._model = model
         self._preprocessor = preprocessor
         self._torch = torch
         self._device = next(model.parameters()).device
-        self.frame_ms = frame_ms
-
-    def words(self, state: _StreamState | None) -> tuple[WordTiming, ...] | None:
-        """The state's timed words, or None when the stream keeps no timings."""
-        if self.frame_ms is None:
-            return None
-        return () if state is None else tuple(state.words)
 
     def new_state(self) -> _StreamState:
         channel, time, channel_len = self._model.encoder.get_initial_cache_state(batch_size=1)
@@ -569,13 +504,6 @@ class _Streamer:
                 )
                 if texts:
                     state.text = _hypothesis_text(list(texts))
-                    if self.frame_ms is not None:
-                        # The step's new frames, ending no later than the audio fed.
-                        start_ms = round(state.frame_idx * self.frame_ms)
-                        end_ms = min(
-                            round(min(end, total) * self.frame_ms), audio_ms(state.audio.size)
-                        )
-                        state.stamp(start_ms, max(start_ms, end_ms))
                 state.frame_idx += shift
                 state.step += 1
                 if last:
@@ -588,18 +516,6 @@ def _streaming_preprocessor(model: NemoModel) -> object:
     cfg.dither = 0.0
     cfg.pad_to = 0
     return model.from_config_dict(cfg).to(next(model.parameters()).device)
-
-
-def _frame_ms(model: NemoModel) -> float | None:
-    """The preprocessor's feature frame stride in milliseconds, or None if it gives none.
-
-    NeMo's mel preprocessor config holds the stride as `window_stride`, in seconds. Whether this
-    checkpoint's does is unverified here, so anything but a positive number reads as absent.
-    """
-    stride = getattr(model._cfg.preprocessor, "window_stride", None)
-    if isinstance(stride, bool) or not isinstance(stride, int | float) or stride <= 0:
-        return None
-    return float(stride) * 1000
 
 
 class NemotronStream(BufferedTranscriptStream):
@@ -628,10 +544,9 @@ class NemotronStream(BufferedTranscriptStream):
             # `from None`: the library's message may echo the utterance.
             raise library_error(ENGINE_ID, action, exc) from None
         self._still_open(action)
-        words = streamer.words(state)
         if state is None:
-            return self._partial("", 0, words)
-        return self._partial(state.text, state.audio.size, words)
+            return self._partial("", 0)
+        return self._partial(state.text, state.audio.size)
 
     def decode_final(self, token: CancelToken) -> TranscriptUpdate:
         """Flush a copy of the stream: the final transcript, with the live stream left as it was.
@@ -646,19 +561,16 @@ class NemotronStream(BufferedTranscriptStream):
             state = self._feed_chunks(streamer, token, action)
             tail = self._unfed
             if state is None and not tail.size:
-                text, samples, words = "", 0, streamer.words(None)
+                text, samples = "", 0
             else:
                 live = state if state is not None else self._new_state(streamer)
-                # The copy carries the live stream's word bookkeeping, and the flush's steps
-                # stamp the copy alone.
                 flushed = copy.deepcopy(live)
                 samples = flushed.audio.size + tail.size
                 text = streamer.flush(flushed, tail)
-                words = streamer.words(flushed)
         except LIBRARY_ERRORS as exc:
             raise library_error(ENGINE_ID, action, exc) from None
         self._still_open(action)
-        return self._final(text, samples, words)
+        return self._final(text, samples)
 
     def _prepare(self, token: CancelToken, action: str) -> _Streamer:
         pending = self._start(token, action)
@@ -705,15 +617,9 @@ class NemotronStreamingTranscriber(TranscriberBase):
 
     __slots__ = ("_streamer",)
 
-    def __init__(
-        self,
-        model: NemoModel,
-        preprocessor: object,
-        torch: ModuleType,
-        frame_ms: float | None = None,
-    ) -> None:
+    def __init__(self, model: NemoModel, preprocessor: object, torch: ModuleType) -> None:
         super().__init__()
-        self._streamer: _Streamer | None = _Streamer(model, preprocessor, torch, frame_ms)
+        self._streamer: _Streamer | None = _Streamer(model, preprocessor, torch)
 
     @classmethod
     def load(
@@ -745,20 +651,13 @@ class NemotronStreamingTranscriber(TranscriberBase):
             model.encoder.set_default_att_context_size(list(ATT_CONTEXT))
             model.encoder.setup_streaming_params()
             preprocessor = _streaming_preprocessor(model)
-            frame_ms = _frame_ms(model)
-            transcriber = cls(model, preprocessor, library.torch, frame_ms)
+            transcriber = cls(model, preprocessor, library.torch)
         except _LOAD_ERRORS as exc:
             raise SpeechEngineError(
                 f"{ENGINE_ID}: loading {path} failed ({type(exc).__name__})"
             ) from exc
         logger.info("%s loaded on %s, streaming %d ms chunks", ENGINE_ID, device, CHUNK_MS)
         log_scores_absent(logger, ENGINE_ID)
-        if frame_ms is None:
-            logger.warning(
-                "%s: the preprocessor config gives no positive window_stride, so its transcripts "
-                "carry no word timings",
-                ENGINE_ID,
-            )
         return transcriber
 
     def open_stream(self) -> NemotronStream:

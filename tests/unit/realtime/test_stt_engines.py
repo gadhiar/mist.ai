@@ -36,12 +36,7 @@ from backend.realtime.engines.nemotron_stt import (
 from backend.realtime.engines.parakeet_stt import OnnxAsrLibrary, ParakeetTranscriber
 from backend.realtime.errors import RealtimeError, SpeechEngineError
 from backend.realtime.lanes import LaneJobCancelled
-from backend.realtime.speech import (
-    CancelToken,
-    StreamingTranscriber,
-    TranscriptUpdate,
-    WordTiming,
-)
+from backend.realtime.speech import CancelToken, StreamingTranscriber, TranscriptUpdate
 from scripts.model_bench.speech.probes import stt_engines as probe
 
 RATE = 16000
@@ -167,11 +162,8 @@ class FakeNemoModel:
         self.words = tuple(words)
         self.replies = replies
         self.encoder = FakeEncoder()
-        # `window_stride` is the 10 ms hop `FakePreprocessor` frames at, in seconds.
         self._cfg = SimpleNamespace(
-            preprocessor=SimpleNamespace(
-                dither=1e-5, pad_to=16, sample_rate=RATE, window_stride=HOP / RATE
-            )
+            preprocessor=SimpleNamespace(dither=1e-5, pad_to=16, sample_rate=RATE)
         )
         self.preprocessor_cfgs: list[SimpleNamespace] = []
         self.feature_lengths: list[int] = []
@@ -332,71 +324,29 @@ class FakeOrtFail(Exception):  # noqa: N818
     """Stands in for onnxruntime's pybind errors, which derive from `Exception` alone."""
 
 
-@dataclass
-class FakeTimestampedResult:
-    """onnx-asr's `TimestampedResult`: the text, each token's start in seconds, the tokens.
-
-    Tokens are as the library returns them, its vocabulary's "▁" already read as a space.
-    """
-
-    text: str
-    timestamps: list[float] | None = None
-    tokens: list[str] | None = None
-    logprobs: list[float] | None = None
-
-
-def timed(text: str, step_s: float = 0.2) -> FakeTimestampedResult:
-    """A result whose tokens are the text's words, each led by a space, `step_s` apart."""
-    words = text.split()
-    return FakeTimestampedResult(
-        text,
-        [round(index * step_s, 2) for index in range(len(words))],
-        [f" {word}" for word in words],
-    )
-
-
 class FakeParakeetModel:
-    """onnx-asr's timestamped adapter: one word of `words` per 200 ms of audio, or replies.
+    """onnx-asr's text adapter, as `load_model` returns it: the decode is a plain string.
 
-    A reply is a result, or a text whose words become its tokens 200 ms apart.
+    One word of `words` per 200 ms of audio, padded with spaces the adapter strips, or scripted
+    replies. It has only `recognize`, so a load that asks it for another adapter fails.
     """
 
-    def __init__(
-        self, words=WORDS, replies: list[str | FakeTimestampedResult] | None = None
-    ) -> None:
+    def __init__(self, words=WORDS, replies: list[str] | None = None) -> None:
         self.words = tuple(words)
         self.replies = replies
         self.calls: list[tuple[np.ndarray, dict]] = []
         self.fail: BaseException | None = None
         self.on_recognize: Callable[[], object] | None = None
 
-    def recognize(self, waveform, **kwargs) -> FakeTimestampedResult:
+    def recognize(self, waveform, **kwargs) -> str:
         self.calls.append((np.array(waveform, copy=True), kwargs))
         if self.on_recognize is not None:
             self.on_recognize()
         if self.fail is not None:
             raise self.fail
         if self.replies is not None:
-            reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
-            return timed(reply) if isinstance(reply, str) else reply
-        return timed(" ".join(self.words[: len(waveform) * 5 // RATE]))
-
-
-class FakeTextModel:
-    """onnx-asr's text adapter, which `load_model` returns: only `with_timestamps` is called."""
-
-    def __init__(self, library: "FakeOnnxAsrLibrary", timestamped: FakeParakeetModel) -> None:
-        self._library = library
-        self._timestamped: FakeParakeetModel | None = timestamped
-
-    def with_timestamps(self) -> FakeParakeetModel:
-        self._library.timestamp_calls += 1
-        model, self._timestamped = self._timestamped, None
-        assert model is not None
-        return model
-
-    def recognize(self, waveform, **kwargs):
-        raise AssertionError("the text adapter was called; only timestamped results carry words")
+            return self.replies[min(len(self.calls), len(self.replies)) - 1]
+        return " " + " ".join(self.words[: len(waveform) * 5 // RATE]) + " "
 
 
 @dataclass
@@ -406,16 +356,15 @@ class FakeOnnxAsrLibrary:
     calls: list[tuple[tuple, dict]] = field(default_factory=list)
     fail_load: BaseException | None = None
     models: list[FakeParakeetModel] = field(default_factory=list)
-    timestamp_calls: int = 0
 
-    def load_model(self, *args, **kwargs) -> FakeTextModel:
+    def load_model(self, *args, **kwargs) -> FakeParakeetModel:
         self.calls.append((args, kwargs))
         if self.fail_load is not None:
             raise self.fail_load
         model, self.model = self.model, None
         assert model is not None
         self.models.append(model)
-        return FakeTextModel(self, model)
+        return model
 
     def __call__(self) -> OnnxAsrLibrary:
         self.loads += 1
@@ -535,20 +484,6 @@ class TestShared:
         assert final.text
         assert final.stable_chars == len(final.text)
         assert final.audio_ms == 600
-
-    def test_partials_and_finals_carry_words_that_join_to_their_text(self, env):
-        stream = env.load().open_stream()
-        updates = []
-        for _ in range(4):
-            push_frames(stream, tone(0.5))
-            updates.append(stream.decode_partial(CancelToken()))
-        updates.append(stream.decode_final(CancelToken()))
-
-        for update in updates:
-            assert update.words is not None
-            assert " ".join(word.text for word in update.words) == " ".join(update.text.split())
-            assert all(word.start_ms <= word.end_ms <= update.audio_ms for word in update.words)
-        assert updates[-1].words
 
     def test_whisper_scores_are_none_with_one_info_line_at_load(self, env, caplog):
         caplog.set_level(logging.DEBUG)
@@ -981,128 +916,6 @@ class TestNemotronStreaming:
         assert env.model.steps[count].cache == 0.0
 
 
-def W(text: str, start_ms: int, end_ms: int) -> WordTiming:  # noqa: N802
-    return WordTiming(text, start_ms, end_ms)
-
-
-class TestNemotronWordTimings:
-    """The fake's steps cover feature frames [0, 9), then 16 at a time: 0-90 ms, 90-250 ms,
-    250-410 ms, 410-570 ms, at the config's 10 ms `window_stride`.
-    """
-
-    def test_each_word_spans_the_step_that_emitted_it(self, tmp_path):
-        env = make_nemotron(tmp_path)
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.5))
-
-        update = stream.decode_partial(CancelToken())
-
-        assert len(env.model.steps) == 3
-        assert update.words == (W("please", 0, 90), W("zebra", 90, 250), W("quartz", 250, 410))
-
-    def test_a_changed_word_keeps_its_first_step_and_ends_at_the_last_step_that_changed_it(
-        self, tmp_path
-    ):
-        replies = ["Mi", "Mist,", "Mist, what", "Mist, what's"]
-        env = make_nemotron(tmp_path, FakeNemoModel(replies=replies))
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.7))
-
-        update = stream.decode_partial(CancelToken())
-
-        assert len(env.model.steps) == 4
-        assert update.text == "Mist, what's"
-        assert update.words == (W("Mist,", 0, 250), W("what's", 250, 570))
-
-    def test_a_word_no_later_step_changed_keeps_its_span_across_partials(self, tmp_path):
-        replies = ["mist", "mist", "mist", "mist stop"]
-        env = make_nemotron(tmp_path, FakeNemoModel(replies=replies))
-        stream = env.load().open_stream()
-
-        push_frames(stream, tone(0.5))
-        first = stream.decode_partial(CancelToken())
-        push_frames(stream, tone(0.2))
-        second = stream.decode_partial(CancelToken())
-
-        assert first.words == (W("mist", 0, 90),)
-        assert second.words == (W("mist", 0, 90), W("stop", 410, 570))
-
-    def test_a_word_a_step_drops_is_dropped(self, tmp_path):
-        replies = ["miss it", "mist"]
-        env = make_nemotron(tmp_path, FakeNemoModel(replies=replies))
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.34))
-
-        update = stream.decode_partial(CancelToken())
-
-        assert len(env.model.steps) == 2
-        assert update.words == (W("mist", 0, 250),)
-
-    def test_the_final_stamps_its_flush_on_a_copy_and_the_live_stream_keeps_its_own(self, tmp_path):
-        env = make_nemotron(tmp_path)
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.5))
-        stream.decode_partial(CancelToken())
-
-        final = stream.decode_final(CancelToken())
-        push_frames(stream, tone(0.5))
-        resumed = stream.decode_partial(CancelToken())
-
-        # The flush's last step covers frames 41 to 50, the audio's end, and yields every word.
-        head = (W("please", 0, 90), W("zebra", 90, 250), W("quartz", 250, 410))
-        assert final.words == head + tuple(W(word, 410, 500) for word in WORDS[3:])
-        assert resumed.words == head + (
-            W("turn", 410, 570),
-            W("the", 570, 730),
-            W("lights", 730, 890),
-        )
-
-    def test_a_final_shorter_than_a_chunk_spans_its_one_flush_step(self, tmp_path):
-        env = make_nemotron(tmp_path, FakeNemoModel(replies=["mist"]))
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.1))
-
-        final = stream.decode_final(CancelToken())
-
-        assert final.words == (W("mist", 0, 90),)
-
-    def test_no_audio_gives_no_words(self, tmp_path):
-        env = make_nemotron(tmp_path)
-        stream = env.load().open_stream()
-
-        assert stream.decode_partial(CancelToken()).words == ()
-        assert stream.decode_final(CancelToken()).words == ()
-
-    def test_a_config_without_window_stride_gives_no_words_and_one_line_at_load(
-        self, tmp_path, caplog
-    ):
-        caplog.set_level(logging.DEBUG)
-        model = FakeNemoModel()
-        del model._cfg.preprocessor.window_stride
-        env = make_nemotron(tmp_path, model)
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.5))
-
-        updates = [stream.decode_partial(CancelToken()), stream.decode_final(CancelToken())]
-
-        assert [update.words for update in updates] == [None, None]
-        assert updates[0].text == "please zebra quartz"
-        lines = [r for r in caplog.records if "window_stride" in r.getMessage()]
-        assert len(lines) == 1
-        assert lines[0].levelno == logging.WARNING
-        assert lines[0].name == nemotron_stt.__name__
-
-    @pytest.mark.parametrize("stride", [0, -0.01, "10ms", None])
-    def test_a_window_stride_that_is_not_a_positive_number_counts_as_absent(self, tmp_path, stride):
-        model = FakeNemoModel()
-        model._cfg.preprocessor.window_stride = stride
-        env = make_nemotron(tmp_path, model)
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.5))
-
-        assert stream.decode_partial(CancelToken()).words is None
-
-
 # ---------------------------------------------------------------------------
 # Parakeet
 # ---------------------------------------------------------------------------
@@ -1123,16 +936,6 @@ class TestParakeetLoad:
         assert set(kwargs) == {"path", "providers", "sess_options"}
         assert transcriber.engine_id == "parakeet-cpu"
         assert transcriber.model_id == "nemo-parakeet-tdt-0.6b-v2"
-
-    def test_load_wraps_the_model_with_timestamps_and_decodes_on_that(self, tmp_path):
-        env = make_parakeet(tmp_path)
-
-        stream = env.load().open_stream()
-        push_frames(stream, tone(0.4))
-        stream.decode_partial(CancelToken())
-
-        assert env.library.timestamp_calls == 1
-        assert len(env.model.calls) == 1
 
     def test_the_weights_are_where_the_probe_reads_them(self, tmp_path):
         env = make_parakeet(tmp_path)
@@ -1212,6 +1015,17 @@ class TestParakeetDecoding:
         assert stream.decode_final(CancelToken()).text == ""
         assert env.model.calls == []
 
+    def test_the_text_is_the_librarys_string_stripped(self, tmp_path):
+        env = make_parakeet(tmp_path, FakeParakeetModel(replies=["  Mist, what's the time?  "]))
+        stream = env.load().open_stream()
+        push_frames(stream, tone(1.0))
+
+        partial = stream.decode_partial(CancelToken())
+        final = stream.decode_final(CancelToken())
+
+        assert (partial.text, final.text) == ("Mist, what's the time?",) * 2
+        assert final.stable_chars == len("Mist, what's the time?")
+
     def test_onnxruntime_errors_become_speech_engine_errors(self, tmp_path):
         env = make_parakeet(tmp_path)
         stream = env.load().open_stream()
@@ -1233,106 +1047,3 @@ class TestParakeetDecoding:
         stream.decode_partial(CancelToken())
 
         assert np.array_equal(env.model.calls[0][0], tone(0.4))
-
-
-def decode_reply(
-    tmp_path: Path, reply: FakeTimestampedResult, seconds: float = 1.5
-) -> tuple[TranscriptUpdate, TranscriptUpdate]:
-    """A partial and a final of `seconds` of audio, each answered with `reply`."""
-    env = make_parakeet(tmp_path, FakeParakeetModel(replies=[reply]))
-    stream = env.load().open_stream()
-    push_frames(stream, tone(seconds))
-    return stream.decode_partial(CancelToken()), stream.decode_final(CancelToken())
-
-
-class TestParakeetWordTimings:
-    """A word starts at its first character's token and ends where the next word starts."""
-
-    def test_punctuation_tokens_join_their_word_and_the_last_word_ends_with_the_audio(
-        self, tmp_path
-    ):
-        reply = FakeTimestampedResult(
-            "Mist, what's the time?",
-            [0.24, 0.48, 0.64, 0.8, 0.96, 1.12, 1.36],
-            [" Mist", ",", " what", "'s", " the", " time", "?"],
-        )
-
-        partial, final = decode_reply(tmp_path, reply)
-
-        words = (
-            W("Mist,", 240, 640),
-            W("what's", 640, 960),
-            W("the", 960, 1120),
-            W("time?", 1120, 1500),
-        )
-        assert (partial.text, partial.words) == ("Mist, what's the time?", words)
-        assert (final.text, final.words) == ("Mist, what's the time?", words)
-
-    def test_the_librarys_spacing_rule_drops_a_space_before_punctuation(self, tmp_path):
-        # onnx-asr's `DECODE_SPACE_PATTERN` removes a leading space and a space before a
-        # non-word character, and keeps one before a word.
-        reply = FakeTimestampedResult(
-            "Mist, hi.", [0.08, 0.24, 0.32, 0.56, 0.72], [" Mist", " ", ",", " hi", " ."]
-        )
-
-        partial, _ = decode_reply(tmp_path, reply, seconds=1.0)
-
-        assert partial.words == (W("Mist,", 80, 560), W("hi.", 560, 1000))
-
-    @pytest.mark.parametrize("space", [" ", "▁"], ids=["read", "raw"])
-    def test_a_lone_space_token_separates_two_words(self, tmp_path, space):
-        reply = FakeTimestampedResult(
-            "mist stop", [0.16, 0.4, 0.48, 0.56], [f"{space}mi", "st", space, "stop"]
-        )
-
-        partial, final = decode_reply(tmp_path, reply, seconds=1.0)
-
-        assert partial.words == final.words == (W("mist", 160, 560), W("stop", 560, 1000))
-
-    def test_a_word_split_across_tokens_starts_at_its_first(self, tmp_path):
-        reply = FakeTimestampedResult(
-            "missed the bus", [0.08, 0.16, 0.4, 0.64], [" mi", "ssed", " the", " bus"]
-        )
-
-        partial, _ = decode_reply(tmp_path, reply, seconds=1.0)
-
-        assert partial.words == (W("missed", 80, 400), W("the", 400, 640), W("bus", 640, 1000))
-
-    def test_the_text_stays_the_librarys_text_stripped(self, tmp_path):
-        reply = FakeTimestampedResult("  mist  ", [0.08], [" mist"])
-
-        partial, final = decode_reply(tmp_path, reply, seconds=0.5)
-
-        assert (partial.text, final.text) == ("mist", "mist")
-        assert partial.words == (W("mist", 80, 500),)
-
-    @pytest.mark.parametrize(
-        "reply",
-        [
-            FakeTimestampedResult("mist stop", [0.08], [" missed"]),
-            FakeTimestampedResult("mist stop", [0.08, 0.4], [" mist", "stop"]),
-            FakeTimestampedResult("mist stop", None, [" mist", " stop"]),
-            FakeTimestampedResult("mist stop", [0.08, 0.4], None),
-            FakeTimestampedResult("mist stop", [0.08], [" mist", " stop"]),
-            FakeTimestampedResult("mist stop", [0.4, 0.08], [" mist", " stop"]),
-        ],
-        ids=["other-text", "joined", "no-timestamps", "no-tokens", "short", "backwards"],
-    )
-    def test_tokens_that_do_not_give_the_text_give_no_words(self, tmp_path, reply):
-        partial, final = decode_reply(tmp_path, reply, seconds=1.0)
-
-        assert (partial.text, partial.words) == ("mist stop", None)
-        assert (final.text, final.words) == ("mist stop", None)
-
-    def test_no_audio_gives_no_words(self, tmp_path):
-        env = make_parakeet(tmp_path)
-        stream = env.load().open_stream()
-
-        assert stream.decode_partial(CancelToken()).words == ()
-        assert stream.decode_final(CancelToken()).words == ()
-
-    def test_a_result_with_no_tokens_is_empty_with_no_words(self, tmp_path):
-        partial, final = decode_reply(tmp_path, FakeTimestampedResult("", [], []), seconds=0.4)
-
-        assert (partial.text, partial.words) == ("", ())
-        assert (final.text, final.words) == ("", ())
