@@ -48,6 +48,8 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
     - `mine.py` - Mines the spotter's hits into training windows: real, synthetic and ambient
     - `build.py` - Builds the dataset index from the mined windows, behind the leakage guard
     - `model.py` - The verifier's network: WavLM Base+ with its last four layers and a head fine-tuned
+    - `store.py` - The trainer's window store: each public window decoded once into one file keyed by the index's sha256; recordings are read into memory, never written
+    - `augment.py` - The training augmentation (gain, room response, band limit, noise, AGC), applied to whole batches on the training device
     - `train.py` - Trains the verifier on the dataset index, one cross-validation fold or the final model
     - `export.py` - Exports a trained run to ONNX, checks it against torch, and times it in ONNX Runtime
     - `calibrate.py` - Calibrates the threshold table on the AMI calibration share and writes the verifier's manifest
