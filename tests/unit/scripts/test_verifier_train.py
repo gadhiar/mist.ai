@@ -981,6 +981,30 @@ def test_the_read_ahead_timed_is_the_device_epochs() -> None:
     assert train.DeviceEpoch.ahead(torch.device("cpu")) == 0
 
 
+def test_the_cold_read_times_the_cold_pass_alone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clock = _FakeClock()
+
+    def loader(data: train.EpochBatches, workers: int, pin: bool) -> Iterator[object]:
+        for _ in range(len(data)):
+            clock.now += 1.0
+            yield types.SimpleNamespace(labels=[0.0] * 4)
+
+    monkeypatch.setattr(train, "epoch_loader", loader)
+    monkeypatch.setattr(train, "_drop_cache", lambda directory: None)
+    plan = [[train.Item(0, 0, 39, 0)] * 4 for _ in range(20)]
+    data = train.EpochBatches(plan, [0.0], types.SimpleNamespace(), augment.Augment())
+    rate = train._cold_read(data, types.SimpleNamespace(directory=None), 2, False, 5.0, clock)
+    assert rate == pytest.approx(4.0)
+    line = capsys.readouterr().out.strip()
+    assert line == (
+        "store cold read: 20 examples through 2 loader workers, 4.0 examples/s; "
+        "warm 4.0 examples/s; page cache dropped, but the cold pass was not slower than the "
+        "warm one"
+    )
+
+
 class _Plan:
     """An `EpochBatches` stand-in: its plan, and its batch at an index is the index."""
 
