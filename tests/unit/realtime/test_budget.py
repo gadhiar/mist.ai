@@ -304,7 +304,6 @@ CONFIG_DEFAULTS = [
             "reference_tolerance_ms": 400,
             "endpoint_min_backlog_ms": 1500,
             "followup_window_ms": 0,
-            "attend_cue": True,
         },
         id="wake",
     ),
@@ -532,7 +531,6 @@ VARIABLES = [
     ("MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS", "500", "wake.reference_tolerance_ms", 500),
     ("MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS", "2000", "wake.endpoint_min_backlog_ms", 2000),
     ("MIST_VOICE_FOLLOWUP_WINDOW_MS", "4000", "wake.followup_window_ms", 4000),
-    ("MIST_VOICE_WAKE_ATTEND_CUE", "false", "wake.attend_cue", False),
     ("MIST_VOICE_KWS_MODEL", "mist-wake-2", "placement.kws_model", "mist-wake-2"),
     ("MIST_VOICE_KWS_THREADS", "2", "placement.kws_threads", 2),
     ("MIST_VOICE_VERIFY_MODEL", " mist-verify-1 ", "placement.verify_model", "mist-verify-1"),
@@ -609,7 +607,6 @@ class TestLoadVoiceSettingsVariables:
             "MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS",
             "MIST_VOICE_WAKE_ENDPOINT_MIN_BACKLOG_MS",
             "MIST_VOICE_FOLLOWUP_WINDOW_MS",
-            "MIST_VOICE_WAKE_ATTEND_CUE",
             "MIST_VOICE_KWS_MODEL",
             "MIST_VOICE_KWS_THREADS",
             "MIST_VOICE_VERIFY_MODEL",
@@ -669,7 +666,9 @@ class TestRetiredWakeVariables:
     """The transcript wake gate's variables: not read, not refused, named in one INFO line.
 
     Not refused, unlike the per-slot variables: those name an engine slot the operator expects
-    to work, while these name a decision the acoustic verifier now makes.
+    to work, while these name a decision the acoustic verifier now makes. The attend cue is one
+    of them: the controller sends no `attend` at a hit, and an accepted wake's cue is the
+    `listen` it sends at acceptance, so the variable has nothing left to switch.
     """
 
     RETIRED = (
@@ -677,15 +676,41 @@ class TestRetiredWakeVariables:
         "MIST_VOICE_WAKE_GATE_TAIL_MS",
         "MIST_VOICE_WAKE_ALIAS_WINDOW_MS",
         "MIST_VOICE_WAKE_TRAILING_SPEECH_MS",
+        "MIST_VOICE_WAKE_ATTEND_CUE",
     )
+
+    # Values each old parser refused, so a read of any of them would raise.
+    REFUSED_VALUES = {
+        "MIST_VOICE_WAKE_PHRASES_FILE": "relative.json",
+        "MIST_VOICE_WAKE_GATE_TAIL_MS": "0",
+        "MIST_VOICE_WAKE_ALIAS_WINDOW_MS": "0",
+        "MIST_VOICE_WAKE_TRAILING_SPEECH_MS": "0",
+        "MIST_VOICE_WAKE_ATTEND_CUE": "sometimes",
+    }
 
     @staticmethod
     def _logged(caplog) -> list[logging.LogRecord]:
         return [record for record in caplog.records if record.name == budget_module.__name__]
 
+    @pytest.mark.parametrize("raw", ["true", "false"])
+    def test_a_set_cue_variable_changes_no_setting(self, raw):
+        assert load_voice_settings({"MIST_VOICE_WAKE_ATTEND_CUE": raw}) == load_voice_settings({})
+
+    def test_the_wake_settings_have_no_cue_field(self):
+        assert [field.name for field in dataclasses.fields(WakeConfig)] == [
+            "names",
+            "kws_threshold",
+            "endpoint_threshold",
+            "lookback_ms",
+            "join_gap_ms",
+            "reference_tolerance_ms",
+            "endpoint_min_backlog_ms",
+            "followup_window_ms",
+        ]
+
     def test_each_one_set_is_named_in_one_info_line_and_changes_no_setting(self, caplog):
-        # Values each old parser refused, so a read of any of them would raise.
-        environ = {name: "0" if name.endswith("_MS") else "relative.json" for name in self.RETIRED}
+        environ = dict(self.REFUSED_VALUES)
+        assert set(environ) == set(self.RETIRED)
 
         with caplog.at_level(logging.INFO, logger=budget_module.__name__):
             settings = load_voice_settings(environ)

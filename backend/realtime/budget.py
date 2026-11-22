@@ -439,8 +439,7 @@ class WakeConfig:
     reference may lead the hit's window by `reference_tolerance_ms`. An endpoint wake with less
     than `endpoint_min_backlog_ms` of audio before it is rejected. Whether a candidate was said
     to her is the acoustic verifier's decision; no setting here reads its transcript.
-    `followup_window_ms` above 0 keeps listening without the name after a turn; `attend_cue`
-    sends `attend` at a hit, before the verdict.
+    `followup_window_ms` above 0 keeps listening without the name after a turn.
     """
 
     names: tuple[str, ...] = ("mist",)
@@ -451,7 +450,6 @@ class WakeConfig:
     reference_tolerance_ms: int = 400
     endpoint_min_backlog_ms: int = 1500
     followup_window_ms: int = 0
-    attend_cue: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -723,7 +721,6 @@ def _wake_config(env: _Env) -> WakeConfig:
         followup_window_ms=env.integer(
             "MIST_VOICE_FOLLOWUP_WINDOW_MS", defaults.followup_window_ms
         ),
-        attend_cue=env.boolean("MIST_VOICE_WAKE_ATTEND_CUE", defaults.attend_cue),
     )
 
 
@@ -762,9 +759,11 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     The variables the transcript wake gate read (`MIST_VOICE_WAKE_PHRASES_FILE`,
     `MIST_VOICE_WAKE_GATE_TAIL_MS`, `MIST_VOICE_WAKE_ALIAS_WINDOW_MS` and
     `MIST_VOICE_WAKE_TRAILING_SPEECH_MS`) are not read either, so an old `.env` still starts;
-    one INFO line names each that is set. Unlike the per-slot variables they are not refused:
-    those name an engine slot the operator expects to work, while these name a decision the
-    acoustic verifier now makes.
+    one INFO line names each that is set. Nor is `MIST_VOICE_WAKE_ATTEND_CUE`: the controller
+    sends no `attend` at a hit, and an accepted wake's cue is the `listen` it sends at
+    acceptance, so there is nothing left to switch. Unlike the per-slot variables these are not
+    refused: those name an engine slot the operator expects to work, while these name a decision
+    the acoustic verifier now makes.
 
     `MIST_VOICE_CHARACTER` (default true) runs every spoken reply through the character stage, a
     `CharacterConfig` with every field at its default except `double_gain`; false turns off the
@@ -784,6 +783,7 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         "MIST_VOICE_WAKE_GATE_TAIL_MS",
         "MIST_VOICE_WAKE_ALIAS_WINDOW_MS",
         "MIST_VOICE_WAKE_TRAILING_SPEECH_MS",
+        "MIST_VOICE_WAKE_ATTEND_CUE",
     )
     retired_set = [name for name in retired if name in environ]
     if retired_set:
