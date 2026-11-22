@@ -157,6 +157,16 @@ def write_dataset(directory: Path, windows: list[dataset.Window], training: str,
     (directory / dataset.PROVENANCE_FILE).write_text(json.dumps(provenance), encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _no_free_margin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build every store with no spare space required beyond the store itself.
+
+    The stores here hold a few windows, but `store.FREE_MARGIN` asks for 1 GiB more, which a
+    small temporary directory (a 1 GiB tmpfs at `/tmp`) does not have.
+    """
+    monkeypatch.setattr(store, "FREE_MARGIN", 0)
+
+
 @pytest.fixture
 def world(tmp_path: Path) -> World:
     recordings = tmp_path / "recordings"
