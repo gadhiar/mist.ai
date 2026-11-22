@@ -15,16 +15,18 @@ from collections.abc import Sequence
 import numpy as np
 import pytest
 import torch
-from scipy.signal import butter
+from scipy.signal import butter, sosfilt
 from scipy.stats import ks_2samp
 
 from scripts.wake.verifier.augment import (
+    TAIL_BOUND,
     Augment,
     BatchDraws,
     Draws,
     augment_batch,
     batch_draws,
     draw,
+    lowpass_tail,
 )
 from scripts.wake.verifier.dataset import FRAME_SAMPLES, SAMPLE_RATE
 
@@ -92,6 +94,15 @@ def room(taps: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     tail = 0.1 * rng.normal(0.0, 1.0, taps) * np.exp(-np.arange(taps) / (taps / 8))
     tail[0] = 1.0
+    return (tail / np.max(np.abs(tail))).astype(np.float32)
+
+
+def reverberant(rt60: float, seed: int) -> np.ndarray:
+    """A room response of `rt60` seconds, noise decaying 60 dB over it, peak-normalised."""
+    rng = np.random.default_rng(seed)
+    taps = int(rt60 * SAMPLE_RATE)
+    tail = rng.normal(0.0, 1.0, taps) * 10 ** (-3 * np.arange(taps) / taps)
+    tail[0] = np.max(np.abs(tail))
     return (tail / np.max(np.abs(tail))).astype(np.float32)
 
 
@@ -195,6 +206,52 @@ def test_matches_the_oracle_step_by_step_with_noise_off(frames: int) -> None:
         expected = oracle_fixed(inputs[row], gain, responses[row], cutoff, agc, settings)
         error = float(np.max(np.abs(out[row].numpy() - expected)))
         assert error < PARITY, f"{name}: max abs {error:.3g}"
+
+
+@pytest.mark.parametrize("cutoff", [3000.0, 7500.0])
+@pytest.mark.parametrize("frames", [40, 60])
+def test_a_long_room_with_a_low_pass_matches_the_oracle(frames: int, cutoff: float) -> None:
+    """The room-convolved signal is 2L - 1 samples; the low-pass's ringing must not wrap into it.
+
+    At 40 and 60 frames twice the window is already a fast FFT length, so with no room past
+    2L the ringing wraps into the first samples kept. A 3 s room keeps the convolution loud up
+    to 2L, and white noise scaled to an output peak of 0.85 keeps it loud to the window's end
+    without clipping. Both ends of the default cutoff range are checked: the top one rings
+    longest.
+    """
+    settings = Augment()
+    length = frames * FRAME_SAMPLES
+    response = reverberant(3.0, seed=frames)
+    carrier = np.random.default_rng(frames).normal(0.0, 1.0, length)
+    probe = oracle_fixed(
+        np.round(100 * carrier).astype(np.int16), 0.0, response, cutoff, False, settings
+    )
+    level = 100 * 0.85 / float(np.max(np.abs(probe)))
+    samples = np.round(level * carrier).astype(np.int16)
+    bank = response[None, :length].copy()
+    out = augment_batch(
+        torch.from_numpy(samples[None]),
+        batch_draws([Draws(0.0, 0, cutoff, None, False, 0)]),
+        torch.from_numpy(bank),
+        settings,
+    )
+    expected = oracle_fixed(samples, 0.0, response, cutoff, False, settings)
+    assert np.max(np.abs(expected)) < CLIP_HIGH, "the case must not clip, or the clip hides it"
+    error = float(np.max(np.abs(out[0].numpy() - expected)))
+    assert error < PARITY, f"max abs {error:.3g}"
+
+
+def test_the_low_pass_tail_bounds_every_cutoff_the_settings_draw() -> None:
+    low, high = Augment().lowpass_hz
+    tail = lowpass_tail(low, high)
+    impulse = np.zeros(8 * tail)
+    impulse[0] = 1.0
+    longest = 0.0
+    for cutoff in [low, high, *np.random.default_rng(5).uniform(low, high, 200)]:
+        response = sosfilt(butter(6, cutoff, fs=SAMPLE_RATE, output="sos"), impulse)
+        assert np.abs(response[tail:]).sum() < TAIL_BOUND, cutoff
+        longest = max(longest, np.abs(response[tail - 8 :]).sum())
+    assert longest >= TAIL_BOUND, "the tail is not tight: eight samples fewer would do"
 
 
 def test_a_batch_without_responses_still_runs() -> None:
