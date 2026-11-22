@@ -134,6 +134,16 @@ def _window(ref: dataset.FileRef, start: int, end: int, kind: str, group: str, i
     return dataset.Window(ref, start, end, label, kind, group, (0.5,), tuple(inputs))
 
 
+@pytest.fixture(autouse=True)
+def no_free_margin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No margin beyond the store itself, so the tests pass on a small temporary directory.
+
+    The free-space check reads the real disk, and the 1 GiB margin would refuse every build in
+    a temporary directory with less than that free. The tests of the check set their own.
+    """
+    monkeypatch.setattr(store, "FREE_MARGIN", 0)
+
+
 @pytest.fixture
 def world(tmp_path: Path) -> World:
     recordings = tmp_path / "recordings"
@@ -433,6 +443,7 @@ class TestInvalidation:
             held = sum(item.stat().st_size for item in world.stores.rglob("*") if item.is_file())
             return usage(1 << 40, held, needed + store.FREE_MARGIN - held)
 
+        monkeypatch.setattr(store, "FREE_MARGIN", 1 << 20)
         monkeypatch.setattr(shutil, "disk_usage", disk_usage)
         reader = world.counting()
         world.open(reader)
@@ -568,6 +579,9 @@ class TestHolders:
         assert not _held(directory)
 
     def test_a_store_another_process_holds_blocks_its_sweep_and_rebuild(self, world: World) -> None:
+        # Built here, so the child only reuses it: the margin this module patches to 0 is 1 GiB
+        # again in a spawned process, which a small temporary directory could not spare.
+        world.open().close()
         context = multiprocessing.get_context("spawn")
         ready, release = context.Event(), context.Event()
         child = context.Process(
@@ -584,7 +598,11 @@ class TestHolders:
         )
         child.start()
         try:
-            assert ready.wait(120)
+            for _ in range(240):
+                if ready.wait(0.5):
+                    break
+                assert child.is_alive(), "the process holding the store exited before it said so"
+            assert ready.is_set()
             world.open(key="a" * 64).close()
             assert _names(world) == {".lock", "a" * 64, world.key()}
             with pytest.raises(store.StoreError, match="in use"):
@@ -653,18 +671,21 @@ class TestBuild:
         world.open(progress=lines.append, clock=lambda: 0.0, interval=60.0)
         assert len(lines) == 1
 
-    def test_too_little_free_space_is_refused(self, world: World, monkeypatch) -> None:
-        usage = collections.namedtuple("usage", "total used free")
-        monkeypatch.setattr(
-            shutil, "disk_usage", lambda path: usage(1 << 30, (1 << 30) - 4096, 4096)
-        )
+    @pytest.mark.parametrize("short", [1, 1 << 20])
+    def test_too_little_free_space_is_refused(self, world: World, monkeypatch, short: int) -> None:
+        margin = 1 << 20
+        monkeypatch.setattr(store, "FREE_MARGIN", margin)
         public_bytes = sum(2 * _length(world.windows[index]) for index in _public(world))
         response_bytes = 4 * sum(min(ref.samples, store.MAX_RESPONSE) for ref in world.responses)
+        needed = public_bytes + response_bytes
+        free = needed + margin - short
+        usage = collections.namedtuple("usage", "total used free")
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(1 << 40, 1 << 39, free))
         with pytest.raises(store.StoreError) as raised:
             world.open()
         message = str(raised.value)
-        assert str(public_bytes + response_bytes) in message
-        assert "4096" in message
+        assert f"needs {needed} bytes and {margin} more" in message
+        assert f"but {free} bytes are free" in message
         assert [path.name for path in world.stores.iterdir()] == [".lock"]
 
     def test_a_reader_error_propagates_and_leaves_no_partial(self, world: World) -> None:
