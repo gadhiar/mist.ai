@@ -1042,8 +1042,9 @@ class VoiceDecisionWakeRejected(_WireModel):
     """A name was heard but the addressee gate rejected it; the one trace such speech leaves.
 
     `turn_id` is the turn in flight when the name was heard, else null. `self_speech`: MIST said
-    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the
-    transcript does not address her. `no_backlog`: an endpoint `wake` carried less pre-wake
+    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the acoustic
+    wake verifier rejected the hit: its score fell below the threshold at the spotter's cutoff,
+    or there was no score or no verifier. `no_backlog`: an endpoint `wake` carried less pre-wake
     audio than the server's minimum. A name that loses cross-session arbitration is not
     rejected: it gets `wake_lost`.
     """

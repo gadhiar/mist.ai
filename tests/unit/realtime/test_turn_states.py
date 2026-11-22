@@ -18,6 +18,10 @@ of its audio queued supersedes the turn instead of barging in. T55d keeps a supe
 dispatched no tool and joins its request text to the next turn's, or records it alone where the
 superseding utterance starts no turn.
 
+T74 (v18) decides every wake by the acoustic verifier's score (`WakeVerified`) at the spotter's
+cutoff, fails closed with no verifier, and moves the wake cue from the hit to acceptance (A71):
+no `attend` is sent, and a rejected or lost wake sends no state.
+
 Every test drives the controller only through `post` and `close`, with the fakes from
 `turn_fakes.py`. The client-facing record is what the recording transport's sender took.
 """
@@ -26,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import logging
 from dataclasses import dataclass
 
@@ -35,11 +38,10 @@ import pytest_asyncio
 
 from backend.chat.conversation_handler import CapabilityOnlyTurn
 from backend.chat.stream_events import Complete, HandOff, Token
-from backend.realtime.addressee import NameAlignment
 from backend.realtime.budget import BargeInConfig, WakeConfig
 from backend.realtime.protocol import VoiceDecisionWakeLost, WakeLostDetail
 from backend.realtime.scene import Immediate
-from backend.realtime.speech import HeardWord, SpotterCalibration
+from backend.realtime.speech import SpotterCalibration
 from backend.realtime.turn import (
     BargeInReport,
     Close,
@@ -55,6 +57,7 @@ from backend.realtime.turn import (
     WakeArbiter,
     WakeRank,
 )
+from tests.fakes.speech import ScriptedWakeVerifier
 
 from .turn_fakes import (
     Call,
@@ -1167,7 +1170,7 @@ async def test_held_endpoint_wake_rejected_names_no_turn(backlog_ms, reason):
         h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.8))
         await h.settle()
         ((*_, uid),) = calls(h.ingress, "open_utterance")
-        h.post(h.ingress.partial(uid, "I missed the bus", gate=True))
+        h.post(h.ingress.verified(uid, hit_pos=99, score=0.1))
         await h.settle()
 
     (rejected,) = h.outbound.of("voice_decision:wake_rejected")
@@ -1685,7 +1688,8 @@ async def test_reconfigure_in_idle_carrying_a_refusal_is_refused_at_once():
 # the real arbiter does for one session; `solo=False` leaves it waiting for the test's verdict.
 
 HIT = 110
-GATE_THROUGH = HIT + 15  # the hit plus `gate_tail_ms` 300, in 20 ms frames
+ACCEPT = 0.9  # the verifier's score for a name that addresses her; the harness threshold is 0.5
+REJECT = 0.1  # and for one that does not
 
 
 async def name_hit(h: Harness, uid: str | None = None, **heard: object) -> str:
@@ -1700,10 +1704,22 @@ async def name_hit(h: Harness, uid: str | None = None, **heard: object) -> str:
     return str(new[0][3])
 
 
-async def gate(h: Harness, uid: str, text: str) -> None:
-    """Post the candidate's gate partial, the decode the controller requested."""
-    h.post(h.ingress.partial(uid, text, gate=True, through_pos=GATE_THROUGH))
+async def verify(
+    h: Harness, uid: str, text: str | None = None, *, score: float = ACCEPT, hit_pos: int = HIT
+) -> None:
+    """Post the candidate's latest partial, when given, then the verifier's score for its hit.
+
+    The partial is what the client sees first on acceptance; the score alone decides.
+    """
+    if text is not None:
+        h.post(h.ingress.partial(uid, text))
+    h.post(h.ingress.verified(uid, hit_pos=hit_pos, score=score))
     await h.settle()
+
+
+async def unverify(h: Harness, uid: str, *, hit_pos: int = HIT) -> None:
+    """Post a verifier score below the threshold for the candidate's hit."""
+    await verify(h, uid, score=REJECT, hit_pos=hit_pos)
 
 
 def engaged_calls(h: Harness) -> list[bool]:
@@ -1733,13 +1749,14 @@ async def test_name_first_sends_nothing_at_the_hit_then_publishes_in_one_step_an
 
     uid = await name_hit(h)
 
-    # Check a, the candidate from `from_pos`, a claim, check b, the gate partial: no `attend`.
+    # Check a, the candidate from `from_pos`, the verify job, a claim, check b: no `attend`.
     assert h.outbound.names() == []
     assert calls(h.ingress, "open_utterance") == [("open_utterance", "wake", 100, uid)]
     assert [(c.session_id, c.rank.margin) for c in h.arbiter.claims] == [
         ("session-1", pytest.approx(0.4))
     ]
-    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, GATE_THROUGH)]
+    assert calls(h.ingress, "request_verify") == [("request_verify", uid, HIT)]
+    assert calls(h.ingress, "request_gate_partial") == []
     assert h.responder.prefetches == []
     mark = len(h.outbound.client)
     at_wake: list[list[str]] = []
@@ -1747,7 +1764,7 @@ async def test_name_first_sends_nothing_at_the_hit_then_publishes_in_one_step_an
         at_wake.append(h.outbound.names()[mark:]) if call[1] == "wake" else None
     )
 
-    await gate(h, uid, "mist what")
+    await verify(h, uid, "mist what")
 
     assert h.outbound.names()[mark:] == [
         "vad_status:speech_started",
@@ -1771,7 +1788,7 @@ async def test_name_last_with_a_preamble_opens_at_from_pos_and_the_turn_holds_th
     h.start_voice()
 
     uid = await name_hit(h, from_pos=40)
-    await gate(h, uid, "so about tomorrow are you there mist")
+    await verify(h, uid, "so about tomorrow are you there mist")
     h.post(h.ingress.ended(uid, "So about tomorrow... are you there, Mist?"))
     await h.settle()
 
@@ -1788,7 +1805,7 @@ async def test_i_missed_the_bus_is_rejected_with_no_trace_of_its_words_or_its_id
 
     uid = await name_hit(h)
     h.post(h.ingress.partial(uid, "I missed the"))
-    await gate(h, uid, "I missed the bus")
+    await verify(h, uid, "I missed the bus", score=REJECT)
     h.post(h.ingress.ended(uid, "I missed the bus."))
     await h.settle()
 
@@ -1812,110 +1829,194 @@ async def test_i_missed_the_bus_is_rejected_with_no_trace_of_its_words_or_its_id
         assert uid not in dumped
 
 
-# -- The name at the hit (v16 T69): a server wake's gate reads the words heard at its hit -----------
-
-ALIAS_LAST = "what's the time, missed?"
-
-
-def heard_at_hit(hit_pos: int) -> tuple[HeardWord, ...]:
-    """`ALIAS_LAST` timed so that "missed?" ends on the hit, as the spotter hears a name."""
-    return (
-        HeardWord("what's", hit_pos - 30, hit_pos - 21),
-        HeardWord("the", hit_pos - 20, hit_pos - 16),
-        HeardWord("time,", hit_pos - 15, hit_pos - 6),
-        HeardWord("missed?", hit_pos - 5, hit_pos),
-    )
-
-
-def spy_alignments(h: Harness, monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    """Record the alignment the controller passes the gate's `decide`, verdicts unchanged."""
-    gate = h.kwargs["gate"]
-    decide = gate.decide  # type: ignore[attr-defined]
-    seen: list[object] = []
-
-    def recording(**kwargs: object) -> object:
-        seen.append(kwargs.get("alignment"))
-        return decide(**kwargs)
-
-    monkeypatch.setattr(gate, "decide", recording)
-    return seen
+# -- The verifier's verdict (v18 T74): the acoustic score decides every wake ------------------------
 
 
 @pytest.mark.parametrize(
-    ("speech_end_pos", "accepted"),
-    [(HIT, True), (HIT + 5, True), (HIT + 30, False)],
-    ids=["speech-ended-at-the-hit", "100-ms-past", "speech-went-on-600-ms"],
+    ("score", "accepted"),
+    [(0.5, True), (0.49, False), (None, False)],
+    ids=["at-the-threshold", "below-it", "no-score"],
 )
-async def test_a_server_gate_partial_reads_an_alias_at_the_hit_under_the_guard(
-    monkeypatch, speech_end_pos, accepted
-):
+async def test_a_server_hit_is_decided_by_its_verifier_score_at_the_kws_threshold(score, accepted):
     h = make_harness([Pause()])
     h.start_voice()
-    seen = spy_alignments(h, monkeypatch)
     uid = await name_hit(h)
-    words = heard_at_hit(HIT)
 
-    h.post(
-        dataclasses.replace(
-            h.ingress.partial(uid, ALIAS_LAST, gate=True, through_pos=GATE_THROUGH),
-            words=words,
-            speech_end_pos=speech_end_pos,
-        )
-    )
+    # A gate partial, should one come, decides nothing: the text path is no longer reached.
+    h.post(h.ingress.partial(uid, "mist, what's the time", gate=True))
+    await h.settle()
+    assert h.arbiter.settles == []
+    h.post(h.ingress.verified(uid, hit_pos=HIT, score=score))
     await h.settle()
 
-    assert seen == [NameAlignment(HIT, 20, speech_end_pos, words)]
+    assert h.verifier is not None
+    assert set(h.verifier.cutoffs) == {WakeConfig().kws_threshold}
     assert h.arbiter.settles == [(1, accepted)]
     if accepted:
-        assert h.outbound.of("voice_decision:wake_rejected") == []
-        assert h.outbound.of("transcript_partial")[0].text == ALIAS_LAST
+        assert h.outbound.names()[:2] == ["vad_status:speech_started", "state_cycle:listen"]
     else:
-        (rejected,) = h.outbound.of("voice_decision:wake_rejected")
-        assert rejected.reason == "not_addressed"
+        assert h.outbound.names() == ["voice_decision:wake_rejected"]
+        assert h.outbound.of("voice_decision:wake_rejected")[0].reason == "not_addressed"
         assert calls(h.ingress, "drop") == [("drop", uid, "not_addressed")]
 
 
-async def test_an_endpoint_wake_is_decided_on_its_text_alone(monkeypatch):
-    h = make_harness([Pause()])
+async def test_an_endpoint_wake_is_decided_at_its_wake_messages_cutoff():
+    verifier = ScriptedWakeVerifier(thresholds=lambda cutoff: 0.95 if cutoff < 0.8 else 0.5)
+    h = make_harness([Pause()], verifier=verifier)
     h.start_voice()
-    seen = spy_alignments(h, monkeypatch)
-    h.post(Wake(keyword="mist", score=0.8, backlog_ms=1500, arrival=0.0))
+    h.post(Wake(keyword="mist", score=0.75, backlog_ms=1500, arrival=0.0))
     await h.settle()
-    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.8))
+    # The backlog's own spotter score is not the cutoff: the `wake` message's is.
+    h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.9))
     await h.settle()
     ((*_, uid),) = calls(h.ingress, "open_utterance")
+    assert calls(h.ingress, "request_verify") == [("request_verify", uid, 99)]
 
-    # The same words at its hit would wake a server candidate; an endpoint's are not read.
-    h.post(
-        dataclasses.replace(
-            h.ingress.partial(uid, ALIAS_LAST, gate=True),
-            words=heard_at_hit(99),
-            speech_end_pos=99,
-        )
-    )
-    await h.settle()
+    await verify(h, uid, score=0.9, hit_pos=99)
 
-    assert seen == [None]
+    assert set(verifier.cutoffs) == {0.75}
     (rejected,) = h.outbound.of("voice_decision:wake_rejected")
     assert rejected.reason == "not_addressed"
 
 
-async def test_a_held_end_is_read_with_its_words_and_no_speech_end(monkeypatch):
+async def test_a_score_before_the_claim_proceeds_waits_for_the_arbitration_verdict():
     h = make_harness([Pause()], solo=False)
     h.start_voice()
-    seen = spy_alignments(h, monkeypatch)
     uid = await name_hit(h)
-    words = heard_at_hit(HIT)
-    h.post(dataclasses.replace(h.ingress.ended(uid, ALIAS_LAST), words=words))
+
+    await verify(h, uid, "mist what")
+    assert h.outbound.client == [] and h.arbiter.settles == []
+
+    h.arbiter.grant(1)
+    await h.settle()
+    assert h.outbound.names()[:2] == ["vad_status:speech_started", "state_cycle:listen"]
+    assert h.arbiter.settles == [(1, True)]
+
+
+@pytest.mark.parametrize("which", ["another-hit", "no-candidate", "after-the-verdict"])
+async def test_a_score_for_no_waiting_candidate_is_counted_stale_and_decides_nothing(which):
+    h = make_harness([Pause()])
+    h.start_voice()
+    uid = await name_hit(h)
+    if which == "after-the-verdict":
+        await verify(h, uid)
+    mark, settles = len(h.outbound.client), list(h.arbiter.settles)
+    stale = h.controller.stale_events
+
+    target = "u-ghost" if which == "no-candidate" else uid
+    hit_pos = HIT + 1 if which == "another-hit" else HIT
+    await verify(h, target, score=REJECT, hit_pos=hit_pos)
+
+    assert h.controller.stale_events == stale + 1
+    assert h.outbound.client[mark:] == []
+    assert h.arbiter.settles == settles
+
+
+async def test_with_no_verifier_every_wake_is_rejected_not_addressed_before_any_duck():
+    pause = Pause()
+    h = make_harness([Token("One two three. Four five. "), pause, Token("Six.")], verifier=None)
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "speaking"
+    mark = len(h.outbound.client)
+
+    h.post(h.ingress.heard(None, hit_pos=HIT))
+    await h.settle()
+    h.post(Wake(keyword="mist", score=0.8, backlog_ms=1500, arrival=0.0))
+    await h.settle()
+
+    assert h.outbound.names()[mark:] == ["voice_decision:wake_rejected"] * 2
+    rejected = h.outbound.of("voice_decision:wake_rejected")
+    assert [m.reason for m in rejected] == ["not_addressed"] * 2
+    assert [m.detail.source for m in rejected] == ["server", "endpoint"]
+    assert ducks(h) == []
+    assert calls(h.ingress, "open_utterance") == []
+    assert calls(h.ingress, "expect_endpoint_wake") == []
+    assert calls(h.ingress, "request_verify") == []
+    assert h.arbiter.claims == []
+    assert h.controller.phase == "speaking"
+    pause.release()
+
+
+async def test_each_verdict_logs_one_info_line_of_numbers_and_no_words(caplog):
+    caplog.set_level(logging.DEBUG)
+    h = make_harness([Pause()])
+    h.start_voice()
+    rejected = await name_hit(h)
+    await verify(h, rejected, "I missed the bus", score=0.3)
+    accepted = await name_hit(h)
+    await verify(h, accepted, "mist what's up", score=0.75)
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "backend.realtime.turn" and record.levelno == logging.INFO
+    ]
+    verdicts = [line for line in lines if line.startswith("Wake verdict")]
+    assert verdicts == [
+        "Wake verdict: source=server cutoff=0.500 verify_score=0.300 threshold=0.500"
+        " verdict=not_addressed",
+        "Wake verdict: source=server cutoff=0.500 verify_score=0.750 threshold=0.500"
+        " verdict=accepted",
+    ]
+    for record in caplog.records:
+        message = record.getMessage().lower()
+        assert "missed" not in message and "bus" not in message and "what's" not in message
+
+
+async def test_an_ended_candidate_waits_for_its_score_and_its_end_opens_the_turn_on_acceptance():
+    h = make_harness([Pause()], solo=False)
+    h.start_voice()
+    uid = await name_hit(h)
+    h.post(h.ingress.ended(uid, "Mist, what's the time?"))
     await h.settle()
 
     h.arbiter.grant(1)
     await h.settle()
+    # The end decides nothing: the verdict waits for the verifier's score.
+    assert h.outbound.client == [] and h.responder.requests == []
+    assert h.arbiter.settles == []
 
-    assert calls(h.ingress, "request_gate_partial") == []
-    assert seen == [NameAlignment(HIT, 20, None, words)]
-    assert [r.user_text for r in h.responder.requests] == [ALIAS_LAST]
+    await verify(h, uid)
+
+    assert [r.user_text for r in h.responder.requests] == ["Mist, what's the time?"]
     assert h.arbiter.settles == [(1, True)]
+
+
+@pytest.mark.parametrize("ended", [False, True], ids=["verify-running", "utterance-ended"])
+async def test_mute_abandons_a_candidate_waiting_on_its_score_and_a_later_hit_opens_anew(ended):
+    pause = Pause()
+    h = make_harness([Token("One two three. Four five. "), pause, Token("Six.")], [Pause()])
+    h.start_voice()
+    await h.speak("hello")
+    assert h.controller.phase == "speaking"
+    uid = await name_hit(h)
+    if ended:
+        h.post(h.ingress.ended(uid, "Mist, wait."))
+    else:
+        h.post(h.ingress.dropped(uid, "muted"))  # ingress's drop precedes `Mute` (T12)
+    mark = len(h.outbound.client)
+
+    h.post(Mute(active=True))
+    await h.settle()
+
+    # Claim settled, duck undone, no message, the candidate cleared.
+    assert h.outbound.names()[mark:] == ["playback_duck"]
+    assert ducks(h) == [12.0, 0.0]
+    assert h.arbiter.settles == [(1, False)]
+    assert h.controller._candidate is None
+    # Ingress withholds a score that lands while muted; one that came anyway is stale.
+    stale = h.controller.stale_events
+    await verify(h, uid)
+    assert h.controller.stale_events == stale + 1
+    assert h.responder.requests[1:] == []
+
+    h.post(Mute(active=False))
+    await h.settle()
+    again = await name_hit(h)
+    assert again != uid
+    assert calls(h.ingress, "request_verify")[-1] == ("request_verify", again, HIT)
+    pause.release()
 
 
 async def test_self_speech_in_her_recent_speech_from_any_session_rejects_before_the_candidate():
@@ -1938,7 +2039,7 @@ async def test_self_speech_in_her_recent_speech_from_any_session_rejects_before_
     assert h.arbiter.claims == []
 
 
-async def test_self_media_rejects_at_the_claim_with_no_state_and_before_any_gate_partial():
+async def test_self_media_rejects_at_the_claim_with_no_state_and_before_the_score():
     h = make_harness([Pause()])
     h.start_voice()
 
@@ -1947,21 +2048,25 @@ async def test_self_media_rejects_at_the_claim_with_no_state_and_before_any_gate
     assert h.outbound.names() == ["voice_decision:wake_rejected"]
     (rejected,) = h.outbound.of("voice_decision:wake_rejected")
     assert (rejected.reason, rejected.detail.reference_score) == ("self_media", 0.7)
-    assert calls(h.ingress, "request_gate_partial") == []
     assert calls(h.ingress, "drop") == [("drop", uid, "not_addressed")]
     assert h.arbiter.settles == [(1, False)]
+    # The score, when it lands, finds no candidate: it is stale.
+    stale = h.controller.stale_events
+    await verify(h, uid)
+    assert h.controller.stale_events == stale + 1
+    assert h.outbound.names() == ["voice_decision:wake_rejected"]
 
 
 async def test_scene_wake_then_listening_only_for_an_accepted_name():
     h = make_harness([Pause()])
     h.start_voice()
     rejected = await name_hit(h)
-    await gate(h, rejected, "I missed the bus")
+    await unverify(h, rejected)
     assert h.scene.calls == []
 
     accepted = await name_hit(h)
     assert h.scene.calls == []
-    await gate(h, accepted, "mist, what's up")
+    await verify(h, accepted)
 
     assert h.scene.phases() == [
         ("phase", "wake", None, Immediate()),
@@ -1978,13 +2083,13 @@ async def test_the_name_step_sends_no_attend_and_listen_goes_out_at_acceptance()
 
     assert h.outbound.names() == []
     assert h.clock.now == 500
-    assert calls(h.ingress, "request_gate_partial") == []
+    # The verify job starts at the hit, before the claim's verdict.
+    assert calls(h.ingress, "request_verify") == [("request_verify", uid, HIT)]
     h.arbiter.grant(1)
     await h.settle()
-    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, GATE_THROUGH)]
     assert h.outbound.names() == []
 
-    await gate(h, uid, "mist what's up")
+    await verify(h, uid, "mist what's up")
 
     assert h.outbound.names()[:2] == ["vad_status:speech_started", "state_cycle:listen"]
     assert h.outbound.of("state_cycle:attend") == []
@@ -2020,7 +2125,7 @@ async def test_a_held_end_waits_for_the_verdict_and_acceptance_replays_it():
     assert h.outbound.client[mark:] == []
     assert h.responder.prefetches == [] and h.responder.requests == []
 
-    await gate(h, uid, text)
+    await verify(h, uid, text)
 
     names = h.outbound.names()[mark:]
     assert names[:3] == ["vad_status:speech_started", "state_cycle:listen", "transcript_partial"]
@@ -2038,28 +2143,12 @@ async def test_a_held_end_is_discarded_on_rejection():
     h.post(h.ingress.candidate(uid, text), h.ingress.ended(uid, text))
     await h.settle()
 
-    await gate(h, uid, text)
+    await unverify(h, uid)
 
     assert h.outbound.names() == ["voice_decision:wake_rejected"]
     assert h.responder.requests == [] and h.responder.prefetches == []
     assert h.outbound.of("voice_decision:dropped") == []
     assert h.controller.phase == "idle"
-
-
-async def test_an_end_held_before_the_verdict_is_decided_on_its_own_text():
-    """Ingress ended the candidate before the claim won, so no gate decode can come (v9 :153)."""
-    h = make_harness([Pause()], solo=False)
-    h.start_voice()
-    uid = await name_hit(h)
-    h.post(h.ingress.ended(uid, "Mist, what's the time?"))
-    await h.settle()
-
-    h.arbiter.grant(1)
-    await h.settle()
-
-    assert calls(h.ingress, "request_gate_partial") == []
-    assert [r.user_text for r in h.responder.requests] == ["Mist, what's the time?"]
-    assert h.arbiter.settles == [(1, True)]
 
 
 # -- Speaking and thinking (v5 :1174, :1177-1178, :1182-1183, :1692-1694, :1702-1708) --------------
@@ -2075,7 +2164,7 @@ async def test_a_rejected_name_unducks_and_sends_no_state_with_nothing_cut(phase
     mark = len(h.outbound.client)
 
     await name_hit(h, uid)
-    await gate(h, uid, "I missed it")
+    await unverify(h, uid)
 
     duck = ["playback_duck"] if phase == "speaking" else []
     assert h.outbound.names()[mark:] == [*duck, "voice_decision:wake_rejected", *duck]
@@ -2110,11 +2199,11 @@ async def test_while_speaking_mist_wait_ducks_at_the_hit_accepts_and_interrupts_
     assert h.outbound.names()[mark:] == ["playback_duck"]
     assert ducks(h) == [12.0]
 
-    # "wait" is a stop keyword: the candidate's partials go to the gate, not the keyword policy.
+    # "wait" is a stop keyword: the candidate's partials are held, not read by the keyword policy.
     h.post(h.ingress.partial(uid, "mist wait"))
     await h.settle()
     assert h.outbound.of("voice_decision:barge_in") == []
-    await gate(h, uid, "mist, wait")
+    await verify(h, uid, "mist, wait")
 
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id) == ("wake", turn_id)
@@ -2190,7 +2279,7 @@ async def test_a_name_during_a_typed_turn_interrupts_it_after_acceptance():
 
     uid = await name_hit(h)
     assert h.responder.commits == []  # nothing is cut before the verdict
-    await gate(h, uid, "mist, what's the time")
+    await verify(h, uid, "mist, what's the time")
 
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id, barge.detail.phase) == ("wake", typed, "text")
@@ -2231,7 +2320,7 @@ async def test_stop_or_the_name_during_the_handoff_wait_cancels_as_in_thinking(h
     else:
         await h.settle()
         await name_hit(h, uid)
-        await gate(h, uid, "mist, never mind that")
+        await verify(h, uid, "mist, never mind that")
 
     (barge,) = h.outbound.of("voice_decision:barge_in")
     reason = "keyword" if how == "stop" else "wake"
@@ -2269,10 +2358,9 @@ async def test_endpoint_wake_sends_nothing_at_the_message_and_opens_at_the_name_
     await h.settle()
     ((_, mode, from_pos, uid),) = calls(h.ingress, "open_utterance")
     assert (mode, from_pos) == ("wake", 60)
-    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, 99 + 15)]
+    assert calls(h.ingress, "request_verify") == [("request_verify", uid, 99)]
 
-    h.post(h.ingress.partial(uid, "mist what's the time", gate=True))
-    await h.settle()
+    await verify(h, uid, "mist what's the time", hit_pos=99)
     assert h.outbound.names()[0:2] == ["vad_status:speech_started", "state_cycle:listen"]
     assert ("phase", "wake", None, Immediate()) in h.scene.calls
 
@@ -2299,10 +2387,12 @@ async def test_endpoint_wake_ranks_with_its_calibration_and_a_slow_backlog_still
     await h.clock.advance(400)
     h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.7))
     await h.settle()
-    assert calls(h.ingress, "request_gate_partial") == []
+    ((*_, uid),) = calls(h.ingress, "open_utterance")
+    await verify(h, uid, hit_pos=99)
+    assert h.outbound.client == []
     h.arbiter.grant(claim.claim_id)
     await h.settle()
-    assert len(calls(h.ingress, "request_gate_partial")) == 1
+    assert h.arbiter.settles == [(claim.claim_id, True)]
 
 
 @pytest.mark.parametrize("backlog_ms", [0, 1499])
@@ -2338,8 +2428,7 @@ async def test_endpoint_wake_while_speaking_interrupts_only_after_acceptance():
     assert h.responder.commits == []
     ((*_, uid),) = calls(h.ingress, "open_utterance")
 
-    h.post(h.ingress.partial(uid, "mist, stop that", gate=True))
-    await h.settle()
+    await verify(h, uid, "mist, stop that", hit_pos=99)
 
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id, barge.detail.utterance_id) == ("wake", turn_id, uid)
@@ -2367,15 +2456,14 @@ async def accept_a_name(h: Harness, how: str, text: str) -> str:
         h.post(h.ingress.started(uid))
         await h.settle()
         await name_hit(h, uid)
-        await gate(h, uid, text)
+        await verify(h, uid, text)
         return uid
     h.post(endpoint_wake(1500))
     await h.settle()
     h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
     await h.settle()
     ((*_, uid),) = calls(h.ingress, "open_utterance")
-    h.post(h.ingress.partial(uid, text, gate=True))
-    await h.settle()
+    await verify(h, str(uid), text, hit_pos=99)
     return str(uid)
 
 
@@ -2833,7 +2921,7 @@ async def test_a_wake_with_no_voice_session_is_ignored(muted):
 async def named_turn(h: Harness, text: str = "Mist, what's up?") -> str:
     """Accept a name in idle, end the utterance and finish the turn it opens; returns its id."""
     uid = await name_hit(h)
-    await gate(h, uid, "mist what's up")
+    await verify(h, uid, "mist what's up")
     h.post(h.ingress.ended(uid, text))
     await h.settle()
     turn_id = h.last_turn()
@@ -2849,7 +2937,7 @@ async def test_set_engaged_is_true_at_acceptance_and_false_at_the_turns_end_with
     uid = await name_hit(h)
     assert engaged_calls(h) == []
 
-    await gate(h, uid, "mist what's up")
+    await verify(h, uid, "mist what's up")
     assert engaged_calls(h) == [True]
     h.post(h.ingress.ended(uid, "Mist, what's up?"))
     await h.settle()
@@ -2936,7 +3024,7 @@ async def test_a_rejected_name_sends_no_attend_and_no_state():
     h.start_voice()
     uid = await name_hit(h)
 
-    await gate(h, uid, "I missed the bus")
+    await verify(h, uid, "I missed the bus", score=REJECT)
 
     assert h.outbound.names() == ["voice_decision:wake_rejected"]
 
@@ -2948,7 +3036,7 @@ async def test_turn_metrics_carry_the_wake_timings_of_a_name_opened_turn():
 
     uid = await name_hit(h, arrival=1000.0)
     await h.clock.advance(260)
-    await gate(h, uid, "mist what's up")
+    await verify(h, uid, "mist what's up")
     h.post(h.ingress.ended(uid, "Mist, what's up?"))
     await h.settle()
     h.post(PlaybackDone(turn_id=h.last_turn(), played_ms=1))
@@ -3174,28 +3262,29 @@ async def test_a_verdict_for_a_settled_claim_is_ignored_counted_and_sends_nothin
     assert h.arbiter.settles == [(1, False)]
 
 
-async def test_a_winning_endpoint_wake_requests_its_gate_partial_when_its_name_heard_comes():
+async def test_a_winning_endpoint_wake_requests_its_score_when_its_name_heard_comes():
     h = make_harness([Pause()])
     h.start_voice()
     h.post(endpoint_wake(1500))
     await h.settle()
     assert [c.answered for c in h.arbiter.claims] == [True]  # the verdict came first
-    assert calls(h.ingress, "request_gate_partial") == []
+    assert calls(h.ingress, "request_verify") == []
 
     h.post(h.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint"))
     await h.settle()
 
     ((*_, uid),) = calls(h.ingress, "open_utterance")
-    assert calls(h.ingress, "request_gate_partial") == [("request_gate_partial", uid, 99 + 15)]
+    assert calls(h.ingress, "request_verify") == [("request_verify", uid, 99)]
+    assert calls(h.ingress, "request_gate_partial") == []
 
 
 async def test_an_accepted_and_a_rejected_claim_are_each_settled_exactly_once():
     h = make_harness([Pause()])
     h.start_voice()
     rejected = await name_hit(h)
-    await gate(h, rejected, "I missed the bus")
+    await unverify(h, rejected)
     accepted = await name_hit(h)
-    await gate(h, accepted, "mist, what's up")
+    await verify(h, accepted)
     h.post(h.ingress.ended(accepted, "Mist, what's up?"))
     await h.settle()
 
@@ -3249,6 +3338,12 @@ def rejected_reasons(h: Harness) -> list[str]:
     return [item.reason for item in h.outbound.of("voice_decision:wake_rejected")]
 
 
+def proceeded(h: Harness) -> bool:
+    """Whether the session's candidate won its claim: its verdict now waits only on its score."""
+    wake = h.controller._candidate
+    return wake is not None and wake.proceed
+
+
 def lost_details(h: Harness) -> list[tuple[str, float, float, str]]:
     """Each `wake_lost`'s reason, winner score, own score and utterance id."""
     return [
@@ -3269,24 +3364,22 @@ async def test_two_calibrated_hits_the_lower_false_accept_rate_proceeds_over_a_l
     ua = await name_hit(s.a, score=0.6, arrival=100.0)
     ub = await name_hit(s.b, score=0.9, arrival=0.0)
 
-    # Both wait in the window; neither decodes its gate partial yet.
-    assert calls(s.a.ingress, "request_gate_partial") == []
-    assert calls(s.b.ingress, "request_gate_partial") == []
+    # Both wait in the window, their verify jobs already asked for; neither proceeds yet.
+    assert calls(s.a.ingress, "request_verify") == [("request_verify", ua, HIT)]
+    assert calls(s.b.ingress, "request_verify") == [("request_verify", ub, HIT)]
+    assert not proceeded(s.a) and not proceeded(s.b)
     await s.close_window()
-    assert calls(s.a.ingress, "request_gate_partial") == [
-        ("request_gate_partial", ua, GATE_THROUGH)
-    ]
-    assert calls(s.b.ingress, "request_gate_partial") == []
-    # The loser waits for the winner's verdict: nothing is sent to it yet.
+    assert proceeded(s.a) and not proceeded(s.b)
+    # The loser waits for the winner's verdict, its own score included: nothing is sent to it.
+    await verify(s.b, ub)
     assert s.b.outbound.names() == []
 
-    await gate(s.a, ua, "mist what's up")
+    await verify(s.a, ua)
 
     assert "vad_status:speech_started" in s.a.outbound.names()
     assert lost_details(s.b) == [("arbitration", 0.6, 0.9, ub)]
     assert s.b.outbound.names() == ["voice_decision:wake_lost"]
     assert calls(s.b.ingress, "drop") == [("drop", ub, "wake_lost")]
-    assert calls(s.b.ingress, "request_gate_partial") == []
 
 
 async def test_two_hits_at_the_false_accept_floor_the_higher_quantile_proceeds_though_second():
@@ -3298,14 +3391,14 @@ async def test_two_hits_at_the_false_accept_floor_the_higher_quantile_proceeds_t
     await s.settle()
 
     await s.close_window()
-    assert calls(s.a.ingress, "request_gate_partial") == []
-    # The room unit won before its backlog arrived; its gate partial follows its `NameHeard`.
+    assert not proceeded(s.a)
+    # The room unit won before its backlog arrived; its verify job follows its `NameHeard`.
     s.b.post(s.b.ingress.heard(None, from_pos=60, hit_pos=99, spotter="endpoint", score=0.95))
     await s.settle()
     ((*_, ub),) = calls(s.b.ingress, "open_utterance")
-    assert calls(s.b.ingress, "request_gate_partial") == [("request_gate_partial", ub, 99 + 15)]
+    assert calls(s.b.ingress, "request_verify") == [("request_verify", ub, 99)]
 
-    await gate(s.b, ub, "mist what's the time")
+    await verify(s.b, ub, hit_pos=99)
 
     assert lost_details(s.a) == [("arbitration", 0.95, 0.85, ua)]
     assert rejected_reasons(s.a) == []
@@ -3321,11 +3414,9 @@ async def test_two_hits_equal_on_both_scales_the_earlier_arrival_proceeds():
 
     await s.close_window()
 
-    assert calls(s.a.ingress, "request_gate_partial") == []
-    assert calls(s.b.ingress, "request_gate_partial") == [
-        ("request_gate_partial", ub, GATE_THROUGH)
-    ]
-    await gate(s.b, ub, "mist, are you there")
+    assert not proceeded(s.a)
+    assert proceeded(s.b)
+    await verify(s.b, ub)
     assert lost_details(s.a) == [("arbitration", 0.8, 0.8, ua)]
     assert rejected_reasons(s.a) == []
     assert calls(s.a.ingress, "drop") == [("drop", ua, "wake_lost")]
@@ -3354,55 +3445,48 @@ async def test_calibrated_outranks_uncalibrated_and_uncalibrated_ranks_by_margin
     won, lost = (s.a, s.b) if winner == "a" else (s.b, s.a)
     won_uid, lost_uid = (ua, ub) if winner == "a" else (ub, ua)
     won_score, lost_score = (score_a, score_b) if winner == "a" else (score_b, score_a)
-    assert calls(won.ingress, "request_gate_partial") == [
-        ("request_gate_partial", won_uid, GATE_THROUGH)
-    ]
-    assert calls(lost.ingress, "request_gate_partial") == []
-    await gate(won, won_uid, "mist what's up")
+    assert proceeded(won)
+    assert not proceeded(lost)
+    await verify(won, won_uid)
     assert rejected_reasons(won) == []
     assert losses(won) == []
     assert rejected_reasons(lost) == []
     assert lost_details(lost) == [("arbitration", won_score, lost_score, lost_uid)]
 
 
-async def test_when_the_winner_is_rejected_the_runner_up_requests_its_gate_partial():
+async def test_when_the_winner_is_rejected_the_runner_up_proceeds_to_its_own_score():
     s = two_sessions()
     ua = await name_hit(s.a, score=0.9, arrival=0.0)
     ub = await name_hit(s.b, score=0.7, arrival=30.0)
     await s.close_window()
-    assert calls(s.b.ingress, "request_gate_partial") == []
+    assert not proceeded(s.b)
 
-    await gate(s.a, ua, "I missed the bus")
+    await unverify(s.a, ua)
     await s.settle()
 
     assert rejected_reasons(s.a) == ["not_addressed"]
-    assert calls(s.b.ingress, "request_gate_partial") == [
-        ("request_gate_partial", ub, GATE_THROUGH)
-    ]
-    await gate(s.b, ub, "mist what's up")
+    assert proceeded(s.b)
+    await verify(s.b, ub)
     assert rejected_reasons(s.b) == []
     assert "vad_status:speech_started" in s.b.outbound.names()
     # The rejected winner's claim is settled, so the runner-up's acceptance sends it no loss.
     assert losses(s.a) == []
 
 
-async def test_only_the_winners_gate_partial_is_requested_while_both_wait():
+async def test_only_the_winner_proceeds_while_both_wait():
     s = two_sessions()
-    ua = await name_hit(s.a, score=0.9, arrival=0.0)
+    await name_hit(s.a, score=0.9, arrival=0.0)
     await name_hit(s.b, score=0.7, arrival=30.0)
 
-    # Inside the window neither decodes; after it only the winner does, and the loser keeps
+    # Inside the window neither proceeds; after it only the winner does, and the loser keeps
     # waiting through any later events until the winner's verdict.
-    assert calls(s.a.ingress, "request_gate_partial") == []
-    assert calls(s.b.ingress, "request_gate_partial") == []
+    assert not proceeded(s.a) and not proceeded(s.b)
     await s.close_window()
     await s.a.clock.advance(1000)
     await s.b.clock.advance(1000)
 
-    assert calls(s.a.ingress, "request_gate_partial") == [
-        ("request_gate_partial", ua, GATE_THROUGH)
-    ]
-    assert calls(s.b.ingress, "request_gate_partial") == []
+    assert proceeded(s.a)
+    assert not proceeded(s.b)
     assert rejected_reasons(s.b) == []
 
 
@@ -3413,13 +3497,11 @@ async def test_with_one_session_no_wait_occurs():
 
     uid = await name_hit(s.a)
 
-    # The gate partial is requested in the name's own step: the clock never moved, and no window
-    # was opened.
+    # The claim proceeds in the name's own step: the clock never moved, and no window was opened.
     assert s.a.clock.now == 0
     assert s.later.timers == []
-    assert calls(s.a.ingress, "request_gate_partial") == [
-        ("request_gate_partial", uid, GATE_THROUGH)
-    ]
+    assert proceeded(s.a)
+    assert calls(s.a.ingress, "request_verify") == [("request_verify", uid, HIT)]
 
 
 async def test_a_dropped_waiting_candidate_withdraws_its_claim_and_the_other_proceeds_alone():
@@ -3431,8 +3513,8 @@ async def test_a_dropped_waiting_candidate_withdraws_its_claim_and_the_other_pro
     await s.settle()
     await s.close_window()
 
-    assert calls(s.b.ingress, "request_gate_partial") == [
-        ("request_gate_partial", ub, GATE_THROUGH)
-    ]
-    assert calls(s.a.ingress, "request_gate_partial") == []
+    assert proceeded(s.b)
+    assert s.a.controller._candidate is None
+    await verify(s.b, ub)
+    assert "vad_status:speech_started" in s.b.outbound.names()
     assert s.a.outbound.of("voice_decision:wake_rejected") == []

@@ -434,6 +434,10 @@ class RealtimeSession:
         responder = services.responder
         if services.power_gate is not None:
             responder = PowerGatedResponder(responder, services.power_gate)
+        # The verifier's thresholds decide every wake (T74); with no verifier there are none,
+        # and the controller rejects every wake before any duck.
+        verifier = engines.verifier
+        thresholds = verifier.threshold_at if verifier is not None else None
         return services.controller_factory(
             session_id=self.session_id,
             responder=responder,
@@ -441,7 +445,11 @@ class RealtimeSession:
             host=self,
             placement=services.placement,
             arbiter=self._host.arbiter,
-            gate=AddresseeGate(settings.wake, echo_guard_ms=settings.barge_in.echo_guard_ms),
+            gate=AddresseeGate(
+                settings.wake,
+                echo_guard_ms=settings.barge_in.echo_guard_ms,
+                thresholds=thresholds,
+            ),
             wake=settings.wake,
             calibration=None if spotter is None else spotter.calibration.get(own),
             hit_lag_ms=0 if spotter is None else spotter.hit_lag_ms,
@@ -457,6 +465,7 @@ class RealtimeSession:
             barge_in_config=settings.barge_in,
             alarm_ringing=services.alarm_ringing,
             power_level=self.power_level,
+            thresholds=thresholds,
         )
 
     def power_level(self) -> PowerLevel:
