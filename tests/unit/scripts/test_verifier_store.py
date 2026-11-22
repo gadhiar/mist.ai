@@ -370,6 +370,37 @@ class TestInvalidation:
         names = sorted(path.name for path in world.stores.iterdir())
         assert names == [".lock", world.key(), "notes"]
 
+    def test_a_reusing_open_also_removes_other_stores_and_partials(self, world: World) -> None:
+        world.open()
+        for name in ("a" * 64, f"{'b' * 64}.partial-12", f"{world.key()}.partial-7", "notes"):
+            (world.stores / name).mkdir()
+        reader = world.counting()
+        world.open(reader)
+        assert reader.public == 0
+        names = sorted(path.name for path in world.stores.iterdir())
+        assert names == [".lock", world.key(), "notes"]
+
+    def test_a_rebuild_counts_the_space_the_stale_stores_free(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        world.open()
+        directory = _store_dir(world)
+        shutil.copytree(directory, world.stores / ("a" * 64))
+        _rewrite("provenance_sha256", "e" * 64)(directory, world)
+        needed = sum(2 * _length(world.windows[index]) for index in _public(world))
+        needed += 4 * sum(min(ref.samples, store.MAX_RESPONSE) for ref in world.responses)
+        usage = collections.namedtuple("usage", "total used free")
+
+        def disk_usage(path: object) -> object:
+            held = sum(item.stat().st_size for item in world.stores.rglob("*") if item.is_file())
+            return usage(1 << 40, held, needed + store.FREE_MARGIN - held)
+
+        monkeypatch.setattr(shutil, "disk_usage", disk_usage)
+        reader = world.counting()
+        world.open(reader)
+        assert reader.public == len(_public(world))
+        assert sorted(path.name for path in world.stores.iterdir()) == [".lock", world.key()]
+
 
 # -- Building ---------------------------------------------------------------------------------
 

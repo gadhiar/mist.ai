@@ -8,12 +8,16 @@ checked through `onnx.reference`, since the runner image has no onnxruntime. No 
 recording, needs a network or the GPU.
 """
 
+import collections
+import itertools
 import json
 import random
+import re
+import shutil
 import sys
 import types
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +26,16 @@ import torch
 from torch import nn
 
 from backend.realtime.engines.verifier import GRID, read_verifier_manifest
-from scripts.wake.verifier import calibrate, dataset, export, model, preflight, train
+from scripts.wake.verifier import (
+    augment,
+    calibrate,
+    dataset,
+    export,
+    model,
+    preflight,
+    store,
+    train,
+)
 
 REPO = Path(__file__).resolve().parents[3]
 RATE = 16000
@@ -421,13 +434,9 @@ class TestTrainer:
         assert np.mean(lengths[0]) == pytest.approx(np.mean(lengths[1]), abs=4)
         rng_a, rng_b = random.Random(5), random.Random(5)
         assert train.truncate(116, 100, rng_a, 1.0) == train.truncate(116, 100, rng_b, 1.0)
-        audio = noise(2.32, 3).astype(np.float32) / 32768
-        rirs = [np.array([1.0, 0.3, 0.1])]
-        settings = train.Augment(rir_p=1.0, lowpass_p=1.0, noise_p=1.0, agc_p=1.0)
-        one = train.augment(audio, np.random.default_rng(7), settings, rirs)
-        two = train.augment(audio, np.random.default_rng(7), settings, rirs)
-        assert np.array_equal(one, two)
-        assert "label" not in train.augment.__code__.co_varnames
+        assert train.Augment is augment.Augment
+        assert "label" not in augment.draw.__code__.co_varnames
+        assert "label" not in augment.augment_batch.__code__.co_varnames
         assert "label" not in train.truncate.__code__.co_varnames
 
     def test_the_hit_offset_follows_window_bounds(self) -> None:
@@ -472,6 +481,333 @@ class TestTrainer:
             ref = dataset.FileRef(source, "b" * 64, file, None, len(mono))
             window = dataset.Window(ref, 2 * FRAME, 50 * FRAME, "negative", "random", "g", ())
             np.testing.assert_array_equal(reader.samples(window), mono[2 * FRAME : 50 * FRAME])
+
+
+# -- The store, the loader, scoring and progress -----------------------------------------------
+
+
+CONFIG_KEYS = {
+    "version",
+    "run",
+    "fold",
+    "optimizer",
+    "layers_lr",
+    "head_lr",
+    "weight_decay",
+    "batch",
+    "accumulate",
+    "epochs",
+    "fp16",
+    "seed",
+    "first_trainable_layer",
+    "folds",
+    "real_repeat",
+    "keep",
+    "loader_workers",
+    "augment",
+    "fp16_autocast",
+    "device",
+    "params",
+    "normalize_waveform",
+    "training",
+    "provenance_sha256",
+    "weights_sha256",
+    "kept_epoch",
+    "windows",
+}
+"""`config.json`'s keys as `train.py` wrote them at dc98960c."""
+AUGMENT_KEYS = {
+    "truncate_p",
+    "gain_db",
+    "noise_p",
+    "noise_snr_db",
+    "rir_p",
+    "lowpass_p",
+    "lowpass_hz",
+    "agc_p",
+    "agc_target_rms",
+    "agc_max_gain_db",
+}
+OOF_KEYS = {"window", "kind", "label", "group", "file_sha256", "cutoffs", "score"}
+FIXTURE_NAMES = (
+    "rec/",
+    "pos-",
+    "hom-",
+    "ES2002a",
+    ".wav",
+    "recordings",
+    "dataset",
+    "train_manifest",
+    "weights",
+    "window-cache",
+    "runs",
+    "rirs",
+)
+
+
+def _private(window: dataset.Window) -> bool:
+    return any(ref.source == "manifest" for ref in window.refs())
+
+
+def _reader(world: World, roots: dict[str, str] | None = None) -> train.WindowReader:
+    manifest = train.train_manifest(world.manifest, {}, dataset.sha256_file(world.manifest))
+    return train.WindowReader(manifest, roots or {"ami": str(world.ami)})
+
+
+def _decay(count: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return (rng.normal(0, 8000, count) * np.exp(-np.arange(count) / (count / 6))).astype("<i2")
+
+
+def _responses(directory: Path) -> list[dataset.FileRef]:
+    refs = []
+    for name, count in (("short.wav", 600), ("mid.wav", 2000), ("long.wav", 3 * RATE)):
+        path = directory / name
+        dataset.write_wav(path, _decay(count, count))
+        refs.append(dataset.FileRef("rirs", dataset.sha256_file(path), name, None, count))
+    return refs
+
+
+def _open(root: Path, windows, responses, reader) -> store.WindowStore:
+    return store.open_store(
+        root,
+        "a" * 64,
+        windows,
+        responses,
+        reader,
+        provenance_sha256="b" * 64,
+        workers=1,
+        progress=lambda line: None,
+    )
+
+
+class TestStoreAndLoader:
+    def test_a_fold_builds_the_store_and_the_final_run_reuses_it(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = collections.Counter()
+        samples = train.WindowReader.samples
+
+        def counting(self: train.WindowReader, window: dataset.Window) -> np.ndarray:
+            calls["private" if _private(window) else "public"] += 1
+            return samples(self, window)
+
+        monkeypatch.setattr(train.WindowReader, "samples", counting)
+        runs = world.root / "runs"
+        one = ("--store-workers", "1")
+        assert train.main(world.train_args(runs, "--fold", "0", *one), build=tiny_builder([])) == 0
+        key = dataset.sha256_file(world.dataset / dataset.INDEX_FILE)
+        cache = runs / train.CACHE_DIR
+        assert sorted(path.name for path in cache.iterdir()) == [".lock", key]
+        public = [window for window in world.windows if not _private(window)]
+        private = [window for window in world.windows if _private(window)]
+        assert public and private
+        assert calls["public"] == len(public)
+        calls.clear()
+        assert train.main(world.train_args(runs, "--final", *one), build=tiny_builder([])) == 0
+        assert calls["public"] == 0
+        assert calls["private"] == len(private)
+        stored = (cache / key / store.WINDOWS_FILE).read_bytes()
+        assert len(stored) == sum(2 * (window.end - window.start) for window in public)
+        reader = _reader(world)
+        for window in private:
+            assert samples(reader, window).tobytes() not in stored
+            assert samples(reader, window)[: RATE // 2].tobytes() not in stored
+
+    def test_config_and_oof_keep_their_keys_and_record_the_options(
+        self, world: World, tmp_path: Path
+    ) -> None:
+        runs = world.root / "runs"
+        cache = tmp_path / "elsewhere"
+        options = ("--cache", str(cache), "--loader-workers", "2", "--progress-seconds", "5")
+        args = world.train_args(runs, "--fold", "1", *options)
+        assert train.main(args, build=tiny_builder([])) == 0
+        assert not (runs / train.CACHE_DIR).exists()
+        assert (cache / store.index_key(world.dataset) / store.RECORD_FILE).exists()
+        config = json.loads((runs / "fold-1" / train.RUN_CONFIG).read_text(encoding="utf-8"))
+        assert set(config) == CONFIG_KEYS
+        assert set(config["augment"]) == AUGMENT_KEYS
+        assert config["loader_workers"] == 2
+        lines = (runs / "fold-1" / train.RUN_OOF).read_text(encoding="utf-8").splitlines()
+        assert lines and all(set(json.loads(line)) == OOF_KEYS for line in lines)
+
+    def test_a_store_that_cannot_be_built_exits_2(
+        self, world: World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        usage = collections.namedtuple("usage", "total used free")
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(1 << 30, 1 << 30, 0))
+        runs = world.root / "runs"
+        assert train.main(world.train_args(runs, "--final"), build=tiny_builder([])) == 2
+        assert "train: the store needs" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "option",
+        [("--loader-workers", "-1"), ("--store-workers", "0"), ("--progress-seconds", "0")],
+    )
+    def test_a_bad_option_is_refused(self, world: World, option: tuple[str, str]) -> None:
+        runs = world.root / "runs"
+        assert train.main(world.train_args(runs, "--final", *option), build=tiny_builder([])) == 2
+        assert not runs.exists()
+
+    def test_batched_scores_equal_batch_one_fp32_scores(self, world: World, tmp_path: Path) -> None:
+        ami = world.windows[-1].file
+        extra = [
+            dataset.Window(ami, start, start + frames * FRAME, "negative", "mined_hit", "ami:x", ())
+            for start, frames in ((0, 40), (7 * FRAME, 40), (3 * FRAME, 80), (50 * FRAME, 80))
+        ]
+        windows = [*world.windows, *extra, extra[0]]
+        reader = _reader(world)
+        opened = _open(tmp_path / "cache", windows, [], reader)
+        torch.manual_seed(5)
+        verifier = tiny_model()
+        verifier.train()
+        held = [9, 0, 3, 10, 6, 12, 8, 1, 11, 2, 7]
+        lines: list[str] = []
+        scores = train.score_windows(
+            verifier, opened, held, torch.device("cpu"), batch=3, progress=lines.append
+        )
+        assert len(scores) == len(held)
+        verifier.eval()
+        for index, score in zip(held, scores, strict=True):
+            audio = reader.samples(windows[index]).astype(np.float32) / np.float32(32768.0)
+            with torch.no_grad():
+                logit = verifier(torch.from_numpy(audio).reshape(1, -1))
+            assert score == pytest.approx(float(torch.sigmoid(logit.float())[0]), abs=1e-5)
+        assert scores[held.index(8)] == pytest.approx(scores[held.index(12)], abs=1e-6)
+        assert f"{len(held)}/{len(held)} windows" in lines[-1]
+        assert "windows/s" in lines[-1] and "ETA" in lines[-1]
+
+    def test_the_loaders_batches_are_the_stores_kept_frames_with_each_items_draws(
+        self, world: World, tmp_path: Path
+    ) -> None:
+        responses = _responses(tmp_path / "rirs")
+        reader = _reader(world, {"ami": str(world.ami), "rirs": str(tmp_path / "rirs")})
+        opened = _open(tmp_path / "cache", world.windows, responses, reader)
+        config = train.TrainConfig(batch=4, augment=augment.Augment(rir_p=0.5))
+        plan = train.plan_epoch(world.windows, range(len(world.windows)), config, 1)
+        labels = [1.0 if window.label == "positive" else 0.0 for window in world.windows]
+        data = train.EpochBatches(plan, labels, opened, config.augment)
+        assert len(data) == len(plan)
+        rows = collections.Counter()
+        for index, items in enumerate(plan):
+            batch = data[index]
+            length = items[0].frames * FRAME
+            assert batch.audio.dtype == torch.int16
+            assert tuple(batch.audio.shape) == (len(items), length)
+            assert batch.labels.dtype == torch.float32
+            draws = [augment.draw(item.seed, config.augment, len(responses)) for item in items]
+            expected = augment.batch_draws(draws)
+            for name in (item.name for item in fields(augment.BatchDraws)):
+                assert torch.equal(getattr(batch.draws, name), getattr(expected, name)), name
+            taps = [opened.response(d.rir)[:length] for d in draws if d.rir is not None]
+            width = max((len(row) for row in taps), default=0)
+            assert tuple(batch.responses.shape) == (len(items), width)
+            for row, (item, choice) in enumerate(zip(items, draws, strict=True)):
+                window = world.windows[item.window]
+                kept = reader.samples(window)[item.first * FRAME : (item.last + 1) * FRAME]
+                np.testing.assert_array_equal(batch.audio[row].numpy(), kept)
+                assert float(batch.labels[row]) == labels[item.window]
+                got = batch.responses[row].numpy()
+                if choice.rir is None:
+                    assert not got.any()
+                    rows["none"] += 1
+                    continue
+                response = opened.response(choice.rir)[:length]
+                np.testing.assert_array_equal(got[: len(response)], response)
+                assert not got[len(response) :].any()
+                rows["room"] += 1
+        assert rows["room"] and rows["none"]
+        quiet = train.TrainConfig(batch=4, augment=augment.Augment(rir_p=0.0))
+        silent = train.EpochBatches(plan, labels, opened, quiet.augment)
+        assert silent[0].responses.shape == (len(plan[0]), 0)
+
+    def test_loader_workers_hand_over_the_same_batches_and_the_device_augments_them(
+        self, world: World, tmp_path: Path
+    ) -> None:
+        responses = _responses(tmp_path / "rirs")
+        reader = _reader(world, {"ami": str(world.ami), "rirs": str(tmp_path / "rirs")})
+        opened = _open(tmp_path / "cache", world.windows, responses, reader)
+        config = train.TrainConfig(batch=8, augment=augment.Augment(rir_p=0.5))
+        plan = train.plan_epoch(world.windows, range(len(world.windows)), config, 2)
+        labels = [1.0 if window.label == "positive" else 0.0 for window in world.windows]
+        data = train.EpochBatches(plan, labels, opened, config.augment)
+        loader = train.epoch_loader(data, 2, pin=False)
+        assert loader.prefetch_factor == train.PREFETCH_BATCHES
+        assert loader.worker_init_fn is not None
+        handed = list(loader)
+        assert len(handed) == len(plan)
+        for index, batch in enumerate(handed):
+            direct = data[index]
+            assert torch.equal(batch.audio, direct.audio)
+            assert torch.equal(batch.responses, direct.responses)
+            assert torch.equal(batch.draws.noise_seeds, direct.draws.noise_seeds)
+        examples = sum(len(items) for items in plan)
+        epoch = train.DeviceEpoch(handed, examples, torch.device("cpu"), config.augment)
+        for (waveforms, batch_labels), direct in zip(epoch, handed, strict=True):
+            expected = augment.augment_batch(
+                direct.audio, direct.draws, direct.responses, config.augment
+            )
+            assert waveforms.dtype == torch.float32
+            assert torch.equal(waveforms, expected)
+            assert torch.equal(batch_labels, direct.labels)
+
+    def test_progress_lines_carry_a_rate_and_an_eta_and_name_no_file(
+        self, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ticks = itertools.count(0.0, 61.0)
+        runs = world.root / "runs"
+        args = world.train_args(runs, "--fold", "0", "--store-workers", "1")
+        code = train.main(args, build=tiny_builder([]), clock=lambda: float(next(ticks)))
+        assert code == 0
+        lines = capsys.readouterr().out.splitlines()
+        ends = [line for line in lines if re.match(r"epoch \d+: loss ", line)]
+        steps = [line for line in lines if re.match(r"epoch \d+: \d+/\d+ examples", line)]
+        assert len(ends) == 6 and steps
+        end = r"epoch \d+: loss \d+\.\d{4} over \d+ examples, \d+\.\d examples/s, run ETA \S+$"
+        assert all(re.match(end, line) for line in ends)
+        assert ends[-1].endswith("run ETA 0:00:00")
+        for line in steps:
+            assert "examples/s" in line and "epoch ETA" in line and "run ETA" in line
+            assert "unknown" not in line
+        scoring = [line for line in lines if line.startswith("oof: ")]
+        assert scoring and "windows/s" in scoring[-1] and "ETA" in scoring[-1]
+        assert any(line.startswith("store: ") for line in lines)
+        key = store.index_key(world.dataset)
+        for line in lines:
+            assert str(world.root) not in line
+            assert key not in line
+            for name in FIXTURE_NAMES:
+                assert name not in line, line
+
+    def test_fit_reads_the_loss_only_for_a_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        verifier = tiny_model()
+        audio = torch.randn(4, 50 * FRAME) * 0.1
+        labels = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        reads = []
+        item = torch.Tensor.item
+
+        def counting(self: torch.Tensor) -> float:
+            reads.append(tuple(self.shape))
+            return float(item(self))
+
+        monkeypatch.setattr(torch.Tensor, "__float__", counting)
+        lines: list[str] = []
+        config = train.TrainConfig(epochs=2, accumulate=2)
+        history = train.fit(
+            verifier,
+            lambda epoch: [(audio, labels)] * 3,
+            config,
+            torch.device("cpu"),
+            progress=lines.append,
+            clock=lambda: 0.0,
+        )
+        assert len(reads) == config.epochs
+        assert [row["examples"] for row in history] == [12, 12]
+        assert lines == [
+            f"epoch {row['epoch']}: loss {row['loss']:.4f} over 12 examples, 0.0 examples/s, "
+            f"run ETA {'unknown' if row['epoch'] == 1 else '0:00:00'}"
+            for row in history
+        ]
 
 
 def run_cli(cli: str, world: World, manifest: Path) -> int:

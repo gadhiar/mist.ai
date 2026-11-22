@@ -10,8 +10,8 @@ cut to `MAX_RESPONSE`, the longest window, since no later tap reaches a kept sam
 
 A store lives in `<root>/<key>`, `key` being the sha256 of the index's `index.jsonl`, and
 `store.json`, written last, records what it was built from. A store whose record or file sizes
-differ from what the caller asks for is rebuilt, and a build leaves only its own store under
-the root: a store for the full index is tens of GB.
+differ from what the caller asks for is rebuilt, and every open, reusing or rebuilding, leaves
+only its own store under the root: a store for the full index is tens of GB.
 
 Privacy: private audio never reaches the disk. A window that reads or mixes any file of source
 `manifest`, the train-only manifest's recordings, takes no bytes in `windows.pcm`; each open
@@ -495,7 +495,13 @@ def _build(
     workers: int,
     progress: _Progress,
 ) -> None:
-    """Decode into `<key>.partial-<pid>`, write `store.json` last, and rename it into place."""
+    """Decode into `<key>.partial-<pid>`, write `store.json` last, and rename it into place.
+
+    The stale store under `key` is removed before the free space is read, so the check counts
+    the space it held: a rebuild of a full index would otherwise need room for two stores.
+    """
+    final = root / key
+    shutil.rmtree(final, ignore_errors=True)
     needed = layout.windows_bytes + layout.responses_bytes
     free = shutil.disk_usage(root).free
     if free < needed + FREE_MARGIN:
@@ -526,14 +532,20 @@ def _build(
         staged.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         _fsync(staged)
         os.replace(staged, partial / RECORD_FILE)
-        final = root / key
-        shutil.rmtree(final, ignore_errors=True)
         os.rename(partial, final)
         built = True
     finally:
         if not built:
             shutil.rmtree(partial, ignore_errors=True)
     progress.finish()
+
+
+def _sweep(root: Path, key: str) -> None:
+    """Remove every other store and every partial build under `root`, `key`'s own included.
+
+    Run under the lock on every open, reused or rebuilt, so one store stays on disk and a build
+    that follows counts the space the removed ones held.
+    """
     for path in root.iterdir():
         if path.name != key and (_KEY.fullmatch(path.name) or ".partial-" in path.name):
             shutil.rmtree(path, ignore_errors=True)
@@ -574,9 +586,10 @@ def open_store(
     """Open the store of `windows` and `responses` under `root`, building it when it is stale.
 
     A store is reused only when its `store.json` matches the request in every field and its
-    files have their recorded sizes; anything else is rebuilt, and a build removes every other
-    store and partial build under `root`. Private windows are read through `reader` on every
-    open and never written.
+    files have their recorded sizes; anything else is rebuilt. Every open first removes every
+    other store and partial build under `root`, and a rebuild removes the stale store before it
+    checks the free space. Private windows are read through `reader` on every open and never
+    written.
 
     Args:
         root: The directory stores are kept in.
@@ -603,6 +616,7 @@ def open_store(
     root.mkdir(parents=True, exist_ok=True)
     directory = root / key
     with _locked(root):
+        _sweep(root, key)
         if not _matches(directory, record):
             size = layout.windows_bytes + layout.responses_bytes
             total = int((~layout.private).sum())
