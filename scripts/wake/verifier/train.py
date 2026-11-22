@@ -61,7 +61,7 @@ from .dataset import (
     FileRef,
     Window,
     parse_root_map,
-    read_audio,
+    read_rir,
     read_wav_segment,
     read_windows,
     sha256_file,
@@ -262,7 +262,7 @@ class WindowReader:
 
     def rir(self, ref: FileRef) -> np.ndarray:
         """A room response at 16 kHz, peak-normalised."""
-        samples, rate = read_audio(self.path(ref))
+        samples, rate = read_rir(self.path(ref))
         response = to_16k(samples, rate)
         peak = float(np.max(np.abs(response))) if len(response) else 0.0
         return response / peak if peak > 0 else response

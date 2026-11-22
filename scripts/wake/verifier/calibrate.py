@@ -57,7 +57,6 @@ from backend.realtime.engines.verifier import (
 )
 from backend.realtime.errors import SpeechEngineError
 
-from ..manifest import read_pcm16
 from .dataset import (
     AFTER_MS,
     BEFORE_MS,
@@ -66,6 +65,7 @@ from .dataset import (
     MIN_WINDOW_MS,
     SAMPLE_RATE,
     DatasetError,
+    read_pcm16_mono,
     read_sums,
     sha256_file,
     window_bounds,
@@ -237,7 +237,7 @@ def _score_meeting(task: Task) -> tuple[str, int, list[ScoredHit]]:
     path = Path(task.path)
     if sha256_file(path) != task.sha256:
         raise CalibrateError(f"{task.meeting}'s sha256 is not the one ami/train/{SUMS} lists")
-    pcm = read_pcm16(path)
+    pcm = read_pcm16_mono(path)
     spotter = engines.spotter
     series = spotter.score_series(pcm)
     found: dict[int, list[float]] = {}

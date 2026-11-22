@@ -11,6 +11,7 @@ import ast
 import io
 import json
 import math
+import struct
 import subprocess
 import sys
 import types
@@ -206,6 +207,46 @@ def write_channels(path: Path, frames: np.ndarray, rate: int = RATE, width: int 
         handle.setframerate(rate)
         handle.writeframes(data)
     return path
+
+
+PCM_SUBFORMAT = bytes.fromhex("0100000000001000800000aa00389b71")
+"""`KSDATAFORMAT_SUBTYPE_PCM` as a file holds it: 00000001-0000-0010-8000-00aa00389b71."""
+FLOAT_SUBFORMAT = bytes.fromhex("0300000000001000800000aa00389b71")
+"""`KSDATAFORMAT_SUBTYPE_IEEE_FLOAT`, a subformat the readers refuse."""
+
+
+def write_extensible(
+    path: Path,
+    frames: np.ndarray,
+    rate: int = RATE,
+    subformat: bytes = PCM_SUBFORMAT,
+) -> Path:
+    """A WAVE_FORMAT_EXTENSIBLE PCM16 WAV of `frames` (samples by channels), as OpenSLR 28
+    writes its multichannel room responses, with an odd-sized chunk before the data.
+    """
+    samples = np.asarray(frames, dtype="<i2")
+    channels = samples.shape[1]
+    block = 2 * channels
+    fmt = struct.pack("<HHIIHHHHI", 0xFFFE, channels, rate, rate * block, block, 16, 22, 16, 0)
+    fmt += subformat
+    body = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+    body += b"LIST" + struct.pack("<I", 3) + b"odd\0"
+    data = samples.tobytes()
+    body += b"data" + struct.pack("<I", len(data)) + data
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WAVE" + body)
+    return path
+
+
+def room_response(channels: int, samples: int = 400) -> np.ndarray:
+    """A multichannel room response: each channel a decaying impulse, delayed by its index."""
+    frames = np.zeros((samples, channels), dtype=np.int32)
+    for channel in range(channels):
+        start = 3 * channel
+        tail = np.arange(samples - start)
+        frames[start:, channel] = (20000 * np.exp(-tail / 40.0) * (-1) ** tail).astype(np.int32)
+    frames[0, 0] = 30000
+    return frames.astype("<i2")
 
 
 @dataclass
@@ -930,6 +971,179 @@ class TestStage:
             stage.https_fetch("https://example.org/b.wav", tmp_path / "b.wav", opener=opener(404))
         with pytest.raises(stage.StageError, match="https"):
             stage.https_fetch("http://example.org/c.wav", tmp_path / "c.wav", opener=opener(200))
+
+
+# -- Audio formats ----------------------------------------------------------------------------
+
+
+def write_census(path: Path, layout: str, frames: np.ndarray) -> Path:
+    """`frames` as the staged data's census holds them: plain PCM (tag 1) or EXTENSIBLE."""
+    if layout == "extensible":
+        return write_extensible(path, frames)
+    if frames.shape[1] == 1:
+        return write(path, frames[:, 0])
+    return write_channels(path, frames)
+
+
+REAL_RIRS = Path("RIRS_NOISES", "real_rirs_isotropic_noises")
+
+
+class TestAudioFormats:
+    def test_the_pcm_subformat_is_ksdataformat_subtype_pcm(self) -> None:
+        assert dataset.PCM_SUBFORMAT == PCM_SUBFORMAT
+
+    @pytest.mark.parametrize(
+        ("layout", "channels"),
+        [("plain", 1), ("plain", 2), ("extensible", 1), ("extensible", 8), ("extensible", 30)],
+    )
+    def test_each_census_wav_goes_through_every_reader(
+        self, tmp_path: Path, layout: str, channels: int
+    ) -> None:
+        frames = room_response(channels)
+        path = write_census(tmp_path / "x.wav", layout, frames)
+        info = dataset.wav_info(path)
+        assert (info.rate, info.channels, info.width, info.frames) == (
+            RATE,
+            channels,
+            2,
+            len(frames),
+        )
+        assert dataset.audio_format(path) == (RATE, channels)
+        scaled = frames.astype(np.float32) / np.float32(32768)
+        # Every source but a room response: the mean of the channels.
+        mean, rate = dataset.read_audio(path)
+        assert rate == RATE
+        np.testing.assert_allclose(mean, scaled.mean(axis=1), atol=1e-6)
+        # A room response, as mine and train read one: channel 0.
+        first, rate = dataset.read_rir(path)
+        assert rate == RATE
+        np.testing.assert_array_equal(first, scaled[:, 0])
+        mono = tmp_path / "mono.wav"
+        assert dataset.downmix_pcm16(path, mono, block_frames=64) == len(frames)
+        rounded = np.round(frames.astype(np.float64).mean(axis=1)).astype("<i2")
+        np.testing.assert_array_equal(dataset.read_wav_segment(mono, 0, len(frames)), rounded)
+        if channels == 1:
+            segment = dataset.read_wav_segment(path, 5, 7)
+            np.testing.assert_array_equal(segment, frames[5:12, 0])
+            tail = dataset.read_wav_segment(path, len(frames) - 3, 10)
+            np.testing.assert_array_equal(tail, frames[-3:, 0])
+            ambient = np.frombuffer(mine._ambient_pcm(path), dtype="<i2")
+            np.testing.assert_array_equal(ambient, frames[:, 0])
+            # How calibrate reads a staged AMI meeting.
+            assert dataset.read_pcm16_mono(path) == frames[:, 0].tobytes()
+        else:
+            with pytest.raises(dataset.DatasetError, match="16 kHz mono"):
+                dataset.read_wav_segment(path, 0, 10)
+            with pytest.raises(dataset.DatasetError, match="16 kHz mono"):
+                dataset.read_pcm16_mono(path)
+            with pytest.raises(dataset.DatasetError, match=f"{channels} channels"):
+                mine._ambient_pcm(path)
+
+    def test_a_flac_and_a_24_khz_clip_are_read_at_their_rate(self, tmp_path: Path) -> None:
+        import soundfile
+
+        flac = tmp_path / "19-198-0001.flac"
+        samples = spoken(0.5, 0.4, 0.3, seed=4)
+        soundfile.write(str(flac), samples, RATE, subtype="PCM_16")
+        assert dataset.audio_format(flac) == (RATE, 1)
+        mine._check_ambient(flac)
+        np.testing.assert_array_equal(np.frombuffer(mine._ambient_pcm(flac), "<i2"), samples)
+        clip = write(tmp_path / "clip.wav", burst(0.6, rate=24000), 24000)
+        assert dataset.audio_format(clip) == (24000, 1)
+        assert len(synth.load_clip(clip)) == round(0.6 * RATE)
+
+    def test_an_unsupported_wav_is_refused_naming_it_and_its_format(self, tmp_path: Path) -> None:
+        extensible = write_extensible(
+            tmp_path / "float_rir.wav", room_response(8), subformat=FLOAT_SUBFORMAT
+        )
+        readers = (dataset.wav_info, dataset.audio_format, dataset.read_audio, dataset.read_rir)
+        for reader in readers:
+            with pytest.raises(
+                dataset.DatasetError,
+                match=r"float_rir\.wav is WAVE_FORMAT_EXTENSIBLE with subformat "
+                "00000003-0000-0010-8000-00aa00389b71",
+            ):
+                reader(extensible)
+        tagged = write(tmp_path / "float.wav", quiet(0.1))
+        raw = bytearray(tagged.read_bytes())
+        raw[20:22] = (3).to_bytes(2, "little")
+        tagged.write_bytes(bytes(raw))
+        with pytest.raises(
+            dataset.DatasetError, match="float.wav is not a PCM WAV file: format tag 3"
+        ):
+            dataset.wav_info(tagged)
+        (tmp_path / "text.wav").write_bytes(b"not audio")
+        with pytest.raises(dataset.DatasetError, match="text.wav is not a PCM WAV file"):
+            dataset.read_audio(tmp_path / "text.wav")
+        wide = write_channels(tmp_path / "wide.wav", room_response(2), width=3)
+        with pytest.raises(dataset.DatasetError, match="wide.wav has 24-bit samples"):
+            dataset.audio_format(wide)
+
+    def test_mine_reads_one_file_of_each_census_format(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The census: plain mono and 2-channel responses, EXTENSIBLE ones with 8 and 30
+        # channels, an EXTENSIBLE mono noise file beside the plain ones, the world's FLAC and
+        # its 24 kHz chatterbox clips.
+        responses = {
+            "plain_2ch_rir.wav": room_response(2),
+            "RWCP_type1_rir_cirline_jr1_imp070.wav": room_response(8),
+            "air_type1_rir_30ch.wav": room_response(30),
+        }
+        for name, frames in responses.items():
+            layout = "plain" if frames.shape[1] == 2 else "extensible"
+            write_census(world.rirs / REAL_RIRS / name, layout, frames)
+        noise = "noise/free-sound/noise-free-sound-0002.wav"
+        write_extensible(world.musan / noise, quiet(2.0, 83)[:, None])
+        convolved: list[np.ndarray] = []
+
+        def spy(
+            clip: np.ndarray, background: np.ndarray, rir: np.ndarray, plan: synth.MixPlan
+        ) -> np.ndarray:
+            convolved.append(rir)
+            return synth.mix(clip, background, rir, plan)
+
+        monkeypatch.setattr(mine, "mix", spy)
+        monkeypatch.setattr(synth, "RIR_SHARE", 1.0)
+        out = world.root / "mined"
+        assert run_mine(world, out) == 0
+        firsts = [
+            frames[:, 0].astype(np.float32) / np.float32(32768) for frames in responses.values()
+        ]
+        simulated = dataset.read_audio(next(world.rirs.rglob("Room001-00001.wav")))[0]
+        assert len(convolved) == 8
+        for rir in convolved:
+            assert any(np.array_equal(rir, first) for first in [*firsts, simulated])
+        assert any(np.array_equal(rir, first) for rir in convolved for first in firsts)
+        windows = dataset.read_windows(out / dataset.MINED_FILE)
+        assert noise in {w.file.path for w in windows if w.file.source == "musan"}
+        assert {w.file.source for w in windows} == {
+            "manifest",
+            "ami",
+            "librispeech",
+            "musan",
+            "mixed",
+        }
+
+    def test_mine_refuses_an_unreadable_header_before_the_spotter_loads(
+        self, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        name = "RWCP_type1_rir_float.wav"
+        write_extensible(world.rirs / REAL_RIRS / name, room_response(8), subformat=FLOAT_SUBFORMAT)
+        write_channels(world.musan / "noise" / "free-sound" / "two.wav", room_response(2))
+        loaded: list[int] = []
+
+        def engines() -> mine.Engines:
+            loaded.append(1)
+            return fake_engines(world.training)()
+
+        out = world.root / "mined"
+        assert mine.main(world.mine_args(out), engines=engines) == 2
+        assert loaded == [] and not out.exists()
+        err = capsys.readouterr().err
+        assert "2 source files cannot be read" in err
+        assert f"{name} is WAVE_FORMAT_EXTENSIBLE with subformat 00000003-" in err
+        assert "two.wav is 16000 Hz, 2 channels, 16-bit" in err
 
 
 # -- Synthesis --------------------------------------------------------------------------------
