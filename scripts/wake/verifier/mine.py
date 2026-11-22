@@ -32,7 +32,10 @@ train `subset_sha256`. A spotter whose `training` is not that sha256 is refused 
 
 The frontend's lead (the calls it makes before its first feature) is measured from the loaded
 spotter (`frontend_lead`), since the stream's positions depend on it and the spotter does not
-report it. `--workers` processes score the sources; the output is the same for any count. The
+report it. Every source file's header is read before the spotter loads (`check_headers`), so
+a file no reader takes is refused in seconds. A multichannel room response is read as its
+first channel (`dataset.read_rir`); every other source as the mean of its channels. `--workers`
+processes score the sources; the output is the same for any count. The
 printed lines are counts, never a file name. Exit 0 written, 1 an engine failed, 2 refused
 (an existing `--out` included).
 """
@@ -79,10 +82,14 @@ from .dataset import (
     SYNTH_META,
     DatasetError,
     FileRef,
+    WavInfo,
     Window,
+    audio_format,
     is_pcm16_16k_mono,
     parse_root_map,
     read_audio,
+    read_pcm16_mono,
+    read_rir,
     read_wav_segment,
     sha256_file,
     to_16k,
@@ -99,6 +106,8 @@ SYNTHESISERS = ("piper", "chatterbox")
 RANDOM_EVERY_SAMPLES = 60 * SAMPLE_RATE
 """One random window a minute of each ambient file, and at least one."""
 MAX_LEAD_CALLS = 64
+MAX_NAMED = 5
+"""The unreadable source files a refusal names; the rest are counted."""
 DEFAULT_SEED = 17
 _MANIFEST_KINDS = {
     "positive": ("positive", "real_positive"),
@@ -324,15 +333,38 @@ def _recording(task: RecordingTask) -> tuple[FileRef, list[Window]]:
     return ref, windows
 
 
+def _check_wav_ambient(path: Path) -> WavInfo:
+    info = wav_info(path)
+    if not is_pcm16_16k_mono(info):
+        raise DatasetError(
+            f"{path.name} is {info.rate} Hz, {info.channels} channels, {8 * info.width}-bit; "
+            "mining reads 16 kHz mono PCM16"
+        )
+    return info
+
+
+def _check_ambient(path: Path) -> None:
+    """Refuse an ambient file whose header `_ambient_pcm` would refuse.
+
+    Raises:
+        DatasetError: It is not a 16 kHz FLAC, or a 16 kHz mono PCM16 WAV.
+    """
+    if path.suffix.lower() != ".flac":
+        _check_wav_ambient(path)
+        return
+    rate, _ = audio_format(path)
+    if rate != SAMPLE_RATE:
+        raise DatasetError(f"{path.name} is {rate} Hz; mining reads 16 kHz sources only")
+
+
 def _ambient_pcm(path: Path) -> bytes:
     if path.suffix.lower() == ".flac":
         samples, rate = read_audio(path)
         if rate != SAMPLE_RATE:
             raise DatasetError(f"{path.name} is {rate} Hz; mining reads 16 kHz sources only")
         return to_pcm16(samples).tobytes()
-    if not is_pcm16_16k_mono(wav_info(path)):
-        raise DatasetError(f"{path.name} is not 16 kHz mono PCM16")
-    return read_pcm16(path)
+    _check_wav_ambient(path)
+    return read_pcm16_mono(path)
 
 
 def _ambient(task: AmbientTask) -> tuple[FileRef, list[Window]]:
@@ -370,7 +402,7 @@ def _synthetic(task: SynthTask) -> tuple[FileRef, list[Window]]:
     rir = None
     if plan.rir is not None:
         rir_path = Path(context.rirs_root, context.rirs[plan.rir])
-        samples, rate = read_audio(rir_path)
+        samples, rate = read_rir(rir_path)
         rir = to_16k(samples, rate)
         inputs.append(
             FileRef("rirs", sha256_file(rir_path), context.rirs[plan.rir], None, max(1, len(rir)))
@@ -485,6 +517,41 @@ def _synth_tasks(root: Path) -> tuple[list[SynthTask], dict[str, dict]]:
     return tasks, metas
 
 
+def check_headers(
+    ambient: Sequence[AmbientTask],
+    synth_tasks: Sequence[SynthTask],
+    rirs_root: Path,
+    rirs: Sequence[str],
+) -> None:
+    """Read every source file's header before the spotter loads and any file is scored.
+
+    Each file is checked as the reader mining uses for it would take it: an ambient file as
+    `_ambient_pcm` reads it, a clip as `synth.load_clip` (`read_audio`), a room response as
+    `read_rir`. A file none reads fails the run in seconds, not hours into the pool.
+
+    Raises:
+        MineError: A file's header is not one its reader takes; the first few are named.
+    """
+    problems: list[str] = []
+    checks: list[tuple[Callable[[Path], object], Path]] = [
+        (_check_ambient, Path(task.root, task.path)) for task in ambient
+    ]
+    checks += [(audio_format, Path(task.root, task.path)) for task in synth_tasks]
+    checks += [(audio_format, Path(rirs_root, rir)) for rir in rirs]
+    for check, path in checks:
+        try:
+            check(path)
+        except DatasetError as exc:
+            problems.append(str(exc))
+    if problems:
+        more = f"; and {len(problems) - MAX_NAMED} more" if len(problems) > MAX_NAMED else ""
+        raise MineError(
+            f"{len(problems)} source files cannot be read: "
+            + "; ".join(problems[:MAX_NAMED])
+            + more
+        )
+
+
 # -- The run ----------------------------------------------------------------------------------
 
 
@@ -504,13 +571,6 @@ def mine(args: argparse.Namespace, factory: Callable[[], Engines]) -> int:
             "the train-only manifest `python -m scripts.wake.manifest split --split train` writes"
         )
     manifest_sha256 = sha256_file(args.manifest)
-    engines = factory()
-    if engines.training != manifest_sha256:
-        raise MineError(
-            f"spotter {engines.model_id} was trained from {engines.training}, not this "
-            f"manifest's {manifest_sha256}"
-        )
-    lead = frontend_lead(engines.spotter)
     recordings = [
         RecordingTask(
             item.index, item.label, item.session, str(item.path), item.sha256, item.frames
@@ -521,6 +581,14 @@ def mine(args: argparse.Namespace, factory: Callable[[], Engines]) -> int:
     ambient = ami + _librispeech_tasks(args.librispeech) + _musan_tasks(args.musan)
     synth_tasks, synth_metas = _synth_tasks(args.synth)
     rirs = _rirs(args.rirs)
+    check_headers(ambient, synth_tasks, args.rirs, rirs)
+    engines = factory()
+    if engines.training != manifest_sha256:
+        raise MineError(
+            f"spotter {engines.model_id} was trained from {engines.training}, not this "
+            f"manifest's {manifest_sha256}"
+        )
+    lead = frontend_lead(engines.spotter)
     args.out.mkdir(parents=True)
     context = Context(seed=args.seed, lead_calls=lead, out=str(args.out))
     first = _map(_recording, recordings, factory, context, args.workers, engines)

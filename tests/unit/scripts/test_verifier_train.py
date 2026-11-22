@@ -437,6 +437,42 @@ class TestTrainer:
             window = dataset.Window(ref, start, end, "negative", "random", "g", ())
             assert start // FRAME + train.hit_offset(window) == hit or end == frames * FRAME
 
+    def test_the_reader_takes_channel_0_of_a_room_response_and_each_census_format(
+        self, world: World, tmp_path: Path
+    ) -> None:
+        import soundfile
+
+        from tests.unit.scripts.test_verifier_data import (
+            room_response,
+            write_channels,
+            write_extensible,
+        )
+
+        rirs = tmp_path / "rirs"
+        responses = {"r8.wav": room_response(8), "r30.wav": room_response(30)}
+        for name, frames in responses.items():
+            write_extensible(rirs / name, frames)
+        responses["r2.wav"] = room_response(2)
+        write_channels(rirs / "r2.wav", responses["r2.wav"])
+        musan = tmp_path / "musan"
+        mono = noise(1.0, 5)
+        write_extensible(musan / "n.wav", mono[:, None])
+        librispeech = tmp_path / "librispeech"
+        librispeech.mkdir()
+        soundfile.write(str(librispeech / "19-198-0001.flac"), mono, RATE, subtype="PCM_16")
+        reader = train.WindowReader(
+            train.train_manifest(world.manifest, {}, dataset.sha256_file(world.manifest)),
+            {"rirs": str(rirs), "musan": str(musan), "librispeech": str(librispeech)},
+        )
+        for name, frames in responses.items():
+            ref = dataset.FileRef("rirs", "a" * 64, name, None, len(frames))
+            first = frames[:, 0].astype(np.float32) / np.float32(32768)
+            np.testing.assert_allclose(reader.rir(ref), first / np.max(np.abs(first)), rtol=1e-6)
+        for source, file in (("musan", "n.wav"), ("librispeech", "19-198-0001.flac")):
+            ref = dataset.FileRef(source, "b" * 64, file, None, len(mono))
+            window = dataset.Window(ref, 2 * FRAME, 50 * FRAME, "negative", "random", "g", ())
+            np.testing.assert_array_equal(reader.samples(window), mono[2 * FRAME : 50 * FRAME])
+
 
 def run_cli(cli: str, world: World, manifest: Path) -> int:
     if cli == "train":

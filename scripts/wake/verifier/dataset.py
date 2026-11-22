@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 import wave
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -283,32 +284,107 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+WAVE_FORMAT_PCM = 0x0001
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+PCM_SUBFORMAT = bytes.fromhex("0100000000001000800000aa00389b71")
+"""`KSDATAFORMAT_SUBTYPE_PCM` (00000001-0000-0010-8000-00aa00389b71) as its bytes sit in a
+WAVE_FORMAT_EXTENSIBLE `fmt ` chunk: the first field little-endian, then the rest."""
+READ_WIDTHS = (2, 4)
+"""The sample widths `read_audio` reads from a WAV, in bytes: PCM16 and PCM32."""
+RIR_CHANNEL = 0
+"""The channel a multichannel room response is read as, by `read_rir`."""
+
+
 @dataclass(frozen=True, slots=True)
 class WavInfo:
-    """A WAV header's format."""
+    """A WAV header's format, and where its sample data starts in the file."""
 
     rate: int
     channels: int
     width: int
     frames: int
+    data_offset: int
+
+
+def _guid(data: bytes) -> str:
+    first, second, third = struct.unpack_from("<IHH", data)
+    return f"{first:08x}-{second:04x}-{third:04x}-{data[8:10].hex()}-{data[10:16].hex()}"
+
+
+def _wav_format(fmt: bytes, name: str, offset: int, data_bytes: int) -> WavInfo:
+    tag, channels, rate = struct.unpack_from("<HHI", fmt, 0)
+    block_align, bits = struct.unpack_from("<HH", fmt, 12)
+    if tag == WAVE_FORMAT_EXTENSIBLE:
+        if len(fmt) < 40:
+            raise DatasetError(f"{name} is WAVE_FORMAT_EXTENSIBLE with a short fmt chunk")
+        if fmt[24:40] != PCM_SUBFORMAT:
+            raise DatasetError(
+                f"{name} is WAVE_FORMAT_EXTENSIBLE with subformat {_guid(fmt[24:40])}; only "
+                f"PCM ({_guid(PCM_SUBFORMAT)}) is read"
+            )
+    elif tag != WAVE_FORMAT_PCM:
+        raise DatasetError(
+            f"{name} is not a PCM WAV file: format tag {tag}; tags {WAVE_FORMAT_PCM} (PCM) "
+            f"and {WAVE_FORMAT_EXTENSIBLE} (WAVE_FORMAT_EXTENSIBLE, PCM subformat) are read"
+        )
+    width = (bits + 7) // 8
+    if channels < 1 or rate < 1 or width < 1 or block_align != channels * width:
+        raise DatasetError(
+            f"{name} has an inconsistent fmt chunk: {channels} channels, {bits}-bit, "
+            f"block align {block_align}"
+        )
+    return WavInfo(rate, channels, width, data_bytes // block_align, offset)
 
 
 def wav_info(path: Path) -> WavInfo:
-    """Read a WAV header.
+    """Read a WAV header: PCM, or WAVE_FORMAT_EXTENSIBLE with the PCM subformat.
+
+    The RIFF chunks are walked here rather than by the `wave` module, which reads
+    WAVE_FORMAT_EXTENSIBLE only from Python 3.12, and the worker image runs 3.11; OpenSLR 28's
+    multichannel room responses are written that way. The frame count is what the data chunk holds, or what the
+    file holds after its start when it is shorter than its header says.
 
     Raises:
-        DatasetError: The file is not a PCM WAV file.
+        DatasetError: The file is not a RIFF WAVE file, or not PCM.
     """
     try:
-        with wave.open(str(path), "rb") as handle:
-            return WavInfo(
-                handle.getframerate(),
-                handle.getnchannels(),
-                handle.getsampwidth(),
-                handle.getnframes(),
-            )
-    except (wave.Error, EOFError, OSError) as exc:
-        raise DatasetError(f"{path.name} is not a PCM WAV file: {exc}") from exc
+        with path.open("rb") as handle:
+            head = handle.read(12)
+            if len(head) < 12 or head[:4] != b"RIFF" or head[8:] != b"WAVE":
+                raise DatasetError(f"{path.name} is not a PCM WAV file: no RIFF WAVE header")
+            fmt = None
+            while len(chunk := handle.read(8)) == 8:
+                kind, size = chunk[:4], int.from_bytes(chunk[4:], "little")
+                if kind == b"data":
+                    if fmt is None:
+                        raise DatasetError(f"{path.name} has its data chunk before its fmt chunk")
+                    offset = handle.tell()
+                    available = path.stat().st_size - offset
+                    return _wav_format(fmt, path.name, offset, min(size, available))
+                if kind == b"fmt ":
+                    fmt = handle.read(size)
+                    if len(fmt) < 16:
+                        raise DatasetError(f"{path.name} has a short fmt chunk")
+                    handle.seek(size % 2, 1)
+                else:
+                    handle.seek(size + size % 2, 1)
+    except OSError as exc:
+        raise DatasetError(f"{path.name} could not be read: {exc}") from exc
+    raise DatasetError(f"{path.name} is not a PCM WAV file: no fmt and data chunks")
+
+
+def _read_frames(path: Path, info: WavInfo, start: int, count: int) -> bytes:
+    """Up to `count` whole frames of interleaved sample data from frame `start`."""
+    start = min(max(start, 0), info.frames)
+    count = min(max(count, 0), info.frames - start)
+    block = info.channels * info.width
+    try:
+        with path.open("rb") as handle:
+            handle.seek(info.data_offset + start * block)
+            data = handle.read(count * block)
+    except OSError as exc:
+        raise DatasetError(f"{path.name} could not be read: {exc}") from exc
+    return data[: len(data) - len(data) % block]
 
 
 def is_pcm16_16k_mono(info: WavInfo) -> bool:
@@ -325,20 +401,63 @@ def read_wav_segment(path: Path, start: int, count: int) -> np.ndarray:
     info = wav_info(path)
     if not is_pcm16_16k_mono(info):
         raise DatasetError(f"{path.name} is not 16 kHz mono PCM16")
-    with wave.open(str(path), "rb") as handle:
-        handle.setpos(min(max(start, 0), info.frames))
-        data = handle.readframes(max(count, 0))
-    return np.frombuffer(data, dtype="<i2").copy()
+    return np.frombuffer(_read_frames(path, info, start, count), dtype="<i2").copy()
 
 
-def read_audio(path: Path) -> tuple[np.ndarray, int]:
-    """A file's samples as float32 in [-1, 1], channels averaged, and its sample rate.
-
-    WAV is read with the standard library (PCM16 or PCM32); FLAC, LibriSpeech's format, with
-    soundfile, imported here only.
+def read_pcm16_mono(path: Path) -> bytes:
+    """All of a 16 kHz mono PCM16 WAV's sample data, plain or WAVE_FORMAT_EXTENSIBLE.
 
     Raises:
-        DatasetError: The file cannot be read as audio.
+        DatasetError: The file is not 16 kHz mono PCM16.
+    """
+    info = wav_info(path)
+    if not is_pcm16_16k_mono(info):
+        raise DatasetError(f"{path.name} is not 16 kHz mono PCM16")
+    return _read_frames(path, info, 0, info.frames)
+
+
+def audio_format(path: Path) -> tuple[int, int]:
+    """The rate and channel count `read_audio` reads `path` at, from its header alone.
+
+    Raises:
+        DatasetError: `read_audio` could not read the file.
+    """
+    if path.suffix.lower() == ".flac":
+        import soundfile  # noqa: PLC0415 - only the FLAC sources need it
+
+        try:
+            found = soundfile.info(str(path))
+        except (RuntimeError, OSError) as exc:
+            raise DatasetError(f"{path.name} could not be read: {exc}") from exc
+        return int(found.samplerate), int(found.channels)
+    info = _readable_wav(path)
+    return info.rate, info.channels
+
+
+def _readable_wav(path: Path) -> WavInfo:
+    info = wav_info(path)
+    if info.width not in READ_WIDTHS:
+        raise DatasetError(f"{path.name} has {8 * info.width}-bit samples; 16 or 32 are read")
+    return info
+
+
+def _pick(data: np.ndarray, channel: int | None, name: str) -> np.ndarray:
+    if channel is None:
+        return data.mean(axis=1)
+    if not 0 <= channel < data.shape[1]:
+        raise DatasetError(f"{name} has {data.shape[1]} channels; channel {channel} was asked for")
+    return data[:, channel]
+
+
+def read_audio(path: Path, *, channel: int | None = None) -> tuple[np.ndarray, int]:
+    """A file's samples as float32 in [-1, 1], and its sample rate.
+
+    A multichannel file is read as the mean of its channels per sample, or as `channel` alone
+    when one is named (`read_rir` names `RIR_CHANNEL`). WAV is read here (PCM16 or PCM32, plain
+    or WAVE_FORMAT_EXTENSIBLE); FLAC, LibriSpeech's format, with soundfile, imported here only.
+
+    Raises:
+        DatasetError: The file cannot be read as audio, or has no channel `channel`.
     """
     if path.suffix.lower() == ".flac":
         import soundfile  # noqa: PLC0415 - only the FLAC sources need it
@@ -347,16 +466,27 @@ def read_audio(path: Path) -> tuple[np.ndarray, int]:
             data, rate = soundfile.read(str(path), dtype="float32", always_2d=True)
         except (RuntimeError, OSError) as exc:
             raise DatasetError(f"{path.name} could not be read: {exc}") from exc
-        return data.mean(axis=1).astype(np.float32), int(rate)
-    info = wav_info(path)
-    if info.width not in (2, 4):
-        raise DatasetError(f"{path.name} has {8 * info.width}-bit samples; 16 or 32 are read")
-    with wave.open(str(path), "rb") as handle:
-        data = handle.readframes(info.frames)
+        return _pick(data, channel, path.name).astype(np.float32), int(rate)
+    info = _readable_wav(path)
+    data = _read_frames(path, info, 0, info.frames)
     dtype, scale = ("<i2", 32768.0) if info.width == 2 else ("<i4", 2147483648.0)
     samples = np.frombuffer(data, dtype=dtype).astype(np.float32) / np.float32(scale)
-    samples = samples.reshape(-1, info.channels).mean(axis=1)
+    samples = _pick(samples.reshape(-1, info.channels), channel, path.name)
     return samples.astype(np.float32), info.rate
+
+
+def read_rir(path: Path) -> tuple[np.ndarray, int]:
+    """A room response as float32 and its sample rate: channel `RIR_CHANNEL` of a multichannel one.
+
+    A multichannel response is one microphone array's responses to one source, each with its own
+    delay; their mean is no room's response, since the delays smear its direct path and
+    reflections. Convolving with one microphone's response, the first, is the usual convention.
+    Every other source is read as the mean of its channels (`read_audio`).
+
+    Raises:
+        DatasetError: The file cannot be read as audio.
+    """
+    return read_audio(path, channel=RIR_CHANNEL)
 
 
 def to_16k(samples: np.ndarray, rate: int) -> np.ndarray:
@@ -404,16 +534,14 @@ def downmix_pcm16(source: Path, dest: Path, block_frames: int = 1 << 18) -> int:
     info = wav_info(source)
     if not is_pcm16_16k(info):
         raise DatasetError(f"{source.name} is not 16 kHz PCM16")
-    frame_bytes = SAMPLE_WIDTH * info.channels
     written = 0
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(source), "rb") as reader, wave.open(str(dest), "wb") as writer:
+    with wave.open(str(dest), "wb") as writer:
         writer.setnchannels(1)
         writer.setsampwidth(SAMPLE_WIDTH)
         writer.setframerate(SAMPLE_RATE)
-        while data := reader.readframes(block_frames):
-            whole = len(data) - len(data) % frame_bytes
-            frames = np.frombuffer(data[:whole], dtype="<i2").reshape(-1, info.channels)
+        while data := _read_frames(source, info, written, block_frames):
+            frames = np.frombuffer(data, dtype="<i2").reshape(-1, info.channels)
             mean = np.round(frames.astype(np.float64).mean(axis=1))
             writer.writeframes(np.clip(mean, -32768, 32767).astype("<i2").tobytes())
             written += len(frames)
