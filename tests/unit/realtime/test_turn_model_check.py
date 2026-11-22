@@ -160,6 +160,7 @@ from backend.realtime.ingress import (
 from backend.realtime.protocol import (
     Frame,
     MsgType,
+    PlaybackDuckMessage,
     TranscriptionMessage,
     VoiceDecisionDegraded,
 )
@@ -234,7 +235,7 @@ REPLY = "Hi. "
 ACK = "One moment. "
 CLOSING = ("transcription", "voice_decision:dropped", "voice_decision:wake_lost")
 WAKE_ENDS = ("voice_decision:wake_rejected", "voice_decision:wake_lost")
-"""The messages that end a name without accepting it; neither may cut or idle a turn."""
+"""The messages that end a name without accepting it; neither may cut a turn or send a state."""
 
 EAGER_SAFE = frozenset({"deliver", "take", "synth_fail", "text"})
 """The actions under which the controller step is eager; only `text` then waits for it (C1)."""
@@ -1260,11 +1261,10 @@ class World:
                 self.fail("rejection cuts nothing", f"{names}")
             if len(self.outbound.purges) > step.purges_from:
                 self.fail("rejection cuts nothing", f"a purge in the step of a {end}")
-            if step.phase in ("thinking", "speaking"):
-                after = names[names.index(end) + 1 :]
-                cycles = [n for n in after if n.startswith("state_cycle")]
-                if cycles and cycles[0] == "state_cycle:idle":
-                    self.fail("rejection restores", f"{step.phase} {end} then {cycles[0]}")
+            after = names[names.index(end) + 1 :]
+            cycles = [n for n in after if n.startswith("state_cycle")]
+            if cycles:
+                self.fail("rejection sends no state", f"{step.phase} {end} then {cycles[0]}")
         for call in scene:
             if call[0] == "phase" and call[1] in ("wake", "listening") and not newly:
                 self.fail("scene anchors", f"{call[1]} intent with no acceptance in its step")
@@ -1340,13 +1340,21 @@ class World:
             held = turn is not None and turn.held and not turn.ending and turn.utterance_id == uid
             if (record is None or record.closed) and not held:
                 self.fail("K kept", f"{kept.turn.turn_id} kept with {uid} closed and none held")
-        # v8: no utterance is open while ingress is muted; an attend cue is never left standing.
+        # v8: no utterance is open while ingress is muted.
         if self.muted and self.ingress is not None and self.ingress.open_uid is not None:
             self.fail("mute", f"ingress holds {self.ingress.open_uid} open while muted")
-        if self.handling is None and c._candidate is None:
-            cycles = [describe(i) for i in client if describe(i).startswith("state_cycle")]
-            if cycles and cycles[-1] == "state_cycle:attend":
-                self.fail("attend", "attend left standing with no candidate")
+        # A71: no `attend` is ever sent; the wake cue is acceptance's `listen`.
+        if any(describe(i) == "state_cycle:attend" for i in client):
+            self.fail("attend", "state_cycle attend sent")
+        # No duck is left standing: a live turn ducked with no candidate and no unduck after.
+        if self.handling is None and c._candidate is None and turn is not None and not turn.ending:
+            dbs = [
+                i.db
+                for i in client
+                if isinstance(i, PlaybackDuckMessage) and i.turn_id == turn.turn_id
+            ]
+            if dbs and dbs[-1] != 0.0:
+                self.fail("duck", f"{turn.turn_id} left ducked with no candidate")
         # v6: segments after the ack, in the vocabulary, neutral first unless hinted.
         for turn_id, segments in self.segments.items():
             for _, _, state in segments:
@@ -1571,7 +1579,6 @@ class World:
                 wake.proceed,
                 wake.gate_requested,
                 wake.ducked is not None,
-                wake.attend_at is not None,
                 wake.claim_id,
                 u(wake.utterance_id),
                 wake.reference_score,
@@ -2344,6 +2351,19 @@ def _no_restore(world: World) -> None:
     world.controller._restore = lambda wake: None  # type: ignore[method-assign]
 
 
+def _attend_at_every_name(world: World) -> None:
+    """The v17 cue put back: `attend` at every name hit."""
+    c = world.controller
+    from backend.realtime.ingress import NameHeard
+    from backend.realtime.protocol import StateCycleMessage
+
+    async def heard(event):
+        c._send_control(StateCycleMessage(state="attend"))
+        await c._on_name_heard(event)
+
+    _handler(world, NameHeard, heard)
+
+
 def _restore_to_idle(world: World) -> None:
     c = world.controller
     from backend.realtime.protocol import StateCycleMessage
@@ -2483,8 +2503,9 @@ TEETH: list[tuple[str, str, int, Callable[[World], None]]] = [
     ("scene cancel", "speaking", 1, _scene_after_cut),
     ("L2", "held", 1, _ignore_voice_stop),
     ("M68", "speaking", 2, _degraded_on_control),
-    ("attend", "idle", 2, _no_restore),
-    ("rejection restores", "speaking", 2, _restore_to_idle),
+    ("duck", "speaking", 2, _no_restore),
+    ("attend", "idle", 1, _attend_at_every_name),
+    ("rejection sends no state", "speaking", 2, _restore_to_idle),
     ("v6 segments", "held", 2, _any_hinted_state),
     ("scene anchors", "idle", 1, _listening_at_every_name),
     ("rejection cuts nothing", "speaking", 2, _purge_at_rejection),

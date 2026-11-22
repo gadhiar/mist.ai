@@ -31,11 +31,12 @@ committed.
 MIST wakes by name. A `NameHeard` from the server's spotter, or an endpoint's `wake` and the
 `NameHeard` its backlog yields, opens an unpublished wake candidate: nothing names it on the
 wire, in a log line or to the responder until the addressee gate accepts it or it loses
-arbitration. The controller checks her own recent speech first, sends `attend`, opens the
-candidate, claims it from the cross-session arbiter, checks the reference score once the claim
-may proceed, and only then asks ingress for the one gate decode. Acceptance publishes the
-candidate in one step and replays any end of turn held meanwhile; rejection drops it and sends
-one `wake_rejected`. A claim that loses because another session's name was accepted drops it
+arbitration. The controller checks her own recent speech first, ducks her playback while she
+speaks, opens the candidate, claims it from the cross-session arbiter, checks the reference score
+once the claim may proceed, and only then asks ingress for the one gate decode. No `attend` is
+sent at the hit: acceptance publishes the candidate in one step, `listen` first after the cut of
+any turn in flight, and replays any end of turn held meanwhile; rejection drops it and sends
+one `wake_rejected` and no state. A claim that loses because another session's name was accepted drops it
 and sends one `wake_lost`, naming its utterance, or a fresh id when an endpoint wake's backlog
 has not opened one yet. While a turn is in flight an accepted name interrupts it with `barge_in`
 reason `wake`, except a model turn still `thinking` with none of its audio queued, which the name
@@ -725,7 +726,6 @@ class _Wake:
     name_end_ms: int
     turn_id: str | None
     reference_score: float | None = None
-    attend_at: int | None = None
     ducked: str | None = None
     claim_id: int | None = None
     proceed: bool = False
@@ -1753,7 +1753,7 @@ class TurnController:
                 )
             )
         elif utterance.candidate:
-            # Nothing named it, so no message names its close; a name's cue is undone (v8).
+            # Nothing named it, so no message names its close; a name's duck is undone (v8).
             utterance.candidate = False
             utterance.held_ends.clear()
             wake = self._candidate_of(event.utterance_id)
@@ -1780,10 +1780,10 @@ class TurnController:
     async def _on_name_heard(self, event: NameHeard) -> None:
         """The `NameHeard` row (v5 :1174): a name hit opens a wake candidate.
 
-        Check a, `attend` (and a duck while she speaks), the candidate, then a claim; checks b
-        and c follow when the claim may proceed. A held utterance is already addressed, so a
-        name in it is ignored, as is a name in a published utterance or while another candidate
-        waits. An endpoint's `NameHeard` continues the `wake` that armed it.
+        Check a, a duck while she speaks, the candidate, then a claim; checks b and c follow
+        when the claim may proceed. No `attend` is sent at the hit. A held utterance is already
+        addressed, so a name in it is ignored, as is a name in a published utterance or while
+        another candidate waits. An endpoint's `NameHeard` continues the `wake` that armed it.
         """
         if not self._accept(event):
             return
@@ -1808,7 +1808,7 @@ class TurnController:
         if not self._screen_self_speech(wake):
             return
         self._candidate = wake
-        self._attend(wake)
+        self._duck(wake)
         if not self._open_candidate(wake, event.from_pos, named):
             return
         self._claim(wake, self._wake.kws_threshold)
@@ -1851,10 +1851,10 @@ class TurnController:
         return wake
 
     def _screen_self_speech(self, wake: _Wake) -> bool:
-        """Check a, which reads memory only and so runs before `attend`: False when it rejects.
+        """Check a, which reads memory only and so runs before the duck: False when it rejects.
 
         `pre_decode` is asked about her recent speech alone here; the reference score is check
-        b's, which runs after `attend`.
+        b's, which runs once the claim may proceed.
         """
         recent = self._recent_tts_text(self._gate.echo_guard_ms)
         verdict = self._gate.pre_decode(
@@ -1865,12 +1865,12 @@ class TurnController:
         self._send_wake_rejected(wake, "self_speech")
         return False
 
-    def _attend(self, wake: _Wake) -> None:
-        """`attend` at the hit, before any wait, and the duck while she speaks (v5 :1174)."""
-        now = self._clock.now_ms()
-        if self._wake.attend_cue:
-            wake.attend_at = now
-            self._send_control(StateCycleMessage(state="attend"))
+    def _duck(self, wake: _Wake) -> None:
+        """Duck her playback at the hit while she speaks, before any wait (v5 :1174).
+
+        The duck stays at the hit; the wake cue moved to acceptance (A71), so no state goes out
+        here: an accepted wake's `listen` is its first.
+        """
         turn = self._turn
         if self._phase == "speaking" and turn is not None and not turn.ending:
             wake.ducked = turn.turn_id
@@ -1880,7 +1880,7 @@ class TurnController:
         """Open the candidate at `from_pos`; in a turn's phase it is the open engaged utterance.
 
         A name that falls in an utterance already published is already addressed: the hit is
-        abandoned with its cue undone, and False is returned.
+        abandoned with its duck undone, and False is returned.
         """
         utterance = named if named is not None and not named.closed else None
         if utterance is None:
@@ -2009,10 +2009,9 @@ class TurnController:
         utterance = self._utterances[wake.utterance_id]
         utterance.candidate = False
         now = self._clock.now_ms()
-        screened_at = wake.attend_at if wake.attend_at is not None else now
         utterance.wake_timings = {
             "wake_accept_ms": max(now - wake.arrival_ms, 0),
-            "wake_screen_ms": max(screened_at - wake.name_end_ms, 0),
+            "wake_screen_ms": max(now - wake.name_end_ms, 0),
         }
         turn = self._turn
         if turn is not None and not turn.ending:
@@ -2158,13 +2157,13 @@ class TurnController:
             await self._judge_followup(utterance)
 
     def _reject(self, wake: _Wake, reason: WakeRejectReason) -> None:
-        """Drop the candidate, send one `wake_rejected`, and put the client back (v5 :417-422)."""
+        """Drop the candidate, send one `wake_rejected`, and undo any duck (v5 :417-422)."""
         self._abandon(wake, drop_reason="not_addressed", restore=False)
         self._send_wake_rejected(wake, reason)
         self._restore(wake)
 
     def _lose(self, wake: _Wake, winner_score: float | None) -> None:
-        """Another session's name won arbitration: drop, one `wake_lost`, restore (A52, v2 :2256).
+        """Another session's name won arbitration: drop, one `wake_lost`, unduck (A52, v2 :2256).
 
         The message names the open candidate's utterance. An endpoint wake whose backlog has not
         arrived has none, so it names a fresh id, as the muted endpoint wake's `dropped` does;
@@ -2189,7 +2188,7 @@ class TurnController:
         """End the candidate with its claim settled not accepted and no message naming it.
 
         `drop_reason` closes its utterance through ingress's `drop`; None leaves ingress alone,
-        when ingress dropped it itself or is closing. `restore` undoes the hit's cue.
+        when ingress dropped it itself or is closing. `restore` undoes the hit's duck.
         """
         if self._candidate is wake:
             self._candidate = None
@@ -2205,23 +2204,16 @@ class TurnController:
             self._restore(wake)
 
     def _restore(self, wake: _Wake) -> None:
-        """Unduck if the hit ducked, and resend the current phase's state after `attend`."""
+        """Unduck if the hit ducked; nothing else, since no state went out at the hit (A71).
+
+        A wake that opens no turn sends no state: the Droplet closes its uplink on the
+        decision itself, and every other client is still showing the phase it was in.
+        """
         turn = self._turn
         ducked = wake.ducked is not None and turn is not None and turn.turn_id == wake.ducked
         if ducked and turn is not None and not turn.ending:
             self._send_control(PlaybackDuckMessage(turn_id=turn.turn_id, db=0.0))
         wake.ducked = None
-        if wake.attend_at is None:
-            return
-        wake.attend_at = None
-        if turn is None or turn.ending or self._phase == "idle":
-            self._send_control(StateCycleMessage(state="idle"))
-        elif self._phase == "speaking":
-            self._send_control(StateCycleMessage(state="speak", turn_id=turn.turn_id))
-        elif self._phase == "held":
-            self._send_control(StateCycleMessage(state="listen"))
-        else:
-            self._send_control(StateCycleMessage(state="think", turn_id=turn.turn_id))
 
     def _send_wake_rejected(self, wake: _Wake, reason: WakeRejectReason) -> None:
         self._send_control(
@@ -2348,8 +2340,8 @@ class TurnController:
 
         The held utterance was never shown as a turn, so it closes visibly (`dropped
         text_input`) rather than ending later and cutting the typed turn it preceded (v1). An
-        unpublished candidate is dropped silently (v5 :1189-1190); the typed turn's `think`
-        follows the `attend` its name sent. A kept turn (A51) is recorded alone before the typed
+        unpublished candidate is dropped silently (v5 :1189-1190), its duck undone; the typed
+        turn's `think` is the next state. A kept turn (A51) is recorded alone before the typed
         turn opens, so its record comes first; an utterance it waited on that stays open later
         starts a turn with its own text.
         """
@@ -2423,8 +2415,7 @@ class TurnController:
     async def _stop_voice(self) -> None:
         """An unpublished candidate is dropped silently with ingress (v5 :1189-1190).
 
-        When its name sent `attend` and no cut follows to send `idle`, the phase's state is sent
-        again, so the client is not left attending.
+        When its hit ducked her playback and no cut follows to stop it, the duck is undone.
         """
         if self._pending is not None:
             pending, self._pending = self._pending, None
@@ -2537,7 +2528,7 @@ class TurnController:
 
         An endpoint wake still waiting for its backlog has no utterance to drop: ingress
         discarded the backlog at mute, so the wake is abandoned here, with its claim settled and
-        its cue undone, and no message (v8 :253-255).
+        its duck undone, and no message (v8 :253-255).
         """
         self._muted = message.active
         wake = self._candidate
@@ -2549,10 +2540,10 @@ class TurnController:
 
         With no voice session it is ignored. Muted, it gets a fresh id and one `dropped muted`
         (v4). With too little backlog it is rejected `no_backlog` before anything opens.
-        Otherwise check a, `attend` and `expect_endpoint_wake` run now, and the claim is made
-        now, from the message's arrival, so a slow backlog still takes part in arbitration; the
-        candidate opens when the backlog's `NameHeard` comes. A held, thinking, speaking or typed
-        turn is interrupted only after acceptance.
+        Otherwise check a, the duck and `expect_endpoint_wake` run now (no `attend` is sent),
+        and the claim is made now, from the message's arrival, so a slow backlog still takes
+        part in arbitration; the candidate opens when the backlog's `NameHeard` comes. A held,
+        thinking, speaking or typed turn is interrupted only after acceptance.
         """
         if self._ingress is None:
             return
@@ -2586,7 +2577,7 @@ class TurnController:
             return
         self._candidate = wake
         wake.waiting_name = True
-        self._attend(wake)
+        self._duck(wake)
         self._ingress.expect_endpoint_wake(
             keyword=message.keyword,
             score=message.score,

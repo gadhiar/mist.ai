@@ -867,8 +867,8 @@ def test_a_muted_client_reconnects_muted(voice_server):
         assert_protocol_rules(before)
 
 
-def test_a_greeting_and_a_leading_name_each_open_a_turn_attend_first(voice_server):
-    """v5 scenario 18."""
+def test_a_greeting_and_a_leading_name_each_open_a_turn_listen_first(voice_server):
+    """v5 scenario 18: no `attend` at the hit; `listen` is the first state, at acceptance."""
     texts = ["hey mist, how's it going", "mist, what's up"]
     stack = VoiceStack(transcripts=texts)
     with voice_server(stack) as srv, srv.connect() as client:
@@ -878,7 +878,8 @@ def test_a_greeting_and_a_leading_name_each_open_a_turn_attend_first(voice_serve
             client.say(NAMED, name_at_ms=NAME_AT_MS)
             finish(client)
             states = [name for name in after(client, mark) if name.startswith("state:")]
-            assert states[:2] == ["state:attend", "state:listen"]
+            assert states[0] == "state:listen"
+            assert "state:attend" not in states
             assert client.of("transcription")[-1]["text"] == text
 
         assert [request.user_text for request in srv.responder.requests] == texts
@@ -886,7 +887,7 @@ def test_a_greeting_and_a_leading_name_each_open_a_turn_attend_first(voice_serve
         assert_protocol_rules(client)
 
 
-def test_the_name_inside_other_speech_leaves_only_attend_rejected_idle(voice_server, caplog):
+def test_the_name_inside_other_speech_leaves_only_its_rejection(voice_server, caplog):
     """v5 scenario 19: neither sentence addresses her, so nothing of either travels."""
     texts = ["I missed it", "the mist rolled in"]
     stack = VoiceStack(transcripts=texts)
@@ -897,8 +898,7 @@ def test_the_name_inside_other_speech_leaves_only_attend_rejected_idle(voice_ser
         for _ in texts:
             client.say(NAMED, name_at_ms=NAME_AT_MS)
 
-        each = ["state:attend", "decision:wake_rejected", "state:idle"]
-        assert after(client, mark) == each * 2
+        assert after(client, mark) == ["decision:wake_rejected"] * 2
         assert [item["reason"] for item in client.of("wake_rejected")] == ["not_addressed"] * 2
         for word in ("missed", "rolled"):
             assert word not in caplog.text
@@ -928,7 +928,7 @@ def test_the_name_in_the_pcs_own_playback_is_self_media(voice_server):
             [silence(1400), speech_burst(1200), silence(600)], name_at_ms=1600, reference=reference
         )
 
-        assert after(client, mark) == ["state:attend", "decision:wake_rejected", "state:idle"]
+        assert after(client, mark) == ["decision:wake_rejected"]
         assert one(client, "wake_rejected")["reason"] == "self_media"
         assert srv.responder.requests == []
         assert_protocol_rules(client)

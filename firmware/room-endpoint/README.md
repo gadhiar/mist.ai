@@ -336,8 +336,7 @@ The uplink closes on the first of these, checked against the realtime controller
 - `state_cycle` `speak` or `idle` after the wake: the controller sends `state_cycle speak` before
   a reply stretch's first `0x01` (`backend/realtime/turn.py:1384-1392`), and `state_cycle idle`
   when a turn completes (`_complete`, `turn.py:3277`), when an interrupted or superseded turn
-  ends (`_cut`, `turn.py:3488`), or after an `attend` whose wake opened no turn, with nothing
-  else in flight (`_restore`, `turn.py:2186-2197`);
+  ends (`_cut`, `turn.py:3488`);
 - `voice_decision` `dropped` (`backend/realtime/protocol.py:948-973`, which closes the utterance
   it names, reason `muted` included), `wake_lost` (`protocol.py:1021-1034`, the same) or
   `wake_rejected` (`protocol.py:1037-1051`);
