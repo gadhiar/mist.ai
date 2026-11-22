@@ -365,9 +365,20 @@ ENTRIES = (
 )
 
 
-def write_manifest(root: Path, recordings: Path, *, written_root: str | None = None) -> Path:
+INTERLEAVED = tuple(ENTRIES[i] for i in (4, 0, 7, 1, 5, 2, 6, 3))
+"""`ENTRIES` with tune and test entries between the train ones, so an entry's position in the
+train-only manifest is not its position in the full one."""
+
+
+def write_manifest(
+    root: Path,
+    recordings: Path,
+    *,
+    written_root: str | None = None,
+    order: Sequence[tuple[str, str, str, str, str]] = ENTRIES,
+) -> Path:
     entries = []
-    for number, (file, label, split, phrase, session) in enumerate(ENTRIES):
+    for number, (file, label, split, phrase, session) in enumerate(order):
         samples = spoken(1.5, 0.4, 0.6, seed=number * 3)
         path = write(recordings / file, samples)
         del path
@@ -410,8 +421,18 @@ def write_clips(directory: Path, name: str, rate: int, labels: Sequence[str]) ->
 
 @pytest.fixture
 def world(tmp_path: Path) -> World:
+    return make_world(tmp_path)
+
+
+@pytest.fixture
+def interleaved(tmp_path: Path) -> World:
+    """A world whose full manifest lists tune and test entries between the train ones."""
+    return make_world(tmp_path, INTERLEAVED)
+
+
+def make_world(tmp_path: Path, order: Sequence[tuple[str, str, str, str, str]] = ENTRIES) -> World:
     recordings = tmp_path / "wake"
-    manifest = write_manifest(tmp_path, recordings)
+    manifest = write_manifest(tmp_path, recordings, order=order)
     full = wake_manifest.load_manifest(manifest)
     train_manifest = tmp_path / "train_manifest.json"
     assert (
@@ -494,7 +515,8 @@ class TestLeakageGuard:
         full = wake_manifest.load_manifest(world.manifest)
         recorded = [window for window in windows if window.file.source == "manifest"]
         assert recorded
-        assert {full.entries[w.file.entry].split for w in recorded} == {"train"}
+        split_of = {item.sha256: item.split for item in full.entries}
+        assert {split_of[w.file.sha256] for w in recorded} == {"train"}
         assert {w.kind for w in recorded} == {"real_positive", "pre_name", "homophone", "media"}
         held_out = {item.sha256 for item in full.entries if item.split != "train"}
         assert not held_out & {ref.sha256 for w in windows for ref in w.refs()}
@@ -517,6 +539,59 @@ class TestLeakageGuard:
             assert build.main(world.build_args(mined, out)) == 2
             assert not out.exists()
         assert "manifest's train split" in capsys.readouterr().err
+
+    def test_recordings_resolve_by_sha256_when_the_two_numberings_differ(
+        self, interleaved: World
+    ) -> None:
+        from scripts.wake.verifier import train
+
+        mined = interleaved.root / "mined"
+        assert run_mine(interleaved, mined) == 0
+        full = wake_manifest.load_manifest(interleaved.manifest)
+        only = wake_manifest.load_manifest(interleaved.train_manifest)
+        refs = [
+            w.file
+            for w in dataset.read_windows(mined / dataset.MINED_FILE)
+            if w.file.source == "manifest"
+        ]
+        assert {ref.entry for ref in refs} == set(range(len(only.entries)))
+        # mine numbers an entry by its place in the train-only manifest, as train reads it...
+        assert all(only.entries[ref.entry].sha256 == ref.sha256 for ref in refs)
+        # ...and in the full manifest that place holds another entry, often a tune or test one.
+        assert all(full.entries[ref.entry].sha256 != ref.sha256 for ref in refs)
+        out = interleaved.root / "dataset"
+        assert build.main(interleaved.build_args(mined, out)) == 0
+        indexed = dataset.read_windows(out / dataset.INDEX_FILE)
+        assert {w.file for w in indexed if w.file.source == "manifest"} == set(refs)
+        reader = train.WindowReader(
+            train.train_manifest(interleaved.train_manifest, {}, interleaved.training), {}
+        )
+        assert all(dataset.sha256_file(reader.path(ref)) == ref.sha256 for ref in refs)
+
+    @pytest.mark.parametrize("split", ["tune", "test", None])
+    def test_a_recording_not_a_train_entrys_by_sha256_is_refused(
+        self, interleaved: World, capsys: pytest.CaptureFixture[str], split: str | None
+    ) -> None:
+        mined = interleaved.root / "mined"
+        assert run_mine(interleaved, mined) == 0
+        full = wake_manifest.load_manifest(interleaved.manifest)
+        digest = next((e.sha256 for e in full.entries if e.split == split), "f" * 64)
+
+        def change(rows: list[dict]) -> None:
+            row = next(r for r in rows if r["file"]["source"] == "manifest")
+            row["file"]["sha256"] = digest
+
+        rewrite(mined / dataset.MINED_FILE, change)
+        out = interleaved.root / "dataset"
+        capsys.readouterr()
+        assert build.main(interleaved.build_args(mined, out)) == 2
+        assert not out.exists()
+        err = capsys.readouterr().err
+        if split is None:
+            assert "no manifest entry has" in err
+        else:
+            assert f"a {split} entry, not in the manifest's train split" in err
+        assert "rec/" not in err and ".wav" not in err
 
     @pytest.mark.parametrize(
         ("meeting", "reason"),
