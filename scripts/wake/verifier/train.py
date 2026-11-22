@@ -52,16 +52,41 @@ norm would see padding. The run writes `<out>/fold-<k>/` or `<out>/final/`: `mod
 verifier's state dict; `config.json`; `history.json`, each epoch's mean loss; and for a fold
 `oof.jsonl`. Exit 0 trained, 2 refused (an existing run directory and a store that cannot be
 built included).
+
+Benchmark. The runner that tests this file has no GPU, so the step rate a training projection
+needs comes from one run on the training host:
+
+    python -m scripts.wake.verifier.train --benchmark [--dataset <dir>] [--out <dir>] \
+        [--batch 32] [--loader-workers N] [--store-workers N] [--benchmark-seconds 30] \
+        [--benchmark-workers 0,1,2,4,8] [--benchmark-windows 16384] [--benchmark-decode 2000]
+
+It reads no manifest, no recording and no training store, so `--manifest`, `--weights`,
+`--fold`, `--final` and `--cache` are refused. Its windows are int16 noise and its room
+responses decaying noise, decoded by `open_store` into `<out>/benchmark-cache` (a temporary
+directory without `--out`), a root no training store shares since `open_store` sweeps its root;
+the directory is removed at the end, failed or not. The model is the Base+ verifier from random
+initialisation. It prints one line a measurement, each over `--benchmark-seconds` after a
+warm-up: the loader's rate for each worker count, the store's cold read rate, the step rate of
+`fit`'s own loop over batches already on the device (cudnn benchmark off, the trainer's
+setting, and on), the end-to-end rate over the real loader, and the scoring rate. With
+`--dataset` it reads the index's three files alone, times a store build over a sample of its
+public windows, and projects the five folds and the final run; without it, the seconds a
+million training examples take. Exit 0 measured, 2 refused.
 """
 
 import argparse
+import hashlib
+import itertools
 import json
+import os
 import random
+import shutil
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -97,7 +122,15 @@ from .model import (
     normalizes_waveform,
     sha256_path,
 )
-from .store import StoreError, WindowStore, index_key, open_store
+from .store import (
+    RESPONSES_FILE,
+    WINDOWS_FILE,
+    StoreError,
+    WindowStore,
+    index_key,
+    is_private,
+    open_store,
+)
 
 FOLDS = 5
 REAL_REPEAT = 10
@@ -768,11 +801,11 @@ def score_windows(
     return scores
 
 
-ModelBuilder = Callable[[TrainConfig, Path], VerifierModel]
+ModelBuilder = Callable[[TrainConfig, Path | None], VerifierModel]
 
 
-def build_wavlm_verifier(config: TrainConfig, weights: Path) -> VerifierModel:
-    """The verifier over the staged Base+ weights, loaded strictly."""
+def build_wavlm_verifier(config: TrainConfig, weights: Path | None) -> VerifierModel:
+    """The verifier over the staged Base+ weights, loaded strictly; random with no weights."""
     return build_verifier(
         base_plus_params(), weights=weights, first_trainable=config.first_trainable_layer
     )
@@ -888,16 +921,606 @@ def run(args: argparse.Namespace, build: ModelBuilder, clock: Clock = time.monot
     return 0
 
 
-def _parser() -> argparse.ArgumentParser:
+# -- Benchmark --------------------------------------------------------------------------------
+
+
+BENCHMARK_CACHE = "benchmark-cache"
+"""The benchmark's store root under `--out`. `open_store` removes every other store under its
+root, so this root is the benchmark's alone, never `--cache` or `<out>/window-cache`."""
+BENCHMARK_SECONDS = 30.0
+BENCHMARK_WORKERS = (0, 1, 2, 4, 8)
+BENCHMARK_WINDOWS = 16384
+"""Synthetic windows: 16,384 whole windows are 1.2 GB, which the page cache holds where the real
+store's 30 GB outgrows it, so the cold read line is the storage bound."""
+BENCHMARK_DECODE = 2000
+BENCHMARK_FRAMES = BEFORE_FRAMES + AFTER_FRAMES + 1
+"""A whole window's frames, 116."""
+BENCHMARK_ROOMS = (8000, 16000, 32000)
+"""The synthetic room responses' lengths in taps, `ROOMS_EACH` of each."""
+ROOMS_EACH = 20
+NOISE_LEVEL = 3000
+WARM_BATCHES = 8
+"""Batches handed over before a loader's measurement starts, so its workers have started and
+filled their prefetch."""
+STEP_POOL = 32
+"""Distinct batches the step rate cycles through on the device, about 7 MB each at most."""
+PLAN_REPEATS = 10_000
+"""How often one loader cycles the synthetic plan, so no measurement restarts its workers."""
+HONOURED = 0.8
+"""A cold pass at this fraction of the warm pass's rate or above reads as a cache not dropped."""
+MILLION = 1_000_000
+
+
+def _say(line: str) -> None:
+    print(line, flush=True)
+
+
+def _quiet(line: str) -> None:
+    del line
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticReader:
+    """Noise windows and decaying room responses made in memory for `open_store` to decode.
+
+    Each is drawn from the seed and its own position, so a decoding process makes the same
+    samples as any other; nothing is read from a file.
+    """
+
+    seed: int
+
+    def samples(self, window: Window) -> np.ndarray:
+        """The window's int16 noise, `end - start` samples."""
+        rng = np.random.default_rng((self.seed, window.start))
+        count = window.end - window.start
+        noise = rng.integers(-NOISE_LEVEL, NOISE_LEVEL + 1, count, dtype=np.int16)
+        return noise.astype("<i2", copy=False)
+
+    def rir(self, ref: FileRef) -> np.ndarray:
+        """An exponentially decaying noise response of `ref.samples` taps, peak-normalised."""
+        rng = np.random.default_rng((self.seed, int(ref.sha256[:8], 16)))
+        decay = np.exp(-np.arange(ref.samples) / (ref.samples / 6))
+        taps = rng.standard_normal(ref.samples) * decay
+        return (taps / np.max(np.abs(taps))).astype(np.float32)
+
+
+def synthetic_windows(count: int) -> list[Window]:
+    """`count` whole windows of one noise file, alternately negative and positive."""
+    length = BENCHMARK_FRAMES * FRAME_SAMPLES
+    ref = FileRef("benchmark", _digest("benchmark noise"), None, None, count * length)
+    return [
+        Window(
+            ref,
+            number * length,
+            (number + 1) * length,
+            "positive" if number % 2 else "negative",
+            "synthetic",
+            f"benchmark:{number % 64}",
+            (),
+        )
+        for number in range(count)
+    ]
+
+
+def synthetic_rooms() -> list[FileRef]:
+    """`ROOMS_EACH` room responses of each length in `BENCHMARK_ROOMS`."""
+    return [
+        FileRef("benchmark", _digest(f"benchmark room {taps} {number}"), None, None, taps)
+        for taps in BENCHMARK_ROOMS
+        for number in range(ROOMS_EACH)
+    ]
+
+
+class _Cycle(Sequence[Sequence[Item]]):
+    """A plan repeated `times` over, read lazily, so one loader outlasts any measurement."""
+
+    def __init__(self, plan: Sequence[Sequence[Item]], times: int) -> None:
+        self.plan = plan
+        self.times = times
+
+    def __len__(self) -> int:
+        return len(self.plan) * self.times
+
+    def __getitem__(self, index: int) -> Sequence[Item]:  # type: ignore[override]
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return self.plan[index % len(self.plan)]
+
+
+class _Timed:
+    """Hands over `batches` until `seconds` have passed after the first `warm` of them.
+
+    The clock starts as batch `warm` is asked for and is checked before each later one is, so
+    the examples counted are those handed over inside the time measured. A consumer that
+    finishes its work on a batch before asking for the next, as `fit`'s loop does, has done the
+    counted work by the time `rate` is read.
+    """
+
+    def __init__(self, batches: Iterable[Batch], warm: int, seconds: float, clock: Clock) -> None:
+        self.batches = batches
+        self.warm = warm
+        self.seconds = seconds
+        self.clock = clock
+        self.examples = 0
+        self.started: float | None = None
+
+    def __iter__(self) -> Iterator[Batch]:
+        iterator = iter(self.batches)
+        try:
+            for number in itertools.count():
+                if number == self.warm:
+                    self.started = self.clock()
+                elif self.started is not None and self.clock() - self.started >= self.seconds:
+                    return
+                batch = next(iterator, None)
+                if batch is None:
+                    return
+                if number >= self.warm:
+                    self.examples += len(batch.labels)
+                yield batch
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    def rate(self, now: float) -> float:
+        """Examples a second from the start to `now`."""
+        if self.started is None or now <= self.started:
+            return 0.0
+        return self.examples / (now - self.started)
+
+
+def _examples_in(batches: Sequence[Batch]) -> int:
+    return sum(len(batch.labels) for batch in batches)
+
+
+def _drop_cache(directory: Path) -> str | None:
+    """Ask the kernel to drop the store files' cached pages; why it could not, or None."""
+    advise = getattr(os, "posix_fadvise", None)
+    if advise is None:
+        return "posix_fadvise is not available"
+    for name in (WINDOWS_FILE, RESPONSES_FILE):
+        fd = os.open(directory / name, os.O_RDONLY)
+        try:
+            advise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError as exc:
+            return f"posix_fadvise was refused ({exc.strerror})"
+        finally:
+            os.close(fd)
+    return None
+
+
+def _read_pass(
+    store: WindowStore, order: Sequence[int], seconds: float, clock: Clock
+) -> tuple[int, float]:
+    started = clock()
+    read = 0
+    for window in order:
+        store.read(window, 0, store.length(window))
+        read += 1
+        if clock() - started >= seconds:
+            break
+    return read, max(clock() - started, 1e-9)
+
+
+def _cold_read(
+    store: WindowStore, mean_frames: float, seed: int, seconds: float, clock: Clock
+) -> float:
+    """One pass of whole-window reads in random order after the store's pages are dropped.
+
+    A warm pass over the same windows follows, so a drop the file system did not honour shows
+    as a cold rate close to the warm one. Returns the cold rate as training examples a second:
+    an example reads its kept frames alone.
+    """
+    order = list(range(len(store)))
+    random.Random(seed).shuffle(order)  # nosec B311 - a reproducible order only
+    refused = _drop_cache(store.directory)
+    read, elapsed = _read_pass(store, order, seconds, clock)
+    _, again = _read_pass(store, order[:read], float("inf"), clock)
+    cold, warm = read / elapsed, read / again
+    if refused is not None:
+        note = f"page cache not dropped: {refused}"
+    elif cold >= HONOURED * warm:
+        note = "page cache dropped, but the cold pass was not slower than the warm one"
+    else:
+        note = "page cache dropped"
+    megabytes = cold * BENCHMARK_FRAMES * FRAME_SAMPLES * 2 / 1e6
+    _say(
+        f"store cold read: {read} windows in random order in {elapsed:.1f} s, "
+        f"{cold:.1f} windows/s, {megabytes:.1f} MB/s; warm {warm:.1f} windows/s; {note}"
+    )
+    examples = cold * BENCHMARK_FRAMES / mean_frames
+    _say(
+        f"store cold read as examples: {cold:.1f} windows/s x {BENCHMARK_FRAMES} / "
+        f"{mean_frames:.1f} mean kept frames = {examples:.1f} examples/s"
+    )
+    return examples
+
+
+def _step_rate(
+    model: VerifierModel,
+    warm: Sequence[Batch],
+    pool: Sequence[Batch],
+    config: TrainConfig,
+    device: torch.device,
+    seconds: float,
+    clock: Clock,
+) -> float:
+    """`fit`'s own loop over batches already on the device: augmentation in, loader out.
+
+    The warm-up epoch runs `warm` once; the measured one cycles `pool` and skips its first
+    batch, which pays for the new optimiser's state.
+    """
+    one = replace(config, epochs=1)
+    fit(
+        model,
+        lambda epoch: DeviceEpoch(warm, _examples_in(warm), device, config.augment),
+        one,
+        device,
+        progress=_quiet,
+    )
+    timed = _Timed(itertools.cycle(pool), 1, seconds, clock)
+    fit(
+        model,
+        lambda epoch: DeviceEpoch(timed, _examples_in(pool), device, config.augment),
+        one,
+        device,
+        progress=_quiet,
+    )
+    return timed.rate(clock())
+
+
+def _step_rates(
+    model: VerifierModel,
+    data: EpochBatches,
+    config: TrainConfig,
+    device: torch.device,
+    seconds: float,
+    clock: Clock,
+) -> float:
+    """The step rate with cudnn's benchmark off (the trainer's setting) and on; the first.
+
+    On CUDA the warm-up covers every kept length once, so each shape's kernels are chosen
+    before the clock starts. The CPU chooses none, so there it is one batch.
+    """
+    pool = [data[index].to(device) for index in range(min(STEP_POOL, len(data)))]
+    if device.type != "cuda":
+        rate = _step_rate(model, [data[0]], pool, config, device, seconds, clock)
+        _say(f"step: cpu, {rate:.1f} examples/s; one warm-up batch, no cudnn")
+        return rate
+    firsts: dict[int, int] = {}
+    for index, items in enumerate(data.plan):
+        firsts.setdefault(items[0].frames, index)
+    warm = [data[index] for index in sorted(firsts.values())]
+    previous = torch.backends.cudnn.benchmark
+    rates: dict[bool, float] = {}
+    try:
+        for flag in (False, True):
+            torch.backends.cudnn.benchmark = flag
+            torch.cuda.reset_peak_memory_stats(device)
+            rates[flag] = _step_rate(model, warm, pool, config, device, seconds, clock)
+            peak = torch.cuda.max_memory_allocated(device) / 2**30
+            _say(
+                f"step: cudnn benchmark {'on' if flag else 'off'}, {rates[flag]:.1f} "
+                f"examples/s over {len(warm)} warmed lengths, peak {peak:.2f} GiB allocated"
+            )
+    finally:
+        torch.backends.cudnn.benchmark = previous
+    return rates[False]
+
+
+def _scoring_rate(
+    model: VerifierModel, store: WindowStore, device: torch.device, seconds: float, clock: Clock
+) -> float:
+    """`score_windows`' rate over whole windows, one batch of them warming up."""
+    chunk = min(SCORE_BATCH, len(store))
+    windows = itertools.cycle(range(len(store)))
+    score_windows(model, store, list(itertools.islice(windows, chunk)), device, progress=_quiet)
+    started = clock()
+    scored = 0
+    while True:
+        held = list(itertools.islice(windows, chunk))
+        score_windows(model, store, held, device, progress=_quiet)
+        scored += len(held)
+        now = clock()
+        if now - started >= seconds:
+            return scored / max(now - started, 1e-9)
+
+
+@dataclass(frozen=True, slots=True)
+class Workload:
+    """What the five folds and the final run read.
+
+    Attributes:
+        folds: Each fold's training examples an epoch (`REAL_REPEAT` included) and its
+            held-out windows.
+        final: The final run's training examples an epoch.
+        public: The windows a store build decodes.
+    """
+
+    folds: tuple[tuple[int, int], ...]
+    final: int
+    public: int
+
+
+def workload(windows: Sequence[Window], config: TrainConfig = _DEFAULTS) -> Workload:
+    """The workload of the index's real fold split."""
+    assigned = assign_folds(windows, config.folds)
+    repeats = [config.real_repeat if w.kind == "real_positive" else 1 for w in windows]
+    split = []
+    for fold in range(config.folds):
+        held = [assigned[window.group] == fold for window in windows]
+        trained = sum(repeat for repeat, out in zip(repeats, held, strict=True) if not out)
+        split.append((trained, sum(held)))
+    public = sum(1 for window in windows if not is_private(window))
+    return Workload(tuple(split), sum(repeats), public)
+
+
+@dataclass(frozen=True, slots=True)
+class Rates:
+    """The measured rates: examples a second, but windows a second for `scoring` and `build`."""
+
+    step: float
+    loader: float
+    cold_read: float
+    scoring: float
+    build: float
+
+    @property
+    def training(self) -> float:
+        """The bound on training: the least of the step, the loader and the cold read."""
+        return min(self.step, self.loader, self.cold_read)
+
+
+def _over(amount: float, rate: float) -> float:
+    if amount == 0:
+        return 0.0
+    return amount / rate if rate > 0 else float("inf")
+
+
+def projection(work: Workload | None, rates: Rates, epochs: int) -> list[str]:
+    """The projection's lines, each with its arithmetic.
+
+    With a workload: each run's training and each fold's scoring, the store build once, and
+    the total. Without one: the seconds a million training examples take.
+    """
+    training = rates.training
+    lines = [
+        f"projection: training rate min(step {rates.step:.1f}, loader {rates.loader:.1f}, "
+        f"cold read {rates.cold_read:.1f}) = {training:.1f} examples/s"
+    ]
+    if work is None:
+        lines.append(
+            f"projection: {MILLION} / {training:.1f} = {_over(MILLION, training):.0f} s "
+            "a million training examples"
+        )
+        return lines
+    total = 0.0
+    for fold, (examples, held) in enumerate(work.folds):
+        trained = _over(epochs * examples, training)
+        scored = _over(held, rates.scoring)
+        total += trained + scored
+        lines.append(
+            f"projection: fold {fold} training {epochs} x {examples} / {training:.1f} "
+            f"= {trained:.0f} s"
+        )
+        lines.append(
+            f"projection: fold {fold} scoring {held} / {rates.scoring:.1f} = {scored:.0f} s"
+        )
+    final = _over(epochs * work.final, training)
+    built = _over(work.public, rates.build)
+    total += final + built
+    lines += [
+        f"projection: final training {epochs} x {work.final} / {training:.1f} = {final:.0f} s",
+        f"projection: store build {work.public} / {rates.build:.1f} = {built:.0f} s",
+        f"projection: total {total:.0f} s = {total / 3600:.2f} h",
+    ]
+    return lines
+
+
+def _sample_build(indexed: Indexed, root: Path, args: argparse.Namespace, clock: Clock) -> float:
+    """Windows a second of a store build over a random sample of the index's public windows.
+
+    The reader has no manifest entries, so no recording can be read; the sample's windows read
+    their files from the source roots `meta.json` gives.
+    """
+    public = [window for window in indexed.windows if not is_private(window)]
+    count = min(args.benchmark_decode, len(public))
+    sample = random.Random(args.seed).sample(public, count)  # nosec B311 - a sample only
+    reader = WindowReader(RecordingManifest(Path(), "", ()), indexed.roots)
+    started = clock()
+    built = open_store(
+        root,
+        _digest(f"benchmark sample {indexed.provenance_sha256} {count}"),
+        sample,
+        [],
+        reader,
+        provenance_sha256=indexed.provenance_sha256,
+        workers=args.store_workers,
+        progress=_quiet,
+    )
+    elapsed = max(clock() - started, 1e-9)
+    built.close()
+    shutil.rmtree(root, ignore_errors=True)
+    rate = count / elapsed
+    _say(
+        f"store build: {count} public windows decoded in {elapsed:.1f} s with "
+        f"{args.store_workers} workers, {rate:.1f} windows/s"
+    )
+    return rate
+
+
+def _check_benchmark(args: argparse.Namespace) -> None:
+    if args.batch < 1 or args.accumulate < 1 or args.accumulate > args.batch:
+        raise TrainError("--batch and --accumulate must be at least 1, accumulate <= batch")
+    if args.loader_workers < 0 or args.store_workers < 1:
+        raise TrainError("--loader-workers must be at least 0 and --store-workers at least 1")
+    if not args.benchmark_seconds > 0 or args.benchmark_windows < 1 or args.benchmark_decode < 1:
+        raise TrainError(
+            "--benchmark-seconds must be above 0, --benchmark-windows and --benchmark-decode "
+            "at least 1"
+        )
+
+
+def benchmark(args: argparse.Namespace, build: ModelBuilder, clock: Clock = time.monotonic) -> int:
+    """Measure the trainer's rates on synthetic windows and print the projection.
+
+    Its store root is removed at the end, whether the measurements finished or not.
+    """
+    _check_benchmark(args)
+    indexed = load_index(args.dataset) if args.dataset is not None else None
+    if args.out is not None:
+        root = args.out / BENCHMARK_CACHE
+        root.mkdir(parents=True, exist_ok=True)
+    else:
+        root = Path(tempfile.mkdtemp(prefix="verifier-benchmark-"))
+    try:
+        _measure(args, build, clock, indexed, root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
+def _measure(
+    args: argparse.Namespace,
+    build: ModelBuilder,
+    clock: Clock,
+    indexed: Indexed | None,
+    root: Path,
+) -> None:
+    config = TrainConfig(
+        batch=args.batch,
+        accumulate=args.accumulate,
+        seed=args.seed,
+        loader_workers=args.loader_workers,
+    )
+    seconds = args.benchmark_seconds
+    windows = synthetic_windows(args.benchmark_windows)
+    rooms = synthetic_rooms()
+    # Both stores before the device: their decoding processes start by spawn, as in `run`.
+    started = clock()
+    store = open_store(
+        root / "synthetic",
+        _digest(f"benchmark {len(windows)} {len(rooms)}"),
+        windows,
+        rooms,
+        SyntheticReader(config.seed),
+        provenance_sha256=_digest("benchmark"),
+        workers=args.store_workers,
+        progress=_quiet,
+    )
+    size = sum((store.directory / name).stat().st_size for name in (WINDOWS_FILE, RESPONSES_FILE))
+    _say(
+        f"synthetic store: {len(windows)} windows of {BENCHMARK_FRAMES} frames and {len(rooms)} "
+        f"room responses of {', '.join(str(taps) for taps in BENCHMARK_ROOMS)} taps, "
+        f"{size / 1e9:.2f} GB, built in {clock() - started:.1f} s with {args.store_workers} "
+        "workers"
+    )
+    work = None
+    build_rate = 0.0
+    if indexed is not None:
+        work = workload(indexed.windows, config)
+        _say(
+            f"index: {len(indexed.windows)} windows, {work.public} public, held-out windows by "
+            f"fold {', '.join(str(held) for _, held in work.folds)}"
+        )
+        build_rate = _sample_build(indexed, root / "sample", args, clock)
+    labels = [1.0 if window.label == "positive" else 0.0 for window in windows]
+    plan = plan_epoch(windows, range(len(windows)), config, 1)
+    mean_frames = float(np.mean([item.frames for items in plan for item in items]))
+    cold_read = _cold_read(store, mean_frames, config.seed, seconds, clock)
+
+    on_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if on_cuda else "cpu")
+    if on_cuda:
+        _say(f"device: cuda, {torch.cuda.get_device_name(device)}")
+    else:
+        _say("device: cpu; no CUDA, so the step, end-to-end and scoring rates are the CPU's")
+    cycled = EpochBatches(_Cycle(plan, PLAN_REPEATS), labels, store, config.augment)
+    loader_rates: dict[int, float] = {}
+    for workers in dict.fromkeys([*args.benchmark_workers, config.loader_workers]):
+        timed = _Timed(epoch_loader(cycled, workers, pin=on_cuda), WARM_BATCHES, seconds, clock)
+        for _ in timed:
+            pass
+        loader_rates[workers] = timed.rate(clock())
+        pinned = ", pinned" if on_cuda else ""
+        _say(f"loader: {workers} workers, {loader_rates[workers]:.1f} examples/s{pinned}")
+
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    model = build(config, None)
+    data = EpochBatches(plan, labels, store, config.augment)
+    step = _step_rates(model, data, config, device, seconds, clock)
+    if on_cuda:
+        torch.cuda.empty_cache()
+
+    workers = config.loader_workers if on_cuda else 0
+    timed = _Timed(
+        epoch_loader(cycled, workers, pin=on_cuda), WARM_BATCHES if on_cuda else 1, seconds, clock
+    )
+    examples = sum(len(items) for items in plan)
+    fit(
+        model,
+        lambda epoch: DeviceEpoch(timed, examples, device, config.augment),
+        replace(config, epochs=1),
+        device,
+        progress=_quiet,
+    )
+    reads = "" if on_cuda else ", as the trainer reads on the CPU"
+    _say(f"end-to-end: {workers} loader workers{reads}, {timed.rate(clock()):.1f} examples/s")
+
+    scoring = _scoring_rate(model, store, device, seconds, clock)
+    _say(f"scoring: {BENCHMARK_FRAMES}-frame windows, {scoring:.1f} windows/s")
+    store.close()
+
+    loader = loader_rates[config.loader_workers]
+    rates = Rates(step, loader, cold_read, scoring, build_rate)
+    for line in projection(work, rates, config.epochs):
+        _say(line)
+    ratio = loader / step if step > 0 else float("inf")
+    _say(f"ratio: loader / step = {loader:.1f} / {step:.1f} = {ratio:.2f}")
+
+
+# -- The command line -------------------------------------------------------------------------
+
+
+_BENCHMARK_DEFAULTS: dict[str, object] = {
+    "benchmark_seconds": BENCHMARK_SECONDS,
+    "benchmark_workers": BENCHMARK_WORKERS,
+    "benchmark_windows": BENCHMARK_WINDOWS,
+    "benchmark_decode": BENCHMARK_DECODE,
+}
+_TRAINING_INPUTS = ("manifest", "weights", "fold", "final", "cache")
+"""What the benchmark refuses: it reads no manifest, no weights and no training store."""
+
+
+def _worker_counts(text: str) -> tuple[int, ...]:
+    try:
+        counts = tuple(int(part) for part in text.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a comma-separated list of counts: {text}") from exc
+    if any(count < 0 for count in counts):
+        raise argparse.ArgumentTypeError("a worker count is at least 0")
+    return counts
+
+
+def _parser(benchmark: bool = False) -> argparse.ArgumentParser:
+    """The command line; with `benchmark` no training input is required."""
     parser = argparse.ArgumentParser(
         prog="python -m scripts.wake.verifier.train", description=__doc__
     )
-    parser.add_argument("--dataset", required=True, type=Path)
-    parser.add_argument("--manifest", required=True, type=Path)
+    training = not benchmark
+    parser.add_argument("--dataset", required=training, type=Path)
+    parser.add_argument("--manifest", required=training, type=Path)
     parser.add_argument("--root-map", action="append", default=[])
-    parser.add_argument("--weights", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
-    which = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument("--weights", required=training, type=Path)
+    parser.add_argument("--out", required=training, type=Path)
+    which = parser.add_mutually_exclusive_group(required=training)
     which.add_argument("--fold", type=int)
     which.add_argument("--final", action="store_true")
     parser.add_argument("--batch", type=int, default=_DEFAULTS.batch)
@@ -907,7 +1530,45 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--store-workers", type=int, default=STORE_WORKERS)
     parser.add_argument("--loader-workers", type=int, default=_DEFAULTS.loader_workers)
     parser.add_argument("--progress-seconds", type=float, default=PROGRESS_SECONDS)
+    parser.add_argument("--benchmark", action="store_true", help="measure; train nothing")
+    parser.add_argument("--benchmark-seconds", type=float, help=f"default {BENCHMARK_SECONDS:g}")
+    parser.add_argument(
+        "--benchmark-workers",
+        type=_worker_counts,
+        help=f"default {','.join(str(count) for count in BENCHMARK_WORKERS)}",
+    )
+    parser.add_argument("--benchmark-windows", type=int, help=f"default {BENCHMARK_WINDOWS}")
+    parser.add_argument("--benchmark-decode", type=int, help=f"default {BENCHMARK_DECODE}")
     return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """The arguments; argparse exits 2 on a missing, refused or malformed one.
+
+    `--benchmark` is found first, so a training run still requires every input it did, and a
+    benchmark refuses the training inputs and fills its own flags' defaults.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    probe.add_argument("--benchmark", action="store_true")
+    known, _ = probe.parse_known_args(argv)
+    parser = _parser(benchmark=known.benchmark)
+    args = parser.parse_args(argv)
+    if args.benchmark:
+        for name in _TRAINING_INPUTS:
+            value = getattr(args, name)
+            if value is not None and value is not False:
+                parser.error(
+                    f"--benchmark reads no manifest, weights or training store: --{name} is "
+                    "refused"
+                )
+        for name, default in _BENCHMARK_DEFAULTS.items():
+            if getattr(args, name) is None:
+                setattr(args, name, default)
+        return args
+    for name in _BENCHMARK_DEFAULTS:
+        if getattr(args, name) is not None:
+            parser.error(f"--{name.replace('_', '-')} is read only with --benchmark")
+    return args
 
 
 def main(
@@ -916,9 +1577,11 @@ def main(
     build: ModelBuilder | None = None,
     clock: Clock = time.monotonic,
 ) -> int:
-    """Run the trainer; 0 trained, 2 refused."""
-    args = _parser().parse_args(argv)
+    """Run the trainer or its benchmark; 0 trained or measured, 2 refused."""
+    args = parse_args(argv)
     try:
+        if args.benchmark:
+            return benchmark(args, build or build_wavlm_verifier, clock)
         return run(args, build or build_wavlm_verifier, clock)
     except (TrainError, ManifestError, DatasetError, ModelError, StoreError) as exc:
         print(f"train: {exc}", file=sys.stderr)
