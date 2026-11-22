@@ -10,8 +10,17 @@ cut to `MAX_RESPONSE`, the longest window, since no later tap reaches a kept sam
 
 A store lives in `<root>/<key>`, `key` being the sha256 of the index's `index.jsonl`, and
 `store.json`, written last, records what it was built from. A store whose record or file sizes
-differ from what the caller asks for is rebuilt, and every open, reusing or rebuilding, leaves
-only its own store under the root: a store for the full index is tens of GB.
+differ from what the caller asks for is rebuilt, and every open, reusing or rebuilding, removes
+every other store under the root that no run holds open: a store for the full index is tens of
+GB.
+
+Locks: `<root>/.lock` serialises opens, so a sweep, a build and the taking of a store's lock
+never overlap. Each open `WindowStore` holds a shared `flock` on its store's directory until
+`close()`. A sweep removes another store only when it takes that lock exclusively without
+waiting, and a rebuild needs it exclusively too, so no open removes or rewrites a store another
+run is reading; it skips the store, or for its own key refuses. The lock is on the directory
+itself, not on a lock file beside it, so it guards the very directory the holder reads from, and
+the root gains no per-store file that could outlive its store and need a sweep of its own.
 
 Privacy: private audio never reaches the disk. A window that reads or mixes any file of source
 `manifest`, the train-only manifest's recordings, takes no bytes in `windows.pcm`; each open
@@ -34,6 +43,7 @@ import re
 import shutil
 import sys
 import time
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import contextmanager
@@ -73,6 +83,7 @@ IN_FLIGHT = 4
 _PCM = np.dtype("<i2")
 _F32 = np.dtype("<f4")
 _KEY = re.compile(r"[0-9a-f]{64}")
+_PARTIAL = re.compile(r"[0-9a-f]{64}\.partial-\d+")
 
 
 class StoreError(ValueError):
@@ -177,13 +188,25 @@ class WindowStore:
     The files are opened lazily in each process and reopened when the process id changes, so a
     DataLoader worker forked from the trainer reads through its own descriptor. The pickled
     state holds the layout and the private windows, never a descriptor.
+
+    The store opened by `open_store` holds the shared lock on its directory from then until
+    `close()`, or until it is garbage collected, so no other open removes it meanwhile. A
+    worker's copy, forked or unpickled, holds no lock of its own; the opening process's lock
+    covers the worker's reads while that process keeps the store open.
     """
 
-    def __init__(self, directory: Path, layout: Layout, private: Mapping[int, np.ndarray]) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        layout: Layout,
+        private: Mapping[int, np.ndarray],
+        lock: int | None = None,
+    ) -> None:
         self._directory = directory
         self._layout = layout
         self._private = dict(private)
         self._descriptors: tuple[int, int, int] | None = None
+        self._holder = None if lock is None else weakref.finalize(self, _release, os.getpid(), lock)
 
     def __len__(self) -> int:
         return len(self._layout.lengths)
@@ -191,6 +214,7 @@ class WindowStore:
     def __getstate__(self) -> dict[str, object]:
         state = dict(self.__dict__)
         state["_descriptors"] = None
+        state["_holder"] = None
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -250,11 +274,18 @@ class WindowStore:
         return out
 
     def close(self) -> None:
-        """Close this process's descriptors; a later read opens them again."""
+        """Close this process's descriptors and release the store's lock.
+
+        A later read opens the files again, but the store is no longer held: the next open of
+        another key may remove it.
+        """
         if self._descriptors is not None and self._descriptors[0] == os.getpid():
             os.close(self._descriptors[1])
             os.close(self._descriptors[2])
         self._descriptors = None
+        if self._holder is not None:
+            self._holder()
+            self._holder = None
 
     def _check_window(self, window: int) -> None:
         if not 0 <= window < len(self):
@@ -541,14 +572,37 @@ def _build(
 
 
 def _sweep(root: Path, key: str) -> None:
-    """Remove every other store and every partial build under `root`, `key`'s own included.
+    """Remove every other store no run holds, and every partial build, `key`'s own included.
 
-    Run under the lock on every open, reused or rebuilt, so one store stays on disk and a build
-    that follows counts the space the removed ones held.
+    Run under the root lock on every open, reused or rebuilt, so a build that follows counts
+    the space the removed stores held. A store is a directory named by a key that holds
+    `store.json`; another 64-hex directory is not one of ours and is left alone. A partial build
+    is always dead here: builds run under the root lock this sweep holds.
     """
-    for path in root.iterdir():
-        if path.name != key and (_KEY.fullmatch(path.name) or ".partial-" in path.name):
+    for path in sorted(root.iterdir()):
+        if _PARTIAL.fullmatch(path.name) and path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
+        elif path.name != key and _KEY.fullmatch(path.name) and (path / RECORD_FILE).is_file():
+            _remove_unheld(root, path.name)
+
+
+def _remove_unheld(root: Path, name: str) -> None:
+    """Remove the store `name`, unless an open `WindowStore` holds its lock.
+
+    The directory is renamed to a partial build's name before it is removed, so a removal cut
+    short leaves what the next sweep removes, not a directory that has lost its `store.json`.
+    """
+    directory = root / name
+    fd = _open_directory(directory)
+    try:
+        if not _try_exclusive(fd):
+            return
+        doomed = root / f"{name}.partial-{os.getpid()}"
+        shutil.rmtree(doomed, ignore_errors=True)
+        os.rename(directory, doomed)
+        shutil.rmtree(doomed, ignore_errors=True)
+    finally:
+        os.close(fd)
 
 
 def _fsync(path: Path) -> None:
@@ -570,6 +624,82 @@ def _locked(root: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+# A store's own lock is `flock` on its directory, not `fcntl.lockf` or an `F_SETLK` record lock.
+# A `flock` lock belongs to the open file description: a DataLoader worker forked from the
+# trainer inherits the descriptor and so shares the trainer's lock, and the worker's exit, which
+# closes its copy, leaves the lock held. A record lock belongs to the process instead: a forked
+# child does not inherit it, the holder loses it when it closes any descriptor of the file, the
+# one a sweep in the same process opens to test it included, and it never conflicts with another
+# lock of the same process, so a second open in one run would not see the first. An exclusive
+# record lock also needs a descriptor open for writing, which a directory cannot have; `flock`
+# needs neither. Workers started by spawn hold no descriptor; they reopen the store's files by
+# path, under the opener's lock.
+#
+# Every lock on a store's directory is taken under the root lock, so between a check that no one
+# holds a store and its removal or rebuild, no other process can take the store's lock.
+
+
+def _open_directory(directory: Path) -> int:
+    return os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+
+
+def _try_exclusive(fd: int) -> bool:
+    """True when the exclusive lock was taken: no other open description holds any lock."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _claim(directory: Path) -> None:
+    """Check that no open `WindowStore` holds `directory`, the stale store a rebuild removes.
+
+    Raises:
+        StoreError: Another holder has the store open.
+    """
+    if not directory.is_dir():
+        return
+    fd = _open_directory(directory)
+    try:
+        if not _try_exclusive(fd):
+            raise StoreError(
+                "the store for this index is stale and in use by another open store, so it is "
+                "not rebuilt; close that run first"
+            )
+    finally:
+        os.close(fd)
+
+
+def _hold(directory: Path) -> int:
+    """A descriptor of `directory` holding its shared lock, taken under the root lock.
+
+    No exclusive lock is held while the root lock is, so this never waits.
+    """
+    fd = _open_directory(directory)
+    held = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        held = True
+    finally:
+        if not held:
+            os.close(fd)
+    return fd
+
+
+def _release(owner: int, fd: int) -> None:
+    """Release a store's lock: unlocked by the process that took it, closed by any.
+
+    Only the owner unlocks: an unlock through a forked worker's copy of the descriptor would
+    release the lock the owner still holds, since the two share one open file description.
+    """
+    try:
+        if os.getpid() == owner:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def open_store(
     root: Path,
     key: str,
@@ -587,9 +717,11 @@ def open_store(
 
     A store is reused only when its `store.json` matches the request in every field and its
     files have their recorded sizes; anything else is rebuilt. Every open first removes every
-    other store and partial build under `root`, and a rebuild removes the stale store before it
-    checks the free space. Private windows are read through `reader` on every open and never
-    written.
+    partial build under `root` and every other store no open `WindowStore` holds, and a rebuild
+    removes the stale store before it checks the free space. A stale store another holder has
+    open is not rebuilt: the open is refused. All of it runs under the root's lock, and the
+    returned store holds the shared lock on its directory until `close()`. Private windows are
+    read through `reader` on every open and never written.
 
     Args:
         root: The directory stores are kept in.
@@ -605,8 +737,9 @@ def open_store(
         clock: The clock `interval` is measured on.
 
     Raises:
-        StoreError: The key is not a sha256, the disk has too little free space, or a file
-            decodes to another length than its index gives.
+        StoreError: The key is not a sha256, the store is stale while another holder has it
+            open, the disk has too little free space, or a file decodes to another length than
+            its index gives.
         DatasetError: The reader could not read a file.
     """
     if not _KEY.fullmatch(key):
@@ -618,6 +751,7 @@ def open_store(
     with _locked(root):
         _sweep(root, key)
         if not _matches(directory, record):
+            _claim(directory)
             size = layout.windows_bytes + layout.responses_bytes
             total = int((~layout.private).sum())
             tracker = _Progress(total, size, progress, interval, clock)
@@ -632,8 +766,15 @@ def open_store(
                 workers=workers,
                 progress=tracker,
             )
-    private = {
-        index: np.asarray(reader.samples(windows[index]), dtype=_PCM)
-        for index in np.flatnonzero(layout.private).tolist()
-    }
-    return WindowStore(directory, layout, private)
+        lock = _hold(directory)
+    opened = None
+    try:
+        private = {
+            index: np.asarray(reader.samples(windows[index]), dtype=_PCM)
+            for index in np.flatnonzero(layout.private).tolist()
+        }
+        opened = WindowStore(directory, layout, private, lock)
+    finally:
+        if opened is None:
+            os.close(lock)
+    return opened

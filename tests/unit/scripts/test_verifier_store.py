@@ -7,7 +7,10 @@ recording, needs a network or the GPU.
 """
 
 import collections
+import fcntl
+import gc
 import json
+import multiprocessing
 import os
 import pickle
 import shutil
@@ -87,7 +90,9 @@ class World:
     def counting(self) -> CountingReader:
         return CountingReader(self.reader)
 
-    def open(self, reader: object | None = None, **options: object) -> store.WindowStore:
+    def open(
+        self, reader: object | None = None, key: str | None = None, **options: object
+    ) -> store.WindowStore:
         settings: dict[str, object] = {
             "provenance_sha256": PROVENANCE,
             "workers": 1,
@@ -96,7 +101,7 @@ class World:
         settings.update(options)
         return store.open_store(
             self.stores,
-            self.key(),
+            key or self.key(),
             self.windows,
             self.responses,
             reader or self.reader,
@@ -202,6 +207,29 @@ def _store_dir(world: World) -> Path:
     return world.stores / world.key()
 
 
+def _names(world: World) -> set[str]:
+    return {path.name for path in world.stores.iterdir()}
+
+
+def _finished(directory: Path) -> None:
+    """A directory that looks like a finished store to the sweep: it holds a `store.json`."""
+    directory.mkdir(parents=True)
+    (directory / "store.json").write_text("{}", encoding="utf-8")
+    (directory / "windows.pcm").write_bytes(b"\0\0")
+
+
+def _held(directory: Path) -> bool:
+    """True when some open descriptor holds a lock on the store's directory."""
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
 # -- Reading back -----------------------------------------------------------------------------
 
 
@@ -265,7 +293,7 @@ class TestKeying:
         digest = dataset.sha256_bytes((world.dataset / dataset.INDEX_FILE).read_bytes())
         assert store.index_key(world.dataset) == digest
         world.open()
-        assert sorted(path.name for path in world.stores.iterdir()) == [".lock", digest]
+        assert _names(world) == {".lock", digest}
         record = json.loads((world.stores / digest / "store.json").read_text(encoding="utf-8"))
         assert record["key"] == digest
         assert record["provenance_sha256"] == PROVENANCE
@@ -287,7 +315,7 @@ class TestKeying:
         world.open(reader)
         assert world.key() != old
         assert reader.public == len(_public(world))
-        assert sorted(path.name for path in world.stores.iterdir()) == [".lock", world.key()]
+        assert _names(world) == {".lock", world.key()}
 
     def test_a_matching_store_is_reused_without_a_public_read(self, world: World) -> None:
         world.open()
@@ -346,7 +374,7 @@ class TestInvalidation:
         reader = world.counting()
         opened = world.open(reader)
         assert reader.public == len(_public(world))
-        assert sorted(path.name for path in world.stores.iterdir()) == [".lock", world.key()]
+        assert _names(world) == {".lock", world.key()}
         again = world.counting()
         world.open(again)
         assert again.public == 0
@@ -364,21 +392,31 @@ class TestInvalidation:
 
     def test_other_stores_and_partials_are_removed_by_a_build(self, world: World) -> None:
         world.stores.mkdir(parents=True)
-        for name in ("a" * 64, f"{'b' * 64}.partial-12", "notes"):
+        _finished(world.stores / ("a" * 64))
+        for name in (f"{'b' * 64}.partial-12", "notes"):
             (world.stores / name).mkdir()
         world.open()
-        names = sorted(path.name for path in world.stores.iterdir())
-        assert names == [".lock", world.key(), "notes"]
+        assert _names(world) == {".lock", world.key(), "notes"}
 
     def test_a_reusing_open_also_removes_other_stores_and_partials(self, world: World) -> None:
         world.open()
-        for name in ("a" * 64, f"{'b' * 64}.partial-12", f"{world.key()}.partial-7", "notes"):
+        _finished(world.stores / ("a" * 64))
+        for name in (f"{'b' * 64}.partial-12", f"{world.key()}.partial-7", "notes"):
             (world.stores / name).mkdir()
+        (world.stores / f"{world.key()}.partial-7" / "windows.pcm").write_bytes(b"\0\0")
         reader = world.counting()
         world.open(reader)
         assert reader.public == 0
-        names = sorted(path.name for path in world.stores.iterdir())
-        assert names == [".lock", world.key(), "notes"]
+        assert _names(world) == {".lock", world.key(), "notes"}
+
+    def test_a_64_hex_directory_without_a_store_record_is_left_alone(self, world: World) -> None:
+        world.stores.mkdir(parents=True)
+        other = world.stores / ("a" * 64)
+        other.mkdir()
+        (other / "notes.txt").write_text("not a store", encoding="utf-8")
+        world.open()
+        assert _names(world) == {".lock", "a" * 64, world.key()}
+        assert (other / "notes.txt").read_text(encoding="utf-8") == "not a store"
 
     def test_a_rebuild_counts_the_space_the_stale_stores_free(
         self, world: World, monkeypatch: pytest.MonkeyPatch
@@ -399,7 +437,173 @@ class TestInvalidation:
         reader = world.counting()
         world.open(reader)
         assert reader.public == len(_public(world))
-        assert sorted(path.name for path in world.stores.iterdir()) == [".lock", world.key()]
+        assert _names(world) == {".lock", world.key()}
+
+
+# -- Holders ----------------------------------------------------------------------------------
+
+
+def _hold_store(
+    root: Path,
+    key: str,
+    windows: list[dataset.Window],
+    responses: list[dataset.FileRef],
+    reader: train.WindowReader,
+    ready: object,
+    release: object,
+) -> None:
+    """A spawned process's whole life: open the store, say so, and hold it until released."""
+    opened = store.open_store(
+        root,
+        key,
+        windows,
+        responses,
+        reader,
+        provenance_sha256=PROVENANCE,
+        workers=1,
+        progress=lambda line: None,
+    )
+    opened.read(0, 0, 10)
+    ready.set()
+    if not release.wait(120):
+        raise TimeoutError("the test never released the store")
+    opened.close()
+
+
+class TestHolders:
+    def test_a_held_store_survives_an_open_of_another_key_and_still_reads(
+        self, world: World
+    ) -> None:
+        held = world.open()
+        other = world.open(key="a" * 64)
+        assert _names(world) == {".lock", "a" * 64, world.key()}
+        index = _public(world)[-1]
+        expected = world.reader.samples(world.windows[index])
+        np.testing.assert_array_equal(held.read(index, 0, len(expected)), expected)
+        # A loader worker of the next epoch reopens the files by path.
+        reopened = pickle.loads(pickle.dumps(held))
+        np.testing.assert_array_equal(reopened.read(index, 0, len(expected)), expected)
+        other.close()
+        held.close()
+
+    def test_after_close_the_next_open_of_another_key_removes_it(self, world: World) -> None:
+        held = world.open()
+        world.open(key="a" * 64).close()
+        assert (world.stores / world.key()).is_dir()
+        held.close()
+        world.open(key="b" * 64).close()
+        assert _names(world) == {".lock", "b" * 64}
+
+    def test_a_partial_build_is_removed_even_beside_a_held_store(self, world: World) -> None:
+        held = world.open()
+        partial = world.stores / f"{'a' * 64}.partial-12"
+        partial.mkdir()
+        (partial / "windows.pcm").write_bytes(b"\0\0")
+        world.open(key="b" * 64).close()
+        assert _names(world) == {".lock", "b" * 64, world.key()}
+        held.close()
+
+    def test_a_rebuild_of_a_held_key_is_refused_and_leaves_it_intact(self, world: World) -> None:
+        held = world.open()
+        directory = _store_dir(world)
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        reader = world.counting()
+        with pytest.raises(store.StoreError, match="in use"):
+            world.open(reader, provenance_sha256="9" * 64)
+        assert reader.public == 0
+        assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+        assert _names(world) == {".lock", world.key()}
+        index = _public(world)[0]
+        np.testing.assert_array_equal(
+            held.read(index, 0, 10), world.reader.samples(world.windows[index])[:10]
+        )
+        held.close()
+        rebuilt = world.counting()
+        world.open(rebuilt, provenance_sha256="9" * 64).close()
+        assert rebuilt.public == len(_public(world))
+
+    def test_a_held_store_reopens_without_a_rebuild(self, world: World) -> None:
+        held = world.open()
+        reader = world.counting()
+        again = world.open(reader)
+        assert reader.public == 0
+        again.close()
+        assert _held(_store_dir(world))
+        held.close()
+
+    def test_close_releases_the_lock_and_a_pickled_copy_holds_none(self, world: World) -> None:
+        directory = _store_dir(world)
+        held = world.open()
+        assert _held(directory)
+        clone = pickle.loads(pickle.dumps(held))
+        held.close()
+        assert not _held(directory)
+        clone.close()
+        held.close()
+        assert not _held(directory)
+
+    def test_a_dropped_store_releases_its_lock(self, world: World) -> None:
+        directory = _store_dir(world)
+        held = world.open()
+        assert _held(directory)
+        del held
+        gc.collect()
+        assert not _held(directory)
+
+    def test_a_forked_child_closing_its_copy_keeps_the_parents_lock(self, world: World) -> None:
+        directory = _store_dir(world)
+        held = world.open()
+        child = os.fork()
+        if child == 0:
+            try:
+                held.close()
+            finally:
+                os._exit(0)
+        _, status = os.waitpid(child, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert _held(directory)
+        world.open(key="a" * 64).close()
+        assert (world.stores / world.key() / "store.json").is_file()
+        held.close()
+        assert not _held(directory)
+
+    def test_a_store_another_process_holds_blocks_its_sweep_and_rebuild(self, world: World) -> None:
+        context = multiprocessing.get_context("spawn")
+        ready, release = context.Event(), context.Event()
+        child = context.Process(
+            target=_hold_store,
+            args=(
+                world.stores,
+                world.key(),
+                world.windows,
+                world.responses,
+                world.reader,
+                ready,
+                release,
+            ),
+        )
+        child.start()
+        try:
+            assert ready.wait(120)
+            world.open(key="a" * 64).close()
+            assert _names(world) == {".lock", "a" * 64, world.key()}
+            with pytest.raises(store.StoreError, match="in use"):
+                world.open(provenance_sha256="9" * 64)
+            index = _public(world)[0]
+            reused = world.counting()
+            opened = world.open(reused)
+            assert reused.public == 0
+            np.testing.assert_array_equal(
+                opened.read(index, 0, 10), world.reader.samples(world.windows[index])[:10]
+            )
+            opened.close()
+        finally:
+            release.set()
+            child.join(120)
+        assert child.exitcode == 0
+        assert not _held(_store_dir(world))
+        world.open(key="b" * 64).close()
+        assert _names(world) == {".lock", "b" * 64}
 
 
 # -- Building ---------------------------------------------------------------------------------
