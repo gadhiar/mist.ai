@@ -170,11 +170,7 @@ VOICE_EXAMPLE_VARIABLES = (
     "MIST_VOICE_KWS_MODEL",
     "MIST_VOICE_KWS_THRESHOLD",
     "MIST_VOICE_VERIFY_MODEL",
-    "MIST_VOICE_WAKE_PHRASES_FILE",
 )
-# The one example value that is a path rather than a `<placeholder>`: only `/models` is mounted
-# for the phrases file, so the example shows where under it the file goes.
-EXAMPLE_PATH_VALUES = {"MIST_VOICE_WAKE_PHRASES_FILE": "/models/speech/wake/phrases.json"}
 VOICE_SETTINGS_PATH = REPO_ROOT / "backend" / "realtime" / "budget.py"
 # Read by the backend from `daily.env` or by `instance.py`, not interpolated by compose.
 EXAMPLE_EXTRA_VARIABLES = (
@@ -1069,11 +1065,7 @@ class TestEnvExample:
         defaults = dict(DEFAULT_INTERPOLATION.findall(_compose_text()))
 
         for _commented, name, value in _example_assignments():
-            assert (
-                PLACEHOLDER.match(value)
-                or value == defaults.get(name)
-                or value == EXAMPLE_PATH_VALUES.get(name)
-            ), f"{name}={value}"
+            assert PLACEHOLDER.match(value) or value == defaults.get(name), f"{name}={value}"
 
     def test_voice_variables_are_commented_out_placeholders(self):
         by_name = {name: (commented, value) for commented, name, value in _example_assignments()}
@@ -1081,7 +1073,7 @@ class TestEnvExample:
         for name in VOICE_EXAMPLE_VARIABLES:
             commented, value = by_name[name]
             assert commented is True, f"{name} must be commented out"
-            assert PLACEHOLDER.match(value) or value == EXAMPLE_PATH_VALUES.get(name), name
+            assert PLACEHOLDER.match(value), name
 
     def test_voice_variables_are_ones_the_backend_reads(self):
         source = VOICE_SETTINGS_PATH.read_text(encoding="utf-8")
@@ -1097,12 +1089,6 @@ class TestEnvExample:
         comment = _comment_above("MIST_VOICE_STT_CHAIN")
 
         for phrase in ("`off`", "<MIST_DAILY_ROOT>/voices/", "outside every repository"):
-            assert phrase in comment, phrase
-
-    def test_phrases_file_comment_says_it_lives_under_the_models_directory(self):
-        comment = _comment_above("MIST_VOICE_WAKE_PHRASES_FILE")
-
-        for phrase in ("MODELS_DIR", "only `/models` is mounted"):
             assert phrase in comment, phrase
 
     def test_verify_model_comment_says_where_it_lives_and_that_wake_needs_it(self):
@@ -1234,7 +1220,7 @@ class TestReadmeVoice:
             pytest.param("`mist-<instance>_voice-cache`", id="cache-volume"),
             pytest.param("deleted while the backend is stopped", id="cache-deletable"),
             pytest.param("`<MODELS_DIR>/speech/wake/<model id>/`", id="wake-model-staging"),
-            pytest.param("`<MODELS_DIR>/speech/wake/phrases.json`", id="phrases-staging"),
+            pytest.param("transcript wake gate the verifier replaced", id="retired-gate"),
             pytest.param("personal use only", id="wake-model-licence"),
             pytest.param("`<MODELS_DIR>/speech/wake/<verifier id>/`", id="verifier-staging"),
             pytest.param("`MIST_VOICE_VERIFY_THREADS`", id="verifier-threads"),

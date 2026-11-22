@@ -305,21 +305,6 @@ class NameHit:
     score: float
 
 
-@dataclass(frozen=True, slots=True)
-class HeardWord:
-    """One word of a transcript and the uplink frames it was heard in.
-
-    `first_pos` and `last_pos` are uplink positions, inclusive, as a `NameHit`'s `end_pos` is,
-    so the addressee gate can tell which word sat at a hit. Ingress rebases an engine's
-    `WordTiming` to them through the frames it pushed into the stream. `text` is the word as the
-    transcript writes it, punctuation included.
-    """
-
-    text: str
-    first_pos: int
-    last_pos: int
-
-
 class NameSpotterStream(Protocol):
     """One audio source's spotting state: the model's streaming state, its window, the cooldown.
 

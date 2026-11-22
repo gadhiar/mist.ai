@@ -422,9 +422,6 @@ class RecordingIngress:
         self.first_pos[uid] = from_pos
         return OpenedUtterance(uid, from_pos)
 
-    def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
-        self.calls.append(("request_gate_partial", utterance_id, through_pos))
-
     def request_verify(self, utterance_id: str, hit_pos: int) -> None:
         self.calls.append(("request_verify", utterance_id, hit_pos))
 
@@ -469,15 +466,7 @@ class RecordingIngress:
     def resumed(self, uid: str) -> SpeechResumed:
         return SpeechResumed(self.epoch, self._next_seq(), uid, self._pos(uid))
 
-    def partial(
-        self,
-        uid: str,
-        text: str,
-        *,
-        heard_at_ms: int = 0,
-        gate: bool = False,
-        through_pos: int | None = None,
-    ) -> TranscriptPartial:
+    def partial(self, uid: str, text: str, *, heard_at_ms: int = 0) -> TranscriptPartial:
         return TranscriptPartial(
             epoch=self.epoch,
             event_seq=self._next_seq(),
@@ -488,8 +477,6 @@ class RecordingIngress:
             heard_at_ms=heard_at_ms,
             audio_end_pos=self._pos(uid) + 10,
             uncovered_since_ms=heard_at_ms,
-            gate=gate,
-            through_pos=through_pos,
         )
 
     def heard(

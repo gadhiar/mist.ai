@@ -37,7 +37,6 @@ from .lanes import LaneJobCancelled
 from .protocol import Frame, Spotter
 from .speech import (
     CancelToken,
-    HeardWord,
     NameHit,
     NameSpotter,
     NameSpotterStream,
@@ -48,7 +47,6 @@ from .speech import (
     VadStream,
     VoiceActivityDetector,
     WakeVerifier,
-    WordTiming,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,7 +186,7 @@ def name_chain_start(
     pre_roll_frames: int,
     window_frames: int,
 ) -> int:
-    """Where a server name hit's gate span starts, before the caller's bounds.
+    """Where a server name hit's wake utterance starts, before the caller's bounds.
 
     The spotter hears every frame, so a hit can come with no segment before it, or after its
     segment closed, and the name it heard lies in the spotter's window before the hit whatever
@@ -267,13 +265,7 @@ class TranscriptPartial:
 
     `audio_end_pos` is the last frame the decode covered and `heard_at_ms` that frame's arrival.
     `uncovered_since_ms` is the arrival of the oldest frame the previous partial did not cover,
-    from which the session measures caption lag. `gate` marks the out-of-cadence decode the
-    controller asked for through `through_pos`.
-
-    `words` are the decode's words with the uplink positions they were heard in, None when the
-    engine gave no timings. A gate partial's `speech_end_pos` is the last frame of the latest
-    VAD window judged speech when its decode started, or None before any speech, so the
-    addressee gate can tell whether speech went on past the name.
+    from which the session measures caption lag.
     """
 
     epoch: int
@@ -285,10 +277,6 @@ class TranscriptPartial:
     heard_at_ms: int
     audio_end_pos: int
     uncovered_since_ms: int
-    gate: bool = False
-    through_pos: int | None = None
-    words: tuple[HeardWord, ...] | None = None
-    speech_end_pos: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,10 +293,7 @@ class EndpointCandidate:
 
 @dataclass(frozen=True, slots=True)
 class UtteranceEnded:
-    """A confirmed end, with why it ended and the final transcript's scores; text is never empty.
-
-    `words` are the final transcript's words with their uplink positions, as a partial's are.
-    """
+    """A confirmed end, with why it ended and the final transcript's scores; text is never empty."""
 
     epoch: int
     event_seq: int
@@ -322,7 +307,6 @@ class UtteranceEnded:
     no_speech_prob: float | None
     avg_logprob: float | None
     heard_at_ms: int
-    words: tuple[HeardWord, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,7 +506,7 @@ class _Utterance:
 
     `state` is `speaking` while frames go into the stream and `pending` from the endpoint
     candidate's silence on, when frames are held back so the final decode covers exactly the
-    utterance; a resume pushes the held frames and continues. Partial and gate decodes use
+    utterance; a resume pushes the held frames and continues. Partial decodes use
     `decode_token`, which only the utterance's close sets, and the final decode and end-of-turn
     score use `end_token`, which a resume also sets.
     """
@@ -547,15 +531,10 @@ class _Utterance:
         "end_pos",
         "final",
         "final_end",
-        "final_from_gate",
         "decided",
         "eot_running",
         "eot_checked_ms",
         "eot_prob",
-        "gate_state",
-        "gate_through",
-        "gate_end",
-        "gate_result",
     )
 
     def __init__(self, utterance_id: str, first_pos: int, stream: TranscriptStream) -> None:
@@ -578,15 +557,10 @@ class _Utterance:
         self.end_pos = first_pos - 1
         self.final: TranscriptUpdate | None = None
         self.final_end = first_pos - 1
-        self.final_from_gate = False
         self.decided: tuple[EndReason, int] | None = None
         self.eot_running = False
         self.eot_checked_ms = 0
         self.eot_prob: float | None = None
-        self.gate_state: Literal["none", "waiting", "running", "done"] = "none"
-        self.gate_through = 0
-        self.gate_end = first_pos - 1
-        self.gate_result: TranscriptUpdate | None = None
 
     def arrival(self, pos: int) -> int:
         index = bisect.bisect_left(self.positions, pos)
@@ -599,27 +573,6 @@ class _Utterance:
 
     def duration_ms(self, last_pos: int) -> int:
         return max(0, last_pos - self.first_pos + 1) * FRAME_MS
-
-    def heard(self, words: tuple[WordTiming, ...] | None) -> tuple[HeardWord, ...] | None:
-        """An update's words at the uplink positions of the frames pushed into the stream.
-
-        A word's milliseconds count from the stream's first sample, and the stream holds the
-        pushed frames in order, 20 ms each, so the k-th 20 ms is `positions[k]`: frames the
-        uplink lost or the queue dropped take no time in the stream, and a word heard across
-        such a gap spans it. An end is exclusive, so a word's last frame holds its last
-        millisecond.
-        """
-        if words is None or not self.positions:
-            return None
-        last = len(self.positions) - 1
-        return tuple(
-            HeardWord(
-                word.text,
-                self.positions[min(word.start_ms // FRAME_MS, last)],
-                self.positions[min(max(word.end_ms - 1, word.start_ms) // FRAME_MS, last)],
-            )
-            for word in words
-        )
 
 
 def _spotter_job(
@@ -719,9 +672,6 @@ class AudioIngress:
         self._vad_generation = 0
         self._tracker = SpeechSegmentTracker(endpointing)
         self._segments: deque[tuple[int, int]] = deque()
-        # The last frame of the latest VAD window judged speech, segment open or not: a gate
-        # partial carries it, so the gate can tell speech that went on past the name.
-        self._last_speech_pos: int | None = None
         self._processed_pos: int | None = None
 
         self._utt: _Utterance | None = None
@@ -933,21 +883,6 @@ class AudioIngress:
                 )
             )
         return OpenedUtterance(utt.id, utt.first_pos)
-
-    def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
-        """Decode the open utterance once frames through `through_pos` have arrived.
-
-        The result is one `TranscriptPartial` with `gate` true. It is the one partial in flight,
-        so a cadence tick meanwhile is skipped, and when the utterance ends within it, it is
-        the final transcript too.
-        """
-        utt = self._utt
-        if self._closed or utt is None or utt.id != utterance_id:
-            return
-        utt.gate_state = "waiting"
-        utt.gate_through = through_pos
-        utt.gate_result = None
-        self._maybe_start_gate(utt)
 
     def request_verify(self, utterance_id: str, hit_pos: int) -> None:
         """Score the audio around the name hit at `hit_pos` with the wake verifier.
@@ -1179,8 +1114,6 @@ class AudioIngress:
     # -- Speech segments --------------------------------------------------------------------------
 
     def _on_window(self, speech: bool, first: int, last: int) -> None:
-        if speech:
-            self._last_speech_pos = last
         step = self._tracker.window(speech, first, last)
         if step.closed is not None:
             self._segments.append(step.closed)
@@ -1622,8 +1555,6 @@ class AudioIngress:
                     self._candidate(utt)
             else:
                 self._tick_pending(utt)
-            if self._utt is utt:
-                self._maybe_start_gate(utt)
         wake = self._endpoint_wake
         if wake is not None and wake.last_pos is not None and item.pos >= wake.last_pos:
             self._endpoint_heard(wake)
@@ -1644,31 +1575,15 @@ class AudioIngress:
             return
         if utt.last_pushed <= utt.partial_end:
             return
-        self._start_decode(utt, gate=False)
+        self._start_decode(utt)
 
-    def _maybe_start_gate(self, utt: _Utterance) -> None:
-        if (
-            utt.gate_state == "waiting"
-            and not utt.decoding
-            and self._processed_pos is not None
-            and self._processed_pos >= utt.gate_through
-        ):
-            utt.gate_state = "running"
-            utt.gate_end = utt.last_pushed
-            self._start_decode(utt, gate=True)
-
-    def _start_decode(self, utt: _Utterance, *, gate: bool) -> None:
+    def _start_decode(self, utt: _Utterance) -> None:
         utt.decoding = True
-        # Read as the decode starts: frames through `through_pos` have arrived, and later
-        # speech is not in the decode.
-        speech_end = self._last_speech_pos if gate else None
-        task = self._spawn(self._decode_partial(utt, utt.last_pushed, gate, speech_end))
+        task = self._spawn(self._decode_partial(utt, utt.last_pushed))
         utt.tasks.add(task)
         task.add_done_callback(utt.tasks.discard)
 
-    async def _decode_partial(
-        self, utt: _Utterance, end_pos: int, gate: bool, speech_end: int | None
-    ) -> None:
+    async def _decode_partial(self, utt: _Utterance, end_pos: int) -> None:
         token = utt.decode_token
         try:
             update = await self._lanes.stt.run(utt.stream.decode_partial, token, token=token)
@@ -1677,11 +1592,6 @@ class AudioIngress:
         except SpeechEngineError:
             logger.warning("Ingress partial decode failed for %s", utt.id, exc_info=True)
             self._engine_errors += 1
-            if gate and self._utt is utt:
-                utt.gate_state = "none"
-                if utt.final_from_gate:
-                    utt.final_from_gate = False
-                    self._start_final(utt)
             return
         finally:
             utt.decoding = False
@@ -1690,7 +1600,6 @@ class AudioIngress:
         uncovered = utt.first_arrival_after(utt.partial_end)
         utt.partial_end = end_pos
         utt.last_partial_text = update.text
-        through = utt.gate_through if gate else None
         self._send(
             TranscriptPartial(
                 self._epoch,
@@ -1702,27 +1611,8 @@ class AudioIngress:
                 utt.arrival(end_pos),
                 end_pos,
                 uncovered,
-                gate,
-                through,
-                utt.heard(update.words),
-                speech_end,
             )
         )
-        if gate:
-            utt.gate_state = "done"
-            utt.gate_result = update
-            if utt.final_from_gate and utt.state == "pending":
-                utt.final_from_gate = False
-                self._on_final(utt, update, end_pos)
-        elif self._utt is utt:
-            self._maybe_start_gate(utt)
-
-    def _gate_covers_end(self, utt: _Utterance) -> bool:
-        if utt.gate_state in ("done", "running"):
-            return utt.gate_end >= utt.end_pos
-        if utt.gate_state == "waiting":
-            return utt.gate_through >= utt.end_pos
-        return False
 
     def _candidate(self, utt: _Utterance) -> None:
         """The endpoint silence started: the final decode and the end-of-turn score start now.
@@ -1736,16 +1626,9 @@ class AudioIngress:
         utt.decided = None
         utt.eot_prob = None
         utt.eot_checked_ms = self._silence_ms()
-        reuse_gate = self._gate_covers_end(utt)
-        if not reuse_gate:
-            self._start_final(utt)
+        self._start_final(utt)
         if self._engines.turn_end is not None:
             self._start_eot(utt)
-        if reuse_gate:
-            if utt.gate_state == "done" and utt.gate_result is not None:
-                self._on_final(utt, utt.gate_result, utt.end_pos)
-            else:
-                utt.final_from_gate = True
 
     def _start_final(self, utt: _Utterance) -> None:
         task = self._spawn(self._final(utt, utt.end_token))
@@ -1864,7 +1747,6 @@ class AudioIngress:
                 final.no_speech_prob,
                 final.avg_logprob,
                 utt.arrival(utt.final_end),
-                utt.heard(final.words),
             )
         )
         self._finish(utt, utt.final_end)
@@ -1877,7 +1759,6 @@ class AudioIngress:
         utt.decided = None
         utt.eot_prob = None
         utt.eot_running = False
-        utt.final_from_gate = False
         held, utt.held = utt.held, []
         for item in held:
             self._push(utt, item)

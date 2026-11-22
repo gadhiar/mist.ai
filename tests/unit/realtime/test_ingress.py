@@ -50,7 +50,7 @@ from backend.realtime.ingress import (
 )
 from backend.realtime.lanes import InferenceLane, LaneJobCancelled
 from backend.realtime.protocol import Frame, MsgType
-from backend.realtime.speech import CancelToken, HeardWord, NameHit, TranscriptUpdate
+from backend.realtime.speech import CancelToken, NameHit, TranscriptUpdate
 from tests.fakes.scripted_audio import scripted_audio, silence, speech_burst, to_pcm16
 from tests.fakes.speech import (
     EnergyVad,
@@ -528,7 +528,6 @@ class TestPartials:
         assert first.uncovered_since_ms == rig.arrivals[first.first_pos]
         assert second.uncovered_since_ms == rig.arrivals[first.audio_end_pos + 1]
         assert second.heard_at_ms == rig.arrivals[second.audio_end_pos]
-        assert first.gate is False and first.through_pos is None
 
     @pytest.mark.asyncio
     async def test_heard_at_is_the_arrival_of_the_last_frame_the_partial_covers(self):
@@ -1861,163 +1860,53 @@ class TestEndpointWake:
         assert rig.of(NameHeard) == []
 
 
-# -- The gate partial -----------------------------------------------------------------------------
+# -- What a transcript event carries --------------------------------------------------------------
 
 
-class TestGatePartial:
-    @pytest.mark.asyncio
-    async def test_it_decodes_once_frames_through_through_pos_arrive(self):
-        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
-        await rig.quiet(320)
-        await rig.speak(640)
-        started = rig.of(SpeechStarted)[0]
+class TestTranscriptEventFields:
+    """A transcript event carries its text and timing only: no text decides a wake (A66)."""
 
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos + 5)
-        await rig.speak(100)
-        assert rig.of(TranscriptPartial) == []
-        await rig.speak(20)
+    def test_a_partial_carries_no_out_of_cadence_or_word_timing_fields(self):
+        assert [field.name for field in dataclasses.fields(TranscriptPartial)] == [
+            "epoch",
+            "event_seq",
+            "utterance_id",
+            "first_pos",
+            "text",
+            "stable_chars",
+            "heard_at_ms",
+            "audio_end_pos",
+            "uncovered_since_ms",
+        ]
 
-        (gate,) = rig.of(TranscriptPartial)
-        assert (gate.gate, gate.through_pos, gate.audio_end_pos) == (True, rig.pos - 1, rig.pos - 1)
-
-    @pytest.mark.asyncio
-    async def test_it_is_the_one_partial_in_flight_and_cadence_ticks_skip(self):
-        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=100))
-        await rig.quiet(320)
-        await rig.speak(640)
-        started = rig.of(SpeechStarted)[0]
-        partials = len(rig.of(TranscriptPartial))
-        skipped = rig.ingress.stats().skipped_partials
-        rig.lanes.stt.holding = True
-
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos - 1)
-        await rig.speak(400)
-        rig.lanes.stt.release()
-        await settle()
-
-        new = rig.of(TranscriptPartial)[partials:]
-        assert [p.gate for p in new][:1] == [True]
-        assert rig.ingress.stats().skipped_partials - skipped >= 3
+    def test_an_utterance_end_carries_no_word_timings(self):
+        assert [field.name for field in dataclasses.fields(UtteranceEnded)] == [
+            "epoch",
+            "event_seq",
+            "utterance_id",
+            "first_pos",
+            "text",
+            "reason",
+            "eot_probability",
+            "silence_ms",
+            "duration_ms",
+            "no_speech_prob",
+            "avg_logprob",
+            "heard_at_ms",
+        ]
 
     @pytest.mark.asyncio
-    async def test_an_utterance_ending_within_the_gate_reuses_its_decode_as_the_final(self):
+    async def test_an_utterance_end_takes_its_text_from_its_own_final_decode(self):
         rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
         await rig.quiet(320)
         await rig.speak(960)
-        started = rig.of(SpeechStarted)[0]
-        rig.lanes.stt.holding = True
 
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos + 30)
         await rig.quiet(640)
-        rig.lanes.stt.release()
-        await settle()
 
-        (gate,) = rig.of(TranscriptPartial)
         (ended,) = rig.of(UtteranceEnded)
         stream = rig.transcriber.streams[0]
-        assert ended.text == gate.text == "hello there"
-        assert (len(stream.partials), len(stream.finals)) == (1, 0)
-        assert last_frame(ended) <= gate.through_pos
-        # The reused decode's words come with it.
-        assert ended.words == gate.words
-        assert [word.text for word in ended.words] == ["hello", "there"]
-
-
-def expected_words(text: str, positions: Sequence[int], ms_per_word: int) -> tuple[HeardWord, ...]:
-    """The scripted stream's words, word i over `[i, i + 1) * ms_per_word` of the stream's
-    audio, at the uplink positions of the frames that audio came from.
-    """
-    frames = ms_per_word // FRAME_MS
-    last = len(positions) - 1
-    return tuple(
-        HeardWord(
-            word, positions[min(i * frames, last)], positions[min((i + 1) * frames - 1, last)]
-        )
-        for i, word in enumerate(text.split()[: len(positions) * FRAME_MS // ms_per_word])
-    )
-
-
-class TestHeardWords:
-    @pytest.mark.asyncio
-    async def test_a_gate_partial_carries_its_words_at_the_frames_pushed_gaps_included(self):
-        rig = Rig(
-            transcriber=ScriptedTranscriber(["hey mist what's up"], ms_per_word=200),
-            endpointing=EndpointingConfig(stt_partial_interval_ms=10000),
-        )
-        await rig.quiet(320)
-        await rig.speak(320)
-        rig.pos += 10  # the uplink lost frames 32 to 41
-        await rig.speak(480)
-        started = rig.of(SpeechStarted)[0]
-
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos - 1)
-        await settle()
-
-        (gate,) = rig.of(TranscriptPartial)
-        positions = [*range(started.first_pos, 32), *range(42, rig.pos)]
-        assert gate.words == expected_words("hey mist what's up", positions, 200)
-        # The fourth word was heard across the gap, so it spans it.
-        assert (gate.words[3].first_pos, gate.words[3].last_pos) == (
-            positions[30],
-            positions[39],
-        )
-        assert gate.words[3].first_pos < 32 and gate.words[3].last_pos >= 42
-
-    @pytest.mark.asyncio
-    async def test_a_gate_partial_carries_the_last_speech_frame_when_speech_has_ended(self):
-        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
-        await rig.quiet(320)
-        # Frames 16 to 47: VAD windows 10 to 29 exactly, the last ending on frame 47.
-        await rig.speak(640)
-        started = rig.of(SpeechStarted)[0]
-
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos + 5)
-        await rig.quiet(200)
-
-        (gate,) = rig.of(TranscriptPartial)
-        assert (gate.through_pos, gate.speech_end_pos) == (53, 47)
-
-    @pytest.mark.asyncio
-    async def test_the_speech_end_is_read_when_the_gate_decode_starts(self):
-        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
-        await rig.quiet(320)
-        await rig.speak(640)
-        started = rig.of(SpeechStarted)[0]
-        rig.lanes.stt.holding = True
-
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos + 5)
-        await rig.speak(600)
-        rig.lanes.stt.release()
-        await settle()
-
-        (gate,) = rig.of(TranscriptPartial)
-        # The decode started as frame 53 arrived, when VAD windows through 32 (frames 51 and
-        # 52) had been scored; the speech after it is not in that decode.
-        assert (gate.through_pos, gate.speech_end_pos) == (53, 52)
-
-    @pytest.mark.asyncio
-    async def test_a_cadence_partial_carries_words_and_no_speech_end(self):
-        rig = Rig(transcriber=ScriptedTranscriber(["one two three"], ms_per_word=100))
-        await rig.quiet(320)
-
-        await rig.speak(640)
-
-        partial = rig.of(TranscriptPartial)[0]
-        assert not partial.gate
-        assert partial.words is not None and len(partial.words) >= 1
-        assert partial.speech_end_pos is None
-
-    @pytest.mark.asyncio
-    async def test_utterance_ended_carries_the_final_s_words(self):
-        rig = Rig(transcriber=ScriptedTranscriber(["hey mist"], ms_per_word=200))
-        await rig.quiet(320)
-        await rig.speak(640)
-
-        await rig.quiet(480)
-
-        (ended,) = rig.of(UtteranceEnded)
-        positions = list(range(ended.first_pos, last_frame(ended) + 1))
-        assert ended.words == expected_words("hey mist", positions, 200)
+        assert ended.text == "hello there"
+        assert len(stream.finals) == 1
 
 
 # -- Mute -----------------------------------------------------------------------------------------
@@ -2710,7 +2599,7 @@ LEAD = WINDOW + PRE_ROLL
 
 
 class TestNameChainStart:
-    """A server hit's gate span starts at its chain of segments or its window, less the pre-roll.
+    """A server hit's wake utterance starts at its segment chain or its window, less the pre-roll.
 
     Each case is `(segments, hit, start)` at the defaults: a 1000 ms join gap (50 frames), a
     300 ms pre-roll (15 frames) and the scripted spotter's 1280 ms window (64 frames).
