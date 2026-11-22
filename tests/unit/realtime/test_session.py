@@ -1034,6 +1034,26 @@ class TestVoiceStart:
         assert kwargs["wake"] is rig.settings.wake
         assert kwargs["tts_lane"] is rig.tts_lane
         assert kwargs["synthesizer"] is rig.engines.synthesizer
+        # The gate and the controller read the verifier's thresholds, one lookup for both.
+        verifier = rig.engines.verifier
+        assert verifier is not None
+        assert kwargs["thresholds"] == verifier.threshold_at
+        assert kwargs["thresholds"](0.5) == 0.5
+        verdict = kwargs["gate"].verified(
+            score=0.9, reference_score=None, verify_score=0.6, cutoff=0.7
+        )
+        assert verdict.accepted
+        assert verifier.cutoffs[-2:] == [0.5, 0.7]
+
+    async def test_with_no_verifier_the_controller_and_its_gate_get_no_thresholds(self):
+        rig = await Rig(verifier=False).start()
+
+        kwargs = rig.controller.kwargs
+        assert kwargs["thresholds"] is None
+        verdict = kwargs["gate"].verified(
+            score=0.9, reference_score=None, verify_score=1.0, cutoff=0.5
+        )
+        assert not verdict.accepted
 
     async def test_with_no_spotter_or_synthesizer_the_controller_gets_none_and_zero(self):
         rig = await Rig(spotter=None, synthesizer=False).start()

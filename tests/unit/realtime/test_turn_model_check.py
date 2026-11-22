@@ -35,8 +35,9 @@ The harness:
   queues there in order, and the controller handles the head only when the search takes a
   controller step (`deliver`). A step runs until its handling ends or suspends at the stall.
 - `ModelIngress` follows T6's contract on top of `RecordingIngress`: one utterance open at a
-  time, opened only while engaged, events numbered by epoch and `event_seq`, a gate decode that
-  returns only on its own action, a mute that drops the open utterance ahead of `Mute`, and an
+  time, opened only while engaged, events numbered by epoch and `event_seq`, a verifier score
+  (`WakeVerified`) that returns only on its own action, kept past its utterance's drop but
+  withheld by a mute or a close, a mute that drops the open utterance ahead of `Mute`, and an
   `open_utterance` on a muted ingress whose drop follows the current step (v8). An ingress the
   session has stopped keeps emitting its open utterance's events (the `late_` actions) until the
   controller calls its `close()` at `VoiceStop`'s handling, as the real ingress does
@@ -49,10 +50,10 @@ The harness:
 Reductions. Each is sound for the reason given; the search uses no other.
 
 - Positions as ranks. The snapshot holds each frame position it refers to (each utterance's
-  `first_pos`, each gate decode's `through_pos`, the ingress floor and the next position) as its
+  `first_pos`, each verify job's `hit_pos`, the ingress floor and the next position) as its
   rank among them, never as its value. The controller and the fake ingress compare positions
-  only by order (the record's audio order, `max` with the floor), and the gate's `through_pos`
-  is only passed back; so states whose positions rank alike decide alike. Retention never acts
+  only by order (the record's audio order, `max` with the floor), and a verify job's `hit_pos`
+  is only passed back and matched; so states whose positions rank alike decide alike. Retention never acts
   within the bound (the preconditions check it), so no frame leaves the ring.
 - No pure counters and no reported-only values. Drop counts, `stale_events`, the fakes' call
   counts, timings and durations stay out of the snapshot. A counter a rule reads enters only as
@@ -64,7 +65,7 @@ Reductions. Each is sound for the reason given; the search uses no other.
   controller free, the step and the actions its handling can observe form a persistent set only
   if no action outside the set, taken first, depends on one inside it (the ample-set condition
   C1). Nearly every environment action appends to the mailbox: the ingress actions, the `late_`
-  events, `name`, `endpoint_name` and the gate answers post an ingress event; `mute`, `unmute`,
+  events, `name`, `endpoint_name` and the verifier's answers post an ingress event; `mute`, `unmute`,
   `voice_stop`, `voice_start`, the wakes, the reconfigures, `interrupt`, `playback_done` and
   `text` post their message; `grant` and `deny` settle a claim whose verdict the controller posts;
   `say`, `hint`, `hint_out`, `handoff` and `done` feed the responder, whose stream task posts a
@@ -116,7 +117,7 @@ Four orders need more than their start's default depth, and three need a start o
 B8 needs 8 from `thinking_tool`: its frameless `0x02` is fifth on the lane and each take moves
 one item. B1(d) needs 4 from `speaking`: a name, the lost verdict, w's end and v's VAD start.
 The posting-step witness needs 6 from `idle`. The supersede needs 4 from `thinking_tool`: a
-name, its grant, the gate decode, and the tool's end, since the cut waits on the tool's grace.
+name, its grant, its score, and the tool's end, since the cut waits on the tool's grace.
 The T55d orders start from `thinking`, which no full-alphabet run searches: `merge` and `K
 alone` need 4, and `merge at release` needs 5. Each one's reach run searches only the actions that the order and its
 alternatives use (`B8_ALPHABET`, `B1D_ALPHABET`, `POSTING_ALPHABET`, `SUPERSEDE_ALPHABET`,
@@ -160,6 +161,7 @@ from backend.realtime.ingress import (
 from backend.realtime.protocol import (
     Frame,
     MsgType,
+    PlaybackDuckMessage,
     TranscriptionMessage,
     VoiceDecisionDegraded,
 )
@@ -176,6 +178,7 @@ from backend.realtime.turn import (
     Wake,
     WakeVerdict,
 )
+from tests.fakes.speech import ScriptedWakeVerifier
 
 from .turn_fakes import (
     TEST_PLAYBACK,
@@ -228,13 +231,16 @@ MAX_UTTERANCES = 3
 MAX_STARTS = 2
 MAX_TEXTS = 1
 ADDRESSED = "mist what's up"
-UNADDRESSED = "I missed the bus"
+VERIFY_YES = 0.9
+VERIFY_NO = 0.1
+"""The verifier's scores for a name that addresses her and one that does not; the threshold is
+`ScriptedWakeVerifier`'s 0.5."""
 STOP = "stop"
 REPLY = "Hi. "
 ACK = "One moment. "
 CLOSING = ("transcription", "voice_decision:dropped", "voice_decision:wake_lost")
 WAKE_ENDS = ("voice_decision:wake_rejected", "voice_decision:wake_lost")
-"""The messages that end a name without accepting it; neither may cut or idle a turn."""
+"""The messages that end a name without accepting it; neither may cut a turn or send a state."""
 
 EAGER_SAFE = frozenset({"deliver", "take", "synth_fail", "text"})
 """The actions under which the controller step is eager; only `text` then waits for it (C1)."""
@@ -323,7 +329,7 @@ class ModelIngress(RecordingIngress):
         self.world = world
         self.open_uid: str | None = None
         self.engaged = False
-        self.gate_asks: list[tuple[str, int]] = []
+        self.verify_asks: list[tuple[str, int]] = []
         self.expecting = False
         self.closed = False
         self.floor = world.pos
@@ -353,10 +359,14 @@ class ModelIngress(RecordingIngress):
         self.world.utterances += 1
         return uid
 
-    def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
-        super().request_gate_partial(utterance_id, through_pos)
-        if utterance_id in self.known:
-            self.gate_asks.append((utterance_id, through_pos))
+    def request_verify(self, utterance_id: str, hit_pos: int) -> None:
+        """T73's contract: a job is scored whatever its utterance does after, but nothing is
+        scored or emitted while muted or closed. A drop keeps the job, so its late
+        `WakeVerified` reaches a controller that no longer holds the candidate.
+        """
+        super().request_verify(utterance_id, hit_pos)
+        if not self.closed and not self.world.muted:
+            self.verify_asks.append((utterance_id, hit_pos))
 
     def set_engaged(self, engaged: bool) -> None:
         super().set_engaged(engaged)
@@ -368,7 +378,6 @@ class ModelIngress(RecordingIngress):
 
     def forget(self, uid: str) -> None:
         self.known.discard(uid)
-        self.gate_asks = [ask for ask in self.gate_asks if ask[0] != uid]
         if self.open_uid == uid:
             self.open_uid = None
 
@@ -383,7 +392,7 @@ class ModelIngress(RecordingIngress):
         if self.world.stopped is self:
             self.world.stopped = None
         self.open_uid = None
-        self.gate_asks = []
+        self.verify_asks = []
         self.known.clear()
         self.expecting = False
         return None
@@ -609,6 +618,7 @@ class World:
         )
         self.ingress: ModelIngress | None = None
         self.ingresses: list[ModelIngress] = []
+        thresholds = ScriptedWakeVerifier().threshold_at
         self.controller = TurnController(
             session_id="s",
             responder=self.responder,
@@ -616,7 +626,8 @@ class World:
             host=self.host,
             placement=floor_placement,
             arbiter=self.arbiter,
-            gate=default_gate(wake),
+            gate=default_gate(wake, thresholds),
+            thresholds=thresholds,
             wake=wake,
             calibration=None,
             hit_lag_ms=150,
@@ -1009,8 +1020,8 @@ class World:
                 actions.append("name")
             if ingress.expecting and not self.muted:
                 actions.append("endpoint_name")
-            if ingress.gate_asks:
-                actions += ["gate_yes", "gate_no"]
+            if ingress.verify_asks:
+                actions += ["verify_yes", "verify_no"]
             if room:
                 actions.append("wake")
             actions.append("wake_short")
@@ -1124,12 +1135,11 @@ class World:
                     spotter="endpoint",
                 )
             )
-        elif name in ("gate_yes", "gate_no"):
+        elif name in ("verify_yes", "verify_no"):
             assert ingress is not None
-            uid, through = ingress.gate_asks.pop(0)
-            text = ADDRESSED if name == "gate_yes" else UNADDRESSED
-            ingress.last_text = text  # type: ignore[attr-defined]
-            self.post(ingress.partial(uid, text, gate=True, through_pos=through))
+            uid, hit_pos = ingress.verify_asks.pop(0)
+            score = VERIFY_YES if name == "verify_yes" else VERIFY_NO
+            self.post(ingress.verified(uid, hit_pos=hit_pos, score=score))
         elif name in ("wake", "wake_short"):
             backlog = 1500 if name == "wake" else 0
             self.post(
@@ -1170,6 +1180,7 @@ class World:
             self.muted = True
             if ingress is not None:
                 ingress.expecting = False
+                ingress.verify_asks = []  # `set_muted` drops the waiting jobs; a result is withheld
                 if ingress.open_uid is not None:
                     uid, ingress.open_uid = ingress.open_uid, None
                     ingress.forget(uid)
@@ -1260,11 +1271,10 @@ class World:
                 self.fail("rejection cuts nothing", f"{names}")
             if len(self.outbound.purges) > step.purges_from:
                 self.fail("rejection cuts nothing", f"a purge in the step of a {end}")
-            if step.phase in ("thinking", "speaking"):
-                after = names[names.index(end) + 1 :]
-                cycles = [n for n in after if n.startswith("state_cycle")]
-                if cycles and cycles[0] == "state_cycle:idle":
-                    self.fail("rejection restores", f"{step.phase} {end} then {cycles[0]}")
+            after = names[names.index(end) + 1 :]
+            cycles = [n for n in after if n.startswith("state_cycle")]
+            if cycles:
+                self.fail("rejection sends no state", f"{step.phase} {end} then {cycles[0]}")
         for call in scene:
             if call[0] == "phase" and call[1] in ("wake", "listening") and not newly:
                 self.fail("scene anchors", f"{call[1]} intent with no acceptance in its step")
@@ -1340,13 +1350,21 @@ class World:
             held = turn is not None and turn.held and not turn.ending and turn.utterance_id == uid
             if (record is None or record.closed) and not held:
                 self.fail("K kept", f"{kept.turn.turn_id} kept with {uid} closed and none held")
-        # v8: no utterance is open while ingress is muted; an attend cue is never left standing.
+        # v8: no utterance is open while ingress is muted.
         if self.muted and self.ingress is not None and self.ingress.open_uid is not None:
             self.fail("mute", f"ingress holds {self.ingress.open_uid} open while muted")
-        if self.handling is None and c._candidate is None:
-            cycles = [describe(i) for i in client if describe(i).startswith("state_cycle")]
-            if cycles and cycles[-1] == "state_cycle:attend":
-                self.fail("attend", "attend left standing with no candidate")
+        # A71: no `attend` is ever sent; the wake cue is acceptance's `listen`.
+        if any(describe(i) == "state_cycle:attend" for i in client):
+            self.fail("attend", "state_cycle attend sent")
+        # No duck is left standing: a live turn ducked with no candidate and no unduck after.
+        if self.handling is None and c._candidate is None and turn is not None and not turn.ending:
+            dbs = [
+                i.db
+                for i in client
+                if isinstance(i, PlaybackDuckMessage) and i.turn_id == turn.turn_id
+            ]
+            if dbs and dbs[-1] != 0.0:
+                self.fail("duck", f"{turn.turn_id} left ducked with no candidate")
         # v6: segments after the ack, in the vocabulary, neutral first unless hinted.
         for turn_id, segments in self.segments.items():
             for _, _, state in segments:
@@ -1436,7 +1454,7 @@ class World:
         order = (
             "deliver",
             "tool_end",
-            "gate_yes",
+            "verify_yes",
             "endpoint_name",
             "end",
             "grant",
@@ -1483,6 +1501,17 @@ class World:
             ends = [i for i, f in enumerate(frames) if f.msg_type != MsgType.AUDIO_CHUNK]
             if len(ends) != 1 or ends[0] != len(frames) - 1:
                 self.fail("M47", f"tag {tag}: {[describe(f) for f in frames]}")
+        # T74: no candidate is left once every event is delivered, every claim answered and no
+        # verify job pending: nothing could ever decide it (a mute that withholds its score).
+        # Checked before the claims, since such a candidate's claim is never settled either.
+        if (
+            self.controller._candidate is not None
+            and self.handling is None
+            and not self.mailbox.items
+            and all(claim.answered for claim in self.arbiter.claims)
+            and not any(ingress.verify_asks for ingress in self.ingresses)
+        ):
+            self.fail("candidate", "a wake candidate left with nothing to decide it")
         # v9: every claim is settled exactly once.
         settles = collections.Counter(cid for cid, _ in self.arbiter.settles)
         if settles != collections.Counter(c.claim_id for c in self.arbiter.claims):
@@ -1504,7 +1533,7 @@ class World:
         positions = {self.pos}
         for ingress in self.ingresses:
             positions |= set(ingress.first_pos.values()) | {ingress.floor}
-            positions |= {through for _, through in ingress.gate_asks}
+            positions |= {hit_pos for _, hit_pos in ingress.verify_asks}
         ranks = {p: n for n, p in enumerate(sorted(positions | {p + 1 for p in positions}))}
         turn = c._turn
         turn_state: object = None
@@ -1565,13 +1594,15 @@ class World:
         wake = c._candidate
         wake_state = None
         if wake is not None:
+            # `hit_pos` and `cutoff` are left out: a uid is a candidate at most once, and the
+            # cutoff follows from the source (the model's every `wake` carries 0.8).
             wake_state = (
                 wake.source,
                 wake.waiting_name,
                 wake.proceed,
-                wake.gate_requested,
+                wake.verified,
+                wake.verify_score,
                 wake.ducked is not None,
-                wake.attend_at is not None,
                 wake.claim_id,
                 u(wake.utterance_id),
                 wake.reference_score,
@@ -1586,7 +1617,7 @@ class World:
                 i.expecting,
                 i.closed,
                 ranks[i.floor],
-                tuple((u(a), ranks[b]) for a, b in i.gate_asks),
+                tuple((u(a), ranks[b]) for a, b in i.verify_asks),
                 getattr(i, "last_text", None),
                 i.emitted == c._handled_seq if i is ingress else None,
                 i is ingress,
@@ -1703,6 +1734,7 @@ class World:
             "text",
             "reason",
             "gate",
+            "score",
             "spotter",
             "proceed",
             "active",
@@ -1767,15 +1799,15 @@ def fingerprint(obj: object, depth: int = 2) -> object:
 START_STATES: dict[str, tuple[str, ...]] = {
     "off": (),
     "idle": ("voice_start",),
-    "held": ("voice_start", "name", "grant:0", "gate_yes", "candidate"),
-    "thinking_tool": ("voice_start", "name", "grant:0", "gate_yes", "end", "tool"),
-    "speaking": ("voice_start", "name", "grant:0", "gate_yes", "end", "say"),
+    "held": ("voice_start", "name", "grant:0", "verify_yes", "candidate"),
+    "thinking_tool": ("voice_start", "name", "grant:0", "verify_yes", "end", "tool"),
+    "speaking": ("voice_start", "name", "grant:0", "verify_yes", "end", "say"),
     "text_tool": ("voice_start", "text", "tool"),
 }
 """Each start state's prefix, run eagerly. Every one but `off` has voice on, unmuted."""
 
 NARROW_STARTS: dict[str, tuple[str, ...]] = {
-    "thinking": ("voice_start", "name", "grant:0", "gate_yes", "end"),
+    "thinking": ("voice_start", "name", "grant:0", "verify_yes", "end"),
 }
 """Start states searched only by a narrowed reach run: `thinking` is a model turn with no tool
 and no audio, which a name supersedes and keeps (T55d)."""
@@ -1882,17 +1914,17 @@ name, the mute and `voice_stop` that leave the controller a muted ingress, and t
 
 SUPERSEDE_DEPTH = 4
 SUPERSEDE_ALPHABET = frozenset(
-    {"name", "grant", "deny", "gate_yes", "gate_no", "say", "tool_end", "advance"}
+    {"name", "grant", "deny", "verify_yes", "verify_no", "say", "tool_end", "advance"}
 )
 """The supersede's actions and its alternatives': a name and its claim's verdict either way, the
-gate decode addressed or not, a token whose audio would make it a barge-in, and the tool's end or
+verifier's score above the threshold or not, a token whose audio would make it a barge-in, and the tool's end or
 its grace running out, either of which lets the cut finish."""
 
 MERGE_DEPTH = 4
 MERGE_ALPHABET = frozenset(
-    {"name", "grant", "gate_yes", "candidate", "resumed", "end", "drop", "text", "mute", "done"}
+    {"name", "grant", "verify_yes", "candidate", "resumed", "end", "drop", "text", "mute", "done"}
 )
-"""The merge's actions and its alternatives': a name, its grant and its addressed gate decode,
+"""The merge's actions and its alternatives': a name, its grant and its accepting score,
 which supersede the turn and keep K; then what U does: a held turn, resumed speech, its end or
 its drop, a mute, a typed message, and the reply's end that commits the turn U started."""
 
@@ -1964,17 +1996,17 @@ REACH: tuple[Reach, ...] = (
         ),
         alphabet=B1D_ALPHABET,
     ),
-    # v13 A51 (T55c): a name, its grant and its addressed gate decode while the tool turn thinks
-    # with no audio queued; the gate decode's step supersedes the turn, waits in the cut on the
+    # v13 A51 (T55c): a name, its grant and its accepting score while the tool turn thinks
+    # with no audio queued; the score's step supersedes the turn, waits in the cut on the
     # tool's grace, and idles once the tool ends. So it needs depth 4.
     Reach(
         "supersede",
         "thinking_tool",
         SUPERSEDE_DEPTH,
-        (handled("TranscriptPartial", before="thinking", after="idle", fact="superseded"),),
+        (handled("WakeVerified", before="thinking", after="idle", fact="superseded"),),
         alphabet=SUPERSEDE_ALPHABET,
     ),
-    # v13 T55d: a name, its grant and its gate decode supersede a model turn with no tool and
+    # v13 T55d: a name, its grant and its accepting score supersede a model turn with no tool and
     # keep it as K; U's end then opens a turn that carries K's words, with no commit of K.
     Reach(
         "merge",
@@ -1992,7 +2024,7 @@ REACH: tuple[Reach, ...] = (
         alphabet=MERGE_ALPHABET,
     ),
     # v13 T55d: a held turn from U carries K's words and resolves K only at its release, so
-    # it needs depth 5: the name, its grant, the gate decode, the candidate and U's end.
+    # it needs depth 5: the name, its grant, its score, the candidate and U's end.
     Reach(
         "merge at release",
         "thinking",
@@ -2344,11 +2376,46 @@ def _no_restore(world: World) -> None:
     world.controller._restore = lambda wake: None  # type: ignore[method-assign]
 
 
+def _attend_at_every_name(world: World) -> None:
+    """The v17 cue put back: `attend` at every name hit."""
+    c = world.controller
+    from backend.realtime.ingress import NameHeard
+    from backend.realtime.protocol import StateCycleMessage
+
+    async def heard(event):
+        c._send_control(StateCycleMessage(state="attend"))
+        await c._on_name_heard(event)
+
+    _handler(world, NameHeard, heard)
+
+
+def _mute_abandons_only_a_waiting_wake(world: World) -> None:
+    """The v17 mute: only an endpoint wake still waiting for its backlog is abandoned, so a
+    candidate whose utterance ended waits for a score the muted ingress withholds.
+    """
+    c = world.controller
+
+    async def mute(message):
+        c._muted = message.active
+        wake = c._candidate
+        if message.active and wake is not None and wake.waiting_name:
+            c._abandon(wake, restore=True)
+
+    _handler(world, Mute, mute)
+
+
 def _restore_to_idle(world: World) -> None:
+    """The v17 restore: the duck undone, then `idle` sent for a wake that opened no turn."""
     c = world.controller
     from backend.realtime.protocol import StateCycleMessage
 
-    c._restore = lambda wake: c._send_control(StateCycleMessage(state="idle"))  # type: ignore[method-assign]
+    restore = c._restore
+
+    def restoring(wake):
+        restore(wake)
+        c._send_control(StateCycleMessage(state="idle"))
+
+    c._restore = restoring  # type: ignore[method-assign]
 
 
 def _any_hinted_state(world: World) -> None:
@@ -2483,8 +2550,10 @@ TEETH: list[tuple[str, str, int, Callable[[World], None]]] = [
     ("scene cancel", "speaking", 1, _scene_after_cut),
     ("L2", "held", 1, _ignore_voice_stop),
     ("M68", "speaking", 2, _degraded_on_control),
-    ("attend", "idle", 2, _no_restore),
-    ("rejection restores", "speaking", 2, _restore_to_idle),
+    ("duck", "speaking", 2, _no_restore),
+    ("attend", "idle", 1, _attend_at_every_name),
+    ("candidate", "idle", 3, _mute_abandons_only_a_waiting_wake),
+    ("rejection sends no state", "speaking", 2, _restore_to_idle),
     ("v6 segments", "held", 2, _any_hinted_state),
     ("scene anchors", "idle", 1, _listening_at_every_name),
     ("rejection cuts nothing", "speaking", 2, _purge_at_rejection),

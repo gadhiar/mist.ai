@@ -202,7 +202,8 @@ async def device_turn(rig, device: DeviceClient) -> None:
     )
     await settle()
     ((_, _mode, _from, uid),) = calls(ingress, "open_utterance")
-    ingress.emit(ingress.partial(uid, "mist turn the lights off", gate=True))
+    ingress.emit(ingress.partial(uid, "mist turn the lights off"))
+    ingress.emit(ingress.verified(uid, hit_pos=backlog - 1, score=0.9))
     ingress.emit(ingress.ended(uid, "Mist, turn the lights off."))
     await settle(200)
 
