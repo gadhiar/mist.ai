@@ -2,14 +2,16 @@
 
 Every engine call runs on an inference lane (`lanes.py`), so ingress itself only keeps state and
 schedules work. One worker task consumes the frames in arrival order: it cuts them into
-512-sample VAD windows, marks speech segments, feeds each segment and its pre-roll to the name
-spotter on the `kws` lane, and routes frames into the open utterance's transcriber stream.
-Partial decodes, the final decode and the end-of-turn score run as their own tasks, so silence
-keeps being measured while they are in flight, and a resume can cancel them.
+512-sample VAD windows, marks speech segments, routes frames into the open utterance's
+transcriber stream, and pushes the name spotter on the `kws` lane every frame the ring holds,
+once and in order as each is routed, reporting every hit it finds, in speech or in silence;
+the addressee gate, not the VAD, decides what a hit means. Partial decodes, the final decode
+and the end-of-turn score run as their own tasks, so silence keeps being measured while they are
+in flight, and a resume can cancel them.
 
 Ingress listens in one of two ways (Design, wake by name, item 1). Dormant, VAD marks segments
-and the spotter hears them, but nothing is transcribed. Engaged, VAD speech also opens an
-utterance. A wake utterance is opened by the controller through `open_utterance`, from the
+and the spotter hears every frame, but nothing is transcribed. Engaged, VAD speech also opens
+an utterance. A wake utterance is opened by the controller through `open_utterance`, from the
 `from_pos` of a `NameHeard`, with backfill from the ring of recent frames.
 
 Audio is kept, stamped and cut by the session's frame position, never by the uplink `seq`, which
@@ -22,13 +24,14 @@ import asyncio
 import bisect
 import logging
 from collections import OrderedDict, deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
 
 import numpy as np
 
 from .budget import EndpointingConfig, TurnConfig, WakeConfig
+from .engines.verifier import verify_window
 from .errors import RealtimeError, SpeechEngineError
 from .lanes import LaneJobCancelled
 from .protocol import Frame, Spotter
@@ -43,6 +46,7 @@ from .speech import (
     TurnEndDetector,
     VadStream,
     VoiceActivityDetector,
+    WakeVerifier,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,9 @@ FRAME_MS = 20
 VAD_WINDOW_SAMPLES = 512
 MAX_RETENTION_MS = 10000
 """The most audio the ring may hold: the wire's longest wake backlog."""
+
+KWS_BACKLOG_FRAMES = 50
+"""The most frames released to the name spotter that may wait behind its running job: 1000 ms."""
 
 _SAMPLE_RATE = 16000
 _RETENTION_HEADROOM_MS = 1000
@@ -171,23 +178,60 @@ class SpeechSegmentTracker:
         return segment
 
 
-def onset_feed_start(onset: int, pre_roll_frames: int, fed_through: int | None) -> int:
-    """The first frame the spotter hears for a segment opening at `onset`.
+def name_chain_start(
+    segments: Sequence[tuple[int, int]],
+    hit_pos: int,
+    *,
+    join_gap_ms: int,
+    pre_roll_frames: int,
+    window_frames: int,
+) -> int:
+    """Where a server name hit's wake utterance starts, before the caller's bounds.
 
-    The pre-roll before the onset, unless the spotter already heard part of it: a frame is
-    never fed twice.
+    The spotter hears every frame, so a hit can come with no segment before it, or after its
+    segment closed, and the name it heard lies in the spotter's window before the hit whatever
+    the VAD made of it. The window is therefore in the decode: with no segment, a decode from
+    the hit would hold only the audio after the name.
+
+    The chain walks back from the hit. A segment `(onset, last speech frame)` that starts at or
+    before the hit joins when the gap from its last speech frame to the next element, the hit
+    or the next chained segment, is at most `join_gap_ms`. The start is the earlier of the first
+    chained segment's onset less `pre_roll_frames`, and `hit_pos` less `window_frames` (the
+    spotter's `window_ms` in whole frames, rounded up) less `pre_roll_frames`; with no chained
+    segment, the second alone.
+
+    Then, if an unchained segment that started before the hit has its last speech frame at or
+    after that start, the start moves to the frame after it, so no unrelated speech enters the
+    decode. Such a segment ended more than `join_gap_ms` before the hit or the chain, so the
+    raise never cuts into the chain, and it cuts the window only where the window and the
+    pre-roll reach back further than `join_gap_ms`. What it cuts ended more than `join_gap_ms`
+    before the hit, where the name is not. `segments` are in order and need not all start
+    before the hit; the rest are ignored. Ingress and the wake harness both call this, each
+    bounding the result as it bounds a span.
     """
-    start = onset - pre_roll_frames
-    if fed_through is not None:
-        start = max(start, fed_through + 1)
+    before = [segment for segment in segments if segment[0] <= hit_pos]
+    chain_from = len(before)
+    following = hit_pos
+    while chain_from > 0:
+        onset, last = before[chain_from - 1]
+        if (following - last - 1) * FRAME_MS > join_gap_ms:
+            break
+        chain_from -= 1
+        following = onset
+    start = hit_pos - window_frames - pre_roll_frames
+    if chain_from < len(before):
+        start = min(start, before[chain_from][0] - pre_roll_frames)
+    for _, last in before[:chain_from]:
+        if last >= start:
+            start = last + 1
     return start
 
 
 def onset_lead_frames(cfg: EndpointingConfig) -> int:
     """The pre-roll, `pre_roll_ms`, in whole frames.
 
-    Ingress opens an utterance, feeds the spotter and starts a wake chain this many frames
-    before a speech onset, and the wake harness reads the same number from here.
+    Ingress opens an utterance and starts a wake chain this many frames before a speech onset,
+    and the wake harness reads the same number from here.
     """
     return cfg.pre_roll_ms // FRAME_MS
 
@@ -221,8 +265,7 @@ class TranscriptPartial:
 
     `audio_end_pos` is the last frame the decode covered and `heard_at_ms` that frame's arrival.
     `uncovered_since_ms` is the arrival of the oldest frame the previous partial did not cover,
-    from which the session measures caption lag. `gate` marks the out-of-cadence decode the
-    controller asked for through `through_pos`.
+    from which the session measures caption lag.
     """
 
     epoch: int
@@ -234,8 +277,6 @@ class TranscriptPartial:
     heard_at_ms: int
     audio_end_pos: int
     uncovered_since_ms: int
-    gate: bool = False
-    through_pos: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,8 +335,11 @@ class UtteranceDropped:
 class IngressOverload:
     """Audio was lost before it could be used, on the named lane.
 
-    `vad` is the queue cap, `capture` a backfill reaching past the ring, and `kws` spotter hops
-    skipped while the previous spotter job still ran.
+    `vad` is the queue cap, `capture` a backfill reaching past the ring, and `kws` frames
+    released to the name spotter and dropped, oldest first, because more than
+    `KWS_BACKLOG_FRAMES` waited behind its running job; the spotter's stream then starts a fresh
+    context. `kws` is sent once per episode, which ends when a spotter job ends with no frame
+    waiting, and `dropped_ms` is the first drop's.
     """
 
     epoch: int
@@ -325,6 +369,21 @@ class NameHeard:
     spotter: Spotter = "server"
 
 
+@dataclass(frozen=True, slots=True)
+class WakeVerified:
+    """The wake verifier's score over a name hit's audio window, for `request_verify`.
+
+    `score` is None when there is no verifier or no `verify` lane, when the audio held around
+    the hit is shorter than the verifier's `min_window_ms`, or when the verifier failed.
+    """
+
+    epoch: int
+    event_seq: int
+    utterance_id: str
+    hit_pos: int
+    score: float | None
+
+
 IngressEvent = (
     SpeechStarted
     | SpeechResumed
@@ -334,6 +393,7 @@ IngressEvent = (
     | UtteranceDropped
     | IngressOverload
     | NameHeard
+    | WakeVerified
 )
 
 
@@ -352,17 +412,25 @@ class IngressSeed:
     `frames` are the retained `(position, float32 audio)` pairs, oldest first; `floor` is one past
     the last frame of the last utterance, or one past the newest frame received before the last
     mute, whichever is later; `vad_from` the first frame the VAD has not scored, or None when the
-    VAD is not running.
+    VAD is not running. `mute_floor` is one past the newest frame received before the last mute,
+    the boundary no verify window reaches back across; unlike `floor`, an utterance's end does
+    not move it.
     """
 
     frames: tuple[tuple[int, np.ndarray], ...]
     floor: int
     vad_from: int | None
+    mute_floor: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class IngressStats:
-    """Counters the session reports; none of them holds audio or text."""
+    """Counters the session reports; none of them holds audio or text.
+
+    `skipped_kws_hops` counts frames, not jobs: the frames the name spotter's backlog bound
+    (`KWS_BACKLOG_FRAMES`) dropped unscored. A frame waiting behind a running spotter job is
+    not counted; the next job scores it.
+    """
 
     frames_received: int
     gap_frames: int
@@ -386,22 +454,27 @@ class Lane(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class IngressLanes:
-    """The lanes ingress submits to: VAD, STT, end of turn and the name spotter's `kws`."""
+    """The lanes ingress submits to: VAD, STT, end of turn and the name spotter's `kws`.
+
+    `verify` is the wake verifier's own lane, so a verify job never waits behind a spotter job.
+    """
 
     vad: Lane
     stt: Lane
     eot: Lane
     kws: Lane
+    verify: Lane | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class IngressEngines:
-    """The engines ingress drives; no end-of-turn model or no spotter turns that part off."""
+    """The engines ingress drives; no end-of-turn model, spotter or verifier turns that part off."""
 
     vad: VoiceActivityDetector
     transcriber: StreamingTranscriber
     turn_end: TurnEndDetector | None
     spotter: NameSpotter | None
+    verifier: WakeVerifier | None = None
 
 
 # -- Internal state -------------------------------------------------------------------------------
@@ -433,7 +506,7 @@ class _Utterance:
 
     `state` is `speaking` while frames go into the stream and `pending` from the endpoint
     candidate's silence on, when frames are held back so the final decode covers exactly the
-    utterance; a resume pushes the held frames and continues. Partial and gate decodes use
+    utterance; a resume pushes the held frames and continues. Partial decodes use
     `decode_token`, which only the utterance's close sets, and the final decode and end-of-turn
     score use `end_token`, which a resume also sets.
     """
@@ -458,15 +531,10 @@ class _Utterance:
         "end_pos",
         "final",
         "final_end",
-        "final_from_gate",
         "decided",
         "eot_running",
         "eot_checked_ms",
         "eot_prob",
-        "gate_state",
-        "gate_through",
-        "gate_end",
-        "gate_result",
     )
 
     def __init__(self, utterance_id: str, first_pos: int, stream: TranscriptStream) -> None:
@@ -489,15 +557,10 @@ class _Utterance:
         self.end_pos = first_pos - 1
         self.final: TranscriptUpdate | None = None
         self.final_end = first_pos - 1
-        self.final_from_gate = False
         self.decided: tuple[EndReason, int] | None = None
         self.eot_running = False
         self.eot_checked_ms = 0
         self.eot_prob: float | None = None
-        self.gate_state: Literal["none", "waiting", "running", "done"] = "none"
-        self.gate_through = 0
-        self.gate_end = first_pos - 1
-        self.gate_result: TranscriptUpdate | None = None
 
     def arrival(self, pos: int) -> int:
         index = bisect.bisect_left(self.positions, pos)
@@ -512,12 +575,18 @@ class _Utterance:
         return max(0, last_pos - self.first_pos + 1) * FRAME_MS
 
 
-def _push_spotter(
-    stream: NameSpotterStream, frames: tuple[tuple[bytes, int], ...], reset: bool
+def _spotter_job(
+    stream: NameSpotterStream,
+    frames: tuple[tuple[bytes, int], ...],
+    reset_warm_up: bool | None,
 ) -> list[NameHit]:
-    """One `kws` lane job: start a new context when asked, then score the frames in order."""
-    if reset:
-        stream.reset()
+    """One `kws` lane job: a fresh context first when asked, then each frame pushed in order.
+
+    `reset_warm_up` is None for no reset, else the reset's `warm_up`. Each frame is
+    `(pcm, pos)`.
+    """
+    if reset_warm_up is not None:
+        stream.reset(warm_up=reset_warm_up)
     hits: list[NameHit] = []
     for pcm, pos in frames:
         hits.extend(stream.push(pcm, pos))
@@ -604,7 +673,6 @@ class AudioIngress:
         self._tracker = SpeechSegmentTracker(endpointing)
         self._segments: deque[tuple[int, int]] = deque()
         self._processed_pos: int | None = None
-        self._current_pos = 0
 
         self._utt: _Utterance | None = None
         self._floor = 0
@@ -612,17 +680,35 @@ class AudioIngress:
         self._last_emitted = 0
         self._queue_overload_key: object = _UNREPORTED
 
+        # The spotter's feed: `_kws_next` is the first frame not yet released to it (None until
+        # the stream's start is known), `_kws_waiting` the released frames no job has taken,
+        # and `_kws_reset` a pending reset's `warm_up`. `_kws_off` is set when the stream could
+        # not be opened: nothing more is fed.
         self._kws_stream: NameSpotterStream | None = None
-        self._kws_task: asyncio.Task[None] | None = None
-        self._kws_fed_through: int | None = None
-        self._kws_reset_pending = True
+        self._kws_next: int | None = None
+        self._kws_waiting: deque[_Frame] = deque()
+        self._kws_busy = False
+        self._kws_off = False
+        self._kws_reset: bool | None = None
+        self._kws_generation = 0
         self._kws_overload_reported = False
         self._reference: OrderedDict[int, bytes] = OrderedDict()
         self._reference_seen = False
         spotter = engines.spotter
         lead_ms = (spotter.window_ms if spotter else 0) + wake.reference_tolerance_ms
         self._reference_cap = -(-lead_ms // FRAME_MS)
+        # The spotter's window in whole frames, rounded up: the audio a hit's name lies in.
+        self._kws_window = -(-spotter.window_ms // FRAME_MS) if spotter else 0
         self._endpoint_wake: _EndpointWake | None = None
+        # The first frame of each endpoint backlog heard, by its hit's position: the frame
+        # before it is the previous uplink's last, so no verify window reaches back past it.
+        self._backlog_starts: dict[int, int] = {}
+
+        # The mute boundary: one past the newest frame received before the last mute. Only a
+        # mute moves it, where `_floor` also moves past every utterance that ends.
+        self._mute_floor = 0
+        # Verify requests waiting for their last frame: `(utterance_id, hit_pos, ready_pos)`.
+        self._verify_waiting: list[tuple[str, int, int]] = []
 
         self._frames_received = 0
         self._gap_frames = 0
@@ -657,6 +743,12 @@ class AudioIngress:
         pcm = np.frombuffer(frame.payload, dtype="<i2").astype(np.float32) / _PCM16_SCALE
         item = _Frame(pos, frame.seq, pcm, frame.payload, self._clock())
         self._remember(item)
+        if self._verify_waiting:
+            self._verify_arrived(pos)
+        if self._kws_next is None:
+            # The spotter's stream starts at the first frame this ingress receives, so frames
+            # the VAD queue drops before any is routed are fed all the same.
+            self._kws_next = pos
         wake = self._endpoint_wake
         if wake is not None and wake.last_pos is None:
             if wake.first_pos is None:
@@ -704,6 +796,14 @@ class AudioIngress:
         frame received so far, including frames still queued for the VAD: no utterance or name
         opened after the unmute can reach back into audio from before the mute. Unmuting starts
         the VAD afresh at the next frame, since the frames between are gone.
+
+        The name spotter skips to the floor too: frames waiting for it are discarded, its next
+        fed frame starts a fresh, warmed context, and a spotter job still running reports none
+        of its hits, even when the mute is over by the time it ends.
+
+        The mute boundary moves to the same frame, so no verify window spans the mute, and a
+        verify request still waiting for its frames is discarded with no event; a verify job
+        that ends while muted emits none either.
         """
         if muted == self._muted or self._closed:
             return
@@ -713,12 +813,15 @@ class AudioIngress:
             if utt is not None:
                 self._drop_emitted(utt, "muted", utt.last_partial_text, None, utt.last_pushed)
             self._endpoint_wake = None
+            self._verify_waiting.clear()
             if self._ring:
                 # A frame enters the ring before its queue, so this covers the queued ones too.
                 self._floor = max(self._floor, self._ring[-1].pos + 1)
+                self._mute_floor = max(self._mute_floor, self._ring[-1].pos + 1)
             self._muted_frames += len(self._queue)
             self._queue.clear()
             self._reset_vad()
+            self._mute_spotter()
 
     def expect_endpoint_wake(
         self, *, keyword: str, score: float, backlog_ms: int, arrival: float
@@ -781,20 +884,27 @@ class AudioIngress:
             )
         return OpenedUtterance(utt.id, utt.first_pos)
 
-    def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
-        """Decode the open utterance once frames through `through_pos` have arrived.
+    def request_verify(self, utterance_id: str, hit_pos: int) -> None:
+        """Score the audio around the name hit at `hit_pos` with the wake verifier.
 
-        The result is one `TranscriptPartial` with `gate` true. It is the one partial in flight,
-        so a cadence tick meanwhile is skipped, and when the utterance ends within it, it is
-        the final transcript too.
+        Once a frame at or past `hit_pos` plus the verifier's `after_ms` has been received,
+        the window is built from one continuous stretch of audio with the hit (`_verify_has`),
+        its frames' uplink bytes are scored on the `verify` lane, and a `WakeVerified` for
+        `utterance_id` is emitted. With no verifier or no lane, the `WakeVerified` carries
+        None at once. While muted or closed nothing is scored or emitted: the controller
+        abandons its candidate on either.
         """
-        utt = self._utt
-        if self._closed or utt is None or utt.id != utterance_id:
+        if self._closed or self._muted:
             return
-        utt.gate_state = "waiting"
-        utt.gate_through = through_pos
-        utt.gate_result = None
-        self._maybe_start_gate(utt)
+        verifier = self._engines.verifier
+        if verifier is None or self._lanes.verify is None:
+            self._send(WakeVerified(self._epoch, self._stamp(), utterance_id, hit_pos, None))
+            return
+        ready_pos = hit_pos + verifier.after_ms // FRAME_MS
+        if self._ring and self._ring[-1].pos >= ready_pos:
+            self._start_verify(utterance_id, hit_pos)
+        else:
+            self._verify_waiting.append((utterance_id, hit_pos, ready_pos))
 
     def drop(self, utterance_id: str, reason: ControllerDropReason) -> UtteranceDropped | None:
         """Close the named open utterance without a final decode and return its drop.
@@ -840,7 +950,12 @@ class AudioIngress:
     def handoff(self) -> IngressSeed:
         """The seed for the next ingress across a reconfigure; reads only."""
         frames = tuple((item.pos, item.pcm) for item in self._ring)
-        return IngressSeed(frames=frames, floor=self._floor, vad_from=self._vad_from())
+        return IngressSeed(
+            frames=frames,
+            floor=self._floor,
+            vad_from=self._vad_from(),
+            mute_floor=self._mute_floor,
+        )
 
     def stats(self) -> IngressStats:
         """The counters so far: uplink gaps, discarded frames, skipped jobs, missing reference."""
@@ -865,9 +980,14 @@ class AudioIngress:
             audio = np.asarray(pcm, dtype=np.float32)
             self._remember(_Frame(pos, None, audio, _to_pcm16(audio), arrival))
         self._floor = seed.floor
+        self._mute_floor = seed.mute_floor
         if seed.vad_from is None:
+            # The spotter starts at the first frame received, as a new ingress's does.
             self._processed_pos = seed.frames[-1][0] if seed.frames else None
             return
+        # No stream state crosses a reconfigure: this ingress's stream starts at the pre-roll
+        # before the first frame its VAD scores, never below the floor.
+        self._kws_next = max(seed.floor, seed.vad_from - self._pre_roll)
         before = [item.pos for item in self._ring if item.pos < seed.vad_from]
         self._processed_pos = before[-1] if before else None
         self._queue.extend(item for item in self._ring if item.pos >= seed.vad_from)
@@ -922,7 +1042,6 @@ class AudioIngress:
 
     async def _process(self, item: _Frame) -> None:
         generation = self._vad_generation
-        self._current_pos = item.pos
         self._vad_frames.append(item)
         self._vad_buffered += len(item.pcm)
         while self._vad_buffered >= VAD_WINDOW_SAMPLES:
@@ -1012,14 +1131,14 @@ class AudioIngress:
         elif self._engaged:
             utt = self._open(max(onset - self._pre_roll, self._floor))
             self._send(SpeechStarted(self._epoch, self._stamp(), utt.id, utt.first_pos))
-        self._spot_onset(onset)
 
     def _chain_from(self, hit_pos: int, lower: int | None) -> int:
-        """Where a wake utterance for a hit at `hit_pos` opens (Design, item 2).
+        """Where a wake utterance for an endpoint's hit at `hit_pos` opens (Design, item 2).
 
         The start of the earliest segment in the chain reaching the hit, each gap at most
         `join_gap_ms`, less the pre-roll; bounded below by the lookback, the floor, the ring's
-        oldest frame and, for an endpoint, the backlog's first frame.
+        oldest frame and, for an endpoint, the backlog's first frame. A server hit's start is
+        `_name_from`'s.
         """
         segments = [segment for segment in self._segments if segment[0] <= hit_pos]
         current = self._tracker.open_segment
@@ -1041,65 +1160,191 @@ class AudioIngress:
             bounds.append(lower)
         return max(bounds)
 
+    def _name_from(self, hit_pos: int) -> int:
+        """Where a wake utterance for a server hit at `hit_pos` opens.
+
+        `name_chain_start` over the segments the VAD has marked, the open one with its last
+        speech frame so far, bounded below by the lookback, the floor and the ring's oldest
+        frame, as `_chain_from` bounds an endpoint's.
+        """
+        segments = list(self._segments)
+        current = self._tracker.open_segment
+        if current is not None:
+            segments.append(current)
+        start = name_chain_start(
+            segments,
+            hit_pos,
+            join_gap_ms=self._wake.join_gap_ms,
+            pre_roll_frames=self._pre_roll,
+            window_frames=self._kws_window,
+        )
+        bounds = [start, hit_pos - self._wake.lookback_ms // FRAME_MS, self._floor]
+        if self._ring:
+            bounds.append(self._ring[0].pos)
+        return max(bounds)
+
     # -- Name spotting ----------------------------------------------------------------------------
 
-    def _spot_onset(self, onset: int) -> None:
-        if self._engines.spotter is None:
-            return
-        start = onset_feed_start(onset, self._pre_roll, self._kws_fed_through)
-        frames = [item for item in self._ring if start <= item.pos <= self._current_pos]
-        self._kws_reset_pending = True
-        self._kws_overload_reported = False
-        if frames:
-            self._spot(frames)
+    def _feed_spotter(self) -> None:
+        """Release every frame through the newest routed one, from the ring by position.
 
-    def _spot(self, frames: list[_Frame]) -> None:
-        spotter = self._engines.spotter
-        assert spotter is not None
-        self._kws_fed_through = frames[-1].pos
-        if self._kws_task is not None and not self._kws_task.done():
-            # At most one spotter job per session: a hop that finds the last one still running
-            # is skipped, not queued, so the spotter never falls behind the uplink.
-            self._skipped_kws += len(frames)
-            if not self._kws_overload_reported:
-                self._kws_overload_reported = True
-                self._send_overload("kws", len(frames) * FRAME_MS)
+        Called after each routed frame, so each frame is pushed once and in order as soon as it
+        is routed, speech or not, and every hit the stream finds is reported. A streaming model
+        carries its state from step to step and runs without a break on the device, so the
+        stream is never started cold at a speech onset. Frames the VAD queue dropped, and a
+        seeded ingress's frames before `vad_from`, are in the ring though never routed, and are
+        released all the same. A position the ring no longer holds is skipped.
+        """
+        if self._engines.spotter is None or self._kws_off or self._kws_next is None:
             return
-        if self._kws_stream is None:
-            self._kws_stream = spotter.open_stream(self._wake.kws_threshold)
-        reset = self._kws_reset_pending
-        self._kws_reset_pending = False
-        payload = tuple((item.payload, item.pos) for item in frames)
-        self._kws_task = self._spawn(self._run_spotter(self._kws_stream, payload, reset))
+        newest = self._processed_pos
+        if newest is None or self._closed or self._muted or newest < self._kws_next:
+            return
+        for pos in range(self._kws_next, newest + 1):
+            frame = self._by_pos.get(pos)
+            if frame is not None:
+                self._kws_waiting.append(frame)
+        self._kws_next = newest + 1
+        if self._kws_busy:
+            self._bound_spotter_backlog()
+        else:
+            self._start_spotter_job()
+
+    def _bound_spotter_backlog(self) -> None:
+        """Drop the oldest frames waiting past `KWS_BACKLOG_FRAMES`, and restart the context.
+
+        The reset skips the silence warm-up, which would only add to the backlog; the fresh
+        context reports nothing until it has heard `warmup_ms` of audio.
+        """
+        dropped = 0
+        while len(self._kws_waiting) > KWS_BACKLOG_FRAMES:
+            self._kws_waiting.popleft()
+            dropped += 1
+        if not dropped:
+            return
+        self._skipped_kws += dropped
+        self._kws_reset = False
+        if not self._kws_overload_reported:
+            self._kws_overload_reported = True
+            self._send_overload("kws", dropped * FRAME_MS)
+
+    def _start_spotter_job(self) -> None:
+        """Start one job with every waiting frame; at most one runs per session.
+
+        With no stream yet, the job opens one first on the `kws` lane (`_run_spotter`).
+        """
+        spotter = self._engines.spotter
+        if spotter is None or self._kws_busy or self._closed or not self._kws_waiting:
+            return
+        frames = tuple((item.payload, item.pos) for item in self._kws_waiting)
+        self._kws_waiting.clear()
+        reset, self._kws_reset = self._kws_reset, None
+        stream = self._kws_stream
+        if stream is None:
+            # A new stream is a fresh context, so a reset asked for before it adds nothing.
+            reset = None
+        self._kws_busy = True
+        self._spawn(self._run_spotter(stream, frames, reset, self._kws_generation))
 
     async def _run_spotter(
-        self, stream: NameSpotterStream, frames: tuple[tuple[bytes, int], ...], reset: bool
+        self,
+        stream: NameSpotterStream | None,
+        frames: tuple[tuple[bytes, int], ...],
+        reset: bool | None,
+        generation: int,
     ) -> None:
+        """Feed one job's frames on the `kws` lane, opening the stream first when `stream` is None.
+
+        The open is a lane job of its own, so a failed open, which turns the spotter off, is
+        told apart from a failed push, which fails only its frames job. However the job ends,
+        `_kws_busy` is cleared and the next job starts unless the ingress is closed, so no
+        exception, from an engine or from reporting a hit, leaves the spotter waiting for good.
+        """
         try:
-            hits = await self._lanes.kws.run(
-                _push_spotter, stream, frames, reset, token=self._token
-            )
+            if stream is None:
+                stream = await self._open_spotter()
+                if stream is None:
+                    return
+                if generation != self._kws_generation:
+                    # A mute landed while no stream existed, so it asked for no reset. Every
+                    # frame here is from before it, and the fresh stream has fed nothing, so
+                    # there is no gap for a backlog reset to restart from either.
+                    self._kws_reset = None
+                    return
+            try:
+                hits = await self._lanes.kws.run(
+                    _spotter_job, stream, frames, reset, token=self._token
+                )
+            except SpeechEngineError:
+                logger.warning("Ingress name spotter job failed", exc_info=True)
+                self._engine_errors += 1
+                hits = []
+            for hit in hits:
+                await self._on_hit(hit, generation)
         except LaneJobCancelled:
             return
+        finally:
+            self._kws_busy = False
+            if not self._closed:
+                if self._kws_waiting:
+                    self._start_spotter_job()
+                else:
+                    # The spotter has caught up, so the next drop is a new overload episode.
+                    self._kws_overload_reported = False
+
+    async def _open_spotter(self) -> NameSpotterStream | None:
+        """Open the spotter's stream as its own `kws` job and store it as soon as it returns.
+
+        Opening builds an interpreter and feeds it `warmup_ms` of silence, engine work that
+        belongs on the lane. A `SpeechEngineError` turns the spotter off for this ingress: it is
+        logged once and counted, the waiting frames are cleared and no later frame is queued.
+        `load` has already built an interpreter from the same bytes, so a failed open is not
+        expected to be transient, and retrying at every job would log and rebuild up to 50
+        times a second. A new ingress (a reconfigure) opens again. Returns None when off.
+        """
+        spotter = self._engines.spotter
+        assert spotter is not None
+        try:
+            stream = await self._lanes.kws.run(
+                spotter.open_stream, self._wake.kws_threshold, token=self._token
+            )
         except SpeechEngineError:
-            logger.warning("Ingress name spotter job failed", exc_info=True)
+            logger.warning(
+                "Ingress name spotter could not open its stream; it is off for this ingress",
+                exc_info=True,
+            )
             self._engine_errors += 1
-            return
-        for hit in hits:
-            await self._on_hit(hit)
+            self._kws_off = True
+            self._kws_waiting.clear()
+            return None
+        self._kws_stream = stream
+        return stream
 
-    def _hearing(self) -> bool:
-        """Whether a name hit may be reported: never while muted or after close."""
-        return not (self._closed or self._muted)
+    def _mute_spotter(self) -> None:
+        """Skip the spotter to the floor; its next fed frame starts a fresh, warmed context."""
+        self._kws_generation += 1
+        self._kws_waiting.clear()
+        if self._kws_next is not None:
+            self._kws_next = max(self._kws_next, self._floor)
+        if self._kws_stream is not None:
+            self._kws_reset = True
 
-    async def _on_hit(self, hit: NameHit) -> None:
-        if not self._hearing():
+    def _hearing(self, generation: int) -> bool:
+        """Whether a name hit may be reported: never while muted, after close, or after a mute.
+
+        A job holds up to `KWS_BACKLOG_FRAMES` frames, and a mute and an unmute can both land
+        while it runs, so a hit from a job the spotter generation has moved past is dropped.
+        """
+        return not (self._closed or self._muted or generation != self._kws_generation)
+
+    async def _on_hit(self, hit: NameHit, generation: int) -> None:
+        if not self._hearing(generation):
             return
         frame = self._by_pos.get(hit.end_pos)
         arrival = float(frame.arrival_ms if frame is not None else self._clock())
         reference = await self._reference_score(hit)
         # Scoring the reference awaits a lane, and a mute or a close may land meanwhile.
-        if not self._hearing():
+        if not self._hearing(generation):
             return
         utt = self._utt
         in_utterance = utt is not None and hit.end_pos >= utt.first_pos
@@ -1109,7 +1354,7 @@ class AudioIngress:
                 event_seq=self._stamp(),
                 hit=hit,
                 arrival=arrival,
-                from_pos=self._chain_from(hit.end_pos, None),
+                from_pos=self._name_from(hit.end_pos),
                 utterance_id=utt.id if in_utterance and utt is not None else None,
                 reference_score=reference,
             )
@@ -1150,6 +1395,8 @@ class AudioIngress:
     def _endpoint_heard(self, wake: _EndpointWake) -> None:
         assert wake.last_pos is not None
         self._endpoint_wake = None
+        if wake.first_pos is not None:
+            self._remember_backlog(wake.last_pos, wake.first_pos)
         utt = self._utt
         self._send(
             NameHeard(
@@ -1163,6 +1410,107 @@ class AudioIngress:
                 spotter="endpoint",
             )
         )
+
+    def _remember_backlog(self, hit_pos: int, first_pos: int) -> None:
+        """Keep an endpoint backlog's first frame by its hit, forgetting hits the ring has lost."""
+        oldest = self._ring[0].pos if self._ring else hit_pos
+        for stale in [pos for pos in self._backlog_starts if pos < oldest]:
+            del self._backlog_starts[stale]
+        self._backlog_starts[hit_pos] = first_pos
+
+    # -- The wake verifier ------------------------------------------------------------------------
+
+    def _verify_arrived(self, pos: int) -> None:
+        """Start every waiting verify request whose last frame has now been received."""
+        ready = [request for request in self._verify_waiting if pos >= request[2]]
+        if not ready:
+            return
+        self._verify_waiting = [request for request in self._verify_waiting if pos < request[2]]
+        for utterance_id, hit_pos, _ in ready:
+            self._start_verify(utterance_id, hit_pos)
+
+    def _start_verify(self, utterance_id: str, hit_pos: int) -> None:
+        """Build the hit's window now, while the ring holds it, and score it as a lane job.
+
+        The bytes are the frames' own uplink payload: `_to_pcm16` scales by 32767 and
+        truncates, and the verifier is trained on int16 over 32768.
+        """
+        verifier = self._engines.verifier
+        lane = self._lanes.verify
+        assert verifier is not None and lane is not None
+        window = verify_window(
+            self._verify_has(hit_pos, verifier.after_ms // FRAME_MS),
+            hit_pos,
+            before_frames=verifier.before_ms // FRAME_MS,
+            after_frames=verifier.after_ms // FRAME_MS,
+            min_frames=-(-verifier.min_window_ms // FRAME_MS),
+        )
+        if window is None:
+            logger.info(
+                "Ingress verify window for the hit at %d is under %d ms; not scored",
+                hit_pos,
+                verifier.min_window_ms,
+            )
+            self._send(WakeVerified(self._epoch, self._stamp(), utterance_id, hit_pos, None))
+            return
+        pcm = b"".join(self._by_pos[pos].payload for pos in window)
+        self._spawn(self._verify(verifier, lane, pcm, utterance_id, hit_pos))
+
+    def _verify_has(self, hit_pos: int, after_frames: int) -> Callable[[int], bool]:
+        """Whether a position's frame is audio of one continuous stretch of time with the hit.
+
+        Positions are the session's arrival counter, not time: the position before an endpoint
+        backlog's first frame is the previous uplink's last, and a frame lost on any link
+        leaves no position gap. So a frame counts when the ring holds it, it is at or past the
+        mute boundary and, for an endpoint hit, the backlog's first frame, and its `seq - pos`
+        is the hit frame's, since a `seq` jump is lost audio. `_floor` is no bound: it also
+        moves past every utterance that ends, which would cut a window short.
+
+        A frame a reconfigure seeded carries no `seq` and counts as continuous, since the
+        handoff keeps positions and the mute boundary; the `seq` check applies between frames
+        that both carry one. When the hit frame is a seeded one, the check is against the
+        first frame after it that carries a `seq`.
+        """
+        lower = max(self._mute_floor, self._backlog_starts.get(hit_pos, self._mute_floor))
+        by_pos = self._by_pos
+        offset: int | None = None
+        for pos in range(hit_pos, hit_pos + after_frames + 1):
+            frame = by_pos.get(pos)
+            if frame is not None and frame.seq is not None:
+                offset = frame.seq - pos
+                break
+
+        def has(pos: int) -> bool:
+            if pos < lower:
+                return False
+            frame = by_pos.get(pos)
+            if frame is None:
+                return False
+            return frame.seq is None or offset is None or frame.seq - pos == offset
+
+        return has
+
+    async def _verify(
+        self, verifier: WakeVerifier, lane: Lane, pcm: bytes, utterance_id: str, hit_pos: int
+    ) -> None:
+        """Score one window on the `verify` lane and emit its `WakeVerified`.
+
+        A close cancels the job and emits nothing; a result that lands while muted emits
+        nothing either. The spotter's generation is not checked: a spotter reset does not
+        abandon the hit, and the controller drops a result for a candidate it no longer holds.
+        """
+        score: float | None
+        try:
+            score = await lane.run(verifier.score, pcm, token=self._token)
+        except LaneJobCancelled:
+            return
+        except SpeechEngineError:
+            logger.warning("Ingress wake verifier failed for the hit at %d", hit_pos, exc_info=True)
+            self._engine_errors += 1
+            score = None
+        if self._closed or self._muted:
+            return
+        self._send(WakeVerified(self._epoch, self._stamp(), utterance_id, hit_pos, score))
 
     # -- Utterances -------------------------------------------------------------------------------
 
@@ -1192,13 +1540,7 @@ class AudioIngress:
                 self._push(utt, item)
             elif not utt.held or item.pos > utt.held[-1].pos:
                 utt.held.append(item)
-        fed = self._kws_fed_through
-        if (
-            self._tracker.open_segment is not None
-            and self._engines.spotter is not None
-            and (fed is None or item.pos > fed)
-        ):
-            self._spot([item])
+        self._feed_spotter()
 
     def _after_frame(self, item: _Frame) -> None:
         utt = self._utt
@@ -1213,8 +1555,6 @@ class AudioIngress:
                     self._candidate(utt)
             else:
                 self._tick_pending(utt)
-            if self._utt is utt:
-                self._maybe_start_gate(utt)
         wake = self._endpoint_wake
         if wake is not None and wake.last_pos is not None and item.pos >= wake.last_pos:
             self._endpoint_heard(wake)
@@ -1235,26 +1575,15 @@ class AudioIngress:
             return
         if utt.last_pushed <= utt.partial_end:
             return
-        self._start_decode(utt, gate=False)
+        self._start_decode(utt)
 
-    def _maybe_start_gate(self, utt: _Utterance) -> None:
-        if (
-            utt.gate_state == "waiting"
-            and not utt.decoding
-            and self._processed_pos is not None
-            and self._processed_pos >= utt.gate_through
-        ):
-            utt.gate_state = "running"
-            utt.gate_end = utt.last_pushed
-            self._start_decode(utt, gate=True)
-
-    def _start_decode(self, utt: _Utterance, *, gate: bool) -> None:
+    def _start_decode(self, utt: _Utterance) -> None:
         utt.decoding = True
-        task = self._spawn(self._decode_partial(utt, utt.last_pushed, gate))
+        task = self._spawn(self._decode_partial(utt, utt.last_pushed))
         utt.tasks.add(task)
         task.add_done_callback(utt.tasks.discard)
 
-    async def _decode_partial(self, utt: _Utterance, end_pos: int, gate: bool) -> None:
+    async def _decode_partial(self, utt: _Utterance, end_pos: int) -> None:
         token = utt.decode_token
         try:
             update = await self._lanes.stt.run(utt.stream.decode_partial, token, token=token)
@@ -1263,11 +1592,6 @@ class AudioIngress:
         except SpeechEngineError:
             logger.warning("Ingress partial decode failed for %s", utt.id, exc_info=True)
             self._engine_errors += 1
-            if gate and self._utt is utt:
-                utt.gate_state = "none"
-                if utt.final_from_gate:
-                    utt.final_from_gate = False
-                    self._start_final(utt)
             return
         finally:
             utt.decoding = False
@@ -1276,7 +1600,6 @@ class AudioIngress:
         uncovered = utt.first_arrival_after(utt.partial_end)
         utt.partial_end = end_pos
         utt.last_partial_text = update.text
-        through = utt.gate_through if gate else None
         self._send(
             TranscriptPartial(
                 self._epoch,
@@ -1288,25 +1611,8 @@ class AudioIngress:
                 utt.arrival(end_pos),
                 end_pos,
                 uncovered,
-                gate,
-                through,
             )
         )
-        if gate:
-            utt.gate_state = "done"
-            utt.gate_result = update
-            if utt.final_from_gate and utt.state == "pending":
-                utt.final_from_gate = False
-                self._on_final(utt, update, end_pos)
-        elif self._utt is utt:
-            self._maybe_start_gate(utt)
-
-    def _gate_covers_end(self, utt: _Utterance) -> bool:
-        if utt.gate_state in ("done", "running"):
-            return utt.gate_end >= utt.end_pos
-        if utt.gate_state == "waiting":
-            return utt.gate_through >= utt.end_pos
-        return False
 
     def _candidate(self, utt: _Utterance) -> None:
         """The endpoint silence started: the final decode and the end-of-turn score start now.
@@ -1320,16 +1626,9 @@ class AudioIngress:
         utt.decided = None
         utt.eot_prob = None
         utt.eot_checked_ms = self._silence_ms()
-        reuse_gate = self._gate_covers_end(utt)
-        if not reuse_gate:
-            self._start_final(utt)
+        self._start_final(utt)
         if self._engines.turn_end is not None:
             self._start_eot(utt)
-        if reuse_gate:
-            if utt.gate_state == "done" and utt.gate_result is not None:
-                self._on_final(utt, utt.gate_result, utt.end_pos)
-            else:
-                utt.final_from_gate = True
 
     def _start_final(self, utt: _Utterance) -> None:
         task = self._spawn(self._final(utt, utt.end_token))
@@ -1460,7 +1759,6 @@ class AudioIngress:
         utt.decided = None
         utt.eot_prob = None
         utt.eot_running = False
-        utt.final_from_gate = False
         held, utt.held = utt.held, []
         for item in held:
             self._push(utt, item)

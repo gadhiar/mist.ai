@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.errors import Neo4jConnectionError
-from backend.factories import build_mist_runtime, build_speech_engines
+from backend.factories import _real_engine_loaders, build_mist_runtime, build_speech_engines
 from backend.knowledge.config import LLMConfig
 from backend.realtime.budget import (
     BUDGET_PRESETS,
@@ -26,11 +26,17 @@ from backend.realtime.budget import (
 )
 from backend.realtime.degraded import DirectResponder
 from backend.realtime.errors import SpeechEngineError
+from backend.realtime.lanes import InferenceLane
 from backend.realtime.runtime import EngineLoaders, TorchGpuMeter
 from backend.realtime.session import InferenceLanes, tts_voice_of
 from backend.realtime.turn import TurnPlacement
 from backend.realtime.voice_assets import VoiceAssetError
-from tests.fakes.speech import FakeSynthesizer, ScriptedNameSpotter, ScriptedTranscriber
+from tests.fakes.speech import (
+    FakeSynthesizer,
+    ScriptedNameSpotter,
+    ScriptedTranscriber,
+    ScriptedWakeVerifier,
+)
 
 from .turn_fakes import InlineLane
 
@@ -42,11 +48,29 @@ class FakeEngine(SimpleNamespace):
 
 
 class Loaders:
-    """Fake loaders that record each load in order; `fail` names options that raise."""
+    """Fake loaders that record each load in order; `fail` names options that raise.
 
-    def __init__(self, *, fail: dict[str, Exception] | None = None) -> None:
+    The verifier is built for the spotter `verifier_spotter` names, `mist-kws` (the settings'
+    `kws_model`) unless a test gives another; `verify` False builds no verifier loader.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail: dict[str, Exception] | None = None,
+        verifier_spotter: str = "mist-kws",
+        verify: bool = True,
+    ) -> None:
         self.fail = fail or {}
         self.calls: list[str] = []
+        self.verifier_spotter = verifier_spotter
+        self.verify = verify
+        self.verifiers: list[ScriptedWakeVerifier] = []
+
+    def _verifier(self) -> ScriptedWakeVerifier:
+        verifier = ScriptedWakeVerifier(spotter_model_id=self.verifier_spotter)
+        self.verifiers.append(verifier)
+        return verifier
 
     def _load(self, name: str, engine: object) -> object:
         self.calls.append(name)
@@ -75,6 +99,9 @@ class Loaders:
             kws=lambda placement: self._load(
                 "kws", ScriptedNameSpotter(model_id="kws-model", hit_lag_ms=120)
             ),
+            verify=(
+                (lambda placement: self._load("verify", self._verifier())) if self.verify else None
+            ),
         )
 
 
@@ -86,9 +113,24 @@ def _no_torch(monkeypatch):
 
 
 def settings(**placement: object) -> VoiceSettings:
-    defaults: dict[str, object] = {"kws_model": "mist-kws", "tts_voice": "mist-v1"}
+    defaults: dict[str, object] = {
+        "kws_model": "mist-kws",
+        "verify_model": "mist-verify",
+        "tts_voice": "mist-v1",
+    }
     defaults.update(placement)
     return VoiceSettings(placement=PlacementConfig(**defaults))  # type: ignore[arg-type]
+
+
+def spotter_skips(caplog) -> list[str]:
+    """The runtime's WARNINGs that say why the server spotter was not loaded."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == RUNTIME_LOGGER
+        and r.levelno == logging.WARNING
+        and r.getMessage().startswith("kws:")
+    ]
 
 
 def errors(caplog) -> list[str]:
@@ -139,7 +181,14 @@ class TestEngineWalk:
 
         build_speech_engines(settings(), loaders=loaders.build())
 
-        assert loaders.calls == ["nemotron-160@cuda", "vad", "eot", "kws", "pocket-clone@cpu"]
+        assert loaders.calls == [
+            "nemotron-160@cuda",
+            "vad",
+            "eot",
+            "verify",
+            "kws",
+            "pocket-clone@cpu",
+        ]
 
     @pytest.mark.parametrize("chain", [(), (EngineOption("parakeet-cpu", "cpu"),)])
     def test_an_empty_or_failed_chain_leaves_the_slot_off(self, chain):
@@ -158,6 +207,18 @@ class TestEngineWalk:
         assert loaders.calls == ["pocket-clone@cpu"]
         assert (engines.vad, engines.turn_end, engines.spotter) == (None, None, None)
         assert engines.statuses.vad.location == "off"
+
+    def test_the_vad_and_eot_statuses_carry_their_engines_model_ids(self):
+        engines = build_speech_engines(settings(), loaders=Loaders().build())
+
+        assert (engines.statuses.vad.location, engines.statuses.vad.model_id) == (
+            "cpu",
+            "vad-model",
+        )
+        assert (engines.statuses.eot.location, engines.statuses.eot.model_id) == (
+            "cpu",
+            "eot-model",
+        )
 
     def test_an_unknown_id_or_unrecorded_device_is_skipped_with_one_error(self, caplog):
         chain = (
@@ -208,6 +269,63 @@ class TestEngineWalk:
         for engines in (no_model, failing):
             assert engines.spotter is None
             assert engines.statuses.kws.location == "off"
+
+    def test_the_verifier_loads_beside_the_spotter(self, caplog):
+        loaders = Loaders()
+
+        with caplog.at_level(logging.WARNING, logger=RUNTIME_LOGGER):
+            engines = build_speech_engines(settings(), loaders=loaders.build())
+
+        assert engines.verifier is loaders.verifiers[0]
+        assert engines.spotter is not None
+        assert engines.statuses.kws.location == "cpu"
+        assert spotter_skips(caplog) == []
+
+    def test_a_verifier_loads_without_a_spotter(self):
+        loaders = Loaders()
+
+        engines = build_speech_engines(settings(kws_model=None), loaders=loaders.build())
+
+        assert engines.verifier is loaders.verifiers[0]
+        assert "kws" not in loaders.calls
+
+    @pytest.mark.parametrize(
+        ("placement", "loader_args", "reason"),
+        [
+            pytest.param({"verify_model": None}, {}, "MIST_VOICE_VERIFY_MODEL", id="no-model"),
+            pytest.param({}, {"verify": False}, "did not load", id="no-loader"),
+            pytest.param(
+                {},
+                {"fail": {"verify": SpeechEngineError("manifest refused")}},
+                "did not load",
+                id="load-error",
+            ),
+            pytest.param(
+                {}, {"verifier_spotter": "mist-kws-old"}, "mist-kws-old", id="other-spotter"
+            ),
+        ],
+    )
+    def test_without_a_matching_verifier_the_spotter_is_never_loaded(
+        self, caplog, placement, loader_args, reason
+    ):
+        loaders = Loaders(**loader_args)
+
+        with caplog.at_level(logging.WARNING, logger=RUNTIME_LOGGER):
+            engines = build_speech_engines(settings(**placement), loaders=loaders.build())
+
+        assert "kws" not in loaders.calls
+        assert engines.spotter is None
+        assert engines.statuses.kws.location == "off"
+        skips = spotter_skips(caplog)
+        assert len(skips) == 1
+        assert reason in skips[0] and "mist-kws" in skips[0]
+
+    def test_a_verifier_for_another_spotter_still_serves_the_endpoint(self):
+        loaders = Loaders(verifier_spotter="mist-kws-old")
+
+        engines = build_speech_engines(settings(), loaders=loaders.build())
+
+        assert engines.verifier is loaders.verifiers[0]
 
     def test_power_off_skips_every_cuda_option_and_walks_on(self):
         loaders = Loaders()
@@ -303,7 +421,12 @@ def knowledge_config(*, enabled: bool = True, first_chars: int = 24) -> SimpleNa
 
 def inline_lanes() -> InferenceLanes:
     return InferenceLanes(
-        vad=InlineLane(), eot=InlineLane(), stt=InlineLane(), tts=InlineLane(), kws=InlineLane()
+        vad=InlineLane(),
+        eot=InlineLane(),
+        stt=InlineLane(),
+        tts=InlineLane(),
+        kws=InlineLane(),
+        verify=InlineLane(),
     )
 
 
@@ -411,6 +534,7 @@ class TestBuildMistRuntime:
     def test_capabilities_offer_wake_and_the_loaded_spotters(self):
         built, _ = runtime(HandlerFactory())
         no_kws, _ = runtime(HandlerFactory(), voice_settings=settings(kws_model=None))
+        neither, _ = runtime(HandlerFactory(), voice_settings=settings(verify_model=None))
 
         voice = built.voice_capabilities()
         assert (voice.modes, voice.spotters, voice.reference) == (
@@ -418,5 +542,67 @@ class TestBuildMistRuntime:
             ["endpoint", "server"],
             True,
         )
-        bare = no_kws.voice_capabilities()
-        assert (bare.spotters, bare.reference) == (["endpoint"], False)
+        verifier_only = no_kws.voice_capabilities()
+        assert (verifier_only.modes, verifier_only.spotters, verifier_only.reference) == (
+            ["wake"],
+            ["endpoint"],
+            False,
+        )
+        # No verifier: no wake can be accepted, so no wake mode or spotter is offered.
+        bare = neither.voice_capabilities()
+        assert (bare.modes, bare.spotters, bare.reference) == ([], [], False)
+        assert (bare.stt, bare.tts) == (True, True)
+
+    def test_close_stops_the_lanes_and_closes_the_verifier(self):
+        built, _ = runtime(HandlerFactory())
+        verifier = built.engines.verifier
+
+        built.close()
+
+        assert verifier.closes == 1
+
+    def test_the_default_lanes_give_the_verifier_its_own_lane(self):
+        built = build_mist_runtime(
+            knowledge_config(),  # type: ignore[arg-type]
+            voice_settings=settings(),
+            llm_provider=FakeProvider(),  # type: ignore[arg-type]
+            handler_factory=HandlerFactory(),
+            engine_loaders=Loaders().build(),
+        )
+        try:
+            lanes = built.lanes
+            assert isinstance(lanes.verify, InferenceLane)
+            assert lanes.verify not in (lanes.vad, lanes.eot, lanes.stt, lanes.tts, lanes.kws)
+        finally:
+            built.close()
+
+    def test_the_real_verify_loader_is_the_onnx_verifier_on_onnxruntime(self, monkeypatch):
+        from backend.realtime.engines import silero_vad
+        from backend.realtime.engines.verifier import OnnxWakeVerifier
+
+        seen: list[tuple[object, dict[str, object]]] = []
+
+        def load(placement: object, **kwargs: object) -> str:
+            seen.append((placement, kwargs))
+            return "loaded"
+
+        monkeypatch.setattr(OnnxWakeVerifier, "load", load)
+        placement = settings().placement
+
+        assert _real_engine_loaders().verify(placement) == "loaded"
+        assert seen == [
+            (
+                placement,
+                {
+                    "session_factory": silero_vad.open_onnx_session,
+                    "available_providers": silero_vad.onnxruntime_providers,
+                },
+            )
+        ]
+
+    def test_close_with_no_verifier_stops_the_lanes_alone(self):
+        built, _ = runtime(HandlerFactory(), voice_settings=settings(verify_model=None))
+
+        built.close()
+
+        assert built.engines.verifier is None

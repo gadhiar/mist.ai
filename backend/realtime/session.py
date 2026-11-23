@@ -129,6 +129,7 @@ from .speech import (
     StreamingTranscriber,
     TurnEndDetector,
     VoiceActivityDetector,
+    WakeVerifier,
 )
 from .turn import (
     BargeInReport,
@@ -176,6 +177,10 @@ class SpeechEngines:
     `tts_slot` are the slots the runtime swaps; a session opens its streams and synthesizes on
     them when they are set, so work started before a swap keeps its engine, and `transcriber`
     and `synthesizer` name the engine loaded now.
+
+    `verifier` is the acoustic wake verifier. With none, no wake can be accepted, so the runtime
+    loads no `spotter` and an endpoint `voice_start` is refused; it has no status of its own in
+    `statuses`.
     """
 
     vad: VoiceActivityDetector | None = None
@@ -187,17 +192,23 @@ class SpeechEngines:
     vram_over_budget: bool = False
     stt_slot: TranscriberSlot | None = None
     tts_slot: SynthesizerSlot | None = None
+    verifier: WakeVerifier | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class InferenceLanes:
-    """The process-wide lanes each engine's calls run on, one per engine kind."""
+    """The process-wide lanes each engine's calls run on, one per engine kind.
+
+    `verify` is the wake verifier's own lane, so a verify job never queues behind the spotter's
+    hops or an end-of-turn check.
+    """
 
     vad: InferenceLane
     eot: InferenceLane
     stt: InferenceLane
     tts: InferenceLane
     kws: InferenceLane
+    verify: InferenceLane
 
 
 def _full() -> PowerLevel:
@@ -423,6 +434,10 @@ class RealtimeSession:
         responder = services.responder
         if services.power_gate is not None:
             responder = PowerGatedResponder(responder, services.power_gate)
+        # The verifier's thresholds decide every wake (T74); with no verifier there are none,
+        # and the controller rejects every wake before any duck.
+        verifier = engines.verifier
+        thresholds = verifier.threshold_at if verifier is not None else None
         return services.controller_factory(
             session_id=self.session_id,
             responder=responder,
@@ -430,7 +445,11 @@ class RealtimeSession:
             host=self,
             placement=services.placement,
             arbiter=self._host.arbiter,
-            gate=AddresseeGate(settings.wake, echo_guard_ms=settings.barge_in.echo_guard_ms),
+            gate=AddresseeGate(
+                settings.wake,
+                echo_guard_ms=settings.barge_in.echo_guard_ms,
+                thresholds=thresholds,
+            ),
             wake=settings.wake,
             calibration=None if spotter is None else spotter.calibration.get(own),
             hit_lag_ms=0 if spotter is None else spotter.hit_lag_ms,
@@ -446,6 +465,7 @@ class RealtimeSession:
             barge_in_config=settings.barge_in,
             alarm_ringing=services.alarm_ringing,
             power_level=self.power_level,
+            thresholds=thresholds,
         )
 
     def power_level(self) -> PowerLevel:
@@ -969,6 +989,9 @@ class RealtimeSession:
             return "vad unavailable"
         if settings.spotter == "server" and engines.spotter is None:
             return "kws unavailable"
+        # No verifier, no wake accepted: refused before the device opens its uplink for one.
+        if settings.spotter == "endpoint" and engines.verifier is None:
+            return "verify unavailable"
         return None
 
     def _on_voice_start(self, settings: VoiceStartMessage) -> None:
@@ -1020,8 +1043,11 @@ class RealtimeSession:
                 ),
                 turn_end=engines.turn_end,
                 spotter=engines.spotter,
+                verifier=engines.verifier,
             ),
-            lanes=IngressLanes(vad=lanes.vad, stt=lanes.stt, eot=lanes.eot, kws=lanes.kws),
+            lanes=IngressLanes(
+                vad=lanes.vad, stt=lanes.stt, eot=lanes.eot, kws=lanes.kws, verify=lanes.verify
+            ),
             endpointing=config.endpointing,
             wake=config.wake,
             emit=self._emit,
@@ -1036,6 +1062,7 @@ class RealtimeSession:
         policy = KeywordBargeIn(
             config.barge_in,
             aec=settings.aec,
+            names=config.wake.names,
             recent_tts_text=self.recent_tts_text,
             clock=self._clock.now_ms,
         )

@@ -61,6 +61,7 @@ from tests.fakes.speech import (
     FakeSynthesizer,
     ScriptedNameSpotter,
     ScriptedTranscriber,
+    ScriptedWakeVerifier,
 )
 
 from .turn_fakes import (
@@ -231,6 +232,7 @@ class Rig:
         self,
         *scripts: object,
         spotter: ScriptedNameSpotter | None | bool = True,
+        verifier: bool = True,
         synthesizer: bool = True,
         vad: bool = True,
         endpoint: str = "desktop",
@@ -258,6 +260,7 @@ class Rig:
             transcriber=ScriptedTranscriber(["hello there"], ms_per_word=20),
             synthesizer=FakeSynthesizer() if synthesizer else None,
             spotter=self.spotter,
+            verifier=ScriptedWakeVerifier() if verifier else None,
         )
         self.tts_lane = InlineLane()
         self.settings = VoiceSettings(
@@ -274,6 +277,7 @@ class Rig:
                 stt=InlineLane(),
                 tts=self.tts_lane,
                 kws=InlineLane(),
+                verify=InlineLane(),
             ),
             settings=self.settings,
             placement=floor_placement,
@@ -942,6 +946,23 @@ class TestVoiceStart:
         assert answer_of(rig.answers()[0]) == (1, False, reason, False)
         assert rig.ingresses == []
 
+    @pytest.mark.parametrize(
+        ("rig_args", "reason"),
+        [
+            ({"verifier": False}, "verify unavailable"),
+            ({"verifier": False, "spotter": None}, "verify unavailable"),
+            # The existing checks come first.
+            ({"verifier": False, "vad": False}, "vad unavailable"),
+        ],
+    )
+    async def test_an_endpoint_spotter_needs_the_verifier(self, rig_args, reason):
+        rig = await Rig(**rig_args).start()
+
+        await rig.send(voice_start(spotter="endpoint"))
+
+        assert answer_of(rig.answers()[0]) == (1, False, reason, False)
+        assert rig.ingresses == []
+
     async def test_an_endpoint_spotter_needs_no_server_spotter(self):
         rig = await Rig(spotter=None).start()
 
@@ -1013,6 +1034,26 @@ class TestVoiceStart:
         assert kwargs["wake"] is rig.settings.wake
         assert kwargs["tts_lane"] is rig.tts_lane
         assert kwargs["synthesizer"] is rig.engines.synthesizer
+        # The gate and the controller read the verifier's thresholds, one lookup for both.
+        verifier = rig.engines.verifier
+        assert verifier is not None
+        assert kwargs["thresholds"] == verifier.threshold_at
+        assert kwargs["thresholds"](0.5) == 0.5
+        verdict = kwargs["gate"].verified(
+            score=0.9, reference_score=None, verify_score=0.6, cutoff=0.7
+        )
+        assert verdict.accepted
+        assert verifier.cutoffs[-2:] == [0.5, 0.7]
+
+    async def test_with_no_verifier_the_controller_and_its_gate_get_no_thresholds(self):
+        rig = await Rig(verifier=False).start()
+
+        kwargs = rig.controller.kwargs
+        assert kwargs["thresholds"] is None
+        verdict = kwargs["gate"].verified(
+            score=0.9, reference_score=None, verify_score=1.0, cutoff=0.5
+        )
+        assert not verdict.accepted
 
     async def test_with_no_spotter_or_synthesizer_the_controller_gets_none_and_zero(self):
         rig = await Rig(spotter=None, synthesizer=False).start()

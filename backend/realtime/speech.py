@@ -136,7 +136,12 @@ class VadStream(Protocol):
 
 
 class VoiceActivityDetector(Protocol):
-    """A VAD engine, shared by sessions, that opens one stream per audio source."""
+    """A VAD engine, shared by sessions, that opens one stream per audio source.
+
+    `model_id` names the model it loaded, which the engine walk reports in the VAD's status.
+    """
+
+    model_id: str
 
     def open_stream(self) -> VadStream:
         """Open a stream with fresh state."""
@@ -144,7 +149,13 @@ class VoiceActivityDetector(Protocol):
 
 
 class TurnEndDetector(Protocol):
-    """A semantic end-of-turn model that judges whether the speaker has finished."""
+    """A semantic end-of-turn model that judges whether the speaker has finished.
+
+    `model_id` names the model it loaded, which the engine walk reports in the end-of-turn
+    status.
+    """
+
+    model_id: str
 
     def probability_complete(self, audio: np.ndarray) -> float:
         """Score up to the last 8 s of 16 kHz float32 audio as the probability the turn ended."""
@@ -247,11 +258,12 @@ class SpeechSynthesizer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class NameHit:
-    """A name spotter's score crossed its threshold on a rising edge.
+    """A name spotter's score reached its threshold outside the cooldown of an earlier hit.
 
-    `end_pos` is an uplink position, a count of 20 ms frames: the position of the last frame of
-    the hop whose score crossed, so ingress can find where the name was said from it. `keyword`
-    is the name the model scored and `score` the crossing score, on that model's own scale.
+    `end_pos` is an uplink position, a count of 20 ms frames: the position of the frame whose
+    push completed the scoring step that hit, so ingress can find where the name was said from
+    it. `keyword` is the name the model scored and `score` the hit's score, on that model's own
+    scale.
     """
 
     end_pos: int
@@ -260,17 +272,25 @@ class NameHit:
 
 
 class NameSpotterStream(Protocol):
-    """One audio source's spotting state: the feature window and the refractory period."""
+    """One audio source's spotting state: the model's streaming state, its window, the cooldown.
+
+    A hit is a scoring step at or above the threshold with no hit in the `window_ms` before it.
+    """
 
     def push(self, pcm: bytes, pos: int) -> list[NameHit]:
         """Score one 20 ms frame of PCM16 mono 16 kHz audio at uplink position `pos`.
 
-        Returns the hits whose hop ended on this frame, usually none.
+        Returns the hits of the steps this frame completed, usually none.
         """
         ...
 
-    def reset(self) -> None:
-        """Forget the partial context, so the next push starts a new one."""
+    def reset(self, *, warm_up: bool = True) -> None:
+        """Forget the context, so the next frame starts a new one.
+
+        With `warm_up` the new context is settled on silence first. Without it, which a reset
+        while the spotter is behind uses, there is no silence and no hit until `warmup_ms` of
+        audio has been fed.
+        """
         ...
 
 
@@ -280,9 +300,9 @@ class SpotterCalibration:
 
     Scores from different models are not comparable, so arbitration between a server hit and an
     endpoint wake ranks them on these instead. Both tables are `(score, value)` points with
-    ascending scores, measured on the tuning split. `false_accepts` maps a score to the
-    estimated false accepts per hour of tuning media at that score, made monotone, so its rates
-    do not increase.
+    ascending scores. `false_accepts` maps a score to the estimated false accepts per hour of
+    the negative audio the table was measured on (the tuning media for the device's spotter, an
+    ambient set for the server's) at that score, made monotone, so its rates do not increase.
     `positive_quantile` maps a score to the share, from 0 to 1, of the tuning positives that
     scored at or below it, so its shares do not decrease.
     """
@@ -294,11 +314,11 @@ class SpotterCalibration:
 class NameSpotter(Protocol):
     """A model trained to spot MIST's names, shared by sessions; CPU-only.
 
-    `window_ms` is the audio one score looks at. `hit_lag_ms` is the typical delay from the
-    name's end to the hit, from the model's manifest, which is how `wake_screen_ms` estimates
-    when the name ended. `calibration` holds each spotter's tables from the tuning pass; a
-    spotter with no entry is uncalibrated, and its events rank by margin below every calibrated
-    one (`arbitration_key`).
+    `window_ms` is the audio one name spans, and the least time between two hits of a stream.
+    `hit_lag_ms` is the typical delay from the name's end to the hit, from the model's manifest,
+    which is how `wake_screen_ms` estimates when the name ended. `calibration` holds each
+    spotter's tables; a spotter with no entry is uncalibrated, and its events rank by margin
+    below every calibrated one (`arbitration_key`).
     """
 
     model_id: str
@@ -312,7 +332,48 @@ class NameSpotter(Protocol):
         ...
 
     def score_window(self, pcm: bytes) -> float:
-        """The highest score over a finished buffer of PCM16 mono 16 kHz audio."""
+        """The highest score over a finished buffer of PCM16 mono 16 kHz audio.
+
+        It is scored from a fresh context, so it reaches a threshold when a fresh stream pushed
+        the same buffer would report a hit.
+        """
+        ...
+
+
+class WakeVerifier(Protocol):
+    """A second-stage acoustic model that judges whether a name hit was said to MIST.
+
+    The spotter only hears the name; the verifier scores the audio around the hit, from
+    `before_ms` before it to `after_ms` after it, and a window shorter than `min_window_ms` is
+    not scored. It was trained against one spotter, `spotter_model_id`, whose hits its threshold
+    table was calibrated on, so a score means nothing for another spotter's hits. CPU-only.
+    """
+
+    model_id: str
+    spotter_model_id: str
+    before_ms: int
+    after_ms: int
+    min_window_ms: int
+
+    def threshold_at(self, cutoff: float) -> float | None:
+        """The score a hit at spotter cutoff `cutoff` must reach, or None below the table."""
+        ...
+
+    def score(self, pcm: bytes) -> float:
+        """Score one window of PCM16 mono 16 kHz audio, as `NameSpotter.score_window` takes it.
+
+        Raises:
+            SpeechEngineError: The window cannot be scored, or the model's output is not one
+                finite score.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release the verifier's session, when its owner is done with it.
+
+        The protocol does not require `score` to raise after `close`; an adapter that frees a
+        model session raises `SpeechEngineError` from a later `score`.
+        """
         ...
 
 

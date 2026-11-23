@@ -1,11 +1,14 @@
 """The wake recording manifest: its check, and the training subset the model records.
 
 A wake model is measured on recordings it never trained on, and a threshold is never chosen on
-the recordings it is reported on. That only holds if the three splits share nothing a model can
-learn from: no file, no copy of a file under another name, no recording session of any label
-(the same room, microphone and voice on the same day), and no homophone sentence. This module
-refuses a manifest that breaks any of those, naming both entries, so the check runs before
-anything trains or evaluates.
+the recordings it is reported on. That only holds if the three splits share no file, no copy of
+a file under another name, no homophone sentence, and no session holding `media`, since a
+programme heard in two splits would leak its content. Any other recording session (the same
+room, microphone and voice on the same day) may span the splits: the model then trains on every
+room, microphone and day that tune and test measure it on, as it will run in one user's own
+rooms, so tune and test do not show how it does in a new room or on a new day. This module
+refuses a manifest that breaks any of those rules, naming both entries, so the check runs
+before anything trains or evaluates.
 
 The manifest is a JSON object:
 
@@ -24,14 +27,16 @@ trained from this manifest's `train` split and not from anything `tune` or `test
 
 `assign` gives every entry a split, so a new set of recordings needs no hand-kept split list.
 Its entries may leave `split` out, and any `split` present is replaced; every other field is
-checked as `check` checks it. Recordings that `check` would refuse in two splits, those sharing
-a session or a homophone sentence, are linked transitively into one group, which goes to one
-split. Each group belongs to the (label, condition) holding most of its duration, so every
-condition of every label is split on its own. Within each, `random.Random(seed)` shuffles the
-groups and each goes to the split furthest below its 60/20/20 share of the duration, ties to
-train, then tune, then test. That keeps each split within one group's duration of its share,
-and the same seed always gives the same manifest. It prints the seed and each split's count and
-share, never a file name, and refuses an `--out` that exists.
+checked as `check` checks it. Recordings sharing a session or a homophone sentence are linked
+transitively into one group, which goes to one split. `check` refuses a shared sentence, or a
+shared session holding media, across splits; keeping every other session whole is `assign`'s
+own rule, which `check` does not require. Each group belongs to the (label, condition) holding
+most of its duration, so every condition of every label is split on its own. Within each,
+`random.Random(seed)` shuffles the groups and each goes to the split furthest below its
+60/20/20 share of the duration, ties to train, then tune, then test. That keeps each split
+within one group's duration of its share, and the same seed always gives the same manifest. It
+prints the seed and each split's count and share, never a file name, and refuses an `--out`
+that exists.
 
     python -m scripts.wake.manifest check --manifest <path>
     python -m scripts.wake.manifest split --manifest <path> --split train --out <path>
@@ -48,7 +53,7 @@ import sys
 import wave
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 LABELS = ("positive", "homophone", "media")
 SPLITS = ("train", "tune", "test")
@@ -234,14 +239,18 @@ def _both(first: Entry, second: Entry) -> str:
 
 
 def _check_splits(entries: Sequence[Entry]) -> None:
-    """Refuse any file, copy, session or homophone sentence that two splits would share.
+    """Refuse any file, copy, media session or homophone sentence that two splits would share.
 
     A file or its contents appearing twice is refused even within one split, because it would
-    count one recording twice. A session or a sentence is refused only across splits.
+    count one recording twice. A homophone sentence is refused only across splits. A session
+    may span the splits, unless one of its entries is `media`: then the refusal names a media
+    entry and an entry of the session in another split. Such a pair is found when its later
+    entry is read, so every media session across splits is refused.
     """
     by_path: dict[Path, Entry] = {}
     by_sha: dict[str, Entry] = {}
-    by_session: dict[str, Entry] = {}
+    by_session: dict[str, dict[str, Entry]] = {}
+    media_by_session: dict[str, dict[str, Entry]] = {}
     by_phrase: dict[str, Entry] = {}
     for item in entries:
         audio = [(item.path, item.sha256)]
@@ -254,11 +263,20 @@ def _check_splits(entries: Sequence[Entry]) -> None:
                 raise ManifestError(f"{_both(by_sha[digest], item)} hold audio with one sha256")
             by_path[path] = item
             by_sha[digest] = item
-        earlier = by_session.setdefault(item.session, item)
-        if earlier.split != item.split:
+        first = by_session.setdefault(item.session, {})
+        media = media_by_session.setdefault(item.session, {})
+        # A media entry clashes with any entry of its session in another split, and any other
+        # entry with a media one; the first of each split stands for the rest.
+        clashes = first if item.label == "media" else media
+        earlier = next((found for split, found in clashes.items() if split != item.split), None)
+        if earlier is not None:
             raise ManifestError(
-                f"{_both(earlier, item)} share session {item.session!r} across splits"
+                f"{_both(earlier, item)} share session {item.session!r} across splits, "
+                "and a session holding media stays in one split"
             )
+        first.setdefault(item.split, item)
+        if item.label == "media":
+            media.setdefault(item.split, item)
         if item.label == "homophone":
             key = phrase_key(item.phrase)
             earlier = by_phrase.setdefault(key, item)
@@ -268,21 +286,35 @@ def _check_splits(entries: Sequence[Entry]) -> None:
                 )
 
 
-def load_manifest(path: Path) -> RecordingManifest:
+def load_manifest(path: Path, *, root_map: Mapping[str, str] | None = None) -> RecordingManifest:
     """Read and check a recording manifest.
+
+    `root_map` translates the root as written to where the recordings are mounted, for a
+    manifest written on one machine and read in a container: `{"D:/wake": "/wake"}` reads
+    `D:/wake/recordings/a.wav` from `/wake/recordings/a.wav`. The manifest's `root` stays as
+    written, so `subset_bytes` and `subset_sha256` are the same whichever way it is read.
 
     Raises:
         ManifestError: The manifest is malformed, an entry fails a check (named by its index
-            and file), or two splits share a file, its contents, a session or a homophone
-            sentence (both entries named).
+            and file), a file or its contents is listed twice, or two splits share a homophone
+            sentence or a session holding media (both entries named). A session without media
+            may span the splits. With `root_map`, the root matches none of its keys.
     """
-    root, entries = _read(path, assigning=False)
+    root, entries = _read(path, assigning=False, root_map=root_map)
     _check_splits(entries)
     return RecordingManifest(path=Path(path), root=root, entries=entries)
 
 
-def _read(path: Path, *, assigning: bool) -> tuple[str, tuple[Entry, ...]]:
-    """The manifest's root as written and its entries, each checked on its own."""
+def _read(
+    path: Path, *, assigning: bool, root_map: Mapping[str, str] | None = None
+) -> tuple[str, tuple[Entry, ...]]:
+    """The manifest's root as written and its entries, each checked on its own.
+
+    With `root_map`, the root is matched against each key with a backslash read as `/`, a
+    trailing `/` ignored, without case when the key has a Windows drive, and the longest
+    matching key wins; the entries resolve under the root it maps to. A root written for another system
+    (`D:/wake` read on Linux) is accepted when it is absolute there.
+    """
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except OSError as exc:
@@ -292,11 +324,35 @@ def _read(path: Path, *, assigning: bool) -> tuple[str, tuple[Entry, ...]]:
     if not isinstance(raw, dict) or set(raw) != _MANIFEST_KEYS:
         raise ManifestError(f"{path}: manifest must be an object with exactly {{root, entries}}")
     root = raw["root"]
-    if not isinstance(root, str) or not Path(root).is_absolute():
-        raise ManifestError(f"{path}: root must be an absolute directory, got {root!r}")
-    root_path = Path(root).resolve()
+    if root_map is None:
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            raise ManifestError(f"{path}: root must be an absolute directory, got {root!r}")
+        located = root
+    else:
+        if not isinstance(root, str) or not (
+            PurePosixPath(root).is_absolute() or PureWindowsPath(root).is_absolute()
+        ):
+            raise ManifestError(f"{path}: root must be an absolute directory, got {root!r}")
+
+        def norm(value: str) -> str:
+            text = value.replace("\\", "/").rstrip("/")
+            return text.casefold() if PureWindowsPath(value).drive else text
+
+        written = root.replace("\\", "/").rstrip("/")
+        matches = [
+            (source, target)
+            for source, target in root_map.items()
+            if norm(written) == norm(source) or (norm(written) + "/").startswith(norm(source) + "/")
+        ]
+        if not matches:
+            raise ManifestError(f"{path}: root {root} matches no --root-map entry")
+        source, target = max(matches, key=lambda pair: len(norm(pair[0])))
+        located = target.rstrip("/\\") + written[len(source.replace("\\", "/").rstrip("/")) :]
+        if not Path(located).is_absolute():
+            raise ManifestError(f"{path}: root {root} maps to {located}, which is not absolute")
+    root_path = Path(located).resolve()
     if not root_path.is_dir():
-        raise ManifestError(f"{path}: root {root} is not a directory")
+        raise ManifestError(f"{path}: root {located} is not a directory")
     if not isinstance(raw["entries"], list):
         raise ManifestError(f"{path}: entries must be a list")
     entries = tuple(
@@ -326,8 +382,9 @@ class KeyAssignment:
 def _linked_groups(entries: Sequence[Entry]) -> list[list[Entry]]:
     """Entries sharing a session, or as homophones a sentence, transitively; in manifest order.
 
-    These are the two relations `_check_splits` refuses across splits, so each group must stay
-    in one split.
+    Each group stays in one split. For a shared homophone sentence, and a shared session holding
+    media, that is what `_check_splits` requires; for any other session it is `assign`'s own rule,
+    since `_check_splits` lets such a session span the splits.
     """
     parent = list(range(len(entries)))
 

@@ -55,6 +55,7 @@ from tests.fakes.speech import (
     ScriptedTranscriptStream,
     ScriptedTurnEnd,
     ScriptedUtterance,
+    ScriptedWakeVerifier,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -244,7 +245,9 @@ class TestProtocols:
         assert _params(speech.NameSpotter.open_stream) == ["self", "threshold"]
         assert _params(speech.NameSpotter.score_window) == ["self", "pcm"]
         assert _params(speech.NameSpotterStream.push) == ["self", "pcm", "pos"]
-        assert _params(speech.NameSpotterStream.reset) == ["self"]
+        assert _params(speech.NameSpotterStream.reset) == ["self", "warm_up"]
+        warm_up = inspect.signature(speech.NameSpotterStream.reset).parameters["warm_up"]
+        assert (warm_up.kind, warm_up.default) == (inspect.Parameter.KEYWORD_ONLY, True)
 
     def test_the_scripted_name_spotter_matches_the_protocols(self):
         spotter = ScriptedNameSpotter([NameHit(end_pos=3, keyword="mist", score=0.9)])
@@ -257,7 +260,9 @@ class TestProtocols:
         assert _params(ScriptedNameSpotter.open_stream) == ["self", "threshold"]
         assert _params(ScriptedNameSpotter.score_window) == ["self", "pcm"]
         assert _params(type(stream).push) == ["self", "pcm", "pos"]
-        assert _params(type(stream).reset) == ["self"]
+        assert _params(type(stream).reset) == ["self", "warm_up"]
+        warm_up = inspect.signature(type(stream).reset).parameters["warm_up"]
+        assert (warm_up.kind, warm_up.default) == (inspect.Parameter.KEYWORD_ONLY, True)
         assert hits and all(isinstance(hit, NameHit) for hit in hits)
 
 
@@ -922,3 +927,82 @@ class TestScriptedNameSpotter:
         assert stream.threshold == 0.4
         assert spotter.scored == [len(FRAME) * 2]
         assert stream.pushed == [0]
+
+
+class TestScriptedWakeVerifier:
+    def test_the_wake_verifier_protocol_matches_the_interfaces(self):
+        assert speech.WakeVerifier.__annotations__ == {
+            "model_id": str,
+            "spotter_model_id": str,
+            "before_ms": int,
+            "after_ms": int,
+            "min_window_ms": int,
+        }
+        assert _params(speech.WakeVerifier.threshold_at) == ["self", "cutoff"]
+        assert _params(speech.WakeVerifier.score) == ["self", "pcm"]
+        assert _params(speech.WakeVerifier.close) == ["self"]
+        assert "SpeechEngineError" in speech.WakeVerifier.score.__doc__
+
+    def test_the_fake_matches_the_protocol(self):
+        verifier = ScriptedWakeVerifier()
+
+        for name in speech.WakeVerifier.__annotations__:
+            assert hasattr(verifier, name)
+        assert _params(ScriptedWakeVerifier.threshold_at) == ["self", "cutoff"]
+        assert _params(ScriptedWakeVerifier.score) == ["self", "pcm"]
+        assert _params(ScriptedWakeVerifier.close) == ["self"]
+        assert (verifier.before_ms, verifier.after_ms, verifier.min_window_ms) == (2000, 300, 800)
+
+    def test_its_spotter_is_the_scripted_name_spotter(self):
+        assert ScriptedWakeVerifier().spotter_model_id == ScriptedNameSpotter().model_id
+
+    def test_scripted_scores_come_in_order_then_the_default(self):
+        verifier = ScriptedWakeVerifier(scores=[0.2, 0.9], default=0.4)
+
+        scores = [verifier.score(FRAME) for _ in range(4)]
+
+        assert scores == [0.2, 0.9, 0.4, 0.4]
+
+    def test_the_default_score_is_one(self):
+        assert ScriptedWakeVerifier().score(FRAME) == 1.0
+
+    def test_each_window_length_is_recorded(self):
+        verifier = ScriptedWakeVerifier()
+
+        verifier.score(FRAME * 116)
+        verifier.score(FRAME * 40)
+
+        assert verifier.windows == [len(FRAME) * 116, len(FRAME) * 40]
+
+    def test_a_scripted_error_is_raised_in_its_turn_and_its_window_recorded(self):
+        failure = SpeechEngineError("scripted verify failure")
+        verifier = ScriptedWakeVerifier(scores=[failure, 0.8])
+
+        with pytest.raises(SpeechEngineError) as caught:
+            verifier.score(FRAME)
+        after = verifier.score(FRAME)
+
+        assert caught.value is failure
+        assert after == 0.8
+        assert verifier.windows == [len(FRAME), len(FRAME)]
+
+    def test_one_threshold_serves_every_cutoff_by_default(self):
+        verifier = ScriptedWakeVerifier()
+
+        assert [verifier.threshold_at(cutoff) for cutoff in (0.01, 0.5, 0.99)] == [0.5] * 3
+
+    def test_a_threshold_function_is_asked_with_each_cutoff(self):
+        verifier = ScriptedWakeVerifier(thresholds=lambda cutoff: None if cutoff < 0.3 else 0.7)
+
+        assert verifier.threshold_at(0.2) is None
+        assert verifier.threshold_at(0.85) == 0.7
+        assert verifier.cutoffs == [0.2, 0.85]
+
+    def test_close_is_recorded_so_a_test_sees_its_owner_closed_it(self):
+        verifier = ScriptedWakeVerifier()
+        assert verifier.closes == 0
+
+        verifier.close()
+        verifier.close()
+
+        assert verifier.closes == 2

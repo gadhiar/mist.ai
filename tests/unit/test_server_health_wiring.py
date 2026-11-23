@@ -200,6 +200,7 @@ def fake_mist_runtime(
         stt=ClosingLane(),
         tts=ClosingLane(),
         kws=ClosingLane(),
+        verify=ClosingLane(),
     )
     settings = VoiceSettings()
     responder = handler if handler is not None else FakeResponder()
@@ -1341,7 +1342,7 @@ async def test_lifespan_wires_the_registry_the_sink_the_gate_and_the_gpu(lifespa
     assert watchers[0].done()
     # The handler is drained, then every lane closed last.
     assert lifespan_harness.handler.closed
-    assert lifespan_harness.factory.closed == ["lane"] * 5
+    assert lifespan_harness.factory.closed == ["lane"] * 6
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,12 @@ from backend.realtime.session import (
     SpeechEngines,
 )
 from backend.realtime.turn import VoiceStart, VoiceStop
-from tests.fakes.speech import EnergyVad, FakeSynthesizer, ScriptedTranscriber
+from tests.fakes.speech import (
+    EnergyVad,
+    FakeSynthesizer,
+    ScriptedTranscriber,
+    ScriptedWakeVerifier,
+)
 
 from .test_session import (
     FakeIngress,
@@ -174,6 +179,7 @@ class PowerRig:
             vad=EnergyVad(),
             transcriber=ScriptedTranscriber(["hello there"], ms_per_word=20),
             synthesizer=FakeSynthesizer(),
+            verifier=ScriptedWakeVerifier(),
             statuses=statuses,
         )
         extra: dict[str, object] = {}
@@ -188,6 +194,7 @@ class PowerRig:
                 stt=InlineLane(),
                 tts=InlineLane(),
                 kws=InlineLane(),
+                verify=InlineLane(),
             ),
             settings=VoiceSettings(
                 playback=TEST_PLAYBACK,
@@ -617,6 +624,7 @@ class TestServices:
                 stt=InlineLane(),
                 tts=InlineLane(),
                 kws=InlineLane(),
+                verify=InlineLane(),
             ),
             settings=VoiceSettings(),
             placement=floor_placement,

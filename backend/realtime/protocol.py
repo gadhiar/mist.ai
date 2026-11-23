@@ -239,7 +239,7 @@ Spotter = Literal["server", "endpoint"]
 # The same values as capabilities' power level. Only gaming mode sets it; nothing in the voice
 # path detects games, full-screen windows or VRAM pressure.
 PowerLevel = Literal["full", "low", "off"]
-# `attend` is the provisional state sent at a name hit, before the addressee verdict.
+# `attend` stays for clients and endpoints that parse it; the controller no longer sends it.
 BackendMistState = Literal["idle", "attend", "listen", "think", "speak"]
 StreamChannel = Literal["tts", "text"]
 TurnOrigin = Literal["voice", "text", "system"]
@@ -624,7 +624,9 @@ class VoiceCapabilities(_WireModel):
     """What the server's voice path supports; its presence marks a protocol 2 server.
 
     Attributes:
-        spotters: `endpoint` once VAD and STT are loaded, and `server` as well once `kws` is.
+        modes: `wake` while at least one spotter is offered, else empty.
+        spotters: `endpoint` once VAD, STT and the wake verifier are loaded, since the
+            verifier accepts every wake, and `server` as well once `kws` is.
         reference: Whether the server scores `0x11` frames, which needs `kws` loaded.
     """
 
@@ -684,7 +686,9 @@ class VoiceStateMessage(_WireModel):
         muted: This session's mute as the server applies it, so the client's indicator shows
             what the server does.
         refused: In an answer, null when the request was applied, and otherwise why it was
-            not: a reason the requested mode is unavailable, `power_off` (the level is off and
+            not: a reason the requested mode is unavailable (`vad unavailable`;
+            `kws unavailable` for the `server` spotter; `verify unavailable` for the
+            `endpoint` spotter with no wake verifier loaded), `power_off` (the level is off and
             voice cannot take capability commands, so `active` is false), `superseded` (a newer
             valid `voice_start` arrived first), `voice_stop` (a `voice_stop` arrived first) or
             `invalid` (the `voice_start` failed validation). In a broadcast it is `power_off`,
@@ -1038,8 +1042,9 @@ class VoiceDecisionWakeRejected(_WireModel):
     """A name was heard but the addressee gate rejected it; the one trace such speech leaves.
 
     `turn_id` is the turn in flight when the name was heard, else null. `self_speech`: MIST said
-    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the
-    transcript does not address her. `no_backlog`: an endpoint `wake` carried less pre-wake
+    the name herself. `self_media`: the PC's own playback said it. `not_addressed`: the acoustic
+    wake verifier rejected the hit: its score fell below the threshold at the spotter's cutoff,
+    or there was no score or no verifier. `no_backlog`: an endpoint `wake` carried less pre-wake
     audio than the server's minimum. A name that loses cross-session arbitration is not
     rejected: it gets `wake_lost`.
     """
@@ -1173,9 +1178,9 @@ class StreamCancelledMessage(_WireModel):
 class StateCycleMessage(_WireModel):
     """MIST's visible state; `turn_id` is absent for `listen` when no turn is speaking.
 
-    `attend` is provisional: with the `attend_cue` setting on, it is sent at a name hit before
-    the addressee verdict, and is followed by `listen` on acceptance or by the state of the
-    controller's current phase on rejection.
+    The controller sends no `attend` at a name hit. An accepted wake sends `listen` in its
+    publishing step, after the cut of any turn in flight; a rejected or lost wake sends no
+    state, since the Droplet closes its uplink on the decision itself.
     """
 
     type: Literal["state_cycle"] = "state_cycle"

@@ -63,8 +63,9 @@ class EnergyVadStream:
 class EnergyVad:
     """A VAD that calls loud windows speech; `scripted_audio` bursts score near 0.9."""
 
-    def __init__(self, reference_rms: float = 0.01) -> None:
+    def __init__(self, reference_rms: float = 0.01, *, model_id: str = "energy-vad") -> None:
         self.reference_rms = reference_rms
+        self.model_id = model_id
         self.streams: list[EnergyVadStream] = []
 
     def open_stream(self) -> EnergyVadStream:
@@ -220,10 +221,11 @@ class ScriptedTranscriber:
 class ScriptedTurnEnd:
     """Returns scripted end-of-turn probabilities in order, repeating the last one after."""
 
-    def __init__(self, probabilities: Sequence[float]) -> None:
+    def __init__(self, probabilities: Sequence[float], *, model_id: str = "scripted-eot") -> None:
         if not probabilities:
             raise ValueError("ScriptedTurnEnd needs at least one probability")
         self.probabilities = list(probabilities)
+        self.model_id = model_id
         self.calls: list[int] = []
 
     def probability_complete(self, audio: np.ndarray) -> float:
@@ -328,8 +330,9 @@ class ScriptedNameSpotterStream:
     """Returns each scripted hit at its `end_pos`, when its score reaches the stream's threshold.
 
     The partial context is the positions pushed since the last `reset`. A hit is reported once
-    per context, as a spotter's refractory period reports a name once, so a frame pushed again in
-    the same context gives no second hit, and after a `reset` it does.
+    per context, as a spotter's cooldown reports a name once, so a frame pushed again in the
+    same context gives no second hit, and after a `reset` it does. `reset` records its
+    `warm_up` in `warm_ups`.
     """
 
     def __init__(self, hits: Sequence[NameHit], threshold: float) -> None:
@@ -338,6 +341,7 @@ class ScriptedNameSpotterStream:
         self.pushed: list[int] = []
         self.context: list[int] = []
         self.resets = 0
+        self.warm_ups: list[bool] = []
         self._reported: set[int] = set()
 
     def push(self, pcm: bytes, pos: int) -> list[NameHit]:
@@ -350,10 +354,11 @@ class ScriptedNameSpotterStream:
                 found.append(hit)
         return found
 
-    def reset(self) -> None:
+    def reset(self, *, warm_up: bool = True) -> None:
         self.context = []
         self._reported = set()
         self.resets += 1
+        self.warm_ups.append(warm_up)
 
 
 class ScriptedNameSpotter:
@@ -396,3 +401,56 @@ class ScriptedNameSpotter:
     def score_window(self, pcm: bytes) -> float:
         self.scored.append(len(pcm))
         return max((score for marker, score in self.markers.items() if marker in pcm), default=0.0)
+
+
+class ScriptedWakeVerifier:
+    """A wake verifier that returns scripted scores in order, then `default` for every window.
+
+    A `SpeechEngineError` in `scores` is raised in its turn instead of returned, for the
+    fail-closed path. `windows` records each scored window's length in bytes, a raised one
+    included. `thresholds` is the threshold for every cutoff, or a function of the cutoff
+    returning None below its table; `cutoffs` records each cutoff asked about. The defaults,
+    1.0 against 0.5, accept every hit. `spotter_model_id` defaults to `ScriptedNameSpotter`'s.
+    `close` only counts its calls in `closes`, so a test can see that the owner closed it.
+    """
+
+    def __init__(
+        self,
+        scores: Sequence[float | SpeechEngineError] = (),
+        *,
+        default: float = 1.0,
+        thresholds: float | Callable[[float], float | None] = 0.5,
+        model_id: str = "scripted-verify",
+        spotter_model_id: str = "scripted-kws",
+        before_ms: int = 2000,
+        after_ms: int = 300,
+        min_window_ms: int = 800,
+    ) -> None:
+        self.scores = list(scores)
+        self.default = default
+        self.thresholds = thresholds
+        self.model_id = model_id
+        self.spotter_model_id = spotter_model_id
+        self.before_ms = before_ms
+        self.after_ms = after_ms
+        self.min_window_ms = min_window_ms
+        self.windows: list[int] = []
+        self.cutoffs: list[float] = []
+        self.closes = 0
+
+    def threshold_at(self, cutoff: float) -> float | None:
+        self.cutoffs.append(cutoff)
+        if callable(self.thresholds):
+            return self.thresholds(cutoff)
+        return self.thresholds
+
+    def score(self, pcm: bytes) -> float:
+        index = len(self.windows)
+        self.windows.append(len(pcm))
+        outcome = self.scores[index] if index < len(self.scores) else self.default
+        if isinstance(outcome, SpeechEngineError):
+            raise outcome
+        return outcome
+
+    def close(self) -> None:
+        self.closes += 1

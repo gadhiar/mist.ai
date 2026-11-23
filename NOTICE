@@ -243,6 +243,45 @@ respective licenses:
    files stay MIT.
 
 -------------------------------------------------------------------------------
+17. LiteRT (ai-edge-litert) and pymicro-features
+   Location: Python packages ai-edge-litert 2.3.0 and pymicro-features 2.0.2
+             (requirements-voice.txt)
+   Source: https://github.com/google-ai-edge/LiteRT (LiteRT)
+           https://github.com/rhasspy/pymicro-features (pymicro-features)
+           https://pypi.org/project/ai-edge-litert/
+           https://pypi.org/project/pymicro-features/
+   License: Apache License 2.0
+   Copyright: The Google AI Edge Authors (LiteRT); Michael Hansen
+              (pymicro-features), whose package includes TensorFlow Lite's
+              microfrontend sources, Copyright 2018 The TensorFlow Authors
+
+   Used by the server name spotter to run the microWakeWord model: LiteRT
+   runs the streaming TFLite model, and pymicro-features computes the
+   microfrontend features it reads. The model is staged under the models
+   directory (speech/wake/<model id>/device/), is not included in this
+   repository and is not downloaded at runtime.
+
+-------------------------------------------------------------------------------
+18. WavLM Base+ (the wake verifier's encoder)
+   Location: Not included in this repository. The weights file
+             wavlm_base_plus.pth that torchaudio publishes for its
+             WAVLM_BASE_PLUS bundle is staged by hand and loaded from a local
+             path (scripts/wake/verifier/train.py --weights); it is never
+             downloaded by MIST.AI.
+   Source: https://github.com/microsoft/unilm/tree/master/wavlm
+           (the torchaudio WAVLM_BASE_PLUS pipeline's weights)
+   License: MIT License
+   Copyright: Microsoft Corporation
+
+   The acoustic wake verifier (mist-verify-1) is trained from WavLM Base+
+   with its last four transformer layers and a new head fine-tuned
+   (scripts/wake/verifier/). It is trained with the data its provenance.json
+   lists: private recordings, AMI, LibriSpeech, MUSAN, RIRS_NOISES, and
+   piper-sample-generator and Chatterbox speech, each under the licence that
+   file records. The trained verifier is for personal use only and is never
+   committed or redistributed.
+
+-------------------------------------------------------------------------------
 
 APACHE LICENSE 2.0 COMPONENTS
 
@@ -255,6 +294,7 @@ The following components are licensed under Apache License 2.0:
 - NVIDIA NeMo toolkit
 - esp_websocket_client
 - microWakeWord stop and VAD models
+- LiteRT (ai-edge-litert) and pymicro-features
 
 Apache License 2.0 Summary:
 You may use, reproduce, and distribute this work, with or without
@@ -275,6 +315,7 @@ The following components are licensed under MIT License:
 - Kyutai Pocket TTS (code)
 - onnx-asr
 - Home Assistant Voice PE configuration (YAML, adapted)
+- WavLM Base+ (weights)
 
 MIT License is permissive and allows commercial use, modification,
 distribution, and private use with minimal restrictions.
@@ -320,4 +361,4 @@ of conditions and the disclaimer are retained.
 
 For questions about licensing, contact: Raj Gadhia
 
-Last updated: 2026-11-18
+Last updated: 2026-11-21

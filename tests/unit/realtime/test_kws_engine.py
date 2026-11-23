@@ -1,15 +1,23 @@
-"""Tests for the ONNX name spotter over an injected session factory and a temporary manifest.
+"""Tests for the microWakeWord name spotter over a fake LiteRT interpreter and a fake frontend.
 
-The unit tier has no onnxruntime, no wake model and no audio, so every test writes a manifest
-and three placeholder graph files under a temporary `models_dir` and hands the spotter recording
-fake sessions. That pins what the adapter owns: the manifest it accepts and refuses, the windows
-each of the three graphs reads per 80 ms hop, the warm-up and fill rules, and the rising edge
-and refractory period. Score parity with openWakeWord on the real model is T36's.
+The unit tier has no ai-edge-litert, no pymicro-features and no wake model, so every test writes a
+manifest and a placeholder model file under a temporary `models_dir` and hands the spotter a fake
+library: an interpreter that records each input it is set and answers a scripted uint8 output,
+and a frontend that answers scripted features per 160-sample call. That pins what the adapter
+owns: the manifest it accepts and refuses, the model checks at load, the device's integer input
+formula, the output scale, the zero-filled sliding window, the hit rule and its cooldown, warm
+and reset, and the offline scores. Parity with microWakeWord on the real model is T36's.
 """
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
+import math
+import pathlib
+import random
+import sys
+import types
+from bisect import bisect_right
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,145 +26,163 @@ import pytest
 
 from backend.realtime.budget import PlacementConfig
 from backend.realtime.engines import kws
-from backend.realtime.engines.kws import OnnxNameSpotter
-from backend.realtime.engines.silero_vad import SessionSpec
+from backend.realtime.engines.kws import MicroLibrary, MicroNameSpotter, hit_steps
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.speech import NameHit, NameSpotter, NameSpotterStream, SpotterCalibration
 
-CPU = "CPUExecutionProvider"
-MODEL_ID = "mist"
-HOP = 1280
-FRAME = 320
-FILES = {
-    "melspectrogram": "melspectrogram.onnx",
-    "embedding": "embedding_model.onnx",
-    "classifier": "mist.onnx",
-}
+MODEL_ID = "mist-mww-test"
+MODEL_FILE = "device/mist.tflite"
+MODEL_BYTES = b"placeholder streaming model"
+SCALE = 0.0390625
+CHUNK = 160
+FRAME_BYTES = 640
+"""A 20 ms uplink frame: 320 samples, two frontend calls."""
+
+Respond = Callable[[int, np.ndarray], int]
+Features = Callable[[int, bytes], Sequence[float]]
 
 
 # -- Fakes ------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class FakeInput:
-    name: str
-    shape: tuple[object, ...]
+def details(index: int, shape: Sequence[int], dtype: type, zero_point: int = 0) -> dict:
+    """Tensor details in LiteRT's form: the shape an int32 array, the dtype a numpy type."""
+    return {
+        "index": index,
+        "shape": np.array(shape, dtype=np.int32),
+        "dtype": dtype,
+        "quantization": (0.1, zero_point),
+    }
 
 
 @dataclass
-class RecordingSession:
-    """A scripted session: records each input it is fed and answers `respond(call, input)`."""
+class FakeInterpreter:
+    """Records each input it is set and answers `respond(call, input)` on each invoke."""
 
-    input_name: str
-    shape: tuple[object, ...]
-    respond: Callable[[int, np.ndarray], np.ndarray]
-    feeds: list[np.ndarray] = field(default_factory=list)
+    model: bytes
+    threads: int
+    input_details: list[dict]
+    output_details: list[dict]
+    respond: Respond
+    inputs: list[np.ndarray] = field(default_factory=list)
+    allocated: int = 0
+    invokes: int = 0
+    _output: int = 0
 
-    def get_inputs(self) -> list[FakeInput]:
-        return [FakeInput(self.input_name, self.shape)]
+    def allocate_tensors(self) -> None:
+        self.allocated += 1
 
-    def get_providers(self) -> list[str]:
-        return [CPU]
+    def get_input_details(self) -> list[dict]:
+        return self.input_details
 
-    def run(
-        self, output_names: Sequence[str] | None, input_feed: Mapping[str, np.ndarray]
-    ) -> list[np.ndarray]:
-        assert output_names is None
-        assert list(input_feed) == [self.input_name]
-        value = np.array(input_feed[self.input_name], copy=True)
-        self.feeds.append(value)
-        return [self.respond(len(self.feeds), value)]
+    def get_output_details(self) -> list[dict]:
+        return self.output_details
+
+    def set_tensor(self, tensor_index: int, value: np.ndarray) -> None:
+        assert self.allocated
+        assert tensor_index == self.input_details[0]["index"]
+        self.inputs.append(np.array(value, copy=True))
+
+    def invoke(self) -> None:
+        self.invokes += 1
+        self._output = self.respond(self.invokes, self.inputs[-1])
+
+    def get_tensor(self, tensor_index: int) -> np.ndarray:
+        assert tensor_index == self.output_details[0]["index"]
+        return np.array([[self._output]], dtype=np.uint8)
 
 
 @dataclass
-class FakeFactory:
-    """Opens the fake session whose graph file name the spec's path ends with."""
+class FakeFrontend:
+    """Answers `script(call, pcm)` for each 160-sample call and records the calls."""
 
-    sessions: dict[str, RecordingSession]
-    specs: list[SessionSpec] = field(default_factory=list)
+    script: Features
+    chunks: list[bytes] = field(default_factory=list)
 
-    def __call__(self, spec: SessionSpec) -> RecordingSession:
-        self.specs.append(spec)
-        return self.sessions[Path(spec.path).name]
+    def features(self, pcm: bytes) -> Sequence[float]:
+        assert len(pcm) == 2 * CHUNK
+        self.chunks.append(pcm)
+        return self.script(len(self.chunks), pcm)
 
 
-def mel_constant(value: float) -> Callable[[int, np.ndarray], np.ndarray]:
-    def respond(call: int, value_in: np.ndarray) -> np.ndarray:
-        return np.full((1, 1, 8, 32), value, dtype=np.float32)
+@dataclass
+class FakeLibrary:
+    """Builds the fakes and keeps every one, so a test can read what reached them."""
+
+    respond: Respond
+    features: Features
+    input_details: list[dict]
+    output_details: list[dict]
+    interpreters: list[FakeInterpreter] = field(default_factory=list)
+    frontends: list[FakeFrontend] = field(default_factory=list)
+    fail: BaseException | None = None
+    loads: int = 0
+
+    def interpreter(self, model: bytes, threads: int) -> FakeInterpreter:
+        if self.fail is not None:
+            raise self.fail
+        built = FakeInterpreter(
+            model, threads, self.input_details, self.output_details, self.respond
+        )
+        self.interpreters.append(built)
+        return built
+
+    def frontend(self) -> FakeFrontend:
+        built = FakeFrontend(self.features)
+        self.frontends.append(built)
+        return built
+
+    def __call__(self) -> MicroLibrary:
+        self.loads += 1
+        return MicroLibrary(interpreter=self.interpreter, frontend=self.frontend)
+
+
+def scripted(*outputs: int) -> Respond:
+    """The n-th invoke of an interpreter answers `outputs[n - 1]`, then 0."""
+
+    def respond(call: int, value: np.ndarray) -> int:
+        return outputs[call - 1] if call <= len(outputs) else 0
 
     return respond
 
 
-def mel_by_call(call: int, value_in: np.ndarray) -> np.ndarray:
-    """Each hop's 8 frames are `10 * call`, so after `x/10 + 2` they read `call + 2`."""
-    return np.full((1, 1, 8, 32), 10.0 * call, dtype=np.float32)
+def constant(output: int) -> Respond:
+    return lambda call, value: output
 
 
-def embedding_by_call(call: int, value_in: np.ndarray) -> np.ndarray:
-    return np.full((1, 1, 1, 96), float(call), dtype=np.float32)
+def by_content(call: int, value: np.ndarray) -> int:
+    """An output that depends only on the input, so two contexts fed the same audio agree."""
+    return (int(value.astype(np.int64).sum()) * 31 + 7) % 256
 
 
-def scripted(scores: Sequence[float]) -> Callable[[int, np.ndarray], np.ndarray]:
-    """The classifier's score for its n-th call is `scores[n - 1]`, then 0.0."""
-
-    def respond(call: int, value_in: np.ndarray) -> np.ndarray:
-        score = scores[call - 1] if call <= len(scores) else 0.0
-        return np.array([[score]], dtype=np.float32)
-
-    return respond
+def flat(call: int, pcm: bytes) -> list[float]:
+    return [0.0] * 40
 
 
-@dataclass
-class Rig:
-    spotter: OnnxNameSpotter
-    factory: FakeFactory
-    mel: RecordingSession
-    embedding: RecordingSession
-    classifier: RecordingSession
-    manifest: Path
+def by_level(call: int, pcm: bytes) -> list[float]:
+    """Every feature is the chunk's first sample v, as the frontend gives it: `v * 0.0390625`."""
+    level = int(np.frombuffer(pcm[:2], dtype="<i2")[0])
+    return [level * SCALE] * 40
 
 
-# -- Manifest helpers -------------------------------------------------------------------------
+# -- Manifest and rig helpers -----------------------------------------------------------------
 
 
 def manifest_path(models_dir: Path) -> Path:
     return models_dir / "speech" / "wake" / MODEL_ID / "manifest.json"
 
 
-def base_manifest(hashes: Mapping[str, str]) -> dict[str, object]:
+def base_manifest(digest: str) -> dict[str, object]:
     return {
         "model_id": MODEL_ID,
         "names": ["mist"],
-        "family": "openwakeword",
+        "family": "microwakeword",
         "sample_rate": 16000,
-        "hop_ms": 80,
-        "window_ms": 2000,
-        "threshold": 0.5,
-        "warmup_predictions": 5,
-        "graphs": [
-            {
-                "role": "melspectrogram",
-                "file": FILES["melspectrogram"],
-                "sha256": hashes["melspectrogram"],
-                "input": {"new_samples": 1280, "left_context_samples": 480},
-                "frames_per_hop": 8,
-                "bins": 32,
-                "output_transform": {"scale": 0.1, "offset": 2.0},
-            },
-            {
-                "role": "embedding",
-                "file": FILES["embedding"],
-                "sha256": hashes["embedding"],
-                "input": {"window_frames": 76, "stride_frames": 8},
-                "dims": 96,
-            },
-            {
-                "role": "classifier",
-                "file": FILES["classifier"],
-                "sha256": hashes["classifier"],
-                "input": {"window_embeddings": "from_model"},
-            },
-        ],
+        "feature_step_ms": 10,
+        "window_ms": 1000,
+        "sliding_window": 5,
+        "warmup_ms": 1000,
+        "model": {"file": MODEL_FILE, "sha256": digest},
         "hit_lag_ms": 120,
         "calibration": {
             "server": {
@@ -169,21 +195,21 @@ def base_manifest(hashes: Mapping[str, str]) -> dict[str, object]:
 
 
 def write_model(
-    models_dir: Path, mutate: Callable[[dict], None] | None = None, **changes: object
+    models_dir: Path,
+    mutate: Callable[[dict], None] | None = None,
+    *,
+    content: bytes = MODEL_BYTES,
+    **changes: object,
 ) -> Path:
-    """Stage three placeholder graphs and a manifest; `changes` and `mutate` alter the manifest."""
-    directory = manifest_path(models_dir).parent
-    directory.mkdir(parents=True, exist_ok=True)
-    hashes = {}
-    for role, name in FILES.items():
-        content = f"{role} graph".encode()
-        (directory / name).write_bytes(content)
-        hashes[role] = hashlib.sha256(content).hexdigest()
-    manifest = base_manifest(hashes)
+    """Stage a placeholder model file and its manifest; `changes` and `mutate` alter the manifest."""
+    path = manifest_path(models_dir)
+    model = path.parent / MODEL_FILE
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_bytes(content)
+    manifest = base_manifest(hashlib.sha256(content).hexdigest())
     manifest.update(changes)
     if mutate is not None:
         mutate(manifest)
-    path = manifest_path(models_dir)
     path.write_text(json.dumps(manifest), encoding="utf-8")
     return path
 
@@ -192,84 +218,119 @@ def placement(models_dir: Path, **changes: object) -> PlacementConfig:
     return PlacementConfig(models_dir=str(models_dir), kws_model=MODEL_ID, **changes)
 
 
+def library(
+    *,
+    stride: int = 2,
+    respond: Respond = constant(0),
+    features: Features = flat,
+    zero_point: int = 0,
+    inputs: list[dict] | None = None,
+    outputs: list[dict] | None = None,
+) -> FakeLibrary:
+    return FakeLibrary(
+        respond=respond,
+        features=features,
+        input_details=inputs or [details(0, (1, stride, 40), np.int8, zero_point=-128)],
+        output_details=outputs or [details(7, (1, 1), np.uint8, zero_point=zero_point)],
+    )
+
+
+@dataclass
+class Rig:
+    spotter: MicroNameSpotter
+    library: FakeLibrary
+    manifest: Path
+
+    def stream(self, threshold: float = 0.5) -> tuple[kws.MicroNameSpotterStream, FakeInterpreter]:
+        """A new stream, and the interpreter it built."""
+        stream = self.spotter.open_stream(threshold)
+        return stream, self.library.interpreters[-1]
+
+
 def build(
     models_dir: Path,
     *,
-    window: int = 16,
-    scores: Sequence[float] = (),
-    mel: Callable[[int, np.ndarray], np.ndarray] | None = None,
+    stride: int = 2,
+    respond: Respond = constant(0),
+    features: Features = flat,
+    zero_point: int = 0,
     threads: int = 1,
+    window_ms: int = 60,
+    sliding_window: int = 1,
+    warmup_ms: int = 0,
     **changes: object,
 ) -> Rig:
-    path = write_model(models_dir, **changes)
-    mel_session = RecordingSession("input", (1, "samples"), mel or mel_constant(10.0))
-    embedding = RecordingSession("input_1", (1, 76, 32, 1), embedding_by_call)
-    classifier = RecordingSession("x", (1, window, 96), scripted(scores))
-    factory = FakeFactory(
-        {
-            FILES["melspectrogram"]: mel_session,
-            FILES["embedding"]: embedding,
-            FILES["classifier"]: classifier,
-        }
+    """A loaded spotter; by default a 20 ms frame is one step, the cooldown is 3 steps, the
+    window one probability and there is no warm-up, so a scripted output is a frame's score.
+    """
+    path = write_model(
+        models_dir,
+        window_ms=window_ms,
+        sliding_window=sliding_window,
+        warmup_ms=warmup_ms,
+        **changes,
     )
-    spotter = OnnxNameSpotter.load(
-        placement(models_dir, kws_threads=threads), session_factory=factory
+    fakes = library(stride=stride, respond=respond, features=features, zero_point=zero_point)
+    spotter = MicroNameSpotter.load(
+        placement(models_dir, kws_threads=threads), library_loader=fakes
     )
-    return Rig(spotter, factory, mel_session, embedding, classifier, path)
+    return Rig(spotter, fakes, path)
 
 
-def audio(samples: int, start: int = 0) -> bytes:
-    """PCM16 whose sample `i` (counted from the stream start) is `i % 20000 - 10000`."""
-    values = (np.arange(start, start + samples) % 20000) - 10000
-    return values.astype("<i2").tobytes()
+def levels(*values: int) -> bytes:
+    """PCM16 of 160-sample chunks, chunk k holding `values[k]` in every sample."""
+    return b"".join(np.full(CHUNK, value, dtype="<i2").tobytes() for value in values)
 
 
-def push_frames(stream: kws.OnnxNameSpotterStream, count: int, first_pos: int = 0) -> list:
-    """Push `count` 20 ms frames at positions `first_pos...`; return each push's hits by pos."""
+def push_frames(
+    stream: kws.MicroNameSpotterStream, pcm: bytes, first_pos: int = 0
+) -> list[NameHit]:
+    """Push `pcm` as 20 ms frames at positions `first_pos...`, the remainder as one more."""
     hits: list[NameHit] = []
-    for pos in range(first_pos, first_pos + count):
-        hits.extend(stream.push(audio(FRAME, pos * FRAME), pos))
+    for number, start in enumerate(range(0, len(pcm), FRAME_BYTES)):
+        hits.extend(stream.push(pcm[start : start + FRAME_BYTES], first_pos + number))
     return hits
 
 
-def hop_of(hit: NameHit) -> int:
-    """The 1-based hop a hit ended on, for frames pushed from position 0."""
-    return (hit.end_pos + 1) // 4
+def silence(frames: int) -> bytes:
+    return bytes(FRAME_BYTES * frames)
 
 
 # -- Manifest and load ------------------------------------------------------------------------
 
 
-def test_load_reads_the_manifest(tmp_path: Path) -> None:
-    rig = build(tmp_path, threads=3)
+def test_load_reads_the_manifest_and_checks_the_model_once(tmp_path: Path) -> None:
+    rig = build(tmp_path, stride=3, threads=3, window_ms=1000, sliding_window=5, warmup_ms=1000)
     spotter = rig.spotter
     contract: NameSpotter = spotter
     stream: NameSpotterStream = contract.open_stream(0.5)
-    assert stream.push(audio(FRAME), 0) == []
+    assert stream.push(silence(1), 0) == []
     assert spotter.model_id == MODEL_ID
     assert spotter.names == ("mist",)
-    assert spotter.window_ms == 2000
+    assert spotter.window_ms == 1000
     assert spotter.hit_lag_ms == 120
-    assert spotter.threshold == 0.5
-    assert spotter.warmup_predictions == 5
-    assert spotter.classifier_window == 16
     assert spotter.training == "ab" * 32
+    assert spotter.stride == 3
+    assert spotter.cooldown_steps == math.ceil(1000 / 30) == 34
     assert dict(spotter.calibration) == {
         "server": SpotterCalibration(
             false_accepts=((0.5, 2.0), (0.7, 0.5), (0.9, 0.5)),
             positive_quantile=((0.5, 0.1), (0.7, 0.1), (0.9, 0.8)),
         )
     }
-    directory = rig.manifest.parent
-    assert [spec.path for spec in rig.factory.specs] == [
-        str(directory / FILES["melspectrogram"]),
-        str(directory / FILES["embedding"]),
-        str(directory / FILES["classifier"]),
-    ]
-    for spec in rig.factory.specs:
-        assert spec.providers == (CPU,)
-        assert spec.intra_op_num_threads == 3
-        assert spec.inter_op_num_threads == 1
+    assert rig.library.loads == 1
+    checker, opened = rig.library.interpreters
+    assert (checker.model, checker.threads, checker.invokes) == (MODEL_BYTES, 3, 0)
+    assert (opened.model, opened.threads, opened.allocated) == (MODEL_BYTES, 3, 1)
+
+
+def test_the_manifest_reads_the_device_file_in_place(tmp_path: Path) -> None:
+    path = write_model(tmp_path)
+    manifest = kws.read_manifest(path, MODEL_ID)
+    assert manifest.model_file == str(path.parent / "device" / "mist.tflite")
+    assert manifest.model_sha256 == hashlib.sha256(MODEL_BYTES).hexdigest()
+    assert (manifest.window_ms, manifest.sliding_window, manifest.warmup_ms) == (1000, 5, 1000)
+    assert (manifest.hit_lag_ms, manifest.names, manifest.path) == (120, ("mist",), str(path))
 
 
 def test_load_accepts_both_calibration_entries_or_none(tmp_path: Path) -> None:
@@ -280,63 +341,68 @@ def test_load_accepts_both_calibration_entries_or_none(tmp_path: Path) -> None:
     assert dict(rig.spotter.calibration) == {}
 
 
+def test_the_model_bytes_are_read_once_and_every_stream_runs_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_model(tmp_path, window_ms=60, sliding_window=1, warmup_ms=0)
+    model = manifest_path(tmp_path).parent / MODEL_FILE
+    reads: list[Path] = []
+    original = pathlib.Path.read_bytes
+
+    def counting(self: Path) -> bytes:
+        reads.append(self)
+        return original(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", counting)
+    fakes = library()
+    spotter = MicroNameSpotter.load(placement(tmp_path, kws_threads=2), library_loader=fakes)
+    assert [Path(read) for read in reads] == [model]
+
+    # A file swapped after load is never run: the streams build from the bytes that were checked.
+    model.write_bytes(b"another model")
+    spotter.open_stream(0.5)
+    spotter.open_stream(0.5).reset()
+    assert [built.model for built in fakes.interpreters] == [MODEL_BYTES] * 4
+    assert [built.threads for built in fakes.interpreters] == [2] * 4
+    assert len(reads) == 1
+
+
 def test_load_without_a_model_setting_is_refused(tmp_path: Path) -> None:
     write_model(tmp_path)
     with pytest.raises(SpeechEngineError, match="MIST_VOICE_KWS_MODEL"):
-        OnnxNameSpotter.load(
-            PlacementConfig(models_dir=str(tmp_path)), session_factory=FakeFactory({})
-        )
+        MicroNameSpotter.load(PlacementConfig(models_dir=str(tmp_path)), library_loader=library())
 
 
 def test_a_model_id_leaving_the_wake_directory_is_refused(tmp_path: Path) -> None:
     with pytest.raises(SpeechEngineError, match="MIST_VOICE_KWS_MODEL"):
-        OnnxNameSpotter.load(
+        MicroNameSpotter.load(
             PlacementConfig(models_dir=str(tmp_path), kws_model="../mist"),
-            session_factory=FakeFactory({}),
+            library_loader=library(),
         )
 
 
 def test_a_missing_manifest_is_refused_naming_it(tmp_path: Path) -> None:
     with pytest.raises(SpeechEngineError) as caught:
-        OnnxNameSpotter.load(placement(tmp_path), session_factory=FakeFactory({}))
-    assert str(manifest_path(tmp_path)) in str(caught.value)
+        MicroNameSpotter.load(placement(tmp_path), library_loader=library())
+    assert str(caught.value).startswith(str(manifest_path(tmp_path)))
 
 
 def test_a_manifest_that_is_not_json_is_refused_naming_it(tmp_path: Path) -> None:
     path = write_model(tmp_path)
     path.write_text("{not json", encoding="utf-8")
     with pytest.raises(SpeechEngineError) as caught:
-        OnnxNameSpotter.load(placement(tmp_path), session_factory=FakeFactory({}))
-    assert str(path) in str(caught.value)
+        MicroNameSpotter.load(placement(tmp_path), library_loader=library())
+    assert str(caught.value).startswith(str(path))
 
 
-def test_a_missing_graph_file_is_refused_naming_it(tmp_path: Path) -> None:
+def test_a_missing_model_file_is_refused_naming_it(tmp_path: Path) -> None:
     path = write_model(tmp_path)
-    graph = path.parent / FILES["embedding"]
-    graph.unlink()
+    model = path.parent / MODEL_FILE
+    model.unlink()
     with pytest.raises(SpeechEngineError) as caught:
-        OnnxNameSpotter.load(placement(tmp_path), session_factory=FakeFactory({}))
-    assert str(path) in str(caught.value)
-    assert str(graph) in str(caught.value)
-
-
-def _graph(role: str) -> Callable[[dict], dict]:
-    index = {"melspectrogram": 0, "embedding": 1, "classifier": 2}[role]
-    return lambda manifest: manifest["graphs"][index]
-
-
-def _set(getter: Callable[[dict], dict], key: str, value: object) -> Callable[[dict], None]:
-    def mutate(manifest: dict) -> None:
-        getter(manifest)[key] = value
-
-    return mutate
-
-
-def _set_input(role: str, key: str, value: object) -> Callable[[dict], None]:
-    def mutate(manifest: dict) -> None:
-        _graph(role)(manifest)["input"][key] = value
-
-    return mutate
+        MicroNameSpotter.load(placement(tmp_path), library_loader=library())
+    assert str(caught.value).startswith(str(path))
+    assert str(model) in str(caught.value)
 
 
 def _top(key: str, value: object) -> Callable[[dict], None]:
@@ -353,9 +419,18 @@ def _drop(key: str) -> Callable[[dict], None]:
     return mutate
 
 
-def _swap_graphs(manifest: dict) -> None:
-    graphs = manifest["graphs"]
-    graphs[0], graphs[1] = graphs[1], graphs[0]
+def _model(key: str, value: object) -> Callable[[dict], None]:
+    def mutate(manifest: dict) -> None:
+        manifest["model"][key] = value
+
+    return mutate
+
+
+def _drop_model(key: str) -> Callable[[dict], None]:
+    def mutate(manifest: dict) -> None:
+        del manifest["model"][key]
+
+    return mutate
 
 
 def _server_entry(**entry: object) -> Callable[[dict], None]:
@@ -367,24 +442,45 @@ def _server_entry(**entry: object) -> Callable[[dict], None]:
 
 GOOD_FA = [[0.5, 2.0], [0.9, 0.1]]
 GOOD_PQ = [[0.5, 0.1], [0.9, 0.8]]
+KEYS = sorted(base_manifest("0" * 64))
 
 REFUSALS = {
-    "sha256 mismatch": _set(_graph("classifier"), "sha256", "0" * 64),
+    **{f"missing {key}": _drop(key) for key in KEYS},
+    "unknown top-level key": _top("notes", "x"),
+    "old threshold key": _top("threshold", 0.5),
+    "old graphs key": _top("graphs", []),
+    "family of another runtime": _top("family", "onnx-chain"),
+    "family not a string": _top("family", 1),
     "sample rate": _top("sample_rate", 22050),
-    "hop": _top("hop_ms", 100),
-    "family": _top("family", "other"),
-    "graphs out of order": _swap_graphs,
-    "two graphs": lambda manifest: manifest["graphs"].pop(),
-    "mel new samples": _set_input("melspectrogram", "new_samples", 1600),
-    "mel left context": _set_input("melspectrogram", "left_context_samples", 320),
-    "mel frames per hop": _set(_graph("melspectrogram"), "frames_per_hop", 10),
-    "mel bins": _set(_graph("melspectrogram"), "bins", 40),
-    "mel transform": _set(_graph("melspectrogram"), "output_transform", {"scale": 1, "offset": 0}),
-    "embedding window": _set_input("embedding", "window_frames", 64),
-    "embedding stride": _set_input("embedding", "stride_frames", 4),
-    "embedding dims": _set(_graph("embedding"), "dims", 128),
-    "classifier window": _set_input("classifier", "window_embeddings", 16),
-    "unknown input key": _set_input("embedding", "channels", 1),
+    "sample rate as a float": _top("sample_rate", 16000.0),
+    "feature step": _top("feature_step_ms", 20),
+    "feature step as a bool": _top("feature_step_ms", True),
+    "window zero": _top("window_ms", 0),
+    "window fractional": _top("window_ms", 1000.5),
+    "window a string": _top("window_ms", "1000"),
+    "sliding window zero": _top("sliding_window", 0),
+    "sliding window fractional": _top("sliding_window", 2.5),
+    "sliding window a bool": _top("sliding_window", True),
+    "negative warm-up": _top("warmup_ms", -1),
+    "fractional warm-up": _top("warmup_ms", 10.5),
+    "negative hit lag": _top("hit_lag_ms", -1),
+    "fractional hit lag": _top("hit_lag_ms", 1.5),
+    "model not an object": _top("model", "device/mist.tflite"),
+    "model without a file": _drop_model("file"),
+    "model without a sha256": _drop_model("sha256"),
+    "model with an unknown key": _model("notes", "x"),
+    "model file absolute": _model("file", "/models/mist.tflite"),
+    "model file with a drive": _model("file", "C:/models/mist.tflite"),
+    "model file empty": _model("file", ""),
+    "model file not a string": _model("file", 3),
+    "model file with an empty part": _model("file", "device//mist.tflite"),
+    "model file with a dot part": _model("file", "./device/mist.tflite"),
+    "model file with a dot-dot part": _model("file", "device/../../mist.tflite"),
+    "model file with a backslash": _model("file", "device\\mist.tflite"),
+    "model file missing": _model("file", "device/other.tflite"),
+    "sha256 upper-case": _model("sha256", "AB" * 32),
+    "sha256 short": _model("sha256", "ab" * 31),
+    "sha256 differs": _model("sha256", "0" * 64),
     "false accepts scores not ascending": _server_entry(
         false_accepts=[[0.9, 2.0], [0.5, 0.1]], positive_quantile=GOOD_PQ
     ),
@@ -397,9 +493,6 @@ REFUSALS = {
     "quantile share above one": _server_entry(
         false_accepts=GOOD_FA, positive_quantile=[[0.5, 0.1], [0.9, 1.5]]
     ),
-    "quantile scores not ascending": _server_entry(
-        false_accepts=GOOD_FA, positive_quantile=[[0.9, 0.1], [0.5, 0.8]]
-    ),
     "entry without quantile": _server_entry(false_accepts=GOOD_FA),
     "entry without false accepts": _server_entry(positive_quantile=GOOD_PQ),
     "unknown calibration spotter": _top(
@@ -408,15 +501,9 @@ REFUSALS = {
     "unknown calibration entry key": _server_entry(
         false_accepts=GOOD_FA, positive_quantile=GOOD_PQ, notes=[]
     ),
-    "unknown top-level key": _top("notes", "x"),
-    "unknown graph key": _set(_graph("embedding"), "notes", "x"),
-    "missing key": _drop("training"),
-    "negative hit lag": _top("hit_lag_ms", -1),
-    "fractional hit lag": _top("hit_lag_ms", 1.5),
     "empty names": _top("names", []),
     "model id not the directory": _top("model_id", "other"),
     "training not a sha256": _top("training", "abc"),
-    "graph file leaving the model directory": _set(_graph("classifier"), "file", "../mist.onnx"),
 }
 
 
@@ -425,224 +512,498 @@ def test_a_bad_manifest_is_refused_naming_it(
     tmp_path: Path, mutate: Callable[[dict], None]
 ) -> None:
     path = write_model(tmp_path, mutate)
-    factory = FakeFactory({})
+    fakes = library()
     with pytest.raises(SpeechEngineError) as caught:
-        OnnxNameSpotter.load(placement(tmp_path), session_factory=factory)
-    assert str(path) in str(caught.value)
+        MicroNameSpotter.load(placement(tmp_path), library_loader=fakes)
+    assert str(caught.value).startswith(f"{path}: ")
+    with pytest.raises(SpeechEngineError) as again:
+        kws.read_manifest(path, MODEL_ID)
+    assert str(again.value) == str(caught.value)
+    assert fakes.interpreters == []
 
 
-@pytest.mark.parametrize("shape", [(1, 0, 96), (1, "N", 96), (1, None, 96), (1,), (1, True, 96)])
-def test_a_classifier_window_that_is_not_a_positive_integer_is_refused(
-    tmp_path: Path, shape: tuple[object, ...]
+def test_a_model_whose_sha256_differs_is_refused_naming_the_file(tmp_path: Path) -> None:
+    path = write_model(tmp_path, _model("sha256", "0" * 64))
+    with pytest.raises(SpeechEngineError) as caught:
+        kws.read_manifest(path, MODEL_ID)
+    message = str(caught.value)
+    assert str(path.parent / MODEL_FILE) in message
+    assert hashlib.sha256(MODEL_BYTES).hexdigest() in message
+
+
+SHAPES = {
+    "input float32": ([details(0, (1, 3, 40), np.float32)], None, "float32 [1, 3, 40]"),
+    "input uint8": ([details(0, (1, 3, 40), np.uint8)], None, "uint8 [1, 3, 40]"),
+    "input of 32 features": ([details(0, (1, 3, 32), np.int8)], None, "int8 [1, 3, 32]"),
+    "input stride zero": ([details(0, (1, 0, 40), np.int8)], None, "int8 [1, 0, 40]"),
+    "input of rank 2": ([details(0, (3, 40), np.int8)], None, "int8 [3, 40]"),
+    "input batch of 2": ([details(0, (2, 3, 40), np.int8)], None, "int8 [2, 3, 40]"),
+    "input of rank 4": ([details(0, (1, 3, 40, 1), np.int8)], None, "int8 [1, 3, 40, 1]"),
+    "two inputs": (
+        [details(0, (1, 3, 40), np.int8), details(1, (1, 3, 40), np.int8)],
+        None,
+        "int8 [1, 3, 40], int8 [1, 3, 40]",
+    ),
+    "output int8": (None, [details(7, (1, 1), np.int8)], "int8 [1, 1]"),
+    "output float32": (None, [details(7, (1, 1), np.float32)], "float32 [1, 1]"),
+    "output of 2": (None, [details(7, (1, 2), np.uint8)], "uint8 [1, 2]"),
+    "two outputs": (
+        None,
+        [details(7, (1, 1), np.uint8), details(8, (1, 1), np.uint8)],
+        "uint8 [1, 1], uint8 [1, 1]",
+    ),
+}
+
+
+@pytest.mark.parametrize(("inputs", "outputs", "found"), SHAPES.values(), ids=SHAPES.keys())
+def test_a_model_of_another_shape_or_type_is_refused_naming_the_file(
+    tmp_path: Path, inputs: list[dict] | None, outputs: list[dict] | None, found: str
 ) -> None:
     path = write_model(tmp_path)
-    factory = FakeFactory(
-        {
-            FILES["melspectrogram"]: RecordingSession("input", (1, 1760), mel_constant(10.0)),
-            FILES["embedding"]: RecordingSession("input_1", (1, 76, 32, 1), embedding_by_call),
-            FILES["classifier"]: RecordingSession("x", shape, scripted(())),
-        }
-    )
+    fakes = library(inputs=inputs, outputs=outputs)
     with pytest.raises(SpeechEngineError) as caught:
-        OnnxNameSpotter.load(placement(tmp_path), session_factory=factory)
-    assert str(path.parent / FILES["classifier"]) in str(caught.value)
+        MicroNameSpotter.load(placement(tmp_path), library_loader=fakes)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: ")
+    assert str(path.parent / MODEL_FILE) in message
+    assert f"got {found}" in message
 
 
-# -- Hops and windows -------------------------------------------------------------------------
+def test_a_model_the_interpreter_cannot_open_is_refused_naming_the_file(tmp_path: Path) -> None:
+    path = write_model(tmp_path)
+    fakes = library()
+    fakes.fail = ValueError("Model provided has model identifier 'plac', should be 'TFL3'")
+    with pytest.raises(SpeechEngineError) as caught:
+        MicroNameSpotter.load(placement(tmp_path), library_loader=fakes)
+    assert str(caught.value).startswith(f"{path}: ")
+    assert str(path.parent / MODEL_FILE) in str(caught.value)
 
 
-def test_frames_are_buffered_into_hops_keeping_the_remainder(tmp_path: Path) -> None:
-    rig = build(tmp_path)
-    stream = rig.spotter.open_stream(0.5)
-    push_frames(stream, 3)
-    assert rig.mel.feeds == []
-    push_frames(stream, 1, first_pos=3)
-    assert len(rig.mel.feeds) == 1
-    # Pushes that do not fall on hop boundaries: 960 + 640 samples is one hop and 320 over.
-    stream.push(audio(960, HOP), 6)
-    assert len(rig.mel.feeds) == 1
-    stream.push(audio(640, HOP + 960), 8)
-    assert len(rig.mel.feeds) == 2
-    stream.push(audio(960, 2 * HOP + 320), 11)
-    assert len(rig.mel.feeds) == 3
-    third = rig.mel.feeds[2][0, 480:]
-    expected = np.frombuffer(audio(HOP, 2 * HOP), dtype="<i2").astype(np.float32)
-    np.testing.assert_array_equal(third, expected)
+# -- Features and the input formula -----------------------------------------------------------
+
+TABLE = (0, 1, 2, 600, 670)
+QUANTIZED = (-128, -128, -127, 103, 127)
+
+
+def test_the_input_is_the_devices_integer_formula_on_the_frontend_value(tmp_path: Path) -> None:
+    """V = 600 gives 103, where the model's input scale of 26/255 would give 102."""
+
+    def table(call: int, pcm: bytes) -> list[float]:
+        return [float(np.float32(value * SCALE)) for value in TABLE] * 8
+
+    rig = build(tmp_path, stride=3, features=table)
+    stream, interpreter = rig.stream()
+    stream.push(bytes(2 * 3 * CHUNK), 0)
+    (step,) = interpreter.inputs
+    assert step.dtype == np.int8
+    assert step.shape == (1, 3, 40)
+    np.testing.assert_array_equal(step, np.array([[list(QUANTIZED) * 8] * 3], dtype=np.int8))
+
+
+def test_a_buffer_gives_the_same_steps_however_it_is_split(tmp_path: Path) -> None:
+    rig = build(tmp_path, stride=3, features=by_level, respond=by_content)
+    pcm = levels(*range(1, 61))
+    whole, whole_interpreter = rig.stream()
+    whole_hits = whole.push(pcm, 0)
+    whole_frontend = rig.library.frontends[-1]
+
+    pieces, piece_interpreter = rig.stream()
+    piece_frontend = rig.library.frontends[-1]
+    piece_hits: list[NameHit] = []
+    start = 0
+    for size in (7, 333, 1, 159, 160, 3000):
+        piece_hits.extend(pieces.push(pcm[2 * start : 2 * (start + size)], 0))
+        start += size
+    piece_hits.extend(pieces.push(pcm[2 * start :], 0))
+
+    assert len(whole_interpreter.inputs) == 20
+    assert len(piece_interpreter.inputs) == 20
+    for one, other in zip(whole_interpreter.inputs, piece_interpreter.inputs, strict=True):
+        np.testing.assert_array_equal(one, other)
+    assert whole_frontend.chunks == piece_frontend.chunks
+    assert [hit.score for hit in whole_hits] == [hit.score for hit in piece_hits]
+
+
+def test_samples_left_over_from_a_push_wait_for_the_next(tmp_path: Path) -> None:
+    rig = build(tmp_path, stride=1, features=by_level)
+    stream, interpreter = rig.stream()
+    pcm = levels(7, 9)
+    stream.push(pcm[:300], 0)
+    assert rig.library.frontends[-1].chunks == []
+    stream.push(pcm[300:322], 1)
+    assert rig.library.frontends[-1].chunks == [pcm[:320]]
+    assert len(interpreter.inputs) == 1
+
+
+def test_a_frontend_call_without_features_completes_no_step(tmp_path: Path) -> None:
+    def filling(call: int, pcm: bytes) -> list[float]:
+        return [] if call <= 2 else [SCALE] * 40
+
+    rig = build(tmp_path, stride=2, features=filling)
+    stream, interpreter = rig.stream()
+    stream.push(silence(2), 0)
+    assert len(interpreter.inputs) == 1
+
+
+def test_a_frontend_giving_another_feature_count_is_refused(tmp_path: Path) -> None:
+    rig = build(tmp_path, features=lambda call, pcm: [0.0] * 32)
+    stream, _ = rig.stream()
+    with pytest.raises(SpeechEngineError, match="40"):
+        stream.push(silence(1), 0)
 
 
 def test_odd_byte_pcm_is_refused(tmp_path: Path) -> None:
-    stream = build(tmp_path).spotter.open_stream(0.5)
+    stream, _ = build(tmp_path).stream()
     with pytest.raises(SpeechEngineError):
         stream.push(b"\x00\x01\x02", 0)
 
 
-def test_the_melspectrogram_reads_1760_samples_with_480_of_left_context(tmp_path: Path) -> None:
-    rig = build(tmp_path)
-    stream = rig.spotter.open_stream(0.5)
-    push_frames(stream, 8)
-    first, second = rig.mel.feeds
-    assert first.shape == (1, 1760)
-    assert first.dtype == np.float32
-    whole = np.frombuffer(audio(2 * HOP), dtype="<i2").astype(np.float32)
-    np.testing.assert_array_equal(first[0, :480], np.zeros(480, dtype=np.float32))
-    np.testing.assert_array_equal(first[0, 480:], whole[:HOP])
-    np.testing.assert_array_equal(second[0], whole[HOP - 480 : 2 * HOP])
+# -- Probabilities, scores and hits -----------------------------------------------------------
 
 
-def test_the_melspectrogram_output_is_scaled_by_x_over_10_plus_2(tmp_path: Path) -> None:
-    rig = build(tmp_path, mel=mel_constant(10.0))
-    push_frames(rig.spotter.open_stream(0.5), 4)
-    (window,) = rig.embedding.feeds
-    np.testing.assert_allclose(window[0, -8:, :, 0], np.full((8, 32), 3.0))
-
-
-def test_the_embedding_reads_76_frames_moving_by_8_per_hop(tmp_path: Path) -> None:
-    rig = build(tmp_path, mel=mel_by_call)
-    push_frames(rig.spotter.open_stream(0.5), 4 * 12)
-    assert len(rig.embedding.feeds) == 12
-    for hop, window in enumerate(rig.embedding.feeds, start=1):
-        assert window.shape == (1, 76, 32, 1)
-        assert window.dtype == np.float32
-        np.testing.assert_allclose(window[0, -8:, :, 0], np.full((8, 32), hop + 2.0))
-        if hop > 1:
-            previous = rig.embedding.feeds[hop - 2]
-            np.testing.assert_array_equal(window[0, :-8], previous[0, 8:])
-    # Hop 12 sees hops 3 to 12: the oldest 4 frames of hop 3, then all of hops 4 to 12.
-    last = rig.embedding.feeds[-1][0, :, 0, 0]
-    np.testing.assert_allclose(last[:4], np.full(4, 5.0))
-    np.testing.assert_allclose(last[4:12], np.full(8, 6.0))
-
-
-@pytest.mark.parametrize("window", [16, 28])
-def test_the_classifier_reads_the_last_n_embeddings(tmp_path: Path, window: int) -> None:
-    rig = build(tmp_path, window=window)
-    assert rig.spotter.classifier_window == window
-    hops = window + 5
-    push_frames(rig.spotter.open_stream(0.5), 4 * hops)
-    assert len(rig.classifier.feeds) == hops
-    first = rig.classifier.feeds[0]
-    assert first.shape == (1, window, 96)
-    np.testing.assert_array_equal(first[0, :-1], np.zeros((window - 1, 96)))
-    np.testing.assert_allclose(first[0, -1], np.full(96, 1.0))
-    last = rig.classifier.feeds[-1]
-    assert last.dtype == np.float32
-    expected = np.arange(hops - window + 1, hops + 1, dtype=np.float32)
-    np.testing.assert_allclose(last[0, :, 0], expected)
-
-
-# -- Scores and hits --------------------------------------------------------------------------
-
-FULL_16 = 25
-"""With N 16 the classifier window is full from hop 25: 10 hops fill the 76 mel frames, and 15
-more give the 16 embeddings of full mel windows."""
-
-
-def test_more_than_one_pending_hop_reports_the_maximum(tmp_path: Path) -> None:
-    scores = [0.0] * FULL_16 + [0.2, 0.9, 0.4]
-    rig = build(tmp_path, scores=scores)
-    stream = rig.spotter.open_stream(0.5)
-    assert push_frames(stream, 4 * FULL_16) == []
-    hits = stream.push(audio(3 * HOP, FULL_16 * HOP), 4 * FULL_16 + 11)
-    assert len(rig.classifier.feeds) == FULL_16 + 3
-    assert hits == [NameHit(end_pos=4 * FULL_16 + 11, keyword="mist", score=pytest.approx(0.9))]
-
-
-def test_the_first_predictions_after_reset_are_zeroed(tmp_path: Path) -> None:
-    # A warm-up longer than the fill shows the warm-up itself: hops 25 to 30 are full but warm.
-    scores = [0.0] * 24 + [0.99] * 6 + [0.0, 0.99]
-    rig = build(tmp_path, scores=scores, warmup_predictions=30)
-    stream = rig.spotter.open_stream(0.5)
-    hits = push_frames(stream, 4 * 32)
-    assert [hop_of(hit) for hit in hits] == [32]
-    rig.classifier.respond = scripted([0.99] * 31)
-    rig.classifier.feeds.clear()
-    stream.reset()
-    hits = push_frames(stream, 4 * 31)
-    assert [hop_of(hit) for hit in hits] == [31]
-
-
-def test_a_scripted_099_in_the_first_5_predictions_gives_no_hit(tmp_path: Path) -> None:
-    rig = build(tmp_path, scores=[0.99] * 5)
-    stream = rig.spotter.open_stream(0.5)
-    assert push_frames(stream, 4 * 5) == []
-    stream.reset()
-    rig.classifier.feeds.clear()
-    assert push_frames(stream, 4 * 5) == []
-
-
-@pytest.mark.parametrize(("window", "full"), [(16, 25), (28, 37)])
-def test_no_hit_before_the_windows_are_full(tmp_path: Path, window: int, full: int) -> None:
-    rig = build(tmp_path, window=window, scores=[0.99] * (full + 2), warmup_predictions=0)
-    stream = rig.spotter.open_stream(0.5)
-    hits = push_frames(stream, 4 * (full + 2))
-    assert [hop_of(hit) for hit in hits] == [full]
-    first = rig.embedding.feeds[0]
-    np.testing.assert_array_equal(first[0, :-8], np.zeros((68, 32, 1)))
-
-
-def test_reset_starts_a_new_context(tmp_path: Path) -> None:
-    rig = build(tmp_path, scores=[0.99] * 100, warmup_predictions=0)
-    stream = rig.spotter.open_stream(0.5)
-    push_frames(stream, 4 * FULL_16 + 2)
-    stream.reset()
-    rig.mel.feeds.clear()
-    hits = push_frames(stream, 4 * FULL_16, first_pos=200)
-    assert len(hits) == 1 and hits[0].end_pos == 200 + 4 * FULL_16 - 1
-    first = rig.mel.feeds[0]
-    np.testing.assert_array_equal(first[0, :480], np.zeros(480, dtype=np.float32))
-    expected = np.frombuffer(audio(HOP, 200 * FRAME), dtype="<i2").astype(np.float32)
-    np.testing.assert_array_equal(first[0, 480:], expected)
-
-
-def test_a_hit_is_a_rising_edge_with_a_refractory_period(tmp_path: Path) -> None:
-    # window_ms 400 is 5 hops: after a hit at hop h, hops h+1 to h+4 cannot hit.
-    # Offsets from hop 25: 0 hits; 1 is not a rising edge; 3 rises inside the refractory
-    # period; 5 rises as it ends; 10 rises to exactly the threshold, which counts.
-    after = [0.9, 0.9, 0.1, 0.9, 0.1, 0.9, 0.95, 0.1, 0.1, 0.1, 0.5]
-    rig = build(tmp_path, scores=[0.0] * (FULL_16 - 1) + after, window_ms=400)
-    stream = rig.spotter.open_stream(0.5)
-    hits = push_frames(stream, 4 * (FULL_16 - 1 + len(after)))
-    assert [(hop_of(hit) - FULL_16, hit.score) for hit in hits] == [
-        (0, pytest.approx(0.9)),
-        (5, pytest.approx(0.9)),
-        (10, pytest.approx(0.5)),
-    ]
-    assert all(hit.keyword == "mist" for hit in hits)
-    assert hits[0].end_pos == 4 * FULL_16 - 1
-
-
-def test_a_score_held_above_the_threshold_through_the_refractory_period_does_not_hit_again(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("zero_point", "output", "expected"), [(0, 255, 1.0), (10, 137, 127 / 255)]
+)
+def test_the_output_is_a_probability_over_255(
+    tmp_path: Path, zero_point: int, output: int, expected: float
 ) -> None:
-    rig = build(tmp_path, scores=[0.0] * (FULL_16 - 1) + [0.9] * 12, window_ms=400)
-    hits = push_frames(rig.spotter.open_stream(0.5), 4 * (FULL_16 - 1 + 12))
-    assert [hop_of(hit) for hit in hits] == [FULL_16]
+    rig = build(tmp_path, zero_point=zero_point, respond=constant(output))
+    assert rig.spotter.probabilities(silence(2)) == [expected, expected]
 
 
-def test_the_stream_threshold_is_its_own(tmp_path: Path) -> None:
-    rig = build(tmp_path, scores=[0.0] * (FULL_16 - 1) + [0.7])
-    assert push_frames(rig.spotter.open_stream(0.8), 4 * FULL_16) == []
+def test_the_score_is_the_mean_of_a_zero_filled_window(tmp_path: Path) -> None:
+    rig = build(tmp_path, sliding_window=4, respond=scripted(255, 255, 0, 0, 0, 0))
+    assert rig.spotter.score_series(silence(6)) == [0.25, 0.5, 0.5, 0.5, 0.25, 0.0]
 
 
-# -- score_window -----------------------------------------------------------------------------
+def test_a_score_equal_to_the_threshold_hits(tmp_path: Path) -> None:
+    rig = build(tmp_path, respond=constant(51))
+    stream, _ = rig.stream(51 / 255)
+    assert [hit.end_pos for hit in push_frames(stream, silence(1))] == [0]
+    above, _ = rig.stream(51 / 255 + 1e-9)
+    assert push_frames(above, silence(1)) == []
 
 
-def test_score_window_runs_the_same_pipeline_and_returns_the_maximum(tmp_path: Path) -> None:
-    scores = [0.99] * (FULL_16 - 1) + [0.3, 0.8, 0.6]
-    rig = build(tmp_path, scores=scores)
-    pcm = audio((FULL_16 + 2) * HOP + 100)
-    assert rig.spotter.score_window(pcm) == pytest.approx(0.8)
-    assert len(rig.classifier.feeds) == FULL_16 + 2
-    np.testing.assert_array_equal(rig.mel.feeds[0][0, :480], np.zeros(480, dtype=np.float32))
-    # A second call starts from a fresh context, as the stream does after a reset.
-    rig.classifier.respond = scripted(scores)
-    rig.classifier.feeds.clear()
-    rig.mel.feeds.clear()
-    assert rig.spotter.score_window(pcm) == pytest.approx(0.8)
-    np.testing.assert_array_equal(rig.mel.feeds[0][0, :480], np.zeros(480, dtype=np.float32))
+def test_no_hit_within_the_cooldown_of_the_last(tmp_path: Path) -> None:
+    # window_ms 60 over 20 ms steps is a cooldown of 3: after a hit at step s, s+1 and s+2
+    # cannot hit, and s+3 can.
+    outputs = (255, 0, 255, 255, 255, 0, 0, 255, 255, 0, 255)
+    rig = build(tmp_path, window_ms=60, respond=scripted(*outputs))
+    assert rig.spotter.cooldown_steps == 3
+    stream, _ = rig.stream()
+    hits = push_frames(stream, silence(len(outputs)))
+    assert [hit.end_pos for hit in hits] == [0, 3, 7, 10]
+    assert all(hit.keyword == "mist" and hit.score == 1.0 for hit in hits)
+    series = [output / 255 for output in outputs]
+    assert hit_steps(series, 0.5, 3) == [0, 3, 7, 10]
 
 
-def test_score_window_over_a_buffer_shorter_than_the_windows_is_zero(tmp_path: Path) -> None:
-    rig = build(tmp_path, scores=[0.99] * 10)
-    assert rig.spotter.score_window(audio(10 * HOP)) == 0.0
+def test_a_cooldown_rounds_up_to_whole_steps(tmp_path: Path) -> None:
+    rig = build(tmp_path, stride=3, window_ms=61)
+    assert rig.spotter.cooldown_steps == math.ceil(61 / 30) == 3
+
+
+def test_a_hits_end_pos_is_the_push_that_completed_its_step(tmp_path: Path) -> None:
+    rig = build(tmp_path, window_ms=20, respond=constant(255))
+    stream, _ = rig.stream()
+    hits = stream.push(silence(4), 9)
+    assert hits == [NameHit(end_pos=9, keyword="mist", score=1.0)] * 4
+
+
+def test_hit_steps_takes_the_greedy_spaced_steps_at_or_above_the_threshold() -> None:
+    assert hit_steps([0.6, 0.6, 0.1, 0.7, 0.5], 0.5, 2) == [0, 3]
+    assert hit_steps([0.6, 0.6, 0.1, 0.7, 0.5], 0.5, 1) == [0, 1, 3, 4]
+    assert hit_steps([], 0.5, 2) == []
+    with pytest.raises(ValueError):
+        hit_steps([0.5], 0.5, -1)
+
+
+# -- Reset and the warm-up --------------------------------------------------------------------
+
+
+def test_a_stream_opens_on_the_warm_up_silence_and_reports_none_of_it(tmp_path: Path) -> None:
+    rig = build(tmp_path, warmup_ms=100, features=by_level, respond=constant(255))
+    stream, interpreter = rig.stream()
+    frontend = rig.library.frontends[-1]
+    assert frontend.chunks == [bytes(2 * CHUNK)] * 10
+    assert interpreter.invokes == 5
+    hits = push_frames(stream, levels(*[5] * 8))
+    assert [hit.end_pos for hit in hits] == [0, 3]
+
+
+def test_reset_starts_a_new_context_with_its_own_interpreter(tmp_path: Path) -> None:
+    rig = build(tmp_path, window_ms=60, warmup_ms=40, features=by_level, respond=constant(255))
+    stream, first = rig.stream()
+    assert [hit.end_pos for hit in push_frames(stream, levels(5, 5))] == [0]
+    stream.push(levels(5)[:100], 1)
+    stream.reset()
+    second = rig.library.interpreters[-1]
+    assert second is not first and second.threads == 1
+    frontend = rig.library.frontends[-1]
+    # The new context warms on silence again; the cooldown and the leftover samples are gone.
+    assert [hit.end_pos for hit in push_frames(stream, levels(5, 5), 2)] == [2]
+    assert frontend.chunks == [bytes(2 * CHUNK)] * 4 + [levels(5)] * 2
+
+
+def test_reset_without_warm_up_reports_no_hit_until_warmup_ms_is_fed(tmp_path: Path) -> None:
+    rig = build(tmp_path, window_ms=20, warmup_ms=100, features=by_level, respond=constant(255))
+    stream, _ = rig.stream()
+    stream.reset(warm_up=False)
+    frontend = rig.library.frontends[-1]
+    hits = push_frames(stream, levels(*[5] * 16))
+    # 100 ms is 1600 samples: the step completed by the fifth frame is the first that may hit.
+    assert [hit.end_pos for hit in hits] == [4, 5, 6, 7]
+    assert frontend.chunks[0] == levels(5)
+    assert len(frontend.chunks) == 16
+
+    stream.reset()
+    assert rig.library.frontends[-1].chunks == [bytes(2 * CHUNK)] * 10
+    assert [hit.end_pos for hit in push_frames(stream, levels(5, 5))] == [0]
+
+
+def test_probabilities_start_from_a_fresh_context_with_no_warm_up(tmp_path: Path) -> None:
+    rig = build(tmp_path, sliding_window=3, warmup_ms=100, respond=scripted(255, 0, 51))
+    assert rig.spotter.probabilities(silence(3)) == [1.0, 0.0, 0.2]
+    assert rig.library.frontends[-1].chunks == [bytes(2 * CHUNK)] * 6
+    assert rig.spotter.probabilities(silence(3)) == [1.0, 0.0, 0.2]
+
+
+def test_score_window_is_the_highest_score_from_a_fresh_warmed_context(tmp_path: Path) -> None:
+    rig = build(tmp_path, sliding_window=2, warmup_ms=40, respond=scripted(255, 255, 0, 255, 51))
+    # The warm-up's two steps take the first two outputs, and the window still holds them.
+    assert rig.spotter.score_series(silence(3)) == pytest.approx([0.5, 0.5, 0.6])
+    assert rig.spotter.score_window(silence(3)) == pytest.approx(0.6)
+    assert rig.spotter.score_window(bytes(2 * CHUNK)) == 0.0
     assert rig.spotter.score_window(b"") == 0.0
+
+
+# -- The seeded property ----------------------------------------------------------------------
+
+
+def _random_case(rng: random.Random) -> tuple[dict[str, int], bytes]:
+    settings = {
+        "stride": rng.randint(1, 3),
+        "sliding_window": rng.randint(1, 6),
+        "window_ms": rng.randint(10, 150),
+        "warmup_ms": rng.choice((0, 30, 45, 200)),
+    }
+    pcm = levels(*(rng.randint(0, 700) for _ in range(rng.randint(0, 80))))
+    return settings, pcm[: len(pcm) - 2 * rng.randint(0, 100)] if pcm else pcm
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_hit_steps_is_monotone_and_equals_a_stream_pushed_every_frame(
+    tmp_path: Path, seed: int
+) -> None:
+    rng = random.Random(seed)
+    settings, pcm = _random_case(rng)
+    rig = build(tmp_path, features=by_level, respond=by_content, **settings)
+    spotter = rig.spotter
+    series = spotter.score_series(pcm)
+    cooldown = spotter.cooldown_steps
+
+    thresholds = sorted({rng.random() for _ in range(12)} | set(series))
+    counts = [len(hit_steps(series, threshold, cooldown)) for threshold in thresholds]
+    assert counts == sorted(counts, reverse=True)
+
+    # The same audio, every piece of it pushed, in pieces of random size.
+    threshold = rng.choice(thresholds) if thresholds else 0.5
+    stream, _ = rig.stream(threshold)
+    pieces: list[int] = []
+    reported: list[tuple[int, float]] = []
+    total = len(pcm) // 2
+    start = 0
+    while start < total:
+        end = min(total, start + rng.randint(1, 700))
+        piece = pcm[2 * start : 2 * end]
+        reported.extend((hit.end_pos, hit.score) for hit in stream.push(piece, len(pieces)))
+        start = end
+        pieces.append(end)
+
+    # Steps completed by the end of each piece: one feature per 160 samples, silence included.
+    silence_samples = settings["warmup_ms"] * 16
+    before = silence_samples // CHUNK // settings["stride"]
+    done = [(silence_samples + end) // CHUNK // settings["stride"] - before for end in pieces]
+    assert len(series) == (done[-1] if done else 0)
+    expected = [
+        (bisect_right(done, step), series[step]) for step in hit_steps(series, threshold, cooldown)
+    ]
+    assert reported == expected
+
+    # `score_window` reaches a threshold exactly when a fresh stream pushed the audio hits.
+    for level in (rng.uniform(0.01, 1.0) for _ in range(3)):
+        fresh, _ = rig.stream(level)
+        assert (spotter.score_window(pcm) >= level) == bool(push_frames(fresh, pcm))
+
+
+# -- The runtime import -----------------------------------------------------------------------
+
+
+class FakeLiteInterpreter:
+    def __init__(self, *, model_content: bytes, num_threads: int) -> None:
+        self.model_content = model_content
+        self.num_threads = num_threads
+
+
+@dataclass
+class FakeResult:
+    features: list[float]
+    samples_read: int
+
+
+class SnakeFrontend:
+    def process_samples(self, audio: bytes) -> FakeResult:
+        return FakeResult(features=[SCALE] * 40, samples_read=len(audio) // 2)
+
+
+class CamelFrontend:
+    def ProcessSamples(self, audio: bytes) -> FakeResult:  # noqa: N802 - pymicro-features 1.x
+        return FakeResult(features=[2 * SCALE] * 40, samples_read=len(audio) // 2)
+
+
+class ShortFrontend:
+    def process_samples(self, audio: bytes) -> FakeResult:
+        return FakeResult(features=[], samples_read=len(audio) // 4)
+
+
+def _install(
+    monkeypatch: pytest.MonkeyPatch, *, litert: bool = True, frontend: type | None = SnakeFrontend
+) -> None:
+    if litert:
+        package = types.ModuleType("ai_edge_litert")
+        module = types.ModuleType("ai_edge_litert.interpreter")
+        module.Interpreter = FakeLiteInterpreter  # type: ignore[attr-defined]
+        package.interpreter = module  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "ai_edge_litert", package)
+        monkeypatch.setitem(sys.modules, "ai_edge_litert.interpreter", module)
+    else:
+        monkeypatch.setitem(sys.modules, "ai_edge_litert", None)
+        monkeypatch.setitem(sys.modules, "ai_edge_litert.interpreter", None)
+    if frontend is None:
+        monkeypatch.setitem(sys.modules, "pymicro_features", None)
+    else:
+        micro = types.ModuleType("pymicro_features")
+        micro.MicroFrontend = frontend  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pymicro_features", micro)
+
+
+@pytest.mark.parametrize(
+    ("litert", "frontend", "package"),
+    [(False, SnakeFrontend, "ai-edge-litert"), (True, None, "pymicro-features")],
+)
+def test_import_micro_runtime_names_the_missing_package(
+    monkeypatch: pytest.MonkeyPatch, litert: bool, frontend: type | None, package: str
+) -> None:
+    _install(monkeypatch, litert=litert, frontend=frontend)
+    with pytest.raises(SpeechEngineError) as caught:
+        kws.import_micro_runtime()
+    assert package in str(caught.value)
+    assert "requirements-voice.txt" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("frontend", "value"), [(SnakeFrontend, SCALE), (CamelFrontend, 2 * SCALE)]
+)
+def test_import_micro_runtime_binds_the_interpreter_and_the_frontend(
+    monkeypatch: pytest.MonkeyPatch, frontend: type, value: float
+) -> None:
+    _install(monkeypatch, frontend=frontend)
+    runtime = kws.import_micro_runtime()
+    interpreter = runtime.interpreter(MODEL_BYTES, 3)
+    assert isinstance(interpreter, FakeLiteInterpreter)
+    assert (interpreter.model_content, interpreter.num_threads) == (MODEL_BYTES, 3)
+    assert list(runtime.frontend().features(bytes(2 * CHUNK))) == [value] * 40
+
+
+def test_a_frontend_that_reads_part_of_a_call_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, frontend=ShortFrontend)
+    with pytest.raises(SpeechEngineError, match="160"):
+        kws.import_micro_runtime().frontend().features(bytes(2 * CHUNK))
+
+
+def test_the_module_imports_neither_runtime_package() -> None:
+    source = Path(kws.__file__).read_text(encoding="utf-8")
+    assert "import ai_edge_litert" not in source
+    assert "import pymicro_features" not in source
+    assert "from ai_edge_litert" not in source
+    assert "from pymicro_features" not in source
+
+
+# -- Hit positions from one series ------------------------------------------------------------
+
+
+class TestHitPositions:
+    """`hit_positions` over one `score_series` equals the stream's `end_pos` at each cutoff.
+
+    The stream is pushed 20 ms frames from `first_pos`, the remainder as one more frame, as
+    ingress pushes it; the frontend gives no features for its first `lead` calls, as a
+    microfrontend filling its analysis window does, and the warm-up need not be whole calls.
+    """
+
+    @staticmethod
+    def _filling(lead: int) -> Features:
+        def features(call: int, pcm: bytes) -> list[float]:
+            return [] if call <= lead else by_level(call, pcm)
+
+        return features
+
+    @pytest.mark.parametrize("seed", range(30))
+    def test_hit_positions_equal_the_streams_end_pos(self, tmp_path: Path, seed: int) -> None:
+        rng = random.Random(1000 + seed)
+        lead = rng.choice((0, 1, 2, 5))
+        settings = {
+            "stride": rng.randint(1, 3),
+            "sliding_window": rng.randint(1, 4),
+            "window_ms": rng.randint(10, 150),
+            "warmup_ms": rng.choice((0, 30, 45, 200)),
+        }
+        rig = build(tmp_path, features=self._filling(lead), respond=by_content, **settings)
+        spotter = rig.spotter
+        pcm = levels(*(rng.randint(0, 700) for _ in range(rng.randint(1, 90))))
+        pcm = pcm[: len(pcm) - 2 * rng.randint(0, 150)]
+        series = spotter.score_series(pcm)
+        first_pos = rng.randint(0, 50)
+        cutoffs = sorted({round(rng.random(), 3) for _ in range(4)} | set(series[:3]))
+        hits = 0
+        for cutoff in cutoffs:
+            stream, _ = rig.stream(cutoff)
+            reported = [hit.end_pos for hit in push_frames(stream, pcm, first_pos)]
+            hits += len(reported)
+            assert reported == kws.hit_positions(
+                series,
+                cutoff,
+                stride=spotter.stride,
+                cooldown_steps=spotter.cooldown_steps,
+                first_pos=first_pos,
+                warmup_samples=settings["warmup_ms"] * 16,
+                lead_calls=lead,
+            )
+        assert hits or not series
+
+    def test_a_step_is_placed_at_the_frame_holding_its_last_sample(self) -> None:
+        # Stride 3 is 480 samples a step: steps end at samples 480, 960 and 1440, in frames 1,
+        # 2 and 4 of 320 samples; a warm-up of 200 samples moves each end 200 samples earlier.
+        series = [1.0, 1.0, 1.0]
+        positions = kws.hit_positions(series, 0.5, stride=3, cooldown_steps=1, first_pos=10)
+        assert positions == [11, 12, 14]
+        warmed = kws.hit_positions(
+            series, 0.5, stride=3, cooldown_steps=1, first_pos=0, warmup_samples=200
+        )
+        assert warmed == [0, 2, 3]
+        assert kws.hit_positions(series, 0.5, stride=3, cooldown_steps=3, first_pos=0) == [1]
+        assert kws.hit_positions([], 0.5, stride=3, cooldown_steps=1, first_pos=0) == []
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"stride": 0},
+            {"cooldown_steps": -1},
+            {"warmup_samples": -1},
+            {"lead_calls": -1},
+            {"frame_samples": 0},
+        ],
+    )
+    def test_a_negative_or_empty_shape_is_refused(self, bad: dict[str, int]) -> None:
+        arguments = {"stride": 1, "cooldown_steps": 1, "first_pos": 0, **bad}
+        with pytest.raises(ValueError):
+            kws.hit_positions([0.5], 0.5, **arguments)

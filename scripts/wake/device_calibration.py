@@ -1,27 +1,32 @@
-"""The room device's wake calibration: its streaming evaluation as `calibration.endpoint`.
+"""One spotter's wake calibration: its streaming evaluation as `calibration.<spotter>`.
 
 A room device and a desktop can both hear the name at once, and the server then ranks the two
 wakes. Their scores come from different models, so the ranking reads each spotter's tables in
 the server wake manifest instead (`backend/realtime/speech.py`, `arbitration_key`). This writes
-the device model's tables there, from the evaluation the lead runs on the `tune` split (H7):
+one spotter's tables there: `endpoint`, the room device's model, or `server`, the server's own
+spotter. `--spotter` names which, and `endpoint` is the default:
 
     python -m scripts.wake.device_calibration <eval.json> --manifest <server manifest.json>
+        [--spotter server|endpoint]
 
 The evaluation is a JSON object with exactly three keys: `cutoffs`, the probability cutoffs the
-streaming ROC was measured at; `false_accepts_per_hour`, the device's false accepts per hour of
-`tune` media at each cutoff, in the same order; and `positive_scores`, the device model's score
-for each `tune` positive. Probabilities run from 0 to 1, as the device's cutoff does.
+streaming ROC was measured at; `false_accepts_per_hour`, the spotter's false accepts at each
+cutoff, in the same order, per hour of the negative audio the evaluation was measured on; and
+`positive_scores`, the spotter's score for each `tune` positive. For the device that audio is the
+`tune` media, in the evaluation the lead runs (H7); for the server it is the ambient set, in
+`scripts/wake/spotter_eval.py`'s output. Probabilities must run from 0 to 1; a cutoff or a score
+outside that is refused.
 
-The tables are built by `eval_wake`'s own builders, so a share or a rate means on the device's
-scale exactly what it means on the server spotter's. A higher score must read as the stronger
-wake: `turn.py`'s `_rank_key` ranks the lower false-accept rate first and the higher positive
-share next, so rates that rise with the cutoff are refused rather than smoothed, since
-they mean the evaluation is not the one the table claims to describe.
+The tables are built by `eval_wake`'s own builders, so both spotters' tables are built the same
+way from their evaluations. A higher score must read as the stronger wake: `turn.py`'s
+`_rank_key` ranks the lower false-accept rate first and the higher positive share next, so rates
+that rise with the cutoff are refused rather than smoothed, since they mean the evaluation is
+not the one the table claims to describe.
 
-Only `calibration.endpoint` changes. The manifest is spliced as text, not re-serialised, so every
-other byte, `calibration.server` included, stays as it was. The result is written beside the
-manifest, loaded by `read_manifest` and only then moved over it, so a manifest the server would
-refuse is never written. No audio is read.
+Only the named spotter's entry changes. The manifest is spliced as text, not re-serialised, so
+every other byte, the other spotter's entry included, stays as it was. The result is written
+beside the manifest, loaded by `read_manifest` and only then moved over it, so a manifest the
+server would refuse is never written. No audio is read.
 """
 
 import argparse
@@ -37,12 +42,14 @@ from pathlib import Path
 
 from backend.realtime.engines.kws import read_manifest
 from backend.realtime.errors import SpeechEngineError
+from backend.realtime.protocol import Spotter
 
 from .eval_wake import false_accept_table, positive_quantile_table
 
 logger = logging.getLogger(__name__)
 
-SPOTTER = "endpoint"
+SPOTTERS: tuple[Spotter, ...] = ("server", "endpoint")
+DEFAULT_SPOTTER: Spotter = "endpoint"
 EVAL_KEYS = ("cutoffs", "false_accepts_per_hour", "positive_scores")
 _JSON_WHITESPACE = " \t\n\r"
 
@@ -53,7 +60,7 @@ class RefusedError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Calibration:
-    """The device spotter's two tables, as `[score, value]` points with ascending scores."""
+    """One spotter's two tables, as `[score, value]` points with ascending scores."""
 
     false_accepts: list[tuple[float, float]]
     positive_quantile: list[tuple[float, float]]
@@ -83,13 +90,13 @@ def _probabilities(values: list[float], key: str) -> list[float]:
     outside = [value for value in values if not 0.0 <= value <= 1.0]
     if outside:
         raise RefusedError(
-            f"{key} must be the device model's probabilities, from 0 to 1; got {outside}"
+            f"{key} must be the spotter model's probabilities, from 0 to 1; got {outside}"
         )
     return values
 
 
 def calibration_from_evaluation(evaluation: object) -> Calibration:
-    """Check one evaluation and build the device's tables from it.
+    """Check one evaluation and build its spotter's tables from it.
 
     Raises:
         RefusedError: A key is missing or unknown, a value is not a finite number, a probability
@@ -126,7 +133,7 @@ def calibration_from_evaluation(evaluation: object) -> Calibration:
                 f"{high_rate} at {high}; a higher cutoff cannot accept more"
             )
     # With rising rates refused, the running minimum changes nothing; it is called so the
-    # table is the server spotter's by construction, not by a second definition.
+    # table is `eval_wake`'s by construction, not by a second definition.
     return Calibration(
         false_accepts=false_accept_table(points),
         positive_quantile=positive_quantile_table(scores, cutoffs),
@@ -212,8 +219,8 @@ def _render(calibration: Calibration, indent: str | None, unit: str, newline: st
     return "{" + inner + ("," + inner).join(members) + newline + indent + "}"
 
 
-def splice_endpoint(text: str, calibration: Calibration) -> str:
-    """The manifest text with `calibration.endpoint` set and every other character kept.
+def splice_calibration(text: str, spotter: Spotter, calibration: Calibration) -> str:
+    """The manifest text with `calibration.<spotter>` set and every other character kept.
 
     An existing entry's value is replaced in place. A new entry goes after the last one, laid
     out like it, or alone inside an empty `calibration` object, one level below the key.
@@ -231,7 +238,7 @@ def splice_endpoint(text: str, calibration: Calibration) -> str:
     if text[entry.value_start] != "{":
         raise RefusedError("the manifest's calibration must be an object")
     spotters, close = _members(text, entry.value_start)
-    current = _keyed(spotters, "calibration").get(SPOTTER)
+    current = _keyed(spotters, "calibration").get(spotter)
 
     newline = "\r\n" if "\r\n" in text else "\n"
     multiline = "\n" in text
@@ -247,15 +254,15 @@ def splice_endpoint(text: str, calibration: Calibration) -> str:
         last = spotters[-1]
         separator = text[last.lead : last.key_start]
         indent = _indent(text, last.key_start) if multiline else None
-        member = f"{json.dumps(SPOTTER)}: {_render(calibration, indent, unit, newline)}"
+        member = f"{json.dumps(spotter)}: {_render(calibration, indent, unit, newline)}"
         return text[: last.value_end] + "," + separator + member + text[last.value_end :]
 
     at = entry.value_start + 1
     if not multiline or top is None:
-        member = f"{json.dumps(SPOTTER)}: {_render(calibration, None, unit, newline)}"
+        member = f"{json.dumps(spotter)}: {_render(calibration, None, unit, newline)}"
         return text[:at] + member + text[at:]
     indent = top + unit
-    member = f"{json.dumps(SPOTTER)}: {_render(calibration, indent, unit, newline)}"
+    member = f"{json.dumps(spotter)}: {_render(calibration, indent, unit, newline)}"
     closing = "" if "\n" in text[at:close] else newline + top
     return text[:at] + newline + indent + member + closing + text[at:]
 
@@ -295,16 +302,16 @@ def _write_checked(manifest: Path, text: str) -> None:
         staged.unlink(missing_ok=True)
 
 
-def _run(evaluation_path: Path, manifest: Path) -> None:
+def _run(evaluation_path: Path, manifest: Path, spotter: Spotter) -> None:
     calibration = calibration_from_evaluation(_read_evaluation(evaluation_path))
     try:
         text = manifest.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise RefusedError(f"the manifest {manifest} could not be read: {exc}") from exc
-    _write_checked(manifest, splice_endpoint(text, calibration))
+    _write_checked(manifest, splice_calibration(text, spotter, calibration))
     logger.info(
         "Wrote calibration.%s to %s: %d false-accept points, %d quantile points",
-        SPOTTER,
+        spotter,
         manifest,
         len(calibration.false_accepts),
         len(calibration.positive_quantile),
@@ -315,18 +322,32 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m scripts.wake.device_calibration", description=__doc__
     )
-    parser.add_argument("evaluation", type=Path, help="the device model's evaluation JSON")
     parser.add_argument(
-        "--manifest", required=True, type=Path, help="the server wake model's manifest.json"
+        "evaluation",
+        type=Path,
+        help="the spotter's evaluation JSON: the device's (H7) or `spotter_eval`'s output",
+    )
+    parser.add_argument(
+        "--manifest",
+        required=True,
+        type=Path,
+        help="the server wake model's manifest.json, which holds both spotters' tables",
+    )
+    parser.add_argument(
+        "--spotter",
+        choices=SPOTTERS,
+        default=DEFAULT_SPOTTER,
+        help=f"the spotter the evaluation measured, whose entry is written (default: "
+        f"{DEFAULT_SPOTTER})",
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Write the device's tables; 0 when the manifest is written, 2 when the run is refused."""
+    """Write one spotter's tables; 0 when the manifest is written, 2 when the run is refused."""
     args = _parser().parse_args(argv)
     try:
-        _run(args.evaluation, args.manifest)
+        _run(args.evaluation, args.manifest, args.spotter)
     except RefusedError as exc:
         print(f"device_calibration: {exc}", file=sys.stderr)
         return 2

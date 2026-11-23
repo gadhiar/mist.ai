@@ -32,7 +32,13 @@ from backend.realtime.registry import LogGate, SessionRegistry
 from backend.realtime.runtime import voice_capabilities
 from backend.realtime.session import InferenceLanes, SessionServices, SpeechEngines
 from backend.request_context import current_session_id
-from tests.fakes.speech import EnergyVad, FakeSynthesizer, ScriptedNameSpotter, ScriptedTranscriber
+from tests.fakes.speech import (
+    EnergyVad,
+    FakeSynthesizer,
+    ScriptedNameSpotter,
+    ScriptedTranscriber,
+    ScriptedWakeVerifier,
+)
 from tests.unit.realtime.test_session import CALIBRATION, FakeIngress, FakeSocket, voice_start
 from tests.unit.realtime.turn_fakes import (
     TEST_PLAYBACK,
@@ -137,6 +143,7 @@ def install_runtime(
         transcriber=ScriptedTranscriber(["hello there"], ms_per_word=20),
         synthesizer=FakeSynthesizer(),
         spotter=ScriptedNameSpotter(hit_lag_ms=180, calibration=CALIBRATION),
+        verifier=ScriptedWakeVerifier(),
     )
     ingresses: list[FakeIngress] = []
 
@@ -149,7 +156,12 @@ def install_runtime(
         responder=handler,  # type: ignore[arg-type]
         engines=engines,
         lanes=InferenceLanes(
-            vad=InlineLane(), eot=InlineLane(), stt=InlineLane(), tts=InlineLane(), kws=InlineLane()
+            vad=InlineLane(),
+            eot=InlineLane(),
+            stt=InlineLane(),
+            tts=InlineLane(),
+            kws=InlineLane(),
+            verify=InlineLane(),
         ),
         settings=VoiceSettings(
             playback=TEST_PLAYBACK,

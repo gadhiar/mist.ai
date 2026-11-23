@@ -91,7 +91,7 @@ def test_load_turn_plan_reports_a_missing_file_by_name(tmp_path):
 
 
 def test_text_frame_has_exactly_the_two_keys_the_server_reads():
-    """`TextMessage` (`backend/realtime/protocol.py:398-402`) has `type` and `text` only."""
+    """`TextMessage` (in `backend/realtime/protocol.py`) has `type` and `text` only."""
     frame = dt.build_text_frame("My name is Dana Whitfield.")
 
     assert frame == {"type": "text", "text": "My name is Dana Whitfield."}
@@ -142,9 +142,9 @@ def _spec(index: int = 1, text: str = "Hello there friend.") -> dt.TurnSpec:
     return dt.TurnSpec(index=index, text=text, purpose="extraction-target")
 
 
-#: A typed turn's opener: `TurnController._open_turn` (`backend/realtime/turn.py:2622-2628`)
-#: builds `StreamStartMessage`, and `_channel_for` (`turn.py:2510-2520`) gives a turn whose
-#: origin is not `voice` the `text` channel, so `audio_tag` is absent.
+#: A typed turn's opener: `TurnController._open_turn` (in `backend/realtime/turn.py`) builds
+#: `StreamStartMessage`, and `TurnController._channel_for` gives a turn whose origin is not
+#: `voice` the `text` channel, so `audio_tag` is absent.
 STREAM_START = {
     "type": "stream_start",
     "turn_id": "aaaa-1111",
@@ -152,7 +152,7 @@ STREAM_START = {
     "origin": "text",
 }
 
-#: Built by `_send_complete` (`backend/realtime/turn.py:2916-2930`).
+#: Built by `TurnController._send_complete` (in `backend/realtime/turn.py`).
 STREAM_COMPLETE = {
     "type": "stream_complete",
     "turn_id": "aaaa-1111",
@@ -161,8 +161,8 @@ STREAM_COMPLETE = {
     "tool_calls_used": 0,
 }
 
-#: Built by `_cut` (`backend/realtime/turn.py:3271-3279`); `spoken_text` is null for a
-#: `text`-channel turn (`StreamCancelledMessage`, `backend/realtime/protocol.py:1139`).
+#: Built by `TurnController._cut` (in `backend/realtime/turn.py`); `spoken_text` is null for a
+#: `text`-channel turn (`StreamCancelledMessage` in `backend/realtime/protocol.py`).
 STREAM_CANCELLED = {
     "type": "stream_cancelled",
     "turn_id": "aaaa-1111",
@@ -171,8 +171,9 @@ STREAM_CANCELLED = {
     "spoken_text": None,
 }
 
-#: A failed generation: `_send_degraded(turn, "turn_error")` (`backend/realtime/turn.py:2943`),
-#: then `stream_complete`, then `turn_metrics` with outcome `error`.
+#: A failed generation: `_send_degraded(turn, "turn_error")` in
+#: `TurnController._on_stream_ended` (in `backend/realtime/turn.py`), then `stream_complete`,
+#: then `turn_metrics` with outcome `error`.
 TURN_ERROR_DECISION = {
     "type": "voice_decision",
     "kind": "degraded",
@@ -181,7 +182,7 @@ TURN_ERROR_DECISION = {
     "detail": {"engine": None, "error": None, "voiced_text": None, "text_from_token": None},
 }
 
-#: Built by `RealtimeSession._protocol_error` (`backend/realtime/session.py:707-720`) when a
+#: Built by `RealtimeSession._protocol_error` (in `backend/realtime/session.py`) when a
 #: client message fails to parse. Session-level: it names a field, never a turn.
 PROTOCOL_ERROR = {
     "type": "error",
@@ -195,7 +196,7 @@ PROTOCOL_ERROR = {
 def _metrics(
     outcome: str = "completed", recorded: bool = True, turn_id: str = "aaaa-1111"
 ) -> dict[str, object]:
-    """The fields of `TurnMetricsMessage` (`backend/realtime/protocol.py:1090`) the driver reads."""
+    """The fields of `TurnMetricsMessage` (in `backend/realtime/protocol.py`) the driver reads."""
     return {
         "type": "turn_metrics",
         "turn_id": turn_id,
@@ -248,9 +249,9 @@ def test_happy_path_turn_ends_at_turn_metrics_with_its_fields():
 def test_stream_complete_alone_does_not_end_the_turn():
     """The turn commits after `stream_complete`; a text sent before `turn_metrics` cuts it.
 
-    `TurnController._on_text` (`backend/realtime/turn.py:2167-2182`) cuts a turn still held in
-    `self._turn` with reason `new_input`, and `_finish` (`turn.py:3370`) clears it only after
-    `_complete` has committed and sent `turn_metrics` (`turn.py:3088-3093`).
+    `TurnController._on_text` (in `backend/realtime/turn.py`) cuts a turn still in
+    `self._turn` (one not `held`) with reason `new_input`, and `TurnController._finish` clears
+    it only after `TurnController._complete` has committed and sent `turn_metrics`.
     """
     recorder = dt.TurnRecorder(_spec(), started_at=0.0)
 

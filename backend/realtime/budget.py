@@ -9,7 +9,7 @@ as an engine failure.
 """
 
 import dataclasses
-import json
+import logging
 import math
 import posixpath
 import re
@@ -21,6 +21,8 @@ from typing import TypeVar
 from src.multimodal.voice_profile import DEFAULT_VOICE_PROFILE
 
 from .protocol import MAX_WAKE_BACKLOG_MS
+
+logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
@@ -381,7 +383,10 @@ class PlacementConfig:
     bounds how long a GPU release waits for running jobs to stop. `kws_model` is the name
     spotter's model id, the same id form, read from `<models_dir>/speech/wake/<id>/`; `None`
     turns the server spotter off. The spotter runs on the CPU only, with `kws_threads` threads,
-    so it has no device setting.
+    so it has no device setting. `verify_model` is the acoustic wake verifier's model id, the
+    same id form, read from the same `<models_dir>/speech/wake/<id>/`; `None` leaves the
+    verifier unloaded. It runs on the CPU only, with `verify_threads` onnxruntime intra-op
+    threads, so it has no device setting either.
     """
 
     vad_device: str = "cpu"
@@ -407,6 +412,8 @@ class PlacementConfig:
     models_dir: str = "/models"
     kws_model: str | None = None
     kws_threads: int = 1
+    verify_model: str | None = None
+    verify_threads: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,73 +423,6 @@ class TurnConfig:
     tool_cancel_grace_ms: int = 2000
 
 
-DEFAULT_WAKE_PHRASES: tuple[str, ...] = (
-    "hey {name}",
-    "{name}, how's it going",
-    "{name}, what's up",
-    "are you there {name}",
-)
-"""Templates that address MIST when they open or end an utterance; `{name}` is any name."""
-
-DEFAULT_ADDRESS_STARTS: tuple[str, ...] = (
-    "what",
-    "what's",
-    "how",
-    "how's",
-    "are",
-    "can",
-    "could",
-    "would",
-    "will",
-    "do",
-    "did",
-    "set",
-    "play",
-    "turn",
-    "tell",
-    "show",
-    "open",
-    "close",
-    "stop",
-    "remind",
-    "start",
-    "put",
-    "add",
-    "call",
-)
-"""Words that start a request after a leading name with no comma.
-
-"is" is not among them, so "mist is a good name" talks about the name rather than to her.
-"""
-
-DEFAULT_STOP_BEFORE: tuple[str, ...] = (
-    "the",
-    "a",
-    "an",
-    "this",
-    "that",
-    "some",
-    "of",
-    "in",
-    "into",
-    "through",
-    "morning",
-    "thick",
-    "light",
-    "sea",
-    "mountain",
-)
-"""Words after which a name is a noun: "the morning mist", "we drove into mist".
-
-A greeting that opens an utterance is read first, so "morning mist" alone still greets her.
-"""
-
-DEFAULT_GREETINGS: tuple[str, ...] = ("hey", "hi", "hello", "morning", "evening", "yo")
-"""Greetings that make a following name a vocative at the start of an utterance."""
-
-# The phrases file's keys, each a list of strings replacing that field's default.
-_PHRASE_KEYS = ("phrases", "address_starts", "stop_before", "greetings")
-
 # `lookback_ms` plus this must stay within the wire's `MAX_WAKE_BACKLOG_MS`.
 _LOOKBACK_HEADROOM_MS = 1000
 # The least `endpoint_min_backlog_ms` may be; its most is `MAX_WAKE_BACKLOG_MS`.
@@ -491,34 +431,25 @@ _MIN_ENDPOINT_BACKLOG_MS = 500
 
 @dataclass(frozen=True, slots=True)
 class WakeConfig:
-    """How MIST hears her name and decides she was addressed (Design doc, Wake by name).
+    """How MIST hears her name and which hits open a wake (Design doc, Wake by name).
 
-    `names` are lower-case single words the spotter scores. `phrases`, `address_starts`,
-    `stop_before` and `greetings` are the addressee gate's word sets, which
-    `MIST_VOICE_WAKE_PHRASES_FILE` changes without a release; each template holds `{name}`
-    once. A name hit at or above `kws_threshold` (an endpoint wake at or above
-    `endpoint_threshold`) opens a candidate reaching back at most `lookback_ms`, across speech
-    gaps of at most `join_gap_ms`. The gate decodes `gate_tail_ms` past the hit, and the
-    reference may lead the hit's window by `reference_tolerance_ms`. An endpoint wake with
-    less than `endpoint_min_backlog_ms` of audio before it is rejected. `followup_window_ms`
-    above 0 keeps listening without the name after a turn; `attend_cue` sends `attend` at a
-    hit, before the verdict.
+    `names` are lower-case single words the spotter scores. A name hit at or above
+    `kws_threshold` (an endpoint wake at or above `endpoint_threshold`) opens a candidate
+    reaching back at most `lookback_ms`, across speech gaps of at most `join_gap_ms`, and the
+    reference may lead the hit's window by `reference_tolerance_ms`. An endpoint wake with less
+    than `endpoint_min_backlog_ms` of audio before it is rejected. Whether a candidate was said
+    to her is the acoustic verifier's decision; no setting here reads its transcript.
+    `followup_window_ms` above 0 keeps listening without the name after a turn.
     """
 
     names: tuple[str, ...] = ("mist",)
-    phrases: tuple[str, ...] = DEFAULT_WAKE_PHRASES
-    address_starts: tuple[str, ...] = DEFAULT_ADDRESS_STARTS
-    stop_before: tuple[str, ...] = DEFAULT_STOP_BEFORE
-    greetings: tuple[str, ...] = DEFAULT_GREETINGS
     kws_threshold: float = 0.5
     endpoint_threshold: float = 0.5
     lookback_ms: int = 6000
     join_gap_ms: int = 1000
-    gate_tail_ms: int = 300
     reference_tolerance_ms: int = 400
     endpoint_min_backlog_ms: int = 1500
     followup_window_ms: int = 0
-    attend_cue: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,9 +569,6 @@ class _Env:
             return value
 
         return self._read(name, default, parse)
-
-    def phrases_file(self, name: str) -> Mapping[str, tuple[str, ...]]:
-        return self._read(name, {}, _parse_phrases_file)
 
 
 def _parse_non_negative_int(name: str, raw: str) -> int:
@@ -768,41 +696,10 @@ def _parse_names(name: str, raw: str) -> tuple[str, ...]:
     return names
 
 
-def _parse_phrases_file(name: str, raw: str) -> Mapping[str, tuple[str, ...]]:
-    path = _parse_absolute_path(name, raw)
-    try:
-        with open(path, encoding="utf-8") as handle:
-            content = json.load(handle)
-    except OSError as exc:
-        raise ValueError(f"{name}: cannot read {path}: {exc.strerror}") from exc
-    except ValueError as exc:  # json.JSONDecodeError and UnicodeDecodeError
-        raise ValueError(f"{name}: {path} is not valid JSON: {exc}") from exc
-    if not isinstance(content, dict):
-        raise ValueError(f"{name}: {path} must hold a JSON object")
-    unknown = sorted(set(content) - set(_PHRASE_KEYS))
-    if unknown:
-        raise ValueError(
-            f"{name}: {path} has unknown keys {', '.join(unknown)}; "
-            f"expected any of {', '.join(_PHRASE_KEYS)}"
-        )
-    sets: dict[str, tuple[str, ...]] = {}
-    for key, items in content.items():
-        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
-            raise ValueError(f"{name}: {path} key {key!r} must be a list of strings")
-        stripped = tuple(item.strip() for item in items)
-        if "" in stripped:
-            raise ValueError(f"{name}: {path} key {key!r} holds an empty string")
-        sets[key] = stripped
-    for template in sets.get("phrases", ()):
-        if template.count("{name}") != 1:
-            raise ValueError(f"{name}: template {template!r} must hold {{name}} exactly once")
-    return sets
-
-
-def _wake_config(env: _Env, barge_in: BargeInConfig) -> WakeConfig:
+def _wake_config(env: _Env) -> WakeConfig:
     defaults = WakeConfig()
     lookback_limit = MAX_WAKE_BACKLOG_MS - _LOOKBACK_HEADROOM_MS
-    wake = WakeConfig(
+    return WakeConfig(
         names=env.names("MIST_VOICE_WAKE_NAMES", defaults.names),
         kws_threshold=env.probability("MIST_VOICE_KWS_THRESHOLD", defaults.kws_threshold),
         endpoint_threshold=env.probability(
@@ -812,7 +709,6 @@ def _wake_config(env: _Env, barge_in: BargeInConfig) -> WakeConfig:
             "MIST_VOICE_WAKE_LOOKBACK_MS", defaults.lookback_ms, 1, lookback_limit
         ),
         join_gap_ms=env.positive_integer("MIST_VOICE_WAKE_JOIN_GAP_MS", defaults.join_gap_ms),
-        gate_tail_ms=env.positive_integer("MIST_VOICE_WAKE_GATE_TAIL_MS", defaults.gate_tail_ms),
         reference_tolerance_ms=env.positive_integer(
             "MIST_VOICE_WAKE_REFERENCE_TOLERANCE_MS", defaults.reference_tolerance_ms
         ),
@@ -825,16 +721,7 @@ def _wake_config(env: _Env, barge_in: BargeInConfig) -> WakeConfig:
         followup_window_ms=env.integer(
             "MIST_VOICE_FOLLOWUP_WINDOW_MS", defaults.followup_window_ms
         ),
-        attend_cue=env.boolean("MIST_VOICE_WAKE_ATTEND_CUE", defaults.attend_cue),
     )
-    # Arbitration runs during the gate tail, so it must end by the time the tail does.
-    if barge_in.wake_arbitration_ms > wake.gate_tail_ms:
-        raise ValueError(
-            f"MIST_VOICE_WAKE_ARBITRATION_MS: {barge_in.wake_arbitration_ms} ms is longer than "
-            f"MIST_VOICE_WAKE_GATE_TAIL_MS, {wake.gate_tail_ms} ms; arbitration must end within "
-            "the gate tail"
-        )
-    return dataclasses.replace(wake, **env.phrases_file("MIST_VOICE_WAKE_PHRASES_FILE"))
 
 
 def _alarm_stop_keywords(env: _Env, name: str, barge_in: BargeInConfig) -> tuple[str, ...]:
@@ -864,9 +751,19 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     the operator no longer expects it. `MIST_VOICE_TTS_VOICE` is a voice identity id, read
     under `MIST_VOICE_IDENTITY_ROOT`; `MIST_VOICE_CACHE_DIR` is where assets built from it go.
 
-    `MIST_VOICE_WAKE_PHRASES_FILE` is the one variable that names a file: a JSON object with
-    any of `phrases`, `address_starts`, `stop_before` and `greetings`, each a list of strings
-    that replaces that set; a key it omits keeps its default.
+    `MIST_VOICE_VERIFY_MODEL` is the acoustic wake verifier's model id, in the form
+    `MIST_VOICE_KWS_MODEL` takes; unset, no verifier loads, so no wake is accepted and the server
+    spotter is not loaded either. `MIST_VOICE_VERIFY_THREADS` is its onnxruntime intra-op
+    thread count, 1 to 8.
+
+    The variables the transcript wake gate read (`MIST_VOICE_WAKE_PHRASES_FILE`,
+    `MIST_VOICE_WAKE_GATE_TAIL_MS`, `MIST_VOICE_WAKE_ALIAS_WINDOW_MS` and
+    `MIST_VOICE_WAKE_TRAILING_SPEECH_MS`) are not read either, so an old `.env` still starts;
+    one INFO line names each that is set. Nor is `MIST_VOICE_WAKE_ATTEND_CUE`: the controller
+    sends no `attend` at a hit, and an accepted wake's cue is the `listen` it sends at
+    acceptance, so there is nothing left to switch. Unlike the per-slot variables these are not
+    refused: those name an engine slot the operator expects to work, while these name a decision
+    the acoustic verifier now makes.
 
     `MIST_VOICE_CHARACTER` (default true) runs every spoken reply through the character stage, a
     `CharacterConfig` with every field at its default except `double_gain`; false turns off the
@@ -881,6 +778,16 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     """
     env = _Env(environ)
     env.refuse_removed(_REMOVED_PER_SLOT)
+    retired = (
+        "MIST_VOICE_WAKE_PHRASES_FILE",
+        "MIST_VOICE_WAKE_GATE_TAIL_MS",
+        "MIST_VOICE_WAKE_ALIAS_WINDOW_MS",
+        "MIST_VOICE_WAKE_TRAILING_SPEECH_MS",
+        "MIST_VOICE_WAKE_ATTEND_CUE",
+    )
+    retired_set = [name for name in retired if name in environ]
+    if retired_set:
+        logger.info("Not read, retired with the transcript wake gate: %s", ", ".join(retired_set))
     defaults = EndpointingConfig()
     endpointing = EndpointingConfig(
         vad_threshold=env.probability("MIST_VOICE_VAD_THRESHOLD", defaults.vad_threshold),
@@ -956,6 +863,13 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
             f"a model id matching {_ID_FORM}",
         ),
         kws_threads=env.positive_integer("MIST_VOICE_KWS_THREADS", place.kws_threads),
+        verify_model=env.pattern(
+            "MIST_VOICE_VERIFY_MODEL",
+            place.verify_model,
+            _ID,
+            f"a model id matching {_ID_FORM}",
+        ),
+        verify_threads=env.bounded_integer("MIST_VOICE_VERIFY_THREADS", place.verify_threads, 1, 8),
     )
     turn = TurnConfig(
         tool_cancel_grace_ms=env.integer(
@@ -970,6 +884,6 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         segmenter=segmenter,
         placement=placement,
         turn=turn,
-        wake=_wake_config(env, barge_in),
+        wake=_wake_config(env),
         profile=env.text("VOICE_PROFILE", VoiceSettings().profile),
     )

@@ -62,6 +62,7 @@ from backend.realtime.ingress import (
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
+    WakeVerified,
 )
 from backend.realtime.lanes import LaneJobCancelled
 from backend.realtime.playback import LanePurge, TurnLane
@@ -82,7 +83,7 @@ from backend.realtime.turn import (
     WakeArbitration,
     WakeRank,
 )
-from tests.fakes.speech import FakeSynthesizer
+from tests.fakes.speech import FakeSynthesizer, ScriptedWakeVerifier
 
 # -- Clock and ids -------------------------------------------------------------
 
@@ -421,8 +422,8 @@ class RecordingIngress:
         self.first_pos[uid] = from_pos
         return OpenedUtterance(uid, from_pos)
 
-    def request_gate_partial(self, utterance_id: str, through_pos: int) -> None:
-        self.calls.append(("request_gate_partial", utterance_id, through_pos))
+    def request_verify(self, utterance_id: str, hit_pos: int) -> None:
+        self.calls.append(("request_verify", utterance_id, hit_pos))
 
     def set_engaged(self, engaged: bool) -> None:
         self.calls.append(("set_engaged", engaged))
@@ -465,15 +466,7 @@ class RecordingIngress:
     def resumed(self, uid: str) -> SpeechResumed:
         return SpeechResumed(self.epoch, self._next_seq(), uid, self._pos(uid))
 
-    def partial(
-        self,
-        uid: str,
-        text: str,
-        *,
-        heard_at_ms: int = 0,
-        gate: bool = False,
-        through_pos: int | None = None,
-    ) -> TranscriptPartial:
+    def partial(self, uid: str, text: str, *, heard_at_ms: int = 0) -> TranscriptPartial:
         return TranscriptPartial(
             epoch=self.epoch,
             event_seq=self._next_seq(),
@@ -484,8 +477,6 @@ class RecordingIngress:
             heard_at_ms=heard_at_ms,
             audio_end_pos=self._pos(uid) + 10,
             uncovered_since_ms=heard_at_ms,
-            gate=gate,
-            through_pos=through_pos,
         )
 
     def heard(
@@ -551,10 +542,20 @@ class RecordingIngress:
     def overload(self, lane: str = "vad", dropped_ms: int = 120) -> IngressOverload:
         return IngressOverload(self.epoch, self._next_seq(), lane, dropped_ms, None, None)
 
+    def verified(self, uid: str, *, hit_pos: int = 110, score: float | None = 0.9) -> WakeVerified:
+        """The verifier's score for the hit at `hit_pos`; None as ingress sends on any failure."""
+        return WakeVerified(self.epoch, self._next_seq(), uid, hit_pos, score)
 
-def default_gate(config: WakeConfig | None = None) -> AddresseeGate:
-    """An addressee gate built from the defaults (v5)."""
-    return AddresseeGate(config or WakeConfig(), echo_guard_ms=BargeInConfig().echo_guard_ms)
+
+def default_gate(
+    config: WakeConfig | None = None, thresholds: AddresseeGate.Thresholds | None = None
+) -> AddresseeGate:
+    """An addressee gate built from the defaults (v5), with the verifier's `thresholds`."""
+    return AddresseeGate(
+        config or WakeConfig(),
+        echo_guard_ms=BargeInConfig().echo_guard_ms,
+        thresholds=thresholds,
+    )
 
 
 # -- The responder ------------------------------------------------------------------------
@@ -846,6 +847,7 @@ class Harness:
     policy: KeywordBargeIn
     kwargs: dict[str, object]
     aec: AecMode = "headset"
+    verifier: ScriptedWakeVerifier | None = None
 
     @property
     def lane(self) -> InlineLane:
@@ -923,13 +925,17 @@ def make_harness(
     id_prefix: str = "u",
     aec: AecMode = "headset",
     alarm_ringing: Callable[[], bool] | None = None,
+    verifier: ScriptedWakeVerifier | None | bool = True,
 ) -> Harness:
     """A controller wired to every fake; `synthesizer=False` builds one with no TTS.
 
     `wake` configures the gate and the controller alike. With `solo=False` every wake claim waits
     until the test grants or denies it, as it would with two sessions registered. `arbiter`, when
     given, is wired in place of the fake one, so two harnesses can share one real `WakeArbiter`;
-    `Harness.arbiter` is then a `FakeWakeArbiter` nothing calls.
+    `Harness.arbiter` is then a `FakeWakeArbiter` nothing calls. `verifier` supplies the
+    thresholds the gate and the controller read: by default a `ScriptedWakeVerifier`, 0.5 for
+    every cutoff; `verifier=None` wires none, so every wake fails closed. Its scores are never
+    read here: a test posts each `WakeVerified` itself.
     """
     clock = FakeClock()
     ids = IdCounter(id_prefix)
@@ -948,11 +954,20 @@ def make_harness(
     host = FakeHost()
     wake_config = wake or WakeConfig()
     barge = barge_in or BargeInConfig(arm_delay_ms=0)
+    wake_verifier: ScriptedWakeVerifier | None
+    if verifier is True:
+        wake_verifier = ScriptedWakeVerifier()
+    elif verifier is False or verifier is None:
+        wake_verifier = None
+    else:
+        wake_verifier = verifier
+    thresholds = wake_verifier.threshold_at if wake_verifier is not None else None
     built: list[TurnController] = []
     # The session's wiring: the policy's echo guard reads the controller's played text.
     policy = KeywordBargeIn(
         barge,
         aec=aec,
+        names=wake_config.names,
         recent_tts_text=lambda ms: built[0].recent_tts_text(ms),
         clock=clock,
     )
@@ -963,7 +978,8 @@ def make_harness(
         "host": host,
         "placement": placement or floor_placement,
         "arbiter": fake_arbiter if arbiter is None else arbiter,
-        "gate": default_gate(wake_config),
+        "gate": default_gate(wake_config, thresholds),
+        "thresholds": thresholds,
         "wake": wake_config,
         "calibration": calibration,
         "hit_lag_ms": hit_lag_ms,
@@ -1000,4 +1016,5 @@ def make_harness(
         policy=policy,
         kwargs=kwargs,
         aec=aec,
+        verifier=wake_verifier,
     )

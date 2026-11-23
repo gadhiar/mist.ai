@@ -1705,11 +1705,12 @@ async def test_ingress_and_controller_ids_come_from_one_counter():
     opened = ingress.open_utterance("wake", 10)
     minted = ids()
     ingress.set_engaged(True)
-    ingress.request_gate_partial(opened.utterance_id, 20)
+    ingress.request_verify(opened.utterance_id, 20)
 
     assert opened.utterance_id != minted
     assert ids.issued == [opened.utterance_id, minted]
     assert ("set_engaged", True) in ingress.calls
+    assert ("request_verify", opened.utterance_id, 20) in ingress.calls
     h = make_harness()
     assert h.kwargs["new_utterance_id"] is h.ids
     assert h.ingress.ids is h.ids
@@ -3018,7 +3019,7 @@ EVERY_KIND = frozenset(
         "SpeechStarted",
         "SpeechResumed",
         "TranscriptPartial",
-        "TranscriptPartial(gate)",
+        "WakeVerified",
         "EndpointCandidate",
         "UtteranceEnded",
         "UtteranceDropped",
@@ -3113,7 +3114,7 @@ async def test_the_cut_checks_accept_a_supersede_and_catch_each_mismatch():
     await h.settle()
     h.post(h.ingress.heard(uid, hit_pos=110))
     await h.settle()
-    h.post(h.ingress.partial(uid, "mist, and then", gate=True, through_pos=125))
+    h.post(h.ingress.verified(uid, hit_pos=110, score=0.9))
     await h.settle()
 
     sent = list(h.outbound.sent)
@@ -3209,7 +3210,7 @@ class Interleaving:
         self.read = 0
         self.applies = 0
         self.open_uid: str | None = None
-        self.gate_asks: list[tuple[str, int]] = []
+        self.verify_asks: list[tuple[str, int]] = []
         self.failures: list[str] = []
         self.committed: list[int] = []
         self.outcomes: list[str] = []
@@ -3273,7 +3274,7 @@ class Interleaving:
         self.ingress = ingress
         self.read = 0
         self.open_uid = None
-        self.gate_asks = []
+        self.verify_asks = []
 
     def _sync(self) -> None:
         """Follow the levers the controller pulled, and a reconfigure it applied."""
@@ -3291,8 +3292,8 @@ class Interleaving:
                 self.open_uid = str(call[3])
             elif call[0] == "drop" and call[1] == self.open_uid:
                 self.open_uid = None
-            elif call[0] == "request_gate_partial":
-                self.gate_asks.append((str(call[1]), int(call[2])))  # type: ignore[call-overload]
+            elif call[0] == "request_verify":
+                self.verify_asks.append((str(call[1]), int(call[2])))  # type: ignore[call-overload]
         self.read = len(ingress.calls)
 
     def _new_start(self) -> VoiceStart:
@@ -3338,12 +3339,14 @@ class Interleaving:
         self.h.post(ingress.dropped(uid, self.rng.choice(["noise", "no_speech", "muted"])))
         return "UtteranceDropped"
 
-    def _gate_partial(self) -> str | None:
-        if self.ingress is None or not self.gate_asks:
+    def _verified(self) -> str | None:
+        """The verifier's score for an asked hit: above the threshold, below it, or none."""
+        if self.ingress is None or not self.verify_asks:
             return None
-        uid, through = self.gate_asks.pop(0)
-        self.h.post(self.ingress.partial(uid, self._text(), gate=True, through_pos=through))
-        return "TranscriptPartial(gate)"
+        uid, hit_pos = self.verify_asks.pop(0)
+        score = self.rng.choice([0.9, 0.9, 0.1, None])
+        self.h.post(self.ingress.verified(uid, hit_pos=hit_pos, score=score))
+        return "WakeVerified"
 
     def _name(self) -> str | None:
         if self.ingress is None:
@@ -3400,7 +3403,10 @@ class Interleaving:
             self.h.post(Interrupt())
             return "Interrupt"
         if roll < 0.55:
-            self.h.post(Mute(active=self.rng.random() < 0.5))
+            active = self.rng.random() < 0.5
+            self.h.post(Mute(active=active))
+            if active:
+                self.verify_asks.clear()  # a muted ingress scores and emits nothing
             return "Mute"
         if roll < 0.7:
             self.h.post(VoiceStop())
@@ -3441,10 +3447,10 @@ class Interleaving:
         return "advance"
 
     def _cut_in(self) -> str | None:
-        """Her name while a turn thinks, which the next two steps grant and gate as addressed.
+        """Her name while a turn thinks, which the next two steps grant and verify as addressed.
 
-        Random names rarely meet a turn still `thinking` and then win a grant and an addressed
-        gate decode in turn, so without this no seed superseded a turn (A51). The turn's script
+        Random names rarely meet a turn still `thinking` and then win a grant and an accepting
+        score in turn, so without this no seed superseded a turn (A51). The turn's script
         decides whether it is superseded (no audio yet) and kept or committed (T55d).
         """
         if self.ingress is None or self.h.controller.phase != "thinking":
@@ -3461,18 +3467,18 @@ class Interleaving:
         return "NameHeard(server)"
 
     def _cut_in_next(self) -> str | None:
-        """The cut-in's grant, then its addressed gate decode; None once neither applies."""
+        """The cut-in's grant, then its accepting score; None once neither applies."""
         if self.cut_in == "grant":
             waiting = [claim for claim in self.h.arbiter.claims if not claim.answered]
             if waiting:
                 self.h.arbiter.grant(waiting[-1].claim_id)
-                self.cut_in = "gate"
+                self.cut_in = "verify"
                 return "WakeVerdict"
-        elif self.cut_in == "gate" and self.ingress is not None and self.gate_asks:
-            uid, through = self.gate_asks.pop(0)
-            self.h.post(self.ingress.partial(uid, "mist, and then", gate=True, through_pos=through))
+        elif self.cut_in == "verify" and self.ingress is not None and self.verify_asks:
+            uid, hit_pos = self.verify_asks.pop()
+            self.h.post(self.ingress.verified(uid, hit_pos=hit_pos, score=0.9))
             self.cut_in = None
-            return "TranscriptPartial(gate)"
+            return "WakeVerified"
         self.cut_in = None
         return None
 
@@ -3481,7 +3487,7 @@ class Interleaving:
     async def step(self) -> None:
         actions: list[Callable[[], str | None]] = [
             self._speech,
-            self._gate_partial,
+            self._verified,
             self._name,
             self._overload,
             self._old_epoch,

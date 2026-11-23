@@ -34,9 +34,10 @@ from .turn_fakes import Pause
 AUDIO_COMPLETE = 0x02
 AUDIO_FADE = 0x03
 
-# "mist, ..." said after 200 ms of room tone: the name ends 200 ms into a 1.2 s burst.
-NAMED = [silence(200), speech_burst(1200), silence(600)]
-NAME_AT_MS = 400
+# "mist, ..." said after 600 ms of room tone: the name ends 200 ms into a 1.2 s burst.
+# The lead-in covers the wake verifier's 800 ms `min_window_ms` around the hit.
+NAMED = [silence(600), speech_burst(1200), silence(600)]
+NAME_AT_MS = 800
 
 
 # -- The rules every connection keeps ------------------------------------------------------------
@@ -297,9 +298,13 @@ def test_other_speech_while_she_speaks_sends_nothing(voice_server):
         assert_protocol_rules(client)
 
 
-def test_stop_while_thinking_ends_the_turn_with_an_empty_response(voice_server):
-    """v1 scenario 6 with v2's change: `stop` closes with `dropped keyword`, no new turn."""
-    stack = VoiceStack(transcripts=["mist, what's the weather", "stop"])
+@pytest.mark.parametrize("second", ["stop", "mist, stop"])
+def test_stop_while_thinking_ends_the_turn_with_an_empty_response(voice_server, second):
+    """v1 scenario 6 with v2's change: `stop` closes with `dropped keyword`, no new turn.
+
+    Her name before the keyword, unmarked by the spotter so nothing supersedes, ends the same way.
+    """
+    stack = VoiceStack(transcripts=["mist, what's the weather", second])
     pause = Pause()
     with voice_server(stack) as srv, srv.connect() as client:
         srv.responder.add(pause, Token("Sure."))
@@ -403,7 +408,7 @@ def test_a_reconfigure_waits_for_the_turn_and_voice_stop_cuts_and_closes(voice_s
 
         # An utterance open: `voice_stop` closes it with `dropped voice_stop`.
         client.send(voice_start(3))
-        client.say([silence(200), speech_burst(1200)], name_at_ms=NAME_AT_MS)
+        client.say([silence(600), speech_burst(1200)], name_at_ms=NAME_AT_MS)
         open_id = client.of("transcript_partial")[-1]["utterance_id"]
         client.send({"type": "voice_stop"})
         dropped = one(client, "dropped", reason="voice_stop")
@@ -437,7 +442,7 @@ def test_speculative_starts_are_cancelled_by_resumed_speech_and_released_at_the_
     with voice_server(stack) as srv, srv.connect() as client:
         client.send(voice_start(1))
         client.say(
-            [silence(200), speech_burst(1200), silence(400), speech_burst(600), silence(2000)],
+            [silence(600), speech_burst(1200), silence(400), speech_burst(600), silence(2000)],
             name_at_ms=NAME_AT_MS,
         )
         metrics = finish(client)
@@ -500,6 +505,41 @@ def test_a_name_while_she_thinks_supersedes_the_turn(voice_server):
         ]
         assert [commit.outcome for commit in srv.responder.commits] == ["completed"]
         assert metrics["turn_id"] != first and metrics["outcome"] == "completed"
+        assert_protocol_rules(client)
+
+
+def test_mist_stop_while_she_thinks_supersedes_the_turn_and_starts_none(voice_server):
+    """The name heard on "mist, stop" supersedes the thinking turn, and the end, her name then a
+    keyword alone, cancels the held turn from it: the first turn is recorded on its own, empty,
+    and no second turn reaches the model or the client.
+    """
+    stack = VoiceStack(transcripts=["mist, what's the weather", "mist, stop"])
+    pause = Pause()
+    with voice_server(stack) as srv, srv.connect() as client:
+        srv.responder.add(pause, Token("It is sunny."))
+        srv.responder.add(Pause())
+        client.send(voice_start(1))
+        client.say(NAMED, name_at_ms=NAME_AT_MS)
+        (first,) = (item["turn_id"] for item in client.of("state_cycle", state="think"))
+        client.say(NAMED, name_at_ms=NAME_AT_MS)
+        srv.run(pause.release)
+
+        supersede = one(client, "supersede", turn_id=first)
+        assert supersede["detail"] == {"merged": True, "tool_dispatched": False}
+        dropped = one(client, "dropped")
+        assert dropped["reason"] == "keyword"
+        (said_first,) = (item["utterance_id"] for item in client.of("transcription"))
+        (said_second,) = {item["utterance_id"] for item in client.of("transcript_partial")} - {
+            said_first
+        }
+        assert dropped["detail"]["utterance_id"] == said_second
+        # Only the first utterance's held turn is released; the second's is cancelled unseen.
+        assert [item["detail"]["utterance_id"] for item in client.of("release")] == [said_first]
+        assert [(c.outcome, c.delivered_text) for c in srv.responder.commits] == [
+            ("superseded", "")
+        ]
+        assert_no_second_turn(srv, client)
+        assert client.of("stream_token") == []
         assert_protocol_rules(client)
 
 
@@ -751,7 +791,7 @@ def test_mute_closes_the_open_utterance_and_holds_until_unmute(voice_server):
     pause = Pause()
     with voice_server(stack) as srv, srv.connect() as client:
         client.send(voice_start(1))
-        client.say([silence(200), speech_burst(1200)], name_at_ms=NAME_AT_MS)
+        client.say([silence(600), speech_burst(1200)], name_at_ms=NAME_AT_MS)
         open_id = client.of("transcript_partial")[-1]["utterance_id"]
         srv.responder.add(Token("Typed reply."), pause, Token(" Done."))
         client.send({"type": "mute", "active": True})
@@ -828,8 +868,8 @@ def test_a_muted_client_reconnects_muted(voice_server):
         assert_protocol_rules(before)
 
 
-def test_a_greeting_and_a_leading_name_each_open_a_turn_attend_first(voice_server):
-    """v5 scenario 18."""
+def test_a_greeting_and_a_leading_name_each_open_a_turn_listen_first(voice_server):
+    """v5 scenario 18: no `attend` at the hit; `listen` is the first state, at acceptance."""
     texts = ["hey mist, how's it going", "mist, what's up"]
     stack = VoiceStack(transcripts=texts)
     with voice_server(stack) as srv, srv.connect() as client:
@@ -839,7 +879,8 @@ def test_a_greeting_and_a_leading_name_each_open_a_turn_attend_first(voice_serve
             client.say(NAMED, name_at_ms=NAME_AT_MS)
             finish(client)
             states = [name for name in after(client, mark) if name.startswith("state:")]
-            assert states[:2] == ["state:attend", "state:listen"]
+            assert states[0] == "state:listen"
+            assert "state:attend" not in states
             assert client.of("transcription")[-1]["text"] == text
 
         assert [request.user_text for request in srv.responder.requests] == texts
@@ -847,10 +888,15 @@ def test_a_greeting_and_a_leading_name_each_open_a_turn_attend_first(voice_serve
         assert_protocol_rules(client)
 
 
-def test_the_name_inside_other_speech_leaves_only_attend_rejected_idle(voice_server, caplog):
-    """v5 scenario 19: neither sentence addresses her, so nothing of either travels."""
+def test_the_name_inside_other_speech_leaves_only_its_rejection(voice_server, caplog):
+    """v5 scenario 19: neither sentence addresses her, so nothing of either travels.
+
+    The verifier decides: its scripted scores for the two hits fall below the threshold.
+    """
     texts = ["I missed it", "the mist rolled in"]
     stack = VoiceStack(transcripts=texts)
+    assert stack.verifier is not None
+    stack.verifier.scores = [0.1, 0.2]
     caplog.set_level(logging.DEBUG)
     with voice_server(stack) as srv, srv.connect() as client:
         client.send(voice_start(1))
@@ -858,8 +904,7 @@ def test_the_name_inside_other_speech_leaves_only_attend_rejected_idle(voice_ser
         for _ in texts:
             client.say(NAMED, name_at_ms=NAME_AT_MS)
 
-        each = ["state:attend", "decision:wake_rejected", "state:idle"]
-        assert after(client, mark) == each * 2
+        assert after(client, mark) == ["decision:wake_rejected"] * 2
         assert [item["reason"] for item in client.of("wake_rejected")] == ["not_addressed"] * 2
         for word in ("missed", "rolled"):
             assert word not in caplog.text
@@ -889,7 +934,7 @@ def test_the_name_in_the_pcs_own_playback_is_self_media(voice_server):
             [silence(1400), speech_burst(1200), silence(600)], name_at_ms=1600, reference=reference
         )
 
-        assert after(client, mark) == ["state:attend", "decision:wake_rejected", "state:idle"]
+        assert after(client, mark) == ["decision:wake_rejected"]
         assert one(client, "wake_rejected")["reason"] == "self_media"
         assert srv.responder.requests == []
         assert_protocol_rules(client)

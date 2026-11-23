@@ -325,7 +325,11 @@ class FakeOrtFail(Exception):  # noqa: N818
 
 
 class FakeParakeetModel:
-    """An onnx-asr model: one word of `words` per 200 ms of audio, or scripted replies."""
+    """onnx-asr's text adapter, as `load_model` returns it: the decode is a plain string.
+
+    One word of `words` per 200 ms of audio, padded with spaces the adapter strips, or scripted
+    replies. It has only `recognize`, so a load that asks it for another adapter fails.
+    """
 
     def __init__(self, words=WORDS, replies: list[str] | None = None) -> None:
         self.words = tuple(words)
@@ -334,7 +338,7 @@ class FakeParakeetModel:
         self.fail: BaseException | None = None
         self.on_recognize: Callable[[], object] | None = None
 
-    def recognize(self, waveform, **kwargs):
+    def recognize(self, waveform, **kwargs) -> str:
         self.calls.append((np.array(waveform, copy=True), kwargs))
         if self.on_recognize is not None:
             self.on_recognize()
@@ -1010,6 +1014,17 @@ class TestParakeetDecoding:
         assert stream.decode_partial(CancelToken()).text == ""
         assert stream.decode_final(CancelToken()).text == ""
         assert env.model.calls == []
+
+    def test_the_text_is_the_librarys_string_stripped(self, tmp_path):
+        env = make_parakeet(tmp_path, FakeParakeetModel(replies=["  Mist, what's the time?  "]))
+        stream = env.load().open_stream()
+        push_frames(stream, tone(1.0))
+
+        partial = stream.decode_partial(CancelToken())
+        final = stream.decode_final(CancelToken())
+
+        assert (partial.text, final.text) == ("Mist, what's the time?",) * 2
+        assert final.stable_chars == len("Mist, what's the time?")
 
     def test_onnxruntime_errors_become_speech_engine_errors(self, tmp_path):
         env = make_parakeet(tmp_path)

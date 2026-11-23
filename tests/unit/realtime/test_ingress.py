@@ -10,6 +10,7 @@ speech onset falls on a window boundary and its position is exact.
 """
 
 import asyncio
+import dataclasses
 import itertools
 import logging
 import typing
@@ -23,6 +24,7 @@ from backend.realtime import ingress as ingress_module
 from backend.realtime.budget import EndpointingConfig, TurnConfig, WakeConfig
 from backend.realtime.errors import SpeechEngineError
 from backend.realtime.ingress import (
+    KWS_BACKLOG_FRAMES,
     AudioIngress,
     ControllerDropReason,
     DropReason,
@@ -31,6 +33,7 @@ from backend.realtime.ingress import (
     IngressLanes,
     IngressOverload,
     IngressSeed,
+    IngressStats,
     NameHeard,
     OpenedUtterance,
     SegmentStep,
@@ -40,7 +43,8 @@ from backend.realtime.ingress import (
     TranscriptPartial,
     UtteranceDropped,
     UtteranceEnded,
-    onset_feed_start,
+    WakeVerified,
+    name_chain_start,
     onset_lead_frames,
     ring_retention_ms,
 )
@@ -51,10 +55,12 @@ from tests.fakes.scripted_audio import scripted_audio, silence, speech_burst, to
 from tests.fakes.speech import (
     EnergyVad,
     ScriptedNameSpotter,
+    ScriptedNameSpotterStream,
     ScriptedTranscriber,
     ScriptedTranscriptStream,
     ScriptedTurnEnd,
     ScriptedUtterance,
+    ScriptedWakeVerifier,
 )
 
 FRAME_MS = 20
@@ -203,14 +209,17 @@ class Rig:
         seed: IngressSeed | None = None,
         engaged: bool = True,
         lanes: IngressLanes | None = None,
+        verifier: ScriptedWakeVerifier | None = None,
     ) -> None:
         self.clock = FakeClock()
         self.vad = EnergyVad()
         self.transcriber = transcriber or ScriptedTranscriber(["hello there"], ms_per_word=20)
         self.turn_end = ScriptedTurnEnd([0.9]) if turn_end == "default" else turn_end
         self.spotter = spotter
+        self.verifier = verifier
+        self.verify_lane = StepLane()
         self.lanes = lanes or IngressLanes(
-            vad=StepLane(), stt=StepLane(), eot=StepLane(), kws=StepLane()
+            vad=StepLane(), stt=StepLane(), eot=StepLane(), kws=StepLane(), verify=self.verify_lane
         )
         self.events: list[object] = []
         self.emitted_at: list[int] = []
@@ -220,6 +229,7 @@ class Rig:
                 transcriber=self.transcriber,
                 turn_end=self.turn_end,  # type: ignore[arg-type]
                 spotter=self.spotter,
+                verifier=self.verifier,
             ),
             lanes=self.lanes,
             endpointing=endpointing or EndpointingConfig(),
@@ -237,6 +247,11 @@ class Rig:
         self.pos = seed.frames[-1][0] + 1 if seed is not None and seed.frames else 0
         self.seq = 0
         self.arrivals: dict[int, int] = {}
+        self.payloads: dict[int, bytes] = {}
+
+    def wire(self, positions: range) -> bytes:
+        """The uplink bytes pushed at `positions`, joined in order."""
+        return b"".join(self.payloads[pos] for pos in positions)
 
     def _emit(self, event: object) -> None:
         self.events.append(event)
@@ -254,6 +269,7 @@ class Rig:
             self.ingress.push_reference(self.seq, reference)
         self.ingress.push_frame(Frame(MsgType.MIC_AUDIO, 0, self.seq, 16000, pcm), pos)
         self.arrivals[pos] = self.clock.now
+        self.payloads[pos] = pcm
         self.pos += 1
         self.seq += 1
         if settle_after:
@@ -387,7 +403,7 @@ class TestDormantListening:
         assert rig.ingress.idle_since() == 0
 
     @pytest.mark.asyncio
-    async def test_the_spotter_hears_the_speech_and_its_pre_roll_and_no_other_silence(self):
+    async def test_the_spotter_hears_every_frame_speech_and_silence_alike(self):
         spotter = ScriptedNameSpotter()
         rig = Rig(engaged=False, spotter=spotter)
 
@@ -395,10 +411,8 @@ class TestDormantListening:
         await rig.speak(640)
         await rig.quiet(1600)
 
-        pushed = spotter.streams[0].pushed
-        assert pushed == list(range(32 - PRE_ROLL, pushed[-1] + 1))
-        # The segment closes once 200 ms of silence follow the last speech window (frame 63).
-        assert pushed[-1] < 64 + 12
+        # Silence before the pre-roll and after the segment closed is pushed as speech is.
+        assert spotter.streams[0].pushed == list(range(rig.pos))
 
     @pytest.mark.asyncio
     async def test_set_engaged_makes_the_next_speech_open_an_utterance(self):
@@ -514,7 +528,6 @@ class TestPartials:
         assert first.uncovered_since_ms == rig.arrivals[first.first_pos]
         assert second.uncovered_since_ms == rig.arrivals[first.audio_end_pos + 1]
         assert second.heard_at_ms == rig.arrivals[second.audio_end_pos]
-        assert first.gate is False and first.through_pos is None
 
     @pytest.mark.asyncio
     async def test_heard_at_is_the_arrival_of_the_last_frame_the_partial_covers(self):
@@ -1231,14 +1244,16 @@ class TestSeed:
 
 class TestNameHeard:
     @pytest.mark.asyncio
-    async def test_a_name_last_in_one_segment_opens_at_the_segment_less_the_pre_roll(self):
+    async def test_a_name_last_in_one_segment_opens_at_the_window_less_the_pre_roll(self):
         rig = Rig(engaged=False, spotter=ScriptedNameSpotter([hit_at(78)]))
         await rig.quiet(640)
 
         await rig.speak(960)
 
         (heard,) = rig.of(NameHeard)
-        assert heard.from_pos == 32 - PRE_ROLL
+        # The spotter's 1280 ms window (64 frames) and the pre-roll reach back past the
+        # segment's pre-roll, to 78 - 64 - 15, and the first frame bounds that.
+        assert heard.from_pos == 0
         assert heard.hit == hit_at(78)
         assert (heard.utterance_id, heard.reference_score, heard.spotter) == (None, None, "server")
         assert heard.arrival == rig.arrivals[78]
@@ -1263,7 +1278,8 @@ class TestNameHeard:
 
         await rig.speak(640)
 
-        assert [h.from_pos for h in rig.of(NameHeard)] == [112 - PRE_ROLL]
+        # The first segment is not chained and ended before the window less the pre-roll.
+        assert [h.from_pos for h in rig.of(NameHeard)] == [140 - 64 - PRE_ROLL]
 
     @pytest.mark.asyncio
     async def test_a_preamble_longer_than_the_lookback_opens_6000_ms_before_the_hit(self):
@@ -1303,19 +1319,419 @@ class TestNameHeard:
         await rig.speak(640)
 
         assert rig.of(NameHeard) == []
-        assert spotter.streams == [] or spotter.streams[0].pushed == []
+        # Only the frames from before the mute reach the spotter.
+        assert spotter.streams[0].pushed == list(range(32))
+
+
+class LoggedStream(ScriptedNameSpotterStream):
+    """A scripted stream that also logs its calls in order, so pushes and resets interleave."""
+
+    def __init__(self, hits: Sequence[NameHit], threshold: float, log: list) -> None:
+        super().__init__(hits, threshold)
+        self.log = log
+
+    def push(self, pcm: bytes, pos: int) -> list[NameHit]:
+        self.log.append(("push", pos))
+        return super().push(pcm, pos)
+
+    def reset(self, *, warm_up: bool = True) -> None:
+        self.log.append(("reset", warm_up))
+        super().reset(warm_up=warm_up)
+
+
+class LoggedSpotter(ScriptedNameSpotter):
+    """A scripted spotter whose streams share one ordered log of their calls."""
+
+    def __init__(self, hits: Sequence[NameHit] = ()) -> None:
+        super().__init__(hits)
+        self.log: list[tuple[str, object]] = []
+
+    def open_stream(self, threshold: float) -> LoggedStream:
+        stream = LoggedStream(self.hits, threshold, self.log)
+        self.streams.append(stream)
+        return stream
+
+
+def fed_positions(log: Sequence[tuple[str, object]]) -> list[int]:
+    """Every position pushed, in the order the spotter was fed them."""
+    return [typing.cast(int, pos) for kind, pos in log if kind != "reset"]
+
+
+class TestTheSpotterHearsEveryFrame:
+    """Ingress pushes the spotter every frame once and in order, and reports every hit."""
 
     @pytest.mark.asyncio
-    async def test_a_spotter_job_that_misses_its_hop_is_skipped_and_reported_on_kws(self):
-        rig = Rig(engaged=False, spotter=ScriptedNameSpotter())
-        rig.lanes.kws.holding = True
+    async def test_every_frame_in_and_between_segments_is_pushed_with_no_reset(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+
         await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(1600)
+        await rig.speak(640)
+        await rig.quiet(400)
+
+        (stream,) = spotter.streams
+        assert stream.resets == 0
+        assert {kind for kind, _ in spotter.log} == {"push"}
+        assert fed_positions(spotter.log) == stream.pushed == list(range(rig.pos))
+
+    @pytest.mark.asyncio
+    async def test_each_frame_is_pushed_as_soon_as_it_is_routed(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        # Frames 32 to 35 are scored as two speech windows: a run, not yet a segment.
+        await rig.speak(80)
+        (stream,) = spotter.streams
+        assert stream.pushed == list(range(36))
+
+        # Frame 36 completes the third window, and the segment opens at frame 32.
+        await rig.speak(20)
+
+        assert stream.pushed == list(range(37))
+
+    @pytest.mark.asyncio
+    async def test_every_frame_the_ring_holds_is_pushed_once_the_vad_queue_s_drops_too(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        for _ in range(150):
+            await rig.quiet(20, settle_after=False)
+        await settle(500)
+
+        await rig.quiet(640)
+
+        assert rig.ingress.stats().queue_dropped_frames == 50
+        assert {kind for kind, _ in spotter.log} == {"push"}
+        assert fed_positions(spotter.log) == list(range(rig.pos))
+
+    @pytest.mark.asyncio
+    async def test_a_hit_in_silence_with_no_segment_is_reported_with_its_window(self):
+        spotter = LoggedSpotter([hit_at(90)])
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(2000)
+
+        (heard,) = rig.of(NameHeard)
+        assert heard.hit == hit_at(90)
+        assert heard.from_pos == 90 - 64 - PRE_ROLL
+
+    @pytest.mark.asyncio
+    async def test_a_hit_in_silence_after_a_segment_closed_is_reported_and_chained(self):
+        spotter = LoggedSpotter([hit_at(100)])
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(1600)
+
+        # The segment (32 to about 63) closed before frame 100, less than 1000 ms before it.
+        (heard,) = rig.of(NameHeard)
+        assert heard.hit == hit_at(100)
+        assert heard.from_pos == 32 - PRE_ROLL
+
+    @pytest.mark.asyncio
+    async def test_a_hit_in_a_pre_roll_is_reported_as_it_is_heard(self):
+        spotter = LoggedSpotter([hit_at(95)])
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(2000)
+
+        (heard,) = rig.of(NameHeard)
+        await rig.speak(640)
+
+        # Reported before the onset at frame 100 that makes frame 95 pre-roll, so with no
+        # segment yet it spans the window less the pre-roll.
+        assert rig.of(NameHeard) == [heard]
+        assert heard.from_pos == 95 - 64 - PRE_ROLL
+
+    @pytest.mark.asyncio
+    async def test_a_mute_resets_the_stream_and_no_frame_from_before_it_is_fed_after_it(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+
+        rig.ingress.set_muted(True)
+        await rig.quiet(200)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+        await rig.quiet(640)
+
+        log = spotter.log
+        assert [entry for entry in log if entry[0] == "reset"] == [("reset", True)]
+        reset_at = log.index(("reset", True))
+        before = fed_positions(log[:reset_at])
+        after = fed_positions(log[reset_at + 1 :])
+        assert before == list(range(32))
+        assert after and after == list(range(unmuted_at, unmuted_at + len(after)))
+        assert len(spotter.streams) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hit_from_a_job_that_ran_across_a_mute_and_a_short_unmute_is_dropped(self):
+        spotter = LoggedSpotter([hit_at(48)])
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        await rig.speak(320)
+        rig.lanes.kws.holding = True
+        await rig.speak(20)
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        rig.lanes.kws.release()
+        await settle()
+
+        assert 48 in spotter.streams[0].pushed
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_frames_the_vad_queue_dropped_are_fed(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        for _ in range(150):
+            await rig.quiet(20, settle_after=False)
+        await settle(500)
+
+        await rig.quiet(640)
+
+        assert rig.ingress.stats().queue_dropped_frames == 50
+        fed = fed_positions(spotter.log)
+        assert fed[:60] == list(range(60))
+
+    @pytest.mark.asyncio
+    async def test_frames_that_arrive_during_a_slow_job_are_fed_by_the_next_job(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        await rig.speak(320)
+        jobs = len(rig.lanes.kws.submitted)
+        rig.lanes.kws.holding = True
+
+        await rig.speak(100)
+        rig.lanes.kws.release()
+        await settle()
+
+        assert spotter.streams[0].pushed[-5:] == [48, 49, 50, 51, 52]
+        assert len(rig.lanes.kws.submitted) - jobs == 2
+        assert rig.ingress.stats().skipped_kws_hops == 0
+        assert rig.of(IngressOverload) == []
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_past_the_bound_drops_the_oldest_resets_cold_and_reports_once(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        await rig.quiet(640)
+        await rig.speak(320)
+        rig.lanes.kws.holding = True
+        await rig.speak(20)
+
+        await rig.speak((KWS_BACKLOG_FRAMES + 10) * FRAME_MS)
+        rig.lanes.kws.release()
+        await settle()
+
+        assert rig.ingress.stats().skipped_kws_hops == 10
+        (overload,) = rig.of(IngressOverload)
+        assert (overload.lane, overload.dropped_ms) == ("kws", FRAME_MS)
+        log = spotter.log
+        reset_at = log.index(("reset", False))
+        assert log[reset_at - 1] == ("push", 48)
+        assert log[reset_at + 1 :] == [("push", pos) for pos in range(59, 109)]
+        fed = fed_positions(log)
+        assert fed == sorted(set(fed))
+        assert not set(range(49, 59)) & set(fed)
+
+    @pytest.mark.parametrize(("floor", "first"), [(0, 83 - PRE_ROLL), (75, 75)])
+    @pytest.mark.asyncio
+    async def test_a_seeded_ingress_feeds_from_the_pre_roll_before_vad_from_above_the_floor(
+        self, floor, first
+    ):
+        audio = scripted_audio([silence(1600), speech_burst(400)], seed=7)
+        spotter = LoggedSpotter()
+        rig = Rig(
+            seed=seed_from(audio, first_pos=0, floor=floor, vad_from=83),
+            spotter=spotter,
+            engaged=False,
+        )
 
         await rig.speak(320)
 
-        assert rig.ingress.stats().skipped_kws_hops >= 5
-        (overload,) = rig.of(IngressOverload)
-        assert overload.lane == "kws"
+        fed = fed_positions(spotter.log)
+        assert fed and fed == list(range(first, first + len(fed)))
+        assert spotter.streams[0].resets == 0
+
+    @pytest.mark.asyncio
+    async def test_a_seed_with_no_vad_from_feeds_from_the_first_frame_pushed(self):
+        seed = seed_from(
+            np.zeros(40 * FRAME_SAMPLES, dtype=np.float32), first_pos=0, floor=0, vad_from=None
+        )
+        spotter = LoggedSpotter()
+        rig = Rig(seed=seed, spotter=spotter, engaged=False)
+
+        await rig.quiet(640)
+
+        fed = fed_positions(spotter.log)
+        assert fed and fed == list(range(40, 40 + len(fed)))
+
+    def test_the_docstrings_say_what_kws_overload_and_skipped_kws_hops_count(self):
+        assert "KWS_BACKLOG_FRAMES" in (IngressOverload.__doc__ or "")
+        assert "skipped_kws_hops" in (IngressStats.__doc__ or "")
+        assert "every frame" in (ingress_module.__doc__ or "")
+        assert "every hit" in (ingress_module.__doc__ or "")
+
+
+class UnopenableSpotter(LoggedSpotter):
+    """A spotter whose stream cannot be built, as when its interpreter fails to load."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.opens = 0
+
+    def open_stream(self, threshold: float) -> LoggedStream:
+        self.opens += 1
+        raise SpeechEngineError("the interpreter could not be built")
+
+
+class FirstPushFailsStream(LoggedStream):
+    """A logged stream whose first push fails as a broken engine would; later pushes work."""
+
+    def __init__(self, hits: Sequence[NameHit], threshold: float, log: list) -> None:
+        super().__init__(hits, threshold, log)
+        self.failed = False
+
+    def push(self, pcm: bytes, pos: int) -> list[NameHit]:
+        if not self.failed:
+            self.failed = True
+            raise SpeechEngineError("the first push failed")
+        return super().push(pcm, pos)
+
+
+class FirstPushFailsSpotter(LoggedSpotter):
+    def open_stream(self, threshold: float) -> FirstPushFailsStream:
+        stream = FirstPushFailsStream(self.hits, threshold, self.log)
+        self.streams.append(stream)
+        return stream
+
+
+class TestTheSpotterLane:
+    """The stream opens as its own `kws` job, and no failure leaves the spotter stuck busy."""
+
+    @pytest.mark.asyncio
+    async def test_the_stream_is_opened_by_its_own_kws_job_before_the_first_frames_job(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.quiet(640)
+
+        submitted = rig.lanes.kws.submitted
+        assert submitted[:2] == ["open_stream", "_spotter_job"]
+        assert submitted.count("open_stream") == 1
+        (stream,) = spotter.streams
+        assert stream.threshold == WakeConfig().kws_threshold
+        assert stream.pushed
+
+    @pytest.mark.asyncio
+    async def test_an_open_that_fails_turns_the_spotter_off_and_the_utterance_still_ends(
+        self, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="backend.realtime.ingress")
+        spotter = UnopenableSpotter()
+        rig = Rig(spotter=spotter)
+
+        await rig.quiet(640)
+        await rig.speak(640)
+        await rig.quiet(960)
+
+        assert [ended.text for ended in rig.of(UtteranceEnded)] == ["hello there"]
+        assert spotter.opens == 1
+        assert rig.lanes.kws.submitted == ["open_stream"]
+        assert rig.ingress.stats().engine_errors == 1
+        failures = [r for r in caplog.records if "spotter" in r.getMessage()]
+        assert len(failures) == 1
+        assert failures[0].exc_info is not None
+        # No frame is queued for a spotter that is off, so none waits for a job that never runs.
+        assert not rig.ingress._kws_waiting
+
+    @pytest.mark.asyncio
+    async def test_a_first_push_that_raises_keeps_the_stream_and_later_frames_are_fed(self):
+        spotter = FirstPushFailsSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+
+        await rig.speak(640)
+
+        assert rig.lanes.kws.submitted[:2] == ["open_stream", "_spotter_job"]
+        assert rig.lanes.kws.submitted.count("open_stream") == 1
+        (stream,) = spotter.streams
+        assert stream.failed
+        assert len(stream.pushed) > 20
+        assert stream.pushed == list(range(stream.pushed[0], stream.pushed[0] + len(stream.pushed)))
+        assert rig.ingress.stats().engine_errors == 1
+
+    @pytest.mark.asyncio
+    async def test_a_mute_during_the_open_skips_its_frames_and_feeds_the_fresh_stream_unreset(
+        self,
+    ):
+        spotter = LoggedSpotter([hit_at(2)])
+        rig = Rig(engaged=False, spotter=spotter)
+        rig.lanes.kws.holding = True
+        await rig.speak(320)
+        assert rig.lanes.kws.submitted == ["open_stream"]
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+        rig.lanes.kws.release()
+        await settle()
+        await rig.speak(320)
+
+        (stream,) = spotter.streams
+        assert stream.resets == 0
+        fed = fed_positions(spotter.log)
+        assert fed and fed == list(range(unmuted_at, unmuted_at + len(fed)))
+        assert 2 not in stream.pushed
+        assert rig.of(NameHeard) == []
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_reset_asked_for_during_an_open_a_mute_skipped_is_cleared(self):
+        spotter = LoggedSpotter()
+        rig = Rig(engaged=False, spotter=spotter)
+        rig.lanes.kws.holding = True
+        await rig.speak(320)
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        unmuted_at = rig.pos
+
+        await rig.quiet((KWS_BACKLOG_FRAMES + 30) * FRAME_MS)
+        assert rig.ingress.stats().skipped_kws_hops > 0
+        rig.lanes.kws.release()
+        await settle()
+
+        (stream,) = spotter.streams
+        assert stream.resets == 0
+        fed = fed_positions(spotter.log)
+        assert fed and min(fed) >= unmuted_at
+        assert fed == sorted(set(fed))
+
+    @pytest.mark.asyncio
+    async def test_an_on_hit_that_raises_once_leaves_the_frames_after_it_fed(self, monkeypatch):
+        spotter = LoggedSpotter([hit_at(40), hit_at(60)])
+        rig = Rig(engaged=False, spotter=spotter)
+        report = rig.ingress._on_hit
+        calls: list[int] = []
+
+        async def on_hit_failing_once(hit: NameHit, generation: int) -> None:
+            calls.append(hit.end_pos)
+            if len(calls) == 1:
+                raise RuntimeError("a bug in reporting a hit")
+            await report(hit, generation)
+
+        monkeypatch.setattr(rig.ingress, "_on_hit", on_hit_failing_once)
+        await rig.quiet(640)
+
+        await rig.speak(960)
+
+        assert calls == [40, 60]
+        (stream,) = spotter.streams
+        assert stream.pushed[-1] == rig.pos - 1
+        assert [heard.hit for heard in rig.of(NameHeard)] == [hit_at(60)]
+        assert rig.ingress.stats().skipped_kws_hops == 0
 
 
 def ref_frame(marker: bool) -> bytes:
@@ -1444,63 +1860,53 @@ class TestEndpointWake:
         assert rig.of(NameHeard) == []
 
 
-# -- The gate partial -----------------------------------------------------------------------------
+# -- What a transcript event carries --------------------------------------------------------------
 
 
-class TestGatePartial:
-    @pytest.mark.asyncio
-    async def test_it_decodes_once_frames_through_through_pos_arrive(self):
-        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
-        await rig.quiet(320)
-        await rig.speak(640)
-        started = rig.of(SpeechStarted)[0]
+class TestTranscriptEventFields:
+    """A transcript event carries its text and timing only: no text decides a wake (A66)."""
 
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos + 5)
-        await rig.speak(100)
-        assert rig.of(TranscriptPartial) == []
-        await rig.speak(20)
+    def test_a_partial_carries_no_out_of_cadence_or_word_timing_fields(self):
+        assert [field.name for field in dataclasses.fields(TranscriptPartial)] == [
+            "epoch",
+            "event_seq",
+            "utterance_id",
+            "first_pos",
+            "text",
+            "stable_chars",
+            "heard_at_ms",
+            "audio_end_pos",
+            "uncovered_since_ms",
+        ]
 
-        (gate,) = rig.of(TranscriptPartial)
-        assert (gate.gate, gate.through_pos, gate.audio_end_pos) == (True, rig.pos - 1, rig.pos - 1)
-
-    @pytest.mark.asyncio
-    async def test_it_is_the_one_partial_in_flight_and_cadence_ticks_skip(self):
-        rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=100))
-        await rig.quiet(320)
-        await rig.speak(640)
-        started = rig.of(SpeechStarted)[0]
-        partials = len(rig.of(TranscriptPartial))
-        skipped = rig.ingress.stats().skipped_partials
-        rig.lanes.stt.holding = True
-
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos - 1)
-        await rig.speak(400)
-        rig.lanes.stt.release()
-        await settle()
-
-        new = rig.of(TranscriptPartial)[partials:]
-        assert [p.gate for p in new][:1] == [True]
-        assert rig.ingress.stats().skipped_partials - skipped >= 3
+    def test_an_utterance_end_carries_no_word_timings(self):
+        assert [field.name for field in dataclasses.fields(UtteranceEnded)] == [
+            "epoch",
+            "event_seq",
+            "utterance_id",
+            "first_pos",
+            "text",
+            "reason",
+            "eot_probability",
+            "silence_ms",
+            "duration_ms",
+            "no_speech_prob",
+            "avg_logprob",
+            "heard_at_ms",
+        ]
 
     @pytest.mark.asyncio
-    async def test_an_utterance_ending_within_the_gate_reuses_its_decode_as_the_final(self):
+    async def test_an_utterance_end_takes_its_text_from_its_own_final_decode(self):
         rig = Rig(endpointing=EndpointingConfig(stt_partial_interval_ms=10000))
         await rig.quiet(320)
         await rig.speak(960)
-        started = rig.of(SpeechStarted)[0]
-        rig.lanes.stt.holding = True
 
-        rig.ingress.request_gate_partial(started.utterance_id, rig.pos + 30)
         await rig.quiet(640)
-        rig.lanes.stt.release()
-        await settle()
 
-        (gate,) = rig.of(TranscriptPartial)
         (ended,) = rig.of(UtteranceEnded)
         stream = rig.transcriber.streams[0]
-        assert ended.text == gate.text == "hello there"
-        assert (len(stream.partials), len(stream.finals)) == (1, 0)
-        assert last_frame(ended) <= gate.through_pos
+        assert ended.text == "hello there"
+        assert len(stream.finals) == 1
 
 
 # -- Mute -----------------------------------------------------------------------------------------
@@ -1765,6 +2171,308 @@ class TestMuteClosesTheUtterance:
         assert "mute" in (IngressSeed.__doc__ or "")
 
 
+# -- The wake verifier ----------------------------------------------------------------------------
+
+AFTER = 15  # the verifier's default 300 ms after the hit, in frames
+BEFORE = 100  # its default 2000 ms before the hit
+
+
+class RecordingVerifier(ScriptedWakeVerifier):
+    """A scripted verifier that keeps the bytes of every window it scores, in order."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.pcms: list[bytes] = []
+
+    def score(self, pcm: bytes) -> float:
+        self.pcms.append(pcm)
+        return super().score(pcm)
+
+
+def first_samples(pcm: bytes) -> list[int]:
+    """The first sample of each 20 ms frame in `pcm`."""
+    samples = np.frombuffer(pcm, dtype="<i2")
+    return [int(samples[start]) for start in range(0, len(samples), FRAME_SAMPLES)]
+
+
+class TestVerify:
+    """`request_verify` scores one continuous stretch of audio around a name hit (Design 5)."""
+
+    @pytest.mark.asyncio
+    async def test_it_waits_for_the_hit_plus_after_then_scores_the_windows_wire_bytes(self):
+        verifier = RecordingVerifier([0.42])
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 120
+        await rig.marked(hit + 1)
+
+        rig.ingress.request_verify("u9", hit)
+        await rig.marked(AFTER - 1)
+
+        assert verifier.pcms == [] and rig.of(WakeVerified) == []
+
+        await rig.marked(1)
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + AFTER + 1))]
+        assert rig.of(WakeVerified) == [WakeVerified(3, 1, "u9", hit, 0.42)]
+        assert rig.verify_lane.started == ["score"]
+
+    @pytest.mark.asyncio
+    async def test_frames_already_received_are_scored_at_once(self):
+        verifier = RecordingVerifier([0.3])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(20, 136))]
+        assert [event.score for event in rig.of(WakeVerified)] == [0.3]
+
+    @pytest.mark.asyncio
+    async def test_no_verifier_gives_none_at_once(self):
+        rig = Rig(engaged=False)
+
+        rig.ingress.request_verify("u1", 5)
+
+        assert rig.of(WakeVerified) == [WakeVerified(3, 1, "u1", 5, None)]
+
+    @pytest.mark.asyncio
+    async def test_no_verify_lane_gives_none_at_once(self):
+        verifier = RecordingVerifier()
+        lanes = IngressLanes(vad=StepLane(), stt=StepLane(), eot=StepLane(), kws=StepLane())
+        rig = Rig(verifier=verifier, engaged=False, lanes=lanes)
+
+        rig.ingress.request_verify("u1", 5)
+
+        assert rig.of(WakeVerified) == [WakeVerified(3, 1, "u1", 5, None)]
+        assert verifier.windows == []
+
+    @pytest.mark.asyncio
+    async def test_a_window_under_min_window_ms_gives_none_unscored(self, caplog):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        caplog.set_level(logging.INFO, logger="backend.realtime.ingress")
+        await rig.marked(10 + AFTER + 1)
+
+        rig.ingress.request_verify("u1", 10)
+        await settle()
+
+        # Frames 0 to 25 are 26 frames, under the 40 that 800 ms needs.
+        assert [event.score for event in rig.of(WakeVerified)] == [None]
+        assert verifier.windows == []
+        assert any(
+            record.levelno == logging.INFO and "verify" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_engine_error_gives_none_and_is_counted(self, caplog):
+        verifier = RecordingVerifier([SpeechEngineError("verifier broke")])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+
+        assert [event.score for event in rig.of(WakeVerified)] == [None]
+        assert rig.ingress.stats().engine_errors == 1
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == "backend.realtime.ingress"
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_mute_while_the_job_runs_gives_no_event(self):
+        verifier = RecordingVerifier([0.9])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+        rig.verify_lane.holding = True
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+        assert rig.verify_lane.submitted == ["score"]
+
+        rig.ingress.set_muted(True)
+        rig.verify_lane.release()
+        await settle()
+
+        assert rig.of(WakeVerified) == []
+
+    @pytest.mark.asyncio
+    async def test_a_mute_while_waiting_for_frames_gives_no_event(self):
+        verifier = RecordingVerifier([0.9])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(121)
+        rig.ingress.request_verify("u1", 120)
+
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        await rig.marked(AFTER + 5)
+
+        assert rig.of(WakeVerified) == []
+        assert verifier.windows == []
+
+    @pytest.mark.asyncio
+    async def test_a_close_while_the_job_runs_gives_no_event(self):
+        verifier = RecordingVerifier([0.9])
+        rig = Rig(verifier=verifier, engaged=False)
+        await rig.marked(150)
+        rig.verify_lane.holding = True
+        rig.ingress.request_verify("u1", 120)
+        await settle()
+
+        rig.ingress.close()
+        rig.verify_lane.release()
+        await settle()
+
+        assert rig.of(WakeVerified) == []
+
+    @pytest.mark.asyncio
+    async def test_a_request_after_close_gives_no_event(self):
+        rig = Rig(verifier=RecordingVerifier(), engaged=False)
+        rig.ingress.close()
+
+        rig.ingress.request_verify("u1", 5)
+
+        assert rig.of(WakeVerified) == []
+
+    # Splicing (design review 1): the window is one continuous stretch of time with the hit.
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_backlog_window_never_reaches_the_earlier_uplinks_frames(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        # An earlier uplink's tail: `seq` runs on into the backlog, since it resets only on
+        # connect, and positions have no gap, so only the backlog's first frame bounds it.
+        await rig.marked(50)
+        rig.ingress.expect_endpoint_wake(
+            keyword="hey mist", score=0.7, backlog_ms=1500, arrival=1.0
+        )
+        await rig.marked(75)
+        (heard,) = rig.of(NameHeard)
+        hit = heard.hit.end_pos
+        assert hit == 124
+
+        rig.ingress.request_verify("u1", hit)
+        await rig.marked(AFTER)
+
+        assert verifier.pcms == [rig.wire(range(50, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_a_seq_jump_before_the_hit_starts_the_window_after_it(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 120
+        await rig.marked(hit - 30)
+        rig.seq += 10  # ten frames lost on the link, with no position gap
+        await rig.marked(30 + AFTER + 1)
+
+        rig.ingress.request_verify("u1", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - 30, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_a_seq_jump_after_the_hit_ends_the_window_before_it(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 120
+        await rig.marked(hit + 6)
+        rig.seq += 3
+        await rig.marked(AFTER)
+
+        rig.ingress.request_verify("u1", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + 6))]
+
+    @pytest.mark.asyncio
+    async def test_a_mute_before_the_hit_starts_the_window_at_the_mute_boundary(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False)
+        hit = 100
+        await rig.marked(hit - 50)
+        rig.ingress.set_muted(True)
+        rig.ingress.set_muted(False)
+        await rig.marked(50 + AFTER + 1)
+
+        rig.ingress.request_verify("u1", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - 50, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_the_mute_boundary_crosses_a_reconfigure(self):
+        old = Rig(engaged=False)
+        await old.marked(50)
+        old.ingress.set_muted(True)
+        old.ingress.set_muted(False)
+        await old.marked(30)
+        seed = old.ingress.handoff()
+        old.ingress.close()
+        assert seed.mute_floor == 50
+
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier, engaged=False, seed=seed)
+        assert rig.pos == 80
+        rig.ingress.request_verify("u1", 100)
+        await rig.marked(36)
+
+        (pcm,) = verifier.pcms
+        assert len(pcm) == (116 - 50) * FRAME_SAMPLES * 2
+        live = (116 - 80) * FRAME_SAMPLES * 2
+        assert pcm[-live:] == rig.wire(range(80, 116))
+        # A seeded frame's bytes come back from float32, within one step of the wire's.
+        expected = [pos + 1 for pos in range(50, 80)]
+        assert all(abs(got - want) <= 1 for got, want in zip(first_samples(pcm[:-live]), expected))
+
+    @pytest.mark.asyncio
+    async def test_an_utterance_ended_20_frames_before_the_hit_leaves_the_full_window(self):
+        verifier = RecordingVerifier()
+        rig = Rig(verifier=verifier)
+        await rig.quiet(2000)
+        await rig.speak(640)
+        await rig.quiet(800)
+        (ended,) = rig.of(UtteranceEnded)
+        hit = last_frame(ended) + 20
+        floor = rig.ingress.handoff().floor
+        assert hit - BEFORE < floor <= hit
+        await rig.quiet((hit + AFTER + 1 - rig.pos) * FRAME_MS)
+
+        rig.ingress.request_verify("u9", hit)
+        await settle()
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + AFTER + 1))]
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_ending_before_its_window_is_built_keeps_its_hit_frame(self):
+        verifier = RecordingVerifier([0.8])
+        rig = Rig(verifier=verifier)
+        await rig.quiet(2000)
+        await rig.speak(640)
+        (started,) = rig.of(SpeechStarted)
+        hit = rig.pos - 1
+        rig.ingress.request_verify(started.utterance_id, hit)
+
+        await rig.quiet(AFTER * FRAME_MS - FRAME_MS)
+
+        assert len(rig.of(UtteranceEnded)) == 1
+        assert rig.ingress.handoff().floor > hit
+        assert verifier.pcms == []
+
+        await rig.quiet(FRAME_MS)
+
+        assert verifier.pcms == [rig.wire(range(hit - BEFORE, hit + AFTER + 1))]
+        assert [(e.utterance_id, e.score) for e in rig.of(WakeVerified)] == [
+            (started.utterance_id, 0.8)
+        ]
+
+    def test_the_seed_carries_the_mute_boundary_as_its_last_defaulted_field(self):
+        last = dataclasses.fields(IngressSeed)[-1]
+        assert (last.name, last.default) == ("mute_floor", 0)
+
+
 # -- Real lanes -----------------------------------------------------------------------------------
 
 
@@ -1886,13 +2594,49 @@ class TestSpeechSegmentTracker:
         assert step.started == (7 * 512 // FRAME_SAMPLES, (9 * 512 + 511) // FRAME_SAMPLES)
 
 
-class TestOnsetFeed:
-    def test_the_feed_starts_a_pre_roll_before_the_onset(self):
-        assert onset_feed_start(40, PRE_ROLL, None) == 40 - PRE_ROLL
-        assert onset_feed_start(40, PRE_ROLL, 10) == 40 - PRE_ROLL
+WINDOW = 64  # the scripted spotter's 1280 ms window in 20 ms frames
+LEAD = WINDOW + PRE_ROLL
 
-    def test_the_feed_never_repeats_a_frame_already_fed(self):
-        assert onset_feed_start(40, PRE_ROLL, 30) == 31
+
+class TestNameChainStart:
+    """A server hit's wake utterance starts at its segment chain or its window, less the pre-roll.
+
+    Each case is `(segments, hit, start)` at the defaults: a 1000 ms join gap (50 frames), a
+    300 ms pre-roll (15 frames) and the scripted spotter's 1280 ms window (64 frames).
+    """
+
+    @pytest.mark.parametrize(
+        ("segments", "hit", "start"),
+        [
+            pytest.param([(100, 400)], 380, 100 - PRE_ROLL, id="inside a long segment"),
+            pytest.param([(200, 230)], 237, 237 - LEAD, id="150 ms after a short segment"),
+            pytest.param([], 300, 300 - LEAD, id="no segment"),
+            pytest.param([(400, 500)], 300, 300 - LEAD, id="only a segment after the hit"),
+            pytest.param(
+                [(100, 150), (196, 260)], 250, 100 - PRE_ROLL, id="a 900 ms gap joins the chain"
+            ),
+            pytest.param(
+                [(100, 180), (232, 250)], 252, 181, id="an unchained segment inside the window"
+            ),
+            pytest.param(
+                [(100, 180)], 236, 181, id="an old segment 1.1 s before an unsegmented name"
+            ),
+            pytest.param(
+                [(100, 180)], 281, 281 - LEAD, id="a segment 2 s before ends outside the window"
+            ),
+        ],
+    )
+    def test_the_table(self, segments, hit, start):
+        assert (
+            name_chain_start(
+                segments,
+                hit,
+                join_gap_ms=1000,
+                pre_roll_frames=PRE_ROLL,
+                window_frames=WINDOW,
+            )
+            == start
+        )
 
     def test_the_pre_roll_in_frames_comes_from_the_endpointing_config(self):
         assert onset_lead_frames(EndpointingConfig()) == PRE_ROLL

@@ -1,26 +1,24 @@
-"""Tests for the addressee gate, which decides whether an utterance naming MIST was said to her.
+"""Tests for the addressee gate, which decides whether a name hit was said to MIST.
 
 The name spotter hears the name; it cannot tell "mist, dim the lights" from "the mist rolled in",
 from her own voice saying her name, or from a film on the PC saying it. Wake by name opens a turn
 only when the gate accepts, so a false accept starts a turn nobody asked for and a false reject
-ignores her user. Each accepted sentence is pinned with the check that accepted it, because the
-check is the reason a rejection reports. The table runs against the shipped `WakeConfig`
-defaults, since those are what a fresh install hears with. The module is imported alone, because
-it must run without a controller, ingress or engine loaded.
+ignores her user. Her own output is ruled out by `pre_decode`, and the acoustic verifier's score
+decides the rest through `verified`; no transcript text takes part, so the module's checks are
+pinned to those four. The checks run against the shipped `WakeConfig` defaults, since those are
+what a fresh install hears with. The module is imported alone, because it must run without a
+controller, ingress or engine loaded.
 """
 
+import ast
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from backend.realtime.addressee import (
-    AddresseeGate,
-    GateVerdict,
-    WakeConfig,
-    normalize,
-    vocative_match,
-)
+from backend.realtime import addressee as addressee_module
+from backend.realtime.addressee import AddresseeGate, GateVerdict, WakeConfig, normalize
 
 DEFAULTS = WakeConfig()
 
@@ -47,65 +45,6 @@ class TestNormalize:
 
     def test_empty_text_gives_no_tokens(self):
         assert normalize("") == []
-
-
-class TestVocativeMatchDefaults:
-    @pytest.mark.parametrize(
-        ("text", "check"),
-        [
-            ("hey mist, what's the time", "phrase"),
-            ("Mist, how's it going?", "phrase"),
-            ("mist what's up", "phrase"),
-            ("are you there mist", "phrase"),
-            ("Mist, set a timer for ten minutes", "vocative"),
-            ("mist can you dim the lights", "vocative"),
-            ("so, mist, what do you think", "vocative"),
-            ("what do you reckon, mist?", "vocative"),
-            ("morning mist", "vocative"),
-            ("good morning mist", "vocative"),
-        ],
-    )
-    def test_accepts_an_addressed_sentence_with_its_check(self, text, check):
-        assert vocative_match(text, DEFAULTS) == check
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "I missed the bus",
-            "the mist rolled in",
-            "a thick mist this morning",
-            "mist is a good name",
-            # `stop_before` away from the start: "morning" is a noun's modifier here.
-            "I love the morning mist",
-            # "good" is not the first word, so the greeting rule does not apply.
-            "it was a good morning mist",
-            # The last-word rule does not count a name after "into".
-            "we drove into mist",
-            "mistakes were made",
-            "",
-            "what's the weather like tomorrow",
-        ],
-    )
-    def test_rejects_a_sentence_not_said_to_her(self, text):
-        assert vocative_match(text, DEFAULTS) is None
-
-
-class TestVocativeMatchConfigured:
-    def test_a_custom_template_matches_what_the_defaults_reject(self):
-        # The lead's ruling of 12 Nov 2026: "ok" replaces v5's "yo", which the shipped greetings
-        # already hold, so the defaults would accept "yo mist lights off" as a vocative.
-        text = "ok mist lights off"
-        custom = WakeConfig(phrases=(*DEFAULTS.phrases, "ok {name}"))
-
-        assert vocative_match(text, DEFAULTS) is None
-        assert vocative_match(text, custom) == "phrase"
-
-    def test_the_name_slot_matches_every_configured_name(self):
-        two_names = WakeConfig(names=("mist", "misty"))
-
-        assert vocative_match("hey misty", DEFAULTS) is None
-        assert vocative_match("hey misty", two_names) == "phrase"
-        assert vocative_match("hey mist", two_names) == "phrase"
 
 
 class TestPreDecode:
@@ -165,33 +104,123 @@ class TestPreDecode:
 
         assert verdict is None
 
+    def test_an_alias_in_her_recent_speech_is_not_her_name(self):
+        # "must" and "miss" are common in her replies; counting them would reject genuine wakes
+        # for the whole echo guard. Her own playback is the reference score's to catch.
+        verdict = self._gate().pre_decode(
+            score=0.9, reference_score=None, recent_tts_text="You must have missed it, miss."
+        )
+
+        assert verdict is None
+
     def test_the_gate_keeps_its_echo_guard_for_the_controller(self):
         assert AddresseeGate(DEFAULTS, echo_guard_ms=1500).echo_guard_ms == 1500
 
 
-class TestDecide:
-    @pytest.mark.parametrize(
-        ("text", "check"),
-        [
-            ("hey mist, what's the time", "phrase"),
-            ("mist can you dim the lights", "vocative"),
-        ],
-    )
-    def test_an_addressed_text_is_accepted_with_its_check_and_both_scores(self, text, check):
-        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).decide(
-            text=text, score=0.83, reference_score=0.12
-        )
+class TestVerified:
+    """The verifier's verdict: its score against the threshold for the spotter's cutoff."""
 
-        assert verdict == GateVerdict(accepted=True, check=check, score=0.83, reference_score=0.12)
+    @staticmethod
+    def _gate(threshold: float | None = 0.6, asked: list[float] | None = None) -> AddresseeGate:
+        def thresholds(cutoff: float) -> float | None:
+            if asked is not None:
+                asked.append(cutoff)
+            return threshold
 
-    def test_a_text_not_said_to_her_is_not_addressed_with_both_scores(self):
-        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).decide(
-            text="the mist rolled in", score=0.61, reference_score=None
+        return AddresseeGate(DEFAULTS, echo_guard_ms=2000, thresholds=thresholds)
+
+    @pytest.mark.parametrize("verify_score", [0.6, 0.61, 0.99], ids=["at", "above", "well-above"])
+    def test_a_score_at_or_above_the_threshold_is_verified(self, verify_score):
+        verdict = self._gate().verified(
+            score=0.83, reference_score=0.12, verify_score=verify_score, cutoff=0.5
         )
 
         assert verdict == GateVerdict(
-            accepted=False, check="not_addressed", score=0.61, reference_score=None
+            accepted=True, check="verified", score=0.83, reference_score=0.12
         )
+
+    def test_a_score_below_the_threshold_is_not_addressed(self):
+        verdict = self._gate().verified(
+            score=0.83, reference_score=None, verify_score=0.59, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.83, reference_score=None
+        )
+
+    def test_no_verifier_score_is_not_addressed(self):
+        # A failed verify, a short window or no verifier at all reaches the gate as None.
+        verdict = self._gate().verified(
+            score=0.9, reference_score=None, verify_score=None, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.9, reference_score=None
+        )
+
+    def test_a_cutoff_with_no_threshold_is_not_addressed(self):
+        verdict = self._gate(threshold=None).verified(
+            score=0.9, reference_score=None, verify_score=1.0, cutoff=0.005
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.9, reference_score=None
+        )
+
+    def test_a_gate_without_thresholds_verifies_nothing(self):
+        verdict = AddresseeGate(DEFAULTS, echo_guard_ms=2000).verified(
+            score=0.9, reference_score=None, verify_score=1.0, cutoff=0.5
+        )
+
+        assert verdict == GateVerdict(
+            accepted=False, check="not_addressed", score=0.9, reference_score=None
+        )
+
+    def test_the_threshold_is_read_for_the_given_cutoff(self):
+        asked: list[float] = []
+
+        self._gate(asked=asked).verified(
+            score=0.9, reference_score=None, verify_score=0.7, cutoff=216 / 255
+        )
+
+        assert asked == [216 / 255]
+
+    def test_verified_is_a_gate_check(self):
+        assert "verified" in addressee_module.GateCheck.__args__
+
+
+class TestNoTextRule:
+    """No transcript text decides a wake (A66): the verifier and her own output do."""
+
+    def test_the_gate_checks_are_the_verifier_s_and_the_self_checks(self):
+        assert addressee_module.GateCheck.__args__ == (
+            "verified",
+            "self_speech",
+            "self_media",
+            "not_addressed",
+        )
+
+    def test_the_module_exports_the_gate_its_verdict_and_the_tokeniser_only(self):
+        assert sorted(addressee_module.__all__) == [
+            "AddresseeGate",
+            "GateCheck",
+            "GateVerdict",
+            "WakeConfig",
+            "normalize",
+        ]
+
+    def test_a_verdict_carries_its_check_and_the_spotter_s_scores_only(self):
+        assert list(GateVerdict.__dataclass_fields__) == [
+            "accepted",
+            "check",
+            "score",
+            "reference_score",
+        ]
+
+    def test_the_gate_decides_by_the_verifier_or_her_own_output_only(self):
+        public = sorted(name for name in vars(AddresseeGate) if not name.startswith("_"))
+
+        assert public == ["Thresholds", "pre_decode", "verified"]
 
 
 class TestPurity:
@@ -211,3 +240,24 @@ class TestPurity:
         assert "backend.realtime.turn" not in loaded
         assert "backend.realtime.ingress" not in loaded
         assert not [name for name in loaded if name.startswith("backend.realtime.engines")]
+
+    def test_the_gate_imports_only_the_wake_settings(self):
+        tree = ast.parse(Path(addressee_module.__file__).read_text(encoding="utf-8"))
+        relative = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level
+        }
+        absolute = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and not node.level
+        }
+
+        assert relative == {"budget"}
+        assert absolute == {"re", "dataclasses", "typing"}

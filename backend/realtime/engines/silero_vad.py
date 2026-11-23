@@ -284,13 +284,15 @@ class SileroVad:
     """Silero VAD v5 over one onnxruntime session that every stream shares.
 
     A session's `run` is safe to call from several threads, and each stream keeps its own
-    state, so one loaded model serves every audio source.
+    state, so one loaded model serves every audio source. `model_id` is the `vad_model` setting
+    it was loaded from, which the engine walk reports in the VAD's status.
     """
 
-    __slots__ = ("_session",)
+    __slots__ = ("_session", "model_id")
 
-    def __init__(self, session: OnnxSession) -> None:
+    def __init__(self, session: OnnxSession, *, model_id: str) -> None:
         self._session = session
+        self.model_id = model_id
 
     @classmethod
     def load(
@@ -322,7 +324,7 @@ class SileroVad:
         )
         session = open_checked_session(spec, session_factory, VAD_INPUTS, "MIST_VOICE_VAD_DEVICE")
         logger.info("Silero VAD loaded from %s on %s", path, providers[0])
-        return cls(session)
+        return cls(session, model_id=placement.vad_model)
 
     def open_stream(self) -> SileroVadStream:
         """Open a stream with zero state, for a new audio source."""
