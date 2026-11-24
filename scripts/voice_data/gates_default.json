@@ -53,6 +53,11 @@
     "bench.decode_loss_max": {"value": 0.05, "h6": false, "note": "Bench (4.2): largest E4B decode loss, as a fraction. Fixed."},
     "bench.sim_median_ratio_min": {"value": 0.9, "h6": false, "note": "Bench (4.2): median SIM per state over the distribution's median. Fixed."},
     "bench.cer_max": {"value": 0.03, "h6": false, "note": "Bench (4.2): highest CER. Fixed."},
-    "bench.f0_std_tolerance": {"value": 0.2, "h6": false, "note": "Bench (4.2): F0 standard deviation within this fraction of the seed's, per state. Fixed."}
+    "bench.f0_std_tolerance": {"value": 0.2, "h6": false, "note": "Bench (4.2): F0 standard deviation within this fraction of the seed's, per state. Fixed."},
+    "corpus.teacher_hours_min": {"value": 5.0, "h6": false, "note": "Corpus: fewest hours of kept teacher takes the training corpus needs; about 0.27-0.31 M chars of `text build` lines. Fixed."},
+    "corpus.seed_share_max": {"value": 0.3, "h6": false, "note": "Corpus: largest share of the training corpus's speech the seed's own clips may make up. Fixed."},
+    "corpus.val_fraction": {"value": 0.02, "h6": false, "note": "Corpus: share of the training corpus held back as the validation split. Fixed."},
+    "voice_ab.preferred_min": {"value": 18, "h6": false, "note": "Voice A/B: fewest ear-test lines on which the trained voice must be the preferred one for the A/B to pass. Fixed."},
+    "voice_ab.lines": {"value": 26, "h6": false, "note": "Voice A/B: ear-test lines the A/B plays, the 20 lines and 6 acknowledgements of `scripts/model_bench/speech/lines.json`. Fixed."}
   }
 }

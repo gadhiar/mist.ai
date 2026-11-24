@@ -67,7 +67,16 @@ FIXED = {
     "bench.sim_median_ratio_min": 0.9,
     "bench.cer_max": 0.03,
     "bench.f0_std_tolerance": 0.2,
+    "corpus.teacher_hours_min": 5.0,
+    "corpus.seed_share_max": 0.3,
+    "corpus.val_fraction": 0.02,
+    "voice_ab.preferred_min": 18,
+    "voice_ab.lines": 26,
 }
+
+# The voice A/B pack plays the bench's ear-test lines and acknowledgements, so its line count
+# must equal theirs.
+EAR_TEST = Path(__file__).resolve().parents[3] / "scripts/model_bench/speech/lines.json"
 
 
 def test_speaking_states_are_v6_five() -> None:
@@ -115,6 +124,31 @@ def test_fixed_gates_are_not_calibrated(key: str, value: float) -> None:
     default = gates.load(None).defaults[key]
     assert default.value == value
     assert default.h6 is False
+
+
+def test_voice_ab_lines_are_the_ear_test_lines() -> None:
+    data = json.loads(EAR_TEST.read_text(encoding="utf-8"))
+    ear = [*data["lines"], *data["acknowledgements"]]
+    defaults = gates.load(None).defaults
+    assert defaults["voice_ab.lines"].value == len(ear)
+    assert defaults["voice_ab.preferred_min"].value <= defaults["voice_ab.lines"].value
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "corpus.teacher_hours_min",
+        "corpus.seed_share_max",
+        "corpus.val_fraction",
+        "voice_ab.preferred_min",
+        "voice_ab.lines",
+    ],
+)
+def test_new_gates_note_their_owner_and_say_fixed(key: str) -> None:
+    note = gates.load(None).defaults[key].note
+    owner = "Corpus" if key.startswith("corpus.") else "Voice A/B"
+    assert note.startswith(owner)
+    assert note.endswith("Fixed.")
 
 
 def test_no_overlay_gives_defaults(private_root: Root) -> None:
