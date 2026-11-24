@@ -15,8 +15,9 @@ in a child process (`trainer` mode of this module). The child puts the clone fir
 wheel. It then runs `training.train` as `__main__` with the config as its one argument, from the
 clone's root, and writes what it measured to a metrics file: the free VRAM before the run, the
 peak `torch.cuda.max_memory_reserved`, the optimizer steps and their rate (a global optimizer
-post-step hook; the first `WARMUP_STEPS` are left out) and the loss of each step (the scalar
-`backward` received, summed over the step's micro-batches, averaged per `LOSS_WINDOW` steps).
+post-step hook; the first `WARMUP_STEPS` are left out), the loss of each step (the scalar
+`backward` received, summed over the step's micro-batches, averaged per `LOSS_WINDOW` steps) and
+the longest `save_checkpoint` call, timed on its own clock (`save_clock`).
 
 Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` and the configs'
 `hf://` URIs name a revision (`49252265`) the cache does not hold:
@@ -39,7 +40,8 @@ Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` 
 
 `probe` trains `PROBE_STEPS` optimizer steps at each batch in turn, with accumulation to the
 effective batch upstream requires, stopping at the first that does not fit (its peak above the
-free VRAM less `HEADROOM_MIB`, or out of memory), and writes `probe.json`. `train` runs the
+free VRAM less `HEADROOM_MIB`, or out of memory), and writes `probe.json`, with the longest
+checkpoint save of any trial as `save_s`, from which a stop's grace is sized. `train` runs the
 fine-tune from the 24-layer base and then the distillation, the student warm-started from the
 released 6-layer student (`student_init_from`) and taught by the fine-tune's newest checkpoint.
 Upstream resumes from its newest checkpoint by itself, saves at `ckpt_freq` and at `max_steps`,
@@ -78,6 +80,7 @@ import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic as _monotonic
 from types import FrameType
 from typing import Protocol
 
@@ -130,6 +133,11 @@ def utc_now() -> datetime:
 def sleep(seconds: float) -> None:
     """Wait between polls of the trainer; tests replace this function."""
     time.sleep(seconds)
+
+
+def save_clock() -> float:
+    """Return a monotonic reading in seconds, to time a checkpoint save; tests replace this."""
+    return _monotonic()
 
 
 class Child(Protocol):
@@ -507,6 +515,12 @@ def _rate(value: object) -> float | None:
     return float(value)
 
 
+def _seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not value >= 0:
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
 def run_probe(
     data: Path, upstream: Path, run_id: str, corpus: str, batches: Sequence[int], stop: Stop
 ) -> tuple[list[str], dict[str, object]]:
@@ -546,7 +560,8 @@ def run_probe(
         )  # fmt: skip
         trials.append(
             {"batch": batch, "accum": int(doc["grad_accum_steps"]), "peak_vram_mib": peak,  # type: ignore[call-overload]
-             "free_vram_mib": free, "steps_per_s": rate, "oom": oom, "fits": fits}
+             "free_vram_mib": free, "steps_per_s": rate,
+             "save_s": _seconds(metrics.get("save_s")), "oom": oom, "fits": fits}
         )  # fmt: skip
         shutil.rmtree(run_dir, ignore_errors=True)
         print(f"student_train: probe batch {batch}: {'fits' if fits else 'does not fit'}")
@@ -554,6 +569,7 @@ def run_probe(
             break
     fitting = [t for t in trials if t["fits"]]
     best = fitting[-1] if fitting else None
+    saves = [float(t["save_s"]) for t in trials if t["save_s"] is not None]  # type: ignore[arg-type]
     total = contract.STEPS_FINETUNE + contract.STEPS_DISTILL
     probe: dict[str, object] = {
         "schema": SCHEMA,
@@ -564,6 +580,8 @@ def run_probe(
         "peak_vram_mib": best["peak_vram_mib"] if best else None,
         "free_vram_mib": (best or trials[0])["free_vram_mib"],
         "steps_per_s": best["steps_per_s"] if best else None,
+        # The longest save of any trial: the model saved is the same at every batch.
+        "save_s": round(max(saves), 1) if saves else None,
         "projected_hours": (
             contract.projected_hours(float(best["steps_per_s"]), total) if best else None  # type: ignore[arg-type]
         ),
@@ -932,6 +950,34 @@ def install_export(module: object, export_dir: Path) -> None:
     module.save_checkpoint = save_checkpoint  # type: ignore[attr-defined]
 
 
+class SaveTimer:
+    """Times each `save_checkpoint` call, the export copy included when it is installed first.
+
+    The longest is what a stop's save costs on top of the step under way.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self.durations: list[float] = []
+
+    def install(self, module: object) -> None:
+        """Wrap `module.save_checkpoint`; a save that raises is timed too."""
+        original = module.save_checkpoint  # type: ignore[attr-defined]
+
+        def save_checkpoint(*args: object, **kwargs: object) -> object:
+            start = self._clock()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self.durations.append(self._clock() - start)
+
+        module.save_checkpoint = save_checkpoint  # type: ignore[attr-defined]
+
+    def longest(self) -> float | None:
+        """Return the longest save in seconds, or `None` before the first."""
+        return max(self.durations, default=None)
+
+
 def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Path | None) -> int:
     """Run upstream's trainer on `config` in this process; write the metrics; return the code.
 
@@ -943,8 +989,11 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
 
     free = int(torch.cuda.mem_get_info()[0])
     monitor = StepMonitor(time.perf_counter)
+    checkpointing = importlib.import_module(CHECKPOINTING_MODULE)
     if export_dir is not None:
-        install_export(importlib.import_module(CHECKPOINTING_MODULE), export_dir)
+        install_export(checkpointing, export_dir)
+    saves = SaveTimer(save_clock)
+    saves.install(checkpointing)
     saved_argv, saved_cwd = sys.argv, os.getcwd()
     oom = False
     monitor.install(torch)
@@ -966,6 +1015,7 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
                 "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
                 "steps": len(monitor.times),
                 "steps_per_s": monitor.steps_per_s(),
+                "save_s": saves.longest(),
                 "losses": monitor.windows(),
                 "oom": oom,
             },

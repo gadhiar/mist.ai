@@ -6,8 +6,9 @@ batch 2, then 4, then 8, each with accumulation to `EFFECTIVE_BATCH` (upstream r
 and each next batch only when the last one fitted (with `--batch N`, at N alone). A batch fits
 when its peak `torch.cuda.max_memory_reserved` stays at or below the free VRAM the job saw
 minus `HEADROOM_MIB`. The job writes `students/<R>/probe.json`: the largest batch that fits,
-its accumulation, its peak and free VRAM in MiB, its optimizer steps/s and the hours the
-pre-registered steps would take at that rate. The `--run` names the run that `student train`
+its accumulation, its peak and free VRAM in MiB, its optimizer steps/s, the hours the
+pre-registered steps would take at that rate, and `save_s`, the longest checkpoint save the
+trials timed, in seconds to one decimal. The `--run` names the run that `student train`
 then trains at that batch. When the smallest batch does not fit,
 the command exits 3. The job asks the preflight for `PROBE_VRAM_GB` (7.5: batch 2 by a linear
 fit of upstream's VRAM table, 6 GiB plus 0.75 GiB a sample) rather than the family's 16 GB,

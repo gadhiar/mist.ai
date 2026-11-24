@@ -304,6 +304,7 @@ class FakeTrainer:
     seconds_per_step: float = 10.0
     peaks_mib: dict[int, int] = field(default_factory=lambda: {2: 6100, 4: 7600, 8: 9900})
     rates: dict[int, float] = field(default_factory=lambda: {2: 0.02, 4: 0.025, 8: 0.03})
+    save_s: dict[int, float] = field(default_factory=dict)
     free_mib: int = FREE_MIB
     oom: set[int] = field(default_factory=set)
     kill_at: tuple[str, int] | None = None
@@ -359,6 +360,7 @@ class FakeChild:
             "peak_reserved_bytes": self.trainer.peaks_mib.get(batch, 0) * MIB,
             "steps": self.local,
             "steps_per_s": None if oom else self.trainer.rates.get(batch),
+            "save_s": None if oom else self.trainer.save_s.get(batch),
             "losses": [[self.local, 2.0 - 0.01 * self.step]] if self.local else [],
             "oom": oom,
         }
@@ -589,6 +591,27 @@ def test_probe_counts_out_of_memory_as_not_fitting(
     assert doc["batch"] == 4
     assert doc["trials"][-1]["batch"] == 8 and doc["trials"][-1]["oom"] is True
     assert "out of memory" in result.out
+
+
+def test_probe_records_its_longest_checkpoint_save(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    # Batch 8 does not fit, but its save was timed too; the longest is kept, to one decimal.
+    trainer = FakeTrainer(save_s={2: 1.24, 4: 2.36, 8: 1.9})
+    result = probe(root, clone, trainer=trainer)
+    assert result.code == 0, result.err + result.log
+    doc = read(run_dir(root) / "probe.json")
+    assert doc["save_s"] == 2.4
+    assert [t["save_s"] for t in doc["trials"]] == [1.24, 2.36, 1.9]
+
+
+def test_probe_save_s_is_null_when_no_save_was_timed(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    result = probe(root, clone, trainer=FakeTrainer(oom={2}))
+    assert result.code == 3
+    doc = read(run_dir(root) / "probe.json")
+    assert doc["save_s"] is None and doc["trials"][0]["save_s"] is None
 
 
 def test_probe_batch_probes_that_batch_alone(root: root_mod.Root, hub: Hub, clone: Path) -> None:
@@ -1144,6 +1167,37 @@ def test_trainer_runs_upstream_from_the_clone_and_measures_it(
     }  # fmt: skip
     # The hooks are gone once the trainer returns.
     assert sys.modules["torch"].hooks == []  # type: ignore[attr-defined]
+
+
+def test_trainer_times_each_checkpoint_save(
+    trainer_clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Saves at steps 4, 8 and 12, each read twice: they take 1.25, 2.5 and 0.5 seconds.
+    readings = iter([0.0, 1.25, 10.0, 12.5, 20.0, 20.5])
+    monkeypatch.setattr(stage, "save_clock", lambda: next(readings))
+    config = trainer_config_file(tmp_path)
+    metrics = tmp_path / "metrics.json"
+    code = stage.main(
+        ["--data", str(tmp_path), "--upstream", str(trainer_clone), "trainer", "--config",
+         str(config), "--metrics", str(metrics)]
+    )  # fmt: skip
+    assert code == 0
+    assert read(metrics)["save_s"] == pytest.approx(2.5)
+    assert next(readings, None) is None
+
+
+def test_save_timer_records_a_save_that_raised() -> None:
+    def save(run_dir: Path, step: int) -> None:
+        raise OSError("disk full")
+
+    module = types.SimpleNamespace(save_checkpoint=save)
+    readings = iter([5.0, 8.0])
+    timer = stage.SaveTimer(lambda: next(readings))
+    timer.install(module)
+    assert timer.longest() is None
+    with pytest.raises(OSError, match="disk full"):
+        module.save_checkpoint(Path("x"), 1)
+    assert timer.longest() == pytest.approx(3.0)
 
 
 def test_trainer_reports_out_of_memory(trainer_clone: Path, tmp_path: Path) -> None:
