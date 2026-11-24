@@ -19,6 +19,7 @@ Two fakes live here rather than in `fakes.py`:
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import dataclasses
 import functools
@@ -41,7 +42,7 @@ from scripts.voice_data import gates as gates_mod
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.bindings.protocols import QualityTrack, Span, Turn
 from scripts.voice_data.commands import extract as extract_cmd
-from scripts.voice_data.errors import JobError, RootError
+from scripts.voice_data.errors import InputError, JobError, RootError
 from scripts.voice_data.records import Prosody, SegmentRecord, SourceRecord, read_jsonl, write_jsonl
 from scripts.voice_data.stages import extract as extract_stage
 from scripts.voice_data.stages import prosody as prosody_mod
@@ -1867,6 +1868,59 @@ def test_a_budget_that_is_not_positive_exits_2_before_any_job(tmp_path: Path, va
     code, _, err = extract(root, docker, "--device", "cuda", f"--vram-gb={value}")
     assert code == 2 and "--vram-gb" in err
     assert docker.argvs == []
+
+
+FLOOR_REFUSAL = "refused: --vram-gb must be above 1 GiB"
+
+
+@pytest.mark.parametrize("value", ["1", "0.5", "0", "-2"])
+def test_a_budget_of_1_gib_or_less_exits_2_before_any_job(tmp_path: Path, value: str) -> None:
+    root, docker = _small_root(tmp_path, clips={"solo.wav": take("target", 6.0, 1)})
+    code, _, err = extract(root, docker, "--device", "cuda", f"--vram-gb={value}")
+    assert code == 2 and FLOOR_REFUSAL in err
+    assert docker.argvs == []
+
+
+def test_a_budget_just_above_the_floor_reaches_the_job(tmp_path: Path) -> None:
+    root, episode, _ = two_source_root(tmp_path)
+    card = FakeVram(SHORT)
+    docker = CudaStageDocker(root, models_for(episode, main_prototypes()), card)
+    _, _, err = extract(root, docker, "--device", "cuda", "--vram-gb", "1.5")
+    assert "refused" not in err
+    (argv,) = docker.argvs
+    assert argv[-2:] == ["--vram-gb", "1.5"]
+    assert card.calls[0] == ("start", "cuda", 1.5)
+
+
+def _host_refusal(value: float) -> str | None:
+    try:
+        extract_cmd.vram_budget(value)
+    except InputError as exc:
+        return str(exc)
+    return None
+
+
+def _stage_refusal(value: float) -> str | None:
+    try:
+        extract_stage._budget(repr(value))
+    except argparse.ArgumentTypeError as exc:
+        return f"refused: --vram-gb {exc}"
+    return None
+
+
+@pytest.mark.parametrize("value", [-1.0, 0.0, 0.5, 1.0, 1.001, 1.5, 8.0])
+def test_host_and_stage_refuse_the_same_budgets(value: float) -> None:
+    host = _host_refusal(value)
+    assert host == _stage_refusal(value)
+    assert host == (FLOOR_REFUSAL if value <= 1.0 else None)
+    assert vram.CAP_MARGIN_GIB == extract_cmd.VRAM_FLOOR_GIB == 1.0
+
+
+def test_host_and_stage_read_one_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(extract_cmd, "VRAM_FLOOR_GIB", 2.0)
+    refusal = "refused: --vram-gb must be above 2 GiB"
+    assert _host_refusal(1.5) == _stage_refusal(1.5) == refusal
+    assert _host_refusal(2.5) is _stage_refusal(2.5) is None
 
 
 def test_a_cpu_job_takes_no_budget(tmp_path: Path) -> None:

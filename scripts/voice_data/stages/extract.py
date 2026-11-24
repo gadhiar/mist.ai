@@ -84,7 +84,7 @@ from . import propose_states, retrieve, segments, vram
 from . import sdh as sdh_stage
 from .ingest import decode_argv
 from .prosody import prosody as measure_prosody
-from .vram import CAP_MARGIN_GIB, CUDA
+from .vram import CUDA
 
 SCHEMA = 1
 NONE = "none"
@@ -1690,8 +1690,8 @@ def run(
 
 def _budget(text: str) -> float:
     value = float(text)
-    if not value > CAP_MARGIN_GIB:
-        raise argparse.ArgumentTypeError(f"must be above {CAP_MARGIN_GIB:g} GiB")
+    if not value > contract.VRAM_FLOOR_GIB:
+        raise argparse.ArgumentTypeError(f"must be above {contract.VRAM_FLOOR_GIB:g} GiB")
     return value
 
 

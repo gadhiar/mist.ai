@@ -15,13 +15,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..commands.extract import VRAM_FLOOR_GIB
+
 CUDA = "cuda"
 GIB = 1 << 30
 MIB = 1 << 20
 # A start with less free VRAM than the budget less this is refused before any model loads.
 SHORT_MARGIN_GIB = 0.5
-# The allocator's cap sits this far under the budget.
-CAP_MARGIN_GIB = 1.0
+# The allocator's cap sits this far under the budget: the host's floor, which the host and the
+# stage refuse a budget at or under, so every accepted budget leaves the cap above zero.
+CAP_MARGIN_GIB = VRAM_FLOOR_GIB
 # CUDA failures that are out-of-memory errors without being `torch.OutOfMemoryError`.
 OOM_MESSAGES = ("CUDA error: out of memory", "CUBLAS_STATUS_ALLOC_FAILED")
 
@@ -58,12 +61,13 @@ def start(device: str, budget_gib: float) -> VramStart | None:
     Free VRAM below the budget less 0.5 GiB returns a short start and sets no cap.
 
     Raises:
-        ValueError: The budget is 1 GiB or less, which leaves the allocator no room.
+        ValueError: The budget is at or under the host's floor (`VRAM_FLOOR_GIB`, 1 GiB), which
+            leaves the allocator no room.
     """
     if device != CUDA:
         return None
-    if budget_gib <= CAP_MARGIN_GIB:
-        raise ValueError(f"a VRAM budget must be above {CAP_MARGIN_GIB:g} GiB")
+    if budget_gib <= VRAM_FLOOR_GIB:
+        raise ValueError(f"a VRAM budget must be above {VRAM_FLOOR_GIB:g} GiB")
     import torch
 
     free, total = torch.cuda.mem_get_info()
