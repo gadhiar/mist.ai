@@ -2120,6 +2120,34 @@ def test_the_log_says_when_the_models_load_and_each_source_starts(
     assert lines.index(loaded) < lines.index(first) < lines.index(second)
 
 
+def test_a_cuda_log_opens_with_the_card_before_the_models_load(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, _ = progress_run
+    card = "extract: card free 10.4 GiB of 12 GiB, budget 8 GiB, allocator cap 7 GiB"
+    loaded = "extract: models loaded in 0.0 s, peak reserved 3000 MiB, free 4096 MiB"
+    assert [line for line in lines if line.startswith("extract: ")][0] == card
+    assert lines.index(card) < lines.index(loaded)
+
+
+def test_a_cpu_log_has_no_card_line(main_run: Ran) -> None:
+    log = next((main_run.root.path / "runs").glob("job-*/log.txt")).read_text(encoding="utf-8")
+    lines = log.splitlines()
+    assert "extract: models loaded in" in log
+    assert not [line for line in lines if line.startswith("extract: card")]
+
+
+def test_a_short_start_logs_the_card_before_its_result(tmp_path: Path) -> None:
+    root, episode, _ = two_source_root(tmp_path)
+    docker = CudaStageDocker(root, models_for(episode, main_prototypes()), FakeVram(SHORT))
+    code, _, _ = extract(root, docker, "--device", "cuda")
+    assert code == 2
+    log = next((root.path / "runs").glob("job-*/log.txt")).read_text(encoding="utf-8")
+    lines = log.splitlines()
+    card = "extract: card free 6.83 GiB of 12 GiB, budget 8 GiB, allocator cap none"
+    assert lines.index(card) < lines.index("extract: vram-short")
+
+
 def test_tiger_windows_are_logged_at_least_once_a_minute(
     progress_run: tuple[list[str], int],
 ) -> None:
