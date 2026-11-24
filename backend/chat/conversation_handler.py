@@ -2766,6 +2766,7 @@ class ConversationHandler:
                     pending_user_message=user_message,
                     interruption_note=scope.request.interruption_note,
                     scope=scope,
+                    origin=scope.request.origin,
                     channel=scope.request.channel,
                     capability_block=(
                         action_result.block
@@ -4333,6 +4334,7 @@ class ConversationHandler:
         pending_user_message: str,
         interruption_note: Literal["mid_reply", "before_reply"] | None = None,
         scope: TurnScope | None = None,
+        origin: Literal["voice", "text", "system"] = "text",
         channel: Literal["tts", "text"] = "text",
         capability_block: str | None = None,
     ) -> PromptLayout:
@@ -4353,8 +4355,8 @@ class ConversationHandler:
              answer), as one system message: it varies per turn, so it opens
              the tail, ahead of the delta.
           4. Delta and user text: the interruption note, retrieval context,
-             live-data advisory and, on a `tts` turn, the spoken-reply
-             register as labelled blocks in the final user
+             live-data advisory and, on a voice turn on `tts`, the
+             spoken-reply register as labelled blocks in the final user
              message ahead of the user's words (`delta_placement`
              `user_prefix`), or as one system message directly before it
              (`system_tail`). Nothing else follows the history.
@@ -4386,8 +4388,13 @@ class ConversationHandler:
             scope: The turn whose trace receives the profile-dedup and
                 budget feeds. None (a direct call outside a turn) feeds
                 nothing.
-            channel: Where the reply goes. A `tts` turn's delta carries the
-                `register` part asking for a short spoken reply.
+            origin: Who produced the input. With `channel` it decides the
+                `register` part: only a voice turn's delta asks for a short
+                spoken reply. A typed reply spoken on request (protocol
+                2.1.0) is shown as text too, so it keeps the written
+                register and is spoken in full.
+            channel: Where the reply goes. A voice turn on `tts` carries the
+                `register` part; on `text` it carries none.
             capability_block: The actions block of this turn's capability calls
                 (`ActionResult.block`). It is never pruned, so the planner
                 charges it as a fixed segment, and the layout counts it in
@@ -4460,7 +4467,7 @@ class ConversationHandler:
                     prunable=False,
                 )
             )
-        if channel == "tts":
+        if origin == "voice" and channel == "tts":
             whole_parts.append(
                 TurnDeltaPart(kind="register", text=SPOKEN_REGISTER_TEXT, prunable=False)
             )
