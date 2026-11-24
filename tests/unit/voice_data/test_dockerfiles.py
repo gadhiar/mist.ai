@@ -529,6 +529,39 @@ def test_neutts_pins_the_torchao_built_for_its_torch() -> None:
     assert {"torch", "neutts", "torchao", "scripts.voice_data"} <= imported_modules(check)
 
 
+POCKET_VENV = "/opt/venv-train-pocket"
+POCKET_CLONE = "/opt/mist-voice/upstream/pocket-tts"
+POCKET_COMMIT = "ee2ebc89aba9d0121d04d18e29c20eea75bb624e"
+
+
+def test_train_pocket_pins_sphn_and_imports_it() -> None:
+    # The pinned training code imports sphn at module level (training/dataloader/audio.py and
+    # training/eval/librispeech.py), and pocket-tts lists it only in its `dev` group, so the
+    # venv installs it and the image build imports it.
+    assert pinned_versions("requirements-pocket.txt").get("sphn") == "0.2.1"
+    assert "sphn" in imported_modules(import_check("train-pocket.Dockerfile", POCKET_VENV))
+
+
+def test_train_pocket_imports_the_pinned_training_and_alignment_code() -> None:
+    # A second interpreter puts the clone first on sys.path, as the jobs do, so `pocket_tts`
+    # resolves to the clone's package; the first one has already imported the installed one.
+    # training/train.py runs its entry point only under `__main__`, so importing it defines
+    # names and does no work.
+    steps = instructions(DOCKER_DIR / "train-pocket.Dockerfile")
+    clone = f"git clone --filter=blob:none https://github.com/kyutai-labs/pocket-tts {POCKET_CLONE}"
+    checkout = f"git -C {POCKET_CLONE} checkout --detach {POCKET_COMMIT}"
+    assert f"RUN {clone} && {checkout}" in steps[:-5]
+    checks = re.findall(rf"{re.escape(POCKET_VENV)}/bin/python -I -c '([^']*)'", steps[-1])
+    assert len(checks) == 2, steps[-1]
+    check = ast.parse(checks[1])
+    prefix = ast.parse(f'import sys; sys.path[:0] = ["{POCKET_CLONE}"]')
+    assert [ast.unparse(node) for node in check.body[:2]] == [
+        ast.unparse(node) for node in prefix.body
+    ]
+    modules = imported_modules(ast.Module(body=check.body[2:], type_ignores=[]))
+    assert {"training.train", "training.scripts.align_data"} <= modules
+
+
 HIGGS3_TORCH_INDEX = "--extra-index-url https://download.pytorch.org/whl/cu129"
 VLLM_WHEEL = re.compile(
     r"vllm @ https://github\.com/vllm-project/vllm/releases/download/v(?P<tag>[^/\s]+)/"

@@ -22,5 +22,8 @@ RUN test -n "$GIT_SHA" \
 
 COPY scripts/voice_data/ /opt/mist-voice/code/scripts/voice_data/
 COPY scripts/model_bench/ /opt/mist-voice/code/scripts/model_bench/
-RUN /opt/venv-train-pocket/bin/python -I -c 'import torch, torchaudio, pocket_tts, numpy, transformers, soundfile, yaml, jiwer, tqdm, scripts.voice_data' \
+# The second interpreter puts the clone first on sys.path, as the jobs do, so `pocket_tts`
+# resolves to the clone's package and the pinned training and alignment code must import.
+RUN /opt/venv-train-pocket/bin/python -I -c 'import torch, torchaudio, pocket_tts, numpy, transformers, soundfile, yaml, jiwer, tqdm, sphn, scripts.voice_data' \
+ && /opt/venv-train-pocket/bin/python -I -c 'import sys; sys.path[:0] = ["/opt/mist-voice/upstream/pocket-tts"]; import training.train, training.scripts.align_data' \
  && /opt/venv-score/bin/python -I -c 'import scripts.voice_data'
