@@ -401,15 +401,33 @@ def answer_of(answer: dict[str, object]) -> tuple[object, ...]:
 
 
 class TestDispatch:
-    async def test_a_text_message_opens_a_turn_whose_stream_reaches_the_socket(self):
+    async def test_a_text_message_without_playback_opens_a_turn_whose_stream_reaches_the_socket(
+        self,
+    ):
+        """No `playback` key is the protocol 1 message: a typed turn answered in text."""
         rig = await Rig().start()
 
         await rig.send({"type": "text", "text": "what time is it"})
 
-        assert [m.text for m in rig.posted(Text)] == ["what time is it"]
+        assert [(m.text, m.playback) for m in rig.posted(Text)] == [("what time is it", False)]
         assert rig.responder.requests[0].user_text == "what time is it"
         assert "stream_start" in rig.names()
         assert "stream_complete" in rig.names()
+        assert not any(isinstance(item, Frame) for item in rig.socket.sent)
+
+    async def test_a_text_message_with_playback_speaks_its_reply_on_this_socket(self):
+        rig = await Rig([Token("Hello there.")]).start()
+
+        await rig.send({"type": "text", "text": "what time is it", "playback": True})
+        await settle()
+
+        assert [(m.text, m.playback) for m in rig.posted(Text)] == [("what time is it", True)]
+        start = next(i for i in rig.socket.sent if name_of(i) == "stream_start")
+        assert (start["channel"], start["origin"]) == ("tts", "text")
+        audio = [i for i in rig.socket.sent if isinstance(i, Frame)]
+        assert audio and {f.turn_tag for f in audio} == {start["audio_tag"]}
+        assert audio[0].msg_type == MsgType.AUDIO_CHUNK
+        assert rig.responder.commits == []  # it waits on this client's playback_done
 
     async def test_control_messages_reach_the_mailbox_as_their_controller_messages(self):
         rig = await Rig().start()
@@ -840,6 +858,23 @@ class TestLanes:
         purge = rig.session.purge_turn("t1")
 
         assert purge == LanePurge(terminal=False, stream_start=True, first_token=0)
+
+    async def test_an_audio_only_purge_takes_the_turns_frames_and_leaves_its_messages(self):
+        rig = await Rig().start()
+        rig.socket.hold()
+        rig.session.send_control({"type": "status", "message": "held"})
+        await settle()
+
+        start = StreamStartMessage(turn_id="t1", channel="tts", origin="text", audio_tag=5)
+        rig.session.send_turn("t1", start, kind="stream_start")
+        rig.session.send_turn("t1", {"type": "stream_token"}, kind="token", token_index=0)
+        end = Frame(msg_type=MsgType.AUDIO_COMPLETE, turn_tag=5, seq=0, sample_rate=24000)
+        rig.session.send_turn("t1", end, terminal=True)
+        purge = rig.session.purge_turn("t1", audio_only=True)
+        full = rig.session.purge_turn("t1")
+
+        assert purge == LanePurge(terminal=True, stream_start=False, first_token=None)
+        assert full == LanePurge(terminal=False, stream_start=True, first_token=0)
 
     async def test_a_full_turn_lane_closes_with_1013_and_commits_the_turn(self):
         rig = await Rig(max_turn_items=2).start()
@@ -1553,13 +1588,27 @@ class TestTurnLane:
         assert degraded["reason"] == "tts_unavailable"
         assert "hello" not in caplog.text
 
-    async def test_a_typed_turn_is_not_degraded(self):
+    async def test_a_typed_turn_without_playback_is_not_degraded(self):
+        """It asked for text, so a missing synthesizer takes nothing from it."""
         rig = await Rig(synthesizer=False).start()
         await rig.send(voice_start())
 
         await rig.send({"type": "text", "text": "hi"})
 
         assert "voice_decision:degraded" not in rig.names()
+
+    async def test_a_typed_turn_with_playback_and_no_synthesizer_is_degraded_first(self):
+        rig = await Rig([Token("Hi.")], synthesizer=False).start()
+
+        await rig.send({"type": "text", "text": "hi", "playback": True})
+
+        names = rig.names()
+        assert names.index("stream_start") + 1 == names.index("voice_decision:degraded")
+        degraded = next(i for i in rig.socket.sent if name_of(i) == "voice_decision:degraded")
+        assert degraded["reason"] == "tts_unavailable"
+        start = next(i for i in rig.socket.sent if name_of(i) == "stream_start")
+        assert (start["channel"], start["origin"]) == ("text", "text")
+        assert "stream_complete" in names
 
     async def test_the_tts_text_a_session_played_is_readable_for_the_echo_guard(self):
         rig = await Rig().start()

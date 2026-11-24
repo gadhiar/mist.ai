@@ -11,8 +11,10 @@ received, and drains three outbound lanes through one sender:
   full lane means the client stopped reading, so the session closes with 1013.
 - `bulk`: logs and broadcasts, bounded at 512 items, dropping the oldest and counting the drops.
 
-The sender takes one item at a time, so a purge between two takes removes everything the client
-has not been sent yet.
+The sender takes one item at a time, so a purge between two takes removes everything of the turn
+the client has not been sent yet. One cut purges only the turn's binary frames: the stop of a
+spoken typed turn whose reply has finished generating, whose tokens and `stream_complete` the
+client still needs.
 
 A session is bound to an endpoint of a kind: `desktop`, the loopback `/ws`, or `room`, a device
 the listener authenticated. A kind not given is `desktop` for the `desktop` endpoint and `room`
@@ -535,10 +537,14 @@ class RealtimeSession:
         self._closing.set()
 
     def _on_tts_release(self) -> None:
-        """A GPU release cancelled TTS: cut a spoken reply whole, as the UI's stop does.
+        """A GPU release cancelled TTS: stop a spoken reply, as the UI's stop does.
 
         The cancel already ended the synthesis; the interrupt makes the controller end the turn,
-        so it is recorded as interrupted. A typed turn streams no audio and goes on.
+        and the turn's origin decides the record (`TurnController._cut`). A voice turn is
+        recorded as interrupted with its spoken prefix. A typed turn spoken on request (protocol
+        2.1.0) is recorded with the text its client was sent, interrupted while it generates,
+        or completed with its full text once its reply has finished generating. A typed turn
+        without playback streams no audio and goes on.
         """
         if self._spoken_turn is not None and self._controller.phase in ("thinking", "speaking"):
             self._controller.post(Interrupt())
@@ -636,9 +642,12 @@ class RealtimeSession:
         self._schedule_activity_check()
         return True
 
-    def purge_turn(self, turn_id: str) -> LanePurge:
-        """Remove the turn's items the sender has not taken, and report what went."""
-        return self._turn.purge(turn_id)
+    def purge_turn(self, turn_id: str, *, audio_only: bool = False) -> LanePurge:
+        """Remove the turn's items the sender has not taken, and report what went.
+
+        With `audio_only`, only its binary frames go (`TurnLane.purge`).
+        """
+        return self._turn.purge(turn_id, audio_only=audio_only)
 
     def send_bulk(self, item: object) -> None:
         """Queue a log line or broadcast; past the bound the oldest is dropped and counted."""
@@ -654,6 +663,9 @@ class RealtimeSession:
         The controller picks the text channel without saying why; the session knows the slot
         is off, so it queues the decision right after the turn's `stream_start`. A `tts` turn
         is noted, so a GPU release knows a spoken reply is the one to cut.
+
+        A typed turn whose message asked for playback (protocol 2.1.0) gets its
+        `tts_unavailable` from the controller, which holds the message's `playback`.
         """
         self._spoken_turn = start.turn_id if start.channel == "tts" else None
         voice = self._voice
@@ -941,7 +953,7 @@ class RealtimeSession:
             case MuteMessage():
                 self._on_mute(message.active)
             case TextMessage():
-                post(Text(message.text))
+                post(Text(message.text, playback=message.playback))
             case InterruptMessage():
                 post(Interrupt())
             case WakeMessage():

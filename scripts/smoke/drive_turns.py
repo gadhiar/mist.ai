@@ -19,7 +19,7 @@ rather than at exit.
 
 PROTOCOL, verified against source
 ---------------------------------
-The wire contract is the realtime protocol, 2.0.0
+The wire contract is the realtime protocol, 2.1.0
 (`backend/realtime/protocol.py`).
 
 - The endpoint is `@app.websocket("/ws")`, `websocket_endpoint` in

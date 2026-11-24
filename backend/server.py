@@ -265,8 +265,9 @@ def configure_file_logging(log_dir: Path) -> logging.Handler:
 logger = logging.getLogger(__name__)
 
 # The WebSocket protocol version `session_started` announces, imported from the
-# realtime protocol: 2.0.0 is main's 1.4.0 control messages plus protocol 2's
-# own. Pinned by tests/unit/test_server_protocol_version.py.
+# realtime protocol: 2.1.0 is main's 1.4.0 control messages plus protocol 2's
+# own, with `text`'s `playback` flag. Pinned by
+# tests/unit/test_server_protocol_version.py.
 
 # Global state
 # Process-wide producers (heartbeat, system and health status, extraction
@@ -2661,9 +2662,9 @@ async def _handle_action_decision(
 async def websocket_endpoint(websocket: WebSocket):
     """Serve one `RealtimeSession` per connection, through the session registry.
 
-    The authoritative message contract is the realtime protocol, 2.0.0
+    The authoritative message contract is the realtime protocol, 2.1.0
     (`backend/realtime/protocol.py`): main's 1.4.0 control messages plus
-    protocol 2's own. `session_started` carries `protocol_version` and
+    protocol 2's own, with `text`'s `playback` flag. `session_started` carries `protocol_version` and
     `capabilities.voice`; the session then owns the socket. Its receive loop
     sends binary frames to uplink handling and text to control handling and
     never awaits a turn, and its sender drains the `control`, `turn` and `bulk`

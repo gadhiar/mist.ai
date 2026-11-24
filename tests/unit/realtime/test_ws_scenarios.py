@@ -325,7 +325,32 @@ def test_stop_while_thinking_ends_the_turn_with_an_empty_response(voice_server, 
         assert_protocol_rules(client)
 
 
-def test_a_typed_turn_sends_no_binary_frame(voice_server):
+def test_a_typed_turn_with_playback_speaks_to_its_own_connection_only(voice_server):
+    """Protocol 2.1.0: the reply is a `tts` turn of origin `text`, on the asking session alone."""
+    stack = VoiceStack()
+    stack.responder.add(Token("Hello there."))
+    with voice_server(stack) as srv, srv.connect() as asking, srv.connect() as other:
+        asking.send({"type": "text", "text": "hello", "playback": True})
+
+        start = one(asking, "stream_start")
+        assert (start["channel"], start["origin"]) == ("tts", "text")
+        tag = start["audio_tag"]
+        audio = [item for item in asking.voice if isinstance(item, Frame)]
+        assert audio and {frame.turn_tag for frame in audio} == {tag}
+        assert srv.responder.commits == []  # it waits on this client's playback_done
+        asking.finish_playback(str(start["turn_id"]))
+
+        (commit,) = srv.responder.commits
+        assert (commit.outcome, commit.delivered_text) == ("completed", "Hello there.")
+        assert one(asking, "turn_metrics")["origin"] == "text"
+        assert [item for item in other.voice if isinstance(item, Frame)] == []
+        assert other.of("stream_start") == []
+        assert_protocol_rules(asking)
+        assert_protocol_rules(other)
+
+
+def test_a_typed_turn_without_playback_sends_no_binary_frame(voice_server):
+    """A typed message that does not ask for playback is answered in text (protocol 2.1.0)."""
     stack = VoiceStack()
     stack.responder.add(Token("Hello."))
     with voice_server(stack) as srv, srv.connect() as client:

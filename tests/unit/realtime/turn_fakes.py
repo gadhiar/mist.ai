@@ -289,8 +289,8 @@ class RecordingOutbound:
             self.take_all()
         return True
 
-    def purge_turn(self, turn_id: str) -> LanePurge:
-        purge = self.lane.purge(turn_id)
+    def purge_turn(self, turn_id: str, *, audio_only: bool = False) -> LanePurge:
+        purge = self.lane.purge(turn_id, audio_only=audio_only)
         self._purged.add(turn_id)
         self.purges.append((turn_id, purge))
         return purge

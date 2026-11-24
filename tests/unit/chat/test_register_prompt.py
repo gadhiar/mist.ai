@@ -1,13 +1,16 @@
 """The register in the prompt: a fixed prefix line, and a spoken-reply part in the delta.
 
 A spoken reply should be brief, a typed one need not be. The request for brevity rides in
-the per-turn delta of `tts` turns only, so switching between typed and spoken turns never
-moves the cached prefix; the register line every turn shares sits in the stable prefix.
+the per-turn delta of voice turns on `tts` only, so switching between typed and spoken turns
+never moves the cached prefix; the register line every turn shares sits in the stable prefix.
+A typed reply spoken on request (protocol 2.1.0) is shown as text too, so it keeps the written
+register.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 import pytest
 
@@ -91,13 +94,21 @@ def _handler(
     return handler, provider, spy
 
 
-async def _run_turn(handler: ConversationHandler, text: str, *, spoken: bool) -> TurnScope:
+async def _run_turn(
+    handler: ConversationHandler,
+    text: str,
+    *,
+    spoken: bool,
+    origin: Literal["voice", "text"] | None = None,
+    channel: Literal["tts", "text"] | None = None,
+) -> TurnScope:
+    """Run one turn: `spoken` is a voice turn on `tts`; `origin` and `channel` override it."""
     scope = handler.open_turn(
         TurnRequest(
             session_id="s1",
             user_text=text,
-            origin="voice" if spoken else "text",
-            channel="tts" if spoken else "text",
+            origin=origin or ("voice" if spoken else "text"),
+            channel=channel or ("tts" if spoken else "text"),
         )
     )
     async for _event in handler.stream_turn(scope):
@@ -166,8 +177,15 @@ class TestRegisterPromptInThePrefix:
 
 
 class TestSpokenRegisterInTheDelta:
+    """Decision 5 (b): the spoken register is for a voice turn on `tts` only.
+
+    A typed reply with playback (protocol 2.1.0) is on `tts` too, but keeps the written register:
+    its client shows the text, so the delta stays off it.
+    """
+
     @pytest.mark.asyncio
     async def test_tts_turn_carries_one_register_part(self):
+        """A voice turn on `tts`: the one turn that carries the spoken register."""
         handler, provider, spy = _handler(1)
         await _run_turn(handler, "what is on today", spoken=True)
         kwargs, _ = spy.calls[0]
@@ -182,6 +200,7 @@ class TestSpokenRegisterInTheDelta:
 
     @pytest.mark.asyncio
     async def test_text_turn_carries_none(self):
+        """A typed turn without playback, on `text`."""
         handler, provider, spy = _handler(1)
         await _run_turn(handler, "what is on today", spoken=False)
         kwargs, _ = spy.calls[0]
@@ -189,6 +208,26 @@ class TestSpokenRegisterInTheDelta:
         messages = provider.calls[0].messages
         assert all(SPOKEN_REGISTER_TEXT not in m["content"] for m in messages)
         assert messages[-1] == {"role": "user", "content": "what is on today"}
+
+    @pytest.mark.asyncio
+    async def test_a_typed_turn_with_playback_on_tts_carries_none(self):
+        handler, provider, spy = _handler(1)
+        await _run_turn(handler, "what is on today", spoken=False, origin="text", channel="tts")
+        kwargs, _ = spy.calls[0]
+        assert [p for p in kwargs["delta_parts"] if p.kind == "register"] == []
+        messages = provider.calls[0].messages
+        assert all(SPOKEN_REGISTER_TEXT not in m["content"] for m in messages)
+        assert messages[-1] == {"role": "user", "content": "what is on today"}
+
+    @pytest.mark.asyncio
+    async def test_a_voice_turn_on_text_carries_none(self):
+        """No synthesizer, or playback off: the reply is read, so the delta stays off, as before."""
+        handler, provider, spy = _handler(1)
+        await _run_turn(handler, "what is on today", spoken=True, channel="text")
+        kwargs, _ = spy.calls[0]
+        assert [p for p in kwargs["delta_parts"] if p.kind == "register"] == []
+        messages = provider.calls[0].messages
+        assert all(SPOKEN_REGISTER_TEXT not in m["content"] for m in messages)
 
 
 class TestSpokenAndTypedTurnsShareThePrefix:

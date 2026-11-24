@@ -17,8 +17,10 @@ A turn runs as a small task group the mailbox task owns:
 
 A cut cancels the group, waits for it with the wait shielded, purges the turn's queued `turn`
 items, stops the pacer with the purge's `terminal` in the same synchronous step, and commits
-what the client received. The commit is always the last step of a turn, and a turn is
-committed at most once, whichever path ends it: completion, a cut, `close`, or the mailbox
+what the client received. One cut purges the turn's frames alone: a stop of a spoken typed turn
+whose reply has finished generating, which keeps its queued tokens and `stream_complete` and
+completes the turn with its full text. The commit is always the last step of a turn, and a turn
+is committed at most once, whichever path ends it: completion, a cut, `close`, or the mailbox
 task's own cancellation at server shutdown.
 
 A speculative turn starts held at an `EndpointCandidate`: it generates and synthesizes, but
@@ -240,7 +242,7 @@ class Outbound(Protocol):
 
     The controller never touches a WebSocket. `send_turn` takes a `turn` lane item with the
     `TurnLane.put` keywords and serves as the pacer's turn sink; `purge_turn` removes the turn's
-    queued items and reports what it removed.
+    queued items, or with `audio_only` its binary frames alone, and reports what it removed.
     """
 
     def send_control(self, item: object) -> None:
@@ -258,8 +260,8 @@ class Outbound(Protocol):
         """Queue an item of a turn on the `turn` lane."""
         ...
 
-    def purge_turn(self, turn_id: str) -> LanePurge:
-        """Remove every queued `turn` item of the turn."""
+    def purge_turn(self, turn_id: str, *, audio_only: bool = False) -> LanePurge:
+        """Remove every queued `turn` item of the turn, or with `audio_only` its frames alone."""
         ...
 
 
@@ -496,9 +498,10 @@ class WakeArbiter:
 
 @dataclass(frozen=True, slots=True)
 class Text:
-    """A typed message: it becomes a typed turn."""
+    """A typed message: it becomes a typed turn, spoken too when `playback` asked for it."""
 
     text: str
+    playback: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2092,8 +2095,18 @@ class TurnController:
         in `speaking` or `text`, the name barges in. So does it on a turn the capability-only
         path answered, whose text that path has already recorded. The caller has excluded a held
         or ending turn.
+
+        Only a voice turn: a typed turn spoken on request (protocol 2.1.0) is in `thinking` too,
+        but a supersede merges a turn into the speech that continues it, and the name's speech
+        does not continue a typed message. So the name cuts it, and `_supersede` keeps its
+        invariant that a typed turn is never kept.
         """
-        return self._phase == "thinking" and not turn.frames_queued and turn.answered is None
+        return (
+            turn.origin == "voice"
+            and self._phase == "thinking"
+            and not turn.frames_queued
+            and turn.answered is None
+        )
 
     async def _supersede(self, turn: _Turn, utterance_id: str) -> None:
         """Send `supersede`, then cut the turn with reason `superseded` (A51).
@@ -2105,8 +2118,10 @@ class TurnController:
         commit sets it, and its request text leads every turn from that utterance until one is
         released or opens unheld; where none will be, `_commit_kept` records it alone.
 
-        A supersede never finds a turn kept: a typed turn is in `text`, and a turn from the
-        kept turn's utterance that reaches `thinking` resolved it when it opened or was released.
+        A supersede never finds a turn kept: a typed turn is never superseded, even one spoken
+        on request in `thinking` (protocol 2.1.0), since `_supersedes` admits voice turns only,
+        and a turn from the kept turn's utterance that reaches `thinking` resolved it when it
+        opened or was released.
         """
         assert self._kept is None  # noqa: S101 - at most one turn is kept (A51)
         merged = not turn.scope.tool_dispatched
@@ -2394,7 +2409,7 @@ class TurnController:
         unpublished candidate is dropped silently (v5 :1189-1190), its duck undone; the typed
         turn's `think` is the next state. A kept turn (A51) is recorded alone before the typed
         turn opens, so its record comes first; an utterance it waited on that stays open later
-        starts a turn with its own text.
+        starts a turn with its own text. The message's `playback` goes to the channel rule.
         """
         self._drop_candidates("text_input")
         turn = self._turn
@@ -2405,7 +2420,14 @@ class TurnController:
             await self._cut(turn, reason="new_input")
         self._commit_kept()
         now = self._clock.now_ms()
-        self._open_turn(self._next_turn_id(), message.text, "text", base_ms=now, marks={})
+        self._open_turn(
+            self._next_turn_id(),
+            message.text,
+            "text",
+            base_ms=now,
+            marks={},
+            playback=message.playback,
+        )
 
     def _drop_for_text(self, utterance_id: str) -> None:
         """Close the utterance through the `drop` lever naming it, with `dropped text_input`."""
@@ -2422,6 +2444,11 @@ class TurnController:
         self._commit_kept_for(utterance_id)
 
     async def _on_interrupt(self, message: Interrupt) -> None:
+        """The UI's stop, or a GPU release's (`RealtimeSession._on_tts_release`): `barge_in ui`.
+
+        `_cut` decides what follows: a spoken typed turn whose reply has finished generating
+        is faded and completed rather than cut, since its client already shows all of it.
+        """
         turn = self._turn
         if turn is None or turn.ending:
             return
@@ -2467,6 +2494,9 @@ class TurnController:
         """An unpublished candidate is dropped silently with ingress (v5 :1189-1190).
 
         When its hit ducked her playback and no cut follows to stop it, the duck is undone.
+
+        Only a voice turn is cut: switching the microphone off does not silence a typed reply,
+        so a typed turn goes on in any phase, spoken (protocol 2.1.0) or not.
         """
         if self._pending is not None:
             pending, self._pending = self._pending, None
@@ -2476,7 +2506,12 @@ class TurnController:
         cut = False
         if turn is not None and turn.held:
             await self._cancel_held(turn)
-        elif turn is not None and not turn.ending and self._phase in ("thinking", "speaking"):
+        elif (
+            turn is not None
+            and not turn.ending
+            and turn.origin == "voice"
+            and self._phase in ("thinking", "speaking")
+        ):
             cut = True
             self._send_control(
                 VoiceDecisionBargeIn(
@@ -2741,15 +2776,18 @@ class TurnController:
         self._turn_seq += 1
         return f"{self._session_id}-turn-{self._turn_seq}"
 
-    def _channel_for(self, origin: TurnOrigin) -> StreamChannel:
-        """The channel rule: speak a voice turn when TTS is on, loaded, and wanted."""
-        if (
-            origin == "voice"
-            and self._tts_enabled
-            and self._synthesizer is not None
-            and self._settings is not None
-            and self._settings.playback
-        ):
+    def _channel_for(self, origin: TurnOrigin, playback: bool = False) -> StreamChannel:
+        """The channel rule: speak a turn when TTS is on, loaded, and wanted.
+
+        A voice turn is wanted spoken by `voice_start`'s `playback`; a typed turn by its own
+        message's `playback` (protocol 2.1.0), whether or not voice is on, since a client's
+        player can be open with its microphone off.
+        """
+        if not self._tts_enabled or self._synthesizer is None:
+            return "text"
+        if origin == "voice" and self._settings is not None and self._settings.playback:
+            return "tts"
+        if origin == "text" and playback:
             return "tts"
         return "text"
 
@@ -2818,6 +2856,7 @@ class TurnController:
         held_utterance: str | None = None,
         from_utterance: str | None = None,
         answered: tuple[StreamEvent, ...] | None = None,
+        playback: bool = False,
     ) -> None:
         """Open a turn; with `held_utterance` it starts held, answering that utterance.
 
@@ -2829,9 +2868,13 @@ class TurnController:
 
         With `answered` the responder opens nothing: the capability-only path opened, answered
         and committed the turn already, so its scope is the controller's own.
+
+        `playback` is a typed message's request for a spoken reply (protocol 2.1.0). When TTS is
+        enabled but no synthesizer loaded, the turn answers in text and `degraded
+        tts_unavailable` follows its `stream_start`, as the session sends one for a voice turn.
         """
         placement = self._placement()
-        channel = self._channel_for(origin)
+        channel = self._channel_for(origin, playback)
         held = held_utterance is not None
         source = held_utterance if held else from_utterance
         kept = self._kept
@@ -2881,6 +2924,8 @@ class TurnController:
             ),
             kind="stream_start",
         )
+        if origin == "text" and playback and self._tts_enabled and self._synthesizer is None:
+            self._send_degraded(turn, "tts_unavailable")
         turn.scene.phase("thinking", turn_id=turn_id, at=Immediate())
         if turn.audio_tag is not None:
             self._start_speech(turn, turn.audio_tag)
@@ -3504,11 +3549,39 @@ class TurnController:
 
         A held turn never reached the client, so any cut of one, a disconnect included, is a
         cancel without trace.
+
+        What a turn records follows its origin, not its channel. A spoken typed turn (protocol
+        2.1.0) records the text its client was sent, `taken_text`, as a typed turn on `text`
+        does, since the client shows it; its spoken prefix goes only in `stream_cancelled`'s
+        `spoken_text`. Once its reply has finished generating, a stop (`user_interrupt`, which
+        a GPU release also posts) or a new typed message (`new_input`) cuts nothing the client
+        lacks: the audio is stopped with `0x03` and `playback_stop`, and the turn is completed
+        with its full text. That cut purges the turn's frames alone (`audio_only`), in the same
+        synchronous step as the pacer's stop and the scene's `cancel_turn`, so no frame of the
+        tag follows its `0x03`, while its queued tokens and `stream_complete` still reach the
+        client: a full purge would take them, and the purge cannot rebuild them.
         """
         if turn.held:
             await self._cancel_held(turn)
             return
         if turn.ending:
+            return
+        if (
+            notify
+            and turn.origin == "text"
+            and turn.channel == "tts"
+            and turn.stream_done
+            and reason in ("user_interrupt", "new_input")
+        ):
+            turn.token.set()
+            await self._cancel_tasks(turn)
+            assert turn.pacer is not None  # noqa: S101 - a `tts` turn has its pacer
+            purge = self._outbound.purge_turn(turn.turn_id, audio_only=True)
+            turn.pacer.stop(purge.terminal, reason=reason)
+            turn.marks["playback_stopped"] = self._clock.now_ms() + self._playback_config.fade_ms
+            self._scene.cancel_turn(turn.turn_id)
+            self._scene.phase("idle", turn_id=None, at=Immediate())
+            await self._complete(turn)
             return
         turn.ending = True
         turn.disconnected = not notify
@@ -3526,9 +3599,10 @@ class TurnController:
         if turn.channel == "tts":
             assert turn.ledger is not None  # noqa: S101
             spoken = turn.ledger.spoken_text()[: len(taken_text)]
-            delivered = spoken
-            if turn.tts_failed:
-                delivered += "".join(turn.token_texts[turn.text_from_token : taken_count])
+            if turn.origin != "text":
+                delivered = spoken
+                if turn.tts_failed:
+                    delivered += "".join(turn.token_texts[turn.text_from_token : taken_count])
         if notify:
             self._send_turn(
                 turn,
@@ -3605,11 +3679,18 @@ class TurnController:
     def _commit(
         self, turn: _Turn, outcome: Outcome, delivered: str, *, tool_effect_unknown: bool
     ) -> CommitResult:
-        """Commit the turn once; a second request returns the first result and writes nothing."""
+        """Commit the turn once; a second request returns the first result and writes nothing.
+
+        A completed typed turn records every token: its client was sent them all as text, so a
+        spoken one (protocol 2.1.0) whose synthesis failed partway records them too, not the
+        voiced text and the tail a voice turn records.
+        """
         if turn.committed and turn.commit_result is not None:
             return turn.commit_result
         turn.committed = True
         turn.outcome = outcome
+        if turn.origin == "text" and outcome == "completed":
+            delivered = "".join(turn.token_texts)
         delivery = TurnDelivery(
             outcome=outcome,
             delivered_text=delivered,
@@ -3655,6 +3736,13 @@ class TurnController:
         )
 
     def _metrics(self, turn: _Turn) -> TurnMetricsMessage:
+        """The turn's `turn_metrics`; a typed turn's timings are not judged against the budget.
+
+        The latency budget is the voice budget. A typed turn keeps its thinking budget by design
+        (ADR-044), so a spoken one (protocol 2.1.0) would read over `llm_first_token_ms` and
+        `total_p50_ms` for its reasoning alone; its `over_budget` is empty and its timings are
+        still reported.
+        """
         timings = {key: value - turn.base_ms for key, value in turn.marks.items()}
         ledger = turn.ledger
         if "first_played" not in timings and ledger is not None and ledger.recorded_samples > 0:
@@ -3667,6 +3755,9 @@ class TurnController:
         )
         budget = turn.placement.budget
         result = turn.commit_result
+        over_budget = (
+            [] if turn.origin == "text" else judge_over_budget(timings, budget, tool=kind == "tool")
+        )
         return TurnMetricsMessage(
             turn_id=turn.turn_id,
             origin=turn.origin,
@@ -3678,7 +3769,7 @@ class TurnController:
             engines=EnginePlacement(stt=turn.placement.stt, tts=turn.placement.tts),
             timings=timings,
             budget=_wire_budget(budget),
-            over_budget=judge_over_budget(timings, budget, tool=kind == "tool"),
+            over_budget=over_budget,
             ledger_source=turn.ledger.source if turn.ledger is not None else "estimate",
             prompt=_prompt_stats(turn.scope.prompt_stats),
             lanes=TurnLaneStats(stt_wait_ms=0, tts_wait_ms=0, tts_busy_after_cancel_ms=0),

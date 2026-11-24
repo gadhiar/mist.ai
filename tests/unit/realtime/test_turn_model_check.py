@@ -2287,8 +2287,8 @@ def _ignore_purge_result(world: World) -> None:
         def __getattr__(self, name):
             return getattr(world.outbound, name)
 
-        def purge_turn(self, turn_id):
-            purge = world.outbound.purge_turn(turn_id)
+        def purge_turn(self, turn_id, *, audio_only=False):
+            purge = world.outbound.purge_turn(turn_id, audio_only=audio_only)
             return dataclasses.replace(purge, terminal=not purge.terminal)
 
     world.controller._outbound = Flipped()  # type: ignore[assignment]

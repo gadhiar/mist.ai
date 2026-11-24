@@ -45,7 +45,7 @@ loop.
 
 ## Protocol
 
-The WebSocket contract is the realtime protocol, version 2.0.0, defined in
+The WebSocket contract is the realtime protocol, version 2.1.0, defined in
 `realtime/protocol.py`: the binary audio frame codec and every control message schema. The first
 frame on a connection is `session_started`, carrying the server-minted `session_id`,
 `protocol_version` and `capabilities.voice`. A turn opens with `stream_start{turn_id, channel,

@@ -534,7 +534,7 @@ MIST_TEST(server_vector_fields_reach_the_reader) {
 
   CHECK(read("session_started", &in));
   CHECK(in.type == InboundType::SessionStarted);
-  CHECK_STREQ(in.session_started.protocol_version, "2.0.0");
+  CHECK_STREQ(in.session_started.protocol_version, "2.1.0");
 
   CHECK(read("error", &in));
   CHECK(in.type == InboundType::Error);

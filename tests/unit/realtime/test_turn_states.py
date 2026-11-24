@@ -119,7 +119,7 @@ async def published(h: Harness, *partials: str) -> str:
 
 
 async def in_phase(phase: str) -> tuple[Harness, Pause]:
-    """A harness with a turn in `thinking`, `speaking` or `text` (a typed turn)."""
+    """A harness with a turn in `thinking`, `speaking` or `text` (typed, without playback)."""
     pause = Pause()
     if phase == "thinking":
         h = make_harness([pause, Token("Late.")])
@@ -250,7 +250,8 @@ async def test_voice_stop_in_thinking_with_a_frameless_0x02_queued_sends_0x03():
     assert names.index("0x03") < names.index("playback_stop")
 
 
-async def test_voice_stop_in_text_closes_ingress_and_the_typed_turn_completes():
+async def test_voice_stop_in_text_closes_ingress_and_the_typed_turn_without_playback_completes():
+    """`in_phase("text")` types without playback, so the turn is on `text` (protocol 2.1.0)."""
     h, pause = await in_phase("text")
 
     h.post(VoiceStop())
@@ -262,6 +263,33 @@ async def test_voice_stop_in_text_closes_ingress_and_the_typed_turn_completes():
     assert h.outbound.of("voice_decision:barge_in") == []
     assert h.responder.commits[-1].outcome == "completed"
     assert h.responder.commits[-1].delivered_text == "One two three. Four five. Six."
+
+
+@pytest.mark.parametrize("phase", ["thinking", "speaking"])
+async def test_voice_stop_leaves_a_spoken_typed_turn_going(phase):
+    """`voice_stop` cuts voice-origin turns only: a typed reply with playback plays on."""
+    pause = Pause()
+    script = [pause, Token("Late.")] if phase == "thinking" else [Token("One two. "), pause]
+    h = make_harness(script)
+    h.start_voice()
+    h.post(Text("typed", playback=True))
+    await h.settle()
+    typed = h.last_turn()
+    assert h.controller.phase == phase
+
+    h.post(VoiceStop())
+    await h.settle()
+
+    assert calls(h.ingress, "close") == [("close",)]
+    assert h.outbound.of("voice_decision:barge_in") == []
+    assert h.outbound.of("stream_cancelled") == []
+    assert h.responder.commits == []
+    pause.release()
+    await h.settle()
+    h.post(PlaybackDone(turn_id=typed, played_ms=1))
+    await h.settle()
+    (delivery,) = h.responder.commits
+    assert delivery.outcome == "completed"
 
 
 async def test_after_voice_stop_every_ingress_event_is_dropped_and_counted():
@@ -354,7 +382,8 @@ async def test_voice_start_driven_in_a_voice_turns_phase_cuts_it_then_adopts(pha
     pause.release()
 
 
-async def test_voice_start_in_text_keeps_the_typed_turn_going():
+async def test_voice_start_in_text_keeps_the_typed_turn_without_playback_going():
+    """A typed turn keeps its channel: `voice_start`'s `playback` does not make it speak."""
     h, pause = await in_phase("text")
 
     h.post(new_start(h))
@@ -431,7 +460,8 @@ async def test_reconfigure_while_a_turn_runs_waits_for_it_to_complete():
     assert h.responder.commits[-1].outcome == "completed"
 
 
-async def test_reconfigure_in_text_waits_for_the_typed_turn():
+async def test_reconfigure_in_text_waits_for_the_typed_turn_without_playback():
+    """The `text` phase is a typed turn without playback; with playback it is `thinking` first."""
     h, pause = await in_phase("text")
     h.post(request())
     await h.settle()
@@ -1191,8 +1221,9 @@ async def with_open_utterance(
 ) -> tuple[Harness, Pause, str]:
     """A turn in `phase`, with an utterance published in idle before it opened and still open.
 
-    Through the session a typed turn reaches `text` this way; `thinking` and `speaking` with a
-    published utterance open are what a named utterance gives (T11e), driven here directly.
+    Through the session a typed turn without playback reaches `text` this way; `thinking` and
+    `speaking` with a published utterance open are what a named utterance gives (T11e), driven
+    here directly.
     """
     pause = Pause()
     if script is not None:
@@ -1266,6 +1297,7 @@ async def test_speech_resumed_with_no_held_turn_is_ignored(phase):
 
 
 async def test_utterance_ended_in_text_cuts_the_typed_turn_then_starts_a_voice_turn():
+    """The typed turn asked for no playback, so it is in `text` (protocol 2.1.0)."""
     h, pause, uid = await with_open_utterance("text", "what", script=[Token("Typed. "), Pause()])
     typed = h.last_turn()
 
@@ -1354,6 +1386,7 @@ async def test_ui_interrupt_in_idle_is_ignored():
 
 @pytest.mark.parametrize("phase", ["thinking", "speaking"])
 async def test_text_message_in_a_voice_turn_cancels_and_commits_then_runs_a_text_turn(phase):
+    """The message asks for no playback, so the typed turn runs on `text` (protocol 2.1.0)."""
     h, pause = await in_phase(phase)
     voice = h.last_turn()
 
@@ -1535,6 +1568,7 @@ async def test_a_partial_keyword_cut_with_nothing_after_it_ends_in_idle_as_dropp
 
 
 async def test_a_keyword_cut_with_nothing_after_it_ending_in_text_leaves_the_typed_turn_going():
+    """The typed message asks for no playback, so its turn is in `text` (protocol 2.1.0)."""
     h = make_harness([Token("One two three. Four five. "), Pause()], [Token("Typed. "), Pause()])
     h.start_voice()
     await h.speak("hello")
@@ -2269,6 +2303,7 @@ async def test_unnamed_speech_ending_without_a_keyword_closes_silently_and_is_co
 
 
 async def test_a_name_during_a_typed_turn_interrupts_it_after_acceptance():
+    """The typed turn asked for no playback, so the name meets it in `text`."""
     h = make_harness([Token("Typed. "), Pause()], [Pause()])
     h.start_voice()
     h.post(Text("typed"))
@@ -2283,6 +2318,27 @@ async def test_a_name_during_a_typed_turn_interrupts_it_after_acceptance():
     (barge,) = h.outbound.of("voice_decision:barge_in")
     assert (barge.reason, barge.turn_id, barge.detail.phase) == ("wake", typed, "text")
     assert [c.outcome for c in h.responder.commits] == ["interrupted"]
+    assert h.outbound.names()[-1] == "transcript_partial"
+
+
+async def test_a_name_during_a_spoken_typed_turns_thinking_cuts_it_and_never_supersedes():
+    """A supersede merges a voice turn into the speech that continues it; a typed one is cut."""
+    h = make_harness([Pause(), Token("Late.")], [Pause()])
+    h.start_voice()
+    h.post(Text("typed", playback=True))
+    await h.settle()
+    typed = h.last_turn()
+    assert h.controller.phase == "thinking"
+
+    uid = await name_hit(h)
+    await verify(h, uid, "mist, what's the time")
+
+    assert h.outbound.of("voice_decision:supersede") == []
+    (barge,) = h.outbound.of("voice_decision:barge_in")
+    assert (barge.reason, barge.turn_id, barge.detail.phase) == ("wake", typed, "thinking")
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert (cancelled.turn_id, cancelled.reason) == (typed, "barge_in")
+    assert [(c.outcome, c.delivered_text) for c in h.responder.commits] == [("interrupted", "")]
     assert h.outbound.names()[-1] == "transcript_partial"
 
 
