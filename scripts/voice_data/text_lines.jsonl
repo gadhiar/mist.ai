@@ -1,0 +1,1001 @@
+{"line_id": "a0001", "text": "It's a quarter past seven in the morning."}
+{"line_id": "a0002", "text": "The time is twenty to nine."}
+{"line_id": "a0003", "text": "It's just after half past ten at night."}
+{"line_id": "a0004", "text": "Right now it's five minutes to noon."}
+{"line_id": "a0005", "text": "It's ten past three in the afternoon."}
+{"line_id": "a0006", "text": "It's almost midnight, a few minutes to twelve."}
+{"line_id": "a0007", "text": "The clock says six forty-five."}
+{"line_id": "a0008", "text": "It's exactly four o'clock."}
+{"line_id": "a0009", "text": "It's twenty-five past eight in the evening."}
+{"line_id": "a0010", "text": "It's a little after one in the afternoon."}
+{"line_id": "a0011", "text": "It's nine fifteen, so you have plenty of time."}
+{"line_id": "a0012", "text": "The time here is eleven thirty in the morning."}
+{"line_id": "a0013", "text": "It's half past six, and the sun has just come up."}
+{"line_id": "a0014", "text": "It's two minutes past five."}
+{"line_id": "a0015", "text": "You've been working for three hours straight now."}
+{"line_id": "a0016", "text": "It's been forty minutes since you started the meeting."}
+{"line_id": "a0017", "text": "Your alarm is set for six thirty tomorrow morning."}
+{"line_id": "a0018", "text": "I've set an alarm for a quarter to seven."}
+{"line_id": "a0019", "text": "There are two alarms on: one at six and one at seven."}
+{"line_id": "a0020", "text": "Your weekday alarm is set for seven fifteen."}
+{"line_id": "a0021", "text": "I've turned off the alarm for tomorrow."}
+{"line_id": "a0022", "text": "The weekend alarm is off, so you can sleep in."}
+{"line_id": "a0023", "text": "I've moved your alarm to five forty-five."}
+{"line_id": "a0024", "text": "Your alarm will go off in eight hours and ten minutes."}
+{"line_id": "a0025", "text": "That alarm already went off at ten past six."}
+{"line_id": "a0026", "text": "I've added a second alarm ten minutes after the first one."}
+{"line_id": "a0027", "text": "All your alarms are cleared."}
+{"line_id": "a0028", "text": "The next alarm is at nine tomorrow, labelled call back."}
+{"line_id": "a0029", "text": "I've snoozed the alarm for nine minutes."}
+{"line_id": "a0030", "text": "Snooze is set to ten minutes now."}
+{"line_id": "a0031", "text": "Your alarm will play the soft chime instead of the bell."}
+{"line_id": "a0032", "text": "There's no alarm set for Saturday."}
+{"line_id": "a0033", "text": "I've set a daily alarm at noon to remind you to stretch."}
+{"line_id": "a0034", "text": "The alarm for Monday is set to six fifty."}
+{"line_id": "a0035", "text": "That alarm repeats every weekday, but not on weekends."}
+{"line_id": "a0036", "text": "Sunrise tomorrow is at six fifty-two."}
+{"line_id": "a0037", "text": "Sunset today is at a quarter past five."}
+{"line_id": "a0038", "text": "You have about two hours of daylight left."}
+{"line_id": "a0039", "text": "It'll be dark in roughly forty minutes."}
+{"line_id": "a0040", "text": "The days are getting shorter by about two minutes each day now."}
+{"line_id": "a0041", "text": "You have twenty minutes before you need to leave."}
+{"line_id": "a0042", "text": "If you leave at eight, you should arrive just before nine."}
+{"line_id": "a0043", "text": "That gives you about an hour and a half between meetings."}
+{"line_id": "a0044", "text": "You started the oven thirty-five minutes ago."}
+{"line_id": "a0045", "text": "The laundry finished about ten minutes ago."}
+{"line_id": "a0046", "text": "The dishwasher has twenty-two minutes left."}
+{"line_id": "a0047", "text": "The washing machine will be done at a quarter past four."}
+{"line_id": "a0048", "text": "Your call started twelve minutes ago."}
+{"line_id": "a0049", "text": "It's been a week since you last watered the plants."}
+{"line_id": "a0050", "text": "It's been three days since your last backup."}
+{"line_id": "a0051", "text": "Your timer has four minutes and thirty seconds left."}
+{"line_id": "a0052", "text": "There's just under two minutes on the timer."}
+{"line_id": "a0053", "text": "I've started a timer for twenty-five minutes."}
+{"line_id": "a0054", "text": "A five minute timer is running now."}
+{"line_id": "a0055", "text": "The pasta timer has nine minutes to go."}
+{"line_id": "a0056", "text": "Your tea timer is done."}
+{"line_id": "a0057", "text": "Time's up on the eggs."}
+{"line_id": "a0058", "text": "I've paused the timer at three minutes and ten seconds."}
+{"line_id": "a0059", "text": "The timer is running again."}
+{"line_id": "a0060", "text": "I've cancelled the oven timer."}
+{"line_id": "a0061", "text": "You have three timers running: rice, oven and laundry."}
+{"line_id": "a0062", "text": "The rice timer finishes first, in six minutes."}
+{"line_id": "a0063", "text": "I've added five more minutes to the timer."}
+{"line_id": "a0064", "text": "I've set a timer for an hour and a half."}
+{"line_id": "a0065", "text": "The bread timer will go off at twenty past two."}
+{"line_id": "a0066", "text": "Your break timer ends in ten minutes."}
+{"line_id": "a0067", "text": "I've started a stopwatch."}
+{"line_id": "a0068", "text": "The stopwatch is at one minute and forty seconds."}
+{"line_id": "a0069", "text": "Stopwatch stopped at four minutes and twelve seconds."}
+{"line_id": "a0070", "text": "Your focus session has fifteen minutes left."}
+{"line_id": "a0071", "text": "That was a twenty-five minute focus session. Time for a short break."}
+{"line_id": "a0072", "text": "Your break is over. Ready for the next session?"}
+{"line_id": "a0073", "text": "You've finished four focus sessions today."}
+{"line_id": "a0074", "text": "The timer is set for thirty seconds, starting now."}
+{"line_id": "a0075", "text": "I've reset the stopwatch to zero."}
+{"line_id": "a0076", "text": "There's no timer running right now."}
+{"line_id": "a0077", "text": "Both timers finished. Nothing else is running."}
+{"line_id": "a0078", "text": "The second timer has seven minutes left."}
+{"line_id": "a0079", "text": "I'll remind you to take the bread out at three."}
+{"line_id": "a0080", "text": "I'll remind you to call back in twenty minutes."}
+{"line_id": "a0081", "text": "I've set a reminder for tomorrow at nine to pay the electricity bill."}
+{"line_id": "a0082", "text": "Your reminder to water the plants is set for Sunday morning."}
+{"line_id": "a0083", "text": "I'll remind you when you get home to take the bins out."}
+{"line_id": "a0084", "text": "I've set a reminder for Friday at noon to book the car service."}
+{"line_id": "a0085", "text": "You'll get a reminder an hour before the appointment."}
+{"line_id": "a0086", "text": "I'll remind you every evening at eight to take your medicine."}
+{"line_id": "a0087", "text": "Reminder: the parcel arrives between ten and twelve today."}
+{"line_id": "a0088", "text": "Reminder: you wanted to stretch after lunch."}
+{"line_id": "a0089", "text": "Just a reminder, the library books are due tomorrow."}
+{"line_id": "a0090", "text": "This is your reminder to check the oven."}
+{"line_id": "a0091", "text": "You asked me to remind you to send the invoice."}
+{"line_id": "a0092", "text": "Reminder: the meeting moved to half past two."}
+{"line_id": "a0093", "text": "Your reminder to pick up the dry cleaning is for five o'clock."}
+{"line_id": "a0094", "text": "I've moved that reminder to tomorrow at the same time."}
+{"line_id": "a0095", "text": "I've deleted the reminder about the gas bill."}
+{"line_id": "a0096", "text": "You have three reminders left for today."}
+{"line_id": "a0097", "text": "The next reminder is at four, to call the garage."}
+{"line_id": "a0098", "text": "There are no more reminders for today."}
+{"line_id": "a0099", "text": "I've marked that reminder as done."}
+{"line_id": "a0100", "text": "I'll remind you again in fifteen minutes."}
+{"line_id": "a0101", "text": "Your reminders for tomorrow: groceries at ten, gym at six."}
+{"line_id": "a0102", "text": "I've set a monthly reminder on the first to pay rent."}
+{"line_id": "a0103", "text": "The reminder repeats every two weeks, on a Tuesday."}
+{"line_id": "a0104", "text": "I'll remind you on the last day of the month."}
+{"line_id": "a0105", "text": "You have a reminder at seven thirty to leave for the airport."}
+{"line_id": "a0106", "text": "I've set the reminder, and I'll check in again if you miss it."}
+{"line_id": "a0107", "text": "That reminder was for yesterday, so I've cleared it."}
+{"line_id": "a0108", "text": "Do you want the reminder at the same time every day?"}
+{"line_id": "a0109", "text": "Should I remind you before you leave, or when you arrive?"}
+{"line_id": "a0110", "text": "I'll remind you after your next meeting ends."}
+{"line_id": "a0111", "text": "Your reminder to back up the laptop is set for Sunday night."}
+{"line_id": "a0112", "text": "I'll remind you to drink water every two hours until six."}
+{"line_id": "a0113", "text": "The reminder to renew the parking permit is set for the twelfth."}
+{"line_id": "a0114", "text": "I've set the reminder twice: once a week before and once on the day."}
+{"line_id": "a0115", "text": "I've added the reminder to your list, without a time."}
+{"line_id": "a0116", "text": "Reminder: the heating engineer is coming between one and three."}
+{"line_id": "a0117", "text": "Reminder: you're meeting someone for coffee at eleven."}
+{"line_id": "a0118", "text": "Don't forget, the recycling goes out tonight."}
+{"line_id": "a0119", "text": "You wanted a nudge to stand up. This is it."}
+{"line_id": "a0120", "text": "It's time to leave for your appointment."}
+{"line_id": "a0121", "text": "You should head out in five minutes to be on time."}
+{"line_id": "a0122", "text": "Your meeting starts in ten minutes."}
+{"line_id": "a0123", "text": "The call begins in two minutes. Shall I open the link?"}
+{"line_id": "a0124", "text": "Your next meeting is at three, and it's thirty minutes long."}
+{"line_id": "a0125", "text": "Your calendar is clear for the rest of the afternoon."}
+{"line_id": "a0126", "text": "You have four meetings today, the first at nine thirty."}
+{"line_id": "a0127", "text": "Tomorrow starts with a nine o'clock call."}
+{"line_id": "a0128", "text": "The rest of your evening is free."}
+{"line_id": "a0129", "text": "You have nothing scheduled before ten tomorrow."}
+{"line_id": "a0130", "text": "Your next free hour is between two and three."}
+{"line_id": "a0131", "text": "There's a gap from twelve to one, if you want lunch."}
+{"line_id": "a0132", "text": "Your last meeting today ends at five fifteen."}
+{"line_id": "a0133", "text": "I've added the dentist to Thursday at four."}
+{"line_id": "a0134", "text": "I've put the team lunch on Wednesday at half past twelve."}
+{"line_id": "a0135", "text": "I've moved the review from Monday to Tuesday morning."}
+{"line_id": "a0136", "text": "I've cancelled the meeting at three and let the others know."}
+{"line_id": "a0137", "text": "The appointment is booked for the fourteenth at ten."}
+{"line_id": "a0138", "text": "I've blocked off Friday afternoon for focused work."}
+{"line_id": "a0139", "text": "I've added a thirty minute buffer after each meeting."}
+{"line_id": "a0140", "text": "There's a conflict: two meetings overlap at eleven."}
+{"line_id": "a0141", "text": "That time is already taken. How about half past two instead?"}
+{"line_id": "a0142", "text": "I've accepted the invitation for Tuesday."}
+{"line_id": "a0143", "text": "I've declined the invitation and sent a short note."}
+{"line_id": "a0144", "text": "The meeting is set to repeat every Monday at ten."}
+{"line_id": "a0145", "text": "I've shortened tomorrow's meeting to twenty minutes."}
+{"line_id": "a0146", "text": "I've added the address to the event."}
+{"line_id": "a0147", "text": "The event has a link for the video call."}
+{"line_id": "a0148", "text": "Your week has twelve meetings, three fewer than last week."}
+{"line_id": "a0149", "text": "Wednesday is your busiest day, with five meetings."}
+{"line_id": "a0150", "text": "Friday is completely free so far."}
+{"line_id": "a0151", "text": "The project deadline is next Thursday."}
+{"line_id": "a0152", "text": "That deadline is in nine days."}
+{"line_id": "a0153", "text": "You have three weeks until the end of the quarter."}
+{"line_id": "a0154", "text": "Today is Tuesday, the fourth of March."}
+{"line_id": "a0155", "text": "It's Friday, the twenty-first."}
+{"line_id": "a0156", "text": "Tomorrow is Saturday."}
+{"line_id": "a0157", "text": "Yesterday was the tenth."}
+{"line_id": "a0158", "text": "Next Monday is the seventeenth."}
+{"line_id": "a0159", "text": "The first of the month is a Wednesday."}
+{"line_id": "a0160", "text": "There are thirty-one days in October."}
+{"line_id": "a0161", "text": "February has twenty-nine days this year."}
+{"line_id": "a0162", "text": "This is the thirty-second week of the year."}
+{"line_id": "a0163", "text": "There are eighty-four days left in the year."}
+{"line_id": "a0164", "text": "That date falls on a Sunday."}
+{"line_id": "a0165", "text": "The twelfth of June is a Thursday."}
+{"line_id": "a0166", "text": "In two weeks it will be the second of May."}
+{"line_id": "a0167", "text": "Ninety days from today is the eighteenth of August."}
+{"line_id": "a0168", "text": "It's been one hundred and twelve days since the start of the year."}
+{"line_id": "a0169", "text": "The weekend starts in two days."}
+{"line_id": "a0170", "text": "It's the last Friday of the month."}
+{"line_id": "a0171", "text": "That was six weeks ago, on a Tuesday."}
+{"line_id": "a0172", "text": "The clocks go forward one hour this Sunday."}
+{"line_id": "a0173", "text": "The clocks go back an hour this weekend, so you get an extra hour of sleep."}
+{"line_id": "a0174", "text": "Your birthday is in eleven days."}
+{"line_id": "a0175", "text": "The anniversary is on the ninth, a week from Saturday."}
+{"line_id": "a0176", "text": "That's three months and four days from now."}
+{"line_id": "a0177", "text": "The new month starts on Thursday."}
+{"line_id": "a0178", "text": "It's the fifteenth today, so the month is half over."}
+{"line_id": "a0179", "text": "The longest day of the year is next week."}
+{"line_id": "a0180", "text": "The shortest day of the year was on the twenty-first of December."}
+{"line_id": "a0181", "text": "I've added the date to your notes."}
+{"line_id": "a0182", "text": "Spring starts on the twentieth of March this year."}
+{"line_id": "a0183", "text": "Autumn officially begins in about three weeks."}
+{"line_id": "a0184", "text": "Your subscription renews on the first of April."}
+{"line_id": "a0185", "text": "The warranty runs out in November."}
+{"line_id": "a0186", "text": "The lease ends at the end of July."}
+{"line_id": "a0187", "text": "The passport expires in fourteen months."}
+{"line_id": "a0188", "text": "Your car is due for its yearly check in September."}
+{"line_id": "a0189", "text": "The bill is due on the twenty-eighth."}
+{"line_id": "a0190", "text": "The return window closes in five days."}
+{"line_id": "a0191", "text": "The trial period ends this Wednesday."}
+{"line_id": "a0192", "text": "You booked that on the third of January."}
+{"line_id": "a0193", "text": "That was the last time you changed the filter, in early May."}
+{"line_id": "a0194", "text": "The tickets go on sale on Monday at nine."}
+{"line_id": "a0195", "text": "The office is closed on Friday for the holiday."}
+{"line_id": "a0196", "text": "The next long weekend is at the end of August."}
+{"line_id": "a0197", "text": "I'll check again on the first Monday of next month."}
+{"line_id": "a0198", "text": "It's fourteen degrees and cloudy right now."}
+{"line_id": "a0199", "text": "It's going to be sunny all day, with a high of twenty-three."}
+{"line_id": "a0200", "text": "Expect light showers this afternoon, clearing by evening."}
+{"line_id": "a0201", "text": "It's cold out, about three degrees, so take a warm coat."}
+{"line_id": "a0202", "text": "There's a strong wind today, gusting up to fifty kilometres an hour."}
+{"line_id": "a0203", "text": "Tonight will be clear, with a low of four degrees."}
+{"line_id": "a0204", "text": "There's a chance of frost early tomorrow morning."}
+{"line_id": "a0205", "text": "Rain is likely after lunch, so an umbrella would help."}
+{"line_id": "a0206", "text": "It's warm and humid, about twenty-eight degrees."}
+{"line_id": "a0207", "text": "Tomorrow looks dry, with some sun in the afternoon."}
+{"line_id": "a0208", "text": "The forecast says snow overnight, about five centimetres."}
+{"line_id": "a0209", "text": "It's foggy this morning, but it should lift by ten."}
+{"line_id": "a0210", "text": "The rain should stop in about twenty minutes."}
+{"line_id": "a0211", "text": "It's drizzling at the moment, nothing heavy."}
+{"line_id": "a0212", "text": "There's a thunderstorm warning for this evening."}
+{"line_id": "a0213", "text": "The air quality is good today."}
+{"line_id": "a0214", "text": "The pollen count is high this afternoon."}
+{"line_id": "a0215", "text": "It's windy and grey, with a high of eleven."}
+{"line_id": "a0216", "text": "The weekend looks mild, around eighteen degrees both days."}
+{"line_id": "a0217", "text": "Saturday will be wet, but Sunday should be bright."}
+{"line_id": "a0218", "text": "It's colder than yesterday by about five degrees."}
+{"line_id": "a0219", "text": "It feels like zero with the wind chill."}
+{"line_id": "a0220", "text": "Humidity is at seventy percent right now."}
+{"line_id": "a0221", "text": "The temperature will drop quickly after sunset."}
+{"line_id": "a0222", "text": "It's a good day to dry laundry outside."}
+{"line_id": "a0223", "text": "There's a ten percent chance of rain today."}
+{"line_id": "a0224", "text": "There's an eighty percent chance of rain tonight."}
+{"line_id": "a0225", "text": "Heavy rain is expected from midnight until about six."}
+{"line_id": "a0226", "text": "The heat will peak around three this afternoon at thirty-one degrees."}
+{"line_id": "a0227", "text": "Tomorrow morning will be chilly, around two degrees."}
+{"line_id": "a0228", "text": "It's twenty-two degrees inside and nine outside."}
+{"line_id": "a0229", "text": "The rest of the week stays cool and mostly dry."}
+{"line_id": "a0230", "text": "There may be some hail in the early evening."}
+{"line_id": "a0231", "text": "The wind will ease off by tomorrow afternoon."}
+{"line_id": "a0232", "text": "It should be clear enough to see the stars tonight."}
+{"line_id": "a0233", "text": "The sun is strong today, so sunscreen is a good idea."}
+{"line_id": "a0234", "text": "The roads may be icy first thing tomorrow."}
+{"line_id": "a0235", "text": "It's raining harder now than an hour ago."}
+{"line_id": "a0236", "text": "The storm should pass by around nine."}
+{"line_id": "a0237", "text": "The high today is nineteen, and the low is eight."}
+{"line_id": "a0238", "text": "Next week starts cold and warms up by Thursday."}
+{"line_id": "a0239", "text": "It's the warmest day of the month so far."}
+{"line_id": "a0240", "text": "It's been dry for eleven days in a row."}
+{"line_id": "a0241", "text": "Rainfall this month is about half the usual amount."}
+{"line_id": "a0242", "text": "There's a light breeze from the west."}
+{"line_id": "a0243", "text": "The temperature in the bedroom is nineteen degrees."}
+{"line_id": "a0244", "text": "The living room is a bit warm at twenty-five degrees."}
+{"line_id": "a0245", "text": "The kitchen is the coldest room right now, at seventeen."}
+{"line_id": "a0246", "text": "The humidity in the bathroom is high. I've turned on the fan."}
+{"line_id": "a0247", "text": "I've set the heating to twenty degrees."}
+{"line_id": "a0248", "text": "I've lowered the heating to eighteen for the night."}
+{"line_id": "a0249", "text": "The heating will come on at six thirty tomorrow."}
+{"line_id": "a0250", "text": "I've turned the heating off. The house is warm enough."}
+{"line_id": "a0251", "text": "The fan is on its lowest setting."}
+{"line_id": "a0252", "text": "I've turned on the air conditioning and set it to twenty-two."}
+{"line_id": "a0253", "text": "The thermostat is in eco mode until you get home."}
+{"line_id": "a0254", "text": "The house should reach twenty-one degrees in about half an hour."}
+{"line_id": "a0255", "text": "The windows in the bedroom are still open."}
+{"line_id": "a0256", "text": "I've closed the blinds in the living room."}
+{"line_id": "a0257", "text": "The blinds will open at seven tomorrow."}
+{"line_id": "a0258", "text": "That comes to sixty-four."}
+{"line_id": "a0259", "text": "The answer is three hundred and twelve."}
+{"line_id": "a0260", "text": "Twelve times twelve is one hundred and forty-four."}
+{"line_id": "a0261", "text": "Half of ninety is forty-five."}
+{"line_id": "a0262", "text": "Fifteen percent of eighty is twelve."}
+{"line_id": "a0263", "text": "A third of a hundred and fifty is fifty."}
+{"line_id": "a0264", "text": "The square root of eighty-one is nine."}
+{"line_id": "a0265", "text": "Two to the power of ten is one thousand and twenty-four."}
+{"line_id": "a0266", "text": "That comes to forty-seven fifty in total."}
+{"line_id": "a0267", "text": "Split four ways, that's eighteen each."}
+{"line_id": "a0268", "text": "With the tip, the total is fifty-two forty."}
+{"line_id": "a0269", "text": "Seven hundred divided by twenty-five is twenty-eight."}
+{"line_id": "a0270", "text": "Nine plus fourteen plus twenty-one makes forty-four."}
+{"line_id": "a0271", "text": "The difference is two hundred and six."}
+{"line_id": "a0272", "text": "That's an increase of about twelve percent."}
+{"line_id": "a0273", "text": "The average of those numbers is sixty-one."}
+{"line_id": "a0274", "text": "Rounded up, that's three thousand."}
+{"line_id": "a0275", "text": "That's roughly one in four."}
+{"line_id": "a0276", "text": "Three quarters of that is ninety."}
+{"line_id": "a0277", "text": "Eighteen out of twenty is ninety percent."}
+{"line_id": "a0278", "text": "That number is prime."}
+{"line_id": "a0279", "text": "Forty-two is not a prime number. It divides by two, three and seven."}
+{"line_id": "a0280", "text": "One million seconds is about eleven and a half days."}
+{"line_id": "a0281", "text": "A billion has nine zeros."}
+{"line_id": "a0282", "text": "There are sixty minutes in an hour and three thousand six hundred seconds."}
+{"line_id": "a0283", "text": "A day has one thousand four hundred and forty minutes."}
+{"line_id": "a0284", "text": "A year has fifty-two weeks and one day, or two in a leap year."}
+{"line_id": "a0285", "text": "Twenty-four hours from now is the same time tomorrow."}
+{"line_id": "a0286", "text": "Ten kilometres is about six point two miles."}
+{"line_id": "a0287", "text": "One mile is roughly one point six kilometres."}
+{"line_id": "a0288", "text": "A kilogram is about two point two pounds."}
+{"line_id": "a0289", "text": "Five pounds is a little under two point three kilograms."}
+{"line_id": "a0290", "text": "Twenty degrees Celsius is sixty-eight degrees Fahrenheit."}
+{"line_id": "a0291", "text": "One hundred degrees Fahrenheit is about thirty-eight Celsius."}
+{"line_id": "a0292", "text": "Zero degrees Celsius is thirty-two Fahrenheit."}
+{"line_id": "a0293", "text": "One litre is just over two pints."}
+{"line_id": "a0294", "text": "A cup is about two hundred and fifty millilitres."}
+{"line_id": "a0295", "text": "A tablespoon is fifteen millilitres, and a teaspoon is five."}
+{"line_id": "a0296", "text": "One inch is two point five four centimetres."}
+{"line_id": "a0297", "text": "Six feet is about one hundred and eighty-three centimetres."}
+{"line_id": "a0298", "text": "A metre is a little over three feet."}
+{"line_id": "a0299", "text": "One hectare is ten thousand square metres."}
+{"line_id": "a0300", "text": "A gallon is about three point eight litres."}
+{"line_id": "a0301", "text": "One ounce is about twenty-eight grams."}
+{"line_id": "a0302", "text": "Half a kilo is five hundred grams."}
+{"line_id": "a0303", "text": "A marathon is about forty-two kilometres."}
+{"line_id": "a0304", "text": "Eighty kilometres an hour is about fifty miles an hour."}
+{"line_id": "a0305", "text": "A gigabyte is about a thousand megabytes."}
+{"line_id": "a0306", "text": "Three hours and forty minutes is two hundred and twenty minutes."}
+{"line_id": "a0307", "text": "Nine hundred seconds is fifteen minutes."}
+{"line_id": "a0308", "text": "Two and a half hours is one hundred and fifty minutes."}
+{"line_id": "a0309", "text": "Six weeks is forty-two days."}
+{"line_id": "a0310", "text": "Ten thousand steps is roughly eight kilometres."}
+{"line_id": "a0311", "text": "You've walked about six thousand steps today."}
+{"line_id": "a0312", "text": "You're four thousand steps short of your goal."}
+{"line_id": "a0313", "text": "Your step count is up a fifth on last week."}
+{"line_id": "a0314", "text": "You slept seven hours and twenty minutes last night."}
+{"line_id": "a0315", "text": "You went to bed about an hour later than usual."}
+{"line_id": "a0316", "text": "Your heart rate is sixty-two beats a minute."}
+{"line_id": "a0317", "text": "You drank five glasses of water so far today."}
+{"line_id": "a0318", "text": "You've been sitting for an hour. Maybe stretch for a minute."}
+{"line_id": "a0319", "text": "Your screen time today is three hours and ten minutes."}
+{"line_id": "a0320", "text": "You spent forty-five pounds on groceries this week."}
+{"line_id": "a0321", "text": "That's twelve more than last week."}
+{"line_id": "a0322", "text": "Your phone battery is at eighteen percent."}
+{"line_id": "a0323", "text": "The laptop is fully charged."}
+{"line_id": "a0324", "text": "The headphones are at forty percent."}
+{"line_id": "a0325", "text": "Your watch has about a day of battery left."}
+{"line_id": "a0326", "text": "The robot vacuum is charging and will be ready in an hour."}
+{"line_id": "a0327", "text": "The car is charged to eighty percent."}
+{"line_id": "a0328", "text": "The battery should last until about nine tonight."}
+{"line_id": "a0329", "text": "The battery in the front door sensor is low."}
+{"line_id": "a0330", "text": "The smoke alarm in the hallway needs a new battery."}
+{"line_id": "a0331", "text": "The water heater is on and will be ready in twenty minutes."}
+{"line_id": "a0332", "text": "The freezer is at minus eighteen degrees, which is normal."}
+{"line_id": "a0333", "text": "The fridge door has been open for two minutes."}
+{"line_id": "a0334", "text": "The kettle has boiled."}
+{"line_id": "a0335", "text": "The oven has reached one hundred and eighty degrees."}
+{"line_id": "a0336", "text": "The coffee is ready."}
+{"line_id": "a0337", "text": "The washing machine finished its cycle."}
+{"line_id": "a0338", "text": "The dryer has stopped. Your clothes are ready."}
+{"line_id": "a0339", "text": "The dishwasher is done, and the dishes are dry."}
+{"line_id": "a0340", "text": "The robot vacuum has finished the living room."}
+{"line_id": "a0341", "text": "The garden lights will turn on at sunset."}
+{"line_id": "a0342", "text": "The front door is locked."}
+{"line_id": "a0343", "text": "The back door is unlocked. Should I lock it?"}
+{"line_id": "a0344", "text": "All the doors are locked and the windows are closed."}
+{"line_id": "a0345", "text": "The garage door is still open."}
+{"line_id": "a0346", "text": "I've closed the garage door."}
+{"line_id": "a0347", "text": "Nobody's at the front door now."}
+{"line_id": "a0348", "text": "Someone rang the doorbell two minutes ago."}
+{"line_id": "a0349", "text": "A parcel was left at the front door at eleven."}
+{"line_id": "a0350", "text": "The camera saw movement in the garden a minute ago."}
+{"line_id": "a0351", "text": "The alarm system is armed."}
+{"line_id": "a0352", "text": "I've disarmed the alarm. Welcome back."}
+{"line_id": "a0353", "text": "The house is set to away mode."}
+{"line_id": "a0354", "text": "Everything is switched off except the fridge and the router."}
+{"line_id": "a0355", "text": "The power use today is lower than average."}
+{"line_id": "a0356", "text": "You used about nine kilowatt hours of electricity yesterday."}
+{"line_id": "a0357", "text": "The solar panels made more power than you used today."}
+{"line_id": "a0358", "text": "The internet connection is back up."}
+{"line_id": "a0359", "text": "The internet is slow right now. Speeds are about a quarter of normal."}
+{"line_id": "a0360", "text": "The router restarted at four this morning."}
+{"line_id": "a0361", "text": "Six devices are connected to the network."}
+{"line_id": "a0362", "text": "A new device joined the network a few minutes ago."}
+{"line_id": "a0363", "text": "The printer is out of black ink."}
+{"line_id": "a0364", "text": "The printer is ready and has paper."}
+{"line_id": "a0365", "text": "Your document finished printing."}
+{"line_id": "a0366", "text": "The update finished installing. A restart is needed."}
+{"line_id": "a0367", "text": "Your laptop has two updates waiting."}
+{"line_id": "a0368", "text": "The backup is complete. Nothing failed."}
+{"line_id": "a0369", "text": "The backup is forty percent done."}
+{"line_id": "a0370", "text": "The download will finish in about six minutes."}
+{"line_id": "a0371", "text": "The file is about two hundred megabytes."}
+{"line_id": "a0372", "text": "Your storage is almost full, with three gigabytes left."}
+{"line_id": "a0373", "text": "I've cleared the temporary files. That freed up four gigabytes."}
+{"line_id": "a0374", "text": "The upload finished a moment ago."}
+{"line_id": "a0375", "text": "The sync is up to date."}
+{"line_id": "a0376", "text": "Your password was changed successfully."}
+{"line_id": "a0377", "text": "That account is locked for fifteen minutes after too many tries."}
+{"line_id": "a0378", "text": "The code expires in five minutes."}
+{"line_id": "a0379", "text": "Water boils at one hundred degrees Celsius at sea level."}
+{"line_id": "a0380", "text": "Water freezes at zero degrees Celsius."}
+{"line_id": "a0381", "text": "Light from the sun takes about eight minutes to reach the earth."}
+{"line_id": "a0382", "text": "The moon goes around the earth about once every twenty-seven days."}
+{"line_id": "a0383", "text": "A spider has eight legs, and an insect has six."}
+{"line_id": "a0384", "text": "An octopus has three hearts."}
+{"line_id": "a0385", "text": "Bananas are berries, but strawberries are not."}
+{"line_id": "a0386", "text": "Honey can keep for a very long time without going off."}
+{"line_id": "a0387", "text": "A group of crows is sometimes called a murder."}
+{"line_id": "a0388", "text": "Cats sleep for about twelve to sixteen hours a day."}
+{"line_id": "a0389", "text": "An adult human has two hundred and six bones."}
+{"line_id": "a0390", "text": "The heart beats roughly one hundred thousand times a day."}
+{"line_id": "a0391", "text": "Most people blink about fifteen to twenty times a minute."}
+{"line_id": "a0392", "text": "Sound travels at about three hundred and forty metres a second in air."}
+{"line_id": "a0393", "text": "Light travels about three hundred thousand kilometres every second."}
+{"line_id": "a0394", "text": "The tallest trees can grow over one hundred metres high."}
+{"line_id": "a0395", "text": "A leap year comes every four years, with a few exceptions."}
+{"line_id": "a0396", "text": "There are seven continents and five oceans."}
+{"line_id": "a0397", "text": "Gold is very soft for a metal."}
+{"line_id": "a0398", "text": "Diamonds are made of carbon."}
+{"line_id": "a0399", "text": "The human body is about sixty percent water."}
+{"line_id": "a0400", "text": "Bamboo can grow almost a metre in a single day."}
+{"line_id": "a0401", "text": "A rainbow has seven colours, from red to violet."}
+{"line_id": "a0402", "text": "Rainbows appear when sunlight passes through raindrops."}
+{"line_id": "a0403", "text": "Lightning is hotter than the surface of the sun."}
+{"line_id": "a0404", "text": "Thunder is the sound of air expanding around a lightning bolt."}
+{"line_id": "a0405", "text": "You can tell how far away a storm is by counting between the flash and the thunder."}
+{"line_id": "a0406", "text": "Snowflakes usually have six sides."}
+{"line_id": "a0407", "text": "Penguins can't fly, but they swim very well."}
+{"line_id": "a0408", "text": "Owls can turn their heads a long way round, but not all the way."}
+{"line_id": "a0409", "text": "A hummingbird's heart can beat over a thousand times a minute."}
+{"line_id": "a0410", "text": "Some turtles can live for more than a hundred years."}
+{"line_id": "a0411", "text": "Whales are mammals, not fish."}
+{"line_id": "a0412", "text": "A cheetah can run over one hundred kilometres an hour in short bursts."}
+{"line_id": "a0413", "text": "Elephants can't jump."}
+{"line_id": "a0414", "text": "Sharks have been around longer than trees."}
+{"line_id": "a0415", "text": "A snail can sleep for a very long time when it's dry."}
+{"line_id": "a0416", "text": "Plants turn sunlight into food through photosynthesis."}
+{"line_id": "a0417", "text": "Leaves change colour in autumn as the green pigment breaks down."}
+{"line_id": "a0418", "text": "Most of the oxygen we breathe comes from the ocean."}
+{"line_id": "a0419", "text": "The deepest part of the ocean is about eleven kilometres down."}
+{"line_id": "a0420", "text": "The air is mostly nitrogen, with about a fifth oxygen."}
+{"line_id": "a0421", "text": "Salt water freezes at a lower temperature than fresh water."}
+{"line_id": "a0422", "text": "Ice floats because it's less dense than liquid water."}
+{"line_id": "a0423", "text": "Copper is a good conductor of electricity."}
+{"line_id": "a0424", "text": "Glass is made mainly from sand."}
+{"line_id": "a0425", "text": "Vinegar and baking soda make a fizzy reaction."}
+{"line_id": "a0426", "text": "Bread rises because yeast produces gas as it feeds."}
+{"line_id": "a0427", "text": "Onions make your eyes water because they release a gas when cut."}
+{"line_id": "a0428", "text": "Eggs float in water when they're no longer fresh."}
+{"line_id": "a0429", "text": "Rice usually needs about twice its volume in water."}
+{"line_id": "a0430", "text": "Pasta needs about ten to twelve minutes in boiling water."}
+{"line_id": "a0431", "text": "A soft boiled egg takes about six minutes."}
+{"line_id": "a0432", "text": "A hard boiled egg takes about ten minutes."}
+{"line_id": "a0433", "text": "Chicken is safe to eat once the middle reaches seventy-five degrees."}
+{"line_id": "a0434", "text": "Let bread cool for at least half an hour before slicing it."}
+{"line_id": "a0435", "text": "Cooked rice is best eaten within a day."}
+{"line_id": "a0436", "text": "Leftovers keep for about three days in the fridge."}
+{"line_id": "a0437", "text": "Frozen bread lasts for about three months."}
+{"line_id": "a0438", "text": "Butter softens in about half an hour at room temperature."}
+{"line_id": "a0439", "text": "A pinch of salt is roughly a sixteenth of a teaspoon."}
+{"line_id": "a0440", "text": "One egg weighs about fifty grams without the shell."}
+{"line_id": "a0441", "text": "A medium potato takes about an hour to bake."}
+{"line_id": "a0442", "text": "Steamed broccoli takes five to seven minutes."}
+{"line_id": "a0443", "text": "Tea is best brewed for three to five minutes."}
+{"line_id": "a0444", "text": "Green tea likes water just below boiling, around eighty degrees."}
+{"line_id": "a0445", "text": "Coffee keeps best in an airtight container away from light."}
+{"line_id": "a0446", "text": "Cut flowers last longer if you trim the stems every few days."}
+{"line_id": "a0447", "text": "Most houseplants prefer to dry out a little between waterings."}
+{"line_id": "a0448", "text": "Tomatoes ripen faster in a paper bag."}
+{"line_id": "a0449", "text": "Basil prefers warm, sunny spots and regular water."}
+{"line_id": "a0450", "text": "A cactus needs water only every couple of weeks."}
+{"line_id": "a0451", "text": "Grass grows fastest in late spring."}
+{"line_id": "a0452", "text": "A typical adult needs seven to nine hours of sleep."}
+{"line_id": "a0453", "text": "Drinking water helps with headaches caused by dehydration."}
+{"line_id": "a0454", "text": "A short walk after a meal can help with digestion."}
+{"line_id": "a0455", "text": "Stretching for a few minutes can ease a stiff back."}
+{"line_id": "a0456", "text": "Looking away from the screen every twenty minutes helps your eyes."}
+{"line_id": "a0457", "text": "The word for a word that reads the same backwards is palindrome."}
+{"line_id": "a0458", "text": "A palindrome reads the same in both directions, like level or noon."}
+{"line_id": "a0459", "text": "The plural of mouse is mice."}
+{"line_id": "a0460", "text": "The past tense of swim is swam."}
+{"line_id": "a0461", "text": "Affect is usually a verb, and effect is usually a noun."}
+{"line_id": "a0462", "text": "A synonym for happy is cheerful."}
+{"line_id": "a0463", "text": "The opposite of generous is mean or stingy."}
+{"line_id": "a0464", "text": "There are twenty-six letters in the alphabet."}
+{"line_id": "a0465", "text": "The most common letter in written text is the letter e."}
+{"line_id": "a0466", "text": "A haiku has three lines of five, seven and five syllables."}
+{"line_id": "a0467", "text": "A sonnet has fourteen lines."}
+{"line_id": "a0468", "text": "A dozen is twelve, and a baker's dozen is thirteen."}
+{"line_id": "a0469", "text": "A score is another word for twenty."}
+{"line_id": "a0470", "text": "A fortnight is two weeks."}
+{"line_id": "a0471", "text": "A decade is ten years, and a century is a hundred."}
+{"line_id": "a0472", "text": "A millennium is a thousand years."}
+{"line_id": "a0473", "text": "An octagon has eight sides."}
+{"line_id": "a0474", "text": "A hexagon has six sides, like a honeycomb cell."}
+{"line_id": "a0475", "text": "A triangle's angles always add up to one hundred and eighty degrees."}
+{"line_id": "a0476", "text": "A right angle is ninety degrees."}
+{"line_id": "a0477", "text": "Pi is about three point one four."}
+{"line_id": "a0478", "text": "Zero is an even number."}
+{"line_id": "a0479", "text": "An odd number plus an odd number is always even."}
+{"line_id": "a0480", "text": "The chance of flipping heads twice in a row is one in four."}
+{"line_id": "a0481", "text": "A standard deck has fifty-two cards."}
+{"line_id": "a0482", "text": "A die has six faces, and opposite faces add up to seven."}
+{"line_id": "a0483", "text": "There are sixty-four squares on a chess board."}
+{"line_id": "a0484", "text": "A chess game starts with sixteen pieces each."}
+{"line_id": "a0485", "text": "In chess, the knight moves two squares one way and one square to the side."}
+{"line_id": "a0486", "text": "A football match lasts ninety minutes plus stoppage time."}
+{"line_id": "a0487", "text": "A tennis set is usually won by the first to six games."}
+{"line_id": "a0488", "text": "A piano has eighty-eight keys."}
+{"line_id": "a0489", "text": "A violin has four strings, and a guitar usually has six."}
+{"line_id": "a0490", "text": "A minute of silence feels much longer than it is."}
+{"line_id": "a0491", "text": "I'm not sure about that one. Should I look it up?"}
+{"line_id": "a0492", "text": "I don't know the answer to that, but I can find out."}
+{"line_id": "a0493", "text": "I can't say for certain. The figures I have are a few years old."}
+{"line_id": "a0494", "text": "That depends on where you measure it, so take it as a rough guide."}
+{"line_id": "a0495", "text": "That's a common myth, but it isn't true."}
+{"line_id": "a0496", "text": "That's partly right. The full answer is a bit more complicated."}
+{"line_id": "a0497", "text": "That's correct, well remembered."}
+{"line_id": "a0498", "text": "Yes, that's right, as far as I know."}
+{"line_id": "a0499", "text": "Close, but not quite. It's slightly more than that."}
+{"line_id": "a0500", "text": "No, it's the other way round."}
+{"line_id": "a0501", "text": "Good question. The short answer is yes."}
+{"line_id": "a0502", "text": "The short answer is no, but there are exceptions."}
+{"line_id": "a0503", "text": "Most likely yes, though I'd double check before relying on it."}
+{"line_id": "a0504", "text": "Probably not, from what I can see."}
+{"line_id": "a0505", "text": "It's about the size of a tennis ball."}
+{"line_id": "a0506", "text": "It weighs roughly as much as a bag of sugar."}
+{"line_id": "a0507", "text": "It's about the height of a door."}
+{"line_id": "a0508", "text": "That would take about four hours on foot."}
+{"line_id": "a0509", "text": "By car, that's around forty minutes without traffic."}
+{"line_id": "a0510", "text": "The traffic is heavy, so allow an extra twenty minutes."}
+{"line_id": "a0511", "text": "The route through town is faster today by about ten minutes."}
+{"line_id": "a0512", "text": "There's a delay on your usual route because of roadworks."}
+{"line_id": "a0513", "text": "Your bus is running five minutes late."}
+{"line_id": "a0514", "text": "The next bus is in seven minutes."}
+{"line_id": "a0515", "text": "The last train back leaves at eleven forty."}
+{"line_id": "a0516", "text": "Your taxi is three minutes away."}
+{"line_id": "a0517", "text": "The driver has arrived and is waiting outside."}
+{"line_id": "a0518", "text": "The parcel is out for delivery and should arrive by two."}
+{"line_id": "a0519", "text": "Your order has been dispatched."}
+{"line_id": "a0520", "text": "The delivery was moved to tomorrow morning."}
+{"line_id": "a0521", "text": "The shop closes at six today and opens at nine tomorrow."}
+{"line_id": "a0522", "text": "The pharmacy is open until eight tonight."}
+{"line_id": "a0523", "text": "The post office is closed all day on Sunday."}
+{"line_id": "a0524", "text": "The nearest petrol station is about two kilometres away."}
+{"line_id": "a0525", "text": "There are three cafes within a ten minute walk."}
+{"line_id": "a0526", "text": "That restaurant is open until ten, and it's quiet right now."}
+{"line_id": "a0527", "text": "The walk to the station takes about twelve minutes."}
+{"line_id": "a0528", "text": "The park is a fifteen minute walk from here."}
+{"line_id": "a0529", "text": "The library is open until seven on weekdays."}
+{"line_id": "a0530", "text": "Okay, the lights are off."}
+{"line_id": "a0531", "text": "I've turned on the kitchen lights."}
+{"line_id": "a0532", "text": "The living room lights are at half brightness now."}
+{"line_id": "a0533", "text": "I've dimmed the bedroom lights to twenty percent."}
+{"line_id": "a0534", "text": "The hallway light is on."}
+{"line_id": "a0535", "text": "I've turned off every light in the house."}
+{"line_id": "a0536", "text": "The lamp in the study is on."}
+{"line_id": "a0537", "text": "I've set the lights to a warm white."}
+{"line_id": "a0538", "text": "The lights are now a cool daylight colour."}
+{"line_id": "a0539", "text": "The bedroom lights will fade out over the next ten minutes."}
+{"line_id": "a0540", "text": "The porch light will stay on until eleven."}
+{"line_id": "a0541", "text": "I've turned the bathroom light off."}
+{"line_id": "a0542", "text": "Brightness is up to full."}
+{"line_id": "a0543", "text": "The lights in the dining room are already off."}
+{"line_id": "a0544", "text": "The desk lamp is on, at seventy percent."}
+{"line_id": "a0545", "text": "I've switched the lights to night mode."}
+{"line_id": "a0546", "text": "The garden lights are on."}
+{"line_id": "a0547", "text": "I've turned on the reading light."}
+{"line_id": "a0548", "text": "All the downstairs lights are off, and the upstairs landing is on."}
+{"line_id": "a0549", "text": "The light in the spare room was left on. I've turned it off."}
+{"line_id": "a0550", "text": "The lights will come on gradually from six forty-five."}
+{"line_id": "a0551", "text": "I've set the lights to turn off when you leave."}
+{"line_id": "a0552", "text": "Playing some quiet music in the kitchen."}
+{"line_id": "a0553", "text": "I've paused the music."}
+{"line_id": "a0554", "text": "Resuming playback from where you stopped."}
+{"line_id": "a0555", "text": "Skipping to the next track."}
+{"line_id": "a0556", "text": "Going back to the start of the song."}
+{"line_id": "a0557", "text": "The volume is at thirty percent."}
+{"line_id": "a0558", "text": "I've turned the volume down a little."}
+{"line_id": "a0559", "text": "I've turned it up to sixty."}
+{"line_id": "a0560", "text": "Muted. Say the word when you want sound back."}
+{"line_id": "a0561", "text": "I've stopped the music in every room."}
+{"line_id": "a0562", "text": "The music will stop in thirty minutes."}
+{"line_id": "a0563", "text": "I've started the podcast where you left off."}
+{"line_id": "a0564", "text": "You're twenty minutes into the episode."}
+{"line_id": "a0565", "text": "That episode is fifty-four minutes long."}
+{"line_id": "a0566", "text": "I've added that song to your favourites."}
+{"line_id": "a0567", "text": "I've shuffled the playlist."}
+{"line_id": "a0568", "text": "The playlist is on repeat now."}
+{"line_id": "a0569", "text": "I'm playing the radio in the living room."}
+{"line_id": "a0570", "text": "I've moved the music to the bedroom speaker."}
+{"line_id": "a0571", "text": "The music is now playing in the kitchen and the living room."}
+{"line_id": "a0572", "text": "The audiobook will continue from chapter six."}
+{"line_id": "a0573", "text": "I've set a sleep timer for twenty minutes."}
+{"line_id": "a0574", "text": "The television is off."}
+{"line_id": "a0575", "text": "The television is on, and the volume is at twelve."}
+{"line_id": "a0576", "text": "I've switched the television to standby."}
+{"line_id": "a0577", "text": "I've added milk to the shopping list."}
+{"line_id": "a0578", "text": "Eggs, bread and butter are on the list now."}
+{"line_id": "a0579", "text": "Your shopping list has nine items."}
+{"line_id": "a0580", "text": "I've removed coffee from the list. You bought it yesterday."}
+{"line_id": "a0581", "text": "The list has tomatoes, onions, rice and olive oil."}
+{"line_id": "a0582", "text": "You already have washing up liquid on the list."}
+{"line_id": "a0583", "text": "I've cleared the shopping list."}
+{"line_id": "a0584", "text": "Three items on the list are marked as bought."}
+{"line_id": "a0585", "text": "I've added batteries and light bulbs to the hardware list."}
+{"line_id": "a0586", "text": "You still need to buy a birthday card."}
+{"line_id": "a0587", "text": "I've started a new list called weekend jobs."}
+{"line_id": "a0588", "text": "The weekend jobs list has four things on it."}
+{"line_id": "a0589", "text": "I've added fix the shelf to your to do list."}
+{"line_id": "a0590", "text": "You have six tasks for today, and two are done."}
+{"line_id": "a0591", "text": "The most urgent task is the tax form, due on Friday."}
+{"line_id": "a0592", "text": "I've marked the report as done."}
+{"line_id": "a0593", "text": "I've moved the remaining tasks to tomorrow."}
+{"line_id": "a0594", "text": "That task has been on your list for three weeks."}
+{"line_id": "a0595", "text": "You finished eleven tasks this week."}
+{"line_id": "a0596", "text": "Your to do list is empty. Nice."}
+{"line_id": "a0597", "text": "I've saved that as a note."}
+{"line_id": "a0598", "text": "The note is saved with today's date."}
+{"line_id": "a0599", "text": "I've added that to your notes about the garden."}
+{"line_id": "a0600", "text": "You have three notes from this morning."}
+{"line_id": "a0601", "text": "I've read back the last note: buy paint, the pale one."}
+{"line_id": "a0602", "text": "I've deleted that note."}
+{"line_id": "a0603", "text": "Your note from Monday says to call the plumber."}
+{"line_id": "a0604", "text": "I've pinned the note to the top."}
+{"line_id": "a0605", "text": "I've written down the number, ending in four five six."}
+{"line_id": "a0606", "text": "The code for the gate is saved in your notes."}
+{"line_id": "a0607", "text": "I've saved the parking spot: level three, row twelve."}
+{"line_id": "a0608", "text": "You parked on the second floor, near the lifts."}
+{"line_id": "a0609", "text": "Your keys were last seen near the front door, according to the tag."}
+{"line_id": "a0610", "text": "The tag on your bag is in the bedroom."}
+{"line_id": "a0611", "text": "Your phone is in the kitchen. I'll make it ring."}
+{"line_id": "a0612", "text": "Ringing your phone now."}
+{"line_id": "a0613", "text": "Your message has been sent."}
+{"line_id": "a0614", "text": "I've sent the text saying you'll be ten minutes late."}
+{"line_id": "a0615", "text": "I've drafted a reply. Shall I read it back?"}
+{"line_id": "a0616", "text": "The message says the meeting has moved to Thursday."}
+{"line_id": "a0617", "text": "You have two new messages."}
+{"line_id": "a0618", "text": "There are no new messages."}
+{"line_id": "a0619", "text": "The last message came in about an hour ago."}
+{"line_id": "a0620", "text": "You have a missed call from earlier this afternoon."}
+{"line_id": "a0621", "text": "I've set your status to busy until four."}
+{"line_id": "a0622", "text": "Do not disturb is on until seven tomorrow morning."}
+{"line_id": "a0623", "text": "I've turned off do not disturb."}
+{"line_id": "a0624", "text": "Notifications are silenced during your focus time."}
+{"line_id": "a0625", "text": "I've turned on the quiet hours from ten at night."}
+{"line_id": "a0626", "text": "You have four unread emails, and one is marked important."}
+{"line_id": "a0627", "text": "Your inbox is clear."}
+{"line_id": "a0628", "text": "I've archived the newsletters from this week."}
+{"line_id": "a0629", "text": "I've flagged that email for follow up on Monday."}
+{"line_id": "a0630", "text": "The email has a document attached, about two pages long."}
+{"line_id": "a0631", "text": "Sent. The reply should arrive within a minute."}
+{"line_id": "a0632", "text": "I've scheduled the email to send at eight tomorrow morning."}
+{"line_id": "a0633", "text": "I've added that address to your contacts."}
+{"line_id": "a0634", "text": "That number isn't in your contacts."}
+{"line_id": "a0635", "text": "Calling now. It's ringing."}
+{"line_id": "a0636", "text": "The call has ended. It lasted seven minutes."}
+{"line_id": "a0637", "text": "Sure, I can do that."}
+{"line_id": "a0638", "text": "Okay, I'll do that now."}
+{"line_id": "a0639", "text": "Done. Anything else?"}
+{"line_id": "a0640", "text": "Alright, that's set."}
+{"line_id": "a0641", "text": "Got it. I've saved it."}
+{"line_id": "a0642", "text": "Understood. I'll leave it as it is."}
+{"line_id": "a0643", "text": "Okay, I've changed it back."}
+{"line_id": "a0644", "text": "No problem. It's sorted."}
+{"line_id": "a0645", "text": "Sure, give me a second."}
+{"line_id": "a0646", "text": "All set for tomorrow."}
+{"line_id": "a0647", "text": "That's done, and I've double checked it."}
+{"line_id": "a0648", "text": "Okay, I've cancelled it."}
+{"line_id": "a0649", "text": "I've undone the last change."}
+{"line_id": "a0650", "text": "Of course. I'll keep it to myself."}
+{"line_id": "a0651", "text": "Right, I'll stop there."}
+{"line_id": "a0652", "text": "Fine by me. I'll wait until you're ready."}
+{"line_id": "a0653", "text": "Okay, I'll check on it again in an hour."}
+{"line_id": "a0654", "text": "Sure thing. It'll be ready when you get back."}
+{"line_id": "a0655", "text": "I've saved your settings."}
+{"line_id": "a0656", "text": "Your preferences are updated."}
+{"line_id": "a0657", "text": "That's been switched on."}
+{"line_id": "a0658", "text": "That's been switched off."}
+{"line_id": "a0659", "text": "Yes, that's on right now."}
+{"line_id": "a0660", "text": "No, that's currently off."}
+{"line_id": "a0661", "text": "I've made a note of that for next time."}
+{"line_id": "a0662", "text": "Okay, I won't ask about that again."}
+{"line_id": "a0663", "text": "I'll remember that you prefer the shorter version."}
+{"line_id": "a0664", "text": "I'll use metric units from now on."}
+{"line_id": "a0665", "text": "I'll keep the answers brief."}
+{"line_id": "a0666", "text": "Sorry, I didn't catch that. Could you say it again?"}
+{"line_id": "a0667", "text": "Sorry, I'm not sure what you mean. Could you put it another way?"}
+{"line_id": "a0668", "text": "Did you mean the kitchen light or the hallway light?"}
+{"line_id": "a0669", "text": "Which list should I add that to?"}
+{"line_id": "a0670", "text": "Do you want that for today or tomorrow?"}
+{"line_id": "a0671", "text": "For how long should I set the timer?"}
+{"line_id": "a0672", "text": "What time should I set the alarm for?"}
+{"line_id": "a0673", "text": "Do you want me to repeat that?"}
+{"line_id": "a0674", "text": "Should I read the whole thing, or just the summary?"}
+{"line_id": "a0675", "text": "Would you like the full forecast or just today?"}
+{"line_id": "a0676", "text": "There are two timers. Which one should I stop?"}
+{"line_id": "a0677", "text": "Do you want me to turn them all off?"}
+{"line_id": "a0678", "text": "Shall I remind you again later?"}
+{"line_id": "a0679", "text": "Do you want the same thing as last time?"}
+{"line_id": "a0680", "text": "Should I send it now or wait until morning?"}
+{"line_id": "a0681", "text": "I can do that, but it will cancel the other one. Is that okay?"}
+{"line_id": "a0682", "text": "That will delete the whole list. Are you sure?"}
+{"line_id": "a0683", "text": "Just to confirm, you want the alarm at five, not six?"}
+{"line_id": "a0684", "text": "Before I do that, do you want to save the current settings?"}
+{"line_id": "a0685", "text": "Sorry, I can't reach the kitchen speaker right now."}
+{"line_id": "a0686", "text": "The bedroom light isn't responding. I'll try again in a moment."}
+{"line_id": "a0687", "text": "That device seems to be offline."}
+{"line_id": "a0688", "text": "I couldn't connect to the thermostat. It may need a restart."}
+{"line_id": "a0689", "text": "Something went wrong on my end. Let me try that again."}
+{"line_id": "a0690", "text": "That didn't work. I'll try a different way."}
+{"line_id": "a0691", "text": "The connection timed out, so nothing was changed."}
+{"line_id": "a0692", "text": "I can't do that yet, but I've noted that you asked."}
+{"line_id": "a0693", "text": "That setting isn't available on this device."}
+{"line_id": "a0694", "text": "I don't have access to that account."}
+{"line_id": "a0695", "text": "I'm having trouble hearing you over the music."}
+{"line_id": "a0696", "text": "Sorry, that took longer than it should have."}
+{"line_id": "a0697", "text": "Sorry about that. It's working now."}
+{"line_id": "a0698", "text": "My mistake. I've corrected it."}
+{"line_id": "a0699", "text": "You're right, I had that wrong. Thanks for catching it."}
+{"line_id": "a0700", "text": "I've retried, and this time it worked."}
+{"line_id": "a0701", "text": "The service is down right now. I'll check again in ten minutes."}
+{"line_id": "a0702", "text": "I've lost the network for a moment. Give me a few seconds."}
+{"line_id": "a0703", "text": "I'm back online now. Sorry for the gap."}
+{"line_id": "a0704", "text": "Everything is working normally again."}
+{"line_id": "a0705", "text": "Here's what I found."}
+{"line_id": "a0706", "text": "Here's the summary of the report."}
+{"line_id": "a0707", "text": "Here are the three main points."}
+{"line_id": "a0708", "text": "First, the price went up. Second, delivery is slower. Third, the size is smaller."}
+{"line_id": "a0709", "text": "In short, it's cheaper to buy the larger pack."}
+{"line_id": "a0710", "text": "The larger box works out about twenty percent cheaper per item."}
+{"line_id": "a0711", "text": "The cheaper option costs fourteen less but takes two days longer."}
+{"line_id": "a0712", "text": "Both options cost about the same."}
+{"line_id": "a0713", "text": "The second one has better reviews, on average four and a half stars."}
+{"line_id": "a0714", "text": "That one is out of stock until next week."}
+{"line_id": "a0715", "text": "The price dropped by six since yesterday."}
+{"line_id": "a0716", "text": "That's within your budget, with about thirty left over."}
+{"line_id": "a0717", "text": "That would put you about ten over budget for the month."}
+{"line_id": "a0718", "text": "You've spent sixty percent of this month's budget so far."}
+{"line_id": "a0719", "text": "Your balance is a bit lower than at this point last month."}
+{"line_id": "a0720", "text": "The payment went through."}
+{"line_id": "a0721", "text": "The refund should arrive in three to five working days."}
+{"line_id": "a0722", "text": "Your bill this month is a little higher than usual."}
+{"line_id": "a0723", "text": "The electricity bill is up by eight percent on last quarter."}
+{"line_id": "a0724", "text": "The water bill is due next Tuesday."}
+{"line_id": "a0725", "text": "I've set the payment to go out on the first of each month."}
+{"line_id": "a0726", "text": "There was a small charge this morning for your music subscription."}
+{"line_id": "a0727", "text": "You have three subscriptions renewing this month."}
+{"line_id": "a0728", "text": "Let's take it one step at a time."}
+{"line_id": "a0729", "text": "Step one: unplug the router. Step two: wait thirty seconds. Step three: plug it back in."}
+{"line_id": "a0730", "text": "First preheat the oven to two hundred degrees."}
+{"line_id": "a0731", "text": "Next, mix the flour and the butter until it looks like breadcrumbs."}
+{"line_id": "a0732", "text": "Then add the eggs one at a time."}
+{"line_id": "a0733", "text": "Bake for twenty-five minutes, or until golden."}
+{"line_id": "a0734", "text": "Let it rest for ten minutes before serving."}
+{"line_id": "a0735", "text": "That's the last step. You're done."}
+{"line_id": "a0736", "text": "You're on step four of seven."}
+{"line_id": "a0737", "text": "The next step is to add the stock and simmer for fifteen minutes."}
+{"line_id": "a0738", "text": "Should I go back a step?"}
+{"line_id": "a0739", "text": "I'll wait until you say next."}
+{"line_id": "a0740", "text": "Take your time. I'll be here."}
+{"line_id": "a0741", "text": "Here's the next one when you're ready."}
+{"line_id": "a0742", "text": "That's all the steps. Enjoy your meal."}
+{"line_id": "a0743", "text": "Good morning. It's seven, and it's twelve degrees outside."}
+{"line_id": "a0744", "text": "Good morning. You have two meetings today and it looks dry."}
+{"line_id": "a0745", "text": "Good afternoon. Your next meeting is in forty minutes."}
+{"line_id": "a0746", "text": "Good evening. The house is warm and the doors are locked."}
+{"line_id": "a0747", "text": "Good night. I've turned off the lights and set your alarm for seven."}
+{"line_id": "a0748", "text": "Welcome home. I've turned the heating up."}
+{"line_id": "a0749", "text": "Welcome back. You've had one delivery while you were out."}
+{"line_id": "a0750", "text": "Hello. What can I do for you?"}
+{"line_id": "a0751", "text": "Hi there. What do you need?"}
+{"line_id": "a0752", "text": "Morning. The kettle's on."}
+{"line_id": "a0753", "text": "Sleep well. Your alarm is set for six forty-five."}
+{"line_id": "a0754", "text": "See you later. I'll lock up behind you."}
+{"line_id": "a0755", "text": "Have a good trip. I've set the house to away mode."}
+{"line_id": "a0756", "text": "Enjoy your lunch. I'll hold your notifications until one."}
+{"line_id": "a0757", "text": "Thanks. I'll pass that on."}
+{"line_id": "a0758", "text": "You're welcome. Anything else?"}
+{"line_id": "a0759", "text": "Happy to help with that."}
+{"line_id": "a0760", "text": "Any time. Just ask me again."}
+{"line_id": "a0761", "text": "Glad that worked out."}
+{"line_id": "a0762", "text": "That sounds like a good plan."}
+{"line_id": "a0763", "text": "That's a sensible choice."}
+{"line_id": "a0764", "text": "That should do it for now."}
+{"line_id": "a0765", "text": "That ought to fix it."}
+{"line_id": "a0766", "text": "Good luck with the presentation."}
+{"line_id": "a0767", "text": "I hope the interview goes well."}
+{"line_id": "a0768", "text": "Take care on the roads. It's icy this morning."}
+{"line_id": "a0769", "text": "Remember to take an umbrella. It's likely to rain by three."}
+{"line_id": "a0770", "text": "Don't forget your keys. They're still on the table."}
+{"line_id": "a0771", "text": "You might want a jacket. It gets cold after six."}
+{"line_id": "a0772", "text": "It's late. You have an early start tomorrow."}
+{"line_id": "a0773", "text": "You've been on the screen a long time. A short break might help."}
+{"line_id": "a0774", "text": "There's still time to make the earlier bus if you leave now."}
+{"line_id": "a0775", "text": "You'll be home before the rain starts if you go now."}
+{"line_id": "a0776", "text": "The meeting notes are saved in the project folder."}
+{"line_id": "a0777", "text": "I've shared the document with the rest of the group."}
+{"line_id": "a0778", "text": "The file was last edited twenty minutes ago."}
+{"line_id": "a0779", "text": "The document is eleven pages long."}
+{"line_id": "a0780", "text": "That spreadsheet has four hundred rows."}
+{"line_id": "a0781", "text": "I've renamed the file to include today's date."}
+{"line_id": "a0782", "text": "I've moved the photos into the holiday folder."}
+{"line_id": "a0783", "text": "You took sixty-two photos yesterday."}
+{"line_id": "a0784", "text": "There are three new photos from this morning."}
+{"line_id": "a0785", "text": "I've made a copy of the file before changing it."}
+{"line_id": "a0786", "text": "The older version is still there if you need it."}
+{"line_id": "a0787", "text": "I've exported the report as a document."}
+{"line_id": "a0788", "text": "The presentation has eighteen slides."}
+{"line_id": "a0789", "text": "You have about twelve minutes per section if you keep to time."}
+{"line_id": "a0790", "text": "At your usual pace, that's about a fifteen minute read."}
+{"line_id": "a0791", "text": "The article takes roughly six minutes to read."}
+{"line_id": "a0792", "text": "The recording is forty-three minutes long."}
+{"line_id": "a0793", "text": "I've set a reminder to finish the chapter tonight."}
+{"line_id": "a0794", "text": "You're on page one hundred and twelve, about halfway through."}
+{"line_id": "a0795", "text": "You've read three books this year."}
+{"line_id": "a0796", "text": "That book is about three hundred and fifty pages."}
+{"line_id": "a0797", "text": "The film runs for two hours and eight minutes."}
+{"line_id": "a0798", "text": "If you start the film now, it'll finish at ten fifteen."}
+{"line_id": "a0799", "text": "The next episode starts automatically in ten seconds."}
+{"line_id": "a0800", "text": "You have two episodes left in the series."}
+{"line_id": "a0801", "text": "The match starts at half past seven."}
+{"line_id": "a0802", "text": "The score is two all, with ten minutes to go."}
+{"line_id": "a0803", "text": "The game went to extra time and ended three to two."}
+{"line_id": "a0804", "text": "The race starts in forty-five minutes."}
+{"line_id": "a0805", "text": "Your workout today is thirty minutes of easy running."}
+{"line_id": "a0806", "text": "You ran five kilometres in twenty-eight minutes."}
+{"line_id": "a0807", "text": "That's your fastest time this month by about a minute."}
+{"line_id": "a0808", "text": "You've exercised four days this week."}
+{"line_id": "a0809", "text": "Rest day today. Your next workout is tomorrow."}
+{"line_id": "a0810", "text": "Your water goal for today is two litres, and you're at one and a half."}
+{"line_id": "a0811", "text": "You've hit your step goal for the day."}
+{"line_id": "a0812", "text": "Time to stand up and move around for a couple of minutes."}
+{"line_id": "a0813", "text": "Breathe in for four seconds, hold for four, and breathe out for six."}
+{"line_id": "a0814", "text": "Let's do that once more, slowly."}
+{"line_id": "a0815", "text": "The stretch is done. How does that feel?"}
+{"line_id": "a0816", "text": "Your bedtime reminder is set for half past ten."}
+{"line_id": "a0817", "text": "It's a quarter past ten. Bedtime in fifteen minutes."}
+{"line_id": "a0818", "text": "You've been asleep for about six hours, and it's five in the morning."}
+{"line_id": "a0819", "text": "The alarm will go off in twenty minutes, but you can rest until then."}
+{"line_id": "a0820", "text": "I've started your morning routine: lights, kettle and the news summary."}
+{"line_id": "a0821", "text": "The news summary is about four minutes long today."}
+{"line_id": "a0822", "text": "There's no major news this morning."}
+{"line_id": "a0823", "text": "Here's the weather, then your calendar, then any messages."}
+{"line_id": "a0824", "text": "That's everything for this morning."}
+{"line_id": "a0825", "text": "Your evening routine has started. The lights are dimming."}
+{"line_id": "a0826", "text": "The house is ready for the night."}
+{"line_id": "a0827", "text": "I've locked the doors and turned down the heating."}
+{"line_id": "a0828", "text": "The night light in the hallway is on."}
+{"line_id": "a0829", "text": "I've set everything to come back on at six thirty."}
+{"line_id": "a0830", "text": "The guest room is warm and the bed light is on."}
+{"line_id": "a0831", "text": "I've started the robot vacuum in the kitchen."}
+{"line_id": "a0832", "text": "The vacuum will skip the bedroom while you're asleep."}
+{"line_id": "a0833", "text": "The vacuum is stuck under the sofa."}
+{"line_id": "a0834", "text": "The plant in the window needs water today."}
+{"line_id": "a0835", "text": "The soil sensor in the garden says it's dry."}
+{"line_id": "a0836", "text": "I've turned on the sprinkler for ten minutes."}
+{"line_id": "a0837", "text": "The sprinkler is off. It will rain tomorrow anyway."}
+{"line_id": "a0838", "text": "The bins go out on Wednesday night this week."}
+{"line_id": "a0839", "text": "The recycling collection moved to Thursday this week."}
+{"line_id": "a0840", "text": "The window cleaner is coming on the second Friday of the month."}
+{"line_id": "a0841", "text": "The boiler service is booked for the morning of the ninth."}
+{"line_id": "a0842", "text": "The smoke alarms were last tested three months ago."}
+{"line_id": "a0843", "text": "It's time to change the water filter."}
+{"line_id": "a0844", "text": "The cooker hood filter should be cleaned this month."}
+{"line_id": "a0845", "text": "The car needs fuel. You have about sixty kilometres left."}
+{"line_id": "a0846", "text": "The tyre pressure on the front left is a little low."}
+{"line_id": "a0847", "text": "The car is unlocked. Should I lock it?"}
+{"line_id": "a0848", "text": "The car is parked on the street, about two minutes away."}
+{"line_id": "a0849", "text": "Your journey home will take about thirty-five minutes."}
+{"line_id": "a0850", "text": "You'll arrive at about twenty past six."}
+{"line_id": "a0851", "text": "You're about ten minutes from home."}
+{"line_id": "a0852", "text": "There's a quicker route that saves eight minutes."}
+{"line_id": "a0853", "text": "I've sent your arrival time to the house, so the heating will be ready."}
+{"line_id": "a0854", "text": "The petrol here is a little cheaper than at the usual place."}
+{"line_id": "a0855", "text": "The car park closes at midnight."}
+{"line_id": "a0856", "text": "Parking costs two an hour, up to a maximum of ten."}
+{"line_id": "a0857", "text": "You have forty minutes left on the parking meter."}
+{"line_id": "a0858", "text": "I'll remind you ten minutes before the parking runs out."}
+{"line_id": "a0859", "text": "Your flight leaves in four hours."}
+{"line_id": "a0860", "text": "Check in opens two hours before departure."}
+{"line_id": "a0861", "text": "The gate closes thirty minutes before the flight."}
+{"line_id": "a0862", "text": "The flight is on time."}
+{"line_id": "a0863", "text": "The flight is delayed by about forty minutes."}
+{"line_id": "a0864", "text": "Your bag allowance is twenty-three kilograms."}
+{"line_id": "a0865", "text": "The journey takes about two and a half hours."}
+{"line_id": "a0866", "text": "You land at nine forty in the evening, local time."}
+{"line_id": "a0867", "text": "The hotel check in starts at three in the afternoon."}
+{"line_id": "a0868", "text": "Checkout is at eleven tomorrow morning."}
+{"line_id": "a0869", "text": "I've packed your list into the notes: chargers, clothes, toothbrush and tickets."}
+{"line_id": "a0870", "text": "Your train is on time and leaves from the far platform."}
+{"line_id": "a0871", "text": "Your seat is in the third carriage, near the window."}
+{"line_id": "a0872", "text": "You change trains once, with eighteen minutes between them."}
+{"line_id": "a0873", "text": "The return ticket is valid for a month."}
+{"line_id": "a0874", "text": "The ferry leaves every hour, on the hour."}
+{"line_id": "a0875", "text": "The time difference is two hours ahead."}
+{"line_id": "a0876", "text": "It's early evening there now, around six."}
+{"line_id": "a0877", "text": "There are about five hours until sunrise."}
+{"line_id": "a0878", "text": "Tonight will be the full moon."}
+{"line_id": "a0879", "text": "The moon is about half full tonight."}
+{"line_id": "a0880", "text": "The next new moon is in eleven days."}
+{"line_id": "a0881", "text": "There's a meteor shower tonight. The best time to look is after midnight."}
+{"line_id": "a0882", "text": "The sky should be clear around ten, if you want to look at the stars."}
+{"line_id": "a0883", "text": "Here's a fun fact: a day on some planets is longer than their year."}
+{"line_id": "a0884", "text": "Here's one: some metals are soft enough to cut with a knife."}
+{"line_id": "a0885", "text": "Did you know that a group of owls is called a parliament?"}
+{"line_id": "a0886", "text": "Fun fact: koalas sleep up to twenty hours a day."}
+{"line_id": "a0887", "text": "A quick fact: sea otters hold hands while they sleep."}
+{"line_id": "a0888", "text": "Here's a riddle. What has keys but can't open locks? A piano."}
+{"line_id": "a0889", "text": "What gets wetter the more it dries? A towel."}
+{"line_id": "a0890", "text": "Why did the scarecrow win an award? Because he was outstanding in his field."}
+{"line_id": "a0891", "text": "That one was a joke, in case it wasn't obvious."}
+{"line_id": "a0892", "text": "I'll keep the jokes to a minimum today."}
+{"line_id": "a0893", "text": "Heads. You win this one."}
+{"line_id": "a0894", "text": "Tails, this time. Best of three?"}
+{"line_id": "a0895", "text": "I picked a number between one and ten. It's seven."}
+{"line_id": "a0896", "text": "You rolled a four this time."}
+{"line_id": "a0897", "text": "You rolled two dice: a three and a six, for nine in total."}
+{"line_id": "a0898", "text": "The coin landed on heads three times in a row."}
+{"line_id": "a0899", "text": "It's your turn now. Take your time."}
+{"line_id": "a0900", "text": "That's a draw. Shall we play again?"}
+{"line_id": "a0901", "text": "You scored eighteen points, two more than last time."}
+{"line_id": "a0902", "text": "I spell it c, o, l, o, u, r."}
+{"line_id": "a0903", "text": "That word has three syllables."}
+{"line_id": "a0904", "text": "That word rhymes with light, bright and night."}
+{"line_id": "a0905", "text": "It's spelled with two r's and two s's."}
+{"line_id": "a0906", "text": "The capital letter goes at the start of the sentence."}
+{"line_id": "a0907", "text": "Here it is, read back slowly."}
+{"line_id": "a0908", "text": "I'll say that again, a little slower."}
+{"line_id": "a0909", "text": "Let me read the numbers one at a time: four, seven, two, nine."}
+{"line_id": "a0910", "text": "The reference number ends in eight three one."}
+{"line_id": "a0911", "text": "The total, including delivery, is twenty-six fifty."}
+{"line_id": "a0912", "text": "The order should arrive between nine and one tomorrow."}
+{"line_id": "a0913", "text": "I've added the receipt to your expenses."}
+{"line_id": "a0914", "text": "You have seven receipts this month to file."}
+{"line_id": "a0915", "text": "I've filed the receipts in the expenses folder."}
+{"line_id": "a0916", "text": "The expense report totals one hundred and eighty."}
+{"line_id": "a0917", "text": "Your next payday is in nine days."}
+{"line_id": "a0918", "text": "The savings goal is seventy percent complete."}
+{"line_id": "a0919", "text": "You saved a little more this month than last."}
+{"line_id": "a0920", "text": "Interest on the account was just under four this month."}
+{"line_id": "a0921", "text": "That subscription costs about the same as two coffees a month."}
+{"line_id": "a0922", "text": "At that rate, it pays for itself in about eight months."}
+{"line_id": "a0923", "text": "That's a fair price for something that size."}
+{"line_id": "a0924", "text": "Prices for that have gone up about ten percent this year."}
+{"line_id": "a0925", "text": "You could save around fifteen by waiting for the weekly offer."}
+{"line_id": "a0926", "text": "I'll keep an eye on the price and tell you if it drops."}
+{"line_id": "a0927", "text": "The price dropped. It's now within your limit."}
+{"line_id": "a0928", "text": "The battery on the smoke alarm is fine."}
+{"line_id": "a0929", "text": "The window in the bathroom has been open for an hour."}
+{"line_id": "a0930", "text": "It's getting cold in the bathroom. Should I close the window?"}
+{"line_id": "a0931", "text": "I've turned on the dehumidifier in the laundry room."}
+{"line_id": "a0932", "text": "The dehumidifier tank is full."}
+{"line_id": "a0933", "text": "The air in the study is a bit stale. Opening a window might help."}
+{"line_id": "a0934", "text": "The carbon dioxide level in the bedroom is a little high."}
+{"line_id": "a0935", "text": "The house was quiet while you were out."}
+{"line_id": "a0936", "text": "Nothing unusual happened overnight."}
+{"line_id": "a0937", "text": "The front door opened at eight twelve and closed at eight thirteen."}
+{"line_id": "a0938", "text": "There were two deliveries today, both left at the door."}
+{"line_id": "a0939", "text": "The camera's battery is at ten percent."}
+{"line_id": "a0940", "text": "The doorbell camera is back online."}
+{"line_id": "a0941", "text": "I've turned the cameras off while you're home."}
+{"line_id": "a0942", "text": "The motion alert in the garden was a cat."}
+{"line_id": "a0943", "text": "The guest has the door code until Sunday."}
+{"line_id": "a0944", "text": "I've changed the door code. The old one no longer works."}
+{"line_id": "a0945", "text": "The cleaner's access is set for each Tuesday from ten until one."}
+{"line_id": "a0946", "text": "The house is set to guest mode for the weekend."}
+{"line_id": "a0947", "text": "The children's lights will turn off at eight thirty."}
+{"line_id": "a0948", "text": "The playroom speaker is set to a lower maximum volume."}
+{"line_id": "a0949", "text": "I've paused the internet on the games console until homework is done."}
+{"line_id": "a0950", "text": "Homework time is over. The console is back on."}
+{"line_id": "a0951", "text": "Story time is set for seven thirty."}
+{"line_id": "a0952", "text": "There are ten minutes until bedtime."}
+{"line_id": "a0953", "text": "The bath is ready, and the water is thirty-eight degrees."}
+{"line_id": "a0954", "text": "The heated towel rail will switch off in an hour."}
+{"line_id": "a0955", "text": "I've set the oven to two hundred degrees with the fan on."}
+{"line_id": "a0956", "text": "The oven will turn itself off in forty minutes."}
+{"line_id": "a0957", "text": "The slow cooker is on low and will be done by six."}
+{"line_id": "a0958", "text": "The bread maker will start at five so it's ready for breakfast."}
+{"line_id": "a0959", "text": "The coffee machine is set to start at seven."}
+{"line_id": "a0960", "text": "The coffee machine needs descaling soon."}
+{"line_id": "a0961", "text": "The kettle is filled and switched on."}
+{"line_id": "a0962", "text": "The microwave has thirty seconds left."}
+{"line_id": "a0963", "text": "The toaster is on its usual setting."}
+{"line_id": "a0964", "text": "Dinner should be ready in about twenty-five minutes."}
+{"line_id": "a0965", "text": "I've found three recipes that use chicken, rice and peppers."}
+{"line_id": "a0966", "text": "The quickest one takes twenty minutes."}
+{"line_id": "a0967", "text": "That recipe serves four, so I'll halve the amounts for two."}
+{"line_id": "a0968", "text": "For two people, you'll need one hundred and fifty grams of rice."}
+{"line_id": "a0969", "text": "You'll need two onions, three cloves of garlic and a tin of tomatoes."}
+{"line_id": "a0970", "text": "I've added the missing ingredients to your shopping list."}
+{"line_id": "a0971", "text": "You're out of eggs, according to the list from yesterday."}
+{"line_id": "a0972", "text": "There's enough milk for about two more days."}
+{"line_id": "a0973", "text": "The bread will be stale by tomorrow, so it might be worth freezing it."}
+{"line_id": "a0974", "text": "The cheese in the fridge should be eaten by Friday."}
+{"line_id": "a0975", "text": "I've set a reminder to defrost the fish tonight."}
+{"line_id": "a0976", "text": "The fish needs about twelve hours to defrost in the fridge."}
+{"line_id": "a0977", "text": "The oven is still warm, so leave the dish inside to keep it hot."}
+{"line_id": "a0978", "text": "I've added a note to buy more rice before the weekend."}
+{"line_id": "a0979", "text": "The soup will keep for four days in a sealed container."}
+{"line_id": "a0980", "text": "Your lunch order will be ready to collect at twenty past twelve."}
+{"line_id": "a0981", "text": "The cafe on the corner opens at seven thirty on weekdays."}
+{"line_id": "a0982", "text": "It's a short walk, about six minutes, and it's dry outside."}
+{"line_id": "a0983", "text": "The meeting room on the second floor is free until three."}
+{"line_id": "a0984", "text": "The projector in the meeting room is switched on."}
+{"line_id": "a0985", "text": "I've booked the small room for an hour from two."}
+{"line_id": "a0986", "text": "Your colleague accepted the invitation a minute ago."}
+{"line_id": "a0987", "text": "Two people have said they can't make the meeting."}
+{"line_id": "a0988", "text": "The agenda has four items, and the first one is the budget."}
+{"line_id": "a0989", "text": "I've added the new item to the bottom of the agenda."}
+{"line_id": "a0990", "text": "The minutes from last week are attached to the invitation."}
+{"line_id": "a0991", "text": "The call quality is poor. Moving closer to the router might help."}
+{"line_id": "a0992", "text": "Your microphone is muted on the call."}
+{"line_id": "a0993", "text": "Your camera is off, and your microphone is on."}
+{"line_id": "a0994", "text": "I've raised your hand in the meeting."}
+{"line_id": "a0995", "text": "The meeting was recorded and the file is in your folder."}
+{"line_id": "a0996", "text": "The recording is ready, and it runs for thirty-eight minutes."}
+{"line_id": "a0997", "text": "I've made a short list of the actions from the call."}
+{"line_id": "a0998", "text": "There are five actions, and two of them are yours."}
+{"line_id": "a0999", "text": "Your first action is to send the updated figures by Wednesday."}
+{"line_id": "a1000", "text": "I'll remind you about the figures on Tuesday afternoon."}
+{"line_id": "a1001", "text": "That's the end of today's list. Nothing else is waiting."}
