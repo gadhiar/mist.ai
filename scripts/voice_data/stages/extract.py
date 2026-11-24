@@ -119,11 +119,12 @@ class Models:
     prosody: Callable[[np.ndarray, int], Prosody] = measure_prosody
 
 
-def load_models(device: str) -> Models:
+def load_models(device: str, progress: Callable[[int, int], None] | None = None) -> Models:
     """Load the extract family's models from T11's bindings, on `device`.
 
     Each binding module exposes `load(device)`, imported here and not at the top so that a
     module walk imports no model package. Separators and embedders return a sequence.
+    `progress` goes to the separators, whose TIGER-DnR calls it after each window.
     """
     from ..bindings import (  # type: ignore[attr-defined]
         arousal,
@@ -135,7 +136,7 @@ def load_models(device: str) -> Models:
     )
 
     return Models(
-        separators=tuple(separators.load(device)),
+        separators=tuple(separators.load(device, progress)),
         embedders=tuple(embedders.load(device)),
         diarizer=diarizers.load(device),
         vad=vad.load(device),

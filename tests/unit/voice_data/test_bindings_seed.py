@@ -41,6 +41,7 @@ from scripts.voice_data.bindings import (
 )
 from scripts.voice_data.bindings.protocols import QualityTrack, Span, Turn, Word
 from scripts.voice_data.errors import JobError
+from scripts.voice_data.stages import extract as extract_stage
 from scripts.voice_data.stages import fetch
 
 FAMILIES = jobs.load_families()
@@ -287,8 +288,16 @@ def msst(monkeypatch: pytest.MonkeyPatch, cache: Cache) -> MsstFakes:
     ) -> dict:
         rec.add("demix", tuple(mix.shape), device, model_type, pbar)
         assert isinstance(mix, torch.Tensor) and mix.dtype == torch.float32
+        # MSST's demix looks the function up as a module global at call time (model_utils.py:161).
+        accumulate = sys.modules["utils.model_utils"]._get_accumulation_device
+        rec.add("accumulation", accumulate(device, 4.0 * 1.5 * mix.numel()))
         data = mix.numpy()
         return {fakes.target: 0.5 * data, "other": 0.5 * data}
+
+    def _get_accumulation_device(device: object, required_bytes: float) -> torch.device:
+        # Upstream's choice when VRAM is plentiful: the model's own device for CUDA.
+        device = torch.device(device)
+        return device if device.type == "cuda" else torch.device("cpu")
 
     def prefer_target_instrument(config: SimpleNamespace) -> list[str]:
         return list(config.training.instruments)
@@ -303,16 +312,57 @@ def msst(monkeypatch: pytest.MonkeyPatch, cache: Cache) -> MsstFakes:
         "utils.model_utils",
         demix=demix,
         prefer_target_instrument=prefer_target_instrument,
+        _get_accumulation_device=_get_accumulation_device,
     )
     monkeypatch.setattr(torch, "load", fake_load)
     return fakes
+
+
+# TIGER-DnR's chunking at its sample rate: 12 s windows, a 4 s hop, 8 s pads.
+TIGER_RATE = 44100
+WINDOW = 12 * TIGER_RATE
+HOP = 4 * TIGER_RATE
+
+
+class FakeDialog:
+    """TIGER-DnR's `dialog` sub-model: [1, 1, T] in, [1, 3, T] out, deterministic.
+
+    With `ramp` set, each track also depends on a sample's position in its window, so a window
+    cut, or added back, at the wrong offset changes the output.
+    """
+
+    def __init__(self, rec: Recorder, ramp: float = 0.0) -> None:
+        self.rec = rec
+        self.ramp = ramp
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        self.rec.add("dialog", tuple(x.shape))
+        pos = torch.arange(x.shape[-1], dtype=x.dtype, device=x.device) / x.shape[-1]
+        mono = x[:, 0, :]
+        shaped = self.ramp * (pos + 3.0 * mono * pos)
+        tracks = [0.2 * mono - shaped, 0.3 * mono + 2.0 * shaped, 0.5 * mono + shaped]
+        return torch.stack(tracks, dim=1)
+
+
+class FakeTigerModel(FakeModule):
+    """TIGERDNR's shape: three sub-models, of which only `dialog` may run."""
+
+    def __init__(self, rec: Recorder, name: str, ramp: float = 0.0) -> None:
+        super().__init__(rec, name)
+        self.dialog = FakeDialog(rec, ramp)
+
+    def forward(self, mixture_tensor: torch.Tensor) -> tuple:
+        raise AssertionError("TIGERDNR.forward runs the effect and music models too")
+
+    def __call__(self, mixture_tensor: torch.Tensor) -> tuple:
+        return self.forward(mixture_tensor)
 
 
 @pytest.fixture
 def tiger(monkeypatch: pytest.MonkeyPatch, cache: Cache) -> Recorder:
     rec = Recorder()
 
-    class TIGERDNR(FakeModule):
+    class TIGERDNR(FakeTigerModel):
         @classmethod
         def from_pretrained(
             cls,
@@ -331,10 +381,6 @@ def tiger(monkeypatch: pytest.MonkeyPatch, cache: Cache) -> Recorder:
                 "from_pretrained", pretrained_model_name_or_path, local_files_only=local_files_only
             )
             return cls(rec, "tiger")
-
-        def __call__(self, mixture_tensor: torch.Tensor) -> tuple:
-            rec.add("forward", tuple(mixture_tensor.shape))
-            return (0.5 * mixture_tensor, 0.3 * mixture_tensor, 0.2 * mixture_tensor)
 
     install(monkeypatch, "look2hear.models", TIGERDNR=TIGERDNR)
     return rec
@@ -366,8 +412,8 @@ def test_tiger_runs_at_44k_and_returns_the_input_rate_and_length(
     audio = tone(2.0, 48000)
     out = dme.dialogue(audio, 48000)
     assert out.dtype == np.float32 and out.shape == audio.shape
-    ((shape,), _) = tiger.one("forward")
-    assert shape == (1, 1, 88200)
+    # 2 s at 44.1 kHz, padded by 8 s at each end, is three 12 s windows on a 4 s hop.
+    assert [shape for (shape,), _ in tiger.named("dialog")] == [(1, 1, WINDOW)] * 3
     assert np.allclose(out[1000:-1000], 0.5 * audio[1000:-1000], atol=0.02)
 
 
@@ -393,6 +439,199 @@ def test_separator_library_error_is_a_job_error(
 
     monkeypatch.setattr(sys.modules["utils.settings"], "get_model_from_config", broken)
     with pytest.raises(JobError, match="separator-melband-vocals: RuntimeError"):
+        separators.load("cpu")
+
+
+# TIGER-DnR's dialogue stem in bounded memory, against upstream's overlap-add.
+
+
+# Transcribed from TIGER (https://github.com/JusperLee/TIGER) at
+# 9f18d4a10a7137e1ce8052cfb62215179f1287b6, look2hear/models/tiger_dnr.py:803-868, licensed
+# under the Apache License, Version 2.0. Modified: the method became a function, `self.sr` became
+# the `sr` argument, and its comments and docstring are omitted.
+def upstream_wav_chunk_inference(
+    model, mixture_tensor, sr=44100, target_length=12.0, hop_length=4.0, batch_size=1, n_tracks=3
+):
+    batch_mixture = mixture_tensor  # [1, nch, T]
+    batch_length = batch_mixture.shape[-1]
+    session = int(sr * target_length)
+    target = int(sr * target_length)
+    ignore = (session - target) // 2
+    hop = int(sr * hop_length)
+    tr_ratio = target_length / hop_length
+    if ignore > 0:
+        zero_pad = (
+            torch.zeros(batch_mixture.shape[0], batch_mixture.shape[1], ignore)
+            .type(batch_mixture.dtype)
+            .to(batch_mixture.device)
+        )
+        batch_mixture_pad = torch.cat([zero_pad, batch_mixture, zero_pad], -1)
+    else:
+        batch_mixture_pad = batch_mixture
+    if target - hop > 0:
+        hop_pad = (
+            torch.zeros(batch_mixture.shape[0], batch_mixture.shape[1], target - hop)
+            .type(batch_mixture.dtype)
+            .to(batch_mixture.device)
+        )
+        batch_mixture_pad = torch.cat([hop_pad, batch_mixture_pad, hop_pad], -1)
+    skip_idx = ignore + target - hop
+    zero_pad = (
+        torch.zeros(batch_mixture.shape[0], batch_mixture.shape[1], session)
+        .type(batch_mixture.dtype)
+        .to(batch_mixture.device)
+    )
+    num_session = (batch_mixture_pad.shape[-1] - session) // hop + 2
+    all_target = torch.zeros(
+        batch_mixture_pad.shape[0],
+        n_tracks,
+        batch_mixture_pad.shape[1],
+        batch_mixture_pad.shape[2],
+    ).to(batch_mixture_pad.device)
+    all_input = []
+    all_segment_length = []
+    for i in range(num_session):
+        this_input = batch_mixture_pad[:, :, i * hop : i * hop + session]
+        segment_length = this_input.shape[-1]
+        if segment_length < session:
+            this_input = torch.cat([this_input, zero_pad[:, :, : session - segment_length]], -1)
+        all_input.append(this_input)
+        all_segment_length.append(segment_length)
+    all_input = torch.cat(all_input, 0)
+    num_batch = num_session // batch_size
+    if num_session % batch_size > 0:
+        num_batch += 1
+    for i in range(num_batch):
+        this_input = all_input[i * batch_size : (i + 1) * batch_size]
+        actual_batch_size = this_input.shape[0]
+        with torch.no_grad():
+            est_target = model(this_input)
+            est_target = est_target.unsqueeze(2)
+        for j in range(actual_batch_size):
+            this_est_target = est_target[j, :, :, : all_segment_length[i * batch_size + j]][
+                :, :, ignore : ignore + target
+            ].unsqueeze(0)
+            at = ignore + (i * batch_size + j) * hop
+            all_target[:, :, :, at : at + target] += this_est_target  # [batch, ntrack, nch, T]
+    all_target = all_target[:, :, :, skip_idx : skip_idx + batch_length].contiguous() / tr_ratio
+    return all_target.squeeze(0)
+
+
+def _ramp(samples: int) -> np.ndarray:
+    """A clip whose every sample differs, so an offset error shows."""
+    t = np.arange(samples, dtype=np.float64) / TIGER_RATE
+    return (0.4 * np.sin(2.0 * np.pi * 3.1 * t) + 0.1 * np.cos(7.0 * t * t)).astype(np.float32)
+
+
+@pytest.mark.parametrize(
+    ("case", "samples"),
+    [("shorter than one window", TIGER_RATE), ("a hop multiple", 5 * HOP), ("odd", 600_001)],
+)
+def test_tiger_dialogue_equals_upstream_chunking(case: str, samples: int) -> None:
+    rec = Recorder()
+    model = FakeTigerModel(rec, "tiger", ramp=0.01)
+    audio = _ramp(samples)
+    mixture = torch.from_numpy(audio)[None, None]
+    expected = upstream_wav_chunk_inference(model.dialog, mixture)[2].numpy().reshape(-1)
+    upstream_calls = len(rec.named("dialog"))
+    rec.calls.clear()
+    out = separators.TigerDnr(model, "cpu").dialogue(audio, TIGER_RATE)
+    assert out.dtype == np.float32 and out.shape == audio.shape
+    np.testing.assert_allclose(out, expected, rtol=0.0, atol=1e-6)
+    assert [shape for (shape,), _ in rec.named("dialog")] == [(1, 1, WINDOW)] * upstream_calls
+
+
+def test_tiger_moves_one_window_at_a_time_to_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    moved: list[int] = []
+    real = torch.Tensor.to
+
+    def recording_to(self: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        moved.append(int(self.shape[-1]) if self.dim() else 1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", recording_to)
+    rec = Recorder()
+    audio = _ramp(5 * WINDOW + 17)
+    separators.TigerDnr(FakeTigerModel(rec, "tiger"), "cpu").dialogue(audio, TIGER_RATE)
+    windows = len(rec.named("dialog"))
+    assert windows == (len(audio) + 2 * (WINDOW - HOP) - WINDOW) // HOP + 2
+    assert len(moved) >= windows and max(moved) <= WINDOW
+
+
+def test_tiger_never_runs_the_whole_model() -> None:
+    model = FakeTigerModel(Recorder(), "tiger")
+    with pytest.raises(AssertionError, match="forward"):
+        model(torch.zeros(1, 1, 10))
+    separators.TigerDnr(model, "cpu").dialogue(_ramp(TIGER_RATE), TIGER_RATE)
+
+
+def test_tiger_reports_each_window_to_its_progress_callable() -> None:
+    calls: list[tuple[int, int]] = []
+    tiger_dnr = separators.TigerDnr(
+        FakeTigerModel(Recorder(), "tiger"), "cpu", progress=lambda d, t: calls.append((d, t))
+    )
+    tiger_dnr.dialogue(_ramp(2 * WINDOW), TIGER_RATE)
+    total = (2 * WINDOW + 2 * (WINDOW - HOP) - WINDOW) // HOP + 2
+    assert calls == [(n, total) for n in range(1, total + 1)]
+
+
+def test_progress_passes_through_every_loader(
+    cache: Cache, msst: MsstFakes, tiger: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    def progress(done: int, total: int) -> None:
+        calls.append((done, total))
+
+    separators.load_tiger("cpu", progress).dialogue(tone(1.0, 44100), 44100)
+    assert calls[-1] == (3, 3)
+    calls.clear()
+    separators.load("cpu", progress=progress)[0].dialogue(tone(1.0, 44100), 44100)
+    assert calls[-1] == (3, 3)
+    seen: list[tuple[str, object]] = []
+
+    def separators_load(device: str, progress: object = None) -> list:
+        seen.append((device, progress))
+        return []
+
+    monkeypatch.setattr(separators, "load", separators_load)
+    for module in (arousal, diarizers, embedders, quality, vad):
+        monkeypatch.setattr(module, "load", lambda device: [])
+    extract_stage.load_models("cuda", progress=progress)
+    assert seen == [("cuda", progress)]
+    extract_stage.load_models("cpu")
+    assert seen[-1] == ("cpu", None)
+
+
+# Mel-Band RoFormer's demix accumulates on the host.
+
+
+def test_melband_keeps_the_demix_accumulator_on_the_host(
+    cache: Cache, msst: MsstFakes, tiger: Recorder
+) -> None:
+    melband = separators.load("cuda")[1]
+    hook = sys.modules["utils.model_utils"]._get_accumulation_device
+    for device in ("cuda", "cpu", torch.device("cuda"), torch.device("cpu")):
+        for size in (1.0, 1e15):
+            assert hook(device, size) == torch.device("cpu")
+    melband.dialogue(tone(1.0, 44100), 44100)
+    assert msst.rec.one("accumulation")[0] == (torch.device("cpu"),)
+
+
+def test_dereverb_keeps_the_demix_accumulator_on_the_host_too(
+    cache: Cache, msst: MsstFakes, sidon: SidonFakes
+) -> None:
+    msst.target = "noreverb"
+    dereverb = enhancers.load("cuda")[1]
+    dereverb.apply(tone(1.0, 44100), 44100)
+    assert msst.rec.one("accumulation")[0] == (torch.device("cpu"),)
+
+
+def test_melband_without_the_accumulation_hook_is_a_job_error(
+    cache: Cache, msst: MsstFakes, tiger: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delattr(sys.modules["utils.model_utils"], "_get_accumulation_device")
+    with pytest.raises(JobError, match="separator-melband-vocals"):
         separators.load("cpu")
 
 
