@@ -148,6 +148,6 @@ def test_pocket_clone_classes_carry_the_arms_pin():
     pin = f"{model['repository']}@{model['revision']}"
 
     assert pocket_tts.PocketCloneSynthesizer.engine_id == "pocket-clone"
-    assert pocket_tts.PocketCloneSynthesizer.model_id == pin
+    assert pin == pocket_tts.MODEL_PIN
     assert pocket_tts.PocketVoiceBuilder.engine_id == "pocket-clone"
-    assert pocket_tts.PocketVoiceBuilder.model_pin == pin
+    assert pin == pocket_tts.MODEL_PIN

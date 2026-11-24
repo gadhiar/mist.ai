@@ -12,6 +12,13 @@ mapped to its staged snapshot under `<models_dir>/speech/<org>/<repo>/`, as the 
 fallback model from `kyutai/pocket-tts-without-voice-cloning`. Any other URI, or a mapped file
 that is missing, is refused, so the config the model loads names no remote file.
 
+Trained weights. A schema-2 identity carries a student trained on MIST's voice. Its weights
+replace the cloning model in `weights_path`, and its tokenizer, when it carries one, replaces the
+stock tokenizer; without one, the stock tokenizer's sha256 must be the one the student was
+trained with. The identity must name this engine and `MODEL_PIN` as its base, and the model must
+run at 24 kHz. The pin then becomes `MODEL_PIN+<sha256>`, so the voice states rebuild for new
+weights, and the turn record and the engine status name the trained weights.
+
 Voice states. For each clip, `build` computes `get_state_for_audio_prompt(<clip>)` and writes it
 with `pocket_tts.export_model_state`; `load` reads it back by passing the `.safetensors` path to
 the same call, which opens a path with that suffix as a voice state rather than as audio to
@@ -23,6 +30,7 @@ this module loads neither and tests pass a fake library.
 """
 
 import copy
+import hashlib
 import importlib
 import logging
 import tempfile
@@ -44,7 +52,14 @@ from ..speech import (
     TextSegment,
     VoiceInfo,
 )
-from ..voice_assets import VoiceAssetError, VoiceClip, ensure_artefacts, load_identity
+from ..voice_assets import (
+    SHA_PREFIX,
+    VoiceAssetError,
+    VoiceClip,
+    VoiceIdentity,
+    ensure_artefacts,
+    load_identity,
+)
 from .audio import (
     OUTPUT_RATE,
     LoudnessNormalizer,
@@ -65,6 +80,8 @@ DEVICE = "cpu"
 THREADS = 4
 ARTEFACT_VERSION = 1
 VOICE_STATE_FILE = "voice_state.safetensors"
+# Pocket's codec rate. Trained weights at another rate are not the base's architecture.
+MODEL_RATE = 24000
 
 # The installed config `local_config` copies, from `pocket_tts.utils.config.CONFIGS_DIR`.
 CONFIG_NAME = "english.yaml"
@@ -180,15 +197,22 @@ def _local_path(uri: str, models_dir: Path) -> Path:
     return models_dir.joinpath("speech", org, repo, *path)
 
 
-def local_config(installed: object, models_dir: Path) -> dict:
+def local_config(
+    installed: object,
+    models_dir: Path,
+    weights: Path | None = None,
+    tokenizer: Path | None = None,
+) -> dict:
     """A copy of the installed config whose three `hf://` URIs are the staged files.
 
-    Voice cloning stays on: `weights_path` is the cloning model.
+    Voice cloning stays on: `weights_path` is the cloning model, or `weights`, an identity's
+    trained weights. `tokenizer`, when given, replaces the stock tokenizer the same way.
+    `weights_path_without_voice_cloning` is always the stock file.
 
     Raises:
         SpeechEngineError: The config does not name 4.0.1's three URIs where 4.0.1 does, it
-            names another remote file, or a mapped file is missing; the message names the URI
-            or the path.
+            names another remote file, or a file it maps to is missing; the message names the
+            URI or the staged path, and never the path of a given file, which is private.
     """
     name = f"{ENGINE_ID}: the installed {CONFIG_NAME}"
     if not isinstance(installed, dict):
@@ -213,10 +237,19 @@ def local_config(installed: object, models_dir: Path) -> dict:
                 f"{name} has {key} {found!r}; this adapter loads only {expected!r}, "
                 "the value of pocket-tts 4.0.1"
             )
-    local = {uri: _local_path(uri, Path(models_dir)) for uri in CONFIG_URIS}
-    for path in local.values():
+    given = {
+        uri: Path(path)
+        for uri, path in ((CLONE_MODEL_URI, weights), (TOKENIZER_URI, tokenizer))
+        if path is not None
+    }
+    for uri, path in given.items():
+        if not path.is_file():
+            raise SpeechEngineError(f"{ENGINE_ID}: a given file for {uri} is missing")
+    staged = {uri: _local_path(uri, Path(models_dir)) for uri in CONFIG_URIS if uri not in given}
+    for path in staged.values():
         if not path.is_file():
             raise SpeechEngineError(f"{ENGINE_ID}: weight file {path} is missing")
+    local = staged | given
     config = copy.deepcopy(installed)
     config["weights_path"] = str(local[CLONE_MODEL_URI])
     config["weights_path_without_voice_cloning"] = str(local[MODEL_URI])
@@ -239,19 +272,29 @@ class PocketVoiceBuilder:
     """Turns an identity clip into a Pocket voice state file, and reads it back.
 
     Holds the loaded model, since computing a voice state runs the model's audio encoder.
+    `model_pin` is `MODEL_PIN`, or `MODEL_PIN+<sha256>` for an identity's trained weights.
     """
 
     engine_id = ENGINE_ID
-    model_pin = MODEL_PIN
     artefact_version = ARTEFACT_VERSION
 
-    __slots__ = ("_export", "_model")
+    __slots__ = ("_export", "_model", "_model_pin")
 
     def __init__(
-        self, model: PocketModel, export_model_state: Callable[[VoiceState, Path], None]
+        self,
+        model: PocketModel,
+        export_model_state: Callable[[VoiceState, Path], None],
+        *,
+        model_pin: str = MODEL_PIN,
     ) -> None:
         self._model = model
         self._export = export_model_state
+        self._model_pin = model_pin
+
+    @property
+    def model_pin(self) -> str:
+        """The weights the voice states are computed with; part of their cache key."""
+        return self._model_pin
 
     def build(self, clip: VoiceClip, out_dir: Path) -> None:
         """Compute the clip's voice state and export it; the transcript is not read.
@@ -284,12 +327,12 @@ class PocketCloneSynthesizer:
     """Pocket TTS speaking MIST's voice identity, one voice state per speaking state."""
 
     engine_id = ENGINE_ID
-    model_id = MODEL_PIN
     sample_rate = OUTPUT_RATE
 
     __slots__ = (
         "_fallbacks_logged",
         "_model",
+        "_model_id",
         "_normalizer",
         "_prompts",
         "_released",
@@ -298,10 +341,16 @@ class PocketCloneSynthesizer:
     )
 
     def __init__(
-        self, model: PocketModel, prompts: Mapping[str, VoiceState], voice: VoiceInfo
+        self,
+        model: PocketModel,
+        prompts: Mapping[str, VoiceState],
+        voice: VoiceInfo,
+        *,
+        model_id: str = MODEL_PIN,
     ) -> None:
         if NEUTRAL_STATE not in prompts:
             raise SpeechEngineError(f"{ENGINE_ID}: no voice state for {NEUTRAL_STATE!r}")
+        self._model_id = model_id
         self._model: PocketModel | None = model
         self._prompts: dict[str, VoiceState] = dict(prompts)
         self.voice = voice
@@ -309,6 +358,11 @@ class PocketCloneSynthesizer:
         self._normalizer = LoudnessNormalizer()
         self._fallbacks_logged: set[str] = set()
         self._released = False
+
+    @property
+    def model_id(self) -> str:
+        """The weights this instance speaks with: the builder's pin, which the turn records."""
+        return self._model_id
 
     @classmethod
     def load(
@@ -323,11 +377,14 @@ class PocketCloneSynthesizer:
 
         The identity loads first, so a bad identity fails before the model loads. Its voice
         states are built into `placement.voice_cache_dir` where missing, then read back under
-        the cache lock; nothing is written under the identity.
+        the cache lock; nothing is written under the identity. An identity's trained weights
+        are checked against this engine before the model loads, and load in place of the
+        stock clone weights.
 
         Raises:
-            VoiceAssetError: No identity is configured, or it or its voice states are unusable;
-                the message names the field, the relative path or the state.
+            VoiceAssetError: No identity is configured, or it or its voice states are unusable,
+                or its trained weights are not for this engine, base, tokenizer or rate; the
+                message names the field, the relative path or the state.
             SpeechEngineError: The device is not `cpu`, pocket-tts is not installed, a weight
                 file is missing, or the model failed to load or loaded without cloning.
         """
@@ -338,12 +395,25 @@ class PocketCloneSynthesizer:
                 f"{ENGINE_ID}: no voice identity is configured (MIST_VOICE_TTS_VOICE)"
             )
         identity = load_identity(Path(placement.voice_root), placement.tts_voice)
+        models_dir = Path(placement.models_dir)
+        pin = _model_pin(identity, models_dir)
+        trained = identity.model
         library = library_loader()
-        model = _load_model(library, Path(placement.models_dir))
-        builder = PocketVoiceBuilder(model, library.export_model_state)
+        model = _load_model(
+            library,
+            models_dir,
+            weights=None if trained is None else trained.weights_path,
+            tokenizer=None if trained is None else trained.tokenizer_path,
+        )
+        if trained is not None and int(model.sample_rate) != MODEL_RATE:
+            raise VoiceAssetError(
+                f"voice identity {identity.voice_id!r}: model: the trained weights run at "
+                f"{int(model.sample_rate)} Hz, not {MODEL_RATE} Hz"
+            )
+        builder = PocketVoiceBuilder(model, library.export_model_state, model_pin=pin)
         prompts = ensure_artefacts(identity, builder, Path(placement.voice_cache_dir))
         voice = VoiceInfo(ENGINE_ID, identity.voice_id, profile)
-        synthesizer = cls(model, prompts, voice)
+        synthesizer = cls(model, prompts, voice, model_id=builder.model_pin)
         logger.info(
             "%s loaded voice %r on %s with %d threads: states %s",
             ENGINE_ID,
@@ -352,6 +422,13 @@ class PocketCloneSynthesizer:
             THREADS,
             ", ".join(sorted(synthesizer.states)),
         )
+        if trained is not None:
+            logger.info(
+                "%s voice %r speaks trained weights sha256 %s",
+                ENGINE_ID,
+                identity.voice_id,
+                trained.sha256[:SHA_PREFIX],
+            )
         return synthesizer
 
     def synthesize(self, segment: TextSegment, token: CancelToken) -> Iterator[SynthChunk]:
@@ -423,8 +500,50 @@ class PocketCloneSynthesizer:
             yield SynthChunk(pcm16=chunk, samples=len(chunk) // 2, segment=segment, state=state)
 
 
-def _load_model(library: PocketLibrary, models_dir: Path) -> PocketModel:
+def _model_pin(identity: VoiceIdentity, models_dir: Path) -> str:
+    """The pin of the weights the identity is voiced with; checks trained weights fit this engine.
+
+    Runs before the library loads, so an identity this adapter cannot voice fails without
+    loading a model.
+
+    Raises:
+        VoiceAssetError: The trained weights name another engine or base, or carry no
+            tokenizer while the stock one is not the tokenizer they were trained with.
+        SpeechEngineError: The stock tokenizer to check is missing; the message names its
+            staged path.
+    """
+    trained = identity.model
+    if trained is None:
+        return MODEL_PIN
+    where = f"voice identity {identity.voice_id!r}: model"
+    if trained.engine != ENGINE_ID:
+        raise VoiceAssetError(f"{where}.engine: {trained.engine!r} is not {ENGINE_ID!r}")
+    if trained.base != MODEL_PIN:
+        raise VoiceAssetError(f"{where}.base: {trained.base!r} is not {MODEL_PIN!r}")
+    if trained.tokenizer_path is None:
+        stock = _local_path(TOKENIZER_URI, models_dir)
+        if not stock.is_file():
+            raise SpeechEngineError(f"{ENGINE_ID}: weight file {stock} is missing")
+        with stock.open("rb") as handle:
+            stock_sha = hashlib.file_digest(handle, "sha256").hexdigest()
+        if stock_sha != trained.tokenizer_sha256:
+            raise VoiceAssetError(
+                f"{where}.tokenizer_sha256: is not the stock tokenizer's "
+                f"({stock_sha[:SHA_PREFIX]}), and the identity carries no tokenizer"
+            )
+    return f"{MODEL_PIN}+{trained.sha256}"
+
+
+def _load_model(
+    library: PocketLibrary,
+    models_dir: Path,
+    weights: Path | None = None,
+    tokenizer: Path | None = None,
+) -> PocketModel:
     """`library.load_model` on `local_config`'s copy of the installed config, on 4 threads.
+
+    `weights` and `tokenizer` are an identity's trained files, which replace the stock clone
+    weights and tokenizer.
 
     Raises:
         SpeechEngineError: A weight file is missing, the model failed to load, or it loaded
@@ -435,7 +554,7 @@ def _load_model(library: PocketLibrary, models_dir: Path) -> PocketModel:
         installed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise SpeechEngineError(f"{ENGINE_ID}: cannot read {config_path}") from exc
-    config = local_config(installed, models_dir)
+    config = local_config(installed, models_dir, weights, tokenizer)
     library.set_num_threads(THREADS)
     try:
         with tempfile.TemporaryDirectory(prefix="pocket-config-") as tmp:
