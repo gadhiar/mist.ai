@@ -24,6 +24,7 @@ import dataclasses
 import functools
 import importlib
 import json
+import re
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1991,3 +1992,109 @@ def test_finish_names_a_short_start(tmp_path: Path) -> None:
         "run r1: 7.12 GiB VRAM free after the job's CUDA context, 7.5 GiB needed for budget 8 GiB"
     )
     assert cli.exit_code(info.value) == 2
+
+
+# Progress lines (T13): the job log says where a long run is, timed on an injected clock.
+
+
+class FakeClock:
+    """A monotonic clock that moves only when a fake model moves it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class WindowedSeparator:
+    """An identity separator that reports its windows as TIGER-DnR does, 25 s on the clock each."""
+
+    name = "separator-tiger"
+    windows = 7
+    window_s = 25.0
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.progress: Callable[[int, int], None] | None = None
+
+    def dialogue(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        assert self.progress is not None, "load_models passes no progress callback"
+        for done in range(1, self.windows + 1):
+            self.clock.now += self.window_s
+            self.progress(done, self.windows)
+        return np.array(audio, dtype=np.float32)
+
+
+class ProgressStageDocker(CudaStageDocker):
+    """A `CudaStageDocker` whose stage reads the fake clock and hands its separators the callback."""
+
+    def __init__(self, root: root_mod.Root, models: extract_stage.Models, clock: FakeClock) -> None:
+        super().__init__(root, models)
+        self.clock = clock
+
+    def load(self, device: str, progress: object = None) -> extract_stage.Models:
+        for separator in self.models.separators:
+            separator.progress = progress  # type: ignore[attr-defined]
+        return super().load(device, progress)
+
+    def run_logged(self, argv: Sequence[str], log: Path) -> int:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(extract_stage, "clock", self.clock)
+            return super().run_logged(argv, log)
+
+
+@pytest.fixture(scope="module")
+def progress_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[list[str], int]:
+    """The job log's lines from a cuda run of two sources, and the second source's samples."""
+    root, episode, length = two_source_root(tmp_path_factory.mktemp("progress"))
+    clock = FakeClock()
+    models = models_for(episode, main_prototypes(), separators=(WindowedSeparator(clock),))
+    code, _, err = extract(root, ProgressStageDocker(root, models, clock), "--device", "cuda")
+    assert code == 0, err
+    log = next((root.path / "runs").glob("job-*/log.txt")).read_text(encoding="utf-8")
+    return log.splitlines(), length
+
+
+def test_the_log_says_when_the_models_load_and_each_source_starts(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, length = progress_run
+    loaded = "extract: models loaded in 0.0 s, peak reserved 3000 MiB, free 4096 MiB"
+    first = f"extract: source 1 of 2: src-0001 FC, {(length - RATE) / RATE / 60:.1f} min"
+    second = f"extract: source 2 of 2: src-0002 FC, {length / RATE / 60:.1f} min"
+    assert lines.index(loaded) < lines.index(first) < lines.index(second)
+
+
+def test_tiger_windows_are_logged_at_least_once_a_minute(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, _ = progress_run
+    prefix = "extract: src-0001 FC separator-tiger windows"
+    assert [line for line in lines if line.startswith(prefix)] == [
+        f"{prefix} 3 of 7, 25.00 s per window, free 4096 MiB",
+        f"{prefix} 6 of 7, 25.00 s per window, free 4096 MiB",
+    ]
+    done = "extract: src-0001 FC separator-tiger: 175.0 s, peak reserved 4000 MiB, free 4096 MiB"
+    assert lines.index(done) > lines.index(f"{prefix} 6 of 7, 25.00 s per window, free 4096 MiB")
+
+
+def test_each_step_on_each_channel_logs_its_time_and_the_card(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, _ = progress_run
+    card = {"src-0001": "peak reserved 4000 MiB, free 4096 MiB"}
+    card["src-0002"] = "peak reserved 5000 MiB, free 4096 MiB"
+    for sid, reading in card.items():
+        for channel in ("FC", "downmix"):
+            for step in ("vad", "quality"):
+                assert f"extract: {sid} {channel} {step}: 0.0 s, {reading}" in lines
+        assert f"extract: {sid} FC diarize: 0.0 s, {reading}" in lines
+        embeds = re.compile(rf"extract: {sid} FC embed: [1-9]\d* calls, 0\.0 s, {reading}")
+        assert any(embeds.fullmatch(line) for line in lines), sid
+
+
+def test_progress_lines_name_no_path_or_file(progress_run: tuple[list[str], int]) -> None:
+    lines, _ = progress_run
+    for line in lines:
+        assert "/" not in line and ".wav" not in line and "episode" not in line, line

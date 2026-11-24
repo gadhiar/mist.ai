@@ -1,7 +1,7 @@
 """The rehearsal's audio work, run as a job in the `score` image (Design 12).
 
-Runs as `/opt/venv-score/bin/python -I -m scripts.voice_data.rehearsal.mix --data /data --step S`,
-with `public/` mounted read-only. Two steps:
+Runs as `/opt/venv-score/bin/python -I -u -m scripts.voice_data.rehearsal.mix --data /data
+--step S`, with `public/` mounted read-only. Two steps:
 
 - `build` (`rehearsal build`): reads `rehearsal/build-plan.json`, checks every public file's
   sha256 against `sources.json` before it reads any, chooses the impostor with ECAPA, mixes

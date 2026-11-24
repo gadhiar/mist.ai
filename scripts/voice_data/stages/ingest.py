@@ -1,8 +1,8 @@
 """Ingest stage: probe source files, copy the chosen audio track without re-encoding, measure it.
 
 Runs in the base image (family `score`, which holds ffmpeg and numpy) as
-`/opt/venv-score/bin/python -I -m scripts.voice_data.stages.ingest --data /data --step probe|copy`,
-with `seed/raw/` mounted read-only and `seed/tracks/` writable. `probe` lists every stream of each
+`/opt/venv-score/bin/python -I -u -m scripts.voice_data.stages.ingest --data /data
+--step probe|copy`, with `seed/raw/` mounted read-only and `seed/tracks/` writable. `probe` lists every stream of each
 source; the host chooses the track; `copy` copies it with `-c copy` into Matroska audio and
 measures the copy's packet bitrate and effective bandwidth. The video stream is never copied or
 decoded.
