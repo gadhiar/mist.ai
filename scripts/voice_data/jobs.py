@@ -29,6 +29,9 @@ REMOTE_MODULE = "scripts.voice_data.remote"
 INSPECT_FORMAT = "{{.Name}} {{json .HostConfig.DeviceRequests}}"
 # The preflight's nvidia-smi arguments; nvidia-smi itself is the entrypoint (see `preflight`).
 NVIDIA_SMI_QUERY = ("--query-gpu=memory.free", "--format=csv,noheader,nounits")
+# Comma-separated container names the preflight lets keep a GPU, such as the daily backend while
+# a gaming-mode window has moved its speech engines to CPU but left its CUDA context open.
+GPU_PEERS_ENV = "MIST_VOICE_GPU_PEERS"
 
 
 class PreflightError(VoiceDataError):
@@ -128,14 +131,23 @@ def load_families(path: Path = FAMILIES_PATH) -> Mapping[str, Mapping[str, objec
 
 
 class LocalDocker:
-    """Runs jobs on this host's Docker, after the GPU-idle preflight for GPU jobs."""
+    """Runs jobs on this host's Docker, after the GPU-idle preflight for GPU jobs.
+
+    `peers` names containers every GPU job may share the card with; `executor_for` reads them
+    from `MIST_VOICE_GPU_PEERS`.
+    """
 
     def __init__(
-        self, root: Root, docker: DockerOps, families: Mapping[str, Mapping[str, object]]
+        self,
+        root: Root,
+        docker: DockerOps,
+        families: Mapping[str, Mapping[str, object]],
+        peers: frozenset[str] = frozenset(),
     ) -> None:
         self._root = root
         self._docker = docker
         self._families = families
+        self._peers = peers
 
     def _family(self, name: str) -> Mapping[str, object]:
         family = self._families.get(name)
@@ -185,19 +197,22 @@ class LocalDocker:
         """Refuse a GPU job while another container holds a GPU or free VRAM is short.
 
         GPU users outside Docker are invisible here; the daily stack runs every GPU service in
-        Docker. `allow` names containers that may keep their GPU (the bench's E4B server).
-        nvidia-smi runs as the entrypoint because a CUDA base image's own entrypoint prints its
-        banner to stdout first, and stdout must hold only one free-MiB line per GPU.
+        Docker. `allow` names containers that may keep their GPU for this call (the bench's E4B
+        server), and the executor's peers may keep theirs for every call. A peer still uses
+        VRAM, so the free-VRAM check runs even when only peers hold the card. nvidia-smi runs
+        as the entrypoint because a CUDA base image's own entrypoint prints its banner to stdout
+        first, and stdout must hold only one free-MiB line per GPU.
 
         Raises:
-            PreflightError: A container outside `allow` holds a GPU, or free VRAM is below the
-                family's `vram_gb`.
+            PreflightError: A container outside `allow` and the peers holds a GPU, or free VRAM
+                is below the family's `vram_gb`.
         """
+        allowed = allow | self._peers
         for cid in self._docker.capture(["docker", "ps", "-q"]).split():
             line = self._docker.capture(["docker", "inspect", "--format", INSPECT_FORMAT, cid])
             name, _, requests = line.strip().partition(" ")
             name = name.lstrip("/")
-            if json.loads(requests or "null") and name not in allow:
+            if json.loads(requests or "null") and name not in allowed:
                 raise PreflightError(f"refused: container {name} holds a GPU; stop it first")
         smi = ["docker", "run", "--rm", "--network", "none", "--gpus", "all"]
         smi += ["--entrypoint", "nvidia-smi", job.image, *NVIDIA_SMI_QUERY]
@@ -243,6 +258,12 @@ class LocalDocker:
         return files
 
 
+def gpu_peers() -> frozenset[str]:
+    """Return the container names `MIST_VOICE_GPU_PEERS` lists; blanks are dropped."""
+    raw = os.environ.get(GPU_PEERS_ENV, "")
+    return frozenset(name for name in (part.strip() for part in raw.split(",")) if name)
+
+
 def executor_for(
     name: str,
     *,
@@ -253,13 +274,17 @@ def executor_for(
     """Return the executor `local` or `remote:<alias>` names; every command gets one here.
 
     The remote executor is imported only when asked for, so local runs work before it exists.
+    The local executor's GPU peers come from `MIST_VOICE_GPU_PEERS`, so no command needs a flag.
 
     Raises:
         InputError: An unknown name, or the remote executor is not installed.
     """
     if name == "local":
         return LocalDocker(
-            root, docker or HostDocker(), load_families() if families is None else families
+            root,
+            docker or HostDocker(),
+            load_families() if families is None else families,
+            gpu_peers(),
         )
     kind, _, alias = name.partition(":")
     if kind != "remote" or not alias:

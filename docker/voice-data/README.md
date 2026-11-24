@@ -42,6 +42,24 @@ rebuilds only the record, the code layer and the import check.
 - Default command `remote-entry.sh`: on a pod with `PUBLIC_KEY` set, sshd with key-only login,
   then wait. Local jobs name their own command.
 
+## GPU preflight and peers
+
+Before a GPU job starts, the local executor lists the running containers and refuses the job when
+one of them holds a GPU (exit 2), then runs `nvidia-smi` in the job's image and refuses the job
+when the largest free VRAM is below the family's `vram_gb`.
+
+`MIST_VOICE_GPU_PEERS` names containers that may keep their GPU while a job runs, as a
+comma-separated list of container names (blanks are ignored):
+
+```bash
+MIST_VOICE_GPU_PEERS=<daily backend container> python -m scripts.voice_data <command> ...
+```
+
+It is for a gaming-mode window, when the daily backend has moved its speech engines to CPU but
+keeps its CUDA context. A peer still uses VRAM, so the free-VRAM check runs as before. Any
+container holding a GPU that is not a peer is still refused. There is no command-line flag; the
+variable is the interface, and it applies to every local job of the command.
+
 ## Devices and VRAM (estimates)
 
 `devices` and `vram_gb` in `families.json` are estimates from model sizes, not measurements:
