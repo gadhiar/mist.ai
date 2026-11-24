@@ -164,7 +164,7 @@ def _write_audio(path: Path, audio: np.ndarray, rate: int) -> None:
 
     part = path.with_name(path.name + ".part")
     clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
-    soundfile.write(str(part), clipped, rate, format="WAV", subtype=SUBTYPE)
+    soundfile.write(str(part), clipped, rate, format="FLAC", subtype=SUBTYPE)
     os.replace(part, path)
 
 

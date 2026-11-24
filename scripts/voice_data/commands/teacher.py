@@ -1,9 +1,9 @@
 """`teacher generate` and `teacher score`: OmniVoice takes in the anchor voice, gated by CER and SIM.
 
-`teacher generate --voice V --text T --run R [--rounds-max N] [--until HH:MM] [--resume]` runs one
-GPU job in the `teacher-omnivoice` family. It makes `take.n` takes of every neutral line of
+`teacher generate --anchor A --text T --run R [--rounds-max N] [--until HH:MM] [--resume]` runs
+one GPU job in the `teacher-omnivoice` family. It makes `take.n` takes of every neutral line of
 `text/<T>/lines.jsonl`, conditioned on the neutral clip and transcript of the identity
-`voices/<V>/` (the anchor), into `teachers/omnivoice/<R>/takes/` and `takes.jsonl`. Stage 1
+`voices/<A>/` (the anchor), into `teachers/omnivoice/<R>/takes/` and `takes.jsonl`. Stage 1
 generates neutral only. A take is written unscored (its one reason is `unscored`) until
 `teacher score` measures it.
 
@@ -14,6 +14,13 @@ gets its next round, or the missing takes of an interrupted one. The job checks 
 and SIGTERM between lines: it finishes the current line, records it, and exits 0 with
 `status: paused` in `summary.json`. `--until HH:MM` is host local time; the job receives it as
 `--deadline-utc`, since a container reads its clock as UTC (`deadline.py`).
+
+`teacher score --run R [--target T] [--device cuda|cpu]` runs one job in the `score` family over
+the run's unscored takes: CER against the line, SIM on both embedders, prosody and arousal; then
+`score.keep` gates every take and `score.select` picks one kept take per line. The SIM floor is
+target T's neutral floor (a seed target, SIM to its centroids); without `--target` it is the
+`state_floor.percentile` of the round-1 takes' SIM to the anchor clip (the seed fallback). A run
+keeps the floor basis it was first scored with.
 
 Nothing printed carries a line's text, a transcript or a clip's path: only ids, counts, hours
 and floors. The stages import the names and helpers below, so host and job share one definition.
@@ -35,8 +42,17 @@ from .. import gates as gates_mod
 from .. import identity as identity_mod
 from .. import jobs
 from .. import root as root_mod
+from .. import target as target_mod
 from ..errors import InputError, JobError
-from ..records import JobInput, TakeRecord, read_json, sha256_file, write_json
+from ..records import (
+    JobInput,
+    TakeRecord,
+    TargetRecord,
+    read_json,
+    read_jsonl,
+    sha256_file,
+    write_json,
+)
 from ..states import NEUTRAL_STATE
 from . import extract as extract_cmd
 
@@ -53,6 +69,13 @@ OUTPUTS_NAME = "outputs.json"
 TAKES_DIR = "takes"
 LINES_NAME = "lines.jsonl"
 UNSCORED = "unscored"
+SCORE_FAMILY = target_mod.FAMILY
+SCORE_MODULE = "scripts.voice_data.stages.teacher_score"
+EMBEDDERS = target_mod.EMBEDDERS
+DEVICES = ("cpu", "cuda")
+SCORE_PLAN_NAME = "score-plan.json"
+# Where a scoring's SIM floor comes from: a seed target's neutral floor, or the round-1 takes.
+FLOOR_SEED, FLOOR_TAKES = "seed", "round-1-takes"
 PAUSED, COMPLETE = "paused", "complete"
 # What `line_status` returns: a line to generate, or why it is finished for now.
 GENERATE, KEPT, TO_SCORE, EXHAUSTED = "generate", "kept", "to-score", "exhausted"
@@ -85,8 +108,12 @@ def take_id(line_id: str, seed: int) -> str:
 
 
 def take_audio_rel(run_id: str, take: str) -> str:
-    """Return a take's WAV, relative to the root."""
-    return f"{run_rel(run_id)}/{TAKES_DIR}/{take}.wav"
+    """Return a take's FLAC, relative to the root.
+
+    FLAC, as the seed's clips are, because the spot-check pack copies clips byte for byte and
+    takes FLAC only (`packs.flac_info`).
+    """
+    return f"{run_rel(run_id)}/{TAKES_DIR}/{take}.flac"
 
 
 def is_scored(take: TakeRecord) -> bool:
@@ -128,21 +155,29 @@ def line_status(
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
-    """Add the `teacher` command with its `generate` step."""
+    """Add the `teacher` command with its `generate` and `score` steps."""
     parser = subparsers.add_parser(
         "teacher",
         help="teacher takes in the anchor voice",
-        description="Generate OmniVoice takes of the neutral lines in the anchor identity's voice.",
+        description=(
+            "Generate OmniVoice takes of the neutral lines in the anchor identity's voice, "
+            "then score them and select one per line."
+        ),
     )
     steps = parser.add_subparsers(dest="step", metavar="STEP", required=True)
     gen = steps.add_parser("generate", help="make take.n takes per line (a GPU job)")
-    gen.add_argument("--voice", required=True, help="the anchor identity under voices/")
+    gen.add_argument("--anchor", required=True, help="the anchor identity under voices/")
     gen.add_argument("--text", required=True, help="the text version under text/")
     gen.add_argument("--run", required=True, help="the run id, a folder under teachers/omnivoice")
     gen.add_argument("--rounds-max", type=int, help="rounds per line (default take.rounds_max)")
     gen.add_argument("--until", metavar="HH:MM", help="stop after the line running then (local)")
     gen.add_argument("--resume", action="store_true", help="continue an existing run")
     gen.set_defaults(func=run_generate)
+    sco = steps.add_parser("score", help="gate the run's takes by CER and SIM, select per line")
+    sco.add_argument("--run", required=True, help="the run id, a folder under teachers/omnivoice")
+    sco.add_argument("--target", help="a seed target whose neutral floor gates SIM")
+    sco.add_argument("--device", choices=DEVICES, default="cuda", help="where the models run")
+    sco.set_defaults(func=run_score)
 
 
 def make_docker() -> jobs.DockerOps:
@@ -324,7 +359,7 @@ def run_generate(args: argparse.Namespace) -> int:
         raise InputError("refused: --rounds-max is at least 1")
     deadline = deadline_mod.deadline_utc(args.until, now=utc_now()) if args.until else None
     gates = gates_mod.load(root.path)
-    anchor = read_anchor(root, args.voice)
+    anchor = read_anchor(root, args.anchor)
     line_ids = read_line_ids(root, args.text)
     run_dir = run_rel(args.run)
     plan_path = root.path / run_dir / PLAN_NAME
@@ -408,4 +443,197 @@ def generate_lines(summary: Mapping[str, object]) -> list[str]:
         f"  takes {_num(summary.get('takes'))} ({_num(summary.get('takes_new'))} new), "
         f"{_num(summary.get('takes_hours'))} h"
     )
+    return lines
+
+
+# `teacher score`.
+
+PROSODY_FIELDS = ("f0_mean_hz", "f0_std_hz", "rate_sps", "energy_db")
+
+
+@dataclass(frozen=True, slots=True)
+class SeedFloor:
+    """A seed target's neutral floor and profile, and its centroid files under the root."""
+
+    target_id: str
+    floor: dict[str, float]
+    centroids: dict[str, str]
+    centroid_sha256: dict[str, str]
+    profile: dict[str, float] | None
+    spread: dict[str, float] | None
+
+
+def _numbers(value: object, keys: Sequence[str]) -> dict[str, float] | None:
+    if not isinstance(value, Mapping):
+        return None
+    found = [value.get(k) for k in keys]
+    if not all(isinstance(v, int | float) and not isinstance(v, bool) for v in found):
+        return None
+    return {k: float(v) for k, v in zip(keys, found, strict=True)}  # type: ignore[arg-type]
+
+
+def seed_floor(root: root_mod.Root, target_id: str, voice_id: str) -> SeedFloor:
+    """Return target `target_id`'s neutral floor, which `teacher score --target` gates on.
+
+    Raises:
+        InputError: The target is missing, names another voice, was built without a seed (or
+            in identity mode, where the seed is not the voice), or lacks a neutral floor or a
+            centroid file on either embedder.
+    """
+    _check_id(target_id, "target id")
+    record: TargetRecord = target_mod.read_target(root, target_id)
+    if record.voice_id != voice_id:
+        raise InputError(f"refused: target {target_id} is not the voice of identity {voice_id}")
+    if record.seed_run is None or record.mode == target_mod.IDENTITY:
+        raise InputError(
+            f"refused: target {target_id} has no seed floor; omit --target for the seed fallback"
+        )
+    entry = record.states.get(STATE)
+    neutral = entry if isinstance(entry, Mapping) else {}
+    floor = _numbers(neutral.get("floor"), EMBEDDERS)
+    if floor is None:
+        raise InputError(f"refused: target {target_id} has no {STATE} floor on both embedders")
+    centroids: dict[str, str] = {}
+    for name in EMBEDDERS:
+        file_name = record.centroids.get(name)
+        rel = f"{target_mod.target_rel(target_id)}/{file_name}"
+        if not isinstance(file_name, str) or "/" in file_name or not (root.path / rel).is_file():
+            raise InputError(f"refused: target {target_id} has no {name} centroid file")
+        centroids[name] = rel
+    return SeedFloor(
+        target_id=target_id,
+        floor=floor,
+        centroids=centroids,
+        centroid_sha256={name: sha256_file(root.path / rel) for name, rel in centroids.items()},
+        profile=_numbers(neutral.get("profile"), PROSODY_FIELDS),
+        spread=_numbers(neutral.get("spread"), PROSODY_FIELDS),
+    )
+
+
+def _floor_basis(
+    root: root_mod.Root, run_id: str, seed: SeedFloor | None, gates: gates_mod.Gates
+) -> dict[str, object]:
+    """Return the scoring's floor basis, refusing one that differs from the run's earlier scoring.
+
+    Takes already scored keep the SIM they were measured with, so the first scoring that measured
+    a take fixes the run's basis: the same source, the same target and, for a seed floor, the same
+    centroid files. A scoring that measured nothing (its job failed) fixes nothing.
+    """
+    floor: dict[str, object] = (
+        {
+            "from": FLOOR_SEED,
+            "target": seed.target_id,
+            "values": seed.floor,
+            "centroid_sha256": seed.centroid_sha256,
+        }
+        if seed is not None
+        else {
+            "from": FLOOR_TAKES,
+            "target": None,
+            "percentile": float(gates.value("state_floor.percentile")),
+        }
+    )
+    run_dir = root.path / run_rel(run_id)
+    old_path = run_dir / SCORE_PLAN_NAME
+    if not old_path.is_file():
+        return floor
+    if not any(is_scored(t) for t in read_jsonl(run_dir / TAKES_NAME, TakeRecord)):
+        return floor
+    old = read_json(old_path)
+    old_floor = old.get("floor") if isinstance(old, dict) else None
+    basis = old_floor if isinstance(old_floor, dict) else {}
+    if (basis.get("from"), basis.get("target")) != (floor["from"], floor["target"]):
+        target = f" (target {basis.get('target')})" if basis.get("target") else ""
+        raise InputError(
+            f"refused: run {run_id} was scored with its floor from {basis.get('from')}"
+            f"{target}; score it the same way"
+        )
+    if seed is not None and basis.get("centroid_sha256") != seed.centroid_sha256:
+        raise InputError(
+            f"refused: target {seed.target_id}'s centroids changed since run {run_id} was "
+            "scored; score its takes in a new run"
+        )
+    return floor
+
+
+def run_score(args: argparse.Namespace) -> int:
+    """Plan the scoring, run the score job, and print its summary."""
+    root = root_mod.open_root(args.root)
+    _check_id(args.run, "run id")
+    run_dir = run_rel(args.run)
+    plan_path = root.path / run_dir / PLAN_NAME
+    if not plan_path.is_file() or not (root.path / run_dir / TAKES_NAME).is_file():
+        raise InputError(f"refused: run {args.run} has no takes; run teacher generate first")
+    plan = read_json(plan_path)
+    if not isinstance(plan, dict) or plan.get("schema") != SCHEMA:
+        raise InputError(f"refused: run {args.run}'s plan is not a schema {SCHEMA} plan")
+    anchor_doc = plan.get("anchor")
+    voice = anchor_doc.get("voice") if isinstance(anchor_doc, dict) else None
+    if not isinstance(voice, str):
+        raise InputError(f"refused: run {args.run}'s plan names no anchor")
+    anchor = read_anchor(root, voice)
+    if anchor.to_json() != anchor_doc:
+        raise InputError(f"refused: identity {voice}'s neutral clip changed since run {args.run}")
+    gates = gates_mod.load(root.path)
+    seed = seed_floor(root, args.target, voice) if args.target else None
+    floor = _floor_basis(root, args.run, seed, gates)
+    lines_file = str(plan["lines_file"])
+    score_plan = {
+        "schema": SCHEMA,
+        "run": args.run,
+        "teacher": TEACHER,
+        "state": STATE,
+        "lines_file": lines_file,
+        "anchor": anchor.to_json(),
+        "embedders": list(EMBEDDERS),
+        "cer_max": float(gates.value("take.cer_max")),
+        "floor": floor,
+        "centroids": seed.centroids if seed is not None else None,
+        "profile": seed.profile if seed is not None else None,
+        "spread": seed.spread if seed is not None else None,
+    }
+    write_json(root, f"{run_dir}/{SCORE_PLAN_NAME}", score_plan)
+    inputs = [
+        JobInput(rel=lines_file, sha256=sha256_file(root.path / lines_file)),
+        JobInput(rel=anchor.audio, sha256=anchor.audio_sha256),
+    ]
+    for name, rel in seed.centroids.items() if seed is not None else ():
+        inputs.append(JobInput(rel=rel, sha256=seed.centroid_sha256[name]))
+    job = jobs.JobSpec(
+        job_id=_job_id(root),
+        family=SCORE_FAMILY,
+        image=image_tag(SCORE_FAMILY),
+        module=SCORE_MODULE,
+        args=("--run", args.run, "--device", args.device),
+        inputs=tuple(inputs),
+        outputs=run_dir,
+        gpu=args.device == "cuda",
+        network=False,
+    )
+    summary = _run(root, job)
+    for line in score_lines(summary):
+        print(line)
+    return 0
+
+
+def score_lines(summary: Mapping[str, object]) -> list[str]:
+    """Return what `teacher score` prints: counts, hours and the floor, never text or paths."""
+    lines = [
+        f"teacher score run {summary.get('run')}: lines {_num(summary.get('lines'))}, "
+        f"{_num(summary.get('lines_kept'))} with a kept take"
+    ]
+    lines.append(
+        f"  takes {_num(summary.get('takes'))}: kept {_num(summary.get('kept'))} "
+        f"({_num(summary.get('kept_hours'))} h), selected {_num(summary.get('selected'))} "
+        f"({_num(summary.get('selected_hours'))} h)"
+    )
+    floors = summary.get("floors")
+    doc = floors if isinstance(floors, Mapping) else {}
+    values = doc.get("values")
+    table = ", ".join(
+        f"{name} {_num(v)}" for name, v in (values.items() if isinstance(values, Mapping) else ())
+    )
+    source = doc.get("from") if doc.get("from") in (FLOOR_SEED, FLOOR_TAKES) else "?"
+    target = f" (target {doc.get('target')})" if isinstance(doc.get("target"), str) else ""
+    lines.append(f"  floor from {source}{target}: {table or 'none'}")
     return lines

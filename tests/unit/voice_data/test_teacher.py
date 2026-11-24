@@ -30,14 +30,24 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from scripts.voice_data import cli, jobs
+from scripts.voice_data import cli, jobs, packs
 from scripts.voice_data import root as root_mod
+from scripts.voice_data.bindings.protocols import Transcript
 from scripts.voice_data.commands import teacher as teacher_cmd
-from scripts.voice_data.records import TakeRecord, read_jsonl, write_jsonl
-from scripts.voice_data.stages import fetch
+from scripts.voice_data.records import (
+    Prosody,
+    TakeRecord,
+    TargetRecord,
+    read_jsonl,
+    write_json,
+    write_jsonl,
+)
+from scripts.voice_data.stages import fetch, score
 from scripts.voice_data.stages import teacher_omnivoice as gen_stage
+from scripts.voice_data.stages import teacher_score as score_stage
 
 from .conftest import Canaries, _assert_no_canary, _synth_voice
+from .fakes import FakeArousal, FakeEmbedder
 from .test_identity import _Capture, edit_manifest, make_identity
 
 RATE = 24000
@@ -272,12 +282,12 @@ def teacher(
             code = cli.main(["--root", str(root.path), "teacher", *args])
     result = Result(code, out.getvalue(), err.getvalue(), docker)
     _assert_no_canary(result.out + result.err)
-    assert ".wav" not in result.out + result.err
+    assert ".wav" not in result.out + result.err and ".flac" not in result.out + result.err
     return result
 
 
 def generate(root: root_mod.Root, *args: str, **kwargs: object) -> Result:
-    base = ("generate", "--voice", VOICE, "--text", TEXT, "--run", RUN)
+    base = ("generate", "--anchor", VOICE, "--text", TEXT, "--run", RUN)
     return teacher(root, *base, *args, **kwargs)  # type: ignore[arg-type]
 
 
@@ -305,10 +315,12 @@ def test_generate_makes_take_n_takes_per_neutral_line(root: root_mod.Root, omni:
     for take in takes:
         assert (take.state, take.teacher, take.round) == ("neutral", "omnivoice", 1)
         assert take.take_id == root_mod.take_id(take.line_id, "neutral", "omnivoice", take.seed)
-        assert take.audio == f"teachers/omnivoice/{RUN}/takes/{take.take_id}.wav"
+        assert take.audio == f"teachers/omnivoice/{RUN}/takes/{take.take_id}.flac"
         assert take.reasons == ("unscored",) and not take.kept and not take.selected
         info = sf.info(str(root.path / take.audio))
-        assert (info.samplerate, info.channels, info.subtype) == (24000, 1, "PCM_16")
+        assert (info.format, info.samplerate, info.channels, info.subtype) == (
+            "FLAC", 24000, 1, "PCM_16"
+        )  # fmt: skip
     assert len({t.seed for t in takes}) == len(takes)
     for line_id in NEUTRAL_LINES:
         seeds = [t.seed for t in takes if t.line_id == line_id]
@@ -534,7 +546,7 @@ def test_resume_makes_only_the_missing_takes_of_an_interrupted_round(
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        (("--voice", "no-such-voice"), "has no voice.json"),
+        (("--anchor", "no-such-voice"), "has no voice.json"),
         (("--text", "v9"), "text/v9/lines.jsonl is missing"),
         (("--run", "../up"), "one folder name"),
         (("--resume",), "no plan to resume"),
@@ -544,7 +556,7 @@ def test_resume_makes_only_the_missing_takes_of_an_interrupted_round(
 def test_generate_refusals_exit_2(
     root: root_mod.Root, omni: OmniFakes, args: tuple[str, ...], message: str
 ) -> None:
-    values = {"--voice": VOICE, "--text": TEXT, "--run": RUN}
+    values = {"--anchor": VOICE, "--text": TEXT, "--run": RUN}
     flags: list[str] = []
     for i in range(0, len(args), 2):
         if args[i] in values and i + 1 < len(args):
@@ -558,13 +570,24 @@ def test_generate_refusals_exit_2(
     assert result.docker.argvs == []
 
 
+def test_generate_names_the_anchor_with_anchor(root: root_mod.Root, omni: OmniFakes) -> None:
+    argv = ["--root", str(root.path), "teacher", "generate", "--text", TEXT, "--run", RUN]
+    err = _Capture()
+    with contextlib.redirect_stderr(err), pytest.raises(SystemExit) as exit_info:
+        cli.main([*argv, "--voice", VOICE])
+    assert exit_info.value.code == 2 and "--anchor" in err.getvalue()
+    assert generate(root).code == 0
+    plan = json.loads((run_dir(root) / "generate-plan.json").read_text(encoding="utf-8"))
+    assert plan["anchor"]["voice"] == VOICE
+
+
 def test_generate_refuses_a_text_without_neutral_lines(
     root: root_mod.Root, omni: OmniFakes
 ) -> None:
     path = root.path / "text" / "v2" / "lines.jsonl"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"line_id": "a", "state": "calm", "text": "x"}) + "\n", "utf-8")
-    result = teacher(root, "generate", "--voice", VOICE, "--text", "v2", "--run", RUN)
+    result = teacher(root, "generate", "--anchor", VOICE, "--text", "v2", "--run", RUN)
     assert result.code == 2 and "no neutral line" in result.err
 
 
@@ -580,7 +603,7 @@ def test_generate_refuses_an_anchor_whose_clip_changed(
 def test_resume_refuses_another_text_version(root: root_mod.Root, omni: OmniFakes) -> None:
     assert generate(root).code == 0
     write_text(root, "v2")
-    result = teacher(root, "generate", "--voice", VOICE, "--text", "v2", "--run", RUN, "--resume")
+    result = teacher(root, "generate", "--anchor", VOICE, "--text", "v2", "--run", RUN, "--resume")
     assert result.code == 2 and "another text version or anchor" in result.err
 
 
@@ -624,3 +647,284 @@ def test_stop_reads_the_signal_before_the_clock() -> None:
     assert stop.reason() == "signal"
     assert gen_stage.Stop(deadline, lambda: deadline).reason() == "deadline"
     assert gen_stage.Stop(None, lambda: deadline).reason() is None
+
+
+# `teacher score`.
+
+
+class ScriptedAsr:
+    """An ASR that hears, in call order, the texts a test scripted."""
+
+    name = "whisper-large-v3-turbo"
+
+    def __init__(self, heard: Sequence[str]) -> None:
+        self.heard = list(heard)
+        self.calls = 0
+
+    def transcribe(self, audio: np.ndarray, sample_rate: int) -> Transcript:
+        text = self.heard[self.calls]
+        self.calls += 1
+        return Transcript(text=text, words=())
+
+
+def quick_prosody(audio: np.ndarray, sample_rate: int) -> Prosody:
+    # The clip's length stands in for its F0 mean, so takes of different lengths differ.
+    seconds = len(audio) / sample_rate
+    return Prosody(f0_mean_hz=200.0 * seconds, f0_std_hz=4.0, rate_sps=4.0, energy_db=-20.0)
+
+
+EMBEDDERS = (FakeEmbedder("wavlm-sv"), FakeEmbedder("ecapa"))
+MISHEARD = "a different sentence altogether"
+
+
+def score_models(heard: Sequence[str]) -> score_stage.Models:
+    return score_stage.Models(
+        embedders=EMBEDDERS, asr=ScriptedAsr(heard), arousal=FakeArousal(), prosody=quick_prosody
+    )
+
+
+def heard_for(takes: Sequence[TakeRecord], misheard: Callable[[TakeRecord], bool]) -> list[str]:
+    unscored = [t for t in takes if not teacher_cmd.is_scored(t)]
+    return [MISHEARD if misheard(t) else line_text(t.line_id) for t in unscored]
+
+
+def score_run(
+    root: root_mod.Root, models: score_stage.Models, *args: str, run: str = RUN
+) -> Result:
+    docker = StageDocker(root)
+    docker.patches["load_models"] = lambda device: models
+    return teacher(root, "score", "--run", run, *args, docker=docker)
+
+
+def audio_of(root: root_mod.Root, take: TakeRecord) -> tuple[np.ndarray, int]:
+    audio, rate = sf.read(str(root.path / take.audio), dtype="float32")
+    return audio, rate
+
+
+def anchor_embedding(root: root_mod.Root) -> dict[str, np.ndarray]:
+    audio, rate = sf.read(str(root.path / "voices" / VOICE / "neutral.wav"), dtype="float32")
+    return {e.name: np.asarray(e.embed(audio, rate), np.float64) for e in EMBEDDERS}
+
+
+def sims_to(root: root_mod.Root, take: TakeRecord, targets: dict[str, np.ndarray]) -> dict:
+    audio, rate = audio_of(root, take)
+    return {
+        e.name: round(
+            score.cosine(np.asarray(e.embed(audio, rate), np.float64), targets[e.name]), 6
+        )
+        for e in EMBEDDERS
+    }
+
+
+def misheard_rule(take: TakeRecord) -> bool:
+    # Every take of line 2, and line 1's second take.
+    return take.line_id == "line-0002" or take.seed == teacher_cmd.take_seed("line-0001", 1, 1)
+
+
+def test_score_under_the_seed_fallback(root: root_mod.Root, omni: OmniFakes) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    result = score_run(root, score_models(heard_for(takes, misheard_rule)))
+    assert result.code == 0, result.err
+    job = result.job
+    assert (job["family"], job["module"], job["gpu"]) == (
+        "score", "scripts.voice_data.stages.teacher_score", True
+    )  # fmt: skip
+    assert job["args"] == ["--run", RUN, "--device", "cuda"]
+    assert [i["rel"] for i in job["inputs"]] == [
+        "text/v1/lines.jsonl",
+        f"voices/{VOICE}/neutral.wav",
+    ]
+
+    scored = takes_of(root)
+    targets = anchor_embedding(root)
+    expected_sims = {t.take_id: sims_to(root, t, targets) for t in takes}
+    floors = {
+        name: round(float(np.percentile([s[name] for s in expected_sims.values()], 10)), 6)
+        for name in ("wavlm-sv", "ecapa")
+    }
+    for take in scored:
+        assert take.sim == expected_sims[take.take_id]
+        assert take.cer > 0.03 if misheard_rule(take) else take.cer == 0.0
+        audio, rate = audio_of(root, take)
+        assert take.prosody == quick_prosody(audio, rate)
+        assert take.arousal == round(FakeArousal().arousal(audio, rate), 6)
+        reasons = tuple(f"sim:{n}" for n in floors if take.sim[n] < floors[n])
+        reasons += ("cer",) if take.cer > 0.03 else ()
+        assert take.reasons == reasons
+        assert take.kept is (not reasons)
+    by_line = {line: [t for t in scored if t.line_id == line] for line in NEUTRAL_LINES}
+    assert not any(t.selected for t in by_line["line-0002"])
+    profile_audio, profile_rate = sf.read(
+        str(root.path / "voices" / VOICE / "neutral.wav"), dtype="float32"
+    )
+    profile = quick_prosody(profile_audio, profile_rate)
+    values = np.asarray([[t.prosody.f0_mean_hz, 4.0, 4.0, -20.0] for t in scored])
+    spread = Prosody(*[round(float(s), 6) for s in values.std(axis=0)])
+    for line in ("line-0001", "line-0003"):
+        kept = [
+            score.TakeScores(t.take_id, t.sim, t.cer, t.prosody) for t in by_line[line] if t.kept
+        ]
+        selected = [t.take_id for t in by_line[line] if t.selected]
+        if kept:
+            assert selected == [score.select(kept, profile, spread).take_id]
+        else:
+            assert selected == []
+
+    summary = summary_of(root)
+    assert summary["floors"] == {"from": "round-1-takes", "target": None, "values": floors, "n": 9}
+    assert summary["takes"] == 9 and summary["lines"] == 3
+    assert summary["kept"] == sum(t.kept for t in scored)
+    assert summary["selected"] == sum(t.selected for t in scored)
+    assert summary["lines_kept"] == len({t.line_id for t in scored if t.kept})
+    assert summary["status"] == "complete"
+    assert summary["kept_hours"] > 0
+    assert "floor from round-1-takes" in result.out
+
+
+def write_target(root: root_mod.Root, floor: dict[str, float], *, seed_run: str | None = "c1",
+                 voice: str = VOICE, target: str = VOICE) -> None:  # fmt: skip
+    folder = root.path / "targets" / target
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, vector in anchor_embedding(root).items():
+        np.save(folder / f"centroid-{name}.npy", vector)
+    profile = {"f0_mean_hz": 250.0, "f0_std_hz": 4.0, "rate_sps": 4.0, "energy_db": -20.0}
+    spread = {"f0_mean_hz": 20.0, "f0_std_hz": 1.0, "rate_sps": 1.0, "energy_db": 1.0}
+    record = TargetRecord(
+        schema=1, target_id=target, voice_id=voice, mode="seed" if seed_run else "identity",
+        seed_run=seed_run, identity=None,
+        embedders={"wavlm-sv": "a@1", "ecapa": "b@2"},
+        centroids={n: f"centroid-{n}.npy" for n in ("wavlm-sv", "ecapa")},
+        distribution={}, windows={}, mode_check=(),
+        states={"neutral": {"refs": [], "floor": floor, "floor_from": "state", "n": 20,
+                            "profile": profile, "spread": spread}},
+    )  # fmt: skip
+    write_json(root, f"targets/{target}/target.json", record)
+
+
+def test_score_with_a_seed_floor(root: root_mod.Root, omni: OmniFakes) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    sims = {t.take_id: sims_to(root, t, anchor_embedding(root)) for t in takes}
+    floor = {n: float(np.median([s[n] for s in sims.values()])) for n in ("wavlm-sv", "ecapa")}
+    write_target(root, floor)
+    result = score_run(root, score_models(heard_for(takes, lambda t: False)), "--target", VOICE)
+    assert result.code == 0, result.err
+    rels = [i["rel"] for i in result.job["inputs"]]
+    assert rels[2:] == [f"targets/{VOICE}/centroid-{n}.npy" for n in ("wavlm-sv", "ecapa")]
+    scored = takes_of(root)
+    for take in scored:
+        assert take.sim == sims[take.take_id]  # the centroid is the anchor's embedding here
+        assert take.kept is all(take.sim[n] >= floor[n] for n in floor)
+    assert 0 < sum(t.kept for t in scored) < len(scored)
+    profile = Prosody(250.0, 4.0, 4.0, -20.0)
+    spread = Prosody(20.0, 1.0, 1.0, 1.0)
+    for line in NEUTRAL_LINES:
+        own = [t for t in scored if t.line_id == line]
+        kept = [score.TakeScores(t.take_id, t.sim, t.cer, t.prosody) for t in own if t.kept]
+        chosen = [t.take_id for t in own if t.selected]
+        assert chosen == ([score.select(kept, profile, spread).take_id] if kept else [])
+    floors = summary_of(root)["floors"]
+    assert floors == {"from": "seed", "target": VOICE, "values": floor, "n": 0}
+    assert f"floor from seed (target {VOICE})" in result.out
+
+
+def test_rescoring_measures_only_new_takes_and_keeps_the_round_1_floor(
+    root: root_mod.Root, omni: OmniFakes
+) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    assert score_run(root, score_models(heard_for(takes, misheard_rule))).code == 0
+    first = {t.take_id: t for t in takes_of(root)}
+    floors = summary_of(root)["floors"]
+    assert generate(root, "--resume").code == 0  # line 2 had nothing kept: round 2
+    round_two = [t for t in takes_of(root) if t.round == 2]
+    assert {t.line_id for t in round_two} == {"line-0002"} and len(round_two) == 3
+    models = score_models([line_text("line-0002")] * 3)
+    assert score_run(root, models).code == 0
+    assert models.asr.calls == 3
+    again = takes_of(root)
+    for take in again:
+        if take.round == 1:
+            assert (take.sim, take.cer, take.kept) == (
+                first[take.take_id].sim, first[take.take_id].cer, first[take.take_id].kept
+            )  # fmt: skip
+    assert summary_of(root)["floors"] == floors
+    line_two = [t for t in again if t.line_id == "line-0002"]
+    assert sum(t.selected for t in line_two) == int(any(t.kept for t in line_two))
+
+
+def test_pack_spotcheck_reads_the_scored_takes(root: root_mod.Root, omni: OmniFakes) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    assert score_run(root, score_models(heard_for(takes, lambda t: False))).code == 0
+    selected = {t.take_id for t in takes_of(root) if t.selected}
+    assert len(selected) == 3
+    rel = f"teachers/omnivoice/{RUN}/takes.jsonl"
+    with contextlib.redirect_stdout(_Capture()):
+        code = cli.main(
+            ["--root", str(root.path), "pack", "spotcheck", "--takes", rel, "--seed", "5"]
+        )
+    assert code == 0
+    key = json.loads(
+        (root.path / "packs" / f"{packs.pack_id(5)}.key" / "key.json").read_text(encoding="utf-8")
+    )
+    assert {info["take_id"] for info in key["items"].values()} == selected
+
+
+def test_score_refusals_exit_2(root: root_mod.Root, omni: OmniFakes) -> None:
+    models = score_models([])
+    before = score_run(root, models)
+    assert before.code == 2 and "run teacher generate first" in before.err
+    assert generate(root).code == 0
+    write_target(root, {"wavlm-sv": 0.5, "ecapa": 0.5}, voice="other-voice", target="t-other")
+    other = score_run(root, models, "--target", "t-other")
+    assert other.code == 2 and "is not the voice of identity" in other.err
+    write_target(root, {"wavlm-sv": 0.5, "ecapa": 0.5}, seed_run=None, target="t-id")
+    unseeded = score_run(root, models, "--target", "t-id")
+    assert unseeded.code == 2 and "has no seed floor" in unseeded.err
+    missing = score_run(root, models, "--target", "t-none")
+    assert missing.code == 2
+    assert all(r.docker.argvs == [] for r in (before, other, unseeded, missing))
+
+
+def test_score_keeps_the_basis_it_first_used(root: root_mod.Root, omni: OmniFakes) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    assert score_run(root, score_models(heard_for(takes, lambda t: False))).code == 0
+    write_target(root, {"wavlm-sv": 0.5, "ecapa": 0.5})
+    switched = score_run(root, score_models([]), "--target", VOICE)
+    assert switched.code == 2 and "score it the same way" in switched.err
+
+
+def test_a_scoring_that_scored_nothing_fixes_no_basis(root: root_mod.Root, omni: OmniFakes) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    write_target(root, {"wavlm-sv": 0.5, "ecapa": 0.5})
+    docker = StageDocker(root)
+
+    def no_models(device: str) -> score_stage.Models:
+        raise score_stage.StageError("no models")
+
+    docker.patches["load_models"] = no_models
+    failed = teacher(root, "score", "--run", RUN, "--target", VOICE, docker=docker)
+    assert failed.code == 4
+    assert not any(teacher_cmd.is_scored(t) for t in takes_of(root))
+    fallback = score_run(root, score_models(heard_for(takes, lambda t: False)))
+    assert fallback.code == 0, fallback.err
+    assert summary_of(root)["floors"]["from"] == "round-1-takes"
+
+
+def test_score_refuses_a_seed_target_whose_centroids_changed(
+    root: root_mod.Root, omni: OmniFakes
+) -> None:
+    assert generate(root).code == 0
+    takes = takes_of(root)
+    write_target(root, {"wavlm-sv": 0.5, "ecapa": 0.5})
+    first = score_run(root, score_models(heard_for(takes, lambda t: False)), "--target", VOICE)
+    assert first.code == 0, first.err
+    centroid = root.path / "targets" / VOICE / "centroid-ecapa.npy"
+    np.save(centroid, -np.load(centroid))
+    again = score_run(root, score_models([]), "--target", VOICE)
+    assert again.code == 2 and "centroids changed" in again.err
+    assert again.docker.argvs == []
