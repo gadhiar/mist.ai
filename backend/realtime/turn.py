@@ -2118,8 +2118,10 @@ class TurnController:
         commit sets it, and its request text leads every turn from that utterance until one is
         released or opens unheld; where none will be, `_commit_kept` records it alone.
 
-        A supersede never finds a turn kept: a typed turn is in `text`, and a turn from the
-        kept turn's utterance that reaches `thinking` resolved it when it opened or was released.
+        A supersede never finds a turn kept: a typed turn is never superseded, even one spoken
+        on request in `thinking` (protocol 2.1.0), since `_supersedes` admits voice turns only,
+        and a turn from the kept turn's utterance that reaches `thinking` resolved it when it
+        opened or was released.
         """
         assert self._kept is None  # noqa: S101 - at most one turn is kept (A51)
         merged = not turn.scope.tool_dispatched

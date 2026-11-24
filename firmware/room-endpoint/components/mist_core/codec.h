@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Part of MIST.AI, released under the MIT License; see LICENSE at the repository root.
 //
-// The room endpoint's half of MIST.AI realtime protocol 2.0.0 (`backend/realtime/protocol.py`,
+// The room endpoint's half of MIST.AI realtime protocol 2.1.0 (`backend/realtime/protocol.py`,
 // vectors in `tests/fixtures/realtime_protocol_v2/vectors.json`): the 16-byte `<IHHII>` binary
 // frame header, the JSON builders for every message the device sends, and the readers for the
 // messages it acts on.

@@ -19,13 +19,14 @@ before sending. Fields a newer client adds are ignored rather than rejected, whi
 protocol bump compatible with this server; `alarm_report` is the one exception, and refuses an
 unknown key.
 
-Protocol 2.0.0 is main's 1.x control messages plus protocol 2's own. Every client message
-main's `/ws` handles is modelled, with main's fields, except `audio` and `reset_vad`, which
-protocol 2 removed: `text`, `interrupt`, `log_config` and `subscribe_logs` from protocol 1, and
-capabilities' `action_decision`, `alarm_action` and `alarm_report` from 1.4.0. Main's server
-messages are not modelled: the server messages here are the ones protocol 2 adds or changes, so
-a server event protocol 2 leaves unchanged, such as `stream_token` or a capability event, is an
-unknown type to `parse_server_message`.
+Protocol 2.1.0 is 2.0.0 with `text`'s `playback` flag (`TextMessage`), and 2.0.0 is
+main's 1.x control messages plus protocol 2's own. Every client message main's `/ws` handles is
+modelled, with main's fields, except `audio` and `reset_vad`, which protocol 2 removed: `text`,
+`interrupt`, `log_config` and `subscribe_logs` from protocol 1, and capabilities'
+`action_decision`, `alarm_action` and `alarm_report` from 1.4.0. Main's server messages are
+not modelled: the server messages here are the ones protocol 2 adds or changes, so a server
+event protocol 2 leaves unchanged, such as `stream_token` or a capability event, is an unknown
+type to `parse_server_message`.
 """
 
 import json
