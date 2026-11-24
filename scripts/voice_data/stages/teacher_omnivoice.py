@@ -1,7 +1,7 @@
 """OmniVoice takes of the neutral lines in the anchor's voice, run as the `teacher-omnivoice` job.
 
-Runs as `/opt/venv-teacher-omnivoice/bin/python -I -m scripts.voice_data.stages.teacher_omnivoice
---data /data --run R [--deadline-utc YYYY-MM-DDTHH:MM:SSZ]`, with the text version's
+Runs as `/opt/venv-teacher-omnivoice/bin/python -I -u -m
+scripts.voice_data.stages.teacher_omnivoice --data /data --run R [--deadline-utc YYYY-MM-DDTHH:MM:SSZ]`, with the text version's
 `lines.jsonl` and the anchor's neutral clip and transcript mounted read-only and
 `teachers/omnivoice/<R>/` writable. The host's `generate-plan.json` names the lines by id, the
 anchor's files with their sha256s, `take_n` and `rounds_max`.

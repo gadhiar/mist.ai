@@ -33,7 +33,9 @@ rebuilds only the record, the code layer and the import check.
   venv-score's pin, because the `extract` and `clean` stages load ECAPA in it.
 - `/opt/mist-voice/code/scripts/{voice_data,model_bench}`: the code at the image's commit, the
   last layer copied. `mist-voice-code.pth` in each venv's `site-packages` puts
-  `/opt/mist-voice/code` on the path, because jobs run `<venv>/bin/python -I`.
+  `/opt/mist-voice/code` on the path, because jobs run `<venv>/bin/python -I -u -m <module>`
+  and `-I` ignores `PYTHONPATH`. `-u` keeps stdout unbuffered, so a job's log shows each line
+  as it is printed; `-I` ignores `PYTHONUNBUFFERED` too, so the flag is needed.
 - `/opt/mist-voice/upstream/<repo>`: upstream code that is not pip-installable, cloned at its
   pinned commit (TIGER, Music-Source-Separation-Training, brouhaha-vad, Sidon, CosyVoice with
   Matcha-TTS, knn-vc, seed-vc, piper1-gpl at 639388b6317fc4731e91d53da42aea68fd4166ff, the

@@ -1,8 +1,8 @@
 """SIM-gated cleaning, transcripts and references (Design 5), run as the `extract` family's job.
 
-Runs as `/opt/venv-extract/bin/python -I -m scripts.voice_data.stages.clean --data /data --run R
---device D`, with the extract run the plan names mounted read-only and `seed/runs/<R>/`
-writable. The host's plan names the extract run, the target id, the thresholds and Raj's labels
+Runs as `/opt/venv-extract/bin/python -I -u -m scripts.voice_data.stages.clean --data /data
+--run R --device D`, with the extract run the plan names mounted read-only and
+`seed/runs/<R>/` writable. The host's plan names the extract run, the target id, the thresholds and Raj's labels
 (segment ids and states, no text), so nothing private reaches the argv.
 
 The order is Design 5's:

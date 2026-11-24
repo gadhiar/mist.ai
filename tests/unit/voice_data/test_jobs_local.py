@@ -154,6 +154,7 @@ def test_argv_is_exactly_the_interface(private_root: Root, monkeypatch) -> None:
         IMAGE,
         f"{VENV}/bin/python",
         "-I",
+        "-u",
         "-m",
         "scripts.voice_data.stages.extract",
         "--data",
@@ -222,9 +223,10 @@ def test_optional_env_name_omitted_when_unset(private_root: Root, monkeypatch) -
 def test_interpreter_is_the_family_venv(private_root: Root) -> None:
     argv = _local(private_root).argv(_job())
     start = argv.index(IMAGE)
-    assert argv[start + 1 : start + 7] == [
+    assert argv[start + 1 : start + 8] == [
         f"{VENV}/bin/python",
         "-I",
+        "-u",
         "-m",
         "scripts.voice_data.stages.extract",
         "--data",

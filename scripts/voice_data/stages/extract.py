@@ -1,9 +1,13 @@
 """Dialogue extraction and target-speaker retrieval (Design 4), run as the `extract` family's job.
 
-Runs as `/opt/venv-extract/bin/python -I -m scripts.voice_data.stages.extract --data /data
---run R --device D`, with each source's copied track and `seed/reference/` mounted read-only and
-`seed/runs/<run>/` writable. The host's plan names sources by id and gives the timestamp anchors
-as source ids and times, so no file name reaches this job.
+Runs as `/opt/venv-extract/bin/python -I -u -m scripts.voice_data.stages.extract --data /data
+--run R --device D [--vram-gb N]`, with each source's copied track and `seed/reference/`
+mounted read-only and `seed/runs/<run>/` writable. On cuda, `--vram-gb` is required: the
+allocator is capped under it before any model loads, and an out-of-memory error ends the run
+with a result naming where it happened (`_job`). The host's plan names sources by id and gives
+the timestamp anchors as source ids and times, so no file name reaches this job. The job log
+carries a progress line per source, per step and channel, and per minute of TIGER-DnR windows
+(`Tracker`), with ids, counts, durations and MiB only.
 
 The order is Design 4's:
 
@@ -47,14 +51,16 @@ Models come from `load_models`, which T11's bindings serve; tests pass fakes thr
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -71,12 +77,14 @@ from ..bindings.protocols import (
     Vad,
 )
 from ..commands import extract as contract
+from ..errors import JobError
 from ..records import Prosody, SegmentRecord
 from ..states import SPEAKING_STATES
-from . import propose_states, retrieve, segments
+from . import propose_states, retrieve, segments, vram
 from . import sdh as sdh_stage
 from .ingest import decode_argv
 from .prosody import prosody as measure_prosody
+from .vram import CAP_MARGIN_GIB, CUDA
 
 SCHEMA = 1
 NONE = "none"
@@ -90,6 +98,17 @@ BASIS_WINDOWS = "windows"
 # A turn shorter than this is too short to embed; it is recorded as a length drop.
 MIN_EMBED_S = 0.5
 AUDIO_SUBTYPE = "PCM_24"
+# The steps an out-of-memory result can name, besides a separator's id.
+STEP_LOAD = "load"
+STEP_DIARIZE = "diarize"
+STEP_EMBED = "embed"
+STEP_VAD = "vad"
+STEP_QUALITY = "quality"
+STEP_RETRIEVE = "retrieve"
+# A separator that reports its windows gets a progress line at least this often.
+WINDOW_REPORT_S = 60.0
+# The clock progress lines are timed on; `main` hands it to the `Tracker`.
+clock: Callable[[], float] = time.monotonic
 
 
 class StageError(RuntimeError):
@@ -119,11 +138,12 @@ class Models:
     prosody: Callable[[np.ndarray, int], Prosody] = measure_prosody
 
 
-def load_models(device: str) -> Models:
+def load_models(device: str, progress: Callable[[int, int], None] | None = None) -> Models:
     """Load the extract family's models from T11's bindings, on `device`.
 
     Each binding module exposes `load(device)`, imported here and not at the top so that a
     module walk imports no model package. Separators and embedders return a sequence.
+    `progress` goes to the separators, whose TIGER-DnR calls it after each window.
     """
     from ..bindings import (  # type: ignore[attr-defined]
         arousal,
@@ -135,12 +155,227 @@ def load_models(device: str) -> Models:
     )
 
     return Models(
-        separators=tuple(separators.load(device)),
+        separators=tuple(separators.load(device, progress)),
         embedders=tuple(embedders.load(device)),
         diarizer=diarizers.load(device),
         vad=vad.load(device),
         quality=quality.load(device),
         arousal=arousal.load(device),
+    )
+
+
+# Where the run is, for an out-of-memory result.
+
+
+@dataclass(frozen=True, slots=True)
+class Where:
+    """The place an out-of-memory result names.
+
+    `step` is a separator's id, or `load`, `diarize`, `embed`, `vad`, `quality` or `retrieve`;
+    `clip_s` is the clip's length for a call on a cut, and `None` for a whole channel.
+    """
+
+    source: str | None = None
+    channel: str | None = None
+    step: str | None = None
+    clip_s: float | None = None
+
+
+class Tracker:
+    """Follows the run through its sources, channels and steps, reads the card, and logs progress.
+
+    A block entered with `at` leaves `where` as it was when the block raised, so the handler of
+    an out-of-memory error reads the place it happened. `vram_module` is `stages.vram`, or a fake
+    of it in tests; on the CPU its readings are `None` and the lines leave the card out.
+
+    The progress lines carry ids, counts, durations and MiB only. A whole-channel step (a
+    separator, the diarizer, VAD, quality) logs a line when it returns; embeddings are many short
+    calls, so their count and time are summed per source and channel and logged when the source
+    changes, before the next step's line, or at `flush`.
+    """
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        vram_module: object = None,
+        clock_fn: Callable[[], float] | None = None,
+    ) -> None:
+        self.device = device
+        self.vram = vram if vram_module is None else vram_module
+        self.clock = time.monotonic if clock_fn is None else clock_fn
+        self.where = Where()
+        self._embeds: dict[tuple[str | None, str | None], list[float]] = {}
+        self._windows_begun = self._windows_logged = 0.0
+
+    @contextlib.contextmanager
+    def at(self, **changes: object) -> Iterator[None]:
+        """Set fields of `where` for the block, and restore them when it ends without an error."""
+        saved = self.where
+        moves = "source" in changes and changes["source"] != saved.source
+        if moves:
+            self.flush()
+        self.where = replace(saved, **changes)  # type: ignore[arg-type]
+        yield
+        if moves:
+            self.flush()
+        self.where = saved
+
+    @contextlib.contextmanager
+    def step(self, label: str, **changes: object) -> Iterator[None]:
+        """Run one whole-channel call under `changes`, then log its time and the card."""
+        with self.at(**changes):
+            self.flush()
+            begun = self._windows_begun = self._windows_logged = self.clock()
+            yield
+            elapsed = self.clock() - begun
+            print(f"extract: {self._place()} {label}: {elapsed:.1f} s{self._card()}")
+
+    @contextlib.contextmanager
+    def embed_call(self, clip_s: float) -> Iterator[None]:
+        """Run one embedding call and add it to its source and channel's totals."""
+        with self.at(step=STEP_EMBED, clip_s=clip_s):
+            begun = self.clock()
+            yield
+            key = (self.where.source, self.where.channel)
+            totals = self._embeds.setdefault(key, [0, 0.0])
+            totals[0] += 1
+            totals[1] += self.clock() - begun
+
+    def flush(self) -> None:
+        """Log the embedding totals not yet logged."""
+        for (source, channel), (calls, seconds) in self._embeds.items():
+            place = _place(source, channel)
+            print(f"extract: {place} embed: {calls:.0f} calls, {seconds:.1f} s{self._card()}")
+        self._embeds.clear()
+
+    def windows(self, done: int, total: int) -> None:
+        """A separator's progress callback: log the windows done at least once a minute."""
+        now = self.clock()
+        if now - self._windows_logged < WINDOW_REPORT_S:
+            return
+        self._windows_logged = now
+        rate = (now - self._windows_begun) / done
+        free = self.vram.free_mib(self.device)  # type: ignore[attr-defined]
+        card = "" if free is None else f", free {free} MiB"
+        print(
+            f"extract: {self._place()} {self.where.step} windows {done} of {total}, "
+            f"{rate:.2f} s per window{card}"
+        )
+
+    def loaded(self, begun: float) -> None:
+        """Log that the models are loaded, with the time since `begun` and the card."""
+        print(f"extract: models loaded in {self.clock() - begun:.1f} s{self._card()}")
+
+    def source_start(self, index: int, count: int, source: str, channel: str, s: float) -> None:
+        """Log the start of a source's first loop, with its length."""
+        self.flush()
+        print(f"extract: source {index} of {count}: {source} {channel}, {s / 60:.1f} min")
+
+    def reset_peak(self) -> None:
+        """Start the card's peak readings again."""
+        self.vram.reset_peak(self.device)  # type: ignore[attr-defined]
+
+    def peak_mib(self) -> dict[str, int] | None:
+        """The reserved and allocated peaks since the last reset; `None` on the CPU."""
+        return self.vram.peak_mib(self.device)  # type: ignore[attr-defined,no-any-return]
+
+    def _place(self) -> str:
+        return _place(self.where.source, self.where.channel)
+
+    def _card(self) -> str:
+        peak = self.peak_mib()
+        free = self.vram.free_mib(self.device)  # type: ignore[attr-defined]
+        if peak is None or free is None:
+            return ""
+        return f", peak reserved {peak['reserved']} MiB, free {free} MiB"
+
+
+def _place(source: str | None, channel: str | None) -> str:
+    # Before the first source, the only calls are the reference clips' embeddings.
+    return " ".join(part for part in (source, channel) if part) or "reference"
+
+
+def _clip_s(audio: np.ndarray, sample_rate: int) -> float:
+    return round(len(audio) / sample_rate, 3)
+
+
+class _TrackedSeparator:
+    def __init__(self, inner: Separator, track: Tracker) -> None:
+        self.name = inner.name
+        self._inner = inner
+        self._track = track
+
+    def dialogue(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        with self._track.step(self.name, step=self.name, clip_s=None):
+            return self._inner.dialogue(audio, sample_rate)
+
+
+class _TrackedEmbedder:
+    def __init__(self, inner: SpeakerEmbedder, track: Tracker) -> None:
+        self.name = inner.name
+        self._inner = inner
+        self._track = track
+
+    def embed(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        with self._track.embed_call(_clip_s(audio, sample_rate)):
+            return self._inner.embed(audio, sample_rate)
+
+
+class _TrackedDiarizer:
+    def __init__(self, inner: Diarizer, track: Tracker) -> None:
+        self._inner = inner
+        self._track = track
+
+    def turns(self, audio: np.ndarray, sample_rate: int) -> list[Turn]:
+        with self._track.step(STEP_DIARIZE, step=STEP_DIARIZE, clip_s=None):
+            return self._inner.turns(audio, sample_rate)
+
+    def overlaps(self, audio: np.ndarray, sample_rate: int) -> list[Span]:
+        with self._track.step("overlaps", step=STEP_DIARIZE, clip_s=None):
+            return self._inner.overlaps(audio, sample_rate)
+
+
+class _TrackedVad:
+    def __init__(self, inner: Vad, track: Tracker) -> None:
+        self._inner = inner
+        self._track = track
+
+    def speech(self, audio: np.ndarray, sample_rate: int) -> list[Span]:
+        with self._track.step(STEP_VAD, step=STEP_VAD, clip_s=None):
+            return self._inner.speech(audio, sample_rate)
+
+
+class _TrackedQuality:
+    def __init__(self, inner: QualityEstimator, track: Tracker) -> None:
+        self._inner = inner
+        self._track = track
+
+    def frames(self, audio: np.ndarray, sample_rate: int) -> QualityTrack:
+        with self._track.step(STEP_QUALITY, step=STEP_QUALITY, clip_s=None):
+            return self._inner.frames(audio, sample_rate)
+
+
+class _TrackedArousal:
+    # Arousal runs on kept cuts during the retrieval step, which stays the step named.
+    def __init__(self, inner: ArousalMonitor, track: Tracker) -> None:
+        self._inner = inner
+        self._track = track
+
+    def arousal(self, audio: np.ndarray, sample_rate: int) -> float:
+        with self._track.at(clip_s=_clip_s(audio, sample_rate)):
+            return self._inner.arousal(audio, sample_rate)
+
+
+def tracked(models: Models, track: Tracker) -> Models:
+    """Return `models` with every model call recorded in `track` as its step."""
+    return Models(
+        separators=tuple(_TrackedSeparator(s, track) for s in models.separators),
+        embedders=tuple(_TrackedEmbedder(e, track) for e in models.embedders),
+        diarizer=_TrackedDiarizer(models.diarizer, track),
+        vad=_TrackedVad(models.vad, track),
+        quality=_TrackedQuality(models.quality, track),
+        arousal=_TrackedArousal(models.arousal, track),
+        prosody=models.prosody,
     )
 
 
@@ -251,6 +486,8 @@ class SourceWork:
     rivals: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     # One per SDH anchor span of the source, in order; `None` when the cut is too short to embed.
     sdh_embs: list[retrieve.Embedding | None] = field(default_factory=list)
+    # The card's reserved and allocated peaks over the source's first loop; `None` on the CPU.
+    vram_peak_mib: dict[str, int] | None = None
 
     @property
     def channels(self) -> tuple[str, ...]:
@@ -615,14 +852,28 @@ def separator_choice(
 
 
 class Extraction:
-    """One run of the stage over the plan's sources."""
+    """One run of the stage over the plan's sources.
 
-    def __init__(self, data: Path, run_id: str, models: Models) -> None:
+    `track` follows the run for an out-of-memory result; every model call goes through it.
+    `started` is the card at the job's start, `None` on the CPU.
+    """
+
+    def __init__(
+        self,
+        data: Path,
+        run_id: str,
+        models: Models,
+        track: Tracker | None = None,
+        started: vram.VramStart | None = None,
+    ) -> None:
         if not contract.RUN_ID.fullmatch(run_id) or ".." in run_id:
             raise StageError("a run id is one folder name under seed/runs")
         self.data = data
         self.run_id = run_id
         self.run_dir = data / contract.run_rel(run_id)
+        self.track = Tracker() if track is None else track
+        self.started = started
+        models = tracked(models, self.track)
         self.models = models
         self.plan = _read_plan(data, run_id)
         self.thresholds = {str(k): float(v) for k, v in self.plan["thresholds"].items()}  # type: ignore[attr-defined]
@@ -672,11 +923,12 @@ class Extraction:
         own: dict[str, list[retrieve.Embedding]] = {name: [] for name in names}
         for sid in sorted({sid for sid, _ in self.anchors}):
             source = self.by_id[sid]
-            primary = decode(self.data, source, source.primary_channel)
-            for name, output in separate(
-                primary, source.sample_rate, self.models.separators
-            ).items():
-                own[name].extend(self._anchor_cuts(sid, output, source.sample_rate).values())
+            with self.track.at(source=sid, channel=source.primary_channel):
+                primary = decode(self.data, source, source.primary_channel)
+                for name, output in separate(
+                    primary, source.sample_rate, self.models.separators
+                ).items():
+                    own[name].extend(self._anchor_cuts(sid, output, source.sample_rate).values())
         return {name: retrieve.centroids(embs) if embs else None for name, embs in own.items()}
 
     def _first_loop(
@@ -684,26 +936,37 @@ class Extraction:
         source: Source,
         references: Mapping[str, Mapping[str, np.ndarray] | None],
         scratch: Path,
+        position: tuple[int, int] = (1, 1),
     ) -> tuple[SourceWork, dict[int, retrieve.Embedding]]:
         rate = source.sample_rate
         primary = decode(self.data, source, source.primary_channel)
+        self.track.source_start(
+            *position, source.source_id, source.primary_channel, len(primary) / rate
+        )
         outputs = separate(primary, rate, self.models.separators)
         choice = separator_choice(outputs, rate, self.models, references)
         chosen = choice.separator
         channels = {source.primary_channel: outputs[chosen]}
         del outputs, primary
         if source.primary_channel == FC:
-            downmix = decode(self.data, source, DOWNMIX)
-            channels[DOWNMIX] = np.asarray(
-                self._separator(chosen).dialogue(downmix, rate), dtype=np.float32
-            )
+            with self.track.at(channel=DOWNMIX):
+                downmix = decode(self.data, source, DOWNMIX)
+                channels[DOWNMIX] = np.asarray(
+                    self._separator(chosen).dialogue(downmix, rate), dtype=np.float32
+                )
         main = channels[source.primary_channel]
         anchors = self._anchor_cuts(source.source_id, main, rate)
         sdh_embs = self._sdh_cuts(source.source_id, main, rate)
         turns, overlaps = choice.diarized.turns, choice.diarized.overlaps
         turn_embs = choice.diarized.turn_embs
-        speech = {name: list(self.models.vad.speech(a, rate)) for name, a in channels.items()}
-        quality = {name: self.models.quality.frames(a, rate) for name, a in channels.items()}
+        speech: dict[str, list[Span]] = {}
+        quality: dict[str, QualityTrack] = {}
+        for name, audio in channels.items():
+            with self.track.at(channel=name):
+                speech[name] = list(self.models.vad.speech(audio, rate))
+        for name, audio in channels.items():
+            with self.track.at(channel=name):
+                quality[name] = self.models.quality.frames(audio, rate)
         offcentre: list[Span] = []
         if DOWNMIX in channels and source.primary_channel == FC:
             offcentre = [
@@ -711,7 +974,8 @@ class Extraction:
                 for s in segments.subtract(speech[DOWNMIX], speech[FC])
                 if s.end_s - s.start_s >= self.limits.min_s
             ]
-        offcentre_embs = [self._embed(cut(channels[DOWNMIX], rate, s), rate) for s in offcentre]
+        with self.track.at(channel=DOWNMIX):
+            offcentre_embs = [self._embed(cut(channels[DOWNMIX], rate, s), rate) for s in offcentre]
         paths = {}
         for name, audio in channels.items():
             paths[name] = scratch / f"{source.source_id}-{name}.npy"
@@ -832,10 +1096,12 @@ class Extraction:
         for work in works:
             rate = work.source.sample_rate
             main = self._load(work)[work.source.primary_channel]
-            for turn, _ in self._eligible(work):
-                for tile in segments.tiles(Span(turn.start_s, turn.end_s), self.limits.window_s):
-                    embs.append(self._embed(np.asarray(cut(main, rate, tile)), rate))
-                    sources.append(work.source.source_id)
+            with self.track.at(source=work.source.source_id, channel=work.source.primary_channel):
+                for turn, _ in self._eligible(work):
+                    span = Span(turn.start_s, turn.end_s)
+                    for tile in segments.tiles(span, self.limits.window_s):
+                        embs.append(self._embed(np.asarray(cut(main, rate, tile)), rate))
+                        sources.append(work.source.source_id)
         return retrieve.target_model(embs, sources, self.limits.window_percentile)
 
     def run(self) -> list[str]:
@@ -854,8 +1120,12 @@ class Extraction:
         with tempfile.TemporaryDirectory(dir=self.run_dir, prefix=".work-") as tmp:
             works = []
             anchor_embs: dict[int, retrieve.Embedding] = {}
-            for source in self.sources:
-                work, cuts = self._first_loop(source, references, Path(tmp))
+            for index, source in enumerate(self.sources, 1):
+                self.track.reset_peak()
+                position = (index, len(self.sources))
+                with self.track.at(source=source.source_id, channel=source.primary_channel):
+                    work, cuts = self._first_loop(source, references, Path(tmp), position)
+                work.vram_peak_mib = self.track.peak_mib()
                 works.append(work)
                 anchor_embs.update(cuts)
             anchors = clip_embs + [anchor_embs[i] for i in sorted(anchor_embs)]
@@ -878,10 +1148,7 @@ class Extraction:
         ]
 
     def _result(self, status: str, detail: Mapping[str, object], written: list[str]) -> list[str]:
-        rel = f"{contract.run_rel(self.run_id)}/{contract.RESULT_NAME}"
-        _write_json(self.data / rel, {"schema": SCHEMA, "status": status, **detail})
-        print(f"extract: {status}")
-        return [*written, rel]
+        return [*written, write_result(self.data, self.run_id, status, detail)]
 
     def _retrieve(
         self,
@@ -899,13 +1166,17 @@ class Extraction:
         model = retrieve.target_model(
             [e for _, e in eligible], [sid for sid, _ in eligible], self.limits.loo_percentile
         )
-        windows = self._window_model(works) if model is not None else None
         audio_dir = self.run_dir / contract.AUDIO_DIR
         audio_dir.mkdir(exist_ok=True)
         drafts: list[Draft] = []
-        for work in works:
-            source_drafts = self._source_drafts(work, model, windows)
-            drafts.extend(sorted(source_drafts, key=lambda d: (d.span.start_s, d.span.end_s)))
+        with self.track.at(step=STEP_RETRIEVE):
+            windows = self._window_model(works) if model is not None else None
+            for work in works:
+                with self.track.at(
+                    source=work.source.source_id, channel=work.source.primary_channel
+                ):
+                    source_drafts = self._source_drafts(work, model, windows)
+                drafts.extend(sorted(source_drafts, key=lambda d: (d.span.start_s, d.span.end_s)))
         records, proposals = self._records(drafts, audio_dir, written)
         report = self._report(works, records, drafts, model, windows, detail)
         turns = turn_records(works, anchor_centroid, model, self.limits.margin)
@@ -919,8 +1190,11 @@ class Extraction:
         report_rel = f"{run_rel}/{contract.REPORT_NAME}"
         _write_json(self.data / report_rel, report)
         kept = sum(r.kept for r in records)
+        self.track.flush()
         print(f"extract: {len(records)} segments, {kept} kept, {len(turns)} turns recorded")
-        return self._result("ok", detail, [*written, seg_rel, turns_rel, prop_rel, report_rel])
+        card = None if self.started is None else self.started.as_json()
+        files = [*written, seg_rel, turns_rel, prop_rel, report_rel]
+        return self._result("ok", {**detail, "vram": card}, files)
 
     # The second pass and the segment gates.
 
@@ -945,7 +1219,8 @@ class Extraction:
         windows: retrieve.TargetModel,
     ) -> tuple[list[str], float, float]:
         snr, c50 = segments.span_quality(work.quality[channel], span)
-        window_ok = self._window_ok(audio[channel], work.source.sample_rate, span, windows)
+        with self.track.at(channel=channel):
+            window_ok = self._window_ok(audio[channel], work.source.sample_rate, span, windows)
         reasons = segments.quality_reasons(
             snr, c50, window_ok, snr_min=self.limits.snr_min_db, c50_min=self.limits.c50_min_db
         )
@@ -1033,12 +1308,9 @@ class Extraction:
             return [self._draft(work, span, channel, channel_reason, base, reasons=("no-target",))]
         verdict = retrieve.judge(emb, model, work.rivals, self.limits.margin)
         if not verdict.passed and channel == FC and DOWNMIX in audio:
-            retry = retrieve.judge(
-                self._embed(np.asarray(cut(audio[DOWNMIX], rate, span)), rate),
-                model,
-                work.rivals,
-                self.limits.margin,
-            )
+            with self.track.at(channel=DOWNMIX):
+                downmix_emb = self._embed(np.asarray(cut(audio[DOWNMIX], rate, span)), rate)
+            retry = retrieve.judge(downmix_emb, model, work.rivals, self.limits.margin)
             if retry.passed:
                 verdict, channel, channel_reason = retry, DOWNMIX, "fc-failed:sim"
             else:
@@ -1113,7 +1385,10 @@ class Extraction:
             )
         rate = work.source.sample_rate
         clip = np.array(cut(audio[channel], rate, span), dtype=np.float32)
-        own = retrieve.judge(self._embed(clip, rate), model, work.rivals, self.limits.margin)
+        with self.track.at(channel=channel):
+            own = retrieve.judge(self._embed(clip, rate), model, work.rivals, self.limits.margin)
+            prosody = self.models.prosody(clip, rate)
+            arousal = float(self.models.arousal.arousal(clip, rate))
         return self._draft(
             work,
             span,
@@ -1126,8 +1401,8 @@ class Extraction:
             audio=clip,
             sample_rate=rate,
             margin=own.margin,
-            prosody=self.models.prosody(clip, rate),
-            arousal=float(self.models.arousal.arousal(clip, rate)),
+            prosody=prosody,
+            arousal=arousal,
             failing_retrieval=not own.passed,
         )
 
@@ -1250,6 +1525,7 @@ class Extraction:
                     "kept": sum(r.kept and r.cluster == retrieve.PRIMARY for r in own),
                     "flagged": sum(r.kept and r.cluster == retrieve.FLAGGED for r in own),
                     "dropped": sum(not r.kept for r in own),
+                    "vram_peak_mib": work.vram_peak_mib,
                 }
             )
         return {
@@ -1393,9 +1669,74 @@ def _distribution(model: retrieve.TargetModel | None) -> dict[str, object] | Non
     }
 
 
-def run(data: Path, run_id: str, models: Models) -> list[str]:
+def write_result(data: Path, run_id: str, status: str, detail: Mapping[str, object]) -> str:
+    """Write the run's `extract-result.json`; return its root-relative path."""
+    rel = f"{contract.run_rel(run_id)}/{contract.RESULT_NAME}"
+    _write_json(data / rel, {"schema": SCHEMA, "status": status, **detail})
+    print(f"extract: {status}")
+    return rel
+
+
+def run(
+    data: Path,
+    run_id: str,
+    models: Models,
+    track: Tracker | None = None,
+    started: vram.VramStart | None = None,
+) -> list[str]:
     """Run the stage over the plan of `run_id`; return the root-relative files written."""
-    return Extraction(data, run_id, models).run()
+    return Extraction(data, run_id, models, track, started).run()
+
+
+def _budget(text: str) -> float:
+    value = float(text)
+    if not value > CAP_MARGIN_GIB:
+        raise argparse.ArgumentTypeError(f"must be above {CAP_MARGIN_GIB:g} GiB")
+    return value
+
+
+def _job(
+    data: Path, run_id: str, device: str, budget_gib: float | None, track: Tracker
+) -> list[str]:
+    """Start the card, load the models and run; stop on the card's memory with a named result.
+
+    `vram.start` runs before `load_models`, so the weights count against the allocator's cap.
+    A CUDA out-of-memory error, however a binding wrapped it, ends the run with an
+    `out-of-memory` result naming where it happened (`track.where`), and a start with too little
+    free VRAM with a `vram-short` result before any model loads. Both exit 0 so the executor
+    verifies the result and the host reports it.
+    """
+    started = vram.start(device, budget_gib) if budget_gib is not None else None
+    if started is not None and started.short:
+        detail = {
+            "free_gib": started.free_gib,
+            "needed_gib": started.needed_gib,
+            "budget_gib": started.budget_gib,
+        }
+        return [write_result(data, run_id, contract.VRAM_SHORT, detail)]
+    try:
+        begun = track.clock()
+        with track.at(step=STEP_LOAD):
+            models = load_models(device, track.windows)
+        track.loaded(begun)
+        return run(data, run_id, models, track, started)
+    except StageError:
+        raise
+    except (JobError, RuntimeError) as exc:
+        if not vram.out_of_memory(exc):
+            raise
+        where = track.where
+        peak = vram.peak_mib(device)
+        detail = {
+            "source": where.source,
+            "channel": where.channel,
+            "step": where.step,
+            "clip_s": where.clip_s,
+            "budget_gib": budget_gib if started is None else started.budget_gib,
+            "cap_gib": None if started is None else started.cap_gib,
+            "peak_reserved_mib": None if peak is None else peak["reserved"],
+        }
+        return [write_result(data, run_id, contract.OUT_OF_MEMORY, detail)]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1404,9 +1745,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--run", required=True)
     parser.add_argument("--device", default="cpu", choices=contract.DEVICES)
+    parser.add_argument("--vram-gb", type=_budget, default=None, help="the job's VRAM budget")
     args = parser.parse_args(argv)
+    if args.device == CUDA and args.vram_gb is None:
+        parser.error("--vram-gb is required with --device cuda")
+    budget = args.vram_gb if args.device == CUDA else None
+    track = Tracker(args.device, vram, clock)
     try:
-        written = run(args.data, args.run, load_models(args.device))
+        written = _job(args.data, args.run, args.device, budget, track)
     except StageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

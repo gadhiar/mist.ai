@@ -20,9 +20,11 @@ Two fakes live here rather than in `fakes.py`:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import importlib
 import json
+import re
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,18 +34,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 
 from scripts.voice_data import cli, jobs, seed_gate
 from scripts.voice_data import gates as gates_mod
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.bindings.protocols import QualityTrack, Span, Turn
 from scripts.voice_data.commands import extract as extract_cmd
-from scripts.voice_data.errors import RootError
+from scripts.voice_data.errors import JobError, RootError
 from scripts.voice_data.records import Prosody, SegmentRecord, SourceRecord, read_jsonl, write_jsonl
 from scripts.voice_data.stages import extract as extract_stage
 from scripts.voice_data.stages import prosody as prosody_mod
-from scripts.voice_data.stages import retrieve
+from scripts.voice_data.stages import retrieve, vram
 from scripts.voice_data.stages import sdh as sdh_stage
+from scripts.voice_data.stages.fetch import library_errors
 from scripts.voice_data.stages.ingest import decode_argv
 from scripts.voice_data.stages.score import spectrum_distance_db
 from scripts.voice_data.stages.segments import span_quality
@@ -541,8 +545,12 @@ class StageDocker:
             contextlib.redirect_stdout(handle),
             contextlib.redirect_stderr(handle),
         ):
-            mp.setattr(stage, "load_models", lambda device: self.models)
+            mp.setattr(stage, "load_models", self.load)
             return stage.main(rest)
+
+    def load(self, device: str, progress: object = None) -> extract_stage.Models:
+        """The stage's `load_models`."""
+        return self.models
 
 
 class _Capture:
@@ -1657,3 +1665,436 @@ def _assert_clean(text: str, canaries: Canaries) -> None:
     for index, value in enumerate(canaries.all()):
         if value.lower() in lowered:
             pytest.fail(f"canary #{index} appears in the checked text")
+
+
+# The VRAM budget (T13): the allocator cap, per-source peaks, and the out-of-memory and short
+# results. The stage's `vram` module is replaced by a fake card, so no CUDA call runs.
+
+STARTED = vram.VramStart(budget_gib=8.0, free_gib=10.4, total_gib=12.0, needed_gib=7.5, cap_gib=7.0)
+SHORT = vram.VramStart(budget_gib=8.0, free_gib=6.83, total_gib=12.0, needed_gib=7.5, cap_gib=None)
+
+
+class FakeVram:
+    """The stage's `vram` module on a pretend card; each reset raises the next peak by 1000 MiB."""
+
+    def __init__(self, started: vram.VramStart = STARTED) -> None:
+        self.started = started
+        self.calls: list[tuple[object, ...]] = []
+        self.resets = 0
+
+    def start(self, device: str, budget_gib: float) -> vram.VramStart:
+        self.calls.append(("start", device, budget_gib))
+        return self.started
+
+    def reset_peak(self, device: str) -> None:
+        self.resets += 1
+
+    def peak_mib(self, device: str) -> dict[str, int]:
+        reserved = 3000 + 1000 * self.resets
+        return {"reserved": reserved, "allocated": reserved - 500}
+
+    def free_mib(self, device: str) -> int:
+        return 4096
+
+    def out_of_memory(self, exc: BaseException) -> bool:
+        return vram.out_of_memory(exc)
+
+
+class CudaStageDocker(StageDocker):
+    """A `StageDocker` on a host whose GPU is idle with 11 GiB free, and the fake card in the job."""
+
+    def __init__(
+        self, root: root_mod.Root, models: extract_stage.Models, card: FakeVram | None = None
+    ) -> None:
+        super().__init__(root, models)
+        self.card = card or FakeVram()
+
+    def capture(self, argv: Sequence[str]) -> str:
+        if list(argv[:3]) == ["docker", "ps", "-q"]:
+            return ""
+        assert "nvidia-smi" in argv
+        return "11264\n"
+
+    def load(self, device: str, progress: object = None) -> extract_stage.Models:
+        self.card.calls.append(("load_models", device))
+        return self.models
+
+    def run_logged(self, argv: Sequence[str], log: Path) -> int:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(extract_stage, "vram", self.card)
+            return super().run_logged(argv, log)
+
+
+class OomSeparator:
+    """An identity separator that runs out of GPU memory on a clip of `fail_samples`.
+
+    The error goes through `library_errors`, as a binding's would.
+    """
+
+    name = "separator-dme"
+
+    def __init__(self, fail_samples: int) -> None:
+        self.fail_samples = fail_samples
+
+    def dialogue(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if len(audio) == self.fail_samples:
+            with library_errors(self.name):
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 1.00 GiB")
+        return np.array(audio, dtype=np.float32)
+
+
+class OomDiarizer(FakeDiarizer):
+    """The scripted diarizer, out of GPU memory on every call."""
+
+    def turns(self, audio: np.ndarray, sample_rate: int) -> list[Turn]:
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 512.00 MiB")
+
+
+class OomEmbedder:
+    """An embedder out of GPU memory on every call, as cuBLAS reports it."""
+
+    name = "wavlm-sv"
+
+    def embed(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        raise RuntimeError("CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate`")
+
+
+def two_source_root(base: Path) -> tuple[root_mod.Root, Episode, int]:
+    """Two 5.1 sources with the small episode in FC; the second runs 1 s longer.
+
+    Returns the root, the 5.1 episode and the second source's length in samples.
+    """
+    small = small_episode()
+    audio = np.zeros((len(small.audio), 6), dtype=np.float32)
+    audio[:, FC] = small.audio
+    episode = Episode(audio, small.turns, small.overlaps, small.groups)
+    root = make_root(base, episode, clips={"solo.wav": take("target", 6.0, 1)})
+    longer = np.concatenate([audio, np.zeros((RATE, 6), dtype=np.float32)])
+    second_track = "seed/tracks/src-0002.wav"
+    write_track(root.path / second_track, longer)
+    (first,) = read_jsonl(root.path / "seed" / "inventory.jsonl", SourceRecord)
+    second = dataclasses.replace(
+        first,
+        source_id="src-0002",
+        path="seed/raw/show/episode two.mkv",
+        track=second_track,
+        duration_s=len(longer) / RATE,
+    )
+    write_jsonl(root, "seed/inventory.jsonl", [first, second])
+    return root, episode, len(longer)
+
+
+def _result(root: root_mod.Root) -> dict[str, object]:
+    return json.loads((root.path / "seed" / "runs" / "r1" / "extract-result.json").read_text())
+
+
+def _outputs(root: root_mod.Root) -> list[str]:
+    manifest = root.path / "seed" / "runs" / "r1" / "outputs.json"
+    return [item["rel"] for item in json.loads(manifest.read_text())["files"]]
+
+
+def _job_record(root: root_mod.Root) -> dict[str, object]:
+    return json.loads(next((root.path / "runs").glob("job-*/job.json")).read_text())
+
+
+@pytest.fixture(scope="module")
+def cuda_run(tmp_path_factory: pytest.TempPathFactory) -> Ran:
+    root, episode, _ = two_source_root(tmp_path_factory.mktemp("cuda"))
+    models = models_for(episode, main_prototypes(), separators=(OomSeparator(-1),))
+    docker = CudaStageDocker(root, models)
+    code, out, err = extract(root, docker, "--device", "cuda")
+    run_dir = root.path / "seed" / "runs" / "r1"
+    report = json.loads((run_dir / "report.json").read_text()) if code == 0 else {}
+    return Ran(root, episode, code, out, err, [], report, docker)
+
+
+def test_a_cuda_run_defaults_to_the_family_budget_and_starts_before_loading(
+    cuda_run: Ran,
+) -> None:
+    assert cuda_run.code == 0, cuda_run.err
+    assert jobs.load_families()["extract"]["vram_gb"] == 8
+    (argv,) = cuda_run.docker.argvs
+    assert argv[-6:] == ["--run", "r1", "--device", "cuda", "--vram-gb", "8"]
+    assert argv[argv.index("--gpus") + 1] == "all"
+    job = _job_record(cuda_run.root)
+    assert job["gpu"] is True and job["vram_gb"] == 8
+    card = cuda_run.docker.card  # type: ignore[attr-defined]
+    assert card.calls == [("start", "cuda", 8.0), ("load_models", "cuda")]
+
+
+def test_each_source_records_its_own_peak_and_the_result_its_budget(cuda_run: Ran) -> None:
+    sources = cuda_run.report["sources"]
+    assert [s["source_id"] for s in sources] == ["src-0001", "src-0002"]
+    assert [s["vram_peak_mib"] for s in sources] == [
+        {"reserved": 4000, "allocated": 3500},
+        {"reserved": 5000, "allocated": 4500},
+    ]
+    result = _result(cuda_run.root)
+    assert result["status"] == "ok"
+    assert result["vram"] == {
+        "budget_gib": 8.0,
+        "cap_gib": 7.0,
+        "free_gib": 10.4,
+        "total_gib": 12.0,
+    }
+    assert (
+        "  vram: budget 8 GiB, allocator cap 7 GiB, largest peak reserved 5000 MiB at src-0002"
+        in cuda_run.out.splitlines()
+    )
+
+
+def test_a_cpu_run_records_no_vram(main_run: Ran) -> None:
+    assert main_run.report["sources"][0]["vram_peak_mib"] is None
+    assert _result(main_run.root)["vram"] is None
+    assert "  vram: none" in main_run.out.splitlines()
+    assert _job_record(main_run.root)["vram_gb"] is None
+
+
+def test_a_set_budget_reaches_the_job_and_its_record(tmp_path: Path) -> None:
+    root, episode, _ = two_source_root(tmp_path)
+    card = FakeVram(SHORT)
+    docker = CudaStageDocker(root, models_for(episode, main_prototypes()), card)
+    extract(root, docker, "--device", "cuda", "--vram-gb", "6.5")
+    (argv,) = docker.argvs
+    assert argv[-2:] == ["--vram-gb", "6.5"]
+    assert _job_record(root)["vram_gb"] == 6.5
+    assert card.calls[0] == ("start", "cuda", 6.5)
+
+
+@pytest.mark.parametrize("value", ["0", "-2", "nan"])
+def test_a_budget_that_is_not_positive_exits_2_before_any_job(tmp_path: Path, value: str) -> None:
+    root, docker = _small_root(tmp_path, clips={"solo.wav": take("target", 6.0, 1)})
+    code, _, err = extract(root, docker, "--device", "cuda", f"--vram-gb={value}")
+    assert code == 2 and "--vram-gb" in err
+    assert docker.argvs == []
+
+
+def test_a_cpu_job_takes_no_budget(tmp_path: Path) -> None:
+    root, docker = _small_root(tmp_path, clips={"solo.wav": take("target", 6.0, 1)})
+    code, _, err = extract(root, docker, "--vram-gb", "6")
+    assert code == 0, err
+    (argv,) = docker.argvs
+    assert "--vram-gb" not in argv and argv[-4:] == ["--run", "r1", "--device", "cpu"]
+    assert _job_record(root)["vram_gb"] is None
+
+
+def test_the_stage_needs_a_budget_on_cuda(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as info:
+        extract_stage.main(["--data", str(tmp_path), "--run", "r1", "--device", "cuda"])
+    assert info.value.code == 2
+
+
+def test_out_of_memory_in_a_separator_is_a_named_result(tmp_path: Path) -> None:
+    root, episode, length = two_source_root(tmp_path)
+    models = models_for(episode, main_prototypes(), separators=(OomSeparator(length),))
+    code, _, err = extract(root, CudaStageDocker(root, models), "--device", "cuda")
+    assert code == 4
+    assert _result(root) == {
+        "schema": 1,
+        "status": "out-of-memory",
+        "source": "src-0002",
+        "channel": "FC",
+        "step": "separator-dme",
+        "clip_s": None,
+        "budget_gib": 8.0,
+        "cap_gib": 7.0,
+        "peak_reserved_mib": 5000,
+    }
+    assert _outputs(root) == ["seed/runs/r1/extract-result.json"]
+    assert err == (
+        "error: run r1: out of GPU memory at src-0002 FC separator-dme: budget 8 GiB, "
+        "allocator cap 7 GiB, peak reserved 5000 MiB\n"
+    )
+
+
+def test_out_of_memory_in_the_diarizer_is_a_named_result(tmp_path: Path) -> None:
+    episode = small_episode()
+    root = make_root(tmp_path, episode, clips={"solo.wav": take("target", 6.0, 1)})
+    models = dataclasses.replace(
+        models_for(episode, main_prototypes()), diarizer=OomDiarizer(episode.turns)
+    )
+    code, _, err = extract(root, CudaStageDocker(root, models), "--device", "cuda")
+    assert code == 4
+    result = _result(root)
+    assert result["status"] == "out-of-memory"
+    assert (result["source"], result["channel"], result["step"]) == (
+        "src-0001",
+        "downmix",
+        "diarize",
+    )
+    assert result["clip_s"] is None and result["peak_reserved_mib"] == 4000
+    assert "out of GPU memory at src-0001 downmix diarize: budget 8 GiB" in err
+
+
+def test_out_of_memory_before_the_first_source_names_no_source(tmp_path: Path) -> None:
+    episode = small_episode()
+    root = make_root(tmp_path, episode, clips={"solo.wav": take("target", 6.0, 1)})
+    models = models_for(episode, main_prototypes())
+    models = dataclasses.replace(models, embedders=(OomEmbedder(), *models.embedders[1:]))
+    code, _, err = extract(root, CudaStageDocker(root, models), "--device", "cuda")
+    assert code == 4
+    result = _result(root)
+    assert (result["source"], result["channel"], result["step"]) == (None, None, "embed")
+    assert result["clip_s"] == 6.0
+    assert "out of GPU memory at none none embed" in err
+
+
+def test_a_short_start_is_vram_short_and_loads_nothing(tmp_path: Path) -> None:
+    root, episode, _ = two_source_root(tmp_path)
+    card = FakeVram(SHORT)
+    docker = CudaStageDocker(root, models_for(episode, main_prototypes()), card)
+    code, _, err = extract(root, docker, "--device", "cuda")
+    assert code == 2
+    assert _result(root) == {
+        "schema": 1,
+        "status": "vram-short",
+        "free_gib": 6.83,
+        "needed_gib": 7.5,
+        "budget_gib": 8.0,
+    }
+    assert _outputs(root) == ["seed/runs/r1/extract-result.json"]
+    assert card.calls == [("start", "cuda", 8.0)]
+    assert err == (
+        "error: run r1: 6.83 GiB VRAM free after the job's CUDA context, 7.5 GiB needed for "
+        "budget 8 GiB\n"
+    )
+
+
+def _finish_with(tmp_path: Path, result: Mapping[str, object]) -> None:
+    root = root_mod.init_root(tmp_path / "voice-root", "private")
+    root.write_bytes("seed/runs/r1/extract-result.json", json.dumps(result).encode("utf-8"))
+    extract_cmd._finish(root, "r1", {})
+
+
+def test_finish_names_an_out_of_memory_result(tmp_path: Path) -> None:
+    result = {
+        "schema": 1, "status": "out-of-memory", "source": "src-0007", "channel": "FC",
+        "step": "separator-dme", "clip_s": None, "budget_gib": 9.5, "cap_gib": 8.5,
+        "peak_reserved_mib": 8701,
+    }  # fmt: skip
+    with pytest.raises(JobError) as info:
+        _finish_with(tmp_path, result)
+    assert str(info.value) == (
+        "run r1: out of GPU memory at src-0007 FC separator-dme: budget 9.5 GiB, allocator cap "
+        "8.5 GiB, peak reserved 8701 MiB"
+    )
+    assert cli.exit_code(info.value) == 4
+
+
+def test_finish_names_a_short_start(tmp_path: Path) -> None:
+    result = {
+        "schema": 1, "status": "vram-short", "free_gib": 7.12, "needed_gib": 7.5,
+        "budget_gib": 8.0,
+    }  # fmt: skip
+    with pytest.raises(jobs.PreflightError) as info:
+        _finish_with(tmp_path, result)
+    assert str(info.value) == (
+        "run r1: 7.12 GiB VRAM free after the job's CUDA context, 7.5 GiB needed for budget 8 GiB"
+    )
+    assert cli.exit_code(info.value) == 2
+
+
+# Progress lines (T13): the job log says where a long run is, timed on an injected clock.
+
+
+class FakeClock:
+    """A monotonic clock that moves only when a fake model moves it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class WindowedSeparator:
+    """An identity separator that reports its windows as TIGER-DnR does, 25 s on the clock each."""
+
+    name = "separator-tiger"
+    windows = 7
+    window_s = 25.0
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.progress: Callable[[int, int], None] | None = None
+
+    def dialogue(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        assert self.progress is not None, "load_models passes no progress callback"
+        for done in range(1, self.windows + 1):
+            self.clock.now += self.window_s
+            self.progress(done, self.windows)
+        return np.array(audio, dtype=np.float32)
+
+
+class ProgressStageDocker(CudaStageDocker):
+    """A `CudaStageDocker` whose stage reads the fake clock and hands its separators the callback."""
+
+    def __init__(self, root: root_mod.Root, models: extract_stage.Models, clock: FakeClock) -> None:
+        super().__init__(root, models)
+        self.clock = clock
+
+    def load(self, device: str, progress: object = None) -> extract_stage.Models:
+        for separator in self.models.separators:
+            separator.progress = progress  # type: ignore[attr-defined]
+        return super().load(device, progress)
+
+    def run_logged(self, argv: Sequence[str], log: Path) -> int:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(extract_stage, "clock", self.clock)
+            return super().run_logged(argv, log)
+
+
+@pytest.fixture(scope="module")
+def progress_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[list[str], int]:
+    """The job log's lines from a cuda run of two sources, and the second source's samples."""
+    root, episode, length = two_source_root(tmp_path_factory.mktemp("progress"))
+    clock = FakeClock()
+    models = models_for(episode, main_prototypes(), separators=(WindowedSeparator(clock),))
+    code, _, err = extract(root, ProgressStageDocker(root, models, clock), "--device", "cuda")
+    assert code == 0, err
+    log = next((root.path / "runs").glob("job-*/log.txt")).read_text(encoding="utf-8")
+    return log.splitlines(), length
+
+
+def test_the_log_says_when_the_models_load_and_each_source_starts(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, length = progress_run
+    loaded = "extract: models loaded in 0.0 s, peak reserved 3000 MiB, free 4096 MiB"
+    first = f"extract: source 1 of 2: src-0001 FC, {(length - RATE) / RATE / 60:.1f} min"
+    second = f"extract: source 2 of 2: src-0002 FC, {length / RATE / 60:.1f} min"
+    assert lines.index(loaded) < lines.index(first) < lines.index(second)
+
+
+def test_tiger_windows_are_logged_at_least_once_a_minute(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, _ = progress_run
+    prefix = "extract: src-0001 FC separator-tiger windows"
+    assert [line for line in lines if line.startswith(prefix)] == [
+        f"{prefix} 3 of 7, 25.00 s per window, free 4096 MiB",
+        f"{prefix} 6 of 7, 25.00 s per window, free 4096 MiB",
+    ]
+    done = "extract: src-0001 FC separator-tiger: 175.0 s, peak reserved 4000 MiB, free 4096 MiB"
+    assert lines.index(done) > lines.index(f"{prefix} 6 of 7, 25.00 s per window, free 4096 MiB")
+
+
+def test_each_step_on_each_channel_logs_its_time_and_the_card(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, _ = progress_run
+    card = {"src-0001": "peak reserved 4000 MiB, free 4096 MiB"}
+    card["src-0002"] = "peak reserved 5000 MiB, free 4096 MiB"
+    for sid, reading in card.items():
+        for channel in ("FC", "downmix"):
+            for step in ("vad", "quality"):
+                assert f"extract: {sid} {channel} {step}: 0.0 s, {reading}" in lines
+        assert f"extract: {sid} FC diarize: 0.0 s, {reading}" in lines
+        embeds = re.compile(rf"extract: {sid} FC embed: [1-9]\d* calls, 0\.0 s, {reading}")
+        assert any(embeds.fullmatch(line) for line in lines), sid
+
+
+def test_progress_lines_name_no_path_or_file(progress_run: tuple[list[str], int]) -> None:
+    lines, _ = progress_run
+    for line in lines:
+        assert "/" not in line and ".wav" not in line and "episode" not in line, line

@@ -1,6 +1,6 @@
 """The numbers of a target (Design 6), run as the `score` family's job.
 
-Runs as `/opt/venv-score/bin/python -I -m scripts.voice_data.stages.target_build --data /data
+Runs as `/opt/venv-score/bin/python -I -u -m scripts.voice_data.stages.target_build --data /data
 --target T --device D`, with the clean run and the identity mounted read-only and
 `targets/<T>/` writable. The host's plan (`target-plan.json`) names the confirmed segments
 (ids, sources, states, audio paths and the prosody `clean` measured), the identity's clips

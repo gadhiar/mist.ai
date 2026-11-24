@@ -1,7 +1,7 @@
 """SDH subtitle cues of the target, the spans made from them, and the recall check on them.
 
 Runs in the base image (family `score`, which holds ffmpeg) as
-`/opt/venv-score/bin/python -I -m scripts.voice_data.stages.sdh --data /data --step scan|score`.
+`/opt/venv-score/bin/python -I -u -m scripts.voice_data.stages.sdh --data /data --step scan|score`.
 
 - `scan --source S`: with `seed/raw/`, `seed/inventory.jsonl` and `config/sdh.json` mounted
   read-only, find the source's SDH stream, convert it to SRT in memory with ffmpeg, and write the

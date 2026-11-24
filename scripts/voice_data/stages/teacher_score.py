@@ -1,6 +1,6 @@
 """The take gate over a teacher run: CER, SIM, prosody and arousal, keep and select (`score` job).
 
-Runs as `/opt/venv-score/bin/python -I -m scripts.voice_data.stages.teacher_score --data /data
+Runs as `/opt/venv-score/bin/python -I -u -m scripts.voice_data.stages.teacher_score --data /data
 --run R --device D`, with the text version's `lines.jsonl`, the anchor's neutral clip and (for
 a seed floor) the target's centroid files mounted read-only and `teachers/omnivoice/<R>/`
 writable. The host's `score-plan.json` gives the floor's basis, `take.cer_max` and, from a seed

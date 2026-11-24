@@ -1,7 +1,7 @@
 """The weight cache: the `fetch` job that fills it, and the offline resolver that reads it.
 
-The job runs as `<venv>/bin/python -I -m scripts.voice_data.stages.fetch --data /data --family F
---out runs/<job_id>/fetch`, with the cache mounted read-write at the parent of `HF_HOME` and
+The job runs as `<venv>/bin/python -I -u -m scripts.voice_data.stages.fetch --data /data
+--family F --out runs/<job_id>/fetch`, with the cache mounted read-write at the parent of `HF_HOME` and
 `TORCH_HOME` and the network on. Each model of the family is fetched by its `kind`:
 
 - `hf`: `huggingface_hub.snapshot_download` at the pinned revision into `$HF_HOME/hub`, with the

@@ -208,7 +208,8 @@ class LocalDocker:
         for name in job.optional_env_names:
             if os.environ.get(name):
                 argv += ["-e", name]
-        argv += [job.image, f"{venv}/bin/python", "-I", "-m", job.module, "--data", "/data"]
+        # `-u`: the log shows each line as it is printed; `-I` ignores `PYTHONUNBUFFERED`.
+        argv += [job.image, f"{venv}/bin/python", "-I", "-u", "-m", job.module, "--data", "/data"]
         return argv + list(job.args)
 
     def preflight(self, job: JobSpec, allow: frozenset[str] = frozenset()) -> None:
