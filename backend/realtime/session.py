@@ -535,10 +535,14 @@ class RealtimeSession:
         self._closing.set()
 
     def _on_tts_release(self) -> None:
-        """A GPU release cancelled TTS: cut a spoken reply whole, as the UI's stop does.
+        """A GPU release cancelled TTS: stop a spoken reply, as the UI's stop does.
 
         The cancel already ended the synthesis; the interrupt makes the controller end the turn,
-        so it is recorded as interrupted. A typed turn streams no audio and goes on.
+        and the turn's origin decides the record (`TurnController._cut`). A voice turn is
+        recorded as interrupted with its spoken prefix. A typed turn spoken on request (protocol
+        2.1.0) is recorded with the text its client was sent, interrupted while it generates,
+        or completed with its full text once its reply has finished generating. A typed turn
+        without playback streams no audio and goes on.
         """
         if self._spoken_turn is not None and self._controller.phase in ("thinking", "speaking"):
             self._controller.post(Interrupt())
@@ -654,6 +658,9 @@ class RealtimeSession:
         The controller picks the text channel without saying why; the session knows the slot
         is off, so it queues the decision right after the turn's `stream_start`. A `tts` turn
         is noted, so a GPU release knows a spoken reply is the one to cut.
+
+        A typed turn whose message asked for playback (protocol 2.1.0) gets its
+        `tts_unavailable` from the controller, which holds the message's `playback`.
         """
         self._spoken_turn = start.turn_id if start.channel == "tts" else None
         voice = self._voice
@@ -941,7 +948,7 @@ class RealtimeSession:
             case MuteMessage():
                 self._on_mute(message.active)
             case TextMessage():
-                post(Text(message.text))
+                post(Text(message.text, playback=message.playback))
             case InterruptMessage():
                 post(Interrupt())
             case WakeMessage():

@@ -47,6 +47,7 @@ from backend.realtime.protocol import (
     StateCycleMessage,
     StreamCancelledMessage,
     StreamStartMessage,
+    TextMessage,
     TranscriptionMessage,
     TtsVoice,
     TurnMetricsMessage,
@@ -123,9 +124,9 @@ def test_protocol_error_names_the_field():
 
 
 def test_vectors_declare_the_contract():
-    assert VECTORS["contract"] == "MIST realtime protocol 2.0.0"
+    assert VECTORS["contract"] == "MIST realtime protocol 2.1.0"
     assert VECTORS["contract"] == CONTRACT
-    assert PROTOCOL_VERSION == "2.0.0"
+    assert PROTOCOL_VERSION == "2.1.0"
     assert VECTORS["protocol_version"] == PROTOCOL_VERSION
 
 
@@ -1846,9 +1847,52 @@ def test_an_unknown_type_beside_mains_control_messages_still_names_type():
     assert excinfo.value.field == "type"
 
 
-def test_module_docstring_states_what_2_0_0_carries():
+def test_module_docstring_states_what_2_0_0_and_2_1_0_carry():
+    """The module names its version; `TextMessage` says what 2.1.0 adds to 2.0.0."""
     doc = protocol.__doc__ or ""
     terms = ("2.0.0", "1.x control messages", "protocol 2's own", "server messages", "not modelled")
 
     assert [term for term in terms if term not in doc] == []
-    assert PROTOCOL_VERSION == "2.0.0"
+    assert doc.startswith("MIST realtime protocol 2.1.0:")
+    assert "2.1.0 adds `playback`" in (TextMessage.__doc__ or "")
+    assert PROTOCOL_VERSION == "2.1.0"
+
+
+# -- text.playback (2.1.0) ------------------------------------------------------------------------
+
+
+def test_a_text_message_without_playback_parses_as_not_asking_and_keeps_its_2_0_0_shape():
+    """A client that never sends `playback` (every 2.0.0 client) asks for no spoken reply."""
+    message = parse_client_message(json.dumps({"type": "text", "text": "hello"}))
+
+    assert isinstance(message, TextMessage)
+    assert message.playback is False
+    assert json.loads(encode_message(message)) == {"type": "text", "text": "hello"}
+
+
+def test_a_text_message_with_playback_true_parses_and_encodes_the_key():
+    message = parse_client_message(json.dumps({"type": "text", "text": "hi", "playback": True}))
+
+    assert isinstance(message, TextMessage)
+    assert message.playback is True
+    assert json.loads(encode_message(message)) == {"type": "text", "text": "hi", "playback": True}
+
+
+def test_a_text_message_with_playback_false_encodes_as_the_2_0_0_message():
+    message = TextMessage(text="hi", playback=False)
+
+    assert json.loads(encode_message(message)) == {"type": "text", "text": "hi"}
+
+
+def test_the_text_playback_vector_asks_for_playback():
+    message = parse_client_message(json.dumps(_vector_message(CLIENT_VECTORS, "text_playback")))
+
+    assert isinstance(message, TextMessage)
+    assert message.playback is True
+
+
+def test_a_text_playback_that_is_not_a_boolean_names_playback():
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps({"type": "text", "text": "hi", "playback": "yes"}))
+
+    assert excinfo.value.field == "playback"

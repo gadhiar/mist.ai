@@ -29,6 +29,7 @@ from backend.realtime.budget import (
     BUDGET_PRESETS,
     BargeInConfig,
     CharacterConfig,
+    PlaybackConfig,
     TurnConfig,
     WakeConfig,
 )
@@ -182,7 +183,11 @@ async def test_voice_turn_missing_one_condition_uses_text(missing):
     assert h.responder.requests[0].channel == "text"
 
 
-async def test_typed_turn_uses_text_with_everything_available():
+async def test_typed_turn_without_playback_uses_text_with_everything_available():
+    """A typed message that does not ask for playback is answered in text (protocol 2.1.0).
+
+    `voice_start`'s `playback` is the voice turns' switch: it does not make a typed reply speak.
+    """
     h = make_harness()
     h.start_voice()
     h.post(Text("hi"))
@@ -190,6 +195,7 @@ async def test_typed_turn_uses_text_with_everything_available():
 
     (start,) = h.outbound.of("stream_start")
     assert (start.channel, start.origin) == ("text", "text")
+    assert h.responder.requests[0].channel == "text"
 
 
 async def test_voice_turn_on_text_channel_behaves_and_records_as_typed():
@@ -250,7 +256,8 @@ async def test_completed_voice_turn_emits_in_order_and_commits_before_the_next_t
     assert h.outbound.violations == []
 
 
-async def test_typed_turn_sends_no_binary_frame_and_commits_at_completion():
+async def test_typed_turn_without_playback_sends_no_binary_frame_and_commits_at_completion():
+    """A typed turn speaks only when its message asked for playback (protocol 2.1.0)."""
     h = make_harness([Token("Hi."), Complete("Hi.")])
     h.post(Text("hello"))
     await h.settle()
@@ -814,6 +821,7 @@ async def test_voice_turn_scene_anchors():
 
 
 async def test_text_turn_scene_anchors_are_immediate():
+    """A typed turn without playback is on `text`, so no anchor waits on an audio tag."""
     h = make_harness([Token("Hi.")])
     h.post(Text("hello"))
     await h.settle()
@@ -1974,7 +1982,8 @@ async def test_a_cut_after_the_stream_start_was_taken_sends_record_failed_after_
     assert h.outbound.violations == []
 
 
-async def test_a_typed_turn_whose_stream_start_was_purged_still_gets_stream_cancelled():
+async def test_a_typed_turn_without_playback_whose_stream_start_was_purged_gets_stream_cancelled():
+    """Without playback the typed turn is on `text`, so its `spoken_text` is null."""
     h = make_harness([Token("Partial "), Pause()], auto_take=False)
     h.post(Text("hello"))
     await h.settle()
@@ -2075,7 +2084,8 @@ async def test_record_with_the_degraded_0x02_and_token_k_taken_holds_token_k_alo
     assert h.outbound.violations == []
 
 
-async def test_record_a_typed_turn_holds_the_tokens_the_sender_took():
+async def test_record_a_typed_turn_without_playback_holds_the_tokens_the_sender_took():
+    """A typed turn records what its client was sent; with playback it does too (below)."""
     h = make_harness([*SIX, Token("Zeta. "), Pause()], auto_take=False)
     h.post(Text("hello"))
     await h.settle()
@@ -2125,7 +2135,8 @@ async def test_record_a_disconnect_with_a_full_lane_sends_nothing_and_caps_the_s
     assert h.outbound.violations == []
 
 
-async def test_record_a_disconnect_of_a_typed_turn_holds_the_taken_tokens():
+async def test_record_a_disconnect_of_a_typed_turn_without_playback_holds_the_taken_tokens():
+    """Without playback the typed turn is on `text`; its record is the tokens the sender took."""
     h = make_harness([*SIX, Token("Zeta. "), Pause()], auto_take=False)
     h.post(Text("hello"))
     await h.settle()
@@ -2463,6 +2474,217 @@ async def test_spoken_text_is_null_for_a_voice_turn_on_the_text_channel():
 
     (cancelled,) = h.outbound.of("stream_cancelled")
     assert (cancelled.partial_text, cancelled.spoken_text) == ("Hi ", None)
+
+
+async def test_spoken_text_is_set_for_a_typed_turn_with_playback():
+    """It is on `tts`, so its `stream_cancelled` carries the spoken prefix, "" before any audio."""
+    h = make_harness([Pause(), Token("Late.")])
+    h.post(Text("hello", playback=True))
+    await h.settle()
+    h.post(Interrupt())
+    await h.settle()
+
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert (cancelled.partial_text, cancelled.spoken_text) == ("", "")
+
+
+# -- A typed turn with playback (protocol 2.1.0) ---------------------------------------------------
+#
+# The reply is spoken on the session the message came from: a `tts` turn of origin `text`. Audio
+# follows the `tts` rules; what the turn records, and its supersede rule, follow its origin.
+
+LONG_REPLY = "One two three four five six seven."
+
+
+async def test_a_typed_turn_with_playback_speaks_on_tts_with_no_voice_start():
+    h = make_harness([Token("Hi there.")])
+    h.post(Text("hello", playback=True))
+    await h.settle()
+
+    (start,) = h.outbound.of("stream_start")
+    assert (start.channel, start.origin) == ("tts", "text")
+    assert start.audio_tag is not None
+    (request,) = h.responder.requests
+    assert (request.channel, request.origin) == ("tts", "text")
+    assert tag_frames(h, start.audio_tag)[0] == "0x01"
+    assert tag_frames(h, start.audio_tag)[-1] == "0x02"
+    assert h.responder.commits == []  # it waits on the client's playback_done
+
+    await finish_voice_turn(h, start.turn_id)
+
+    (delivery,) = h.responder.commits
+    assert (delivery.outcome, delivery.delivered_text) == ("completed", "Hi there.")
+    assert delivery.tts_model is not None
+    assert "stream_cancelled" not in h.outbound.names()
+    assert h.outbound.violations == []
+
+
+async def test_a_typed_turn_with_playback_and_no_synthesizer_is_degraded_then_answers_in_text():
+    h = make_harness([Token("Hi.")], synthesizer=False)
+    h.post(Text("hello", playback=True))
+    await h.settle()
+
+    (start,) = h.outbound.of("stream_start")
+    assert (start.channel, start.origin, start.audio_tag) == ("text", "text", None)
+    (degraded,) = h.outbound.of("voice_decision:degraded")
+    assert (degraded.turn_id, degraded.reason) == (start.turn_id, "tts_unavailable")
+    assert subsequence(
+        h.outbound.names(), ["stream_start", "voice_decision:degraded", "stream_token"]
+    )
+    assert [i for i in h.outbound.client if isinstance(i, Frame)] == []
+    (delivery,) = h.responder.commits
+    assert (delivery.outcome, delivery.delivered_text) == ("completed", "Hi.")
+
+
+async def test_a_typed_turn_with_playback_while_tts_is_off_answers_in_text_and_is_not_degraded():
+    h = make_harness([Token("Hi.")], tts_enabled=False)
+    h.post(Text("hello", playback=True))
+    await h.settle()
+
+    (start,) = h.outbound.of("stream_start")
+    assert start.channel == "text"
+    assert "voice_decision:degraded" not in h.outbound.names()
+
+
+async def test_a_typed_turn_without_playback_and_no_synthesizer_is_not_degraded():
+    h = make_harness([Token("Hi.")], synthesizer=False)
+    h.post(Text("hello"))
+    await h.settle()
+
+    assert "voice_decision:degraded" not in h.outbound.names()
+
+
+async def open_speaking(h: Harness, origin: str) -> str:
+    if origin == "text":
+        h.post(Text("hello", playback=True))
+        await h.settle()
+    else:
+        h.start_voice()
+        await h.speak("hello")
+    assert h.controller.phase == "speaking"
+    return h.last_turn()
+
+
+@pytest.mark.parametrize("cut", ["interrupt", "text"])
+@pytest.mark.parametrize("origin", ["text", "voice"])
+async def test_a_cut_while_generating_records_the_text_for_a_typed_turn_and_speech_for_voice(
+    origin, cut
+):
+    """A typed turn's client shows its text: that is what it records; a voice turn, the speech."""
+    h = make_harness([Token(LONG_REPLY + " "), Pause()], [Token("Ok.")])
+    turn_id = await open_speaking(h, origin)
+
+    h.post(Interrupt() if cut == "interrupt" else Text("again"))
+    await h.settle()
+
+    (cancelled,) = h.outbound.of("stream_cancelled")
+    assert cancelled.turn_id == turn_id
+    assert cancelled.partial_text == LONG_REPLY + " "
+    spoken = cancelled.spoken_text
+    assert spoken is not None and len(spoken) < len(cancelled.partial_text)
+    assert cancelled.partial_text.startswith(spoken)
+    delivery = h.responder.commits[0]
+    assert delivery.outcome == "interrupted"
+    expected = cancelled.partial_text if origin == "text" else spoken
+    assert delivery.delivered_text == expected
+    assert h.outbound.violations == []
+
+
+@pytest.mark.parametrize("cut", ["interrupt", "text"])
+async def test_a_cut_after_a_typed_turns_stream_ended_fades_and_completes_it(cut):
+    """Its client has the whole text, so the cut stops the audio and the turn is completed."""
+    h = make_harness([Token(LONG_REPLY)], [Token("Ok.")], playback=PlaybackConfig())
+    turn_id = await open_speaking(h, "text")
+    (start,) = h.outbound.of("stream_start")
+    assert "stream_complete" in h.outbound.names()
+    assert "0x02" not in tag_frames(h, start.audio_tag)  # the pacer still holds frames back
+
+    h.post(Interrupt() if cut == "interrupt" else Text("again"))
+    await h.settle()
+
+    assert h.outbound.purges == []
+    assert "stream_cancelled" not in h.outbound.names()
+    assert_one_terminal(h, start.audio_tag)
+    assert tag_frames(h, start.audio_tag)[-1] == "0x03"
+    assert subsequence(h.outbound.names(), ["0x03", "playback_stop"])
+    delivery = h.responder.commits[0]
+    assert (delivery.outcome, delivery.delivered_text) == ("completed", LONG_REPLY)
+    (first_metrics, *_) = metrics(h)
+    assert (first_metrics.turn_id, first_metrics.outcome) == (turn_id, "completed")
+    assert h.outbound.violations == []
+
+
+async def test_an_interrupt_after_a_typed_turns_stream_ended_in_thinking_completes_it():
+    h = make_harness([Token("Hi there.")])
+    h.lane.hold()
+    h.post(Text("hello", playback=True))
+    await h.settle()
+    assert h.controller.phase == "thinking"
+    assert "stream_complete" in h.outbound.names()
+
+    h.post(Interrupt())
+    await h.settle()
+
+    (start,) = h.outbound.of("stream_start")
+    assert tag_frames(h, start.audio_tag) == ["0x03"]
+    assert "stream_cancelled" not in h.outbound.names()
+    (delivery,) = h.responder.commits
+    assert (delivery.outcome, delivery.delivered_text) == ("completed", "Hi there.")
+    assert h.controller.phase == "idle"
+
+
+async def test_a_typed_turn_with_playback_whose_synthesis_failed_records_every_token():
+    """Its client was sent every token as text, so the voiced text and tail are not the record.
+
+    The voice turn of `test_completion_a_drain_first_moves_to_text_and_commits_at_the_completion`
+    records "One two three.Six." for the same script.
+    """
+    pause = Pause()
+    h = speaking_failure(pause, Token("Six."))
+    h.post(Text("hello", playback=True))
+    await h.settle()
+    turn_id = queued_start(h).turn_id
+    assert h.controller.phase == "speaking"
+    h.post(PlaybackDone(turn_id=turn_id, played_ms=10_000))
+    await h.settle()
+
+    pause.release()
+    await h.settle()
+
+    (delivery,) = h.responder.commits
+    assert (delivery.outcome, delivery.delivered_text) == (
+        "completed",
+        "One two three. Four five. Six.",
+    )
+
+
+async def test_a_voice_turn_cut_after_its_stream_ended_is_still_interrupted():
+    h = make_harness([Token(LONG_REPLY)], playback=PlaybackConfig())
+    await open_speaking(h, "voice")
+
+    h.post(Interrupt())
+    await h.settle()
+
+    assert len(h.outbound.of("stream_cancelled")) == 1
+    assert h.responder.commits[0].outcome == "interrupted"
+
+
+async def test_a_typed_turn_with_playback_carries_its_timings_and_is_judged_against_no_budget():
+    """Typed turns are outside the voice budget: its metrics show timings, `over_budget` none."""
+    h = make_harness()
+    pause = Pause()
+    h.responder.add(Token("Hi there."), pause)
+    slow_first_chunk(h, 800)
+    h.post(Text("hello", playback=True))
+    await h.settle()
+    pause.release()
+    await h.settle()
+    await finish_voice_turn(h, h.last_turn())
+
+    (m,) = metrics(h)
+    assert (m.origin, m.channel, m.outcome) == ("text", "tts", "completed")
+    assert m.timings["first_tts_chunk"] - m.timings["first_segment"] == 800
+    assert m.over_budget == []
 
 
 # -- Tool grace (v1 :2723-2726) -----------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
-  "contract": "MIST realtime protocol 2.0.0",
-  "protocol_version": "2.0.0",
+  "contract": "MIST realtime protocol 2.1.0",
+  "protocol_version": "2.1.0",
   "binary": [
     {
       "name": "audio_chunk",
@@ -244,6 +244,10 @@
       {
         "name": "text",
         "message": {"type": "text", "text": "What is on my calendar today?"}
+      },
+      {
+        "name": "text_playback",
+        "message": {"type": "text", "text": "What is on my calendar today?", "playback": true}
       },
       {
         "name": "interrupt",
@@ -971,6 +975,16 @@
         "message": {"type": "stream_start", "turn_id": "turn-3", "channel": "text", "origin": "text"}
       },
       {
+        "name": "stream_start_typed_spoken",
+        "message": {
+          "type": "stream_start",
+          "turn_id": "turn-4",
+          "channel": "tts",
+          "origin": "text",
+          "audio_tag": 8
+        }
+      },
+      {
         "name": "stream_cancelled",
         "message": {
           "type": "stream_cancelled",
@@ -1007,7 +1021,7 @@
         "message": {
           "type": "session_started",
           "session_id": "00000000-0000-4000-8000-000000000001",
-          "protocol_version": "2.0.0",
+          "protocol_version": "2.1.0",
           "mist_state": "idle",
           "capabilities": {
             "tts_enabled": true,
@@ -1036,6 +1050,13 @@
       "json": {"type": "ptt", "pressed": true},
       "rule": "protocol 2 has no push-to-talk; MIST wakes by name on every endpoint",
       "field": "type"
+    },
+    {
+      "name": "text: playback is a JSON boolean, not a string",
+      "direction": "client_to_server",
+      "json": {"type": "text", "text": "What is on my calendar today?", "playback": "yes"},
+      "rule": "control messages validate in strict mode, so no value is coerced to a boolean",
+      "field": "playback"
     },
     {
       "name": "voice_start: mode open is removed",

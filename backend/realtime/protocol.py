@@ -1,4 +1,4 @@
-"""MIST realtime protocol 2.0.0: the binary frame codec and the control message schemas.
+"""MIST realtime protocol 2.1.0: the binary frame codec and the control message schemas.
 
 This module is the backend half of the contract with the mist-frontend client. The contract is
 recorded in `tests/fixtures/realtime_protocol_v2/vectors.json`: `test_protocol.py` compares
@@ -51,7 +51,7 @@ from pydantic_core import PydanticCustomError
 
 from .errors import ProtocolError
 
-PROTOCOL_VERSION = "2.0.0"
+PROTOCOL_VERSION = "2.1.0"
 CONTRACT = f"MIST realtime protocol {PROTOCOL_VERSION}"
 
 # -- Binary frames -------------------------------------------------------------
@@ -396,10 +396,25 @@ class MuteMessage(_WireModel):
 
 
 class TextMessage(_WireModel):
-    """Typed user input (unchanged from protocol 1)."""
+    """Typed user input; protocol 2.1.0 adds `playback`.
+
+    `playback` true asks for the reply spoken on this session as well as shown: a client sets
+    it while its player is open, and must then send `playback_done` for the turn's audio tag,
+    since a spoken turn commits only after it. A 2.0.0 client never sends the key, so its typed
+    turns stay text replies. False is left out of the serialized message, so such a message
+    encodes as it did in protocol 1.
+    """
 
     type: Literal["text"] = "text"
     text: str
+    playback: bool = False
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if not data.get("playback"):
+            data.pop("playback", None)
+        return data
 
 
 class InterruptMessage(_WireModel):

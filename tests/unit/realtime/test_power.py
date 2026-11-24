@@ -671,7 +671,51 @@ class TestSessionCut:
         assert rig.posted(Interrupt)
         assert [c.outcome for c in rig.responder.commits] == ["interrupted"]
 
-    async def test_a_typed_turn_streaming_at_the_drop_is_not_cut(self):
+    async def test_a_spoken_typed_turn_in_synthesis_is_cut_and_records_the_text_it_sent(self):
+        """A typed reply with playback is cut as a voice turn is; its origin decides the record."""
+        pause = Pause()
+        rig = Rig([Token("Hello there. "), pause])
+        slot = SynthesizerSlot(rig.engines.synthesizer)
+        rig.engines.tts_slot = slot
+        await rig.start()
+        await rig.send({"type": "text", "text": "hi", "playback": True})
+        await settle()
+
+        slot.cancel_jobs(rig.engines.synthesizer)
+        await settle()
+
+        assert rig.posted(Interrupt)
+        assert [(c.outcome, c.delivered_text) for c in rig.responder.commits] == [
+            ("interrupted", "Hello there. ")
+        ]
+
+    async def test_a_spoken_typed_turn_whose_stream_ended_completes_at_the_drop(self):
+        """Its client has the whole text: the release stops the audio and the turn completes."""
+        rig = Rig([Token("Hello there.")])
+        slot = SynthesizerSlot(rig.engines.synthesizer)
+        rig.engines.tts_slot = slot
+        await rig.start()
+        await rig.send({"type": "text", "text": "hi", "playback": True})
+        await settle()
+        assert rig.responder.commits == []  # it waits on the client's playback_done
+
+        slot.cancel_jobs(rig.engines.synthesizer)
+        await settle()
+
+        assert rig.posted(Interrupt)
+        assert [(c.outcome, c.delivered_text) for c in rig.responder.commits] == [
+            ("completed", "Hello there.")
+        ]
+        names = rig.names()
+        assert "stream_cancelled" not in names
+        # The audio stops: `0x03` unless the sender already took the tag's `0x02`, then
+        # `playback_stop` with its fade. Either way the tag ends once.
+        terminals = [n for n in names if n in ("0x02", "0x03")]
+        assert len(terminals) == 1
+        assert names.index(terminals[0]) < names.index("playback_stop")
+
+    async def test_a_typed_turn_without_playback_streaming_at_the_drop_is_not_cut(self):
+        """It streams no audio, so a GPU release leaves it going."""
         pause = Pause()
         rig = Rig([Token("Hello there. "), pause])
         slot = SynthesizerSlot(rig.engines.synthesizer)
