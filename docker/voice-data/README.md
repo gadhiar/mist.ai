@@ -42,6 +42,43 @@ rebuilds only the record, the code layer and the import check.
 - Default command `remote-entry.sh`: on a pod with `PUBLIC_KEY` set, sshd with key-only login,
   then wait. Local jobs name their own command.
 
+## GPU preflight and peers
+
+Before a GPU job starts, the local executor lists the running containers and refuses the job when
+one of them holds a GPU (exit 2), then runs `nvidia-smi` in the job's image and refuses the job
+when the largest free VRAM is below the family's `vram_gb`.
+
+`MIST_VOICE_GPU_PEERS` names containers that may keep their GPU while a job runs, as a
+comma-separated list of container names (blanks are ignored):
+
+```bash
+MIST_VOICE_GPU_PEERS=<daily backend container> python -m scripts.voice_data <command> ...
+```
+
+It is for a gaming-mode window, when the daily backend has moved its speech engines to CPU but
+keeps its CUDA context. A peer still uses VRAM, so the free-VRAM check runs as before. Any
+container holding a GPU that is not a peer is still refused. There is no command-line flag; the
+variable is the interface, and it applies to every local job of the command.
+
+A job may state its own VRAM need (`JobSpec.vram_gb`, recorded as `vram_gb` in
+`runs/<job_id>/job.json`). When it is set, the preflight checks free VRAM against it instead of the
+family's `vram_gb`; when it is `null`, the family's value applies.
+
+## Resource caps
+
+A family may cap the host resources its jobs take, so a job fits beside the daily stack. Each key
+is optional and, when present, must be a positive number; the local executor adds its flag to
+every `docker run` of the family:
+
+| `families.json` key | `docker run` flag | train-pocket | teacher-omnivoice |
+|---------------------|-------------------|--------------|-------------------|
+| `shm_gb`            | `--shm-size <n>g` | 2            | 1                 |
+| `memory_gb`         | `--memory <n>g`   | 9            | 8                 |
+| `cpus`              | `--cpus <n>`      | 8            | 8                 |
+
+The values are estimates, not measurements; replace each with a measured peak once the family has
+run. A family without a key runs without that cap.
+
 ## Devices and VRAM (estimates)
 
 `devices` and `vram_gb` in `families.json` are estimates from model sizes, not measurements:

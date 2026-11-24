@@ -201,7 +201,8 @@ class JobInput(_Record):
 class JobRecord(_Record):
     """`runs/<job_id>/job.json`: what a container job runs, on which inputs, with which env names.
 
-    Env vars appear by name only; a value is read from the environment at run time.
+    Env vars appear by name only; a value is read from the environment at run time. `vram_gb` is
+    the job's own VRAM need, or `None` when the preflight used the family's.
     """
 
     schema: int
@@ -217,6 +218,7 @@ class JobRecord(_Record):
     env_names: tuple[str, ...]
     optional_env_names: tuple[str, ...]
     est_hours: float
+    vram_gb: float | None
 
     _nested = (("inputs", JobInput),)
 
