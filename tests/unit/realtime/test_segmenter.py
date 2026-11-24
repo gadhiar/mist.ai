@@ -325,6 +325,67 @@ class TestCodeBlocks:
         assert _texts(segments) == ["Run this command now:", "That builds it."]
 
     @pytest.mark.parametrize(
+        "tokens",
+        [
+            pytest.param(
+                ["Okay then.", "\n```x``` is inline code here.", "\nAnd more prose."], id="whole"
+            ),
+            pytest.param(
+                ["Okay then.", "\n``", "`x", "``` is inline", " code here.", "\nAnd more prose."],
+                id="split",
+            ),
+        ],
+    )
+    def test_a_backtick_run_with_a_backtick_after_it_on_its_line_is_prose(self, tokens):
+        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10))
+
+        segments = _feed_all(segmenter, tokens)
+
+        assert _texts(segments) == [
+            "Okay then.",
+            "```x``` is inline code here.",
+            "And more prose.",
+        ]
+        _assert_spans_locate(segmenter, segments)
+
+    def test_a_backtick_after_the_run_shows_the_line_is_prose_before_the_line_ends(self):
+        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10))
+        tokens = ["Okay then.", "\n```x", "``` is inline code here.", "\nMore."]
+
+        per_token = [segmenter.feed(token, False) for token in tokens]
+
+        assert [_texts(segments) for segments in per_token] == [
+            ["Okay then."],
+            [],
+            ["```x``` is inline code here."],
+            ["More."],
+        ]
+        assert segmenter.flush() == []
+
+    def test_a_backtick_run_with_an_info_string_still_opens_a_fence(self):
+        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10))
+        tokens = ["Here it is.", "\n```py", "thon", "\nprint(1).\n```", "\nDone."]
+
+        per_token = [segmenter.feed(token, False) for token in tokens]
+
+        assert [_texts(segments) for segments in per_token] == [
+            ["Here it is."],
+            [],
+            [],
+            [],
+            ["Done."],
+        ]
+        assert segmenter.flush() == []
+
+    def test_a_tilde_fence_with_a_backtick_in_its_info_string_still_opens_a_fence(self):
+        segmenter = SpeechSegmenter(SegmenterConfig(first_segment_min_chars=10))
+        tokens = ["Here it is.", "\n~~~ `odd` info\nprint(1).\n~~~", "\nDone."]
+
+        segments = _feed_all(segmenter, tokens)
+
+        assert _texts(segments) == ["Here it is.", "Done."]
+
+    @pytest.mark.parametrize(
         "block",
         [
             pytest.param("````\n```\nstill code.\n````", id="shorter-run-does-not-close"),

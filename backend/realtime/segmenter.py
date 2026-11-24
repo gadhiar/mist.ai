@@ -22,18 +22,27 @@ around them. Unspoken text is counted in the spans and never segmented, and pros
 it starts is cut at once, so no segment spans it. The segmenter reads the text a line at a time:
 
 - A fence opens on a line whose first character after any indentation (spaces or tabs) starts
-  a run of three or more backticks or tildes; what follows the run on that line is not checked.
-  It closes on a later line holding, after any indentation, only a run of the same character at
-  least as long as the opening run, then whitespace. An unclosed fence runs to the end of the
-  stream. Every line from the opening to the closing fence is unspoken.
+  a run of three or more backticks or tildes. After a backtick run, the rest of the line (the
+  info string) may not hold a backtick, or the line is prose: CommonMark's rule, so a line
+  such as "```x``` is inline code" is spoken rather than silencing the rest of the reply. After
+  a tilde run the rest of the line may hold anything.
+- A fence closes on a later line holding, after any indentation, only a run of the same
+  character at least as long as the opening run, then whitespace. An unclosed fence runs to
+  the end of the stream. Every line from the opening to the closing fence is unspoken.
 - A table row is a line, outside a fence, whose first character after any indentation is `|`.
   A pipe later in a line is prose, and so is a table written without leading pipes.
 
 A line is classified from its first characters, which may arrive in different Tokens. Until
-they show whether the line opens a fence, the line's characters are held back: a line holding
-only indentation and one or two backticks or tildes waits for its next character, or for its
-end, before it is spoken or skipped. Error text ends a line, so the text after it is classified
-as a new line; a fence open before it stays open.
+they show what the line is, its characters are held back, and prose before it is not cut:
+
+- a line holding only indentation and one or two backticks or tildes waits for its next
+  character, or for its end;
+- a line starting with a run of three or more backticks waits for a backtick after the run,
+  which makes it prose, or for its end, or for the end of the stream, because the rest of the
+  line decides whether it opens a fence.
+
+Error text ends a line, so the text after it is classified as a new line; a fence open before
+it stays open.
 """
 
 import re
@@ -171,8 +180,8 @@ class SpeechSegmenter:
                 self._line = kind
             if kind is None:
                 # A line holding only indentation so far is whitespace, never spoken, so the
-                # prose may run on over it. Backticks or tildes wait until the line shows what
-                # it is.
+                # prose may run on over it. A line starting with backticks or tildes waits, with
+                # the prose before it, until the line shows what it is.
                 if line.strip():
                     self._spoken_end = max(self._spoken_end, self._line_start)
                 else:
@@ -196,14 +205,23 @@ class SpeechSegmenter:
             self._line = None
 
     def _kind_of(self, line: str, complete: bool) -> _Line | None:
-        """What a line is, from its first characters, or None while they cannot tell yet."""
+        """What a line is, or None while the part of it fed so far cannot tell yet.
+
+        Most lines are told by their first characters. A line starting with three backticks is
+        prose as soon as a backtick follows the run, and a fence's opening line only once it is
+        `complete` without one.
+        """
         if self._fence is not None:
             return _Line.CODE
         body = line.lstrip(_INDENT)
         if body.startswith("|"):
             return _Line.TABLE_ROW
-        if any(body.startswith(char * 3) for char in _FENCE_CHARS):
+        if body.startswith("~~~"):
             return _Line.FENCE_OPEN
+        if body.startswith("```"):
+            if "`" in body.lstrip("`"):
+                return _Line.PROSE
+            return _Line.FENCE_OPEN if complete else None
         if not complete and (not body or any(body == char * len(body) for char in _FENCE_CHARS)):
             return None
         return _Line.PROSE
