@@ -70,6 +70,11 @@ AUDIO_DIR = "audio"
 # start with less free VRAM than the budget needs.
 OUT_OF_MEMORY = "out-of-memory"
 VRAM_SHORT = "vram-short"
+# The job caps its allocator this far under the VRAM budget (`stages/vram.py`), so a budget of
+# this or less leaves the allocator no room: this command and the stage both refuse it by this
+# value. It lives here, under the host-side purity scan, because the stage already imports this
+# module and the host imports no stage module.
+VRAM_FLOOR_GIB = 1.0
 # A SIM equal to a gate value up to rounding meets it, as in `stages/retrieve.py`.
 EPS = 1e-9
 # A run id names a folder under `seed/runs/`, so it is one plain path segment.
@@ -250,13 +255,13 @@ def vram_budget(value: float | None) -> float:
     """Return the job's VRAM budget in GiB: `value`, or the extract family's `vram_gb`.
 
     Raises:
-        InputError: The budget is not a positive number.
+        InputError: The budget is not above `VRAM_FLOOR_GIB`.
     """
     if value is None:
         value = float(jobs.load_families()[FAMILY]["vram_gb"])  # type: ignore[arg-type]
     budget = value
-    if not budget > 0:
-        raise InputError("refused: --vram-gb must be a positive number of GiB")
+    if not budget > VRAM_FLOOR_GIB:
+        raise InputError(f"refused: --vram-gb must be above {VRAM_FLOOR_GIB:g} GiB")
     return budget
 
 

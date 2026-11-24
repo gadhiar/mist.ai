@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from scripts.voice_data.commands import extract as extract_cmd
 from scripts.voice_data.errors import JobError
 from scripts.voice_data.stages import vram
 from scripts.voice_data.stages.fetch import library_errors
@@ -81,6 +82,14 @@ def test_start_at_exactly_the_budget_less_half_a_gib_is_not_short(cuda: FakeCuda
     started = vram.start("cuda", 8.0)
     assert started is not None and not started.short
     assert len(cuda.fractions) == 1
+
+
+@pytest.mark.parametrize("budget", [0.5, 1.0])
+def test_start_refuses_a_budget_at_or_under_the_host_floor(cuda: FakeCuda, budget: float) -> None:
+    assert vram.CAP_MARGIN_GIB == extract_cmd.VRAM_FLOOR_GIB
+    with pytest.raises(ValueError, match="must be above 1 GiB"):
+        vram.start("cuda", budget)
+    assert cuda.fractions == []
 
 
 def test_peaks_and_free_memory_in_mib(cuda: FakeCuda) -> None:

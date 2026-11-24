@@ -5,9 +5,10 @@ Runs as `/opt/venv-extract/bin/python -I -u -m scripts.voice_data.stages.extract
 mounted read-only and `seed/runs/<run>/` writable. On cuda, `--vram-gb` is required: the
 allocator is capped under it before any model loads, and an out-of-memory error ends the run
 with a result naming where it happened (`_job`). The host's plan names sources by id and gives
-the timestamp anchors as source ids and times, so no file name reaches this job. The job log
-carries a progress line per source, per step and channel, and per minute of TIGER-DnR windows
-(`Tracker`), with ids, counts, durations and MiB only.
+the timestamp anchors as source ids and times, so no file name reaches this job. On cuda the job
+log opens with the card's free and total VRAM, the budget and the allocator's cap, then carries a
+progress line per source, per step and channel, and per minute of TIGER-DnR windows (`Tracker`),
+with ids, counts, durations and sizes only.
 
 The order is Design 4's:
 
@@ -84,7 +85,7 @@ from . import propose_states, retrieve, segments, vram
 from . import sdh as sdh_stage
 from .ingest import decode_argv
 from .prosody import prosody as measure_prosody
-from .vram import CAP_MARGIN_GIB, CUDA
+from .vram import CUDA
 
 SCHEMA = 1
 NONE = "none"
@@ -188,7 +189,7 @@ class Tracker:
     an out-of-memory error reads the place it happened. `vram_module` is `stages.vram`, or a fake
     of it in tests; on the CPU its readings are `None` and the lines leave the card out.
 
-    The progress lines carry ids, counts, durations and MiB only. A whole-channel step (a
+    The progress lines carry ids, counts, durations and sizes only. A whole-channel step (a
     separator, the diarizer, VAD, quality) logs a line when it returns; embeddings are many short
     calls, so their count and time are summed per source and channel and logged when the source
     changes, before the next step's line, or at `flush`.
@@ -260,6 +261,17 @@ class Tracker:
         print(
             f"extract: {self._place()} {self.where.step} windows {done} of {total}, "
             f"{rate:.2f} s per window{card}"
+        )
+
+    def card_at_start(self, started: vram.VramStart) -> None:
+        """Log the card at the job's start: free and total VRAM, the budget and the cap.
+
+        A short start has no cap, so its line says `none` and the `vram-short` line follows.
+        """
+        cap = "none" if started.cap_gib is None else f"{started.cap_gib:g} GiB"
+        print(
+            f"extract: card free {started.free_gib:g} GiB of {started.total_gib:g} GiB, "
+            f"budget {started.budget_gib:g} GiB, allocator cap {cap}"
         )
 
     def loaded(self, begun: float) -> None:
@@ -1690,8 +1702,8 @@ def run(
 
 def _budget(text: str) -> float:
     value = float(text)
-    if not value > CAP_MARGIN_GIB:
-        raise argparse.ArgumentTypeError(f"must be above {CAP_MARGIN_GIB:g} GiB")
+    if not value > contract.VRAM_FLOOR_GIB:
+        raise argparse.ArgumentTypeError(f"must be above {contract.VRAM_FLOOR_GIB:g} GiB")
     return value
 
 
@@ -1700,13 +1712,16 @@ def _job(
 ) -> list[str]:
     """Start the card, load the models and run; stop on the card's memory with a named result.
 
-    `vram.start` runs before `load_models`, so the weights count against the allocator's cap.
+    `vram.start` runs before `load_models`, so the weights count against the allocator's cap,
+    and on cuda the log opens with the card it read (`Tracker.card_at_start`), short or not.
     A CUDA out-of-memory error, however a binding wrapped it, ends the run with an
     `out-of-memory` result naming where it happened (`track.where`), and a start with too little
     free VRAM with a `vram-short` result before any model loads. Both exit 0 so the executor
     verifies the result and the host reports it.
     """
     started = vram.start(device, budget_gib) if budget_gib is not None else None
+    if started is not None:
+        track.card_at_start(started)
     if started is not None and started.short:
         detail = {
             "free_gib": started.free_gib,

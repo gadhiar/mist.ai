@@ -19,6 +19,7 @@ Two fakes live here rather than in `fakes.py`:
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import dataclasses
 import functools
@@ -41,7 +42,7 @@ from scripts.voice_data import gates as gates_mod
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.bindings.protocols import QualityTrack, Span, Turn
 from scripts.voice_data.commands import extract as extract_cmd
-from scripts.voice_data.errors import JobError, RootError
+from scripts.voice_data.errors import InputError, JobError, RootError
 from scripts.voice_data.records import Prosody, SegmentRecord, SourceRecord, read_jsonl, write_jsonl
 from scripts.voice_data.stages import extract as extract_stage
 from scripts.voice_data.stages import prosody as prosody_mod
@@ -1869,6 +1870,59 @@ def test_a_budget_that_is_not_positive_exits_2_before_any_job(tmp_path: Path, va
     assert docker.argvs == []
 
 
+FLOOR_REFUSAL = "refused: --vram-gb must be above 1 GiB"
+
+
+@pytest.mark.parametrize("value", ["1", "0.5", "0", "-2"])
+def test_a_budget_of_1_gib_or_less_exits_2_before_any_job(tmp_path: Path, value: str) -> None:
+    root, docker = _small_root(tmp_path, clips={"solo.wav": take("target", 6.0, 1)})
+    code, _, err = extract(root, docker, "--device", "cuda", f"--vram-gb={value}")
+    assert code == 2 and FLOOR_REFUSAL in err
+    assert docker.argvs == []
+
+
+def test_a_budget_just_above_the_floor_reaches_the_job(tmp_path: Path) -> None:
+    root, episode, _ = two_source_root(tmp_path)
+    card = FakeVram(SHORT)
+    docker = CudaStageDocker(root, models_for(episode, main_prototypes()), card)
+    _, _, err = extract(root, docker, "--device", "cuda", "--vram-gb", "1.5")
+    assert "refused" not in err
+    (argv,) = docker.argvs
+    assert argv[-2:] == ["--vram-gb", "1.5"]
+    assert card.calls[0] == ("start", "cuda", 1.5)
+
+
+def _host_refusal(value: float) -> str | None:
+    try:
+        extract_cmd.vram_budget(value)
+    except InputError as exc:
+        return str(exc)
+    return None
+
+
+def _stage_refusal(value: float) -> str | None:
+    try:
+        extract_stage._budget(repr(value))
+    except argparse.ArgumentTypeError as exc:
+        return f"refused: --vram-gb {exc}"
+    return None
+
+
+@pytest.mark.parametrize("value", [-1.0, 0.0, 0.5, 1.0, 1.001, 1.5, 8.0])
+def test_host_and_stage_refuse_the_same_budgets(value: float) -> None:
+    host = _host_refusal(value)
+    assert host == _stage_refusal(value)
+    assert host == (FLOOR_REFUSAL if value <= 1.0 else None)
+    assert vram.CAP_MARGIN_GIB == extract_cmd.VRAM_FLOOR_GIB == 1.0
+
+
+def test_host_and_stage_read_one_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(extract_cmd, "VRAM_FLOOR_GIB", 2.0)
+    refusal = "refused: --vram-gb must be above 2 GiB"
+    assert _host_refusal(1.5) == _stage_refusal(1.5) == refusal
+    assert _host_refusal(2.5) is _stage_refusal(2.5) is None
+
+
 def test_a_cpu_job_takes_no_budget(tmp_path: Path) -> None:
     root, docker = _small_root(tmp_path, clips={"solo.wav": take("target", 6.0, 1)})
     code, _, err = extract(root, docker, "--vram-gb", "6")
@@ -2064,6 +2118,34 @@ def test_the_log_says_when_the_models_load_and_each_source_starts(
     first = f"extract: source 1 of 2: src-0001 FC, {(length - RATE) / RATE / 60:.1f} min"
     second = f"extract: source 2 of 2: src-0002 FC, {length / RATE / 60:.1f} min"
     assert lines.index(loaded) < lines.index(first) < lines.index(second)
+
+
+def test_a_cuda_log_opens_with_the_card_before_the_models_load(
+    progress_run: tuple[list[str], int],
+) -> None:
+    lines, _ = progress_run
+    card = "extract: card free 10.4 GiB of 12 GiB, budget 8 GiB, allocator cap 7 GiB"
+    loaded = "extract: models loaded in 0.0 s, peak reserved 3000 MiB, free 4096 MiB"
+    assert [line for line in lines if line.startswith("extract: ")][0] == card
+    assert lines.index(card) < lines.index(loaded)
+
+
+def test_a_cpu_log_has_no_card_line(main_run: Ran) -> None:
+    log = next((main_run.root.path / "runs").glob("job-*/log.txt")).read_text(encoding="utf-8")
+    lines = log.splitlines()
+    assert "extract: models loaded in" in log
+    assert not [line for line in lines if line.startswith("extract: card")]
+
+
+def test_a_short_start_logs_the_card_before_its_result(tmp_path: Path) -> None:
+    root, episode, _ = two_source_root(tmp_path)
+    docker = CudaStageDocker(root, models_for(episode, main_prototypes()), FakeVram(SHORT))
+    code, _, _ = extract(root, docker, "--device", "cuda")
+    assert code == 2
+    log = next((root.path / "runs").glob("job-*/log.txt")).read_text(encoding="utf-8")
+    lines = log.splitlines()
+    card = "extract: card free 6.83 GiB of 12 GiB, budget 8 GiB, allocator cap none"
+    assert lines.index(card) < lines.index("extract: vram-short")
 
 
 def test_tiger_windows_are_logged_at_least_once_a_minute(
