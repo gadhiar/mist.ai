@@ -154,6 +154,31 @@ def test_states(key: str) -> None:
         assert isinstance(control["verified"], bool)
 
 
+CAP_KEYS = ("shm_gb", "memory_gb", "cpus")
+
+
+@pytest.mark.parametrize("key", sorted(FAMILY_KEYS))
+def test_family_caps_are_positive_numbers(key: str) -> None:
+    family = load()["families"][key]
+    for cap in CAP_KEYS:
+        if cap in family:
+            value = family[cap]
+            assert isinstance(value, int | float) and not isinstance(value, bool), (key, cap)
+            assert value > 0, (key, cap)
+
+
+@pytest.mark.parametrize(
+    ("key", "caps"),
+    [
+        ("train-pocket", {"shm_gb": 2, "memory_gb": 9, "cpus": 8}),
+        ("teacher-omnivoice", {"shm_gb": 1, "memory_gb": 8, "cpus": 8}),
+    ],
+)
+def test_gpu_window_families_are_capped(key: str, caps: dict) -> None:
+    family = load()["families"][key]
+    assert {cap: family.get(cap) for cap in CAP_KEYS} == caps
+
+
 def test_higgs_uses_inline_tags_and_omnivoice_only_neutral() -> None:
     families = load()["families"]
     assert {c["control"] for c in families["teacher-higgs3"]["states"].values()} == {"inline-tag"}

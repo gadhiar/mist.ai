@@ -291,6 +291,61 @@ def test_preflight_refuses_free_vram_below_the_family_need(private_root: Root) -
     assert cli.exit_code(caught.value) == 2
 
 
+def test_job_vram_need_overrides_a_larger_family_need(private_root: Root) -> None:
+    docker = FakeDocker(free_mib="8192")
+    _local(private_root, docker).preflight(_job(gpu=True, vram_gb=6.5))
+    assert docker.calls[-1][docker.calls[-1].index("--entrypoint") + 1] == "nvidia-smi"
+
+
+def test_job_vram_need_overrides_a_smaller_family_need(private_root: Root) -> None:
+    docker = FakeDocker(free_mib="17408")
+    with pytest.raises(jobs.PreflightError, match=r"job job-20261112T1015Z-1 needs 18\.5"):
+        _local(private_root, docker).preflight(_job(gpu=True, vram_gb=18.5))
+
+
+def test_job_without_a_vram_need_uses_the_family_need(private_root: Root) -> None:
+    docker = FakeDocker(free_mib="15360")
+    with pytest.raises(jobs.PreflightError, match=f"family {FAMILY} needs 16"):
+        _local(private_root, docker).preflight(_job(gpu=True))
+
+
+def test_job_record_holds_the_vram_need(private_root: Root) -> None:
+    assert _job().record().to_json()["vram_gb"] is None
+    files = {"seed/runs/r1/a.bin": b"a"}
+    docker = FakeDocker(on_run=_writes_outputs(private_root, files))
+    _local(private_root, docker).run(_job(gpu=True, vram_gb=9.5))
+    job_json = private_root.path / "runs/job-20261112T1015Z-1/job.json"
+    assert json.loads(job_json.read_text(encoding="utf-8"))["vram_gb"] == 9.5
+
+
+CAPPED = {**FAMILIES[FAMILY], "shm_gb": 2, "memory_gb": 9.5, "cpus": 8}
+
+
+def test_family_caps_add_shm_memory_and_cpus(private_root: Root) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: CAPPED})
+    argv = local.argv(_job(gpu=True))
+    assert _pairs(argv, "--shm-size") == ["2g"]
+    assert _pairs(argv, "--memory") == ["9.5g"]
+    assert _pairs(argv, "--cpus") == ["8"]
+    assert argv.index("--cpus") < argv.index(IMAGE)
+
+
+def test_family_without_caps_adds_none(private_root: Root) -> None:
+    argv = _local(private_root).argv(_job(gpu=True))
+    assert not {"--shm-size", "--memory", "--cpus"} & set(argv)
+
+
+@pytest.mark.parametrize("key", ["shm_gb", "memory_gb", "cpus"])
+@pytest.mark.parametrize("value", [0, -1, "8", True])
+def test_family_cap_that_is_not_a_positive_number_is_refused(
+    private_root: Root, key: str, value: object
+) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: {**CAPPED, key: value}})
+    with pytest.raises(InputError, match=key) as caught:
+        local.argv(_job())
+    assert cli.exit_code(caught.value) == 2
+
+
 PEER = "mist-daily-backend"
 
 

@@ -71,6 +71,9 @@
       "venv": "/opt/venv-teacher-omnivoice",
       "devices": ["cuda"],
       "vram_gb": 8,
+      "shm_gb": 1,
+      "memory_gb": 8,
+      "cpus": 8,
       "models": {
         "omnivoice": {"kind": "hf", "repository": "k2-fsa/OmniVoice", "revision": "c5fdb5ccb189668d56333f77ba2629f4cd7535f4", "licence": "CC-BY-NC (version not stated on the card; no licence field in HF metadata)", "gated": false}
       },
@@ -163,6 +166,9 @@
       "venv": "/opt/venv-train-pocket",
       "devices": ["cuda"],
       "vram_gb": 16,
+      "shm_gb": 2,
+      "memory_gb": 9,
+      "cpus": 8,
       "models": {
         "pocket-tts": {"kind": "hf", "repository": "kyutai/pocket-tts", "revision": "db04f0e653473e5c7333c69686ac92b7460b0c1d", "licence": "cc-by-4.0", "gated": true, "files": ["languages/english_2026-04_24l/*", "tokenizer.json", "tokenizer.model"]}
       },
