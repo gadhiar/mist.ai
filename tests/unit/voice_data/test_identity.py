@@ -252,6 +252,149 @@ def test_check_refuses_a_missing_identity_and_a_bad_id(private_root: root_mod.Ro
     assert code == 2 and "voice id" in err
 
 
+# Schema 2: an identity with trained weights.
+
+
+WEIGHTS = b"trained student weights"
+STOCK_TOKENIZER = b'{"model": "stock"}'
+TRAINED_TOKENIZER = b'{"model": "trained"}'
+
+
+def with_model(directory: Path, *, tokenizer: bytes | None = None, schema: int = 2) -> dict:
+    """Add trained weights, and a tokenizer when given, to an identity as schema 2 lists them."""
+    (directory / "model.safetensors").write_bytes(WEIGHTS)
+    model: dict[str, object] = {
+        "engine": "pocket-clone",
+        "base": "kyutai/pocket-tts@" + "a" * 40,
+        "weights": "model.safetensors",
+        "sha256": sha(WEIGHTS),
+        "tokenizer_sha256": sha(STOCK_TOKENIZER),
+    }
+    if tokenizer is not None:
+        (directory / "tokenizer.json").write_bytes(tokenizer)
+        model.update(tokenizer="tokenizer.json", tokenizer_sha256=sha(tokenizer))
+    edit_manifest(directory, schema=schema, model=model)
+    return model
+
+
+def test_check_accepts_schema_2_with_its_model(tmp_path: Path) -> None:
+    directory = _good(tmp_path)
+    with_model(directory)
+    found = identity_mod.check(directory)
+    assert found.model == identity_mod.IdentityModel(
+        engine="pocket-clone", base="kyutai/pocket-tts@" + "a" * 40, weights="model.safetensors",
+        sha256=sha(WEIGHTS), tokenizer=None, tokenizer_sha256=sha(STOCK_TOKENIZER),
+    )  # fmt: skip
+    assert [c.state for c in found.clips] == ["neutral", "calm"]
+    with_model(directory, tokenizer=TRAINED_TOKENIZER)
+    found = identity_mod.check(directory)
+    assert found.model is not None and found.model.tokenizer == "tokenizer.json"
+    assert identity_mod.check(_good(tmp_path / "plain")).model is None
+
+
+def _model_field(directory: Path, **changes: object) -> None:
+    data = json.loads((directory / "voice.json").read_text(encoding="utf-8"))
+    data["model"].update(changes)
+    (directory / "voice.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("change", "field"),
+    [
+        ({"engine": ""}, "model.engine"),
+        ({"base": None}, "model.base"),
+        ({"sha256": "not-a-sha"}, "model.sha256"),
+        ({"sha256": "0" * 64}, "model.weights"),
+        ({"weights": "../outside.safetensors"}, "model.weights"),
+        ({"weights": "missing.safetensors"}, "model.weights"),
+        ({"tokenizer_sha256": "0" * 64}, "model.tokenizer"),
+        ({"tokenizer": "../tokenizer.json"}, "model.tokenizer"),
+    ],
+)
+def test_model_rules(tmp_path: Path, change: dict[str, object], field: str) -> None:
+    directory = _good(tmp_path)
+    with_model(directory, tokenizer=TRAINED_TOKENIZER)
+    _model_field(directory, **change)
+    _refused(directory, field)
+
+
+def test_schema_1_refuses_a_model_and_schema_2_needs_one(tmp_path: Path) -> None:
+    directory = _good(tmp_path)
+    with_model(directory, schema=1)
+    _refused(directory, "model needs schema 2")
+    data = json.loads((directory / "voice.json").read_text(encoding="utf-8"))
+    del data["model"]["sha256"]
+    data["schema"] = 2
+    (directory / "voice.json").write_text(json.dumps(data), encoding="utf-8")
+    _refused(directory, "model has no sha256")
+    edit_manifest(directory, model="model.safetensors")
+    _refused(directory, "model is not an object")
+    data = json.loads((directory / "voice.json").read_text(encoding="utf-8"))
+    del data["model"]
+    (directory / "voice.json").write_text(json.dumps(data), encoding="utf-8")
+    _refused(directory, "schema 2 needs a model")
+
+
+def _export_clip(tmp_path: Path) -> identity_mod.ExportClip:
+    audio, text = tmp_path / "src" / "neutral.wav", tmp_path / "src" / "neutral.private.txt"
+    write_wav(audio, tone(4.0))
+    text.write_bytes(CANARY.transcript.encode("utf-8"))
+    return identity_mod.ExportClip(
+        state="neutral", audio=audio, transcript=text,
+        transcript_sha256=sha(CANARY.transcript.encode("utf-8")),
+    )  # fmt: skip
+
+
+def _export_model(tmp_path: Path, tokenizer: bytes | None) -> identity_mod.ExportModel:
+    weights = tmp_path / "src" / "weights.safetensors"
+    weights.parent.mkdir(parents=True, exist_ok=True)
+    weights.write_bytes(WEIGHTS)
+    path = None
+    if tokenizer is not None:
+        path = tmp_path / "src" / "trained-tokenizer.json"
+        path.write_bytes(tokenizer)
+    return identity_mod.ExportModel(
+        engine="pocket-clone", base="kyutai/pocket-tts@" + "a" * 40, weights=weights,
+        tokenizer=path, tokenizer_sha256=sha(tokenizer or STOCK_TOKENIZER),
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("tokenizer", [None, TRAINED_TOKENIZER], ids=["stock", "trained"])
+def test_export_with_a_model_writes_schema_2_and_round_trips_through_check(
+    private_root: root_mod.Root, tmp_path: Path, tokenizer: bytes | None
+) -> None:
+    found = identity_mod.export(
+        private_root, "mist-s", [_export_clip(tmp_path)], status="frozen",
+        model=_export_model(tmp_path, tokenizer), rate=None,
+    )  # fmt: skip
+    directory = private_root.path / "voices" / "mist-s"
+    manifest = json.loads((directory / "voice.json").read_text(encoding="utf-8"))
+    assert manifest["schema"] == 2 and manifest["status"] == "frozen"
+    assert manifest["model"]["weights"] == "model.safetensors"
+    assert (directory / "model.safetensors").read_bytes() == WEIGHTS
+    assert manifest["model"]["sha256"] == sha(WEIGHTS)
+    assert ("tokenizer" in manifest["model"]) is (tokenizer is not None)
+    assert (directory / "tokenizer.json").exists() is (tokenizer is not None)
+    assert manifest["model"]["tokenizer_sha256"] == sha(tokenizer or STOCK_TOKENIZER)
+    assert found == identity_mod.check(directory)
+    assert not [p for p in (private_root.path / "voices").iterdir() if p.name.startswith(".")]
+
+
+def test_export_refuses_a_bad_status_and_a_tokenizer_that_is_not_its_sha256(
+    private_root: root_mod.Root, tmp_path: Path
+) -> None:
+    clip = _export_clip(tmp_path)
+    with pytest.raises(identity_mod.IdentityError, match="status"):
+        identity_mod.export(private_root, "mist-s", [clip], status="draft")
+    model = _export_model(tmp_path, TRAINED_TOKENIZER)
+    assert model.tokenizer is not None
+    model.tokenizer.write_bytes(b"changed")
+    with pytest.raises(identity_mod.IdentityError, match="tokenizer"):
+        identity_mod.export(private_root, "mist-s", [clip], model=model)
+    voices = private_root.path / "voices"
+    assert not voices.exists() or not list(voices.iterdir())
+
+
 def test_check_errors_name_the_field_and_never_the_transcript(
     private_root: root_mod.Root,
 ) -> None:
