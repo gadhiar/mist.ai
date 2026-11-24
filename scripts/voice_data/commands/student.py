@@ -15,9 +15,10 @@ fit of upstream's VRAM table, 6 GiB plus 0.75 GiB a sample) rather than the fami
 which the 12 GB card cannot give.
 
 `student train --corpus C --run R [--resume] [--stage finetune|distill] [--steps-finetune N]
-[--steps-distill N] [--until HH:MM]` runs one GPU job that fine-tunes the 24-layer base with
-upstream's `finetune.yaml`, then distills the 6-layer student with `depth_distill.yaml`, the
-student warm-started from the released 6-layer student (`student_init_from`). It trains at the
+[--steps-distill N] [--keep-last N] [--until HH:MM]` runs one GPU job that fine-tunes the
+24-layer base with upstream's `finetune.yaml`, then distills the 6-layer student with
+`depth_distill.yaml`, the student warm-started from the released 6-layer student
+(`student_init_from`). It trains at the
 probe's batch with accumulation to `EFFECTIVE_BATCH`, asks the preflight for the probe's peak
 plus `HEADROOM_MIB`, and sets the checkpoint interval from the probe's rate so a checkpoint
 lands about every `CHECKPOINT_TARGET_MINUTES`; the job also has the trainer save and restart
@@ -26,13 +27,18 @@ whenever a checkpoint is late, so one lands at least every `CHECKPOINT_MAX_MINUT
 resumed run keeps the steps it was planned with unless they are given again. `--until HH:MM` is
 host local time; the job receives it as `--deadline-utc` (`deadline.py`). At the deadline, or on
 SIGTERM, the job has the trainer save a checkpoint and exits 0 with `status: paused`;
-`--resume` continues from the newest checkpoint.
+`--resume` continues from the newest checkpoint. Each stage keeps its last `--keep-last`
+checkpoints (default `KEEP_LAST`, upstream's `num_ckpt_keep`, which replaces
+`depth_distill.yaml`'s 999), and a resumed run keeps the number it was planned with unless it is
+given again. Validation runs at every checkpoint interval over the validation split's whole
+batches, so each interval's checkpoint has a validation loss; the distillation also keeps the
+weights of the checkpoint with the lowest, `train.json`'s `best`.
 
 Everything lands in `students/<R>/`: `probe.json`, `train-plan.json` (the host's plan),
-`train.json` (the job's status, steps, losses, versions and file sha256s), the corpus copy the
-trainer reads under `data/`, the model and trainer configs under `configs/`, and the trainer's
+`train.json` (the job's status, steps, losses, best, versions and file sha256s), the corpus copy
+the trainer reads under `data/`, the model and trainer configs under `configs/`, and the trainer's
 checkpoints under `checkpoints/finetune/` and `checkpoints/distill/`. Each distill checkpoint
-the trainer keeps has its student weights, alone and in the runtime's key layout, at
+the trainer keeps, and the best, has its student weights, alone and in the runtime's layout, at
 `checkpoints/weights/<checkpoint>/model.safetensors` (`weights_rel`), which `student score`
 and `student export` read.
 
@@ -112,6 +118,8 @@ STEPS_FINETUNE = 8000
 STEPS_DISTILL = 20000
 CHECKPOINT_TARGET_MINUTES = 20
 CHECKPOINT_MAX_MINUTES = 30
+# Checkpoints each stage keeps (upstream's `num_ckpt_keep`); the best distill weights are kept too.
+KEEP_LAST = 3
 FINETUNE, DISTILL = "finetune", "distill"
 STAGES = (FINETUNE, DISTILL)
 RUNNING, PAUSED, DONE = "running", "paused", "done"
@@ -252,6 +260,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     train.add_argument("--stage", choices=STAGES, help="run this stage alone")
     train.add_argument("--steps-finetune", type=int, help=f"default {STEPS_FINETUNE}")
     train.add_argument("--steps-distill", type=int, help=f"default {STEPS_DISTILL}")
+    train.add_argument(
+        "--keep-last", type=int, metavar="N",
+        help=f"checkpoints each stage keeps, besides the best distill one (default {KEEP_LAST})",
+    )  # fmt: skip
     train.add_argument("--until", metavar="HH:MM", help="checkpoint and pause then (local)")
     train.set_defaults(func=run_train)
     sco = steps.add_parser("score", help="gate a checkpoint by CER, SIM and F0 (two GPU jobs)")
@@ -475,7 +487,7 @@ def _read_probe(root: root_mod.Root, run_id: str, corpus: str) -> Mapping[str, o
     return probe
 
 
-def _steps(value: int | None, planned: object, default: int, flag: str) -> int:
+def _planned(value: int | None, planned: object, default: int, flag: str) -> int:
     if value is not None:
         if value < 1:
             raise InputError(f"refused: {flag} is at least 1")
@@ -504,13 +516,14 @@ def run_train(args: argparse.Namespace) -> int:
         old = doc
     old_steps = old.get("steps") if isinstance(old.get("steps"), Mapping) else {}
     steps = {
-        FINETUNE: _steps(
+        FINETUNE: _planned(
             args.steps_finetune, old_steps.get(FINETUNE), STEPS_FINETUNE, "--steps-finetune"  # type: ignore[union-attr]
         ),
-        DISTILL: _steps(
+        DISTILL: _planned(
             args.steps_distill, old_steps.get(DISTILL), STEPS_DISTILL, "--steps-distill"  # type: ignore[union-attr]
         ),
     }
+    keep_last = _planned(args.keep_last, old.get("keep_last"), KEEP_LAST, "--keep-last")
     batch = int(probe["batch"])  # type: ignore[call-overload]
     accum = accum_for(batch)
     rate = float(probe["steps_per_s"])  # type: ignore[arg-type]
@@ -527,6 +540,7 @@ def run_train(args: argparse.Namespace) -> int:
         "ckpt_freq": every,
         "vram_gb": vram,
         "steps": steps,
+        "keep_last": keep_last,
     }
     write_json(root, f"{folder}/{PLAN_NAME}", plan)
     extra: list[str] = []
@@ -553,6 +567,8 @@ def run_train(args: argparse.Namespace) -> int:
             str(steps[FINETUNE]),
             "--steps-distill",
             str(steps[DISTILL]),
+            "--keep-last",
+            str(keep_last),
             *extra,
         ),
         inputs=inputs,
@@ -568,7 +584,10 @@ def run_train(args: argparse.Namespace) -> int:
 
 
 def train_lines(run_id: str, train: Mapping[str, object]) -> list[str]:
-    """Return what `student train` prints: the status and each stage's steps and last loss."""
+    """Return what `student train` prints: the status, each stage's steps and last loss, the best.
+
+    The best is the distill checkpoint with the lowest validation loss, once there is one.
+    """
     status = train.get("status") if train.get("status") in (RUNNING, PAUSED, DONE) else "?"
     by = train.get("stopped_by")
     reason = f" ({by})" if by in (DEADLINE, SIGNAL) else ""
@@ -585,6 +604,12 @@ def train_lines(run_id: str, train: Mapping[str, object]) -> list[str]:
         lines.append(
             f"  {stage}: step {_num(entry.get('done'))} of {_num(entry.get('max'))}, "
             f"loss {_num(loss, 4)}"
+        )
+    best = train.get("best")
+    if isinstance(best, Mapping) and _CHECKPOINT.fullmatch(str(best.get("checkpoint"))):
+        lines.append(
+            f"  best: {best['checkpoint']} at step {_num(best.get('step'))}, "
+            f"valid loss {_num(best.get('valid_loss'), 4)}"
         )
     return lines
 
