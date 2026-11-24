@@ -2,11 +2,13 @@
 
 An identity is a directory `<voice_root>/<voice_id>/` under a private root: a manifest
 (`voice.json`), one clip per speaking state, each with a transcript, and optionally the design
-log. Loading only reads, so the root can be mounted read-only: it reads the manifest, checks each
-file's sha256 and WAV header, and checks that the design log exists without reading it. A bad identity fails at load with a
-`VoiceAssetError` that names the field or the path relative to the identity, so a misspelt tag
-or a stale hash fails when the voice is configured, not at every turn, and the message never
-holds a transcript or audio.
+log. A schema-2 identity also carries trained weights (its `model` object), which the engine it
+names loads in place of its stock clone weights. Loading only reads, so the root can be mounted
+read-only: it reads the manifest, checks each file's sha256 and WAV header, and checks that the
+design log exists without reading it. A bad identity fails at load with a `VoiceAssetError`
+that names the field or the path relative to the identity, so a misspelt tag or a stale hash
+fails when the voice is configured, not at every turn, and the message never holds a transcript
+or audio.
 
 Each engine adapter turns a clip into its own artefacts (Pocket: a voice state) through a
 `VoiceArtefactBuilder`. They are cached under `<cache_root>/<engine_id>/<voice_id>/<state>/<key>/`,
@@ -38,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 VOICE_MANIFEST = "voice.json"
 MANIFEST_SCHEMA = 1
+MODEL_MANIFEST_SCHEMA = 2
+"""The schema of an identity that carries trained weights; schema 1 carries clips only."""
+SHA_PREFIX = 12
+"""How many hex characters of a weights sha256 a log line shows, in place of its path."""
 
 _ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -81,18 +87,39 @@ class VoiceClip:
 
 
 @dataclass(frozen=True, slots=True)
+class IdentityModel:
+    """Trained weights a schema-2 identity carries, checked against its manifest entry.
+
+    `engine` and `base` are as the manifest names them: the engine adapter decides whether it
+    can load them. `weights_path` and `tokenizer_path` are absolute paths inside the identity
+    directory, each matching its sha256. `tokenizer_path` is None when the weights were trained
+    with the engine's stock tokenizer; `tokenizer_sha256` then names that stock file, which the
+    adapter checks.
+    """
+
+    engine: str
+    base: str
+    weights_path: Path
+    sha256: str
+    tokenizer_path: Path | None
+    tokenizer_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class VoiceIdentity:
     """MIST's voice: one clip per speaking state, a `neutral` clip always.
 
     `voice_id` is the id `PlacementConfig.tts_voice` names and `TtsVoice.voice` reports.
     `status` is `placeholder` until a voice is frozen. `root` is the identity directory,
-    resolved; nothing is ever written under it.
+    resolved; nothing is ever written under it. `model` is the trained weights of a schema-2
+    identity, None for schema 1.
     """
 
     voice_id: str
     status: Literal["placeholder", "frozen"]
     clips: tuple[VoiceClip, ...]
     root: Path
+    model: IdentityModel | None = None
 
     def clip(self, state: str) -> VoiceClip:
         """The clip for `state`; any state the identity has no clip for gets the neutral clip."""
@@ -219,14 +246,49 @@ def _check_states(clips: object, voice_id: str) -> list[object]:
     return clips
 
 
+def _non_empty(value: object, field: str, voice_id: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise _error(voice_id, field, "must be a non-empty string")
+    return value
+
+
+def _load_identity_model(root: Path, entry: object, voice_id: str) -> IdentityModel:
+    """Check a schema-2 `model` object: its fields, and its files against their sha256."""
+    if not isinstance(entry, dict):
+        raise _error(voice_id, "model", "is not an object")
+    engine = _non_empty(entry.get("engine"), "model.engine", voice_id)
+    base = _non_empty(entry.get("base"), "model.base", voice_id)
+    weights, weights_rel = _resolve_inside(root, entry.get("weights"), "model.weights", voice_id)
+    sha = _check_sha256(entry.get("sha256"), "model.sha256", voice_id)
+    tokenizer_sha = _check_sha256(entry.get("tokenizer_sha256"), "model.tokenizer_sha256", voice_id)
+    if _file_sha256(weights) != sha:
+        raise _error(voice_id, "model.sha256", f"does not match {weights_rel!r}")
+    tokenizer = None
+    if entry.get("tokenizer") is not None:
+        tokenizer, tokenizer_rel = _resolve_inside(
+            root, entry["tokenizer"], "model.tokenizer", voice_id
+        )
+        if _file_sha256(tokenizer) != tokenizer_sha:
+            raise _error(voice_id, "model.tokenizer_sha256", f"does not match {tokenizer_rel!r}")
+    return IdentityModel(
+        engine=engine,
+        base=base,
+        weights_path=weights,
+        sha256=sha,
+        tokenizer_path=tokenizer,
+        tokenizer_sha256=tokenizer_sha,
+    )
+
+
 def load_identity(voice_root: Path, voice_id: str) -> VoiceIdentity:
     """Load and check the identity `<voice_root>/<voice_id>/`.
 
     Every check runs here, so an identity that loads can be voiced: the manifest's schema, id,
     status and clip tags; each path relative and inside the identity directory, symlinks
     included; each file's sha256; each clip's WAV header; each transcript non-empty UTF-8; and
-    the design log's existence, which is never opened. Reads only, so the read-only mount is
-    enough.
+    the design log's existence, which is never opened. Schema 2 requires a `model` object and
+    schema 1 refuses one, so trained weights are never ignored or guessed at; the weights and
+    an identity tokenizer are checked like clips. Reads only, so the read-only mount is enough.
 
     Raises:
         VoiceAssetError: The identity is missing or breaks a rule; the message names the field
@@ -248,8 +310,21 @@ def load_identity(voice_root: Path, voice_id: str) -> VoiceIdentity:
 
     schema = manifest.get("schema")
     # `True == 1` in Python, so a bool is refused before the comparison.
-    if isinstance(schema, bool) or not isinstance(schema, int) or schema != MANIFEST_SCHEMA:
-        raise _error(voice_id, "schema", f"must be {MANIFEST_SCHEMA}")
+    if (
+        isinstance(schema, bool)
+        or not isinstance(schema, int)
+        or schema not in (MANIFEST_SCHEMA, MODEL_MANIFEST_SCHEMA)
+    ):
+        raise _error(voice_id, "schema", f"must be {MANIFEST_SCHEMA} or {MODEL_MANIFEST_SCHEMA}")
+    if schema == MANIFEST_SCHEMA and "model" in manifest:
+        raise _error(
+            voice_id,
+            "model",
+            f"is not allowed in schema {MANIFEST_SCHEMA}; trained weights need schema "
+            f"{MODEL_MANIFEST_SCHEMA}",
+        )
+    if schema == MODEL_MANIFEST_SCHEMA and "model" not in manifest:
+        raise _error(voice_id, "model", f"is required by schema {MODEL_MANIFEST_SCHEMA}")
     if manifest.get("voice_id") != voice_id:
         raise _error(voice_id, "voice_id", "does not equal the identity directory's name")
     status = manifest.get("status")
@@ -259,13 +334,20 @@ def load_identity(voice_root: Path, voice_id: str) -> VoiceIdentity:
     clips = tuple(_load_clip(root, entry, index, voice_id) for index, entry in enumerate(entries))
     if manifest.get("design_log") is not None:
         _resolve_inside(root, manifest["design_log"], "design_log", voice_id)
+    model = (
+        _load_identity_model(root, manifest["model"], voice_id)
+        if schema == MODEL_MANIFEST_SCHEMA
+        else None
+    )
 
-    identity = VoiceIdentity(voice_id=voice_id, status=status, clips=clips, root=root)
+    identity = VoiceIdentity(voice_id=voice_id, status=status, clips=clips, root=root, model=model)
+    # The weights are named by a sha prefix, never by a path under the private root.
     logger.info(
-        "Loaded voice identity %r (%s): states %s",
+        "Loaded voice identity %r (%s): states %s%s",
         voice_id,
         status,
         ", ".join(sorted(identity.states)),
+        "" if model is None else f"; trained weights sha256 {model.sha256[:SHA_PREFIX]}",
     )
     return identity
 
@@ -277,8 +359,9 @@ T_co = TypeVar("T_co", covariant=True)
 class VoiceArtefactBuilder(Protocol[T_co]):
     """An engine adapter's recipe for turning one clip into its own files, and reading them back.
 
-    `model_pin` is `<repo>@<revision>` and `artefact_version` the builder's format version; both
-    go into the cache key, so a new model or a changed builder rebuilds. `build` writes into
+    `model_pin` is `<repo>@<revision>`, or `<repo>@<revision>+<sha256>` for an identity's
+    trained weights, and `artefact_version` the builder's format version; both go into the
+    cache key, so a new model, changed weights or a changed builder rebuilds. `build` writes into
     `out_dir`, a fresh temporary directory, and nowhere else; `load` reads a finished key
     directory (Pocket: the voice state). Both raise `SpeechEngineError` for a bad clip or
     artefact, converting their library's errors as every adapter does. Neither logs or raises

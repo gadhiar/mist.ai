@@ -11,6 +11,7 @@ Identities are synthetic: sine-tone WAVs written with `wave` into `tmp_path`, wi
 carrying a distinctive mark that must never reach a log record or an error.
 """
 
+import dataclasses
 import gc
 import hashlib
 import importlib
@@ -29,7 +30,7 @@ import numpy as np
 import pytest
 import yaml
 
-from backend.realtime.budget import PlacementConfig
+from backend.realtime.budget import EngineOption, PlacementConfig, VoiceSettings
 from backend.realtime.engines import audio, pocket_tts
 from backend.realtime.engines.audio import (
     LoudnessNormalizer,
@@ -42,6 +43,7 @@ from backend.realtime.engines.audio import (
 from backend.realtime.engines.pocket_tts import (
     CLONE_MODEL_URI,
     CONFIG_NAME,
+    MODEL_PIN,
     MODEL_URI,
     TOKENIZER_URI,
     VOICE_STATE_FILE,
@@ -51,6 +53,7 @@ from backend.realtime.engines.pocket_tts import (
     local_config,
 )
 from backend.realtime.errors import SpeechEngineError
+from backend.realtime.runtime import EngineLoaders, load_speech_engines
 from backend.realtime.speech import (
     CancelToken,
     SpeechSynthesizer,
@@ -62,6 +65,7 @@ from backend.realtime.voice_assets import (
     VOICE_MANIFEST,
     VoiceArtefactBuilder,
     VoiceAssetError,
+    artefact_key,
     load_identity,
 )
 
@@ -688,6 +692,226 @@ class TestVoiceBuilder:
     def test_load_of_a_missing_state_file_raises_naming_it(self, tmp_path):
         with pytest.raises(SpeechEngineError, match=VOICE_STATE_FILE):
             PocketVoiceBuilder(FakeModel(), lambda state, dest: None).load(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Trained weights in the identity (voice.json schema 2)
+# ---------------------------------------------------------------------------
+
+
+def add_model(
+    env: Env,
+    *,
+    weights: bytes = b"trained weights",
+    tokenizer: bytes | None = None,
+    **changes: object,
+) -> dict:
+    """Give the env's identity trained weights (and a tokenizer); returns its `model` entry.
+
+    Without `tokenizer`, `tokenizer_sha256` is the stock tokenizer's, as an export writes it
+    when the student was trained with a byte-identical tokenizer.
+    """
+    identity = env.voice_root / VOICE_ID
+    (identity / "model.safetensors").write_bytes(weights)
+    model: dict = {
+        "engine": "pocket-clone",
+        "base": MODEL_PIN,
+        "weights": "model.safetensors",
+        "sha256": _sha(identity / "model.safetensors"),
+        "tokenizer_sha256": _sha(mapped_files(env.models_dir)[TOKENIZER_URI]),
+    }
+    if tokenizer is not None:
+        (identity / "tokenizer.json").write_bytes(tokenizer)
+        model["tokenizer"] = "tokenizer.json"
+        model["tokenizer_sha256"] = _sha(identity / "tokenizer.json")
+    model.update(changes)
+    manifest = json.loads((identity / VOICE_MANIFEST).read_text(encoding="utf-8"))
+    manifest.update(schema=2, model=model)
+    (identity / VOICE_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+    return model
+
+
+def _key_dirs(env: Env) -> set[Path]:
+    return set((env.cache / "pocket-clone" / VOICE_ID).glob("*/*"))
+
+
+class TestIdentityWeights:
+    def test_the_config_loads_the_identity_weights_and_keeps_the_stock_rest(self, tmp_path):
+        env = make_env(tmp_path)
+        add_model(env)
+
+        env.load()
+
+        (config,) = env.library.configs
+        stock = mapped_files(env.models_dir)
+        identity = (env.voice_root / VOICE_ID).resolve()
+        assert config["weights_path"] == str(identity / "model.safetensors")
+        assert config["weights_path_without_voice_cloning"] == str(stock[MODEL_URI])
+        assert config["flow_lm"]["lookup_table"]["tokenizer_path"] == str(stock[TOKENIZER_URI])
+        assert config["mimi"] == installed_config()["mimi"]
+
+    def test_the_identity_tokenizer_replaces_the_stock_one(self, tmp_path):
+        env = make_env(tmp_path)
+        add_model(env, tokenizer=b"trained tokenizer")
+
+        env.load()
+
+        (config,) = env.library.configs
+        identity = (env.voice_root / VOICE_ID).resolve()
+        assert config["flow_lm"]["lookup_table"]["tokenizer_path"] == str(
+            identity / "tokenizer.json"
+        )
+        assert config["weights_path"] == str(identity / "model.safetensors")
+
+    def test_the_identity_weights_need_no_stock_clone_weights(self, tmp_path):
+        env = make_env(tmp_path)
+        add_model(env)
+        mapped_files(env.models_dir)[CLONE_MODEL_URI].unlink()
+
+        assert env.load().model_id.startswith(MODEL_PIN)
+
+    def test_local_config_maps_the_given_files(self, tmp_path):
+        files = stage_weights(tmp_path / "models")
+        weights, tokenizer = tmp_path / "w.safetensors", tmp_path / "t.json"
+        weights.write_bytes(b"w")
+        tokenizer.write_bytes(b"t")
+
+        config = local_config(installed_config(), tmp_path / "models", weights, tokenizer)
+
+        assert config["weights_path"] == str(weights)
+        assert config["weights_path_without_voice_cloning"] == str(files[MODEL_URI])
+        assert config["flow_lm"]["lookup_table"]["tokenizer_path"] == str(tokenizer)
+
+    def test_local_config_refuses_a_missing_given_file_without_its_path(self, tmp_path):
+        stage_weights(tmp_path / "models")
+        missing = tmp_path / "private" / "w.safetensors"
+
+        with pytest.raises(SpeechEngineError) as caught:
+            local_config(installed_config(), tmp_path / "models", missing)
+
+        assert "private" not in str(caught.value)
+
+    def test_the_model_id_and_the_builder_pin_carry_the_weights_sha(self, tmp_path):
+        env = make_env(tmp_path, ("neutral", "calm"))
+        entry = add_model(env)
+
+        synth = env.load()
+
+        assert synth.model_id == f"{MODEL_PIN}+{entry['sha256']}"
+        builder = PocketVoiceBuilder(
+            FakeModel(), lambda state, dest: None, model_pin=synth.model_id
+        )
+        assert builder.model_pin == synth.model_id
+        identity = load_identity(env.voice_root, VOICE_ID)
+        assert {path.name for path in _key_dirs(env)} == {
+            artefact_key(builder, clip) for clip in identity.clips
+        }
+
+    def test_the_default_pins_are_the_stock_model(self):
+        model = FakeModel()
+        synth = PocketCloneSynthesizer(
+            model, {"neutral": FakeState("neutral", True)}, VoiceInfo("pocket-clone", "v", "p")
+        )
+
+        assert synth.model_id == MODEL_PIN
+        assert PocketVoiceBuilder(model, lambda state, dest: None).model_pin == MODEL_PIN
+
+    def test_trained_weights_and_a_changed_weight_file_rebuild_every_voice_state(self, tmp_path):
+        env = make_env(tmp_path, ("neutral", "calm"))
+        env.load()
+        stock = _key_dirs(env)
+        add_model(env, weights=b"trained weights one")
+        env.library.model = FakeModel()
+        env.load()
+        first = _key_dirs(env)
+        add_model(env, weights=b"trained weights two")
+        env.library.model = FakeModel()
+
+        env.load()
+
+        second = _key_dirs(env)
+        assert len(stock) == len(first) == len(second) == 2
+        assert not stock & first and not first & second
+        assert len(env.library.exports) == 6
+
+    def test_the_engine_status_names_the_trained_weights(self, tmp_path):
+        env = make_env(tmp_path)
+        entry = add_model(env)
+        placement = dataclasses.replace(
+            env.placement, stt_chain=(), tts_chain=(EngineOption("pocket-clone", "cpu"),)
+        )
+
+        def unused(*args: object) -> object:
+            raise AssertionError("no STT chain, so no single engine loads")
+
+        engines = load_speech_engines(
+            VoiceSettings(placement=placement),
+            EngineLoaders(
+                chains={
+                    "pocket-clone": lambda settings, device: PocketCloneSynthesizer.load(
+                        settings.placement, PROFILE, library_loader=env.library, device=device
+                    )
+                },
+                vad=unused,
+                eot=unused,
+                kws=unused,
+            ),
+        )
+
+        assert engines.statuses.tts.model_id == f"{MODEL_PIN}+{entry['sha256']}"
+        assert engines.synthesizer.model_id == engines.statuses.tts.model_id
+
+    @pytest.mark.parametrize(
+        ("changes", "named"),
+        [
+            pytest.param({"engine": "pocket-tts"}, "model.engine", id="wrong-engine"),
+            pytest.param({"base": f"{MODEL_PIN[:-1]}0"}, "model.base", id="wrong-base"),
+            pytest.param(
+                {"tokenizer_sha256": "0" * 64},
+                "model.tokenizer_sha256",
+                id="stock-tokenizer-sha-mismatch",
+            ),
+        ],
+    )
+    def test_an_incompatible_model_is_refused_before_the_library_loads(
+        self, tmp_path, changes, named
+    ):
+        env = make_env(tmp_path)
+        add_model(env, **changes)
+
+        with pytest.raises(VoiceAssetError) as caught:
+            env.load()
+
+        assert named in str(caught.value) and VOICE_ID in str(caught.value)
+        assert str(tmp_path) not in str(caught.value)
+        assert env.library.loads == 0
+
+    def test_a_trained_model_at_another_sample_rate_is_refused(self, tmp_path):
+        env = make_env(tmp_path, model=FakeModel(sample_rate=16000))
+        add_model(env)
+
+        with pytest.raises(VoiceAssetError, match="24000"):
+            env.load()
+
+        assert env.library.exports == []
+
+    def test_logs_name_the_voice_and_a_sha_prefix_never_an_identity_path(self, tmp_path, caplog):
+        env = make_env(tmp_path, ("neutral", "calm"))
+        entry = add_model(env, tokenizer=b"trained tokenizer")
+        caplog.set_level(logging.DEBUG)
+
+        synth = env.load()
+        collect(synth, segment(state="calm"))
+        synth.release()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "pocket-clone" in m and VOICE_ID in m and entry["sha256"][:12] in m for m in messages
+        )
+        for message in messages:
+            assert entry["sha256"] not in message
+            assert str(env.voice_root) not in message
+            assert "model.safetensors" not in message and "tokenizer.json" not in message
 
 
 # ---------------------------------------------------------------------------
