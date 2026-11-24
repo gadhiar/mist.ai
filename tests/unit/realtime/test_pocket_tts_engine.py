@@ -2,10 +2,11 @@
 
 pocket-tts is not installed where these tests run, so every test hands the adapter a fake
 library: a model factory that records the config it was given, a voice-state export that writes
-a small file, and a model that returns sine tones and records the voice state and text of each
-call. That pins what the adapter owns: the config it builds from the installed one, where the
-weights must be, the voice prompts it builds and keeps per speaking state, the state fallback,
-the text it sends, the audio it yields, release, and that no log line or error holds text.
+a small file, a seed setter that records each seed, and a model that returns sine tones and
+records the voice state and text of each call. That pins what the adapter owns: the config it
+builds from the installed one, where the weights must be, the voice prompts and per-state gains
+it builds and keeps per speaking state, the state fallback, the text it sends, the audio it
+yields piece by piece, release, and that no log line or error holds text.
 
 Identities are synthetic: sine-tone WAVs written with `wave` into `tmp_path`, with transcripts
 carrying a distinctive mark that must never reach a log record or an error.
@@ -33,7 +34,6 @@ import yaml
 from backend.realtime.budget import EngineOption, PlacementConfig, VoiceSettings
 from backend.realtime.engines import audio, pocket_tts
 from backend.realtime.engines.audio import (
-    LoudnessNormalizer,
     integrated_loudness,
     pcm16_chunks,
     resample,
@@ -77,6 +77,8 @@ TRANSCRIPT_MARK = "zebra quartz"
 SEGMENT_MARK = "violet harbour"
 """A distinctive segment string no log record or error text may hold."""
 TONES = {"neutral": 220.0, "calm": 330.0, "sleepy": 440.0}
+CALIBRATION_SHA_V2 = "54947a6a56c4a1bf4126f77ea9ca73740a950e25887e08c9ea10e1df7fab2898"
+"""`pocket_tts.CALIBRATION_SHA` at `ARTEFACT_VERSION` 2: the calibration recipe's pin."""
 LOGGERS = (pocket_tts.__name__, audio.__name__, "backend.realtime.voice_assets")
 
 
@@ -178,7 +180,12 @@ class FakeState:
 
 @dataclass
 class FakeModel:
-    """A Pocket model: voice states from clips and files, sine tones for text."""
+    """A Pocket model: voice states from clips and files, sine tones for text.
+
+    `seed_amplitudes` makes the tone's amplitude depend on the last seed `FakeLibrary` set, as
+    a sampled render's level depends on torch's generator; `state_amplitudes` makes it depend
+    on the voice state the call speaks with.
+    """
 
     sample_rate: int = RATE
     has_voice_cloning: bool = True
@@ -187,8 +194,12 @@ class FakeModel:
     fail_prompt: Exception | None = None
     fail_generate: Exception | None = None
     stream_pieces: int = 0
+    seed_amplitudes: dict[int, float] | None = None
+    state_amplitudes: dict[str, float] | None = None
+    seed: int | None = None
     prompt_calls: list[Path] = field(default_factory=list)
     generated: list[tuple[str, str]] = field(default_factory=list)
+    rendered_seeds: list[int | None] = field(default_factory=list)
     pulled: int = 0
 
     def get_state_for_audio_prompt(self, audio_conditioning: Path, truncate: bool = False):
@@ -201,11 +212,17 @@ class FakeModel:
         return FakeState(audio_conditioning.stem, loaded=False)
 
     def _tone(self, seconds: float) -> np.ndarray:
+        amplitude = self.amplitude
+        if self.seed_amplitudes is not None:
+            amplitude = self.seed_amplitudes[self.seed]
+        if self.state_amplitudes is not None and self.generated:
+            amplitude = self.state_amplitudes[self.generated[-1][0]]
         t = np.arange(int(seconds * self.sample_rate)) / self.sample_rate
-        return (self.amplitude * np.sin(2 * np.pi * 300.0 * t)).astype(np.float32)
+        return (amplitude * np.sin(2 * np.pi * 300.0 * t)).astype(np.float32)
 
     def generate_audio(self, model_state, text_to_generate: str):
         self.generated.append((model_state.source, text_to_generate))
+        self.rendered_seeds.append(self.seed)
         if self.fail_generate is not None:
             raise self.fail_generate
         return self._tone(self.seconds)
@@ -213,13 +230,29 @@ class FakeModel:
 
 @dataclass
 class StreamingModel(FakeModel):
-    """A model with the streaming call, yielding `stream_pieces` pieces."""
+    """A model with the streaming call, yielding `stream_pieces` pieces.
+
+    `fail_at` raises `fail_generate` in place of that piece (1-based), after the ones before it.
+    `closed` counts streams closed before their last piece.
+    """
+
+    fail_at: int | None = None
+    closed: int = 0
 
     def generate_audio_stream(self, model_state, text_to_generate: str) -> Iterator[np.ndarray]:
         self.generated.append((model_state.source, text_to_generate))
-        for _ in range(self.stream_pieces):
-            self.pulled += 1
-            yield self._tone(self.seconds / self.stream_pieces)
+        self.rendered_seeds.append(self.seed)
+        finished = False
+        try:
+            for index in range(1, self.stream_pieces + 1):
+                self.pulled += 1
+                if self.fail_at == index and self.fail_generate is not None:
+                    raise self.fail_generate
+                yield self._tone(self.seconds / self.stream_pieces)
+            finished = True
+        finally:
+            if not finished:
+                self.closed += 1
 
 
 @dataclass
@@ -231,10 +264,16 @@ class FakeLibrary:
     configs: list[dict] = field(default_factory=list)
     threads: list[int] = field(default_factory=list)
     exports: list[Path] = field(default_factory=list)
+    seeds: list[int] = field(default_factory=list)
     loads: int = 0
     fail_load: Exception | None = None
     fail_export: Exception | None = None
     models: list[FakeModel] = field(default_factory=list)
+
+    def manual_seed(self, seed: int) -> None:
+        self.seeds.append(seed)
+        for model in self.models:
+            model.seed = seed
 
     def load_model(self, config: Path) -> FakeModel:
         assert isinstance(config, Path)
@@ -258,6 +297,7 @@ class FakeLibrary:
             export_model_state=self.export_model_state,
             configs_dir=self.configs_dir,
             set_num_threads=self.threads.append,
+            manual_seed=self.manual_seed,
         )
 
 
@@ -314,6 +354,33 @@ def segment(text: str = "Hello there, test line.", state: str = "neutral") -> Te
 def pcm_samples(chunks: list[SynthChunk]) -> np.ndarray:
     raw = b"".join(chunk.pcm16 for chunk in chunks)
     return np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32767
+
+
+def make_builder(
+    model: FakeModel, export=lambda state, dest: None, seeds: list[int] | None = None, **kwargs
+) -> PocketVoiceBuilder:
+    """A builder on `model` whose seed setter records into `seeds` and sets the model's seed."""
+
+    def manual_seed(seed: int) -> None:
+        model.seed = seed
+        if seeds is not None:
+            seeds.append(seed)
+
+    return PocketVoiceBuilder(model, export, manual_seed=manual_seed, **kwargs)
+
+
+def write_gain(artefact_dir: Path, **changes: object) -> dict:
+    """A `gain.json` as `build` writes it, with `changes` applied; returns what was written."""
+    gain = {"state": "calm", "gain_db": 4.5, "calibration_sha": pocket_tts.CALIBRATION_SHA}
+    gain.update(changes)
+    (artefact_dir / pocket_tts.GAIN_FILE).write_text(json.dumps(gain), encoding="utf-8")
+    return gain
+
+
+def calibration_loudness(amplitude: float, seconds: float = 1.0) -> float:
+    """What the calibration measures for `FakeModel` tones at `amplitude`, one per sentence."""
+    tone = FakeModel(amplitude=amplitude)._tone(seconds)
+    return integrated_loudness(np.tile(tone, len(pocket_tts.CALIBRATION_SENTENCES)), RATE)
 
 
 def _listing(root: Path) -> list[tuple[str, int, int]]:
@@ -386,30 +453,27 @@ class TestLoudness:
     def test_silence_is_minus_infinity(self):
         assert integrated_loudness(np.zeros(RATE, dtype=np.float32), RATE) == float("-inf")
 
+    @pytest.mark.parametrize(
+        ("loudness", "gain_db"),
+        [
+            pytest.param(-35.0, 15.0, id="quiet-raised"),
+            pytest.param(-12.5, -7.5, id="loud-lowered"),
+            pytest.param(-20.0, 0.0, id="on-target"),
+            pytest.param(-60.0, 20.0, id="capped-at-20-db"),
+            pytest.param(float("-inf"), 20.0, id="silence-capped"),
+        ],
+    )
+    def test_the_gain_to_the_target_is_capped_at_20_db(self, loudness, gain_db):
+        assert audio.target_gain_db(loudness) == pytest.approx(gain_db)
+
     @pytest.mark.parametrize("amplitude", [0.02, 0.6])
-    def test_quiet_and_loud_segments_reach_the_target(self, amplitude):
-        out = LoudnessNormalizer()(_sine(amplitude, 1.0), RATE)
+    def test_the_gain_brings_a_tone_to_the_target(self, amplitude):
+        tone = _sine(amplitude, 1.0)
+        gain_db = audio.target_gain_db(integrated_loudness(tone, RATE))
 
-        assert integrated_loudness(out, RATE) == pytest.approx(-20.0, abs=1.0)
+        out = tone * 10 ** (gain_db / 20)
 
-    def test_gain_is_capped_at_20_db(self):
-        quiet = _sine(0.001, 1.0)
-        out = LoudnessNormalizer()(quiet, RATE)
-
-        np.testing.assert_allclose(out, quiet * 10.0, rtol=1e-4)
-
-    def test_a_short_segment_takes_the_previous_gain(self):
-        normalizer = LoudnessNormalizer()
-        first = _sine(0.05, 1.0)
-        gain = float(np.max(normalizer(first, RATE)) / np.max(first))
-        short = _sine(0.3, 0.3)
-
-        np.testing.assert_allclose(normalizer(short, RATE), short * gain, rtol=1e-4)
-
-    def test_a_first_short_segment_keeps_unity_gain(self):
-        short = _sine(0.3, 0.3)
-
-        np.testing.assert_allclose(LoudnessNormalizer()(short, RATE), short)
+        assert integrated_loudness(out, RATE) == pytest.approx(-20.0, abs=0.01)
 
 
 class TestPcmAndChunks:
@@ -565,6 +629,8 @@ class TestLoad:
         for state in ("neutral", "sleepy"):
             (key_dir,) = (env.cache / "pocket-clone" / VOICE_ID / state).iterdir()
             assert (key_dir / VOICE_STATE_FILE).read_text(encoding="utf-8") == state
+            gain = json.loads((key_dir / pocket_tts.GAIN_FILE).read_text(encoding="utf-8"))
+            assert gain["state"] == state
 
     def test_identity_errors_come_before_the_library_loads(self, tmp_path):
         env = make_env(tmp_path)
@@ -653,45 +719,176 @@ class TestLoad:
         with pytest.raises(VoiceAssetError, match="pocket-clone"):
             env.load()
 
+    def test_a_calibration_failure_is_a_voice_asset_error_and_leaves_no_key(self, tmp_path):
+        env = make_env(tmp_path, model=FakeModel(fail_generate=RuntimeError("no audio")))
+
+        with pytest.raises(VoiceAssetError, match="pocket-clone"):
+            env.load()
+
+        assert not _key_dirs(env)
+
+    def test_each_state_speaks_with_its_own_gain(self, tmp_path):
+        model = FakeModel(state_amplitudes={"neutral": 0.02, "calm": 0.08})
+        env = make_env(tmp_path, ("neutral", "calm"), model=model)
+        synth = env.load()
+        gains = {
+            state: json.loads(key_dir.joinpath(pocket_tts.GAIN_FILE).read_text(encoding="utf-8"))
+            for state in ("neutral", "calm")
+            for key_dir in (env.cache / "pocket-clone" / VOICE_ID / state).iterdir()
+        }
+        model.state_amplitudes = {"neutral": 0.05, "calm": 0.05}
+
+        levels = {
+            state: integrated_loudness(pcm_samples(collect(synth, segment(state=state))), RATE)
+            for state in ("neutral", "calm")
+        }
+
+        # The calm clip rendered 12 dB louder, so its gain is 12 dB lower, and a line the
+        # engine renders at one level for both states leaves 12 dB quieter in calm.
+        assert gains["neutral"]["gain_db"] - gains["calm"]["gain_db"] == pytest.approx(
+            20 * np.log10(4), abs=0.01
+        )
+        assert levels["neutral"] - levels["calm"] == pytest.approx(20 * np.log10(4), abs=0.05)
+
+
+def _clip(tmp_path: Path, state: str = "neutral"):
+    make_identity(tmp_path / "voices", (state,))
+    return load_identity(tmp_path / "voices", VOICE_ID).clip(state)
+
+
+def _built_gain(tmp_path: Path, model: FakeModel, **kwargs) -> dict:
+    out = tmp_path / "out"
+    out.mkdir()
+    make_builder(model, **kwargs).build(_clip(tmp_path), out)
+    return json.loads((out / pocket_tts.GAIN_FILE).read_text(encoding="utf-8"))
+
 
 class TestVoiceBuilder:
     def test_meets_the_builder_contract(self):
-        builder: VoiceArtefactBuilder = PocketVoiceBuilder(FakeModel(), lambda state, dest: None)
+        builder: VoiceArtefactBuilder = make_builder(FakeModel())
 
         assert builder.engine_id == "pocket-clone"
         assert builder.model_pin == "kyutai/pocket-tts@db04f0e653473e5c7333c69686ac92b7460b0c1d"
         assert isinstance(builder.artefact_version, int)
 
+    def test_the_artefact_version_and_the_calibration_are_pinned_together(self):
+        # A changed sentence, seed, target or cap changes the calibration sha; bump
+        # ARTEFACT_VERSION with it so every cached gain is rebuilt, then update both here.
+        assert pocket_tts.ARTEFACT_VERSION == 2
+        assert pocket_tts.CALIBRATION_SHA == CALIBRATION_SHA_V2
+        assert len(pocket_tts.CALIBRATION_SEEDS) == 3
+        assert len(set(pocket_tts.CALIBRATION_SEEDS)) == 3
+
     def test_build_computes_from_the_clip_and_exports_and_never_reads_the_transcript(
         self, tmp_path
     ):
-        make_identity(tmp_path / "voices", ("neutral",))
-        clip = load_identity(tmp_path / "voices", VOICE_ID).clip("neutral")
+        clip = _clip(tmp_path)
         clip.transcript.unlink()
         model = FakeModel()
         exported: list[tuple[str, Path]] = []
         out = tmp_path / "out"
         out.mkdir()
 
-        PocketVoiceBuilder(model, lambda state, dest: exported.append((state.source, dest))).build(
+        make_builder(model, lambda state, dest: exported.append((state.source, dest))).build(
             clip, out
         )
 
         assert model.prompt_calls == [clip.audio]
         assert exported == [("neutral", out / VOICE_STATE_FILE)]
 
-    def test_load_reads_the_exported_state_file(self, tmp_path):
+    def test_build_writes_the_state_gain_beside_the_voice_state(self, tmp_path):
+        gain = _built_gain(tmp_path, FakeModel(amplitude=0.05))
+
+        assert set(gain) == {"state", "gain_db", "calibration_sha"}
+        assert gain["state"] == "neutral"
+        assert gain["calibration_sha"] == pocket_tts.CALIBRATION_SHA
+        assert gain["gain_db"] == pytest.approx(-20.0 - calibration_loudness(0.05), abs=0.01)
+
+    def test_the_gain_is_the_median_of_three_seeded_renders_of_every_sentence(self, tmp_path):
+        seeds_used: list[int] = []
+        first, second, third = pocket_tts.CALIBRATION_SEEDS
+        model = FakeModel(seed_amplitudes={first: 0.01, second: 0.2, third: 0.04})
+
+        gain = _built_gain(tmp_path, model, seeds=seeds_used)
+
+        assert seeds_used == list(pocket_tts.CALIBRATION_SEEDS)
+        sentences = list(pocket_tts.CALIBRATION_SENTENCES)
+        assert [text for _state, text in model.generated] == sentences * 3
+        assert model.rendered_seeds == [seed for seed in seeds_used for _ in sentences]
+        assert gain["gain_db"] == pytest.approx(-20.0 - calibration_loudness(0.04), abs=0.01)
+
+    def test_a_streaming_model_is_calibrated_through_its_stream(self, tmp_path):
+        model = StreamingModel(stream_pieces=4, amplitude=0.05)
+
+        gain = _built_gain(tmp_path, model)
+
+        assert model.pulled == 4 * 3 * len(pocket_tts.CALIBRATION_SENTENCES)
+        assert gain["gain_db"] == pytest.approx(-20.0 - calibration_loudness(0.05), abs=0.01)
+
+    def test_the_gain_is_capped_at_20_db(self, tmp_path):
+        gain = _built_gain(tmp_path, FakeModel(amplitude=0.0005))
+
+        assert gain["gain_db"] == 20.0
+
+    def test_a_silent_calibration_fails_the_build_naming_the_state(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+
+        with pytest.raises(SpeechEngineError, match="'neutral'"):
+            make_builder(FakeModel(amplitude=0.0)).build(_clip(tmp_path), out)
+
+        assert not (out / pocket_tts.GAIN_FILE).exists()
+
+    def test_a_calibration_render_failure_is_a_speech_engine_error(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        model = FakeModel(fail_generate=RuntimeError("no audio"))
+
+        with pytest.raises(SpeechEngineError, match="calibrat"):
+            make_builder(model).build(_clip(tmp_path), out)
+
+    def test_load_reads_the_exported_state_file_and_its_gain(self, tmp_path):
         (tmp_path / VOICE_STATE_FILE).write_text("calm", encoding="utf-8")
+        write_gain(tmp_path, gain_db=-3.25)
         model = FakeModel()
 
-        state = PocketVoiceBuilder(model, lambda state, dest: None).load(tmp_path)
+        voice = make_builder(model).load(tmp_path)
 
         assert model.prompt_calls == [tmp_path / VOICE_STATE_FILE]
-        assert (state.source, state.loaded) == ("calm", True)
+        assert (voice.state.source, voice.state.loaded) == ("calm", True)
+        assert voice.gain_db == -3.25
 
     def test_load_of_a_missing_state_file_raises_naming_it(self, tmp_path):
+        write_gain(tmp_path)
+
         with pytest.raises(SpeechEngineError, match=VOICE_STATE_FILE):
-            PocketVoiceBuilder(FakeModel(), lambda state, dest: None).load(tmp_path)
+            make_builder(FakeModel()).load(tmp_path)
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param({"calibration_sha": "0" * 64}, id="other-calibration"),
+            pytest.param({"gain_db": "4.5"}, id="gain-not-a-number"),
+            pytest.param({"gain_db": True}, id="gain-a-bool"),
+            pytest.param({"gain_db": 20.5}, id="gain-over-the-cap"),
+            pytest.param({"state": 3}, id="state-not-a-string"),
+        ],
+    )
+    def test_load_refuses_a_missing_or_unusable_gain_file_naming_it(self, tmp_path, changes):
+        (tmp_path / VOICE_STATE_FILE).write_text("calm", encoding="utf-8")
+        if changes is not None:
+            write_gain(tmp_path, **changes)
+
+        with pytest.raises(SpeechEngineError, match=pocket_tts.GAIN_FILE):
+            make_builder(FakeModel()).load(tmp_path)
+
+    def test_load_refuses_a_gain_file_that_is_not_json(self, tmp_path):
+        (tmp_path / VOICE_STATE_FILE).write_text("calm", encoding="utf-8")
+        (tmp_path / pocket_tts.GAIN_FILE).write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(SpeechEngineError, match=pocket_tts.GAIN_FILE):
+            make_builder(FakeModel()).load(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -798,9 +995,7 @@ class TestIdentityWeights:
         synth = env.load()
 
         assert synth.model_id == f"{MODEL_PIN}+{entry['sha256']}"
-        builder = PocketVoiceBuilder(
-            FakeModel(), lambda state, dest: None, model_pin=synth.model_id
-        )
+        builder = make_builder(FakeModel(), model_pin=synth.model_id)
         assert builder.model_pin == synth.model_id
         identity = load_identity(env.voice_root, VOICE_ID)
         assert {path.name for path in _key_dirs(env)} == {
@@ -810,11 +1005,13 @@ class TestIdentityWeights:
     def test_the_default_pins_are_the_stock_model(self):
         model = FakeModel()
         synth = PocketCloneSynthesizer(
-            model, {"neutral": FakeState("neutral", True)}, VoiceInfo("pocket-clone", "v", "p")
+            model,
+            {"neutral": pocket_tts.PocketVoice(FakeState("neutral", True), 0.0)},
+            VoiceInfo("pocket-clone", "v", "p"),
         )
 
         assert synth.model_id == MODEL_PIN
-        assert PocketVoiceBuilder(model, lambda state, dest: None).model_pin == MODEL_PIN
+        assert make_builder(model).model_pin == MODEL_PIN
 
     def test_trained_weights_and_a_changed_weight_file_rebuild_every_voice_state(self, tmp_path):
         env = make_env(tmp_path, ("neutral", "calm"))
@@ -989,9 +1186,10 @@ class TestSynthesis:
     def test_a_segment_that_cleans_to_empty_makes_no_engine_call(self, tmp_path):
         env = make_env(tmp_path)
         synth = env.load()
+        calls = len(env.library.models[0].generated)
 
         assert collect(synth, segment("** [sigh] `` ")) == []
-        assert env.library.models[0].generated == []
+        assert len(env.library.models[0].generated) == calls
 
     def test_chunks_are_pcm16_at_24_khz_of_at_most_200_ms_and_carry_the_segment(self, tmp_path):
         env = make_env(tmp_path, model=FakeModel(seconds=1.05))
@@ -1012,13 +1210,110 @@ class TestSynthesis:
 
         assert sum(chunk.samples for chunk in chunks) == RATE
 
-    def test_loudness_is_normalized_to_minus_20_lufs(self, tmp_path):
-        env = make_env(tmp_path, model=FakeModel(amplitude=0.02, seconds=1.0))
+    @pytest.mark.parametrize(
+        "model",
+        [
+            pytest.param(FakeModel(amplitude=0.02), id="whole"),
+            pytest.param(StreamingModel(amplitude=0.02, stream_pieces=8), id="streamed"),
+        ],
+    )
+    def test_each_line_of_a_model_of_known_loudness_is_within_1_5_lu_of_minus_20(
+        self, tmp_path, model
+    ):
+        # A 300 Hz tone at 0.02 measures about -37 LUFS, so the state's gain is about +17 dB.
+        env = make_env(tmp_path, model=model)
         synth = env.load()
 
-        out = pcm_samples(collect(synth, segment()))
+        for seconds in (0.3, 0.8, 1.0, 2.5, 4.0):
+            model.seconds = seconds
+            line = pcm_samples(collect(synth, segment(f"A line of {seconds} seconds.")))
 
-        assert integrated_loudness(out, RATE) == pytest.approx(-20.0, abs=1.0)
+            assert integrated_loudness(line, RATE) == pytest.approx(-20.0, abs=1.5)
+
+    def test_the_first_chunk_leaves_before_the_second_piece_is_pulled(self, tmp_path):
+        model = StreamingModel(stream_pieces=4, seconds=1.0)
+        synth = make_env(tmp_path, model=model).load()
+        pulled = model.pulled
+        chunks = synth.synthesize(segment(), CancelToken())
+
+        first = next(chunks)
+
+        assert model.pulled == pulled + 1
+        assert first.samples == 4800
+        rest = list(chunks)
+        assert model.pulled == pulled + 4
+        assert sum(chunk.samples for chunk in [first, *rest]) == RATE
+
+    def test_a_set_token_stops_after_the_piece_it_was_set_during(self, tmp_path):
+        model = StreamingModel(stream_pieces=4, seconds=1.0)
+        synth = make_env(tmp_path, model=model).load()
+        pulled = model.pulled
+        token = CancelToken()
+        original = model._tone
+
+        def tone_then_cancel_on_the_second_piece(seconds: float) -> np.ndarray:
+            if model.pulled == pulled + 2:
+                token.set()
+            return original(seconds)
+
+        model._tone = tone_then_cancel_on_the_second_piece
+        chunks = list(synth.synthesize(segment(), token))
+
+        assert model.pulled == pulled + 2
+        assert sum(chunk.samples for chunk in chunks) == RATE // 4
+        assert model.closed == 1
+
+    def test_closing_the_chunks_closes_the_engine_stream(self, tmp_path):
+        model = StreamingModel(stream_pieces=4, seconds=1.0)
+        synth = make_env(tmp_path, model=model).load()
+        chunks = synth.synthesize(segment(), CancelToken())
+        next(chunks)
+
+        chunks.close()
+
+        assert model.closed == 1
+
+    def test_without_the_streaming_call_a_segment_is_generated_whole(self, tmp_path):
+        model = FakeModel(seconds=1.05)
+        synth = make_env(tmp_path, model=model).load()
+        calls = len(model.generated)
+
+        chunks = collect(synth, segment())
+
+        assert len(model.generated) == calls + 1
+        assert [chunk.samples for chunk in chunks] == [4800] * 5 + [1200]
+
+    def test_the_peak_limiter_keeps_pcm16_from_clipping_across_the_pieces(
+        self, tmp_path, monkeypatch
+    ):
+        limiters: list = []
+
+        class RecordingLimiter(pocket_tts.PeakLimiter):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.sizes: list[int] = []
+                limiters.append(self)
+
+            def process(self, x: np.ndarray) -> np.ndarray:
+                self.sizes.append(len(x))
+                return super().process(x)
+
+        monkeypatch.setattr(pocket_tts, "PeakLimiter", RecordingLimiter)
+        # Calibrated at 0.1, so the state's gain is about +3.5 dB; a line at 0.9 then peaks
+        # about 4 dB over full scale, and only the limiter keeps it from hard clipping.
+        model = StreamingModel(stream_pieces=5, seconds=1.0, amplitude=0.1)
+        synth = make_env(tmp_path, model=model).load()
+        model.amplitude = 0.9
+
+        first = collect(synth, segment("One line."))
+        second = collect(synth, segment("Another line."))
+
+        assert [limiter.sizes for limiter in limiters] == [[4800] * 5, [4800] * 5]
+        assert all(limiter.limited_samples > 0 for limiter in limiters)
+        for chunks in (first, second):
+            pcm = np.frombuffer(b"".join(chunk.pcm16 for chunk in chunks), dtype="<i2")
+            assert np.abs(pcm.astype(np.int32)).max() < 32767
+            assert np.abs(pcm.astype(np.int32)).max() > 29000
 
     def test_a_set_token_stops_between_chunks(self, tmp_path):
         env = make_env(tmp_path)
@@ -1035,11 +1330,12 @@ class TestSynthesis:
     def test_a_token_set_before_the_call_makes_no_engine_call(self, tmp_path):
         env = make_env(tmp_path)
         synth = env.load()
+        calls = len(env.library.models[0].generated)
         token = CancelToken()
         token.set()
 
         assert list(synth.synthesize(segment(), token)) == []
-        assert env.library.models[0].generated == []
+        assert len(env.library.models[0].generated) == calls
 
     def test_a_streaming_model_is_read_piece_by_piece_and_stops_on_the_token(self, tmp_path):
         model = StreamingModel(stream_pieces=4, seconds=1.0)
@@ -1063,13 +1359,30 @@ class TestSynthesis:
     @pytest.mark.parametrize("error", [RuntimeError, ValueError, IndexError, TypeError])
     def test_library_errors_become_speech_engine_errors_without_text(self, tmp_path, error):
         text = f"say {SEGMENT_MARK}"
-        model = FakeModel(fail_generate=error(f"cannot say {text}"))
+        model = FakeModel()
         env = make_env(tmp_path, model=model)
         synth = env.load()
+        model.fail_generate = error(f"cannot say {text}")
 
         with pytest.raises(SpeechEngineError) as caught:
             collect(synth, segment(text))
 
+        assert SEGMENT_MARK not in _chain_text(caught.value)
+
+    @pytest.mark.parametrize("error", [RuntimeError, ValueError, IndexError, TypeError])
+    def test_a_stream_error_after_a_piece_raises_without_text_after_its_chunks(
+        self, tmp_path, error
+    ):
+        text = f"say {SEGMENT_MARK}"
+        model = StreamingModel(stream_pieces=4, seconds=1.0)
+        synth = make_env(tmp_path, model=model).load()
+        model.fail_at, model.fail_generate = 2, error(f"cannot say {text}")
+        chunks: list[SynthChunk] = []
+
+        with pytest.raises(SpeechEngineError) as caught:
+            chunks.extend(synth.synthesize(segment(text), CancelToken()))
+
+        assert sum(chunk.samples for chunk in chunks) == RATE // 4
         assert SEGMENT_MARK not in _chain_text(caught.value)
 
 
@@ -1121,9 +1434,11 @@ class TestPrivacy:
         with pytest.raises(VoiceAssetError) as build_error:
             failing.load()
 
-        broken = make_env(tmp_path / "broken", model=FakeModel(fail_generate=RuntimeError("x")))
+        broken_model = FakeModel()
+        broken = make_env(tmp_path / "broken", model=broken_model).load()
+        broken_model.fail_generate = RuntimeError("x")
         with pytest.raises(SpeechEngineError) as synth_error:
-            collect(broken.load(), segment(f"Say {SEGMENT_MARK}."))
+            collect(broken, segment(f"Say {SEGMENT_MARK}."))
 
         assert caplog.records
         _assert_private(caplog.records, TRANSCRIPT_MARK, SEGMENT_MARK)

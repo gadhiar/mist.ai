@@ -25,6 +25,24 @@ the same call, which opens a path with that suffix as a voice state rather than 
 clone. The transcript is never read: Pocket clones from audio alone. The adapter keeps the
 states `ensure_artefacts` returns and never reads the cache again.
 
+Loudness. Each voice state has one gain, measured when its artefacts are built and written
+beside it as `gain.json` (`state`, `gain_db`, `calibration_sha`): the state renders the fixed
+`CALIBRATION_SENTENCES` once per seed in `CALIBRATION_SEEDS`, torch seeded before each render
+set, each set's integrated loudness is measured, and the gain brings the median of the three to
+-20 LUFS, capped at +20 dB (`audio.target_gain_db`). One measured gain per state, rather than one
+per segment, is what lets a segment leave before the engine has finished it. `CALIBRATION_SHA`
+pins the recipe; changing it means bumping `ARTEFACT_VERSION`, so every cached gain rebuilds,
+and `load` refuses a `gain.json` from another recipe.
+
+Streaming. With the model's streaming call, each piece it yields is resampled, scaled by the
+state's gain, passed through a `character.PeakLimiter` and cut into chunks of at most 200 ms
+before the next piece is pulled, so the first chunk leaves after Pocket's first piece. The
+limiter is the one the character stage ends with, one per segment, its state carried across
+the segment's pieces, so a line louder than its state's calibration is limited, not clipped.
+The cancel token is checked after every piece and between chunks, and the engine's stream is
+closed when synthesis stops early. Without the streaming call, `generate_audio` returns the
+whole segment as one piece, which goes through the same steps.
+
 pocket-tts and torch are imported only by `import_pocket`, which `load` is handed, so importing
 this module loads neither and tests pass a fake library.
 """
@@ -32,9 +50,11 @@ this module loads neither and tests pass a fake library.
 import copy
 import hashlib
 import importlib
+import json
 import logging
+import math
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -42,7 +62,8 @@ from typing import Protocol
 import numpy as np
 import yaml
 
-from ..budget import PlacementConfig
+from ..budget import LimiterConfig, PlacementConfig
+from ..character import PeakLimiter
 from ..errors import SpeechEngineError
 from ..speech import (
     NEUTRAL_STATE,
@@ -61,11 +82,14 @@ from ..voice_assets import (
     load_identity,
 )
 from .audio import (
+    MAX_GAIN_DB,
     OUTPUT_RATE,
-    LoudnessNormalizer,
+    TARGET_LUFS,
+    integrated_loudness,
     pcm16_chunks,
     resample,
     speakable_text,
+    target_gain_db,
     to_mono_float,
     to_pcm16,
 )
@@ -78,8 +102,36 @@ REVISION = "db04f0e653473e5c7333c69686ac92b7460b0c1d"
 MODEL_PIN = f"{REPOSITORY}@{REVISION}"
 DEVICE = "cpu"
 THREADS = 4
-ARTEFACT_VERSION = 1
+# 2: `gain.json`, the state's calibrated gain, beside the voice state.
+ARTEFACT_VERSION = 2
 VOICE_STATE_FILE = "voice_state.safetensors"
+GAIN_FILE = "gain.json"
+
+# What every voice state is measured on: plain, public sentences of ordinary length, rendered
+# once per seed. Sampling makes each render's level vary, and three seeds' median holds the
+# gain steady against one loud or quiet render.
+CALIBRATION_SENTENCES = (
+    "The morning train leaves the station at a quarter past eight.",
+    "Please remember to water the plants on the kitchen window sill.",
+    "A cup of warm tea and a quiet hour can make a long evening feel slower.",
+)
+CALIBRATION_SEEDS = (0, 1, 2)
+CALIBRATION_SHA = hashlib.sha256(
+    json.dumps(
+        {
+            "sentences": CALIBRATION_SENTENCES,
+            "seeds": CALIBRATION_SEEDS,
+            "target_lufs": TARGET_LUFS,
+            "max_gain_db": MAX_GAIN_DB,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+).hexdigest()
+"""The calibration recipe's pin, written into each `gain.json` and checked by `load`."""
+
+# The limiter that ends the character stage, at its default settings: a soft knee at -1 dBFS,
+# no look-ahead, so it adds no latency to the first chunk.
+LIMITER = LimiterConfig()
 # Pocket's codec rate. Trained weights at another rate are not the base's architecture.
 MODEL_RATE = 24000
 
@@ -143,13 +195,15 @@ class PocketLibrary:
     """What the adapter needs from pocket-tts and torch, bound once by `import_pocket`.
 
     `load_model` is the model factory: `TTSModel.load_model(config=<path>)`.
-    `set_num_threads` is `torch.set_num_threads`, which is process-wide.
+    `set_num_threads` is `torch.set_num_threads`, which is process-wide. `manual_seed` is
+    `torch.manual_seed`, which seeds the generator Pocket samples from; the calibration seeds it.
     """
 
     load_model: Callable[[Path], PocketModel]
     export_model_state: Callable[[VoiceState, Path], None]
     configs_dir: Path
     set_num_threads: Callable[[int], None]
+    manual_seed: Callable[[int], object]
 
 
 def import_pocket() -> PocketLibrary:
@@ -175,6 +229,7 @@ def import_pocket() -> PocketLibrary:
         export_model_state=package.export_model_state,
         configs_dir=Path(config.CONFIGS_DIR),
         set_num_threads=torch.set_num_threads,
+        manual_seed=torch.manual_seed,
     )
 
 
@@ -268,27 +323,59 @@ def _library_error(action: str, exc: BaseException) -> SpeechEngineError:
     return SpeechEngineError(f"{ENGINE_ID}: {action} failed ({type(exc).__name__})")
 
 
-class PocketVoiceBuilder:
-    """Turns an identity clip into a Pocket voice state file, and reads it back.
+@dataclass(frozen=True, slots=True)
+class PocketVoice:
+    """One speaking state's artefacts: its voice state and the gain it is spoken at."""
 
-    Holds the loaded model, since computing a voice state runs the model's audio encoder.
-    `model_pin` is `MODEL_PIN`, or `MODEL_PIN+<sha256>` for an identity's trained weights.
+    state: VoiceState
+    gain_db: float
+
+
+def _pieces(model: PocketModel, prompt: VoiceState, text: str) -> Generator[np.ndarray, None, None]:
+    """The model's audio for `text` as mono float pieces at its own rate, as it produces them.
+
+    The streaming call's pieces when the model has it, else `generate_audio`'s whole segment
+    as one piece. Closing this closes the engine's stream.
+    """
+    stream = getattr(model, STREAM_METHOD, None)
+    if not callable(stream):
+        yield to_mono_float(model.generate_audio(prompt, text))
+        return
+    pieces = iter(stream(prompt, text))
+    try:
+        for piece in pieces:
+            yield to_mono_float(piece)
+    finally:
+        close = getattr(pieces, "close", None)
+        if callable(close):
+            close()
+
+
+class PocketVoiceBuilder:
+    """Turns an identity clip into a Pocket voice state file and its gain, and reads them back.
+
+    Holds the loaded model, since computing a voice state runs the model's audio encoder and
+    the gain renders speech with it. `model_pin` is `MODEL_PIN`, or `MODEL_PIN+<sha256>` for an
+    identity's trained weights. `manual_seed` seeds the model's sampling before each set of
+    calibration renders.
     """
 
     engine_id = ENGINE_ID
     artefact_version = ARTEFACT_VERSION
 
-    __slots__ = ("_export", "_model", "_model_pin")
+    __slots__ = ("_export", "_manual_seed", "_model", "_model_pin")
 
     def __init__(
         self,
         model: PocketModel,
         export_model_state: Callable[[VoiceState, Path], None],
         *,
+        manual_seed: Callable[[int], object],
         model_pin: str = MODEL_PIN,
     ) -> None:
         self._model = model
         self._export = export_model_state
+        self._manual_seed = manual_seed
         self._model_pin = model_pin
 
     @property
@@ -297,30 +384,106 @@ class PocketVoiceBuilder:
         return self._model_pin
 
     def build(self, clip: VoiceClip, out_dir: Path) -> None:
-        """Compute the clip's voice state and export it; the transcript is not read.
+        """Compute the clip's voice state and export it, then calibrate its gain.
+
+        The transcript is not read. `gain.json` is written last, so a build that fails leaves
+        no gain behind.
 
         Raises:
-            SpeechEngineError: pocket-tts could not compute or write the state.
+            SpeechEngineError: pocket-tts could not compute or write the state, a calibration
+                render failed, or every render is silent; the message names the state.
         """
         try:
             state = self._model.get_state_for_audio_prompt(clip.audio)
             self._export(state, out_dir / VOICE_STATE_FILE)
         except _LIBRARY_ERRORS as exc:
             raise _library_error(f"voice state for state {clip.state!r}", exc) from exc
+        try:
+            levels = [self._calibration_loudness(state, seed) for seed in CALIBRATION_SEEDS]
+        except _LIBRARY_ERRORS as exc:
+            raise _library_error(f"calibrating state {clip.state!r}", exc) from exc
+        loudness = float(np.median(levels))
+        if not math.isfinite(loudness):
+            raise SpeechEngineError(
+                f"{ENGINE_ID}: the calibration renders of state {clip.state!r} are silent"
+            )
+        gain_db = target_gain_db(loudness)
+        gain = {"state": clip.state, "gain_db": gain_db, "calibration_sha": CALIBRATION_SHA}
+        (out_dir / GAIN_FILE).write_text(json.dumps(gain, indent=2) + "\n", encoding="utf-8")
+        logger.info(
+            "%s calibrated state %r at %.1f LUFS: gain %+.1f dB",
+            ENGINE_ID,
+            clip.state,
+            loudness,
+            gain_db,
+        )
 
-    def load(self, artefact_dir: Path) -> VoiceState:
-        """Read the exported voice state.
+    def _calibration_loudness(self, state: VoiceState, seed: int) -> float:
+        """The integrated loudness of every calibration sentence rendered after one seed."""
+        self._manual_seed(seed)
+        rate = int(self._model.sample_rate)
+        renders = [
+            resample(piece, rate)
+            for sentence in CALIBRATION_SENTENCES
+            for piece in _pieces(self._model, state, sentence)
+            if piece.size
+        ]
+        if not renders:
+            return float("-inf")
+        return integrated_loudness(np.concatenate(renders), OUTPUT_RATE)
+
+    def load(self, artefact_dir: Path) -> PocketVoice:
+        """Read the exported voice state and its gain.
 
         Raises:
-            SpeechEngineError: The file is missing or pocket-tts could not read it.
+            SpeechEngineError: A file is missing, `gain.json` is unusable or from another
+                calibration, or pocket-tts could not read the state; the message names the file.
         """
         path = artefact_dir / VOICE_STATE_FILE
         if not path.is_file():
             raise SpeechEngineError(f"{ENGINE_ID}: {VOICE_STATE_FILE} is missing")
+        gain_db = _read_gain(artefact_dir / GAIN_FILE)
         try:
-            return self._model.get_state_for_audio_prompt(path)
+            state = self._model.get_state_for_audio_prompt(path)
         except _LIBRARY_ERRORS as exc:
             raise _library_error(f"reading {VOICE_STATE_FILE}", exc) from exc
+        return PocketVoice(state, gain_db)
+
+
+def _read_gain(path: Path) -> float:
+    """The `gain_db` of a `gain.json` that `build` wrote with this calibration.
+
+    Raises:
+        SpeechEngineError: The file is missing, is not JSON, lacks a field, holds a gain that is
+            not a finite number at most `MAX_GAIN_DB`, or names another calibration.
+    """
+    where = f"{ENGINE_ID}: {GAIN_FILE}"
+    if not path.is_file():
+        raise SpeechEngineError(f"{where} is missing")
+    try:
+        gain = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SpeechEngineError(f"{where} is unreadable ({type(exc).__name__})") from exc
+    if not isinstance(gain, dict):
+        raise SpeechEngineError(f"{where} is not an object")
+    if gain.get("calibration_sha") != CALIBRATION_SHA:
+        raise SpeechEngineError(
+            f"{where} was measured with another calibration; bump ARTEFACT_VERSION when the "
+            "calibration changes, so every gain is rebuilt"
+        )
+    if not isinstance(gain.get("state"), str):
+        raise SpeechEngineError(f"{where} has no `state` string")
+    gain_db = gain.get("gain_db")
+    if (
+        isinstance(gain_db, bool)
+        or not isinstance(gain_db, int | float)
+        or not math.isfinite(gain_db)
+        or gain_db > MAX_GAIN_DB
+    ):
+        raise SpeechEngineError(
+            f"{where} has `gain_db` {gain_db!r}, not a gain of at most {MAX_GAIN_DB:+g} dB"
+        )
+    return float(gain_db)
 
 
 class PocketCloneSynthesizer:
@@ -331,9 +494,9 @@ class PocketCloneSynthesizer:
 
     __slots__ = (
         "_fallbacks_logged",
+        "_gains",
         "_model",
         "_model_id",
-        "_normalizer",
         "_prompts",
         "_released",
         "states",
@@ -343,7 +506,7 @@ class PocketCloneSynthesizer:
     def __init__(
         self,
         model: PocketModel,
-        prompts: Mapping[str, VoiceState],
+        prompts: Mapping[str, PocketVoice],
         voice: VoiceInfo,
         *,
         model_id: str = MODEL_PIN,
@@ -352,10 +515,14 @@ class PocketCloneSynthesizer:
             raise SpeechEngineError(f"{ENGINE_ID}: no voice state for {NEUTRAL_STATE!r}")
         self._model_id = model_id
         self._model: PocketModel | None = model
-        self._prompts: dict[str, VoiceState] = dict(prompts)
+        self._prompts: dict[str, VoiceState] = {
+            state: prompt.state for state, prompt in prompts.items()
+        }
+        self._gains: dict[str, float] = {
+            state: 10.0 ** (prompt.gain_db / 20.0) for state, prompt in prompts.items()
+        }
         self.voice = voice
         self.states: frozenset[str] = frozenset(self._prompts) & SPEAKING_STATES
-        self._normalizer = LoudnessNormalizer()
         self._fallbacks_logged: set[str] = set()
         self._released = False
 
@@ -410,7 +577,9 @@ class PocketCloneSynthesizer:
                 f"voice identity {identity.voice_id!r}: model: the trained weights run at "
                 f"{int(model.sample_rate)} Hz, not {MODEL_RATE} Hz"
             )
-        builder = PocketVoiceBuilder(model, library.export_model_state, model_pin=pin)
+        builder = PocketVoiceBuilder(
+            model, library.export_model_state, manual_seed=library.manual_seed, model_pin=pin
+        )
         prompts = ensure_artefacts(identity, builder, Path(placement.voice_cache_dir))
         voice = VoiceInfo(ENGINE_ID, identity.voice_id, profile)
         synthesizer = cls(model, prompts, voice, model_id=builder.model_pin)
@@ -449,6 +618,7 @@ class PocketCloneSynthesizer:
         self._released = True
         self._model = None
         self._prompts = {}
+        self._gains = {}
         logger.info("%s released voice %r", ENGINE_ID, self.voice.voice)
 
     def _voiced_state(self, requested: str) -> str:
@@ -476,28 +646,31 @@ class PocketCloneSynthesizer:
         text = speakable_text(segment.text, keep_tags=False)
         if not text or token.is_set():
             return
-        model, prompt = self._model, self._prompts[state]
-        pieces = []
+        model, prompt, gain = self._model, self._prompts[state], self._gains[state]
+        rate = int(model.sample_rate)
+        limiter = PeakLimiter(LIMITER, sample_rate=OUTPUT_RATE)
+        pieces = _pieces(model, prompt, text)
         try:
-            stream = getattr(model, STREAM_METHOD, None)
-            if callable(stream):
-                for piece in stream(prompt, text):
-                    pieces.append(to_mono_float(piece))
+            while True:
+                # Only the pull is guarded: an error thrown in at a `yield` is the caller's.
+                try:
+                    piece = next(pieces, None)
+                except _LIBRARY_ERRORS as exc:
+                    # `from None`: the library's message may echo the segment text.
+                    raise _library_error("synthesis", exc) from None
+                if piece is None or token.is_set():
+                    return
+                if not piece.size:
+                    continue
+                samples = limiter.process(resample(piece, rate) * gain)
+                for chunk in pcm16_chunks(to_pcm16(samples), OUTPUT_RATE):
                     if token.is_set():
                         return
-            else:
-                pieces.append(to_mono_float(model.generate_audio(prompt, text)))
-        except _LIBRARY_ERRORS as exc:
-            # `from None`: the library's message may echo the segment text.
-            raise _library_error("synthesis", exc) from None
-        if token.is_set() or not pieces:
-            return
-        samples = resample(np.concatenate(pieces), int(model.sample_rate))
-        pcm = to_pcm16(self._normalizer(samples, OUTPUT_RATE))
-        for chunk in pcm16_chunks(pcm, OUTPUT_RATE):
-            if token.is_set():
-                return
-            yield SynthChunk(pcm16=chunk, samples=len(chunk) // 2, segment=segment, state=state)
+                    yield SynthChunk(
+                        pcm16=chunk, samples=len(chunk) // 2, segment=segment, state=state
+                    )
+        finally:
+            pieces.close()
 
 
 def _model_pin(identity: VoiceIdentity, models_dir: Path) -> str:
