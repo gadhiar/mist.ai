@@ -219,6 +219,29 @@ def test_train_pocket_runtime_tokenizer_is_ungated() -> None:
     assert model["gated"] is False
 
 
+def test_train_pocket_fetches_the_ctc_aligner() -> None:
+    # training/scripts/align_data.py loads this checkpoint with `Wav2Vec2Processor` and
+    # `Wav2Vec2ForCTC.from_pretrained`; the jobs run with HF_HUB_OFFLINE=1, so the fetch carries
+    # every file the two loaders read.
+    model = load()["families"]["train-pocket"]["models"]["wav2vec2-base-960h"]
+    assert model == {
+        "kind": "hf",
+        "repository": "facebook/wav2vec2-base-960h",
+        "revision": "22aad52d435eb6dbaf354bdad9b0da84ce7d6156",
+        "licence": "apache-2.0",
+        "gated": False,
+        "files": [
+            "config.json",
+            "preprocessor_config.json",
+            "feature_extractor_config.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "model.safetensors",
+        ],
+    }
+
+
 def test_higgs_uses_inline_tags_and_omnivoice_only_neutral() -> None:
     families = load()["families"]
     assert {c["control"] for c in families["teacher-higgs3"]["states"].values()} == {"inline-tag"}
