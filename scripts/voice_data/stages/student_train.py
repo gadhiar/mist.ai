@@ -118,11 +118,12 @@ PROBE_VALID_FREQ = 10**9
 CHILD_OOM = 3
 STOP_NAME = "STOP"
 SOURCE_NAME = "source.json"
-# Upstream's log in its run_dir: one JSON object a line. A validation line is marked by
-# `VALID_MARK`'s key and value, and carries the `step` and the validation `loss`. The marker's
-# key is not pinned in the upstream excerpts at ee2ebc89; it is the one place to change.
+# Upstream's log in its run_dir, one JSON object a line, written by `ProgressLog.log(event, step,
+# metrics)` (training/train_utils.py at ee2ebc89) as `{"time", "type": event, "step", "metrics"}`.
+# train.py logs `progress.log("valid", step + 1, valid_metrics)` after each validation, and every
+# forward branch's metrics carry `loss`: `{"type": "valid", "step": S, "metrics": {"loss": L}}`.
 PROGRESS_NAME = "progress.jsonl"
-VALID_MARK = ("kind", "valid")
+VALID_MARK = ("type", "valid")
 CHECKPOINT = "checkpoint"
 MIB = 1 << 20
 _CHECKPOINT_PT = re.compile(r"checkpoint_([0-9]{8})\.pt")
@@ -945,7 +946,8 @@ def valid_losses(run_dir: Path) -> dict[int, float]:
     """Return the validation loss of each step upstream logged in `<run_dir>/progress.jsonl`.
 
     A step logged twice (a stretch was killed after validating and run again) keeps its last
-    line; a line that is not a whole JSON object (a torn last line) is passed over.
+    line; a line that is not a whole JSON object (a torn last line), or has no `metrics` mapping
+    holding a finite `loss`, is passed over.
     """
     try:
         text = (run_dir / PROGRESS_NAME).read_text(encoding="utf-8")
@@ -960,7 +962,10 @@ def valid_losses(run_dir: Path) -> dict[int, float]:
             continue
         if not isinstance(doc, dict) or doc.get(key) != mark:
             continue
-        step, loss = doc.get("step"), doc.get("loss")
+        metrics = doc.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        step, loss = doc.get("step"), metrics.get("loss")
         if isinstance(step, bool) or not isinstance(step, int):
             continue
         if isinstance(loss, bool) or not isinstance(loss, int | float) or not math.isfinite(loss):

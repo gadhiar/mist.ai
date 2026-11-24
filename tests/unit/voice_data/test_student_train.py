@@ -278,10 +278,16 @@ def safetensors_fake(monkeypatch: pytest.MonkeyPatch) -> FakeSafetensorsTorch:
 
 
 def write_valid_line(run_dir: Path, step: int, loss: float) -> None:
-    """Append the line upstream's `validate` logs to `<run_dir>/progress.jsonl`."""
+    """Append the line upstream logs after validating (`ProgressLog.log("valid", ...)`)."""
+    doc = {"time": "2026-11-24 15:00:00+0000", "type": "valid", "step": step,
+           "metrics": {"flow_loss": loss - 0.1, "loss": loss}}  # fmt: skip
+    write_progress_line(run_dir, doc)
+
+
+def write_progress_line(run_dir: Path, doc: dict) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     with (run_dir / "progress.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "valid", "step": step, "loss": loss}) + "\n")
+        handle.write(json.dumps(doc) + "\n")
 
 
 def upstream_save(keep: int) -> object:
@@ -932,6 +938,20 @@ def test_retention_breaks_ties_by_the_earlier_step_and_skips_unvalidated_saves(
     # A new best within the last two releases the old one.
     assert save(8, 0.3) == [7, 8]
     assert stage.best_checkpoint(run, weights)["checkpoint"] == "checkpoint_00000008"  # type: ignore[index]
+
+
+def test_only_a_valid_line_with_a_metrics_loss_is_a_validation_loss(tmp_path: Path) -> None:
+    run, weights = tmp_path / "distill", tmp_path / "weights"
+    for step in (2, 4, 6, 8):
+        (weights / f"checkpoint_{step:08d}").mkdir(parents=True)
+        (weights / f"checkpoint_{step:08d}" / "model.safetensors").write_text("{}", "utf-8")
+    write_valid_line(run, 2, 0.9)
+    # A top-level `loss` with no `metrics`, metrics that are not a mapping, a checkpoint line.
+    write_progress_line(run, {"type": "valid", "step": 4, "loss": 0.1})
+    write_progress_line(run, {"type": "valid", "step": 6, "metrics": [0.1]})
+    write_progress_line(run, {"type": "checkpoint", "step": 8, "metrics": {"loss": 0.1}})
+    assert stage.valid_losses(run) == {2: 0.9}
+    assert stage.best_checkpoint(run, weights)["step"] == 2  # type: ignore[index]
 
 
 def test_best_checkpoint_is_none_without_progress(tmp_path: Path) -> None:
