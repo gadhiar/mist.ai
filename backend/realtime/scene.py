@@ -67,9 +67,11 @@ class ScenePort(Protocol):
     """What the controller calls with scene intents; it also serves as the pacer's listener.
 
     `cancel_turn` comes in the same synchronous step as the turn's purge and drops every intent
-    of the turn still held, so nothing of a cut turn follows its purge. `turn_ended` comes once
-    for a turn that ends without a cut, after its last frame was queued or when it queued none;
-    a port then writes what it still holds of the turn as `Immediate`.
+    of the turn still held, so nothing of a cut turn follows its purge. That purge takes all
+    the turn's queued items, except at the stop of a spoken typed turn whose reply has finished
+    generating, where it takes the frames alone. `turn_ended` comes once for a turn that ends
+    without a cut, after its last frame was queued or when it queued none; a port then writes
+    what it still holds of the turn as `Immediate`.
     """
 
     def phase(self, phase: ScenePhase, *, turn_id: str | None, at: SceneAnchor) -> None:

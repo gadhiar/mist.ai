@@ -859,6 +859,23 @@ class TestLanes:
 
         assert purge == LanePurge(terminal=False, stream_start=True, first_token=0)
 
+    async def test_an_audio_only_purge_takes_the_turns_frames_and_leaves_its_messages(self):
+        rig = await Rig().start()
+        rig.socket.hold()
+        rig.session.send_control({"type": "status", "message": "held"})
+        await settle()
+
+        start = StreamStartMessage(turn_id="t1", channel="tts", origin="text", audio_tag=5)
+        rig.session.send_turn("t1", start, kind="stream_start")
+        rig.session.send_turn("t1", {"type": "stream_token"}, kind="token", token_index=0)
+        end = Frame(msg_type=MsgType.AUDIO_COMPLETE, turn_tag=5, seq=0, sample_rate=24000)
+        rig.session.send_turn("t1", end, terminal=True)
+        purge = rig.session.purge_turn("t1", audio_only=True)
+        full = rig.session.purge_turn("t1")
+
+        assert purge == LanePurge(terminal=True, stream_start=False, first_token=None)
+        assert full == LanePurge(terminal=False, stream_start=True, first_token=0)
+
     async def test_a_full_turn_lane_closes_with_1013_and_commits_the_turn(self):
         rig = await Rig(max_turn_items=2).start()
         rig.socket.hold()

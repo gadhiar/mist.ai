@@ -11,8 +11,10 @@ received, and drains three outbound lanes through one sender:
   full lane means the client stopped reading, so the session closes with 1013.
 - `bulk`: logs and broadcasts, bounded at 512 items, dropping the oldest and counting the drops.
 
-The sender takes one item at a time, so a purge between two takes removes everything the client
-has not been sent yet.
+The sender takes one item at a time, so a purge between two takes removes everything of the turn
+the client has not been sent yet. One cut purges only the turn's binary frames: the stop of a
+spoken typed turn whose reply has finished generating, whose tokens and `stream_complete` the
+client still needs.
 
 A session is bound to an endpoint of a kind: `desktop`, the loopback `/ws`, or `room`, a device
 the listener authenticated. A kind not given is `desktop` for the `desktop` endpoint and `room`
@@ -640,9 +642,12 @@ class RealtimeSession:
         self._schedule_activity_check()
         return True
 
-    def purge_turn(self, turn_id: str) -> LanePurge:
-        """Remove the turn's items the sender has not taken, and report what went."""
-        return self._turn.purge(turn_id)
+    def purge_turn(self, turn_id: str, *, audio_only: bool = False) -> LanePurge:
+        """Remove the turn's items the sender has not taken, and report what went.
+
+        With `audio_only`, only its binary frames go (`TurnLane.purge`).
+        """
+        return self._turn.purge(turn_id, audio_only=audio_only)
 
     def send_bulk(self, item: object) -> None:
         """Queue a log line or broadcast; past the bound the oldest is dropped and counted."""

@@ -2602,7 +2602,10 @@ async def test_a_cut_after_a_typed_turns_stream_ended_fades_and_completes_it(cut
     h.post(Interrupt() if cut == "interrupt" else Text("again"))
     await h.settle()
 
-    assert h.outbound.purges == []
+    # The sender had taken everything, so the audio-only purge found nothing (M11).
+    assert h.outbound.purges == [
+        (turn_id, LanePurge(terminal=False, stream_start=False, first_token=None))
+    ]
     assert "stream_cancelled" not in h.outbound.names()
     assert_one_terminal(h, start.audio_tag)
     assert tag_frames(h, start.audio_tag)[-1] == "0x03"
@@ -2611,6 +2614,61 @@ async def test_a_cut_after_a_typed_turns_stream_ended_fades_and_completes_it(cut
     assert (delivery.outcome, delivery.delivered_text) == ("completed", LONG_REPLY)
     (first_metrics, *_) = metrics(h)
     assert (first_metrics.turn_id, first_metrics.outcome) == (turn_id, "completed")
+    assert h.outbound.violations == []
+
+
+def turn_messages(h: Harness, turn_id: str) -> list[str]:
+    """The client-facing record of one turn's stream messages, in the order taken."""
+    stream = ("stream_start", "stream_token", "stream_complete")
+    return [
+        describe(item)
+        for item in h.outbound.client
+        if describe(item) in stream and turn_id_of_item(item) == turn_id
+    ]
+
+
+@pytest.mark.parametrize("cut", ["interrupt", "text"])
+@pytest.mark.parametrize(
+    ("playback", "terminal_queued"),
+    [
+        pytest.param(PlaybackConfig(), False, id="frames-held-back"),
+        pytest.param(TEST_PLAYBACK, True, id="0x02-queued"),
+    ],
+)
+async def test_a_fade_after_a_typed_turns_stream_ended_leaves_no_frame_behind_its_0x03(
+    cut, playback, terminal_queued
+):
+    """Under backpressure its queued frames go, its text stays, and the `0x03` ends the tag (M11).
+
+    The sender drains `control` first, so a `0x01` left on the `turn` lane would reach the client
+    after the `0x03` and `playback_stop`; a queued `0x02` left there would stand for a clean end
+    the client never got to, and suppress the `0x03`.
+    """
+    h = make_harness([Token(LONG_REPLY)], [Token("Ok.")], playback=playback, auto_take=False)
+    h.post(Text("hello", playback=True))
+    await h.settle()
+    start = queued_start(h)
+    queued = [describe(s.item) for s in h.outbound.sent if s.turn_id == start.turn_id]
+    assert "stream_complete" in queued
+    assert "0x01" in queued
+    assert ("0x02" in queued) is terminal_queued
+
+    h.post(Interrupt() if cut == "interrupt" else Text("again"))
+    await h.settle()
+    h.outbound.take_all()
+
+    (purged_turn, purge) = h.outbound.purges[0]
+    assert purged_turn == start.turn_id
+    assert purge == LanePurge(terminal=terminal_queued, stream_start=False, first_token=None)
+    assert tag_frames(h, start.audio_tag) == ["0x03"]
+    names = h.outbound.names()
+    assert names.index("0x03") < names.index("playback_stop")
+    messages = turn_messages(h, start.turn_id)
+    assert messages == ["stream_start", *["stream_token"] * (len(messages) - 2), "stream_complete"]
+    assert "".join(h.outbound.tokens(start.turn_id)) == LONG_REPLY
+    assert "stream_cancelled" not in names
+    delivery = h.responder.commits[0]
+    assert (delivery.outcome, delivery.delivered_text) == ("completed", LONG_REPLY)
     assert h.outbound.violations == []
 
 

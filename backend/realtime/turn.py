@@ -17,8 +17,10 @@ A turn runs as a small task group the mailbox task owns:
 
 A cut cancels the group, waits for it with the wait shielded, purges the turn's queued `turn`
 items, stops the pacer with the purge's `terminal` in the same synchronous step, and commits
-what the client received. The commit is always the last step of a turn, and a turn is
-committed at most once, whichever path ends it: completion, a cut, `close`, or the mailbox
+what the client received. One cut purges the turn's frames alone: a stop of a spoken typed turn
+whose reply has finished generating, which keeps its queued tokens and `stream_complete` and
+completes the turn with its full text. The commit is always the last step of a turn, and a turn
+is committed at most once, whichever path ends it: completion, a cut, `close`, or the mailbox
 task's own cancellation at server shutdown.
 
 A speculative turn starts held at an `EndpointCandidate`: it generates and synthesizes, but
@@ -240,7 +242,7 @@ class Outbound(Protocol):
 
     The controller never touches a WebSocket. `send_turn` takes a `turn` lane item with the
     `TurnLane.put` keywords and serves as the pacer's turn sink; `purge_turn` removes the turn's
-    queued items and reports what it removed.
+    queued items, or with `audio_only` its binary frames alone, and reports what it removed.
     """
 
     def send_control(self, item: object) -> None:
@@ -258,8 +260,8 @@ class Outbound(Protocol):
         """Queue an item of a turn on the `turn` lane."""
         ...
 
-    def purge_turn(self, turn_id: str) -> LanePurge:
-        """Remove every queued `turn` item of the turn."""
+    def purge_turn(self, turn_id: str, *, audio_only: bool = False) -> LanePurge:
+        """Remove every queued `turn` item of the turn, or with `audio_only` its frames alone."""
         ...
 
 
@@ -3552,8 +3554,10 @@ class TurnController:
         `spoken_text`. Once its reply has finished generating, a stop (`user_interrupt`, which
         a GPU release also posts) or a new typed message (`new_input`) cuts nothing the client
         lacks: the audio is stopped with `0x03` and `playback_stop`, and the turn is completed
-        with its full text. Nothing is purged there, since a purge would take queued tokens and
-        `stream_complete` with the frames.
+        with its full text. That cut purges the turn's frames alone (`audio_only`), in the same
+        synchronous step as the pacer's stop and the scene's `cancel_turn`, so no frame of the
+        tag follows its `0x03`, while its queued tokens and `stream_complete` still reach the
+        client: a full purge would take them, and the purge cannot rebuild them.
         """
         if turn.held:
             await self._cancel_held(turn)
@@ -3570,7 +3574,8 @@ class TurnController:
             turn.token.set()
             await self._cancel_tasks(turn)
             assert turn.pacer is not None  # noqa: S101 - a `tts` turn has its pacer
-            turn.pacer.stop(False, reason=reason)
+            purge = self._outbound.purge_turn(turn.turn_id, audio_only=True)
+            turn.pacer.stop(purge.terminal, reason=reason)
             turn.marks["playback_stopped"] = self._clock.now_ms() + self._playback_config.fade_ms
             self._scene.cancel_turn(turn.turn_id)
             self._scene.phase("idle", turn_id=None, at=Immediate())
