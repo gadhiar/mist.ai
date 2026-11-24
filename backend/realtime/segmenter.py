@@ -14,10 +14,31 @@ sentence punctuation (or, for the first segment, clause punctuation) is cut at i
 Every segment's span locates it in the concatenation of all the turn's Token texts, error text
 included, which is the text the client displays and the playback ledger maps played audio back
 to.
+
+Some of that text is displayed and never spoken: error text, fenced code blocks and Markdown
+table rows. Code read aloud is a string of symbols, and table cells read in order make no
+sentence, so a typed reply's code and tables stay on screen while the voice speaks the prose
+around them. Unspoken text is counted in the spans and never segmented, and prose pending when
+it starts is cut at once, so no segment spans it. The segmenter reads the text a line at a time:
+
+- A fence opens on a line whose first character after any indentation (spaces or tabs) starts
+  a run of three or more backticks or tildes; what follows the run on that line is not checked.
+  It closes on a later line holding, after any indentation, only a run of the same character at
+  least as long as the opening run, then whitespace. An unclosed fence runs to the end of the
+  stream. Every line from the opening to the closing fence is unspoken.
+- A table row is a line, outside a fence, whose first character after any indentation is `|`.
+  A pipe later in a line is prose, and so is a table written without leading pipes.
+
+A line is classified from its first characters, which may arrive in different Tokens. Until
+they show whether the line opens a fence, the line's characters are held back: a line holding
+only indentation and one or two backticks or tildes waits for its next character, or for its
+end, before it is spoken or skipped. Error text ends a line, so the text after it is classified
+as a new line; a fence open before it stays open.
 """
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 
 from ..sentence_detector import SentenceBoundaryDetector, find_clause_boundary
 from .budget import SegmenterConfig
@@ -27,6 +48,37 @@ from .speech import TextSegment
 # `;` or `:` too for the first, each optionally followed by a closing quote or bracket.
 _SENTENCE_END = re.compile(r"""[.!?]["')}\]]?$""")
 _CLAUSE_END = re.compile(r"""[.!?,;:]["')}\]]?$""")
+
+_FENCE_CHARS = "`~"
+_INDENT = " \t"
+
+
+class _Line(Enum):
+    """What a line of reply text is, which decides whether it is spoken."""
+
+    PROSE = "prose"
+    TABLE_ROW = "table_row"
+    FENCE_OPEN = "fence_open"
+    CODE = "code"
+
+
+@dataclass(frozen=True, slots=True)
+class _Fence:
+    """An open fence: its character and the length of its opening run."""
+
+    char: str
+    run: int
+
+
+def _fence_of(line: str) -> _Fence:
+    body = line.lstrip(_INDENT)
+    char = body[0]
+    return _Fence(char, len(body) - len(body.lstrip(char)))
+
+
+def _closes(line: str, fence: _Fence) -> bool:
+    body = line.strip()
+    return len(body) >= fence.run and body == fence.char * len(body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +106,17 @@ class SpeechSegmenter:
         self._config = config
         self._text = ""
         # Start of the text not yet cut into a segment; everything before it is segmented,
-        # error text, or whitespace between segments.
+        # unspoken, or whitespace between segments.
         self._pending_start = 0
+        # End of the prose known to be speakable. The text past it is unspoken, or a line whose
+        # first characters do not yet show what it is.
+        self._spoken_end = 0
         self._next_index = 0
+        # The line being classified: where it starts, what it is once its first characters
+        # show that, and the fence it lies in, if any.
+        self._line_start = 0
+        self._line: _Line | None = None
+        self._fence: _Fence | None = None
 
     @property
     def text(self) -> str:
@@ -73,25 +133,92 @@ class SpeechSegmenter:
 
         Error text is displayed but never spoken: it is counted in the spans and never
         segmented. Text pending when error text arrives is cut at once, so a segment never
-        spans the error text.
+        spans the error text. Code and table rows are skipped the same way, by
+        `_classify_lines`.
         """
         if is_error:
-            segments = self._cut_rest()
+            segments = self._classify_lines(final=True)
+            segments += self._cut_rest()
             self._text += text
-            self._pending_start = len(self._text)
+            self._pending_start = self._spoken_end = self._line_start = len(self._text)
+            self._line = None
             return segments
         self._text += text
-        return self._cut(token_end=text)
+        segments = self._classify_lines(final=False)
+        return segments + self._cut(token_end=text)
 
     def flush(self) -> list[SpeechSegment]:
         """Cut whatever text is still pending at the end of the stream."""
-        return self._cut_rest()
+        segments = self._classify_lines(final=True)
+        return segments + self._cut_rest()
 
-    def _cut(self, token_end: str) -> list[SpeechSegment]:
+    def _classify_lines(self, final: bool) -> list[SpeechSegment]:
+        """Classify the lines fed so far, extend the speakable prose, and skip unspoken lines.
+
+        Prose pending when an unspoken line starts goes through the usual cut rules up to the
+        line's start, and what is left of it is cut there, so no segment spans the line.
+        `final` means no more text follows the last line, so a line still waiting for its
+        first characters is classified as it stands, and its kind is not kept.
+        """
         segments: list[SpeechSegment] = []
         while True:
-            self._skip_whitespace()
-            pending = self._text[self._pending_start :]
+            newline = self._text.find("\n", self._line_start)
+            complete = newline != -1
+            end = newline + 1 if complete else len(self._text)
+            line = self._text[self._line_start : end]
+            kind = self._line if self._line is not None else self._kind_of(line, complete or final)
+            if not final:
+                self._line = kind
+            if kind is None:
+                # A line holding only indentation so far is whitespace, never spoken, so the
+                # prose may run on over it. Backticks or tildes wait until the line shows what
+                # it is.
+                if line.strip():
+                    self._spoken_end = max(self._spoken_end, self._line_start)
+                else:
+                    self._spoken_end = end
+                return segments
+            if kind is _Line.PROSE:
+                self._spoken_end = end
+            else:
+                # No Token ends here, so the Token-end rule is off: an empty `token_end`.
+                segments += self._cut("", limit=self._line_start)
+                segments += self._cut_rest(limit=self._line_start)
+                self._pending_start = self._spoken_end = max(self._pending_start, end)
+                if kind is _Line.FENCE_OPEN:
+                    # Recomputed while the line grows, so the run is the whole opening run.
+                    self._fence = _fence_of(line)
+                elif self._fence is not None and complete and _closes(line, self._fence):
+                    self._fence = None
+            if not complete:
+                return segments
+            self._line_start = end
+            self._line = None
+
+    def _kind_of(self, line: str, complete: bool) -> _Line | None:
+        """What a line is, from its first characters, or None while they cannot tell yet."""
+        if self._fence is not None:
+            return _Line.CODE
+        body = line.lstrip(_INDENT)
+        if body.startswith("|"):
+            return _Line.TABLE_ROW
+        if any(body.startswith(char * 3) for char in _FENCE_CHARS):
+            return _Line.FENCE_OPEN
+        if not complete and (not body or any(body == char * len(body) for char in _FENCE_CHARS)):
+            return None
+        return _Line.PROSE
+
+    def _cut(self, token_end: str, limit: int | None = None) -> list[SpeechSegment]:
+        """Cut the pending prose, up to `limit` or the end of the speakable prose, by the rules.
+
+        `token_end` is the Token just fed, for the Token-end rule; it is empty when the prose is
+        cut short of the Token's end.
+        """
+        end = self._spoken_end if limit is None else limit
+        segments: list[SpeechSegment] = []
+        while True:
+            self._skip_whitespace(limit=end)
+            pending = self._text[self._pending_start : end]
             if not pending:
                 return segments
             cut = self._find_cut(pending, token_end)
@@ -119,12 +246,14 @@ class SpeechSegmenter:
             cut = len(pending)
         return cut
 
-    def _cut_rest(self) -> list[SpeechSegment]:
+    def _cut_rest(self, limit: int | None = None) -> list[SpeechSegment]:
+        """Cut all the pending prose, up to `limit` or the end of the speakable prose."""
+        end = self._spoken_end if limit is None else limit
         segments: list[SpeechSegment] = []
         while True:
-            self._skip_whitespace()
-            pending_chars = len(self._text) - self._pending_start
-            if pending_chars == 0:
+            self._skip_whitespace(limit=end)
+            pending_chars = end - self._pending_start
+            if pending_chars <= 0:
                 return segments
             segments += self._emit(pending_chars)
 
@@ -169,7 +298,6 @@ class SpeechSegmenter:
         self._pending_start = start + length
         return segment
 
-    def _skip_whitespace(self, limit: int | None = None) -> None:
-        end = len(self._text) if limit is None else limit
-        while self._pending_start < end and self._text[self._pending_start].isspace():
+    def _skip_whitespace(self, limit: int) -> None:
+        while self._pending_start < limit and self._text[self._pending_start].isspace():
             self._pending_start += 1
