@@ -81,6 +81,14 @@ every `docker run` of the family:
 The values are estimates, not measurements; replace each with a measured peak once the family has
 run. A family without a key runs without that cap.
 
+A job may also set its own stop grace (`JobSpec.stop_timeout_s`, recorded as `stop_timeout_s` in
+`runs/<job_id>/job.json`). When it is set, the local executor adds `--stop-timeout <n>` after the
+family caps; when it is `null`, the argv is unchanged and Docker's default grace of 10 s between
+SIGTERM and SIGKILL applies. A training job saves a checkpoint on SIGTERM, but first finishes the
+optimizer step under way, and the step and the save together can outlast 10 s. `student train`
+sets it to `max(120, ceil(2 x (1 / steps_per_s + save_s)) + 30)` seconds from the run's
+`probe.json`, and refuses a probe without `save_s`.
+
 ## Devices and VRAM (estimates)
 
 `devices` and `vram_gb` in `families.json` are estimates from model sizes, not measurements:

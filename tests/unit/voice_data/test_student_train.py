@@ -525,9 +525,12 @@ def read(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+ABSENT = object()
+
+
 def write_probe(
     root: root_mod.Root, *, batch: int | None = 4, steps_per_s: float = 0.025,
-    peak: float = 7600.0, corpus: str = CORPUS,
+    peak: float = 7600.0, corpus: str = CORPUS, save_s: object = 2.0,
 ) -> None:  # fmt: skip
     doc = {
         "schema": 1, "run": RUN, "corpus": corpus, "batch": batch,
@@ -535,6 +538,8 @@ def write_probe(
         "free_vram_mib": float(FREE_MIB), "steps_per_s": steps_per_s, "projected_hours": 1.0,
         "steps": {"finetune": 8000, "distill": 20000}, "trials": [],
     }  # fmt: skip
+    if save_s is not ABSENT:
+        doc["save_s"] = save_s
     write_json(root, f"students/{RUN}/probe.json", doc)
 
 
@@ -1106,6 +1111,14 @@ def test_train_refuses_differing_tokenizers(root: root_mod.Root, hub: Hub, clone
             lambda r: write_probe(r), ("--resume",), "no training to resume", id="resume-nothing"
         ),
         pytest.param(lambda r: write_probe(r), ("--steps-distill", "0"), "at least 1", id="steps"),
+        pytest.param(
+            lambda r: write_probe(r, save_s=ABSENT), (), f"students/{RUN}/probe.json has no save_s",
+            id="no-save-s",
+        ),  # fmt: skip
+        pytest.param(
+            lambda r: write_probe(r, save_s=None), (), f"students/{RUN}/probe.json has no save_s",
+            id="null-save-s",
+        ),  # fmt: skip
     ],
 )
 def test_train_refusals_exit_2(
@@ -1117,6 +1130,33 @@ def test_train_refusals_exit_2(
     assert result.code == 2
     assert message in result.err
     assert not result.docker.argvs
+
+
+@pytest.mark.parametrize(
+    ("steps_per_s", "save_s", "grace"),
+    [
+        # 2 x (1 / 0.025 + 2.0) + 30 = 114, under the floor.
+        pytest.param(0.025, 2.0, 120, id="floor"),
+        # ceil(2 x (100 + 3.4)) + 30 = 207 + 30.
+        pytest.param(0.01, 3.4, 237, id="measured"),
+    ],
+)
+def test_train_job_stop_grace_comes_from_the_probe(
+    root: root_mod.Root, hub: Hub, clone: Path, steps_per_s: float, save_s: float, grace: int
+) -> None:
+    write_probe(root, steps_per_s=steps_per_s, save_s=save_s)
+    result = train(root, clone, "--steps-finetune", "1", "--steps-distill", "1")
+    assert result.code == 0, result.err + result.log
+    assert result.job["stop_timeout_s"] == grace
+    argv = result.docker.argvs[0]
+    assert argv[argv.index("--stop-timeout") + 1] == str(grace)
+
+
+def test_probe_job_has_no_stop_grace(root: root_mod.Root, hub: Hub, clone: Path) -> None:
+    result = probe(root, clone)
+    assert result.code == 0, result.err + result.log
+    assert result.job["stop_timeout_s"] is None
+    assert "--stop-timeout" not in result.docker.argvs[0]
 
 
 def test_probe_refuses_a_run_that_started_training(
@@ -1137,6 +1177,9 @@ def test_contract_helpers() -> None:
     assert student_cmd.checkpoint_every(0.1) == 120
     assert student_cmd.checkpoint_every(0.0001) == 1
     assert student_cmd.vram_gb_for(7000.0) == 7.4
+    assert student_cmd.stop_timeout_for(0.025, 2.0) == 120
+    assert student_cmd.stop_timeout_for(0.01, 3.4) == 237
+    assert student_cmd.stop_timeout_for(0.005, 0.0) == 430
     assert student_cmd.weights_rel(RUN, "checkpoint_00002500") == (
         f"students/{RUN}/checkpoints/weights/checkpoint_00002500/model.safetensors"
     )

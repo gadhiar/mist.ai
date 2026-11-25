@@ -27,7 +27,9 @@ whenever a checkpoint is late, so one lands at least every `CHECKPOINT_MAX_MINUT
 resumed run keeps the steps it was planned with unless they are given again. `--until HH:MM` is
 host local time; the job receives it as `--deadline-utc` (`deadline.py`). At the deadline, or on
 SIGTERM, the job has the trainer save a checkpoint and exits 0 with `status: paused`;
-`--resume` continues from the newest checkpoint. Each stage keeps its last `--keep-last`
+`--resume` continues from the newest checkpoint. Docker waits `stop_timeout_for` the probe's
+rate and `save_s` between SIGTERM and SIGKILL, so that save finishes; a probe without `save_s`
+is refused. Each stage keeps its last `--keep-last`
 checkpoints (default `KEEP_LAST`, upstream's `num_ckpt_keep`, which replaces
 `depth_distill.yaml`'s 999), and a resumed run keeps the number it was planned with unless it is
 given again. Validation runs at every checkpoint interval over the validation split's whole
@@ -120,6 +122,10 @@ CHECKPOINT_TARGET_MINUTES = 20
 CHECKPOINT_MAX_MINUTES = 30
 # Checkpoints each stage keeps (upstream's `num_ckpt_keep`); the best distill weights are kept too.
 KEEP_LAST = 3
+# A training job's stop grace (`JobSpec.stop_timeout_s`), in seconds: twice one optimizer step
+# and the longest save the probe timed, plus a margin, and never under the floor.
+STOP_GRACE_FLOOR_S = 120
+STOP_GRACE_MARGIN_S = 30
 FINETUNE, DISTILL = "finetune", "distill"
 STAGES = (FINETUNE, DISTILL)
 RUNNING, PAUSED, DONE = "running", "paused", "done"
@@ -234,6 +240,16 @@ def checkpoint_every(steps_per_s: float) -> int:
 def vram_gb_for(peak_vram_mib: float) -> float:
     """Return the preflight need of a training job: the probe's peak plus the headroom."""
     return math.ceil((peak_vram_mib + HEADROOM_MIB) / 1024 * 10) / 10
+
+
+def stop_timeout_for(steps_per_s: float, save_s: float) -> int:
+    """Return a training job's stop grace from the probe's rate and its longest timed save.
+
+    On SIGTERM the trainer finishes the optimizer step under way, then saves, so the grace
+    covers a step and a save twice over plus a margin; Docker's default of 10 s covers neither.
+    """
+    need = math.ceil(2 * (1 / steps_per_s + save_s)) + STOP_GRACE_MARGIN_S
+    return max(STOP_GRACE_FLOOR_S, need)
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -484,6 +500,12 @@ def _read_probe(root: root_mod.Root, run_id: str, corpus: str) -> Mapping[str, o
     for value in (batch, rate, peak):
         if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
             raise InputError(f"refused: run {run_id}'s probe is incomplete")
+    save_s = probe.get("save_s")
+    if isinstance(save_s, bool) or not isinstance(save_s, int | float) or save_s < 0:
+        # A probe written before it timed saves, or one that timed none: no stop grace to size.
+        raise InputError(
+            f"refused: {run_rel(run_id)}/{PROBE_NAME} has no save_s; run student probe again"
+        )
     return probe
 
 
@@ -576,6 +598,7 @@ def run_train(args: argparse.Namespace) -> int:
         gpu=True,
         network=False,
         vram_gb=vram,
+        stop_timeout_s=stop_timeout_for(rate, float(probe["save_s"])),  # type: ignore[arg-type]
     )
     train = _run_job(root, job, TRAIN_NAME)
     for line in train_lines(args.run, train):
