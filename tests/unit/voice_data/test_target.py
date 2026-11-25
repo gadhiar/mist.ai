@@ -17,7 +17,7 @@ import functools
 import importlib
 import json
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +29,8 @@ from scripts.voice_data import root as root_mod
 from scripts.voice_data import target as target_mod
 from scripts.voice_data.bindings.protocols import Word
 from scripts.voice_data.commands import target as target_cmd
+from scripts.voice_data.commands import teacher as teacher_cmd
+from scripts.voice_data.errors import InputError
 from scripts.voice_data.records import (
     Prosody,
     SegmentRecord,
@@ -603,6 +605,152 @@ def test_no_transcript_reaches_output_or_a_written_file_through_export_and_check
     changed = _changed_files(seed_built.root, before)
     assert any(p.name == "voice.json" for p in changed)
     _assert_no_canary_in_files(changed)
+
+
+# A labelled seed (schema-2 clean plan): neutral's entry is always written.
+
+LABELLED_CALM = tuple(range(20, 24))
+UNPROJECTED_K = 26
+
+
+def plan_label(state: str | None) -> dict[str, object]:
+    return {
+        "voices": "her", "energy": 3, "mood": 3, "tags": [], "keep_from_s": None,
+        "keep_to_s": None, "state": state, "removed": None, "carried_from": [],
+    }  # fmt: skip
+
+
+def labelled_record(k: int, state: str | None) -> SegmentRecord:
+    # Extract proposed `calm` for every clip; a labelled clip's state never falls back to it.
+    return replace(record(k, "calm"), state=state)
+
+
+def write_labelled_seed(root: root_mod.Root, neutral_n: int) -> list[tuple[int, str | None]]:
+    """Write clean run `c1` (schema 2) with `neutral_n` neutral clips, 4 calm and one null."""
+    segs: list[tuple[int, str | None]] = [(k, "neutral") for k in range(neutral_n)]
+    segs += [(k, "calm") for k in LABELLED_CALM] + [(UNPROJECTED_K, None)]
+    records = []
+    for k, state in segs:
+        path = root.path / f"seed/runs/c1/audio/{sid(k)}.flac"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(path), voice(k, seconds(k)), RATE, format="FLAC", subtype="PCM_24")
+        records.append(labelled_record(k, state))
+    write_jsonl(root, "seed/runs/c1/segments.jsonl", records)
+    run = root.path / "seed" / "runs" / "c1"
+    plan = {"schema": 2, "run": "c1", "from": "r1", "target": "t1", "thresholds": {},
+            "labels": {sid(k): plan_label(state) for k, state in segs}}  # fmt: skip
+    (run / "clean-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    states = {s: {"members": 0, "eligible": 0, "short": True, "refs": []} for s in SPEAKING}
+    refs_doc = {"schema": 1, "run": "c1", "target": "t1", "medians": {}, "states": states}
+    (run / "refs.json").write_text(json.dumps(refs_doc), encoding="utf-8")
+    return segs
+
+
+SPEAKING = ("neutral", "calm", "awake", "sleepy", "excited")
+NEUTRAL_ONLY = {"neutral": SEEDLIKE["neutral"]}
+
+
+@functools.cache
+def labelled_build(base: Path, neutral_n: int, identity: bool) -> Built:
+    root = root_mod.init_root(base / f"n{neutral_n}-{int(identity)}" / "voice-root", "private")
+    write_labelled_seed(root, neutral_n)
+    if identity:
+        make_identity(root.path / "voices", "mist-neutral", identity_clips(NEUTRAL_ONLY))
+        return build(root, "--seed-run", "c1", "--identity", "mist-neutral")
+    return build(root, "--seed-run", "c1")
+
+
+@pytest.fixture(scope="module")
+def labelled_base(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("labelled")
+
+
+def expected_profile(members: Sequence[Prosody]) -> tuple[dict[str, float], dict[str, float]]:
+    fields = ("f0_mean_hz", "f0_std_hz", "rate_sps", "energy_db")
+    return (
+        {f: float(np.median([getattr(p, f) for p in members])) for f in fields},
+        {f: float(np.std([getattr(p, f) for p in members])) for f in fields},
+    )
+
+
+@pytest.mark.parametrize("identity", [False, True])
+@pytest.mark.parametrize("neutral_n", [0, 3, 5])
+def test_neutral_is_always_written_with_a_profile_that_has_a_spread(
+    labelled_base: Path, neutral_n: int, identity: bool
+) -> None:
+    built = labelled_build(labelled_base, neutral_n, identity)
+    assert built.code == 0, built.err
+    found = built.record()
+    assert found.mode == ("seed+identity" if identity else "seed")
+    neutral = found.states["neutral"]
+    assert neutral["n"] == neutral_n
+    floor_from = {0: "pooled-offset", 3: "pooled-offset", 5: "thin"}[neutral_n]
+    assert neutral["floor_from"] == floor_from
+    if neutral_n < 5:
+        # Pooled over every seed clip, the null-state one included, never the identity clip.
+        members = [prosody_of(k) for k in range(neutral_n)]
+        members += [prosody_of(k) for k in (*LABELLED_CALM, UNPROJECTED_K)]
+        assert neutral["profile_from"] == "pooled"
+    else:
+        members = [prosody_of(k) for k in range(neutral_n)]
+        assert neutral["profile_from"] == "state"
+    profile, spread = expected_profile(members)
+    assert neutral["profile"] == pytest.approx(profile, abs=1e-6)
+    assert neutral["spread"] == pytest.approx(spread, abs=1e-6)
+    assert all(value > 0 for value in neutral["spread"].values())
+    assert f"state neutral: n {neutral_n}, floor {floor_from}" in built.out
+    assert "profile " + neutral["profile_from"] in built.out
+
+
+def test_a_null_state_joins_the_pooled_figures_and_no_states(labelled_base: Path) -> None:
+    found = labelled_build(labelled_base, 5, False).record()
+    assert set(found.states) == {"neutral", "calm"}
+    assert found.distribution["wavlm-sv"]["n"] == 5 + len(LABELLED_CALM) + 1
+    assert found.states["calm"]["n"] == len(LABELLED_CALM)
+    assert found.states["calm"]["profile_from"] == "state"
+    profile, _ = expected_profile([prosody_of(k) for k in LABELLED_CALM])
+    assert found.states["calm"]["profile"] == pytest.approx(profile, abs=1e-6)
+
+
+def test_read_seed_keeps_a_labelled_null_state(labelled_base: Path) -> None:
+    root = labelled_build(labelled_base, 3, False).root
+    seed = target_mod.read_seed(root, "c1", "t1")
+    states = {r.segment_id: seed.state_of(r) for r in seed.segments}
+    assert states[sid(UNPROJECTED_K)] is None and states[sid(0)] == "neutral"
+    assert all(isinstance(r, SegmentRecord) for r in seed.segments)
+    plan = target_mod.plan(target_id="t1", seed=seed, identity=None, thresholds={})
+    by_id = {row["segment_id"]: row["state"] for row in plan["segments"]}  # type: ignore[union-attr]
+    assert by_id[sid(UNPROJECTED_K)] is None
+
+
+def test_read_seed_refuses_a_state_outside_the_speaking_states(tmp_path: Path) -> None:
+    root = root_mod.init_root(tmp_path / "voice-root", "private")
+    write_labelled_seed(root, 3)
+    path = root.path / "seed/runs/c1/segments.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["state"] = "bogus"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    with pytest.raises(InputError, match="not a speaking state"):
+        target_mod.read_seed(root, "c1", "t1")
+
+
+def test_a_schema_1_seed_still_falls_back_to_the_proposed_state(seed_built: Built) -> None:
+    seed = target_mod.read_seed(seed_built.root, "c1", "t1")
+    assert not seed.labelled
+    unset = replace(seed.segments[0], state=None)
+    assert seed.state_of(unset) == unset.state_proposed == "neutral"
+    assert seed_built.record().states["neutral"]["profile_from"] == "state"
+
+
+def test_the_teacher_and_student_read_neutral_from_a_seed_with_none(labelled_base: Path) -> None:
+    built = labelled_build(labelled_base, 0, False)
+    floor = teacher_cmd.seed_floor(built.root, "t1", "t1")
+    assert set(floor.floor) == set(EMBEDDERS)
+    assert floor.profile is not None and floor.spread is not None
+    assert all(value > 0 for value in floor.spread.values())
+    # `student.seed_reference` reads this field of neutral's profile.
+    profile = built.record().states["neutral"]["profile"]
+    assert isinstance(profile["f0_std_hz"], float) and profile["f0_std_hz"] > 0
 
 
 def test_the_mode_rule_itself() -> None:
