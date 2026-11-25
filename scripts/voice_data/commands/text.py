@@ -1,11 +1,13 @@
-"""`text build --version V --sources DIR [--assistant-lines FILE]`: the teacher's script.
+"""`text build --version V --sources DIR [--assistant-lines FILE] [--lines-max N]`: the script.
 
 Merges the public transcripts under `--sources` (a rehearsal root's `public/`, holding
-`librittsr/` and `expresso/`) with the committed assistant-register lines, holds out the ear-test
-lines, drops every line an earlier version under the root's `text/` holds and every line shorter
-than the `text.line_chars_min` gate, and writes `text/<V>/lines.jsonl` and `text/<V>/summary.json`
-in the root. Output names counts, version names, source names and root-relative paths only: never
-a line's text or a source path.
+`librittsr/` and `expresso/`; every LibriTTS-R subset folder present under
+`librittsr/LibriTTS_R/` is read, test-clean first) with the committed assistant-register lines,
+holds out the ear-test lines, drops every line an earlier version under the root's `text/` holds
+and every line shorter than the `text.line_chars_min` gate, keeps at most `--lines-max` lines,
+and writes `text/<V>/lines.jsonl` and `text/<V>/summary.json` in the root. Output names counts,
+version names, source and subset names and root-relative paths only: never a line's text or a
+source path.
 """
 
 from __future__ import annotations
@@ -31,11 +33,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "build",
         help="merge the public transcripts and the assistant lines into one neutral script",
         description=(
-            "Merge LibriTTS-R test-clean and Expresso's read transcriptions with the assistant "
-            "lines; drop, in this order, lines that overlap an ear-test line, lines whose id or "
-            "text an earlier version under text/ holds, lines shorter than the "
+            "Merge every LibriTTS-R subset present under librittsr/LibriTTS_R/ (in the order "
+            f"{', '.join(text_corpus.LIBRITTSR_SUBSETS)}; any other folder there is refused) "
+            "and Expresso's read transcriptions with the assistant lines; drop, in this order, "
+            "lines that overlap an ear-test line, lines whose id or text an earlier version "
+            "under text/ holds, lines shorter than the "
             f"{text_corpus.LINE_CHARS_GATE} gate or longer than {text_corpus.MAX_CHARS} chars, "
-            "and duplicates; write text/<V>/lines.jsonl and text/<V>/summary.json."
+            "duplicates, and with --lines-max N all but the N lines whose sha256 of the line id "
+            "sorts first; write text/<V>/lines.jsonl and text/<V>/summary.json."
         ),
     )
     build.add_argument("--version", required=True, help="the script version, a folder under text")
@@ -49,6 +54,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         default=str(text_corpus.ASSISTANT_LINES_PATH),
         help="the assistant-register lines, JSONL (default: the committed text_lines.jsonl)",
     )
+    build.add_argument(
+        "--lines-max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="keep at most N lines (at least 1), chosen by the sha256 of each line id and "
+        "written in source order (default: no cap)",
+    )
     build.set_defaults(func=run_build)
 
 
@@ -60,6 +73,7 @@ def run_build(args: argparse.Namespace) -> int:
     version_dir = f"{text_corpus.TEXT_DIR}/{args.version}"
     if (root.path / version_dir).exists():
         raise InputError(f"refused: {version_dir} already exists; choose a new version")
+    text_corpus.check_lines_max(args.lines_max)
     line_chars_min = text_corpus.line_chars_gate(gates.load(root.path))
     sources = Path(args.sources)
     if not sources.is_dir():
@@ -70,6 +84,8 @@ def run_build(args: argparse.Namespace) -> int:
         text_corpus.HoldOut(text_corpus.load_ear_test()),
         earlier,
         line_chars_min=line_chars_min,
+        lines_max=args.lines_max,
+        subsets=text_corpus.librittsr_subsets(sources),
     )
     lines = write_jsonl(root, f"{version_dir}/{text_corpus.LINES_NAME}", corpus.rows())
     summary = write_json(root, f"{version_dir}/{text_corpus.SUMMARY_NAME}", corpus.summary())

@@ -12,14 +12,20 @@ first teacher run kept a take far more often for long lines than for short ones;
 the floor any gate value must respect.
 
 The public sources are read from the folder a rehearsal root keeps them in (`public/`): one
-LibriTTS-R test-clean utterance per `.normalized.txt` file, and Expresso's
-`read_transcriptions.txt` (`<utterance id><TAB><text>` per line). Either may be absent; the build
-counts it as 0 and refuses only when both are. The source texts are public, but they are still
-never printed, so the command's output stays counts and root-relative paths alone.
+LibriTTS-R utterance per `.normalized.txt` file, from each of the seven subset folders present
+under `librittsr/LibriTTS_R/` in the fixed order of `LIBRITTSR_SUBSETS` (test-clean first, so a
+root grows its text by placing folders), and Expresso's `read_transcriptions.txt`
+(`<utterance id><TAB><text>` per line). Either source may be absent; the build counts it as 0 and
+refuses only when both are. Any other folder under `LibriTTS_R/` is refused rather than skipped,
+so a misnamed subset cannot silently drop out. With `lines_max`, the build keeps the lines whose
+sha256 of the line id sorts first, a choice that depends only on the ids, so the same inputs give
+the same file. The source texts are public, but they are still never printed, so the command's
+output stays counts and root-relative paths alone.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -33,7 +39,18 @@ from .states import NEUTRAL_STATE
 
 ASSISTANT_LINES_PATH = Path(__file__).with_name("text_lines.jsonl")
 EAR_TEST_PATH = Path(__file__).resolve().parents[1] / "model_bench" / "speech" / "lines.json"
-LIBRITTSR_DIR = ("librittsr", "LibriTTS_R", "test-clean")
+LIBRITTSR_DIR = ("librittsr", "LibriTTS_R")
+# The seven LibriTTS-R subsets, in the order the build reads them: test-clean, the v1 source,
+# first, then the held-out subsets, then the training subsets.
+LIBRITTSR_SUBSETS = (
+    "test-clean",
+    "dev-clean",
+    "test-other",
+    "dev-other",
+    "train-clean-100",
+    "train-clean-360",
+    "train-other-500",
+)
 LIBRITTSR_SUFFIX = ".normalized.txt"
 EXPRESSO_FILE = ("expresso", "expresso", "read_transcriptions.txt")
 
@@ -63,18 +80,24 @@ _ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 @dataclass(frozen=True, slots=True)
 class SourceLine:
-    """One candidate line: its source, its id in the output, and its raw text."""
+    """One candidate line: its source, its id in the output, its raw text, and its subset.
+
+    `subset` names the LibriTTS-R subset folder a LibriTTS-R line came from; other sources have
+    none.
+    """
 
     source: str
     line_id: str
     text: str
+    subset: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Corpus:
     """The kept lines and the counts of what the rules dropped.
 
-    Each drop count is of its own rule, in the order the rules run.
+    Each drop count is of its own rule, in the order the rules run. Every count of kept lines
+    (`lines`, `sources`, `librittsr_subsets`) is of the lines written, after the cap.
 
     Attributes:
         lines: Kept lines, cleaned, in source order.
@@ -84,7 +107,10 @@ class Corpus:
         dropped_earlier: Lines dropped because an earlier version holds their id or text.
         dropped_length: Lines dropped for a cleaned length outside `line_chars_min`-`MAX_CHARS`.
         dropped_duplicates: Lines dropped as a normalised duplicate of an earlier kept line.
+        lines_max: The cap on kept lines, or None for no cap.
+        dropped_cap: Lines the rules kept that the cap dropped.
         sources: Kept lines per source; a missing source counts 0.
+        librittsr_subsets: Kept lines per LibriTTS-R subset present, in `LIBRITTSR_SUBSETS` order.
         missing: The sources that were absent.
     """
 
@@ -95,7 +121,10 @@ class Corpus:
     dropped_earlier: int
     dropped_length: int
     dropped_duplicates: int
+    lines_max: int | None
+    dropped_cap: int
     sources: Mapping[str, int]
+    librittsr_subsets: Mapping[str, int]
     missing: tuple[str, ...]
 
     def rows(self) -> list[dict[str, str]]:
@@ -117,23 +146,29 @@ class Corpus:
             "dropped_earlier": self.dropped_earlier,
             "dropped_length": self.dropped_length,
             "dropped_duplicates": self.dropped_duplicates,
+            "lines_max": self.lines_max,
+            "dropped_cap": self.dropped_cap,
             "sources": dict(self.sources),
+            "librittsr_subsets": dict(self.librittsr_subsets),
         }
 
     def report_lines(self) -> list[str]:
-        """Return the printed summary: counts, version names and source names only."""
+        """Return the printed summary: counts, version names, source and subset names only."""
         summary = self.summary()
+        cap = "no --lines-max" if self.lines_max is None else f"over --lines-max {self.lines_max}"
         out = [
             f"text: {summary['lines']} lines, {summary['chars']} chars",
             f"earlier versions: {', '.join(self.earlier_versions) or 'none'}",
             f"held out (ear-test overlap): {self.held_out}",
             f"dropped: {self.dropped_earlier} in an earlier version, {self.dropped_length} "
             f"outside {self.line_chars_min}-{MAX_CHARS} chars, {self.dropped_duplicates} "
-            "duplicates",
+            f"duplicates, {self.dropped_cap} {cap}",
         ]
         for name in SOURCE_ORDER:
             state = "missing, 0 lines" if name in self.missing else f"{self.sources[name]} lines"
             out.append(f"source {name}: {state}")
+        for subset, count in self.librittsr_subsets.items():
+            out.append(f"librittsr subset {subset}: {count} lines")
         return out
 
 
@@ -220,22 +255,47 @@ def _source_id(source: str, raw: str) -> str:
     return f"{source}-{_ID_UNSAFE.sub('_', raw)}"
 
 
-def read_librittsr(sources: Path) -> list[SourceLine] | None:
-    """Return LibriTTS-R test-clean's utterances in path order, or None when absent.
+def librittsr_subsets(sources: Path) -> tuple[str, ...]:
+    """Return the LibriTTS-R subset folders present under `sources`, in `LIBRITTSR_SUBSETS` order.
+
+    Files beside the subset folders (a download's notes and tables) are not read.
 
     Raises:
-        InputError: A transcript is unreadable.
+        InputError: A folder under `librittsr/LibriTTS_R/` is not a LibriTTS-R subset name.
     """
     base = sources.joinpath(*LIBRITTSR_DIR)
     if not base.is_dir():
+        return ()
+    present = {entry.name for entry in base.iterdir() if entry.is_dir()}
+    if present - set(LIBRITTSR_SUBSETS):
+        raise InputError(
+            "refused: a folder under librittsr/LibriTTS_R is not one of the LibriTTS-R subsets "
+            f"{', '.join(LIBRITTSR_SUBSETS)}"
+        )
+    return tuple(name for name in LIBRITTSR_SUBSETS if name in present)
+
+
+def read_librittsr(sources: Path) -> list[SourceLine] | None:
+    """Return the utterances of every LibriTTS-R subset present, or None when none is.
+
+    Subsets come in `LIBRITTSR_SUBSETS` order and each subset's files in path order.
+
+    Raises:
+        InputError: A folder there is not a subset name, or a transcript is unreadable.
+    """
+    subsets = librittsr_subsets(sources)
+    if not subsets:
         return None
+    base = sources.joinpath(*LIBRITTSR_DIR)
     return [
         SourceLine(
             source=LIBRITTSR,
             line_id=_source_id(LIBRITTSR, path.name[: -len(LIBRITTSR_SUFFIX)]),
             text=_read_text(path, "LibriTTS-R transcript"),
+            subset=subset,
         )
-        for path in sorted(base.glob(f"*/*/*{LIBRITTSR_SUFFIX}"))
+        for subset in subsets
+        for path in sorted((base / subset).glob(f"*/*/*{LIBRITTSR_SUFFIX}"))
     ]
 
 
@@ -362,29 +422,36 @@ def build(
     earlier: EarlierVersions,
     *,
     line_chars_min: int,
+    lines_max: int | None = None,
+    subsets: Sequence[str] = (),
 ) -> Corpus:
-    """Apply the rules in order: hold-out, earlier versions, length, then duplicates.
+    """Apply the rules in order: hold-out, earlier versions, length, duplicates, then the cap.
 
     The hold-out runs first so `held_out` counts every overlapping line, whatever its length or
     version; the earlier versions run before the length so `dropped_earlier` counts every line a
-    version already holds.
+    version already holds. The cap runs last, so it chooses among lines every other rule kept.
 
     Args:
         sources: Each source's lines, or None for a missing source.
         hold_out: The ear-test lines.
         earlier: What the root's earlier text versions hold.
         line_chars_min: The shortest cleaned line kept, from `line_chars_gate`.
+        lines_max: Keep at most this many lines, those whose sha256 of the line id sorts first,
+            in source order; None keeps every line.
+        subsets: The LibriTTS-R subsets present, from `librittsr_subsets`, so a subset whose
+            every line was dropped still reports 0. A subset a line names is reported as well.
 
     Raises:
         InputError: Both public sources are missing, `line_chars_min` is outside
-            `MIN_CHARS`-`MAX_CHARS`, or two kept lines share an id.
+            `MIN_CHARS`-`MAX_CHARS`, `lines_max` is below 1, or two kept lines share an id.
     """
     if not MIN_CHARS <= line_chars_min <= MAX_CHARS:
         raise InputError(f"refused: the shortest line must be {MIN_CHARS}-{MAX_CHARS} chars")
+    check_lines_max(lines_max)
     if all(sources.get(name) is None for name in PUBLIC_SOURCES):
         raise InputError("refused: neither LibriTTS-R nor Expresso is under --sources")
     kept: list[SourceLine] = []
-    counts = {name: 0 for name in SOURCE_ORDER}
+    present = set(subsets) | {line.subset for line in sources.get(LIBRITTSR) or () if line.subset}
     missing: list[str] = []
     seen_text: set[str] = set()
     seen_ids: set[str] = set()
@@ -413,19 +480,54 @@ def build(
                 raise InputError(f"refused: two {name} lines share one id")
             seen_text.add(key)
             seen_ids.add(line.line_id)
-            kept.append(SourceLine(line.source, line.line_id, text))
-            counts[name] += 1
+            kept.append(SourceLine(line.source, line.line_id, text, line.subset))
+    written = _cap(kept, lines_max)
+    counts = {name: 0 for name in SOURCE_ORDER}
+    per_subset = {name: 0 for name in LIBRITTSR_SUBSETS if name in present}
+    for line in written:
+        counts[line.source] += 1
+        if line.subset is not None:
+            per_subset[line.subset] += 1
     return Corpus(
-        lines=tuple(kept),
+        lines=tuple(written),
         line_chars_min=line_chars_min,
         earlier_versions=earlier.versions,
         held_out=held,
         dropped_earlier=in_earlier,
         dropped_length=length,
         dropped_duplicates=duplicates,
+        lines_max=lines_max,
+        dropped_cap=len(kept) - len(written),
         sources=counts,
+        librittsr_subsets=per_subset,
         missing=tuple(missing),
     )
+
+
+def check_lines_max(lines_max: int | None) -> None:
+    """Refuse a cap below one line; None means no cap.
+
+    Raises:
+        InputError: `lines_max` is below 1.
+    """
+    if lines_max is not None and lines_max < 1:
+        raise InputError("refused: --lines-max must be at least 1")
+
+
+def _id_hash(line: SourceLine) -> str:
+    return hashlib.sha256(line.line_id.encode("utf-8")).hexdigest()
+
+
+def _cap(kept: Sequence[SourceLine], lines_max: int | None) -> list[SourceLine]:
+    """Return the `lines_max` lines whose sha256 of the line id sorts first, in source order.
+
+    Hashing the id, rather than taking the first lines, spreads the choice over every source and
+    subset, and depends on nothing but the ids, so the same inputs give the same lines.
+    """
+    if lines_max is None or len(kept) <= lines_max:
+        return list(kept)
+    chosen = {line.line_id for line in sorted(kept, key=_id_hash)[:lines_max]}
+    return [line for line in kept if line.line_id in chosen]
 
 
 def read_sources(sources: Path, assistant_lines: Path) -> dict[str, list[SourceLine] | None]:

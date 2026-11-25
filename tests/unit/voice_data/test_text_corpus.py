@@ -6,6 +6,7 @@ The public sources are fake trees under the test's tmp directory, laid out as a 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -15,7 +16,7 @@ import pytest
 
 from scripts.voice_data import cli, packs, text_corpus
 from scripts.voice_data.errors import InputError
-from scripts.voice_data.root import Root
+from scripts.voice_data.root import Root, init_root
 
 REPO = Path(__file__).resolve().parents[3]
 EAR_TEST = REPO / "scripts" / "model_bench" / "speech" / "lines.json"
@@ -60,10 +61,10 @@ def _ear_texts() -> list[str]:
     return [line["text"] for line in [*data["lines"], *data["acknowledgements"]]]
 
 
-def _librittsr(sources: Path, lines: dict[str, str]) -> None:
+def _librittsr(sources: Path, lines: dict[str, str], subset: str = "test-clean") -> None:
     for utt, text in lines.items():
         speaker, chapter = utt.split("_")[:2]
-        folder = sources / "librittsr" / "LibriTTS_R" / "test-clean" / speaker / chapter
+        folder = sources / "librittsr" / "LibriTTS_R" / subset / speaker / chapter
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"{utt}.normalized.txt").write_text(text, encoding="utf-8")
 
@@ -243,8 +244,16 @@ def test_build_merges_sources_and_holds_out_the_ear_test_lines(
         "dropped_earlier": 0,
         "dropped_length": 2,
         "dropped_duplicates": 1,
+        "lines_max": None,
+        "dropped_cap": 0,
         "sources": {"assistant": 1, "librittsr": 3, "expresso": 1},
+        "librittsr_subsets": {"test-clean": 3},
     }
+    assert [row["line_id"] for row in rows][1:4] == [
+        "librittsr-1089_134686_000001_000001",
+        "librittsr-1188_133604_000001_000000",
+        "librittsr-1188_133604_000004_000000",
+    ]
     out = capsys.readouterr()
     printed = out.out + out.err
     assert_no_canary(printed)
@@ -524,7 +533,166 @@ def test_the_rules_run_in_order_and_each_drop_counts_once(
         ("dropped_earlier", 1),
         ("dropped_length", 2),
         ("dropped_duplicates", 1),
+        ("dropped_cap", 0),
     ]
+
+
+# --- every LibriTTS-R subset, and the cap ------------------------------------------------------
+
+
+def test_every_librittsr_subset_present_is_read_in_the_fixed_order(
+    private_root: Root, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources = tmp_path / "public"
+    # Path order would put dev-clean before test-clean; the fixed order puts test-clean first.
+    _librittsr(sources, {"1272_128104_000001_000000": _text(90, "dev a")}, "dev-clean")
+    _librittsr(sources, {"1272_128104_000002_000000": _text(90, "dev b")}, "dev-clean")
+    _librittsr(sources, {"1089_134686_000001_000000": _text(90, "test")}, "test-clean")
+    _librittsr(sources, {"20_205_000001_000000": _text(90, "other")}, "train-other-500")
+    # A subset present whose every line is dropped still reports its 0.
+    _librittsr(sources, {"116_288045_000001_000000": _text(30, "short")}, "dev-other")
+    (sources / "librittsr" / "LibriTTS_R" / "README.txt").write_text("notes", encoding="utf-8")
+    assistant = _assistant(tmp_path / "a.jsonl", {})
+    assert _build(private_root, sources, "--assistant-lines", str(assistant)) == 0
+    assert [row["line_id"] for row in _rows(private_root)] == [
+        "librittsr-1089_134686_000001_000000",
+        "librittsr-1272_128104_000001_000000",
+        "librittsr-1272_128104_000002_000000",
+        "librittsr-20_205_000001_000000",
+    ]
+    summary = _summary(private_root)
+    assert list(summary["librittsr_subsets"].items()) == [
+        ("test-clean", 1),
+        ("dev-clean", 2),
+        ("dev-other", 0),
+        ("train-other-500", 1),
+    ]
+    assert summary["sources"]["librittsr"] == 4
+    printed = capsys.readouterr().out
+    assert "librittsr subset dev-clean: 2 lines" in printed
+    assert "librittsr subset dev-other: 0 lines" in printed
+    assert str(sources) not in printed
+
+
+def test_a_librittsr_subset_without_test_clean_is_read(private_root: Root, tmp_path: Path) -> None:
+    sources = tmp_path / "public"
+    _librittsr(sources, {"1272_128104_000001_000000": _text(90, "dev")}, "dev-clean")
+    assert _build(private_root, sources) == 0
+    assert _summary(private_root)["librittsr_subsets"] == {"dev-clean": 1}
+
+
+def test_a_stray_folder_under_librittsr_is_refused(
+    private_root: Root, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources = tmp_path / "public"
+    _librittsr(sources, {"1089_134686_000001_000000": _text(90, "test")})
+    _librittsr(sources, {"1089_134686_000002_000000": _text(90, "stray")}, "test-clean-copy")
+    assert _build(private_root, sources) == 2
+    assert "LibriTTS_R" in capsys.readouterr().err
+    assert not (private_root.path / "text" / "v1").exists()
+
+
+def test_an_utterance_id_in_two_subsets_is_refused(private_root: Root, tmp_path: Path) -> None:
+    sources = tmp_path / "public"
+    _librittsr(sources, {"1089_134686_000001_000000": _text(90, "one")})
+    _librittsr(sources, {"1089_134686_000001_000000": _text(90, "two")}, "dev-clean")
+    assert _build(private_root, sources) == 2
+
+
+def _capped_sources(tmp_path: Path) -> tuple[Path, Path]:
+    sources = tmp_path / "public"
+    _librittsr(sources, {f"1089_134686_{i:06d}_000000": _text(90, f"t{i}") for i in range(4)})
+    _librittsr(
+        sources, {f"1272_128104_{i:06d}_000000": _text(100, f"d{i}") for i in range(3)}, "dev-clean"
+    )
+    _expresso(sources, {f"ex01_default_{i:05d}": _text(110, f"e{i}") for i in range(3)})
+    assistant = _assistant(tmp_path / "a.jsonl", {"a1": _text(85, "a"), "a2": _text(10, "b")})
+    return sources, assistant
+
+
+def test_lines_max_keeps_the_lines_whose_id_hash_sorts_first_in_source_order(
+    private_root: Root, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources, assistant = _capped_sources(tmp_path)
+    argv = ["--assistant-lines", str(assistant), "--lines-max", "5"]
+    assert _build(private_root, sources, *argv) == 0
+    every = [
+        "assistant-a1",
+        *(f"librittsr-1089_134686_{i:06d}_000000" for i in range(4)),
+        *(f"librittsr-1272_128104_{i:06d}_000000" for i in range(3)),
+        *(f"expresso-ex01_default_{i:05d}" for i in range(3)),
+    ]
+    chosen = set(sorted(every, key=lambda i: hashlib.sha256(i.encode("utf-8")).hexdigest())[:5])
+    rows = _rows(private_root)
+    assert [row["line_id"] for row in rows] == [i for i in every if i in chosen]
+    summary = _summary(private_root)
+    assert summary["lines"] == 5
+    assert summary["chars"] == sum(len(row["text"]) for row in rows)
+    assert summary["lines_max"] == 5
+    assert summary["dropped_cap"] == len(every) - 5
+    assert summary["dropped_length"] == 1
+    assert summary["sources"] == {
+        name: sum(i.startswith(f"{name}-") for i in chosen)
+        for name in ("assistant", "librittsr", "expresso")
+    }
+    assert summary["librittsr_subsets"] == {
+        "test-clean": sum(i.startswith("librittsr-1089") for i in chosen),
+        "dev-clean": sum(i.startswith("librittsr-1272") for i in chosen),
+    }
+    printed = capsys.readouterr().out
+    assert f"{len(every) - 5} over --lines-max 5" in printed
+    for row in rows:
+        assert row["text"] not in printed
+
+
+def test_lines_max_above_the_kept_lines_caps_nothing(private_root: Root, tmp_path: Path) -> None:
+    sources, assistant = _capped_sources(tmp_path)
+    argv = ["--assistant-lines", str(assistant), "--lines-max", "100"]
+    assert _build(private_root, sources, *argv) == 0
+    summary = _summary(private_root)
+    assert (summary["lines"], summary["lines_max"], summary["dropped_cap"]) == (11, 100, 0)
+
+
+def test_the_same_inputs_give_the_same_capped_lines_file(
+    private_root: Root, tmp_path: Path
+) -> None:
+    sources, assistant = _capped_sources(tmp_path)
+    other = init_root(tmp_path / "other-root", "private")
+    argv = ["--assistant-lines", str(assistant), "--lines-max", "4"]
+    assert _build(private_root, sources, *argv) == 0
+    assert _build(other, sources, *argv) == 0
+    first = (private_root.path / "text" / "v1" / "lines.jsonl").read_bytes()
+    assert first == (other.path / "text" / "v1" / "lines.jsonl").read_bytes()
+    assert len(first.splitlines()) == 4
+
+
+@pytest.mark.parametrize("value", ["0", "-3"])
+def test_lines_max_below_one_is_refused(private_root: Root, tmp_path: Path, value: str) -> None:
+    sources, assistant = _capped_sources(tmp_path)
+    argv = ["--assistant-lines", str(assistant), "--lines-max", value]
+    assert _build(private_root, sources, *argv) == 2
+    assert not (private_root.path / "text" / "v1").exists()
+
+
+def test_lines_max_that_is_not_a_number_is_refused(private_root: Root, tmp_path: Path) -> None:
+    sources, assistant = _capped_sources(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        _build(private_root, sources, "--lines-max", "many")
+    assert exc.value.code == 2
+    assert not (private_root.path / "text" / "v1").exists()
+
+
+def test_the_help_names_every_subset_rule_and_the_cap(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A wide terminal, so argparse never wraps a hyphenated name across lines.
+    monkeypatch.setenv("COLUMNS", "2000")
+    with pytest.raises(SystemExit):
+        cli.main(["text", "build", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "every LibriTTS-R subset" in out
+    assert "--lines-max" in out
+    assert "earlier version" in out
 
 
 # --- the committed assistant-register lines ---------------------------------------------------
