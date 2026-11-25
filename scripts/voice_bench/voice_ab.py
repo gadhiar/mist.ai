@@ -28,11 +28,11 @@ recorded once, at the top.
 It runs on the CPU in the Pocket bench image, with the repository mounted and the private root
 writable. The run folder must be `bench/voice-ab/<run>` of a marked private root, outside the
 checkout, and must not exist: nothing is overwritten, and nothing is written until every line of
-both arms has rendered. The summary on stdout is counts and milliseconds per arm, then the run
-folder, and never a line id or a line's text. A refusal or a failure goes to stderr as its error
-words it, and an engine error may name an identity id given on the command line; only the pages
-`pack voice-ab` builds must name no identity. A refusal exits 2 before anything loads; an engine
-failure exits 1.
+both arms has rendered. The summary on stdout is counts, milliseconds and a loudness range per
+arm, then the run folder, and never a line id or a line's text. A refusal or a failure goes to
+stderr as its error words it, and an engine error may name an identity id given on the command
+line; only the pages `pack voice-ab` builds must name no identity. A refusal exits 2 before
+anything loads; an engine failure exits 1.
 """
 
 from __future__ import annotations
