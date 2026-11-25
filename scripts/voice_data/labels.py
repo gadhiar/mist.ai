@@ -735,8 +735,11 @@ def carry(
     clip was usually never judged on its own). A segment carries only when every match agrees on
     `voices`, `energy`, `mood`, `tags` and the keep range in source time, and, for `her_nearby`,
     that range lies inside the segment; a `her_nearby` match without a range, or with one
-    outside, leaves the segment to be asked again. Carried labels and labels of `run` itself
-    are never sources.
+    outside, leaves the segment to be asked again. The range may reach `CARRY_TOL_S` past the
+    segment and is clamped into it, so the label built is carried only when it still agrees
+    (`_agree`, the test `carried_stale` applies) with every match it lists; otherwise the segment
+    is asked again rather than written stale. Carried labels and labels of `run` itself are
+    never sources.
 
     Args:
         segments: The kept segments of `run` (`SegmentRecord`s).
@@ -769,7 +772,7 @@ def carry(
                 continue
             keep_from = max(0.0, round(source_range[0] - start, 2))
             keep_to = min(duration, round(source_range[1] - start, 2))
-        carried[segment.segment_id] = LabelRecord(
+        record = LabelRecord(
             run=run,
             segment_id=segment.segment_id,
             source_id=segment.source_id,
@@ -789,6 +792,10 @@ def carry(
             removed=None,
             carried_from=tuple(sorted(f"{m.run}/{m.segment_id}" for m in matches)),
         )
+        # Clamping a range that reaches past the span moves it in source time, possibly past
+        # `_RANGE_TOL_S`; such a label would be stale for `carried_stale` the moment it was written.
+        if all(_agree(record, match) for match in matches):
+            carried[segment.segment_id] = record
     return carried
 
 
