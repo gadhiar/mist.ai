@@ -19,7 +19,7 @@ import importlib
 import json
 import sys
 import types
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -139,12 +139,15 @@ DROPPED = 5
 EAR = 6
 
 
-def segment(k: int) -> SegmentRecord:
+ONE_SOURCE = "src-0001"
+
+
+def segment(k: int, source: str = ONE_SOURCE) -> SegmentRecord:
     kept = k != DROPPED
     text = EAR_LINE if k == EAR else CANARY.transcript
     reasons = ("asr_disagree",) if k == DISAGREE else () if kept else ("not-her",)
     return SegmentRecord(
-        segment_id=seg_id(k), source_id="src-0001", start_s=10.0 * k,
+        segment_id=seg_id(k), source_id=source, start_s=10.0 * k,
         end_s=10.0 * k + seg_seconds(k), channel="FC", channel_reason=None, separator="none",
         audio=f"seed/runs/{SEED_RUN}/audio/{seg_id(k)}.flac" if kept else "",
         diar_cluster="spk-01", cluster="primary", flag_group=None,
@@ -155,11 +158,14 @@ def segment(k: int) -> SegmentRecord:
     )  # fmt: skip
 
 
-def write_seed(root: root_mod.Root) -> list[SegmentRecord]:
-    records = [segment(k) for k in range(7)]
-    for record in records:
+def write_seed(
+    root: root_mod.Root, *, extra: int = 0, source_of: Callable[[int], str] = lambda k: ONE_SOURCE
+) -> list[SegmentRecord]:
+    """Write the seed: the seven segments above plus `extra` trusted ones, each in `source_of(k)`."""
+    records = [segment(k, source_of(k)) for k in range(7 + extra)]
+    for k, record in enumerate(records):
         if record.audio:
-            write_audio(root.path / record.audio, seg_seconds(int(record.segment_id[-2:]) - 1))
+            write_audio(root.path / record.audio, seg_seconds(k))
     write_jsonl(root, f"seed/runs/{SEED_RUN}/segments.jsonl", records)
     run = root.path / "seed" / "runs" / SEED_RUN
     plan = {"schema": 1, "run": SEED_RUN, "from": "r1", "target": TARGET, "thresholds": {},
@@ -444,12 +450,73 @@ def test_validation_holds_out_whole_lines(root: root_mod.Root, hub: dict) -> Non
 
 def test_holdout_is_stable_and_keeps_a_line_in_each_split() -> None:
     lines = [f"l{n}" for n in range(100)]
-    held = corpus_cmd.holdout_lines(lines, 0.02)
-    assert len(held) == 2 and held == corpus_cmd.holdout_lines(list(reversed(lines)), 0.02)
-    assert len(corpus_cmd.holdout_lines(lines[:10], 0.02)) == 1
-    assert corpus_cmd.holdout_lines(lines[:1], 0.02) == set()
-    assert corpus_cmd.holdout_lines(lines[:10], 0.0) == set()
-    assert len(corpus_cmd.holdout_lines(lines[:3], 0.9)) == 2
+    held = corpus_cmd.holdout_lines(lines, 0.02, seed=0)
+    assert len(held) == 2
+    assert held == corpus_cmd.holdout_lines(list(reversed(lines)), 0.02, seed=0)
+    assert len(corpus_cmd.holdout_lines(lines[:10], 0.02, seed=0)) == 1
+    assert corpus_cmd.holdout_lines(lines[:1], 0.02, seed=0) == set()
+    assert corpus_cmd.holdout_lines(lines[:10], 0.0, seed=0) == set()
+    assert len(corpus_cmd.holdout_lines(lines[:3], 0.9, seed=0)) == 2
+
+
+def test_the_seed_orders_the_line_hold_out_and_the_seed_cap() -> None:
+    lines = [f"l{n}" for n in range(100)]
+    first = corpus_cmd.holdout_lines(lines, 0.1, seed=1)
+    assert first == corpus_cmd.holdout_lines(lines, 0.1, seed=1)
+    assert first != corpus_cmd.holdout_lines(lines, 0.1, seed=2)
+    segments = [(f"s{n}", 1.0) for n in range(20)]
+    kept = corpus_cmd.cap_seed(segments, 14.0, 0.3, 3, seed=1)
+    assert len(kept) == 2 and kept == corpus_cmd.cap_seed(segments[::-1], 14.0, 0.3, 3, seed=1)
+    assert kept != corpus_cmd.cap_seed(segments, 14.0, 0.3, 3, seed=2)
+    assert corpus_cmd.cap_seed(segments, 14.0, 1.0, 3, seed=1) != corpus_cmd.cap_seed(
+        segments, 14.0, 1.0, 3, seed=2
+    )
+
+
+def test_the_seed_is_recorded_and_its_splits_reproduce(root: root_mod.Root, hub: dict) -> None:
+    set_gates(root, val_fraction=0.25, seed_share_max=0.3)
+    assert build(root).code == 0
+    assert manifest_of(root)["random_seed"] == 0
+    plan = json.loads((corpus_dir(root) / "corpus-plan.json").read_text(encoding="utf-8"))
+    assert plan["random_seed"] == 0
+    names = ("train_aligned.jsonl", "valid_aligned.jsonl")
+    default = {n: (corpus_dir(root) / n).read_bytes() for n in names}
+    assert build(root, version="s2").code == 0
+    again = root.path / "corpus" / "s2"
+    assert {n: (again / n).read_bytes() for n in names} == default
+    result = build(root, "--seed", "7", version="s3")
+    assert result.code == 0, result.err
+    other = root.path / "corpus" / "s3"
+    assert json.loads((other / "manifest.json").read_text(encoding="utf-8"))["random_seed"] == 7
+    assert (other / "valid_aligned.jsonl").read_bytes() != default["valid_aligned.jsonl"]
+    assert (other / "train_aligned.jsonl").read_bytes() != default["train_aligned.jsonl"]
+    assert build(root, "--seed", "7", version="s4").code == 0
+    for name in names:
+        assert (root.path / "corpus" / "s4" / name).read_bytes() == (other / name).read_bytes()
+
+
+def edit_plan(root: root_mod.Root, change: dict) -> None:
+    path = corpus_dir(root) / "corpus-plan.json"
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    plan.update(change)
+    path.write_text(json.dumps({k: v for k, v in plan.items() if v is not None}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("value", [None, "7", True])
+def test_the_stage_refuses_a_plan_without_an_integer_seed(
+    root: root_mod.Root, hub: dict, value: object
+) -> None:
+    assert build(root).code == 0
+    edit_plan(root, {"random_seed": value})
+    with pytest.raises(stage.StageError, match="random_seed"):
+        stage.run(root.path, VERSION, "cpu", 8)
+
+
+def test_a_seed_that_is_not_an_integer_is_refused(root: root_mod.Root, hub: dict) -> None:
+    with pytest.raises(SystemExit) as exc:
+        build(root, "--seed", "x")
+    assert exc.value.code == 2
+    assert not corpus_dir(root).exists()
 
 
 def test_the_seed_share_is_capped_after_oversampling(root: root_mod.Root, hub: dict) -> None:
@@ -475,11 +542,11 @@ def test_the_seed_share_is_capped_after_oversampling(root: root_mod.Root, hub: d
 
 def test_cap_seed_fills_greedily_in_a_stable_order() -> None:
     segments = [("a", 1.0), ("b", 1.0), ("c", 1.0), ("d", 1.0)]
-    kept = corpus_cmd.cap_seed(segments, teacher_train_s=14.0, share_max=0.3, oversample=3)
+    kept = corpus_cmd.cap_seed(segments, teacher_train_s=14.0, share_max=0.3, oversample=3, seed=0)
     assert len(kept) == 2  # 3 x 2 s of 20 s is 0.3; a third would be 9 of 23
-    assert kept == corpus_cmd.cap_seed(segments[::-1], 14.0, 0.3, 3)
-    assert corpus_cmd.cap_seed(segments, 14.0, 0.0, 3) == []
-    assert len(corpus_cmd.cap_seed(segments, 14.0, 1.0, 3)) == 4
+    assert kept == corpus_cmd.cap_seed(segments[::-1], 14.0, 0.3, 3, seed=0)
+    assert corpus_cmd.cap_seed(segments, 14.0, 0.0, 3, seed=0) == []
+    assert len(corpus_cmd.cap_seed(segments, 14.0, 1.0, 3, seed=0)) == 4
 
 
 def test_refuses_below_teacher_hours_min_counted_after_alignment(
@@ -589,6 +656,184 @@ def test_refusals_exit_2(root: root_mod.Root, hub: dict) -> None:
 
 def test_missing_run_is_refused(private_root: root_mod.Root, hub: dict) -> None:
     assert build(private_root).code == 2
+
+
+# The seed's hold-out by whole source.
+
+FOUR_SOURCES = tuple(f"src-{n:04d}" for n in range(1, 5))
+
+
+def four_sources(k: int) -> str:
+    return FOUR_SOURCES[k % 4]
+
+
+def trusted_ks(extra: int) -> list[int]:
+    return [*TRUSTED, *range(7, 7 + extra)]
+
+
+def test_holdout_sources_takes_whole_sources_to_the_share() -> None:
+    even = {f"s{n}": 10.0 for n in range(4)}
+    one = corpus_cmd.holdout_sources(even, 0.15, seed=0)
+    assert len(one.sources) == 1 and one.reason is None  # 10 s of 40 reaches 6 s
+    two = corpus_cmd.holdout_sources(even, 0.5, seed=0)
+    assert len(two.sources) == 2  # 20 s of 40 reaches 20 s
+    assert one.sources < two.sources  # the same seeded order, taken further
+    assert len(corpus_cmd.holdout_sources(even, 0.99, seed=0).sources) == 3  # one stays
+    assert len(corpus_cmd.holdout_sources(even, 0.001, seed=0).sources) == 1  # one is held
+    pair = corpus_cmd.holdout_sources({"a": 1.0, "b": 100.0}, 0.15, seed=0)
+    assert len(pair.sources) == 1 and pair.reason is None
+    uneven = {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0, "e": 96.0}
+    for seed in range(20):
+        held = corpus_cmd.holdout_sources(uneven, 0.15, seed=seed).sources
+        seconds = sum(uneven[s] for s in held)
+        assert 1 <= len(held) <= 4
+        # Taken in order until the share is reached: the last one taken was still needed.
+        assert seconds >= 15.0 or len(held) == 4
+        assert min(seconds - uneven[s] for s in held) < 15.0
+
+
+def test_holdout_sources_is_seeded_and_reproducible() -> None:
+    sources = {f"source-{n}": 5.0 for n in range(20)}
+    first = corpus_cmd.holdout_sources(sources, 0.15, seed=1)
+    assert len(first.sources) == 3
+    assert first == corpus_cmd.holdout_sources(dict(reversed(sources.items())), 0.15, seed=1)
+    assert first.sources != corpus_cmd.holdout_sources(sources, 0.15, seed=2).sources
+
+
+@pytest.mark.parametrize(
+    "sources", [{}, {"src-only": 30.0}], ids=["no trusted segment", "one source"]
+)
+def test_holdout_sources_holds_none_out_below_two_sources(sources: dict[str, float]) -> None:
+    held = corpus_cmd.holdout_sources(sources, 0.15, seed=0)
+    assert held.sources == frozenset()
+    assert held.reason and "src" not in held.reason
+
+
+def test_held_out_sources_have_no_training_row(root: root_mod.Root, hub: dict) -> None:
+    records = write_seed(root, extra=8, source_of=four_sources)
+    trusted = {str(root.path / records[k].audio): records[k] for k in trusted_ks(8)}
+    result = build(root)
+    assert result.code == 0, result.err
+    train, valid = rows_of(root, "train_aligned.jsonl"), rows_of(root, "valid_aligned.jsonl")
+    seed_valid = [r for r in valid if r["path"] in trusted]
+    seed_train = [r for r in train if r["path"] in trusted]
+    held = {trusted[r["path"]].source_id for r in seed_valid}
+    kept = {trusted[r["path"]].source_id for r in seed_train}
+    assert held and kept and held.isdisjoint(kept) and held | kept == set(FOUR_SOURCES)
+    # Whole sources, written once each, ahead of every teacher validation row.
+    assert sorted(r["path"] for r in seed_valid) == sorted(
+        path for path, record in trusted.items() if record.source_id in held
+    )
+    assert valid[: len(seed_valid)] == seed_valid
+    assert all(r["path"] not in trusted for r in valid[len(seed_valid) :])
+    seconds = dict.fromkeys(FOUR_SOURCES, 0.0)
+    for record in trusted.values():
+        seconds[record.source_id] += seconds_of(root, record.audio)
+    expected = corpus_cmd.holdout_sources(seconds, 0.15, seed=0)
+    assert held == expected.sources
+    manifest = manifest_of(root)
+    assert manifest["seed_val_share"] == 0.15
+    assert manifest["seed_val_sources"] == len(held)
+    assert manifest["seed_val_segments"] == len(seed_valid)
+    held_s = sum(r["duration"] for r in seed_valid)
+    assert manifest["seed_val_hours"] == pytest.approx(held_s / 3600, abs=1e-6)
+    assert manifest["seed_val_reason"] is None
+    # The share cap and the seed hours count the training seed only.
+    assert manifest["seed_hours"] == pytest.approx(
+        sum(r["duration"] for r in seed_train) / 3600, abs=1e-6
+    )
+    assert manifest["seed_segments"] == len({r["path"] for r in seed_train})
+    hours = f"{manifest['seed_val_hours']:.3f}"
+    assert (
+        f"seed validation: {len(held)} sources held out whole, {len(seed_valid)} segments, "
+        f"{hours} h" in result.out
+    )
+    assert "src-" not in result.out + result.err
+
+
+def test_two_seeds_hold_out_different_sources(root: root_mod.Root, hub: dict) -> None:
+    records = write_seed(root, extra=8, source_of=four_sources)
+    source_of_path = {str(root.path / r.audio): r.source_id for r in records if r.audio}
+
+    def held(version: str, *args: str) -> set[str]:
+        assert build(root, *args, version=version).code == 0
+        valid = (root.path / "corpus" / version / "valid_aligned.jsonl").read_text("utf-8")
+        rows = [json.loads(r) for r in valid.splitlines() if r]
+        return {source_of_path[r["path"]] for r in rows if r["path"] in source_of_path}
+
+    first = held("s1")
+    assert held("s2") == first
+    assert held("s3", "--seed", "3") != first
+
+
+def test_one_seed_source_is_kept_for_training(root: root_mod.Root, hub: dict) -> None:
+    result = build(root)
+    assert result.code == 0, result.err
+    manifest = manifest_of(root)
+    assert (manifest["seed_val_sources"], manifest["seed_val_segments"]) == (0, 0)
+    assert manifest["seed_val_hours"] == 0
+    assert manifest["seed_val_reason"] == "one seed source, which training keeps"
+    assert "seed validation: none held out (one seed source, which training keeps)" in result.out
+    seed_paths = {str(root.path / segment(k).audio) for k in TRUSTED}
+    assert not any(r["path"] in seed_paths for r in rows_of(root, "valid_aligned.jsonl"))
+
+
+def test_dropped_segments_never_count_toward_the_hold_out(root: root_mod.Root, hub: dict) -> None:
+    # The untrusted, dropped and ear-test segments are a second source of their own.
+    write_seed(
+        root, source_of=lambda k: "src-0009" if k in (DISAGREE, DROPPED, EAR) else ONE_SOURCE
+    )
+    result = build(root)
+    assert result.code == 0, result.err
+    manifest = manifest_of(root)
+    assert manifest["seed_val_sources"] == 0
+    assert manifest["seed_val_reason"] == "one seed source, which training keeps"
+
+
+def test_a_teacher_only_corpus_holds_out_no_seed(root: root_mod.Root, hub: dict) -> None:
+    write_takes(root, floor_from="round-1-takes")
+    assert build(root).code == 0
+    manifest = manifest_of(root)
+    assert manifest["seed_val_sources"] == 0
+    assert manifest["seed_val_reason"] == "no trusted seed segment"
+
+
+def test_plan_segments_carry_their_source(root: root_mod.Root, hub: dict) -> None:
+    records = write_seed(root, extra=8, source_of=four_sources)
+    assert build(root).code == 0
+    plan = json.loads((corpus_dir(root) / "corpus-plan.json").read_text(encoding="utf-8"))
+    sources = {r.segment_id: r.source_id for r in records}
+    assert plan["segments"]
+    for entry in plan["segments"]:
+        assert set(entry) == {"segment_id", "source_id", "audio"}
+        assert entry["source_id"] == sources[entry["segment_id"]]
+    assert plan["seed_val_share"] == 0.15
+
+
+@pytest.mark.parametrize("source", [None, "", "src-0002"])
+def test_the_stage_refuses_a_plan_segment_without_its_source(
+    root: root_mod.Root, hub: dict, source: object
+) -> None:
+    assert build(root).code == 0
+    path = corpus_dir(root) / "corpus-plan.json"
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    first = plan["segments"][0]
+    first.pop("source_id")
+    if source is not None:
+        first["source_id"] = source
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(stage.StageError, match=first["segment_id"]):
+        stage.run(root.path, VERSION, "cpu", 8)
+
+
+@pytest.mark.parametrize("value", [None, "0.15", True])
+def test_the_stage_refuses_a_plan_without_a_seed_val_share(
+    root: root_mod.Root, hub: dict, value: object
+) -> None:
+    assert build(root).code == 0
+    edit_plan(root, {"seed_val_share": value})
+    with pytest.raises(stage.StageError, match="seed_val_share"):
+        stage.run(root.path, VERSION, "cpu", 8)
 
 
 # The upstream aligner, run in-process from the clone.
