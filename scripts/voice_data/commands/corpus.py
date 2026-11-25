@@ -16,8 +16,12 @@ One GPU job in the `train-pocket` family (`stages/corpus_build.py`) measures eve
 upstream's CTC aligner (`training/scripts/align_data.py`) over all of them once: the loader
 refuses a row without `words` (`UnalignedEntry`), so a row the aligner leaves out is dropped and
 counted. After alignment the job holds out `corpus.val_fraction` of the teacher lines (whole
-lines, so a line's takes never sit in both splits), caps the seed by `corpus.seed_share_max` of
-the training split's hours counted after the seed is oversampled 3x, and writes the splits.
+lines, so a line's takes never sit in both splits) and `corpus.seed_val_share` of the trusted
+seed seconds (whole sources, so no training segment shares a recording with a validation one),
+caps the training seed by `corpus.seed_share_max` of the training split's hours counted after
+the seed is oversampled 3x, and writes the splits. The held-out seed rows come first in
+`valid_aligned.jsonl`, once each, so a validation pass that drops a short tail drops teacher
+rows, not her real voice.
 Every such choice follows the order of the sha256 of `--seed` (default 0) and the id, so the
 seed the manifest records as `random_seed` reproduces the splits byte for byte.
 The aligner's batch is 8, not upstream's 32, and the job asks for 3 GB of VRAM rather than the
@@ -30,7 +34,8 @@ sha256. A take of an ear-test line (`scripts/model_bench/speech/lines.json`) is 
 job; a seed segment speaking one is left out by the job, and the manifest's count of ear-test
 rows is asserted to be 0.
 
-Nothing printed carries a transcript, a line's text or a clip's path: only ids, counts and hours.
+Nothing printed carries a transcript, a line's text, a clip's path or a source id: only take,
+line, segment and run ids, counts and hours.
 The stage imports the names and helpers below, so host and job share one definition.
 """
 
@@ -42,6 +47,7 @@ import json
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from .. import gates as gates_mod
@@ -100,6 +106,48 @@ def holdout_lines(line_ids: Iterable[str], fraction: float, *, seed: int) -> set
         return set()
     count = min(max(1, round(fraction * len(lines))), len(lines) - 1)
     return set(lines[:count])
+
+
+NO_SEED = "no trusted seed segment"
+ONE_SOURCE = "one seed source, which training keeps"
+NO_SHARE = "corpus.seed_val_share is 0"
+# The only reasons a report prints for holding out no seed source; none names a source.
+SEED_VAL_REASONS = (NO_SEED, ONE_SOURCE, NO_SHARE)
+
+
+@dataclass(frozen=True, slots=True)
+class SeedHoldout:
+    """The seed sources held out for validation, or the reason none is."""
+
+    sources: frozenset[str]
+    reason: str | None
+
+
+def holdout_sources(sources: Mapping[str, float], share: float, *, seed: int) -> SeedHoldout:
+    """Return the seed sources held out for validation: whole sources, in the seed's order.
+
+    `sources` maps each source with trusted segments to their seconds. A whole source is held
+    out so no segment in training shares a recording with one the student is validated on.
+    Sources are taken in the seed's order until the held-out seconds reach `share` of the total.
+    With two or more sources, at least one is held out and at least one stays in training; with
+    fewer, none is held out and `reason` says why without naming a source.
+    """
+    if not sources:
+        return SeedHoldout(frozenset(), NO_SEED)
+    if len(sources) < 2:
+        return SeedHoldout(frozenset(), ONE_SOURCE)
+    if share <= 0:
+        return SeedHoldout(frozenset(), NO_SHARE)
+    ordered = sorted(sources, key=lambda source: _order(source, seed))
+    goal = share * sum(sources.values())
+    held: list[str] = []
+    seconds = 0.0
+    for source in ordered[:-1]:
+        if held and seconds >= goal - 1e-9:
+            break
+        held.append(source)
+        seconds += sources[source]
+    return SeedHoldout(frozenset(held), None)
 
 
 def cap_seed(
@@ -218,10 +266,12 @@ def _selected_takes(root: root_mod.Root, run_id: str) -> tuple[dict[str, object]
 
 def _seed(
     root: root_mod.Root, score_plan: Mapping[str, object]
-) -> tuple[str | None, list[tuple[str, str]]]:
-    """Return the seed run behind the takes' seed target and its confirmed segments' audio.
+) -> tuple[str | None, list[tuple[str, str, str]]]:
+    """Return the seed run behind the takes' seed target and its confirmed segments.
 
-    Returns `(None, [])` when the takes were scored without a seed target.
+    Each segment is `(segment_id, source_id, audio)`: the job holds out whole sources for
+    validation, so the plan carries each segment's source. Returns `(None, [])` when the takes
+    were scored without a seed target.
     """
     floor = score_plan.get("floor")
     doc = floor if isinstance(floor, Mapping) else {}
@@ -234,7 +284,7 @@ def _seed(
     if record.seed_run is None:
         raise InputError(f"refused: target {target_id} has no seed run")
     seed = target_mod.read_seed(root, record.seed_run, target_id)
-    return record.seed_run, [(s.segment_id, s.audio) for s in seed.segments]
+    return record.seed_run, [(s.segment_id, s.source_id, s.audio) for s in seed.segments]
 
 
 def run_build(args: argparse.Namespace) -> int:
@@ -266,10 +316,14 @@ def run_build(args: argparse.Namespace) -> int:
         "lines_file": lines_file,
         "takes": [{"take_id": t.take_id, "line_id": t.line_id, "audio": t.audio} for t in takes],
         "seed_run": seed_run,
-        "segments": [{"segment_id": s, "audio": a} for s, a in segments],
+        "segments": [
+            {"segment_id": segment_id, "source_id": source_id, "audio": audio}
+            for segment_id, source_id, audio in segments
+        ],
         "random_seed": args.seed,
         "oversample": OVERSAMPLE,
         "val_fraction": float(gates.value("corpus.val_fraction")),
+        "seed_val_share": float(gates.value("corpus.seed_val_share")),
         "seed_share_max": float(gates.value("corpus.seed_share_max")),
         "teacher_hours_min": float(gates.value("corpus.teacher_hours_min")),
         "aligner": {
@@ -290,7 +344,7 @@ def run_build(args: argparse.Namespace) -> int:
     if seed_run is not None:
         seed_dir = clean_cmd.run_rel(seed_run)
         seed_parts = [sha256_file(root.path / seed_dir / clean_cmd.SEGMENTS_NAME)]
-        seed_parts += [sha256_file(root.path / audio) for _, audio in segments]
+        seed_parts += [sha256_file(root.path / audio) for _, _, audio in segments]
         inputs.append(JobInput(rel=seed_dir, sha256=_digest(seed_parts)))
     job = jobs.JobSpec(
         job_id=_job_id(root),
@@ -364,6 +418,11 @@ MANIFEST_KEYS = (
     "unaligned",
     "seed_left_out",
     "ear_test_lines",
+    "seed_val_share",
+    "seed_val_sources",
+    "seed_val_segments",
+    "seed_val_hours",
+    "seed_val_reason",
 )
 
 
@@ -402,4 +461,18 @@ def build_lines(version: str, summary: Mapping[str, object]) -> list[str]:
         f"  unaligned: teacher {_num(lost.get(TEACHER))}, seed {_num(lost.get(SEED))}",
         f"  seed left out: untrusted text {_num(out.get('untrusted_text'))}, ear-test "
         f"{_num(out.get('ear_test'))}, over the share cap {_num(out.get('share_cap'))}",
+        _seed_val_line(summary),
     ]
+
+
+def _seed_val_line(summary: Mapping[str, object]) -> str:
+    # Counts and hours only: a source id names a recording, so no report carries one.
+    reason = summary.get("seed_val_reason")
+    if reason is not None:
+        said = reason if reason in SEED_VAL_REASONS else "?"
+        return f"  seed validation: none held out ({said})"
+    return (
+        f"  seed validation: {_num(summary.get('seed_val_sources'))} sources held out whole, "
+        f"{_num(summary.get('seed_val_segments'))} segments, "
+        f"{_num(summary.get('seed_val_hours'))} h (share {_num(summary.get('seed_val_share'))})"
+    )

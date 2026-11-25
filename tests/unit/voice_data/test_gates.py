@@ -70,6 +70,7 @@ FIXED = {
     "corpus.teacher_hours_min": 5.0,
     "corpus.seed_share_max": 0.3,
     "corpus.val_fraction": 0.02,
+    "corpus.seed_val_share": 0.15,
     "voice_ab.preferred_min": 18,
     "voice_ab.lines": 26,
 }
@@ -140,6 +141,7 @@ def test_voice_ab_lines_are_the_ear_test_lines() -> None:
         "corpus.teacher_hours_min",
         "corpus.seed_share_max",
         "corpus.val_fraction",
+        "corpus.seed_val_share",
         "voice_ab.preferred_min",
         "voice_ab.lines",
     ],

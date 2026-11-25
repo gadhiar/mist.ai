@@ -57,6 +57,7 @@
     "corpus.teacher_hours_min": {"value": 5.0, "h6": false, "note": "Corpus: fewest hours of kept teacher takes the training corpus needs; about 0.27-0.31 M chars of `text build` lines. Fixed."},
     "corpus.seed_share_max": {"value": 0.3, "h6": false, "note": "Corpus: largest share of the training corpus's hours the seed's real segments may make up, counted after they are oversampled 3x. Fixed."},
     "corpus.val_fraction": {"value": 0.02, "h6": false, "note": "Corpus: share of the training corpus held back as the validation split. Fixed."},
+    "corpus.seed_val_share": {"value": 0.15, "h6": false, "note": "Corpus: share of the trusted seed seconds held out for validation, in whole sources, with at least one source on each side when two or more exist. Fixed."},
     "voice_ab.preferred_min": {"value": 18, "h6": false, "note": "Voice A/B: fewest of the 26 ear-test lines on which the trained voice must be the preferred one for the A/B to pass; a no-preference answer counts against the trained voice, and its not-her flags must be no more than the baseline's. Fixed."},
     "voice_ab.lines": {"value": 26, "h6": false, "note": "Voice A/B: ear-test lines the A/B plays, the 20 lines and 6 acknowledgements of `scripts/model_bench/speech/lines.json`. Fixed."}
   }

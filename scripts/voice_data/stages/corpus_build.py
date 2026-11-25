@@ -15,9 +15,11 @@ cache (`fetch.model_dir`, through `fetch.snapshot_dir`): a snapshot fetched at a
 writes no `refs/main`, so the repository id alone does not resolve offline. A row the aligner
 leaves out, or returns without words, is dropped and counted.
 
-The aligned teacher rows are split by line (`commands.corpus.holdout_lines`), the seed is capped
-on the training split's teacher hours (`commands.corpus.cap_seed`) and repeated `oversample`
-times in training only, both in the order of the plan's `random_seed`, and the splits are
+The aligned teacher rows are split by line (`commands.corpus.holdout_lines`), the aligned seed
+segments by whole source (`commands.corpus.holdout_sources`, each plan segment naming its
+`source_id`), the training seed is capped on the training split's teacher hours
+(`commands.corpus.cap_seed`) and repeated `oversample` times, all in the order of the plan's
+`random_seed`. The held-out seed rows open the validation split, once each. The splits are
 written as upstream's rows: `path` (the clip's path
 under `--data`), `duration`, `transcript` and `words`, nothing else.
 
@@ -65,6 +67,7 @@ class Candidate:
     path: str
     duration: float
     transcript: str
+    source: str | None = None  # a seed segment's source, held out whole; None for a take
 
     def row(self) -> dict[str, object]:
         """Return the aligner's input row."""
@@ -174,6 +177,10 @@ class Builder:
         if isinstance(random_seed, bool) or not isinstance(random_seed, int):
             raise StageError("the corpus plan records no integer random_seed")
         self.random_seed = random_seed
+        share = self.plan.get("seed_val_share")
+        if isinstance(share, bool) or not isinstance(share, int | float):
+            raise StageError("the corpus plan records no numeric seed_val_share")
+        self.seed_val_share = float(share)
         self.rel = contract.corpus_rel(version)
         self.hold_out = HoldOut(load_ear_test())
         self.left_out = {"untrusted_text": 0, "ear_test": 0, "share_cap": 0}
@@ -220,8 +227,11 @@ class Builder:
             raise StageError("the seed's segments.jsonl is missing or malformed") from exc
         found = []
         for entry in self.plan["segments"]:  # type: ignore[attr-defined]
+            source = entry.get("source_id")
+            if not isinstance(source, str) or not source:
+                raise StageError(f"segment {entry['segment_id']} has no source_id in the plan")
             record = records.get(entry["segment_id"])
-            if record is None or record.audio != entry["audio"]:
+            if record is None or record.audio != entry["audio"] or record.source_id != source:
                 raise StageError(f"segment {entry['segment_id']} is not in the seed run")
             text = training_text(record)
             if not text:
@@ -232,7 +242,8 @@ class Builder:
                 continue
             found.append(
                 Candidate(contract.SEED, record.segment_id, record.segment_id,
-                          self._path(record.audio), _seconds(self.data / record.audio), text)
+                          self._path(record.audio), _seconds(self.data / record.audio), text,
+                          record.source_id)
             )  # fmt: skip
         return found
 
@@ -272,12 +283,20 @@ class Builder:
         train = [c for c in teacher_ok if c.group not in held]
         valid = [c for c in teacher_ok if c.group in held]
         train_s = sum(c.duration for c in train)
+        # The seed's hold-out counts only segments that passed the text rules and aligned, so a
+        # dropped segment never moves it; the share cap then applies to the training seed alone.
+        by_source: dict[str, float] = {}
+        for c in seed_ok:
+            by_source[str(c.source)] = by_source.get(str(c.source), 0.0) + c.duration
+        seed_hold = contract.holdout_sources(by_source, self.seed_val_share, seed=random_seed)
+        seed_valid = [c for c in seed_ok if c.source in seed_hold.sources]
+        seed_train = [c for c in seed_ok if c.source not in seed_hold.sources]
         oversample = int(self.plan["oversample"])  # type: ignore[arg-type]
         share_max = float(self.plan["seed_share_max"])  # type: ignore[arg-type]
-        offered = [(c.key, c.duration) for c in seed_ok]
+        offered = [(c.key, c.duration) for c in seed_train]
         fits = set(contract.cap_seed(offered, train_s, share_max, oversample, seed=random_seed))
-        seed_kept = [c for c in seed_ok if c.key in fits]
-        self.left_out["share_cap"] = len(seed_ok) - len(seed_kept)
+        seed_kept = [c for c in seed_train if c.key in fits]
+        self.left_out["share_cap"] = len(seed_train) - len(seed_kept)
 
         def row(c: Candidate) -> dict[str, object]:
             return {"path": c.path, "duration": c.duration, "transcript": c.transcript,
@@ -285,7 +304,9 @@ class Builder:
 
         train_rows = [row(c) for c in train]
         train_rows += [row(c) for _ in range(oversample) for c in seed_kept]
-        valid_rows = [row(c) for c in valid]
+        # Held-out seed rows first and once: a validation pass over whole batches in file order
+        # drops a short tail, which is then teacher rows, never her real voice.
+        valid_rows = [row(c) for c in seed_valid] + [row(c) for c in valid]
         ear = sum(self.hold_out.holds(str(r["transcript"])) for r in train_rows + valid_rows)
         if ear:
             raise StageError(f"{ear} corpus rows speak an ear-test line")
@@ -318,6 +339,11 @@ class Builder:
             },
             "seed_left_out": dict(self.left_out),
             "ear_test_lines": ear,
+            "seed_val_share": self.seed_val_share,
+            "seed_val_sources": len(seed_hold.sources),
+            "seed_val_segments": len(seed_valid),
+            "seed_val_hours": _hours(sum(c.duration for c in seed_valid)),
+            "seed_val_reason": seed_hold.reason,
         }
         summary_rel = f"{self.rel}/{contract.SUMMARY_NAME}"
         payload = json.dumps(summary, indent=2) + "\n"
