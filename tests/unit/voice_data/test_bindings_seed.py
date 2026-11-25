@@ -1497,6 +1497,27 @@ def test_arousal_is_logit_zero_of_the_card_model(
     assert_offline_and_quiet("transformers")
 
 
+def test_dimensions_are_head_outputs_0_1_2_each_clipped(
+    cache: Cache, transformers_fake: Transformers
+) -> None:
+    monitor = arousal.load("cpu")
+    head = monitor._model.classifier
+    with torch.no_grad():
+        head.out_proj.weight.zero_()
+        head.out_proj.bias.copy_(torch.tensor([0.7, 0.2, 0.4]))
+    values = monitor.dimensions(tone(1.0, 24000), 24000)
+    assert [round(v, 6) for v in values] == [0.7, 0.2, 0.4]
+    assert all(isinstance(v, float) for v in values)
+    (length,), kwargs = transformers_fake.rec.one("extract")
+    assert length == 16000 and kwargs["sampling_rate"] == 16000
+    assert transformers_fake.rec.one("wav2vec2")[0] == ((1, 16000),)
+    with torch.no_grad():
+        head.out_proj.bias.copy_(torch.tensor([1.4, -0.3, 0.9]))
+    values = monitor.dimensions(tone(1.0, 16000), 16000)
+    assert [round(v, 6) for v in values] == [1.0, 0.0, 0.9]
+    assert math.isclose(monitor.arousal(tone(1.0, 16000), 16000), 1.0)
+
+
 def test_arousal_missing_keys_are_a_job_error(
     cache: Cache, transformers_fake: Transformers, monkeypatch: pytest.MonkeyPatch
 ) -> None:
