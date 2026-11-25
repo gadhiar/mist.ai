@@ -1,8 +1,8 @@
-"""Tests for the blind listening packs (T9, T17): six kinds, the sealed key and `pack import`.
+"""Tests for the blind listening packs (T9, T17): seven kinds, the sealed key and `pack import`.
 
 Records the packs read that later tasks produce (bake-off takes, `gains.json`, spot-check takes,
-the ABX manifest, the labels pre-fill) are built here from the Interfaces shapes with synthetic
-data. Clips are small synthetic FLAC files: a real STREAMINFO header and an opaque payload unique
+the ABX manifest, the labels pre-fill, the voice A/B bench run) are built here from the
+Interfaces shapes with synthetic data. Clips are small synthetic FLAC files: a real STREAMINFO header and an opaque payload unique
 to each clip, so the byte-identity check is meaningful and no audio processing is needed.
 """
 
@@ -233,6 +233,49 @@ def write_takes(root: root_mod.Root, rel: str, takes: list[dict]) -> None:
     write_jsonl(root.path / rel, takes)
     for row in takes:
         write_clip(root, row["audio"])
+
+
+VOICE_AB_BASELINE = "mist"
+VOICE_AB_TRAINED = "mist-trained-r1"
+VOICE_AB_LINES = tuple(f"L{n:02d}" for n in range(1, 21)) + tuple(f"A{n:02d}" for n in range(1, 7))
+
+
+def write_voice_ab_run(
+    root: root_mod.Root,
+    run: str,
+    *,
+    lines: tuple[str, ...] = VOICE_AB_LINES,
+    text: Callable[[str], str] = lambda line: f"Public line {line}.",
+) -> dict:
+    """A `voice_ab.py` bench run as its manifest shape: per line, both arms' FLAC clips."""
+    base = f"bench/voice-ab/{run}"
+    rows = []
+    for line in lines:
+        arms = {}
+        for arm in ("baseline", "trained"):
+            rel = f"{base}/clips/{line}-{arm}.flac"
+            write_clip(root, rel)
+            arms[arm] = {
+                "clip": rel,
+                "first_chunk_ms": 120.0,
+                "loudness_lufs": -20.4,
+                "gain_db": 0.4,
+                "clipped_samples": 0,
+                "model_id": f"pin+{arm}",
+            }
+        rows.append({"line_id": line, "text": text(line), "arms": arms})
+    manifest = {
+        "schema": 1,
+        "baseline": VOICE_AB_BASELINE,
+        "trained": VOICE_AB_TRAINED,
+        "target_lufs": -20.0,
+        "sample_rate": 24000,
+        "character": {"double_gain": 0.35, "limiter": True},
+        "lines": rows,
+    }
+    path = root.path / base / "voice_ab.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
 
 
 def run_cli(root: root_mod.Root, *args: str) -> int:
@@ -884,6 +927,7 @@ def test_the_template_has_a_branch_for_every_field_type_a_draft_uses(
         clips[system] = rel
     manifest = {"lines": [{"line_id": "L1", "state": "calm", "clips": clips}]}
     (root.path / "bench" / "abx" / "abx.json").write_text(json.dumps(manifest), encoding="utf-8")
+    write_voice_ab_run(root, "v1")
     options = {
         "labels": {"run": "r1"},
         "clean-ab": {"before": "r1", "after": "c1"},
@@ -891,6 +935,7 @@ def test_the_template_has_a_branch_for_every_field_type_a_draft_uses(
         "bakeoff": {"run": "b1"},
         "spotcheck": {"takes": f"{BATCH}/takes.jsonl"},
         "abx": {"manifest": "bench/abx/abx.json"},
+        "voice-ab": {"run": "v1"},
     }
     assert set(options) == set(packs.KINDS)
     used = {
@@ -1260,6 +1305,200 @@ def test_abx_pack_and_tallies(private_root: root_mod.Root, tmp_path: Path) -> No
     assert sum(row["correct"] for row in tallies["abx"]) == 5
     assert tallies["ratings"]["seed"]["preferred"] == 2
     assert tallies["ratings"]["student:pocket-ft"]["natural_mean"] == 4
+
+
+# --- voice A/B ----------------------------------------------------------------------------------
+
+
+def test_voice_ab_pack_seals_a_random_order_per_line(private_root: root_mod.Root) -> None:
+    manifest = write_voice_ab_run(private_root, "v1")
+    argv = ["pack", "voice-ab", "--run", "v1", "--seed", "5"]
+    assert run_cli(private_root, *argv) == 0
+    data, key = page_of(private_root, 5), key_of(private_root, 5)
+    assert data["kind"] == "voice-ab"
+    assert data["columns"] == ["label", "preferred", "not_her_a", "not_her_b"]
+    assert data["fields"]["preferred"] == {
+        "type": "choice",
+        "title": "Preferred",
+        "options": ["A", "B", "none"],
+    }
+    assert data["fields"]["not_her_a"]["type"] == data["fields"]["not_her_b"]["type"] == "flag"
+    rows = items_of(data)
+    assert len(rows) == 26
+    texts = {row["line_id"]: row["text"] for row in manifest["lines"]}
+    clips = {
+        (row["line_id"], arm): info["clip"]
+        for row in manifest["lines"]
+        for arm, info in row["arms"].items()
+    }
+    seen_lines, firsts = [], set()
+    for _, item in rows:
+        assert [c["name"] for c in item["clips"]] == ["A", "B"]
+        assert item["fields"] == ["preferred", "not_her_a", "not_her_b"]
+        info = key["items"][item["label"]]
+        assert {info["A"], info["B"]} == {"baseline", "trained"}
+        assert item["text"] == texts[info["line_id"]]
+        seen_lines.append(info["line_id"])
+        firsts.add(info["A"])
+        for clip in item["clips"]:
+            src = private_root.path / clips[(info["line_id"], info[clip["name"]])]
+            packed = pack_dir(private_root, 5) / "clips" / f"{clip['label']}.flac"
+            assert packed.read_bytes() == src.read_bytes()
+    assert sorted(seen_lines) == sorted(VOICE_AB_LINES)
+    assert seen_lines != list(VOICE_AB_LINES)  # the lines are shuffled too
+    assert firsts == {"baseline", "trained"}
+    assert key["inputs"] == {"run": "v1"}
+    page = (pack_dir(private_root, 5) / "index.html").read_text(encoding="utf-8")
+    for name in (VOICE_AB_BASELINE, VOICE_AB_TRAINED, "baseline", "trained", "pocket"):
+        assert name not in page.lower()
+
+
+def test_voice_ab_order_follows_the_seed(private_root: root_mod.Root) -> None:
+    write_voice_ab_run(private_root, "v1")
+    orders = []
+    for seed in (5, 6):
+        draft = packs.draft_for(private_root, "voice-ab", {"run": "v1"}, seed)
+        orders.append([(item.key["line_id"], item.key["A"]) for item in draft.groups[0].items])
+    again = packs.draft_for(private_root, "voice-ab", {"run": "v1"}, 5)
+    assert orders[0] == [(item.key["line_id"], item.key["A"]) for item in again.groups[0].items]
+    assert orders[0] != orders[1]
+
+
+@pytest.mark.parametrize("problem", ["25-lines", "27-lines", "no-trained-arm", "no-clip"])
+def test_voice_ab_pack_refuses_a_run_that_is_not_the_ear_test(
+    private_root: root_mod.Root, problem: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lines = VOICE_AB_LINES[:25] if problem == "25-lines" else VOICE_AB_LINES
+    if problem == "27-lines":
+        lines = (*VOICE_AB_LINES, "A07")
+    manifest = write_voice_ab_run(private_root, "v1", lines=lines)
+    if problem == "no-trained-arm":
+        del manifest["lines"][3]["arms"]["trained"]
+    if problem == "no-clip":
+        del manifest["lines"][3]["arms"]["baseline"]["clip"]
+    path = private_root.path / "bench" / "voice-ab" / "v1" / "voice_ab.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert run_cli(private_root, "pack", "voice-ab", "--run", "v1", "--seed", "5") == 2
+    err = capsys.readouterr().err
+    assert ("26" in err) if problem.endswith("lines") else ("arm" in err)
+    assert list((private_root.path / "packs").iterdir()) == []
+
+
+@pytest.mark.parametrize("run", ["missing", "../v1", "Bad Run"])
+def test_voice_ab_pack_refuses_a_run_it_cannot_read(private_root: root_mod.Root, run: str) -> None:
+    write_voice_ab_run(private_root, "v1")
+    assert run_cli(private_root, "pack", "voice-ab", "--run", run, "--seed", "5") == 2
+    assert list((private_root.path / "packs").iterdir()) == []
+
+
+@pytest.mark.parametrize("who", [VOICE_AB_BASELINE, VOICE_AB_TRAINED])
+def test_voice_ab_page_naming_either_identity_is_refused(
+    private_root: root_mod.Root, who: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def text(line: str) -> str:
+        return f"Say hello to {who} today." if line == "L07" else f"Public line {line}."
+
+    write_voice_ab_run(private_root, "v1", text=text)
+    assert run_cli(private_root, "pack", "voice-ab", "--run", "v1", "--seed", "5") == 2
+    err = capsys.readouterr().err
+    # The trained id holds the baseline's as a word, so it counts as two names.
+    assert "refused: the page would name" in err and who not in err
+    assert list((private_root.path / "packs").iterdir()) == []
+
+
+def _voice_ab_fill(
+    key: dict, prefer: dict[str, str], not_her: dict[str, set[str]]
+) -> Callable[[dict, dict], dict[str, object]]:
+    """Answers per line: `prefer[line]` is an arm or `none`; `not_her[line]` the arms flagged."""
+
+    def fill(group: dict, item: dict) -> dict[str, object]:
+        info = key["items"][item["label"]]
+        line = info["line_id"]
+        choice = prefer[line]
+        shown = {info["A"]: "A", info["B"]: "B"}
+        flagged = not_her.get(line, set())
+        return {
+            "preferred": "none" if choice == "none" else shown[choice],
+            "not_her_a": int(info["A"] in flagged),
+            "not_her_b": int(info["B"] in flagged),
+        }
+
+    return fill
+
+
+def _voice_ab_prefer(trained: int, baseline: int) -> dict[str, str]:
+    arms = ["trained"] * trained + ["baseline"] * baseline
+    arms += ["none"] * (len(VOICE_AB_LINES) - len(arms))
+    return dict(zip(VOICE_AB_LINES, arms, strict=True))
+
+
+@pytest.mark.parametrize(
+    ("trained", "baseline", "not_her", "result"),
+    [
+        (18, 6, {"L02": {"trained"}, "L03": {"baseline"}, "A01": {"baseline", "trained"}}, True),
+        (17, 9, {}, False),
+        (18, 0, {}, True),
+        (20, 6, {"L02": {"trained"}, "L03": {"trained"}, "L04": {"baseline"}}, False),
+    ],
+    ids=["pass-at-18", "fail-at-17", "none-counts-against", "fail-on-not-her"],
+)
+def test_voice_ab_import_applies_the_pass_rule_and_prints_counts_only(
+    private_root: root_mod.Root,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    trained: int,
+    baseline: int,
+    not_her: dict[str, set[str]],
+    result: bool,
+) -> None:
+    write_voice_ab_run(private_root, "v1")
+    assert run_cli(private_root, "pack", "voice-ab", "--run", "v1", "--seed", "5") == 0
+    data, key = page_of(private_root, 5), key_of(private_root, 5)
+    prefer = _voice_ab_prefer(trained, baseline)
+    capsys.readouterr()
+    text = answer(data, _voice_ab_fill(key, prefer, not_her))
+    assert import_ratings(private_root, text, tmp_path, seed=5) == 0
+    out = capsys.readouterr().out
+    doc = json.loads(
+        (private_root.path / "bench" / "voice-ab" / "v1" / "voice_ab_result.json").read_text()
+    )
+    flags = [arm for arms in not_her.values() for arm in arms]
+    expected = {
+        "lines": 26,
+        "trained_preferred": trained,
+        "baseline_preferred": baseline,
+        "none": 26 - trained - baseline,
+        "not_her_trained": flags.count("trained"),
+        "not_her_baseline": flags.count("baseline"),
+        "pass": result,
+    }
+    assert {name: doc[name] for name in expected} == expected
+    assert doc["pack"] == packs.pack_id(5) and doc["run"] == "v1"
+    assert doc["thresholds"] == {"voice_ab.preferred_min": 18, "voice_ab.lines": 26}
+    per_line = {row["line_id"]: row for row in doc["per_line"]}
+    assert per_line["L01"]["preferred"] == prefer["L01"]
+    assert sorted(per_line["A01"]["not_her"]) == sorted(not_her.get("A01", set()))
+    verdict = "pass" if result else "fail"
+    assert f"trained preferred {trained} of 26" in out
+    assert f"baseline preferred {baseline}" in out and verdict in out
+    for secret in (VOICE_AB_BASELINE, VOICE_AB_TRAINED, "L01", "A01", "Public line"):
+        assert secret not in out
+
+
+def test_voice_ab_incomplete_ratings_keep_the_key_sealed(
+    private_root: root_mod.Root,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write_voice_ab_run(private_root, "v1")
+    assert run_cli(private_root, "pack", "voice-ab", "--run", "v1", "--seed", "5") == 0
+    data = page_of(private_root, 5)
+    text = answer(data, lambda group, item: {"preferred": "", "not_her_a": 0, "not_her_b": 0})
+    _sealed(monkeypatch)
+    assert import_ratings(private_root, text, tmp_path, seed=5) == 2
+    assert "the key stays sealed" in capsys.readouterr().err
+    assert not (private_root.path / "bench" / "voice-ab" / "v1" / "voice_ab_result.json").exists()
 
 
 # --- privacy ------------------------------------------------------------------------------------

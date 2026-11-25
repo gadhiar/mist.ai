@@ -1,9 +1,9 @@
 """Blind listening packs for Raj's ratings, their sealed keys, and `pack import`.
 
 A pack is a static page, `packs/<pack_id>/index.html`, with its clips in `clips/` beside it and
-the key that ties each seeded label to what made it in `packs/<pack_id>.key/`. Six kinds share one
-page template, driven by the page data: `labels`, `clean-ab`, `text`, `bakeoff`, `spotcheck` and
-`abx`. Raj rates the page in a browser and exports `ratings.csv`; `pack import` checks that every
+the key that ties each seeded label to what made it in `packs/<pack_id>.key/`. Seven kinds share
+one page template, driven by the page data: `labels`, `clean-ab`, `text`, `bakeoff`, `spotcheck`,
+`abx` and `voice-ab`. Raj rates the page in a browser and exports `ratings.csv`; `pack import` checks that every
 item is rated before it opens the key, then writes the records later stages read.
 
 The `labels` pack asks, per kept clip of one extract run, who is audible, a keep range for a clip
@@ -50,7 +50,7 @@ from .records import SegmentRecord, TakeRecord, read_json, read_jsonl, sha256_fi
 from .root import Root
 from .states import SPEAKING_STATES
 
-KINDS = ("labels", "clean-ab", "text", "bakeoff", "spotcheck", "abx")
+KINDS = ("labels", "clean-ab", "text", "bakeoff", "spotcheck", "abx", "voice-ab")
 # The labels pack's fields, in its column order after `label`.
 LABEL_FIELDS = ("voices", "keep_from_s", "keep_to_s", "energy", "mood", "tags", "note")
 # The words shown beside each digit of the energy and mood scales (Design part 1).
@@ -955,6 +955,92 @@ def draft_abx(root: Root, manifest_rel: str, seed: int) -> Draft:
     )
 
 
+VOICE_AB_DIR = "bench/voice-ab"
+VOICE_AB_MANIFEST = "voice_ab.json"
+VOICE_AB_RESULT = "voice_ab_result.json"
+VOICE_AB_ARMS = ("baseline", "trained")
+_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _voice_ab_lines(doc: object) -> tuple[list[dict], frozenset[str]]:
+    """The manifest's lines and its two identity ids; refuses a line without both arms."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("lines"), list):
+        raise InputError("refused: the voice A/B manifest has no lines")
+    ids = [doc.get(arm) for arm in VOICE_AB_ARMS]
+    if not all(isinstance(i, str) and i for i in ids) or ids[0] == ids[1]:
+        raise InputError("refused: the voice A/B manifest does not name two identities")
+    seen: set[str] = set()
+    for line in doc["lines"]:
+        if not isinstance(line, dict) or not isinstance(line.get("line_id"), str):
+            raise InputError("refused: a voice A/B line lacks a line_id")
+        if line["line_id"] in seen:
+            raise InputError("refused: two voice A/B lines share a line_id")
+        seen.add(line["line_id"])
+        arms = line.get("arms")
+        if (
+            not isinstance(arms, dict)
+            or set(arms) != set(VOICE_AB_ARMS)
+            or not all(
+                isinstance(a, dict) and isinstance(a.get("clip"), str) for a in arms.values()
+            )
+        ):
+            raise InputError("refused: a voice A/B line lacks an arm or an arm's clip")
+        if not isinstance(line.get("text", ""), str):
+            raise InputError("refused: a voice A/B line's text is not text")
+    return doc["lines"], frozenset(ids)  # type: ignore[arg-type]
+
+
+def draft_voice_ab(root: Root, run: str, seed: int, lines_n: int) -> Draft:
+    """Per ear-test line, the baseline and trained renders as A and B in a seeded order.
+
+    The run is `voice_ab.py`'s `bench/voice-ab/<run>/`, whose manifest lists per line both
+    arms' clips; it must hold exactly the `voice_ab.lines` gate's count. The lines are shuffled
+    and each line's A/B order is drawn from the seed, both sealed in the key. Both identity ids
+    are names the page must not show.
+    """
+    if not _RUN_RE.fullmatch(run):
+        raise InputError("refused: a run name is letters, digits, '.', '_' and '-'")
+    path = _read_path(root, f"{VOICE_AB_DIR}/{run}/{VOICE_AB_MANIFEST}")
+    lines, ids = _voice_ab_lines(read_json(path))
+    if len(lines) != lines_n:
+        raise InputError(
+            f"refused: the voice A/B run has {len(lines)} lines; the ear test plays {lines_n}"
+        )
+    rng = random.Random(f"{seed}:order")
+    order = sorted(lines, key=lambda line: line["line_id"])
+    rng.shuffle(order)
+    items = []
+    for line in order:
+        sides = VOICE_AB_ARMS if rng.random() < 0.5 else VOICE_AB_ARMS[::-1]
+        clips = {arm: line["arms"][arm]["clip"] for arm in VOICE_AB_ARMS}
+        items.append(
+            DraftItem(
+                clips=((clips[sides[0]], "A"), (clips[sides[1]], "B")),
+                fields=("preferred", "not_her_a", "not_her_b"),
+                key={"line_id": line["line_id"], "A": sides[0], "B": sides[1]},
+                text=line.get("text") or None,
+            )
+        )
+    return Draft(
+        kind="voice-ab",
+        title="Voice A/B",
+        intro=(
+            "Each row is one line spoken twice, A and B, in a random order. Pick the one you "
+            "prefer, or none if neither is better. Replay as often as you like.",
+            "Tick not her under any clip that does not sound like her.",
+        ),
+        fields={
+            "preferred": {"type": "choice", "title": "Preferred", "options": ["A", "B", "none"]},
+            "not_her_a": {"type": "flag", "title": "A not her"},
+            "not_her_b": {"type": "flag", "title": "B not her"},
+        },
+        columns=("label", "preferred", "not_her_a", "not_her_b"),
+        groups=(DraftGroup(id="lines", heading="Lines", items=tuple(items)),),
+        inputs={"run": run},
+        names=ids,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Building a pack
 # ---------------------------------------------------------------------------
@@ -997,6 +1083,8 @@ def draft_for(
         return draft_spotcheck(root, options["takes"], seed, per_state)
     if kind == "abx":
         return draft_abx(root, options["manifest"], seed)
+    if kind == "voice-ab":
+        return draft_voice_ab(root, options["run"], seed, int(gates.value("voice_ab.lines")))
     raise InputError(f"refused: unknown pack kind; use one of {', '.join(KINDS)}")
 
 
@@ -1529,6 +1617,64 @@ def _import_abx(root: Root, key: dict, ratings: dict, gates: gates_mod.Gates, em
     emit(f"abx: tallies written to {rel}")
 
 
+def _import_voice_ab(
+    root: Root, key: dict, ratings: dict, gates: gates_mod.Gates, emit: Emit
+) -> None:
+    """Count the ear test and apply its pass rule; print counts only.
+
+    The trained arm passes when it is preferred on at least `voice_ab.preferred_min` lines, a
+    `none` counting against it, and its not-her flags are no more than the baseline's.
+    """
+    per_line = []
+    for label, info in key["items"].items():
+        values = ratings[label]
+        choice = values["preferred"]
+        flagged = [info[side] for side in ("A", "B") if values[f"not_her_{side.lower()}"] == "1"]
+        per_line.append(
+            {
+                "line_id": info["line_id"],
+                "preferred": info[choice] if choice in ("A", "B") else "none",
+                "not_her": sorted(flagged),
+            }
+        )
+    per_line.sort(key=lambda row: row["line_id"])
+    preferred_min = int(gates.value("voice_ab.preferred_min"))
+    counts = {
+        "lines": len(per_line),
+        "trained_preferred": sum(row["preferred"] == "trained" for row in per_line),
+        "baseline_preferred": sum(row["preferred"] == "baseline" for row in per_line),
+        "none": sum(row["preferred"] == "none" for row in per_line),
+        "not_her_trained": sum("trained" in row["not_her"] for row in per_line),
+        "not_her_baseline": sum("baseline" in row["not_her"] for row in per_line),
+    }
+    passed = (
+        counts["trained_preferred"] >= preferred_min
+        and counts["not_her_trained"] <= counts["not_her_baseline"]
+    )
+    run = str(key["inputs"]["run"])
+    rel = f"{VOICE_AB_DIR}/{run}/{VOICE_AB_RESULT}"
+    doc = {
+        "schema": 1,
+        "pack": key["pack"],
+        "run": run,
+        "thresholds": {
+            "voice_ab.preferred_min": preferred_min,
+            "voice_ab.lines": int(gates.value("voice_ab.lines")),
+        },
+        **counts,
+        "pass": passed,
+        "per_line": per_line,
+    }
+    write_json(root, rel, doc)
+    emit(
+        f"voice-ab: trained preferred {counts['trained_preferred']} of {counts['lines']} "
+        f"(needs {preferred_min}), baseline preferred {counts['baseline_preferred']}, "
+        f"none {counts['none']}; not her: trained {counts['not_her_trained']}, "
+        f"baseline {counts['not_her_baseline']}; {'pass' if passed else 'fail'}"
+    )
+    emit(f"voice-ab: result written to {rel}")
+
+
 # The labels kind is imported by `_import_labels`, which also takes `replace`.
 _IMPORTERS: dict[str, Callable[[Root, dict, dict, gates_mod.Gates, Emit], None]] = {
     "clean-ab": _import_clean_ab,
@@ -1536,4 +1682,5 @@ _IMPORTERS: dict[str, Callable[[Root, dict, dict, gates_mod.Gates, Emit], None]]
     "bakeoff": _import_bakeoff,
     "spotcheck": _import_spotcheck,
     "abx": _import_abx,
+    "voice-ab": _import_voice_ab,
 }

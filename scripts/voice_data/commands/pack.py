@@ -1,4 +1,4 @@
-"""`pack {labels,clean-ab,text,bakeoff,spotcheck,abx}` and `pack import`: blind pages for Raj.
+"""`pack {labels,clean-ab,text,bakeoff,spotcheck,abx,voice-ab}` and `pack import`: blind pages.
 
 Output names pack ids, counts and root-relative paths only: never a transcript, a script line, a
 teacher's or student's label mapping, or a source file name.
@@ -24,6 +24,7 @@ _OPTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "bakeoff": (("--run", "run", "the bake-off run under teachers/bakeoff/"),),
     "spotcheck": (("--takes", "takes", "the batch's takes.jsonl, relative to the root"),),
     "abx": (("--manifest", "manifest", "the ABX manifest, relative to the root"),),
+    "voice-ab": (("--run", "run", "the voice_ab.py bench run under bench/voice-ab/"),),
 }
 
 _HELP = {
@@ -36,6 +37,7 @@ _HELP = {
     "bakeoff": "per state and line, every teacher's take, rated",
     "spotcheck": "random selected takes per state of one batch, each accepted or rejected",
     "abx": "seed, teacher and student ABX trials, plus ratings",
+    "voice-ab": "the ear test: per line, two identities as A and B in a seeded order",
 }
 
 
