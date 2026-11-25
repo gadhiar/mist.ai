@@ -2,16 +2,21 @@
 
 Runs as `/opt/venv-extract/bin/python -I -u -m scripts.voice_data.stages.clean --data /data
 --run R --device D`, with the extract run the plan names mounted read-only and
-`seed/runs/<R>/` writable. The host's plan names the extract run, the target id, the thresholds and Raj's labels
-(segment ids and states, no text), so nothing private reaches the argv.
+`seed/runs/<R>/` writable. The host's plan (schema 2) names the extract run, the target id, the
+thresholds and Raj's labels (each labelled clip's label fields, never its note), so nothing
+private reaches the argv.
 
 The order is Design 5's:
 
 1. Each kept segment is read from the extract run and resampled to 24 kHz mono, where every
-   later step works. With labels, a kept segment they do not list is dropped as `not-her`, and
-   a listed one takes its labelled state.
+   later step works. With labels, a segment whose label has `removed` is dropped with that
+   reason, a kept segment with no label is dropped as `unlabelled`, and a `her_nearby` clip
+   with a keep range is cut to it, its span moved to match, before any step sees it. A labelled
+   clip's state is its projected state, null when it lies outside every region, and is never
+   replaced by extract's `state_proposed`: a null-state clip counts in the pooled figures and
+   joins no state's references or minutes.
 2. The cleaning gate's distribution is the leave-one-out SIM of the confirmed segments
-   (labelled ones, else primary-cluster ones), and its threshold per embedder the
+   (labelled ones that survive, else primary-cluster ones), and its threshold per embedder the
    `cleaning.sim_percentile` of it (the median). Each `Enhancer` step runs on every segment in
    turn, and is kept only when the median SIM of its output to its input reaches the threshold
    on every embedder and the median spectrum distance (`score.spectrum_distance_db`) is at most
@@ -26,6 +31,9 @@ The order is Design 5's:
    (`references`) and written as WAV PCM16 under `refs/<state>/`, each with its segment's
    `crisper` transcript beside it as `<n>.private.txt`; `refs.json` names both paths and never
    the text. The host copies both to `targets/<T>/refs/<state>/`.
+
+With labels, `report.json` also carries `labels.tables` over the labels of the clips that
+survived, with no pre-fill.
 
 The reference SIM reuses the embeddings of the cleaned audio before its gain: a scalar gain
 does not change a speaker embedding, and embedding every clip again would double the cost of the
@@ -48,9 +56,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .. import labels as labels_mod
 from ..bindings.protocols import Asr, Enhancer, SpeakerEmbedder
 from ..commands import clean as contract
 from ..records import SegmentRecord
+from ..states import SPEAKING_STATES
 from . import references, score, transcribe
 from .prosody import active_energy_db
 from .prosody import prosody as measure_prosody
@@ -299,15 +309,51 @@ def _read_plan(data: Path, run_id: str) -> dict[str, object]:
         plan = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StageError("the clean plan is missing or not JSON") from exc
-    if not isinstance(plan, dict) or plan.get("schema") != SCHEMA:
-        raise StageError("the clean plan is not a schema 1 plan")
+    if not isinstance(plan, dict) or plan.get("schema") != contract.PLAN_SCHEMA:
+        raise StageError(f"the clean plan is not a schema {contract.PLAN_SCHEMA} plan")
     if not isinstance(plan.get("from"), str) or not isinstance(plan.get("target"), str):
         raise StageError("the clean plan names no extract run or target")
     if not isinstance(plan.get("thresholds"), dict):
         raise StageError("the clean plan has no thresholds")
-    if plan.get("labels") is not None and not isinstance(plan.get("labels"), dict):
+    labels = plan.get("labels")
+    if labels is not None and not isinstance(labels, dict):
         raise StageError("the clean plan's labels are not a map")
+    for label in (labels or {}).values():
+        if not isinstance(label, dict) or set(label) != set(contract.LABEL_KEYS):
+            raise StageError("a label in the clean plan does not hold the label fields")
     return plan
+
+
+def _trim(record: SegmentRecord, label: Mapping[str, object] | None) -> SegmentRecord:
+    """Return the record with its span moved to a `her_nearby` label's keep range, if it has one."""
+    if label is None or label["voices"] != "her_nearby" or label["keep_from_s"] is None:
+        return record
+    keep_from = float(label["keep_from_s"])  # type: ignore[arg-type]
+    keep_to = float(label["keep_to_s"])  # type: ignore[arg-type]
+    return replace(record, start_s=record.start_s + keep_from, end_s=record.start_s + keep_to)
+
+
+def _label_record(
+    run: str, record: SegmentRecord, label: Mapping[str, object]
+) -> labels_mod.LabelRecord:
+    """Rebuild a survivor's label from the plan and its extract segment, for the tables.
+
+    The plan carries no note, so `has_note` is false here.
+    """
+    return labels_mod.LabelRecord.from_json(
+        {
+            "run": run,
+            "segment_id": record.segment_id,
+            "source_id": record.source_id,
+            "start_s": record.start_s,
+            "end_s": record.end_s,
+            "channel": record.channel,
+            "separator": record.separator,
+            "duration_s": round(record.end_s - record.start_s, 2),
+            **label,
+            "has_note": False,
+        }
+    )
 
 
 class Cleaning:
@@ -320,10 +366,11 @@ class Cleaning:
         self.models = models
         self.from_run = str(plan["from"])
         self.target = str(plan["target"])
-        self.labels: dict[str, str] | None = plan["labels"]  # type: ignore[assignment]
+        self.labels: dict[str, dict[str, object]] | None = plan["labels"]  # type: ignore[assignment]
         thresholds: Mapping[str, float] = plan["thresholds"]  # type: ignore[assignment]
         self.sim_percentile = float(thresholds["cleaning.sim_percentile"])
         self.spectrum_max_db = float(thresholds["cleaning.spectrum_max_db"])
+        self.state_seconds_min = float(thresholds[labels_mod.STATE_SECONDS_MIN_GATE])
         self.run_rel = contract.run_rel(run_id)
         self.run_dir = data / self.run_rel
 
@@ -347,16 +394,24 @@ class Cleaning:
         work: list[int] = []
         audios: list[np.ndarray] = []
         for record in records:
+            label = None if self.labels is None else self.labels.get(record.segment_id)
             if not record.kept:
                 rows.append(record)
-            elif self.labels is not None and record.segment_id not in self.labels:
-                reasons = (*record.reasons, contract.NOT_HER)
+            elif self.labels is not None and (label is None or label["removed"] is not None):
+                reason = contract.UNLABELLED if label is None else str(label["removed"])
+                reasons = (*record.reasons, reason)
                 rows.append(replace(record, kept=False, audio="", reasons=reasons))
             else:
-                state = self.labels[record.segment_id] if self.labels is not None else record.state
-                rows.append(replace(record, state=state))
+                state = record.state if label is None else label["state"]
+                trimmed = _trim(record, label)
+                rows.append(replace(trimmed, state=state))  # type: ignore[arg-type]
                 work.append(len(rows) - 1)
-                audios.append(_read_audio(self.data / record.audio))
+                audio = _read_audio(self.data / record.audio)
+                if trimmed is not record and label is not None:
+                    start = float(label["keep_from_s"])  # type: ignore[arg-type]
+                    end = float(label["keep_to_s"])  # type: ignore[arg-type]
+                    audio = audio[int(round(start * RATE)) : int(round(end * RATE))]
+                audios.append(audio)
         ids = set(contract.confirmed_ids([rows[i] for i in work], self.labels))
         confirmed = [k for k, i in enumerate(work) if rows[i].segment_id in ids]
         if len(confirmed) < 2:
@@ -470,7 +525,7 @@ class Cleaning:
                 references.Candidate(
                     segment_id=record.segment_id,
                     source_id=record.source_id,
-                    state=record.state or record.state_proposed,
+                    state=self._state(record),  # type: ignore[arg-type]
                     duration_s=len(audios[k]) / RATE,
                     snr_db=record.snr_db,
                     prosody=record.prosody,
@@ -534,11 +589,30 @@ class Cleaning:
         choices: Mapping[str, references.StateChoice],
         disagree: int,
     ) -> dict[str, object]:
-        minutes: dict[str, float] = {}
+        minutes: dict[str, float] = (
+            {} if self.labels is None else {state: 0.0 for state in SPEAKING_STATES}
+        )
+        seconds = 0.0
         for i in work:
             row = rows[i]
-            state = row.state or row.state_proposed
-            minutes[state] = minutes.get(state, 0.0) + (row.end_s - row.start_s) / 60.0
+            state = self._state(row)
+            seconds += row.end_s - row.start_s
+            if state is not None:
+                minutes[state] = minutes.get(state, 0.0) + (row.end_s - row.start_s) / 60.0
+        labels = self.labels or {}
+        removed = [
+            labels[r.segment_id]["removed"] for r in records if r.kept and r.segment_id in labels
+        ]
+        trimmed = sum(
+            _trim(records[i], labels.get(records[i].segment_id)) is not records[i] for i in work
+        )
+        tables = None
+        if self.labels is not None:
+            survivors = [
+                _label_record(self.from_run, records[i], self.labels[rows[i].segment_id])
+                for i in work
+            ]
+            tables = labels_mod.tables(survivors, None, state_seconds_min=self.state_seconds_min)
         return {
             "schema": SCHEMA,
             "run": self.run_id,
@@ -549,12 +623,25 @@ class Cleaning:
                 "kept": len(work),
                 "not_her": sum(contract.NOT_HER in r.reasons for r in rows),
                 "asr_disagree": disagree,
+                "removed_by_label": {
+                    reason: removed.count(reason) for reason in labels_mod.REMOVED
+                },
+                "trimmed": trimmed,
             },
             "steps": [d.to_json() for d in decisions],
+            "clean_minutes": round(seconds / 60.0, 3),
             "minutes_per_state": {s: round(m, 3) for s, m in sorted(minutes.items())},
             "references": {state: len(c.chosen) for state, c in choices.items()},
             "short_states": [state for state, c in choices.items() if c.short],
+            "labels": tables,
         }
+
+    def _state(self, record: SegmentRecord) -> str | None:
+        # A labelled clip's state is its projection, None allowed; only an unlabelled run falls
+        # back to extract's proposal.
+        if self.labels is not None:
+            return record.state
+        return record.state or record.state_proposed
 
 
 def run(data: Path, run_id: str, models: Models) -> list[str]:

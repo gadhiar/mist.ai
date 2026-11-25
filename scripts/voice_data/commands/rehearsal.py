@@ -456,8 +456,15 @@ def find_clean_run(root: root_mod.Root, run: str) -> str | None:
     return found[0] if found else None
 
 
-def _labels(root: root_mod.Root) -> dict[str, str] | None:
-    return clean_cmd.read_labels(root)
+def _labels(root: root_mod.Root, run: str) -> frozenset[str] | None:
+    # The ids of extract run `run`'s labelled segments that no label removes, so the impostor's
+    # `in_labels` still counts its segments that reached the seed as hers.
+    from .. import labels as labels_mod
+
+    labels = labels_mod.read_labels(root, run)
+    if labels is None:
+        return None
+    return frozenset(label.segment_id for label in labels if label.removed is None)
 
 
 def effects_plan(
@@ -513,7 +520,7 @@ def run_score(args: argparse.Namespace) -> int:
     clean_run = args.clean or find_clean_run(root, args.run)
     clean = _segments(root, clean_run) if clean_run else []
     eps, layouts = _episodes(root)
-    labels = _labels(root)
+    labels = _labels(root, args.run)
     plan_doc = read_json(root.path / pkg.PLAN_REL)
     sources = pkg.parse_sources(plan_doc.get("sources") if isinstance(plan_doc, dict) else None)
     files = sources.all_files()
