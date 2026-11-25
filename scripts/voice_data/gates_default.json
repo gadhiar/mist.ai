@@ -46,6 +46,7 @@
     "bakeoff.pass_fraction_min": {"value": 0.5, "h6": false, "note": "Bake-off: a state is weak when fewer than this share of its teacher's takes pass the take gate. Fixed."},
     "text.sample_n": {"value": 30, "h6": false, "note": "Text sample: lines Raj reviews per state. Fixed."},
     "text.reject_max": {"value": 3, "h6": true, "note": "Text sample: a state's lines pass with at most this many rejected. H6 calibrates [E]."},
+    "text.line_chars_min": {"value": 80, "h6": false, "note": "Text build: shortest line `text build` keeps, in characters after `clean`; set on 25 Nov from the first teacher run's keep rate by line length (text v1 was built at 20). Fixed."},
     "spotcheck.sample_n": {"value": 50, "h6": false, "note": "Spot check: takes Raj reviews per state. Fixed."},
     "spotcheck.reject_max": {"value": 5, "h6": true, "note": "Spot check: a batch is accepted with at most this many rejected per state. H6 calibrates [E]."},
     "bench.first_audio_cpu_ms_max": {"value": 196, "h6": false, "note": "Bench (4.2): median first audio on the CPU path, ms, idle and under E4B decode. Fixed."},
