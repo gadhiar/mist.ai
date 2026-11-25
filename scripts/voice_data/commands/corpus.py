@@ -1,4 +1,4 @@
-"""`corpus build --takes R --version C`: the student's training corpus, word-aligned.
+"""`corpus build --takes R --version C [--seed N]`: the student's training corpus, word-aligned.
 
 The corpus is the selected takes of teacher run `teachers/omnivoice/<R>/` plus the seed's kept
 real segments, written to `corpus/<C>/` in the layout the pinned Pocket TTS training code reads:
@@ -18,6 +18,8 @@ refuses a row without `words` (`UnalignedEntry`), so a row the aligner leaves ou
 counted. After alignment the job holds out `corpus.val_fraction` of the teacher lines (whole
 lines, so a line's takes never sit in both splits), caps the seed by `corpus.seed_share_max` of
 the training split's hours counted after the seed is oversampled 3x, and writes the splits.
+Every such choice follows the order of the sha256 of `--seed` (default 0) and the id, so the
+seed the manifest records as `random_seed` reproduces the splits byte for byte.
 The aligner's batch is 8, not upstream's 32, and the job asks for 3 GB of VRAM rather than the
 family's 16, which the 12 GB card cannot give.
 
@@ -81,18 +83,19 @@ def corpus_rel(version: str) -> str:
     return f"corpus/{version}"
 
 
-def _order(key: str) -> str:
-    # A stable order no input file's order can change: the sha256 of the id.
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+def _order(key: str, seed: int) -> str:
+    # A stable order no input file's order can change, the sha256 of the seed and the id, so a
+    # recorded seed reproduces every split and another seed draws a different one.
+    return hashlib.sha256(f"{seed}\n{key}".encode()).hexdigest()
 
 
-def holdout_lines(line_ids: Iterable[str], fraction: float) -> set[str]:
-    """Return the lines held out for validation: `fraction` of them, in a stable order.
+def holdout_lines(line_ids: Iterable[str], fraction: float, *, seed: int) -> set[str]:
+    """Return the lines held out for validation: `fraction` of them, in the seed's order.
 
     With two or more lines and a positive fraction, at least one line is held out and at least
     one stays in training, so neither split is empty.
     """
-    lines = sorted(set(line_ids), key=_order)
+    lines = sorted(set(line_ids), key=lambda line: _order(line, seed))
     if fraction <= 0 or len(lines) < 2:
         return set()
     count = min(max(1, round(fraction * len(lines))), len(lines) - 1)
@@ -104,19 +107,22 @@ def cap_seed(
     teacher_train_s: float,
     share_max: float,
     oversample: int,
+    *,
+    seed: int,
 ) -> list[str]:
-    """Return the seed segments that fit the share cap, filled greedily in a stable order.
+    """Return the seed segments that fit the share cap, filled greedily in the seed's order.
 
     The share is the oversampled seed's seconds over the training split's seconds (the teacher's
     training takes plus the oversampled seed). A segment that would push it past `share_max` is
     left out and the next one tried, so a short segment can still fit after a long one did not.
     """
+    ordered = sorted(segments, key=lambda s: _order(s[0], seed))
     if share_max >= 1:
-        return [segment_id for segment_id, _ in sorted(segments, key=lambda s: _order(s[0]))]
+        return [segment_id for segment_id, _ in ordered]
     budget = share_max / (1.0 - share_max) * teacher_train_s if share_max > 0 else 0.0
     kept: list[str] = []
     total = 0.0
-    for segment_id, seconds in sorted(segments, key=lambda s: _order(s[0])):
+    for segment_id, seconds in ordered:
         if oversample * (total + seconds) <= budget + 1e-9:
             kept.append(segment_id)
             total += seconds
@@ -137,6 +143,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     build = steps.add_parser("build", help="align and split the corpus (a GPU job)")
     build.add_argument("--takes", required=True, help="the scored teacher run under teachers/")
     build.add_argument("--version", required=True, help="the corpus version, a folder in corpus/")
+    build.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="orders every split choice; recorded in the manifest as random_seed (default 0)",
+    )
     build.set_defaults(func=run_build)
 
 
@@ -255,6 +267,7 @@ def run_build(args: argparse.Namespace) -> int:
         "takes": [{"take_id": t.take_id, "line_id": t.line_id, "audio": t.audio} for t in takes],
         "seed_run": seed_run,
         "segments": [{"segment_id": s, "audio": a} for s, a in segments],
+        "random_seed": args.seed,
         "oversample": OVERSAMPLE,
         "val_fraction": float(gates.value("corpus.val_fraction")),
         "seed_share_max": float(gates.value("corpus.seed_share_max")),
@@ -334,6 +347,7 @@ def run_build(args: argparse.Namespace) -> int:
 
 # The stage's summary keys the manifest copies.
 MANIFEST_KEYS = (
+    "random_seed",
     "teacher_hours",
     "teacher_train_hours",
     "valid_hours",

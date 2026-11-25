@@ -444,12 +444,73 @@ def test_validation_holds_out_whole_lines(root: root_mod.Root, hub: dict) -> Non
 
 def test_holdout_is_stable_and_keeps_a_line_in_each_split() -> None:
     lines = [f"l{n}" for n in range(100)]
-    held = corpus_cmd.holdout_lines(lines, 0.02)
-    assert len(held) == 2 and held == corpus_cmd.holdout_lines(list(reversed(lines)), 0.02)
-    assert len(corpus_cmd.holdout_lines(lines[:10], 0.02)) == 1
-    assert corpus_cmd.holdout_lines(lines[:1], 0.02) == set()
-    assert corpus_cmd.holdout_lines(lines[:10], 0.0) == set()
-    assert len(corpus_cmd.holdout_lines(lines[:3], 0.9)) == 2
+    held = corpus_cmd.holdout_lines(lines, 0.02, seed=0)
+    assert len(held) == 2
+    assert held == corpus_cmd.holdout_lines(list(reversed(lines)), 0.02, seed=0)
+    assert len(corpus_cmd.holdout_lines(lines[:10], 0.02, seed=0)) == 1
+    assert corpus_cmd.holdout_lines(lines[:1], 0.02, seed=0) == set()
+    assert corpus_cmd.holdout_lines(lines[:10], 0.0, seed=0) == set()
+    assert len(corpus_cmd.holdout_lines(lines[:3], 0.9, seed=0)) == 2
+
+
+def test_the_seed_orders_the_line_hold_out_and_the_seed_cap() -> None:
+    lines = [f"l{n}" for n in range(100)]
+    first = corpus_cmd.holdout_lines(lines, 0.1, seed=1)
+    assert first == corpus_cmd.holdout_lines(lines, 0.1, seed=1)
+    assert first != corpus_cmd.holdout_lines(lines, 0.1, seed=2)
+    segments = [(f"s{n}", 1.0) for n in range(20)]
+    kept = corpus_cmd.cap_seed(segments, 14.0, 0.3, 3, seed=1)
+    assert len(kept) == 2 and kept == corpus_cmd.cap_seed(segments[::-1], 14.0, 0.3, 3, seed=1)
+    assert kept != corpus_cmd.cap_seed(segments, 14.0, 0.3, 3, seed=2)
+    assert corpus_cmd.cap_seed(segments, 14.0, 1.0, 3, seed=1) != corpus_cmd.cap_seed(
+        segments, 14.0, 1.0, 3, seed=2
+    )
+
+
+def test_the_seed_is_recorded_and_its_splits_reproduce(root: root_mod.Root, hub: dict) -> None:
+    set_gates(root, val_fraction=0.25, seed_share_max=0.3)
+    assert build(root).code == 0
+    assert manifest_of(root)["random_seed"] == 0
+    plan = json.loads((corpus_dir(root) / "corpus-plan.json").read_text(encoding="utf-8"))
+    assert plan["random_seed"] == 0
+    names = ("train_aligned.jsonl", "valid_aligned.jsonl")
+    default = {n: (corpus_dir(root) / n).read_bytes() for n in names}
+    assert build(root, version="s2").code == 0
+    again = root.path / "corpus" / "s2"
+    assert {n: (again / n).read_bytes() for n in names} == default
+    result = build(root, "--seed", "7", version="s3")
+    assert result.code == 0, result.err
+    other = root.path / "corpus" / "s3"
+    assert json.loads((other / "manifest.json").read_text(encoding="utf-8"))["random_seed"] == 7
+    assert (other / "valid_aligned.jsonl").read_bytes() != default["valid_aligned.jsonl"]
+    assert (other / "train_aligned.jsonl").read_bytes() != default["train_aligned.jsonl"]
+    assert build(root, "--seed", "7", version="s4").code == 0
+    for name in names:
+        assert (root.path / "corpus" / "s4" / name).read_bytes() == (other / name).read_bytes()
+
+
+def edit_plan(root: root_mod.Root, change: dict) -> None:
+    path = corpus_dir(root) / "corpus-plan.json"
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    plan.update(change)
+    path.write_text(json.dumps({k: v for k, v in plan.items() if v is not None}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("value", [None, "7", True])
+def test_the_stage_refuses_a_plan_without_an_integer_seed(
+    root: root_mod.Root, hub: dict, value: object
+) -> None:
+    assert build(root).code == 0
+    edit_plan(root, {"random_seed": value})
+    with pytest.raises(stage.StageError, match="random_seed"):
+        stage.run(root.path, VERSION, "cpu", 8)
+
+
+def test_a_seed_that_is_not_an_integer_is_refused(root: root_mod.Root, hub: dict) -> None:
+    with pytest.raises(SystemExit) as exc:
+        build(root, "--seed", "x")
+    assert exc.value.code == 2
+    assert not corpus_dir(root).exists()
 
 
 def test_the_seed_share_is_capped_after_oversampling(root: root_mod.Root, hub: dict) -> None:
@@ -475,11 +536,11 @@ def test_the_seed_share_is_capped_after_oversampling(root: root_mod.Root, hub: d
 
 def test_cap_seed_fills_greedily_in_a_stable_order() -> None:
     segments = [("a", 1.0), ("b", 1.0), ("c", 1.0), ("d", 1.0)]
-    kept = corpus_cmd.cap_seed(segments, teacher_train_s=14.0, share_max=0.3, oversample=3)
+    kept = corpus_cmd.cap_seed(segments, teacher_train_s=14.0, share_max=0.3, oversample=3, seed=0)
     assert len(kept) == 2  # 3 x 2 s of 20 s is 0.3; a third would be 9 of 23
-    assert kept == corpus_cmd.cap_seed(segments[::-1], 14.0, 0.3, 3)
-    assert corpus_cmd.cap_seed(segments, 14.0, 0.0, 3) == []
-    assert len(corpus_cmd.cap_seed(segments, 14.0, 1.0, 3)) == 4
+    assert kept == corpus_cmd.cap_seed(segments[::-1], 14.0, 0.3, 3, seed=0)
+    assert corpus_cmd.cap_seed(segments, 14.0, 0.0, 3, seed=0) == []
+    assert len(corpus_cmd.cap_seed(segments, 14.0, 1.0, 3, seed=0)) == 4
 
 
 def test_refuses_below_teacher_hours_min_counted_after_alignment(

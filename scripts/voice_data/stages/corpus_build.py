@@ -17,7 +17,8 @@ leaves out, or returns without words, is dropped and counted.
 
 The aligned teacher rows are split by line (`commands.corpus.holdout_lines`), the seed is capped
 on the training split's teacher hours (`commands.corpus.cap_seed`) and repeated `oversample`
-times in training only, and the splits are written as upstream's rows: `path` (the clip's path
+times in training only, both in the order of the plan's `random_seed`, and the splits are
+written as upstream's rows: `path` (the clip's path
 under `--data`), `duration`, `transcript` and `words`, nothing else.
 
 Nothing this stage prints carries a transcript, a line's text or a clip's path.
@@ -169,6 +170,10 @@ class Builder:
         self.device = device
         self.batch_size = batch_size
         self.plan = _read_plan(data, version)
+        random_seed = self.plan.get("random_seed")
+        if isinstance(random_seed, bool) or not isinstance(random_seed, int):
+            raise StageError("the corpus plan records no integer random_seed")
+        self.random_seed = random_seed
         self.rel = contract.corpus_rel(version)
         self.hold_out = HoldOut(load_ear_test())
         self.left_out = {"untrusted_text": 0, "ear_test": 0, "share_cap": 0}
@@ -261,15 +266,16 @@ class Builder:
         words = self.align_all([*teacher, *seed])
         teacher_ok = [c for c in teacher if c.path in words]
         seed_ok = [c for c in seed if c.path in words]
+        random_seed = self.random_seed
         fraction = float(self.plan["val_fraction"])  # type: ignore[arg-type]
-        held = contract.holdout_lines((c.group for c in teacher_ok), fraction)
+        held = contract.holdout_lines((c.group for c in teacher_ok), fraction, seed=random_seed)
         train = [c for c in teacher_ok if c.group not in held]
         valid = [c for c in teacher_ok if c.group in held]
         train_s = sum(c.duration for c in train)
         oversample = int(self.plan["oversample"])  # type: ignore[arg-type]
         share_max = float(self.plan["seed_share_max"])  # type: ignore[arg-type]
         offered = [(c.key, c.duration) for c in seed_ok]
-        fits = set(contract.cap_seed(offered, train_s, share_max, oversample))
+        fits = set(contract.cap_seed(offered, train_s, share_max, oversample, seed=random_seed))
         seed_kept = [c for c in seed_ok if c.key in fits]
         self.left_out["share_cap"] = len(seed_ok) - len(seed_kept)
 
@@ -292,6 +298,7 @@ class Builder:
         summary: dict[str, object] = {
             "schema": SCHEMA,
             "version": self.version,
+            "random_seed": random_seed,
             "teacher_hours": _hours(teacher_s),
             "teacher_train_hours": _hours(train_s),
             "valid_hours": _hours(teacher_s - train_s),
