@@ -38,6 +38,9 @@ LOO_IDENTITY_WINDOWS = "loo-identity-windows"
 REHEARSAL_FLOOR = "rehearsal-floor"
 IDENTITY_WINDOW_S = 3.0
 FROM_SEED, FROM_IDENTITY = "seed", "identity"
+PROFILE_FROM_STATE, PROFILE_FROM_IDENTITY, PROFILE_FROM_POOLED = "state", "identity", "pooled"
+"""A seed-mode state entry's `profile_from`: its own clips, the identity's clip, or every seed
+clip pooled (neutral below `state_floor.thin_n_min` clips)."""
 EPS = 1e-9
 _REF_NUMBER = re.compile(r"(?P<n>[1-9][0-9]*)\.wav")
 
@@ -105,24 +108,40 @@ class SeedRef:
 
 @dataclass(frozen=True, slots=True)
 class Seed:
-    """A clean run as the target reads it: confirmed segments, their states, and references."""
+    """A clean run as the target reads it: confirmed segments, their states, and references.
+
+    `labelled` is true for a run cleaned with labels under a schema-2 plan: each segment's state
+    is then its projected state, None allowed (`state_of`).
+    """
 
     run_id: str
     segments: tuple[SegmentRecord, ...]
     refs: Mapping[str, tuple[SeedRef, ...]]
+    labelled: bool = False
+
+    def state_of(self, record: SegmentRecord) -> str | None:
+        """Return a segment's state: its own when labelled, else with extract's as fallback."""
+        return record.state if self.labelled else _state(record)
 
 
-def _read_labels(root: Root, run_dir: str) -> dict[str, str] | None:
+PLAN_SCHEMAS = (1, clean_cmd.PLAN_SCHEMA)
+
+
+def _read_labels(root: Root, run_dir: str) -> tuple[int, dict[str, object] | None]:
+    """Return the clean plan's schema and labels: schema 1 maps ids to states, 2 to labels."""
     plan = read_json(root.path / run_dir / clean_cmd.PLAN_NAME)
     if not isinstance(plan, dict):
         raise InputError(f"refused: {run_dir}/{clean_cmd.PLAN_NAME} is not a JSON object")
+    schema = plan.get("schema")
+    if schema not in PLAN_SCHEMAS:
+        raise InputError(f"refused: {run_dir}/{clean_cmd.PLAN_NAME} is not a schema 1 or 2 plan")
     labels = plan.get("labels")
     if labels is not None and not isinstance(labels, dict):
         raise InputError(f"refused: {run_dir}/{clean_cmd.PLAN_NAME} has malformed labels")
-    return labels
+    return int(schema), labels  # type: ignore[call-overload]
 
 
-def _state(record: SegmentRecord) -> str:
+def _state(record: SegmentRecord) -> str | None:
     return record.state or record.state_proposed
 
 
@@ -142,13 +161,16 @@ def read_seed(root: Root, run_id: str, target_id: str) -> Seed:
         if not (root.path / run_dir / name).is_file():
             raise InputError(f"refused: {run_dir}/{name} is missing; run clean first")
     records = read_jsonl(root.path / run_dir / clean_cmd.SEGMENTS_NAME, SegmentRecord)
-    labels = _read_labels(root, run_dir)
+    schema, labels = _read_labels(root, run_dir)
     ids = set(clean_cmd.confirmed_ids(records, labels))
     confirmed = tuple(r for r in records if r.segment_id in ids)
     if len(confirmed) < 2:
         raise InputError(f"refused: run {run_id} has fewer than two confirmed segments")
+    labelled = schema == clean_cmd.PLAN_SCHEMA and labels is not None
     for record in confirmed:
-        if _state(record) not in SPEAKING_STATES:
+        if labelled and record.state is not None and record.state not in SPEAKING_STATES:
+            raise InputError(f"refused: {record.segment_id}'s state is not a speaking state")
+        if not labelled and _state(record) not in SPEAKING_STATES:
             raise InputError(f"refused: {record.segment_id} has no speaking state")
         if not record.audio.startswith(f"{run_dir}/") or not (root.path / record.audio).is_file():
             raise InputError(f"refused: {record.segment_id}'s audio is missing from {run_dir}")
@@ -159,7 +181,8 @@ def read_seed(root: Root, run_id: str, target_id: str) -> Seed:
         raise InputError(
             f"refused: run {run_id} placed its references for target {refs_doc.get('target')}"
         )
-    return Seed(run_id, confirmed, _seed_refs(root, run_dir, target_id, refs_doc))
+    refs = _seed_refs(root, run_dir, target_id, refs_doc)
+    return Seed(run_id, confirmed, refs, labelled=labelled)
 
 
 def _seed_refs(
@@ -212,7 +235,7 @@ def plan(
         {
             "segment_id": r.segment_id,
             "source_id": r.source_id,
-            "state": _state(r),
+            "state": seed.state_of(r),
             "audio": r.audio,
             "prosody": r.prosody.to_json(),
         }
@@ -403,9 +426,10 @@ def report_lines(record: TargetRecord) -> list[str]:
         if not isinstance(entry, Mapping):
             continue
         floors = _pairs(entry.get("floor"), tuple(record.embedders))
+        profile = f", profile {entry['profile_from']}" if "profile_from" in entry else ""
         lines.append(
             f"  state {state}: n {_num(entry.get('n'))}, floor {entry.get('floor_from')} "
-            f"({floors}), references {len(entry.get('refs', []))}"
+            f"({floors}){profile}, references {len(entry.get('refs', []))}"
         )
     lines.append(f"  wrote {target_rel(record.target_id)}/{TARGET_NAME}")
     return lines

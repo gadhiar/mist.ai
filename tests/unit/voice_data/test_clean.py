@@ -25,15 +25,18 @@ import soundfile as sf
 from scipy.signal import lfilter
 
 from scripts.voice_data import cli, jobs
+from scripts.voice_data import labels as labels_mod
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.bindings.protocols import Transcript, Word
 from scripts.voice_data.commands import clean as clean_cmd
 from scripts.voice_data.errors import JobError
+from scripts.voice_data.labels import LabelRecord
 from scripts.voice_data.records import Prosody, SegmentRecord, read_jsonl, write_jsonl
 from scripts.voice_data.stages import clean as clean_stage
 from scripts.voice_data.stages import prosody as prosody_mod
-from scripts.voice_data.stages import score, transcribe
+from scripts.voice_data.stages import references, score, transcribe
 from scripts.voice_data.stages.clean import RATE
+from scripts.voice_data.states import SPEAKING_STATES
 
 from .conftest import Canaries, _assert_no_canary, _synth_voice
 from .fakes import FakeAsr, FakeEmbedder, FakeEnhancer
@@ -709,7 +712,7 @@ def test_clean_prints_step_decisions_and_counts_only(main_run: Ran) -> None:
     assert "step decomb: dropped (sim:wavlm-sv" in main_run.out
     allowed = (
         "job ", "clean run ", "  step ", "  segments:", "  references:", "  short states:",
-        "  minutes per state:", "  references written to ",
+        "  minutes per state:", "  references written to ", "  clean minutes ",
     )  # fmt: skip
     for line in main_run.out.splitlines():
         assert line.startswith(allowed), line
@@ -754,37 +757,251 @@ def test_clean_refuses_before_any_job(main_run: Ran, args: tuple[str, ...], mess
     assert executors == [] and len(main_run.docker.argvs) == 1
 
 
-# Raj's labels.
+# Raj's labels: `seed/labels/<run>/labels.jsonl`, read through `labels.read_labels`.
 
 
-def test_labels_set_the_state_and_drop_unlisted_segments(tmp_path: Path) -> None:
-    segs = SEGS[:3] + (SEGS[6],)
-    root = make_root(tmp_path, segs)
-    labels = "segment_id,state\nseg-000001,calm\nseg-000002,neutral\nseg-000007,calm\n"
-    (root.path / "seed" / "labels.csv").write_text(labels, encoding="utf-8")
+def seg_label(
+    seg: Seg,
+    k: int,
+    *,
+    run: str = "r1",
+    voices: str = "her",
+    energy: int = 3,
+    mood: int = 3,
+    tags: tuple[str, ...] = (),
+    keep: tuple[float, float] | None = None,
+    state: str | None = None,
+    removed: str | None = None,
+    carried_from: tuple[str, ...] = (),
+    sid: str | None = None,
+) -> LabelRecord:
+    """The label of `seg`, the `k`th segment `make_root` wrote (its span starts at 10 k s)."""
+    start = 10.0 * k
+    return LabelRecord(
+        run=run, segment_id=sid or seg.sid, source_id=seg.source, start_s=start,
+        end_s=start + seg.seconds, channel="FC", separator="none",
+        duration_s=round(seg.seconds, 2), voices=voices, energy=energy, mood=mood, tags=tags,
+        keep_from_s=None if keep is None else keep[0], keep_to_s=None if keep is None else keep[1],
+        has_note=False, state=state, removed=removed, carried_from=carried_from,
+    )  # fmt: skip
+
+
+def write_run_labels(root: root_mod.Root, run: str, records: Sequence[LabelRecord]) -> None:
+    labels_mod.write_labels(root, run, records, {}, {}, replace=True)
+
+
+# Ten segments of SEGS, one per removal reason, a trim, an unlabelled one, and a labelled clip
+# whose projection is None although extract proposed `calm` for it.
+LABELLED_SEGS = SEGS[:10]
+TRIM = (1.0, 4.5)
+
+
+def labelled_labels() -> list[LabelRecord]:
+    s = LABELLED_SEGS
+    return [
+        seg_label(s[0], 0, state="neutral"),
+        seg_label(s[1], 1, energy=2, state="calm"),
+        # s[2] (seg-000003) has no label.
+        seg_label(s[3], 3, voices="her_nearby", keep=TRIM, state="neutral"),
+        seg_label(s[4], 4, voices="not_her", removed="not-her"),
+        seg_label(s[5], 5, voices="her_overlap", removed="overlap"),
+        seg_label(s[6], 6, voices="her_nearby", removed="nearby"),
+        seg_label(s[7], 7, mood=5, tags=("warm",), state=None),
+        seg_label(s[8], 8, removed="flag-group"),
+        seg_label(s[9], 9, energy=4, state="awake"),
+    ]
+
+
+SURVIVORS = ("seg-000001", "seg-000002", "seg-000004", "seg-000008", "seg-000010")
+UNPROJECTED = "seg-000008"
+
+
+@pytest.fixture(scope="module")
+def labelled_run(tmp_path_factory: pytest.TempPathFactory) -> Ran:
+    root = make_root(tmp_path_factory.mktemp("labelled"), LABELLED_SEGS)
+    write_run_labels(root, "r1", labelled_labels())
     docker = StageDocker(root, models())
     code, out, err = run_clean(root, docker, *ARGS)
+    return Ran(root, code, out, err, docker, [])
+
+
+def test_a_labelled_clean_run_exits_0(labelled_run: Ran) -> None:
+    assert labelled_run.code == 0, labelled_run.err
+
+
+def test_the_plan_is_schema_2_with_every_label_but_the_note(labelled_run: Ran) -> None:
+    plan = labelled_run.json("clean-plan.json")
+    assert plan["schema"] == 2
+    labels = plan["labels"]
+    assert set(labels) == {r.segment_id for r in labelled_labels()}
+    assert labels["seg-000004"] == {
+        "voices": "her_nearby", "energy": 3, "mood": 3, "tags": [], "keep_from_s": 1.0,
+        "keep_to_s": 4.5, "state": "neutral", "removed": None, "carried_from": [],
+    }  # fmt: skip
+    assert labels["seg-000008"]["tags"] == ["warm"] and labels["seg-000008"]["state"] is None
+    assert all("note" not in label and "has_note" not in label for label in labels.values())
+
+
+@pytest.mark.parametrize(
+    ("sid", "reason"),
+    [
+        ("seg-000003", "unlabelled"),
+        ("seg-000005", "not-her"),
+        ("seg-000006", "overlap"),
+        ("seg-000007", "nearby"),
+        ("seg-000009", "flag-group"),
+    ],
+)
+def test_each_removal_reason_drops_its_segment(labelled_run: Ran, sid: str, reason: str) -> None:
+    row = labelled_run.records()[sid]
+    assert not row.kept and row.reasons == (reason,) and row.audio == ""
+
+
+def test_only_the_labelled_survivors_are_cleaned(labelled_run: Ran) -> None:
+    kept = {sid for sid, r in labelled_run.records().items() if r.kept}
+    assert kept == set(SURVIVORS)
+    assert labelled_run.json("gates.json")["distribution"]["wavlm-sv"]["n"] == len(SURVIVORS)
+
+
+def test_a_her_nearby_clip_is_cut_to_its_keep_range(labelled_run: Ran) -> None:
+    row = labelled_run.records()["seg-000004"]
+    assert (row.start_s, row.end_s) == pytest.approx((30.0 + TRIM[0], 30.0 + TRIM[1]))
+    assert len(clean_clip(labelled_run, "seg-000004")) == round((TRIM[1] - TRIM[0]) * RATE)
+
+
+def test_the_state_is_the_projection_with_no_fallback(labelled_run: Ran) -> None:
+    rows = labelled_run.records()
+    assert rows["seg-000001"].state == "neutral" and rows["seg-000002"].state == "calm"
+    assert rows["seg-000010"].state == "awake"
+    assert rows[UNPROJECTED].state is None and rows[UNPROJECTED].state_proposed == "calm"
+
+
+def test_a_null_state_is_never_a_reference(labelled_run: Ran) -> None:
+    refs = labelled_run.json("refs.json")["states"]
+    assert refs["calm"]["members"] == 1 and refs["neutral"]["members"] == 2
+    assert refs["awake"]["members"] == 1
+    assert UNPROJECTED not in {r["segment_id"] for e in refs.values() for r in e["refs"]}
+
+
+def test_the_report_lists_all_five_states_and_the_new_keys(labelled_run: Ran) -> None:
+    report = labelled_run.json("report.json")
+    minutes = report["minutes_per_state"]
+    assert list(minutes) == sorted(SPEAKING_STATES)
+    assert minutes["excited"] == 0 and minutes["sleepy"] == 0
+    assert minutes["neutral"] == pytest.approx((5.0 + 3.5) / 60, abs=1e-3)
+    assert minutes["calm"] == pytest.approx(5.5 / 60, abs=1e-3)
+    assert report["clean_minutes"] == pytest.approx((5.0 + 5.5 + 3.5 + 4.8 + 3.8) / 60, abs=1e-3)
+    segments = report["segments"]
+    assert segments["kept"] == len(SURVIVORS) and segments["trimmed"] == 1
+    assert segments["removed_by_label"] == {
+        "not-her": 1, "flag-group": 1, "overlap": 1, "nearby": 1
+    }  # fmt: skip
+
+
+def test_the_report_tables_are_the_labels_of_the_survivors(labelled_run: Ran) -> None:
+    survivors = [r for r in labelled_labels() if r.segment_id in SURVIVORS]
+    expected = labels_mod.tables(survivors, None, state_seconds_min=30.0)
+    tables = labelled_run.json("report.json")["labels"]
+    assert tables == json.loads(json.dumps(expected))
+    assert "agreement" not in tables
+    assert tables["state_none"] == {"count": 1, "seconds": 4.8}
+    assert tables["trimmed_s"] == pytest.approx(3.0)
+
+
+def test_the_host_prints_the_label_tables_after_its_lines(labelled_run: Ran) -> None:
+    _assert_no_canary(labelled_run.out + labelled_run.err)
+    lines = labelled_run.out.splitlines()
+    tables = labelled_run.json("report.json")["labels"]
+    table = labels_mod.table_lines(tables)
+    at = lines.index(table[0])
+    assert lines[at : at + len(table)] == table
+    assert at > max(i for i, line in enumerate(lines) if line.startswith("  short states:"))
+
+
+def test_the_tables_flag_thin_states_at_the_roots_gate(tmp_path: Path) -> None:
+    root = make_root(tmp_path, LABELLED_SEGS)
+    (root.path / "config" / "gates.json").write_text(
+        json.dumps({"seed.state_seconds_min": 1}), encoding="utf-8"
+    )
+    write_run_labels(root, "r1", labelled_labels())
+    code, _, err = run_clean(root, StageDocker(root, models()), *ARGS)
     assert code == 0, err
-    rows = {
-        r.segment_id: r
-        for r in read_jsonl(root.path / "seed/runs/c1/segments.jsonl", SegmentRecord)
-    }
-    assert rows["seg-000001"].state == "calm" and rows["seg-000001"].kept
-    assert rows["seg-000002"].state == "neutral"
-    assert not rows["seg-000003"].kept and rows["seg-000003"].reasons == ("not-her",)
-    assert rows["seg-000003"].audio == ""
-    refs = json.loads((root.path / "seed/runs/c1/refs.json").read_text())["states"]
-    assert refs["calm"]["members"] == 2 and refs["neutral"]["members"] == 1
-    assert "not her 1" in out
+    tables = json.loads((root.path / "seed/runs/c1/report.json").read_text())["labels"]
+    assert tables["state_seconds_min"] == 1
+    assert not tables["states"]["neutral"]["thin"] and tables["states"]["excited"]["thin"]
+
+
+def test_without_labels_the_report_has_no_tables(main_run: Ran) -> None:
+    report = main_run.json("report.json")
+    assert report["labels"] is None
+    assert report["segments"]["removed_by_label"] == {
+        "not-her": 0, "flag-group": 0, "overlap": 0, "nearby": 0
+    }  # fmt: skip
+    assert report["segments"]["trimmed"] == 0
+    assert "excited" not in report["minutes_per_state"]
+    seconds = sum(s.seconds for s in SEGS)
+    assert report["clean_minutes"] == pytest.approx(seconds / 60, abs=1e-3)
 
 
 def test_labels_that_name_no_segment_of_the_run_are_refused(tmp_path: Path) -> None:
     root = make_root(tmp_path, SEGS[:3])
-    (root.path / "seed" / "labels.csv").write_text(
-        "segment_id,state\nseg-009999,calm\n", encoding="utf-8"
+    write_run_labels(root, "r1", [seg_label(SEGS[0], 0, sid="seg-009999", state="neutral")])
+    executors: list[str] = []
+    code, _, err = run_clean(root, StageDocker(root, models()), *ARGS, executors=executors)
+    assert code == 2 and "labels" in err and executors == []
+
+
+def test_the_old_labels_csv_is_refused(tmp_path: Path) -> None:
+    root = make_root(tmp_path, SEGS[:3])
+    (root.path / labels_mod.LEGACY_LABELS_REL).write_text(
+        "segment_id,state\nseg-000001,calm\n", encoding="utf-8"
     )
-    code, _, err = run_clean(root, StageDocker(root, models()), *ARGS)
-    assert code == 2 and "labels" in err
+    executors: list[str] = []
+    code, _, err = run_clean(root, StageDocker(root, models()), *ARGS, executors=executors)
+    assert code == 2 and labels_mod.LEGACY_LABELS_REL in err and executors == []
+
+
+def test_a_stale_carried_label_is_refused(tmp_path: Path) -> None:
+    segs = SEGS[:3]
+    root = make_root(tmp_path, segs)
+    earlier = seg_label(segs[0], 0, run="r0", state="neutral")
+    write_run_labels(root, "r0", [earlier])
+    carried = [
+        seg_label(segs[0], 0, state="neutral", carried_from=("r0/seg-000001",)),
+        seg_label(segs[1], 1, state="neutral"),
+        seg_label(segs[2], 2, state="neutral"),
+    ]
+    write_run_labels(root, "r1", carried)
+    # r0 is imported again with a changed label after r1 carried it.
+    write_run_labels(root, "r0", [replace(earlier, energy=4, state="awake")])
+    executors: list[str] = []
+    code, _, err = run_clean(root, StageDocker(root, models()), *ARGS, executors=executors)
+    assert code == 2 and executors == []
+    assert "1 carried label" in err and "pack labels --run r1 --replace" in err
+
+
+def test_the_stage_refuses_a_schema_1_plan(tmp_path: Path) -> None:
+    plan = {"schema": 1, "from": "r1", "target": "t1", "thresholds": {}, "labels": None}
+    folder = tmp_path / "seed" / "runs" / "c1"
+    folder.mkdir(parents=True)
+    (folder / "clean-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(clean_stage.StageError, match="schema 2"):
+        clean_stage.Cleaning(tmp_path, "c1", models())
+
+
+def test_references_skip_a_null_state_and_one_outside_the_vocabulary() -> None:
+    def candidate(sid: str, state: str | None) -> references.Candidate:
+        return references.Candidate(
+            segment_id=sid, source_id=sid, state=state, duration_s=5.0,  # type: ignore[arg-type]
+            snr_db=30.0, prosody=Prosody(210.0, 4.0, 4.0, -20.0), sim={"e": 0.9},
+            transcript="", asr_disagree=False,
+        )  # fmt: skip
+
+    choices = references.choose(
+        [candidate("a", None), candidate("b", None), candidate("c", "bogus")], {"e": 0.5}
+    )
+    assert set(choices) == set(SPEAKING_STATES)
+    assert all(choice.members == 0 for choice in choices.values())
 
 
 def test_fewer_than_two_confirmed_segments_are_refused(tmp_path: Path) -> None:

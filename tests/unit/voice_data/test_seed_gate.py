@@ -518,3 +518,183 @@ def test_gate_needs_exactly_one_of_run_and_check_record(
     with pytest.raises(SystemExit) as caught:
         _gate(private_root, *flags)
     assert caught.value.code == 2
+
+
+# `gate --run E --clean C`: the labelled, cleaned seed.
+
+# What `gate --run r1` printed for `_report()` before `--clean` existed, byte for byte.
+TODAY = """\
+seed gate, run r1:
+  source src-0001: eac3 (Dolby Digital Plus + Dolby Atmos), 5.1(side), 48000 Hz, 768000 bps, \
+bandwidth 16000 Hz, lossless False
+  source src-0002: flac (no profile), stereo, 24000 Hz, 900000 bps, bandwidth 12000 Hz, \
+lossless True
+  pass  clean minutes: 22.50 (min 10)
+  pass  sample rate: lowest 24000 Hz (min 24000)
+  pass  source facts: 2 of 2 sources recorded; lossless 1 of 2 (best source available)
+  pass  one speaker: kept 240; kept failing retrieval 0, kept failing window 0, flagged \
+unconfirmed 0
+  pass  rehearsal precision: 0.970 (min 0.95), at the run's thresholds
+  info  purity: p10 margin 0.120
+  info  channel FC: 20.00 min
+  info  channel downmix: 2.50 min
+  info  state calm: 6.00 min
+  info  state excited: 4.00 min
+  info  state neutral: 12.00 min
+  info  state sleepy: 0.50 min
+seed gate: pass
+"""
+
+
+def test_without_clean_the_output_is_todays_byte_for_byte(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(private_root, _report())
+    assert _gate(private_root, "--run", "r1") == 0
+    out = capsys.readouterr()
+    assert out.out == TODAY and out.err == ""
+
+
+def _segment(sid: str, cluster: str = "primary", kept: bool = True) -> dict[str, object]:
+    return {
+        "segment_id": sid, "source_id": "src-0001", "start_s": 1.0, "end_s": 5.0,
+        "channel": "FC", "channel_reason": None, "separator": "none",
+        "audio": f"seed/runs/c1/audio/{sid}.flac" if kept else "", "diar_cluster": "spk-01",
+        "cluster": cluster, "flag_group": None, "sim": {"wavlm-sv": 0.9}, "overlap_ms": 0,
+        "snr_db": 30.0, "c50_db": 40.0, "transcripts": {}, "asr_agreement_cer": 0.0,
+        "prosody": {"f0_mean_hz": 210.0, "f0_std_hz": 4.0, "rate_sps": 4.0, "energy_db": -20.0},
+        "arousal": 0.4, "state_proposed": "neutral", "state": "neutral", "set": "short",
+        "kept": kept, "reasons": [] if kept else ["not-her"],
+    }  # fmt: skip
+
+
+REMOVED = {"not-her": 2, "flag-group": 1, "overlap": 1, "nearby": 0}
+CLEAN_STATES = {"awake": 0.4, "calm": 0.6, "excited": 0.0, "neutral": 1.9, "sleepy": 0.2}
+
+
+def _write_clean(
+    root: root_mod.Root,
+    *,
+    from_run: str = "r1",
+    labelled: bool = True,
+    clean_minutes: float = 3.1,
+) -> None:
+    run = root.path / "seed" / "runs" / "c1"
+    run.mkdir(parents=True, exist_ok=True)
+    rows = [_segment("seg-000001"), _segment("seg-000002", "flagged"), _segment("seg-000003")]
+    rows.append(_segment("seg-000004", kept=False))
+    labels = {r["segment_id"]: {"state": "neutral"} for r in rows} if labelled else None
+    plan = {"schema": 2, "run": "c1", "from": from_run, "target": "t1", "labels": labels}
+    report = {
+        "clean_minutes": clean_minutes,
+        "minutes_per_state": CLEAN_STATES,
+        "segments": {"in": 4, "kept": 3, "removed_by_label": REMOVED, "trimmed": 1},
+    }
+    (run / "clean-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (run / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    (run / "segments.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+    )
+
+
+def test_merge_clean_takes_the_labelled_values_from_the_clean_run(
+    private_root: root_mod.Root,
+) -> None:
+    from scripts.voice_data.commands import gate as gate_cmd
+
+    _write_clean(private_root)
+    merged = gate_cmd.merge_clean(private_root, "r1", "c1", _report())
+    assert merged["clean_minutes"] == 3.1 and merged["minutes_per_state"] == CLEAN_STATES
+    assert merged["one_speaker"] == {
+        "kept": 3, "kept_failing_retrieval": 0, "kept_failing_window": 0,
+        "flagged_unconfirmed": 0, "labelled_not_her": 2, "labelled_flag_group": 1,
+        "labelled_overlap": 1, "labelled_nearby_removed": 0,
+    }  # fmt: skip
+    # Extract's facts stay: sources, channels, purity, thresholds.
+    for key in ("sources", "minutes_per_channel", "purity_p10", "thresholds", "rehearsal"):
+        assert merged[key] == _report()[key]
+
+
+def test_without_labels_a_kept_flagged_segment_is_unconfirmed(
+    private_root: root_mod.Root,
+) -> None:
+    from scripts.voice_data.commands import gate as gate_cmd
+
+    _write_clean(private_root, labelled=False)
+    merged = gate_cmd.merge_clean(private_root, "r1", "c1", _report())
+    assert merged["one_speaker"]["flagged_unconfirmed"] == 1  # type: ignore[index]
+    result = seed_gate.evaluate(merged, THRESHOLDS)
+    assert _criterion(result, "one speaker").passed is False
+
+
+def test_gate_clean_prints_the_labelled_counts_as_reported(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = _report()
+    _write_report(private_root, report)
+    _write_clean(private_root, clean_minutes=12.0)
+    assert _gate(private_root, "--run", "r1", "--clean", "c1") == 0
+    out = capsys.readouterr().out
+    assert "  clean run c1: labelled minutes, states and kept count\n" in out
+    assert "  pass  clean minutes: 12.00 (min 10)\n" in out
+    assert "one speaker: kept 3; " in out
+    assert (
+        "  info  labelled removals: not her 2, flag group 1, overlap 1, nearby removed 0\n" in out
+    )
+    # An empty state is listed and flagged, not failed; extract's states are gone.
+    assert "  info  state excited: 0.00 min; under 30 s, flagged" in out
+    assert "state calm: 0.60 min" in out and "state calm: 6.00 min" not in out
+    assert out.endswith("seed gate: pass\n")
+
+
+def test_gate_clean_fails_on_the_labelled_minutes(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Extract's 22.5 minutes would pass; the labelled 3.1 do not.
+    _write_report(private_root, _report())
+    _write_clean(private_root)
+    assert _gate(private_root, "--run", "r1", "--clean", "c1") == 3
+    out = capsys.readouterr().out
+    assert "  FAIL  clean minutes: 3.10 (min 10)" in out
+
+
+def test_evaluate_reports_the_labelled_counts_without_gating_them() -> None:
+    report = _report()
+    report["one_speaker"] = {
+        **report["one_speaker"],  # type: ignore[dict-item]
+        "labelled_not_her": 9, "labelled_flag_group": 9, "labelled_overlap": 9,
+        "labelled_nearby_removed": 9,
+    }  # fmt: skip
+    result = seed_gate.evaluate(report, THRESHOLDS)
+    assert result.passed and _criterion(result, "labelled removals").passed is None
+    lines = seed_gate.format_lines(result)
+    assert (
+        "  info  labelled removals: not her 9, flag group 9, overlap 9, nearby removed 9" in lines
+    )
+
+
+@pytest.mark.parametrize(
+    ("setup", "flags", "message"),
+    [
+        ("none", ("--run", "r1", "--clean", "c1"), "not a finished clean run"),
+        ("no-report", ("--run", "r1", "--clean", "c1"), "not a finished clean run"),
+        ("other", ("--run", "r1", "--clean", "c1"), "not made from run r1"),
+        ("ok", ("--run", "r1", "--clean", "../c1"), "clean run id"),
+        ("ok", ("--check-record", "--clean", "c1"), "--clean goes with --run"),
+    ],
+)
+def test_gate_clean_refusals_exit_2(
+    private_root: root_mod.Root,
+    capsys: pytest.CaptureFixture[str],
+    setup: str,
+    flags: tuple[str, ...],
+    message: str,
+) -> None:
+    _write_report(private_root, _report())
+    _write_record(private_root, _record())
+    if setup != "none":
+        _write_clean(private_root, from_run="r0" if setup == "other" else "r1")
+    if setup == "no-report":
+        (private_root.path / "seed" / "runs" / "c1" / "report.json").unlink()
+    assert _gate(private_root, *flags) == 2
+    assert message in capsys.readouterr().err

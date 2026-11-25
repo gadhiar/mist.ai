@@ -789,7 +789,54 @@ def answered(extracted: Extracted) -> Answered:
         )
     text = (root.path / packs.LABELS_REL).read_text(encoding="utf-8") if icode == 0 else ""
     labels = {row["segment_id"]: row["state"] for row in csv.DictReader(io.StringIO(text))}
+    # Until the labels pack writes the run's label folder itself, the import's csv moves into
+    # `seed/labels/r1/` here, as the reader of the impostor's `in_labels` expects, and leaves
+    # the root, since every label reader refuses the old file.
+    if icode == 0:
+        _write_run_labels(root, extracted.segments, labels)
+        (root.path / packs.LABELS_REL).unlink()
     return Answered(built.pack_id, code, out, err, icode, ierr, labels)
+
+
+def _label(seg: SegmentRecord, state: str | None, removed: str | None = None) -> object:
+    from scripts.voice_data.labels import LabelRecord
+
+    return LabelRecord(
+        run="r1", segment_id=seg.segment_id, source_id=seg.source_id, start_s=seg.start_s,
+        end_s=seg.end_s, channel=seg.channel, separator=seg.separator,
+        duration_s=round(seg.end_s - seg.start_s, 2),
+        voices="her" if removed is None else "not_her", energy=3, mood=3, tags=(),
+        keep_from_s=None, keep_to_s=None, has_note=False, state=state, removed=removed,
+        carried_from=(),
+    )  # fmt: skip
+
+
+def _write_run_labels(
+    root: root_mod.Root, segments: Sequence[SegmentRecord], states: Mapping[str, str]
+) -> None:
+    from scripts.voice_data import labels as labels_mod
+
+    # A kept segment the csv does not list was dropped as not her, with its flag group.
+    records = [
+        _label(s, states[s.segment_id]) if s.segment_id in states else _label(s, None, "not-her")
+        for s in segments
+        if s.kept
+    ]
+    labels_mod.write_labels(root, "r1", records, {}, {}, replace=True)
+
+
+def test_the_impostors_in_labels_reads_the_runs_label_file(
+    extracted: Extracted, answered: Answered
+) -> None:
+    root = extracted.built.root
+    eps = rehearsal_cmd._episodes(root)[0]
+    kept = [s for s in extracted.segments if s.kept]
+    impostor = [s for s in kept if eps.who(s) == "impostor"]
+    found = rehearsal_cmd._labels(root, "r1")
+    assert found is not None and found == set(answered.labels)
+    # Labelled segments with `removed` are not hers: the impostor's are all removed here.
+    assert impostor and not {s.segment_id for s in impostor} & found
+    assert rehearsal_cmd._labels(root, "r-none") is None
 
 
 def test_answer_writes_ratings_that_pack_import_accepts(
