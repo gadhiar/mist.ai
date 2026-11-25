@@ -17,7 +17,8 @@ the same call gives the same result in every run and on every machine.
 - `FakeQualityEstimator`: a constant SNR and C50 track, one frame per `hop_s`.
 - `FakeEnhancer`: applies the function it was built with, or returns a copy.
 - `FakeAsr`: returns the text it was built with, its words spread evenly over the audio.
-- `FakeArousal`: the clip's RMS level mapped linearly from -40..-10 dBFS onto 0..1.
+- `FakeArousal`: the clip's RMS level mapped linearly from -40..-10 dBFS onto 0..1; its
+  `dimensions` are that arousal, the same value as dominance and one minus it as valence.
 """
 
 from __future__ import annotations
@@ -192,3 +193,8 @@ class FakeArousal:
         rms = float(np.sqrt(np.mean(np.asarray(audio, dtype=np.float64) ** 2))) if len(audio) else 0
         level = 20.0 * np.log10(rms) if rms > 0 else -120.0
         return float(np.clip((level + 40.0) / 30.0, 0.0, 1.0))
+
+    def dimensions(self, audio: np.ndarray, sample_rate: int) -> tuple[float, float, float]:
+        # Valence falls as arousal rises, so a test can tell which output fed which field.
+        value = self.arousal(audio, sample_rate)
+        return value, value, 1.0 - value
