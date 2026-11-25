@@ -282,6 +282,30 @@ respective licenses:
    committed or redistributed.
 
 -------------------------------------------------------------------------------
+19. TIGER (look2hear) chunked inference (Adapted)
+   Location: tests/unit/voice_data/test_bindings_seed.py
+             (upstream_wav_chunk_inference, a reference transcription,
+             attributed there); scripts/voice_data/bindings/separators.py
+             (TigerDnr, which reproduces its windowed overlap-add)
+   Source: https://github.com/JusperLee/TIGER,
+           look2hear/models/tiger_dnr.py (wav_chunk_inference) at commit
+           9f18d4a10a7137e1ce8052cfb62215179f1287b6
+   License: Apache License 2.0
+   Copyright: Original authors of TIGER
+
+   Modifications made for MIST.AI:
+   - test_bindings_seed.py: the method became a function, with the sample
+     rate as an argument, and its comments and docstring are omitted
+   - separators.py: TigerDnr runs the same windows on the dialogue model
+     alone, with one window on the device at a time and the mixture, its
+     padding and the accumulator in host memory
+
+   Used by voice-data extract to separate the dialogue stem of long sources.
+   The rest of TIGER is cloned at that commit into the extract image
+   (docker/voice-data/extract.Dockerfile) and is not included in this
+   repository.
+
+-------------------------------------------------------------------------------
 
 APACHE LICENSE 2.0 COMPONENTS
 
@@ -295,6 +319,7 @@ The following components are licensed under Apache License 2.0:
 - esp_websocket_client
 - microWakeWord stop and VAD models
 - LiteRT (ai-edge-litert) and pymicro-features
+- TIGER (look2hear) chunked inference (Adapted)
 
 Apache License 2.0 Summary:
 You may use, reproduce, and distribute this work, with or without
@@ -361,4 +386,4 @@ of conditions and the disclaimer are retained.
 
 For questions about licensing, contact: Raj Gadhia
 
-Last updated: 2026-11-21
+Last updated: 2026-11-24

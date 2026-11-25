@@ -247,9 +247,10 @@ def _inside(directory: Path, rel: object, where: str) -> Path:
 def read_anchor(root: root_mod.Root, voice_id: str) -> Anchor:
     """Read the neutral clip and transcript of identity `voices/<voice_id>/`.
 
-    `voice.json` schema 1 and schema 2 (which adds trained weights) list clips alike, and only
-    the neutral clip is read, so this checks that clip by v6's rules (`identity.py`) without
-    the schema-1-only `identity.check`. The transcript is hashed and never shown.
+    `identity.check` reads `voice.json` schema 1 and schema 2 (which adds trained weights), but
+    it checks every clip and hashes a schema-2 identity's weights. The anchor is the neutral clip
+    and its transcript alone, so this reads only that clip, checks its two sha256s and runs
+    `check_transcript` and `check_wav` on it. The transcript is hashed and never shown.
 
     Raises:
         InputError: The id is malformed, the manifest is missing or not schema 1 or 2, it has
