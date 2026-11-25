@@ -15,8 +15,9 @@ in a child process (`trainer` mode of this module). The child puts the clone fir
 wheel. It then runs `training.train` as `__main__` with the config as its one argument, from the
 clone's root, and writes what it measured to a metrics file: the free VRAM before the run, the
 peak `torch.cuda.max_memory_reserved`, the optimizer steps and their rate (a global optimizer
-post-step hook; the first `WARMUP_STEPS` are left out) and the loss of each step (the scalar
-`backward` received, summed over the step's micro-batches, averaged per `LOSS_WINDOW` steps).
+post-step hook; the first `WARMUP_STEPS` are left out), the loss of each step (the scalar
+`backward` received, summed over the step's micro-batches, averaged per `LOSS_WINDOW` steps) and
+the longest `save_checkpoint` call, timed on its own clock (`save_clock`).
 
 Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` and the configs'
 `hf://` URIs name a revision (`49252265`) the cache does not hold:
@@ -39,7 +40,8 @@ Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` 
 
 `probe` trains `PROBE_STEPS` optimizer steps at each batch in turn, with accumulation to the
 effective batch upstream requires, stopping at the first that does not fit (its peak above the
-free VRAM less `HEADROOM_MIB`, or out of memory), and writes `probe.json`. `train` runs the
+free VRAM less `HEADROOM_MIB`, or out of memory), and writes `probe.json`, with the longest
+checkpoint save of any trial as `save_s`, from which a stop's grace is sized. `train` runs the
 fine-tune from the 24-layer base and then the distillation, the student warm-started from the
 released 6-layer student (`student_init_from`) and taught by the fine-tune's newest checkpoint.
 Upstream resumes from its newest checkpoint by itself, saves at `ckpt_freq` and at `max_steps`,
@@ -53,9 +55,12 @@ the sha256 of every config and cached file; the log stays in `runs/<job>/log.txt
 In the distill child, `training.checkpointing.save_checkpoint` is wrapped: after each save, the
 `model.safetensors` that upstream's `export_pocket_safetensors` refreshes in the run_dir (the
 EMA student's `flow_lm.*` and `mimi.*` tensors, no optimizer state) is checked for that layout
-and written to `checkpoints/weights/<checkpoint>/model.safetensors`; a checkpoint upstream
-prunes loses its copy. Nothing this stage prints carries a transcript, a line's text or a
-clip's path.
+and written to `checkpoints/weights/<checkpoint>/model.safetensors`. Each stage keeps its last
+`--keep-last` checkpoints (upstream's `num_ckpt_keep`) and validates at every checkpoint
+interval over the validation split's whole batches (`Trainer.retention`), logging the loss to
+`progress.jsonl`. A distill checkpoint upstream prunes loses its weights unless its validation
+loss is the lowest so far (`best_checkpoint`), which `train.json` records as `best`. Nothing
+this stage prints carries a transcript, a line's text or a clip's path.
 """
 
 from __future__ import annotations
@@ -78,6 +83,7 @@ import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic as _monotonic
 from types import FrameType
 from typing import Protocol
 
@@ -112,6 +118,12 @@ PROBE_VALID_FREQ = 10**9
 CHILD_OOM = 3
 STOP_NAME = "STOP"
 SOURCE_NAME = "source.json"
+# Upstream's log in its run_dir, one JSON object a line, written by `ProgressLog.log(event, step,
+# metrics)` (training/train_utils.py at ee2ebc89) as `{"time", "type": event, "step", "metrics"}`.
+# train.py logs `progress.log("valid", step + 1, valid_metrics)` after each validation, and every
+# forward branch's metrics carry `loss`: `{"type": "valid", "step": S, "metrics": {"loss": L}}`.
+PROGRESS_NAME = "progress.jsonl"
+VALID_MARK = ("type", "valid")
 CHECKPOINT = "checkpoint"
 MIB = 1 << 20
 _CHECKPOINT_PT = re.compile(r"checkpoint_([0-9]{8})\.pt")
@@ -130,6 +142,11 @@ def utc_now() -> datetime:
 def sleep(seconds: float) -> None:
     """Wait between polls of the trainer; tests replace this function."""
     time.sleep(seconds)
+
+
+def save_clock() -> float:
+    """Return a monotonic reading in seconds, to time a checkpoint save; tests replace this."""
+    return _monotonic()
 
 
 class Child(Protocol):
@@ -337,7 +354,8 @@ def trainer_config(
     """Return upstream's trainer config `base` with this run's paths, batch and steps set.
 
     The accumulation brings `batch` to the config's own effective batch; the checkpoint interval
-    is the smaller of `ckpt_freq` and the config's.
+    is the smaller of `ckpt_freq` and the config's, and validation runs at the same interval, so
+    upstream logs a validation loss at the step of each interval checkpoint.
     """
     config = copy.deepcopy(dict(base))
     effective = int(config.get("batch_size", contract.EFFECTIVE_BATCH)) * int(
@@ -355,6 +373,7 @@ def trainer_config(
         grad_accum_steps=contract.accum_for(batch, effective),
         max_steps=max_steps,
         ckpt_freq=max(1, every),
+        valid_freq=max(1, every),
         compile=False,
         sample_sentences=[],
     )
@@ -385,6 +404,8 @@ class Workspace:
     def prepare(self, *, student: bool) -> None:
         """Copy the corpus and write the teacher's (and with `student`, the student's) config."""
         self.train_jsonl, self.valid_jsonl = prepare_corpus(self.data, self.run_id, self.corpus)
+        lines = self.valid_jsonl.read_text(encoding="utf-8").splitlines()
+        self.valid_rows = sum(1 for line in lines if line.strip())
         base, base_tokenizer = cached_file(BASE_WEIGHTS), cached_file(BASE_TOKENIZER)
         self.teacher_config = local_model_config(
             self.upstream / TEACHER_MODEL_CONFIG, self.configs / "teacher-model.yaml",
@@ -507,6 +528,12 @@ def _rate(value: object) -> float | None:
     return float(value)
 
 
+def _seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not value >= 0:
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
 def run_probe(
     data: Path, upstream: Path, run_id: str, corpus: str, batches: Sequence[int], stop: Stop
 ) -> tuple[list[str], dict[str, object]]:
@@ -546,7 +573,8 @@ def run_probe(
         )  # fmt: skip
         trials.append(
             {"batch": batch, "accum": int(doc["grad_accum_steps"]), "peak_vram_mib": peak,  # type: ignore[call-overload]
-             "free_vram_mib": free, "steps_per_s": rate, "oom": oom, "fits": fits}
+             "free_vram_mib": free, "steps_per_s": rate,
+             "save_s": _seconds(metrics.get("save_s")), "oom": oom, "fits": fits}
         )  # fmt: skip
         shutil.rmtree(run_dir, ignore_errors=True)
         print(f"student_train: probe batch {batch}: {'fits' if fits else 'does not fit'}")
@@ -554,6 +582,7 @@ def run_probe(
             break
     fitting = [t for t in trials if t["fits"]]
     best = fitting[-1] if fitting else None
+    saves = [float(t["save_s"]) for t in trials if t["save_s"] is not None]  # type: ignore[arg-type]
     total = contract.STEPS_FINETUNE + contract.STEPS_DISTILL
     probe: dict[str, object] = {
         "schema": SCHEMA,
@@ -564,6 +593,8 @@ def run_probe(
         "peak_vram_mib": best["peak_vram_mib"] if best else None,
         "free_vram_mib": (best or trials[0])["free_vram_mib"],
         "steps_per_s": best["steps_per_s"] if best else None,
+        # The longest save of any trial: the model saved is the same at every batch.
+        "save_s": round(max(saves), 1) if saves else None,
         "projected_hours": (
             contract.projected_hours(float(best["steps_per_s"]), total) if best else None  # type: ignore[arg-type]
         ),
@@ -600,6 +631,7 @@ class TrainRecord:
             "stage": doc.get("stage"),
             "steps": dict(doc.get("steps") or {}),  # type: ignore[call-overload]
             "losses": {k: list(v) for k, v in dict(doc.get("losses") or {}).items()},  # type: ignore[call-overload]
+            "best": doc.get("best"),
             "versions": doc.get("versions"),
             "tokenizer_sha256": doc.get("tokenizer_sha256"),
             "files": doc.get("files"),
@@ -626,13 +658,33 @@ class Trainer:
     """One `train` job: each stage's trainer, restarted until it reaches its last step or stops."""
 
     def __init__(
-        self, space: Workspace, record: TrainRecord, stop: Stop, batch: int, ckpt_freq: int | None
+        self,
+        space: Workspace,
+        record: TrainRecord,
+        stop: Stop,
+        batch: int,
+        ckpt_freq: int | None,
+        keep_last: int = contract.KEEP_LAST,
     ) -> None:
         self.space = space
         self.record = record
         self.stop = stop
         self.batch = batch
         self.ckpt_freq = ckpt_freq
+        self.keep_last = keep_last
+
+    def retention(self) -> dict[str, object]:
+        """Return the checkpoints a stage keeps and the validation batches each pass runs.
+
+        Upstream's `validate` reads the split in file order in whole batches, dropping a tail
+        shorter than one, and starts again from the top after the last; `rows // batch` batches
+        validate each row of the whole batches once. The corpus writes its held-out seed rows
+        first, so a dropped tail is teacher rows.
+        """
+        return {
+            "num_ckpt_keep": self.keep_last,
+            "num_valid_batches": max(1, self.space.valid_rows // self.batch),
+        }
 
     def finetune_config(self, max_steps: int) -> Path:
         """Write the fine-tune's trainer config: the 24-layer base, upstream's `finetune.yaml`."""
@@ -642,6 +694,7 @@ class Trainer:
             valid_jsonl=self.space.valid_jsonl, run_dir=self.space.stage_dir(contract.FINETUNE),
             batch=self.batch, max_steps=max_steps,
             ckpt_freq=self.ckpt_freq or int(base.get("ckpt_freq", 1)),  # type: ignore[call-overload]
+            extra=self.retention(),
         )  # fmt: skip
         return self.space.config(contract.FINETUNE, doc)
 
@@ -664,6 +717,7 @@ class Trainer:
             batch=self.batch, max_steps=max_steps,
             ckpt_freq=self.ckpt_freq or int(base.get("ckpt_freq", 1)),  # type: ignore[call-overload]
             extra={
+                **self.retention(),
                 "student_init_from": str(self.space.student_init),
                 "distill_teacher_config": str(self.space.teacher_config),
                 "distill_teacher_weights": str(teacher),
@@ -722,13 +776,16 @@ def run_train(
     steps: Mapping[str, int],
     stage: str | None,
     stop: Stop,
+    keep_last: int = contract.KEEP_LAST,
 ) -> tuple[list[str], dict[str, object]]:
     """Fine-tune, then distill (or the one `stage`); return the files written and `train.json`.
 
     Raises:
-        StageError: The two tokenizers differ, a trainer failed, or distillation was asked for
-            before the fine-tune finished.
+        StageError: `keep_last` is below 1, the two tokenizers differ, a trainer failed, or
+            distillation was asked for before the fine-tune finished.
     """
+    if keep_last < 1:
+        raise StageError("a stage keeps at least 1 checkpoint")
     space = Workspace(data, upstream, run_id, corpus)
     weights_before = set(space.weights_dir().glob(f"*/{contract.WEIGHTS_NAME}"))
     space.prepare(student=True)
@@ -740,12 +797,13 @@ def run_train(
     record.doc["versions"] = versions(upstream)
     record.doc["tokenizer_sha256"] = space.files["student_tokenizer"]
     stages = (stage,) if stage else contract.STAGES
-    trainer = Trainer(space, record, stop, batch, ckpt_freq)
+    trainer = Trainer(space, record, stop, batch, ckpt_freq, keep_last)
     reason: str | None = None
     try:
         reason = trainer.run(stages, steps)
     finally:
         record.doc["files"] = dict(space.files)
+        record.doc["best"] = best_checkpoint(space.stage_dir(contract.DISTILL), space.weights_dir())
         record.save()
     finished = all(newest_step(space.stage_dir(name)) >= steps[name] for name in contract.STAGES)
     record.doc["status"] = (
@@ -884,13 +942,64 @@ def export_weights(source: Path, dest: Path) -> None:
     os.replace(temp, dest)
 
 
-def prune_exports(run_dir: Path, export_dir: Path) -> None:
-    """Remove the weights of each checkpoint upstream no longer keeps."""
+def valid_losses(run_dir: Path) -> dict[int, float]:
+    """Return the validation loss of each step upstream logged in `<run_dir>/progress.jsonl`.
+
+    A step logged twice (a stretch was killed after validating and run again) keeps its last
+    line; a line that is not a whole JSON object (a torn last line), or has no `metrics` mapping
+    holding a finite `loss`, is passed over.
+    """
+    try:
+        text = (run_dir / PROGRESS_NAME).read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, UnicodeDecodeError):
+        return {}
+    key, mark = VALID_MARK
+    losses: dict[int, float] = {}
+    for line in text.splitlines():
+        try:
+            doc = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(doc, dict) or doc.get(key) != mark:
+            continue
+        metrics = doc.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        step, loss = doc.get("step"), metrics.get("loss")
+        if isinstance(step, bool) or not isinstance(step, int):
+            continue
+        if isinstance(loss, bool) or not isinstance(loss, int | float) or not math.isfinite(loss):
+            continue
+        losses[step] = float(loss)
+    return losses
+
+
+def best_checkpoint(run_dir: Path, export_dir: Path) -> dict[str, object] | None:
+    """Return the checkpoint with weights whose validation loss is lowest, or `None`.
+
+    Ties go to the earlier step. A checkpoint saved by a stop, the deadline or the watchdog has
+    no validation line, and a validated step whose save never landed has no weights; neither
+    can be the best.
+    """
+    found = [
+        (loss, step)
+        for step, loss in valid_losses(run_dir).items()
+        if (export_dir / contract.checkpoint_name(step) / contract.WEIGHTS_NAME).is_file()
+    ]
+    if not found:
+        return None
+    loss, step = min(found)
+    return {"checkpoint": contract.checkpoint_name(step), "step": step, "valid_loss": loss}
+
+
+def prune_exports(run_dir: Path, export_dir: Path, keep: str | None) -> None:
+    """Remove the weights of each checkpoint upstream no longer keeps, except `keep`'s."""
     if not export_dir.is_dir():
         return
     for folder in export_dir.iterdir():
         if (
             re.fullmatch(r"checkpoint_[0-9]{8}", folder.name)
+            and folder.name != keep
             and not (run_dir / f"{folder.name}.pt").is_file()
         ):
             shutil.rmtree(folder)
@@ -909,6 +1018,8 @@ def install_export(module: object, export_dir: Path) -> None:
 
     Upstream calls `save_checkpoint(run_dir, step, ...)`; with Mimi it refreshes
     `run_dir/model.safetensors`, which the next save overwrites, so the copy is made at once.
+    The weights of the checkpoints upstream keeps (its last `num_ckpt_keep`) remain, and so do
+    those of the best validated checkpoint (`best_checkpoint`); the others are removed.
 
     Raises:
         StageError: (from the wrapper) A save refreshed no `model.safetensors`.
@@ -926,10 +1037,39 @@ def install_export(module: object, export_dir: Path) -> None:
             raise StageError(f"the save at step {step} refreshed no {contract.WEIGHTS_NAME}")
         name = contract.checkpoint_name(step)
         export_weights(exported, export_dir / name / contract.WEIGHTS_NAME)
-        prune_exports(run_dir, export_dir)
+        best = best_checkpoint(run_dir, export_dir)
+        prune_exports(run_dir, export_dir, str(best["checkpoint"]) if best else None)
         return result
 
     module.save_checkpoint = save_checkpoint  # type: ignore[attr-defined]
+
+
+class SaveTimer:
+    """Times each `save_checkpoint` call, the export copy included when it is installed first.
+
+    The longest is what a stop's save costs on top of the step under way.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self.durations: list[float] = []
+
+    def install(self, module: object) -> None:
+        """Wrap `module.save_checkpoint`; a save that raises is timed too."""
+        original = module.save_checkpoint  # type: ignore[attr-defined]
+
+        def save_checkpoint(*args: object, **kwargs: object) -> object:
+            start = self._clock()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self.durations.append(self._clock() - start)
+
+        module.save_checkpoint = save_checkpoint  # type: ignore[attr-defined]
+
+    def longest(self) -> float | None:
+        """Return the longest save in seconds, or `None` before the first."""
+        return max(self.durations, default=None)
 
 
 def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Path | None) -> int:
@@ -943,8 +1083,11 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
 
     free = int(torch.cuda.mem_get_info()[0])
     monitor = StepMonitor(time.perf_counter)
+    checkpointing = importlib.import_module(CHECKPOINTING_MODULE)
     if export_dir is not None:
-        install_export(importlib.import_module(CHECKPOINTING_MODULE), export_dir)
+        install_export(checkpointing, export_dir)
+    saves = SaveTimer(save_clock)
+    saves.install(checkpointing)
     saved_argv, saved_cwd = sys.argv, os.getcwd()
     oom = False
     monitor.install(torch)
@@ -966,6 +1109,7 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
                 "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
                 "steps": len(monitor.times),
                 "steps_per_s": monitor.steps_per_s(),
+                "save_s": saves.longest(),
                 "losses": monitor.windows(),
                 "oom": oom,
             },
@@ -999,6 +1143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     train.add_argument("--ckpt-freq", type=int)
     train.add_argument("--steps-finetune", type=int, default=contract.STEPS_FINETUNE)
     train.add_argument("--steps-distill", type=int, default=contract.STEPS_DISTILL)
+    train.add_argument("--keep-last", type=int, default=contract.KEEP_LAST)
     train.add_argument("--stage", choices=contract.STAGES)
     train.add_argument("--deadline-utc", type=deadline_mod.parse_utc)
     trainer = modes.add_parser("trainer")
@@ -1028,7 +1173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             written, _doc = run_train(
                 args.data, upstream, args.run, args.corpus, args.batch, args.ckpt_freq, steps,
-                args.stage, stop,
+                args.stage, stop, args.keep_last,
             )  # fmt: skip
     except StageError as exc:
         print(f"error: {exc}", file=sys.stderr)

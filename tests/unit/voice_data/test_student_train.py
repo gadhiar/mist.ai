@@ -277,6 +277,35 @@ def safetensors_fake(monkeypatch: pytest.MonkeyPatch) -> FakeSafetensorsTorch:
 # The trainer.
 
 
+def write_valid_line(run_dir: Path, step: int, loss: float) -> None:
+    """Append the line upstream logs after validating (`ProgressLog.log("valid", ...)`)."""
+    doc = {"time": "2026-11-24 15:00:00+0000", "type": "valid", "step": step,
+           "metrics": {"flow_loss": loss - 0.1, "loss": loss}}  # fmt: skip
+    write_progress_line(run_dir, doc)
+
+
+def write_progress_line(run_dir: Path, doc: dict) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / "progress.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(doc) + "\n")
+
+
+def upstream_save(keep: int) -> object:
+    """`save_checkpoint` as upstream's: a `.pt`, pruned to `keep`, and a refreshed export."""
+
+    def save_checkpoint(run_dir: Path, step: int) -> None:
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / f"checkpoint_{step:08d}.pt").write_bytes(b"model ema")
+        for old in sorted(run_dir.glob("checkpoint_*.pt"))[:-keep]:
+            old.unlink()
+        state = {"flow_lm.w": [float(step)], "mimi.w": [1.0]}
+        sys.modules["safetensors.torch"].save_file(state, str(run_dir / "model.tmp"))
+        (run_dir / "model.tmp").rename(run_dir / "model.safetensors")
+
+    return save_checkpoint
+
+
 class FakeClock:
     def __init__(self, now: datetime = T0) -> None:
         self.now = now
@@ -304,6 +333,9 @@ class FakeTrainer:
     seconds_per_step: float = 10.0
     peaks_mib: dict[int, int] = field(default_factory=lambda: {2: 6100, 4: 7600, 8: 9900})
     rates: dict[int, float] = field(default_factory=lambda: {2: 0.02, 4: 0.025, 8: 0.03})
+    save_s: dict[int, float] = field(default_factory=dict)
+    # Validation losses by `(run, step)`; a step not named falls with the step.
+    valid_losses: dict[tuple[str, int], float] = field(default_factory=dict)
     free_mib: int = FREE_MIB
     oom: set[int] = field(default_factory=set)
     kill_at: tuple[str, int] | None = None
@@ -359,6 +391,7 @@ class FakeChild:
             "peak_reserved_bytes": self.trainer.peaks_mib.get(batch, 0) * MIB,
             "steps": self.local,
             "steps_per_s": None if oom else self.trainer.rates.get(batch),
+            "save_s": None if oom else self.trainer.save_s.get(batch),
             "losses": [[self.local, 2.0 - 0.01 * self.step]] if self.local else [],
             "oom": oom,
         }
@@ -384,6 +417,9 @@ class FakeChild:
             signal.raise_signal(signal.SIGTERM)
         stop = (self.run_dir / "STOP").exists()
         last = self.step >= self.config["max_steps"]
+        if self.step % self.config["valid_freq"] == 0:
+            loss = self.trainer.valid_losses.get(here, 2.0 - 0.01 * self.step)
+            write_valid_line(self.run_dir, self.step, loss)
         if stop or last or self.step % self.config["ckpt_freq"] == 0:
             self.module.save_checkpoint(self.run_dir, self.step)
         if stop or last:
@@ -591,6 +627,27 @@ def test_probe_counts_out_of_memory_as_not_fitting(
     assert "out of memory" in result.out
 
 
+def test_probe_records_its_longest_checkpoint_save(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    # Batch 8 does not fit, but its save was timed too; the longest is kept, to one decimal.
+    trainer = FakeTrainer(save_s={2: 1.24, 4: 2.36, 8: 1.9})
+    result = probe(root, clone, trainer=trainer)
+    assert result.code == 0, result.err + result.log
+    doc = read(run_dir(root) / "probe.json")
+    assert doc["save_s"] == 2.4
+    assert [t["save_s"] for t in doc["trials"]] == [1.24, 2.36, 1.9]
+
+
+def test_probe_save_s_is_null_when_no_save_was_timed(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    result = probe(root, clone, trainer=FakeTrainer(oom={2}))
+    assert result.code == 3
+    doc = read(run_dir(root) / "probe.json")
+    assert doc["save_s"] is None and doc["trials"][0]["save_s"] is None
+
+
 def test_probe_batch_probes_that_batch_alone(root: root_mod.Root, hub: Hub, clone: Path) -> None:
     trainer = FakeTrainer(peaks_mib={16: 9000}, rates={16: 0.1})
     result = probe(root, clone, "--batch", "16", trainer=trainer)
@@ -669,7 +726,7 @@ def test_train_finetunes_then_distills_from_the_local_files(
     # 0.025 steps/s for 20 minutes is 30 steps; 7600 + 512 MiB is 7.93 GiB.
     assert job["args"] == [
         "train", "--run", RUN, "--corpus", CORPUS, "--batch", "4", "--ckpt-freq", "30",
-        "--steps-finetune", "6", "--steps-distill", "8",
+        "--steps-finetune", "6", "--steps-distill", "8", "--keep-last", "3",
     ]  # fmt: skip
     assert job["vram_gb"] == 8.0
     assert [s.name for s in trainer.starts] == ["finetune", "distill"]
@@ -730,11 +787,9 @@ def test_train_steps_are_pre_registered_at_8k_and_20k(
 def test_distill_checkpoints_keep_runtime_layout_student_weights(
     root: root_mod.Root, hub: Hub, clone: Path
 ) -> None:
-    (clone / stage.DISTILL_CONFIG).write_text(
-        DISTILL_YAML.replace("num_ckpt_keep: 999", "num_ckpt_keep: 2"), encoding="utf-8"
-    )
     write_probe(root, steps_per_s=0.002)  # a checkpoint every 2 steps
-    result = train(root, clone, "--steps-finetune", "4", "--steps-distill", "7")
+    # The fake's validation loss falls with the step, so the best is among the last two.
+    result = train(root, clone, "--steps-finetune", "4", "--steps-distill", "7", "--keep-last", "2")
     assert result.code == 0, result.err + result.log
     distill = run_dir(root) / "checkpoints" / "distill"
     kept = sorted(p.stem for p in distill.glob("checkpoint_*.pt"))
@@ -747,6 +802,160 @@ def test_distill_checkpoints_keep_runtime_layout_student_weights(
         assert state == {"flow_lm.layer.weight": [float(name[-1])], "mimi.encoder.weight": [0.5]}
     listed = {f["rel"] for f in read(run_dir(root) / "outputs.json")["files"]}
     assert {student_cmd.weights_rel(RUN, name) for name in kept} <= listed
+
+
+def rewrite_valid(root: root_mod.Root, rows: int) -> None:
+    """Make the corpus's validation split `rows` rows long, its manifest updated."""
+    folder = root.path / "corpus" / CORPUS
+    line = (folder / "valid_aligned.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    (folder / "valid_aligned.jsonl").write_text((line + "\n") * rows, encoding="utf-8")
+    manifest = read(folder / "manifest.json")
+    manifest["files"] = [
+        {"rel": f"corpus/{CORPUS}/{name}", "sha256": sha256(folder / name)}
+        for name in ("train_aligned.jsonl", "valid_aligned.jsonl")
+    ]
+    write_json(root, f"corpus/{CORPUS}/manifest.json", manifest)
+
+
+@pytest.mark.parametrize(
+    ("args", "rows", "keep", "batches"),
+    [
+        pytest.param((), 1, 3, 1, id="default-one-row"),
+        pytest.param(("--keep-last", "5"), 9, 5, 2, id="keep-5-nine-rows"),
+    ],
+)
+def test_train_sets_retention_and_validation_for_both_stages(
+    root: root_mod.Root, hub: Hub, clone: Path, args: tuple[str, ...], rows: int, keep: int,
+    batches: int,
+) -> None:  # fmt: skip
+    rewrite_valid(root, rows)
+    write_probe(root, batch=4, steps_per_s=0.025)  # a checkpoint every 30 steps
+    trainer = FakeTrainer()
+    result = train(
+        root, clone, "--steps-finetune", "2", "--steps-distill", "2", *args, trainer=trainer
+    )
+    assert result.code == 0, result.err + result.log
+    assert result.job["args"][-2:] == ["--keep-last", str(keep)]
+    assert read(run_dir(root) / "train-plan.json")["keep_last"] == keep
+    assert [s.name for s in trainer.starts] == ["finetune", "distill"]
+    for start in trainer.starts:
+        config = start.config
+        # The validation split's whole batches of 4, each validated once at every checkpoint.
+        assert (config["num_ckpt_keep"], config["valid_freq"], config["ckpt_freq"]) == (
+            keep, 30, 30
+        )  # fmt: skip
+        assert config["num_valid_batches"] == batches
+
+
+def test_train_refuses_keep_last_below_1(root: root_mod.Root, hub: Hub, clone: Path) -> None:
+    write_probe(root)
+    result = train(root, clone, "--keep-last", "0")
+    assert result.code == 2 and "--keep-last is at least 1" in result.err
+    assert not result.docker.argvs
+
+
+def test_a_resumed_run_keeps_its_planned_keep_last(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    write_probe(root)
+    killed = train(root, clone, "--keep-last", "5", trainer=FakeTrainer(kill_at=("finetune", 1)))
+    assert killed.code == 4
+    trainer = FakeTrainer()
+    resumed = train(root, clone, "--resume", "--steps-finetune", "1", "--steps-distill", "1",
+                    trainer=trainer)  # fmt: skip
+    assert resumed.code == 0, resumed.err + resumed.log
+    assert resumed.job["args"][-2:] == ["--keep-last", "5"]
+    assert {s.config["num_ckpt_keep"] for s in trainer.starts} == {5}
+
+
+def test_distill_keeps_the_last_n_and_the_best_validated_weights(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    write_probe(root, steps_per_s=0.002)  # a checkpoint and a validation every 2 steps
+    losses = {2: 0.9, 4: 0.4, 6: 0.7, 8: 0.6}
+    trainer = FakeTrainer(valid_losses={("distill", s): v for s, v in losses.items()})
+    result = train(
+        root, clone, "--steps-finetune", "2", "--steps-distill", "9", "--keep-last", "2",
+        trainer=trainer,
+    )  # fmt: skip
+    assert result.code == 0, result.err + result.log
+    distill = run_dir(root) / "checkpoints" / "distill"
+    # Upstream keeps the last two; step 9's save (the last step) had no validation.
+    assert sorted(p.stem for p in distill.glob("checkpoint_*.pt")) == [
+        "checkpoint_00000008", "checkpoint_00000009"
+    ]  # fmt: skip
+    weights = run_dir(root) / "checkpoints" / "weights"
+    kept = ["checkpoint_00000004", "checkpoint_00000008", "checkpoint_00000009"]
+    assert sorted(p.name for p in weights.iterdir()) == kept
+    record = read(run_dir(root) / "train.json")
+    assert record["best"] == {"checkpoint": "checkpoint_00000004", "step": 4, "valid_loss": 0.4}
+    listed = {f["rel"] for f in read(run_dir(root) / "outputs.json")["files"]}
+    assert {student_cmd.weights_rel(RUN, name) for name in kept} <= listed
+    assert student_cmd.weights_rel(RUN, "checkpoint_00000006") not in listed
+    assert "best: checkpoint_00000004 at step 4, valid loss 0.4000" in result.out
+
+
+def test_train_json_best_is_null_before_the_first_validation(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    write_probe(root)  # a checkpoint every 30 steps: none is validated in 2
+    result = train(root, clone, "--steps-finetune", "2", "--steps-distill", "2")
+    assert result.code == 0, result.err + result.log
+    assert read(run_dir(root) / "train.json")["best"] is None
+    assert "best:" not in result.out
+
+
+def test_retention_breaks_ties_by_the_earlier_step_and_skips_unvalidated_saves(
+    tmp_path: Path,
+) -> None:
+    run, weights = tmp_path / "distill", tmp_path / "weights"
+    module = types.SimpleNamespace(save_checkpoint=upstream_save(keep=2))
+    stage.install_export(module, weights)
+
+    def save(step: int, loss: float | None) -> list[int]:
+        if loss is not None:
+            write_valid_line(run, step, loss)
+        module.save_checkpoint(run, step)
+        return sorted(int(p.name[-8:]) for p in weights.iterdir())
+
+    assert save(2, 0.5) == [2]
+    assert save(4, 0.5) == [2, 4]
+    # Steps 2 and 4 tie: the earlier is the best, kept beside the last two.
+    assert save(6, 0.6) == [2, 4, 6]
+    # A stop's save has no figure: it is one of the last two, and never the best.
+    assert save(7, None) == [2, 6, 7]
+    assert stage.best_checkpoint(run, weights) == {
+        "checkpoint": "checkpoint_00000002", "step": 2, "valid_loss": 0.5
+    }  # fmt: skip
+    # A validation whose save never landed (the trainer was killed) and a torn last line
+    # are passed over.
+    write_valid_line(run, 10, 0.1)
+    with (run / "progress.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"kind": "valid", "st')
+    assert stage.best_checkpoint(run, weights)["step"] == 2  # type: ignore[index]
+    with (run / "progress.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    # A new best within the last two releases the old one.
+    assert save(8, 0.3) == [7, 8]
+    assert stage.best_checkpoint(run, weights)["checkpoint"] == "checkpoint_00000008"  # type: ignore[index]
+
+
+def test_only_a_valid_line_with_a_metrics_loss_is_a_validation_loss(tmp_path: Path) -> None:
+    run, weights = tmp_path / "distill", tmp_path / "weights"
+    for step in (2, 4, 6, 8):
+        (weights / f"checkpoint_{step:08d}").mkdir(parents=True)
+        (weights / f"checkpoint_{step:08d}" / "model.safetensors").write_text("{}", "utf-8")
+    write_valid_line(run, 2, 0.9)
+    # A top-level `loss` with no `metrics`, metrics that are not a mapping, a checkpoint line.
+    write_progress_line(run, {"type": "valid", "step": 4, "loss": 0.1})
+    write_progress_line(run, {"type": "valid", "step": 6, "metrics": [0.1]})
+    write_progress_line(run, {"type": "checkpoint", "step": 8, "metrics": {"loss": 0.1}})
+    assert stage.valid_losses(run) == {2: 0.9}
+    assert stage.best_checkpoint(run, weights)["step"] == 2  # type: ignore[index]
+
+
+def test_best_checkpoint_is_none_without_progress(tmp_path: Path) -> None:
+    assert stage.best_checkpoint(tmp_path / "distill", tmp_path / "weights") is None
 
 
 def test_a_checkpoint_lands_at_least_every_30_minutes(
@@ -1144,6 +1353,37 @@ def test_trainer_runs_upstream_from_the_clone_and_measures_it(
     }  # fmt: skip
     # The hooks are gone once the trainer returns.
     assert sys.modules["torch"].hooks == []  # type: ignore[attr-defined]
+
+
+def test_trainer_times_each_checkpoint_save(
+    trainer_clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Saves at steps 4, 8 and 12, each read twice: they take 1.25, 2.5 and 0.5 seconds.
+    readings = iter([0.0, 1.25, 10.0, 12.5, 20.0, 20.5])
+    monkeypatch.setattr(stage, "save_clock", lambda: next(readings))
+    config = trainer_config_file(tmp_path)
+    metrics = tmp_path / "metrics.json"
+    code = stage.main(
+        ["--data", str(tmp_path), "--upstream", str(trainer_clone), "trainer", "--config",
+         str(config), "--metrics", str(metrics)]
+    )  # fmt: skip
+    assert code == 0
+    assert read(metrics)["save_s"] == pytest.approx(2.5)
+    assert next(readings, None) is None
+
+
+def test_save_timer_records_a_save_that_raised() -> None:
+    def save(run_dir: Path, step: int) -> None:
+        raise OSError("disk full")
+
+    module = types.SimpleNamespace(save_checkpoint=save)
+    readings = iter([5.0, 8.0])
+    timer = stage.SaveTimer(lambda: next(readings))
+    timer.install(module)
+    assert timer.longest() is None
+    with pytest.raises(OSError, match="disk full"):
+        module.save_checkpoint(Path("x"), 1)
+    assert timer.longest() == pytest.approx(3.0)
 
 
 def test_trainer_reports_out_of_memory(trainer_clone: Path, tmp_path: Path) -> None:
