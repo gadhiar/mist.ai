@@ -1069,6 +1069,44 @@ def test_carry_her_nearby_range_outside_the_new_span_is_asked_again() -> None:
     assert carry_one(segment(start=100.5, end=110.0), earlier) is None
 
 
+@pytest.mark.parametrize(
+    ("keep", "span"),
+    [((0.0, 5.0), (10.01, 20.0)), ((5.0, 10.0), (10.0, 19.99))],
+    ids=["start-clamped", "end-clamped"],
+)
+def test_carry_her_nearby_range_clamped_into_the_span_is_asked_again(
+    keep: tuple[float, float], span: tuple[float, float]
+) -> None:
+    # The range reaches 0.01 s past the new span, inside `CARRY_TOL_S`, but clamping it into the
+    # span moves it 0.01 s in source time: past `carried_stale`'s tolerance, so it is not carried.
+    earlier = label(start=10.0, end=20.0, voices="her_nearby", keep=keep)
+    assert carry_one(segment(start=span[0], end=span[1]), earlier) is None
+
+
+_OFFSETS = (-0.01, -0.006, -0.005, -0.004, -0.003, 0.0, 0.003, 0.004, 0.005, 0.006, 0.01)
+
+
+@pytest.mark.parametrize(
+    ("keep", "inside"),
+    [((0.5, 9.5), True), ((2.0, 7.0), True), ((0.0, 5.0), False), ((5.0, 10.0), False),
+     ((0.0, 10.0), False)],
+)  # fmt: skip
+def test_every_her_nearby_label_carry_returns_agrees_with_its_sources(
+    root: root_mod.Root, keep: tuple[float, float], inside: bool
+) -> None:
+    write(root, "r1", [label(run="r1", start=10.0, end=20.0, voices="her_nearby", keep=keep)])
+    segs = [
+        segment(f"seg-{index:06d}", start=10.0 + a, end=20.0 + b)
+        for index, (a, b) in enumerate(itertools.product(_OFFSETS, _OFFSETS), start=100)
+    ]
+    carried = labels.carry(segs, labels.earlier_labels(root, "r2"), run="r2")
+    if inside:
+        # A range well inside every span still lies inside it after rounding: each one carries.
+        assert len(carried) == len(segs)
+    assert carried
+    assert labels.carried_stale(root, tuple(carried.values())) == ()
+
+
 def test_carry_her_nearby_without_a_range_is_asked_again() -> None:
     earlier = label(voices="her_nearby", removed="nearby")
     assert carry_one(segment(), earlier) is None
