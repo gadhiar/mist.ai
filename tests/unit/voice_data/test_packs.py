@@ -1,9 +1,9 @@
-"""Tests for the blind listening packs (T9): six kinds, the sealed key and `pack import`.
+"""Tests for the blind listening packs (T9, T17): six kinds, the sealed key and `pack import`.
 
 Records the packs read that later tasks produce (bake-off takes, `gains.json`, spot-check takes,
-the ABX manifest) are built here from the Interfaces shapes with synthetic data. Clips are small
-synthetic FLAC files: a real STREAMINFO header and an opaque payload unique to each clip, so the
-byte-identity check is meaningful and no audio processing is needed.
+the ABX manifest, the labels pre-fill) are built here from the Interfaces shapes with synthetic
+data. Clips are small synthetic FLAC files: a real STREAMINFO header and an opaque payload unique
+to each clip, so the byte-identity check is meaningful and no audio processing is needed.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -20,11 +21,14 @@ from pathlib import Path
 import pytest
 
 from scripts.voice_data import cli, packs
+from scripts.voice_data import labels as labels_mod
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.errors import InputError
+from scripts.voice_data.labels import LabelRecord, PrefillRecord
 from scripts.voice_data.states import SPEAKING_STATES
 
 SEED = 7
+LABEL_COLUMNS = ["label", "voices", "keep_from_s", "keep_to_s", "energy", "mood", "tags", "note"]
 
 
 # --- synthetic inputs --------------------------------------------------------------------------
@@ -92,8 +96,9 @@ def segment(
     return {
         "segment_id": sid,
         "source_id": source,
-        "start_s": 1.0,
-        "end_s": 5.0,
+        # Each segment its own 4 s span, so a carried label matches one segment only.
+        "start_s": 10.0 * number,
+        "end_s": 10.0 * number + 4.0,
         "channel": "FC",
         "channel_reason": None,
         "separator": "none",
@@ -117,10 +122,82 @@ def segment(
     }
 
 
-def write_run(root: root_mod.Root, run: str, segments: list[dict]) -> None:
+def prefill_row(seg: dict, **values: object) -> dict:
+    """A `PrefillRecord` line for a segment: her, energy 3 and mood 3 unless `values` say else."""
+    row: dict[str, object] = {
+        "segment_id": seg["segment_id"],
+        "source_id": seg["source_id"],
+        "start_s": seg["start_s"],
+        "end_s": seg["end_s"],
+        "duration_s": round(seg["end_s"] - seg["start_s"], 2),
+        "arousal": 0.5,
+        "dominance": 0.5,
+        "valence": 0.5,
+        "energy": 3,
+        "mood": 3,
+        "voices": "her",
+        "keep_from_s": None,
+        "keep_to_s": None,
+        "other_s": 0.0,
+        "overlap_ms": 0,
+    }
+    row.update(values)
+    PrefillRecord.from_json(row)  # the fixture is a valid record
+    return row
+
+
+def write_prefill(root: root_mod.Root, run: str, rows: list[dict]) -> None:
+    write_jsonl(root.path / "seed" / "prefill" / run / "prefill.jsonl", rows)
+
+
+def write_run(root: root_mod.Root, run: str, segments: list[dict], *, prefill: bool = True) -> None:
+    """The run's segments and clips and, unless `prefill` is false, a default pre-fill."""
     write_jsonl(root.path / "seed" / "runs" / run / "segments.jsonl", segments)
     for seg in segments:
         write_clip(root, seg["audio"])
+    if prefill:
+        write_prefill(root, run, [prefill_row(s) for s in segments if s["kept"]])
+
+
+def earlier_label(seg: dict, run: str, segment_id: str, **values: object) -> LabelRecord:
+    """A rated label of an earlier run `run` over `seg`'s span, source, channel and separator."""
+    fields: dict[str, object] = {
+        "run": run,
+        "segment_id": segment_id,
+        "source_id": seg["source_id"],
+        "start_s": seg["start_s"],
+        "end_s": seg["end_s"],
+        "channel": seg["channel"],
+        "separator": seg["separator"],
+        "duration_s": round(seg["end_s"] - seg["start_s"], 2),
+        "voices": "her",
+        "energy": 4,
+        "mood": 4,
+        "tags": ("warm",),
+        "keep_from_s": None,
+        "keep_to_s": None,
+        "has_note": False,
+        "state": "awake",
+        "removed": None,
+        "carried_from": (),
+    }
+    fields.update(values)
+    return LabelRecord(**fields)  # type: ignore[arg-type]
+
+
+def label_dir(root: root_mod.Root, run: str = "r1") -> Path:
+    return root.path / "seed" / "labels" / run
+
+
+def read_label_file(root: root_mod.Root, run: str = "r1") -> dict[str, dict]:
+    text = (label_dir(root, run) / "labels.jsonl").read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    return {row["segment_id"]: row for row in rows}
+
+
+def as_prefilled(group: dict, item: dict) -> dict:
+    """An item's answers as the page pre-fills them: its defaults, else blank."""
+    return {name: item["defaults"].get(name, "") for name in item["fields"]}
 
 
 def take(
@@ -358,7 +435,7 @@ def test_labels_pack_layout_order_and_byte_identical_clips(
     assert (private_root.path / "packs" / f"{packs.pack_id(SEED)}.key" / "key.json").is_file()
     assert not (directory / "key.json").exists()
     data, key = page_of(private_root), key_of(private_root)
-    assert data["columns"] == ["label", "state", "not_her"]
+    assert data["columns"] == LABEL_COLUMNS
     kept = [s for s in segs if s["kept"]]
     pairs = items_of(data)
     assert len(pairs) == len(kept)
@@ -369,7 +446,9 @@ def test_labels_pack_layout_order_and_byte_identical_clips(
     for _, item in pairs:
         info = key["items"][item["label"]]
         seg = by_id[info["segment_id"]]
-        assert item["defaults"]["state"] == seg["state_proposed"]
+        assert item["fields"] == LABEL_COLUMNS[1:]
+        assert item["defaults"] == {"voices": "her", "energy": 3, "mood": 3}
+        assert item["duration_s"] == 4.0
         clip = directory / "clips" / f"{item['label']}.flac"
         assert clip.read_bytes() == (private_root.path / seg["audio"]).read_bytes()
     # Three segments of each multi-segment flag group lead, one page group per flag group.
@@ -382,44 +461,452 @@ def test_labels_pack_layout_order_and_byte_identical_clips(
     assert "seg-0000" not in page and "src-000" not in page
 
 
-def test_labels_import_drops_groups_and_marked_segments(
-    private_root: root_mod.Root, tmp_path: Path
+def test_labels_pack_fields_intro_and_key(private_root: root_mod.Root) -> None:
+    segs = _labels_segments()
+    write_run(private_root, "r1", segs)
+    rows = [prefill_row(s) for s in segs if s["kept"]]
+    rows[2] = prefill_row(
+        segs[2], voices="her_nearby", keep_from_s=0.5, keep_to_s=3.8, energy=2, mood=4
+    )
+    write_prefill(private_root, "r1", rows)
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    data, key = page_of(private_root), key_of(private_root)
+    fields = data["fields"]
+    assert fields["voices"] == {
+        "type": "choice",
+        "title": "Voices",
+        "options": list(labels_mod.VOICES),
+    }
+    for name in ("keep_from_s", "keep_to_s"):
+        assert fields[name]["type"] == "number"
+        assert fields[name]["decimals"] == 2
+        assert fields[name]["only_if"] == ["voices", "her_nearby"]
+    assert data["ranges"] == [{"from": "keep_from_s", "to": "keep_to_s", "min_s": 3}]
+    for name in ("energy", "mood"):
+        assert (fields[name]["type"], fields[name]["min"], fields[name]["max"]) == ("scale", 1, 5)
+        assert len(fields[name]["labels"]) == 5
+    assert fields["energy"]["labels"][0].startswith("very low")
+    assert fields["mood"]["labels"][4].startswith("positive")
+    assert fields["tags"] == {
+        "type": "tags",
+        "title": "Tags",
+        "options": list(labels_mod.TAGS),
+        "max": labels_mod.MAX_TAGS,
+    }
+    assert fields["note"] == {"type": "text", "title": "Note", "max": labels_mod.NOTE_MAX}
+    # One intro line per field, and one that says where a note stays.
+    intro = data["intro"]
+    for word in ("Voices", "Keep from", "Energy", "Mood", "Tags", "Note"):
+        assert sum(line.startswith(word) for line in intro) == 1
+    note_line = next(line for line in intro if line.startswith("Note"))
+    assert "browser" in note_line and "ratings.csv" in note_line and "report" in note_line
+    by_sid = {
+        key["items"][i["label"]]["segment_id"]: (i, key["items"][i["label"]])
+        for _, i in items_of(data)
+    }
+    item, info = by_sid["seg-000003"]
+    assert item["defaults"] == {
+        "voices": "her_nearby",
+        "keep_from_s": 0.5,
+        "keep_to_s": 3.8,
+        "energy": 2,
+        "mood": 4,
+    }
+    assert info["prefill"] == rows[2]
+    seg = segs[2]
+    for name in ("source_id", "start_s", "end_s", "channel", "separator", "flag_group"):
+        assert info[name] == seg[name]
+    assert info["duration_s"] == 4.0
+    assert key["carried"] == {}
+
+
+@pytest.mark.parametrize("problem", ["missing", "one-short", "one-extra"])
+def test_labels_pack_refuses_a_run_without_its_prefill(
+    private_root: root_mod.Root, problem: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    segs = [segment(n) for n in range(1, 5)]
+    write_run(private_root, "r1", segs, prefill=problem != "missing")
+    if problem == "one-short":
+        write_prefill(private_root, "r1", [prefill_row(s) for s in segs[:3]])
+    elif problem == "one-extra":
+        write_prefill(private_root, "r1", [prefill_row(s) for s in [*segs, segment(9)]])
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 2
+    assert "labels prefill --run r1" in capsys.readouterr().err
+    assert list((private_root.path / "packs").iterdir()) == []
+
+
+def test_labels_pack_refuses_an_existing_label_folder_without_replace(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    segs = [segment(n) for n in range(1, 4)]
+    write_run(private_root, "r1", segs)
+    old = [earlier_label(s, "r1", s["segment_id"]) for s in segs]
+    labels_mod.write_labels(private_root, "r1", old, {}, {})
+    argv = ["pack", "labels", "--run", "r1", "--seed", str(SEED)]
+    assert run_cli(private_root, *argv) == 2
+    assert "--replace" in capsys.readouterr().err
+    assert list((private_root.path / "packs").iterdir()) == []
+    assert run_cli(private_root, *argv, "--replace") == 0
+    assert len(items_of(page_of(private_root))) == 3
+
+
+def _import_fill(key: dict) -> Callable[[dict, dict], dict[str, object]]:
+    """Answers for `_labels_segments`' pack that exercise each choice of voices."""
+    chosen: dict[str, dict[str, object]] = {
+        "seg-000001": {"energy": 5, "mood": 5, "tags": "laughing", "note": "bright, quick"},
+        "seg-000002": {"voices": "not_her"},
+        "seg-000003": {"voices": "her_nearby", "keep_from_s": "0.5", "keep_to_s": "3.8"},
+        "seg-000004": {"voices": "her_overlap"},
+        "seg-000005": {"voices": "her_nearby", "keep_from_s": "", "keep_to_s": ""},
+        "seg-000006": {"energy": 2, "mood": 4, "tags": "whispered;tired"},
+        "seg-000010": {"voices": "not_her"},  # group A
+        "seg-000016": {"voices": "not_her"},  # off-centre, its own group
+    }
+
+    def fill(group: dict, item: dict) -> dict[str, object]:
+        sid = key["items"][item["label"]]["segment_id"]
+        return {**as_prefilled(group, item), **chosen.get(sid, {})}
+
+    return fill
+
+
+def test_labels_import_writes_the_runs_label_folder(
+    private_root: root_mod.Root, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     segs = _labels_segments()
     write_run(private_root, "r1", segs)
     assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
     data, key = page_of(private_root), key_of(private_root)
-    marked = {"seg-000002", "seg-000010", "seg-000016"}  # a primary, group A, off-centre
+    capsys.readouterr()
+    assert import_ratings(private_root, answer(data, _import_fill(key)), tmp_path) == 0
+    out = capsys.readouterr().out
+    got = read_label_file(private_root)
+    kept = [s["segment_id"] for s in segs if s["kept"]]
+    assert list(got) == kept  # every kept clip, in segment order
+    removed = {sid: row["removed"] for sid, row in got.items() if row["removed"]}
+    # Group A (seg 9-13) goes with one not_her; group B, which shares the cluster label spk-03
+    # in another episode, stays; the off-centre segment's drop removes only itself.
+    assert removed == {
+        "seg-000002": "not-her",
+        "seg-000004": "overlap",
+        "seg-000005": "nearby",
+        "seg-000009": "flag-group",
+        "seg-000010": "not-her",
+        "seg-000011": "flag-group",
+        "seg-000012": "flag-group",
+        "seg-000013": "flag-group",
+        "seg-000016": "not-her",
+    }
+    assert all(got[sid]["state"] is None for sid in removed)
+    first = got["seg-000001"]
+    assert (first["energy"], first["mood"], first["tags"]) == (5, 5, ["laughing"])
+    assert first["state"] == "excited" and first["has_note"] is True
+    assert first["run"] == "r1" and first["carried_from"] == []
+    assert (first["start_s"], first["end_s"], first["duration_s"]) == (10.0, 14.0, 4.0)
+    nearby = got["seg-000003"]
+    assert (nearby["keep_from_s"], nearby["keep_to_s"], nearby["state"]) == (0.5, 3.8, "neutral")
+    assert got["seg-000006"]["tags"] == ["whispered", "tired"]
+    assert got["seg-000006"]["state"] == "sleepy"
+    assert got["seg-000014"]["state"] == "neutral" and got["seg-000014"]["removed"] is None
+    notes = (label_dir(private_root) / "notes.private.jsonl").read_text(encoding="utf-8")
+    assert [json.loads(line) for line in notes.splitlines()] == [
+        {"segment_id": "seg-000001", "note": "bright, quick"}
+    ]
+    report = json.loads((label_dir(private_root) / "report.json").read_text(encoding="utf-8"))
+    assert (report["schema"], report["run"], report["pack"]) == (1, "r1", packs.pack_id(SEED))
+    tables = report["tables"]
+    assert tables["removed"]["flag-group"]["count"] == 4
+    assert tables["voices"]["not_her"]["count"] == 3
+    assert tables["trimmed_s"] == 0.7
+    assert tables["agreement"]["clips"] == len(kept)
+    assert tables["agreement"]["voices"]["her"]["her_nearby"] == 2
+    assert tables["notes"] == 1
+    for line in labels_mod.table_lines(tables):
+        assert line in out
+    assert "bright, quick" not in out
+    assert "bright, quick" not in json.dumps(report)
+    assert not (private_root.path / "seed" / "labels.csv").exists()
+    assert not hasattr(packs, "LABELS_REL")
 
-    def fill(group: dict, item: dict) -> dict:
-        sid = key["items"][item["label"]]["segment_id"]
-        state = "excited" if sid == "seg-000001" else item["defaults"]["state"]
-        return {"state": state, "not_her": 1 if sid in marked else 0}
 
-    assert import_ratings(private_root, answer(data, fill), tmp_path) == 0
-    text = (private_root.path / "seed" / "labels.csv").read_text(encoding="utf-8")
-    rows = list(csv.reader(io.StringIO(text)))
-    assert rows[0] == ["segment_id", "state"]
-    got = dict(rows[1:])
-    expected_ids = {f"seg-{n:06d}" for n in (1, 3, 4, 5, 6, 7, 8, 14, 15)}
-    # Group A (seg 9-13) goes with one mark; group B, which shares the cluster label spk-03 in
-    # another episode, stays; the off-centre segment's drop removes only itself.
-    assert set(got) == expected_ids
-    assert got["seg-000001"] == "excited"
-    assert got["seg-000003"] == SPEAKING_STATES[3]
-
-
-def test_labels_group_with_no_mark_is_confirmed(
+def test_labels_import_with_no_change_keeps_every_clip(
     private_root: root_mod.Root, tmp_path: Path
 ) -> None:
     segs = _labels_segments()
     write_run(private_root, "r1", segs)
     assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    assert import_ratings(private_root, answer(page_of(private_root), as_prefilled), tmp_path) == 0
+    got = read_label_file(private_root)
+    assert len(got) == len([s for s in segs if s["kept"]])
+    assert {(row["state"], row["removed"]) for row in got.values()} == {("neutral", None)}
+    assert (label_dir(private_root) / "notes.private.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_labels_import_refuses_an_existing_label_folder_without_replace(
+    private_root: root_mod.Root, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    segs = [segment(n) for n in range(1, 4)]
+    write_run(private_root, "r1", segs)
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    old = [earlier_label(s, "r1", s["segment_id"]) for s in segs]
+    labels_mod.write_labels(private_root, "r1", old, {}, {})
+    before = (label_dir(private_root) / "labels.jsonl").read_bytes()
+    text = answer(page_of(private_root), as_prefilled)
+    capsys.readouterr()
+    assert import_ratings(private_root, text, tmp_path) == 2
+    assert "--replace" in capsys.readouterr().err
+    assert (label_dir(private_root) / "labels.jsonl").read_bytes() == before
+    ratings = tmp_path / "downloads" / "ratings.csv"
+    argv = ["pack", "import", "--pack", packs.pack_id(SEED), "--ratings", str(ratings)]
+    assert run_cli(private_root, *argv, "--replace") == 0
+    got = read_label_file(private_root)
+    assert {row["energy"] for row in got.values()} == {3}
+    assert json.loads((label_dir(private_root) / "report.json").read_text())["pack"] == (
+        packs.pack_id(SEED)
+    )
+
+
+def _carry_setup(root: root_mod.Root) -> list[dict]:
+    """Run r1 of `_labels_segments`, with r0's rated labels over segments 1, 2 and 14."""
+    segs = _labels_segments()
+    write_run(root, "r1", segs)
+    by_id = {s["segment_id"]: s for s in segs}
+    earlier = [
+        earlier_label(by_id["seg-000001"], "r0", "seg-000101"),
+        earlier_label(
+            by_id["seg-000002"],
+            "r0",
+            "seg-000102",
+            voices="her_nearby",
+            keep_from_s=0.5,
+            keep_to_s=3.9,
+            tags=(),
+        ),
+        # Group B's segment 14 was not her in r0: carried, it drops group B in r1.
+        earlier_label(
+            by_id["seg-000014"],
+            "r0",
+            "seg-000114",
+            voices="not_her",
+            tags=(),
+            state=None,
+            removed="not-her",
+        ),
+    ]
+    labels_mod.write_labels(root, "r0", earlier, {}, {})
+    return segs
+
+
+def test_carried_clips_stay_off_the_page_and_are_listed_in_the_key(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    segs = _carry_setup(private_root)
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    assert "3 clips carried" in capsys.readouterr().out
+    data, key = page_of(private_root), key_of(private_root)
+    asked = {key["items"][i["label"]]["segment_id"] for _, i in items_of(data)}
+    carried = {"seg-000001", "seg-000002", "seg-000014"}
+    assert asked == {s["segment_id"] for s in segs if s["kept"]} - carried
+    assert set(key["carried"]) == carried
+    entry = key["carried"]["seg-000002"]
+    assert entry["flag_group"] is None
+    assert entry["label"]["carried_from"] == ["r0/seg-000102"]
+    assert (entry["label"]["keep_from_s"], entry["label"]["keep_to_s"]) == (0.5, 3.9)
+    assert key["carried"]["seg-000014"]["flag_group"] == "src-0002/spk-03"
+    # Group B keeps one clip on the page, so it no longer leads.
+    assert len(data["groups"]) == 2
+
+
+def test_import_writes_carried_clips_and_a_carried_not_her_drops_its_group(
+    private_root: root_mod.Root, tmp_path: Path
+) -> None:
+    _carry_setup(private_root)
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
     data = page_of(private_root)
-    text = answer(data, lambda g, i: {"state": i["defaults"]["state"], "not_her": 0})
-    assert import_ratings(private_root, text, tmp_path) == 0
-    rows = (private_root.path / "seed" / "labels.csv").read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 1 + len([s for s in segs if s["kept"]])
+    assert import_ratings(private_root, answer(data, as_prefilled), tmp_path) == 0
+    got = read_label_file(private_root)
+    assert len(got) == 16
+    first = got["seg-000001"]
+    assert first["carried_from"] == ["r0/seg-000101"] and first["run"] == "r1"
+    assert (first["energy"], first["mood"], first["tags"], first["state"]) == (
+        4,
+        4,
+        ["warm"],
+        "awake",
+    )
+    assert got["seg-000002"]["carried_from"] == ["r0/seg-000102"]
+    assert got["seg-000002"]["state"] == "awake"
+    assert got["seg-000014"]["removed"] == "not-her"
+    assert got["seg-000015"]["removed"] == "flag-group"
+    assert got["seg-000015"]["carried_from"] == []
+    assert sum(1 for row in got.values() if row["carried_from"]) == 3
+    tables = json.loads((label_dir(private_root) / "report.json").read_text())["tables"]
+    assert tables["carried"] == {"clips": 3, "runs": {"r0": 3}}
+    assert tables["agreement"]["clips"] == 13
+
+
+def test_a_run_whose_every_clip_is_carried_gets_its_labels_and_no_page(
+    private_root: root_mod.Root, capsys: pytest.CaptureFixture[str]
+) -> None:
+    segs = [segment(n) for n in range(1, 4)]
+    write_run(private_root, "r1", segs)
+    earlier = [earlier_label(s, "r0", f"seg-0001{k:02d}") for k, s in enumerate(segs)]
+    labels_mod.write_labels(private_root, "r0", earlier, {}, {})
+    argv = ["pack", "labels", "--run", "r1", "--seed", str(SEED)]
+    assert run_cli(private_root, *argv) == 0
+    out = capsys.readouterr().out
+    assert list((private_root.path / "packs").iterdir()) == []
+    got = read_label_file(private_root)
+    assert list(got) == [s["segment_id"] for s in segs]
+    assert all(row["carried_from"] and row["state"] == "awake" for row in got.values())
+    report = json.loads((label_dir(private_root) / "report.json").read_text())
+    assert report["pack"] is None and report["run"] == "r1"
+    for line in labels_mod.table_lines(report["tables"]):
+        assert line in out
+    assert "no page" in out
+    assert run_cli(private_root, *argv) == 2
+    assert run_cli(private_root, *argv, "--replace") == 0
+
+
+_BASE = {"voices": "her_nearby", "keep_from_s": "0.5", "keep_to_s": "3.6"}
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"keep_from_s": "0", "keep_to_s": "4"},
+        {"keep_from_s": "0.25", "keep_to_s": "3.5"},
+        {"keep_from_s": "", "keep_to_s": ""},
+        {"voices": "her", "keep_from_s": "x", "keep_to_s": "9"},  # read only for her_nearby
+        {"tags": "whispered;warm;tired"},
+        {"tags": ""},
+        {"energy": "1", "mood": "5"},
+        {"note": "n" * 200},
+    ],
+    ids=["whole", "decimals", "no-range", "ignored", "three-tags", "no-tags", "ends", "note-max"],
+)
+def test_check_ratings_accepts_each_field_type(
+    private_root: root_mod.Root, tmp_path: Path, values: dict
+) -> None:
+    write_run(private_root, "r1", [segment(n) for n in range(1, 3)])
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    first = items_of(page_of(private_root))[0][1]["label"]
+
+    def fill(group: dict, item: dict) -> dict:
+        own = {**_BASE, **values} if item["label"] == first else {}
+        return {**as_prefilled(group, item), **own}
+
+    assert import_ratings(private_root, answer(page_of(private_root), fill), tmp_path) == 0
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"keep_from_s": "0.125"},
+        {"keep_from_s": "-1"},
+        {"keep_from_s": "x"},
+        {"keep_to_s": "4.01"},
+        {"keep_to_s": ""},
+        {"keep_from_s": "3.5", "keep_to_s": "0.5"},
+        {"keep_from_s": "1", "keep_to_s": "3.99"},
+        {"tags": "warm;whispered"},
+        {"tags": "warm;warm"},
+        {"tags": "grumpy"},
+        {"tags": "whispered;laughing;warm;tired"},
+        {"energy": "6"},
+        {"energy": "very low"},
+        {"mood": "0"},
+        {"note": "n" * 201},
+        {"voices": "someone"},
+    ],
+    ids=[
+        "three-decimals",
+        "negative",
+        "not-a-number",
+        "past-the-clip",
+        "one-end",
+        "reversed",
+        "under-min-s",
+        "tag-order",
+        "tag-repeated",
+        "tag-unknown",
+        "four-tags",
+        "energy-6",
+        "energy-word",
+        "mood-0",
+        "note-201",
+        "voices-unknown",
+    ],
+)
+def test_check_ratings_refuses_each_bad_value_with_the_key_sealed(
+    private_root: root_mod.Root,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    values: dict,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write_run(private_root, "r1", [segment(n) for n in range(1, 3)])
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    first = items_of(page_of(private_root))[0][1]["label"]
+
+    def fill(group: dict, item: dict) -> dict:
+        own = {**_BASE, **values} if item["label"] == first else {}
+        return {**as_prefilled(group, item), **own}
+
+    text = answer(page_of(private_root), fill)
+    _sealed(monkeypatch)
+    capsys.readouterr()
+    assert import_ratings(private_root, text, tmp_path) == 2
+    assert "1 values missing or invalid" in capsys.readouterr().err
+    assert not label_dir(private_root).exists()
+
+
+def _function_body(template: str, name: str) -> str:
+    match = re.search(rf"\nfunction {name}\(.*?\n}}\n", template, re.DOTALL)
+    assert match is not None, name
+    return match.group(0)
+
+
+def test_the_template_has_a_branch_for_every_field_type_a_draft_uses(
+    private_root: root_mod.Root,
+) -> None:
+    root = private_root
+    write_run(root, "r1", _labels_segments())
+    write_run(root, "c1", [segment(n, run="c1") for n in range(1, 5)])
+    write_jsonl(root.path / "text" / "v1" / "lines.jsonl", _lines(2))
+    write_takes(root, f"{BAKE}/takes.jsonl", _bakeoff_takes())
+    spot = [take(f"calm-{n}", "calm", "indextts2", 0, base=BATCH, selected=True) for n in range(3)]
+    write_takes(root, f"{BATCH}/takes.jsonl", spot)
+    clips = {}
+    for system in ("seed", "teacher:indextts2"):
+        rel = f"bench/abx/{system.replace(':', '-')}.flac"
+        write_clip(root, rel)
+        clips[system] = rel
+    manifest = {"lines": [{"line_id": "L1", "state": "calm", "clips": clips}]}
+    (root.path / "bench" / "abx" / "abx.json").write_text(json.dumps(manifest), encoding="utf-8")
+    options = {
+        "labels": {"run": "r1"},
+        "clean-ab": {"before": "r1", "after": "c1"},
+        "text": {"version": "v1"},
+        "bakeoff": {"run": "b1"},
+        "spotcheck": {"takes": f"{BATCH}/takes.jsonl"},
+        "abx": {"manifest": "bench/abx/abx.json"},
+    }
+    assert set(options) == set(packs.KINDS)
+    used = {
+        str(spec["type"])
+        for kind, opts in options.items()
+        for spec in packs.draft_for(root, kind, opts, SEED).fields.values()
+    }
+    assert {"number", "tags", "scale", "text", "choice", "flag", "pick"} <= used
+    template = packs.load_template()
+    for function in ("valid", "widget"):
+        body = _function_body(template, function)
+        branches = set(re.findall(r'field\.type === "([a-z]+)"', body))
+        assert used <= branches, (function, used - branches)
+    # The template marks the words of a scale and caps a text field's length.
+    widget = _function_body(template, "widget")
+    assert "field.labels" in widget and "maxlength" in widget
 
 
 # --- the seal -----------------------------------------------------------------------------------
@@ -432,7 +919,7 @@ def _sealed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(packs, "read_key", refuse)
 
 
-@pytest.mark.parametrize("damage", ["missing-row", "bad-state", "bad-header", "empty-flag"])
+@pytest.mark.parametrize("damage", ["missing-row", "bad-voices", "bad-header", "empty-energy"])
 def test_incomplete_ratings_exit_2_with_the_key_sealed(
     private_root: root_mod.Root,
     tmp_path: Path,
@@ -443,19 +930,19 @@ def test_incomplete_ratings_exit_2_with_the_key_sealed(
     write_run(private_root, "r1", [segment(n) for n in range(1, 5)])
     assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
     data = page_of(private_root)
-    text = answer(data, lambda g, i: {"state": "calm", "not_her": 0})
+    text = answer(data, as_prefilled)
     lines = text.splitlines()
     if damage == "missing-row":
         text = "\n".join(lines[:-1]) + "\n"
-    elif damage == "bad-state":
-        text = text.replace(",calm,", ",grumpy,", 1)
+    elif damage == "bad-voices":
+        text = text.replace(",her,", ",grumpy,", 1)
     elif damage == "bad-header":
-        text = "label,state\n" + "\n".join(lines[1:]) + "\n"
+        text = "label,voices\n" + "\n".join(lines[1:]) + "\n"
     else:
-        text = "\n".join([lines[0], lines[1].rsplit(",", 1)[0] + ",", *lines[2:]]) + "\n"
+        text = text.replace(",3,3,", ",,3,", 1)
     _sealed(monkeypatch)
     assert import_ratings(private_root, text, tmp_path) == 2
-    assert not (private_root.path / "seed" / "labels.csv").exists()
+    assert not label_dir(private_root).exists()
     _, err = capsys.readouterr()
     assert "the key stays sealed" in err
 
@@ -805,7 +1292,7 @@ def test_pack_commands_leak_no_canary(
         assert run_cli(private_root, *argv) == 0
     data = page_of(private_root)
     ratings = tmp_path / "ratings.csv"
-    ratings.write_text(answer(data, lambda g, i: {"state": "calm", "not_her": 0}), encoding="utf-8")
+    ratings.write_text(answer(data, as_prefilled), encoding="utf-8")
     import_argv = ["pack", "import", "--pack", packs.pack_id(SEED), "--ratings", str(ratings)]
     assert run_cli(private_root, *import_argv) == 0
     out, err = capsys.readouterr()
@@ -816,9 +1303,40 @@ def test_pack_commands_leak_no_canary(
     after = _snapshot(tmp_path)
     written = [p for p, content in after.items() if before.get(p) != content]
     assert any(p.name == "index.html" for p in written)
-    assert any(p.name == "labels.csv" for p in written)
+    assert {"labels.jsonl", "notes.private.jsonl", "report.json"} <= {p.name for p in written}
     for path in written:
         assert_no_canary(path.read_bytes().decode("utf-8", errors="replace"))
+
+
+def test_a_note_is_written_only_to_the_private_notes_file(
+    private_root: root_mod.Root,
+    tmp_path: Path,
+    canaries,  # the conftest fixture's Canaries
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write_run(private_root, "r1", [segment(n) for n in range(1, 4)])
+    assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 0
+    data = page_of(private_root)
+    first = items_of(data)[0][1]["label"]
+    note = f"sounds like {canaries.transcript}"[: labels_mod.NOTE_MAX]
+
+    def fill(group: dict, item: dict) -> dict:
+        return {**as_prefilled(group, item), "note": note if item["label"] == first else ""}
+
+    before = _snapshot(tmp_path)
+    capsys.readouterr()
+    assert import_ratings(private_root, answer(data, fill), tmp_path) == 0
+    out, err = capsys.readouterr()
+    assert canaries.transcript not in out + err
+    written = {p for p, content in _snapshot(tmp_path).items() if before.get(p) != content}
+    holding = {
+        p.name
+        for p in written
+        if canaries.transcript in p.read_bytes().decode("utf-8", errors="replace")
+    }
+    # The ratings file is Raj's own export; the import writes the note to one file only.
+    assert holding == {"notes.private.jsonl", "ratings.csv"}
+    assert json.loads((label_dir(private_root) / "report.json").read_text())["tables"]["notes"] == 1
 
 
 def test_text_pack_refuses_a_line_holding_a_private_term(
@@ -849,7 +1367,7 @@ def test_every_pack_writer_refuses_a_root_in_a_git_work_tree(
     write_run(private_root, "r1", [segment(n) for n in range(1, 4)])
     assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", "1") == 0
     data = page_of(private_root, 1)
-    text = answer(data, lambda g, i: {"state": "calm", "not_her": 0})
+    text = answer(data, as_prefilled)
     git = tmp_path / ".git"
     if as_file:
         git.write_text("gitdir: elsewhere\n", encoding="utf-8")
@@ -863,7 +1381,7 @@ def test_every_pack_writer_refuses_a_root_in_a_git_work_tree(
     ratings.write_text(text, encoding="utf-8")
     argv = ["pack", "import", "--pack", packs.pack_id(1), "--ratings", str(ratings)]
     assert run_cli(private_root, *argv) == 2
-    assert not (private_root.path / "seed" / "labels.csv").exists()
+    assert not label_dir(private_root).exists()
     assert capsys.readouterr().err.count("holds .git") == 3
 
 
@@ -871,6 +1389,7 @@ def test_a_clip_outside_the_root_is_refused(private_root: root_mod.Root) -> None
     segs = [segment(n) for n in range(1, 3)]
     segs[1]["audio"] = "../elsewhere.flac"
     write_jsonl(private_root.path / "seed" / "runs" / "r1" / "segments.jsonl", segs)
+    write_prefill(private_root, "r1", [prefill_row(s) for s in segs])
     write_clip(private_root, segs[0]["audio"])
     (private_root.path.parent / "elsewhere.flac").write_bytes(flac_bytes(b"x"))
     assert run_cli(private_root, "pack", "labels", "--run", "r1", "--seed", str(SEED)) == 2

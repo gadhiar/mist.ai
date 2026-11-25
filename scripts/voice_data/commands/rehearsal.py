@@ -12,9 +12,12 @@ are never mixed with the stand-in's.
   but neutral, which the solo clip covers, so extract checks anchors across registers as it will
   with Raj's. The ground truth picks each row by a fixed rule (`anchor_rows`), never by a score.
   It prints `time-<n> <state> <source_id>` for data row n.
-- `answer --pack P` answers a labels pack from the ground truth: each segment's true state, and
-  "not her" for every segment that is not the target's. It writes
-  `rehearsal/answers/<P>/ratings.csv` for `pack import`.
+- `answer --pack P` answers a labels pack from the ground truth. A segment the target speaks is
+  `her`, with its true state's `example` energy and mood from `delivery.json`, no tags and no keep
+  range, so its label projects to that state; any other segment is `not_her`, with the key's
+  pre-filled energy and mood. It writes `rehearsal/answers/<P>/ratings.csv` for `pack import`.
+  A rehearsal labels run R in this order: `labels prefill --run R`, then `pack labels --run R`,
+  then `answer`, then `pack import`, since `pack labels` refuses a run with no pre-fill.
 - `score --run R [--clean C]` scores extract run R (and the clean run C made from it, found by
   itself when there is one) against the ground truth; the effect measures run as the `effects`
   step of the same job module. It writes `rehearsal/scores/<R>/score.json`, and, when the run
@@ -38,6 +41,7 @@ from datetime import UTC, datetime
 
 from .. import gates as gates_mod
 from .. import jobs, packs
+from .. import labels as labels_mod
 from .. import rehearsal as pkg
 from .. import root as root_mod
 from ..errors import InputError, JobError, RootError
@@ -376,10 +380,15 @@ def run_answer(args: argparse.Namespace) -> int:
     if key["kind"] != "labels" or data.get("kind") != "labels":
         raise InputError("refused: rehearsal answer answers labels packs only")
     run = str(key.get("inputs", {}).get("run"))
+    columns = list(data["columns"])
+    if columns != ["label", *packs.LABEL_FIELDS]:
+        raise InputError(
+            f"refused: pack {args.pack} predates the labels pack's fields; make a new one with "
+            f"pack labels --run {run}"
+        )
     segments = {s.segment_id: s for s in _segments(root, run)}
     eps, _ = _episodes(root)
-    rows = answer_rows(key["items"], segments, eps)
-    columns = list(data["columns"])
+    rows = answer_rows(key["items"], segments, eps, labels_mod.load_delivery())
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow(columns)
@@ -387,7 +396,7 @@ def run_answer(args: argparse.Namespace) -> int:
         writer.writerow([label if c == "label" else rows[label][c] for c in columns])
     rel = ratings_rel(args.pack)
     root.write_bytes(rel, out.getvalue().encode("utf-8"))
-    marked = sum(r["not_her"] == "1" for r in rows.values())
+    marked = sum(r["voices"] == "not_her" for r in rows.values())
     print(
         f"rehearsal answer: pack {args.pack}, {len(rows)} items, {len(rows) - marked} hers, "
         f"{marked} not her; ratings written to {rel}; import them with pack import --pack "
@@ -405,17 +414,21 @@ def answer_rows(
     items: Mapping[str, Mapping[str, object]],
     segments: Mapping[str, SegmentRecord],
     eps: score_mod.Episodes,
+    delivery: labels_mod.Delivery,
 ) -> dict[str, dict[str, str]]:
-    """Return each item's answer: the true state of a target segment, else "not her".
+    """Return each item's answer in the labels pack's fields, from the ground truth.
 
     A segment is the target's when target lines cover half of it; its state is that of the line
-    covering most of it. Any other segment is marked not her and keeps its proposed state, which
-    `pack import` ignores for a dropped segment.
+    covering most of it. It is answered `her` with that state's `example` energy and mood, no
+    tags and no keep range; `load_delivery` checks that every example projects to its own state,
+    so the imported label projects to the true state. Any other segment is answered `not_her`
+    with the key's pre-filled energy and mood, which `pack import` records but no state reads.
 
     Raises:
-        InputError: The key names a segment the run does not hold, or one of a source that is no
-            rehearsal episode.
+        InputError: The key names a segment the run does not hold, one of a source that is no
+            rehearsal episode, or an item without its pre-fill.
     """
+    examples = {region.state: region.example for region in delivery.regions}
     rows = {}
     for label, info in items.items():
         seg = segments.get(str(info.get("segment_id")))
@@ -425,9 +438,21 @@ def answer_rows(
             raise InputError(f"refused: {seg.source_id} is not a rehearsal episode (by sha256)")
         line = eps.target_line(seg) if eps.who(seg) == "target" else None
         if line is not None and line.state is not None:
-            rows[label] = {"state": line.state, "not_her": "0"}
+            voices, (energy, mood) = "her", examples[line.state]
         else:
-            rows[label] = {"state": seg.state_proposed, "not_her": "1"}
+            prefill = info.get("prefill")
+            if not isinstance(prefill, Mapping):
+                raise InputError("refused: a pack key item has no pre-fill")
+            voices, energy, mood = "not_her", prefill["energy"], prefill["mood"]
+        rows[label] = {
+            "voices": voices,
+            "keep_from_s": "",
+            "keep_to_s": "",
+            "energy": str(energy),
+            "mood": str(mood),
+            "tags": "",
+            "note": "",
+        }
     return rows
 
 

@@ -6,6 +6,12 @@ page template, driven by the page data: `labels`, `clean-ab`, `text`, `bakeoff`,
 `abx`. Raj rates the page in a browser and exports `ratings.csv`; `pack import` checks that every
 item is rated before it opens the key, then writes the records later stages read.
 
+The `labels` pack asks, per kept clip of one extract run, who is audible, a keep range for a clip
+with other voices nearby, her energy and mood, tags and an optional note, pre-filled from
+`labels prefill`. A clip an earlier run already labelled carries that label (`labels.carry`) and
+stays off the page. Its import writes the run's label folder through `labels.write_labels`; a
+note goes only to the folder's `notes.private.jsonl`, never to a print, report or key.
+
 Clips are copied byte for byte. Every clip a pack takes was already written at its stored gain by
 the stage that made it, so the energy differences between states reach Raj's ear unchanged, and
 packing needs no audio processing and no job. Instead, each clip's FLAC header is read, and a pack
@@ -30,18 +36,38 @@ import re
 import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as replace_fields
 from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path, PurePosixPath
 
 from . import gates as gates_mod
+from . import labels as labels_mod
 from .errors import InputError
 from .jobs import load_families
+from .labels import LabelRecord, PrefillRecord
 from .records import SegmentRecord, TakeRecord, read_json, read_jsonl, sha256_file, write_json
 from .root import Root
 from .states import SPEAKING_STATES
 
 KINDS = ("labels", "clean-ab", "text", "bakeoff", "spotcheck", "abx")
+# The labels pack's fields, in its column order after `label`.
+LABEL_FIELDS = ("voices", "keep_from_s", "keep_to_s", "energy", "mood", "tags", "note")
+# The words shown beside each digit of the energy and mood scales (Design part 1).
+ENERGY_WORDS = (
+    "very low (drowsy, murmured)",
+    "low (relaxed, soft)",
+    "conversational",
+    "high (lively)",
+    "very high (excited, shouting)",
+)
+MOOD_WORDS = (
+    "negative (upset, angry)",
+    "slightly negative (annoyed, worried, sad)",
+    "neutral",
+    "slightly positive (warm, pleased)",
+    "positive (delighted)",
+)
 PLACEHOLDER = "__PACK_DATA__"
 RATINGS_COLUMNS = ("label", "line_id", "natural", "feeling", "preferred")
 TEMPLATE_PATH = Path(__file__).with_name("pack_template.html")
@@ -51,8 +77,9 @@ CLIPS_DIR = "clips"
 KEY_FILE = "key.json"
 RATINGS_FILE = "ratings.csv"
 KEY_SCHEMA = 1
-LABELS_REL = "seed/labels.csv"
 LEADS_PER_GROUP = 3
+# Float slack for seconds typed with two decimals against spans the extract stage wrote as floats.
+_EPS = 1e-9
 # Families that make or learn a voice; their names, and the name after the prefix, would tell a
 # listener which teacher or student made a clip. Job families (`score`, `extract`, `convert`)
 # name no voice.
@@ -336,13 +363,17 @@ _RATING_FIELDS = {
 
 @dataclass(frozen=True, slots=True)
 class DraftItem:
-    """One rated row: its clips (source path and shown name), text, fields and key entry."""
+    """One rated row: its clips (source path and shown name), text, fields and key entry.
+
+    `duration_s` is the clip's length, shown on the page and the bound of a `number` field.
+    """
 
     clips: tuple[tuple[str, str], ...]
     fields: tuple[str, ...]
     key: Mapping[str, object]
     defaults: Mapping[str, object] = field(default_factory=dict)
     text: str | None = None
+    duration_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,7 +388,11 @@ class DraftGroup:
 
 @dataclass(frozen=True, slots=True)
 class Draft:
-    """A pack before labels are assigned: groups, fields, columns and the key's inputs."""
+    """A pack before labels are assigned: groups, fields, columns and the key's inputs.
+
+    `ranges` pairs two `number` fields into a range: both blank, or both set, in order and at
+    least `min_s` apart. `key_extra` holds keys the sealed key gains beside its items.
+    """
 
     kind: str
     title: str
@@ -367,6 +402,8 @@ class Draft:
     groups: tuple[DraftGroup, ...]
     inputs: Mapping[str, str]
     names: frozenset[str] = frozenset()
+    ranges: tuple[Mapping[str, object], ...] = ()
+    key_extra: Mapping[str, object] = field(default_factory=dict)
 
 
 def _labels(prefix: str, count: int, rng: random.Random) -> list[str]:
@@ -403,15 +440,16 @@ def _finalise(
                 shown.append({"label": label, "name": name})
             label = shown[0]["label"] if len(shown) == 1 else next(item_labels)
             key_items[label] = item.key
-            page_items.append(
-                {
-                    "label": label,
-                    "clips": shown,
-                    "text": item.text,
-                    "fields": list(item.fields),
-                    "defaults": dict(item.defaults),
-                }
-            )
+            page_item: dict[str, object] = {
+                "label": label,
+                "clips": shown,
+                "text": item.text,
+                "fields": list(item.fields),
+                "defaults": dict(item.defaults),
+            }
+            if item.duration_s is not None:
+                page_item["duration_s"] = item.duration_s
+            page_items.append(page_item)
         groups.append(
             {"id": group.id, "heading": group.heading, "note": group.note, "items": page_items}
         )
@@ -422,40 +460,137 @@ def _finalise(
         "intro": list(draft.intro),
         "columns": list(draft.columns),
         "fields": {name: dict(spec) for name, spec in draft.fields.items()},
+        "ranges": [dict(rule) for rule in draft.ranges],
         "ratings_file": RATINGS_FILE,
         "groups": groups,
     }
     return data, key_items, clips
 
 
-def draft_labels(root: Root, run: str, seed: int) -> Draft:
-    """One clip per kept segment, its proposed state preselected, with a "not her" choice.
+def _refuse_label_folder(root: Root, run: str, replace: bool) -> None:
+    rel = labels_mod.labels_rel(run)
+    if (root.path / rel).exists() and not replace:
+        raise InputError(f"refused: {rel} exists; pass --replace to label run {run} again")
 
-    Three segments of each flag group with more than one segment lead the page, one block per
-    group, so a cluster that is not her is caught early; every other segment follows.
+
+def _span_s(seg: SegmentRecord) -> float:
+    """A clip's length as its label records it, to 0.01 s (as `labels.carry` does)."""
+    return round(seg.end_s - seg.start_s, 2)
+
+
+def _read_prefill(root: Root, run: str, kept: Sequence[SegmentRecord]) -> dict[str, PrefillRecord]:
+    """Return run's pre-fill by segment id, refusing one that does not cover its kept segments.
+
+    Raises:
+        InputError: `prefill.jsonl` is missing or malformed, repeats a segment, or its segment
+            ids are not exactly the run's kept segments.
     """
+    rel = f"{labels_mod.prefill_rel(run)}/{labels_mod.PREFILL_NAME}"
+    path = root.path / rel
+    if not path.is_file():
+        raise InputError(f"refused: {rel} is missing; run labels prefill --run {run} first")
+    records = read_jsonl(path, PrefillRecord)
+    by_id = {record.segment_id: record for record in records}
+    if len(by_id) != len(records) or set(by_id) != {seg.segment_id for seg in kept}:
+        raise InputError(
+            f"refused: {rel} does not cover exactly run {run}'s kept segments; move it aside and "
+            f"run labels prefill --run {run} again"
+        )
+    return by_id
+
+
+def _label_fields() -> dict[str, dict[str, object]]:
+    keep = {"type": "number", "decimals": 2, "only_if": ["voices", "her_nearby"]}
+    return {
+        "voices": {"type": "choice", "title": "Voices", "options": list(labels_mod.VOICES)},
+        "keep_from_s": {**keep, "title": "Keep from (s)"},
+        "keep_to_s": {**keep, "title": "Keep to (s)"},
+        "energy": {**_SCALE, "title": "Energy", "labels": list(ENERGY_WORDS)},
+        "mood": {**_SCALE, "title": "Mood", "labels": list(MOOD_WORDS)},
+        "tags": {
+            "type": "tags",
+            "title": "Tags",
+            "options": list(labels_mod.TAGS),
+            "max": labels_mod.MAX_TAGS,
+        },
+        "note": {"type": "text", "title": "Note", "max": labels_mod.NOTE_MAX},
+    }
+
+
+def _label_intro(min_s: float) -> tuple[str, ...]:
+    def scale(words: Sequence[str]) -> str:
+        return ", ".join(f"{n} {word}" for n, word in enumerate(words, start=1))
+
+    return (
+        "Each row is one clip, shown with its length. Its answers are pre-filled from a model's "
+        "estimates: listen to the whole clip, then keep or correct each one.",
+        "Voices: her (only her voice), her_overlap (another voice overlaps hers), her_nearby "
+        "(other voices in the clip, but not over her speech) or not_her (someone else).",
+        "Keep from and keep to, in seconds: for her_nearby only, the stretch of the clip to "
+        f"keep, with no other voice in it and at least {min_s:g} s long. Leave both blank to "
+        "drop the clip.",
+        f"Energy, 1-5: {scale(ENERGY_WORDS)}.",
+        f"Mood, 1-5: {scale(MOOD_WORDS)}.",
+        f"Tags: up to {labels_mod.MAX_TAGS} that fit, or none. Delivery: "
+        f"{', '.join(labels_mod.MODES)}. Attitude: {', '.join(labels_mod.ATTITUDES)}.",
+        f"Note: optional, one line of at most {labels_mod.NOTE_MAX} characters. A note stays on "
+        "this machine, in this page's browser storage and the ratings.csv you export; pack "
+        "import keeps it apart from the labels, and no report shows it.",
+    )
+
+
+def draft_labels(root: Root, run: str, seed: int, *, replace: bool = False) -> Draft:
+    """One clip per kept segment no earlier run labelled, pre-filled from `labels prefill`.
+
+    A kept segment that carries an earlier run's label (`labels.carry` over
+    `labels.earlier_labels`) is left off the page; the key lists it under `carried`, with its
+    flag group, for `pack import` to write beside the rated clips. Three asked segments of each
+    flag group with more than one asked segment lead the page, one block per group, so a cluster
+    that is not her is caught early; every other asked segment follows.
+
+    Raises:
+        InputError: Run's label folder exists and `replace` is false; the run has no kept
+            segment; its pre-fill is missing or does not cover exactly its kept segments.
+    """
+    _refuse_label_folder(root, run, replace)
     path = _read_path(root, f"seed/runs/{run}/segments.jsonl")
     kept = sorted(
         (s for s in read_jsonl(path, SegmentRecord) if s.kept), key=lambda s: s.segment_id
     )
     if not kept:
         raise InputError(f"refused: run {run} has no kept segments")
-    if any(s.state_proposed not in SPEAKING_STATES for s in kept):
-        raise InputError("refused: a segment proposes a state outside the speaking states")
+    prefill = _read_prefill(root, run, kept)
+    min_s = gates_mod.load(root.path).value("segment.min_s")
+    carried = labels_mod.carry(kept, labels_mod.earlier_labels(root, run), run=run)
+    asked = [seg for seg in kept if seg.segment_id not in carried]
     rng = random.Random(f"{seed}:order")
     by_group: dict[str, list[SegmentRecord]] = {}
-    for seg in kept:
+    for seg in asked:
         if seg.flag_group:
             by_group.setdefault(seg.flag_group, []).append(seg)
     multi = sorted(name for name, members in by_group.items() if len(members) > 1)
     rng.shuffle(multi)
 
     def item(seg: SegmentRecord) -> DraftItem:
+        pre = prefill[seg.segment_id]
+        shown = {name: getattr(pre, name) for name in ("voices", "keep_from_s", "keep_to_s")}
+        shown.update(energy=pre.energy, mood=pre.mood)
         return DraftItem(
             clips=((seg.audio, ""),),
-            fields=("state", "not_her"),
-            key={"segment_id": seg.segment_id, "flag_group": seg.flag_group},
-            defaults={"state": seg.state_proposed, "not_her": 0},
+            fields=LABEL_FIELDS,
+            key={
+                "segment_id": seg.segment_id,
+                "flag_group": seg.flag_group,
+                "source_id": seg.source_id,
+                "start_s": seg.start_s,
+                "end_s": seg.end_s,
+                "channel": seg.channel,
+                "separator": seg.separator,
+                "duration_s": _span_s(seg),
+                "prefill": pre.to_json(),
+            },
+            defaults={name: value for name, value in shown.items() if value is not None},
+            duration_s=_span_s(seg),
         )
 
     groups = []
@@ -467,31 +602,105 @@ def draft_labels(root: Root, run: str, seed: int) -> Draft:
             DraftGroup(
                 id=f"g{number:02d}",
                 heading=f"Set {number} of {len(multi)}",
-                note="These clips may be one speaker. Mark any that is not her.",
+                note="These clips may be one speaker. Choose not_her for any that is not her.",
                 items=tuple(item(seg) for seg in chosen),
             )
         )
-    rest = [seg for seg in kept if seg.segment_id not in leads]
+    rest = [seg for seg in asked if seg.segment_id not in leads]
     rng.shuffle(rest)
     if rest:
         groups.append(
             DraftGroup(id="rest", heading="Segments", items=tuple(item(seg) for seg in rest))
         )
+    flag_groups = {seg.segment_id: seg.flag_group for seg in kept}
     return Draft(
         kind="labels",
         title="Labels",
-        intro=(
-            "For each clip, confirm or change its state, and mark it not her if it is someone "
-            "else.",
-        ),
-        fields={
-            "state": {"type": "choice", "title": "State", "options": list(SPEAKING_STATES)},
-            "not_her": {"type": "flag", "title": "Not her"},
-        },
-        columns=("label", "state", "not_her"),
+        intro=_label_intro(min_s),
+        fields=_label_fields(),
+        columns=("label", *LABEL_FIELDS),
         groups=tuple(groups),
         inputs={"run": run},
+        ranges=({"from": "keep_from_s", "to": "keep_to_s", "min_s": min_s},),
+        key_extra={
+            "carried": {
+                sid: {"flag_group": flag_groups[sid], "label": record.to_json()}
+                for sid, record in sorted(carried.items())
+            }
+        },
     )
+
+
+def settle_labels(
+    records: Iterable[LabelRecord],
+    flag_groups: Mapping[str, str | None],
+    delivery: labels_mod.Delivery,
+) -> list[LabelRecord]:
+    """Recompute each label's `removed` and projected `state` in its run, in segment order.
+
+    A `not_her` clip is removed (`not-her`), and with it every other clip of its flag group
+    (`flag-group`), as the old pack dropped a group with a marked clip. Then `her_overlap` is
+    removed (`overlap`), and `her_nearby` without a keep range (`nearby`). Every other clip's
+    state is its projection, None outside every region. Carried labels are settled the same way,
+    since flag groups are per run.
+    """
+    records = sorted(records, key=lambda r: r.segment_id)
+    dropped = {flag_groups.get(r.segment_id) for r in records if r.voices == "not_her"}
+    dropped.discard(None)
+    settled = []
+    for record in records:
+        removed = None
+        if record.voices == "not_her":
+            removed = "not-her"
+        elif flag_groups.get(record.segment_id) in dropped:
+            removed = "flag-group"
+        elif record.voices == "her_overlap":
+            removed = "overlap"
+        elif record.voices == "her_nearby" and record.keep_from_s is None:
+            removed = "nearby"
+        state = None
+        if removed is None:
+            state = labels_mod.project(delivery, record.energy, record.mood, record.tags)
+        settled.append(replace_fields(record, state=state, removed=removed))
+    return settled
+
+
+def _carried_labels(
+    entries: Mapping[str, Mapping[str, object]],
+) -> tuple[list[LabelRecord], dict[str, str | None]]:
+    """Return the key's carried labels and each one's flag group in the new run."""
+    records: list[LabelRecord] = []
+    groups: dict[str, str | None] = {}
+    for sid, entry in entries.items():
+        record = LabelRecord.from_json(entry["label"])  # type: ignore[arg-type]
+        if record.segment_id != sid:
+            raise InputError("refused: a carried label in the pack key names another segment")
+        group = entry["flag_group"]
+        records.append(record)
+        groups[sid] = group if isinstance(group, str) else None
+    return records, groups
+
+
+def _write_run_labels(
+    root: Root,
+    run: str,
+    records: Sequence[LabelRecord],
+    flag_groups: Mapping[str, str | None],
+    notes: Mapping[str, str],
+    prefill: Sequence[PrefillRecord] | None,
+    *,
+    pack: str | None,
+    replace: bool,
+    emit: Emit,
+) -> None:
+    """Settle the labels, write run's label folder and print its tables (never a note)."""
+    settled = settle_labels(records, flag_groups, labels_mod.load_delivery())
+    threshold = gates_mod.load(root.path).value(labels_mod.STATE_SECONDS_MIN_GATE)
+    tables = labels_mod.tables(settled, prefill, state_seconds_min=threshold)
+    labels_mod.write_labels(root, run, settled, notes, tables, replace, pack=pack)
+    for line in labels_mod.table_lines(tables):
+        emit(line)
+    emit(f"labels: written to {labels_mod.labels_rel(run)}/")
 
 
 def draft_clean_ab(root: Root, before: str, after: str, seed: int) -> Draft:
@@ -753,15 +962,22 @@ def draft_abx(root: Root, manifest_rel: str, seed: int) -> Draft:
 
 @dataclass(frozen=True, slots=True)
 class BuiltPack:
-    """What `build_pack` wrote, for the command's output: ids and counts only."""
+    """What `build_pack` wrote, for the command's output: ids and counts only.
 
-    pack_id: str
+    `pack_id` is None when a labels pack had no clip to ask, because every kept clip carried an
+    earlier label: `build_pack` then wrote the run's label folder and no page.
+    """
+
+    pack_id: str | None
     kind: str
     items: int
     clips: int
+    carried: int = 0
 
 
-def draft_for(root: Root, kind: str, options: Mapping[str, str], seed: int) -> Draft:
+def draft_for(
+    root: Root, kind: str, options: Mapping[str, str], seed: int, *, replace: bool = False
+) -> Draft:
     """Build the draft of one pack kind from its command options.
 
     Raises:
@@ -769,7 +985,7 @@ def draft_for(root: Root, kind: str, options: Mapping[str, str], seed: int) -> D
     """
     gates = gates_mod.load(root.path)
     if kind == "labels":
-        return draft_labels(root, options["run"], seed)
+        return draft_labels(root, options["run"], seed, replace=replace)
     if kind == "clean-ab":
         return draft_clean_ab(root, options["before"], options["after"], seed)
     if kind == "text":
@@ -791,15 +1007,20 @@ def build_pack(
     seed: int,
     *,
     template_path: Path = TEMPLATE_PATH,
+    replace: bool = False,
+    emit: Emit = print,
 ) -> BuiltPack:
     """Write a pack: the key first, then the clips, then the page.
 
     Everything that can refuse runs before the first write: the inputs, the clips' formats and
-    the blind check. The page is written last, so a failure leaves no page to open.
+    the blind check. The page is written last, so a failure leaves no page to open. A labels
+    pack whose every kept clip carries an earlier label has nothing to ask: the run's label
+    folder is written instead, its tables printed through `emit`, and no page is made.
 
     Raises:
         InputError: The pack exists, an input is refused, the clips' formats differ or carry
-            tags, or the page would name a forbidden name.
+            tags, or the page would name a forbidden name; for labels, also the run's label
+            folder exists and `replace` is false.
         RootError: The root refused a write.
     """
     pid = pack_id(seed)
@@ -807,7 +1028,15 @@ def build_pack(
     key_dir = root.path / PACKS_DIR / f"{pid}.key"
     if page_dir.exists() or key_dir.exists():
         raise InputError(f"refused: pack {pid} already exists; a pack is built once")
-    draft = draft_for(root, kind, options, seed)
+    draft = draft_for(root, kind, options, seed, replace=replace)
+    carried: Mapping[str, Mapping[str, object]] = draft.key_extra.get("carried", {})  # type: ignore[assignment]
+    if kind == "labels" and not draft.groups:
+        records, groups = _carried_labels(carried)
+        run = draft.inputs["run"]
+        _write_run_labels(
+            root, run, records, groups, {}, None, pack=None, replace=replace, emit=emit
+        )
+        return BuiltPack(pack_id=None, kind=kind, items=0, clips=0, carried=len(records))
     data, key_items, clips = _finalise(draft, seed, pid)
     sources = {label: _read_path(root, rel) for label, rel in clips.items()}
     check_formats(sources.values())
@@ -824,12 +1053,15 @@ def build_pack(
             for label, path in sources.items()
         },
         "items": {label: dict(info) for label, info in key_items.items()},
+        **draft.key_extra,
     }
     write_json(root, key_dir / KEY_FILE, key)
     for label, path in sources.items():
         root.write_bytes(page_dir / CLIPS_DIR / f"{label}.flac", path.read_bytes())
     root.write_bytes(page_dir / PAGE_FILE, page.encode("utf-8"))
-    return BuiltPack(pack_id=pid, kind=kind, items=len(key_items), clips=len(clips))
+    return BuiltPack(
+        pack_id=pid, kind=kind, items=len(key_items), clips=len(clips), carried=len(carried)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +1069,19 @@ def build_pack(
 # ---------------------------------------------------------------------------
 
 
-def _valid(spec: Mapping[str, object], value: str, row: Mapping[str, str]) -> bool:
+def _active(spec: Mapping[str, object], row: Mapping[str, str]) -> bool:
+    """Whether a field is read: always, or, with `only_if` [field, value], while it holds."""
+    rule = spec.get("only_if")
+    return not isinstance(rule, list) or row.get(rule[0], "") == rule[1]
+
+
+def _valid(
+    spec: Mapping[str, object],
+    value: str,
+    row: Mapping[str, str],
+    item: Mapping[str, object],
+) -> bool:
+    """Whether one exported value is valid for its field; the template's `valid` mirrors it."""
     kind = spec["type"]
     if kind == "scale":
         bounds = (spec["min"], spec["max"])
@@ -847,18 +1091,60 @@ def _valid(spec: Mapping[str, object], value: str, row: Mapping[str, str]) -> bo
     if kind in ("flag", "pick"):
         return value in ("0", "1")
     if kind == "text":
+        limit = spec.get("max")
+        if isinstance(limit, int) and (len(value) > limit or "\n" in value or "\r" in value):
+            return False
         rule = spec.get("required_if")
         if isinstance(rule, list) and row.get(rule[0], "").strip() == rule[1]:
             return bool(value)
         return True
+    if kind == "number":
+        if not _active(spec, row) or value == "":
+            return True
+        if not re.fullmatch(rf"[0-9]+(\.[0-9]{{1,{int(spec['decimals'])}}})?", value):  # type: ignore[call-overload]
+            return False
+        return float(value) <= float(item["duration_s"]) + _EPS  # type: ignore[arg-type]
+    if kind == "tags":
+        options = list(spec["options"])  # type: ignore[call-overload]
+        chosen = value.split(";") if value else []
+        if len(chosen) > int(spec["max"]) or not all(tag in options for tag in chosen):  # type: ignore[call-overload]
+            return False
+        positions = [options.index(tag) for tag in chosen]
+        return positions == sorted(set(positions))
     return False
+
+
+def _range_valid(
+    rule: Mapping[str, object],
+    fields: Mapping[str, Mapping[str, object]],
+    row: Mapping[str, str],
+    item: Mapping[str, object],
+) -> bool:
+    """Whether a range's two ends are both blank, or set in order and at least `min_s` apart.
+
+    An end that is itself invalid is counted by `_valid` alone, so a value is refused once.
+    """
+    start, end = str(rule["from"]), str(rule["to"])
+    if start not in item["fields"] or not _active(fields[start], row):  # type: ignore[operator]
+        return True
+    low, high = row.get(start, ""), row.get(end, "")
+    if not low and not high:
+        return True
+    if not low or not high:
+        return False
+    if not (_valid(fields[start], low, row, item) and _valid(fields[end], high, row, item)):
+        return True
+    span = float(high) - float(low)
+    return span > 0 and span >= float(rule["min_s"]) - _EPS  # type: ignore[arg-type]
 
 
 def check_ratings(data: Mapping[str, object], text: str) -> dict[str, dict[str, str]]:
     """Check an exported `ratings.csv` against the page and return each item's values.
 
     Complete means the page's columns, every item exactly once, each item's fields valid for
-    their type, a reason wherever a verdict is reject, and exactly one favourite per block.
+    their type, a reason wherever a verdict is reject, exactly one favourite per block, and each
+    of the page's ranges (a labels pack's keep range) whole, in order and long enough. All of it
+    is checked before the key is read.
 
     Raises:
         InputError: The ratings are incomplete; the message gives counts only.
@@ -890,11 +1176,13 @@ def check_ratings(data: Mapping[str, object], text: str) -> dict[str, dict[str, 
             problems += 1
         got[label] = values
     missing = len(items) - len(got)
+    ranges: list[Mapping[str, object]] = list(data.get("ranges", []))  # type: ignore[call-overload]
     for label, values in got.items():
         _, item = items[label]
         problems += sum(
-            not _valid(fields[name], values.get(name, ""), values) for name in item["fields"]
+            not _valid(fields[name], values.get(name, ""), values, item) for name in item["fields"]
         )
+        problems += sum(not _range_valid(rule, fields, values, item) for rule in ranges)
     for group in data["groups"]:  # type: ignore[attr-defined]
         picks = {n for i in group["items"] for n in i["fields"] if fields[n]["type"] == "pick"}
         for name in picks:
@@ -930,12 +1218,15 @@ def read_key(root: Root, pid: str) -> dict:
 Emit = Callable[[str], None]
 
 
-def import_pack(root: Root, pid: str, ratings_path: Path, *, emit: Emit = print) -> None:
+def import_pack(
+    root: Root, pid: str, ratings_path: Path, *, emit: Emit = print, replace: bool = False
+) -> None:
     """Check the ratings, then unseal the key and write the kind's decisions.
 
     Raises:
         InputError: An unknown pack, an unreadable or incomplete ratings file, or a decision
-            input (such as `gains.json`) that is missing or malformed.
+            input (such as `gains.json`) that is missing or malformed; `replace` for a pack
+            other than labels; a labels pack whose run has a label folder, without `replace`.
         RootError: The root refused a write.
     """
     if not _PACK_ID_RE.fullmatch(pid):
@@ -944,6 +1235,8 @@ def import_pack(root: Root, pid: str, ratings_path: Path, *, emit: Emit = print)
     if not page_path.is_file():
         raise InputError(f"refused: there is no pack {pid}")
     data = page_data(page_path.read_text(encoding="utf-8"))
+    if replace and data.get("kind") != "labels":
+        raise InputError("refused: --replace applies to a labels pack only")
     try:
         text = ratings_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
@@ -953,31 +1246,68 @@ def import_pack(root: Root, pid: str, ratings_path: Path, *, emit: Emit = print)
     if key["kind"] != data.get("kind") or set(key["items"]) != set(ratings):
         raise InputError("refused: the key does not match the pack's page")
     gates = gates_mod.load(root.path)
+    if key["kind"] == "labels":
+        _import_labels(root, key, ratings, emit, replace=replace)
+        return
     _IMPORTERS[key["kind"]](root, key, ratings, gates, emit)
 
 
-def _import_labels(
-    root: Root, key: dict, ratings: dict, gates: gates_mod.Gates, emit: Emit
-) -> None:
-    items: dict[str, dict] = key["items"]
-    marked = {label for label in items if ratings[label]["not_her"] == "1"}
-    dropped = {items[label]["flag_group"] for label in marked if items[label]["flag_group"]}
-    flag_groups = {info["flag_group"] for info in items.values() if info["flag_group"]}
-    rows = []
-    with_group = 0
-    for label, info in items.items():
-        if label in marked:
-            continue
-        if info["flag_group"] in dropped:
-            with_group += 1
-            continue
-        rows.append((info["segment_id"], ratings[label]["state"]))
-    text = "segment_id,state\n" + "".join(f"{sid},{state}\n" for sid, state in sorted(rows))
-    root.write_bytes(LABELS_REL, text.encode("utf-8"))
-    emit(
-        f"labels: {len(rows)} segments written to {LABELS_REL}; {len(marked)} marked not her, "
-        f"{with_group} more dropped with {len(dropped)} flag groups; "
-        f"{len(flag_groups - dropped)} flag groups confirmed"
+def _import_labels(root: Root, key: dict, ratings: dict, emit: Emit, *, replace: bool) -> None:
+    """Write the run's label folder: the rated clips and the key's carried ones.
+
+    A keep range is read only for `her_nearby`. The note goes to `notes.private.jsonl` alone;
+    the records keep only `has_note`, and the printed tables count notes.
+    """
+    run = str(key["inputs"]["run"])
+    _refuse_label_folder(root, run, replace)
+    records: list[LabelRecord] = []
+    notes: dict[str, str] = {}
+    groups: dict[str, str | None] = {}
+    prefill: list[PrefillRecord] = []
+    for label, info in key["items"].items():
+        values = ratings[label]
+        sid = info["segment_id"]
+        keep = {
+            name: float(values[name]) if values["voices"] == "her_nearby" and values[name] else None
+            for name in ("keep_from_s", "keep_to_s")
+        }
+        records.append(
+            LabelRecord(
+                run=run,
+                segment_id=sid,
+                source_id=info["source_id"],
+                start_s=info["start_s"],
+                end_s=info["end_s"],
+                channel=info["channel"],
+                separator=info["separator"],
+                duration_s=info["duration_s"],
+                voices=values["voices"],
+                energy=int(values["energy"]),
+                mood=int(values["mood"]),
+                tags=tuple(values["tags"].split(";")) if values["tags"] else (),
+                keep_from_s=keep["keep_from_s"],
+                keep_to_s=keep["keep_to_s"],
+                has_note=bool(values["note"]),
+                state=None,
+                removed=None,
+                carried_from=(),
+            )
+        )
+        if values["note"]:
+            notes[sid] = values["note"]
+        groups[sid] = info["flag_group"]
+        prefill.append(PrefillRecord.from_json(info["prefill"]))
+    carried, carried_groups = _carried_labels(key.get("carried", {}))
+    _write_run_labels(
+        root,
+        run,
+        [*records, *carried],
+        {**groups, **carried_groups},
+        notes,
+        prefill,
+        pack=key["pack"],
+        replace=replace,
+        emit=emit,
     )
 
 
@@ -1199,8 +1529,8 @@ def _import_abx(root: Root, key: dict, ratings: dict, gates: gates_mod.Gates, em
     emit(f"abx: tallies written to {rel}")
 
 
+# The labels kind is imported by `_import_labels`, which also takes `replace`.
 _IMPORTERS: dict[str, Callable[[Root, dict, dict, gates_mod.Gates, Emit], None]] = {
-    "labels": _import_labels,
     "clean-ab": _import_clean_ab,
     "text": _import_text,
     "bakeoff": _import_bakeoff,

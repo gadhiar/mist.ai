@@ -47,6 +47,10 @@
   tr.complete td.label::after { content: " \2713"; color: #2a7d4f; }
   td.field label { white-space: nowrap; margin-right: 0.5rem; cursor: pointer; }
   td.field input[type="text"] { width: 14rem; font: inherit; }
+  td.field input.number { width: 4.5rem; }
+  td.field.words label, td.field.tags label { display: block; }
+  td.field input:disabled { background: #eee; }
+  .duration { color: #555; font-size: 0.85rem; }
   .clip { display: flex; align-items: center; gap: 0.4rem; margin: 0.15rem 0; }
   .clip-name { font-weight: 600; min-width: 1rem; }
   audio { height: 2rem; max-width: 16rem; }
@@ -78,6 +82,8 @@ for (const group of DATA.groups) {
   }
 }
 const answers = restore();
+// Inputs read only while another field holds a value (`only_if`); refresh() enables them.
+const GATED = [];
 
 function restore() {
   let saved = {};
@@ -118,10 +124,41 @@ function current(item, name) {
   if (own && own[name] !== undefined) {
     return own[name];
   }
-  if (item.defaults && item.defaults[name] !== undefined) {
+  if (item.defaults && item.defaults[name] !== undefined && item.defaults[name] !== null) {
     return String(item.defaults[name]);
   }
   return DATA.fields[name].type === "flag" ? "0" : "";
+}
+
+// A field with `only_if` [field, value] is read only while that field holds that value.
+function active(item, name) {
+  const rule = DATA.fields[name].only_if;
+  return !rule || current(item, rule[0]) === rule[1];
+}
+
+function tagList(value) {
+  return value === "" ? [] : value.split(";");
+}
+
+function numberValid(field, item, value) {
+  const pattern = new RegExp("^[0-9]+(\\.[0-9]{1," + field.decimals + "})?$");
+  return pattern.test(value) && Number(value) <= item.duration_s + 1e-9;
+}
+
+// A range's two ends: both blank, or both set, in order and at least `min_s` apart.
+function rangeValid(item, range) {
+  if (!item.fields.includes(range.from) || !active(item, range.from)) {
+    return true;
+  }
+  const from = current(item, range.from);
+  const to = current(item, range.to);
+  if (from === "" && to === "") {
+    return true;
+  }
+  if (from === "" || to === "") {
+    return false;
+  }
+  return Number(from) < Number(to) && Number(to) - Number(from) >= range.min_s - 1e-9;
 }
 
 function store(item, name, value) {
@@ -148,29 +185,41 @@ function valid(group, item, name) {
     return Boolean(answers.picks[pickKey(group, name)]);
   }
   if (field.type === "text") {
+    if (field.max !== undefined && (value.length > field.max || /[\r\n]/.test(value))) {
+      return false;
+    }
     const rule = field.required_if;
     if (rule && current(item, rule[0]) === rule[1]) {
       return value.trim() !== "";
     }
     return true;
   }
+  if (field.type === "number") {
+    return !active(item, name) || value === "" || numberValid(field, item, value);
+  }
+  if (field.type === "tags") {
+    const order = tagList(value).map((tag) => field.options.indexOf(tag));
+    return order.length <= field.max &&
+      order.every((index, at) => index >= 0 && (at === 0 || index > order[at - 1]));
+  }
   return false;
 }
 
 function complete(group, item) {
-  return item.fields.every((name) => valid(group, item, name));
+  return item.fields.every((name) => valid(group, item, name)) &&
+    (DATA.ranges || []).every((range) => rangeValid(item, range));
 }
 
-function radios(cell, item, name, options) {
-  for (const option of options) {
+function radios(cell, item, name, options, captions) {
+  options.forEach((option, index) => {
     const id = item.label + "-" + name + "-" + option;
     const input = el("input", { type: "radio", name: item.label + "-" + name, id: id });
     input.checked = current(item, name) === option;
     input.addEventListener("change", () => store(item, name, option));
     const tag = el("label", { for: id });
-    tag.append(input, " " + option);
+    tag.append(input, " " + option + (captions ? " " + captions[index] : ""));
     cell.append(tag);
-  }
+  });
 }
 
 function widget(group, item, name) {
@@ -181,7 +230,11 @@ function widget(group, item, name) {
     for (let value = field.min; value <= field.max; value++) {
       options.push(String(value));
     }
-    radios(cell, item, name, options);
+    // A scale with words shows each beside its digit; the export stays the digit.
+    if (field.labels) {
+      cell.classList.add("words");
+    }
+    radios(cell, item, name, options, field.labels);
   } else if (field.type === "choice") {
     radios(cell, item, name, field.options);
   } else if (field.type === "flag") {
@@ -207,10 +260,45 @@ function widget(group, item, name) {
     });
     cell.append(input);
   } else if (field.type === "text") {
-    const input = el("input", { type: "text", "aria-label": field.title + ": " + item.label });
+    const attrs = { type: "text", "aria-label": field.title + ": " + item.label };
+    if (field.max !== undefined) {
+      attrs.maxlength = String(field.max);
+    }
+    const input = el("input", attrs);
     input.value = current(item, name);
     input.addEventListener("input", () => store(item, name, input.value));
     cell.append(input);
+  } else if (field.type === "number") {
+    const input = el("input", {
+      type: "text",
+      inputmode: "decimal",
+      class: "number",
+      "aria-label": field.title + ": " + item.label,
+    });
+    input.value = current(item, name);
+    input.addEventListener("input", () => store(item, name, input.value.trim()));
+    GATED.push({ item: item, name: name, input: input });
+    cell.append(input);
+  } else if (field.type === "tags") {
+    cell.classList.add("tags");
+    for (const option of field.options) {
+      const id = item.label + "-" + name + "-" + option;
+      const input = el("input", { type: "checkbox", id: id });
+      input.checked = tagList(current(item, name)).includes(option);
+      input.addEventListener("change", () => {
+        const before = tagList(current(item, name));
+        const chosen = field.options.filter(
+          (tag) => (tag === option ? input.checked : before.includes(tag)));
+        if (chosen.length > field.max) {
+          input.checked = false;
+          return;
+        }
+        store(item, name, chosen.join(";"));
+      });
+      const tag = el("label", { for: id });
+      tag.append(input, " " + option);
+      cell.append(tag);
+    }
   }
   return cell;
 }
@@ -253,6 +341,9 @@ function render() {
         line.append(el("audio", { controls: "", preload: "none", src: "clips/" + clip.label + ".flac" }));
         body.append(line);
       }
+      if (typeof item.duration_s === "number") {
+        body.append(el("span", { class: "duration" }, item.duration_s.toFixed(2) + " s"));
+      }
       row.append(body);
       for (const name of names) {
         row.append(item.fields.includes(name) ? widget(group, item, name) : el("td"));
@@ -273,6 +364,9 @@ function doneCount() {
 }
 
 function refresh() {
+  for (const gated of GATED) {
+    gated.input.disabled = !active(gated.item, gated.name);
+  }
   for (const entry of ENTRIES) {
     document.getElementById("row-" + entry.item.label)
       .classList.toggle("complete", complete(entry.group, entry.item));
