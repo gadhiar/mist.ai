@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "prefill": {
+    "energy": "energy = 1 + floor(4 x arousal + 0.5), on the emotion model's arousal clipped to 0..1",
+    "mood": "mood = 1 + floor(4 x valence + 0.5), on the emotion model's valence clipped to 0..1",
+    "note": "Both are estimates: a linear map from the model's own 0..1 scale, rounding halves up, that the labels pack pre-fills and the rater corrects. pack import measures how far the ratings move them, the evidence for a later change."
+  },
+  "states": [
+    {
+      "state": "sleepy",
+      "example": {"energy": 1, "mood": 3},
+      "any": [
+        {"energy": [1, 1]},
+        {"energy": [2, 2], "tags_any": ["whispered", "tired"]}
+      ]
+    },
+    {
+      "state": "excited",
+      "example": {"energy": 5, "mood": 5},
+      "any": [
+        {"energy": [5, 5], "mood": [4, 5], "tags_none": ["worried", "sad", "annoyed", "tired"]},
+        {"energy": [4, 4], "mood": [5, 5], "tags_any": ["laughing"], "tags_none": ["worried", "sad", "annoyed", "tired"]}
+      ]
+    },
+    {
+      "state": "calm",
+      "example": {"energy": 2, "mood": 4},
+      "any": [
+        {"energy": [2, 2], "mood": [3, 5], "tags_none": ["whispered", "laughing", "sighing", "shouted", "worried", "sad", "annoyed", "tired"]}
+      ]
+    },
+    {
+      "state": "awake",
+      "example": {"energy": 4, "mood": 4},
+      "any": [
+        {"energy": [4, 4], "mood": [3, 5], "tags_none": ["whispered", "laughing", "sighing", "shouted", "worried", "sad", "annoyed", "tired"]}
+      ]
+    },
+    {
+      "state": "neutral",
+      "example": {"energy": 3, "mood": 3},
+      "any": [
+        {"energy": [3, 3], "mood": [3, 4], "tags_none": ["whispered", "laughing", "sighing", "shouted", "worried", "sad", "annoyed", "tired"]}
+      ]
+    }
+  ]
+}
