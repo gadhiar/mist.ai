@@ -106,8 +106,8 @@ def valid_text(number: int) -> str:
     return f"{CANARY.transcript}, validation {number}."
 
 
-def take_rel(number: int) -> str:
-    return f"{teacher_cmd.run_rel(TAKES_RUN)}/takes/take-{number:04d}.flac"
+def take_rel(number: int, runs: Sequence[str] = (TAKES_RUN,)) -> str:
+    return f"{teacher_cmd.run_rel(runs[number % len(runs)])}/takes/take-{number:04d}.flac"
 
 
 def write_anchor(root: root_mod.Root, voice: str = ANCHOR) -> teacher_cmd.Anchor:
@@ -116,15 +116,19 @@ def write_anchor(root: root_mod.Root, voice: str = ANCHOR) -> teacher_cmd.Anchor
     return teacher_cmd.read_anchor(root, voice)
 
 
-def write_corpus(root: root_mod.Root) -> None:
-    """A built corpus of teacher takes in the anchor's voice, and its manifest."""
+def write_corpus(root: root_mod.Root, runs: Sequence[str] = (TAKES_RUN,)) -> None:
+    """A built corpus of teacher takes in the anchor's voice, and its manifest.
+
+    One run gives a schema-1 manifest, as `corpus build` wrote before corpora combined runs;
+    more give a schema-2 manifest, the takes spread over the runs in turn.
+    """
     for number in range(4 + VALID_N):
-        path = root.path / take_rel(number)
+        path = root.path / take_rel(number, runs)
         path.parent.mkdir(parents=True, exist_ok=True)
         sf.write(str(path), _synth_voice(205.0, FORMANTS, 2.0, RATE), RATE, format="FLAC")
 
     def row(number: int, text: str) -> str:
-        doc = {"path": f"/data/{take_rel(number)}", "duration": 2.0, "transcript": text,
+        doc = {"path": f"/data/{take_rel(number, runs)}", "duration": 2.0, "transcript": text,
                "words": []}  # fmt: skip
         return json.dumps(doc) + "\n"
 
@@ -138,8 +142,10 @@ def write_corpus(root: root_mod.Root) -> None:
         {"rel": f"corpus/{CORPUS}/{name}", "sha256": sha256((folder / name).read_bytes())}
         for name in ("train_aligned.jsonl", "valid_aligned.jsonl")
     ]
-    manifest = {"schema": 1, "version": CORPUS, "takes_run": TAKES_RUN, "seed_run": None,
-                "files": files}  # fmt: skip
+    named = {"schema": 1, "takes_run": runs[0]} if len(runs) == 1 else {
+        "schema": 2, "takes_runs": list(runs)
+    }  # fmt: skip
+    manifest = {**named, "version": CORPUS, "seed_run": None, "files": files}
     write_json(root, f"corpus/{CORPUS}/manifest.json", manifest)
 
 
@@ -206,15 +212,17 @@ def write_target(
     write_json(root, f"targets/{TARGET}/target.json", record)
 
 
-def write_teacher_score_plan(root: root_mod.Root, target: str | None = TARGET) -> None:
+def write_teacher_score_plan(
+    root: root_mod.Root, target: str | None = TARGET, run: str = TAKES_RUN
+) -> None:
     """The teacher run's score plan: its floor from the seed target, or the seed fallback's."""
     floor = (
         {"from": teacher_cmd.FLOOR_SEED, "target": target}
         if target is not None
         else {"from": teacher_cmd.FLOOR_TAKES, "target": None, "percentile": 10.0}
     )
-    plan = {"schema": 1, "run": TAKES_RUN, "lines_file": "text/v1/lines.jsonl", "floor": floor}
-    write_json(root, f"{teacher_cmd.run_rel(TAKES_RUN)}/{teacher_cmd.SCORE_PLAN_NAME}", plan)
+    plan = {"schema": 1, "run": run, "lines_file": "text/v1/lines.jsonl", "floor": floor}
+    write_json(root, f"{teacher_cmd.run_rel(run)}/{teacher_cmd.SCORE_PLAN_NAME}", plan)
 
 
 @pytest.fixture
@@ -672,6 +680,78 @@ def test_score_refusals_exit_2_before_any_job(
     breaks(root)
     result = score(root, "--checkpoint", CHECKPOINT)
     assert result.code == 2 and message in result.err, result.err
+    assert result.docker.argvs == []
+
+
+# A corpus of two teacher runs.
+
+TAKES_RUN2 = "g2"
+
+
+def two_runs(root: root_mod.Root) -> None:
+    """Make the corpus a schema-2 corpus of g1 and g2, made with the same anchor and floor."""
+    plan = read(root.path / teacher_cmd.run_rel(TAKES_RUN) / teacher_cmd.PLAN_NAME)
+    write_json(
+        root, f"{teacher_cmd.run_rel(TAKES_RUN2)}/{teacher_cmd.PLAN_NAME}",
+        {**plan, "run": TAKES_RUN2},
+    )  # fmt: skip
+    write_teacher_score_plan(root, run=TAKES_RUN2)
+    write_corpus(root, runs=(TAKES_RUN, TAKES_RUN2))
+
+
+def test_score_reads_every_teacher_run_of_a_two_run_corpus(
+    root: root_mod.Root, hub: list[tuple[str, str | None]]
+) -> None:
+    two_runs(root)
+    result = score(root, "--checkpoint", CHECKPOINT)
+    assert result.code == 0, result.err
+    rels = [i.rel for i in student_cmd.corpus_inputs(root, CORPUS)]
+    assert teacher_cmd.run_rel(TAKES_RUN) in rels and teacher_cmd.run_rel(TAKES_RUN2) in rels
+    assert student_cmd.run_anchor(root, CORPUS) == teacher_cmd.read_anchor(root, ANCHOR)
+    assert student_cmd.seed_reference(root, CORPUS, ANCHOR)["target"] == TARGET
+    assert read(root.path / "students" / RUN / "score.json")["seed"]["target"] == TARGET
+
+
+def _another_anchor(root: root_mod.Root) -> None:
+    path = root.path / teacher_cmd.run_rel(TAKES_RUN2) / teacher_cmd.PLAN_NAME
+    plan = read(path)
+    plan["anchor"] = {**plan["anchor"], "voice": "another-voice"}
+    path.write_text(json.dumps(plan), encoding="utf-8")
+
+
+def _another_floor(root: root_mod.Root) -> None:
+    write_teacher_score_plan(root, target="t2", run=TAKES_RUN2)
+
+
+def _second_not_scored(root: root_mod.Root) -> None:
+    (root.path / teacher_cmd.run_rel(TAKES_RUN2) / teacher_cmd.SCORE_PLAN_NAME).unlink()
+
+
+def _second_not_planned(root: root_mod.Root) -> None:
+    (root.path / teacher_cmd.run_rel(TAKES_RUN2) / teacher_cmd.PLAN_NAME).unlink()
+
+
+@pytest.mark.parametrize(
+    ("breaks", "message", "hidden"),
+    [
+        (_another_anchor, "different anchors", "another-voice"),
+        (_another_floor, "different floors", "t2"),
+        (_second_not_scored, f"teacher run {TAKES_RUN2} has no score plan", None),
+        (_second_not_planned, "generate-plan.json", None),
+    ],
+    ids=["anchor", "floor", "unscored", "unplanned"],
+)
+def test_score_refuses_two_runs_that_disagree(
+    root: root_mod.Root, hub: list[tuple[str, str | None]], breaks, message: str,
+    hidden: str | None,
+) -> None:  # fmt: skip
+    two_runs(root)
+    breaks(root)
+    result = score(root, "--checkpoint", CHECKPOINT)
+    assert result.code == 2 and message in result.err, result.err
+    if hidden is not None:
+        assert TAKES_RUN in result.err and TAKES_RUN2 in result.err
+        assert hidden not in result.err
     assert result.docker.argvs == []
 
 

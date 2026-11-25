@@ -45,10 +45,11 @@ the trainer keeps, and the best, has its student weights, alone and in the runti
 and `student export` read.
 
 `student score --run R [--checkpoint C]` gates a distill checkpoint (default: the newest with
-weights) against the anchor, the identity whose neutral clip the run's teacher takes were
-conditioned on (corpus manifest, then the teacher run's plan), and against the seed target those
-takes were scored with (the teacher run's score plan; takes scored under the seed fallback have
-none, and are refused). It runs two jobs of `stages/student_score.py` on
+weights) against the anchor, the identity whose neutral clip the teacher takes were conditioned
+on (the corpus manifest's teacher runs, then each run's plan, which must name the same anchor),
+and against the seed target those takes were scored with (each run's score plan, which must
+record the same floor; takes scored under the seed fallback have none, and are refused). The
+manifest's runs are read through `commands/corpus.py::teacher_runs`, schema 1 or 2. It runs two jobs of `stages/student_score.py` on
 `students/<R>/scores/<C>/`: one in `train-pocket` renders the corpus's validation lines and the
 speech bench's 26 items (`BENCH_LINES_REL`: its lines and acknowledgements) with the checkpoint,
 at `RENDER_VRAM_GB` (E: inference of the 6-layer student) rather than the family's 16, and one in
@@ -342,7 +343,7 @@ def _clip_rel(path: object, number: int, rel: str) -> str:
 def corpus_inputs(root: root_mod.Root, version: str) -> tuple[JobInput, ...]:
     """Return a built corpus's job inputs: its two splits and the run folders of their clips.
 
-    The corpus rows name each clip as `/data/<root-relative path>`, so the job mounts the
+    The corpus rows name each clip as `/data/<root-relative path>`, so the job mounts every
     teacher run and the seed run the manifest names, and every row's clip must lie in one of
     them. A folder's sha256 is a digest of the sha256s of the clips the splits name in it.
 
@@ -369,7 +370,7 @@ def corpus_inputs(root: root_mod.Root, version: str) -> tuple[JobInput, ...]:
         if not path.is_file() or sha256_file(path) != recorded.get(rel):
             raise InputError(f"refused: {rel} is missing or changed since its manifest")
         inputs.append(JobInput(rel=rel, sha256=recorded[rel]))  # type: ignore[arg-type]
-    dirs = [teacher_cmd.run_rel(str(manifest.get("takes_run")))]
+    dirs = [teacher_cmd.run_rel(run) for run in corpus_cmd.teacher_runs(manifest)]
     if manifest.get("seed_run") is not None:
         dirs.append(clean_cmd.run_rel(str(manifest["seed_run"])))
     clips: dict[str, list[str]] = {d: [] for d in dirs}
@@ -698,22 +699,32 @@ def read_train(root: root_mod.Root, run_id: str) -> Mapping[str, object]:
 
 
 def run_anchor(root: root_mod.Root, corpus: str) -> teacher_cmd.Anchor:
-    """Return the anchor of the teacher run a corpus was built from, unchanged since then.
+    """Return the anchor the teacher runs of a corpus were made with, unchanged since then.
+
+    Every run's plan must name the same anchor, since the student is gated against one.
 
     Raises:
-        InputError: The corpus or its teacher run's plan is missing, or the anchor's neutral
-            clip changed since the teacher run (`teacher_cmd.read_anchor` names the rest).
+        InputError: The corpus or a teacher run's plan is missing, the runs' plans name
+            different anchors, or the anchor's neutral clip changed since the first run
+            (`teacher_cmd.read_anchor` names the rest).
     """
     manifest = read_json(root.path / corpus_cmd.corpus_rel(corpus) / corpus_cmd.MANIFEST_NAME)
-    takes_run = manifest.get("takes_run") if isinstance(manifest, dict) else None
-    if not isinstance(takes_run, str):
-        raise InputError(f"refused: corpus {corpus}'s manifest names no teacher run")
-    _check_id(takes_run, "teacher run id")
-    plan = read_json(root.path / teacher_cmd.run_rel(takes_run) / teacher_cmd.PLAN_NAME)
-    doc = plan.get("anchor") if isinstance(plan, dict) else None
-    voice = doc.get("voice") if isinstance(doc, dict) else None
-    if not isinstance(voice, str):
-        raise InputError(f"refused: teacher run {takes_run}'s plan names no anchor")
+    runs = corpus_cmd.teacher_runs(manifest)
+    docs: dict[str, object] = {}
+    for run in runs:
+        plan = read_json(root.path / teacher_cmd.run_rel(run) / teacher_cmd.PLAN_NAME)
+        found = plan.get("anchor") if isinstance(plan, dict) else None
+        if not isinstance(found, dict) or not isinstance(found.get("voice"), str):
+            raise InputError(f"refused: teacher run {run}'s plan names no anchor")
+        docs[run] = found
+    takes_run = runs[0]
+    for run in runs[1:]:
+        if docs[run] != docs[takes_run]:
+            raise InputError(
+                f"refused: teacher runs {takes_run} and {run} were made with different anchors"
+            )
+    doc = docs[takes_run]
+    voice = str(doc["voice"])  # type: ignore[index]
     anchor = teacher_cmd.read_anchor(root, voice)
     if anchor.to_json() != doc:
         raise InputError(f"refused: identity {voice}'s neutral clip changed since run {takes_run}")
@@ -728,30 +739,41 @@ def _number(value: object) -> float | None:
 def seed_reference(root: root_mod.Root, corpus: str, voice_id: str) -> dict[str, object]:
     """Return what the seed target gives the gates: its SIM medians and its neutral F0 SD.
 
-    The chain is `commands/corpus.py`'s: the corpus's teacher run, that run's score plan, and
-    the seed target its takes were scored against. `sim_median` is each embedder's leave-one-out
+    The chain is `commands/corpus.py`'s: the corpus's teacher runs, each run's score plan, and
+    the seed target their takes were scored against. Every run's plan must record the same
+    floor, so the takes share one target. `sim_median` is each embedder's leave-one-out
     SIM median over the seed's confirmed segments (`distribution`, pooled over states);
     `f0_std_hz` is the median F0 standard deviation of the seed's neutral segments (`profile`),
     and `f0_std_spread_hz` that measure's standard deviation across them (`spread`), recorded.
 
     Raises:
-        InputError: The takes were scored under the seed fallback (no target), the target is
-            missing, not the anchor's voice, or not a seed target, or it lacks a SIM median on
-            either embedder or a neutral F0 SD.
+        InputError: A run has no score plan, the runs' plans record different floors, the
+            takes were scored under the seed fallback (no target), the target is missing, not
+            the anchor's voice, or not a seed target, or it lacks a SIM median on either
+            embedder or a neutral F0 SD.
     """
     manifest = read_json(root.path / corpus_cmd.corpus_rel(corpus) / corpus_cmd.MANIFEST_NAME)
-    takes_run = str(manifest.get("takes_run")) if isinstance(manifest, dict) else ""
-    _check_id(takes_run, "teacher run id")
-    plan_path = root.path / teacher_cmd.run_rel(takes_run) / teacher_cmd.SCORE_PLAN_NAME
-    if not plan_path.is_file():
-        raise InputError(f"refused: teacher run {takes_run} has no score plan")
-    plan = read_json(plan_path)
-    floor = plan.get("floor") if isinstance(plan, dict) else None
-    doc = floor if isinstance(floor, Mapping) else {}
+    runs = corpus_cmd.teacher_runs(manifest)
+    floors: dict[str, Mapping[str, object]] = {}
+    for run in runs:
+        plan_path = root.path / teacher_cmd.run_rel(run) / teacher_cmd.SCORE_PLAN_NAME
+        if not plan_path.is_file():
+            raise InputError(f"refused: teacher run {run} has no score plan")
+        plan = read_json(plan_path)
+        floor = plan.get("floor") if isinstance(plan, dict) else None
+        floors[run] = floor if isinstance(floor, Mapping) else {}
+    takes_run = runs[0]
+    for run in runs[1:]:
+        if floors[run] != floors[takes_run]:
+            raise InputError(
+                f"refused: teacher runs {takes_run} and {run} were scored with different floors"
+            )
+    doc = floors[takes_run]
     target_id = doc.get("target")
     if doc.get("from") != teacher_cmd.FLOOR_SEED or not isinstance(target_id, str):
+        named = f"run {takes_run}" if len(runs) == 1 else f"runs {', '.join(runs)}"
         raise InputError(
-            f"refused: teacher run {takes_run}'s takes were scored under the seed fallback, "
+            f"refused: teacher {named}'s takes were scored under the seed fallback, "
             "with no seed target; student score gates against a seed target's numbers"
         )
     _check_id(target_id, "target id")

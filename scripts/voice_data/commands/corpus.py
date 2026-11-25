@@ -1,25 +1,37 @@
-"""`corpus build --takes R --version C [--seed N]`: the student's training corpus, word-aligned.
+"""`corpus build --takes R [--takes R ...] --version C [--seed N]`: the student's corpus, aligned.
 
-The corpus is the selected takes of teacher run `teachers/omnivoice/<R>/` plus the seed's kept
-real segments, written to `corpus/<C>/` in the layout the pinned Pocket TTS training code reads:
+The corpus is the selected takes of one or more teacher runs `teachers/omnivoice/<R>/`, read in
+the order given, plus the seed's kept real segments, written to `corpus/<C>/` in the layout the
+pinned Pocket TTS training code reads:
 `train_aligned.jsonl` and `valid_aligned.jsonl`, one `{path, duration, transcript, words}` row
 per utterance, the names its fine-tune config gives `data.train_jsonl` and `data.valid_jsonl`.
 A row carries only `Entry`'s fields, because the loader builds an `Entry` from each row. `path`
 is the clip's path inside a job (`/data/<root-relative path>`), where every job mounts its
 inputs, so the training job must mount the clips the same way.
 
+Runs combine only when they were made the same way, which the build checks rather than assumes:
+their score plans agree on every key but `run` and `lines_file` (anchor, embedders, `cer_max`,
+the floor and its target, values and centroid hashes, the centroids, profile and spread); with
+more than one run, each floor comes from the seed target, since a floor from a run's own takes
+records only a percentile, and two such runs could pass with different real floors; their
+generation plans agree on `take_n` (`rounds_max` and `thresholds` may differ); and their lines
+files are different files sharing no line id and no `text_corpus.normalise`d text. Take ids
+derive from the line id, so unique line ids give unique take ids across runs. A refusal names
+the runs and the key or a count, never a value or a line's text.
+
 The seed is the clean run behind the seed target the takes were scored against (`teacher score
---target`): its confirmed segments whose two ASR transcripts agree. Takes scored under the seed
-fallback have no seed target, so their corpus is teacher-only.
+--target`), which the runs share: its confirmed segments whose two ASR transcripts agree. Takes
+scored under the seed fallback have no seed target, so their corpus is teacher-only.
 
 One GPU job in the `train-pocket` family (`stages/corpus_build.py`) measures every clip and runs
 upstream's CTC aligner (`training/scripts/align_data.py`) over all of them once: the loader
 refuses a row without `words` (`UnalignedEntry`), so a row the aligner leaves out is dropped and
-counted. After alignment the job holds out `corpus.val_fraction` of the teacher lines (whole
-lines, so a line's takes never sit in both splits) and `corpus.seed_val_share` of the trusted
-seed seconds (whole sources, so no training segment shares a recording with a validation one),
-caps the training seed by `corpus.seed_share_max` of the training split's hours counted after
-the seed is oversampled 3x, and writes the splits. The held-out seed rows come first in
+counted. After alignment the job holds out `corpus.val_fraction` of the teacher lines, drawn
+once over every run's lines (whole lines, so a line's takes never sit in both splits), and
+`corpus.seed_val_share` of the trusted seed seconds (whole sources, so no training segment
+shares a recording with a validation one), caps the training seed by `corpus.seed_share_max` of
+the training split's hours, every run's teacher seconds plus the seed counted after it is
+oversampled 3x, and writes the splits. The held-out seed rows come first in
 `valid_aligned.jsonl`, once each, so a validation pass that drops a short tail drops teacher
 rows, not her real voice.
 Every such choice follows the order of the sha256 of `--seed` (default 0) and the id, so the
@@ -27,12 +39,15 @@ seed the manifest records as `random_seed` reproduces the splits byte for byte.
 The aligner's batch is 8, not upstream's 32, and the job asks for 3 GB of VRAM rather than the
 family's 16, which the 12 GB card cannot give.
 
-This side then gates the aligned teacher hours on `corpus.teacher_hours_min`: below it, it writes
-`report.json` and refuses (exit 3) without a `manifest.json`, so nothing downstream takes the
-corpus. Above it, `manifest.json` records the hours, the shares, the counts and each split's
-sha256. A take of an ear-test line (`scripts/model_bench/speech/lines.json`) is refused before the
-job; a seed segment speaking one is left out by the job, and the manifest's count of ear-test
-rows is asserted to be 0.
+This side prints each run's selected takes, its takes not yet scored and its aligned hours, then
+gates the aligned teacher hours of all runs together on `corpus.teacher_hours_min`: below it, it
+writes `report.json` and refuses (exit 3) without a `manifest.json`, so nothing downstream takes
+the corpus. Above it, the schema-2 `manifest.json` records the runs (`takes_runs`), each run's
+aligned hours (`teacher_hours_by_run`), the hours, the shares, the counts and each split's
+sha256. `teacher_runs` reads a manifest's runs, schema 1 or 2, for the student commands. A take
+of an ear-test line (`scripts/model_bench/speech/lines.json`) is refused before the job; a seed
+segment speaking one is left out by the job, and the manifest's count of ear-test rows is
+asserted to be 0.
 
 Nothing printed carries a transcript, a line's text, a clip's path or a source id: only take,
 line, segment and run ids, counts and hours.
@@ -60,7 +75,7 @@ from . import clean as clean_cmd
 from . import extract as extract_cmd
 from . import teacher as teacher_cmd
 
-SCHEMA = 1
+SCHEMA = 2
 FAMILY = "train-pocket"
 MODULE = "scripts.voice_data.stages.corpus_build"
 ALIGNER_MODEL = "wav2vec2-base-960h"
@@ -183,13 +198,19 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "corpus",
         help="the student's training corpus",
         description=(
-            "Build the student's training corpus from a scored teacher run's selected takes and "
-            "the seed's kept real segments, word-aligned in the Pocket TTS training layout."
+            "Build the student's training corpus from the selected takes of one or more scored "
+            "teacher runs made the same way and the seed's kept real segments, word-aligned in "
+            "the Pocket TTS training layout."
         ),
     )
     steps = parser.add_subparsers(dest="step", metavar="STEP", required=True)
     build = steps.add_parser("build", help="align and split the corpus (a GPU job)")
-    build.add_argument("--takes", required=True, help="the scored teacher run under teachers/")
+    build.add_argument(
+        "--takes",
+        required=True,
+        action="append",
+        help="a scored teacher run under teachers/; repeat it once per run, read in that order",
+    )
     build.add_argument("--version", required=True, help="the corpus version, a folder in corpus/")
     build.add_argument(
         "--seed",
@@ -245,8 +266,24 @@ def _read_texts(root: root_mod.Root, rel: str) -> dict[str, str]:
     }
 
 
-def _selected_takes(root: root_mod.Root, run_id: str) -> tuple[dict[str, object], list[TakeRecord]]:
-    """Return the run's score plan and its selected takes, each audio file inside the run."""
+@dataclass(frozen=True, slots=True)
+class RunTakes:
+    """One teacher run's part of a corpus: its score plan, its lines and its selected takes."""
+
+    run: str
+    score_plan: Mapping[str, object]
+    lines_file: str
+    texts: Mapping[str, str]
+    selected: tuple[TakeRecord, ...]
+    unscored: int
+
+
+def _read_run(root: root_mod.Root, run_id: str, hold_out: text_corpus.HoldOut) -> RunTakes:
+    """Return a run's selected takes, each audio file inside the run, and each line its own.
+
+    Each selected take's line must be in the run's own lines file and must not be an ear-test
+    line. `unscored` counts the run's takes `teacher score` has not measured yet.
+    """
     run_dir = teacher_cmd.run_rel(run_id)
     plan_path = root.path / run_dir / teacher_cmd.SCORE_PLAN_NAME
     takes_path = root.path / run_dir / teacher_cmd.TAKES_NAME
@@ -255,13 +292,138 @@ def _selected_takes(root: root_mod.Root, run_id: str) -> tuple[dict[str, object]
     plan = read_json(plan_path)
     if not isinstance(plan, dict) or not isinstance(plan.get("lines_file"), str):
         raise InputError(f"refused: run {run_id}'s score plan names no lines file")
-    selected = [t for t in read_jsonl(takes_path, TakeRecord) if t.selected and t.kept]
+    records = read_jsonl(takes_path, TakeRecord)
+    selected = tuple(t for t in records if t.selected and t.kept)
     if not selected:
         raise InputError(f"refused: run {run_id} has no selected take; run teacher score first")
     for take in selected:
         if not take.audio.startswith(f"{run_dir}/") or not (root.path / take.audio).is_file():
             raise InputError(f"refused: take {take.take_id}'s audio is missing from run {run_id}")
-    return plan, selected
+    lines_file = str(plan["lines_file"])
+    texts = _read_texts(root, lines_file)
+    missing = {t.line_id for t in selected} - set(texts)
+    if missing:
+        raise InputError(
+            f"refused: {len(missing)} selected lines of run {run_id} are not in {lines_file}"
+        )
+    held = sum(hold_out.holds(texts[t.line_id]) for t in selected)
+    if held:
+        raise InputError(f"refused: {held} selected takes of run {run_id} speak an ear-test line")
+    unscored = sum(not teacher_cmd.is_scored(t) for t in records)
+    return RunTakes(run_id, plan, lines_file, texts, selected, unscored)
+
+
+# The score plan keys that name the run itself, so runs made the same way differ on them.
+OWN_KEYS = ("run", "lines_file")
+_ABSENT = object()
+
+
+def _differing_keys(
+    first: Mapping[str, object], other: Mapping[str, object], prefix: str = ""
+) -> list[str]:
+    """Return the dotted keys on which two plans differ, descending into nested mappings."""
+    found: list[str] = []
+    for key in sorted(set(first) | set(other)):
+        if not prefix and key in OWN_KEYS:
+            continue
+        left, right = first.get(key, _ABSENT), other.get(key, _ABSENT)
+        if left == right:
+            continue
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            found += _differing_keys(left, right, f"{prefix}{key}.")
+        else:
+            found.append(f"{prefix}{key}")
+    return found
+
+
+def _take_n(root: root_mod.Root, run_id: str) -> object:
+    path = root.path / teacher_cmd.run_rel(run_id) / teacher_cmd.PLAN_NAME
+    if not path.is_file():
+        raise InputError(f"refused: run {run_id} has no generation plan")
+    plan = read_json(path)
+    if not isinstance(plan, dict) or "take_n" not in plan:
+        raise InputError(f"refused: run {run_id}'s generation plan records no take_n")
+    return plan["take_n"]
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
+def _check_same_way(root: root_mod.Root, runs: Sequence[RunTakes]) -> None:
+    """Refuse runs not made the same way; a refusal names runs and keys or counts, no values.
+
+    Raises:
+        InputError: The runs' score plans differ on a key but `run` and `lines_file`; more than
+            one run is given and a run's floor is not from the seed target; their generation
+            plans differ on `take_n`; or two runs' lines files are the same file, or share a
+            line id or a normalised text.
+    """
+    first = runs[0]
+    if len(runs) > 1:
+        names = ", ".join(r.run for r in runs)
+        for run in runs:
+            floor = run.score_plan.get("floor")
+            if not isinstance(floor, Mapping) or floor.get("from") != teacher_cmd.FLOOR_SEED:
+                raise InputError(
+                    f"refused: runs {names} combine only with floors from the seed target, and "
+                    f"run {run.run}'s is not"
+                )
+    for other in runs[1:]:
+        keys = _differing_keys(first.score_plan, other.score_plan)
+        if keys:
+            raise InputError(
+                f"refused: runs {first.run} and {other.run} were scored differently, on "
+                f"{', '.join(keys)}"
+            )
+    if len(runs) > 1:
+        take_n = _take_n(root, first.run)
+        for other in runs[1:]:
+            if _take_n(root, other.run) != take_n:
+                raise InputError(
+                    f"refused: runs {first.run} and {other.run}'s generation plans differ on "
+                    "take_n"
+                )
+    for index, one in enumerate(runs):
+        for two in runs[index + 1 :]:
+            pair = f"runs {one.run} and {two.run}"
+            if one.lines_file == two.lines_file:
+                raise InputError(f"refused: {pair} read the same lines file")
+            shared = len(set(one.texts) & set(two.texts))
+            if shared:
+                raise InputError(f"refused: {pair}'s lines files share {_count(shared, 'line id')}")
+            said = {text_corpus.normalise(t) for t in one.texts.values()}
+            same = len(said & {text_corpus.normalise(t) for t in two.texts.values()})
+            if same:
+                raise InputError(
+                    f"refused: {pair}'s lines files share {_count(same, 'line')} by normalised "
+                    "text"
+                )
+
+
+def teacher_runs(manifest: object) -> tuple[str, ...]:
+    """Return a corpus manifest's teacher runs, in the order the build read them.
+
+    A schema-2 manifest lists them in `takes_runs`; a schema-1 manifest, built from one run
+    before corpora combined runs, names it in `takes_run`, so corpora built then stay readable.
+
+    Raises:
+        InputError: The manifest names no teacher run for its schema, names one twice, or
+            names an id that is not one folder name.
+    """
+    doc = manifest if isinstance(manifest, Mapping) else {}
+    schema, found = doc.get("schema"), None
+    if schema == SCHEMA:
+        found = doc.get("takes_runs")
+    elif schema == 1 and isinstance(doc.get("takes_run"), str):
+        found = [doc["takes_run"]]
+    if not isinstance(found, list) or not found or not all(isinstance(r, str) for r in found):
+        raise InputError("refused: the corpus manifest names no teacher run")
+    for run in found:
+        _check_id(run, "teacher run id")
+    if len(set(found)) != len(found):
+        raise InputError("refused: the corpus manifest names a teacher run twice")
+    return tuple(found)
 
 
 def _seed(
@@ -290,31 +452,33 @@ def _seed(
 def run_build(args: argparse.Namespace) -> int:
     """Plan the corpus, run the alignment job, gate its teacher hours and write the manifest."""
     root = root_mod.open_root(args.root)
-    _check_id(args.takes, "run id")
+    given: list[str] = list(args.takes)
+    for run_id in given:
+        _check_id(run_id, "run id")
     _check_id(args.version, "corpus version")
+    twice = next((r for i, r in enumerate(given) if r in given[:i]), None)
+    if twice is not None:
+        raise InputError(f"refused: run {twice} is named twice")
     out_dir = corpus_rel(args.version)
     if (root.path / out_dir / MANIFEST_NAME).exists():
         raise InputError(f"refused: corpus {args.version} exists; choose a new version")
-    score_plan, takes = _selected_takes(root, args.takes)
-    lines_file = str(score_plan["lines_file"])
-    texts = _read_texts(root, lines_file)
-    missing = {t.line_id for t in takes} - set(texts)
-    if missing:
-        raise InputError(f"refused: {len(missing)} selected lines are not in {lines_file}")
     hold_out = text_corpus.HoldOut(text_corpus.load_ear_test())
-    held = sum(hold_out.holds(texts[t.line_id]) for t in takes)
-    if held:
-        raise InputError(f"refused: {held} selected takes speak an ear-test line")
-    seed_run, segments = _seed(root, score_plan)
+    runs = [_read_run(root, run_id, hold_out) for run_id in given]
+    _check_same_way(root, runs)
+    # The runs' score plans agree on the floor, so the first names the seed target they share.
+    seed_run, segments = _seed(root, runs[0].score_plan)
     gates = gates_mod.load(root.path)
     families = jobs.load_families()
     aligner = families[FAMILY]["models"][ALIGNER_MODEL]  # type: ignore[index]
     plan = {
         "schema": SCHEMA,
         "version": args.version,
-        "takes_run": args.takes,
-        "lines_file": lines_file,
-        "takes": [{"take_id": t.take_id, "line_id": t.line_id, "audio": t.audio} for t in takes],
+        "takes_runs": [{"run": r.run, "lines_file": r.lines_file} for r in runs],
+        "takes": [
+            {"take_id": t.take_id, "line_id": t.line_id, "audio": t.audio, "run": r.run}
+            for r in runs
+            for t in r.selected
+        ],
         "seed_run": seed_run,
         "segments": [
             {"segment_id": segment_id, "source_id": source_id, "audio": audio}
@@ -334,13 +498,15 @@ def run_build(args: argparse.Namespace) -> int:
         },
     }
     write_json(root, f"{out_dir}/{PLAN_NAME}", plan)
-    run_dir = teacher_cmd.run_rel(args.takes)
-    take_parts = [sha256_file(root.path / run_dir / teacher_cmd.TAKES_NAME)]
-    take_parts += [sha256_file(root.path / t.audio) for t in takes]
-    inputs = [
-        JobInput(rel=lines_file, sha256=sha256_file(root.path / lines_file)),
-        JobInput(rel=run_dir, sha256=_digest(take_parts)),
-    ]
+    inputs: list[JobInput] = []
+    for run in runs:
+        run_dir = teacher_cmd.run_rel(run.run)
+        take_parts = [sha256_file(root.path / run_dir / teacher_cmd.TAKES_NAME)]
+        take_parts += [sha256_file(root.path / t.audio) for t in run.selected]
+        inputs += [
+            JobInput(rel=run.lines_file, sha256=sha256_file(root.path / run.lines_file)),
+            JobInput(rel=run_dir, sha256=_digest(take_parts)),
+        ]
     if seed_run is not None:
         seed_dir = clean_cmd.run_rel(seed_run)
         seed_parts = [sha256_file(root.path / seed_dir / clean_cmd.SEGMENTS_NAME)]
@@ -362,7 +528,7 @@ def run_build(args: argparse.Namespace) -> int:
     summary = _summary(root, job)
     if summary.get("ear_test_lines") != 0:
         raise JobError(f"job {job.job_id}: the corpus holds ear-test lines")
-    for line in build_lines(args.version, summary):
+    for line in build_lines(args.version, summary) + run_lines(runs, summary):
         print(line)
     teacher_hours = float(summary["teacher_hours"])  # type: ignore[arg-type]
     minimum = float(plan["teacher_hours_min"])  # type: ignore[arg-type]
@@ -371,6 +537,7 @@ def run_build(args: argparse.Namespace) -> int:
         "schema": SCHEMA,
         "version": args.version,
         "teacher_hours": teacher_hours,
+        "teacher_hours_by_run": summary["teacher_hours_by_run"],
         "teacher_hours_min": minimum,
         "passed": passed,
     }
@@ -387,7 +554,7 @@ def run_build(args: argparse.Namespace) -> int:
     manifest = {
         "schema": SCHEMA,
         "version": args.version,
-        "takes_run": args.takes,
+        "takes_runs": [r.run for r in runs],
         "seed_run": seed_run,
         **{key: summary[key] for key in MANIFEST_KEYS},
         "aligner": plan["aligner"],
@@ -403,6 +570,7 @@ def run_build(args: argparse.Namespace) -> int:
 MANIFEST_KEYS = (
     "random_seed",
     "teacher_hours",
+    "teacher_hours_by_run",
     "teacher_train_hours",
     "valid_hours",
     "seed_hours",
@@ -462,6 +630,17 @@ def build_lines(version: str, summary: Mapping[str, object]) -> list[str]:
         f"  seed left out: untrusted text {_num(out.get('untrusted_text'))}, ear-test "
         f"{_num(out.get('ear_test'))}, over the share cap {_num(out.get('share_cap'))}",
         _seed_val_line(summary),
+    ]
+
+
+def run_lines(runs: Sequence[RunTakes], summary: Mapping[str, object]) -> list[str]:
+    """Return what `corpus build` prints per run: counts and hours, never text or paths."""
+    found = summary.get("teacher_hours_by_run")
+    hours = found if isinstance(found, Mapping) else {}
+    return [
+        f"  run {run.run}: {len(run.selected)} selected takes, {run.unscored} not yet scored, "
+        f"{_num(hours.get(run.run))} h aligned"
+        for run in runs
     ]
 
 
