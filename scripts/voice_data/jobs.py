@@ -64,6 +64,9 @@ class JobSpec:
     # The VRAM this job needs, when it differs from the family's estimate: a probe's measured
     # batch, or a training run sized to fit beside a peer. `None` uses the family's `vram_gb`.
     vram_gb: float | None = None
+    # Seconds Docker waits between SIGTERM and SIGKILL (`--stop-timeout`), for a job whose
+    # SIGTERM save outlasts Docker's default 10 s. `None` keeps Docker's default.
+    stop_timeout_s: int | None = None
 
     def record(self) -> JobRecord:
         """Return the job as its `runs/<job_id>/job.json` record."""
@@ -196,6 +199,8 @@ class LocalDocker:
                 if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
                     raise InputError(f"refused: {job.family} {key} is not a positive number")
                 argv += [flag, f"{value:g}{suffix}"]
+        if job.stop_timeout_s is not None:
+            argv += ["--stop-timeout", str(job.stop_timeout_s)]
         for item in job.inputs:
             argv += ["-v", f"{self._inside(item.rel)}:/data/{item.rel}:ro"]
         argv += ["-v", f"{self._root.writable(job.outputs)}:/data/{job.outputs}"]

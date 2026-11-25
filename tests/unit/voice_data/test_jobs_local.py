@@ -332,6 +332,32 @@ def test_family_caps_add_shm_memory_and_cpus(private_root: Root) -> None:
     assert argv.index("--cpus") < argv.index(IMAGE)
 
 
+def test_stop_timeout_follows_the_family_caps_when_set(private_root: Root) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: CAPPED})
+    plain = local.argv(_job(gpu=True))
+    at = plain.index("--cpus") + 2
+    assert local.argv(_job(gpu=True, stop_timeout_s=237)) == [
+        *plain[:at], "--stop-timeout", "237", *plain[at:]
+    ]  # fmt: skip
+
+
+def test_stop_timeout_none_leaves_the_argv_unchanged(private_root: Root) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: CAPPED})
+    assert _job().stop_timeout_s is None
+    assert "--stop-timeout" not in local.argv(_job(gpu=True))
+    assert "--stop-timeout" not in _local(private_root).argv(_job())
+
+
+def test_job_record_holds_the_stop_timeout(private_root: Root) -> None:
+    assert _job().record().to_json()["stop_timeout_s"] is None
+    files = {"seed/runs/r1/a.bin": b"a"}
+    docker = FakeDocker(on_run=_writes_outputs(private_root, files))
+    _local(private_root, docker).run(_job(stop_timeout_s=150))
+    job_json = private_root.path / "runs/job-20261112T1015Z-1/job.json"
+    assert json.loads(job_json.read_text(encoding="utf-8"))["stop_timeout_s"] == 150
+    assert _pairs(docker.calls[-1], "--stop-timeout") == ["150"]
+
+
 def test_family_without_caps_adds_none(private_root: Root) -> None:
     argv = _local(private_root).argv(_job(gpu=True))
     assert not {"--shm-size", "--memory", "--cpus"} & set(argv)
