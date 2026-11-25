@@ -8,6 +8,7 @@ runner, so the host's argv, the probe's outputs and the host's merge are checked
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import sys
@@ -146,6 +147,7 @@ def run_probe(argv, *, engines=None, clock=None, emit=None):
         wall=StepClock(start=1_793_980_800.0, step=0.5),
         device_factory=lambda engine: FakeDevice(peak=512.0),
         emit=emit or lines.append,
+        rss=lambda: 1536.0,
     )
     return code, engines, lines
 
@@ -492,6 +494,81 @@ def test_the_timed_mode_records_streaming_false_for_a_whole_segment_engine(tmp_p
     assert code == 0
     assert load["streaming"] is False
     assert sample["first_segment_ms"] is not None
+
+
+# ---------------------------------------------------------------------------
+# The probe's resident memory peak: `VmHWM`, read after the load and after every sample
+# ---------------------------------------------------------------------------
+
+PROC_STATUS = """\
+Name:\tpython
+VmPeak:\t 4194304 kB
+VmHWM:\t 1572864 kB
+VmRSS:\t 1048576 kB
+"""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(PROC_STATUS, 1536.0, id="vmhwm-in-kib"),
+        pytest.param("Name:\tpython\nVmRSS:\t 1024 kB\n", None, id="no-vmhwm-line"),
+        pytest.param("VmHWM:\t lots kB\n", None, id="not-a-number"),
+        pytest.param("VmHWM:\t 1024 MB\n", None, id="another-unit"),
+    ],
+)
+def test_rss_peak_mib_is_vmhwm_from_proc_status_or_null(tmp_path, text, expected):
+    status = tmp_path / "status"
+    status.write_text(text, encoding="utf-8")
+
+    assert tts_probe.rss_peak_mib(status) == expected
+
+
+def test_rss_peak_mib_is_null_where_proc_status_is_unreadable(tmp_path):
+    assert tts_probe.rss_peak_mib(tmp_path / "absent") is None
+
+
+def test_the_timed_mode_records_the_rss_peak_after_the_load_and_after_every_sample(tmp_path):
+    engines: dict = {}
+    readings = iter([700.0, *range(1000, 1100)])
+    seen: list[str] = []
+
+    def rss() -> float:
+        engine = engines[CLONE][0]
+        seen.append(f"{len(engine.loaded)}:{len(engine.calls)}")
+        return float(next(readings))
+
+    code = tts_probe.main(
+        timed_args(CLONE, tmp_path, "--lines", "L02", "--lines", "L03", "--repeats", "1"),
+        engine_factory=fake_factory(engines),
+        clock=StepClock(),
+        wall=StepClock(),
+        device_factory=lambda engine: FakeDevice(),
+        emit=lambda line: None,
+        rss=rss,
+    )
+
+    rows = read_jsonl(tmp_path / "probe-idle.jsonl")
+    assert code == 0
+    assert [r["rss_peak_mib"] for r in rows] == [700.0, 1000.0, 1001.0]
+    # After the load (no synthesis yet), then after the warm-ups and each timed item.
+    assert seen == ["1:0", "1:4", "1:5"]
+
+
+def test_the_timed_mode_records_a_null_rss_peak_where_it_is_unreadable(tmp_path):
+    code = tts_probe.main(
+        timed_args("pocket", tmp_path, "--lines", "L02", "--repeats", "1"),
+        engine_factory=fake_factory({}),
+        clock=StepClock(),
+        wall=StepClock(),
+        device_factory=lambda engine: FakeDevice(),
+        emit=lambda line: None,
+        rss=lambda: None,
+    )
+
+    rows = read_jsonl(tmp_path / "probe-idle.jsonl")
+    assert code == 0
+    assert [r["rss_peak_mib"] for r in rows] == [None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1468,237 @@ def test_the_clone_adapter_refuses_when_no_clip_is_mounted(tmp_path):
     assert adapter.voice is None
 
 
+# ---------------------------------------------------------------------------
+# `pocket-clone` with an identity directory (`--voice-dir`, plan v5 M17)
+# ---------------------------------------------------------------------------
+
+VOICE_ID = "mist-trained"
+TRAINED_WEIGHTS = b"fake trained weights"
+TRAINED_TOKENIZER = b'{"fake": "trained tokenizer"}'
+# The runtime adapter's modules, which the clone adapter imports through its importer.
+RUNTIME_MODULES = ("backend.realtime.voice_assets", "backend.realtime.engines.pocket_tts")
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_identity(
+    voice_root: Path,
+    voice_id: str = VOICE_ID,
+    *,
+    trained: bool = True,
+    tokenizer: bool = True,
+    engine: str = CLONE,
+    tokenizer_sha256: str | None = None,
+) -> Path:
+    """An identity directory as `student export` writes it: a neutral clip, maybe weights."""
+    identity = voice_root / voice_id
+    identity.mkdir(parents=True)
+    rate = 24000
+    frames = (np.sin(2 * np.pi * 220.0 * np.arange(4 * rate) / rate) * 8000).astype("<i2")
+    with wave.open(str(identity / "neutral.wav"), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(frames.tobytes())
+    (identity / "neutral.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    manifest: dict = {
+        "schema": 1,
+        "voice_id": voice_id,
+        "status": "frozen",
+        "clips": [
+            {
+                "state": "neutral",
+                "audio": "neutral.wav",
+                "transcript": "neutral.txt",
+                "audio_sha256": _sha((identity / "neutral.wav").read_bytes()),
+                "transcript_sha256": _sha(TRANSCRIPT.encode("utf-8")),
+            }
+        ],
+    }
+    if trained:
+        (identity / "model.safetensors").write_bytes(TRAINED_WEIGHTS)
+        model = {
+            "engine": engine,
+            "base": f"{CLONE_REPO}@{CLONE_REVISION}",
+            "weights": "model.safetensors",
+            "sha256": _sha(TRAINED_WEIGHTS),
+            "tokenizer_sha256": tokenizer_sha256 or _sha(b"fake"),
+        }
+        if tokenizer:
+            (identity / "tokenizer.json").write_bytes(TRAINED_TOKENIZER)
+            model["tokenizer"] = "tokenizer.json"
+            model["tokenizer_sha256"] = _sha(TRAINED_TOKENIZER)
+        manifest.update(schema=2, model=model)
+    (identity / "voice.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return identity
+
+
+def identity_adapter(tmp_path: Path, rec: Recorder, **identity_kwargs):
+    """The clone adapter on an identity, its models directory at `<root>/speech` as mounted."""
+    configs_dir, models_dir, _ = clone_setup(tmp_path)
+    speech_models = tmp_path / "models-root" / "speech"
+    speech_models.parent.mkdir()
+    models_dir.rename(speech_models)
+    voice_root = tmp_path / "voice"
+    identity = write_identity(voice_root, **identity_kwargs)
+    modules = pocket_modules(rec, streaming=False, configs_dir=configs_dir)
+    modules["pocket_tts"].TTSModel.configs = []
+    modules.update({name: importlib.import_module(name) for name in RUNTIME_MODULES})
+    adapter = tts_engines.PocketCloneEngine(
+        CLONE,
+        TTS[CLONE],
+        models_dir=speech_models,
+        importer=fake_importer(modules, []),
+        voice_root=voice_root,
+        voice_id=VOICE_ID,
+    )
+    return adapter, modules, speech_models, identity
+
+
+def test_make_engine_builds_the_clone_adapter_on_the_identity_mounted_at_voice_slash_its_id():
+    adapter = tts_engines.make_engine(CLONE, importer=fake_importer({}, []), voice_id=VOICE_ID)
+
+    assert isinstance(adapter, tts_engines.PocketCloneEngine)
+    assert adapter.voice_id == VOICE_ID
+    assert adapter.voice_root == Path(tts_engines.CONTAINER_VOICE_ROOT)
+    assert tts_engines.container_voice_dir(VOICE_ID) == f"/voice/{VOICE_ID}"
+    assert tts_engines.CONTAINER_VOICE_CLIP == "/voice/identity.wav"
+
+
+@pytest.mark.parametrize("engine", [e for e in TTS if e != CLONE])
+def test_make_engine_refuses_an_identity_for_any_other_engine(engine):
+    with pytest.raises(core.SpeechBenchError, match=CLONE):
+        tts_engines.make_engine(engine, importer=fake_importer({}, []), voice_id=VOICE_ID)
+
+
+def test_the_identity_adapter_loads_the_trained_weights_and_tokenizer(tmp_path):
+    rec = Recorder()
+    adapter, modules, speech_models, identity = identity_adapter(tmp_path, rec)
+    ungated = speech_models.joinpath(*POCKET_REPO.split("/"), "languages", "english")
+
+    adapter.load(core.IDENTITY_VOICE)
+
+    [written] = modules["pocket_tts"].TTSModel.configs
+    assert written["weights_path"] == str((identity / "model.safetensors").resolve())
+    assert written["flow_lm"]["lookup_table"]["tokenizer_path"] == str(
+        (identity / "tokenizer.json").resolve()
+    )
+    assert written["weights_path_without_voice_cloning"] == str(ungated / "model.safetensors")
+    assert remote_strings(written) == []
+    assert ("set_num_threads", (4,), {}) in rec.calls
+
+
+def test_the_identity_adapter_without_a_tokenizer_keeps_the_stock_one(tmp_path):
+    rec = Recorder()
+    adapter, modules, speech_models, identity = identity_adapter(tmp_path, rec, tokenizer=False)
+    ungated = speech_models.joinpath(*POCKET_REPO.split("/"), "languages", "english")
+
+    adapter.load(core.IDENTITY_VOICE)
+
+    [written] = modules["pocket_tts"].TTSModel.configs
+    assert written["weights_path"] == str((identity / "model.safetensors").resolve())
+    assert written["flow_lm"]["lookup_table"]["tokenizer_path"] == str(ungated / "tokenizer.json")
+
+
+def test_a_stock_identity_loads_the_stock_cloning_weights(tmp_path):
+    rec = Recorder()
+    adapter, modules, speech_models, _ = identity_adapter(tmp_path, rec, trained=False)
+    cloning = speech_models.joinpath(*CLONE_REPO.split("/"), "languages", "english")
+
+    adapter.load(core.IDENTITY_VOICE)
+
+    [written] = modules["pocket_tts"].TTSModel.configs
+    assert written["weights_path"] == str(cloning / "model.safetensors")
+
+
+def test_the_identity_adapter_takes_its_voice_from_the_identity_s_neutral_clip(tmp_path):
+    rec = Recorder()
+    adapter, _, _, identity = identity_adapter(tmp_path, rec)
+
+    adapter.load(core.IDENTITY_VOICE)
+    chunks = list(adapter.stream("Hello."))
+
+    [state] = [args for name, args, _ in rec.calls if name == "state"]
+    assert state == ((identity / "neutral.wav").resolve(),)
+    assert ("generate_audio", ("state:neutral", "Hello."), {}) in rec.calls
+    assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    "identity_kwargs",
+    [
+        pytest.param({"engine": "pocket"}, id="weights-for-another-engine"),
+        pytest.param(
+            {"tokenizer": False, "tokenizer_sha256": "0" * 64}, id="not-the-stock-tokenizer"
+        ),
+    ],
+)
+def test_the_identity_adapter_refuses_what_the_runtime_refuses_before_loading(
+    tmp_path, identity_kwargs
+):
+    rec = Recorder()
+    adapter, _, _, _ = identity_adapter(tmp_path, rec, **identity_kwargs)
+
+    with pytest.raises(core.SpeechBenchError):
+        adapter.load(core.IDENTITY_VOICE)
+
+    assert "load_model" not in [call[0] for call in rec.calls]
+
+
+def test_the_identity_adapter_refuses_a_broken_identity_naming_no_private_path(tmp_path):
+    rec = Recorder()
+    adapter, _, _, identity = identity_adapter(tmp_path, rec)
+    (identity / "neutral.wav").write_bytes(b"not the clip the manifest hashed")
+
+    with pytest.raises(tts_engines.VoiceError) as info:
+        adapter.load(core.IDENTITY_VOICE)
+
+    assert str(tmp_path) not in str(info.value) and TRANSCRIPT not in str(info.value)
+    assert "load_model" not in [call[0] for call in rec.calls]
+
+
+def test_the_identity_adapter_needs_the_models_directory_mounted_as_speech(tmp_path):
+    rec = Recorder()
+    adapter, modules, speech_models, _ = identity_adapter(tmp_path, rec)
+    adapter._models_dir = speech_models.parent
+
+    with pytest.raises(core.SpeechBenchError, match="speech"):
+        adapter.load(core.IDENTITY_VOICE)
+
+
+def test_the_probe_builds_the_clone_adapter_on_the_identity_it_names(tmp_path, monkeypatch):
+    built = []
+
+    def make_engine(engine_id, **kwargs):
+        built.append((engine_id, kwargs))
+        return fake_factory({})(engine_id, kwargs["models_dir"])
+
+    monkeypatch.setattr(tts_engines, "make_engine", make_engine)
+
+    code = tts_probe.main(
+        timed_args(CLONE, tmp_path, "--lines", "L02", "--repeats", "1", "--voice-id", VOICE_ID),
+        clock=StepClock(),
+        wall=StepClock(),
+        device_factory=lambda engine: FakeDevice(),
+        emit=lambda line: None,
+        rss=lambda: None,
+    )
+
+    assert code == 0
+    assert built == [(CLONE, {"models_dir": Path("/models/speech"), "voice_id": VOICE_ID})]
+
+
+@pytest.mark.parametrize("engine", [e for e in TTS if e != CLONE])
+def test_the_probe_refuses_an_identity_for_any_other_engine_before_any_write(tmp_path, engine):
+    code, engines, _ = run_probe(timed_args(engine, tmp_path, "--voice-id", VOICE_ID))
+
+    assert code == 2
+    assert engines == {}
+    assert list(tmp_path.iterdir()) == []
+
+
 def qwen3_design_modules(rec: Recorder):
     class Model:
         def generate_voice_design(self, text, instruct, language=None, **kwargs):
@@ -1536,6 +1844,71 @@ def test_no_other_engine_s_argv_takes_a_clip(engine):
             speech_models_dir="/models",
             voice_clip=CLIP_HOST,
         )
+
+
+VOICE_DIR_HOST = "/private/voices/trained-run-2"
+
+
+def timed_on_identity(engine: str = CLONE, **kwargs) -> list[str]:
+    paths = {"voice_dir": VOICE_DIR_HOST, "voice_id": VOICE_ID, **kwargs}
+    return tts_suite.timed_argv(
+        engine, "idle", out_dir=OUT, repo_dir="/repo", speech_models_dir="/models", **paths
+    )
+
+
+def test_pocket_clone_mounts_an_identity_read_only_at_voice_slash_its_id():
+    argv = timed_on_identity()
+
+    assert f"{VOICE_DIR_HOST}:/voice/{VOICE_ID}:ro" in mounts(argv)
+    assert not [m for m in mounts(argv) if tts_engines.CONTAINER_VOICE_CLIP in m]
+    tail = argv[argv.index("scripts.model_bench.speech.probes.tts_probe") + 1 :]
+    assert value(tail, "--voice-id") == VOICE_ID
+    assert VOICE_DIR_HOST not in " ".join(tail)
+
+
+@pytest.mark.parametrize("build", [tts_suite.timed_argv, tts_suite.render_argv])
+def test_an_identity_and_a_clip_are_exclusive(build):
+    extra = {"expressive": False, "voices": ()} if build is tts_suite.render_argv else {}
+    first = () if build is tts_suite.render_argv else ("idle",)
+
+    with pytest.raises(core.VoiceClipError, match="voice-dir"):
+        build(
+            CLONE,
+            *first,
+            out_dir=OUT,
+            repo_dir="/repo",
+            speech_models_dir="/models",
+            voice_clip=CLIP_HOST,
+            voice_dir=VOICE_DIR_HOST,
+            voice_id=VOICE_ID,
+            **extra,
+        )
+
+
+@pytest.mark.parametrize("engine", [e for e in TTS if e != CLONE])
+def test_no_other_engine_s_argv_takes_an_identity(engine):
+    with pytest.raises(core.VoiceClipError):
+        timed_on_identity(engine)
+
+
+def test_an_identity_mount_needs_its_voice_id():
+    with pytest.raises(core.SpeechBenchError):
+        timed_on_identity(voice_id=None)
+
+
+def test_the_loop_argv_mounts_the_identity_too():
+    argv = tts_suite.loop_container_argv(
+        CLONE,
+        line_id="L01",
+        seconds=5,
+        repo_dir="/repo",
+        speech_models_dir="/models",
+        voice_dir=VOICE_DIR_HOST,
+        voice_id=VOICE_ID,
+    )
+
+    assert f"{VOICE_DIR_HOST}:/voice/{VOICE_ID}:ro" in mounts(argv)
+    assert value(argv, "--voice-id") == VOICE_ID
 
 
 @pytest.mark.parametrize("engine", list(TTS))
@@ -2086,6 +2459,108 @@ def test_the_docker_runner_logs_the_clip_mount_as_a_placeholder(tmp_path, monkey
     assert code == 0
     assert clip.as_posix() not in text and str(clip) not in text
     assert f"{core.VOICE_CLIP_PLACEHOLDER}:{tts_engines.CONTAINER_VOICE_CLIP}:ro" in text
+
+
+# ---------------------------------------------------------------------------
+# A trained identity: `--voice-dir`, what it records, and its refusals
+# ---------------------------------------------------------------------------
+
+
+def test_a_default_run_includes_pocket_clone_with_an_identity(tmp_path):
+    assert tts_suite.default_engines(TTS, tmp_path / "voices" / VOICE_ID) == tuple(TTS)
+
+
+def test_a_run_on_an_identity_records_its_id_weights_prefix_and_rss_but_no_path(tmp_path, caplog):
+    caplog.set_level("DEBUG")
+    voices = tmp_path / "private" / "voices"
+    identity = write_identity(voices)
+    before = sorted((p.name, p.stat().st_mtime_ns) for p in identity.iterdir())
+
+    _, runner = run_suite(tmp_path, request(tmp_path, engines=(CLONE,), voice_dir=identity))
+
+    tts_dir = tmp_path / "results" / "mh1" / "speech" / "tts"
+    samples = read_jsonl(tts_dir / "samples.jsonl")
+    [load] = read_jsonl(tts_dir / "load.jsonl")
+    expected = {"voice_id": VOICE_ID, "voice_weights_sha256": _sha(TRAINED_WEIGHTS)[:12]}
+    assert samples and all(r["voice"] == core.IDENTITY_VOICE for r in samples)
+    assert all({k: r[k] for k in expected} == expected for r in samples)
+    assert {k: load[k] for k in expected} == expected
+    assert all(r["rss_peak_mib"] == 1536.0 for r in samples)
+    assert all("voice_clip_sha256" not in r for r in [*samples, load])
+    mount = f"{identity.resolve().as_posix()}:/voice/{VOICE_ID}:ro"
+    assert all(mount in mounts(argv) for argv in runner.argvs)
+    written = _all_text_under(tmp_path / "results")
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in (str(identity), identity.as_posix(), identity.resolve().as_posix(), TRANSCRIPT):
+        assert secret not in written
+        assert secret not in logged
+    assert sorted((p.name, p.stat().st_mtime_ns) for p in identity.iterdir()) == before
+
+
+def test_a_run_on_a_stock_identity_records_no_weights_prefix(tmp_path):
+    identity = write_identity(tmp_path / "voices", trained=False)
+
+    run_suite(tmp_path, request(tmp_path, engines=(CLONE,), voice_dir=identity))
+
+    [load] = read_jsonl(tmp_path / "results" / "mh1" / "speech" / "tts" / "load.jsonl")
+    assert (load["voice_id"], load["voice_weights_sha256"]) == (VOICE_ID, None)
+
+
+def _refused_identity(tmp_path, req) -> str:
+    message = _refused_before_anything(tmp_path, req)
+    for secret in (str(tmp_path), tmp_path.as_posix(), "private-host-name"):
+        assert secret not in message
+    return message
+
+
+def test_run_tts_refuses_an_identity_and_a_clip_together(tmp_path):
+    identity = write_identity(tmp_path / "voices")
+    clip = write_identity_clip(tmp_path / "identity")
+
+    message = _refused_identity(
+        tmp_path, request(tmp_path, engines=(CLONE,), voice_dir=identity, voice_clip=clip)
+    )
+
+    assert "--voice-clip" in message and "--voice-dir" in message
+
+
+def test_run_tts_refuses_an_identity_for_a_run_without_pocket_clone(tmp_path):
+    identity = write_identity(tmp_path / "voices")
+
+    _refused_identity(tmp_path, request(tmp_path, engines=("pocket",), voice_dir=identity))
+
+
+@pytest.mark.parametrize("case", ["missing", "no-manifest", "bad-voice-id"])
+def test_run_tts_refuses_an_unusable_identity_directory(tmp_path, case):
+    folder = tmp_path / "voices" / "private-host-name"
+    if case != "missing":
+        folder.mkdir(parents=True)
+    if case == "bad-voice-id":
+        (folder / "voice.json").write_text(json.dumps({"voice_id": "../up"}), encoding="utf-8")
+
+    _refused_identity(tmp_path, request(tmp_path, engines=(CLONE,), voice_dir=folder))
+
+
+def test_the_docker_runner_logs_the_identity_mount_as_a_placeholder(tmp_path, monkeypatch):
+    identity = write_identity(tmp_path / "voices")
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.stdout = iter(["ready\n"])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(tts_suite.subprocess, "Popen", FakePopen)
+    argv = timed_on_identity(voice_dir=identity.as_posix())
+    log_path = tmp_path / "idle.log"
+
+    code = tts_suite.DockerRunner().run(argv, log_path=log_path, on_line=lambda line: None)
+
+    text = log_path.read_text(encoding="utf-8")
+    assert code == 0
+    assert identity.as_posix() not in text and str(identity) not in text
+    assert f"{core.VOICE_DIR_PLACEHOLDER}:/voice/{VOICE_ID}:ro" in text
 
 
 # ---------------------------------------------------------------------------

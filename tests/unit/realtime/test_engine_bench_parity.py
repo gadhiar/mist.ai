@@ -9,16 +9,25 @@ here to its arm's fields, and each package the arm records to an exact pin in
 index's `+cu124` build, which the Dockerfile installs from the PyTorch index, not from a
 requirements file. The arm's `verified` flag is not required: the engine was picked by ruling,
 and the host measures it (A42).
+
+The bench's `pocket-clone` adapter builds the model config the runtime adapter builds, for a clip
+and for an identity's trained weights and tokenizer, so a benched identity loads the files the
+runtime would load.
 """
 
+import copy
+import hashlib
 import json
 import re
+import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from backend.realtime import voice_assets
 from backend.realtime.engines import nemotron_stt, parakeet_stt, pocket_tts
-from scripts.model_bench.speech.probes import stt_engines
+from scripts.model_bench.speech.probes import stt_engines, tts_engines
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ARMS = json.loads(
@@ -151,3 +160,107 @@ def test_pocket_clone_classes_carry_the_arms_pin():
     assert pin == pocket_tts.MODEL_PIN
     assert pocket_tts.PocketVoiceBuilder.engine_id == "pocket-clone"
     assert pin == pocket_tts.MODEL_PIN
+
+
+# ---------------------------------------------------------------------------
+# The bench's `pocket-clone` config for an identity is the runtime adapter's (plan v5, M17)
+# ---------------------------------------------------------------------------
+
+VOICE_ID = "parity-voice"
+STOCK_TOKENIZER = b"stock tokenizer"
+# pocket-tts 4.0.1's installed `english.yaml`, reduced to the keys `local_config` reads.
+INSTALLED = {
+    "weights_path": pocket_tts.CLONE_MODEL_URI,
+    "weights_path_without_voice_cloning": pocket_tts.MODEL_URI,
+    "flow_lm": {"lookup_table": {"tokenizer_path": pocket_tts.TOKENIZER_URI}},
+    "mimi": {"sample_rate": 24000},
+}
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _stage_models(root: Path) -> Path:
+    """`<root>/speech/<org>/<repo>/...`, the runtime's layout; the bench mounts `<root>/speech`."""
+    for uri in pocket_tts.CONFIG_URIS:
+        org, repo, *rest = uri.removeprefix("hf://").rsplit("@", 1)[0].split("/")
+        path = root.joinpath("speech", org, repo, *rest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(STOCK_TOKENIZER if uri == pocket_tts.TOKENIZER_URI else b"stock weights")
+    return root
+
+
+def _identity(voice_root: Path, kind: str) -> Path:
+    """An identity as `student export` writes it: stock, trained, or trained with a tokenizer."""
+    identity = voice_root / VOICE_ID
+    identity.mkdir(parents=True)
+    rate = 24000
+    frames = (np.sin(2 * np.pi * 220.0 * np.arange(4 * rate) / rate) * 8000).astype("<i2")
+    with wave.open(str(identity / "neutral.wav"), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(frames.tobytes())
+    (identity / "neutral.txt").write_text("a parity line", encoding="utf-8")
+    clip = {
+        "state": "neutral",
+        "audio": "neutral.wav",
+        "transcript": "neutral.txt",
+        "audio_sha256": _sha((identity / "neutral.wav").read_bytes()),
+        "transcript_sha256": _sha(b"a parity line"),
+    }
+    manifest: dict = {"schema": 1, "voice_id": VOICE_ID, "status": "frozen", "clips": [clip]}
+    if kind != "stock":
+        (identity / "model.safetensors").write_bytes(b"trained weights")
+        model = {
+            "engine": pocket_tts.ENGINE_ID,
+            "base": pocket_tts.MODEL_PIN,
+            "weights": "model.safetensors",
+            "sha256": _sha(b"trained weights"),
+            "tokenizer_sha256": _sha(STOCK_TOKENIZER),
+        }
+        if kind == "trained-with-tokenizer":
+            (identity / "tokenizer.json").write_bytes(b"trained tokenizer")
+            model.update(tokenizer="tokenizer.json", tokenizer_sha256=_sha(b"trained tokenizer"))
+        manifest.update(schema=2, model=model)
+    (identity / "voice.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return identity
+
+
+@pytest.mark.parametrize("kind", ["stock", "trained", "trained-with-tokenizer"])
+def test_the_bench_config_for_an_identity_is_the_runtime_adapter_s(tmp_path, kind):
+    models_root = _stage_models(tmp_path / "models")
+    voice_root = tmp_path / "voices"
+    _identity(voice_root, kind)
+    trained = voice_assets.load_identity(voice_root, VOICE_ID).model
+    engine = tts_engines.PocketCloneEngine(
+        "pocket-clone",
+        _arm("tts", "pocket-clone"),
+        models_dir=models_root / "speech",
+        voice_root=voice_root,
+        voice_id=VOICE_ID,
+    )
+
+    bench = engine._local_config(copy.deepcopy(INSTALLED))
+
+    runtime = pocket_tts.local_config(
+        copy.deepcopy(INSTALLED),
+        models_root,
+        None if trained is None else trained.weights_path,
+        None if trained is None else trained.tokenizer_path,
+    )
+    assert bench == runtime
+    if trained is not None:
+        assert bench["weights_path"] == str(trained.weights_path)
+
+
+def test_the_bench_config_for_a_clip_is_the_runtime_adapter_s_stock_config(tmp_path):
+    models_root = _stage_models(tmp_path / "models")
+    engine = tts_engines.PocketCloneEngine(
+        "pocket-clone", _arm("tts", "pocket-clone"), models_dir=models_root / "speech"
+    )
+
+    assert engine._local_config(copy.deepcopy(INSTALLED)) == pocket_tts.local_config(
+        copy.deepcopy(INSTALLED), models_root
+    )

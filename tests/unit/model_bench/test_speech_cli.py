@@ -324,18 +324,20 @@ FORBIDDEN_OPTION_PARTS = (
     "voice-path",
     "voice-sample",
     "voice-clip",
+    "voice-dir",
     "clone",
     "speaker-wav",
 )
 
 
 # The owner's ruling of 12 Nov allows one cloned arm, `pocket-clone`, which clones a private
-# identity clip named at run time and kept outside the checkout. So exactly one option that takes
-# a voice sample exists: `--voice-clip`, on the three subcommands that can run that arm, `tts`,
-# `chain` and `reply-ab` (which voices both replies of an item with it). Any other option holding
-# a listed part, or `--voice-clip` anywhere else, still fails.
+# identity clip named at run time and kept outside the checkout. So one option that takes a voice
+# sample exists on the three subcommands that can run that arm: `--voice-clip`, on `tts`, `chain`
+# and `reply-ab` (which voices both replies of an item with it). Plan v5 (M17) adds a second,
+# `--voice-dir`, a whole identity directory with its trained weights, on `tts` alone. Any other
+# option holding a listed part, or either option anywhere else, still fails.
 ALLOWED_VOICE_SAMPLE_OPTIONS = {
-    "tts": {"voice-clip"},
+    "tts": {"voice-clip", "voice-dir"},
     "chain": {"voice-clip"},
     "reply-ab": {"voice-clip"},
 }
@@ -365,11 +367,19 @@ def test_no_option_takes_a_voice_sample_but_voice_clip_on_tts_chain_and_reply_ab
     assert hits == []
     for name in ALLOWED_VOICE_SAMPLE_OPTIONS:
         assert "voice-clip" in _normalised(speech_bench.all_option_strings(subcommands[name]))
+    with_voice_dir = [
+        name
+        for name, sub in subcommands.items()
+        if "voice-dir" in _normalised(speech_bench.all_option_strings(sub))
+    ]
+    assert with_voice_dir == ["tts"]
     assert "host-1070-script" in _normalised(speech_bench.all_option_strings(parser))
 
 
 def test_the_narrowed_check_still_fails_on_any_other_voice_sample_option():
     assert _hits({"--voice-clip"}) == ["voice-clip"]
+    assert _hits({"--voice-dir"}) == ["voice-dir"]
+    assert _hits({"--voice-dir", "--voice-clip"}, {"voice-clip"}) == ["voice-dir"]
     assert _hits({"--voice-clip", "--clone-from"}, {"voice-clip"}) == ["clone-from"]
     assert _hits({"--speaker-wav", "--voice-clip"}, {"voice-clip"}) == ["speaker-wav"]
 
@@ -483,3 +493,83 @@ def test_tts_without_an_engine_runs_pocket_clone_only_with_a_clip(
         assert request.engines == tuple(a for a in arms if a != "pocket-clone")
         assert request.voice_clip is None
     assert str(clip.parent) not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# --voice-dir: an identity directory on `tts` only, exclusive with --voice-clip
+# ---------------------------------------------------------------------------
+
+
+def write_voice_dir(root: Path) -> Path:
+    """An identity directory under a private host folder name, with its manifest."""
+    folder = root / "private-voice-folder"
+    folder.mkdir(parents=True)
+    (folder / "voice.json").write_text('{"schema": 1, "voice_id": "mist"}', encoding="utf-8")
+    (folder / "neutral.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    return folder
+
+
+def _tts_argv(tmp_path: Path, *extra: str) -> list[str]:
+    argv = ["tts", "--results-root", str(tmp_path / "results"), "--run", "mh1"]
+    return [*argv, "--speech-models-dir", str(tmp_path), *extra]
+
+
+def test_tts_refuses_voice_clip_and_voice_dir_together(tmp_path, monkeypatch, capsys):
+    from scripts.model_bench.speech import tts_suite
+
+    monkeypatch.setattr(tts_suite, "run_tts", _explode)
+    clip = write_identity_clip(tmp_path)
+    folder = write_voice_dir(tmp_path)
+
+    with pytest.raises(SystemExit) as info:
+        speech_bench.main(
+            _tts_argv(tmp_path, "--voice-clip", str(clip), "--voice-dir", str(folder))
+        )
+
+    assert info.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+    assert not (tmp_path / "results").exists()
+
+
+@pytest.mark.parametrize("case", ["another-engine", "missing-dir"])
+def test_voice_dir_misuse_exits_2_before_any_container_or_write(
+    tmp_path, monkeypatch, capsys, case
+):
+    from scripts.model_bench.speech import tts_suite
+
+    monkeypatch.setattr(tts_suite, "DockerRunner", ExplodingRunner)
+    monkeypatch.setattr(tts_suite.bench_host, "probe_container_state", _explode)
+    folder = write_voice_dir(tmp_path)
+    engine = "pocket" if case == "another-engine" else "pocket-clone"
+    target = folder if case == "another-engine" else folder.parent / "absent-folder"
+
+    code = speech_bench.main(_tts_argv(tmp_path, "--engine", engine, "--voice-dir", str(target)))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "[REFUSED]" in captured.out
+    for text in (captured.out, captured.err):
+        for secret in (str(target), target.as_posix(), folder.name, "absent-folder", TRANSCRIPT):
+            assert secret not in text
+    assert not (tmp_path / "results").exists()
+
+
+def test_tts_without_an_engine_runs_pocket_clone_with_an_identity(tmp_path, monkeypatch):
+    from scripts.model_bench.speech import core, tts_suite
+
+    seen = {}
+
+    def run_tts(request, **kwargs):
+        seen["request"] = request
+        return tmp_path / "tts"
+
+    monkeypatch.setattr(tts_suite, "run_tts", run_tts)
+    folder = write_voice_dir(tmp_path)
+
+    code = speech_bench.main(_tts_argv(tmp_path, "--voice-dir", str(folder)))
+
+    assert code == 0
+    request = seen["request"]
+    assert request.engines == tuple(core.load_json(core.SPEECH_ARMS_PATH)["tts"])
+    assert (request.voice_dir, request.voice_clip) == (folder, None)
+    assert str(folder) not in repr(request)
