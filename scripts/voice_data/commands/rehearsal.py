@@ -484,8 +484,6 @@ def find_clean_run(root: root_mod.Root, run: str) -> str | None:
 def _labels(root: root_mod.Root, run: str) -> frozenset[str] | None:
     # The ids of extract run `run`'s labelled segments that no label removes, so the impostor's
     # `in_labels` still counts its segments that reached the seed as hers.
-    from .. import labels as labels_mod
-
     labels = labels_mod.read_labels(root, run)
     if labels is None:
         return None
