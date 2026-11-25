@@ -151,9 +151,13 @@ def sha256(path: Path) -> str:
 # The corpus T4 builds, the cache and the clone.
 
 
-def write_corpus(root: root_mod.Root) -> dict[str, list[str]]:
-    """Write a built corpus: splits naming teacher takes and seed segments, and its manifest."""
-    takes = [f"teachers/omnivoice/{TAKES_RUN}/takes/take-{k:04d}.flac" for k in range(6)]
+def write_corpus(root: root_mod.Root, runs: Sequence[str] = (TAKES_RUN,)) -> dict[str, list[str]]:
+    """Write a built corpus: splits naming teacher takes and seed segments, and its manifest.
+
+    One run gives a schema-1 manifest, as `corpus build` wrote before corpora combined runs;
+    more give a schema-2 manifest, its takes spread over the runs in turn.
+    """
+    takes = [f"teachers/omnivoice/{runs[k % len(runs)]}/takes/take-{k:04d}.flac" for k in range(6)]
     segments = [f"seed/runs/{SEED_RUN}/audio/seg-{k:06d}.flac" for k in range(2)]
     for rel in takes + segments:
         path = root.path / rel
@@ -176,8 +180,10 @@ def write_corpus(root: root_mod.Root) -> dict[str, list[str]]:
         {"rel": f"corpus/{CORPUS}/{name}", "sha256": sha256(folder / name)}
         for name in ("train_aligned.jsonl", "valid_aligned.jsonl")
     ]
-    manifest = {"schema": 1, "version": CORPUS, "takes_run": TAKES_RUN, "seed_run": SEED_RUN,
-                "files": files}  # fmt: skip
+    named = {"schema": 1, "takes_run": runs[0]} if len(runs) == 1 else {
+        "schema": 2, "takes_runs": list(runs)
+    }  # fmt: skip
+    manifest = {**named, "version": CORPUS, "seed_run": SEED_RUN, "files": files}
     write_json(root, f"corpus/{CORPUS}/manifest.json", manifest)
     return {"takes": takes, "segments": segments}
 
@@ -705,6 +711,54 @@ def test_probe_refuses_a_corpus_without_a_manifest(
     (root.path / "corpus" / CORPUS / "manifest.json").unlink()
     result = probe(root, clone)
     assert result.code == 2 and "corpus build" in result.err
+    assert not result.docker.argvs
+
+
+TAKES_RUN2 = "g2"
+
+
+def test_probe_mounts_every_teacher_run_of_a_two_run_corpus(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    clips = write_corpus(root, runs=(TAKES_RUN, TAKES_RUN2))
+    result = probe(root, clone)
+    assert result.code == 0, result.err + result.log
+    inputs = {i["rel"]: i["sha256"] for i in result.job["inputs"]}
+    folders = [f"teachers/omnivoice/{TAKES_RUN}", f"teachers/omnivoice/{TAKES_RUN2}",
+               f"seed/runs/{SEED_RUN}"]  # fmt: skip
+    assert list(inputs) == [
+        f"corpus/{CORPUS}/train_aligned.jsonl", f"corpus/{CORPUS}/valid_aligned.jsonl", *folders
+    ]  # fmt: skip
+    for folder in folders:
+        mine = sorted(rel for rel in clips["takes"] + clips["segments"] if rel.startswith(folder))
+        assert mine
+        parts = [sha256(root.path / rel) for rel in mine]
+        assert inputs[folder] == hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _manifest(root: root_mod.Root, change: dict) -> None:
+    path = root.path / "corpus" / CORPUS / "manifest.json"
+    doc = read(path)
+    doc.update(change)
+    path.write_text(json.dumps({k: v for k, v in doc.items() if v is not None}), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"takes_runs": [TAKES_RUN]}, "unmounted"),
+        ({"takes_runs": None, "takes_run": TAKES_RUN}, "names no teacher run"),
+        ({"takes_runs": [TAKES_RUN, "../x"]}, "one folder name"),
+    ],
+    ids=["a-run-left-out", "schema-1-key", "bad-id"],
+)
+def test_probe_refuses_a_two_run_corpus_whose_manifest_does_not_match_its_rows(
+    root: root_mod.Root, hub: Hub, clone: Path, change: dict, message: str
+) -> None:
+    write_corpus(root, runs=(TAKES_RUN, TAKES_RUN2))
+    _manifest(root, change)
+    result = probe(root, clone)
+    assert result.code == 2 and message in result.err, result.err
     assert not result.docker.argvs
 
 
