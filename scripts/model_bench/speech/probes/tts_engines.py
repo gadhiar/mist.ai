@@ -432,7 +432,23 @@ class PocketCloneEngine(PocketEngine):
         model = self._load_local_model()
         if getattr(model, "has_voice_cloning", None) is not True:
             raise core.SpeechBenchError(f"{self.name}: the model loaded without voice cloning")
+        if self.voice_id is not None:
+            self._check_trained_rate(int(model.sample_rate))
         return model
+
+    def _check_trained_rate(self, rate: int) -> None:
+        """Refuse trained weights not at the runtime's rate, as `PocketCloneSynthesizer.load` does.
+
+        Raises:
+            VoiceError: the identity's trained weights run at another rate than the adapter's.
+        """
+        identity = self._load_identity()
+        expected = int(self._import(RUNTIME_POCKET_MODULE).MODEL_RATE)
+        if identity.model is not None and rate != expected:
+            raise VoiceError(
+                f"{self.name}: voice identity {identity.voice_id!r}: model: the trained weights "
+                f"run at {rate} Hz, not {expected} Hz"
+            )
 
     def _load_identity(self) -> object:
         """The identity `voice_id` names, loaded once and checked as the runtime adapter checks it.

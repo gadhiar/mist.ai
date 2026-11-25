@@ -1647,6 +1647,43 @@ def test_the_identity_adapter_refuses_what_the_runtime_refuses_before_loading(
     assert "load_model" not in [call[0] for call in rec.calls]
 
 
+def _loading_at(modules, rate: int) -> None:
+    """Make the fake library's model load at `rate` Hz."""
+    tts_model = modules["pocket_tts"].TTSModel
+    load = tts_model.load_model
+
+    def load_at_rate(**kwargs):
+        model = load(**kwargs)
+        model.sample_rate = rate
+        return model
+
+    tts_model.load_model = staticmethod(load_at_rate)
+
+
+def test_the_identity_adapter_refuses_trained_weights_not_at_24_khz_as_the_runtime_does(
+    tmp_path,
+):
+    rec = Recorder()
+    adapter, modules, _, _ = identity_adapter(tmp_path, rec)
+    _loading_at(modules, 22050)
+
+    with pytest.raises(tts_engines.VoiceError, match="22050 Hz, not 24000 Hz") as info:
+        adapter.load(core.IDENTITY_VOICE)
+
+    assert str(tmp_path) not in str(info.value)
+    assert "state" not in [call[0] for call in rec.calls]
+
+
+def test_a_stock_identity_is_not_held_to_the_trained_weights_rate(tmp_path):
+    rec = Recorder()
+    adapter, modules, _, _ = identity_adapter(tmp_path, rec, trained=False)
+    _loading_at(modules, 22050)
+
+    adapter.load(core.IDENTITY_VOICE)
+
+    assert adapter.sample_rate == 22050
+
+
 def test_the_identity_adapter_refuses_a_broken_identity_naming_no_private_path(tmp_path):
     rec = Recorder()
     adapter, _, _, identity = identity_adapter(tmp_path, rec)

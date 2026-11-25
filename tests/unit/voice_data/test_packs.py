@@ -2,8 +2,9 @@
 
 Records the packs read that later tasks produce (bake-off takes, `gains.json`, spot-check takes,
 the ABX manifest, the labels pre-fill, the voice A/B bench run) are built here from the
-Interfaces shapes with synthetic data. Clips are small synthetic FLAC files: a real STREAMINFO header and an opaque payload unique
-to each clip, so the byte-identity check is meaningful and no audio processing is needed.
+Interfaces shapes with synthetic data. Clips are small synthetic FLAC files: a real STREAMINFO
+header and an opaque payload unique to each clip, so the byte-identity check is meaningful and no
+audio processing is needed.
 """
 
 from __future__ import annotations

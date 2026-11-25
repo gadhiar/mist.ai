@@ -3,8 +3,9 @@
 A pack is a static page, `packs/<pack_id>/index.html`, with its clips in `clips/` beside it and
 the key that ties each seeded label to what made it in `packs/<pack_id>.key/`. Seven kinds share
 one page template, driven by the page data: `labels`, `clean-ab`, `text`, `bakeoff`, `spotcheck`,
-`abx` and `voice-ab`. Raj rates the page in a browser and exports `ratings.csv`; `pack import` checks that every
-item is rated before it opens the key, then writes the records later stages read.
+`abx` and `voice-ab`. Raj rates the page in a browser and exports `ratings.csv`; `pack import`
+checks that every item is rated before it opens the key, then writes the records later stages
+read.
 
 The `labels` pack asks, per kept clip of one extract run, who is audible, a keep range for a clip
 with other voices nearby, her energy and mood, tags and an optional note, pre-filled from
