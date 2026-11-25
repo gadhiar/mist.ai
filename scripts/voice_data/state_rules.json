@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "about": "State proposals (T7): each kept segment of a run is placed by its arousal quantile within the run and the z-scores of its F0 mean, speech rate and active energy within the run, and proposed the state whose centre is nearest under the feature weights. The margin is the distance to the second-nearest centre less the distance to the nearest. Raj confirms every proposal in the labels pack, so these numbers order the pack and set defaults; they gate nothing.",
+  "about": "State proposals (T7): each kept segment of a run is placed by its arousal quantile within the run and the z-scores of its F0 mean, speech rate and active energy within the run, and proposed the state whose centre is nearest under the feature weights. The margin is the distance to the second-nearest centre less the distance to the nearest. The proposal is recorded on each segment as state_proposed and scored by the rehearsal against its ground truth; it no longer sets the labels pack's defaults, which come from the labels pre-fill. These numbers gate nothing.",
   "features": {
     "arousal_q": {"weight": 4.0, "[E]": "weight of the arousal quantile (0..1) against the z-scores; H6 calibrates on the rehearsal"},
     "f0_z": {"weight": 1.0, "[E]": "weight of the F0-mean z-score; H6 calibrates on the rehearsal"},
