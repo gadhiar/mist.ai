@@ -589,6 +589,15 @@ def _run1(inp: Inputs) -> dict:
                     n=len(rows),
                     keys=keys,
                 ),
+            ]
+            # The probe's resident peak (`VmHWM`), beside the GPU peak; rows from before the
+            # probe read it carry no key and get no figure, rows where it was unreadable null.
+            if any("rss_peak_mib" in r for r in rows):
+                rss = _nums(r.get("rss_peak_mib") for r in rows)
+                figs.append(
+                    value_fig("peak RSS", max(rss, default=None), "MiB", n=len(rss), keys=keys)
+                )
+            figs += [
                 summary_fig(
                     "first audio, acknowledgements (kept out of the line figures)",
                     (r.get("first_audio_ms") for r in rows if r.get("kind") == "ack"),

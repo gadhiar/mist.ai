@@ -758,7 +758,8 @@ container mounts its model files read-only from the speech or small models direc
 stock voice its package ships, and `voice-design` designs its candidate voices from text
 descriptions. The one exception is `pocket-clone`, which clones the identity clip that
 `--voice-clip` names at run time; only `tts`, `chain` and `reply-ab` take that option, the clip
-stays outside the repository, and results record its sha256 prefix, never its path.
+stays outside the repository, and results record its sha256 prefix, never its path. `tts` alone
+also takes `--voice-dir`, an identity directory, on the same terms.
 
 Results go to `<results-root>/<run>/speech/`, one directory per suite (`tts/`, `cache/`, `stt/`,
 `turn/`, `fit/`, `lowtier/`, `host1070/`, `chain/`, `game/`, `listening/`, `reply-ab/`), with
@@ -776,7 +777,7 @@ directory and a `reply-ab` pack inside it, and no suite overwrites an earlier ru
 | `selftest` | Runs each suite's self-checks against the committed fixtures; prints `selftest ok`. |
 | `prepare` | Converts Raj's recordings in `--material-dir` to 16 kHz mono WAV and writes `manifest.json`. |
 | `small-serve`, `small-unserve` | Starts or removes `mist-bench-small` for a model and placement, timing load and unload. |
-| `tts` | Run 1: speech first audio and compute per second of speech, each engine in its stock voice; `--extra-voice ENGINE:VOICE` adds an untimed stock voice for listening. |
+| `tts` | Run 1: speech first audio and compute per second of speech, each engine in its stock voice; `--extra-voice ENGINE:VOICE` adds an untimed stock voice for listening. `pocket-clone` speaks as `--voice-clip <wav>` or, exclusively, `--voice-dir <identity dir>`: a whole identity, trained weights included, mounted read-only at `/voice/<voice_id>` and loaded with the runtime adapter's own config; its rows record the voice id and the weights' sha256 prefix, never the path. Every load and sample row carries `rss_peak_mib`, the probe's resident peak (`VmHWM`, null where unreadable), which the report prints as `peak RSS` beside the peak GPU memory reserved. |
 | `cache` | Run 2: the prompt cache against the arm `bench_host serve` started. |
 | `stt` | Run 3: final-text time and word error rate. |
 | `turn` | Run 4: Smart Turn's verdict and inference time at every decision point. |

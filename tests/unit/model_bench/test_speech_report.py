@@ -183,6 +183,61 @@ def test_first_audio_is_marked_against_250_and_500_ms(tmp_path):
         assert fig["mark"] == report.mark(fig["median"], report.TTS_FIRST_AUDIO)
 
 
+def _with_rss(speech: Path, readings: dict) -> None:
+    """Give the tts rows of each (engine, condition) in `readings` its list of RSS readings."""
+    path = speech / "tts" / "samples.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    pending = {key: list(values) for key, values in readings.items()}
+    for row in rows:
+        key = (row["engine"], row["condition"])
+        if pending.get(key):
+            row["rss_peak_mib"] = pending[key].pop(0)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _run1_figures(numbers: dict, engine: str, condition: str) -> list[dict]:
+    want = {"engine": engine, "condition": condition}
+    return [
+        f
+        for t in _run(numbers, 1)["tables"]
+        for f in t["figures"]
+        if {k: f.get("keys", {}).get(k) for k in want} == want
+    ]
+
+
+def test_run_1_prints_the_rss_peak_beside_the_peak_reserved_figure(tmp_path):
+    root = _tree(tmp_path)
+    _with_rss(_speech(root), {("qwen3", "idle"): [1500.0, None, 1720.25]})
+
+    numbers, text = report.build_report(_speech(root), run=RUN, git_sha="x")
+
+    labels = [f["label"] for f in _run1_figures(numbers, "qwen3", "idle")]
+    rss = next(f for f in _run1_figures(numbers, "qwen3", "idle") if f["label"] == "peak RSS")
+    assert labels[labels.index("peak GPU memory reserved") + 1] == "peak RSS"
+    # The highest reading, over the rows that carry one.
+    assert (rss["value"], rss["unit"], rss["n"]) == (1720.25, "MiB", 2)
+    assert "| qwen3 | aiden | idle | peak RSS | 1,720 MiB |" in text
+
+
+def test_run_1_shows_no_rss_figure_for_rows_from_before_the_figure_existed(tmp_path):
+    root = _tree(tmp_path)
+    _with_rss(_speech(root), {("qwen3", "idle"): [1500.0]})
+
+    numbers, _ = report.build_report(_speech(root), run=RUN, git_sha="x")
+
+    assert "peak RSS" not in [f["label"] for f in _run1_figures(numbers, "qwen3", "decoding")]
+
+
+def test_run_1_marks_an_unreadable_rss_peak_as_no_data(tmp_path):
+    root = _tree(tmp_path)
+    _with_rss(_speech(root), {("qwen3", "idle"): [None]})
+
+    numbers, _ = report.build_report(_speech(root), run=RUN, git_sha="x")
+
+    rss = next(f for f in _run1_figures(numbers, "qwen3", "idle") if f["label"] == "peak RSS")
+    assert rss["value"] is None and rss["n"] == 0
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(250, "target met"), (250.5, "floor met"), (500, "floor met"), (501, "over floor")],
@@ -490,6 +545,14 @@ def test_the_readme_speech_section_names_every_subcommand():
     assert sorted(n for n in names if f"`{n}`" not in section) == []
     assert "`--replace`" in section
     assert "`--larger-models`" in section
+
+
+def test_the_readme_tts_row_names_the_identity_option_and_the_rss_figure():
+    [row] = [line for line in _speech_section().splitlines() if line.startswith("| `tts` |")]
+
+    assert "`--voice-dir " in row
+    assert "`--voice-clip " in row
+    assert "`rss_peak_mib`" in row
 
 
 def test_the_readme_speech_section_names_no_voice_profile_path():

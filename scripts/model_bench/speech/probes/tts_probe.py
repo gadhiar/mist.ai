@@ -24,6 +24,11 @@ whole line, and both times are recorded. CUDA work is synchronized before every 
 every timestamp is `time.perf_counter` inside this container. Compute per second of speech is the
 whole line's synthesis time over its audio seconds.
 
+Memory: the load row and every sample row carry `rss_peak_mib`, the process's `VmHWM` from
+`/proc/self/status` read just after the load and just after each timed item, null where that
+file cannot be read. `--voice-id <id>` (any mode, `pocket-clone` only) makes the engine speak as
+the identity directory mounted at `/voice/<id>`.
+
 Exit codes: 0 done, 2 refused before any write (an unknown line, a voice the engine does not
 list, a setting it does not have), 1 failed. numpy and torch are imported only when used, so the
 host's selftest can import this module.
@@ -153,6 +158,30 @@ def default_device(engine: object) -> NoDevice | TorchCuda:
     return NoDevice()
 
 
+# The kernel's per-process status file; `VmHWM` is the resident set's high-water mark.
+PROC_STATUS = Path("/proc/self/status")
+_KIB_PER_MIB = 1024
+
+
+def rss_peak_mib(status: Path = PROC_STATUS) -> float | None:
+    """The probe process's peak resident memory (`VmHWM`) in MiB, or None where unreadable.
+
+    The kernel keeps the high-water mark, so a reading after the load and after each sample
+    covers the whole process to that point: the model, the voice state and every synthesis.
+    """
+    try:
+        text = status.read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("VmHWM:"):
+            parts = line.split()
+            if len(parts) == 3 and parts[1].isdigit() and parts[2] == "kB":
+                return int(parts[1]) / _KIB_PER_MIB
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Timing one item
 # ---------------------------------------------------------------------------
@@ -274,6 +303,7 @@ class ProbeEnv:
     clock: Clock
     wall: Clock
     emit: Callable[[str], None]
+    rss: Callable[[], float | None] = rss_peak_mib
 
 
 def _rel(engine_id: str, *parts: str) -> str:
@@ -306,6 +336,7 @@ def run_timed(engine, device, env: ProbeEnv, *, condition, item_ids, repeats, se
                 "streaming": bool(engine.streaming),
                 "sample_rate": engine.sample_rate,
                 "load_s": load_s,
+                "rss_peak_mib": env.rss(),
             }
         )
         warm = [text_for(env.items[i], env.cfg) for i in item_ids if i not in env.acks]
@@ -343,6 +374,7 @@ def run_timed(engine, device, env: ProbeEnv, *, condition, item_ids, repeats, se
                     "audio_s": timing.audio_s,
                     "compute_per_speech_s": timing.compute_per_speech_s,
                     "torch_peak_reserved_mib": timing.torch_peak_reserved_mib,
+                    "rss_peak_mib": env.rss(),
                     "t_start_unix": timing.t_start_unix,
                     "t_end_unix": timing.t_end_unix,
                     "wav": _rel(env.engine_id, "audio", name),
@@ -420,6 +452,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expressive", action="store_true", help="render: the expressive setting")
     parser.add_argument("--line-id", help="loop: the line to synthesize")
     parser.add_argument("--seconds", type=float, help="loop: how long to keep synthesizing")
+    parser.add_argument(
+        "--voice-id",
+        help=f"{core.VOICE_CLIP_ENGINE}: speak as the identity mounted at "
+        f"{tts_engines.CONTAINER_VOICE_ROOT}/<id>",
+    )
     return parser
 
 
@@ -431,6 +468,10 @@ def _check_request(args, cfg, items) -> list[str]:
     """Everything the probe refuses, checked before the engine is built or a file is written."""
     if args.repeats < 1:
         raise RefusedError(f"--repeats must be at least 1, got {args.repeats}")
+    if args.voice_id is not None and args.engine != core.VOICE_CLIP_ENGINE:
+        raise RefusedError(
+            f"--voice-id is for {core.VOICE_CLIP_ENGINE} only; {args.engine} has its own voices"
+        )
     # `items` keeps the file's order (lines, then acknowledgements); `acks` is a set, whose order
     # would change with string hashing and break the seeded order.
     selected = list(args.lines) if args.lines else list(items)
@@ -465,6 +506,7 @@ def main(
     wall: Clock = time.time,
     device_factory: Callable[[object], object] | None = None,
     emit: Callable[[str], None] | None = None,
+    rss: Callable[[], float | None] = rss_peak_mib,
 ) -> int:
     args = build_parser().parse_args(argv)
     say = emit or _print_flush
@@ -481,10 +523,12 @@ def main(
         print(f"[REFUSED] {exc}", file=sys.stderr, flush=True)
         return 2
 
-    env = ProbeEnv(args.engine, cfg, items, acks, clock, wall, say)
+    env = ProbeEnv(args.engine, cfg, items, acks, clock, wall, say, rss)
     try:
         if engine_factory is None:
-            engine = tts_engines.make_engine(args.engine, models_dir=args.models_dir)
+            engine = tts_engines.make_engine(
+                args.engine, models_dir=args.models_dir, voice_id=args.voice_id
+            )
         else:
             engine = engine_factory(args.engine, args.models_dir)
         device = (device_factory or default_device)(engine)
