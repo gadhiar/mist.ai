@@ -31,6 +31,7 @@ from scripts.voice_data import cli, jobs, text_corpus
 from scripts.voice_data import root as root_mod
 from scripts.voice_data.commands import corpus as corpus_cmd
 from scripts.voice_data.commands import teacher as teacher_cmd
+from scripts.voice_data.errors import InputError
 from scripts.voice_data.records import (
     Prosody,
     SegmentRecord,
@@ -77,10 +78,16 @@ def write_audio(path: Path, seconds: float) -> None:
     sf.write(str(path), tone(seconds), RATE, format="FLAC", subtype="PCM_16")
 
 
-def write_lines(root: root_mod.Root, texts: dict[str, str] | None = None) -> None:
+def write_lines(
+    root: root_mod.Root,
+    texts: dict[str, str] | None = None,
+    *,
+    text: str = TEXT,
+    lines: Sequence[str] = LINES,
+) -> None:
     texts = texts or {}
-    rows = [{"line_id": i, "state": "neutral", "text": texts.get(i, line_text(i))} for i in LINES]
-    path = root.path / "text" / TEXT / "lines.jsonl"
+    rows = [{"line_id": i, "state": "neutral", "text": texts.get(i, line_text(i))} for i in lines]
+    path = root.path / "text" / text / "lines.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 
@@ -89,14 +96,21 @@ def take_seconds(index: int, take: int) -> float:
     return 2.0 + 0.25 * (index % 3) + 0.1 * take
 
 
-def write_takes(root: root_mod.Root, *, floor_from: str = "seed") -> list[TakeRecord]:
+def write_takes(
+    root: root_mod.Root,
+    *,
+    floor_from: str = "seed",
+    run: str = RUN,
+    text: str = TEXT,
+    lines: Sequence[str] = LINES,
+) -> list[TakeRecord]:
     """Write a scored run: per line a selected take, a kept unselected one and a rejected one."""
     takes = []
-    for index, line in enumerate(LINES):
+    for index, line in enumerate(lines):
         for k in range(3):
             seed = teacher_cmd.take_seed(line, 1, k)
             take = teacher_cmd.take_id(line, seed)
-            audio = teacher_cmd.take_audio_rel(RUN, take)
+            audio = teacher_cmd.take_audio_rel(run, take)
             write_audio(root.path / audio, take_seconds(index, k))
             selected = k == 0 or (line == TWO_SELECTED and k == 1)
             takes.append(
@@ -107,19 +121,19 @@ def write_takes(root: root_mod.Root, *, floor_from: str = "seed") -> list[TakeRe
                     selected=selected, reasons=() if k < 2 else ("cer",),
                 )  # fmt: skip
             )
-    write_jsonl(root, f"{teacher_cmd.run_rel(RUN)}/takes.jsonl", takes)
+    write_jsonl(root, f"{teacher_cmd.run_rel(run)}/takes.jsonl", takes)
     floor: dict[str, object] = (
         {"from": "seed", "target": TARGET, "values": {"wavlm-sv": 0.5, "ecapa": 0.5},
-         "centroid_sha256": {}}
+         "centroid_sha256": {"wavlm-sv": "a" * 64, "ecapa": "b" * 64}}
         if floor_from == "seed"
         else {"from": "round-1-takes", "target": None, "percentile": 10.0}
     )  # fmt: skip
     plan = {
-        "schema": 1, "run": RUN, "teacher": "omnivoice", "state": "neutral",
-        "lines_file": f"text/{TEXT}/lines.jsonl", "anchor": {}, "embedders": [],
+        "schema": 1, "run": run, "teacher": "omnivoice", "state": "neutral",
+        "lines_file": f"text/{text}/lines.jsonl", "anchor": {"voice": VOICE}, "embedders": [],
         "cer_max": 0.03, "floor": floor, "centroids": None, "profile": None, "spread": None,
     }  # fmt: skip
-    write_json(root, f"{teacher_cmd.run_rel(RUN)}/score-plan.json", plan)
+    write_json(root, f"{teacher_cmd.run_rel(run)}/score-plan.json", plan)
     return takes
 
 
@@ -299,17 +313,22 @@ class Result:
 
 
 def build(
-    root: root_mod.Root, *args: str, aligner: FakeAligner | None = None, version: str = VERSION
+    root: root_mod.Root,
+    *args: str,
+    aligner: FakeAligner | None = None,
+    version: str = VERSION,
+    runs: Sequence[str] = (RUN,),
 ) -> Result:
     docker = StageDocker(root, aligner or FakeAligner())
     out, err = _Capture(), _Capture()
+    takes = [arg for run in runs for arg in ("--takes", run)]
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(corpus_cmd, "make_docker", lambda: docker)
         mp.setattr(corpus_cmd, "image_tag", lambda family: IMAGE)
         mp.delenv(jobs.GPU_PEERS_ENV, raising=False)
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(
-                ["--root", str(root.path), "corpus", "build", "--takes", RUN, "--version", version,
+                ["--root", str(root.path), "corpus", "build", *takes, "--version", version,
                  *args]
             )  # fmt: skip
     result = Result(code, out.getvalue(), err.getvalue(), docker)
@@ -581,7 +600,9 @@ def test_manifest_records_hours_shares_and_file_hashes(root: root_mod.Root, hub:
     assert manifest["oversample"] == 3
     assert manifest["val_fraction"] == 0.02
     assert manifest["unaligned"] == {"teacher": 0, "seed": 0}
-    assert manifest["takes_run"] == RUN and manifest["seed_run"] == SEED_RUN
+    assert manifest["schema"] == 2 and "takes_run" not in manifest
+    assert manifest["takes_runs"] == [RUN] and manifest["seed_run"] == SEED_RUN
+    assert manifest["teacher_hours_by_run"] == {RUN: manifest["teacher_hours"]}
     assert manifest["aligner"] == {
         "repository": "facebook/wav2vec2-base-960h", "revision": ALIGNER["revision"],
         "device": "cuda", "batch_size": 8,
@@ -834,6 +855,368 @@ def test_the_stage_refuses_a_plan_without_a_seed_val_share(
     edit_plan(root, {"seed_val_share": value})
     with pytest.raises(stage.StageError, match="seed_val_share"):
         stage.run(root.path, VERSION, "cpu", 8)
+
+
+# A corpus from several teacher runs.
+
+RUN2 = "g2"
+TEXT2 = "v2"
+LINES2 = tuple(f"line-{n:04d}" for n in range(101, 109))
+THRESHOLDS = {"take.cer_max": 0.03, "take.rounds_max": 3}
+
+
+def write_generate_plan(root: root_mod.Root, run: str, text: str, **change: object) -> None:
+    plan = {
+        "schema": 1, "run": run, "teacher": "omnivoice", "state": "neutral", "text": text,
+        "lines_file": f"text/{text}/lines.jsonl", "line_ids": [], "anchor": {"voice": VOICE},
+        "take_n": 3, "rounds_max": 3, "thresholds": THRESHOLDS,
+    }  # fmt: skip
+    plan.update(change)
+    write_json(root, f"{teacher_cmd.run_rel(run)}/generate-plan.json", plan)
+
+
+def add_second_run(
+    root: root_mod.Root, *, texts: dict[str, str] | None = None, floor_from: str = "seed"
+) -> list[TakeRecord]:
+    """Add run g2 over text v2, made as g1 was but for one round and the newer text gate."""
+    write_lines(root, texts, text=TEXT2, lines=LINES2)
+    takes = write_takes(root, run=RUN2, text=TEXT2, lines=LINES2, floor_from=floor_from)
+    write_generate_plan(root, RUN, TEXT)
+    newer = {**THRESHOLDS, "text.line_chars_min": 80}
+    write_generate_plan(root, RUN2, TEXT2, rounds_max=1, thresholds=newer)
+    return takes
+
+
+TWO = (RUN, RUN2)
+
+
+def edit_json(root: root_mod.Root, rel: str, change: Callable[[dict], None]) -> None:
+    path = root.path / rel
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    change(doc)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def plan_of(root: root_mod.Root, version: str = VERSION) -> dict:
+    path = root.path / "corpus" / version / "corpus-plan.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_two_runs_of_two_text_versions_combine(root: root_mod.Root, hub: dict) -> None:
+    first = selected_takes(write_takes(root))
+    second = selected_takes(add_second_run(root))
+    result = build(root, runs=TWO)
+    assert result.code == 0, result.err
+    rows = rows_of(root, "train_aligned.jsonl") + rows_of(root, "valid_aligned.jsonl")
+    take_paths = by_path(root, [t.audio for t in first + second])
+    assert sorted({r["path"] for r in rows if r["path"] in take_paths}) == sorted(take_paths)
+    texts = {str(root.path / t.audio): line_text(t.line_id) for t in first + second}
+    assert all(r["transcript"] == texts[r["path"]] for r in rows if r["path"] in texts)
+    plan = plan_of(root)
+    assert plan["schema"] == 2
+    assert "takes_run" not in plan and "lines_file" not in plan
+    assert plan["takes_runs"] == [
+        {"run": RUN, "lines_file": f"text/{TEXT}/lines.jsonl"},
+        {"run": RUN2, "lines_file": f"text/{TEXT2}/lines.jsonl"},
+    ]
+    assert plan["takes"] == [
+        {"take_id": t.take_id, "line_id": t.line_id, "audio": t.audio, "run": run}
+        for run, takes in ((RUN, first), (RUN2, second))
+        for t in takes
+    ]
+    assert plan["seed_run"] == SEED_RUN
+    manifest = manifest_of(root)
+    assert manifest["schema"] == 2 and "takes_run" not in manifest
+    assert manifest["takes_runs"] == [RUN, RUN2]
+    by_run = manifest["teacher_hours_by_run"]
+    assert list(by_run) == [RUN, RUN2]
+    for run, takes in ((RUN, first), (RUN2, second)):
+        seconds = sum(seconds_of(root, t.audio) for t in takes)
+        assert by_run[run] == pytest.approx(seconds / 3600, abs=1e-6)
+    assert manifest["teacher_hours"] == pytest.approx(sum(by_run.values()), abs=1e-5)
+    assert manifest["teacher_takes"] == len(first) + len(second)
+    assert manifest["teacher_lines"] == len(LINES) + len(LINES2)
+
+
+def test_runs_are_read_in_the_order_given(root: root_mod.Root, hub: dict) -> None:
+    add_second_run(root)
+    assert build(root, runs=(RUN2, RUN)).code == 0
+    assert [r["run"] for r in plan_of(root)["takes_runs"]] == [RUN2, RUN]
+    assert manifest_of(root)["takes_runs"] == [RUN2, RUN]
+
+
+def test_two_runs_hold_out_lines_from_their_union(root: root_mod.Root, hub: dict) -> None:
+    set_gates(root, val_fraction=0.25)
+    takes = selected_takes(write_takes(root)) + selected_takes(add_second_run(root))
+    line_of = {str(root.path / t.audio): t.line_id for t in takes}
+
+    def splits(version: str, *args: str) -> tuple[set[str], set[str]]:
+        result = build(root, *args, version=version, runs=TWO)
+        assert result.code == 0, result.err
+        folder = root.path / "corpus" / version
+        found = []
+        for name in ("train_aligned.jsonl", "valid_aligned.jsonl"):
+            rows = [json.loads(r) for r in (folder / name).read_text("utf-8").splitlines() if r]
+            found.append({line_of[r["path"]] for r in rows if r["path"] in line_of})
+        return found[0], found[1]
+
+    train, valid = splits("s1")
+    union = set(LINES) | set(LINES2)
+    assert valid == corpus_cmd.holdout_lines(union, 0.25, seed=0)
+    assert len(valid) == 5 and train.isdisjoint(valid) and train | valid == union
+    assert splits("s2") == (train, valid)
+    seven = splits("s3", "--seed", "7")
+    assert seven[1] == corpus_cmd.holdout_lines(union, 0.25, seed=7) != valid
+    assert seven[0].isdisjoint(seven[1])
+    assert splits("s4", "--seed", "7") == seven
+
+
+def test_two_runs_cap_the_seed_on_their_combined_training_hours(
+    root: root_mod.Root, hub: dict
+) -> None:
+    set_gates(root, seed_share_max=0.3)
+    add_second_run(root)
+    result = build(root, runs=TWO)
+    assert result.code == 0, result.err
+    train = rows_of(root, "train_aligned.jsonl")
+    seed_paths = by_path(root, [segment(k).audio for k in TRUSTED])
+    kept = {r["path"] for r in train if r["path"] in seed_paths}
+    teacher_s = sum(r["duration"] for r in train if r["path"] not in seed_paths)
+    seed_s = sum(r["duration"] for r in train if r["path"] in seed_paths)
+    first_s = sum(r["duration"] for r in train if f"/{RUN}/" in r["path"])
+    assert 0 < first_s < teacher_s  # both runs' takes are in training
+    assert 0 < len(kept) < len(TRUSTED)
+    assert seed_s / (teacher_s + seed_s) <= 0.3
+    for path in set(seed_paths) - kept:  # every segment left out would break the combined cap
+        extra = 3 * seconds_of(root, seed_paths[path])
+        assert (seed_s + extra) / (teacher_s + seed_s + extra) > 0.3
+    # The cap read the training seconds of both runs; one run's alone would fit fewer segments.
+    offered = [(seg_id(k), seg_seconds(k)) for k in TRUSTED]
+    combined = corpus_cmd.cap_seed(offered, teacher_s, 0.3, 3, seed=0)
+    assert {str(root.path / segment(int(s[4:]) - 1).audio) for s in combined} == kept
+    assert len(corpus_cmd.cap_seed(offered, first_s, 0.3, 3, seed=0)) < len(kept)
+
+
+def test_job_inputs_are_each_lines_file_and_run_folder(root: root_mod.Root, hub: dict) -> None:
+    first = selected_takes(write_takes(root))
+    second = selected_takes(add_second_run(root))
+    result = build(root, runs=TWO)
+    assert result.code == 0, result.err
+    inputs = {i["rel"]: i["sha256"] for i in result.job["inputs"]}
+    assert list(inputs) == [
+        f"text/{TEXT}/lines.jsonl", f"teachers/omnivoice/{RUN}",
+        f"text/{TEXT2}/lines.jsonl", f"teachers/omnivoice/{RUN2}", f"seed/runs/{SEED_RUN}",
+    ]  # fmt: skip
+    for text in (TEXT, TEXT2):
+        rel = f"text/{text}/lines.jsonl"
+        assert inputs[rel] == sha256(root.path / rel)
+    for run, takes in ((RUN, first), (RUN2, second)):
+        folder = root.path / teacher_cmd.run_rel(run)
+        parts = [sha256(folder / "takes.jsonl"), *(sha256(root.path / t.audio) for t in takes)]
+        digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+        assert inputs[teacher_cmd.run_rel(run)] == digest
+
+
+def test_the_host_prints_each_runs_counts_and_hours(root: root_mod.Root, hub: dict) -> None:
+    second = add_second_run(root)
+    unscored = [t for t in second if not t.kept][:2]
+    records = [
+        (
+            TakeRecord.from_json({**t.to_json(), "reasons": [teacher_cmd.UNSCORED]})
+            if t in unscored
+            else t
+        )
+        for t in second
+    ]
+    write_jsonl(root, f"{teacher_cmd.run_rel(RUN2)}/takes.jsonl", records)
+    result = build(root, runs=TWO)
+    assert result.code == 0, result.err
+    by_run = manifest_of(root)["teacher_hours_by_run"]
+    assert (
+        f"  run {RUN}: {len(LINES) + 1} selected takes, 0 not yet scored, "
+        f"{by_run[RUN]:.3f} h aligned" in result.out
+    )
+    assert (
+        f"  run {RUN2}: {len(LINES2)} selected takes, 2 not yet scored, "
+        f"{by_run[RUN2]:.3f} h aligned" in result.out
+    )
+
+
+def test_the_gate_holds_the_aligned_hours_of_every_run_together(
+    root: root_mod.Root, hub: dict
+) -> None:
+    first = selected_takes(write_takes(root))
+    second = selected_takes(add_second_run(root))
+    first_s = sum(seconds_of(root, t.audio) for t in first)
+    both_s = first_s + sum(seconds_of(root, t.audio) for t in second)
+    set_gates(root, teacher_hours_min=(first_s + both_s) / 2 / 3600)
+    assert build(root).code == 3
+    result = build(root, runs=TWO, version="s2")
+    assert result.code == 0, result.err
+
+
+def _named_twice(root: root_mod.Root) -> tuple[str, ...]:
+    return (RUN, RUN)
+
+
+def _score_plan(key: str, value: object) -> Callable[[root_mod.Root], tuple[str, ...]]:
+    def breaks(root: root_mod.Root) -> tuple[str, ...]:
+        def change(plan: dict) -> None:
+            *path, last = key.split(".")
+            doc = plan
+            for part in path:
+                doc = doc[part]
+            doc[last] = value
+
+        edit_json(root, f"{teacher_cmd.run_rel(RUN2)}/score-plan.json", change)
+        return TWO
+
+    return breaks
+
+
+def _own_floors(root: root_mod.Root) -> tuple[str, ...]:
+    write_takes(root, floor_from="round-1-takes")
+    add_second_run(root, floor_from="round-1-takes")
+    return TWO
+
+
+def _take_n(root: root_mod.Root) -> tuple[str, ...]:
+    write_generate_plan(root, RUN2, TEXT2, take_n=4)
+    return TWO
+
+
+def _same_lines_file(root: root_mod.Root) -> tuple[str, ...]:
+    write_takes(root, run=RUN2, text=TEXT, lines=LINES)
+    write_generate_plan(root, RUN2, TEXT)
+    return TWO
+
+
+def _shared_line_id(root: root_mod.Root) -> tuple[str, ...]:
+    path = root.path / "text" / TEXT2 / "lines.jsonl"
+    extra = {"line_id": LINES[0], "state": "neutral", "text": f"{CANARY.transcript} elsewhere."}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(extra) + "\n")
+    return TWO
+
+
+def _shared_text(root: root_mod.Root) -> tuple[str, ...]:
+    # The same line as g1's first, in other case and punctuation.
+    write_lines(root, {LINES2[0]: line_text(LINES[0]).upper() + "!"}, text=TEXT2, lines=LINES2)
+    return TWO
+
+
+@pytest.mark.parametrize(
+    ("breaks", "said", "hidden"),
+    [
+        (_named_twice, "named twice", None),
+        (_score_plan("anchor.voice", "another-voice"), "anchor", "another-voice"),
+        # The ecapa value: "wavlm-sv" holds ".wav", which `build` refuses to see printed.
+        (_score_plan("floor.values.ecapa", 0.625), "floor.values.ecapa", "0.625"),
+        (_score_plan("floor.centroid_sha256.ecapa", "c" * 64), "centroid_sha256", "c" * 64),
+        (_score_plan("cer_max", 0.0625), "cer_max", "0.0625"),
+        (_own_floors, "seed target", None),
+        (_take_n, "take_n", None),
+        (_same_lines_file, "same lines file", None),
+        (_shared_line_id, "1 line id", None),
+        (_shared_text, "1 line", None),
+    ],
+    ids=[
+        "named-twice", "anchor", "floor-value", "centroid-hash", "cer-max", "own-floors",
+        "take-n", "same-lines-file", "shared-line-id", "shared-text",
+    ],
+)  # fmt: skip
+def test_runs_made_differently_are_refused(
+    root: root_mod.Root,
+    hub: dict,
+    breaks: Callable[[root_mod.Root], tuple[str, ...]],
+    said: str,
+    hidden: str | None,
+) -> None:
+    add_second_run(root)
+    runs = breaks(root)
+    result = build(root, runs=runs)
+    assert result.code == 2, result.out + result.err
+    assert said in result.err and RUN in result.err, result.err
+    if len(set(runs)) > 1:
+        assert RUN2 in result.err
+    if hidden is not None:
+        assert hidden not in result.err
+    assert "elsewhere" not in result.err
+    assert not result.docker.argvs
+    assert not (corpus_dir(root) / "corpus-plan.json").exists()
+
+
+def test_a_shared_text_refusal_counts_by_normalised_text(root: root_mod.Root, hub: dict) -> None:
+    add_second_run(root)
+    _shared_text(root)
+    result = build(root, runs=TWO)
+    assert result.code == 2 and "share 1 line by normalised text" in result.err, result.err
+    assert text_corpus.normalise(line_text(LINES[0])) not in result.err
+
+
+def test_one_run_needs_no_generation_plan_and_keeps_an_own_floor(
+    root: root_mod.Root, hub: dict
+) -> None:
+    write_takes(root, floor_from="round-1-takes")
+    assert not (root.path / teacher_cmd.run_rel(RUN) / "generate-plan.json").exists()
+    assert build(root).code == 0
+    assert manifest_of(root)["takes_runs"] == [RUN]
+
+
+def test_the_stage_refuses_a_schema_1_plan(root: root_mod.Root, hub: dict) -> None:
+    assert build(root).code == 0
+    edit_plan(root, {"schema": 1})
+    with pytest.raises(stage.StageError, match="schema 2"):
+        stage.run(root.path, VERSION, "cpu", 8)
+
+
+def test_the_stage_refuses_a_take_whose_run_is_not_in_the_plan(
+    root: root_mod.Root, hub: dict
+) -> None:
+    add_second_run(root)
+    assert build(root, runs=TWO).code == 0
+    plan = plan_of(root)
+    take = plan["takes"][0]["take_id"]
+    edit_json(root, f"corpus/{VERSION}/corpus-plan.json",
+              lambda doc: doc["takes"][0].update(run="g9"))  # fmt: skip
+    with pytest.raises(stage.StageError, match=f"take {take}.*not in the plan"):
+        stage.run(root.path, VERSION, "cpu", 8)
+
+
+def test_the_stage_checks_each_take_against_its_own_run(root: root_mod.Root, hub: dict) -> None:
+    add_second_run(root)
+    assert build(root, runs=TWO).code == 0
+    take = plan_of(root)["takes"][0]["take_id"]
+    edit_json(root, f"corpus/{VERSION}/corpus-plan.json",
+              lambda doc: doc["takes"][0].update(run=RUN2))  # fmt: skip
+    with pytest.raises(stage.StageError, match=f"take {take} is not a selected take of run {RUN2}"):
+        stage.run(root.path, VERSION, "cpu", 8)
+
+
+def test_teacher_runs_reads_schema_1_and_schema_2_manifests() -> None:
+    assert corpus_cmd.teacher_runs({"schema": 1, "takes_run": RUN}) == (RUN,)
+    assert corpus_cmd.teacher_runs({"schema": 2, "takes_runs": [RUN, RUN2]}) == (RUN, RUN2)
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"schema": 2},
+        {"schema": 1},
+        {"schema": 2, "takes_run": RUN},
+        {"schema": 2, "takes_runs": []},
+        {"schema": 2, "takes_runs": RUN},
+        {"schema": 2, "takes_runs": [RUN, "../x"]},
+        {"schema": 1, "takes_run": "../x"},
+        {"schema": 1, "takes_run": 7},
+        [],
+    ],
+    ids=["v2-none", "v1-none", "v2-old-key", "empty", "a-string", "bad-id-2", "bad-id-1",
+         "not-a-string", "not-a-dict"],
+)  # fmt: skip
+def test_teacher_runs_refuses_a_manifest_without_valid_runs(manifest: object) -> None:
+    with pytest.raises(InputError, match="refused"):
+        corpus_cmd.teacher_runs(manifest)
 
 
 # The upstream aligner, run in-process from the clone.

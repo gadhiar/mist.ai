@@ -1,12 +1,14 @@
 """The student corpus's alignment job: measure, align, split and cap (`train-pocket` job).
 
 Runs as `/opt/venv-train-pocket/bin/python -I -u -m scripts.voice_data.stages.corpus_build
---data /data --version C --device cuda --batch-size 8`, with the text version's `lines.jsonl`,
-the teacher run and the seed's clean run mounted read-only, `corpus/<C>/` writable, and the
-weight cache at `/cache`. The host's `corpus-plan.json` lists the selected takes, the seed's
-confirmed segments and the corpus gates.
+--data /data --version C --device cuda --batch-size 8`, with each teacher run's text version
+`lines.jsonl`, each teacher run and the seed's clean run mounted read-only, `corpus/<C>/`
+writable, and the weight cache at `/cache`. The host's schema-2 `corpus-plan.json` lists the
+runs with their lines files (`takes_runs`), the selected takes each with its run, the seed's
+confirmed segments and the corpus gates; a schema-1 plan, which named one run, is refused.
 
-Every take is a candidate with its line's text; a seed segment is one when its two ASR
+Every take is a candidate with its line's text, checked against its own run's `takes.jsonl`
+and lines file; a seed segment is one when its two ASR
 transcripts agree (`transcribe.training_text`) and it speaks no ear-test line. Each candidate's
 duration is measured, and all of them go through upstream's CTC aligner once
 (`training/scripts/align_data.py`, run in this process with the clone first on `sys.path`,
@@ -15,13 +17,14 @@ cache (`fetch.model_dir`, through `fetch.snapshot_dir`): a snapshot fetched at a
 writes no `refs/main`, so the repository id alone does not resolve offline. A row the aligner
 leaves out, or returns without words, is dropped and counted.
 
-The aligned teacher rows are split by line (`commands.corpus.holdout_lines`), the aligned seed
-segments by whole source (`commands.corpus.holdout_sources`, each plan segment naming its
-`source_id`), the training seed is capped on the training split's teacher hours
-(`commands.corpus.cap_seed`) and repeated `oversample` times, all in the order of the plan's
-`random_seed`. The held-out seed rows open the validation split, once each. The splits are
-written as upstream's rows: `path` (the clip's path
-under `--data`), `duration`, `transcript` and `words`, nothing else.
+The aligned teacher rows of every run are split by line in one draw
+(`commands.corpus.holdout_lines`), the aligned seed segments by whole source
+(`commands.corpus.holdout_sources`, each plan segment naming its `source_id`), the training seed
+is capped on the training split's teacher hours of every run (`commands.corpus.cap_seed`) and
+repeated `oversample` times, all in the order of the plan's `random_seed`. The held-out seed rows
+open the validation split, once each. The splits are written as upstream's rows: `path` (the
+clip's path under `--data`), `duration`, `transcript` and `words`, nothing else. The summary
+gives each run's aligned teacher hours (`teacher_hours_by_run`).
 
 Nothing this stage prints carries a transcript, a line's text or a clip's path.
 """
@@ -47,7 +50,7 @@ from ..text_corpus import HoldOut, load_ear_test
 from . import fetch
 from .transcribe import training_text
 
-SCHEMA = 1
+SCHEMA = 2
 DIGITS = 6
 UPSTREAM = fetch.UPSTREAM / "pocket-tts"
 ALIGN_MODULE = "training.scripts.align_data"
@@ -68,6 +71,7 @@ class Candidate:
     duration: float
     transcript: str
     source: str | None = None  # a seed segment's source, held out whole; None for a take
+    run: str | None = None  # a take's teacher run; None for a seed segment
 
     def row(self) -> dict[str, object]:
         """Return the aligner's input row."""
@@ -114,8 +118,23 @@ def _read_plan(data: Path, version: str) -> dict[str, object]:
         SCHEMA,
         version,
     ):
-        raise StageError("the corpus plan is not this version's schema 1 plan")
+        raise StageError(f"the corpus plan is not this version's schema {SCHEMA} plan")
     return plan
+
+
+def _runs(plan: Mapping[str, object]) -> dict[str, str]:
+    """Return the plan's teacher runs, in order, each with its lines file."""
+    entries = plan.get("takes_runs")
+    runs: dict[str, str] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        run = entry.get("run") if isinstance(entry, dict) else None
+        lines_file = entry.get("lines_file") if isinstance(entry, dict) else None
+        if not isinstance(run, str) or not isinstance(lines_file, str) or run in runs:
+            raise StageError("the corpus plan's takes_runs is malformed")
+        runs[run] = lines_file
+    if not runs:
+        raise StageError("the corpus plan names no teacher run")
+    return runs
 
 
 def _texts(data: Path, lines_file: str) -> dict[str, str]:
@@ -173,6 +192,7 @@ class Builder:
         self.device = device
         self.batch_size = batch_size
         self.plan = _read_plan(data, version)
+        self.runs = _runs(self.plan)
         random_seed = self.plan.get("random_seed")
         if isinstance(random_seed, bool) or not isinstance(random_seed, int):
             raise StageError("the corpus plan records no integer random_seed")
@@ -189,29 +209,32 @@ class Builder:
         return str(self.data / rel)
 
     def teacher(self) -> list[Candidate]:
-        """Return a candidate per planned take, checked against the run's `takes.jsonl`."""
-        takes_path = (
-            self.data / teacher_contract.run_rel(str(self.plan["takes_run"]))
-            / teacher_contract.TAKES_NAME
-        )  # fmt: skip
-        try:
-            records = {t.take_id: t for t in read_jsonl(takes_path, TakeRecord)}
-        except InputError as exc:
-            raise StageError("takes.jsonl is missing or malformed") from exc
-        texts = _texts(self.data, str(self.plan["lines_file"]))
+        """Return a candidate per planned take, checked against its own run's `takes.jsonl`."""
+        records: dict[str, dict[str, TakeRecord]] = {}
+        texts: dict[str, dict[str, str]] = {}
+        for run, lines_file in self.runs.items():
+            takes_path = self.data / teacher_contract.run_rel(run) / teacher_contract.TAKES_NAME
+            try:
+                records[run] = {t.take_id: t for t in read_jsonl(takes_path, TakeRecord)}
+            except InputError as exc:
+                raise StageError(f"run {run}'s takes.jsonl is missing or malformed") from exc
+            texts[run] = _texts(self.data, lines_file)
         found = []
         for entry in self.plan["takes"]:  # type: ignore[attr-defined]
-            take = records.get(entry["take_id"])
+            run = entry.get("run")
+            if run not in self.runs:
+                raise StageError(f"take {entry['take_id']} names a run not in the plan")
+            take = records[run].get(entry["take_id"])
             if take is None or not take.selected or take.audio != entry["audio"]:
-                raise StageError(f"take {entry['take_id']} is not a selected take of the run")
-            text = texts.get(take.line_id)
+                raise StageError(f"take {entry['take_id']} is not a selected take of run {run}")
+            text = texts[run].get(take.line_id)
             if text is None:
-                raise StageError(f"line {take.line_id} is not in the lines file")
+                raise StageError(f"line {take.line_id} is not in run {run}'s lines file")
             if self.hold_out.holds(text):
                 raise StageError(f"take {take.take_id} speaks an ear-test line")
             found.append(
                 Candidate(contract.TEACHER, take.take_id, take.line_id, self._path(take.audio),
-                          _seconds(self.data / take.audio), text)
+                          _seconds(self.data / take.audio), text, run=run)
             )  # fmt: skip
         return found
 
@@ -321,6 +344,10 @@ class Builder:
             "version": self.version,
             "random_seed": random_seed,
             "teacher_hours": _hours(teacher_s),
+            "teacher_hours_by_run": {
+                run: _hours(sum(c.duration for c in teacher_ok if c.run == run))
+                for run in self.runs
+            },
             "teacher_train_hours": _hours(train_s),
             "valid_hours": _hours(teacher_s - train_s),
             "seed_hours": _hours(seed_s),
