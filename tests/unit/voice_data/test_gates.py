@@ -73,6 +73,7 @@ FIXED = {
     "corpus.seed_val_share": 0.15,
     "voice_ab.preferred_min": 18,
     "voice_ab.lines": 26,
+    "text.line_chars_min": 80,
 }
 
 # The voice A/B pack plays the bench's ear-test lines and acknowledgements, so its line count
@@ -144,13 +145,23 @@ def test_voice_ab_lines_are_the_ear_test_lines() -> None:
         "corpus.seed_val_share",
         "voice_ab.preferred_min",
         "voice_ab.lines",
+        "text.line_chars_min",
     ],
 )
 def test_new_gates_note_their_owner_and_say_fixed(key: str) -> None:
     note = gates.load(None).defaults[key].note
-    owner = "Corpus" if key.startswith("corpus.") else "Voice A/B"
-    assert note.startswith(owner)
+    owners = {"corpus": "Corpus", "voice_ab": "Voice A/B", "text": "Text build"}
+    assert note.startswith(owners[key.split(".")[0]])
     assert note.endswith("Fixed.")
+
+
+def test_the_text_line_gate_says_why_and_what_v1_used() -> None:
+    # The note says where the value came from without naming a run or its counts, so it stays
+    # true in the public repository whatever the private root holds.
+    note = gates.load(None).defaults["text.line_chars_min"].note
+    assert "after `clean`" in note
+    assert "keep rate by line length" in note
+    assert "text v1 was built at 20" in note
 
 
 def test_no_overlay_gives_defaults(private_root: Root) -> None:

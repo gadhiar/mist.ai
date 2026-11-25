@@ -5,6 +5,12 @@ training line may teach it those words: a line that equals one of them, or share
 `NGRAM` words with one, after normalisation, is held out. Every line is neutral, because stage 1
 trains the neutral state only.
 
+Each text version holds only new lines: a line whose id or normalised text an earlier version of
+the root holds is dropped, so a second teacher run speaks nothing the first one spoke. A line is
+kept only from the `text.line_chars_min` gate to `MAX_CHARS` characters after `clean`, because the
+first teacher run kept a take far more often for long lines than for short ones; `MIN_CHARS` stays
+the floor any gate value must respect.
+
 The public sources are read from the folder a rehearsal root keeps them in (`public/`): one
 LibriTTS-R test-clean utterance per `.normalized.txt` file, and Expresso's
 `read_transcriptions.txt` (`<utterance id><TAB><text>` per line). Either may be absent; the build
@@ -22,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import InputError
+from .gates import Gates
 from .states import NEUTRAL_STATE
 
 ASSISTANT_LINES_PATH = Path(__file__).with_name("text_lines.jsonl")
@@ -39,8 +46,10 @@ PUBLIC_SOURCES = (LIBRITTSR, EXPRESSO)
 
 MIN_CHARS = 20
 MAX_CHARS = 200
+LINE_CHARS_GATE = "text.line_chars_min"
 NGRAM = 8
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+TEXT_DIR = "text"
 LINES_NAME = "lines.jsonl"
 SUMMARY_NAME = "summary.json"
 
@@ -65,19 +74,27 @@ class SourceLine:
 class Corpus:
     """The kept lines and the counts of what the rules dropped.
 
+    Each drop count is of its own rule, in the order the rules run.
+
     Attributes:
         lines: Kept lines, cleaned, in source order.
+        line_chars_min: The shortest cleaned line kept, from the `text.line_chars_min` gate.
+        earlier_versions: The root's earlier text versions, sorted.
         held_out: Lines dropped for overlapping an ear-test line.
+        dropped_earlier: Lines dropped because an earlier version holds their id or text.
+        dropped_length: Lines dropped for a cleaned length outside `line_chars_min`-`MAX_CHARS`.
         dropped_duplicates: Lines dropped as a normalised duplicate of an earlier kept line.
-        dropped_length: Lines dropped for a cleaned length outside `MIN_CHARS`-`MAX_CHARS`.
         sources: Kept lines per source; a missing source counts 0.
         missing: The sources that were absent.
     """
 
     lines: tuple[SourceLine, ...]
+    line_chars_min: int
+    earlier_versions: tuple[str, ...]
     held_out: int
-    dropped_duplicates: int
+    dropped_earlier: int
     dropped_length: int
+    dropped_duplicates: int
     sources: Mapping[str, int]
     missing: tuple[str, ...]
 
@@ -93,20 +110,26 @@ class Corpus:
         return {
             "lines": len(self.lines),
             "chars": sum(len(line.text) for line in self.lines),
+            "line_chars_min": self.line_chars_min,
+            "line_chars_max": MAX_CHARS,
+            "earlier_versions": list(self.earlier_versions),
             "held_out": self.held_out,
-            "dropped_duplicates": self.dropped_duplicates,
+            "dropped_earlier": self.dropped_earlier,
             "dropped_length": self.dropped_length,
+            "dropped_duplicates": self.dropped_duplicates,
             "sources": dict(self.sources),
         }
 
     def report_lines(self) -> list[str]:
-        """Return the printed summary: counts and source names only."""
+        """Return the printed summary: counts, version names and source names only."""
         summary = self.summary()
         out = [
             f"text: {summary['lines']} lines, {summary['chars']} chars",
+            f"earlier versions: {', '.join(self.earlier_versions) or 'none'}",
             f"held out (ear-test overlap): {self.held_out}",
-            f"dropped: {self.dropped_duplicates} duplicates, {self.dropped_length} outside "
-            f"{MIN_CHARS}-{MAX_CHARS} chars",
+            f"dropped: {self.dropped_earlier} in an earlier version, {self.dropped_length} "
+            f"outside {self.line_chars_min}-{MAX_CHARS} chars, {self.dropped_duplicates} "
+            "duplicates",
         ]
         for name in SOURCE_ORDER:
             state = "missing, 0 lines" if name in self.missing else f"{self.sources[name]} lines"
@@ -261,18 +284,103 @@ def read_assistant(path: Path = ASSISTANT_LINES_PATH) -> list[SourceLine]:
     return out
 
 
-def build(sources: Mapping[str, Sequence[SourceLine] | None], hold_out: HoldOut) -> Corpus:
-    """Apply the rules in order: hold-out, then length, then duplicates.
+def line_chars_gate(gates: Gates) -> int:
+    """Return the `text.line_chars_min` gate: the shortest cleaned line a build keeps.
 
-    The hold-out runs first so `held_out` counts every overlapping line, whatever its length.
+    Raises:
+        InputError: The value is not a whole number from `MIN_CHARS` to `MAX_CHARS`.
+    """
+    value = gates.value(LINE_CHARS_GATE)
+    if float(value).is_integer() and MIN_CHARS <= value <= MAX_CHARS:
+        return int(value)
+    raise InputError(
+        f"refused: gate {LINE_CHARS_GATE} must be a whole number from {MIN_CHARS} to {MAX_CHARS}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EarlierVersions:
+    """What the root's earlier text versions hold: their names, line ids and normalised texts."""
+
+    versions: tuple[str, ...]
+    line_ids: frozenset[str]
+    texts: frozenset[str]
+
+    def holds(self, line_id: str, text: str) -> bool:
+        """Return whether an earlier version holds this line id or this text, normalised."""
+        return line_id in self.line_ids or normalise(text) in self.texts
+
+
+NO_EARLIER = EarlierVersions(versions=(), line_ids=frozenset(), texts=frozenset())
+
+
+def read_earlier(root_path: Path) -> EarlierVersions:
+    """Return what every folder under the root's `text/` holds, each read from its lines file.
+
+    A folder without a readable lines file is refused rather than skipped: skipping it would let
+    a new version repeat the lines a half-written or damaged version once held.
+
+    Raises:
+        InputError: A folder has no readable `lines.jsonl`, or a row of one is not an object with
+            a string `line_id` and `text`. Errors name the folder and a row number, never text.
+    """
+    text_dir = root_path / TEXT_DIR
+    if not text_dir.is_dir():
+        return NO_EARLIER
+    versions = sorted(entry.name for entry in text_dir.iterdir() if entry.is_dir())
+    line_ids: set[str] = set()
+    texts: set[str] = set()
+    for version in versions:
+        rel = f"{TEXT_DIR}/{version}"
+        try:
+            rows = (text_dir / version / LINES_NAME).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise InputError(f"refused: {rel} has no readable {LINES_NAME}") from exc
+        for number, raw in enumerate(rows, 1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise InputError(f"refused: {rel}/{LINES_NAME} row {number} is not JSON") from exc
+            if not (
+                isinstance(row, dict)
+                and isinstance(row.get("line_id"), str)
+                and isinstance(row.get("text"), str)
+            ):
+                raise InputError(
+                    f"refused: {rel}/{LINES_NAME} row {number} lacks a line_id or text"
+                )
+            line_ids.add(row["line_id"])
+            texts.add(normalise(clean(row["text"])))
+    return EarlierVersions(tuple(versions), frozenset(line_ids), frozenset(texts))
+
+
+def build(
+    sources: Mapping[str, Sequence[SourceLine] | None],
+    hold_out: HoldOut,
+    earlier: EarlierVersions,
+    *,
+    line_chars_min: int,
+) -> Corpus:
+    """Apply the rules in order: hold-out, earlier versions, length, then duplicates.
+
+    The hold-out runs first so `held_out` counts every overlapping line, whatever its length or
+    version; the earlier versions run before the length so `dropped_earlier` counts every line a
+    version already holds.
 
     Args:
         sources: Each source's lines, or None for a missing source.
         hold_out: The ear-test lines.
+        earlier: What the root's earlier text versions hold.
+        line_chars_min: The shortest cleaned line kept, from `line_chars_gate`.
 
     Raises:
-        InputError: Both public sources are missing, or two kept lines share an id.
+        InputError: Both public sources are missing, `line_chars_min` is outside
+            `MIN_CHARS`-`MAX_CHARS`, or two kept lines share an id.
     """
+    if not MIN_CHARS <= line_chars_min <= MAX_CHARS:
+        raise InputError(f"refused: the shortest line must be {MIN_CHARS}-{MAX_CHARS} chars")
     if all(sources.get(name) is None for name in PUBLIC_SOURCES):
         raise InputError("refused: neither LibriTTS-R nor Expresso is under --sources")
     kept: list[SourceLine] = []
@@ -280,7 +388,7 @@ def build(sources: Mapping[str, Sequence[SourceLine] | None], hold_out: HoldOut)
     missing: list[str] = []
     seen_text: set[str] = set()
     seen_ids: set[str] = set()
-    held = duplicates = length = 0
+    held = in_earlier = duplicates = length = 0
     for name in SOURCE_ORDER:
         lines = sources.get(name)
         if lines is None:
@@ -291,7 +399,10 @@ def build(sources: Mapping[str, Sequence[SourceLine] | None], hold_out: HoldOut)
             if hold_out.holds(text):
                 held += 1
                 continue
-            if not MIN_CHARS <= len(text) <= MAX_CHARS:
+            if earlier.holds(line.line_id, text):
+                in_earlier += 1
+                continue
+            if not line_chars_min <= len(text) <= MAX_CHARS:
                 length += 1
                 continue
             key = normalise(text)
@@ -306,9 +417,12 @@ def build(sources: Mapping[str, Sequence[SourceLine] | None], hold_out: HoldOut)
             counts[name] += 1
     return Corpus(
         lines=tuple(kept),
+        line_chars_min=line_chars_min,
+        earlier_versions=earlier.versions,
         held_out=held,
-        dropped_duplicates=duplicates,
+        dropped_earlier=in_earlier,
         dropped_length=length,
+        dropped_duplicates=duplicates,
         sources=counts,
         missing=tuple(missing),
     )
