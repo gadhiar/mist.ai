@@ -1367,11 +1367,14 @@ def make_torch(free: int, peak: int) -> types.ModuleType:
     class OutOfMemoryError(RuntimeError):
         pass
 
+    # Real torch's layout (2.6 and 2.8): `torch.optim.optimizer` is imported but `torch.optim`
+    # does not bind it, and `torch.optim` does not re-export the hook registration.
+    hook_module = types.ModuleType("torch.optim.optimizer")
+    hook_module.register_optimizer_step_post_hook = register  # type: ignore[attr-defined]
+    optim = types.ModuleType("torch.optim")
+    optim.Optimizer = Optimizer  # type: ignore[attr-defined]
     torch = types.ModuleType("torch")
-    torch.optim = types.SimpleNamespace(  # type: ignore[attr-defined]
-        optimizer=types.SimpleNamespace(register_optimizer_step_post_hook=register),
-        Optimizer=Optimizer,
-    )
+    torch.optim = optim  # type: ignore[attr-defined]
     torch.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
         mem_get_info=lambda: (free, 2 * free), max_memory_reserved=lambda: peak,
         OutOfMemoryError=OutOfMemoryError,
@@ -1379,7 +1382,68 @@ def make_torch(free: int, peak: int) -> types.ModuleType:
     torch.Tensor = Tensor  # type: ignore[attr-defined]
     torch.tensor = Tensor  # type: ignore[attr-defined]
     torch.hooks = hooks  # type: ignore[attr-defined]
+    torch.hook_module = hook_module  # type: ignore[attr-defined]
     return torch
+
+
+def use_torch(monkeypatch: pytest.MonkeyPatch, torch: types.ModuleType) -> types.ModuleType:
+    """Put a `make_torch` fake in `sys.modules` under all three names the monitor resolves.
+
+    Replacing `torch.optim.optimizer` too keeps a real torch imported earlier in the session
+    from lending the fake its global hook registry.
+    """
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.optim", torch.optim)  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        sys.modules, "torch.optim.optimizer", torch.hook_module  # type: ignore[attr-defined]
+    )
+    return torch
+
+
+def test_step_monitor_reaches_the_hook_module_torch_optim_does_not_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = use_torch(monkeypatch, make_torch(free=0, peak=0))
+    assert not hasattr(torch.optim, "optimizer")
+    ticks = iter(range(100))
+    monitor = stage.StepMonitor(lambda: float(next(ticks)))
+    monitor.install(torch)
+    optimizer = torch.optim.Optimizer()
+    torch.tensor(0.25).backward()
+    torch.tensor(0.5).backward()
+    optimizer.step()
+    monitor.remove()
+    assert monitor.times == [0.0] and monitor.step_losses == [pytest.approx(0.75)]
+    assert torch.hooks == []
+
+
+def test_step_monitor_counts_and_unhooks_real_torch_steps() -> None:
+    torch = pytest.importorskip("torch")
+    original = torch.Tensor.backward
+    ticks = iter(range(100))
+    monitor = stage.StepMonitor(lambda: float(next(ticks)))
+    weight = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([weight], lr=0.1)
+
+    def step() -> None:
+        optimizer.zero_grad()
+        (weight * 2.0).backward()
+        optimizer.step()
+
+    monitor.install(torch)
+    try:
+        for _ in range(3):
+            step()
+        assert monitor.times == [0.0, 1.0, 2.0]
+        # The loss is 2w, and each step moves w down by 0.1 * 2.
+        assert monitor.step_losses == [
+            pytest.approx(2.0), pytest.approx(1.6), pytest.approx(1.2)
+        ]  # fmt: skip
+    finally:
+        monitor.remove()
+    assert torch.Tensor.backward is original
+    step()
+    assert len(monitor.times) == 3 and len(monitor.step_losses) == 3
 
 
 @pytest.fixture
@@ -1399,7 +1463,7 @@ def trainer_clone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[P
     (decoy / "pocket_tts").mkdir(parents=True)
     (decoy / "pocket_tts" / "__init__.py").write_text("", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(decoy), *sys.path])
-    monkeypatch.setitem(sys.modules, "torch", make_torch(free=10 * 1024 * MIB, peak=6 * 1024 * MIB))
+    use_torch(monkeypatch, make_torch(free=10 * 1024 * MIB, peak=6 * 1024 * MIB))
     ticks = iter(range(10_000))
     monkeypatch.setattr(
         stage, "time", types.SimpleNamespace(perf_counter=lambda: next(ticks) * 0.5)
