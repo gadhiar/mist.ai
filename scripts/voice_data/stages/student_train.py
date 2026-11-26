@@ -1218,10 +1218,12 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
     no CUDA device or a non-finite gradient) passes through after the metrics are written.
 
     The peak in the metrics, `peak_reserved_bytes`, is that of everything after upstream's
-    latent step (the optimizer and EMA build, a resume's checkpoint load, the steps and the
-    saves): the latent step (`training.train_utils.ensure_train_latents`, which `train.py` also
-    binds by name at import) is wrapped the same way, and when it returns its own peak is
-    recorded as `latents_peak_reserved_bytes` and the peak statistic starts again
+    latent step (the optimizer and EMA build, a resume's checkpoint load, the steps, the
+    validation passes `train` runs at each checkpoint interval, and the saves; no stretch writes
+    samples, because every config sets `sample_sentences` empty, and the probe validates never,
+    `PROBE_VALID_FREQ`): the latent step (`training.train_utils.ensure_train_latents`, which
+    `train.py` also binds by name at import) is wrapped the same way, and when it returns its
+    own peak is recorded as `latents_peak_reserved_bytes` and the peak statistic starts again
     (`LatentsStep`). When the step never returned, that key is null and the peak is the whole
     run's. `oom_in_latents` is true when CUDA ran out of memory while that step was running.
 
