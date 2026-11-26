@@ -1643,20 +1643,47 @@ def test_trainer_writes_its_metrics_before_upstreams_hard_exit_on_a_stop(
     assert upstream_exit_is_bound(trainer_clone)
 
 
-def test_trainer_hard_exits_when_its_metrics_cannot_be_written(
-    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub, capsys: pytest.CaptureFixture[str]
-) -> None:
+def _metrics_path_is_a_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A folder where the metrics file belongs: writing it raises `IsADirectoryError`.
     (tmp_path / "metrics.json").mkdir()
+
+
+def _metrics_json_raises_value_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(path: Path, payload: object) -> None:
+        raise ValueError("not serializable")
+
+    monkeypatch.setattr(stage, "_write_json", refuse)
+
+
+@pytest.mark.parametrize(
+    ("break_write", "error"),
+    [
+        pytest.param(_metrics_path_is_a_folder, IsADirectoryError, id="os-error"),
+        pytest.param(_metrics_json_raises_value_error, ValueError, id="value-error"),
+    ],
+)
+def test_trainer_hard_exits_and_reports_why_when_its_metrics_cannot_be_written(
+    trainer_clone: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hard_exit: ExitStub,
+    capsys: pytest.CaptureFixture[str],
+    break_write: Callable[[Path, pytest.MonkeyPatch], None],
+    error: type[Exception],
+) -> None:
+    break_write(tmp_path, monkeypatch)
     config = trainer_config_file(tmp_path)
 
-    # Upstream's `os._exit` would end the process here; the stub lets the `finally` run, and its
-    # own write fails the same way.
-    with pytest.raises(OSError):
+    # Upstream's `os._exit` would end the process here, dropping the exception in flight; the
+    # stub lets the `finally` run, and its own write fails the same way.
+    with pytest.raises(error):
         stage.main(trainer_argv(trainer_clone, tmp_path, config))
 
     assert hard_exit.calls == [(0, None)]
-    assert "metrics could not be written" in capsys.readouterr().err
+    # The failure reached stderr, traceback included, before the hard exit.
+    err = capsys.readouterr().err
+    assert "metrics could not be written" in err
+    assert "Traceback (most recent call last)" in err and error.__name__ in err
     assert upstream_exit_is_bound(trainer_clone)
 
 
