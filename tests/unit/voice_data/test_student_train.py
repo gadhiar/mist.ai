@@ -1311,6 +1311,17 @@ def test_importing_the_stage_leaves_torch_unimported() -> None:
             "pinned_expandable_segments:True,expandable_segments:True",
             id="key-not-substring",
         ),
+        pytest.param("  ", "expandable_segments:True", id="whitespace-only"),
+        pytest.param(
+            "max_split_size_mb:512,",
+            "max_split_size_mb:512,expandable_segments:True",
+            id="trailing-comma",
+        ),
+        pytest.param(
+            "roundup_power2_divisions:[256:1,512:2]",
+            "roundup_power2_divisions:[256:1,512:2],expandable_segments:True",
+            id="bracketed-value-appended",
+        ),
     ],
 )
 def test_allocator_conf_carries_expandable_segments(current: str | None, expected: str) -> None:
