@@ -872,8 +872,14 @@ class StepMonitor:
         self._pending.clear()
 
     def install(self, torch: object) -> None:
-        """Hook the optimizer's post-step and `Tensor.backward`; `remove` undoes both."""
-        hooks = torch.optim.optimizer  # type: ignore[attr-defined]
+        """Hook the optimizer's post-step and `Tensor.backward`; `remove` undoes both.
+
+        The hook registration lives in the `torch.optim.optimizer` submodule, which `import
+        torch` loads but `torch.optim` neither binds as an attribute nor re-exports (torch 2.6
+        and 2.8), so it is looked up as a module under the injected torch's name.
+        """
+        name = torch.__name__  # type: ignore[attr-defined]
+        hooks = importlib.import_module(f"{name}.optim.optimizer")
         handle = hooks.register_optimizer_step_post_hook(lambda opt, a, k: self.on_step(opt))
         self._restore.append(handle.remove)
         tensor = torch.Tensor  # type: ignore[attr-defined]
