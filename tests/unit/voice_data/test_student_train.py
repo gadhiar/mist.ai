@@ -345,6 +345,9 @@ class FakeTrainer:
     valid_losses: dict[tuple[str, int], float] = field(default_factory=dict)
     free_mib: int = FREE_MIB
     oom: set[int] = field(default_factory=set)
+    # The trainer child's latent-step figures by batch, written only for the batches named.
+    latents_peaks_mib: dict[int, int] = field(default_factory=dict)
+    oom_in_latents: set[int] = field(default_factory=set)
     kill_at: tuple[str, int] | None = None
     signal_at: tuple[str, int] | None = None
     jump_at: tuple[str, int] | None = None
@@ -402,12 +405,17 @@ class FakeChild:
             "losses": [[self.local, 2.0 - 0.01 * self.step]] if self.local else [],
             "oom": oom,
         }
+        if batch in self.trainer.latents_peaks_mib:
+            doc["latents_peak_reserved_bytes"] = self.trainer.latents_peaks_mib[batch] * MIB
+        if batch in self.trainer.oom_in_latents:
+            doc["oom_in_latents"] = oom
         self.metrics.write_text(json.dumps(doc), encoding="utf-8")
 
     def poll(self) -> int | None:
         if self.code is not None:
             return self.code
-        if self.config["batch_size"] in self.trainer.oom:
+        batch = self.config["batch_size"]
+        if batch in self.trainer.oom or batch in self.trainer.oom_in_latents:
             self._write_metrics(oom=True)
             self.code = stage.CHILD_OOM
             return self.code
@@ -637,6 +645,48 @@ def test_probe_counts_out_of_memory_as_not_fitting(
     assert doc["batch"] == 4
     assert doc["trials"][-1]["batch"] == 8 and doc["trials"][-1]["oom"] is True
     assert "out of memory" in result.out
+
+
+def test_probe_records_every_latent_step_and_prints_one_above_the_training_peak(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    # A fresh run: batch 2's child encoded the latents; later children found them cached, and
+    # their latent step's peak is the resident weights, below their training peaks.
+    trainer = FakeTrainer(latents_peaks_mib={2: 12546, 4: 4000, 8: 4000})
+    result = probe(root, clone, trainer=trainer)
+    assert result.code == 0, result.err + result.log
+    doc = read(run_dir(root) / "probe.json")
+    assert [t["latents_peak_vram_mib"] for t in doc["trials"]] == [12546.0, 4000.0, 4000.0]
+    assert doc["batch"] == 4
+    lines = result.out.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("  batch 2: peak 6100 MiB"))
+    assert lines[at + 1] == "    latent step: peak 12546 MiB, above the training peak, not counted"
+    assert result.out.count("latent step") == 1
+
+
+@pytest.mark.parametrize("latents_mib", [4000, 6100], ids=["below", "equal"])
+def test_probe_prints_no_latent_step_at_or_below_the_training_peak(
+    root: root_mod.Root, hub: Hub, clone: Path, latents_mib: int
+) -> None:
+    trainer = FakeTrainer(latents_peaks_mib={2: latents_mib, 4: latents_mib, 8: latents_mib})
+    result = probe(root, clone, trainer=trainer)
+    assert result.code == 0, result.err + result.log
+    trials = read(run_dir(root) / "probe.json")["trials"]
+    assert [t["latents_peak_vram_mib"] for t in trials] == [float(latents_mib)] * 3
+    assert "latent" not in result.out
+
+
+def test_probe_fails_on_a_latent_precompute_out_of_memory_without_a_fit_verdict(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    trainer = FakeTrainer(oom_in_latents={2})
+    result = probe(root, clone, trainer=trainer)
+    # A failed job, not the exit 3 of a batch that does not fit.
+    assert result.code == 4
+    assert "latent precompute ran out of memory at batch 2" in result.log
+    assert "no batch fits" not in result.out and "does not fit" not in result.err
+    assert [s.name for s in trainer.starts] == ["batch-2"]
+    assert not (run_dir(root) / "probe.json").exists()
 
 
 def test_probe_records_its_longest_checkpoint_save(
@@ -1330,9 +1380,13 @@ def test_allocator_conf_carries_expandable_segments(current: str | None, expecte
 
 # The trainer child: upstream's trainer run in-process from the clone.
 
-# Like upstream's train.py, it binds `exit_training` by name at import and ends through it, at
-# the last step and on a stop (`stop_at`: the stop request arrives during that step). A non-finite
-# gradient (`nonfinite`) raises `SystemExit` before that step's optimizer step, as upstream does.
+# Like upstream's train.py, it binds `exit_training` and `ensure_train_latents` by name at import
+# and ends through `exit_training`, at the last step and on a stop (`stop_at`: the stop request
+# arrives during that step). As upstream's `setup` does, it moves the model and Mimi to the device
+# (`model_mib`, resident from then on) and then calls `ensure_train_latents`. Each step allocates
+# `step_mib` and frees it after the optimizer step. A non-finite gradient (`nonfinite`) raises
+# `SystemExit` before that step's optimizer step, as upstream does; `oom_at` runs out of memory
+# at that step's allocation.
 TRAIN_PY = """\
 import json
 import sys
@@ -1342,20 +1396,27 @@ import torch
 import pocket_tts
 from training.checkpointing import save_checkpoint
 from training.distributed import exit_training
+from training.train_utils import ensure_train_latents
+
+MIB = 1 << 20
 
 
 def main():
     config = json.loads(open(sys.argv[1], encoding="utf-8").read())
-    if config.get("oom"):
-        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+    torch.cuda.fake_malloc(config["model_mib"] * MIB)
+    ensure_train_latents(config, None, "cuda", 0, 1)
     adam, muon = torch.optim.Optimizer(), torch.optim.Optimizer()
     for step in range(1, config["steps"] + 1):
+        if config.get("oom_at") == step:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        torch.cuda.fake_malloc(config["step_mib"] * MIB)
         for _ in range(2):
             torch.tensor(0.25 * step).backward()
         if config.get("nonfinite") == step:
             raise SystemExit(f"non-finite gradient at step {step}")
         adam.step()
         muon.step()
+        torch.cuda.fake_free(config["step_mib"] * MIB)
         if config.get("stop_at") == step:
             save_checkpoint(config["run_dir"], step)
             exit_training()
@@ -1404,9 +1465,61 @@ def save_checkpoint(run_dir, step, ema=None, mimi=None):
     (run_dir / "model.tmp").rename(run_dir / "model.safetensors")
 """
 
+# Upstream's `ensure_train_latents` encodes the corpus through Mimi when its latents are not
+# cached: a one-time precompute (`precompute_mib`, allocated and freed) that can run out of memory
+# (`latents_oom`). With the latents cached (no `precompute_mib`) it allocates nothing.
+TRAIN_UTILS_PY = """\
+import torch
 
-def make_torch(free: int, peak: int) -> types.ModuleType:
-    """A fake `torch`: CUDA memory figures, a step-post hook registry and scalar tensors."""
+MIB = 1 << 20
+
+
+def ensure_train_latents(args, mimi, device, rank, world_size):
+    size = args.get("precompute_mib", 0) * MIB
+    torch.cuda.fake_malloc(size)
+    if args.get("latents_oom"):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+    torch.cuda.fake_free(size)
+"""
+
+
+class FakeCuda:
+    """`torch.cuda`'s memory figures, kept by the caching allocator's rules.
+
+    Freeing keeps the freed blocks reserved; `empty_cache` releases what is reserved but not
+    allocated; `reset_peak_memory_stats` sets the peak to what is reserved now; and
+    `max_memory_reserved` returns the highest reserved since then. `fake_malloc` and `fake_free`
+    are the fake trainer's tensors; real torch has neither.
+    """
+
+    def __init__(self, free: int, error: type[Exception]) -> None:
+        self.free = free
+        self.OutOfMemoryError = error
+        self.allocated = self.reserved = self.peak = 0
+
+    def mem_get_info(self) -> tuple[int, int]:
+        return self.free, 2 * self.free
+
+    def fake_malloc(self, size: int) -> None:
+        self.allocated += size
+        self.reserved = max(self.reserved, self.allocated)
+        self.peak = max(self.peak, self.reserved)
+
+    def fake_free(self, size: int) -> None:
+        self.allocated -= size
+
+    def empty_cache(self) -> None:
+        self.reserved = self.allocated
+
+    def reset_peak_memory_stats(self) -> None:
+        self.peak = self.reserved
+
+    def max_memory_reserved(self) -> int:
+        return self.peak
+
+
+def make_torch(free: int) -> types.ModuleType:
+    """A fake `torch`: a CUDA caching allocator, a step-post hook registry and scalar tensors."""
     hooks: list[object] = []
 
     class Handle:
@@ -1455,10 +1568,7 @@ def make_torch(free: int, peak: int) -> types.ModuleType:
     optim.Optimizer = Optimizer  # type: ignore[attr-defined]
     torch = types.ModuleType("torch")
     torch.optim = optim  # type: ignore[attr-defined]
-    torch.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
-        mem_get_info=lambda: (free, 2 * free), max_memory_reserved=lambda: peak,
-        OutOfMemoryError=OutOfMemoryError,
-    )  # fmt: skip
+    torch.cuda = FakeCuda(free, OutOfMemoryError)  # type: ignore[attr-defined]
     torch.Tensor = Tensor  # type: ignore[attr-defined]
     torch.tensor = Tensor  # type: ignore[attr-defined]
     torch.hooks = hooks  # type: ignore[attr-defined]
@@ -1483,7 +1593,7 @@ def use_torch(monkeypatch: pytest.MonkeyPatch, torch: types.ModuleType) -> types
 def test_step_monitor_reaches_the_hook_module_torch_optim_does_not_bind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    torch = use_torch(monkeypatch, make_torch(free=0, peak=0))
+    torch = use_torch(monkeypatch, make_torch(free=0))
     assert not hasattr(torch.optim, "optimizer")
     ticks = iter(range(100))
     monitor = stage.StepMonitor(lambda: float(next(ticks)))
@@ -1592,6 +1702,7 @@ def trainer_clone(
         "training/train.py": TRAIN_PY,
         "training/checkpointing.py": CHECKPOINTING_PY,
         "training/distributed.py": DISTRIBUTED_PY,
+        "training/train_utils.py": TRAIN_UTILS_PY,
     }.items():
         path = folder / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1600,14 +1711,14 @@ def trainer_clone(
     (decoy / "pocket_tts").mkdir(parents=True)
     (decoy / "pocket_tts" / "__init__.py").write_text("", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(decoy), *sys.path])
-    use_torch(monkeypatch, make_torch(free=10 * 1024 * MIB, peak=6 * 1024 * MIB))
+    use_torch(monkeypatch, make_torch(free=10 * 1024 * MIB))
     ticks = iter(range(10_000))
     monkeypatch.setattr(
         stage, "time", types.SimpleNamespace(perf_counter=lambda: next(ticks) * 0.5)
     )
     names = (
         "pocket_tts", "training", "training.train", "training.checkpointing",
-        "training.distributed",
+        "training.distributed", "training.train_utils",
     )  # fmt: skip
     for name in names:
         monkeypatch.delitem(sys.modules, name, raising=False)
@@ -1617,8 +1728,10 @@ def trainer_clone(
 
 
 def trainer_config_file(tmp_path: Path, **values: object) -> Path:
+    """The fake trainer's config: 12 steps, latents cached, a 6 GiB peak (4 GiB resident)."""
     config = {"steps": 12, "ckpt_freq": 4, "run_dir": str(tmp_path / "distill"),
-              "seen": str(tmp_path / "seen.json"), **values}  # fmt: skip
+              "seen": str(tmp_path / "seen.json"), "model_mib": 4096, "step_mib": 2048,
+              **values}  # fmt: skip
     path = tmp_path / "config.yaml"
     path.write_text(json.dumps(config), encoding="utf-8")
     return path
@@ -1644,6 +1757,89 @@ def upstream_exit_is_bound(clone: Path) -> bool:
     """Whether `training.distributed.exit_training` is the clone's own function again."""
     function = sys.modules["training.distributed"].exit_training  # type: ignore[attr-defined]
     return Path(function.__code__.co_filename).resolve().is_relative_to(clone.resolve())
+
+
+def upstream_latents_is_bound(clone: Path) -> bool:
+    """Whether `training.train_utils.ensure_train_latents` is the clone's own function again."""
+    function = sys.modules["training.train_utils"].ensure_train_latents  # type: ignore[attr-defined]
+    return Path(function.__code__.co_filename).resolve().is_relative_to(clone.resolve())
+
+
+# The host's 26 Nov figures, in MiB: the free VRAM, a fresh run's latent precompute high-water
+# mark, and the training steps' peak at batch 8 with the latents cached.
+HOST_FREE_MIB = 11049
+HOST_PRECOMPUTE_PEAK_MIB = 12546
+HOST_TRAINING_PEAK_MIB = 9230
+HOST_RESIDENT_MIB = 4000
+
+
+def host_config(tmp_path: Path, **values: object) -> Path:
+    """A fresh run on the host: the precompute reaches 12,546 MiB, the steps 9,230 MiB."""
+    return trainer_config_file(
+        tmp_path, model_mib=HOST_RESIDENT_MIB,
+        precompute_mib=HOST_PRECOMPUTE_PEAK_MIB - HOST_RESIDENT_MIB,
+        step_mib=HOST_TRAINING_PEAK_MIB - HOST_RESIDENT_MIB, **values,
+    )  # fmt: skip
+
+
+def test_the_latent_precompute_is_measured_apart_from_the_training_peak(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    sys.modules["torch"].cuda.free = HOST_FREE_MIB * MIB  # type: ignore[attr-defined]
+    config = host_config(tmp_path)
+
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    doc = metrics_at_exit(hard_exit)
+    assert doc["free_bytes"] == HOST_FREE_MIB * MIB
+    assert doc["peak_reserved_bytes"] == HOST_TRAINING_PEAK_MIB * MIB
+    assert doc["latents_peak_reserved_bytes"] == HOST_PRECOMPUTE_PEAK_MIB * MIB
+    assert doc["steps"] == 12
+    assert doc["oom"] is False and doc["oom_in_latents"] is False
+    assert upstream_latents_is_bound(trainer_clone)
+
+
+def test_with_the_latents_cached_the_peak_is_the_training_peak(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = trainer_config_file(tmp_path)
+
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    doc = metrics_at_exit(hard_exit)
+    # The latents step returned with the model resident: its peak is what was reserved then.
+    assert doc["peak_reserved_bytes"] == 6 * 1024 * MIB
+    assert doc["latents_peak_reserved_bytes"] == 4096 * MIB
+
+
+def test_the_latents_peak_is_null_when_the_latents_step_never_returned(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = host_config(tmp_path, latents_oom=True)
+
+    assert stage.main(trainer_argv(trainer_clone, tmp_path, config)) == stage.CHILD_OOM
+
+    doc = read(tmp_path / "metrics.json")
+    # No reset happened: the peak is the whole run's.
+    assert doc["latents_peak_reserved_bytes"] is None
+    assert doc["peak_reserved_bytes"] == HOST_PRECOMPUTE_PEAK_MIB * MIB
+    assert upstream_latents_is_bound(trainer_clone)
+
+
+def test_trainer_reports_an_out_of_memory_in_the_latent_step(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = host_config(tmp_path, latents_oom=True)
+
+    assert stage.main(trainer_argv(trainer_clone, tmp_path, config)) == stage.CHILD_OOM
+
+    assert hard_exit.calls == []
+    doc = read(tmp_path / "metrics.json")
+    assert doc["oom"] is True and doc["oom_in_latents"] is True and doc["steps"] == 0
+    assert upstream_exit_is_bound(trainer_clone)
+    assert upstream_latents_is_bound(trainer_clone)
 
 
 def test_trainer_runs_upstream_from_the_clone_and_measures_it(
@@ -1716,6 +1912,7 @@ def test_trainer_writes_its_metrics_before_upstreams_hard_exit_at_the_last_step(
     assert doc["steps"] == 12 and doc["steps_per_s"] == pytest.approx(2.0)
     assert doc["oom"] is False
     assert upstream_exit_is_bound(trainer_clone)
+    assert upstream_latents_is_bound(trainer_clone)
 
 
 def test_trainer_writes_its_metrics_before_upstreams_hard_exit_on_a_stop(
@@ -1813,6 +2010,7 @@ def test_trainer_passes_upstreams_system_exit_through_after_the_metrics(
     doc = read(tmp_path / "metrics.json")
     assert doc["steps"] == 8 and doc["oom"] is False
     assert upstream_exit_is_bound(trainer_clone)
+    assert upstream_latents_is_bound(trainer_clone)
 
 
 def test_trainer_times_each_checkpoint_save(
@@ -1845,13 +2043,16 @@ def test_save_timer_records_a_save_that_raised() -> None:
 def test_trainer_reports_out_of_memory(
     trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
 ) -> None:
-    config = trainer_config_file(tmp_path, oom=True)
+    config = trainer_config_file(tmp_path, oom_at=1)
     code = stage.main(trainer_argv(trainer_clone, tmp_path, config))
     assert code == stage.CHILD_OOM
     assert hard_exit.calls == []
     doc = read(tmp_path / "metrics.json")
     assert doc["oom"] is True and doc["steps"] == 0 and doc["steps_per_s"] is None
+    # The latent step had returned: the out of memory was in the training steps.
+    assert doc["oom_in_latents"] is False
     assert upstream_exit_is_bound(trainer_clone)
+    assert upstream_latents_is_bound(trainer_clone)
 
 
 def test_trainer_refuses_a_pocket_tts_outside_the_clone(

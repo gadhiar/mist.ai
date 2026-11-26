@@ -17,10 +17,14 @@ that entry point runs (`allocator_conf`). It puts the clone first on
 `training` and the `pocket_tts` it imports come from one commit and not from the installed 4.0.1
 wheel. It then runs `training.train` as `__main__` with the config as its one argument, from the
 clone's root, and writes what it measured to a metrics file: the free VRAM before the run, the
-peak `torch.cuda.max_memory_reserved`, the optimizer steps and their rate (a global optimizer
-post-step hook; the first `WARMUP_STEPS` are left out), the loss of each step (the scalar
-`backward` received, summed over the step's micro-batches, averaged per `LOSS_WINDOW` steps) and
-the longest `save_checkpoint` call, timed on its own clock (`save_clock`). Upstream ends a run,
+peak `torch.cuda.max_memory_reserved` of the training steps and, apart from it, that of upstream's
+latent step (`ensure_train_latents`, which encodes the corpus through Mimi when the run's latents
+are not cached; after it returns, the cache is emptied and the peak statistic reset, so its
+one-time precompute is not counted in the training's peak), the optimizer steps and their rate
+(a global optimizer post-step hook; the first `WARMUP_STEPS` are left out), the loss of each
+step (the scalar `backward` received, summed over the step's micro-batches, averaged per
+`LOSS_WINDOW` steps) and the longest `save_checkpoint` call, timed on its own clock
+(`save_clock`). Upstream ends a run,
 at its last step and on a stop, with `training.distributed.exit_training`, whose `os._exit(0)`
 skips every `finally`, so the child wraps that function to write the metrics before the exit.
 
@@ -46,7 +50,10 @@ Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` 
 `probe` trains `PROBE_STEPS` optimizer steps at each batch in turn, with accumulation to the
 effective batch upstream requires, stopping at the first that does not fit (its peak above the
 free VRAM less `HEADROOM_MIB`, or out of memory), and writes `probe.json`, with the longest
-checkpoint save of any trial as `save_s`, from which a stop's grace is sized. `train` runs the
+checkpoint save of any trial as `save_s`, from which a stop's grace is sized. Each trial records
+the latent step's peak as `latents_peak_vram_mib`, outside the fit; when CUDA ran out of memory
+in that step, the probe fails with no fit verdict, because the precompute runs at upstream's own
+batch, not the trial's. `train` runs the
 fine-tune from the 24-layer base and then the distillation, the student warm-started from the
 released 6-layer student (`student_init_from`) and taught by the fine-tune's newest checkpoint.
 Upstream resumes from its newest checkpoint by itself, saves at `ckpt_freq` and at `max_steps`,
@@ -106,6 +113,9 @@ TRAIN_MODULE = "training.train"
 CHECKPOINTING_MODULE = "training.checkpointing"
 # Home of `exit_training`, upstream's hard exit (`os._exit(0)`) at the end of a run and on a stop.
 DISTRIBUTED_MODULE = "training.distributed"
+# Home of `ensure_train_latents`, upstream's latent step: it encodes the corpus through Mimi when
+# the run's latents are not cached, once, before the first training step.
+TRAIN_UTILS_MODULE = "training.train_utils"
 # The CUDA caching allocator's options, read once when it initializes, and the one upstream's
 # `train.py` sets at its entry point (`allocator_conf`).
 ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
@@ -572,6 +582,12 @@ def run_probe(
         if stopped is not None:
             raise StageError(f"the probe was stopped by a {stopped} before it finished")
         metrics = read_metrics(metrics_path)
+        if metrics.get("oom_in_latents") is True:
+            # The precompute's batch is upstream's own, whatever the trial's: no fit verdict.
+            raise StageError(
+                f"the latent precompute ran out of memory at batch {batch}, before any training "
+                "step; it measures no batch's fit"
+            )
         oom = code == CHILD_OOM and bool(metrics.get("oom"))
         if code != 0 and not oom:
             raise StageError(f"the trainer exited {code} at batch {batch}")
@@ -585,6 +601,7 @@ def run_probe(
         )  # fmt: skip
         trials.append(
             {"batch": batch, "accum": int(doc["grad_accum_steps"]), "peak_vram_mib": peak,  # type: ignore[call-overload]
+             "latents_peak_vram_mib": _mib(metrics.get("latents_peak_reserved_bytes")),
              "free_vram_mib": free, "steps_per_s": rate,
              "save_s": _seconds(metrics.get("save_s")), "oom": oom, "fits": fits}
         )  # fmt: skip
@@ -1149,6 +1166,45 @@ def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callab
     return restore
 
 
+class LatentsStep:
+    """Measures upstream's latent step (`ensure_train_latents`) apart from the training steps.
+
+    When the step returns, three calls follow, in this order: `max_memory_reserved` is kept as
+    `peak`; `empty_cache` releases the blocks the step freed but the caching allocator still
+    holds; `reset_peak_memory_stats` sets the peak to what is reserved after that release. A
+    reset before the release would carry those cached blocks into the training's peak. The
+    three run on every return, when the latents were cached and nothing was encoded too.
+    `running` is true from the call until the step returns, so it stays true when the step
+    raised, and an out-of-memory error can be told apart from one in the training steps.
+    """
+
+    def __init__(self, cuda: object) -> None:
+        self._cuda = cuda
+        self.peak: int | None = None
+        self.running = False
+
+    def install(self, module: object) -> Callable[[], None]:
+        """Wrap `module.ensure_train_latents`; return the call that undoes it."""
+        original = module.ensure_train_latents  # type: ignore[attr-defined]
+        cuda = self._cuda
+
+        def ensure_train_latents(*args: object, **kwargs: object) -> object:
+            self.running = True
+            result = original(*args, **kwargs)
+            self.running = False
+            self.peak = int(cuda.max_memory_reserved())  # type: ignore[attr-defined]
+            cuda.empty_cache()  # type: ignore[attr-defined]
+            cuda.reset_peak_memory_stats()  # type: ignore[attr-defined]
+            return result
+
+        module.ensure_train_latents = ensure_train_latents  # type: ignore[attr-defined]
+
+        def restore() -> None:
+            module.ensure_train_latents = original  # type: ignore[attr-defined]
+
+        return restore
+
+
 def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Path | None) -> int:
     """Run upstream's trainer on `config` in this process; write the metrics; return the code.
 
@@ -1161,6 +1217,13 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
     when CUDA ran out of memory, and upstream's own `SystemExit` (for example a refused config,
     no CUDA device or a non-finite gradient) passes through after the metrics are written.
 
+    The peak in the metrics, `peak_reserved_bytes`, is that of the training steps: upstream's
+    latent step (`training.train_utils.ensure_train_latents`, which `train.py` also binds by name
+    at import) is wrapped the same way, and when it returns its own peak is recorded as
+    `latents_peak_reserved_bytes` and the peak statistic starts again (`LatentsStep`). When the
+    step never returned, that key is null and the peak is the whole run's. `oom_in_latents` is
+    true when CUDA ran out of memory while that step was running.
+
     The allocator config is set first, before anything here imports torch (`allocator_conf`).
     """
     os.environ[ALLOC_CONF] = allocator_conf(os.environ.get(ALLOC_CONF))
@@ -1169,6 +1232,7 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
 
     free = int(torch.cuda.mem_get_info()[0])
     monitor = StepMonitor(time.perf_counter)
+    latents = LatentsStep(torch.cuda)
     checkpointing = importlib.import_module(CHECKPOINTING_MODULE)
     if export_dir is not None:
         install_export(checkpointing, export_dir)
@@ -1182,28 +1246,34 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
                 "schema": SCHEMA,
                 "free_bytes": free,
                 "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                "latents_peak_reserved_bytes": latents.peak,
                 "steps": len(monitor.times),
                 "steps_per_s": monitor.steps_per_s(),
                 "save_s": saves.longest(),
                 "losses": monitor.windows(),
                 "oom": oom,
+                "oom_in_latents": oom and latents.running,
             },
         )
 
     distributed = importlib.import_module(DISTRIBUTED_MODULE)
+    train_utils = importlib.import_module(TRAIN_UTILS_MODULE)
     saved_argv, saved_cwd = sys.argv, os.getcwd()
     oom = False
     monitor.install(torch)
-    # The last statement before `try`, so the `finally` that restores it covers every raise.
-    restore_exit = install_exit_hook(distributed, lambda: write_metrics(False))
+    # Each wrapper is installed inside `try`, so the `finally` undoes every one that went in.
+    restores: list[Callable[[], None]] = []
     try:
+        restores.append(latents.install(train_utils))
+        restores.append(install_exit_hook(distributed, lambda: write_metrics(False)))
         os.chdir(upstream)
         sys.argv = [TRAIN_MODULE, str(config)]
         runpy.run_module(TRAIN_MODULE, run_name="__main__", alter_sys=True)
     except torch.cuda.OutOfMemoryError:
         oom = True
     finally:
-        restore_exit()
+        while restores:
+            restores.pop()()
         sys.argv = saved_argv
         os.chdir(saved_cwd)
         monitor.remove()

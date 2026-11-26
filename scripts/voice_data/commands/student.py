@@ -4,8 +4,10 @@
 (`stages/student_train.py`) that trains the 24-layer base for `PROBE_STEPS` optimizer steps at
 batch 2, then 4, then 8, each with accumulation to `EFFECTIVE_BATCH` (upstream requires it),
 and each next batch only when the last one fitted (with `--batch N`, at N alone). A batch fits
-when its peak `torch.cuda.max_memory_reserved` stays at or below the free VRAM the job saw
-minus `HEADROOM_MIB`. The job writes `students/<R>/probe.json`: the largest batch that fits,
+when the peak `torch.cuda.max_memory_reserved` of its training steps stays at or below the free
+VRAM the job saw minus `HEADROOM_MIB`; upstream's one-time latent precompute, which a run with
+no cached latents runs before its first step, is measured apart and not counted. The job writes
+`students/<R>/probe.json`: the largest batch that fits,
 its accumulation, its peak and free VRAM in MiB, its optimizer steps/s, the hours the
 pre-registered steps would take at that rate, and `save_s`, the longest checkpoint save the
 trials timed, in seconds to one decimal. The `--run` names the run that `student train`
@@ -462,7 +464,14 @@ def run_probe(args: argparse.Namespace) -> int:
 
 
 def probe_lines(run_id: str, probe: Mapping[str, object]) -> list[str]:
-    """Return what `student probe` prints: each batch's fit, then the batch chosen."""
+    """Return what `student probe` prints: each batch's fit, then the batch chosen.
+
+    A trial whose latent step peaked above its training peak (`latents_peak_vram_mib` over
+    `peak_vram_mib`, both numbers) gets a line of its own under its batch, because leaving that
+    step out of the fit changed the measurement. Every trial whose latent step returned records that peak;
+    one at or below the training peak, such as the resident weights when the latents were
+    already cached, prints nothing.
+    """
     lines = [f"student probe {run_id}: free {_num(probe.get('free_vram_mib'), 0)} MiB"]
     trials = probe.get("trials")
     for trial in trials if isinstance(trials, list) else []:
@@ -473,6 +482,13 @@ def probe_lines(run_id: str, probe: Mapping[str, object]) -> list[str]:
             f"  batch {_num(trial.get('batch'))}: peak {_num(trial.get('peak_vram_mib'), 0)} "
             f"MiB, {_num(trial.get('steps_per_s'))} steps/s, {fit}"
         )
+        latents = _finite(trial.get("latents_peak_vram_mib"))
+        peak = _finite(trial.get("peak_vram_mib"))
+        if latents is not None and peak is not None and latents > peak:
+            lines.append(
+                f"    latent step: peak {_num(latents, 0)} MiB, above the training peak, "
+                "not counted"
+            )
     if probe.get("batch") is None:
         lines.append("  no batch fits")
     else:
