@@ -17,16 +17,16 @@ that entry point runs (`allocator_conf`). It puts the clone first on
 `training` and the `pocket_tts` it imports come from one commit and not from the installed 4.0.1
 wheel. It then runs `training.train` as `__main__` with the config as its one argument, from the
 clone's root, and writes what it measured to a metrics file: the free VRAM before the run, the
-peak `torch.cuda.max_memory_reserved` of the training steps and, apart from it, that of upstream's
-latent step (`ensure_train_latents`, which encodes the corpus through Mimi when the run's latents
-are not cached; after it returns, the cache is emptied and the peak statistic reset, so its
-one-time precompute is not counted in the training's peak), the optimizer steps and their rate
-(a global optimizer post-step hook; the first `WARMUP_STEPS` are left out), the loss of each
-step (the scalar `backward` received, summed over the step's micro-batches, averaged per
-`LOSS_WINDOW` steps) and the longest `save_checkpoint` call, timed on its own clock
-(`save_clock`). Upstream ends a run,
-at its last step and on a stop, with `training.distributed.exit_training`, whose `os._exit(0)`
-skips every `finally`, so the child wraps that function to write the metrics before the exit.
+peak `torch.cuda.max_memory_reserved` after upstream's latent step and, apart from it, that of
+the latent step itself (`ensure_train_latents`, which encodes the corpus through Mimi when the
+run's latents are not cached; after it returns, the cache is emptied and the peak statistic
+reset, so its one-time precompute is not counted in the later peak), the optimizer steps and
+their rate (a global optimizer post-step hook; the first `WARMUP_STEPS` are left out), the loss
+of each step (the scalar `backward` received, summed over the step's micro-batches, averaged
+per `LOSS_WINDOW` steps) and the longest `save_checkpoint` call, timed on its own clock
+(`save_clock`). Upstream ends a run, at its last step and on a stop, with
+`training.distributed.exit_training`, whose `os._exit(0)` skips every `finally`, so the child
+wraps that function to write the metrics before the exit.
 
 Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` and the configs'
 `hf://` URIs name a revision (`49252265`) the cache does not hold:
@@ -1167,15 +1167,15 @@ def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callab
 
 
 class LatentsStep:
-    """Measures upstream's latent step (`ensure_train_latents`) apart from the training steps.
+    """Measures upstream's latent step (`ensure_train_latents`) apart from what runs after it.
 
     When the step returns, three calls follow, in this order: `max_memory_reserved` is kept as
     `peak`; `empty_cache` releases the blocks the step freed but the caching allocator still
     holds; `reset_peak_memory_stats` sets the peak to what is reserved after that release. A
-    reset before the release would carry those cached blocks into the training's peak. The
+    reset before the release would carry those cached blocks into the peak after the step. The
     three run on every return, when the latents were cached and nothing was encoded too.
     `running` is true from the call until the step returns, so it stays true when the step
-    raised, and an out-of-memory error can be told apart from one in the training steps.
+    raised, and an out-of-memory error in the step can be told apart from one after it.
     """
 
     def __init__(self, cuda: object) -> None:
@@ -1217,12 +1217,13 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
     when CUDA ran out of memory, and upstream's own `SystemExit` (for example a refused config,
     no CUDA device or a non-finite gradient) passes through after the metrics are written.
 
-    The peak in the metrics, `peak_reserved_bytes`, is that of the training steps: upstream's
-    latent step (`training.train_utils.ensure_train_latents`, which `train.py` also binds by name
-    at import) is wrapped the same way, and when it returns its own peak is recorded as
-    `latents_peak_reserved_bytes` and the peak statistic starts again (`LatentsStep`). When the
-    step never returned, that key is null and the peak is the whole run's. `oom_in_latents` is
-    true when CUDA ran out of memory while that step was running.
+    The peak in the metrics, `peak_reserved_bytes`, is that of everything after upstream's
+    latent step (the optimizer and EMA build, a resume's checkpoint load, the steps and the
+    saves): the latent step (`training.train_utils.ensure_train_latents`, which `train.py` also
+    binds by name at import) is wrapped the same way, and when it returns its own peak is
+    recorded as `latents_peak_reserved_bytes` and the peak statistic starts again
+    (`LatentsStep`). When the step never returned, that key is null and the peak is the whole
+    run's. `oom_in_latents` is true when CUDA ran out of memory while that step was running.
 
     The allocator config is set first, before anything here imports torch (`allocator_conf`).
     """

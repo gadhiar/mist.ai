@@ -1761,7 +1761,8 @@ def upstream_exit_is_bound(clone: Path) -> bool:
 
 def upstream_latents_is_bound(clone: Path) -> bool:
     """Whether `training.train_utils.ensure_train_latents` is the clone's own function again."""
-    function = sys.modules["training.train_utils"].ensure_train_latents  # type: ignore[attr-defined]
+    module = sys.modules["training.train_utils"]
+    function = module.ensure_train_latents  # type: ignore[attr-defined]
     return Path(function.__code__.co_filename).resolve().is_relative_to(clone.resolve())
 
 
