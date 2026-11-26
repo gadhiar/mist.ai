@@ -4,8 +4,10 @@
 (`stages/student_train.py`) that trains the 24-layer base for `PROBE_STEPS` optimizer steps at
 batch 2, then 4, then 8, each with accumulation to `EFFECTIVE_BATCH` (upstream requires it),
 and each next batch only when the last one fitted (with `--batch N`, at N alone). A batch fits
-when its peak `torch.cuda.max_memory_reserved` stays at or below the free VRAM the job saw
-minus `HEADROOM_MIB`. The job writes `students/<R>/probe.json`: the largest batch that fits,
+when the peak `torch.cuda.max_memory_reserved` of its training steps stays at or below the free
+VRAM the job saw minus `HEADROOM_MIB`; upstream's one-time latent precompute, which a run with
+no cached latents runs before its first step, is measured apart and not counted. The job writes
+`students/<R>/probe.json`: the largest batch that fits,
 its accumulation, its peak and free VRAM in MiB, its optimizer steps/s, the hours the
 pre-registered steps would take at that rate, and `save_s`, the longest checkpoint save the
 trials timed, in seconds to one decimal. The `--run` names the run that `student train`
