@@ -1088,12 +1088,12 @@ def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callab
 
     Upstream's `exit_training` ends with `os._exit(0)`, which runs no `finally` and no `atexit`
     handler, so whatever the child must leave behind has to be written before it. The exit still
-    happens when `before_exit` raises: a raise out of the wrapper would propagate through
-    `train.py` past upstream's cleanup, and the loader processes `exit_training` kills could then
-    keep the child alive. `os._exit` drops the exception in flight, so any failure of
-    `before_exit` is printed with its traceback first, and the log says why the parent then
-    finds no metrics. The flag, not `sys.exc_info()` alone, decides that it failed: a `finally`
-    also sees an exception an enclosing `except` is handling.
+    happens when `before_exit` raises, and when reporting that raises too: a raise out of the
+    wrapper would propagate through `train.py` past upstream's cleanup, and the loader processes
+    `exit_training` kills could then keep the child alive. `os._exit` drops the exception in
+    flight, so any failure of `before_exit` is printed with its traceback first, and the log says
+    why the parent then finds no metrics. The flag, not `sys.exc_info()` alone, decides that it
+    failed: a `finally` also sees an exception an enclosing `except` is handling.
     """
     original = module.exit_training  # type: ignore[attr-defined]
 
@@ -1103,10 +1103,13 @@ def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callab
             before_exit()
             written = True
         finally:
-            if not written:
-                print("error: the trainer's metrics could not be written", file=sys.stderr)
-                traceback.print_exc()
-            original(*args, **kwargs)
+            try:
+                if not written:
+                    print("error: the trainer's metrics could not be written", file=sys.stderr)
+                    traceback.print_exc()
+            finally:
+                # The report can fail too (a closed stderr); the exit happens regardless.
+                original(*args, **kwargs)
 
     module.exit_training = exit_training  # type: ignore[attr-defined]
 
@@ -1125,8 +1128,8 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
     wrapper that writes the metrics first (`install_exit_hook`) is installed on the module before
     `runpy` imports `train.py`, and removed again once the trainer returns or raises. The
     `finally` writes the same metrics on the paths that do not hard-exit: `CHILD_OOM` is returned
-    when CUDA ran out of memory, and upstream's own `SystemExit` (a refused config, no CUDA
-    device, a non-finite gradient) passes through after the metrics are written.
+    when CUDA ran out of memory, and upstream's own `SystemExit` (for example a refused config,
+    no CUDA device or a non-finite gradient) passes through after the metrics are written.
     """
     check_clone(upstream)
     import torch
