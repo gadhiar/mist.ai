@@ -10,8 +10,11 @@ in its `expressive` setting). The GPU sampler writes the engine's `vram.csv` thr
 Every engine but two speaks with a stock voice of its own. `pocket-clone` clones the identity clip
 a run passes (mist-realtime-voice plan v6, T41), mounted read-only at a fixed container path; a
 run without a clip leaves `pocket-clone` out, and its results keep the voice `identity` and the
-clip's sha256 prefix, never its path. `qwen3-design` speaks a voice designed from the fixed text
-of its arm. An `--extra-voice` name
+clip's sha256 prefix, never its path. `--voice-dir` passes a whole identity directory instead,
+trained weights included (mist-voice-fidelity plan v5, M17): it is mounted read-only at
+`/voice/<voice_id>`, and results keep its voice id and its weights' sha256 prefix, never its
+path. The probe reports each process's resident peak (`rss_peak_mib`) beside its timings.
+`qwen3-design` speaks a voice designed from the fixed text of its arm. An `--extra-voice` name
 the engine does not list is refused here before any write, and the probe refuses it again in the
 container. Containers mount the repository at `/work:ro` and the speech models directory
 read-only, run with `HF_HUB_OFFLINE=1` and publish no port; GPU engines share the bench server's
@@ -68,12 +71,12 @@ def _engine_cfg(engine_id: str, tts: Mapping[str, object]) -> Mapping[str, objec
     return tts[engine_id]
 
 
-def default_engines(tts: Mapping[str, object], voice_clip: object | None) -> tuple[str, ...]:
-    """Every arm, in file order, but `pocket-clone` only when a clip is given.
+def default_engines(tts: Mapping[str, object], voice: object | None) -> tuple[str, ...]:
+    """Every arm, in file order, but `pocket-clone` only when a clip or an identity is given.
 
     So a run without `--engine` needs no private file.
     """
-    return tuple(e for e in tts if e != core.VOICE_CLIP_ENGINE or voice_clip is not None)
+    return tuple(e for e in tts if e != core.VOICE_CLIP_ENGINE or voice is not None)
 
 
 def _item_ids(lines_doc: Mapping[str, object]) -> list[str]:
@@ -94,13 +97,18 @@ def _probe_argv(
     out_dir: str | None = None,
     name: str | None = None,
     voice_clip: str | None = None,
+    voice_dir: str | None = None,
+    voice_id: str | None = None,
 ) -> list[str]:
-    """`docker run` up to and including the probe's `--engine` and `--models-dir`.
+    """`docker run` up to and including the probe's `--engine`, `--models-dir` and `--voice-id`.
 
-    `pocket-clone` mounts `voice_clip` read-only at the adapter's fixed container path, and no
-    other engine takes one; the probe's own arguments never name the clip.
+    `pocket-clone` mounts `voice_clip` read-only at the adapter's fixed container path, or
+    `voice_dir`, an identity directory, read-only at `/voice/<voice_id>`; no other engine takes
+    either. The probe's own arguments never name a host path, only the identity's voice id.
     """
-    core.check_voice_clip_use([engine_id], voice_clip)
+    core.check_voice_source_use([engine_id], voice_clip, voice_dir)
+    if (voice_dir is None) != (voice_id is None):
+        raise core.SpeechBenchError("an identity mount needs both its directory and its voice id")
     argv = ["docker", "run", "--rm"]
     if name is not None:
         argv += ["--name", name]
@@ -117,10 +125,14 @@ def _probe_argv(
     argv += docker_cmds.ro_mount(speech_models_dir, tts_engines.CONTAINER_MODELS_DIR)
     if voice_clip is not None:
         argv += docker_cmds.ro_mount(voice_clip, tts_engines.CONTAINER_VOICE_CLIP)
+    if voice_dir is not None:
+        argv += docker_cmds.ro_mount(voice_dir, tts_engines.container_voice_dir(voice_id))
     if out_dir is not None:
         argv += ["-v", f"{out_dir}:{CONTAINER_OUT}"]
     argv += ["-w", docker_cmds.REPO_MOUNT, str(cfg["image"]), "python", "-m", PROBE_MODULE]
     argv += ["--engine", engine_id, "--models-dir", tts_engines.CONTAINER_MODELS_DIR]
+    if voice_id is not None:
+        argv += ["--voice-id", voice_id]
     return argv
 
 
@@ -140,6 +152,8 @@ def timed_argv(
     lines: Sequence[str] | None = None,
     arms: Mapping[str, object] | None = None,
     voice_clip: str | None = None,
+    voice_dir: str | None = None,
+    voice_id: str | None = None,
 ) -> list[str]:
     """The container argv of one timed pass, `idle` or `decoding`."""
     if condition not in tts_probe.CONDITIONS:
@@ -152,6 +166,8 @@ def timed_argv(
         speech_models_dir=speech_models_dir,
         out_dir=out_dir,
         voice_clip=voice_clip,
+        voice_dir=voice_dir,
+        voice_id=voice_id,
     )
     argv += ["--mode", "timed", "--condition", condition, "--seed", str(seed)]
     argv += ["--repeats", str(repeats), "--out", CONTAINER_OUT, *_line_flags(lines)]
@@ -169,6 +185,8 @@ def render_argv(
     lines: Sequence[str] | None = None,
     arms: Mapping[str, object] | None = None,
     voice_clip: str | None = None,
+    voice_dir: str | None = None,
+    voice_id: str | None = None,
 ) -> list[str]:
     """The container argv of the untimed listening clips."""
     cfg = _engine_cfg(engine_id, _tts_arms(arms))
@@ -179,6 +197,8 @@ def render_argv(
         speech_models_dir=speech_models_dir,
         out_dir=out_dir,
         voice_clip=voice_clip,
+        voice_dir=voice_dir,
+        voice_id=voice_id,
     )
     argv += ["--mode", "render", "--out", CONTAINER_OUT]
     argv += [flag for voice in voices for flag in ("--voice", voice)]
@@ -198,6 +218,8 @@ def loop_container_argv(
     lines_doc: Mapping[str, object] | None = None,
     name: str | None = None,
     voice_clip: str | None = None,
+    voice_dir: str | None = None,
+    voice_id: str | None = None,
 ) -> list[str]:
     """The argv of run 5's synthesis loop: load, warm up, `READY`, synthesize, `DONE`.
 
@@ -217,6 +239,8 @@ def loop_container_argv(
         speech_models_dir=speech_models_dir,
         name=name or f"mist-bench-tts-loop-{engine_id}",
         voice_clip=voice_clip,
+        voice_dir=voice_dir,
+        voice_id=voice_id,
     )
     return argv + ["--mode", "loop", "--line-id", line_id, "--seconds", f"{seconds:g}"]
 
@@ -285,14 +309,21 @@ class Sampler(Protocol):
 
 
 def loggable_argv(argv: Sequence[str]) -> list[str]:
-    """`argv` with the identity clip's host path shown as `core.VOICE_CLIP_PLACEHOLDER`.
+    """`argv` with the identity clip's host path shown as `core.VOICE_CLIP_PLACEHOLDER`, and an
+    identity directory's as `core.VOICE_DIR_PLACEHOLDER`.
 
-    A log sits in the results directory, which never holds the clip's path.
+    A log sits in the results directory, which never holds either path.
     """
-    target = f":{tts_engines.CONTAINER_VOICE_CLIP}:ro"
-    return [
-        f"{core.VOICE_CLIP_PLACEHOLDER}{target}" if arg.endswith(target) else arg for arg in argv
-    ]
+    clip = f":{tts_engines.CONTAINER_VOICE_CLIP}:ro"
+    identity = f":{tts_engines.CONTAINER_VOICE_ROOT}/"
+    shown = []
+    for arg in argv:
+        if arg.endswith(clip):
+            arg = f"{core.VOICE_CLIP_PLACEHOLDER}{clip}"
+        elif arg.endswith(":ro") and identity in arg:
+            arg = core.VOICE_DIR_PLACEHOLDER + arg[arg.rindex(identity) :]
+        shown.append(arg)
+    return shown
 
 
 class DockerRunner:
@@ -339,6 +370,7 @@ class TtsRequest:
     lines: tuple[str, ...] | None = None
     baseline_s: float = BASELINE_S
     voice_clip: Path | None = field(default=None, repr=False)
+    voice_dir: Path | None = field(default=None, repr=False)
 
 
 def _read_rows(path: Path) -> list[dict]:
@@ -365,7 +397,7 @@ def _refuse_before_writing(request: TtsRequest, tts: Mapping[str, object], lines
         raise core.SpeechBenchError(f"engines {list(request.engines)} must be distinct, not none")
     for engine_id in request.engines:
         _engine_cfg(engine_id, tts)
-    core.check_voice_clip_use(request.engines, request.voice_clip)
+    core.check_voice_source_use(request.engines, request.voice_clip, request.voice_dir)
     if request.lines is not None:
         unknown = [i for i in request.lines if i not in _item_ids(lines_doc)]
         if unknown:
@@ -388,19 +420,36 @@ class _EngineRun:
     models_dir: str
     arms: Mapping[str, object]
     clip: core.VoiceClip | None = None
+    identity: core.VoiceDir | None = None
 
-    @property
-    def voice_clip(self) -> str | None:
-        """The clip's host path for `pocket-clone`'s mount; None for every other engine."""
-        if self.engine_id != core.VOICE_CLIP_ENGINE or self.clip is None:
-            return None
-        return self.clip.path.as_posix()
+    def voice_mounts(self) -> dict[str, str | None]:
+        """The clip's or the identity's host path (and voice id) for `pocket-clone`'s mount;
+        all None for every other engine.
+        """
+        mounts: dict[str, str | None] = {"voice_clip": None, "voice_dir": None, "voice_id": None}
+        if self.engine_id != core.VOICE_CLIP_ENGINE:
+            return mounts
+        if self.clip is not None:
+            mounts["voice_clip"] = self.clip.path.as_posix()
+        if self.identity is not None:
+            mounts["voice_dir"] = self.identity.path.as_posix()
+            mounts["voice_id"] = self.identity.voice_id
+        return mounts
 
-    def clip_fields(self) -> dict[str, str]:
-        """What a cloned run's rows record of the clip: its sha256 prefix, never its path."""
-        if self.voice_clip is None:
+    def voice_fields(self) -> dict[str, str | None]:
+        """What a cloned run's rows record of its voice: the clip's sha256 prefix, or the
+        identity's voice id and trained weights' sha256 prefix, never a path.
+        """
+        if self.engine_id != core.VOICE_CLIP_ENGINE:
             return {}
-        return {"voice_clip_sha256": self.clip.sha256_prefix}
+        if self.clip is not None:
+            return {"voice_clip_sha256": self.clip.sha256_prefix}
+        if self.identity is not None:
+            return {
+                "voice_id": self.identity.voice_id,
+                "voice_weights_sha256": self.identity.weights_sha256_prefix,
+            }
+        return {}
 
     def timed(self, condition: str, on_line: Callable[[str], None]) -> dict:
         argv = timed_argv(
@@ -413,7 +462,7 @@ class _EngineRun:
             repeats=self.request.repeats,
             lines=self.request.lines,
             arms=self.arms,
-            voice_clip=self.voice_clip,
+            **self.voice_mounts(),
         )
         self._run(argv, f"{condition}.log", on_line)
         rows = _read_rows(self.claim.path / tts_probe.probe_file(condition))
@@ -427,7 +476,7 @@ class _EngineRun:
         with self.claim.shared_jsonl(SAMPLES_FILE) as writer:
             for row in samples:
                 kept = {k: v for k, v in row.items() if k != "row_type"}
-                writer.write({**kept, **self.clip_fields()})
+                writer.write({**kept, **self.voice_fields()})
         return loads[0]
 
     def render(self, voices: Sequence[str], expressive: bool) -> None:
@@ -440,7 +489,7 @@ class _EngineRun:
             speech_models_dir=self.models_dir,
             lines=self.request.lines,
             arms=self.arms,
-            voice_clip=self.voice_clip,
+            **self.voice_mounts(),
         )
         self._run(argv, "render.log", lambda line: None)
 
@@ -522,7 +571,7 @@ def _run_engine(run: _EngineRun, *, load_gen_factory, sampler_factory) -> None:
                 "seed": run.request.seed,
                 "repeats": run.request.repeats,
                 "lines": list(run.request.lines) if run.request.lines is not None else None,
-                **run.clip_fields(),
+                **run.voice_fields(),
             }
         )
 
@@ -543,19 +592,22 @@ def run_tts(
     """Run every requested engine in turn; return the `tts/` results directory.
 
     Refuses before any write: an unlisted extra voice, an unknown engine or line, `pocket-clone`
-    without a clip or a clip without `pocket-clone`, a clip that is missing or inside the
-    repository, a results root inside the repository, a missing speech models directory, a bench
-    server that is not running, and an engine whose results directory already exists. `clock`
-    marks the decoding window and must be the clock the load generator stamps its completions
-    with.
+    with neither a clip nor an identity directory, both, or either without `pocket-clone`, a clip
+    or identity directory that is missing or inside the repository, an identity directory with
+    no usable `voice.json`, a results root inside the repository, a missing speech models
+    directory, a bench server that is not running, and an engine whose results directory already
+    exists. `clock` marks the decoding window and must be the clock the load generator stamps its
+    completions with.
     """
     arms_doc = arms if arms is not None else core.load_json(core.SPEECH_ARMS_PATH)
     tts = _tts_arms(arms_doc)
     lines = lines_doc if lines_doc is not None else core.load_json(core.LINES_PATH)
     _refuse_before_writing(request, tts, lines)
-    clip = None
+    clip = identity = None
     if request.voice_clip is not None:
         clip = core.check_voice_clip(request.voice_clip, repo_root=repo_root)
+    if request.voice_dir is not None:
+        identity = core.check_voice_dir(request.voice_dir, repo_root=repo_root)
     speech = core.speech_root(request.results_root, request.run, repo_root=repo_root)
     if not request.speech_models_dir.is_dir():
         raise core.SpeechBenchError(
@@ -593,6 +645,7 @@ def run_tts(
             models_dir=request.speech_models_dir.resolve().as_posix(),
             arms=arms_doc,
             clip=clip,
+            identity=identity,
         )
         _run_engine(run, load_gen_factory=load_gen_factory, sampler_factory=sampler_factory)
     return tts_dir
@@ -609,7 +662,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
     request = TtsRequest(
         results_root=args.results_root,
         run=args.run,
-        engines=tuple(args.engine or default_engines(tts, args.voice_clip)),
+        engines=tuple(args.engine or default_engines(tts, args.voice_clip or args.voice_dir)),
         speech_models_dir=models_dir,
         extra_voices=extra,
         seed=args.seed,
@@ -617,6 +670,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
         lines=tuple(args.lines) if args.lines else None,
         baseline_s=args.baseline_s,
         voice_clip=args.voice_clip,
+        voice_dir=args.voice_dir,
     )
     try:
         tts_dir = run_tts(
@@ -627,7 +681,8 @@ def cmd_tts(args: argparse.Namespace) -> int:
             sampler_factory=bench_host.GpuSampler,
         )
     except core.VoiceClipError as exc:
-        # `run_tts` checks the clip before it reads a container state or writes anything.
+        # `run_tts` checks the clip or the identity directory (`VoiceDirError`, a subclass)
+        # before it reads a container state or writes anything.
         print(f"[REFUSED] {exc}")
         return 2
     print(f"tts ok: {', '.join(request.engines)}; results in {tts_dir}")
@@ -647,7 +702,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--engine",
         action="append",
-        help="an engine id from speech_arms.json (default: all but pocket-clone)",
+        help="an engine id from speech_arms.json (default: all, pocket-clone only with "
+        "--voice-clip or --voice-dir)",
     )
     parser.add_argument(
         "--extra-voice",
@@ -669,11 +725,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         default=Path(env_models) if env_models else None,
         help=f"host speech models directory, <org>/<repo>/ layout (env {SPEECH_MODELS_DIR_ENV})",
     )
-    parser.add_argument(
+    voice = parser.add_mutually_exclusive_group()
+    voice.add_argument(
         "--voice-clip",
         type=Path,
         help=f"the identity WAV {core.VOICE_CLIP_ENGINE} clones, outside the checkout; "
-        f"needed by {core.VOICE_CLIP_ENGINE} and refused without it",
+        f"it or --voice-dir is needed by {core.VOICE_CLIP_ENGINE} and refused without it",
+    )
+    voice.add_argument(
+        "--voice-dir",
+        type=Path,
+        help=f"an identity directory (voice.json, its clips and any trained weights) "
+        f"{core.VOICE_CLIP_ENGINE} speaks as, outside the checkout, mounted read-only",
     )
     parser.set_defaults(func=cmd_tts)
 
@@ -804,6 +867,21 @@ def selftest() -> None:
         _check(
             "/c/clip.wav" not in " ".join(loggable_argv(argv)), f"{engine_id} logs the clip path"
         )
+
+    identity = timed_argv(
+        core.VOICE_CLIP_ENGINE,
+        "idle",
+        out_dir="/r/tts/x",
+        repo_dir="/repo",
+        speech_models_dir="/m",
+        voice_dir="/v/private",
+        voice_id="selftest",
+    )
+    _check(
+        "/v/private" not in " ".join(loggable_argv(identity))
+        and f"{core.VOICE_DIR_PLACEHOLDER}:/voice/selftest:ro" in loggable_argv(identity),
+        "an identity mount's host path is logged",
+    )
 
     _check(tts_probe.first_segment("a" * 39 + ", b") == "a" * 39 + ",", "cut at 40")
     _check(tts_probe.first_segment("a" * 38 + ", b") == "a" * 38 + ", b", "no cut before 40")

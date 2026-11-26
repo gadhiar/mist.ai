@@ -237,7 +237,7 @@ backend/
 │   ├── lanes.py                 # Inference lanes: one worker thread per engine, so model calls never block the event loop
 │   ├── playback.py              # Downlink playback: the session's `turn` lane, the pacer that feeds it and the ledger
 │   ├── power.py                 # Power level on the realtime path: the gate that turns and voice read
-│   ├── protocol.py              # Realtime protocol 2.0.0: the binary frame codec and the control message schemas
+│   ├── protocol.py              # Realtime protocol 2.1.0: the binary frame codec and the control message schemas
 │   ├── registry.py              # The process's sessions: routing, log streaming, voice activity and wake arbitration
 │   ├── runtime.py               # The composed realtime runtime, and the walk that loads each speech slot from its chain
 │   ├── scene.py                 # Scene seam: what the turn controller tells the screen, anchored to the audio clock
@@ -415,7 +415,7 @@ Tauri Frontend (./mist-frontend/)
   -> WebSocket (ws://localhost:8001/ws)
 Backend Server (server.py)
   -> one RealtimeSession per connection (backend/realtime/session.py)
-  -> binary audio frames OR text messages (protocol 2.0.0)
+  -> binary audio frames OR text messages (protocol 2.1.0)
 Per-session TurnController (backend/realtime/turn.py):
   voice turns: VAD -> STT -> end of turn -> LLM -> TTS
   typed turns: text -> LLM

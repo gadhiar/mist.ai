@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -29,6 +30,17 @@ REMOTE_MODULE = "scripts.voice_data.remote"
 INSPECT_FORMAT = "{{.Name}} {{json .HostConfig.DeviceRequests}}"
 # The preflight's nvidia-smi arguments; nvidia-smi itself is the entrypoint (see `preflight`).
 NVIDIA_SMI_QUERY = ("--query-gpu=memory.free", "--format=csv,noheader,nounits")
+# Comma-separated container names the preflight lets keep a GPU, such as the daily backend while
+# a gaming-mode window has moved its speech engines to CPU but left its CUDA context open.
+GPU_PEERS_ENV = "MIST_VOICE_GPU_PEERS"
+# Optional per-family resource caps in `families.json`: key, `docker run` flag, value suffix.
+# They keep a job inside the RAM and cores a shared host can spare beside the daily stack. A
+# `cpus` budget also pins the job's CPU affinity (`--cpuset-cpus`, see `cpuset_for`).
+FAMILY_CAPS = (
+    ("shm_gb", "--shm-size", "g"),
+    ("memory_gb", "--memory", "g"),
+    ("cpus", "--cpus", ""),
+)
 
 
 class PreflightError(VoiceDataError):
@@ -51,6 +63,12 @@ class JobSpec:
     env_names: tuple[str, ...] = ()
     optional_env_names: tuple[str, ...] = ()
     est_hours: float = 0.0
+    # The VRAM this job needs, when it differs from the family's estimate: a probe's measured
+    # batch, or a training run sized to fit beside a peer. `None` uses the family's `vram_gb`.
+    vram_gb: float | None = None
+    # Seconds Docker waits between SIGTERM and SIGKILL (`--stop-timeout`), for a job whose
+    # SIGTERM save outlasts Docker's default 10 s. `None` keeps Docker's default.
+    stop_timeout_s: int | None = None
 
     def record(self) -> JobRecord:
         """Return the job as its `runs/<job_id>/job.json` record."""
@@ -115,6 +133,29 @@ class HostDocker:
         return proc.returncode
 
 
+def cpuset_for(cpus: float) -> str:
+    """Return the `--cpuset-cpus` range that matches a family's `cpus` budget.
+
+    `--cpus` is a CFS quota: it limits CPU time but leaves `os.sched_getaffinity(0)` at every
+    core of the Docker VM, so a process pool or thread count sized from the affinity is sized
+    for the whole VM. The Pocket TTS trainer's latent precompute starts `max(4, cores - 2)`
+    workers, 14 on a 16-core VM, and those 14 workers, each importing torch, ran past the job's
+    memory cap. Pinning `ceil(cpus)` cores makes the affinity agree with the budget, while
+    `--cpus` still caps a fractional one.
+
+    The range starts at core 0 because `0-<k-1>` exists on any Docker VM that accepts
+    `--cpus k`, so it needs no query of the VM's core count and `argv` makes no docker call.
+    The count is clamped to `os.cpu_count()` so the range never names a core this host lacks;
+    Docker refuses a `--cpus` above the VM's cores either way. When `os.cpu_count()` returns
+    `None`, the rounded-up budget is used unclamped.
+    """
+    cores = math.ceil(cpus)
+    host = os.cpu_count()
+    if host is not None:
+        cores = min(cores, host)
+    return "0" if cores == 1 else f"0-{cores - 1}"
+
+
 def load_families(path: Path = FAMILIES_PATH) -> Mapping[str, Mapping[str, object]]:
     """Return the `families` map of `families.json`.
 
@@ -128,14 +169,23 @@ def load_families(path: Path = FAMILIES_PATH) -> Mapping[str, Mapping[str, objec
 
 
 class LocalDocker:
-    """Runs jobs on this host's Docker, after the GPU-idle preflight for GPU jobs."""
+    """Runs jobs on this host's Docker, after the GPU-idle preflight for GPU jobs.
+
+    `peers` names containers every GPU job may share the card with; `executor_for` reads them
+    from `MIST_VOICE_GPU_PEERS`.
+    """
 
     def __init__(
-        self, root: Root, docker: DockerOps, families: Mapping[str, Mapping[str, object]]
+        self,
+        root: Root,
+        docker: DockerOps,
+        families: Mapping[str, Mapping[str, object]],
+        peers: frozenset[str] = frozenset(),
     ) -> None:
         self._root = root
         self._docker = docker
         self._families = families
+        self._peers = peers
 
     def _family(self, name: str) -> Mapping[str, object]:
         family = self._families.get(name)
@@ -152,20 +202,35 @@ class LocalDocker:
     def argv(self, job: JobSpec) -> list[str]:
         """Return the `docker run` argv for a job.
 
+        A family's `cpus` budget adds `--cpuset-cpus` beside `--cpus`, because the quota alone
+        leaves the container's affinity at every core of the Docker VM (see `cpuset_for`).
+
         Raises:
             RootError: An input or the outputs resolve outside the root.
-            InputError: An `env_names` entry is unset on the host, or the family is unknown.
+            InputError: An `env_names` entry is unset on the host, the family is unknown, or a
+                family cap is not a positive number.
         """
         missing = [name for name in job.env_names if not os.environ.get(name)]
         if missing:
             raise InputError(f"refused: env var {', '.join(missing)} is unset")
-        venv = self._family(job.family)["venv"]
+        family = self._family(job.family)
+        venv = family["venv"]
         fetch = job.module == FETCH_MODULE
         argv = ["docker", "run", "--rm", "--name", f"mvd-{job.job_id}"]
         if not job.network:
             argv += ["--network", "none"]
         if job.gpu:
             argv += ["--gpus", "all"]
+        for key, flag, suffix in FAMILY_CAPS:
+            if key in family:
+                value = family[key]
+                if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+                    raise InputError(f"refused: {job.family} {key} is not a positive number")
+                if key == "cpus":
+                    argv += ["--cpuset-cpus", cpuset_for(value)]
+                argv += [flag, f"{value:g}{suffix}"]
+        if job.stop_timeout_s is not None:
+            argv += ["--stop-timeout", str(job.stop_timeout_s)]
         for item in job.inputs:
             argv += ["-v", f"{self._inside(item.rel)}:/data/{item.rel}:ro"]
         argv += ["-v", f"{self._root.writable(job.outputs)}:/data/{job.outputs}"]
@@ -178,34 +243,42 @@ class LocalDocker:
         for name in job.optional_env_names:
             if os.environ.get(name):
                 argv += ["-e", name]
-        argv += [job.image, f"{venv}/bin/python", "-I", "-m", job.module, "--data", "/data"]
+        # `-u`: the log shows each line as it is printed; `-I` ignores `PYTHONUNBUFFERED`.
+        argv += [job.image, f"{venv}/bin/python", "-I", "-u", "-m", job.module, "--data", "/data"]
         return argv + list(job.args)
 
     def preflight(self, job: JobSpec, allow: frozenset[str] = frozenset()) -> None:
         """Refuse a GPU job while another container holds a GPU or free VRAM is short.
 
         GPU users outside Docker are invisible here; the daily stack runs every GPU service in
-        Docker. `allow` names containers that may keep their GPU (the bench's E4B server).
-        nvidia-smi runs as the entrypoint because a CUDA base image's own entrypoint prints its
-        banner to stdout first, and stdout must hold only one free-MiB line per GPU.
+        Docker. `allow` names containers that may keep their GPU for this call (the bench's E4B
+        server), and the executor's peers may keep theirs for every call. A peer still uses
+        VRAM, so the free-VRAM check runs even when only peers hold the card. nvidia-smi runs
+        as the entrypoint because a CUDA base image's own entrypoint prints its banner to stdout
+        first, and stdout must hold only one free-MiB line per GPU.
 
         Raises:
-            PreflightError: A container outside `allow` holds a GPU, or free VRAM is below the
-                family's `vram_gb`.
+            PreflightError: A container outside `allow` and the peers holds a GPU, or free VRAM
+                is below the job's `vram_gb`, or the family's when the job sets none.
         """
+        allowed = allow | self._peers
         for cid in self._docker.capture(["docker", "ps", "-q"]).split():
             line = self._docker.capture(["docker", "inspect", "--format", INSPECT_FORMAT, cid])
             name, _, requests = line.strip().partition(" ")
             name = name.lstrip("/")
-            if json.loads(requests or "null") and name not in allow:
+            if json.loads(requests or "null") and name not in allowed:
                 raise PreflightError(f"refused: container {name} holds a GPU; stop it first")
         smi = ["docker", "run", "--rm", "--network", "none", "--gpus", "all"]
         smi += ["--entrypoint", "nvidia-smi", job.image, *NVIDIA_SMI_QUERY]
         free_mib = max(int(v) for v in self._docker.capture(smi).split())
-        need_gb = float(self._family(job.family)["vram_gb"])  # type: ignore[arg-type]
+        if job.vram_gb is not None:
+            need_gb, who = float(job.vram_gb), f"job {job.job_id}"
+        else:
+            need_gb = float(self._family(job.family)["vram_gb"])  # type: ignore[arg-type]
+            who = f"family {job.family}"
         if free_mib / 1024 < need_gb:
             raise PreflightError(
-                f"refused: {free_mib / 1024:.1f} GB VRAM free, family {job.family} needs {need_gb:g}"
+                f"refused: {free_mib / 1024:.1f} GB VRAM free, {who} needs {need_gb:g}"
             )
 
     def run(self, job: JobSpec, allow: frozenset[str] = frozenset()) -> JobResult:
@@ -243,6 +316,12 @@ class LocalDocker:
         return files
 
 
+def gpu_peers() -> frozenset[str]:
+    """Return the container names `MIST_VOICE_GPU_PEERS` lists; blanks are dropped."""
+    raw = os.environ.get(GPU_PEERS_ENV, "")
+    return frozenset(name for name in (part.strip() for part in raw.split(",")) if name)
+
+
 def executor_for(
     name: str,
     *,
@@ -253,13 +332,17 @@ def executor_for(
     """Return the executor `local` or `remote:<alias>` names; every command gets one here.
 
     The remote executor is imported only when asked for, so local runs work before it exists.
+    The local executor's GPU peers come from `MIST_VOICE_GPU_PEERS`, so no command needs a flag.
 
     Raises:
         InputError: An unknown name, or the remote executor is not installed.
     """
     if name == "local":
         return LocalDocker(
-            root, docker or HostDocker(), load_families() if families is None else families
+            root,
+            docker or HostDocker(),
+            load_families() if families is None else families,
+            gpu_peers(),
         )
     kind, _, alias = name.partition(":")
     if kind != "remote" or not alias:

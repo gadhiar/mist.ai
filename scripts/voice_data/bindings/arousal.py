@@ -3,8 +3,10 @@
 The checkpoint is not a stock transformers class: its card defines `EmotionModel`, a wav2vec 2.0
 encoder whose hidden states are mean-pooled into a regression head (dense, tanh, out_proj), and
 that definition is reproduced here. The head's three outputs are arousal, dominance and valence,
-each about 0 to 1; arousal is the first, clipped to 0..1. A checkpoint that leaves any of these
-weights missing would give an untrained head, so missing keys are refused rather than warned.
+each about 0 to 1. `arousal` returns the first, clipped to 0..1, for extract and the take gate;
+`dimensions` returns all three, each clipped, for the labels pre-fill. A checkpoint that leaves
+any of these weights missing would give an untrained head, so missing keys are refused rather
+than warned.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from ..stages.fetch import SCORE, library_errors, model_dir, prepare
 MODEL = "arousal"
 RATE = 16000
 AROUSAL_INDEX = 0
+# The head's outputs in the card's order: arousal, dominance, valence.
+DIMENSION_INDICES = (0, 1, 2)
 
 
 def emotion_model_class() -> type:
@@ -62,7 +66,7 @@ def emotion_model_class() -> type:
 
 
 class Arousal:
-    """The model's arousal output, clipped to 0..1."""
+    """The model's outputs, each clipped to 0..1: arousal alone, or all three dimensions."""
 
     def __init__(self, extractor: object, model: object, device: str) -> None:
         self._extractor = extractor
@@ -82,6 +86,26 @@ class Arousal:
             _pooled, logits = self._model(torch.from_numpy(values).to(self._device))  # type: ignore[operator]
             value = float(logits[0][AROUSAL_INDEX])
         return min(1.0, max(0.0, value))
+
+    def dimensions(self, audio: np.ndarray, sample_rate: int) -> tuple[float, float, float]:
+        """Return the clip's arousal, dominance and valence, each from 0 to 1.
+
+        The features are `arousal`'s: the clip resampled to 16 kHz through the card's extractor.
+        """
+        import torch
+
+        clip = np.ascontiguousarray(resample(audio, sample_rate, RATE), dtype=np.float32)
+        with library_errors(MODEL), torch.inference_mode():
+            features = self._extractor(  # type: ignore[operator]
+                clip, sampling_rate=RATE, return_tensors="np"
+            )
+            values = np.asarray(features["input_values"], dtype=np.float32).reshape(1, -1)
+            _pooled, logits = self._model(torch.from_numpy(values).to(self._device))  # type: ignore[operator]
+            if logits.shape[-1] < len(DIMENSION_INDICES):
+                raise JobError(f"{MODEL}: the head gives {logits.shape[-1]} outputs, not 3")
+            raw = [float(logits[0][index]) for index in DIMENSION_INDICES]
+        arousal, dominance, valence = (min(1.0, max(0.0, value)) for value in raw)
+        return arousal, dominance, valence
 
 
 def load(device: str) -> Arousal:

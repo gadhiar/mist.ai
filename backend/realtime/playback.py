@@ -163,13 +163,30 @@ class TurnLane:
                 return None
             return self._items.popleft().item
 
-    def purge(self, turn_id: str) -> LanePurge:
-        """Remove every queued item of `turn_id` and report what was removed."""
+    def purge(self, turn_id: str, *, audio_only: bool = False) -> LanePurge:
+        """Remove the queued items of `turn_id` and report what was removed.
+
+        Args:
+            turn_id: The turn whose items go.
+            audio_only: Remove only the turn's binary frames, its `0x01`s and `0x02`, and keep
+                every other item in order. The fade of a spoken typed turn whose reply has
+                finished uses it: its tokens and `stream_complete` are already queued, and the
+                client still needs them. Entries carry no audio kind, so frames are picked by
+                type; only the pacer puts a `Frame` on the lane, and its `0x03` goes on
+                `control`. Such a purge removes no `stream_start` or token, so its
+                `stream_start` is False and its `first_token` None.
+        """
+
+        def removes(entry: _LaneEntry) -> bool:
+            if entry.turn_id != turn_id:
+                return False
+            return not audio_only or isinstance(entry.item, Frame)
+
         with self._lock:
             entries = list(self._items)
             self._items.clear()
-            self._items.extend(entry for entry in entries if entry.turn_id != turn_id)
-        removed = [entry for entry in entries if entry.turn_id == turn_id]
+            self._items.extend(entry for entry in entries if not removes(entry))
+        removed = [entry for entry in entries if removes(entry)]
         tokens = [entry.token_index for entry in removed if entry.kind == "token"]
         return LanePurge(
             terminal=any(entry.terminal for entry in removed),

@@ -2,8 +2,9 @@
 
 A spoken reply cannot start until the model's first words reach TTS, so a voice turn asks
 for no reasoning at all and a `tts` turn releases its first clause before the sentence ends.
-Typed turns keep the base behaviour: the adaptive thinking budget applies and Tokens break
-at sentence boundaries.
+Typed turns keep the adaptive thinking budget; one without playback (protocol 2.1.0) is on
+`text`, where Tokens break at sentence boundaries, and one with playback is on `tts`, so it
+releases its first clause early too.
 """
 
 from __future__ import annotations
@@ -152,6 +153,8 @@ class TestLLMConfigVoiceFields:
 
 
 class TestVoiceTurnThinking:
+    """No-thinking follows the origin: a voice turn; never a typed one, spoken or not (5 (b))."""
+
     @pytest.mark.asyncio
     async def test_both_passes_reach_the_inner_provider_with_budget_zero(self):
         inner = FakeStreamingLLMProvider(
@@ -197,6 +200,7 @@ class TestVoiceTurnThinking:
 
     @pytest.mark.asyncio
     async def test_text_turn_leaves_thinking_unset_so_the_adaptive_budget_applies(self):
+        """A typed turn without playback, on `text`; with playback, see the next test."""
         inner = FakeStreamingLLMProvider(
             [
                 ScriptedPass(chunks=[], tool_calls=_tool_call()),
@@ -220,6 +224,19 @@ class TestVoiceTurnThinking:
         # Pass 1 carries tools, so the wrapper budgets it; pass 2 has none and passes through.
         assert inner.calls[0].thinking.budget_tokens == 1024
         assert inner.calls[1].thinking is None
+
+    @pytest.mark.asyncio
+    async def test_a_typed_turn_with_playback_on_tts_leaves_thinking_unset(self):
+        """Protocol 2.1.0's spoken typed reply keeps a typed turn's reasoning."""
+        recorder = FakeStreamingLLMProvider(
+            [
+                ScriptedPass(chunks=[], tool_calls=_tool_call()),
+                ScriptedPass(chunks=["It is sunny today."]),
+            ]
+        )
+        await _tokens(_handler(recorder, voice_budget=64), origin="text", channel="tts")
+
+        assert [call.thinking for call in recorder.calls] == [None, None]
 
 
 class TestFirstClauseReleasedEarly:
@@ -316,8 +333,21 @@ class TestFirstClauseReleasedEarly:
         tokens = await _tokens(_handler(provider), origin="voice", channel="tts")
         assert [token.text for token in tokens] == ["Sunny today."]
 
+    @pytest.mark.asyncio
+    async def test_a_typed_turn_with_playback_releases_the_first_clause_early_too(self):
+        """The early clause follows the channel: a spoken typed reply starts its audio sooner."""
+        provider = FakeStreamingLLMProvider([ScriptedPass(chunks=[REPLY])])
+        tokens = await _tokens(_handler(provider), origin="text", channel="tts")
+        assert [token.text for token in tokens] == [
+            FIRST_CLAUSE,
+            " and then I will tell you more.",
+            " Second sentence here.",
+        ]
+
 
 class TestTextChannelUnchanged:
+    """The `text` channel: a typed turn without playback, or a voice turn nothing speaks."""
+
     @pytest.mark.asyncio
     async def test_text_channel_tokens_break_at_sentences(self):
         later = asyncio.Event()

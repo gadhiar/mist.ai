@@ -1,8 +1,13 @@
-"""`extract --run R [--device cpu|cuda]`: dialogue extraction and target-speaker retrieval.
+"""`extract --run R [--device cpu|cuda] [--vram-gb N]`: dialogue extraction and retrieval.
 
 The host side of Design 4. It reads the inventory and the anchors, writes the run's plan, runs
 one local job in the `extract` image, and prints the run's `report.json` as numbers. Seed stages
 stay on this host, so there is no executor option (Design 3).
+
+On cuda the job gets a VRAM budget, `--vram-gb` or the family's `vram_gb`: the preflight checks
+free VRAM against it, and the job caps its allocator 1 GiB under it (`stages/vram.py`). A job that
+outgrows the cap ends with an `out-of-memory` result naming the source, channel and step (exit 4),
+and one that starts with too little free VRAM with a `vram-short` result (exit 2).
 
 Anchors are solo clips in `seed/reference/`, rows of `seed/anchors.csv` (`source,start_s,end_s`,
 the source relative to `seed/raw/`), or both. A row names a source by its file, so this command
@@ -61,6 +66,15 @@ SEGMENTS_NAME = "segments.jsonl"
 TURNS_NAME = "turns.jsonl"
 PROPOSALS_NAME = "proposals.jsonl"
 AUDIO_DIR = "audio"
+# Result statuses of a run stopped by the card's memory: an overrun of the allocator's cap, and a
+# start with less free VRAM than the budget needs.
+OUT_OF_MEMORY = "out-of-memory"
+VRAM_SHORT = "vram-short"
+# The job caps its allocator this far under the VRAM budget (`stages/vram.py`), so a budget of
+# this or less leaves the allocator no room: this command and the stage both refuse it by this
+# value. It lives here, under the host-side purity scan, because the stage already imports this
+# module and the host imports no stage module.
+VRAM_FLOOR_GIB = 1.0
 # A SIM equal to a gate value up to rounding meets it, as in `stages/retrieve.py`.
 EPS = 1e-9
 # A run id names a folder under `seed/runs/`, so it is one plain path segment.
@@ -128,6 +142,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--run", required=True, help="the run id, a new folder under seed/runs")
     parser.add_argument("--device", choices=DEVICES, default="cpu", help="where models run")
+    parser.add_argument(
+        "--vram-gb",
+        type=float,
+        default=None,
+        help=(
+            "the job's VRAM budget in GiB on cuda; the allocator is capped 1 GiB under it "
+            "(default: the extract family's vram_gb)"
+        ),
+    )
     parser.set_defaults(func=run)
 
 
@@ -228,11 +251,26 @@ def _plan_source(record: SourceRecord) -> dict[str, object]:
     }
 
 
+def vram_budget(value: float | None) -> float:
+    """Return the job's VRAM budget in GiB: `value`, or the extract family's `vram_gb`.
+
+    Raises:
+        InputError: The budget is not above `VRAM_FLOOR_GIB`.
+    """
+    if value is None:
+        value = float(jobs.load_families()[FAMILY]["vram_gb"])  # type: ignore[arg-type]
+    budget = value
+    if not budget > VRAM_FLOOR_GIB:
+        raise InputError(f"refused: --vram-gb must be above {VRAM_FLOOR_GIB:g} GiB")
+    return budget
+
+
 def run(args: argparse.Namespace) -> int:
     """Plan the run, run the extract job, and print its report."""
     root = root_mod.open_root(args.root)
     if not RUN_ID.fullmatch(args.run) or ".." in args.run:
         raise InputError("refused: a run id is one folder name under seed/runs")
+    budget = vram_budget(args.vram_gb)
     thresholds = gates_mod.load(root.path).effective()
     inventory = root.path / INVENTORY_REL
     if not inventory.is_file():
@@ -268,16 +306,21 @@ def run(args: argparse.Namespace) -> int:
     sdh = sdh_cmd.sdh_input(root)
     if sdh is not None:
         inputs.append(sdh)
+    cuda = args.device == "cuda"
+    job_args = ("--run", args.run, "--device", args.device)
+    if cuda:
+        job_args += ("--vram-gb", f"{budget:g}")
     job = jobs.JobSpec(
         job_id=_job_id(root),
         family=FAMILY,
         image=image_tag(FAMILY),
         module=MODULE,
-        args=("--run", args.run, "--device", args.device),
+        args=job_args,
         inputs=tuple(inputs),
         outputs=run_dir,
-        gpu=args.device == "cuda",
+        gpu=cuda,
         network=False,
+        vram_gb=budget if cuda else None,
     )
     jobs.executor_for("local", root=root, docker=make_docker()).run(job)
     return _finish(root, args.run, thresholds)
@@ -291,6 +334,10 @@ def _finish(root: root_mod.Root, run_id: str, thresholds: Mapping[str, float]) -
     if status == "anchor-length":
         bad = ", ".join(str(a) for a in result.get("anchors", []))  # type: ignore[union-attr]
         raise InputError(f"refused: anchors must be 3-30 s; out of range: {bad}")
+    if status == OUT_OF_MEMORY:
+        raise JobError(oom_message(run_id, result))  # type: ignore[arg-type]
+    if status == VRAM_SHORT:
+        raise jobs.PreflightError(short_message(run_id, result))  # type: ignore[arg-type]
     if status != "ok":
         raise JobError(f"run {run_id}: the job wrote no result")
     report = read_json(root.path / run_rel(run_id) / REPORT_NAME)
@@ -303,9 +350,60 @@ def _finish(root: root_mod.Root, run_id: str, thresholds: Mapping[str, float]) -
             f"anchors disagree in run {run_id}: flagged, not refused; each SIM above is to the "
             "others"
         )
-    for line in report_lines(report):
+    for line in report_lines(report, result.get("vram")):  # type: ignore[union-attr]
         print(line)
     return 0
+
+
+def _gib(value: object) -> str:
+    return (
+        f"{value:g}" if isinstance(value, int | float) and not isinstance(value, bool) else "none"
+    )
+
+
+def _name(value: object) -> str:
+    return str(value) if value is not None else "none"
+
+
+def oom_message(run_id: str, result: Mapping[str, object]) -> str:
+    """The line an `out-of-memory` result prints: where it happened, the budget and the peak."""
+    return (
+        f"run {run_id}: out of GPU memory at {_name(result.get('source'))} "
+        f"{_name(result.get('channel'))} {_name(result.get('step'))}: budget "
+        f"{_gib(result.get('budget_gib'))} GiB, allocator cap {_gib(result.get('cap_gib'))} GiB, "
+        f"peak reserved {_name(result.get('peak_reserved_mib'))} MiB"
+    )
+
+
+def short_message(run_id: str, result: Mapping[str, object]) -> str:
+    """The line a `vram-short` result prints."""
+    return (
+        f"run {run_id}: {_gib(result.get('free_gib'))} GiB VRAM free after the job's CUDA "
+        f"context, {_gib(result.get('needed_gib'))} GiB needed for budget "
+        f"{_gib(result.get('budget_gib'))} GiB"
+    )
+
+
+def vram_line(report: Mapping[str, object], card: object) -> str:
+    """The report's VRAM line: the budget and cap, and the largest per-source reserved peak."""
+    if not isinstance(card, Mapping):
+        return "  vram: none"
+    line = (
+        f"  vram: budget {_gib(card.get('budget_gib'))} GiB, allocator cap "
+        f"{_gib(card.get('cap_gib'))} GiB"
+    )
+    sources = report.get("sources")
+    peaks = [
+        (source["vram_peak_mib"]["reserved"], str(source.get("source_id")))
+        for source in (sources if isinstance(sources, list) else [])
+        if isinstance(source, Mapping)
+        and isinstance(source.get("vram_peak_mib"), Mapping)
+        and isinstance(source["vram_peak_mib"].get("reserved"), int)
+    ]
+    if peaks:
+        reserved, source_id = max(peaks, key=lambda pair: pair[0])
+        line += f", largest peak reserved {reserved} MiB at {source_id}"
+    return line
 
 
 def _num(value: object) -> str:
@@ -349,8 +447,11 @@ def anchor_lines(rows: object, thresholds: Mapping[str, float]) -> list[str]:
     return lines
 
 
-def report_lines(report: Mapping[str, object]) -> list[str]:
-    """Return the report as printed: ids, names of states, channels and gates, and numbers."""
+def report_lines(report: Mapping[str, object], card: object = None) -> list[str]:
+    """Return the report as printed: ids, names of states, channels and gates, and numbers.
+
+    `card` is the `vram` object of the run's result, `None` on the CPU.
+    """
     lines = [f"extract run {report.get('run')}:"]
     lines.append(f"  clean minutes {_num(report.get('clean_minutes'))}")
     lines.append(f"  minutes per state: {_table(report.get('minutes_per_state'))}")
@@ -374,6 +475,7 @@ def report_lines(report: Mapping[str, object]) -> list[str]:
         else:
             lines.append(f"  {key}: none")
     lines.append(f"  drops: {_table(report.get('drops'))}")
+    lines.append(vram_line(report, card))
     sources = report.get("sources")
     for source in sources if isinstance(sources, list) else []:
         if not isinstance(source, Mapping):

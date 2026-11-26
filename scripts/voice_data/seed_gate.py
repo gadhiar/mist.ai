@@ -1,14 +1,20 @@
 """The seed gate (VC-040 as amended 12 Nov), evaluated from a run's `report.json`.
 
 `evaluate` is a pure function of the report and the effective gate thresholds, so each boundary
-is tested without running a stage. It reads these report keys, which the extraction and cleaning
-stages write:
+is tested without running a stage. The report comes from one of two sources. `gate --run E`
+passes extract run E's `report.json` as it is. `gate --run E --clean C` passes E's report with
+clean run C's labelled values merged in by `commands/gate.py`: `clean_minutes` (what survived
+the labels and cleaning), `minutes_per_state` (per projected state, all five with labels), and
+`one_speaker.kept` from C's report; `flagged_unconfirmed` counted over C's kept segments; and
+the four `LABELLED_COUNTS` from C's removals. It reads these report keys:
 
 - `clean_minutes`: number; `minutes_per_state` and `minutes_per_channel`: name to minutes;
 - `sources`: one object per source with `source_id`, `codec`, `profile`, `bitrate_bps`,
   `sample_rate`, `layout`, `effective_bandwidth_hz` and `lossless`, copied from the inventory;
 - `one_speaker`: counts `kept`, `kept_failing_retrieval`, `kept_failing_window` and
-  `flagged_unconfirmed` (flagged segments in the seed that Raj has not confirmed);
+  `flagged_unconfirmed` (flagged segments in the seed that no label covers), and, from a clean
+  run only, `LABELLED_COUNTS`, which are printed and not gated: a clip Raj removed never reaches
+  the seed;
 - `purity_p10`: the 10th percentile of kept segments' margin over the nearest other cluster, or
   null when no segment was kept;
 - `rehearsal`: `{"precision": number, "thresholds": {...}}` from the rehearsal's score, or null;
@@ -23,8 +29,8 @@ are compared with the run's as a report's would be, so a record from a rehearsal
 fails as "thresholds differ"; `gate --check-record` makes the same comparison against the root's
 effective gate values before any job runs (`record_differences`).
 
-A criterion with `passed` `None` is reported, not gated: purity, minutes per channel, and minutes
-per state, where a state under `seed.state_seconds_min` is flagged for state-prompted teachers
+A criterion with `passed` `None` is reported, not gated: the labelled removals (from a clean run
+only), purity, minutes per channel, and minutes per state, where a state under `seed.state_seconds_min` is flagged for state-prompted teachers
 or conversion. Every line carries names and numbers only.
 """
 
@@ -37,6 +43,12 @@ from .errors import InputError
 
 SOURCE_FACTS = ("codec", "bitrate_bps", "layout", "effective_bandwidth_hz")
 ONE_SPEAKER_COUNTS = ("kept_failing_retrieval", "kept_failing_window", "flagged_unconfirmed")
+LABELLED_COUNTS = (
+    "labelled_not_her",
+    "labelled_flag_group",
+    "labelled_overlap",
+    "labelled_nearby_removed",
+)
 REHEARSAL_RECORD_REL = "config/rehearsal.json"
 RECORD_SCHEMA = 1
 RECORD_KIND = "rehearsal-precision"
@@ -173,6 +185,14 @@ def evaluate(report: Mapping[str, object], thresholds: Mapping[str, float]) -> S
             + ", ".join(f"{k.replace('_', ' ')} {v:g}" for k, v in counts.items()),
         )
     )
+    labelled = [key for key in LABELLED_COUNTS if key in speaker]
+    if labelled:
+        removed = [
+            f"{key.removeprefix('labelled_').replace('_', ' ')} "
+            f"{_number(speaker, key, 'report one_speaker'):g}"
+            for key in labelled
+        ]
+        criteria.append(Criterion("labelled removals", None, ", ".join(removed)))
     criteria.append(_rehearsal(report, used, precision_min))
     shown = "not reported" if purity is None else f"{float(purity):.3f}"  # type: ignore[arg-type]
     criteria.append(Criterion("purity", None, f"p{percentile:g} margin {shown}"))

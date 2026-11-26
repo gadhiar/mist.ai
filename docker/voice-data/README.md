@@ -33,7 +33,9 @@ rebuilds only the record, the code layer and the import check.
   venv-score's pin, because the `extract` and `clean` stages load ECAPA in it.
 - `/opt/mist-voice/code/scripts/{voice_data,model_bench}`: the code at the image's commit, the
   last layer copied. `mist-voice-code.pth` in each venv's `site-packages` puts
-  `/opt/mist-voice/code` on the path, because jobs run `<venv>/bin/python -I`.
+  `/opt/mist-voice/code` on the path, because jobs run `<venv>/bin/python -I -u -m <module>`
+  and `-I` ignores `PYTHONPATH`. `-u` keeps stdout unbuffered, so a job's log shows each line
+  as it is printed; `-I` ignores `PYTHONUNBUFFERED` too, so the flag is needed.
 - `/opt/mist-voice/upstream/<repo>`: upstream code that is not pip-installable, cloned at its
   pinned commit (TIGER, Music-Source-Separation-Training, brouhaha-vad, Sidon, CosyVoice with
   Matcha-TTS, knn-vc, seed-vc, piper1-gpl at 639388b6317fc4731e91d53da42aea68fd4166ff, the
@@ -41,6 +43,54 @@ rebuilds only the record, the code layer and the import check.
 - `/etc/mist-voice-image.json`: the family, the git sha and the sha256 of each requirements file.
 - Default command `remote-entry.sh`: on a pod with `PUBLIC_KEY` set, sshd with key-only login,
   then wait. Local jobs name their own command.
+
+## GPU preflight and peers
+
+Before a GPU job starts, the local executor lists the running containers and refuses the job when
+one of them holds a GPU (exit 2), then runs `nvidia-smi` in the job's image and refuses the job
+when the largest free VRAM is below the family's `vram_gb`.
+
+`MIST_VOICE_GPU_PEERS` names containers that may keep their GPU while a job runs, as a
+comma-separated list of container names (blanks are ignored):
+
+```bash
+MIST_VOICE_GPU_PEERS=<daily backend container> python -m scripts.voice_data <command> ...
+```
+
+It is for a gaming-mode window, when the daily backend has moved its speech engines to CPU but
+keeps its CUDA context. A peer still uses VRAM, so the free-VRAM check runs as before. Any
+container holding a GPU that is not a peer is still refused. There is no command-line flag; the
+variable is the interface, and it applies to every local job of the command.
+
+A job may state its own VRAM need (`JobSpec.vram_gb`, recorded as `vram_gb` in
+`runs/<job_id>/job.json`). When it is set, the preflight checks free VRAM against it instead of the
+family's `vram_gb`; when it is `null`, the family's value applies.
+
+## Resource caps
+
+A family may cap the host resources its jobs take, so a job fits beside the daily stack. Each key
+is optional and, when present, must be a positive number; the local executor adds its flag to
+every `docker run` of the family:
+
+| `families.json` key | `docker run` flag | train-pocket | teacher-omnivoice |
+|---------------------|-------------------|--------------|-------------------|
+| `shm_gb`            | `--shm-size <n>g` | 2            | 1                 |
+| `memory_gb`         | `--memory <n>g`   | 9            | 8                 |
+| `cpus`              | `--cpuset-cpus 0-<k-1> --cpus <n>`, k = ceil(n) clamped to the host's cores | 8 | 8 |
+
+`--cpus` is a quota that leaves the container's CPU affinity at every core, so process pools and
+thread counts sized from the affinity follow the budget only through `--cpuset-cpus`.
+
+The values are estimates, not measurements; replace each with a measured peak once the family has
+run. A family without a key runs without that cap.
+
+A job may also set its own stop grace (`JobSpec.stop_timeout_s`, recorded as `stop_timeout_s` in
+`runs/<job_id>/job.json`). When it is set, the local executor adds `--stop-timeout <n>` after the
+family caps; when it is `null`, the argv is unchanged and Docker's default grace of 10 s between
+SIGTERM and SIGKILL applies. A training job saves a checkpoint on SIGTERM, but first finishes the
+optimizer step under way, and the step and the save together can outlast 10 s. `student train`
+sets it to `max(120, ceil(2 x (1 / steps_per_s + save_s)) + 30)` seconds from the run's
+`probe.json`, and refuses a probe without `save_s`.
 
 ## Devices and VRAM (estimates)
 

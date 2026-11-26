@@ -67,7 +67,18 @@ FIXED = {
     "bench.sim_median_ratio_min": 0.9,
     "bench.cer_max": 0.03,
     "bench.f0_std_tolerance": 0.2,
+    "corpus.teacher_hours_min": 5.0,
+    "corpus.seed_share_max": 0.3,
+    "corpus.val_fraction": 0.02,
+    "corpus.seed_val_share": 0.15,
+    "voice_ab.preferred_min": 18,
+    "voice_ab.lines": 26,
+    "text.line_chars_min": 80,
 }
+
+# The voice A/B pack plays the bench's ear-test lines and acknowledgements, so its line count
+# must equal theirs.
+EAR_TEST = Path(__file__).resolve().parents[3] / "scripts/model_bench/speech/lines.json"
 
 
 def test_speaking_states_are_v6_five() -> None:
@@ -115,6 +126,42 @@ def test_fixed_gates_are_not_calibrated(key: str, value: float) -> None:
     default = gates.load(None).defaults[key]
     assert default.value == value
     assert default.h6 is False
+
+
+def test_voice_ab_lines_are_the_ear_test_lines() -> None:
+    data = json.loads(EAR_TEST.read_text(encoding="utf-8"))
+    ear = [*data["lines"], *data["acknowledgements"]]
+    defaults = gates.load(None).defaults
+    assert defaults["voice_ab.lines"].value == len(ear)
+    assert defaults["voice_ab.preferred_min"].value <= defaults["voice_ab.lines"].value
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "corpus.teacher_hours_min",
+        "corpus.seed_share_max",
+        "corpus.val_fraction",
+        "corpus.seed_val_share",
+        "voice_ab.preferred_min",
+        "voice_ab.lines",
+        "text.line_chars_min",
+    ],
+)
+def test_new_gates_note_their_owner_and_say_fixed(key: str) -> None:
+    note = gates.load(None).defaults[key].note
+    owners = {"corpus": "Corpus", "voice_ab": "Voice A/B", "text": "Text build"}
+    assert note.startswith(owners[key.split(".")[0]])
+    assert note.endswith("Fixed.")
+
+
+def test_the_text_line_gate_says_why_and_what_v1_used() -> None:
+    # The note says where the value came from without naming a run or its counts, so it stays
+    # true in the public repository whatever the private root holds.
+    note = gates.load(None).defaults["text.line_chars_min"].note
+    assert "after `clean`" in note
+    assert "keep rate by line length" in note
+    assert "text v1 was built at 20" in note
 
 
 def test_no_overlay_gives_defaults(private_root: Root) -> None:

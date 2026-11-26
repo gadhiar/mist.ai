@@ -434,6 +434,94 @@ def check_voice_clip_use(engines: Sequence[str], clip: object | None) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# The identity directory `pocket-clone` speaks as (`--voice-dir` on `tts`; plan v5, M17)
+# ---------------------------------------------------------------------------
+
+# What a printed plan or a log shows in place of the identity directory's host path.
+VOICE_DIR_PLACEHOLDER = "<voice-dir>"
+# The identity manifest and the voice id rule of `backend.realtime.voice_assets`, which the probe
+# loads the identity with inside its container; this module stays stdlib only.
+VOICE_MANIFEST = "voice.json"
+_VOICE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+class VoiceDirError(VoiceClipError):
+    """A `--voice-dir` request refused before any container starts (exit 2, as for a clip).
+
+    Its message never holds the directory's path, which names the private identity root.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceDir:
+    """A checked identity directory: its resolved path, kept out of `repr`, and what results
+    record of it: its voice id and its trained weights' sha256 prefix (None for stock weights).
+    """
+
+    path: Path = field(repr=False)
+    voice_id: str
+    weights_sha256_prefix: str | None
+
+
+def check_voice_dir(path: Path, *, repo_root: Path = REPO_ROOT) -> VoiceDir:
+    """The identity directory `--voice-dir` names, read only for its manifest's id and weights.
+
+    The probe mounts it at `/voice/<voice_id>`, because `load_identity` refuses an identity
+    whose `voice_id` is not its directory's name, and checks it in full there; this host check
+    reads `voice.json` alone, with the stdlib. Refusals never name the path.
+
+    Raises:
+        VoiceDirError: the path is not a directory, lies inside the checkout, or has no
+            readable `voice.json` object with a valid `voice_id`.
+    """
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise VoiceDirError("--voice-dir names no directory; give the identity's directory")
+    if resolved.is_relative_to(repo_root.resolve()):
+        raise VoiceDirError(
+            "--voice-dir lies inside the git checkout; an identity stays outside it"
+        )
+    try:
+        manifest = json.loads((resolved / VOICE_MANIFEST).read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise VoiceDirError(f"--voice-dir has no readable {VOICE_MANIFEST}") from None
+    if not isinstance(manifest, dict):
+        raise VoiceDirError(f"--voice-dir: {VOICE_MANIFEST} is not a JSON object")
+    voice_id = manifest.get("voice_id")
+    if not isinstance(voice_id, str) or not _VOICE_ID_RE.fullmatch(voice_id):
+        raise VoiceDirError(
+            f"--voice-dir: {VOICE_MANIFEST} has no voice_id matching [a-z0-9][a-z0-9-]*"
+        )
+    model = manifest.get("model")
+    sha = model.get("sha256") if isinstance(model, dict) else None
+    prefix = sha[:CLIP_SHA_CHARS] if isinstance(sha, str) and _SHA256_RE.fullmatch(sha) else None
+    return VoiceDir(resolved, voice_id, prefix)
+
+
+def check_voice_source_use(
+    engines: Sequence[str], clip: object | None, voice_dir: object | None
+) -> None:
+    """`pocket-clone` speaks as a clip or as an identity directory, never both; nothing else does.
+
+    Raises:
+        VoiceClipError: both are given, `pocket-clone` runs with neither, or either is given to
+            a run without `pocket-clone` (`VoiceDirError` for the directory's refusals).
+    """
+    if clip is not None and voice_dir is not None:
+        raise VoiceDirError("--voice-clip and --voice-dir are exclusive; give one of them")
+    if VOICE_CLIP_ENGINE in engines and clip is None and voice_dir is None:
+        raise VoiceClipError(
+            f"{VOICE_CLIP_ENGINE} clones a voice and needs --voice-clip or --voice-dir"
+        )
+    if voice_dir is None:
+        check_voice_clip_use(engines, clip)
+    elif VOICE_CLIP_ENGINE not in engines:
+        raise VoiceDirError(
+            f"--voice-dir is for {VOICE_CLIP_ENGINE} only, and this run does not include it"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class MaterialItem:
     """One recording in the material manifest."""

@@ -46,6 +46,7 @@
     "bakeoff.pass_fraction_min": {"value": 0.5, "h6": false, "note": "Bake-off: a state is weak when fewer than this share of its teacher's takes pass the take gate. Fixed."},
     "text.sample_n": {"value": 30, "h6": false, "note": "Text sample: lines Raj reviews per state. Fixed."},
     "text.reject_max": {"value": 3, "h6": true, "note": "Text sample: a state's lines pass with at most this many rejected. H6 calibrates [E]."},
+    "text.line_chars_min": {"value": 80, "h6": false, "note": "Text build: shortest line `text build` keeps, in characters after `clean`; set on 25 Nov from the first teacher run's keep rate by line length (text v1 was built at 20). Fixed."},
     "spotcheck.sample_n": {"value": 50, "h6": false, "note": "Spot check: takes Raj reviews per state. Fixed."},
     "spotcheck.reject_max": {"value": 5, "h6": true, "note": "Spot check: a batch is accepted with at most this many rejected per state. H6 calibrates [E]."},
     "bench.first_audio_cpu_ms_max": {"value": 196, "h6": false, "note": "Bench (4.2): median first audio on the CPU path, ms, idle and under E4B decode. Fixed."},
@@ -53,6 +54,12 @@
     "bench.decode_loss_max": {"value": 0.05, "h6": false, "note": "Bench (4.2): largest E4B decode loss, as a fraction. Fixed."},
     "bench.sim_median_ratio_min": {"value": 0.9, "h6": false, "note": "Bench (4.2): median SIM per state over the distribution's median. Fixed."},
     "bench.cer_max": {"value": 0.03, "h6": false, "note": "Bench (4.2): highest CER. Fixed."},
-    "bench.f0_std_tolerance": {"value": 0.2, "h6": false, "note": "Bench (4.2): F0 standard deviation within this fraction of the seed's, per state. Fixed."}
+    "bench.f0_std_tolerance": {"value": 0.2, "h6": false, "note": "Bench (4.2): F0 standard deviation within this fraction of the seed's, per state. Fixed."},
+    "corpus.teacher_hours_min": {"value": 5.0, "h6": false, "note": "Corpus: fewest hours of kept teacher takes the training corpus needs; about 0.27-0.31 M chars of `text build` lines. Fixed."},
+    "corpus.seed_share_max": {"value": 0.3, "h6": false, "note": "Corpus: largest share of the training corpus's hours the seed's real segments may make up, counted after they are oversampled 3x. Fixed."},
+    "corpus.val_fraction": {"value": 0.02, "h6": false, "note": "Corpus: share of the training corpus held back as the validation split. Fixed."},
+    "corpus.seed_val_share": {"value": 0.15, "h6": false, "note": "Corpus: share of the trusted seed seconds held out for validation, in whole sources, with at least one source on each side when two or more exist. Fixed."},
+    "voice_ab.preferred_min": {"value": 18, "h6": false, "note": "Voice A/B: fewest of the 26 ear-test lines on which the trained voice must be the preferred one for the A/B to pass; a no-preference answer counts against the trained voice, and its not-her flags must be no more than the baseline's. Fixed."},
+    "voice_ab.lines": {"value": 26, "h6": false, "note": "Voice A/B: ear-test lines the A/B plays, the 20 lines and 6 acknowledgements of `scripts/model_bench/speech/lines.json`. Fixed."}
   }
 }

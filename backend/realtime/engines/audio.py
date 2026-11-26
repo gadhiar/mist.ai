@@ -5,10 +5,12 @@ heading markers, list bullets at a line start, link syntax) and, for an engine w
 support, bracketed tags such as `[laugh]`. Case, digits and every other punctuation mark pass
 unchanged, because each engine normalises its own punctuation and some read case.
 
-Audio: each segment is resampled to the 24 kHz the realtime path plays, normalised to -20 LUFS
-integrated (ITU-R BS.1770 gating) with the gain capped at +20 dB, converted to PCM16 with
-clipping, and cut into chunks of at most 200 ms. A segment too short to measure (under 400 ms)
-takes the previous segment's gain, so a short reply tail is not pumped up on its own.
+Audio: engine output is resampled to the 24 kHz the realtime path plays, converted to PCM16
+with clipping, and cut into chunks of at most 200 ms. Loudness is measured as integrated
+loudness (ITU-R BS.1770 gating), and `target_gain_db` is the gain that brings a measured level
+to -20 LUFS, capped at +20 dB so near-silence is not raised into noise. An adapter decides what
+it measures: Pocket measures each voice state once, when its artefacts are built, so a segment
+can leave piece by piece at a fixed gain.
 
 Only numpy and scipy are imported here; no engine library.
 """
@@ -23,7 +25,6 @@ from scipy.signal import lfilter, resample_poly
 OUTPUT_RATE = 24000
 TARGET_LUFS = -20.0
 MAX_GAIN_DB = 20.0
-MIN_MEASURE_MS = 400
 MAX_CHUNK_MS = 200
 
 _LINK = re.compile(r"\[([^\[\]\n]*)\]\([^()\s]*\)")
@@ -120,35 +121,14 @@ def integrated_loudness(samples: np.ndarray, rate: int) -> float:
     return float(_lufs(gated.mean()))
 
 
-class LoudnessNormalizer:
-    """Per-segment gain to a loudness target, carried across one adapter's segments.
+def target_gain_db(
+    loudness: float, target_lufs: float = TARGET_LUFS, max_gain_db: float = MAX_GAIN_DB
+) -> float:
+    """The gain in dB that brings `loudness` (LUFS) to `target_lufs`, at most `max_gain_db`.
 
-    The gain is capped at `max_gain_db`, so near-silence is not raised into noise. A segment
-    shorter than `min_measure_ms`, or one with no gated loudness, reuses the last measured gain
-    (unity before any), because one 400 ms block cannot judge it.
+    Silence (`-inf`) gets the cap, as anything quieter than the cap allows does.
     """
-
-    __slots__ = ("_gain", "_max_gain_db", "_min_measure_ms", "_target")
-
-    def __init__(
-        self,
-        target_lufs: float = TARGET_LUFS,
-        max_gain_db: float = MAX_GAIN_DB,
-        min_measure_ms: int = MIN_MEASURE_MS,
-    ) -> None:
-        self._target = target_lufs
-        self._max_gain_db = max_gain_db
-        self._min_measure_ms = min_measure_ms
-        self._gain = 1.0
-
-    def __call__(self, samples: np.ndarray, rate: int) -> np.ndarray:
-        """`samples` scaled to the target, or by the previous gain when it cannot be measured."""
-        if samples.size * 1000 >= self._min_measure_ms * rate:
-            measured = integrated_loudness(samples, rate)
-            if math.isfinite(measured):
-                gain_db = min(self._target - measured, self._max_gain_db)
-                self._gain = 10 ** (gain_db / 20)
-        return (samples * self._gain).astype(np.float32)
+    return float(min(target_lufs - loudness, max_gain_db))
 
 
 def resample(samples: np.ndarray, rate: int, target: int = OUTPUT_RATE) -> np.ndarray:

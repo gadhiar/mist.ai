@@ -353,6 +353,80 @@ class TestTurnLane:
         assert taken_after_purge is None
 
 
+def _lane_frame(msg_type: MsgType, seq: int, tag: int = TAG) -> Frame:
+    return Frame(msg_type=msg_type, turn_tag=tag, seq=seq, sample_rate=DOWNLINK_SAMPLE_RATE)
+
+
+class TestTurnLaneAudioOnlyPurge:
+    """`purge(audio_only=True)`: the fade of a spoken typed turn whose reply finished (M11).
+
+    Its tokens and `stream_complete` are already queued and must still reach the client, so
+    only its binary frames go. The lane picks them by item type, since entries carry no audio
+    kind.
+    """
+
+    def test_it_removes_the_turns_frames_and_keeps_its_messages_in_order(self):
+        lane = TurnLane()
+        lane.put(TURN, "stream_start", kind="stream_start")
+        lane.put(TURN, "token-0", kind="token", token_index=0)
+        first = _lane_frame(MsgType.AUDIO_CHUNK, 0)
+        lane.put(TURN, first)
+        lane.put(TURN, "token-1", kind="token", token_index=1)
+        lane.put(TURN, _lane_frame(MsgType.AUDIO_CHUNK, 1))
+        lane.put(TURN, "stream_complete")
+        lane.take()  # the sender took `stream_start`
+
+        purge = lane.purge(TURN, audio_only=True)
+
+        assert purge == LanePurge(terminal=False, stream_start=False, first_token=None)
+        assert _drain(lane) == ["token-0", "token-1", "stream_complete"]
+
+    @pytest.mark.parametrize(
+        ("taken", "expected"),
+        [pytest.param(False, True, id="queued"), pytest.param(True, False, id="taken")],
+    )
+    def test_it_reports_a_queued_0x02(self, taken, expected):
+        lane = TurnLane()
+        lane.put(TURN, _lane_frame(MsgType.AUDIO_CHUNK, 0))
+        lane.put(TURN, _lane_frame(MsgType.AUDIO_COMPLETE, 1), terminal=True)
+        if taken:
+            _drain(lane)
+        lane.put(TURN, "stream_complete")
+
+        purge = lane.purge(TURN, audio_only=True)
+
+        assert purge == LanePurge(terminal=expected, stream_start=False, first_token=None)
+        assert _drain(lane) == ["stream_complete"]
+
+    def test_it_leaves_another_turns_items_frames_included(self):
+        lane = TurnLane()
+        other_frame = _lane_frame(MsgType.AUDIO_CHUNK, 0, tag=TAG + 1)
+        other_end = _lane_frame(MsgType.AUDIO_COMPLETE, 1, tag=TAG + 1)
+        lane.put("other", "other-start", kind="stream_start")
+        lane.put(TURN, _lane_frame(MsgType.AUDIO_CHUNK, 0))
+        lane.put("other", other_frame)
+        lane.put(TURN, "token-0", kind="token", token_index=0)
+        lane.put("other", "other-token", kind="token", token_index=0)
+        lane.put(TURN, _lane_frame(MsgType.AUDIO_COMPLETE, 1), terminal=True)
+        lane.put("other", other_end, terminal=True)
+
+        purge = lane.purge(TURN, audio_only=True)
+
+        assert purge.terminal is True
+        assert _drain(lane) == ["other-start", other_frame, "token-0", "other-token", other_end]
+
+    def test_the_full_purge_is_the_default(self):
+        lane = TurnLane()
+        lane.put(TURN, "stream_start", kind="stream_start")
+        lane.put(TURN, _lane_frame(MsgType.AUDIO_CHUNK, 0))
+        lane.put(TURN, "token-0", kind="token", token_index=0)
+
+        purge = lane.purge(TURN)
+
+        assert purge == LanePurge(terminal=False, stream_start=True, first_token=0)
+        assert _drain(lane) == []
+
+
 class TestTurnLaneMark:
     """`mark` and `passed`: the session's fence for a `voice_state` answer (A53)."""
 

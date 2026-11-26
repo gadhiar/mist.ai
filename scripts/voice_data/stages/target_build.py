@@ -1,6 +1,6 @@
 """The numbers of a target (Design 6), run as the `score` family's job.
 
-Runs as `/opt/venv-score/bin/python -I -m scripts.voice_data.stages.target_build --data /data
+Runs as `/opt/venv-score/bin/python -I -u -m scripts.voice_data.stages.target_build --data /data
 --target T --device D`, with the clean run and the identity mounted read-only and
 `targets/<T>/` writable. The host's plan (`target-plan.json`) names the confirmed segments
 (ids, sources, states, audio paths and the prosody `clean` measured), the identity's clips
@@ -22,7 +22,13 @@ pooled floor for every state; with fewer, the rehearsal-calibrated
 `state_floor.rehearsal_identity_window_floor` is, and `distribution.kind` records which.
 
 Profiles (medians) and spreads (standard deviations) per state come from the confirmed
-segments' prosody, or, for a state only the identity voices, from its clip.
+segments' prosody, or, for a state only the identity voices, from its clip. Neutral is the
+exception in seed mode: two later gates read its entry by name, so it is always written, its
+floor from `score.state_floors` (`pooled-offset` at `n` 0 too), and below
+`state_floor.thin_n_min` clips its profile and spread come from every seed segment pooled,
+whatever its state, never from the identity clip. Each seed-mode entry's `profile_from` says
+which (`state`, `identity` or `pooled`). A segment with a null state (a labelled clip outside
+every region) joins the pooled figures and no state's.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ import numpy as np
 from .. import target as contract
 from ..bindings.protocols import Span, SpeakerEmbedder
 from ..records import Prosody
+from ..states import NEUTRAL_STATE as NEUTRAL
 from ..states import SPEAKING_STATES
 from . import score, segments, transcribe
 from .prosody import prosody as measure_prosody
@@ -166,7 +173,9 @@ class Build:
         audios = [_read_audio(self.data / str(row["audio"])) for row in rows]
         embs = [self._embed(audio) for audio in audios]
         sources = [str(row["source_id"]) for row in rows]
-        states = [str(row["state"]) for row in rows]
+        # A labelled segment outside every region has a null state: it joins the pooled
+        # figures and no state's.
+        states = [None if row["state"] is None else str(row["state"]) for row in rows]
         window_embs: list[Embedding] = []
         window_sources: list[str] = []
         for audio, source in zip(audios, sources, strict=True):
@@ -209,6 +218,7 @@ class Build:
             "windows": windows,
             "floors": floors,
             "prosody": prosody,
+            "pooled_prosody": measured,
         }
 
     def _seed_state(self, seed: Mapping[str, object], state: str) -> dict[str, object]:
@@ -222,6 +232,7 @@ class Build:
             "n": first.n,
             "profile": profile,
             "spread": spread,
+            "profile_from": contract.PROFILE_FROM_STATE if members else None,
         }
 
     # The identity.
@@ -321,12 +332,27 @@ class Build:
         floors: Floors = seed["floors"]  # type: ignore[assignment]
         clip_audio = {str(c["state"]): a for c, a in zip(clips, audios, strict=True)}
         states: dict[str, object] = {}
+        thin_n = int(self.th["state_floor.thin_n_min"])
         for state in SPEAKING_STATES:
-            if floors[self.names[0]][state].n == 0 and state not in clip_audio:
+            n = floors[self.names[0]][state].n
+            if state == NEUTRAL:
+                # Two later gates read neutral by name, so it is always written. Below
+                # `thin_n` clips its profile and spread are every seed clip's, pooled: a
+                # one-clip profile (its own, or the identity clip's) has spread 0 in every
+                # field, and `score._z_distance` compares no field whose spread is 0.
+                entry = self._seed_state(seed, state)
+                if n < thin_n:
+                    pooled: Sequence[Prosody] = seed["pooled_prosody"]  # type: ignore[assignment]
+                    entry["profile"], entry["spread"] = _profile(pooled)
+                    entry["profile_from"] = contract.PROFILE_FROM_POOLED
+                states[state] = entry
+                continue
+            if n == 0 and state not in clip_audio:
                 continue
             entry = self._seed_state(seed, state)
             if entry["profile"] is None:
                 entry["profile"], entry["spread"] = _profile([self._measure(clip_audio[state])])
+                entry["profile_from"] = contract.PROFILE_FROM_IDENTITY
             states[state] = entry
         return {
             "centroids": seed["centroids"],

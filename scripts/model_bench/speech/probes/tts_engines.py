@@ -30,6 +30,11 @@ mounted snapshots (host step H13 printed them from the pocket image): the clonin
 names. Its voice is `get_state_for_audio_prompt(<the mounted clip>)`. `qwen3-design` loads and
 calls the VoiceDesign model through `design_probe.Designer`, the loading path T40's voice-design
 tool uses, with the entry point H13 read from the qwen3 image.
+
+`pocket-clone` can instead speak as an identity directory `--voice-dir` mounts at
+`/voice/<voice_id>` (mist-voice-fidelity plan v5, M17): the runtime's `load_identity` reads it,
+and its trained weights and tokenizer reach the model through the runtime adapter's own
+`local_config`, which `tests/unit/realtime/test_engine_bench_parity.py` holds equal to the bench's.
 """
 
 from __future__ import annotations
@@ -95,6 +100,25 @@ POCKET_CLONE_URIS = (POCKET_CLONE_MODEL_URI, POCKET_MODEL_URI, POCKET_TOKENIZER_
 
 # Fixed container path of the identity clip `--voice-clip` mounts read-only for `pocket-clone`.
 CONTAINER_VOICE_CLIP = "/voice/identity.wav"
+
+# Where `--voice-dir` mounts an identity directory read-only for `pocket-clone`: at
+# `<root>/<voice_id>`, since `load_identity` refuses an identity whose `voice_id` is not its
+# directory's name.
+CONTAINER_VOICE_ROOT = "/voice"
+
+# The runtime adapter's modules, imported through the adapter's importer inside the bench
+# container only, so importing this module on the host loads neither (nor numpy).
+VOICE_ASSETS_MODULE = "backend.realtime.voice_assets"
+RUNTIME_POCKET_MODULE = "backend.realtime.engines.pocket_tts"
+# The runtime adapter reads its weights from `<models_dir>/speech/<org>/<repo>/`; the bench
+# mounts that `speech` directory at `CONTAINER_MODELS_DIR`.
+RUNTIME_SPEECH_DIR = "speech"
+
+
+def container_voice_dir(voice_id: str) -> str:
+    """The container path an identity directory is mounted at."""
+    return f"{CONTAINER_VOICE_ROOT}/{voice_id}"
+
 
 # Values `pocket_tts.utils.utils.download_if_necessary` fetches rather than opens.
 _REMOTE_PREFIXES = ("hf://", "http://", "https://")
@@ -373,11 +397,18 @@ def _hf_local_path(uri: str, models_dir: Path) -> Path:
 
 
 class PocketCloneEngine(PocketEngine):
-    """Pocket TTS on the CPU with voice cloning on, speaking as the mounted identity clip.
+    """Pocket TTS on the CPU with voice cloning on, speaking as the mounted identity clip, or as
+    a mounted identity directory with its trained weights.
 
     The gated repository's cloning model is the one 4.0.1 loads from `weights_path`, so the copy
     maps that URI and the other two to their mounted snapshots and keeps cloning on. A model that
     loads without cloning anyway is refused: it cannot speak as the clip.
+
+    With `voice_id` (`--voice-dir`, plan v5 M17), the identity at `<voice_root>/<voice_id>` is
+    loaded by the runtime's `load_identity`, checked by the runtime adapter's own rules, and the
+    model config is the runtime adapter's `local_config` with the identity's weights and
+    tokenizer, so the bench loads exactly the files the runtime would. Its voice is the
+    identity's neutral clip, the state every other one falls back to.
     """
 
     def __init__(
@@ -388,17 +419,86 @@ class PocketCloneEngine(PocketEngine):
         models_dir: Path = Path(CONTAINER_MODELS_DIR),
         importer: Importer = importlib.import_module,
         voice_clip: Path = Path(CONTAINER_VOICE_CLIP),
+        voice_root: Path = Path(CONTAINER_VOICE_ROOT),
+        voice_id: str | None = None,
     ):
         super().__init__(name, cfg, models_dir=models_dir, importer=importer)
         self.voice_clip = voice_clip
+        self.voice_root = voice_root
+        self.voice_id = voice_id
+        self._identity: object | None = None
 
     def _load_model(self) -> object:
         model = self._load_local_model()
         if getattr(model, "has_voice_cloning", None) is not True:
             raise core.SpeechBenchError(f"{self.name}: the model loaded without voice cloning")
+        if self.voice_id is not None:
+            self._check_trained_rate(int(model.sample_rate))
         return model
 
+    def _check_trained_rate(self, rate: int) -> None:
+        """Refuse trained weights not at the runtime's rate, as `PocketCloneSynthesizer.load` does.
+
+        Raises:
+            VoiceError: the identity's trained weights run at another rate than the adapter's.
+        """
+        identity = self._load_identity()
+        expected = int(self._import(RUNTIME_POCKET_MODULE).MODEL_RATE)
+        if identity.model is not None and rate != expected:
+            raise VoiceError(
+                f"{self.name}: voice identity {identity.voice_id!r}: model: the trained weights "
+                f"run at {rate} Hz, not {expected} Hz"
+            )
+
+    def _load_identity(self) -> object:
+        """The identity `voice_id` names, loaded once and checked as the runtime adapter checks it.
+
+        Raises:
+            VoiceError: the identity is unusable, or its trained weights are not for this
+                engine, base or tokenizer; the message names a manifest field or a relative
+                path, never a path under the private root.
+        """
+        if self._identity is not None:
+            return self._identity
+        assets = self._import(VOICE_ASSETS_MODULE)
+        runtime = self._import(RUNTIME_POCKET_MODULE)
+        try:
+            identity = assets.load_identity(self.voice_root, self.voice_id)
+            # The runtime's own check of trained weights against this engine, its base and the
+            # stock tokenizer; it runs before the model loads, as it does at runtime.
+            runtime._model_pin(identity, self._runtime_models_dir())
+        except runtime.SpeechEngineError as exc:
+            raise VoiceError(f"{self.name}: {exc}") from exc
+        self._identity = identity
+        return identity
+
+    def _runtime_models_dir(self) -> Path:
+        """The runtime's `models_dir`, whose `speech` directory is the bench's mounted one."""
+        if self._models_dir.name != RUNTIME_SPEECH_DIR:
+            raise core.SpeechBenchError(
+                f"{self.name}: an identity needs the models directory mounted as "
+                f"`<models>/{RUNTIME_SPEECH_DIR}`, the runtime adapter's layout"
+            )
+        return self._models_dir.parent
+
     def _local_config(self, installed: object) -> dict:
+        """The runtime adapter's config for the identity, or else the clip's config."""
+        if self.voice_id is None:
+            return self._clip_config(installed)
+        models_dir = self._runtime_models_dir()
+        trained = self._load_identity().model
+        runtime = self._import(RUNTIME_POCKET_MODULE)
+        try:
+            return runtime.local_config(
+                installed,
+                models_dir,
+                None if trained is None else trained.weights_path,
+                None if trained is None else trained.tokenizer_path,
+            )
+        except runtime.SpeechEngineError as exc:
+            raise core.SpeechBenchError(str(exc)) from exc
+
+    def _clip_config(self, installed: object) -> dict:
         """A copy of the installed config whose three `hf://` URIs are the mounted snapshots.
 
         Raises:
@@ -452,6 +552,11 @@ class PocketCloneEngine(PocketEngine):
 
     def _select_voice(self, voice: str) -> None:
         # A `Path` not ending in `.safetensors` is read as audio to clone.
+        if self.voice_id is not None:
+            identity = self._load_identity()
+            neutral = self._import(VOICE_ASSETS_MODULE).NEUTRAL_STATE
+            self._voice_state = self._model.get_state_for_audio_prompt(identity.clip(neutral).audio)
+            return
         if not self.voice_clip.is_file():
             raise VoiceError(
                 f"{self.name}: no identity clip is mounted at {self.voice_clip}; "
@@ -495,11 +600,25 @@ def make_engine(
     models_dir: Path = Path(CONTAINER_MODELS_DIR),
     arms: Mapping[str, object] | None = None,
     importer: Importer = importlib.import_module,
+    voice_id: str | None = None,
 ) -> StockVoiceEngine:
-    """The adapter for `engine_id`, configured from the `tts` section of `speech_arms.json`."""
+    """The adapter for `engine_id`, configured from the `tts` section of `speech_arms.json`.
+
+    `voice_id` names the identity mounted under `CONTAINER_VOICE_ROOT`, for `pocket-clone` only.
+    """
     tts = (arms if arms is not None else core.load_json(core.SPEECH_ARMS_PATH))["tts"]
     if engine_id not in ADAPTERS or engine_id not in tts:
         raise core.SpeechBenchError(
             f"unknown speech engine {engine_id!r}; known: {sorted(set(ADAPTERS) & set(tts))}"
         )
-    return ADAPTERS[engine_id](engine_id, tts[engine_id], models_dir=models_dir, importer=importer)
+    if voice_id is None:
+        return ADAPTERS[engine_id](
+            engine_id, tts[engine_id], models_dir=models_dir, importer=importer
+        )
+    if ADAPTERS[engine_id] is not PocketCloneEngine:
+        raise core.SpeechBenchError(
+            f"{engine_id} speaks a voice of its own; an identity is for {core.VOICE_CLIP_ENGINE}"
+        )
+    return PocketCloneEngine(
+        engine_id, tts[engine_id], models_dir=models_dir, importer=importer, voice_id=voice_id
+    )

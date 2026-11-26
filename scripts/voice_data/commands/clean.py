@@ -9,10 +9,15 @@ with its verbatim transcript beside it as `<n>.private.txt`, are written by the 
 them. The transcript is private text: it is copied as bytes and never printed. Seed stages stay
 on this host, so there is no executor option.
 
-Raj's labels (`seed/labels.csv`, from `pack import`) confirm segments when present: a listed
-segment takes the state he gave it, and a kept segment he did not list is dropped as `not-her`.
-Without labels, every kept segment is cleaned, and only primary-cluster segments count as
-confirmed for the leave-one-out distribution and the references.
+Raj's labels for extract run E (`seed/labels/<E>/labels.jsonl`, from `pack import`) replace
+the old `seed/labels.csv` and its state column; they are read only through
+`labels.read_labels`, which refuses that old file. When labels exist, the plan (schema 2)
+carries each labelled clip's whole label but the note. The stage drops a clip whose label has
+`removed` with that reason and a kept clip with no label as `unlabelled`, trims a `her_nearby`
+clip to its keep range, and gives every labelled clip its projected state, which may be null.
+The labelled clips that survive are the confirmed ones. Without labels, every kept segment is
+cleaned, and only primary-cluster segments count as confirmed for the leave-one-out distribution
+and the references.
 
 The stage imports the names below, so host and job share one definition.
 """
@@ -20,18 +25,16 @@ The stage imports the names below, so host and job share one definition.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
-import io
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
 from .. import gates as gates_mod
 from .. import jobs
+from .. import labels as labels_mod
 from .. import root as root_mod
 from ..errors import InputError, JobError
-from ..packs import LABELS_REL
 from ..records import JobInput, SegmentRecord, read_json, read_jsonl, sha256_file, write_json
 from ..states import SPEAKING_STATES
 from . import extract as extract_cmd
@@ -39,6 +42,7 @@ from . import extract as extract_cmd
 FAMILY = "extract"
 MODULE = "scripts.voice_data.stages.clean"
 DEVICES = extract_cmd.DEVICES
+PLAN_SCHEMA = 2
 PLAN_NAME = "clean-plan.json"
 SEGMENTS_NAME = "segments.jsonl"
 GATES_NAME = "gates.json"
@@ -46,9 +50,20 @@ REFS_NAME = "refs.json"
 REPORT_NAME = "report.json"
 AUDIO_DIR = "audio"
 REFS_DIR = "refs"
-LABELS_HEADER = ["segment_id", "state"]
 PRIMARY = "primary"
 NOT_HER = "not-her"
+UNLABELLED = "unlabelled"
+LABEL_KEYS = (
+    "voices",
+    "energy",
+    "mood",
+    "tags",
+    "keep_from_s",
+    "keep_to_s",
+    "state",
+    "removed",
+    "carried_from",
+)
 RUN_ID = extract_cmd.RUN_ID
 REF_REL = re.compile(r"refs/(?P<state>[a-z]+)/(?P<n>[1-9][0-9]*)\.wav")
 
@@ -97,39 +112,63 @@ def image_tag(family: str) -> str:
     return extract_cmd.image_tag(family)
 
 
-def read_labels(root: root_mod.Root) -> dict[str, str] | None:
-    """Return Raj's labels as segment id to state, or `None` when there are none yet.
+def plan_label(record: labels_mod.LabelRecord) -> dict[str, object]:
+    """Return a label as the plan carries it: `LABEL_KEYS`, never the note or `has_note`."""
+    whole = record.to_json()
+    return {key: whole[key] for key in LABEL_KEYS}
 
-    Errors name the row number only.
 
-    Raises:
-        InputError: The header is not `segment_id,state`, or a row is malformed or names a
-            state outside the speaking states.
+def removed_by(label: object) -> str | None:
+    """Return a plan label's `removed`; a schema-1 plan's label (a state name) removes nothing."""
+    if isinstance(label, Mapping):
+        removed = label.get("removed")
+        return removed if isinstance(removed, str) else None
+    return None
+
+
+def confirmed_ids(
+    records: Sequence[SegmentRecord], labels: Mapping[str, object] | None
+) -> list[str]:
+    """Return the kept segments that count as the target's.
+
+    With labels, the labelled ones no label removes; without, the primary-cluster ones. `labels`
+    is a plan's: a schema-2 label maps to its fields, a schema-1 one to a state name.
     """
-    path = root.path / LABELS_REL
-    if not path.is_file():
-        return None
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise InputError(f"refused: {LABELS_REL} is unreadable") from exc
-    rows = [(n, row) for n, row in enumerate(csv.reader(io.StringIO(text)), 1) if any(row)]
-    if not rows or [cell.strip() for cell in rows[0][1]] != LABELS_HEADER:
-        raise InputError(f"refused: {LABELS_REL} must start with the header segment_id,state")
-    labels: dict[str, str] = {}
-    for number, row in rows[1:]:
-        if len(row) != 2 or row[1].strip() not in SPEAKING_STATES:
-            raise InputError(f"refused: {LABELS_REL} row {number} is not a segment and a state")
-        labels[row[0].strip()] = row[1].strip()
-    return labels
-
-
-def confirmed_ids(records: Sequence[SegmentRecord], labels: Mapping[str, str] | None) -> list[str]:
-    """Return the kept segments that count as the target's: labelled ones, else primary ones."""
     kept = [r for r in records if r.kept]
     if labels is not None:
-        return [r.segment_id for r in kept if r.segment_id in labels]
+        return [
+            r.segment_id
+            for r in kept
+            if r.segment_id in labels and removed_by(labels[r.segment_id]) is None
+        ]
     return [r.segment_id for r in kept if r.cluster == PRIMARY]
+
+
+def read_run_labels(
+    root: root_mod.Root, from_run: str, records: Sequence[SegmentRecord]
+) -> dict[str, dict[str, object]] | None:
+    """Return extract run `from_run`'s labels as the plan carries them, or None without labels.
+
+    Raises:
+        InputError: `seed/labels.csv` exists; the labels are malformed, cover no kept segment
+            of the run, or hold a carried label that no longer holds.
+    """
+    labels = labels_mod.read_labels(root, from_run)
+    if labels is None:
+        return None
+    kept = {r.segment_id for r in records if r.kept}
+    if not kept & {label.segment_id for label in labels}:
+        raise InputError(
+            f"refused: {labels_mod.labels_rel(from_run)} labels no kept segment of run {from_run}"
+        )
+    stale = labels_mod.carried_stale(root, labels)
+    if stale:
+        noun = "label no longer holds" if len(stale) == 1 else "labels no longer hold"
+        raise InputError(
+            f"refused: {len(stale)} carried {noun} in run {from_run}; ask them again with "
+            f"pack labels --run {from_run} --replace"
+        )
+    return {label.segment_id: plan_label(label) for label in labels}
 
 
 def _run_input(root: root_mod.Root, from_dir: str, records: Sequence[SegmentRecord]) -> JobInput:
@@ -185,17 +224,14 @@ def run(args: argparse.Namespace) -> int:
     refs_dir = f"{target_rel(args.target)}/{REFS_DIR}"
     if (root.path / refs_dir).exists():
         raise InputError(f"refused: {refs_dir} already holds references; choose a new target")
-    labels = read_labels(root)
-    kept = {r.segment_id for r in records if r.kept}
-    if labels is not None and not kept & set(labels):
-        raise InputError(f"refused: {LABELS_REL} labels no kept segment of run {args.from_run}")
+    labels = read_run_labels(root, args.from_run, records)
     if len(confirmed_ids(records, labels)) < 2:
         raise InputError(
             f"refused: run {args.from_run} has fewer than two confirmed segments to clean"
         )
 
     plan = {
-        "schema": 1,
+        "schema": PLAN_SCHEMA,
         "run": args.run,
         "from": args.from_run,
         "target": args.target,
@@ -317,6 +353,10 @@ def report_lines(report: Mapping[str, object]) -> list[str]:
             f"not her {_num(counts.get('not_her'))}, "
             f"asr disagree {_num(counts.get('asr_disagree'))}"
         )
+        lines.append(
+            f"  clean minutes {_num(report.get('clean_minutes'))}; removed by label: "
+            f"{_table(counts.get('removed_by_label'))}; trimmed {_num(counts.get('trimmed'))}"
+        )
     lines.append(f"  minutes per state: {_table(report.get('minutes_per_state'))}")
     lines.append(f"  references: {_table(report.get('references'))}")
     short = report.get("short_states")
@@ -324,4 +364,7 @@ def report_lines(report: Mapping[str, object]) -> list[str]:
         "  short states: "
         + (", ".join(str(s) for s in short) if isinstance(short, list) and short else "none")
     )
+    tables = report.get("labels")
+    if isinstance(tables, Mapping):
+        lines += labels_mod.table_lines(tables)
     return lines

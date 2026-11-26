@@ -133,6 +133,8 @@ JOB = {
     "env_names": [],
     "optional_env_names": [],
     "est_hours": 0.5,
+    "vram_gb": None,
+    "stop_timeout_s": None,
 }
 
 LEDGER = {
@@ -156,6 +158,8 @@ CASES = [
     pytest.param(records.TargetRecord, TARGET, id="target"),
     pytest.param(records.TakeRecord, TAKE, id="take"),
     pytest.param(records.JobRecord, JOB, id="job"),
+    pytest.param(records.JobRecord, {**JOB, "vram_gb": 18.5}, id="job-vram"),
+    pytest.param(records.JobRecord, {**JOB, "stop_timeout_s": 237}, id="job-stop-timeout"),
     pytest.param(records.LedgerRecord, LEDGER, id="ledger"),
 ]
 

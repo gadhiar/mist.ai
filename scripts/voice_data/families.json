@@ -71,6 +71,9 @@
       "venv": "/opt/venv-teacher-omnivoice",
       "devices": ["cuda"],
       "vram_gb": 8,
+      "shm_gb": 1,
+      "memory_gb": 8,
+      "cpus": 8,
       "models": {
         "omnivoice": {"kind": "hf", "repository": "k2-fsa/OmniVoice", "revision": "c5fdb5ccb189668d56333f77ba2629f4cd7535f4", "licence": "CC-BY-NC (version not stated on the card; no licence field in HF metadata)", "gated": false}
       },
@@ -163,8 +166,13 @@
       "venv": "/opt/venv-train-pocket",
       "devices": ["cuda"],
       "vram_gb": 16,
+      "shm_gb": 2,
+      "memory_gb": 9,
+      "cpus": 8,
       "models": {
-        "pocket-tts": {"kind": "hf", "repository": "kyutai/pocket-tts", "revision": "db04f0e653473e5c7333c69686ac92b7460b0c1d", "licence": "cc-by-4.0", "gated": true, "files": ["languages/english_2026-04_24l/*", "tokenizer.json", "tokenizer.model"]}
+        "pocket-tts": {"kind": "hf", "repository": "kyutai/pocket-tts", "revision": "db04f0e653473e5c7333c69686ac92b7460b0c1d", "licence": "cc-by-4.0", "gated": true, "files": ["languages/english_2026-04_24l/*", "tokenizer.json", "tokenizer.model", "languages/english/model.safetensors"]},
+        "pocket-tts-runtime-tokenizer": {"kind": "hf", "repository": "kyutai/pocket-tts-without-voice-cloning", "revision": "00eac05ed3d16bdc3f6b5d598874019c34a89214", "licence": "cc-by-4.0", "gated": false, "files": ["languages/english/tokenizer.json"]},
+        "wav2vec2-base-960h": {"kind": "hf", "repository": "facebook/wav2vec2-base-960h", "revision": "22aad52d435eb6dbaf354bdad9b0da84ce7d6156", "licence": "apache-2.0", "gated": false, "files": ["config.json", "preprocessor_config.json", "feature_extractor_config.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "model.safetensors"]}
       },
       "training": {
         "repo": "https://github.com/kyutai-labs/pocket-tts",

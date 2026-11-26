@@ -809,6 +809,113 @@ def test_the_plan_context_names_the_clip_by_a_placeholder():
 
 
 # ---------------------------------------------------------------------------
+# The identity directory `--voice-dir` names (plan v5, M17)
+# ---------------------------------------------------------------------------
+
+WEIGHTS_SHA = "ab" * 32
+
+
+def _identity_dir(root: Path, manifest: object | None = None) -> Path:
+    """An identity directory under a host name that is not its voice id."""
+    folder = root / "host-folder-name"
+    folder.mkdir(parents=True)
+    if manifest is None:
+        manifest = {"schema": 2, "voice_id": "mist-trained", "model": {"sha256": WEIGHTS_SHA}}
+    text = manifest if isinstance(manifest, str) else json.dumps(manifest)
+    (folder / "voice.json").write_text(text, encoding="utf-8")
+    (folder / "neutral.txt").write_text(CLIP_TRANSCRIPT, encoding="utf-8")
+    return folder
+
+
+def test_check_voice_dir_reads_the_voice_id_and_the_weights_sha256_prefix(tmp_path):
+    folder = _identity_dir(tmp_path)
+
+    checked = core.check_voice_dir(folder, repo_root=_REPO_ROOT)
+
+    assert checked.path == folder.resolve()
+    assert checked.voice_id == "mist-trained"
+    assert checked.weights_sha256_prefix == WEIGHTS_SHA[:12]
+    assert str(folder) not in repr(checked) and CLIP_TRANSCRIPT not in repr(checked)
+
+
+def test_check_voice_dir_of_a_stock_identity_has_no_weights_prefix(tmp_path):
+    folder = _identity_dir(tmp_path, {"schema": 1, "voice_id": "mist"})
+
+    checked = core.check_voice_dir(folder, repo_root=_REPO_ROOT)
+
+    assert (checked.voice_id, checked.weights_sha256_prefix) == ("mist", None)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing",
+        "a-file",
+        "no-manifest",
+        "not-json",
+        "not-an-object",
+        "no-voice-id",
+        "bad-voice-id",
+        "inside-the-checkout",
+    ],
+)
+def test_check_voice_dir_refuses_without_naming_the_path(tmp_path, case):
+    manifests = {
+        "not-json": "{not json",
+        "not-an-object": json.dumps(["mist"]),
+        "no-voice-id": {"schema": 1},
+        "bad-voice-id": {"schema": 1, "voice_id": "../Mist"},
+    }
+    repo_root = _REPO_ROOT
+    folder = _identity_dir(tmp_path, manifests.get(case))
+    target = folder
+    if case == "missing":
+        target = folder.parent / "absent-folder"
+    elif case == "a-file":
+        target = folder / "voice.json"
+    elif case == "no-manifest":
+        (folder / "voice.json").unlink()
+    elif case == "inside-the-checkout":
+        repo_root = tmp_path
+
+    with pytest.raises(core.VoiceDirError) as info:
+        core.check_voice_dir(target, repo_root=repo_root)
+
+    message = str(info.value)
+    # A refused identity directory exits 2, as a refused clip does.
+    assert isinstance(info.value, core.VoiceClipError)
+    assert "--voice-dir" in message
+    for secret in (str(target), target.as_posix(), folder.name, "absent", CLIP_TRANSCRIPT):
+        assert secret not in message
+
+
+@pytest.mark.parametrize(
+    ("engines", "clip", "voice_dir", "refused"),
+    [
+        pytest.param(("pocket-clone",), "clip", None, False, id="clone-with-a-clip"),
+        pytest.param(("pocket-clone",), None, "dir", False, id="clone-with-an-identity"),
+        pytest.param(("pocket-clone",), "clip", "dir", True, id="both"),
+        pytest.param(("pocket-clone",), None, None, True, id="clone-with-neither"),
+        pytest.param(("pocket", "qwen3"), None, "dir", True, id="identity-without-clone"),
+        pytest.param(("pocket", "qwen3"), "clip", None, True, id="clip-without-clone"),
+        pytest.param(("pocket",), None, None, False, id="neither"),
+    ],
+)
+def test_pocket_clone_takes_a_clip_or_an_identity_and_nothing_else_does(
+    engines, clip, voice_dir, refused
+):
+    if refused:
+        with pytest.raises(core.VoiceClipError):
+            core.check_voice_source_use(engines, clip, voice_dir)
+    else:
+        core.check_voice_source_use(engines, clip, voice_dir)
+
+
+def test_the_identity_placeholder_differs_from_the_clip_s():
+    assert core.VOICE_DIR_PLACEHOLDER == "<voice-dir>" != core.VOICE_CLIP_PLACEHOLDER
+
+
+# ---------------------------------------------------------------------------
 # No voice sample anywhere (Raj, 2026-11-06)
 # ---------------------------------------------------------------------------
 

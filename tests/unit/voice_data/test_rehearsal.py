@@ -29,11 +29,14 @@ import soundfile as sf
 from scipy.signal import lfilter
 
 from scripts.voice_data import cli, gates, packs, seed_gate
+from scripts.voice_data import labels as labels_mod
 from scripts.voice_data import rehearsal as pkg
 from scripts.voice_data import root as root_mod
+from scripts.voice_data.commands import clean as clean_cmd
 from scripts.voice_data.commands import extract as extract_cmd
 from scripts.voice_data.commands import rehearsal as rehearsal_cmd
 from scripts.voice_data.errors import InputError
+from scripts.voice_data.labels import PrefillRecord
 from scripts.voice_data.records import (
     Prosody,
     SegmentRecord,
@@ -759,14 +762,41 @@ class Answered:
     out: str
     err: str
     import_code: int
+    import_out: str
     import_err: str
-    labels: dict[str, str]
+    labels: dict[str, str | None]
+    ratings: list[dict[str, str]]
+    prefill: dict[str, PrefillRecord]
+
+
+def _prefill(segments: Sequence[SegmentRecord]) -> dict[str, PrefillRecord]:
+    """A fixture pre-fill for the run's kept segments, as `labels prefill` writes it.
+
+    Energy and mood vary by segment, so an answer that kept them would not project to the true
+    state; every segment is pre-filled `her`.
+    """
+    records = {}
+    for seg in segments:
+        if not seg.kept:
+            continue
+        n = int(seg.segment_id[4:])
+        records[seg.segment_id] = PrefillRecord(
+            segment_id=seg.segment_id, source_id=seg.source_id, start_s=seg.start_s,
+            end_s=seg.end_s, duration_s=round(seg.end_s - seg.start_s, 2), arousal=0.5,
+            dominance=0.5, valence=0.5, energy=1 + n % 5, mood=1 + (n * 2) % 5, voices="her",
+            keep_from_s=None, keep_to_s=None, other_s=0.0, overlap_ms=0,
+        )  # fmt: skip
+    return records
 
 
 @pytest.fixture(scope="module")
 def answered(extracted: Extracted) -> Answered:
+    """`labels prefill` (a fixture file), `pack labels`, `rehearsal answer`, `pack import`."""
     root = extracted.built.root
+    prefill = _prefill(extracted.segments)
+    write_jsonl(root, f"{labels_mod.prefill_rel('r1')}/{labels_mod.PREFILL_NAME}", prefill.values())
     built = packs.build_pack(root, "labels", {"run": "r1"}, seed=11)
+    assert built.pack_id is not None
     with patched(extracted.built.docker, extracted.built.sources):
         code, out, err = run_cli(
             ["--root", str(root.path), "rehearsal", "answer", "--pack", built.pack_id]
@@ -775,7 +805,7 @@ def answered(extracted: Extracted) -> Answered:
         rel = rehearsal_cmd.ratings_rel(built.pack_id)
         assert f"ratings written to {rel};" in out
         ratings = root.path / rel
-        icode, _, ierr = run_cli(
+        icode, iout, ierr = run_cli(
             [
                 "--root",
                 str(root.path),
@@ -787,9 +817,25 @@ def answered(extracted: Extracted) -> Answered:
                 str(ratings),
             ]
         )
-    text = (root.path / packs.LABELS_REL).read_text(encoding="utf-8") if icode == 0 else ""
-    labels = {row["segment_id"]: row["state"] for row in csv.DictReader(io.StringIO(text))}
-    return Answered(built.pack_id, code, out, err, icode, ierr, labels)
+    text = ratings.read_text(encoding="utf-8") if code == 0 else ""
+    rows = list(csv.DictReader(io.StringIO(text)))
+    records = labels_mod.read_labels(root, "r1") if icode == 0 else None
+    labels = {r.segment_id: r.state for r in records or () if r.removed is None}
+    return Answered(built.pack_id, code, out, err, icode, iout, ierr, labels, rows, prefill)
+
+
+def test_the_impostors_in_labels_reads_the_runs_label_file(
+    extracted: Extracted, answered: Answered
+) -> None:
+    root = extracted.built.root
+    eps = rehearsal_cmd._episodes(root)[0]
+    kept = [s for s in extracted.segments if s.kept]
+    impostor = [s for s in kept if eps.who(s) == "impostor"]
+    found = rehearsal_cmd._labels(root, "r1")
+    assert found is not None and found == set(answered.labels)
+    # Labelled segments with `removed` are not hers: the impostor's are all removed here.
+    assert impostor and not {s.segment_id for s in impostor} & found
+    assert rehearsal_cmd._labels(root, "r-none") is None
 
 
 def test_answer_writes_ratings_that_pack_import_accepts(
@@ -806,6 +852,52 @@ def test_answer_writes_ratings_that_pack_import_accepts(
     assert answered.labels == target
     impostor = [s.segment_id for s in kept if eps.who(s) == "impostor"]
     assert impostor and not set(impostor) & set(answered.labels)
+    # The import printed the label tables: counts and seconds only.
+    assert f"labels: {len(kept)} clips" in answered.import_out
+    assert answered.out.startswith(
+        f"rehearsal answer: pack {answered.pack}, {len(kept)} items, {len(target)} hers, "
+        f"{len(kept) - len(target)} not her;"
+    )
+
+
+def test_answer_fills_the_new_columns_from_the_truth(
+    extracted: Extracted, answered: Answered
+) -> None:
+    root = extracted.built.root
+    key = packs.read_key(root, answered.pack)
+    sid_of = {label: info["segment_id"] for label, info in key["items"].items()}
+    examples = {r.state: r.example for r in labels_mod.load_delivery().regions}
+    eps = rehearsal_cmd._episodes(root)[0]
+    by_id = {s.segment_id: s for s in extracted.segments}
+    assert answered.ratings and list(answered.ratings[0]) == ["label", *packs.LABEL_FIELDS]
+    for row in answered.ratings:
+        seg = by_id[sid_of[row["label"]]]
+        assert (row["keep_from_s"], row["keep_to_s"], row["tags"], row["note"]) == ("", "", "", "")
+        if eps.who(seg) == "target":
+            state = eps.target_line(seg).state  # type: ignore[union-attr]
+            assert row["voices"] == "her"
+            assert (int(row["energy"]), int(row["mood"])) == examples[state]
+        else:
+            prefill = answered.prefill[seg.segment_id]
+            assert row["voices"] == "not_her"
+            assert (int(row["energy"]), int(row["mood"])) == (prefill.energy, prefill.mood)
+
+
+def test_the_answered_labels_clean_to_the_true_states(
+    extracted: Extracted, answered: Answered
+) -> None:
+    """What `clean --from r1` plans from the imported labels: each survivor in its true state."""
+    root = extracted.built.root
+    kept = [s for s in extracted.segments if s.kept]
+    plan = clean_cmd.read_run_labels(root, "r1", kept)
+    assert plan is not None and set(plan) == {s.segment_id for s in kept}
+    confirmed = set(clean_cmd.confirmed_ids(kept, plan))
+    eps = rehearsal_cmd._episodes(root)[0]
+    target = {s.segment_id: eps.target_line(s).state for s in kept if eps.who(s) == "target"}  # type: ignore[union-attr]
+    assert confirmed == set(target)
+    assert {sid: plan[sid]["state"] for sid in confirmed} == target
+    removed = {plan[sid]["removed"] for sid in set(plan) - confirmed}
+    assert removed <= {"not-her", "flag-group"} and "not-her" in removed
 
 
 # ---------------------------------------------------------------------------

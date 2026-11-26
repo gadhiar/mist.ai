@@ -135,3 +135,11 @@ class ArousalMonitor(Protocol):
     def arousal(self, audio: np.ndarray, sample_rate: int) -> float:
         """Return the clip's arousal from 0 (low) to 1 (high)."""
         ...
+
+
+class EmotionDimensions(Protocol):
+    """A dimensional emotion estimator: the labels pre-fill reads energy and mood from it."""
+
+    def dimensions(self, audio: np.ndarray, sample_rate: int) -> tuple[float, float, float]:
+        """Return the clip's arousal, dominance and valence, each from 0 to 1."""
+        ...

@@ -1,6 +1,6 @@
 """Gate calibration on public speakers: pools, trials and the threshold rule (A22).
 
-Runs as `/opt/venv-score/bin/python -I -m scripts.voice_data.rehearsal.calibrate --data /data
+Runs as `/opt/venv-score/bin/python -I -u -m scripts.voice_data.rehearsal.calibrate --data /data
 --plan rehearsal/calibration/<C>/calibration-plan.json` in the `score` image, on the CPU, with
 `public/` mounted read-only. It sets the six per-embedder values `anchors.sim_min.<e>`,
 `retrieval.anchor_floor.<e>` and `retrieval.margin.<e>` on public speakers that no rehearsal

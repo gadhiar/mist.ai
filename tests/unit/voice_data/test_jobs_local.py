@@ -154,6 +154,7 @@ def test_argv_is_exactly_the_interface(private_root: Root, monkeypatch) -> None:
         IMAGE,
         f"{VENV}/bin/python",
         "-I",
+        "-u",
         "-m",
         "scripts.voice_data.stages.extract",
         "--data",
@@ -222,9 +223,10 @@ def test_optional_env_name_omitted_when_unset(private_root: Root, monkeypatch) -
 def test_interpreter_is_the_family_venv(private_root: Root) -> None:
     argv = _local(private_root).argv(_job())
     start = argv.index(IMAGE)
-    assert argv[start + 1 : start + 7] == [
+    assert argv[start + 1 : start + 8] == [
         f"{VENV}/bin/python",
         "-I",
+        "-u",
         "-m",
         "scripts.voice_data.stages.extract",
         "--data",
@@ -289,6 +291,166 @@ def test_preflight_refuses_free_vram_below_the_family_need(private_root: Root) -
     with pytest.raises(jobs.PreflightError, match="VRAM") as caught:
         _local(private_root, docker).preflight(_job(gpu=True))
     assert cli.exit_code(caught.value) == 2
+
+
+def test_job_vram_need_overrides_a_larger_family_need(private_root: Root) -> None:
+    docker = FakeDocker(free_mib="8192")
+    _local(private_root, docker).preflight(_job(gpu=True, vram_gb=6.5))
+    assert docker.calls[-1][docker.calls[-1].index("--entrypoint") + 1] == "nvidia-smi"
+
+
+def test_job_vram_need_overrides_a_smaller_family_need(private_root: Root) -> None:
+    docker = FakeDocker(free_mib="17408")
+    with pytest.raises(jobs.PreflightError, match=r"job job-20261112T1015Z-1 needs 18\.5"):
+        _local(private_root, docker).preflight(_job(gpu=True, vram_gb=18.5))
+
+
+def test_job_without_a_vram_need_uses_the_family_need(private_root: Root) -> None:
+    docker = FakeDocker(free_mib="15360")
+    with pytest.raises(jobs.PreflightError, match=f"family {FAMILY} needs 16"):
+        _local(private_root, docker).preflight(_job(gpu=True))
+
+
+def test_job_record_holds_the_vram_need(private_root: Root) -> None:
+    assert _job().record().to_json()["vram_gb"] is None
+    files = {"seed/runs/r1/a.bin": b"a"}
+    docker = FakeDocker(on_run=_writes_outputs(private_root, files))
+    _local(private_root, docker).run(_job(gpu=True, vram_gb=9.5))
+    job_json = private_root.path / "runs/job-20261112T1015Z-1/job.json"
+    assert json.loads(job_json.read_text(encoding="utf-8"))["vram_gb"] == 9.5
+
+
+CAPPED = {**FAMILIES[FAMILY], "shm_gb": 2, "memory_gb": 9.5, "cpus": 8}
+
+
+def test_family_caps_add_shm_memory_and_cpus(private_root: Root) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: CAPPED})
+    argv = local.argv(_job(gpu=True))
+    assert _pairs(argv, "--shm-size") == ["2g"]
+    assert _pairs(argv, "--memory") == ["9.5g"]
+    assert _pairs(argv, "--cpus") == ["8"]
+    assert argv.index("--cpus") < argv.index(IMAGE)
+
+
+def test_stop_timeout_follows_the_family_caps_when_set(private_root: Root) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: CAPPED})
+    plain = local.argv(_job(gpu=True))
+    at = plain.index("--cpus") + 2
+    assert local.argv(_job(gpu=True, stop_timeout_s=237)) == [
+        *plain[:at], "--stop-timeout", "237", *plain[at:]
+    ]  # fmt: skip
+
+
+def test_stop_timeout_none_leaves_the_argv_unchanged(private_root: Root) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: CAPPED})
+    assert _job().stop_timeout_s is None
+    assert "--stop-timeout" not in local.argv(_job(gpu=True))
+    assert "--stop-timeout" not in _local(private_root).argv(_job())
+
+
+def test_job_record_holds_the_stop_timeout(private_root: Root) -> None:
+    assert _job().record().to_json()["stop_timeout_s"] is None
+    files = {"seed/runs/r1/a.bin": b"a"}
+    docker = FakeDocker(on_run=_writes_outputs(private_root, files))
+    _local(private_root, docker).run(_job(stop_timeout_s=150))
+    job_json = private_root.path / "runs/job-20261112T1015Z-1/job.json"
+    assert json.loads(job_json.read_text(encoding="utf-8"))["stop_timeout_s"] == 150
+    assert _pairs(docker.calls[-1], "--stop-timeout") == ["150"]
+
+
+def test_family_without_caps_adds_none(private_root: Root) -> None:
+    argv = _local(private_root).argv(_job(gpu=True))
+    assert not {"--shm-size", "--memory", "--cpus"} & set(argv)
+
+
+@pytest.mark.parametrize("key", ["shm_gb", "memory_gb", "cpus"])
+@pytest.mark.parametrize("value", [0, -1, "8", True])
+def test_family_cap_that_is_not_a_positive_number_is_refused(
+    private_root: Root, key: str, value: object
+) -> None:
+    local = jobs.LocalDocker(private_root, FakeDocker(), {FAMILY: {**CAPPED, key: value}})
+    with pytest.raises(InputError, match=key) as caught:
+        local.argv(_job())
+    assert cli.exit_code(caught.value) == 2
+
+
+PEER = "mist-daily-backend"
+
+
+def _peer_local(private_root: Root, docker: FakeDocker, monkeypatch, peers: str | None):
+    if peers is None:
+        monkeypatch.delenv(jobs.GPU_PEERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(jobs.GPU_PEERS_ENV, peers)
+    return jobs.executor_for("local", root=private_root, docker=docker, families=FAMILIES)
+
+
+def test_gpu_peers_env_name_is_the_interface() -> None:
+    assert jobs.GPU_PEERS_ENV == "MIST_VOICE_GPU_PEERS"
+
+
+def test_preflight_passes_a_named_peer_and_still_checks_vram(
+    private_root: Root, monkeypatch
+) -> None:
+    docker = FakeDocker(containers={"p1": (PEER, GPU_REQUEST)})
+    local = _peer_local(private_root, docker, monkeypatch, f" {PEER} ,, other-peer ")
+    local.preflight(_job(gpu=True))
+    assert docker.calls[-1][docker.calls[-1].index("--entrypoint") + 1] == "nvidia-smi"
+
+
+def test_preflight_refuses_a_non_peer_beside_a_peer(private_root: Root, monkeypatch) -> None:
+    docker = FakeDocker(containers={"p1": (PEER, GPU_REQUEST), "n1": ("mist-llm", GPU_REQUEST)})
+    local = _peer_local(private_root, docker, monkeypatch, PEER)
+    with pytest.raises(jobs.PreflightError, match="mist-llm") as caught:
+        local.preflight(_job(gpu=True))
+    assert cli.exit_code(caught.value) == 2
+    assert PEER not in str(caught.value)
+
+
+def test_preflight_with_peers_and_no_containers_checks_vram(
+    private_root: Root, monkeypatch
+) -> None:
+    docker = FakeDocker(free_mib="4096")
+    local = _peer_local(private_root, docker, monkeypatch, PEER)
+    with pytest.raises(jobs.PreflightError, match="VRAM"):
+        local.preflight(_job(gpu=True))
+    assert docker.calls[0] == ["docker", "ps", "-q"]
+
+
+def test_preflight_refuses_a_peer_when_free_vram_is_short(private_root: Root, monkeypatch) -> None:
+    docker = FakeDocker(containers={"p1": (PEER, GPU_REQUEST)}, free_mib="8192")
+    local = _peer_local(private_root, docker, monkeypatch, PEER)
+    with pytest.raises(jobs.PreflightError, match="VRAM"):
+        local.preflight(_job(gpu=True))
+
+
+def test_preflight_refuses_the_peer_when_the_env_is_unset(private_root: Root, monkeypatch) -> None:
+    docker = FakeDocker(containers={"p1": (PEER, GPU_REQUEST)})
+    local = _peer_local(private_root, docker, monkeypatch, None)
+    with pytest.raises(jobs.PreflightError, match=PEER):
+        local.preflight(_job(gpu=True))
+
+
+def test_preflight_allows_the_union_of_allow_and_peers(private_root: Root, monkeypatch) -> None:
+    docker = FakeDocker(containers={"p1": (PEER, GPU_REQUEST), "b2": ("mist-llm", GPU_REQUEST)})
+    local = _peer_local(private_root, docker, monkeypatch, PEER)
+    local.preflight(_job(gpu=True), allow=frozenset({"mist-llm"}))
+    assert docker.calls[-1][:2] == ["docker", "run"]
+
+
+def test_gpu_run_passes_beside_a_peer(private_root: Root, monkeypatch) -> None:
+    files = {"seed/runs/r1/a.bin": b"a"}
+    docker = FakeDocker(
+        containers={"p1": (PEER, GPU_REQUEST)}, on_run=_writes_outputs(private_root, files)
+    )
+    result = _peer_local(private_root, docker, monkeypatch, PEER).run(_job(gpu=True))
+    assert result.exit_code == 0
+
+
+def test_local_docker_peers_default_to_none(private_root: Root) -> None:
+    docker = FakeDocker(containers={"p1": (PEER, GPU_REQUEST)})
+    with pytest.raises(jobs.PreflightError, match=PEER):
+        _local(private_root, docker).preflight(_job(gpu=True))
 
 
 def _writes_outputs(root: Root, files: dict[str, bytes], manifest: dict[str, str] | None = None):

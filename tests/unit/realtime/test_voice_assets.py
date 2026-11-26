@@ -28,7 +28,9 @@ from backend.realtime.errors import SpeechEngineError
 from backend.realtime.speech import SPEAKING_STATES
 from backend.realtime.voice_assets import (
     MANIFEST_SCHEMA,
+    MODEL_MANIFEST_SCHEMA,
     VOICE_MANIFEST,
+    IdentityModel,
     VoiceAssetError,
     VoiceClip,
     VoiceIdentity,
@@ -405,6 +407,158 @@ class TestBadIdentities:
     def test_a_missing_identity_directory_names_the_manifest(self, voice_root):
         with pytest.raises(VoiceAssetError, match="voice.json"):
             load_identity(voice_root, "absent-voice")
+
+
+# -- schema 2: trained weights in the identity ------------------------------------------------
+
+MODEL_BASE = "test/pocket@abc123"
+WEIGHTS = b"trained weights"
+TOKENIZER = b"trained tokenizer"
+TOKENIZER_SHA = hashlib.sha256(b"stock tokenizer").hexdigest()
+
+
+def add_model(identity: Path, *, tokenizer: bool = False, schema: int = 2) -> dict:
+    """Make `identity` carry trained weights (and a tokenizer); returns its `model` entry."""
+    (identity / "model.safetensors").write_bytes(WEIGHTS)
+    model: dict = {
+        "engine": "pocket-clone",
+        "base": MODEL_BASE,
+        "weights": "model.safetensors",
+        "sha256": _sha(identity / "model.safetensors"),
+        "tokenizer_sha256": TOKENIZER_SHA,
+    }
+    if tokenizer:
+        (identity / "tokenizer.json").write_bytes(TOKENIZER)
+        model["tokenizer"] = "tokenizer.json"
+        model["tokenizer_sha256"] = _sha(identity / "tokenizer.json")
+    manifest = _read_manifest(identity)
+    manifest.update(schema=schema, model=model)
+    _write_manifest(identity, manifest)
+    return model
+
+
+def _model(**changes: object) -> Callable[[Path], None]:
+    def apply(identity: Path) -> None:
+        add_model(identity, tokenizer=True)
+        manifest = _read_manifest(identity)
+        manifest["model"].update(changes)
+        _write_manifest(identity, manifest)
+
+    return apply
+
+
+def _model_without(key: str) -> Callable[[Path], None]:
+    def apply(identity: Path) -> None:
+        add_model(identity, tokenizer=True)
+        manifest = _read_manifest(identity)
+        del manifest["model"][key]
+        _write_manifest(identity, manifest)
+
+    return apply
+
+
+def _weights_symlink_out(identity: Path) -> None:
+    outside = identity.parent.parent / "outside.safetensors"
+    outside.write_bytes(WEIGHTS)
+    os.symlink(outside, identity / "link.safetensors")
+    _model(weights="link.safetensors")(identity)
+
+
+BAD_MODELS = [
+    pytest.param(lambda i: add_model(i, schema=1), "model", id="model-on-schema-1"),
+    pytest.param(_edit(lambda i, m: m.update(schema=2)), "model", id="schema-2-without-model"),
+    pytest.param(_edit(lambda i, m: m.update(schema=3)), "schema", id="schema-3"),
+    pytest.param(
+        _edit(lambda i, m: m.update(schema=2, model="model.safetensors")),
+        "model",
+        id="model-not-an-object",
+    ),
+    pytest.param(_model(sha256="0" * 64), "model.sha256", id="weights-sha-mismatch"),
+    pytest.param(_model(sha256="xyz"), "model.sha256", id="weights-sha-not-hex"),
+    pytest.param(_model(weights="../outside.safetensors"), "model.weights", id="weights-parent"),
+    pytest.param(_weights_symlink_out, "link.safetensors", id="weights-symlink-out"),
+    pytest.param(_model(weights="missing.safetensors"), "missing.safetensors", id="no-weights"),
+    pytest.param(_model_without("weights"), "model.weights", id="weights-unnamed"),
+    pytest.param(_model(engine=""), "model.engine", id="engine-empty"),
+    pytest.param(_model_without("base"), "model.base", id="base-unnamed"),
+    pytest.param(
+        _model(tokenizer_sha256="0" * 64), "model.tokenizer_sha256", id="tokenizer-sha-mismatch"
+    ),
+    pytest.param(
+        _model_without("tokenizer_sha256"), "model.tokenizer_sha256", id="tokenizer-sha-missing"
+    ),
+    pytest.param(_model(tokenizer="../t.json"), "model.tokenizer", id="tokenizer-outside"),
+]
+
+
+class TestIdentityModel:
+    def test_a_schema_1_identity_has_no_model(self, voice_root):
+        make_identity(voice_root)
+
+        assert load_identity(voice_root, VOICE_ID).model is None
+
+    def test_a_schema_2_identity_loads_its_trained_weights(self, voice_root):
+        identity_dir = make_identity(voice_root, ("neutral", "calm"))
+        entry = add_model(identity_dir)
+
+        identity = load_identity(voice_root, VOICE_ID)
+
+        assert identity.model == IdentityModel(
+            engine="pocket-clone",
+            base=MODEL_BASE,
+            weights_path=(identity_dir / "model.safetensors").resolve(),
+            sha256=entry["sha256"],
+            tokenizer_path=None,
+            tokenizer_sha256=TOKENIZER_SHA,
+        )
+        assert identity.states == frozenset({"neutral", "calm"})
+
+    def test_a_schema_2_identity_loads_its_own_tokenizer(self, voice_root):
+        identity_dir = make_identity(voice_root)
+        entry = add_model(identity_dir, tokenizer=True)
+
+        model = load_identity(voice_root, VOICE_ID).model
+
+        assert model is not None
+        assert model.tokenizer_path == (identity_dir / "tokenizer.json").resolve()
+        assert (
+            model.tokenizer_sha256
+            == entry["tokenizer_sha256"]
+            == _sha(identity_dir / "tokenizer.json")
+        )
+
+    def test_the_model_type_is_frozen_and_slotted(self):
+        assert IdentityModel.__dataclass_params__.frozen
+        assert "__slots__" in IdentityModel.__dict__
+        assert MODEL_MANIFEST_SCHEMA == 2
+
+    @pytest.mark.parametrize(("spoil", "named"), BAD_MODELS)
+    def test_a_bad_model_raises_naming_the_field_or_the_relative_path(
+        self, voice_root, spoil, named
+    ):
+        identity_dir = make_identity(voice_root, ("neutral", "calm"))
+        spoil(identity_dir)
+
+        with pytest.raises(VoiceAssetError) as caught:
+            load_identity(voice_root, VOICE_ID)
+
+        assert named in str(caught.value)
+        assert VOICE_ID in str(caught.value)
+        assert str(identity_dir) not in str(caught.value)
+
+    def test_the_load_log_names_the_voice_and_a_sha_prefix_never_a_path(self, voice_root, caplog):
+        identity_dir = make_identity(voice_root)
+        entry = add_model(identity_dir, tokenizer=True)
+
+        with caplog.at_level(logging.DEBUG):
+            load_identity(voice_root, VOICE_ID)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(VOICE_ID in m and entry["sha256"][:12] in m for m in messages)
+        for message in messages:
+            assert entry["sha256"] not in message
+            assert str(voice_root) not in message
+            assert "model.safetensors" not in message and "tokenizer.json" not in message
 
 
 class TestPrivacy:

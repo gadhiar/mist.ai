@@ -2,8 +2,9 @@
 
 `backend/server.py` sends `PROTOCOL_VERSION` on `session_started`. Protocol 2.0.0 is the
 realtime protocol (`backend/realtime/protocol.py`): main's 1.4.0 control messages plus the
-voice path's own, with `audio` and `reset_vad` removed. A bump that is not also made in the
-protocol module, or the reverse, should fail here rather than drift silently.
+voice path's own, with `audio` and `reset_vad` removed. 2.1.0 adds the optional
+`text.playback`, so a typed message can ask for its reply spoken. A bump that is not also made
+in the protocol module, or the reverse, should fail here rather than drift silently.
 
 The endpoint tests drive the real `websocket_endpoint` with one `RealtimeSession` per
 connection through a real `SessionRegistry`, over the fakes of
@@ -31,7 +32,7 @@ from tests.unit.test_session_id_propagation import (  # noqa: F401 -- autouse fi
     run_endpoint,
 )
 
-EXPECTED_PROTOCOL_VERSION = "2.0.0"
+EXPECTED_PROTOCOL_VERSION = "2.1.0"
 
 
 def test_protocol_version_is_the_realtime_protocols() -> None:
@@ -54,7 +55,7 @@ async def test_session_started_carries_protocol_2_and_the_voice_capabilities(mon
 
     started = ws.frames[0]
     assert started["type"] == "session_started"
-    assert started["protocol_version"] == "2.0.0"
+    assert started["protocol_version"] == "2.1.0"
     assert started["mist_state"] == "idle"
     capabilities = started["capabilities"]
     assert isinstance(capabilities, dict)

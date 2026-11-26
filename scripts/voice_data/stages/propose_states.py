@@ -4,8 +4,10 @@ Each kept segment of a run gets four features: its arousal quantile within the r
 z-scores within the run of its F0 mean, speech rate and active energy. Relative features carry
 the state contrast of one speaker in one show, whatever her absolute pitch and the mix level. A
 segment is proposed the state whose centre in `state_rules.json` is nearest under the feature
-weights, and its margin is how much nearer that centre is than the next. Raj confirms every
-proposal in the labels pack; a proposal gates nothing.
+weights, and its margin is how much nearer that centre is than the next. The proposal is recorded
+on each segment as `state_proposed`, and the rehearsal scores it against the ground truth. It no
+longer sets the labels pack's defaults, which come from the labels pre-fill; a clean run made
+without labels still reads it as the segment's state. A proposal gates nothing.
 """
 
 from __future__ import annotations

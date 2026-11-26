@@ -291,9 +291,9 @@ def test_job_has_network_writable_cache_and_optional_token(
     assert argv[argv.index("HF_TOKEN") - 1] == "-e"
     assert "HF_HOME=/cache/hf" in argv and "TORCH_HOME=/cache/torch" in argv
     tail = argv[argv.index(IMAGE) :]
-    assert tail[:4] == [IMAGE, "/opt/venv-fam/bin/python", "-I", "-m"]
-    assert tail[4] == fetch_cmd.MODULE == jobs.FETCH_MODULE
-    assert tail[5:9] == ["--data", "/data", "--family", "fam"]
+    assert tail[:5] == [IMAGE, "/opt/venv-fam/bin/python", "-I", "-u", "-m"]
+    assert tail[5] == fetch_cmd.MODULE == jobs.FETCH_MODULE
+    assert tail[6:10] == ["--data", "/data", "--family", "fam"]
     job = ran.job()
     assert job["network"] is True and job["gpu"] is False
     assert job["optional_env_names"] == ["HF_TOKEN"] and job["env_names"] == []
