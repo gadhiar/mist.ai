@@ -345,6 +345,9 @@ class FakeTrainer:
     valid_losses: dict[tuple[str, int], float] = field(default_factory=dict)
     free_mib: int = FREE_MIB
     oom: set[int] = field(default_factory=set)
+    # The trainer child's latent-step figures by batch, written only for the batches named.
+    latents_peaks_mib: dict[int, int] = field(default_factory=dict)
+    oom_in_latents: set[int] = field(default_factory=set)
     kill_at: tuple[str, int] | None = None
     signal_at: tuple[str, int] | None = None
     jump_at: tuple[str, int] | None = None
@@ -402,12 +405,17 @@ class FakeChild:
             "losses": [[self.local, 2.0 - 0.01 * self.step]] if self.local else [],
             "oom": oom,
         }
+        if batch in self.trainer.latents_peaks_mib:
+            doc["latents_peak_reserved_bytes"] = self.trainer.latents_peaks_mib[batch] * MIB
+        if batch in self.trainer.oom_in_latents:
+            doc["oom_in_latents"] = oom
         self.metrics.write_text(json.dumps(doc), encoding="utf-8")
 
     def poll(self) -> int | None:
         if self.code is not None:
             return self.code
-        if self.config["batch_size"] in self.trainer.oom:
+        batch = self.config["batch_size"]
+        if batch in self.trainer.oom or batch in self.trainer.oom_in_latents:
             self._write_metrics(oom=True)
             self.code = stage.CHILD_OOM
             return self.code
@@ -637,6 +645,35 @@ def test_probe_counts_out_of_memory_as_not_fitting(
     assert doc["batch"] == 4
     assert doc["trials"][-1]["batch"] == 8 and doc["trials"][-1]["oom"] is True
     assert "out of memory" in result.out
+
+
+def test_probe_records_and_prints_the_latent_precompute_peak_apart(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    # A fresh run: batch 2's child encoded the latents; later children found them cached.
+    trainer = FakeTrainer(latents_peaks_mib={2: 12546})
+    result = probe(root, clone, trainer=trainer)
+    assert result.code == 0, result.err + result.log
+    doc = read(run_dir(root) / "probe.json")
+    assert [t["latents_peak_vram_mib"] for t in doc["trials"]] == [12546.0, None, None]
+    assert doc["batch"] == 4
+    lines = result.out.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("  batch 2: peak 6100 MiB"))
+    assert lines[at + 1] == "    latent precompute: peak 12546 MiB, not counted"
+    assert result.out.count("latent precompute") == 1
+
+
+def test_probe_fails_on_a_latent_precompute_out_of_memory_without_a_fit_verdict(
+    root: root_mod.Root, hub: Hub, clone: Path
+) -> None:
+    trainer = FakeTrainer(oom_in_latents={2})
+    result = probe(root, clone, trainer=trainer)
+    # A failed job, not the exit 3 of a batch that does not fit.
+    assert result.code == 4
+    assert "latent precompute ran out of memory at batch 2" in result.log
+    assert "no batch fits" not in result.out and "does not fit" not in result.err
+    assert [s.name for s in trainer.starts] == ["batch-2"]
+    assert not (run_dir(root) / "probe.json").exists()
 
 
 def test_probe_records_its_longest_checkpoint_save(
@@ -1746,6 +1783,7 @@ def test_the_latent_precompute_is_measured_apart_from_the_training_peak(
     assert doc["peak_reserved_bytes"] == HOST_TRAINING_PEAK_MIB * MIB
     assert doc["latents_peak_reserved_bytes"] == HOST_PRECOMPUTE_PEAK_MIB * MIB
     assert doc["steps"] == 12
+    assert doc["oom"] is False and doc["oom_in_latents"] is False
     assert upstream_latents_is_bound(trainer_clone)
 
 
@@ -1774,6 +1812,20 @@ def test_the_latents_peak_is_null_when_the_latents_step_never_returned(
     # No reset happened: the peak is the whole run's.
     assert doc["latents_peak_reserved_bytes"] is None
     assert doc["peak_reserved_bytes"] == HOST_PRECOMPUTE_PEAK_MIB * MIB
+    assert upstream_latents_is_bound(trainer_clone)
+
+
+def test_trainer_reports_an_out_of_memory_in_the_latent_step(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = host_config(tmp_path, latents_oom=True)
+
+    assert stage.main(trainer_argv(trainer_clone, tmp_path, config)) == stage.CHILD_OOM
+
+    assert hard_exit.calls == []
+    doc = read(tmp_path / "metrics.json")
+    assert doc["oom"] is True and doc["oom_in_latents"] is True and doc["steps"] == 0
+    assert upstream_exit_is_bound(trainer_clone)
     assert upstream_latents_is_bound(trainer_clone)
 
 
@@ -1984,6 +2036,8 @@ def test_trainer_reports_out_of_memory(
     assert hard_exit.calls == []
     doc = read(tmp_path / "metrics.json")
     assert doc["oom"] is True and doc["steps"] == 0 and doc["steps_per_s"] is None
+    # The latent step had returned: the out of memory was in the training steps.
+    assert doc["oom_in_latents"] is False
     assert upstream_exit_is_bound(trainer_clone)
     assert upstream_latents_is_bound(trainer_clone)
 

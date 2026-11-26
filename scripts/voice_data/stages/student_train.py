@@ -50,7 +50,10 @@ Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` 
 `probe` trains `PROBE_STEPS` optimizer steps at each batch in turn, with accumulation to the
 effective batch upstream requires, stopping at the first that does not fit (its peak above the
 free VRAM less `HEADROOM_MIB`, or out of memory), and writes `probe.json`, with the longest
-checkpoint save of any trial as `save_s`, from which a stop's grace is sized. `train` runs the
+checkpoint save of any trial as `save_s`, from which a stop's grace is sized. Each trial records
+the latent step's peak as `latents_peak_vram_mib`, outside the fit; when CUDA ran out of memory
+in that step, the probe fails with no fit verdict, because the precompute runs at upstream's own
+batch, not the trial's. `train` runs the
 fine-tune from the 24-layer base and then the distillation, the student warm-started from the
 released 6-layer student (`student_init_from`) and taught by the fine-tune's newest checkpoint.
 Upstream resumes from its newest checkpoint by itself, saves at `ckpt_freq` and at `max_steps`,
@@ -579,6 +582,12 @@ def run_probe(
         if stopped is not None:
             raise StageError(f"the probe was stopped by a {stopped} before it finished")
         metrics = read_metrics(metrics_path)
+        if metrics.get("oom_in_latents") is True:
+            # The precompute's batch is upstream's own, whatever the trial's: no fit verdict.
+            raise StageError(
+                f"the latent precompute ran out of memory at batch {batch}, before any training "
+                "step; it measures no batch's fit"
+            )
         oom = code == CHILD_OOM and bool(metrics.get("oom"))
         if code != 0 and not oom:
             raise StageError(f"the trainer exited {code} at batch {batch}")
@@ -592,6 +601,7 @@ def run_probe(
         )  # fmt: skip
         trials.append(
             {"batch": batch, "accum": int(doc["grad_accum_steps"]), "peak_vram_mib": peak,  # type: ignore[call-overload]
+             "latents_peak_vram_mib": _mib(metrics.get("latents_peak_reserved_bytes")),
              "free_vram_mib": free, "steps_per_s": rate,
              "save_s": _seconds(metrics.get("save_s")), "oom": oom, "fits": fits}
         )  # fmt: skip
@@ -1164,11 +1174,14 @@ class LatentsStep:
     holds; `reset_peak_memory_stats` sets the peak to what is reserved after that release. A
     reset before the release would carry those cached blocks into the training's peak. The
     three run on every return, when the latents were cached and nothing was encoded too.
+    `running` is true from the call until the step returns, so it stays true when the step
+    raised, and an out-of-memory error can be told apart from one in the training steps.
     """
 
     def __init__(self, cuda: object) -> None:
         self._cuda = cuda
         self.peak: int | None = None
+        self.running = False
 
     def install(self, module: object) -> Callable[[], None]:
         """Wrap `module.ensure_train_latents`; return the call that undoes it."""
@@ -1176,7 +1189,9 @@ class LatentsStep:
         cuda = self._cuda
 
         def ensure_train_latents(*args: object, **kwargs: object) -> object:
+            self.running = True
             result = original(*args, **kwargs)
+            self.running = False
             self.peak = int(cuda.max_memory_reserved())  # type: ignore[attr-defined]
             cuda.empty_cache()  # type: ignore[attr-defined]
             cuda.reset_peak_memory_stats()  # type: ignore[attr-defined]
@@ -1206,7 +1221,8 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
     latent step (`training.train_utils.ensure_train_latents`, which `train.py` also binds by name
     at import) is wrapped the same way, and when it returns its own peak is recorded as
     `latents_peak_reserved_bytes` and the peak statistic starts again (`LatentsStep`). When the
-    step never returned, that key is null and the peak is the whole run's.
+    step never returned, that key is null and the peak is the whole run's. `oom_in_latents` is
+    true when CUDA ran out of memory while that step was running.
 
     The allocator config is set first, before anything here imports torch (`allocator_conf`).
     """
@@ -1236,6 +1252,7 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
                 "save_s": saves.longest(),
                 "losses": monitor.windows(),
                 "oom": oom,
+                "oom_in_latents": oom and latents.running,
             },
         )
 

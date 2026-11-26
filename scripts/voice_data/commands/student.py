@@ -464,7 +464,11 @@ def run_probe(args: argparse.Namespace) -> int:
 
 
 def probe_lines(run_id: str, probe: Mapping[str, object]) -> list[str]:
-    """Return what `student probe` prints: each batch's fit, then the batch chosen."""
+    """Return what `student probe` prints: each batch's fit, then the batch chosen.
+
+    A trial whose metrics carry the latent step's peak (`latents_peak_vram_mib`) gets a line of
+    its own under its batch: that peak is outside the fit.
+    """
     lines = [f"student probe {run_id}: free {_num(probe.get('free_vram_mib'), 0)} MiB"]
     trials = probe.get("trials")
     for trial in trials if isinstance(trials, list) else []:
@@ -475,6 +479,9 @@ def probe_lines(run_id: str, probe: Mapping[str, object]) -> list[str]:
             f"  batch {_num(trial.get('batch'))}: peak {_num(trial.get('peak_vram_mib'), 0)} "
             f"MiB, {_num(trial.get('steps_per_s'))} steps/s, {fit}"
         )
+        latents = trial.get("latents_peak_vram_mib")
+        if isinstance(latents, int | float) and not isinstance(latents, bool):
+            lines.append(f"    latent precompute: peak {_num(latents, 0)} MiB, not counted")
     if probe.get("batch") is None:
         lines.append("  no batch fits")
     else:
