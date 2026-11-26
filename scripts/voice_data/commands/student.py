@@ -466,8 +466,11 @@ def run_probe(args: argparse.Namespace) -> int:
 def probe_lines(run_id: str, probe: Mapping[str, object]) -> list[str]:
     """Return what `student probe` prints: each batch's fit, then the batch chosen.
 
-    A trial whose metrics carry the latent step's peak (`latents_peak_vram_mib`) gets a line of
-    its own under its batch: that peak is outside the fit.
+    A trial whose latent step peaked above its training peak (`latents_peak_vram_mib` over
+    `peak_vram_mib`, both numbers) gets a line of its own under its batch, because leaving that
+    step out of the fit changed the measurement. Every trial whose latent step returned records that peak;
+    one at or below the training peak, such as the resident weights when the latents were
+    already cached, prints nothing.
     """
     lines = [f"student probe {run_id}: free {_num(probe.get('free_vram_mib'), 0)} MiB"]
     trials = probe.get("trials")
@@ -479,9 +482,13 @@ def probe_lines(run_id: str, probe: Mapping[str, object]) -> list[str]:
             f"  batch {_num(trial.get('batch'))}: peak {_num(trial.get('peak_vram_mib'), 0)} "
             f"MiB, {_num(trial.get('steps_per_s'))} steps/s, {fit}"
         )
-        latents = trial.get("latents_peak_vram_mib")
-        if isinstance(latents, int | float) and not isinstance(latents, bool):
-            lines.append(f"    latent precompute: peak {_num(latents, 0)} MiB, not counted")
+        latents = _finite(trial.get("latents_peak_vram_mib"))
+        peak = _finite(trial.get("peak_vram_mib"))
+        if latents is not None and peak is not None and latents > peak:
+            lines.append(
+                f"    latent step: peak {_num(latents, 0)} MiB, above the training peak, "
+                "not counted"
+            )
     if probe.get("batch") is None:
         lines.append("  no batch fits")
     else:

@@ -647,20 +647,33 @@ def test_probe_counts_out_of_memory_as_not_fitting(
     assert "out of memory" in result.out
 
 
-def test_probe_records_and_prints_the_latent_precompute_peak_apart(
+def test_probe_records_every_latent_step_and_prints_one_above_the_training_peak(
     root: root_mod.Root, hub: Hub, clone: Path
 ) -> None:
-    # A fresh run: batch 2's child encoded the latents; later children found them cached.
-    trainer = FakeTrainer(latents_peaks_mib={2: 12546})
+    # A fresh run: batch 2's child encoded the latents; later children found them cached, and
+    # their latent step's peak is the resident weights, below their training peaks.
+    trainer = FakeTrainer(latents_peaks_mib={2: 12546, 4: 4000, 8: 4000})
     result = probe(root, clone, trainer=trainer)
     assert result.code == 0, result.err + result.log
     doc = read(run_dir(root) / "probe.json")
-    assert [t["latents_peak_vram_mib"] for t in doc["trials"]] == [12546.0, None, None]
+    assert [t["latents_peak_vram_mib"] for t in doc["trials"]] == [12546.0, 4000.0, 4000.0]
     assert doc["batch"] == 4
     lines = result.out.splitlines()
     at = next(i for i, line in enumerate(lines) if line.startswith("  batch 2: peak 6100 MiB"))
-    assert lines[at + 1] == "    latent precompute: peak 12546 MiB, not counted"
-    assert result.out.count("latent precompute") == 1
+    assert lines[at + 1] == "    latent step: peak 12546 MiB, above the training peak, not counted"
+    assert result.out.count("latent step") == 1
+
+
+@pytest.mark.parametrize("latents_mib", [4000, 6100], ids=["below", "equal"])
+def test_probe_prints_no_latent_step_at_or_below_the_training_peak(
+    root: root_mod.Root, hub: Hub, clone: Path, latents_mib: int
+) -> None:
+    trainer = FakeTrainer(latents_peaks_mib={2: latents_mib, 4: latents_mib, 8: latents_mib})
+    result = probe(root, clone, trainer=trainer)
+    assert result.code == 0, result.err + result.log
+    trials = read(run_dir(root) / "probe.json")["trials"]
+    assert [t["latents_peak_vram_mib"] for t in trials] == [float(latents_mib)] * 3
+    assert "latent" not in result.out
 
 
 def test_probe_fails_on_a_latent_precompute_out_of_memory_without_a_fit_verdict(
