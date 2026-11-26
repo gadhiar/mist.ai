@@ -76,7 +76,10 @@ every `docker run` of the family:
 |---------------------|-------------------|--------------|-------------------|
 | `shm_gb`            | `--shm-size <n>g` | 2            | 1                 |
 | `memory_gb`         | `--memory <n>g`   | 9            | 8                 |
-| `cpus`              | `--cpus <n>`      | 8            | 8                 |
+| `cpus`              | `--cpuset-cpus 0-<k-1> --cpus <n>`, k = ceil(n) clamped to the host's cores | 8 | 8 |
+
+`--cpus` is a quota that leaves the container's CPU affinity at every core, so process pools and
+thread counts sized from the affinity follow the budget only through `--cpuset-cpus`.
 
 The values are estimates, not measurements; replace each with a measured peak once the family has
 run. A family without a key runs without that cap.
