@@ -9,7 +9,10 @@ standalone with the root at `--data`, the cache under `HF_HOME`, and `--upstream
 pinned clone when it is not at `/opt/mist-voice/upstream/pocket-tts`.
 
 The trainer is upstream's own, `training/train.py` of the ee2ebc89 clone, run once per stretch
-in a child process (`trainer` mode of this module). The child puts the clone first on
+in a child process (`trainer` mode of this module). The child first sets
+`PYTORCH_CUDA_ALLOC_CONF` to carry upstream's `expandable_segments:True`, before torch is
+imported, because it imports torch before upstream's entry point would set it
+(`allocator_conf`). It puts the clone first on
 `sys.path`, because `-I` keeps it off, and checks that `pocket_tts` resolves inside it, so
 `training` and the `pocket_tts` it imports come from one commit and not from the installed 4.0.1
 wheel. It then runs `training.train` as `__main__` with the config as its one argument, from the
@@ -103,6 +106,10 @@ TRAIN_MODULE = "training.train"
 CHECKPOINTING_MODULE = "training.checkpointing"
 # Home of `exit_training`, upstream's hard exit (`os._exit(0)`) at the end of a run and on a stop.
 DISTRIBUTED_MODULE = "training.distributed"
+# The CUDA caching allocator's options, read once when it initializes, and the one upstream's
+# `train.py` sets at its entry point (`allocator_conf`).
+ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
+EXPANDABLE_SEGMENTS = "expandable_segments"
 TEACHER_MODEL_CONFIG = "pocket_tts/config/english_2026-04_24l.yaml"
 STUDENT_MODEL_CONFIG = "pocket_tts/config/english.yaml"
 FINETUNE_CONFIG = "training/configs/finetune.yaml"
@@ -1083,6 +1090,25 @@ class SaveTimer:
         return max(self.durations, default=None)
 
 
+def allocator_conf(current: str | None) -> str:
+    """Return `current` (a `PYTORCH_CUDA_ALLOC_CONF` value) carrying `expandable_segments:True`.
+
+    Upstream's `train.py` sets `expandable_segments:True` only when it runs as `__main__` and
+    before it imports torch, because the allocator reads the variable when it initializes. This
+    child imports torch before `runpy` reaches that line (`check_clone` imports `pocket_tts`, and
+    `run_trainer` reads the free VRAM), so it sets the option itself. The value is a
+    comma-separated list of `key:value` options; one whose key, stripped of whitespace, is
+    `expandable_segments` is left as it is, whatever its value, and otherwise the option is
+    appended.
+    """
+    if not current:
+        return f"{EXPANDABLE_SEGMENTS}:True"
+    keys = {option.split(":", 1)[0].strip() for option in current.split(",")}
+    if EXPANDABLE_SEGMENTS in keys:
+        return current
+    return f"{current},{EXPANDABLE_SEGMENTS}:True"
+
+
 def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callable[[], None]:
     """Wrap `module.exit_training` so `before_exit` runs first; return the call that undoes it.
 
@@ -1130,7 +1156,10 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
     `finally` writes the same metrics on the paths that do not hard-exit: `CHILD_OOM` is returned
     when CUDA ran out of memory, and upstream's own `SystemExit` (for example a refused config,
     no CUDA device or a non-finite gradient) passes through after the metrics are written.
+
+    The allocator config is set first, before anything here imports torch (`allocator_conf`).
     """
+    os.environ[ALLOC_CONF] = allocator_conf(os.environ.get(ALLOC_CONF))
     check_clone(upstream)
     import torch
 
