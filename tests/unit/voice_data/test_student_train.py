@@ -1276,6 +1276,47 @@ def test_the_stage_runs_standalone() -> None:
     assert proc.returncode == 0 and "--deadline-utc" in proc.stdout
 
 
+def test_importing_the_stage_leaves_torch_unimported() -> None:
+    # The child sets the allocator config in `run_trainer`; an import of torch any earlier, at
+    # module load, would start the allocator without it.
+    proc = subprocess.run(  # noqa: S603 - a fixed argv of this interpreter
+        [sys.executable, "-c",
+         "import sys, scripts.voice_data.stages.student_train; print('torch' in sys.modules)"],
+        capture_output=True, text=True, check=False, cwd=Path(__file__).resolve().parents[3],
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "False"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        pytest.param(None, "expandable_segments:True", id="unset"),
+        pytest.param("", "expandable_segments:True", id="empty"),
+        pytest.param(
+            "max_split_size_mb:512",
+            "max_split_size_mb:512,expandable_segments:True",
+            id="other-option-appended",
+        ),
+        pytest.param(
+            "expandable_segments:False", "expandable_segments:False", id="explicit-false-kept"
+        ),
+        pytest.param(
+            "max_split_size_mb:512, expandable_segments :True,garbage_collection_threshold:0.6",
+            "max_split_size_mb:512, expandable_segments :True,garbage_collection_threshold:0.6",
+            id="among-others-kept",
+        ),
+        pytest.param(
+            "pinned_expandable_segments:True",
+            "pinned_expandable_segments:True,expandable_segments:True",
+            id="key-not-substring",
+        ),
+    ],
+)
+def test_allocator_conf_carries_expandable_segments(current: str | None, expected: str) -> None:
+    assert stage.allocator_conf(current) == expected
+
+
 # The trainer child: upstream's trainer run in-process from the clone.
 
 # Like upstream's train.py, it binds `exit_training` by name at import and ends through it, at
@@ -1316,6 +1357,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""
+
+ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
+POCKET_TTS_INIT = """\
+import os
+
+ALLOC_CONF_AT_IMPORT = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
 """
 
 # Upstream's `exit_training` kills the loader processes, shuts logging down and calls
@@ -1519,10 +1567,16 @@ def trainer_clone(
     """A clone whose trainer is `TRAIN_PY`, a decoy installed `pocket_tts`, and a fake torch.
 
     It depends on `hard_exit`, so the fake upstream's `os._exit` never ends the test process.
+    The clone's `pocket_tts`, which `check_clone` imports first, stands in for the real one that
+    imports torch: it records `PYTORCH_CUDA_ALLOC_CONF` as it was at that import.
     """
+    # `run_trainer` sets the variable; `setenv` first so that undoing restores it as it was
+    # even when it was unset (`delenv` of an absent name records nothing to undo).
+    monkeypatch.setenv(ALLOC_CONF, "")
+    monkeypatch.delenv(ALLOC_CONF)
     folder = tmp_path / "trainer-clone"
     for rel, text in {
-        "pocket_tts/__init__.py": "",
+        "pocket_tts/__init__.py": POCKET_TTS_INIT,
         "training/__init__.py": "",
         "training/train.py": TRAIN_PY,
         "training/checkpointing.py": CHECKPOINTING_PY,
@@ -1607,6 +1661,35 @@ def test_trainer_runs_upstream_from_the_clone_and_measures_it(
     }  # fmt: skip
     # The hooks are gone once the trainer returns.
     assert sys.modules["torch"].hooks == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("before", "at_import"),
+    [
+        pytest.param(None, "expandable_segments:True", id="unset"),
+        pytest.param(
+            "max_split_size_mb:512",
+            "max_split_size_mb:512,expandable_segments:True",
+            id="appended",
+        ),
+    ],
+)
+def test_trainer_sets_expandable_segments_before_torch_is_imported(
+    trainer_clone: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before: str | None,
+    at_import: str,
+) -> None:
+    if before is not None:
+        monkeypatch.setenv(ALLOC_CONF, before)
+    config = trainer_config_file(tmp_path)
+
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    recorded = sys.modules["pocket_tts"].ALLOC_CONF_AT_IMPORT  # type: ignore[attr-defined]
+    assert recorded == at_import
 
 
 def test_trainer_writes_its_metrics_before_upstreams_hard_exit_at_the_last_step(
