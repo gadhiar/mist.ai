@@ -9,10 +9,10 @@ standalone with the root at `--data`, the cache under `HF_HOME`, and `--upstream
 pinned clone when it is not at `/opt/mist-voice/upstream/pocket-tts`.
 
 The trainer is upstream's own, `training/train.py` of the ee2ebc89 clone, run once per stretch
-in a child process (`trainer` mode of this module). The child first sets
-`PYTORCH_CUDA_ALLOC_CONF` to carry upstream's `expandable_segments:True`, before torch is
-imported, because it imports torch before upstream's entry point would set it
-(`allocator_conf`). It puts the clone first on
+in a child process (`trainer` mode of this module). The child first gives
+`PYTORCH_CUDA_ALLOC_CONF` an `expandable_segments` option (`True`, which upstream's entry point
+sets when the variable is unset), before torch is imported, because it imports torch before
+that entry point runs (`allocator_conf`). It puts the clone first on
 `sys.path`, because `-I` keeps it off, and checks that `pocket_tts` resolves inside it, so
 `training` and the `pocket_tts` it imports come from one commit and not from the installed 4.0.1
 wheel. It then runs `training.train` as `__main__` with the config as its one argument, from the
@@ -1091,22 +1091,26 @@ class SaveTimer:
 
 
 def allocator_conf(current: str | None) -> str:
-    """Return `current` (a `PYTORCH_CUDA_ALLOC_CONF` value) carrying `expandable_segments:True`.
+    """Return `current` (a `PYTORCH_CUDA_ALLOC_CONF` value) with an `expandable_segments` option.
 
-    Upstream's `train.py` sets `expandable_segments:True` only when it runs as `__main__` and
-    before it imports torch, because the allocator reads the variable when it initializes. This
-    child imports torch before `runpy` reaches that line (`check_clone` imports `pocket_tts`, and
-    `run_trainer` reads the free VRAM), so it sets the option itself. The value is a
-    comma-separated list of `key:value` options; one whose key, stripped of whitespace, is
-    `expandable_segments` is left as it is, whatever its value, and otherwise the option is
-    appended.
+    Upstream's `train.py` sets `expandable_segments:True` with `setdefault`, so only when the
+    variable is unset, when it runs as `__main__` and before it imports torch, because the
+    allocator reads the variable when it initializes. This child imports torch before `runpy`
+    reaches that line (`check_clone` imports `pocket_tts`, and `run_trainer` reads the free VRAM),
+    so it sets the option itself, and more strictly than upstream: a value without the option
+    gets `expandable_segments:True` appended, where upstream would leave it as it is. The value
+    is a comma-separated list of `key:value` options; a value with an option whose key, stripped
+    of whitespace, is `expandable_segments` is returned unchanged, whatever that option's value.
+    Empty options are dropped before appending, because torch refuses an empty one; rejoining
+    the rest keeps a bracketed value such as `roundup_power2_divisions:[256:1,512:2]` intact.
     """
-    if not current:
+    text = current or ""
+    options = [option for option in text.split(",") if option.strip()]
+    if not options:
         return f"{EXPANDABLE_SEGMENTS}:True"
-    keys = {option.split(":", 1)[0].strip() for option in current.split(",")}
-    if EXPANDABLE_SEGMENTS in keys:
-        return current
-    return f"{current},{EXPANDABLE_SEGMENTS}:True"
+    if EXPANDABLE_SEGMENTS in {option.split(":", 1)[0].strip() for option in options}:
+        return text
+    return ",".join([*options, f"{EXPANDABLE_SEGMENTS}:True"])
 
 
 def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callable[[], None]:
