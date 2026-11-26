@@ -3,8 +3,8 @@
 `--cpus` alone is a CFS quota: the container still sees every core of the Docker VM in
 `os.sched_getaffinity(0)`, so the Pocket TTS trainer's latent precompute, which starts
 `max(4, cores - 2)` workers, started 14 on a 16-core VM and ran out of memory. Each test pins the
-host's core
-count through `jobs.os.cpu_count`, so no result depends on the machine running the suite.
+host's core count through `jobs.os.cpu_count`, so no result depends on the machine running the
+suite.
 """
 
 from __future__ import annotations
