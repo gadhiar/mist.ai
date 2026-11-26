@@ -1687,6 +1687,26 @@ def test_trainer_hard_exits_and_reports_why_when_its_metrics_cannot_be_written(
     assert upstream_exit_is_bound(trainer_clone)
 
 
+def test_trainer_hard_exits_when_reporting_the_failed_write_fails_too(
+    trainer_clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard_exit: ExitStub
+) -> None:
+    _metrics_json_raises_value_error(tmp_path, monkeypatch)
+
+    def closed_stderr() -> None:
+        raise OSError("stderr is closed")
+
+    monkeypatch.setattr(stage.traceback, "print_exc", closed_stderr)
+    config = trainer_config_file(tmp_path)
+
+    # The stub's `HardExit` replaces the report's `OSError`; the `finally` then fails its own
+    # write with the `ValueError`.
+    with pytest.raises(ValueError):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    assert hard_exit.calls == [(0, None)]
+    assert upstream_exit_is_bound(trainer_clone)
+
+
 def test_trainer_passes_upstreams_system_exit_through_after_the_metrics(
     trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
 ) -> None:
