@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import importlib
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -1277,6 +1278,9 @@ def test_the_stage_runs_standalone() -> None:
 
 # The trainer child: upstream's trainer run in-process from the clone.
 
+# Like upstream's train.py, it binds `exit_training` by name at import and ends through it, at
+# the last step and on a stop (`stop_at`: the stop request arrives during that step). A non-finite
+# gradient (`nonfinite`) raises `SystemExit` before that step's optimizer step, as upstream does.
 TRAIN_PY = """\
 import json
 import sys
@@ -1285,6 +1289,7 @@ import torch
 
 import pocket_tts
 from training.checkpointing import save_checkpoint
+from training.distributed import exit_training
 
 
 def main():
@@ -1295,16 +1300,32 @@ def main():
     for step in range(1, config["steps"] + 1):
         for _ in range(2):
             torch.tensor(0.25 * step).backward()
+        if config.get("nonfinite") == step:
+            raise SystemExit(f"non-finite gradient at step {step}")
         adam.step()
         muon.step()
+        if config.get("stop_at") == step:
+            save_checkpoint(config["run_dir"], step)
+            exit_training()
         if step % config["ckpt_freq"] == 0:
             save_checkpoint(config["run_dir"], step)
     with open(config["seen"], "w", encoding="utf-8") as handle:
         json.dump({"pocket_tts": pocket_tts.__file__, "argv": sys.argv[1:]}, handle)
+    exit_training()
 
 
 if __name__ == "__main__":
     main()
+"""
+
+# Upstream's `exit_training` kills the loader processes, shuts logging down and calls
+# `os._exit(0)`; only the hard exit matters here, and the tests replace `os._exit` (`HardExit`).
+DISTRIBUTED_PY = """\
+import os
+
+
+def exit_training():
+    os._exit(0)
 """
 
 CHECKPOINTING_PY = """\
@@ -1463,15 +1484,49 @@ def test_step_monitor_remove_restores_real_torch() -> None:
     assert len(monitor.times) == 1 and len(monitor.step_losses) == 1
 
 
+class HardExit(BaseException):
+    """Raised by the `os._exit` stub, so the process upstream would end is the test's."""
+
+
+@dataclass
+class ExitStub:
+    """Stands in for `os._exit`: records the code and the metrics file as they were at the call.
+
+    The record is taken at the call because `run_trainer`'s `finally` writes the metrics while
+    `HardExit` unwinds, which upstream's real `os._exit` would have skipped.
+    """
+
+    metrics: Path
+    calls: list[tuple[int, dict | None]] = field(default_factory=list)
+
+    def __call__(self, code: int) -> None:
+        self.calls.append((code, read(self.metrics) if self.metrics.is_file() else None))
+        raise HardExit(code)
+
+
 @pytest.fixture
-def trainer_clone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """A clone whose trainer is `TRAIN_PY`, a decoy installed `pocket_tts`, and a fake torch."""
+def hard_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ExitStub:
+    """Replace `os._exit`; the trainer tests' metrics file is `tmp_path / "metrics.json"`."""
+    stub = ExitStub(tmp_path / "metrics.json")
+    monkeypatch.setattr(os, "_exit", stub)
+    return stub
+
+
+@pytest.fixture
+def trainer_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard_exit: ExitStub
+) -> Iterator[Path]:
+    """A clone whose trainer is `TRAIN_PY`, a decoy installed `pocket_tts`, and a fake torch.
+
+    It depends on `hard_exit`, so the fake upstream's `os._exit` never ends the test process.
+    """
     folder = tmp_path / "trainer-clone"
     for rel, text in {
         "pocket_tts/__init__.py": "",
         "training/__init__.py": "",
         "training/train.py": TRAIN_PY,
         "training/checkpointing.py": CHECKPOINTING_PY,
+        "training/distributed.py": DISTRIBUTED_PY,
     }.items():
         path = folder / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1485,7 +1540,10 @@ def trainer_clone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[P
     monkeypatch.setattr(
         stage, "time", types.SimpleNamespace(perf_counter=lambda: next(ticks) * 0.5)
     )
-    names = ("pocket_tts", "training", "training.train", "training.checkpointing")
+    names = (
+        "pocket_tts", "training", "training.train", "training.checkpointing",
+        "training.distributed",
+    )  # fmt: skip
     for name in names:
         monkeypatch.delitem(sys.modules, name, raising=False)
     yield folder
@@ -1501,23 +1559,41 @@ def trainer_config_file(tmp_path: Path, **values: object) -> Path:
     return path
 
 
+def trainer_argv(clone: Path, tmp_path: Path, config: Path, *extra: str) -> list[str]:
+    """The `trainer` mode's command line, its metrics at `tmp_path / "metrics.json"`."""
+    return [
+        "--data", str(tmp_path), "--upstream", str(clone), "trainer", "--config", str(config),
+        "--metrics", str(tmp_path / "metrics.json"), *extra,
+    ]  # fmt: skip
+
+
+def metrics_at_exit(hard_exit: ExitStub) -> dict:
+    """Return the metrics file as it was when upstream's one `os._exit(0)` was called."""
+    [(code, doc)] = hard_exit.calls
+    assert code == 0
+    assert doc is not None, "no metrics file when upstream's exit_training hard-exited"
+    return doc
+
+
+def upstream_exit_is_bound(clone: Path) -> bool:
+    """Whether `training.distributed.exit_training` is the clone's own function again."""
+    function = sys.modules["training.distributed"].exit_training  # type: ignore[attr-defined]
+    return Path(function.__code__.co_filename).resolve().is_relative_to(clone.resolve())
+
+
 def test_trainer_runs_upstream_from_the_clone_and_measures_it(
-    trainer_clone: Path, tmp_path: Path
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
 ) -> None:
     config = trainer_config_file(tmp_path)
-    metrics = tmp_path / "metrics.json"
     weights = tmp_path / "weights"
-    code = stage.main(
-        ["--data", str(tmp_path), "--upstream", str(trainer_clone), "trainer", "--config",
-         str(config), "--metrics", str(metrics), "--export-dir", str(weights)]
-    )  # fmt: skip
-    assert code == 0
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config, "--export-dir", str(weights)))
     seen = read(tmp_path / "seen.json")
     # `pocket_tts` came from the clone, not from the installed copy earlier on the path.
     assert Path(seen["pocket_tts"]).resolve().is_relative_to(trainer_clone.resolve())
     assert seen["argv"] == [str(config)]
     assert sys.path[0] == str(trainer_clone)
-    doc = read(metrics)
+    doc = metrics_at_exit(hard_exit)
     assert (doc["free_bytes"], doc["peak_reserved_bytes"]) == (10 * 1024 * MIB, 6 * 1024 * MIB)
     # One timed step per step of the first optimizer; the first five are warm-up.
     assert doc["steps"] == 12 and doc["steps_per_s"] == pytest.approx(2.0)
@@ -1533,20 +1609,81 @@ def test_trainer_runs_upstream_from_the_clone_and_measures_it(
     assert sys.modules["torch"].hooks == []  # type: ignore[attr-defined]
 
 
+def test_trainer_writes_its_metrics_before_upstreams_hard_exit_at_the_last_step(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = trainer_config_file(tmp_path)
+
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    doc = metrics_at_exit(hard_exit)
+    assert (doc["free_bytes"], doc["peak_reserved_bytes"]) == (10 * 1024 * MIB, 6 * 1024 * MIB)
+    assert doc["steps"] == 12 and doc["steps_per_s"] == pytest.approx(2.0)
+    assert doc["oom"] is False
+    assert upstream_exit_is_bound(trainer_clone)
+
+
+def test_trainer_writes_its_metrics_before_upstreams_hard_exit_on_a_stop(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = trainer_config_file(tmp_path, stop_at=7)
+
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    doc = metrics_at_exit(hard_exit)
+    assert (doc["free_bytes"], doc["peak_reserved_bytes"]) == (10 * 1024 * MIB, 6 * 1024 * MIB)
+    assert doc["steps"] == 7 and doc["steps_per_s"] == pytest.approx(2.0)
+    assert doc["losses"] == [[7, pytest.approx(0.5 * 4.0)]]
+    assert doc["oom"] is False
+    # The stop saved after its step and ended the trainer there.
+    assert stage.newest_step(tmp_path / "distill") == 7
+    assert not (tmp_path / "seen.json").exists()
+    assert upstream_exit_is_bound(trainer_clone)
+
+
+def test_trainer_hard_exits_when_its_metrics_cannot_be_written(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A folder where the metrics file belongs: writing it raises `IsADirectoryError`.
+    (tmp_path / "metrics.json").mkdir()
+    config = trainer_config_file(tmp_path)
+
+    # Upstream's `os._exit` would end the process here; the stub lets the `finally` run, and its
+    # own write fails the same way.
+    with pytest.raises(OSError):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    assert hard_exit.calls == [(0, None)]
+    assert "metrics could not be written" in capsys.readouterr().err
+    assert upstream_exit_is_bound(trainer_clone)
+
+
+def test_trainer_passes_upstreams_system_exit_through_after_the_metrics(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
+    config = trainer_config_file(tmp_path, nonfinite=9)
+
+    with pytest.raises(SystemExit, match="non-finite gradient at step 9"):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+
+    assert hard_exit.calls == []
+    doc = read(tmp_path / "metrics.json")
+    assert doc["steps"] == 8 and doc["oom"] is False
+    assert upstream_exit_is_bound(trainer_clone)
+
+
 def test_trainer_times_each_checkpoint_save(
-    trainer_clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    trainer_clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard_exit: ExitStub
 ) -> None:
     # Saves at steps 4, 8 and 12, each read twice: they take 1.25, 2.5 and 0.5 seconds.
     readings = iter([0.0, 1.25, 10.0, 12.5, 20.0, 20.5])
     monkeypatch.setattr(stage, "save_clock", lambda: next(readings))
     config = trainer_config_file(tmp_path)
-    metrics = tmp_path / "metrics.json"
-    code = stage.main(
-        ["--data", str(tmp_path), "--upstream", str(trainer_clone), "trainer", "--config",
-         str(config), "--metrics", str(metrics)]
-    )  # fmt: skip
-    assert code == 0
-    assert read(metrics)["save_s"] == pytest.approx(2.5)
+    with pytest.raises(HardExit):
+        stage.main(trainer_argv(trainer_clone, tmp_path, config))
+    assert metrics_at_exit(hard_exit)["save_s"] == pytest.approx(2.5)
     assert next(readings, None) is None
 
 
@@ -1564,16 +1701,16 @@ def test_save_timer_records_a_save_that_raised() -> None:
     assert timer.longest() == pytest.approx(3.0)
 
 
-def test_trainer_reports_out_of_memory(trainer_clone: Path, tmp_path: Path) -> None:
+def test_trainer_reports_out_of_memory(
+    trainer_clone: Path, tmp_path: Path, hard_exit: ExitStub
+) -> None:
     config = trainer_config_file(tmp_path, oom=True)
-    metrics = tmp_path / "metrics.json"
-    code = stage.main(
-        ["--data", str(tmp_path), "--upstream", str(trainer_clone), "trainer", "--config",
-         str(config), "--metrics", str(metrics)]
-    )  # fmt: skip
+    code = stage.main(trainer_argv(trainer_clone, tmp_path, config))
     assert code == stage.CHILD_OOM
-    doc = read(metrics)
+    assert hard_exit.calls == []
+    doc = read(tmp_path / "metrics.json")
     assert doc["oom"] is True and doc["steps"] == 0 and doc["steps_per_s"] is None
+    assert upstream_exit_is_bound(trainer_clone)
 
 
 def test_trainer_refuses_a_pocket_tts_outside_the_clone(
@@ -1582,8 +1719,5 @@ def test_trainer_refuses_a_pocket_tts_outside_the_clone(
     (trainer_clone / "pocket_tts" / "__init__.py").unlink()
     (trainer_clone / "pocket_tts").rmdir()
     config = trainer_config_file(tmp_path)
-    code = stage.main(
-        ["--data", str(tmp_path), "--upstream", str(trainer_clone), "trainer", "--config",
-         str(config), "--metrics", str(tmp_path / "metrics.json")]
-    )  # fmt: skip
+    code = stage.main(trainer_argv(trainer_clone, tmp_path, config))
     assert code == 1

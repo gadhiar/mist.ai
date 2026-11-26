@@ -17,7 +17,9 @@ clone's root, and writes what it measured to a metrics file: the free VRAM befor
 peak `torch.cuda.max_memory_reserved`, the optimizer steps and their rate (a global optimizer
 post-step hook; the first `WARMUP_STEPS` are left out), the loss of each step (the scalar
 `backward` received, summed over the step's micro-batches, averaged per `LOSS_WINDOW` steps) and
-the longest `save_checkpoint` call, timed on its own clock (`save_clock`).
+the longest `save_checkpoint` call, timed on its own clock (`save_clock`). Upstream ends a run,
+at its last step and on a stop, with `training.distributed.exit_training`, whose `os._exit(0)`
+skips every `finally`, so the child wraps that function to write the metrics before the exit.
 
 Everything the trainer reads is local, because jobs run with `HF_HUB_OFFLINE=1` and the configs'
 `hf://` URIs name a revision (`49252265`) the cache does not hold:
@@ -98,6 +100,8 @@ UPSTREAM = fetch.UPSTREAM / "pocket-tts"
 PACKAGE = "pocket-tts"
 TRAIN_MODULE = "training.train"
 CHECKPOINTING_MODULE = "training.checkpointing"
+# Home of `exit_training`, upstream's hard exit (`os._exit(0)`) at the end of a run and on a stop.
+DISTRIBUTED_MODULE = "training.distributed"
 TEACHER_MODEL_CONFIG = "pocket_tts/config/english_2026-04_24l.yaml"
 STUDENT_MODEL_CONFIG = "pocket_tts/config/english.yaml"
 FINETUNE_CONFIG = "training/configs/finetune.yaml"
@@ -1078,11 +1082,44 @@ class SaveTimer:
         return max(self.durations, default=None)
 
 
+def install_exit_hook(module: object, before_exit: Callable[[], None]) -> Callable[[], None]:
+    """Wrap `module.exit_training` so `before_exit` runs first; return the call that undoes it.
+
+    Upstream's `exit_training` ends with `os._exit(0)`, which runs no `finally` and no `atexit`
+    handler, so whatever the child must leave behind has to be written before it. The exit still
+    happens when `before_exit` raises: a trainer that returned instead could hang on its loader
+    processes, which `exit_training` exists to kill. An `OSError` is reported on stderr, so the
+    log says why the parent then finds no metrics.
+    """
+    original = module.exit_training  # type: ignore[attr-defined]
+
+    def exit_training(*args: object, **kwargs: object) -> None:
+        try:
+            before_exit()
+        except OSError:
+            print("error: the trainer's metrics could not be written", file=sys.stderr)
+        finally:
+            original(*args, **kwargs)
+
+    module.exit_training = exit_training  # type: ignore[attr-defined]
+
+    def restore() -> None:
+        module.exit_training = original  # type: ignore[attr-defined]
+
+    return restore
+
+
 def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Path | None) -> int:
     """Run upstream's trainer on `config` in this process; write the metrics; return the code.
 
-    Returns `CHILD_OOM` when CUDA ran out of memory. Upstream's own `SystemExit` (a non-finite
-    gradient) passes through, after the metrics are written.
+    Upstream ends a run, at its last step or on a stop (a `STOP` file or its own signal handler),
+    with `training.distributed.exit_training`, which hard-exits with `os._exit(0)` and so skips
+    this function's `finally`. `train.py` binds that function by name when it is imported, so the
+    wrapper that writes the metrics first (`install_exit_hook`) is installed on the module before
+    `runpy` imports `train.py`, and removed again once the trainer returns or raises. The
+    `finally` writes the same metrics on the paths that do not hard-exit: `CHILD_OOM` is returned
+    when CUDA ran out of memory, and upstream's own `SystemExit` (a non-finite gradient) passes
+    through after the metrics are written.
     """
     check_clone(upstream)
     import torch
@@ -1094,19 +1131,8 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
         install_export(checkpointing, export_dir)
     saves = SaveTimer(save_clock)
     saves.install(checkpointing)
-    saved_argv, saved_cwd = sys.argv, os.getcwd()
-    oom = False
-    monitor.install(torch)
-    try:
-        os.chdir(upstream)
-        sys.argv = [TRAIN_MODULE, str(config)]
-        runpy.run_module(TRAIN_MODULE, run_name="__main__", alter_sys=True)
-    except torch.cuda.OutOfMemoryError:
-        oom = True
-    finally:
-        sys.argv = saved_argv
-        os.chdir(saved_cwd)
-        monitor.remove()
+
+    def write_metrics(oom: bool) -> None:
         _write_json(
             metrics_path,
             {
@@ -1120,6 +1146,25 @@ def run_trainer(config: Path, metrics_path: Path, upstream: Path, export_dir: Pa
                 "oom": oom,
             },
         )
+
+    restore_exit = install_exit_hook(
+        importlib.import_module(DISTRIBUTED_MODULE), lambda: write_metrics(False)
+    )
+    saved_argv, saved_cwd = sys.argv, os.getcwd()
+    oom = False
+    monitor.install(torch)
+    try:
+        os.chdir(upstream)
+        sys.argv = [TRAIN_MODULE, str(config)]
+        runpy.run_module(TRAIN_MODULE, run_name="__main__", alter_sys=True)
+    except torch.cuda.OutOfMemoryError:
+        oom = True
+    finally:
+        restore_exit()
+        sys.argv = saved_argv
+        os.chdir(saved_cwd)
+        monitor.remove()
+        write_metrics(oom)
     return CHILD_OOM if oom else 0
 
 
