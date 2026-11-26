@@ -1,8 +1,9 @@
 """Tests for the CPU affinity a job container gets from its family's `cpus` budget.
 
 `--cpus` alone is a CFS quota: the container still sees every core of the Docker VM in
-`os.sched_getaffinity(0)`, so a process pool sized from it (the Pocket TTS trainer's latent
-precompute) starts one worker per VM core and runs out of memory. Each test pins the host's core
+`os.sched_getaffinity(0)`, so the Pocket TTS trainer's latent precompute, which starts
+`max(4, cores - 2)` workers, started 14 on a 16-core VM and ran out of memory. Each test pins the
+host's core
 count through `jobs.os.cpu_count`, so no result depends on the machine running the suite.
 """
 

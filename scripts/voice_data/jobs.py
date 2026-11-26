@@ -137,13 +137,17 @@ def cpuset_for(cpus: float) -> str:
     """Return the `--cpuset-cpus` range that matches a family's `cpus` budget.
 
     `--cpus` is a CFS quota: it limits CPU time but leaves `os.sched_getaffinity(0)` at every
-    core of the Docker VM, so a process pool or thread count sized from the affinity starts one
-    worker per VM core. The Pocket TTS trainer's latent precompute does that, and 14 workers
-    each importing torch ran past the job's memory cap. Pinning `ceil(cpus)` cores makes the
-    affinity agree with the budget, while `--cpus` still caps a fractional one. The range starts
-    at core 0 because `0-<k-1>` exists on any Docker VM that accepts `--cpus k`, while a range
-    at the top end needs the VM's own core count, which this host cannot see. The count is
-    clamped to the host's cores; when `os.cpu_count()` cannot tell, the budget is used as is.
+    core of the Docker VM, so a process pool or thread count sized from the affinity is sized
+    for the whole VM. The Pocket TTS trainer's latent precompute starts `max(4, cores - 2)`
+    workers, 14 on a 16-core VM, and those 14 workers, each importing torch, ran past the job's
+    memory cap. Pinning `ceil(cpus)` cores makes the affinity agree with the budget, while
+    `--cpus` still caps a fractional one.
+
+    The range starts at core 0 because `0-<k-1>` exists on any Docker VM that accepts
+    `--cpus k`, so it needs no query of the VM's core count and `argv` makes no docker call.
+    The count is clamped to `os.cpu_count()` so the range never names a core this host lacks;
+    Docker refuses a `--cpus` above the VM's cores either way. When `os.cpu_count()` returns
+    `None`, the rounded-up budget is used unclamped.
     """
     cores = math.ceil(cpus)
     host = os.cpu_count()
