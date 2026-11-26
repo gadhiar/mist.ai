@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -33,7 +34,8 @@ NVIDIA_SMI_QUERY = ("--query-gpu=memory.free", "--format=csv,noheader,nounits")
 # a gaming-mode window has moved its speech engines to CPU but left its CUDA context open.
 GPU_PEERS_ENV = "MIST_VOICE_GPU_PEERS"
 # Optional per-family resource caps in `families.json`: key, `docker run` flag, value suffix.
-# They keep a job inside the RAM and cores a shared host can spare beside the daily stack.
+# They keep a job inside the RAM and cores a shared host can spare beside the daily stack. A
+# `cpus` budget also pins the job's CPU affinity (`--cpuset-cpus`, see `cpuset_for`).
 FAMILY_CAPS = (
     ("shm_gb", "--shm-size", "g"),
     ("memory_gb", "--memory", "g"),
@@ -131,6 +133,25 @@ class HostDocker:
         return proc.returncode
 
 
+def cpuset_for(cpus: float) -> str:
+    """Return the `--cpuset-cpus` range that matches a family's `cpus` budget.
+
+    `--cpus` is a CFS quota: it limits CPU time but leaves `os.sched_getaffinity(0)` at every
+    core of the Docker VM, so a process pool or thread count sized from the affinity starts one
+    worker per VM core. The Pocket TTS trainer's latent precompute does that, and 14 workers
+    each importing torch ran past the job's memory cap. Pinning `ceil(cpus)` cores makes the
+    affinity agree with the budget, while `--cpus` still caps a fractional one. The range starts
+    at core 0 because `0-<k-1>` exists on any Docker VM that accepts `--cpus k`, while a range
+    at the top end needs the VM's own core count, which this host cannot see. The count is
+    clamped to the host's cores; when `os.cpu_count()` cannot tell, the budget is used as is.
+    """
+    cores = math.ceil(cpus)
+    host = os.cpu_count()
+    if host is not None:
+        cores = min(cores, host)
+    return "0" if cores == 1 else f"0-{cores - 1}"
+
+
 def load_families(path: Path = FAMILIES_PATH) -> Mapping[str, Mapping[str, object]]:
     """Return the `families` map of `families.json`.
 
@@ -177,6 +198,9 @@ class LocalDocker:
     def argv(self, job: JobSpec) -> list[str]:
         """Return the `docker run` argv for a job.
 
+        A family's `cpus` budget adds `--cpuset-cpus` beside `--cpus`, because the quota alone
+        leaves the container's affinity at every core of the Docker VM (see `cpuset_for`).
+
         Raises:
             RootError: An input or the outputs resolve outside the root.
             InputError: An `env_names` entry is unset on the host, the family is unknown, or a
@@ -198,6 +222,8 @@ class LocalDocker:
                 value = family[key]
                 if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
                     raise InputError(f"refused: {job.family} {key} is not a positive number")
+                if key == "cpus":
+                    argv += ["--cpuset-cpus", cpuset_for(value)]
                 argv += [flag, f"{value:g}{suffix}"]
         if job.stop_timeout_s is not None:
             argv += ["--stop-timeout", str(job.stop_timeout_s)]
