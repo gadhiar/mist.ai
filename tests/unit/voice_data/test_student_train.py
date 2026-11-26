@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import types
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1387,10 +1387,10 @@ def make_torch(free: int, peak: int) -> types.ModuleType:
 
 
 def use_torch(monkeypatch: pytest.MonkeyPatch, torch: types.ModuleType) -> types.ModuleType:
-    """Put a `make_torch` fake in `sys.modules` under all three names the monitor resolves.
+    """Put a `make_torch` fake in `sys.modules` under the three names real torch puts there.
 
-    Replacing `torch.optim.optimizer` too keeps a real torch imported earlier in the session
-    from lending the fake its global hook registry.
+    The monitor looks up `torch.optim.optimizer` by name, so replacing that entry is what keeps
+    a real torch imported earlier in the session from lending the fake its global hook registry.
     """
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.optim", torch.optim)  # type: ignore[attr-defined]
@@ -1417,33 +1417,50 @@ def test_step_monitor_reaches_the_hook_module_torch_optim_does_not_bind(
     assert torch.hooks == []
 
 
-def test_step_monitor_counts_and_unhooks_real_torch_steps() -> None:
-    torch = pytest.importorskip("torch")
-    original = torch.Tensor.backward
-    ticks = iter(range(100))
-    monitor = stage.StepMonitor(lambda: float(next(ticks)))
-    weight = torch.nn.Parameter(torch.tensor(1.0))
-    optimizer = torch.optim.SGD([weight], lr=0.1)
+def sgd_step(torch: types.ModuleType) -> Callable[[], None]:
+    """Return one CPU SGD step on the scalar loss 2w, w starting at 1.0 with lr 0.1."""
+    weight = torch.nn.Parameter(torch.tensor(1.0))  # type: ignore[attr-defined]
+    optimizer = torch.optim.SGD([weight], lr=0.1)  # type: ignore[attr-defined]
 
     def step() -> None:
         optimizer.zero_grad()
         (weight * 2.0).backward()
         optimizer.step()
 
+    return step
+
+
+def test_step_monitor_counts_real_torch_steps_and_their_losses() -> None:
+    torch = pytest.importorskip("torch")
+    step = sgd_step(torch)
+    ticks = iter(range(100))
+    monitor = stage.StepMonitor(lambda: float(next(ticks)))
     monitor.install(torch)
     try:
         for _ in range(3):
             step()
-        assert monitor.times == [0.0, 1.0, 2.0]
-        # The loss is 2w, and each step moves w down by 0.1 * 2.
-        assert monitor.step_losses == [
-            pytest.approx(2.0), pytest.approx(1.6), pytest.approx(1.2)
-        ]  # fmt: skip
+    finally:
+        monitor.remove()
+    assert monitor.times == [0.0, 1.0, 2.0]
+    # The loss is 2w, and each step moves w down by 0.1 * 2.
+    assert monitor.step_losses == [
+        pytest.approx(2.0), pytest.approx(1.6), pytest.approx(1.2)
+    ]  # fmt: skip
+
+
+def test_step_monitor_remove_restores_real_torch() -> None:
+    torch = pytest.importorskip("torch")
+    original = torch.Tensor.backward
+    step = sgd_step(torch)
+    monitor = stage.StepMonitor(lambda: 0.0)
+    monitor.install(torch)
+    try:
+        step()
     finally:
         monitor.remove()
     assert torch.Tensor.backward is original
     step()
-    assert len(monitor.times) == 3 and len(monitor.step_losses) == 3
+    assert len(monitor.times) == 1 and len(monitor.step_losses) == 1
 
 
 @pytest.fixture
