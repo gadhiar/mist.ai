@@ -2323,8 +2323,10 @@ class ConversationHandler:
 
         The tier's provider is read at call time, not at attach time, because the tier can
         go away between turns (a power level that forbids it, a model being reloaded). The
-        decode sends no tools and no thinking budget: the JSON-schema grammar is the whole
-        answer, and reasoning tokens would only delay it.
+        decode sends no tools and switches thinking off (`enabled=False`): the JSON-schema
+        grammar is the whole answer, and reasoning tokens would only delay it. It does not
+        send a zero budget, which on Gemma 4 force-closes the thinking channel rather than
+        turning thinking off.
 
         The stream is closed through `contextlib.aclosing` whichever way the loop ends, as
         `adaptive_thinking.py` closes its streams. When the host's decode timeout cancels this
@@ -2345,7 +2347,7 @@ class ConversationHandler:
             messages=[dict(message) for message in decode.messages],
             tools=None,
             response_schema=dict(decode.response_schema),
-            thinking=ThinkingConfig(budget_tokens=0),
+            thinking=ThinkingConfig(enabled=False),
             temperature=decode.temperature,
             max_tokens=decode.max_tokens,
         )
@@ -2621,15 +2623,21 @@ class ConversationHandler:
         actions = _ActionsOutcome()
         retrieval_result: RetrievalResult | None = None
         mist_context: MistContext | None = None
-        # A spoken turn waits on the model's first words, so it asks for the
-        # voice budget (0: no reasoning) on both passes. Being caller-set, it
-        # also stops `AdaptiveThinkingProvider` budgeting and retrying the
-        # pass. A typed turn leaves thinking unset, as before.
-        thinking = (
-            ThinkingConfig(budget_tokens=self.config.llm.voice_thinking_budget_tokens)
-            if scope.request.origin == "voice"
-            else None
-        )
+        # A spoken turn waits on the model's first words, so it sends the
+        # voice budget on both passes. A budget of 0 switches thinking off
+        # (`enabled=False`) instead of sending a zero budget: on Gemma 4 a zero
+        # budget force-closes the thinking channel and the model writes its plan
+        # into the spoken reply. Either way thinking is caller-set, which stops
+        # `AdaptiveThinkingProvider` budgeting and retrying the pass. A typed
+        # turn leaves thinking unset, as before.
+        thinking: ThinkingConfig | None = None
+        if scope.request.origin == "voice":
+            voice_budget = self.config.llm.voice_thinking_budget_tokens
+            thinking = (
+                ThinkingConfig(budget_tokens=voice_budget)
+                if voice_budget > 0
+                else ThinkingConfig(enabled=False)
+            )
         first_clause_min_chars = (
             self.config.llm.voice_first_segment_min_chars
             if scope.request.channel == "tts"

@@ -192,6 +192,23 @@ class TestAppliesGating:
         assert sent.thinking == caller_thinking
         assert get_adaptive_thinking_retry_count() == 0
 
+    @pytest.mark.asyncio
+    async def test_thinking_switched_off_is_caller_set_and_never_retried(self):
+        # Voice turns and the capability decode turn thinking off with `enabled=False`.
+        # That is caller-set like a budget, so a length-exhausted empty reply, which the
+        # wrapper retries when it budgeted the request itself, passes straight through.
+        length_failure = LLMResponse(content=None, tool_calls=None, finish_reason="length")
+        inner = ScriptedProvider([[length_failure], [_success_response("unexpected retry")]])
+        provider = AdaptiveThinkingProvider(inner, budget_tokens=1024)
+        req = _request(tools=TOOLS, thinking=ThinkingConfig(enabled=False))
+
+        results = await _collect_async(provider.generate(req, stream=False))
+
+        assert inner.call_count == 1
+        assert inner.received_requests[0] == req
+        assert [r.finish_reason for r in results] == ["length"]
+        assert get_adaptive_thinking_retry_count() == 0
+
 
 # ---------------------------------------------------------------------------
 # Failure kinds -- each triggers exactly one unbudgeted retry

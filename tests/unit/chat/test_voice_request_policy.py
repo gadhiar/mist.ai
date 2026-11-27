@@ -24,6 +24,7 @@ from backend.llm.adaptive_thinking import (
     get_adaptive_thinking_retry_count,
     reset_adaptive_thinking_retry_count,
 )
+from backend.llm.models import ThinkingConfig
 from backend.llm.models import ToolCall as LLMToolCall
 from backend.sentence_detector import find_clause_boundary
 from tests.mocks.config import build_test_config
@@ -156,7 +157,10 @@ class TestVoiceTurnThinking:
     """No-thinking follows the origin: a voice turn; never a typed one, spoken or not (5 (b))."""
 
     @pytest.mark.asyncio
-    async def test_both_passes_reach_the_inner_provider_with_budget_zero(self):
+    async def test_both_passes_reach_the_inner_provider_with_thinking_off(self):
+        # The default budget is 0, which turns thinking off through the chat template rather
+        # than sending a zero reasoning budget: on Gemma 4 a zero budget force-closes the
+        # thinking channel and the model writes its plan into the spoken reply.
         inner = FakeStreamingLLMProvider(
             [
                 ScriptedPass(chunks=[], tool_calls=_tool_call()),
@@ -168,20 +172,23 @@ class TestVoiceTurnThinking:
         await _tokens(handler, origin="voice", channel="tts")
 
         assert len(inner.calls) == 2
-        assert [call.thinking.budget_tokens for call in inner.calls] == [0, 0]
+        assert [call.thinking for call in inner.calls] == [
+            ThinkingConfig(enabled=False),
+            ThinkingConfig(enabled=False),
+        ]
         assert get_adaptive_thinking_retry_count() == 0
 
     @pytest.mark.asyncio
     async def test_a_failing_first_attempt_is_not_retried_unbudgeted(self):
         # Length-exhausted with no output is the shape the adaptive wrapper retries on when
-        # it applied its own budget. A voice turn set the budget itself, so nothing retries.
+        # it applied its own budget. A voice turn set thinking itself, so nothing retries.
         inner = FakeStreamingLLMProvider([ScriptedPass(chunks=[], finish_reason="length")])
         handler = _handler(AdaptiveThinkingProvider(inner, budget_tokens=1024))
 
         await _tokens(handler, origin="voice", channel="tts")
 
         assert len(inner.calls) == 1
-        assert inner.calls[0].thinking.budget_tokens == 0
+        assert inner.calls[0].thinking == ThinkingConfig(enabled=False)
         assert get_adaptive_thinking_retry_count() == 0
 
     @pytest.mark.asyncio
