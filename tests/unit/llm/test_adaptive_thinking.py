@@ -194,7 +194,8 @@ class TestAppliesGating:
 
     @pytest.mark.asyncio
     async def test_thinking_switched_off_is_caller_set_and_never_retried(self):
-        # Voice turns and the capability decode turn thinking off with `enabled=False`.
+        # Voice turns at the default budget of 0, and the capability decode, turn thinking
+        # off with `enabled=False`.
         # That is caller-set like a budget, so a length-exhausted empty reply, which the
         # wrapper retries when it budgeted the request itself, passes straight through.
         length_failure = LLMResponse(content=None, tool_calls=None, finish_reason="length")

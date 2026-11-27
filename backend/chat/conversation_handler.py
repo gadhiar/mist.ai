@@ -2623,8 +2623,8 @@ class ConversationHandler:
         actions = _ActionsOutcome()
         retrieval_result: RetrievalResult | None = None
         mist_context: MistContext | None = None
-        # A spoken turn waits on the model's first words, so it sends the
-        # voice budget on both passes. A budget of 0 switches thinking off
+        # A spoken turn waits on the model's first words, so it sends its
+        # voice thinking setting on both passes. A budget of 0 switches thinking off
         # (`enabled=False`) instead of sending a zero budget: on Gemma 4 a zero
         # budget force-closes the thinking channel and the model writes its plan
         # into the spoken reply. Either way thinking is caller-set, which stops

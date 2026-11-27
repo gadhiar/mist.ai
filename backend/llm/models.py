@@ -64,9 +64,11 @@ class ThinkingConfig(BaseModel):
 
     `effort` and `enabled` are chat-template hints (`reasoning_effort`,
     `enable_thinking`) forwarded via `chat_template_kwargs`; either, both,
-    or neither may be set. gpt-oss and Qwen templates read them, and Gemma
-    4's template honours `enable_thinking` too: `enabled=False` is its off
-    switch (same probe: a direct reply and no reasoning, 8 of 8 runs).
+    or neither may be set. The gpt-oss template reads `reasoning_effort`
+    and the Qwen template reads `enable_thinking` (the extraction adapters
+    send each model only its own template field). Gemma 4's template honours
+    `enable_thinking` too: `enabled=False` is its off switch (same probe: a
+    direct reply and no reasoning, 8 of 8 runs).
     """
 
     budget_tokens: int | None = None
