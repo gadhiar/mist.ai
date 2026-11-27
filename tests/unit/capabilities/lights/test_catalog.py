@@ -44,6 +44,48 @@ LIVE_CONTEXT = (
 )
 
 
+# The shape Home Assistant 2026.11 returned on 26 Nov: quoted states, `attributes` holding quoted
+# brightness values, a scene with no area, a scene whose state is a timestamp, the whole text
+# inside a JSON object's `result`. Invented names.
+LIVE_CONTEXT_2026_11 = (
+    "Live Context: An overview of the areas and the devices in this smart home:\n"
+    "- names: Reading Lamp\n"
+    "  domain: light\n"
+    "  state: 'on'\n"
+    "  areas: Study\n"
+    "  attributes:\n"
+    "    brightness: '178'\n"
+    "    brightness_pct: '70'\n"
+    "- names: Porch Light\n"
+    "  domain: light\n"
+    "  state: 'off'\n"
+    "  areas: Front Porch\n"
+    "- names: Evening Glow\n"
+    "  domain: scene\n"
+    "  state: unknown\n"
+    "- names: Movie Night\n"
+    "  domain: scene\n"
+    "  state: '2026-11-20T18:04:11.123456+00:00'\n"
+    "  areas: Study\n"
+)
+
+
+class TestParseTheNovember2026Shape:
+    def test_json_wrapped_text_parses_as_the_same_text_unwrapped(self):
+        wrapped = json.dumps({"result": LIVE_CONTEXT_2026_11})
+
+        assert parse_live_context(wrapped) == parse_live_context(LIVE_CONTEXT_2026_11)
+
+    def test_keeps_the_lights_and_leaves_out_the_scenes(self):
+        catalog = parse_live_context(json.dumps({"result": LIVE_CONTEXT_2026_11}))
+
+        assert catalog.lights == (
+            LightEntity(names=("Reading Lamp",), areas=("Study",), state="on"),
+            LightEntity(names=("Porch Light",), areas=("Front Porch",), state="off"),
+        )
+        assert catalog.targets() == ("Front Porch", "Porch Light", "Reading Lamp", "Study")
+
+
 class TestParse:
     def test_extracts_light_names_and_areas_from_the_documented_shape(self):
         catalog = parse_live_context(LIVE_CONTEXT)
