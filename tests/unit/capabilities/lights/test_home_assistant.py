@@ -1,13 +1,16 @@
 """Tests for `HomeAssistantLightsProvider` over `McpConnection` and the fake Home Assistant.
 
-The fake models the documented Home Assistant intents; the live tool list and the
-`GetLiveContext` layout are unverified (see `fake_home_assistant.py`).
+The fake models the documented Home Assistant intents, listed bare (before 2026.11) or with the
+source prefix Home Assistant 2026.11 listed on 26 Nov (`intent__HassTurnOn`), and the
+`GetLiveContext` layout that server returned; the input schemas are still unverified (see
+`fake_home_assistant.py`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -36,6 +39,7 @@ from tests.unit.capabilities.mcp.fake_home_assistant import (
     TURN_OFF,
     TURN_ON,
     FakeHomeAssistant,
+    prefixed_name,
     tool_error,
     unexpected_error,
 )
@@ -84,10 +88,13 @@ def _build(server: FakeHomeAssistant, clock: FakeClock) -> Rig:
 
 @contextlib.asynccontextmanager
 async def _running(
-    server: FakeHomeAssistant | None = None, *, connect: bool = True
+    server: FakeHomeAssistant | None = None,
+    *,
+    connect: bool = True,
+    live_context: str = LIVE_CONTEXT_TEXT,
 ) -> AsyncIterator[Rig]:
     server = server or FakeHomeAssistant(include_get_state=True)
-    server.live_context = LIVE_CONTEXT_TEXT
+    server.live_context = live_context
     rig = _build(server, FakeClock())
     await rig.provider.start()
     try:
@@ -430,3 +437,174 @@ class TestCatalogRefresh:
             pass
         assert rig.clock.pending == 0
         assert rig.connection.state().reason == "stopped"
+
+
+def _prefixed(
+    *, omit: list[str] | None = None, include_get_state: bool = False
+) -> FakeHomeAssistant:
+    return FakeHomeAssistant(prefixed=True, omit=omit or [], include_get_state=include_get_state)
+
+
+AMBIGUOUS_TURN_ON = "Home Assistant lists HassTurnOn more than once (a__HassTurnOn, b__HassTurnOn)"
+
+
+class TestPrefixedToolNames:
+    """Home Assistant 2026.11 lists each tool as `<source>__<name>`."""
+
+    @pytest.mark.asyncio
+    async def test_a_prefixed_listing_gives_lights_available(self):
+        async with _running(_prefixed()) as rig:
+            status = rig.provider.status()
+
+            assert (status.state, status.reason) == ("available", None)
+
+    @pytest.mark.parametrize(("on", "tool"), [(True, TURN_ON), (False, TURN_OFF)])
+    @pytest.mark.asyncio
+    async def test_power_calls_the_listed_prefixed_name(self, on, tool):
+        async with _running(_prefixed()) as rig:
+            await rig.provider.power(LightTarget(kind="area", value="Kitchen"), on)
+
+            assert rig.calls_to(prefixed_name(tool)) == [{"area": "Kitchen", "domain": ["light"]}]
+            assert rig.calls_to(tool) == []
+
+    @pytest.mark.asyncio
+    async def test_adjust_calls_the_listed_prefixed_light_set(self):
+        async with _running(_prefixed()) as rig:
+            await rig.provider.adjust(
+                LightTarget(kind="area", value="Kitchen"), LightAdjustment(brightness_pct=40)
+            )
+
+            assert rig.calls_to("light__HassLightSet") == [
+                {"area": "Kitchen", "domain": ["light"], "brightness": 40}
+            ]
+
+    @pytest.mark.asyncio
+    async def test_connect_fills_the_catalog_from_json_wrapped_prefixed_live_context(self):
+        wrapped = json.dumps({"result": LIVE_CONTEXT_TEXT})
+
+        async with _running(_prefixed(), live_context=wrapped) as rig:
+            assert rig.provider.catalog().names == ("Bedroom Lamp", "Ceiling Light")
+            assert len(rig.calls_to("homeassistant__GetLiveContext")) == 1
+
+    @pytest.mark.asyncio
+    async def test_read_status_calls_the_prefixed_live_context(self):
+        async with _running(_prefixed()) as rig:
+            reading = await rig.provider.read_status(None)
+
+            assert reading.text == LIVE_CONTEXT_TEXT.strip()
+            # The first call is the on-connect catalog refresh.
+            assert len(rig.calls_to("homeassistant__GetLiveContext")) == 2
+
+    @pytest.mark.asyncio
+    async def test_read_status_falls_back_to_the_prefixed_get_state(self):
+        server = _prefixed(omit=[LIVE_CONTEXT], include_get_state=True)
+        async with _running(server) as rig:
+            await rig.provider.read_status(None)
+
+            assert rig.calls_to("intent__HassGetState") == [{"domain": ["light"]}]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_tool_is_named_bare_in_the_reason(self):
+        async with _running(_prefixed(omit=[TURN_OFF])) as rig:
+            status = rig.provider.status()
+
+            assert (status.state, status.reason) == (
+                "unavailable",
+                "Home Assistant lacks HassTurnOff",
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_tool_error_without_text_names_the_listed_tool(self):
+        async with _running(_prefixed()) as rig:
+            rig.server.call_script.append(tool_error(""))
+
+            with pytest.raises(CapabilityInvocationError, match="^intent__HassTurnOn failed$"):
+                await rig.provider.power(LightTarget(kind="area", value="Kitchen"), True)
+
+    @pytest.mark.asyncio
+    async def test_provider_tools_lists_the_names_as_the_server_lists_them(self):
+        async with _running(_prefixed()) as rig:
+            assert rig.provider.provider_tools() == (
+                "homeassistant__GetLiveContext",
+                "intent__HassTurnOff",
+                "intent__HassTurnOn",
+                "light__HassLightSet",
+            )
+
+
+class TestAmbiguousToolNames:
+    """Two sources listing the same tool, with no bare name, count as missing."""
+
+    @pytest.mark.asyncio
+    async def test_two_prefixed_matches_give_unavailable_naming_both(self):
+        server = FakeHomeAssistant(omit=[TURN_ON], extra_tools=["b__HassTurnOn", "a__HassTurnOn"])
+        async with _running(server) as rig:
+            status = rig.provider.status()
+
+            assert (status.state, status.reason) == ("unavailable", AMBIGUOUS_TURN_ON)
+
+    @pytest.mark.asyncio
+    async def test_power_with_two_prefixed_matches_raises_and_calls_neither(self):
+        server = FakeHomeAssistant(omit=[TURN_ON], extra_tools=["b__HassTurnOn", "a__HassTurnOn"])
+        async with _running(server) as rig:
+            with pytest.raises(CapabilityUnavailableError) as raised:
+                await rig.provider.power(LightTarget(kind="area", value="Kitchen"), True)
+
+            assert str(raised.value) == AMBIGUOUS_TURN_ON
+            assert rig.calls_to("a__HassTurnOn") == rig.calls_to("b__HassTurnOn") == []
+
+    @pytest.mark.asyncio
+    async def test_a_bare_name_wins_over_a_prefixed_one(self):
+        async with _running(FakeHomeAssistant(extra_tools=["x__HassTurnOn"])) as rig:
+            await rig.provider.power(LightTarget(kind="area", value="Kitchen"), True)
+
+            assert len(rig.calls_to(TURN_ON)) == 1
+            assert rig.calls_to("x__HassTurnOn") == []
+
+
+class TestBareToolNames:
+    """A listing before Home Assistant 2026.11 keeps today's calls and reasons."""
+
+    @pytest.mark.asyncio
+    async def test_bare_listing_calls_the_bare_names(self):
+        async with _running() as rig:
+            target = LightTarget(kind="area", value="Kitchen")
+            await rig.provider.power(target, True)
+            await rig.provider.adjust(target, LightAdjustment(brightness_pct=10))
+            await rig.provider.read_status(None)
+
+            names = [call.name for call in rig.server.calls]
+            assert names == [LIVE_CONTEXT, TURN_ON, LIGHT_SET, LIVE_CONTEXT]
+
+    @pytest.mark.parametrize(
+        ("omit", "state", "reason"),
+        [
+            pytest.param(
+                [TURN_ON, TURN_OFF],
+                "unavailable",
+                "Home Assistant lacks HassTurnOn and HassTurnOff",
+                id="both-power-tools",
+            ),
+            pytest.param(
+                [LIGHT_SET, LIVE_CONTEXT],
+                "degraded",
+                "Home Assistant lacks HassLightSet and GetLiveContext and HassGetState",
+                id="light-set-and-status-tools",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_reasons_read_as_today(self, omit, state, reason):
+        async with _running(FakeHomeAssistant(omit=omit)) as rig:
+            status = rig.provider.status()
+
+            assert (status.state, status.reason) == (state, reason)
+
+    @pytest.mark.asyncio
+    async def test_power_without_its_tool_is_unavailable_and_calls_nothing(self):
+        async with _running(FakeHomeAssistant(omit=[TURN_ON])) as rig:
+            with pytest.raises(CapabilityUnavailableError) as raised:
+                await rig.provider.power(LightTarget(kind="area", value="Kitchen"), True)
+
+            assert str(raised.value) == "Home Assistant lacks HassTurnOn"
+            assert rig.calls_to(TURN_ON) == []

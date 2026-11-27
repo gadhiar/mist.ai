@@ -3,8 +3,14 @@
 The mapping follows Home Assistant's documented built-in intents: power goes to `HassTurnOn` and
 `HassTurnOff`, adjust to `HassLightSet`, both with a `name` or `area` slot and a `domain` slot
 listing light, and status to `GetLiveContext`, or `HassGetState` when that is not listed.
-Whether the live MCP server lists exactly these tools under the Assist API is unverified, so the
-provider checks the listed tools and reports a missing one by name in its status.
+
+Home Assistant 2026.11 lists each tool with its source as a prefix: a tools/list read on 26 Nov,
+on `/api/mcp` and `/api/mcp/assist` alike, gave `intent__HassTurnOn`, `intent__HassTurnOff`,
+`light__HassLightSet` and `homeassistant__GetLiveContext`, while earlier servers list the bare
+names. So each tool resolves against the listing as its bare name, else the one listed name
+ending in `__<name>`, and is called under the listed name; two such names and no bare one count
+as missing rather than a guess. Reasons name the bare tool. Slot schemas under the prefixed names
+have not been exercised live.
 
 The target catalog is refreshed on connect, every `CATALOG_REFRESH_S` and on every status read.
 The refresh runs in a task of its own, outside any turn, so its call is bounded by the same
@@ -17,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 
 from backend.errors import (
@@ -145,7 +151,8 @@ class HomeAssistantLightsProvider:
         While the connection is down this is its status under the name lights, `task_dead`
         included. Once it is up, a missing `HassTurnOn` or `HassTurnOff` makes lights
         `unavailable`; a missing `HassLightSet`, both status tools missing, or a dead refresh
-        task makes them `degraded`. The reason names each missing tool.
+        task makes them `degraded`. The reason names each missing tool, and each tool listed
+        more than once.
         """
         connection = self._connection.state()
         if connection.state != "available":
@@ -157,15 +164,15 @@ class HomeAssistantLightsProvider:
                 task_dead=connection.task_dead,
             )
         listed = self._listed()
-        missing = [tool for tool in (TURN_ON, TURN_OFF) if tool not in listed]
+        missing = [tool for tool in (TURN_ON, TURN_OFF) if _resolve(tool, listed) is None]
         if missing:
-            return self._status("unavailable", f"Home Assistant lacks {' and '.join(missing)}")
+            return self._status("unavailable", _unresolved_reason(missing, listed))
         problems = []
-        lacking = [] if LIGHT_SET in listed else [LIGHT_SET]
-        if LIVE_CONTEXT not in listed and GET_STATE not in listed:
+        lacking = [] if _resolve(LIGHT_SET, listed) is not None else [LIGHT_SET]
+        if _resolve(LIVE_CONTEXT, listed) is None and _resolve(GET_STATE, listed) is None:
             lacking.extend((LIVE_CONTEXT, GET_STATE))
         if lacking:
-            problems.append(f"Home Assistant lacks {' and '.join(lacking)}")
+            problems.append(_unresolved_reason(lacking, listed))
         if self._refresh_failure is not None:
             problems.append(self._refresh_failure)
         if problems:
@@ -196,17 +203,30 @@ class HomeAssistantLightsProvider:
     # -- Calls -----------------------------------------------------------------------------
 
     async def power(self, target: LightTarget, on: bool) -> None:
-        """Call `HassTurnOn` or `HassTurnOff` for the target's lights."""
-        await self._call(TURN_ON if on else TURN_OFF, _target_slots(target))
+        """Call `HassTurnOn` or `HassTurnOff` for the target's lights.
+
+        The tool is resolved first, so a missing one gives the same reason as `status` rather
+        than Home Assistant's unknown-tool error.
+
+        Raises:
+            CapabilityUnavailableError: The connection is down, with its reason; or Home
+                Assistant does not list the tool, or lists it more than once.
+        """
+        tool = TURN_ON if on else TURN_OFF
+        # A down connection lists no tools, so it is left to raise its own reason, which
+        # "lacks HassTurnOn" would hide.
+        if self._connection.state().state == "available":
+            tool = self._require(tool)
+        await self._call(tool, _target_slots(target))
 
     async def adjust(self, target: LightTarget, adjustment: LightAdjustment) -> None:
         """Call `HassLightSet` with the settings given.
 
         Raises:
-            CapabilityUnavailableError: Home Assistant does not list `HassLightSet`.
+            CapabilityUnavailableError: Home Assistant does not list `HassLightSet`, or lists
+                it more than once.
         """
-        if LIGHT_SET not in self._listed():
-            raise CapabilityUnavailableError(f"Home Assistant lacks {LIGHT_SET}")
+        tool = self._require(LIGHT_SET)
         slots = _target_slots(target)
         for slot, value in (
             ("brightness", adjustment.brightness_pct),
@@ -215,26 +235,28 @@ class HomeAssistantLightsProvider:
         ):
             if value is not None:
                 slots[slot] = value
-        await self._call(LIGHT_SET, slots)
+        await self._call(tool, slots)
 
     async def read_status(self, target: LightTarget | None) -> StatusReading:
         """Read `GetLiveContext`, refreshing the catalog from it, or else `HassGetState`.
 
         Raises:
-            CapabilityUnavailableError: Home Assistant lists neither status tool.
+            CapabilityUnavailableError: Home Assistant lists neither status tool once.
         """
         listed = self._listed()
-        if LIVE_CONTEXT in listed:
-            result = await self._call(LIVE_CONTEXT, {})
+        live_context = _resolve(LIVE_CONTEXT, listed)
+        if live_context is not None:
+            result = await self._call(live_context, {})
             self._catalog = parse_live_context(result.text)
             self._next_refresh = self._clock.now() + _REFRESH_INTERVAL
             lights = self._catalog.lights_for(target) if not self._catalog.is_empty else None
             return _reading(live_context_body(result.text), lights)
-        if GET_STATE in listed:
+        get_state = _resolve(GET_STATE, listed)
+        if get_state is not None:
             slots = _target_slots(target) if target is not None else {"domain": list(_DOMAIN)}
-            result = await self._call(GET_STATE, slots)
+            result = await self._call(get_state, slots)
             return _reading(result.text, None)
-        raise CapabilityUnavailableError(f"Home Assistant lacks {LIVE_CONTEXT} and {GET_STATE}")
+        raise CapabilityUnavailableError(_unresolved_reason((LIVE_CONTEXT, GET_STATE), listed))
 
     async def _call(self, tool: str, arguments: Mapping[str, object]) -> McpToolResult:
         """Call one tool, bounded by `call_timeout_s`; a tool error raises with its text.
@@ -256,6 +278,18 @@ class HomeAssistantLightsProvider:
 
     def _listed(self) -> frozenset[str]:
         return frozenset(tool.name for tool in self._connection.tools())
+
+    def _require(self, tool: str) -> str:
+        """Return the listed name `tool` resolves to.
+
+        Raises:
+            CapabilityUnavailableError: `tool` is not listed, or is listed more than once.
+        """
+        listed = self._listed()
+        name = _resolve(tool, listed)
+        if name is None:
+            raise CapabilityUnavailableError(_unresolved_reason((tool,), listed))
+        return name
 
     def _status(self, state: CapabilityState, reason: str | None) -> CapabilityStatus:
         return CapabilityStatus(
@@ -285,10 +319,11 @@ class HomeAssistantLightsProvider:
     async def _refresh(self) -> None:
         self._stale = False
         self._next_refresh = self._clock.now() + _REFRESH_INTERVAL
-        if LIVE_CONTEXT not in self._listed():
+        live_context = _resolve(LIVE_CONTEXT, self._listed())
+        if live_context is None:
             return
         try:
-            result = await self._call(LIVE_CONTEXT, {})
+            result = await self._call(live_context, {})
         except _CONTAINED_ERRORS as exc:
             logger.warning("Lights catalog refresh failed: %s", _describe(exc))
             return
@@ -311,6 +346,32 @@ class HomeAssistantLightsProvider:
                 reason = f"lights catalog refresh died: {type(exc).__name__}: {exc}"
                 logger.error("%s", reason, exc_info=exc)
         self._refresh_failure = reason
+
+
+def _matches(tool: str, listed: frozenset[str]) -> tuple[str, ...]:
+    """Return the bare name alone when listed, else every `<source>__<tool>` name, sorted."""
+    if tool in listed:
+        return (tool,)
+    return tuple(
+        sorted(name for name in listed if "__" in name and name.rpartition("__")[2] == tool)
+    )
+
+
+def _resolve(tool: str, listed: frozenset[str]) -> str | None:
+    """Return the one listed name `tool` resolves to, or None when it has none or several."""
+    matches = _matches(tool, listed)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _unresolved_reason(tools: Sequence[str], listed: frozenset[str]) -> str:
+    """Name the unresolved `tools` by their bare names, the missing ones in one phrase."""
+    lacking = [tool for tool in tools if not _matches(tool, listed)]
+    phrases = [f"Home Assistant lacks {' and '.join(lacking)}"] if lacking else []
+    for tool in tools:
+        matches = _matches(tool, listed)
+        if len(matches) > 1:
+            phrases.append(f"Home Assistant lists {tool} more than once ({', '.join(matches)})")
+    return " and ".join(phrases)
 
 
 def _target_slots(target: LightTarget) -> dict[str, object]:
