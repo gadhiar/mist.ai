@@ -7,10 +7,14 @@ intents) as MCP tools: `HassTurnOn` and `HassTurnOff` with the slots `name`, `ar
 and, when asked for, `HassGetState`, given the same target slots as `HassTurnOn` because the
 design's external facts quote none for it.
 
-Which of these tools Home Assistant's MCP Server integration really lists under the Assist API,
-their exact input schemas and the shape of their results are UNVERIFIED: the live tool list has
-not been read from a running Home Assistant. Tests built on this fake prove MIST's behaviour
-against the documented intents, not against a live server.
+A tools/list read from Home Assistant 2026.11 on 26 Nov (inside the backend container, on
+`/api/mcp` and `/api/mcp/assist` alike) listed these tools with a source prefix:
+`intent__HassTurnOn`, `intent__HassTurnOff`, `light__HassLightSet` and
+`homeassistant__GetLiveContext`, among others; `prefixed=True` lists them that way. Its
+`GetLiveContext` text arrived JSON-wrapped, `{"result": "Live Context: ..."}`. The input schemas
+here and the source of `HassGetState` (`intent` assumed) were not read, so they are still
+UNVERIFIED; tests built on this fake prove MIST's behaviour against the documented intents and
+the 26 Nov names, not against a live server.
 
 One `FakeHomeAssistant` is the server and keeps state across connections; `transport()` is the
 `transport_factory` an `McpConnection` takes, and builds a fresh transport per connect attempt.
@@ -23,7 +27,7 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from backend.capabilities.mcp.transport import McpToolResult, McpToolSpec
 from backend.errors import CapabilityUnavailableError, McpTransportError
@@ -33,6 +37,21 @@ TURN_OFF = "HassTurnOff"
 LIGHT_SET = "HassLightSet"
 LIVE_CONTEXT = "GetLiveContext"
 GET_STATE = "HassGetState"
+
+SOURCES: dict[str, str] = {
+    TURN_ON: "intent",
+    TURN_OFF: "intent",
+    LIGHT_SET: "light",
+    LIVE_CONTEXT: "homeassistant",
+    GET_STATE: "intent",
+}
+"""The source each tool is listed under with `prefixed=True`, as `<source>__<name>`."""
+
+
+def prefixed_name(name: str) -> str:
+    """Return the name Home Assistant 2026.11 lists a tool under, such as `intent__HassTurnOn`."""
+    return f"{SOURCES[name]}__{name}"
+
 
 _TARGET_SLOTS: dict[str, object] = {
     "name": {"type": "string"},
@@ -59,7 +78,8 @@ DEFAULT_LIVE_CONTEXT = (
     "  state: 'off'\n"
     "  areas: Bedroom\n"
 )
-"""A small stand-in for `GetLiveContext` text; its real layout is unverified."""
+"""A small stand-in for `GetLiveContext` text, in the layout Home Assistant 2026.11 returned on
+26 Nov inside its JSON `result`; this default is left unwrapped."""
 
 _OK_TEXT = json.dumps({"success": True})
 
@@ -103,7 +123,12 @@ class FakeHomeAssistant:
 
     Attributes:
         include_get_state: List `HassGetState` too.
-        omit: Tool names left out of `list_tools`; a call to one is answered as an unknown tool.
+        omit: Bare tool names left out of `list_tools`, prefixed or not; a call to one is
+            answered as an unknown tool.
+        prefixed: List each tool as `<source>__<name>` (`SOURCES`), as Home Assistant 2026.11
+            does; off by default, so the bare names stay the default listing.
+        extra_tools: Further names listed as given, with the target slots, answered with ok;
+            for listings such as two sources offering the same tool.
         open_failures: Each `open` pops one and raises it while any remain.
         list_tools_failures: Each `list_tools` pops one and raises it while any remain.
         call_script: Each `call_tool` pops one while any remain: a result is returned, an
@@ -118,9 +143,18 @@ class FakeHomeAssistant:
         transports: Every transport `transport()` built.
     """
 
-    def __init__(self, *, include_get_state: bool = False, omit: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        include_get_state: bool = False,
+        omit: Sequence[str] = (),
+        prefixed: bool = False,
+        extra_tools: Sequence[str] = (),
+    ) -> None:
         self.include_get_state = include_get_state
         self.omit: set[str] = set(omit)
+        self.prefixed = prefixed
+        self.extra_tools: list[str] = list(extra_tools)
         self.open_failures: deque[BaseException] = deque()
         self.list_tools_failures: deque[BaseException] = deque()
         self.call_script: deque[McpToolResult | BaseException] = deque()
@@ -141,7 +175,18 @@ class FakeHomeAssistant:
         return transport
 
     def tool_specs(self) -> list[McpToolSpec]:
-        """Return the tools the server lists now, after `include_get_state` and `omit`."""
+        """Return the tools the server lists now, after every listing attribute."""
+        listed = [
+            replace(spec, name=prefixed_name(spec.name)) if self.prefixed else spec
+            for spec in self._bare_specs()
+        ]
+        listed.extend(
+            McpToolSpec(name, "An extra tool listed as given", _object_schema(_TARGET_SLOTS))
+            for name in self.extra_tools
+        )
+        return listed
+
+    def _bare_specs(self) -> list[McpToolSpec]:
         specs = [
             McpToolSpec(
                 TURN_ON, "Turns on/opens a device or entity", _object_schema(_TARGET_SLOTS)
@@ -172,7 +217,7 @@ class FakeHomeAssistant:
         """Return the answer to a call nothing scripted: ok, an unknown-tool error, or context."""
         if name not in {spec.name for spec in self.tool_specs()}:
             return tool_error(f"Unknown tool: {name}")
-        if name == LIVE_CONTEXT:
+        if name in (LIVE_CONTEXT, prefixed_name(LIVE_CONTEXT)):
             return McpToolResult(is_error=False, text=self.live_context, structured=None)
         return McpToolResult(is_error=False, text=_OK_TEXT, structured={"success": True})
 
