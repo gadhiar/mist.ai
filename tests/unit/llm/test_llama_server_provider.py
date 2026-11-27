@@ -248,6 +248,19 @@ class TestBuildKwargsThinking:
 
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
 
+    def test_enabled_false_alone_sends_only_the_template_switch(
+        self, provider: LlamaServerProvider
+    ):
+        """Thinking off sends no `reasoning_budget_tokens`, so the channel is never force-closed."""
+        request = LLMRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=ThinkingConfig(enabled=False),
+        )
+
+        kwargs = provider._build_kwargs(request, stream=True)
+
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
     def test_effort_and_enabled_both_set(self, provider: LlamaServerProvider):
         request = LLMRequest(
             messages=[{"role": "user", "content": "hi"}],

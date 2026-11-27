@@ -54,12 +54,21 @@ class ThinkingConfig(BaseModel):
     `--reasoning-budget` default. llama.cpp b11151 treats a per-request
     `-1` as "not provided" and silently falls back to that same server
     default -- so `-1` can never mean "unbudgeted" here, it would just be a
-    confusing spelling of `None`. Use `budget_tokens=0` to end thinking
-    immediately, and leave it `None` for "unbudgeted".
+    confusing spelling of `None`. Leave it `None` for "unbudgeted".
 
-    `effort` and `enabled` are gpt-oss/Qwen chat-template hints
-    (`reasoning_effort`, `enable_thinking`) forwarded via
-    `chat_template_kwargs`; either, both, or neither may be set.
+    `budget_tokens=0` does not turn thinking off: llama-server force-closes
+    the thinking channel before the model has reasoned. On Gemma 4 E4B the
+    model then writes its plan into the reply itself (probed 26 Nov 2026:
+    4 of 4 runs, which is how voice replies came to speak the plan). To ask
+    for no reasoning, send `enabled=False`.
+
+    `effort` and `enabled` are chat-template hints (`reasoning_effort`,
+    `enable_thinking`) forwarded via `chat_template_kwargs`; either, both,
+    or neither may be set. The gpt-oss template reads `reasoning_effort`
+    and the Qwen template reads `enable_thinking` (the extraction adapters
+    send each model only its own template field). Gemma 4's template honours
+    `enable_thinking` too: `enabled=False` is its off switch (same probe: a
+    direct reply and no reasoning, 8 of 8 runs).
     """
 
     budget_tokens: int | None = None

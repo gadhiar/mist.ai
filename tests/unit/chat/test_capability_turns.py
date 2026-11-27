@@ -594,7 +594,7 @@ class TestDecodeCallback:
             messages=[dict(m) for m in _DECODE.messages],
             tools=None,
             response_schema=dict(_DECODE.response_schema),
-            thinking=ThinkingConfig(budget_tokens=0),
+            thinking=ThinkingConfig(enabled=False),
             temperature=_DECODE.temperature,
             max_tokens=_DECODE.max_tokens,
         )

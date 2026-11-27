@@ -130,9 +130,12 @@ class LLMConfig:
     # overrides an explicit thinking config.
     tool_thinking_budget_tokens: int | None = 1024
     # A spoken reply cannot start before its first words exist, so a voice
-    # turn sends this reasoning budget on both passes. 0 ends thinking at
-    # once. Being caller-set, it also keeps `AdaptiveThinkingProvider` from
-    # budgeting and retrying the turn.
+    # turn sends its voice thinking setting on both passes: a positive value
+    # is sent as the reasoning budget, and 0 turns thinking off
+    # (`ThinkingConfig(enabled=False)`), not a zero budget, which on Gemma 4
+    # force-closes the thinking channel and puts the model's plan in the
+    # reply. Being caller-set, either form keeps `AdaptiveThinkingProvider`
+    # from budgeting and retrying the turn.
     voice_thinking_budget_tokens: int = 0
     # The earliest character a `tts` turn's first emission may be cut at, so
     # the first spoken segment is long enough to sound like a phrase.
