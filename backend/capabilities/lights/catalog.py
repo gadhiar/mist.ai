@@ -7,10 +7,10 @@ decode grammar can offer the targets as an enum.
 The layout parsed here is the one Home Assistant 2026.11 returned on 26 Nov: a JSON object whose
 `result` string holds a header line, then a YAML list with one mapping per exposed entity,
 carrying `names` (aliases joined by commas), `domain`, `state`, `areas` when it has one, and
-`attributes`; plain text without the wrapper reads the same. Only that one server's output has
-been read, so the parser stays defensive: any text it cannot read gives an empty catalog rather
-than an exception, and an empty catalog only costs the enum, the dynamic keywords and the
-target-only fast path.
+`attributes` when it has any; plain text without the wrapper reads the same. Only that one
+server's output has been read, so the parser stays defensive: any text it cannot read gives an
+empty catalog rather than an exception, and an empty catalog only costs the enum, the dynamic
+keywords and the target-only fast path.
 """
 
 from __future__ import annotations

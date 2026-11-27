@@ -241,7 +241,7 @@ class HomeAssistantLightsProvider:
         """Read `GetLiveContext`, refreshing the catalog from it, or else `HassGetState`.
 
         Raises:
-            CapabilityUnavailableError: Home Assistant lists neither status tool once.
+            CapabilityUnavailableError: Home Assistant resolves neither status tool.
         """
         listed = self._listed()
         live_context = _resolve(LIVE_CONTEXT, listed)
