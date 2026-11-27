@@ -156,8 +156,11 @@ class TestPower:
     async def test_while_disconnected_a_call_is_unavailable(self):
         async with _running(connect=False) as rig:
             await rig.provider.stop()
-            with pytest.raises(CapabilityUnavailableError):
+            with pytest.raises(CapabilityUnavailableError) as raised:
                 await rig.provider.power(LightTarget(kind="area", value="Kitchen"), True)
+
+            # The connection's own reason, not "Home Assistant lacks HassTurnOn".
+            assert str(raised.value) == "stopped"
 
 
 class TestAdjust:
